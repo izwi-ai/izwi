@@ -513,6 +513,54 @@ impl std::fmt::Debug for FishDrama3QuantumCheckpoint {
     }
 }
 
+/// A request's preparation (§7.1 stage 0): its prompt, built from its
+/// encoded references and its text, sealed to the model load whose codec
+/// encoded the references.
+#[derive(Debug)]
+pub struct FishDrama3PreparedArtifact {
+    prompt: Arc<FishDrama3Prompt>,
+    model: u64,
+    references: usize,
+    reference_cache_hits: usize,
+    preparation_ms: f64,
+}
+
+impl FishDrama3PreparedArtifact {
+    pub fn prompt(&self) -> &Arc<FishDrama3Prompt> {
+        &self.prompt
+    }
+
+    pub fn prompt_rows(&self) -> usize {
+        self.prompt.rows
+    }
+
+    pub fn references(&self) -> usize {
+        self.references
+    }
+
+    pub fn reference_cache_hits(&self) -> usize {
+        self.reference_cache_hits
+    }
+
+    pub fn preparation_ms(&self) -> f64 {
+        self.preparation_ms
+    }
+
+    /// Host bytes the artifact keeps until the request ends: its `[11][T]`
+    /// prompt values.
+    pub fn retained_bytes(&self) -> Result<u64> {
+        self.prompt
+            .values
+            .iter()
+            .try_fold(0u64, |total, values| {
+                total.checked_add(u64::try_from(values.len()).ok()?.checked_mul(4)?)
+            })
+            .ok_or_else(|| {
+                Error::Overloaded("Fish Audio Drama 3 prepared prompt bytes overflow".into())
+            })
+    }
+}
+
 /// A whole streamed generation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FishDrama3Synthesis {
@@ -535,6 +583,9 @@ pub struct FishDrama3Model {
     reference_cache: FishDrama3ReferenceCache,
     device: Device,
     prefill_span_rows: usize,
+    /// The content identity a durable speech checkpoint records
+    /// ([`super::artifacts::pinned_fingerprint`]), set by the loader.
+    artifact_fingerprint: Option<String>,
 }
 
 impl std::fmt::Debug for FishDrama3Model {
@@ -693,7 +744,19 @@ impl FishDrama3Model {
             reference_cache: FishDrama3ReferenceCache::default(),
             device: device.clone(),
             prefill_span_rows: options.prefill_span_rows,
+            artifact_fingerprint: None,
         })
+    }
+
+    /// The load with the content identity a durable speech checkpoint
+    /// records.
+    pub fn with_artifact_fingerprint(mut self, fingerprint: String) -> Self {
+        self.artifact_fingerprint = Some(fingerprint);
+        self
+    }
+
+    pub fn artifact_fingerprint(&self) -> Option<&str> {
+        self.artifact_fingerprint.as_deref()
     }
 
     pub fn config(&self) -> &FishDrama3Config {
@@ -791,6 +854,114 @@ impl FishDrama3Model {
             .collect()
     }
 
+    /// A request's preparation (§7.1 stage 0): every reference encoded
+    /// through the cache, cancellable between references, then the prompt
+    /// built and checked against `max_frames` and the load's positions.
+    pub fn prepare_request(
+        &self,
+        references: &[(&str, FishDrama3ReferenceAudio<'_>)],
+        text: &str,
+        max_frames: usize,
+        check: FishDrama3CancelCheck<'_>,
+    ) -> Result<FishDrama3PreparedArtifact> {
+        let started = std::time::Instant::now();
+        if references.len() > MAX_REFERENCES {
+            return Err(Error::InvalidInput(format!(
+                "Fish Audio Drama 3 takes at most {MAX_REFERENCES} references; got {}",
+                references.len()
+            )));
+        }
+        let mut encoded = Vec::with_capacity(references.len());
+        let mut hits = 0;
+        for (transcript, audio) in references {
+            check()?;
+            let (codes, hit) = self.encode_reference(audio, check)?;
+            hits += usize::from(hit);
+            encoded.push(FishDrama3Reference {
+                transcript: (*transcript).to_string(),
+                codes,
+            });
+        }
+        check()?;
+        let prompt = super::prompt::build_prompt(&self.tokenizer, &encoded, [], text)?;
+        budget::check_positions(prompt.rows, max_frames, self.max_positions())?;
+        Ok(FishDrama3PreparedArtifact {
+            prompt: Arc::new(prompt),
+            model: self.identity,
+            references: encoded.len(),
+            reference_cache_hits: hits,
+            preparation_ms: started.elapsed().as_secs_f64() * 1000.0,
+        })
+    }
+
+    /// A new request over a preparation of this load, with the engine's
+    /// empty first-quantum KV views and the `positions` its retained row
+    /// holds.
+    pub fn new_prepared_request(
+        &self,
+        artifact: &FishDrama3PreparedArtifact,
+        params: FishDrama3GenerationParams,
+        trunk_cache: PhysicalPagedKvCache,
+        tower_cache: PhysicalPagedKvCache,
+        positions: usize,
+    ) -> Result<FishDrama3RequestState> {
+        if artifact.model != self.identity {
+            return Err(Error::InvalidInput(
+                "Fish Audio Drama 3 preparation belongs to another model load".into(),
+            ));
+        }
+        self.new_request_within(
+            artifact.prompt.clone(),
+            params,
+            trunk_cache,
+            tower_cache,
+            positions,
+        )
+    }
+
+    /// Installs the engine's views of the two paged domains for the next
+    /// quantum: the managed cache hands out a fresh lease-backed view each
+    /// quantum, whose length is the committed one. `tower` is `None` when
+    /// the quantum appends nothing to the tower (a final one-row prompt
+    /// cell), which keeps the current view. Refused inside a quantum, or
+    /// for a view of another geometry or length.
+    pub fn rebind_caches(
+        &self,
+        state: &mut FishDrama3RequestState,
+        trunk: PhysicalPagedKvCache,
+        tower: Option<PhysicalPagedKvCache>,
+    ) -> Result<()> {
+        self.check_state(state)?;
+        if state.quantum.is_some() {
+            return Err(Error::InferenceError(
+                "Fish Audio Drama 3 caches cannot change inside a quantum".into(),
+            ));
+        }
+        self.trunk.validate_cache(&trunk)?;
+        if trunk.context_len() != state.trunk_cache.context_len() {
+            return Err(Error::InvalidInput(format!(
+                "Fish Audio Drama 3 trunk view holds {} rows; the request holds {}",
+                trunk.context_len(),
+                state.trunk_cache.context_len()
+            )));
+        }
+        if let Some(tower) = &tower {
+            self.tower.validate_cache(tower)?;
+            if tower.context_len() != state.tower_cache.context_len() {
+                return Err(Error::InvalidInput(format!(
+                    "Fish Audio Drama 3 tower view holds {} rows; the request holds {}",
+                    tower.context_len(),
+                    state.tower_cache.context_len()
+                )));
+            }
+        }
+        state.trunk_cache = trunk;
+        if let Some(tower) = tower {
+            state.tower_cache = tower;
+        }
+        Ok(())
+    }
+
     fn check_state(&self, state: &FishDrama3RequestState) -> Result<()> {
         if state.model != self.identity {
             return Err(Error::InvalidInput(
@@ -800,13 +971,31 @@ impl FishDrama3Model {
         Ok(())
     }
 
-    /// A new request over `prompt` with the caller's empty KV views.
+    /// A new request over `prompt` with the caller's empty KV views, which
+    /// hold every position it may reach.
     pub fn new_request(
         &self,
         prompt: impl Into<Arc<FishDrama3Prompt>>,
         params: FishDrama3GenerationParams,
         trunk_cache: PhysicalPagedKvCache,
         tower_cache: PhysicalPagedKvCache,
+    ) -> Result<FishDrama3RequestState> {
+        let positions = trunk_cache
+            .capacity_tokens()
+            .min(tower_cache.capacity_tokens() + 1);
+        self.new_request_within(prompt, params, trunk_cache, tower_cache, positions)
+    }
+
+    /// [`Self::new_request`] whose views grow quantum by quantum (the
+    /// engine's managed ones), so the caller names the positions the
+    /// request may reach.
+    fn new_request_within(
+        &self,
+        prompt: impl Into<Arc<FishDrama3Prompt>>,
+        params: FishDrama3GenerationParams,
+        trunk_cache: PhysicalPagedKvCache,
+        tower_cache: PhysicalPagedKvCache,
+        positions: usize,
     ) -> Result<FishDrama3RequestState> {
         let prompt = prompt.into();
         params.validate()?;
@@ -824,11 +1013,11 @@ impl FishDrama3Model {
                 "Fish Audio Drama 3 request caches must begin empty".into(),
             ));
         }
-        let positions = self
-            .max_positions()
-            .min(trunk_cache.capacity_tokens())
-            .min(tower_cache.capacity_tokens() + 1);
-        budget::check_positions(prompt.rows, params.max_frames, positions)?;
+        budget::check_positions(
+            prompt.rows,
+            params.max_frames,
+            self.max_positions().min(positions),
+        )?;
         let sampler =
             FishDrama3RowSampler::new(params.sampling, self.config.ids, prompt.main_ids())?;
         Ok(FishDrama3RequestState {

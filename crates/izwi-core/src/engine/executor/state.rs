@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use crate::model::ModelVariant;
 use crate::models::architectures::chatterbox::retained::ChatterboxRetainedState;
+use crate::models::architectures::fish_drama3::{FishDrama3AudioStream, FishDrama3RequestState};
 use crate::models::architectures::fish_s2::FishS2RetainedState;
 use crate::models::architectures::lfm25_audio::asr_retained::Lfm25AudioAsrRetainedState;
 use crate::models::architectures::lfm25_audio::tts_retained::Lfm25AudioTtsRetainedState;
@@ -20,10 +21,10 @@ use crate::models::architectures::voxtral::realtime::{
 };
 use crate::models::architectures::voxtral::tts::retained::VoxtralTtsRetainedState;
 use crate::models::registry::{
-    AsrModelLease, ChatterboxTtsModelLease, FishS2TtsModelLease, Lfm25AudioModelLease,
-    Maya1TtsModelLease, Maya2TtsModelLease, NativeAsrDecodeState, NativeAsrModel,
-    NativeChatDecodeState, NativeChatReplayCheckpoint, QwenTtsModelLease, VibeVoiceTtsModelLease,
-    VoxtralModelLease, VoxtralTtsModelLease,
+    AsrModelLease, ChatterboxTtsModelLease, FishDrama3TtsModelLease, FishS2TtsModelLease,
+    Lfm25AudioModelLease, Maya1TtsModelLease, Maya2TtsModelLease, NativeAsrDecodeState,
+    NativeAsrModel, NativeChatDecodeState, NativeChatReplayCheckpoint, QwenTtsModelLease,
+    VibeVoiceTtsModelLease, VoxtralModelLease, VoxtralTtsModelLease,
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
@@ -159,6 +160,30 @@ pub(super) struct ActiveFishS2TtsDecode {
     pub(super) audio_samples: Vec<f32>,
     pub(super) total_audio_samples: usize,
     pub(super) collect_audio_samples: bool,
+    pub(super) codec_ms: f64,
+    pub(super) execution_started: std::time::Instant,
+    pub(super) first_audio_ms: Option<f64>,
+}
+
+/// One Fish Audio Drama 3 request between quanta: its retained state (the
+/// trunk's DeltaNet tensors live in the engine's tensor arena between
+/// quanta), its committed codec stream, and what it has emitted.
+pub(super) struct ActiveFishDrama3TtsDecode {
+    pub(super) variant: ModelVariant,
+    pub(super) model: FishDrama3TtsModelLease,
+    pub(super) state: FishDrama3RequestState,
+    pub(super) stream: FishDrama3AudioStream,
+    /// Frames committed by the last decode quantum.
+    pub(super) last_frames: usize,
+    pub(super) stream_sequence: usize,
+    /// A final-only request's PCM, handed over at finalization.
+    pub(super) audio_samples: Vec<f32>,
+    pub(super) total_audio_samples: usize,
+    pub(super) collect_audio_samples: bool,
+    pub(super) prefill_ms: f64,
+    pub(super) decode_ms: f64,
+    pub(super) prefill_steps: usize,
+    pub(super) decode_steps: usize,
     pub(super) codec_ms: f64,
     pub(super) execution_started: std::time::Instant,
     pub(super) first_audio_ms: Option<f64>,

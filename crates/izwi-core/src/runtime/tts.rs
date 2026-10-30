@@ -127,6 +127,21 @@ fn direct_tts_generation_shape(
             2_048,
             true,
         ),
+        // The family's budget: the automatic one of the text, or the
+        // explicit one up to the codec stream's 4,096 frames.
+        ModelFamily::FishDrama3Tts => (
+            if explicit == 0 {
+                crate::models::architectures::fish_drama3::model::auto_frame_budget(&request.text)
+            } else {
+                explicit.min(tts_explicit_output_limit(
+                    backend,
+                    variant,
+                    max_sequence_length,
+                ))
+            },
+            2_048,
+            true,
+        ),
         _ => {
             return Err(Error::InvalidInput(format!(
                 "model {variant} does not use the direct TTS runtime"
@@ -799,11 +814,11 @@ mod tests {
     fn advertised_streaming_mode_is_what_the_route_does() {
         use crate::runtime::adapters::{RuntimeAdapterRegistry, StreamingMode};
         let registry = RuntimeAdapterRegistry::built_in();
-        for variant in ModelVariant::all().iter().copied().filter(|variant| {
-            variant.is_enabled()
-                && variant.speech_capabilities().is_some()
-                && !crate::models::families::engine_route_pending(*variant)
-        }) {
+        for variant in ModelVariant::all()
+            .iter()
+            .copied()
+            .filter(|variant| variant.is_enabled() && variant.speech_capabilities().is_some())
+        {
             // A stream runs on a streaming capability, or on the TTS
             // capability's own native-streaming graph, which the loader
             // seals only for a TTS adapter that streams in chunks.
@@ -981,9 +996,10 @@ mod tests {
         use crate::runtime::adapters::RuntimeAdapterRegistry;
         // Families whose engine executors stream committed audio and publish
         // the final marker.
-        const ENGINE_STREAM_EMITTERS: [ModelFamily; 8] = [
+        const ENGINE_STREAM_EMITTERS: [ModelFamily; 9] = [
             ModelFamily::Qwen3Tts,
             ModelFamily::FishS2Tts,
+            ModelFamily::FishDrama3Tts,
             ModelFamily::VoxtralTts,
             ModelFamily::Lfm25Audio,
             ModelFamily::VibeVoiceTts,
@@ -997,10 +1013,7 @@ mod tests {
         let flood = "word ".repeat(20_000);
         let mut checked = 0;
         for variant in ModelVariant::all().iter().copied() {
-            if !variant.is_enabled()
-                || !variant.is_tts()
-                || crate::models::families::engine_route_pending(variant)
-            {
+            if !variant.is_enabled() || !variant.is_tts() {
                 continue;
             }
             checked += 1;

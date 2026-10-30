@@ -89,6 +89,19 @@ mod published {
     pub const SEMANTIC_END: u32 = 252_194;
 }
 
+/// The policy a lifecycle load of `model_dir` holds its `config.json` to:
+/// the published one, except for a test build's synthetic checkpoint marked
+/// for the lifecycle (`synthetic::LIFECYCLE_MARKER`). A release build has no
+/// way to load anything but the pinned geometry.
+pub(crate) fn lifecycle_policy(model_dir: &Path) -> FishDrama3ConfigPolicy {
+    #[cfg(test)]
+    if super::synthetic::marked_for_lifecycle(model_dir) {
+        return FishDrama3ConfigPolicy::Synthetic;
+    }
+    let _ = model_dir;
+    FishDrama3ConfigPolicy::Published
+}
+
 /// How strictly `config.json` is held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FishDrama3ConfigPolicy {

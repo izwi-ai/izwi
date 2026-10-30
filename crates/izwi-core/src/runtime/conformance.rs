@@ -15,7 +15,7 @@ use crate::catalog::{CudaSupportLevel, ModelFamily, ModelVariant};
 #[cfg(test)]
 pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 57;
 #[cfg(test)]
-pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 83;
+pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 85;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConformanceExecutionClass {
@@ -392,10 +392,7 @@ mod tests {
 
         assert_eq!(actual.len(), manifest.len(), "duplicate manifest binding");
         assert_eq!(actual, expected);
-        for variant in ModelVariant::all()
-            .iter()
-            .filter(|variant| !crate::models::families::engine_route_pending(**variant))
-        {
+        for variant in ModelVariant::all() {
             assert!(
                 manifest.iter().any(|case| case.variant == *variant),
                 "catalog variant {variant} has no state conformance binding"
@@ -445,7 +442,7 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            70
+            72
         );
         assert_eq!(
             manifest
@@ -556,6 +553,8 @@ mod tests {
         for (variant, capability) in [
             (ModelVariant::FishAudioS2Pro, CapabilityKind::Tts),
             (ModelVariant::FishAudioS2Pro, CapabilityKind::StreamingTts),
+            (ModelVariant::FishAudioDrama3, CapabilityKind::Tts),
+            (ModelVariant::FishAudioDrama3, CapabilityKind::StreamingTts),
             (ModelVariant::WhisperLargeV3Turbo, CapabilityKind::Asr),
             (ModelVariant::VibeVoiceAsr, CapabilityKind::Asr),
             (ModelVariant::ParakeetTdt06BV3, CapabilityKind::Asr),

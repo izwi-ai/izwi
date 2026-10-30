@@ -616,13 +616,26 @@ fn load_fish_drama3_tts_model(
     use crate::models::architectures::fish_drama3::{
         FishDrama3ConfigPolicy, FishDrama3ModelOptions,
     };
+    // A test build loads a synthetic checkpoint marked for the lifecycle
+    // as a test would; a release build has no such path.
+    #[cfg(test)]
+    if crate::models::architectures::fish_drama3::config::lifecycle_policy(model_dir)
+        == FishDrama3ConfigPolicy::Synthetic
+    {
+        return load_synthetic_fish_drama3_tts_model(model_dir, variant, device);
+    }
     prepare_fish_drama3_tts_load(
         model_dir,
         variant,
         &device,
         FishDrama3ConfigPolicy::Published,
     )?;
-    FishDrama3Model::load(model_dir, &device.device, FishDrama3ModelOptions::default())
+    Ok(
+        FishDrama3Model::load(model_dir, &device.device, FishDrama3ModelOptions::default())?
+            .with_artifact_fingerprint(
+                crate::models::architectures::fish_drama3::artifacts::pinned_fingerprint(),
+            ),
+    )
 }
 
 fn load_qwen_tts_model(
@@ -821,7 +834,8 @@ pub(crate) fn load_synthetic_fish_drama3_tts_model(
         &device,
         FishDrama3ConfigPolicy::Synthetic,
     )?;
-    FishDrama3Model::load_with_codec(
+    let config = std::fs::read(model_dir.join("config.json"))?;
+    Ok(FishDrama3Model::load_with_codec(
         model_dir,
         &device.device,
         FishDrama3ModelOptions {
@@ -829,7 +843,11 @@ pub(crate) fn load_synthetic_fish_drama3_tts_model(
             ..Default::default()
         },
         Arc::new(StubCodec),
-    )
+    )?
+    .with_artifact_fingerprint(format!(
+        "synthetic-{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(config))
+    )))
 }
 
 const FISH_DRAMA3_TTS_LOADER_REGISTRY: &[FishDrama3TtsLoaderRegistration] =
@@ -5123,6 +5141,12 @@ pub struct FishDrama3TtsModelLease {
     inner: TrackedModelLease<FishDrama3Model>,
 }
 
+impl FishDrama3TtsModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<FishDrama3Model> {
+        self.inner.model.clone()
+    }
+}
+
 impl Deref for FishDrama3TtsModelLease {
     type Target = FishDrama3Model;
 
@@ -9170,6 +9194,16 @@ impl ModelRegistry {
         let entry = guard.get(&variant).ok_or_else(|| {
             Error::ModelLoadError(format!(
                 "cannot publish missing Fish S2 TTS model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
+    }
+
+    pub(crate) async fn publish_fish_drama3_tts_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.fish_drama3_tts_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing Fish Audio Drama 3 TTS model {variant} as ready"
             ))
         })?;
         entry.publish_ready()

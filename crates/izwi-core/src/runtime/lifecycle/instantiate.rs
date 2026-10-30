@@ -137,7 +137,6 @@ pub(in crate::runtime::lifecycle) async fn load_into_registry(
             registry.load_maya2_tts(variant, model_path).await?;
             InstantiatedPayload::None
         }
-        // `resolve_model_load` refuses it until its engine route lands.
         ModelFamily::FishDrama3Tts => {
             registry.load_fish_drama3_tts(variant, model_path).await?;
             InstantiatedPayload::None

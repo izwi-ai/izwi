@@ -1320,6 +1320,11 @@ impl ModelLifecycleController {
                     .publish_fish_s2_tts_ready(variant)
                     .await?;
             }
+            if variant.family() == crate::catalog::ModelFamily::FishDrama3Tts {
+                self.model_registry
+                    .publish_fish_drama3_tts_ready(variant)
+                    .await?;
+            }
             if variant.family() == crate::catalog::ModelFamily::KokoroTts {
                 self.model_registry.publish_kokoro_ready(variant).await?;
             }

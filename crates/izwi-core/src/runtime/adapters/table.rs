@@ -30,6 +30,7 @@ pub(crate) enum LoadedAdapterKind {
     Lfm25AudioTts,
     VibeVoiceTts,
     FishS2Tts,
+    FishDrama3Tts,
     VoxtralTts,
     ChatterboxTts,
     Maya1Tts,
@@ -59,6 +60,7 @@ impl LoadedAdapterKind {
             Self::Lfm25AudioTts => "builtin.lfm25_audio_tts.physical_sequence",
             Self::VibeVoiceTts => "builtin.vibevoice_tts.physical_sequence",
             Self::FishS2Tts => "builtin.fish_s2_tts.physical_sequence",
+            Self::FishDrama3Tts => "builtin.fish_drama3_tts.physical_sequence",
             Self::VoxtralTts => "builtin.voxtral_tts.physical_sequence",
             Self::ChatterboxTts => "builtin.chatterbox_tts.physical_sequence",
             Self::Maya1Tts => "builtin.maya1_tts.physical_sequence",
@@ -277,6 +279,22 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
             F::FishS2Tts,
             C::StreamingTts,
             Loaded::FishS2Tts,
+            RetainedAndInvocation,
+        )
+        .chunked(),
+        // S2's route shape on its own rows: one state shared by both
+        // capabilities, a separate streaming graph.
+        row(
+            F::FishDrama3Tts,
+            C::Tts,
+            Loaded::FishDrama3Tts,
+            RetainedAndInvocation,
+        )
+        .chunked(),
+        row(
+            F::FishDrama3Tts,
+            C::StreamingTts,
+            Loaded::FishDrama3Tts,
             RetainedAndInvocation,
         )
         .chunked(),

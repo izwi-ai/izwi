@@ -17,6 +17,8 @@ mod coordinator;
 mod diarization;
 pub(crate) mod fish_capacity;
 pub(crate) mod fish_drama3_capacity;
+#[cfg(test)]
+mod fish_drama3_tests;
 mod forced_alignment;
 mod health;
 mod kokoro;

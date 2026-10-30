@@ -173,6 +173,15 @@ pub(crate) fn write_synthetic_model(seed: u64) -> SyntheticCheckpoint {
     synthetic
 }
 
+/// The synthetic checkpoint with its tokenizer at `dir` (a runtime's
+/// `models_dir/<variant>`), marked for the lifecycle: a test loads it
+/// through `RuntimeService` as it would the published one.
+pub(crate) fn write_lifecycle_synthetic_model(dir: &std::path::Path, seed: u64) {
+    super::super::synthetic::write_checkpoint_at(dir, seed);
+    std::fs::write(dir.join("tokenizer.json"), tokenizer_json().to_string()).unwrap();
+    std::fs::write(dir.join(super::super::synthetic::LIFECYCLE_MARKER), b"").unwrap();
+}
+
 fn load_synthetic(seed: u64, cell: usize) -> FishDrama3Model {
     let synthetic = write_synthetic_model(seed);
     FishDrama3Model::load_with_codec(

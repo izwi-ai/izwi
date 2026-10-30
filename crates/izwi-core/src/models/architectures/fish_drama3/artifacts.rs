@@ -175,6 +175,26 @@ pub fn pinned_file(name: &str) -> Option<&'static FishDrama3PinnedFile> {
     FISH_DRAMA3_FILES.iter().find(|file| file.name == name)
 }
 
+/// The content identity of the pinned bundle, as a durable speech checkpoint
+/// records it: the SHA-256 of the repository, revision and every pinned
+/// file's name, size and hash. A load of the bundle passed
+/// [`verify_identity`] and its download [`verify_full`], so this names its
+/// bytes without hashing 41.5 GB again.
+pub fn pinned_fingerprint() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"fish-drama3-artifact-v1\0");
+    hasher.update(FISH_DRAMA3_REPO.as_bytes());
+    hasher.update(b"@");
+    hasher.update(FISH_DRAMA3_REVISION.as_bytes());
+    for file in FISH_DRAMA3_FILES {
+        hasher.update(b"\0");
+        hasher.update(file.name.as_bytes());
+        hasher.update(file.bytes.to_le_bytes());
+        hasher.update(file.sha256.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
 /// The cheap identity check every load runs: each pinned file is present
 /// at its exact size, and `config.json` hashes to the pinned value.
 pub fn verify_identity(model_dir: &Path) -> Result<()> {

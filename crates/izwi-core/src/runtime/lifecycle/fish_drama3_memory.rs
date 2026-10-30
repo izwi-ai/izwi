@@ -302,9 +302,14 @@ pub(super) fn census_estimate(
     })
 }
 
-/// `config.json` under the published policy: the only file pricing reads.
+/// `config.json` under the published policy (a test build's synthetic
+/// checkpoint marked for the lifecycle, under the synthetic one): the only
+/// file pricing reads.
 fn published_config(model_path: &Path) -> Result<FishDrama3Config> {
-    FishDrama3Config::load(model_path)
+    FishDrama3Config::load_with_policy(
+        model_path,
+        crate::models::architectures::fish_drama3::config::lifecycle_policy(model_path),
+    )
 }
 
 /// The plan load admission prices for the checkpoint at `model_path`.

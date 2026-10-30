@@ -272,18 +272,6 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
     },
 ];
 
-/// Catalog families whose engine route (registry slot, state contract,
-/// capability rows, adapter and executor) has not landed: listed and
-/// downloadable, but every load is refused before admission prices it. The
-/// route's landing removes the family here, and every inventory test then
-/// demands its rows.
-pub const ENGINE_ROUTE_PENDING_FAMILIES: &[ModelFamily] = &[ModelFamily::FishDrama3Tts];
-
-/// Whether `variant` is in the catalog without an engine route yet.
-pub fn engine_route_pending(variant: ModelVariant) -> bool {
-    ENGINE_ROUTE_PENDING_FAMILIES.contains(&variant.family())
-}
-
 pub fn model_family_registrations() -> &'static [FamilyRegistration] {
     MODEL_FAMILY_REGISTRATIONS
 }
@@ -314,15 +302,12 @@ mod tests {
         for registration in model_family_registrations() {
             assert!(!registration.variants.is_empty());
             assert!(!registration.module_path.is_empty());
-            // A family has capability rows exactly when its route landed.
-            let pending = ENGINE_ROUTE_PENDING_FAMILIES.contains(&registration.family);
-            assert_eq!(
-                registration.capabilities().is_empty(),
-                pending,
-                "{:?}: capability rows disagree with the pending-route list",
+            assert!(
+                !registration.capabilities().is_empty(),
+                "{:?} has no capability rows",
                 registration.family
             );
-            assert_eq!(registration.fixture_ids().is_empty(), pending);
+            assert!(!registration.fixture_ids().is_empty());
 
             for variant in registration.variants {
                 assert_eq!(

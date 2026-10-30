@@ -458,6 +458,18 @@ fn fish_drama3_files() -> Vec<String> {
 /// or unverified download never reads as complete; loads then check sizes
 /// and `config.json` only, never the 41.5 GB again.
 fn fish_drama3_bundle_is_complete(model_dir: &Path) -> bool {
+    // Tests load a synthetic checkpoint through the real runtime; it holds
+    // the files the loader reads, at their own sizes.
+    #[cfg(test)]
+    if crate::models::architectures::fish_drama3::synthetic::marked_for_lifecycle(model_dir) {
+        return [
+            "config.json",
+            "tokenizer.json",
+            "model.safetensors.index.json",
+        ]
+        .iter()
+        .all(|file| model_dir.join(file).is_file());
+    }
     let files_present = fish_drama3_artifacts::FISH_DRAMA3_FILES.iter().all(|file| {
         std::fs::metadata(model_dir.join(file.name))
             .is_ok_and(|meta| meta.is_file() && meta.len() == file.bytes)

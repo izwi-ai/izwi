@@ -17,25 +17,11 @@ pub(super) struct AcquiredModelLoad {
     pub model_path: PathBuf,
 }
 
-/// Why a load of a variant in the catalog without an engine route fails
-/// (`models::families::ENGINE_ROUTE_PENDING_FAMILIES`: Fish Audio Drama 3,
-/// which downloads, prices, allocates its state and loads into the registry,
-/// but has no adapter, executor or publication yet).
-pub(super) fn route_pending_error(variant: ModelVariant) -> Error {
-    Error::ModelLoadError(format!(
-        "{variant} is not available on this build yet: its engine route has not landed"
-    ))
-}
-
 impl ModelLifecycleController {
     pub(super) async fn resolve_model_load(
         &self,
         variant: ModelVariant,
     ) -> Result<ResolvedModelLoad> {
-        // Refused before admission prices it or evicts anything for it.
-        if crate::models::families::engine_route_pending(variant) {
-            return Err(route_pending_error(variant));
-        }
         let backend_plan = self.backend_router.select(variant);
         info!(
             "Selected backend {:?} for {} ({})",

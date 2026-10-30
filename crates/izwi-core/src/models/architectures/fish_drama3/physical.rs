@@ -60,6 +60,13 @@ pub(crate) const STATE_GROUP: StateGroupId = StateGroupId::new(1);
 /// largest frame budget (§7.5).
 pub const STATE_CONTEXT_TOKENS: usize = MAX_REQUEST_POSITIONS;
 
+/// The route's five stages (§7.1), in stage-id order.
+pub const PREPARATION_STAGE: &str = "tts.prepare.fish_drama3";
+pub const PREFILL_STAGE: &str = "tts.prefill.fish_drama3";
+pub const DECODE_STAGE: &str = "tts.decode.fish_drama3";
+pub const AUDIO_DECODE_STAGE: &str = "tts.audio_decode.fish_drama3";
+pub const FINALIZE_STAGE: &str = "tts.codec.fish_drama3.scalar";
+
 fn contract_error(message: impl Into<String>) -> Error {
     Error::ModelLoadError(format!(
         "Fish Audio Drama 3 state contract: {}",
@@ -407,25 +414,15 @@ pub(crate) fn test_stage_graph(workspace: &FishDrama3Workspace) -> Vec<StageDesc
             vec![ClockedStateSelection::new(STATE_GROUP, StateClock::DecoderTokens).unwrap()]
         }),
     };
-    let mut prefill = stage(
-        1,
-        "tts.prefill.fish_drama3",
-        StageWorkSelector::SequencePrefill,
-        true,
-    );
+    let mut prefill = stage(1, PREFILL_STAGE, StageWorkSelector::SequencePrefill, true);
     prefill.max_workspace_bytes = workspace.span_bytes;
-    let mut decode = stage(
-        2,
-        "tts.decode.fish_drama3",
-        StageWorkSelector::SequenceDecode,
-        true,
-    );
+    let mut decode = stage(2, DECODE_STAGE, StageWorkSelector::SequenceDecode, true);
     decode.workspace_per_row_bytes = workspace.decode_row_bytes;
     decode.max_workspace_bytes = workspace.decode_row_bytes;
     vec![
         stage(
             0,
-            "tts.prepare.fish_drama3",
+            PREPARATION_STAGE,
             StageWorkSelector::PreSequencePreparation,
             false,
         ),
@@ -433,13 +430,13 @@ pub(crate) fn test_stage_graph(workspace: &FishDrama3Workspace) -> Vec<StageDesc
         decode,
         stage(
             3,
-            "tts.audio_decode.fish_drama3",
+            AUDIO_DECODE_STAGE,
             StageWorkSelector::SequenceAudioDecode,
             false,
         ),
         stage(
             4,
-            "tts.codec.fish_drama3.scalar",
+            FINALIZE_STAGE,
             StageWorkSelector::SequenceFinalize,
             false,
         ),

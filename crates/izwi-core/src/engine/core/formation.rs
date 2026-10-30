@@ -367,29 +367,52 @@ impl EngineCore {
                         "Fish S2 codec requires its exact bound execution stage".into(),
                     )
                 })?;
-            let params = request
-                .fish_s2_tts_generation_params_for_executor()?
-                .ok_or_else(|| {
-                    Error::InvalidInput(
-                        "Fish S2 finalization requires sealed generation parameters".into(),
+            // Each Fish family's sealed frame budget and codec workspace.
+            let (max_frames, streaming_decode_workspace_bytes): (usize, fn(usize) -> Result<u64>) =
+                if request.model_variant.is_some_and(|variant| {
+                    variant.family() == crate::catalog::ModelFamily::FishDrama3Tts
+                }) {
+                    let params = request
+                        .fish_drama3_tts_generation_params_for_executor()?
+                        .ok_or_else(|| {
+                            Error::InvalidInput(
+                                "Fish Audio Drama 3 finalization requires sealed generation \
+                                 parameters"
+                                    .into(),
+                            )
+                        })?;
+                    params.validate()?;
+                    (
+                        params.max_frames,
+                        crate::models::architectures::fish_drama3::codec::streaming_decode_workspace_bytes,
                     )
-                })?;
-            params.validate()?;
-            if params.max_frames > ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES {
-                return Err(Error::InvalidInput(
-                    "Fish S2 output exceeds the codec frame limit".into(),
-                ));
-            }
+                } else {
+                    let params = request
+                        .fish_s2_tts_generation_params_for_executor()?
+                        .ok_or_else(|| {
+                            Error::InvalidInput(
+                                "Fish S2 finalization requires sealed generation parameters".into(),
+                            )
+                        })?;
+                    params.validate()?;
+                    if params.max_frames > ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES {
+                        return Err(Error::InvalidInput(
+                            "Fish S2 output exceeds the codec frame limit".into(),
+                        ));
+                    }
+                    (
+                        params.max_frames,
+                        crate::models::architectures::fish_s2::codec::streaming_decode_workspace_bytes,
+                    )
+                };
             let frames = match work {
-                WorkUnit::SequenceAudioDecode { max_frames } => {
-                    (*max_frames).min(params.max_frames)
-                }
-                _ => params.max_frames,
+                WorkUnit::SequenceAudioDecode {
+                    max_frames: quantum,
+                } => (*quantum).min(max_frames),
+                _ => max_frames,
             };
             let bytes = if matches!(work, WorkUnit::SequenceAudioDecode { .. }) {
-                crate::models::architectures::fish_s2::codec::streaming_decode_workspace_bytes(
-                    frames,
-                )?
+                streaming_decode_workspace_bytes(frames)?
             } else {
                 // Terminal flush only moves retained PCM; neural work is complete.
                 0

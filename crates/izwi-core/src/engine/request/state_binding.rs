@@ -179,6 +179,46 @@ impl EngineCoreRequest {
         {
             return InputRange::new(0, 0);
         }
+        // Fish Audio Drama 3's tower runs one row behind its trunk (§7.2):
+        // prefill writes every prompt row but the last, which the first
+        // decode step completes, and decode then writes the row before the
+        // trunk's.
+        if domain == crate::models::architectures::fish_drama3::physical::TOWER_KV_DOMAIN
+            && self
+                .incremental_model_execution_ready
+                .as_ref()
+                .is_some_and(|ready| {
+                    matches!(ready.model, PreparedIncrementalModel::FishDrama3Tts(_))
+                        && ready.fish_drama3_tts.is_some()
+                })
+        {
+            let prompt_rows = self.prepared_sequence_input_tokens.ok_or_else(|| {
+                Error::InferenceError(
+                    "prepared Fish Audio Drama 3 request lost its prompt rows".into(),
+                )
+            })?;
+            let last = prompt_rows.checked_sub(1).ok_or_else(|| {
+                Error::InvalidInput("Fish Audio Drama 3 prompt has no rows".into())
+            })?;
+            return match phase {
+                super::super::SequencePhase::Prefill => {
+                    InputRange::new(input.start.min(last), input.end.min(last))
+                }
+                super::super::SequencePhase::Decode => {
+                    let start = input
+                        .start
+                        .checked_sub(1)
+                        .filter(|_| input.start >= prompt_rows);
+                    let end = input.end.checked_sub(1);
+                    match (start, end) {
+                        (Some(start), Some(end)) => InputRange::new(start, end),
+                        _ => Err(Error::InvalidInput(
+                            "Fish Audio Drama 3 decode began inside its prompt".into(),
+                        )),
+                    }
+                }
+            };
+        }
         let is_vibevoice_tts =
             self.incremental_model_execution_ready
                 .as_ref()
@@ -441,6 +481,30 @@ impl EngineCoreRequest {
                 )));
             }
         }
+        if matches!(&ready.model, PreparedIncrementalModel::FishDrama3Tts(_)) {
+            let prepared = ready.fish_drama3_tts.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Fish Audio Drama 3 request {} is missing its prepared prompt",
+                    self.id
+                ))
+            })?;
+            let params = ready.fish_drama3_tts_params.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Fish Audio Drama 3 request {} is missing its sealed generation parameters",
+                    self.id
+                ))
+            })?;
+            params.validate()?;
+            if ready.model_variant.family() != ModelFamily::FishDrama3Tts
+                || self.prepared_sequence_input_tokens != Some(prepared.prompt_rows())
+                || self.params.max_tokens != Self::fish_drama3_decode_quanta(params)
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Fish Audio Drama 3 request {} changed after preparation",
+                    self.id
+                )));
+            }
+        }
         if matches!(&ready.model, PreparedIncrementalModel::VoxtralTts(_)) {
             let prepared = ready.voxtral_tts.as_ref().ok_or_else(|| {
                 Error::InvalidInput(format!(
@@ -633,6 +697,13 @@ impl EngineCoreRequest {
             {
                 Ok(())
             }
+            (PreparedIncrementalModel::FishDrama3Tts(_), TaskType::TTS)
+                if ready.model_variant.family() == ModelFamily::FishDrama3Tts
+                    && ready.fish_drama3_tts.is_some()
+                    && ready.fish_drama3_tts_params.is_some() =>
+            {
+                Ok(())
+            }
             (PreparedIncrementalModel::VoxtralTts(_), TaskType::TTS)
                 if ready.model_variant.family() == ModelFamily::VoxtralTts
                     && ready.voxtral_tts.is_some()
@@ -742,6 +813,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::QwenTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)

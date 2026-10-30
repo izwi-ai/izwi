@@ -62,8 +62,9 @@ pub use model::{
     FishDrama3AudioCandidate, FishDrama3AudioStream, FishDrama3CancelCheck, FishDrama3ChunkPlan,
     FishDrama3ChunkResult, FishDrama3ChunkSession, FishDrama3ChunkSessionOptions,
     FishDrama3FrameCodec, FishDrama3GenerationParams, FishDrama3Model, FishDrama3ModelOptions,
-    FishDrama3PagedDomain, FishDrama3QuantumCheckpoint, FishDrama3RequestState,
-    FishDrama3StateGeometry, FishDrama3Step, FishDrama3StopReason, FishDrama3Synthesis,
+    FishDrama3PagedDomain, FishDrama3PreparedArtifact, FishDrama3QuantumCheckpoint,
+    FishDrama3RequestState, FishDrama3StateGeometry, FishDrama3Step, FishDrama3StopReason,
+    FishDrama3Synthesis,
 };
 pub use precision::FishDrama3PrecisionReport;
 pub use prompt::{FishDrama3Codes, FishDrama3HistoryTurn, FishDrama3Prompt, FishDrama3Reference};

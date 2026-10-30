@@ -275,6 +275,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            fish_drama3_tts: None,
+            fish_drama3_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
             chatterbox_tts: None,
@@ -338,6 +340,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: Some(params),
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            fish_drama3_tts: None,
+            fish_drama3_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
             chatterbox_tts: None,
@@ -392,6 +396,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: Some(artifact),
             fish_s2_tts_params: Some(params),
+            fish_drama3_tts: None,
+            fish_drama3_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
             chatterbox_tts: None,
@@ -439,6 +445,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            fish_drama3_tts: None,
+            fish_drama3_tts_params: None,
             voxtral_tts: Some(artifact),
             voxtral_tts_params: Some(params),
             chatterbox_tts: None,
@@ -486,6 +494,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            fish_drama3_tts: None,
+            fish_drama3_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
             chatterbox_tts: Some(artifact),
@@ -533,6 +543,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            fish_drama3_tts: None,
+            fish_drama3_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
             chatterbox_tts: None,
@@ -582,6 +594,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            fish_drama3_tts: None,
+            fish_drama3_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
             chatterbox_tts: None,
@@ -590,6 +604,64 @@ impl EngineCoreRequest {
             maya1_tts_params: None,
             maya2_tts: Some(artifact),
             maya2_tts_params: Some(params),
+            lfm3_audio: None,
+            nemotron_transcribe: None,
+            kokoro_tts: None,
+        });
+        Ok(())
+    }
+
+    /// Seals a Fish Audio Drama 3 request to its preparation: its prompt
+    /// rows are the sequence input and its frame budget the output bound,
+    /// both within the `max_sequence_tokens` positions its retained row
+    /// holds.
+    pub(crate) fn install_fish_drama3_tts_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: FishDrama3TtsModelLease,
+        artifact: Arc<FishDrama3PreparedArtifact>,
+        params: FishDrama3GenerationParams,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        let prompt = artifact.prompt_rows();
+        if self.task_type != TaskType::TTS
+            || self.model_variant != Some(model_variant)
+            || model_variant.family() != ModelFamily::FishDrama3Tts
+            || prompt == 0
+            || params.max_frames == 0
+            || prompt
+                .checked_add(params.max_frames)
+                .is_none_or(|positions| positions > max_sequence_tokens)
+        {
+            return Err(Error::InvalidInput(format!(
+                "Fish Audio Drama 3 request {} preparation does not match its routed \
+                 model/context",
+                self.id
+            )));
+        }
+        params.validate()?;
+        self.prepared_stage_costs.clear();
+        self.prepared_sequence_input_tokens = Some(prompt);
+        self.params.max_tokens = Self::fish_drama3_decode_quanta(&params);
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::FishDrama3Tts(model),
+            qwen_tts: None,
+            lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
+            fish_s2_tts: None,
+            fish_s2_tts_params: None,
+            fish_drama3_tts: Some(artifact),
+            fish_drama3_tts_params: Some(params),
+            voxtral_tts: None,
+            voxtral_tts_params: None,
+            chatterbox_tts: None,
+            chatterbox_tts_params: None,
+            maya1_tts: None,
+            maya1_tts_params: None,
+            maya2_tts: None,
+            maya2_tts_params: None,
             lfm3_audio: None,
             nemotron_transcribe: None,
             kokoro_tts: None,
@@ -747,6 +819,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            fish_drama3_tts: None,
+            fish_drama3_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
             chatterbox_tts: None,
@@ -805,6 +879,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            fish_drama3_tts: None,
+            fish_drama3_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
             chatterbox_tts: None,
@@ -918,6 +994,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            fish_drama3_tts: None,
+            fish_drama3_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
             chatterbox_tts: None,
@@ -1046,6 +1124,49 @@ impl EngineCoreRequest {
             .incremental_model_execution_ready
             .as_ref()
             .and_then(|ready| ready.fish_s2_tts_params.clone()))
+    }
+
+    /// The decode quanta a Fish Audio Drama 3 request may take: one per
+    /// frame of its budget, and the draw after the last, which must be eos
+    /// (§7.5). The scheduler stops granting decode once a request has made
+    /// `max_tokens` frames, so the stop draw needs its own quantum.
+    pub(crate) fn fish_drama3_decode_quanta(
+        params: &crate::models::architectures::fish_drama3::FishDrama3GenerationParams,
+    ) -> usize {
+        params.max_frames + 1
+    }
+
+    pub(crate) fn prepared_fish_drama3_tts_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<FishDrama3TtsModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::FishDrama3Tts(model) => Some(model.clone()),
+                _ => None,
+            }))
+    }
+
+    pub(crate) fn prepared_fish_drama3_tts_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<FishDrama3PreparedArtifact>>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.fish_drama3_tts.clone()))
+    }
+
+    pub(crate) fn fish_drama3_tts_generation_params_for_executor(
+        &self,
+    ) -> Result<Option<FishDrama3GenerationParams>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.fish_drama3_tts_params))
     }
 
     pub(crate) fn prepared_voxtral_tts_model_lease_for_executor(
@@ -1240,6 +1361,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Lfm25AudioTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
@@ -1263,6 +1385,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Lfm25AudioTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)

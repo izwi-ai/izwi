@@ -2,7 +2,6 @@ use crate::catalog::ModelFamily;
 use crate::error::Result;
 use crate::runtime::lifecycle::controller::ModelLifecycleController;
 use crate::runtime::lifecycle::instantiate::{InstantiatedModelLoad, InstantiatedPayload};
-use crate::runtime::lifecycle::phases::route_pending_error;
 
 impl ModelLifecycleController {
     pub(super) async fn publish_loaded_model(
@@ -43,6 +42,7 @@ impl ModelLifecycleController {
             | ModelFamily::VoxtralTts
             | ModelFamily::VibeVoiceTts
             | ModelFamily::FishS2Tts
+            | ModelFamily::FishDrama3Tts
             | ModelFamily::ChatterboxTts
             | ModelFamily::Maya1Tts
             | ModelFamily::Maya2Tts => {
@@ -55,17 +55,13 @@ impl ModelLifecycleController {
                         | ModelFamily::VoxtralTts
                         | ModelFamily::VibeVoiceTts
                         | ModelFamily::FishS2Tts
+                        | ModelFamily::FishDrama3Tts
                         | ModelFamily::ChatterboxTts
                         | ModelFamily::Maya1Tts
                         | ModelFamily::Maya2Tts
                 ) {
                     self.set_active_tts_variant(variant).await;
                 }
-            }
-            // Never published until its engine route lands (the execution
-            // step adds its ready publication and the active-TTS arm).
-            ModelFamily::FishDrama3Tts => {
-                return Err(route_pending_error(variant));
             }
             ModelFamily::Tokenizer => {
                 if let InstantiatedPayload::Tokenizer(Some(tokenizer)) = payload {

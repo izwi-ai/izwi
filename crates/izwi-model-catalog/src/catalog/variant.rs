@@ -118,9 +118,11 @@ impl ModelFamily {
     /// Whether every prefill of this family must run in bounded resumable
     /// spans, whatever the engine's opt-in chunked-prefill switch says: its
     /// prompts (Nemotron 3.5 Transcribe: up to 45,000 audio tokens for an
-    /// hour) are too long for one quantum to hold the device.
+    /// hour) are too long for one quantum to hold the device, or its model
+    /// prefills on a grid of its own (Fish Audio Drama 3: one cell a
+    /// quantum, so other users' work interleaves between them).
     pub fn requires_prefill_spans(self) -> bool {
-        matches!(self, Self::NemotronTranscribeAsr)
+        matches!(self, Self::NemotronTranscribeAsr | Self::FishDrama3Tts)
     }
 
     /// Whether this family's ASR encoder pads every input to one fixed window

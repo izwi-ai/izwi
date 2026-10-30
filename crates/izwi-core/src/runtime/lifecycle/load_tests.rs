@@ -3012,40 +3012,6 @@ async fn cold_model_load_is_rejected_before_artifact_work_during_drain() {
     std::fs::remove_dir_all(models_dir).unwrap();
 }
 
-/// A catalog variant whose engine route has not landed (Fish Audio Drama 3)
-/// is refused at load before any artifact or admission work: the refusal
-/// names the missing route, not the absent download.
-#[allow(clippy::await_holding_lock)]
-#[tokio::test]
-async fn a_variant_without_an_engine_route_is_refused_before_artifact_work() {
-    let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    let models_dir = std::env::temp_dir().join(format!(
-        "izwi-runtime-route-pending-test-{}",
-        Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&models_dir).unwrap();
-    let runtime = RuntimeService::new(EngineConfig {
-        models_dir: models_dir.clone(),
-        backend: BackendPreference::Cpu,
-        ..EngineConfig::default()
-    })
-    .unwrap();
-    let variant = ModelVariant::FishAudioDrama3;
-    assert!(crate::models::families::engine_route_pending(variant));
-
-    let error = runtime.load_model(variant).await.unwrap_err();
-    assert!(
-        matches!(error, Error::ModelLoadError(ref message)
-            if message.contains("Fish Audio Drama 3 is not available on this build yet")),
-        "{error:?}"
-    );
-    assert!(runtime.model_manager.resident_variants().await.is_empty());
-
-    std::fs::remove_dir_all(models_dir).unwrap();
-}
-
 /// Fish Audio Drama 3's retained rows on the CPU: its own capacity (one
 /// row), the four-domain contract through the managed state fit, booked
 /// into the ledger; then one prefill cell and one decode quantum of the

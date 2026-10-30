@@ -293,6 +293,27 @@ pub(crate) fn trained_like_tensors(config: &FishDrama3Config, seed: u64) -> Vec<
         .collect()
 }
 
+/// Marks a synthetic checkpoint that a test loads through the real
+/// lifecycle: the downloader's completeness check, load pricing and the
+/// registry's loader then take it under the synthetic policy, with the stub
+/// codec. Only test builds read it, so a release build never skips the
+/// pinned identity.
+pub(crate) const LIFECYCLE_MARKER: &str = ".izwi-fish-drama3-synthetic";
+
+/// Whether `model_dir` holds a checkpoint marked for the lifecycle.
+pub(crate) fn marked_for_lifecycle(model_dir: &Path) -> bool {
+    model_dir.join(LIFECYCLE_MARKER).is_file()
+}
+
+/// The §10.1 checkpoint written into `dir` (created if missing) with
+/// `seed`'s values: the tensors, index, `config.json` and companion files.
+pub(crate) fn write_checkpoint_at(dir: &Path, seed: u64) {
+    std::fs::create_dir_all(dir).unwrap();
+    let config = trunk_geometry();
+    let tensors = trained_like_tensors(&config, seed);
+    write_checkpoint(dir, &tensors, &trunk_geometry_json());
+}
+
 /// A written §10.1 checkpoint, removed when dropped.
 pub(crate) struct SyntheticCheckpoint {
     pub(crate) dir: TempDir,
