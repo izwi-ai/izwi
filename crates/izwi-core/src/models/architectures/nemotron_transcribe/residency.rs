@@ -133,8 +133,9 @@ mod tests {
         let cpu = residency(&config, None, ResidencyBackend::Cpu, mode);
         let metal = residency(&config, None, ResidencyBackend::Metal, mode);
         let cuda = residency(&config, None, ResidencyBackend::Cuda, mode);
-        // Plan §4.1: about 33.6 GiB as CPU Q8_0 and 31.6 GiB as raw FP8
-        // (without the MTP head, the CTC head priced separately).
+        // About 32.6 GiB as CPU Q8_0; as raw FP8, 30.4 GiB on Metal and
+        // 30.2 GiB on CUDA plus the 0.66 GiB host embedding table (without
+        // the MTP head, the CTC head priced separately).
         assert!(
             (31.0..35.0).contains(&gib(cpu.device_bytes)),
             "{}",

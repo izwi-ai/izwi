@@ -104,7 +104,7 @@ Run `izwi list` to see the enabled catalog. Current families include:
   Chatterbox (English and multilingual), Maya1, Maya 2 Native, LFM2.5
   Audio, and LFM3 Audio.
 - **ASR:** Parakeet, Whisper, Qwen3-ASR, Nemotron 3.5 ASR, Nemotron 3.5
-  Transcribe (experimental), VibeVoice ASR, Granite Speech 4.1, LFM2.5 Audio,
+  Transcribe, VibeVoice ASR, Granite Speech 4.1, LFM2.5 Audio,
   LFM3 Audio, and Voxtral Mini.
 - **Diarization and alignment:** Sortformer and Nemotron 3 diarization, and
   Qwen3 ForcedAligner.

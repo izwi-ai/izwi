@@ -145,8 +145,7 @@ Name it as the diarization `model` and Izwi runs no pipeline. It loads no
 diarizer, ASR or aligner model and runs one transcription with speaker tags
 and word timestamps, up to 60 minutes in one pass.
 
-The model is **experimental**: it has not yet run with its real weights on
-any backend, and it needs about 32 GiB of memory (see
+The model needs about 32 GiB of memory (see
 [Transcription](/features/transcription#nemotron-35-transcribe)). Sortformer
 stays the default diarization model.
 

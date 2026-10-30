@@ -221,8 +221,8 @@ izwi pull <model-name>
 
 ### Nemotron 3.5 Transcribe refused at load: not enough memory
 
-`Nemotron-3.5-Transcribe-30B-A4B-FP8` needs about 31.6 GiB on Metal and CUDA
-and about 33.6 GiB on CPU, plus about 48 MiB per request in flight and its
+`Nemotron-3.5-Transcribe-30B-A4B-FP8` needs about 31 GiB on Metal and CUDA
+and about 33 GiB on CPU, plus about 48 MiB per request in flight and its
 attention KV. Izwi works this out from the model's config and refuses the load
 before reading any weights when the backend's memory budget cannot hold it, so
 the refusal is quick and leaves nothing half-loaded.
@@ -242,8 +242,7 @@ the refusal is quick and leaves nothing half-loaded.
   `IZWI_CUDA_MEMORY_BUDGET_BYTES`, make sure the budget leaves room for the
   model.
 
-The model is experimental: these figures are computed from its published
-configuration and have not yet been measured on a loaded model.
+These figures are computed from the model's published configuration.
 
 ### Model not detected after manual download
 

@@ -564,7 +564,7 @@ without chunks. Its default instruction is the model card's readable-text form
 `timestamp_granularities[]=word` needs no aligner; a translation has no word
 timestamps. `izwi_asr_diagnostics.finish_reason` is `stop`, `length` or
 `repetition` (stopped after repeating itself). It is offline only: the realtime
-WebSocket APIs refuse it. It is experimental; see the
+WebSocket APIs refuse it. Its memory needs and backends are in the
 [support matrix](/support-matrix#nemotron-35-transcribe).
 
 `json` response:

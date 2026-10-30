@@ -2379,8 +2379,8 @@ fn granite_plan(
 /// Granite Speech 5.0 (`granite_speech5/asr/runtime.rs`): 4.1's load shape
 /// over one unsharded checkpoint, with 5.0's own switches.
 /// Nemotron 3.5 Transcribe, priced from its config's census before a weight
-/// is read (`nemotron_transcribe::residency`): about 31.6 GiB as raw FP8 on
-/// Metal and CUDA, 33.6 GiB as CPU Q8_0. The embedding table stays in host
+/// is read (`nemotron_transcribe::residency`): about 31 GiB as raw FP8 on
+/// Metal and CUDA, 33 GiB as CPU Q8_0. The embedding table stays in host
 /// memory (unified on Metal); a load converts one tensor at a time.
 fn nemotron_transcribe_plan(
     model_path: &Path,

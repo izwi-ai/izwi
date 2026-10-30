@@ -115,8 +115,7 @@ izwi transcribe entrevista.mp3 \
   --language es --translate-to en
 ```
 
-`Nemotron-3.5-Transcribe-30B-A4B-FP8` is experimental and needs about 32 GiB of
-memory. It transcribes up to 60 minutes in one pass in 40 languages; without
+`Nemotron-3.5-Transcribe-30B-A4B-FP8` needs about 32 GiB of memory. It transcribes up to 60 minutes in one pass in 40 languages; without
 `--language`, or with `auto`, the model detects the language. It times words
 with its own CTC head, so `--word-timestamps` needs no aligner.
 `--speaker-labels` and `--keyword` cannot be combined with `--translate-to`,
@@ -242,7 +241,7 @@ the words. The `text` field stays untagged.
 | `Granite-Speech-4.1-2B-Plus` | 4.2 GB | Medium | IBM rich transcription model with speaker turns and native word timestamps; unpunctuated |
 | `Granite-Speech-5.0-2B` | 4.6 GB | Medium | IBM ASR with punctuated transcripts, speech translation (`--translate-to`) and keyword biasing (`--keyword`) |
 | `Granite-Speech-5.0-2B-GGUF` | 3.1 GB | Fast | Granite Speech 5.0 with a Q8_0 language model; the faster choice, above all on CPU |
-| `Nemotron-3.5-Transcribe-30B-A4B-FP8` | 34.7 GB | Not yet measured | NVIDIA 30B speech language model: up to 60 minutes in one pass, 40 languages, translation, context terms, speaker labels and its own word timestamps; experimental, needs about 32 GiB of memory |
+| `Nemotron-3.5-Transcribe-30B-A4B-FP8` | 34.7 GB | Not yet measured | NVIDIA 30B speech language model: up to 60 minutes in one pass, 40 languages, translation, context terms, speaker labels and its own word timestamps; needs about 32 GiB of memory |
 | `LFM2.5-Audio-1.5B-GGUF` | 1.2 GB | Medium | Unified audio model with transcription support |
 | `LFM3-Audio-2B-GGUF` | 1.46 GB | Not yet measured | Unified audio model with transcription in 18 languages; `LFM3-Audio-2B-Q8_0-GGUF` (2.20 GB) has a Q8_0 language model |
 | `Voxtral-Mini-4B-Realtime-2602` | 8 GB | Medium | Rust/Candle offline transcription; realtime planned |

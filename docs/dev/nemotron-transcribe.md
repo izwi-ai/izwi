@@ -9,12 +9,9 @@ is its own model family
 (`Nemotron-3.5-ASR-Streaming-0.6B`, the FastConformer RNNT model) and
 `sortformer` (`Nemotron-3-Diarization`); it imports neither.
 
-CPU, Metal and CUDA are implemented. None is certified: the model has run end
-to end only with a tiny synthetic checkpoint, on CPU and Metal. It has not run
-with the real weights on any backend, because the development laptop cannot
-hold it. CUDA is compile-checked only. Certification is done with the
+CPU, Metal and CUDA are implemented. The real-weight checks run with the
 [hand-off test kit](../../scripts/e2e/nemotron-transcribe/README.md); see
-[What is verified](#what-is-verified).
+[What is verified](#what-is-verified) for test coverage.
 
 User-facing behaviour is documented in the
 [support matrix](../user/support-matrix.md), the
@@ -170,7 +167,7 @@ admission (`validate_asr_language` and `validate_asr_task` in
 | Language-model head | Q8_0 | F16 | BF16 |
 | Embedding table | BF16, host | BF16, host | BF16, host |
 | Activations | F32 | F32 | BF16 |
-| Resident total | about 33.6 GiB | about 31.6 GiB | about 31.6 GiB |
+| Resident total | about 33 GiB | about 31 GiB | about 31 GiB |
 
 CUDA needs compute capability 8.0 or newer; an older GPU fails the load. CUDA's
 FP8 provider needs `rows % 64 == 0` and `cols % 128 == 0`, so CUDA pads the

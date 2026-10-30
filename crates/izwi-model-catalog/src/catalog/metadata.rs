@@ -860,8 +860,8 @@ impl ModelVariant {
             // The same weights as 4.1 with a 16k-token decoder context.
             Self::GraniteSpeech502B => 12.0,
             Self::GraniteSpeech502BGguf => 8.0,
-            // About 31.6 GiB resident as raw FP8 on Metal and CUDA, 33.6 GiB
-            // as CPU Q8_0, before rows.
+            // About 31 GiB resident as raw FP8 on Metal and CUDA, 33 GiB as
+            // CPU Q8_0, before rows.
             Self::Nemotron35Transcribe30BA4BFp8 => 36.0,
             // The diarizers and the forced aligner are priced by their
             // residency plans (`asr_memory`); these figures cover the largest

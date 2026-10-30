@@ -200,9 +200,7 @@ transcripts (Granite Speech 4.1 Plus or Nemotron 3.5 Transcribe), and
 It transcribes a recording of up to 60 minutes in one pass, translates,
 takes context terms, labels speakers and times words itself.
 
-It is **experimental** in Izwi: it has not yet run with its real weights on
-any backend (see the [support matrix](/support-matrix#nemotron-35-transcribe)).
-It needs about 31.6 GiB of memory on Metal and CUDA and about 33.6 GiB on CPU;
+It needs about 31 GiB of memory on Metal and CUDA and about 33 GiB on CPU;
 a machine that cannot hold it is refused when the model loads.
 
 ```bash
@@ -343,7 +341,7 @@ model repeated itself and was stopped).
 | `Granite-Speech-4.1-2B-Plus` | 4.2 GB | IBM rich transcription model with speaker-attributed output and native word timestamps; unpunctuated | Medium |
 | `Granite-Speech-5.0-2B` | 4.6 GB | IBM ASR with punctuated transcripts, speech translation and keyword biasing | Medium |
 | `Granite-Speech-5.0-2B-GGUF` | 3.1 GB | Granite Speech 5.0 with a Q8_0 language model; the faster choice, above all on CPU | Fast |
-| `Nemotron-3.5-Transcribe-30B-A4B-FP8` | 34.7 GB | NVIDIA's 30B speech language model: up to 60 minutes in one pass, 40 languages, translation, context terms, speaker labels and its own word timestamps; experimental, needs about 32 GiB of memory | Not yet measured |
+| `Nemotron-3.5-Transcribe-30B-A4B-FP8` | 34.7 GB | NVIDIA's 30B speech language model: up to 60 minutes in one pass, 40 languages, translation, context terms, speaker labels and its own word timestamps; needs about 32 GiB of memory | Not yet measured |
 | `LFM2.5-Audio-1.5B-GGUF` | 1.2 GB | Good integrated speech model | Medium |
 | `LFM3-Audio-2B-GGUF` | 1.46 GB | Integrated speech model in 18 languages; no word timestamps of its own | Not yet measured |
 | `Voxtral-Mini-4B-Realtime-2602` | 8 GB | Rust/Candle offline transcription; realtime planned | Medium |

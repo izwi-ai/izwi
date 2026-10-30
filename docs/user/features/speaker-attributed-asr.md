@@ -36,8 +36,7 @@ If the API request omits `model_id`, the persisted SAA workflow defaults to
 `Granite-Speech-4.1-2B-Plus`. Supplying any other model returns a validation
 error.
 
-`Nemotron-3.5-Transcribe-30B-A4B-FP8` is experimental and needs about 32 GiB of
-memory (see [Transcription](/features/transcription#nemotron-35-transcribe)).
+`Nemotron-3.5-Transcribe-30B-A4B-FP8` needs about 32 GiB of memory (see [Transcription](/features/transcription#nemotron-35-transcribe)).
 It tags speakers as it transcribes, in one pass of up to 60 minutes. Its turns
 are labelled "Speaker 1", "Speaker 2" and so on, and carry start and end times
 when its own word timestamps align. It labels speakers in Arabic, Chinese,

@@ -78,7 +78,7 @@ izwi diarize call.wav --model Nemotron-3.5-Transcribe-30B-A4B-FP8
 words itself, so no diarizer, ASR or aligner model is loaded. Do not pass
 `--asr-model` with it: the server returns `400`. `--num-speakers` can be at
 most 8, and only adds a warning when the model counts a different number. The
-model is experimental and needs about 32 GiB of memory; see
+model needs about 32 GiB of memory; see
 [Single-Model Diarization](/features/diarization#single-model-diarization).
 
 ### Full pipeline with custom models
@@ -152,7 +152,7 @@ SPEAKER_00 [12.30s - 20.00s]: Let's start with the agenda.
 | `sortformer-4spk` | Alias for `diar_streaming_sortformer_4spk-v2.1` |
 | `diar_streaming_sortformer_4spk-v2.1` | Canonical Sortformer model ID (default), up to 4 speakers |
 | `Nemotron-3-Diarization` | NVIDIA Nemotron 3 diarization, up to 8 speakers |
-| `Nemotron-3.5-Transcribe-30B-A4B-FP8` | Diarizes on its own, with no pipeline ASR or aligner; up to 8 speakers; experimental |
+| `Nemotron-3.5-Transcribe-30B-A4B-FP8` | Diarizes on its own, with no pipeline ASR or aligner; up to 8 speakers |
 
 ---
 

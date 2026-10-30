@@ -17,8 +17,8 @@ files. izwi's variant id is `Nemotron-3.5-Transcribe-30B-A4B-FP8`.
 
 ## Hardware
 
-About 31.6 GiB resident on Metal and CUDA (raw FP8), about 33.6 GiB on the
-CPU (FP8 to Q8_0 at load). Machines that cannot fit it are refused before any
+About 31 GiB resident on Metal and CUDA (raw FP8), about 33 GiB on the CPU
+(FP8 to Q8_0 at load). Machines that cannot fit it are refused before any
 weight is read.
 
 | Machine | Fits? | Expected single-request RTF, 1 h of audio | Notes |

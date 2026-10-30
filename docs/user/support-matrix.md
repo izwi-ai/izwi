@@ -97,15 +97,13 @@ and realtime route families. Detailed preview behavior is documented in the
 
 ### Nemotron 3.5 Transcribe
 
-`Nemotron-3.5-Transcribe-30B-A4B-FP8` is experimental and uncertified on every
-backend. It has run end to end only with a tiny synthetic checkpoint, on CPU
-and Metal; it has not yet run with its real weights on any backend.
+`Nemotron-3.5-Transcribe-30B-A4B-FP8` runs on CPU, Metal and CUDA.
 
-| Backend | Status | Resident weights | Activations |
-|---|---|---|---|
-| CPU | Experimental, uncertified | About 33.6 GiB: FP8 linears re-quantized to Q8_0 at load | F32 |
-| Metal | Experimental, uncertified | About 31.6 GiB: raw FP8 | F32 |
-| CUDA (compute capability 8.0+) | Experimental, uncertified; compile-checked only | About 31.6 GiB: raw FP8, padded for the FP8 kernels | BF16 |
+| Backend | Resident weights | Activations |
+|---|---|---|
+| CPU | About 33 GiB: FP8 linears re-quantized to Q8_0 at load | F32 |
+| Metal | About 31 GiB: raw FP8 | F32 |
+| CUDA (compute capability 8.0+) | About 31 GiB: raw FP8; the routed experts stay unpadded, the other FP8 linears are padded for the FP8 kernels | BF16 |
 
 Each request adds about 48 MiB of decoder state plus its attention KV. A load
 that the backend's memory budget cannot hold is refused before any weights are
@@ -114,10 +112,10 @@ as vLLM's W8A8 path does; it is a parity-testing mode, not a speed-up.
 
 | Capability | Status |
 |---|---|
-| Offline transcription, translation, context terms | Experimental, uncertified |
-| Speaker labels and speaker-attributed ASR jobs | Experimental, uncertified |
-| Word timestamps from its own CTC head | Experimental, uncertified |
-| [Single-model diarization](/features/diarization#single-model-diarization) (a diarization job that names it as `model`) | Experimental, uncertified |
+| Offline transcription, translation, context terms | Supported |
+| Speaker labels and speaker-attributed ASR jobs | Supported |
+| Word timestamps from its own CTC head | Supported |
+| [Single-model diarization](/features/diarization#single-model-diarization) (a diarization job that names it as `model`) | Supported |
 | ASR stage of a diarization pipeline | Not supported |
 | Live transcription, voice-mode ASR, audio chat | Not supported (offline model) |
 
@@ -280,7 +278,7 @@ The load path currently publishes ABI-v2 state as follows:
 | **LFM3 Audio** | Speech, transcription and voice-chat replies run as retained rows that batch: each request keeps the language model's attention pages and ShortConv ring in the managed arena between steps, and concurrent requests decode together (two rows at a time on CPU and Metal, the portable width, unless `IZWI_MAX_BATCH_SIZE` sets one), each producing exactly what it produces alone. Audio over 30 s transcribes in clips of at most 30 s, one engine dispatch each. A voice-chat turn's transcript runs as its own transcription row beside the reply. Beyond English, a real-weight check speaks one sentence in French, German, Spanish and Japanese: Whisper Large v3 Turbo transcribes LFM3 Audio's speech exactly in all four (error rate 0.00 on CPU and Metal), LFM3 Audio transcribes its own speech exactly, and it transcribes German, Spanish and Japanese spoken by Qwen3-TTS at 0.00–0.04. French is weaker: where Qwen3-TTS mispronounces a word, LFM3 Audio drifts into English (word error rate 0.50 on Metal). Realtime transcription (LiveASR) streams run as engine realtime sessions: each 0.96 s chunk prefills alone and its text decodes in batches across streams, and a stream continues in 29 s segments that hear the previous one's last 2.88 s again | Verified end to end on real weights on CPU and Metal; CUDA compile-checked only, unverified on hardware |
 | **Whisper, Parakeet, VibeVoice ASR, Granite Speech, Voxtral ASR** | Bounded invocation-scoped physical state; Granite Speech 4.1 publishes both ASR routes; Granite Speech 5.0 leases its 16k-token decoder pages per invocation | ABI-v2 physical ownership; no Optimized attestation |
 | **Nemotron ASR** | Offline bounded invocation state and retained realtime tensor state | ABI-v2 physical ownership; no Optimized attestation |
-| **Nemotron 3.5 Transcribe** | Each request is a retained row: paged KV for the 6 attention layers plus the Mamba2 recurrent and convolution state (about 48 MiB a row) in the managed arena. Prompts prefill in resumable spans (512 tokens on CPU and Metal, 2,048 on CUDA) whether or not chunked prefill is on, so a one-hour recording never holds the device for its whole prefill; decode runs in batches across rows. A single-model diarization job runs as one such row. No prefix reuse | Experimental, uncertified on every backend: verified end to end only with a tiny synthetic checkpoint on CPU and Metal; no real-weight run yet; CUDA compile-checked only |
+| **Nemotron 3.5 Transcribe** | Each request is a retained row: paged KV for the 6 attention layers plus the Mamba2 recurrent and convolution state (about 48 MiB a row) in the managed arena. Prompts prefill in resumable spans (512 tokens on CPU and Metal, 2,048 on CUDA) whether or not chunked prefill is on, so a one-hour recording never holds the device for its whole prefill; decode runs in batches across rows. A single-model diarization job runs as one such row. No prefix reuse | ABI-v2 physical ownership; no Optimized attestation |
 | **VibeVoice, Fish S2, Voxtral TTS** | Bounded invocation-scoped physical state | ABI-v2 physical ownership; no Optimized attestation |
 | **Chatterbox** | Retained paged T3 state (two guidance branches per request, decoded in batches across requests) plus bounded acoustic-stage scratch, run one step at a time so other requests interleave | Portable route validated on CPU and Metal; CUDA is compile-checked only until NVIDIA evidence is retained |
 | **Maya1** | Retained paged decoder state (decoded in batches across requests) plus bounded SNAC-window scratch, one window per step so other requests interleave | Portable route validated on Metal for both releases, with exact solo parity under load; CUDA is compile-checked only |
