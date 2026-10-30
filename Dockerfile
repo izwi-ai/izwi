@@ -18,7 +18,7 @@
 # -----------------------------------------------------------------------------
 # Stage 1: Build the React UI
 # -----------------------------------------------------------------------------
-FROM node:24.22.1-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS ui-builder
+FROM node:26.12.0-trixie-slim@sha256:e556a144463cc8dc53afe8de6d2fa0db5c132fd39ffa232c17641bd40df2bf11 AS ui-builder
 
 WORKDIR /app/ui
 
@@ -84,7 +84,7 @@ RUN --mount=type=cache,id=izwi-cargo-registry,target=/usr/local/cargo/registry,s
 # digest-pinned rust image above rather than fetched with curl | sh; rustup's
 # release binaries run on any glibc distribution.
 # -----------------------------------------------------------------------------
-FROM nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04@sha256:0230b7f243483cb15969fa3cc724a9459599604427052fc2a0d4291c7c0647dd AS rust-builder-cuda
+FROM nvidia/cuda:13.4.3-cudnn-devel-ubuntu24.04@sha256:f2d23b75391766a02175908d3fa1c2afee9849aa13d09326d71649de2b33cfe9 AS rust-builder-cuda
 ARG TARGETARCH
 ARG CUDA_COMPUTE_CAP=80
 ARG IZWI_CUDA_FEATURES=cuda,cudnn
@@ -186,7 +186,7 @@ CMD ["izwi-server"]
 # -----------------------------------------------------------------------------
 # Stage 5: Production runtime with CUDA support (Docker-only CUDA artifact)
 # -----------------------------------------------------------------------------
-FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04@sha256:14f6d08d1cd4a96effbfe3101d0b56326f552c199d05e4979ee0bd616df5811b AS production-cuda
+FROM nvidia/cuda:13.4.3-cudnn-runtime-ubuntu24.04@sha256:534ea2e94fd17f053b4422d094f50a43a7e75a03240c4b89cbe9ad42085ec1c3 AS production-cuda
 
 LABEL org.opencontainers.image.title="Izwi Audio (CUDA)" \
       org.opencontainers.image.description="Rust-native audio inference engine with CUDA support" \
@@ -241,7 +241,7 @@ CMD ["izwi-server"]
 # fleets: the gateway never runs a model. Distroless: no shell or package
 # manager, only glibc, libgcc and CA certificates.
 # -----------------------------------------------------------------------------
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:83b9b50586253821cf63ffcec87d3d94265a093ad30da232039af962dd8f4edf AS production-gateway
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e AS production-gateway
 
 LABEL org.opencontainers.image.title="Izwi Gateway" \
       org.opencontainers.image.description="Izwi public API gateway: OpenAI-compatible routing to approved inference workers" \
