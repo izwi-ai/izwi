@@ -40,6 +40,7 @@ pub mod sampling;
 #[cfg(test)]
 pub(crate) mod synthetic;
 pub mod tokenizer;
+pub mod tower;
 pub mod trunk;
 
 pub use artifacts::{FISH_DRAMA3_REPO, FISH_DRAMA3_REVISION};
@@ -60,6 +61,10 @@ pub use sampling::{
     FishDrama3SamplingParams,
 };
 pub use tokenizer::FishDrama3Tokenizer;
+pub use tower::{
+    FishDrama3Tower, FishDrama3TowerCheckpoint, FishDrama3TowerForcedRow, FishDrama3TowerOptions,
+    FishDrama3TowerStepRow,
+};
 pub use trunk::{
     FishDrama3StepRow, FishDrama3Trunk, FishDrama3TrunkCheckpoint, FishDrama3TrunkOptions,
     FishDrama3TrunkState,

@@ -16,7 +16,9 @@
 use candle_core::Device;
 use serde_json::json;
 
-use super::checkpoint::{expert, trunk_layer, FishDrama3Checkpoint};
+use super::checkpoint::{
+    expert, tower_head, tower_shared_layer, trunk_layer, FishDrama3Checkpoint,
+};
 use super::config::FishDrama3Config;
 use super::linear::{FishDrama3KernelPhase, FishDrama3Linear};
 use super::residency::{
@@ -84,7 +86,8 @@ struct Probe {
 }
 
 /// The first instances of each class: the first layer of the right kind,
-/// and the first and last routed experts of layer 0.
+/// the first and last routed experts of layer 0, the first tower layer and
+/// head.
 fn probes(config: &FishDrama3Config, class: FishDrama3ProjectionClass) -> Result<Vec<Probe>> {
     let t = &config.trunk;
     let h = t.hidden;
@@ -182,6 +185,41 @@ fn probes(config: &FishDrama3Config, class: FishDrama3ProjectionClass) -> Result
             }
             out
         }
+        FishDrama3ProjectionClass::TowerMerge => {
+            let d = config.tower.dim;
+            vec![dense(
+                format!("{}.eh_proj.weight", tower_shared_layer(0)),
+                d,
+                2 * d,
+            )]
+        }
+        FishDrama3ProjectionClass::TowerAttention => {
+            let tower = &config.tower;
+            let x = format!("{}.transformer_layer.attention", tower_shared_layer(0));
+            vec![
+                dense(format!("{x}.wqkv.weight"), tower.wqkv_rows(), tower.dim),
+                dense(
+                    format!("{x}.wo.weight"),
+                    tower.dim,
+                    tower.attention.q_width(),
+                ),
+            ]
+        }
+        FishDrama3ProjectionClass::TowerFeedForward => {
+            let tower = &config.tower;
+            let x = format!("{}.transformer_layer.feed_forward", tower_shared_layer(0));
+            let (d, i) = (tower.dim, tower.intermediate);
+            vec![
+                dense(format!("{x}.w1.weight"), i, d),
+                dense(format!("{x}.w3.weight"), i, d),
+                dense(format!("{x}.w2.weight"), d, i),
+            ]
+        }
+        FishDrama3ProjectionClass::TowerHead => vec![dense(
+            tower_head(0),
+            config.tower.codebook_vocab,
+            config.tower.dim,
+        )],
     })
 }
 
@@ -237,12 +275,14 @@ fn probe_values(
     }
 }
 
-/// The form each projection class loads in on the CPU, and the report.
+/// The form each of `classes` loads in on the CPU (the trunk's or the
+/// tower's, [`FishDrama3ProjectionClass::TRUNK`] / `TOWER`), and the report.
 pub fn decide_cpu_forms(
     checkpoint: &FishDrama3Checkpoint,
     config: &FishDrama3Config,
     precision: FishDrama3CpuPrecision,
     tolerance: f64,
+    classes: &[FishDrama3ProjectionClass],
 ) -> Result<(FishDrama3ClassForms, FishDrama3PrecisionReport)> {
     let mut report = FishDrama3PrecisionReport {
         tolerance,
@@ -253,7 +293,7 @@ pub fn decide_cpu_forms(
         FishDrama3CpuPrecision::Q8_0 => FishDrama3ClassForms::of(FishDrama3Residency::Cpu),
     };
     if precision == FishDrama3CpuPrecision::Q8_0 {
-        for class in FishDrama3ProjectionClass::ALL {
+        for &class in classes {
             let mut worst = 0f64;
             for probe in probes(config, class)? {
                 let values = probe_values(checkpoint, &probe, config.fp8_block)?;
@@ -277,7 +317,10 @@ pub fn decide_cpu_forms(
             }
         }
     }
-    report.forms = forms.iter().collect();
+    report.forms = classes
+        .iter()
+        .map(|&class| (class, forms.form(class)))
+        .collect();
     Ok((forms, report))
 }
 

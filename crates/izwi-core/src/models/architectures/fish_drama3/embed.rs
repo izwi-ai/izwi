@@ -58,8 +58,9 @@ fn load_error(message: impl Into<String>) -> Error {
     Error::ModelLoadError(format!("Fish Audio Drama 3 embedding: {}", message.into()))
 }
 
-/// Rows `rows` of the BF16 matrix `name` (`[.., cols]`), copied out.
-fn bf16_table(
+/// Rows `rows` of the BF16 matrix `name` (`[.., cols]`), copied out (the
+/// tower's embedding tables too).
+pub(crate) fn bf16_table(
     checkpoint: &FishDrama3Checkpoint,
     name: &str,
     shape: [usize; 2],

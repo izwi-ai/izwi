@@ -42,7 +42,9 @@ use super::config::{FishDrama3Config, FishDrama3LayerKind, FishDrama3TrunkConfig
 pub use super::linear::FishDrama3KernelPhase;
 use super::linear::FishDrama3Linear;
 use super::precision::{decide_cpu_forms, FishDrama3PrecisionReport, Q8_0_TOLERANCE};
-use super::residency::{FishDrama3CpuPrecision, FishDrama3Residency, FishDrama3WeightForm};
+use super::residency::{
+    FishDrama3CpuPrecision, FishDrama3ProjectionClass, FishDrama3Residency, FishDrama3WeightForm,
+};
 use crate::error::{Error, Result};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 
@@ -210,6 +212,7 @@ impl FishDrama3Trunk {
             config,
             options.precision,
             options.q8_0_tolerance,
+            &FishDrama3ProjectionClass::TRUNK,
         )?;
         let t = &config.trunk;
         let h = t.hidden;

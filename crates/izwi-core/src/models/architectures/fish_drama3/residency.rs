@@ -7,6 +7,8 @@
 //! | Norm gains, router, shared-expert gate, DeltaNet gates, `A_log`, `dt_bias`, conv | F32 | F32 | F32 |
 //! | Embedding (and the frame codebooks) | BF16 host table, gathered to F32 | — | — |
 //! | Compact main head | F32 | — | — |
+//! | Tower projections and codebook heads (BF16) | Q8_0 | F16 | BF16 |
+//! | Tower code embeddings | BF16 host tables, gathered to F32 | — | — |
 //!
 //! The DeltaNet gate projections `in_proj_a` / `in_proj_b` (32 rows each)
 //! stay F32 beside the router: they feed `exp` and `softplus` decays, and
@@ -73,16 +75,46 @@ pub enum FishDrama3ProjectionClass {
     SharedExpert,
     /// The FP8 routed experts' gate, up and down projections.
     RoutedExpert,
+    /// The tower layers' `eh_proj` merges.
+    TowerMerge,
+    /// The tower layers' `wqkv` and `wo`.
+    TowerAttention,
+    /// The tower layers' `w1`, `w3` and `w2`.
+    TowerFeedForward,
+    /// The tower's codebook heads.
+    TowerHead,
 }
 
 impl FishDrama3ProjectionClass {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 10] = [
         Self::AttentionIn,
         Self::AttentionOut,
         Self::DeltaNetIn,
         Self::DeltaNetOut,
         Self::SharedExpert,
         Self::RoutedExpert,
+        Self::TowerMerge,
+        Self::TowerAttention,
+        Self::TowerFeedForward,
+        Self::TowerHead,
+    ];
+
+    /// The classes a trunk load checks.
+    pub const TRUNK: [Self; 6] = [
+        Self::AttentionIn,
+        Self::AttentionOut,
+        Self::DeltaNetIn,
+        Self::DeltaNetOut,
+        Self::SharedExpert,
+        Self::RoutedExpert,
+    ];
+
+    /// The classes a tower load checks.
+    pub const TOWER: [Self; 4] = [
+        Self::TowerMerge,
+        Self::TowerAttention,
+        Self::TowerFeedForward,
+        Self::TowerHead,
     ];
 
     pub fn name(self) -> &'static str {
@@ -93,6 +125,10 @@ impl FishDrama3ProjectionClass {
             Self::DeltaNetOut => "deltanet_out",
             Self::SharedExpert => "shared_expert",
             Self::RoutedExpert => "routed_expert",
+            Self::TowerMerge => "tower_merge",
+            Self::TowerAttention => "tower_attention",
+            Self::TowerFeedForward => "tower_feed_forward",
+            Self::TowerHead => "tower_head",
         }
     }
 
