@@ -509,14 +509,23 @@ impl RuntimeService {
         }
     }
 
-    /// Content identity of the loaded Fish weights, codec and tokenizer. Native
-    /// loading computes this once; segment admission only clones the small hash.
-    pub async fn fish_s2_artifact_fingerprint(&self) -> Option<String> {
-        self.model_registry
-            .get_fish_s2_tts(ModelVariant::FishAudioS2Pro)
-            .await?
-            .artifact_fingerprint()
-            .map(str::to_owned)
+    /// Content identity of `variant`'s loaded Fish weights, codec and
+    /// tokenizer; `None` when the model publishes none or is not loaded.
+    /// Native loading computes this once; segment admission only clones the
+    /// small hash.
+    pub async fn fish_artifact_fingerprint(&self, variant: ModelVariant) -> Option<String> {
+        if !variant.has_fish_artifact_fingerprint() {
+            return None;
+        }
+        match variant.family() {
+            crate::catalog::ModelFamily::FishS2Tts => self
+                .model_registry
+                .get_fish_s2_tts(variant)
+                .await?
+                .artifact_fingerprint()
+                .map(str::to_owned),
+            _ => None,
+        }
     }
 
     /// Machine-readable diagnostics for the currently loaded direct TTS model.

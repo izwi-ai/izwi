@@ -553,7 +553,7 @@ impl RuntimeService {
         let diagnostics = Some(serde_json::json!({
             "latency_breakdown": output.latency_breakdown,
             "timing_basis": "engine_execution",
-            "token_unit": if resolved_variant == ModelVariant::FishAudioS2Pro {
+            "token_unit": if resolved_variant.uses_fish_dac_codec() {
                 "semantic_frames"
             } else {
                 "model_tokens"
@@ -634,7 +634,7 @@ impl RuntimeService {
         let core_params = core_params_from_generation(&request.config);
         let mut core_request = TtsRuntimeRequest::from_generation(request, resolved_variant)?
             .into_engine_request(core_params);
-        if resolved_variant == ModelVariant::FishAudioS2Pro {
+        if resolved_variant.streams_audio_only() {
             core_request.audio_stream_external_queue_capacity = chunk_tx.max_capacity();
             core_request.mark_audio_streaming_only();
         }

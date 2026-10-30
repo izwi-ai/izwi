@@ -11,6 +11,9 @@ export interface SpeechModelCapabilities {
   supports_streaming: boolean;
   supports_speed_control: boolean;
   supports_auto_long_form: boolean;
+  /** Whether an unfinished text-to-speech record of this model can be played
+   * from its start (Fish S2 Pro journals each segment's audio). */
+  supports_in_progress_replay?: boolean;
   /** Model-specific controls a request may set (Chatterbox). */
   controls?: SpeechControlRange[];
   /** The only languages a request may name, for a model that refuses

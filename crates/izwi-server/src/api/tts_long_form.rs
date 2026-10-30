@@ -292,7 +292,7 @@ pub fn split_tts_text_for_long_form(
         return Vec::new();
     }
 
-    if variant == ModelVariant::FishAudioS2Pro {
+    if variant.plans_own_speech_segments() {
         // Callers accepting work must validate SpeechTextPlan first. This legacy
         // infallible splitter is also used by Studio's text editor.
         return SpeechTextPlan::fish(trimmed, requested_max_tokens)
@@ -337,19 +337,19 @@ pub fn expand_generation_requests_for_long_form(
     variant: ModelVariant,
 ) -> Vec<GenerationRequest> {
     let requested = base_request.config.options.max_tokens;
-    let automatic = requested == 0 && variant != ModelVariant::FishAudioS2Pro;
+    let automatic = requested == 0 && !variant.plans_own_speech_segments();
     let chunks = if automatic && !splits_into_segments(variant, &base_request.text) {
         vec![base_request.text.trim().to_string()]
     } else {
         split_tts_text_for_long_form(variant, requested, base_request.text.as_str())
     };
     let budget_for = |request: &mut GenerationRequest| {
-        if variant == ModelVariant::FishAudioS2Pro || automatic {
+        if variant.plans_own_speech_segments() || automatic {
             if let Some(frames) =
                 crate::api::tts_policy::resolve_tts_output_frames(variant, &request.text, None)
             {
                 request.config.options.max_tokens = frames;
-            } else if variant == ModelVariant::FishAudioS2Pro {
+            } else if variant.plans_own_speech_segments() {
                 request.config.options.max_tokens = 4096;
             }
         }
@@ -357,7 +357,7 @@ pub fn expand_generation_requests_for_long_form(
 
     if chunks.len() <= 1 {
         let mut request = base_request.clone();
-        if variant == ModelVariant::FishAudioS2Pro && request.config.options.max_tokens != 0 {
+        if variant.plans_own_speech_segments() && request.config.options.max_tokens != 0 {
             return vec![request];
         }
         budget_for(&mut request);
@@ -386,7 +386,7 @@ pub(crate) fn defer_automatic_budget_to_long_form(
     explicit_frames: Option<usize>,
 ) {
     if explicit_frames.unwrap_or(0) == 0
-        && variant != ModelVariant::FishAudioS2Pro
+        && !variant.plans_own_speech_segments()
         && splits_into_segments(variant, &request.text)
     {
         request.config.options.max_tokens = 0;
@@ -674,7 +674,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
     let progress_error = |error: anyhow::Error| izwi_core::Error::InferenceError(error.to_string());
     let expected_fingerprint = state
         .runtime
-        .fish_s2_artifact_fingerprint()
+        .fish_artifact_fingerprint(variant)
         .await
         .ok_or_else(|| {
             izwi_core::Error::ModelLoadError("Fish model fingerprint unavailable".into())
@@ -744,7 +744,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
         }
         if state
             .runtime
-            .fish_s2_artifact_fingerprint()
+            .fish_artifact_fingerprint(variant)
             .await
             .as_deref()
             != Some(expected_fingerprint.as_str())

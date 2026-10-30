@@ -354,6 +354,11 @@ export function TextToSpeechPage({
     };
   }, [record, recordId, streamingRecord]);
 
+  // The server names the models whose records journal their audio as it is
+  // generated, so an unfinished record can be played from its start.
+  const visibleRecordReplaysInProgress =
+    models.find((model) => model.variant === visibleRecord?.model_id)
+      ?.speech_capabilities?.supports_in_progress_replay === true;
 
   const visibleVoiceLabel = useMemo(
     () =>
@@ -455,7 +460,7 @@ export function TextToSpeechPage({
         </div>
       )}
       {playback.error && <p role="alert" className="text-sm text-destructive">{playback.error}</p>}
-      {playback.status === "idle" && visibleRecord?.model_id === "FishAudio-S2-Pro" &&
+      {playback.status === "idle" && visibleRecord && visibleRecordReplaysInProgress &&
         (visibleRecord.processing_status === "pending" || visibleRecord.processing_status === "processing") && (
         <Button variant="outline" onClick={() => { void playback.listen(visibleRecord).catch(() => {}); }}>
           Listen from beginning

@@ -141,6 +141,12 @@ pub struct AdminSpeechModelCapabilities {
     pub streaming_mode: Option<&'static str>,
     pub supports_speed_control: bool,
     pub supports_auto_long_form: bool,
+    /// Whether an unfinished text-to-speech record of this model can be
+    /// played from its start (`GET /v1/text-to-speech/{record_id}/events`):
+    /// the server plans the model's speech segments and journals each
+    /// segment's audio as it is generated.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub supports_in_progress_replay: bool,
     /// Model-specific controls a speech request may set, each with its
     /// range and the model's default (Chatterbox: `exaggeration`,
     /// `cfg_weight`, `min_p`).
@@ -323,6 +329,7 @@ impl AdminModelInfo {
                     .with_controls(variant)
                     .with_languages(variant)
                     .with_inline_tags(variant)
+                    .with_in_progress_replay(variant)
             }),
             cuda_support: serde_json::to_value(info.cuda_support)
                 .unwrap_or(serde_json::Value::Null),
@@ -398,6 +405,7 @@ impl From<SpeechModelCapabilities> for AdminSpeechModelCapabilities {
             streaming_mode: None,
             supports_speed_control: capabilities.supports_speed_control,
             supports_auto_long_form: capabilities.supports_auto_long_form,
+            supports_in_progress_replay: false,
             controls: Vec::new(),
             languages: Vec::new(),
             default_language: None,
@@ -427,6 +435,11 @@ impl AdminSpeechModelCapabilities {
     fn with_inline_tags(mut self, variant: ModelVariant) -> Self {
         self.inline_tags = variant.speech_inline_tags().to_vec();
         self.inline_tags_strict = variant.refuses_unknown_inline_tags();
+        self
+    }
+
+    fn with_in_progress_replay(mut self, variant: ModelVariant) -> Self {
+        self.supports_in_progress_replay = variant.plans_own_speech_segments();
         self
     }
 
@@ -1404,6 +1417,28 @@ mod tests {
             true
         );
         assert!(maya2["default_language"].is_null());
+    }
+
+    /// Only a model whose records journal their audio (Fish S2 Pro) offers
+    /// to play an unfinished record from its start.
+    #[test]
+    fn speech_capabilities_offer_in_progress_replay_for_planned_segments() {
+        let replay = |variant: ModelVariant| {
+            let model = AdminModelInfo::from_model_info(ModelInfo::new(variant), None, false);
+            serde_json::to_value(model).expect("serialize admin model")["speech_capabilities"]
+                ["supports_in_progress_replay"]
+                .clone()
+        };
+        assert_eq!(replay(ModelVariant::FishAudioS2Pro), true);
+        for variant in [
+            ModelVariant::Qwen3Tts12Hz06BBase,
+            ModelVariant::Kokoro82M,
+            ModelVariant::VibeVoice15BTts,
+            ModelVariant::Chatterbox500M,
+            ModelVariant::Maya2Native25B,
+        ] {
+            assert!(replay(variant).is_null(), "{variant}");
+        }
     }
 
     /// LFM3 Audio lists its 19 locales and names American English as the

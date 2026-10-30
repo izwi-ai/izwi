@@ -13,7 +13,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AppLayout } from "@/app/layouts/AppLayout";
 import { NotificationProvider } from "@/app/providers/NotificationProvider";
 import { TextToSpeechPage } from "./route";
-import type { SpeechHistoryRecordStreamCallbacks } from "@/api";
+import type { ModelInfo, SpeechHistoryRecordStreamCallbacks } from "@/api";
 
 const apiMocks = vi.hoisted(() => ({
   listTextToSpeechRecords: vi.fn(),
@@ -93,7 +93,7 @@ vi.mock("@/features/models/components/RouteModelModal", () => ({
 }));
 
 const baseProps = {
-  models: [],
+  models: [] as ModelInfo[],
   selectedModel: null,
   loading: false,
   downloadProgress: {},
@@ -181,6 +181,27 @@ function buildSpeechCapabilities(overrides: Partial<Record<string, boolean>> = {
     supports_speed_control: true,
     supports_auto_long_form: false,
     ...overrides,
+  };
+}
+
+function buildFishModel(supportsInProgressReplay: boolean): ModelInfo {
+  return {
+    variant: "FishAudio-S2-Pro",
+    status: "ready",
+    local_path: null,
+    size_bytes: null,
+    download_progress: null,
+    error_message: null,
+    speech_capabilities: {
+      supports_builtin_voices: false,
+      built_in_voice_count: null,
+      supports_reference_voice: true,
+      supports_voice_description: false,
+      supports_streaming: true,
+      supports_speed_control: false,
+      supports_auto_long_form: true,
+      ...(supportsInProgressReplay ? { supports_in_progress_replay: true } : {}),
+    },
   };
 }
 
@@ -1050,7 +1071,7 @@ describe("TextToSpeechPage", () => {
       callbacks.onCreated?.(record);
       return controller;
     });
-    renderRoute("/text-to-speech/existing-fish", {}, true);
+    renderRoute("/text-to-speech/existing-fish", { models: [buildFishModel(true)] }, true);
     const listen = await screen.findByRole("button", { name: "Listen from beginning" });
     expect(apiMocks.attachTextToSpeechRecordStream).not.toHaveBeenCalled();
     fireEvent.click(listen);
@@ -1064,6 +1085,16 @@ describe("TextToSpeechPage", () => {
     fireEvent.click(within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByRole("link", { name: "Text to Speech" }));
     expect(controller.signal.aborted).toBe(true);
     expect(apiMocks.cancelTextToSpeechRecord).not.toHaveBeenCalled();
+  });
+
+  it("offers no replay from the beginning for a model the server does not mark replayable", async () => {
+    apiMocks.getTextToSpeechRecord.mockResolvedValue(
+      buildRecord({ id: "existing-fish", model_id: "FishAudio-S2-Pro", processing_status: "processing" }),
+    );
+    renderRoute("/text-to-speech/existing-fish", { models: [buildFishModel(false)] });
+    expect(await screen.findByTitle("Voice")).toHaveTextContent("Vivian");
+    expect(screen.queryByRole("button", { name: "Listen from beginning" })).not.toBeInTheDocument();
+    expect(apiMocks.attachTextToSpeechRecordStream).not.toHaveBeenCalled();
   });
 
   it.each([

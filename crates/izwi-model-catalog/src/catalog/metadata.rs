@@ -1137,6 +1137,40 @@ impl ModelVariant {
         )
     }
 
+    /// Whether this model speaks through the Fish DAC codec: one semantic
+    /// frame is 2,048 PCM samples, decoded by the batched codec stage. Its
+    /// output reservations, codec workspace and PCM length checks count
+    /// codec frames, and its speech diagnostics report `semantic_frames` as
+    /// the token unit.
+    pub fn uses_fish_dac_codec(&self) -> bool {
+        matches!(self.family(), crate::catalog::ModelFamily::FishS2Tts)
+    }
+
+    /// Whether the server plans this model's speech segments itself
+    /// (`SpeechTextPlan`) instead of using the shared long-form splitter.
+    /// Every speech route runs the text as one segment plan: each segment
+    /// takes its own budget and workload permit, a client's `max_tokens`
+    /// bounds the whole plan, and a speech record journals its audio so an
+    /// unfinished take can be replayed from the start.
+    pub fn plans_own_speech_segments(&self) -> bool {
+        matches!(self.family(), crate::catalog::ModelFamily::FishS2Tts)
+    }
+
+    /// Whether a streamed request of this model delivers its audio only as
+    /// stream chunks: the engine keeps no terminal copy of the PCM, and the
+    /// stream's queue capacity is frozen before admission so its output
+    /// memory is priced from that queue.
+    pub fn streams_audio_only(&self) -> bool {
+        matches!(self.family(), crate::catalog::ModelFamily::FishS2Tts)
+    }
+
+    /// Whether the loaded model publishes a content fingerprint of its
+    /// weights, codec and tokenizer. A durable speech checkpoint records it,
+    /// and a segment plan refuses to continue or recover once it changes.
+    pub fn has_fish_artifact_fingerprint(&self) -> bool {
+        matches!(self.family(), crate::catalog::ModelFamily::FishS2Tts)
+    }
+
     pub fn speech_capabilities(&self) -> Option<SpeechModelCapabilities> {
         let capabilities = match self {
             Self::Qwen3Tts12Hz06BBase
@@ -2268,6 +2302,45 @@ mod tests {
                 supports_auto_long_form: true,
             })
         );
+    }
+
+    /// The Fish product path (codec stage, own segment plans, audio-only
+    /// streams, artifact fingerprints) is Fish S2 Pro's alone today.
+    #[test]
+    fn fish_product_path_predicates_select_only_fish_s2_pro() {
+        let fish = ModelVariant::FishAudioS2Pro;
+        assert!(fish.uses_fish_dac_codec());
+        assert!(fish.plans_own_speech_segments());
+        assert!(fish.streams_audio_only());
+        assert!(fish.has_fish_artifact_fingerprint());
+        for variant in [
+            ModelVariant::Qwen3Tts12Hz06BBase,
+            ModelVariant::Qwen3Tts12Hz17BCustomVoice,
+            ModelVariant::Kokoro82M,
+            ModelVariant::Voxtral4BTts2603,
+            ModelVariant::VibeVoice15BTts,
+            ModelVariant::Chatterbox500M,
+            ModelVariant::Maya13B,
+            ModelVariant::Maya2Native25B,
+            ModelVariant::Lfm25Audio15BGguf,
+            ModelVariant::Lfm3Audio2BGguf,
+        ] {
+            assert!(!variant.uses_fish_dac_codec(), "{variant}");
+            assert!(!variant.plans_own_speech_segments(), "{variant}");
+            assert!(!variant.streams_audio_only(), "{variant}");
+            assert!(!variant.has_fish_artifact_fingerprint(), "{variant}");
+        }
+        for variant in ModelVariant::all() {
+            let is_fish = *variant == fish;
+            assert_eq!(variant.uses_fish_dac_codec(), is_fish, "{variant}");
+            assert_eq!(variant.plans_own_speech_segments(), is_fish, "{variant}");
+            assert_eq!(variant.streams_audio_only(), is_fish, "{variant}");
+            assert_eq!(
+                variant.has_fish_artifact_fingerprint(),
+                is_fish,
+                "{variant}"
+            );
+        }
     }
 
     #[test]

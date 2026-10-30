@@ -119,7 +119,7 @@ async fn fish_s2_load_publishes_and_seals_both_tts_capabilities() {
     draft.seal_fish_capacity(capacity.clone()).unwrap();
     let publications = runtime
         .model_lifecycle
-        .load_fish_s2_state_publications(instance, &draft, 32, &capacity, |graphs| {
+        .load_fish_s2_state_publications(variant, instance, &draft, 32, &capacity, |graphs| {
             fish_s2_physical_state_spec(&config, candle_core::DType::F32, graphs)
         })
         .await

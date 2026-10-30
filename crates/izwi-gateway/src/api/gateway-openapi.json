@@ -614,6 +614,10 @@
           "supports_builtin_voices": {
             "type": "boolean"
           },
+          "supports_in_progress_replay": {
+            "description": "Whether an unfinished text-to-speech record of this model can be\nplayed from its start (`GET /v1/text-to-speech/{record_id}/events`):\nthe server plans the model's speech segments and journals each\nsegment's audio as it is generated.",
+            "type": "boolean"
+          },
           "supports_reference_voice": {
             "type": "boolean"
           },

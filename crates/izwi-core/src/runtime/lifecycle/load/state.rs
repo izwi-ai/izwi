@@ -1491,7 +1491,7 @@ impl ModelLifecycleController {
             tracing::info!(?capacity, ?backend, "Sealing Fish serving capacity; device throughput qualification is separate");
             bundle_draft.seal_fish_capacity(capacity.clone())?;
             state_publications.extend(self.load_fish_s2_state_publications(
-                model_instance_id, bundle_draft,
+                variant, model_instance_id, bundle_draft,
                 self.config.max_sequence_length.explicit_tokens().unwrap_or(model.config().max_seq_len).min(model.config().max_seq_len),
                 &capacity,
                 |graphs| model.physical_state_spec(graphs),

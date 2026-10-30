@@ -205,7 +205,7 @@ pub(super) async fn synthesize_fish_record(
         state.runtime.load_model(variant).await?;
         let artifact_fingerprint = state
             .runtime
-            .fish_s2_artifact_fingerprint()
+            .fish_artifact_fingerprint(variant)
             .await
             .context("Fish model did not publish an artifact fingerprint")?;
         let mut progress = if let Some(attempt) = attempt {

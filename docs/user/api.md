@@ -1330,6 +1330,10 @@ Speech model capabilities, when present:
 }
 ```
 
+A model whose text-to-speech records journal their audio as it is generated
+(Fish S2 Pro) also reports `"supports_in_progress_replay": true`: an unfinished
+record of it can be played from its start.
+
 Model records also expose route and batch capability flags so clients can discover which models can drive OpenAI-compatible speech, persisted speech-to-text jobs, diarization records, Studio projects, realtime voice sessions, saved voices, forced alignment, tokenizer workflows, and durable ASR/TTS jobs:
 
 ```json

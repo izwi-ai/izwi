@@ -343,7 +343,9 @@ impl EngineCore {
         // a bound batchable stage, so derive this workspace from the sealed
         // generation geometry only after the execution plan has its binding.
         if request.task_type == super::super::TaskType::TTS
-            && request.model_variant == Some(ModelVariant::FishAudioS2Pro)
+            && request
+                .model_variant
+                .is_some_and(|variant| variant.uses_fish_dac_codec())
             && matches!(
                 work,
                 WorkUnit::SequenceFinalize { .. } | WorkUnit::SequenceAudioDecode { .. }

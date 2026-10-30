@@ -291,7 +291,9 @@ impl RuntimeService {
             spec.resources = spec.resources.checked_add(output)?;
         }
         if request.task_type == TaskType::TTS
-            && request.model_variant == Some(ModelVariant::FishAudioS2Pro)
+            && request
+                .model_variant
+                .is_some_and(|variant| variant.uses_fish_dac_codec())
         {
             let frames = request
                 .params
@@ -747,7 +749,10 @@ impl RuntimeService {
         Fut: Future<Output = Result<()>>,
     {
         request.streaming = true;
-        if request.model_variant == Some(ModelVariant::FishAudioS2Pro) {
+        if request
+            .model_variant
+            .is_some_and(|variant| variant.streams_audio_only())
+        {
             request.mark_audio_streaming_only();
         }
         if request.workload_class == WorkloadClass::Online {
@@ -812,7 +817,9 @@ impl RuntimeService {
             ));
         }
         request.runtime_admitted_at = Some(job.admitted_at());
-        if request.model_variant == Some(ModelVariant::FishAudioS2Pro)
+        if request
+            .model_variant
+            .is_some_and(|variant| variant.streams_audio_only())
             && (request.collect_audio_samples
                 || request.audio_stream_engine_queue_capacity.is_none())
         {

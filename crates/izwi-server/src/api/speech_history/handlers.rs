@@ -848,7 +848,7 @@ async fn create_record(
     let variant = parse_tts_model_variant(model_id.as_str())
         .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {err}")))?;
 
-    if variant == ModelVariant::FishAudioS2Pro {
+    if variant.plans_own_speech_segments() {
         crate::api::tts_long_form::SpeechTextPlan::fish(
             &input_text,
             req.max_output_tokens.or(req.max_tokens).unwrap_or(0),
@@ -941,7 +941,7 @@ async fn create_record(
             }
         };
 
-        if req.stream.unwrap_or(false) && variant != ModelVariant::FishAudioS2Pro {
+        if req.stream.unwrap_or(false) && !variant.plans_own_speech_segments() {
             return stream_record_creation(
                 state,
                 ctx,
@@ -1878,7 +1878,7 @@ async fn synthesize_record_internal(
     ),
     ApiError,
 > {
-    if variant == ModelVariant::FishAudioS2Pro {
+    if variant.plans_own_speech_segments() {
         return durable::synthesize_fish_record(
             state,
             ctx,
@@ -2076,7 +2076,7 @@ async fn stream_record_creation(
         variant,
         req.max_output_tokens.or(req.max_tokens),
     );
-    let planned_count = if variant == ModelVariant::FishAudioS2Pro {
+    let planned_count = if variant.plans_own_speech_segments() {
         crate::api::tts_long_form::SpeechTextPlan::fish(
             &generation_request.text,
             generation_request.config.options.max_tokens,
@@ -2087,7 +2087,7 @@ async fn stream_record_creation(
     } else {
         expand_generation_requests_for_long_form(&generation_request, variant).len()
     };
-    let mut planned_requests = if variant == ModelVariant::FishAudioS2Pro {
+    let mut planned_requests = if variant.plans_own_speech_segments() {
         vec![generation_request.clone()]
     } else {
         expand_generation_requests_for_long_form(&generation_request, variant)
@@ -2221,7 +2221,7 @@ async fn stream_record_creation(
             )
             .await;
 
-        let _permit = if variant == ModelVariant::FishAudioS2Pro {
+        let _permit = if variant.plans_own_speech_segments() {
             drop(permit);
             None
         } else {
@@ -2257,7 +2257,7 @@ async fn stream_record_creation(
             let runner_state = admission_state.clone();
             // Aborting this stream task (cancel) must stop the model too.
             let mut generation_task = AbortOnDrop(tokio::spawn(async move {
-                if variant == ModelVariant::FishAudioS2Pro {
+                if variant.plans_own_speech_segments() {
                     crate::api::tts_long_form::generate_speech_plan_stream(
                         &runner_state,
                         variant,
@@ -2527,7 +2527,7 @@ async fn stream_record_creation(
                                             .map(|ms| ms / 1000.0 / f64::from(audio_duration_secs)),
                                         "split_request_count": split_request_count,
                                         "pcm_sample_count": total_samples,
-                                        "token_unit": if model_id == "FishAudio-S2-Pro" { "semantic_frames" } else { "model_tokens" },
+                                        "token_unit": if variant.uses_fish_dac_codec() { "semantic_frames" } else { "model_tokens" },
                                     })),
                                     request_id: Some(stream_request_id.clone()),
                                     sequence: None,
@@ -2687,7 +2687,7 @@ fn build_generation_request(
         &text,
         req.max_output_tokens.or(req.max_tokens),
     ) {
-        generation_config.options.max_tokens = if variant == ModelVariant::FishAudioS2Pro {
+        generation_config.options.max_tokens = if variant.plans_own_speech_segments() {
             req.max_output_tokens.or(req.max_tokens).unwrap_or(0)
         } else {
             max_tokens

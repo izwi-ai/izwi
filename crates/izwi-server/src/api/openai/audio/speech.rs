@@ -212,8 +212,16 @@ pub async fn speech(
         .await;
     }
 
-    if variant == ModelVariant::FishAudioS2Pro {
-        return fish_file_speech(state, req, ctx.correlation_id, tenant_key, resolved_format).await;
+    if variant.plans_own_speech_segments() {
+        return fish_file_speech(
+            state,
+            req,
+            ctx.correlation_id,
+            tenant_key,
+            variant,
+            resolved_format,
+        )
+        .await;
     }
 
     let permit = state
@@ -323,11 +331,11 @@ async fn fish_file_speech(
     req: SpeechRequest,
     correlation_id: String,
     tenant_key: Option<[u8; 32]>,
+    variant: ModelVariant,
     resolved_format: ResolvedSpeechFormat,
 ) -> Result<Response<Body>, ApiError> {
     use crate::speech_history_store::SpeechWavSpool;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-    let variant = ModelVariant::FishAudioS2Pro;
     let mut request = build_generation_request(&req, correlation_id, true, variant);
     request.runtime_context.tenant_key = tenant_key;
     // Validate admission before model load or output allocation.
@@ -586,7 +594,7 @@ async fn stream_speech(
         variant,
         req.max_output_tokens.or(req.max_tokens),
     );
-    let planned_segment_count = if variant == ModelVariant::FishAudioS2Pro {
+    let planned_segment_count = if variant.plans_own_speech_segments() {
         crate::api::tts_long_form::SpeechTextPlan::fish(
             &req.input,
             gen_request.config.options.max_tokens,
@@ -667,7 +675,7 @@ async fn stream_speech(
         let fallback_sample_rate = engine.sample_rate().await;
         let (chunk_tx, mut chunk_rx) = mpsc::channel::<AudioChunk>(32);
         let generation_engine = engine.clone();
-        let retained_permit = if variant == ModelVariant::FishAudioS2Pro {
+        let retained_permit = if variant.plans_own_speech_segments() {
             drop(permit);
             None
         } else {
@@ -675,7 +683,7 @@ async fn stream_speech(
         };
         let generation_task = tokio::spawn(async move {
             let _permit = retained_permit;
-            if variant == ModelVariant::FishAudioS2Pro {
+            if variant.plans_own_speech_segments() {
                 crate::api::tts_long_form::generate_speech_plan_stream(
                     &admission_state,
                     variant,
@@ -844,7 +852,7 @@ async fn stream_speech(
                         "request_to_last_pcm_rtf": last_pcm_ms.filter(|_| audio_duration_secs > 0.0)
                             .map(|ms| ms / 1000.0 / f64::from(audio_duration_secs)),
                         "pcm_sample_count": total_samples,
-                        "token_unit": if variant == ModelVariant::FishAudioS2Pro { "semantic_frames" } else { "model_tokens" },
+                        "token_unit": if variant.uses_fish_dac_codec() { "semantic_frames" } else { "model_tokens" },
                         "planned_segment_count": planned_segment_count,
                     })),
                     request_id: Some(stream_request_id.clone()),
@@ -967,7 +975,7 @@ fn build_generation_request(
         &req.input,
         req.max_output_tokens.or(req.max_tokens),
     ) {
-        gen_config.options.max_tokens = if variant == ModelVariant::FishAudioS2Pro {
+        gen_config.options.max_tokens = if variant.plans_own_speech_segments() {
             req.max_output_tokens.or(req.max_tokens).unwrap_or(0)
         } else {
             max_tokens
