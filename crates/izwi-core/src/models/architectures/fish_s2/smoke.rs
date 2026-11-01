@@ -46,6 +46,10 @@ fn fish_s2_real_artifacts_load_native_modules() -> Result<()> {
 #[ignore = "requires local fishaudio/s2-pro artifacts and sufficient backend memory"]
 async fn fish_s2_real_model_smoke_generates_finite_audio() -> Result<()> {
     let variant = ModelVariant::FishAudioS2Pro;
+    #[cfg(feature = "metal")]
+    let _lease = crate::backends::metal_test_device_or_skip(
+        "fish_s2_real_model_smoke_generates_finite_audio",
+    );
     let model_dir = required_env_path("IZWI_FISH_S2_MODEL_DIR")?;
     if model_dir.file_name().and_then(|name| name.to_str()) != Some(variant.dir_name()) {
         return Err(Error::InvalidInput(format!(
