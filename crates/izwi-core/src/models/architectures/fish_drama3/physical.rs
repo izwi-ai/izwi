@@ -78,9 +78,9 @@ fn as_u32(value: usize, what: &str) -> Result<u32> {
     u32::try_from(value).map_err(|_| contract_error(format!("{what} exceeds u32")))
 }
 
-/// The paged KV dtype on `backend` (§6): F32 on the CPU, F16 on Metal (its
-/// F32 fallback after a failed self-check is Phase 3's), BF16 on CUDA. Only
-/// the CPU loads today; the other two price admission.
+/// The paged KV dtype a load on `backend` plans (§6): F32 on the CPU, F16
+/// on Metal, BF16 on CUDA (priced, not loaded yet). A Metal load whose
+/// self-check breached stores F32 instead (`FishDrama3Model::kv_dtype`).
 pub fn kv_dtype(backend: BackendKind) -> DType {
     match backend {
         BackendKind::Cpu => DType::F32,

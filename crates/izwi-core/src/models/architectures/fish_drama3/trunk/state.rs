@@ -112,6 +112,22 @@ impl FishDrama3ConvRing {
         Ok(())
     }
 
+    /// The three columns oldest first, as the fused conv kernel reads them.
+    pub(crate) fn columns(&self) -> Result<[&Tensor; 3]> {
+        let columns = self.ordered().collect::<Vec<_>>();
+        columns
+            .try_into()
+            .map_err(|_| state_error("the fused conv reads a three-column history"))
+    }
+
+    /// Replaces the history with `history` `[columns, channels]` F32 on the
+    /// device, oldest first (the fused conv kernel's next history).
+    pub(crate) fn set_history(&mut self, history: &Tensor) -> Result<()> {
+        let channels = self.slots.first().map_or(0, Tensor::elem_count);
+        *self = Self::from_history(history, self.slots.len(), channels)?;
+        Ok(())
+    }
+
     /// Replaces the history with `columns` (`[columns, channels]` host values,
     /// oldest first).
     pub(crate) fn replace(
@@ -147,6 +163,25 @@ impl FishDrama3LinearState {
             .flatten_all()?
             .to_device(&Device::Cpu)?
             .to_vec1::<f32>()?)
+    }
+
+    /// `[value_heads, key_dim, value_dim]` F32.
+    pub(crate) fn recurrent(&self) -> &Tensor {
+        &self.recurrent
+    }
+
+    /// Installs the next recurrent state, a device tensor of the same shape.
+    pub(crate) fn set_recurrent_tensor(&mut self, next: Tensor) -> Result<()> {
+        if next.dims() != self.recurrent.dims() || next.dtype() != DType::F32 {
+            return Err(state_error(format!(
+                "a recurrent state of {:?} {:?} replaces one of {:?}",
+                next.dims(),
+                next.dtype(),
+                self.recurrent.dims()
+            )));
+        }
+        self.recurrent = next;
+        Ok(())
     }
 
     pub(crate) fn set_recurrent(

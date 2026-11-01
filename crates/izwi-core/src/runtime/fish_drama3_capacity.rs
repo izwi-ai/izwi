@@ -81,12 +81,46 @@ pub(crate) fn decode_width(backend: BackendKind, native_batching: bool) -> usize
     }
 }
 
-/// The load's prefill grid cell on `backend`.
-pub(crate) fn prefill_span_rows(backend: BackendKind) -> usize {
+/// The backend's own prefill grid cell.
+pub(crate) fn default_prefill_span_rows(backend: BackendKind) -> usize {
     match backend {
         BackendKind::Cpu | BackendKind::Metal => DEFAULT_PREFILL_SPAN_ROWS,
         BackendKind::Cuda => CUDA_PREFILL_SPAN_ROWS,
     }
+}
+
+/// The load's prefill grid cell on `backend`: `IZWI_FISH_DRAMA3_PREFILL_SPAN`
+/// (which the load reads too, so admission and the model agree), else the
+/// backend's.
+pub(crate) fn prefill_span_rows(backend: BackendKind) -> Result<usize> {
+    crate::models::architectures::fish_drama3::model::prefill_span_rows(
+        std::env::var(crate::models::architectures::fish_drama3::model::PREFILL_SPAN_ENV)
+            .ok()
+            .as_deref(),
+        default_prefill_span_rows(backend),
+    )
+}
+
+/// The paged KV dtype a load on `backend` plans before its weights exist:
+/// the backend's (§6), or F32 under `IZWI_FISH_DRAMA3_DTYPE=f32`. A loaded
+/// model reports its own ([`ResolvedFishDrama3Capacity::resolve_loaded`]),
+/// which its self-check may have moved to F32.
+pub(crate) fn planned_kv_dtype(backend: BackendKind) -> Result<DType> {
+    use crate::models::architectures::fish_drama3::precision::{activation_dtype, DTYPE_ENV};
+    use crate::models::architectures::fish_drama3::FishDrama3Residency;
+    let residency = match backend {
+        BackendKind::Cpu => FishDrama3Residency::Cpu,
+        BackendKind::Metal => FishDrama3Residency::Metal,
+        BackendKind::Cuda => FishDrama3Residency::Cuda,
+    };
+    let activations = activation_dtype(residency, std::env::var(DTYPE_ENV).ok().as_deref())?;
+    Ok(
+        if residency == FishDrama3Residency::Metal && activations == DType::F32 {
+            DType::F32
+        } else {
+            kv_dtype(backend)
+        },
+    )
 }
 
 /// What one retained row holds and uses.
@@ -223,13 +257,62 @@ impl ResolvedFishDrama3Capacity {
         safety_reserve_bytes: u64,
         native_batching: bool,
     ) -> Result<Self> {
+        Self::resolve_with(
+            config,
+            backend,
+            planned_kv_dtype(backend)?,
+            prefill_span_rows(backend)?,
+            context_tokens,
+            ceilings,
+            headroom,
+            safety_reserve_bytes,
+            native_batching,
+        )
+    }
+
+    /// [`Self::resolve`] for a loaded `model`: its own paged KV dtype (F32
+    /// after a breached Metal self-check) and prefill cell.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolve_loaded(
+        model: &crate::models::architectures::fish_drama3::FishDrama3Model,
+        backend: BackendKind,
+        context_tokens: Option<usize>,
+        ceilings: FishDrama3RowCeilings,
+        headroom: Option<u64>,
+        safety_reserve_bytes: u64,
+        native_batching: bool,
+    ) -> Result<Self> {
+        Self::resolve_with(
+            model.config(),
+            backend,
+            model.kv_dtype(),
+            model.prefill_span_rows(),
+            context_tokens,
+            ceilings,
+            headroom,
+            safety_reserve_bytes,
+            native_batching,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_with(
+        config: &FishDrama3Config,
+        backend: BackendKind,
+        kv: DType,
+        span_rows: usize,
+        context_tokens: Option<usize>,
+        ceilings: FishDrama3RowCeilings,
+        headroom: Option<u64>,
+        safety_reserve_bytes: u64,
+        native_batching: bool,
+    ) -> Result<Self> {
         let positions = context_tokens
             .unwrap_or(STATE_CONTEXT_TOKENS)
             .clamp(1, STATE_CONTEXT_TOKENS);
         let prompt_rows = positions.min(MAX_PROMPT_ROWS);
         let frames = positions - prompt_rows;
-        let workspace = FishDrama3Workspace::of(config, prefill_span_rows(backend))?;
-        let kv = kv_dtype(backend);
+        let workspace = FishDrama3Workspace::of(config, span_rows)?;
         let row = FishDrama3RowCost::of(config, kv, prompt_rows, frames, &workspace)?;
         let row_bytes = row.total()?;
         let preparation_bytes = reference_preparation_bytes()?;

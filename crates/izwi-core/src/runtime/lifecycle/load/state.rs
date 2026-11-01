@@ -1615,8 +1615,8 @@ impl ModelLifecycleController {
             .explicit_tokens()
             .unwrap_or(model.max_positions())
             .min(model.max_positions());
-        ResolvedFishDrama3Capacity::resolve(
-            model.config(),
+        ResolvedFishDrama3Capacity::resolve_loaded(
+            model,
             backend,
             Some(context),
             FishDrama3RowCeilings {

@@ -14,12 +14,14 @@
 //! and codebook 0 is never read, so it is not loaded. Codes are clamped to
 //! `[0, V - 1]` before a lookup.
 //!
-//! Both tables stay BF16 on the host (D4) and are gathered to F32 per row,
-//! so they cost no device memory.
+//! On the CPU both tables stay BF16 on the host (D4) and are gathered to
+//! F32 per row, so they cost no device memory. On Metal they are F16 device
+//! tables (exact for every BF16 value in F16's normal range) gathered to F32
+//! on the device, so a row never crosses to the host.
 
 use std::ops::Range;
 
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use half::bf16;
 use safetensors::tensor::Dtype;
 
@@ -31,16 +33,29 @@ use crate::error::{Error, Result};
 /// The codebook the trunk's semantic rows add.
 pub const TRUNK_CODEBOOK: usize = 1;
 
+/// Where the two tables live.
+enum Tables {
+    /// BF16 on the host (the CPU).
+    Host {
+        /// `embed_tokens`, `[vocab, hidden]`.
+        tokens: Vec<bf16>,
+        /// `CB` rows `V..codebooks * V` (codebooks 1 and up).
+        codebook_table: Vec<bf16>,
+    },
+    /// F16 on the device (Metal), the same rows.
+    Device {
+        tokens: Tensor,
+        codebook_table: Tensor,
+    },
+}
+
 pub struct FishDrama3Embedding {
     hidden: usize,
     vocab: usize,
-    /// `embed_tokens`, `[vocab, hidden]`.
-    tokens: Vec<bf16>,
+    tables: Tables,
     /// Codes per codebook (`V`).
     codebook_vocab: usize,
     codebooks: usize,
-    /// `CB` rows `V..codebooks * V` (codebooks 1 and up).
-    codebook_table: Vec<bf16>,
     ids: FishDrama3TokenIds,
 }
 
@@ -86,6 +101,51 @@ pub(crate) fn bf16_table(
 }
 
 impl FishDrama3Embedding {
+    /// The tables for `device`: host BF16 on the CPU, device F16 on Metal.
+    pub fn load_on(
+        checkpoint: &FishDrama3Checkpoint,
+        config: &FishDrama3Config,
+        device: &Device,
+    ) -> Result<Self> {
+        if device.is_cpu() {
+            return Self::load(checkpoint, config);
+        }
+        let hidden = config.trunk.hidden;
+        let vocab = config.trunk.vocab;
+        let tower = &config.tower;
+        let (v, k) = (tower.codebook_vocab, tower.codebooks);
+        let tokens = checkpoint.bf16_tensor(
+            &format!("{TRUNK_PREFIX}.embed_tokens.weight"),
+            &[vocab, hidden],
+            DType::F16,
+            device,
+        )?;
+        let (dtype, found) = checkpoint.info(CODEBOOK_EMBEDDINGS)?;
+        if dtype != Dtype::BF16 || found != [k * v, hidden] {
+            return Err(load_error(format!(
+                "{CODEBOOK_EMBEDDINGS} is {dtype:?} {found:?}; expected BF16 [{}, {hidden}]",
+                k * v
+            )));
+        }
+        let codebook_table = checkpoint.bf16_rows_tensor(
+            CODEBOOK_EMBEDDINGS,
+            &(v..k * v).collect::<Vec<_>>(),
+            DType::F16,
+            device,
+        )?;
+        Ok(Self {
+            hidden,
+            vocab,
+            tables: Tables::Device {
+                tokens,
+                codebook_table,
+            },
+            codebook_vocab: v,
+            codebooks: k,
+            ids: config.ids,
+        })
+    }
+
     pub fn load(checkpoint: &FishDrama3Checkpoint, config: &FishDrama3Config) -> Result<Self> {
         let hidden = config.trunk.hidden;
         let vocab = config.trunk.vocab;
@@ -102,10 +162,12 @@ impl FishDrama3Embedding {
         Ok(Self {
             hidden,
             vocab,
-            tokens,
+            tables: Tables::Host {
+                tokens,
+                codebook_table,
+            },
             codebook_vocab: v,
             codebooks: k,
-            codebook_table,
             ids: config.ids,
         })
     }
@@ -119,13 +181,30 @@ impl FishDrama3Embedding {
         self.codebooks + 1
     }
 
-    /// Host bytes of both tables.
+    /// Host bytes of both tables (zero when they live on the device).
     pub fn host_bytes(&self) -> usize {
-        (self.tokens.len() + self.codebook_table.len()) * 2
+        match &self.tables {
+            Tables::Host {
+                tokens,
+                codebook_table,
+            } => (tokens.len() + codebook_table.len()) * 2,
+            Tables::Device { .. } => 0,
+        }
     }
 
-    /// `CB[codebook * V + clamp(code)]`, the row's BF16 values.
-    fn codebook_row(&self, codebook: usize, code: u32) -> Result<&[bf16]> {
+    /// Device bytes of both tables (zero when they live on the host).
+    pub fn device_bytes(&self) -> usize {
+        match &self.tables {
+            Tables::Host { .. } => 0,
+            Tables::Device {
+                tokens,
+                codebook_table,
+            } => (tokens.elem_count() + codebook_table.elem_count()) * 2,
+        }
+    }
+
+    /// The row of `CB[codebook * V + clamp(code)]` in the loaded table.
+    fn codebook_index(&self, codebook: usize, code: u32) -> Result<usize> {
         if codebook == 0 || codebook >= self.codebooks {
             return Err(Error::InferenceError(format!(
                 "codebook {codebook} is not one of the loaded 1..{}",
@@ -133,8 +212,20 @@ impl FishDrama3Embedding {
             )));
         }
         let code = (code as usize).min(self.codebook_vocab - 1);
-        let row = (codebook - 1) * self.codebook_vocab + code;
-        Ok(&self.codebook_table[row * self.hidden..(row + 1) * self.hidden])
+        Ok((codebook - 1) * self.codebook_vocab + code)
+    }
+
+    /// `CB[codebook * V + clamp(code)]`, the row's BF16 values.
+    fn codebook_row(&self, codebook: usize, code: u32) -> Result<&[bf16]> {
+        let row = self.codebook_index(codebook, code)?;
+        match &self.tables {
+            Tables::Host { codebook_table, .. } => {
+                Ok(&codebook_table[row * self.hidden..(row + 1) * self.hidden])
+            }
+            Tables::Device { .. } => Err(Error::InferenceError(
+                "the Fish Audio Drama 3 tables live on the device".into(),
+            )),
+        }
     }
 
     /// Adds `CB[codebook * V + clamp(code)]` to `out` (the tower's sum over
@@ -147,14 +238,76 @@ impl FishDrama3Embedding {
                 out.len()
             )));
         }
+        if let Tables::Device { codebook_table, .. } = &self.tables {
+            let row = codebook_table
+                .get(self.codebook_index(codebook, code)?)?
+                .to_dtype(DType::F32)?
+                .to_device(&Device::Cpu)?
+                .to_vec1::<f32>()?;
+            for (o, v) in out.iter_mut().zip(row) {
+                *o += v;
+            }
+            return Ok(());
+        }
         for (o, v) in out.iter_mut().zip(self.codebook_row(codebook, code)?) {
             *o += v.to_f32();
         }
         Ok(())
     }
 
+    /// The tower's `extra` of input frames `inputs` (row-major `[n,
+    /// width]`) on the device: `[n, hidden]` F32, the unscaled sum of
+    /// codebooks 2.. of each frame whose main is semantic (summed in
+    /// codebook order, as [`Self::add_codebook_row`] adds them), else zero.
+    pub(crate) fn extra_device(&self, inputs: &[u32]) -> Result<Tensor> {
+        let Tables::Device { codebook_table, .. } = &self.tables else {
+            return Err(Error::InferenceError(
+                "the Fish Audio Drama 3 tables live on the host".into(),
+            ));
+        };
+        let width = self.frame_width();
+        let n = inputs.len() / width;
+        let first = TRUNK_CODEBOOK + 1;
+        let mut index = Vec::with_capacity(n * (self.codebooks - first));
+        let mut semantic = Vec::with_capacity(n);
+        for frame in inputs.chunks_exact(width) {
+            semantic.push(u8::from(self.ids.is_semantic(frame[0])));
+            for codebook in first..self.codebooks {
+                index.push(self.codebook_index(codebook, frame[1 + codebook])? as u32);
+            }
+        }
+        let device = codebook_table.device();
+        let terms = self.codebooks - first;
+        let rows = codebook_table
+            .index_select(&Tensor::from_vec(index, n * terms, device)?, 0)?
+            .to_dtype(DType::F32)?
+            .reshape((n, terms, self.hidden))?;
+        let mut sum = rows.narrow(1, 0, 1)?;
+        for term in 1..terms {
+            sum = (sum + rows.narrow(1, term, 1)?)?;
+        }
+        let sum = sum.reshape((n, self.hidden))?;
+        let mask = Tensor::from_vec(semantic, (n, 1), device)?.broadcast_as((n, self.hidden))?;
+        Ok(mask.where_cond(&sum, &sum.zeros_like()?)?)
+    }
+
+    /// Rows `codes` (`[n]` U32, clamped already) of the device table
+    /// `table`, F32 on its device.
+    pub(crate) fn gather(table: &Tensor, codes: &Tensor) -> Result<Tensor> {
+        Ok(table.index_select(codes, 0)?.to_dtype(DType::F32)?)
+    }
+
     /// The F32 embedding `[n, hidden]` of `rows`, row-major `[n, width]`.
     pub fn embed(&self, rows: &[u32]) -> Result<Vec<f32>> {
+        if let Tables::Device { .. } = &self.tables {
+            return Ok(self
+                .embed_tensor(rows, &Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?);
+        }
+        let Tables::Host { tokens, .. } = &self.tables else {
+            unreachable!("handled above");
+        };
         let width = self.frame_width();
         if rows.is_empty() || !rows.len().is_multiple_of(width) {
             return Err(Error::InvalidInput(format!(
@@ -171,7 +324,7 @@ impl FishDrama3Embedding {
                     self.vocab
                 )));
             }
-            let e = &self.tokens[main * self.hidden..(main + 1) * self.hidden];
+            let e = &tokens[main * self.hidden..(main + 1) * self.hidden];
             if self.ids.is_semantic(row[0]) {
                 let cb = self.codebook_row(TRUNK_CODEBOOK, row[1 + TRUNK_CODEBOOK])?;
                 out.extend(
@@ -186,11 +339,48 @@ impl FishDrama3Embedding {
         Ok(out)
     }
 
-    /// [`Self::embed`] as an F32 `[n, hidden]` tensor on `device`.
+    /// [`Self::embed`] as an F32 `[n, hidden]` tensor on `device`. Device
+    /// tables gather on their own device (the semantic rows' mix divides by
+    /// `sqrt(2)` as the host does) and the result moves to `device`.
     pub fn embed_tensor(&self, rows: &[u32], device: &Device) -> Result<Tensor> {
-        let values = self.embed(rows)?;
-        let n = values.len() / self.hidden;
-        Ok(Tensor::from_vec(values, (n, self.hidden), device)?)
+        let Tables::Device {
+            tokens,
+            codebook_table,
+        } = &self.tables
+        else {
+            let values = self.embed(rows)?;
+            let n = values.len() / self.hidden;
+            return Ok(Tensor::from_vec(values, (n, self.hidden), device)?);
+        };
+        let width = self.frame_width();
+        if rows.is_empty() || !rows.len().is_multiple_of(width) {
+            return Err(Error::InvalidInput(format!(
+                "{} row values are not whole rows of {width}",
+                rows.len()
+            )));
+        }
+        let n = rows.len() / width;
+        let mut mains = Vec::with_capacity(n);
+        let mut codes = Vec::with_capacity(n);
+        let mut semantic = Vec::with_capacity(n);
+        for row in rows.chunks_exact(width) {
+            if row[0] as usize >= self.vocab {
+                return Err(Error::InvalidInput(format!(
+                    "token {} is outside the {}-token vocabulary",
+                    row[0], self.vocab
+                )));
+            }
+            mains.push(row[0]);
+            codes.push(self.codebook_index(TRUNK_CODEBOOK, row[1 + TRUNK_CODEBOOK])? as u32);
+            semantic.push(u8::from(self.ids.is_semantic(row[0])));
+        }
+        let on = tokens.device();
+        let e = Self::gather(tokens, &Tensor::from_vec(mains, n, on)?)?;
+        let cb = Self::gather(codebook_table, &Tensor::from_vec(codes, n, on)?)?;
+        let root_two = Tensor::from_slice(&[std::f32::consts::SQRT_2], 1, on)?;
+        let mixed = (&e + cb)?.broadcast_div(&root_two)?;
+        let mask = Tensor::from_vec(semantic, (n, 1), on)?.broadcast_as((n, self.hidden))?;
+        Ok(mask.where_cond(&mixed, &e)?.to_device(device)?)
     }
 }
 

@@ -7,9 +7,11 @@
 //! F32 in candidate order, eos first: logit index 0 is eos and index
 //! `1 + code` is `<|semantic:code|>`.
 //!
-//! The weights are the BF16 rows widened to F32 (about 32 MiB). Each hidden
-//! row is projected on its own, so a row's logits never depend on how many
-//! rows share the call.
+//! On the CPU the weights are the BF16 rows widened to F32 (about 32 MiB);
+//! on Metal they are F16 (16 MiB) and the projection runs in F16, widened
+//! to F32 logits (F32 throughout once the load-time range probe breached
+//! the head). Each hidden row is projected on its own, so a row's logits
+//! never depend on how many rows share the call.
 
 use candle_core::{DType, Device, Tensor};
 
@@ -18,8 +20,11 @@ use super::config::{FishDrama3Config, FishDrama3TokenIds};
 use crate::error::{Error, Result};
 
 pub struct FishDrama3CompactHead {
-    /// `[candidates, hidden]` F32.
+    /// `[candidates, hidden]`: F32 on the CPU, F16 on Metal.
     weight: Tensor,
+    /// The projection's dtype: F32 on the CPU, F16 on Metal unless the
+    /// range probe moved it to F32.
+    act: DType,
     /// Logit index → token id: eos, then the semantic band.
     token_ids: Vec<u32>,
     ids: FishDrama3TokenIds,
@@ -42,7 +47,12 @@ impl FishDrama3CompactHead {
         device: &Device,
     ) -> Result<Self> {
         let rows = config.ids.compact_head_rows();
-        let weight = checkpoint.bf16_rows_tensor(LM_HEAD, &rows, DType::F32, device)?;
+        let dtype = if device.is_metal() {
+            DType::F16
+        } else {
+            DType::F32
+        };
+        let weight = checkpoint.bf16_rows_tensor(LM_HEAD, &rows, dtype, device)?;
         let (count, hidden) = weight.dims2()?;
         if count != rows.len() || hidden != config.trunk.hidden {
             return Err(Error::ModelLoadError(format!(
@@ -53,6 +63,7 @@ impl FishDrama3CompactHead {
         }
         Ok(Self {
             weight,
+            act: dtype,
             token_ids: rows.into_iter().map(|row| row as u32).collect(),
             ids: config.ids,
             hidden,
@@ -98,7 +109,17 @@ impl FishDrama3CompactHead {
 
     /// Resident bytes of the weights.
     pub fn resident_bytes(&self) -> usize {
-        self.weight.elem_count() * 4
+        self.weight.elem_count() * self.weight.dtype().size_in_bytes()
+    }
+
+    /// The projection's dtype.
+    pub fn act(&self) -> DType {
+        self.act
+    }
+
+    /// Runs the projection in `act` (the range probe's F32 fallback).
+    pub(crate) fn set_act(&mut self, act: DType) {
+        self.act = act;
     }
 
     /// F32 logits `[n, candidates]` of final-norm hidden rows `[n, hidden]`.
@@ -111,12 +132,16 @@ impl FishDrama3CompactHead {
                 hidden.dims()
             )));
         }
-        let hidden = hidden.to_dtype(DType::F32)?;
-        let w = self.weight.t()?;
+        let hidden = hidden.to_dtype(self.act)?;
+        let w = if self.weight.dtype() == self.act {
+            self.weight.t()?
+        } else {
+            self.weight.to_dtype(self.act)?.t()?
+        };
         let rows = (0..n)
             .map(|row| hidden.narrow(0, row, 1)?.contiguous()?.matmul(&w))
             .collect::<candle_core::Result<Vec<_>>>()?;
-        Ok(Tensor::cat(&rows, 0)?)
+        Ok(Tensor::cat(&rows, 0)?.to_dtype(DType::F32)?)
     }
 }
 

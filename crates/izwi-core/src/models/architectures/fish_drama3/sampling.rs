@@ -46,9 +46,11 @@
 //! takes and restores (§7.2). A draw consumes one exponential per candidate,
 //! masked or not, so the stream stays aligned across policies.
 //!
-//! Device-resident sampling (Phase 3) slots in behind the same split: the
-//! noise comes from [`FishDrama3RowSampler::exponentials`] and the selection
-//! is [`race`] over the device's logits.
+//! Device-resident sampling (`metal::sampling`) slots in behind the same
+//! split: the noise comes from [`FishDrama3RowSampler::main_noise`] and
+//! [`FishDrama3RowSampler::exponentials`] in the order the host draws take
+//! it, the selection is [`race`]'s rule over the device's logits, and RAS
+//! is [`FishDrama3RowSampler::finish_main`] on the host.
 
 use std::collections::VecDeque;
 #[cfg(test)]
@@ -417,6 +419,24 @@ impl FishDrama3RowSampler {
         let first = race(logits, &self.params.main, first_candidate, &noise)?;
         let noise = self.exponentials(candidates)?;
         let retry = race(logits, &FishDrama3DrawPolicy::RAS, first_candidate, &noise)?;
+        Ok(self.finish_main(first, retry))
+    }
+
+    /// The exponentials of one frame's two main draws, in the order
+    /// [`Self::sample_main`] takes them (the request policy's, then RAS's),
+    /// for a device race over the same candidates.
+    pub fn main_noise(&mut self) -> Result<(Vec<f32>, Vec<f32>)> {
+        let candidates = 1 + self.ids.semantic_codes();
+        Ok((
+            self.exponentials(candidates)?,
+            self.exponentials(candidates)?,
+        ))
+    }
+
+    /// RAS over a frame's two draws (candidate indices of the compact head,
+    /// the request policy's and the retry's), and the token joins the
+    /// window: the end of [`Self::sample_main`], which a device race shares.
+    pub fn finish_main(&mut self, first: usize, retry: usize) -> FishDrama3MainDraw {
         let (first, retry) = (self.main_token(first), self.main_token(retry));
         // Only semantic repeats: the window starts with prompt rows, which
         // hold the user turn's eos, and a stop is never redrawn.
@@ -426,12 +446,12 @@ impl FishDrama3RowSampler {
             self.window.pop_front();
         }
         self.window.push_back(token);
-        Ok(FishDrama3MainDraw {
+        FishDrama3MainDraw {
             token,
             first,
             retry,
             redrawn,
-        })
+        }
     }
 
     /// A codebook head's code from its logits (one per code). Non-finite

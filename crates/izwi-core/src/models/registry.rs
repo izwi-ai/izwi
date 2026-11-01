@@ -571,10 +571,11 @@ fn load_fish_s2_tts_model(
 }
 
 /// What a Fish Audio Drama 3 load checks before it reads a weight: the
-/// backend has a residency (only the CPU's exists until Phase 3), and a
-/// published checkpoint is the pinned one (sizes and the `config.json`
-/// hash, never a re-hash of 41.5 GB). It then logs the licence once per
-/// load. Test checkpoints (`Synthetic`) have no pinned manifest.
+/// backend has a residency (the CPU's and Metal's; CUDA's is a later
+/// phase), and a published checkpoint is the pinned one (sizes and the
+/// `config.json` hash, never a re-hash of 41.5 GB). It then logs the
+/// licence once per load. Test checkpoints (`Synthetic`) have no pinned
+/// manifest.
 fn prepare_fish_drama3_tts_load(
     model_dir: &Path,
     variant: ModelVariant,
@@ -582,14 +583,9 @@ fn prepare_fish_drama3_tts_load(
     policy: crate::models::architectures::fish_drama3::FishDrama3ConfigPolicy,
 ) -> Result<()> {
     use crate::models::architectures::fish_drama3::{artifacts, FishDrama3ConfigPolicy};
-    let backend = match device.kind {
-        crate::backends::DeviceKind::Cpu => None,
-        crate::backends::DeviceKind::Metal => Some("Metal"),
-        crate::backends::DeviceKind::Cuda => Some("CUDA"),
-    };
-    if let Some(backend) = backend {
+    if device.kind == crate::backends::DeviceKind::Cuda {
         return Err(Error::ModelLoadError(format!(
-            "{variant} is not yet supported on the {backend} backend; load it on the CPU"
+            "{variant} is not yet supported on the CUDA backend; load it on the CPU or Metal"
         )));
     }
     if policy == FishDrama3ConfigPolicy::Published {
@@ -606,16 +602,29 @@ fn prepare_fish_drama3_tts_load(
     Ok(())
 }
 
-/// Loads the published Fish Audio Drama 3 on the CPU residency (Q8_0
-/// weights, F32 numerics).
+/// The load options of a Fish Audio Drama 3 load on `device`: the family's
+/// defaults with `IZWI_FISH_DRAMA3_DTYPE`, `_MOE_BACKEND` and
+/// `_PREFILL_SPAN` over them.
+fn fish_drama3_load_options(
+    device: &DeviceProfile,
+) -> Result<crate::models::architectures::fish_drama3::FishDrama3ModelOptions> {
+    use crate::models::architectures::fish_drama3::{FishDrama3ModelOptions, FishDrama3Residency};
+    let backend = crate::backends::BackendKind::from(device.kind);
+    FishDrama3ModelOptions::from_env(
+        FishDrama3Residency::of(&device.device),
+        crate::runtime::fish_drama3_capacity::default_prefill_span_rows(backend),
+    )
+}
+
+/// Loads the published Fish Audio Drama 3 in its backend's residency: CPU
+/// (Q8_0 weights, F32 numerics) or Metal (raw FP8 and F16 weights, F32
+/// residual).
 fn load_fish_drama3_tts_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
 ) -> Result<FishDrama3Model> {
-    use crate::models::architectures::fish_drama3::{
-        FishDrama3ConfigPolicy, FishDrama3ModelOptions,
-    };
+    use crate::models::architectures::fish_drama3::FishDrama3ConfigPolicy;
     // A test build loads a synthetic checkpoint marked for the lifecycle
     // as a test would; a release build has no such path.
     #[cfg(test)]
@@ -630,11 +639,11 @@ fn load_fish_drama3_tts_model(
         &device,
         FishDrama3ConfigPolicy::Published,
     )?;
+    let options = fish_drama3_load_options(&device)?;
     Ok(
-        FishDrama3Model::load(model_dir, &device.device, FishDrama3ModelOptions::default())?
-            .with_artifact_fingerprint(
-                crate::models::architectures::fish_drama3::artifacts::pinned_fingerprint(),
-            ),
+        FishDrama3Model::load(model_dir, &device.device, options)?.with_artifact_fingerprint(
+            crate::models::architectures::fish_drama3::artifacts::pinned_fingerprint(),
+        ),
     )
 }
 
@@ -840,7 +849,7 @@ pub(crate) fn load_synthetic_fish_drama3_tts_model(
         &device.device,
         FishDrama3ModelOptions {
             config_policy: FishDrama3ConfigPolicy::Synthetic,
-            ..Default::default()
+            ..fish_drama3_load_options(&device)?
         },
         Arc::new(StubCodec),
     )?
@@ -7167,6 +7176,14 @@ fn tts_fast_path_counters(family: ModelFamily) -> Option<Value> {
         ModelFamily::FishS2Tts => Some(serde_json::json!({
             "resident_fast_frames_total": fish_s2::fast::fish_s2_resident_fast_frames(),
         })),
+        ModelFamily::FishDrama3Tts => {
+            use crate::models::architectures::fish_drama3::metal::sampling as resident;
+            Some(serde_json::json!({
+                "resident_frames_total": resident::fish_drama3_resident_frames(),
+                "resident_readbacks_total": resident::fish_drama3_resident_readbacks(),
+                "resident_host_fallbacks_total": resident::fish_drama3_resident_host_fallbacks(),
+            }))
+        }
         _ => None,
     }
 }
@@ -7775,7 +7792,7 @@ impl ModelRegistry {
                     LoadedModelActualRuntime::default(),
                     None,
                     None,
-                    Some(model.diagnostics_summary()),
+                    with_tts_fast_path_counters(*variant, Some(model.diagnostics_summary())),
                 ));
             }
         }
@@ -9606,6 +9623,14 @@ mod tests {
             ["resident_fast_frames_total"]
         );
         assert_eq!(
+            counters(ModelVariant::FishAudioDrama3, Some(serde_json::json!({}))),
+            [
+                "resident_frames_total",
+                "resident_host_fallbacks_total",
+                "resident_readbacks_total"
+            ]
+        );
+        assert_eq!(
             counters(ModelVariant::Qwen3Tts12Hz06BBase, None),
             ["codec_stream_frames_total"]
         );
@@ -9954,33 +9979,34 @@ mod tests {
             .is_none());
     }
 
-    /// The published loader checks the backend and the pinned identity
-    /// before it reads a weight.
+    /// The published loader checks the backend (CUDA is refused; the CPU
+    /// and Metal load) and the pinned identity before it reads a weight.
     #[tokio::test]
-    async fn the_published_drama3_loader_refuses_other_backends_and_foreign_checkpoints() {
+    async fn the_published_drama3_loader_refuses_cuda_and_foreign_checkpoints() {
         use crate::backends::DeviceKind;
         use crate::models::architectures::fish_drama3::FishDrama3ConfigPolicy;
         let synthetic =
             crate::models::architectures::fish_drama3::model::tests::write_synthetic_model(6);
         let variant = ModelVariant::FishAudioDrama3;
-        for (kind, name) in [(DeviceKind::Metal, "Metal"), (DeviceKind::Cuda, "CUDA")] {
-            let device = DeviceProfile {
-                kind,
-                ..DeviceProfile::cpu()
-            };
-            let error = prepare_fish_drama3_tts_load(
+        let on = |kind| DeviceProfile {
+            kind,
+            ..DeviceProfile::cpu()
+        };
+        let prepare = |kind| {
+            prepare_fish_drama3_tts_load(
                 synthetic.path(),
                 variant,
-                &device,
+                &on(kind),
                 FishDrama3ConfigPolicy::Synthetic,
             )
-            .unwrap_err()
-            .to_string();
-            assert!(
-                error.contains(&format!("is not yet supported on the {name} backend")),
-                "{error}"
-            );
-        }
+        };
+        let error = prepare(DeviceKind::Cuda).unwrap_err().to_string();
+        assert!(
+            error.contains("is not yet supported on the CUDA backend"),
+            "{error}"
+        );
+        prepare(DeviceKind::Metal).expect("Metal has a residency");
+        prepare(DeviceKind::Cpu).expect("the CPU has a residency");
         // The synthetic checkpoint is not the pinned revision.
         let registry = ModelRegistry::new(PathBuf::new(), DeviceProfile::cpu());
         let error = registry

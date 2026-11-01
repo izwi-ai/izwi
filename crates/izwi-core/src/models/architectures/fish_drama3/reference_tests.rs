@@ -172,6 +172,41 @@ const TINY: Tolerances = Tolerances {
     frames_required: usize::MAX,
 };
 
+/// L1 on Metal: the Metal form (F16 weights and activations, F32 residual,
+/// F16 KV) against upstream's F32 run. F16 rounds each layer's activations
+/// to 11 bits, about 5e-4, and the untrained tiny trunk grows that to about
+/// 2e-2 by its last layer (the synthetic checkpoint's Metal tests measure
+/// 2.0e-2 on the trunk, 6e-3 on the tower, 3e-4 on the compact head).
+/// Router margins move with it, so ties widen to 1e-3, and a race whose
+/// gap is under 1e-2 may flip: frames replay until the first such tie and
+/// a divergence after it is reported, never failed. Uncalibrated: the
+/// first run's worst values set them.
+const TINY_METAL: Tolerances = Tolerances {
+    embedding: bound(2e-7, 1e-5),
+    trunk: rel(5e-2),
+    tower: rel(2e-2),
+    logits: bound(2e-2, 0.2),
+    decode: rel(5e-2),
+    route_tie: 1e-3,
+    frame_tie: 1e-2,
+    frames_required: usize::MAX,
+};
+
+/// L2 `metal`: the published model's Metal form (a ≥ 64 GB Mac) against
+/// upstream's F32 W8A16 run: F16 activations over 40 layers, about a percent
+/// on traces; ties and frames as on [`TINY_METAL`], and §10.6 asks for 32
+/// replayed frames before the first near tie. Uncalibrated.
+const L2_METAL: Tolerances = Tolerances {
+    embedding: bound(2e-7, 1e-5),
+    trunk: rel(5e-2),
+    tower: rel(5e-2),
+    logits: bound(5e-2, 0.5),
+    decode: rel(1e-1),
+    route_tie: 1e-3,
+    frame_tie: 1e-2,
+    frames_required: 32,
+};
+
 /// L1.5: the same F32-against-F32 comparison on real weights, one layer (or
 /// the tower, or the head) from exact xorshift inputs: sums of 2,048 (6,144
 /// in the tower's feed-forward) in another order, the chunked DeltaNet
@@ -636,6 +671,7 @@ fn model_options(
         },
         prefill_span_rows,
         config_policy,
+        activations: None,
     }
 }
 
@@ -1590,7 +1626,7 @@ fn run_tiny_tensors(device: &Device, backend: &str) {
     let (h, d) = (config.trunk.hidden, config.tower.dim);
     let (experts, top_k) = (config.trunk.moe.experts, config.trunk.moe.top_k);
     let (shared, heads) = (config.tower.shared_layers, config.tower.residual_layers());
-    let tol = TINY;
+    let tol = if device.is_cpu() { TINY } else { TINY_METAL };
     let mut report = Report::default();
     for entry in list(&json["prompts"]) {
         let label = format!("{backend} {}", text(&entry["name"]));
@@ -1868,7 +1904,7 @@ fn run_tiny_rollouts(device: &Device, backend: &str) {
             rollout,
             sidecar,
             &ours,
-            &TINY,
+            if device.is_cpu() { &TINY } else { &TINY_METAL },
             config.trunk.hidden,
         );
         if device.is_cpu() && exact {
@@ -1890,13 +1926,13 @@ fn tiny_rollouts_replay_upstream_on_cpu() {
     run_tiny_rollouts(&Device::Cpu, "cpu");
 }
 
-/// TODO(Phase 3): L1 on Metal (§10.6 requires it). The family refuses Metal
-/// at load until its Metal residency lands; then this runs the same
-/// comparisons there (the model-loop cross-check stays on the CPU, where
-/// its private caches are), with Metal's own bounds if F16 needs them.
+/// L1 on Metal (§10.6 requires it): the same comparisons on the Metal form
+/// with [`TINY_METAL`]'s bounds. The model-loop cross-check stays on the
+/// CPU. The tiny fixture's 32-dim DeltaNet heads take Metal's Candle
+/// recurrence (the published 128-dim heads take `gdn_decode`).
 #[cfg(feature = "metal")]
 #[test]
-#[ignore = "needs tests/fixtures/fish_drama3/tiny/ and the family's Metal residency (Phase 3)"]
+#[ignore = "needs tests/fixtures/fish_drama3/tiny/ from generate_fish_drama3_tiny.py"]
 fn tiny_matches_upstream_on_metal() {
     let _fixture = tiny_fixture();
     let Some((device, _lease)) =
@@ -1904,9 +1940,6 @@ fn tiny_matches_upstream_on_metal() {
     else {
         return;
     };
-    if let Err(error) = FishDrama3Residency::of(&device).require_implemented() {
-        panic!("L1 on Metal waits for the family's Metal residency (Phase 3): {error}");
-    }
     run_tiny_tensors(&device, "metal");
     run_tiny_rollouts(&device, "metal");
 }
@@ -2888,32 +2921,43 @@ fn reference_utterance_pcm_matches_the_upstream_codec() {
     report.finish("L2 utterance PCM");
 }
 
-/// `IZWI_FISH_DRAMA3_BACKEND`: the L2 run's name, bounds and CPU precision.
-fn reference_backend() -> (String, Tolerances, FishDrama3CpuPrecision) {
+/// What keeps the shared Metal device to the L2 run (its test lease), held
+/// for the whole run; nothing on the CPU.
+type DeviceLease = Option<Box<dyn std::any::Any>>;
+
+/// `IZWI_FISH_DRAMA3_BACKEND`: the L2 run's name, bounds, CPU precision,
+/// device and the device's lease.
+fn reference_backend() -> (
+    String,
+    Tolerances,
+    FishDrama3CpuPrecision,
+    Device,
+    DeviceLease,
+) {
     let backend = std::env::var(BACKEND_ENV).unwrap_or_else(|_| "cpu".into());
-    let (tolerances, precision) = match backend.as_str() {
-        "cpu" => (L2_CPU, FishDrama3CpuPrecision::F32),
-        "cpu-q8_0" => (L2_CPU_Q8_0, FishDrama3CpuPrecision::Q8_0),
-        "metal" | "cuda" => {
-            let residency = if backend == "metal" {
-                FishDrama3Residency::Metal
-            } else {
-                FishDrama3Residency::Cuda
-            };
-            match residency.require_implemented() {
-                Err(error) => panic!(
-                    "{BACKEND_ENV}={backend}: {error} (plan Phase 3); run L2 with cpu (F32, about \
-                     140 GiB of RAM) or cpu-q8_0 (about 40 GiB) until then"
-                ),
-                Ok(()) => panic!(
-                    "{BACKEND_ENV}={backend}: the family loads there now; give reference_tests.rs \
-                     its device and bounds (TODO Phase 3)"
-                ),
-            }
+    let (tolerances, precision, device, lease) = match backend.as_str() {
+        "cpu" => (L2_CPU, FishDrama3CpuPrecision::F32, Device::Cpu, None),
+        "cpu-q8_0" => (L2_CPU_Q8_0, FishDrama3CpuPrecision::Q8_0, Device::Cpu, None),
+        #[cfg(feature = "metal")]
+        "metal" => {
+            let (device, lease) =
+                crate::backends::metal_test_device_or_skip("reference_generations_match_upstream")
+                    .unwrap_or_else(|| panic!("{BACKEND_ENV}=metal: no Metal device"));
+            let lease: DeviceLease = Some(Box::new(lease));
+            (L2_METAL, FishDrama3CpuPrecision::Q8_0, device, lease)
+        }
+        #[cfg(not(feature = "metal"))]
+        "metal" => panic!("{BACKEND_ENV}=metal needs a test build with --features metal"),
+        "cuda" => {
+            let error = FishDrama3Residency::Cuda.require_implemented().unwrap_err();
+            panic!(
+                "{BACKEND_ENV}=cuda: {error}; run L2 with cpu (F32, about 140 GiB of RAM), \
+                 cpu-q8_0 (about 40 GiB) or metal (a Mac with at least 64 GB)"
+            )
         }
         other => panic!("{BACKEND_ENV}={other}: expected cpu, cpu-q8_0, metal or cuda"),
     };
-    (backend, tolerances, precision)
+    (backend, tolerances, precision, device, lease)
 }
 
 /// One upstream generation (a `<generation>` record) against izwi's traced
@@ -3063,10 +3107,10 @@ fn compare_generation(
 /// tower layers, routes, the main logits, and the first 64 frames under the
 /// recorded noise.
 #[test]
-#[ignore = "needs IZWI_FISH_DRAMA3_REFERENCE_DIR, IZWI_FISH_DRAMA3_MODEL_DIR and IZWI_FISH_DRAMA3_BACKEND (cpu: F32, about 140 GiB of RAM; cpu-q8_0: about 40 GiB); run with --release"]
+#[ignore = "needs IZWI_FISH_DRAMA3_REFERENCE_DIR, IZWI_FISH_DRAMA3_MODEL_DIR and IZWI_FISH_DRAMA3_BACKEND (cpu: F32, about 140 GiB of RAM; cpu-q8_0: about 40 GiB; metal: a Mac with at least 64 GB); run with --release"]
 fn reference_generations_match_upstream() {
     let run = reference_run();
-    let (backend, tolerances, precision) = reference_backend();
+    let (backend, tolerances, precision, device, _lease) = reference_backend();
     let (json, sidecar) = (&run.fixture.json, &run.fixture.sidecar);
     let options = model_options(
         precision,
@@ -3074,7 +3118,7 @@ fn reference_generations_match_upstream() {
         FishDrama3ConfigPolicy::Published,
     );
     let model =
-        FishDrama3Model::load_with_codec(&run.model_dir, &Device::Cpu, options, Arc::new(NoCodec))
+        FishDrama3Model::load_with_codec(&run.model_dir, &device, options, Arc::new(NoCodec))
             .unwrap();
     eprintln!("{}", model.diagnostics_summary());
     let mut report = Report::default();

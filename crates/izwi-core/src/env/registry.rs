@@ -361,7 +361,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Choice,
         "cpu",
         TestHarness,
-        "Backend of the ignored Fish Audio Drama 3 L2 parity test: cpu (F32 weights, about 140 GiB of RAM), cpu-q8_0 (the production Q8_0 form, about 40 GiB, looser bounds) or metal / cuda (refused until the family has those residencies).",
+        "Backend of the ignored Fish Audio Drama 3 L2 parity test: cpu (F32 weights, about 140 GiB of RAM), cpu-q8_0 (the production Q8_0 form, about 40 GiB, looser bounds), metal (the F16 Metal form) or cuda (refused until the family has its residency).",
     ),
     CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_CODEBOOK_FIXTURE",
@@ -378,6 +378,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "The published codec.pth (Fish Audio Drama 3's, byte-identical to Fish S2 Pro's) for the ignored real-codec tests: the cross-family bit-identity test and the CUDA streaming test.",
     ),
     CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_DTYPE",
+        Choice,
+        "the backend's (f16 on Metal, f32 on CPU)",
+        Load,
+        "Overrides a Fish Audio Drama 3 load's activation dtype: f16 or f32 on Metal (f32 also stores the paged KV in F32 and runs every MoE layer's host loop), f32 on CPU; anything else fails the load.",
+    ),
+    CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_MODEL_DIR",
         Path,
         "unset (test fails)",
@@ -385,11 +392,25 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "The fishaudio/drama-3 checkpoint at 78e5ab79 (codec.pth included) for the ignored Fish Audio Drama 3 L2 parity tests.",
     ),
     CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_MOE_BACKEND",
+        Choice,
+        "fused",
+        Load,
+        "How a Fish Audio Drama 3 load on Metal runs its routed experts: fused (device routing, the fused FP8 kernels) or loop (host routing and one FP8 GEMV pair per expert with F32 activations; diagnosis).",
+    ),
+    CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_NATIVE_BATCHING",
         Flag,
         "false",
         Load,
         "Lets a Fish Audio Drama 3 load on Metal decode two rows at once instead of one; CPU stays at one row and CUDA at eight.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_PREFILL_SPAN",
+        Int,
+        "256 (CPU and Metal), 1024 (CUDA)",
+        Load,
+        "Rows per Fish Audio Drama 3 prefill span (1 to 8192), fixed per load: the scheduler's prefill grid and the admission workspace read it.",
     ),
     CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_REFERENCE_DIR",

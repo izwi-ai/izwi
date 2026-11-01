@@ -174,11 +174,35 @@ pub(crate) fn trunk_geometry_json() -> Value {
 }
 
 pub(crate) fn trunk_geometry() -> FishDrama3Config {
-    FishDrama3Config::from_json(
-        &trunk_geometry_json().to_string(),
-        FishDrama3ConfigPolicy::Synthetic,
-    )
-    .unwrap()
+    SyntheticGeometry::L0.config()
+}
+
+/// The synthetic geometries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyntheticGeometry {
+    /// §10.1's: DeltaNet heads of 32.
+    L0,
+    /// §10.1's with the published 128-dim DeltaNet heads (2 key / 4 value),
+    /// which the fused Metal DeltaNet kernels take: Metal's tests run it,
+    /// while L0's heads take Metal's Candle recurrence.
+    KernelHeads,
+}
+
+impl SyntheticGeometry {
+    pub(crate) fn json(self) -> Value {
+        let mut c = trunk_geometry_json();
+        if self == Self::KernelHeads {
+            let t = &mut c["text_config"];
+            t["linear_key_head_dim"] = 128.into();
+            t["linear_value_head_dim"] = 128.into();
+        }
+        c
+    }
+
+    pub(crate) fn config(self) -> FishDrama3Config {
+        FishDrama3Config::from_json(&self.json().to_string(), FishDrama3ConfigPolicy::Synthetic)
+            .unwrap()
+    }
 }
 
 /// FNV-1a: a stable per-tensor seed.
@@ -308,10 +332,15 @@ pub(crate) fn marked_for_lifecycle(model_dir: &Path) -> bool {
 /// The §10.1 checkpoint written into `dir` (created if missing) with
 /// `seed`'s values: the tensors, index, `config.json` and companion files.
 pub(crate) fn write_checkpoint_at(dir: &Path, seed: u64) {
+    write_geometry_at(dir, seed, SyntheticGeometry::L0);
+}
+
+/// [`write_checkpoint_at`] in `geometry`.
+pub(crate) fn write_geometry_at(dir: &Path, seed: u64, geometry: SyntheticGeometry) {
     std::fs::create_dir_all(dir).unwrap();
-    let config = trunk_geometry();
+    let config = geometry.config();
     let tensors = trained_like_tensors(&config, seed);
-    write_checkpoint(dir, &tensors, &trunk_geometry_json());
+    write_checkpoint(dir, &tensors, &geometry.json());
 }
 
 /// A written §10.1 checkpoint, removed when dropped.
@@ -327,11 +356,20 @@ impl SyntheticCheckpoint {
 
     /// The checkpoint with one edit to its tensors.
     pub(crate) fn write_with(seed: u64, edit: impl FnOnce(&mut Vec<Written>)) -> Self {
-        let config = trunk_geometry();
+        Self::write_geometry_with(seed, SyntheticGeometry::L0, edit)
+    }
+
+    /// The checkpoint in `geometry` with one edit to its tensors.
+    pub(crate) fn write_geometry_with(
+        seed: u64,
+        geometry: SyntheticGeometry,
+        edit: impl FnOnce(&mut Vec<Written>),
+    ) -> Self {
+        let config = geometry.config();
         let mut tensors = trained_like_tensors(&config, seed);
         edit(&mut tensors);
         let dir = temp_dir();
-        write_checkpoint(&dir.0, &tensors, &trunk_geometry_json());
+        write_checkpoint(&dir.0, &tensors, &geometry.json());
         Self { dir, config }
     }
 

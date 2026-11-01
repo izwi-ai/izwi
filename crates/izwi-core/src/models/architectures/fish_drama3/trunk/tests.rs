@@ -1470,7 +1470,7 @@ fn a_class_failing_its_q8_0_check_stays_f32_and_is_counted() {
         assert_eq!(*form, expected, "{class:?}");
     }
     assert_eq!(
-        trunk.layers[0].moe.shared_expert().projections()[0].form(),
+        trunk.host_layers()[0].moe.shared_expert().projections()[0].form(),
         FishDrama3WeightForm::F32
     );
     assert_eq!(

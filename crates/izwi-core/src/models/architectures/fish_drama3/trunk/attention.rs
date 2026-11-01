@@ -53,6 +53,11 @@ impl FishDrama3Rope {
         self.layout
     }
 
+    /// The rotated leading dims of each head.
+    pub fn rotary_dims(&self) -> usize {
+        self.rotary_dims
+    }
+
     /// `(cos, sin)` of each rotated pair at `position`.
     pub fn cos_sin(&self, position: usize) -> (Vec<f32>, Vec<f32>) {
         self.inv_freq

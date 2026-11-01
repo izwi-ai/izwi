@@ -12,7 +12,7 @@ use super::super::prompt::{
     build_prompt, planned_rows, FishDrama3Codes, FishDrama3HistoryTurn, FishDrama3Reference,
 };
 use super::super::sampling::{FishDrama3RowSampler, FishDrama3SamplingParams};
-use super::super::synthetic::SyntheticCheckpoint;
+use super::super::synthetic::{SyntheticCheckpoint, SyntheticGeometry};
 use super::super::tokenizer::{semantic_token, speaker_token};
 use super::*;
 use crate::kernels::numeric_check::relative_l2;
@@ -164,7 +164,16 @@ fn tokenizer_json() -> Value {
 /// The synthetic checkpoint with its tokenizer: a model directory the
 /// family loads with [`StubCodec`] (the engine's tests use it too).
 pub(crate) fn write_synthetic_model(seed: u64) -> SyntheticCheckpoint {
-    let synthetic = SyntheticCheckpoint::write(seed);
+    write_synthetic_model_in(seed, SyntheticGeometry::L0, |_| {})
+}
+
+/// [`write_synthetic_model`] in `geometry`, with one edit to its tensors.
+pub(crate) fn write_synthetic_model_in(
+    seed: u64,
+    geometry: SyntheticGeometry,
+    edit: impl FnOnce(&mut Vec<super::super::synthetic::Written>),
+) -> SyntheticCheckpoint {
+    let synthetic = SyntheticCheckpoint::write_geometry_with(seed, geometry, edit);
     std::fs::write(
         synthetic.path().join("tokenizer.json"),
         tokenizer_json().to_string(),
@@ -177,9 +186,29 @@ pub(crate) fn write_synthetic_model(seed: u64) -> SyntheticCheckpoint {
 /// `models_dir/<variant>`), marked for the lifecycle: a test loads it
 /// through `RuntimeService` as it would the published one.
 pub(crate) fn write_lifecycle_synthetic_model(dir: &std::path::Path, seed: u64) {
-    super::super::synthetic::write_checkpoint_at(dir, seed);
+    write_lifecycle_synthetic_model_in(dir, seed, SyntheticGeometry::L0);
+}
+
+/// [`write_lifecycle_synthetic_model`] in `geometry`.
+pub(crate) fn write_lifecycle_synthetic_model_in(
+    dir: &std::path::Path,
+    seed: u64,
+    geometry: SyntheticGeometry,
+) {
+    super::super::synthetic::write_geometry_at(dir, seed, geometry);
     std::fs::write(dir.join("tokenizer.json"), tokenizer_json().to_string()).unwrap();
     std::fs::write(dir.join(super::super::synthetic::LIFECYCLE_MARKER), b"").unwrap();
+}
+
+#[test]
+fn the_prefill_span_override_is_a_row_count_within_a_prompt() {
+    assert_eq!(prefill_span_rows(None, 256).unwrap(), 256);
+    assert_eq!(prefill_span_rows(Some(" "), 1_024).unwrap(), 1_024);
+    assert_eq!(prefill_span_rows(Some("64"), 256).unwrap(), 64);
+    assert_eq!(prefill_span_rows(Some("8192"), 256).unwrap(), 8_192);
+    for bad in ["0", "8193", "-4", "many"] {
+        assert!(prefill_span_rows(Some(bad), 256).is_err(), "{bad}");
+    }
 }
 
 fn load_synthetic(seed: u64, cell: usize) -> FishDrama3Model {

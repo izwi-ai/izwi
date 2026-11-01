@@ -9,14 +9,17 @@
 //! hidden = (1 + w)-RMSNorm(x)                                   # model.norm
 //! ```
 //!
-//! The residual stream and every activation are F32. The caller picks the
-//! [`FishDrama3KernelPhase`]:
+//! On the CPU the residual stream and every activation are F32; on Metal
+//! the residual stays F32 and the layers run in the forms of
+//! `metal::trunk`. The caller picks the [`FishDrama3KernelPhase`]:
 //! * [`FishDrama3Trunk::forward_span`] runs one request's rows from its
 //!   position (prefill) and returns the final-norm hidden of every row: the
 //!   teacher-forced tower reads them all;
 //! * [`FishDrama3Trunk::forward_step`] runs one row for each of several
 //!   requests, each with its own paged KV and state (decode). On the CPU it
-//!   is a loop over the rows, so a row's bits never depend on its batch.
+//!   is a loop over the rows; on Metal the rows run together layer by layer
+//!   through row-wise kernels only. Either way a row's bits never depend on
+//!   its batch.
 //!
 //! Full-attention layers share one "trunk" paged domain holding only them
 //! (model layers from `layer_types`); one prepared append covers all of
@@ -41,9 +44,12 @@ use super::checkpoint::{trunk_layer, FishDrama3Checkpoint, TRUNK_PREFIX};
 use super::config::{FishDrama3Config, FishDrama3LayerKind, FishDrama3TrunkConfig};
 pub use super::linear::FishDrama3KernelPhase;
 use super::linear::FishDrama3Linear;
+use super::metal::trunk::{FishDrama3MoeBackend, MetalTrunk};
+use super::metal::MetalRow;
 use super::precision::{decide_cpu_forms, FishDrama3PrecisionReport, Q8_0_TOLERANCE};
 use super::residency::{
-    FishDrama3CpuPrecision, FishDrama3ProjectionClass, FishDrama3Residency, FishDrama3WeightForm,
+    FishDrama3ClassForms, FishDrama3CpuPrecision, FishDrama3ProjectionClass, FishDrama3Residency,
+    FishDrama3WeightForm,
 };
 use crate::error::{Error, Result};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
@@ -127,6 +133,9 @@ pub struct FishDrama3TrunkOptions {
     pub precision: FishDrama3CpuPrecision,
     /// The Q8_0 self-check's tolerance ([`Q8_0_TOLERANCE`]).
     pub q8_0_tolerance: f64,
+    /// How a Metal load runs its routed experts
+    /// (`IZWI_FISH_DRAMA3_MOE_BACKEND`); the CPU always loops.
+    pub moe_backend: FishDrama3MoeBackend,
 }
 
 impl Default for FishDrama3TrunkOptions {
@@ -134,6 +143,7 @@ impl Default for FishDrama3TrunkOptions {
         Self {
             precision: FishDrama3CpuPrecision::Q8_0,
             q8_0_tolerance: Q8_0_TOLERANCE,
+            moe_backend: FishDrama3MoeBackend::Fused,
         }
     }
 }
@@ -173,10 +183,20 @@ struct Counters {
     step_rows: AtomicU64,
 }
 
+/// The trunk's weights in its backend's form.
+enum Weights {
+    /// The CPU reference: host norms, Q8_0 or F32 projections.
+    Host {
+        layers: Vec<Layer>,
+        final_norm: Vec<f32>,
+    },
+    /// The Metal forms (`metal::trunk`).
+    Metal(MetalTrunk),
+}
+
 pub struct FishDrama3Trunk {
     config: FishDrama3TrunkConfig,
-    layers: Vec<Layer>,
-    final_norm: Vec<f32>,
+    weights: Weights,
     /// Model layers of the paged domain, in slot order.
     attention_layers: Vec<u32>,
     device: Device,
@@ -188,7 +208,7 @@ pub struct FishDrama3Trunk {
 impl std::fmt::Debug for FishDrama3Trunk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FishDrama3Trunk")
-            .field("layers", &self.layers.len())
+            .field("layers", &self.config.layers.len())
             .field("attention_layers", &self.attention_layers)
             .finish()
     }
@@ -212,15 +232,21 @@ pub(crate) struct LayerTrace {
 }
 
 impl FishDrama3Trunk {
-    /// Loads the trunk on `device` (the CPU; Metal and CUDA are Phase 3),
-    /// after the Q8_0 self-check decides each projection class's form.
+    /// Loads the trunk on `device`: on the CPU after the Q8_0 self-check
+    /// decides each projection class's form; on Metal in its forms, which
+    /// the model's load-time checks (`metal::self_check`) may then move per
+    /// layer.
     pub fn load(
         checkpoint: &FishDrama3Checkpoint,
         config: &FishDrama3Config,
         device: &Device,
         options: FishDrama3TrunkOptions,
     ) -> Result<Self> {
-        FishDrama3Residency::of(device).require_implemented()?;
+        let residency = FishDrama3Residency::of(device);
+        residency.require_implemented()?;
+        if residency == FishDrama3Residency::Metal {
+            return Self::load_metal(checkpoint, config, device, options);
+        }
         let (forms, precision) = decide_cpu_forms(
             checkpoint,
             config,
@@ -283,13 +309,15 @@ impl FishDrama3Trunk {
             .collect::<Result<Vec<_>>>()?;
         let trunk = Self {
             config: t.clone(),
-            layers,
-            final_norm: norm_gain(
-                checkpoint,
-                &format!("{TRUNK_PREFIX}.norm.weight"),
-                h,
-                NormGain::ZeroCentred,
-            )?,
+            weights: Weights::Host {
+                layers,
+                final_norm: norm_gain(
+                    checkpoint,
+                    &format!("{TRUNK_PREFIX}.norm.weight"),
+                    h,
+                    NormGain::ZeroCentred,
+                )?,
+            },
             attention_layers: t
                 .full_attention_layers()
                 .into_iter()
@@ -307,6 +335,70 @@ impl FishDrama3Trunk {
             trunk.precision.q8_fallback_classes
         );
         Ok(trunk)
+    }
+
+    fn load_metal(
+        checkpoint: &FishDrama3Checkpoint,
+        config: &FishDrama3Config,
+        device: &Device,
+        options: FishDrama3TrunkOptions,
+    ) -> Result<Self> {
+        let t = &config.trunk;
+        let metal = MetalTrunk::load(checkpoint, config, options.moe_backend, device)?;
+        let forms = FishDrama3ClassForms::of(FishDrama3Residency::Metal);
+        let precision = FishDrama3PrecisionReport {
+            forms: FishDrama3ProjectionClass::TRUNK
+                .iter()
+                .map(|&class| (class, forms.form(class)))
+                .collect(),
+            ..Default::default()
+        };
+        let trunk = Self {
+            config: t.clone(),
+            weights: Weights::Metal(metal),
+            attention_layers: t
+                .full_attention_layers()
+                .into_iter()
+                .map(|layer| layer as u32)
+                .collect(),
+            device: device.clone(),
+            eps: t.rms_norm_eps as f32,
+            precision,
+            counters: Counters::default(),
+        };
+        tracing::info!(
+            "Loaded the Fish Audio Drama 3 trunk on Metal: {:.2} GiB",
+            trunk.resident_bytes() as f64 / (1u64 << 30) as f64
+        );
+        Ok(trunk)
+    }
+
+    /// The Metal weights, for the load-time checks.
+    pub(crate) fn metal(&self) -> Option<&MetalTrunk> {
+        match &self.weights {
+            Weights::Metal(metal) => Some(metal),
+            Weights::Host { .. } => None,
+        }
+    }
+
+    pub(crate) fn metal_mut(&mut self) -> Option<&mut MetalTrunk> {
+        match &mut self.weights {
+            Weights::Metal(metal) => Some(metal),
+            Weights::Host { .. } => None,
+        }
+    }
+
+    pub(crate) fn precision_mut(&mut self) -> &mut FishDrama3PrecisionReport {
+        &mut self.precision
+    }
+
+    /// The CPU layers (tests reach into them).
+    #[cfg(test)]
+    fn host_layers(&self) -> &[Layer] {
+        match &self.weights {
+            Weights::Host { layers, .. } => layers,
+            Weights::Metal(_) => &[],
+        }
     }
 
     pub fn config(&self) -> &FishDrama3TrunkConfig {
@@ -333,8 +425,11 @@ impl FishDrama3Trunk {
 
     /// Resident bytes of the weights.
     pub fn resident_bytes(&self) -> usize {
-        let layers = self
-            .layers
+        let (layers, final_norm) = match &self.weights {
+            Weights::Host { layers, final_norm } => (layers, final_norm),
+            Weights::Metal(metal) => return metal.resident_bytes(),
+        };
+        let layers = layers
             .iter()
             .map(|layer| {
                 let mixer = match &layer.mixer {
@@ -346,7 +441,7 @@ impl FishDrama3Trunk {
                     + (layer.input_norm.len() + layer.post_norm.len()) * 4
             })
             .sum::<usize>();
-        layers + self.final_norm.len() * 4
+        layers + final_norm.len() * 4
     }
 
     pub fn diagnostics_summary(&self) -> serde_json::Value {
@@ -433,8 +528,13 @@ impl FishDrama3Trunk {
         phase: FishDrama3KernelPhase,
         mut trace: Option<&mut LayerTrace>,
     ) -> Result<Vec<f32>> {
+        let Weights::Host { layers, final_norm } = &self.weights else {
+            return Err(Error::InferenceError(
+                "the Fish Audio Drama 3 host forward runs the CPU weights".into(),
+            ));
+        };
         let h = self.config.hidden;
-        for layer in &self.layers {
+        for layer in layers {
             let normed = rms_norm_rows(&x, h, &layer.input_norm, self.eps);
             let mixed = match &layer.mixer {
                 Mixer::Attention { slot, attention } => {
@@ -457,7 +557,7 @@ impl FishDrama3Trunk {
                 trace.outputs.push(x.clone());
             }
         }
-        Ok(rms_norm_rows(&x, h, &self.final_norm, self.eps))
+        Ok(rms_norm_rows(&x, h, final_norm, self.eps))
     }
 
     fn span(
@@ -468,6 +568,9 @@ impl FishDrama3Trunk {
         cache: &mut PhysicalPagedKvCache,
         trace: Option<&mut LayerTrace>,
     ) -> Result<Tensor> {
+        if let Weights::Metal(metal) = &self.weights {
+            return self.span_metal(metal, embeds, start_pos, state, cache, trace);
+        }
         let (x, n) = self.host_rows(embeds, None)?;
         self.check_clocks(n, start_pos, state, cache)?;
         let mut next = state.layers()?.to_vec();
@@ -555,12 +658,158 @@ impl FishDrama3Trunk {
         Ok((hidden, trace))
     }
 
+    /// The device rows of `embeds` `[n, hidden]`, checked.
+    fn device_rows(&self, embeds: &Tensor, rows: Option<usize>) -> Result<(Tensor, usize)> {
+        let (n, width) = embeds.dims2()?;
+        if width != self.config.hidden || rows.is_some_and(|rows| rows != n) {
+            return Err(Error::InvalidInput(format!(
+                "Fish Audio Drama 3 trunk embeddings are {:?}; expected [{}, {}]",
+                embeds.dims(),
+                rows.map_or("n".to_string(), |rows| rows.to_string()),
+                self.config.hidden
+            )));
+        }
+        Ok((embeds.to_device(&self.device)?.to_dtype(DType::F32)?, n))
+    }
+
+    fn span_metal(
+        &self,
+        metal: &MetalTrunk,
+        embeds: &Tensor,
+        start_pos: usize,
+        state: &mut FishDrama3TrunkState,
+        cache: &mut PhysicalPagedKvCache,
+        trace: Option<&mut LayerTrace>,
+    ) -> Result<Tensor> {
+        let (x, n) = self.device_rows(embeds, None)?;
+        self.check_clocks(n, start_pos, state, cache)?;
+        let mut next = state.layers()?.to_vec();
+        let mut prepared = cache.prepare_append(start_pos, n)?;
+        let result = {
+            let mut rows = [MetalRow {
+                start: start_pos,
+                rows: n,
+                cache: &*cache,
+                prepared: &mut prepared,
+            }];
+            let mut states = [next.as_mut_slice()];
+            metal.run(
+                x,
+                &mut rows,
+                &mut states,
+                FishDrama3KernelPhase::Span,
+                trace,
+            )
+        };
+        match result {
+            Ok(hidden) => {
+                cache.commit_prepared(prepared)?;
+                state.install(next, start_pos + n);
+                self.counters.spans.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .span_rows
+                    .fetch_add(n as u64, Ordering::Relaxed);
+                Ok(hidden)
+            }
+            Err(error) => {
+                let _ = cache.abort_prepared(prepared);
+                Err(error)
+            }
+        }
+    }
+
+    /// A decode step on Metal: every row's append is prepared, the rows run
+    /// together layer by layer, and they commit together.
+    fn steps_metal(
+        &self,
+        metal: &MetalTrunk,
+        embeds: &Tensor,
+        rows: &mut [FishDrama3StepRow<'_>],
+        trace: Option<&mut LayerTrace>,
+    ) -> Result<Tensor> {
+        let (x, count) = self.device_rows(embeds, Some(rows.len()))?;
+        if count == 0 {
+            return Err(Error::InvalidInput("a decode step needs a row".into()));
+        }
+        let mut prepared = Vec::with_capacity(count);
+        let mut next = Vec::with_capacity(count);
+        for row in rows.iter_mut() {
+            let start = row.state.position();
+            let attempt = (|| {
+                self.check_clocks(1, start, row.state, row.cache)?;
+                let layers = row.state.layers()?.to_vec();
+                Ok::<_, Error>((layers, row.cache.prepare_append(start, 1)?))
+            })();
+            match attempt {
+                Ok((layers, step)) => {
+                    next.push(layers);
+                    prepared.push(step);
+                }
+                Err(error) => {
+                    for (row, step) in rows.iter_mut().zip(prepared) {
+                        let _ = row.cache.abort_prepared(step);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let result = {
+            let mut device_rows = rows
+                .iter()
+                .zip(prepared.iter_mut())
+                .map(|(row, step)| MetalRow {
+                    start: row.state.position(),
+                    rows: 1,
+                    cache: &*row.cache,
+                    prepared: step,
+                })
+                .collect::<Vec<_>>();
+            let mut states = next.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>();
+            metal.run(
+                x,
+                &mut device_rows,
+                &mut states,
+                FishDrama3KernelPhase::Step,
+                trace,
+            )
+        };
+        let hidden = match result {
+            Ok(hidden) => hidden,
+            Err(error) => {
+                for (row, step) in rows.iter_mut().zip(prepared) {
+                    let _ = row.cache.abort_prepared(step);
+                }
+                return Err(error);
+            }
+        };
+        for ((row, step), layers) in rows.iter_mut().zip(prepared).zip(next) {
+            let start = row.state.position();
+            row.cache.commit_prepared(step)?;
+            row.state.install(layers, start + 1);
+        }
+        self.counters
+            .step_rows
+            .fetch_add(count as u64, Ordering::Relaxed);
+        self.counters.steps.fetch_add(1, Ordering::Relaxed);
+        Ok(hidden)
+    }
+
     fn steps(
         &self,
         embeds: &Tensor,
         rows: &mut [FishDrama3StepRow<'_>],
         mut trace: Option<&mut LayerTrace>,
     ) -> Result<Tensor> {
+        if let Weights::Metal(metal) = &self.weights {
+            // Metal runs a step's rows together layer by layer; a trace
+            // keeps the CPU's row-major layout for one row only.
+            if trace.is_some() && rows.len() != 1 {
+                return Err(Error::InferenceError(
+                    "a traced Metal step takes one row".into(),
+                ));
+            }
+            return self.steps_metal(metal, embeds, rows, trace);
+        }
         let (x, count) = self.host_rows(embeds, Some(rows.len()))?;
         if count == 0 {
             return Err(Error::InvalidInput("a decode step needs a row".into()));

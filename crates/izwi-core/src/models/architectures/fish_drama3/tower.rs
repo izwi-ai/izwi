@@ -49,10 +49,12 @@
 //! Across a request the domain trails the trunk's by one row once the
 //! prompt is in ([`check_lengths`]).
 //!
-//! Activations and the residual are F32. Projections and heads follow the
-//! CPU policy (Q8_0 after the self-check, or F32), the code embeddings
-//! stay BF16 on the host, and `extra` reads the trunk embedding's codebook
-//! table ([`FishDrama3Embedding::add_codebook_row`]).
+//! On the CPU activations and the residual are F32. Projections and heads
+//! follow the CPU policy (Q8_0 after the self-check, or F32), the code
+//! embeddings stay BF16 on the host, and `extra` reads the trunk
+//! embedding's codebook table ([`FishDrama3Embedding::add_codebook_row`]).
+//! On Metal the layers run in the forms of `metal::tower`, and a decode
+//! step samples its codes on the device (`metal::sampling`).
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -67,6 +69,9 @@ use super::checkpoint::{
 use super::config::{FishDrama3Config, FishDrama3TokenIds, FishDrama3TowerConfig};
 use super::embed::{bf16_table, FishDrama3Embedding, TRUNK_CODEBOOK};
 use super::linear::{FishDrama3KernelPhase, FishDrama3Linear};
+use super::metal::sampling::{count_fallback, count_frames, device_cap};
+use super::metal::tower::{MetalStepCodes, MetalTower};
+use super::metal::MetalRow;
 use super::precision::{decide_cpu_forms, FishDrama3PrecisionReport, Q8_0_TOLERANCE};
 use super::residency::{
     FishDrama3ClassForms, FishDrama3CpuPrecision, FishDrama3ProjectionClass, FishDrama3Residency,
@@ -297,12 +302,22 @@ struct Counters {
 #[cfg(test)]
 pub(crate) type TowerTrace = Vec<Vec<f32>>;
 
+/// The tower's weights in its backend's form.
+enum Weights {
+    /// The CPU reference.
+    Host {
+        /// The shared layers, then the residual ones.
+        layers: Vec<TowerLayer>,
+        /// `[V, dim]` each; head `j` follows residual layer `j`.
+        heads: Vec<FishDrama3Linear>,
+    },
+    /// The Metal forms (`metal::tower`).
+    Metal(MetalTower),
+}
+
 pub struct FishDrama3Tower {
     config: FishDrama3TowerConfig,
-    /// The shared layers, then the residual ones.
-    layers: Vec<TowerLayer>,
-    /// `[V, dim]` each; head `j` follows residual layer `j`.
-    heads: Vec<FishDrama3Linear>,
+    weights: Weights,
     rope: FishDrama3Rope,
     /// Model layers of the paged domain, in slot order.
     attention_layers: Vec<u32>,
@@ -317,8 +332,8 @@ pub struct FishDrama3Tower {
 impl std::fmt::Debug for FishDrama3Tower {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FishDrama3Tower")
-            .field("layers", &self.layers.len())
-            .field("heads", &self.heads.len())
+            .field("layers", &self.attention_layers.len())
+            .field("heads", &self.config.residual_layers())
             .field("attention_layers", &self.attention_layers)
             .finish()
     }
@@ -351,15 +366,34 @@ pub fn check_lengths(trunk_len: usize, tower_len: usize, prompt_rows: usize) -> 
 }
 
 impl FishDrama3Tower {
-    /// Loads the tower on `device` (the CPU; Metal and CUDA are Phase 3),
-    /// after the Q8_0 self-check decides each tower class's form.
+    /// Loads the tower on `device`: on the CPU after the Q8_0 self-check
+    /// decides each tower class's form; on Metal in its forms, which the
+    /// model's load-time checks may then move per layer.
     pub fn load(
         checkpoint: &FishDrama3Checkpoint,
         config: &FishDrama3Config,
         device: &Device,
         options: FishDrama3TowerOptions,
     ) -> Result<Self> {
-        FishDrama3Residency::of(device).require_implemented()?;
+        let residency = FishDrama3Residency::of(device);
+        residency.require_implemented()?;
+        if residency == FishDrama3Residency::Metal {
+            let forms = FishDrama3ClassForms::of(residency);
+            let precision = FishDrama3PrecisionReport {
+                forms: FishDrama3ProjectionClass::TOWER
+                    .iter()
+                    .map(|&class| (class, forms.form(class)))
+                    .collect(),
+                ..Default::default()
+            };
+            let metal = MetalTower::load(checkpoint, config, device)?;
+            return Ok(Self::assemble(
+                config,
+                Weights::Metal(metal),
+                device,
+                precision,
+            ));
+        }
         let (forms, precision) = decide_cpu_forms(
             checkpoint,
             config,
@@ -401,14 +435,29 @@ impl FishDrama3Tower {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
+        Ok(Self::assemble(
+            config,
+            Weights::Host { layers, heads },
+            device,
+            precision,
+        ))
+    }
+
+    fn assemble(
+        config: &FishDrama3Config,
+        weights: Weights,
+        device: &Device,
+        precision: FishDrama3PrecisionReport,
+    ) -> Self {
+        let t = config.tower;
+        let layers = (t.shared_layers + t.residual_layers()) as u32;
         // After the trunk's layers, as sglang numbers them (40..52), so the
         // two paged domains of one group never share a model layer.
         let first = config.trunk.layers.len() as u32;
         let tower = Self {
             config: t,
-            attention_layers: (first..first + layers.len() as u32).collect(),
-            layers,
-            heads,
+            weights,
+            attention_layers: (first..first + layers).collect(),
             rope: FishDrama3Rope::new(&t.attention),
             ids: config.ids,
             max_positions: config.trunk.max_positions,
@@ -423,7 +472,36 @@ impl FishDrama3Tower {
             tower.resident_bytes() as f64 / (1u64 << 30) as f64,
             tower.precision.q8_fallback_classes
         );
-        Ok(tower)
+        tower
+    }
+
+    /// The Metal weights, for the load-time checks.
+    pub(crate) fn metal(&self) -> Option<&MetalTower> {
+        match &self.weights {
+            Weights::Metal(metal) => Some(metal),
+            Weights::Host { .. } => None,
+        }
+    }
+
+    pub(crate) fn metal_mut(&mut self) -> Option<&mut MetalTower> {
+        match &mut self.weights {
+            Weights::Metal(metal) => Some(metal),
+            Weights::Host { .. } => None,
+        }
+    }
+
+    pub(crate) fn precision_mut(&mut self) -> &mut FishDrama3PrecisionReport {
+        &mut self.precision
+    }
+
+    /// The CPU layers and heads (the CPU path and tests).
+    fn host(&self) -> Result<(&[TowerLayer], &[FishDrama3Linear])> {
+        match &self.weights {
+            Weights::Host { layers, heads } => Ok((layers, heads)),
+            Weights::Metal(_) => Err(Error::InferenceError(
+                "the Fish Audio Drama 3 host tower runs the CPU weights".into(),
+            )),
+        }
     }
 
     pub fn config(&self) -> &FishDrama3TowerConfig {
@@ -439,13 +517,16 @@ impl FishDrama3Tower {
         &self.precision
     }
 
-    /// Resident bytes of the weights (the code embeddings on the host).
+    /// Resident bytes of the weights (the code embeddings on the host on
+    /// the CPU, on the device on Metal).
     pub fn resident_bytes(&self) -> usize {
-        self.layers
-            .iter()
-            .map(TowerLayer::resident_bytes)
-            .sum::<usize>()
-            + self.heads.iter().map(|h| h.resident_bytes()).sum::<usize>()
+        match &self.weights {
+            Weights::Host { layers, heads } => {
+                layers.iter().map(TowerLayer::resident_bytes).sum::<usize>()
+                    + heads.iter().map(|h| h.resident_bytes()).sum::<usize>()
+            }
+            Weights::Metal(metal) => metal.resident_bytes(),
+        }
     }
 
     pub fn diagnostics_summary(&self) -> serde_json::Value {
@@ -682,7 +763,15 @@ impl FishDrama3Tower {
         n: usize,
         phase: FishDrama3KernelPhase,
     ) -> Result<Vec<f32>> {
-        self.heads[index].forward_host(h, n, phase)
+        if let Weights::Metal(metal) = &self.weights {
+            let h = Tensor::from_slice(h, (n, self.config.dim), &self.device)?;
+            return Ok(metal
+                .head_logits(index, &h, phase, None)?
+                .flatten_all()?
+                .to_device(&Device::Cpu)?
+                .to_vec1::<f32>()?);
+        }
+        self.host()?.1[index].forward_host(h, n, phase)
     }
 
     /// The layers over `n` teacher-forced rows: `inputs` and `labels` hold
@@ -700,13 +789,14 @@ impl FishDrama3Tower {
         prepared: &mut PreparedPhysicalPagedStep,
         mut trace: Option<&mut Vec<Vec<f32>>>,
     ) -> Result<()> {
+        let (layers, _) = self.host()?;
         let d = self.config.dim;
         let width = self.config.frame_width();
         let mut extra = vec![0f32; n * d];
         for (input, out) in inputs.chunks_exact(width).zip(extra.chunks_exact_mut(d)) {
             self.add_extra(embedding, input, out)?;
         }
-        for slot in 0..self.layers.len() {
+        for slot in 0..layers.len() {
             let column = 1 + injected_code(slot, self.config.shared_layers);
             let mut e = if slot == 0 {
                 extra.clone()
@@ -715,11 +805,11 @@ impl FishDrama3Tower {
             };
             for (label, out) in labels.chunks_exact(width).zip(e.chunks_exact_mut(d)) {
                 if self.ids.is_semantic(label[0]) {
-                    self.layers[slot].add_code(label[column], out);
+                    layers[slot].add_code(label[column], out);
                 }
             }
             x = self.layer(
-                &self.layers[slot],
+                &layers[slot],
                 slot,
                 &e,
                 &x,
@@ -746,6 +836,9 @@ impl FishDrama3Tower {
         trace: Option<&mut Vec<Vec<f32>>>,
     ) -> Result<()> {
         self.check_embedding(embedding)?;
+        if let Weights::Metal(metal) = &self.weights {
+            return self.span_metal(metal, embedding, hidden, frames, start_pos, cache, trace);
+        }
         let (x, n) = self.host_rows(hidden, None)?;
         let width = self.config.frame_width();
         if frames.len() != (n + 1) * width {
@@ -845,21 +938,22 @@ impl FishDrama3Tower {
             Codes::Sample(_) => (true, main - self.ids.semantic_start),
             Codes::Forced { label, .. } => (self.ids.is_semantic(main), label[1]),
         };
+        let (layers, _) = self.host()?;
         let mut frame = Vec::with_capacity(self.config.frame_width());
         frame.extend([main, c0]);
         let mut extra = vec![0f32; d];
         self.add_extra(embedding, input, &mut extra)?;
-        for slot in 0..self.layers.len() {
+        for slot in 0..layers.len() {
             let mut e = if slot == 0 {
                 std::mem::take(&mut extra)
             } else {
                 vec![0f32; d]
             };
             if labelled {
-                self.layers[slot].add_code(frame[1 + injected_code(slot, shared)], &mut e);
+                layers[slot].add_code(frame[1 + injected_code(slot, shared)], &mut e);
             }
             x = self.layer(
-                &self.layers[slot],
+                &layers[slot],
                 slot,
                 &e,
                 &x,
@@ -902,6 +996,9 @@ impl FishDrama3Tower {
         rows: Vec<(&mut PhysicalPagedKvCache, &[u32], u32, Codes<'a>)>,
     ) -> Result<Vec<(Vec<u32>, Codes<'a>)>> {
         self.check_embedding(embedding)?;
+        if let Weights::Metal(metal) = &self.weights {
+            return self.steps_metal(metal, embedding, hidden, rows);
+        }
         let (x, count) = self.host_rows(hidden, Some(rows.len()))?;
         if count == 0 {
             return Err(Error::InvalidInput("a decode step needs a row".into()));
@@ -1062,6 +1159,274 @@ impl FishDrama3Tower {
             }
         }
         Ok((logits, outputs))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn span_metal(
+        &self,
+        metal: &MetalTower,
+        embedding: &FishDrama3Embedding,
+        hidden: &Tensor,
+        frames: &[u32],
+        start_pos: usize,
+        cache: &mut PhysicalPagedKvCache,
+        trace: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<()> {
+        let (n, width) = hidden.dims2()?;
+        let fw = self.config.frame_width();
+        if width != self.config.dim || frames.len() != (n + 1) * fw {
+            return Err(Error::InvalidInput(format!(
+                "a Fish Audio Drama 3 tower span of {:?} hidden rows takes {} frames; got {} \
+                 values",
+                hidden.dims(),
+                n + 1,
+                frames.len()
+            )));
+        }
+        self.check_clocks(n, start_pos, cache)?;
+        let hidden = hidden.to_device(&self.device)?.to_dtype(DType::F32)?;
+        let mut prepared = cache.prepare_append(start_pos, n)?;
+        let result = {
+            let mut rows = [MetalRow {
+                start: start_pos,
+                rows: n,
+                cache: &*cache,
+                prepared: &mut prepared,
+            }];
+            metal.span(
+                embedding,
+                &hidden,
+                &frames[..n * fw],
+                &frames[fw..],
+                fw,
+                |main| self.ids.is_semantic(main),
+                &mut rows,
+            )
+        };
+        match result {
+            Ok(outputs) => {
+                cache.commit_prepared(prepared)?;
+                self.counters.spans.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .span_rows
+                    .fetch_add(n as u64, Ordering::Relaxed);
+                if let Some(trace) = trace {
+                    for output in outputs {
+                        trace.push(
+                            output
+                                .to_dtype(DType::F32)?
+                                .flatten_all()?
+                                .to_device(&Device::Cpu)?
+                                .to_vec1::<f32>()?,
+                        );
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let _ = cache.abort_prepared(prepared);
+                Err(error)
+            }
+        }
+    }
+
+    /// A decode step on Metal. Sampled rows draw their codes on the device
+    /// (each row's exponentials taken from its sampler in head order, as
+    /// the host draws them) unless a row's head cap exceeds the device's
+    /// ranks; forced rows inject their label's codes.
+    fn steps_metal<'a>(
+        &self,
+        metal: &MetalTower,
+        embedding: &FishDrama3Embedding,
+        hidden: &Tensor,
+        rows: Vec<(&mut PhysicalPagedKvCache, &[u32], u32, Codes<'a>)>,
+    ) -> Result<Vec<(Vec<u32>, Codes<'a>)>> {
+        let count = rows.len();
+        let (n, width) = hidden.dims2()?;
+        if count == 0 || n != count || width != self.config.dim {
+            return Err(Error::InvalidInput(format!(
+                "Fish Audio Drama 3 tower hidden rows are {:?} for {count} requests",
+                hidden.dims()
+            )));
+        }
+        let fw = self.config.frame_width();
+        let mut caches = Vec::with_capacity(count);
+        let mut prepared = Vec::with_capacity(count);
+        let mut sources = Vec::with_capacity(count);
+        let mut inputs = Vec::with_capacity(count * fw);
+        let mut mains = Vec::with_capacity(count);
+        let mut failure = None;
+        for (cache, input, main, codes) in rows {
+            let position = cache.context_len();
+            let attempt = (|| {
+                self.frame(input, "input")?;
+                if let Codes::Forced { label, .. } = &codes {
+                    self.frame(label, "label")?;
+                } else if !self.ids.is_semantic(main) {
+                    return Err(Error::InvalidInput(format!(
+                        "a Fish Audio Drama 3 frame's main token {main} is not semantic; \
+                         eos stops before the tower"
+                    )));
+                }
+                self.check_clocks(1, position, cache)?;
+                cache.prepare_append(position, 1)
+            })();
+            match attempt {
+                Ok(step) => {
+                    prepared.push(step);
+                    caches.push(cache);
+                    inputs.extend_from_slice(input);
+                    mains.push(main);
+                    sources.push(codes);
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = failure {
+            for (cache, step) in caches.into_iter().zip(prepared) {
+                let _ = cache.abort_prepared(step);
+            }
+            return Err(error);
+        }
+        let mut c0 = Vec::with_capacity(count);
+        let mut labelled = Vec::with_capacity(count);
+        for (main, source) in mains.iter().zip(&sources) {
+            match source {
+                Codes::Sample(_) => {
+                    c0.push(main - self.ids.semantic_start);
+                    labelled.push(true);
+                }
+                Codes::Forced { label, .. } => {
+                    c0.push(label[1]);
+                    labelled.push(self.ids.is_semantic(*main));
+                }
+            }
+        }
+        let resident = sources.iter().all(|source| match source {
+            Codes::Sample(sampler) => device_cap(&sampler.params().heads).is_some(),
+            Codes::Forced { .. } => false,
+        });
+        let vocab = self.config.codebook_vocab;
+        let heads = metal.heads();
+        let hidden = hidden.to_device(&self.device)?.to_dtype(DType::F32)?;
+        let result = (|| {
+            let mut device_rows = caches
+                .iter()
+                .zip(prepared.iter_mut())
+                .map(|(cache, step)| MetalRow {
+                    start: cache.context_len(),
+                    rows: 1,
+                    cache,
+                    prepared: step,
+                })
+                .collect::<Vec<_>>();
+            if resident {
+                let mut noise = Vec::with_capacity(count * heads * vocab);
+                let mut policies = Vec::with_capacity(count);
+                for source in sources.iter_mut() {
+                    if let Codes::Sample(sampler) = source {
+                        policies.push(sampler.params().heads);
+                        for _ in 0..heads {
+                            noise.extend(sampler.exponentials(vocab)?);
+                        }
+                    }
+                }
+                let noise = Tensor::from_vec(noise, (count, heads, vocab), &self.device)?;
+                return metal.step(
+                    embedding,
+                    &hidden,
+                    &inputs,
+                    &c0,
+                    &labelled,
+                    &mut device_rows,
+                    MetalStepCodes::Device { policies, noise },
+                );
+            }
+            let mut pick = |head: usize, logits: &Tensor| -> Result<Vec<u32>> {
+                let host = logits.to_device(&Device::Cpu)?.to_vec2::<f32>()?;
+                sources
+                    .iter_mut()
+                    .zip(host)
+                    .map(|(source, row)| match source {
+                        Codes::Sample(sampler) => {
+                            count_fallback();
+                            sampler.sample_code(&row)
+                        }
+                        Codes::Forced {
+                            label,
+                            logits: kept,
+                            ..
+                        } => {
+                            kept.extend(row);
+                            Ok(label[2 + head])
+                        }
+                    })
+                    .collect()
+            };
+            metal.step(
+                embedding,
+                &hidden,
+                &inputs,
+                &c0,
+                &labelled,
+                &mut device_rows,
+                MetalStepCodes::Host(&mut pick),
+            )
+        })();
+        let (codes, outputs) = match result {
+            Ok(done) => done,
+            Err(error) => {
+                for (cache, step) in caches.into_iter().zip(prepared) {
+                    let _ = cache.abort_prepared(step);
+                }
+                return Err(error);
+            }
+        };
+        if sources
+            .iter()
+            .any(|source| matches!(source, Codes::Forced { .. }))
+        {
+            let layers = outputs
+                .iter()
+                .map(|output| -> Result<Vec<Vec<f32>>> {
+                    Ok(output
+                        .to_dtype(DType::F32)?
+                        .to_device(&Device::Cpu)?
+                        .to_vec2::<f32>()?)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (r, source) in sources.iter_mut().enumerate() {
+                if let Codes::Forced { outputs, .. } = source {
+                    for layer in &layers {
+                        outputs.extend_from_slice(&layer[r]);
+                    }
+                }
+            }
+        }
+        if resident {
+            count_frames(count);
+        }
+        let mut out = Vec::with_capacity(count);
+        for (((cache, step), source), (main, (c0, codes))) in caches
+            .into_iter()
+            .zip(prepared)
+            .zip(sources)
+            .zip(mains.iter().zip(c0.iter().zip(codes)))
+        {
+            cache.commit_prepared(step)?;
+            let mut frame = Vec::with_capacity(fw);
+            frame.extend([*main, *c0]);
+            frame.extend(codes);
+            out.push((frame, source));
+        }
+        self.counters
+            .step_rows
+            .fetch_add(count as u64, Ordering::Relaxed);
+        self.counters.steps.fetch_add(1, Ordering::Relaxed);
+        Ok(out)
     }
 
     /// Begins a quantum: a rollback point of `cache`, the request's tower
@@ -1607,7 +1972,7 @@ mod tests {
                     n,
                 ));
                 let one = || caches_for(&[tower.attention_layers()[index]], config, 1).remove(0);
-                let layer = &tower.layers[index];
+                let layer = &tower.host().unwrap().0[index];
                 let mut cache = one();
                 let mut prepared = cache.prepare_append(0, n).unwrap();
                 let span = tower
@@ -2433,11 +2798,9 @@ mod tests {
             };
             assert_eq!(*form, expected, "{class:?}");
         }
-        assert!(tower
-            .heads
-            .iter()
-            .all(|h| h.form() == FishDrama3WeightForm::F32));
-        assert_eq!(tower.layers[0].wqkv.form(), FishDrama3WeightForm::Q8_0);
+        let (layers, heads) = tower.host().unwrap();
+        assert!(heads.iter().all(|h| h.form() == FishDrama3WeightForm::F32));
+        assert_eq!(layers[0].wqkv.form(), FishDrama3WeightForm::Q8_0);
         assert_eq!(
             tower.diagnostics_summary()["precision"]["q8_0_fallback_classes"],
             1

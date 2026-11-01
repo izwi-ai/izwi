@@ -29,8 +29,9 @@
 //! per-tensor instantiation slack of the 62,245 tensors, and on Metal and
 //! CUDA the fused MoE's expert stacking (4/3 of one layer's experts). CUDA
 //! also authorizes its host staging window. The reference cache is a
-//! deferred host charge. Only the CPU loads today; Metal's and CUDA's
-//! arithmetic prices their admission ahead of Phase 3.
+//! deferred host charge. The CPU and Metal load in these forms (a Metal
+//! load holds exactly what this prices, `a_metal_load_holds_what_its_census_prices`);
+//! CUDA's arithmetic prices its admission ahead of its residency.
 //!
 //! A machine whose memory can never hold the weights and one request is
 //! refused here, with the numbers, before anything is evicted or read
@@ -51,7 +52,7 @@ use crate::models::architectures::fish_drama3::codec::{
     FishDrama3CodecMemory, FishDrama3DacConfig,
 };
 use crate::models::architectures::fish_drama3::config::FishDrama3Config;
-use crate::models::architectures::fish_drama3::physical::{kv_dtype, state_contract};
+use crate::models::architectures::fish_drama3::physical::state_contract;
 use crate::models::architectures::fish_drama3::reference_cache::FISH_DRAMA3_REFERENCE_CACHE_BYTES;
 use crate::models::architectures::fish_drama3::residency::{
     FishDrama3Residency, FishDrama3WeightForm,
@@ -356,7 +357,7 @@ pub(super) fn retained_state_contract(
 ) -> Result<InferenceStateContract> {
     state_contract(
         &published_config(model_path)?,
-        kv_dtype(backend),
+        crate::runtime::fish_drama3_capacity::planned_kv_dtype(backend)?,
         crate::models::shared::attention::paged::default_kv_page_size(),
     )
 }
@@ -677,5 +678,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(measured, PINNED_CODEC_MEMORY);
+    }
+
+    /// What a Metal load holds is what its census prices, part for part
+    /// but the codec (the synthetic checkpoint's census is priced as the
+    /// published one is): stacked raw FP8 experts and F32 scales, packed
+    /// F16 projections, F32 small tensors, F16 tables and head.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_metal_load_holds_what_its_census_prices() {
+        use crate::models::architectures::fish_drama3::model::tests::{
+            write_synthetic_model_in, StubCodec,
+        };
+        use crate::models::architectures::fish_drama3::synthetic::SyntheticGeometry;
+        use crate::models::architectures::fish_drama3::{FishDrama3Model, FishDrama3ModelOptions};
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("a_metal_load_holds_what_its_census_prices")
+        else {
+            return;
+        };
+        let synthetic = write_synthetic_model_in(5, SyntheticGeometry::KernelHeads, |_| {});
+        let model = FishDrama3Model::load_with_codec(
+            synthetic.path(),
+            &device,
+            FishDrama3ModelOptions {
+                config_policy: FishDrama3ConfigPolicy::Synthetic,
+                ..Default::default()
+            },
+            std::sync::Arc::new(StubCodec),
+        )
+        .unwrap();
+        let estimate = census_estimate(&synthetic.config, BackendKind::Metal).unwrap();
+        let held = model.trunk().resident_bytes()
+            + model.tower().resident_bytes()
+            + model.head().resident_bytes()
+            + model.embedding().device_bytes();
+        assert_eq!(held as u64, estimate.resident_bytes - estimate.parts.codec);
+        assert_eq!(model.head().resident_bytes() as u64, estimate.parts.head);
+        assert_eq!(model.embedding().host_bytes(), 0);
     }
 }

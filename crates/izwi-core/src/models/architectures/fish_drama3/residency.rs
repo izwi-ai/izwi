@@ -2,21 +2,22 @@
 //!
 //! | Weight | CPU | Metal | CUDA |
 //! |---|---|---|---|
-//! | Routed experts | Q8_0 (FP8 → F32 → Q8_0 at load) | raw E4M3 + F32 block scales | raw E4M3 + F32 block scales |
-//! | Dense trunk projections, shared expert | Q8_0 | F16 | BF16 |
+//! | Routed experts | Q8_0 (FP8 → F32 → Q8_0 at load) | raw E4M3 + F32 block scales, stacked per layer | raw E4M3 + F32 block scales |
+//! | Dense trunk projections, shared expert | Q8_0 | F16; q/k/v and qkv+z packed | BF16 |
 //! | Norm gains, router, shared-expert gate, DeltaNet gates, `A_log`, `dt_bias`, conv | F32 | F32 | F32 |
-//! | Embedding (and the frame codebooks) | BF16 host table, gathered to F32 | — | — |
-//! | Compact main head | F32 | — | — |
-//! | Tower projections and codebook heads (BF16) | Q8_0 | F16 | BF16 |
-//! | Tower code embeddings | BF16 host tables, gathered to F32 | — | — |
+//! | Embedding (and the frame codebooks) | BF16 host table, gathered to F32 | F16 device tables, gathered to F32 | — |
+//! | Compact main head | F32 | F16 | — |
+//! | Tower projections and codebook heads (BF16) | Q8_0 | F16; `wqkv` repacked per head | BF16 |
+//! | Tower code embeddings | BF16 host tables, gathered to F32 | F16 device tables | — |
 //!
 //! The DeltaNet gate projections `in_proj_a` / `in_proj_b` (32 rows each)
 //! stay F32 beside the router: they feed `exp` and `softplus` decays, and
 //! they are 0.4% of the dense bytes.
 //!
 //! A CPU load checks each Q8_0 projection class against F32 first
-//! (`precision.rs`); a class over tolerance stays F32. Only the CPU column
-//! loads today: Metal and CUDA are Phase 3 and refused until then.
+//! (`precision.rs`); a class over tolerance stays F32. A Metal load runs its
+//! own checks (`metal::self_check`): a layer whose activations leave F16's
+//! range runs them in F32. CUDA is refused until its residency lands.
 
 use std::collections::BTreeMap;
 
@@ -38,11 +39,11 @@ pub enum FishDrama3WeightForm {
     /// ggml Q8_0 blocks (34 B per 32 values), CPU `QMatMul`.
     Q8_0,
     F32,
-    /// Metal dense (Phase 3).
+    /// Metal dense: F16 weights on the device.
     F16,
     /// CUDA dense (Phase 3).
     Bf16,
-    /// E4M3 codes plus their F32 block scales, unchanged (Phase 3).
+    /// E4M3 codes plus their F32 block scales, unchanged (Metal, CUDA).
     RawFp8,
 }
 
@@ -161,9 +162,9 @@ impl FishDrama3Residency {
     /// Refuses the backends whose forms are not implemented yet.
     pub fn require_implemented(self) -> Result<()> {
         match self {
-            Self::Cpu => Ok(()),
-            Self::Metal | Self::Cuda => Err(Error::ModelLoadError(format!(
-                "Fish Audio Drama 3 has no {self:?} weight residency yet; load it on the CPU"
+            Self::Cpu | Self::Metal => Ok(()),
+            Self::Cuda => Err(Error::ModelLoadError(format!(
+                "Fish Audio Drama 3 has no {self:?} weight residency yet; load it on the CPU or Metal"
             ))),
         }
     }
@@ -242,7 +243,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn each_backend_names_its_forms_and_only_the_cpu_loads() {
+    fn each_backend_names_its_forms_and_cuda_is_refused() {
         use FishDrama3WeightForm::*;
         let cpu = FishDrama3ClassForms::of(FishDrama3Residency::Cpu);
         assert!(cpu.iter().all(|(_, form)| form == Q8_0));
@@ -253,7 +254,7 @@ mod tests {
         assert_eq!(cuda.form(FishDrama3ProjectionClass::SharedExpert), Bf16);
         assert_eq!(cuda.form(FishDrama3ProjectionClass::RoutedExpert), RawFp8);
         assert!(FishDrama3Residency::Cpu.require_implemented().is_ok());
-        assert!(FishDrama3Residency::Metal.require_implemented().is_err());
+        assert!(FishDrama3Residency::Metal.require_implemented().is_ok());
         assert!(FishDrama3Residency::Cuda.require_implemented().is_err());
         // A published routed expert projection, [512, 2048].
         assert_eq!(Q8_0.bytes(512, 2048), 1_114_112);

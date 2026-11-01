@@ -33,6 +33,7 @@ pub mod config;
 pub mod embed;
 pub mod head;
 pub mod linear;
+pub mod metal;
 pub mod model;
 pub mod physical;
 pub mod precision;
@@ -58,6 +59,7 @@ pub use config::{FishDrama3Config, FishDrama3ConfigPolicy};
 pub use embed::FishDrama3Embedding;
 pub use head::FishDrama3CompactHead;
 pub use linear::FishDrama3KernelPhase;
+pub use metal::trunk::FishDrama3MoeBackend;
 pub use model::{
     FishDrama3AudioCandidate, FishDrama3AudioStream, FishDrama3CancelCheck, FishDrama3ChunkPlan,
     FishDrama3ChunkResult, FishDrama3ChunkSession, FishDrama3ChunkSessionOptions,
@@ -66,7 +68,7 @@ pub use model::{
     FishDrama3RequestState, FishDrama3StateGeometry, FishDrama3Step, FishDrama3StopReason,
     FishDrama3Synthesis,
 };
-pub use precision::FishDrama3PrecisionReport;
+pub use precision::{FishDrama3MetalChecks, FishDrama3PrecisionReport};
 pub use prompt::{FishDrama3Codes, FishDrama3HistoryTurn, FishDrama3Prompt, FishDrama3Reference};
 pub use reference_cache::FishDrama3ReferenceAudio;
 pub use residency::{FishDrama3CpuPrecision, FishDrama3Residency, FishDrama3WeightForm};

@@ -1,6 +1,9 @@
 //! The family's model loop (§3.5, §7.1–7.5): the embedding, trunk, tower,
 //! compact head, sampler and codec composed into prefill spans, decode
-//! quanta and finished generations, on the CPU.
+//! quanta and finished generations, on the CPU and on Metal. A Metal load
+//! runs its self-checks (`metal::self_check`) before it serves, and its
+//! decode samples on the device with two readbacks a frame
+//! (`metal::sampling`).
 //!
 //! A request ([`FishDrama3RequestState`]) owns its retained state: the
 //! trunk's DeltaNet state, its two paged KV views ("trunk" and "tower",
@@ -59,10 +62,16 @@ use super::codec::{
 use super::config::{FishDrama3Config, FishDrama3ConfigPolicy};
 use super::embed::{prompt_rows, FishDrama3Embedding};
 use super::head::FishDrama3CompactHead;
+use super::metal::sampling::{
+    count_fallback, device_cap, race as device_race, rank, read_back, DEVICE_RANKS,
+};
+use super::precision::{activation_dtype, check_activations, moe_backend, FishDrama3MetalChecks};
 use super::prompt::{FishDrama3Codes, FishDrama3Prompt, FishDrama3Reference};
 use super::reference_cache::{FishDrama3ReferenceAudio, FishDrama3ReferenceCache, MAX_REFERENCES};
+use super::residency::FishDrama3Residency;
 use super::sampling::{
-    FishDrama3RowSampler, FishDrama3SamplerCheckpoint, FishDrama3SamplingParams,
+    race as host_race, FishDrama3DrawPolicy, FishDrama3MainDraw, FishDrama3RowSampler,
+    FishDrama3SamplerCheckpoint, FishDrama3SamplingParams,
 };
 use super::tokenizer::FishDrama3Tokenizer;
 use super::tower::{
@@ -94,6 +103,25 @@ pub use session::{
 
 /// Prefill rows per span on the CPU and Metal (CUDA takes 1,024 in Phase 3).
 pub const DEFAULT_PREFILL_SPAN_ROWS: usize = 256;
+
+/// Overrides the prefill grid's cell: rows per span, fixed per load (the
+/// scheduler's grid reads it back from the model).
+pub const PREFILL_SPAN_ENV: &str = "IZWI_FISH_DRAMA3_PREFILL_SPAN";
+
+/// The prefill grid's cell from `raw` (the [`PREFILL_SPAN_ENV`] value),
+/// else `default`: 1 to 8,192 rows (one cell never exceeds a prompt).
+pub fn prefill_span_rows(raw: Option<&str>, default: usize) -> Result<usize> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(default);
+    };
+    match raw.parse::<usize>() {
+        Ok(rows) if (1..=super::prompt::MAX_PROMPT_ROWS).contains(&rows) => Ok(rows),
+        _ => Err(Error::ConfigError(format!(
+            "{PREFILL_SPAN_ENV}={raw} must be a row count from 1 to {}",
+            super::prompt::MAX_PROMPT_ROWS
+        ))),
+    }
+}
 
 /// Polled between quanta: an `Err` (normally [`Error::Cancelled`]) stops a
 /// request at its last committed boundary.
@@ -190,6 +218,9 @@ pub struct FishDrama3ModelOptions {
     pub prefill_span_rows: usize,
     /// [`FishDrama3ConfigPolicy::Published`] except for test checkpoints.
     pub config_policy: FishDrama3ConfigPolicy,
+    /// A Metal load's activation dtype: `None` for the backend's (F16),
+    /// `Some(F32)` for F32 throughout (`IZWI_FISH_DRAMA3_DTYPE`).
+    pub activations: Option<DType>,
 }
 
 impl Default for FishDrama3ModelOptions {
@@ -199,7 +230,33 @@ impl Default for FishDrama3ModelOptions {
             tower: FishDrama3TowerOptions::default(),
             prefill_span_rows: DEFAULT_PREFILL_SPAN_ROWS,
             config_policy: FishDrama3ConfigPolicy::Published,
+            activations: None,
         }
+    }
+}
+
+impl FishDrama3ModelOptions {
+    /// The defaults with the load-time environment over them for a load on
+    /// `residency`: `IZWI_FISH_DRAMA3_DTYPE`, `IZWI_FISH_DRAMA3_MOE_BACKEND`
+    /// and `IZWI_FISH_DRAMA3_PREFILL_SPAN` (over `prefill_span_rows`, the
+    /// backend's default cell), each validated.
+    pub fn from_env(residency: FishDrama3Residency, prefill_span_rows: usize) -> Result<Self> {
+        let read = |name: &str| std::env::var(name).ok();
+        Ok(Self {
+            trunk: FishDrama3TrunkOptions {
+                moe_backend: moe_backend(read(super::precision::MOE_BACKEND_ENV).as_deref())?,
+                ..Default::default()
+            },
+            prefill_span_rows: self::prefill_span_rows(
+                read(PREFILL_SPAN_ENV).as_deref(),
+                prefill_span_rows,
+            )?,
+            activations: Some(activation_dtype(
+                residency,
+                read(super::precision::DTYPE_ENV).as_deref(),
+            )?),
+            ..Self::default()
+        })
     }
 }
 
@@ -480,6 +537,12 @@ impl FishDrama3RequestState {
         Ok(())
     }
 
+    /// `h_t` on the host, for exact comparisons in tests.
+    #[cfg(test)]
+    pub(crate) fn last_hidden_values(&self) -> Vec<f32> {
+        host_values(self.last_hidden().unwrap()).unwrap()
+    }
+
     fn last_hidden(&self) -> Result<&Tensor> {
         self.last_hidden.as_ref().ok_or_else(|| {
             Error::InferenceError("Fish Audio Drama 3 request has no trunk hidden yet".into())
@@ -583,6 +646,11 @@ pub struct FishDrama3Model {
     reference_cache: FishDrama3ReferenceCache,
     device: Device,
     prefill_span_rows: usize,
+    /// Both paged domains' dtype: F32 on the CPU, F16 on Metal unless a
+    /// load-time check put them in F32.
+    kv_dtype: DType,
+    /// What a Metal load's checks found (`None` on the CPU).
+    metal_checks: Option<FishDrama3MetalChecks>,
     /// The content identity a durable speech checkpoint records
     /// ([`super::artifacts::pinned_fingerprint`]), set by the loader.
     artifact_fingerprint: Option<String>,
@@ -606,25 +674,29 @@ fn private_cache_error(message: impl Into<String>) -> Error {
 /// Page size of the helpers' private arenas.
 const PRIVATE_PAGE_TOKENS: usize = 16;
 
-/// A private, request-sized F32 cache over `domain` for `tokens`
-/// positions, outside any lifecycle-owned arena: the whole-generation
-/// helpers use it; the engine passes lease-backed views instead. Distinct
-/// `generation`s keep the two domains' arena ids apart, so a checkpoint of
-/// one never restores into the other.
-fn private_cache(
+/// A private, request-sized cache over `domain` for `tokens` positions on
+/// `device` in `dtype`, outside any lifecycle-owned arena: the
+/// whole-generation helpers use it; the engine passes lease-backed views
+/// instead. Distinct `generation`s keep the two domains' arena ids apart,
+/// so a checkpoint of one never restores into the other.
+pub(crate) fn private_cache(
     domain: &FishDrama3PagedDomain,
     tokens: usize,
     generation: u32,
+    device: &Device,
+    dtype: DType,
 ) -> Result<PhysicalPagedKvCache> {
     let u32_of = |value: usize, what: &str| {
         u32::try_from(value).map_err(|_| private_cache_error(format!("{what} exceeds u32")))
     };
     let pages = tokens.div_ceil(PRIVATE_PAGE_TOKENS).max(1);
+    let backend = crate::backends::backend_kind_for_device(device);
     let id = KvArenaId {
         // Never registered with the engine, like the load-time probes.
         model_instance: crate::engine::ModelInstanceId::new(u64::MAX),
-        backend: BackendKind::Cpu,
-        device_ordinal: None,
+        backend,
+        // Metal's location is a registry id the arena does not compare.
+        device_ordinal: (backend != BackendKind::Cpu).then_some(0),
         generation,
     };
     let group = KvGroupId::new(0);
@@ -645,7 +717,7 @@ fn private_cache(
         page_tokens: PRIVATE_PAGE_TOKENS as u32,
         capacity_pages: u32_of(pages, "page count")?,
         growth: None,
-        dtype: DType::F32,
+        dtype,
         layers: bindings
             .iter()
             .map(|&binding| {
@@ -658,7 +730,22 @@ fn private_cache(
             })
             .collect::<Result<Vec<_>>>()?,
     };
-    let arena: Arc<dyn KvArena> = Arc::new(CpuKvArena::new(config)?);
+    let arena: Arc<dyn KvArena> = match backend {
+        BackendKind::Cpu => Arc::new(CpuKvArena::new(config)?),
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        BackendKind::Metal | BackendKind::Cuda => Arc::new(
+            crate::backends::kv::CandleAcceleratorKvArena::new_mutation_only(
+                config,
+                device.clone(),
+            )?,
+        ),
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        BackendKind::Metal | BackendKind::Cuda => {
+            return Err(private_cache_error(
+                "an accelerator cache needs the metal or cuda feature",
+            ))
+        }
+    };
     let blocks = (0..pages)
         .map(|index| {
             Ok(CacheBlockRef {
@@ -681,8 +768,8 @@ fn host_values(tensor: &Tensor) -> Result<Vec<f32>> {
 }
 
 impl FishDrama3Model {
-    /// Loads the model and its DAC from `model_dir` on `device` (the CPU;
-    /// Metal and CUDA are Phase 3).
+    /// Loads the model and its DAC from `model_dir` on `device` (the CPU or
+    /// Metal; CUDA is refused until its residency lands).
     pub fn load(
         model_dir: &Path,
         device: &Device,
@@ -720,10 +807,27 @@ impl FishDrama3Model {
         let tokenizer = FishDrama3Tokenizer::load(model_dir, &config)?;
         let checkpoint = FishDrama3Checkpoint::open(model_dir)?;
         checkpoint.validate_census(&config)?;
-        let embedding = FishDrama3Embedding::load(&checkpoint, &config)?;
-        let trunk = FishDrama3Trunk::load(&checkpoint, &config, device, options.trunk)?;
-        let tower = FishDrama3Tower::load(&checkpoint, &config, device, options.tower)?;
-        let head = FishDrama3CompactHead::load(&checkpoint, &config, device)?;
+        let residency = FishDrama3Residency::of(device);
+        residency.require_implemented()?;
+        let activations = check_activations(residency, options.activations)?;
+        let embedding = FishDrama3Embedding::load_on(&checkpoint, &config, device)?;
+        let mut trunk = FishDrama3Trunk::load(&checkpoint, &config, device, options.trunk)?;
+        let mut tower = FishDrama3Tower::load(&checkpoint, &config, device, options.tower)?;
+        let mut head = FishDrama3CompactHead::load(&checkpoint, &config, device)?;
+        let (kv_dtype, metal_checks) = if residency == FishDrama3Residency::Metal {
+            let (checks, kv) = super::metal::self_check::run(
+                &checkpoint,
+                &config,
+                &embedding,
+                &mut trunk,
+                &mut tower,
+                &mut head,
+                activations,
+            )?;
+            (kv, Some(checks))
+        } else {
+            (DType::F32, None)
+        };
         let geometry = FishDrama3StateGeometry::of(&config);
         if trunk.attention_layers() != geometry.trunk.layers
             || tower.attention_layers() != geometry.tower.layers
@@ -744,6 +848,8 @@ impl FishDrama3Model {
             reference_cache: FishDrama3ReferenceCache::default(),
             device: device.clone(),
             prefill_span_rows: options.prefill_span_rows,
+            kv_dtype,
+            metal_checks,
             artifact_fingerprint: None,
         })
     }
@@ -795,6 +901,17 @@ impl FishDrama3Model {
         self.prefill_span_rows
     }
 
+    /// Both paged domains' dtype: what the engine's state contract must
+    /// store (F16 on Metal unless a load-time check moved it to F32).
+    pub fn kv_dtype(&self) -> DType {
+        self.kv_dtype
+    }
+
+    /// What a Metal load's checks found (`None` on the CPU).
+    pub fn metal_checks(&self) -> Option<&FishDrama3MetalChecks> {
+        self.metal_checks.as_ref()
+    }
+
     /// Positions one request may use: the trunk's and §7.5's.
     pub fn max_positions(&self) -> usize {
         self.config.trunk.max_positions.min(MAX_REQUEST_POSITIONS)
@@ -805,14 +922,26 @@ impl FishDrama3Model {
     }
 
     pub fn diagnostics_summary(&self) -> serde_json::Value {
-        json!({
+        let mut summary = json!({
             "trunk": self.trunk.diagnostics_summary(),
             "tower": self.tower.diagnostics_summary(),
             "head_bytes": self.head.resident_bytes(),
             "embedding_host_bytes": self.embedding.host_bytes(),
             "sample_rate": self.codec.sample_rate(),
             "prefill_span_rows": self.prefill_span_rows,
-        })
+            "kv_dtype": format!("{:?}", self.kv_dtype),
+        });
+        if let Some(checks) = &self.metal_checks {
+            summary["embedding_device_bytes"] = json!(self.embedding.device_bytes());
+            summary["metal_checks"] = checks.diagnostics();
+            summary["resident_sampling"] = json!({
+                "frames_total": super::metal::sampling::fish_drama3_resident_frames(),
+                "readbacks_total": super::metal::sampling::fish_drama3_resident_readbacks(),
+                "host_fallbacks_total":
+                    super::metal::sampling::fish_drama3_resident_host_fallbacks(),
+            });
+        }
+        summary
     }
 
     /// The codes of one reference clip, through the model's cache: mono
@@ -1048,14 +1177,11 @@ impl FishDrama3Model {
     ) -> Result<FishDrama3RequestState> {
         let prompt = prompt.into();
         params.validate()?;
-        if !self.device.is_cpu() {
-            return Err(private_cache_error("private caches are CPU-only"));
-        }
         budget::check_positions(prompt.rows, params.max_frames, self.max_positions())?;
         let geometry = self.state_geometry();
         let positions = prompt.rows + params.max_frames;
-        let trunk = private_cache(&geometry.trunk, positions, 1)?;
-        let tower = private_cache(&geometry.tower, positions, 2)?;
+        let trunk = private_cache(&geometry.trunk, positions, 1, &self.device, self.kv_dtype)?;
+        let tower = private_cache(&geometry.tower, positions, 2, &self.device, self.kv_dtype)?;
         self.new_request(prompt, params, trunk, tower)
     }
 
@@ -1214,9 +1340,8 @@ impl FishDrama3Model {
             )?;
         }
         state.check_lengths()?;
-        let h = self.config.trunk.hidden;
-        let last = host_values(&hidden.narrow(0, b - a - 1, 1)?)?;
-        state.last_hidden = Some(Tensor::from_vec(last, (1, h), &self.device)?);
+        // `h_t` stays where it was made: no readback on an accelerator.
+        state.last_hidden = Some(hidden.narrow(0, b - a - 1, 1)?.contiguous()?);
         let width = self.config.tower.frame_width();
         state.last_row = span[span.len() - width..].to_vec();
         state.prefilled = b;
@@ -1244,7 +1369,8 @@ impl FishDrama3Model {
         let mut steps = Vec::with_capacity(rows.len());
         // The sampled main token of every row that goes on.
         let mut mains = Vec::with_capacity(rows.len());
-        for state in rows.iter_mut() {
+        let mut drawing = Vec::with_capacity(rows.len());
+        for (index, state) in rows.iter_mut().enumerate() {
             self.check_state(state)?;
             state.require_quantum("decode")?;
             if !state.is_prefilled() {
@@ -1257,13 +1383,28 @@ impl FishDrama3Model {
                     frames: state.frames(),
                     reason,
                 }));
-                mains.push(None);
-                continue;
+            } else {
+                drawing.push(index);
+                steps.push(None);
             }
+            mains.push(None);
+        }
+        let draws = if self.device.is_cpu() {
+            drawing
+                .iter()
+                .map(|&index| {
+                    let state = &mut rows[index];
+                    let logits = host_values(&self.head.logits(state.last_hidden()?)?)?;
+                    let allow_eos = !(state.params.mask_first_eos && state.frames() == 0);
+                    state.sampler.sample_main(&logits, allow_eos)
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            self.draw_main_on_device(rows, &drawing)?
+        };
+        for (&index, draw) in drawing.iter().zip(draws) {
+            let state = &mut rows[index];
             let frames = state.frames();
-            let logits = host_values(&self.head.logits(state.last_hidden()?)?)?;
-            let allow_eos = !(state.params.mask_first_eos && frames == 0);
-            let draw = state.sampler.sample_main(&logits, allow_eos)?;
             let reason = if draw.token == ids.eos {
                 Some(FishDrama3StopReason::EndOfSpeech)
             } else if frames >= state.params.max_frames {
@@ -1273,11 +1414,9 @@ impl FishDrama3Model {
             };
             if let Some(reason) = reason {
                 state.stop = Some(reason);
-                steps.push(Some(FishDrama3Step::Finished { frames, reason }));
-                mains.push(None);
+                steps[index] = Some(FishDrama3Step::Finished { frames, reason });
             } else {
-                steps.push(None);
-                mains.push(Some(draw.token));
+                mains[index] = Some(draw.token);
             }
         }
         if mains.iter().any(Option::is_some) {
@@ -1292,6 +1431,104 @@ impl FishDrama3Model {
                 })
             })
             .collect())
+    }
+
+    /// The main draws of `rows[drawing]` on the device: each row's compact
+    /// head, ranked once, raced at the request's policy and at RAS's from
+    /// exponentials its sampler draws in the host's order, and every row's
+    /// picks read back at once (readback 1 of the frame). A draw whose kept
+    /// prefix runs past the device's ranks re-runs on the host from the
+    /// same exponentials.
+    fn draw_main_on_device(
+        &self,
+        rows: &mut [&mut FishDrama3RequestState],
+        drawing: &[usize],
+    ) -> Result<Vec<FishDrama3MainDraw>> {
+        if drawing.is_empty() {
+            return Ok(Vec::new());
+        }
+        let candidates = self.head.len();
+        let mut picks = Vec::with_capacity(drawing.len());
+        let mut kept = Vec::with_capacity(drawing.len());
+        for &index in drawing {
+            let state = &mut *rows[index];
+            let allow_eos = !(state.params.mask_first_eos && state.frames() == 0);
+            let first_candidate = usize::from(!allow_eos);
+            let logits = self.head.logits(state.last_hidden()?)?.squeeze(0)?;
+            let (first_noise, retry_noise) = state.sampler.main_noise()?;
+            let policy = state.params.sampling.main;
+            let ranks = device_cap(&policy)
+                .unwrap_or(DEVICE_RANKS)
+                .max(FishDrama3DrawPolicy::RAS.top_k.unwrap_or(1))
+                .min(DEVICE_RANKS);
+            let ranked = rank(&logits, first_candidate, ranks)?;
+            let noise = |values: &[f32]| Tensor::from_slice(values, candidates, &self.device);
+            let first = device_race(&ranked, &policy, &noise(&first_noise)?)?;
+            let retry = device_race(&ranked, &FishDrama3DrawPolicy::RAS, &noise(&retry_noise)?)?;
+            picks.push(Tensor::cat(
+                &[
+                    &first.pick,
+                    &retry.pick,
+                    &first.non_finite,
+                    &first.overflow,
+                    &retry.overflow,
+                ],
+                0,
+            )?);
+            kept.push((logits, first_noise, retry_noise, first_candidate, policy));
+        }
+        let values = read_back(&Tensor::cat(&picks, 0)?)?;
+        let mut draws = Vec::with_capacity(drawing.len());
+        let (rows_read, _) = values.as_chunks::<5>();
+        for ((&index, row), (logits, first_noise, retry_noise, first_candidate, policy)) in
+            drawing.iter().zip(rows_read).zip(kept)
+        {
+            let [first, retry, non_finite, first_overflow, retry_overflow] = row;
+            // The row's logits on the host, read once if a fallback needs them.
+            let mut host: Option<Vec<f32>> = None;
+            let mut on_host = |logits: &Tensor| -> Result<Vec<f32>> {
+                if let Some(values) = &host {
+                    return Ok(values.clone());
+                }
+                let values = host_values(logits)?;
+                host = Some(values.clone());
+                Ok(values)
+            };
+            if *non_finite > 0 {
+                // The host sampler's error, with its counts.
+                let state = &mut *rows[index];
+                return Err(state
+                    .sampler
+                    .clone()
+                    .sample_main(&on_host(&logits)?, first_candidate == 0)
+                    .err()
+                    .unwrap_or_else(|| {
+                        Error::InferenceError(format!(
+                            "Fish Audio Drama 3 main logits hold {non_finite} non-finite values"
+                        ))
+                    }));
+            }
+            let mut decide = |pick: u32,
+                              overflow: u32,
+                              policy: &FishDrama3DrawPolicy,
+                              noise: &[f32]|
+             -> Result<usize> {
+                if overflow == 0 {
+                    return Ok(pick as usize);
+                }
+                count_fallback();
+                host_race(&on_host(&logits)?, policy, first_candidate, noise)
+            };
+            let first = decide(*first, *first_overflow, &policy, &first_noise)?;
+            let retry = decide(
+                *retry,
+                *retry_overflow,
+                &FishDrama3DrawPolicy::RAS,
+                &retry_noise,
+            )?;
+            draws.push(rows[index].sampler.finish_main(first, retry));
+        }
+        Ok(draws)
     }
 
     /// The tower and trunk steps of the rows with a main token.
@@ -1334,8 +1571,6 @@ impl FishDrama3Model {
             .collect::<Vec<_>>();
         let next = self.trunk.forward_step(&embeds, &mut trunk_rows)?;
         drop(trunk_rows);
-        let h = self.config.trunk.hidden;
-        let next = host_values(&next)?;
         let going = rows
             .iter_mut()
             .zip(mains)
@@ -1347,11 +1582,8 @@ impl FishDrama3Model {
                 codebook.push(code);
             }
             state.last_row = frame.to_vec();
-            state.last_hidden = Some(Tensor::from_slice(
-                &next[r * h..(r + 1) * h],
-                (1, h),
-                &self.device,
-            )?);
+            // On the device: no readback between a frame and the next.
+            state.last_hidden = Some(next.narrow(0, r, 1)?.contiguous()?);
             state.check_lengths()?;
         }
         Ok(())
