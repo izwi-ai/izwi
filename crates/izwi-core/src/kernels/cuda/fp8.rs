@@ -399,6 +399,154 @@ fn project(
     )
 }
 
+/// What [`block_fp8_projection_f32`] applies to each output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fp8Epilogue {
+    None,
+    /// `relu(y)^2`, a relu² MLP's up projection.
+    ReluSquare,
+}
+
+/// Whether [`block_fp8_projection_f32`] runs its vectorized CUDA kernel for
+/// `input` (F32, `[m, k]`) over `weights` (`[n, k]`): CUDA, `k` a multiple
+/// of 128 and 16-byte aligned rows. Elsewhere it runs the portable reference.
+pub fn f32_projection_vectorized(input: &Tensor, weights: &Tensor) -> bool {
+    let Ok((_, k)) = weights.dims2() else {
+        return false;
+    };
+    input.device().is_cuda()
+        && input.dtype() == DType::F32
+        && k.is_multiple_of(128)
+        && input.layout().start_offset().is_multiple_of(4)
+        && weights.layout().start_offset().is_multiple_of(16)
+}
+
+/// A block-FP8 projection over F32 activations into F32 outputs, with an
+/// optional epilogue: `y = epilogue(x @ (decode(W) * scale).T)`. On CUDA (when
+/// [`f32_projection_vectorized`]) one launch of the vectorized GEMV, whose
+/// rows each sum in a fixed order whatever the row count (row-invariant, so
+/// for decode steps); elsewhere the dequantized F32 matmul.
+pub fn block_fp8_projection_f32(
+    input: &Tensor,
+    weights: &Tensor,
+    scales: &Tensor,
+    epilogue: Fp8Epilogue,
+) -> Result<Tensor> {
+    let (n, k) = validate_projection(input, weights, scales)?;
+    if input.dtype() != DType::F32 {
+        candle_core::bail!("the F32 FP8 projection takes F32 activations")
+    }
+    let input = input.contiguous()?;
+    #[cfg(feature = "cuda")]
+    if f32_projection_vectorized(&input, weights) {
+        return f32_projection_cuda(
+            &input,
+            &weights.contiguous()?,
+            &scales.contiguous()?,
+            n,
+            k,
+            epilogue,
+        );
+    }
+    let _ = (n, k);
+    let dense = dequantize_compact(weights, scales)?;
+    let y = input.matmul(&dense.t()?)?;
+    match epilogue {
+        Fp8Epilogue::None => Ok(y),
+        Fp8Epilogue::ReluSquare => y.relu()?.sqr(),
+    }
+}
+
+/// `decode(byte) * block scale` of a compact projection as F32, on its device.
+fn dequantize_compact(weights: &Tensor, scales: &Tensor) -> Result<Tensor> {
+    let (n, k) = weights.dims2()?;
+    let bytes = weights
+        .flatten_all()?
+        .to_device(&Device::Cpu)?
+        .to_vec1::<u8>()?;
+    let grid = scales
+        .flatten_all()?
+        .to_device(&Device::Cpu)?
+        .to_vec1::<f32>()?;
+    let blocks = k.div_ceil(128);
+    let values = bytes
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| decode_e4m3fn(b) * grid[(i / k / 128) * blocks + (i % k) / 128])
+        .collect::<Vec<_>>();
+    Tensor::from_vec(values, (n, k), &Device::Cpu)?.to_device(weights.device())
+}
+
+#[cfg(feature = "cuda")]
+fn f32_projection_cuda(
+    input: &Tensor,
+    weights: &Tensor,
+    scales: &Tensor,
+    n: usize,
+    k: usize,
+    epilogue: Fp8Epilogue,
+) -> Result<Tensor> {
+    use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+    use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice, WrapErr};
+    let device = input.device().as_cuda_device()?;
+    let m = input.elem_count() / k;
+    let (x_storage, x_layout) = input.storage_and_layout();
+    let (w_storage, w_layout) = weights.storage_and_layout();
+    let (s_storage, s_layout) = scales.storage_and_layout();
+    let (
+        candle_core::Storage::Cuda(x),
+        candle_core::Storage::Cuda(w),
+        candle_core::Storage::Cuda(s),
+    ) = (&*x_storage, &*w_storage, &*s_storage)
+    else {
+        candle_core::bail!("the F32 FP8 projection needs CUDA tensors")
+    };
+    let (CudaStorageSlice::F32(x), CudaStorageSlice::U8(w), CudaStorageSlice::F32(s)) =
+        (&x.slice, &w.slice, &s.slice)
+    else {
+        candle_core::bail!("the F32 FP8 projection takes F32 activations, E4M3 bytes, F32 scales")
+    };
+    let x = x.slice(x_layout.start_offset()..x_layout.start_offset() + m * k);
+    let w = w.slice(w_layout.start_offset()..w_layout.start_offset() + n * k);
+    let s = s.slice(
+        s_layout.start_offset()..s_layout.start_offset() + n.div_ceil(128) * k.div_ceil(128),
+    );
+    // SAFETY: the kernel writes every output element.
+    let out = unsafe { device.alloc::<f32>(m * n)? };
+    let function = device.get_or_load_custom_func(
+        "izwi_fp8_mv_f32",
+        "izwi_qwen38_fp8",
+        super::cuda_ptx::FP8,
+    )?;
+    let mut builder = function.builder();
+    builder.arg(&x);
+    builder.arg(&w);
+    builder.arg(&s);
+    builder.arg(&out);
+    candle_core::builder_arg!(
+        builder,
+        m as i32,
+        n as i32,
+        k as i32,
+        i32::from(epilogue == Fp8Epilogue::ReluSquare)
+    );
+    let config = LaunchConfig {
+        grid_dim: (n.div_ceil(8) as u32, m.div_ceil(4) as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    // SAFETY: the geometry was validated and the arguments match the kernel.
+    unsafe { builder.launch(config) }.w()?;
+    let mut dims = input.dims().to_vec();
+    *dims.last_mut().expect("rank checked") = n;
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(CudaStorage::wrap_cuda_slice(out, device.clone())),
+        dims,
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
 pub(crate) fn decode_e4m3fn(b: u8) -> f32 {
     let e = (b >> 3) & 15;
     let m = b & 7;
@@ -918,6 +1066,109 @@ impl CustomOp3 for DequantGemm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A compact projection `[n, k]` of real E4M3 bytes with varied block
+    /// scales, and activations `[m, k]`.
+    fn f32_case(m: usize, n: usize, k: usize, device: &Device) -> (Tensor, Tensor, Tensor) {
+        use crate::kernels::numeric_check::xorshift_values;
+        let bytes = xorshift_values(n * k, 31, 200.0)
+            .into_iter()
+            .map(encode_e4m3fn)
+            .collect::<Vec<_>>();
+        let scales = xorshift_values(n.div_ceil(128) * k.div_ceil(128), 32, 1.0)
+            .into_iter()
+            .map(|v| 1e-3 * (1.5 + v))
+            .collect::<Vec<_>>();
+        (
+            Tensor::from_vec(xorshift_values(m * k, 33, 2.0), (m, k), device).unwrap(),
+            Tensor::from_vec(bytes, (n, k), device).unwrap(),
+            Tensor::from_vec(scales, (n.div_ceil(128), k.div_ceil(128)), device).unwrap(),
+        )
+    }
+
+    /// `x @ (decode(W) * scale).T` in F64, with the epilogue.
+    fn exact(x: &Tensor, w: &Tensor, s: &Tensor, epilogue: Fp8Epilogue) -> Vec<f64> {
+        let (m, k) = x.dims2().unwrap();
+        let n = w.dim(0).unwrap();
+        let host = |t: &Tensor| t.to_device(&Device::Cpu).unwrap().flatten_all().unwrap();
+        let xv = host(x).to_vec1::<f32>().unwrap();
+        let wv = host(w).to_vec1::<u8>().unwrap();
+        let sv = host(s).to_vec1::<f32>().unwrap();
+        let blocks = k.div_ceil(128);
+        let mut out = vec![0f64; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0f64;
+                for i in 0..k {
+                    let weight = decode_e4m3fn(wv[col * k + i]) as f64
+                        * sv[(col / 128) * blocks + i / 128] as f64;
+                    acc += xv[row * k + i] as f64 * weight;
+                }
+                out[row * n + col] = match epilogue {
+                    Fp8Epilogue::None => acc,
+                    Fp8Epilogue::ReluSquare => acc.max(0.0).powi(2),
+                };
+            }
+        }
+        out
+    }
+
+    fn assert_close(got: &Tensor, want: &[f64], tolerance: f64) {
+        let got = got
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let scale = want.iter().fold(0f64, |m, v| m.max(v.abs())).max(1e-6);
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (*g as f64 - w).abs() <= tolerance * scale,
+                "[{i}]: {g} vs {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_f32_projection_reference_matches_the_exact_dequantization() {
+        for epilogue in [Fp8Epilogue::None, Fp8Epilogue::ReluSquare] {
+            let (x, w, s) = f32_case(3, 192, 384, &Device::Cpu);
+            let y = block_fp8_projection_f32(&x, &w, &s, epilogue).unwrap();
+            assert_eq!(y.dims(), [3, 192]);
+            assert_close(&y, &exact(&x, &w, &s, epilogue), 1e-5);
+        }
+        let (x, w, s) = f32_case(1, 64, 128, &Device::Cpu);
+        let bf16 = x.to_dtype(DType::BF16).unwrap();
+        assert!(block_fp8_projection_f32(&bf16, &w, &s, Fp8Epilogue::None).is_err());
+    }
+
+    /// The CUDA kernel against the exact dequantization, and a row alone
+    /// against the same row among six (two blocks of rows).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_cuda_f32_projection_is_exact_to_rounding_and_row_invariant() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        for epilogue in [Fp8Epilogue::None, Fp8Epilogue::ReluSquare] {
+            let (x, w, s) = f32_case(6, 2688, 4096, &device);
+            assert!(f32_projection_vectorized(&x, &w));
+            let y = block_fp8_projection_f32(&x, &w, &s, epilogue).unwrap();
+            assert_close(&y, &exact(&x, &w, &s, epilogue), 1e-5);
+            let one =
+                block_fp8_projection_f32(&x.narrow(0, 5, 1).unwrap(), &w, &s, epilogue).unwrap();
+            let host = |t: &Tensor| {
+                t.to_device(&Device::Cpu)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            assert_eq!(host(&y.narrow(0, 5, 1).unwrap()), host(&one));
+        }
+    }
 
     fn finite_bytes() -> impl Iterator<Item = u8> {
         (0u16..256).map(|b| b as u8).filter(|b| b & 127 != 127)

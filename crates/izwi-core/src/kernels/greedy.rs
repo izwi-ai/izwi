@@ -7,7 +7,7 @@
 //! back 8 bytes a row. The merge compares and takes maxima only, so the pick
 //! and margin are exactly the host scan's on every backend, whatever the
 //! partition of the row.
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{DType, Result, Tensor};
 
 /// `(id, margin)` of each row of `logits` `[rows, vocab]` (F32, F16 or
 /// BF16), as [`host_pick`] scans them.
@@ -23,9 +23,9 @@ pub fn greedy(logits: &Tensor) -> Result<Vec<(u32, f32)>> {
     let logits = logits.contiguous()?;
     let packed: Option<Tensor> = match logits.device() {
         #[cfg(feature = "metal")]
-        Device::Metal(_) => Some(metal_impl::run(&logits, rows, vocab)?),
+        candle_core::Device::Metal(_) => Some(metal_impl::run(&logits, rows, vocab)?),
         #[cfg(feature = "cuda")]
-        Device::Cuda(_) => Some(cuda_impl::run(&logits, rows, vocab)?),
+        candle_core::Device::Cuda(_) => Some(cuda_impl::run(&logits, rows, vocab)?),
         _ => None,
     };
     let Some(packed) = packed else {
@@ -275,6 +275,7 @@ mod cuda_impl {
 mod tests {
     use super::*;
     use crate::kernels::numeric_check::xorshift_values;
+    use candle_core::Device;
 
     /// Rows with the cases that matter: a clear winner, a duplicated best
     /// (margin 0, lowest id wins), NaNs, and a near tie.
