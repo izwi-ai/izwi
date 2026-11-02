@@ -29,7 +29,7 @@ run real weights: build them with `--release` (a release test build needs severa
 ```sh
 python3 -I scripts/fixtures/generate_fish_drama3_tiny.py --fish-speech /path/to/fish-speech
 cargo test -p izwi-core --lib fish_drama3::reference_tests::tiny -- --ignored
-# Metal (fails clearly until the family's Metal residency lands in Phase 3):
+# Metal (CUDA likewise, with --features cuda):
 cargo test -p izwi-core --lib --features metal fish_drama3::reference_tests::tiny -- --ignored
 ```
 
@@ -39,7 +39,7 @@ cargo test -p izwi-core --lib --features metal fish_drama3::reference_tests::tin
 | `tiny_prompts_match_upstream_rows` | the four prompt shapes build upstream's rows exactly; the ids and layer types agree |
 | `tiny_prefill_and_forced_steps_match_upstream_on_cpu` | every trunk layer's residual, the mixer and MoE outputs of layers 0 and 3, the routes of every layer (as sets, near ties counted), the final norm, all 13 tower layers, the teacher-forced head logits, the main logits, and two forced decode steps (hidden, main and head logits) |
 | `tiny_rollouts_replay_upstream_on_cpu` | the five rollouts under the recorded noise: RAS windows, both main draws, RAS decisions and every code, exactly until a recorded near tie; the model loop itself makes the same frames |
-| `tiny_matches_upstream_on_metal` (`--features metal`) | the same on Metal; a TODO until Phase 3 |
+| `tiny_matches_upstream_on_metal` (`--features metal`), `tiny_matches_upstream_on_cuda` (`--features cuda`) | the same tensors and rollouts on Metal and CUDA, to their own bounds (`TINY_METAL`, `TINY_CUDA`) |
 
 The tests load the checkpoint from `tiny/` when the generator's checkpoint files are committed there. Otherwise
 they build `SyntheticCheckpoint::write(seed)` and use `tiny/tokenizer.json`, after checking the digest. So only
@@ -106,8 +106,9 @@ IZWI_FISH_DRAMA3_BACKEND=cpu \
 | `reference_utterance_pcm_matches_the_upstream_codec` | the family codec on the utterance's recorded codes against upstream's codec PCM; it also reports how often izwi's encoder agrees with the recorded reference codes |
 | `reference_generations_match_upstream` | every generation: the input rows, hidden checksums at trunk layers 0, 1, 3 and 39 and tower layers 0, 4 and 12, routes, the main logits (all and the top 16), and the first 64 frames under the recorded noise. On `cpu` the frames must match until the first recorded near tie (gap < 1e-4), and the frame where they diverge is reported. On `cpu-q8_0` the divergence is reported only |
 
-`IZWI_FISH_DRAMA3_BACKEND` takes `cpu` (default), `cpu-q8_0`, `metal` or `cuda`. The last two fail with the
-family's own refusal until its Metal and CUDA residencies exist (Phase 3).
+`IZWI_FISH_DRAMA3_BACKEND` takes `cpu` (default), `cpu-q8_0`, `metal` (a test build with `--features metal`, on a
+Mac with 64 GB or more) or `cuda` (`--features cuda`, a GPU of compute capability 8.0 or newer).
+`scripts/e2e/fish-drama3/run-parity.sh` runs these suites per backend.
 
 - **Cases.**
   - `plain`, `one_reference` (`data/fox.wav`) and `two_speakers` (`data/fox.wav` + `data/test.wav`): 64 frames each.

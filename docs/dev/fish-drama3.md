@@ -617,3 +617,64 @@ makes a missing device a failure rather than a skip.
   all from seed 7. The family's footprint guard defaults to 45,000 MiB (the
   12,000 MiB default would kill the server while it loads) and its load
   timeout to an hour.
+
+## Hand-off kit
+
+`scripts/e2e/fish-drama3/` runs the parity suites, the end-to-end matrix,
+load parity and eval-mini on machines that hold the model, and packs the
+results into one tarball; its
+[`README.md`](../../scripts/e2e/fish-drama3/README.md) has the hardware
+table, the prerequisites and every option. From the repository root:
+
+```bash
+K=scripts/e2e/fish-drama3
+bash $K/fetch.sh            # once per machine: 41.5 GB at the pin, hashed once
+bash $K/build.sh cuda && bash $K/run-parity.sh cuda && \
+  bash $K/run-e2e.sh cuda && bash $K/run-load.sh cuda && bash $K/collect.sh cuda
+```
+
+with `metal` on a Mac with 64 GB or more and `cpu` on a box with 64 GB of
+RAM or more. Every shell script takes `--help` and `--dry-run`.
+
+- `fetch.sh` downloads with a resumable curl loop, checks every file's size
+  and SHA-256 against `FISH_DRAMA3_FILES`, then writes `izwi-artifact.json`
+  as izwi's downloader does after `verify_full`, so izwi reads the bundle as
+  downloaded.
+- `build.sh` builds `izwi-server` in a private target directory with
+  `IZWI_BUILD_GIT_SHA`, and `run-e2e.sh` and `run-load.sh` refuse a server
+  whose logged `build_git_sha` is not that build's.
+- `run-parity.sh` runs the [parity suites](#parity-suites-ignored) leg by
+  leg in one release test build: the family's suites, the codec device
+  tests, the published tokenizer and codec, then L1, L1.5 and L2 when their
+  fixtures exist (a missing fixture skips its leg; `--require-all` fails
+  it). A missing Metal or CUDA device fails the run.
+- `run-e2e.sh` runs the end-to-end matrix over HTTP: a seeded and a cloned
+  voice (inline and saved), tags, a two-speaker script, long
+  text with its history, SSE time to first audio with streamed PCM equal to
+  the WAV, the formats, a take edit, cancellation at each stage the API
+  reaches, a soak with untracked device memory flat (`--soak-minutes`, 30 by
+  default), the backend's fast-path counters, unload and reload, and a load
+  refused under an undersized budget. It keeps every take under `audio/`.
+- `run-load.sh` runs `scripts/bench/run-audio-load.py --require-parity` with
+  a tolerance of 0 (rows are batch-invariant) at the backend's widths, a
+  streaming probe of time to first audio, RTF and frames/s beside the card's
+  H200 table, and chat inter-token latency beside a long take
+  (`FD3_CHAT_MODEL`).
+- `eval-mini.py` clones 100 LibriSpeech test-clean pairs and 25 + 25
+  Seed-TTS-eval items at both sampling profiles (the defaults, and 0.7 / 0.7
+  / 30) and scores any directory of WAVs for WER and ECAPA similarity, so
+  izwi's takes are compared with the official engine's (Leg B), which the
+  tester runs on the same machine. It runs no upstream code.
+
+`build.sh cpu --synthetic` and `run-e2e.sh cpu --synthetic` run the same
+matrix against the synthetic checkpoint (written by the ignored izwi-server
+test `write_the_e2e_kit_synthetic_checkpoint`, served by a debug build with
+izwi-core's `test-support` feature), which checks the kit and the routes
+without the weights.
+
+Send back `target/fish-drama3/<backend>/fish-drama3-report-<backend>-<sha>.tar.gz`
+per backend: the report (build, parity, e2e, load and eval sections), the
+admission and memory snapshots, the path counters, timings, log tails and
+the WAVs. From the generator runs, also send the L1 `tiny/` directory, the
+L1.5 `slice_expected.json` and the L2 `reference.json` and
+`reference.safetensors`.

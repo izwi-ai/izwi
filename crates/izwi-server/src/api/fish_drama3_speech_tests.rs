@@ -1718,3 +1718,19 @@ async fn previous_take_refusals_come_before_any_load() {
         .await
         .is_none());
 }
+
+/// The synthetic checkpoint as a models directory, for the e2e kit's
+/// synthetic run (`scripts/e2e/fish-drama3/run-e2e.sh --synthetic`): an
+/// izwi-server built with `--features izwi-core/test-support` serves it
+/// from the workspace's `target/fish-drama3/synthetic-models`.
+#[test]
+#[ignore = "writes the e2e kit's synthetic checkpoint into target/fish-drama3/synthetic-models"]
+fn write_the_e2e_kit_synthetic_checkpoint() {
+    let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/fish-drama3/synthetic-models")
+        .join(VARIANT.dir_name());
+    if model_dir.exists() {
+        std::fs::remove_dir_all(&model_dir).expect("an older synthetic checkpoint removed");
+    }
+    write_lifecycle_synthetic_model(&model_dir, 5);
+}
