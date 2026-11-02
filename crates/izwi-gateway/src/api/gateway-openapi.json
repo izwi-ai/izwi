@@ -604,6 +604,22 @@
             },
             "type": "array"
           },
+          "max_references": {
+            "description": "The reference clips a dialogue request may carry; present only with\n`supports_speaker_dialogue`.",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_speakers": {
+            "description": "The speakers a dialogue may voice, numbered from 0; present only\nwith `supports_speaker_dialogue`.",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "reference_transcript_required": {
             "description": "Whether a reference voice needs its transcript. Every reference\nfamily but Chatterbox conditions on the reference's words; Chatterbox\ntakes the audio alone.",
             "type": "boolean"
@@ -630,6 +646,10 @@
           },
           "supports_seeded_voice": {
             "description": "Whether the model speaks without any voice input: with no reference,\nthe sampling seed sets its voice, so a reference is optional (Fish\nAudio Drama 3).",
+            "type": "boolean"
+          },
+          "supports_speaker_dialogue": {
+            "description": "Whether one request may voice several speakers: `<|speaker:N|>`\ntags or a `script`, with `references` per speaker (Fish Audio\nDrama 3).",
             "type": "boolean"
           },
           "supports_speed_control": {
@@ -1983,6 +2003,41 @@
         ],
         "type": "object"
       },
+      "SpeechDialogueReference": {
+        "description": "One reference voice of a dialogue request: a clip (`audio`, base64, with\nits transcript `text`) or a saved voice, and the speaker it voices.",
+        "properties": {
+          "audio": {
+            "description": "The clip, base64 audio (at most 60 s for Fish Audio Drama 3).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "saved_voice_id": {
+            "description": "A saved voice instead of `audio` and `text`: its clip and\ntranscript (it must have one).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "speaker": {
+            "description": "The speaker this reference voices, 0 to the model's\n`max_speakers - 1`; unset, the speaker of a `<|speaker:N|>` tag that\nleads `text`, else 0. A leading tag must name this speaker.",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "text": {
+            "description": "What the clip says; required with `audio`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "SpeechRequest": {
         "allOf": [
           {
@@ -1998,8 +2053,11 @@
                 ]
               },
               "input": {
-                "description": "The text to speak. Fish S2 and Fish Audio Drama 3 refuse text holding\ntheir prompt's control tokens (`<|im_start|>`, `<|im_end|>`,\n`<|voice|>`, `<|text|>`, `<|interleave|>`, `<|semantic:N|>`);\nperformance tags such as `[sighs]` and `<whisper>…</whisper>` pass\nthrough. Long text is split into chunks the model speaks one after\nanother.",
-                "type": "string"
+                "description": "The text to speak. Fish S2 and Fish Audio Drama 3 refuse text holding\ntheir prompt's control tokens (`<|im_start|>`, `<|im_end|>`,\n`<|voice|>`, `<|text|>`, `<|interleave|>`, `<|semantic:N|>`);\nperformance tags such as `[sighs]` and `<whisper>…</whisper>` pass\nthrough. Long text is split into chunks the model speaks one after\nanother. Fish Audio Drama 3 voices `<|speaker:0|>` to\n`<|speaker:15|>` tags in it as a dialogue. Required unless a\n`script` gives the text.",
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "instructions": {
                 "type": [
@@ -2053,6 +2111,16 @@
                   "null"
                 ]
               },
+              "references": {
+                "description": "Reference voices per speaker, for a model that voices several\n(`supports_speaker_dialogue`: Fish Audio Drama 3, at most 8, speakers\n0 to 15; several may voice one speaker). Each is a clip (`audio` and\nits `text`) or a `saved_voice_id`. Replaces `reference_audio`,\n`reference_text` and `saved_voice_id` (giving both is a 400); a\nspeaker without a reference speaks in a voice its `seed` sets. Inline\nclips total at most 16 MiB; use saved voices beyond that.",
+                "items": {
+                  "$ref": "#/components/schemas/SpeechDialogueReference"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
               "response_format": {
                 "type": [
                   "string",
@@ -2062,6 +2130,16 @@
               "saved_voice_id": {
                 "type": [
                   "string",
+                  "null"
+                ]
+              },
+              "script": {
+                "description": "A dialogue as lines, each spoken as `<|speaker:N|> text`, the lines\njoined by newlines; replaces `input` (giving both is a 400). Models\nwith `supports_speaker_dialogue` only.",
+                "items": {
+                  "$ref": "#/components/schemas/SpeechScriptLine"
+                },
+                "type": [
+                  "array",
                   "null"
                 ]
               },
@@ -2107,8 +2185,7 @@
               }
             },
             "required": [
-              "model",
-              "input"
+              "model"
             ],
             "type": "object"
           }
@@ -2218,6 +2295,25 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "SpeechScriptLine": {
+        "description": "One line of a dialogue script: a speaker and what they say.",
+        "properties": {
+          "speaker": {
+            "description": "The speaker, 0 to the model's `max_speakers - 1`.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "text": {
+            "description": "The line, without a speaker tag; performance tags such as `[sighs]`\npass through.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "speaker",
+          "text"
+        ],
         "type": "object"
       },
       "SpeechStreamEvent": {

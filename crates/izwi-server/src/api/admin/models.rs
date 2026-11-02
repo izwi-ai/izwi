@@ -153,6 +153,19 @@ pub struct AdminSpeechModelCapabilities {
     /// Audio Drama 3).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub supports_seeded_voice: bool,
+    /// Whether one request may voice several speakers: `<|speaker:N|>`
+    /// tags or a `script`, with `references` per speaker (Fish Audio
+    /// Drama 3).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub supports_speaker_dialogue: bool,
+    /// The speakers a dialogue may voice, numbered from 0; present only
+    /// with `supports_speaker_dialogue`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_speakers: Option<usize>,
+    /// The reference clips a dialogue request may carry; present only with
+    /// `supports_speaker_dialogue`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_references: Option<usize>,
     /// Whether an unfinished text-to-speech record of this model can be
     /// played from its start (`GET /v1/text-to-speech/{record_id}/events`):
     /// the server plans the model's speech segments and journals each
@@ -419,6 +432,13 @@ impl From<SpeechModelCapabilities> for AdminSpeechModelCapabilities {
             supports_speed_control: capabilities.supports_speed_control,
             supports_auto_long_form: capabilities.supports_auto_long_form,
             supports_seeded_voice: capabilities.supports_seeded_voice,
+            supports_speaker_dialogue: capabilities.supports_speaker_dialogue,
+            max_speakers: capabilities
+                .supports_speaker_dialogue
+                .then_some(capabilities.max_speakers),
+            max_references: capabilities
+                .supports_speaker_dialogue
+                .then_some(capabilities.max_references),
             supports_in_progress_replay: false,
             controls: Vec::new(),
             languages: Vec::new(),
@@ -1457,8 +1477,9 @@ mod tests {
     }
 
     /// Fish Audio Drama 3's card: a seeded voice (a reference is optional),
-    /// its licence and what that licence permits. No other model reports a
-    /// seeded voice, and S2 keeps its own licence label without a notice.
+    /// dialogue of up to 16 speakers from up to 8 references, its licence
+    /// and what that licence permits. No other model reports a seeded voice
+    /// or dialogue, and S2 keeps its own licence label without a notice.
     #[test]
     fn fish_drama3_reports_its_seeded_voice_and_licence_notice() {
         let model = |variant: ModelVariant| {
@@ -1471,6 +1492,12 @@ mod tests {
         };
         let drama3 = model(ModelVariant::FishAudioDrama3);
         assert_eq!(drama3["speech_capabilities"]["supports_seeded_voice"], true);
+        assert_eq!(
+            drama3["speech_capabilities"]["supports_speaker_dialogue"],
+            true
+        );
+        assert_eq!(drama3["speech_capabilities"]["max_speakers"], 16);
+        assert_eq!(drama3["speech_capabilities"]["max_references"], 8);
         assert_eq!(
             drama3["speech_capabilities"]["reference_transcript_required"],
             true
@@ -1490,10 +1517,15 @@ mod tests {
             .iter()
             .filter(|variant| **variant != ModelVariant::FishAudioDrama3)
         {
-            assert!(
-                model(*variant)["speech_capabilities"]["supports_seeded_voice"].is_null(),
-                "{variant}"
-            );
+            let speech = &model(*variant)["speech_capabilities"];
+            for field in [
+                "supports_seeded_voice",
+                "supports_speaker_dialogue",
+                "max_speakers",
+                "max_references",
+            ] {
+                assert!(speech[field].is_null(), "{variant}: {field}");
+            }
         }
     }
 

@@ -196,6 +196,17 @@ pub struct CreateSpeechHistoryRecordRequest {
     pub reference_language: Option<String>,
     #[serde(default)]
     pub saved_voice_id: Option<String>,
+    /// Reference voices per speaker, for models that voice several speakers
+    /// (Fish Audio Drama 3); replaces `reference_audio`, `reference_text`
+    /// and `saved_voice_id`. Absent from stored requests without them, so
+    /// their idempotency digests are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<crate::api::speech_dialogue::SpeechDialogueReference>,
+    /// A dialogue as `{speaker, text}` lines, spoken as `<|speaker:N|>
+    /// text` lines; replaces `text`, and the record stores the rendered
+    /// lines as its text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<Vec<crate::api::speech_dialogue::SpeechScriptLine>>,
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
@@ -237,7 +248,11 @@ impl BatchSpeechRequest {
         // the advertised text bound untruthful.
         request.model_id = None;
         request.text = None;
+        request.script = None;
         request.reference_audio = None;
+        for reference in &mut request.references {
+            reference.audio = None;
+        }
         Self {
             tenant_key: None,
             route_kind,
@@ -842,11 +857,19 @@ async fn create_record(
     idempotency_key: Option<String>,
 ) -> Result<Response, ApiError> {
     let mut req = normalize_create_request(req);
+    if let Some(text) = crate::api::speech_dialogue::script_text(
+        req.text.as_deref(),
+        req.script.as_deref(),
+        "text",
+    )? {
+        req.text = Some(text);
+    }
     let model_id = required_trimmed(req.model_id.as_deref(), "model_id")?;
     let input_text = required_trimmed(req.text.as_deref(), "text")?;
     crate::api::tts_policy::check_tts_input_length(&input_text)?;
     let variant = parse_tts_model_variant(model_id.as_str())
         .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {err}")))?;
+    crate::api::speech_dialogue::check_dialogue_request(variant, speech_dialogue(&req))?;
 
     if variant.plans_own_speech_segments() {
         crate::api::tts_long_form::SpeechTextPlan::for_variant(
@@ -876,7 +899,8 @@ async fn create_record(
     if route_kind == SpeechRouteKind::TextToSpeech {
         let is_text_only = req.reference_audio.is_none()
             && req.reference_text.is_none()
-            && req.saved_voice_id.is_none();
+            && req.saved_voice_id.is_none()
+            && req.references.is_empty();
         if !req.stream.unwrap_or(false) && is_text_only {
             return accept_durable_text_tts_record(
                 &state,
@@ -901,8 +925,11 @@ async fn create_record(
                     input_text.clone(),
                     keyed,
                 );
-                let request_digest =
-                    durable_tts_request_digest(&snapshot, req.reference_audio.as_deref())?;
+                let request_digest = durable_tts_request_digest(
+                    &snapshot,
+                    req.reference_audio.as_deref(),
+                    &req.references,
+                )?;
                 match begin_durable_idempotency(
                     &state.batch_runtime_store,
                     DurableIdempotencyRequest {
@@ -1054,7 +1081,7 @@ async fn accept_durable_text_tts_record(
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
     let reservation = if let Some(idempotency_key) = idempotency_key {
-        let request_digest = durable_tts_request_digest(&request_snapshot, None)?;
+        let request_digest = durable_tts_request_digest(&request_snapshot, None, &[])?;
         match begin_durable_idempotency(
             &state.batch_runtime_store,
             DurableIdempotencyRequest {
@@ -1193,11 +1220,13 @@ fn normalize_durable_text_tts_request(req: &mut CreateSpeechHistoryRecordRequest
 }
 
 /// The keyed request's canonical digest. A reference voice is identified by
-/// its audio payload's hash; a text-only digest has no reference field, so
-/// keys stored before reference voices could be keyed still replay.
+/// its audio payload's hash, and dialogue references by theirs in order; a
+/// text-only digest has no reference field, so keys stored before reference
+/// voices could be keyed still replay.
 fn durable_tts_request_digest(
     request: &BatchSpeechRequest,
     reference_audio: Option<&str>,
+    references: &[crate::api::speech_dialogue::SpeechDialogueReference],
 ) -> Result<String, ApiError> {
     let mut semantic_request = serde_json::json!({
         "version": DURABLE_IDEMPOTENCY_DIGEST_VERSION,
@@ -1211,6 +1240,16 @@ fn durable_tts_request_digest(
     if let Some(reference_audio) = reference_audio {
         semantic_request["reference_audio_sha256"] =
             serde_json::Value::String(sha256_hex(reference_audio.trim().as_bytes()));
+    }
+    if !references.is_empty() {
+        semantic_request["references_audio_sha256"] = references
+            .iter()
+            .map(|reference| {
+                serde_json::Value::String(sha256_hex(
+                    reference.audio.as_deref().unwrap_or_default().as_bytes(),
+                ))
+            })
+            .collect();
     }
     canonical_request_digest(&semantic_request).map_err(|err| {
         ApiError::payload_too_large(format!(
@@ -1253,19 +1292,22 @@ async fn create_pending_record(
         .map_err(map_store_error)
 }
 
+/// One reference's audio as a durable input: a saved voice's stored audio
+/// (`saved_voice_id`), else the request's base64 clip.
 async fn ingest_batch_reference_audio(
     state: &AppState,
     placeholder: &SpeechHistoryRecord,
     route_kind: SpeechRouteKind,
-    req: &CreateSpeechHistoryRecordRequest,
+    reference_audio: Option<&str>,
+    saved_voice_id: Option<&str>,
 ) -> Result<Option<MediaIngestResult>, ApiError> {
-    let Some(reference_audio) = req.reference_audio.as_deref() else {
+    let Some(reference_audio) = reference_audio else {
         return Ok(None);
     };
     let policy = AudioIngestPolicy::media_upload(REFERENCE_AUDIO_UPLOAD_LIMIT_BYTES);
     let profile = CanonicalAudioProfile::ReferenceVoiceSourceRateMonoWav;
 
-    if let Some(saved_voice_id) = req.saved_voice_id.as_deref() {
+    if let Some(saved_voice_id) = saved_voice_id {
         let saved_audio = state
             .saved_voice_store
             .get_audio(saved_voice_id.to_string())
@@ -1332,8 +1374,42 @@ async fn enqueue_batch_speech_job(
         .preflight_speech_admission(tenant_key)
         .await
         .map_err(map_store_error)?;
-    let reference_ingest =
-        ingest_batch_reference_audio(state, placeholder, route_kind, &req).await?;
+    let reference_ingest = ingest_batch_reference_audio(
+        state,
+        placeholder,
+        route_kind,
+        req.reference_audio.as_deref(),
+        req.saved_voice_id.as_deref(),
+    )
+    .await?;
+    // Each dialogue reference is its own pair of input artifacts, numbered
+    // by its place in the request.
+    let mut dialogue_ingests = Vec::with_capacity(req.references.len());
+    for reference in &req.references {
+        let ingest = ingest_batch_reference_audio(
+            state,
+            placeholder,
+            route_kind,
+            reference.audio.as_deref(),
+            reference.saved_voice_id.as_deref(),
+        )
+        .await?
+        .ok_or_else(|| ApiError::internal("A dialogue reference reached enqueue without audio"))?;
+        dialogue_ingests.push(ingest);
+    }
+    let dialogue_references = req
+        .references
+        .iter()
+        .map(|reference| {
+            (
+                crate::api::speech_dialogue::reference_speaker(reference),
+                reference
+                    .text
+                    .as_deref()
+                    .map(|text| sha256_hex(text.as_bytes())),
+            )
+        })
+        .collect::<Vec<_>>();
     let mut request_snapshot =
         BatchSpeechRequest::for_durable_job(route_kind, model_id.clone(), input_text.clone(), req);
     request_snapshot.tenant_key = tenant_key;
@@ -1364,55 +1440,28 @@ async fn enqueue_batch_speech_job(
     let mut input_media_asset_id = None;
     let mut reference_audio_sha256 = None;
     if let Some(reference_ingest) = reference_ingest {
-        let source_asset = reference_ingest.source_asset.ok_or_else(|| {
-            ApiError::internal("Reference audio ingest did not register its source asset")
-        })?;
-        let canonical = reference_ingest.canonical.ok_or_else(|| {
-            ApiError::internal("Reference audio ingest did not create a canonical asset")
-        })?;
-        let original_artifact_id = new_uuid();
-        let canonical_artifact_id = new_uuid();
-        input_media_asset_id = Some(source_asset.id.clone());
-        reference_audio_sha256 = source_asset.sha256.clone();
-        artifacts.push(NewDurableJobArtifact {
-            id: original_artifact_id.clone(),
-            artifact_kind: RuntimeArtifactKind::Media,
-            artifact_role: RuntimeArtifactRole::InputOriginal,
-            media_asset_id: Some(source_asset.id),
-            text_asset_id: None,
-            storage_key: Some(source_asset.storage_key),
-            content_type: Some(source_asset.content_type),
-            filename: source_asset.filename,
-            size_bytes: Some(source_asset.size_bytes),
-            sha256: source_asset.sha256,
-            metadata_json: serde_json::json!({
-                "route_record_id": placeholder.id.clone(),
-                "input_kind": "reference_audio",
-                "canonical_profile": CanonicalAudioProfile::ReferenceVoiceSourceRateMonoWav.id()
-            }),
-            retention_policy: "default".to_string(),
-        });
-        artifacts.push(NewDurableJobArtifact {
-            id: canonical_artifact_id.clone(),
-            artifact_kind: RuntimeArtifactKind::Media,
-            artifact_role: RuntimeArtifactRole::InputCanonical,
-            media_asset_id: Some(canonical.asset.id),
-            text_asset_id: None,
-            storage_key: Some(canonical.asset.storage_key),
-            content_type: Some(canonical.asset.content_type),
-            filename: canonical.asset.filename,
-            size_bytes: Some(canonical.asset.size_bytes),
-            sha256: canonical.asset.sha256,
-            metadata_json: serde_json::json!({
-                "route_record_id": placeholder.id.clone(),
-                "input_kind": "reference_audio",
-                "source_artifact_id": original_artifact_id,
-                "canonical_profile": CanonicalAudioProfile::ReferenceVoiceSourceRateMonoWav.id(),
-                "sample_rate_hz": canonical.asset.sample_rate_hz
-            }),
-            retention_policy: "default".to_string(),
-        });
-        stage_input_artifact_ids.push(canonical_artifact_id);
+        let reference =
+            push_reference_artifacts(&mut artifacts, placeholder, reference_ingest, None)?;
+        input_media_asset_id = Some(reference.source_asset_id);
+        reference_audio_sha256 = reference.source_sha256;
+        stage_input_artifact_ids.push(reference.canonical_artifact_id);
+    }
+    // The snapshot names every dialogue reference's speaker, audio and
+    // transcript, so a recovered plan's identity changes with any of them.
+    let mut snapshot_references = Vec::with_capacity(dialogue_ingests.len());
+    for (index, (ingest, (speaker, text_sha256))) in dialogue_ingests
+        .into_iter()
+        .zip(dialogue_references)
+        .enumerate()
+    {
+        let reference = push_reference_artifacts(&mut artifacts, placeholder, ingest, Some(index))?;
+        input_media_asset_id.get_or_insert(reference.source_asset_id);
+        stage_input_artifact_ids.push(reference.canonical_artifact_id);
+        snapshot_references.push(serde_json::json!({
+            "speaker": speaker,
+            "audio_sha256": reference.source_sha256,
+            "text_sha256": text_sha256,
+        }));
     }
 
     let accepted = state
@@ -1437,6 +1486,7 @@ async fn enqueue_batch_speech_job(
                     "reference_audio_sha256": reference_audio_sha256,
                     "reference_text_sha256": request_snapshot.request.reference_text.as_ref()
                         .map(|text| sha256_hex(text.as_bytes())),
+                    "references": snapshot_references,
                 }),
                 retry_policy_json: serde_json::json!({"max_attempts": 2}),
                 max_attempts: 2,
@@ -1482,6 +1532,83 @@ async fn enqueue_batch_speech_job(
     state.runtime.record_batch_tts_pipeline_job();
 
     Ok(())
+}
+
+/// The input artifacts of one reference's ingest.
+struct ReferenceArtifacts {
+    canonical_artifact_id: String,
+    source_asset_id: String,
+    source_sha256: Option<String>,
+}
+
+/// Adds one reference's original and canonical audio to `artifacts`: the
+/// request's one reference (`index` none) or its dialogue reference
+/// `index`, which the canonical artifact's metadata records for recovery.
+fn push_reference_artifacts(
+    artifacts: &mut Vec<NewDurableJobArtifact>,
+    placeholder: &SpeechHistoryRecord,
+    ingest: MediaIngestResult,
+    index: Option<usize>,
+) -> Result<ReferenceArtifacts, ApiError> {
+    let source_asset = ingest.source_asset.ok_or_else(|| {
+        ApiError::internal("Reference audio ingest did not register its source asset")
+    })?;
+    let canonical = ingest.canonical.ok_or_else(|| {
+        ApiError::internal("Reference audio ingest did not create a canonical asset")
+    })?;
+    let original_artifact_id = new_uuid();
+    let canonical_artifact_id = new_uuid();
+    let source_asset_id = source_asset.id.clone();
+    let source_sha256 = source_asset.sha256.clone();
+    let mut original_metadata = serde_json::json!({
+        "route_record_id": placeholder.id.clone(),
+        "input_kind": "reference_audio",
+        "canonical_profile": CanonicalAudioProfile::ReferenceVoiceSourceRateMonoWav.id()
+    });
+    let mut canonical_metadata = serde_json::json!({
+        "route_record_id": placeholder.id.clone(),
+        "input_kind": "reference_audio",
+        "source_artifact_id": original_artifact_id,
+        "canonical_profile": CanonicalAudioProfile::ReferenceVoiceSourceRateMonoWav.id(),
+        "sample_rate_hz": canonical.asset.sample_rate_hz
+    });
+    if let Some(index) = index {
+        original_metadata["reference_index"] = index.into();
+        canonical_metadata["reference_index"] = index.into();
+    }
+    artifacts.push(NewDurableJobArtifact {
+        id: original_artifact_id,
+        artifact_kind: RuntimeArtifactKind::Media,
+        artifact_role: RuntimeArtifactRole::InputOriginal,
+        media_asset_id: Some(source_asset.id),
+        text_asset_id: None,
+        storage_key: Some(source_asset.storage_key),
+        content_type: Some(source_asset.content_type),
+        filename: source_asset.filename,
+        size_bytes: Some(source_asset.size_bytes),
+        sha256: source_asset.sha256,
+        metadata_json: original_metadata,
+        retention_policy: "default".to_string(),
+    });
+    artifacts.push(NewDurableJobArtifact {
+        id: canonical_artifact_id.clone(),
+        artifact_kind: RuntimeArtifactKind::Media,
+        artifact_role: RuntimeArtifactRole::InputCanonical,
+        media_asset_id: Some(canonical.asset.id),
+        text_asset_id: None,
+        storage_key: Some(canonical.asset.storage_key),
+        content_type: Some(canonical.asset.content_type),
+        filename: canonical.asset.filename,
+        size_bytes: Some(canonical.asset.size_bytes),
+        sha256: canonical.asset.sha256,
+        metadata_json: canonical_metadata,
+        retention_policy: "default".to_string(),
+    });
+    Ok(ReferenceArtifacts {
+        canonical_artifact_id,
+        source_asset_id,
+        source_sha256,
+    })
 }
 
 pub(crate) fn batch_tts_stage_executor(state: AppState) -> Arc<dyn StageExecutor> {
@@ -1666,7 +1793,12 @@ async fn hydrate_batch_reference_audio(
     // Enqueueing stores every reference's audio as an input artifact and
     // drops it from the request; a reference may come without a transcript
     // (Chatterbox), so the artifact, not the transcript, says there is one.
-    if request.reference_audio.is_some() {
+    // A dialogue reference's artifact carries its place in the request.
+    let dialogue_missing = request
+        .references
+        .iter()
+        .any(|reference| reference.audio.is_none());
+    if request.reference_audio.is_some() && !dialogue_missing {
         return Ok(());
     }
 
@@ -1677,6 +1809,25 @@ async fn hydrate_batch_reference_audio(
         if artifact.artifact_role != RuntimeArtifactRole::InputCanonical
             || artifact.metadata_json["input_kind"] != "reference_audio"
         {
+            continue;
+        }
+        let slot = match artifact.metadata_json.get("reference_index") {
+            Some(index) => {
+                let index = index
+                    .as_u64()
+                    .and_then(|index| usize::try_from(index).ok())
+                    .ok_or_else(|| anyhow::anyhow!("TTS reference artifact has a bad index"))?;
+                &mut request
+                    .references
+                    .get_mut(index)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("TTS reference artifact {index} has no reference")
+                    })?
+                    .audio
+            }
+            None => &mut request.reference_audio,
+        };
+        if slot.is_some() {
             continue;
         }
         let storage_key = artifact.storage_key.as_deref().ok_or_else(|| {
@@ -1699,14 +1850,20 @@ async fn hydrate_batch_reference_audio(
                 "Canonical TTS reference size changed"
             );
         }
-        request.reference_audio =
-            Some(base64::engine::general_purpose::STANDARD.encode(stored.bytes));
-        return Ok(());
+        *slot = Some(base64::engine::general_purpose::STANDARD.encode(stored.bytes));
     }
 
     anyhow::ensure!(
-        request.reference_text.is_none() && request.saved_voice_id.is_none(),
+        request.reference_audio.is_some()
+            || (request.reference_text.is_none() && request.saved_voice_id.is_none()),
         "TTS batch request is missing its reference-audio input artifact"
+    );
+    anyhow::ensure!(
+        request
+            .references
+            .iter()
+            .all(|reference| reference.audio.is_some()),
+        "TTS batch request is missing a dialogue reference's audio artifact"
     );
     Ok(())
 }
@@ -2604,7 +2761,21 @@ fn normalize_create_request(
     req.reference_text = normalize_optional_trimmed(req.reference_text);
     req.reference_language = normalize_optional_trimmed(req.reference_language);
     req.saved_voice_id = normalize_optional_trimmed(req.saved_voice_id);
+    crate::api::speech_dialogue::normalize_references(&mut req.references);
     req
+}
+
+/// The dialogue fields of `req`, as the dialogue checks read them.
+fn speech_dialogue(
+    req: &CreateSpeechHistoryRecordRequest,
+) -> crate::api::speech_dialogue::SpeechDialogue<'_> {
+    crate::api::speech_dialogue::SpeechDialogue {
+        single_reference: req.reference_audio.is_some()
+            || req.reference_text.is_some()
+            || req.saved_voice_id.is_some(),
+        references: &req.references,
+        script: req.script.as_deref(),
+    }
 }
 
 async fn resolve_saved_voice_selection(
@@ -2612,6 +2783,7 @@ async fn resolve_saved_voice_selection(
     variant: ModelVariant,
     mut req: CreateSpeechHistoryRecordRequest,
 ) -> Result<CreateSpeechHistoryRecordRequest, ApiError> {
+    crate::api::speech_dialogue::resolve_saved_voices(state, &mut req.references).await?;
     let Some(saved_voice_id) = req.saved_voice_id.as_deref() else {
         return Ok(req);
     };
@@ -2715,7 +2887,7 @@ fn build_generation_request(
         reference_audio: req.reference_audio,
         reference_text: req.reference_text,
         reference_language: req.reference_language,
-        speaker_references: Vec::new(),
+        speaker_references: crate::api::speech_dialogue::speaker_references(&req.references),
         voice_description: req.voice_description,
         chunk_history: Vec::new(),
     }
@@ -2745,16 +2917,21 @@ fn normalize_for_model_capabilities(
         .as_deref()
         .map(has_non_empty_text)
         .unwrap_or(false);
-    let has_reference_audio = req
-        .reference_audio
-        .as_deref()
-        .map(has_non_empty_text)
-        .unwrap_or(false);
-    let has_reference_text = req
-        .reference_text
-        .as_deref()
-        .map(has_non_empty_text)
-        .unwrap_or(false);
+    // Each dialogue reference's transcript is checked on its own; the
+    // contract then reads them as the request's reference.
+    let dialogue = !req.references.is_empty();
+    let has_reference_audio = dialogue
+        || req
+            .reference_audio
+            .as_deref()
+            .map(has_non_empty_text)
+            .unwrap_or(false);
+    let has_reference_text = dialogue
+        || req
+            .reference_text
+            .as_deref()
+            .map(has_non_empty_text)
+            .unwrap_or(false);
     let has_voice_description = req
         .voice_description
         .as_deref()
@@ -2791,6 +2968,11 @@ fn normalize_for_model_capabilities(
             reference_text,
         )?;
     }
+    crate::api::speech_dialogue::check_dialogue_references(
+        variant,
+        &req.references,
+        req.text.as_deref().unwrap_or_default(),
+    )?;
 
     if req.stream.unwrap_or(false) && !capabilities.supports_streaming {
         return Err(ApiError::bad_request(format!(
@@ -3155,6 +3337,8 @@ mod tests {
             reference_text: None,
             reference_language: None,
             saved_voice_id: None,
+            references: Vec::new(),
+            script: None,
             temperature: None,
             speed: None,
             max_tokens: None,
@@ -3238,29 +3422,53 @@ mod tests {
         equivalent.tenant_key = Some([2; 32]);
 
         assert_eq!(
-            durable_tts_request_digest(&first, None).unwrap(),
-            durable_tts_request_digest(&equivalent, None).unwrap()
+            durable_tts_request_digest(&first, None, &[]).unwrap(),
+            durable_tts_request_digest(&equivalent, None, &[]).unwrap()
         );
 
         // A reference voice is part of the request; its payload identifies it.
-        let with_reference = durable_tts_request_digest(&first, Some("UklGRg==")).unwrap();
+        let with_reference = durable_tts_request_digest(&first, Some("UklGRg=="), &[]).unwrap();
         assert_ne!(
-            durable_tts_request_digest(&first, None).unwrap(),
+            durable_tts_request_digest(&first, None, &[]).unwrap(),
             with_reference
         );
         assert_eq!(
-            durable_tts_request_digest(&equivalent, Some(" UklGRg== ")).unwrap(),
+            durable_tts_request_digest(&equivalent, Some(" UklGRg== "), &[]).unwrap(),
             with_reference
         );
         assert_ne!(
-            durable_tts_request_digest(&first, Some("UklGRh==")).unwrap(),
+            durable_tts_request_digest(&first, Some("UklGRh=="), &[]).unwrap(),
             with_reference
+        );
+
+        // Dialogue references are identified by their payloads, in order.
+        let reference = |audio: &str| crate::api::speech_dialogue::SpeechDialogueReference {
+            speaker: Some(1),
+            audio: Some(audio.into()),
+            text: Some("Hi.".into()),
+            saved_voice_id: None,
+        };
+        let two = [reference("UklGRg=="), reference("UklGRh==")];
+        let dialogue = durable_tts_request_digest(&first, None, &two).unwrap();
+        assert_ne!(
+            dialogue,
+            durable_tts_request_digest(&first, None, &[]).unwrap()
+        );
+        assert_ne!(dialogue, with_reference);
+        assert_eq!(
+            durable_tts_request_digest(&equivalent, None, &two).unwrap(),
+            dialogue
+        );
+        let swapped = [reference("UklGRh=="), reference("UklGRg==")];
+        assert_ne!(
+            durable_tts_request_digest(&first, None, &swapped).unwrap(),
+            dialogue
         );
 
         equivalent.input_text = "Different".into();
         assert_ne!(
-            durable_tts_request_digest(&first, None).unwrap(),
-            durable_tts_request_digest(&equivalent, None).unwrap()
+            durable_tts_request_digest(&first, None, &[]).unwrap(),
+            durable_tts_request_digest(&equivalent, None, &[]).unwrap()
         );
     }
 
@@ -3407,6 +3615,56 @@ mod tests {
         assert!(json["request"]["text"].is_null());
         assert!(json["request"]["reference_audio"].is_null());
         assert_eq!(json["request"]["reference_text"], "Reference words");
+        // A request without dialogue stores no dialogue fields, so its
+        // idempotency digest is what it was before them.
+        let request = json["request"].as_object().unwrap();
+        assert!(!request.contains_key("references") && !request.contains_key("script"));
+    }
+
+    /// A dialogue request's stored copy keeps each reference's speaker,
+    /// transcript and saved voice, but not its audio (an input artifact
+    /// each) nor the script (the record's text is the rendered script).
+    #[test]
+    fn dialogue_batch_request_json_omits_reference_audio_and_script() {
+        use crate::api::speech_dialogue::{SpeechDialogueReference, SpeechScriptLine};
+        let mut request = base_request();
+        request.model_id = Some("FishAudio-Drama-3".into());
+        request.references = vec![
+            SpeechDialogueReference {
+                speaker: Some(0),
+                audio: Some("large-base64-audio".into()),
+                text: Some("Hi.".into()),
+                saved_voice_id: None,
+            },
+            SpeechDialogueReference {
+                speaker: Some(1),
+                audio: Some("saved-voice-audio".into()),
+                text: Some("Yo.".into()),
+                saved_voice_id: Some("voice-1".into()),
+            },
+        ];
+        request.script = Some(vec![SpeechScriptLine {
+            speaker: 0,
+            text: "Hi.".into(),
+        }]);
+        let snapshot = BatchSpeechRequest::for_durable_job(
+            SpeechRouteKind::TextToSpeech,
+            "FishAudio-Drama-3".into(),
+            "<|speaker:0|> Hi.".into(),
+            request,
+        );
+        let json = serde_json::to_value(&snapshot).expect("serialize batch request");
+        assert!(json["request"]["script"].is_null());
+        assert_eq!(
+            json["request"]["references"],
+            serde_json::json!([
+                {"speaker": 0, "text": "Hi."},
+                {"speaker": 1, "text": "Yo.", "saved_voice_id": "voice-1"},
+            ])
+        );
+        let decoded: BatchSpeechRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.request.references.len(), 2);
+        assert!(decoded.request.references.iter().all(|r| r.audio.is_none()));
     }
 
     #[test]

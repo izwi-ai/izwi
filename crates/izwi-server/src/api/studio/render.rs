@@ -144,6 +144,9 @@ async fn render_segment(state: &AppState, claim: &StudioRenderClaim) -> Result<(
         reference_text: None,
         reference_language: None,
         saved_voice_id: settings.saved_voice_id,
+        // Studio speaks one voice per paragraph.
+        references: Vec::new(),
+        script: None,
         temperature: None,
         // A model without speed control rejects a speed: the project may
         // keep one from an earlier model.

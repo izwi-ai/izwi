@@ -6,10 +6,14 @@
 //! long text as a chunk session whose chunks carry their history, the
 //! frame budget, and a durable first-party record whose chunks run as
 //! separate stage attempts with the history recovered from the checkpoint.
+//! Dialogue (4b): a two-speaker script with a reference per speaker, a
+//! referenced speaker beside a seeded one, saved voices per speaker, raw
+//! speaker tags in `input`, a long dialogue of several chunks, a durable
+//! record of two references across stage attempts, and every refusal.
 //!
 //! Expected audio comes from the runtime itself: each chunk the family's
-//! chunker plans, sent as one request carrying the pinned first chunk and
-//! the latest with their codes, from seed + its index.
+//! chunker plans, sent as one request carrying the references, the pinned
+//! first chunk and the latest with their codes, from seed + its index.
 
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
@@ -23,6 +27,7 @@ use izwi_core::runtime_models::architectures::fish_drama3::test_support::{
 };
 use izwi_core::{
     GenerationRequest, ModelVariant, RuntimeService, ServeRuntimeConfig, SpeechChunkTurn,
+    SpeechSpeakerReference,
 };
 use serde_json::{json, Value};
 use tower::Service;
@@ -55,10 +60,18 @@ impl Drop for Server {
 
 /// A server whose models directory holds the synthetic checkpoint.
 fn server(tag: &str) -> Server {
+    server_with(tag, true)
+}
+
+/// A server whose models directory holds the synthetic checkpoint, or
+/// nothing: requests refused before any load need no model.
+fn server_with(tag: &str, model: bool) -> Server {
     let root =
         std::env::temp_dir().join(format!("izwi-drama3-speech-{tag}-{}", uuid::Uuid::new_v4()));
     let models_dir = root.join("models");
-    write_lifecycle_synthetic_model(&models_dir.join(VARIANT.dir_name()), 5);
+    if model {
+        write_lifecycle_synthetic_model(&models_dir.join(VARIANT.dir_name()), 5);
+    }
     let serve_config = ServeRuntimeConfig {
         backend: izwi_core::backends::BackendPreference::Cpu,
         ui_enabled: false,
@@ -125,16 +138,22 @@ fn body(input: &str, seed: u64) -> Value {
 
 /// `seconds` of a tone as a base64 16-bit WAV at 44.1 kHz.
 fn reference_wav(seconds: f32) -> String {
+    tone_wav(seconds, SAMPLE_RATE, 0.031)
+}
+
+/// `seconds` of a tone advancing `step` radians a sample, as a base64
+/// 16-bit WAV at `rate`.
+fn tone_wav(seconds: f32, rate: u32, step: f32) -> String {
     let mut cursor = std::io::Cursor::new(Vec::new());
     let spec = hound::WavSpec {
         channels: 1,
-        sample_rate: SAMPLE_RATE,
+        sample_rate: rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
     let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
-    for i in 0..(seconds * SAMPLE_RATE as f32) as usize {
-        let sample = (i as f32 * 0.031).sin() * 0.4;
+    for i in 0..(seconds * rate as f32) as usize {
+        let sample = (i as f32 * step).sin() * 0.4;
         writer.write_sample((sample * 32_767.0) as i16).unwrap();
     }
     writer.finalize().unwrap();
@@ -163,14 +182,25 @@ fn pcm_i16(samples: &[f32]) -> Vec<i16> {
         .collect()
 }
 
+/// The voices a chunk session speaks in.
+#[derive(Clone, Copy)]
+enum Voices<'a> {
+    /// Every speaker's voice comes from the seed.
+    Seeded,
+    /// One reference (`reference_audio`, `reference_text`).
+    Clone(&'a str, &'a str),
+    /// References per speaker.
+    Speakers(&'a [SpeechSpeakerReference]),
+}
+
 /// The audio of `text` as the chunk session speaks it, chunk by chunk
-/// through the runtime: each chunk from `seed + index`, carrying the pinned
-/// first chunk and the latest with their codes.
+/// through the runtime: each chunk from `seed + index`, carrying the
+/// references and the pinned first chunk and the latest with their codes.
 async fn chunk_session_pcm(
     state: &AppState,
     text: &str,
     seed: u64,
-    reference: Option<(&str, &str)>,
+    voices: Voices<'_>,
 ) -> izwi_core::Result<(Vec<f32>, usize)> {
     let mut history = SpeechChunkHistory::default();
     let mut pcm = Vec::new();
@@ -182,8 +212,14 @@ async fn chunk_session_pcm(
         request.config.options.max_tokens = BUDGET;
         request.config.options.speech.temperature = Some(TEMPERATURE);
         request.config.options.speech.seed = Some(seed + index as u64);
-        request.reference_audio = reference.map(|(audio, _)| audio.to_string());
-        request.reference_text = reference.map(|(_, text)| text.to_string());
+        match voices {
+            Voices::Seeded => {}
+            Voices::Clone(audio, text) => {
+                request.reference_audio = Some(audio.to_string());
+                request.reference_text = Some(text.to_string());
+            }
+            Voices::Speakers(references) => request.speaker_references = references.to_vec(),
+        }
         request.chunk_history = history.turns();
         let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         let run = Box::pin(state.runtime.generate_streaming(request, tx));
@@ -214,10 +250,10 @@ async fn complete_seed(
     state: &AppState,
     text: &str,
     from: u64,
-    reference: Option<(&str, &str)>,
+    voices: Voices<'_>,
 ) -> (u64, Vec<f32>) {
     for seed in from..from + 24 {
-        match chunk_session_pcm(state, text, seed, reference).await {
+        match chunk_session_pcm(state, text, seed, voices).await {
             Ok((pcm, _)) => return (seed, pcm),
             Err(error) if error.to_string().contains("frame_limit") => continue,
             Err(error) => panic!("seed {seed}: {error}"),
@@ -240,28 +276,7 @@ fn sse_events(body: &[u8]) -> Vec<Value> {
 /// loads (neither is on disk here).
 #[tokio::test]
 async fn control_tokens_are_refused_on_every_speech_route_before_any_load() {
-    let root = std::env::temp_dir().join(format!("izwi-control-tokens-{}", uuid::Uuid::new_v4()));
-    let server = {
-        let serve_config = ServeRuntimeConfig {
-            backend: izwi_core::backends::BackendPreference::Cpu,
-            ui_enabled: false,
-            models_dir: root.join("models"),
-            ..ServeRuntimeConfig::default()
-        };
-        let _guard = env_lock();
-        std::env::set_var("IZWI_DB_PATH", root.join("izwi.sqlite3"));
-        std::env::set_var("IZWI_MEDIA_DIR", root.join("media"));
-        let runtime = RuntimeService::new(serve_config.engine_config()).expect("runtime");
-        let state = AppState::new(runtime, &serve_config).expect("app state");
-        std::env::remove_var("IZWI_DB_PATH");
-        std::env::remove_var("IZWI_MEDIA_DIR");
-        state.lifecycle.mark_ready();
-        Server {
-            app: crate::api::create_router(state.clone(), &serve_config),
-            state,
-            root,
-        }
-    };
+    let server = server_with("control-tokens", false);
     for model in ["FishAudio-S2-Pro", "FishAudio-Drama-3"] {
         let response = speech(
             &server,
@@ -330,7 +345,7 @@ async fn fish_drama3_speaks_through_openai_speech() {
     let text = "hello world.";
 
     // A seeded voice: the same audio as the runtime's own chunk.
-    let (seed, expected) = complete_seed(&server.state, text, 0, None).await;
+    let (seed, expected) = complete_seed(&server.state, text, 0, Voices::Seeded).await;
     let response = speech(&server, body(text, seed)).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["X-Audio-Sample-Rate"], "44100");
@@ -364,8 +379,13 @@ async fn fish_drama3_speaks_through_openai_speech() {
 
     // A cloned voice: the reference and its transcript.
     let reference = reference_wav(2.0);
-    let (clone_seed, cloned) =
-        complete_seed(&server.state, text, 0, Some((&reference, "hello world."))).await;
+    let (clone_seed, cloned) = complete_seed(
+        &server.state,
+        text,
+        0,
+        Voices::Clone(&reference, "hello world."),
+    )
+    .await;
     let mut clone = body(text, clone_seed);
     clone["reference_audio"] = json!(reference);
     clone["reference_text"] = json!("hello world.");
@@ -422,7 +442,7 @@ async fn fish_drama3_speaks_through_openai_speech() {
     // carrying its history, spoken one after another with no gap.
     let long = "one two three hello world. ".repeat(30);
     assert!(plan_chunks(&long, false).len() >= 3);
-    let (long_seed, long_expected) = complete_seed(&server.state, &long, 100, None).await;
+    let (long_seed, long_expected) = complete_seed(&server.state, &long, 100, Voices::Seeded).await;
     let response = speech(&server, body(&long, long_seed)).await;
     assert_eq!(response.status(), StatusCode::OK);
     let tokens: usize = response.headers()["X-Tokens-Generated"]
@@ -440,7 +460,14 @@ async fn fish_drama3_speaks_through_openai_speech() {
     // reached every prompt after the first.
     let mut alone = Vec::new();
     for (index, chunk) in plan_chunks(&long, false).iter().enumerate() {
-        match chunk_session_pcm(&server.state, chunk, long_seed + index as u64, None).await {
+        match chunk_session_pcm(
+            &server.state,
+            chunk,
+            long_seed + index as u64,
+            Voices::Seeded,
+        )
+        .await
+        {
             Ok((pcm, _)) => alone.extend(pcm),
             Err(error) if error.to_string().contains("frame_limit") => {}
             Err(error) => panic!("{error}"),
@@ -502,7 +529,6 @@ fn fish_drama3_durable_records_carry_history_across_stage_attempts() {
 }
 
 async fn durable_records_carry_history_across_stage_attempts() {
-    use crate::batch_runtime::worker::{BatchWorkerConfig, BatchWorkerRunner};
     let _load = LOADS.lock().await;
     let server = server("durable");
     server
@@ -514,7 +540,7 @@ async fn durable_records_carry_history_across_stage_attempts() {
     let long = "one two three hello world. ".repeat(30);
     let chunks = plan_chunks(&long, false).len();
     assert!(chunks >= 3);
-    let (seed, expected) = complete_seed(&server.state, &long, 200, None).await;
+    let (seed, expected) = complete_seed(&server.state, &long, 200, Voices::Seeded).await;
 
     let response = send(
         &server,
@@ -533,6 +559,32 @@ async fn durable_records_carry_history_across_stage_attempts() {
     let record: Value = serde_json::from_slice(&bytes(response).await).unwrap();
     let id = record["id"].as_str().unwrap().to_string();
 
+    let attempts = run_durable_record(&server, "/v1/text-to-speech", &id).await;
+    // One stage attempt per chunk.
+    assert_eq!(attempts, chunks);
+    let response = send(
+        &server,
+        Method::GET,
+        &format!("/v1/text-to-speech/{id}/audio"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (rate, wav) = wav_samples(&bytes(response).await);
+    assert_eq!(rate, SAMPLE_RATE);
+    assert_eq!(wav, pcm_i16(&expected));
+    server
+        .state
+        .runtime
+        .unload_model(VARIANT)
+        .await
+        .expect("unload");
+}
+
+/// Runs a batch worker until record `id` of `route` is ready, one stage
+/// attempt a pass, and returns the attempts it took.
+async fn run_durable_record(server: &Server, route: &str, id: &str) -> usize {
+    use crate::batch_runtime::worker::{BatchWorkerConfig, BatchWorkerRunner};
     let state = &server.state;
     let mut config = BatchWorkerConfig::local("drama3-durable-test");
     config.queue_names = crate::roles::local::local_batch_worker_queue_names();
@@ -558,16 +610,7 @@ async fn durable_records_carry_history_across_stage_attempts() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
     loop {
         let record: Value = serde_json::from_slice(
-            &bytes(
-                send(
-                    &server,
-                    Method::GET,
-                    &format!("/v1/text-to-speech/{id}"),
-                    None,
-                )
-                .await,
-            )
-            .await,
+            &bytes(send(server, Method::GET, &format!("{route}/{id}"), None).await).await,
         )
         .unwrap();
         match record["processing_status"].as_str() {
@@ -585,7 +628,352 @@ async fn durable_records_carry_history_across_stage_attempts() {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
-    // One stage attempt per chunk.
+    attempts
+}
+
+/// A dialogue reference for the runtime: `audio` voicing `speaker`.
+fn speaker_reference(speaker: usize, audio: &str, text: &str) -> SpeechSpeakerReference {
+    SpeechSpeakerReference {
+        speaker,
+        audio: audio.to_string(),
+        text: text.to_string(),
+    }
+}
+
+/// The same references as a request's `references`.
+fn references_json(references: &[SpeechSpeakerReference]) -> Value {
+    references
+        .iter()
+        .map(|reference| {
+            json!({
+                "speaker": reference.speaker,
+                "audio": reference.audio,
+                "text": reference.text,
+            })
+        })
+        .collect()
+}
+
+/// `lines` as a request's `script`, and the text the server renders it to.
+fn script(lines: &[(usize, &str)]) -> (Value, String) {
+    let json = lines
+        .iter()
+        .map(|(speaker, text)| json!({ "speaker": speaker, "text": text }))
+        .collect();
+    let text = lines
+        .iter()
+        .map(|(speaker, text)| format!("<|speaker:{speaker}|> {text}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (json, text)
+}
+
+/// A saved voice of `audio` and its transcript; its id.
+async fn save_voice(server: &Server, name: &str, audio: &str, text: Option<&str>) -> String {
+    let response = send(
+        server,
+        Method::POST,
+        "/v1/voices",
+        Some(json!({
+            "name": name,
+            "reference_text": text,
+            "audio_base64": audio,
+            "audio_mime_type": "audio/wav",
+            "consent": true,
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let voice: Value = serde_json::from_slice(&bytes(response).await).unwrap();
+    voice["id"].as_str().unwrap().to_string()
+}
+
+/// The error message of a 400.
+async fn bad_request(response: Response) -> String {
+    let status = response.status();
+    let body = bytes(response).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let error: Value = serde_json::from_slice(&body).unwrap();
+    error["error"]["message"].as_str().unwrap().to_string()
+}
+
+/// Dialogue on `/v1/audio/speech` on the synthetic checkpoint, each against
+/// the runtime's own chunk session with the same references: a two-speaker
+/// script with an inline reference per speaker (and the references reached
+/// the prompt); the same text as raw speaker tags in `input`; a referenced
+/// speaker beside a seeded one; a saved voice per speaker; the voice-cloning
+/// record route; a long dialogue of three or more chunks, every chunk
+/// holding both references; and the limits only preparation can check (a
+/// clip over 60 s, references that leave the prompt no room).
+///
+/// The voice-clone record runs the durable speech path inline, which an
+/// unoptimized build polls deeper than the default 2 MiB stack, so this
+/// test's runtime gives its workers more, as the durable tests do.
+#[test]
+fn fish_drama3_speaks_dialogue_through_openai_speech() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(32 << 20)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime
+        .block_on(runtime.spawn(speaks_dialogue_through_openai_speech()))
+        .expect("the test task");
+}
+
+async fn speaks_dialogue_through_openai_speech() {
+    let _load = LOADS.lock().await;
+    let server = server("dialogue");
+    server
+        .state
+        .runtime
+        .load_model(VARIANT)
+        .await
+        .expect("load");
+    let (anna, ben) = (reference_wav(1.5), tone_wav(2.0, SAMPLE_RATE, 0.047));
+    let references = [
+        speaker_reference(0, &anna, "hello world."),
+        speaker_reference(1, &ben, "one two three."),
+    ];
+    let request = |seed: u64| {
+        json!({
+            "model": "FishAudio-Drama-3",
+            "temperature": TEMPERATURE,
+            "max_tokens": BUDGET,
+            "seed": seed,
+        })
+    };
+
+    // A two-speaker script with a reference per speaker.
+    let (lines, text) = script(&[(0, "hello world."), (1, "one two three.")]);
+    let (seed, expected) =
+        complete_seed(&server.state, &text, 0, Voices::Speakers(&references)).await;
+    let mut body = request(seed);
+    body["script"] = lines.clone();
+    body["references"] = references_json(&references);
+    let response = speech(&server, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (rate, wav) = wav_samples(&bytes(response).await);
+    assert_eq!(rate, SAMPLE_RATE);
+    assert_eq!(wav, pcm_i16(&expected));
+    // The references reached the prompt: the same seed without them speaks
+    // otherwise.
+    match chunk_session_pcm(&server.state, &text, seed, Voices::Seeded).await {
+        Ok((seeded, _)) => assert_ne!(pcm_i16(&seeded), wav),
+        Err(error) => assert!(error.to_string().contains("frame_limit"), "{error}"),
+    }
+
+    // Raw speaker tags in `input`: the script's text, the same audio.
+    let mut body = request(seed);
+    body["input"] = json!(text);
+    body["references"] = references_json(&references);
+    let (_, tagged) = wav_samples(&bytes(speech(&server, body).await).await);
+    assert_eq!(tagged, wav);
+
+    // A referenced speaker beside a seeded one.
+    let one = [speaker_reference(1, &ben, "one two three.")];
+    let (mixed_seed, mixed) = complete_seed(&server.state, &text, 40, Voices::Speakers(&one)).await;
+    let mut body = request(mixed_seed);
+    body["script"] = lines.clone();
+    body["references"] = references_json(&one);
+    let response = speech(&server, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(wav_samples(&bytes(response).await).1, pcm_i16(&mixed));
+
+    // A saved voice per speaker: their clips and transcripts, the same
+    // audio as the inline references.
+    let anna_id = save_voice(&server, "Anna", &anna, Some("hello world.")).await;
+    let ben_id = save_voice(&server, "Ben", &ben, Some("one two three.")).await;
+    let mut body = request(seed);
+    body["script"] = lines.clone();
+    body["references"] = json!([
+        {"speaker": 0, "saved_voice_id": anna_id},
+        {"speaker": 1, "saved_voice_id": ben_id},
+    ]);
+    let response = speech(&server, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(wav_samples(&bytes(response).await).1, wav);
+
+    // The voice-cloning record route: a record whose text is the rendered
+    // script and whose audio is the same.
+    let response = send(
+        &server,
+        Method::POST,
+        "/v1/voice-clones",
+        Some(json!({
+            "model_id": "FishAudio-Drama-3",
+            "script": lines,
+            "references": references_json(&references),
+            "temperature": TEMPERATURE,
+            "max_tokens": BUDGET,
+            "seed": seed,
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let record: Value = serde_json::from_slice(&bytes(response).await).unwrap();
+    assert_eq!(record["input_text"], json!(text));
+    let id = record["id"].as_str().unwrap();
+    let response = send(
+        &server,
+        Method::GET,
+        &format!("/v1/voice-clones/{id}/audio"),
+        None,
+    )
+    .await;
+    assert_eq!(wav_samples(&bytes(response).await).1, wav);
+
+    // A long dialogue: three or more chunks, each holding both references
+    // and its history.
+    let turns = (0..20)
+        .map(|index| (index % 2, "one two three hello world."))
+        .collect::<Vec<_>>();
+    let (long_lines, long_text) = script(&turns);
+    let chunks = plan_chunks(&long_text, false).len();
+    assert!(chunks >= 3, "{chunks}");
+    let (long_seed, long_expected) = complete_seed(
+        &server.state,
+        &long_text,
+        100,
+        Voices::Speakers(&references),
+    )
+    .await;
+    let mut body = request(long_seed);
+    body["script"] = long_lines;
+    body["references"] = references_json(&references);
+    body["stream"] = json!(true);
+    body["response_format"] = json!("pcm_i16");
+    let events = sse_events(&bytes(speech(&server, body).await).await);
+    let mut stream_pcm = Vec::new();
+    for event in events.iter().filter(|e| e["event"] == "audio.chunk") {
+        let chunk = base64::engine::general_purpose::STANDARD
+            .decode(event["audio_base64"].as_str().unwrap())
+            .unwrap();
+        stream_pcm.extend(
+            chunk
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| i16::from_le_bytes(*pair)),
+        );
+    }
+    let done = events.iter().find(|e| e["event"] == "audio.done").unwrap();
+    assert_eq!(done["timing"]["planned_segment_count"], chunks);
+    assert_eq!(stream_pcm, pcm_i16(&long_expected));
+
+    // A clip over 60 s is refused at preparation (8 kHz keeps it small).
+    let mut body = request(seed);
+    body["input"] = json!(text);
+    body["references"] = json!([
+        {"speaker": 0, "audio": tone_wav(61.0, 8_000, 0.2), "text": "hello world."},
+    ]);
+    let message = bad_request(speech(&server, body).await).await;
+    assert!(
+        message.contains("`references[0]`") && message.contains("at most 60 s"),
+        "{message}"
+    );
+    // The single reference too.
+    let mut body = request(seed);
+    body["input"] = json!("hello world.");
+    body["reference_audio"] = json!(tone_wav(61.0, 8_000, 0.2));
+    body["reference_text"] = json!("hello world.");
+    let message = bad_request(speech(&server, body).await).await;
+    assert!(
+        message.contains("`reference_audio`") && message.contains("at most 60 s"),
+        "{message}"
+    );
+    // References that leave the prompt no room for the text: four clips of
+    // 60 s pass the synthetic model's positions on their own.
+    let long_clip = tone_wav(60.0, 8_000, 0.2);
+    let mut body = request(seed);
+    body["input"] = json!(text);
+    body["references"] = (0..4)
+        .map(|speaker| json!({"speaker": speaker, "audio": long_clip, "text": "hello world."}))
+        .collect();
+    let message = bad_request(speech(&server, body).await).await;
+    assert!(
+        message.contains("holds 4 references in") && message.contains("fewer or shorter"),
+        "{message}"
+    );
+    server
+        .state
+        .runtime
+        .unload_model(VARIANT)
+        .await
+        .expect("unload");
+}
+
+/// A durable first-party record of a long dialogue with two references, one
+/// inline and one a saved voice: every chunk runs as its own stage attempt,
+/// and each attempt recovers both references from the job's input artifacts.
+/// The record's text is the rendered script and its audio the chunk
+/// session's with both references.
+#[test]
+fn fish_drama3_durable_dialogue_records_recover_every_reference() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(32 << 20)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime
+        .block_on(runtime.spawn(durable_dialogue_records_recover_every_reference()))
+        .expect("the test task");
+}
+
+async fn durable_dialogue_records_recover_every_reference() {
+    let _load = LOADS.lock().await;
+    let server = server("durable-dialogue");
+    server
+        .state
+        .runtime
+        .load_model(VARIANT)
+        .await
+        .expect("load");
+    let (anna, ben) = (reference_wav(1.5), tone_wav(2.0, SAMPLE_RATE, 0.047));
+    let references = [
+        speaker_reference(0, &anna, "hello world."),
+        speaker_reference(1, &ben, "one two three."),
+    ];
+    let ben_id = save_voice(&server, "Ben", &ben, Some("one two three.")).await;
+    let turns = (0..20)
+        .map(|index| (index % 2, "one two three hello world."))
+        .collect::<Vec<_>>();
+    let (lines, text) = script(&turns);
+    let chunks = plan_chunks(&text, false).len();
+    assert!(chunks >= 3, "{chunks}");
+    let (seed, expected) =
+        complete_seed(&server.state, &text, 200, Voices::Speakers(&references)).await;
+
+    let response = send(
+        &server,
+        Method::POST,
+        "/v1/text-to-speech",
+        Some(json!({
+            "model_id": "FishAudio-Drama-3",
+            "script": lines,
+            "references": [
+                {"speaker": 0, "audio": anna, "text": "hello world."},
+                {"speaker": 1, "saved_voice_id": ben_id},
+            ],
+            "temperature": TEMPERATURE,
+            "max_tokens": BUDGET,
+            "seed": seed,
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let record: Value = serde_json::from_slice(&bytes(response).await).unwrap();
+    assert_eq!(record["input_text"], json!(text));
+    let id = record["id"].as_str().unwrap().to_string();
+    let attempts = run_durable_record(&server, "/v1/text-to-speech", &id).await;
+    // One stage attempt per chunk, each with both references.
     assert_eq!(attempts, chunks);
     let response = send(
         &server,
@@ -604,4 +992,180 @@ async fn durable_records_carry_history_across_stage_attempts() {
         .unload_model(VARIANT)
         .await
         .expect("unload");
+}
+
+/// Every dialogue refusal is a 400 naming its cause, on `/v1/audio/speech`
+/// and the first-party record routes alike, before any model loads (none is
+/// on disk here).
+#[tokio::test]
+async fn dialogue_refusals_come_before_any_load() {
+    let server = server_with("dialogue-refusals", false);
+    let clip = reference_wav(1.0);
+    let inline = |speaker: usize| json!({"speaker": speaker, "audio": clip, "text": "Hi."});
+    let untranscribed = save_voice(&server, "No words", &clip, None).await;
+    let cases: Vec<(&str, Value, &str)> = vec![
+        (
+            "a single-voice model",
+            json!({"model": "FishAudio-S2-Pro", "input": "Hi.", "references": [inline(0)]}),
+            "speaks one voice",
+        ),
+        (
+            "a script for a single-voice model",
+            json!({"model": "Kokoro-82M", "script": [{"speaker": 0, "text": "Hi."}]}),
+            "speaks one voice",
+        ),
+        (
+            "both reference forms",
+            json!({"input": "Hi.", "references": [inline(1)], "reference_audio": clip,
+                   "reference_text": "Hi."}),
+            "not both",
+        ),
+        (
+            "a saved voice beside references",
+            json!({"input": "Hi.", "references": [inline(1)], "saved_voice_id": "voice"}),
+            "not both",
+        ),
+        (
+            "a script beside the text",
+            json!({"input": "Hi.", "script": [{"speaker": 0, "text": "Hi."}]}),
+            "not both",
+        ),
+        (
+            "nine references",
+            json!({"input": "Hi.", "references": (0..9).map(|s| inline(s % 3)).collect::<Vec<_>>()}),
+            "at most 8 references; got 9",
+        ),
+        (
+            "speaker 16",
+            json!({"input": "Hi.", "references": [inline(16)]}),
+            "0 to 15",
+        ),
+        (
+            "a script speaker 16",
+            json!({"script": [{"speaker": 16, "text": "Hi."}]}),
+            "speaker 16 is not 0 to 15",
+        ),
+        ("an empty script", json!({"script": []}), "no lines"),
+        (
+            "an empty script line",
+            json!({"script": [{"speaker": 0, "text": " "}]}),
+            "must not be empty",
+        ),
+        (
+            "a tagged script line",
+            json!({"script": [{"speaker": 0, "text": "<|speaker:1|> Hi."}]}),
+            "speaker field",
+        ),
+        (
+            "a reference without its transcript",
+            json!({"input": "Hi.", "references": [{"speaker": 0, "audio": clip}]}),
+            "`references[0]` needs `text`",
+        ),
+        (
+            "a reference with audio and a saved voice",
+            json!({"input": "Hi.", "references": [
+                {"speaker": 0, "audio": clip, "text": "Hi.", "saved_voice_id": "voice"}]}),
+            "both `audio` and `saved_voice_id`",
+        ),
+        (
+            "a reference with neither",
+            json!({"input": "Hi.", "references": [{"speaker": 0, "text": "Hi."}]}),
+            "needs `audio`",
+        ),
+        (
+            "a saved voice given a transcript",
+            json!({"input": "Hi.", "references": [
+                {"speaker": 0, "saved_voice_id": "voice", "text": "Hi."}]}),
+            "brings its own transcript",
+        ),
+        (
+            "a saved voice without a transcript",
+            json!({"input": "Hi.", "references": [
+                {"speaker": 0, "saved_voice_id": untranscribed}]}),
+            "`references[0]` is a saved voice without a transcript",
+        ),
+        (
+            "a control token in a transcript",
+            json!({"input": "Hi.", "references": [
+                {"speaker": 0, "audio": clip, "text": "Hi <|voice|>"}]}),
+            "`references[0].text` contains `<|voice|>`",
+        ),
+        (
+            "a control token in a script line",
+            json!({"script": [{"speaker": 0, "text": "Hi <|im_start|>"}]}),
+            "`script[0].text` contains `<|im_start|>`",
+        ),
+        (
+            "another speaker's tag leading a transcript",
+            json!({"input": "Hi.", "references": [
+                {"speaker": 1, "audio": clip, "text": "<|speaker:2|> Hi."}]}),
+            "another speaker's tag",
+        ),
+    ];
+    for (case, body, expected) in cases {
+        let mut openai = body.clone();
+        let object = openai.as_object_mut().unwrap();
+        object
+            .entry("model")
+            .or_insert_with(|| json!("FishAudio-Drama-3"));
+        let message = bad_request(speech(&server, openai).await).await;
+        assert!(message.contains(expected), "{case}: {message}");
+        // The first-party route reads `model_id` and `text`.
+        let mut first_party = body;
+        let object = first_party.as_object_mut().unwrap();
+        let model = object
+            .remove("model")
+            .unwrap_or_else(|| json!("FishAudio-Drama-3"));
+        object.insert("model_id".into(), model);
+        if let Some(input) = object.remove("input") {
+            object.insert("text".into(), input);
+        }
+        let response = send(
+            &server,
+            Method::POST,
+            "/v1/text-to-speech",
+            Some(first_party),
+        )
+        .await;
+        let message = bad_request(response).await;
+        let expected = expected.replace("`input`", "`text`");
+        assert!(
+            message.contains(&expected),
+            "{case} (first party): {message}"
+        );
+    }
+    // Neither text nor a script.
+    let message = bad_request(
+        speech(
+            &server,
+            json!({"model": "FishAudio-Drama-3", "voice": "alloy"}),
+        )
+        .await,
+    )
+    .await;
+    assert!(message.contains("Missing required `input`"), "{message}");
+    // Inline clips past 16 MiB point at saved voices.
+    let big = "A".repeat(9 * 1024 * 1024);
+    let message = bad_request(
+        speech(
+            &server,
+            json!({"model": "FishAudio-Drama-3", "input": "Hi.", "references": [
+                {"speaker": 0, "audio": big, "text": "Hi."},
+                {"speaker": 1, "audio": big, "text": "Hi."},
+            ]}),
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        message.contains("at most 16 MiB") && message.contains("saved_voice_id"),
+        "{message}"
+    );
+    // Nothing loaded: every refusal came before any load.
+    assert!(server
+        .state
+        .runtime
+        .fish_artifact_fingerprint(VARIANT)
+        .await
+        .is_none());
 }

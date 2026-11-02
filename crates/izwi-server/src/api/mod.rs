@@ -22,6 +22,7 @@ pub mod request_context;
 mod router;
 pub mod saved_voices;
 pub(crate) mod sentence_split;
+pub(crate) mod speech_dialogue;
 pub mod speech_history;
 pub(crate) mod speech_text_upload;
 pub mod studio;

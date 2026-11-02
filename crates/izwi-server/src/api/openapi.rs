@@ -2207,8 +2207,10 @@ pub struct SpeechRequest {
     /// `<|voice|>`, `<|text|>`, `<|interleave|>`, `<|semantic:N|>`);
     /// performance tags such as `[sighs]` and `<whisper>…</whisper>` pass
     /// through. Long text is split into chunks the model speaks one after
-    /// another.
-    pub input: String,
+    /// another. Fish Audio Drama 3 voices `<|speaker:0|>` to
+    /// `<|speaker:15|>` tags in it as a dialogue. Required unless a
+    /// `script` gives the text.
+    pub input: Option<String>,
     pub voice: Option<String>,
     pub response_format: Option<String>,
     pub allow_format_fallback: Option<bool>,
@@ -2238,6 +2240,18 @@ pub struct SpeechRequest {
     /// clones across languages); absent, read from the transcript's script.
     pub reference_language: Option<String>,
     pub saved_voice_id: Option<String>,
+    /// Reference voices per speaker, for a model that voices several
+    /// (`supports_speaker_dialogue`: Fish Audio Drama 3, at most 8, speakers
+    /// 0 to 15; several may voice one speaker). Each is a clip (`audio` and
+    /// its `text`) or a `saved_voice_id`. Replaces `reference_audio`,
+    /// `reference_text` and `saved_voice_id` (giving both is a 400); a
+    /// speaker without a reference speaks in a voice its `seed` sets. Inline
+    /// clips total at most 16 MiB; use saved voices beyond that.
+    pub references: Option<Vec<crate::api::speech_dialogue::SpeechDialogueReference>>,
+    /// A dialogue as lines, each spoken as `<|speaker:N|> text`, the lines
+    /// joined by newlines; replaces `input` (giving both is a 400). Models
+    /// with `supports_speaker_dialogue` only.
+    pub script: Option<Vec<crate::api::speech_dialogue::SpeechScriptLine>>,
     /// Model-specific sampling and controls (`top_p`, `seed`, `cfg_weight`,
     /// `exaggeration`, `min_p`, ...); a control the model does not take is
     /// refused.

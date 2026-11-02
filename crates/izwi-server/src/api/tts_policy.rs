@@ -4,7 +4,6 @@ use izwi_core::runtime_models::architectures::chatterbox::{
 };
 use izwi_core::runtime_models::architectures::fish_drama3::model::auto_frame_budget as fish_drama3_auto_frame_budget;
 use izwi_core::runtime_models::architectures::fish_drama3::prompt as fish_drama3_prompt;
-use izwi_core::runtime_models::architectures::fish_drama3::reference_cache::MAX_REFERENCES as FISH_DRAMA3_MAX_REFERENCES;
 use izwi_core::runtime_models::architectures::fish_s2::contracts::CONTROL_TOKENS as FISH_S2_CONTROL_TOKENS;
 use izwi_core::runtime_models::architectures::maya1::{
     maya1_auto_max_new_tokens, prompt::validate_inline_tags,
@@ -80,6 +79,7 @@ pub(crate) fn validate_speech_voice(
             &[SpeechReferenceRequest {
                 transcript: voice.reference_text,
                 saved_voice: voice.saved_voice,
+                index: None,
             }],
         )?;
     }
@@ -131,16 +131,18 @@ pub(crate) struct SpeechReferenceRequest {
     pub(crate) transcript: bool,
     /// It came from a saved voice.
     pub(crate) saved_voice: bool,
+    /// Its place in a dialogue request's `references`; none for the
+    /// single-reference fields.
+    pub(crate) index: Option<usize>,
 }
 
-/// The most reference clips one request of `variant` may carry: the
-/// family's prompt limit for Fish Audio Drama 3 (8), one for every other
-/// model that clones.
+/// The most reference clips one request of `variant` may carry: its
+/// catalog `max_references` (Fish Audio Drama 3: the family's prompt limit
+/// of 8; one for every other model that clones).
 pub(crate) fn max_speech_references(variant: ModelVariant) -> usize {
-    match variant.family() {
-        ModelFamily::FishDrama3Tts => FISH_DRAMA3_MAX_REFERENCES,
-        _ => 1,
-    }
+    variant
+        .speech_capabilities()
+        .map_or(0, |capabilities| capabilities.max_references)
 }
 
 /// Refuse references the model cannot take: more than
@@ -165,14 +167,21 @@ pub(crate) fn validate_speech_references(
         .iter()
         .find(|reference| transcript_required && !reference.transcript)
     {
-        return Err(ApiError::bad_request(if reference.saved_voice {
-            format!(
+        let message = match (reference.index, reference.saved_voice) {
+            (None, true) => format!(
                 "This saved voice has no transcript, which {variant} needs. Use a voice saved \
                  with one, or a model that clones from audio alone."
-            )
-        } else {
-            "Provide both `reference_audio` and `reference_text` together.".to_string()
-        }));
+            ),
+            (None, false) => "Provide both `reference_audio` and `reference_text` together.".into(),
+            (Some(index), true) => format!(
+                "`references[{index}]` is a saved voice without a transcript, which {variant} \
+                 needs. Use a voice saved with one."
+            ),
+            (Some(index), false) => {
+                format!("`references[{index}]` needs `text`, the transcript of its `audio`.")
+            }
+        };
+        return Err(ApiError::bad_request(message));
     }
     Ok(())
 }
@@ -711,9 +720,11 @@ mod tests {
         let with_transcript = SpeechReferenceRequest {
             transcript: true,
             saved_voice: false,
+            index: None,
         };
         assert_eq!(max_speech_references(drama3), 8);
         assert_eq!(max_speech_references(ModelVariant::FishAudioS2Pro), 1);
+        assert_eq!(max_speech_references(ModelVariant::Kokoro82M), 0);
         validate_speech_references(drama3, &[with_transcript; 8]).expect("eight");
         let err = validate_speech_references(drama3, &[with_transcript; 9]).unwrap_err();
         assert!(err.message.contains("at most 8"), "{}", err.message);
