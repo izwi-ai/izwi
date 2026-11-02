@@ -260,8 +260,13 @@ Every request is a retained engine row. The pieces:
   committed with the KV pages, so a failed or cancelled quantum rolls the row
   back to where it started. Text streams as it decodes. A finished row
   reports `finish_reason`, `raw_text`, `speaker_turns`, token counts and the
-  number of perception windows in its ASR diagnostics. Rows are cleaned up on
-  cancel, session end and purge.
+  number of perception windows in its ASR diagnostics, and `timing`: host
+  milliseconds of preparation, prefill (with the perception windows it
+  encoded), decode (with its steps and milliseconds per step) and the CTC
+  stage. A decode step ends in the logits readback and a span in the KV
+  commit fence, so on a GPU both include the device work. The model's
+  diagnostics add the totals, `host_readbacks` and `fp8_decode_kernel`. Rows
+  are cleaned up on cancel, session end and purge.
 - **Scheduler**: the family sets `ModelFamily::requires_prefill_spans`, which
   becomes the execution profile's `prefill_spans_required`
   (`engine/executor.rs`, `engine/scheduler/mod.rs`). The scheduler then

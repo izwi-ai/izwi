@@ -108,6 +108,39 @@ pub struct NemotronPreparedArtifact {
     pub duration_secs: f32,
     pub samples: usize,
     pub(crate) mel: super::frontend::NemotronMel,
+    /// Host time of the preparation: the log-mel and the prompt.
+    pub preparation_ms: f64,
+}
+
+/// Where one row's time went, in host milliseconds. A decode step ends in
+/// the logits readback and a prefill span in the KV commit fence, so on a GPU
+/// both include the device work; perception is the encoder windows a span
+/// needed, enqueue time only when nothing waits on them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NemotronRowTiming {
+    pub preparation_ms: f64,
+    pub prefill_ms: f64,
+    pub perception_ms: f64,
+    pub prefill_spans: u64,
+    pub decode_ms: f64,
+    pub decode_steps: u64,
+    pub ctc_ms: f64,
+}
+
+impl NemotronRowTiming {
+    pub fn to_json(&self) -> serde_json::Value {
+        json!({
+            "preparation_ms": self.preparation_ms,
+            "prefill_ms": self.prefill_ms,
+            "perception_ms": self.perception_ms,
+            "prefill_spans": self.prefill_spans,
+            "decode_ms": self.decode_ms,
+            "decode_steps": self.decode_steps,
+            "ms_per_decode_step": (self.decode_steps > 0)
+                .then(|| self.decode_ms / self.decode_steps as f64),
+            "ctc_ms": self.ctc_ms,
+        })
+    }
 }
 
 impl std::fmt::Debug for NemotronPreparedArtifact {
@@ -187,6 +220,8 @@ pub struct NemotronRetainedState {
     decode: Option<NemotronDecodeLoop>,
     context: usize,
     tensor_sequence: Option<PhysicalStateSequenceId>,
+    /// Kept across rollbacks: a rolled-back quantum's time was still spent.
+    timing: NemotronRowTiming,
 }
 
 impl std::fmt::Debug for NemotronRetainedState {
@@ -220,6 +255,10 @@ impl NemotronRetainedState {
 
     pub fn decode_loop(&self) -> Option<&NemotronDecodeLoop> {
         self.decode.as_ref()
+    }
+
+    pub fn timing(&self) -> &NemotronRowTiming {
+        &self.timing
     }
 
     pub fn perception(&self) -> &PerceptionStream {
@@ -319,6 +358,7 @@ pub struct NemotronTranscription {
     pub windows: usize,
     /// Word timestamps and diarization segments, when the request asked.
     pub timestamps: Option<CtcTimestamps>,
+    pub timing: NemotronRowTiming,
 }
 
 /// One speaker turn of a finished transcript, timed when the CTC stage
@@ -414,6 +454,9 @@ struct NemotronDiagnostics {
     windows_encoded: AtomicU64,
     near_ties: AtomicU64,
     loop_stops: AtomicU64,
+    /// Host microseconds of every prefill span and decode step.
+    prefill_us: AtomicU64,
+    decode_us: AtomicU64,
 }
 
 pub struct NemotronTranscribeModel {
@@ -694,7 +737,23 @@ impl NemotronTranscribeModel {
             "windows_encoded": d.windows_encoded.load(Ordering::Relaxed),
             "greedy_near_ties": d.near_ties.load(Ordering::Relaxed),
             "loop_stops": d.loop_stops.load(Ordering::Relaxed),
+            "prefill_ms": d.prefill_us.load(Ordering::Relaxed) as f64 / 1e3,
+            "decode_ms": d.decode_us.load(Ordering::Relaxed) as f64 / 1e3,
+            "host_readbacks": super::speech_transformer::host_readbacks(),
+            "fp8_decode_kernel": self.fp8_decode_kernel(),
         })
+    }
+
+    /// The FP8 decode GEMV the step projections run on this device.
+    fn fp8_decode_kernel(&self) -> &'static str {
+        match self.residency {
+            Residency::Cpu => "q8_0",
+            Residency::Metal => "metal_fp8_mv_f32",
+            Residency::Cuda if crate::kernels::cuda::fp8::vectorized_decode_enabled() => {
+                "vectorized"
+            }
+            Residency::Cuda => "reference",
+        }
     }
 
     /// Device workspace one decode row holds during a step: the stacked
@@ -743,6 +802,7 @@ impl NemotronTranscribeModel {
         samples: &[f32],
         request: NemotronTranscribeRequest,
     ) -> Result<NemotronPreparedArtifact> {
+        let started = Instant::now();
         let sample_rate = self.config.frontend.sample_rate;
         let duration_secs = samples.len() as f32 / sample_rate as f32;
         if duration_secs > MAX_AUDIO_SECONDS + 1.0 {
@@ -778,6 +838,7 @@ impl NemotronTranscribeModel {
             duration_secs,
             samples: samples.len(),
             mel,
+            preparation_ms: started.elapsed().as_secs_f64() * 1e3,
         })
     }
 
@@ -811,6 +872,10 @@ impl NemotronTranscribeModel {
             decode: None,
             context,
             tensor_sequence: None,
+            timing: NemotronRowTiming {
+                preparation_ms: artifact.preparation_ms,
+                ..NemotronRowTiming::default()
+            },
             artifact,
         })
     }
@@ -822,6 +887,7 @@ impl NemotronTranscribeModel {
         start: usize,
         len: usize,
     ) -> Result<Tensor> {
+        let started = Instant::now();
         let layout = &state.artifact.layout;
         let mut parts = Vec::new();
         let mut text = Vec::new();
@@ -863,6 +929,7 @@ impl NemotronTranscribeModel {
             );
         }
         flush_text(&mut parts, &mut text)?;
+        state.timing.perception_ms += started.elapsed().as_secs_f64() * 1e3;
         self.diagnostics.windows_encoded.fetch_add(
             (state.perception.windows_encoded() - before) as u64,
             Ordering::Relaxed,
@@ -888,6 +955,7 @@ impl NemotronTranscribeModel {
         span: usize,
         trace: Option<(&TraceRequest, &mut DecoderTrace)>,
     ) -> Result<()> {
+        let started = Instant::now();
         let start = state.prefill_cursor;
         let prompt = state.prompt_tokens();
         if state.decode.is_some() || span == 0 || start + span > prompt {
@@ -932,6 +1000,12 @@ impl NemotronTranscribeModel {
             self.accept(&mut decode, token, margin)?;
             state.decode = Some(decode);
         }
+        let elapsed = started.elapsed();
+        state.timing.prefill_ms += elapsed.as_secs_f64() * 1e3;
+        state.timing.prefill_spans += 1;
+        self.diagnostics
+            .prefill_us
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -990,6 +1064,7 @@ impl NemotronTranscribeModel {
             }
         }
         if !active.is_empty() {
+            let started = Instant::now();
             let mut step_rows = Vec::with_capacity(active.len());
             for (index, row) in rows.iter_mut().enumerate() {
                 if !active.contains(&index) {
@@ -1016,9 +1091,18 @@ impl NemotronTranscribeModel {
                 let decode = rows[index].state.decode.as_mut().expect("checked above");
                 self.accept(decode, token, margin)?;
             }
+            let elapsed = started.elapsed();
+            for &index in &active {
+                let timing = &mut rows[index].state.timing;
+                timing.decode_ms += elapsed.as_secs_f64() * 1e3;
+                timing.decode_steps += 1;
+            }
             self.diagnostics
                 .decode_steps
                 .fetch_add(1, Ordering::Relaxed);
+            self.diagnostics
+                .decode_us
+                .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
         }
         Ok(rows.iter().map(|row| row.state.finished()).collect())
     }
@@ -1040,11 +1124,16 @@ impl NemotronTranscribeModel {
             .map(String::as_str)
             .collect::<Vec<_>>();
         let transcript = parse_transcript(&clean_sot_transcript(&decoded, &special_tokens));
+        let ctc_started = Instant::now();
         let timestamps = state
             .artifact
             .request
             .word_timestamps
             .then(|| self.word_timestamps(state, &transcript.raw));
+        let timing = NemotronRowTiming {
+            ctc_ms: ctc_started.elapsed().as_secs_f64() * 1e3,
+            ..state.timing.clone()
+        };
         Ok(NemotronTranscription {
             transcript,
             finish_reason: decode.finished.expect("finished"),
@@ -1053,6 +1142,7 @@ impl NemotronTranscribeModel {
             audio_tokens: state.artifact.layout.audio_tokens,
             windows: state.perception.windows_encoded(),
             timestamps,
+            timing,
         })
     }
 

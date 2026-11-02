@@ -283,6 +283,10 @@ async fn synthetic_word_timestamps_reach_the_diagnostics() {
         diagnostics["ctc_timestamps"]["error"].is_null(),
         "{diagnostics}"
     );
+    // The row's stage timing reaches the diagnostics, the CTC stage included.
+    let timing = &diagnostics["timing"];
+    assert!(timing["prefill_spans"].as_u64().unwrap() >= 1, "{timing}");
+    assert!(timing["ctc_ms"].as_f64().unwrap() > 0.0, "{timing}");
     let words = diagnostics["timestamp_words"]
         .as_array()
         .expect("timestamp_words");

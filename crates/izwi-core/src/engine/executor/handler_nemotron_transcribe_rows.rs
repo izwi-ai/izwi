@@ -398,6 +398,7 @@ impl NativeExecutor {
                     "audio_tokens": transcription.audio_tokens,
                     "generated_tokens": transcription.generated_tokens,
                     "perception_windows": transcription.windows,
+                    "timing": transcription.timing.to_json(),
                     "greedy_near_ties": active
                         .state
                         .decode_loop()

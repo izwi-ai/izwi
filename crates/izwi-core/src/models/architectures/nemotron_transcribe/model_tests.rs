@@ -112,6 +112,23 @@ fn a_request_transcribes_deterministically_through_retained_spans() {
         .transcribe_with_cache(&audio, request(12), &mut cache, 64)
         .unwrap();
     assert_eq!(first.transcript, again.transcript);
+    // The timing counts the spans and steps the row ran: the first token
+    // comes from the last span, and an eos ends a step without a token.
+    let timing = &first.timing;
+    assert_eq!(
+        timing.prefill_spans as usize,
+        first.prompt_tokens.div_ceil(64)
+    );
+    let accepted =
+        first.generated_tokens + usize::from(first.finish_reason == NemotronFinishReason::Stop);
+    assert_eq!(timing.decode_steps as usize, accepted - 1);
+    assert!(timing.prefill_ms > 0.0 && timing.perception_ms > 0.0);
+    assert!(timing.perception_ms <= timing.prefill_ms);
+    // No timestamps were asked for, so the CTC stage never ran.
+    assert!(timing.ctc_ms < 50.0);
+    let json = timing.to_json();
+    assert_eq!(json["decode_steps"], timing.decode_steps);
+    assert!(model.diagnostics_summary()["decode_ms"].as_f64().unwrap() >= timing.decode_ms);
 }
 
 /// The first decode logits after prefilling in spans of different sizes

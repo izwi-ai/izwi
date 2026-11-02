@@ -370,8 +370,19 @@ impl SpeechTransformer {
     }
 }
 
+static HOST_READBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Readbacks through [`host_values`] since the process started: every
+/// device-to-host copy the family makes outside the KV fences.
+pub(crate) fn host_readbacks() -> u64 {
+    HOST_READBACKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A device tensor's values on the host.
 pub(crate) fn host_values(tensor: &Tensor) -> Result<Vec<f32>> {
+    if !tensor.device().is_cpu() {
+        HOST_READBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(tensor
         .to_dtype(DType::F32)?
         .flatten_all()?
