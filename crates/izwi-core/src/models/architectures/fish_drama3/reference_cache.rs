@@ -21,7 +21,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 
 use super::prompt::FishDrama3Codes;
-use crate::audio::resample_mono_high_quality;
+use crate::audio::{resample_mono_high_quality, target_sample_count};
 use crate::error::{Error, Result};
 
 pub const FISH_DRAMA3_REFERENCE_CACHE_BYTES: u64 = 4 * 1024 * 1024;
@@ -89,6 +89,16 @@ impl FishDrama3ReferenceAudio<'_> {
             };
         }
         Ok(samples)
+    }
+
+    /// The length of [`Self::prepared`] at `rate`, without resampling.
+    pub fn prepared_len(&self, rate: u32) -> Result<usize> {
+        self.validate()?;
+        Ok(target_sample_count(
+            self.samples.len() / self.channels,
+            self.sample_rate,
+            rate,
+        ))
     }
 }
 
@@ -319,6 +329,27 @@ mod tests {
 
     fn ok() -> Result<()> {
         Ok(())
+    }
+
+    /// The prepared length is known without resampling: mono frames at
+    /// the target rate, as `prepared` makes them.
+    #[test]
+    fn the_prepared_length_matches_the_prepared_samples() {
+        let samples = (0..4_802)
+            .map(|i| (i as f32 * 0.01).sin())
+            .collect::<Vec<_>>();
+        for (channels, sample_rate) in [(1, 8_000), (2, 16_000), (1, RATE), (2, 48_000)] {
+            let audio = FishDrama3ReferenceAudio {
+                samples: &samples,
+                channels,
+                sample_rate,
+            };
+            assert_eq!(
+                audio.prepared_len(RATE).unwrap(),
+                audio.prepared(RATE).unwrap().len(),
+                "{channels} channels at {sample_rate} Hz"
+            );
+        }
     }
 
     #[test]

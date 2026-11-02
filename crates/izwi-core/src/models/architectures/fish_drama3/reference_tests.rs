@@ -728,6 +728,10 @@ impl FishDrama3FrameCodec for NoCodec {
     ) -> Result<FishDrama3Codes> {
         Err(no_codec())
     }
+
+    fn reference_frames(&self, samples: usize, sample_rate: u32) -> Result<usize> {
+        FishDrama3DacConfig::current().reference_frame_count(samples, sample_rate)
+    }
 }
 
 fn model_options(

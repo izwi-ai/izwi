@@ -167,6 +167,9 @@ pub trait FishDrama3FrameCodec: Send + Sync {
         sample_rate: u32,
         check: FishDrama3CancelCheck<'_>,
     ) -> Result<FishDrama3Codes>;
+    /// The frames [`Self::encode_reference`] makes of `samples` mono samples
+    /// at `sample_rate`, known before any audio is encoded.
+    fn reference_frames(&self, samples: usize, sample_rate: u32) -> Result<usize>;
 }
 
 impl FishDrama3FrameCodec for FishDrama3DacDecoder {
@@ -211,6 +214,10 @@ impl FishDrama3FrameCodec for FishDrama3DacDecoder {
         check: FishDrama3CancelCheck<'_>,
     ) -> Result<FishDrama3Codes> {
         self.encode_reference_audio_with_cancel(samples, sample_rate, check)
+    }
+
+    fn reference_frames(&self, samples: usize, sample_rate: u32) -> Result<usize> {
+        self.config().reference_frame_count(samples, sample_rate)
     }
 }
 
@@ -1072,7 +1079,7 @@ impl FishDrama3Model {
             });
         }
         check()?;
-        let room = MAX_PROMPT_ROWS.min(self.max_positions().saturating_sub(max_frames));
+        let room = self.prompt_room(max_frames);
         let reference_rows = self.check_reference_rows(&encoded, room)?;
         let built = if history.is_empty() {
             super::prompt::build_prompt(&self.tokenizer, &encoded, [], text).and_then(|prompt| {
@@ -1112,6 +1119,39 @@ impl FishDrama3Model {
             reference_cache_hits: hits,
             preparation_ms: started.elapsed().as_secs_f64() * 1000.0,
         })
+    }
+
+    /// The rows a prompt may take beside `max_frames` generated frames.
+    fn prompt_room(&self, max_frames: usize) -> usize {
+        MAX_PROMPT_ROWS.min(self.max_positions().saturating_sub(max_frames))
+    }
+
+    /// [`Self::prepare_request`]'s refusal of references that leave no room
+    /// for any text, before any audio is encoded: a clip's frames follow
+    /// from its length at the codec's rate. A request that can never fit is
+    /// the caller's to fix whatever capacity the host has, so it is refused
+    /// before its preparation is admitted.
+    pub fn check_reference_room(
+        &self,
+        references: &[(&str, FishDrama3ReferenceAudio<'_>)],
+        max_frames: usize,
+    ) -> Result<()> {
+        let rate = self.codec.sample_rate();
+        let codebooks = self.codec.codebooks();
+        let sized = references
+            .iter()
+            .map(|(transcript, audio)| {
+                let frames = self
+                    .codec
+                    .reference_frames(audio.prepared_len(rate)?, rate)?;
+                Ok(FishDrama3Reference {
+                    transcript: (*transcript).to_string(),
+                    codes: FishDrama3Codes::new(vec![vec![0; frames]; codebooks]),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.check_reference_rows(&sized, self.prompt_room(max_frames))
+            .map(drop)
     }
 
     /// The prompt rows `references` take (their blocks and the longer

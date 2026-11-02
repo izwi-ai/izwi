@@ -1111,6 +1111,26 @@ impl RuntimeService {
             .map_err(|error| name_reference(index, error))?;
             references.push((transcript, samples, sample_rate));
         }
+        // References that leave no room for any text are refused from their
+        // lengths, before their preparation is admitted: on a host short of
+        // capacity the request would otherwise wait for capacity it can
+        // never use.
+        model.check_reference_room(
+            &references
+                .iter()
+                .map(|(transcript, samples, sample_rate)| {
+                    (
+                        transcript.as_str(),
+                        FishDrama3ReferenceAudio {
+                            samples,
+                            channels: 1,
+                            sample_rate: *sample_rate,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>(),
+            params.max_frames,
+        )?;
         // A chunk of a chunk session: the earlier chunks its prompt holds,
         // with the codes generated for them.
         let history = request

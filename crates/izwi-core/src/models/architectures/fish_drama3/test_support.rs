@@ -87,7 +87,7 @@ impl FishDrama3FrameCodec for StubCodec {
         check: FishDrama3CancelCheck<'_>,
     ) -> Result<FishDrama3Codes> {
         check()?;
-        let frames = samples.len().div_ceil(STUB_SAMPLES_PER_FRAME);
+        let frames = self.reference_frames(samples.len(), 0)?;
         Ok(FishDrama3Codes::new(
             (0..10)
                 .map(|k| {
@@ -97,6 +97,11 @@ impl FishDrama3FrameCodec for StubCodec {
                 })
                 .collect(),
         ))
+    }
+
+    /// A frame per 2,048 samples, the sample rate aside.
+    fn reference_frames(&self, samples: usize, _sample_rate: u32) -> Result<usize> {
+        Ok(samples.div_ceil(STUB_SAMPLES_PER_FRAME))
     }
 }
 

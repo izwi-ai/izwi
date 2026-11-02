@@ -702,6 +702,18 @@ async fn synthetic_drama3_prepares_every_speaker_reference() {
             if message.contains("holds 4 references in") && message.contains("no room")),
         "{error}"
     );
+    // The same refusal from the clips' lengths alone, before any audio is
+    // encoded (preparation checks it before admission); one clip fits.
+    assert_eq!(
+        model
+            .check_reference_room(&long_references, BUDGET)
+            .expect_err("no room from the lengths")
+            .to_string(),
+        error.to_string()
+    );
+    model
+        .check_reference_room(&long_references[..1], BUDGET)
+        .expect("one clip leaves room");
     // One short clip beside text too long for the prompt: a context error
     // that names the reference's share.
     let long_text = "one two three hello world. ".repeat(1_000);
