@@ -581,6 +581,24 @@ pub(super) fn retained_engine_request_input_bytes(request: &EngineCoreRequest) -
     }
     add_retained_allocation(
         &mut total,
+        request.tts_speaker_references.capacity(),
+        std::mem::size_of::<crate::runtime::SpeechSpeakerReference>(),
+        "request speaker references",
+    )?;
+    for reference in &request.tts_speaker_references {
+        add_owned_string_capacity(
+            &mut total,
+            &reference.audio,
+            "request speaker reference audio",
+        )?;
+        add_owned_string_capacity(
+            &mut total,
+            &reference.text,
+            "request speaker reference text",
+        )?;
+    }
+    add_retained_allocation(
+        &mut total,
         request.tts_chunk_history.capacity(),
         std::mem::size_of::<crate::runtime::SpeechChunkTurn>(),
         "request chunk history",

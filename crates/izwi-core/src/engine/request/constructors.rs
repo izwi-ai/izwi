@@ -70,6 +70,7 @@ impl EngineCoreRequest {
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
             cancellation: None,
+            tts_speaker_references: Vec::new(),
             tts_chunk_history: Vec::new(),
             tts_generated_codes: None,
         }
@@ -141,6 +142,7 @@ impl EngineCoreRequest {
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
             cancellation: None,
+            tts_speaker_references: Vec::new(),
             tts_chunk_history: Vec::new(),
             tts_generated_codes: None,
         }
@@ -212,6 +214,7 @@ impl EngineCoreRequest {
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
             cancellation: None,
+            tts_speaker_references: Vec::new(),
             tts_chunk_history: Vec::new(),
             tts_generated_codes: None,
         }
@@ -280,6 +283,7 @@ impl EngineCoreRequest {
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
             cancellation: None,
+            tts_speaker_references: Vec::new(),
             tts_chunk_history: Vec::new(),
             tts_generated_codes: None,
         }
@@ -349,6 +353,7 @@ impl EngineCoreRequest {
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
             cancellation: None,
+            tts_speaker_references: Vec::new(),
             tts_chunk_history: Vec::new(),
             tts_generated_codes: None,
         }
@@ -418,6 +423,7 @@ impl EngineCoreRequest {
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
             cancellation: None,
+            tts_speaker_references: Vec::new(),
             tts_chunk_history: Vec::new(),
             tts_generated_codes: None,
         }

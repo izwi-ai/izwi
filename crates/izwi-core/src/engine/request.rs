@@ -63,7 +63,7 @@ use crate::runtime::audio_io::{
     validate_base64_audio_retained_size, validate_base64_audio_source_input,
     MAX_AUDIO_SOURCE_BYTES, MAX_REFERENCE_SOURCE_BYTES,
 };
-use crate::runtime::{SpeechChunkTurn, SpeechFrameCodes};
+use crate::runtime::{SpeechChunkTurn, SpeechFrameCodes, SpeechSpeakerReference};
 
 mod asr_preparation;
 mod chat_preparation;
@@ -1122,6 +1122,10 @@ pub struct EngineCoreRequest {
     pub(crate) streaming_tx: Option<mpsc::Sender<StreamingOutput>>,
     /// Cooperative cancellation signal set without waiting for the core write lock.
     pub(crate) cancellation: Option<Arc<AtomicBool>>,
+    /// The reference voices of a request that voices several speakers
+    /// (Fish Audio Drama 3), each with its speaker; empty for every other
+    /// request, whose one reference is `reference_audio`.
+    pub(crate) tts_speaker_references: Vec<SpeechSpeakerReference>,
     /// Earlier chunks of a long-text chunk session, oldest first, that this
     /// request's prompt holds with their generated codes (Fish Audio
     /// Drama 3); empty for every other request.
@@ -1153,6 +1157,11 @@ impl TtsGeneratedCodesSink {
 impl EngineCoreRequest {
     pub(crate) fn set_cancellation_signal(&mut self, signal: Arc<AtomicBool>) {
         self.cancellation = Some(signal);
+    }
+
+    /// The speaker references this request's prompt holds.
+    pub(crate) fn tts_speaker_references_for_execution(&self) -> &[SpeechSpeakerReference] {
+        &self.tts_speaker_references
     }
 
     /// The chunk-session history this request's prompt holds.

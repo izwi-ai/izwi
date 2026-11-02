@@ -286,6 +286,14 @@ pub struct GenerationRequest {
     #[serde(default)]
     pub voice_description: Option<String>,
 
+    /// The reference voices of a request that voices several speakers
+    /// (`supports_speaker_dialogue`: Fish Audio Drama 3), each a clip with
+    /// its transcript for one speaker. Every chunk of a long text holds
+    /// them all. A request gives these or `reference_audio` and
+    /// `reference_text` (one reference), never both.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speaker_references: Vec<SpeechSpeakerReference>,
+
     /// Earlier chunks of a long-text chunk session, oldest first, whose
     /// text and generated codes this chunk's prompt holds (Fish Audio
     /// Drama 3: the pinned first chunk and the latest). Set by the server's
@@ -320,6 +328,20 @@ pub struct SpeechChunkTurn {
     pub codes: SpeechFrameCodes,
 }
 
+/// One reference voice of a request that voices several speakers: a clip,
+/// its transcript, and the speaker the clip voices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeechSpeakerReference {
+    /// The speaker, `0` to the model's `max_speakers - 1`. The model reads
+    /// it from the transcript, which is tagged `<|speaker:N|>` unless a tag
+    /// already leads it (that tag must name this speaker).
+    pub speaker: usize,
+    /// The clip, base64-encoded audio.
+    pub audio: String,
+    /// What the clip says.
+    pub text: String,
+}
+
 fn generate_request_id() -> String {
     Uuid::new_v4().to_string()
 }
@@ -338,6 +360,7 @@ impl GenerationRequest {
             reference_text: None,
             reference_language: None,
             voice_description: None,
+            speaker_references: Vec::new(),
             chunk_history: Vec::new(),
         }
     }

@@ -162,6 +162,27 @@ pub fn tagged_transcript(transcript: &str) -> String {
     }
 }
 
+/// The transcript of a reference that voices `speaker`
+/// (`tag_reference_text`, fish-speech `inference_engine/__init__.py:88-96`):
+/// `"<|speaker:N|> " + transcript` unless a tag already leads it. Upstream
+/// keeps a leading tag that names another speaker; here that is refused,
+/// since the reference would voice someone else.
+pub fn speaker_reference_transcript(speaker: usize, transcript: &str) -> Result<String> {
+    if speaker > MAX_SPEAKER_ID {
+        return Err(Error::InvalidInput(format!(
+            "reference speaker {speaker} is not 0 to {MAX_SPEAKER_ID}"
+        )));
+    }
+    match match_speaker_tag(lstrip_white_space(transcript)) {
+        None => Ok(format!("<|speaker:{speaker}|> {transcript}")),
+        Some((_, digits)) if speaker_index(digits) == Some(speaker) => Ok(transcript.to_string()),
+        Some((tag, _)) => Err(Error::InvalidInput(format!(
+            "a reference transcript for speaker {speaker} starts with {}",
+            &lstrip_white_space(transcript)[..tag]
+        ))),
+    }
+}
+
 /// Codec codes `[codebooks][frames]` (upstream's `[10, frames]`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FishDrama3Codes {
@@ -435,6 +456,18 @@ pub fn planned_rows<'a>(
         history,
         text,
     )
+}
+
+/// The shortest text a prompt can speak.
+const SHORTEST_TEXT: &str = ".";
+
+/// The rows of the shortest prompt holding `references` and no history:
+/// what any text needs at least. Every reference validated.
+pub fn shortest_prompt_rows(
+    tokenizer: &FishDrama3Tokenizer,
+    references: &[FishDrama3Reference],
+) -> Result<usize> {
+    planned_rows(tokenizer, references, [], SHORTEST_TEXT)
 }
 
 /// `build_drama3_prompt` with the 8,192-row limit.
@@ -901,6 +934,80 @@ pub(crate) mod tests {
         // Invalid text fails at once, not as "too long".
         let err = build_chunk_prompt(&tokenizer, &[], &history, "<|voice|>", bare).unwrap_err();
         assert!(matches!(err, Error::InvalidInput(_)), "{err}");
+    }
+
+    /// A reference for speaker N is tagged as upstream's per-reference
+    /// `speaker` field tags it; a leading tag must name the same speaker.
+    #[test]
+    fn reference_transcripts_are_tagged_with_their_speaker() {
+        assert_eq!(
+            speaker_reference_transcript(0, "Hi there.").unwrap(),
+            "<|speaker:0|> Hi there."
+        );
+        assert_eq!(
+            speaker_reference_transcript(15, "Hi.").unwrap(),
+            "<|speaker:15|> Hi."
+        );
+        // A tag that already leads it is kept, white space and all.
+        assert_eq!(
+            speaker_reference_transcript(3, " <|speaker:3|> Hi.").unwrap(),
+            " <|speaker:3|> Hi."
+        );
+        // Tags further in are the transcript's own words.
+        assert_eq!(
+            speaker_reference_transcript(1, "Hi. <|speaker:2|> Yes.").unwrap(),
+            "<|speaker:1|> Hi. <|speaker:2|> Yes."
+        );
+        let message = invalid_message(speaker_reference_transcript(1, "<|speaker:2|> Hi."));
+        assert!(
+            message.contains("speaker 1 starts with <|speaker:2|>"),
+            "{message}"
+        );
+        let message = invalid_message(speaker_reference_transcript(16, "Hi."));
+        assert!(message.contains("16 is not 0 to 15"), "{message}");
+        // The tagged transcript is what the prompt's `Text:` line holds.
+        let recording = Recording::default();
+        recording
+            .build(
+                &[reference(
+                    &speaker_reference_transcript(2, "Hello.").unwrap(),
+                    codes(&[&[1], &[2], &[3]]),
+                )],
+                &[],
+                "Hi.",
+            )
+            .unwrap();
+        assert_eq!(
+            recording.parts()[2],
+            "\n\n[Reference 1]\nText: <|speaker:2|> Hello.\nSpeech: "
+        );
+    }
+
+    /// The shortest prompt holding references: what any text needs, so a
+    /// prompt whose references pass the limit fits no text.
+    #[test]
+    fn the_shortest_prompt_counts_the_references_and_the_scaffold() {
+        let tokenizer = synthetic_tokenizer();
+        let bare = shortest_prompt_rows(&tokenizer, &[]).unwrap();
+        assert_eq!(
+            bare,
+            planned_rows(&tokenizer, &[], [], ".").unwrap(),
+            "the scaffold and the shortest text"
+        );
+        let layout = FishDrama3RowLayout::of(&tokenizer);
+        let frames = |count: usize| FishDrama3Codes::new(vec![vec![1; count]; layout.codebooks]);
+        let one = [reference("<|speaker:0|> hi.", frames(40))];
+        let two = [
+            reference("<|speaker:0|> hi.", frames(40)),
+            reference("<|speaker:1|> hi.", frames(60)),
+        ];
+        let with_one = shortest_prompt_rows(&tokenizer, &one).unwrap();
+        let with_two = shortest_prompt_rows(&tokenizer, &two).unwrap();
+        assert!(with_one > bare + 40, "{with_one} {bare}");
+        assert!(with_two > with_one + 60, "{with_two} {with_one}");
+        assert!(
+            with_two <= planned_rows(&tokenizer, &two, [], "<|speaker:1|> A longer line.").unwrap()
+        );
     }
 
     #[test]

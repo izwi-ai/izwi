@@ -1017,6 +1017,7 @@ fn build_generation_request(
         reference_text: req.reference_text.clone(),
         reference_language: req.reference_language.clone(),
         voice_description: req.instructions.clone(),
+        speaker_references: Vec::new(),
         chunk_history: Vec::new(),
     }
 }

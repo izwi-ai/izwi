@@ -970,11 +970,12 @@ impl RuntimeService {
         }
     }
 
-    /// Fish Audio Drama 3 (§7.1 stage 0): the reference clip, when the
-    /// request clones a voice, decoded and encoded through the model's
-    /// reference cache (cancellable between references); the prompt built;
-    /// the frame budget planned against the row's positions. A request
-    /// without a reference speaks in a voice the model chooses.
+    /// Fish Audio Drama 3 (§7.1 stage 0): the reference clips, when the
+    /// request clones voices (its speaker references, or its one reference
+    /// for speaker 0), decoded and encoded through the model's reference
+    /// cache (cancellable between references); the prompt built; the frame
+    /// budget planned against the row's positions. A speaker without a
+    /// reference speaks in a voice the seed sets.
     pub(super) async fn prepare_fish_drama3_tts_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -984,6 +985,7 @@ impl RuntimeService {
         use crate::models::architectures::fish_drama3::codec::{
             maximum_preparation_workspace_bytes, preparation_workspace_bytes,
         };
+        use crate::models::architectures::fish_drama3::prompt::speaker_reference_transcript;
         use crate::models::architectures::fish_drama3::reference_cache::MAX_REFERENCE_SECONDS;
         use crate::models::architectures::fish_drama3::{
             FishDrama3Codes, FishDrama3HistoryTurn, FishDrama3ReferenceAudio,
@@ -1042,38 +1044,73 @@ impl RuntimeService {
             .to_string();
         let params = fish_drama3_request_params(&request.params, &request.id, &text)?;
         params.validate()?;
-        // A cloned voice: its clip and transcript together.
-        let reference = match (
+        // Cloned voices, each a clip with its transcript: the speaker
+        // references, every transcript tagged with its speaker, or the one
+        // reference, whose transcript the prompt tags speaker 0 unless a
+        // tag leads it.
+        let single = (
             request.tts_reference_audio_for_execution(),
             request
                 .tts_reference_text_for_execution()
                 .filter(|text| !text.trim().is_empty()),
-        ) {
-            (None, None) => None,
-            (Some(audio), Some(transcript)) => {
-                // Inline clips up to the family's 60 s; saved voices hold
-                // 30 s from upload.
-                let (samples, sample_rate) =
-                    crate::runtime::audio_io::decode_long_reference_audio_base64(
-                        audio,
-                        u64::from(MAX_REFERENCE_SECONDS),
-                    )?;
-                FishDrama3ReferenceAudio {
-                    samples: &samples,
-                    channels: 1,
-                    sample_rate,
-                }
-                .validate()?;
-                Some((transcript.trim().to_string(), samples, sample_rate))
+        );
+        let speaker_references = request.tts_speaker_references_for_execution();
+        let sources = match single {
+            (None, None) => speaker_references
+                .iter()
+                .map(|reference| {
+                    Ok((
+                        speaker_reference_transcript(reference.speaker, reference.text.trim())?,
+                        reference.audio.as_str(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            (Some(audio), Some(transcript)) if speaker_references.is_empty() => {
+                vec![(transcript.trim().to_string(), audio)]
             }
             _ => {
                 return Err(Error::InvalidInput(
                     "Fish Audio Drama 3 clones a voice from reference_audio and its \
-                     reference_text together"
+                     reference_text together, or from speaker references instead"
                         .into(),
                 ))
             }
         };
+        // A clip that does not decode, or runs past the limit, is the
+        // caller's to fix: invalid input naming it (`reference_audio`, or
+        // its place among the speaker references).
+        let name_reference = |index: usize, error: Error| {
+            let (Error::InvalidInput(message) | Error::InferenceError(message)) = error else {
+                return error;
+            };
+            let field = if speaker_references.is_empty() {
+                "`reference_audio`".to_string()
+            } else {
+                format!("`references[{index}]`")
+            };
+            Error::InvalidInput(format!(
+                "{field}: {message}; a reference clip lasts at most {MAX_REFERENCE_SECONDS} s"
+            ))
+        };
+        let mut references = Vec::with_capacity(sources.len());
+        for (index, (transcript, audio)) in sources.into_iter().enumerate() {
+            // Inline clips up to the family's 60 s; saved voices hold 30 s
+            // from upload.
+            let (samples, sample_rate) =
+                crate::runtime::audio_io::decode_long_reference_audio_base64(
+                    audio,
+                    u64::from(MAX_REFERENCE_SECONDS),
+                )
+                .map_err(|error| name_reference(index, error))?;
+            FishDrama3ReferenceAudio {
+                samples: &samples,
+                channels: 1,
+                sample_rate,
+            }
+            .validate()
+            .map_err(|error| name_reference(index, error))?;
+            references.push((transcript, samples, sample_rate));
+        }
         // A chunk of a chunk session: the earlier chunks its prompt holds,
         // with the codes generated for them.
         let history = request
@@ -1084,24 +1121,28 @@ impl RuntimeService {
                 codes: FishDrama3Codes::new(turn.codes.codebooks.clone()),
             })
             .collect::<Vec<_>>();
-        // The decoded clip, its 44.1 kHz copy and the text are host buffers
-        // of the preparation; the encoder's workspace is the stage's.
+        // The decoded clips, their 44.1 kHz copies and the texts are host
+        // buffers of the preparation; the encoder's workspace is the
+        // stage's, for one clip at a time.
         let codec_rate = model.codec().sample_rate();
-        let (reference_host_bytes, codec_workspace) = match &reference {
-            Some((_, samples, rate)) => {
-                let resampled = (samples.len() as u64)
-                    .saturating_mul(u64::from(codec_rate))
-                    .div_ceil(u64::from((*rate).max(1)));
-                (
+        let mut reference_host_bytes = 0u64;
+        let mut codec_workspace = 0;
+        for (transcript, samples, rate) in &references {
+            let resampled = (samples.len() as u64)
+                .saturating_mul(u64::from(codec_rate))
+                .div_ceil(u64::from((*rate).max(1)));
+            reference_host_bytes = reference_host_bytes
+                .saturating_add(
                     (samples.len() as u64)
                         .saturating_add(resampled)
                         .saturating_mul(4),
-                    preparation_workspace_bytes(resampled as usize, codec_rate)?
-                        .min(maximum_preparation_workspace_bytes()?),
                 )
-            }
-            None => (0, 0),
-        };
+                .saturating_add(transcript.len() as u64);
+            codec_workspace = codec_workspace.max(
+                preparation_workspace_bytes(resampled as usize, codec_rate)?
+                    .min(maximum_preparation_workspace_bytes()?),
+            );
+        }
         // The artifact it leaves: at most the longest prompt's `[11][T]`
         // values.
         let artifact_bound = (crate::models::architectures::fish_drama3::prompt::MAX_PROMPT_ROWS
@@ -1199,8 +1240,8 @@ impl RuntimeService {
                     }
                     Ok(())
                 };
-                let references = reference
-                    .as_ref()
+                let references = references
+                    .iter()
                     .map(|(transcript, samples, sample_rate)| {
                         (
                             transcript.as_str(),
@@ -1211,7 +1252,6 @@ impl RuntimeService {
                             },
                         )
                     })
-                    .into_iter()
                     .collect::<Vec<_>>();
                 let artifact = model_for_preparation.prepare_request(
                     &references,

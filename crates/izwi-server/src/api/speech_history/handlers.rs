@@ -2715,6 +2715,7 @@ fn build_generation_request(
         reference_audio: req.reference_audio,
         reference_text: req.reference_text,
         reference_language: req.reference_language,
+        speaker_references: Vec::new(),
         voice_description: req.voice_description,
         chunk_history: Vec::new(),
     }

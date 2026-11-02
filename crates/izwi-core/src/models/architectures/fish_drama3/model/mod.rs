@@ -583,6 +583,15 @@ impl std::fmt::Debug for FishDrama3QuantumCheckpoint {
     }
 }
 
+/// `n` references, in words.
+fn reference_count(n: usize) -> String {
+    if n == 1 {
+        "1 reference".into()
+    } else {
+        format!("{n} references")
+    }
+}
+
 /// A request's preparation (§7.1 stage 0): its prompt, built from its
 /// encoded references and its text, sealed to the model load whose codec
 /// encoded the references.
@@ -1063,11 +1072,13 @@ impl FishDrama3Model {
             });
         }
         check()?;
-        let (prompt, history_turns) = if history.is_empty() {
-            (
-                super::prompt::build_prompt(&self.tokenizer, &encoded, [], text)?,
-                0,
-            )
+        let room = MAX_PROMPT_ROWS.min(self.max_positions().saturating_sub(max_frames));
+        let reference_rows = self.check_reference_rows(&encoded, room)?;
+        let built = if history.is_empty() {
+            super::prompt::build_prompt(&self.tokenizer, &encoded, [], text).and_then(|prompt| {
+                budget::check_positions(prompt.rows, max_frames, self.max_positions())?;
+                Ok((prompt, 0))
+            })
         } else {
             // The session's own policy: the first turn is the pinned chunk,
             // the next the latest.
@@ -1075,18 +1086,24 @@ impl FishDrama3Model {
             for turn in history {
                 session.push(turn.clone());
             }
-            let max_rows = MAX_PROMPT_ROWS.min(self.max_positions().saturating_sub(max_frames));
-            let chunk = super::prompt::build_chunk_prompt(
-                &self.tokenizer,
-                &encoded,
-                &session,
-                text,
-                max_rows,
-            )?;
-            let kept = chunk.history.len();
-            (chunk.prompt, kept)
+            super::prompt::build_chunk_prompt(&self.tokenizer, &encoded, &session, text, room)
+                .and_then(|chunk| {
+                    budget::check_positions(chunk.prompt.rows, max_frames, self.max_positions())?;
+                    let kept = chunk.history.len();
+                    Ok((chunk.prompt, kept))
+                })
         };
-        budget::check_positions(prompt.rows, max_frames, self.max_positions())?;
+        // A prompt too long for its text and references: shorter chunks of
+        // the text may fit, so the cause is named and the error kept.
+        let (prompt, history_turns) = built.map_err(|error| match error {
+            Error::ContextLengthExceeded(message) if reference_rows > 0 => {
+                Error::ContextLengthExceeded(format!(
+                    "{message}; it holds {} in {reference_rows} of them",
+                    reference_count(encoded.len())
+                ))
+            }
+            other => other,
+        })?;
         Ok(FishDrama3PreparedArtifact {
             prompt: Arc::new(prompt),
             model: self.identity,
@@ -1095,6 +1112,37 @@ impl FishDrama3Model {
             reference_cache_hits: hits,
             preparation_ms: started.elapsed().as_secs_f64() * 1000.0,
         })
+    }
+
+    /// The prompt rows `references` take (their blocks and the longer
+    /// instruction), refusing references that leave no room in `room` rows
+    /// for any text: no shorter chunk of the text helps, so the request has
+    /// to give fewer or shorter references.
+    fn check_reference_rows(
+        &self,
+        references: &[FishDrama3Reference],
+        room: usize,
+    ) -> Result<usize> {
+        if references.is_empty() {
+            return Ok(0);
+        }
+        let shortest = super::prompt::shortest_prompt_rows(&self.tokenizer, references)?;
+        let rows =
+            shortest.saturating_sub(super::prompt::shortest_prompt_rows(&self.tokenizer, &[])?);
+        if shortest > room {
+            let frames = references
+                .iter()
+                .map(|reference| reference.codes.frames())
+                .sum::<usize>();
+            return Err(Error::InvalidInput(format!(
+                "Fish Audio Drama 3's prompt holds {} in {rows} rows ({frames} audio frames, \
+                 about {:.0} s of reference audio), leaving no room for the text in its {room} \
+                 rows; give fewer or shorter references",
+                reference_count(references.len()),
+                frames as f32 / budget::FISH_DRAMA3_FRAME_RATE_HZ
+            )));
+        }
+        Ok(rows)
     }
 
     /// A new request over a preparation of this load, with the engine's

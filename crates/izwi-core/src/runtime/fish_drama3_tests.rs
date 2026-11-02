@@ -599,6 +599,124 @@ async fn synthetic_drama3_chunks_carry_their_history_through_the_runtime() {
     runtime.unload_model(VARIANT).await.expect("unload");
 }
 
+/// Speaker references through the runtime's preparation: one reference
+/// for speaker 0 speaks exactly as the single reference fields; a second
+/// reference, and the speaker it voices, change the prompt; references that
+/// leave the prompt no room for any text are invalid input naming them,
+/// while text too long beside them stays a context error (shorter chunks of
+/// it fit).
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn synthetic_drama3_prepares_every_speaker_reference() {
+    use crate::models::architectures::fish_drama3::prompt::speaker_reference_transcript;
+    use crate::models::architectures::fish_drama3::FishDrama3ReferenceAudio;
+    use crate::runtime::SpeechSpeakerReference;
+    let _authority = crate::engine::resources::test_support::authority_test_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let models = synthetic_models_dir("speakers");
+    let runtime = runtime_with(&models).await;
+    let (anna, ben) = (reference_wav(1.0), reference_wav(1.5));
+    let text = "<|speaker:0|> hello world.\n<|speaker:3|> one two three.";
+    let speakers = |references: &[(usize, &str, &str)]| {
+        references
+            .iter()
+            .map(|(speaker, audio, text)| SpeechSpeakerReference {
+                speaker: *speaker,
+                audio: audio.to_string(),
+                text: text.to_string(),
+            })
+            .collect::<Vec<_>>()
+    };
+    // A request's outcome: its samples' bits, or its error.
+    let outcome = |request: GenerationRequest| {
+        let runtime = &runtime;
+        async move {
+            match stream(runtime, request).await {
+                Ok((samples, _)) => Ok(bits(&samples)),
+                Err(error) => Err(error.to_string()),
+            }
+        }
+    };
+    let mut decided = false;
+    for seed in 0..16 {
+        let mut single = request(text, seed);
+        single.reference_audio = Some(anna.clone());
+        single.reference_text = Some("hello world.".into());
+        let mut speaker_zero = request(text, seed);
+        speaker_zero.speaker_references = speakers(&[(0, &anna, "hello world.")]);
+        let mut two = request(text, seed);
+        two.speaker_references =
+            speakers(&[(0, &anna, "hello world."), (3, &ben, "one two three.")]);
+        let mut moved = request(text, seed);
+        moved.speaker_references =
+            speakers(&[(0, &anna, "hello world."), (5, &ben, "one two three.")]);
+        let single = outcome(single).await;
+        assert_eq!(outcome(speaker_zero).await, single, "seed {seed}");
+        let two = outcome(two).await;
+        let moved = outcome(moved).await;
+        if let Err(error) = &two {
+            assert!(error.contains("frame_limit"), "{error}");
+            continue;
+        }
+        assert_ne!(
+            two, single,
+            "seed {seed}: the second reference reached the prompt"
+        );
+        assert_ne!(two, moved, "seed {seed}: its speaker reached the prompt");
+        decided = true;
+        break;
+    }
+    assert!(decided, "a seed whose two-reference take ends on eos");
+
+    let model = runtime
+        .model_registry
+        .get_fish_drama3_tts_lease(VARIANT)
+        .await
+        .expect("loaded");
+    // Four clips of 60 s pass the synthetic model's positions on their own.
+    let clip = (0..60 * 8_000)
+        .map(|i| (i as f32 * 0.2).sin() * 0.4)
+        .collect::<Vec<_>>();
+    let transcripts = (0..4)
+        .map(|speaker| speaker_reference_transcript(speaker, "hello world.").unwrap())
+        .collect::<Vec<_>>();
+    let long_references = transcripts
+        .iter()
+        .map(|transcript| {
+            (
+                transcript.as_str(),
+                FishDrama3ReferenceAudio {
+                    samples: &clip,
+                    channels: 1,
+                    sample_rate: 8_000,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let error = model
+        .prepare_request(&long_references, &[], "hello world.", BUDGET, &|| Ok(()))
+        .expect_err("no room for the text");
+    assert!(
+        matches!(&error, crate::error::Error::InvalidInput(message)
+            if message.contains("holds 4 references in") && message.contains("no room")),
+        "{error}"
+    );
+    // One short clip beside text too long for the prompt: a context error
+    // that names the reference's share.
+    let long_text = "one two three hello world. ".repeat(1_000);
+    let error = model
+        .prepare_request(&long_references[..1], &[], &long_text, BUDGET, &|| Ok(()))
+        .expect_err("text too long");
+    assert!(
+        matches!(&error, crate::error::Error::ContextLengthExceeded(message)
+            if message.contains("it holds 1 reference in")),
+        "{error}"
+    );
+    drop(model);
+    runtime.unload_model(VARIANT).await.expect("unload");
+}
+
 /// A machine that cannot hold the load is refused at admission, before the
 /// model is published; once the memory is free the same load succeeds.
 #[allow(clippy::await_holding_lock)]

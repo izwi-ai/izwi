@@ -1258,6 +1258,9 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 1,
             },
             Self::Qwen3Tts12Hz06BCustomVoice
             | Self::Qwen3Tts12Hz06BCustomVoice8Bit
@@ -1271,6 +1274,9 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 0,
             },
             Self::Qwen3Tts12Hz17BCustomVoice => SpeechModelCapabilities {
                 supports_builtin_voices: true,
@@ -1282,6 +1288,9 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 0,
             },
             Self::Qwen3Tts12Hz17BVoiceDesign
             | Self::Qwen3Tts12Hz17BVoiceDesign8Bit
@@ -1295,6 +1304,9 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 0,
             },
             Self::Kokoro82M => SpeechModelCapabilities {
                 supports_builtin_voices: true,
@@ -1306,6 +1318,9 @@ impl ModelVariant {
                 supports_speed_control: true,
                 supports_auto_long_form: false,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 0,
             },
             Self::Lfm25Audio15BGguf => SpeechModelCapabilities {
                 supports_builtin_voices: true,
@@ -1317,6 +1332,9 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: false,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 0,
             },
             Self::Lfm3Audio2BGguf | Self::Lfm3Audio2BQ8Gguf => SpeechModelCapabilities {
                 supports_builtin_voices: true,
@@ -1328,6 +1346,9 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 0,
             },
             Self::Voxtral4BTts2603 => SpeechModelCapabilities {
                 supports_builtin_voices: true,
@@ -1339,6 +1360,9 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: false,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 0,
             },
             Self::VibeVoice15BTts => SpeechModelCapabilities {
                 supports_builtin_voices: false,
@@ -1350,6 +1374,9 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 1,
             },
             Self::FishAudioS2Pro => SpeechModelCapabilities {
                 supports_builtin_voices: false,
@@ -1361,10 +1388,14 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 1,
             },
-            // Clones from a reference clip with its transcript, or speaks in a
-            // voice its seed sets when given none; streams, and speaks long
-            // text as a chunk session.
+            // Clones from reference clips with their transcripts, or speaks in
+            // a voice its seed sets when given none; voices up to 16 tagged
+            // speakers from up to 8 references (the family's prompt limits);
+            // streams, and speaks long text as a chunk session.
             Self::FishAudioDrama3 => SpeechModelCapabilities {
                 supports_builtin_voices: false,
                 built_in_voice_count: None,
@@ -1375,6 +1406,9 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: true,
+                supports_speaker_dialogue: true,
+                max_speakers: 16,
+                max_references: 8,
             },
             Self::Chatterbox500M | Self::ChatterboxMultilingual500M => SpeechModelCapabilities {
                 supports_builtin_voices: true,
@@ -1386,6 +1420,9 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 1,
             },
             // Built-in voices are named descriptions; a request's own
             // description replaces the voice's.
@@ -1401,6 +1438,9 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 1,
             },
             Self::Maya13B | Self::Maya13BGguf => SpeechModelCapabilities {
                 supports_builtin_voices: true,
@@ -1412,6 +1452,9 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 0,
             },
             _ => return None,
         };
@@ -1978,6 +2021,16 @@ pub struct SpeechModelCapabilities {
     /// seed sets (Fish Audio Drama 3). A reference stays optional for such
     /// a model, and its transcript stays required when one is given.
     pub supports_seeded_voice: bool,
+    /// Whether one request may voice several speakers: `<|speaker:N|>`
+    /// tags or a `script` in the text, and `references`, each a clip with
+    /// its transcript for one speaker (Fish Audio Drama 3).
+    pub supports_speaker_dialogue: bool,
+    /// The speakers one request may voice, numbered `0` to
+    /// `max_speakers - 1`; 1 for a single-voice model.
+    pub max_speakers: usize,
+    /// The reference clips one request may carry: 0 for a model that does
+    /// not clone, 1 for one that clones a single voice.
+    pub max_references: usize,
 }
 
 impl SpeechModelCapabilities {
@@ -2362,6 +2415,9 @@ mod tests {
                 supports_speed_control: false,
                 supports_auto_long_form: false,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 0,
             })
         );
     }
@@ -2403,6 +2459,9 @@ mod tests {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 1,
             })
         );
     }
@@ -2437,6 +2496,9 @@ mod tests {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 1,
             })
         );
     }
@@ -2503,17 +2565,27 @@ mod tests {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: true,
+                supports_speaker_dialogue: true,
+                max_speakers: 16,
+                max_references: 8,
             })
         );
-        // Only Drama 3 speaks without a voice input.
+        // Only Drama 3 speaks without a voice input or voices a dialogue;
+        // every other model speaks one voice from at most one reference,
+        // and only a model that clones takes one.
         for other in ModelVariant::all()
             .iter()
             .filter(|other| **other != variant)
         {
-            assert!(
-                !other
-                    .speech_capabilities()
-                    .is_some_and(|capabilities| capabilities.supports_seeded_voice),
+            let Some(capabilities) = other.speech_capabilities() else {
+                continue;
+            };
+            assert!(!capabilities.supports_seeded_voice, "{other}");
+            assert!(!capabilities.supports_speaker_dialogue, "{other}");
+            assert_eq!(capabilities.max_speakers, 1, "{other}");
+            assert_eq!(
+                capabilities.max_references,
+                usize::from(capabilities.supports_reference_voice),
                 "{other}"
             );
         }
@@ -2642,6 +2714,9 @@ mod tests {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 1,
             })
         );
     }
@@ -2760,6 +2835,9 @@ mod tests {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 1,
             })
         );
     }
@@ -2778,6 +2856,9 @@ mod tests {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 0,
             })
         );
         assert_eq!(
@@ -2792,6 +2873,9 @@ mod tests {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 0,
             })
         );
     }
@@ -2810,6 +2894,9 @@ mod tests {
                 supports_speed_control: true,
                 supports_auto_long_form: false,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 0,
             })
         );
     }
@@ -2828,6 +2915,9 @@ mod tests {
                 supports_speed_control: false,
                 supports_auto_long_form: false,
                 supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 0,
             })
         );
     }
