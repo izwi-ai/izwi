@@ -255,6 +255,26 @@ fn cuda_decode_rows_are_bit_identical_alone_and_together() {
     );
 }
 
+/// The trunk step's stretches are captured, verified and replayed, and the
+/// frames are the eager stretches' own.
+#[test]
+fn cuda_trunk_graphs_decode_as_the_eager_stretches() {
+    let Some(device) = device_or_skip() else {
+        return;
+    };
+    let synthetic = write_synthetic_model_in(7, SyntheticGeometry::KernelHeads, |_| {});
+    let mut model = load(&synthetic, &device, options(FishDrama3CpuPrecision::Q8_0));
+    let a = prompt_of(&model, &rows(&model, 9, 1));
+    let b = prompt_of(&model, &rows(&model, 12, 2));
+    let graphed = decode_together(&model, &[(&a, 11), (&b, 12)], 6, false);
+    let graphs = model.diagnostics_summary()["trunk"]["decode_graphs"].clone();
+    assert!(graphs["off"].is_null(), "{graphs}");
+    assert!(graphs["replays"].as_u64().unwrap() > 0, "{graphs}");
+    model.trunk_mut().device_trunk_mut().unwrap().graphs = Err("disabled by a test".into());
+    let eager = decode_together(&model, &[(&a, 11), (&b, 12)], 6, false);
+    assert_eq!(graphed, eager);
+}
+
 /// The one-readback frame makes the two-readback path's frames bit for bit,
 /// through a frame limit and an eos whose speculative step is aborted.
 #[test]

@@ -911,8 +911,8 @@ impl FishDrama3Model {
         let fused = decode_path
             .as_ref()
             .is_some_and(FishDrama3DecodePath::is_fused);
-        if let Some(weights) = trunk.device_trunk_mut() {
-            weights.fused = fused;
+        if let Some(weights) = trunk.device_trunk_mut().filter(|_| fused) {
+            weights.enable_fused(device);
         }
         if let Some(weights) = tower.device_tower_mut() {
             weights.fused = fused;
@@ -1036,6 +1036,12 @@ impl FishDrama3Model {
     /// How the device trunk and tower run (`None` on the CPU).
     pub fn decode_path(&self) -> Option<&FishDrama3DecodePath> {
         self.decode_path.as_ref()
+    }
+
+    /// The trunk, for tests that switch its paths.
+    #[cfg(test)]
+    pub(crate) fn trunk_mut(&mut self) -> &mut FishDrama3Trunk {
+        &mut self.trunk
     }
 
     /// Runs the device trunk, tower and draws fused or eagerly, for tests

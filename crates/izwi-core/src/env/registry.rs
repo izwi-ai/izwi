@@ -427,6 +427,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "The directory generate_fish_drama3_reference.py wrote (reference.json, reference.safetensors, audio/) for the ignored Fish Audio Drama 3 L2 parity tests.",
     ),
     CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_SEGMENT_GRAPHS",
+        Flag,
+        "true",
+        Load,
+        "On CUDA, Fish Audio Drama 3's fused trunk step replays a CUDA graph for each stretch of DeltaNet and MoE layers between attention mixers (captured per row count up to 4, checked bit for bit against the eager stretch on two steps, off for the process on any mismatch; never with a host-routed MoE layer). Any false value, or `IZWI_CUDA_DECODE_GRAPHS=off`, runs every stretch eagerly; the trunk's `decode_graphs` diagnostics report captures, replays and why the graphs are off.",
+    ),
+    CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_SLICE_DIR",
         Path,
         "unset (test fails)",

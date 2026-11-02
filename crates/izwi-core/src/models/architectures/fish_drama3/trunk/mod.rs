@@ -463,6 +463,9 @@ impl FishDrama3Trunk {
             "span_rows": c.span_rows.load(Ordering::Relaxed),
             "steps": c.steps.load(Ordering::Relaxed),
             "step_rows": c.step_rows.load(Ordering::Relaxed),
+            "decode_graphs": self
+                .device_trunk()
+                .map_or(serde_json::Value::Null, DeviceTrunk::graph_diagnostics),
         })
     }
 

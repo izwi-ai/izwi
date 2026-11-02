@@ -28,6 +28,7 @@ pub mod row_gemv;
 pub mod sampling;
 pub mod segment_graph;
 pub mod split_decode;
+pub mod stretch_graphs;
 pub mod timing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -171,7 +171,7 @@ pub struct NemotronDecoder {
     path: DecodePath,
     pieces: Vec<Piece>,
     /// CUDA graphs of the fused step's stretches, or why there are none.
-    graphs: std::result::Result<graphs::StepGraphs, String>,
+    graphs: std::result::Result<crate::kernels::cuda::stretch_graphs::StretchGraphs, String>,
 }
 
 impl NemotronDecoder {
@@ -263,7 +263,7 @@ impl NemotronDecoder {
             .filter(|piece| matches!(piece, Piece::Stretch { .. }))
             .count();
         let graphs = match &path {
-            DecodePath::Fused { .. } => graphs::StepGraphs::resolve(device, stretches),
+            DecodePath::Fused { .. } => graphs::resolve(device, stretches),
             DecodePath::Eager { .. } => Err("the decode runs eagerly".into()),
         };
         Ok(Self {

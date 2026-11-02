@@ -57,6 +57,11 @@ use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedP
 /// composed race. Read at load.
 pub const FUSED_DECODE_ENV: &str = "IZWI_FISH_DRAMA3_FUSED_DECODE";
 
+/// Kill switch for the CUDA graphs of a fused trunk step's stretches (`0`,
+/// `off`, `false`): every stretch runs eagerly. The global
+/// `IZWI_CUDA_DECODE_GRAPHS=off` turns them off too. Read at load.
+pub const SEGMENT_GRAPHS_ENV: &str = "IZWI_FISH_DRAMA3_SEGMENT_GRAPHS";
+
 /// Largest relative L2 deviation of a device's fused kernels from their CPU
 /// forms that keeps the fused forward on.
 pub(crate) const FUSED_CHECK_LIMIT: f64 = 1e-3;

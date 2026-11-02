@@ -209,6 +209,21 @@ other families (`crates/izwi-core/src/kernels/`):
   a flat distribution) is bounded by mass on the device, so no draw falls
   back to the host.
 
+A fused trunk step runs as pieces: stretches of DeltaNet and MoE layers
+between attention mixers (each opens with the previous attention layer's
+MoE half), pure functions of the residual, the normed hidden and each row's
+conv history and recurrent state, and the attention mixers with their post
+norms, eager. On CUDA each stretch replays a CUDA graph
+(`kernels::cuda::stretch_graphs`), captured per row count up to 4 rows and
+checked bit for bit against the eager stretch on its capture step and the
+next; any failure turns the graphs off for the process, and a host-routed
+MoE layer keeps them off. A replay copies the DeltaNet states in and out of
+the graph's buffers. The trunk's `decode_graphs` diagnostics count warmups,
+captures, verified steps and replays; `IZWI_FISH_DRAMA3_SEGMENT_GRAPHS=0` or
+`IZWI_CUDA_DECODE_GRAPHS=off` keeps every stretch eager. Prefill spans run
+the fused layers whole. The graphs have been compiled and type-checked but
+not yet run on a GPU.
+
 On the fused path a frame reads back once. The main draws, RAS (the
 retry replaces a semantic first draw already in the row's 16-token window,
 uploaded per frame), the tower and the trunk all run on the device for every
@@ -520,6 +535,8 @@ load:
   runs the eager chain with two readbacks a frame.
 - `IZWI_FISH_DRAMA3_MOE_BACKEND`: `fused` (default) or `loop`, on Metal and
   CUDA.
+- `IZWI_FISH_DRAMA3_SEGMENT_GRAPHS`: CUDA graphs of the fused trunk step's
+  stretches (default `true`).
 - `IZWI_FISH_DRAMA3_NATIVE_BATCHING`: two rows at once on Metal instead of
   one.
 - `IZWI_FISH_DRAMA3_PREFILL_SPAN`: rows per prefill cell, 1 to 8,192; 256 on
