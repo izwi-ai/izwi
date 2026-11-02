@@ -24,7 +24,7 @@ use super::super::linear::{FishDrama3KernelPhase, FishDrama3Linear};
 use super::super::residency::FishDrama3Residency;
 use super::super::sampling::FishDrama3DrawPolicy;
 use super::super::trunk::{norm_gain, NormGain};
-use super::sampling::{race, race_rows, rank, read_back};
+use super::sampling::{race, race_rows, rank};
 use super::trunk::{gain, half_linear, half_linear_packed};
 use super::{
     add_residual, record, rms_norm, swiglu, DeviceAttention, DeviceForms, DeviceRow, Probe,
@@ -405,7 +405,7 @@ impl DeviceTower {
     }
 
     /// `[N, 1]` U8: whether each row's label (or sampled) main is semantic.
-    fn labelled(flags: &[bool], device: &Device) -> Result<Tensor> {
+    pub(crate) fn labelled(flags: &[bool], device: &Device) -> Result<Tensor> {
         super::count_uploads(1);
         Ok(Tensor::from_vec(
             flags.iter().map(|&flag| u8::from(flag)).collect::<Vec<_>>(),
@@ -415,7 +415,11 @@ impl DeviceTower {
     }
 
     /// `values` clamped to the table, `[N]` U32 on `device`.
-    fn codes(&self, values: impl Iterator<Item = u32>, device: &Device) -> Result<Tensor> {
+    pub(crate) fn codes(
+        &self,
+        values: impl Iterator<Item = u32>,
+        device: &Device,
+    ) -> Result<Tensor> {
         let values = values
             .map(|code| code.min(self.vocab as u32 - 1))
             .collect::<Vec<_>>();
@@ -468,25 +472,23 @@ impl DeviceTower {
     }
 
     /// A decode step over one row per request: `hidden` `[m, dim]` F32,
-    /// `inputs` the rows' input frames (row-major), `c0` each row's code 0
-    /// and `labelled` whether it injects. Returns each row's codes 1.. and
-    /// every layer's output.
+    /// `inputs` the rows' input frames (row-major), `first` each row's code 0
+    /// (`[m]` U32, clamped) and `labelled` whether it injects (`[m, 1]` U8).
+    /// Nothing is read back: device codes stay on the device for the caller
+    /// to read with whatever else its frame reads.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn step(
         &self,
         embedding: &FishDrama3Embedding,
         hidden: &Tensor,
         inputs: &[u32],
-        c0: &[u32],
-        labelled: &[bool],
+        first: &Tensor,
+        labelled: &Tensor,
         rows: &mut [DeviceRow<'_>],
         mut codes: DeviceStepCodes<'_>,
-    ) -> Result<(Vec<Vec<u32>>, Vec<Tensor>)> {
-        let device = hidden.device().clone();
-        let m = c0.len();
+    ) -> Result<DeviceTowerStep> {
+        let m = first.dim(0)?;
         let extra = embedding.extra_device(inputs)?;
-        let labelled = Self::labelled(labelled, &device)?;
-        let first = self.codes(c0.iter().copied(), &device)?;
         let mut x = hidden.clone();
         let mut outputs = Vec::with_capacity(self.layers.len());
         // The code each residual layer injects: c0, then each head's pick.
@@ -497,11 +499,11 @@ impl DeviceTower {
         let mut positions = None;
         for slot in 0..self.layers.len() {
             let source = if slot < self.shared_layers {
-                &first
+                first
             } else {
                 &injected
             };
-            let e = self.inject(slot, source, &labelled, (slot == 0).then_some(&extra))?;
+            let e = self.inject(slot, source, labelled, (slot == 0).then_some(&extra))?;
             x = self.forward_layer(
                 slot,
                 &e,
@@ -548,29 +550,64 @@ impl DeviceTower {
                     for (row, &code) in host_codes.iter_mut().zip(&values) {
                         row.push(code);
                     }
-                    self.codes(values.into_iter(), &device)?
+                    self.codes(values.into_iter(), hidden.device())?
                 }
             };
         }
-        if let DeviceStepCodes::Device { .. } = codes {
-            // Readback 2: every head's pick, then every draw's non-finite
-            // count, in one transfer.
-            let heads = picks.len();
-            let mut all = picks;
-            all.extend(checks);
-            let values = read_back(&Tensor::cat(&all, 0)?)?;
-            let (codes, non_finite) = values.split_at(heads * m);
-            if let Some(count) = non_finite.iter().find(|count| **count > 0) {
-                return Err(Error::InferenceError(format!(
-                    "Fish Audio Drama 3 codebook head logits are non-finite: {count} values"
-                )));
-            }
-            for head_codes in codes.chunks_exact(m) {
-                for (row, &code) in host_codes.iter_mut().zip(head_codes) {
-                    row.push(code);
-                }
+        let device = match codes {
+            DeviceStepCodes::Device { .. } => Some(DeviceCodes {
+                picks: Tensor::stack(&picks, 0)?,
+                checks: Tensor::cat(&checks, 0)?,
+            }),
+            DeviceStepCodes::Host(_) => None,
+        };
+        Ok(DeviceTowerStep {
+            host_codes,
+            device,
+            outputs,
+        })
+    }
+}
+
+/// A device decode step's result.
+pub(crate) struct DeviceTowerStep {
+    /// Each row's codes 1.. under [`DeviceStepCodes::Host`].
+    pub(crate) host_codes: Vec<Vec<u32>>,
+    /// The codes under [`DeviceStepCodes::Device`], not yet read back.
+    pub(crate) device: Option<DeviceCodes>,
+    /// Every layer's output.
+    pub(crate) outputs: Vec<Tensor>,
+}
+
+/// A step's device-drawn codes.
+pub(crate) struct DeviceCodes {
+    /// `[heads, m]` U32: head `j`'s pick for each row (codebook `j + 1`).
+    pub(crate) picks: Tensor,
+    /// `[heads * m]` U32: each draw's non-finite logits.
+    pub(crate) checks: Tensor,
+}
+
+impl DeviceCodes {
+    /// Every row's codes 1.. from the host values of `[picks ; checks]`;
+    /// a non-finite head is an error.
+    pub(crate) fn rows(values: &[u32], m: usize) -> Result<Vec<Vec<u32>>> {
+        let (codes, non_finite) = values.split_at(values.len() / 2);
+        if let Some(count) = non_finite.iter().find(|count| **count > 0) {
+            return Err(Error::InferenceError(format!(
+                "Fish Audio Drama 3 codebook head logits are non-finite: {count} values"
+            )));
+        }
+        let mut rows = vec![Vec::with_capacity(codes.len() / m.max(1)); m];
+        for head_codes in codes.chunks_exact(m) {
+            for (row, &code) in rows.iter_mut().zip(head_codes) {
+                row.push(code);
             }
         }
-        Ok((host_codes, outputs))
+        Ok(rows)
+    }
+
+    /// `[picks ; checks]` flattened, for one readback.
+    pub(crate) fn packed(&self) -> Result<Tensor> {
+        Ok(Tensor::cat(&[&self.picks.flatten_all()?, &self.checks], 0)?)
     }
 }

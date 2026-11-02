@@ -389,7 +389,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Flag,
         "true",
         Load,
-        "Fish Audio Drama 3 on Metal or CUDA runs its trunk, tower and draws through the fused kernels (residual add + norm, q/k norm + RoPE from load-time tables, packed SwiGLU, one-launch races). Any false value runs the eager per-layer chain; a failed load-time kernel check does too, and `decode_path` in the diagnostics says which ran.",
+        "Fish Audio Drama 3 on Metal or CUDA runs its trunk, tower and draws through the fused kernels (residual add + norm, q/k norm + RoPE from load-time tables, packed SwiGLU, one-launch races) and reads each frame back once. Any false value runs the eager per-layer chain with two readbacks a frame; a failed load-time kernel check does too, and `decode_path` in the diagnostics says which ran.",
     ),
     CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_MODEL_DIR",

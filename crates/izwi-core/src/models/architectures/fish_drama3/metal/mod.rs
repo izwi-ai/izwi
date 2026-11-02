@@ -14,7 +14,7 @@
 //! | Paged KV (both domains) | F16, F32 after a breached load-time probe |
 //! | Embedding and code tables | F16 device tables, gathered to F32 |
 //! | Logits | F16 projections widened to F32 |
-//! | Sampling | on the device, two readbacks a frame (`device::sampling`) |
+//! | Sampling | on the device, one readback a frame (two with the fused path off) (`device::sampling`) |
 //!
 //! The forward code is the device column's (`device/`), which CUDA shares in
 //! its own forms; this module holds what only Metal runs: the F16 range

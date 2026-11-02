@@ -17,9 +17,12 @@
 //! ```
 //!
 //! A codebook head's pick indexes the next tower layer's injection on the
-//! device, so a frame reads back twice: readback 1 is each row's main and
-//! RAS picks (RAS itself, a window lookup, runs on the host), readback 2
-//! the 9 head codes. A main draw whose kept prefix runs past the device's
+//! device. On the composed path a frame reads back twice: readback 1 is each
+//! row's main and RAS picks (RAS itself, a window lookup, runs on the host),
+//! readback 2 the 9 head codes. On the fused path the model runs RAS on the
+//! device too and reads a frame back once
+//! (`FishDrama3Model::decode_resident`). A composed main draw whose kept
+//! prefix runs past the device's
 //! 512 ranks (an uncapped flat distribution) re-runs on the host from the
 //! same exponentials, which costs one more readback of that row's logits;
 //! a request whose head cap exceeds 512 samples its heads on the host.

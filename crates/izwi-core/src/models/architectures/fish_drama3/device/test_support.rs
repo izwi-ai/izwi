@@ -300,3 +300,92 @@ pub(crate) fn fused_against_eager(device: &Device, seed: u64) -> (f64, f64) {
         relative_l2(&tower_fused, &tower_eager),
     )
 }
+
+/// One request of [`decode_requests`]: its prompt, seed and frame budget,
+/// and the frame at which recorded exponentials make it draw eos.
+pub(crate) struct DecodeRequest<'a> {
+    pub(crate) prompt: &'a FishDrama3Prompt,
+    pub(crate) seed: u64,
+    pub(crate) max_frames: usize,
+    pub(crate) eos_at: Option<usize>,
+}
+
+/// Each request prefilled, then `rounds` decode rounds of the unfinished
+/// ones together: every request's codes, `h_t` and stop reason. Requests
+/// sample at temperature 1 and top_p 1, so every candidate is kept; one
+/// with `eos_at` replays seeded exponentials, except that its main draw at
+/// that frame gives eos (candidate 0) a vanishing exponential.
+pub(crate) fn decode_requests(
+    model: &FishDrama3Model,
+    requests: &[DecodeRequest<'_>],
+    rounds: usize,
+) -> Vec<(
+    Vec<Vec<u32>>,
+    Vec<f32>,
+    Option<super::super::model::FishDrama3StopReason>,
+)> {
+    let config = model.config();
+    let candidates = model.head().len();
+    let heads = config.tower.residual_layers();
+    let vocab = config.tower.codebook_vocab;
+    let mut states = requests
+        .iter()
+        .map(|request| {
+            let sampling =
+                FishDrama3SamplingParams::from_request(Some(1.0), Some(1.0), None, request.seed)
+                    .unwrap();
+            let params = FishDrama3GenerationParams::new(sampling, request.max_frames);
+            let Some(eos_at) = request.eos_at else {
+                return model
+                    .new_private_request(request.prompt.clone(), params)
+                    .unwrap();
+            };
+            let mut noise = Vec::new();
+            for frame in 0..=request.max_frames {
+                let mut first = xorshift_values(candidates, request.seed + frame as u64, 0.5)
+                    .into_iter()
+                    .map(|u| -((u + 0.5).clamp(1e-6, 1.0 - 1e-6)).ln())
+                    .collect::<Vec<_>>();
+                if frame == eos_at {
+                    first[0] = 1e-30;
+                }
+                noise.extend(first);
+                noise.extend(
+                    xorshift_values(
+                        candidates + heads * vocab,
+                        100 + request.seed + frame as u64,
+                        0.5,
+                    )
+                    .into_iter()
+                    .map(|u| -((u + 0.5).clamp(1e-6, 1.0 - 1e-6)).ln()),
+                );
+            }
+            model
+                .new_private_replay(request.prompt.clone(), params, noise)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    for state in &mut states {
+        model.run_prefill(state, &ok).unwrap();
+    }
+    for _ in 0..rounds {
+        let mut going = states
+            .iter_mut()
+            .filter(|state| !state.is_finished())
+            .collect::<Vec<_>>();
+        if going.is_empty() {
+            break;
+        }
+        model.decode_round(&mut going).unwrap();
+    }
+    states
+        .iter()
+        .map(|state| {
+            (
+                state.codes().to_vec(),
+                state.last_hidden_values(),
+                state.stop_reason(),
+            )
+        })
+        .collect()
+}

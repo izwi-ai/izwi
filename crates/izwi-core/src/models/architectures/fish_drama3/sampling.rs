@@ -437,21 +437,31 @@ impl FishDrama3RowSampler {
     /// the request policy's and the retry's), and the token joins the
     /// window: the end of [`Self::sample_main`], which a device race shares.
     pub fn finish_main(&mut self, first: usize, retry: usize) -> FishDrama3MainDraw {
+        let draw = self.ras(first, retry);
+        if self.window.len() == RAS_WINDOW {
+            self.window.pop_front();
+        }
+        self.window.push_back(draw.token);
+        draw
+    }
+
+    /// RAS over a frame's two draws, leaving the window as it is.
+    pub(crate) fn ras(&self, first: usize, retry: usize) -> FishDrama3MainDraw {
         let (first, retry) = (self.main_token(first), self.main_token(retry));
         // Only semantic repeats: the window starts with prompt rows, which
         // hold the user turn's eos, and a stop is never redrawn.
         let redrawn = self.ids.is_semantic(first) && self.window.contains(&first);
-        let token = if redrawn { retry } else { first };
-        if self.window.len() == RAS_WINDOW {
-            self.window.pop_front();
-        }
-        self.window.push_back(token);
         FishDrama3MainDraw {
-            token,
+            token: if redrawn { retry } else { first },
             first,
             retry,
             redrawn,
         }
+    }
+
+    /// The RAS window's tokens, oldest first (at most [`RAS_WINDOW`]).
+    pub(crate) fn ras_window(&self) -> impl Iterator<Item = u32> + '_ {
+        self.window.iter().copied()
     }
 
     /// A codebook head's code from its logits (one per code). Non-finite

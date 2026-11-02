@@ -175,6 +175,14 @@ pub struct FishDrama3StepRow<'a> {
     pub cache: &'a mut PhysicalPagedKvCache,
 }
 
+/// A resident decode step in flight: its appends prepared, each row's next
+/// states, and the final-norm hidden `[rows, hidden]` F32 on the device.
+pub(crate) struct FishDrama3ResidentTrunkStep {
+    prepared: Vec<PreparedPhysicalPagedStep>,
+    next: Vec<Vec<state::FishDrama3LinearState>>,
+    pub(crate) hidden: Tensor,
+}
+
 #[derive(Debug, Default)]
 struct Counters {
     spans: AtomicU64,
@@ -729,6 +737,37 @@ impl FishDrama3Trunk {
         rows: &mut [FishDrama3StepRow<'_>],
         trace: Option<&mut LayerTrace>,
     ) -> Result<Tensor> {
+        let step = self.begin_device_step(weights, embeds, rows, trace)?;
+        let hidden = step.hidden.clone();
+        self.finish_resident_step(step, rows, &vec![true; rows.len()])?;
+        Ok(hidden)
+    }
+
+    /// A resident decode step (the model's one-readback frame): row `r` of
+    /// `embeds` `[rows.len(), hidden]` is the next row of request
+    /// `rows[r]`. The rows run together; their appends and states stay
+    /// pending until [`Self::finish_resident_step`] or
+    /// [`Self::abort_resident_step`]. On an error nothing moves.
+    pub(crate) fn begin_resident_step(
+        &self,
+        embeds: &Tensor,
+        rows: &mut [FishDrama3StepRow<'_>],
+    ) -> Result<FishDrama3ResidentTrunkStep> {
+        let Weights::Device(weights) = &self.weights else {
+            return Err(Error::InferenceError(
+                "a resident trunk step needs device weights".into(),
+            ));
+        };
+        self.begin_device_step(weights, embeds, rows, None)
+    }
+
+    fn begin_device_step(
+        &self,
+        weights: &DeviceTrunk,
+        embeds: &Tensor,
+        rows: &mut [FishDrama3StepRow<'_>],
+        trace: Option<&mut LayerTrace>,
+    ) -> Result<FishDrama3ResidentTrunkStep> {
         let (x, count) = self.device_rows(embeds, Some(rows.len()))?;
         if count == 0 {
             return Err(Error::InvalidInput("a decode step needs a row".into()));
@@ -775,25 +814,75 @@ impl FishDrama3Trunk {
                 trace,
             )
         };
-        let hidden = match result {
-            Ok(hidden) => hidden,
+        match result {
+            Ok(hidden) => Ok(FishDrama3ResidentTrunkStep {
+                prepared,
+                next,
+                hidden,
+            }),
             Err(error) => {
                 for (row, step) in rows.iter_mut().zip(prepared) {
                     let _ = row.cache.abort_prepared(step);
                 }
-                return Err(error);
+                Err(error)
             }
-        };
-        for ((row, step), layers) in rows.iter_mut().zip(prepared).zip(next) {
+        }
+    }
+
+    /// Commits the rows of `step` where `keep` (their appends and states)
+    /// and aborts the others; `rows` are its rows in order.
+    pub(crate) fn finish_resident_step(
+        &self,
+        step: FishDrama3ResidentTrunkStep,
+        rows: &mut [FishDrama3StepRow<'_>],
+        keep: &[bool],
+    ) -> Result<()> {
+        if rows.len() != step.prepared.len() || keep.len() != rows.len() {
+            return Err(Error::InferenceError(
+                "a resident trunk step finishes with other rows than it began".into(),
+            ));
+        }
+        let mut failure = None;
+        let mut kept = 0;
+        for (((row, prepared), layers), &keep) in
+            rows.iter_mut().zip(step.prepared).zip(step.next).zip(keep)
+        {
+            if !(keep && failure.is_none()) {
+                if let Err(error) = row.cache.abort_prepared(prepared) {
+                    failure.get_or_insert(error);
+                }
+                continue;
+            }
             let start = row.state.position();
-            row.cache.commit_prepared(step)?;
-            row.state.install(layers, start + 1);
+            match row.cache.commit_prepared(prepared) {
+                Ok(()) => {
+                    row.state.install(layers, start + 1);
+                    kept += 1;
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
         self.counters
             .step_rows
-            .fetch_add(count as u64, Ordering::Relaxed);
+            .fetch_add(kept as u64, Ordering::Relaxed);
         self.counters.steps.fetch_add(1, Ordering::Relaxed);
-        Ok(hidden)
+        Ok(())
+    }
+
+    /// Aborts every row of `step`.
+    pub(crate) fn abort_resident_step(
+        &self,
+        step: FishDrama3ResidentTrunkStep,
+        rows: &mut [FishDrama3StepRow<'_>],
+    ) {
+        for (row, prepared) in rows.iter_mut().zip(step.prepared) {
+            let _ = row.cache.abort_prepared(prepared);
+        }
     }
 
     fn steps(

@@ -9,8 +9,8 @@
 use candle_core::{DType, Device, Tensor};
 
 use super::super::device::test_support::{
-    decode_together, fused_against_eager, host, load, ok, options, pair, params, prompt_of, rows,
-    trunk_caches, trunk_span_error,
+    decode_requests, decode_together, fused_against_eager, host, load, ok, options, pair, params,
+    prompt_of, rows, trunk_caches, trunk_span_error, DecodeRequest,
 };
 use super::super::model::tests::write_synthetic_model_in;
 use super::super::residency::FishDrama3CpuPrecision;
@@ -255,10 +255,38 @@ fn cuda_decode_rows_are_bit_identical_alone_and_together() {
     );
 }
 
-/// Two readbacks a frame: the main and RAS picks of every row, then their
-/// 9 head codes; every frame counted as sampled on the device.
+/// The one-readback frame makes the two-readback path's frames bit for bit,
+/// through a frame limit and an eos whose speculative step is aborted.
 #[test]
-fn cuda_decode_reads_back_twice_a_frame() {
+fn cuda_one_readback_frames_are_the_two_readback_frames() {
+    let Some(device) = device_or_skip() else {
+        return;
+    };
+    let synthetic = write_synthetic_model_in(7, SyntheticGeometry::KernelHeads, |_| {});
+    let mut model = load(&synthetic, &device, options(FishDrama3CpuPrecision::Q8_0));
+    let (a, b, c) = (
+        prompt_of(&model, &rows(&model, 9, 1)),
+        prompt_of(&model, &rows(&model, 12, 2)),
+        prompt_of(&model, &rows(&model, 5, 3)),
+    );
+    let requests = [(&a, 11, 16, None), (&b, 12, 3, None), (&c, 13, 16, Some(2))].map(
+        |(prompt, seed, max_frames, eos_at)| DecodeRequest {
+            prompt,
+            seed,
+            max_frames,
+            eos_at,
+        },
+    );
+    let one = decode_requests(&model, &requests, 6);
+    model.two_readbacks = true;
+    let two = decode_requests(&model, &requests, 6);
+    assert_eq!(one, two);
+}
+
+/// One readback a frame (every row's picks, chosen candidate, 9 head codes
+/// and flags); every frame counted as sampled on the device.
+#[test]
+fn cuda_decode_reads_back_once_a_frame() {
     let Some(device) = device_or_skip() else {
         return;
     };
@@ -287,7 +315,7 @@ fn cuda_decode_reads_back_twice_a_frame() {
     );
     let mut refs = states.iter_mut().collect::<Vec<_>>();
     model.decode_round(&mut refs).unwrap();
-    assert_eq!(fish_drama3_resident_readbacks() - readbacks, 2);
+    assert_eq!(fish_drama3_resident_readbacks() - readbacks, 1);
     assert_eq!(fish_drama3_resident_frames() - frames, 2);
     assert_eq!(fish_drama3_resident_host_fallbacks(), fallbacks);
     assert!(states.iter().all(|state| state.frames() == 1));

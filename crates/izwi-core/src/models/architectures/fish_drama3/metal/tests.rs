@@ -6,8 +6,8 @@
 use candle_core::{DType, Device, Tensor};
 
 use super::super::device::test_support::{
-    decode_together, fused_against_eager, host, load, ok, options, pair, params, prompt_of, rows,
-    trunk_caches, trunk_span_error,
+    decode_requests, decode_together, fused_against_eager, host, load, ok, options, pair, params,
+    prompt_of, rows, trunk_caches, trunk_span_error, DecodeRequest,
 };
 use super::super::model::tests::write_synthetic_model_in;
 use super::super::model::FishDrama3ModelOptions;
@@ -248,12 +248,14 @@ fn metal_decode_rows_are_bit_identical_alone_and_together() {
     );
 }
 
-/// Two readbacks a frame: the main and RAS picks of every row, then their
-/// 9 head codes; every frame counted as sampled on the device.
+/// One readback a frame on the fused path (every row's main and RAS picks,
+/// chosen candidate, 9 head codes and flags), two on the two-readback path
+/// (the picks, then the codes); every frame counted as sampled on the
+/// device.
 #[test]
-fn metal_decode_reads_back_twice_a_frame() {
+fn metal_decode_reads_back_once_a_frame() {
     let Some((device, _lease)) =
-        crate::backends::metal_test_device_or_skip("metal_decode_reads_back_twice_a_frame")
+        crate::backends::metal_test_device_or_skip("metal_decode_reads_back_once_a_frame")
     else {
         return;
     };
@@ -262,51 +264,126 @@ fn metal_decode_reads_back_twice_a_frame() {
         fish_drama3_resident_readbacks,
     };
     let synthetic = write_synthetic_model_in(7, SyntheticGeometry::KernelHeads, |_| {});
-    let model = load(&synthetic, &device, options(FishDrama3CpuPrecision::Q8_0));
+    let mut model = load(&synthetic, &device, options(FishDrama3CpuPrecision::Q8_0));
     let a = prompt_of(&model, &rows(&model, 9, 1));
     let b = prompt_of(&model, &rows(&model, 12, 2));
-    let mut states = [(&a, 21u64), (&b, 22)]
-        .iter()
-        .map(|(prompt, seed)| {
-            let mut state = model
-                .new_private_request((*prompt).clone(), params(*seed, 16))
-                .unwrap();
-            model.run_prefill(&mut state, &ok).unwrap();
-            state
-        })
-        .collect::<Vec<_>>();
-    // The first frame masks eos, so both rows make it.
-    let (readbacks, frames, fallbacks) = (
-        fish_drama3_resident_readbacks(),
-        fish_drama3_resident_frames(),
-        fish_drama3_resident_host_fallbacks(),
-    );
-    let counters = super::super::device::fast_path_counters();
-    let mut refs = states.iter_mut().collect::<Vec<_>>();
-    model.decode_round(&mut refs).unwrap();
-    // The step's uploads and its three timed sections are counted.
-    let after = super::super::device::fast_path_counters();
-    for key in [
-        "step_uploads_total",
-        "step_main_draw_ms_total",
-        "step_tower_ms_total",
-        "step_trunk_ms_total",
-    ] {
-        assert!(
-            after[key].as_f64().unwrap() > counters[key].as_f64().unwrap(),
-            "{key}: {after}"
+    for (two, readbacks_a_frame) in [(false, 1), (true, 2)] {
+        model.two_readbacks = two;
+        let mut states = [(&a, 21u64), (&b, 22)]
+            .iter()
+            .map(|(prompt, seed)| {
+                let mut state = model
+                    .new_private_request((*prompt).clone(), params(*seed, 16))
+                    .unwrap();
+                model.run_prefill(&mut state, &ok).unwrap();
+                state
+            })
+            .collect::<Vec<_>>();
+        // The first frame masks eos, so both rows make it.
+        let (readbacks, frames, fallbacks) = (
+            fish_drama3_resident_readbacks(),
+            fish_drama3_resident_frames(),
+            fish_drama3_resident_host_fallbacks(),
         );
+        let counters = super::super::device::fast_path_counters();
+        let mut refs = states.iter_mut().collect::<Vec<_>>();
+        model.decode_round(&mut refs).unwrap();
+        // The step's uploads and its three timed sections are counted.
+        let after = super::super::device::fast_path_counters();
+        for key in [
+            "step_uploads_total",
+            "step_main_draw_ms_total",
+            "step_tower_ms_total",
+            "step_trunk_ms_total",
+        ] {
+            assert!(
+                after[key].as_f64().unwrap() > counters[key].as_f64().unwrap(),
+                "{key}: {after}"
+            );
+        }
+        assert_eq!(
+            fish_drama3_resident_readbacks() - readbacks,
+            readbacks_a_frame,
+            "two readbacks: {two}"
+        );
+        assert_eq!(fish_drama3_resident_frames() - frames, 2);
+        assert_eq!(fish_drama3_resident_host_fallbacks(), fallbacks);
+        assert!(states.iter().all(|state| state.frames() == 1));
     }
-    assert_eq!(fish_drama3_resident_readbacks() - readbacks, 2);
-    assert_eq!(fish_drama3_resident_frames() - frames, 2);
-    assert_eq!(fish_drama3_resident_host_fallbacks(), fallbacks);
-    assert!(states.iter().all(|state| state.frames() == 1));
     let summary = model.diagnostics_summary();
     assert!(
         summary["resident_sampling"]["frames_total"]
             .as_u64()
             .unwrap()
-            >= 2
+            >= 4
+    );
+}
+
+/// The one-readback frame makes the two-readback path's frames bit for bit:
+/// a request that keeps going, one that reaches its frame limit, and one
+/// that draws eos (whose speculative tower and trunk step is aborted), alone
+/// in no round and together in every one.
+#[test]
+fn metal_one_readback_frames_are_the_two_readback_frames() {
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "metal_one_readback_frames_are_the_two_readback_frames",
+    ) else {
+        return;
+    };
+    use super::super::device::sampling::fish_drama3_resident_readbacks;
+    use super::super::model::FishDrama3StopReason;
+    let synthetic = write_synthetic_model_in(7, SyntheticGeometry::KernelHeads, |_| {});
+    let mut model = load(&synthetic, &device, options(FishDrama3CpuPrecision::Q8_0));
+    let (a, b, c) = (
+        prompt_of(&model, &rows(&model, 9, 1)),
+        prompt_of(&model, &rows(&model, 12, 2)),
+        prompt_of(&model, &rows(&model, 5, 3)),
+    );
+    let requests = [
+        DecodeRequest {
+            prompt: &a,
+            seed: 11,
+            max_frames: 16,
+            eos_at: None,
+        },
+        DecodeRequest {
+            prompt: &b,
+            seed: 12,
+            max_frames: 3,
+            eos_at: None,
+        },
+        DecodeRequest {
+            prompt: &c,
+            seed: 13,
+            max_frames: 16,
+            eos_at: Some(2),
+        },
+    ];
+    let rounds = 6;
+    let before = fish_drama3_resident_readbacks();
+    let one = decode_requests(&model, &requests, rounds);
+    let one_readbacks = fish_drama3_resident_readbacks() - before;
+    model.two_readbacks = true;
+    let before = fish_drama3_resident_readbacks();
+    let two = decode_requests(&model, &requests, rounds);
+    let two_readbacks = fish_drama3_resident_readbacks() - before;
+    assert_eq!(one, two);
+    let stops = one.iter().map(|(_, _, stop)| *stop).collect::<Vec<_>>();
+    assert_eq!(
+        stops,
+        [
+            None,
+            Some(FishDrama3StopReason::FrameLimit),
+            Some(FishDrama3StopReason::EndOfSpeech)
+        ]
+    );
+    assert_eq!(one[0].0[0].len(), rounds);
+    assert_eq!(one[1].0[0].len(), 3);
+    assert_eq!(one[2].0[0].len(), 2);
+    // Request a goes on every round: one readback a round, against two.
+    assert_eq!(
+        (one_readbacks, two_readbacks),
+        (rounds as u64, 2 * rounds as u64)
     );
 }
 

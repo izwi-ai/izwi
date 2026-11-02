@@ -17,7 +17,7 @@
 //! | Paged KV (both domains) | BF16; a decode row's split-decode partitions come from its own length (`SplitDecodePartitioning::RowLength`) |
 //! | Embedding and code tables | BF16 device tables, gathered to F32 |
 //! | Logits | BF16 projections into F32 |
-//! | Sampling | on the device, two readbacks a frame (`device::sampling`) |
+//! | Sampling | on the device, one readback a frame (two with the fused path off) (`device::sampling`) |
 //!
 //! The forward code is the device column's (`device/`), shared with Metal;
 //! this module holds what only CUDA runs: the SM80 floor, the load-time

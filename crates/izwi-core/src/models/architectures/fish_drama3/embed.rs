@@ -383,13 +383,48 @@ impl FishDrama3Embedding {
             semantic.push(u8::from(self.ids.is_semantic(row[0])));
         }
         let on = tokens.device();
-        let e = Self::gather(tokens, &Tensor::from_vec(mains, n, on)?)?;
-        let cb = Self::gather(codebook_table, &Tensor::from_vec(codes, n, on)?)?;
-        let root_two = Tensor::from_slice(&[std::f32::consts::SQRT_2], 1, on)?;
-        let mixed = (&e + cb)?.broadcast_div(&root_two)?;
+        let (e, mixed) = Self::mix(
+            tokens,
+            codebook_table,
+            &Tensor::from_vec(mains, n, on)?,
+            &Tensor::from_vec(codes, n, on)?,
+        )?;
         let mask = Tensor::from_vec(semantic, (n, 1), on)?.broadcast_as((n, self.hidden))?;
         super::device::count_uploads(4);
         Ok(mask.where_cond(&mixed, &e)?.to_device(device)?)
+    }
+
+    /// The trunk rows of semantic frames whose tokens are already on the
+    /// device: `mains` `[n]` U32 semantic ids and `codes` `[n]` U32 their
+    /// codebook-1 codes (each below the codebook vocabulary), exactly as
+    /// [`Self::embed_tensor`] embeds them.
+    pub(crate) fn embed_semantic_device(&self, mains: &Tensor, codes: &Tensor) -> Result<Tensor> {
+        let Tables::Device {
+            tokens,
+            codebook_table,
+        } = &self.tables
+        else {
+            return Err(Error::InferenceError(
+                "the embedding's tables are on the host".into(),
+            ));
+        };
+        super::device::count_uploads(1);
+        Ok(Self::mix(tokens, codebook_table, mains, codes)?.1)
+    }
+
+    /// `(E[main], (E[main] + CB[code]) / sqrt(2))` gathered on the tables'
+    /// device; `codes` index the codebook-1 block (its rows come first).
+    fn mix(
+        tokens: &Tensor,
+        codebook_table: &Tensor,
+        mains: &Tensor,
+        codes: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let e = Self::gather(tokens, mains)?;
+        let cb = Self::gather(codebook_table, codes)?;
+        let root_two = Tensor::from_slice(&[std::f32::consts::SQRT_2], 1, tokens.device())?;
+        let mixed = (&e + cb)?.broadcast_div(&root_two)?;
+        Ok((e, mixed))
     }
 }
 

@@ -16,7 +16,7 @@
 //! | Paged KV (both domains) | F16, F32 after a breached load-time probe | BF16 |
 //! | Embedding and code tables | F16 device tables, gathered to F32 | BF16 device tables |
 //! | Logits | F16 projections widened to F32 | BF16 projections into F32 |
-//! | Sampling | on the device, two readbacks a frame (`sampling.rs`) | the same |
+//! | Sampling | on the device, one readback a frame on the fused path, two on the composed one (`sampling.rs`) | the same |
 //!
 //! Each backend keeps its own load-time checks: `metal::self_check` (the
 //! F16 range probe, FP8, RoPE) and `cuda::self_check` (FP8, RoPE, and the
@@ -395,12 +395,15 @@ static STEP_TRUNK_US: AtomicU64 = AtomicU64::new(0);
 /// The three parts of a decode step, timed on the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StepSection {
-    /// The main head, its ranks and races, and readback 1. On a GPU it also
-    /// waits for the previous step's trunk.
+    /// The main head, its ranks and races, and on the two-readback path
+    /// readback 1 (on a GPU it also waits for the previous step's trunk);
+    /// on the one-readback path RAS too, enqueued.
     MainDraw,
-    /// The 13 tower layers, the 9 head draws and readback 2.
+    /// The 13 tower layers and the 9 head draws, with readback 2 on the
+    /// two-readback path.
     Tower,
-    /// The frame embedding and the 40 trunk layers, enqueued.
+    /// The frame embedding and the 40 trunk layers, enqueued; on the
+    /// one-readback path also the frame's readback and commits.
     Trunk,
 }
 

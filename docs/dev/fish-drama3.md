@@ -161,7 +161,7 @@ eos; otherwise the request fails with `frame_limit`, never a cut-off take.
 | Embedding and code tables | BF16 host tables | F16 device tables | BF16 device tables |
 | Residual stream | F32 | F32 | BF16 |
 | Paged KV (both domains) | F32 | F16 (F32 after a breached probe) | BF16 |
-| Sampling | Host | Device, two readbacks a frame | Device, two readbacks a frame |
+| Sampling | Host | Device, one readback a frame | Device, one readback a frame |
 | Codec | F32 | F32 | F32 |
 | Resident total | about 37 GiB | about 37 GiB | about 37 GiB |
 
@@ -209,6 +209,17 @@ other families (`crates/izwi-core/src/kernels/`):
   a flat distribution) is bounded by mass on the device, so no draw falls
   back to the host.
 
+On the fused path a frame reads back once. The main draws, RAS (the
+retry replaces a semantic first draw already in the row's 16-token window,
+uploaded per frame), the tower and the trunk all run on the device for every
+row under its frame limit, the next trunk row is embedded from the device's
+token and codebook-1 code, and every pick, chosen candidate, code and
+non-finite count then comes back in one transfer. The tower and trunk
+appends and DeltaNet states stay prepared until then: a row that drew eos
+has its step aborted (one wasted step), and the host replays RAS to check
+the device's choice. Frames, noise and samplers are those of the
+two-readback path bit for bit.
+
 The load compares the kernels on the device with their CPU forms at the
 model's widths and dtype mixes (relative L2 at most 1e-3; the race must
 pick exactly as its CPU form does), and
@@ -236,12 +247,14 @@ pending coordinator (`fish_drama3_pending.rs`). The stages:
 | `tts.codec.fish_drama3.scalar` | Flush; the PCM is frames × 2,048 samples |
 
 The backend report's fast-path counters time each decode step's three parts
-on the host (`step_main_draw_ms_total`: the main head, its draws and
-readback 1, which on a GPU also waits for the previous step's trunk;
-`step_tower_ms_total`: the tower, its heads and readback 2;
-`step_trunk_ms_total`: the embedding and the trunk, enqueued) and count the
-step's host-to-device uploads (`step_uploads_total`), beside the resident
-sampler's frames and readbacks.
+on the host and count the step's host-to-device uploads
+(`step_uploads_total`), beside the resident sampler's frames and readbacks.
+On the one-readback frame `step_main_draw_ms_total` is the main head, its
+draws and RAS, `step_tower_ms_total` the tower and its heads, and
+`step_trunk_ms_total` the embedding, the trunk, the frame's readback (where
+the host waits for the GPU) and the commits. With the fused path off,
+`step_main_draw_ms_total` ends with readback 1 and `step_tower_ms_total`
+with readback 2.
 
 Every model quantum runs inside the family's quantum checkpoint, and the
 DeltaNet tensors move through the engine's transactional tensor arena, so an
@@ -502,8 +515,9 @@ load:
 - `IZWI_FISH_DRAMA3_DTYPE`: the activation dtype, f16 or f32 on Metal (f32
   also stores the paged KV in F32 and runs every MoE layer's host loop), bf16
   on CUDA, f32 on CPU. Anything else fails the load.
-- `IZWI_FISH_DRAMA3_FUSED_DECODE`: the fused trunk, tower and draws on
-  Metal and CUDA (default `true`); any false value runs the eager chain.
+- `IZWI_FISH_DRAMA3_FUSED_DECODE`: the fused trunk, tower and draws and
+  the one-readback frame on Metal and CUDA (default `true`); any false value
+  runs the eager chain with two readbacks a frame.
 - `IZWI_FISH_DRAMA3_MOE_BACKEND`: `fused` (default) or `loop`, on Metal and
   CUDA.
 - `IZWI_FISH_DRAMA3_NATIVE_BATCHING`: two rows at once on Metal instead of
