@@ -30,6 +30,8 @@ pub(crate) mod metal_paged_gqa;
 pub(crate) mod metal_qwen36moe;
 pub mod moe_relu2;
 pub mod numeric_check;
+pub mod qk_norm_rope;
+pub mod residual_norm;
 
 use crate::error::Error;
 use candle_core::{Device, Tensor};

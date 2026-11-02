@@ -14,6 +14,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=src/kernels/cuda/mamba2.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/moe_relu2.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/row_gemv.cu");
+    println!("cargo:rerun-if-changed=src/kernels/cuda/residual_norm.cu");
+    println!("cargo:rerun-if-changed=src/kernels/cuda/qk_norm_rope.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return Ok(());
@@ -40,6 +42,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "src/kernels/cuda/mamba2.cu",
             "src/kernels/cuda/moe_relu2.cu",
             "src/kernels/cuda/row_gemv.cu",
+            "src/kernels/cuda/residual_norm.cu",
+            "src/kernels/cuda/qk_norm_rope.cu",
         ])
         .arg("-std=c++17")
         .arg("-O3")

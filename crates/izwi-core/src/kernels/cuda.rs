@@ -3461,6 +3461,18 @@ pub(crate) fn cuda_ptx_moe_relu2() -> &'static str {
     cuda_ptx::MOE_RELU2
 }
 
+/// The PTX of `kernels/cuda/residual_norm.cu` (`kernels::residual_norm`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_residual_norm() -> &'static str {
+    cuda_ptx::RESIDUAL_NORM
+}
+
+/// The PTX of `kernels/cuda/qk_norm_rope.cu` (`kernels::qk_norm_rope`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_qk_norm_rope() -> &'static str {
+    cuda_ptx::QK_NORM_ROPE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
