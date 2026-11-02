@@ -14,16 +14,25 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+/// The client's fence for one chunk of speech. Dense diffusion TTS can
+/// legitimately exceed five minutes on resource-constrained local Metal
+/// devices; keep a finite fence, but leave room for the server's own
+/// configured request deadline.
 const TTS_REQUEST_TIMEOUT: Duration = Duration::from_secs(900);
 
 pub struct TtsArgs {
-    pub text: String,
+    /// None with a script.
+    pub text: Option<String>,
     pub model: String,
     pub speaker: Option<String>,
     pub saved_voice_id: Option<String>,
     pub reference_audio: Option<PathBuf>,
     pub reference_text: Option<String>,
     pub reference_text_file: Option<PathBuf>,
+    pub speaker_references: Vec<SpeakerReferenceArg>,
+    pub speaker_voices: Vec<SpeakerVoiceArg>,
+    pub script: Option<PathBuf>,
+    pub seed: Option<u64>,
     pub instructions: Option<String>,
     pub output: Option<PathBuf>,
     pub format: AudioFormat,
@@ -36,6 +45,149 @@ pub struct TtsArgs {
     pub min_p: Option<f32>,
     pub stream: bool,
     pub play: bool,
+}
+
+/// `--speaker-reference N=AUDIO[:TRANSCRIPT_FILE]`: a clip and its
+/// transcript file for dialogue speaker N.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeakerReferenceArg {
+    pub speaker: usize,
+    pub audio: PathBuf,
+    pub transcript: Option<PathBuf>,
+}
+
+impl SpeakerReferenceArg {
+    /// Parses `N=AUDIO[:TRANSCRIPT_FILE]`. The first colon after AUDIO's
+    /// start separates the two paths, so AUDIO may not hold a colon past a
+    /// Windows drive letter (`C:\`).
+    pub fn parse(value: &str) -> std::result::Result<Self, String> {
+        let (speaker, paths) = split_speaker(value, "N=AUDIO[:TRANSCRIPT_FILE]")?;
+        let drive = paths.len() >= 3
+            && paths.as_bytes()[0].is_ascii_alphabetic()
+            && paths.as_bytes()[1] == b':'
+            && matches!(paths.as_bytes()[2], b'\\' | b'/');
+        let start = if drive { 2 } else { 0 };
+        let (audio, transcript) = match paths[start..].find(':') {
+            Some(offset) => {
+                let at = start + offset;
+                (&paths[..at], Some(&paths[at + 1..]))
+            }
+            None => (paths, None),
+        };
+        if audio.is_empty() || transcript.is_some_and(str::is_empty) {
+            return Err(format!(
+                "`{value}` needs an audio path, and a transcript file after `:` if any"
+            ));
+        }
+        Ok(Self {
+            speaker,
+            audio: PathBuf::from(audio),
+            transcript: transcript.map(PathBuf::from),
+        })
+    }
+}
+
+/// `--speaker-voice N=SAVED_ID`: a saved voice for dialogue speaker N.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeakerVoiceArg {
+    pub speaker: usize,
+    pub voice_id: String,
+}
+
+impl SpeakerVoiceArg {
+    pub fn parse(value: &str) -> std::result::Result<Self, String> {
+        let (speaker, voice_id) = split_speaker(value, "N=SAVED_ID")?;
+        let voice_id = voice_id.trim();
+        if voice_id.is_empty() {
+            return Err(format!("`{value}` needs a saved voice ID after `=`"));
+        }
+        Ok(Self {
+            speaker,
+            voice_id: voice_id.to_string(),
+        })
+    }
+}
+
+/// `N=REST` as the speaker number and REST. The server checks N against
+/// the model's speakers.
+fn split_speaker<'a>(value: &'a str, shape: &str) -> std::result::Result<(usize, &'a str), String> {
+    let (speaker, rest) = value
+        .split_once('=')
+        .ok_or_else(|| format!("`{value}` is not {shape}"))?;
+    let speaker = speaker
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{value}`: the speaker must be a number such as 0 or 1"))?;
+    Ok((speaker, rest))
+}
+
+/// A `--script` file's lines: one `{"speaker": N, "text": "..."}` object
+/// per non-blank line.
+fn read_script(path: &Path) -> Result<Vec<Value>> {
+    let contents = fs::read_to_string(path).map_err(CliError::Io)?;
+    let mut lines = Vec::new();
+    for (number, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let invalid = |problem: &str| {
+            CliError::InvalidInput(format!(
+                "{} line {}: {problem}; expected {{\"speaker\": N, \"text\": \"...\"}}",
+                path.display(),
+                number + 1
+            ))
+        };
+        let value: Value = serde_json::from_str(line).map_err(|_| invalid("not JSON"))?;
+        let speaker = value
+            .get("speaker")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| invalid("no speaker number"))?;
+        let text = value
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("no text"))?;
+        lines.push(json!({ "speaker": speaker, "text": text }));
+    }
+    if lines.is_empty() {
+        return Err(CliError::InvalidInput(format!(
+            "{} has no script lines",
+            path.display()
+        )));
+    }
+    Ok(lines)
+}
+
+/// The text the server speaks for `script`, as it renders it, for the
+/// timeout's chunk count; `None` when the server will refuse it anyway.
+fn rendered_script(script: &[Value]) -> Option<String> {
+    let lines = script
+        .iter()
+        .map(|line| {
+            Some((
+                usize::try_from(line["speaker"].as_u64()?).ok()?,
+                line["text"].as_str()?,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    izwi_core::runtime_models::architectures::fish_drama3::prompt::render_script(&lines).ok()
+}
+
+/// The client's fence for a request: [`TTS_REQUEST_TIMEOUT`] per chunk the
+/// server will speak. A model that speaks long text as a chunk session
+/// (Fish Audio Drama 3) runs its chunks one after another, and the CLI
+/// counts them with the model's own chunker, as the server does; every
+/// other model keeps one fence for the request.
+fn tts_request_timeout(model: &str, text: &str) -> Duration {
+    let chunks = izwi_core::parse_tts_model_variant(model)
+        .ok()
+        .filter(|variant| variant.continues_speech_across_chunks())
+        .map_or(1, |_| {
+            izwi_core::runtime_models::architectures::fish_drama3::chunking::plan_chunks(
+                text, false,
+            )
+            .len()
+        });
+    TTS_REQUEST_TIMEOUT.saturating_mul(u32::try_from(chunks.max(1)).unwrap_or(u32::MAX))
 }
 
 /// Model-specific speech controls; each is sent only when set, and the
@@ -56,6 +208,10 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         reference_audio,
         reference_text,
         reference_text_file,
+        speaker_references,
+        speaker_voices,
+        script,
+        seed,
         instructions,
         output,
         format,
@@ -70,18 +226,21 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         play,
     } = args;
 
-    // Read text from stdin if "-"
-    let text = if text == "-" {
-        let mut buffer = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buffer)
-            .map_err(CliError::Io)?;
-        buffer
-    } else {
-        text
+    // A script's lines, or the text (from stdin if "-").
+    let script = script.as_deref().map(read_script).transpose()?;
+    let text = match (&script, text) {
+        (Some(script), _) => rendered_script(script).unwrap_or_default(),
+        (None, Some(text)) if text == "-" => {
+            let mut buffer = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buffer)
+                .map_err(CliError::Io)?;
+            buffer
+        }
+        (None, text) => text.unwrap_or_default(),
     };
 
-    if text.trim().is_empty() {
+    if script.is_none() && text.trim().is_empty() {
         return Err(CliError::InvalidInput("Text cannot be empty".to_string()));
     }
     reject_unsupported_cli_stream(&format, stream)?;
@@ -92,6 +251,7 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
     }
 
     theme.step(1, 2, &format!("Generating speech with '{}'...", model));
+    let timeout = tts_request_timeout(&model, &text);
 
     let request_body = build_request_body(BuildRequestArgs {
         model,
@@ -101,6 +261,12 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         reference_audio,
         reference_text,
         reference_text_file,
+        dialogue: DialogueArgs {
+            script,
+            speaker_references,
+            speaker_voices,
+        },
+        seed,
         instructions,
         format: &format,
         speed,
@@ -115,10 +281,7 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         stream,
     })?;
 
-    // Dense diffusion TTS can legitimately exceed five minutes on
-    // resource-constrained local Metal devices. Keep a finite client fence,
-    // but leave enough room for the server's own configured request deadline.
-    let client = http::client(Some(TTS_REQUEST_TIMEOUT))?;
+    let client = http::client(Some(timeout))?;
 
     let start_time = Instant::now();
     let progress = style::spinner(if stream {
@@ -287,6 +450,15 @@ fn format_label(format: &AudioFormat) -> &'static str {
     }
 }
 
+/// A dialogue's parts: its script lines (sent instead of `input`) and its
+/// reference voices per speaker.
+#[derive(Debug, Default)]
+struct DialogueArgs {
+    script: Option<Vec<Value>>,
+    speaker_references: Vec<SpeakerReferenceArg>,
+    speaker_voices: Vec<SpeakerVoiceArg>,
+}
+
 struct BuildRequestArgs<'a> {
     model: String,
     text: String,
@@ -295,6 +467,8 @@ struct BuildRequestArgs<'a> {
     reference_audio: Option<PathBuf>,
     reference_text: Option<String>,
     reference_text_file: Option<PathBuf>,
+    dialogue: DialogueArgs,
+    seed: Option<u64>,
     instructions: Option<String>,
     format: &'a AudioFormat,
     speed: Option<f32>,
@@ -326,11 +500,18 @@ fn build_request_body(args: BuildRequestArgs<'_>) -> Result<Value> {
 
     let mut request_body = json!({
         "model": args.model,
-        "input": args.text,
         // A stream carries raw 16-bit PCM chunks, assembled into a WAV.
         "response_format": if args.stream { "pcm" } else { format_label(args.format) },
         "stream": args.stream,
     });
+    let dialogue = args.dialogue;
+    match dialogue.script {
+        Some(script) => request_body["script"] = Value::Array(script),
+        None => request_body["input"] = Value::String(args.text),
+    }
+    if let Some(seed) = args.seed {
+        request_body["seed"] = json!(seed);
+    }
     // Unset sampling and speed keep the model's own defaults.
     if let Some(speed) = args.speed {
         request_body["speed"] = json!(speed);
@@ -358,15 +539,57 @@ fn build_request_body(args: BuildRequestArgs<'_>) -> Result<Value> {
     if let Some(speaker) = normalize_optional_text(args.speaker) {
         request_body["voice"] = Value::String(speaker);
     }
-    if let Some(saved_voice_id) = normalize_optional_text(args.saved_voice_id) {
-        request_body["saved_voice_id"] = Value::String(saved_voice_id);
-    }
-    if let Some(reference_audio) = args.reference_audio {
-        let audio = fs::read(&reference_audio).map_err(CliError::Io)?;
-        request_body["reference_audio"] = Value::String(STANDARD.encode(audio));
-    }
-    if let Some(reference_text) = reference_text {
-        request_body["reference_text"] = Value::String(reference_text);
+    let saved_voice_id = normalize_optional_text(args.saved_voice_id);
+    let reference_audio = args
+        .reference_audio
+        .map(|path| fs::read(path).map(|audio| STANDARD.encode(audio)))
+        .transpose()
+        .map_err(CliError::Io)?;
+    if dialogue.speaker_references.is_empty() && dialogue.speaker_voices.is_empty() {
+        if let Some(saved_voice_id) = saved_voice_id {
+            request_body["saved_voice_id"] = Value::String(saved_voice_id);
+        }
+        if let Some(reference_audio) = reference_audio {
+            request_body["reference_audio"] = Value::String(reference_audio);
+        }
+        if let Some(reference_text) = reference_text {
+            request_body["reference_text"] = Value::String(reference_text);
+        }
+    } else {
+        // Per-speaker references: the single-reference flags join them as
+        // speaker 0.
+        let mut references = Vec::new();
+        if let Some(saved_voice_id) = saved_voice_id {
+            references.push(json!({ "speaker": 0, "saved_voice_id": saved_voice_id }));
+        }
+        if let Some(audio) = reference_audio {
+            let mut reference = json!({ "speaker": 0, "audio": audio });
+            if let Some(text) = reference_text {
+                reference["text"] = Value::String(text);
+            }
+            references.push(reference);
+        }
+        for reference in &dialogue.speaker_references {
+            let audio = fs::read(&reference.audio).map_err(CliError::Io)?;
+            let mut entry = json!({
+                "speaker": reference.speaker,
+                "audio": STANDARD.encode(audio),
+            });
+            if let Some(path) = &reference.transcript {
+                let text = fs::read_to_string(path).map_err(CliError::Io)?;
+                if let Some(text) = normalize_optional_text(Some(text)) {
+                    entry["text"] = Value::String(text);
+                }
+            }
+            references.push(entry);
+        }
+        for voice in &dialogue.speaker_voices {
+            references.push(json!({
+                "speaker": voice.speaker,
+                "saved_voice_id": voice.voice_id,
+            }));
+        }
+        request_body["references"] = Value::Array(references);
     }
     if let Some(instructions) = normalize_optional_text(args.instructions) {
         request_body["instructions"] = Value::String(instructions);
@@ -522,6 +745,8 @@ mod tests {
                 language: None,
                 reference_language: None,
                 controls: SpeechControls::default(),
+                dialogue: DialogueArgs::default(),
+                seed: None,
                 stream: false,
             })
             .expect("request body")
@@ -590,6 +815,8 @@ mod tests {
             language: None,
             reference_language: None,
             controls: SpeechControls::default(),
+            dialogue: DialogueArgs::default(),
+            seed: None,
             stream: true,
         })
         .expect("request body");
@@ -618,6 +845,8 @@ mod tests {
                 cfg_weight: Some(0.0),
                 min_p: None,
             },
+            dialogue: DialogueArgs::default(),
+            seed: None,
             stream: false,
         })
         .expect("request body");
@@ -643,6 +872,8 @@ mod tests {
             language: Some("hi".to_string()),
             reference_language: Some(" en ".to_string()),
             controls: SpeechControls::default(),
+            dialogue: DialogueArgs::default(),
+            seed: None,
             stream: false,
         })
         .expect("request body");
@@ -667,6 +898,8 @@ mod tests {
             language: None,
             reference_language: None,
             controls: SpeechControls::default(),
+            dialogue: DialogueArgs::default(),
+            seed: None,
             stream: false,
         })
         .expect("request body");
@@ -696,6 +929,8 @@ mod tests {
             language: None,
             reference_language: None,
             controls: SpeechControls::default(),
+            dialogue: DialogueArgs::default(),
+            seed: None,
             stream: false,
         })
         .expect("request body");
@@ -726,12 +961,207 @@ mod tests {
             language: None,
             reference_language: None,
             controls: SpeechControls::default(),
+            dialogue: DialogueArgs::default(),
+            seed: None,
             stream: false,
         })
         .expect("request body");
 
         assert_eq!(body["reference_audio"], "UklGRg==");
         assert!(body.get("reference_text").is_none());
+    }
+
+    #[test]
+    fn speaker_references_parse_a_speaker_audio_and_transcript_file() {
+        let parsed = SpeakerReferenceArg::parse("1=voices/b.wav:voices/b.txt").unwrap();
+        assert_eq!(
+            parsed,
+            SpeakerReferenceArg {
+                speaker: 1,
+                audio: PathBuf::from("voices/b.wav"),
+                transcript: Some(PathBuf::from("voices/b.txt")),
+            }
+        );
+        let alone = SpeakerReferenceArg::parse("0=a.wav").unwrap();
+        assert_eq!((alone.speaker, alone.transcript), (0, None));
+        // A Windows drive letter's colon belongs to the path.
+        let windows = SpeakerReferenceArg::parse(r"2=C:\v\a.wav:D:\t\a.txt").unwrap();
+        assert_eq!(windows.audio, PathBuf::from(r"C:\v\a.wav"));
+        assert_eq!(windows.transcript, Some(PathBuf::from(r"D:\t\a.txt")));
+        let windows = SpeakerReferenceArg::parse(r"2=C:\v\a.wav").unwrap();
+        assert_eq!(
+            (windows.audio, windows.transcript),
+            (PathBuf::from(r"C:\v\a.wav"), None)
+        );
+        for bad in ["a.wav", "x=a.wav", "=a.wav", "1=", "1=:t.txt", "1=a.wav:"] {
+            assert!(SpeakerReferenceArg::parse(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            SpeakerVoiceArg::parse("3= voice-1 ").unwrap(),
+            SpeakerVoiceArg {
+                speaker: 3,
+                voice_id: "voice-1".into(),
+            }
+        );
+        for bad in ["voice-1", "1=", "one=voice"] {
+            assert!(SpeakerVoiceArg::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_script_file_is_json_lines_of_speakers_and_text() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("scene.jsonl");
+        fs::write(
+            &path,
+            "{\"speaker\": 0, \"text\": \"Ready?\"}\n\n{\"speaker\": 1, \"text\": \"Always. [laughs]\", \"note\": 1}\n",
+        )
+        .unwrap();
+        let script = read_script(&path).unwrap();
+        assert_eq!(
+            script,
+            [
+                json!({"speaker": 0, "text": "Ready?"}),
+                json!({"speaker": 1, "text": "Always. [laughs]"}),
+            ]
+        );
+        assert_eq!(
+            rendered_script(&script).as_deref(),
+            Some("<|speaker:0|> Ready?\n<|speaker:1|> Always. [laughs]")
+        );
+        for (contents, problem) in [
+            ("{\"speaker\": 0}", "line 1: no text"),
+            ("{\"text\": \"Hi.\"}", "line 1: no speaker"),
+            (
+                "{\"speaker\": 0, \"text\": \"Hi.\"}\nnope",
+                "line 2: not JSON",
+            ),
+            ("\n \n", "no script lines"),
+        ] {
+            fs::write(&path, contents).unwrap();
+            let message = read_script(&path).unwrap_err().to_string();
+            assert!(message.contains(problem), "{message}");
+        }
+    }
+
+    /// Per-speaker flags send `references`, which the single-reference
+    /// flags join as speaker 0; a script is sent instead of `input`, with
+    /// the seed.
+    #[test]
+    fn dialogue_flags_send_references_and_a_script() {
+        let dir = tempdir().expect("temp dir");
+        let audio = dir.path().join("a.wav");
+        fs::write(&audio, b"RIFF").unwrap();
+        let transcript = dir.path().join("b.txt");
+        fs::write(&transcript, " Hello there. \n").unwrap();
+        let script = vec![json!({"speaker": 0, "text": "Hi."})];
+        let body = build_request_body(BuildRequestArgs {
+            model: "FishAudio-Drama-3".to_string(),
+            text: "<|speaker:0|> Hi.".to_string(),
+            speaker: None,
+            saved_voice_id: None,
+            reference_audio: Some(audio.clone()),
+            reference_text: Some("Hi.".to_string()),
+            reference_text_file: None,
+            dialogue: DialogueArgs {
+                script: Some(script.clone()),
+                speaker_references: vec![SpeakerReferenceArg {
+                    speaker: 1,
+                    audio: audio.clone(),
+                    transcript: Some(transcript),
+                }],
+                speaker_voices: vec![SpeakerVoiceArg {
+                    speaker: 2,
+                    voice_id: "voice-2".into(),
+                }],
+            },
+            seed: Some(7),
+            instructions: None,
+            format: &AudioFormat::Wav,
+            speed: None,
+            temperature: None,
+            language: None,
+            reference_language: None,
+            controls: SpeechControls::default(),
+            stream: false,
+        })
+        .expect("request body");
+        assert!(body.get("input").is_none());
+        assert_eq!(body["script"], json!(script));
+        assert_eq!(body["seed"], 7);
+        for field in ["reference_audio", "reference_text", "saved_voice_id"] {
+            assert!(body.get(field).is_none(), "{field}");
+        }
+        assert_eq!(
+            body["references"],
+            json!([
+                {"speaker": 0, "audio": "UklGRg==", "text": "Hi."},
+                {"speaker": 1, "audio": "UklGRg==", "text": "Hello there."},
+                {"speaker": 2, "saved_voice_id": "voice-2"},
+            ])
+        );
+        // A saved voice for speaker 0 joins them too.
+        let body = build_request_body(BuildRequestArgs {
+            model: "FishAudio-Drama-3".to_string(),
+            text: "Hi.".to_string(),
+            speaker: None,
+            saved_voice_id: Some("voice-0".into()),
+            reference_audio: None,
+            reference_text: None,
+            reference_text_file: None,
+            dialogue: DialogueArgs {
+                speaker_voices: vec![SpeakerVoiceArg {
+                    speaker: 1,
+                    voice_id: "voice-1".into(),
+                }],
+                ..DialogueArgs::default()
+            },
+            seed: None,
+            instructions: None,
+            format: &AudioFormat::Wav,
+            speed: None,
+            temperature: None,
+            language: None,
+            reference_language: None,
+            controls: SpeechControls::default(),
+            stream: false,
+        })
+        .expect("request body");
+        assert_eq!(body["input"], "Hi.");
+        assert!(body.get("seed").is_none() && body.get("saved_voice_id").is_none());
+        assert_eq!(
+            body["references"],
+            json!([
+                {"speaker": 0, "saved_voice_id": "voice-0"},
+                {"speaker": 1, "saved_voice_id": "voice-1"},
+            ])
+        );
+    }
+
+    /// Fish Audio Drama 3 speaks its chunks one after another: the fence is
+    /// 900 s per chunk its chunker plans. Other models keep one fence.
+    #[test]
+    fn the_request_timeout_scales_with_the_planned_chunks() {
+        use izwi_core::runtime_models::architectures::fish_drama3::chunking::plan_chunks;
+        let short = "Hello there.";
+        assert_eq!(
+            tts_request_timeout("FishAudio-Drama-3", short),
+            TTS_REQUEST_TIMEOUT
+        );
+        let long = "one two three hello world. ".repeat(30);
+        let chunks = plan_chunks(&long, false).len();
+        assert!(chunks >= 3, "{chunks}");
+        assert_eq!(
+            tts_request_timeout("FishAudio-Drama-3", &long),
+            TTS_REQUEST_TIMEOUT * chunks as u32
+        );
+        for model in ["Kokoro-82M", "FishAudio-S2-Pro", "not-a-model"] {
+            assert_eq!(
+                tts_request_timeout(model, &long),
+                TTS_REQUEST_TIMEOUT,
+                "{model}"
+            );
+        }
     }
 
     #[test]
@@ -751,6 +1181,8 @@ mod tests {
             language: None,
             reference_language: None,
             controls: SpeechControls::default(),
+            dialogue: DialogueArgs::default(),
+            seed: None,
             stream: false,
         })
         .expect_err("a transcript without audio should fail");
