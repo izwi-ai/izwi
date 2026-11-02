@@ -1341,6 +1341,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "The L2 reference JSON generate_nemotron_transcribe_reference.py wrote, for the Nemotron 3.5 Transcribe parity test.",
     ),
     CoreEnvVar::new(
+        "IZWI_NEMOTRON_TRANSCRIBE_SEGMENT_GRAPHS",
+        Flag,
+        "true",
+        Load,
+        "On CUDA, Nemotron 3.5 Transcribe's fused decode step replays a CUDA graph for each stretch of Mamba and MoE layers between attention layers (captured per row count up to 4, checked bit for bit against the eager stretch on two steps, off for the process on any mismatch). Any false value, or `IZWI_CUDA_DECODE_GRAPHS=off`, runs every stretch eagerly; `decode_graphs` in the diagnostics reports captures, replays and why the graphs are off.",
+    ),
+    CoreEnvVar::new(
         "IZWI_NO_UI",
         Flag,
         "false (UI enabled)",

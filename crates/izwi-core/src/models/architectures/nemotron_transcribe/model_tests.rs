@@ -369,6 +369,34 @@ fn the_fused_decode_transcribes_as_the_eager_one() {
     assert_eq!(fused.generated_tokens, eager.generated_tokens);
 }
 
+/// On CUDA the fused step's stretches are captured, verified and replayed,
+/// and the transcript is the eager stretches' own.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_decode_graphs_transcribe_as_the_eager_stretches() {
+    let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+        return;
+    };
+    let dir = temp_checkpoint();
+    let mut model = NemotronTranscribeModel::load_on(dir.path(), None, &device).unwrap();
+    let audio = test_audio(2.5, 3);
+    let run = |model: &NemotronTranscribeModel| {
+        let mut cache = caches(&device, model, 1, 1024).remove(0);
+        model
+            .transcribe_with_cache(&audio, request(16), &mut cache, 64)
+            .unwrap()
+    };
+    let graphed = run(&model);
+    let graphs = model.diagnostics_summary()["decode_graphs"].clone();
+    assert!(graphs["off"].is_null(), "{graphs}");
+    assert!(graphs["verified"].as_u64().unwrap() >= 4, "{graphs}");
+    assert!(graphs["replays"].as_u64().unwrap() > 0, "{graphs}");
+    model.decoder_mut().disable_graphs();
+    let eager = run(&model);
+    assert_eq!(graphed.transcript, eager.transcript);
+    assert_eq!(graphed.generated_tokens, eager.generated_tokens);
+}
+
 /// On Metal the load-time kernel check passes, so decode runs fused, and a
 /// row decodes the same alone and beside another.
 #[cfg(feature = "metal")]

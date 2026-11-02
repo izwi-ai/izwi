@@ -9,6 +9,7 @@
 //! over its own paged KV.
 
 pub mod attention;
+mod graphs;
 pub mod mamba;
 pub mod moe;
 pub mod state;
@@ -39,6 +40,50 @@ enum Mixer {
 struct Layer {
     norm: Tensor,
     mixer: Mixer,
+}
+
+/// One piece of the fused decode step.
+#[derive(Debug, PartialEq)]
+enum Piece {
+    /// Layers `layers`, none of them attention, as one pure function of the
+    /// residual, the normed hidden and their Mamba states. The first stretch
+    /// starts from the embeddings with layer 0's norm; the tail ends with the
+    /// LM head and the device greedy pick.
+    Stretch {
+        layers: std::ops::Range<usize>,
+        first: bool,
+        tail: bool,
+    },
+    /// Attention layer `index`, eager: it writes and reads the paged KV.
+    Attention(usize),
+}
+
+/// The fused step's pieces over layers whose `attention` flags are given:
+/// maximal stretches between attention layers, always a first and a tail
+/// stretch (either may hold no layer).
+fn pieces(attention: impl ExactSizeIterator<Item = bool>) -> Vec<Piece> {
+    let layers = attention.len();
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    for (i, attention) in attention.enumerate() {
+        if attention {
+            if start < i || pieces.is_empty() {
+                pieces.push(Piece::Stretch {
+                    layers: start..i,
+                    first: pieces.is_empty(),
+                    tail: false,
+                });
+            }
+            pieces.push(Piece::Attention(i));
+            start = i + 1;
+        }
+    }
+    pieces.push(Piece::Stretch {
+        layers: start..layers,
+        first: pieces.is_empty(),
+        tail: true,
+    });
+    pieces
 }
 
 /// The decoder's embedding table, kept BF16 on the host: a span gathers its
@@ -124,6 +169,9 @@ pub struct NemotronDecoder {
     attention_layers: Vec<u32>,
     device: Device,
     path: DecodePath,
+    pieces: Vec<Piece>,
+    /// CUDA graphs of the fused step's stretches, or why there are none.
+    graphs: std::result::Result<graphs::StepGraphs, String>,
 }
 
 impl NemotronDecoder {
@@ -205,8 +253,23 @@ impl NemotronDecoder {
         if let DecodePath::Eager { reason } = &path {
             tracing::warn!("Nemotron 3.5 Transcribe decodes eagerly: {reason}");
         }
+        let pieces = pieces(
+            layers
+                .iter()
+                .map(|layer| matches!(layer.mixer, Mixer::Attention { .. })),
+        );
+        let stretches = pieces
+            .iter()
+            .filter(|piece| matches!(piece, Piece::Stretch { .. }))
+            .count();
+        let graphs = match &path {
+            DecodePath::Fused { .. } => graphs::StepGraphs::resolve(device, stretches),
+            DecodePath::Eager { .. } => Err("the decode runs eagerly".into()),
+        };
         Ok(Self {
             path,
+            pieces,
+            graphs,
             embeddings: HostEmbeddings {
                 hidden: d.hidden,
                 vocab: d.vocab,
@@ -237,6 +300,20 @@ impl NemotronDecoder {
     /// How decode steps run.
     pub fn decode_path(&self) -> &DecodePath {
         &self.path
+    }
+
+    /// Runs every stretch eagerly, for tests that compare.
+    #[cfg(test)]
+    pub(crate) fn disable_graphs(&mut self) {
+        self.graphs = Err("disabled by a test".into());
+    }
+
+    /// The stretch graphs' state and counters.
+    pub fn graph_diagnostics(&self) -> serde_json::Value {
+        match &self.graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        }
     }
 
     fn fused(&self) -> bool {
@@ -470,17 +547,13 @@ impl NemotronDecoder {
             .collect::<candle_core::Result<Vec<_>>>()?;
         let result = (|| -> Result<Vec<(u32, f32)>> {
             let x = self.embeddings.gather(&ids, &self.device)?;
-            let hidden = if self.fused() {
-                self.step_layers_fused(x, rows, &mut prepared, &mut conv, &mut ssm)?
-            } else {
-                self.step_layers_eager(x, rows, &mut prepared, &mut conv, &mut ssm)?
-            };
             if self.fused() {
-                // The head in its own dtype straight into the device pick.
-                Ok(crate::kernels::greedy::greedy(
-                    &self.lm_head.forward_native(&hidden)?,
-                )?)
+                let picks = self.step_fused(x, rows, &mut prepared, &mut conv, &mut ssm)?;
+                Ok(crate::kernels::greedy::unpack(
+                    &picks.flatten_all()?.to_vec1::<u32>()?,
+                ))
             } else {
+                let hidden = self.step_layers_eager(x, rows, &mut prepared, &mut conv, &mut ssm)?;
                 self.greedy(&hidden)
             }
         })();
@@ -562,10 +635,12 @@ impl NemotronDecoder {
         Ok(candle_nn::ops::rms_norm(&x, &self.norm_f, eps)?)
     }
 
-    /// The decode layers through the fused kernels: each residual add with
-    /// the next norm in one launch, each Mamba mixer through its step
-    /// kernels. Returns the final normed hidden.
-    fn step_layers_fused(
+    /// The decode layers through the fused kernels, piece by piece: each
+    /// residual add with the next norm in one launch, each Mamba mixer
+    /// through its step kernels, the head in its own dtype straight into the
+    /// device greedy pick. On CUDA the stretches replay their graphs.
+    /// Returns the packed picks `[rows, 2]` U32 on the device.
+    fn step_fused(
         &self,
         mut x: Tensor,
         rows: &mut [DecodeRow<'_>],
@@ -574,26 +649,157 @@ impl NemotronDecoder {
         ssm: &mut [Tensor],
     ) -> Result<Tensor> {
         let eps = self.config.norm_eps as f32;
-        let mut h = residual_norm::rms_norm(&x, &self.layers[0].norm, eps, DType::F32)?;
-        for (i, layer) in self.layers.iter().enumerate() {
-            let out = match &layer.mixer {
-                Mixer::Mamba { index, mixer } => {
-                    let (out, c, s) = mixer.forward_step_fused(&h, &conv[*index], &ssm[*index])?;
-                    conv[*index] = c;
-                    ssm[*index] = s;
+        let mut graphs = self
+            .graphs
+            .as_ref()
+            .ok()
+            .and_then(|graphs| graphs.begin(rows.len()));
+        let mut h = None;
+        let mut stretch = 0;
+        for piece in &self.pieces {
+            match piece {
+                Piece::Stretch {
+                    layers,
+                    first,
+                    tail,
+                } => {
+                    let mamba = self.mamba_indices(layers.clone());
+                    let mut inputs = vec![x.clone()];
+                    if !first {
+                        inputs.push(h.clone().ok_or_else(|| {
+                            Error::InferenceError("a decode stretch has no normed input".into())
+                        })?);
+                    }
+                    inputs.extend(mamba.iter().map(|&m| conv[m].clone()));
+                    inputs.extend(mamba.iter().map(|&m| ssm[m].clone()));
+                    let body = |inputs: &[Tensor]| {
+                        self.run_stretch(layers.clone(), *first, *tail, &mamba, inputs)
+                    };
+                    let mut outputs = match graphs.as_mut() {
+                        Some(run) => run.run(stretch, &inputs, &body)?,
+                        None => body(&inputs)?,
+                    }
+                    .into_iter();
+                    let mut next = || {
+                        outputs.next().ok_or_else(|| {
+                            Error::InferenceError(
+                                "a decode stretch returned too few outputs".into(),
+                            )
+                        })
+                    };
+                    if *tail {
+                        let picks = next()?;
+                        for &m in &mamba {
+                            conv[m] = next()?;
+                        }
+                        for &m in &mamba {
+                            ssm[m] = next()?;
+                        }
+                        return Ok(picks);
+                    }
+                    x = next()?;
+                    h = Some(next()?);
+                    for &m in &mamba {
+                        conv[m] = next()?;
+                    }
+                    for &m in &mamba {
+                        ssm[m] = next()?;
+                    }
+                    stretch += 1;
+                }
+                Piece::Attention(i) => {
+                    let Mixer::Attention { index, mixer } = &self.layers[*i].mixer else {
+                        return Err(Error::InferenceError(format!(
+                            "Nemotron 3.5 Transcribe layer {i} is not attention"
+                        )));
+                    };
+                    let normed = h.as_ref().ok_or_else(|| {
+                        Error::InferenceError("an attention layer has no normed input".into())
+                    })?;
+                    let out = self.step_attention(*index, mixer, normed, rows, prepared)?;
+                    let gain = self.layers.get(i + 1).map_or(&self.norm_f, |l| &l.norm);
+                    let (sum, normed) =
+                        residual_norm::add_rms_norm(&x, &out, gain, eps, DType::F32)?;
+                    x = sum;
+                    h = Some(normed);
+                }
+            }
+        }
+        Err(Error::InferenceError(
+            "Nemotron 3.5 Transcribe's decode pieces have no tail".into(),
+        ))
+    }
+
+    /// The Mamba state indices of `layers`, in order.
+    fn mamba_indices(&self, layers: std::ops::Range<usize>) -> Vec<usize> {
+        self.layers[layers]
+            .iter()
+            .filter_map(|layer| match layer.mixer {
+                Mixer::Mamba { index, .. } => Some(index),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One stretch, eagerly: `inputs` are the residual, the normed hidden
+    /// (unless `first`), then the conv and the SSM states of `mamba` (the
+    /// stretch's Mamba indices). Returns the residual and the normed hidden
+    /// (or, at the tail, the packed greedy picks), then the new states.
+    fn run_stretch(
+        &self,
+        layers: std::ops::Range<usize>,
+        first: bool,
+        tail: bool,
+        mamba: &[usize],
+        inputs: &[Tensor],
+    ) -> Result<Vec<Tensor>> {
+        let eps = self.config.norm_eps as f32;
+        let base = if first { 1 } else { 2 };
+        if inputs.len() != base + 2 * mamba.len() {
+            return Err(Error::InferenceError(format!(
+                "a decode stretch took {} inputs for {} Mamba layers",
+                inputs.len(),
+                mamba.len()
+            )));
+        }
+        let mut x = inputs[0].clone();
+        let mut h = if first {
+            residual_norm::rms_norm(&x, &self.layers[0].norm, eps, DType::F32)?
+        } else {
+            inputs[1].clone()
+        };
+        let mut conv = inputs[base..base + mamba.len()].to_vec();
+        let mut ssm = inputs[base + mamba.len()..].to_vec();
+        let mut at = 0;
+        for i in layers {
+            let out = match &self.layers[i].mixer {
+                Mixer::Mamba { mixer, .. } => {
+                    let (out, c, s) = mixer.forward_step_fused(&h, &conv[at], &ssm[at])?;
+                    conv[at] = c;
+                    ssm[at] = s;
+                    at += 1;
                     out
                 }
                 Mixer::Moe(mixer) => mixer.forward(&h, Pass::Step, false)?.0,
-                Mixer::Attention { index, mixer } => {
-                    self.step_attention(*index, mixer, &h, rows, prepared)?
+                Mixer::Attention { .. } => {
+                    return Err(Error::InferenceError(format!(
+                        "decode stretch layer {i} is attention"
+                    )))
                 }
             };
             let gain = self.layers.get(i + 1).map_or(&self.norm_f, |l| &l.norm);
-            let (sum, normed) = residual_norm::add_rms_norm(&x, &out, gain, eps, DType::F32)?;
-            x = sum;
-            h = normed;
+            (x, h) = residual_norm::add_rms_norm(&x, &out, gain, eps, DType::F32)?;
         }
-        Ok(h)
+        let mut outputs = if tail {
+            vec![crate::kernels::greedy::greedy_packed(
+                &self.lm_head.forward_native(&h)?,
+            )?]
+        } else {
+            vec![x, h]
+        };
+        outputs.extend(conv);
+        outputs.extend(ssm);
+        Ok(outputs)
     }
 
     /// Logits `[rows, vocab]` of final hidden states `[rows, hidden]`.
@@ -714,4 +920,59 @@ fn fused_kernels_check(device: &Device, d: &NemotronDecoderConfig) -> Result<f64
         return Ok(f64::INFINITY);
     }
     Ok(worst)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout(pattern: &str) -> Vec<Piece> {
+        pieces(
+            pattern
+                .chars()
+                .map(|c| c == '*')
+                .collect::<Vec<_>>()
+                .into_iter(),
+        )
+    }
+
+    fn stretch(layers: std::ops::Range<usize>, first: bool, tail: bool) -> Piece {
+        Piece::Stretch {
+            layers,
+            first,
+            tail,
+        }
+    }
+
+    /// Stretches cover every non-attention layer once, between the attention
+    /// layers, and the first and tail stretches always exist.
+    #[test]
+    fn the_pieces_split_the_layers_at_attention() {
+        assert_eq!(
+            layout("ME*ME"),
+            [
+                stretch(0..2, true, false),
+                Piece::Attention(2),
+                stretch(3..5, false, true)
+            ]
+        );
+        assert_eq!(
+            layout("*M"),
+            [
+                stretch(0..0, true, false),
+                Piece::Attention(0),
+                stretch(1..2, false, true)
+            ]
+        );
+        assert_eq!(
+            layout("ME**"),
+            [
+                stretch(0..2, true, false),
+                Piece::Attention(2),
+                Piece::Attention(3),
+                stretch(4..4, false, true)
+            ]
+        );
+        assert_eq!(layout("MEME"), [stretch(0..4, true, true)]);
+    }
 }

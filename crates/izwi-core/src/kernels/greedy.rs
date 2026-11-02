@@ -12,6 +12,15 @@ use candle_core::{DType, Result, Tensor};
 /// `(id, margin)` of each row of `logits` `[rows, vocab]` (F32, F16 or
 /// BF16), as [`host_pick`] scans them.
 pub fn greedy(logits: &Tensor) -> Result<Vec<(u32, f32)>> {
+    Ok(unpack(
+        &greedy_packed(logits)?.flatten_all()?.to_vec1::<u32>()?,
+    ))
+}
+
+/// [`greedy`] left on the logits' device: `[rows, 2]` U32 `{id, margin
+/// bits}` per row, for a caller that reads it back with other values (or
+/// captures it in a CUDA graph). A CPU tensor on the CPU.
+pub fn greedy_packed(logits: &Tensor) -> Result<Tensor> {
     let (rows, vocab) = logits.dims2()?;
     if rows == 0 || vocab == 0 || !matches!(logits.dtype(), DType::F32 | DType::F16 | DType::BF16) {
         candle_core::bail!(
@@ -21,27 +30,34 @@ pub fn greedy(logits: &Tensor) -> Result<Vec<(u32, f32)>> {
         )
     }
     let logits = logits.contiguous()?;
-    let packed: Option<Tensor> = match logits.device() {
+    match logits.device() {
         #[cfg(feature = "metal")]
-        candle_core::Device::Metal(_) => Some(metal_impl::run(&logits, rows, vocab)?),
+        candle_core::Device::Metal(_) => metal_impl::run(&logits, rows, vocab),
         #[cfg(feature = "cuda")]
-        candle_core::Device::Cuda(_) => Some(cuda_impl::run(&logits, rows, vocab)?),
-        _ => None,
-    };
-    let Some(packed) = packed else {
-        let values = logits
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        return Ok(values.chunks_exact(vocab).map(host_pick).collect());
-    };
-    let values = packed.flatten_all()?.to_vec1::<u32>()?;
-    Ok(values
+        candle_core::Device::Cuda(_) => cuda_impl::run(&logits, rows, vocab),
+        _ => {
+            let values = logits
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let packed = values
+                .chunks_exact(vocab)
+                .map(host_pick)
+                .flat_map(|(id, margin)| [id, margin.to_bits()])
+                .collect::<Vec<_>>();
+            Tensor::from_vec(packed, (rows, 2), &candle_core::Device::Cpu)
+        }
+    }
+}
+
+/// The host values of a [`greedy_packed`] result as `(id, margin)` pairs.
+pub fn unpack(packed: &[u32]) -> Vec<(u32, f32)> {
+    packed
         .as_chunks::<2>()
         .0
         .iter()
         .map(|&[id, margin]| (id, f32::from_bits(margin)))
-        .collect())
+        .collect()
 }
 
 /// The host scan: ties to the lowest id, and the runner-up counts a

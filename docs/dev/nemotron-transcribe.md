@@ -306,6 +306,21 @@ geometry; above 1e-4 relative L2 (or any greedy pick that differs), the
 step runs the eager composition instead. The model diagnostics'
 `decode_path` reports which path runs and why.
 
+The fused step runs as pieces: stretches of Mamba and MoE layers, each a
+pure function of the residual, the normed hidden and its layers' Mamba
+states, and the attention layers between them (the tail stretch ends with
+the head and the greedy pick). On CUDA each stretch replays a CUDA graph
+(`decoder/graphs.rs`, on `SegmentGraph`), captured per row count up to 4
+rows, while attention, which writes the paged KV under per-step metadata,
+stays eager. A stretch warms once, then its capture is checked bit for bit
+against the eager stretch on the capture step and on the next one; any
+failure turns the graphs off for the process. A replay copies the Mamba
+states in and out of the graph's buffers. `decode_graphs` in the diagnostics
+counts warmups, captures, verified steps and replays, and says why the
+graphs are off; `IZWI_NEMOTRON_TRANSCRIBE_SEGMENT_GRAPHS=0` or
+`IZWI_CUDA_DECODE_GRAPHS=off` runs every stretch eagerly. The graphs have
+been compiled and type-checked but not yet run on a GPU.
+
 ### Row state
 
 `decoder/state.rs` declares one transactional consistency group per row:

@@ -741,6 +741,7 @@ impl NemotronTranscribeModel {
             "decode_ms": d.decode_us.load(Ordering::Relaxed) as f64 / 1e3,
             "host_readbacks": super::speech_transformer::host_readbacks(),
             "fp8_decode_kernel": self.fp8_decode_kernel(),
+            "decode_graphs": self.decoder.graph_diagnostics(),
             "decode_path": match self.decoder.decode_path() {
                 super::decoder::DecodePath::Fused { check } => {
                     json!({"path": "fused", "kernel_check": check})
