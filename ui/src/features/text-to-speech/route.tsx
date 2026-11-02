@@ -34,6 +34,11 @@ import {
   normalizeSpeechProcessingStatus,
   resolveSpeechVoiceLabel,
 } from "@/features/text-to-speech/support";
+import {
+  dialogueLimits,
+  parseDialogueText,
+  type DialogueScene,
+} from "@/features/text-to-speech/dialogue";
 
 interface TextToSpeechPageProps {
   models: ModelInfo[];
@@ -69,6 +74,10 @@ export function TextToSpeechPage({
   const autoOpenCreateRef = useRef(false);
   const [isNewTextToSpeechModalOpen, setIsNewTextToSpeechModalOpen] =
     useState(false);
+  // Rows a take reopens the creation dialog's dialogue editor with.
+  const [initialDialogue, setInitialDialogue] = useState<DialogueScene | null>(
+    null,
+  );
   const [streamingRecord, setStreamingRecord] =
     useState<SpeechHistoryRecord | null>(null);
   const [recordActionError, setRecordActionError] = useState<string | null>(
@@ -354,11 +363,40 @@ export function TextToSpeechPage({
     };
   }, [record, recordId, streamingRecord]);
 
+  const visibleRecordCapabilities = models.find(
+    (model) => model.variant === visibleRecord?.model_id,
+  )?.speech_capabilities;
   // The server names the models whose records journal their audio as it is
   // generated, so an unfinished record can be played from its start.
   const visibleRecordReplaysInProgress =
-    models.find((model) => model.variant === visibleRecord?.model_id)
-      ?.speech_capabilities?.supports_in_progress_replay === true;
+    visibleRecordCapabilities?.supports_in_progress_replay === true;
+  // A dialogue model's take whose text is a rendered script reopens in the
+  // dialogue editor, one row per line.
+  const visibleRecordLimits = useMemo(
+    () => dialogueLimits(visibleRecordCapabilities),
+    [visibleRecordCapabilities],
+  );
+  const visibleRecordDialogue = useMemo(
+    () =>
+      visibleRecord && visibleRecordLimits
+        ? parseDialogueText(
+            visibleRecord.input_text,
+            visibleRecordLimits.maxSpeakers,
+          )
+        : null,
+    [visibleRecord, visibleRecordLimits],
+  );
+  const openInDialogueEditor = () => {
+    const modelId = visibleRecord?.model_id;
+    if (!visibleRecordDialogue || !modelId) {
+      return;
+    }
+    if (resolvedSelectedModel !== modelId) {
+      onSelect(modelId);
+    }
+    setInitialDialogue(visibleRecordDialogue);
+    setIsNewTextToSpeechModalOpen(true);
+  };
 
   const visibleVoiceLabel = useMemo(
     () =>
@@ -489,6 +527,9 @@ export function TextToSpeechPage({
             cancelPending={recordCancelPending}
             onCancel={() => void handleDetailCancel()}
             onDelete={() => void handleDetailDelete()}
+            onOpenInDialogueEditor={
+              visibleRecordDialogue ? openInDialogueEditor : undefined
+            }
           />
         </>
       ) : (
@@ -557,13 +598,17 @@ export function TextToSpeechPage({
 
       <NewTextToSpeechModal
         isOpen={isNewTextToSpeechModalOpen}
-        onClose={() => setIsNewTextToSpeechModalOpen(false)}
+        onClose={() => {
+          setIsNewTextToSpeechModalOpen(false);
+          setInitialDialogue(null);
+        }}
         selectedModel={resolvedSelectedModel}
         selectedModelInfo={selectedModelInfo}
         selectedModelReady={selectedModelReady}
         isModelManagerOpen={isModelModalOpen}
         initialSavedVoiceId={searchParams.get("voiceId")}
         initialSpeaker={searchParams.get("speaker")}
+        initialDialogue={initialDialogue}
         onLoadSelectedModel={(variant) => {
           onLoad(variant);
         }}

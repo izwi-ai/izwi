@@ -1360,4 +1360,157 @@ describe("TextToSpeechPage", () => {
     expect(await screen.findByTitle("Voice")).toHaveTextContent("Anna");
     expect(screen.queryByText("Voice: Ono_anna")).not.toBeInTheDocument();
   });
+
+  describe("a Fish Audio Drama 3 dialogue take", () => {
+    const drama3: ModelInfo = {
+      variant: "FishAudio-Drama-3",
+      status: "ready",
+      local_path: null,
+      size_bytes: null,
+      download_progress: null,
+      error_message: null,
+      speech_capabilities: {
+        supports_builtin_voices: false,
+        built_in_voice_count: null,
+        supports_reference_voice: true,
+        reference_transcript_required: true,
+        supports_voice_description: false,
+        supports_streaming: true,
+        supports_speed_control: false,
+        supports_auto_long_form: true,
+        supports_seeded_voice: true,
+        supports_speaker_dialogue: true,
+        max_speakers: 16,
+        max_references: 8,
+      },
+    };
+    const dialogueRecord = buildRecord({
+      id: "scene-1",
+      model_id: "FishAudio-Drama-3",
+      speaker: null,
+      processing_status: "ready",
+      input_text:
+        "<|speaker:0|> Ready when you are.\n<|speaker:2|> Always. [laughs] Let's go.",
+    });
+
+    function selectModel(variant: string, info: ModelInfo | null) {
+      hookMocks.useRouteModelSelection.mockReturnValue({
+        routeModels: [drama3],
+        resolvedSelectedModel: variant,
+        selectedModelInfo: info,
+        selectedModelReady: true,
+        isModelModalOpen: false,
+        intentVariant: null,
+        closeModelModal: vi.fn(),
+        openModelManager: vi.fn(),
+        requestModel: vi.fn(),
+      });
+    }
+
+    it("shows in history like any record, without its speaker tags", async () => {
+      apiMocks.listTextToSpeechRecords.mockResolvedValue([
+        buildSummary({
+          id: "scene-1",
+          model_id: "FishAudio-Drama-3",
+          speaker: null,
+          processing_status: "ready",
+          input_preview: "<|speaker:0|> Ready when you are.\n<|speaker:1|> Always.",
+        }),
+      ]);
+      renderRoute("/text-to-speech", { models: [drama3] });
+      expect(
+        await screen.findByText("Ready when you are. Always."),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/<\|speaker:/)).not.toBeInTheDocument();
+    });
+
+    it("reopens in the dialogue editor, one row per line, in seeded voices", async () => {
+      selectModel("FishAudio-Drama-3", drama3);
+      apiMocks.getTextToSpeechRecord.mockResolvedValue(dialogueRecord);
+      const onSelect = vi.fn();
+      renderRoute("/text-to-speech/scene-1", { models: [drama3], onSelect });
+
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Open in dialogue editor" }),
+      );
+
+      const dialog = await screen.findByRole("dialog", {
+        name: "New text-to-speech job",
+      });
+      expect(
+        within(dialog).getByRole("radio", { name: "Dialogue" }),
+      ).toHaveAttribute("aria-checked", "true");
+      expect(
+        within(dialog).getByRole("textbox", { name: "Line 1 text" }),
+      ).toHaveValue("Ready when you are.");
+      expect(
+        within(dialog).getByRole("textbox", { name: "Line 2 text" }),
+      ).toHaveValue("Always. [laughs] Let's go.");
+      expect(
+        within(dialog).getByRole("combobox", { name: "Line 2 speaker" }),
+      ).toHaveTextContent("Speaker 2");
+      // The record keeps no voices: both speakers start seeded, and say so.
+      for (const speaker of ["Speaker 0 voice", "Speaker 2 voice"]) {
+        expect(
+          within(dialog).getByRole("combobox", { name: speaker }),
+        ).toHaveTextContent("Seeded voice");
+      }
+      expect(within(dialog).getByRole("note")).toHaveTextContent(
+        "pick their voices again",
+      );
+      expect(onSelect).not.toHaveBeenCalled();
+
+      // Closed and opened again, it reads the take afresh.
+      fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Open in dialogue editor" }),
+      );
+      expect(
+        await screen.findByRole("textbox", { name: "Line 1 text" }),
+      ).toHaveValue("Ready when you are.");
+    });
+
+    it("selects the take's model when another one is selected", async () => {
+      apiMocks.getTextToSpeechRecord.mockResolvedValue(dialogueRecord);
+      const onSelect = vi.fn();
+      renderRoute("/text-to-speech/scene-1", { models: [drama3], onSelect });
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Open in dialogue editor" }),
+      );
+      expect(onSelect).toHaveBeenCalledWith("FishAudio-Drama-3");
+    });
+
+    it("is not offered for a single-voice take or a model without dialogue", async () => {
+      apiMocks.getTextToSpeechRecord.mockResolvedValue(
+        buildRecord({
+          id: "plain",
+          model_id: "FishAudio-Drama-3",
+          input_text: "Just one voice.",
+          processing_status: "ready",
+        }),
+      );
+      const view = renderRoute("/text-to-speech/plain", { models: [drama3] });
+      expect(
+        await screen.findByRole("button", { name: /Copy text/ }),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "Open in dialogue editor" }),
+      ).toBeNull();
+      view.unmount();
+
+      apiMocks.getTextToSpeechRecord.mockResolvedValue({
+        ...dialogueRecord,
+        model_id: "FishAudio-S2-Pro",
+      });
+      renderRoute("/text-to-speech/scene-1", {
+        models: [buildFishModel(false)],
+      });
+      expect(
+        await screen.findByRole("button", { name: /Copy text/ }),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "Open in dialogue editor" }),
+      ).toBeNull();
+    });
+  });
 });

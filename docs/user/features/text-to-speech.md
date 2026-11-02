@@ -174,6 +174,21 @@ and min-p. With Chatterbox Multilingual it also asks which language the text is
 in. With Maya 2 Native it asks the same, with **Auto-detect** (the default) to
 read the language from the text's script, and offers its inline tags.
 
+With Fish Audio Drama 3 the saved voice is optional (**None (seeded voice)**)
+and the dialog has a **Seed**, filled with a new number each time it opens;
+keep it to get the same voice again. **Dialogue**, beside **Single voice**,
+edits a scene:
+
+- **Speakers**: each speaks in a saved voice that has a transcript, or in a
+  voice the seed sets. Up to 16 speakers and 8 saved voices.
+- **Lines**: each has its speaker, its text and **Insert a tag** for
+  performance tags. **Preview** speaks one line without saving it.
+- **Generate scene** speaks every line as one take.
+
+A dialogue take's page has **Open in dialogue editor**, which brings its lines
+back as a scene. A take does not keep its voices or seed, so pick the voices
+again.
+
 ### Features
 
 - **Live preview** — Hear audio as it generates

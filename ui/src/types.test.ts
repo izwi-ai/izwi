@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   VIEW_CONFIGS,
   getSpeakerProfilesForVariant,
+  isFishDrama3Variant,
+  isFishS2TtsVariant,
   isLfm25AudioVariant,
   isLfm3AudioVariant,
 } from "@/types";
@@ -270,5 +272,39 @@ describe("Kokoro speakers", () => {
     );
     expect(ids).toHaveLength(41);
     expect(ids.filter((id) => /^[jz]/.test(id))).toEqual([]);
+  });
+});
+
+describe("Fish Audio Drama 3", () => {
+  it("is recognised by its catalog id and aliases, and kept apart from S2", () => {
+    for (const variant of [
+      "FishAudio-Drama-3",
+      "fishaudio/drama-3",
+      "Fish Audio Drama 3",
+      "drama-3",
+      "drama3",
+    ]) {
+      expect(isFishDrama3Variant(variant)).toBe(true);
+      expect(isFishS2TtsVariant(variant)).toBe(false);
+    }
+    expect(isFishDrama3Variant("FishAudio-S2-Pro")).toBe(false);
+    expect(isFishDrama3Variant("Drama-3-int4")).toBe(false);
+  });
+
+  it("has no built-in voices instead of falling back to Qwen's", () => {
+    expect(getSpeakerProfilesForVariant("FishAudio-Drama-3")).toEqual([]);
+    expect(getSpeakerProfilesForVariant("fishaudio/drama-3")).toEqual([]);
+    // The fallback it used to hit.
+    expect(getSpeakerProfilesForVariant("Unknown-TTS").length).toBeGreaterThan(0);
+  });
+
+  it("clones voices and stays off the built-in voice route", () => {
+    expect(VIEW_CONFIGS["voice-clone"].modelFilter("FishAudio-Drama-3")).toBe(true);
+    expect(VIEW_CONFIGS["voice-clone"].emptyStateDescription).toContain(
+      "Fish Drama 3",
+    );
+    expect(VIEW_CONFIGS["custom-voice"].modelFilter("FishAudio-Drama-3")).toBe(
+      false,
+    );
   });
 });

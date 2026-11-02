@@ -18,8 +18,26 @@ import {
 
 const FIRST_PARTY_AUDIO_UPLOAD_LIMIT_BYTES = 64 * 1024 * 1024;
 
-export interface TTSRequest {
+/** One line of a dialogue script: a speaker and what they say, without a
+ * speaker tag (Fish Audio Drama 3). */
+export interface SpeechScriptLine {
+  /** 0 to the model's `max_speakers - 1`. */
+  speaker: number;
   text: string;
+}
+
+/** One reference voice of a dialogue request: a saved voice (it must have a
+ * transcript), or a base64 clip with its transcript, for one speaker. */
+export interface SpeechDialogueReference {
+  speaker: number;
+  saved_voice_id?: string;
+  audio?: string;
+  text?: string;
+}
+
+export interface TTSRequest {
+  /** The text to speak; leave it out when `script` gives it. */
+  text?: string;
   model_id: string;
   language?: string;
   speaker?: string;
@@ -29,6 +47,15 @@ export interface TTSRequest {
   /** The language the reference is spoken in (Maya 2 Native). */
   reference_language?: string;
   saved_voice_id?: string;
+  /** A dialogue instead of `text`, for a model with
+   * `supports_speaker_dialogue`. */
+  script?: SpeechScriptLine[];
+  /** Reference voices per speaker; they replace `reference_audio`,
+   * `reference_text` and `saved_voice_id`. */
+  references?: SpeechDialogueReference[];
+  /** Sampling seed; for a model with `supports_seeded_voice` it also sets
+   * the voice of a speaker without a reference. */
+  seed?: number;
   max_tokens?: number;
   format?: "wav" | "pcm" | "raw_f32" | "raw_i16";
   temperature?: number;
@@ -158,7 +185,8 @@ export interface CancelSpeechHistoryRecordResponse {
 
 export interface SpeechHistoryRecordCreateRequest {
   model_id: string;
-  text: string;
+  /** The text to speak; leave it out when `script` gives it. */
+  text?: string;
   speaker?: string;
   language?: string;
   voice_description?: string;
@@ -167,6 +195,15 @@ export interface SpeechHistoryRecordCreateRequest {
   /** The language the reference is spoken in (Maya 2 Native). */
   reference_language?: string;
   saved_voice_id?: string;
+  /** A dialogue instead of `text`; the record stores it rendered as
+   * `<|speaker:N|> text` lines. */
+  script?: SpeechScriptLine[];
+  /** Reference voices per speaker; they replace `reference_audio`,
+   * `reference_text` and `saved_voice_id`. */
+  references?: SpeechDialogueReference[];
+  /** Sampling seed; for a model with `supports_seeded_voice` it also sets
+   * the voice of a speaker without a reference. */
+  seed?: number;
   temperature?: number;
   speed?: number;
   max_tokens?: number;
@@ -1366,6 +1403,9 @@ export class AudioApiClient {
         reference_audio: request.reference_audio,
         reference_text: request.reference_text,
         saved_voice_id: request.saved_voice_id,
+        script: request.script,
+        references: request.references,
+        seed: request.seed,
         max_tokens: request.max_tokens,
         temperature: request.temperature,
         speed: request.speed,
@@ -1418,6 +1458,9 @@ export class AudioApiClient {
             reference_audio: request.reference_audio,
             reference_text: request.reference_text,
             saved_voice_id: request.saved_voice_id,
+            script: request.script,
+            references: request.references,
+            seed: request.seed,
             max_tokens: request.max_tokens,
             temperature: request.temperature,
             speed: request.speed,
@@ -1650,6 +1693,9 @@ export class AudioApiClient {
       reference_audio: request.reference_audio,
       reference_text: request.reference_text,
       saved_voice_id: request.saved_voice_id,
+      script: request.script,
+      references: request.references,
+      seed: request.seed,
       temperature: request.temperature,
       speed: request.speed,
       max_tokens: request.max_tokens,

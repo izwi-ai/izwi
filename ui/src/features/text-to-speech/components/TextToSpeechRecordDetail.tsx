@@ -8,6 +8,7 @@ import {
   Cpu,
   Download,
   Loader2,
+  MessagesSquare,
   Mic,
   OctagonX,
   Trash2,
@@ -35,13 +36,14 @@ import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import {
   normalizeSpeechProcessingStatus,
   speechDownloadFilename,
+  speechTextLabel,
 } from "@/features/text-to-speech/support";
 
 const TITLE_MAX_CHARS = 60;
 
 /** The opening of the spoken text, which names a take better than its model. */
 function speechRecordTitle(record: SpeechHistoryRecord | null): string {
-  const text = record?.input_text?.replace(/\s+/g, " ").trim() ?? "";
+  const text = speechTextLabel(record?.input_text ?? "");
   if (!text) {
     return "Speech generation";
   }
@@ -63,6 +65,8 @@ interface TextToSpeechRecordDetailProps {
   cancelPending?: boolean;
   onCancel?: () => Promise<void> | void;
   onDelete?: () => Promise<void> | void;
+  /** Opens the take's lines in the dialogue editor; given for a dialogue. */
+  onOpenInDialogueEditor?: () => void;
   /** The list this record belongs to, for the breadcrumb trail. */
   parentCrumb: Breadcrumb;
   /** Route actions for the header menu (Models). */
@@ -81,6 +85,7 @@ export function TextToSpeechRecordDetail({
   cancelPending = false,
   onCancel,
   onDelete,
+  onOpenInDialogueEditor,
   parentCrumb,
   extraMenuItems = [],
 }: TextToSpeechRecordDetailProps) {
@@ -207,6 +212,18 @@ export function TextToSpeechRecordDetail({
       menuItems={menuItems}
       actions={
         <>
+          {onOpenInDialogueEditor ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-9 gap-2"
+              onClick={onOpenInDialogueEditor}
+            >
+              <MessagesSquare className="h-4 w-4" />
+              Open in dialogue editor
+            </Button>
+          ) : null}
           <Button
             type="button"
             variant="outline"
