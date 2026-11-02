@@ -49,6 +49,7 @@ impl Schema {
                 (12, "transcription translation target and keywords"),
                 (13, "saved voices without a transcript"),
                 (14, "saved voice reference language"),
+                (15, "speech take codes, voices and parent"),
             ],
             Self::Fleet => &[
                 (1, "fleet coordination"),
@@ -219,6 +220,11 @@ async fn apply_migration<C: ConnectionTrait>(
         }
         (Schema::App, 14) => {
             ensure_column(db, &SAVED_VOICE_REFERENCE_LANGUAGE_COLUMN).await?;
+        }
+        (Schema::App, 15) => {
+            for column in SPEECH_TAKE_COLUMNS {
+                ensure_column(db, column).await?;
+            }
         }
         (Schema::App, 13) => {
             if backend == DbBackend::Postgres {
@@ -1200,6 +1206,41 @@ const SAVED_VOICE_REFERENCE_LANGUAGE_COLUMN: CompatibilityColumn = Compatibility
     definition: "TEXT NULL",
 };
 
+/// Migration 15: what a speech take keeps so a later take can continue it
+/// (Fish Audio Drama 3 take editing): its generated codes, the voices it
+/// used and its seed, and the take it continued. Null on every other
+/// model's records and on takes made before.
+///
+/// - `generated_codes_json`: the codes of the take's first and last chunks
+///   with each chunk's text, versioned JSON (`speech_takes.rs` in the
+///   server); written only when the take completes.
+/// - `references_json`: `[{"speaker": N, "saved_voice_id": "…"}]`, one per
+///   reference; an inline clip is speaker-only.
+/// - `seed`: the request's seed, its 64 bits stored as a signed integer.
+/// - `parent_take_id`: the last of the request's `previous_take_ids`.
+const SPEECH_TAKE_COLUMNS: &[CompatibilityColumn] = &[
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "generated_codes_json",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "references_json",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "seed",
+        definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "parent_take_id",
+        definition: "TEXT NULL",
+    },
+];
+
 /// Migration 13: a saved voice may omit its transcript, as a model that
 /// clones from audio alone (Chatterbox) needs none. PostgreSQL drops the
 /// constraint in place.
@@ -1785,6 +1826,10 @@ pub(crate) fn postgres_schema_sql() -> String {
     push(SAVED_VOICE_TRANSCRIPT_OPTIONAL);
     // Migration 14.
     push(&add_column(&SAVED_VOICE_REFERENCE_LANGUAGE_COLUMN));
+    // Migration 15.
+    for column in SPEECH_TAKE_COLUMNS {
+        push(&add_column(column));
+    }
     push(SCHEMA_MIGRATIONS_DDL);
     for (version, name) in Schema::App.migrations() {
         push(&format!(
@@ -2112,6 +2157,77 @@ mod tests {
                 .await
                 .is_err(),
             "names stay unique regardless of case"
+        );
+    }
+
+    /// Migration 15 adds the take columns; records made before keep their
+    /// fields and read null in each, so they are not editable.
+    #[tokio::test]
+    async fn a_database_at_migration_14_keeps_its_speech_records_without_take_codes() {
+        let database = TestDatabase::new().await;
+        let store = database.database();
+        let db = store.connection().await.expect("connection");
+        for column in SPEECH_TAKE_COLUMNS {
+            db.execute_unprepared(&format!(
+                "ALTER TABLE {} DROP COLUMN {}",
+                column.table, column.column
+            ))
+            .await
+            .expect("column drops");
+        }
+        db.execute_unprepared(
+            "DELETE FROM schema_migrations WHERE component = 'app' AND version = 15",
+        )
+        .await
+        .expect("version row deletes");
+        db.execute_unprepared(
+            "INSERT INTO speech_history_records (id, created_at, route_kind, model_id, \
+             input_text, generation_time_ms, audio_mime_type, audio_storage_path) \
+             VALUES ('take', 1, 'text_to_speech', 'FishAudio-Drama-3', 'Hello.', 0.0, \
+             'audio/wav', 'take.wav')",
+        )
+        .await
+        .expect("a take made before migration 15");
+
+        Migrator::up(db).await.expect("the database upgrades");
+        for column in SPEECH_TAKE_COLUMNS {
+            assert!(table_has_column(db, column.table, column.column)
+                .await
+                .unwrap());
+        }
+        assert_eq!(
+            text(
+                db,
+                "SELECT input_text FROM speech_history_records WHERE id = 'take'"
+            )
+            .await
+            .as_deref(),
+            Some("Hello.")
+        );
+        assert_eq!(
+            count(
+                db,
+                "SELECT COUNT(*) FROM speech_history_records WHERE id = 'take' \
+                 AND generated_codes_json IS NULL AND references_json IS NULL \
+                 AND seed IS NULL AND parent_take_id IS NULL"
+            )
+            .await,
+            1
+        );
+        // A seed keeps all 64 bits as a signed integer.
+        db.execute_unprepared(&format!(
+            "UPDATE speech_history_records SET seed = {} WHERE id = 'take'",
+            u64::MAX as i64
+        ))
+        .await
+        .expect("a 64-bit seed");
+        assert_eq!(
+            count(
+                db,
+                "SELECT seed FROM speech_history_records WHERE id = 'take'"
+            )
+            .await as u64,
+            u64::MAX
         );
     }
 
