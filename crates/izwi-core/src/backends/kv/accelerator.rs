@@ -3863,6 +3863,8 @@ mod tests {
 
     #[test]
     fn resident_page_copy_fills_the_leading_pages_and_keeps_the_tail_zero() -> Result<()> {
+        // Metal builds add the Metal device.
+        #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
         let mut devices = vec![Device::Cpu];
         #[cfg(feature = "metal")]
         let _lease = crate::backends::metal_test_device_or_skip(
