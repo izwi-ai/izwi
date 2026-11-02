@@ -9,8 +9,11 @@ use tracing::{debug, error, info};
 
 #[path = "executor/audio.rs"]
 mod audio;
+#[path = "executor/fish_drama3_pending.rs"]
+mod fish_drama3_pending;
 #[path = "executor/fish_pending.rs"]
 mod fish_pending;
+use fish_drama3_pending::{FishDrama3CodecCommit, FishDrama3StateCoordinator};
 use fish_pending::{FishCodecCommit, FishStateCoordinator};
 #[path = "executor/dispatch.rs"]
 mod dispatch;
@@ -21,6 +24,7 @@ mod handler_audio_chat;
 #[path = "executor/handler_chat.rs"]
 mod handler_chat;
 mod handler_chatterbox;
+mod handler_fish_drama3;
 mod handler_lfm3_audio_rows;
 mod handler_maya1;
 mod handler_maya2;
@@ -106,11 +110,12 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::ModelRegistry;
 use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
 use state::{
-    ActiveAsrDecode, ActiveChatDecode, ActiveChatterboxTtsDecode, ActiveFishS2TtsDecode,
-    ActiveLfm25AsrDecode, ActiveLfm25TtsDecode, ActiveLfm3AudioDecode, ActiveLfm3AudioRealtime,
-    ActiveMaya1TtsDecode, ActiveMaya2TtsDecode, ActiveNemotronTranscribeDecode,
-    ActiveParakeetAsrDecode, ActiveQwenTtsDecode, ActiveVibeVoiceTtsDecode, ActiveVoxtralRealtime,
-    ActiveVoxtralTtsDecode, PendingLfm3AudioRealtimeQuantum, PendingVoxtralRealtimeQuantum,
+    ActiveAsrDecode, ActiveChatDecode, ActiveChatterboxTtsDecode, ActiveFishDrama3TtsDecode,
+    ActiveFishS2TtsDecode, ActiveLfm25AsrDecode, ActiveLfm25TtsDecode, ActiveLfm3AudioDecode,
+    ActiveLfm3AudioRealtime, ActiveMaya1TtsDecode, ActiveMaya2TtsDecode,
+    ActiveNemotronTranscribeDecode, ActiveParakeetAsrDecode, ActiveQwenTtsDecode,
+    ActiveVibeVoiceTtsDecode, ActiveVoxtralRealtime, ActiveVoxtralTtsDecode,
+    PendingLfm3AudioRealtimeQuantum, PendingVoxtralRealtimeQuantum,
 };
 
 const QWEN38_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
@@ -2626,6 +2631,7 @@ impl<Q: PendingRealtimeQuantum> PendingQuantumFinalizer for RealtimeStateCoordin
 
 struct RealtimePendingQuantumFinalizer {
     fish: Arc<FishStateCoordinator>,
+    fish_drama3: Arc<FishDrama3StateCoordinator>,
     voxtral: Arc<VoxtralRealtimeStateCoordinator>,
     lfm3_audio: Arc<Lfm3AudioRealtimeStateCoordinator>,
     long_form: Arc<long_form::LongFormAsrRuns>,
@@ -2634,6 +2640,7 @@ struct RealtimePendingQuantumFinalizer {
 impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
     fn contains(&self, plan_id: PlanId, session: &SessionKey) -> bool {
         self.fish.contains(plan_id, session)
+            || self.fish_drama3.contains(plan_id, session)
             || self.voxtral.contains(plan_id, session)
             || self.lfm3_audio.contains(plan_id, session)
             || self.long_form.contains(plan_id, session)
@@ -2646,6 +2653,8 @@ impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
     ) -> Result<PendingQuantumFinalizeStatus> {
         if self.fish.contains(plan_id, session) {
             self.fish.prepare(plan_id, session, decision)
+        } else if self.fish_drama3.contains(plan_id, session) {
+            self.fish_drama3.prepare(plan_id, session, decision)
         } else if self.long_form.contains(plan_id, session) {
             self.long_form.prepare(plan_id, session, decision)
         } else if self.lfm3_audio.contains(plan_id, session) {
@@ -2661,6 +2670,8 @@ impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
     ) -> Result<PendingQuantumFinalizeStatus> {
         if self.fish.has_prepared(plan_id) {
             self.fish.publish(plan_id, session)
+        } else if self.fish_drama3.has_prepared(plan_id) {
+            self.fish_drama3.publish(plan_id, session)
         } else if self.long_form.has_prepared(plan_id) {
             self.long_form.publish(plan_id, session)
         } else if self.lfm3_audio.holds_prepared(plan_id) {
@@ -2672,6 +2683,8 @@ impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
     fn discard(&self, plan_id: PlanId, session: &SessionKey) {
         if self.fish.has_prepared(plan_id) {
             self.fish.discard(plan_id, session);
+        } else if self.fish_drama3.has_prepared(plan_id) {
+            self.fish_drama3.discard(plan_id, session);
         } else if self.long_form.has_prepared(plan_id) {
             self.long_form.discard(plan_id, session)
         } else if self.lfm3_audio.holds_prepared(plan_id) {
@@ -2754,6 +2767,8 @@ pub struct NativeExecutor {
     vibevoice_tts_decode_states: ExecutorStateStore<ActiveVibeVoiceTtsDecode>,
     fish_s2_tts_decode_states: Arc<ExecutorStateStore<ActiveFishS2TtsDecode>>,
     fish_s2_pending: Arc<FishStateCoordinator>,
+    fish_drama3_tts_decode_states: Arc<ExecutorStateStore<ActiveFishDrama3TtsDecode>>,
+    fish_drama3_pending: Arc<FishDrama3StateCoordinator>,
     voxtral_tts_decode_states: ExecutorStateStore<ActiveVoxtralTtsDecode>,
     chatterbox_tts_decode_states: ExecutorStateStore<ActiveChatterboxTtsDecode>,
     maya1_tts_decode_states: ExecutorStateStore<ActiveMaya1TtsDecode>,
@@ -2837,6 +2852,7 @@ impl NativeExecutor {
             Arc::new(VoxtralRealtimeStateCoordinator::new()),
             Arc::new(Lfm3AudioRealtimeStateCoordinator::new()),
             Arc::new(FishStateCoordinator::new()),
+            Arc::new(FishDrama3StateCoordinator::new()),
             Arc::default(),
         )
     }
@@ -2846,6 +2862,7 @@ impl NativeExecutor {
         voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
         lfm3_audio_realtime: Arc<Lfm3AudioRealtimeStateCoordinator>,
         fish_s2_pending: Arc<FishStateCoordinator>,
+        fish_drama3_pending: Arc<FishDrama3StateCoordinator>,
         long_form_asr: Arc<long_form::LongFormAsrRuns>,
     ) -> Self {
         Self {
@@ -2861,6 +2878,8 @@ impl NativeExecutor {
             vibevoice_tts_decode_states: Mutex::new(HashMap::new()),
             fish_s2_tts_decode_states: fish_s2_pending.states.clone(),
             fish_s2_pending,
+            fish_drama3_tts_decode_states: fish_drama3_pending.states.clone(),
+            fish_drama3_pending,
             voxtral_tts_decode_states: Mutex::new(HashMap::new()),
             chatterbox_tts_decode_states: Mutex::new(HashMap::new()),
             maya1_tts_decode_states: Mutex::new(HashMap::new()),
@@ -3060,6 +3079,15 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
                     .map(|_| (true, true))
             })
             .unwrap_or((false, false)),
+        // Drama 3 decodes rows of many users together, but a prefill cell
+        // is never batched across requests (§7.4).
+        TaskType::TTS
+            if request
+                .prepared_fish_drama3_tts_model_lease_for_executor()
+                .is_ok_and(|model| model.is_some()) =>
+        {
+            (false, true)
+        }
         TaskType::TTS
             if request
                 .prepared_fish_s2_tts_model_lease_for_executor()
@@ -3311,6 +3339,9 @@ impl ModelExecutor for NativeExecutor {
                         .prepared_fish_s2_tts_model_lease_for_executor()
                         .is_ok_and(|model| model.is_some())
                     || request
+                        .prepared_fish_drama3_tts_model_lease_for_executor()
+                        .is_ok_and(|model| model.is_some())
+                    || request
                         .prepared_lfm25_audio_tts_model_lease_for_executor()
                         .is_ok_and(|model| model.is_some())
                     || request
@@ -3335,6 +3366,7 @@ impl ModelExecutor for NativeExecutor {
                         | crate::catalog::ModelFamily::Lfm25Audio
                         | crate::catalog::ModelFamily::VibeVoiceTts
                         | crate::catalog::ModelFamily::FishS2Tts
+                        | crate::catalog::ModelFamily::FishDrama3Tts
                         | crate::catalog::ModelFamily::ChatterboxTts
                         | crate::catalog::ModelFamily::Maya1Tts
                         | crate::catalog::ModelFamily::Maya2Tts
@@ -3382,6 +3414,7 @@ impl ModelExecutor for NativeExecutor {
                             | crate::catalog::ModelFamily::Lfm25Audio
                             | crate::catalog::ModelFamily::VibeVoiceTts
                             | crate::catalog::ModelFamily::FishS2Tts
+                            | crate::catalog::ModelFamily::FishDrama3Tts
                             | crate::catalog::ModelFamily::ChatterboxTts
                             | crate::catalog::ModelFamily::Maya1Tts
                             | crate::catalog::ModelFamily::Maya2Tts
@@ -3430,6 +3463,15 @@ impl ModelExecutor for NativeExecutor {
                 .or_else(|| {
                     request
                         .prepared_fish_s2_tts_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| true)
+                })
+                // Drama 3 resumes at every cell of its own grid
+                // (`prefill_grid_tokens` below).
+                .or_else(|| {
+                    request
+                        .prepared_fish_drama3_tts_model_lease_for_executor()
                         .ok()
                         .flatten()
                         .map(|_| true)
@@ -3487,6 +3529,11 @@ impl ModelExecutor for NativeExecutor {
                 resumable_prefill_proof,
             );
             profile.prefill_spans_required = spans_required;
+            // Drama 3's spans are its model's grid cells: the scheduler hands
+            // over exactly the next cell, never a budget's cut of it.
+            if let Ok(Some(model)) = request.prepared_fish_drama3_tts_model_lease_for_executor() {
+                profile.prefill_grid_tokens = model.prefill_span_rows();
+            }
             profile.incremental_decode = true;
             profile.recompute_safe = profile.resolved_from_loaded_model;
             profile.cache_release_safe = profile.resolved_from_loaded_model;
@@ -3522,8 +3569,13 @@ impl ModelExecutor for NativeExecutor {
             profile.prefill_batch = native_batch_support.prefill;
             profile.decode_batch = native_batch_support.decode;
             profile.concurrency = ConcurrencyClass::Batchable;
-            profile.max_batch_size = if request.model_variant == Some(ModelVariant::FishAudioS2Pro)
-            {
+            profile.max_batch_size = if request.model_variant.is_some_and(|variant| {
+                matches!(
+                    variant.family(),
+                    crate::catalog::ModelFamily::FishS2Tts
+                        | crate::catalog::ModelFamily::FishDrama3Tts
+                )
+            }) {
                 request
                     .execution_adapter_binding()
                     .and_then(|binding| {
@@ -3630,11 +3682,15 @@ impl ModelExecutor for NativeExecutor {
             let route = NativeBatchRoute::resolve(&execution).map_err(|error| {
                 PhysicalDispatchError::not_started(error, width, FailureOrigin::ExecutorValidation)
             })?;
-            let tensor_ceiling = if execution
-                .requests
-                .iter()
-                .all(|request| request.model_variant == Some(ModelVariant::FishAudioS2Pro))
-            {
+            let tensor_ceiling = if execution.requests.iter().all(|request| {
+                request.model_variant.is_some_and(|variant| {
+                    matches!(
+                        variant.family(),
+                        crate::catalog::ModelFamily::FishS2Tts
+                            | crate::catalog::ModelFamily::FishDrama3Tts
+                    )
+                })
+            }) {
                 execution
                     .requests
                     .iter()
@@ -3954,6 +4010,23 @@ impl ModelExecutor for NativeExecutor {
                 }
                 NativeBatchRoute::Audio {
                     task: TaskType::TTS,
+                    stage: NativeAudioStage::SequenceAudioDecode,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::FishDrama3Tts
+                    })
+                }) =>
+                {
+                    self.execute_static_fish_drama3_codec_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::TTS,
                     stage: NativeAudioStage::SequencePrefill,
                     mode: NativeBatchMode::Static,
                     ..
@@ -4160,6 +4233,7 @@ impl ModelExecutor for NativeExecutor {
     fn shutdown(&mut self) -> Result<()> {
         info!("Shutting down native executor");
         self.fish_s2_pending.abort_matching(|_| true)?;
+        self.fish_drama3_pending.abort_matching(|_| true)?;
         let mut chat = self
             .chat_decode_states
             .lock()
@@ -4182,6 +4256,9 @@ impl ModelExecutor for NativeExecutor {
         })?;
         let mut fish_s2_tts = self.fish_s2_tts_decode_states.lock().map_err(|_| {
             Error::InferenceError("Fish S2 TTS decode state mutex poisoned".to_string())
+        })?;
+        let mut fish_drama3_tts = self.fish_drama3_tts_decode_states.lock().map_err(|_| {
+            Error::InferenceError("Fish Audio Drama 3 decode state mutex poisoned".to_string())
         })?;
         let mut voxtral_tts = self.voxtral_tts_decode_states.lock().map_err(|_| {
             Error::InferenceError("Voxtral TTS decode state mutex poisoned".to_string())
@@ -4239,6 +4316,7 @@ impl ModelExecutor for NativeExecutor {
         lfm25_tts.clear();
         vibevoice_tts.clear();
         fish_s2_tts.clear();
+        fish_drama3_tts.clear();
         voxtral_tts.clear();
         chatterbox_tts.clear();
         maya1_tts.clear();
@@ -4256,6 +4334,7 @@ impl ModelExecutor for NativeExecutor {
             lfm25_tts,
             vibevoice_tts,
             fish_s2_tts,
+            fish_drama3_tts,
             voxtral_tts,
             chatterbox_tts,
             maya1_tts,
@@ -4276,6 +4355,10 @@ impl ModelExecutor for NativeExecutor {
             .fish_s2_pending
             .abort_matching(|session| session.request_id == request_id)
             .is_err()
+            || self
+                .fish_drama3_pending
+                .abort_matching(|session| session.request_id == request_id)
+                .is_err()
         {
             return CacheReleaseReport::unconfirmed();
         }
@@ -4303,6 +4386,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut lfm25_tts),
             Ok(mut vibevoice_tts),
             Ok(mut fish_s2_tts),
+            Ok(mut fish_drama3_tts),
             Ok(mut voxtral_tts),
             Ok(mut chatterbox_tts),
             Ok(mut maya1_tts),
@@ -4320,6 +4404,7 @@ impl ModelExecutor for NativeExecutor {
             self.lfm25_tts_decode_states.lock(),
             self.vibevoice_tts_decode_states.lock(),
             self.fish_s2_tts_decode_states.lock(),
+            self.fish_drama3_tts_decode_states.lock(),
             self.voxtral_tts_decode_states.lock(),
             self.chatterbox_tts_decode_states.lock(),
             self.maya1_tts_decode_states.lock(),
@@ -4341,6 +4426,7 @@ impl ModelExecutor for NativeExecutor {
         let lfm25_tts = cleanup_request_states_locked(&mut lfm25_tts, request_id);
         let vibevoice_tts = cleanup_request_states_locked(&mut vibevoice_tts, request_id);
         let fish_s2_tts = cleanup_request_states_locked(&mut fish_s2_tts, request_id);
+        let fish_drama3_tts = cleanup_request_states_locked(&mut fish_drama3_tts, request_id);
         let voxtral_tts = cleanup_request_states_locked(&mut voxtral_tts, request_id);
         let chatterbox_tts = cleanup_request_states_locked(&mut chatterbox_tts, request_id);
         let maya1_tts = cleanup_request_states_locked(&mut maya1_tts, request_id);
@@ -4357,6 +4443,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(lfm25_tts)
                 .combine(vibevoice_tts)
                 .combine(fish_s2_tts)
+                .combine(fish_drama3_tts)
                 .combine(voxtral_tts)
                 .combine(chatterbox_tts)
                 .combine(maya1_tts)
@@ -4379,6 +4466,10 @@ impl ModelExecutor for NativeExecutor {
             .fish_s2_pending
             .abort_matching(|pending| pending == session)
             .is_err()
+            || self
+                .fish_drama3_pending
+                .abort_matching(|pending| pending == session)
+                .is_err()
         {
             return CacheReleaseReport::unconfirmed();
         }
@@ -4401,6 +4492,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut lfm25_tts),
             Ok(mut vibevoice_tts),
             Ok(mut fish_s2_tts),
+            Ok(mut fish_drama3_tts),
             Ok(mut voxtral_tts),
             Ok(mut chatterbox_tts),
             Ok(mut maya1_tts),
@@ -4418,6 +4510,7 @@ impl ModelExecutor for NativeExecutor {
             self.lfm25_tts_decode_states.lock(),
             self.vibevoice_tts_decode_states.lock(),
             self.fish_s2_tts_decode_states.lock(),
+            self.fish_drama3_tts_decode_states.lock(),
             self.voxtral_tts_decode_states.lock(),
             self.chatterbox_tts_decode_states.lock(),
             self.maya1_tts_decode_states.lock(),
@@ -4443,6 +4536,7 @@ impl ModelExecutor for NativeExecutor {
         let lfm25_tts = cleanup_session_state_locked(&mut lfm25_tts, session);
         let vibevoice_tts = cleanup_session_state_locked(&mut vibevoice_tts, session);
         let fish_s2_tts = cleanup_session_state_locked(&mut fish_s2_tts, session);
+        let fish_drama3_tts = cleanup_session_state_locked(&mut fish_drama3_tts, session);
         let voxtral_tts = cleanup_session_state_locked(&mut voxtral_tts, session);
         let chatterbox_tts = cleanup_session_state_locked(&mut chatterbox_tts, session);
         let maya1_tts = cleanup_session_state_locked(&mut maya1_tts, session);
@@ -4459,6 +4553,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(lfm25_tts)
                 .combine(vibevoice_tts)
                 .combine(fish_s2_tts)
+                .combine(fish_drama3_tts)
                 .combine(voxtral_tts)
                 .combine(chatterbox_tts)
                 .combine(maya1_tts)
@@ -4485,11 +4580,13 @@ impl ModelExecutor for NativeExecutor {
                 .lfm3_audio_realtime
                 .abort_matching(|pending| pending.active.variant == variant)
                 .is_err()
+            || self.fish_drama3_pending.abort_variant(variant).is_err()
         {
             return CacheReleaseReport::unconfirmed();
         }
         let (
             Ok(mut states),
+            Ok(mut fish_drama3_tts),
             Ok(mut voxtral_tts),
             Ok(mut chatterbox_tts),
             Ok(mut maya1_tts),
@@ -4499,6 +4596,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut lfm3_live),
         ) = (
             self.voxtral_realtime.states.lock(),
+            self.fish_drama3_tts_decode_states.lock(),
             self.voxtral_tts_decode_states.lock(),
             self.chatterbox_tts_decode_states.lock(),
             self.maya1_tts_decode_states.lock(),
@@ -4511,6 +4609,11 @@ impl ModelExecutor for NativeExecutor {
         };
         cleanup_report(
             cleanup_model_states_locked(&mut states, variant, |active| active.variant)
+                .combine(cleanup_model_states_locked(
+                    &mut fish_drama3_tts,
+                    variant,
+                    |active| active.variant,
+                ))
                 .combine(cleanup_model_states_locked(
                     &mut voxtral_tts,
                     variant,
@@ -4598,6 +4701,7 @@ impl UnifiedExecutor {
         let voxtral_realtime = Arc::new(VoxtralRealtimeStateCoordinator::new());
         let lfm3_audio_realtime = Arc::new(Lfm3AudioRealtimeStateCoordinator::new());
         let fish_s2_pending = Arc::new(FishStateCoordinator::new());
+        let fish_drama3_pending = Arc::new(FishDrama3StateCoordinator::new());
         let long_form_asr = Arc::new(long_form::LongFormAsrRuns::default());
         let device = match DeviceThread::for_device(&config.backend_context.device.device) {
             Ok(device) => Some(device),
@@ -4615,6 +4719,7 @@ impl UnifiedExecutor {
                     voxtral_realtime.clone(),
                     lfm3_audio_realtime.clone(),
                     fish_s2_pending.clone(),
+                    fish_drama3_pending.clone(),
                     long_form_asr.clone(),
                 ),
             ))),
@@ -4622,6 +4727,7 @@ impl UnifiedExecutor {
             physical_execution_admission,
             pending_quantum_finalizer: Some(Arc::new(RealtimePendingQuantumFinalizer {
                 fish: fish_s2_pending,
+                fish_drama3: fish_drama3_pending,
                 voxtral: voxtral_realtime,
                 lfm3_audio: lfm3_audio_realtime,
                 long_form: long_form_asr,
@@ -7437,6 +7543,28 @@ mod tests {
         assert_eq!(profile.mode, ExecutionMode::Sequence);
         assert!(profile.incremental_decode);
         assert_eq!(profile.prefill, PrefillMode::Full);
+    }
+
+    /// Before its model is prepared, Drama 3 is a retained sequence whose
+    /// prefill is not yet proven resumable; its spans and grid come with the
+    /// prepared lease (the runtime tests run the prepared route).
+    #[test]
+    fn fish_drama3_tts_raw_profile_uses_the_sequence_execution_route() {
+        let executor = NativeExecutor::new(WorkerConfig {
+            backend: BackendKind::Cpu,
+            request_parallelism: 4,
+            ..Default::default()
+        });
+        let mut request = EngineCoreRequest::tts("hello world.");
+        request.model_variant = Some(ModelVariant::FishAudioDrama3);
+
+        let profile = executor.execution_profile(&request).unwrap();
+
+        assert_eq!(profile.mode, ExecutionMode::Sequence);
+        assert!(profile.incremental_decode);
+        assert_eq!(profile.prefill, PrefillMode::Full);
+        assert!(profile.prefill_spans_required);
+        assert_eq!(profile.prefill_grid_tokens, 0);
     }
 
     #[test]

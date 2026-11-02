@@ -2811,6 +2811,8 @@ impl SegmentSynthesis {
             reference_text: None,
             reference_language: None,
             voice_description: None,
+            speaker_references: Vec::new(),
+            chunk_history: Vec::new(),
         };
         let (chunk_tx, chunks) = tokio::sync::mpsc::channel(32);
         let state = state.clone();

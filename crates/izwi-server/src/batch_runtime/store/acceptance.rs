@@ -235,6 +235,8 @@ impl BatchRuntimeStore {
         let audio_mime_type = sanitize_audio_mime_type(&input.projection.audio_mime_type);
         let audio_filename =
             sanitize_optional_text(input.projection.audio_filename.as_deref(), 260);
+        let take = input.projection.take.clone();
+        let take_references_json = crate::speech_history_store::take_references_json(&take)?;
         let request_json_string = bounded_json_string(
             &input.request_json,
             MAX_DURABLE_TTS_REQUEST_JSON_BYTES,
@@ -296,6 +298,10 @@ impl BatchRuntimeStore {
             tokens_generated: None,
             audio_mime_type: audio_mime_type.clone(),
             audio_filename: audio_filename.clone(),
+            parent_take_id: take.parent_take_id.clone(),
+            references: take.references.clone(),
+            seed: take.seed,
+            editable: false,
         };
         // Persist only a bounded lookup key. Replays load the route projection
         // by ID, avoiding a second copy of potentially 1 MiB input text.
@@ -344,11 +350,12 @@ impl BatchRuntimeStore {
                 language, saved_voice_id, speed, input_text, voice_description,
                 reference_text, generation_time_ms, audio_duration_secs, rtf,
                 tokens_generated, audio_mime_type, audio_filename, audio_storage_path,
-                audio_media_asset_id, audio_artifact_tenant
+                audio_media_asset_id, audio_artifact_tenant, references_json, seed,
+                parent_take_id
             )
             VALUES (?1, ?2, 'text_to_speech', 'pending', NULL, NULL, NULL, ?3,
                     ?4, ?5, NULL, ?6, ?7, ?8, NULL, 0.0, NULL, NULL, NULL,
-                    ?9, ?10, '', NULL, NULL)
+                    ?9, ?10, '', NULL, NULL, ?11, ?12, ?13)
             "#,
             vec![
                 record_id.clone().into(),
@@ -361,6 +368,11 @@ impl BatchRuntimeStore {
                 opt_string(voice_description),
                 audio_mime_type.clone().into(),
                 opt_string(audio_filename.clone()),
+                opt_string(take_references_json),
+                take.seed
+                    .map(crate::speech_history_store::seed_to_db)
+                    .into(),
+                opt_string(take.parent_take_id),
             ],
         )?)
         .await

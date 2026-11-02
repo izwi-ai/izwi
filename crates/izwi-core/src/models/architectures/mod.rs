@@ -6,6 +6,7 @@
 //! 3. Wire loading in `crate::models::registry`.
 
 pub mod chatterbox;
+pub mod fish_drama3;
 pub mod fish_s2;
 pub mod gemma3;
 pub mod granite_speech;
@@ -28,3 +29,8 @@ pub mod sortformer;
 pub mod vibevoice;
 pub mod voxtral;
 pub mod whisper;
+
+/// Fish S2's DAC and Fish Audio Drama 3's copy of it, bit for bit: the one
+/// place that names both families.
+#[cfg(test)]
+mod fish_codec_equivalence;

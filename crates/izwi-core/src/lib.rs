@@ -121,7 +121,8 @@ pub use runtime::{
     ChatSamplingRequest, ChunkStats, DiarizationConfig, DiarizationPipelineOptions,
     DiarizationResult, DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance,
     DiarizationWord, GenerationRequest, GenerationResult, JobCancellation, ResolvedChatSampling,
-    TtsStopReason, TtsStreamingMode, WindowedAlignment, CHAT_MAX_TOKENS_UNSET,
+    SpeechChunkTurn, SpeechFrameCodes, SpeechSpeakerReference, TtsStopReason, TtsStreamingMode,
+    WindowedAlignment, CHAT_MAX_TOKENS_UNSET,
 };
 pub use runtime::{
     runtime_trace_contracts, sanitized_replay_record, stream_slow_consumer_timeout,

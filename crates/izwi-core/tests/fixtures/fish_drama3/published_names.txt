@@ -1,0 +1,4 @@
+# fishaudio/drama-3@78e5ab79e49aa9a25abe8799eff2c4d73a1c3216, model.safetensors.index.json:
+# the weight_map keys, sorted bytewise and joined with "\n" (no trailing newline).
+count 62245
+sha256 d179c02723415d2c3ea7fbcfb84311cea8a6c2df36295dbc0a6800c0a8690e5a

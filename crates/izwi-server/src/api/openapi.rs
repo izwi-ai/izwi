@@ -2202,25 +2202,56 @@ pub struct PromptTokensDetails {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SpeechRequest {
     pub model: String,
-    pub input: String,
+    /// The text to speak. Fish S2 and Fish Audio Drama 3 refuse text holding
+    /// their prompt's control tokens (`<|im_start|>`, `<|im_end|>`,
+    /// `<|voice|>`, `<|text|>`, `<|interleave|>`, `<|semantic:N|>`);
+    /// performance tags such as `[sighs]` and `<whisper>…</whisper>` pass
+    /// through. Long text is split into chunks the model speaks one after
+    /// another. Fish Audio Drama 3 voices `<|speaker:0|>` to
+    /// `<|speaker:15|>` tags in it as a dialogue. Required unless a
+    /// `script` gives the text.
+    pub input: Option<String>,
     pub voice: Option<String>,
     pub response_format: Option<String>,
     pub allow_format_fallback: Option<bool>,
     pub speed: Option<f32>,
+    /// A language hint. Fish Audio Drama 3 reads the language from the text
+    /// and is not given this; a `[language: xx]` tag in the text steers it.
     pub language: Option<String>,
     pub temperature: Option<f32>,
+    /// The output budget in model frames. Fish S2 bounds the whole request
+    /// with it; Fish Audio Drama 3 bounds each chunk (1 to 4,096; unset, a
+    /// chunk gets about 2.5 times its speaking estimate, at most 1,024).
     pub max_tokens: Option<usize>,
     pub max_output_tokens: Option<usize>,
+    /// Top-k sampling. Fish Audio Drama 3 reads 0 as no cap.
     pub top_k: Option<usize>,
     pub stream: Option<bool>,
     pub stream_format: Option<String>,
     pub instructions: Option<String>,
+    /// A reference clip to clone, base64 audio. Fish Audio Drama 3 takes one
+    /// up to 60 s (saved voices hold 30 s) and speaks in a voice its `seed`
+    /// sets when given none.
     pub reference_audio: Option<String>,
+    /// The reference clip's transcript, required with `reference_audio` by
+    /// every model that conditions on its words (all but Chatterbox).
     pub reference_text: Option<String>,
     /// The language the reference audio is spoken in (Maya 2 Native, which
     /// clones across languages); absent, read from the transcript's script.
     pub reference_language: Option<String>,
     pub saved_voice_id: Option<String>,
+    /// Reference voices per speaker, for a model that voices several
+    /// (`supports_speaker_dialogue`: Fish Audio Drama 3, at most 8, speakers
+    /// 0 to 15; several may voice one speaker). Each is a clip (`audio` and
+    /// its `text`) or a `saved_voice_id`. Replaces `reference_audio`,
+    /// `reference_text` and `saved_voice_id` (giving both is a 400); a
+    /// speaker without a reference speaks in a voice its `seed` sets. Inline
+    /// clips total at most 16 MiB; use saved voices beyond that.
+    pub references: Option<Vec<crate::api::speech_dialogue::SpeechDialogueReference>>,
+    /// A dialogue as lines, each spoken as `<|speaker:N|> text`, the lines
+    /// joined by newlines; replaces `input` (giving both is a 400). Models
+    /// with `supports_speaker_dialogue` only.
+    pub script: Option<Vec<crate::api::speech_dialogue::SpeechScriptLine>>,
     /// Model-specific sampling and controls (`top_p`, `seed`, `cfg_weight`,
     /// `exaggeration`, `min_p`, ...); a control the model does not take is
     /// refused.

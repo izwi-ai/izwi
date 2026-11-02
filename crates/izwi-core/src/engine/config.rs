@@ -50,6 +50,10 @@ pub(crate) fn tts_explicit_output_limit(
             crate::catalog::ModelFamily::FishS2Tts => {
                 ModelVariant::FISH_S2_PRO_NATIVE_CONTEXT_TOKENS
             }
+            // The codec stream's frame capacity, as on every backend.
+            crate::catalog::ModelFamily::FishDrama3Tts => {
+                crate::models::architectures::fish_drama3::model::MAX_EXPLICIT_FRAMES
+            }
             crate::catalog::ModelFamily::VoxtralTts => {
                 ModelVariant::VOXTRAL_TTS_CUDA_MAX_OUTPUT_FRAMES
             }

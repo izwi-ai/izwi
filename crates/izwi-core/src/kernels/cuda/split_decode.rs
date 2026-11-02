@@ -9,6 +9,14 @@
 //! `[context[B] | first_page_offset[B] | block_table[B x max_blocks]]`, and
 //! derives token ranges from the device context lengths.
 //!
+//! How many partitions a row gets is the caller's choice
+//! ([`SplitDecodePartitioning`]). [`partitions`] sizes them to fill the GPU,
+//! from the batch size and the batch's longest row, so a row's partition
+//! count, token ranges and merge depend on the rows beside it. The opt-in
+//! [`SplitDecodePartitioning::RowLength`] cuts every row into partitions of
+//! [`ROW_PARTITION_TOKENS`] tokens of its own context instead, so a row's
+//! output is the same whatever it is batched with (batch-invariant decode).
+//!
 //! On by default: `IZWI_CUDA_SPLIT_DECODE=0` turns it off, and so does
 //! `IZWI_KV_DISABLE_OPTIMIZED_PROVIDER`. The first use of each geometry runs
 //! [`self_check`] and compares one live call against the current provider;
@@ -55,6 +63,66 @@ pub fn partitions(batch: usize, kv_heads: usize, max_context: usize) -> usize {
     let by_context = max_context.div_ceil(MIN_PARTITION_TOKENS);
     let by_occupancy = TARGET_BLOCKS.div_ceil(batch.saturating_mul(kv_heads).max(1));
     by_context.min(by_occupancy).clamp(1, MAX_PARTITIONS)
+}
+
+/// How a split decode divides each row's context into partitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SplitDecodePartitioning {
+    /// [`partitions`]`(batch, kv_heads, longest row)` partitions for every
+    /// row, enough blocks to fill the GPU: a row's partition count, token
+    /// ranges and merge depend on its batch.
+    #[default]
+    Occupancy,
+    /// Partitions of [`ROW_PARTITION_TOKENS`] tokens over each row's own
+    /// context (at most 1,024 partitions, after which each grows): a row's
+    /// partitions, their token ranges and their merge come from its own
+    /// length only, so its output does not depend on the rows beside it.
+    RowLength,
+}
+
+/// A [`SplitDecodePartitioning::RowLength`] partition's tokens: one key tile
+/// per warp of the 4-warp block.
+pub const ROW_PARTITION_TOKENS: usize = MIN_PARTITION_TOKENS;
+
+/// The launch's partition count and the per-row partition length the
+/// kernel takes (`min_partition_tokens`, 0 for "every row uses them all")
+/// under `mode`, for a batch whose longest row holds `max_context` tokens.
+/// Under [`SplitDecodePartitioning::RowLength`] the launch has room for the
+/// longest row's own count, so every row uses exactly
+/// [`row_partitions`]`(its length)`.
+pub fn launch_partitions(
+    mode: SplitDecodePartitioning,
+    batch: usize,
+    kv_heads: usize,
+    max_context: usize,
+) -> (usize, usize) {
+    match mode {
+        SplitDecodePartitioning::Occupancy => (partitions(batch, kv_heads, max_context), 0),
+        SplitDecodePartitioning::RowLength => (
+            max_context
+                .div_ceil(ROW_PARTITION_TOKENS)
+                .clamp(1, MAX_PARTITIONS),
+            ROW_PARTITION_TOKENS,
+        ),
+    }
+}
+
+/// The partitions a row of `context_len` tokens uses in a launch of
+/// `num_partitions` with `min_partition_tokens` (the kernel's
+/// `izwi_split_decode_partitions`): all of them when that is 0, else one per
+/// `min_partition_tokens` of its own context, at least one.
+pub fn row_partitions(
+    context_len: usize,
+    num_partitions: usize,
+    min_partition_tokens: usize,
+) -> usize {
+    if min_partition_tokens == 0 {
+        return num_partitions;
+    }
+    context_len
+        .div_ceil(min_partition_tokens)
+        .min(num_partitions)
+        .max(1)
 }
 
 /// `[batch, query_heads, head_dim]` attention output for one decode token per
@@ -119,6 +187,38 @@ pub fn paged_decode_adaptive(
         softcap,
         max_partitions,
         MIN_PARTITION_TOKENS,
+    )
+}
+
+/// [`paged_decode`] partitioned by `mode` for a batch whose longest row
+/// holds `max_context` tokens ([`launch_partitions`]).
+#[allow(clippy::too_many_arguments)]
+pub fn paged_decode_partitioned(
+    queries: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    metadata: &Tensor,
+    batch: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    softmax_scale: f32,
+    softcap: Option<f32>,
+    mode: SplitDecodePartitioning,
+    max_context: usize,
+) -> Result<Tensor> {
+    let (partitions, min_partition_tokens) = launch_partitions(mode, batch, kv_heads, max_context);
+    paged_decode_with(
+        queries,
+        keys,
+        values,
+        metadata,
+        [batch, query_heads, kv_heads, page_tokens, max_blocks],
+        softmax_scale,
+        softcap,
+        partitions,
+        min_partition_tokens,
     )
 }
 
@@ -568,6 +668,154 @@ mod tests {
         assert_eq!(partitions(1, 1, 1_000_000), 512);
     }
 
+    /// One row of the split algorithm on the host, as the kernels divide
+    /// it: `used` partitions of `ceil(L / used)` tokens, each an online
+    /// softmax over its tokens in order (max, sum, unnormalized output),
+    /// then the reduction's merge. `keys` and `values` are `[L, dim]` for
+    /// one KV head, `query` `[dim]`.
+    fn split_row(query: &[f32], keys: &[f32], values: &[f32], used: usize, scale: f32) -> Vec<f32> {
+        let dim = query.len();
+        let len = keys.len() / dim;
+        let span = len.div_ceil(used);
+        let mut partials = Vec::with_capacity(used);
+        for p in 0..used {
+            let (start, end) = ((p * span).min(len), (p * span + span).min(len));
+            let (mut max, mut sum, mut out) = (f32::NEG_INFINITY, 0f32, vec![0f32; dim]);
+            for t in start..end {
+                let score = query
+                    .iter()
+                    .zip(&keys[t * dim..(t + 1) * dim])
+                    .fold(0f32, |acc, (q, k)| q.mul_add(*k, acc))
+                    * scale;
+                let next = max.max(score);
+                let rescale = (max - next).exp();
+                let weight = (score - next).exp();
+                sum = sum * rescale + weight;
+                for (o, v) in out.iter_mut().zip(&values[t * dim..(t + 1) * dim]) {
+                    *o = o.mul_add(rescale, weight * v);
+                }
+                max = next;
+            }
+            partials.push((max, sum, out));
+        }
+        let global = partials
+            .iter()
+            .filter(|(_, sum, _)| *sum > 0.0)
+            .fold(f32::NEG_INFINITY, |m, (max, ..)| m.max(*max));
+        let weights = partials
+            .iter()
+            .map(|(max, sum, _)| {
+                if *sum > 0.0 {
+                    (max - global).exp()
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        let total = partials
+            .iter()
+            .zip(&weights)
+            .fold(0f32, |t, ((_, sum, _), w)| t + sum * w);
+        (0..dim)
+            .map(|d| {
+                partials
+                    .iter()
+                    .zip(&weights)
+                    .fold(0f32, |acc, ((.., out), w)| acc + w * out[d])
+                    / total
+            })
+            .collect()
+    }
+
+    /// Under [`SplitDecodePartitioning::RowLength`] a row's partitions come
+    /// from its own length, so its output is the same alone, beside a longer
+    /// row and beside a shorter one; under today's occupancy partitioning
+    /// (RED) a longer row beside it changes its partitions and its bits.
+    #[test]
+    fn row_length_partitions_make_a_rows_output_independent_of_its_batch() {
+        let (dim, kv_heads) = (64usize, 2usize);
+        let row_len = 700usize;
+        let wave = |n: usize, seed: f32| {
+            (0..n)
+                .map(|i| ((i as f32 + seed) * 0.754_877_7).sin())
+                .collect::<Vec<_>>()
+        };
+        let (query, keys, values) = (
+            wave(dim, 1.0),
+            wave(row_len * dim, 2.0),
+            wave(row_len * dim, 3.0),
+        );
+        let scale = 1.0 / (dim as f32).sqrt();
+        let output = |mode: SplitDecodePartitioning, batch: &[usize]| {
+            let longest = batch.iter().copied().max().unwrap();
+            let (launch, min_tokens) = launch_partitions(mode, batch.len(), kv_heads, longest);
+            let used = row_partitions(row_len, launch, min_tokens);
+            let bits = split_row(&query, &keys, &values, used, scale)
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>();
+            (used, bits)
+        };
+        // Alone, beside a longer row, beside a shorter one, in either order.
+        let batches: [&[usize]; 5] = [
+            &[row_len],
+            &[row_len, 3_000],
+            &[3_000, row_len],
+            &[200, row_len],
+            &[row_len, 200, 3_000, 40_000],
+        ];
+        let alone = output(SplitDecodePartitioning::RowLength, batches[0]);
+        assert_eq!(alone.0, row_len.div_ceil(ROW_PARTITION_TOKENS));
+        for batch in &batches[1..] {
+            assert_eq!(
+                output(SplitDecodePartitioning::RowLength, batch),
+                alone,
+                "{batch:?}"
+            );
+        }
+        // RED: occupancy gives the row 6 partitions alone and 24 beside a
+        // 3,000-token row, and the merge changes its bits.
+        let occupancy = output(SplitDecodePartitioning::Occupancy, batches[0]);
+        let beside = output(SplitDecodePartitioning::Occupancy, batches[1]);
+        assert_ne!(occupancy.0, beside.0);
+        assert_ne!(
+            occupancy.1, beside.1,
+            "the RED partitioning must change the row's bits"
+        );
+        // Every output is the attention itself.
+        let reference = split_row(&query, &keys, &values, 1, scale);
+        let bits = |values: &[u32]| {
+            values
+                .iter()
+                .map(|&v| f32::from_bits(v))
+                .collect::<Vec<_>>()
+        };
+        for (a, b) in bits(&alone.1).iter().zip(&reference) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+        // Existing callers keep their geometry exactly.
+        assert_eq!(
+            launch_partitions(SplitDecodePartitioning::Occupancy, 3, 2, 4_096),
+            (partitions(3, 2, 4_096), 0)
+        );
+        assert_eq!(
+            SplitDecodePartitioning::default(),
+            SplitDecodePartitioning::Occupancy
+        );
+        // Past 1,024 partitions a row's partitions grow, still from its own
+        // length.
+        assert_eq!(
+            launch_partitions(SplitDecodePartitioning::RowLength, 1, 2, 1_000_000),
+            (MAX_PARTITIONS, ROW_PARTITION_TOKENS)
+        );
+        assert_eq!(
+            row_partitions(1_000_000, MAX_PARTITIONS, ROW_PARTITION_TOKENS),
+            MAX_PARTITIONS
+        );
+        assert_eq!(row_partitions(1, 7, ROW_PARTITION_TOKENS), 1);
+        assert_eq!(row_partitions(300, 7, 0), 7);
+    }
+
     #[test]
     fn compare_accepts_rounding_and_rejects_drift() {
         let expected = Tensor::new(&[1.0f32, -2.0, 0.5], &Device::Cpu)
@@ -585,6 +833,106 @@ mod tests {
             .to_dtype(DType::BF16)
             .unwrap();
         assert!(compare(&nan, &expected).is_err());
+    }
+
+    /// On the device, a row's output under
+    /// [`SplitDecodePartitioning::RowLength`] is the same alone, beside a
+    /// longer row and beside a shorter one, at any slot of the batch (the
+    /// RED against occupancy partitioning runs on the emulator, which reads
+    /// the merge in F32: a BF16 store rounds most of its differences away).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_row_length_split_decode_is_batch_invariant() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let (query_heads, kv_heads, head_dim, page_tokens) = (16usize, 2usize, 256usize, 16usize);
+        // (context, first-page offset, query seed): the subject, a longer
+        // row and a shorter one, each on its own pages handed out in reverse.
+        let rows = [(700usize, 5usize, 1.0f32), (3_000, 0, 2.0), (200, 11, 3.0)];
+        let mut next = 0u32;
+        let tables = rows
+            .iter()
+            .map(|&(context, offset, _)| {
+                let pages = (context + offset).div_ceil(page_tokens) as u32;
+                let table = (next..next + pages).rev().collect::<Vec<_>>();
+                next += pages;
+                table
+            })
+            .collect::<Vec<_>>();
+        let capacity = next as usize;
+        let wave = |n: usize, seed: f32, scale: f32| {
+            (0..n)
+                .map(|i| ((i as f32 + seed) * 0.754_877_7).sin() * scale)
+                .collect::<Vec<_>>()
+        };
+        let kv_dims = (capacity, page_tokens, kv_heads, head_dim);
+        let kv_len = capacity * page_tokens * kv_heads * head_dim;
+        let cache = |seed: f32, scale: f32| {
+            Tensor::from_vec(wave(kv_len, seed, scale), kv_dims, &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .to_device(&device)
+                .unwrap()
+        };
+        let (keys, values) = (cache(5.0, 2.0), cache(7.0, 1.0));
+        let subject_bits = |batch: &[usize]| -> Vec<u32> {
+            let max_blocks = batch.iter().map(|&r| tables[r].len()).max().unwrap();
+            let mut metadata = batch.iter().map(|&r| rows[r].0 as u32).collect::<Vec<_>>();
+            metadata.extend(batch.iter().map(|&r| rows[r].1 as u32));
+            for &r in batch {
+                let mut table = tables[r].clone();
+                table.resize(max_blocks, 0);
+                metadata.extend(table);
+            }
+            let queries = batch
+                .iter()
+                .flat_map(|&r| wave(query_heads * head_dim, rows[r].2, 1.0))
+                .collect::<Vec<_>>();
+            let queries =
+                Tensor::from_vec(queries, (batch.len(), query_heads, head_dim), &Device::Cpu)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap()
+                    .to_device(&device)
+                    .unwrap();
+            let metadata =
+                Tensor::from_vec(metadata, batch.len() * (2 + max_blocks), &device).unwrap();
+            let longest = batch.iter().map(|&r| rows[r].0).max().unwrap();
+            let out = paged_decode_partitioned(
+                &queries,
+                &keys,
+                &values,
+                &metadata,
+                batch.len(),
+                query_heads,
+                kv_heads,
+                page_tokens,
+                max_blocks,
+                1.0 / (head_dim as f32).sqrt(),
+                None,
+                SplitDecodePartitioning::RowLength,
+                longest,
+            )
+            .unwrap();
+            let slot = batch.iter().position(|&r| r == 0).unwrap();
+            out.get(slot)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect()
+        };
+        let alone = subject_bits(&[0]);
+        for batch in [&[0usize, 1][..], &[1, 0], &[2, 0], &[2, 0, 1]] {
+            assert_eq!(subject_bits(batch), alone, "{batch:?}");
+        }
     }
 
     #[cfg(feature = "cuda")]

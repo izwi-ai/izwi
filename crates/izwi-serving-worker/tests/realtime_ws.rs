@@ -1074,6 +1074,7 @@ impl RealtimeTtsStageStream for FakeTtsStream {
                     sample_rate: 24_000,
                     is_final: chunk.is_final,
                     stats: None,
+                    generated_codes: None,
                 }))
             }
             None => Ok(None),

@@ -244,6 +244,54 @@ the refusal is quick and leaves nothing half-loaded.
 
 These figures are computed from the model's published configuration.
 
+### Fish Audio Drama 3 refused at load: not enough memory
+
+`FishAudio-Drama-3` holds about 37 GiB of weights on CPU, Metal and CUDA, and
+its load briefly needs a little more, plus room for one request. Izwi works
+this out before reading any weights and refuses a load the backend's memory
+budget cannot hold, with a message such as "Fish Audio Drama 3 needs about …
+GiB of … memory (… GiB of weights, a … GiB load peak, … GiB for one request);
+this device has … GiB".
+
+- Unload other models and load it again:
+  ```bash
+  izwi models unload <model-name>
+  izwi models load FishAudio-Drama-3
+  ```
+- On a Mac, use one with 64 GB or more of unified memory.
+- On NVIDIA, use a GPU with 48 GB or more and compute capability 8.0 or newer;
+  an older GPU is refused before any weights are read.
+- If you set `IZWI_CPU_MEMORY_BUDGET_BYTES`, `IZWI_METAL_MEMORY_BUDGET_BYTES` or
+  `IZWI_CUDA_MEMORY_BUDGET_BYTES`, make sure the budget leaves room for the
+  model.
+
+### Fish Audio Drama 3 request errors
+
+| Error | Cause and fix |
+|-------|---------------|
+| `500` with "generation incomplete: frame_limit reached before end of speech" | A chunk ran out of its frame budget before the model finished speaking. Raise `max_tokens` (up to 4,096 frames per chunk, about 190 s), or shorten the text of that chunk. |
+| `400` "`input` contains `<\|im_end\|>`, a control token … reserves for its prompt" | The text (or `reference_text`) holds one of `<\|im_start\|>`, `<\|im_end\|>`, `<\|voice\|>`, `<\|text\|>`, `<\|interleave\|>` or `<\|semantic:N\|>`. Remove it; performance tags such as `[sighs]` are fine. Fish Audio S2 Pro refuses the same tokens. |
+| `400` naming a speaker tag | Speaker tags run from `<\|speaker:0\|>` to `<\|speaker:15\|>`; other `<\|speaker…` forms are refused. |
+| `400` "Fish Audio Drama 3 long-form generation is disabled by this deployment" | The text needs more than one chunk (about 300 bytes) and the server runs with `IZWI_FISH_DRAMA3_LONG_FORM_ENABLED=false`. Shorten the text, or remove the setting and restart the server. |
+| `400` "Provide both `reference_audio` and `reference_text` together." | A reference clip needs its transcript. Send both, or send neither for a voice set by the `seed`. |
+| `400` "This saved voice has no transcript, …" | The saved voice was stored without a transcript. Use a voice saved with one, or no voice. |
+| `400` "`reference_audio`: … production limit; a reference clip lasts at most 60 s" (`` `references[N]` `` for a dialogue reference) | The reference is longer than 60 seconds, or its audio does not decode. Trim it; 10 to 30 seconds of clear speech is enough. |
+| `400` "… speaks one voice: `references` and `script` are for models that voice several speakers" | Only `FishAudio-Drama-3` takes `references` and `script`. For another model, use `reference_audio` with `reference_text`, or `saved_voice_id`. |
+| `400` "Use either `references` or `reference_audio`/`reference_text`/`saved_voice_id`, not both." | A dialogue gives every voice in `references`. Move the single reference into it as `{"speaker": 0, …}`. |
+| `400` "Use either `input` or `script`, not both." (`text` on the record routes) | A script is the text. Send one or the other. |
+| `400` "… takes at most 8 references" or "… speakers are 0 to 15" | A request carries at most 8 reference clips, and speakers are numbered 0 to 15. Several references may voice one speaker; a speaker with none speaks in a voice the `seed` sets. |
+| `400` "`references[N]` needs `text`, …" or "`references[N]` is a saved voice without a transcript" | Every reference needs its transcript: send `text` with `audio`, or use a saved voice stored with one. |
+| `400` "`references[N]` gives both `audio` and `saved_voice_id`", "… needs `audio` …" or "… brings its own transcript" | Each reference is either `audio` with its `text`, or a `saved_voice_id` alone. |
+| `400` "`references[N].text` starts with another speaker's tag …" | The transcript starts with a `<\|speaker:M\|>` tag that differs from the reference's `speaker`. Drop the tag or make them match. |
+| `400` "script line N: …" | A script line is empty, carries its own speaker tag, or names a speaker past 15. The speaker comes from the line's `speaker` field. |
+| `400` "The inline reference audio totals … at most 16 MiB" | Inline clips are capped below the request size limit. Save the voices with `POST /v1/voices` and give each reference its `saved_voice_id`. |
+| `400` "Fish Audio Drama 3's prompt holds N references in … rows, leaving no room for the text" | The references' audio fills the prompt (8,192 rows, about 21.5 per second of audio). Use fewer or shorter references; 10 to 30 seconds each is plenty. |
+| `404` "Previous take `ID` not found." | `previous_take_ids` names a record that does not exist on this route: deleted, mistyped, or a record of another route (a `/v1/voice-clones` take on `/v1/text-to-speech`). Send the id of a take from the same route. A durable take whose earlier take is deleted while it runs fails with the same message. |
+| `400` "Previous take `ID` kept no codes to continue from …" | The take has not finished, failed, or was made before take editing, so it kept no audio codes. Wait for it to finish, or continue a newer take. |
+| `400` "Previous take `ID` was made by …, not …" | A take continues only takes of its own model. Generate the new take with the earlier take's model. |
+| `400` "`previous_take_ids` names N takes; a take continues at most 2." or "… names `ID` twice." | Send at most 2 different takes, oldest first. |
+| `400` "… does not continue earlier takes" | Only `FishAudio-Drama-3` takes `previous_take_ids`. Drop the field for another model. |
+
 ### Model not detected after manual download
 
 1. Verify correct directory:
@@ -461,10 +509,10 @@ Ensure required models are loaded:
 
 | Feature | Required Model Type |
 |---------|---------------------|
-| TTS | `Kokoro-82M`, `Qwen3-TTS-*`, `Voxtral-4B-TTS-2603`, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `Chatterbox-500M` / `Chatterbox-Multilingual-500M`, `Maya1-3B`, `Maya2-Native-2.5B`, or `LFM3-Audio-2B-*` |
+| TTS | `Kokoro-82M`, `Qwen3-TTS-*`, `Voxtral-4B-TTS-2603`, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `FishAudio-Drama-3`, `Chatterbox-500M` / `Chatterbox-Multilingual-500M`, `Maya1-3B`, `Maya2-Native-2.5B`, or `LFM3-Audio-2B-*` |
 | Transcription | `Parakeet-*`, `Whisper-*`, `Qwen3-ASR-*`, `Granite-Speech-*`, `LFM2.5-Audio-*`, or `LFM3-Audio-2B-*` |
 | Chat | `Qwen3.5-*`, `Qwen3.6-*`, `Qwen3.8-*`, `LFM2.5-1.2B-*`, or `LFM3-1.7B-*` |
-| Voice Cloning | `Qwen3-TTS-12Hz-*-Base`, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `Chatterbox-500M` / `Chatterbox-Multilingual-500M`, or `Maya2-Native-2.5B` |
+| Voice Cloning | `Qwen3-TTS-12Hz-*-Base`, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `FishAudio-Drama-3`, `Chatterbox-500M` / `Chatterbox-Multilingual-500M`, or `Maya2-Native-2.5B` |
 | Voice Design | `Qwen3-TTS-12Hz-1.7B-VoiceDesign*` or `Maya1-3B` |
 
 ---

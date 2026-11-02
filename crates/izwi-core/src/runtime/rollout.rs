@@ -49,8 +49,9 @@ impl KvProviderRollout {
         self.optimized_provider_enabled
     }
 
-    // Read by the accelerator KV backend, which only Metal and CUDA builds compile.
-    #[cfg_attr(not(any(feature = "cuda", feature = "metal")), allow(dead_code))]
+    // Read by the accelerator KV backend's Metal completion tracking, which
+    // only Metal builds compile.
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
     pub(crate) const fn metal_eager_fences(self) -> bool {
         self.metal_eager_fences
     }
@@ -113,6 +114,10 @@ pub(crate) fn validate_managed_state_plan_eligibility(
             | (ModelFamily::VoxtralTts, CapabilityKind::Tts)
             | (
                 ModelFamily::FishS2Tts,
+                CapabilityKind::Tts | CapabilityKind::StreamingTts
+            )
+            | (
+                ModelFamily::FishDrama3Tts,
                 CapabilityKind::Tts | CapabilityKind::StreamingTts
             )
             | (ModelFamily::ChatterboxTts, CapabilityKind::Tts)

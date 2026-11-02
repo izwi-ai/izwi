@@ -1320,6 +1320,12 @@ pub struct ExecutionProfile {
     /// (`ModelFamily::requires_prefill_spans`).
     #[serde(default)]
     pub prefill_spans_required: bool,
+    /// The loaded family's own prefill grid, in prompt tokens (0: none). A
+    /// resumable prefill quantum is then exactly the next cell of the grid,
+    /// never cut to the engine's chunk or step budget: the family's span
+    /// bits depend on how the prompt splits (Fish Audio Drama 3).
+    #[serde(default)]
+    pub prefill_grid_tokens: usize,
     pub resolved_from_loaded_model: bool,
     pub compute_dtype: String,
     pub kv_dtype: String,
@@ -1370,6 +1376,7 @@ impl ExecutionProfile {
             mixed_step: false,
             preferred_prefill_tokens: 0,
             prefill_spans_required: false,
+            prefill_grid_tokens: 0,
             resolved_from_loaded_model: false,
             compute_dtype: "unknown".to_string(),
             kv_dtype: "none".to_string(),
@@ -1741,6 +1748,48 @@ impl ManagedCacheReservation {
         Ok(())
     }
 
+    /// The decoder clock's span `[start, target)`: the furthest domain's. A
+    /// domain the request projects behind the clock
+    /// (`EngineCoreRequest::project_paged_state_input`: VibeVoice's negative
+    /// sequence, Fish Audio Drama 3's tower one row behind its trunk) starts
+    /// and ends no later.
+    pub(crate) fn clock_span_tokens(&self) -> Option<(u32, u32)> {
+        let start = self
+            .domains
+            .iter()
+            .map(|domain| domain.execution_start_tokens)
+            .max()?;
+        let target = self
+            .domains
+            .iter()
+            .map(|domain| domain.target_committed_tokens)
+            .max()?;
+        Some((start, target))
+    }
+
+    /// Where `domain` commits: its reserved target, or under an accepted
+    /// clock prefix as many positions past its own start as the clock
+    /// advanced, never past its target. Without a projected domain every
+    /// domain shares the clock's span, so this is the accepted prefix itself.
+    pub(crate) fn domain_committed_tokens(
+        &self,
+        domain: &ManagedCacheDomainReservation,
+        accepted_prefix: Option<u32>,
+    ) -> u32 {
+        match accepted_prefix {
+            None => domain.target_committed_tokens,
+            Some(clock) => {
+                let clock_start = self
+                    .clock_span_tokens()
+                    .map_or(domain.execution_start_tokens, |(start, _)| start);
+                domain
+                    .execution_start_tokens
+                    .saturating_add(clock.saturating_sub(clock_start))
+                    .min(domain.target_committed_tokens)
+            }
+        }
+    }
+
     /// Reconcile backend-sealed physical writes with this exact row.
     pub(crate) fn completed_write_receipt(
         &self,
@@ -1770,10 +1819,18 @@ impl ManagedCacheReservation {
         completions: &[Arc<KvWriteBatchCompletion>],
         accepted_prefix: Option<u32>,
     ) -> Result<ManagedCacheReceipt> {
+        if let (Some(clock), Some((start, target))) = (accepted_prefix, self.clock_span_tokens()) {
+            if clock < start || clock > target {
+                return Err(Error::InferenceError(
+                    "managed-cache accepted prefix is outside the reserved append range".into(),
+                ));
+            }
+        }
         let unchanged_prefix = accepted_prefix.is_some_and(|committed| {
-            self.domains
-                .iter()
-                .all(|domain| committed == domain.execution_start_tokens)
+            self.domains.iter().all(|domain| {
+                self.domain_committed_tokens(domain, Some(committed))
+                    == domain.execution_start_tokens
+            })
         });
         if unchanged_prefix {
             if !self.allow_unchanged_prefix {
@@ -1809,7 +1866,7 @@ impl ManagedCacheReservation {
         }
         let mut receipts = Vec::with_capacity(self.domains.len());
         for domain in &self.domains {
-            let committed_tokens = accepted_prefix.unwrap_or(domain.target_committed_tokens);
+            let committed_tokens = self.domain_committed_tokens(domain, accepted_prefix);
             if committed_tokens < domain.execution_start_tokens
                 || committed_tokens > domain.target_committed_tokens
             {
@@ -2055,6 +2112,22 @@ impl ManagedCacheReceipt {
         self.accepted_prefix
     }
 
+    /// The cursor `domain` commits at under this receipt
+    /// ([`ManagedCacheReservation::domain_committed_tokens`]).
+    pub(crate) fn committed_tokens(&self, domain: &ManagedCacheDomainReservation) -> u32 {
+        self.reservation
+            .domain_committed_tokens(domain, self.accepted_prefix)
+    }
+
+    /// The decoder clock's committed cursor: the furthest domain's.
+    pub(crate) fn clock_committed_tokens(&self) -> Option<u32> {
+        self.reservation
+            .domains
+            .iter()
+            .map(|domain| self.committed_tokens(domain))
+            .max()
+    }
+
     pub(crate) const fn clocked_state(&self) -> Option<&ManagedClockedStateReceipt> {
         self.clocked_state.as_ref()
     }
@@ -2150,9 +2223,16 @@ impl ManagedCacheReceipt {
                 .iter()
                 .copied()
                 .collect::<HashSet<_>>();
-            let committed_tokens = self
-                .accepted_prefix
-                .unwrap_or(reservation.target_committed_tokens);
+            if let (Some(clock), Some((start, target))) =
+                (self.accepted_prefix, self.reservation.clock_span_tokens())
+            {
+                if clock < start || clock > target {
+                    return Err(Error::InferenceError(
+                        "managed-cache receipt has an invalid committed prefix".into(),
+                    ));
+                }
+            }
+            let committed_tokens = self.committed_tokens(reservation);
             let unchanged = committed_tokens == reservation.execution_start_tokens;
             if committed_tokens < reservation.execution_start_tokens
                 || committed_tokens > reservation.target_committed_tokens
@@ -4116,6 +4196,73 @@ mod tests {
         assert!(report.validate_against(&batch, &active).is_err());
         report.rows[0].state = StateDisposition::RolledBack;
         assert!(report.validate_against(&batch, &active).is_ok());
+    }
+
+    /// A domain the request projects behind the decoder clock (Fish Audio
+    /// Drama 3's tower) commits as many positions past its own start as the
+    /// clock advanced, never past its own target, and an unchanged clock
+    /// leaves every domain unchanged.
+    #[test]
+    fn projected_domains_commit_relative_to_the_decoder_clock() {
+        use crate::kv::KvGroupId;
+
+        let lane = lane();
+        let arena = |generation| KvArenaId {
+            model_instance: lane.model_instance,
+            backend: lane.backend,
+            device_ordinal: lane.device_ordinal,
+            generation,
+        };
+        let domain = |id: u32, start: u32, target: u32| ManagedCacheDomainReservation {
+            arena: arena(id),
+            domain: CacheDomainId::new(id),
+            expected_version: 1,
+            expected_committed_tokens: start,
+            execution_start_tokens: start,
+            target_committed_tokens: target,
+            target_window_start: 0,
+            first_page_offset: 0,
+            provisional_groups: vec![GroupBlockTable {
+                group: KvGroupId::new(0),
+                blocks: Vec::new(),
+            }],
+            writable_blocks: Vec::new(),
+        };
+        let reservation = |domains, allow_unchanged_prefix| ManagedCacheReservation {
+            txn_id: 5,
+            session: SessionKey::new("projected".to_string(), 1),
+            session_generation: ManagedSessionGeneration::INITIAL,
+            domains,
+            clocked_state: None,
+            allow_unchanged_prefix,
+        };
+        // Decode: the trunk appends row 40, the tower row 39.
+        let decode = reservation(vec![domain(1, 40, 41), domain(2, 39, 40)], true);
+        assert_eq!(decode.clock_span_tokens(), Some((40, 41)));
+        let [trunk, tower] = [&decode.domains[0], &decode.domains[1]];
+        assert_eq!(decode.domain_committed_tokens(trunk, Some(41)), 41);
+        assert_eq!(decode.domain_committed_tokens(tower, Some(41)), 40);
+        assert_eq!(decode.domain_committed_tokens(tower, None), 40);
+        // An eos quantum appends nothing to either.
+        assert_eq!(decode.domain_committed_tokens(tower, Some(40)), 39);
+        let receipt = decode.completed_write_receipt_for_prefix(&[], 40).unwrap();
+        assert_eq!(receipt.committed_tokens(trunk), 40);
+        assert_eq!(receipt.committed_tokens(tower), 39);
+        assert_eq!(receipt.clock_committed_tokens(), Some(40));
+        receipt.validate().unwrap();
+        // A clock outside its span is refused, not clamped.
+        assert!(decode.completed_write_receipt_for_prefix(&[], 39).is_err());
+        assert!(decode.completed_write_receipt_for_prefix(&[], 42).is_err());
+        // The final prefill cell: the tower stops one row short.
+        let last_cell = reservation(vec![domain(1, 256, 300), domain(2, 256, 299)], false);
+        let [trunk, tower] = [&last_cell.domains[0], &last_cell.domains[1]];
+        assert_eq!(last_cell.domain_committed_tokens(trunk, Some(300)), 300);
+        assert_eq!(last_cell.domain_committed_tokens(tower, Some(300)), 299);
+        // Unprojected domains share the clock: the prefix is the cursor.
+        let level = reservation(vec![domain(1, 8, 16), domain(2, 8, 16)], false);
+        for domain in &level.domains {
+            assert_eq!(level.domain_committed_tokens(domain, Some(12)), 12);
+        }
     }
 
     #[test]

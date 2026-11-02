@@ -25,6 +25,7 @@ use crate::kv::v2::{InvocationStateBackingKindV2, InvocationWorkspaceLeaseSetV2}
 use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
 use crate::models::architectures::chatterbox::ChatterboxTtsModel;
+use crate::models::architectures::fish_drama3::FishDrama3Model;
 use crate::models::architectures::fish_s2::FishS2TtsModel;
 use crate::models::architectures::gemma3::chat::{
     ChatDecodeCheckpoint as Gemma3ChatDecodeCheckpoint, ChatDecodeState as Gemma3ChatDecodeState,
@@ -172,6 +173,7 @@ type Maya1TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<Maya1Tt
 type Maya2TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<Maya2TtsModel>;
 type VibeVoiceTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VibeVoiceTtsModel>;
 type FishS2TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<FishS2TtsModel>;
+type FishDrama3TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<FishDrama3Model>;
 type QwenTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile, usize, &str) -> Result<Qwen3TtsModel>;
 type KokoroLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<KokoroTtsModel>;
 
@@ -244,6 +246,12 @@ struct FishS2TtsLoaderRegistration {
     name: &'static str,
     family: ModelFamily,
     loader: FishS2TtsLoaderFn,
+}
+
+struct FishDrama3TtsLoaderRegistration {
+    name: &'static str,
+    family: ModelFamily,
+    loader: FishDrama3TtsLoaderFn,
 }
 
 struct QwenTtsLoaderRegistration {
@@ -562,6 +570,83 @@ fn load_fish_s2_tts_model(
     FishS2TtsModel::load(model_dir, variant, device)
 }
 
+/// What a Fish Audio Drama 3 load checks before it reads a weight: the
+/// backend's forms run on the device (a CUDA load needs compute capability
+/// 8.0 or newer), and a published checkpoint is the pinned one (sizes and
+/// the `config.json` hash, never a re-hash of 41.5 GB). It then logs the
+/// licence once per load. Test checkpoints (`Synthetic`) have no pinned
+/// manifest.
+fn prepare_fish_drama3_tts_load(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: &DeviceProfile,
+    policy: crate::models::architectures::fish_drama3::FishDrama3ConfigPolicy,
+) -> Result<()> {
+    use crate::models::architectures::fish_drama3::{
+        artifacts, FishDrama3ConfigPolicy, FishDrama3Residency,
+    };
+    if device.kind == crate::backends::DeviceKind::Cuda {
+        FishDrama3Residency::Cuda.require_supported(&device.device)?;
+    }
+    if policy == FishDrama3ConfigPolicy::Published {
+        artifacts::verify_identity(model_dir)?;
+    }
+    info!(
+        model = %variant,
+        license = variant.license_label().unwrap_or("unknown"),
+        "{variant} weights: {}",
+        variant
+            .license_notice()
+            .unwrap_or("see the model card for the licence terms")
+    );
+    Ok(())
+}
+
+/// The load options of a Fish Audio Drama 3 load on `device`: the family's
+/// defaults with `IZWI_FISH_DRAMA3_DTYPE`, `_MOE_BACKEND` and
+/// `_PREFILL_SPAN` over them.
+fn fish_drama3_load_options(
+    device: &DeviceProfile,
+) -> Result<crate::models::architectures::fish_drama3::FishDrama3ModelOptions> {
+    use crate::models::architectures::fish_drama3::{FishDrama3ModelOptions, FishDrama3Residency};
+    let backend = crate::backends::BackendKind::from(device.kind);
+    FishDrama3ModelOptions::from_env(
+        FishDrama3Residency::of(&device.device),
+        crate::runtime::fish_drama3_capacity::default_prefill_span_rows(backend),
+    )
+}
+
+/// Loads the published Fish Audio Drama 3 in its backend's residency: CPU
+/// (Q8_0 weights, F32 numerics), Metal (raw FP8 and F16 weights, F32
+/// residual) or CUDA (raw FP8 and BF16 weights, BF16 residual).
+fn load_fish_drama3_tts_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+) -> Result<FishDrama3Model> {
+    use crate::models::architectures::fish_drama3::FishDrama3ConfigPolicy;
+    // A test build loads a synthetic checkpoint marked for the lifecycle
+    // as a test would; a release build has no such path.
+    #[cfg(any(test, feature = "test-support"))]
+    if crate::models::architectures::fish_drama3::config::lifecycle_policy(model_dir)
+        == FishDrama3ConfigPolicy::Synthetic
+    {
+        return load_synthetic_fish_drama3_tts_model(model_dir, variant, device);
+    }
+    prepare_fish_drama3_tts_load(
+        model_dir,
+        variant,
+        &device,
+        FishDrama3ConfigPolicy::Published,
+    )?;
+    let options = fish_drama3_load_options(&device)?;
+    Ok(
+        FishDrama3Model::load(model_dir, &device.device, options)?.with_artifact_fingerprint(
+            crate::models::architectures::fish_drama3::artifacts::pinned_fingerprint(),
+        ),
+    )
+}
+
 fn load_qwen_tts_model(
     model_dir: &Path,
     _variant: ModelVariant,
@@ -738,6 +823,49 @@ const FISH_S2_TTS_LOADER_REGISTRY: &[FishS2TtsLoaderRegistration] =
         loader: load_fish_s2_tts_model,
     }];
 
+/// A synthetic Fish Audio Drama 3 checkpoint
+/// (`fish_drama3::test_support::write_lifecycle_synthetic_model`), loaded as
+/// the published loader loads but under the synthetic config policy, with
+/// the family's stub codec.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn load_synthetic_fish_drama3_tts_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+) -> Result<FishDrama3Model> {
+    use crate::models::architectures::fish_drama3::test_support::StubCodec;
+    use crate::models::architectures::fish_drama3::{
+        FishDrama3ConfigPolicy, FishDrama3ModelOptions,
+    };
+    prepare_fish_drama3_tts_load(
+        model_dir,
+        variant,
+        &device,
+        FishDrama3ConfigPolicy::Synthetic,
+    )?;
+    let config = std::fs::read(model_dir.join("config.json"))?;
+    Ok(FishDrama3Model::load_with_codec(
+        model_dir,
+        &device.device,
+        FishDrama3ModelOptions {
+            config_policy: FishDrama3ConfigPolicy::Synthetic,
+            ..fish_drama3_load_options(&device)?
+        },
+        Arc::new(StubCodec),
+    )?
+    .with_artifact_fingerprint(format!(
+        "synthetic-{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(config))
+    )))
+}
+
+const FISH_DRAMA3_TTS_LOADER_REGISTRY: &[FishDrama3TtsLoaderRegistration] =
+    &[FishDrama3TtsLoaderRegistration {
+        name: "fish_drama3_tts",
+        family: ModelFamily::FishDrama3Tts,
+        loader: load_fish_drama3_tts_model,
+    }];
+
 const QWEN_TTS_LOADER_REGISTRY: &[QwenTtsLoaderRegistration] = &[QwenTtsLoaderRegistration {
     name: "qwen3_tts",
     family: ModelFamily::Qwen3Tts,
@@ -857,6 +985,15 @@ fn resolve_fish_s2_tts_loader_registration(
 ) -> Option<&'static FishS2TtsLoaderRegistration> {
     let family = variant.family();
     FISH_S2_TTS_LOADER_REGISTRY
+        .iter()
+        .find(|registration| registration.family == family)
+}
+
+fn resolve_fish_drama3_tts_loader_registration(
+    variant: ModelVariant,
+) -> Option<&'static FishDrama3TtsLoaderRegistration> {
+    let family = variant.family();
+    FISH_DRAMA3_TTS_LOADER_REGISTRY
         .iter()
         .find(|registration| registration.family == family)
 }
@@ -5006,6 +5143,27 @@ pub struct FishS2TtsModelLease {
     inner: TrackedModelLease<FishS2TtsModel>,
 }
 
+/// A loaded Fish Audio Drama 3 handle that fences unload for the exact
+/// model instance retained by an admitted incremental request.
+#[derive(Clone)]
+pub struct FishDrama3TtsModelLease {
+    inner: TrackedModelLease<FishDrama3Model>,
+}
+
+impl FishDrama3TtsModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<FishDrama3Model> {
+        self.inner.model.clone()
+    }
+}
+
+impl Deref for FishDrama3TtsModelLease {
+    type Target = FishDrama3Model;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 /// A loaded Voxtral TTS handle that fences unload for the exact model
 /// instance retained by an admitted incremental request.
 #[derive(Clone)]
@@ -6900,6 +7058,8 @@ pub struct ModelRegistry {
     vibevoice_tts_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<VibeVoiceTtsModel>>>>>,
     fish_s2_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<FishS2TtsModel>>>>>,
+    fish_drama3_tts_models:
+        Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<FishDrama3Model>>>>>,
     qwen_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<Qwen3TtsModel>>>>>,
     kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<KokoroTtsModel>>>>>,
     effective_contexts: Arc<std::sync::RwLock<HashMap<ModelVariant, usize>>>,
@@ -7016,6 +7176,20 @@ fn tts_fast_path_counters(family: ModelFamily) -> Option<Value> {
         ModelFamily::FishS2Tts => Some(serde_json::json!({
             "resident_fast_frames_total": fish_s2::fast::fish_s2_resident_fast_frames(),
         })),
+        ModelFamily::FishDrama3Tts => {
+            use crate::models::architectures::fish_drama3::device::{self, sampling as resident};
+            let mut counters = serde_json::json!({
+                "resident_frames_total": resident::fish_drama3_resident_frames(),
+                "resident_readbacks_total": resident::fish_drama3_resident_readbacks(),
+                "resident_host_fallbacks_total": resident::fish_drama3_resident_host_fallbacks(),
+            });
+            if let (Some(fields), serde_json::Value::Object(paths)) =
+                (counters.as_object_mut(), device::fast_path_counters())
+            {
+                fields.extend(paths);
+            }
+            Some(counters)
+        }
         _ => None,
     }
 }
@@ -7079,6 +7253,7 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::Maya2Tts => "maya2_tts",
         ModelFamily::VibeVoiceTts => "vibevoice_tts",
         ModelFamily::FishS2Tts => "fish_s2_tts",
+        ModelFamily::FishDrama3Tts => "fish_drama3_tts",
         ModelFamily::ParakeetAsr => "parakeet_asr",
         ModelFamily::WhisperAsr => "whisper_asr",
         ModelFamily::Qwen3Asr => "qwen3_asr",
@@ -7205,6 +7380,7 @@ impl ModelRegistry {
             maya2_tts_models: Arc::new(RwLock::new(HashMap::new())),
             vibevoice_tts_models: Arc::new(RwLock::new(HashMap::new())),
             fish_s2_tts_models: Arc::new(RwLock::new(HashMap::new())),
+            fish_drama3_tts_models: Arc::new(RwLock::new(HashMap::new())),
             qwen_tts_models: Arc::new(RwLock::new(HashMap::new())),
             kokoro_models: Arc::new(RwLock::new(HashMap::new())),
             effective_contexts: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -7604,6 +7780,25 @@ impl ModelRegistry {
                         *variant,
                         serde_json::to_value(model.diagnostics()).ok(),
                     ),
+                ));
+            }
+        }
+
+        {
+            let guard = self.fish_drama3_tts_models.read().await;
+            for (variant, entry) in guard.iter() {
+                let Some(model) = entry.model.get() else {
+                    continue;
+                };
+                diagnostics.push(loaded_model_diagnostics_entry(
+                    &self.device,
+                    *variant,
+                    "fish_drama3_tts",
+                    "fish_drama3_tts",
+                    LoadedModelActualRuntime::default(),
+                    None,
+                    None,
+                    with_tts_fast_path_counters(*variant, Some(model.diagnostics_summary())),
                 ));
             }
         }
@@ -8411,6 +8606,76 @@ impl ModelRegistry {
         })
     }
 
+    pub async fn load_fish_drama3_tts(
+        &self,
+        variant: ModelVariant,
+        model_dir: &Path,
+    ) -> Result<Arc<FishDrama3Model>> {
+        let registration =
+            resolve_fish_drama3_tts_loader_registration(variant).ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Unsupported Fish Audio Drama 3 TTS model variant: {variant}"
+                ))
+            })?;
+        info!(
+            "Loading Fish Audio Drama 3 TTS model {variant} ({}) from {model_dir:?}",
+            registration.name
+        );
+        self.load_fish_drama3_tts_with(variant, model_dir, registration.loader)
+            .await
+    }
+
+    /// [`Self::load_fish_drama3_tts`] through `loader` (tests load a
+    /// synthetic checkpoint with it).
+    pub(crate) async fn load_fish_drama3_tts_with(
+        &self,
+        variant: ModelVariant,
+        model_dir: &Path,
+        loader: FishDrama3TtsLoaderFn,
+    ) -> Result<Arc<FishDrama3Model>> {
+        let (entry, loading_guard) = {
+            let mut guard = self.fish_drama3_tts_models.write().await;
+            let entry = guard
+                .entry(variant)
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Fish Audio Drama 3 TTS model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
+        };
+
+        entry
+            .model
+            .get_or_try_init({
+                let model_dir = model_dir.to_path_buf();
+                let device = self.device.clone();
+                move || async move {
+                    DeviceThread::for_device(&device.device)?
+                        .submit(move || loader(&model_dir, variant, device))
+                        .await
+                        .map_err(|e| Error::ModelLoadError(e.to_string()))?
+                        .map(Arc::new)
+                }
+            })
+            .await?;
+        let model = {
+            let guard = self.fish_drama3_tts_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.model.get().cloned())
+        };
+        drop(loading_guard);
+        model.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Fish Audio Drama 3 TTS model {variant} load was superseded before publication"
+            ))
+        })
+    }
+
     pub async fn load_kokoro(
         &self,
         variant: ModelVariant,
@@ -8957,6 +9222,59 @@ impl ModelRegistry {
         entry.publish_ready()
     }
 
+    pub(crate) async fn publish_fish_drama3_tts_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.fish_drama3_tts_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing Fish Audio Drama 3 TTS model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
+    }
+
+    pub async fn get_fish_drama3_tts(&self, variant: ModelVariant) -> Option<Arc<FishDrama3Model>> {
+        let guard = self.fish_drama3_tts_models.read().await;
+        guard.get(&variant).and_then(|entry| entry.ready_model())
+    }
+
+    pub fn try_get_fish_drama3_tts(&self, variant: ModelVariant) -> Option<Arc<FishDrama3Model>> {
+        let guard = self.fish_drama3_tts_models.try_read().ok()?;
+        guard.get(&variant).and_then(|entry| entry.ready_model())
+    }
+
+    pub async fn get_fish_drama3_tts_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<FishDrama3TtsModelLease> {
+        let guard = self.fish_drama3_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| FishDrama3TtsModelLease { inner })
+    }
+
+    pub fn try_get_fish_drama3_tts_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<FishDrama3TtsModelLease> {
+        let guard = self.fish_drama3_tts_models.try_read().ok()?;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| FishDrama3TtsModelLease { inner })
+    }
+
+    /// The model a load is still instantiating, before it is published.
+    pub(crate) async fn get_loading_fish_drama3_tts(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<FishDrama3Model>> {
+        let guard = self.fish_drama3_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
     pub async fn get_qwen_tts(&self, variant: ModelVariant) -> Option<Arc<Qwen3TtsModel>> {
         let guard = self.qwen_tts_models.read().await;
         guard
@@ -9199,6 +9517,21 @@ impl ModelRegistry {
         }
     }
 
+    pub async fn unload_fish_drama3_tts(&self, variant: ModelVariant) {
+        let entry = {
+            let mut guard = self.fish_drama3_tts_models.write().await;
+            let entry = guard.remove(&variant);
+            if let Some(entry) = &entry {
+                entry.reset_ready();
+            }
+            entry
+        };
+        if let Some(entry) = entry {
+            entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
+        }
+    }
+
     pub async fn unload_qwen_tts(&self, variant: ModelVariant) {
         let entry = {
             let mut guard = self.qwen_tts_models.write().await;
@@ -9294,6 +9627,18 @@ mod tests {
         assert_eq!(
             counters(ModelVariant::FishAudioS2Pro, Some(serde_json::json!({}))),
             ["resident_fast_frames_total"]
+        );
+        assert_eq!(
+            counters(ModelVariant::FishAudioDrama3, Some(serde_json::json!({}))),
+            [
+                "chunked_deltanet_spans_total",
+                "grouped_moe_spans_total",
+                "resident_frames_total",
+                "resident_host_fallbacks_total",
+                "resident_readbacks_total",
+                "step_row_gemv_calls_total",
+                "step_row_loop_calls_total"
+            ]
         );
         assert_eq!(
             counters(ModelVariant::Qwen3Tts12Hz06BBase, None),
@@ -9567,6 +9912,125 @@ mod tests {
 
         assert_eq!(registration.name, "fish_s2_tts");
         assert_eq!(registration.family, ModelFamily::FishS2Tts);
+    }
+
+    #[test]
+    fn resolves_fish_drama3_tts_loader_registration() {
+        let registration =
+            resolve_fish_drama3_tts_loader_registration(ModelVariant::FishAudioDrama3)
+                .expect("Fish Audio Drama 3 TTS loader should be registered");
+
+        assert_eq!(registration.name, "fish_drama3_tts");
+        assert_eq!(registration.family, ModelFamily::FishDrama3Tts);
+        assert!(
+            resolve_fish_drama3_tts_loader_registration(ModelVariant::FishAudioS2Pro).is_none()
+        );
+        assert!(resolve_fish_s2_tts_loader_registration(ModelVariant::FishAudioDrama3).is_none());
+    }
+
+    /// The synthetic checkpoint loads into the registry on the CPU and reads
+    /// back as the same instance; it stays unpublished (no adapter yet) and
+    /// unloads.
+    #[tokio::test]
+    async fn fish_drama3_loads_a_synthetic_checkpoint_into_the_registry_on_cpu() {
+        let synthetic =
+            crate::models::architectures::fish_drama3::model::tests::write_synthetic_model(5);
+        let registry = ModelRegistry::new(PathBuf::new(), DeviceProfile::cpu());
+        let variant = ModelVariant::FishAudioDrama3;
+        assert!(registry
+            .get_loading_fish_drama3_tts(variant)
+            .await
+            .is_none());
+
+        let loaded = registry
+            .load_fish_drama3_tts_with(
+                variant,
+                synthetic.path(),
+                load_synthetic_fish_drama3_tts_model,
+            )
+            .await
+            .expect("synthetic Drama 3 load");
+        let read_back = registry
+            .get_loading_fish_drama3_tts(variant)
+            .await
+            .expect("the loading instance");
+        assert!(Arc::ptr_eq(&loaded, &read_back));
+        assert_eq!(read_back.config().trunk.full_attention_layers(), vec![3, 7]);
+        assert!(read_back.device().is_cpu());
+        assert_eq!(
+            read_back.state_geometry().tower.layers,
+            (8..21).collect::<Vec<u32>>()
+        );
+        // A second load reuses the instance.
+        let again = registry
+            .load_fish_drama3_tts_with(
+                variant,
+                synthetic.path(),
+                load_synthetic_fish_drama3_tts_model,
+            )
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&loaded, &again));
+        // Never ready before its engine route publishes it.
+        assert!(registry.get_fish_drama3_tts(variant).await.is_none());
+        assert!(registry.try_get_fish_drama3_tts(variant).is_none());
+        assert!(registry.get_fish_drama3_tts_lease(variant).await.is_none());
+        let diagnostics = registry.loaded_model_diagnostics().await;
+        assert!(diagnostics.iter().any(|entry| serde_json::to_value(entry)
+            .unwrap()
+            .to_string()
+            .contains("fish_drama3_tts")));
+
+        drop((loaded, read_back, again));
+        registry.unload_fish_drama3_tts(variant).await;
+        assert!(registry
+            .get_loading_fish_drama3_tts(variant)
+            .await
+            .is_none());
+    }
+
+    /// The published loader checks the backend (CUDA needs an SM80 CUDA
+    /// device; the CPU and Metal load) and the pinned identity before it
+    /// reads a weight.
+    #[tokio::test]
+    async fn the_published_drama3_loader_checks_the_device_and_the_checkpoint() {
+        use crate::backends::DeviceKind;
+        use crate::models::architectures::fish_drama3::FishDrama3ConfigPolicy;
+        let synthetic =
+            crate::models::architectures::fish_drama3::model::tests::write_synthetic_model(6);
+        let variant = ModelVariant::FishAudioDrama3;
+        let on = |kind| DeviceProfile {
+            kind,
+            ..DeviceProfile::cpu()
+        };
+        let prepare = |kind| {
+            prepare_fish_drama3_tts_load(
+                synthetic.path(),
+                variant,
+                &on(kind),
+                FishDrama3ConfigPolicy::Synthetic,
+            )
+        };
+        // A CUDA profile whose device is not an SM80 CUDA device.
+        let error = prepare(DeviceKind::Cuda).unwrap_err().to_string();
+        assert!(error.contains("compute capability 8.0"), "{error}");
+        prepare(DeviceKind::Metal).expect("Metal has a residency");
+        prepare(DeviceKind::Cpu).expect("the CPU has a residency");
+        // The synthetic checkpoint is not the pinned revision.
+        let registry = ModelRegistry::new(PathBuf::new(), DeviceProfile::cpu());
+        let error = registry
+            .load_fish_drama3_tts(variant, synthetic.path())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("is not fishaudio/drama-3@78e5ab79"),
+            "{error}"
+        );
+        assert!(registry
+            .get_loading_fish_drama3_tts(variant)
+            .await
+            .is_none());
     }
 
     #[test]

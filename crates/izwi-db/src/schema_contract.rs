@@ -243,6 +243,10 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "audio_artifact_tenant",
             "stop_reason",
             "owner_node_id",
+            "generated_codes_json",
+            "references_json",
+            "seed",
+            "parent_take_id",
         ],
     },
     RequiredSchemaTable {

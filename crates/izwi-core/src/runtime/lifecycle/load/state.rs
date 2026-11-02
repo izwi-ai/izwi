@@ -1491,13 +1491,195 @@ impl ModelLifecycleController {
             tracing::info!(?capacity, ?backend, "Sealing Fish serving capacity; device throughput qualification is separate");
             bundle_draft.seal_fish_capacity(capacity.clone())?;
             state_publications.extend(self.load_fish_s2_state_publications(
-                model_instance_id, bundle_draft,
+                variant, model_instance_id, bundle_draft,
                 self.config.max_sequence_length.explicit_tokens().unwrap_or(model.config().max_seq_len).min(model.config().max_seq_len),
                 &capacity,
                 |graphs| model.physical_state_spec(graphs),
             ).await?);
         }
         Ok(())
+    }
+
+    /// Fish Audio Drama 3 (§7.2–7.3): its own capacity, sealed into its
+    /// adapter through Fish S2's interface; one retained state of four
+    /// transactional domains (the trunk's and the tower's KV, the DeltaNet's
+    /// recurrent and conv tensors), fitted once and shared by both
+    /// capabilities; and per capability the descriptor of its stage graphs,
+    /// whose span and decode stages lease scratch per row.
+    pub(super) async fn allocate_fish_drama3_tts_state(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        backend: BackendKind,
+        state_fit_reserve: StateFitReserve,
+        bundle_draft: &LoadedModelBundleDraft,
+        state_publications: &mut HashMap<CapabilityKind, LoadedStatePublication>,
+    ) -> Result<()> {
+        if variant.family() != crate::catalog::ModelFamily::FishDrama3Tts {
+            return Ok(());
+        }
+        let model = self
+            .model_registry
+            .get_loading_fish_drama3_tts(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "loaded Fish Audio Drama 3 model {variant} is missing from the registry"
+                ))
+            })?;
+        let capacity =
+            self.resolve_fish_drama3_capacity(&model, variant, backend, state_fit_reserve)?;
+        tracing::info!(
+            rows = capacity.rows,
+            row_bytes = capacity.row_bytes,
+            ?backend,
+            "Sealing Fish Audio Drama 3 serving capacity"
+        );
+        bundle_draft.seal_fish_capacity(capacity.serving())?;
+        let (contract, retained) = self
+            .allocate_fish_drama3_retained_state(
+                variant,
+                model_instance_id,
+                backend,
+                &model,
+                &capacity,
+                state_fit_reserve,
+            )
+            .await?;
+        for capability in [CapabilityKind::Tts, CapabilityKind::StreamingTts] {
+            let contracts = bundle_draft.execution_contracts(capability)?;
+            let stage_graphs = contracts
+                .iter()
+                .map(|contract| contract.stages.as_ref())
+                .collect::<Vec<_>>();
+            let descriptor = crate::models::architectures::fish_drama3::physical::state_descriptor(
+                &contract,
+                &capacity.workspace,
+                &stage_graphs,
+            )?;
+            let retained_uses = contracts
+                .iter()
+                .map(|contract| {
+                    Ok((
+                        stage_graph_fingerprint(&contract.stages)?,
+                        RetainedStateUseV2::ExternalPaged,
+                    ))
+                })
+                .collect::<Result<HashMap<_, _>>>()?;
+            let publication = self.load_scratch_only_workspace_publication(
+                &contracts,
+                descriptor,
+                Some(retained.clone().into()),
+                retained_uses,
+            )?;
+            state_publications.insert(capability, publication);
+        }
+        Ok(())
+    }
+
+    /// The rows a Drama 3 load seals on `backend`, from the planning
+    /// headroom its weights left, less the reserve its state fit keeps.
+    pub(super) fn resolve_fish_drama3_capacity(
+        &self,
+        model: &crate::models::architectures::fish_drama3::FishDrama3Model,
+        variant: ModelVariant,
+        backend: BackendKind,
+        state_fit_reserve: StateFitReserve,
+    ) -> Result<crate::runtime::fish_drama3_capacity::ResolvedFishDrama3Capacity> {
+        use crate::runtime::fish_drama3_capacity::{
+            native_batching_from_env, FishDrama3RowCeilings, ResolvedFishDrama3Capacity,
+        };
+        let authority = self.coordinator.resource_authority();
+        let headroom = match authority.planning_headroom_bytes(backend)? {
+            ResourceAmount::Known(bytes) => Some(bytes),
+            ResourceAmount::Unknown => None,
+        };
+        let configured =
+            portable_context_reserve_bytes(variant, self.config.portable_context_reserve_bytes);
+        let mut reserve = match state_fit_reserve {
+            StateFitReserve::MeasuredUntracked => {
+                authority.state_safety_reserve_bytes(backend, configured)
+            }
+            StateFitReserve::Configured => configured,
+        };
+        if backend == BackendKind::Cuda {
+            reserve =
+                reserve.max(self.core_engine.config().cuda_context_reserve_bytes(
+                    authority.snapshot().physical.capacity.device_bytes,
+                ));
+        }
+        let core = self.core_engine.config();
+        let context = self
+            .config
+            .max_sequence_length
+            .explicit_tokens()
+            .unwrap_or(model.max_positions())
+            .min(model.max_positions());
+        ResolvedFishDrama3Capacity::resolve_loaded(
+            model,
+            backend,
+            Some(context),
+            FishDrama3RowCeilings {
+                retained: core.max_retained_sequences,
+                staged: core.max_staged_transactions,
+                batch: self.config.max_batch_size.fixed_rows(),
+            },
+            headroom,
+            reserve,
+            native_batching_from_env()?,
+        )
+    }
+
+    /// The retained state of `capacity`'s rows: the family's contract fitted
+    /// by the managed state (live memory above one worst-case request a
+    /// row, keeping `state_fit_reserve`), its context published, its plan
+    /// checked against the validated provider routes. Every arena it binds
+    /// books into the ledger with the model's lease.
+    pub(super) async fn allocate_fish_drama3_retained_state(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        backend: BackendKind,
+        model: &crate::models::architectures::fish_drama3::FishDrama3Model,
+        capacity: &crate::runtime::fish_drama3_capacity::ResolvedFishDrama3Capacity,
+        state_fit_reserve: StateFitReserve,
+    ) -> Result<(
+        InferenceStateContract,
+        Arc<crate::engine::ManagedKvModelRuntime>,
+    )> {
+        if !managed_kv_backend_compiled(backend) {
+            return Err(Error::ModelLoadError(format!(
+                "loaded model {variant} requires managed paged state, but the {backend:?} build has no direct paged-attention runtime"
+            )));
+        }
+        let contract = crate::models::architectures::fish_drama3::physical::state_contract(
+            model.config(),
+            capacity.kv_dtype,
+            crate::models::shared::attention::paged::default_kv_page_size(),
+        )?;
+        let positions = capacity.positions();
+        let retained = self
+            .core_engine
+            .load_managed_model_state_with_rows(
+                model_instance_id,
+                &contract,
+                Some(positions),
+                (capacity.rows, capacity.rows),
+                tts_state_minimum_tokens(variant),
+                state_fit_reserve,
+            )
+            .await?;
+        self.model_registry.publish_effective_context(
+            variant,
+            retained.logical_token_reach().min(positions as u64),
+        )?;
+        self.model_registry.publish_kv_storage(variant, &retained);
+        crate::runtime::rollout::validate_managed_state_plan_eligibility(
+            variant,
+            CapabilityKind::Tts,
+            retained.state_plan_v2(),
+        )?;
+        Ok((contract, retained))
     }
 
     /// Voxtral TTS: retained and invocation state.

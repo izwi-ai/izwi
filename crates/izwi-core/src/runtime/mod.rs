@@ -16,6 +16,9 @@ mod conformance;
 mod coordinator;
 mod diarization;
 pub(crate) mod fish_capacity;
+pub(crate) mod fish_drama3_capacity;
+#[cfg(test)]
+mod fish_drama3_tests;
 mod forced_alignment;
 mod health;
 mod kokoro;
@@ -92,8 +95,8 @@ pub use types::{
     DiarizationPipelineOptions, DiarizationResult, DiarizationSegment, DiarizationTranscriptResult,
     DiarizationUtterance, DiarizationWord, GenerationConfig, GenerationRequest, GenerationResult,
     InferenceOptions, RuntimeRequestContext, SpeakerAttributedAsrResult,
-    SpeakerAttributedAsrStatus, SpeakerAttributedAsrTurn, SpeechToSpeechGeneration, TtsStopReason,
-    TtsStreamingMode,
+    SpeakerAttributedAsrStatus, SpeakerAttributedAsrTurn, SpeechChunkTurn, SpeechFrameCodes,
+    SpeechSpeakerReference, SpeechToSpeechGeneration, TtsStopReason, TtsStreamingMode,
 };
 pub use voice_metrics::{
     prometheus_voice_metric_name, prometheus_voice_metric_type, voice_metric_catalog,

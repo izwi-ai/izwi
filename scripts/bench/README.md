@@ -129,9 +129,10 @@ custom kernel.
 Audio concurrency evidence uses the `cpu-audio-concurrency.toml`,
 `metal-audio-concurrency.toml`, and `cuda-audio-concurrency.toml` manifests.
 Each manifest covers every benchmarkable ASR and TTS family at c1/c2/c4/c8
-through the SSE endpoints. The CLI records first-audio and inter-audio-chunk
-latency for TTS, plus first-transcript and inter-transcript-delta latency for
-ASR. A final-only TTS model (one whose capabilities say it does not stream)
+through the SSE endpoints, and Fish Audio Drama 3 at the widths its backend
+decodes: c1 and c2 on the CPU and Metal, c1 to c32 on CUDA. The CLI records
+first-audio and inter-audio-chunk latency for TTS, plus first-transcript and
+inter-transcript-delta latency for ASR. A final-only TTS model (one whose capabilities say it does not stream)
 runs unstreamed: the report marks its cases `final_only`, each sample's first
 audio is its end-to-end time, and no inter-chunk latency is recorded. Require the complete matrix with the fail-closed gate:
 
@@ -483,9 +484,13 @@ scripts/bench/run-tts-matrix.sh --backend metal \
 ```
 
 Each model names its case family (`kokoro`, `lfm`, `qwen_cv`, `qwen_base`,
-`qwen_greedy`, `vibevoice`, `voxtral`, `fish`). Texts are a 9-word sentence, a
-45-word paragraph, a numbers sentence, a 250-word passage and a leading-dash
-probe; clone families use `data/fox.wav` with `data/fox.md` as the reference.
+`qwen_greedy`, `vibevoice`, `voxtral`, `fish`, `chatterbox`, `drama3`). Texts
+are a 9-word sentence, a 45-word paragraph, a numbers sentence, a 250-word
+passage and a leading-dash probe, and for `drama3` performance tags (two
+leading their lines) and a two-speaker dialogue; clone families use
+`data/fox.wav` with `data/fox.md` as the reference. `drama3` runs every case
+from seed 7, and its guard defaults to 45000 MiB: run
+`--models FishAudio-Drama-3:drama3` on a machine with 64 GB or more.
 Cases are written as WAV plus JSON under `<out>/<model>/cases/`.
 
 `score-tts-matrix.py score` writes `summary.json` with audio-health statistics

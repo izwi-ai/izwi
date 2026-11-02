@@ -67,6 +67,33 @@ impl DurableSpeechProgress {
     pub(crate) fn completed_duration_secs(&self) -> f32 {
         self.checkpoint.completed_duration_secs
     }
+    /// A chunk session's history as of the last completed segment.
+    pub(crate) fn chunk_history(
+        &self,
+    ) -> Option<&crate::batch_runtime::speech_progress::SpeechChunkHistoryCheckpoint> {
+        self.checkpoint.chunk_history.as_ref()
+    }
+    /// The history the next segment's prompt holds; it is saved with the
+    /// segment's completion.
+    pub(crate) fn record_chunk_history(
+        &mut self,
+        history: crate::batch_runtime::speech_progress::SpeechChunkHistoryCheckpoint,
+    ) {
+        self.checkpoint.chunk_history = Some(history);
+    }
+    /// The chunks a chunk session's take keeps, as of the last completed
+    /// segment.
+    pub(crate) fn take(&self) -> Option<&crate::batch_runtime::speech_progress::SpeechTakeCodes> {
+        self.checkpoint.take.as_ref()
+    }
+    /// The chunks the take keeps after this segment; saved with the
+    /// segment's completion.
+    pub(crate) fn record_take(
+        &mut self,
+        take: crate::batch_runtime::speech_progress::SpeechTakeCodes,
+    ) {
+        self.checkpoint.take = Some(take);
+    }
     pub(crate) async fn begin_segment(
         &mut self,
         index: usize,
@@ -183,6 +210,21 @@ pub(super) async fn synthesize_fish_record(
     ),
     ApiError,
 > {
+    // The takes this one continues, read afresh on every attempt; their
+    // codes' hashes join the plan identity, so a recovered plan continues
+    // the same takes.
+    let previous_takes = crate::api::speech_takes::load_previous_takes(
+        state,
+        route_kind,
+        variant,
+        &req.previous_take_ids,
+    )
+    .await?;
+    let previous_identity = previous_takes
+        .iter()
+        .map(|take| serde_json::json!({"id": take.id, "codes_sha256": take.codes_sha256}))
+        .collect::<Vec<_>>();
+    let previous_turns = crate::api::speech_takes::previous_turns(previous_takes);
     let synthesis = async {
         let record_id = match target_record_id {
             Some(id) => id,
@@ -201,22 +243,28 @@ pub(super) async fn synthesize_fish_record(
             variant,
         );
         base.runtime_context.tenant_key = tenant_key;
-        let plan = SpeechTextPlan::fish(&input_text, base.config.options.max_tokens)?;
+        base.chunk_history = previous_turns;
+        let plan =
+            SpeechTextPlan::for_variant(variant, &input_text, base.config.options.max_tokens)?;
         state.runtime.load_model(variant).await?;
         let artifact_fingerprint = state
             .runtime
-            .fish_s2_artifact_fingerprint()
+            .fish_artifact_fingerprint(variant)
             .await
             .context("Fish model did not publish an artifact fingerprint")?;
         let mut progress = if let Some(attempt) = attempt {
+            let mut identity = serde_json::json!({
+            "plan": plan, "model_snapshot": claimed.map(|c| &c.job.model_snapshot_json),
+            "model": model_id, "artifact_fingerprint": artifact_fingerprint,
+            });
+            if !previous_identity.is_empty() {
+                identity["previous_takes"] = previous_identity.into();
+            }
             Some(
                 DurableSpeechProgress::new(
                     state,
                     attempt,
-                    serde_json::json!({
-                    "plan": plan, "model_snapshot": claimed.map(|c| &c.job.model_snapshot_json),
-                    "model": model_id, "artifact_fingerprint": artifact_fingerprint,
-                    }),
+                    identity,
                     plan.segments.len(),
                     tenant_key,
                 )
@@ -227,7 +275,7 @@ pub(super) async fn synthesize_fish_record(
         };
         let mut spool: Option<SpeechWavSpool> = None;
         let mut stats = StreamRequestStatistics::default();
-        {
+        let take = {
             let (tx, mut rx) = mpsc::channel::<AudioChunk>(2);
             let runner = generate_speech_plan_stream_with_progress(
                 state,
@@ -251,8 +299,14 @@ pub(super) async fn synthesize_fish_record(
                 }
                 Ok::<_, anyhow::Error>(())
             };
-            tokio::try_join!(async { runner.await.map_err(anyhow::Error::from) }, consume)?;
-        }
+            tokio::try_join!(async { runner.await.map_err(anyhow::Error::from) }, consume)?.0
+        };
+        // A finished take keeps its codes; a failed or cancelled one never
+        // gets here.
+        let generated_codes_json = take
+            .filter(|take| !take.is_empty())
+            .map(|take| take.to_json())
+            .transpose()?;
         if let Some(progress) = progress.as_mut() {
             progress.checkpoint.total_segments = progress.checkpoint.completed_segments;
             progress.checkpoint.save(&progress.attempt).await?;
@@ -371,6 +425,7 @@ pub(super) async fn synthesize_fish_record(
                             "sample_count": file.sample_count(),
                         }),
                         progress: serde_json::to_value(final_checkpoint)?,
+                        generated_codes_json: generated_codes_json.clone(),
                     },
                 )
                 .await?;
@@ -450,6 +505,7 @@ pub(super) async fn synthesize_fish_record(
             audio_filename: Some(filename),
             audio_bytes: Vec::new(),
             preexisting_audio_storage_path: Some(storage_key),
+            generated_codes_json,
         };
         let record = match projection_attempt {
             Some(projection) => {

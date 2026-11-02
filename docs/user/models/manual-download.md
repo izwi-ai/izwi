@@ -324,3 +324,74 @@ SHA-256:
 | `mimi/config.json` | 1,117 | `aca6f44b04f7bc2e7466b71597d2d51e463ed1cf3cd7025d8848595580546c36` |
 | `mimi/model.safetensors` | 384,649,828 | `bac7e85083dcded655d24eaadde7e6eea34c0da1b35fa2d284e641bd2b942a5e` |
 | `ecapa/embedding_model.ckpt` | 83,316,686 | `0575cb64845e6b9a10db9bcb74d5ac32b326b8dc90352671d345e2ee3d0126a2` |
+
+---
+
+## Fish Audio Drama 3
+
+`FishAudio-Drama-3` (about 41.5 GB) needs the 24 files of `fishaudio/drama-3`
+at a pinned revision: 15 safetensors shards, the codec (`codec.pth`, the same
+file Fish S2 Pro ships), the configs, tokenizer, chat template, `README.md`
+and `LICENSE`. Place them in the model's directory:
+
+```bash
+MODEL_DIR="<izwi-models-path>/FishAudio-Drama-3"
+
+huggingface-cli download fishaudio/drama-3 \
+  --revision 78e5ab79e49aa9a25abe8799eff2c4d73a1c3216 \
+  --local-dir "$MODEL_DIR"
+```
+
+Izwi lists the model as downloaded only once every file has been checked
+against its pinned SHA-256. Its own download does that once, after the last
+file lands, and records it in `izwi-artifact.json` in the model's directory;
+every load then checks only that each file is present at its exact size and
+that `config.json` has its pinned hash. So finish a copy you placed yourself
+with Izwi's download, or **Download** on the Models page:
+
+```bash
+izwi pull FishAudio-Drama-3
+```
+
+It reads the revision's file list from Hugging Face, finds every file already
+at its size, downloads nothing, hashes each file once (a few minutes for
+41.5 GB) and marks the model downloaded. A file that does not match its pin is
+named in the error: delete it and run `izwi pull` again.
+
+With `IZWI_OFFLINE` set, Izwi contacts no one and downloads nothing, so it
+cannot check a copy. Copy the whole `FishAudio-Drama-3` directory from a
+machine where Izwi downloaded or checked it, `izwi-artifact.json` included.
+
+To check a copy by hand first, use `shasum -a 256` (macOS) or `sha256sum`
+(Linux):
+
+| File | Size (bytes) | SHA-256 |
+|------|--------------|---------|
+| `LICENSE` | 19,685 | `733a32442087acbda12ecafe8e71eb8ee5890c89b50ce7ac4ea3777faa3c823e` |
+| `README.md` | 7,996 | `6d147e079b87e0b9bb4e1c899f75da3e658754933457a3ca753ca9912d1f5e10` |
+| `chat_template.jinja` | 7,756 | `a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715` |
+| `codec.pth` | 1,871,099,728 | `74fc41c5a7151c6f350af8bd7e5d6e3accfcc7f3dfbfac23afd35af07052bb2f` |
+| `config.json` | 5,534 | `aea53f0f2b9a15023fc0f8eb0f42360663671c99814037bada6867d508010111` |
+| `model-00001-of-00015.safetensors` | 2,862,881,576 | `a1b7af15210d2eda2d75a2cf976295f80e345855b745b109aa3ce49d26a44497` |
+| `model-00002-of-00015.safetensors` | 2,628,610,248 | `a95e113c6f32f8fcb23ecb618cd4384fad6358f3c0ac31cfbf352daf5370db94` |
+| `model-00003-of-00015.safetensors` | 2,628,610,224 | `a34d0952d6369f5c73e6ae06138ef96bc6a3af9bb259c4e41425a33706cf5b68` |
+| `model-00004-of-00015.safetensors` | 2,628,611,792 | `13ac368d87441a18752e424e485b711a115ea1084e3a18ab13276e73eedef8b4` |
+| `model-00005-of-00015.safetensors` | 2,641,525,264 | `c432fa0dac97471f0d625bc67eb94fe084ca2e5ecd8865f457b751479b50e363` |
+| `model-00006-of-00015.safetensors` | 2,628,614,896 | `661a31433747fa9d029632a61350ea9eb105bf7276d013ff0901b6a939fb2dcb` |
+| `model-00007-of-00015.safetensors` | 2,628,614,880 | `4a7574b5c238f424b37aa945a736da1994a26bd38b86bf3ec4abf524c0969cc8` |
+| `model-00008-of-00015.safetensors` | 2,628,614,888 | `7fac6d1e899939eb03c9cf28a33b0bfd9c7a599298662f26d9a59d64c96d007f` |
+| `model-00009-of-00015.safetensors` | 2,641,525,264 | `fcf1313744ea5978e363b2bb49c3b66748d886d79f3ec102f4346a462385de4b` |
+| `model-00010-of-00015.safetensors` | 2,628,614,896 | `6db3f7cd9d49806ae4f17b6f6d17a0c8dd9686aee57728da1b50ec0c6139a629` |
+| `model-00011-of-00015.safetensors` | 2,628,614,880 | `a9027ef4db30bb1875bd2bc93b80bae785c5943807efe63bf09834b66e49fc16` |
+| `model-00012-of-00015.safetensors` | 2,628,614,888 | `c16fea955e973010064ff7bc907a6fa67821956e0de23f74807c31fb48339f3a` |
+| `model-00013-of-00015.safetensors` | 2,641,525,264 | `64861c8e1ee13a0cbb5ec9431f402cee33edcbcbc744ff63091fe3a997f0da19` |
+| `model-00014-of-00015.safetensors` | 3,749,111,392 | `ba5319475a6258984143b69af8380f166df8179af90378f2f4e02694cad87baf` |
+| `model-00015-of-00015.safetensors` | 1,409,461,016 | `1e2ddf01c1be73fb19f3022c28e90d24e730c1bc759e5de78083afb39aab3fb7` |
+| `model.safetensors.index.json` | 6,880,196 | `a8e9aca4e9fddca51f03fad63f52c82c470e98e28b6b0b1b1562dbe6456b50bb` |
+| `special_tokens_map.json` | 102,779 | `08aed9e321dc05275ac68cf883bfa96006b3fc09ff5cccadf262b6bce0873adb` |
+| `tokenizer.json` | 20,791,070 | `0e9b9db76b2f0389b04b6ef057a2ac3b89100b7e96f2dd7034d19580a09654d6` |
+| `tokenizer_config.json` | 103,580 | `00e800279d8436c324b924e97872c7eacd2b19406aa0fe71eeb557b4cd53aa3e` |
+
+The 24 files total 41,502,569,692 bytes. The weights are licensed under the
+Fish Audio Community License v1.0 (the repository's `LICENSE`); see
+[Models](/models).

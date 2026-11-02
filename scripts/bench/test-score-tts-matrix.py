@@ -4,7 +4,9 @@ import importlib.util
 import json
 import math
 import pathlib
+import re
 import struct
+import subprocess
 import tempfile
 import unittest
 import wave
@@ -90,11 +92,38 @@ class Scorer(unittest.TestCase):
 
     def test_every_family_has_cases_with_known_texts(self):
         for family in ('kokoro', 'lfm', 'qwen_cv', 'qwen_base', 'qwen_greedy', 'vibevoice',
-                       'voxtral', 'fish'):
+                       'voxtral', 'fish', 'chatterbox', 'drama3'):
             for case_id, key, _, _ in scorer.family_cases(family, ('ref', 'text')):
                 self.assertIn(key, scorer.TEXTS, (family, case_id))
         with self.assertRaises(SystemExit):
             scorer.family_cases('unknown', ('ref', 'text'))
+
+    def test_the_runner_lists_every_family_the_scorer_knows(self):
+        with self.assertRaises(SystemExit) as raised:
+            scorer.family_cases('unknown', ('ref', 'text'))
+        known = str(raised.exception).split('known: ')[1].split(', ')
+        runner = pathlib.Path(__file__).with_name('run-tts-matrix.sh')
+        usage = subprocess.run(['bash', str(runner), '--help'], check=True,
+                               capture_output=True, text=True).stdout
+        listed = usage.split('Families:')[1].split('(see')[0]
+        self.assertEqual(sorted(re.findall(r'\w+', listed)), sorted(known))
+
+    def test_wer_skips_speaker_and_performance_tags(self):
+        self.assertEqual(scorer.wer(scorer.TEXTS['tags'], 'I told you this would happen. '
+                                    'Fine, have it your way. We start again tomorrow.'), 0.0)
+        self.assertEqual(scorer.wer(scorer.TEXTS['dialogue'], 'Ready when you are. Always. '
+                                    "Let's go before the rain starts."), 0.0)
+
+    def test_drama3_cases_are_seeded_and_clone_with_a_transcript(self):
+        cases = {case_id: (key, extra, stream)
+                 for case_id, key, extra, stream in scorer.family_cases('drama3', ('ref', 'text'))}
+        self.assertTrue(all(extra['seed'] == 7 for _, extra, _ in cases.values()))
+        self.assertEqual(cases['clone'][1]['reference_text'], 'text')
+        self.assertEqual(cases['dialogue'][1]['references'],
+                         [{'speaker': 0, 'audio': 'ref', 'text': 'text'}])
+        self.assertTrue(cases['med_stream'][2])
+        # Lines that open with a tag: the silence quirk the case listens for.
+        self.assertEqual([line[0] for line in scorer.TEXTS['tags'].splitlines()], ['[', '['])
 
 
 if __name__ == '__main__':

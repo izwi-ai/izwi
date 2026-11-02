@@ -5,6 +5,7 @@ Kokoro-82M
 Voxtral-4B-TTS-2603
 VibeVoice-1.5B
 FishAudio-S2-Pro
+FishAudio-Drama-3
 Chatterbox-500M
 Parakeet-TDT-0.6B-v3
 Whisper-Large-v3-Turbo

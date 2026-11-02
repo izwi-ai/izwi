@@ -318,13 +318,13 @@ impl ModelLifecycleController {
     /// retained state is model-scoped and reused; invocation backing is per adapter.
     pub(super) async fn load_fish_s2_state_publications(
         &self,
+        variant: ModelVariant,
         model_instance_id: ModelInstanceId,
         bundle_draft: &LoadedModelBundleDraft,
         max_sequence_tokens: usize,
         capacity: &crate::runtime::fish_capacity::ResolvedFishServingCapacity,
         physical_state_spec: impl Fn(&[&[StageDescriptor]]) -> Result<FishS2PhysicalStateSpec>,
     ) -> Result<HashMap<CapabilityKind, LoadedStatePublication>> {
-        let variant = ModelVariant::FishAudioS2Pro;
         let mut publications = HashMap::new();
         let mut retained_runtime: Option<Arc<crate::engine::ManagedKvModelRuntime>> = None;
         for capability in [CapabilityKind::Tts, CapabilityKind::StreamingTts] {

@@ -93,6 +93,7 @@ windows-sys = { version = "0.61", features = [
 libc = "0.2"
 
 [dev-dependencies]
+izwi-core = { path = "../izwi-core", default-features = false, features = ["test-support"] }
 izwi-db = { path = "../izwi-db", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 izwi-serving-worker = { path = "../izwi-serving-worker", features = ["test-support"] }

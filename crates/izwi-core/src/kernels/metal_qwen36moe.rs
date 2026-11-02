@@ -790,7 +790,7 @@ fn u32_arg(value: usize, name: &str) -> Result<u32> {
 
 /// A contiguous Metal tensor's buffer and byte offset.
 struct Bound<'a> {
-    guard: std::sync::RwLockReadGuard<'a, Storage>,
+    guard: candle_core::StorageRef<'a>,
     offset: usize,
 }
 

@@ -102,6 +102,12 @@ F32 on CPU. The storage a model actually uses is reported per loaded model in
 "kv_storage": [{ "domain": 1, "page_tokens": 64, "dtype": "f16" }]
 ```
 
+Fish Audio Drama 3 keeps two paged KV domains per request: one for its 10
+trunk attention layers and one for its 13 tower layers, stored in F32 on CPU,
+F16 on Metal and BF16 on CUDA. Beside them each request holds its DeltaNet
+recurrent and convolution state, about 62.8 MiB a row. All of it is released
+when the request ends, and the model does not reuse prefixes.
+
 ## Prefix isolation and capacity
 
 The server engages prefix reuse in catalog-auto mode by default: a model

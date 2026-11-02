@@ -2340,6 +2340,7 @@ async fn speech_replay_fixture(
             audio_bytes: AudioEncoder::new(44100, 1)
                 .encode(&samples, AudioFormat::Wav)
                 .unwrap(),
+            take: Default::default(),
         })
         .await
         .unwrap();
@@ -2554,6 +2555,7 @@ async fn a_failed_speech_attempt_with_a_retry_pending_says_so() {
             audio_bytes: AudioEncoder::new(24000, 1)
                 .encode(&[0.0], AudioFormat::Wav)
                 .unwrap(),
+            take: Default::default(),
         })
         .await
         .unwrap();
@@ -2619,6 +2621,7 @@ async fn cancelling_a_speech_stream_aborts_its_task() {
             audio_bytes: AudioEncoder::new(24000, 1)
                 .encode(&[0.0], AudioFormat::Wav)
                 .unwrap(),
+            take: Default::default(),
         })
         .await
         .unwrap();

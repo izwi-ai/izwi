@@ -31,7 +31,9 @@ const SPEECH_RESPONSE_EXPOSED_HEADERS: &str = "X-Generation-Time-Ms, X-Audio-Dur
 pub struct SpeechRequest {
     /// OpenAI field name for TTS model.
     pub model: String,
-    /// OpenAI field name for text input.
+    /// OpenAI field name for text input; empty when a `script` gives the
+    /// text.
+    #[serde(default)]
     pub input: String,
     /// OpenAI-style voice selection.
     #[serde(default)]
@@ -84,6 +86,15 @@ pub struct SpeechRequest {
     /// Optional saved voice identifier resolved server-side.
     #[serde(default)]
     pub saved_voice_id: Option<String>,
+    /// izwi extension: reference voices per speaker, for models that voice
+    /// several speakers (Fish Audio Drama 3); replaces `reference_audio`,
+    /// `reference_text` and `saved_voice_id`.
+    #[serde(default)]
+    pub references: Vec<crate::api::speech_dialogue::SpeechDialogueReference>,
+    /// izwi extension: a dialogue as `{speaker, text}` lines, spoken as
+    /// `<|speaker:N|> text` lines; replaces `input`.
+    #[serde(default)]
+    pub script: Option<Vec<crate::api::speech_dialogue::SpeechScriptLine>>,
     /// izwi extensions: speech sampling (`top_p`, `seed`, `subtalker_*`,
     /// `cfg_scale`, `diffusion_steps`, `repetition_penalty`).
     #[serde(flatten)]
@@ -177,12 +188,23 @@ pub async fn speech(
     Extension(ctx): Extension<RequestContext>,
     ApiJson(req): ApiJson<SpeechRequest>,
 ) -> Result<Response<Body>, ApiError> {
+    let mut req = normalize_speech_request(req);
+    if let Some(text) =
+        crate::api::speech_dialogue::script_text(Some(&req.input), req.script.as_deref(), "input")?
+    {
+        req.input = text;
+    }
+    if req.input.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "Missing required `input` field (or a `script` to speak).",
+        ));
+    }
     crate::api::tts_policy::check_tts_input_length(&req.input)?;
-    let req = resolve_saved_voice_request(&state, normalize_speech_request(req)).await?;
-    info!("OpenAI speech request: {} bytes", req.input.len());
-
     let variant = parse_tts_model_variant(&req.model)
         .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {}", err)))?;
+    crate::api::speech_dialogue::check_dialogue_request(variant, speech_dialogue(&req))?;
+    let req = resolve_saved_voice_request(&state, req).await?;
+    info!("OpenAI speech request: {} bytes", req.input.len());
     validate_speech_voice_contract(&req, variant)?;
     crate::api::tts_policy::validate_speech_speed(variant, req.speed)?;
     crate::api::tts_policy::validate_speech_controls(variant, &req.sampling)?;
@@ -212,8 +234,16 @@ pub async fn speech(
         .await;
     }
 
-    if variant == ModelVariant::FishAudioS2Pro {
-        return fish_file_speech(state, req, ctx.correlation_id, tenant_key, resolved_format).await;
+    if variant.plans_own_speech_segments() {
+        return fish_file_speech(
+            state,
+            req,
+            ctx.correlation_id,
+            tenant_key,
+            variant,
+            resolved_format,
+        )
+        .await;
     }
 
     let permit = state
@@ -323,16 +353,20 @@ async fn fish_file_speech(
     req: SpeechRequest,
     correlation_id: String,
     tenant_key: Option<[u8; 32]>,
+    variant: ModelVariant,
     resolved_format: ResolvedSpeechFormat,
 ) -> Result<Response<Body>, ApiError> {
     use crate::speech_history_store::SpeechWavSpool;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-    let variant = ModelVariant::FishAudioS2Pro;
     let mut request = build_generation_request(&req, correlation_id, true, variant);
     request.runtime_context.tenant_key = tenant_key;
     // Validate admission before model load or output allocation.
-    crate::api::tts_long_form::SpeechTextPlan::fish(&req.input, request.config.options.max_tokens)
-        .map_err(core_api_error)?;
+    crate::api::tts_long_form::SpeechTextPlan::for_variant(
+        variant,
+        &req.input,
+        request.config.options.max_tokens,
+    )
+    .map_err(core_api_error)?;
     state
         .runtime
         .load_model(variant)
@@ -502,13 +536,27 @@ fn normalize_speech_request(mut req: SpeechRequest) -> SpeechRequest {
     req.reference_language = normalize_optional_trimmed(req.reference_language);
     req.saved_voice_id = normalize_optional_trimmed(req.saved_voice_id);
     req.stream_format = normalize_optional_trimmed(req.stream_format);
+    crate::api::speech_dialogue::normalize_references(&mut req.references);
     req
+}
+
+/// The dialogue fields of `req`, as the dialogue checks read them.
+fn speech_dialogue(req: &SpeechRequest) -> crate::api::speech_dialogue::SpeechDialogue<'_> {
+    let present = |value: Option<&str>| value.is_some_and(has_non_empty_text);
+    crate::api::speech_dialogue::SpeechDialogue {
+        single_reference: present(req.reference_audio.as_deref())
+            || present(req.reference_text.as_deref())
+            || present(req.saved_voice_id.as_deref()),
+        references: &req.references,
+        script: req.script.as_deref(),
+    }
 }
 
 async fn resolve_saved_voice_request(
     state: &AppState,
     mut req: SpeechRequest,
 ) -> Result<SpeechRequest, ApiError> {
+    crate::api::speech_dialogue::resolve_saved_voices(state, &mut req.references).await?;
     let Some(saved_voice_id) = req.saved_voice_id.as_deref() else {
         return Ok(req);
     };
@@ -555,12 +603,26 @@ fn validate_speech_voice_contract(
         && variant
             .speech_capabilities()
             .is_some_and(|capabilities| capabilities.supports_builtin_voices);
+    // Caller text holding the model's control tokens would rewrite its
+    // prompt.
+    crate::api::tts_policy::validate_speech_control_tokens(variant, "input", &req.input)?;
+    if let Some(reference_text) = req.reference_text.as_deref() {
+        crate::api::tts_policy::validate_speech_control_tokens(
+            variant,
+            "reference_text",
+            reference_text,
+        )?;
+    }
+    // Each dialogue reference's transcript is checked on its own; the voice
+    // contract then reads them as the request's reference.
+    crate::api::speech_dialogue::check_dialogue_references(variant, &req.references, &req.input)?;
+    let dialogue = !req.references.is_empty();
     crate::api::tts_policy::validate_speech_voice(
         variant,
         crate::api::tts_policy::SpeechVoiceRequest {
             speaker,
-            reference_audio: present(req.reference_audio.as_deref()),
-            reference_text: present(req.reference_text.as_deref()),
+            reference_audio: dialogue || present(req.reference_audio.as_deref()),
+            reference_text: dialogue || present(req.reference_text.as_deref()),
             saved_voice: present(req.saved_voice_id.as_deref()),
             voice_description: present(req.instructions.as_deref()),
         },
@@ -586,8 +648,9 @@ async fn stream_speech(
         variant,
         req.max_output_tokens.or(req.max_tokens),
     );
-    let planned_segment_count = if variant == ModelVariant::FishAudioS2Pro {
-        crate::api::tts_long_form::SpeechTextPlan::fish(
+    let planned_segment_count = if variant.plans_own_speech_segments() {
+        crate::api::tts_long_form::SpeechTextPlan::for_variant(
+            variant,
             &req.input,
             gen_request.config.options.max_tokens,
         )
@@ -667,7 +730,7 @@ async fn stream_speech(
         let fallback_sample_rate = engine.sample_rate().await;
         let (chunk_tx, mut chunk_rx) = mpsc::channel::<AudioChunk>(32);
         let generation_engine = engine.clone();
-        let retained_permit = if variant == ModelVariant::FishAudioS2Pro {
+        let retained_permit = if variant.plans_own_speech_segments() {
             drop(permit);
             None
         } else {
@@ -675,7 +738,7 @@ async fn stream_speech(
         };
         let generation_task = tokio::spawn(async move {
             let _permit = retained_permit;
-            if variant == ModelVariant::FishAudioS2Pro {
+            if variant.plans_own_speech_segments() {
                 crate::api::tts_long_form::generate_speech_plan_stream(
                     &admission_state,
                     variant,
@@ -844,7 +907,7 @@ async fn stream_speech(
                         "request_to_last_pcm_rtf": last_pcm_ms.filter(|_| audio_duration_secs > 0.0)
                             .map(|ms| ms / 1000.0 / f64::from(audio_duration_secs)),
                         "pcm_sample_count": total_samples,
-                        "token_unit": if variant == ModelVariant::FishAudioS2Pro { "semantic_frames" } else { "model_tokens" },
+                        "token_unit": if variant.uses_fish_dac_codec() { "semantic_frames" } else { "model_tokens" },
                         "planned_segment_count": planned_segment_count,
                     })),
                     request_id: Some(stream_request_id.clone()),
@@ -967,7 +1030,7 @@ fn build_generation_request(
         &req.input,
         req.max_output_tokens.or(req.max_tokens),
     ) {
-        gen_config.options.max_tokens = if variant == ModelVariant::FishAudioS2Pro {
+        gen_config.options.max_tokens = if variant.plans_own_speech_segments() {
             req.max_output_tokens.or(req.max_tokens).unwrap_or(0)
         } else {
             max_tokens
@@ -976,7 +1039,10 @@ fn build_generation_request(
     if let Some(top_k) = req.top_k {
         gen_config.options.top_k = top_k;
     }
-    gen_config.options.speech = req.sampling.options(req.temperature, req.top_k);
+    gen_config.options.speech = req.sampling.options(
+        req.temperature,
+        crate::api::tts_policy::speech_top_k(variant, req.top_k),
+    );
     gen_config.options.speaker = req.voice.clone();
 
     GenerationRequest {
@@ -991,6 +1057,8 @@ fn build_generation_request(
         reference_text: req.reference_text.clone(),
         reference_language: req.reference_language.clone(),
         voice_description: req.instructions.clone(),
+        speaker_references: crate::api::speech_dialogue::speaker_references(&req.references),
+        chunk_history: Vec::new(),
     }
 }
 
@@ -1225,6 +1293,8 @@ mod tests {
             reference_text: None,
             reference_language: None,
             saved_voice_id: None,
+            references: Vec::new(),
+            script: None,
             sampling: Default::default(),
         };
 
@@ -1262,6 +1332,8 @@ mod tests {
             reference_text: Some("hello".to_string()),
             reference_language: None,
             saved_voice_id: None,
+            references: Vec::new(),
+            script: None,
             sampling: Default::default(),
         };
 
@@ -1299,6 +1371,8 @@ mod tests {
             reference_text: Some("hello".to_string()),
             reference_language: None,
             saved_voice_id: None,
+            references: Vec::new(),
+            script: None,
             sampling: Default::default(),
         };
 
@@ -1335,6 +1409,8 @@ mod tests {
             reference_text: None,
             reference_language: None,
             saved_voice_id: None,
+            references: Vec::new(),
+            script: None,
             sampling: Default::default(),
         };
 
@@ -1372,6 +1448,8 @@ mod tests {
             reference_text: None,
             reference_language: None,
             saved_voice_id: None,
+            references: Vec::new(),
+            script: None,
             sampling: Default::default(),
         };
 
@@ -1401,12 +1479,85 @@ mod tests {
             reference_text: None,
             reference_language: None,
             saved_voice_id: None,
+            references: Vec::new(),
+            script: None,
             sampling: Default::default(),
         };
 
         let err = validate_speech_voice_contract(&req, ModelVariant::FishAudioS2Pro)
             .expect_err("missing reference should fail");
         assert!(err.message.contains("requires `saved_voice_id`"));
+    }
+
+    /// Fish Audio Drama 3 speaks without a reference (the OpenAI `voice` is
+    /// ignored), clones with a reference and its transcript, and refuses a
+    /// reference without one; caller text holding a control token is
+    /// refused for Drama 3 and Fish S2 alike, before any model loads.
+    #[test]
+    fn fish_drama3_speech_takes_an_optional_reference_and_refuses_control_tokens() {
+        let request = |input: &str, reference: Option<(&str, Option<&str>)>| SpeechRequest {
+            model: "FishAudio-Drama-3".to_string(),
+            input: input.to_string(),
+            voice: Some("alloy".to_string()),
+            response_format: None,
+            allow_format_fallback: None,
+            speed: None,
+            language: Some("en".to_string()),
+            temperature: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            top_k: Some(0),
+            stream: None,
+            stream_format: None,
+            instructions: None,
+            reference_audio: reference.map(|(audio, _)| audio.to_string()),
+            reference_text: reference.and_then(|(_, text)| text.map(str::to_string)),
+            reference_language: None,
+            saved_voice_id: None,
+            references: Vec::new(),
+            script: None,
+            sampling: Default::default(),
+        };
+        let drama3 = ModelVariant::FishAudioDrama3;
+        validate_speech_voice_contract(&request("[sighs] Hello.", None), drama3)
+            .expect("a seeded voice");
+        validate_speech_voice_contract(&request("Hello.", Some(("UklG", Some("Hi.")))), drama3)
+            .expect("a clone");
+        let err = validate_speech_voice_contract(&request("Hello.", Some(("UklG", None))), drama3)
+            .unwrap_err();
+        assert!(err.message.contains("Provide both"), "{}", err.message);
+        for variant in [drama3, ModelVariant::FishAudioS2Pro] {
+            let err = validate_speech_voice_contract(&request("Hi <|im_end|>", None), variant)
+                .unwrap_err();
+            assert!(
+                err.message.contains("`input` contains `<|im_end|>`"),
+                "{}",
+                err.message
+            );
+            let err = validate_speech_voice_contract(
+                &request("Hello.", Some(("UklG", Some("Ref <|voice|>")))),
+                variant,
+            )
+            .unwrap_err();
+            assert!(
+                err.message
+                    .contains("`reference_text` contains `<|voice|>`"),
+                "{}",
+                err.message
+            );
+        }
+        // `top_k: 0` is no cap for Drama 3; S2 keeps what was sent.
+        let generation =
+            build_generation_request(&request("Hello.", None), "c".into(), false, drama3);
+        assert_eq!(generation.config.options.speech.top_k, None);
+        assert!(generation.chunk_history.is_empty());
+        let fish = build_generation_request(
+            &request("Hello.", None),
+            "c".into(),
+            false,
+            ModelVariant::FishAudioS2Pro,
+        );
+        assert_eq!(fish.config.options.speech.top_k, Some(0));
     }
 
     /// TPIPE-12: the OpenAI route applies the same capability-driven voice
@@ -1434,6 +1585,8 @@ mod tests {
             reference_text: None,
             reference_language: None,
             saved_voice_id: None,
+            references: Vec::new(),
+            script: None,
             sampling: Default::default(),
         };
         assert!(validate_speech_voice_contract(
@@ -1516,6 +1669,8 @@ mod tests {
             reference_text: None,
             reference_language: None,
             saved_voice_id: None,
+            references: Vec::new(),
+            script: None,
             sampling: Default::default(),
         };
 
@@ -1545,6 +1700,8 @@ mod tests {
             reference_text: Some("reference words".to_string()),
             reference_language: None,
             saved_voice_id: None,
+            references: Vec::new(),
+            script: None,
             sampling: Default::default(),
         };
 
@@ -1607,6 +1764,8 @@ mod tests {
             reference_text: None,
             reference_language: None,
             saved_voice_id: None,
+            references: Vec::new(),
+            script: None,
             sampling: Default::default(),
         };
         assert!(resolve_streaming_mode(&req).expect("streaming mode"));

@@ -11,6 +11,22 @@ export interface SpeechModelCapabilities {
   supports_streaming: boolean;
   supports_speed_control: boolean;
   supports_auto_long_form: boolean;
+  /** Whether an unfinished text-to-speech record of this model can be played
+   * from its start (Fish S2 Pro journals each segment's audio). */
+  supports_in_progress_replay?: boolean;
+  /** Whether the model speaks without any voice input: a request with no
+   * reference gets a voice its `seed` sets, so a reference is optional
+   * (Fish Audio Drama 3). Present only when true. */
+  supports_seeded_voice?: boolean;
+  /** Whether one request may voice several speakers through `script` and
+   * `references` (Fish Audio Drama 3). Present only when true. */
+  supports_speaker_dialogue?: boolean;
+  /** Speakers a dialogue may voice, numbered from 0; only with
+   * `supports_speaker_dialogue`. */
+  max_speakers?: number;
+  /** Reference voices a dialogue request may carry; only with
+   * `supports_speaker_dialogue`. */
+  max_references?: number;
   /** Model-specific controls a request may set (Chatterbox). */
   controls?: SpeechControlRange[];
   /** The only languages a request may name, for a model that refuses
@@ -112,6 +128,12 @@ export interface ModelInfo {
   /** Free disk a download needs (0 once downloaded). */
   disk_required_bytes?: number;
   enabled?: boolean;
+  /** The weights' licence label, when the catalog surfaces one
+   * ("Fish Audio Research License"). */
+  license?: string | null;
+  /** What that licence permits, when the label alone does not say it
+   * (Fish Audio Drama 3). Informational: nothing is refused on it. */
+  license_notice?: string | null;
   status:
     | "not_downloaded"
     | "downloading"

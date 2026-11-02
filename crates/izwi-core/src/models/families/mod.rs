@@ -66,6 +66,7 @@ const MAYA1_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::Maya13B, ModelVarian
 const MAYA2_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::Maya2Native25B];
 const VIBEVOICE_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::VibeVoice15BTts];
 const FISH_S2_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::FishAudioS2Pro];
+const FISH_DRAMA3_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::FishAudioDrama3];
 const PARAKEET_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::ParakeetTdt06BV3];
 const WHISPER_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::WhisperLargeV3Turbo];
 const QWEN3_ASR_VARIANTS: &[ModelVariant] =
@@ -138,6 +139,11 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
         family: ModelFamily::FishS2Tts,
         module_path: "crate::models::architectures::fish_s2",
         variants: FISH_S2_TTS_VARIANTS,
+    },
+    FamilyRegistration {
+        family: ModelFamily::FishDrama3Tts,
+        module_path: "crate::models::architectures::fish_drama3",
+        variants: FISH_DRAMA3_TTS_VARIANTS,
     },
     FamilyRegistration {
         family: ModelFamily::ChatterboxTts,
@@ -296,7 +302,11 @@ mod tests {
         for registration in model_family_registrations() {
             assert!(!registration.variants.is_empty());
             assert!(!registration.module_path.is_empty());
-            assert!(!registration.capabilities().is_empty());
+            assert!(
+                !registration.capabilities().is_empty(),
+                "{:?} has no capability rows",
+                registration.family
+            );
             assert!(!registration.fixture_ids().is_empty());
 
             for variant in registration.variants {

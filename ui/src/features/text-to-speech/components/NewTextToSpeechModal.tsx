@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Loader2, Sparkles } from "lucide-react";
+import { AlertTriangle, Dices, Loader2, Sparkles } from "lucide-react";
 
 import {
   api,
@@ -9,7 +9,9 @@ import {
   type SpeechControlRange,
   type SpeechHistoryRecord,
   type SpeechHistoryRecordCreateRequest,
+  type TTSRequest,
 } from "@/api";
+import { useAudioPreview } from "@/components/audio/useAudioPreview";
 import { CreationDialog } from "@/components/CreationDialog";
 import {
   CreationBody,
@@ -18,7 +20,26 @@ import {
   ModelRow,
   ModelRowAction,
 } from "@/components/creation/CreationParts";
+import {
+  SegmentedFilter,
+  type SegmentOption,
+} from "@/components/history/HistoryToolbar";
 import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
+import { DialogueEditor } from "@/features/text-to-speech/components/DialogueEditor";
+import {
+  FISH_DRAMA3_SCOPED_TAGS,
+  dialogueLimits,
+  dialogueProblem,
+  dialogueReferences,
+  dialogueScript,
+  insertTagAt,
+  newDialogueScene,
+  type DialogueLine,
+  type DialogueScene,
+} from "@/features/text-to-speech/dialogue";
+import { savedVoiceLabel } from "@/features/text-to-speech/support";
+import type { TakeDraft } from "@/features/text-to-speech/take";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
 import {
@@ -28,7 +49,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { getSpeakerProfilesForVariant, isMaya1Variant } from "@/types";
+import {
+  getSpeakerProfilesForVariant,
+  isFishDrama3Variant,
+  isMaya1Variant,
+} from "@/types";
 
 interface NewTextToSpeechModalProps {
   isOpen: boolean;
@@ -39,6 +64,9 @@ interface NewTextToSpeechModalProps {
   isModelManagerOpen?: boolean;
   initialSavedVoiceId?: string | null;
   initialSpeaker?: string | null;
+  /** A take to start from: its lines, voices and seed. With `editsTakeId`,
+   * new takes continue from it while its model is selected. */
+  initialTake?: TakeDraft | null;
   onLoadSelectedModel?: (variant: string) => Promise<void> | void;
   onUnloadSelectedModel?: (variant: string) => Promise<void> | void;
   onOpenModelManager: () => void;
@@ -82,17 +110,35 @@ const DEFAULT_SPEECH_LANGUAGE = "en";
 const AUTO_DETECT_LANGUAGE = "auto";
 
 /** The saved-voice picker's "no saved voice" choice, for a model that also
- * has built-in voices (Radix Select takes no empty value). */
+ * has built-in voices or a seeded voice (Radix Select takes no empty value). */
 const BUILT_IN_VOICE = "__built_in__";
 
-function savedVoiceLabel(voice: SavedVoiceSummary): string {
-  const source =
-    voice.source_route_kind === "voice_cloning"
-      ? "Clone"
-      : voice.source_route_kind === "voice_design"
-        ? "Design"
-        : "Saved";
-  return `${voice.name} (${source})`;
+type SpeechMode = "single" | "dialogue";
+
+const NO_TAGS: readonly string[] = [];
+
+const MODE_OPTIONS: SegmentOption<SpeechMode>[] = [
+  { id: "single", label: "Single voice" },
+  { id: "dialogue", label: "Dialogue" },
+];
+
+/** A seed to start from, so a line preview and the scene share voices. */
+function randomSeed(): number {
+  return Math.floor(Math.random() * 1_000_000);
+}
+
+/** The seed field as a request sends it: none when empty, an error when
+ * it is not a whole number. */
+function parseSeed(value: string): { seed?: number; error?: string } {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return {};
+  }
+  const seed = Number(trimmed);
+  if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(seed)) {
+    return { error: "The seed must be a whole number, 0 or more." };
+  }
+  return { seed };
 }
 
 export function NewTextToSpeechModal({
@@ -104,6 +150,7 @@ export function NewTextToSpeechModal({
   isModelManagerOpen = false,
   initialSavedVoiceId = null,
   initialSpeaker = null,
+  initialTake = null,
   onLoadSelectedModel,
   onUnloadSelectedModel,
   onOpenModelManager,
@@ -111,9 +158,11 @@ export function NewTextToSpeechModal({
   onCreated,
   onCreateStream,
 }: NewTextToSpeechModalProps) {
-  const [text, setText] = useState("");
+  const [text, setText] = useState(initialTake?.text ?? "");
   const [speaker, setSpeaker] = useState(initialSpeaker || "Vivian");
-  const [savedVoiceId, setSavedVoiceId] = useState(initialSavedVoiceId || "");
+  const [savedVoiceId, setSavedVoiceId] = useState(
+    (initialTake ? initialTake.savedVoiceId : initialSavedVoiceId) || "",
+  );
   const [voiceDescription, setVoiceDescription] = useState("");
   const [speed, setSpeed] = useState(1);
   const [language, setLanguage] = useState<string | null>(null);
@@ -129,9 +178,50 @@ export function NewTextToSpeechModal({
   const [savedVoices, setSavedVoices] = useState<SavedVoiceSummary[]>([]);
   const [savedVoicesLoading, setSavedVoicesLoading] = useState(false);
   const [savedVoicesError, setSavedVoicesError] = useState<string | null>(null);
+  const [mode, setMode] = useState<SpeechMode>(
+    initialTake?.dialogue ? "dialogue" : "single",
+  );
+  const [scene, setScene] = useState<DialogueScene>(
+    () => initialTake?.dialogue ?? newDialogueScene(null),
+  );
+  const [seed, setSeed] = useState("");
+  // The latest line preview, replayed while its request is unchanged.
+  const [linePreview, setLinePreview] = useState<{
+    lineId: string;
+    key: string;
+    url: string;
+  } | null>(null);
+  const [previewingLineId, setPreviewingLineId] = useState<string | null>(
+    null,
+  );
+  const previewRunRef = useRef(0);
+  const linePreviewAudio = useAudioPreview(() =>
+    setError("The preview could not play in this browser."),
+  );
+  const stopLinePreview = linePreviewAudio.stop;
   const wasOpenRef = useRef(false);
 
   const capabilities = selectedModelInfo?.speech_capabilities ?? null;
+  // A model that speaks without voice input (Fish Audio Drama 3): the seed
+  // sets the voice, so a saved voice is optional.
+  const seededVoice = capabilities?.supports_seeded_voice ?? false;
+  const limits = useMemo(() => dialogueLimits(capabilities), [capabilities]);
+  const dialogueMode = mode === "dialogue" && limits !== null;
+  // The take being edited: new takes continue from it while its model is
+  // the selected one.
+  const editsTakeId =
+    initialTake?.editsTakeId && selectedModel === initialTake.modelId
+      ? initialTake.editsTakeId
+      : null;
+  // What of the take could not come back, in the form it opened in.
+  const takeNote =
+    initialTake?.note && dialogueMode === Boolean(initialTake.dialogue)
+      ? initialTake.note
+      : null;
+  const scopedTags =
+    selectedModel && isFishDrama3Variant(selectedModel)
+      ? FISH_DRAMA3_SCOPED_TAGS
+      : NO_TAGS;
   const supportsSpeed = capabilities?.supports_speed_control ?? false;
   const supportsBuiltInVoices = capabilities?.supports_builtin_voices ?? false;
   const supportsReferenceVoices =
@@ -186,6 +276,8 @@ export function NewTextToSpeechModal({
   const usesBuiltInVoiceSelection =
     effectiveVoiceWorkflow === "built_in_voice";
   const usesVoiceDescription = effectiveVoiceWorkflow === "voice_description";
+  // A built-in or seeded voice speaks when no saved voice is chosen.
+  const savedVoiceOptional = usesBuiltInVoiceSelection || seededVoice;
   // A description is required only when it is the model's sole voice mode;
   // models with built-in voices (Qwen3 1.7B CustomVoice) accept it as
   // optional style direction alongside the speaker.
@@ -206,16 +298,16 @@ export function NewTextToSpeechModal({
   const insertInlineTag = useCallback(
     (tag: string) => {
       const field = scriptRef.current;
-      const start = field?.selectionStart ?? text.length;
-      const end = field?.selectionEnd ?? text.length;
-      const before = text.slice(0, start);
-      const after = text.slice(end).replace(/^\s+/, "");
-      const lead = before && !/\s$/.test(before) ? " " : "";
-      const inserted = `${before}${lead}${tag} `;
-      setText(`${inserted}${after}`);
+      const next = insertTagAt(
+        text,
+        field?.selectionStart ?? text.length,
+        field?.selectionEnd ?? text.length,
+        tag,
+      );
+      setText(next.text);
       requestAnimationFrame(() => {
         field?.focus();
-        field?.setSelectionRange(inserted.length, inserted.length);
+        field?.setSelectionRange(next.caret, next.caret);
       });
     },
     [text],
@@ -243,9 +335,11 @@ export function NewTextToSpeechModal({
   }, [speaker, speakerOptions, usesBuiltInVoiceSelection]);
 
   const resetModalState = useCallback(() => {
-    setText("");
+    setText(initialTake?.text ?? "");
     setSpeaker(initialSpeaker || "Vivian");
-    setSavedVoiceId(initialSavedVoiceId || "");
+    setSavedVoiceId(
+      (initialTake ? initialTake.savedVoiceId : initialSavedVoiceId) || "",
+    );
     setVoiceDescription("");
     setLanguage(null);
     setControlValues({});
@@ -256,7 +350,23 @@ export function NewTextToSpeechModal({
     setSavedVoices([]);
     setSavedVoicesLoading(false);
     setSavedVoicesError(null);
-  }, [initialSavedVoiceId, initialSpeaker]);
+    setMode(initialTake?.dialogue ? "dialogue" : "single");
+    setScene(initialTake?.dialogue ?? newDialogueScene(limits));
+    setSeed(initialTake?.seed ?? String(randomSeed()));
+    previewRunRef.current += 1;
+    setPreviewingLineId(null);
+    setLinePreview(null);
+    stopLinePreview();
+  }, [initialTake, initialSavedVoiceId, initialSpeaker, limits, stopLinePreview]);
+
+  // A replaced or abandoned preview frees its audio.
+  useEffect(() => {
+    if (!linePreview) {
+      return;
+    }
+    const { url } = linePreview;
+    return () => URL.revokeObjectURL(url);
+  }, [linePreview]);
 
   const handleModelAction = useCallback(async () => {
     if (!selectedModel || modelActionPending) {
@@ -376,10 +486,91 @@ export function NewTextToSpeechModal({
     [savedVoices, transcriptRequired],
   );
 
+  // Fields every request of the dialog carries besides its text and voices.
+  const sharedRequestFields = useCallback(() => {
+    const parsedSeed = seededVoice ? parseSeed(seed) : {};
+    return {
+      error: parsedSeed.error,
+      fields: {
+        language:
+          offersLanguage && resolvedLanguage !== AUTO_DETECT_LANGUAGE
+            ? resolvedLanguage
+            : undefined,
+        // Only a model with speed control gets one (Kokoro); 1× sends none.
+        speed:
+          supportsSpeed && Math.abs(speed - 1) > 0.001 ? speed : undefined,
+        ...changedSpeechControls(speechControls, controlValues),
+        seed: parsedSeed.seed,
+        previous_take_ids: editsTakeId ? [editsTakeId] : undefined,
+      },
+    };
+  }, [
+    controlValues,
+    editsTakeId,
+    offersLanguage,
+    resolvedLanguage,
+    seed,
+    seededVoice,
+    speechControls,
+    speed,
+    supportsSpeed,
+  ]);
+
+  // The page's record path: streamed when the switch allows, else a job.
+  const sendGeneration = useCallback(
+    async (request: SpeechHistoryRecordCreateRequest) => {
+      stopLinePreview();
+      setIsSubmitting(true);
+      setError(null);
+
+      try {
+        const createdRecord =
+          streamingEnabled && streamAvailable
+            ? await onCreateStream(request)
+            : await api.createTextToSpeechRecord(request);
+
+        await onCreated(createdRecord);
+        onClose();
+      } catch (err) {
+        setError(
+          err instanceof Error ? err.message : "Failed to create generation.",
+        );
+      } finally {
+        setIsSubmitting(false);
+      }
+    },
+    [
+      onClose,
+      onCreated,
+      onCreateStream,
+      stopLinePreview,
+      streamAvailable,
+      streamingEnabled,
+    ],
+  );
+
   const submitGeneration = useCallback(async () => {
     if (!selectedModel || !selectedModelReady) {
       onModelRequired();
       setError("Select and load a compatible model before starting generation.");
+      return;
+    }
+
+    // The whole scene: every line, and the saved voices of its speakers.
+    if (dialogueMode && limits) {
+      const problem = dialogueProblem(scene, scene.lines, limits);
+      const shared = sharedRequestFields();
+      if (problem || shared.error) {
+        setError(problem ?? shared.error ?? null);
+        return;
+      }
+      const references = dialogueReferences(scene, scene.lines);
+      await sendGeneration({
+        model_id: selectedModel,
+        script: dialogueScript(scene.lines),
+        references: references.length > 0 ? references : undefined,
+        ...shared.fields,
+      });
       return;
     }
 
@@ -403,7 +594,8 @@ export function NewTextToSpeechModal({
       return;
     }
 
-    if (usesSavedVoiceSelection && !savedVoiceId) {
+    // A seeded-voice model speaks without one: the seed sets the voice.
+    if (usesSavedVoiceSelection && !savedVoiceId && !seededVoice) {
       setError("Select a saved voice before starting generation.");
       return;
     }
@@ -413,7 +605,13 @@ export function NewTextToSpeechModal({
       return;
     }
 
-    const request: SpeechHistoryRecordCreateRequest = {
+    const shared = sharedRequestFields();
+    if (shared.error) {
+      setError(shared.error);
+      return;
+    }
+
+    await sendGeneration({
       model_id: selectedModel,
       text: trimmedText,
       speaker:
@@ -421,55 +619,25 @@ export function NewTextToSpeechModal({
           ? resolvedBuiltInSpeaker
           : undefined,
       saved_voice_id: useSavedVoice ? savedVoiceId : undefined,
-      language:
-        offersLanguage && resolvedLanguage !== AUTO_DETECT_LANGUAGE
-          ? resolvedLanguage
-          : undefined,
       voice_description:
         showsVoiceDescription && trimmedVoiceDescription
           ? trimmedVoiceDescription
           : undefined,
-      // Only a model with speed control gets one (Kokoro); 1× sends none.
-      speed: supportsSpeed && Math.abs(speed - 1) > 0.001 ? speed : undefined,
-      ...changedSpeechControls(speechControls, controlValues),
-    };
-
-    setIsSubmitting(true);
-    setError(null);
-
-    try {
-      const createdRecord =
-        streamingEnabled && streamAvailable
-          ? await onCreateStream(request)
-          : await api.createTextToSpeechRecord(request);
-
-      await onCreated(createdRecord);
-      onClose();
-    } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "Failed to create generation.",
-      );
-    } finally {
-      setIsSubmitting(false);
-    }
+      ...shared.fields,
+    });
   }, [
-    onClose,
-    onCreated,
     onModelRequired,
-    onCreateStream,
+    dialogueMode,
     effectiveVoiceWorkflow,
-    offersLanguage,
-    resolvedLanguage,
+    limits,
     resolvedBuiltInSpeaker,
     savedVoiceId,
+    scene,
+    seededVoice,
     selectedModel,
     selectedModelReady,
-    speechControls,
-    controlValues,
-    speed,
-    streamAvailable,
-    streamingEnabled,
-    supportsSpeed,
+    sendGeneration,
+    sharedRequestFields,
     text,
     voiceDescription,
     usesBuiltInVoiceSelection,
@@ -479,6 +647,83 @@ export function NewTextToSpeechModal({
     showsVoiceDescription,
   ]);
 
+  // A line on its own, with its speaker's saved voice, through the speech
+  // route: nothing is added to history.
+  const previewLine = useCallback(
+    async (line: DialogueLine) => {
+      if (!selectedModel || !selectedModelReady) {
+        onModelRequired();
+        setError("Select and load a compatible model before previewing a line.");
+        return;
+      }
+      if (!limits) {
+        return;
+      }
+      const problem = dialogueProblem(scene, [line], limits);
+      if (problem) {
+        setError(problem);
+        return;
+      }
+      const shared = sharedRequestFields();
+      if (shared.error) {
+        setError(shared.error);
+        return;
+      }
+      const references = dialogueReferences(scene, [line]);
+      const request: TTSRequest = {
+        model_id: selectedModel,
+        script: dialogueScript([line]),
+        references: references.length > 0 ? references : undefined,
+        language: shared.fields.language,
+        speed: shared.fields.speed,
+        seed: shared.fields.seed,
+      };
+      const key = JSON.stringify(request);
+      if (linePreview?.lineId === line.id && linePreview.key === key) {
+        linePreviewAudio.toggle(line.id, linePreview.url);
+        return;
+      }
+      stopLinePreview();
+      const run = ++previewRunRef.current;
+      setPreviewingLineId(line.id);
+      setError(null);
+      try {
+        const { audioBlob } = await api.generateTTSWithStats(request);
+        if (run !== previewRunRef.current) {
+          return;
+        }
+        const url = URL.createObjectURL(audioBlob);
+        setLinePreview({ lineId: line.id, key, url });
+        linePreviewAudio.toggle(line.id, url);
+      } catch (err) {
+        if (run === previewRunRef.current) {
+          setError(
+            err instanceof Error ? err.message : "Failed to preview the line.",
+          );
+        }
+      } finally {
+        if (run === previewRunRef.current) {
+          setPreviewingLineId(null);
+        }
+      }
+    },
+    [
+      limits,
+      linePreview,
+      linePreviewAudio,
+      onModelRequired,
+      scene,
+      selectedModel,
+      selectedModelReady,
+      sharedRequestFields,
+      stopLinePreview,
+    ],
+  );
+
+  const sceneCharacters = scene.lines.reduce(
+    (total, line) => total + Array.from(line.text).length,
+    0,
+  );
   const modelStatus = selectedModelReady ? "ready" : "not_ready";
   const modelStatusCode = selectedModelInfo?.status ?? null;
   const modelStatusBusy =
@@ -497,6 +742,15 @@ export function NewTextToSpeechModal({
             ? "Unload model"
             : "Load model";
 
+  const takeNoteElement = takeNote ? (
+    <p
+      role="note"
+      className="rounded-[10px] border border-(--border-subtle) bg-(--surface-panel) px-3 py-2 text-[12.5px] leading-5 text-(--text-muted)"
+    >
+      {takeNote}
+    </p>
+  ) : null;
+
   return (
     <CreationDialog
       open={isOpen}
@@ -504,58 +758,104 @@ export function NewTextToSpeechModal({
       modal={!isModelManagerOpen}
       blockDismiss={isModelManagerOpen}
       className="max-w-208"
-      title="New text-to-speech job"
-      description="Create a generation job and open it on its own record page immediately."
+      title={editsTakeId ? "Edit take" : "New text-to-speech job"}
+      description={
+        editsTakeId
+          ? "Editing a take: the new take continues from it."
+          : "Create a generation job and open it on its own record page immediately."
+      }
+      header={
+        limits ? (
+          <div className="mt-3">
+            <SegmentedFilter
+              label="Speech mode"
+              options={MODE_OPTIONS}
+              value={dialogueMode ? "dialogue" : "single"}
+              onChange={(next) => {
+                stopLinePreview();
+                setError(null);
+                setMode(next);
+              }}
+              disabled={isSubmitting}
+            />
+          </div>
+        ) : null
+      }
       onSubmit={() => void submitGeneration()}
-      submitLabel="Create generation"
+      submitLabel={dialogueMode ? "Generate scene" : "Create generation"}
       submitIcon={<Sparkles className="h-4 w-4" />}
       submitting={isSubmitting}
-      footerStart={`${Array.from(text).length} characters`}
+      footerStart={
+        dialogueMode
+          ? `${scene.lines.length} ${scene.lines.length === 1 ? "line" : "lines"} · ${sceneCharacters} characters`
+          : `${Array.from(text).length} characters`
+      }
     >
         <CreationBody
           main={
-            <>
-              <textarea
-                ref={scriptRef}
-                aria-label="Script"
-                value={text}
-                onChange={(event) => setText(event.target.value)}
-                disabled={isSubmitting}
-                rows={12}
-                autoFocus
-                placeholder="Write or paste the text to speak…"
-                className="min-h-68 w-full flex-1 resize-y rounded-[12px] border border-(--border-default) bg-(--surface-panel) px-4 py-3 text-[14.5px] leading-6 text-(--text-primary) outline-hidden transition-colors placeholder:text-(--text-subtle) focus:border-(--border-strong)"
-              />
-              {inlineTags.length > 0 ? (
-                <Select
-                  value=""
-                  onValueChange={insertInlineTag}
+            dialogueMode && limits ? (
+              <>
+                {takeNoteElement}
+                <DialogueEditor
+                  scene={scene}
+                  onChange={setScene}
+                  limits={limits}
+                  savedVoices={savedVoices}
+                  savedVoicesLoading={savedVoicesLoading}
+                  savedVoicesError={savedVoicesError}
+                  pointTags={inlineTags}
+                  scopedTags={scopedTags}
                   disabled={isSubmitting}
-                >
-                  <SelectTrigger
-                    aria-label="Insert an expression tag"
-                    className="h-8 w-fit gap-2 text-xs"
+                  previewingLineId={previewingLineId}
+                  playingLineId={linePreviewAudio.playingId}
+                  onPreviewLine={(line) => void previewLine(line)}
+                />
+              </>
+            ) : (
+              <>
+                {takeNoteElement}
+                <textarea
+                  ref={scriptRef}
+                  aria-label="Script"
+                  value={text}
+                  onChange={(event) => setText(event.target.value)}
+                  disabled={isSubmitting}
+                  rows={12}
+                  autoFocus
+                  placeholder="Write or paste the text to speak…"
+                  className="min-h-68 w-full flex-1 resize-y rounded-[12px] border border-(--border-default) bg-(--surface-panel) px-4 py-3 text-[14.5px] leading-6 text-(--text-primary) outline-hidden transition-colors placeholder:text-(--text-subtle) focus:border-(--border-strong)"
+                />
+                {inlineTags.length > 0 ? (
+                  <Select
+                    value=""
+                    onValueChange={insertInlineTag}
+                    disabled={isSubmitting}
                   >
-                    <SelectValue
-                      placeholder={`Insert a tag: ${inlineTags.slice(0, 3).join(", ")}…`}
-                    />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {inlineTags.map((tag) => (
-                      <SelectItem key={tag} value={tag}>
-                        {tag}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              ) : null}
-              {isSubmitting ? (
-                <div className="inline-flex items-center gap-2 text-xs text-(--text-muted)">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  Creating job
-                </div>
-              ) : null}
-            </>
+                    <SelectTrigger
+                      aria-label="Insert an expression tag"
+                      className="h-8 w-fit gap-2 text-xs"
+                    >
+                      <SelectValue
+                        placeholder={`Insert a tag: ${inlineTags.slice(0, 3).join(", ")}…`}
+                      />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {inlineTags.map((tag) => (
+                        <SelectItem key={tag} value={tag}>
+                          {tag}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                ) : null}
+                {isSubmitting ? (
+                  <div className="inline-flex items-center gap-2 text-xs text-(--text-muted)">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    Creating job
+                  </div>
+                ) : null}
+              </>
+            )
           }
           side={
             <>
@@ -627,7 +927,7 @@ export function NewTextToSpeechModal({
                 );
               })}
 
-              {usesBuiltInVoiceSelection ? (
+              {usesBuiltInVoiceSelection && !dialogueMode ? (
                 <CreationField label="Built-in voice">
                   <Select
                     value={speaker}
@@ -651,10 +951,10 @@ export function NewTextToSpeechModal({
                 </CreationField>
               ) : null}
 
-              {offersSavedVoice ? (
+              {offersSavedVoice && !dialogueMode ? (
                 <CreationField
                   label={
-                    usesBuiltInVoiceSelection
+                    savedVoiceOptional
                       ? "Saved voice (optional)"
                       : "Saved voice"
                   }
@@ -667,12 +967,14 @@ export function NewTextToSpeechModal({
                       </span>
                     ) : usesBuiltInVoiceSelection ? (
                       "A saved voice replaces the built-in one."
+                    ) : seededVoice ? (
+                      "Without one, the seed sets the voice. A saved voice needs its transcript."
                     ) : undefined
                   }
                 >
                   <Select
                     value={
-                      usesBuiltInVoiceSelection
+                      savedVoiceOptional
                         ? savedVoiceId || BUILT_IN_VOICE
                         : savedVoiceId
                     }
@@ -688,9 +990,11 @@ export function NewTextToSpeechModal({
                       <SelectValue placeholder="Select saved voice" />
                     </SelectTrigger>
                     <SelectContent>
-                      {usesBuiltInVoiceSelection ? (
+                      {savedVoiceOptional ? (
                         <SelectItem value={BUILT_IN_VOICE}>
-                          None (built-in voice)
+                          {usesBuiltInVoiceSelection
+                            ? "None (built-in voice)"
+                            : "None (seeded voice)"}
                         </SelectItem>
                       ) : null}
                       {usableSavedVoices.map((voice) => (
@@ -703,7 +1007,7 @@ export function NewTextToSpeechModal({
                 </CreationField>
               ) : null}
 
-              {showsVoiceDescription ? (
+              {showsVoiceDescription && !dialogueMode ? (
                 <CreationField
                   label={
                     usesVoiceDescription
@@ -742,6 +1046,41 @@ export function NewTextToSpeechModal({
                       }
                     />
                   )}
+                </CreationField>
+              ) : null}
+
+              {seededVoice ? (
+                <CreationField
+                  label="Seed"
+                  htmlFor="tts-seed"
+                  hint={
+                    dialogueMode
+                      ? "Speakers without a saved voice speak in voices the seed sets."
+                      : "The same seed gives the same voice. Leave it empty for a new voice each time."
+                  }
+                >
+                  <div className="flex items-center gap-2">
+                    <Input
+                      id="tts-seed"
+                      inputMode="numeric"
+                      value={seed}
+                      onChange={(event) => setSeed(event.target.value)}
+                      disabled={isSubmitting}
+                      placeholder="Random"
+                      className="h-9"
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      className="h-9 w-9 shrink-0"
+                      aria-label="Pick a new seed"
+                      onClick={() => setSeed(String(randomSeed()))}
+                      disabled={isSubmitting}
+                    >
+                      <Dices aria-hidden="true" />
+                    </Button>
+                  </div>
                 </CreationField>
               ) : null}
 

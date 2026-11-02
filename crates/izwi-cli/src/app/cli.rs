@@ -354,8 +354,10 @@ pub enum Commands {
     /// Supports streaming output and various audio formats.
     #[command(name = "tts", alias = "speak")]
     Tts {
-        /// Text to synthesize (or "-" to read from stdin)
-        text: String,
+        /// Text to synthesize (or "-" to read from stdin); omit it with
+        /// --script
+        #[arg(required_unless_present = "script")]
+        text: Option<String>,
 
         /// Model to use. The default speaks with a built-in voice; voice-clone
         /// models (e.g. qwen3-tts-0.6b-base) need --reference-audio and
@@ -384,6 +386,38 @@ pub enum Commands {
         /// File containing the reference transcript
         #[arg(long, value_name = "PATH")]
         reference_text_file: Option<PathBuf>,
+
+        /// A reference voice for one speaker of a dialogue (Fish Audio
+        /// Drama 3): speaker N (0 to 15), an audio file and a file holding
+        /// its transcript. Repeatable, up to the model's 8 references;
+        /// several may voice one speaker. --reference-audio and
+        /// --reference-text still give speaker 0
+        #[arg(
+            long = "speaker-reference",
+            value_name = "N=AUDIO[:TRANSCRIPT_FILE]",
+            value_parser = crate::commands::tts::SpeakerReferenceArg::parse
+        )]
+        speaker_references: Vec<crate::commands::tts::SpeakerReferenceArg>,
+
+        /// A saved voice for one speaker of a dialogue: speaker N and the
+        /// voice's ID (it needs a transcript). Repeatable
+        #[arg(
+            long = "speaker-voice",
+            value_name = "N=SAVED_ID",
+            value_parser = crate::commands::tts::SpeakerVoiceArg::parse
+        )]
+        speaker_voices: Vec<crate::commands::tts::SpeakerVoiceArg>,
+
+        /// A dialogue script instead of TEXT: a JSON Lines file, one
+        /// {"speaker": N, "text": "..."} object per line, spoken in order
+        #[arg(long, value_name = "FILE.jsonl", conflicts_with = "text")]
+        script: Option<PathBuf>,
+
+        /// Sampling seed: the same seed and inputs give the same audio. A
+        /// speaker without a reference speaks in a voice it sets (Fish Audio
+        /// Drama 3)
+        #[arg(long)]
+        seed: Option<u64>,
 
         /// Voice direction for supported models: Qwen3 VoiceDesign's voice,
         /// CustomVoice's style, or the voice Maya1 speaks with (replacing
@@ -970,6 +1004,60 @@ mod tests {
     use super::{Cli, Commands};
     use clap::Parser;
     use izwi_core::PhysicalExecutionMode;
+
+    /// A dialogue: repeatable per-speaker references and saved voices, a
+    /// script instead of the text, and a seed.
+    #[test]
+    fn tts_takes_dialogue_flags() {
+        let cli = Cli::try_parse_from([
+            "izwi",
+            "tts",
+            "--model",
+            "FishAudio-Drama-3",
+            "--script",
+            "scene.jsonl",
+            "--speaker-reference",
+            "0=a.wav:a.txt",
+            "--speaker-reference",
+            "1=b.wav",
+            "--speaker-voice",
+            "2=voice-2",
+            "--seed",
+            "42",
+        ])
+        .expect("dialogue flags parse");
+        match cli.command {
+            Commands::Tts {
+                text,
+                script,
+                speaker_references,
+                speaker_voices,
+                seed,
+                ..
+            } => {
+                assert_eq!(text, None);
+                assert_eq!(script.as_deref(), Some(std::path::Path::new("scene.jsonl")));
+                assert_eq!(
+                    speaker_references
+                        .iter()
+                        .map(|reference| reference.speaker)
+                        .collect::<Vec<_>>(),
+                    [0, 1]
+                );
+                assert_eq!(speaker_voices[0].voice_id, "voice-2");
+                assert_eq!(seed, Some(42));
+            }
+            _ => panic!("expected tts command"),
+        }
+        // Text or a script, not both and not neither; a malformed flag is
+        // refused while parsing.
+        assert!(Cli::try_parse_from(["izwi", "tts", "hi", "--script", "s.jsonl"]).is_err());
+        assert!(Cli::try_parse_from(["izwi", "tts"]).is_err());
+        assert!(
+            Cli::try_parse_from(["izwi", "tts", "hi", "--speaker-reference", "a.wav"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["izwi", "tts", "hi", "--speaker-voice", "x=v"]).is_err());
+    }
 
     /// TPIPE-25: the default TTS model speaks with a built-in voice (the old
     /// default was clone-only and was sent no reference), and unset sampling

@@ -26,6 +26,7 @@ import {
   normalizeSpeechProcessingStatus,
   resolveSpeechVoiceLabel,
   speechDownloadFilename,
+  speechTextLabel,
 } from "@/features/text-to-speech/support";
 import { cn } from "@/lib/utils";
 
@@ -59,7 +60,7 @@ function rowLabel(
   record: SpeechHistoryRecordSummary,
   voiceLabel: string,
 ): string {
-  const text = record.input_preview.replace(/\s+/g, " ").trim();
+  const text = speechTextLabel(record.input_preview);
   if (text) {
     return text.length > LABEL_MAX_CHARS
       ? `${text.slice(0, LABEL_MAX_CHARS).trimEnd()}…`
@@ -291,7 +292,7 @@ export function TextToSpeechHistoryTable({
         return (
           <div className="min-w-0">
             <div className="truncate text-(--text-primary)">
-              {record.input_preview || "Untitled generation"}
+              {speechTextLabel(record.input_preview) || "Untitled generation"}
             </div>
             <div className="mt-0.5 flex items-center gap-1.5 text-xs text-(--text-subtle)">
               {status === "failed" ? (

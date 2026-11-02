@@ -239,6 +239,12 @@ impl ModelFamily {
             | Self::Qwen3ForcedAligner => excluded(
                 "managed prefix reuse is gated to chat task requests",
             ),
+            // Two rows rarely share more than the system line before their
+            // references, and a shared reference would need its 62.8 MiB
+            // DeltaNet snapshot published per prefix: out of v1.
+            Self::FishDrama3Tts => excluded(
+                "Fish Audio Drama 3's state contract declares every domain's prefix policy Disabled; reference-prefix snapshot reuse is not in v1",
+            ),
             // Prompts share about 15 tokens before the audio, and vLLM serves
             // this model without prefix or Mamba caching too.
             Self::NemotronTranscribeAsr => excluded(
@@ -358,7 +364,7 @@ mod tests {
 
     #[test]
     fn hybrid_unproven_families_stay_excluded() {
-        for variant in [ModelVariant::Qwen3508BGguf] {
+        for variant in [ModelVariant::Qwen3508BGguf, ModelVariant::FishAudioDrama3] {
             for backend in ALL_BACKENDS {
                 let cell = variant.prefix_reuse_support(backend);
                 assert!(!cell.engages(), "{variant:?} must stay off on {backend:?}");

@@ -127,6 +127,21 @@ fn direct_tts_generation_shape(
             2_048,
             true,
         ),
+        // The family's budget: the automatic one of the text, or the
+        // explicit one up to the codec stream's 4,096 frames.
+        ModelFamily::FishDrama3Tts => (
+            if explicit == 0 {
+                crate::models::architectures::fish_drama3::model::auto_frame_budget(&request.text)
+            } else {
+                explicit.min(tts_explicit_output_limit(
+                    backend,
+                    variant,
+                    max_sequence_length,
+                ))
+            },
+            2_048,
+            true,
+        ),
         _ => {
             return Err(Error::InvalidInput(format!(
                 "model {variant} does not use the direct TTS runtime"
@@ -553,7 +568,7 @@ impl RuntimeService {
         let diagnostics = Some(serde_json::json!({
             "latency_breakdown": output.latency_breakdown,
             "timing_basis": "engine_execution",
-            "token_unit": if resolved_variant == ModelVariant::FishAudioS2Pro {
+            "token_unit": if resolved_variant.uses_fish_dac_codec() {
                 "semantic_frames"
             } else {
                 "model_tokens"
@@ -634,10 +649,16 @@ impl RuntimeService {
         let core_params = core_params_from_generation(&request.config);
         let mut core_request = TtsRuntimeRequest::from_generation(request, resolved_variant)?
             .into_engine_request(core_params);
-        if resolved_variant == ModelVariant::FishAudioS2Pro {
+        if resolved_variant.streams_audio_only() {
             core_request.audio_stream_external_queue_capacity = chunk_tx.max_capacity();
             core_request.mark_audio_streaming_only();
         }
+        // A chunk of a chunk session returns its codes on its final chunk,
+        // for the next chunk's prompt.
+        let generated_codes = resolved_variant
+            .continues_speech_across_chunks()
+            .then(crate::engine::TtsGeneratedCodesSink::default);
+        core_request.tts_generated_codes = generated_codes.clone();
 
         let terminal_deadline = core_request.deadline;
         let budget_frames = core_request.params.max_tokens;
@@ -692,6 +713,10 @@ impl RuntimeService {
                 output.num_tokens,
             ),
         });
+        terminal.generated_codes = generated_codes
+            .as_ref()
+            .and_then(crate::engine::TtsGeneratedCodesSink::take)
+            .map(std::sync::Arc::new);
         send_terminal_tts_chunk(&chunk_tx, terminal, terminal_deadline).await?;
         info!("Streaming generation complete via core engine");
         Ok(())
@@ -981,9 +1006,10 @@ mod tests {
         use crate::runtime::adapters::RuntimeAdapterRegistry;
         // Families whose engine executors stream committed audio and publish
         // the final marker.
-        const ENGINE_STREAM_EMITTERS: [ModelFamily; 8] = [
+        const ENGINE_STREAM_EMITTERS: [ModelFamily; 9] = [
             ModelFamily::Qwen3Tts,
             ModelFamily::FishS2Tts,
+            ModelFamily::FishDrama3Tts,
             ModelFamily::VoxtralTts,
             ModelFamily::Lfm25Audio,
             ModelFamily::VibeVoiceTts,

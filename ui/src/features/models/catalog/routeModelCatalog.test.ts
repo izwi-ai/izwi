@@ -179,6 +179,34 @@ describe("route model catalog", () => {
     expect(VOICE_CLONING_PREFERRED_MODELS[0]).toBe("FishAudio-S2-Pro");
   });
 
+  it("offers Fish Audio Drama 3 on its routes without making it a default pick", () => {
+    // About 40 GB of memory: listed and selectable, never preferred.
+    const drama3 = "FishAudio-Drama-3";
+    expect(TEXT_TO_SPEECH_PREFERRED_MODELS).not.toContain(drama3);
+    expect(VOICE_CLONING_PREFERRED_MODELS).not.toContain(drama3);
+    expect(VOICE_DESIGN_PREFERRED_MODELS).not.toContain(drama3);
+    expect(
+      resolvePreferredRouteModel({
+        models: [
+          { variant: drama3, status: "ready" },
+          { variant: "FishAudio-S2-Pro", status: "downloaded" },
+        ],
+        selectedModel: null,
+        preferredVariants: VOICE_CLONING_PREFERRED_MODELS,
+      }),
+    ).toBe(drama3);
+    expect(
+      resolvePreferredRouteModel({
+        models: [
+          { variant: drama3, status: "downloaded" },
+          { variant: "FishAudio-S2-Pro", status: "downloaded" },
+        ],
+        selectedModel: null,
+        preferredVariants: VOICE_CLONING_PREFERRED_MODELS,
+      }),
+    ).toBe("FishAudio-S2-Pro");
+  });
+
   it("keeps Granite as the preferred speaker-attributed ASR model", () => {
     expect(SPEAKER_ATTRIBUTED_ASR_PREFERRED_MODELS).toEqual([
       "Granite-Speech-4.1-2B-Plus",

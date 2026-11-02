@@ -61,7 +61,20 @@ TEXTS = {
     ),
     # Input that begins with "-" must be spoken, never read as an option.
     "dash": "-5 degrees outside.",
+    # Performance tags, two of them leading their lines (Drama 3).
+    "tags": (
+        "[sighs] I told you this would happen.\n"
+        "[laughs] Fine, have it your way. [pause] We start again tomorrow."
+    ),
+    # Two speakers, tagged in the text (Drama 3).
+    "dialogue": (
+        "<|speaker:0|> Ready when you are.\n"
+        "<|speaker:1|> Always. Let's go before the rain starts."
+    ),
 }
+
+# Speaker and performance tags are directions, not words to hear.
+TAGS = re.compile(r"<\|[^|>]*\|>|\[[^\]]*\]")
 
 
 def family_cases(family, reference):
@@ -69,6 +82,7 @@ def family_cases(family, reference):
     clone = {"reference_audio": reference[0], "reference_text": reference[1]}
     ryan = {"voice": "ryan", "language": "English"}
     greedy = dict(ryan, temperature=0.0, top_k=1)
+    seeded = {"seed": 7}
     table = {
         "kokoro": [
             ("short", "short", {"voice": "af_heart"}, False),
@@ -119,6 +133,19 @@ def family_cases(family, reference):
             ("expressive", "short",
              {"voice": "default", "exaggeration": 0.9, "cfg_weight": 0.3}, False),
         ],
+        # Fish Audio Drama 3: a voice its seed sets, a cloned one, chunked
+        # streaming, tags, a referenced speaker beside a seeded one, and
+        # "long" as a chunk session of about five chunks with history.
+        "drama3": [
+            ("short", "short", seeded, False),
+            ("clone", "short", dict(clone, **seeded), False),
+            ("med_stream", "med", seeded, True),
+            ("num", "num", seeded, False),
+            ("tags", "tags", seeded, False),
+            ("dialogue", "dialogue", dict(seeded, references=[
+                {"speaker": 0, "audio": reference[0], "text": reference[1]}]), False),
+            ("long", "long", seeded, False),
+        ],
     }
     if family not in table:
         raise SystemExit(f"unknown family {family}; known: {', '.join(sorted(table))}")
@@ -128,7 +155,8 @@ def family_cases(family, reference):
 def normalize(text):
     ones = ("zero one two three four five six seven eight nine ten eleven twelve thirteen "
             "fourteen fifteen sixteen seventeen eighteen nineteen").split()
-    text = unicodedata.normalize("NFKC", text).lower().replace("’", "'").replace("-", " ")
+    text = TAGS.sub(" ", unicodedata.normalize("NFKC", text))
+    text = text.lower().replace("’", "'").replace("-", " ")
     words = re.sub(r"[^\w\s']", " ", text).split()
     return [ones[int(w)] if w.isdigit() and int(w) < 20 else w for w in words]
 

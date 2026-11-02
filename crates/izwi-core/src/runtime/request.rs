@@ -129,6 +129,8 @@ pub(crate) struct TtsRuntimeRequest {
     reference_text: Option<String>,
     reference_language: Option<String>,
     voice_description: Option<String>,
+    speaker_references: Vec<crate::runtime::SpeechSpeakerReference>,
+    chunk_history: Vec<crate::runtime::SpeechChunkTurn>,
 }
 
 /// How long a TTS stream may wait for its reader before failing: the same
@@ -152,6 +154,14 @@ impl TtsRuntimeRequest {
         if request.text.is_empty() {
             return Err(Error::InvalidInput("TTS request missing text".to_string()));
         }
+        if !request.chunk_history.is_empty() && !model_variant.continues_speech_across_chunks() {
+            return Err(Error::InvalidInput(format!(
+                "{model_variant} does not continue speech across chunks"
+            )));
+        }
+        if !request.speaker_references.is_empty() {
+            validate_speaker_references(&request, model_variant)?;
+        }
 
         Ok(Self {
             envelope: RequestEnvelope::new(model_variant)
@@ -167,6 +177,8 @@ impl TtsRuntimeRequest {
             reference_text: request.reference_text,
             reference_language: request.reference_language,
             voice_description: request.voice_description,
+            speaker_references: request.speaker_references,
+            chunk_history: request.chunk_history,
         })
     }
 
@@ -178,9 +190,66 @@ impl TtsRuntimeRequest {
         request.reference_text = self.reference_text;
         request.reference_language = self.reference_language;
         request.voice_description = self.voice_description;
+        request.tts_speaker_references = self.speaker_references;
+        request.tts_chunk_history = self.chunk_history;
         request.params = params;
         request
     }
+}
+
+/// Refuse speaker references the model cannot take: any for a model that
+/// does not voice several speakers, alongside `reference_audio` or
+/// `reference_text`, more than the model's `max_references`, a speaker
+/// past its `max_speakers`, or one without its clip or transcript.
+fn validate_speaker_references(request: &GenerationRequest, variant: ModelVariant) -> Result<()> {
+    let references = &request.speaker_references;
+    let capabilities = variant
+        .speech_capabilities()
+        .filter(|capabilities| capabilities.supports_speaker_dialogue)
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "{variant} does not voice several speakers; give one reference with \
+                 reference_audio and reference_text"
+            ))
+        })?;
+    if request.reference_audio.is_some() || request.reference_text.is_some() {
+        return Err(Error::InvalidInput(
+            "Give speaker references or reference_audio and reference_text, not both".into(),
+        ));
+    }
+    if references.len() > capabilities.max_references {
+        return Err(Error::InvalidInput(format!(
+            "{variant} takes at most {} references; got {}",
+            capabilities.max_references,
+            references.len()
+        )));
+    }
+    for (index, reference) in references.iter().enumerate() {
+        let number = index + 1;
+        if reference.speaker >= capabilities.max_speakers {
+            return Err(Error::InvalidInput(format!(
+                "Reference {number}: speaker {} is not 0 to {}",
+                reference.speaker,
+                capabilities.max_speakers - 1
+            )));
+        }
+        if reference.text.trim().is_empty() {
+            return Err(Error::InvalidInput(format!(
+                "Reference {number} has no transcript"
+            )));
+        }
+        crate::runtime::audio_io::validate_base64_audio_retained_size(
+            reference.audio.len(),
+            crate::runtime::audio_io::MAX_REFERENCE_SOURCE_BYTES,
+        )
+        .map_err(|error| match error {
+            Error::InvalidInput(message) => {
+                Error::InvalidInput(format!("Reference {number}: {message}"))
+            }
+            other => other,
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -455,6 +524,73 @@ mod tests {
         );
         assert_eq!(core_request.text.as_deref(), Some("hello"));
         assert_eq!(core_request.params.speaker.as_deref(), Some("alice"));
+    }
+
+    /// Speaker references reach the engine request of a model that voices
+    /// several speakers, within its limits; any other model, the single
+    /// reference beside them, a speaker or count past the limits, and a
+    /// reference without its clip or transcript are refused.
+    #[test]
+    fn speaker_references_are_for_dialogue_models_within_their_limits() {
+        use crate::runtime::SpeechSpeakerReference;
+        let drama3 = ModelVariant::FishAudioDrama3;
+        let reference = |speaker: usize| SpeechSpeakerReference {
+            speaker,
+            audio: "UklGRg==".into(),
+            text: "Hi.".into(),
+        };
+        let with = |references: Vec<SpeechSpeakerReference>| {
+            let mut request = GenerationRequest::new("<|speaker:1|> Hello.");
+            request.speaker_references = references;
+            request
+        };
+        let core =
+            TtsRuntimeRequest::from_generation(with(vec![reference(0), reference(15)]), drama3)
+                .expect("two speakers")
+                .into_engine_request(CoreGenerationParams::default());
+        assert_eq!(
+            core.tts_speaker_references_for_execution(),
+            [reference(0), reference(15)]
+        );
+        assert!(core.reference_audio.is_none());
+        let refused = |request: GenerationRequest, variant: ModelVariant, expected: &str| {
+            let error = TtsRuntimeRequest::from_generation(request, variant)
+                .expect_err(expected)
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        };
+        refused(
+            with(vec![reference(0)]),
+            ModelVariant::FishAudioS2Pro,
+            "does not voice several speakers",
+        );
+        let mut both = with(vec![reference(1)]);
+        both.reference_audio = Some("UklGRg==".into());
+        refused(both, drama3, "not both");
+        refused(
+            with((0..9).map(reference).collect()),
+            drama3,
+            "at most 8 references",
+        );
+        refused(
+            with(vec![reference(16)]),
+            drama3,
+            "speaker 16 is not 0 to 15",
+        );
+        let mut silent = reference(2);
+        silent.text = " ".into();
+        refused(
+            with(vec![reference(0), silent]),
+            drama3,
+            "Reference 2 has no transcript",
+        );
+        let mut empty = reference(2);
+        empty.audio.clear();
+        refused(
+            with(vec![empty]),
+            drama3,
+            "Reference 1: Base64 audio input cannot be empty",
+        );
     }
 
     #[test]

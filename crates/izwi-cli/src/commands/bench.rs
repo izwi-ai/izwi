@@ -6669,7 +6669,7 @@ concurrent = [1, 2]
         let text = std::fs::read_to_string(path).expect("CUDA family manifest");
         let manifest: BenchmarkManifest = toml::from_str(&text).expect("valid CUDA manifest");
         let cases = expand_manifest_cases(&manifest).expect("unique CUDA cases");
-        assert_eq!(cases.len(), 18);
+        assert_eq!(cases.len(), 19);
         assert!(cases.iter().all(|case| case.model.is_some()));
         assert!(cases
             .iter()
@@ -6712,8 +6712,12 @@ concurrent = [1, 2]
         }
     }
 
+    /// Every ASR and TTS family at c1, c2, c4 and c8, and Fish Audio Drama 3
+    /// at the widths its backend decodes: one row at a time on the CPU and
+    /// Metal (c1 and c2), eight on CUDA (c1 to c32, the queue past them).
     #[test]
-    fn backend_audio_performance_manifests_cover_all_asr_and_tts_families_at_c1_to_c8() {
+    fn backend_audio_performance_manifests_cover_all_asr_and_tts_families() {
+        const DRAMA3: &str = "FishAudio-Drama-3";
         let manifest_root =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/manifests");
         let expected_models: BTreeSet<_> = [
@@ -6734,20 +6738,21 @@ concurrent = [1, 2]
             ("Whisper-Large-v3-Turbo", "asr"),
             ("FishAudio-S2-Pro", "tts"),
             ("Chatterbox-500M", "tts"),
+            (DRAMA3, "tts"),
         ]
         .into_iter()
         .collect();
-        for name in [
-            "cpu-audio-concurrency.toml",
-            "metal-audio-concurrency.toml",
-            "cuda-audio-concurrency.toml",
+        for (name, drama3_widths) in [
+            ("cpu-audio-concurrency.toml", &[1, 2][..]),
+            ("metal-audio-concurrency.toml", &[1, 2][..]),
+            ("cuda-audio-concurrency.toml", &[1, 2, 4, 8, 16, 32][..]),
         ] {
             let text = std::fs::read_to_string(manifest_root.join(name))
                 .expect("audio performance manifest");
             let manifest: BenchmarkManifest =
                 toml::from_str(&text).expect("valid audio performance manifest");
             let cases = expand_manifest_cases(&manifest).expect("unique audio performance cases");
-            assert_eq!(cases.len(), 68, "{name}");
+            assert_eq!(cases.len(), 68 + drama3_widths.len(), "{name}");
             assert!(
                 cases
                     .iter()
@@ -6770,9 +6775,12 @@ concurrent = [1, 2]
                 }),
                 "{name} must collect first-output and inter-event streaming latency"
             );
+            let (drama3, others): (Vec<_>, Vec<_>) = cases
+                .iter()
+                .partition(|case| case.model.as_deref() == Some(DRAMA3));
             for concurrency in [1, 2, 4, 8] {
                 assert_eq!(
-                    cases
+                    others
                         .iter()
                         .filter(|case| case.concurrent == Some(concurrency))
                         .count(),
@@ -6780,6 +6788,14 @@ concurrent = [1, 2]
                     "{name} c{concurrency}"
                 );
             }
+            assert_eq!(
+                drama3
+                    .iter()
+                    .map(|case| case.concurrent.expect("a width"))
+                    .collect::<Vec<_>>(),
+                drama3_widths,
+                "{name} Drama 3 widths"
+            );
             let actual_models: BTreeSet<_> = cases
                 .iter()
                 .map(|case| (case.model.as_deref().expect("model"), case.command.as_str()))
@@ -6788,8 +6804,10 @@ concurrent = [1, 2]
         }
     }
 
+    /// Fish S2 Pro needs a reference with its transcript; Drama 3 is
+    /// measured cloning the same one.
     #[test]
-    fn fish_s2_backend_manifests_provide_a_matching_reference_fixture() {
+    fn fish_backend_manifests_provide_a_matching_reference_fixture() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/manifests");
         for name in [
             "cuda-family-api.toml",
@@ -6801,26 +6819,28 @@ concurrent = [1, 2]
                 toml::from_str(&std::fs::read_to_string(root.join(name)).expect("manifest"))
                     .expect("valid manifest");
             let cases = expand_manifest_cases(&manifest).expect("expanded cases");
-            let fish: Vec<_> = cases
-                .iter()
-                .filter(|case| case.model.as_deref() == Some("FishAudio-S2-Pro"))
-                .collect();
-            assert!(!fish.is_empty(), "{name}");
-            for case in fish {
-                assert_eq!(
-                    case.reference_audio.as_deref(),
-                    Some("../../data/fox.wav"),
-                    "{name}"
-                );
-                assert_eq!(
-                    case.reference_text_file.as_deref(),
-                    Some("../../data/fox.md"),
-                    "{name}"
-                );
-                assert!(root.join(case.reference_audio.as_ref().unwrap()).is_file());
-                assert!(root
-                    .join(case.reference_text_file.as_ref().unwrap())
-                    .is_file());
+            for model in ["FishAudio-S2-Pro", "FishAudio-Drama-3"] {
+                let fish: Vec<_> = cases
+                    .iter()
+                    .filter(|case| case.model.as_deref() == Some(model))
+                    .collect();
+                assert!(!fish.is_empty(), "{name} {model}");
+                for case in fish {
+                    assert_eq!(
+                        case.reference_audio.as_deref(),
+                        Some("../../data/fox.wav"),
+                        "{name} {model}"
+                    );
+                    assert_eq!(
+                        case.reference_text_file.as_deref(),
+                        Some("../../data/fox.md"),
+                        "{name} {model}"
+                    );
+                    assert!(root.join(case.reference_audio.as_ref().unwrap()).is_file());
+                    assert!(root
+                        .join(case.reference_text_file.as_ref().unwrap())
+                        .is_file());
+                }
             }
         }
     }

@@ -60,6 +60,33 @@ pub(super) fn fish_s2_request_params(params: &GenerationParams, request_id: &str
     }
 }
 
+/// Fish Audio Drama 3 generation settings for a request (§3.6, §7.5): the
+/// request's `max_tokens` (at most 4,096 frames) or the automatic budget of
+/// its text, the family's sampling defaults under the request's, and a seed
+/// derived from the request id unless it names one.
+pub(super) fn fish_drama3_request_params(
+    params: &GenerationParams,
+    request_id: &str,
+    text: &str,
+) -> Result<crate::models::architectures::fish_drama3::FishDrama3GenerationParams> {
+    use crate::models::architectures::fish_drama3::model::frame_budget;
+    use crate::models::architectures::fish_drama3::{
+        FishDrama3GenerationParams, FishDrama3SamplingParams,
+    };
+    let max_frames = frame_budget(text, (params.max_tokens != 0).then_some(params.max_tokens))?;
+    let seed = params
+        .speech
+        .seed
+        .unwrap_or_else(|| EngineCoreRequest::chat_request_seed(request_id));
+    let sampling = FishDrama3SamplingParams::from_request(
+        params.speech.temperature,
+        params.speech.top_p,
+        params.audio_top_k.or(params.speech.top_k),
+        seed,
+    )?;
+    Ok(FishDrama3GenerationParams::new(sampling, max_frames))
+}
+
 /// Voxtral sampling for a request: unset fields keep Voxtral's defaults
 /// (greedy semantic codes), and the flow-matching seed defaults to one
 /// derived from the request id, so a retried frame redraws the same noise.
@@ -941,6 +968,353 @@ impl RuntimeService {
             Ok(job) => Ok((prepared, job)),
             Err(failure) => Err(release_failed_preparation(failure, prepared)),
         }
+    }
+
+    /// Fish Audio Drama 3 (§7.1 stage 0): the reference clips, when the
+    /// request clones voices (its speaker references, or its one reference
+    /// for speaker 0), decoded and encoded through the model's reference
+    /// cache (cancellable between references); the prompt built; the frame
+    /// budget planned against the row's positions. A speaker without a
+    /// reference speaks in a voice the seed sets.
+    pub(super) async fn prepare_fish_drama3_tts_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        use crate::models::architectures::fish_drama3::codec::{
+            maximum_preparation_workspace_bytes, preparation_workspace_bytes,
+        };
+        use crate::models::architectures::fish_drama3::prompt::speaker_reference_transcript;
+        use crate::models::architectures::fish_drama3::reference_cache::MAX_REFERENCE_SECONDS;
+        use crate::models::architectures::fish_drama3::{
+            FishDrama3Codes, FishDrama3HistoryTurn, FishDrama3ReferenceAudio,
+        };
+        if request.task_type != TaskType::TTS
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::FishDrama3Tts)
+            || request
+                .prepared_fish_drama3_tts_artifact_for_executor()?
+                .is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request
+            .model_variant
+            .expect("validated Fish Audio Drama 3 variant");
+        let model = self
+            .model_registry
+            .get_fish_drama3_tts_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("Fish Audio Drama 3 model {variant} is not loaded"))
+            })?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Fish Audio Drama 3 preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Tts,
+            false,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Fish Audio Drama 3 model {variant} has no effective context"
+                ))
+            })?;
+        let text = request
+            .tts_text_for_execution()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| {
+                Error::InvalidInput("Fish Audio Drama 3 request is missing text".into())
+            })?
+            .trim()
+            .to_string();
+        let params = fish_drama3_request_params(&request.params, &request.id, &text)?;
+        params.validate()?;
+        // Cloned voices, each a clip with its transcript: the speaker
+        // references, every transcript tagged with its speaker, or the one
+        // reference, whose transcript the prompt tags speaker 0 unless a
+        // tag leads it.
+        let single = (
+            request.tts_reference_audio_for_execution(),
+            request
+                .tts_reference_text_for_execution()
+                .filter(|text| !text.trim().is_empty()),
+        );
+        let speaker_references = request.tts_speaker_references_for_execution();
+        let sources = match single {
+            (None, None) => speaker_references
+                .iter()
+                .map(|reference| {
+                    Ok((
+                        speaker_reference_transcript(reference.speaker, reference.text.trim())?,
+                        reference.audio.as_str(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            (Some(audio), Some(transcript)) if speaker_references.is_empty() => {
+                vec![(transcript.trim().to_string(), audio)]
+            }
+            _ => {
+                return Err(Error::InvalidInput(
+                    "Fish Audio Drama 3 clones a voice from reference_audio and its \
+                     reference_text together, or from speaker references instead"
+                        .into(),
+                ))
+            }
+        };
+        // A clip that does not decode, or runs past the limit, is the
+        // caller's to fix: invalid input naming it (`reference_audio`, or
+        // its place among the speaker references).
+        let name_reference = |index: usize, error: Error| {
+            let (Error::InvalidInput(message) | Error::InferenceError(message)) = error else {
+                return error;
+            };
+            let field = if speaker_references.is_empty() {
+                "`reference_audio`".to_string()
+            } else {
+                format!("`references[{index}]`")
+            };
+            Error::InvalidInput(format!(
+                "{field}: {message}; a reference clip lasts at most {MAX_REFERENCE_SECONDS} s"
+            ))
+        };
+        let mut references = Vec::with_capacity(sources.len());
+        for (index, (transcript, audio)) in sources.into_iter().enumerate() {
+            // Inline clips up to the family's 60 s; saved voices hold 30 s
+            // from upload.
+            let (samples, sample_rate) =
+                crate::runtime::audio_io::decode_long_reference_audio_base64(
+                    audio,
+                    u64::from(MAX_REFERENCE_SECONDS),
+                )
+                .map_err(|error| name_reference(index, error))?;
+            FishDrama3ReferenceAudio {
+                samples: &samples,
+                channels: 1,
+                sample_rate,
+            }
+            .validate()
+            .map_err(|error| name_reference(index, error))?;
+            references.push((transcript, samples, sample_rate));
+        }
+        // References that leave no room for any text are refused from their
+        // lengths, before their preparation is admitted: on a host short of
+        // capacity the request would otherwise wait for capacity it can
+        // never use.
+        model.check_reference_room(
+            &references
+                .iter()
+                .map(|(transcript, samples, sample_rate)| {
+                    (
+                        transcript.as_str(),
+                        FishDrama3ReferenceAudio {
+                            samples,
+                            channels: 1,
+                            sample_rate: *sample_rate,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>(),
+            params.max_frames,
+        )?;
+        // A chunk of a chunk session: the earlier chunks its prompt holds,
+        // with the codes generated for them.
+        let history = request
+            .tts_chunk_history_for_execution()
+            .iter()
+            .map(|turn| FishDrama3HistoryTurn {
+                text: turn.text.clone(),
+                codes: FishDrama3Codes::new(turn.codes.codebooks.clone()),
+            })
+            .collect::<Vec<_>>();
+        // The decoded clips, their 44.1 kHz copies and the texts are host
+        // buffers of the preparation; the encoder's workspace is the
+        // stage's, for one clip at a time.
+        let codec_rate = model.codec().sample_rate();
+        let mut reference_host_bytes = 0u64;
+        let mut codec_workspace = 0;
+        for (transcript, samples, rate) in &references {
+            let resampled = (samples.len() as u64)
+                .saturating_mul(u64::from(codec_rate))
+                .div_ceil(u64::from((*rate).max(1)));
+            reference_host_bytes = reference_host_bytes
+                .saturating_add(
+                    (samples.len() as u64)
+                        .saturating_add(resampled)
+                        .saturating_mul(4),
+                )
+                .saturating_add(transcript.len() as u64);
+            codec_workspace = codec_workspace.max(
+                preparation_workspace_bytes(resampled as usize, codec_rate)?
+                    .min(maximum_preparation_workspace_bytes()?),
+            );
+        }
+        // The artifact it leaves: at most the longest prompt's `[11][T]`
+        // values.
+        let artifact_bound = (crate::models::architectures::fish_drama3::prompt::MAX_PROMPT_ROWS
+            as u64)
+            .saturating_mul(model.config().tower.frame_width() as u64)
+            .saturating_mul(4);
+        // The history's copy for the prompt builder.
+        let history_host_bytes = history.iter().fold(0u64, |total, turn| {
+            let codes = turn
+                .codes
+                .codebooks
+                .iter()
+                .map(|codebook| codebook.len() as u64)
+                .sum::<u64>();
+            total
+                .saturating_add(codes.saturating_mul(4))
+                .saturating_add(turn.text.len() as u64)
+        });
+        let preparation_host_bytes = reference_host_bytes
+            .checked_add(u64::try_from(text.capacity()).unwrap_or(u64::MAX))
+            .and_then(|bytes| bytes.checked_add(history_host_bytes))
+            .and_then(|bytes| bytes.checked_add(artifact_bound))
+            .ok_or_else(|| {
+                Error::Overloaded("Fish Audio Drama 3 preparation host bytes overflow".into())
+            })?;
+        let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
+            .map_err(|_| {
+                Error::Overloaded("Fish Audio Drama 3 retained request exceeds u64".into())
+            })?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let preparation_job = self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                JobSpec {
+                    request_id: request.id.clone(),
+                    lane: CoordinatorLane::Atomic,
+                    priority: request.priority,
+                    workload_class: request.workload_class,
+                    deadline: request.deadline,
+                    resources: retained_artifact_resources(
+                        self.backend_router.context().backend_kind,
+                        retained_request_bytes.saturating_add(preparation_host_bytes),
+                        0,
+                    )?,
+                },
+                JobResourceObservation::host(retained_request_bytes),
+            )
+            .await
+            .map_err(|failure| failure.error)?;
+        let work = WorkUnit::PreSequencePreparation {
+            kind: crate::models::architectures::fish_drama3::physical::PREPARATION_STAGE.into(),
+        };
+        let cost = crate::engine::WorkCost::with_workspace(
+            context_limit as u64,
+            context_limit as u64,
+            lfm25_audio_tts_preparation_workspace(
+                self.backend_router.context().backend_kind,
+                codec_workspace,
+            ),
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &contract,
+            &work,
+            cost,
+            context_limit as u64,
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let cancellation_for_codec = cancellation.clone();
+        let codec_request_id = request.id.clone();
+        let codec_deadline = request.deadline;
+        let max_frames = params.max_frames;
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "Fish Audio Drama 3 preparation must remain scalar".into(),
+                    ));
+                }
+                let check = || {
+                    if cancellation_for_codec.is_cancelled() {
+                        return Err(Error::Cancelled(codec_request_id.clone()));
+                    }
+                    if codec_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        return Err(Error::Timeout(codec_request_id.clone()));
+                    }
+                    Ok(())
+                };
+                let references = references
+                    .iter()
+                    .map(|(transcript, samples, sample_rate)| {
+                        (
+                            transcript.as_str(),
+                            FishDrama3ReferenceAudio {
+                                samples,
+                                channels: 1,
+                                sample_rate: *sample_rate,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let artifact = model_for_preparation.prepare_request(
+                    &references,
+                    &history,
+                    &text,
+                    max_frames,
+                    &check,
+                )?;
+                let retained_host_bytes = retained_request_bytes
+                    .checked_add(artifact.retained_bytes()?)
+                    .ok_or_else(|| {
+                        Error::Overloaded("Fish Audio Drama 3 retained bytes overflow".into())
+                    })?;
+                Ok(vec![Ok(PreparationArtifact {
+                    retained: JobResourceObservation::host(retained_host_bytes),
+                    value: Arc::new(artifact),
+                })])
+            })
+            .await?;
+        cancellation_guard.armed = false;
+        let (artifact, bridge) = match outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("Fish Audio Drama 3 preparation returned no outcome".into())
+        })? {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(request.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(request.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let retained = artifact.retained;
+        let mut prepared = request;
+        prepared.install_fish_drama3_tts_execution_model(
+            variant,
+            model,
+            artifact.value,
+            params,
+            context_limit,
+        )?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        self.coordinator
+            .admit_observed_from_preparation(bridge, execution, retained)
+            .await
+            .map(|job| (prepared, job))
+            .map_err(|failure| failure.error)
     }
 
     pub(super) async fn prepare_voxtral_tts_for_binding(
@@ -2042,6 +2416,9 @@ impl RuntimeService {
             .await?;
         let (request, job) = self
             .prepare_fish_s2_tts_for_binding(request, job, residency_lease)
+            .await?;
+        let (request, job) = self
+            .prepare_fish_drama3_tts_for_binding(request, job, residency_lease)
             .await?;
         let (request, job) = self
             .prepare_voxtral_tts_for_binding(request, job, residency_lease)

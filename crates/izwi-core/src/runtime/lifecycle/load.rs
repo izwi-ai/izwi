@@ -43,6 +43,8 @@ mod admission;
 #[path = "asr_memory.rs"]
 mod asr_memory;
 mod checkpoint;
+#[path = "fish_drama3_memory.rs"]
+mod fish_drama3_memory;
 mod invocation;
 #[path = "qwen36moe_memory.rs"]
 mod qwen36moe_memory;
@@ -284,6 +286,10 @@ fn tts_state_minimum_tokens(variant: ModelVariant) -> u64 {
         crate::catalog::ModelFamily::Lfm3Audio => {
             crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload::Tts
                 .context_tokens()
+        }
+        // The worst admitted request: the longest prompt and budget.
+        crate::catalog::ModelFamily::FishDrama3Tts => {
+            crate::models::architectures::fish_drama3::physical::STATE_CONTEXT_TOKENS
         }
         _ => 0,
     };
@@ -530,6 +536,7 @@ fn reconciles_device_usage(variant: ModelVariant, backend: BackendKind) -> bool 
                 | crate::catalog::ModelFamily::Lfm3Chat
                 | crate::catalog::ModelFamily::Qwen35Chat
                 | crate::catalog::ModelFamily::FishS2Tts
+                | crate::catalog::ModelFamily::FishDrama3Tts
         ))
         && asr_memory::weights_on_backend_device(variant, backend)
 }
@@ -790,6 +797,17 @@ impl ModelLifecycleController {
         // Price the plan, and refuse one that can never fit, before evicting
         // anything for it.
         let mut resource_plan = self.model_resource_plan(variant, &acquired.model_path)?;
+        if variant.family() == crate::catalog::ModelFamily::FishDrama3Tts {
+            // A machine that can never hold it is told so with its numbers
+            // before a weight is read or a resident evicted.
+            let backend = self.backend_router.context().backend_kind;
+            let ceiling = self
+                .coordinator
+                .resource_authority()
+                .planning_ceiling_bytes(backend)
+                .map_or(ResourceAmount::Unknown, ResourceAmount::Known);
+            fish_drama3_memory::refuse_undersized_device(&acquired.model_path, backend, ceiling)?;
+        }
         if let Some(floor) = self.cuda_state_floor(variant, &acquired.model_path)? {
             let device_capacity = self
                 .coordinator
@@ -1185,6 +1203,15 @@ impl ModelLifecycleController {
                 &mut state_publications,
             )
             .await?;
+            self.allocate_fish_drama3_tts_state(
+                variant,
+                model_instance_id,
+                backend,
+                state_fit_reserve,
+                &bundle_draft,
+                &mut state_publications,
+            )
+            .await?;
             self.allocate_voxtral_tts_state(
                 variant,
                 model_instance_id,
@@ -1291,6 +1318,11 @@ impl ModelLifecycleController {
             if variant.family() == crate::catalog::ModelFamily::FishS2Tts {
                 self.model_registry
                     .publish_fish_s2_tts_ready(variant)
+                    .await?;
+            }
+            if variant.family() == crate::catalog::ModelFamily::FishDrama3Tts {
+                self.model_registry
+                    .publish_fish_drama3_tts_ready(variant)
                     .await?;
             }
             if variant.family() == crate::catalog::ModelFamily::KokoroTts {

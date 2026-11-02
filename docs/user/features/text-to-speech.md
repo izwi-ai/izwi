@@ -174,6 +174,31 @@ and min-p. With Chatterbox Multilingual it also asks which language the text is
 in. With Maya 2 Native it asks the same, with **Auto-detect** (the default) to
 read the language from the text's script, and offers its inline tags.
 
+With Fish Audio Drama 3 the saved voice is optional (**None (seeded voice)**)
+and the dialog has a **Seed**, filled with a new number each time it opens;
+keep it to get the same voice again. **Dialogue**, beside **Single voice**,
+edits a scene:
+
+- **Speakers**: each speaks in a saved voice that has a transcript, or in a
+  voice the seed sets. Up to 16 speakers and 8 saved voices.
+- **Lines**: each has its speaker, its text and **Insert a tag** for
+  performance tags. **Preview** speaks one line without saving it.
+- **Generate scene** speaks every line as one take.
+
+A Drama 3 take's page has **Edit this take**: the dialog opens with the take's
+text (its lines, for a dialogue), its voices and its seed. Change the line and
+generate: the new take continues from the old one, so the model says the new
+text in the context of what it already said. The new take's page links back
+to it under **Edited from**. A dialogue take's **⋯** menu has **Open in
+dialogue editor**, which brings its lines back as a new scene with the same
+voices and seed.
+
+Saved voices and the seed come back. A voice given as a reference clip does
+not, because a take keeps no clip audio: its speaker starts in a seeded voice.
+Takes made before take editing kept no voices or seed and cannot be edited;
+their lines still open in the dialogue editor, every speaker in a seeded
+voice.
+
 ### Features
 
 - **Live preview** — Hear audio as it generates
@@ -235,8 +260,9 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 | `Voxtral-4B-TTS-2603` | ~8.1 GB | Better | Medium |
 | `Chatterbox-500M` | ~3.2 GB | English reference voice, emotion control | Slow |
 | `Chatterbox-Multilingual-500M` | ~3.3 GB | 22 languages, reference voice, emotion control | Slow |
+| `FishAudio-Drama-3` | ~41.5 GB | Seeded or reference voice, dialogue of up to 16 speakers, performance tags, 44.1 kHz | Slow; needs about 40 GB of memory |
 
-For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `Chatterbox-500M`, `Chatterbox-Multilingual-500M` or `Maya2-Native-2.5B`.  
+For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `FishAudio-Drama-3`, `Chatterbox-500M`, `Chatterbox-Multilingual-500M` or `Maya2-Native-2.5B`.  
 For built-in voice presets, use `Kokoro-82M`, **CustomVoice** variants, `Voxtral-4B-TTS-2603`, `LFM2.5-Audio-1.5B-GGUF`, `LFM3-Audio-2B-GGUF` or `Maya2-Native-2.5B`.  
 For prompt-based voice design, use **VoiceDesign** variants.
 `Kokoro-82M` requires `espeak-ng` to be installed separately.
@@ -264,7 +290,82 @@ or `male` voice in one of 19 locales named with `language` (American English
 when unset). It streams, splits long text into sentences automatically, and
 has no voice cloning, voice design or speed control. The same model also
 transcribes speech and answers in voice chat.
+`FishAudio-Drama-3` (44.1 kHz, Fish Audio Community License v1.0) speaks
+without any voice input, or clones a reference voice; see
+[Fish Audio Drama 3](#fish-audio-drama-3) below.
 For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
+
+---
+
+## Fish Audio Drama 3
+
+`FishAudio-Drama-3` needs no voice input. Without a reference voice, the
+sampling `seed` sets the voice: the same `seed` gives the same voice, and a
+request without one gets a different voice each time. With reference audio and
+its transcript, or a saved voice that has one, it speaks in that voice (see
+[Voice Cloning](/features/voice-cloning)). It reads the language from the text;
+a `[language: xx]` tag in the text steers it.
+
+Tags in the text direct the performance where they stand: `[sighs]`,
+`[laughs]`, `[pause]`, `[gasps]`, `[clears throat]`, `[hesitates]`, free-text
+tags such as `[with quiet excitement]`, and `<whisper>…</whisper>`. They reach
+the model as text.
+
+```bash
+izwi tts "[sighs] It has been a long day. [pause] But we made it, and <whisper>nobody noticed</whisper>." \
+  --model FishAudio-Drama-3 \
+  --output drama3.wav
+```
+
+Long text is spoken as a chunk session. The model's own chunker cuts the text
+into chunks of about 300 bytes, at sentence ends where it can, and each chunk
+is its own generation. Each chunk's prompt holds the references and the first
+and latest chunks with the audio already generated for them, so the voices
+carry through the whole text. Chunks play one after another with no added
+pause. With `--stream` (or `stream: true` on the API), audio arrives as it is
+generated: first after 4 frames, then every 16 frames.
+
+### Dialogue
+
+One request can voice up to 16 speakers. Mark each turn with a speaker tag,
+`<|speaker:0|>` to `<|speaker:15|>`, or send a script of `{speaker, text}`
+lines. Give each speaker a reference voice (a clip with its transcript, or a
+saved voice), up to 8 references in all; a speaker without one speaks in a
+voice the seed sets. The chunker keeps each turn whole with its speaker.
+
+```bash
+izwi tts --script scene.jsonl \
+  --model FishAudio-Drama-3 \
+  --speaker-reference 0=voices/anna.wav:voices/anna.txt \
+  --speaker-voice 1=voice_ben \
+  --seed 7 \
+  --output scene.wav
+```
+
+On the API, the same request is `references` and `script` on
+`/v1/audio/speech` or the text-to-speech records; see
+[Drama 3 dialogue](/api#drama-3-dialogue).
+
+### Take editing
+
+A take can continue from earlier takes: to say a line again, or the next
+line, in the context of what was already said. Its prompt holds the earlier
+takes as finished turns, their text and the audio generated for it, before the
+new text; that is how the model was trained to edit takes. Each Drama 3 take
+keeps the audio codes of its first and last chunks, its voices (saved voices
+by id) and its seed, so a later take can name it.
+
+On the text-to-speech records, send `previous_take_ids` with up to 2 earlier
+takes, oldest first, beside the new text, voices and seed. Voices and seed are
+not inherited: send the ones you want, for example those the earlier take's
+record reports. Takes of another model, unfinished or failed takes, and takes
+made before take editing are refused. See
+[Drama 3 take editing](/api#drama-3-take-editing). In the Web UI, **Edit this
+take** does this for you.
+
+Its license allows commercial use only below USD 500,000 in annual revenue,
+and offering the model to third parties as a hosted speech service needs a
+license from Fish Audio; see [Models](/models).
 
 ---
 

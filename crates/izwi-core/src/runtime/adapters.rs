@@ -328,7 +328,6 @@ mod tests {
 
     fn expected_capabilities(model_variant: ModelVariant) -> BTreeSet<CapabilityKind> {
         let mut expected = BTreeSet::new();
-
         if model_variant.speech_capabilities().is_some() {
             expected.insert(CapabilityKind::Tts);
         }

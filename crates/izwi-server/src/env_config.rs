@@ -232,6 +232,11 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "Allow Fish S2 requests that need more than one segment.",
     ),
     var(
+        "IZWI_FISH_DRAMA3_LONG_FORM_ENABLED",
+        "true",
+        "Allow Fish Audio Drama 3 requests that need more than one chunk (its chunk session).",
+    ),
+    var(
         "IZWI_TTS_SEGMENT_TIMEOUT_SECS",
         "1800",
         "How long a long-form segment may publish nothing before it fails.",
@@ -394,6 +399,7 @@ pub(crate) struct ServerTuning {
     /// Clamped to 80-4000; `None` takes the model's segment size.
     pub(crate) tts_long_form_chunk_max_chars: Option<usize>,
     pub(crate) fish_long_form_enabled: bool,
+    pub(crate) fish_drama3_long_form_enabled: bool,
     pub(crate) tts_segment_timeout: Duration,
     /// `None` takes each model's allowance.
     pub(crate) tts_stream_max_pcm_bytes: Option<usize>,
@@ -462,6 +468,8 @@ impl ServerTuning {
             tts_max_text_bytes: at_least(env, "IZWI_TTS_MAX_TEXT_BYTES", 1, 1024 * 1024)?,
             tts_long_form_chunk_max_chars: env.parse("IZWI_TTS_LONG_FORM_CHUNK_MAX_CHARS")?,
             fish_long_form_enabled: env.flag_or("IZWI_FISH_LONG_FORM_ENABLED", true)?,
+            fish_drama3_long_form_enabled: env
+                .flag_or("IZWI_FISH_DRAMA3_LONG_FORM_ENABLED", true)?,
             tts_segment_timeout: Duration::from_secs(secs("IZWI_TTS_SEGMENT_TIMEOUT_SECS", 1800)?),
             tts_stream_max_pcm_bytes: optional_at_least(env, "IZWI_TTS_STREAM_MAX_PCM_BYTES", 2)?,
             audio_stream_event_queue_capacity: at_least(

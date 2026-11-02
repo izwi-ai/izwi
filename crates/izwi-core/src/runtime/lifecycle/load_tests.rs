@@ -119,7 +119,7 @@ async fn fish_s2_load_publishes_and_seals_both_tts_capabilities() {
     draft.seal_fish_capacity(capacity.clone()).unwrap();
     let publications = runtime
         .model_lifecycle
-        .load_fish_s2_state_publications(instance, &draft, 32, &capacity, |graphs| {
+        .load_fish_s2_state_publications(variant, instance, &draft, 32, &capacity, |graphs| {
             fish_s2_physical_state_spec(&config, candle_core::DType::F32, graphs)
         })
         .await
@@ -3012,6 +3012,222 @@ async fn cold_model_load_is_rejected_before_artifact_work_during_drain() {
     std::fs::remove_dir_all(models_dir).unwrap();
 }
 
+/// Fish Audio Drama 3's retained rows on the CPU: its own capacity (one
+/// row), the four-domain contract through the managed state fit, booked
+/// into the ledger; then one prefill cell and one decode quantum of the
+/// synthetic model on views of the allocated arenas, its DeltaNet state
+/// committed through the allocated tensor arena between them; then the
+/// release.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn fish_drama3_state_allocates_serves_a_cell_and_a_quantum_and_releases_on_cpu() {
+    use crate::backends::state::{PhysicalStateSequenceId, PhysicalStateTransactionId};
+    use crate::engine::StateFitReserve;
+    use crate::kv::CacheBlockRef;
+    use crate::models::architectures::fish_drama3::model::tests::write_synthetic_model;
+    use crate::models::architectures::fish_drama3::physical::{
+        CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN, TOWER_KV_DOMAIN, TRUNK_KV_DOMAIN,
+    };
+    use crate::models::architectures::fish_drama3::prompt::build_prompt;
+    use crate::models::architectures::fish_drama3::{
+        FishDrama3GenerationParams, FishDrama3SamplingParams, FishDrama3Step,
+    };
+    use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+
+    let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let models_dir =
+        std::env::temp_dir().join(format!("izwi-runtime-drama3-state-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&models_dir).unwrap();
+    let runtime = RuntimeService::new(EngineConfig {
+        models_dir: models_dir.clone(),
+        backend: BackendPreference::Cpu,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let lifecycle = &runtime.model_lifecycle;
+    let variant = ModelVariant::FishAudioDrama3;
+    let synthetic = write_synthetic_model(11);
+    let model = lifecycle
+        .model_registry
+        .load_fish_drama3_tts_with(
+            variant,
+            synthetic.path(),
+            crate::models::registry::load_synthetic_fish_drama3_tts_model,
+        )
+        .await
+        .unwrap();
+    let instance = ModelInstanceId::new(9_311);
+    let authority = lifecycle.coordinator.resource_authority();
+    // The ledger's bytes in every memory domain (host and unified memory
+    // are one domain on a unified-memory machine).
+    let booked = || {
+        let reserved = authority.snapshot().reserved;
+        [
+            reserved.host_bytes,
+            reserved.unified_bytes,
+            reserved.device_bytes,
+        ]
+        .into_iter()
+        .map(|amount| match amount {
+            ResourceAmount::Known(bytes) => bytes,
+            ResourceAmount::Unknown => panic!("unknown reservation"),
+        })
+        .sum::<u64>()
+    };
+    let reserved_before = booked();
+
+    let capacity = lifecycle
+        .resolve_fish_drama3_capacity(
+            &model,
+            variant,
+            BackendKind::Cpu,
+            StateFitReserve::Configured,
+        )
+        .unwrap();
+    assert_eq!((capacity.rows, capacity.width), (1, 1));
+    assert_eq!(capacity.kv_dtype, candle_core::DType::F32);
+    // The synthetic trunk's 4,096 positions bound the planned row.
+    assert_eq!(capacity.positions(), 4_096);
+    let serving = capacity.serving();
+    assert_eq!((serving.ar_rows, serving.prefill_tokens), (1, 256));
+
+    let (contract, retained) = lifecycle
+        .allocate_fish_drama3_retained_state(
+            variant,
+            instance,
+            BackendKind::Cpu,
+            &model,
+            &capacity,
+            StateFitReserve::Configured,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        retained.plan().contract_fingerprint,
+        contract.fingerprint().unwrap()
+    );
+    let mut domains = retained
+        .plan()
+        .groups
+        .iter()
+        .map(|group| group.domain)
+        .collect::<Vec<_>>();
+    domains.sort_unstable();
+    assert_eq!(domains, vec![TRUNK_KV_DOMAIN, TOWER_KV_DOMAIN]);
+    let tensors = retained.tensor_state().expect("the tensor arena").clone();
+    assert!(retained.logical_token_reach() >= 4_096);
+    // Every byte the fit bound is booked.
+    let reserved_after = booked();
+    assert!(retained.physical_bytes() > 0);
+    assert!(
+        reserved_after - reserved_before >= retained.physical_bytes(),
+        "{reserved_before} -> {reserved_after}, {} bound",
+        retained.physical_bytes()
+    );
+
+    // Views of one row over the allocated pages, as the executor's lease
+    // would hand them over.
+    let view = |domain| {
+        let group = retained
+            .plan()
+            .groups
+            .iter()
+            .find(|group| group.domain == domain)
+            .unwrap();
+        let blocks = (0..group.capacity_pages)
+            .map(|index| CacheBlockRef {
+                arena: group.arena,
+                group: group.id,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        PhysicalPagedKvCache::new(
+            retained.arena(group.arena).unwrap().clone(),
+            group.layers.clone(),
+            blocks,
+            0,
+        )
+        .unwrap()
+    };
+    let prompt = build_prompt(model.tokenizer(), &[], [], "hello world.").unwrap();
+    let rows = prompt.rows;
+    let params = FishDrama3GenerationParams::new(
+        FishDrama3SamplingParams::from_request(None, None, None, 3).unwrap(),
+        8,
+    );
+    let mut state = model
+        .new_request(prompt, params, view(TRUNK_KV_DOMAIN), view(TOWER_KV_DOMAIN))
+        .unwrap();
+    let sequence = PhysicalStateSequenceId::new(1).unwrap();
+    tensors.register(sequence).unwrap();
+    state.trunk_state_mut().bind_tensor_sequence(1).unwrap();
+
+    // One prefill cell (the whole short prompt), committed with its tensors.
+    let checkpoint = model.begin_quantum(&mut state).unwrap();
+    assert_eq!(
+        model.prefill_span(&mut state).unwrap(),
+        FishDrama3Step::Prefill {
+            consumed: rows,
+            position: rows,
+            complete: true
+        }
+    );
+    model.commit_quantum(&mut state, &checkpoint).unwrap();
+    assert_eq!(
+        (state.trunk_kv_len(), state.tower_kv_len()),
+        (rows, rows - 1)
+    );
+    let transaction = PhysicalStateTransactionId::new(1).unwrap();
+    tensors.begin(transaction, sequence).unwrap();
+    state
+        .trunk_state_mut()
+        .stage_tensor_state(&tensors, transaction.get())
+        .unwrap();
+    tensors.commit(transaction, rows as u64).unwrap();
+    for domain in [RECURRENT_STATE_DOMAIN, CONVOLUTION_STATE_DOMAIN] {
+        assert_eq!(
+            tensors.read(sequence, domain).unwrap().unwrap().cursor,
+            rows as u64
+        );
+    }
+
+    // One decode quantum from the restored state.
+    state
+        .trunk_state_mut()
+        .restore_tensor_state(&tensors)
+        .unwrap();
+    // The first frame never draws eos, so the quantum makes one: the tower
+    // writes row `rows - 1`, the trunk row `rows`.
+    let steps = model.decode_round(&mut [&mut state]).unwrap();
+    assert_eq!(steps, vec![FishDrama3Step::Frame { frames: 1 }]);
+    assert_eq!(
+        (state.trunk_kv_len(), state.tower_kv_len()),
+        (rows + 1, rows)
+    );
+    assert_eq!(state.codes().len(), 10);
+
+    // Release: the row's tensors, the views, the arenas.
+    drop(tensors.release(sequence).unwrap());
+    drop(state);
+    drop(tensors);
+    drop(retained);
+    assert!(runtime
+        .core_engine
+        .unload_managed_model_cache(instance)
+        .await
+        .unwrap());
+    assert_eq!(booked(), reserved_before);
+    drop(model);
+    lifecycle
+        .model_registry
+        .unload_fish_drama3_tts(variant)
+        .await;
+    std::fs::remove_dir_all(models_dir).unwrap();
+}
+
 /// SPK-F7: a realtime voice session holds its models through
 /// `SessionModelLeases`. The models are never pinned, a held model is not
 /// evicted to make room for another, and it becomes evictable once the
@@ -3696,6 +3912,11 @@ fn tts_state_floor_covers_one_full_request_per_family() {
             // Upstream's per-seat capacity: prompt plus frames.
             ModelFamily::Maya2Tts => {
                 crate::models::architectures::maya2::config::STATE_CONTEXT_TOKENS
+            }
+            // The longest prompt and the largest explicit frame budget.
+            ModelFamily::FishDrama3Tts => {
+                crate::models::architectures::fish_drama3::prompt::MAX_PROMPT_ROWS
+                    + crate::models::architectures::fish_drama3::model::MAX_EXPLICIT_FRAMES
             }
             _ => {
                 assert_eq!(floor(variant), 0, "{variant}");

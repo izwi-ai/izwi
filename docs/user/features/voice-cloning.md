@@ -48,10 +48,10 @@ Voice cloning now lives inside the unified **Voices** workspace.
    - Single speaker
 
 The reference transcript is marked optional: Chatterbox clones from the audio
-alone, while Qwen3-TTS Base, VibeVoice, Fish Audio S2 Pro and Maya 2 Native
-need it. With Maya 2 Native, the dialog also asks for the language of the
-recording, or detects it from the transcript; the voice can then speak any of
-the model's languages.
+alone, while Qwen3-TTS Base, VibeVoice, Fish Audio S2 Pro, Fish Audio Drama 3
+and Maya 2 Native need it. With Maya 2 Native, the dialog also asks for the
+language of the recording, or detects it from the transcript; the voice can
+then speak any of the model's languages.
 
 ### Step 2: Generate Speech
 
@@ -68,8 +68,8 @@ the model's languages.
 
 ## Using the CLI
 
-Use `izwi tts` with a Base, VibeVoice, `FishAudio-S2-Pro` or `Maya2-Native-2.5B` TTS model and provide both the
-reference audio and its transcript:
+Use `izwi tts` with a Base, VibeVoice, `FishAudio-S2-Pro`, `FishAudio-Drama-3` or `Maya2-Native-2.5B` TTS model and
+provide both the reference audio and its transcript:
 
 ```bash
 izwi tts "This sentence will use the cloned voice." \
@@ -117,6 +117,23 @@ izwi tts "आपका ऑर्डर कल शाम तक पहुँच �
   --reference-text "This is the exact text spoken in the reference sample." \
   --reference-language en \
   --output cloned-hindi.wav
+```
+
+`FishAudio-Drama-3` clones from reference audio and its transcript, but the
+reference is optional: without one it speaks in a voice its sampling seed sets
+(see [Text-to-Speech](/features/text-to-speech#fish-audio-drama-3)). A
+reference sent with the request may last up to 60 seconds; a saved voice holds
+up to 30 seconds, as for every model. For a dialogue it takes a reference per
+speaker, up to 8 in one request, each a clip with its transcript or a saved
+voice with one (`--speaker-reference`, `--speaker-voice`; `references` on the
+API); see [Dialogue](/features/text-to-speech#dialogue).
+
+```bash
+izwi tts "[laughs] I did not expect to see you here." \
+  --model FishAudio-Drama-3 \
+  --reference-audio samples/reference.wav \
+  --reference-text "This is the exact text spoken in the reference sample." \
+  --output cloned-drama3.wav
 ```
 
 Saved voices created in Voice Studio or through `/v1/voices` can be reused from
@@ -222,6 +239,7 @@ its own.
 | `Qwen3-TTS-12Hz-1.7B-Base` | ~4.2 GB | Better |
 | `VibeVoice-1.5B` | ~5.0 GB | Better long-form/reference voice |
 | `FishAudio-S2-Pro` | ~11.5 GB | Reference voice or saved voice only |
+| `FishAudio-Drama-3` | ~41.5 GB | Needs a transcript; reference clips up to 60 s; a reference per speaker for dialogue (up to 8); also speaks without a reference |
 | `Chatterbox-500M` | ~3.2 GB | English; clones from audio alone, no transcript needed |
 | `Chatterbox-Multilingual-500M` | ~3.3 GB | 22 languages (set `language`); clones from audio alone |
 | `Maya2-Native-2.5B` | ~5.5 GB | English and 11 Indic languages; needs a transcript; clones across languages |

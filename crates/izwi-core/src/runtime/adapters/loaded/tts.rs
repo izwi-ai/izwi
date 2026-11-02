@@ -1300,6 +1300,242 @@ impl LoadedExecutionAdapter for FishS2TtsExecutionAdapter {
     }
 }
 
+/// Fish Audio Drama 3 (§7.1): S2's route shape on the family's own rows.
+/// A request prepares alone (its references through the reference cache),
+/// prefills one cell of the family's grid per quantum (never batched across
+/// requests, so other users' cells and frames interleave between a
+/// request's), decodes one frame per row per quantum across users, decodes
+/// committed frames through the codec in batched quanta, and flushes the
+/// stream at finalization.
+#[derive(Debug)]
+pub(super) struct FishDrama3TtsExecutionAdapter {
+    pub(super) execution_group_id: ExecutionGroupId,
+    pub(super) model_instance_id: ModelInstanceId,
+    pub(super) adapter_instance_id: AdapterInstanceId,
+    pub(super) metadata: AdapterMetadata,
+    pub(super) backend_kind: BackendKind,
+    pub(super) capacity: OnceLock<crate::runtime::fish_capacity::ResolvedFishServingCapacity>,
+}
+
+impl FishDrama3TtsExecutionAdapter {
+    pub(super) fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            capacity: OnceLock::new(),
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for FishDrama3TtsExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        FISH_DRAMA3_TTS_ADAPTER_ABI
+    }
+
+    fn seal_fish_capacity(
+        &self,
+        capacity: crate::runtime::fish_capacity::ResolvedFishServingCapacity,
+    ) -> Result<()> {
+        if let Some(existing) = self.capacity.get() {
+            return if existing == &capacity {
+                Ok(())
+            } else {
+                Err(Error::ModelLoadError(
+                    "Fish Audio Drama 3 serving capacity cannot change after sealing".into(),
+                ))
+            };
+        }
+        self.capacity.set(capacity).map_err(|_| {
+            Error::ModelLoadError("Fish Audio Drama 3 capacity seal raced publication".into())
+        })
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        use crate::models::architectures::fish_drama3::codec::maximum_preparation_workspace_bytes;
+        use crate::models::architectures::fish_drama3::model::FISH_DRAMA3_AUDIO_CHUNK_FRAMES;
+        use crate::models::architectures::fish_drama3::physical::{
+            AUDIO_DECODE_STAGE, DECODE_STAGE, FINALIZE_STAGE, PREFILL_STAGE, PREPARATION_STAGE,
+            STATE_CONTEXT_TOKENS,
+        };
+        use crate::models::architectures::fish_drama3::prompt::MAX_PROMPT_ROWS;
+        if streaming.asr_long_form {
+            return Err(Error::InvalidInput(
+                "Fish Audio Drama 3 supports retained TTS execution only".into(),
+            ));
+        }
+        // Unsealed (a contract built before the load prices its rows): one
+        // scalar row.
+        let capacity = self
+            .capacity
+            .get()
+            .cloned()
+            .unwrap_or(crate::runtime::fish_capacity::ResolvedFishServingCapacity::scalar()?);
+        let rows = capacity.ar_rows.max(1);
+        let native = if rows > 1 {
+            NativeBatchMode::Continuous
+        } else {
+            NativeBatchMode::None
+        };
+        let mut profile = scalar_execution_profile(self.metadata, self.backend_kind);
+        profile.mode = ExecutionMode::Sequence;
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        profile.decode_batch = native;
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.cache_namespace = Some(format!(
+            "{}:tts:{}:fish-drama3-state-v1",
+            self.metadata.model_variant,
+            self.backend_kind.as_str()
+        ));
+        profile.kv_dtype = "state_v2_resolved".into();
+        profile.cancellation = CancellationGranularity::SequenceStep;
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.recompute_safe = true;
+        profile.cache_release_safe = true;
+        profile.max_batch_size = rows;
+        profile.resolved_from_loaded_model = true;
+
+        // Stage 0: references decoded, resampled and encoded one at a time
+        // (cancellable between them), the prompt built, the budget planned.
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            PREPARATION_STAGE,
+            &profile,
+            NativeBatchMode::None,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.concurrency = ConcurrencyClass::Exclusive;
+        preparation.shape_policy = StageShapePolicy::Exact;
+        preparation.max_batch_size = 1;
+        preparation.max_work_units = STATE_CONTEXT_TOKENS as u64;
+        preparation.max_workspace_bytes = maximum_preparation_workspace_bytes()?;
+
+        // Stage 1: one cell of the family's grid per quantum, whatever the
+        // span the scheduler offers; a request's cells are never batched
+        // with another's. One span's activations, whatever its rows.
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            PREFILL_STAGE,
+            &profile,
+            NativeBatchMode::None,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.concurrency = ConcurrencyClass::Exclusive;
+        prefill.shape_policy = StageShapePolicy::Ragged;
+        prefill.max_batch_size = 1;
+        prefill.max_work_units = MAX_PROMPT_ROWS as u64;
+        prefill.workspace_per_row_bytes = capacity.ar_workspace_per_row;
+        prefill.workspace_per_work_unit_bytes = 0;
+        prefill.max_workspace_bytes = capacity.ar_workspace_per_row;
+        // Every domain of the one group advances with the decoder clock
+        // (the trunk's tensors in a legacy decoder-coupled transaction), so
+        // the stage selects no independently clocked group.
+        prefill.retained_state_selections = None;
+
+        // Stage 2: one frame per row per quantum, every row alone through
+        // each kernel, continuous across users.
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            DECODE_STAGE,
+            &profile,
+            native,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.concurrency = if rows > 1 {
+            ConcurrencyClass::Batchable
+        } else {
+            ConcurrencyClass::Exclusive
+        };
+        decode.shape_policy = StageShapePolicy::Ragged;
+        decode.max_batch_size = rows;
+        decode.max_work_units = rows as u64;
+        decode.workspace_per_row_bytes = capacity.ar_workspace_per_row;
+        decode.max_workspace_bytes = capacity.ar_workspace_per_row.saturating_mul(rows as u64);
+        decode.retained_state_selections = None;
+
+        // Stage 3: committed frames through the codec, at most 16 a row.
+        let mut audio_decode = StageDescriptor::from_execution_profile(
+            StageId::new(3),
+            AUDIO_DECODE_STAGE,
+            &profile,
+            if rows > 1 {
+                NativeBatchMode::Static
+            } else {
+                NativeBatchMode::None
+            },
+        );
+        audio_decode.selector = StageWorkSelector::SequenceAudioDecode;
+        audio_decode.progress = StageProgressKind::Iterative;
+        audio_decode.shape_policy = StageShapePolicy::Exact;
+        audio_decode.concurrency = if rows > 1 {
+            ConcurrencyClass::Batchable
+        } else {
+            ConcurrencyClass::Exclusive
+        };
+        audio_decode.max_batch_size = capacity.codec_rows.max(1);
+        audio_decode.max_work_units = (FISH_DRAMA3_AUDIO_CHUNK_FRAMES as u64)
+            .saturating_mul(audio_decode.max_batch_size as u64);
+        audio_decode.workspace_per_row_bytes = capacity.codec_workspace_per_row;
+        audio_decode.max_workspace_bytes = capacity
+            .codec_workspace_per_row
+            .saturating_mul(audio_decode.max_batch_size as u64);
+
+        // Stage 4: the stream flushed; its PCM is frames × 2,048.
+        let mut finalize = StageDescriptor::from_execution_profile(
+            StageId::new(4),
+            FINALIZE_STAGE,
+            &profile,
+            NativeBatchMode::None,
+        );
+        finalize.selector = StageWorkSelector::SequenceFinalize;
+        finalize.progress = StageProgressKind::Atomic;
+        finalize.shape_policy = StageShapePolicy::Exact;
+        finalize.max_batch_size = 1;
+        finalize.concurrency = ConcurrencyClass::Exclusive;
+        finalize.max_work_units = 1;
+        finalize.max_workspace_bytes = 0;
+        for stage in [
+            &mut preparation,
+            &mut prefill,
+            &mut decode,
+            &mut audio_decode,
+            &mut finalize,
+        ] {
+            stage.max_padding_basis_points = 0;
+            stage.output_visibility = OutputVisibility::AfterQuantumCommit;
+            stage.validate()?;
+        }
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id,
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata: self.metadata,
+            execution_profile: profile,
+            stages: Arc::from([preparation, prefill, decode, audio_decode, finalize]),
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct VibeVoiceTtsExecutionAdapter {
     pub(super) execution_group_id: ExecutionGroupId,

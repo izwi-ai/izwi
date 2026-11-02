@@ -25,6 +25,9 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::chatterbox::retained::ChatterboxPreparedArtifact;
 use crate::models::architectures::chatterbox::ChatterboxGenerationParams;
+use crate::models::architectures::fish_drama3::{
+    FishDrama3GenerationParams, FishDrama3PreparedArtifact,
+};
 use crate::models::architectures::fish_s2::{FishS2GenerationParams, FishS2PreparedArtifact};
 use crate::models::architectures::granite_speech::asr::GraniteSpeechPreparedPromptArtifact;
 use crate::models::architectures::kokoro::KokoroPreparedRequest;
@@ -50,16 +53,17 @@ use crate::models::architectures::voxtral::tts::retained::VoxtralTtsPreparedArti
 use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
 use crate::models::architectures::whisper::asr::WhisperPreparedWindow;
 use crate::models::registry::{
-    AsrModelLease, ChatModelLease, ChatterboxTtsModelLease, FishS2TtsModelLease,
-    KokoroTtsModelLease, Lfm25AudioModelLease, Maya1TtsModelLease, Maya2TtsModelLease,
-    NativeAsrModel, NativeChatModel, NativeChatPreparedPrompt, QwenTtsModelLease,
-    VibeVoiceTtsModelLease, VoxtralTtsModelLease,
+    AsrModelLease, ChatModelLease, ChatterboxTtsModelLease, FishDrama3TtsModelLease,
+    FishS2TtsModelLease, KokoroTtsModelLease, Lfm25AudioModelLease, Maya1TtsModelLease,
+    Maya2TtsModelLease, NativeAsrModel, NativeChatModel, NativeChatPreparedPrompt,
+    QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralTtsModelLease,
 };
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig, ChatRole};
 use crate::runtime::audio_io::{
     validate_base64_audio_retained_size, validate_base64_audio_source_input,
     MAX_AUDIO_SOURCE_BYTES, MAX_REFERENCE_SOURCE_BYTES,
 };
+use crate::runtime::{SpeechChunkTurn, SpeechFrameCodes, SpeechSpeakerReference};
 
 mod asr_preparation;
 mod chat_preparation;
@@ -438,6 +442,7 @@ enum PreparedIncrementalModel {
     QwenTts(QwenTtsModelLease),
     VibeVoiceTts(VibeVoiceTtsModelLease),
     FishS2Tts(FishS2TtsModelLease),
+    FishDrama3Tts(FishDrama3TtsModelLease),
     VoxtralTts(VoxtralTtsModelLease),
     ChatterboxTts(ChatterboxTtsModelLease),
     Maya1Tts(Maya1TtsModelLease),
@@ -456,6 +461,7 @@ impl fmt::Debug for PreparedIncrementalModel {
             Self::QwenTts(model) => write!(formatter, "QwenTts({:p})", &**model),
             Self::VibeVoiceTts(model) => write!(formatter, "VibeVoiceTts({:p})", &**model),
             Self::FishS2Tts(model) => write!(formatter, "FishS2Tts({:p})", &**model),
+            Self::FishDrama3Tts(model) => write!(formatter, "FishDrama3Tts({:p})", &**model),
             Self::VoxtralTts(model) => write!(formatter, "VoxtralTts({:p})", &**model),
             Self::ChatterboxTts(model) => write!(formatter, "ChatterboxTts({:p})", &**model),
             Self::Maya1Tts(model) => write!(formatter, "Maya1Tts({:p})", &**model),
@@ -476,6 +482,8 @@ pub(super) struct IncrementalModelExecutionReady {
     vibevoice_tts_params: Option<VibeVoiceTtsGenerationParams>,
     fish_s2_tts: Option<Arc<FishS2PreparedArtifact>>,
     fish_s2_tts_params: Option<FishS2GenerationParams>,
+    fish_drama3_tts: Option<Arc<FishDrama3PreparedArtifact>>,
+    fish_drama3_tts_params: Option<FishDrama3GenerationParams>,
     voxtral_tts: Option<Arc<VoxtralTtsPreparedArtifact>>,
     voxtral_tts_params: Option<VoxtralTtsGenerationParams>,
     chatterbox_tts: Option<Arc<ChatterboxPreparedArtifact>>,
@@ -1114,11 +1122,59 @@ pub struct EngineCoreRequest {
     pub(crate) streaming_tx: Option<mpsc::Sender<StreamingOutput>>,
     /// Cooperative cancellation signal set without waiting for the core write lock.
     pub(crate) cancellation: Option<Arc<AtomicBool>>,
+    /// The reference voices of a request that voices several speakers
+    /// (Fish Audio Drama 3), each with its speaker; empty for every other
+    /// request, whose one reference is `reference_audio`.
+    pub(crate) tts_speaker_references: Vec<SpeechSpeakerReference>,
+    /// Earlier chunks of a long-text chunk session, oldest first, that this
+    /// request's prompt holds with their generated codes (Fish Audio
+    /// Drama 3); empty for every other request.
+    pub(crate) tts_chunk_history: Vec<SpeechChunkTurn>,
+    /// Where the request's generated codes go, when its caller asked for
+    /// them to carry into the next chunk.
+    pub(crate) tts_generated_codes: Option<TtsGeneratedCodesSink>,
+}
+
+/// One slot for the codec codes a speech request generated: the executor
+/// publishes them when it finalizes the request, and the runtime takes them
+/// once the request has ended. Clones of a request share the slot.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TtsGeneratedCodesSink(Arc<Mutex<Option<SpeechFrameCodes>>>);
+
+impl TtsGeneratedCodesSink {
+    pub(crate) fn publish(&self, codes: SpeechFrameCodes) {
+        *self.0.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(codes);
+    }
+
+    pub(crate) fn take(&self) -> Option<SpeechFrameCodes> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+    }
 }
 
 impl EngineCoreRequest {
     pub(crate) fn set_cancellation_signal(&mut self, signal: Arc<AtomicBool>) {
         self.cancellation = Some(signal);
+    }
+
+    /// The speaker references this request's prompt holds.
+    pub(crate) fn tts_speaker_references_for_execution(&self) -> &[SpeechSpeakerReference] {
+        &self.tts_speaker_references
+    }
+
+    /// The chunk-session history this request's prompt holds.
+    pub(crate) fn tts_chunk_history_for_execution(&self) -> &[SpeechChunkTurn] {
+        &self.tts_chunk_history
+    }
+
+    /// Hands the request's generated codes to its caller, when it asked for
+    /// them.
+    pub(crate) fn publish_tts_generated_codes(&self, codes: impl FnOnce() -> SpeechFrameCodes) {
+        if let Some(sink) = &self.tts_generated_codes {
+            sink.publish(codes());
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {

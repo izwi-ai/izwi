@@ -126,6 +126,10 @@ impl ModelLifecycleController {
                 self.model_registry.unload_maya2_tts(variant).await;
                 self.clear_active_tts_variant(variant).await;
             }
+            ModelFamily::FishDrama3Tts => {
+                self.model_registry.unload_fish_drama3_tts(variant).await;
+                self.clear_active_tts_variant(variant).await;
+            }
             ModelFamily::Tokenizer => {
                 let mut tokenizer_guard = self.tokenizer.write().await;
                 *tokenizer_guard = None;

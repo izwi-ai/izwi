@@ -59,9 +59,9 @@ safetensors = "0.8"
 tokenizers = "0.23"
 
 # Candle (native inference)
-candle-core = "0.11.0"
-candle-nn = "0.11.0"
-candle-transformers = "0.11.0"
+candle-core = "0.11.1"
+candle-nn = "0.11.1"
+candle-transformers = "0.11.1"
 half = "2.7"
 
 # Audio processing
@@ -114,6 +114,6 @@ memmap2 = "0.9.10"
 # With fp16 disabled for Candle on Apple Silicon, gemm-f16's inline fp16
 # assembly needs enough optimization to remain in its target-feature context.
 # The built-in test profile inherits this dev override; release is already
-# optimized. Scope it to Candle 0.11.0's exact transitive gemm-f16 version.
+# optimized. Scope it to Candle 0.11.1's exact transitive gemm-f16 version.
 [profile.dev.package."gemm-f16:0.19.0"]
 opt-level = 1

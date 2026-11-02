@@ -21,6 +21,10 @@ const TARGET: &str = "The scientist opened the window and listened to the rain. 
 #[ignore = "requires Fish weights, reference audio and explicit IZWI_FISH_S2_BACKEND"]
 async fn fish_s2_real_runtime_streaming_emits_pcm_before_completion() -> Result<()> {
     let variant = ModelVariant::FishAudioS2Pro;
+    #[cfg(feature = "metal")]
+    let _lease = crate::backends::metal_test_device_or_skip(
+        "fish_s2_real_runtime_streaming_emits_pcm_before_completion",
+    );
     let model_dir = PathBuf::from(required("IZWI_FISH_S2_MODEL_DIR")?);
     if model_dir.file_name().and_then(|name| name.to_str()) != Some(variant.dir_name()) {
         return Err(Error::InvalidInput(format!(

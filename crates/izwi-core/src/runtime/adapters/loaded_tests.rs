@@ -740,7 +740,9 @@ fn every_supported_model_capability_authors_an_exact_width_one_contract() {
                 assert_eq!(contract.adapter_abi_revision, SCALAR_ADAPTER_ABI);
                 assert_eq!(contract.stages.len(), 1);
                 assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
-            } else if factory.id() == LoadedAdapterKind::FishS2Tts.factory_id() {
+            } else if factory.id() == LoadedAdapterKind::FishS2Tts.factory_id()
+                || factory.id() == LoadedAdapterKind::FishDrama3Tts.factory_id()
+            {
                 // The factory implements native batching, but an unqualified
                 // scalar load must publish the scalar graph truthfully.
                 assert_ne!(contract.adapter_abi_revision, SCALAR_ADAPTER_ABI);
@@ -1123,8 +1125,10 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                         == crate::catalog::ModelFamily::Qwen3Tts;
                     let kokoro_tts = execution.metadata().capability == CapabilityKind::Tts
                         && variant.family() == crate::catalog::ModelFamily::KokoroTts;
+                    // S2's route shape, S2's and Drama 3's.
                     let fish_s2_tts = FishS2PhysicalTtsAdapterFactory
-                        .supports(execution.metadata(), BackendKind::Cpu);
+                        .supports(execution.metadata(), BackendKind::Cpu)
+                        || variant.family() == crate::catalog::ModelFamily::FishDrama3Tts;
                     let retained_tts = execution.metadata().capability == CapabilityKind::Tts
                         && matches!(
                             variant.family(),

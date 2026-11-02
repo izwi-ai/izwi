@@ -42,6 +42,7 @@ impl ModelLifecycleController {
             | ModelFamily::VoxtralTts
             | ModelFamily::VibeVoiceTts
             | ModelFamily::FishS2Tts
+            | ModelFamily::FishDrama3Tts
             | ModelFamily::ChatterboxTts
             | ModelFamily::Maya1Tts
             | ModelFamily::Maya2Tts => {
@@ -54,6 +55,7 @@ impl ModelLifecycleController {
                         | ModelFamily::VoxtralTts
                         | ModelFamily::VibeVoiceTts
                         | ModelFamily::FishS2Tts
+                        | ModelFamily::FishDrama3Tts
                         | ModelFamily::ChatterboxTts
                         | ModelFamily::Maya1Tts
                         | ModelFamily::Maya2Tts

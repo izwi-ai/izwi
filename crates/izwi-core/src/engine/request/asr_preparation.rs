@@ -32,6 +32,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            fish_drama3_tts: None,
+            fish_drama3_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
             chatterbox_tts: None,
@@ -94,6 +96,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            fish_drama3_tts: None,
+            fish_drama3_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
             chatterbox_tts: None,
@@ -210,6 +214,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            fish_drama3_tts: None,
+            fish_drama3_tts_params: None,
             voxtral_tts: None,
             voxtral_tts_params: None,
             chatterbox_tts: None,
@@ -883,6 +889,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::QwenTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
@@ -904,6 +911,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::QwenTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
@@ -941,6 +949,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::QwenTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)

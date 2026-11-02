@@ -150,6 +150,26 @@ impl AudioDecodeLimits {
         }
     }
 
+    /// The reference limits for a family whose inline clips may run to
+    /// `max_seconds` (at least the shared limit): the decoded-byte bound
+    /// grows with the duration, the encoded upload's does not.
+    fn long_reference(max_seconds: u64) -> Self {
+        let seconds = if max_seconds > MAX_REFERENCE_DURATION_SECONDS {
+            max_seconds
+        } else {
+            MAX_REFERENCE_DURATION_SECONDS
+        };
+        Self {
+            max_decoded_bytes: (MAX_REFERENCE_DECODED_BYTES as u64)
+                .saturating_mul(seconds)
+                .div_ceil(MAX_REFERENCE_DURATION_SECONDS)
+                .try_into()
+                .unwrap_or(usize::MAX),
+            max_duration_seconds: seconds,
+            ..Self::reference()
+        }
+    }
+
     fn validate_source_len(self, source_len: usize) -> Result<()> {
         if source_len > self.max_source_bytes {
             return Err(Error::InvalidInput(format!(
@@ -328,6 +348,24 @@ fn validated_base64_audio_payload(data: &str, max_decoded_bytes: usize) -> Resul
 pub(crate) fn decode_reference_audio_base64(data: &str) -> Result<(Vec<f32>, u32)> {
     let bytes = base64_decode_with_limit(data, MAX_REFERENCE_SOURCE_BYTES)?;
     decode_reference_audio_bytes(&bytes)
+}
+
+/// [`decode_reference_audio_base64`] for a family whose inline reference
+/// clips may run longer than the shared limit (Fish Audio Drama 3: 60 s).
+/// Saved voices keep the shared limit at upload, and every other family
+/// decodes with it.
+pub(crate) fn decode_long_reference_audio_base64(
+    data: &str,
+    max_seconds: u64,
+) -> Result<(Vec<f32>, u32)> {
+    let bytes = base64_decode_with_limit(data, MAX_REFERENCE_SOURCE_BYTES)?;
+    decode_audio_bytes_with_metadata_and_limits(
+        &bytes,
+        DecodeErrorMode::Permissive,
+        AudioDecodeLimits::long_reference(max_seconds),
+        DecodeOutputRate::Native,
+    )
+    .map(|(samples, source)| (samples, source.sample_rate))
 }
 
 pub(crate) fn decode_audio_bytes_with_metadata(
@@ -1408,6 +1446,47 @@ mod tests {
         let decoded = base64_decode_with_limit(" \n\t A Q I D \r\n", 3)
             .expect("bounded whitespace normalization should decode");
         assert_eq!(decoded, vec![1, 2, 3]);
+    }
+
+    /// A family with longer inline references (Fish Audio Drama 3: 60 s)
+    /// decodes a 45 s clip the shared 30 s limit refuses, and still refuses
+    /// one past its own limit.
+    #[test]
+    fn long_references_decode_past_the_shared_limit_up_to_their_own() {
+        let wav = |seconds: u32| {
+            let spec = hound::WavSpec {
+                channels: 2,
+                sample_rate: 48_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut bytes = Vec::new();
+            {
+                let mut writer =
+                    hound::WavWriter::new(std::io::Cursor::new(&mut bytes), spec).unwrap();
+                for _ in 0..seconds * 48_000 * 2 {
+                    writer.write_sample(0_i16).unwrap();
+                }
+                writer.finalize().unwrap();
+            }
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        };
+        let clip = wav(45);
+        let error = decode_reference_audio_base64(&clip).unwrap_err();
+        assert!(error.to_string().contains("production limit"), "{error}");
+        let (samples, rate) = decode_long_reference_audio_base64(&clip, 60).unwrap();
+        assert_eq!((samples.len(), rate), (45 * 48_000, 48_000));
+        let error = decode_long_reference_audio_base64(&wav(61), 60).unwrap_err();
+        assert!(error.to_string().contains("production limit"), "{error}");
+        // Never below the shared limit.
+        assert_eq!(
+            AudioDecodeLimits::long_reference(10).max_duration_seconds,
+            MAX_REFERENCE_DURATION_SECONDS
+        );
+        assert_eq!(
+            AudioDecodeLimits::long_reference(60).max_decoded_bytes,
+            2 * MAX_REFERENCE_DECODED_BYTES
+        );
     }
 
     #[test]

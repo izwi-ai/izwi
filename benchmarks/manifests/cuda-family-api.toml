@@ -70,6 +70,15 @@ reference_audio = "../../data/fox.wav"
 reference_text_file = "../../data/fox.md"
 
 [[benchmarks]]
+name = "fish-drama3-tts-cuda"
+command = "tts"
+model = "FishAudio-Drama-3"
+iterations = 1
+text = "CUDA model evidence."
+reference_audio = "../../data/fox.wav"
+reference_text_file = "../../data/fox.md"
+
+[[benchmarks]]
 name = "chatterbox-tts-cuda"
 command = "tts"
 model = "Chatterbox-500M"

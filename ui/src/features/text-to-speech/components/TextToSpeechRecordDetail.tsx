@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Link } from "react-router";
 import {
   AlertTriangle,
   CalendarDays,
@@ -8,8 +9,10 @@ import {
   Cpu,
   Download,
   Loader2,
+  MessagesSquare,
   Mic,
   OctagonX,
+  PencilLine,
   Trash2,
 } from "lucide-react";
 
@@ -35,19 +38,46 @@ import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
 import {
   normalizeSpeechProcessingStatus,
   speechDownloadFilename,
+  speechTextLabel,
 } from "@/features/text-to-speech/support";
 
 const TITLE_MAX_CHARS = 60;
 
 /** The opening of the spoken text, which names a take better than its model. */
 function speechRecordTitle(record: SpeechHistoryRecord | null): string {
-  const text = record?.input_text?.replace(/\s+/g, " ").trim() ?? "";
+  const text = speechTextLabel(record?.input_text ?? "");
   if (!text) {
     return "Speech generation";
   }
   return text.length > TITLE_MAX_CHARS
     ? `${text.slice(0, TITLE_MAX_CHARS).trimEnd()}…`
     : text;
+}
+
+/** The take a take was edited from: a link titled like its page, or a
+ * plain label once it is deleted. */
+function editedFromValue({
+  to,
+  record,
+  deleted,
+}: {
+  to: string;
+  record: SpeechHistoryRecord | null;
+  deleted: boolean;
+}) {
+  if (deleted) {
+    return <span className="text-(--text-muted)">Deleted take</span>;
+  }
+  const label = record ? speechRecordTitle(record) : "Earlier take";
+  return (
+    <Link
+      to={to}
+      title={label}
+      className="text-(--text-primary) underline decoration-(--border-strong) underline-offset-2 transition-colors hover:decoration-(--text-primary)"
+    >
+      {label}
+    </Link>
+  );
 }
 
 interface TextToSpeechRecordDetailProps {
@@ -63,6 +93,19 @@ interface TextToSpeechRecordDetailProps {
   cancelPending?: boolean;
   onCancel?: () => Promise<void> | void;
   onDelete?: () => Promise<void> | void;
+  /** Opens the take's lines in the dialogue editor, from the header menu;
+   * given for a dialogue. */
+  onOpenInDialogueEditor?: () => void;
+  /** Opens the take to edit: new takes continue from it; given for an
+   * editable take. */
+  onEditTake?: () => void;
+  /** The take this one was edited from: its page, its record once loaded,
+   * and whether it has since been deleted. */
+  editedFrom?: {
+    to: string;
+    record: SpeechHistoryRecord | null;
+    deleted: boolean;
+  } | null;
   /** The list this record belongs to, for the breadcrumb trail. */
   parentCrumb: Breadcrumb;
   /** Route actions for the header menu (Models). */
@@ -81,6 +124,9 @@ export function TextToSpeechRecordDetail({
   cancelPending = false,
   onCancel,
   onDelete,
+  onOpenInDialogueEditor,
+  onEditTake,
+  editedFrom = null,
   parentCrumb,
   extraMenuItems = [],
 }: TextToSpeechRecordDetailProps) {
@@ -171,7 +217,19 @@ export function TextToSpeechRecordDetail({
           : []),
       ]
     : [];
+  // The header keeps its buttons for a take's main actions; starting a new
+  // scene from this one is in the menu, so the title keeps its room.
   const menuItems: RowMenuItem[] = [
+    ...(onOpenInDialogueEditor
+      ? [
+          {
+            id: "dialogue-editor",
+            label: "Open in dialogue editor",
+            icon: MessagesSquare,
+            onSelect: onOpenInDialogueEditor,
+          },
+        ]
+      : []),
     ...(onCancel && canCancel
       ? [
           {
@@ -207,6 +265,18 @@ export function TextToSpeechRecordDetail({
       menuItems={menuItems}
       actions={
         <>
+          {onEditTake ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-9 gap-2"
+              onClick={onEditTake}
+            >
+              <PencilLine className="h-4 w-4" />
+              Edit this take
+            </Button>
+          ) : null}
           <Button
             type="button"
             variant="outline"
@@ -321,6 +391,9 @@ export function TextToSpeechRecordDetail({
               : []),
             ...(record?.language
               ? [{ label: "Language", value: record.language }]
+              : []),
+            ...(editedFrom
+              ? [{ label: "Edited from", value: editedFromValue(editedFrom) }]
               : []),
           ]}
         />

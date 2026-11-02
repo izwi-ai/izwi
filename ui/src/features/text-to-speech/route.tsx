@@ -34,6 +34,11 @@ import {
   normalizeSpeechProcessingStatus,
   resolveSpeechVoiceLabel,
 } from "@/features/text-to-speech/support";
+import {
+  dialogueLimits,
+  parseDialogueText,
+} from "@/features/text-to-speech/dialogue";
+import { takeDraft, type TakeDraft } from "@/features/text-to-speech/take";
 
 interface TextToSpeechPageProps {
   models: ModelInfo[];
@@ -69,6 +74,9 @@ export function TextToSpeechPage({
   const autoOpenCreateRef = useRef(false);
   const [isNewTextToSpeechModalOpen, setIsNewTextToSpeechModalOpen] =
     useState(false);
+  // The take the creation dialog starts from (Edit this take, Open in
+  // dialogue editor).
+  const [initialTake, setInitialTake] = useState<TakeDraft | null>(null);
   const [streamingRecord, setStreamingRecord] =
     useState<SpeechHistoryRecord | null>(null);
   const [recordActionError, setRecordActionError] = useState<string | null>(
@@ -351,9 +359,54 @@ export function TextToSpeechPage({
         record.tokens_generated ?? streamingRecord.tokens_generated,
       audio_filename: record.audio_filename || streamingRecord.audio_filename,
       audio_mime_type: record.audio_mime_type || streamingRecord.audio_mime_type,
+      // Set once the take is ready, which the stream may say first.
+      editable: streamingRecord.editable ?? record.editable,
     };
   }, [record, recordId, streamingRecord]);
 
+  const visibleRecordCapabilities = models.find(
+    (model) => model.variant === visibleRecord?.model_id,
+  )?.speech_capabilities;
+  // The server names the models whose records journal their audio as it is
+  // generated, so an unfinished record can be played from its start.
+  const visibleRecordReplaysInProgress =
+    visibleRecordCapabilities?.supports_in_progress_replay === true;
+  // A dialogue model's take whose text is a rendered script reopens in the
+  // dialogue editor, one row per line.
+  const visibleRecordLimits = useMemo(
+    () => dialogueLimits(visibleRecordCapabilities),
+    [visibleRecordCapabilities],
+  );
+  const visibleRecordDialogue = useMemo(
+    () =>
+      visibleRecord && visibleRecordLimits
+        ? parseDialogueText(
+            visibleRecord.input_text,
+            visibleRecordLimits.maxSpeakers,
+          )
+        : null,
+    [visibleRecord, visibleRecordLimits],
+  );
+  // Opens the creation dialog on the take's lines, voices and seed: to
+  // edit it (new takes continue from it), or as a fresh take.
+  const openTake = (edit: boolean) => {
+    const modelId = visibleRecord?.model_id;
+    if (!visibleRecord || !modelId) {
+      return;
+    }
+    if (resolvedSelectedModel !== modelId) {
+      onSelect(modelId);
+    }
+    setInitialTake(
+      takeDraft(visibleRecord, visibleRecordLimits?.maxSpeakers ?? null, edit),
+    );
+    setIsNewTextToSpeechModalOpen(true);
+  };
+
+  // The take this one was edited from, for a link back to it.
+  const parentTakeId = visibleRecord?.parent_take_id ?? null;
+  const { record: parentTake, error: parentTakeError } =
+    useTextToSpeechRecord(parentTakeId);
 
   const visibleVoiceLabel = useMemo(
     () =>
@@ -455,7 +508,7 @@ export function TextToSpeechPage({
         </div>
       )}
       {playback.error && <p role="alert" className="text-sm text-destructive">{playback.error}</p>}
-      {playback.status === "idle" && visibleRecord?.model_id === "FishAudio-S2-Pro" &&
+      {playback.status === "idle" && visibleRecord && visibleRecordReplaysInProgress &&
         (visibleRecord.processing_status === "pending" || visibleRecord.processing_status === "processing") && (
         <Button variant="outline" onClick={() => { void playback.listen(visibleRecord).catch(() => {}); }}>
           Listen from beginning
@@ -484,6 +537,22 @@ export function TextToSpeechPage({
             cancelPending={recordCancelPending}
             onCancel={() => void handleDetailCancel()}
             onDelete={() => void handleDetailDelete()}
+            onOpenInDialogueEditor={
+              visibleRecordDialogue ? () => openTake(false) : undefined
+            }
+            onEditTake={
+              visibleRecord?.editable === true ? () => openTake(true) : undefined
+            }
+            editedFrom={
+              parentTakeId
+                ? {
+                    to: `/text-to-speech/${parentTakeId}`,
+                    record: parentTake?.id === parentTakeId ? parentTake : null,
+                    // The server no longer has it: it was deleted.
+                    deleted: Boolean(parentTakeError),
+                  }
+                : null
+            }
           />
         </>
       ) : (
@@ -552,13 +621,17 @@ export function TextToSpeechPage({
 
       <NewTextToSpeechModal
         isOpen={isNewTextToSpeechModalOpen}
-        onClose={() => setIsNewTextToSpeechModalOpen(false)}
+        onClose={() => {
+          setIsNewTextToSpeechModalOpen(false);
+          setInitialTake(null);
+        }}
         selectedModel={resolvedSelectedModel}
         selectedModelInfo={selectedModelInfo}
         selectedModelReady={selectedModelReady}
         isModelManagerOpen={isModelModalOpen}
         initialSavedVoiceId={searchParams.get("voiceId")}
         initialSpeaker={searchParams.get("speaker")}
+        initialTake={initialTake}
         onLoadSelectedModel={(variant) => {
           onLoad(variant);
         }}

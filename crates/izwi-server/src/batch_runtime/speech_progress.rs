@@ -48,6 +48,61 @@ pub struct SpeechCheckpoint {
     /// Set only by the atomic final-audio settlement transaction.
     #[serde(default)]
     pub final_audio_published: bool,
+    /// A chunk session's earlier chunks with their generated codes (Fish
+    /// Audio Drama 3), as of the last completed segment: the next segment's
+    /// prompt holds them, so a plan that yields or recovers between
+    /// segments keeps one voice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_history: Option<SpeechChunkHistoryCheckpoint>,
+    /// The chunks a chunk session's take keeps for its record (§8.4), as
+    /// of the last completed segment: its first and its latest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub take: Option<SpeechTakeCodes>,
+}
+
+/// A chunk session's history in a speech checkpoint: at most the pinned
+/// first chunk and the latest one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpeechChunkHistoryCheckpoint {
+    pub turns: Vec<SpeechChunkTurnCheckpoint>,
+}
+
+/// One earlier chunk: the text it spoke and its generated codes,
+/// `[codebooks][frames]` flattened codebook by codebook as little-endian
+/// u16, base64 (a 1,024-frame chunk is about 27 KB).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpeechChunkTurnCheckpoint {
+    pub text: String,
+    pub codebooks: usize,
+    pub codes: String,
+}
+
+/// The codes a take keeps so a later take can continue it (Fish Audio
+/// Drama 3 take editing), as its record stores them (`generated_codes_json`)
+/// and a speech checkpoint carries them: the take's first and last chunks,
+/// each with its index and text. A later prompt holds only the first take's
+/// first chunk and the latest chunk (the chunk session's history), so the
+/// chunks between are not kept.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpeechTakeCodes {
+    /// [`SPEECH_TAKE_CODES_VERSION`].
+    pub version: u32,
+    /// The take's chunks, kept or not.
+    pub chunks: usize,
+    /// The kept chunks, oldest first: one when the take had one.
+    pub turns: Vec<SpeechTakeTurnCodes>,
+}
+
+/// The stored take format.
+pub const SPEECH_TAKE_CODES_VERSION: u32 = 1;
+
+/// One kept chunk of a take: its index in the take, and its text and codes
+/// as a checkpoint's history turn holds them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpeechTakeTurnCodes {
+    pub chunk: usize,
+    #[serde(flatten)]
+    pub turn: SpeechChunkTurnCheckpoint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -179,6 +234,8 @@ impl SpeechCheckpoint {
             active_segment: None,
             publication_started: false,
             final_audio_published: false,
+            chunk_history: None,
+            take: None,
         })
     }
 
@@ -387,6 +444,53 @@ mod tests {
             .to_string()
             .contains("speech_partial_segment_interrupted"));
     }
+    /// A chunk session's history rides in the checkpoint and recovers with
+    /// it; a plan without one (Fish S2) writes the checkpoint as before.
+    #[test]
+    fn chunk_history_recovers_with_its_checkpoint() {
+        let identity = serde_json::json!({"plan": "drama3"});
+        let mut checkpoint = SpeechCheckpoint::new(identity.clone(), 3, 1024).unwrap();
+        let plain = serde_json::to_value(&checkpoint).unwrap();
+        assert!(plain.get("chunk_history").is_none());
+        checkpoint.chunk_history = Some(SpeechChunkHistoryCheckpoint {
+            turns: vec![SpeechChunkTurnCheckpoint {
+                text: "<|speaker:0|> One.".into(),
+                codebooks: 10,
+                codes: "AAAB".into(),
+            }],
+        });
+        checkpoint.completed_segments = 1;
+        checkpoint.completed_text_bytes = 10;
+        checkpoint.take = Some(SpeechTakeCodes {
+            version: SPEECH_TAKE_CODES_VERSION,
+            chunks: 1,
+            turns: vec![SpeechTakeTurnCodes {
+                chunk: 0,
+                turn: SpeechChunkTurnCheckpoint {
+                    text: "<|speaker:0|> One.".into(),
+                    codebooks: 10,
+                    codes: "AAAB".into(),
+                },
+            }],
+        });
+        let encoded = serde_json::to_value(&checkpoint).unwrap();
+        // A kept chunk is its index beside a history turn's fields.
+        assert_eq!(
+            encoded["take"],
+            serde_json::json!({"version": 1, "chunks": 1, "turns": [
+                {"chunk": 0, "text": "<|speaker:0|> One.", "codebooks": 10, "codes": "AAAB"},
+            ]})
+        );
+        let recovered = SpeechCheckpoint::recover(&encoded, &identity).unwrap();
+        assert_eq!(recovered.chunk_history, checkpoint.chunk_history);
+        assert_eq!(recovered.take, checkpoint.take);
+        // A checkpoint written before chunk histories and takes existed
+        // still reads.
+        let earlier = SpeechCheckpoint::recover(&plain, &identity).unwrap();
+        assert_eq!(earlier.chunk_history, None);
+        assert_eq!(earlier.take, None);
+    }
+
     #[test]
     fn recovery_rejects_identity_version_and_storage_changes() {
         let identity = serde_json::json!({"reference": "stable"});

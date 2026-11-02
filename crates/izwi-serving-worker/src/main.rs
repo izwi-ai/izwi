@@ -912,6 +912,7 @@ impl WorkerProcessConfig {
                     | izwi_core::catalog::ModelFamily::VoxtralTts
                     | izwi_core::catalog::ModelFamily::VibeVoiceTts
                     | izwi_core::catalog::ModelFamily::FishS2Tts
+                    | izwi_core::catalog::ModelFamily::FishDrama3Tts
                     | izwi_core::catalog::ModelFamily::ChatterboxTts
                     | izwi_core::catalog::ModelFamily::Maya1Tts
                     | izwi_core::catalog::ModelFamily::Maya2Tts
@@ -1453,7 +1454,12 @@ fn execution_profile(
                 },
             ),
         },
-        TaskKind::TextToSpeech => ("fp32", "native-tts-realtime"),
+        TaskKind::TextToSpeech => match variant.family() {
+            // Its own route: the pinned FP8 block-scaled checkpoint on the
+            // family's executor, never the shared F32 realtime profile.
+            izwi_core::catalog::ModelFamily::FishDrama3Tts => ("fp8-block", "native-fish-drama3"),
+            _ => ("fp32", "native-tts-realtime"),
+        },
         TaskKind::Unknown => bail!("parse_worker_task yields only known tasks"),
     })
 }
@@ -2146,6 +2152,30 @@ n4hqQcj6Ww1lUPQR8+rJ24RBjCuhRANCAARrApXyDvzciYQCSB4ddOaW3lsBSwJN
             error.contains("file: path"),
             "error should mention file: path requirement: {error}"
         );
+    }
+
+    /// Fish Audio Drama 3 serves speech with its own execution profile; S2
+    /// keeps the shared one.
+    #[test]
+    fn fish_drama3_takes_the_tts_lane_with_its_own_profile() {
+        for (model, profile) in [
+            ("FishAudio-Drama-3", ("fp8-block", "native-fish-drama3")),
+            ("FishAudio-S2-Pro", ("fp32", "native-tts-realtime")),
+        ] {
+            let process = WorkerProcessConfig::from_env(&env_config::snapshot([
+                (WORKER_TASK_ENV, "text_to_speech"),
+                ("IZWI_WORKER_MODEL", model),
+                ("IZWI_WORKER_ARTIFACT_REVISION", "test-rev"),
+                ("IZWI_WORKER_CREDENTIAL_ID", "test-cred"),
+                ("IZWI_WORKER_BEARER_TOKEN", "test-token-12345678"),
+            ]))
+            .unwrap_or_else(|error| panic!("{model}: {error}"));
+            assert_eq!(
+                execution_profile(process.task, process.variant).unwrap(),
+                profile,
+                "{model}"
+            );
+        }
     }
 
     /// The LFM lanes: both LFM2.5 chat checkpoints and LFM3 chat serve chat,

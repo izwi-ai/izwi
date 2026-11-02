@@ -776,6 +776,31 @@ impl PhysicalPagedKvCache {
         )
     }
 
+    /// [`Self::write_and_attend`] whose one-token decode is batch-invariant
+    /// (`KvArena::paged_decode_row_invariant`): the row's output depends on
+    /// its own context only, never on how the backend would split a batch
+    /// (CUDA's split decode partitions it from its own length). Multi-token
+    /// calls are the same page-native prefill.
+    pub(crate) fn write_and_attend_row_invariant(
+        &self,
+        layer_idx: usize,
+        prepared: &mut PreparedPhysicalPagedStep,
+        queries: &Tensor,
+        keys: &Tensor,
+        values: &Tensor,
+        softmax_scale: f32,
+    ) -> Result<Tensor> {
+        self.write_and_attend_inner(
+            layer_idx,
+            prepared,
+            [queries, keys, values],
+            softmax_scale,
+            None,
+            None,
+            true,
+        )
+    }
+
     /// Write and attend with model-specific attention semantics while keeping
     /// physical slot coordinates and completion authentication unchanged.
     #[allow(clippy::too_many_arguments)]
@@ -789,6 +814,28 @@ impl PhysicalPagedKvCache {
         softmax_scale: f32,
         softcap: Option<f32>,
         window_tokens: Option<usize>,
+    ) -> Result<Tensor> {
+        self.write_and_attend_inner(
+            layer_idx,
+            prepared,
+            [queries, keys, values],
+            softmax_scale,
+            softcap,
+            window_tokens,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_and_attend_inner(
+        &self,
+        layer_idx: usize,
+        prepared: &mut PreparedPhysicalPagedStep,
+        [queries, keys, values]: [&Tensor; 3],
+        softmax_scale: f32,
+        softcap: Option<f32>,
+        window_tokens: Option<usize>,
+        row_invariant: bool,
     ) -> Result<Tensor> {
         let token_count = queries.dim(0)?;
         if token_count == 0 || keys.dim(0)? != token_count || values.dim(0)? != token_count {
@@ -843,15 +890,17 @@ impl PhysicalPagedKvCache {
                     .as_ref()
                     .map(|(decode, _)| decode)
                     .unwrap_or(&prepared.decode);
-                return self.arena.paged_decode(
-                    binding,
-                    PagedKvDecodeArgs {
-                        queries,
-                        batch: decode,
-                        softmax_scale,
-                        softcap,
-                    },
-                );
+                let args = PagedKvDecodeArgs {
+                    queries,
+                    batch: decode,
+                    softmax_scale,
+                    softcap,
+                };
+                return if row_invariant {
+                    self.arena.paged_decode_row_invariant(binding, args)
+                } else {
+                    self.arena.paged_decode(binding, args)
+                };
             }
 
             let prefill = window_views

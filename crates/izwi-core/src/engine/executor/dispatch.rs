@@ -294,6 +294,30 @@ impl NativeExecutor {
                     self.fish_s2_tts_finalize_request(request, scheduled_req)
                 };
             }
+            if request.task_type == TaskType::TTS
+                && request.model_variant.is_some_and(|variant| {
+                    variant.family() == crate::catalog::ModelFamily::FishDrama3Tts
+                })
+                && matches!(
+                    scheduled_req.work,
+                    crate::engine::WorkUnit::SequenceFinalize { .. }
+                        | crate::engine::WorkUnit::SequenceAudioDecode { .. }
+                )
+            {
+                if managed_cache.is_some() {
+                    return Err(Error::InferenceError(
+                        "Fish Audio Drama 3 codec unexpectedly received managed KV state".into(),
+                    ));
+                }
+                return if matches!(
+                    scheduled_req.work,
+                    crate::engine::WorkUnit::SequenceAudioDecode { .. }
+                ) {
+                    self.fish_drama3_tts_audio_decode_request(request, scheduled_req)
+                } else {
+                    self.fish_drama3_tts_finalize_request(request, scheduled_req)
+                };
+            }
             match managed_cache {
                 Some(reservation) if request.task_type == TaskType::Chat => {
                     if request.model_variant.is_some_and(|variant| {
@@ -380,6 +404,23 @@ impl NativeExecutor {
                         reservation,
                     )?;
                     self.fish_s2_tts_request_with_managed_cache(request, scheduled_req, Some(state))
+                }
+                Some(reservation)
+                    if request.task_type == TaskType::TTS
+                        && request.model_variant.is_some_and(|variant| {
+                            variant.family() == crate::catalog::ModelFamily::FishDrama3Tts
+                        }) =>
+                {
+                    let state = super::retained_row_managed_state_for_row(
+                        request,
+                        scheduled_req,
+                        reservation,
+                    )?;
+                    self.fish_drama3_tts_request_with_managed_cache(
+                        request,
+                        scheduled_req,
+                        Some(state),
+                    )
                 }
                 Some(reservation)
                     if request.task_type == TaskType::TTS
@@ -1215,6 +1256,30 @@ impl NativeExecutor {
         )
     }
 
+    pub(super) fn execute_static_fish_drama3_codec_requests_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: Option<&[ReadyQuantum]>,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let ordered = scheduled
+            .iter()
+            .map(|scheduled| {
+                Self::find_request(requests, scheduled).ok_or_else(|| {
+                    Error::InferenceError("static Fish Audio Drama 3 codec row lost request".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outputs = self.fish_drama3_tts_audio_decode_batch(&ordered, scheduled)?;
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            outputs,
+            BatchDispatch::new(BatchDispatchKind::TensorStatic, scheduled.len()),
+            rows,
+        )
+    }
+
     pub(super) fn execute_static_kokoro_tts_requests_with_rows(
         &self,
         requests: &[&EngineCoreRequest],
@@ -1345,21 +1410,19 @@ impl NativeExecutor {
                             .is_some_and(|state| state.selections().is_some());
                         let receipt = if let Some(appended) = result.managed_cache_append {
                             reservation
-                                .domains
-                                .first()
+                                .clock_span_tokens()
                                 .ok_or_else(|| {
                                     Error::InferenceError(
                                         "managed-cache reservation has no domains".into(),
                                     )
                                 })
-                                .and_then(|domain| {
+                                .and_then(|(clock_start, _)| {
                                     let appended = u32::try_from(appended).map_err(|_| {
                                         Error::InferenceError(
                                             "managed-cache append exceeds u32".into(),
                                         )
                                     })?;
-                                    let committed = domain
-                                        .execution_start_tokens
+                                    let committed = clock_start
                                         .checked_add(appended)
                                         .ok_or_else(|| {
                                             Error::InferenceError(
@@ -1396,22 +1459,20 @@ impl NativeExecutor {
                             ))
                         } else {
                             reservation
-                                .domains
-                                .first()
+                                .clock_span_tokens()
                                 .ok_or_else(|| {
                                     Error::InferenceError(
                                         "managed-cache reservation has no domains".into(),
                                     )
                                 })
-                                .and_then(|domain| {
+                                .and_then(|(clock_start, _)| {
                                     let accepted = u32::try_from(result.output.tokens_processed)
                                         .map_err(|_| {
                                             Error::InferenceError(
                                                 "accepted cache prefix exceeds u32".into(),
                                             )
                                         })?;
-                                    let committed = domain
-                                        .execution_start_tokens
+                                    let committed = clock_start
                                         .checked_add(accepted)
                                         .ok_or_else(|| {
                                             Error::InferenceError(

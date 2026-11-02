@@ -1488,3 +1488,37 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     );
   });
 });
+
+describe("AudioApiClient.createTextToSpeechRecord", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("sends the takes a new take continues from", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: "take-2" }), {
+        status: 202,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    await client.createTextToSpeechRecord({
+      model_id: "FishAudio-Drama-3",
+      text: "Again, softer.",
+      seed: 3,
+      previous_take_ids: ["take-1"],
+    });
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://localhost/v1/text-to-speech");
+    expect(JSON.parse(init.body)).toMatchObject({
+      model_id: "FishAudio-Drama-3",
+      text: "Again, softer.",
+      seed: 3,
+      previous_take_ids: ["take-1"],
+      stream: false,
+    });
+  });
+});

@@ -121,6 +121,35 @@ Rust ports of:
   (c) 2001-2002 Enthought, Inc. 2003, SciPy Developers. All rights
   reserved. BSD 3-Clause License, below.
 
+The Fish Audio S2 Pro and Fish Audio Drama 3 text-to-speech families
+(crates/izwi-core/src/models/architectures/fish_s2 and fish_drama3) run
+Fish Audio's open-weight checkpoints, which izwi downloads unmodified:
+
+* Fish Audio S2 Pro (https://huggingface.co/fishaudio/s2-pro), licensed
+  under the Fish Audio Research License: research and non-commercial use
+  only; commercial use needs a separate license from Fish Audio.
+  "This model is licensed under the Fish Audio Research License,
+  Copyright © 39 AI, INC. All Rights Reserved."
+* Fish Audio Drama 3 (https://huggingface.co/fishaudio/drama-3), licensed
+  under the Fish Audio Community License, Version 1.0: free for research
+  and non-commercial use, and for commercial use only while annual revenue
+  is below USD 500,000. It grants no license to offer a Hosted Service,
+  that is, to let third parties generate speech from text, audio or voice
+  samples they supply through an API, SDK, model-hosting service, or a
+  website or app whose primary purpose is text-to-speech, voiceover or
+  voice cloning. izwi's server and Docker image expose such an API, so a
+  deployment that lets third parties use Fish Audio Drama 3 needs a
+  separate license from Fish Audio (see the LICENSE file in the model
+  repository).
+  "These Fish Audio Materials are licensed under the Fish Audio Community
+  License, Version 1.0. Copyright © 39 AI, INC. All Rights Reserved."
+
+Both families include Rust ports of Fish Audio's fish-speech inference code
+(https://github.com/fishaudio/fish-speech): the prompt layout, the sampler,
+the text chunker and the DAC codec, rewritten in Rust for izwi.
+
+Built with Fish Audio.
+
 The Apache License, Version 2.0 is in the LICENSE file. The MIT-licensed
 works above are used under these terms:
 

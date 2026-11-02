@@ -1,4 +1,4 @@
-import { type SpeechHistoryProcessingStatus } from "@/api";
+import { type SavedVoiceSummary, type SpeechHistoryProcessingStatus } from "@/api";
 import { getSpeakerProfilesForVariant } from "@/types";
 
 export function normalizeSpeechProcessingStatus(
@@ -50,6 +50,25 @@ export function formatSpeechDuration(durationSecs: number | null): string {
   return `${minutes}m ${seconds}s`;
 }
 
+const SPEAKER_TAG = /<\|speaker:\d+\|>/g;
+
+/** A take's text as titles and lists show it: a dialogue's
+ * `<|speaker:N|>` turn tags dropped, white space collapsed. */
+export function speechTextLabel(text: string): string {
+  return text.replace(SPEAKER_TAG, " ").replace(/\s+/g, " ").trim();
+}
+
+/** A saved voice as voice pickers list it: its name and where it came from. */
+export function savedVoiceLabel(voice: SavedVoiceSummary): string {
+  const source =
+    voice.source_route_kind === "voice_cloning"
+      ? "Clone"
+      : voice.source_route_kind === "voice_design"
+        ? "Design"
+        : "Saved";
+  return `${voice.name} (${source})`;
+}
+
 export function resolveSpeechVoiceLabel({
   savedVoiceId,
   speaker,
@@ -91,7 +110,7 @@ export function speechDownloadFilename(record: {
   input_preview?: string | null;
   audio_mime_type: string;
 }): string {
-  const text = (record.input_text ?? record.input_preview ?? "")
+  const text = speechTextLabel(record.input_text ?? record.input_preview ?? "")
     .replace(/[\\/:*?"<>|]/g, " ")
     .replace(/\p{Cc}/gu, " ")
     .replace(/\s+/g, " ")

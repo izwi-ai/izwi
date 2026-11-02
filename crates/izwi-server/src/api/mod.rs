@@ -6,6 +6,8 @@ pub(crate) mod asr_task;
 pub(crate) mod audio_payload;
 pub mod chat;
 pub mod diarization;
+#[cfg(test)]
+mod fish_drama3_speech_tests;
 pub use izwi_gateway::api::docs;
 pub(crate) mod idempotency;
 pub mod internal;
@@ -20,7 +22,9 @@ pub mod request_context;
 mod router;
 pub mod saved_voices;
 pub(crate) mod sentence_split;
+pub(crate) mod speech_dialogue;
 pub mod speech_history;
+pub(crate) mod speech_takes;
 pub(crate) mod speech_text_upload;
 pub mod studio;
 pub(crate) mod summary;

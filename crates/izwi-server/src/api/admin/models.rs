@@ -102,6 +102,13 @@ pub struct AdminModelInfo {
     pub disk_required_bytes: u64,
     pub enabled: bool,
     pub license: Option<String>,
+    /// What the weights' licence permits, when the label alone does not
+    /// say it (Fish Audio Drama 3: free for research and non-commercial
+    /// use, commercial use only below USD 500k annual revenue, and a hosted
+    /// service needs a licence from Fish Audio). Informational: nothing is
+    /// refused on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license_notice: Option<String>,
     pub status: String,
     /// Explicitly loaded in this session: survives budget and memory-pressure
     /// eviction until explicitly unloaded.
@@ -141,6 +148,30 @@ pub struct AdminSpeechModelCapabilities {
     pub streaming_mode: Option<&'static str>,
     pub supports_speed_control: bool,
     pub supports_auto_long_form: bool,
+    /// Whether the model speaks without any voice input: with no reference,
+    /// the sampling seed sets its voice, so a reference is optional (Fish
+    /// Audio Drama 3).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub supports_seeded_voice: bool,
+    /// Whether one request may voice several speakers: `<|speaker:N|>`
+    /// tags or a `script`, with `references` per speaker (Fish Audio
+    /// Drama 3).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub supports_speaker_dialogue: bool,
+    /// The speakers a dialogue may voice, numbered from 0; present only
+    /// with `supports_speaker_dialogue`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_speakers: Option<usize>,
+    /// The reference clips a dialogue request may carry; present only with
+    /// `supports_speaker_dialogue`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_references: Option<usize>,
+    /// Whether an unfinished text-to-speech record of this model can be
+    /// played from its start (`GET /v1/text-to-speech/{record_id}/events`):
+    /// the server plans the model's speech segments and journals each
+    /// segment's audio as it is generated.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub supports_in_progress_replay: bool,
     /// Model-specific controls a speech request may set, each with its
     /// range and the model's default (Chatterbox: `exaggeration`,
     /// `cfg_weight`, `min_p`).
@@ -305,6 +336,7 @@ impl AdminModelInfo {
             },
             enabled: info.enabled,
             license: variant.license_label().map(str::to_string),
+            license_notice: variant.license_notice().map(str::to_string),
             status: model_status_as_str(info.status).to_string(),
             pinned,
             local_path: info
@@ -323,6 +355,7 @@ impl AdminModelInfo {
                     .with_controls(variant)
                     .with_languages(variant)
                     .with_inline_tags(variant)
+                    .with_in_progress_replay(variant)
             }),
             cuda_support: serde_json::to_value(info.cuda_support)
                 .unwrap_or(serde_json::Value::Null),
@@ -398,6 +431,15 @@ impl From<SpeechModelCapabilities> for AdminSpeechModelCapabilities {
             streaming_mode: None,
             supports_speed_control: capabilities.supports_speed_control,
             supports_auto_long_form: capabilities.supports_auto_long_form,
+            supports_seeded_voice: capabilities.supports_seeded_voice,
+            supports_speaker_dialogue: capabilities.supports_speaker_dialogue,
+            max_speakers: capabilities
+                .supports_speaker_dialogue
+                .then_some(capabilities.max_speakers),
+            max_references: capabilities
+                .supports_speaker_dialogue
+                .then_some(capabilities.max_references),
+            supports_in_progress_replay: false,
             controls: Vec::new(),
             languages: Vec::new(),
             default_language: None,
@@ -427,6 +469,11 @@ impl AdminSpeechModelCapabilities {
     fn with_inline_tags(mut self, variant: ModelVariant) -> Self {
         self.inline_tags = variant.speech_inline_tags().to_vec();
         self.inline_tags_strict = variant.refuses_unknown_inline_tags();
+        self
+    }
+
+    fn with_in_progress_replay(mut self, variant: ModelVariant) -> Self {
+        self.supports_in_progress_replay = variant.plans_own_speech_segments();
         self
     }
 
@@ -1404,6 +1451,82 @@ mod tests {
             true
         );
         assert!(maya2["default_language"].is_null());
+    }
+
+    /// Only a model whose records journal their audio (Fish S2 Pro, Fish
+    /// Audio Drama 3) offers to play an unfinished record from its start.
+    #[test]
+    fn speech_capabilities_offer_in_progress_replay_for_planned_segments() {
+        let replay = |variant: ModelVariant| {
+            let model = AdminModelInfo::from_model_info(ModelInfo::new(variant), None, false);
+            serde_json::to_value(model).expect("serialize admin model")["speech_capabilities"]
+                ["supports_in_progress_replay"]
+                .clone()
+        };
+        assert_eq!(replay(ModelVariant::FishAudioS2Pro), true);
+        assert_eq!(replay(ModelVariant::FishAudioDrama3), true);
+        for variant in [
+            ModelVariant::Qwen3Tts12Hz06BBase,
+            ModelVariant::Kokoro82M,
+            ModelVariant::VibeVoice15BTts,
+            ModelVariant::Chatterbox500M,
+            ModelVariant::Maya2Native25B,
+        ] {
+            assert!(replay(variant).is_null(), "{variant}");
+        }
+    }
+
+    /// Fish Audio Drama 3's card: a seeded voice (a reference is optional),
+    /// dialogue of up to 16 speakers from up to 8 references, its licence
+    /// and what that licence permits. No other model reports a seeded voice
+    /// or dialogue, and S2 keeps its own licence label without a notice.
+    #[test]
+    fn fish_drama3_reports_its_seeded_voice_and_licence_notice() {
+        let model = |variant: ModelVariant| {
+            serde_json::to_value(AdminModelInfo::from_model_info(
+                ModelInfo::new(variant),
+                None,
+                false,
+            ))
+            .expect("serialize admin model")
+        };
+        let drama3 = model(ModelVariant::FishAudioDrama3);
+        assert_eq!(drama3["speech_capabilities"]["supports_seeded_voice"], true);
+        assert_eq!(
+            drama3["speech_capabilities"]["supports_speaker_dialogue"],
+            true
+        );
+        assert_eq!(drama3["speech_capabilities"]["max_speakers"], 16);
+        assert_eq!(drama3["speech_capabilities"]["max_references"], 8);
+        assert_eq!(
+            drama3["speech_capabilities"]["reference_transcript_required"],
+            true
+        );
+        assert_eq!(drama3["license"], "Fish Audio Community License v1.0");
+        let notice = drama3["license_notice"].as_str().expect("notice");
+        assert_eq!(
+            notice,
+            "Free for research and non-commercial use; commercial use only below USD 500k \
+             annual revenue; offering it as a hosted service requires a licence from Fish Audio"
+        );
+        let s2 = model(ModelVariant::FishAudioS2Pro);
+        assert!(s2["speech_capabilities"]["supports_seeded_voice"].is_null());
+        assert_eq!(s2["license"], "Fish Audio Research License");
+        assert!(s2["license_notice"].is_null());
+        for variant in ModelVariant::all()
+            .iter()
+            .filter(|variant| **variant != ModelVariant::FishAudioDrama3)
+        {
+            let speech = &model(*variant)["speech_capabilities"];
+            for field in [
+                "supports_seeded_voice",
+                "supports_speaker_dialogue",
+                "max_speakers",
+                "max_references",
+            ] {
+                assert!(speech[field].is_null(), "{variant}: {field}");
+            }
+        }
     }
 
     /// LFM3 Audio lists its 19 locales and names American English as the

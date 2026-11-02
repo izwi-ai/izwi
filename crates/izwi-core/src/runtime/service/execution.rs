@@ -291,20 +291,41 @@ impl RuntimeService {
             spec.resources = spec.resources.checked_add(output)?;
         }
         if request.task_type == TaskType::TTS
-            && request.model_variant == Some(ModelVariant::FishAudioS2Pro)
+            && request
+                .model_variant
+                .is_some_and(|variant| variant.uses_fish_dac_codec())
         {
-            let frames = request
-                .params
-                .max_tokens
-                .clamp(1, ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES);
+            // Each Fish family's frame ceiling, codec quantum and stream
+            // history bound.
+            let drama3 = request
+                .model_variant
+                .is_some_and(|variant| variant.family() == ModelFamily::FishDrama3Tts);
+            let (max_frames, chunk_frames, history_bound) = if drama3 {
+                use crate::models::architectures::fish_drama3::model::{
+                    FISH_DRAMA3_AUDIO_CHUNK_FRAMES, MAX_EXPLICIT_FRAMES,
+                };
+                (
+                    // Its budget and the stop draw's quantum.
+                    MAX_EXPLICIT_FRAMES + 1,
+                    FISH_DRAMA3_AUDIO_CHUNK_FRAMES,
+                    crate::models::architectures::fish_drama3::FishDrama3DacConfig::current()
+                        .streaming_history_bound_bytes()?,
+                )
+            } else {
+                (
+                    ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES,
+                    crate::models::architectures::fish_s2::FISH_S2_AUDIO_CHUNK_FRAMES,
+                    crate::models::architectures::fish_s2::dac::FishS2DacConfig::current()
+                        .streaming_history_bound_bytes()?,
+                )
+            };
+            let frames = request.params.max_tokens.clamp(1, max_frames);
             let output_bytes = if request.collect_audio_samples {
                 (frames as u64).checked_mul(2048 * 4 * 3).ok_or_else(|| {
                     Error::Overloaded("Fish S2 output reservation overflow".into())
                 })?
             } else {
-                request.streaming_audio_buffer_bytes(
-                    crate::models::architectures::fish_s2::FISH_S2_AUDIO_CHUNK_FRAMES * 2048,
-                )?
+                request.streaming_audio_buffer_bytes(chunk_frames * 2048)?
             };
             let mut output = ResourceVector::zero();
             match self.backend_router.context().backend_kind {
@@ -315,13 +336,9 @@ impl RuntimeService {
             }
             spec.resources = spec.resources.checked_add(output)?;
             // Current history and immutable rollback history coexist during a push.
-            let history_bytes =
-                crate::models::architectures::fish_s2::dac::FishS2DacConfig::current()
-                    .streaming_history_bound_bytes()?
-                    .checked_mul(2)
-                    .ok_or_else(|| {
-                        Error::Overloaded("Fish codec history reservation overflow".into())
-                    })?;
+            let history_bytes = history_bound.checked_mul(2).ok_or_else(|| {
+                Error::Overloaded("Fish codec history reservation overflow".into())
+            })?;
             spec.resources = spec.resources.checked_add(asr_encoder_retained_resources(
                 self.backend_router.context().backend_kind,
                 0,
@@ -350,6 +367,20 @@ impl RuntimeService {
             && request.model_variant == Some(ModelVariant::FishAudioS2Pro)
         {
             if let Some(artifact) = request.prepared_fish_s2_tts_artifact_for_executor()? {
+                add_fish_s2_artifact_to_admission(
+                    self.backend_router.context().backend_kind,
+                    &mut spec,
+                    &mut observation,
+                    artifact.retained_bytes()?,
+                )?;
+            }
+        }
+        if request.task_type == TaskType::TTS
+            && request
+                .model_variant
+                .is_some_and(|variant| variant.family() == ModelFamily::FishDrama3Tts)
+        {
+            if let Some(artifact) = request.prepared_fish_drama3_tts_artifact_for_executor()? {
                 add_fish_s2_artifact_to_admission(
                     self.backend_router.context().backend_kind,
                     &mut spec,
@@ -747,7 +778,10 @@ impl RuntimeService {
         Fut: Future<Output = Result<()>>,
     {
         request.streaming = true;
-        if request.model_variant == Some(ModelVariant::FishAudioS2Pro) {
+        if request
+            .model_variant
+            .is_some_and(|variant| variant.streams_audio_only())
+        {
             request.mark_audio_streaming_only();
         }
         if request.workload_class == WorkloadClass::Online {
@@ -812,7 +846,9 @@ impl RuntimeService {
             ));
         }
         request.runtime_admitted_at = Some(job.admitted_at());
-        if request.model_variant == Some(ModelVariant::FishAudioS2Pro)
+        if request
+            .model_variant
+            .is_some_and(|variant| variant.streams_audio_only())
             && (request.collect_audio_samples
                 || request.audio_stream_engine_queue_capacity.is_none())
         {
