@@ -164,6 +164,15 @@ pub fn verify_and_enable_grouped_mma(device: &Device, hidden: usize, inter: usiz
     if grouped_mma_enabled() {
         return Ok(());
     }
+    verify_grouped_mma(device, hidden, inter)?;
+    GROUPED_MMA_VERIFIED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// The check behind [`verify_and_enable_grouped_mma`], without touching the
+/// process-wide switch: a family that picks the kernel per call (through
+/// [`fp8_moe_grouped_with`]) keeps its own verdict.
+pub fn verify_grouped_mma(device: &Device, hidden: usize, inter: usize) -> Result<()> {
     if !device.is_cuda() {
         candle_core::bail!("the tensor-core grouped MoE kernels run on CUDA only")
     }
@@ -255,7 +264,6 @@ pub fn verify_and_enable_grouped_mma(device: &Device, hidden: usize, inter: usiz
             )
         }
     }
-    GROUPED_MMA_VERIFIED.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -274,8 +282,10 @@ pub fn fp8_moe_grouped(
     fp8_moe_grouped_with(x, routing, slots, w13, s13, w2, s2, GroupedKernel::Auto)
 }
 
+/// [`fp8_moe_grouped`] with the CUDA kernels chosen per call (Metal and the
+/// CPU have one form and ignore `kernel`).
 #[allow(clippy::too_many_arguments)]
-fn fp8_moe_grouped_with(
+pub fn fp8_moe_grouped_with(
     x: &Tensor,
     routing: &Tensor,
     slots: usize,
