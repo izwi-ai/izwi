@@ -342,6 +342,7 @@ impl DeviceTower {
 
     /// `[N, 1]` U8: whether each row's label (or sampled) main is semantic.
     fn labelled(flags: &[bool], device: &Device) -> Result<Tensor> {
+        super::count_uploads(1);
         Ok(Tensor::from_vec(
             flags.iter().map(|&flag| u8::from(flag)).collect::<Vec<_>>(),
             (flags.len(), 1),
@@ -355,6 +356,7 @@ impl DeviceTower {
             .map(|code| code.min(self.vocab as u32 - 1))
             .collect::<Vec<_>>();
         let n = values.len();
+        super::count_uploads(1);
         Ok(Tensor::from_vec(values, n, device)?)
     }
 

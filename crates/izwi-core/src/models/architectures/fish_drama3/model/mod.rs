@@ -51,6 +51,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use candle_core::{DType, Device, Tensor};
 use serde_json::json;
@@ -64,6 +65,7 @@ use super::config::{FishDrama3Config, FishDrama3ConfigPolicy};
 use super::device::sampling::{
     count_fallback, device_cap, race as device_race, rank, read_back, DEVICE_RANKS,
 };
+use super::device::{record_step_section, StepSection};
 use super::embed::{prompt_rows, FishDrama3Embedding};
 use super::head::FishDrama3CompactHead;
 use super::precision::{
@@ -1551,6 +1553,7 @@ impl FishDrama3Model {
             }
             mains.push(None);
         }
+        let started = Instant::now();
         let draws = if self.device.is_cpu() {
             drawing
                 .iter()
@@ -1564,6 +1567,7 @@ impl FishDrama3Model {
         } else {
             self.draw_main_on_device(rows, &drawing)?
         };
+        record_step_section(StepSection::MainDraw, started.elapsed());
         for (&index, draw) in drawing.iter().zip(draws) {
             let state = &mut rows[index];
             let frames = state.frames();
@@ -1624,7 +1628,10 @@ impl FishDrama3Model {
                 .max(FishDrama3DrawPolicy::RAS.top_k.unwrap_or(1))
                 .min(DEVICE_RANKS);
             let ranked = rank(&logits, first_candidate, ranks)?;
-            let noise = |values: &[f32]| Tensor::from_slice(values, candidates, &self.device);
+            let noise = |values: &[f32]| {
+                super::device::count_uploads(1);
+                Tensor::from_slice(values, candidates, &self.device)
+            };
             let first = device_race(&ranked, &policy, &noise(&first_noise)?)?;
             let retry = device_race(&ranked, &FishDrama3DrawPolicy::RAS, &noise(&retry_noise)?)?;
             picks.push(Tensor::cat(
@@ -1714,10 +1721,13 @@ impl FishDrama3Model {
             });
         }
         let hidden = Tensor::cat(&hidden, 0)?;
+        let started = Instant::now();
         let frames = self
             .tower
             .forward_step(&self.embedding, &hidden, &mut tower_rows)?;
         drop(tower_rows);
+        record_step_section(StepSection::Tower, started.elapsed());
+        let started = Instant::now();
         let embeds = self.embedding.embed_tensor(&frames, &self.device)?;
         let mut trunk_rows = rows
             .iter_mut()
@@ -1733,6 +1743,7 @@ impl FishDrama3Model {
             .collect::<Vec<_>>();
         let next = self.trunk.forward_step(&embeds, &mut trunk_rows)?;
         drop(trunk_rows);
+        record_step_section(StepSection::Trunk, started.elapsed());
         let going = rows
             .iter_mut()
             .zip(mains)

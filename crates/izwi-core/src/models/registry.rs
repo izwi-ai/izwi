@@ -9636,8 +9636,12 @@ mod tests {
                 "resident_frames_total",
                 "resident_host_fallbacks_total",
                 "resident_readbacks_total",
+                "step_main_draw_ms_total",
                 "step_row_gemv_calls_total",
-                "step_row_loop_calls_total"
+                "step_row_loop_calls_total",
+                "step_tower_ms_total",
+                "step_trunk_ms_total",
+                "step_uploads_total"
             ]
         );
         assert_eq!(

@@ -131,14 +131,56 @@ pub fn fish_drama3_grouped_moe_spans() -> u64 {
     GROUPED_MOE_SPANS.load(Ordering::Relaxed)
 }
 
+static UPLOADS: AtomicU64 = AtomicU64::new(0);
+static STEP_MAIN_DRAW_US: AtomicU64 = AtomicU64::new(0);
+static STEP_TOWER_US: AtomicU64 = AtomicU64::new(0);
+static STEP_TRUNK_US: AtomicU64 = AtomicU64::new(0);
+
+/// The three parts of a decode step, timed on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StepSection {
+    /// The main head, its ranks and races, and readback 1. On a GPU it also
+    /// waits for the previous step's trunk.
+    MainDraw,
+    /// The 13 tower layers, the 9 head draws and readback 2.
+    Tower,
+    /// The frame embedding and the 40 trunk layers, enqueued.
+    Trunk,
+}
+
+/// Process-wide count of host-to-device uploads on the decode step's hot
+/// paths: RoPE tables, sampling scalars and noise, frame codes and labels,
+/// embedding inputs.
+pub fn fish_drama3_step_uploads() -> u64 {
+    UPLOADS.load(Ordering::Relaxed)
+}
+
 /// The device column's process-wide fast-path counters, for diagnostics.
 pub fn fast_path_counters() -> serde_json::Value {
+    let ms = |counter: &AtomicU64| counter.load(Ordering::Relaxed) as f64 / 1e3;
     serde_json::json!({
         "step_row_gemv_calls_total": fish_drama3_step_row_gemv_calls(),
         "step_row_loop_calls_total": fish_drama3_step_row_loop_calls(),
         "chunked_deltanet_spans_total": fish_drama3_chunked_deltanet_spans(),
         "grouped_moe_spans_total": fish_drama3_grouped_moe_spans(),
+        "step_uploads_total": fish_drama3_step_uploads(),
+        "step_main_draw_ms_total": ms(&STEP_MAIN_DRAW_US),
+        "step_tower_ms_total": ms(&STEP_TOWER_US),
+        "step_trunk_ms_total": ms(&STEP_TRUNK_US),
     })
+}
+
+pub(crate) fn count_uploads(count: usize) {
+    UPLOADS.fetch_add(count as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_step_section(section: StepSection, elapsed: std::time::Duration) {
+    let counter = match section {
+        StepSection::MainDraw => &STEP_MAIN_DRAW_US,
+        StepSection::Tower => &STEP_TOWER_US,
+        StepSection::Trunk => &STEP_TRUNK_US,
+    };
+    counter.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
 }
 
 pub(crate) fn count_step_row_gemv() {
@@ -242,6 +284,7 @@ pub(crate) fn rope(x: &Tensor, rope: &FishDrama3Rope, positions: &[usize]) -> Re
     let device = x.device();
     let cos = Tensor::from_vec(cos, (n, half), device)?;
     let sin = Tensor::from_vec(sin, (n, half), device)?;
+    count_uploads(2);
     let xf = x.to_dtype(DType::F32)?;
     let part = xf.narrow(2, 0, rotary)?;
     let rotated = match rope.layout() {

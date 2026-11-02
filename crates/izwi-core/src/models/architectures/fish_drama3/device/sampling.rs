@@ -157,6 +157,7 @@ pub(crate) fn race(
     let k = ranked.values.dim(0)?;
     let cap = policy.top_k.unwrap_or(usize::MAX);
     let temperature = Tensor::from_slice(&[policy.temperature.max(MIN_TEMPERATURE)], 1, device)?;
+    super::count_uploads(1);
     let tempered = ranked.values.broadcast_div(&temperature)?;
     let max = tempered.narrow(0, 0, 1)?;
     let weights = tempered.broadcast_sub(&max)?.exp()?;

@@ -205,6 +205,14 @@ pending coordinator (`fish_drama3_pending.rs`). The stages:
 | `tts.audio_decode.fish_drama3` | Committed frames through the codec in batched quanta: the first after 4 frames, then 16 at a time, within each stream's output credit |
 | `tts.codec.fish_drama3.scalar` | Flush; the PCM is frames × 2,048 samples |
 
+The backend report's fast-path counters time each decode step's three parts
+on the host (`step_main_draw_ms_total`: the main head, its draws and
+readback 1, which on a GPU also waits for the previous step's trunk;
+`step_tower_ms_total`: the tower, its heads and readback 2;
+`step_trunk_ms_total`: the embedding and the trunk, enqueued) and count the
+step's host-to-device uploads (`step_uploads_total`), beside the resident
+sampler's frames and readbacks.
+
 Every model quantum runs inside the family's quantum checkpoint, and the
 DeltaNet tensors move through the engine's transactional tensor arena, so an
 aborted quantum restores the request bit for bit. Cancellation and the

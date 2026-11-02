@@ -295,6 +295,7 @@ impl FishDrama3Embedding {
         }
         let sum = sum.reshape((n, self.hidden))?;
         let mask = Tensor::from_vec(semantic, (n, 1), device)?.broadcast_as((n, self.hidden))?;
+        super::device::count_uploads(2);
         Ok(mask.where_cond(&sum, &sum.zeros_like()?)?)
     }
 
@@ -387,6 +388,7 @@ impl FishDrama3Embedding {
         let root_two = Tensor::from_slice(&[std::f32::consts::SQRT_2], 1, on)?;
         let mixed = (&e + cb)?.broadcast_div(&root_two)?;
         let mask = Tensor::from_vec(semantic, (n, 1), on)?.broadcast_as((n, self.hidden))?;
+        super::device::count_uploads(4);
         Ok(mask.where_cond(&mixed, &e)?.to_device(device)?)
     }
 }

@@ -265,8 +265,22 @@ fn metal_decode_reads_back_twice_a_frame() {
         fish_drama3_resident_frames(),
         fish_drama3_resident_host_fallbacks(),
     );
+    let counters = super::super::device::fast_path_counters();
     let mut refs = states.iter_mut().collect::<Vec<_>>();
     model.decode_round(&mut refs).unwrap();
+    // The step's uploads and its three timed sections are counted.
+    let after = super::super::device::fast_path_counters();
+    for key in [
+        "step_uploads_total",
+        "step_main_draw_ms_total",
+        "step_tower_ms_total",
+        "step_trunk_ms_total",
+    ] {
+        assert!(
+            after[key].as_f64().unwrap() > counters[key].as_f64().unwrap(),
+            "{key}: {after}"
+        );
+    }
     assert_eq!(fish_drama3_resident_readbacks() - readbacks, 2);
     assert_eq!(fish_drama3_resident_frames() - frames, 2);
     assert_eq!(fish_drama3_resident_host_fallbacks(), fallbacks);

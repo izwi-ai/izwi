@@ -1340,6 +1340,7 @@ impl FishDrama3Tower {
                     }
                 }
                 let noise = Tensor::from_vec(noise, (count, heads, vocab), &self.device)?;
+                super::device::count_uploads(1);
                 return weights.step(
                     embedding,
                     &hidden,
