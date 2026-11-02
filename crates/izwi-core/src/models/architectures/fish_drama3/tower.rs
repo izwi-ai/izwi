@@ -1329,17 +1329,19 @@ impl FishDrama3Tower {
                 })
                 .collect::<Vec<_>>();
             if resident {
-                let mut noise = Vec::with_capacity(count * heads * vocab);
+                // Head-major, so each head's rows are one contiguous block.
+                let mut noise = vec![0f32; count * heads * vocab];
                 let mut policies = Vec::with_capacity(count);
-                for source in sources.iter_mut() {
+                for (row, source) in sources.iter_mut().enumerate() {
                     if let Codes::Sample(sampler) = source {
                         policies.push(sampler.params().heads);
-                        for _ in 0..heads {
-                            noise.extend(sampler.exponentials(vocab)?);
+                        for head in 0..heads {
+                            let at = (head * count + row) * vocab;
+                            noise[at..at + vocab].copy_from_slice(&sampler.exponentials(vocab)?);
                         }
                     }
                 }
-                let noise = Tensor::from_vec(noise, (count, heads, vocab), &self.device)?;
+                let noise = Tensor::from_vec(noise, (heads, count, vocab), &self.device)?;
                 super::device::count_uploads(1);
                 return weights.step(
                     embedding,

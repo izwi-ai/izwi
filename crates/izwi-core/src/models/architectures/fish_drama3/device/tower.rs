@@ -24,7 +24,7 @@ use super::super::linear::{FishDrama3KernelPhase, FishDrama3Linear};
 use super::super::residency::FishDrama3Residency;
 use super::super::sampling::FishDrama3DrawPolicy;
 use super::super::trunk::{norm_gain, NormGain};
-use super::sampling::{race, rank, read_back};
+use super::sampling::{race, race_rows, rank, read_back};
 use super::trunk::{gain, half_linear, half_linear_packed};
 use super::{
     add_residual, record, rms_norm, swiglu, DeviceAttention, DeviceForms, DeviceRow, Probe,
@@ -170,7 +170,8 @@ impl DeviceTowerLayer {
 /// Where a step's codes after `c0` come from.
 pub(crate) enum DeviceStepCodes<'a> {
     /// The device race: each row's heads policy and its exponentials
-    /// `[rows, heads, V]` F32, drawn on the host in head order.
+    /// `[heads, rows, V]` F32 (head-major; each row's drawn on the host in
+    /// head order).
     Device {
         policies: Vec<FishDrama3DrawPolicy>,
         noise: Tensor,
@@ -516,12 +517,19 @@ impl DeviceTower {
             let head = slot - self.shared_layers;
             let logits = self.head_logits(head, &x, FishDrama3KernelPhase::Step, None)?;
             injected = match &mut codes {
+                DeviceStepCodes::Device { policies, noise } if self.fused => {
+                    let draws = race_rows(&logits, &noise.get(head)?, 0, policies)?;
+                    checks.push(draws.narrow(1, 1, 1)?.flatten_all()?);
+                    let pick = draws.narrow(1, 0, 1)?.flatten_all()?;
+                    picks.push(pick.clone());
+                    pick
+                }
                 DeviceStepCodes::Device { policies, noise } => {
                     let mut row_picks = Vec::with_capacity(m);
                     for (r, policy) in policies.iter().enumerate() {
                         let cap = policy.top_k.unwrap_or(self.vocab).min(self.vocab);
                         let ranked = rank(&logits.get(r)?, 0, cap)?;
-                        let draw = race(&ranked, policy, &noise.get(r)?.get(head)?)?;
+                        let draw = race(&ranked, policy, &noise.get(head)?.get(r)?)?;
                         checks.push(draw.non_finite);
                         row_picks.push(draw.pick);
                     }

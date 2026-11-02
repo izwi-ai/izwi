@@ -132,8 +132,8 @@ pub(crate) fn positions_tensor(rows: &[DeviceRow<'_>], device: &Device) -> Resul
 /// How a device load's trunk and tower run, and why.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FishDrama3DecodePath {
-    /// Fused residual norms, q/k norm + RoPE and SwiGLU, with the load-time
-    /// kernel check's worst relative error.
+    /// Fused residual norms, q/k norm + RoPE and SwiGLU, and one-launch
+    /// races, with the load-time kernel check's worst relative error.
     Fused { check: f64 },
     /// The eager per-layer chain: switched off, or the check failed.
     Eager { reason: String },
@@ -179,9 +179,11 @@ impl FishDrama3DecodePath {
 /// The worst relative L2 deviation of the fused kernels on `device` from
 /// their CPU forms, at the model's widths and dtype mixes: the residual
 /// norms of both stacks, both attentions' q/k norm + RoPE at the first and
-/// last table rows, and both SwiGLUs.
+/// last table rows and both SwiGLUs; a device race that picks otherwise than
+/// its CPU form is an error.
 fn fused_kernels_check(device: &Device, config: &FishDrama3Config) -> Result<f64> {
     use crate::kernels::numeric_check::{host_f32, relative_l2, xorshift_tensor};
+    use crate::kernels::race_sampler::{race_sample, RacePolicy};
     use crate::kernels::{qk_norm_rope::qk_norm_rope, residual_norm, swiglu::swiglu};
     let forms = DeviceForms::of(device)?;
     let cpu = Device::Cpu;
@@ -248,6 +250,33 @@ fn fused_kernels_check(device: &Device, config: &FishDrama3Config) -> Result<f64
             &swiglu(&on(&packed)?, forms.half)?,
             &swiglu(&packed, forms.half)?,
         )?;
+    }
+    // The race picks what its CPU form picks, at both vocabularies, capped
+    // and uncapped.
+    let policies = [
+        sampling::race_policy(&super::sampling::FishDrama3DrawPolicy::RAS),
+        RacePolicy {
+            temperature: 0.7,
+            top_p: 0.8,
+            top_k: None,
+        },
+    ];
+    for vocab in [config.ids.compact_head_rows().len(), w.codebook_vocab] {
+        let logits = xorshift_tensor(&[rows, vocab], 8, 6.0, &cpu)?;
+        let noise = (xorshift_tensor(&[rows, vocab], 9, 2.0, &cpu)?.abs()? + 1e-3)?;
+        for policy in policies {
+            let want = race_sample(&logits, &noise, 1, policy)?;
+            let got = race_sample(&on(&logits)?, &on(&noise)?, 1, policy)?;
+            let (want, got) = (
+                want.flatten_all()?.to_vec1::<u32>()?,
+                got.flatten_all()?.to_device(&cpu)?.to_vec1::<u32>()?,
+            );
+            if got != want {
+                return Err(Error::InferenceError(format!(
+                    "the device race drew {got:?} where its CPU form drew {want:?}"
+                )));
+            }
+        }
     }
     Ok(worst)
 }

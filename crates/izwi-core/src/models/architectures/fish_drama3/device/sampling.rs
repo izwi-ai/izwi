@@ -25,6 +25,11 @@
 //! a request whose head cap exceeds 512 samples its heads on the host.
 //! Picks agree with the host sampler's except where rounding splits a
 //! near-tie (the device sums and exponentiates in F32 in another order).
+//!
+//! On the fused path each race is one launch of `kernels::race_sampler`
+//! (the same rule over the same exponentials): the main draws upload both
+//! their exponentials at once, and a codebook head races every row sharing
+//! a policy in one launch over head-major exponentials.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -32,6 +37,7 @@ use candle_core::{DType, Tensor};
 
 use super::super::sampling::{FishDrama3DrawPolicy, MIN_TEMPERATURE};
 use crate::error::{Error, Result};
+use crate::kernels::race_sampler::{race_sample, RacePolicy};
 use crate::models::shared::sampling::device_top_k;
 
 /// The most ranks a device draw sorts (the shared bounded top-k converges
@@ -135,6 +141,50 @@ pub(crate) fn rank(logits: &Tensor, first: usize, ranks: usize) -> Result<Ranked
     })
 }
 
+/// `policy` as the one-launch race's (`kernels::race_sampler`).
+pub(crate) fn race_policy(policy: &FishDrama3DrawPolicy) -> RacePolicy {
+    RacePolicy {
+        temperature: policy.temperature.max(MIN_TEMPERATURE),
+        top_p: policy.top_p,
+        top_k: policy.top_k,
+    }
+}
+
+/// The draws of `logits` `[m, V]` (F32 on the device) with `noise` `[m, V]`,
+/// row `r` under `policies[r]`, over candidates `first..V`: one launch per
+/// run of rows sharing a policy (each row's draw depends on its row alone),
+/// `[m, 3]` U32 `{pick, non_finite, overflow}`.
+pub(crate) fn race_rows(
+    logits: &Tensor,
+    noise: &Tensor,
+    first: usize,
+    policies: &[FishDrama3DrawPolicy],
+) -> Result<Tensor> {
+    if logits.dim(0)? != policies.len() {
+        return Err(Error::InferenceError(format!(
+            "{} policies for {} device draws",
+            policies.len(),
+            logits.dim(0)?
+        )));
+    }
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while let Some(policy) = policies.get(start) {
+        let run = policies[start..]
+            .iter()
+            .take_while(|other| *other == policy)
+            .count();
+        parts.push(race_sample(
+            &logits.narrow(0, start, run)?,
+            &noise.narrow(0, start, run)?,
+            first,
+            race_policy(policy),
+        )?);
+        start += run;
+    }
+    Ok(Tensor::cat(&parts, 0)?)
+}
+
 /// One device race.
 pub(crate) struct DeviceDraw {
     /// The winning candidate, `[1]` U32.
@@ -214,10 +264,11 @@ mod tests {
             .collect()
     }
 
-    /// The device race picks what the host race picks under the same
-    /// exponentials, over the policies the family runs (capped, uncapped,
-    /// near-greedy, eos masked), and flags an uncapped flat row whose kept
-    /// prefix runs past the device's ranks.
+    /// The device race, composed and one-launch (`race_rows`, every row
+    /// under its own policy in one call), picks what the host race picks
+    /// under the same exponentials, over the policies the family runs
+    /// (capped, uncapped, near-greedy, eos masked), and flags an uncapped
+    /// flat row whose kept prefix runs past the device's ranks.
     #[cfg(feature = "metal")]
     #[test]
     fn the_device_race_agrees_with_the_host_race() {
@@ -292,9 +343,40 @@ mod tests {
                     assert_eq!(draw.overflow.to_vec1::<u32>().unwrap(), [0]);
                     draws += 1;
                 }
+                // The same draws as rows of one call: two runs of equal
+                // policies and two single rows.
+                let order = [0usize, 0, 1, 1, 2, 3];
+                let rows = order.len();
+                let noise = order
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(r, &p)| exponentials(width, seed * 7 + p as u64 + 1000 * r as u64))
+                    .collect::<Vec<_>>();
+                let packed = race_rows(
+                    &on_device.unsqueeze(0).unwrap().repeat((rows, 1)).unwrap(),
+                    &Tensor::from_slice(&noise, (rows, width), &device).unwrap(),
+                    first,
+                    &order.map(|p| policies[p]),
+                )
+                .unwrap();
+                let got = crate::kernels::race_sampler::draws(
+                    &packed.flatten_all().unwrap().to_vec1::<u32>().unwrap(),
+                );
+                for (r, &p) in order.iter().enumerate() {
+                    let expected = host_race(
+                        &logits,
+                        &policies[p],
+                        first,
+                        &noise[r * width..(r + 1) * width],
+                    )
+                    .unwrap();
+                    assert_eq!(got[r].pick as usize, expected, "seed {seed}, row {r}");
+                    assert_eq!((got[r].non_finite, got[r].overflow), (0, false));
+                    draws += 1;
+                }
             }
         }
-        assert_eq!(draws, 96);
+        assert_eq!(draws, 96 + 144);
         // A flat row under an uncapped top-p of 0.9 keeps ~3,700 ranks.
         let flat = Tensor::from_slice(&vec![0.5f32; width], width, &device).unwrap();
         let ranked = rank(&flat, 1, DEVICE_RANKS).unwrap();

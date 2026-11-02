@@ -201,9 +201,15 @@ other families (`crates/izwi-core/src/kernels/`):
 - `swiglu`: the shared expert's and the tower's gate and up projections are
   packed into one `[gate | up]` projection at load; one GEMV and one launch
   replace two GEMVs, two casts, SiLU, the product and a cast.
+- `race_sampler`: each device draw is one launch instead of a bounded sort
+  and about 40 Candle ops. A row's main draw uploads both its exponentials
+  (the request's draw and RAS's) at once; a codebook head races every row
+  that shares a policy in one launch, over exponentials uploaded head-major.
+  Picks, overflow and non-finite flags read back as before.
 
 The load compares the kernels on the device with their CPU forms at the
-model's widths and dtype mixes (relative L2 at most 1e-3), and
+model's widths and dtype mixes (relative L2 at most 1e-3; the race must
+pick exactly as its CPU form does), and
 `decode_path` in the diagnostics says which path runs and why.
 `IZWI_FISH_DRAMA3_FUSED_DECODE=0` runs the eager per-layer chain. The Metal
 range probe and the trunk's traced test forwards always run eagerly.
@@ -494,8 +500,8 @@ load:
 - `IZWI_FISH_DRAMA3_DTYPE`: the activation dtype, f16 or f32 on Metal (f32
   also stores the paged KV in F32 and runs every MoE layer's host loop), bf16
   on CUDA, f32 on CPU. Anything else fails the load.
-- `IZWI_FISH_DRAMA3_FUSED_DECODE`: the fused trunk and tower on Metal and
-  CUDA (default `true`); any false value runs the eager chain.
+- `IZWI_FISH_DRAMA3_FUSED_DECODE`: the fused trunk, tower and draws on
+  Metal and CUDA (default `true`); any false value runs the eager chain.
 - `IZWI_FISH_DRAMA3_MOE_BACKEND`: `fused` (default) or `loop`, on Metal and
   CUDA.
 - `IZWI_FISH_DRAMA3_NATIVE_BATCHING`: two rows at once on Metal instead of

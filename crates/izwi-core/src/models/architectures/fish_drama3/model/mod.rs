@@ -63,7 +63,7 @@ use super::codec::{
 };
 use super::config::{FishDrama3Config, FishDrama3ConfigPolicy};
 use super::device::sampling::{
-    count_fallback, device_cap, race as device_race, rank, read_back, DEVICE_RANKS,
+    count_fallback, device_cap, race as device_race, race_policy, rank, read_back, DEVICE_RANKS,
 };
 use super::device::{record_step_section, FishDrama3DecodePath, StepSection};
 use super::embed::{prompt_rows, FishDrama3Embedding};
@@ -92,6 +92,7 @@ use super::trunk::{
 use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
+use crate::kernels::race_sampler::race_sample;
 use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
@@ -979,10 +980,17 @@ impl FishDrama3Model {
         self.decode_path.as_ref()
     }
 
-    /// Runs the device trunk and tower fused or eagerly, for tests that
-    /// compare the two.
+    /// Runs the device trunk, tower and draws fused or eagerly, for tests
+    /// that compare the two.
     #[cfg(test)]
     pub(crate) fn force_fused(&mut self, fused: bool) {
+        self.decode_path = Some(if fused {
+            FishDrama3DecodePath::Fused { check: 0.0 }
+        } else {
+            FishDrama3DecodePath::Eager {
+                reason: "forced by a test".into(),
+            }
+        });
         if let Some(weights) = self.trunk.device_trunk_mut() {
             weights.fused = fused;
         }
@@ -1634,11 +1642,12 @@ impl FishDrama3Model {
     }
 
     /// The main draws of `rows[drawing]` on the device: each row's compact
-    /// head, ranked once, raced at the request's policy and at RAS's from
-    /// exponentials its sampler draws in the host's order, and every row's
-    /// picks read back at once (readback 1 of the frame). A draw whose kept
-    /// prefix runs past the device's ranks re-runs on the host from the
-    /// same exponentials.
+    /// head, raced at the request's policy and at RAS's from exponentials
+    /// its sampler draws in the host's order (one launch each on the fused
+    /// path, both draws' exponentials uploaded at once; else ranked once and
+    /// raced in Candle ops), and every row's picks read back at once
+    /// (readback 1 of the frame). A draw whose kept prefix runs past the
+    /// device's ranks re-runs on the host from the same exponentials.
     fn draw_main_on_device(
         &self,
         rows: &mut [&mut FishDrama3RequestState],
@@ -1648,6 +1657,10 @@ impl FishDrama3Model {
             return Ok(Vec::new());
         }
         let candidates = self.head.len();
+        let fused = self
+            .decode_path
+            .as_ref()
+            .is_some_and(FishDrama3DecodePath::is_fused);
         let mut picks = Vec::with_capacity(drawing.len());
         let mut kept = Vec::with_capacity(drawing.len());
         for &index in drawing {
@@ -1657,36 +1670,61 @@ impl FishDrama3Model {
             let logits = self.head.logits(state.last_hidden()?)?.squeeze(0)?;
             let (first_noise, retry_noise) = state.sampler.main_noise()?;
             let policy = state.params.sampling.main;
-            let ranks = device_cap(&policy)
-                .unwrap_or(DEVICE_RANKS)
-                .max(FishDrama3DrawPolicy::RAS.top_k.unwrap_or(1))
-                .min(DEVICE_RANKS);
-            let ranked = rank(&logits, first_candidate, ranks)?;
-            let noise = |values: &[f32]| {
+            // `{pick, non_finite, overflow}` of the request's draw, then RAS's.
+            if fused {
                 super::device::count_uploads(1);
-                Tensor::from_slice(values, candidates, &self.device)
-            };
-            let first = device_race(&ranked, &policy, &noise(&first_noise)?)?;
-            let retry = device_race(&ranked, &FishDrama3DrawPolicy::RAS, &noise(&retry_noise)?)?;
-            picks.push(Tensor::cat(
-                &[
-                    &first.pick,
-                    &retry.pick,
-                    &first.non_finite,
-                    &first.overflow,
-                    &retry.overflow,
-                ],
-                0,
-            )?);
+                let noise = Tensor::from_vec(
+                    [first_noise.as_slice(), retry_noise.as_slice()].concat(),
+                    (2, candidates),
+                    &self.device,
+                )?;
+                let row = logits.unsqueeze(0)?;
+                let draw = |r: usize, policy: &FishDrama3DrawPolicy| {
+                    race_sample(
+                        &row,
+                        &noise.narrow(0, r, 1)?,
+                        first_candidate,
+                        race_policy(policy),
+                    )
+                };
+                picks.push(Tensor::cat(
+                    &[&draw(0, &policy)?, &draw(1, &FishDrama3DrawPolicy::RAS)?],
+                    1,
+                )?);
+            } else {
+                let ranks = device_cap(&policy)
+                    .unwrap_or(DEVICE_RANKS)
+                    .max(FishDrama3DrawPolicy::RAS.top_k.unwrap_or(1))
+                    .min(DEVICE_RANKS);
+                let ranked = rank(&logits, first_candidate, ranks)?;
+                let noise = |values: &[f32]| {
+                    super::device::count_uploads(1);
+                    Tensor::from_slice(values, candidates, &self.device)
+                };
+                let first = device_race(&ranked, &policy, &noise(&first_noise)?)?;
+                let retry =
+                    device_race(&ranked, &FishDrama3DrawPolicy::RAS, &noise(&retry_noise)?)?;
+                picks.push(Tensor::cat(
+                    &[
+                        &first.pick,
+                        &first.non_finite,
+                        &first.overflow,
+                        &retry.pick,
+                        &retry.non_finite,
+                        &retry.overflow,
+                    ],
+                    0,
+                )?);
+            }
             kept.push((logits, first_noise, retry_noise, first_candidate, policy));
         }
         let values = read_back(&Tensor::cat(&picks, 0)?)?;
         let mut draws = Vec::with_capacity(drawing.len());
-        let (rows_read, _) = values.as_chunks::<5>();
+        let (rows_read, _) = values.as_chunks::<6>();
         for ((&index, row), (logits, first_noise, retry_noise, first_candidate, policy)) in
             drawing.iter().zip(rows_read).zip(kept)
         {
-            let [first, retry, non_finite, first_overflow, retry_overflow] = row;
+            let [first, non_finite, first_overflow, retry, _, retry_overflow] = row;
             // The row's logits on the host, read once if a fallback needs them.
             let mut host: Option<Vec<f32>> = None;
             let mut on_host = |logits: &Tensor| -> Result<Vec<f32>> {
