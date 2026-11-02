@@ -13,6 +13,22 @@ pub const SPEAKER_ASSISTANT_TOKEN: &str = "<|speaker:assistant|>";
 pub const SEMANTIC_TOKEN_TEMPLATE_PREFIX: &str = "<|semantic:";
 pub const SEMANTIC_TOKEN_TEMPLATE_SUFFIX: &str = "|>";
 
+/// Tokens only the prompt builder writes: the ChatML turn markers, the
+/// modality markers and the semantic band (by its prefix). The tokenizer
+/// maps each to one special id, and the target text and the reference
+/// transcript go into the prompt as written, so a caller's copy would
+/// rewrite the prompt's structure. The speech routes refuse caller text
+/// holding one; any other text, `[tags]` and `<|speaker:N|>` included, is
+/// content.
+pub const CONTROL_TOKENS: [&str; 6] = [
+    "<|im_start|>",
+    IM_END_TOKEN,
+    MODALITY_VOICE_TOKEN,
+    "<|text|>",
+    "<|interleave|>",
+    SEMANTIC_TOKEN_TEMPLATE_PREFIX,
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FishS2DacContract {
     pub sample_rate: u32,

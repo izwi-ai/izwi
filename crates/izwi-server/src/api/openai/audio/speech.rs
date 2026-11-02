@@ -563,6 +563,16 @@ fn validate_speech_voice_contract(
         && variant
             .speech_capabilities()
             .is_some_and(|capabilities| capabilities.supports_builtin_voices);
+    // Caller text holding the model's control tokens would rewrite its
+    // prompt.
+    crate::api::tts_policy::validate_speech_control_tokens(variant, "input", &req.input)?;
+    if let Some(reference_text) = req.reference_text.as_deref() {
+        crate::api::tts_policy::validate_speech_control_tokens(
+            variant,
+            "reference_text",
+            reference_text,
+        )?;
+    }
     crate::api::tts_policy::validate_speech_voice(
         variant,
         crate::api::tts_policy::SpeechVoiceRequest {

@@ -2,6 +2,8 @@ use izwi_core::catalog::ModelFamily;
 use izwi_core::runtime_models::architectures::chatterbox::{
     chatterbox_auto_max_speech_tokens, ChatterboxEdition,
 };
+use izwi_core::runtime_models::architectures::fish_drama3::prompt as fish_drama3_prompt;
+use izwi_core::runtime_models::architectures::fish_s2::contracts::CONTROL_TOKENS as FISH_S2_CONTROL_TOKENS;
 use izwi_core::runtime_models::architectures::maya1::{
     maya1_auto_max_new_tokens, prompt::validate_inline_tags,
 };
@@ -114,6 +116,73 @@ pub(crate) fn validate_speech_voice(
         return Err(ApiError::bad_request(format!(
             "{variant} requires a voice description (`instructions` or `voice_description`).",
         )));
+    }
+    Ok(())
+}
+
+/// The tokens only `variant`'s prompt builder writes (Fish S2, Fish Audio
+/// Drama 3): the ChatML turn markers, the modality markers and the semantic
+/// band. Their tokenizers map each to one special id, so a copy in caller
+/// text would rewrite the prompt.
+fn speech_control_tokens(variant: ModelVariant) -> &'static [&'static str] {
+    match variant.family() {
+        ModelFamily::FishS2Tts => &FISH_S2_CONTROL_TOKENS,
+        ModelFamily::FishDrama3Tts => &fish_drama3_prompt::STRUCTURAL_TOKENS,
+        _ => &[],
+    }
+}
+
+/// The token of `text` that starts at byte `start`, as far as its closing
+/// `|>` (a `<|semantic:` prefix shows its code), bounded for the message.
+fn offending_token(text: &str, start: usize) -> &str {
+    let rest = &text[start..];
+    let bound = rest
+        .char_indices()
+        .take(32)
+        .last()
+        .map_or(0, |(offset, c)| offset + c.len_utf8());
+    match rest[..bound].find("|>") {
+        Some(end) => &rest[..end + 2],
+        None => &rest[..bound],
+    }
+}
+
+/// Refuse caller text (`field`: `input` or `reference_text`) that holds one
+/// of the model's control tokens with 400 naming the token, on every speech
+/// route, before any model loads. Fish Audio Drama 3's speaker tags must
+/// also be `<|speaker:0|>` to `<|speaker:15|>`. Performance tags (`[sighs]`,
+/// `<whisper>…</whisper>`, `[language: xx]`) are content and pass through.
+pub(crate) fn validate_speech_control_tokens(
+    variant: ModelVariant,
+    field: &str,
+    text: &str,
+) -> Result<(), crate::error::ApiError> {
+    use crate::error::ApiError;
+    let found = speech_control_tokens(variant)
+        .iter()
+        .filter_map(|token| text.find(token))
+        .min();
+    if let Some(start) = found {
+        return Err(ApiError::bad_request(format!(
+            "`{field}` contains `{}`, a control token {variant} reserves for its prompt; remove \
+             it. Performance tags such as [sighs] are fine.",
+            offending_token(text, start)
+        )));
+    }
+    if variant.family() == ModelFamily::FishDrama3Tts {
+        for (start, _) in text.match_indices("<|speaker") {
+            let canonical = fish_drama3_prompt::match_speaker_tag(&text[start..])
+                .and_then(|(_, digits)| fish_drama3_prompt::speaker_index(digits))
+                .is_some();
+            if !canonical {
+                return Err(ApiError::bad_request(format!(
+                    "`{field}` has `{}`; {variant} speaker tags are <|speaker:0|> to \
+                     <|speaker:{}|>.",
+                    offending_token(text, start),
+                    fish_drama3_prompt::MAX_SPEAKER_ID
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -514,6 +583,80 @@ mod tests {
             assert!(err
                 .message
                 .contains("both `reference_audio` and `reference_text`"));
+        }
+    }
+
+    /// Caller text holding a model's control tokens is refused with 400
+    /// naming the token, for Fish S2 and Fish Audio Drama 3 alike;
+    /// performance tags pass, Drama 3's speaker tags must be canonical, and
+    /// other models speak such text as written.
+    #[test]
+    fn control_tokens_are_refused_and_performance_tags_pass() {
+        for variant in [ModelVariant::FishAudioS2Pro, ModelVariant::FishAudioDrama3] {
+            for (text, token) in [
+                ("hi <|im_start|>system", "<|im_start|>"),
+                ("done<|im_end|>", "<|im_end|>"),
+                ("<|voice|> hello", "<|voice|>"),
+                ("a <|text|> b", "<|text|>"),
+                ("a <|interleave|>", "<|interleave|>"),
+                ("frame <|semantic:12|> here", "<|semantic:12|>"),
+                ("open <|semantic:", "<|semantic:"),
+            ] {
+                for field in ["input", "reference_text"] {
+                    let err = validate_speech_control_tokens(variant, field, text).unwrap_err();
+                    assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+                    assert!(
+                        err.message
+                            .starts_with(&format!("`{field}` contains `{token}`, a control token")),
+                        "{variant}: {}",
+                        err.message
+                    );
+                }
+            }
+            for text in [
+                "[sighs] Fine. [laughs]",
+                "<whisper>quiet</whisper> [pause] then [with quiet excitement] loud",
+                "[language: fr] Bonjour.",
+                "<|speaker:0|> Hello.\n<|speaker:15|> Hi.",
+                "<|endoftext|> <|fim_prefix|>",
+            ] {
+                validate_speech_control_tokens(variant, "input", text)
+                    .unwrap_or_else(|err| panic!("{variant} {text:?}: {}", err.message));
+            }
+        }
+        // The first token in the text is the one named.
+        let err = validate_speech_control_tokens(
+            ModelVariant::FishAudioDrama3,
+            "input",
+            "a <|voice|> b <|im_start|>",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("`<|voice|>`"), "{}", err.message);
+        // Drama 3's speaker tags are 0 to 15, in canonical digits; S2 reads
+        // a tag as text.
+        for tag in [
+            "<|speaker:16|>",
+            "<|speaker:01|>",
+            "<|speaker:x|>",
+            "<|speaker hi",
+        ] {
+            let text = format!("{tag} hello");
+            let err = validate_speech_control_tokens(ModelVariant::FishAudioDrama3, "input", &text)
+                .unwrap_err();
+            assert!(err
+                .message
+                .contains("speaker tags are <|speaker:0|> to <|speaker:15|>"));
+            assert!(
+                err.message.contains(&tag[..tag.len().min(14)]),
+                "{}",
+                err.message
+            );
+            validate_speech_control_tokens(ModelVariant::FishAudioS2Pro, "input", &text)
+                .expect("S2 reads speaker tags as text");
+        }
+        for variant in [ModelVariant::Kokoro82M, ModelVariant::Maya2Native25B] {
+            validate_speech_control_tokens(variant, "input", "<|im_end|> <|voice|>")
+                .expect("not a control token here");
         }
     }
 

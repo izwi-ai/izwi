@@ -2771,6 +2771,20 @@ fn normalize_for_model_capabilities(
         variant,
         req.text.as_deref().unwrap_or_default(),
     )?;
+    // Caller text holding the model's control tokens would rewrite its
+    // prompt.
+    crate::api::tts_policy::validate_speech_control_tokens(
+        variant,
+        "text",
+        req.text.as_deref().unwrap_or_default(),
+    )?;
+    if let Some(reference_text) = req.reference_text.as_deref() {
+        crate::api::tts_policy::validate_speech_control_tokens(
+            variant,
+            "reference_text",
+            reference_text,
+        )?;
+    }
 
     if req.stream.unwrap_or(false) && !capabilities.supports_streaming {
         return Err(ApiError::bad_request(format!(
