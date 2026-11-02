@@ -296,8 +296,10 @@ pub struct GenerationRequest {
 
     /// Earlier chunks of a long-text chunk session, oldest first, whose
     /// text and generated codes this chunk's prompt holds (Fish Audio
-    /// Drama 3: the pinned first chunk and the latest). Set by the server's
-    /// segment plan only; never read from or written to a public request.
+    /// Drama 3: the pinned first chunk and the latest). The chunks of the
+    /// takes a request continues come first, as if they were the session's
+    /// own. Set by the server's segment plan only; never read from or
+    /// written to a public request.
     #[serde(skip)]
     pub chunk_history: Vec<SpeechChunkTurn>,
 }

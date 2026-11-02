@@ -396,6 +396,52 @@ pub struct SpeechHistoryRecord {
     /// "failed" with the attempt's error until the retry starts.
     #[serde(default)]
     pub retry_pending: bool,
+    /// The take this one continues: the last of its request's
+    /// `previous_take_ids` (Fish Audio Drama 3 take editing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_take_id: Option<String>,
+    /// The voices a take used, in its request's order: each reference's
+    /// speaker, and its saved voice when it was one (an inline clip is not
+    /// kept). Empty when every speaker spoke in a seeded voice; absent on
+    /// records that keep none (other models, takes made before take
+    /// editing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub references: Option<Vec<SpeechTakeReference>>,
+    /// The take's seed, when its request gave one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    /// The take kept its generated codes, so `previous_take_ids` can name
+    /// it; never the codes themselves.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub editable: bool,
+}
+
+/// One voice of a take, as its record keeps it: the speaker, and the saved
+/// voice that voiced it (none for an inline clip, whose audio is not kept).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeechTakeReference {
+    pub speaker: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_voice_id: Option<String>,
+}
+
+/// What a new take keeps of its request (Fish Audio Drama 3 take editing):
+/// its voices, its seed and the take it continues. Default (nothing) for
+/// every other model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpeechTakeInputs {
+    pub references: Option<Vec<SpeechTakeReference>>,
+    pub seed: Option<u64>,
+    pub parent_take_id: Option<String>,
+}
+
+/// A record as a request that continues it reads it.
+#[derive(Debug, Clone)]
+pub struct StoredSpeechTake {
+    pub model_id: Option<String>,
+    pub processing_status: SpeechHistoryProcessingStatus,
+    /// The kept codes (`SpeechTakeCodes` JSON), when the take kept them.
+    pub generated_codes_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -426,6 +472,7 @@ pub struct NewSpeechHistoryRecord {
     pub audio_filename: Option<String>,
     pub audio_bytes: Vec<u8>,
     pub stop_reason: Option<String>,
+    pub take: SpeechTakeInputs,
 }
 
 #[derive(Debug, Clone)]
@@ -448,6 +495,9 @@ pub struct CompleteSpeechHistoryRecord {
     /// Attempt-owned output already persisted before the route projection is made ready.
     pub preexisting_audio_storage_path: Option<String>,
     pub stop_reason: Option<String>,
+    /// The codes a finished take keeps (`SpeechTakeCodes` JSON); none for
+    /// any other model.
+    pub generated_codes_json: Option<String>,
 }
 
 impl CompleteSpeechHistoryRecord {
@@ -626,6 +676,35 @@ impl SpeechHistoryStore {
     ) -> anyhow::Result<Option<SpeechHistoryRecord>> {
         let db = self.db.connection().await?;
         fetch_record_without_audio(db, route_kind, &record_id).await
+    }
+
+    /// The record `record_id` of `route_kind` as a take a request continues:
+    /// its model, its status and its kept codes.
+    pub async fn get_take(
+        &self,
+        route_kind: SpeechRouteKind,
+        record_id: &str,
+    ) -> anyhow::Result<Option<StoredSpeechTake>> {
+        let db = self.db.connection().await?;
+        let row = db
+            .query_one_raw(raw::statement(
+                db,
+                "SELECT model_id, processing_status, generated_codes_json \
+                 FROM speech_history_records WHERE route_kind = ?1 AND id = ?2",
+                vec![route_kind.as_db_value().into(), record_id.into()],
+            )?)
+            .await
+            .context("Failed to load speech take")?;
+        row.map(|row| {
+            let status: String = row.try_get_by_index(1)?;
+            Ok(StoredSpeechTake {
+                model_id: row.try_get_by_index(0)?,
+                processing_status: SpeechHistoryProcessingStatus::from_db_value(&status)
+                    .unwrap_or_default(),
+                generated_codes_json: row.try_get_by_index(2)?,
+            })
+        })
+        .transpose()
     }
 
     pub async fn get_audio(
@@ -811,6 +890,10 @@ impl SpeechHistoryStore {
                 audio_artifact_tenant: Set(None),
                 stop_reason: Set(record.stop_reason.clone()),
                 owner_node_id: Set(Some(self.node.id().to_string())),
+                generated_codes_json: Set(None),
+                references_json: Set(take_references_json(&record.take)?),
+                seed: Set(record.take.seed.map(seed_to_db)),
+                parent_take_id: Set(record.take.parent_take_id.clone()),
             })
             .exec(db)
             .await
@@ -1213,6 +1296,12 @@ impl SpeechHistoryStore {
             )
             .filter(speech_history_records::Column::RouteKind.eq(route_kind.as_db_value()))
             .filter(speech_history_records::Column::Id.eq(record_id.clone()));
+        if let Some(codes) = record.generated_codes_json {
+            update = update.col_expr(
+                speech_history_records::Column::GeneratedCodesJson,
+                Expr::value(Some(codes)),
+            );
+        }
         if let Some(attempt) = attempt {
             update = update
                 .filter(speech_history_records::Column::RuntimeStageId.eq(attempt.stage_id.clone()))
@@ -1427,7 +1516,11 @@ const SPEECH_HISTORY_RECORD_COLUMNS: &str = r#"
           AND j.route_record_kind = speech_history_records.route_kind
           AND j.route_record_id = speech_history_records.id
           AND j.status IN ('queued', 'running', 'retrying')
-    )) AS retry_pending
+    )) AS retry_pending,
+    parent_take_id,
+    references_json,
+    seed,
+    (generated_codes_json IS NOT NULL) AS editable
 "#;
 
 async fn fetch_record_without_audio(
@@ -1594,7 +1687,33 @@ fn map_speech_history_record(row: &QueryResult) -> anyhow::Result<SpeechHistoryR
         audio_filename: row.try_get_by_index(18)?,
         stop_reason: row.try_get_by_index(19)?,
         retry_pending: row.try_get_by_index::<Option<bool>>(20)?.unwrap_or(false),
+        parent_take_id: row.try_get_by_index(21)?,
+        references: row
+            .try_get_by_index::<Option<String>>(22)?
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .context("Invalid speech take references")?,
+        seed: row.try_get_by_index::<Option<i64>>(23)?.map(seed_from_db),
+        editable: row.try_get_by_index::<Option<bool>>(24)?.unwrap_or(false),
     })
+}
+
+/// A seed's 64 bits as the signed integer column holds them.
+pub(crate) fn seed_to_db(seed: u64) -> i64 {
+    i64::from_ne_bytes(seed.to_ne_bytes())
+}
+
+fn seed_from_db(seed: i64) -> u64 {
+    u64::from_ne_bytes(seed.to_ne_bytes())
+}
+
+/// A take's voices as `references_json` holds them.
+pub(crate) fn take_references_json(take: &SpeechTakeInputs) -> anyhow::Result<Option<String>> {
+    take.references
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("Failed to encode speech take references")
 }
 
 fn input_preview(content: &str) -> String {
@@ -2077,6 +2196,7 @@ mod tests {
             audio_mime_type: "audio/wav".to_string(),
             audio_filename: Some("hello.wav".to_string()),
             audio_bytes: vec![5, 6, 7],
+            take: Default::default(),
         }
     }
 
@@ -2099,6 +2219,7 @@ mod tests {
             audio_filename: Some("attempt.wav".to_string()),
             audio_bytes,
             preexisting_audio_storage_path: None,
+            generated_codes_json: None,
         }
     }
 
@@ -2191,6 +2312,109 @@ mod tests {
         assert_eq!(records[0].stop_reason.as_deref(), Some("length"));
         let serialized = serde_json::to_value(&created).unwrap();
         assert_eq!(serialized["stop_reason"], "length");
+    }
+
+    /// A take's voices, seed (all 64 bits) and parent are stored with it,
+    /// its codes with its completion; `GET` says it is editable and never
+    /// shows the codes, and the take reads back for a request that continues
+    /// it. A record without them serializes as before.
+    #[tokio::test]
+    async fn takes_keep_their_voices_seed_parent_and_codes() {
+        let _guard = env_lock();
+        let (_temp, store) = setup_store();
+        let plain = store
+            .create_record(ready_record())
+            .await
+            .expect("record should create");
+        let plain_json = serde_json::to_value(&plain).unwrap();
+        for field in [
+            "parent_take_id",
+            "references",
+            "seed",
+            "editable",
+            "generated_codes_json",
+        ] {
+            assert!(plain_json.get(field).is_none(), "{field}: {plain_json}");
+        }
+
+        let references = vec![
+            SpeechTakeReference {
+                speaker: 0,
+                saved_voice_id: Some("voice-a".into()),
+            },
+            SpeechTakeReference {
+                speaker: 1,
+                saved_voice_id: None,
+            },
+        ];
+        let pending = store
+            .create_record(NewSpeechHistoryRecord {
+                processing_status: SpeechHistoryProcessingStatus::Pending,
+                audio_bytes: Vec::new(),
+                take: SpeechTakeInputs {
+                    references: Some(references.clone()),
+                    seed: Some(u64::MAX),
+                    parent_take_id: Some(plain.id.clone()),
+                },
+                ..ready_record()
+            })
+            .await
+            .expect("pending take should create");
+        assert_eq!(pending.references.as_ref(), Some(&references));
+        assert_eq!(pending.seed, Some(u64::MAX));
+        assert_eq!(pending.parent_take_id.as_deref(), Some(plain.id.as_str()));
+        assert!(!pending.editable);
+        let unfinished = store
+            .get_take(SpeechRouteKind::TextToSpeech, &pending.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unfinished.processing_status,
+            SpeechHistoryProcessingStatus::Pending
+        );
+        assert_eq!(unfinished.generated_codes_json, None);
+
+        let completed = store
+            .complete_record(
+                SpeechRouteKind::TextToSpeech,
+                pending.id.clone(),
+                CompleteSpeechHistoryRecord {
+                    generated_codes_json: Some(r#"{"version":1}"#.into()),
+                    ..completed_record(vec![1, 2, 3])
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(completed.editable);
+        assert_eq!(completed.seed, Some(u64::MAX));
+        let json = serde_json::to_value(&completed).unwrap();
+        assert_eq!(json["editable"], true);
+        assert_eq!(json["seed"], u64::MAX);
+        assert_eq!(
+            json["references"],
+            serde_json::json!([{"speaker": 0, "saved_voice_id": "voice-a"}, {"speaker": 1}])
+        );
+        assert_eq!(json["parent_take_id"], plain.id.as_str());
+        assert!(json.get("generated_codes_json").is_none());
+        let take = store
+            .get_take(SpeechRouteKind::TextToSpeech, &pending.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(take.processing_status, SpeechHistoryProcessingStatus::Ready);
+        assert_eq!(take.model_id, completed.model_id);
+        assert_eq!(
+            take.generated_codes_json.as_deref(),
+            Some(r#"{"version":1}"#)
+        );
+        // Another route's records are not this route's takes.
+        assert!(store
+            .get_take(SpeechRouteKind::VoiceCloning, &pending.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -2293,6 +2517,7 @@ mod tests {
                     audio_filename: Some("completed.wav".to_string()),
                     audio_bytes: vec![8, 9],
                     preexisting_audio_storage_path: None,
+                    generated_codes_json: None,
                 },
             )
             .await

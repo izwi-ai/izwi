@@ -10,6 +10,9 @@
 //! referenced speaker beside a seeded one, saved voices per speaker, raw
 //! speaker tags in `input`, a long dialogue of several chunks, a durable
 //! record of two references across stage attempts, and every refusal.
+//! Take editing (4d): takes that continue earlier ones on the durable and
+//! the synchronous record routes, a long take edited across stage attempts,
+//! a dialogue take edited with its stored voices, and every refusal.
 //!
 //! Expected audio comes from the runtime itself: each chunk the family's
 //! chunker plans, sent as one request carrying the references, the pinned
@@ -193,6 +196,12 @@ enum Voices<'a> {
     Speakers(&'a [SpeechSpeakerReference]),
 }
 
+/// A chunk session's audio and every chunk it spoke, with its codes.
+struct Session {
+    pcm: Vec<f32>,
+    turns: Vec<SpeechChunkTurn>,
+}
+
 /// The audio of `text` as the chunk session speaks it, chunk by chunk
 /// through the runtime: each chunk from `seed + index`, carrying the
 /// references and the pinned first chunk and the latest with their codes.
@@ -202,8 +211,29 @@ async fn chunk_session_pcm(
     seed: u64,
     voices: Voices<'_>,
 ) -> izwi_core::Result<(Vec<f32>, usize)> {
+    let session = chunk_session(state, text, seed, voices, &[]).await?;
+    let chunks = session.turns.len();
+    Ok((session.pcm, chunks))
+}
+
+/// [`chunk_session_pcm`] continuing `previous`, the chunks of earlier takes
+/// in order: they enter the session's history first, as its own earlier
+/// chunks would (the first pinned, the latest kept).
+async fn chunk_session(
+    state: &AppState,
+    text: &str,
+    seed: u64,
+    voices: Voices<'_>,
+    previous: &[SpeechChunkTurn],
+) -> izwi_core::Result<Session> {
     let mut history = SpeechChunkHistory::default();
-    let mut pcm = Vec::new();
+    for turn in previous {
+        history.push(turn.clone());
+    }
+    let mut session = Session {
+        pcm: Vec::new(),
+        turns: Vec::new(),
+    };
     let chunks = plan_chunks(text, false);
     for (index, chunk) in chunks.iter().enumerate() {
         let mut request = GenerationRequest::new(chunk.clone());
@@ -235,13 +265,15 @@ async fn chunk_session_pcm(
         result?;
         let codes = codes.expect("a chunk's codes");
         assert_eq!(codes.frames() * STUB_SAMPLES_PER_FRAME, samples.len());
-        pcm.extend_from_slice(&samples);
-        history.push(SpeechChunkTurn {
+        session.pcm.extend_from_slice(&samples);
+        let turn = SpeechChunkTurn {
             text: chunk.clone(),
             codes: std::sync::Arc::unwrap_or_clone(codes),
-        });
+        };
+        history.push(turn.clone());
+        session.turns.push(turn);
     }
-    Ok((pcm, chunks.len()))
+    Ok(session)
 }
 
 /// The first seed from `from` whose chunk session of `text` ends on eos
@@ -252,9 +284,21 @@ async fn complete_seed(
     from: u64,
     voices: Voices<'_>,
 ) -> (u64, Vec<f32>) {
+    let (seed, session) = complete_session(state, text, from, voices, &[]).await;
+    (seed, session.pcm)
+}
+
+/// [`complete_seed`] continuing `previous`, with every chunk it spoke.
+async fn complete_session(
+    state: &AppState,
+    text: &str,
+    from: u64,
+    voices: Voices<'_>,
+    previous: &[SpeechChunkTurn],
+) -> (u64, Session) {
     for seed in from..from + 24 {
-        match chunk_session_pcm(state, text, seed, voices).await {
-            Ok((pcm, _)) => return (seed, pcm),
+        match chunk_session(state, text, seed, voices, previous).await {
+            Ok(session) => return (seed, session),
             Err(error) if error.to_string().contains("frame_limit") => continue,
             Err(error) => panic!("seed {seed}: {error}"),
         }
@@ -584,35 +628,11 @@ async fn durable_records_carry_history_across_stage_attempts() {
 /// Runs a batch worker until record `id` of `route` is ready, one stage
 /// attempt a pass, and returns the attempts it took.
 async fn run_durable_record(server: &Server, route: &str, id: &str) -> usize {
-    use crate::batch_runtime::worker::{BatchWorkerConfig, BatchWorkerRunner};
-    let state = &server.state;
-    let mut config = BatchWorkerConfig::local("drama3-durable-test");
-    config.queue_names = crate::roles::local::local_batch_worker_queue_names();
-    config.capabilities = vec!["tts".to_string()];
-    config.stage_kinds = vec![crate::api::speech_history::BATCH_TTS_STAGE_KIND.to_string()];
-    let backend = state.runtime.backend_context();
-    config.resources = crate::roles::local::local_batch_worker_resources(
-        backend.backend_kind,
-        backend.device.capabilities.available_memory_bytes,
-    );
-    config.resources.concurrency_slots = 1;
-    let worker = BatchWorkerRunner::new(
-        state.batch_runtime_store.clone(),
-        vec![crate::api::speech_history::batch_tts_stage_executor(
-            state.clone(),
-        )],
-        config,
-        state.batch_worker_health.clone(),
-    )
-    .with_runtime_observer(state.runtime.clone())
-    .with_artifact_store(state.artifact_store.clone());
+    let worker = durable_worker(server);
     let mut attempts = 0;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
     loop {
-        let record: Value = serde_json::from_slice(
-            &bytes(send(server, Method::GET, &format!("{route}/{id}"), None).await).await,
-        )
-        .unwrap();
+        let record = get_json(server, &format!("{route}/{id}")).await;
         match record["processing_status"].as_str() {
             Some("ready") => break,
             Some("failed") => panic!("the record failed: {record}"),
@@ -629,6 +649,37 @@ async fn run_durable_record(server: &Server, route: &str, id: &str) -> usize {
         }
     }
     attempts
+}
+
+/// A `GET` response's JSON.
+async fn get_json(server: &Server, path: &str) -> Value {
+    serde_json::from_slice(&bytes(send(server, Method::GET, path, None).await).await).unwrap()
+}
+
+/// A batch worker of the server's speech stages, one at a time.
+fn durable_worker(server: &Server) -> crate::batch_runtime::worker::BatchWorkerRunner {
+    use crate::batch_runtime::worker::{BatchWorkerConfig, BatchWorkerRunner};
+    let state = &server.state;
+    let mut config = BatchWorkerConfig::local("drama3-durable-test");
+    config.queue_names = crate::roles::local::local_batch_worker_queue_names();
+    config.capabilities = vec!["tts".to_string()];
+    config.stage_kinds = vec![crate::api::speech_history::BATCH_TTS_STAGE_KIND.to_string()];
+    let backend = state.runtime.backend_context();
+    config.resources = crate::roles::local::local_batch_worker_resources(
+        backend.backend_kind,
+        backend.device.capabilities.available_memory_bytes,
+    );
+    config.resources.concurrency_slots = 1;
+    BatchWorkerRunner::new(
+        state.batch_runtime_store.clone(),
+        vec![crate::api::speech_history::batch_tts_stage_executor(
+            state.clone(),
+        )],
+        config,
+        state.batch_worker_health.clone(),
+    )
+    .with_runtime_observer(state.runtime.clone())
+    .with_artifact_store(state.artifact_store.clone())
 }
 
 /// A dialogue reference for the runtime: `audio` voicing `speaker`.
@@ -1161,6 +1212,504 @@ async fn dialogue_refusals_come_before_any_load() {
         message.contains("at most 16 MiB") && message.contains("saved_voice_id"),
         "{message}"
     );
+    // Nothing loaded: every refusal came before any load.
+    assert!(server
+        .state
+        .runtime
+        .fish_artifact_fingerprint(VARIANT)
+        .await
+        .is_none());
+}
+
+/// A runtime whose workers have room for the durable speech path, which an
+/// unoptimized build polls deeper than tokio's default 2 MiB stack.
+fn run_on_large_stacks<F>(test: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(32 << 20)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime
+        .block_on(runtime.spawn(test))
+        .expect("the test task");
+}
+
+/// A record route's `POST`; the new record.
+async fn create_record(server: &Server, route: &str, body: Value, status: StatusCode) -> Value {
+    let response = send(server, Method::POST, route, Some(body)).await;
+    let actual = response.status();
+    let body = bytes(response).await;
+    assert_eq!(actual, status, "{}", String::from_utf8_lossy(&body));
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// A record's audio as 16-bit samples.
+async fn record_pcm(server: &Server, route: &str, id: &str) -> Vec<i16> {
+    let response = send(server, Method::GET, &format!("{route}/{id}/audio"), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (rate, wav) = wav_samples(&bytes(response).await);
+    assert_eq!(rate, SAMPLE_RATE);
+    wav
+}
+
+/// A take of `text` on `/v1/text-to-speech` from `seed` in seeded voices,
+/// continuing `previous`; its id.
+async fn durable_take(server: &Server, text: &str, seed: u64, previous: &[&str]) -> String {
+    let mut body = json!({
+        "model_id": "FishAudio-Drama-3",
+        "text": text,
+        "temperature": TEMPERATURE,
+        "max_tokens": BUDGET,
+        "seed": seed,
+    });
+    if !previous.is_empty() {
+        body["previous_take_ids"] = json!(previous);
+    }
+    let record = create_record(server, "/v1/text-to-speech", body, StatusCode::ACCEPTED).await;
+    record["id"].as_str().unwrap().to_string()
+}
+
+/// Take editing on the durable `/v1/text-to-speech` route: a take keeps its
+/// codes, seed and (no) voices; a take that continues it holds it as a
+/// completed turn before its own text, and its audio is the runtime's
+/// chunk session continuing the first take's chunks; a third take continues
+/// both, oldest first.
+#[test]
+fn fish_drama3_takes_continue_earlier_takes() {
+    run_on_large_stacks(takes_continue_earlier_takes());
+}
+
+async fn takes_continue_earlier_takes() {
+    let _load = LOADS.lock().await;
+    let server = server("takes");
+    server
+        .state
+        .runtime
+        .load_model(VARIANT)
+        .await
+        .expect("load");
+    let route = "/v1/text-to-speech";
+
+    let (seed, first) =
+        complete_session(&server.state, "hello world.", 300, Voices::Seeded, &[]).await;
+    let first_id = durable_take(&server, "hello world.", seed, &[]).await;
+    run_durable_record(&server, route, &first_id).await;
+    let record = get_json(&server, &format!("{route}/{first_id}")).await;
+    assert_eq!(record["editable"], true, "{record}");
+    assert_eq!(record["seed"], seed);
+    assert_eq!(record["references"], json!([]));
+    assert!(record.get("parent_take_id").is_none());
+    assert!(record.get("generated_codes_json").is_none());
+    assert_eq!(
+        record_pcm(&server, route, &first_id).await,
+        pcm_i16(&first.pcm)
+    );
+
+    // The edit: its prompt holds the first take as a completed turn.
+    let (edit_seed, edit) = complete_session(
+        &server.state,
+        "one two three.",
+        340,
+        Voices::Seeded,
+        &first.turns,
+    )
+    .await;
+    let edit_id = durable_take(&server, "one two three.", edit_seed, &[&first_id]).await;
+    run_durable_record(&server, route, &edit_id).await;
+    let record = get_json(&server, &format!("{route}/{edit_id}")).await;
+    assert_eq!(record["parent_take_id"], json!(first_id));
+    assert_eq!(record["editable"], true);
+    let wav = record_pcm(&server, route, &edit_id).await;
+    assert_eq!(wav, pcm_i16(&edit.pcm));
+    // The take reached the prompt: the same seed without it speaks
+    // otherwise.
+    match chunk_session_pcm(&server.state, "one two three.", edit_seed, Voices::Seeded).await {
+        Ok((alone, _)) => assert_ne!(pcm_i16(&alone), wav),
+        Err(error) => assert!(error.to_string().contains("frame_limit"), "{error}"),
+    }
+
+    // Two takes, oldest first: the first stays pinned, the latest follows.
+    let both = [first.turns.clone(), edit.turns.clone()].concat();
+    let (third_seed, third) =
+        complete_session(&server.state, "hello one two.", 380, Voices::Seeded, &both).await;
+    let third_id = durable_take(
+        &server,
+        "hello one two.",
+        third_seed,
+        &[&first_id, &edit_id],
+    )
+    .await;
+    run_durable_record(&server, route, &third_id).await;
+    let record = get_json(&server, &format!("{route}/{third_id}")).await;
+    assert_eq!(record["parent_take_id"], json!(edit_id));
+    assert_eq!(
+        record_pcm(&server, route, &third_id).await,
+        pcm_i16(&third.pcm)
+    );
+    server
+        .state
+        .runtime
+        .unload_model(VARIANT)
+        .await
+        .expect("unload");
+}
+
+/// A long take keeps its first and last chunks, which is all a take that
+/// continues it holds: a long edit of it, one stage attempt per chunk,
+/// recovers its history from the checkpoint and reads the earlier take
+/// again on every attempt, and speaks as the runtime's chunk session that
+/// continues every chunk of the long take. An earlier take deleted while
+/// its edit runs fails the edit at its next attempt.
+#[test]
+fn fish_drama3_long_takes_continue_across_stage_attempts() {
+    run_on_large_stacks(long_takes_continue_across_stage_attempts());
+}
+
+async fn long_takes_continue_across_stage_attempts() {
+    let _load = LOADS.lock().await;
+    let server = server("long-takes");
+    server
+        .state
+        .runtime
+        .load_model(VARIANT)
+        .await
+        .expect("load");
+    let route = "/v1/text-to-speech";
+    let long = "one two three hello world. ".repeat(30);
+    let chunks = plan_chunks(&long, false).len();
+    assert!(chunks >= 3, "{chunks}");
+    let (seed, take) = complete_session(&server.state, &long, 400, Voices::Seeded, &[]).await;
+    let take_id = durable_take(&server, &long, seed, &[]).await;
+    assert_eq!(run_durable_record(&server, route, &take_id).await, chunks);
+    assert_eq!(
+        record_pcm(&server, route, &take_id).await,
+        pcm_i16(&take.pcm)
+    );
+    let stored = server
+        .state
+        .speech_history_store
+        .get_take(
+            crate::speech_history_store::SpeechRouteKind::TextToSpeech,
+            &take_id,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .generated_codes_json
+        .expect("the take's codes");
+    let stored: Value = serde_json::from_str(&stored).unwrap();
+    assert_eq!(stored["version"], 1);
+    assert_eq!(stored["chunks"], chunks);
+    assert_eq!(stored["turns"][0]["chunk"], 0);
+    assert_eq!(stored["turns"][1]["chunk"], chunks - 1);
+    assert_eq!(
+        stored["turns"][1]["text"],
+        json!(take.turns[chunks - 1].text)
+    );
+
+    let edit_text = "hello world one two three. ".repeat(20);
+    let edit_chunks = plan_chunks(&edit_text, false).len();
+    assert!(edit_chunks >= 2, "{edit_chunks}");
+    let (edit_seed, edit) =
+        complete_session(&server.state, &edit_text, 460, Voices::Seeded, &take.turns).await;
+    let edit_id = durable_take(&server, &edit_text, edit_seed, &[&take_id]).await;
+    assert_eq!(
+        run_durable_record(&server, route, &edit_id).await,
+        edit_chunks
+    );
+    assert_eq!(
+        record_pcm(&server, route, &edit_id).await,
+        pcm_i16(&edit.pcm)
+    );
+
+    // The earlier take goes after the edit's first attempt.
+    let doomed = durable_take(&server, &edit_text, edit_seed, &[&take_id]).await;
+    let worker = durable_worker(&server);
+    while !worker.run_once().await.expect("a worker pass") {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let response = send(&server, Method::DELETE, &format!("{route}/{take_id}"), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    let record = loop {
+        let record = get_json(&server, &format!("{route}/{doomed}")).await;
+        if record["processing_status"] == "failed" && record["retry_pending"] != true {
+            break record;
+        }
+        assert_ne!(record["processing_status"], "ready", "{record}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the edit never failed"
+        );
+        if !worker.run_once().await.expect("a worker pass") {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    let error = record["processing_error"].as_str().unwrap();
+    assert!(
+        error.contains(&format!("Previous take `{take_id}` not found")),
+        "{error}"
+    );
+    assert!(record.get("editable").is_none());
+    server
+        .state
+        .runtime
+        .unload_model(VARIANT)
+        .await
+        .expect("unload");
+}
+
+/// A dialogue take on the synchronous voice-cloning route keeps its voices:
+/// a saved voice by its id, an inline clip as its speaker only. An edit
+/// from those stored voices speaks the saved voice again and the clip's
+/// speaker in a seeded voice, continuing the take.
+#[test]
+fn fish_drama3_dialogue_takes_continue_with_their_stored_voices() {
+    run_on_large_stacks(dialogue_takes_continue_with_their_stored_voices());
+}
+
+async fn dialogue_takes_continue_with_their_stored_voices() {
+    let _load = LOADS.lock().await;
+    let server = server("dialogue-takes");
+    server
+        .state
+        .runtime
+        .load_model(VARIANT)
+        .await
+        .expect("load");
+    let route = "/v1/voice-clones";
+    let (anna, ben) = (reference_wav(1.5), tone_wav(2.0, SAMPLE_RATE, 0.047));
+    let anna_id = save_voice(&server, "Anna", &anna, Some("hello world.")).await;
+    let both = [
+        speaker_reference(0, &anna, "hello world."),
+        speaker_reference(1, &ben, "one two three."),
+    ];
+    let (lines, text) = script(&[(0, "hello world."), (1, "one two three.")]);
+    let (seed, take) =
+        complete_session(&server.state, &text, 500, Voices::Speakers(&both), &[]).await;
+    let record = create_record(
+        &server,
+        route,
+        json!({
+            "model_id": "FishAudio-Drama-3",
+            "script": lines,
+            "references": [
+                {"speaker": 0, "saved_voice_id": anna_id},
+                {"speaker": 1, "audio": ben, "text": "one two three."},
+            ],
+            "temperature": TEMPERATURE,
+            "max_tokens": BUDGET,
+            "seed": seed,
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let take_id = record["id"].as_str().unwrap().to_string();
+    assert_eq!(record["editable"], true, "{record}");
+    assert_eq!(record["seed"], seed);
+    assert_eq!(
+        record["references"],
+        json!([{"speaker": 0, "saved_voice_id": anna_id}, {"speaker": 1}])
+    );
+    assert_eq!(
+        record_pcm(&server, route, &take_id).await,
+        pcm_i16(&take.pcm)
+    );
+
+    // The edit, from what the take kept: its saved voices only.
+    let restored = record["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|reference| reference.get("saved_voice_id").is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    let (edit_lines, edit_text) = script(&[(0, "one two three."), (1, "hello world.")]);
+    let anna_only = [speaker_reference(0, &anna, "hello world.")];
+    let (edit_seed, edit) = complete_session(
+        &server.state,
+        &edit_text,
+        540,
+        Voices::Speakers(&anna_only),
+        &take.turns,
+    )
+    .await;
+    let record = create_record(
+        &server,
+        route,
+        json!({
+            "model_id": "FishAudio-Drama-3",
+            "script": edit_lines,
+            "references": restored,
+            "temperature": TEMPERATURE,
+            "max_tokens": BUDGET,
+            "seed": edit_seed,
+            "previous_take_ids": [take_id],
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let edit_id = record["id"].as_str().unwrap();
+    assert_eq!(record["parent_take_id"], json!(take_id));
+    assert_eq!(
+        record["references"],
+        json!([{"speaker": 0, "saved_voice_id": anna_id}])
+    );
+    assert_eq!(
+        record_pcm(&server, route, edit_id).await,
+        pcm_i16(&edit.pcm)
+    );
+    server
+        .state
+        .runtime
+        .unload_model(VARIANT)
+        .await
+        .expect("unload");
+}
+
+/// Every `previous_take_ids` refusal, before any model loads (none is on
+/// disk here): 404 for a take that does not exist on the request's route,
+/// 400 for another model's take, a take without kept codes (unfinished,
+/// failed, made before takes kept them), an empty or repeated id, more
+/// than two, and a model that continues no takes.
+#[tokio::test]
+async fn previous_take_refusals_come_before_any_load() {
+    use crate::speech_history_store::{
+        NewSpeechHistoryRecord, SpeechHistoryProcessingStatus, SpeechRouteKind,
+    };
+    let server = server_with("take-refusals", false);
+    let record = |route_kind, model: &str, status| NewSpeechHistoryRecord {
+        route_kind,
+        processing_status: status,
+        processing_error: None,
+        model_id: Some(model.into()),
+        speaker: None,
+        language: None,
+        saved_voice_id: None,
+        speed: None,
+        input_text: "hello world.".into(),
+        voice_description: None,
+        reference_text: None,
+        generation_time_ms: 0.0,
+        audio_duration_secs: None,
+        rtf: None,
+        tokens_generated: None,
+        audio_mime_type: "audio/wav".into(),
+        audio_filename: None,
+        audio_bytes: match status {
+            SpeechHistoryProcessingStatus::Ready => vec![1, 2],
+            _ => Vec::new(),
+        },
+        stop_reason: None,
+        take: Default::default(),
+    };
+    let store = &server.state.speech_history_store;
+    let mut ids = Vec::new();
+    for (route_kind, model, status) in [
+        // A finished Drama 3 take made before takes kept their codes.
+        (
+            SpeechRouteKind::TextToSpeech,
+            "FishAudio-Drama-3",
+            SpeechHistoryProcessingStatus::Ready,
+        ),
+        (
+            SpeechRouteKind::TextToSpeech,
+            "FishAudio-Drama-3",
+            SpeechHistoryProcessingStatus::Pending,
+        ),
+        (
+            SpeechRouteKind::TextToSpeech,
+            "FishAudio-Drama-3",
+            SpeechHistoryProcessingStatus::Failed,
+        ),
+        (
+            SpeechRouteKind::TextToSpeech,
+            "FishAudio-S2-Pro",
+            SpeechHistoryProcessingStatus::Ready,
+        ),
+        (
+            SpeechRouteKind::VoiceCloning,
+            "FishAudio-Drama-3",
+            SpeechHistoryProcessingStatus::Ready,
+        ),
+    ] {
+        ids.push(
+            store
+                .create_record(record(route_kind, model, status))
+                .await
+                .unwrap()
+                .id,
+        );
+    }
+    let [before, pending, failed, other_model, other_route] = <[String; 5]>::try_from(ids).unwrap();
+    let refused = |route: &'static str, model: &'static str, previous: Value| {
+        let server = &server;
+        async move {
+            let response = send(
+                server,
+                Method::POST,
+                route,
+                Some(json!({
+                    "model_id": model,
+                    "text": "hello world.",
+                    "seed": 1,
+                    "previous_take_ids": previous,
+                })),
+            )
+            .await;
+            let status = response.status();
+            let error: Value = serde_json::from_slice(&bytes(response).await).unwrap();
+            (
+                status,
+                error["error"]["message"].as_str().unwrap().to_string(),
+            )
+        }
+    };
+    let tts = "/v1/text-to-speech";
+    let drama3 = "FishAudio-Drama-3";
+
+    let (status, message) = refused(tts, drama3, json!(["missing"])).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        message.contains("Previous take `missing` not found"),
+        "{message}"
+    );
+    // A record of another route is not this route's take.
+    let (status, message) = refused(tts, drama3, json!([other_route])).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{message}");
+    for id in [&before, &pending, &failed] {
+        let (status, message) = refused(tts, drama3, json!([id])).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{message}");
+        assert!(message.contains("kept no codes"), "{message}");
+    }
+    let (status, message) = refused(tts, drama3, json!([other_model])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        message.contains("was made by FishAudio-S2-Pro") && message.contains("its own model"),
+        "{message}"
+    );
+    for (previous, expected) in [
+        (json!([before, before]), "twice"),
+        (json!(["a", "b", "c"]), "at most 2"),
+        (json!([" "]), "`previous_take_ids[0]` is empty"),
+    ] {
+        let (status, message) = refused(tts, drama3, previous).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains(expected), "{message}");
+    }
+    let (status, message) = refused(tts, "FishAudio-S2-Pro", json!([other_model])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        message.contains("does not continue earlier takes"),
+        "{message}"
+    );
+    // The voice-cloning route checks its own records the same way.
+    let (status, message) = refused("/v1/voice-clones", drama3, json!(["missing"])).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{message}");
     // Nothing loaded: every refusal came before any load.
     assert!(server
         .state

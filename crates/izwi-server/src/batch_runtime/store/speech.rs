@@ -27,6 +27,9 @@ pub(crate) struct SpeechHistoryFinalization {
     pub audio_filename: Option<String>,
     pub artifact_metadata_json: serde_json::Value,
     pub progress: serde_json::Value,
+    /// The codes a finished take keeps (`SpeechTakeCodes` JSON); none for
+    /// any other model.
+    pub generated_codes_json: Option<String>,
 }
 
 pub(super) fn speech_admission_tenant(request: &serde_json::Value) -> anyhow::Result<String> {
@@ -581,7 +584,8 @@ impl BatchRuntimeStore {
                     audio_filename = ?14,
                     audio_storage_path = '',
                     audio_media_asset_id = ?15,
-                    audio_artifact_tenant = ?16
+                    audio_artifact_tenant = ?16,
+                    generated_codes_json = ?21
                 WHERE route_kind = ?17
                   AND id = ?18
                   AND processing_status IN ('pending', 'processing')
@@ -612,6 +616,7 @@ impl BatchRuntimeStore {
                     finalization.record_id.clone().into(),
                     lease.stage_id.clone().into(),
                     attempt_token.into(),
+                    opt_string(finalization.generated_codes_json.clone()),
                 ],
             )?)
             .await

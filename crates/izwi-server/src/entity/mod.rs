@@ -295,6 +295,10 @@ pub mod speech_history_records {
         pub audio_artifact_tenant: Option<String>,
         pub stop_reason: Option<String>,
         pub owner_node_id: Option<String>,
+        pub generated_codes_json: Option<String>,
+        pub references_json: Option<String>,
+        pub seed: Option<i64>,
+        pub parent_take_id: Option<String>,
     }
     empty_relation!();
 }

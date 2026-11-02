@@ -11,6 +11,9 @@ use izwi_core::{
     SpeechFrameCodes, TtsStopReason,
 };
 
+use crate::api::speech_takes::SpeechTake;
+use crate::batch_runtime::speech_progress::SpeechChunkTurnCheckpoint;
+
 const DEFAULT_CHUNK_MAX_CHARS: usize = 480;
 const CHUNK_MAX_CHARS_MIN: usize = 80;
 const CHUNK_MAX_CHARS_MAX: usize = 4000;
@@ -595,69 +598,80 @@ impl SpeechChunkHistory {
         &self,
     ) -> Result<crate::batch_runtime::speech_progress::SpeechChunkHistoryCheckpoint, izwi_core::Error>
     {
-        use crate::batch_runtime::speech_progress::{
-            SpeechChunkHistoryCheckpoint, SpeechChunkTurnCheckpoint,
-        };
-        use base64::Engine;
         let turns = self
-            .turns()
-            .into_iter()
-            .map(|turn| {
-                let mut bytes =
-                    Vec::with_capacity(turn.codes.frames() * turn.codes.codebooks.len() * 2);
-                for code in turn.codes.codebooks.iter().flatten() {
-                    let code = u16::try_from(*code).map_err(|_| {
-                        izwi_core::Error::InferenceError(format!(
-                            "Speech chunk code {code} does not fit its checkpoint"
-                        ))
-                    })?;
-                    bytes.extend_from_slice(&code.to_le_bytes());
-                }
-                Ok(SpeechChunkTurnCheckpoint {
-                    text: turn.text,
-                    codebooks: turn.codes.codebooks.len(),
-                    codes: base64::engine::general_purpose::STANDARD.encode(bytes),
-                })
-            })
-            .collect::<Result<Vec<_>, izwi_core::Error>>()?;
-        Ok(SpeechChunkHistoryCheckpoint { turns })
+            .pinned
+            .iter()
+            .chain(&self.recent)
+            .map(encode_chunk_turn)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::batch_runtime::speech_progress::SpeechChunkHistoryCheckpoint { turns })
     }
 
     /// The history a durable checkpoint holds, checked.
     pub(crate) fn from_checkpoint(
         checkpoint: &crate::batch_runtime::speech_progress::SpeechChunkHistoryCheckpoint,
     ) -> Result<Self, izwi_core::Error> {
-        use base64::Engine;
-        let invalid = |reason: &str| {
-            izwi_core::Error::InvalidInput(format!("Invalid speech chunk history: {reason}"))
-        };
         if checkpoint.turns.len() > 1 + HISTORY_RECENT_TURNS {
-            return Err(invalid("too many turns"));
+            return Err(izwi_core::Error::InvalidInput(
+                "Invalid speech chunk history: too many turns".into(),
+            ));
         }
         let mut history = Self::default();
         for turn in &checkpoint.turns {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(&turn.codes)
-                .map_err(|_| invalid("codes are not base64"))?;
-            if turn.codebooks == 0 || bytes.is_empty() || bytes.len() % (2 * turn.codebooks) != 0 {
-                return Err(invalid("codes do not fill whole frames"));
-            }
-            let frames = bytes.len() / 2 / turn.codebooks;
-            let codes = bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|pair| u32::from(u16::from_le_bytes(*pair)))
-                .collect::<Vec<_>>();
-            history.push(SpeechChunkTurn {
-                text: turn.text.clone(),
-                codes: SpeechFrameCodes::new(
-                    codes.chunks_exact(frames).map(<[u32]>::to_vec).collect(),
-                ),
-            });
+            history.push(decode_chunk_turn(turn)?);
         }
         Ok(history)
     }
+}
+
+/// A chunk's text and codes as a checkpoint (or a take's record) stores
+/// them: the codes `[codebooks][frames]` flattened codebook by codebook as
+/// little-endian u16 (every code is below 4,096), base64.
+pub(crate) fn encode_chunk_turn(
+    turn: &SpeechChunkTurn,
+) -> Result<SpeechChunkTurnCheckpoint, izwi_core::Error> {
+    use base64::Engine;
+    let mut bytes = Vec::with_capacity(turn.codes.frames() * turn.codes.codebooks.len() * 2);
+    for code in turn.codes.codebooks.iter().flatten() {
+        let code = u16::try_from(*code).map_err(|_| {
+            izwi_core::Error::InferenceError(format!(
+                "Speech chunk code {code} does not fit its checkpoint"
+            ))
+        })?;
+        bytes.extend_from_slice(&code.to_le_bytes());
+    }
+    Ok(SpeechChunkTurnCheckpoint {
+        text: turn.text.clone(),
+        codebooks: turn.codes.codebooks.len(),
+        codes: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+}
+
+/// A stored chunk's text and codes, checked: whole frames, at least one.
+pub(crate) fn decode_chunk_turn(
+    turn: &SpeechChunkTurnCheckpoint,
+) -> Result<SpeechChunkTurn, izwi_core::Error> {
+    use base64::Engine;
+    let invalid = |reason: &str| {
+        izwi_core::Error::InvalidInput(format!("Invalid speech chunk history: {reason}"))
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&turn.codes)
+        .map_err(|_| invalid("codes are not base64"))?;
+    if turn.codebooks == 0 || bytes.is_empty() || bytes.len() % (2 * turn.codebooks) != 0 {
+        return Err(invalid("codes do not fill whole frames"));
+    }
+    let frames = bytes.len() / 2 / turn.codebooks;
+    let codes = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u32::from(u16::from_le_bytes(*pair)))
+        .collect::<Vec<_>>();
+    Ok(SpeechChunkTurn {
+        text: turn.text.clone(),
+        codes: SpeechFrameCodes::new(codes.chunks_exact(frames).map(<[u32]>::to_vec).collect()),
+    })
 }
 
 fn should_enable_chunking(variant: ModelVariant, requested_max_tokens: usize) -> bool {
@@ -1039,17 +1053,25 @@ pub(crate) async fn generate_speech_plan_stream(
     output: tokio::sync::mpsc::Sender<izwi_core::AudioChunk>,
     workload: izwi_core::WorkloadClass,
 ) -> Result<(), izwi_core::Error> {
-    generate_speech_plan_stream_with_progress(state, variant, base, output, workload, None).await
+    generate_speech_plan_stream_with_progress(state, variant, base, output, workload, None)
+        .await
+        .map(|_| ())
 }
 
+/// Speaks `base.text` by `variant`'s plan, sending the audio to `output`.
+///
+/// A chunk session (Fish Audio Drama 3) starts its history from
+/// `base.chunk_history`, the chunks of the takes it continues (oldest
+/// first), unless a recovered checkpoint already holds it, and returns the
+/// chunks its own take keeps ([`SpeechTake`]); any other plan returns none.
 pub(crate) async fn generate_speech_plan_stream_with_progress(
     state: &crate::state::AppState,
     variant: ModelVariant,
-    base: GenerationRequest,
+    mut base: GenerationRequest,
     output: tokio::sync::mpsc::Sender<izwi_core::AudioChunk>,
     workload: izwi_core::WorkloadClass,
     mut progress: Option<&mut crate::api::speech_history::DurableSpeechProgress>,
-) -> Result<(), izwi_core::Error> {
+) -> Result<Option<SpeechTake>, izwi_core::Error> {
     use izwi_core::{AudioChunk, ChunkStats};
     let progress_error = |error: anyhow::Error| izwi_core::Error::InferenceError(error.to_string());
     let expected_fingerprint = state
@@ -1097,11 +1119,32 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
     // Resume only its suffix, never replay the already committed prefix.
     let mut ranges = plan.queue(&base.text, completed)?;
     // A chunk session's earlier chunks, as a recovered plan last recorded
-    // them.
+    // them, else those of the takes it continues, pushed as if they were
+    // its own earlier chunks: the first stays pinned, the latest follows.
+    let previous_turns = std::mem::take(&mut base.chunk_history);
     let mut history = if plan.is_chunk_session() {
         Some(match progress.as_deref().and_then(|p| p.chunk_history()) {
             Some(checkpoint) => SpeechChunkHistory::from_checkpoint(checkpoint)?,
-            None => SpeechChunkHistory::default(),
+            None => {
+                let mut history = SpeechChunkHistory::default();
+                for turn in previous_turns {
+                    history.push(turn);
+                }
+                history
+            }
+        })
+    } else if previous_turns.is_empty() {
+        None
+    } else {
+        return Err(izwi_core::Error::InvalidInput(format!(
+            "{variant} does not continue earlier takes"
+        )));
+    };
+    // The chunks this take keeps for its record.
+    let mut take = if plan.is_chunk_session() {
+        Some(match progress.as_deref().and_then(|p| p.take()) {
+            Some(stored) => SpeechTake::from_stored(stored)?,
+            None => SpeechTake::default(),
         })
     } else {
         None
@@ -1272,10 +1315,17 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
                     "Speech chunk completed without its generated codes".into(),
                 )
             })?;
-            history.push(SpeechChunkTurn {
+            let turn = SpeechChunkTurn {
                 text: planned.text,
                 codes: Arc::unwrap_or_clone(codes),
-            });
+            };
+            if let Some(take) = take.as_mut() {
+                take.push(turn.clone());
+                if let Some(progress) = progress.as_deref_mut() {
+                    progress.record_take(take.to_stored()?);
+                }
+            }
+            history.push(turn);
             if let Some(progress) = progress.as_deref_mut() {
                 progress.record_chunk_history(history.to_checkpoint()?);
             }
@@ -1311,7 +1361,8 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
     output
         .send(terminal)
         .await
-        .map_err(|_| izwi_core::Error::InferenceError("Speech consumer disconnected".into()))
+        .map_err(|_| izwi_core::Error::InferenceError("Speech consumer disconnected".into()))?;
+    Ok(take)
 }
 
 /// Send one published chunk under the next output sequence.

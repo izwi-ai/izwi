@@ -91,6 +91,7 @@ fn durable_text_tts_acceptance(
             audio_mime_type: "audio/wav".to_string(),
             audio_filename: Some("speech.wav".to_string()),
             audio_bytes: Vec::new(),
+            take: Default::default(),
         },
         request_json: json!({
             "tenant_key": null,

@@ -207,6 +207,13 @@ pub struct CreateSpeechHistoryRecordRequest {
     /// lines as its text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script: Option<Vec<crate::api::speech_dialogue::SpeechScriptLine>>,
+    /// Earlier takes this one continues (Fish Audio Drama 3 take editing):
+    /// records of this route, oldest first, at most two. The prompt holds
+    /// their kept chunks as completed turns before the text, and the new
+    /// record's `parent_take_id` is the last. Absent from stored requests
+    /// without them, so their idempotency digests are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous_take_ids: Vec<String>,
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
@@ -870,6 +877,7 @@ async fn create_record(
     let variant = parse_tts_model_variant(model_id.as_str())
         .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {err}")))?;
     crate::api::speech_dialogue::check_dialogue_request(variant, speech_dialogue(&req))?;
+    crate::api::speech_takes::check_previous_take_ids(variant, &req.previous_take_ids)?;
 
     if variant.plans_own_speech_segments() {
         crate::api::tts_long_form::SpeechTextPlan::for_variant(
@@ -880,6 +888,19 @@ async fn create_record(
         .map_err(core_api_error)?;
     }
     validate_reference_voice_selection(&req)?;
+    // The takes it continues, read now so a missing or unusable one is
+    // refused before anything is queued or loaded; the stage reads them
+    // again.
+    let previous_codes_sha256 = crate::api::speech_takes::load_previous_takes(
+        &state,
+        route_kind,
+        variant,
+        &req.previous_take_ids,
+    )
+    .await?
+    .into_iter()
+    .map(|take| take.codes_sha256)
+    .collect::<Vec<_>>();
     if route_kind == SpeechRouteKind::TextToSpeech
         && idempotency_key.is_some()
         && req.stream.unwrap_or(false)
@@ -910,6 +931,7 @@ async fn create_record(
                 model_id,
                 input_text,
                 idempotency_key,
+                &previous_codes_sha256,
             )
             .await;
         }
@@ -929,6 +951,7 @@ async fn create_record(
                     &snapshot,
                     req.reference_audio.as_deref(),
                     &req.references,
+                    &previous_codes_sha256,
                 )?;
                 match begin_durable_idempotency(
                     &state.batch_runtime_store,
@@ -1051,6 +1074,7 @@ async fn create_record(
     Ok(response)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_durable_text_tts_record(
     state: &AppState,
     ctx: &RequestContext,
@@ -1059,6 +1083,7 @@ async fn accept_durable_text_tts_record(
     model_id: String,
     input_text: String,
     idempotency_key: Option<String>,
+    previous_codes_sha256: &[String],
 ) -> Result<Response, ApiError> {
     if input_text.len() > MAX_DURABLE_TTS_TEXT_BYTES {
         return Err(ApiError::payload_too_large(format!(
@@ -1081,7 +1106,8 @@ async fn accept_durable_text_tts_record(
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
     let reservation = if let Some(idempotency_key) = idempotency_key {
-        let request_digest = durable_tts_request_digest(&request_snapshot, None, &[])?;
+        let request_digest =
+            durable_tts_request_digest(&request_snapshot, None, &[], previous_codes_sha256)?;
         match begin_durable_idempotency(
             &state.batch_runtime_store,
             DurableIdempotencyRequest {
@@ -1139,6 +1165,7 @@ async fn accept_durable_text_tts_record(
         audio_mime_type: AudioEncoder::content_type(AudioFormat::Wav).to_string(),
         audio_filename: Some(default_audio_filename(route_kind, "wav")),
         audio_bytes: Vec::new(),
+        take: record_take_inputs(&model_id, &req),
     };
     let model_snapshot_json = serde_json::json!({
         "version": 1,
@@ -1220,13 +1247,15 @@ fn normalize_durable_text_tts_request(req: &mut CreateSpeechHistoryRecordRequest
 }
 
 /// The keyed request's canonical digest. A reference voice is identified by
-/// its audio payload's hash, and dialogue references by theirs in order; a
-/// text-only digest has no reference field, so keys stored before reference
-/// voices could be keyed still replay.
+/// its audio payload's hash, dialogue references by theirs in order, and
+/// the takes it continues by their stored codes' hashes in order; a
+/// text-only digest has none of these fields, so keys stored before they
+/// could be keyed still replay.
 fn durable_tts_request_digest(
     request: &BatchSpeechRequest,
     reference_audio: Option<&str>,
     references: &[crate::api::speech_dialogue::SpeechDialogueReference],
+    previous_codes_sha256: &[String],
 ) -> Result<String, ApiError> {
     let mut semantic_request = serde_json::json!({
         "version": DURABLE_IDEMPOTENCY_DIGEST_VERSION,
@@ -1250,6 +1279,9 @@ fn durable_tts_request_digest(
                 ))
             })
             .collect();
+    }
+    if !previous_codes_sha256.is_empty() {
+        semantic_request["previous_takes_codes_sha256"] = previous_codes_sha256.into();
     }
     canonical_request_digest(&semantic_request).map_err(|err| {
         ApiError::payload_too_large(format!(
@@ -1287,9 +1319,20 @@ async fn create_pending_record(
             audio_mime_type: AudioEncoder::content_type(AudioFormat::Wav).to_string(),
             audio_filename: Some(default_audio_filename(route_kind, "wav")),
             audio_bytes: Vec::new(),
+            take: record_take_inputs(model_id, req),
         })
         .await
         .map_err(map_store_error)
+}
+
+/// What a new record of `model_id` keeps of `req` for take editing.
+fn record_take_inputs(
+    model_id: &str,
+    req: &CreateSpeechHistoryRecordRequest,
+) -> crate::speech_history_store::SpeechTakeInputs {
+    parse_tts_model_variant(model_id)
+        .map(|variant| crate::api::speech_takes::take_inputs(variant, req))
+        .unwrap_or_default()
 }
 
 /// One reference's audio as a durable input: a saved voice's stored audio
@@ -2134,6 +2177,7 @@ async fn synthesize_record_internal(
             audio_filename: Some(default_audio_filename(route_kind, "wav")),
             audio_bytes: encoded_audio,
             preexisting_audio_storage_path: None,
+            generated_codes_json: None,
         };
         let output_artifact = match batch_publication {
             Some(claimed) => {
@@ -2204,6 +2248,7 @@ async fn synthesize_record_internal(
             audio_mime_type: AudioEncoder::content_type(AudioFormat::Wav).to_string(),
             audio_filename: Some(default_audio_filename(route_kind, "wav")),
             audio_bytes: encoded_audio,
+            take: Default::default(),
         })
         .await
         .map_err(map_store_error)
@@ -2663,6 +2708,7 @@ async fn stream_record_creation(
                                 audio_filename: Some(default_audio_filename(route_kind, "wav")),
                                 audio_bytes: wav_bytes.bytes,
                                 preexisting_audio_storage_path: None,
+                                generated_codes_json: None,
                             },
                         )
                         .await;
@@ -2762,6 +2808,9 @@ fn normalize_create_request(
     req.reference_language = normalize_optional_trimmed(req.reference_language);
     req.saved_voice_id = normalize_optional_trimmed(req.saved_voice_id);
     crate::api::speech_dialogue::normalize_references(&mut req.references);
+    for id in &mut req.previous_take_ids {
+        *id = id.trim().to_string();
+    }
     req
 }
 
@@ -3339,6 +3388,7 @@ mod tests {
             saved_voice_id: None,
             references: Vec::new(),
             script: None,
+            previous_take_ids: Vec::new(),
             temperature: None,
             speed: None,
             max_tokens: None,
@@ -3422,22 +3472,23 @@ mod tests {
         equivalent.tenant_key = Some([2; 32]);
 
         assert_eq!(
-            durable_tts_request_digest(&first, None, &[]).unwrap(),
-            durable_tts_request_digest(&equivalent, None, &[]).unwrap()
+            durable_tts_request_digest(&first, None, &[], &[]).unwrap(),
+            durable_tts_request_digest(&equivalent, None, &[], &[]).unwrap()
         );
 
         // A reference voice is part of the request; its payload identifies it.
-        let with_reference = durable_tts_request_digest(&first, Some("UklGRg=="), &[]).unwrap();
+        let with_reference =
+            durable_tts_request_digest(&first, Some("UklGRg=="), &[], &[]).unwrap();
         assert_ne!(
-            durable_tts_request_digest(&first, None, &[]).unwrap(),
+            durable_tts_request_digest(&first, None, &[], &[]).unwrap(),
             with_reference
         );
         assert_eq!(
-            durable_tts_request_digest(&equivalent, Some(" UklGRg== "), &[]).unwrap(),
+            durable_tts_request_digest(&equivalent, Some(" UklGRg== "), &[], &[]).unwrap(),
             with_reference
         );
         assert_ne!(
-            durable_tts_request_digest(&first, Some("UklGRh=="), &[]).unwrap(),
+            durable_tts_request_digest(&first, Some("UklGRh=="), &[], &[]).unwrap(),
             with_reference
         );
 
@@ -3449,26 +3500,44 @@ mod tests {
             saved_voice_id: None,
         };
         let two = [reference("UklGRg=="), reference("UklGRh==")];
-        let dialogue = durable_tts_request_digest(&first, None, &two).unwrap();
+        let dialogue = durable_tts_request_digest(&first, None, &two, &[]).unwrap();
         assert_ne!(
             dialogue,
-            durable_tts_request_digest(&first, None, &[]).unwrap()
+            durable_tts_request_digest(&first, None, &[], &[]).unwrap()
         );
         assert_ne!(dialogue, with_reference);
         assert_eq!(
-            durable_tts_request_digest(&equivalent, None, &two).unwrap(),
+            durable_tts_request_digest(&equivalent, None, &two, &[]).unwrap(),
             dialogue
         );
         let swapped = [reference("UklGRh=="), reference("UklGRg==")];
         assert_ne!(
-            durable_tts_request_digest(&first, None, &swapped).unwrap(),
+            durable_tts_request_digest(&first, None, &swapped, &[]).unwrap(),
             dialogue
+        );
+
+        // The takes a request continues are identified by their stored
+        // codes, in order; a request without them digests as before.
+        let takes = ["a".to_string(), "b".to_string()];
+        let continued = durable_tts_request_digest(&first, None, &[], &takes).unwrap();
+        assert_ne!(
+            continued,
+            durable_tts_request_digest(&first, None, &[], &[]).unwrap()
+        );
+        assert_eq!(
+            durable_tts_request_digest(&equivalent, None, &[], &takes).unwrap(),
+            continued
+        );
+        let reordered = ["b".to_string(), "a".to_string()];
+        assert_ne!(
+            durable_tts_request_digest(&first, None, &[], &reordered).unwrap(),
+            continued
         );
 
         equivalent.input_text = "Different".into();
         assert_ne!(
-            durable_tts_request_digest(&first, None, &[]).unwrap(),
-            durable_tts_request_digest(&equivalent, None, &[]).unwrap()
+            durable_tts_request_digest(&first, None, &[], &[]).unwrap(),
+            durable_tts_request_digest(&equivalent, None, &[], &[]).unwrap()
         );
     }
 

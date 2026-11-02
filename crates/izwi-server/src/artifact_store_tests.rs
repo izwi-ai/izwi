@@ -661,6 +661,7 @@ async fn speech_final_file_settlement_commits_history_stage_job_and_reservation(
                 progress: serde_json::json!({
                     "final_audio_published": true,
                 }),
+                generated_codes_json: None,
             },
         )
         .await
@@ -801,6 +802,7 @@ async fn speech_final_file_settlement_fences_cancelled_attempt_and_keeps_object_
                 progress: serde_json::json!({
                     "final_audio_published": true,
                 }),
+                generated_codes_json: None,
             },
         )
         .await;
@@ -902,6 +904,7 @@ async fn speech_final_file_settlement_fences_expired_attempt_and_keeps_object_re
                 progress: serde_json::json!({
                     "final_audio_published": true,
                 }),
+                generated_codes_json: None,
             },
         )
         .await;
@@ -1008,6 +1011,7 @@ async fn speech_final_file_settlement_recovers_after_provider_write_failure() {
                     "sample_count": 800,
                 }),
                 progress: serde_json::json!({"final_audio_published": true}),
+                generated_codes_json: None,
             },
         )
         .await;
@@ -1403,6 +1407,7 @@ async fn speech_final_file_settlement_replacement_settles_after_stale_attempt_lo
                     "sample_count": 1600,
                 }),
                 progress: serde_json::json!({"final_audio_published": true}),
+                generated_codes_json: None,
             },
         )
         .await
