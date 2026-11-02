@@ -38,6 +38,7 @@ import {
   type DialogueScene,
 } from "@/features/text-to-speech/dialogue";
 import { savedVoiceLabel } from "@/features/text-to-speech/support";
+import type { TakeDraft } from "@/features/text-to-speech/take";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
@@ -63,9 +64,9 @@ interface NewTextToSpeechModalProps {
   isModelManagerOpen?: boolean;
   initialSavedVoiceId?: string | null;
   initialSpeaker?: string | null;
-  /** Opens the dialog on the dialogue editor with these rows (a take's,
-   * parsed back). */
-  initialDialogue?: DialogueScene | null;
+  /** A take to start from: its lines, voices and seed. With `editsTakeId`,
+   * new takes continue from it while its model is selected. */
+  initialTake?: TakeDraft | null;
   onLoadSelectedModel?: (variant: string) => Promise<void> | void;
   onUnloadSelectedModel?: (variant: string) => Promise<void> | void;
   onOpenModelManager: () => void;
@@ -149,7 +150,7 @@ export function NewTextToSpeechModal({
   isModelManagerOpen = false,
   initialSavedVoiceId = null,
   initialSpeaker = null,
-  initialDialogue = null,
+  initialTake = null,
   onLoadSelectedModel,
   onUnloadSelectedModel,
   onOpenModelManager,
@@ -157,9 +158,11 @@ export function NewTextToSpeechModal({
   onCreated,
   onCreateStream,
 }: NewTextToSpeechModalProps) {
-  const [text, setText] = useState("");
+  const [text, setText] = useState(initialTake?.text ?? "");
   const [speaker, setSpeaker] = useState(initialSpeaker || "Vivian");
-  const [savedVoiceId, setSavedVoiceId] = useState(initialSavedVoiceId || "");
+  const [savedVoiceId, setSavedVoiceId] = useState(
+    (initialTake ? initialTake.savedVoiceId : initialSavedVoiceId) || "",
+  );
   const [voiceDescription, setVoiceDescription] = useState("");
   const [speed, setSpeed] = useState(1);
   const [language, setLanguage] = useState<string | null>(null);
@@ -176,10 +179,10 @@ export function NewTextToSpeechModal({
   const [savedVoicesLoading, setSavedVoicesLoading] = useState(false);
   const [savedVoicesError, setSavedVoicesError] = useState<string | null>(null);
   const [mode, setMode] = useState<SpeechMode>(
-    initialDialogue ? "dialogue" : "single",
+    initialTake?.dialogue ? "dialogue" : "single",
   );
   const [scene, setScene] = useState<DialogueScene>(
-    () => initialDialogue ?? newDialogueScene(null),
+    () => initialTake?.dialogue ?? newDialogueScene(null),
   );
   const [seed, setSeed] = useState("");
   // The latest line preview, replayed while its request is unchanged.
@@ -204,6 +207,17 @@ export function NewTextToSpeechModal({
   const seededVoice = capabilities?.supports_seeded_voice ?? false;
   const limits = useMemo(() => dialogueLimits(capabilities), [capabilities]);
   const dialogueMode = mode === "dialogue" && limits !== null;
+  // The take being edited: new takes continue from it while its model is
+  // the selected one.
+  const editsTakeId =
+    initialTake?.editsTakeId && selectedModel === initialTake.modelId
+      ? initialTake.editsTakeId
+      : null;
+  // What of the take could not come back, in the form it opened in.
+  const takeNote =
+    initialTake?.note && dialogueMode === Boolean(initialTake.dialogue)
+      ? initialTake.note
+      : null;
   const scopedTags =
     selectedModel && isFishDrama3Variant(selectedModel)
       ? FISH_DRAMA3_SCOPED_TAGS
@@ -321,9 +335,11 @@ export function NewTextToSpeechModal({
   }, [speaker, speakerOptions, usesBuiltInVoiceSelection]);
 
   const resetModalState = useCallback(() => {
-    setText("");
+    setText(initialTake?.text ?? "");
     setSpeaker(initialSpeaker || "Vivian");
-    setSavedVoiceId(initialSavedVoiceId || "");
+    setSavedVoiceId(
+      (initialTake ? initialTake.savedVoiceId : initialSavedVoiceId) || "",
+    );
     setVoiceDescription("");
     setLanguage(null);
     setControlValues({});
@@ -334,14 +350,14 @@ export function NewTextToSpeechModal({
     setSavedVoices([]);
     setSavedVoicesLoading(false);
     setSavedVoicesError(null);
-    setMode(initialDialogue ? "dialogue" : "single");
-    setScene(initialDialogue ?? newDialogueScene(limits));
-    setSeed(String(randomSeed()));
+    setMode(initialTake?.dialogue ? "dialogue" : "single");
+    setScene(initialTake?.dialogue ?? newDialogueScene(limits));
+    setSeed(initialTake?.seed ?? String(randomSeed()));
     previewRunRef.current += 1;
     setPreviewingLineId(null);
     setLinePreview(null);
     stopLinePreview();
-  }, [initialDialogue, initialSavedVoiceId, initialSpeaker, limits, stopLinePreview]);
+  }, [initialTake, initialSavedVoiceId, initialSpeaker, limits, stopLinePreview]);
 
   // A replaced or abandoned preview frees its audio.
   useEffect(() => {
@@ -485,10 +501,12 @@ export function NewTextToSpeechModal({
           supportsSpeed && Math.abs(speed - 1) > 0.001 ? speed : undefined,
         ...changedSpeechControls(speechControls, controlValues),
         seed: parsedSeed.seed,
+        previous_take_ids: editsTakeId ? [editsTakeId] : undefined,
       },
     };
   }, [
     controlValues,
+    editsTakeId,
     offersLanguage,
     resolvedLanguage,
     seed,
@@ -724,6 +742,15 @@ export function NewTextToSpeechModal({
             ? "Unload model"
             : "Load model";
 
+  const takeNoteElement = takeNote ? (
+    <p
+      role="note"
+      className="rounded-[10px] border border-(--border-subtle) bg-(--surface-panel) px-3 py-2 text-[12.5px] leading-5 text-(--text-muted)"
+    >
+      {takeNote}
+    </p>
+  ) : null;
+
   return (
     <CreationDialog
       open={isOpen}
@@ -731,8 +758,12 @@ export function NewTextToSpeechModal({
       modal={!isModelManagerOpen}
       blockDismiss={isModelManagerOpen}
       className="max-w-208"
-      title="New text-to-speech job"
-      description="Create a generation job and open it on its own record page immediately."
+      title={editsTakeId ? "Edit take" : "New text-to-speech job"}
+      description={
+        editsTakeId
+          ? "Editing a take: the new take continues from it."
+          : "Create a generation job and open it on its own record page immediately."
+      }
       header={
         limits ? (
           <div className="mt-3">
@@ -763,23 +794,26 @@ export function NewTextToSpeechModal({
         <CreationBody
           main={
             dialogueMode && limits ? (
-              <DialogueEditor
-                scene={scene}
-                onChange={setScene}
-                limits={limits}
-                savedVoices={savedVoices}
-                savedVoicesLoading={savedVoicesLoading}
-                savedVoicesError={savedVoicesError}
-                pointTags={inlineTags}
-                scopedTags={scopedTags}
-                disabled={isSubmitting}
-                previewingLineId={previewingLineId}
-                playingLineId={linePreviewAudio.playingId}
-                onPreviewLine={(line) => void previewLine(line)}
-                restored={Boolean(initialDialogue)}
-              />
+              <>
+                {takeNoteElement}
+                <DialogueEditor
+                  scene={scene}
+                  onChange={setScene}
+                  limits={limits}
+                  savedVoices={savedVoices}
+                  savedVoicesLoading={savedVoicesLoading}
+                  savedVoicesError={savedVoicesError}
+                  pointTags={inlineTags}
+                  scopedTags={scopedTags}
+                  disabled={isSubmitting}
+                  previewingLineId={previewingLineId}
+                  playingLineId={linePreviewAudio.playingId}
+                  onPreviewLine={(line) => void previewLine(line)}
+                />
+              </>
             ) : (
               <>
+                {takeNoteElement}
                 <textarea
                   ref={scriptRef}
                   aria-label="Script"

@@ -49,8 +49,6 @@ interface DialogueEditorProps {
   /** The line whose preview is playing. */
   playingLineId: string | null;
   onPreviewLine: (line: DialogueLine) => void;
-  /** Rows parsed back from a take: its voices were not stored with it. */
-  restored?: boolean;
 }
 
 /**
@@ -70,7 +68,6 @@ export function DialogueEditor({
   previewingLineId,
   playingLineId,
   onPreviewLine,
-  restored = false,
 }: DialogueEditorProps) {
   const baseId = useId();
   const textareas = useRef(new Map<string, HTMLTextAreaElement>());
@@ -128,16 +125,6 @@ export function DialogueEditor({
 
   return (
     <div className="flex flex-col gap-5">
-      {restored ? (
-        <p
-          role="note"
-          className="rounded-[10px] border border-(--border-subtle) bg-(--surface-panel) px-3 py-2 text-[12.5px] leading-5 text-(--text-muted)"
-        >
-          These lines come from a take. A take keeps no voices or seed, so
-          every speaker starts in a seeded voice: pick their voices again.
-        </p>
-      ) : null}
-
       <section
         aria-labelledby={`${baseId}-speakers`}
         className="flex flex-col gap-2"

@@ -252,6 +252,24 @@ function deferredPromise<T>() {
   return { promise, resolve, reject };
 }
 
+/** Opens the record page's header menu; its items. */
+async function openRecordMenu() {
+  const recordMenu = await screen.findByRole("button", {
+    name: /^More actions for /,
+  });
+  fireEvent.pointerDown(recordMenu, { button: 0, ctrlKey: false });
+  fireEvent.click(recordMenu);
+  return screen.findByRole("menu");
+}
+
+/** Chooses Open in dialogue editor from the record page's header menu. */
+async function openInDialogueEditor() {
+  const menu = await openRecordMenu();
+  fireEvent.click(
+    within(menu).getByRole("menuitem", { name: "Open in dialogue editor" }),
+  );
+}
+
 describe("TextToSpeechPage", () => {
   beforeEach(() => {
     vi.stubGlobal("AudioContext", class {
@@ -1430,9 +1448,7 @@ describe("TextToSpeechPage", () => {
       const onSelect = vi.fn();
       renderRoute("/text-to-speech/scene-1", { models: [drama3], onSelect });
 
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Open in dialogue editor" }),
-      );
+      await openInDialogueEditor();
 
       const dialog = await screen.findByRole("dialog", {
         name: "New text-to-speech job",
@@ -1462,9 +1478,7 @@ describe("TextToSpeechPage", () => {
 
       // Closed and opened again, it reads the take afresh.
       fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Open in dialogue editor" }),
-      );
+      await openInDialogueEditor();
       expect(
         await screen.findByRole("textbox", { name: "Line 1 text" }),
       ).toHaveValue("Ready when you are.");
@@ -1474,9 +1488,7 @@ describe("TextToSpeechPage", () => {
       apiMocks.getTextToSpeechRecord.mockResolvedValue(dialogueRecord);
       const onSelect = vi.fn();
       renderRoute("/text-to-speech/scene-1", { models: [drama3], onSelect });
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Open in dialogue editor" }),
-      );
+      await openInDialogueEditor();
       expect(onSelect).toHaveBeenCalledWith("FishAudio-Drama-3");
     });
 
@@ -1493,8 +1505,14 @@ describe("TextToSpeechPage", () => {
       expect(
         await screen.findByRole("button", { name: /Copy text/ }),
       ).toBeInTheDocument();
+      let menu = await openRecordMenu();
       expect(
-        screen.queryByRole("button", { name: "Open in dialogue editor" }),
+        within(menu).getByRole("menuitem", { name: /^Delete$/ }),
+      ).toBeInTheDocument();
+      expect(
+        within(menu).queryByRole("menuitem", {
+          name: "Open in dialogue editor",
+        }),
       ).toBeNull();
       view.unmount();
 
@@ -1508,9 +1526,231 @@ describe("TextToSpeechPage", () => {
       expect(
         await screen.findByRole("button", { name: /Copy text/ }),
       ).toBeInTheDocument();
+      menu = await openRecordMenu();
       expect(
-        screen.queryByRole("button", { name: "Open in dialogue editor" }),
+        within(menu).getByRole("menuitem", { name: /^Delete$/ }),
+      ).toBeInTheDocument();
+      expect(
+        within(menu).queryByRole("menuitem", {
+          name: "Open in dialogue editor",
+        }),
       ).toBeNull();
+    });
+
+    describe("take editing", () => {
+      const editableScene = buildRecord({
+        ...dialogueRecord,
+        editable: true,
+        references: [
+          { speaker: 0, saved_voice_id: "voice-anna" },
+          { speaker: 2 },
+        ],
+        seed: 77,
+      });
+
+      beforeEach(() => {
+        apiMocks.listSavedVoices.mockResolvedValue([
+          buildSavedVoice("voice-anna", "Anna"),
+          buildSavedVoice("voice-ben", "Ben"),
+        ]);
+      });
+
+      it("offers Edit this take only for a take the server marks editable", async () => {
+        for (const take of [
+          dialogueRecord,
+          { ...dialogueRecord, editable: false },
+          { ...dialogueRecord, processing_status: "pending" },
+          buildRecord({ id: "kokoro", model_id: "Kokoro-82M", processing_status: "ready" }),
+        ]) {
+          apiMocks.getTextToSpeechRecord.mockResolvedValue(take);
+          const view = renderRoute(`/text-to-speech/${take.id}`, {
+            models: [drama3],
+          });
+          expect(await screen.findByTitle("Model")).toBeInTheDocument();
+          expect(
+            screen.queryByRole("button", { name: "Edit this take" }),
+          ).toBeNull();
+          view.unmount();
+        }
+
+        apiMocks.getTextToSpeechRecord.mockResolvedValue(editableScene);
+        renderRoute("/text-to-speech/scene-1", { models: [drama3] });
+        expect(
+          await screen.findByRole("button", { name: "Edit this take" }),
+        ).toBeInTheDocument();
+      });
+
+      it("edits a dialogue take: its lines, voices and seed, continuing from it", async () => {
+        selectModel("FishAudio-Drama-3", drama3);
+        apiMocks.getTextToSpeechRecord.mockResolvedValue(editableScene);
+        renderRoute("/text-to-speech/scene-1", { models: [drama3] });
+
+        fireEvent.click(
+          await screen.findByRole("button", { name: "Edit this take" }),
+        );
+        const dialog = await screen.findByRole("dialog", { name: "Edit take" });
+        expect(dialog).toHaveTextContent(
+          "Editing a take: the new take continues from it.",
+        );
+        expect(
+          within(dialog).getByRole("radio", { name: "Dialogue" }),
+        ).toHaveAttribute("aria-checked", "true");
+        const speaker0 = within(dialog).getByRole("combobox", {
+          name: "Speaker 0 voice",
+        });
+        await waitFor(() => expect(speaker0).toHaveTextContent("Anna (Saved)"));
+        // Speaker 2 spoke in a clip, which the take does not keep.
+        expect(
+          within(dialog).getByRole("combobox", { name: "Speaker 2 voice" }),
+        ).toHaveTextContent("Seeded voice");
+        expect(within(dialog).getByRole("note")).toHaveTextContent(
+          "Speaker 2 spoke in a reference clip, which takes do not keep, so they start in a seeded voice.",
+        );
+        expect(within(dialog).getByLabelText("Seed")).toHaveValue("77");
+
+        fireEvent.click(
+          within(dialog).getByRole("button", { name: /Generate scene/ }),
+        );
+        await waitFor(() =>
+          expect(apiMocks.createTextToSpeechRecordStream).toHaveBeenCalledTimes(1),
+        );
+        expect(apiMocks.createTextToSpeechRecordStream.mock.calls[0][0]).toEqual({
+          model_id: "FishAudio-Drama-3",
+          script: [
+            { speaker: 0, text: "Ready when you are." },
+            { speaker: 2, text: "Always. [laughs] Let's go." },
+          ],
+          references: [{ speaker: 0, saved_voice_id: "voice-anna" }],
+          seed: 77,
+          previous_take_ids: ["scene-1"],
+        });
+      });
+
+      it("edits a single-voice take in the single-voice form", async () => {
+        selectModel("FishAudio-Drama-3", drama3);
+        apiMocks.getTextToSpeechRecord.mockResolvedValue(
+          buildRecord({
+            id: "plain",
+            model_id: "FishAudio-Drama-3",
+            speaker: null,
+            processing_status: "ready",
+            input_text: "Just one voice.",
+            editable: true,
+            references: [{ speaker: 0, saved_voice_id: "voice-ben" }],
+            seed: 5,
+          }),
+        );
+        renderRoute("/text-to-speech/plain", { models: [drama3] });
+
+        fireEvent.click(
+          await screen.findByRole("button", { name: "Edit this take" }),
+        );
+        const dialog = await screen.findByRole("dialog", { name: "Edit take" });
+        expect(
+          within(dialog).getByRole("radio", { name: "Single voice" }),
+        ).toHaveAttribute("aria-checked", "true");
+        expect(
+          within(dialog).getByRole("textbox", { name: "Script" }),
+        ).toHaveValue("Just one voice.");
+        await waitFor(() =>
+          expect(
+            within(dialog).getByRole("combobox", { name: "Saved voice" }),
+          ).toHaveTextContent("Ben (Saved)"),
+        );
+        expect(within(dialog).getByLabelText("Seed")).toHaveValue("5");
+        expect(within(dialog).queryByRole("note")).toBeNull();
+
+        fireEvent.click(
+          within(dialog).getByRole("button", { name: /Create generation/ }),
+        );
+        await waitFor(() =>
+          expect(apiMocks.createTextToSpeechRecordStream).toHaveBeenCalledTimes(1),
+        );
+        expect(apiMocks.createTextToSpeechRecordStream.mock.calls[0][0]).toEqual({
+          model_id: "FishAudio-Drama-3",
+          text: "Just one voice.",
+          saved_voice_id: "voice-ben",
+          seed: 5,
+          previous_take_ids: ["plain"],
+        });
+      });
+
+      it("restores a take's voices and seed in the dialogue editor, as a new take", async () => {
+        selectModel("FishAudio-Drama-3", drama3);
+        apiMocks.getTextToSpeechRecord.mockResolvedValue({
+          ...editableScene,
+          references: [
+            { speaker: 0, saved_voice_id: "voice-anna" },
+            { speaker: 2, saved_voice_id: "voice-ben" },
+          ],
+        });
+        renderRoute("/text-to-speech/scene-1", { models: [drama3] });
+
+        await openInDialogueEditor();
+        const dialog = await screen.findByRole("dialog", {
+          name: "New text-to-speech job",
+        });
+        const speaker0 = within(dialog).getByRole("combobox", {
+          name: "Speaker 0 voice",
+        });
+        await waitFor(() => expect(speaker0).toHaveTextContent("Anna (Saved)"));
+        expect(
+          within(dialog).getByRole("combobox", { name: "Speaker 2 voice" }),
+        ).toHaveTextContent("Ben (Saved)");
+        expect(within(dialog).getByLabelText("Seed")).toHaveValue("77");
+        // Everything came back: nothing to say.
+        expect(within(dialog).queryByRole("note")).toBeNull();
+
+        fireEvent.click(
+          within(dialog).getByRole("button", { name: /Generate scene/ }),
+        );
+        await waitFor(() =>
+          expect(apiMocks.createTextToSpeechRecordStream).toHaveBeenCalledTimes(1),
+        );
+        const request = apiMocks.createTextToSpeechRecordStream.mock.calls[0][0];
+        expect(request).toMatchObject({
+          references: [
+            { speaker: 0, saved_voice_id: "voice-anna" },
+            { speaker: 2, saved_voice_id: "voice-ben" },
+          ],
+          seed: 77,
+        });
+        expect(request.previous_take_ids).toBeUndefined();
+      });
+
+      it("links an edited take back to the take it was edited from", async () => {
+        apiMocks.getTextToSpeechRecord.mockImplementation(async (id: string) =>
+          id === "scene-0"
+            ? buildRecord({
+                id: "scene-0",
+                model_id: "FishAudio-Drama-3",
+                processing_status: "ready",
+                input_text: "<|speaker:0|> First try.\n<|speaker:2|> Again.",
+              })
+            : { ...editableScene, parent_take_id: "scene-0" },
+        );
+        renderRoute("/text-to-speech/scene-1", { models: [drama3] });
+
+        // Titled like the parent's page: its words, without speaker tags.
+        const link = await screen.findByRole("link", {
+          name: "First try. Again.",
+        });
+        expect(link).toHaveAttribute("href", "/text-to-speech/scene-0");
+        expect(screen.getByText("Edited from")).toBeInTheDocument();
+      });
+
+      it("says when the take it was edited from is deleted", async () => {
+        apiMocks.getTextToSpeechRecord.mockImplementation(async (id: string) => {
+          if (id === "scene-0") {
+            throw new Error("Speech history record not found");
+          }
+          return { ...editableScene, parent_take_id: "scene-0" };
+        });
+        renderRoute("/text-to-speech/scene-1", { models: [drama3] });
+
+        expect(await screen.findByText("Deleted take")).toBeInTheDocument();
+        expect(screen.queryByRole("link", { name: /Earlier take/ })).toBeNull();
+      });
     });
   });
 });

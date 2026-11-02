@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { api, type ModelInfo, type SavedVoiceSummary } from "@/api";
+import { takeDraft } from "@/features/text-to-speech/take";
 import { NewTextToSpeechModal } from "./NewTextToSpeechModal";
 
 function model(
@@ -331,5 +332,52 @@ describe("NewTextToSpeechModal with Fish Audio Drama 3", () => {
         name: "Preview line 1",
       }),
     ).toBeEnabled();
+  });
+
+  it("continues from the take it edits only while the take's model is selected", () => {
+    const take = takeDraft(
+      {
+        id: "take-1",
+        model_id: "FishAudio-Drama-3",
+        input_text: "Again, softer.",
+        references: [],
+        seed: 3,
+      },
+      16,
+      true,
+    );
+    const props = {
+      isOpen: true,
+      onClose: vi.fn(),
+      selectedModelReady: true,
+      onOpenModelManager: vi.fn(),
+      onModelRequired: vi.fn(),
+      onCreated: vi.fn(),
+      onCreateStream: vi.fn(),
+      initialTake: take,
+    };
+    const { rerender } = render(
+      <NewTextToSpeechModal
+        {...props}
+        selectedModel={DRAMA3.variant}
+        selectedModelInfo={DRAMA3}
+      />,
+    );
+    expect(screen.getByRole("dialog", { name: "Edit take" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Script" })).toHaveValue(
+      "Again, softer.",
+    );
+
+    // Another model cannot continue a Drama 3 take: a new job instead.
+    rerender(
+      <NewTextToSpeechModal
+        {...props}
+        selectedModel={FISH_S2.variant}
+        selectedModelInfo={FISH_S2}
+      />,
+    );
+    expect(
+      screen.getByRole("dialog", { name: "New text-to-speech job" }),
+    ).toBeInTheDocument();
   });
 });

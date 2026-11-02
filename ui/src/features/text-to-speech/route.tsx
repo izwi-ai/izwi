@@ -37,8 +37,8 @@ import {
 import {
   dialogueLimits,
   parseDialogueText,
-  type DialogueScene,
 } from "@/features/text-to-speech/dialogue";
+import { takeDraft, type TakeDraft } from "@/features/text-to-speech/take";
 
 interface TextToSpeechPageProps {
   models: ModelInfo[];
@@ -74,10 +74,9 @@ export function TextToSpeechPage({
   const autoOpenCreateRef = useRef(false);
   const [isNewTextToSpeechModalOpen, setIsNewTextToSpeechModalOpen] =
     useState(false);
-  // Rows a take reopens the creation dialog's dialogue editor with.
-  const [initialDialogue, setInitialDialogue] = useState<DialogueScene | null>(
-    null,
-  );
+  // The take the creation dialog starts from (Edit this take, Open in
+  // dialogue editor).
+  const [initialTake, setInitialTake] = useState<TakeDraft | null>(null);
   const [streamingRecord, setStreamingRecord] =
     useState<SpeechHistoryRecord | null>(null);
   const [recordActionError, setRecordActionError] = useState<string | null>(
@@ -360,6 +359,8 @@ export function TextToSpeechPage({
         record.tokens_generated ?? streamingRecord.tokens_generated,
       audio_filename: record.audio_filename || streamingRecord.audio_filename,
       audio_mime_type: record.audio_mime_type || streamingRecord.audio_mime_type,
+      // Set once the take is ready, which the stream may say first.
+      editable: streamingRecord.editable ?? record.editable,
     };
   }, [record, recordId, streamingRecord]);
 
@@ -386,17 +387,26 @@ export function TextToSpeechPage({
         : null,
     [visibleRecord, visibleRecordLimits],
   );
-  const openInDialogueEditor = () => {
+  // Opens the creation dialog on the take's lines, voices and seed: to
+  // edit it (new takes continue from it), or as a fresh take.
+  const openTake = (edit: boolean) => {
     const modelId = visibleRecord?.model_id;
-    if (!visibleRecordDialogue || !modelId) {
+    if (!visibleRecord || !modelId) {
       return;
     }
     if (resolvedSelectedModel !== modelId) {
       onSelect(modelId);
     }
-    setInitialDialogue(visibleRecordDialogue);
+    setInitialTake(
+      takeDraft(visibleRecord, visibleRecordLimits?.maxSpeakers ?? null, edit),
+    );
     setIsNewTextToSpeechModalOpen(true);
   };
+
+  // The take this one was edited from, for a link back to it.
+  const parentTakeId = visibleRecord?.parent_take_id ?? null;
+  const { record: parentTake, error: parentTakeError } =
+    useTextToSpeechRecord(parentTakeId);
 
   const visibleVoiceLabel = useMemo(
     () =>
@@ -528,7 +538,20 @@ export function TextToSpeechPage({
             onCancel={() => void handleDetailCancel()}
             onDelete={() => void handleDetailDelete()}
             onOpenInDialogueEditor={
-              visibleRecordDialogue ? openInDialogueEditor : undefined
+              visibleRecordDialogue ? () => openTake(false) : undefined
+            }
+            onEditTake={
+              visibleRecord?.editable === true ? () => openTake(true) : undefined
+            }
+            editedFrom={
+              parentTakeId
+                ? {
+                    to: `/text-to-speech/${parentTakeId}`,
+                    record: parentTake?.id === parentTakeId ? parentTake : null,
+                    // The server no longer has it: it was deleted.
+                    deleted: Boolean(parentTakeError),
+                  }
+                : null
             }
           />
         </>
@@ -600,7 +623,7 @@ export function TextToSpeechPage({
         isOpen={isNewTextToSpeechModalOpen}
         onClose={() => {
           setIsNewTextToSpeechModalOpen(false);
-          setInitialDialogue(null);
+          setInitialTake(null);
         }}
         selectedModel={resolvedSelectedModel}
         selectedModelInfo={selectedModelInfo}
@@ -608,7 +631,7 @@ export function TextToSpeechPage({
         isModelManagerOpen={isModelModalOpen}
         initialSavedVoiceId={searchParams.get("voiceId")}
         initialSpeaker={searchParams.get("speaker")}
-        initialDialogue={initialDialogue}
+        initialTake={initialTake}
         onLoadSelectedModel={(variant) => {
           onLoad(variant);
         }}

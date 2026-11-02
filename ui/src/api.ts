@@ -52,6 +52,7 @@ export type {
   SpeechHistoryRecord,
   SpeechHistoryRecordCreateRequest,
   SpeechDialogueReference,
+  SpeechRecordReference,
   SpeechScriptLine,
   SpeechHistoryRecordStreamCallbacks,
   SpeechHistoryRecordSummary,

@@ -164,8 +164,9 @@ function canonicalSpeaker(digits: string, maxSpeakers: number): number | null {
 /**
  * The lines of a stored dialogue: a record's text as the server renders a
  * script (`<|speaker:N|> text` lines). Null unless the text starts with a
- * speaker tag and every tag is one the model takes. The record keeps no
- * voices or seed, so every speaker comes back in a seeded voice.
+ * speaker tag and every tag is one the model takes. Every speaker comes
+ * back in a seeded voice; `takeDraft` (take.ts) gives back the voices the
+ * record kept.
  */
 export function parseDialogueText(
   text: string,

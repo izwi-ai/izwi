@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Link } from "react-router";
 import {
   AlertTriangle,
   CalendarDays,
@@ -11,6 +12,7 @@ import {
   MessagesSquare,
   Mic,
   OctagonX,
+  PencilLine,
   Trash2,
 } from "lucide-react";
 
@@ -52,6 +54,32 @@ function speechRecordTitle(record: SpeechHistoryRecord | null): string {
     : text;
 }
 
+/** The take a take was edited from: a link titled like its page, or a
+ * plain label once it is deleted. */
+function editedFromValue({
+  to,
+  record,
+  deleted,
+}: {
+  to: string;
+  record: SpeechHistoryRecord | null;
+  deleted: boolean;
+}) {
+  if (deleted) {
+    return <span className="text-(--text-muted)">Deleted take</span>;
+  }
+  const label = record ? speechRecordTitle(record) : "Earlier take";
+  return (
+    <Link
+      to={to}
+      title={label}
+      className="text-(--text-primary) underline decoration-(--border-strong) underline-offset-2 transition-colors hover:decoration-(--text-primary)"
+    >
+      {label}
+    </Link>
+  );
+}
+
 interface TextToSpeechRecordDetailProps {
   record: SpeechHistoryRecord | null;
   audioUrl: string | null;
@@ -65,8 +93,19 @@ interface TextToSpeechRecordDetailProps {
   cancelPending?: boolean;
   onCancel?: () => Promise<void> | void;
   onDelete?: () => Promise<void> | void;
-  /** Opens the take's lines in the dialogue editor; given for a dialogue. */
+  /** Opens the take's lines in the dialogue editor, from the header menu;
+   * given for a dialogue. */
   onOpenInDialogueEditor?: () => void;
+  /** Opens the take to edit: new takes continue from it; given for an
+   * editable take. */
+  onEditTake?: () => void;
+  /** The take this one was edited from: its page, its record once loaded,
+   * and whether it has since been deleted. */
+  editedFrom?: {
+    to: string;
+    record: SpeechHistoryRecord | null;
+    deleted: boolean;
+  } | null;
   /** The list this record belongs to, for the breadcrumb trail. */
   parentCrumb: Breadcrumb;
   /** Route actions for the header menu (Models). */
@@ -86,6 +125,8 @@ export function TextToSpeechRecordDetail({
   onCancel,
   onDelete,
   onOpenInDialogueEditor,
+  onEditTake,
+  editedFrom = null,
   parentCrumb,
   extraMenuItems = [],
 }: TextToSpeechRecordDetailProps) {
@@ -176,7 +217,19 @@ export function TextToSpeechRecordDetail({
           : []),
       ]
     : [];
+  // The header keeps its buttons for a take's main actions; starting a new
+  // scene from this one is in the menu, so the title keeps its room.
   const menuItems: RowMenuItem[] = [
+    ...(onOpenInDialogueEditor
+      ? [
+          {
+            id: "dialogue-editor",
+            label: "Open in dialogue editor",
+            icon: MessagesSquare,
+            onSelect: onOpenInDialogueEditor,
+          },
+        ]
+      : []),
     ...(onCancel && canCancel
       ? [
           {
@@ -212,16 +265,16 @@ export function TextToSpeechRecordDetail({
       menuItems={menuItems}
       actions={
         <>
-          {onOpenInDialogueEditor ? (
+          {onEditTake ? (
             <Button
               type="button"
               variant="outline"
               size="sm"
               className="h-9 gap-2"
-              onClick={onOpenInDialogueEditor}
+              onClick={onEditTake}
             >
-              <MessagesSquare className="h-4 w-4" />
-              Open in dialogue editor
+              <PencilLine className="h-4 w-4" />
+              Edit this take
             </Button>
           ) : null}
           <Button
@@ -338,6 +391,9 @@ export function TextToSpeechRecordDetail({
               : []),
             ...(record?.language
               ? [{ label: "Language", value: record.language }]
+              : []),
+            ...(editedFrom
+              ? [{ label: "Edited from", value: editedFromValue(editedFrom) }]
               : []),
           ]}
         />

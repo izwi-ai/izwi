@@ -175,6 +175,26 @@ export interface SpeechHistoryRecord {
   stop_reason?: string | null;
   /** A failed attempt whose job will run again. */
   retry_pending?: boolean;
+  /** The take this one was made from: the last of the request's
+   * `previous_take_ids`. It may since have been deleted. */
+  parent_take_id?: string;
+  /** The voices the take used, one per reference in request order (Fish
+   * Audio Drama 3). `[]`: every speaker spoke in a seeded voice. Absent on
+   * other models' records and on takes made before takes kept them. */
+  references?: SpeechRecordReference[];
+  /** The request's seed, when it gave one. One above
+   * `Number.MAX_SAFE_INTEGER` arrives rounded. */
+  seed?: number;
+  /** Whether a new take can continue from this one (`previous_take_ids`):
+   * a ready Fish Audio Drama 3 take that kept its generated codes. */
+  editable?: boolean;
+}
+
+/** A voice a take used, as its record keeps it: a saved voice, or, for a
+ * clip sent with the request, the speaker alone (its audio is not kept). */
+export interface SpeechRecordReference {
+  speaker: number;
+  saved_voice_id?: string;
 }
 
 export interface CancelSpeechHistoryRecordResponse {
@@ -204,6 +224,9 @@ export interface SpeechHistoryRecordCreateRequest {
   /** Sampling seed; for a model with `supports_seeded_voice` it also sets
    * the voice of a speaker without a reference. */
   seed?: number;
+  /** Takes the new one continues from, oldest first (at most 2): record
+   * ids of `editable` takes (Fish Audio Drama 3). */
+  previous_take_ids?: string[];
   temperature?: number;
   speed?: number;
   max_tokens?: number;
@@ -1696,6 +1719,7 @@ export class AudioApiClient {
       script: request.script,
       references: request.references,
       seed: request.seed,
+      previous_take_ids: request.previous_take_ids,
       temperature: request.temperature,
       speed: request.speed,
       max_tokens: request.max_tokens,
