@@ -358,6 +358,78 @@ the server's policy reads those fields, not the model id.
   900 s per chunk the family's chunker plans for the text (`plan_chunks`), one
   fence for every other model.
 
+## Take editing
+
+A take can continue earlier takes (plan §8.4). No public engine implements
+upstream's `previous_takes`; Izwi builds on the trained history-turn layout
+(`FS-omni/generate.py:158-169`, Report Fig. 12): an earlier take is a
+completed `user` turn (its text) and `assistant` turn (`<|voice|>`, its frames,
+`<|im_end|>`) before the new text.
+
+- **No second history mechanism.** The takes' chunks enter the chunk
+  session's history (`SpeechChunkHistory`) before the new text's first chunk,
+  as if they were the session's own earlier chunks
+  (`generate_speech_plan_stream_with_progress` reads them from the base
+  request's `chunk_history`). The family's policy then applies unchanged: the
+  first take's first chunk is pinned, the latest chunk follows, and
+  `build_chunk_prompt` drops the latest, then the pinned one, when the prompt
+  would pass its rows. A long new text is a chunk session after them. The
+  engine and `prepare_request` are untouched.
+- **What a take keeps** (`crates/izwi-server/src/api/speech_takes.rs`). Under
+  that policy only a take's first chunk (pinned when it is the first take) and
+  its last chunk (the latest when it is the last take) ever reach a later
+  prompt, so a take keeps exactly those two (one when it had one chunk). That
+  bounds the stored codes and the durable checkpoint at two chunks whatever
+  the take's length. At most 2 `previous_take_ids` (`MAX_PREVIOUS_TAKES`): a
+  third take could never reach the prompt.
+- **Storage** (migration 15, nullable, Drama 3 records only:
+  `keeps_takes` is `continues_speech_across_chunks`):
+  - `generated_codes_json`, written only by a take's completion (the
+    synchronous `complete_record`, the attempt-fenced
+    `complete_record_for_attempt`, and the opaque final-audio settlement), so
+    a failed or cancelled take has none. Versioned JSON
+    (`SpeechTakeCodes`, `version: 1`):
+    `{"version": 1, "chunks": N, "turns": [{"chunk": i, "text": "…",
+    "codebooks": 10, "codes": "<base64>"}]}`. `chunks` counts the take's
+    chunks; each kept turn carries its chunk index, the text the chunker gave
+    it (re-tagged pieces included) and its codes `[codebooks][frames]`
+    flattened codebook by codebook as little-endian u16, base64, the same
+    encoding as a checkpoint's history turn (`encode_chunk_turn`). About 13 KB
+    of codes per 30 s of a chunk, 4/3 of that in base64.
+  - `references_json`: `[{"speaker": N, "saved_voice_id": "…"}]` in request
+    order (`SpeechTakeReference`); an inline clip is speaker-only, the
+    single-reference form is speaker 0, and no reference is `[]`. Written when
+    the record is created, so a failed take reports its voices too.
+  - `seed`: the request's seed, its 64 bits in the signed column.
+  - `parent_take_id`: the last of `previous_take_ids`. No foreign key: a
+    parent may be deleted, and its children keep the id.
+  - `GET` reports `references`, `seed`, `parent_take_id` and
+    `editable` (`generated_codes_json IS NOT NULL`), never the codes. Every
+    other record serializes as before.
+- **Durable records.** A take's kept chunks ride in the speech checkpoint
+  (`SpeechCheckpoint::take`) beside the chunk history, so a take whose chunks
+  run as separate stage attempts keeps its first chunk. The stored request
+  keeps `previous_take_ids`; every stage attempt reads the takes again
+  (`load_previous_takes`), and the plan identity lists each take's id and
+  the sha256 of its stored codes, so a recovered plan continues the same
+  takes. A take deleted meanwhile fails the record with its `404` message
+  (a client error, so the job does not retry). An idempotency key's digest
+  adds the codes' hashes in order (`previous_takes_codes_sha256`); requests
+  without previous takes digest as before.
+- **Checks before any load**: the shape (`check_previous_take_ids`: a model
+  that keeps no takes, more than 2, an empty or repeated id), then each take
+  read from the request's route (`get_take`): `404` when it is not there,
+  `400` for another model's take or one without kept codes (not ready, or made
+  before migration 15). Records belong to no caller, so a take is any record
+  the route's `GET` returns.
+- **Not on `/v1/audio/speech`** or the CLI (which uses it): that route keeps no
+  records, and a field that names records belongs on the routes that keep
+  them.
+- **UI.** **Edit this take** reopens the generation dialog from the record
+  (`ui/src/features/text-to-speech/take.ts`) and sends
+  `previous_take_ids: [id]`; **Open in dialogue editor** restores the saved
+  voices and seed the same way, without continuing the take.
+
 ## Routes and capabilities
 
 The admin API's `speech_capabilities` for this model:
@@ -439,7 +511,13 @@ from the checkpoint; for dialogue, a two-speaker script with a reference per
 speaker, raw tags in `input`, a referenced speaker beside a seeded one, saved
 voices per speaker, the voice-cloning record route, a long dialogue of three
 or more chunks, a durable record with an inline and a saved-voice reference
-across stage attempts, and every dialogue `400` on both route families.
+across stage attempts, and every dialogue `400` on both route families; for
+take editing, takes continuing one and two earlier takes on the durable route,
+a long take continued by a long edit across stage attempts (and failed when
+its earlier take is deleted between attempts), a dialogue take on the
+synchronous voice-cloning route continued with its stored voices, and every
+`previous_take_ids` refusal. Each take's expected audio is the runtime's chunk
+session with every chunk of the earlier takes pushed into its history first.
 
 ### Fixtures and generators
 

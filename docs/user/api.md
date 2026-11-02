@@ -554,6 +554,10 @@ Japanese returns `400` until Izwi has its text processing.
   unfinished record can be played from its start
   (`GET /v1/text-to-speech/{record_id}/events`), and a durable job that stops
   between chunks resumes with the same voice.
+- A speech record keeps what a later take needs to continue it: its audio
+  codes, its voices and its seed. See
+  [Drama 3 take editing](#drama-3-take-editing). `/v1/audio/speech` keeps no
+  records and does not take `previous_take_ids`.
 - The weights' license (Fish Audio Community License v1.0) allows commercial
   use only below USD 500,000 in annual revenue, and offering the model to
   third parties as a hosted speech service, such as this API, needs a license
@@ -1099,6 +1103,62 @@ Streaming create responses emit JSON SSE events with an `event` field:
 | `final` | Includes generation stats and the completed record. |
 | `error` | Includes an error string. |
 | `done` | Terminal stream marker. |
+
+#### Drama 3 take editing
+
+A `FishAudio-Drama-3` take can continue earlier takes: to say a line again, or
+the next one, in the context of what was already said.
+
+- **Request.** `previous_take_ids` on `POST /v1/text-to-speech` and
+  `POST /v1/voice-clones`: up to 2 record ids of the same route, oldest first.
+  The prompt holds those takes as finished turns (their text and the audio
+  codes generated for it) before the new text, the layout the model was
+  trained on for take editing. They join the prompt the way a long text's
+  earlier chunks do: the first take's first chunk stays, and the latest chunk
+  follows; when the prompt would pass 8,192 rows, the latest is left out
+  first, then the first. A new text longer than one chunk is a chunk session
+  after them.
+- **Voices and seed are not inherited.** Send the `references` (or
+  `saved_voice_id`) and `seed` you want, for example the ones the earlier
+  take's record reports.
+- **Record fields.** A Drama 3 record reports:
+  - `editable: true` once it has finished and kept its codes, so
+    `previous_take_ids` can name it. The codes themselves are never returned.
+  - `references`: `[{"speaker": N, "saved_voice_id": "<id>"}]`, one per
+    reference in request order. An inline clip shows only its speaker, as its
+    audio is not kept; `[]` means every speaker spoke in a seeded voice.
+  - `seed`, when the request gave one.
+  - `parent_take_id`: the last of the request's `previous_take_ids`. The
+    parent may have been deleted since.
+
+  The fields are absent on other models' records and on Drama 3 takes made
+  before take editing, which cannot be continued.
+- **Who can name a take.** Any record the route's `GET` returns; records
+  belong to no caller.
+
+```json
+{
+  "model_id": "FishAudio-Drama-3",
+  "script": [{ "speaker": 0, "text": "Ready when you are. [laughs]" }],
+  "references": [{ "speaker": 0, "saved_voice_id": "voice_anna" }],
+  "seed": 8,
+  "previous_take_ids": ["5d0b8e3a-6f0e-4a57-9a3c-2f1e9b7c4d21"]
+}
+```
+
+These are refused before any model loads:
+
+- `404` for an id that is not a record of the request's route;
+- `400` for a take of another model;
+- `400` for a take that kept no codes: still pending or processing, failed, or
+  made before take editing;
+- `400` for an empty or repeated id, or more than 2 ids;
+- `400` for `previous_take_ids` with a model other than Drama 3.
+
+A durable record reads its earlier takes again at every stage attempt, and its
+recovery checkpoint and `Idempotency-Key` digest include their codes' hashes;
+an earlier take deleted while the record runs fails it with the `404`
+message.
 
 ### Durable Runtime Jobs
 

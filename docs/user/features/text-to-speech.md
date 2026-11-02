@@ -185,9 +185,19 @@ edits a scene:
   performance tags. **Preview** speaks one line without saving it.
 - **Generate scene** speaks every line as one take.
 
-A dialogue take's page has **Open in dialogue editor**, which brings its lines
-back as a scene. A take does not keep its voices or seed, so pick the voices
-again.
+A Drama 3 take's page has **Edit this take**: the dialog opens with the take's
+text (its lines, for a dialogue), its voices and its seed. Change the line and
+generate: the new take continues from the old one, so the model says the new
+text in the context of what it already said. The new take's page links back
+to it under **Edited from**. A dialogue take's **⋯** menu has **Open in
+dialogue editor**, which brings its lines back as a new scene with the same
+voices and seed.
+
+Saved voices and the seed come back. A voice given as a reference clip does
+not, because a take keeps no clip audio: its speaker starts in a seeded voice.
+Takes made before take editing kept no voices or seed and cannot be edited;
+their lines still open in the dialogue editor, every speaker in a seeded
+voice.
 
 ### Features
 
@@ -335,6 +345,23 @@ izwi tts --script scene.jsonl \
 On the API, the same request is `references` and `script` on
 `/v1/audio/speech` or the text-to-speech records; see
 [Drama 3 dialogue](/api#drama-3-dialogue).
+
+### Take editing
+
+A take can continue from earlier takes: to say a line again, or the next
+line, in the context of what was already said. Its prompt holds the earlier
+takes as finished turns, their text and the audio generated for it, before the
+new text; that is how the model was trained to edit takes. Each Drama 3 take
+keeps the audio codes of its first and last chunks, its voices (saved voices
+by id) and its seed, so a later take can name it.
+
+On the text-to-speech records, send `previous_take_ids` with up to 2 earlier
+takes, oldest first, beside the new text, voices and seed. Voices and seed are
+not inherited: send the ones you want, for example those the earlier take's
+record reports. Takes of another model, unfinished or failed takes, and takes
+made before take editing are refused. See
+[Drama 3 take editing](/api#drama-3-take-editing). In the Web UI, **Edit this
+take** does this for you.
 
 Its license allows commercial use only below USD 500,000 in annual revenue,
 and offering the model to third parties as a hosted speech service needs a

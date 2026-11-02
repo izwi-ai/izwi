@@ -286,6 +286,11 @@ this device has … GiB".
 | `400` "script line N: …" | A script line is empty, carries its own speaker tag, or names a speaker past 15. The speaker comes from the line's `speaker` field. |
 | `400` "The inline reference audio totals … at most 16 MiB" | Inline clips are capped below the request size limit. Save the voices with `POST /v1/voices` and give each reference its `saved_voice_id`. |
 | `400` "Fish Audio Drama 3's prompt holds N references in … rows, leaving no room for the text" | The references' audio fills the prompt (8,192 rows, about 21.5 per second of audio). Use fewer or shorter references; 10 to 30 seconds each is plenty. |
+| `404` "Previous take `ID` not found." | `previous_take_ids` names a record that does not exist on this route: deleted, mistyped, or a record of another route (a `/v1/voice-clones` take on `/v1/text-to-speech`). Send the id of a take from the same route. A durable take whose earlier take is deleted while it runs fails with the same message. |
+| `400` "Previous take `ID` kept no codes to continue from …" | The take has not finished, failed, or was made before take editing, so it kept no audio codes. Wait for it to finish, or continue a newer take. |
+| `400` "Previous take `ID` was made by …, not …" | A take continues only takes of its own model. Generate the new take with the earlier take's model. |
+| `400` "`previous_take_ids` names N takes; a take continues at most 2." or "… names `ID` twice." | Send at most 2 different takes, oldest first. |
+| `400` "… does not continue earlier takes" | Only `FishAudio-Drama-3` takes `previous_take_ids`. Drop the field for another model. |
 
 ### Model not detected after manual download
 
