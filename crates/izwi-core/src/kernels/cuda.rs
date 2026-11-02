@@ -3485,6 +3485,12 @@ pub(crate) fn cuda_ptx_race_sampler() -> &'static str {
     cuda_ptx::RACE_SAMPLER
 }
 
+/// The PTX of `kernels/cuda/swiglu.cu` (`kernels::swiglu`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_swiglu() -> &'static str {
+    cuda_ptx::SWIGLU
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -34,6 +34,7 @@ pub mod numeric_check;
 pub mod qk_norm_rope;
 pub mod race_sampler;
 pub mod residual_norm;
+pub mod swiglu;
 
 use crate::error::Error;
 use candle_core::{Device, Tensor};
