@@ -121,9 +121,12 @@ izwi tts "आपका ऑर्डर कल शाम तक पहुँच �
 
 `FishAudio-Drama-3` clones from reference audio and its transcript, but the
 reference is optional: without one it speaks in a voice its sampling seed sets
-(see [Text-to-Speech](/features/text-to-speech#fish-audio-drama-3)). One
-reference per request. A reference sent with the request may last up to 60
-seconds; a saved voice holds up to 30 seconds, as for every model.
+(see [Text-to-Speech](/features/text-to-speech#fish-audio-drama-3)). A
+reference sent with the request may last up to 60 seconds; a saved voice holds
+up to 30 seconds, as for every model. For a dialogue it takes a reference per
+speaker, up to 8 in one request, each a clip with its transcript or a saved
+voice with one (`--speaker-reference`, `--speaker-voice`; `references` on the
+API); see [Dialogue](/features/text-to-speech#dialogue).
 
 ```bash
 izwi tts "[laughs] I did not expect to see you here." \
@@ -236,7 +239,7 @@ its own.
 | `Qwen3-TTS-12Hz-1.7B-Base` | ~4.2 GB | Better |
 | `VibeVoice-1.5B` | ~5.0 GB | Better long-form/reference voice |
 | `FishAudio-S2-Pro` | ~11.5 GB | Reference voice or saved voice only |
-| `FishAudio-Drama-3` | ~41.5 GB | Needs a transcript; reference clips up to 60 s; also speaks without a reference |
+| `FishAudio-Drama-3` | ~41.5 GB | Needs a transcript; reference clips up to 60 s; a reference per speaker for dialogue (up to 8); also speaks without a reference |
 | `Chatterbox-500M` | ~3.2 GB | English; clones from audio alone, no transcript needed |
 | `Chatterbox-Multilingual-500M` | ~3.3 GB | 22 languages (set `language`); clones from audio alone |
 | `Maya2-Native-2.5B` | ~5.5 GB | English and 11 Indic languages; needs a transcript; clones across languages |

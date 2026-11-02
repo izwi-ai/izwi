@@ -11,6 +11,7 @@ Generate speech from text.
 
 ```bash
 izwi tts <TEXT> [OPTIONS]
+izwi tts --script <FILE.jsonl> [OPTIONS]
 ```
 
 ---
@@ -34,7 +35,7 @@ Converts text to speech using a TTS model. The OSS server emits WAV audio for th
 
 | Argument | Description |
 |----------|-------------|
-| `<TEXT>` | Text to synthesize (use `-` to read from stdin) |
+| `<TEXT>` | Text to synthesize (use `-` to read from stdin); omit it with `--script` |
 
 ---
 
@@ -48,6 +49,10 @@ Converts text to speech using a TTS model. The OSS server emits WAV audio for th
 | `--reference-audio <PATH>` | Reference audio file for voice cloning | — |
 | `--reference-text <TEXT>` | Transcript for the reference audio; needs `--reference-audio` (optional for Chatterbox) | — |
 | `--reference-text-file <PATH>` | File containing the reference transcript | — |
+| `--speaker-reference <N=AUDIO[:TRANSCRIPT_FILE]>` | A reference voice for dialogue speaker `N` (0 to 15): an audio file and a file holding its transcript. Repeatable, up to 8 references; `FishAudio-Drama-3` only | — |
+| `--speaker-voice <N=SAVED_ID>` | A saved voice (with a transcript) for dialogue speaker `N`. Repeatable; `FishAudio-Drama-3` only | — |
+| `--script <FILE.jsonl>` | A dialogue instead of `<TEXT>`: one `{"speaker": N, "text": "..."}` object per line; `FishAudio-Drama-3` only | — |
+| `--seed <N>` | Sampling seed: the same seed and inputs give the same audio; with `FishAudio-Drama-3` it also sets the voice of a speaker without a reference | random |
 | `--instructions <TEXT>`, `--voice-description <TEXT>` | Voice direction for voice-design models; for `Maya1-3B`, the description of the voice to speak with (replaces `--speaker`) | — |
 | `-o, --output <PATH>` | Output file path | `izwi_output_<timestamp>.wav` in the current directory |
 | `-f, --format <FORMAT>` | `wav` or `pcm` (raw 16-bit little-endian mono, no header) | `wav` |
@@ -259,12 +264,12 @@ top-k 128); `--temperature` overrides the temperature. It refuses
 
 ### Fish Audio Drama 3
 
-`FishAudio-Drama-3` needs no voice input. Without a reference, each run picks
-a new voice: `izwi tts` has no seed option, so for a repeatable voice call the
-API with `seed` (see [Audio Speech](/api#audio-speech)). Tags in the text, such
-as `[sighs]`, `[laughs]`, `[pause]`, `[gasps]`, `[clears throat]`,
-`[hesitates]`, free-text ones like `[with quiet excitement]` and
-`<whisper>…</whisper>`, direct the delivery where they stand:
+`FishAudio-Drama-3` needs no voice input. Without a reference, `--seed` sets
+the voice: the same seed gives the same voice, and without one each run picks
+a new voice. Tags in the text, such as `[sighs]`, `[laughs]`, `[pause]`,
+`[gasps]`, `[clears throat]`, `[hesitates]`, free-text ones like
+`[with quiet excitement]` and `<whisper>…</whisper>`, direct the delivery
+where they stand:
 
 ```bash
 izwi tts "[sighs] It has been a long day. [pause] But we made it." \
@@ -291,6 +296,39 @@ It reads the language from the text. Long text is spoken in chunks of about
 300 bytes that carry the voice from one to the next, and `--stream` writes
 44.1 kHz audio as it is generated. Sampling defaults to temperature 1.0 and
 top-p 0.9; `--temperature` overrides the temperature.
+
+#### Dialogue
+
+`FishAudio-Drama-3` voices up to 16 speakers in one take. Write the dialogue as
+a script, one JSON object per line:
+
+```json
+{"speaker": 0, "text": "Ready when you are."}
+{"speaker": 1, "text": "Always. [laughs] Let's go."}
+```
+
+Give each speaker a reference voice: `--speaker-reference N=AUDIO:TRANSCRIPT_FILE`
+for a clip and a file with its transcript, or `--speaker-voice N=SAVED_ID` for a
+saved voice. Both repeat, up to 8 references, and several may voice one
+speaker. `--reference-audio` with `--reference-text` (or `--saved-voice-id`)
+still give speaker 0. A speaker without a reference speaks in a voice the seed
+sets:
+
+```bash
+izwi tts --script scene.jsonl \
+  --model FishAudio-Drama-3 \
+  --speaker-reference 0=voices/anna.wav:voices/anna.txt \
+  --speaker-voice 1=voice_ben \
+  --seed 7 \
+  --output scene.wav
+```
+
+Instead of `--script`, the text may carry the tags itself:
+`izwi tts "<|speaker:0|> Ready? <|speaker:1|> Always." --model FishAudio-Drama-3`.
+The CLI waits up to 900 s for each chunk the model's chunker plans from the
+text (one chunk is about 300 bytes) before it gives up; the server's own
+deadlines apply as well. See [Drama 3 dialogue](/api#drama-3-dialogue) for
+what the server refuses.
 
 ### Saved voice reuse
 
@@ -347,7 +385,7 @@ Izwi saves the streamed audio, then plays it.
 | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | Design | Voice design-capable model family; needs `--instructions` |
 | `VibeVoice-1.5B` | Long-form/reference voice | Reference-voice TTS with long-form positioning |
 | `FishAudio-S2-Pro` | Reference voice | Voice cloning only: needs `--reference-audio` + `--reference-text` or `--saved-voice-id` |
-| `FishAudio-Drama-3` | Seeded/reference voice | Speaks without a voice input, or clones from `--reference-audio` + `--reference-text` or `--saved-voice-id`; performance tags in the text, 44.1 kHz output, Fish Audio Community License v1.0 |
+| `FishAudio-Drama-3` | Seeded/reference voice | Speaks without a voice input, or clones from `--reference-audio` + `--reference-text` or `--saved-voice-id`; dialogue of up to 16 speakers (`--script`, `--speaker-reference`, `--speaker-voice`); performance tags in the text, 44.1 kHz output, Fish Audio Community License v1.0 |
 | `Voxtral-4B-TTS-2603` | Preset voices | 20 built-in voices, 24 kHz output, CC BY-NC 4.0 |
 | `Chatterbox-500M` | Built-in/reference voice | English; built-in `default` voice or cloning from `--reference-audio` alone; watermarked, 24 kHz output, MIT |
 | `Chatterbox-Multilingual-500M` | Built-in/reference voice | Chatterbox in 22 languages chosen with `--language`; watermarked, 24 kHz output, MIT |

@@ -362,7 +362,7 @@ Request fields:
 | Field | Notes |
 |-------|-------|
 | `model` | Required TTS model variant. |
-| `input` | Required text to synthesize. |
+| `input` | Required text to synthesize, unless `script` gives it. |
 | `voice` | Built-in voice/speaker name where the model supports presets. |
 | `response_format` | Native OSS formats: `wav` (default), `pcm`, `pcm16`, `pcm_i16`, `raw_i16`, `raw_f32`, `pcm_f32`. Recognized compressed names `mp3`, `opus`, `ogg`, `aac`, and `flac` require explicit fallback opt-in because compressed encoders are not bundled. |
 | `allow_format_fallback` | Optional boolean. When `true`, recognized compressed `response_format` values return WAV bytes with `X-Actual-Response-Format: wav`, `X-Response-Format-Fallback`, and `Warning` headers. When omitted or `false`, compressed formats return `400`. |
@@ -378,6 +378,8 @@ Request fields:
 | `reference_text` | Transcript of the reference audio. Optional for Chatterbox, which ignores it. |
 | `reference_language` | `Maya2-Native-2.5B` only. The language the reference audio is spoken in, one of its 12 codes; unset, it is read from the transcript's script. Any other model returns `400` if it is set. The speech history create routes accept it too. |
 | `saved_voice_id` | Server-side saved voice reference to reuse. |
+| `references` | Izwi extension, for models that voice several speakers (`speech_capabilities.supports_speaker_dialogue`: `FishAudio-Drama-3`). Reference voices per speaker, each `{speaker, audio, text}` or `{speaker, saved_voice_id}`; it replaces `reference_audio`, `reference_text` and `saved_voice_id`. See the Drama 3 dialogue notes below. |
+| `script` | Izwi extension, for the same models. A dialogue as `[{speaker, text}]` lines, instead of `input`. |
 | `stream`, `stream_format` | `stream: true` or `stream_format: "sse"` enables SSE audio chunks. Text one request cannot speak streams as consecutive long-form segments, as a final-only request splits it. |
 
 `exaggeration`, `cfg_weight` and `min_p` are also accepted by the speech
@@ -503,9 +505,10 @@ Japanese returns `400` until Izwi has its text processing.
 - A reference voice is optional. Without one, the sampling `seed` sets the
   voice: the same `seed` gives the same voice, and without a `seed` each
   request picks one. With one, its transcript is required, inline
-  (`reference_text`) or from a saved voice that has one. One reference per
-  request; an inline clip may last up to 60 s, and saved voices hold up to
-  30 s.
+  (`reference_text`) or from a saved voice that has one. An inline clip may
+  last up to 60 s, and saved voices hold up to 30 s. `reference_audio` and
+  `reference_text` (or `saved_voice_id`) give one reference, for speaker 0;
+  `references` gives up to 8 for a dialogue (below).
 - `response_format` is `wav`, `pcm_i16` or `pcm_f32`, at 44.1 kHz. `mp3`,
   `opus`, `ogg`, `aac` and `flac` need `allow_format_fallback: true` and
   return WAV.
@@ -555,6 +558,89 @@ Japanese returns `400` until Izwi has its text processing.
   use only below USD 500,000 in annual revenue, and offering the model to
   third parties as a hosted speech service, such as this API, needs a license
   from Fish Audio. Nothing is refused because of it.
+
+#### Drama 3 dialogue
+
+`FishAudio-Drama-3` voices up to 16 speakers in one request. Its card reports
+`supports_speaker_dialogue: true`, `max_speakers: 16` and `max_references: 8`
+under `speech_capabilities` in `GET /v1/admin/models`.
+
+- **Who says what.** Tag the text: `<|speaker:0|>` to `<|speaker:15|>` before
+  each turn in `input`, or send `script` instead of `input`, a list of
+  `{"speaker": N, "text": "..."}` lines. Izwi writes a script as one
+  `<|speaker:N|> text` line per entry, joined by newlines; that rendered text
+  is what a speech record stores as its `input_text`. Text before the first
+  tag is speaker 0. A script line's text may not carry its own speaker tag;
+  performance tags such as `[laughs]` are fine.
+- **Voices.** `references` is a list of up to 8 reference voices. Each is
+  `{"speaker": N, "audio": "<base64>", "text": "<transcript>"}` or
+  `{"speaker": N, "saved_voice_id": "<id>"}` (the saved voice must have a
+  transcript). `speaker` defaults to 0, or to the speaker of a
+  `<|speaker:N|>` tag that starts `text`. Several references may voice one
+  speaker. Every chunk of a long dialogue holds every reference.
+- **Seeded speakers.** A speaker with no reference speaks in a voice the
+  `seed` sets, so a request may mix referenced and seeded speakers, or give no
+  references at all.
+- **One reference form.** `references` replaces `reference_audio`,
+  `reference_text` and `saved_voice_id`; those mean one reference for speaker
+  0.
+- **Size.** Inline clips (`audio`) may total 16 MiB of base64 per request,
+  below the route's body limit; save larger voices with `POST /v1/voices` and
+  pass their `saved_voice_id`. Each inline clip lasts at most 60 s.
+
+```json
+{
+  "model": "FishAudio-Drama-3",
+  "script": [
+    { "speaker": 0, "text": "Ready when you are." },
+    { "speaker": 1, "text": "Always. [laughs] Let's go." }
+  ],
+  "references": [
+    { "speaker": 0, "saved_voice_id": "voice_anna" },
+    { "speaker": 1, "audio": "<base64 WAV>", "text": "Thanks for calling, how can I help?" }
+  ],
+  "seed": 7
+}
+```
+
+The same dialogue with tags in `input`:
+
+```json
+{
+  "model": "FishAudio-Drama-3",
+  "input": "<|speaker:0|> Ready when you are.\n<|speaker:1|> Always. [laughs] Let's go.",
+  "references": [
+    { "speaker": 0, "saved_voice_id": "voice_anna" },
+    { "speaker": 1, "saved_voice_id": "voice_ben" }
+  ]
+}
+```
+
+The speech record routes (`POST /v1/text-to-speech`, `POST /v1/voice-clones`)
+take the same `references` and `script`, with `script` replacing `text`.
+
+These return `400` before any model loads, naming the field:
+
+- `references` or `script` for a model without `supports_speaker_dialogue`;
+- `references` together with `reference_audio`, `reference_text` or
+  `saved_voice_id`, or `script` together with `input` (`text` on the record
+  routes);
+- more than 8 references, or a `speaker` outside 0 to 15 in a reference or a
+  script line;
+- a reference that is not exactly one of `audio` (with its `text`) and
+  `saved_voice_id`, a saved-voice reference given its own `text`, or a saved
+  voice without a transcript;
+- a reference `text` that starts with another speaker's tag than its
+  `speaker`;
+- control tokens in a reference `text` or a script line;
+- an empty script, an empty script line, or a script line with a speaker tag;
+- inline clips over 16 MiB in total.
+
+Two limits are checked when the loaded model prepares the request, and also
+return `400`: an inline clip over 60 s, and references that fill the prompt
+(8,192 rows; audio takes about 21.5 rows a second) with no room left for the
+text. Use fewer or shorter references then. Text that is too long beside the
+references is cut into shorter chunks instead.
 
 Non-stream response:
 
@@ -1402,6 +1488,12 @@ A model that speaks without any voice input (Fish Audio Drama 3) also reports
 sampling `seed` sets, so a reference is optional. The field is present only
 when it is `true`. `reference_transcript_required` says whether a reference
 voice needs its transcript.
+
+A model that voices several speakers in one request (Fish Audio Drama 3) also
+reports `"supports_speaker_dialogue": true`, with `max_speakers` (16: speakers
+0 to 15) and `max_references` (8), the limits of its `references` and
+`script` fields (see [Drama 3 dialogue](#drama-3-dialogue)). The three fields
+are present only for such a model.
 
 Model records carry the weights' license label in `license` and, when the
 label alone does not say what it permits, a `license_notice`. Fish Audio

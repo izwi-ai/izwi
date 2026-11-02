@@ -235,7 +235,7 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 | `Voxtral-4B-TTS-2603` | ~8.1 GB | Better | Medium |
 | `Chatterbox-500M` | ~3.2 GB | English reference voice, emotion control | Slow |
 | `Chatterbox-Multilingual-500M` | ~3.3 GB | 22 languages, reference voice, emotion control | Slow |
-| `FishAudio-Drama-3` | ~41.5 GB | Seeded or reference voice, performance tags, 44.1 kHz | Slow; needs about 40 GB of memory |
+| `FishAudio-Drama-3` | ~41.5 GB | Seeded or reference voice, dialogue of up to 16 speakers, performance tags, 44.1 kHz | Slow; needs about 40 GB of memory |
 
 For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `FishAudio-Drama-3`, `Chatterbox-500M`, `Chatterbox-Multilingual-500M` or `Maya2-Native-2.5B`.  
 For built-in voice presets, use `Kokoro-82M`, **CustomVoice** variants, `Voxtral-4B-TTS-2603`, `LFM2.5-Audio-1.5B-GGUF`, `LFM3-Audio-2B-GGUF` or `Maya2-Native-2.5B`.  
@@ -294,11 +294,32 @@ izwi tts "[sighs] It has been a long day. [pause] But we made it, and <whisper>n
 
 Long text is spoken as a chunk session. The model's own chunker cuts the text
 into chunks of about 300 bytes, at sentence ends where it can, and each chunk
-is its own generation. Each chunk's prompt holds the reference and the first
-and latest chunks with the audio already generated for them, so the voice
-carries through the whole text. Chunks play one after another with no added
+is its own generation. Each chunk's prompt holds the references and the first
+and latest chunks with the audio already generated for them, so the voices
+carry through the whole text. Chunks play one after another with no added
 pause. With `--stream` (or `stream: true` on the API), audio arrives as it is
 generated: first after 4 frames, then every 16 frames.
+
+### Dialogue
+
+One request can voice up to 16 speakers. Mark each turn with a speaker tag,
+`<|speaker:0|>` to `<|speaker:15|>`, or send a script of `{speaker, text}`
+lines. Give each speaker a reference voice (a clip with its transcript, or a
+saved voice), up to 8 references in all; a speaker without one speaks in a
+voice the seed sets. The chunker keeps each turn whole with its speaker.
+
+```bash
+izwi tts --script scene.jsonl \
+  --model FishAudio-Drama-3 \
+  --speaker-reference 0=voices/anna.wav:voices/anna.txt \
+  --speaker-voice 1=voice_ben \
+  --seed 7 \
+  --output scene.wav
+```
+
+On the API, the same request is `references` and `script` on
+`/v1/audio/speech` or the text-to-speech records; see
+[Drama 3 dialogue](/api#drama-3-dialogue).
 
 Its license allows commercial use only below USD 500,000 in annual revenue,
 and offering the model to third parties as a hosted speech service needs a

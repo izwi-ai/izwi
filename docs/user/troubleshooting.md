@@ -275,7 +275,17 @@ this device has … GiB".
 | `400` "Fish Audio Drama 3 long-form generation is disabled by this deployment" | The text needs more than one chunk (about 300 bytes) and the server runs with `IZWI_FISH_DRAMA3_LONG_FORM_ENABLED=false`. Shorten the text, or remove the setting and restart the server. |
 | `400` "Provide both `reference_audio` and `reference_text` together." | A reference clip needs its transcript. Send both, or send neither for a voice set by the `seed`. |
 | `400` "This saved voice has no transcript, …" | The saved voice was stored without a transcript. Use a voice saved with one, or no voice. |
-| `400` "Decoded audio would … production limit" for a reference clip | The reference is longer than 60 seconds. Trim it; 10 to 30 seconds of clear speech is enough. |
+| `400` "`reference_audio`: … production limit; a reference clip lasts at most 60 s" (`` `references[N]` `` for a dialogue reference) | The reference is longer than 60 seconds, or its audio does not decode. Trim it; 10 to 30 seconds of clear speech is enough. |
+| `400` "… speaks one voice: `references` and `script` are for models that voice several speakers" | Only `FishAudio-Drama-3` takes `references` and `script`. For another model, use `reference_audio` with `reference_text`, or `saved_voice_id`. |
+| `400` "Use either `references` or `reference_audio`/`reference_text`/`saved_voice_id`, not both." | A dialogue gives every voice in `references`. Move the single reference into it as `{"speaker": 0, …}`. |
+| `400` "Use either `input` or `script`, not both." (`text` on the record routes) | A script is the text. Send one or the other. |
+| `400` "… takes at most 8 references" or "… speakers are 0 to 15" | A request carries at most 8 reference clips, and speakers are numbered 0 to 15. Several references may voice one speaker; a speaker with none speaks in a voice the `seed` sets. |
+| `400` "`references[N]` needs `text`, …" or "`references[N]` is a saved voice without a transcript" | Every reference needs its transcript: send `text` with `audio`, or use a saved voice stored with one. |
+| `400` "`references[N]` gives both `audio` and `saved_voice_id`", "… needs `audio` …" or "… brings its own transcript" | Each reference is either `audio` with its `text`, or a `saved_voice_id` alone. |
+| `400` "`references[N].text` starts with another speaker's tag …" | The transcript starts with a `<\|speaker:M\|>` tag that differs from the reference's `speaker`. Drop the tag or make them match. |
+| `400` "script line N: …" | A script line is empty, carries its own speaker tag, or names a speaker past 15. The speaker comes from the line's `speaker` field. |
+| `400` "The inline reference audio totals … at most 16 MiB" | Inline clips are capped below the request size limit. Save the voices with `POST /v1/voices` and give each reference its `saved_voice_id`. |
+| `400` "Fish Audio Drama 3's prompt holds N references in … rows, leaving no room for the text" | The references' audio fills the prompt (8,192 rows, about 21.5 per second of audio). Use fewer or shorter references; 10 to 30 seconds each is plenty. |
 
 ### Model not detected after manual download
 

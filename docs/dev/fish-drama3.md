@@ -288,6 +288,76 @@ session (`SpeechTextPlan::chunk_session` in
 - `IZWI_FISH_DRAMA3_LONG_FORM_ENABLED=false` (server) refuses text that needs
   more than one chunk with `400`.
 
+## Dialogue
+
+A request may voice up to 16 speakers from up to 8 references
+(`reference_cache::MAX_REFERENCES`, `prompt::MAX_SPEAKER_ID`). The catalog
+says so (`supports_speaker_dialogue`, `max_speakers`, `max_references`), and
+the server's policy reads those fields, not the model id.
+
+- **Request shape** (`crates/izwi-server/src/api/speech_dialogue.rs`):
+  `references: [{speaker, audio | saved_voice_id, text}]` and
+  `script: [{speaker, text}]` on `/v1/audio/speech` and the first-party
+  text-to-speech and voice-cloning record routes. Studio stays one voice per
+  paragraph. `reference_audio` / `reference_text` / `saved_voice_id` mean one
+  reference for speaker 0; giving both forms is a `400`. A script replaces
+  `input` (`text`): the server renders it with `prompt::render_script`
+  (`<|speaker:N|> text` lines joined by `"\n"`), and a record stores that
+  rendered text as its `input_text`. Raw tags in `input` work the same way.
+- **Speakers.** A reference's speaker is its `speaker`, else the tag leading
+  its transcript, else 0. Its transcript is tagged
+  `<|speaker:N|> ` unless a tag already leads it
+  (`prompt::speaker_reference_transcript`, upstream's
+  `tag_reference_text`); a leading tag for another speaker is refused, where
+  upstream keeps it. Several references may voice one speaker, as upstream's
+  prompt allows (two clips of one voice share a tag). A speaker the text names
+  without a reference speaks in a voice the seed sets beside referenced ones,
+  as upstream allows; a dialogue model without a seeded voice would need a
+  reference per speaker (`check_unreferenced_speakers`).
+- **Checks before any load** (`check_dialogue_request`,
+  `check_dialogue_references`): dialogue fields for a model without
+  `supports_speaker_dialogue`, both reference forms, `script` with `input`,
+  more than `max_references`, a speaker past `max_speakers`, a reference that
+  is not exactly one of `audio` and `saved_voice_id`, a saved voice given its
+  own `text` or saved without one, a missing transcript, control tokens in a
+  transcript or script line, a transcript led by another speaker's tag, and
+  inline clips over 16 MiB of base64 (`MAX_INLINE_REFERENCE_BYTES`, below the
+  25 MiB default body limit of `/v1/audio/speech` and the 64 MiB of the record
+  routes). The runtime repeats the structural checks
+  (`TtsRuntimeRequest::from_generation`).
+- **Plumbing.** `GenerationRequest::speaker_references`
+  (`Vec<SpeechSpeakerReference>`: speaker, base64 audio, transcript) travels
+  through `TtsRuntimeRequest` into `EngineCoreRequest::tts_speaker_references`
+  (crate-private, like the chunk history; `TtsEngineInput`, the direct
+  engine's payload, stays single-reference, since only the runtime prepares
+  Drama 3). Each chunk of a long text is a clone of the base request, so every
+  chunk holds every reference, as upstream's `generate_long_drama3` does. The
+  retained-bytes ledger counts them.
+- **Preparation** (`prepare_fish_drama3_tts_for_binding`): decodes each clip
+  (60 s inline; saved voices hold 30 s from upload), tags its transcript, and
+  encodes them in order through the reference cache. A clip it cannot take is
+  named by its place (`` `references[i]` ``). `prepare_request` then refuses
+  references whose shortest prompt passes the rows left for the text
+  (`min(8,192, positions − budget)`) as invalid input naming them, since no
+  shorter chunk helps; text too long beside them stays
+  `ContextLengthExceeded`, now naming the references' share, and the plan
+  cuts the chunk in two as before.
+- **Durable records.** Each dialogue reference is its own pair of input
+  artifacts (original and canonical audio), whose metadata carries
+  `reference_index`; the stored request keeps each reference's speaker,
+  transcript and saved voice id but not its audio, and not the script. Every
+  stage attempt rehydrates every reference from its artifact
+  (`hydrate_batch_reference_audio`). The model snapshot lists each
+  reference's speaker and audio and transcript hashes, so a recovered plan's
+  identity changes when any of them does; an idempotency key's digest hashes
+  each reference's audio in order. Requests without dialogue serialize as
+  before, so their digests are unchanged.
+- **CLI.** `izwi tts` takes `--speaker-reference N=AUDIO[:TRANSCRIPT_FILE]`
+  and `--speaker-voice N=SAVED_ID` (repeatable; the single-reference flags join
+  them as speaker 0), `--script FILE.jsonl` and `--seed`. Its request timeout is
+  900 s per chunk the family's chunker plans for the text (`plan_chunks`), one
+  fence for every other model.
+
 ## Routes and capabilities
 
 The admin API's `speech_capabilities` for this model:
@@ -298,14 +368,18 @@ The admin API's `speech_capabilities` for this model:
 | `supports_reference_voice` | `true` |
 | `reference_transcript_required` | `true` |
 | `supports_seeded_voice` | `true` (a new field, present only when `true`) |
+| `supports_speaker_dialogue` | `true` (present only when `true`) |
+| `max_speakers` | `16` (present only with `supports_speaker_dialogue`) |
+| `max_references` | `8` (present only with `supports_speaker_dialogue`) |
 | `supports_streaming` | `true` |
 | `supports_auto_long_form` | `true` |
 | `supports_in_progress_replay` | `true` |
 | `inline_tags` | `[sighs]`, `[laughs]`, `[pause]`, `[gasps]`, `[clears throat]`, `[hesitates]` |
 
 The server's voice policy (`validate_speech_voice` in `tts_policy.rs`) accepts
-a request with no voice input, or one reference with its transcript, inline
-or from a saved voice; inline clips may last 60 s, saved voices 30 s. The
+a request with no voice input, or references with their transcripts, inline
+or from saved voices (see [Dialogue](#dialogue)); inline clips may last 60 s,
+saved voices 30 s. The
 OpenAI `voice` field is ignored, and `language` is a hint the model does not
 read. Realtime voice sessions refuse the model, since they need built-in
 voices. Prefix reuse is excluded in the catalog (`prefix_reuse.rs`).
@@ -352,14 +426,20 @@ cargo test -p izwi-server --lib fish_drama3
 The izwi-core suites cover the family's units, the CPU and Metal device
 columns, batch invariance and the runtime
 (`crates/izwi-core/src/runtime/fish_drama3_tests.rs`: load, streaming and
-non-streaming speech, a cloned voice, requests alone and together,
-cancellation mid-prefill and mid-decode, the frame budget, admission refusal
-and unload). The izwi-server suite
+non-streaming speech, a cloned voice, speaker references (one for speaker 0
+speaks as the single reference does; a second one, and its speaker, change
+the take; references that fill the prompt are refused), requests alone and
+together, cancellation mid-prefill and mid-decode, the frame budget,
+admission refusal and unload). The izwi-server suite
 (`crates/izwi-server/src/api/fish_drama3_speech_tests.rs`) runs the speech
 routes end to end: a seeded and a cloned voice in each native format, refused
 references and control tokens, SSE streams, long text as a chunk session
 carrying its history, and a durable record whose chunks recover their history
-from the checkpoint.
+from the checkpoint; for dialogue, a two-speaker script with a reference per
+speaker, raw tags in `input`, a referenced speaker beside a seeded one, saved
+voices per speaker, the voice-cloning record route, a long dialogue of three
+or more chunks, a durable record with an inline and a saved-voice reference
+across stage attempts, and every dialogue `400` on both route families.
 
 ### Fixtures and generators
 
