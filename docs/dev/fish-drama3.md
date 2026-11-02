@@ -602,3 +602,18 @@ component parity against the CPU reference, batch invariance at widths 1 to
 8, the load checks, device sampling, the runtime at widths 1 and 8, and a load
 holding what its census prices. `IZWI_REQUIRE_CUDA_TEST_DEVICE=1`
 makes a missing device a failure rather than a skip.
+
+### Benchmarks
+
+- **Manifests.** `benchmarks/manifests/{cpu,metal}-audio-concurrency.toml`
+  measure Drama 3 at c1 and c2, the rows those backends decode together;
+  `cuda-audio-concurrency.toml` at c1 to c32 (eight rows decode together,
+  so c16 and c32 measure the queue). Every case clones `data/fox.wav` with
+  `data/fox.md`, as Fish S2 Pro's do. `cuda-family-api.toml` and
+  `cuda-family-load.txt` list the model for the CUDA certification runner.
+- **TTS matrix.** `scripts/bench/run-tts-matrix.sh --models
+  FishAudio-Drama-3:drama3` runs a seeded voice, a cloned one, a stream,
+  numbers, tags, a two-speaker dialogue and about five chunks of long text,
+  all from seed 7. The family's footprint guard defaults to 45,000 MiB (the
+  12,000 MiB default would kill the server while it loads) and its load
+  timeout to an hour.

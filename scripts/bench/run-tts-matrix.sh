@@ -15,12 +15,13 @@ usage() {
     cat <<'EOF'
 Usage: scripts/bench/run-tts-matrix.sh --backend <cpu|metal|cuda> --models <Model:family,...> [options]
 
-Families: kokoro, lfm, qwen_cv, qwen_base, qwen_greedy, vibevoice, voxtral, fish, chatterbox
-(see scripts/bench/score-tts-matrix.py for each family's cases).
+Families: kokoro, lfm, qwen_cv, qwen_base, qwen_greedy, vibevoice, voxtral, fish, chatterbox,
+drama3 (see scripts/bench/score-tts-matrix.py for each family's cases).
 
 Options:
   --only <cases>      Comma-separated case ids to run (default: every case)
-  --guard-mb <n>      Kill the server above this footprint (default: 12000)
+  --guard-mb <n>      Kill the server above this footprint (default: 12000; 45000 for
+                      drama3, whose weights alone are about 37 GiB)
   --min-free-pct <n>  macOS: wait up to 5 min for this much free memory (default: 50)
   --port <n>          Server port (default: 18190)
   --server <path>     izwi-server binary (default: target/release/izwi-server)
@@ -35,7 +36,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BACKEND=""
 MODELS=""
 ONLY=""
-GUARD_MB=12000
+GUARD_MB=""
 MIN_FREE_PCT=50
 PORT=18190
 SERVER="${ROOT}/target/release/izwi-server"
@@ -102,7 +103,7 @@ swap_mib() {
 # Samples the footprint once a second and kills the server above the guard.
 # Readings above 1 TiB are sampler glitches and are recorded but ignored.
 guard_server() {
-    local pid="$1" log="$2" mib
+    local pid="$1" log="$2" guard="$3" mib
     while kill -0 "${pid}" 2>/dev/null; do
         mib="$(footprint_mib "${pid}" || true)"
         if [[ -n "${mib}" ]]; then
@@ -110,7 +111,7 @@ guard_server() {
                 echo "$(date +%s) bogus ${mib}" >> "${log}"
             else
                 echo "$(date +%s) ${mib} swap=$(swap_mib)" >> "${log}"
-                if (( mib > GUARD_MB )); then
+                if (( mib > guard )); then
                     echo "$(date +%s) guard ${mib}" >> "${log}"
                     kill -9 "${pid}" 2>/dev/null || true
                     return
@@ -119,6 +120,25 @@ guard_server() {
         fi
         sleep 1
     done
+}
+
+# The footprint guard for a family: --guard-mb when given, else 45000 MiB
+# for Fish Audio Drama 3 (about 37 GiB resident plus load transients; the
+# default would kill it while it loads) and 12000 MiB for the rest.
+family_guard_mb() {
+    if [[ -n "${GUARD_MB}" ]]; then
+        echo "${GUARD_MB}"
+    elif [[ "$1" == "drama3" ]]; then
+        echo 45000
+    else
+        echo 12000
+    fi
+}
+
+# Seconds a load may take: Drama 3 reads 41.5 GB (and converts its experts
+# to Q8_0 on the CPU).
+family_load_timeout() {
+    if [[ "$1" == "drama3" ]]; then echo 3600; else echo 1200; fi
 }
 
 port_owner() {
@@ -165,12 +185,14 @@ for item in "${MODEL_LIST[@]}"; do
         kill "${server_pid}" 2>/dev/null || true
         exit 3
     fi
-    guard_server "${server_pid}" "${memory_log}" &
+    guard_mb="$(family_guard_mb "${family}")"
+    guard_server "${server_pid}" "${memory_log}" "${guard_mb}" &
     guard_pid=$!
-    echo "== ${model} (${family}) backend=${BACKEND} free=${free_pct:-?}% swap=$(swap_mib)M"
+    echo "== ${model} (${family}) backend=${BACKEND} free=${free_pct:-?}% swap=$(swap_mib)M guard=${guard_mb}M"
 
     started="$(now)"
-    load_status="$(curl -s -o "${dir}/load.json" -w '%{http_code}' -X POST --max-time 1200 \
+    load_status="$(curl -s -o "${dir}/load.json" -w '%{http_code}' -X POST \
+        --max-time "$(family_load_timeout "${family}")" \
         "${BASE}/v1/admin/models/${model}/load" || echo 000)"
     load_secs="$(python3 -c "print(round($(now) - ${started}, 2))")"
     sleep 2

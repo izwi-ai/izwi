@@ -1,5 +1,6 @@
 # Exact-SHA cuda ASR/TTS concurrency evidence matrix.
-# This workload records portable correctness and c1/c2/c4/c8 responsiveness.
+# This workload records portable correctness and c1/c2/c4/c8 responsiveness
+# (Fish Audio Drama 3 at its own widths, below).
 # Accelerator throughput is certified only when this manifest is run on the
 # exact named device and retained with its runtime/hardware artifacts.
 
@@ -85,3 +86,20 @@ text = "Continuous audio batching should remain responsive and clear."
 
 [benchmarks.matrix]
 concurrent = [1, 2, 4, 8]
+
+# Drama 3 speaks without a reference too (its seed sets the voice); it is
+# measured cloning the same reference as Fish S2 Pro. CUDA decodes eight
+# rows together; c16 and c32 measure the queue past that width.
+[[benchmarks]]
+name = "fish-drama3-tts-cuda-concurrency"
+command = "tts"
+model = "FishAudio-Drama-3"
+iterations = 8
+warmup = true
+stream = true
+text = "Continuous audio batching should remain responsive and clear."
+reference_audio = "../../data/fox.wav"
+reference_text_file = "../../data/fox.md"
+
+[benchmarks.matrix]
+concurrent = [1, 2, 4, 8, 16, 32]
