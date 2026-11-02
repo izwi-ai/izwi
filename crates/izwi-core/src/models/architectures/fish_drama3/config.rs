@@ -91,10 +91,11 @@ mod published {
 
 /// The policy a lifecycle load of `model_dir` holds its `config.json` to:
 /// the published one, except for a test build's synthetic checkpoint marked
-/// for the lifecycle (`synthetic::LIFECYCLE_MARKER`). A release build has no
-/// way to load anything but the pinned geometry.
+/// for the lifecycle (`synthetic::LIFECYCLE_MARKER`; this crate's tests, or
+/// another crate's through the `test-support` feature). A release build has
+/// no way to load anything but the pinned geometry.
 pub(crate) fn lifecycle_policy(model_dir: &Path) -> FishDrama3ConfigPolicy {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if super::synthetic::marked_for_lifecycle(model_dir) {
         return FishDrama3ConfigPolicy::Synthetic;
     }

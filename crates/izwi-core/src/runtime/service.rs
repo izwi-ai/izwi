@@ -579,6 +579,29 @@ pub(super) fn retained_engine_request_input_bytes(request: &EngineCoreRequest) -
     for keyword in &request.asr_task.keywords {
         add_owned_string_capacity(&mut total, keyword, "request ASR keyword")?;
     }
+    add_retained_allocation(
+        &mut total,
+        request.tts_chunk_history.capacity(),
+        std::mem::size_of::<crate::runtime::SpeechChunkTurn>(),
+        "request chunk history",
+    )?;
+    for turn in &request.tts_chunk_history {
+        add_owned_string_capacity(&mut total, &turn.text, "request chunk history text")?;
+        add_retained_allocation(
+            &mut total,
+            turn.codes.codebooks.capacity(),
+            std::mem::size_of::<Vec<u32>>(),
+            "request chunk history codebooks",
+        )?;
+        for codebook in &turn.codes.codebooks {
+            add_retained_allocation(
+                &mut total,
+                codebook.capacity(),
+                std::mem::size_of::<u32>(),
+                "request chunk history codes",
+            )?;
+        }
+    }
     add_generation_param_allocations(&mut total, &request.params)?;
     add_retained_allocation(
         &mut total,

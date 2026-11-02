@@ -4,8 +4,6 @@
 use std::cell::Cell;
 use std::sync::{Arc, OnceLock};
 
-use serde_json::{json, Value};
-
 use super::super::config::tests::published;
 use super::super::config::FishDrama3ConfigPolicy;
 use super::super::prompt::{
@@ -13,153 +11,9 @@ use super::super::prompt::{
 };
 use super::super::sampling::{FishDrama3RowSampler, FishDrama3SamplingParams};
 use super::super::synthetic::{SyntheticCheckpoint, SyntheticGeometry};
-use super::super::tokenizer::{semantic_token, speaker_token};
+use super::super::test_support::{stub_frame, tokenizer_json, StubCodec};
 use super::*;
 use crate::kernels::numeric_check::relative_l2;
-
-/// A stateless codec: each frame's 2,048 samples come from its codes alone.
-pub(crate) struct StubCodec;
-
-const STUB_SAMPLES: usize = 2048;
-
-fn stub_frame(codes: &[u32]) -> impl Iterator<Item = f32> + '_ {
-    let seed = codes
-        .iter()
-        .enumerate()
-        .map(|(k, &code)| (k as u32 + 1) * code)
-        .sum::<u32>() as f32;
-    (0..STUB_SAMPLES).map(move |j| (seed * 0.01 + j as f32 * 1e-3).sin() * 0.5)
-}
-
-impl FishDrama3FrameCodec for StubCodec {
-    fn sample_rate(&self) -> u32 {
-        44_100
-    }
-
-    fn samples_per_frame(&self) -> Result<usize> {
-        Ok(STUB_SAMPLES)
-    }
-
-    fn codebooks(&self) -> usize {
-        10
-    }
-
-    fn stream_history_bound_bytes(&self) -> Result<u64> {
-        Ok(0)
-    }
-
-    fn stream_frames(
-        &self,
-        _state: &mut FishDrama3DacStreamState,
-        codebooks: &[Vec<u32>],
-        check: FishDrama3CancelCheck<'_>,
-    ) -> Result<Vec<f32>> {
-        check()?;
-        let frames = codebooks[0].len();
-        Ok((0..frames)
-            .flat_map(|f| {
-                let codes = codebooks.iter().map(|row| row[f]).collect::<Vec<_>>();
-                stub_frame(&codes).collect::<Vec<_>>()
-            })
-            .collect())
-    }
-
-    fn stream_frames_batch(
-        &self,
-        states: &mut [FishDrama3DacStreamState],
-        codebooks: &[Vec<Vec<u32>>],
-        check: FishDrama3CancelCheck<'_>,
-    ) -> Result<Vec<Vec<f32>>> {
-        states
-            .iter_mut()
-            .zip(codebooks)
-            .map(|(state, codes)| self.stream_frames(state, codes, check))
-            .collect()
-    }
-
-    fn encode_reference(
-        &self,
-        samples: &[f32],
-        _sample_rate: u32,
-        check: FishDrama3CancelCheck<'_>,
-    ) -> Result<FishDrama3Codes> {
-        check()?;
-        let frames = samples.len().div_ceil(STUB_SAMPLES);
-        Ok(FishDrama3Codes::new(
-            (0..10)
-                .map(|k| {
-                    (0..frames)
-                        .map(|f| ((k * 7 + f * 13) % 64) as u32)
-                        .collect()
-                })
-                .collect(),
-        ))
-    }
-}
-
-/// A WordLevel tokenizer laid out like the synthetic checkpoint's ids: pad
-/// 468, `<|im_start|>` 469, eos 470, audio pad 480, `<|voice|>` 494,
-/// speakers 496..=511, the semantic band 512..=575.
-fn tokenizer_json() -> Value {
-    let mut controls: Vec<(String, u32)> = vec![
-        ("<|endoftext|>".into(), 468),
-        ("<|im_start|>".into(), 469),
-        ("<|im_end|>".into(), 470),
-        ("<|audio_pad|>".into(), 480),
-        ("<|voice|>".into(), 494),
-        ("<|interleave|>".into(), 495),
-    ];
-    controls.extend((0..16).map(|index| (speaker_token(index), 496 + index as u32)));
-    controls.extend((0..64).map(|code| (semantic_token(code), 512 + code as u32)));
-    let words = [
-        "system",
-        "user",
-        "assistant",
-        "convert",
-        "the",
-        "provided",
-        "text",
-        "to",
-        "speech",
-        "reference",
-        "following:",
-        "hello",
-        "world.",
-        "Text:",
-        "Speech:",
-        "one",
-        "two",
-        "three",
-    ];
-    let mut vocab = serde_json::Map::new();
-    vocab.insert("<unk>".into(), 0.into());
-    for (index, word) in words.iter().enumerate() {
-        vocab.insert((*word).into(), (index + 1).into());
-    }
-    for (token, id) in &controls {
-        vocab.insert(token.clone(), (*id).into());
-    }
-    let added = controls
-        .iter()
-        .map(|(token, id)| {
-            json!({
-                "id": id, "content": token, "single_word": false, "lstrip": false,
-                "rstrip": false, "normalized": false, "special": true
-            })
-        })
-        .collect::<Vec<_>>();
-    json!({
-        "version": "1.0",
-        "truncation": null,
-        "padding": null,
-        "added_tokens": added,
-        "normalizer": null,
-        "pre_tokenizer": {"type": "WhitespaceSplit"},
-        "post_processor": null,
-        "decoder": null,
-        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"}
-    })
-}
 
 /// The synthetic checkpoint with its tokenizer: a model directory the
 /// family loads with [`StubCodec`] (the engine's tests use it too).
@@ -180,24 +34,6 @@ pub(crate) fn write_synthetic_model_in(
     )
     .unwrap();
     synthetic
-}
-
-/// The synthetic checkpoint with its tokenizer at `dir` (a runtime's
-/// `models_dir/<variant>`), marked for the lifecycle: a test loads it
-/// through `RuntimeService` as it would the published one.
-pub(crate) fn write_lifecycle_synthetic_model(dir: &std::path::Path, seed: u64) {
-    write_lifecycle_synthetic_model_in(dir, seed, SyntheticGeometry::L0);
-}
-
-/// [`write_lifecycle_synthetic_model`] in `geometry`.
-pub(crate) fn write_lifecycle_synthetic_model_in(
-    dir: &std::path::Path,
-    seed: u64,
-    geometry: SyntheticGeometry,
-) {
-    super::super::synthetic::write_geometry_at(dir, seed, geometry);
-    std::fs::write(dir.join("tokenizer.json"), tokenizer_json().to_string()).unwrap();
-    std::fs::write(dir.join(super::super::synthetic::LIFECYCLE_MARKER), b"").unwrap();
 }
 
 #[test]
@@ -969,6 +805,48 @@ fn the_chunk_session_keeps_pinned_and_latest_history() {
         results[1].prompt_rows,
         planned_rows(tokenizer, &[], [&first], &session.chunks()[1]).unwrap()
     );
+}
+
+/// A chunk's preparation (the engine's stage 0) holds the history its
+/// session keeps, laid out as the session's own prompt builder lays it out:
+/// the pinned first chunk, then the latest. Without history it is the
+/// plain prompt; more than those two turns is refused.
+#[test]
+fn a_prepared_chunk_holds_its_session_history() {
+    use super::super::prompt::build_chunk_prompt;
+    let model = model();
+    let text = "hello world.";
+    let turn = |index: usize, frames| FishDrama3HistoryTurn {
+        text: format!("one two {index}"),
+        codes: turn_codes(frames, index),
+    };
+    let history = [turn(0, 5), turn(2, 3)];
+    let artifact = model.prepare_request(&[], &history, text, 8, &ok).unwrap();
+    assert_eq!(artifact.history_turns(), 2);
+    let mut session = FishDrama3History::new();
+    for held in &history {
+        session.push(held.clone());
+    }
+    let expected =
+        build_chunk_prompt(model.tokenizer(), &[], &session, text, MAX_PROMPT_ROWS).unwrap();
+    assert_eq!(**artifact.prompt(), expected.prompt);
+    assert!(history
+        .iter()
+        .all(|held| holds(artifact.prompt(), &held.codes)));
+
+    let plain = model.prepare_request(&[], &[], text, 8, &ok).unwrap();
+    assert_eq!(plain.history_turns(), 0);
+    assert_eq!(
+        **plain.prompt(),
+        build_prompt(model.tokenizer(), &[], [], text).unwrap()
+    );
+    assert!(plain.prompt_rows() < artifact.prompt_rows());
+
+    let three = [turn(0, 1), turn(1, 1), turn(2, 1)];
+    assert!(matches!(
+        model.prepare_request(&[], &three, text, 8, &ok),
+        Err(Error::InvalidInput(_))
+    ));
 }
 
 /// References go through the cache (a repeat hits), at most 8 of them and

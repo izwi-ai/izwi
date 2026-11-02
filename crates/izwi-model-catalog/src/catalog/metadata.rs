@@ -1212,6 +1212,15 @@ impl ModelVariant {
         matches!(self.family(), crate::catalog::ModelFamily::FishS2Tts)
     }
 
+    /// Whether this model speaks long text as a chunk session: its own
+    /// chunker cuts the text, and each chunk's prompt holds earlier chunks
+    /// with the codes generated for them (the first, pinned, and the
+    /// latest), so the server carries those codes from one chunk request to
+    /// the next and one voice runs through the whole text.
+    pub fn continues_speech_across_chunks(&self) -> bool {
+        self.family() == crate::catalog::ModelFamily::FishDrama3Tts
+    }
+
     /// Whether a streamed request of this model delivers its audio only as
     /// stream chunks: the engine keeps no terminal copy of the PCM, and the
     /// stream's queue capacity is frozen before admission so its output

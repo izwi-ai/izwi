@@ -33,7 +33,7 @@ fn synthetic_models_dir(tag: &str) -> ModelsDir {
         "izwi-fish-drama3-runtime-{tag}-{}",
         uuid::Uuid::new_v4()
     ));
-    crate::models::architectures::fish_drama3::model::tests::write_lifecycle_synthetic_model(
+    crate::models::architectures::fish_drama3::test_support::write_lifecycle_synthetic_model(
         &root.join(VARIANT.dir_name()),
         5,
     );
@@ -453,6 +453,152 @@ async fn synthetic_drama3_cancels_mid_prefill_and_mid_decode() {
     runtime.unload_model(VARIANT).await.expect("unload");
 }
 
+/// Streams `request` to its end: its PCM and the codes its final chunk
+/// carried back.
+async fn stream_with_codes(
+    runtime: &RuntimeService,
+    request: GenerationRequest,
+) -> crate::error::Result<(Vec<f32>, Option<crate::runtime::SpeechFrameCodes>)> {
+    let (tx, mut rx) = mpsc::channel(256);
+    let run = Box::pin(runtime.generate_streaming(request, tx));
+    let collect = async {
+        let (mut samples, mut codes) = (Vec::new(), None);
+        while let Some(chunk) = rx.recv().await {
+            samples.extend_from_slice(&chunk.samples);
+            if let Some(generated) = chunk.generated_codes {
+                assert!(chunk.is_final, "codes come back on the final chunk only");
+                codes = Some(std::sync::Arc::unwrap_or_clone(generated));
+            }
+        }
+        (samples, codes)
+    };
+    let (result, collected) = tokio::join!(run, collect);
+    result.map(|()| collected)
+}
+
+/// Long text as a chunk session through the runtime (§7.5): each chunk is
+/// one request whose prompt holds the earlier chunks it carries (the
+/// pinned first and the latest), and whose final chunk hands back the
+/// codes it generated, the codes of exactly the audio it streamed. A chunk
+/// without its history speaks otherwise. Only a model that continues
+/// speech across chunks takes history.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn synthetic_drama3_chunks_carry_their_history_through_the_runtime() {
+    use crate::models::architectures::fish_drama3::test_support::stub_frame;
+    use crate::models::architectures::fish_drama3::{
+        FishDrama3Codes, FishDrama3History, FishDrama3HistoryTurn,
+    };
+    use crate::runtime::SpeechChunkTurn;
+    let _authority = crate::engine::resources::test_support::authority_test_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let models = synthetic_models_dir("chunks");
+    let runtime = runtime_with(&models).await;
+    let chunks = ["one two.", "three hello.", "world. one."];
+
+    // A seed whose three chunks each end on eos, each chunk carrying the
+    // pinned first chunk and the latest, as the server's plan runs them.
+    let mut found = None;
+    'seeds: for seed in 0..64u64 {
+        let mut history: Vec<SpeechChunkTurn> = Vec::new();
+        let mut spoken = Vec::new();
+        for (index, text) in chunks.iter().enumerate() {
+            let mut chunk = request(text, seed + index as u64);
+            chunk.chunk_history = history.clone();
+            match stream_with_codes(&runtime, chunk).await {
+                Ok((samples, Some(codes))) => {
+                    let turn = SpeechChunkTurn {
+                        text: (*text).into(),
+                        codes,
+                    };
+                    // Pinned first chunk, then the latest.
+                    if history.len() == 2 {
+                        history.pop();
+                    }
+                    history.push(turn.clone());
+                    spoken.push((samples, turn));
+                }
+                Ok((_, None)) => panic!("chunk {index} returned no codes"),
+                Err(error) if error.to_string().contains("frame_limit") => continue 'seeds,
+                Err(error) => panic!("seed {seed} chunk {index}: {error}"),
+            }
+        }
+        found = Some((seed, spoken));
+        break;
+    }
+    let (seed, spoken) = found.expect("a seed whose three chunks end on eos");
+    for (samples, turn) in &spoken {
+        // The codes are the streamed audio's, frame for frame.
+        let frames = assert_whole_frames(samples);
+        assert_eq!(turn.codes.frames(), frames);
+        assert_eq!(turn.codes.codebooks.len(), 10);
+        let decoded = (0..frames)
+            .flat_map(|f| {
+                let codes = turn
+                    .codes
+                    .codebooks
+                    .iter()
+                    .map(|row| row[f])
+                    .collect::<Vec<_>>();
+                stub_frame(&codes).collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bits(&decoded), bits(samples));
+    }
+
+    // The third chunk without its history speaks otherwise: the history
+    // reached its prompt.
+    let (alone, _) = stream_with_codes(&runtime, request(chunks[2], seed + 2))
+        .await
+        .unwrap_or_default();
+    assert_ne!(bits(&alone), bits(&spoken[2].0));
+
+    // The family's session keeps the same turns the requests carried: each
+    // chunk's preparation over the same load holds every one of them.
+    let model = runtime
+        .model_registry
+        .get_fish_drama3_tts_lease(VARIANT)
+        .await
+        .expect("loaded");
+    let mut history = FishDrama3History::new();
+    for (index, (text, (_, turn))) in chunks.iter().zip(&spoken).enumerate() {
+        let held = history
+            .candidates()
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let artifact = model
+            .prepare_request(&[], &held, text, BUDGET, &|| Ok(()))
+            .expect("prepare in process");
+        assert_eq!(artifact.history_turns(), index.min(2), "chunk {index}");
+        history.push(FishDrama3HistoryTurn {
+            text: (*text).into(),
+            codes: FishDrama3Codes::new(turn.codes.codebooks.clone()),
+        });
+    }
+
+    // A model that does not continue speech across chunks takes no history.
+    let mut foreign = GenerationRequest::new("hello");
+    foreign.model_variant = Some(ModelVariant::FishAudioS2Pro);
+    foreign.chunk_history = vec![spoken[0].1.clone()];
+    let error = crate::runtime::request::TtsRuntimeRequest::from_generation(
+        foreign,
+        ModelVariant::FishAudioS2Pro,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("does not continue speech across chunks"),
+        "{error}"
+    );
+    drop(model);
+    runtime.unload_model(VARIANT).await.expect("unload");
+}
+
 /// A machine that cannot hold the load is refused at admission, before the
 /// model is published; once the memory is free the same load succeeds.
 #[allow(clippy::await_holding_lock)]
@@ -639,7 +785,7 @@ mod metal {
             "izwi-fish-drama3-metal-runtime-{tag}-{}",
             uuid::Uuid::new_v4()
         ));
-        crate::models::architectures::fish_drama3::model::tests::write_lifecycle_synthetic_model_in(
+        crate::models::architectures::fish_drama3::test_support::write_lifecycle_synthetic_model_in(
             &root.join(VARIANT.dir_name()),
             5,
             SyntheticGeometry::KernelHeads,
@@ -826,7 +972,7 @@ mod cuda {
             "izwi-fish-drama3-cuda-runtime-{tag}-{}",
             uuid::Uuid::new_v4()
         ));
-        crate::models::architectures::fish_drama3::model::tests::write_lifecycle_synthetic_model_in(
+        crate::models::architectures::fish_drama3::test_support::write_lifecycle_synthetic_model_in(
             &root.join(VARIANT.dir_name()),
             5,
             SyntheticGeometry::KernelHeads,

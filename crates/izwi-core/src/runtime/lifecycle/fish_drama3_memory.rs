@@ -690,10 +690,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn a_metal_load_holds_what_its_census_prices() {
-        use crate::models::architectures::fish_drama3::model::tests::{
-            write_synthetic_model_in, StubCodec,
-        };
+        use crate::models::architectures::fish_drama3::model::tests::write_synthetic_model_in;
         use crate::models::architectures::fish_drama3::synthetic::SyntheticGeometry;
+        use crate::models::architectures::fish_drama3::test_support::StubCodec;
         use crate::models::architectures::fish_drama3::{FishDrama3Model, FishDrama3ModelOptions};
         let Some((device, _lease)) =
             crate::backends::metal_test_device_or_skip("a_metal_load_holds_what_its_census_prices")
@@ -727,10 +726,9 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn a_cuda_load_holds_what_its_census_prices() {
-        use crate::models::architectures::fish_drama3::model::tests::{
-            write_synthetic_model_in, StubCodec,
-        };
+        use crate::models::architectures::fish_drama3::model::tests::write_synthetic_model_in;
         use crate::models::architectures::fish_drama3::synthetic::SyntheticGeometry;
+        use crate::models::architectures::fish_drama3::test_support::StubCodec;
         use crate::models::architectures::fish_drama3::{FishDrama3Model, FishDrama3ModelOptions};
         let Some(device) = crate::kernels::cuda::cuda_test_device() else {
             return;

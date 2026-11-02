@@ -45,8 +45,11 @@ pub mod reference_cache;
 mod reference_tests;
 pub mod residency;
 pub mod sampling;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod synthetic;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod tokenizer;
 pub mod tower;
 pub mod trunk;

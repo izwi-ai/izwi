@@ -63,6 +63,7 @@ use crate::runtime::audio_io::{
     validate_base64_audio_retained_size, validate_base64_audio_source_input,
     MAX_AUDIO_SOURCE_BYTES, MAX_REFERENCE_SOURCE_BYTES,
 };
+use crate::runtime::{SpeechChunkTurn, SpeechFrameCodes};
 
 mod asr_preparation;
 mod chat_preparation;
@@ -1121,11 +1122,50 @@ pub struct EngineCoreRequest {
     pub(crate) streaming_tx: Option<mpsc::Sender<StreamingOutput>>,
     /// Cooperative cancellation signal set without waiting for the core write lock.
     pub(crate) cancellation: Option<Arc<AtomicBool>>,
+    /// Earlier chunks of a long-text chunk session, oldest first, that this
+    /// request's prompt holds with their generated codes (Fish Audio
+    /// Drama 3); empty for every other request.
+    pub(crate) tts_chunk_history: Vec<SpeechChunkTurn>,
+    /// Where the request's generated codes go, when its caller asked for
+    /// them to carry into the next chunk.
+    pub(crate) tts_generated_codes: Option<TtsGeneratedCodesSink>,
+}
+
+/// One slot for the codec codes a speech request generated: the executor
+/// publishes them when it finalizes the request, and the runtime takes them
+/// once the request has ended. Clones of a request share the slot.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TtsGeneratedCodesSink(Arc<Mutex<Option<SpeechFrameCodes>>>);
+
+impl TtsGeneratedCodesSink {
+    pub(crate) fn publish(&self, codes: SpeechFrameCodes) {
+        *self.0.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(codes);
+    }
+
+    pub(crate) fn take(&self) -> Option<SpeechFrameCodes> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+    }
 }
 
 impl EngineCoreRequest {
     pub(crate) fn set_cancellation_signal(&mut self, signal: Arc<AtomicBool>) {
         self.cancellation = Some(signal);
+    }
+
+    /// The chunk-session history this request's prompt holds.
+    pub(crate) fn tts_chunk_history_for_execution(&self) -> &[SpeechChunkTurn] {
+        &self.tts_chunk_history
+    }
+
+    /// Hands the request's generated codes to its caller, when it asked for
+    /// them.
+    pub(crate) fn publish_tts_generated_codes(&self, codes: impl FnOnce() -> SpeechFrameCodes) {
+        if let Some(sink) = &self.tts_generated_codes {
+            sink.publish(codes());
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {

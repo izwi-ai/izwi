@@ -129,6 +129,7 @@ pub(crate) struct TtsRuntimeRequest {
     reference_text: Option<String>,
     reference_language: Option<String>,
     voice_description: Option<String>,
+    chunk_history: Vec<crate::runtime::SpeechChunkTurn>,
 }
 
 /// How long a TTS stream may wait for its reader before failing: the same
@@ -152,6 +153,11 @@ impl TtsRuntimeRequest {
         if request.text.is_empty() {
             return Err(Error::InvalidInput("TTS request missing text".to_string()));
         }
+        if !request.chunk_history.is_empty() && !model_variant.continues_speech_across_chunks() {
+            return Err(Error::InvalidInput(format!(
+                "{model_variant} does not continue speech across chunks"
+            )));
+        }
 
         Ok(Self {
             envelope: RequestEnvelope::new(model_variant)
@@ -167,6 +173,7 @@ impl TtsRuntimeRequest {
             reference_text: request.reference_text,
             reference_language: request.reference_language,
             voice_description: request.voice_description,
+            chunk_history: request.chunk_history,
         })
     }
 
@@ -178,6 +185,7 @@ impl TtsRuntimeRequest {
         request.reference_text = self.reference_text;
         request.reference_language = self.reference_language;
         request.voice_description = self.voice_description;
+        request.tts_chunk_history = self.chunk_history;
         request.params = params;
         request
     }

@@ -627,7 +627,7 @@ fn load_fish_drama3_tts_model(
     use crate::models::architectures::fish_drama3::FishDrama3ConfigPolicy;
     // A test build loads a synthetic checkpoint marked for the lifecycle
     // as a test would; a release build has no such path.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if crate::models::architectures::fish_drama3::config::lifecycle_policy(model_dir)
         == FishDrama3ConfigPolicy::Synthetic
     {
@@ -824,16 +824,16 @@ const FISH_S2_TTS_LOADER_REGISTRY: &[FishS2TtsLoaderRegistration] =
     }];
 
 /// A synthetic Fish Audio Drama 3 checkpoint
-/// (`fish_drama3::model::tests::write_synthetic_model`), loaded as the
-/// published loader loads but under the synthetic config policy, with the
-/// family's stub codec.
-#[cfg(test)]
+/// (`fish_drama3::test_support::write_lifecycle_synthetic_model`), loaded as
+/// the published loader loads but under the synthetic config policy, with
+/// the family's stub codec.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn load_synthetic_fish_drama3_tts_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
 ) -> Result<FishDrama3Model> {
-    use crate::models::architectures::fish_drama3::model::tests::StubCodec;
+    use crate::models::architectures::fish_drama3::test_support::StubCodec;
     use crate::models::architectures::fish_drama3::{
         FishDrama3ConfigPolicy, FishDrama3ModelOptions,
     };

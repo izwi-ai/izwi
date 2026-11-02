@@ -653,6 +653,12 @@ impl RuntimeService {
             core_request.audio_stream_external_queue_capacity = chunk_tx.max_capacity();
             core_request.mark_audio_streaming_only();
         }
+        // A chunk of a chunk session returns its codes on its final chunk,
+        // for the next chunk's prompt.
+        let generated_codes = resolved_variant
+            .continues_speech_across_chunks()
+            .then(crate::engine::TtsGeneratedCodesSink::default);
+        core_request.tts_generated_codes = generated_codes.clone();
 
         let terminal_deadline = core_request.deadline;
         let budget_frames = core_request.params.max_tokens;
@@ -707,6 +713,10 @@ impl RuntimeService {
                 output.num_tokens,
             ),
         });
+        terminal.generated_codes = generated_codes
+            .as_ref()
+            .and_then(crate::engine::TtsGeneratedCodesSink::take)
+            .map(std::sync::Arc::new);
         send_terminal_tts_chunk(&chunk_tx, terminal, terminal_deadline).await?;
         info!("Streaming generation complete via core engine");
         Ok(())

@@ -460,7 +460,7 @@ fn fish_drama3_files() -> Vec<String> {
 fn fish_drama3_bundle_is_complete(model_dir: &Path) -> bool {
     // Tests load a synthetic checkpoint through the real runtime; it holds
     // the files the loader reads, at their own sizes.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if crate::models::architectures::fish_drama3::synthetic::marked_for_lifecycle(model_dir) {
         return [
             "config.json",

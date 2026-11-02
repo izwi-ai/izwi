@@ -8,12 +8,13 @@ use candle_core::{DType, Device, Tensor};
 
 use super::super::config::FishDrama3ConfigPolicy;
 use super::super::linear::with_split_k_steps;
-use super::super::model::tests::{write_synthetic_model_in, StubCodec};
+use super::super::model::tests::write_synthetic_model_in;
 use super::super::model::{FishDrama3GenerationParams, FishDrama3ModelOptions};
 use super::super::prompt::FishDrama3Prompt;
 use super::super::residency::FishDrama3CpuPrecision;
 use super::super::sampling::FishDrama3SamplingParams;
 use super::super::synthetic::{SyntheticCheckpoint, SyntheticGeometry};
+use super::super::test_support::StubCodec;
 use super::super::tower::FishDrama3TowerOptions;
 use super::super::trunk::FishDrama3TrunkOptions;
 use super::super::FishDrama3Model;

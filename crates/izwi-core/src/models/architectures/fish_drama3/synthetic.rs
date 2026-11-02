@@ -24,10 +24,12 @@ use serde_json::Value;
 use super::checkpoint::{
     expected_census, CensusDtype, FishDrama3Checkpoint, COMPANION_FILES, INDEX_FILE, TRUNK_PREFIX,
 };
-use super::config::tests::PUBLISHED_CONFIG;
 use super::config::{FishDrama3Config, FishDrama3ConfigPolicy};
 use crate::kernels::cuda::fp8::encode_e4m3fn;
 use crate::kernels::numeric_check::xorshift_values;
+
+/// The published `config.json` the synthetic geometries are cut from.
+const PUBLISHED_CONFIG: &str = include_str!("../../../../tests/fixtures/fish_drama3/config.json");
 
 /// A tensor to write: name, dtype, shape, bytes.
 pub(crate) type Written = (String, Dtype, Vec<usize>, Vec<u8>);

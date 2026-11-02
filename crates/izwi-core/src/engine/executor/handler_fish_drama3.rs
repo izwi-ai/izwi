@@ -816,6 +816,11 @@ impl NativeExecutor {
         if active.collect_audio_samples {
             active.audio_samples.extend_from_slice(&tail);
         }
+        // A chunk of a chunk session hands its codes to the next chunk's
+        // prompt (§7.5).
+        request.publish_tts_generated_codes(|| {
+            crate::runtime::SpeechFrameCodes::new(active.state.generated_codes().codebooks)
+        });
         let output_timing = timing(active, active.codec_ms, active.first_audio_ms);
         if let Some(tx) = Self::stream_sender(request) {
             Self::stream_audio_with_policy(

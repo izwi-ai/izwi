@@ -18,11 +18,12 @@
 //! has and the other lacks.
 
 use std::collections::{HashMap, VecDeque};
+use std::ops::Range;
 
 use icu_properties::props::{GeneralCategory, GeneralCategoryGroup, NumericType};
 use icu_properties::CodePointMapData;
 
-use super::prompt::{speaker_tags, strip_white_space, FishDrama3HistoryTurn};
+use super::prompt::{lstrip_white_space, speaker_tags, strip_white_space, FishDrama3HistoryTurn};
 use crate::error::{Error, Result};
 
 /// A threshold, not a hard cap (`chunking.py:21-22`).
@@ -263,11 +264,21 @@ fn break_by_length(pieces: Vec<Piece>, length: usize) -> Vec<Piece> {
 /// bytes, packed sentence by sentence. Text that fits is returned whole and
 /// unstripped; split chunks are stripped of white space.
 pub fn split_by_length(text: &str, length: usize) -> Vec<String> {
+    split_by_length_spans(text, length)
+        .into_iter()
+        .map(|span| text[span].to_string())
+        .collect()
+}
+
+/// [`split_by_length`]'s chunks as byte ranges of `text`: every chunk is a
+/// slice of it, since the passes only partition the text and packing joins
+/// neighbouring pieces.
+pub fn split_by_length_spans(text: &str, length: usize) -> Vec<Range<usize>> {
     if strip_white_space(text).is_empty() {
         return Vec::new();
     }
     if text.len() <= length {
-        return vec![text.to_string()];
+        return std::iter::once(0..text.len()).collect();
     }
     let mut pieces = break_at_marks(protected_pieces(text), 0, SENTENCE_ENDS);
     for marks in [CLAUSE_MARKS, SPACES] {
@@ -275,20 +286,25 @@ pub fn split_by_length(text: &str, length: usize) -> Vec<String> {
     }
     let pieces = break_by_length(pieces, length);
 
+    // `current` is `text[start..end]`.
     let mut chunks = Vec::new();
-    let mut current = String::new();
+    let (mut start, mut end) = (0, 0);
     for (piece, _) in pieces {
-        if !current.is_empty() && current.len() + piece.len() > length {
-            chunks.push(std::mem::take(&mut current));
+        if end > start && end - start + piece.len() > length {
+            chunks.push(start..end);
+            start = end;
         }
-        current.push_str(&piece);
+        end += piece.len();
     }
-    chunks.push(current);
+    chunks.push(start..end);
     chunks
-        .iter()
-        .map(|chunk| strip_white_space(chunk))
-        .filter(|chunk| !chunk.is_empty())
-        .map(str::to_string)
+        .into_iter()
+        .filter_map(|span| {
+            let chunk = &text[span.clone()];
+            let stripped = strip_white_space(chunk).len();
+            let lead = chunk.len() - lstrip_white_space(chunk).len();
+            (stripped > 0).then(|| span.start + lead..span.start + lead + stripped)
+        })
         .collect()
 }
 
@@ -296,19 +312,26 @@ pub fn split_by_length(text: &str, length: usize) -> Vec<String> {
 /// text)` per tagged segment, unstripped; text before the first tag is
 /// speaker `"0"`, and blank segments are dropped.
 pub fn parse_speaker_segments(text: &str) -> Vec<(&str, &str)> {
+    speaker_segment_spans(text)
+        .into_iter()
+        .map(|(speaker, body)| (speaker, &text[body]))
+        .collect()
+}
+
+/// [`parse_speaker_segments`] with each body as a byte range of `text`.
+fn speaker_segment_spans(text: &str) -> Vec<(&str, Range<usize>)> {
     let tags = speaker_tags(text).collect::<Vec<_>>();
     let mut segments = Vec::with_capacity(tags.len() + 1);
-    let head = &text[..tags.first().map_or(text.len(), |&(start, _, _)| start)];
-    if !strip_white_space(head).is_empty() {
+    let head = 0..tags.first().map_or(text.len(), |&(start, _, _)| start);
+    if !strip_white_space(&text[head.clone()]).is_empty() {
         segments.push(("0", head));
     }
     for (index, &(_, end, speaker)) in tags.iter().enumerate() {
         let body_end = tags
             .get(index + 1)
             .map_or(text.len(), |&(start, _, _)| start);
-        let body = &text[end..body_end];
-        if !strip_white_space(body).is_empty() {
-            segments.push((speaker, body));
+        if !strip_white_space(&text[end..body_end]).is_empty() {
+            segments.push((speaker, end..body_end));
         }
     }
     segments
@@ -323,26 +346,49 @@ pub fn parse_speaker_segments(text: &str) -> Vec<(&str, &str)> {
 /// starts when a segment would bring in one speaker too many or exceed
 /// `max_bytes`, so A, B, A can share a chunk.
 pub fn split_text(text: &str, max_bytes: usize, max_speakers: usize) -> Vec<String> {
+    split_text_spans(text, max_bytes, max_speakers)
+        .into_iter()
+        .map(|(chunk, _)| chunk)
+        .collect()
+}
+
+/// [`split_text`]'s chunks, each with the bytes of `text` it speaks: from
+/// its first piece's start to its last piece's end. The ranges ascend and
+/// never overlap; tags and white space between chunks belong to neither. A
+/// tagged chunk is rewritten (its pieces re-tagged and joined), so its
+/// text is not that slice; an untagged one is exactly it.
+pub fn split_text_spans(
+    text: &str,
+    max_bytes: usize,
+    max_speakers: usize,
+) -> Vec<(String, Range<usize>)> {
     if speaker_tags(text).next().is_none() {
-        return split_by_length(text, max_bytes);
+        return split_by_length_spans(text, max_bytes)
+            .into_iter()
+            .map(|span| (text[span.clone()].to_string(), span))
+            .collect();
     }
     let mut segments = Vec::new();
-    for (speaker, body) in parse_speaker_segments(text) {
-        for piece in split_by_length(body, max_bytes) {
-            segments.push((speaker, format!("<|speaker:{speaker}|> {piece}")));
+    for (speaker, body) in speaker_segment_spans(text) {
+        for piece in split_by_length_spans(&text[body.clone()], max_bytes) {
+            let source = body.start + piece.start..body.start + piece.end;
+            let segment = format!("<|speaker:{speaker}|> {}", &text[source.clone()]);
+            segments.push((speaker, segment, source));
         }
     }
 
     let mut chunks = Vec::new();
     let mut batch: Vec<String> = Vec::new();
+    let mut span: Option<Range<usize>> = None;
     let mut speakers: Vec<&str> = Vec::new();
     let mut size = 0;
-    for (speaker, segment) in segments {
+    for (speaker, segment, source) in segments {
         let mut new_speaker = !speakers.contains(&speaker);
         let too_many_speakers = new_speaker && speakers.len() >= max_speakers;
         let too_long = !batch.is_empty() && size + segment.len() > max_bytes;
         if too_many_speakers || too_long {
-            chunks.push(batch.join("\n"));
+            let held = span.take().unwrap_or(source.start..source.start);
+            chunks.push((batch.join("\n"), held));
             batch.clear();
             speakers.clear();
             size = 0;
@@ -350,12 +396,16 @@ pub fn split_text(text: &str, max_bytes: usize, max_speakers: usize) -> Vec<Stri
         }
         size += segment.len();
         batch.push(segment);
+        span = Some(match span {
+            Some(held) => held.start..source.end,
+            None => source,
+        });
         if new_speaker {
             speakers.push(speaker);
         }
     }
-    if !batch.is_empty() {
-        chunks.push(batch.join("\n"));
+    if let Some(held) = span.filter(|_| !batch.is_empty()) {
+        chunks.push((batch.join("\n"), held));
     }
     chunks
 }
@@ -364,12 +414,21 @@ pub fn split_text(text: &str, max_bytes: usize, max_speakers: usize) -> Vec<Stri
 /// `single_chunk`, else [`split_text`] at the defaults, or the text itself
 /// when that yields none (the prompt builder then refuses blank text).
 pub fn plan_chunks(text: &str, single_chunk: bool) -> Vec<String> {
+    plan_chunk_spans(text, single_chunk)
+        .into_iter()
+        .map(|(chunk, _)| chunk)
+        .collect()
+}
+
+/// [`plan_chunks`] with each chunk's source bytes ([`split_text_spans`]);
+/// a whole-text chunk covers all of it.
+pub fn plan_chunk_spans(text: &str, single_chunk: bool) -> Vec<(String, Range<usize>)> {
     if single_chunk {
-        return vec![text.to_string()];
+        return vec![(text.to_string(), 0..text.len())];
     }
-    let chunks = split_text(text, CHUNK_BYTES, CHUNK_MAX_SPEAKERS);
+    let chunks = split_text_spans(text, CHUNK_BYTES, CHUNK_MAX_SPEAKERS);
     if chunks.is_empty() {
-        vec![text.to_string()]
+        vec![(text.to_string(), 0..text.len())]
     } else {
         chunks
     }
@@ -702,6 +761,52 @@ mod tests {
             .flat_map(|c| c.split('\n'))
             .all(|s| s.starts_with("<|speaker:0|> ")));
         assert!(chunks.last().unwrap().ends_with("Short."));
+    }
+
+    /// Each chunk's span is the bytes it speaks: an untagged chunk is that
+    /// slice exactly; a tagged one holds every piece of it, re-tagged. Spans
+    /// ascend without overlapping, so they place each chunk in the text.
+    #[test]
+    fn chunk_spans_locate_each_chunk_in_its_text() {
+        let long = "This sentence is long enough. ".repeat(12);
+        let texts = [
+            long.clone(),
+            format!("  {long}  "),
+            "今天天气很好，我们去公园散步。".repeat(30),
+            format!("intro <|speaker:1|>{long}<|speaker:2|> Yo<|speaker:1|> again."),
+            "<|speaker:0|>A1<|speaker:1|>B1<|speaker:0|>A2<|speaker:2|>C1<|speaker:3|>D1".into(),
+            "<|speaker:1|>Hi<|speaker:2|> Yo".into(),
+            "Hello.".into(),
+        ];
+        for text in &texts {
+            for max_bytes in [20, 100, CHUNK_BYTES] {
+                let spans = split_text_spans(text, max_bytes, CHUNK_MAX_SPEAKERS);
+                assert_eq!(
+                    spans.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>(),
+                    split_text(text, max_bytes, CHUNK_MAX_SPEAKERS)
+                );
+                let mut end = 0;
+                for (chunk, span) in &spans {
+                    assert!(span.start >= end && span.end > span.start, "{text:?}");
+                    end = span.end;
+                    let source = &text[span.clone()];
+                    if speaker_tags(text).next().is_none() {
+                        assert_eq!(chunk, source);
+                        continue;
+                    }
+                    for line in chunk.split("\n<|speaker:") {
+                        let (_, piece) = line.split_once("|> ").unwrap();
+                        assert!(source.contains(piece), "{piece:?} in {source:?}");
+                    }
+                    assert!(source.ends_with(chunk.rsplit("|> ").next().unwrap()));
+                }
+            }
+        }
+        // The whole text when it is one chunk or splits to none.
+        assert_eq!(plan_chunk_spans("a. b.", true), [("a. b.".into(), 0..5)]);
+        assert_eq!(plan_chunk_spans("  ", false), [("  ".into(), 0..2)]);
+        let whole = split_by_length_spans("  Hi.  ", 300);
+        assert_eq!((whole.len(), whole[0].clone()), (1, 0..7));
     }
 
     #[test]

@@ -984,7 +984,10 @@ impl RuntimeService {
         use crate::models::architectures::fish_drama3::codec::{
             maximum_preparation_workspace_bytes, preparation_workspace_bytes,
         };
-        use crate::models::architectures::fish_drama3::FishDrama3ReferenceAudio;
+        use crate::models::architectures::fish_drama3::reference_cache::MAX_REFERENCE_SECONDS;
+        use crate::models::architectures::fish_drama3::{
+            FishDrama3Codes, FishDrama3HistoryTurn, FishDrama3ReferenceAudio,
+        };
         if request.task_type != TaskType::TTS
             || request
                 .model_variant
@@ -1048,7 +1051,13 @@ impl RuntimeService {
         ) {
             (None, None) => None,
             (Some(audio), Some(transcript)) => {
-                let (samples, sample_rate) = decode_reference_audio_base64(audio)?;
+                // Inline clips up to the family's 60 s; saved voices hold
+                // 30 s from upload.
+                let (samples, sample_rate) =
+                    crate::runtime::audio_io::decode_long_reference_audio_base64(
+                        audio,
+                        u64::from(MAX_REFERENCE_SECONDS),
+                    )?;
                 FishDrama3ReferenceAudio {
                     samples: &samples,
                     channels: 1,
@@ -1065,6 +1074,16 @@ impl RuntimeService {
                 ))
             }
         };
+        // A chunk of a chunk session: the earlier chunks its prompt holds,
+        // with the codes generated for them.
+        let history = request
+            .tts_chunk_history_for_execution()
+            .iter()
+            .map(|turn| FishDrama3HistoryTurn {
+                text: turn.text.clone(),
+                codes: FishDrama3Codes::new(turn.codes.codebooks.clone()),
+            })
+            .collect::<Vec<_>>();
         // The decoded clip, its 44.1 kHz copy and the text are host buffers
         // of the preparation; the encoder's workspace is the stage's.
         let codec_rate = model.codec().sample_rate();
@@ -1089,8 +1108,21 @@ impl RuntimeService {
             as u64)
             .saturating_mul(model.config().tower.frame_width() as u64)
             .saturating_mul(4);
+        // The history's copy for the prompt builder.
+        let history_host_bytes = history.iter().fold(0u64, |total, turn| {
+            let codes = turn
+                .codes
+                .codebooks
+                .iter()
+                .map(|codebook| codebook.len() as u64)
+                .sum::<u64>();
+            total
+                .saturating_add(codes.saturating_mul(4))
+                .saturating_add(turn.text.len() as u64)
+        });
         let preparation_host_bytes = reference_host_bytes
             .checked_add(u64::try_from(text.capacity()).unwrap_or(u64::MAX))
+            .and_then(|bytes| bytes.checked_add(history_host_bytes))
             .and_then(|bytes| bytes.checked_add(artifact_bound))
             .ok_or_else(|| {
                 Error::Overloaded("Fish Audio Drama 3 preparation host bytes overflow".into())
@@ -1183,6 +1215,7 @@ impl RuntimeService {
                     .collect::<Vec<_>>();
                 let artifact = model_for_preparation.prepare_request(
                     &references,
+                    &history,
                     &text,
                     max_frames,
                     &check,

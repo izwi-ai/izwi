@@ -285,6 +285,39 @@ pub struct GenerationRequest {
     /// Voice description for voice design models
     #[serde(default)]
     pub voice_description: Option<String>,
+
+    /// Earlier chunks of a long-text chunk session, oldest first, whose
+    /// text and generated codes this chunk's prompt holds (Fish Audio
+    /// Drama 3: the pinned first chunk and the latest). Set by the server's
+    /// segment plan only; never read from or written to a public request.
+    #[serde(skip)]
+    pub chunk_history: Vec<SpeechChunkTurn>,
+}
+
+/// Codec codes a speech request generated, `[codebooks][frames]`. Internal:
+/// a long-text chunk session carries them from one chunk request into the
+/// next; no public request or response holds them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpeechFrameCodes {
+    pub codebooks: Vec<Vec<u32>>,
+}
+
+impl SpeechFrameCodes {
+    pub fn new(codebooks: Vec<Vec<u32>>) -> Self {
+        Self { codebooks }
+    }
+
+    pub fn frames(&self) -> usize {
+        self.codebooks.first().map_or(0, Vec::len)
+    }
+}
+
+/// A completed chunk of a chunk session: the text it spoke, as the session
+/// planned it, and the codes generated for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeechChunkTurn {
+    pub text: String,
+    pub codes: SpeechFrameCodes,
 }
 
 fn generate_request_id() -> String {
@@ -305,6 +338,7 @@ impl GenerationRequest {
             reference_text: None,
             reference_language: None,
             voice_description: None,
+            chunk_history: Vec::new(),
         }
     }
 
@@ -353,6 +387,12 @@ pub struct AudioChunk {
     /// Generation statistics. Final chunks report cumulative request totals,
     /// including terminal markers with no PCM. Non-final statistics are deltas.
     pub stats: Option<ChunkStats>,
+
+    /// On a final chunk of a model that continues speech across chunks
+    /// (`ModelVariant::continues_speech_across_chunks`): the codes the
+    /// request generated, for the next chunk's prompt. Internal: the server
+    /// takes it before forwarding a chunk, so no response carries it.
+    pub generated_codes: Option<std::sync::Arc<SpeechFrameCodes>>,
 }
 
 impl AudioChunk {
@@ -364,6 +404,7 @@ impl AudioChunk {
             sample_rate: 0,
             is_final: false,
             stats: None,
+            generated_codes: None,
         }
     }
 
@@ -375,6 +416,7 @@ impl AudioChunk {
             sample_rate: 0,
             is_final: true,
             stats: None,
+            generated_codes: None,
         }
     }
 

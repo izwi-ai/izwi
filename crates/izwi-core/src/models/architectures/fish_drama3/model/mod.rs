@@ -56,6 +56,7 @@ use candle_core::{DType, Device, Tensor};
 use serde_json::json;
 
 use super::checkpoint::FishDrama3Checkpoint;
+use super::chunking::{FishDrama3History, HISTORY_RECENT_TURNS};
 use super::codec::{
     FishDrama3CodecArtifact, FishDrama3DacConfig, FishDrama3DacDecoder, FishDrama3DacStreamState,
 };
@@ -68,7 +69,9 @@ use super::head::FishDrama3CompactHead;
 use super::precision::{
     activation_dtype, check_activations, moe_backend, FishDrama3CudaChecks, FishDrama3MetalChecks,
 };
-use super::prompt::{FishDrama3Codes, FishDrama3Prompt, FishDrama3Reference};
+use super::prompt::{
+    FishDrama3Codes, FishDrama3HistoryTurn, FishDrama3Prompt, FishDrama3Reference, MAX_PROMPT_ROWS,
+};
 use super::reference_cache::{FishDrama3ReferenceAudio, FishDrama3ReferenceCache, MAX_REFERENCES};
 use super::residency::FishDrama3Residency;
 use super::sampling::{
@@ -588,6 +591,8 @@ pub struct FishDrama3PreparedArtifact {
     prompt: Arc<FishDrama3Prompt>,
     model: u64,
     references: usize,
+    /// Earlier chunks of a chunk session the prompt kept.
+    history_turns: usize,
     reference_cache_hits: usize,
     preparation_ms: f64,
 }
@@ -603,6 +608,12 @@ impl FishDrama3PreparedArtifact {
 
     pub fn references(&self) -> usize {
         self.references
+    }
+
+    /// The earlier chunks of a chunk session the prompt holds: every one
+    /// the request carried when they fit, fewer when the oldest had to go.
+    pub fn history_turns(&self) -> usize {
+        self.history_turns
     }
 
     pub fn reference_cache_hits(&self) -> usize {
@@ -1011,9 +1022,17 @@ impl FishDrama3Model {
     /// A request's preparation (§7.1 stage 0): every reference encoded
     /// through the cache, cancellable between references, then the prompt
     /// built and checked against `max_frames` and the load's positions.
+    ///
+    /// A chunk of a chunk session (§7.5) also carries `history`, its
+    /// session's earlier chunks with their codes, oldest first: the pinned
+    /// first chunk and the latest. The prompt holds as many of them as fit
+    /// beside the references, the text and the budget, dropping the oldest
+    /// recent chunk first and the pinned one last, as
+    /// [`FishDrama3ChunkSession::plan_next`] does.
     pub fn prepare_request(
         &self,
         references: &[(&str, FishDrama3ReferenceAudio<'_>)],
+        history: &[FishDrama3HistoryTurn],
         text: &str,
         max_frames: usize,
         check: FishDrama3CancelCheck<'_>,
@@ -1023,6 +1042,13 @@ impl FishDrama3Model {
             return Err(Error::InvalidInput(format!(
                 "Fish Audio Drama 3 takes at most {MAX_REFERENCES} references; got {}",
                 references.len()
+            )));
+        }
+        if history.len() > 1 + HISTORY_RECENT_TURNS {
+            return Err(Error::InvalidInput(format!(
+                "Fish Audio Drama 3 chunks carry at most {} earlier chunks; got {}",
+                1 + HISTORY_RECENT_TURNS,
+                history.len()
             )));
         }
         let mut encoded = Vec::with_capacity(references.len());
@@ -1037,12 +1063,35 @@ impl FishDrama3Model {
             });
         }
         check()?;
-        let prompt = super::prompt::build_prompt(&self.tokenizer, &encoded, [], text)?;
+        let (prompt, history_turns) = if history.is_empty() {
+            (
+                super::prompt::build_prompt(&self.tokenizer, &encoded, [], text)?,
+                0,
+            )
+        } else {
+            // The session's own policy: the first turn is the pinned chunk,
+            // the next the latest.
+            let mut session = FishDrama3History::new();
+            for turn in history {
+                session.push(turn.clone());
+            }
+            let max_rows = MAX_PROMPT_ROWS.min(self.max_positions().saturating_sub(max_frames));
+            let chunk = super::prompt::build_chunk_prompt(
+                &self.tokenizer,
+                &encoded,
+                &session,
+                text,
+                max_rows,
+            )?;
+            let kept = chunk.history.len();
+            (chunk.prompt, kept)
+        };
         budget::check_positions(prompt.rows, max_frames, self.max_positions())?;
         Ok(FishDrama3PreparedArtifact {
             prompt: Arc::new(prompt),
             model: self.identity,
             references: encoded.len(),
+            history_turns,
             reference_cache_hits: hits,
             preparation_ms: started.elapsed().as_secs_f64() * 1000.0,
         })
