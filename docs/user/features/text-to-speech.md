@@ -235,8 +235,9 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 | `Voxtral-4B-TTS-2603` | ~8.1 GB | Better | Medium |
 | `Chatterbox-500M` | ~3.2 GB | English reference voice, emotion control | Slow |
 | `Chatterbox-Multilingual-500M` | ~3.3 GB | 22 languages, reference voice, emotion control | Slow |
+| `FishAudio-Drama-3` | ~41.5 GB | Seeded or reference voice, performance tags, 44.1 kHz | Slow; needs about 40 GB of memory |
 
-For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `Chatterbox-500M`, `Chatterbox-Multilingual-500M` or `Maya2-Native-2.5B`.  
+For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `FishAudio-Drama-3`, `Chatterbox-500M`, `Chatterbox-Multilingual-500M` or `Maya2-Native-2.5B`.  
 For built-in voice presets, use `Kokoro-82M`, **CustomVoice** variants, `Voxtral-4B-TTS-2603`, `LFM2.5-Audio-1.5B-GGUF`, `LFM3-Audio-2B-GGUF` or `Maya2-Native-2.5B`.  
 For prompt-based voice design, use **VoiceDesign** variants.
 `Kokoro-82M` requires `espeak-ng` to be installed separately.
@@ -264,7 +265,44 @@ or `male` voice in one of 19 locales named with `language` (American English
 when unset). It streams, splits long text into sentences automatically, and
 has no voice cloning, voice design or speed control. The same model also
 transcribes speech and answers in voice chat.
+`FishAudio-Drama-3` (44.1 kHz, Fish Audio Community License v1.0) speaks
+without any voice input, or clones a reference voice; see
+[Fish Audio Drama 3](#fish-audio-drama-3) below.
 For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
+
+---
+
+## Fish Audio Drama 3
+
+`FishAudio-Drama-3` needs no voice input. Without a reference voice, the
+sampling `seed` sets the voice: the same `seed` gives the same voice, and a
+request without one gets a different voice each time. With reference audio and
+its transcript, or a saved voice that has one, it speaks in that voice (see
+[Voice Cloning](/features/voice-cloning)). It reads the language from the text;
+a `[language: xx]` tag in the text steers it.
+
+Tags in the text direct the performance where they stand: `[sighs]`,
+`[laughs]`, `[pause]`, `[gasps]`, `[clears throat]`, `[hesitates]`, free-text
+tags such as `[with quiet excitement]`, and `<whisper>…</whisper>`. They reach
+the model as text.
+
+```bash
+izwi tts "[sighs] It has been a long day. [pause] But we made it, and <whisper>nobody noticed</whisper>." \
+  --model FishAudio-Drama-3 \
+  --output drama3.wav
+```
+
+Long text is spoken as a chunk session. The model's own chunker cuts the text
+into chunks of about 300 bytes, at sentence ends where it can, and each chunk
+is its own generation. Each chunk's prompt holds the reference and the first
+and latest chunks with the audio already generated for them, so the voice
+carries through the whole text. Chunks play one after another with no added
+pause. With `--stream` (or `stream: true` on the API), audio arrives as it is
+generated: first after 4 frames, then every 16 frames.
+
+Its license allows commercial use only below USD 500,000 in annual revenue,
+and offering the model to third parties as a hosted speech service needs a
+license from Fish Audio; see [Models](/models).
 
 ---
 

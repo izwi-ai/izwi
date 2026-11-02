@@ -94,6 +94,7 @@ and realtime route families. Detailed preview behavior is documented in the
 - `Maya2-Native-2.5B` has a CUDA path but has not yet run on an NVIDIA GPU. Its Qwen3 backbone runs in BF16 on CUDA devices with BF16, behind a load-time range probe that falls back to F32; in F16 on Metal, where a failed probe refuses the load (F32 would need 10 GB of weights); and in F32 on CPU. Its depth decoder runs in F16 on Metal and CUDA and in F32 on CPU or after an F32 fallback; Mimi runs in F32 everywhere, and the ECAPA speaker encoder for clones runs on the CPU in F32.
 - `LFM3-Audio-2B-GGUF` and `LFM3-Audio-2B-Q8_0-GGUF` build for CUDA but are compile-checked only: they have not yet run on an NVIDIA GPU. On CUDA the quantized language model, speech encoder, MaskGIT depth decoder and LiquidCodec decoder use Candle CUDA kernels, while mel features, sampling and the inverse FFT run on the host. LFM3 Audio is verified end to end on real weights on CPU and Metal.
 - `Nemotron-3.5-Transcribe-30B-A4B-FP8` builds for CUDA but is compile-checked only: it has not run on an NVIDIA GPU. It needs compute capability 8.0 or newer. See [Nemotron 3.5 Transcribe](#nemotron-35-transcribe).
+- `FishAudio-Drama-3` needs compute capability 8.0 or newer on CUDA; an older GPU is refused before any weights are read. See [Fish Audio Drama 3](#fish-audio-drama-3).
 
 ### Nemotron 3.5 Transcribe
 
@@ -118,6 +119,32 @@ as vLLM's W8A8 path does; it is a parity-testing mode, not a speed-up.
 | [Single-model diarization](/features/diarization#single-model-diarization) (a diarization job that names it as `model`) | Supported |
 | ASR stage of a diarization pipeline | Not supported |
 | Live transcription, voice-mode ASR, audio chat | Not supported (offline model) |
+
+### Fish Audio Drama 3
+
+`FishAudio-Drama-3` runs on CPU, Metal and CUDA. Its codec runs in F32 on every
+backend.
+
+| Backend | Resident weights | Activations and KV | Rows decoded together |
+|---|---|---|---|
+| CPU | About 37 GiB: Q8_0 | F32 math, F32 KV | 1 |
+| Metal | About 37 GiB: raw FP8 experts, F16 other weights | F16, with an F32 residual stream; F16 KV | 1 (2 with `IZWI_FISH_DRAMA3_NATIVE_BATCHING=true`) |
+| CUDA (compute capability 8.0+) | About 37 GiB: raw FP8 experts, BF16 other weights | BF16; BF16 KV | 8 |
+
+Izwi estimates about 40 GB of memory for the model. Each request adds about
+62.8 MiB of recurrent state plus its KV. A load that the backend's memory
+budget cannot hold is refused before any weights are read, with a message
+naming what it needs.
+
+| Capability | Status |
+|---|---|
+| Seeded voice (no reference; the `seed` sets the voice) | Supported |
+| Reference-voice cloning (transcript required; inline clips up to 60 s, saved voices up to 30 s) | Supported |
+| Streaming (`stream: true`, SSE) | Supported |
+| Long text as a chunk session, with the voice carried across chunks | Supported |
+| First-party records played while unfinished, durable jobs resumed between chunks | Supported |
+| Realtime voice sessions | Not supported (they need a model with built-in voices) |
+| Prefix reuse | Not supported |
 
 ### Qwen3.8 CUDA weight residency
 
@@ -280,6 +307,7 @@ The load path currently publishes ABI-v2 state as follows:
 | **Nemotron ASR** | Offline bounded invocation state and retained realtime tensor state | ABI-v2 physical ownership; no Optimized attestation |
 | **Nemotron 3.5 Transcribe** | Each request is a retained row: paged KV for the 6 attention layers plus the Mamba2 recurrent and convolution state (about 48 MiB a row) in the managed arena. Prompts prefill in resumable spans (512 tokens on CPU and Metal, 2,048 on CUDA) whether or not chunked prefill is on, so a one-hour recording never holds the device for its whole prefill; decode runs in batches across rows. A single-model diarization job runs as one such row. No prefix reuse | ABI-v2 physical ownership; no Optimized attestation |
 | **VibeVoice, Fish S2, Voxtral TTS** | Bounded invocation-scoped physical state | ABI-v2 physical ownership; no Optimized attestation |
+| **Fish Audio Drama 3** | Each request is a retained row: two paged KV domains (the 10 trunk attention layers and the 13 tower layers) plus the DeltaNet recurrent and convolution state (about 62.8 MiB a row) in the managed arena. Prompts prefill in resumable spans (256 rows on CPU and Metal, 1,024 on CUDA); decode steps every row one frame at a time, batched across rows, and the codec decodes committed frames in batched quanta. No prefix reuse | ABI-v2 physical ownership; no Optimized attestation |
 | **Chatterbox** | Retained paged T3 state (two guidance branches per request, decoded in batches across requests) plus bounded acoustic-stage scratch, run one step at a time so other requests interleave | Portable route validated on CPU and Metal; CUDA is compile-checked only until NVIDIA evidence is retained |
 | **Maya1** | Retained paged decoder state (decoded in batches across requests) plus bounded SNAC-window scratch, one window per step so other requests interleave | Portable route validated on Metal for both releases, with exact solo parity under load; CUDA is compile-checked only |
 | **Maya 2 Native** | Retained paged backbone state (decoded in batches across requests) plus bounded depth-decoder and Mimi-window scratch, one window per step so other requests interleave | Portable route validated on Metal and CPU, with exact solo parity under load; CUDA has not run on a GPU |

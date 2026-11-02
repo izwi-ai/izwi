@@ -244,6 +244,39 @@ the refusal is quick and leaves nothing half-loaded.
 
 These figures are computed from the model's published configuration.
 
+### Fish Audio Drama 3 refused at load: not enough memory
+
+`FishAudio-Drama-3` holds about 37 GiB of weights on CPU, Metal and CUDA, and
+its load briefly needs a little more, plus room for one request. Izwi works
+this out before reading any weights and refuses a load the backend's memory
+budget cannot hold, with a message such as "Fish Audio Drama 3 needs about …
+GiB of … memory (… GiB of weights, a … GiB load peak, … GiB for one request);
+this device has … GiB".
+
+- Unload other models and load it again:
+  ```bash
+  izwi models unload <model-name>
+  izwi models load FishAudio-Drama-3
+  ```
+- On a Mac, use one with 64 GB or more of unified memory.
+- On NVIDIA, use a GPU with 48 GB or more and compute capability 8.0 or newer;
+  an older GPU is refused before any weights are read.
+- If you set `IZWI_CPU_MEMORY_BUDGET_BYTES`, `IZWI_METAL_MEMORY_BUDGET_BYTES` or
+  `IZWI_CUDA_MEMORY_BUDGET_BYTES`, make sure the budget leaves room for the
+  model.
+
+### Fish Audio Drama 3 request errors
+
+| Error | Cause and fix |
+|-------|---------------|
+| `500` with "generation incomplete: frame_limit reached before end of speech" | A chunk ran out of its frame budget before the model finished speaking. Raise `max_tokens` (up to 4,096 frames per chunk, about 190 s), or shorten the text of that chunk. |
+| `400` "`input` contains `<\|im_end\|>`, a control token … reserves for its prompt" | The text (or `reference_text`) holds one of `<\|im_start\|>`, `<\|im_end\|>`, `<\|voice\|>`, `<\|text\|>`, `<\|interleave\|>` or `<\|semantic:N\|>`. Remove it; performance tags such as `[sighs]` are fine. Fish Audio S2 Pro refuses the same tokens. |
+| `400` naming a speaker tag | Speaker tags run from `<\|speaker:0\|>` to `<\|speaker:15\|>`; other `<\|speaker…` forms are refused. |
+| `400` "Fish Audio Drama 3 long-form generation is disabled by this deployment" | The text needs more than one chunk (about 300 bytes) and the server runs with `IZWI_FISH_DRAMA3_LONG_FORM_ENABLED=false`. Shorten the text, or remove the setting and restart the server. |
+| `400` "Provide both `reference_audio` and `reference_text` together." | A reference clip needs its transcript. Send both, or send neither for a voice set by the `seed`. |
+| `400` "This saved voice has no transcript, …" | The saved voice was stored without a transcript. Use a voice saved with one, or no voice. |
+| `400` "Decoded audio would … production limit" for a reference clip | The reference is longer than 60 seconds. Trim it; 10 to 30 seconds of clear speech is enough. |
+
 ### Model not detected after manual download
 
 1. Verify correct directory:
@@ -461,10 +494,10 @@ Ensure required models are loaded:
 
 | Feature | Required Model Type |
 |---------|---------------------|
-| TTS | `Kokoro-82M`, `Qwen3-TTS-*`, `Voxtral-4B-TTS-2603`, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `Chatterbox-500M` / `Chatterbox-Multilingual-500M`, `Maya1-3B`, `Maya2-Native-2.5B`, or `LFM3-Audio-2B-*` |
+| TTS | `Kokoro-82M`, `Qwen3-TTS-*`, `Voxtral-4B-TTS-2603`, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `FishAudio-Drama-3`, `Chatterbox-500M` / `Chatterbox-Multilingual-500M`, `Maya1-3B`, `Maya2-Native-2.5B`, or `LFM3-Audio-2B-*` |
 | Transcription | `Parakeet-*`, `Whisper-*`, `Qwen3-ASR-*`, `Granite-Speech-*`, `LFM2.5-Audio-*`, or `LFM3-Audio-2B-*` |
 | Chat | `Qwen3.5-*`, `Qwen3.6-*`, `Qwen3.8-*`, `LFM2.5-1.2B-*`, or `LFM3-1.7B-*` |
-| Voice Cloning | `Qwen3-TTS-12Hz-*-Base`, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `Chatterbox-500M` / `Chatterbox-Multilingual-500M`, or `Maya2-Native-2.5B` |
+| Voice Cloning | `Qwen3-TTS-12Hz-*-Base`, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `FishAudio-Drama-3`, `Chatterbox-500M` / `Chatterbox-Multilingual-500M`, or `Maya2-Native-2.5B` |
 | Voice Design | `Qwen3-TTS-12Hz-1.7B-VoiceDesign*` or `Maya1-3B` |
 
 ---

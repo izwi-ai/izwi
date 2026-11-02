@@ -125,8 +125,8 @@ izwi tts "Hello from a built-in CustomVoice speaker" \
 
 ### Reference-audio voice cloning
 
-Base, VibeVoice and FishAudio-S2-Pro models can clone from a reference audio sample. Provide the
-audio and matching transcript together:
+Base, VibeVoice, FishAudio-S2-Pro and FishAudio-Drama-3 models can clone from a reference audio sample.
+Provide the audio and matching transcript together:
 
 ```bash
 izwi tts "This sentence will use the reference voice." \
@@ -257,6 +257,41 @@ audio as it is generated. Sampling follows Liquid AI's defaults (temperature 1.0
 top-k 128); `--temperature` overrides the temperature. It refuses
 `--reference-audio`, `--saved-voice-id`, `--instructions` and `--speed`.
 
+### Fish Audio Drama 3
+
+`FishAudio-Drama-3` needs no voice input. Without a reference, each run picks
+a new voice: `izwi tts` has no seed option, so for a repeatable voice call the
+API with `seed` (see [Audio Speech](/api#audio-speech)). Tags in the text, such
+as `[sighs]`, `[laughs]`, `[pause]`, `[gasps]`, `[clears throat]`,
+`[hesitates]`, free-text ones like `[with quiet excitement]` and
+`<whisper>…</whisper>`, direct the delivery where they stand:
+
+```bash
+izwi tts "[sighs] It has been a long day. [pause] But we made it." \
+  --model FishAudio-Drama-3 \
+  --stream \
+  --output drama3.wav
+```
+
+It clones a voice from `--reference-audio` with its transcript
+(`--reference-text` or `--reference-text-file`), or from `--saved-voice-id`
+when the saved voice has a transcript. A reference file may last up to 60
+seconds:
+
+```bash
+izwi tts "[laughs] I did not expect to see you here." \
+  --model FishAudio-Drama-3 \
+  --reference-audio samples/reference.wav \
+  --reference-text-file samples/reference.txt \
+  --temperature 0.8 \
+  --output drama3-clone.wav
+```
+
+It reads the language from the text. Long text is spoken in chunks of about
+300 bytes that carry the voice from one to the next, and `--stream` writes
+44.1 kHz audio as it is generated. Sampling defaults to temperature 1.0 and
+top-p 0.9; `--temperature` overrides the temperature.
+
 ### Saved voice reuse
 
 Saved voices created through Voice Studio or `/v1/voices` can be reused without
@@ -312,6 +347,7 @@ Izwi saves the streamed audio, then plays it.
 | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | Design | Voice design-capable model family; needs `--instructions` |
 | `VibeVoice-1.5B` | Long-form/reference voice | Reference-voice TTS with long-form positioning |
 | `FishAudio-S2-Pro` | Reference voice | Voice cloning only: needs `--reference-audio` + `--reference-text` or `--saved-voice-id` |
+| `FishAudio-Drama-3` | Seeded/reference voice | Speaks without a voice input, or clones from `--reference-audio` + `--reference-text` or `--saved-voice-id`; performance tags in the text, 44.1 kHz output, Fish Audio Community License v1.0 |
 | `Voxtral-4B-TTS-2603` | Preset voices | 20 built-in voices, 24 kHz output, CC BY-NC 4.0 |
 | `Chatterbox-500M` | Built-in/reference voice | English; built-in `default` voice or cloning from `--reference-audio` alone; watermarked, 24 kHz output, MIT |
 | `Chatterbox-Multilingual-500M` | Built-in/reference voice | Chatterbox in 22 languages chosen with `--language`; watermarked, 24 kHz output, MIT |

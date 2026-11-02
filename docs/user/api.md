@@ -494,6 +494,68 @@ Japanese returns `400` until Izwi has its text processing.
   [Transcription Realtime](#transcription-realtime). It is not a chat model:
   chat completions and Responses refuse it. Prefix reuse is not supported yet.
 
+`FishAudio-Drama-3` specifics:
+
+- It takes the same fields as Fish S2 Pro: `input`, `reference_audio` with
+  `reference_text`, `saved_voice_id`, `stream` / `stream_format`,
+  `response_format`, `temperature`, `top_p`, `top_k`, `max_tokens` and
+  `seed`. `voice` is ignored.
+- A reference voice is optional. Without one, the sampling `seed` sets the
+  voice: the same `seed` gives the same voice, and without a `seed` each
+  request picks one. With one, its transcript is required, inline
+  (`reference_text`) or from a saved voice that has one. One reference per
+  request; an inline clip may last up to 60 s, and saved voices hold up to
+  30 s.
+- `response_format` is `wav`, `pcm_i16` or `pcm_f32`, at 44.1 kHz. `mp3`,
+  `opus`, `ogg`, `aac` and `flac` need `allow_format_fallback: true` and
+  return WAV.
+- `language` is accepted as a hint and not passed to the model, which reads
+  the language from the text; a `[language: xx]` tag in `input` steers it.
+- Tags in `input` reach the model as text: `[sighs]`, `[laughs]`, `[pause]`,
+  `[gasps]`, `[clears throat]`, `[hesitates]`, free-text tags such as
+  `[with quiet excitement]`, `<whisper>…</whisper>` and `[language: xx]`.
+  `speech_capabilities.inline_tags` of `GET /v1/admin/models` lists the
+  trained point tags. Speaker tags `<|speaker:0|>` to `<|speaker:15|>` are
+  accepted; any other `<|speaker…` form returns `400`.
+- Control tokens return `400` naming the token, in `input` and in
+  `reference_text`: `<|im_start|>`, `<|im_end|>`, `<|voice|>`, `<|text|>`,
+  `<|interleave|>` and `<|semantic:N|>`. `FishAudio-S2-Pro` refuses them the
+  same way; it used to pass them into its prompt.
+- Sampling defaults: `temperature` 1.0 and top-p 0.9. Without `top_k` the main
+  token has no cap and the residual codebooks keep 30; `top_k: 0` also means
+  no cap. `seed` seeds the sampler and, for a request without a reference,
+  fixes the voice.
+- Long text is a chunk session. The model's own chunker cuts `input` into
+  chunks of about 300 UTF-8 bytes: sentence ends first, then clause marks,
+  then spaces; decimals, `<|…|>` tokens, `<tag>…</tag>` and `[…]` stay whole;
+  a speaker's lines keep their tag; a chunk holds at most three speakers. Each
+  chunk is its own generation, and chunk `i` samples from `seed + i`. Its
+  prompt holds the reference, the first chunk and the latest chunk with the
+  audio codes generated for them, so the voice carries through the whole
+  text; when a prompt would be too long, the latest chunk is left out first,
+  then the first chunk. A chunk whose prompt is too long for the model before
+  any audio is cut in two and retried. Chunks play one after another with no
+  added pause. The server setting `IZWI_FISH_DRAMA3_LONG_FORM_ENABLED=false`
+  refuses text that needs more than one chunk with `400` (Fish S2 Pro keeps
+  `IZWI_FISH_LONG_FORM_ENABLED`).
+- `max_tokens` is a frame budget per chunk (21.5 frames a second), 1 to
+  4,096; larger values are clamped to 4,096. Unset, each chunk gets about 2.5
+  times its speaking estimate, at most 1,024 frames (about 47 s). A chunk that
+  runs out of budget before the model ends its speech fails the request with
+  a `frame_limit` error (`500`) instead of returning a cut-off take.
+- With `stream: true`, each chunk streams as it is generated: first audio
+  after 4 frames, then every 16 frames. The final `audio.done` event also
+  reports `planned_segment_count` (the chunks) and
+  `token_unit: "semantic_frames"`.
+- First-party text-to-speech records journal their audio per chunk, so an
+  unfinished record can be played from its start
+  (`GET /v1/text-to-speech/{record_id}/events`), and a durable job that stops
+  between chunks resumes with the same voice.
+- The weights' license (Fish Audio Community License v1.0) allows commercial
+  use only below USD 500,000 in annual revenue, and offering the model to
+  third parties as a hosted speech service, such as this API, needs a license
+  from Fish Audio. Nothing is refused because of it.
+
 Non-stream response:
 
 - Body is binary audio.
@@ -987,7 +1049,7 @@ Reusable voice clone references:
 
 Use `saved_voice_id` on `/v1/audio/speech` or first-party generation routes to reuse a saved voice without resending reference audio.
 
-A voice saved without a transcript works with `Chatterbox-500M` and `Chatterbox-Multilingual-500M`, which clone from audio alone. Models that need a transcript (Qwen3-TTS Base, VibeVoice, Fish Audio S2 Pro and Maya 2 Native) return `400` for it, asking for a voice saved with one.
+A voice saved without a transcript works with `Chatterbox-500M` and `Chatterbox-Multilingual-500M`, which clone from audio alone. Models that need a transcript (Qwen3-TTS Base, VibeVoice, Fish Audio S2 Pro, Fish Audio Drama 3 and Maya 2 Native) return `400` for it, asking for a voice saved with one.
 
 `POST /v1/voices` also takes an optional `reference_language`: the language the
 reference is spoken in, one of Maya 2 Native's 12 codes (any other value
@@ -1331,8 +1393,22 @@ Speech model capabilities, when present:
 ```
 
 A model whose text-to-speech records journal their audio as it is generated
-(Fish S2 Pro) also reports `"supports_in_progress_replay": true`: an unfinished
-record of it can be played from its start.
+(Fish S2 Pro and Fish Audio Drama 3) also reports
+`"supports_in_progress_replay": true`: an unfinished record of it can be played
+from its start.
+
+A model that speaks without any voice input (Fish Audio Drama 3) also reports
+`"supports_seeded_voice": true`: a request with no reference gets a voice its
+sampling `seed` sets, so a reference is optional. The field is present only
+when it is `true`. `reference_transcript_required` says whether a reference
+voice needs its transcript.
+
+Model records carry the weights' license label in `license` and, when the
+label alone does not say what it permits, a `license_notice`. Fish Audio
+Drama 3's is "Free for research and non-commercial use; commercial use only
+below USD 500k annual revenue; offering it as a hosted service requires a
+licence from Fish Audio". The notice is informational: nothing is refused
+because of it.
 
 Model records also expose route and batch capability flags so clients can discover which models can drive OpenAI-compatible speech, persisted speech-to-text jobs, diarization records, Studio projects, realtime voice sessions, saved voices, forced alignment, tokenizer workflows, and durable ASR/TTS jobs:
 

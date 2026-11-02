@@ -20,6 +20,7 @@ Those endpoints only show variants that are enabled for download/use.
 | Voxtral TTS | `Voxtral-4B-TTS-2603` |
 | VibeVoice TTS | `VibeVoice-1.5B` |
 | Fish Audio S2 Pro (reference voice only) | `FishAudio-S2-Pro` |
+| Fish Audio Drama 3 (seeded or reference voice; performance tags; reads the language from the text) | `FishAudio-Drama-3` |
 | Chatterbox (English; reference-voice cloning) | `Chatterbox-500M` |
 | Chatterbox Multilingual (22 languages; reference-voice cloning) | `Chatterbox-Multilingual-500M` |
 | Maya1 (voice design from a description; emotion tags) | `Maya1-3B` |
@@ -40,6 +41,29 @@ Those endpoints only show variants that are enabled for download/use.
 > `VibeVoice-1.5B` is a Microsoft long-form TTS model with reference-voice
 > cloning. It uses saved or direct reference voices rather than built-in speaker
 > presets.
+
+> `FishAudio-Drama-3` is Fish Audio's Drama 3 (Fish Audio Community License
+> v1.0), a 35.9B-parameter mixture-of-experts TTS model with about 3B
+> parameters active per frame: a Qwen3.5-MoE trunk and a 13-layer codebook
+> tower write codes that the Fish S2 codec turns into 44.1 kHz audio. It reads
+> the language from the text. Without a reference it speaks in a voice its
+> sampling `seed` sets (the same seed gives the same voice); with reference
+> audio and its transcript, or a saved voice that has one, it speaks in that
+> voice. Tags in the text, such as `[sighs]`, `[laughs]`, `[pause]` or
+> `<whisper>…</whisper>`, direct the delivery where they stand (see
+> [Text-to-Speech](/features/text-to-speech#fish-audio-drama-3)). Long text is
+> spoken in chunks of about 300 bytes, each chunk's prompt carrying the audio
+> of the first and the latest chunks so the voice holds across the text, and
+> audio streams as it is generated. The download is about 41.5 GB, and Izwi
+> estimates about 40 GB of memory: the weights take about 37 GiB on CPU,
+> Metal and CUDA (compute capability 8.0 or newer). A machine that cannot hold
+> it is refused when the model loads, before any weights are read. The license
+> is free for research and non-commercial use, allows commercial use only
+> below USD 500,000 in annual revenue, and grants no right to offer the model
+> to third parties as a hosted speech service, such as an API on Izwi's
+> server; that needs a license from Fish Audio. `izwi pull` prints these terms
+> before it downloads, and `GET /v1/admin/models` reports them in `license`
+> and `license_notice`. Built with Fish Audio.
 
 > `Chatterbox-500M` is Resemble AI's English TTS model (MIT code and weights):
 > a 0.5B Llama speech-token model with classifier-free guidance, then S3Gen flow
@@ -254,6 +278,9 @@ izwi pull Maya1-3B-GGUF
 
 # Download Maya Research Maya 2 Native (about 5.5 GB)
 izwi pull Maya2-Native-2.5B
+
+# Download Fish Audio Drama 3 (about 41.5 GB; needs about 40 GB of memory)
+izwi pull FishAudio-Drama-3
 
 # Download Liquid AI LFM3 Audio (about 1.46 GB, or 2.20 GB with a Q8_0 language model)
 izwi pull LFM3-Audio-2B-GGUF
