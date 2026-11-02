@@ -3473,6 +3473,12 @@ pub(crate) fn cuda_ptx_qk_norm_rope() -> &'static str {
     cuda_ptx::QK_NORM_ROPE
 }
 
+/// The PTX of `kernels/cuda/greedy.cu` (`kernels::greedy`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_greedy() -> &'static str {
+    cuda_ptx::GREEDY
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

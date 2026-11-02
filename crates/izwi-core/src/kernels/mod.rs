@@ -14,6 +14,7 @@ pub mod cpu_q8;
 pub mod cuda;
 pub mod depthwise_conv;
 pub mod f16_weight_linear;
+pub mod greedy;
 pub(crate) mod lfm_shortconv_step;
 pub mod mamba2;
 pub mod metal;
