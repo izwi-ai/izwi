@@ -133,7 +133,7 @@ Then write the key to `./secrets/izwi_api_key` and, in `.env`, replace the `IZWI
 
 ### Offline and proxied networks
 
-- `IZWI_OFFLINE=1` stops the server from contacting Hugging Face at all: model downloads are refused and sizes come from built-in estimates. Copy model files into the `izwi-models` volume yourself.
+- `IZWI_OFFLINE=1` stops the server from contacting Hugging Face at all: model downloads are refused and sizes come from built-in estimates. Copy model files into the `izwi-models` volume yourself. Fish Audio Drama 3 also needs the `izwi-artifact.json` Izwi writes when it checks a download, so copy its whole directory from a machine where Izwi downloaded it (see [Manual Downloads](/models/manual-download#fish-audio-drama-3)).
 - Downloads use `HTTPS_PROXY` (with `NO_PROXY` exceptions) when it is set.
 
 Add either under `environment:` in a compose file of your own, listed after the others in `COMPOSE_FILE`.

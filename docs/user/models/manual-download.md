@@ -342,10 +342,28 @@ huggingface-cli download fishaudio/drama-3 \
   --local-dir "$MODEL_DIR"
 ```
 
-When Izwi downloads the model itself, it checks every file's size and SHA-256
-once, after the download. Every load checks only that each file is present at
-its exact size and that `config.json` has its pinned hash, so check a copy you
-place yourself with `shasum -a 256` (macOS) or `sha256sum` (Linux):
+Izwi lists the model as downloaded only once every file has been checked
+against its pinned SHA-256. Its own download does that once, after the last
+file lands, and records it in `izwi-artifact.json` in the model's directory;
+every load then checks only that each file is present at its exact size and
+that `config.json` has its pinned hash. So finish a copy you placed yourself
+with Izwi's download, or **Download** on the Models page:
+
+```bash
+izwi pull FishAudio-Drama-3
+```
+
+It reads the revision's file list from Hugging Face, finds every file already
+at its size, downloads nothing, hashes each file once (a few minutes for
+41.5 GB) and marks the model downloaded. A file that does not match its pin is
+named in the error: delete it and run `izwi pull` again.
+
+With `IZWI_OFFLINE` set, Izwi contacts no one and downloads nothing, so it
+cannot check a copy. Copy the whole `FishAudio-Drama-3` directory from a
+machine where Izwi downloaded or checked it, `izwi-artifact.json` included.
+
+To check a copy by hand first, use `shasum -a 256` (macOS) or `sha256sum`
+(Linux):
 
 | File | Size (bytes) | SHA-256 |
 |------|--------------|---------|
