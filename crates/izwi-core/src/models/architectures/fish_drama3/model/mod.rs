@@ -1646,8 +1646,9 @@ impl FishDrama3Model {
     /// its sampler draws in the host's order (one launch each on the fused
     /// path, both draws' exponentials uploaded at once; else ranked once and
     /// raced in Candle ops), and every row's picks read back at once
-    /// (readback 1 of the frame). A draw whose kept prefix runs past the
-    /// device's ranks re-runs on the host from the same exponentials.
+    /// (readback 1 of the frame). On the composed race a draw whose kept
+    /// prefix runs past the device's ranks re-runs on the host from the same
+    /// exponentials; the one-launch race bounds any prefix on the device.
     fn draw_main_on_device(
         &self,
         rows: &mut [&mut FishDrama3RequestState],
@@ -1670,7 +1671,6 @@ impl FishDrama3Model {
             let logits = self.head.logits(state.last_hidden()?)?.squeeze(0)?;
             let (first_noise, retry_noise) = state.sampler.main_noise()?;
             let policy = state.params.sampling.main;
-            // `{pick, non_finite, overflow}` of the request's draw, then RAS's.
             if fused {
                 super::device::count_uploads(1);
                 let noise = Tensor::from_vec(
@@ -1720,11 +1720,19 @@ impl FishDrama3Model {
         }
         let values = read_back(&Tensor::cat(&picks, 0)?)?;
         let mut draws = Vec::with_capacity(drawing.len());
-        let (rows_read, _) = values.as_chunks::<6>();
+        // Each row's draw at its policy, then RAS's: `{pick, non_finite}`,
+        // followed by an overflow flag on the composed race.
+        let width = if fused { 4 } else { 6 };
         for ((&index, row), (logits, first_noise, retry_noise, first_candidate, policy)) in
-            drawing.iter().zip(rows_read).zip(kept)
+            drawing.iter().zip(values.chunks_exact(width)).zip(kept)
         {
-            let [first, non_finite, first_overflow, retry, _, retry_overflow] = row;
+            let (first, non_finite, first_overflow, retry, retry_overflow) = match *row {
+                [first, non_finite, retry, _] => (first, non_finite, 0, retry, 0),
+                [first, non_finite, first_overflow, retry, _, retry_overflow] => {
+                    (first, non_finite, first_overflow, retry, retry_overflow)
+                }
+                _ => unreachable!("main draw rows hold 4 or 6 values"),
+            };
             // The row's logits on the host, read once if a fallback needs them.
             let mut host: Option<Vec<f32>> = None;
             let mut on_host = |logits: &Tensor| -> Result<Vec<f32>> {
@@ -1735,7 +1743,7 @@ impl FishDrama3Model {
                 host = Some(values.clone());
                 Ok(values)
             };
-            if *non_finite > 0 {
+            if non_finite > 0 {
                 // The host sampler's error, with its counts.
                 let state = &mut *rows[index];
                 return Err(state
@@ -1760,10 +1768,10 @@ impl FishDrama3Model {
                 count_fallback();
                 host_race(&on_host(&logits)?, policy, first_candidate, noise)
             };
-            let first = decide(*first, *first_overflow, &policy, &first_noise)?;
+            let first = decide(first, first_overflow, &policy, &first_noise)?;
             let retry = decide(
-                *retry,
-                *retry_overflow,
+                retry,
+                retry_overflow,
                 &FishDrama3DrawPolicy::RAS,
                 &retry_noise,
             )?;

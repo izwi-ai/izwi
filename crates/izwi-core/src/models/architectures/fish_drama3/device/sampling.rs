@@ -27,9 +27,10 @@
 //! near-tie (the device sums and exponentiates in F32 in another order).
 //!
 //! On the fused path each race is one launch of `kernels::race_sampler`
-//! (the same rule over the same exponentials): the main draws upload both
-//! their exponentials at once, and a codebook head races every row sharing
-//! a policy in one launch over head-major exponentials.
+//! (the same rule over the same exponentials), which bounds a kept prefix
+//! of any length on the device, so no draw falls back to the host: the main
+//! draws upload both their exponentials at once, and a codebook head races
+//! every row sharing a policy in one launch over head-major exponentials.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -153,7 +154,7 @@ pub(crate) fn race_policy(policy: &FishDrama3DrawPolicy) -> RacePolicy {
 /// The draws of `logits` `[m, V]` (F32 on the device) with `noise` `[m, V]`,
 /// row `r` under `policies[r]`, over candidates `first..V`: one launch per
 /// run of rows sharing a policy (each row's draw depends on its row alone),
-/// `[m, 3]` U32 `{pick, non_finite, overflow}`.
+/// `[m, 2]` U32 `{pick, non_finite}`.
 pub(crate) fn race_rows(
     logits: &Tensor,
     noise: &Tensor,
@@ -371,7 +372,7 @@ mod tests {
                     )
                     .unwrap();
                     assert_eq!(got[r].pick as usize, expected, "seed {seed}, row {r}");
-                    assert_eq!((got[r].non_finite, got[r].overflow), (0, false));
+                    assert_eq!(got[r].non_finite, 0);
                     draws += 1;
                 }
             }
@@ -383,6 +384,26 @@ mod tests {
         let noise = Tensor::from_slice(&exponentials(width, 3), width, &device).unwrap();
         let draw = race(&ranked, &policies[0], &noise).unwrap();
         assert_eq!(draw.overflow.to_vec1::<u32>().unwrap(), [1]);
+        // The one-launch race draws it on the device, as the host does.
+        let packed = race_rows(
+            &flat.unsqueeze(0).unwrap(),
+            &noise.unsqueeze(0).unwrap(),
+            1,
+            &policies[..1],
+        )
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<u32>()
+        .unwrap();
+        let expected = host_race(
+            &vec![0.5f32; width],
+            &policies[0],
+            1,
+            &exponentials(width, 3),
+        )
+        .unwrap();
+        assert_eq!(packed, [expected as u32, 0]);
         // A non-finite logit is counted.
         let mut bad = vec![0.5f32; width];
         bad[7] = f32::NAN;

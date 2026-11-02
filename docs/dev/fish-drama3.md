@@ -205,7 +205,9 @@ other families (`crates/izwi-core/src/kernels/`):
   and about 40 Candle ops. A row's main draw uploads both its exponentials
   (the request's draw and RAS's) at once; a codebook head races every row
   that shares a policy in one launch, over exponentials uploaded head-major.
-  Picks, overflow and non-finite flags read back as before.
+  A kept prefix longer than the 512 sorted ranks (an uncapped main draw over
+  a flat distribution) is bounded by mass on the device, so no draw falls
+  back to the host.
 
 The load compares the kernels on the device with their CPU forms at the
 model's widths and dtype mixes (relative L2 at most 1e-3; the race must

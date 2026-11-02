@@ -18,14 +18,18 @@
 //! select finds the R-th largest `s` (`R <= 512` ranks), the candidates above
 //! it and the lowest-index ties at it are bitonic-sorted, and one thread
 //! walks the ranks. When all `R < candidates` ranks are kept and the cap
-//! allows more, `overflow` asks the caller to redraw on the host.
+//! allows more, the kept prefix runs past them: a second radix descent finds
+//! its end by mass (the largest `s` whose candidates at or above it hold more
+//! than `top_p`), a count select finds the cap's, the ties at both bounds are
+//! kept in candidate order, and the race runs over every kept candidate in
+//! parallel. No draw needs the host.
 //!
 //! Sums run in F32 in a fixed order on every backend, so a row's draw depends
 //! on that row alone and repeats bit for bit; against a host sampler that
 //! sums in F64 it agrees except where rounding splits a near-tie.
 use candle_core::{DType, Device, Result, Tensor};
 
-/// The most ranks one draw materialises.
+/// The most ranks one draw sorts; a longer kept prefix is bounded by mass.
 pub const MAX_RANKS: usize = 512;
 
 /// One draw's policy.
@@ -34,7 +38,7 @@ pub struct RacePolicy {
     /// Already raised to the sampler's floor.
     pub temperature: f32,
     pub top_p: f32,
-    /// `None` keeps every rank (up to [`MAX_RANKS`], then `overflow`).
+    /// `None` keeps every rank.
     pub top_k: Option<usize>,
 }
 
@@ -44,20 +48,18 @@ impl RacePolicy {
     }
 }
 
-/// One row's draw: the picked candidate (an index into the whole row), the
-/// row's non-finite logits (when non-zero the pick is meaningless) and
-/// whether the kept prefix ran past [`MAX_RANKS`].
+/// One row's draw: the picked candidate (an index into the whole row) and
+/// the row's non-finite logits (when non-zero the pick is meaningless).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RaceDraw {
     pub pick: u32,
     pub non_finite: u32,
-    pub overflow: bool,
 }
 
 /// Draws one candidate of each row of `logits` `[rows, vocab]` (F32) with
 /// its row of `noise` (`[rows, vocab]` F32 exponentials, by candidate), over
-/// candidates `first..vocab`. Returns `[rows, 3]` U32 `{pick, non_finite,
-/// overflow}` on the logits' device, for one batched readback.
+/// candidates `first..vocab`. Returns `[rows, 2]` U32 `{pick, non_finite}`
+/// on the logits' device, for one batched readback.
 pub fn race_sample(
     logits: &Tensor,
     noise: &Tensor,
@@ -97,37 +99,35 @@ pub fn race_sample(
                 .zip(n.chunks_exact(vocab))
                 .flat_map(|(row, noise)| {
                     let d = draw_row(row, noise, first, policy);
-                    [d.pick, d.non_finite, u32::from(d.overflow)]
+                    [d.pick, d.non_finite]
                 })
                 .collect::<Vec<_>>();
-            Tensor::from_vec(out, (rows, 3), &Device::Cpu)
+            Tensor::from_vec(out, (rows, 2), &Device::Cpu)
         }
     }
 }
 
-/// The `[rows, 3]` result of [`race_sample`] as draws.
+/// The `[rows, 2]` result of [`race_sample`] as draws.
 pub fn draws(packed: &[u32]) -> Vec<RaceDraw> {
     packed
-        .as_chunks::<3>()
+        .as_chunks::<2>()
         .0
         .iter()
-        .map(|&[pick, non_finite, overflow]| RaceDraw {
-            pick,
-            non_finite,
-            overflow: overflow != 0,
-        })
+        .map(|&[pick, non_finite]| RaceDraw { pick, non_finite })
         .collect()
 }
 
 /// One row on the host, in the kernels' arithmetic: the softmax total
-/// summed in F32 in candidate order, ranks by a stable sort.
+/// summed in F32 in candidate order, ranks by a stable sort, the kept prefix
+/// walked in F32 to its end (a device that bounds a long prefix by mass sums
+/// it in another order, so it agrees except where rounding splits a
+/// near-tie at the bound).
 pub fn draw_row(row: &[f32], noise: &[f32], first: usize, policy: RacePolicy) -> RaceDraw {
     let non_finite = row.iter().filter(|v| !v.is_finite()).count() as u32;
     if non_finite > 0 {
         return RaceDraw {
             pick: first as u32,
             non_finite,
-            overflow: false,
         };
     }
     let t = policy.temperature;
@@ -141,12 +141,10 @@ pub fn draw_row(row: &[f32], noise: &[f32], first: usize, policy: RacePolicy) ->
     let inverse = 1.0 / total;
     let mut order = (first..row.len()).collect::<Vec<_>>();
     order.sort_by(|&a, &b| scaled(b).total_cmp(&scaled(a)));
-    let candidates = order.len();
-    let r_count = policy.ranks().min(candidates);
     let limit = policy.top_k.unwrap_or(usize::MAX);
     let mut cumulative = 0f32;
     let mut kept = 0;
-    for (r, &i) in order.iter().take(r_count).enumerate() {
+    for (r, &i) in order.iter().enumerate() {
         cumulative += (scaled(i) - max).exp() * inverse;
         if r > 0 && (r >= limit || cumulative > policy.top_p) {
             break;
@@ -163,7 +161,6 @@ pub fn draw_row(row: &[f32], noise: &[f32], first: usize, policy: RacePolicy) ->
     RaceDraw {
         pick: best.0 as u32,
         non_finite: 0,
-        overflow: kept == r_count && r_count < candidates && limit > r_count,
     }
 }
 
@@ -208,7 +205,7 @@ mod metal_impl {
             })
             .clone()
             .map_err(candle_core::Error::Msg)?;
-        let out = device.new_buffer(rows * 3, DType::U32, "izwi-race-sample")?;
+        let out = device.new_buffer(rows * 2, DType::U32, "izwi-race-sample")?;
         let params: [u32; 6] = [
             vocab as u32,
             first as u32,
@@ -238,8 +235,8 @@ mod metal_impl {
         );
         drop(encoder);
         Ok(Tensor::from_storage(
-            Storage::Metal(MetalStorage::new(out, device.clone(), rows * 3, DType::U32)),
-            Shape::from((rows, 3)),
+            Storage::Metal(MetalStorage::new(out, device.clone(), rows * 2, DType::U32)),
+            Shape::from((rows, 2)),
             BackpropOp::none(),
             false,
         ))
@@ -259,7 +256,9 @@ static inline bool rs_before(uint ka, uint ia, uint kb, uint ib) {
 }
 
 // One threadgroup of 256 per row. params: vocab, first, temperature bits,
-// cap (0 none), top_p bits, ranks. out[row] = {pick, non_finite, overflow}.
+// cap (0 none), top_p bits, ranks. out[row] = {pick, non_finite}. A kept
+// prefix past the sorted ranks is bounded by mass and by count, as the CUDA
+// kernel's (`cuda/race_sampler.cu`).
 kernel void izwi_race_sample(
     device const float* logits [[buffer(0)]],
     device const float* noise [[buffer(1)]],
@@ -273,6 +272,7 @@ kernel void izwi_race_sample(
     threadgroup float f_scratch[256];
     threadgroup uint u_scratch[256];
     threadgroup atomic_uint slot;
+    threadgroup int spill;
     const int vocab = int(params[0]), first = int(params[1]);
     const float temperature = as_type<float>(params[2]);
     const int cap = int(params[3]);
@@ -298,9 +298,8 @@ kernel void izwi_race_sample(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (non_finite > 0 || candidates <= 0) {
         if (tid == 0) {
-            out[3 * row_index] = uint(first);
-            out[3 * row_index + 1] = non_finite;
-            out[3 * row_index + 2] = 0;
+            out[2 * row_index] = uint(first);
+            out[2 * row_index + 1] = non_finite;
         }
         return;
     }
@@ -413,8 +412,8 @@ kernel void izwi_race_sample(
         }
     }
 
+    const int limit = cap > 0 ? cap : 0x7FFFFFFF;
     if (tid == 0) {
-        const int limit = cap > 0 ? cap : 0x7FFFFFFF;
         float cumulative = 0.0f;
         int kept = 0;
         for (int r = 0; r < r_count; ++r) {
@@ -422,21 +421,155 @@ kernel void izwi_race_sample(
             if (r > 0 && (r >= limit || cumulative > top_p)) { break; }
             ++kept;
         }
-        uint best = idx[0];
-        float best_score = -INFINITY;
-        for (int r = 0; r < kept; ++r) {
-            const float score = precise::divide(
-                precise::exp(precise::divide(row[idx[r]], temperature) - max_s) * inverse,
-                nz[idx[r]]);
-            if (score > best_score) {
+        spill = (kept == r_count && r_count < candidates && limit > r_count) ? 1 : 0;
+        if (spill == 0) {
+            uint best = idx[0];
+            float best_score = -INFINITY;
+            for (int r = 0; r < kept; ++r) {
+                const float score = precise::divide(
+                    precise::exp(precise::divide(row[idx[r]], temperature) - max_s) * inverse,
+                    nz[idx[r]]);
+                if (score > best_score) {
+                    best_score = score;
+                    best = idx[r];
+                }
+            }
+            out[2 * row_index] = best;
+            out[2 * row_index + 1] = 0;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (spill == 0) { return; }
+
+    uint cap_key = 0;
+    uint cap_room = 0xFFFFFFFFu;
+    if (limit < candidates) {
+        for (int bit = 31; bit >= 0; --bit) {
+            const uint t = cap_key | (1u << bit);
+            uint count = 0;
+            for (int i = first + int(tid); i < vocab; i += 256) {
+                count += rs_key(precise::divide(row[i], temperature)) >= t ? 1u : 0u;
+            }
+            u_scratch[tid] = count;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) { u_scratch[tid] += u_scratch[tid + s]; }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (u_scratch[0] >= uint(limit)) { cap_key = t; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        uint count = 0;
+        for (int i = first + int(tid); i < vocab; i += 256) {
+            count += rs_key(precise::divide(row[i], temperature)) > cap_key ? 1u : 0u;
+        }
+        u_scratch[tid] = count;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = 128; s > 0; s >>= 1) {
+            if (tid < s) { u_scratch[tid] += u_scratch[tid + s]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        cap_room = uint(limit) - u_scratch[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint mass_key = 0;
+    for (int bit = 31; bit >= 0; --bit) {
+        const uint t = mass_key | (1u << bit);
+        float mass = 0.0f;
+        for (int i = first + int(tid); i < vocab; i += 256) {
+            const float v = precise::divide(row[i], temperature);
+            if (rs_key(v) >= t) { mass += precise::exp(v - max_s) * inverse; }
+        }
+        f_scratch[tid] = mass;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = 128; s > 0; s >>= 1) {
+            if (tid < s) { f_scratch[tid] += f_scratch[tid + s]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (f_scratch[0] > top_p) { mass_key = t; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mass = 0.0f;
+    for (int i = first + int(tid); i < vocab; i += 256) {
+        const float v = precise::divide(row[i], temperature);
+        if (rs_key(v) > mass_key) { mass += precise::exp(v - max_s) * inverse; }
+    }
+    f_scratch[tid] = mass;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) { f_scratch[tid] += f_scratch[tid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float mass_above = f_scratch[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint cap_ties = 0;
+    float mass_ties = 0.0f;
+    for (int i = lo; i < hi; ++i) {
+        const float v = precise::divide(row[i], temperature);
+        const uint k = rs_key(v);
+        cap_ties += k == cap_key ? 1u : 0u;
+        if (k == mass_key) { mass_ties += precise::exp(v - max_s) * inverse; }
+    }
+    u_scratch[tid] = cap_ties;
+    f_scratch[tid] = mass_ties;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint running = 0;
+        float total = mass_above;
+        for (uint t = 0; t < 256; ++t) {
+            const uint c = u_scratch[t];
+            const float m = f_scratch[t];
+            u_scratch[t] = running;
+            f_scratch[t] = total;
+            running += c;
+            total += m;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint seen = u_scratch[tid];
+    float cumulative = f_scratch[tid];
+    float best_score = -INFINITY;
+    uint best_key = 0, best = 0xFFFFFFFFu;
+    for (int i = lo; i < hi; ++i) {
+        const float v = precise::divide(row[i], temperature);
+        const uint k = rs_key(v);
+        const float p = precise::exp(v - max_s) * inverse;
+        bool counted = k > cap_key;
+        if (k == cap_key) { counted = seen < cap_room; ++seen; }
+        bool massed = k > mass_key;
+        if (k == mass_key) {
+            cumulative += p;
+            massed = cumulative <= top_p;
+        }
+        if (counted && massed) {
+            const float score = precise::divide(p, nz[i]);
+            if (score > best_score || (score == best_score && rs_before(k, uint(i), best_key, best))) {
                 best_score = score;
-                best = idx[r];
+                best_key = k;
+                best = uint(i);
             }
         }
-        out[3 * row_index] = best;
-        out[3 * row_index + 1] = 0;
-        out[3 * row_index + 2] =
-            (kept == r_count && r_count < candidates && limit > r_count) ? 1u : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    f_scratch[tid] = best_score;
+    keys[tid] = best_key;
+    idx[tid] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            const float o = f_scratch[tid + s];
+            if (o > f_scratch[tid]
+                || (o == f_scratch[tid] && rs_before(keys[tid + s], idx[tid + s], keys[tid], idx[tid]))) {
+                f_scratch[tid] = o;
+                keys[tid] = keys[tid + s];
+                idx[tid] = idx[tid + s];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        out[2 * row_index] = idx[0];
+        out[2 * row_index + 1] = 0;
     }
 }
 "#;
@@ -467,8 +600,8 @@ mod cuda_impl {
         let (ls, ns) = (l_layout.start_offset(), n_layout.start_offset());
         let l = l_cuda.as_cuda_slice::<f32>()?.slice(ls..ls + rows * vocab);
         let n = n_cuda.as_cuda_slice::<f32>()?.slice(ns..ns + rows * vocab);
-        // SAFETY: the kernel writes all three words of every row.
-        let out = unsafe { device.alloc::<u32>(rows * 3)? };
+        // SAFETY: the kernel writes both words of every row.
+        let out = unsafe { device.alloc::<u32>(rows * 2)? };
         let function = device.get_or_load_custom_func(
             "izwi_race_sample",
             "izwi_race_sampler",
@@ -496,7 +629,7 @@ mod cuda_impl {
         unsafe { builder.launch(config) }.w()?;
         Ok(Tensor::from_storage(
             Storage::Cuda(CudaStorage::wrap_cuda_slice(out, device.clone())),
-            Shape::from((rows, 3)),
+            Shape::from((rows, 2)),
             BackpropOp::none(),
             false,
         ))
@@ -547,10 +680,10 @@ mod tests {
         },
     ];
 
-    /// The host form against a direct full sort of every candidate: same
-    /// picks, and ties ranked by candidate index.
+    /// The host form: ties ranked by candidate index, and a kept prefix
+    /// walked to its end however long.
     #[test]
-    fn the_host_form_ranks_ties_by_candidate_and_flags_overflow() {
+    fn the_host_form_ranks_ties_by_candidate_and_walks_the_whole_prefix() {
         let width = 4097;
         for seed in 0..6u64 {
             let row = peaked(width, seed);
@@ -558,7 +691,6 @@ mod tests {
                 let noise = exponentials(width, seed + 3);
                 let d = draw_row(&row, &noise, 1, policy);
                 assert_eq!(d.non_finite, 0);
-                assert!(!d.overflow);
                 assert!(d.pick >= 1);
             }
         }
@@ -572,8 +704,11 @@ mod tests {
             top_k: Some(1),
         };
         assert_eq!(draw_row(&flat, &noise, 1, greedy).pick, 1);
-        // An uncapped flat row keeps more than 512 ranks.
-        assert!(draw_row(&flat, &noise, 1, POLICIES[0]).overflow);
+        // An uncapped flat row keeps candidates 1..=3686 under top_p 0.9.
+        let mut late = noise.clone();
+        late[3000] = 1e-3;
+        late[4000] = 1e-4;
+        assert_eq!(draw_row(&flat, &late, 1, POLICIES[0]).pick, 3000);
         let mut bad = flat.clone();
         bad[7] = f32::NAN;
         bad[9] = f32::INFINITY;
@@ -609,11 +744,51 @@ mod tests {
                 assert_eq!(got, expected, "policy {p}, first {first}");
             }
         }
-        let flat = Tensor::from_vec(vec![0.5f32; 2 * width], (2, width), device).unwrap();
-        let noise = Tensor::from_vec(exponentials(2 * width, 9), (2, width), device).unwrap();
-        let got = race_sample(&flat, &noise, 1, POLICIES[0]).unwrap();
-        let got = draws(&got.flatten_all().unwrap().to_vec1::<u32>().unwrap());
-        assert!(got.iter().all(|d| d.overflow));
+        // Kept prefixes past the sorted ranks, bounded by mass, by a cap
+        // above them, and both: flat rows (every candidate tied), and rows
+        // whose top 512 ranks hold too little mass.
+        let spills = [
+            POLICIES[0],
+            RacePolicy {
+                temperature: 1.0,
+                top_p: 0.5,
+                top_k: None,
+            },
+            RacePolicy {
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: Some(1000),
+            },
+            RacePolicy {
+                temperature: 1.3,
+                top_p: 0.95,
+                top_k: Some(600),
+            },
+        ];
+        for (p, policy) in spills.iter().enumerate() {
+            let rows = 4;
+            let logits = (0..rows as u64)
+                .flat_map(|seed| match seed {
+                    0 => vec![0.5f32; width],
+                    _ => xorshift_values(width, 40 + seed + 7 * p as u64, 0.5),
+                })
+                .collect::<Vec<_>>();
+            let noise = exponentials(rows * width, 50 + p as u64);
+            let expected = logits
+                .chunks_exact(width)
+                .zip(noise.chunks_exact(width))
+                .map(|(l, n)| draw_row(l, n, 1, *policy))
+                .collect::<Vec<_>>();
+            let got = race_sample(
+                &Tensor::from_vec(logits, (rows, width), device).unwrap(),
+                &Tensor::from_vec(noise, (rows, width), device).unwrap(),
+                1,
+                *policy,
+            )
+            .unwrap();
+            let got = draws(&got.flatten_all().unwrap().to_vec1::<u32>().unwrap());
+            assert_eq!(got, expected, "spill policy {p}");
+        }
         let mut bad = vec![0.5f32; width];
         bad[7] = f32::NAN;
         let got = race_sample(
