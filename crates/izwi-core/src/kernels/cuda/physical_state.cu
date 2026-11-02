@@ -732,7 +732,7 @@ __device__ __forceinline__ void izwi_load_floats(const T* __restrict__ source,
   }
 }
 
-template <typename T, int HEAD_DIM>
+template <typename T, int HEAD_DIM, int GROUP_CAP = IZWI_SPLIT_DECODE_MAX_GROUP>
 __device__ void izwi_paged_decode_gqa_partition(
     const T* __restrict__ queries,
     const T* __restrict__ keys,
@@ -749,7 +749,7 @@ __device__ void izwi_paged_decode_gqa_partition(
     int min_partition_tokens,
     float softmax_scale,
     float softcap) {
-  constexpr int MAX_GROUP = IZWI_SPLIT_DECODE_MAX_GROUP;
+  constexpr int MAX_GROUP = GROUP_CAP;
   constexpr int LANE_DIMS = HEAD_DIM / 32;
   constexpr int KEY_CHUNK = 16 / sizeof(T);
   static_assert(HEAD_DIM % (32 * 4) == 0, "head dim must give each lane 4n dims");
@@ -1099,6 +1099,25 @@ IZWI_DEFINE_PAGED_DECODE_SPLIT(f16, __half, 128)
 IZWI_DEFINE_PAGED_DECODE_SPLIT(f16, __half, 256)
 IZWI_DEFINE_PAGED_DECODE_SPLIT(bf16, __nv_bfloat16, 128)
 IZWI_DEFINE_PAGED_DECODE_SPLIT(bf16, __nv_bfloat16, 256)
+
+// Up to 16 query heads per KV head (Nemotron-H: 32 over 2), at head dim 128
+// only: the register arrays grow with the group, and 16 x 256 would spill.
+#define IZWI_DEFINE_PAGED_DECODE_SPLIT_G16(SUFFIX, TYPE)                       \
+  extern "C" __global__ void __launch_bounds__(IZWI_SPLIT_DECODE_WARPS * 32)  \
+      physical_paged_decode_split_##SUFFIX##_d128_g16(                         \
+          const TYPE* queries, const TYPE* keys, const TYPE* values,           \
+          const unsigned int* metadata, float* partials, int batch,            \
+          int query_heads, int kv_heads, int page_tokens, int max_blocks,      \
+          int capacity_pages, int num_partitions, int min_partition_tokens,    \
+          float softmax_scale, float softcap) {                                \
+    izwi_paged_decode_gqa_partition<TYPE, 128, 16>(                            \
+        queries, keys, values, metadata, partials, batch, query_heads,         \
+        kv_heads, page_tokens, max_blocks, capacity_pages, num_partitions,     \
+        min_partition_tokens, softmax_scale, softcap);                         \
+  }
+
+IZWI_DEFINE_PAGED_DECODE_SPLIT_G16(f16, __half)
+IZWI_DEFINE_PAGED_DECODE_SPLIT_G16(bf16, __nv_bfloat16)
 
 #define IZWI_DEFINE_PAGED_DECODE_SPLIT_REDUCE(SUFFIX, TYPE)                    \
   extern "C" __global__ void physical_paged_decode_split_reduce_##SUFFIX(     \
