@@ -115,6 +115,12 @@ export interface ModelInfo {
   /** Free disk a download needs (0 once downloaded). */
   disk_required_bytes?: number;
   enabled?: boolean;
+  /** The weights' licence label, when the catalog surfaces one
+   * ("Fish Audio Research License"). */
+  license?: string | null;
+  /** What that licence permits, when the label alone does not say it
+   * (Fish Audio Drama 3). Informational: nothing is refused on it. */
+  license_notice?: string | null;
   status:
     | "not_downloaded"
     | "downloading"

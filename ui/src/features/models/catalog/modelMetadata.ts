@@ -228,7 +228,7 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     shortName: "Fish Drama 3",
     fullName: "Fish Audio Drama 3",
     description:
-      "Expressive multilingual text-to-speech that needs about 40 GB of GPU or unified memory: voice cloning from reference clips and their transcripts, multi-speaker dialogue, and performance tags such as [sighs], [laughs] and <whisper>. Fish Audio Community License v1.0: free for research and non-commercial use; commercial use only below USD 500k annual revenue; offering it as a hosted service requires a licence from Fish Audio.",
+      "Expressive multilingual text-to-speech that needs about 40 GB of GPU or unified memory: a voice set by the seed or cloned from a reference clip and its transcript, multi-speaker dialogue, and performance tags such as [sighs], [laughs] and <whisper>.",
     category: "tts",
     capabilities: [
       "Text to Speech",

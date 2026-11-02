@@ -39,6 +39,22 @@ export function neededMemoryLabel(model: ModelInfo): string | null {
     : "Too large for this device";
 }
 
+/**
+ * The weights' licence, as `izwi pull` states it before a download: the
+ * label the catalog surfaces, and what it permits when the catalog spells
+ * that out (Fish Audio Drama 3). Null for a model without one.
+ */
+export function modelLicenseText(
+  model: Pick<ModelInfo, "license" | "license_notice">,
+): string | null {
+  const label = model.license?.trim();
+  if (!label) {
+    return null;
+  }
+  const notice = model.license_notice?.trim().replace(/\.$/, "");
+  return notice ? `License: ${label}. ${notice}.` : `License: ${label}`;
+}
+
 export function isModelOnDisk(model: ModelInfo): boolean {
   return model.status === "downloaded" || model.status === "ready";
 }
@@ -178,6 +194,7 @@ export function ModelListRow({
 }: ModelListRowProps) {
   const tooLarge = model.device_fit === "too_large" && !isModelOnDisk(model);
   const size = model.size_bytes ?? model.estimated_size_bytes ?? null;
+  const license = modelLicenseText(model);
   const common = "h-8 gap-1.5 px-2.5 text-[13px]";
 
   let primary = null;
@@ -340,6 +357,11 @@ export function ModelListRow({
             ? model.error_message
             : subtitle}
         </span>
+        {license ? (
+          <span className="text-[12px] leading-4 text-(--text-subtle)">
+            {license}
+          </span>
+        ) : null}
       </div>
       <ModelStatusCell model={model} progress={progress} />
       <span

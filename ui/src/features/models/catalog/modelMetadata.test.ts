@@ -55,15 +55,26 @@ describe("model display metadata", () => {
     expect(getModelProviderLabel("LFM3-1.7B-GGUF")).toBe("Liquid AI");
   });
 
-  it("lists Fish Audio Drama 3 as its own Fish Audio model with its licence", () => {
+  it("lists Fish Audio Drama 3 as its own Fish Audio model", () => {
     const detail = resolveModelDetail({
       variant: "FishAudio-Drama-3",
       task: "tts",
     });
     expect(detail.fullName).toBe("Fish Audio Drama 3");
     expect(detail.category).toBe("tts");
-    expect(detail.description).toContain("Fish Audio Community License");
-    expect(detail.description).toContain("hosted service");
+    expect(detail.size).toBe("41.5 GB");
+    expect(detail.capabilities).toEqual(
+      expect.arrayContaining([
+        "Voice Cloning",
+        "Dialogue",
+        "Performance Tags",
+        "44.1 kHz",
+      ]),
+    );
+    expect(detail.description).toContain("40 GB");
+    // The licence comes from the model's API record (`license`,
+    // `license_notice`), shown by its row, not from this table.
+    expect(detail.description).not.toContain("License");
     expect(detail).not.toEqual(
       resolveModelDetail({ variant: "FishAudio-S2-Pro", task: "tts" }),
     );
