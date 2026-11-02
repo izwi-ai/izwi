@@ -914,8 +914,8 @@ impl FishDrama3Model {
         if let Some(weights) = trunk.device_trunk_mut().filter(|_| fused) {
             weights.enable_fused(device);
         }
-        if let Some(weights) = tower.device_tower_mut() {
-            weights.fused = fused;
+        if let Some(weights) = tower.device_tower_mut().filter(|_| fused) {
+            weights.enable_fused(device);
         }
         let main_tables = (residency != FishDrama3Residency::Cpu)
             .then(|| -> Result<(Tensor, Tensor)> {
@@ -1042,6 +1042,12 @@ impl FishDrama3Model {
     #[cfg(test)]
     pub(crate) fn trunk_mut(&mut self) -> &mut FishDrama3Trunk {
         &mut self.trunk
+    }
+
+    /// The tower, for tests that switch its paths.
+    #[cfg(test)]
+    pub(crate) fn tower_mut(&mut self) -> &mut FishDrama3Tower {
+        &mut self.tower
     }
 
     /// Runs the device trunk, tower and draws fused or eagerly, for tests

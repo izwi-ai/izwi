@@ -48,8 +48,12 @@ struct Stretch {
     phase: Phase,
 }
 
-/// Each row count's stretches, or why the graphs are off.
-type Runtime = std::result::Result<HashMap<usize, Vec<Stretch>>, String>;
+/// Each (row count, key) pair's stretches, or why the graphs are off.
+type Runtime = std::result::Result<HashMap<(usize, u64), Vec<Stretch>>, String>;
+
+/// Most (row count, key) pairs one model keeps graphs for: a new pair past
+/// it drops another's.
+const MAX_SHAPES: usize = 8;
 
 /// The stretch graphs of one model's decode step.
 pub struct StretchGraphs {
@@ -102,6 +106,13 @@ impl StretchGraphs {
     /// A step of `rows` rows through the graphs, or `None` when they are off,
     /// held by another step, or not made for that width.
     pub fn begin(&self, rows: usize) -> Option<StepRun<'_>> {
+        self.begin_keyed(rows, 0)
+    }
+
+    /// [`Self::begin`] for stretches whose kernels also take host values
+    /// (a sampling policy, say) as launch arguments: `key` fingerprints
+    /// them, and each key keeps its own graphs.
+    pub fn begin_keyed(&self, rows: usize, key: u64) -> Option<StepRun<'_>> {
         if rows == 0 || rows > MAX_GRAPH_ROWS {
             return None;
         }
@@ -109,7 +120,7 @@ impl StretchGraphs {
         guard.is_ok().then_some(StepRun {
             graphs: self,
             guard,
-            rows,
+            shape: (rows, key),
         })
     }
 
@@ -118,8 +129,9 @@ impl StretchGraphs {
         json!({
             "off": runtime.as_ref().err(),
             "widths": runtime.as_ref().map(|map| {
-                let mut widths = map.keys().copied().collect::<Vec<_>>();
+                let mut widths = map.keys().map(|(rows, _)| *rows).collect::<Vec<_>>();
                 widths.sort_unstable();
+                widths.dedup();
                 widths
             }).unwrap_or_default(),
             "warmups": self.warmups.load(Relaxed),
@@ -192,7 +204,7 @@ impl StretchGraphs {
 pub struct StepRun<'a> {
     graphs: &'a StretchGraphs,
     guard: MutexGuard<'a, Runtime>,
-    rows: usize,
+    shape: (usize, u64),
 }
 
 impl StepRun<'_> {
@@ -208,7 +220,13 @@ impl StepRun<'_> {
         let Ok(widths) = self.guard.as_mut() else {
             return body(inputs);
         };
-        let stretches = widths.entry(self.rows).or_insert_with(|| {
+        if !widths.contains_key(&self.shape) && widths.len() >= MAX_SHAPES {
+            // Dropping a shape's graphs fences the stream before their memory goes.
+            if let Some(oldest) = widths.keys().next().copied() {
+                widths.remove(&oldest);
+            }
+        }
+        let stretches = widths.entry(self.shape).or_insert_with(|| {
             (0..self.graphs.stretches)
                 .map(|_| Stretch::default())
                 .collect()
@@ -226,7 +244,7 @@ impl StepRun<'_> {
                 tracing::warn!(
                     "{} decode graphs are off: stretch {index} at width {}: {reason}",
                     self.graphs.label,
-                    self.rows
+                    self.shape.0
                 );
                 // Dropping the graphs fences the stream before their memory goes.
                 *self.guard = Err(reason);

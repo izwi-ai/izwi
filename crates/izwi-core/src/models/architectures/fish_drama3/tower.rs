@@ -592,6 +592,9 @@ impl FishDrama3Tower {
             "span_rows": c.span_rows.load(Ordering::Relaxed),
             "steps": c.steps.load(Ordering::Relaxed),
             "step_rows": c.step_rows.load(Ordering::Relaxed),
+            "decode_graphs": self
+                .device_tower()
+                .map_or(serde_json::Value::Null, DeviceTower::graph_diagnostics),
         })
     }
 

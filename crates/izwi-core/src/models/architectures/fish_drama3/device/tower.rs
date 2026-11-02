@@ -30,6 +30,7 @@ use super::{
     add_residual, record, rms_norm, swiglu, DeviceAttention, DeviceForms, DeviceRow, Probe,
 };
 use crate::error::{Error, Result};
+use crate::kernels::cuda::stretch_graphs::StretchGraphs;
 use crate::kernels::residual_norm;
 
 /// One tower layer on the device.
@@ -192,9 +193,16 @@ pub(crate) struct DeviceTower {
     vocab: usize,
     eps: f32,
     forms: DeviceForms,
-    /// Span and step layers run [`Self::layer_fused`]; set after the load's
-    /// fused kernel check.
+    /// Span and step layers run [`Self::layer_fused`] (a device-drawn step
+    /// [`Self::step_pieces`]); set after the load's fused kernel check.
     pub(crate) fused: bool,
+    /// CUDA graphs of a device-drawn fused step's stretches, or why there
+    /// are none.
+    pub(crate) graphs: std::result::Result<StretchGraphs, String>,
+    /// Device-drawn fused steps layer by layer instead of the pieces, for
+    /// tests that compare.
+    #[cfg(test)]
+    pub(crate) steps_whole: bool,
 }
 
 impl DeviceTower {
@@ -247,6 +255,9 @@ impl DeviceTower {
             eps: t.norm_eps as f32,
             forms,
             fused: false,
+            graphs: Err("the tower runs eagerly".into()),
+            #[cfg(test)]
+            steps_whole: false,
         })
     }
 
@@ -260,6 +271,25 @@ impl DeviceTower {
 
     pub(crate) fn heads(&self) -> usize {
         self.heads.len()
+    }
+
+    /// Turns the fused kernels on, and on CUDA the step's stretch graphs.
+    pub(crate) fn enable_fused(&mut self, device: &Device) {
+        self.fused = true;
+        self.graphs = StretchGraphs::resolve(
+            "Fish Audio Drama 3 tower",
+            super::SEGMENT_GRAPHS_ENV,
+            device,
+            self.layers.len() + 1,
+        );
+    }
+
+    /// The stretch graphs' state and counters.
+    pub(crate) fn graph_diagnostics(&self) -> serde_json::Value {
+        match &self.graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        }
     }
 
     /// Layer `index` over injections `e` (`[N, dim]` F32) and hidden `h`
@@ -321,6 +351,21 @@ impl DeviceTower {
         phase: FishDrama3KernelPhase,
         positions: &Tensor,
     ) -> Result<Tensor> {
+        let (x, normed) = self.pre_attention(index, e, h, phase)?;
+        let (x, normed) = self.attend(index, &x, &normed, rows, phase, positions)?;
+        self.post_attention(index, &x, &normed, phase)
+    }
+
+    /// Layer `index` up to its attention: the injections `e` and hidden `h`
+    /// normed, merged and projected into the residual, and its attention
+    /// norm. Returns the residual and the normed rows.
+    fn pre_attention(
+        &self,
+        index: usize,
+        e: &Tensor,
+        h: &Tensor,
+        phase: FishDrama3KernelPhase,
+    ) -> Result<(Tensor, Tensor)> {
         let layer = &self.layers[index];
         let act = layer.act;
         let e = residual_norm::rms_norm(e, &layer.enorm, self.eps, act)?;
@@ -331,14 +376,177 @@ impl DeviceTower {
             .forward_device(&merged, phase, act)?
             .to_dtype(self.forms.residual)?;
         let normed = residual_norm::rms_norm(&x, &layer.attention_norm, self.eps, act)?;
+        Ok((x, normed))
+    }
+
+    /// Layer `index`'s attention over its normed rows and the FFN norm after
+    /// it: the residual and the FFN's normed input.
+    fn attend(
+        &self,
+        index: usize,
+        x: &Tensor,
+        normed: &Tensor,
+        rows: &mut [DeviceRow<'_>],
+        phase: FishDrama3KernelPhase,
+        positions: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let layer = &self.layers[index];
         let mixed = layer
             .attention
-            .forward_fused(&normed, rows, index, phase, act, positions)?;
-        let (x, normed) = residual_norm::add_rms_norm(&x, &mixed, &layer.ffn_norm, self.eps, act)?;
-        let gate_up = layer.w13.forward_device(&normed, phase, act)?;
+            .forward_fused(normed, rows, index, phase, layer.act, positions)?;
+        Ok(residual_norm::add_rms_norm(
+            x,
+            &mixed,
+            &layer.ffn_norm,
+            self.eps,
+            layer.act,
+        )?)
+    }
+
+    /// Layer `index`'s FFN over its normed input and the final norm: the
+    /// layer's output.
+    fn post_attention(
+        &self,
+        index: usize,
+        x: &Tensor,
+        normed: &Tensor,
+        phase: FishDrama3KernelPhase,
+    ) -> Result<Tensor> {
+        let layer = &self.layers[index];
+        let act = layer.act;
+        let gate_up = layer.w13.forward_device(normed, phase, act)?;
         let activations = crate::kernels::swiglu::swiglu(&gate_up, act)?;
         let down = layer.w2.forward_device(&activations, phase, act)?;
-        Ok(residual_norm::add_rms_norm(&x, &down, &layer.final_norm, self.eps, act)?.1)
+        Ok(residual_norm::add_rms_norm(x, &down, &layer.final_norm, self.eps, act)?.1)
+    }
+
+    /// A device-drawn fused step through pieces: each layer's attention with
+    /// its FFN norm, eager, and the stretches between them (a layer's FFN
+    /// and final norm, its head's race, then the next layer's injection and
+    /// pre-attention norms), on CUDA replaying graphs keyed by the rows'
+    /// heads policies. Every value is the layer-by-layer step's.
+    #[allow(clippy::too_many_arguments)]
+    fn step_pieces(
+        &self,
+        embedding: &FishDrama3Embedding,
+        hidden: &Tensor,
+        inputs: &[u32],
+        first: &Tensor,
+        labelled: &Tensor,
+        rows: &mut [DeviceRow<'_>],
+        policies: &[FishDrama3DrawPolicy],
+        noise: &Tensor,
+    ) -> Result<DeviceTowerStep> {
+        let m = first.dim(0)?;
+        let phase = FishDrama3KernelPhase::Step;
+        let extra = embedding.extra_device(inputs)?;
+        let mut graphs = self
+            .graphs
+            .as_ref()
+            .ok()
+            .and_then(|graphs| graphs.begin_keyed(m, policy_key(policies)));
+        let mut stretch = |index: usize, inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+            let after = index.checked_sub(1);
+            let body = |inputs: &[Tensor]| self.stretch(after, inputs, policies);
+            match graphs.as_mut() {
+                Some(run) => run.run(index, inputs, &body),
+                None => body(inputs),
+            }
+        };
+        let front = stretch(0, &[hidden.clone(), first.clone(), labelled.clone(), extra])?;
+        let (mut x, mut normed) = (front[0].clone(), front[1].clone());
+        let positions = super::positions_tensor(rows, hidden.device())?;
+        let layers = self.layers.len();
+        let mut outputs = Vec::with_capacity(layers);
+        let (mut picks, mut checks) = (Vec::new(), Vec::new());
+        for slot in 0..layers {
+            let (sum, ffn) = self.attend(slot, &x, &normed, rows, phase, &positions)?;
+            let mut inputs = vec![sum, ffn];
+            if let Some(head) = slot.checked_sub(self.shared_layers) {
+                inputs.push(noise.get(head)?);
+            }
+            if slot + 1 < layers {
+                inputs.extend([first.clone(), labelled.clone()]);
+            }
+            let mut out = stretch(slot + 1, &inputs)?.into_iter();
+            let mut next = || {
+                out.next().ok_or_else(|| {
+                    Error::InferenceError("a tower stretch returned too few outputs".into())
+                })
+            };
+            outputs.push(next()?);
+            if slot >= self.shared_layers {
+                picks.push(next()?);
+                checks.push(next()?);
+            }
+            if slot + 1 < layers {
+                (x, normed) = (next()?, next()?);
+            }
+        }
+        Ok(DeviceTowerStep {
+            host_codes: vec![Vec::new(); m],
+            device: Some(DeviceCodes {
+                picks: Tensor::stack(&picks, 0)?,
+                checks: Tensor::cat(&checks, 0)?,
+            }),
+            outputs,
+        })
+    }
+
+    /// One stretch of a device-drawn fused step, eagerly. The first
+    /// (`after` `None`) takes the hidden rows, code 0, the labels and layer
+    /// 0's extra and returns layer 0's residual and normed rows. The one
+    /// after layer `slot`'s attention takes its residual and FFN input, its
+    /// head's exponentials (a residual layer), and code 0 and the labels
+    /// when a layer follows; it returns the layer's output, its head's picks
+    /// and non-finite counts, and the next layer's residual and normed rows.
+    fn stretch(
+        &self,
+        after: Option<usize>,
+        inputs: &[Tensor],
+        policies: &[FishDrama3DrawPolicy],
+    ) -> Result<Vec<Tensor>> {
+        let phase = FishDrama3KernelPhase::Step;
+        let missing = || Error::InferenceError("a tower stretch is missing an input".into());
+        let Some(slot) = after else {
+            let [hidden, first, labelled, extra] = inputs else {
+                return Err(missing());
+            };
+            let e = self.inject(0, first, labelled, Some(extra))?;
+            let (x, normed) = self.pre_attention(0, &e, hidden, phase)?;
+            return Ok(vec![x, normed]);
+        };
+        let mut inputs = inputs.iter();
+        let (x, normed) = (
+            inputs.next().ok_or_else(missing)?,
+            inputs.next().ok_or_else(missing)?,
+        );
+        let out = self.post_attention(slot, x, normed, phase)?;
+        let mut outputs = vec![out.clone()];
+        let mut pick = None;
+        if let Some(head) = slot.checked_sub(self.shared_layers) {
+            let noise = inputs.next().ok_or_else(missing)?;
+            let logits = self.head_logits(head, &out, phase, None)?;
+            let draws = race_rows(&logits, noise, 0, policies)?;
+            let picked = draws.narrow(1, 0, 1)?.flatten_all()?;
+            outputs.extend([picked.clone(), draws.narrow(1, 1, 1)?.flatten_all()?]);
+            pick = Some(picked);
+        }
+        if slot + 1 < self.layers.len() {
+            let (first, labelled) = (
+                inputs.next().ok_or_else(missing)?,
+                inputs.next().ok_or_else(missing)?,
+            );
+            // The first residual layer still injects code 0.
+            let source = match &pick {
+                Some(pick) if slot + 1 > self.shared_layers => pick,
+                _ => first,
+            };
+            let e = self.inject(slot + 1, source, labelled, None)?;
+            let (x, normed) = self.pre_attention(slot + 1, &e, &out, phase)?;
+            outputs.extend([x, normed]);
+        }
+        Ok(outputs)
     }
 
     /// Layer `index` of a span or step forward: fused when the load enabled
@@ -487,6 +695,17 @@ impl DeviceTower {
         rows: &mut [DeviceRow<'_>],
         mut codes: DeviceStepCodes<'_>,
     ) -> Result<DeviceTowerStep> {
+        if let DeviceStepCodes::Device { policies, noise } = &codes {
+            #[cfg(test)]
+            let pieces = self.fused && !self.steps_whole;
+            #[cfg(not(test))]
+            let pieces = self.fused;
+            if pieces {
+                return self.step_pieces(
+                    embedding, hidden, inputs, first, labelled, rows, policies, noise,
+                );
+            }
+        }
         let m = first.dim(0)?;
         let extra = embedding.extra_device(inputs)?;
         let mut x = hidden.clone();
@@ -610,4 +829,17 @@ impl DeviceCodes {
     pub(crate) fn packed(&self) -> Result<Tensor> {
         Ok(Tensor::cat(&[&self.picks.flatten_all()?, &self.checks], 0)?)
     }
+}
+
+/// A fingerprint of every row's heads policy: the race takes them as launch
+/// arguments, so each set keeps its own graphs.
+fn policy_key(policies: &[FishDrama3DrawPolicy]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for policy in policies {
+        policy.temperature.to_bits().hash(&mut hasher);
+        policy.top_p.to_bits().hash(&mut hasher);
+        policy.top_k.hash(&mut hasher);
+    }
+    hasher.finish()
 }

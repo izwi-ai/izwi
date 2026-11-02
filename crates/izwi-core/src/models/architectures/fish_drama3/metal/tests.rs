@@ -339,6 +339,26 @@ fn metal_trunk_steps_through_pieces_as_the_whole_fused_step() {
     assert_eq!(pieces, whole);
 }
 
+/// A device-drawn tower step through its pieces (each layer's attention and
+/// the stretches between them, which the CUDA graphs capture) makes the
+/// layer-by-layer step's frames bit for bit.
+#[test]
+fn metal_tower_steps_through_pieces_as_the_layer_by_layer_step() {
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "metal_tower_steps_through_pieces_as_the_layer_by_layer_step",
+    ) else {
+        return;
+    };
+    let synthetic = write_synthetic_model_in(7, SyntheticGeometry::KernelHeads, |_| {});
+    let mut model = load(&synthetic, &device, options(FishDrama3CpuPrecision::Q8_0));
+    let a = prompt_of(&model, &rows(&model, 9, 1));
+    let b = prompt_of(&model, &rows(&model, 12, 2));
+    let pieces = decode_together(&model, &[(&a, 11), (&b, 12)], 4, false);
+    model.tower_mut().device_tower_mut().unwrap().steps_whole = true;
+    let whole = decode_together(&model, &[(&a, 11), (&b, 12)], 4, false);
+    assert_eq!(pieces, whole);
+}
+
 /// The one-readback frame makes the two-readback path's frames bit for bit:
 /// a request that keeps going, one that reaches its frame limit, and one
 /// that draws eos (whose speculative tower and trunk step is aborted), alone
