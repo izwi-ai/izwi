@@ -1186,10 +1186,6 @@ impl ModelVariant {
         )
     }
 
-    // Fish Audio Drama 3 shares three of the four Fish product predicates.
-    // It stays out of `plans_own_speech_segments` until its long-text chunk
-    // session lands: the server's segment plan is S2's chunker.
-
     /// Whether this model speaks through the Fish DAC codec: one semantic
     /// frame is 2,048 PCM samples, decoded by the batched codec stage. Its
     /// output reservations, codec workspace and PCM length checks count
@@ -1205,18 +1201,23 @@ impl ModelVariant {
     /// Whether the server plans this model's speech segments itself
     /// (`SpeechTextPlan`) instead of using the shared long-form splitter.
     /// Every speech route runs the text as one segment plan: each segment
-    /// takes its own budget and workload permit, a client's `max_tokens`
-    /// bounds the whole plan, and a speech record journals its audio so an
-    /// unfinished take can be replayed from the start.
+    /// takes its own budget and workload permit, and a speech record
+    /// journals its audio so an unfinished take can be replayed from the
+    /// start. A client's `max_tokens` bounds the whole plan (Fish S2), or
+    /// each chunk of a model that [`Self::continues_speech_across_chunks`].
     pub fn plans_own_speech_segments(&self) -> bool {
-        matches!(self.family(), crate::catalog::ModelFamily::FishS2Tts)
+        matches!(
+            self.family(),
+            crate::catalog::ModelFamily::FishS2Tts | crate::catalog::ModelFamily::FishDrama3Tts
+        )
     }
 
     /// Whether this model speaks long text as a chunk session: its own
     /// chunker cuts the text, and each chunk's prompt holds earlier chunks
     /// with the codes generated for them (the first, pinned, and the
     /// latest), so the server carries those codes from one chunk request to
-    /// the next and one voice runs through the whole text.
+    /// the next and one voice runs through the whole text. Implies
+    /// [`Self::plans_own_speech_segments`].
     pub fn continues_speech_across_chunks(&self) -> bool {
         self.family() == crate::catalog::ModelFamily::FishDrama3Tts
     }
@@ -1256,6 +1257,7 @@ impl ModelVariant {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: false,
             },
             Self::Qwen3Tts12Hz06BCustomVoice
             | Self::Qwen3Tts12Hz06BCustomVoice8Bit
@@ -1268,6 +1270,7 @@ impl ModelVariant {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: false,
             },
             Self::Qwen3Tts12Hz17BCustomVoice => SpeechModelCapabilities {
                 supports_builtin_voices: true,
@@ -1278,6 +1281,7 @@ impl ModelVariant {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: false,
             },
             Self::Qwen3Tts12Hz17BVoiceDesign
             | Self::Qwen3Tts12Hz17BVoiceDesign8Bit
@@ -1290,6 +1294,7 @@ impl ModelVariant {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: false,
             },
             Self::Kokoro82M => SpeechModelCapabilities {
                 supports_builtin_voices: true,
@@ -1300,6 +1305,7 @@ impl ModelVariant {
                 supports_streaming: true,
                 supports_speed_control: true,
                 supports_auto_long_form: false,
+                supports_seeded_voice: false,
             },
             Self::Lfm25Audio15BGguf => SpeechModelCapabilities {
                 supports_builtin_voices: true,
@@ -1310,6 +1316,7 @@ impl ModelVariant {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: false,
+                supports_seeded_voice: false,
             },
             Self::Lfm3Audio2BGguf | Self::Lfm3Audio2BQ8Gguf => SpeechModelCapabilities {
                 supports_builtin_voices: true,
@@ -1320,6 +1327,7 @@ impl ModelVariant {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: false,
             },
             Self::Voxtral4BTts2603 => SpeechModelCapabilities {
                 supports_builtin_voices: true,
@@ -1330,6 +1338,7 @@ impl ModelVariant {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: false,
+                supports_seeded_voice: false,
             },
             Self::VibeVoice15BTts => SpeechModelCapabilities {
                 supports_builtin_voices: false,
@@ -1340,6 +1349,7 @@ impl ModelVariant {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: false,
             },
             Self::FishAudioS2Pro => SpeechModelCapabilities {
                 supports_builtin_voices: false,
@@ -1350,12 +1360,11 @@ impl ModelVariant {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: false,
             },
-            // Clones from reference clips with their transcripts, streams, and
-            // splits long text into chunk sessions. A reference is optional
-            // (the seed then sets the voice) and several tagged references
-            // make a dialogue; neither has a capability field yet, so both
-            // arrive with the speech route.
+            // Clones from a reference clip with its transcript, or speaks in a
+            // voice its seed sets when given none; streams, and speaks long
+            // text as a chunk session.
             Self::FishAudioDrama3 => SpeechModelCapabilities {
                 supports_builtin_voices: false,
                 built_in_voice_count: None,
@@ -1365,6 +1374,7 @@ impl ModelVariant {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: true,
             },
             Self::Chatterbox500M | Self::ChatterboxMultilingual500M => SpeechModelCapabilities {
                 supports_builtin_voices: true,
@@ -1375,6 +1385,7 @@ impl ModelVariant {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: false,
             },
             // Built-in voices are named descriptions; a request's own
             // description replaces the voice's.
@@ -1389,6 +1400,7 @@ impl ModelVariant {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: false,
             },
             Self::Maya13B | Self::Maya13BGguf => SpeechModelCapabilities {
                 supports_builtin_voices: true,
@@ -1399,6 +1411,7 @@ impl ModelVariant {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: false,
             },
             _ => return None,
         };
@@ -1960,6 +1973,11 @@ pub struct SpeechModelCapabilities {
     pub supports_streaming: bool,
     pub supports_speed_control: bool,
     pub supports_auto_long_form: bool,
+    /// Whether the model speaks without any voice input: a request with no
+    /// reference, built-in voice or description gets a voice the sampling
+    /// seed sets (Fish Audio Drama 3). A reference stays optional for such
+    /// a model, and its transcript stays required when one is given.
+    pub supports_seeded_voice: bool,
 }
 
 impl SpeechModelCapabilities {
@@ -2343,6 +2361,7 @@ mod tests {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: false,
+                supports_seeded_voice: false,
             })
         );
     }
@@ -2383,6 +2402,7 @@ mod tests {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: false,
             })
         );
     }
@@ -2416,6 +2436,7 @@ mod tests {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: false,
             })
         );
     }
@@ -2481,8 +2502,21 @@ mod tests {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: true,
             })
         );
+        // Only Drama 3 speaks without a voice input.
+        for other in ModelVariant::all()
+            .iter()
+            .filter(|other| **other != variant)
+        {
+            assert!(
+                !other
+                    .speech_capabilities()
+                    .is_some_and(|capabilities| capabilities.supports_seeded_voice),
+                "{other}"
+            );
+        }
     }
 
     #[test]
@@ -2508,8 +2542,8 @@ mod tests {
     }
 
     /// The Fish product path (codec stage, own segment plans, audio-only
-    /// streams, artifact fingerprints) is Fish S2 Pro's and, but for its own
-    /// segment plans, Fish Audio Drama 3's.
+    /// streams, artifact fingerprints) is Fish S2 Pro's and Fish Audio
+    /// Drama 3's; only Drama 3 carries generated codes from chunk to chunk.
     #[test]
     fn fish_product_path_predicates_select_only_the_fish_families() {
         let fish = ModelVariant::FishAudioS2Pro;
@@ -2519,9 +2553,11 @@ mod tests {
         assert!(fish.has_fish_artifact_fingerprint());
         let drama3 = ModelVariant::FishAudioDrama3;
         assert!(drama3.uses_fish_dac_codec());
-        assert!(!drama3.plans_own_speech_segments());
+        assert!(drama3.plans_own_speech_segments());
         assert!(drama3.streams_audio_only());
         assert!(drama3.has_fish_artifact_fingerprint());
+        assert!(drama3.continues_speech_across_chunks());
+        assert!(!fish.continues_speech_across_chunks());
         for variant in [
             ModelVariant::Qwen3Tts12Hz06BBase,
             ModelVariant::Qwen3Tts12Hz17BCustomVoice,
@@ -2542,9 +2578,10 @@ mod tests {
         for variant in ModelVariant::all() {
             let is_fish = *variant == fish || *variant == drama3;
             assert_eq!(variant.uses_fish_dac_codec(), is_fish, "{variant}");
+            assert_eq!(variant.plans_own_speech_segments(), is_fish, "{variant}");
             assert_eq!(
-                variant.plans_own_speech_segments(),
-                *variant == fish,
+                variant.continues_speech_across_chunks(),
+                *variant == drama3,
                 "{variant}"
             );
             assert_eq!(variant.streams_audio_only(), is_fish, "{variant}");
@@ -2604,6 +2641,7 @@ mod tests {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: false,
             })
         );
     }
@@ -2721,6 +2759,7 @@ mod tests {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: false,
             })
         );
     }
@@ -2738,6 +2777,7 @@ mod tests {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: false,
             })
         );
         assert_eq!(
@@ -2751,6 +2791,7 @@ mod tests {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+                supports_seeded_voice: false,
             })
         );
     }
@@ -2768,6 +2809,7 @@ mod tests {
                 supports_streaming: true,
                 supports_speed_control: true,
                 supports_auto_long_form: false,
+                supports_seeded_voice: false,
             })
         );
     }
@@ -2785,6 +2827,7 @@ mod tests {
                 supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: false,
+                supports_seeded_voice: false,
             })
         );
     }

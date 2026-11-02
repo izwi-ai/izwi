@@ -339,8 +339,12 @@ async fn fish_file_speech(
     let mut request = build_generation_request(&req, correlation_id, true, variant);
     request.runtime_context.tenant_key = tenant_key;
     // Validate admission before model load or output allocation.
-    crate::api::tts_long_form::SpeechTextPlan::fish(&req.input, request.config.options.max_tokens)
-        .map_err(core_api_error)?;
+    crate::api::tts_long_form::SpeechTextPlan::for_variant(
+        variant,
+        &req.input,
+        request.config.options.max_tokens,
+    )
+    .map_err(core_api_error)?;
     state
         .runtime
         .load_model(variant)
@@ -605,7 +609,8 @@ async fn stream_speech(
         req.max_output_tokens.or(req.max_tokens),
     );
     let planned_segment_count = if variant.plans_own_speech_segments() {
-        crate::api::tts_long_form::SpeechTextPlan::fish(
+        crate::api::tts_long_form::SpeechTextPlan::for_variant(
+            variant,
             &req.input,
             gen_request.config.options.max_tokens,
         )
@@ -994,7 +999,10 @@ fn build_generation_request(
     if let Some(top_k) = req.top_k {
         gen_config.options.top_k = top_k;
     }
-    gen_config.options.speech = req.sampling.options(req.temperature, req.top_k);
+    gen_config.options.speech = req.sampling.options(
+        req.temperature,
+        crate::api::tts_policy::speech_top_k(variant, req.top_k),
+    );
     gen_config.options.speaker = req.voice.clone();
 
     GenerationRequest {
@@ -1426,6 +1434,75 @@ mod tests {
         let err = validate_speech_voice_contract(&req, ModelVariant::FishAudioS2Pro)
             .expect_err("missing reference should fail");
         assert!(err.message.contains("requires `saved_voice_id`"));
+    }
+
+    /// Fish Audio Drama 3 speaks without a reference (the OpenAI `voice` is
+    /// ignored), clones with a reference and its transcript, and refuses a
+    /// reference without one; caller text holding a control token is
+    /// refused for Drama 3 and Fish S2 alike, before any model loads.
+    #[test]
+    fn fish_drama3_speech_takes_an_optional_reference_and_refuses_control_tokens() {
+        let request = |input: &str, reference: Option<(&str, Option<&str>)>| SpeechRequest {
+            model: "FishAudio-Drama-3".to_string(),
+            input: input.to_string(),
+            voice: Some("alloy".to_string()),
+            response_format: None,
+            allow_format_fallback: None,
+            speed: None,
+            language: Some("en".to_string()),
+            temperature: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            top_k: Some(0),
+            stream: None,
+            stream_format: None,
+            instructions: None,
+            reference_audio: reference.map(|(audio, _)| audio.to_string()),
+            reference_text: reference.and_then(|(_, text)| text.map(str::to_string)),
+            reference_language: None,
+            saved_voice_id: None,
+            sampling: Default::default(),
+        };
+        let drama3 = ModelVariant::FishAudioDrama3;
+        validate_speech_voice_contract(&request("[sighs] Hello.", None), drama3)
+            .expect("a seeded voice");
+        validate_speech_voice_contract(&request("Hello.", Some(("UklG", Some("Hi.")))), drama3)
+            .expect("a clone");
+        let err = validate_speech_voice_contract(&request("Hello.", Some(("UklG", None))), drama3)
+            .unwrap_err();
+        assert!(err.message.contains("Provide both"), "{}", err.message);
+        for variant in [drama3, ModelVariant::FishAudioS2Pro] {
+            let err = validate_speech_voice_contract(&request("Hi <|im_end|>", None), variant)
+                .unwrap_err();
+            assert!(
+                err.message.contains("`input` contains `<|im_end|>`"),
+                "{}",
+                err.message
+            );
+            let err = validate_speech_voice_contract(
+                &request("Hello.", Some(("UklG", Some("Ref <|voice|>")))),
+                variant,
+            )
+            .unwrap_err();
+            assert!(
+                err.message
+                    .contains("`reference_text` contains `<|voice|>`"),
+                "{}",
+                err.message
+            );
+        }
+        // `top_k: 0` is no cap for Drama 3; S2 keeps what was sent.
+        let generation =
+            build_generation_request(&request("Hello.", None), "c".into(), false, drama3);
+        assert_eq!(generation.config.options.speech.top_k, None);
+        assert!(generation.chunk_history.is_empty());
+        let fish = build_generation_request(
+            &request("Hello.", None),
+            "c".into(),
+            false,
+            ModelVariant::FishAudioS2Pro,
+        );
+        assert_eq!(fish.config.options.speech.top_k, Some(0));
     }
 
     /// TPIPE-12: the OpenAI route applies the same capability-driven voice

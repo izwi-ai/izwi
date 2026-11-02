@@ -6,6 +6,8 @@ pub(crate) mod asr_task;
 pub(crate) mod audio_payload;
 pub mod chat;
 pub mod diarization;
+#[cfg(test)]
+mod fish_drama3_speech_tests;
 pub use izwi_gateway::api::docs;
 pub(crate) mod idempotency;
 pub mod internal;

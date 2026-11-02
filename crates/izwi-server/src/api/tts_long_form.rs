@@ -1,6 +1,15 @@
+use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::Arc;
 
-use izwi_core::{GenerationRequest, GenerationResult, ModelVariant, RuntimeService, TtsStopReason};
+use izwi_core::runtime_models::architectures::fish_drama3::chunking::{
+    plan_chunk_spans, split_text as fish_drama3_split_text, CHUNK_MAX_SPEAKERS,
+    HISTORY_RECENT_TURNS,
+};
+use izwi_core::{
+    GenerationRequest, GenerationResult, ModelVariant, RuntimeService, SpeechChunkTurn,
+    SpeechFrameCodes, TtsStopReason,
+};
 
 const DEFAULT_CHUNK_MAX_CHARS: usize = 480;
 const CHUNK_MAX_CHARS_MIN: usize = 80;
@@ -177,17 +186,254 @@ pub(crate) struct SpeechTextPlan {
     pub text_sha256: String,
     pub segments: Vec<std::ops::Range<usize>>,
     pub max_output_frames: Option<usize>,
+    /// A chunk session's chunks (Fish Audio Drama 3), one per segment: the
+    /// text each speaks as the model's chunker wrote it. Each segment's
+    /// range is the input it covers, for progress and recovery; a chunk of
+    /// tagged text is rewritten (its pieces re-tagged), so it is not that
+    /// slice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chunks: Vec<String>,
+    /// A chunk session's budget per chunk when the client named one
+    /// (`max_tokens`, at most 4,096 frames); unset, each chunk takes its
+    /// automatic budget. Fish S2 bounds the whole plan instead
+    /// (`max_output_frames`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_frames: Option<usize>,
+}
+
+/// A chunk session's plan (its chunks and per-chunk budgets).
+const CHUNK_SESSION_PLAN_VERSION: u32 = 2;
+
+/// One segment a plan still has to speak: the input bytes it covers and the
+/// text the model is given for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedSegment {
+    pub range: Range<usize>,
+    pub text: String,
+}
+
+fn check_speech_text_bytes(text: &str) -> Result<(), izwi_core::Error> {
+    let max_bytes = crate::api::tts_policy::tts_max_text_bytes();
+    if text.len() > max_bytes {
+        return Err(izwi_core::Error::InvalidInput(format!(
+            "Speech text exceeds configured limit of {max_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a plan whose PCM would pass the deployment's output limit (or
+/// WAV's capacity): `frames` of 2,048 16-bit samples each.
+fn check_speech_plan_pcm(frames: usize) -> Result<(), izwi_core::Error> {
+    let max_pcm_bytes = crate::env_config::tuning()
+        .tts_stream_max_pcm_bytes
+        .unwrap_or(u32::MAX as usize - 44)
+        .min(u32::MAX as usize - 44);
+    if frames
+        .checked_mul(2048 * 2)
+        .is_none_or(|bytes| bytes > max_pcm_bytes)
+    {
+        return Err(izwi_core::Error::InvalidInput("Speech plan exceeds configured PCM/WAV output limit; shorten the text or raise the deployment limit within WAV capacity".into()));
+    }
+    Ok(())
 }
 
 impl SpeechTextPlan {
+    /// The plan of `variant`'s speech: a chunk session for a model that
+    /// continues speech across chunks, else Fish S2's segment plan.
+    pub fn for_variant(
+        variant: ModelVariant,
+        text: &str,
+        max_output_frames: usize,
+    ) -> Result<Self, izwi_core::Error> {
+        if variant.continues_speech_across_chunks() {
+            Self::chunk_session(variant, text, max_output_frames)
+        } else {
+            Self::fish(text, max_output_frames)
+        }
+    }
+
+    /// Fish Audio Drama 3's chunk session (§3.7, §7.5): the model's own
+    /// speaker-aware chunker cuts the text (about 300 bytes a chunk, at most
+    /// three speakers, sentence ends first, tags and protected spans kept
+    /// whole). Each chunk is one engine request with its own budget: the
+    /// client's `max_tokens` (at most 4,096 frames) or the chunk's automatic
+    /// one (S2's speaking estimate times 2.5, at most 1,024).
+    pub fn chunk_session(
+        variant: ModelVariant,
+        text: &str,
+        max_tokens: usize,
+    ) -> Result<Self, izwi_core::Error> {
+        use sha2::{Digest, Sha256};
+        check_speech_text_bytes(text)?;
+        if text.trim().is_empty() {
+            return Err(izwi_core::Error::InvalidInput(
+                "Speech input is empty".into(),
+            ));
+        }
+        let chunks = plan_chunk_spans(text, false);
+        if chunks.len() > 1 && !crate::env_config::tuning().fish_drama3_long_form_enabled {
+            return Err(izwi_core::Error::InvalidInput(
+                "Fish Audio Drama 3 long-form generation is disabled by this deployment".into(),
+            ));
+        }
+        // Segments tile the input: each runs to its chunk's last byte, the
+        // last to the end.
+        let mut segments = Vec::with_capacity(chunks.len());
+        let mut start = 0;
+        for (index, (_, span)) in chunks.iter().enumerate() {
+            let end = if index + 1 == chunks.len() {
+                text.len()
+            } else {
+                span.end
+            };
+            if end <= start {
+                return Err(izwi_core::Error::InferenceError(
+                    "Speech plan chunks are out of order".into(),
+                ));
+            }
+            segments.push(start..end);
+            start = end;
+        }
+        let chunk_frames = (max_tokens > 0)
+            .then(|| {
+                crate::api::tts_policy::resolve_tts_output_frames(variant, text, Some(max_tokens))
+            })
+            .flatten();
+        let chunks: Vec<String> = chunks.into_iter().map(|(chunk, _)| chunk).collect();
+        let estimated_frames = chunks.iter().try_fold(0usize, |total, chunk| {
+            total.checked_add(chunk_frames.unwrap_or_else(|| {
+                crate::api::tts_policy::resolve_tts_output_frames(variant, chunk, None)
+                    .unwrap_or(ModelVariant::FISH_DRAMA3_MAX_OUTPUT_FRAMES)
+            }))
+        });
+        check_speech_plan_pcm(estimated_frames.ok_or_else(|| {
+            izwi_core::Error::InvalidInput("Speech output size overflow".into())
+        })?)?;
+        Ok(Self {
+            version: CHUNK_SESSION_PLAN_VERSION,
+            text_sha256: hex::encode(Sha256::digest(text.as_bytes())),
+            segments,
+            max_output_frames: None,
+            chunks,
+            chunk_frames,
+        })
+    }
+
+    /// Whether this plan is a chunk session.
+    pub fn is_chunk_session(&self) -> bool {
+        !self.chunks.is_empty()
+    }
+
+    /// The text each segment speaks, in order.
+    pub fn segment_texts(&self, text: &str) -> Vec<String> {
+        if self.is_chunk_session() {
+            return self.chunks.clone();
+        }
+        self.segments
+            .iter()
+            .map(|range| text[range.clone()].to_string())
+            .collect()
+    }
+
+    /// The segments still to speak once the first `completed` bytes of
+    /// `text` are done, in order. A Fish S2 segment that `completed` falls
+    /// inside (a halved one whose first part finished) resumes from it; a
+    /// chunk that it falls inside is halved again, as it was, and only the
+    /// parts after it remain.
+    pub(crate) fn queue(
+        &self,
+        text: &str,
+        completed: usize,
+    ) -> Result<VecDeque<PlannedSegment>, izwi_core::Error> {
+        let mut queue = VecDeque::with_capacity(self.segments.len());
+        if !self.is_chunk_session() {
+            for range in &self.segments {
+                if range.end <= completed {
+                    continue;
+                }
+                let range = range.start.max(completed)..range.end;
+                queue.push_back(PlannedSegment {
+                    text: text[range.clone()].to_string(),
+                    range,
+                });
+            }
+            return Ok(queue);
+        }
+        if self.chunks.len() != self.segments.len() {
+            return Err(izwi_core::Error::InvalidInput(
+                "Speech plan chunks do not match its segments".into(),
+            ));
+        }
+        let mut pending: Vec<PlannedSegment> = self
+            .segments
+            .iter()
+            .zip(&self.chunks)
+            .rev()
+            .map(|(range, chunk)| PlannedSegment {
+                range: range.clone(),
+                text: chunk.clone(),
+            })
+            .collect();
+        while let Some(segment) = pending.pop() {
+            if segment.range.end <= completed {
+                continue;
+            }
+            if segment.range.start >= completed {
+                queue.push_back(segment);
+                continue;
+            }
+            let halves = halve_chunk(text, &segment).ok_or_else(|| {
+                izwi_core::Error::InvalidInput("Invalid speech recovery text offset".into())
+            })?;
+            pending.extend(halves.into_iter().rev());
+        }
+        Ok(queue)
+    }
+
+    /// `segment` split in two or more, for a segment whose prompt was too
+    /// long for the model: Fish S2's halves at its middle character; a
+    /// chunk's cut again by the model's chunker at half its bytes (tags and
+    /// protected spans kept whole), each part placed in the chunk's input
+    /// range by its share of the text. `None` when it cannot be split.
+    pub(crate) fn halve(
+        &self,
+        text: &str,
+        segment: &PlannedSegment,
+    ) -> Option<Vec<PlannedSegment>> {
+        if self.is_chunk_session() {
+            return halve_chunk(text, segment);
+        }
+        let range = segment.range.clone();
+        let count = text[range.clone()].chars().count();
+        if count <= 1 {
+            return None;
+        }
+        let middle = range.start + text[range.clone()].char_indices().nth(count / 2)?.0;
+        Some(vec![
+            PlannedSegment {
+                text: text[range.start..middle].to_string(),
+                range: range.start..middle,
+            },
+            PlannedSegment {
+                text: text[middle..range.end].to_string(),
+                range: middle..range.end,
+            },
+        ])
+    }
+
+    /// The frame budget of a segment speaking `segment`: a chunk session's
+    /// per-chunk budget, else the segment's automatic one.
+    fn segment_frames(&self, variant: ModelVariant, segment: &str) -> usize {
+        self.chunk_frames.unwrap_or_else(|| {
+            crate::api::tts_policy::resolve_tts_output_frames(variant, segment, None)
+                .unwrap_or(4096)
+        })
+    }
+
     pub fn fish(text: &str, max_output_frames: usize) -> Result<Self, izwi_core::Error> {
         use sha2::{Digest, Sha256};
-        let max_bytes = crate::api::tts_policy::tts_max_text_bytes();
-        if text.len() > max_bytes {
-            return Err(izwi_core::Error::InvalidInput(format!(
-                "Speech text exceeds configured limit of {max_bytes} bytes"
-            )));
-        }
+        check_speech_text_bytes(text)?;
         let mut segments = Vec::new();
         let mut start = 0;
         let mut chars = 0;
@@ -256,22 +502,161 @@ impl SpeechTextPlan {
         } else {
             estimated_frames
         };
-        let max_pcm_bytes = crate::env_config::tuning()
-            .tts_stream_max_pcm_bytes
-            .unwrap_or(u32::MAX as usize - 44)
-            .min(u32::MAX as usize - 44);
-        if estimated_frames
-            .checked_mul(2048 * 2)
-            .is_none_or(|bytes| bytes > max_pcm_bytes)
-        {
-            return Err(izwi_core::Error::InvalidInput("Speech plan exceeds configured PCM/WAV output limit; shorten the text or raise the deployment limit within WAV capacity".into()));
-        }
+        check_speech_plan_pcm(estimated_frames)?;
         Ok(Self {
             version: 1,
             text_sha256: hex::encode(Sha256::digest(text.as_bytes())),
             segments,
             max_output_frames: (max_output_frames > 0).then_some(max_output_frames),
+            chunks: Vec::new(),
+            chunk_frames: None,
         })
+    }
+}
+
+/// A chunk cut again by the model's chunker at half its bytes, each part
+/// given its share of the chunk's input range (on character boundaries of
+/// `source`). Deterministic, so a recovered plan halves a chunk exactly as
+/// the attempt before it did.
+fn halve_chunk(source: &str, segment: &PlannedSegment) -> Option<Vec<PlannedSegment>> {
+    let pieces = fish_drama3_split_text(
+        &segment.text,
+        (segment.text.len() / 2).max(1),
+        CHUNK_MAX_SPEAKERS,
+    );
+    if pieces.len() < 2 {
+        return None;
+    }
+    let total = pieces.iter().map(String::len).sum::<usize>().max(1);
+    let span = segment.range.len();
+    let count = pieces.len();
+    let mut halves = Vec::with_capacity(count);
+    let (mut start, mut cumulative) = (segment.range.start, 0usize);
+    for (index, piece) in pieces.into_iter().enumerate() {
+        cumulative += piece.len();
+        let end = if index + 1 == count {
+            segment.range.end
+        } else {
+            let mut end = segment.range.start + span.checked_mul(cumulative)? / total;
+            while !source.is_char_boundary(end) {
+                end -= 1;
+            }
+            end
+        };
+        if end <= start {
+            return None;
+        }
+        halves.push(PlannedSegment {
+            range: start..end,
+            text: piece,
+        });
+        start = end;
+    }
+    Some(halves)
+}
+
+/// A chunk session's history as the server carries it from one chunk
+/// request to the next (§7.5, the family's `FishDrama3History` policy): the
+/// first chunk that made audio, pinned, and the latest others. Each chunk's
+/// prompt holds as many of them as fit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SpeechChunkHistory {
+    pinned: Option<SpeechChunkTurn>,
+    recent: VecDeque<SpeechChunkTurn>,
+}
+
+impl SpeechChunkHistory {
+    /// Records a completed chunk; a chunk without frames is not history.
+    pub(crate) fn push(&mut self, turn: SpeechChunkTurn) {
+        if turn.codes.frames() == 0 {
+            return;
+        }
+        if self.pinned.is_none() {
+            self.pinned = Some(turn);
+            return;
+        }
+        if HISTORY_RECENT_TURNS == 0 {
+            return;
+        }
+        if self.recent.len() == HISTORY_RECENT_TURNS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(turn);
+    }
+
+    /// The turns the next chunk's request carries, oldest (pinned) first.
+    pub(crate) fn turns(&self) -> Vec<SpeechChunkTurn> {
+        self.pinned.iter().chain(&self.recent).cloned().collect()
+    }
+
+    /// The history as a durable checkpoint holds it: each turn's codes as
+    /// little-endian u16 (every code is below 4,096), base64.
+    pub(crate) fn to_checkpoint(
+        &self,
+    ) -> Result<crate::batch_runtime::speech_progress::SpeechChunkHistoryCheckpoint, izwi_core::Error>
+    {
+        use crate::batch_runtime::speech_progress::{
+            SpeechChunkHistoryCheckpoint, SpeechChunkTurnCheckpoint,
+        };
+        use base64::Engine;
+        let turns = self
+            .turns()
+            .into_iter()
+            .map(|turn| {
+                let mut bytes =
+                    Vec::with_capacity(turn.codes.frames() * turn.codes.codebooks.len() * 2);
+                for code in turn.codes.codebooks.iter().flatten() {
+                    let code = u16::try_from(*code).map_err(|_| {
+                        izwi_core::Error::InferenceError(format!(
+                            "Speech chunk code {code} does not fit its checkpoint"
+                        ))
+                    })?;
+                    bytes.extend_from_slice(&code.to_le_bytes());
+                }
+                Ok(SpeechChunkTurnCheckpoint {
+                    text: turn.text,
+                    codebooks: turn.codes.codebooks.len(),
+                    codes: base64::engine::general_purpose::STANDARD.encode(bytes),
+                })
+            })
+            .collect::<Result<Vec<_>, izwi_core::Error>>()?;
+        Ok(SpeechChunkHistoryCheckpoint { turns })
+    }
+
+    /// The history a durable checkpoint holds, checked.
+    pub(crate) fn from_checkpoint(
+        checkpoint: &crate::batch_runtime::speech_progress::SpeechChunkHistoryCheckpoint,
+    ) -> Result<Self, izwi_core::Error> {
+        use base64::Engine;
+        let invalid = |reason: &str| {
+            izwi_core::Error::InvalidInput(format!("Invalid speech chunk history: {reason}"))
+        };
+        if checkpoint.turns.len() > 1 + HISTORY_RECENT_TURNS {
+            return Err(invalid("too many turns"));
+        }
+        let mut history = Self::default();
+        for turn in &checkpoint.turns {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&turn.codes)
+                .map_err(|_| invalid("codes are not base64"))?;
+            if turn.codebooks == 0 || bytes.is_empty() || bytes.len() % (2 * turn.codebooks) != 0 {
+                return Err(invalid("codes do not fill whole frames"));
+            }
+            let frames = bytes.len() / 2 / turn.codebooks;
+            let codes = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u32::from(u16::from_le_bytes(*pair)))
+                .collect::<Vec<_>>();
+            history.push(SpeechChunkTurn {
+                text: turn.text.clone(),
+                codes: SpeechFrameCodes::new(
+                    codes.chunks_exact(frames).map(<[u32]>::to_vec).collect(),
+                ),
+            });
+        }
+        Ok(history)
     }
 }
 
@@ -295,13 +680,8 @@ pub fn split_tts_text_for_long_form(
     if variant.plans_own_speech_segments() {
         // Callers accepting work must validate SpeechTextPlan first. This legacy
         // infallible splitter is also used by Studio's text editor.
-        return SpeechTextPlan::fish(trimmed, requested_max_tokens)
-            .map(|plan| {
-                plan.segments
-                    .into_iter()
-                    .map(|range| trimmed[range].to_string())
-                    .collect()
-            })
+        return SpeechTextPlan::for_variant(variant, trimmed, requested_max_tokens)
+            .map(|plan| plan.segment_texts(trimmed))
             .unwrap_or_else(|_| vec![trimmed.to_string()]);
     }
     if !should_enable_chunking(variant, requested_max_tokens) {
@@ -688,8 +1068,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
             "Fish model changed during speech recovery".into(),
         ));
     }
-    let plan = SpeechTextPlan::fish(&base.text, base.config.options.max_tokens)?;
-    let mut ranges: std::collections::VecDeque<_> = plan.segments.into();
+    let plan = SpeechTextPlan::for_variant(variant, &base.text, base.config.options.max_tokens)?;
     let mut remaining = plan.max_output_frames.unwrap_or(usize::MAX);
     let mut sequence = progress.as_deref().map_or(0, |p| p.next_sequence());
     let mut segment = progress.as_deref().map_or(0, |p| p.completed_segments());
@@ -714,18 +1093,21 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
             "Invalid speech recovery text offset".into(),
         ));
     }
-    while let Some(mut range) = ranges.pop_front() {
-        if progress
-            .as_deref()
-            .is_some_and(|p| range.end <= p.completed_text_bytes())
-        {
-            continue;
-        }
-        // A previously completed adaptive split can end inside an original range.
-        // Resume only its suffix, never replay the already committed prefix.
-        if let Some(progress) = progress.as_deref() {
-            range.start = range.start.max(progress.completed_text_bytes());
-        }
+    // A previously completed adaptive split can end inside an original range.
+    // Resume only its suffix, never replay the already committed prefix.
+    let mut ranges = plan.queue(&base.text, completed)?;
+    // A chunk session's earlier chunks, as a recovered plan last recorded
+    // them.
+    let mut history = if plan.is_chunk_session() {
+        Some(match progress.as_deref().and_then(|p| p.chunk_history()) {
+            Some(checkpoint) => SpeechChunkHistory::from_checkpoint(checkpoint)?,
+            None => SpeechChunkHistory::default(),
+        })
+    } else {
+        None
+    };
+    while let Some(planned) = ranges.pop_front() {
+        let range = planned.range.clone();
         if let Some(progress) = progress.as_deref_mut() {
             progress
                 .begin_segment(segment, range.clone(), segment + 1 + ranges.len())
@@ -755,12 +1137,18 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
         }
         let mut request = base.clone();
         request.id = format!("{}:{}", base.id, segment);
-        request.text = base.text[range.clone()].to_string();
+        request.text = planned.text.clone();
         request.config.streaming = true;
         request.config.options.max_tokens =
-            crate::api::tts_policy::resolve_tts_output_frames(variant, &request.text, None)
-                .unwrap_or(4096)
-                .min(remaining);
+            plan.segment_frames(variant, &request.text).min(remaining);
+        if let Some(history) = &history {
+            // Each chunk's prompt holds the earlier chunks with their codes,
+            // and chunk i samples from seed + i (the family's session).
+            request.chunk_history = history.turns();
+            if let Some(seed) = base.config.options.speech.seed {
+                request.config.options.speech.seed = Some(seed.wrapping_add(segment as u64));
+            }
+        }
         let permit = state.acquire_workload_permit(workload).await;
         let tenant = base.runtime_context.tenant_key;
         request.runtime_context = permit.runtime_context();
@@ -778,6 +1166,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
         let mut segment_tokens = 0;
         let mut segment_ms = 0.0;
         let mut segment_stop = None;
+        let mut segment_codes = None;
         loop {
             // Buffered durable audio is published by its deadline even when
             // the model is between chunks.
@@ -805,6 +1194,11 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
                 }
             };
             deadline = tokio::time::Instant::now() + stall_timeout;
+            // The codes a chunk generated stay with the plan; no listener
+            // sees them.
+            if let Some(codes) = chunk.generated_codes.take() {
+                segment_codes = Some(codes);
+            }
             if let Some(stats) = &chunk.stats {
                 if chunk.is_final {
                     segment_tokens = stats.tokens_generated;
@@ -858,12 +1252,10 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
             // Exact tokenized reference+text fit is checked inside admitted model
             // preparation. Replan only before this segment has published audio.
             if !emitted && error.kind() == izwi_core::ErrorKind::ContextLengthExceeded {
-                let text = &base.text[range.clone()];
-                let count = text.chars().count();
-                if count > 1 {
-                    let middle = range.start + text.char_indices().nth(count / 2).unwrap().0;
-                    ranges.push_front(middle..range.end);
-                    ranges.push_front(range.start..middle);
+                if let Some(halves) = plan.halve(&base.text, &planned) {
+                    for half in halves.into_iter().rev() {
+                        ranges.push_front(half);
+                    }
                     continue;
                 }
             }
@@ -873,6 +1265,20 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
             return Err(izwi_core::Error::InferenceError(
                 "Speech segment completed without audio or accounting".into(),
             ));
+        }
+        if let Some(history) = history.as_mut() {
+            let codes = segment_codes.ok_or_else(|| {
+                izwi_core::Error::InferenceError(
+                    "Speech chunk completed without its generated codes".into(),
+                )
+            })?;
+            history.push(SpeechChunkTurn {
+                text: planned.text,
+                codes: Arc::unwrap_or_clone(codes),
+            });
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.record_chunk_history(history.to_checkpoint()?);
+            }
         }
         if let Some(progress) = progress.as_deref_mut() {
             if let Some(published) = progress.flush().await.map_err(progress_error)? {
@@ -1480,6 +1886,208 @@ mod tests {
                 "segment budget {budget}"
             );
         }
+    }
+
+    /// Drama 3's plan is its chunk session: the family's speaker-aware
+    /// chunker (not S2's segment plan), one segment per chunk tiling the
+    /// input, and its own per-chunk budget. S2's plan serializes as before.
+    #[test]
+    fn fish_drama3_plans_a_chunk_session_with_its_own_chunker() {
+        use izwi_core::runtime_models::architectures::fish_drama3::chunking::plan_chunks;
+        let drama3 = ModelVariant::FishAudioDrama3;
+        let text = format!(
+            "  {}<|speaker:1|> [sighs] {}<|speaker:2|> Short.  ",
+            "The first speaker talks for a while here. ".repeat(9),
+            "Then the second one answers at some length. ".repeat(8)
+        );
+        let plan = SpeechTextPlan::for_variant(drama3, &text, 0).unwrap();
+        assert!(plan.is_chunk_session());
+        assert_eq!(plan.version, CHUNK_SESSION_PLAN_VERSION);
+        assert_eq!(plan.chunks, plan_chunks(&text, false));
+        assert!(plan.chunks.len() >= 3, "{}", plan.chunks.len());
+        assert_ne!(
+            plan.chunks,
+            SpeechTextPlan::fish(&text, 0).unwrap().segment_texts(&text)
+        );
+        // Every chunk of tagged text carries its speaker's tag.
+        assert!(plan
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.split('\n'))
+            .all(|line| line.starts_with("<|speaker:")));
+        // Segments tile the input, from its first byte to its last.
+        assert_eq!(plan.segments.first().unwrap().start, 0);
+        assert_eq!(plan.segments.last().unwrap().end, text.len());
+        assert!(plan
+            .segments
+            .windows(2)
+            .all(|pair| pair[0].end == pair[1].start && pair[0].start < pair[0].end));
+        assert_eq!(plan.segment_texts(&text), plan.chunks);
+        // Each chunk's budget: its own automatic one, or the client's per
+        // chunk (at most 4,096).
+        assert_eq!(plan.max_output_frames, None);
+        assert_eq!(plan.chunk_frames, None);
+        for chunk in &plan.chunks {
+            assert_eq!(
+                plan.segment_frames(drama3, chunk),
+                crate::api::tts_policy::resolve_tts_output_frames(drama3, chunk, None).unwrap()
+            );
+        }
+        let explicit = SpeechTextPlan::for_variant(drama3, &text, 9_000).unwrap();
+        assert_eq!(explicit.chunk_frames, Some(4_096));
+        assert_eq!(explicit.segment_frames(drama3, &plan.chunks[0]), 4_096);
+        assert!(matches!(
+            SpeechTextPlan::for_variant(drama3, " \n ", 0),
+            Err(izwi_core::Error::InvalidInput(_))
+        ));
+        // One short text is one chunk; the splitter Studio uses agrees.
+        let short = SpeechTextPlan::for_variant(drama3, "Hello there.", 0).unwrap();
+        assert_eq!(short.chunks, ["Hello there."]);
+        assert_eq!(short.segments.len(), 1);
+        assert_eq!(short.segments[0], 0..12);
+        assert_eq!(
+            split_tts_text_for_long_form(drama3, 0, &text),
+            plan_chunks(text.trim(), false)
+        );
+        // S2's plan is unchanged and its identity JSON has no chunk fields.
+        let fish = SpeechTextPlan::for_variant(ModelVariant::FishAudioS2Pro, &text, 0).unwrap();
+        assert_eq!(fish, SpeechTextPlan::fish(&text, 0).unwrap());
+        assert!(!fish.is_chunk_session());
+        let json = serde_json::to_value(&fish).unwrap();
+        let mut keys = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["max_output_frames", "segments", "text_sha256", "version"]
+        );
+        let json = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(json["chunk_frames"], 4_096);
+        assert_eq!(
+            serde_json::from_value::<SpeechTextPlan>(json).unwrap(),
+            explicit
+        );
+    }
+
+    /// A chunk too long for the model is cut again by the family's chunker
+    /// (tags kept), its parts tiling its input range; recovery finds the
+    /// same parts again from the completed offset alone.
+    #[test]
+    fn halved_chunks_keep_their_tags_and_resume_where_they_stopped() {
+        let drama3 = ModelVariant::FishAudioDrama3;
+        let text = format!(
+            "<|speaker:3|> {}<|speaker:4|> {}",
+            "One clause, then another clause, and more words follow here. ".repeat(4),
+            "A reply that is long enough to stand alone as its chunk. ".repeat(5)
+        );
+        let plan = SpeechTextPlan::for_variant(drama3, &text, 0).unwrap();
+        let all = plan.queue(&text, 0).unwrap();
+        assert_eq!(all.len(), plan.chunks.len());
+        let first = all[0].clone();
+        let halves = plan.halve(&text, &first).unwrap();
+        assert!(halves.len() >= 2);
+        assert_eq!(halves[0].range.start, first.range.start);
+        assert_eq!(halves.last().unwrap().range.end, first.range.end);
+        assert!(halves
+            .windows(2)
+            .all(|pair| pair[0].range.end == pair[1].range.start));
+        assert!(halves.iter().all(
+            |half| half.text.starts_with("<|speaker:3|>") && half.text.len() < first.text.len()
+        ));
+        // Recovery after the first half: the rest of the halved chunk, then
+        // every later chunk.
+        let resumed = plan.queue(&text, halves[0].range.end).unwrap();
+        assert_eq!(resumed[0], halves[1]);
+        assert_eq!(resumed.len(), halves.len() - 1 + all.len() - 1);
+        assert_eq!(resumed.back(), all.back());
+        // At a chunk boundary: the chunks after it.
+        let at_boundary = plan.queue(&text, all[0].range.end).unwrap();
+        assert_eq!(
+            at_boundary,
+            all.iter().skip(1).cloned().collect::<VecDeque<_>>()
+        );
+        assert!(plan.queue(&text, text.len()).unwrap().is_empty());
+        // An offset inside a chunk no halving can produce is refused.
+        let whole = "[a long tag stays whole]";
+        let tagged = SpeechTextPlan::for_variant(drama3, whole, 0).unwrap();
+        let error = tagged.queue(whole, 5).unwrap_err();
+        assert!(
+            error.to_string().contains("recovery text offset"),
+            "{error}"
+        );
+        // A protected span cannot be cut.
+        let tag = PlannedSegment {
+            range: 0..20,
+            text: "[a long tag stays whole]".into(),
+        };
+        assert!(plan.halve("[a long tag stays w]", &tag).is_none());
+        // S2 halves at its middle character, as before.
+        let fish = SpeechTextPlan::fish("abcdef", 0).unwrap();
+        let segment = fish.queue("abcdef", 0).unwrap().pop_front().unwrap();
+        let halves = fish.halve("abcdef", &segment).unwrap();
+        assert_eq!(
+            halves
+                .iter()
+                .map(|h| (h.range.clone(), h.text.as_str()))
+                .collect::<Vec<_>>(),
+            [(0..3, "abc"), (3..6, "def")]
+        );
+        assert_eq!(fish.queue("abcdef", 3).unwrap()[0].text, "def");
+    }
+
+    /// The history pins the first chunk that made audio and keeps the
+    /// latest one, as the family's session does, and survives a durable
+    /// checkpoint exactly.
+    #[test]
+    fn chunk_history_pins_the_first_keeps_the_latest_and_round_trips() {
+        let turn = |text: &str, frames: usize, salt: u32| SpeechChunkTurn {
+            text: text.into(),
+            codes: SpeechFrameCodes::new(
+                (0..10u32)
+                    .map(|k| {
+                        (0..frames as u32)
+                            .map(|f| (k * 409 + f * 13 + salt) % 4096)
+                            .collect()
+                    })
+                    .collect(),
+            ),
+        };
+        let mut history = SpeechChunkHistory::default();
+        assert!(history.turns().is_empty());
+        history.push(turn("one", 0, 0));
+        assert!(
+            history.turns().is_empty(),
+            "a chunk without frames is no history"
+        );
+        history.push(turn("one", 3, 1));
+        history.push(turn("two", 2, 2));
+        history.push(turn("three", 4, 3));
+        let held = history.turns();
+        assert_eq!(
+            held.iter().map(|t| t.text.as_str()).collect::<Vec<_>>(),
+            ["one", "three"]
+        );
+        let checkpoint = history.to_checkpoint().unwrap();
+        assert_eq!(checkpoint.turns[1].codebooks, 10);
+        let json = serde_json::to_value(&checkpoint).unwrap();
+        let recovered =
+            SpeechChunkHistory::from_checkpoint(&serde_json::from_value(json).unwrap()).unwrap();
+        assert_eq!(recovered, history);
+        assert_eq!(recovered.turns()[1].codes, turn("three", 4, 3).codes);
+        // A damaged checkpoint is refused.
+        let mut bad = checkpoint.clone();
+        bad.turns[0].codes.push_str("!!");
+        assert!(SpeechChunkHistory::from_checkpoint(&bad).is_err());
+        let mut ragged = checkpoint.clone();
+        ragged.turns[0].codebooks = 7;
+        assert!(SpeechChunkHistory::from_checkpoint(&ragged).is_err());
+        let mut many = checkpoint;
+        many.turns.push(many.turns[0].clone());
+        assert!(SpeechChunkHistory::from_checkpoint(&many).is_err());
     }
 
     #[test]

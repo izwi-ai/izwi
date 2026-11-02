@@ -149,6 +149,7 @@ fn unset_variables_keep_the_previous_defaults() {
         OpenAiCompatibilityProfile::Strict
     );
     assert!(tuning.fish_long_form_enabled);
+    assert!(tuning.fish_drama3_long_form_enabled);
     assert!(!tuning.tts_opaque_final_wav_enabled);
     assert_eq!(tuning.tts_max_text_bytes, 1024 * 1024);
     assert_eq!(tuning.audio_stream_stall_timeout, Duration::from_secs(30));
@@ -173,12 +174,14 @@ fn unset_variables_keep_the_previous_defaults() {
 fn booleans_use_the_shared_vocabulary_and_fail_closed() {
     let tuning = tuning_with(&[
         ("IZWI_FISH_LONG_FORM_ENABLED", "no"),
+        ("IZWI_FISH_DRAMA3_LONG_FORM_ENABLED", "off"),
         ("IZWI_TTS_OPAQUE_FINAL_WAV_ENABLED", "ON"),
         ("IZWI_ALLOW_UNAUTHENTICATED_NETWORK", "yes"),
         ("IZWI_LOOPBACK_PUBLISHED", "1"),
     ])
     .unwrap();
     assert!(!tuning.fish_long_form_enabled);
+    assert!(!tuning.fish_drama3_long_form_enabled);
     assert!(tuning.tts_opaque_final_wav_enabled);
     assert!(tuning.allow_unauthenticated_network);
     assert!(tuning.local_exposure.loopback_published);
@@ -186,6 +189,7 @@ fn booleans_use_the_shared_vocabulary_and_fail_closed() {
         "IZWI_ALLOW_UNAUTHENTICATED_NETWORK",
         "IZWI_LOOPBACK_PUBLISHED",
         "IZWI_FISH_LONG_FORM_ENABLED",
+        "IZWI_FISH_DRAMA3_LONG_FORM_ENABLED",
         "IZWI_TTS_OPAQUE_FINAL_WAV_ENABLED",
     ] {
         let error = tuning_with(&[(name, "fasle")]).unwrap_err().to_string();

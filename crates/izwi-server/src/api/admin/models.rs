@@ -102,6 +102,13 @@ pub struct AdminModelInfo {
     pub disk_required_bytes: u64,
     pub enabled: bool,
     pub license: Option<String>,
+    /// What the weights' licence permits, when the label alone does not
+    /// say it (Fish Audio Drama 3: free for research and non-commercial
+    /// use, commercial use only below USD 500k annual revenue, and a hosted
+    /// service needs a licence from Fish Audio). Informational: nothing is
+    /// refused on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license_notice: Option<String>,
     pub status: String,
     /// Explicitly loaded in this session: survives budget and memory-pressure
     /// eviction until explicitly unloaded.
@@ -141,6 +148,11 @@ pub struct AdminSpeechModelCapabilities {
     pub streaming_mode: Option<&'static str>,
     pub supports_speed_control: bool,
     pub supports_auto_long_form: bool,
+    /// Whether the model speaks without any voice input: with no reference,
+    /// the sampling seed sets its voice, so a reference is optional (Fish
+    /// Audio Drama 3).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub supports_seeded_voice: bool,
     /// Whether an unfinished text-to-speech record of this model can be
     /// played from its start (`GET /v1/text-to-speech/{record_id}/events`):
     /// the server plans the model's speech segments and journals each
@@ -311,6 +323,7 @@ impl AdminModelInfo {
             },
             enabled: info.enabled,
             license: variant.license_label().map(str::to_string),
+            license_notice: variant.license_notice().map(str::to_string),
             status: model_status_as_str(info.status).to_string(),
             pinned,
             local_path: info
@@ -405,6 +418,7 @@ impl From<SpeechModelCapabilities> for AdminSpeechModelCapabilities {
             streaming_mode: None,
             supports_speed_control: capabilities.supports_speed_control,
             supports_auto_long_form: capabilities.supports_auto_long_form,
+            supports_seeded_voice: capabilities.supports_seeded_voice,
             supports_in_progress_replay: false,
             controls: Vec::new(),
             languages: Vec::new(),
@@ -1419,8 +1433,8 @@ mod tests {
         assert!(maya2["default_language"].is_null());
     }
 
-    /// Only a model whose records journal their audio (Fish S2 Pro) offers
-    /// to play an unfinished record from its start.
+    /// Only a model whose records journal their audio (Fish S2 Pro, Fish
+    /// Audio Drama 3) offers to play an unfinished record from its start.
     #[test]
     fn speech_capabilities_offer_in_progress_replay_for_planned_segments() {
         let replay = |variant: ModelVariant| {
@@ -1430,6 +1444,7 @@ mod tests {
                 .clone()
         };
         assert_eq!(replay(ModelVariant::FishAudioS2Pro), true);
+        assert_eq!(replay(ModelVariant::FishAudioDrama3), true);
         for variant in [
             ModelVariant::Qwen3Tts12Hz06BBase,
             ModelVariant::Kokoro82M,
@@ -1438,6 +1453,47 @@ mod tests {
             ModelVariant::Maya2Native25B,
         ] {
             assert!(replay(variant).is_null(), "{variant}");
+        }
+    }
+
+    /// Fish Audio Drama 3's card: a seeded voice (a reference is optional),
+    /// its licence and what that licence permits. No other model reports a
+    /// seeded voice, and S2 keeps its own licence label without a notice.
+    #[test]
+    fn fish_drama3_reports_its_seeded_voice_and_licence_notice() {
+        let model = |variant: ModelVariant| {
+            serde_json::to_value(AdminModelInfo::from_model_info(
+                ModelInfo::new(variant),
+                None,
+                false,
+            ))
+            .expect("serialize admin model")
+        };
+        let drama3 = model(ModelVariant::FishAudioDrama3);
+        assert_eq!(drama3["speech_capabilities"]["supports_seeded_voice"], true);
+        assert_eq!(
+            drama3["speech_capabilities"]["reference_transcript_required"],
+            true
+        );
+        assert_eq!(drama3["license"], "Fish Audio Community License v1.0");
+        let notice = drama3["license_notice"].as_str().expect("notice");
+        assert_eq!(
+            notice,
+            "Free for research and non-commercial use; commercial use only below USD 500k \
+             annual revenue; offering it as a hosted service requires a licence from Fish Audio"
+        );
+        let s2 = model(ModelVariant::FishAudioS2Pro);
+        assert!(s2["speech_capabilities"]["supports_seeded_voice"].is_null());
+        assert_eq!(s2["license"], "Fish Audio Research License");
+        assert!(s2["license_notice"].is_null());
+        for variant in ModelVariant::all()
+            .iter()
+            .filter(|variant| **variant != ModelVariant::FishAudioDrama3)
+        {
+            assert!(
+                model(*variant)["speech_capabilities"]["supports_seeded_voice"].is_null(),
+                "{variant}"
+            );
         }
     }
 

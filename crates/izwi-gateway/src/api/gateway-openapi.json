@@ -229,6 +229,13 @@
               "null"
             ]
           },
+          "license_notice": {
+            "description": "What the weights' licence permits, when the label alone does not\nsay it (Fish Audio Drama 3: free for research and non-commercial\nuse, commercial use only below USD 500k annual revenue, and a hosted\nservice needs a licence from Fish Audio). Informational: nothing is\nrefused on it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "local_path": {
             "type": [
               "string",
@@ -619,6 +626,10 @@
             "type": "boolean"
           },
           "supports_reference_voice": {
+            "type": "boolean"
+          },
+          "supports_seeded_voice": {
+            "description": "Whether the model speaks without any voice input: with no reference,\nthe sampling seed sets its voice, so a reference is optional (Fish\nAudio Drama 3).",
             "type": "boolean"
           },
           "supports_speed_control": {
@@ -1987,6 +1998,7 @@
                 ]
               },
               "input": {
+                "description": "The text to speak. Fish S2 and Fish Audio Drama 3 refuse text holding\ntheir prompt's control tokens (`<|im_start|>`, `<|im_end|>`,\n`<|voice|>`, `<|text|>`, `<|interleave|>`, `<|semantic:N|>`);\nperformance tags such as `[sighs]` and `<whisper>…</whisper>` pass\nthrough. Long text is split into chunks the model speaks one after\nanother.",
                 "type": "string"
               },
               "instructions": {
@@ -1996,6 +2008,7 @@
                 ]
               },
               "language": {
+                "description": "A language hint. Fish Audio Drama 3 reads the language from the text\nand is not given this; a `[language: xx]` tag in the text steers it.",
                 "type": [
                   "string",
                   "null"
@@ -2009,6 +2022,7 @@
                 ]
               },
               "max_tokens": {
+                "description": "The output budget in model frames. Fish S2 bounds the whole request\nwith it; Fish Audio Drama 3 bounds each chunk (1 to 4,096; unset, a\nchunk gets about 2.5 times its speaking estimate, at most 1,024).",
                 "minimum": 0,
                 "type": [
                   "integer",
@@ -2019,6 +2033,7 @@
                 "type": "string"
               },
               "reference_audio": {
+                "description": "A reference clip to clone, base64 audio. Fish Audio Drama 3 takes one\nup to 60 s (saved voices hold 30 s) and speaks in a voice its `seed`\nsets when given none.",
                 "type": [
                   "string",
                   "null"
@@ -2032,6 +2047,7 @@
                 ]
               },
               "reference_text": {
+                "description": "The reference clip's transcript, required with `reference_audio` by\nevery model that conditions on its words (all but Chatterbox).",
                 "type": [
                   "string",
                   "null"
@@ -2076,6 +2092,7 @@
                 ]
               },
               "top_k": {
+                "description": "Top-k sampling. Fish Audio Drama 3 reads 0 as no cap.",
                 "minimum": 0,
                 "type": [
                   "integer",
@@ -2156,7 +2173,7 @@
             ]
           },
           "seed": {
-            "description": "Sampling seed (Qwen3-TTS, LFM2.5-Audio, Fish S2, Voxtral noise, Kokoro noise).",
+            "description": "Sampling seed (Qwen3-TTS, LFM2.5-Audio, Fish S2, Fish Audio Drama 3,\nVoxtral noise, Kokoro noise). Fish Audio Drama 3's voice without a\nreference comes from it, and chunk i of long text samples from\nseed + i.",
             "format": "int64",
             "minimum": 0,
             "type": [

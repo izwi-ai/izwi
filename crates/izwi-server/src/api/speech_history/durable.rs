@@ -67,6 +67,20 @@ impl DurableSpeechProgress {
     pub(crate) fn completed_duration_secs(&self) -> f32 {
         self.checkpoint.completed_duration_secs
     }
+    /// A chunk session's history as of the last completed segment.
+    pub(crate) fn chunk_history(
+        &self,
+    ) -> Option<&crate::batch_runtime::speech_progress::SpeechChunkHistoryCheckpoint> {
+        self.checkpoint.chunk_history.as_ref()
+    }
+    /// The history the next segment's prompt holds; it is saved with the
+    /// segment's completion.
+    pub(crate) fn record_chunk_history(
+        &mut self,
+        history: crate::batch_runtime::speech_progress::SpeechChunkHistoryCheckpoint,
+    ) {
+        self.checkpoint.chunk_history = Some(history);
+    }
     pub(crate) async fn begin_segment(
         &mut self,
         index: usize,
@@ -201,7 +215,8 @@ pub(super) async fn synthesize_fish_record(
             variant,
         );
         base.runtime_context.tenant_key = tenant_key;
-        let plan = SpeechTextPlan::fish(&input_text, base.config.options.max_tokens)?;
+        let plan =
+            SpeechTextPlan::for_variant(variant, &input_text, base.config.options.max_tokens)?;
         state.runtime.load_model(variant).await?;
         let artifact_fingerprint = state
             .runtime

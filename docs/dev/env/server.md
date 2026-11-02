@@ -45,6 +45,7 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_TTS_MAX_TEXT_BYTES` | `1048576` | Longest speech input one request may carry, in UTF-8 bytes. |
 | `IZWI_TTS_LONG_FORM_CHUNK_MAX_CHARS` | the model's segment size | Characters per long-form speech segment (clamped to 80-4000). |
 | `IZWI_FISH_LONG_FORM_ENABLED` | `true` | Allow Fish S2 requests that need more than one segment. |
+| `IZWI_FISH_DRAMA3_LONG_FORM_ENABLED` | `true` | Allow Fish Audio Drama 3 requests that need more than one chunk (its chunk session). |
 | `IZWI_TTS_SEGMENT_TIMEOUT_SECS` | `1800` | How long a long-form segment may publish nothing before it fails. |
 | `IZWI_TTS_STREAM_MAX_PCM_BYTES` | the model's allowance | Most PCM bytes one streamed or durable speech output may hold (at least 2). |
 | `IZWI_AUDIO_STREAM_EVENT_QUEUE_CAPACITY` | `32` | Events a speech stream buffers for its reader. |

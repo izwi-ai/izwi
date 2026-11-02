@@ -849,7 +849,8 @@ async fn create_record(
         .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {err}")))?;
 
     if variant.plans_own_speech_segments() {
-        crate::api::tts_long_form::SpeechTextPlan::fish(
+        crate::api::tts_long_form::SpeechTextPlan::for_variant(
+            variant,
             &input_text,
             req.max_output_tokens.or(req.max_tokens).unwrap_or(0),
         )
@@ -2077,7 +2078,8 @@ async fn stream_record_creation(
         req.max_output_tokens.or(req.max_tokens),
     );
     let planned_count = if variant.plans_own_speech_segments() {
-        crate::api::tts_long_form::SpeechTextPlan::fish(
+        crate::api::tts_long_form::SpeechTextPlan::for_variant(
+            variant,
             &generation_request.text,
             generation_request.config.options.max_tokens,
         )
@@ -2696,7 +2698,10 @@ fn build_generation_request(
     if let Some(top_k) = req.top_k {
         generation_config.options.top_k = top_k;
     }
-    generation_config.options.speech = req.sampling.options(req.temperature, req.top_k);
+    generation_config.options.speech = req.sampling.options(
+        req.temperature,
+        crate::api::tts_policy::speech_top_k(variant, req.top_k),
+    );
     generation_config.options.speaker = req.speaker.clone();
 
     GenerationRequest {
@@ -3258,6 +3263,16 @@ mod tests {
         );
     }
 
+    /// Drama 3's own allowance: each chunk may make its 4,096-frame budget
+    /// at 44.1 kHz, from its own frame rate.
+    #[test]
+    fn stream_spool_allowance_covers_fish_drama3_chunks() {
+        let single = stream_pcm_byte_allowance(ModelVariant::FishAudioDrama3, 44_100, 1);
+        assert!(single >= ModelVariant::FISH_DRAMA3_MAX_OUTPUT_FRAMES * 2048 * 2 * 4);
+        let three = stream_pcm_byte_allowance(ModelVariant::FishAudioDrama3, 44_100, 3);
+        assert!(three >= single * 3 - 3 && three <= single * 3);
+    }
+
     #[test]
     fn stream_spool_allowance_preserves_fish_full_output_and_long_form() {
         let single = stream_pcm_byte_allowance(ModelVariant::FishAudioS2Pro, 44_100, 1);
@@ -3503,6 +3518,90 @@ mod tests {
             ..base_request()
         })
         .expect("audio alone passes the model-independent check");
+    }
+
+    /// Fish Audio Drama 3 on the first-party routes: text to speech without
+    /// a voice, a clone with its transcript; the cloning route still needs
+    /// a reference; control tokens are refused in the text and the
+    /// transcript; and `top_k: 0` reaches the engine as no cap.
+    #[test]
+    fn fish_drama3_first_party_requests_follow_its_voice_and_token_contract() {
+        let drama3 = ModelVariant::FishAudioDrama3;
+        let request = |text: &str, reference: Option<(&str, Option<&str>)>| {
+            CreateSpeechHistoryRecordRequest {
+                model_id: Some("FishAudio-Drama-3".to_string()),
+                text: Some(text.to_string()),
+                reference_audio: reference.map(|(audio, _)| audio.to_string()),
+                reference_text: reference.and_then(|(_, text)| text.map(str::to_string)),
+                top_k: Some(0),
+                ..base_request()
+            }
+        };
+        normalize_for_model_capabilities(
+            SpeechRouteKind::TextToSpeech,
+            drama3,
+            request("[sighs] Hello.", None),
+        )
+        .expect("a seeded voice");
+        normalize_for_model_capabilities(
+            SpeechRouteKind::VoiceCloning,
+            drama3,
+            request("Hello.", Some(("UklGRg==", Some("Hi.")))),
+        )
+        .expect("a clone");
+        let err = normalize_for_model_capabilities(
+            SpeechRouteKind::VoiceCloning,
+            drama3,
+            request("Hello.", None),
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("require `saved_voice_id`"),
+            "{}",
+            err.message
+        );
+        let err = normalize_for_model_capabilities(
+            SpeechRouteKind::TextToSpeech,
+            drama3,
+            request("Hello.", Some(("UklGRg==", None))),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("Provide both"), "{}", err.message);
+        for variant in [drama3, ModelVariant::FishAudioS2Pro] {
+            let err = normalize_for_model_capabilities(
+                SpeechRouteKind::TextToSpeech,
+                variant,
+                request("Hi <|semantic:7|>", Some(("UklGRg==", Some("Hi.")))),
+            )
+            .unwrap_err();
+            assert!(
+                err.message.contains("`text` contains `<|semantic:7|>`"),
+                "{}",
+                err.message
+            );
+            let err = normalize_for_model_capabilities(
+                SpeechRouteKind::TextToSpeech,
+                variant,
+                request("Hello.", Some(("UklGRg==", Some("<|im_start|>user")))),
+            )
+            .unwrap_err();
+            assert!(
+                err.message
+                    .contains("`reference_text` contains `<|im_start|>`"),
+                "{}",
+                err.message
+            );
+        }
+        let generation = build_generation_request(
+            request("Hello.", None),
+            "c".into(),
+            "Hello.".into(),
+            true,
+            drama3,
+        );
+        assert_eq!(generation.config.options.speech.top_k, None);
+        // The plan's budget: raw, as S2's is (the plan resolves it per chunk).
+        assert_eq!(generation.config.options.max_tokens, 0);
     }
 
     #[test]

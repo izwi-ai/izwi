@@ -2,7 +2,9 @@ use izwi_core::catalog::ModelFamily;
 use izwi_core::runtime_models::architectures::chatterbox::{
     chatterbox_auto_max_speech_tokens, ChatterboxEdition,
 };
+use izwi_core::runtime_models::architectures::fish_drama3::model::auto_frame_budget as fish_drama3_auto_frame_budget;
 use izwi_core::runtime_models::architectures::fish_drama3::prompt as fish_drama3_prompt;
+use izwi_core::runtime_models::architectures::fish_drama3::reference_cache::MAX_REFERENCES as FISH_DRAMA3_MAX_REFERENCES;
 use izwi_core::runtime_models::architectures::fish_s2::contracts::CONTROL_TOKENS as FISH_S2_CONTROL_TOKENS;
 use izwi_core::runtime_models::architectures::maya1::{
     maya1_auto_max_new_tokens, prompt::validate_inline_tags,
@@ -45,8 +47,9 @@ pub(crate) struct SpeechVoiceRequest {
 /// (TPIPE-12): a reference is its audio, with its transcript for every model
 /// that conditions on the reference's words (all but Chatterbox); a model
 /// is given only the voice inputs it supports; and a model whose only voice
-/// mode is a reference (Qwen Base, VibeVoice, Fish) or a description (Qwen
-/// VoiceDesign) must be given one.
+/// mode is a reference (Qwen Base, VibeVoice, Fish S2) or a description
+/// (Qwen VoiceDesign) must be given one. A model with a seeded voice (Fish
+/// Audio Drama 3) speaks without any, so its reference is optional.
 pub(crate) fn validate_speech_voice(
     variant: ModelVariant,
     voice: SpeechVoiceRequest,
@@ -71,15 +74,14 @@ pub(crate) fn validate_speech_voice(
             "{variant} does not support reference or saved voices.",
         )));
     }
-    if reference && capabilities.reference_transcript_required && !voice.reference_text {
-        return Err(ApiError::bad_request(if voice.saved_voice {
-            format!(
-                "This saved voice has no transcript, which {variant} needs. Use a voice saved \
-                 with one, or a model that clones from audio alone."
-            )
-        } else {
-            "Provide both `reference_audio` and `reference_text` together.".to_string()
-        }));
+    if reference {
+        validate_speech_references(
+            variant,
+            &[SpeechReferenceRequest {
+                transcript: voice.reference_text,
+                saved_voice: voice.saved_voice,
+            }],
+        )?;
     }
     if voice.voice_description && !capabilities.supports_voice_description {
         return Err(ApiError::bad_request(format!(
@@ -89,6 +91,7 @@ pub(crate) fn validate_speech_voice(
     if !capabilities.supports_builtin_voices
         && !capabilities.supports_reference_voice
         && !capabilities.supports_voice_description
+        && !capabilities.supports_seeded_voice
     {
         return Err(ApiError::bad_request(format!(
             "{variant} does not expose a supported text-to-speech voice mode.",
@@ -97,6 +100,7 @@ pub(crate) fn validate_speech_voice(
     if capabilities.supports_reference_voice
         && !capabilities.supports_builtin_voices
         && !capabilities.supports_voice_description
+        && !capabilities.supports_seeded_voice
         && !reference
     {
         let message = if capabilities.reference_transcript_required {
@@ -116,6 +120,59 @@ pub(crate) fn validate_speech_voice(
         return Err(ApiError::bad_request(format!(
             "{variant} requires a voice description (`instructions` or `voice_description`).",
         )));
+    }
+    Ok(())
+}
+
+/// One reference voice a request carries, as the routes read it.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SpeechReferenceRequest {
+    /// Its transcript was given.
+    pub(crate) transcript: bool,
+    /// It came from a saved voice.
+    pub(crate) saved_voice: bool,
+}
+
+/// The most reference clips one request of `variant` may carry: the
+/// family's prompt limit for Fish Audio Drama 3 (8), one for every other
+/// model that clones.
+pub(crate) fn max_speech_references(variant: ModelVariant) -> usize {
+    match variant.family() {
+        ModelFamily::FishDrama3Tts => FISH_DRAMA3_MAX_REFERENCES,
+        _ => 1,
+    }
+}
+
+/// Refuse references the model cannot take: more than
+/// [`max_speech_references`], or one without the transcript a model that
+/// conditions on its words needs.
+pub(crate) fn validate_speech_references(
+    variant: ModelVariant,
+    references: &[SpeechReferenceRequest],
+) -> Result<(), crate::error::ApiError> {
+    use crate::error::ApiError;
+    let max = max_speech_references(variant);
+    if references.len() > max {
+        return Err(ApiError::bad_request(format!(
+            "{variant} takes at most {max} reference voices; got {}.",
+            references.len()
+        )));
+    }
+    let transcript_required = variant
+        .speech_capabilities()
+        .is_some_and(|capabilities| capabilities.reference_transcript_required);
+    if let Some(reference) = references
+        .iter()
+        .find(|reference| transcript_required && !reference.transcript)
+    {
+        return Err(ApiError::bad_request(if reference.saved_voice {
+            format!(
+                "This saved voice has no transcript, which {variant} needs. Use a voice saved \
+                 with one, or a model that clones from audio alone."
+            )
+        } else {
+            "Provide both `reference_audio` and `reference_text` together.".to_string()
+        }));
     }
     Ok(())
 }
@@ -185,6 +242,17 @@ pub(crate) fn validate_speech_control_tokens(
         }
     }
     Ok(())
+}
+
+/// The `top_k` a speech request samples with: Fish Audio Drama 3 reads
+/// `0` as no cap (its defaults: the main token uncapped, the residual heads
+/// at 30), since the family itself refuses a cap of 0. Every other model
+/// keeps the value as sent.
+pub(crate) fn speech_top_k(variant: ModelVariant, top_k: Option<usize>) -> Option<usize> {
+    match top_k {
+        Some(0) if variant.family() == ModelFamily::FishDrama3Tts => None,
+        top_k => top_k,
+    }
 }
 
 /// Refuse a `speed` the model cannot honour with 400 (TPIPE-10): any speed
@@ -383,7 +451,10 @@ pub struct SpeechSamplingRequest {
     /// Nucleus sampling threshold, in (0, 1].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
-    /// Sampling seed (Qwen3-TTS, LFM2.5-Audio, Fish S2, Voxtral noise, Kokoro noise).
+    /// Sampling seed (Qwen3-TTS, LFM2.5-Audio, Fish S2, Fish Audio Drama 3,
+    /// Voxtral noise, Kokoro noise). Fish Audio Drama 3's voice without a
+    /// reference comes from it, and chunk i of long text samples from
+    /// seed + i.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
     /// Repetition penalty (Qwen3-TTS), >= 1.
@@ -479,6 +550,10 @@ pub(crate) fn resolve_tts_output_frames(
         }
         Some(0) | None if variant == ModelVariant::FishAudioS2Pro => {
             Some(fish_s2_tts_auto_max_frames_for_text(text).min(model_max_frames))
+        }
+        // Per chunk: S2's speaking estimate times 2.5, at most 1,024 frames.
+        Some(0) | None if variant.family() == ModelFamily::FishDrama3Tts => {
+            Some(fish_drama3_auto_frame_budget(text).min(model_max_frames))
         }
         Some(0) | None if variant.family() == ModelFamily::ChatterboxTts => {
             Some(chatterbox_auto_max_speech_tokens(text).min(model_max_frames))
@@ -586,6 +661,74 @@ mod tests {
         }
     }
 
+    /// Fish Audio Drama 3 speaks with or without a reference (its seed sets
+    /// the voice without one), and a reference needs its transcript, saved
+    /// or inline. Fish S2 still requires a reference.
+    #[test]
+    fn fish_drama3_takes_an_optional_reference_with_its_transcript() {
+        let drama3 = ModelVariant::FishAudioDrama3;
+        let voice = |reference_audio, reference_text, saved_voice| SpeechVoiceRequest {
+            reference_audio,
+            reference_text,
+            saved_voice,
+            ..Default::default()
+        };
+        validate_speech_voice(drama3, voice(false, false, false)).expect("a seeded voice");
+        validate_speech_voice(drama3, voice(true, true, false)).expect("a clone");
+        validate_speech_voice(drama3, voice(true, true, true)).expect("a saved voice");
+        let err = validate_speech_voice(drama3, voice(true, false, false)).unwrap_err();
+        assert!(err.message.contains("Provide both"), "{}", err.message);
+        let err = validate_speech_voice(drama3, voice(true, false, true)).unwrap_err();
+        assert!(err.message.contains("saved voice has no transcript"));
+        let err = validate_speech_voice(drama3, voice(false, true, false)).unwrap_err();
+        assert!(err.message.contains("without `reference_audio`"));
+        for refused in [
+            SpeechVoiceRequest {
+                speaker: true,
+                ..Default::default()
+            },
+            SpeechVoiceRequest {
+                voice_description: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(validate_speech_voice(drama3, refused).is_err());
+        }
+        // S2's contract is unchanged: it must be given a reference.
+        let err = validate_speech_voice(ModelVariant::FishAudioS2Pro, voice(false, false, false))
+            .unwrap_err();
+        assert!(err
+            .message
+            .contains("requires `saved_voice_id` or both `reference_audio` and `reference_text`"));
+    }
+
+    /// A request carries at most the model's references (Drama 3: the
+    /// family's 8; any other cloning model: one), each with its transcript
+    /// where the model needs one.
+    #[test]
+    fn references_are_counted_and_need_their_transcripts() {
+        let drama3 = ModelVariant::FishAudioDrama3;
+        let with_transcript = SpeechReferenceRequest {
+            transcript: true,
+            saved_voice: false,
+        };
+        assert_eq!(max_speech_references(drama3), 8);
+        assert_eq!(max_speech_references(ModelVariant::FishAudioS2Pro), 1);
+        validate_speech_references(drama3, &[with_transcript; 8]).expect("eight");
+        let err = validate_speech_references(drama3, &[with_transcript; 9]).unwrap_err();
+        assert!(err.message.contains("at most 8"), "{}", err.message);
+        let err = validate_speech_references(ModelVariant::FishAudioS2Pro, &[with_transcript; 2])
+            .unwrap_err();
+        assert!(err.message.contains("at most 1"), "{}", err.message);
+        let mut missing = [with_transcript; 3];
+        missing[2].transcript = false;
+        let err = validate_speech_references(drama3, &missing).unwrap_err();
+        assert!(err.message.contains("Provide both"), "{}", err.message);
+        // Chatterbox clones from audio alone.
+        let audio_only = SpeechReferenceRequest::default();
+        validate_speech_references(ModelVariant::Chatterbox500M, &[audio_only]).unwrap();
+    }
+
     /// Caller text holding a model's control tokens is refused with 400
     /// naming the token, for Fish S2 and Fish Audio Drama 3 alike;
     /// performance tags pass, Drama 3's speaker tags must be canonical, and
@@ -658,6 +801,73 @@ mod tests {
             validate_speech_control_tokens(variant, "input", "<|im_end|> <|voice|>")
                 .expect("not a control token here");
         }
+    }
+
+    /// `top_k: 0` turns Drama 3's cap off (its family refuses a cap of 0);
+    /// every other value, and every other model, keeps what was sent.
+    #[test]
+    fn fish_drama3_reads_top_k_zero_as_no_cap() {
+        let drama3 = ModelVariant::FishAudioDrama3;
+        assert_eq!(speech_top_k(drama3, Some(0)), None);
+        assert_eq!(speech_top_k(drama3, Some(30)), Some(30));
+        assert_eq!(speech_top_k(drama3, None), None);
+        assert_eq!(speech_top_k(ModelVariant::FishAudioS2Pro, Some(0)), Some(0));
+        assert_eq!(speech_top_k(ModelVariant::Kokoro82M, Some(0)), Some(0));
+    }
+
+    /// Drama 3 takes `language` as a hint and speaks any it is given (the
+    /// text's own `[language: xx]` tag steers it).
+    #[test]
+    fn fish_drama3_takes_language_as_a_hint() {
+        for language in [None, Some("en"), Some("fr"), Some("Swahili"), Some("auto")] {
+            assert!(validate_speech_language(ModelVariant::FishAudioDrama3, language).is_ok());
+        }
+    }
+
+    /// Drama 3's budget per chunk: S2's speaking estimate times 2.5, at
+    /// most 1,024 frames, or an explicit one up to 4,096. S2's own budget
+    /// is unchanged.
+    #[test]
+    fn fish_drama3_budget_is_its_own_auto_estimate_or_an_explicit_one() {
+        let drama3 = ModelVariant::FishAudioDrama3;
+        assert_eq!(resolve_tts_output_frames(drama3, "Hello", None), Some(323));
+        assert_eq!(
+            resolve_tts_output_frames(drama3, "Hello", Some(0)),
+            Some(323)
+        );
+        assert_eq!(
+            resolve_tts_output_frames(drama3, &"word ".repeat(36), None),
+            Some(1_024)
+        );
+        assert_eq!(resolve_tts_output_frames(drama3, "Hello", Some(7)), Some(7));
+        assert_eq!(
+            resolve_tts_output_frames(drama3, "Hello", Some(2_000)),
+            Some(2_000)
+        );
+        assert_eq!(
+            resolve_tts_output_frames(drama3, "Hello", Some(9_999)),
+            Some(4_096)
+        );
+        // The family's own estimate.
+        for text in [
+            "Hello",
+            "你好世界".repeat(30).as_str(),
+            &"word ".repeat(200),
+        ] {
+            assert_eq!(
+                resolve_tts_output_frames(drama3, text, None),
+                Some(fish_drama3_auto_frame_budget(text))
+            );
+        }
+        // S2: 6 s at 21.5 Hz for a short text, as before.
+        assert_eq!(
+            resolve_tts_output_frames(ModelVariant::FishAudioS2Pro, "Hello", None),
+            Some(129)
+        );
+        assert!(!tts_text_exceeds_one_request(
+            drama3,
+            &"word ".repeat(1_000)
+        ));
     }
 
     /// TPIPE-19: an explicit Voxtral budget up to CUDA's 2,048 frames
