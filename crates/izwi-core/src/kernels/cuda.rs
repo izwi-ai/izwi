@@ -24,6 +24,7 @@ pub mod kquant;
 pub mod moe;
 pub mod norm;
 pub mod rope;
+pub mod row_gemv;
 pub mod sampling;
 pub mod segment_graph;
 pub mod split_decode;

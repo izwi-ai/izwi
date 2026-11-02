@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=src/kernels/cuda/physical_state.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/mamba2.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/moe_relu2.cu");
+    println!("cargo:rerun-if-changed=src/kernels/cuda/row_gemv.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return Ok(());
@@ -38,6 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "src/kernels/cuda/physical_state.cu",
             "src/kernels/cuda/mamba2.cu",
             "src/kernels/cuda/moe_relu2.cu",
+            "src/kernels/cuda/row_gemv.cu",
         ])
         .arg("-std=c++17")
         .arg("-O3")
