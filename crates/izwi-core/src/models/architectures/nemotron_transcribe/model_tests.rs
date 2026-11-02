@@ -343,3 +343,80 @@ fn word_timestamps_run_the_ctc_stage_and_time_the_turns() {
         assert_eq!(plain.transcript, result.transcript);
     }
 }
+
+/// The fused decode step (fused norms, Mamba step kernels, device greedy)
+/// transcribes as the eager composition does, and the summary names the
+/// path.
+#[test]
+fn the_fused_decode_transcribes_as_the_eager_one() {
+    use super::decoder::DecodePath;
+    let dir = temp_checkpoint();
+    let mut model = NemotronTranscribeModel::load_on(dir.path(), None, &Device::Cpu).unwrap();
+    assert_eq!(model.diagnostics_summary()["decode_path"]["path"], "fused");
+    let audio = test_audio(2.5, 3);
+    let run = |model: &NemotronTranscribeModel| {
+        let mut cache = caches(&Device::Cpu, model, 1, 1024).remove(0);
+        model
+            .transcribe_with_cache(&audio, request(16), &mut cache, 64)
+            .unwrap()
+    };
+    let fused = run(&model);
+    model.decoder_mut().force_decode_path(DecodePath::Eager {
+        reason: "test".into(),
+    });
+    let eager = run(&model);
+    assert_eq!(fused.transcript, eager.transcript);
+    assert_eq!(fused.generated_tokens, eager.generated_tokens);
+}
+
+/// On Metal the load-time kernel check passes, so decode runs fused, and a
+/// row decodes the same alone and beside another.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_decodes_fused_and_rows_alone_and_together_alike() {
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "metal_decodes_fused_and_rows_alone_and_together_alike",
+    ) else {
+        return;
+    };
+    let dir = temp_checkpoint();
+    let model = NemotronTranscribeModel::load_on(dir.path(), None, &device).unwrap();
+    let summary = model.diagnostics_summary();
+    assert_eq!(summary["decode_path"]["path"], "fused", "{summary}");
+    let audio = [test_audio(2.0, 4), test_audio(2.6, 5)];
+    let artifacts = audio
+        .iter()
+        .map(|a| Arc::new(model.prepare(a, request(10)).unwrap()))
+        .collect::<Vec<_>>();
+    let decode = |rows: &[usize]| {
+        let mut caches = caches(&device, &model, rows.len(), 1024);
+        let mut states = rows
+            .iter()
+            .map(|&i| {
+                let context = artifacts[i].max_context();
+                model.new_row(artifacts[i].clone(), context).unwrap()
+            })
+            .collect::<Vec<_>>();
+        for (state, cache) in states.iter_mut().zip(caches.iter_mut()) {
+            while state.prefill_cursor() < state.prompt_tokens() {
+                let n = 64.min(state.prompt_tokens() - state.prefill_cursor());
+                model.retained_prefill(state, cache, n).unwrap();
+            }
+        }
+        while states.iter().any(|s| !s.finished()) {
+            let mut step = states
+                .iter_mut()
+                .zip(caches.iter_mut())
+                .map(|(state, cache)| NemotronStepRow { state, cache })
+                .collect::<Vec<_>>();
+            model.retained_decode_batch(&mut step).unwrap();
+        }
+        states
+            .iter()
+            .map(|s| model.finish_row(s).unwrap().transcript)
+            .collect::<Vec<_>>()
+    };
+    let together = decode(&[0, 1]);
+    assert_eq!(decode(&[0])[0], together[0]);
+    assert_eq!(decode(&[1])[0], together[1]);
+}

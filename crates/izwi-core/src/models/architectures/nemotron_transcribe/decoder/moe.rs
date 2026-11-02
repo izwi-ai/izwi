@@ -79,7 +79,7 @@ struct Expert {
 
 impl Expert {
     fn forward(&self, x: &Tensor, pass: Pass) -> Result<Tensor> {
-        let h = self.up.forward_padded(x, pass)?.relu()?.sqr()?;
+        let h = self.up.forward_relu2(x, pass)?;
         self.down.forward(&h, pass)
     }
 }

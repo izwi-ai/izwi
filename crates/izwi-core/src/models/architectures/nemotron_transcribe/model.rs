@@ -741,7 +741,21 @@ impl NemotronTranscribeModel {
             "decode_ms": d.decode_us.load(Ordering::Relaxed) as f64 / 1e3,
             "host_readbacks": super::speech_transformer::host_readbacks(),
             "fp8_decode_kernel": self.fp8_decode_kernel(),
+            "decode_path": match self.decoder.decode_path() {
+                super::decoder::DecodePath::Fused { check } => {
+                    json!({"path": "fused", "kernel_check": check})
+                }
+                super::decoder::DecodePath::Eager { reason } => {
+                    json!({"path": "eager", "reason": reason})
+                }
+            },
         })
+    }
+
+    /// The decoder, for tests that switch its decode path.
+    #[cfg(test)]
+    pub(crate) fn decoder_mut(&mut self) -> &mut NemotronDecoder {
+        &mut self.decoder
     }
 
     /// The FP8 decode GEMV the step projections run on this device.
@@ -1084,9 +1098,8 @@ impl NemotronTranscribeModel {
                     token,
                 });
             }
-            let hidden = self.decoder.forward_step(&mut step_rows)?;
+            let next = self.decoder.decode_step(&mut step_rows)?;
             drop(step_rows);
-            let next = self.decoder.greedy(&hidden)?;
             for (&index, (token, margin)) in active.iter().zip(next) {
                 let decode = rows[index].state.decode.as_mut().expect("checked above");
                 self.accept(decode, token, margin)?;

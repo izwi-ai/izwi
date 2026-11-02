@@ -132,4 +132,58 @@ impl MambaMixer {
             .forward(&gated.reshape((rows * tokens, m.inner()))?, pass)?;
         Ok((out, next_conv, next_ssm))
     }
+
+    /// Where a step's operands sit in the in_proj row `[z | xBC | dt]`.
+    fn step_layout(&self) -> mamba2::Mamba2StepLayout {
+        let m = self.config;
+        mamba2::Mamba2StepLayout {
+            width: m.in_proj_rows(),
+            z_offset: 0,
+            xbc_offset: m.inner(),
+            dt_offset: m.inner() + m.conv_channels(),
+            taps: m.conv_kernel,
+        }
+    }
+
+    /// One decode token of every row through the step kernels: in_proj, the
+    /// convolution step (read from the projection, writing dt for the
+    /// scan), the scan, the gated norm (z read from the projection) and
+    /// out_proj. `h` is `[rows, hidden]`; the states as in [`Self::forward`].
+    /// Matches it to rounding.
+    pub fn forward_step_fused(
+        &self,
+        h: &Tensor,
+        conv: &Tensor,
+        ssm: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let m = self.config;
+        let rows = h.dim(0)?;
+        let layout = self.step_layout();
+        let projected = self.in_proj.forward(h, Pass::Step)?;
+        let (u, dt, next_conv) = mamba2::conv_step_silu(
+            m.geometry(),
+            layout,
+            &projected,
+            conv,
+            &self.conv_weight,
+            &self.conv_bias,
+        )?;
+        let (y, next_ssm) = mamba2::selective_scan(
+            m.geometry(),
+            &u.reshape((rows, 1, m.conv_channels()))?,
+            &dt.reshape((rows, 1, m.heads))?,
+            &self.params,
+            ssm,
+        )?;
+        let gated = mamba2::gated_group_rms_norm_step(
+            &y.reshape((rows, m.inner()))?,
+            &projected,
+            layout,
+            &self.norm,
+            m.norm_group(),
+            self.eps,
+        )?;
+        let out = self.out_proj.forward(&gated, Pass::Step)?;
+        Ok((out, next_conv, next_ssm))
+    }
 }

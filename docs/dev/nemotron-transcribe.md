@@ -279,6 +279,33 @@ Decode rows run at the engine's tensor batch width for speech models: two rows
 on CPU and Metal unless `IZWI_MAX_BATCH_SIZE` sets one, and CUDA's automatic
 width.
 
+### Decode step
+
+A decode step runs the fused path by default (`decode_step` in
+`decoder/mod.rs`):
+
+- each residual add runs with the next layer's RMSNorm in one launch
+  (`kernels::residual_norm`);
+- each Mamba2 mixer is five launches: in_proj, the convolution step (read
+  straight from the projection; it also copies dt out for the scan), the
+  scan, the gated norm (z read from the projection), and out_proj
+  (`kernels::mamba2::{conv_step_silu, gated_group_rms_norm_step}`);
+- on CUDA the FP8 step projections take and return F32 in one vectorized
+  GEMV, and the shared expert's up projection applies relu² in the GEMV
+  (`fp8::block_fp8_projection_f32`);
+- the language-model head's output, in its own dtype, goes straight to the
+  device greedy pick (`kernels::greedy`), and the step reads back 8 bytes a
+  row before the rows' KV and state commit, so it drains the device once.
+
+Attention decodes groups of 16 query heads per KV head on CUDA's split
+decode and Metal's simdgroup kernel. Prefill spans use the same fused
+residual norms.
+
+At load the fused kernels run against their CPU forms in the decoder's
+geometry; above 1e-4 relative L2 (or any greedy pick that differs), the
+step runs the eager composition instead. The model diagnostics'
+`decode_path` reports which path runs and why.
+
 ### Row state
 
 `decoder/state.rs` declares one transactional consistency group per row:
@@ -501,6 +528,9 @@ The family's knobs, in [`env/core.md`](env/core.md):
 - `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN` (read at load): the most prompt
   tokens one row prefills per engine step, 16 to 16,384. Defaults to 2,048 on
   CUDA and 512 on CPU and Metal; values outside the range are ignored.
+- `IZWI_NEMOTRON_TRANSCRIBE_FUSED_DECODE` (read at load): any false value
+  runs decode steps through the eager composition instead of the fused
+  kernels (see [Decode step](#decode-step)).
 
 `IZWI_NEMOTRON_TRANSCRIBE_MODEL_DIR`, `_AUDIO_DIR`, `_BACKEND` and
 `_REFERENCE` are read only by the tests.

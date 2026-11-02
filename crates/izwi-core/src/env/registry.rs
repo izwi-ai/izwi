@@ -1306,6 +1306,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Nemotron 3.5 Transcribe FP8 linears: w8a16 (FP8 weights, wide activations) or vllm-fp8 (activations rounded to E4M3 per token, as vLLM's W8A8 path); anything else fails the load.",
     ),
     CoreEnvVar::new(
+        "IZWI_NEMOTRON_TRANSCRIBE_FUSED_DECODE",
+        Flag,
+        "true",
+        Load,
+        "Nemotron 3.5 Transcribe decode steps through the fused kernels (residual add + norm, Mamba2 step kernels, device greedy pick, a single readback). Any false value runs the eager composition; a failed load-time kernel check does too, and `decode_path` in the diagnostics says which ran.",
+    ),
+    CoreEnvVar::new(
         "IZWI_NEMOTRON_TRANSCRIBE_MODEL_DIR",
         Path,
         "unset (test fails)",

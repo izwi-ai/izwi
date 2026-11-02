@@ -24,6 +24,7 @@ use half::f16;
 use super::checkpoint::{Fp8Weight, NemotronCheckpoint};
 use super::precision::Fp8Mode;
 use crate::error::{Error, Result};
+use crate::kernels::cuda::fp8::{self, Fp8Epilogue};
 
 /// CPU prefill expands Q8_0 weights in tiles of this many rows above
 /// [`CPU_TILE_MIN_ROWS`] activation rows.
@@ -414,18 +415,20 @@ impl NtLinear {
                         }
                     },
                     _ => {
-                        let xb = x.to_dtype(DType::BF16)?.contiguous()?;
-                        let y = match pass {
-                            Pass::Step => {
-                                crate::kernels::cuda::fp8::block_fp8_projection(&xb, bytes, scales)?
-                            }
-                            Pass::Span => {
-                                crate::kernels::cuda::fp8::block_fp8_projection_dequant_gemm(
-                                    &xb, bytes, scales,
-                                )?
-                            }
-                        };
-                        y.to_dtype(DType::F32)?
+                        let x = x.contiguous()?;
+                        if pass == Pass::Step && fp8::f32_projection_vectorized(&x, bytes) {
+                            // F32 in and out: no casts around the GEMV.
+                            fp8::block_fp8_projection_f32(&x, bytes, scales, Fp8Epilogue::None)?
+                        } else {
+                            let xb = x.to_dtype(DType::BF16)?;
+                            let y = match pass {
+                                Pass::Step => fp8::block_fp8_projection(&xb, bytes, scales)?,
+                                Pass::Span => {
+                                    fp8::block_fp8_projection_dequant_gemm(&xb, bytes, scales)?
+                                }
+                            };
+                            y.to_dtype(DType::F32)?
+                        }
                     }
                 }
             }
@@ -445,6 +448,43 @@ impl NtLinear {
             }
             None => Ok(y),
         }
+    }
+
+    /// `x @ W.T` in the weight's own dtype for a dense layer (no cast back to
+    /// F32: a device greedy pick reads 16-bit logits as they are); the F32
+    /// [`Self::forward`] of a decode step otherwise.
+    pub fn forward_native(&self, x: &Tensor) -> Result<Tensor> {
+        match (&self.weight, &self.bias) {
+            (Weight::Dense(w), None) => Ok(x.to_dtype(w.dtype())?.contiguous()?.matmul(&w.t()?)?),
+            _ => self.forward(x, Pass::Step),
+        }
+    }
+
+    /// `relu(forward_padded(x))^2`: a relu² MLP's up projection. A CUDA step
+    /// applies the relu² in the GEMV's epilogue (one launch).
+    pub fn forward_relu2(&self, x: &Tensor, pass: Pass) -> Result<Tensor> {
+        if let (Weight::Fp8 { bytes, scales }, Pass::Step, None) =
+            (&self.weight, pass, self.input_scale)
+        {
+            if bytes.device().is_cuda() && self.bias.is_none() {
+                let (_, width) = x.dims2()?;
+                let x = if width < self.padded_in {
+                    x.pad_with_zeros(1, 0, self.padded_in - width)?
+                } else {
+                    x.clone()
+                }
+                .contiguous()?;
+                if fp8::f32_projection_vectorized(&x, bytes) {
+                    return Ok(fp8::block_fp8_projection_f32(
+                        &x,
+                        bytes,
+                        scales,
+                        Fp8Epilogue::ReluSquare,
+                    )?);
+                }
+            }
+        }
+        Ok(self.forward_padded(x, pass)?.relu()?.sqr()?)
     }
 
     /// Compares rows `rows` of this layer against the exactly dequantized
