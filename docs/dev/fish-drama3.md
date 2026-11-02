@@ -186,6 +186,28 @@ backend's report:
 `IZWI_FISH_DRAMA3_MOE_BACKEND=loop` runs the routed experts as a host-routed
 loop of one FP8 GEMV pair per expert on Metal and CUDA, for diagnosis.
 
+### Fused forwards
+
+On Metal and CUDA the trunk and tower run through fused kernels shared with
+other families (`crates/izwi-core/src/kernels/`):
+
+- `residual_norm`: each residual add with the norm after it in one launch,
+  the sum rounded once to the stream's dtype (BF16 on CUDA, F32 on Metal)
+  and the norm read through the next layer's activation dtype.
+- `qk_norm_rope`: q, k and v read straight from the packed projection, each
+  head's q/k norm and RoPE in one launch from cos/sin tables built on the
+  host at load (one set per stack and device, shared by every layer) and
+  one positions upload per stack forward.
+- `swiglu`: the shared expert's and the tower's gate and up projections are
+  packed into one `[gate | up]` projection at load; one GEMV and one launch
+  replace two GEMVs, two casts, SiLU, the product and a cast.
+
+The load compares the kernels on the device with their CPU forms at the
+model's widths and dtype mixes (relative L2 at most 1e-3), and
+`decode_path` in the diagnostics says which path runs and why.
+`IZWI_FISH_DRAMA3_FUSED_DECODE=0` runs the eager per-layer chain. The Metal
+range probe and the trunk's traced test forwards always run eagerly.
+
 ## Engine path
 
 ### Retained rows
@@ -472,6 +494,8 @@ load:
 - `IZWI_FISH_DRAMA3_DTYPE`: the activation dtype, f16 or f32 on Metal (f32
   also stores the paged KV in F32 and runs every MoE layer's host loop), bf16
   on CUDA, f32 on CPU. Anything else fails the load.
+- `IZWI_FISH_DRAMA3_FUSED_DECODE`: the fused trunk and tower on Metal and
+  CUDA (default `true`); any false value runs the eager chain.
 - `IZWI_FISH_DRAMA3_MOE_BACKEND`: `fused` (default) or `loop`, on Metal and
   CUDA.
 - `IZWI_FISH_DRAMA3_NATIVE_BATCHING`: two rows at once on Metal instead of

@@ -41,15 +41,242 @@ pub(crate) mod tower;
 pub(crate) mod trunk;
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use candle_core::{DType, Device, Tensor};
 
-use super::config::{FishDrama3AttentionConfig, FishDrama3RopeLayout};
+use super::config::{FishDrama3AttentionConfig, FishDrama3Config, FishDrama3RopeLayout};
 use super::linear::{FishDrama3KernelPhase, FishDrama3Linear};
 use super::residency::{FishDrama3Residency, FishDrama3WeightForm};
 use super::trunk::attention::FishDrama3Rope;
 use crate::error::{Error, Result};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
+
+/// Kill switch for the fused device forward (`0`, `off`, `false`): the
+/// trunk and tower then run the eager per-layer chain and the draws the
+/// composed race. Read at load.
+pub const FUSED_DECODE_ENV: &str = "IZWI_FISH_DRAMA3_FUSED_DECODE";
+
+/// Largest relative L2 deviation of a device's fused kernels from their CPU
+/// forms that keeps the fused forward on.
+pub(crate) const FUSED_CHECK_LIMIT: f64 = 1e-3;
+
+/// One RoPE's cos/sin tables on a device, `[positions, rotary / 2]` F32 each:
+/// the family's F64 angles rounded once, exactly the rows the eager chain
+/// uploads per call.
+pub(crate) struct RopeTables {
+    pub(crate) cos: Tensor,
+    pub(crate) sin: Tensor,
+}
+
+/// The tables of `rope` for positions `0..positions` on `device`, shared by
+/// every layer of a stack (one upload per load, not four per layer a step).
+pub(crate) fn rope_tables(
+    rope: &FishDrama3Rope,
+    positions: usize,
+    device: &Device,
+) -> Result<Arc<RopeTables>> {
+    type Key = (String, Vec<u32>, usize);
+    static CACHE: OnceLock<Mutex<Vec<(Key, std::sync::Weak<RopeTables>)>>> = OnceLock::new();
+    let half = rope.rotary_dims() / 2;
+    let (c0, s0) = rope.cos_sin(1);
+    let mut signature = c0
+        .iter()
+        .chain(&s0)
+        .map(|v| v.to_bits())
+        .collect::<Vec<_>>();
+    signature.push(rope.rotary_dims() as u32);
+    signature.push(u32::from(
+        rope.layout() == FishDrama3RopeLayout::InterleavedPairs,
+    ));
+    let key = (format!("{:?}", device.location()), signature, positions);
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut entries = cache
+        .lock()
+        .map_err(|_| Error::InferenceError("the RoPE table cache is poisoned".into()))?;
+    entries.retain(|(_, weak)| weak.strong_count() > 0);
+    if let Some(tables) = entries
+        .iter()
+        .find(|(k, _)| *k == key)
+        .and_then(|(_, weak)| weak.upgrade())
+    {
+        return Ok(tables);
+    }
+    let mut cos = Vec::with_capacity(positions * half);
+    let mut sin = Vec::with_capacity(positions * half);
+    for position in 0..positions {
+        let (c, s) = rope.cos_sin(position);
+        cos.extend(c);
+        sin.extend(s);
+    }
+    let tables = Arc::new(RopeTables {
+        cos: Tensor::from_vec(cos, (positions, half.max(1)), device)?,
+        sin: Tensor::from_vec(sin, (positions, half.max(1)), device)?,
+    });
+    entries.push((key, Arc::downgrade(&tables)));
+    Ok(tables)
+}
+
+/// Each row position of `rows`, `[n]` U32 on `device`: the one upload a
+/// fused stack forward makes for its RoPE.
+pub(crate) fn positions_tensor(rows: &[DeviceRow<'_>], device: &Device) -> Result<Tensor> {
+    let at = positions(rows)
+        .into_iter()
+        .map(|p| p as u32)
+        .collect::<Vec<_>>();
+    let n = at.len();
+    count_uploads(1);
+    Ok(Tensor::from_vec(at, n, device)?)
+}
+
+/// How a device load's trunk and tower run, and why.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FishDrama3DecodePath {
+    /// Fused residual norms, q/k norm + RoPE and SwiGLU, with the load-time
+    /// kernel check's worst relative error.
+    Fused { check: f64 },
+    /// The eager per-layer chain: switched off, or the check failed.
+    Eager { reason: String },
+}
+
+impl FishDrama3DecodePath {
+    /// The path a load on `device` takes: fused unless [`FUSED_DECODE_ENV`]
+    /// is off or the kernels miss their CPU forms on this device.
+    pub(crate) fn select(device: &Device, config: &FishDrama3Config) -> Self {
+        let path = if !crate::env::flag_or(FUSED_DECODE_ENV, true) {
+            Self::Eager {
+                reason: format!("{FUSED_DECODE_ENV} is off"),
+            }
+        } else {
+            match fused_kernels_check(device, config) {
+                Ok(check) if check <= FUSED_CHECK_LIMIT => Self::Fused { check },
+                Ok(check) => Self::Eager {
+                    reason: format!("the fused kernels deviate by {check:.3e}"),
+                },
+                Err(error) => Self::Eager {
+                    reason: format!("the fused kernel check failed: {error}"),
+                },
+            }
+        };
+        if let Self::Eager { reason } = &path {
+            tracing::warn!("Fish Audio Drama 3 runs its device forwards eagerly: {reason}");
+        }
+        path
+    }
+
+    pub fn is_fused(&self) -> bool {
+        matches!(self, Self::Fused { .. })
+    }
+
+    pub fn diagnostics(&self) -> serde_json::Value {
+        match self {
+            Self::Fused { check } => serde_json::json!({ "path": "fused", "check": check }),
+            Self::Eager { reason } => serde_json::json!({ "path": "eager", "reason": reason }),
+        }
+    }
+}
+
+/// The worst relative L2 deviation of the fused kernels on `device` from
+/// their CPU forms, at the model's widths and dtype mixes: the residual
+/// norms of both stacks, both attentions' q/k norm + RoPE at the first and
+/// last table rows, and both SwiGLUs.
+fn fused_kernels_check(device: &Device, config: &FishDrama3Config) -> Result<f64> {
+    use crate::kernels::numeric_check::{host_f32, relative_l2, xorshift_tensor};
+    use crate::kernels::{qk_norm_rope::qk_norm_rope, residual_norm, swiglu::swiglu};
+    let forms = DeviceForms::of(device)?;
+    let cpu = Device::Cpu;
+    let on = |t: &Tensor| t.to_device(device);
+    let mut worst = 0f64;
+    let mut track = |a: &Tensor, b: &Tensor| -> Result<()> {
+        worst = worst.max(relative_l2(&host_f32(a)?, &host_f32(b)?));
+        Ok(())
+    };
+    let rows = 2;
+    let (t, w) = (&config.trunk, &config.tower);
+    for (width, eps) in [(t.hidden, t.rms_norm_eps), (w.dim, w.norm_eps)] {
+        let eps = eps as f32;
+        let x = xorshift_tensor(&[rows, width], 1, 4.0, &cpu)?.to_dtype(forms.residual)?;
+        let gain = (xorshift_tensor(&[width], 2, 0.3, &cpu)? + 1.0)?;
+        // A mixer's delta in the activation dtype, the experts' in F32.
+        for dtype in [forms.half, DType::F32] {
+            let delta = xorshift_tensor(&[rows, width], 3, 2.0, &cpu)?.to_dtype(dtype)?;
+            let (sum, normed) = residual_norm::add_rms_norm(&x, &delta, &gain, eps, forms.half)?;
+            let (dsum, dnormed) =
+                residual_norm::add_rms_norm(&on(&x)?, &on(&delta)?, &on(&gain)?, eps, forms.half)?;
+            track(&dsum, &sum)?;
+            track(&dnormed, &normed)?;
+        }
+        // The residual, the tower's F32 injections and its 16-bit hidden.
+        for dtype in [forms.residual, DType::F32, forms.half] {
+            let x = x.to_dtype(dtype)?;
+            let normed = residual_norm::rms_norm(&x, &gain, eps, forms.half)?;
+            track(
+                &residual_norm::rms_norm(&on(&x)?, &on(&gain)?, eps, forms.half)?,
+                &normed,
+            )?;
+        }
+    }
+    let positions = t.max_positions.min(super::model::MAX_REQUEST_POSITIONS);
+    for (attention, eps) in [(&t.attention, t.rms_norm_eps), (&w.attention, w.norm_eps)] {
+        let rope = FishDrama3Rope::new(attention);
+        let spec = qk_norm_rope_spec(attention, &rope, eps as f32);
+        let width = 2 * attention.q_width() + 2 * attention.kv_width();
+        let packed = xorshift_tensor(&[rows, width], 4, 2.0, &cpu)?.to_dtype(forms.half)?;
+        let d = attention.head_dim;
+        let q_gain = (xorshift_tensor(&[d], 5, 0.3, &cpu)? + 1.0)?;
+        let k_gain = (xorshift_tensor(&[d], 6, 0.3, &cpu)? + 1.0)?;
+        let at = Tensor::new(&[0u32, positions as u32 - 1], &cpu)?;
+        let host = rope_tables(&rope, positions, &cpu)?;
+        let tables = rope_tables(&rope, positions, device)?;
+        let want = qk_norm_rope(&packed, &q_gain, &k_gain, &host.cos, &host.sin, &at, spec)?;
+        let got = qk_norm_rope(
+            &on(&packed)?,
+            &on(&q_gain)?,
+            &on(&k_gain)?,
+            &tables.cos,
+            &tables.sin,
+            &on(&at)?,
+            spec,
+        )?;
+        track(&got.0, &want.0)?;
+        track(&got.1, &want.1)?;
+        track(&got.2, &want.2)?;
+    }
+    for width in [t.moe.shared_intermediate, w.intermediate] {
+        let packed = xorshift_tensor(&[rows, 2 * width], 7, 6.0, &cpu)?.to_dtype(forms.half)?;
+        track(
+            &swiglu(&on(&packed)?, forms.half)?,
+            &swiglu(&packed, forms.half)?,
+        )?;
+    }
+    Ok(worst)
+}
+
+/// Where q, k and v sit in a packed `[q_h | gate_h]... | k | v` projection
+/// row, and how `rope` rotates them.
+fn qk_norm_rope_spec(
+    config: &FishDrama3AttentionConfig,
+    rope: &FishDrama3Rope,
+    eps: f32,
+) -> crate::kernels::qk_norm_rope::QkNormRopeSpec {
+    use crate::kernels::qk_norm_rope::{QkNormRopeSpec, RopeLayout};
+    let (qw, kvw, d) = (config.q_width(), config.kv_width(), config.head_dim);
+    QkNormRopeSpec {
+        heads: config.heads,
+        kv_heads: config.kv_heads,
+        head_dim: d,
+        rotary_dims: rope.rotary_dims(),
+        layout: match rope.layout() {
+            FishDrama3RopeLayout::HalfSplit => RopeLayout::HalfSplit,
+            FishDrama3RopeLayout::InterleavedPairs => RopeLayout::Interleaved,
+        },
+        q_offset: 0,
+        q_stride: 2 * d,
+        k_offset: 2 * qw,
+        v_offset: 2 * qw + kvw,
+        eps,
+    }
+}
 
 /// What a device load holds and runs in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +555,8 @@ pub(crate) struct DeviceAttention {
     config: FishDrama3AttentionConfig,
     rope: FishDrama3Rope,
     eps: f32,
+    /// The stack's shared cos/sin tables, for the fused q/k norm + RoPE.
+    tables: Arc<RopeTables>,
 }
 
 impl DeviceAttention {
@@ -345,6 +574,7 @@ impl DeviceAttention {
         k_gain: &[f32],
         config: FishDrama3AttentionConfig,
         eps: f32,
+        positions: usize,
         forms: DeviceForms,
         device: &Device,
     ) -> Result<Self> {
@@ -370,6 +600,7 @@ impl DeviceAttention {
             o_proj: FishDrama3Linear::from_values(out, hidden, qw, forms.weight_form(), device)?,
             q_gain: vector(q_gain, device)?,
             k_gain: vector(k_gain, device)?,
+            tables: rope_tables(&FishDrama3Rope::new(&config), positions, device)?,
             rope: FishDrama3Rope::new(&config),
             config,
             eps,
@@ -475,5 +706,72 @@ impl DeviceAttention {
         let out = self.o_proj.forward_device(&gated, phase, act)?;
         record(probe, || "attention_out".into(), &out);
         Ok(out)
+    }
+
+    /// [`Self::forward`] with q, k and v read, normalized and rotated straight
+    /// from the packed projection in one launch (`kernels::qk_norm_rope`) from
+    /// the stack's tables at `positions` (`[N]` U32, one upload per stack
+    /// forward). Matches it to rounding.
+    pub(crate) fn forward_fused(
+        &self,
+        x: &Tensor,
+        rows: &mut [DeviceRow<'_>],
+        slot: usize,
+        phase: FishDrama3KernelPhase,
+        act: DType,
+        positions: &Tensor,
+    ) -> Result<Tensor> {
+        let a = &self.config;
+        let (heads, d, qw) = (a.heads, a.head_dim, a.q_width());
+        let n = x.dim(0)?;
+        let limit = self.tables.cos.dim(0)?;
+        if let Some(row) = rows.iter().find(|row| row.start + row.rows > limit) {
+            return Err(Error::InferenceError(format!(
+                "Fish Audio Drama 3 attention position {} is past its {limit} RoPE rows",
+                row.start + row.rows - 1
+            )));
+        }
+        let packed = self.qkv.forward_device(x, phase, act)?;
+        let spec = qk_norm_rope_spec(a, &self.rope, self.eps);
+        let (queries, keys, values) = crate::kernels::qk_norm_rope::qk_norm_rope(
+            &packed,
+            &self.q_gain,
+            &self.k_gain,
+            &self.tables.cos,
+            &self.tables.sin,
+            positions,
+            spec,
+        )?;
+        let scale = (1.0 / (d as f64).sqrt()) as f32;
+        let mut attended = Vec::with_capacity(rows.len());
+        let mut offset = 0;
+        for row in rows.iter_mut() {
+            let kv = row.cache.arena().config().dtype;
+            let take = |t: &Tensor| -> Result<Tensor> {
+                Ok(t.narrow(0, offset, row.rows)?.to_dtype(kv)?.contiguous()?)
+            };
+            let out = row.cache.write_and_attend_row_invariant(
+                slot,
+                row.prepared,
+                &take(&queries)?,
+                &take(&keys)?,
+                &take(&values)?,
+                scale,
+            )?;
+            attended.push(out.to_dtype(act)?.reshape((row.rows, qw))?);
+            offset += row.rows;
+        }
+        if offset != n {
+            return Err(Error::InferenceError(format!(
+                "Fish Audio Drama 3 attention got {n} rows for requests of {offset}"
+            )));
+        }
+        let attended = Tensor::cat(&attended, 0)?;
+        let query_gate = packed
+            .narrow(1, 0, 2 * qw)?
+            .contiguous()?
+            .reshape((n, heads, 2 * d))?;
+        let gated = crate::kernels::cuda::gate::attn_gate(&attended, &query_gate, heads, d)?;
+        self.o_proj.forward_device(&gated, phase, act)
     }
 }

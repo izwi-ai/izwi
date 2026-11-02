@@ -385,6 +385,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides a Fish Audio Drama 3 load's activation dtype: f16 or f32 on Metal (f32 also stores the paged KV in F32 and runs every MoE layer's host loop), bf16 on CUDA, f32 on CPU; anything else fails the load.",
     ),
     CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_FUSED_DECODE",
+        Flag,
+        "true",
+        Load,
+        "Fish Audio Drama 3 on Metal or CUDA runs its trunk and tower through the fused kernels (residual add + norm, q/k norm + RoPE from load-time tables, packed SwiGLU). Any false value runs the eager per-layer chain; a failed load-time kernel check does too, and `decode_path` in the diagnostics says which ran.",
+    ),
+    CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_MODEL_DIR",
         Path,
         "unset (test fails)",

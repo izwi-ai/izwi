@@ -26,6 +26,7 @@ use candle_core::{DType, Device, Tensor};
 use super::super::checkpoint::{expert, trunk_layer, FishDrama3Checkpoint, TRUNK_PREFIX};
 use super::super::config::{FishDrama3Config, FishDrama3LayerKind};
 use super::super::linear::{FishDrama3KernelPhase, FishDrama3Linear};
+use super::super::model::MAX_REQUEST_POSITIONS;
 use super::super::residency::FishDrama3WeightForm;
 use super::super::trunk::state::FishDrama3LinearState;
 use super::super::trunk::{norm_gain, LayerTrace, NormGain};
@@ -36,6 +37,7 @@ use super::{
 use crate::error::{Error, Result};
 use crate::kernels::cuda::gdn::{self, GdnDecodeSpec};
 use crate::kernels::cuda::moe::{self, GroupedKernel, RouteSpec, SharedSlot};
+use crate::kernels::residual_norm;
 
 /// Rows from which a CUDA span runs the chunked DeltaNet prefill (the
 /// grouped MoE's threshold too): below it the per-row kernels cost less.
@@ -89,6 +91,23 @@ pub(crate) fn half_linear(
     device: &Device,
 ) -> Result<FishDrama3Linear> {
     FishDrama3Linear::from_half(checkpoint.bf16_tensor(name, &[rows, cols], forms.half, device)?)
+}
+
+/// BF16 projections `names` (each `[rows, cols]`) stacked into one 16-bit
+/// layer `[names.len() * rows, cols]` in `forms`, so one GEMV serves them.
+pub(crate) fn half_linear_packed(
+    checkpoint: &FishDrama3Checkpoint,
+    names: &[&str],
+    rows: usize,
+    cols: usize,
+    forms: DeviceForms,
+    device: &Device,
+) -> Result<FishDrama3Linear> {
+    let parts = names
+        .iter()
+        .map(|name| checkpoint.bf16_tensor(name, &[rows, cols], forms.half, device))
+        .collect::<Result<Vec<_>>>()?;
+    FishDrama3Linear::from_half(Tensor::cat(&parts, 0)?)
 }
 
 fn f32_linear(
@@ -449,8 +468,10 @@ pub(crate) struct DeviceMoe {
     router: FishDrama3Linear,
     /// `[1, hidden]` F32.
     shared_gate: FishDrama3Linear,
-    shared_gate_proj: FishDrama3Linear,
-    shared_up: FishDrama3Linear,
+    /// `[2 shared_intermediate, hidden]`: the shared expert's gate rows,
+    /// then its up rows, so one GEMV feeds SwiGLU.
+    shared_gate_up: FishDrama3Linear,
+    shared_intermediate: usize,
     shared_down: FishDrama3Linear,
     /// `[experts, 2 intermediate, hidden]` E4M3 bytes, each expert's gate
     /// rows then its up rows.
@@ -539,22 +560,18 @@ impl DeviceMoe {
                 h,
                 device,
             )?,
-            shared_gate_proj: half_linear(
+            shared_gate_up: half_linear_packed(
                 checkpoint,
-                &format!("{s}.gate_proj.weight"),
+                &[
+                    &format!("{s}.gate_proj.weight"),
+                    &format!("{s}.up_proj.weight"),
+                ],
                 si,
                 h,
                 forms,
                 device,
             )?,
-            shared_up: half_linear(
-                checkpoint,
-                &format!("{s}.up_proj.weight"),
-                si,
-                h,
-                forms,
-                device,
-            )?,
+            shared_intermediate: si,
             shared_down: half_linear(
                 checkpoint,
                 &format!("{s}.down_proj.weight"),
@@ -580,8 +597,7 @@ impl DeviceMoe {
         [
             &self.router,
             &self.shared_gate,
-            &self.shared_gate_proj,
-            &self.shared_up,
+            &self.shared_gate_up,
             &self.shared_down,
         ]
         .iter()
@@ -614,12 +630,15 @@ impl DeviceMoe {
         Ok(Tensor::cat(&[&routing.narrow(1, 0, k)?, &weights], 1)?.contiguous()?)
     }
 
-    /// The block's output `[N, hidden]` F32 for the normed rows `x`.
+    /// The block's output `[N, hidden]` F32 for the normed rows `x`; `fused`
+    /// runs the shared expert's SwiGLU in one launch over its packed gate/up
+    /// projection (`kernels::swiglu`).
     fn forward(
         &self,
         x: &Tensor,
         phase: FishDrama3KernelPhase,
         act: DType,
+        fused: bool,
         probe: &mut Probe<'_>,
     ) -> Result<Tensor> {
         let n = x.dim(0)?;
@@ -657,9 +676,13 @@ impl DeviceMoe {
                 self.expert_loop(&x.to_dtype(self.forms.loop_activations())?, &routing)?
             }
         };
-        let gate = self.shared_gate_proj.forward_device(x, phase, act)?;
-        let up = self.shared_up.forward_device(x, phase, act)?;
-        let activations = swiglu(&gate, &up, act)?;
+        let gate_up = self.shared_gate_up.forward_device(x, phase, act)?;
+        let si = self.shared_intermediate;
+        let activations = if fused {
+            crate::kernels::swiglu::swiglu(&gate_up, act)?
+        } else {
+            swiglu(&gate_up.narrow(1, 0, si)?, &gate_up.narrow(1, si, si)?, act)?
+        };
         record(probe, || "shared_activations".into(), &activations);
         let shared = self.shared_down.forward_device(&activations, phase, act)?;
         record(probe, || "shared_out".into(), &shared);
@@ -778,6 +801,9 @@ impl DeviceLayer {
 /// The trunk's weights on the device.
 pub(crate) struct DeviceTrunk {
     pub(crate) layers: Vec<DeviceLayer>,
+    /// Untraced forwards run [`Self::run_fused`]; set after the load's
+    /// fused kernel check.
+    pub(crate) fused: bool,
     final_norm: Tensor,
     /// The final norm's dtype (F32 once Metal's probe breached it).
     pub(crate) final_act: DType,
@@ -831,6 +857,7 @@ impl DeviceTrunk {
                                 &gain_of("k_norm")?,
                                 a,
                                 t.rms_norm_eps as f32,
+                                t.max_positions.min(MAX_REQUEST_POSITIONS),
                                 forms,
                                 device,
                             )?,
@@ -867,6 +894,7 @@ impl DeviceTrunk {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             layers,
+            fused: false,
             final_norm: gain(
                 checkpoint,
                 &format!("{TRUNK_PREFIX}.norm.weight"),
@@ -928,7 +956,7 @@ impl DeviceTrunk {
         let x = add_residual(x, &mixed)?;
         let normed = rms_norm(&x, &layer.post_norm, self.eps, act)?;
         record(probe, || "post_normed".into(), &normed);
-        let moe = layer.moe.forward(&normed, phase, act, probe)?;
+        let moe = layer.moe.forward(&normed, phase, act, false, probe)?;
         let x = add_residual(&x, &moe)?;
         record(probe, || "residual".into(), &x);
         if let Some(trace) = trace {
@@ -967,6 +995,9 @@ impl DeviceTrunk {
         phase: FishDrama3KernelPhase,
         mut trace: Option<&mut LayerTrace>,
     ) -> Result<Tensor> {
+        if self.fused && trace.is_none() {
+            return self.run_fused(x, rows, states, phase);
+        }
         let mut x = x.to_dtype(self.forms.residual)?;
         for index in 0..self.layers.len() {
             x = self.layer(
@@ -981,6 +1012,54 @@ impl DeviceTrunk {
             )?;
         }
         self.final_norm(&x, None)
+    }
+
+    /// [`Self::run`] through the fused kernels: each residual add with the
+    /// next norm in one launch (`kernels::residual_norm`), attention's q/k
+    /// norm and RoPE in one from the stack's tables with one positions
+    /// upload, and the shared experts' SwiGLU in one. Matches the eager chain
+    /// to rounding.
+    fn run_fused(
+        &self,
+        x: Tensor,
+        rows: &mut [DeviceRow<'_>],
+        states: &mut [&mut [FishDrama3LinearState]],
+        phase: FishDrama3KernelPhase,
+    ) -> Result<Tensor> {
+        let positions = super::positions_tensor(rows, x.device())?;
+        let mut x = x.to_dtype(self.forms.residual)?;
+        let first = &self.layers[0];
+        let mut normed = residual_norm::rms_norm(&x, &first.input_norm, self.eps, first.act)?;
+        for (index, layer) in self.layers.iter().enumerate() {
+            let act = layer.act;
+            let mixed = match &layer.mixer {
+                DeviceMixer::Attention { slot, attention } => {
+                    attention.forward_fused(&normed, rows, *slot, phase, act, &positions)?
+                }
+                DeviceMixer::DeltaNet { slot, net } => {
+                    let mut layer_states = states
+                        .iter_mut()
+                        .map(|states| {
+                            states.get_mut(*slot).ok_or_else(|| {
+                                Error::InferenceError("a DeltaNet state is missing".into())
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    net.forward(&normed, rows, &mut layer_states, phase, act, &mut None)?
+                }
+            };
+            let (sum, post) =
+                residual_norm::add_rms_norm(&x, &mixed, &layer.post_norm, self.eps, act)?;
+            let moe = layer.moe.forward(&post, phase, act, true, &mut None)?;
+            let (gain, next_act) = self
+                .layers
+                .get(index + 1)
+                .map_or((&self.final_norm, self.final_act), |next| {
+                    (&next.input_norm, next.act)
+                });
+            (x, normed) = residual_norm::add_rms_norm(&sum, &moe, gain, self.eps, next_act)?;
+        }
+        Ok(normed.to_dtype(DType::F32)?)
     }
 
     /// The layers' activation dtypes and expert backends, for diagnostics.

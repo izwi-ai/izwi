@@ -376,6 +376,7 @@ kernel void izwi_residual_norm_##NAME(                                          
 
 IZWI_RESIDUAL_NORM(f32_f32_f32, float, float, float)
 IZWI_RESIDUAL_NORM(f32_f32_f16, float, float, half)
+IZWI_RESIDUAL_NORM(f32_f16_f16, float, half, half)
 IZWI_RESIDUAL_NORM(f16_f32_f16, half, float, half)
 IZWI_RESIDUAL_NORM(f16_f16_f16, half, half, half)
 "#;
@@ -421,6 +422,7 @@ mod cuda_impl {
         let exported = [
             "f32_f32_f32",
             "f32_f32_f16",
+            "f32_f16_f16",
             "f32_f32_bf16",
             "bf16_f32_bf16",
             "bf16_bf16_bf16",
@@ -506,6 +508,7 @@ mod cuda_impl {
         Ok(match (r_dtype, d_dtype, out) {
             (DType::F32, DType::F32, DType::F32) => go!(f32, f32, f32),
             (DType::F32, DType::F32, DType::F16) => go!(f32, f32, f16),
+            (DType::F32, DType::F16, DType::F16) => go!(f32, f16, f16),
             (DType::F32, DType::F32, DType::BF16) => go!(f32, f32, bf16),
             (DType::BF16, DType::F32, DType::BF16) => go!(bf16, f32, bf16),
             (DType::BF16, DType::BF16, DType::BF16) => go!(bf16, bf16, bf16),
@@ -545,10 +548,11 @@ mod tests {
 
     /// The dtype mixes the decoders run: Nemotron-H's F32 stream, Drama 3's
     /// BF16 stream with F32 and BF16 deltas (CUDA) and F32 stream with F16
-    /// activations (Metal).
-    const MIXES: [(DType, DType, DType); 5] = [
+    /// activations and F16 or F32 deltas (Metal).
+    const MIXES: [(DType, DType, DType); 6] = [
         (DType::F32, DType::F32, DType::F32),
         (DType::F32, DType::F32, DType::F16),
+        (DType::F32, DType::F16, DType::F16),
         (DType::BF16, DType::F32, DType::BF16),
         (DType::BF16, DType::BF16, DType::BF16),
         (DType::F16, DType::F16, DType::F16),

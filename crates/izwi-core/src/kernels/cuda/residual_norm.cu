@@ -77,6 +77,7 @@ __device__ void rn_row(const R* __restrict__ residual, const D* __restrict__ del
 // residual_delta_output
 RN_EXPORT(f32_f32_f32, float, float, float)
 RN_EXPORT(f32_f32_f16, float, float, __half)
+RN_EXPORT(f32_f16_f16, float, __half, __half)
 RN_EXPORT(f32_f32_bf16, float, float, __nv_bfloat16)
 RN_EXPORT(bf16_f32_bf16, __nv_bfloat16, float, __nv_bfloat16)
 RN_EXPORT(bf16_bf16_bf16, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16)

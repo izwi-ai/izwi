@@ -206,3 +206,97 @@ pub(crate) fn trunk_span_error(
     let b = run(on_device, device, on_device.kv_dtype());
     relative_l2(&b, &a)
 }
+
+/// One load of `seed`'s checkpoint on `device`, through the fused path and
+/// then the eager one: relative L2 of the trunk's final hidden over a span
+/// and three steps, and of the tower's layer outputs and head logits over a
+/// span and a forced step.
+pub(crate) fn fused_against_eager(device: &Device, seed: u64) -> (f64, f64) {
+    use super::super::tower::FishDrama3TowerForcedRow;
+    use super::super::trunk::FishDrama3StepRow;
+    let synthetic = write_synthetic_model_in(seed, SyntheticGeometry::KernelHeads, |_| {});
+    let mut model = load(&synthetic, device, options(FishDrama3CpuPrecision::Q8_0));
+    assert!(
+        model.decode_path().is_some_and(|path| path.is_fused()),
+        "{:?}",
+        model.decode_path()
+    );
+    let config = model.config().clone();
+    let (width, n) = (config.tower.frame_width(), 12);
+    let prompt = rows(&model, n + 3, seed);
+    let frames = rows(&model, n + 2, seed + 1);
+    let d = config.tower.dim;
+    let hidden = xorshift_values((n + 1) * d, seed + 2, 1.7);
+    let run = |model: &FishDrama3Model| -> (Vec<f32>, Vec<f32>) {
+        let mut trunk_out = Vec::new();
+        let mut state = model.trunk().new_state().unwrap();
+        let mut cache = trunk_caches(model, device, model.kv_dtype(), 1).remove(0);
+        let (span, steps) = prompt.split_at(n * width);
+        let x = model.embedding().embed_tensor(span, device).unwrap();
+        let out = model
+            .trunk()
+            .forward_span(&x, 0, &mut state, &mut cache)
+            .unwrap();
+        trunk_out.extend(host(&out));
+        for row in steps.chunks_exact(width) {
+            let x = model.embedding().embed_tensor(row, device).unwrap();
+            let out = model
+                .trunk()
+                .forward_step(
+                    &x,
+                    &mut [FishDrama3StepRow {
+                        state: &mut state,
+                        cache: &mut cache,
+                    }],
+                )
+                .unwrap();
+            trunk_out.extend(host(&out));
+        }
+        let a = &config.tower.attention;
+        let mut cache = test_physical_caches_for_model_layers_on(
+            device,
+            model.kv_dtype(),
+            model.tower().attention_layers(),
+            a.kv_heads,
+            a.head_dim,
+            64,
+            1,
+        )
+        .remove(0);
+        let span = Tensor::from_slice(&hidden[..n * d], (n, d), device).unwrap();
+        let mut tower_out = model
+            .tower()
+            .forward_span_traced(
+                model.embedding(),
+                &span,
+                &frames[..(n + 1) * width],
+                0,
+                &mut cache,
+            )
+            .unwrap()
+            .concat();
+        let step = Tensor::from_slice(&hidden[n * d..], (1, d), device).unwrap();
+        tower_out.extend(
+            model
+                .tower()
+                .forward_step_forced(
+                    model.embedding(),
+                    &step,
+                    &mut [FishDrama3TowerForcedRow {
+                        cache: &mut cache,
+                        input: &frames[n * width..(n + 1) * width],
+                        label: &frames[(n + 1) * width..],
+                    }],
+                )
+                .unwrap(),
+        );
+        (trunk_out, tower_out)
+    };
+    let (trunk_fused, tower_fused) = run(&model);
+    model.force_fused(false);
+    let (trunk_eager, tower_eager) = run(&model);
+    (
+        relative_l2(&trunk_fused, &trunk_eager),
+        relative_l2(&tower_fused, &tower_eager),
+    )
+}

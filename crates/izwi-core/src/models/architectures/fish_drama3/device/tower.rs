@@ -25,11 +25,12 @@ use super::super::residency::FishDrama3Residency;
 use super::super::sampling::FishDrama3DrawPolicy;
 use super::super::trunk::{norm_gain, NormGain};
 use super::sampling::{race, rank, read_back};
-use super::trunk::{gain, half_linear};
+use super::trunk::{gain, half_linear, half_linear_packed};
 use super::{
     add_residual, record, rms_norm, swiglu, DeviceAttention, DeviceForms, DeviceRow, Probe,
 };
 use crate::error::{Error, Result};
+use crate::kernels::residual_norm;
 
 /// One tower layer on the device.
 pub(crate) struct DeviceTowerLayer {
@@ -41,8 +42,9 @@ pub(crate) struct DeviceTowerLayer {
     attention_norm: Tensor,
     attention: DeviceAttention,
     ffn_norm: Tensor,
-    w1: FishDrama3Linear,
-    w3: FishDrama3Linear,
+    /// `[2 intermediate, dim]`: w1's rows, then w3's (gate, then up).
+    w13: FishDrama3Linear,
+    intermediate: usize,
     w2: FishDrama3Linear,
     final_norm: Tensor,
     /// The 16-bit dtype, or F32 once Metal's range probe breached the layer.
@@ -115,26 +117,23 @@ impl DeviceTowerLayer {
                 &gain_values("k_norm")?,
                 a,
                 eps,
+                config
+                    .trunk
+                    .max_positions
+                    .min(super::super::model::MAX_REQUEST_POSITIONS),
                 forms,
                 device,
             )?,
             ffn_norm: norm("transformer_layer.ffn_norm", d)?,
-            w1: half_linear(
+            w13: half_linear_packed(
                 checkpoint,
-                &format!("{ffn}.w1.weight"),
+                &[&format!("{ffn}.w1.weight"), &format!("{ffn}.w3.weight")],
                 tower.intermediate,
                 d,
                 forms,
                 device,
             )?,
-            w3: half_linear(
-                checkpoint,
-                &format!("{ffn}.w3.weight"),
-                tower.intermediate,
-                d,
-                forms,
-                device,
-            )?,
+            intermediate: tower.intermediate,
             w2: half_linear(
                 checkpoint,
                 &format!("{ffn}.w2.weight"),
@@ -149,7 +148,7 @@ impl DeviceTowerLayer {
     }
 
     fn resident_bytes(&self) -> usize {
-        [&self.eh_proj, &self.w1, &self.w3, &self.w2]
+        [&self.eh_proj, &self.w13, &self.w2]
             .iter()
             .map(|l| l.resident_bytes())
             .sum::<usize>()
@@ -192,6 +191,9 @@ pub(crate) struct DeviceTower {
     vocab: usize,
     eps: f32,
     forms: DeviceForms,
+    /// Span and step layers run [`Self::layer_fused`]; set after the load's
+    /// fused kernel check.
+    pub(crate) fused: bool,
 }
 
 impl DeviceTower {
@@ -243,6 +245,7 @@ impl DeviceTower {
             vocab: t.codebook_vocab,
             eps: t.norm_eps as f32,
             forms,
+            fused: false,
         })
     }
 
@@ -287,15 +290,75 @@ impl DeviceTower {
             .forward(&normed, rows, index, phase, act, probe)?;
         let x = add_residual(&x, &mixed)?;
         let normed = rms_norm(&x, &layer.ffn_norm, self.eps, act)?;
-        let gate = layer.w1.forward_device(&normed, phase, act)?;
-        let up = layer.w3.forward_device(&normed, phase, act)?;
-        let activations = swiglu(&gate, &up, act)?;
+        let gate_up = layer.w13.forward_device(&normed, phase, act)?;
+        let width = layer.intermediate;
+        let activations = swiglu(
+            &gate_up.narrow(1, 0, width)?,
+            &gate_up.narrow(1, width, width)?,
+            act,
+        )?;
         record(probe, || "ffn_activations".into(), &activations);
         let down = layer.w2.forward_device(&activations, phase, act)?;
         record(probe, || "ffn_out".into(), &down);
         let x = add_residual(&x, &down)?;
         record(probe, || "residual".into(), &x);
         rms_norm(&x, &layer.final_norm, self.eps, act)
+    }
+
+    /// [`Self::layer`] in its own dtype through the fused kernels: the
+    /// norms read the residual once with the add before them
+    /// (`kernels::residual_norm`), attention's q/k norm and RoPE take
+    /// `positions` (`[N]` U32, uploaded once per forward), and the SwiGLU
+    /// reads the packed w1/w3 projection in one launch. Matches it to
+    /// rounding.
+    fn layer_fused(
+        &self,
+        index: usize,
+        e: &Tensor,
+        h: &Tensor,
+        rows: &mut [DeviceRow<'_>],
+        phase: FishDrama3KernelPhase,
+        positions: &Tensor,
+    ) -> Result<Tensor> {
+        let layer = &self.layers[index];
+        let act = layer.act;
+        let e = residual_norm::rms_norm(e, &layer.enorm, self.eps, act)?;
+        let h = residual_norm::rms_norm(h, &layer.hnorm, self.eps, act)?;
+        let merged = Tensor::cat(&[&e, &h], 1)?;
+        let x = layer
+            .eh_proj
+            .forward_device(&merged, phase, act)?
+            .to_dtype(self.forms.residual)?;
+        let normed = residual_norm::rms_norm(&x, &layer.attention_norm, self.eps, act)?;
+        let mixed = layer
+            .attention
+            .forward_fused(&normed, rows, index, phase, act, positions)?;
+        let (x, normed) = residual_norm::add_rms_norm(&x, &mixed, &layer.ffn_norm, self.eps, act)?;
+        let gate_up = layer.w13.forward_device(&normed, phase, act)?;
+        let activations = crate::kernels::swiglu::swiglu(&gate_up, act)?;
+        let down = layer.w2.forward_device(&activations, phase, act)?;
+        Ok(residual_norm::add_rms_norm(&x, &down, &layer.final_norm, self.eps, act)?.1)
+    }
+
+    /// Layer `index` of a span or step forward: fused when the load enabled
+    /// it, `positions` uploaded on first use.
+    fn forward_layer(
+        &self,
+        index: usize,
+        e: &Tensor,
+        h: &Tensor,
+        rows: &mut [DeviceRow<'_>],
+        phase: FishDrama3KernelPhase,
+        positions: &mut Option<Tensor>,
+    ) -> Result<Tensor> {
+        if !self.fused {
+            return self.layer(index, e, h, rows, phase, None, &mut None);
+        }
+        let positions = match positions {
+            Some(positions) => positions,
+            None => positions.insert(super::positions_tensor(rows, h.device())?),
+        };
+        self.layer_fused(index, e, h, rows, phase, positions)
     }
 
     /// Head `index`'s F32 logits `[N, V]` of layer outputs `h`: an F16
@@ -385,18 +448,18 @@ impl DeviceTower {
         )?;
         let mut x = hidden.clone();
         let mut outputs = Vec::with_capacity(self.layers.len());
+        let mut positions = None;
         for slot in 0..self.layers.len() {
             let column = 1 + slot.saturating_sub(self.shared_layers);
             let codes = self.codes(labels.chunks_exact(width).map(|l| l[column]), &device)?;
             let e = self.inject(slot, &codes, &labelled, (slot == 0).then_some(&extra))?;
-            x = self.layer(
+            x = self.forward_layer(
                 slot,
                 &e,
                 &x,
                 rows,
                 FishDrama3KernelPhase::Span,
-                None,
-                &mut None,
+                &mut positions,
             )?;
             outputs.push(x.clone());
         }
@@ -430,6 +493,7 @@ impl DeviceTower {
         let mut picks = Vec::with_capacity(self.heads.len());
         let mut checks = Vec::new();
         let mut host_codes = vec![Vec::with_capacity(self.heads.len()); m];
+        let mut positions = None;
         for slot in 0..self.layers.len() {
             let source = if slot < self.shared_layers {
                 &first
@@ -437,14 +501,13 @@ impl DeviceTower {
                 &injected
             };
             let e = self.inject(slot, source, &labelled, (slot == 0).then_some(&extra))?;
-            x = self.layer(
+            x = self.forward_layer(
                 slot,
                 &e,
                 &x,
                 rows,
                 FishDrama3KernelPhase::Step,
-                None,
-                &mut None,
+                &mut positions,
             )?;
             outputs.push(x.clone());
             if slot < self.shared_layers {

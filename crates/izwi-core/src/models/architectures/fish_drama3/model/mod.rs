@@ -65,7 +65,7 @@ use super::config::{FishDrama3Config, FishDrama3ConfigPolicy};
 use super::device::sampling::{
     count_fallback, device_cap, race as device_race, rank, read_back, DEVICE_RANKS,
 };
-use super::device::{record_step_section, StepSection};
+use super::device::{record_step_section, FishDrama3DecodePath, StepSection};
 use super::embed::{prompt_rows, FishDrama3Embedding};
 use super::head::FishDrama3CompactHead;
 use super::precision::{
@@ -686,6 +686,8 @@ pub struct FishDrama3Model {
     metal_checks: Option<FishDrama3MetalChecks>,
     /// What a CUDA load's checks found (`None` elsewhere).
     cuda_checks: Option<FishDrama3CudaChecks>,
+    /// How the device trunk and tower run (`None` on the CPU).
+    decode_path: Option<FishDrama3DecodePath>,
     /// The content identity a durable speech checkpoint records
     /// ([`super::artifacts::pinned_fingerprint`]), set by the loader.
     artifact_fingerprint: Option<String>,
@@ -869,6 +871,17 @@ impl FishDrama3Model {
             }
             FishDrama3Residency::Cpu => (DType::F32, None, None),
         };
+        let decode_path = (residency != FishDrama3Residency::Cpu)
+            .then(|| FishDrama3DecodePath::select(device, &config));
+        let fused = decode_path
+            .as_ref()
+            .is_some_and(FishDrama3DecodePath::is_fused);
+        if let Some(weights) = trunk.device_trunk_mut() {
+            weights.fused = fused;
+        }
+        if let Some(weights) = tower.device_tower_mut() {
+            weights.fused = fused;
+        }
         let geometry = FishDrama3StateGeometry::of(&config);
         if trunk.attention_layers() != geometry.trunk.layers
             || tower.attention_layers() != geometry.tower.layers
@@ -892,6 +905,7 @@ impl FishDrama3Model {
             kv_dtype,
             metal_checks,
             cuda_checks,
+            decode_path,
             artifact_fingerprint: None,
         })
     }
@@ -960,6 +974,23 @@ impl FishDrama3Model {
         self.cuda_checks.as_ref()
     }
 
+    /// How the device trunk and tower run (`None` on the CPU).
+    pub fn decode_path(&self) -> Option<&FishDrama3DecodePath> {
+        self.decode_path.as_ref()
+    }
+
+    /// Runs the device trunk and tower fused or eagerly, for tests that
+    /// compare the two.
+    #[cfg(test)]
+    pub(crate) fn force_fused(&mut self, fused: bool) {
+        if let Some(weights) = self.trunk.device_trunk_mut() {
+            weights.fused = fused;
+        }
+        if let Some(weights) = self.tower.device_tower_mut() {
+            weights.fused = fused;
+        }
+    }
+
     /// Positions one request may use: the trunk's and §7.5's.
     pub fn max_positions(&self) -> usize {
         self.config.trunk.max_positions.min(MAX_REQUEST_POSITIONS)
@@ -984,6 +1015,9 @@ impl FishDrama3Model {
         }
         if let Some(checks) = &self.cuda_checks {
             summary["cuda_checks"] = checks.diagnostics();
+        }
+        if let Some(path) = &self.decode_path {
+            summary["decode_path"] = path.diagnostics();
         }
         if !self.device.is_cpu() {
             summary["embedding_device_bytes"] = json!(self.embedding.device_bytes());

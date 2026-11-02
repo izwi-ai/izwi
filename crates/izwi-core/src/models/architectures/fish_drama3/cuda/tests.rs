@@ -9,8 +9,8 @@
 use candle_core::{DType, Device, Tensor};
 
 use super::super::device::test_support::{
-    decode_together, host, load, ok, options, pair, params, prompt_of, rows, trunk_caches,
-    trunk_span_error,
+    decode_together, fused_against_eager, host, load, ok, options, pair, params, prompt_of, rows,
+    trunk_caches, trunk_span_error,
 };
 use super::super::model::tests::write_synthetic_model_in;
 use super::super::residency::FishDrama3CpuPrecision;
@@ -186,6 +186,19 @@ fn cuda_tower_and_heads_track_the_cpu_reference() {
     assert!(worst < TOWER_TOLERANCE, "tower layers: {worst:.3e}");
     assert!(heads < TOWER_TOLERANCE, "codebook heads: {heads:.3e}");
     assert!(head < HEAD_TOLERANCE, "compact head: {head:.3e}");
+}
+
+/// The fused trunk and tower (residual norms, q/k norm + RoPE, packed
+/// SwiGLU) against the eager chain on one load.
+#[test]
+fn cuda_fused_forwards_track_the_eager_chain() {
+    let Some(device) = device_or_skip() else {
+        return;
+    };
+    let (trunk, tower) = fused_against_eager(&device, 5);
+    eprintln!("fused against eager: trunk {trunk:.3e}, tower {tower:.3e}");
+    assert!(trunk < TRUNK_TOLERANCE, "trunk: {trunk:.3e}");
+    assert!(tower < TOWER_TOLERANCE, "tower: {tower:.3e}");
 }
 
 /// §7.4 at CUDA widths 1, 2, 4 and 8: a request's frames and `h_t` are
