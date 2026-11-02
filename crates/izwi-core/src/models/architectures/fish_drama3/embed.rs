@@ -16,8 +16,9 @@
 //!
 //! On the CPU both tables stay BF16 on the host (D4) and are gathered to
 //! F32 per row, so they cost no device memory. On Metal they are F16 device
-//! tables (exact for every BF16 value in F16's normal range) gathered to F32
-//! on the device, so a row never crosses to the host.
+//! tables (exact for every BF16 value in F16's normal range), on CUDA the
+//! BF16 tables themselves, gathered to F32 on the device, so a row never
+//! crosses to the host.
 
 use std::ops::Range;
 
@@ -42,7 +43,7 @@ enum Tables {
         /// `CB` rows `V..codebooks * V` (codebooks 1 and up).
         codebook_table: Vec<bf16>,
     },
-    /// F16 on the device (Metal), the same rows.
+    /// 16-bit on the device (F16 on Metal, BF16 on CUDA), the same rows.
     Device {
         tokens: Tensor,
         codebook_table: Tensor,
@@ -101,7 +102,8 @@ pub(crate) fn bf16_table(
 }
 
 impl FishDrama3Embedding {
-    /// The tables for `device`: host BF16 on the CPU, device F16 on Metal.
+    /// The tables for `device`: host BF16 on the CPU, device F16 on Metal,
+    /// device BF16 on CUDA.
     pub fn load_on(
         checkpoint: &FishDrama3Checkpoint,
         config: &FishDrama3Config,
@@ -110,6 +112,11 @@ impl FishDrama3Embedding {
         if device.is_cpu() {
             return Self::load(checkpoint, config);
         }
+        let table_dtype = if device.is_cuda() {
+            DType::BF16
+        } else {
+            DType::F16
+        };
         let hidden = config.trunk.hidden;
         let vocab = config.trunk.vocab;
         let tower = &config.tower;
@@ -117,7 +124,7 @@ impl FishDrama3Embedding {
         let tokens = checkpoint.bf16_tensor(
             &format!("{TRUNK_PREFIX}.embed_tokens.weight"),
             &[vocab, hidden],
-            DType::F16,
+            table_dtype,
             device,
         )?;
         let (dtype, found) = checkpoint.info(CODEBOOK_EMBEDDINGS)?;
@@ -130,7 +137,7 @@ impl FishDrama3Embedding {
         let codebook_table = checkpoint.bf16_rows_tensor(
             CODEBOOK_EMBEDDINGS,
             &(v..k * v).collect::<Vec<_>>(),
-            DType::F16,
+            table_dtype,
             device,
         )?;
         Ok(Self {

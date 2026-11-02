@@ -1,13 +1,13 @@
-//! The codebook-MTP tower on Metal: the CPU reference's layers (`tower.rs`)
-//! in the Metal forms of `metal/mod.rs`.
+//! The codebook-MTP tower on a device: the CPU reference's layers
+//! (`tower.rs`) in the device forms of `device/mod.rs`.
 //!
 //! ```text
-//! m   = eh_proj([enorm(e) ; hnorm(h)])               # F16, into the F32 residual
+//! m   = eh_proj([enorm(e) ; hnorm(h)])               # 16-bit, into the residual (F32 on Metal, BF16 on CUDA)
 //! r   = m + wo(Attn(attn_ln(m)) * sigmoid(gate))    # contiguous wqkv repacked per head, interleaved RoPE
-//! out = final_ln(r + w2(silu(w1 x) * w3 x))          # w2's output added into the F32 residual
+//! out = final_ln(r + w2(silu(w1 x) * w3 x))          # w2's output added into the residual
 //! ```
 //!
-//! Injections gather the layer's F16 code table on the device; layer 0 adds
+//! Injections gather the layer's 16-bit code table on the device; layer 0 adds
 //! the input frame's `extra` (`FishDrama3Embedding::extra_device`). In a
 //! decode step each head's code comes from the device race
 //! (`metal::sampling`) and indexes the next layer's table without leaving
@@ -21,37 +21,41 @@ use super::super::checkpoint::{
 use super::super::config::FishDrama3Config;
 use super::super::embed::FishDrama3Embedding;
 use super::super::linear::{FishDrama3KernelPhase, FishDrama3Linear};
+use super::super::residency::FishDrama3Residency;
 use super::super::sampling::FishDrama3DrawPolicy;
 use super::super::trunk::{norm_gain, NormGain};
 use super::sampling::{race, rank, read_back};
-use super::trunk::{f16_linear, gain};
-use super::{record, rms_norm, swiglu, MetalAttention, MetalRow, Probe, HALF};
+use super::trunk::{gain, half_linear};
+use super::{
+    add_residual, record, rms_norm, swiglu, DeviceAttention, DeviceForms, DeviceRow, Probe,
+};
 use crate::error::{Error, Result};
 
 /// One tower layer on the device.
-pub(crate) struct MetalTowerLayer {
+pub(crate) struct DeviceTowerLayer {
     /// `[V, dim]` F16.
     embedding: Tensor,
     enorm: Tensor,
     hnorm: Tensor,
     eh_proj: FishDrama3Linear,
     attention_norm: Tensor,
-    attention: MetalAttention,
+    attention: DeviceAttention,
     ffn_norm: Tensor,
     w1: FishDrama3Linear,
     w3: FishDrama3Linear,
     w2: FishDrama3Linear,
     final_norm: Tensor,
-    /// F16, or F32 once the range probe breached the layer.
+    /// The 16-bit dtype, or F32 once Metal's range probe breached the layer.
     pub(crate) act: DType,
 }
 
-impl MetalTowerLayer {
+impl DeviceTowerLayer {
     fn load(
         checkpoint: &FishDrama3Checkpoint,
         prefix: &str,
         embedding: &str,
         config: &FishDrama3Config,
+        forms: DeviceForms,
         device: &Device,
     ) -> Result<Self> {
         let tower = &config.tower;
@@ -88,21 +92,22 @@ impl MetalTowerLayer {
             embedding: checkpoint.bf16_tensor(
                 &format!("{prefix}.{embedding}.weight"),
                 &[tower.codebook_vocab, d],
-                DType::F16,
+                forms.half,
                 device,
             )?,
             enorm: norm("enorm", d)?,
             hnorm: norm("hnorm", d)?,
-            eh_proj: f16_linear(
+            eh_proj: half_linear(
                 checkpoint,
                 &format!("{prefix}.eh_proj.weight"),
                 d,
                 2 * d,
+                forms,
                 device,
             )?,
             attention_norm: norm("transformer_layer.attention_norm", d)?,
-            attention: MetalAttention::new(
-                MetalAttention::interleave(query, gate, a.head_dim, d),
+            attention: DeviceAttention::new(
+                DeviceAttention::interleave(query, gate, a.head_dim, d),
                 keys,
                 values,
                 checkpoint.bf16_to_f32(&format!("{x}.wo.weight"), &[d, qw])?,
@@ -110,32 +115,36 @@ impl MetalTowerLayer {
                 &gain_values("k_norm")?,
                 a,
                 eps,
+                forms,
                 device,
             )?,
             ffn_norm: norm("transformer_layer.ffn_norm", d)?,
-            w1: f16_linear(
+            w1: half_linear(
                 checkpoint,
                 &format!("{ffn}.w1.weight"),
                 tower.intermediate,
                 d,
+                forms,
                 device,
             )?,
-            w3: f16_linear(
+            w3: half_linear(
                 checkpoint,
                 &format!("{ffn}.w3.weight"),
                 tower.intermediate,
                 d,
+                forms,
                 device,
             )?,
-            w2: f16_linear(
+            w2: half_linear(
                 checkpoint,
                 &format!("{ffn}.w2.weight"),
                 d,
                 tower.intermediate,
+                forms,
                 device,
             )?,
             final_norm: norm("final_layernorm", d)?,
-            act: HALF,
+            act: forms.half,
         })
     }
 
@@ -160,7 +169,7 @@ impl MetalTowerLayer {
 }
 
 /// Where a step's codes after `c0` come from.
-pub(crate) enum MetalStepCodes<'a> {
+pub(crate) enum DeviceStepCodes<'a> {
     /// The device race: each row's heads policy and its exponentials
     /// `[rows, heads, V]` F32, drawn on the host in head order.
     Device {
@@ -172,51 +181,56 @@ pub(crate) enum MetalStepCodes<'a> {
     Host(&'a mut dyn FnMut(usize, &Tensor) -> Result<Vec<u32>>),
 }
 
-/// The tower's weights on Metal.
-pub(crate) struct MetalTower {
-    pub(crate) layers: Vec<MetalTowerLayer>,
-    /// `[V, dim]` F16 each; head `j` follows residual layer `j`.
+/// The tower's weights on the device.
+pub(crate) struct DeviceTower {
+    pub(crate) layers: Vec<DeviceTowerLayer>,
+    /// `[V, dim]` 16-bit each; head `j` follows residual layer `j`.
     heads: Vec<FishDrama3Linear>,
-    /// The heads' dtype (F32 once the range probe breached one).
+    /// The heads' dtype (F32 once Metal's range probe breached one).
     pub(crate) head_act: DType,
     shared_layers: usize,
     vocab: usize,
     eps: f32,
+    forms: DeviceForms,
 }
 
-impl MetalTower {
+impl DeviceTower {
     pub(crate) fn load(
         checkpoint: &FishDrama3Checkpoint,
         config: &FishDrama3Config,
         device: &Device,
     ) -> Result<Self> {
+        let forms = DeviceForms::of(device)?;
         let t = &config.tower;
         let shared = (0..t.shared_layers).map(|index| {
-            MetalTowerLayer::load(
+            DeviceTowerLayer::load(
                 checkpoint,
                 &tower_shared_layer(index),
                 "semantic_embedding",
                 config,
+                forms,
                 device,
             )
         });
         let residual = (0..t.residual_layers()).map(|index| {
-            MetalTowerLayer::load(
+            DeviceTowerLayer::load(
                 checkpoint,
                 &tower_residual_layer(index),
                 "codebook_embedding",
                 config,
+                forms,
                 device,
             )
         });
         let layers = shared.chain(residual).collect::<Result<Vec<_>>>()?;
         let heads = (0..t.residual_layers())
             .map(|index| {
-                f16_linear(
+                half_linear(
                     checkpoint,
                     &tower_head(index),
                     t.codebook_vocab,
                     t.dim,
+                    forms,
                     device,
                 )
             })
@@ -224,17 +238,18 @@ impl MetalTower {
         Ok(Self {
             layers,
             heads,
-            head_act: HALF,
+            head_act: forms.half,
             shared_layers: t.shared_layers,
             vocab: t.codebook_vocab,
             eps: t.norm_eps as f32,
+            forms,
         })
     }
 
     pub(crate) fn resident_bytes(&self) -> usize {
         self.layers
             .iter()
-            .map(MetalTowerLayer::resident_bytes)
+            .map(DeviceTowerLayer::resident_bytes)
             .sum::<usize>()
             + self.heads.iter().map(|h| h.resident_bytes()).sum::<usize>()
     }
@@ -253,7 +268,7 @@ impl MetalTower {
         index: usize,
         e: &Tensor,
         h: &Tensor,
-        rows: &mut [MetalRow<'_>],
+        rows: &mut [DeviceRow<'_>],
         phase: FishDrama3KernelPhase,
         act: Option<DType>,
         probe: &mut Probe<'_>,
@@ -265,12 +280,12 @@ impl MetalTower {
         let merged = Tensor::cat(&[&e, &h], 1)?;
         let x = layer.eh_proj.forward_device(&merged, phase, act)?;
         record(probe, || "merged".into(), &x);
-        let x = x.to_dtype(DType::F32)?;
+        let x = x.to_dtype(self.forms.residual)?;
         let normed = rms_norm(&x, &layer.attention_norm, self.eps, act)?;
         let mixed = layer
             .attention
             .forward(&normed, rows, index, phase, act, probe)?;
-        let x = (x + mixed.to_dtype(DType::F32)?)?;
+        let x = add_residual(&x, &mixed)?;
         let normed = rms_norm(&x, &layer.ffn_norm, self.eps, act)?;
         let gate = layer.w1.forward_device(&normed, phase, act)?;
         let up = layer.w3.forward_device(&normed, phase, act)?;
@@ -278,12 +293,14 @@ impl MetalTower {
         record(probe, || "ffn_activations".into(), &activations);
         let down = layer.w2.forward_device(&activations, phase, act)?;
         record(probe, || "ffn_out".into(), &down);
-        let x = (x + down.to_dtype(DType::F32)?)?;
+        let x = add_residual(&x, &down)?;
         record(probe, || "residual".into(), &x);
         rms_norm(&x, &layer.final_norm, self.eps, act)
     }
 
-    /// Head `index`'s F32 logits `[N, V]` of layer outputs `h`.
+    /// Head `index`'s F32 logits `[N, V]` of layer outputs `h`: an F16
+    /// projection widened on Metal, a BF16 projection summed into F32 on
+    /// CUDA (BF16 logits would lose two decimal digits).
     pub(crate) fn head_logits(
         &self,
         index: usize,
@@ -291,8 +308,12 @@ impl MetalTower {
         phase: FishDrama3KernelPhase,
         act: Option<DType>,
     ) -> Result<Tensor> {
+        let act = act.unwrap_or(self.head_act);
+        if self.forms.residency == FishDrama3Residency::Cuda && act == self.forms.half {
+            return self.heads[index].forward_device_f32(h, phase);
+        }
         Ok(self.heads[index]
-            .forward_device(h, phase, act.unwrap_or(self.head_act))?
+            .forward_device(h, phase, act)?
             .to_dtype(DType::F32)?)
     }
 
@@ -349,7 +370,7 @@ impl MetalTower {
         labels: &[u32],
         width: usize,
         semantic: impl Fn(u32) -> bool,
-        rows: &mut [MetalRow<'_>],
+        rows: &mut [DeviceRow<'_>],
     ) -> Result<Vec<Tensor>> {
         let device = hidden.device().clone();
         let extra = embedding.extra_device(inputs)?;
@@ -392,8 +413,8 @@ impl MetalTower {
         inputs: &[u32],
         c0: &[u32],
         labelled: &[bool],
-        rows: &mut [MetalRow<'_>],
-        mut codes: MetalStepCodes<'_>,
+        rows: &mut [DeviceRow<'_>],
+        mut codes: DeviceStepCodes<'_>,
     ) -> Result<(Vec<Vec<u32>>, Vec<Tensor>)> {
         let device = hidden.device().clone();
         let m = c0.len();
@@ -430,7 +451,7 @@ impl MetalTower {
             let head = slot - self.shared_layers;
             let logits = self.head_logits(head, &x, FishDrama3KernelPhase::Step, None)?;
             injected = match &mut codes {
-                MetalStepCodes::Device { policies, noise } => {
+                DeviceStepCodes::Device { policies, noise } => {
                     let mut row_picks = Vec::with_capacity(m);
                     for (r, policy) in policies.iter().enumerate() {
                         let cap = policy.top_k.unwrap_or(self.vocab).min(self.vocab);
@@ -443,7 +464,7 @@ impl MetalTower {
                     picks.push(pick.clone());
                     pick
                 }
-                MetalStepCodes::Host(sample) => {
+                DeviceStepCodes::Host(sample) => {
                     let values = sample(head, &logits)?;
                     if values.len() != m {
                         return Err(Error::InferenceError(format!(
@@ -458,7 +479,7 @@ impl MetalTower {
                 }
             };
         }
-        if let MetalStepCodes::Device { .. } = codes {
+        if let DeviceStepCodes::Device { .. } = codes {
             // Readback 2: every head's pick, then every draw's non-finite
             // count, in one transfer.
             let heads = picks.len();

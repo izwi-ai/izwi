@@ -30,6 +30,8 @@ pub mod checkpoint;
 pub mod chunking;
 pub mod codec;
 pub mod config;
+pub mod cuda;
+pub mod device;
 pub mod embed;
 pub mod head;
 pub mod linear;
@@ -56,10 +58,10 @@ pub use codec::{
     FishDrama3CodecArtifact, FishDrama3CodecSupport, FishDrama3DacConfig, FishDrama3DacDecoder,
 };
 pub use config::{FishDrama3Config, FishDrama3ConfigPolicy};
+pub use device::trunk::FishDrama3MoeBackend;
 pub use embed::FishDrama3Embedding;
 pub use head::FishDrama3CompactHead;
 pub use linear::FishDrama3KernelPhase;
-pub use metal::trunk::FishDrama3MoeBackend;
 pub use model::{
     FishDrama3AudioCandidate, FishDrama3AudioStream, FishDrama3CancelCheck, FishDrama3ChunkPlan,
     FishDrama3ChunkResult, FishDrama3ChunkSession, FishDrama3ChunkSessionOptions,
@@ -68,7 +70,7 @@ pub use model::{
     FishDrama3RequestState, FishDrama3StateGeometry, FishDrama3Step, FishDrama3StopReason,
     FishDrama3Synthesis,
 };
-pub use precision::{FishDrama3MetalChecks, FishDrama3PrecisionReport};
+pub use precision::{FishDrama3CudaChecks, FishDrama3MetalChecks, FishDrama3PrecisionReport};
 pub use prompt::{FishDrama3Codes, FishDrama3HistoryTurn, FishDrama3Prompt, FishDrama3Reference};
 pub use reference_cache::FishDrama3ReferenceAudio;
 pub use residency::{FishDrama3CpuPrecision, FishDrama3Residency, FishDrama3WeightForm};

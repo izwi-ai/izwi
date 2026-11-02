@@ -10,16 +10,17 @@
 //! ```
 //!
 //! On the CPU the residual stream and every activation are F32; on Metal
-//! the residual stays F32 and the layers run in the forms of
-//! `metal::trunk`. The caller picks the [`FishDrama3KernelPhase`]:
+//! and CUDA the layers run in the device column's forms (`device::trunk`:
+//! an F32 residual and F16 layers on Metal, BF16 throughout on CUDA). The
+//! caller picks the [`FishDrama3KernelPhase`]:
 //! * [`FishDrama3Trunk::forward_span`] runs one request's rows from its
 //!   position (prefill) and returns the final-norm hidden of every row: the
 //!   teacher-forced tower reads them all;
 //! * [`FishDrama3Trunk::forward_step`] runs one row for each of several
 //!   requests, each with its own paged KV and state (decode). On the CPU it
-//!   is a loop over the rows; on Metal the rows run together layer by layer
-//!   through row-wise kernels only. Either way a row's bits never depend on
-//!   its batch.
+//!   is a loop over the rows; on a device the rows run together layer by
+//!   layer through row-invariant kernels only. Either way a row's bits never
+//!   depend on its batch.
 //!
 //! Full-attention layers share one "trunk" paged domain holding only them
 //! (model layers from `layer_types`); one prepared append covers all of
@@ -42,10 +43,10 @@ use serde_json::json;
 
 use super::checkpoint::{trunk_layer, FishDrama3Checkpoint, TRUNK_PREFIX};
 use super::config::{FishDrama3Config, FishDrama3LayerKind, FishDrama3TrunkConfig};
+use super::device::trunk::{DeviceTrunk, FishDrama3MoeBackend};
+use super::device::DeviceRow;
 pub use super::linear::FishDrama3KernelPhase;
 use super::linear::FishDrama3Linear;
-use super::metal::trunk::{FishDrama3MoeBackend, MetalTrunk};
-use super::metal::MetalRow;
 use super::precision::{decide_cpu_forms, FishDrama3PrecisionReport, Q8_0_TOLERANCE};
 use super::residency::{
     FishDrama3ClassForms, FishDrama3CpuPrecision, FishDrama3ProjectionClass, FishDrama3Residency,
@@ -133,7 +134,7 @@ pub struct FishDrama3TrunkOptions {
     pub precision: FishDrama3CpuPrecision,
     /// The Q8_0 self-check's tolerance ([`Q8_0_TOLERANCE`]).
     pub q8_0_tolerance: f64,
-    /// How a Metal load runs its routed experts
+    /// How a Metal or CUDA load runs its routed experts
     /// (`IZWI_FISH_DRAMA3_MOE_BACKEND`); the CPU always loops.
     pub moe_backend: FishDrama3MoeBackend,
 }
@@ -190,8 +191,8 @@ enum Weights {
         layers: Vec<Layer>,
         final_norm: Vec<f32>,
     },
-    /// The Metal forms (`metal::trunk`).
-    Metal(MetalTrunk),
+    /// The device column's forms on Metal or CUDA (`device::trunk`).
+    Device(DeviceTrunk),
 }
 
 pub struct FishDrama3Trunk {
@@ -233,9 +234,9 @@ pub(crate) struct LayerTrace {
 
 impl FishDrama3Trunk {
     /// Loads the trunk on `device`: on the CPU after the Q8_0 self-check
-    /// decides each projection class's form; on Metal in its forms, which
-    /// the model's load-time checks (`metal::self_check`) may then move per
-    /// layer.
+    /// decides each projection class's form; on Metal or CUDA in the device
+    /// forms, which the model's load-time checks (`metal::self_check`,
+    /// `cuda::self_check`) may then move per layer.
     pub fn load(
         checkpoint: &FishDrama3Checkpoint,
         config: &FishDrama3Config,
@@ -243,9 +244,9 @@ impl FishDrama3Trunk {
         options: FishDrama3TrunkOptions,
     ) -> Result<Self> {
         let residency = FishDrama3Residency::of(device);
-        residency.require_implemented()?;
-        if residency == FishDrama3Residency::Metal {
-            return Self::load_metal(checkpoint, config, device, options);
+        residency.require_supported(device)?;
+        if residency != FishDrama3Residency::Cpu {
+            return Self::load_device(checkpoint, config, device, options);
         }
         let (forms, precision) = decide_cpu_forms(
             checkpoint,
@@ -337,15 +338,15 @@ impl FishDrama3Trunk {
         Ok(trunk)
     }
 
-    fn load_metal(
+    fn load_device(
         checkpoint: &FishDrama3Checkpoint,
         config: &FishDrama3Config,
         device: &Device,
         options: FishDrama3TrunkOptions,
     ) -> Result<Self> {
         let t = &config.trunk;
-        let metal = MetalTrunk::load(checkpoint, config, options.moe_backend, device)?;
-        let forms = FishDrama3ClassForms::of(FishDrama3Residency::Metal);
+        let weights = DeviceTrunk::load(checkpoint, config, options.moe_backend, device)?;
+        let forms = FishDrama3ClassForms::of(FishDrama3Residency::of(device));
         let precision = FishDrama3PrecisionReport {
             forms: FishDrama3ProjectionClass::TRUNK
                 .iter()
@@ -355,7 +356,7 @@ impl FishDrama3Trunk {
         };
         let trunk = Self {
             config: t.clone(),
-            weights: Weights::Metal(metal),
+            weights: Weights::Device(weights),
             attention_layers: t
                 .full_attention_layers()
                 .into_iter()
@@ -367,23 +368,24 @@ impl FishDrama3Trunk {
             counters: Counters::default(),
         };
         tracing::info!(
-            "Loaded the Fish Audio Drama 3 trunk on Metal: {:.2} GiB",
+            "Loaded the Fish Audio Drama 3 trunk on {:?}: {:.2} GiB",
+            device.location(),
             trunk.resident_bytes() as f64 / (1u64 << 30) as f64
         );
         Ok(trunk)
     }
 
-    /// The Metal weights, for the load-time checks.
-    pub(crate) fn metal(&self) -> Option<&MetalTrunk> {
+    /// The device weights, for the load-time checks.
+    pub(crate) fn device_trunk(&self) -> Option<&DeviceTrunk> {
         match &self.weights {
-            Weights::Metal(metal) => Some(metal),
+            Weights::Device(weights) => Some(weights),
             Weights::Host { .. } => None,
         }
     }
 
-    pub(crate) fn metal_mut(&mut self) -> Option<&mut MetalTrunk> {
+    pub(crate) fn device_trunk_mut(&mut self) -> Option<&mut DeviceTrunk> {
         match &mut self.weights {
-            Weights::Metal(metal) => Some(metal),
+            Weights::Device(weights) => Some(weights),
             Weights::Host { .. } => None,
         }
     }
@@ -397,7 +399,7 @@ impl FishDrama3Trunk {
     fn host_layers(&self) -> &[Layer] {
         match &self.weights {
             Weights::Host { layers, .. } => layers,
-            Weights::Metal(_) => &[],
+            Weights::Device(_) => &[],
         }
     }
 
@@ -427,7 +429,7 @@ impl FishDrama3Trunk {
     pub fn resident_bytes(&self) -> usize {
         let (layers, final_norm) = match &self.weights {
             Weights::Host { layers, final_norm } => (layers, final_norm),
-            Weights::Metal(metal) => return metal.resident_bytes(),
+            Weights::Device(weights) => return weights.resident_bytes(),
         };
         let layers = layers
             .iter()
@@ -568,8 +570,8 @@ impl FishDrama3Trunk {
         cache: &mut PhysicalPagedKvCache,
         trace: Option<&mut LayerTrace>,
     ) -> Result<Tensor> {
-        if let Weights::Metal(metal) = &self.weights {
-            return self.span_metal(metal, embeds, start_pos, state, cache, trace);
+        if let Weights::Device(weights) = &self.weights {
+            return self.span_device(weights, embeds, start_pos, state, cache, trace);
         }
         let (x, n) = self.host_rows(embeds, None)?;
         self.check_clocks(n, start_pos, state, cache)?;
@@ -672,9 +674,9 @@ impl FishDrama3Trunk {
         Ok((embeds.to_device(&self.device)?.to_dtype(DType::F32)?, n))
     }
 
-    fn span_metal(
+    fn span_device(
         &self,
-        metal: &MetalTrunk,
+        weights: &DeviceTrunk,
         embeds: &Tensor,
         start_pos: usize,
         state: &mut FishDrama3TrunkState,
@@ -686,14 +688,14 @@ impl FishDrama3Trunk {
         let mut next = state.layers()?.to_vec();
         let mut prepared = cache.prepare_append(start_pos, n)?;
         let result = {
-            let mut rows = [MetalRow {
+            let mut rows = [DeviceRow {
                 start: start_pos,
                 rows: n,
                 cache: &*cache,
                 prepared: &mut prepared,
             }];
             let mut states = [next.as_mut_slice()];
-            metal.run(
+            weights.run(
                 x,
                 &mut rows,
                 &mut states,
@@ -718,11 +720,11 @@ impl FishDrama3Trunk {
         }
     }
 
-    /// A decode step on Metal: every row's append is prepared, the rows run
-    /// together layer by layer, and they commit together.
-    fn steps_metal(
+    /// A decode step on a device: every row's append is prepared, the rows
+    /// run together layer by layer, and they commit together.
+    fn steps_device(
         &self,
-        metal: &MetalTrunk,
+        weights: &DeviceTrunk,
         embeds: &Tensor,
         rows: &mut [FishDrama3StepRow<'_>],
         trace: Option<&mut LayerTrace>,
@@ -757,7 +759,7 @@ impl FishDrama3Trunk {
             let mut device_rows = rows
                 .iter()
                 .zip(prepared.iter_mut())
-                .map(|(row, step)| MetalRow {
+                .map(|(row, step)| DeviceRow {
                     start: row.state.position(),
                     rows: 1,
                     cache: &*row.cache,
@@ -765,7 +767,7 @@ impl FishDrama3Trunk {
                 })
                 .collect::<Vec<_>>();
             let mut states = next.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>();
-            metal.run(
+            weights.run(
                 x,
                 &mut device_rows,
                 &mut states,
@@ -800,15 +802,15 @@ impl FishDrama3Trunk {
         rows: &mut [FishDrama3StepRow<'_>],
         mut trace: Option<&mut LayerTrace>,
     ) -> Result<Tensor> {
-        if let Weights::Metal(metal) = &self.weights {
-            // Metal runs a step's rows together layer by layer; a trace
+        if let Weights::Device(weights) = &self.weights {
+            // A device runs a step's rows together layer by layer; a trace
             // keeps the CPU's row-major layout for one row only.
             if trace.is_some() && rows.len() != 1 {
                 return Err(Error::InferenceError(
-                    "a traced Metal step takes one row".into(),
+                    "a traced device step takes one row".into(),
                 ));
             }
-            return self.steps_metal(metal, embeds, rows, trace);
+            return self.steps_device(weights, embeds, rows, trace);
         }
         let (x, count) = self.host_rows(embeds, Some(rows.len()))?;
         if count == 0 {

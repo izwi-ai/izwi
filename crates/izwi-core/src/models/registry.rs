@@ -571,9 +571,9 @@ fn load_fish_s2_tts_model(
 }
 
 /// What a Fish Audio Drama 3 load checks before it reads a weight: the
-/// backend has a residency (the CPU's and Metal's; CUDA's is a later
-/// phase), and a published checkpoint is the pinned one (sizes and the
-/// `config.json` hash, never a re-hash of 41.5 GB). It then logs the
+/// backend's forms run on the device (a CUDA load needs compute capability
+/// 8.0 or newer), and a published checkpoint is the pinned one (sizes and
+/// the `config.json` hash, never a re-hash of 41.5 GB). It then logs the
 /// licence once per load. Test checkpoints (`Synthetic`) have no pinned
 /// manifest.
 fn prepare_fish_drama3_tts_load(
@@ -582,11 +582,11 @@ fn prepare_fish_drama3_tts_load(
     device: &DeviceProfile,
     policy: crate::models::architectures::fish_drama3::FishDrama3ConfigPolicy,
 ) -> Result<()> {
-    use crate::models::architectures::fish_drama3::{artifacts, FishDrama3ConfigPolicy};
+    use crate::models::architectures::fish_drama3::{
+        artifacts, FishDrama3ConfigPolicy, FishDrama3Residency,
+    };
     if device.kind == crate::backends::DeviceKind::Cuda {
-        return Err(Error::ModelLoadError(format!(
-            "{variant} is not yet supported on the CUDA backend; load it on the CPU or Metal"
-        )));
+        FishDrama3Residency::Cuda.require_supported(&device.device)?;
     }
     if policy == FishDrama3ConfigPolicy::Published {
         artifacts::verify_identity(model_dir)?;
@@ -617,8 +617,8 @@ fn fish_drama3_load_options(
 }
 
 /// Loads the published Fish Audio Drama 3 in its backend's residency: CPU
-/// (Q8_0 weights, F32 numerics) or Metal (raw FP8 and F16 weights, F32
-/// residual).
+/// (Q8_0 weights, F32 numerics), Metal (raw FP8 and F16 weights, F32
+/// residual) or CUDA (raw FP8 and BF16 weights, BF16 residual).
 fn load_fish_drama3_tts_model(
     model_dir: &Path,
     variant: ModelVariant,
@@ -7177,12 +7177,18 @@ fn tts_fast_path_counters(family: ModelFamily) -> Option<Value> {
             "resident_fast_frames_total": fish_s2::fast::fish_s2_resident_fast_frames(),
         })),
         ModelFamily::FishDrama3Tts => {
-            use crate::models::architectures::fish_drama3::metal::sampling as resident;
-            Some(serde_json::json!({
+            use crate::models::architectures::fish_drama3::device::{self, sampling as resident};
+            let mut counters = serde_json::json!({
                 "resident_frames_total": resident::fish_drama3_resident_frames(),
                 "resident_readbacks_total": resident::fish_drama3_resident_readbacks(),
                 "resident_host_fallbacks_total": resident::fish_drama3_resident_host_fallbacks(),
-            }))
+            });
+            if let (Some(fields), serde_json::Value::Object(paths)) =
+                (counters.as_object_mut(), device::fast_path_counters())
+            {
+                fields.extend(paths);
+            }
+            Some(counters)
         }
         _ => None,
     }
@@ -9625,9 +9631,13 @@ mod tests {
         assert_eq!(
             counters(ModelVariant::FishAudioDrama3, Some(serde_json::json!({}))),
             [
+                "chunked_deltanet_spans_total",
+                "grouped_moe_spans_total",
                 "resident_frames_total",
                 "resident_host_fallbacks_total",
-                "resident_readbacks_total"
+                "resident_readbacks_total",
+                "step_row_gemv_calls_total",
+                "step_row_loop_calls_total"
             ]
         );
         assert_eq!(
@@ -9979,10 +9989,11 @@ mod tests {
             .is_none());
     }
 
-    /// The published loader checks the backend (CUDA is refused; the CPU
-    /// and Metal load) and the pinned identity before it reads a weight.
+    /// The published loader checks the backend (CUDA needs an SM80 CUDA
+    /// device; the CPU and Metal load) and the pinned identity before it
+    /// reads a weight.
     #[tokio::test]
-    async fn the_published_drama3_loader_refuses_cuda_and_foreign_checkpoints() {
+    async fn the_published_drama3_loader_checks_the_device_and_the_checkpoint() {
         use crate::backends::DeviceKind;
         use crate::models::architectures::fish_drama3::FishDrama3ConfigPolicy;
         let synthetic =
@@ -10000,11 +10011,9 @@ mod tests {
                 FishDrama3ConfigPolicy::Synthetic,
             )
         };
+        // A CUDA profile whose device is not an SM80 CUDA device.
         let error = prepare(DeviceKind::Cuda).unwrap_err().to_string();
-        assert!(
-            error.contains("is not yet supported on the CUDA backend"),
-            "{error}"
-        );
+        assert!(error.contains("compute capability 8.0"), "{error}");
         prepare(DeviceKind::Metal).expect("Metal has a residency");
         prepare(DeviceKind::Cpu).expect("the CPU has a residency");
         // The synthetic checkpoint is not the pinned revision.

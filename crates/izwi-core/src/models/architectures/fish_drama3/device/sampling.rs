@@ -1,6 +1,8 @@
-//! Device-resident sampling on Metal (§6): Fish S2's resident pattern
-//! (`fish_s2/sampling.rs`, `fish_s2/fast.rs`) as the family's own copy,
-//! over the family's sampler (`sampling.rs`).
+//! Device-resident sampling on Metal and CUDA (§6): Fish S2's resident
+//! pattern (`fish_s2/sampling.rs`, `fish_s2/fast.rs`) as the family's own
+//! copy, over the family's sampler (`sampling.rs`). Every step is a Candle
+//! op or the shared bounded top-k (`models::shared::sampling::device_top_k`),
+//! so one implementation serves both devices.
 //!
 //! The host draws every exponential a frame needs from the row's own
 //! stream, in the order the host sampler takes them (the main draw's, the
@@ -198,7 +200,7 @@ pub(crate) fn race(
     })
 }
 
-#[cfg(all(test, feature = "metal"))]
+#[cfg(all(test, any(feature = "metal", feature = "cuda")))]
 mod tests {
     use super::super::super::sampling::race as host_race;
     use super::*;
@@ -215,6 +217,7 @@ mod tests {
     /// exponentials, over the policies the family runs (capped, uncapped,
     /// near-greedy, eos masked), and flags an uncapped flat row whose kept
     /// prefix runs past the device's ranks.
+    #[cfg(feature = "metal")]
     #[test]
     fn the_device_race_agrees_with_the_host_race() {
         let Some((device, _lease)) =
@@ -222,6 +225,21 @@ mod tests {
         else {
             return;
         };
+        race_agrees_with_the_host(&device);
+    }
+
+    /// [`the_device_race_agrees_with_the_host_race`] on CUDA.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_cuda_race_agrees_with_the_host_race() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        race_agrees_with_the_host(&device);
+    }
+
+    fn race_agrees_with_the_host(device: &candle_core::Device) {
+        let device = device.clone();
         let policies = [
             FishDrama3DrawPolicy {
                 temperature: 1.0,

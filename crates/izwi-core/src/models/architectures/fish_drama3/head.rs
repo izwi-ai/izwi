@@ -10,7 +10,9 @@
 //! On the CPU the weights are the BF16 rows widened to F32 (about 32 MiB);
 //! on Metal they are F16 (16 MiB) and the projection runs in F16, widened
 //! to F32 logits (F32 throughout once the load-time range probe breached
-//! the head). Each hidden row is projected on its own, so a row's logits
+//! the head); on CUDA they stay BF16 and the projection writes F32 logits.
+//! Each hidden row is projected on its own (on CUDA through the
+//! row-invariant multi-row GEMV once it is enabled), so a row's logits
 //! never depend on how many rows share the call.
 
 use candle_core::{DType, Device, Tensor};
@@ -20,10 +22,10 @@ use super::config::{FishDrama3Config, FishDrama3TokenIds};
 use crate::error::{Error, Result};
 
 pub struct FishDrama3CompactHead {
-    /// `[candidates, hidden]`: F32 on the CPU, F16 on Metal.
+    /// `[candidates, hidden]`: F32 on the CPU, F16 on Metal, BF16 on CUDA.
     weight: Tensor,
     /// The projection's dtype: F32 on the CPU, F16 on Metal unless the
-    /// range probe moved it to F32.
+    /// range probe moved it to F32, BF16 on CUDA.
     act: DType,
     /// Logit index → token id: eos, then the semantic band.
     token_ids: Vec<u32>,
@@ -47,10 +49,10 @@ impl FishDrama3CompactHead {
         device: &Device,
     ) -> Result<Self> {
         let rows = config.ids.compact_head_rows();
-        let dtype = if device.is_metal() {
-            DType::F16
-        } else {
-            DType::F32
+        let dtype = match device {
+            Device::Metal(_) => DType::F16,
+            Device::Cuda(_) => DType::BF16,
+            Device::Cpu => DType::F32,
         };
         let weight = checkpoint.bf16_rows_tensor(LM_HEAD, &rows, dtype, device)?;
         let (count, hidden) = weight.dims2()?;
@@ -133,6 +135,24 @@ impl FishDrama3CompactHead {
             )));
         }
         let hidden = hidden.to_dtype(self.act)?;
+        if hidden.device().is_cuda() {
+            // BF16 rows summed into F32 logits (BF16 logits would lose two
+            // decimal digits): the row-invariant GEMV once enabled, else one
+            // F32 GEMV per row over the widened values.
+            use crate::kernels::cuda::row_gemv::{row_gemv, supported, RowGemvWeight};
+            let weight = RowGemvWeight::Dense(&self.weight);
+            if crate::kernels::cuda::row_gemv::enabled()
+                && supported(hidden.dtype(), weight, DType::F32)
+            {
+                return Ok(row_gemv(&hidden, weight, DType::F32)?);
+            }
+            let w = self.weight.to_dtype(DType::F32)?.t()?;
+            let hidden = hidden.to_dtype(DType::F32)?;
+            let rows = (0..n)
+                .map(|row| hidden.narrow(0, row, 1)?.contiguous()?.matmul(&w))
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            return Ok(Tensor::cat(&rows, 0)?);
+        }
         let w = if self.weight.dtype() == self.act {
             self.weight.t()?
         } else {

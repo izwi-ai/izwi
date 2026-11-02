@@ -16,9 +16,12 @@
 //! Metal (D5) runs F16 activations beside an F32 residual. Its load-time
 //! checks (`metal::self_check`) report through [`FishDrama3MetalChecks`]:
 //! the F16 range probe per layer, the FP8 GEMV against the original
-//! tensors, and the host RoPE tables. `IZWI_FISH_DRAMA3_DTYPE` overrides the
-//! activation dtype ([`activation_dtype`]) and `IZWI_FISH_DRAMA3_MOE_BACKEND`
-//! the routed experts' path ([`moe_backend`]).
+//! tensors, and the host RoPE tables. CUDA runs BF16 throughout; its checks
+//! (`cuda::self_check`) report through [`FishDrama3CudaChecks`]: the same
+//! table checks, and the device checks that gate its kernels.
+//! `IZWI_FISH_DRAMA3_DTYPE` overrides the activation dtype
+//! ([`activation_dtype`]) and `IZWI_FISH_DRAMA3_MOE_BACKEND` the routed
+//! experts' path ([`moe_backend`]).
 
 use candle_core::{DType, Device};
 use serde_json::json;
@@ -27,8 +30,8 @@ use super::checkpoint::{
     expert, tower_head, tower_shared_layer, trunk_layer, FishDrama3Checkpoint,
 };
 use super::config::FishDrama3Config;
+use super::device::trunk::FishDrama3MoeBackend;
 use super::linear::{FishDrama3KernelPhase, FishDrama3Linear};
-use super::metal::trunk::FishDrama3MoeBackend;
 use super::residency::{
     FishDrama3ClassForms, FishDrama3CpuPrecision, FishDrama3ProjectionClass, FishDrama3Residency,
     FishDrama3WeightForm,
@@ -88,8 +91,8 @@ impl FishDrama3PrecisionReport {
 /// Overrides a load's activation dtype: `f16` or `f32` on Metal, `f32` on
 /// the CPU (whose numerics are F32 throughout).
 pub const DTYPE_ENV: &str = "IZWI_FISH_DRAMA3_DTYPE";
-/// `fused` (the default) or `loop`: how a Metal load runs its routed
-/// experts.
+/// `fused` (the default) or `loop`: how a Metal or CUDA load runs its
+/// routed experts.
 pub const MOE_BACKEND_ENV: &str = "IZWI_FISH_DRAMA3_MOE_BACKEND";
 
 /// The activation dtype a load on `residency` runs: `raw` (the
@@ -106,7 +109,7 @@ pub fn activation_dtype(residency: FishDrama3Residency, raw: Option<&str>) -> Re
         "bf16" | "bfloat16" => DType::BF16,
         _ => {
             return Err(Error::ModelLoadError(format!(
-                "{DTYPE_ENV}={raw} is not a dtype (f16, f32)"
+                "{DTYPE_ENV}={raw} is not a dtype (f16, bf16, f32)"
             )))
         }
     };
@@ -196,9 +199,10 @@ pub struct FishDrama3MetalChecks {
     pub rope_table_breaches: u64,
 }
 
-/// The largest relative L2 the FP8 GEMV (F16 activations in and out) may
+/// The largest relative L2 the FP8 GEMV (16-bit activations in and out) may
 /// show against the F64 dequantization of the original tensor: F16 input
-/// and output rounding measure about 5e-4; a scale or layout fault, order 1.
+/// and output rounding measure about 5e-4 and BF16's about 3e-3; a scale or
+/// layout fault, order 1.
 pub const FP8_GEMV_TOLERANCE: f64 = 1e-2;
 /// The largest absolute error of a rotated unit-scale vector against F64:
 /// F32 tables and F32 rotation measure under 1e-6 at any position; an F32
@@ -221,6 +225,69 @@ impl FishDrama3MetalChecks {
                 "non_finite": c.non_finite,
                 "breached": c.breached,
             })).collect::<Vec<_>>(),
+            "fp8_checks": self.fp8_checks.iter().map(|(name, error)| json!({
+                "projection": name,
+                "relative_l2": error,
+            })).collect::<Vec<_>>(),
+            "rope_checks": self.rope_checks.iter().map(|(layout, position, error)| json!({
+                "layout": layout,
+                "position": position,
+                "max_abs_error": error,
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// What a CUDA load's checks found and decided (`cuda::self_check`). The
+/// table checks refuse a load that misses them; a kernel check that fails
+/// leaves its kernel off and counts it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FishDrama3CudaChecks {
+    /// The activation dtype every layer runs (BF16).
+    pub activations: String,
+    /// Relative L2 of the FP8 GEMV against the original tensors' F64
+    /// dequantization, per checked projection.
+    pub fp8_checks: Vec<(String, f64)>,
+    /// FP8 checks over [`FP8_GEMV_TOLERANCE`] (the counter; the load is
+    /// refused at the first).
+    pub fp8_gemv_breaches: u64,
+    /// The largest error of the device rotation against F64, per layout and
+    /// position.
+    pub rope_checks: Vec<(String, usize, f64)>,
+    /// RoPE checks over [`ROPE_TOLERANCE`] (the counter).
+    pub rope_table_breaches: u64,
+    /// The row-invariant multi-row GEMV's device check: `verified`, or why
+    /// steps run one GEMV per row instead.
+    pub row_gemv: String,
+    /// 1 when that check failed.
+    pub row_gemv_breaches: u64,
+    /// The chunked DeltaNet prefill's device check: `verified`, or why long
+    /// spans run the per-row kernels instead.
+    pub chunked_deltanet: String,
+    /// 1 when that check failed.
+    pub chunked_deltanet_breaches: u64,
+    /// The grouped MoE prefill's kernels: `tensor-core` once their device
+    /// check passed, else `warp` and why.
+    pub grouped_moe: String,
+    /// 1 when the tensor-core check failed.
+    pub grouped_mma_breaches: u64,
+    /// The paged KV dtype both domains store (BF16).
+    pub kv_dtype: String,
+}
+
+impl FishDrama3CudaChecks {
+    pub fn diagnostics(&self) -> serde_json::Value {
+        json!({
+            "activations": self.activations,
+            "kv_dtype": self.kv_dtype,
+            "fp8_gemv_breaches": self.fp8_gemv_breaches,
+            "rope_table_breaches": self.rope_table_breaches,
+            "row_gemv": self.row_gemv,
+            "row_gemv_breaches": self.row_gemv_breaches,
+            "chunked_deltanet": self.chunked_deltanet,
+            "chunked_deltanet_breaches": self.chunked_deltanet_breaches,
+            "grouped_moe": self.grouped_moe,
+            "grouped_mma_breaches": self.grouped_mma_breaches,
             "fp8_checks": self.fp8_checks.iter().map(|(name, error)| json!({
                 "projection": name,
                 "relative_l2": error,

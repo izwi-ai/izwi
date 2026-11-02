@@ -3,12 +3,12 @@
 //! | Weight | CPU | Metal | CUDA |
 //! |---|---|---|---|
 //! | Routed experts | Q8_0 (FP8 → F32 → Q8_0 at load) | raw E4M3 + F32 block scales, stacked per layer | raw E4M3 + F32 block scales |
-//! | Dense trunk projections, shared expert | Q8_0 | F16; q/k/v and qkv+z packed | BF16 |
+//! | Dense trunk projections, shared expert | Q8_0 | F16; q/k/v and qkv+z packed | BF16; q/k/v and qkv+z packed |
 //! | Norm gains, router, shared-expert gate, DeltaNet gates, `A_log`, `dt_bias`, conv | F32 | F32 | F32 |
-//! | Embedding (and the frame codebooks) | BF16 host table, gathered to F32 | F16 device tables, gathered to F32 | — |
-//! | Compact main head | F32 | F16 | — |
-//! | Tower projections and codebook heads (BF16) | Q8_0 | F16; `wqkv` repacked per head | BF16 |
-//! | Tower code embeddings | BF16 host tables, gathered to F32 | F16 device tables | — |
+//! | Embedding (and the frame codebooks) | BF16 host table, gathered to F32 | F16 device tables, gathered to F32 | BF16 device tables, gathered to F32 |
+//! | Compact main head | F32 | F16 | BF16 |
+//! | Tower projections and codebook heads (BF16) | Q8_0 | F16; `wqkv` repacked per head | BF16; `wqkv` repacked per head |
+//! | Tower code embeddings | BF16 host tables, gathered to F32 | F16 device tables | BF16 device tables |
 //!
 //! The DeltaNet gate projections `in_proj_a` / `in_proj_b` (32 rows each)
 //! stay F32 beside the router: they feed `exp` and `softplus` decays, and
@@ -17,13 +17,14 @@
 //! A CPU load checks each Q8_0 projection class against F32 first
 //! (`precision.rs`); a class over tolerance stays F32. A Metal load runs its
 //! own checks (`metal::self_check`): a layer whose activations leave F16's
-//! range runs them in F32. CUDA is refused until its residency lands.
+//! range runs them in F32. A CUDA load (SM80 or newer; older devices are
+//! refused) runs `cuda::self_check`.
 
 use std::collections::BTreeMap;
 
 use candle_core::Device;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 /// The backend a load targets (`Device` alone does not carry the policy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +42,7 @@ pub enum FishDrama3WeightForm {
     F32,
     /// Metal dense: F16 weights on the device.
     F16,
-    /// CUDA dense (Phase 3).
+    /// CUDA dense: BF16 weights on the device.
     Bf16,
     /// E4M3 codes plus their F32 block scales, unchanged (Metal, CUDA).
     RawFp8,
@@ -159,13 +160,13 @@ impl FishDrama3Residency {
         }
     }
 
-    /// Refuses the backends whose forms are not implemented yet.
-    pub fn require_implemented(self) -> Result<()> {
+    /// Refuses a load this backend's forms cannot run on `device`: CUDA
+    /// needs a device of compute capability 8.0 or newer (BF16 and the FP8
+    /// kernels' floor).
+    pub fn require_supported(self, device: &Device) -> Result<()> {
         match self {
             Self::Cpu | Self::Metal => Ok(()),
-            Self::Cuda => Err(Error::ModelLoadError(format!(
-                "Fish Audio Drama 3 has no {self:?} weight residency yet; load it on the CPU or Metal"
-            ))),
+            Self::Cuda => super::cuda::require_sm80(device),
         }
     }
 
@@ -243,7 +244,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn each_backend_names_its_forms_and_cuda_is_refused() {
+    fn each_backend_names_its_forms_and_cuda_needs_sm80() {
         use FishDrama3WeightForm::*;
         let cpu = FishDrama3ClassForms::of(FishDrama3Residency::Cpu);
         assert!(cpu.iter().all(|(_, form)| form == Q8_0));
@@ -253,9 +254,15 @@ mod tests {
         let cuda = FishDrama3ClassForms::of(FishDrama3Residency::Cuda);
         assert_eq!(cuda.form(FishDrama3ProjectionClass::SharedExpert), Bf16);
         assert_eq!(cuda.form(FishDrama3ProjectionClass::RoutedExpert), RawFp8);
-        assert!(FishDrama3Residency::Cpu.require_implemented().is_ok());
-        assert!(FishDrama3Residency::Metal.require_implemented().is_ok());
-        assert!(FishDrama3Residency::Cuda.require_implemented().is_err());
+        assert!(FishDrama3Residency::Cpu
+            .require_supported(&Device::Cpu)
+            .is_ok());
+        // CUDA's forms need an SM80 CUDA device; anything else is refused.
+        let error = FishDrama3Residency::Cuda
+            .require_supported(&Device::Cpu)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("compute capability 8.0"), "{error}");
         // A published routed expert projection, [512, 2048].
         assert_eq!(Q8_0.bytes(512, 2048), 1_114_112);
         assert_eq!(RawFp8.bytes(512, 2048), 1_048_576 + 4 * 4 * 16);

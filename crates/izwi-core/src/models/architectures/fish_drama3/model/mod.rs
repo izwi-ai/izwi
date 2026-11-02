@@ -1,9 +1,9 @@
 //! The family's model loop (§3.5, §7.1–7.5): the embedding, trunk, tower,
 //! compact head, sampler and codec composed into prefill spans, decode
-//! quanta and finished generations, on the CPU and on Metal. A Metal load
-//! runs its self-checks (`metal::self_check`) before it serves, and its
-//! decode samples on the device with two readbacks a frame
-//! (`metal::sampling`).
+//! quanta and finished generations, on the CPU, Metal and CUDA. A device
+//! load runs its backend's self-checks (`metal::self_check`,
+//! `cuda::self_check`) before it serves, and its decode samples on the
+//! device with two readbacks a frame (`device::sampling`).
 //!
 //! A request ([`FishDrama3RequestState`]) owns its retained state: the
 //! trunk's DeltaNet state, its two paged KV views ("trunk" and "tower",
@@ -60,12 +60,14 @@ use super::codec::{
     FishDrama3CodecArtifact, FishDrama3DacConfig, FishDrama3DacDecoder, FishDrama3DacStreamState,
 };
 use super::config::{FishDrama3Config, FishDrama3ConfigPolicy};
-use super::embed::{prompt_rows, FishDrama3Embedding};
-use super::head::FishDrama3CompactHead;
-use super::metal::sampling::{
+use super::device::sampling::{
     count_fallback, device_cap, race as device_race, rank, read_back, DEVICE_RANKS,
 };
-use super::precision::{activation_dtype, check_activations, moe_backend, FishDrama3MetalChecks};
+use super::embed::{prompt_rows, FishDrama3Embedding};
+use super::head::FishDrama3CompactHead;
+use super::precision::{
+    activation_dtype, check_activations, moe_backend, FishDrama3CudaChecks, FishDrama3MetalChecks,
+};
 use super::prompt::{FishDrama3Codes, FishDrama3Prompt, FishDrama3Reference};
 use super::reference_cache::{FishDrama3ReferenceAudio, FishDrama3ReferenceCache, MAX_REFERENCES};
 use super::residency::FishDrama3Residency;
@@ -101,7 +103,8 @@ pub use session::{
     FishDrama3ChunkSessionOptions,
 };
 
-/// Prefill rows per span on the CPU and Metal (CUDA takes 1,024 in Phase 3).
+/// Prefill rows per span on the CPU and Metal (CUDA's default is 1,024,
+/// `runtime::fish_drama3_capacity`).
 pub const DEFAULT_PREFILL_SPAN_ROWS: usize = 256;
 
 /// Overrides the prefill grid's cell: rows per span, fixed per load (the
@@ -218,8 +221,9 @@ pub struct FishDrama3ModelOptions {
     pub prefill_span_rows: usize,
     /// [`FishDrama3ConfigPolicy::Published`] except for test checkpoints.
     pub config_policy: FishDrama3ConfigPolicy,
-    /// A Metal load's activation dtype: `None` for the backend's (F16),
-    /// `Some(F32)` for F32 throughout (`IZWI_FISH_DRAMA3_DTYPE`).
+    /// A load's activation dtype: `None` for the backend's (F16 on Metal,
+    /// BF16 on CUDA, F32 on the CPU), `Some(F32)` for F32 throughout on
+    /// Metal (`IZWI_FISH_DRAMA3_DTYPE`).
     pub activations: Option<DType>,
 }
 
@@ -647,10 +651,12 @@ pub struct FishDrama3Model {
     device: Device,
     prefill_span_rows: usize,
     /// Both paged domains' dtype: F32 on the CPU, F16 on Metal unless a
-    /// load-time check put them in F32.
+    /// load-time check put them in F32, BF16 on CUDA.
     kv_dtype: DType,
-    /// What a Metal load's checks found (`None` on the CPU).
+    /// What a Metal load's checks found (`None` elsewhere).
     metal_checks: Option<FishDrama3MetalChecks>,
+    /// What a CUDA load's checks found (`None` elsewhere).
+    cuda_checks: Option<FishDrama3CudaChecks>,
     /// The content identity a durable speech checkpoint records
     /// ([`super::artifacts::pinned_fingerprint`]), set by the loader.
     artifact_fingerprint: Option<String>,
@@ -768,13 +774,14 @@ fn host_values(tensor: &Tensor) -> Result<Vec<f32>> {
 }
 
 impl FishDrama3Model {
-    /// Loads the model and its DAC from `model_dir` on `device` (the CPU or
-    /// Metal; CUDA is refused until its residency lands).
+    /// Loads the model and its DAC from `model_dir` on `device` (the CPU,
+    /// Metal, or a CUDA device of compute capability 8.0 or newer).
     pub fn load(
         model_dir: &Path,
         device: &Device,
         options: FishDrama3ModelOptions,
     ) -> Result<Self> {
+        FishDrama3Residency::of(device).require_supported(device)?;
         let artifact = FishDrama3CodecArtifact::load(model_dir)?;
         let weights = artifact.load_weights(device, DType::F32)?;
         let codec =
@@ -808,25 +815,30 @@ impl FishDrama3Model {
         let checkpoint = FishDrama3Checkpoint::open(model_dir)?;
         checkpoint.validate_census(&config)?;
         let residency = FishDrama3Residency::of(device);
-        residency.require_implemented()?;
+        residency.require_supported(device)?;
         let activations = check_activations(residency, options.activations)?;
         let embedding = FishDrama3Embedding::load_on(&checkpoint, &config, device)?;
         let mut trunk = FishDrama3Trunk::load(&checkpoint, &config, device, options.trunk)?;
         let mut tower = FishDrama3Tower::load(&checkpoint, &config, device, options.tower)?;
         let mut head = FishDrama3CompactHead::load(&checkpoint, &config, device)?;
-        let (kv_dtype, metal_checks) = if residency == FishDrama3Residency::Metal {
-            let (checks, kv) = super::metal::self_check::run(
-                &checkpoint,
-                &config,
-                &embedding,
-                &mut trunk,
-                &mut tower,
-                &mut head,
-                activations,
-            )?;
-            (kv, Some(checks))
-        } else {
-            (DType::F32, None)
+        let (kv_dtype, metal_checks, cuda_checks) = match residency {
+            FishDrama3Residency::Metal => {
+                let (checks, kv) = super::metal::self_check::run(
+                    &checkpoint,
+                    &config,
+                    &embedding,
+                    &mut trunk,
+                    &mut tower,
+                    &mut head,
+                    activations,
+                )?;
+                (kv, Some(checks), None)
+            }
+            FishDrama3Residency::Cuda => {
+                let checks = super::cuda::self_check::run(&checkpoint, &config, &mut trunk)?;
+                (DType::BF16, None, Some(checks))
+            }
+            FishDrama3Residency::Cpu => (DType::F32, None, None),
         };
         let geometry = FishDrama3StateGeometry::of(&config);
         if trunk.attention_layers() != geometry.trunk.layers
@@ -850,6 +862,7 @@ impl FishDrama3Model {
             prefill_span_rows: options.prefill_span_rows,
             kv_dtype,
             metal_checks,
+            cuda_checks,
             artifact_fingerprint: None,
         })
     }
@@ -902,14 +915,20 @@ impl FishDrama3Model {
     }
 
     /// Both paged domains' dtype: what the engine's state contract must
-    /// store (F16 on Metal unless a load-time check moved it to F32).
+    /// store (F16 on Metal unless a load-time check moved it to F32, BF16 on
+    /// CUDA).
     pub fn kv_dtype(&self) -> DType {
         self.kv_dtype
     }
 
-    /// What a Metal load's checks found (`None` on the CPU).
+    /// What a Metal load's checks found (`None` elsewhere).
     pub fn metal_checks(&self) -> Option<&FishDrama3MetalChecks> {
         self.metal_checks.as_ref()
+    }
+
+    /// What a CUDA load's checks found (`None` elsewhere).
+    pub fn cuda_checks(&self) -> Option<&FishDrama3CudaChecks> {
+        self.cuda_checks.as_ref()
     }
 
     /// Positions one request may use: the trunk's and §7.5's.
@@ -932,14 +951,20 @@ impl FishDrama3Model {
             "kv_dtype": format!("{:?}", self.kv_dtype),
         });
         if let Some(checks) = &self.metal_checks {
-            summary["embedding_device_bytes"] = json!(self.embedding.device_bytes());
             summary["metal_checks"] = checks.diagnostics();
+        }
+        if let Some(checks) = &self.cuda_checks {
+            summary["cuda_checks"] = checks.diagnostics();
+        }
+        if !self.device.is_cpu() {
+            summary["embedding_device_bytes"] = json!(self.embedding.device_bytes());
             summary["resident_sampling"] = json!({
-                "frames_total": super::metal::sampling::fish_drama3_resident_frames(),
-                "readbacks_total": super::metal::sampling::fish_drama3_resident_readbacks(),
+                "frames_total": super::device::sampling::fish_drama3_resident_frames(),
+                "readbacks_total": super::device::sampling::fish_drama3_resident_readbacks(),
                 "host_fallbacks_total":
-                    super::metal::sampling::fish_drama3_resident_host_fallbacks(),
+                    super::device::sampling::fish_drama3_resident_host_fallbacks(),
             });
+            summary["device_fast_paths"] = super::device::fast_path_counters();
         }
         summary
     }

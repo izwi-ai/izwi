@@ -29,9 +29,10 @@
 //! per-tensor instantiation slack of the 62,245 tensors, and on Metal and
 //! CUDA the fused MoE's expert stacking (4/3 of one layer's experts). CUDA
 //! also authorizes its host staging window. The reference cache is a
-//! deferred host charge. The CPU and Metal load in these forms (a Metal
-//! load holds exactly what this prices, `a_metal_load_holds_what_its_census_prices`);
-//! CUDA's arithmetic prices its admission ahead of its residency.
+//! deferred host charge. Every backend loads in these forms: a Metal load
+//! holds exactly what this prices (`a_metal_load_holds_what_its_census_prices`),
+//! and a CUDA load, which runs Metal's device column in BF16, holds the
+//! same bytes (`a_cuda_load_holds_what_its_census_prices`, on a GPU).
 //!
 //! A machine whose memory can never hold the weights and one request is
 //! refused here, with the numbers, before anything is evicted or read
@@ -62,8 +63,10 @@ use crate::runtime::fish_drama3_capacity::{FishDrama3RowCeilings, ResolvedFishDr
 const GIB: u64 = 1024 * 1024 * 1024;
 const PORTABLE_CONVERSION_SCRATCH_BYTES: u64 = GIB;
 const CUDA_DEVICE_CONVERSION_SCRATCH_BYTES: u64 = 256 * 1024 * 1024;
-/// The CUDA host staging window (qwen36moe's, until Phase 3 measures the
-/// family's own uploads).
+/// The CUDA host staging window: qwen36moe's 8 GiB, kept until a GPU run
+/// measures the family's own uploads (a load holds at most two thirds of one
+/// layer's experts on the host while it stacks them, about 0.5 GiB, beside
+/// one projection's F32 conversion).
 const CUDA_HOST_STAGING_BYTES: u64 = 8 * GIB;
 
 /// `codec.pth`'s metadata as `fish_drama3_codec_memory` prices it. The file
@@ -716,5 +719,41 @@ mod tests {
         assert_eq!(held as u64, estimate.resident_bytes - estimate.parts.codec);
         assert_eq!(model.head().resident_bytes() as u64, estimate.parts.head);
         assert_eq!(model.embedding().host_bytes(), 0);
+    }
+
+    /// What a CUDA load holds is what its census prices, part for part but
+    /// the codec: stacked raw FP8 experts and F32 scales, packed BF16
+    /// projections, F32 small tensors, BF16 tables and head. Runs on a GPU.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_cuda_load_holds_what_its_census_prices() {
+        use crate::models::architectures::fish_drama3::model::tests::{
+            write_synthetic_model_in, StubCodec,
+        };
+        use crate::models::architectures::fish_drama3::synthetic::SyntheticGeometry;
+        use crate::models::architectures::fish_drama3::{FishDrama3Model, FishDrama3ModelOptions};
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let synthetic = write_synthetic_model_in(5, SyntheticGeometry::KernelHeads, |_| {});
+        let model = FishDrama3Model::load_with_codec(
+            synthetic.path(),
+            &device,
+            FishDrama3ModelOptions {
+                config_policy: FishDrama3ConfigPolicy::Synthetic,
+                ..Default::default()
+            },
+            std::sync::Arc::new(StubCodec),
+        )
+        .unwrap();
+        let estimate = census_estimate(&synthetic.config, BackendKind::Cuda).unwrap();
+        let held = model.trunk().resident_bytes()
+            + model.tower().resident_bytes()
+            + model.head().resident_bytes()
+            + model.embedding().device_bytes();
+        assert_eq!(held as u64, estimate.resident_bytes - estimate.parts.codec);
+        assert_eq!(model.head().resident_bytes() as u64, estimate.parts.head);
+        assert_eq!(model.embedding().host_bytes(), 0);
+        assert_eq!(model.kv_dtype(), candle_core::DType::BF16);
     }
 }

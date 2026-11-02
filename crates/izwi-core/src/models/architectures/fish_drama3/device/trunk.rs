@@ -1,22 +1,25 @@
-//! The trunk on Metal: the CPU reference's layers (`trunk/`) in the Metal
-//! forms of `metal/mod.rs`.
+//! The trunk on a device: the CPU reference's layers (`trunk/`) in the
+//! device forms of `device/mod.rs` (16-bit F16 on Metal, BF16 on CUDA).
 //!
-//! * Gated attention: [`MetalAttention`] over the trunk's packed
+//! * Gated attention: [`DeviceAttention`] over the trunk's packed
 //!   `q_proj | k_proj | v_proj`, NeoX RoPE.
-//! * Gated DeltaNet: `in_proj_qkv | in_proj_z` packed F16, `in_proj_a` /
+//! * Gated DeltaNet: `in_proj_qkv | in_proj_z` packed 16-bit, `in_proj_a` /
 //!   `in_proj_b` F32, then per row `gdn_conv` (causal conv + SiLU over the
 //!   request's 3-column history) and `gdn_decode` (q/k L2 norm, the delta
 //!   rule on the F32 state with grouped value heads, the plain-`w` gated
 //!   norm), then `out_proj`. `gdn_decode` takes the published 128-dim
 //!   heads; another head size (the L0 test geometry, the tiny fixture's)
-//!   runs the same rule as a Candle composition.
+//!   runs the same rule as a Candle composition. On CUDA a span of
+//!   [`CHUNKED_MIN_ROWS`] rows or more runs the causal conv over the span
+//!   and the chunked prefill instead, once the load verified it.
 //! * MoE: the F32 router through the fused routing kernel (softmax, top-k,
 //!   renormalised), the weights rounded to BF16 as upstream does, the
 //!   stacked E4M3 experts through the fused gate/up and down kernels (or
-//!   the grouped ones on a long span), the F16 shared expert gated by its
-//!   F32 sigmoid gate. A layer the range probe breached, or every layer
+//!   the grouped ones on a long span), the 16-bit shared expert gated by its
+//!   F32 sigmoid gate. A layer Metal's range probe breached, or every layer
 //!   under `IZWI_FISH_DRAMA3_MOE_BACKEND=loop`, routes on the host and runs
-//!   each expert's rows through the FP8 GEMV with F32 activations.
+//!   each expert's rows through the FP8 GEMV (F32 activations on Metal,
+//!   BF16 on CUDA).
 
 use candle_core::{DType, Device, Tensor};
 
@@ -26,10 +29,17 @@ use super::super::linear::{FishDrama3KernelPhase, FishDrama3Linear};
 use super::super::residency::FishDrama3WeightForm;
 use super::super::trunk::state::FishDrama3LinearState;
 use super::super::trunk::{norm_gain, LayerTrace, NormGain};
-use super::{record, rms_norm, swiglu, vector, MetalAttention, MetalRow, Probe, HALF};
+use super::{
+    add_residual, count_chunked_deltanet_span, count_grouped_moe_span, record, rms_norm, swiglu,
+    vector, DeviceAttention, DeviceForms, DeviceRow, Probe,
+};
 use crate::error::{Error, Result};
 use crate::kernels::cuda::gdn::{self, GdnDecodeSpec};
-use crate::kernels::cuda::moe::{self, RouteSpec, SharedSlot};
+use crate::kernels::cuda::moe::{self, GroupedKernel, RouteSpec, SharedSlot};
+
+/// Rows from which a CUDA span runs the chunked DeltaNet prefill (the
+/// grouped MoE's threshold too): below it the per-row kernels cost less.
+pub(crate) const CHUNKED_MIN_ROWS: usize = 32;
 
 /// How a MoE layer runs its routed experts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +61,10 @@ impl FishDrama3MoeBackend {
 }
 
 fn load_error(message: impl Into<String>) -> Error {
-    Error::ModelLoadError(format!("Fish Audio Drama 3 on Metal: {}", message.into()))
+    Error::ModelLoadError(format!(
+        "Fish Audio Drama 3 on the device: {}",
+        message.into()
+    ))
 }
 
 /// The F32 gain of norm `name` on `device`.
@@ -65,16 +78,17 @@ pub(crate) fn gain(
     vector(&norm_gain(checkpoint, name, width, kind)?, device)
 }
 
-/// The BF16 projection `name` as an F16 layer (cast on the host, uploaded
-/// once).
-pub(crate) fn f16_linear(
+/// The BF16 projection `name` as a 16-bit layer in `forms` (cast on the
+/// host to F16 on Metal, kept BF16 on CUDA; uploaded once).
+pub(crate) fn half_linear(
     checkpoint: &FishDrama3Checkpoint,
     name: &str,
     rows: usize,
     cols: usize,
+    forms: DeviceForms,
     device: &Device,
 ) -> Result<FishDrama3Linear> {
-    FishDrama3Linear::from_f16(checkpoint.bf16_tensor(name, &[rows, cols], DType::F16, device)?)
+    FishDrama3Linear::from_half(checkpoint.bf16_tensor(name, &[rows, cols], forms.half, device)?)
 }
 
 fn f32_linear(
@@ -94,7 +108,7 @@ fn f32_linear(
 }
 
 /// Gated DeltaNet on the device.
-pub(crate) struct MetalDeltaNet {
+pub(crate) struct DeviceDeltaNet {
     /// `[conv_channels + value_width, hidden]`: `in_proj_qkv` then `in_proj_z`.
     qkvz: FishDrama3Linear,
     in_proj_a: FishDrama3Linear,
@@ -110,17 +124,20 @@ pub(crate) struct MetalDeltaNet {
     spec: GdnDecodeSpec,
     /// Whether `gdn_decode` takes the heads (else the Candle composition).
     fused: bool,
+    /// Whether a long span runs the chunked prefill (CUDA, once verified).
+    pub(crate) chunked: bool,
     key_dim: usize,
     channels: usize,
     value_width: usize,
     state_shape: (usize, usize, usize),
 }
 
-impl MetalDeltaNet {
+impl DeviceDeltaNet {
     fn load(
         checkpoint: &FishDrama3Checkpoint,
         layer: usize,
         config: &FishDrama3Config,
+        forms: DeviceForms,
         device: &Device,
     ) -> Result<Self> {
         let t = &config.trunk;
@@ -154,7 +171,7 @@ impl MetalDeltaNet {
                 packed,
                 channels + vw,
                 h,
-                FishDrama3WeightForm::F16,
+                forms.weight_form(),
                 device,
             )?,
             in_proj_a: f32_linear(
@@ -181,7 +198,14 @@ impl MetalDeltaNet {
                 NormGain::Plain,
                 device,
             )?,
-            out_proj: f16_linear(checkpoint, &format!("{x}.out_proj.weight"), h, vw, device)?,
+            out_proj: half_linear(
+                checkpoint,
+                &format!("{x}.out_proj.weight"),
+                h,
+                vw,
+                forms,
+                device,
+            )?,
             spec: GdnDecodeSpec {
                 key_heads: la.key_heads,
                 value_heads: la.value_heads,
@@ -189,6 +213,7 @@ impl MetalDeltaNet {
                 norm_eps: t.rms_norm_eps as f32,
             },
             fused: gdn::supported(device, la.key_head_dim, la.value_head_dim, la.conv_kernel),
+            chunked: false,
             key_dim: la.key_head_dim,
             channels,
             value_width: vw,
@@ -257,12 +282,103 @@ impl MetalDeltaNet {
         Ok(((o * gate)?.reshape(hv * dv)?, s))
     }
 
+    /// One request's span through the causal conv over the span and the
+    /// chunked prefill (FLA's chunk rule, `kernels::cuda`): the per-row
+    /// kernels' rule with the span's rows resolved a chunk at a time.
+    /// `packed` is `[n, conv_channels + value_width]`, `alpha` and `beta`
+    /// `[n, value_heads]` F32. Returns the gated output `[n, value_width]`
+    /// F32 and advances `state`, or `None` (nothing moved) when the kernels
+    /// do not take these tensors.
+    fn chunked_span(
+        &self,
+        packed: &Tensor,
+        alpha: &Tensor,
+        beta: &Tensor,
+        state: &mut FishDrama3LinearState,
+    ) -> Result<Option<Tensor>> {
+        let (c, vw) = (self.channels, self.value_width);
+        let (hv, dk, dv) = self.state_shape;
+        let hk = self.spec.key_heads;
+        let kw = hk * dk;
+        let n = packed.dim(0)?;
+        let mixed = packed
+            .narrow(1, 0, c)?
+            .to_dtype(DType::F32)?
+            .contiguous()?
+            .reshape((1, n, c))?;
+        // The ring oldest first, as `[channels, columns]`.
+        let history = Tensor::stack(&state.conv.columns()?, 1)?;
+        let Some((conv, final_history)) =
+            crate::kernels::cuda::try_qwen35_causal_conv_sequence(&mixed, &self.conv, &history)
+        else {
+            return Ok(None);
+        };
+        let conv = conv.reshape((n, c))?;
+        let l2 = |t: Tensor| -> Result<Tensor> {
+            let norm = (t.sqr()?.sum_keepdim(2)?
+                + f64::from(super::super::trunk::deltanet::L2_NORM_EPS))?
+            .sqrt()?;
+            Ok(t.broadcast_div(&norm)?)
+        };
+        // Value head j reads key head j / (value_heads / key_heads).
+        let expand = |t: Tensor| -> Result<Tensor> {
+            Ok(t.unsqueeze(2)?
+                .broadcast_as((n, hk, hv / hk, dk))?
+                .reshape((1, n, hv, dk))?
+                .contiguous()?)
+        };
+        let q = expand(l2(conv
+            .narrow(1, 0, kw)?
+            .contiguous()?
+            .reshape((n, hk, dk))?)?)?;
+        let k = expand(l2(conv
+            .narrow(1, kw, kw)?
+            .contiguous()?
+            .reshape((n, hk, dk))?)?)?;
+        let v = conv
+            .narrow(1, 2 * kw, hv * dv)?
+            .contiguous()?
+            .reshape((1, n, hv, dv))?;
+        // g = -exp(A_log) * softplus(a + dt_bias), softplus without overflow;
+        // beta = sigmoid(b).
+        let gate_in = alpha.broadcast_add(&self.dt_bias)?;
+        let softplus = (gate_in.relu()? + (gate_in.abs()?.neg()?.exp()? + 1.0)?.log()?)?;
+        let g = softplus
+            .broadcast_mul(&self.neg_a)?
+            .contiguous()?
+            .reshape((1, n, hv))?;
+        let b = candle_nn::ops::sigmoid(beta)?
+            .contiguous()?
+            .reshape((1, n, hv))?;
+        let initial = state.recurrent().reshape((1, hv, dk, dv))?;
+        let Some((out, next)) =
+            crate::kernels::cuda::try_chunked_deltanet_recurrence(&q, &k, &v, &g, &b, &initial)
+        else {
+            return Ok(None);
+        };
+        let out = out.contiguous()?.reshape((n * hv, dv))?;
+        let normed = candle_nn::ops::rms_norm(&out, &self.norm, self.spec.norm_eps)?;
+        let z = packed
+            .narrow(1, c, vw)?
+            .to_dtype(DType::F32)?
+            .contiguous()?
+            .reshape((n * hv, dv))?;
+        let gated = (normed * candle_nn::ops::silu(&z)?)?.reshape((n, vw))?;
+        // The ring's next columns are the span's last raw inputs; the state
+        // is copied out of the kernels' packed output, so the span's outputs
+        // are not kept alive with it.
+        state.conv.set_history(&final_history.t()?.contiguous()?)?;
+        state.set_recurrent_tensor(next.reshape(self.state_shape)?.force_contiguous()?)?;
+        Ok(Some(gated))
+    }
+
     /// The mixer output `[N, hidden]` in `act` of the normed rows `x`;
-    /// `states[r]` is request `r`'s state of this layer, advanced row by row.
+    /// `states[r]` is request `r`'s state of this layer, advanced row by row
+    /// (or, on CUDA, one long span through [`Self::chunked_span`]).
     fn forward(
         &self,
         x: &Tensor,
-        rows: &[MetalRow<'_>],
+        rows: &[DeviceRow<'_>],
         states: &mut [&mut FishDrama3LinearState],
         phase: FishDrama3KernelPhase,
         act: DType,
@@ -273,6 +389,19 @@ impl MetalDeltaNet {
         record(probe, || "qkvz".into(), &packed);
         let alpha = self.in_proj_a.forward_device(x, phase, DType::F32)?;
         let beta = self.in_proj_b.forward_device(x, phase, DType::F32)?;
+        if self.chunked
+            && phase == FishDrama3KernelPhase::Span
+            && rows.len() == 1
+            && rows[0].rows >= CHUNKED_MIN_ROWS
+        {
+            if let Some(gated) = self.chunked_span(&packed, &alpha, &beta, states[0])? {
+                count_chunked_deltanet_span();
+                record(probe, || "deltanet_core".into(), &gated);
+                let out = self.out_proj.forward_device(&gated, phase, act)?;
+                record(probe, || "deltanet_out".into(), &out);
+                return Ok(out);
+            }
+        }
         let mut outputs = Vec::with_capacity(x.dim(0)?);
         let mut t = 0;
         for (row, state) in rows.iter().zip(states.iter_mut()) {
@@ -315,7 +444,7 @@ impl MetalDeltaNet {
 }
 
 /// The sparse MoE block on the device.
-pub(crate) struct MetalMoe {
+pub(crate) struct DeviceMoe {
     /// `[experts, hidden]` F32.
     router: FishDrama3Linear,
     /// `[1, hidden]` F32.
@@ -336,14 +465,19 @@ pub(crate) struct MetalMoe {
     hidden: usize,
     intermediate: usize,
     pub(crate) backend: FishDrama3MoeBackend,
+    /// The grouped span kernels CUDA runs: the warp kernels until the load
+    /// verified the tensor-core tiles (Metal has one form).
+    pub(crate) grouped: GroupedKernel,
+    forms: DeviceForms,
 }
 
-impl MetalMoe {
+impl DeviceMoe {
     fn load(
         checkpoint: &FishDrama3Checkpoint,
         layer: usize,
         config: &FishDrama3Config,
         backend: FishDrama3MoeBackend,
+        forms: DeviceForms,
         device: &Device,
     ) -> Result<Self> {
         let t = &config.trunk;
@@ -357,7 +491,7 @@ impl MetalMoe {
             shared_slot_id: 0,
             norm_topk: true,
         };
-        if block != 128 || !moe::supported(device, HALF, h, inter, spec.slots()) {
+        if block != 128 || !moe::supported(device, forms.half, h, inter, spec.slots()) {
             return Err(load_error(format!(
                 "the fused MoE takes 128×128 FP8 blocks over hidden and expert widths that are \
                  multiples of 128 and at most {} slots; this checkpoint has {block}-blocks, \
@@ -405,15 +539,30 @@ impl MetalMoe {
                 h,
                 device,
             )?,
-            shared_gate_proj: f16_linear(
+            shared_gate_proj: half_linear(
                 checkpoint,
                 &format!("{s}.gate_proj.weight"),
                 si,
                 h,
+                forms,
                 device,
             )?,
-            shared_up: f16_linear(checkpoint, &format!("{s}.up_proj.weight"), si, h, device)?,
-            shared_down: f16_linear(checkpoint, &format!("{s}.down_proj.weight"), h, si, device)?,
+            shared_up: half_linear(
+                checkpoint,
+                &format!("{s}.up_proj.weight"),
+                si,
+                h,
+                forms,
+                device,
+            )?,
+            shared_down: half_linear(
+                checkpoint,
+                &format!("{s}.down_proj.weight"),
+                h,
+                si,
+                forms,
+                device,
+            )?,
             w13,
             s13,
             w2,
@@ -422,6 +571,8 @@ impl MetalMoe {
             hidden: h,
             intermediate: inter,
             backend,
+            grouped: GroupedKernel::Warp,
+            forms,
         })
     }
 
@@ -476,13 +627,23 @@ impl MetalMoe {
         let k = self.spec.top_k;
         let routed = match self.backend {
             FishDrama3MoeBackend::Fused => {
-                let x16 = x.to_dtype(HALF)?.contiguous()?;
+                let x16 = x.to_dtype(self.forms.half)?.contiguous()?;
+                // Never in a step: a step's rows must not share a kernel
+                // choice that depends on how many there are.
                 let y = if phase == FishDrama3KernelPhase::Span
                     && n >= moe::GROUPED_MIN_TOKENS
                     && moe::grouped_supported(self.hidden, self.intermediate, self.spec.num_experts)
                 {
-                    moe::fp8_moe_grouped(
-                        &x16, &routing, k, &self.w13, &self.s13, &self.w2, &self.s2,
+                    count_grouped_moe_span();
+                    moe::fp8_moe_grouped_with(
+                        &x16,
+                        &routing,
+                        k,
+                        &self.w13,
+                        &self.s13,
+                        &self.w2,
+                        &self.s2,
+                        self.grouped,
                     )?
                 } else {
                     let activations = moe::fp8_gate_up(&x16, &routing, k, &self.w13, &self.s13)?;
@@ -492,7 +653,9 @@ impl MetalMoe {
                 record(probe, || "routed".into(), &y);
                 y.to_dtype(DType::F32)?
             }
-            FishDrama3MoeBackend::Loop => self.expert_loop(&x.to_dtype(DType::F32)?, &routing)?,
+            FishDrama3MoeBackend::Loop => {
+                self.expert_loop(&x.to_dtype(self.forms.loop_activations())?, &routing)?
+            }
         };
         let gate = self.shared_gate_proj.forward_device(x, phase, act)?;
         let up = self.shared_up.forward_device(x, phase, act)?;
@@ -505,8 +668,9 @@ impl MetalMoe {
         Ok((routed + shared.to_dtype(DType::F32)?.broadcast_mul(&shared_gate)?)?)
     }
 
-    /// Host routing and one FP8 GEMV pair per expert over its rows, F32
-    /// activations; the outputs combine in rank order as the CPU's do.
+    /// Host routing and one FP8 GEMV pair per expert over its rows in `x`'s
+    /// dtype (F32 on Metal, BF16 on CUDA); the outputs combine in F32 in
+    /// rank order as the CPU's do.
     fn expert_loop(&self, x: &Tensor, routing: &Tensor) -> Result<Tensor> {
         let (n, h, inter) = (x.dim(0)?, self.hidden, self.intermediate);
         let k = self.spec.top_k;
@@ -543,7 +707,7 @@ impl MetalMoe {
             let activations = swiglu(
                 &gate_up.narrow(1, 0, inter)?,
                 &gate_up.narrow(1, inter, inter)?,
-                DType::F32,
+                x.dtype(),
             )?
             .contiguous()?;
             outputs.push(crate::kernels::cuda::fp8::block_fp8_projection(
@@ -557,6 +721,7 @@ impl MetalMoe {
             at += list.len();
         }
         let y = Tensor::cat(&outputs, 0)?
+            .to_dtype(DType::F32)?
             .index_select(&Tensor::from_vec(order, n * k, device)?, 0)?
             .reshape((n, k, h))?;
         let weights = Tensor::from_vec(
@@ -578,31 +743,31 @@ impl MetalMoe {
     }
 }
 
-pub(crate) enum MetalMixer {
+pub(crate) enum DeviceMixer {
     Attention {
         slot: usize,
-        attention: MetalAttention,
+        attention: DeviceAttention,
     },
     DeltaNet {
         slot: usize,
-        net: MetalDeltaNet,
+        net: DeviceDeltaNet,
     },
 }
 
-pub(crate) struct MetalLayer {
+pub(crate) struct DeviceLayer {
     input_norm: Tensor,
     post_norm: Tensor,
-    pub(crate) mixer: MetalMixer,
-    pub(crate) moe: MetalMoe,
+    pub(crate) mixer: DeviceMixer,
+    pub(crate) moe: DeviceMoe,
     /// F16, or F32 once the range probe breached the layer.
     pub(crate) act: DType,
 }
 
-impl MetalLayer {
+impl DeviceLayer {
     fn resident_bytes(&self) -> usize {
         let mixer = match &self.mixer {
-            MetalMixer::Attention { attention, .. } => attention.resident_bytes(),
-            MetalMixer::DeltaNet { net, .. } => net.resident_bytes(),
+            DeviceMixer::Attention { attention, .. } => attention.resident_bytes(),
+            DeviceMixer::DeltaNet { net, .. } => net.resident_bytes(),
         };
         mixer
             + self.moe.resident_bytes()
@@ -610,22 +775,24 @@ impl MetalLayer {
     }
 }
 
-/// The trunk's weights on Metal.
-pub(crate) struct MetalTrunk {
-    pub(crate) layers: Vec<MetalLayer>,
+/// The trunk's weights on the device.
+pub(crate) struct DeviceTrunk {
+    pub(crate) layers: Vec<DeviceLayer>,
     final_norm: Tensor,
-    /// The final norm's dtype (F32 once the probe breached it).
+    /// The final norm's dtype (F32 once Metal's probe breached it).
     pub(crate) final_act: DType,
     eps: f32,
+    pub(crate) forms: DeviceForms,
 }
 
-impl MetalTrunk {
+impl DeviceTrunk {
     pub(crate) fn load(
         checkpoint: &FishDrama3Checkpoint,
         config: &FishDrama3Config,
         moe_backend: FishDrama3MoeBackend,
         device: &Device,
     ) -> Result<Self> {
+        let forms = DeviceForms::of(device)?;
         let t = &config.trunk;
         let h = t.hidden;
         let mut attention_slots = 0;
@@ -652,10 +819,10 @@ impl MetalTrunk {
                                 NormGain::ZeroCentred,
                             )
                         };
-                        MetalMixer::Attention {
+                        DeviceMixer::Attention {
                             slot: attention_slots - 1,
                             // `q_proj` is already `[q_h | gate_h]` per head.
-                            attention: MetalAttention::new(
+                            attention: DeviceAttention::new(
                                 read("q_proj", 2 * a.q_width(), h)?,
                                 &read("k_proj", a.kv_width(), h)?,
                                 &read("v_proj", a.kv_width(), h)?,
@@ -664,19 +831,20 @@ impl MetalTrunk {
                                 &gain_of("k_norm")?,
                                 a,
                                 t.rms_norm_eps as f32,
+                                forms,
                                 device,
                             )?,
                         }
                     }
                     FishDrama3LayerKind::LinearAttention => {
                         linear_slots += 1;
-                        MetalMixer::DeltaNet {
+                        DeviceMixer::DeltaNet {
                             slot: linear_slots - 1,
-                            net: MetalDeltaNet::load(checkpoint, layer, config, device)?,
+                            net: DeviceDeltaNet::load(checkpoint, layer, config, forms, device)?,
                         }
                     }
                 };
-                Ok(MetalLayer {
+                Ok(DeviceLayer {
                     input_norm: gain(
                         checkpoint,
                         &format!("{l}.input_layernorm.weight"),
@@ -692,8 +860,8 @@ impl MetalTrunk {
                         device,
                     )?,
                     mixer,
-                    moe: MetalMoe::load(checkpoint, layer, config, moe_backend, device)?,
-                    act: HALF,
+                    moe: DeviceMoe::load(checkpoint, layer, config, moe_backend, forms, device)?,
+                    act: forms.half,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -706,29 +874,30 @@ impl MetalTrunk {
                 NormGain::ZeroCentred,
                 device,
             )?,
-            final_act: HALF,
+            final_act: forms.half,
             eps: t.rms_norm_eps as f32,
+            forms,
         })
     }
 
     pub(crate) fn resident_bytes(&self) -> usize {
         self.layers
             .iter()
-            .map(MetalLayer::resident_bytes)
+            .map(DeviceLayer::resident_bytes)
             .sum::<usize>()
             + self.final_norm.elem_count() * 4
     }
 
-    /// Layer `index` over the F32 residual `x` (`[N, hidden]`, `rows` in
-    /// order), with `act` in place of the layer's own when given; returns
-    /// the residual after it. `states[r]` holds request `r`'s DeltaNet
+    /// Layer `index` over the residual `x` (`[N, hidden]`, F32 on Metal and
+    /// BF16 on CUDA, `rows` in order), with `act` in place of the layer's
+    /// own when given; returns the residual after it. `states[r]` holds request `r`'s DeltaNet
     /// states. `trace` records the layer as the CPU's traced forwards do.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn layer(
         &self,
         index: usize,
         x: &Tensor,
-        rows: &mut [MetalRow<'_>],
+        rows: &mut [DeviceRow<'_>],
         states: &mut [&mut [FishDrama3LinearState]],
         phase: FishDrama3KernelPhase,
         act: Option<DType>,
@@ -740,10 +909,10 @@ impl MetalTrunk {
         let normed = rms_norm(x, &layer.input_norm, self.eps, act)?;
         record(probe, || "input_normed".into(), &normed);
         let mixed = match &layer.mixer {
-            MetalMixer::Attention { slot, attention } => {
+            DeviceMixer::Attention { slot, attention } => {
                 attention.forward(&normed, rows, *slot, phase, act, probe)?
             }
-            MetalMixer::DeltaNet { slot, net } => {
+            DeviceMixer::DeltaNet { slot, net } => {
                 let mut layer_states = states
                     .iter_mut()
                     .map(|states| {
@@ -756,11 +925,11 @@ impl MetalTrunk {
             }
         };
         let mixed = mixed.to_dtype(DType::F32)?;
-        let x = (x + &mixed)?;
+        let x = add_residual(x, &mixed)?;
         let normed = rms_norm(&x, &layer.post_norm, self.eps, act)?;
         record(probe, || "post_normed".into(), &normed);
         let moe = layer.moe.forward(&normed, phase, act, probe)?;
-        let x = (x + &moe)?;
+        let x = add_residual(&x, &moe)?;
         record(probe, || "residual".into(), &x);
         if let Some(trace) = trace {
             let host = |t: &Tensor| -> Result<Vec<f32>> {
@@ -787,17 +956,18 @@ impl MetalTrunk {
         )
     }
 
-    /// Every layer over the F32 embeddings `x` (`[N, hidden]`), then the
-    /// final norm: the final-norm hidden `[N, hidden]` F32.
+    /// Every layer over the embeddings `x` (`[N, hidden]`, taken into the
+    /// residual's dtype), then the final norm: the final-norm hidden `[N,
+    /// hidden]` F32.
     pub(crate) fn run(
         &self,
         x: Tensor,
-        rows: &mut [MetalRow<'_>],
+        rows: &mut [DeviceRow<'_>],
         states: &mut [&mut [FishDrama3LinearState]],
         phase: FishDrama3KernelPhase,
         mut trace: Option<&mut LayerTrace>,
     ) -> Result<Tensor> {
-        let mut x = x.to_dtype(DType::F32)?;
+        let mut x = x.to_dtype(self.forms.residual)?;
         for index in 0..self.layers.len() {
             x = self.layer(
                 index,

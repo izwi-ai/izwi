@@ -729,7 +729,13 @@ run_cargo_cuda_device_profile() {
     # These are real-device checks, including new projection, sampling,
     # graph-lifetime and tiled-loading probes. A requested CUDA device may not
     # silently fall back to CPU and still produce a certification record.
-    for suite in kernels::cuda models::architectures::qwen38 models::shared::attention::physical; do
+    # Fish Audio Drama 3's CUDA column: component parity, batch invariance at
+    # widths 1-8, the load checks, device sampling, the runtime at widths 1
+    # and 8 and the load/census agreement (the row-invariant GEMV and the
+    # row-length split decode run under kernels::cuda).
+    for suite in kernels::cuda models::architectures::qwen38 models::shared::attention::physical \
+        models::architectures::fish_drama3::cuda models::architectures::fish_drama3::device \
+        runtime::fish_drama3_tests::cuda a_cuda_load_holds_what_its_census_prices; do
         IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test --locked -p izwi-core \
             --features "${core_features}" "${suite}" --lib -- --test-threads=1
     done

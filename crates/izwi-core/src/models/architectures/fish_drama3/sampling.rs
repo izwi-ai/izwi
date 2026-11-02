@@ -46,7 +46,7 @@
 //! takes and restores (§7.2). A draw consumes one exponential per candidate,
 //! masked or not, so the stream stays aligned across policies.
 //!
-//! Device-resident sampling (`metal::sampling`) slots in behind the same
+//! Device-resident sampling (`device::sampling`) slots in behind the same
 //! split: the noise comes from [`FishDrama3RowSampler::main_noise`] and
 //! [`FishDrama3RowSampler::exponentials`] in the order the host draws take
 //! it, the selection is [`race`]'s rule over the device's logits, and RAS

@@ -53,8 +53,9 @@
 //! follow the CPU policy (Q8_0 after the self-check, or F32), the code
 //! embeddings stay BF16 on the host, and `extra` reads the trunk
 //! embedding's codebook table ([`FishDrama3Embedding::add_codebook_row`]).
-//! On Metal the layers run in the forms of `metal::tower`, and a decode
-//! step samples its codes on the device (`metal::sampling`).
+//! On Metal and CUDA the layers run in the device column's forms
+//! (`device::tower`), and a decode step samples its codes on the device
+//! (`device::sampling`).
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -67,11 +68,11 @@ use super::checkpoint::{
     tower_head, tower_residual_layer, tower_shared_layer, FishDrama3Checkpoint,
 };
 use super::config::{FishDrama3Config, FishDrama3TokenIds, FishDrama3TowerConfig};
+use super::device::sampling::{count_fallback, count_frames, device_cap};
+use super::device::tower::{DeviceStepCodes, DeviceTower};
+use super::device::DeviceRow;
 use super::embed::{bf16_table, FishDrama3Embedding, TRUNK_CODEBOOK};
 use super::linear::{FishDrama3KernelPhase, FishDrama3Linear};
-use super::metal::sampling::{count_fallback, count_frames, device_cap};
-use super::metal::tower::{MetalStepCodes, MetalTower};
-use super::metal::MetalRow;
 use super::precision::{decide_cpu_forms, FishDrama3PrecisionReport, Q8_0_TOLERANCE};
 use super::residency::{
     FishDrama3ClassForms, FishDrama3CpuPrecision, FishDrama3ProjectionClass, FishDrama3Residency,
@@ -311,8 +312,8 @@ enum Weights {
         /// `[V, dim]` each; head `j` follows residual layer `j`.
         heads: Vec<FishDrama3Linear>,
     },
-    /// The Metal forms (`metal::tower`).
-    Metal(MetalTower),
+    /// The device column's forms on Metal or CUDA (`device::tower`).
+    Device(DeviceTower),
 }
 
 pub struct FishDrama3Tower {
@@ -367,8 +368,8 @@ pub fn check_lengths(trunk_len: usize, tower_len: usize, prompt_rows: usize) -> 
 
 impl FishDrama3Tower {
     /// Loads the tower on `device`: on the CPU after the Q8_0 self-check
-    /// decides each tower class's form; on Metal in its forms, which the
-    /// model's load-time checks may then move per layer.
+    /// decides each tower class's form; on Metal or CUDA in the device
+    /// forms, which the model's load-time checks may then move per layer.
     pub fn load(
         checkpoint: &FishDrama3Checkpoint,
         config: &FishDrama3Config,
@@ -376,8 +377,8 @@ impl FishDrama3Tower {
         options: FishDrama3TowerOptions,
     ) -> Result<Self> {
         let residency = FishDrama3Residency::of(device);
-        residency.require_implemented()?;
-        if residency == FishDrama3Residency::Metal {
+        residency.require_supported(device)?;
+        if residency != FishDrama3Residency::Cpu {
             let forms = FishDrama3ClassForms::of(residency);
             let precision = FishDrama3PrecisionReport {
                 forms: FishDrama3ProjectionClass::TOWER
@@ -386,10 +387,10 @@ impl FishDrama3Tower {
                     .collect(),
                 ..Default::default()
             };
-            let metal = MetalTower::load(checkpoint, config, device)?;
+            let weights = DeviceTower::load(checkpoint, config, device)?;
             return Ok(Self::assemble(
                 config,
-                Weights::Metal(metal),
+                Weights::Device(weights),
                 device,
                 precision,
             ));
@@ -475,17 +476,17 @@ impl FishDrama3Tower {
         tower
     }
 
-    /// The Metal weights, for the load-time checks.
-    pub(crate) fn metal(&self) -> Option<&MetalTower> {
+    /// The device weights, for the load-time checks.
+    pub(crate) fn device_tower(&self) -> Option<&DeviceTower> {
         match &self.weights {
-            Weights::Metal(metal) => Some(metal),
+            Weights::Device(weights) => Some(weights),
             Weights::Host { .. } => None,
         }
     }
 
-    pub(crate) fn metal_mut(&mut self) -> Option<&mut MetalTower> {
+    pub(crate) fn device_tower_mut(&mut self) -> Option<&mut DeviceTower> {
         match &mut self.weights {
-            Weights::Metal(metal) => Some(metal),
+            Weights::Device(weights) => Some(weights),
             Weights::Host { .. } => None,
         }
     }
@@ -498,7 +499,7 @@ impl FishDrama3Tower {
     fn host(&self) -> Result<(&[TowerLayer], &[FishDrama3Linear])> {
         match &self.weights {
             Weights::Host { layers, heads } => Ok((layers, heads)),
-            Weights::Metal(_) => Err(Error::InferenceError(
+            Weights::Device(_) => Err(Error::InferenceError(
                 "the Fish Audio Drama 3 host tower runs the CPU weights".into(),
             )),
         }
@@ -513,19 +514,23 @@ impl FishDrama3Tower {
         &self.attention_layers
     }
 
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
     pub fn precision_report(&self) -> &FishDrama3PrecisionReport {
         &self.precision
     }
 
     /// Resident bytes of the weights (the code embeddings on the host on
-    /// the CPU, on the device on Metal).
+    /// the CPU, on the device on Metal and CUDA).
     pub fn resident_bytes(&self) -> usize {
         match &self.weights {
             Weights::Host { layers, heads } => {
                 layers.iter().map(TowerLayer::resident_bytes).sum::<usize>()
                     + heads.iter().map(|h| h.resident_bytes()).sum::<usize>()
             }
-            Weights::Metal(metal) => metal.resident_bytes(),
+            Weights::Device(weights) => weights.resident_bytes(),
         }
     }
 
@@ -763,9 +768,9 @@ impl FishDrama3Tower {
         n: usize,
         phase: FishDrama3KernelPhase,
     ) -> Result<Vec<f32>> {
-        if let Weights::Metal(metal) = &self.weights {
+        if let Weights::Device(weights) = &self.weights {
             let h = Tensor::from_slice(h, (n, self.config.dim), &self.device)?;
-            return Ok(metal
+            return Ok(weights
                 .head_logits(index, &h, phase, None)?
                 .flatten_all()?
                 .to_device(&Device::Cpu)?
@@ -836,8 +841,8 @@ impl FishDrama3Tower {
         trace: Option<&mut Vec<Vec<f32>>>,
     ) -> Result<()> {
         self.check_embedding(embedding)?;
-        if let Weights::Metal(metal) = &self.weights {
-            return self.span_metal(metal, embedding, hidden, frames, start_pos, cache, trace);
+        if let Weights::Device(weights) = &self.weights {
+            return self.span_device(weights, embedding, hidden, frames, start_pos, cache, trace);
         }
         let (x, n) = self.host_rows(hidden, None)?;
         let width = self.config.frame_width();
@@ -996,8 +1001,8 @@ impl FishDrama3Tower {
         rows: Vec<(&mut PhysicalPagedKvCache, &[u32], u32, Codes<'a>)>,
     ) -> Result<Vec<(Vec<u32>, Codes<'a>)>> {
         self.check_embedding(embedding)?;
-        if let Weights::Metal(metal) = &self.weights {
-            return self.steps_metal(metal, embedding, hidden, rows);
+        if let Weights::Device(weights) = &self.weights {
+            return self.steps_device(weights, embedding, hidden, rows);
         }
         let (x, count) = self.host_rows(hidden, Some(rows.len()))?;
         if count == 0 {
@@ -1162,9 +1167,9 @@ impl FishDrama3Tower {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn span_metal(
+    fn span_device(
         &self,
-        metal: &MetalTower,
+        weights: &DeviceTower,
         embedding: &FishDrama3Embedding,
         hidden: &Tensor,
         frames: &[u32],
@@ -1187,13 +1192,13 @@ impl FishDrama3Tower {
         let hidden = hidden.to_device(&self.device)?.to_dtype(DType::F32)?;
         let mut prepared = cache.prepare_append(start_pos, n)?;
         let result = {
-            let mut rows = [MetalRow {
+            let mut rows = [DeviceRow {
                 start: start_pos,
                 rows: n,
                 cache: &*cache,
                 prepared: &mut prepared,
             }];
-            metal.span(
+            weights.span(
                 embedding,
                 &hidden,
                 &frames[..n * fw],
@@ -1230,13 +1235,13 @@ impl FishDrama3Tower {
         }
     }
 
-    /// A decode step on Metal. Sampled rows draw their codes on the device
+    /// A decode step on a device. Sampled rows draw their codes on the device
     /// (each row's exponentials taken from its sampler in head order, as
     /// the host draws them) unless a row's head cap exceeds the device's
     /// ranks; forced rows inject their label's codes.
-    fn steps_metal<'a>(
+    fn steps_device<'a>(
         &self,
-        metal: &MetalTower,
+        weights: &DeviceTower,
         embedding: &FishDrama3Embedding,
         hidden: &Tensor,
         rows: Vec<(&mut PhysicalPagedKvCache, &[u32], u32, Codes<'a>)>,
@@ -1310,13 +1315,13 @@ impl FishDrama3Tower {
             Codes::Forced { .. } => false,
         });
         let vocab = self.config.codebook_vocab;
-        let heads = metal.heads();
+        let heads = weights.heads();
         let hidden = hidden.to_device(&self.device)?.to_dtype(DType::F32)?;
         let result = (|| {
             let mut device_rows = caches
                 .iter()
                 .zip(prepared.iter_mut())
-                .map(|(cache, step)| MetalRow {
+                .map(|(cache, step)| DeviceRow {
                     start: cache.context_len(),
                     rows: 1,
                     cache,
@@ -1335,14 +1340,14 @@ impl FishDrama3Tower {
                     }
                 }
                 let noise = Tensor::from_vec(noise, (count, heads, vocab), &self.device)?;
-                return metal.step(
+                return weights.step(
                     embedding,
                     &hidden,
                     &inputs,
                     &c0,
                     &labelled,
                     &mut device_rows,
-                    MetalStepCodes::Device { policies, noise },
+                    DeviceStepCodes::Device { policies, noise },
                 );
             }
             let mut pick = |head: usize, logits: &Tensor| -> Result<Vec<u32>> {
@@ -1366,14 +1371,14 @@ impl FishDrama3Tower {
                     })
                     .collect()
             };
-            metal.step(
+            weights.step(
                 embedding,
                 &hidden,
                 &inputs,
                 &c0,
                 &labelled,
                 &mut device_rows,
-                MetalStepCodes::Host(&mut pick),
+                DeviceStepCodes::Host(&mut pick),
             )
         })();
         let (codes, outputs) = match result {

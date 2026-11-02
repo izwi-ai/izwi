@@ -1,18 +1,18 @@
 //! Linear layers of the family in their resident form.
 //!
-//! | Weight | CPU (D4) | Metal | CUDA (Phase 3) |
+//! | Weight | CPU (D4) | Metal | CUDA |
 //! |---|---|---|---|
-//! | Routed experts (E4M3 × F32 block scales) | Q8_0 of the exact F32 dequantization | raw E4M3 + scales (`trunk::metal`) | raw E4M3 + scales |
+//! | Routed experts (E4M3 × F32 block scales) | Q8_0 of the exact F32 dequantization | raw E4M3 + scales (`device::trunk`) | raw E4M3 + scales (`device::trunk`) |
 //! | Dense trunk projections, shared expert (BF16) | Q8_0 | F16 | BF16 |
 //! | A projection class whose Q8_0 self-check fails | F32 | — | — |
 //! | Router, DeltaNet gates | F32 | F32 | F32 |
 //!
 //! Every layer takes and returns F32 activations `[m, in]` → `[m, out]`
-//! through [`FishDrama3Linear::forward`]; a Metal layer also runs
+//! through [`FishDrama3Linear::forward`]; a device layer also runs
 //! [`FishDrama3Linear::forward_device`], whose activations stay on the
-//! device in the layer's activation dtype (F16, or F32 for a layer the
-//! load-time range probe moved). The caller names the
-//! [`FishDrama3KernelPhase`].
+//! device in the layer's activation dtype (F16 on Metal or BF16 on CUDA,
+//! or F32 for a Metal layer the load-time range probe moved). The caller
+//! names the [`FishDrama3KernelPhase`].
 //!
 //! On the CPU a Q8_0 step runs
 //! Candle's row-wise Q8_0 kernel (its activations are quantized to Q8_0
@@ -28,11 +28,15 @@
 //! On Metal a step runs one GEMV per row (§7.4: at widths 1–2 the weights
 //! are read once per row either way), each over a contiguous row, so no row
 //! shares a reduction with another; a span runs one tile GEMM over the
-//! span's rows.
+//! span's rows. On CUDA a step of several rows runs the row-invariant
+//! multi-row GEMV (`kernels::cuda::row_gemv`: one fixed reduction order per
+//! row, the weights read once for all of them) once its device check has
+//! enabled it, else one GEMV per row as on Metal; a span runs one cuBLAS
+//! GEMM.
 
 use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{DType, Device, Module, Tensor};
-use half::f16;
+use half::{bf16, f16};
 
 use super::residency::FishDrama3WeightForm;
 use crate::error::{Error, Result};
@@ -56,8 +60,9 @@ pub enum FishDrama3KernelPhase {
 enum Weight {
     Q8_0(QMatMul),
     F32(Tensor),
-    /// `[rows, cols]` F16 on the layer's device (Metal).
-    F16(Tensor),
+    /// `[rows, cols]` 16-bit on the layer's device: F16 on Metal, BF16 on
+    /// CUDA.
+    Half(Tensor),
 }
 
 #[cfg(test)]
@@ -80,6 +85,42 @@ pub(crate) fn with_split_k_steps<R>(f: impl FnOnce() -> R) -> R {
     SPLIT_K_STEPS.with(|flag| flag.set(true));
     let _reset = Reset;
     f()
+}
+
+/// Whether this thread's steps run the RED split (always false outside
+/// tests).
+fn split_k_steps() -> bool {
+    #[cfg(test)]
+    {
+        SPLIT_K_STEPS.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// A CUDA step's projection through the row-invariant multi-row GEMV, once
+/// its device check has enabled it: `x` rounded to the weights' 16-bit dtype
+/// (16-bit activations as they are, for F32 weights), the output in `act`.
+/// `None` when the kernel is off or does not take the operands; the caller
+/// then runs one GEMV per row.
+fn row_invariant_step(x: &Tensor, w: &Tensor, act: DType) -> Result<Option<Tensor>> {
+    use crate::kernels::cuda::row_gemv::{self, RowGemvWeight};
+    if !row_gemv::enabled() {
+        return Ok(None);
+    }
+    let input = match w.dtype() {
+        DType::F16 | DType::BF16 => w.dtype(),
+        _ if matches!(x.dtype(), DType::F16 | DType::BF16) => x.dtype(),
+        _ => return Ok(None),
+    };
+    if !row_gemv::supported(input, RowGemvWeight::Dense(w), act) {
+        return Ok(None);
+    }
+    let y = row_gemv::row_gemv(&x.to_dtype(input)?, RowGemvWeight::Dense(w), act)?;
+    super::device::count_step_row_gemv();
+    Ok(Some(y))
 }
 
 /// A loaded projection `[rows, cols]` (no bias: the trunk has none).
@@ -180,33 +221,39 @@ impl FishDrama3Linear {
             FishDrama3WeightForm::F32 => {
                 Weight::F32(Tensor::from_vec(values, (rows, cols), device)?)
             }
-            FishDrama3WeightForm::F16 => Weight::F16(Tensor::from_vec(
+            FishDrama3WeightForm::F16 => Weight::Half(Tensor::from_vec(
                 values.into_iter().map(f16::from_f32).collect::<Vec<_>>(),
+                (rows, cols),
+                device,
+            )?),
+            FishDrama3WeightForm::Bf16 => Weight::Half(Tensor::from_vec(
+                values.into_iter().map(bf16::from_f32).collect::<Vec<_>>(),
                 (rows, cols),
                 device,
             )?),
             other => {
                 return Err(load_error(format!(
-                    "the {other:?} form has no implementation yet (Phase 3)"
+                    "the {other:?} form is not a dense projection's (experts stack per layer)"
                 )))
             }
         };
         Ok(Self { weight, rows, cols })
     }
 
-    /// An F16 layer over `weight`, `[rows, cols]` F16 already on its device
-    /// (a BF16 checkpoint tensor cast on the host and uploaded once).
-    pub fn from_f16(weight: Tensor) -> Result<Self> {
+    /// A 16-bit layer over `weight`, `[rows, cols]` F16 or BF16 already on
+    /// its device (a BF16 checkpoint tensor, cast to F16 on the host for
+    /// Metal, and uploaded once).
+    pub fn from_half(weight: Tensor) -> Result<Self> {
         let (rows, cols) = weight.dims2()?;
-        if weight.dtype() != DType::F16 || rows == 0 || cols == 0 {
+        if !matches!(weight.dtype(), DType::F16 | DType::BF16) || rows == 0 || cols == 0 {
             return Err(load_error(format!(
-                "an F16 layer takes a non-empty F16 matrix, not {:?} {:?}",
+                "a 16-bit layer takes a non-empty F16 or BF16 matrix, not {:?} {:?}",
                 weight.dtype(),
                 weight.dims()
             )));
         }
         Ok(Self {
-            weight: Weight::F16(weight),
+            weight: Weight::Half(weight),
             rows,
             cols,
         })
@@ -221,10 +268,11 @@ impl FishDrama3Linear {
     }
 
     pub fn form(&self) -> FishDrama3WeightForm {
-        match self.weight {
+        match &self.weight {
             Weight::Q8_0(_) => FishDrama3WeightForm::Q8_0,
             Weight::F32(_) => FishDrama3WeightForm::F32,
-            Weight::F16(_) => FishDrama3WeightForm::F16,
+            Weight::Half(w) if w.dtype() == DType::BF16 => FishDrama3WeightForm::Bf16,
+            Weight::Half(_) => FishDrama3WeightForm::F16,
         }
     }
 
@@ -254,15 +302,16 @@ impl FishDrama3Linear {
             },
             Weight::F32(w) => x.matmul(&w.t()?)?,
             // F32 activations over the widened weights.
-            Weight::F16(w) => x.matmul(&w.to_dtype(DType::F32)?.t()?)?,
+            Weight::Half(w) => x.matmul(&w.to_dtype(DType::F32)?.t()?)?,
         })
     }
 
     /// `x @ W.T` on the weight's device for `x` `[m, cols]` (any float
-    /// dtype), computed and returned in `act`: F16 for a healthy Metal
-    /// layer, F32 for one the range probe moved (its F16 weights are then
-    /// widened per call). A step runs one GEMV per contiguous row, a span
-    /// one GEMM.
+    /// dtype), computed and returned in `act`: the 16-bit dtype for a
+    /// healthy layer, F32 for an F32-gated one (the router and gates) or
+    /// one Metal's range probe moved (its 16-bit weights are then widened
+    /// per call). A step runs one GEMV per contiguous row, or on CUDA the
+    /// row-invariant multi-row GEMV; a span one GEMM.
     pub fn forward_device(
         &self,
         x: &Tensor,
@@ -279,13 +328,18 @@ impl FishDrama3Linear {
             )));
         }
         let w = match &self.weight {
-            Weight::F16(w) | Weight::F32(w) => w,
+            Weight::Half(w) | Weight::F32(w) => w,
             Weight::Q8_0(_) => {
                 return Err(Error::InferenceError(
                     "a Q8_0 projection has no device forward".into(),
                 ))
             }
         };
+        if phase == FishDrama3KernelPhase::Step && w.device().is_cuda() && !split_k_steps() {
+            if let Some(y) = row_invariant_step(x, w, act)? {
+                return Ok(y);
+            }
+        }
         let w = if w.dtype() == act {
             w.clone()
         } else {
@@ -296,8 +350,7 @@ impl FishDrama3Linear {
         if phase == FishDrama3KernelPhase::Span || m == 1 {
             return Ok(x.contiguous()?.matmul(&wt)?);
         }
-        #[cfg(test)]
-        if SPLIT_K_STEPS.with(|flag| flag.get()) {
+        if split_k_steps() {
             let half = self.cols / 2;
             let part = |start: usize, len: usize| -> Result<Tensor> {
                 Ok(x.narrow(1, start, len)?
@@ -305,6 +358,56 @@ impl FishDrama3Linear {
                     .matmul(&w.narrow(1, start, len)?.contiguous()?.t()?)?)
             };
             return Ok((part(0, half)? + part(half, self.cols - half)?)?);
+        }
+        if x.device().is_cuda() {
+            super::device::count_step_row_loop();
+        }
+        let rows = (0..m)
+            .map(|row| x.narrow(0, row, 1)?.contiguous()?.matmul(&wt))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        Ok(Tensor::cat(&rows, 0)?)
+    }
+
+    /// `x @ W.T` with `x` rounded to the weights' 16-bit dtype and the
+    /// products summed into F32 outputs: a 16-bit projection into F32
+    /// logits (CUDA's codebook heads, whose BF16 outputs would keep two
+    /// fewer decimal digits than sampling reads). A step runs the
+    /// row-invariant GEMV once enabled, else one F32 GEMV per row over the
+    /// widened weights; a span one F32 GEMM.
+    pub fn forward_device_f32(&self, x: &Tensor, phase: FishDrama3KernelPhase) -> Result<Tensor> {
+        let (m, width) = x.dims2()?;
+        let w = match &self.weight {
+            Weight::Half(w) if width == self.cols && m > 0 => w,
+            _ => {
+                return Err(Error::InferenceError(format!(
+                    "linear [{}, {}] has no 16-bit device forward into F32 for {:?} rows",
+                    self.rows,
+                    self.cols,
+                    x.dims()
+                )))
+            }
+        };
+        if phase == FishDrama3KernelPhase::Step && w.device().is_cuda() && !split_k_steps() {
+            if let Some(y) = row_invariant_step(x, w, DType::F32)? {
+                return Ok(y);
+            }
+        }
+        let x = x.to_dtype(w.dtype())?.to_dtype(DType::F32)?;
+        let wt = w.to_dtype(DType::F32)?.t()?;
+        if phase == FishDrama3KernelPhase::Span || m == 1 {
+            return Ok(x.contiguous()?.matmul(&wt)?);
+        }
+        if split_k_steps() {
+            let half = self.cols / 2;
+            let part = |start: usize, len: usize| -> Result<Tensor> {
+                Ok(x.narrow(1, start, len)?
+                    .contiguous()?
+                    .matmul(&wt.narrow(0, start, len)?)?)
+            };
+            return Ok((part(0, half)? + part(half, self.cols - half)?)?);
+        }
+        if x.device().is_cuda() {
+            super::device::count_step_row_loop();
         }
         let rows = (0..m)
             .map(|row| x.narrow(0, row, 1)?.contiguous()?.matmul(&wt))
@@ -328,7 +431,7 @@ impl FishDrama3Linear {
             )));
         }
         let device = match &self.weight {
-            Weight::F32(w) | Weight::F16(w) => w.device().clone(),
+            Weight::F32(w) | Weight::Half(w) => w.device().clone(),
             Weight::Q8_0(_) => Device::Cpu,
         };
         let input = Tensor::from_slice(x, (m, self.cols), &device)?;
@@ -404,12 +507,36 @@ mod tests {
     }
 
     #[test]
-    fn the_cuda_forms_are_refused_until_their_phase() {
-        for form in [FishDrama3WeightForm::Bf16, FishDrama3WeightForm::RawFp8] {
-            assert!(
-                FishDrama3Linear::from_values(vec![0.0; 64], 2, 32, form, &Device::Cpu).is_err()
-            );
-        }
+    fn bf16_layers_load_and_raw_fp8_is_not_a_dense_form() {
+        let values = xorshift_values(2 * 32, 9, 0.5);
+        let layer = FishDrama3Linear::from_values(
+            values.clone(),
+            2,
+            32,
+            FishDrama3WeightForm::Bf16,
+            &Device::Cpu,
+        )
+        .unwrap();
+        assert_eq!(layer.form(), FishDrama3WeightForm::Bf16);
+        assert_eq!(layer.resident_bytes(), 2 * 32 * 2);
+        // The host forward over the widened BF16 weights.
+        let x = xorshift_values(32, 10, 1.0);
+        let rounded = values
+            .iter()
+            .map(|v| bf16::from_f32(*v).to_f32())
+            .collect::<Vec<_>>();
+        let y = layer
+            .forward_host(&x, 1, FishDrama3KernelPhase::Step)
+            .unwrap();
+        assert!(relative_l2(&y, &reference(&rounded, &x, 2, 32)) < 1e-6);
+        assert!(FishDrama3Linear::from_values(
+            vec![0.0; 64],
+            2,
+            32,
+            FishDrama3WeightForm::RawFp8,
+            &Device::Cpu
+        )
+        .is_err());
         assert!(FishDrama3Linear::from_values(
             vec![0.0; 40],
             2,

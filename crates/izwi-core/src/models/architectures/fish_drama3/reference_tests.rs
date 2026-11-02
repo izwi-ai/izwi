@@ -69,7 +69,7 @@ use super::model::{
 use super::prompt::{
     build_prompt, FishDrama3Codes, FishDrama3HistoryTurn, FishDrama3Prompt, FishDrama3Reference,
 };
-use super::residency::{FishDrama3CpuPrecision, FishDrama3Residency};
+use super::residency::FishDrama3CpuPrecision;
 use super::sampling::{FishDrama3MainDraw, FishDrama3RowSampler, FishDrama3SamplingParams};
 use super::synthetic::{temp_dir, trunk_geometry, SyntheticCheckpoint, TempDir, Written};
 use super::tokenizer::FishDrama3Tokenizer;
@@ -192,6 +192,38 @@ const TINY_METAL: Tolerances = Tolerances {
     frames_required: usize::MAX,
 };
 
+/// L1 on CUDA: the CUDA form (BF16 weights, activations, residual and KV)
+/// against upstream's F32 run. BF16 rounds to 8 bits, about four times
+/// F16's step, and the residual itself rounds too (upstream's own BF16
+/// numerics), so the tiny trunk's untrained depth grows it to about four
+/// times the Metal bounds; ties widen to 5e-3. Uncalibrated: the first run
+/// on a GPU sets them.
+const TINY_CUDA: Tolerances = Tolerances {
+    embedding: bound(2e-7, 1e-5),
+    trunk: rel(2e-1),
+    tower: rel(8e-2),
+    logits: bound(8e-2, 0.8),
+    decode: rel(2e-1),
+    route_tie: 5e-3,
+    frame_tie: 5e-2,
+    frames_required: usize::MAX,
+};
+
+/// L2 `cuda`: the published model's CUDA form (a ≥ 48 GB GPU) against
+/// upstream's F32 W8A16 run: BF16 throughout over 40 layers, a few percent
+/// on traces; §10.6 asks for 32 replayed frames before the first near tie.
+/// Uncalibrated.
+const L2_CUDA: Tolerances = Tolerances {
+    embedding: bound(2e-7, 1e-5),
+    trunk: rel(1e-1),
+    tower: rel(1e-1),
+    logits: bound(1e-1, 1.0),
+    decode: rel(2e-1),
+    route_tie: 5e-3,
+    frame_tie: 5e-2,
+    frames_required: 32,
+};
+
 /// L2 `metal`: the published model's Metal form (a ≥ 64 GB Mac) against
 /// upstream's F32 W8A16 run: F16 activations over 40 layers, about a percent
 /// on traces; ties and frames as on [`TINY_METAL`], and §10.6 asks for 32
@@ -220,6 +252,45 @@ const SLICE: Tolerances = Tolerances {
     decode: rel(1e-4),
     route_tie: 1e-5,
     frame_tie: 1e-4,
+    frames_required: usize::MAX,
+};
+
+/// L1.5 on Metal: the same real-weight pieces in the Metal form (F16
+/// weights and activations, F32 residual, F16 KV, the fused F16 MoE) against
+/// upstream's F32 run. Every BF16 weight in F16's normal range is exact in
+/// F16, so what differs is F16 rounding of each projection's inputs and
+/// outputs (11 bits, about 5e-4 a rounding, a handful per layer): about 1e-3
+/// for one trunk layer, where the synthetic checkpoint's Metal tests
+/// measure up to 6.3e-3 over eight untrained layers, so 1e-2. The tower's 13
+/// layers and the codebook heads after them take the synthetic tower's
+/// bound, 2e-2 (measured 6.3e-3), and logits an absolute 0.2 over values of
+/// order ten. Router margins move about 1e-3 with the F16-rounded input, so
+/// ties widen to it. The embedding's F16 tables hold every BF16 value, so
+/// only the semantic rows' `/ sqrt(2)` may round. Uncalibrated: the first
+/// run with the slices sets them.
+const SLICE_METAL: Tolerances = Tolerances {
+    embedding: bound(2e-7, 1e-5),
+    trunk: rel(1e-2),
+    tower: rel(2e-2),
+    logits: bound(2e-2, 0.2),
+    decode: rel(1e-2),
+    route_tie: 1e-3,
+    frame_tie: 1e-2,
+    frames_required: usize::MAX,
+};
+
+/// L1.5 on CUDA: the CUDA form (BF16 weights, activations, residual and
+/// KV). BF16's 8-bit rounding is four times F16's, and the residual rounds
+/// as well, so each stage takes four times [`SLICE_METAL`]'s bound.
+/// Uncalibrated: the first run on a GPU sets them.
+const SLICE_CUDA: Tolerances = Tolerances {
+    embedding: bound(2e-7, 1e-5),
+    trunk: rel(4e-2),
+    tower: rel(8e-2),
+    logits: bound(8e-2, 0.8),
+    decode: rel(4e-2),
+    route_tie: 5e-3,
+    frame_tie: 5e-2,
     frames_required: usize::MAX,
 };
 
@@ -265,6 +336,10 @@ const PCM: Bound = bound(1e-3, 1e-2);
 
 /// A RED variant must miss by this many times its stage's bound.
 const RED_FACTOR: f64 = 100.0;
+/// [`RED_FACTOR`] on a 16-bit device form, whose bounds are a hundred times
+/// the F32 ones or more: a RED miss of a convention is of order one, which
+/// must still be five times the bound.
+const RED_FACTOR_DEVICE: f64 = 5.0;
 
 /// Frames each L2 generation replays (§10.4).
 const REFERENCE_FRAMES: usize = 64;
@@ -1008,17 +1083,17 @@ fn compare_routes(
     flipped
 }
 
-/// A RED variant must miss upstream by more than [`RED_FACTOR`] times its
+/// A RED variant must miss upstream by more than `factor` times its
 /// stage's bound.
-fn red(report: &mut Report, name: &str, ours: &[f32], upstream: &[f32], bound: f64) {
+fn red(report: &mut Report, name: &str, ours: &[f32], upstream: &[f32], bound: f64, factor: f64) {
     let error = relative_l2(ours, upstream);
-    let floor = RED_FACTOR * bound;
+    let floor = factor * bound;
     report.note(format!(
         "RED {name}: rel L2 {error:.3e} (must exceed {floor:.1e})"
     ));
     report.check(error > floor, || {
         format!(
-            "RED {name}: misses upstream by only {error:.3e}, under {floor:.1e} ({RED_FACTOR} times \
+            "RED {name}: misses upstream by only {error:.3e}, under {floor:.1e} ({factor} times \
              its bound): the fixture cannot tell this convention apart"
         )
     });
@@ -1036,14 +1111,20 @@ fn cache(
     head_dim: usize,
     positions: usize,
 ) -> PhysicalPagedKvCache {
+    cache_in(device, DType::F32, layers, kv_heads, head_dim, positions)
+}
+
+/// A one-row paged cache storing `dtype`.
+fn cache_in(
+    device: &Device,
+    dtype: DType,
+    layers: &[u32],
+    kv_heads: usize,
+    head_dim: usize,
+    positions: usize,
+) -> PhysicalPagedKvCache {
     test_physical_caches_for_model_layers_on(
-        device,
-        DType::F32,
-        layers,
-        kv_heads,
-        head_dim,
-        positions,
-        1,
+        device, dtype, layers, kv_heads, head_dim, positions, 1,
     )
     .remove(0)
 }
@@ -1626,7 +1707,7 @@ fn run_tiny_tensors(device: &Device, backend: &str) {
     let (h, d) = (config.trunk.hidden, config.tower.dim);
     let (experts, top_k) = (config.trunk.moe.experts, config.trunk.moe.top_k);
     let (shared, heads) = (config.tower.shared_layers, config.tower.residual_layers());
-    let tol = if device.is_cpu() { TINY } else { TINY_METAL };
+    let tol = tiny_tolerances(device);
     let mut report = Report::default();
     for entry in list(&json["prompts"]) {
         let label = format!("{backend} {}", text(&entry["name"]));
@@ -1904,7 +1985,7 @@ fn run_tiny_rollouts(device: &Device, backend: &str) {
             rollout,
             sidecar,
             &ours,
-            if device.is_cpu() { &TINY } else { &TINY_METAL },
+            &tiny_tolerances(device),
             config.trunk.hidden,
         );
         if device.is_cpu() && exact {
@@ -1942,6 +2023,29 @@ fn tiny_matches_upstream_on_metal() {
     };
     run_tiny_tensors(&device, "metal");
     run_tiny_rollouts(&device, "metal");
+}
+
+/// L1 on CUDA (§10.6): the same comparisons on the CUDA form with
+/// [`TINY_CUDA`]'s bounds.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs tests/fixtures/fish_drama3/tiny/ from generate_fish_drama3_tiny.py"]
+fn tiny_matches_upstream_on_cuda() {
+    let _fixture = tiny_fixture();
+    let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+        return;
+    };
+    run_tiny_tensors(&device, "cuda");
+    run_tiny_rollouts(&device, "cuda");
+}
+
+/// The L1 bounds of `device`'s form.
+fn tiny_tolerances(device: &Device) -> Tolerances {
+    match device {
+        Device::Cpu => TINY,
+        Device::Metal(_) => TINY_METAL,
+        Device::Cuda(_) => TINY_CUDA,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1982,6 +2086,54 @@ fn slice_inputs_are_the_documented_xorshift() {
             "seed {seed}"
         );
         assert!(ours.iter().all(|v| (-scale..scale).contains(v)));
+    }
+}
+
+/// Where a slice test runs, and the bounds it holds there.
+struct SliceBackend {
+    name: &'static str,
+    device: Device,
+    tol: Tolerances,
+    /// How far a RED variant must miss, in multiples of its stage's bound.
+    red_factor: f64,
+    /// Both paged domains' dtype: F32 on the CPU, F16 in the Metal form.
+    kv: DType,
+}
+
+impl SliceBackend {
+    /// The CPU's F32 load, upstream's own numerics.
+    fn cpu() -> Self {
+        Self {
+            name: "cpu",
+            device: Device::Cpu,
+            tol: SLICE,
+            red_factor: RED_FACTOR,
+            kv: DType::F32,
+        }
+    }
+
+    /// The Metal form on `device` (§10.6 requires L1.5 there).
+    #[cfg(feature = "metal")]
+    fn metal(device: Device) -> Self {
+        Self {
+            name: "metal",
+            device,
+            tol: SLICE_METAL,
+            red_factor: RED_FACTOR_DEVICE,
+            kv: DType::F16,
+        }
+    }
+
+    /// The CUDA form on `device` (§10.6 requires L1.5 there too).
+    #[cfg(feature = "cuda")]
+    fn cuda(device: Device) -> Self {
+        Self {
+            name: "cuda",
+            device,
+            tol: SLICE_CUDA,
+            red_factor: RED_FACTOR_DEVICE,
+            kv: DType::BF16,
+        }
     }
 }
 
@@ -2052,6 +2204,7 @@ fn slice_trunk(
     layers: &[usize],
     extra: &[PathBuf],
     edit: impl FnOnce(&mut FishDrama3Config),
+    backend: &SliceBackend,
 ) -> (FishDrama3Trunk, FishDrama3Config) {
     let mut config = slices.config.clone();
     config.trunk.layers = layers
@@ -2078,7 +2231,7 @@ fn slice_trunk(
     let trunk = FishDrama3Trunk::load(
         &view,
         &config,
-        &Device::Cpu,
+        &backend.device,
         FishDrama3TrunkOptions {
             precision: FishDrama3CpuPrecision::F32,
             ..Default::default()
@@ -2095,12 +2248,14 @@ fn run_slice_trunk(
     x: &[f32],
     chunks: &[(usize, usize)],
     decode: &[usize],
+    kv: DType,
 ) -> LayerTrace {
     let config = trunk.config();
     let h = config.hidden;
     let attention = &config.attention;
-    let mut cache = cache(
-        &Device::Cpu,
+    let mut cache = cache_in(
+        trunk.device(),
+        kv,
         trunk.attention_layers(),
         attention.kv_heads,
         attention.head_dim,
@@ -2154,6 +2309,7 @@ fn compare_slice_layer(
     trace: &LayerTrace,
     slot: usize,
     config: &FishDrama3Config,
+    tol: &Tolerances,
 ) {
     let h = config.trunk.hidden;
     let (experts, top_k) = (config.trunk.moe.experts, config.trunk.moe.top_k);
@@ -2167,7 +2323,7 @@ fn compare_slice_layer(
         &trace.router_logits[slot],
         experts,
         top_k,
-        SLICE.route_tie,
+        tol.route_tie,
     );
     report.note(format!(
         "{label}: history near ties ours {}, upstream {} (upstream min margin {})",
@@ -2175,7 +2331,7 @@ fn compare_slice_layer(
             &trace.router_logits[slot][..history * experts],
             experts,
             top_k,
-            SLICE.route_tie
+            tol.route_tie
         ),
         routes["history"]["near_ties"],
         routes["history"]["min_margin"]
@@ -2199,7 +2355,7 @@ fn compare_slice_layer(
             &format!("{label} {part} at decode rows {positions:?}"),
             &gather(ours, h, &positions),
             &gather(&upstream, h, &kept),
-            SLICE.trunk,
+            tol.trunk,
             false,
         );
         if kept.len() == decode.len() {
@@ -2209,7 +2365,7 @@ fn compare_slice_layer(
                 &format!("{label} {part} decode"),
                 &record["decode_checksum"],
                 &ours[history * h..],
-                SLICE.trunk.rel_l2,
+                tol.trunk.rel_l2,
             );
         }
         compare_trace(
@@ -2220,7 +2376,7 @@ fn compare_slice_layer(
             sidecar,
             &ours[..history * h],
             h,
-            SLICE.trunk,
+            tol.trunk,
         );
     }
 }
@@ -2321,10 +2477,39 @@ fn tiled_value_heads(slices: &Slices, layer: usize, dir: &Path) -> PathBuf {
 #[test]
 #[ignore = "needs IZWI_FISH_DRAMA3_SLICE_DIR (fetch_fish_drama3_slices.py, then generate_fish_drama3_slices.py); about 7 GB of RAM; run with --release"]
 fn slice_trunk_deltanet_layer_0_matches_upstream() {
+    run_slice_layer_0(&slices(), &SliceBackend::cpu());
+}
+
+/// [`slice_trunk_deltanet_layer_0_matches_upstream`] in the Metal form.
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs IZWI_FISH_DRAMA3_SLICE_DIR (fetch_fish_drama3_slices.py, then generate_fish_drama3_slices.py); about 7 GB of RAM; run with --release"]
+fn slice_trunk_deltanet_layer_0_matches_upstream_on_metal() {
     let slices = slices();
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "slice_trunk_deltanet_layer_0_matches_upstream_on_metal",
+    ) else {
+        return;
+    };
+    run_slice_layer_0(&slices, &SliceBackend::metal(device));
+}
+
+/// [`slice_trunk_deltanet_layer_0_matches_upstream`] in the CUDA form.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs IZWI_FISH_DRAMA3_SLICE_DIR (fetch_fish_drama3_slices.py, then generate_fish_drama3_slices.py); about 7 GB of RAM; run with --release"]
+fn slice_trunk_deltanet_layer_0_matches_upstream_on_cuda() {
+    let slices = slices();
+    let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+        return;
+    };
+    run_slice_layer_0(&slices, &SliceBackend::cuda(device));
+}
+
+fn run_slice_layer_0(slices: &Slices, backend: &SliceBackend) {
     let sidecar = &slices.fixture.sidecar;
     let mut report = Report::default();
-    let entry = slice_layer_entry(&slices, 0);
+    let entry = slice_layer_entry(slices, 0);
     let x = slice_input(&mut report, "layer 0", &entry["input"]);
     let (chunks, decode) = (
         spans(&entry["prefill_chunks"]),
@@ -2334,23 +2519,36 @@ fn slice_trunk_deltanet_layer_0_matches_upstream() {
     // least one), so slice layer 3 rides behind layer 0 as layer 1; only
     // layer 0's record is read.
     {
-        let (trunk, config) = slice_trunk(&slices, &[0, 3], &[], |_| {});
-        let trace = run_slice_trunk(&trunk, &x, &chunks, &decode);
-        compare_slice_layer(&mut report, "layer 0", entry, sidecar, &trace, 0, &config);
+        let (trunk, config) = slice_trunk(slices, &[0, 3], &[], |_| {}, backend);
+        let trace = run_slice_trunk(&trunk, &x, &chunks, &decode, backend.kv);
+        compare_slice_layer(
+            &mut report,
+            "layer 0",
+            entry,
+            sidecar,
+            &trace,
+            0,
+            &config,
+            &backend.tol,
+        );
     }
     let red_dir = temp_dir();
-    let tiled = tiled_value_heads(&slices, 0, &red_dir.0);
-    let (trunk, config) = slice_trunk(&slices, &[0, 3], &[tiled], |_| {});
-    let trace = run_slice_trunk(&trunk, &x, &chunks, &decode);
+    let tiled = tiled_value_heads(slices, 0, &red_dir.0);
+    let (trunk, config) = slice_trunk(slices, &[0, 3], &[tiled], |_| {}, backend);
+    let trace = run_slice_trunk(&trunk, &x, &chunks, &decode, backend.kv);
     let (ours, upstream) = mixer_rows(entry, sidecar, &trace.mixers[0], config.trunk.hidden);
     red(
         &mut report,
         "tiled value heads (layer 0 mixer)",
         &ours,
         &upstream,
-        SLICE.trunk.rel_l2,
+        backend.tol.trunk.rel_l2,
+        backend.red_factor,
     );
-    report.finish("L1.5 trunk layer 0 (Gated DeltaNet)");
+    report.finish(&format!(
+        "L1.5 trunk layer 0 (Gated DeltaNet) on {}",
+        backend.name
+    ));
 }
 
 /// Layer 3 (gated full attention) on real weights: prefill chunks read the
@@ -2358,33 +2556,81 @@ fn slice_trunk_deltanet_layer_0_matches_upstream() {
 #[test]
 #[ignore = "needs IZWI_FISH_DRAMA3_SLICE_DIR (fetch_fish_drama3_slices.py, then generate_fish_drama3_slices.py); about 4 GB of RAM; run with --release"]
 fn slice_trunk_attention_layer_3_matches_upstream() {
+    run_slice_layer_3(&slices(), &SliceBackend::cpu());
+}
+
+/// [`slice_trunk_attention_layer_3_matches_upstream`] in the Metal form.
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs IZWI_FISH_DRAMA3_SLICE_DIR (fetch_fish_drama3_slices.py, then generate_fish_drama3_slices.py); about 4 GB of RAM; run with --release"]
+fn slice_trunk_attention_layer_3_matches_upstream_on_metal() {
     let slices = slices();
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "slice_trunk_attention_layer_3_matches_upstream_on_metal",
+    ) else {
+        return;
+    };
+    run_slice_layer_3(&slices, &SliceBackend::metal(device));
+}
+
+/// [`slice_trunk_attention_layer_3_matches_upstream`] in the CUDA form.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs IZWI_FISH_DRAMA3_SLICE_DIR (fetch_fish_drama3_slices.py, then generate_fish_drama3_slices.py); about 4 GB of RAM; run with --release"]
+fn slice_trunk_attention_layer_3_matches_upstream_on_cuda() {
+    let slices = slices();
+    let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+        return;
+    };
+    run_slice_layer_3(&slices, &SliceBackend::cuda(device));
+}
+
+fn run_slice_layer_3(slices: &Slices, backend: &SliceBackend) {
     let sidecar = &slices.fixture.sidecar;
     let mut report = Report::default();
-    let entry = slice_layer_entry(&slices, 3);
+    let entry = slice_layer_entry(slices, 3);
     let x = slice_input(&mut report, "layer 3", &entry["input"]);
     let (chunks, decode) = (
         spans(&entry["prefill_chunks"]),
         counts(&entry["decode_positions"]),
     );
     {
-        let (trunk, config) = slice_trunk(&slices, &[3], &[], |_| {});
-        let trace = run_slice_trunk(&trunk, &x, &chunks, &decode);
-        compare_slice_layer(&mut report, "layer 3", entry, sidecar, &trace, 0, &config);
+        let (trunk, config) = slice_trunk(slices, &[3], &[], |_| {}, backend);
+        let trace = run_slice_trunk(&trunk, &x, &chunks, &decode, backend.kv);
+        compare_slice_layer(
+            &mut report,
+            "layer 3",
+            entry,
+            sidecar,
+            &trace,
+            0,
+            &config,
+            &backend.tol,
+        );
     }
-    let (trunk, config) = slice_trunk(&slices, &[3], &[], |config| {
-        config.trunk.attention.rope_layout = FishDrama3RopeLayout::InterleavedPairs;
-    });
-    let trace = run_slice_trunk(&trunk, &x, &chunks, &decode);
+    let (trunk, config) = slice_trunk(
+        slices,
+        &[3],
+        &[],
+        |config| {
+            config.trunk.attention.rope_layout = FishDrama3RopeLayout::InterleavedPairs;
+        },
+        backend,
+    );
+    let trace = run_slice_trunk(&trunk, &x, &chunks, &decode, backend.kv);
     let (ours, upstream) = mixer_rows(entry, sidecar, &trace.mixers[0], config.trunk.hidden);
     red(
         &mut report,
         "interleaved RoPE in the trunk (layer 3 mixer)",
         &ours,
         &upstream,
-        SLICE.trunk.rel_l2,
+        backend.tol.trunk.rel_l2,
+        backend.red_factor,
     );
-    report.finish("L1.5 trunk layer 3 (gated attention)");
+    report.finish(&format!(
+        "L1.5 trunk layer 3 (gated attention) on {}",
+        backend.name
+    ));
 }
 
 /// Slice A with its two row slices named as the whole tables they stand
@@ -2433,13 +2679,14 @@ fn slice_tower(
     view: &FishDrama3Checkpoint,
     config: &FishDrama3Config,
     edit: impl FnOnce(&mut FishDrama3Config),
+    device: &Device,
 ) -> FishDrama3Tower {
     let mut config = config.clone();
     edit(&mut config);
     FishDrama3Tower::load(
         view,
         &config,
-        &Device::Cpu,
+        device,
         FishDrama3TowerOptions {
             precision: FishDrama3CpuPrecision::F32,
             ..Default::default()
@@ -2467,12 +2714,14 @@ fn run_slice_tower(
     frames: &[Vec<u32>],
     chunks: &[(usize, usize)],
     step: Option<(usize, &[u32])>,
+    kv: DType,
 ) -> TowerRun {
     let config = tower.config();
     let d = config.dim;
     let attention = &config.attention;
-    let mut cache = cache(
-        &Device::Cpu,
+    let mut cache = cache_in(
+        tower.device(),
+        kv,
         tower.attention_layers(),
         attention.kv_heads,
         attention.head_dim,
@@ -2516,13 +2765,45 @@ fn run_slice_tower(
 #[test]
 #[ignore = "needs IZWI_FISH_DRAMA3_SLICE_DIR (fetch_fish_drama3_slices.py, then generate_fish_drama3_slices.py); about 6 GB of RAM; run with --release"]
 fn slice_tower_matches_upstream_on_a_forced_step() {
+    run_slice_tower_test(&slices(), &SliceBackend::cpu());
+}
+
+/// [`slice_tower_matches_upstream_on_a_forced_step`] in the Metal form.
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs IZWI_FISH_DRAMA3_SLICE_DIR (fetch_fish_drama3_slices.py, then generate_fish_drama3_slices.py); about 6 GB of RAM; run with --release"]
+fn slice_tower_matches_upstream_on_a_forced_step_on_metal() {
     let slices = slices();
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "slice_tower_matches_upstream_on_a_forced_step_on_metal",
+    ) else {
+        return;
+    };
+    run_slice_tower_test(&slices, &SliceBackend::metal(device));
+}
+
+/// [`slice_tower_matches_upstream_on_a_forced_step`] in the CUDA form.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs IZWI_FISH_DRAMA3_SLICE_DIR (fetch_fish_drama3_slices.py, then generate_fish_drama3_slices.py); about 6 GB of RAM; run with --release"]
+fn slice_tower_matches_upstream_on_a_forced_step_on_cuda() {
+    let slices = slices();
+    let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+        return;
+    };
+    run_slice_tower_test(&slices, &SliceBackend::cuda(device));
+}
+
+fn run_slice_tower_test(slices: &Slices, backend: &SliceBackend) {
     let (json, sidecar) = (&slices.fixture.json, &slices.fixture.sidecar);
     let config = &slices.config;
     let entry = &json["tower"];
+    let tol = &backend.tol;
     let mut report = Report::default();
-    let view = slice_a_view(&slices);
-    let embedding = FishDrama3Embedding::load(&view, &semantic_rows_config(config)).unwrap();
+    let view = slice_a_view(slices);
+    let embedding =
+        FishDrama3Embedding::load_on(&view, &semantic_rows_config(config), &backend.device)
+            .unwrap();
     let hidden = slice_input(&mut report, "tower", &entry["hidden"]);
     let frames = table(&entry["frames"]);
     let forced = ids(&entry["forced_frame"]);
@@ -2537,7 +2818,7 @@ fn slice_tower_matches_upstream_on_a_forced_step() {
     let d = config.tower.dim;
     let layers = list(&entry["layers"]);
     {
-        let tower = slice_tower(&view, config, |_| {});
+        let tower = slice_tower(&view, config, |_| {}, &backend.device);
         let run = run_slice_tower(
             &tower,
             &embedding,
@@ -2545,6 +2826,7 @@ fn slice_tower_matches_upstream_on_a_forced_step() {
             &frames,
             &chunks,
             Some((position, forced.as_slice())),
+            backend.kv,
         );
         for layer in layers {
             let i = int(&layer["index"]);
@@ -2557,7 +2839,7 @@ fn slice_tower_matches_upstream_on_a_forced_step() {
                 sidecar,
                 &run.prefill[i],
                 d,
-                SLICE.tower,
+                tol.tower,
             );
             compare_values(
                 &mut report,
@@ -2565,7 +2847,7 @@ fn slice_tower_matches_upstream_on_a_forced_step() {
                 &format!("tower layer {i} at the forced step"),
                 &run.step[i * d..(i + 1) * d],
                 &sidecar.f32(&layer["step"]),
-                SLICE.tower,
+                tol.tower,
                 false,
             );
         }
@@ -2575,15 +2857,28 @@ fn slice_tower_matches_upstream_on_a_forced_step() {
             "tower head logits at the forced step",
             &run.heads,
             &sidecar.f32(&entry["head_logits"]),
-            SLICE.logits,
+            tol.logits,
             false,
         );
     }
     // RED over the first chunk: the last layer at its stored rows there.
-    let tower = slice_tower(&view, config, |config| {
-        config.tower.attention.rope_layout = FishDrama3RopeLayout::HalfSplit;
-    });
-    let run = run_slice_tower(&tower, &embedding, &hidden, &frames, &chunks[..1], None);
+    let tower = slice_tower(
+        &view,
+        config,
+        |config| {
+            config.tower.attention.rope_layout = FishDrama3RopeLayout::HalfSplit;
+        },
+        &backend.device,
+    );
+    let run = run_slice_tower(
+        &tower,
+        &embedding,
+        &hidden,
+        &frames,
+        &chunks[..1],
+        None,
+        backend.kv,
+    );
     let last = layers.last().expect("tower layers");
     let picks = counts(&last["prefill"]["rows"]);
     let kept = (0..picks.len())
@@ -2595,9 +2890,10 @@ fn slice_tower_matches_upstream_on_a_forced_step() {
         "half-split RoPE in the tower (last layer)",
         &gather(&run.prefill[int(&last["index"])], d, &rows),
         &gather(&sidecar.f32(&last["prefill"]["values"]), d, &kept),
-        SLICE.tower.rel_l2,
+        tol.tower.rel_l2,
+        backend.red_factor,
     );
-    report.finish("L1.5 tower");
+    report.finish(&format!("L1.5 tower on {}", backend.name));
 }
 
 /// The compact main head on the final norm of xorshift rows (RED: the final
@@ -2605,12 +2901,42 @@ fn slice_tower_matches_upstream_on_a_forced_step() {
 #[test]
 #[ignore = "needs IZWI_FISH_DRAMA3_SLICE_DIR (fetch_fish_drama3_slices.py, then generate_fish_drama3_slices.py); run with --release"]
 fn slice_main_head_and_embedding_match_upstream() {
+    run_slice_head_test(&slices(), &SliceBackend::cpu());
+}
+
+/// [`slice_main_head_and_embedding_match_upstream`] in the Metal form.
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs IZWI_FISH_DRAMA3_SLICE_DIR (fetch_fish_drama3_slices.py, then generate_fish_drama3_slices.py); run with --release"]
+fn slice_main_head_and_embedding_match_upstream_on_metal() {
     let slices = slices();
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "slice_main_head_and_embedding_match_upstream_on_metal",
+    ) else {
+        return;
+    };
+    run_slice_head_test(&slices, &SliceBackend::metal(device));
+}
+
+/// [`slice_main_head_and_embedding_match_upstream`] in the CUDA form.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs IZWI_FISH_DRAMA3_SLICE_DIR (fetch_fish_drama3_slices.py, then generate_fish_drama3_slices.py); run with --release"]
+fn slice_main_head_and_embedding_match_upstream_on_cuda() {
+    let slices = slices();
+    let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+        return;
+    };
+    run_slice_head_test(&slices, &SliceBackend::cuda(device));
+}
+
+fn run_slice_head_test(slices: &Slices, backend: &SliceBackend) {
     let (json, sidecar) = (&slices.fixture.json, &slices.fixture.sidecar);
     let config = &slices.config;
     let h = config.trunk.hidden;
+    let tol = &backend.tol;
     let mut report = Report::default();
-    let view = slice_a_view(&slices);
+    let view = slice_a_view(slices);
 
     let entry = &json["main_head"];
     let candidates = format!(
@@ -2625,11 +2951,13 @@ fn slice_main_head_and_embedding_match_upstream() {
     });
     let x = slice_input(&mut report, "main head", &entry["input"]);
     let head =
-        FishDrama3CompactHead::load(&view, &compact_rows_config(config), &Device::Cpu).unwrap();
+        FishDrama3CompactHead::load(&view, &compact_rows_config(config), &backend.device).unwrap();
+    // The final norm on the host in F32 (the trunk's own, in either form,
+    // hands the head F32 rows), then the head in its form.
     let logits = |gain: NormGain| {
         let gain = norm_gain(&view, &format!("{TRUNK_PREFIX}.norm.weight"), h, gain).unwrap();
         let normed = rms_norm_rows(&x, h, &gain, config.trunk.rms_norm_eps as f32);
-        let rows = Tensor::from_vec(normed, (x.len() / h, h), &Device::Cpu).unwrap();
+        let rows = Tensor::from_vec(normed, (x.len() / h, h), &backend.device).unwrap();
         host(&head.logits(&rows).unwrap())
     };
     let upstream = sidecar.f32(&entry["logits"]);
@@ -2639,7 +2967,7 @@ fn slice_main_head_and_embedding_match_upstream() {
         "main head logits",
         &logits(NormGain::ZeroCentred),
         &upstream,
-        SLICE.logits,
+        tol.logits,
         false,
     );
     red(
@@ -2647,11 +2975,14 @@ fn slice_main_head_and_embedding_match_upstream() {
         "no 1 + w on the final norm (main head logits)",
         &logits(NormGain::Plain),
         &upstream,
-        SLICE.logits.rel_l2,
+        tol.logits.rel_l2,
+        backend.red_factor,
     );
 
     let entry = &json["embedding"];
-    let embedding = FishDrama3Embedding::load(&view, &semantic_rows_config(config)).unwrap();
+    let embedding =
+        FishDrama3Embedding::load_on(&view, &semantic_rows_config(config), &backend.device)
+            .unwrap();
     let rows = table(&entry["frames"])
         .into_iter()
         .flat_map(|mut frame| {
@@ -2668,10 +2999,10 @@ fn slice_main_head_and_embedding_match_upstream() {
         "semantic-row embedding",
         &embedding.embed(&rows).unwrap(),
         &sidecar.f32(&entry["values"]),
-        SLICE.embedding,
+        tol.embedding,
         false,
     );
-    report.finish("L1.5 main head and embedding");
+    report.finish(&format!("L1.5 main head and embedding on {}", backend.name));
 }
 
 // ---------------------------------------------------------------------------
@@ -2948,13 +3279,19 @@ fn reference_backend() -> (
         }
         #[cfg(not(feature = "metal"))]
         "metal" => panic!("{BACKEND_ENV}=metal needs a test build with --features metal"),
+        #[cfg(feature = "cuda")]
         "cuda" => {
-            let error = FishDrama3Residency::Cuda.require_implemented().unwrap_err();
-            panic!(
-                "{BACKEND_ENV}=cuda: {error}; run L2 with cpu (F32, about 140 GiB of RAM), \
-                 cpu-q8_0 (about 40 GiB) or metal (a Mac with at least 64 GB)"
-            )
+            let device = crate::kernels::cuda::cuda_test_device()
+                .unwrap_or_else(|| panic!("{BACKEND_ENV}=cuda: no CUDA device"));
+            if let Err(error) =
+                super::residency::FishDrama3Residency::Cuda.require_supported(&device)
+            {
+                panic!("{BACKEND_ENV}=cuda: {error}");
+            }
+            (L2_CUDA, FishDrama3CpuPrecision::Q8_0, device, None)
         }
+        #[cfg(not(feature = "cuda"))]
+        "cuda" => panic!("{BACKEND_ENV}=cuda needs a test build with --features cuda"),
         other => panic!("{BACKEND_ENV}={other}: expected cpu, cpu-q8_0, metal or cuda"),
     };
     (backend, tolerances, precision, device, lease)

@@ -361,7 +361,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Choice,
         "cpu",
         TestHarness,
-        "Backend of the ignored Fish Audio Drama 3 L2 parity test: cpu (F32 weights, about 140 GiB of RAM), cpu-q8_0 (the production Q8_0 form, about 40 GiB, looser bounds), metal (the F16 Metal form) or cuda (refused until the family has its residency).",
+        "Backend of the ignored Fish Audio Drama 3 L2 parity test: cpu (F32 weights, about 140 GiB of RAM), cpu-q8_0 (the production Q8_0 form, about 40 GiB, looser bounds), metal (the F16 Metal form) or cuda (the BF16 CUDA form, a test build with --features cuda on an SM80+ GPU).",
     ),
     CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_CODEBOOK_FIXTURE",
@@ -380,9 +380,9 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_DTYPE",
         Choice,
-        "the backend's (f16 on Metal, f32 on CPU)",
+        "the backend's (f16 on Metal, bf16 on CUDA, f32 on CPU)",
         Load,
-        "Overrides a Fish Audio Drama 3 load's activation dtype: f16 or f32 on Metal (f32 also stores the paged KV in F32 and runs every MoE layer's host loop), f32 on CPU; anything else fails the load.",
+        "Overrides a Fish Audio Drama 3 load's activation dtype: f16 or f32 on Metal (f32 also stores the paged KV in F32 and runs every MoE layer's host loop), bf16 on CUDA, f32 on CPU; anything else fails the load.",
     ),
     CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_MODEL_DIR",
@@ -396,7 +396,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Choice,
         "fused",
         Load,
-        "How a Fish Audio Drama 3 load on Metal runs its routed experts: fused (device routing, the fused FP8 kernels) or loop (host routing and one FP8 GEMV pair per expert with F32 activations; diagnosis).",
+        "How a Fish Audio Drama 3 load on Metal or CUDA runs its routed experts: fused (device routing, the fused FP8 kernels) or loop (host routing and one FP8 GEMV pair per expert, with F32 activations on Metal and BF16 on CUDA; diagnosis).",
     ),
     CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_NATIVE_BATCHING",
