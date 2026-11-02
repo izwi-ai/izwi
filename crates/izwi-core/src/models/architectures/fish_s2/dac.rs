@@ -8,6 +8,7 @@ use candle_nn::{
 
 use crate::audio::{resample_mono_high_quality, target_sample_count};
 use crate::error::{Error, Result};
+use crate::kernels::depthwise_conv::{depthwise_conv1d, is_depthwise_conv1d, DepthwiseConv1dSpec};
 use crate::models::architectures::fish_s2::codec::fuse_weight_norm_dim0;
 use crate::models::architectures::fish_s2::contracts::FishS2DacContract;
 use crate::models::architectures::fish_s2::rotary::FishS2RotaryCache;
@@ -135,6 +136,10 @@ struct FishS2CausalConv1d {
     effective_kernel: usize,
     stride: usize,
     padding_total: usize,
+    /// Set for a depthwise layer (groups == channels, stride 1): Candle's
+    /// grouped `conv1d` runs one convolution per channel, so these run as
+    /// one shift-and-accumulate over every channel instead.
+    depthwise: Option<DepthwiseConv1dSpec>,
 }
 
 struct FishS2CausalConvTranspose1d {
@@ -1070,11 +1075,15 @@ impl FishS2CausalConv1d {
             load_conv1d_weight(in_channels, out_channels, kernel_size, groups, cfg, conv_vb)?;
         let effective_kernel = (kernel_size - 1) * dilation + 1;
         let padding_total = effective_kernel.saturating_sub(stride);
+        let depthwise = (in_channels == out_channels
+            && is_depthwise_conv1d(conv.weight(), in_channels, groups, stride))
+        .then(|| DepthwiseConv1dSpec::padded(0, 0).with_dilation(dilation));
         Ok(Self {
             conv,
             effective_kernel,
             stride,
             padding_total,
+            depthwise,
         })
     }
 
@@ -1087,6 +1096,10 @@ impl FishS2CausalConv1d {
             self.padding_total,
         );
         let x = x.pad_with_zeros(2, self.padding_total, extra_padding)?;
+        if let Some(spec) = self.depthwise {
+            return depthwise_conv1d(&x, self.conv.weight(), self.conv.bias(), spec)
+                .map_err(Error::from);
+        }
         self.conv.forward(&x).map_err(Error::from)
     }
 }

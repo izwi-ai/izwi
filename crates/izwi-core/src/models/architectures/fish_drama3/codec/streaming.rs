@@ -536,7 +536,21 @@ mod tests {
             &device,
         )
         .unwrap();
-        for dilation in [1, 3, 9] {
+        // The plain convolution and the depthwise shift-and-accumulate
+        // keep the same history (one channel is a depthwise layer too).
+        let forms = [1, 3, 9].into_iter().flat_map(|dilation| {
+            [
+                (dilation, None),
+                (
+                    dilation,
+                    Some(
+                        crate::kernels::depthwise_conv::DepthwiseConv1dSpec::padded(0, 0)
+                            .with_dilation(dilation),
+                    ),
+                ),
+            ]
+        });
+        for (dilation, depthwise) in forms {
             let layer = FishDrama3CausalConv1d {
                 conv: Conv1d::new(
                     Tensor::from_vec(vec![0.2f32, -0.3, 0.4], (1, 1, 3), &device).unwrap(),
@@ -549,6 +563,7 @@ mod tests {
                 effective_kernel: 2 * dilation + 1,
                 stride: 1,
                 padding_total: 2 * dilation,
+                depthwise,
             };
             let mut states = Vec::new();
             let chunks = (0..43)
