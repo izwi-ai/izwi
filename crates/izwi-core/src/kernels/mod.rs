@@ -32,6 +32,7 @@ pub(crate) mod metal_qwen36moe;
 pub mod moe_relu2;
 pub mod numeric_check;
 pub mod qk_norm_rope;
+pub mod race_sampler;
 pub mod residual_norm;
 
 use crate::error::Error;

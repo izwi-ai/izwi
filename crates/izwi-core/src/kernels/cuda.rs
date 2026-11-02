@@ -3479,6 +3479,12 @@ pub(crate) fn cuda_ptx_greedy() -> &'static str {
     cuda_ptx::GREEDY
 }
 
+/// The PTX of `kernels/cuda/race_sampler.cu` (`kernels::race_sampler`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_race_sampler() -> &'static str {
+    cuda_ptx::RACE_SAMPLER
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
