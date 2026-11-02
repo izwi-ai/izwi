@@ -101,8 +101,8 @@ at `http://localhost:8080/docs`, and the raw OpenAPI document is available at
 Run `izwi list` to see the enabled catalog. Current families include:
 
 - **TTS:** Qwen3-TTS, Kokoro-82M, Voxtral TTS, VibeVoice, Fish Audio S2 Pro,
-  Chatterbox (English and multilingual), Maya1, Maya 2 Native, LFM2.5
-  Audio, and LFM3 Audio.
+  Fish Audio Drama 3, Chatterbox (English and multilingual), Maya1, Maya 2
+  Native, LFM2.5 Audio, and LFM3 Audio.
 - **ASR:** Parakeet, Whisper, Qwen3-ASR, Nemotron 3.5 ASR, Nemotron 3.5
   Transcribe, VibeVoice ASR, Granite Speech 4.1, LFM2.5 Audio,
   LFM3 Audio, and Voxtral Mini.
@@ -113,6 +113,12 @@ Run `izwi list` to see the enabled catalog. Current families include:
 Some model weights and bundled assets have their own licenses or access terms.
 Check the [Models Guide](https://izwiai.com/docs/models) before redistribution
 or commercial use of downloaded model artifacts.
+
+Fish Audio Drama 3 is licensed under the Fish Audio Community License v1.0.
+Commercial use is licensed only below USD 500,000 in annual revenue, and
+offering the model to third parties as a hosted speech service, for example
+through Izwi's API, needs a separate license from Fish Audio. Izwi's Fish
+Audio S2 Pro and Fish Audio Drama 3 support is Built with Fish Audio.
 
 ## Build From Source
 

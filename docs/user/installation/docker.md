@@ -93,6 +93,8 @@ The overlay (`docker-compose.prod.yml`) changes these settings and nothing else:
 
 Both modes run as the unprivileged `izwi` user (uid 1000) with every Linux capability dropped and privilege escalation disabled, and on a server with a key the public `/livez` and `/readyz` answer with only the status and version. Capacity, queues and startup warnings are on `/v1/health`, which needs the key.
 
+**Fish Audio Drama 3 and third parties.** A server or Docker deployment that lets third parties generate speech with `FishAudio-Drama-3` from text or voice samples they supply is a "Hosted Service" under the model's Fish Audio Community License v1.0, which grants no license for one: such a deployment needs a license from Fish Audio. Personal, research and non-commercial use, and speech for your own product, are fine within the license's terms, including its USD 500,000 annual revenue cap on commercial use. See [Models](/models).
+
 ### Reaching the server from other machines
 
 The server speaks plain HTTP, so anything that crosses a network should go through a TLS-terminating reverse proxy. The production overlay includes one: Caddy, which gets and renews a certificate automatically. Point a DNS name at the host, open ports 80 and 443, and add to `.env`:

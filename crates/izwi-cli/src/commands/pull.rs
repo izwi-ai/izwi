@@ -75,6 +75,9 @@ pub async fn execute(
     }
 
     theme.step(1, 3, &format!("Starting download for '{}'...", model));
+    if let Some(terms) = license_terms(&model) {
+        theme.info(&terms);
+    }
 
     let client = http::client(Some(std::time::Duration::from_secs(30)))?;
     let response = client
@@ -113,6 +116,19 @@ pub async fn execute(
     );
 
     Ok(())
+}
+
+/// What the model's weights' licence permits, when the catalog spells it
+/// out beyond the label (Fish Audio Drama 3), shown before the download.
+/// Informational: nothing is refused on it.
+fn license_terms(model: &str) -> Option<String> {
+    let variant = parse_model_variant(model).ok()?;
+    Some(format!(
+        "{} is licensed under the {}: {}.",
+        variant.display_name(),
+        variant.license_label()?,
+        variant.license_notice()?
+    ))
 }
 
 fn post_download_usage_label(model: &str) -> &'static str {
@@ -310,6 +326,28 @@ async fn wait_for_download_poll(server: &str, model: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fish Audio Drama 3's terms are printed before its download; a model
+    /// whose label says it all prints none.
+    #[test]
+    fn pull_shows_the_licence_terms_the_catalog_spells_out() {
+        assert_eq!(
+            license_terms("FishAudio-Drama-3").as_deref(),
+            Some(
+                "Fish Audio Drama 3 is licensed under the Fish Audio Community License v1.0: \
+                 Free for research and non-commercial use; commercial use only below USD 500k \
+                 annual revenue; offering it as a hosted service requires a licence from Fish \
+                 Audio."
+            )
+        );
+        assert_eq!(
+            license_terms("fishaudio/drama-3"),
+            license_terms("FishAudio-Drama-3")
+        );
+        assert_eq!(license_terms("FishAudio-S2-Pro"), None);
+        assert_eq!(license_terms("Kokoro-82M"), None);
+        assert_eq!(license_terms("not-a-model"), None);
+    }
 
     #[test]
     fn post_download_hint_for_voxtral_uses_transcribe() {
