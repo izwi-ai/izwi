@@ -1,7 +1,27 @@
 # Candle 0.11 Upgrade Notes
 
-Izwi is pinned to Candle `0.11.0` for `candle-core`, `candle-nn`,
-`candle-transformers`, `candle-metal-kernels`, and `candle-flash-attn`.
+Izwi is pinned to Candle `0.11.1` for `candle-core`, `candle-nn`,
+`candle-transformers`, `candle-kernels` (exactly), `candle-metal-kernels`, and
+`candle-flash-attn`.
+
+## 0.11.1
+
+`0.11.1` moved Candle's `zip` to 9, clearing the `zip` 8 advisories
+(RUSTSEC-2026-0367, -0368, -0369 and -0429) that `.cargo/audit.toml` had
+ignored; `tauri-plugin-updater 2.14.1` did the same for its `zip` 4. Despite the
+patch version it changes Candle's API:
+
+- `InplaceOp2` and `InplaceOp3` now run through `InplaceOpN<1>` and
+  `InplaceOpN<2>`. A source that aliases the destination is refused at run time
+  unless the op implements `InplaceOpN` with an access pattern.
+- The `ug` kernel compiler and `Device::compile` are gone.
+- A tensor's shape must match its buffer exactly: `Tensor::from_vec` with more
+  values than a fixed shape holds is now an error (0.11.0 kept the extra).
+- With Metal, storage is guarded by `parking_lot`: hold `candle_core::StorageRef`
+  rather than naming `std::sync::RwLockReadGuard`.
+- CPU SIMD, quantized (a weight repack path), CUDA and Metal backend code,
+  layer norm and MoE changed, so outputs can move within each model's
+  tolerances.
 
 ## Candle Dependency Source
 
@@ -80,4 +100,4 @@ scripts/ci/check-backend-truth.sh docker-cuda
 
 On the local macOS machine used for the upgrade, those CUDA compile gates stop at
 `Missing required command: nvcc`; dependency resolution still confirms Candle's
-CUDA path uses `cudarc v0.19.8` and `candle-flash-attn v0.11.0`.
+CUDA path uses `cudarc v0.19.10` and `candle-flash-attn v0.11.1`.

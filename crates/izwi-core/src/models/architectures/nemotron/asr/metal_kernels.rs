@@ -630,7 +630,7 @@ mod tests {
         };
 
         let input_values: Vec<f32> = (0..40).map(|idx| (idx as f32 - 11.0) * 0.125).collect();
-        let weight_values: Vec<f32> = (0..15).map(|idx| (idx as f32 - 4.0) * 0.0625).collect();
+        let weight_values: Vec<f32> = (0..10).map(|idx| (idx as f32 - 4.0) * 0.0625).collect();
         let input = Tensor::from_vec(input_values, (2, 2, 10), &device)?;
         let weight = Tensor::from_vec(weight_values, (2, 1, 5), &device)?;
 

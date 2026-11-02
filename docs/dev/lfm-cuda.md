@@ -1,6 +1,6 @@
 # LFM CUDA implementation and qualification
 
-LFM uses Candle 0.11.0. The text backbone and audio depthformer retain quantized
+LFM uses Candle 0.11.1. The text backbone and audio depthformer retain quantized
 projections; audio encoder/detokenizer components are dense. Backbone
 activations and recurrent rings are F32. Chat paged KV (LFM2.5 and LFM3) is F16
 on CUDA and Metal and F32 on the CPU; LFM2.5-Audio's KV is F32. A generic

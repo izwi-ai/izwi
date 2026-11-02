@@ -903,7 +903,7 @@ kernel void mr2_combine(
 
     /// A contiguous Metal tensor's buffer and byte offset.
     struct Bound<'a> {
-        guard: std::sync::RwLockReadGuard<'a, Storage>,
+        guard: candle_core::StorageRef<'a>,
         offset: usize,
     }
 
