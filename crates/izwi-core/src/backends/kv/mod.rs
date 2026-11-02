@@ -769,6 +769,19 @@ pub trait KvArena: Send + Sync {
     }
     fn paged_decode(&self, layer: KvLayerBinding, args: PagedKvDecodeArgs<'_>) -> Result<Tensor>;
 
+    /// [`Self::paged_decode`] where every row's output depends on its own
+    /// context only, never on the rows beside it or on how many there are
+    /// (batch-invariant decode). The default suits a backend whose decode
+    /// already computes each row alone; CUDA's split decode overrides it to
+    /// partition each row from its own length.
+    fn paged_decode_row_invariant(
+        &self,
+        layer: KvLayerBinding,
+        args: PagedKvDecodeArgs<'_>,
+    ) -> Result<Tensor> {
+        self.paged_decode(layer, args)
+    }
+
     fn operation_stats(&self) -> KvArenaOperationStats {
         KvArenaOperationStats::default()
     }

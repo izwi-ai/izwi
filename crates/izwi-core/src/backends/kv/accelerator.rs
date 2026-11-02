@@ -1708,10 +1708,35 @@ impl CandleAcceleratorKvArena {
         &self,
         layer: &AcceleratorLayerStorage,
         args: PagedKvDecodeArgs<'_>,
+        partitioning: crate::kernels::cuda::split_decode::SplitDecodePartitioning,
     ) -> Result<Tensor> {
+        use crate::kernels::cuda::split_decode::SplitDecodePartitioning;
         let device_metadata = self.cached_decode_plan(args.batch)?;
-        if let Some(output) = self.cuda_split_paged_decode(layer, &args, &device_metadata)? {
+        if let Some(output) =
+            self.cuda_split_paged_decode(layer, &args, &device_metadata, partitioning)?
+        {
             return Ok(output);
+        }
+        if partitioning == SplitDecodePartitioning::RowLength && args.batch.sequences.len() > 1 {
+            // The providers below size their partitions by the batch, so a
+            // batch-invariant decode the split kernel cannot serve runs them
+            // one row at a time: each call sees its own context only.
+            let mut outputs = Vec::with_capacity(args.batch.sequences.len());
+            for (row, sequence) in args.batch.sequences.iter().enumerate() {
+                let batch = KvDecodeBatchMetadata {
+                    sequences: vec![sequence.clone()],
+                };
+                let queries = args.queries.narrow(0, row, 1)?;
+                let row_args = PagedKvDecodeArgs {
+                    queries: &queries,
+                    batch: &batch,
+                    softmax_scale: args.softmax_scale,
+                    softcap: args.softcap,
+                };
+                let metadata = self.cached_decode_plan(&batch)?;
+                outputs.push(self.cuda_provider_paged_decode(layer, &row_args, &metadata)?);
+            }
+            return Ok(Tensor::cat(&outputs, 0)?);
         }
         self.cuda_provider_paged_decode(layer, &args, &device_metadata)
     }
@@ -1727,6 +1752,7 @@ impl CandleAcceleratorKvArena {
         layer: &AcceleratorLayerStorage,
         args: &PagedKvDecodeArgs<'_>,
         device_metadata: &DecodeDeviceMetadata,
+        partitioning: crate::kernels::cuda::split_decode::SplitDecodePartitioning,
     ) -> Result<Option<Tensor>> {
         use crate::kernels::cuda::split_decode;
 
@@ -1761,7 +1787,7 @@ impl CandleAcceleratorKvArena {
         };
         let batch = args.batch.sequences.len();
         let run = || {
-            split_decode::paged_decode(
+            split_decode::paged_decode_partitioned(
                 args.queries,
                 &layer.keys,
                 &layer.values,
@@ -1773,7 +1799,8 @@ impl CandleAcceleratorKvArena {
                 device_metadata.max_blocks,
                 args.softmax_scale,
                 args.softcap,
-                split_decode::partitions(batch, layer.num_kv_heads, device_metadata.max_context),
+                partitioning,
+                device_metadata.max_context,
             )
         };
         if verified {
@@ -1814,6 +1841,54 @@ impl CandleAcceleratorKvArena {
                 Ok(None)
             }
         }
+    }
+
+    /// The direct paged decode, with the split decode's `partitioning` on
+    /// CUDA (the other backends compute each row alone either way).
+    fn paged_decode_partitioned(
+        &self,
+        binding: KvLayerBinding,
+        args: PagedKvDecodeArgs<'_>,
+        partitioning: crate::kernels::cuda::split_decode::SplitDecodePartitioning,
+    ) -> Result<Tensor> {
+        probe_device_op("kv.paged_decode");
+        if !candle_accelerator_kv_support(self.backend).direct_paged_attention {
+            return Err(Error::InferenceError(format!(
+                "direct paged attention is not compiled for {:?}",
+                self.backend
+            )));
+        }
+        let _guard = self.mutation_lock.lock().map_err(|_| {
+            Error::InferenceError("accelerator KV mutation lock was poisoned".into())
+        })?;
+        let layers = self
+            .layers
+            .read()
+            .map_err(|_| Error::InferenceError("accelerator KV layer map was poisoned".into()))?;
+        let layer = self.layer_from(&layers, binding)?;
+        validate_decode_query(layer, &args, self.config.dtype, &self.device, self.backend)?;
+
+        #[cfg(feature = "cuda")]
+        if self.backend == BackendKind::Cuda {
+            let output = self.cuda_paged_decode(layer, args, partitioning)?;
+            self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
+            return Ok(output);
+        }
+
+        #[cfg(not(feature = "cuda"))]
+        let _ = partitioning;
+        #[cfg(feature = "metal")]
+        if self.backend == BackendKind::Metal {
+            let output = self.metal_paged_decode(layer, args)?;
+            self.record_attention_provider(KvAttentionProvider::MetalNative);
+            self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
+            return Ok(output);
+        }
+
+        Err(Error::InferenceError(format!(
+            "direct paged attention is unavailable for {:?}",
+            self.backend
+        )))
     }
 
     /// FlashAttention-2 when eligible, otherwise the native paged kernel.
@@ -2635,42 +2710,23 @@ impl KvArena for CandleAcceleratorKvArena {
     }
 
     fn paged_decode(&self, binding: KvLayerBinding, args: PagedKvDecodeArgs<'_>) -> Result<Tensor> {
-        probe_device_op("kv.paged_decode");
-        if !candle_accelerator_kv_support(self.backend).direct_paged_attention {
-            return Err(Error::InferenceError(format!(
-                "direct paged attention is not compiled for {:?}",
-                self.backend
-            )));
-        }
-        let _guard = self.mutation_lock.lock().map_err(|_| {
-            Error::InferenceError("accelerator KV mutation lock was poisoned".into())
-        })?;
-        let layers = self
-            .layers
-            .read()
-            .map_err(|_| Error::InferenceError("accelerator KV layer map was poisoned".into()))?;
-        let layer = self.layer_from(&layers, binding)?;
-        validate_decode_query(layer, &args, self.config.dtype, &self.device, self.backend)?;
+        self.paged_decode_partitioned(
+            binding,
+            args,
+            crate::kernels::cuda::split_decode::SplitDecodePartitioning::Occupancy,
+        )
+    }
 
-        #[cfg(feature = "cuda")]
-        if self.backend == BackendKind::Cuda {
-            let output = self.cuda_paged_decode(layer, args)?;
-            self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
-            return Ok(output);
-        }
-
-        #[cfg(feature = "metal")]
-        if self.backend == BackendKind::Metal {
-            let output = self.metal_paged_decode(layer, args)?;
-            self.record_attention_provider(KvAttentionProvider::MetalNative);
-            self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
-            return Ok(output);
-        }
-
-        Err(Error::InferenceError(format!(
-            "direct paged attention is unavailable for {:?}",
-            self.backend
-        )))
+    fn paged_decode_row_invariant(
+        &self,
+        binding: KvLayerBinding,
+        args: PagedKvDecodeArgs<'_>,
+    ) -> Result<Tensor> {
+        self.paged_decode_partitioned(
+            binding,
+            args,
+            crate::kernels::cuda::split_decode::SplitDecodePartitioning::RowLength,
+        )
     }
 
     fn operation_stats(&self) -> KvArenaOperationStats {
