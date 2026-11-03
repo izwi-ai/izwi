@@ -282,9 +282,12 @@ Every request is a retained engine row. The pieces:
   becomes the execution profile's `prefill_spans_required`
   (`engine/executor.rs`, `engine/scheduler/mod.rs`). The scheduler then
   prefills this model's prompts in resumable spans whatever the
-  chunked-prefill switch says. A one-hour prompt (about 45,000 audio tokens)
-  is 23 spans of 2,048 tokens on CUDA or 88 of 512 on CPU and Metal, so it
-  never holds the device for its whole prefill while other rows wait.
+  chunked-prefill switch says. A row prefilling alone takes the model's span
+  as its preferred prefill (`preferred_prefill_tokens`): a one-hour prompt
+  (about 45,000 audio tokens) is 23 spans of 2,048 tokens on CUDA or 88 of 512
+  on CPU and Metal. While other rows decode, the engine's prefill chunk caps
+  the span (512 on CUDA, 192 on CPU and Metal), so a prefill never holds the
+  device long while other rows wait for their next token.
 
 Decode rows run at the engine's tensor batch width for speech models: two rows
 on CPU and Metal unless `IZWI_MAX_BATCH_SIZE` sets one, and CUDA's automatic
@@ -552,8 +555,9 @@ The family's knobs, in [`env/core.md`](env/core.md):
 - `IZWI_NEMOTRON_TRANSCRIBE_FP8_MODE` (read at load): `w8a16` (default) or
   `vllm-fp8`. Anything else fails the load.
 - `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN` (read at load): the most prompt
-  tokens one row prefills per engine step, 16 to 16,384. Defaults to 2,048 on
-  CUDA and 512 on CPU and Metal; values outside the range are ignored.
+  tokens one row prefills per engine step, 16 to 16,384, and the span a row
+  prefilling alone takes. Defaults to 2,048 on CUDA and 512 on CPU and Metal;
+  values outside the range are ignored.
 - `IZWI_NEMOTRON_TRANSCRIBE_FUSED_DECODE` (read at load): any false value
   runs decode steps through the eager composition instead of the fused
   kernels (see [Decode step](#decode-step)).

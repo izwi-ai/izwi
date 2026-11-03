@@ -68,8 +68,10 @@ static NEXT_MODEL_IDENTITY: AtomicU64 = AtomicU64::new(1);
 pub const PREFILL_SPAN_ENV: &str = "IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN";
 
 /// The prefill span per row and quantum: 2,048 tokens on CUDA, 512 on CPU
-/// and Metal (a bounded dispatch between other users' decode steps; an
-/// hour's 45,000-token prompt is 23 or 88 spans), or the environment's.
+/// and Metal (an hour's 45,000-token prompt is 23 or 88 spans), or the
+/// environment's. A row takes it while it prefills alone; while other rows
+/// decode, the engine's prefill chunk caps it (512 on CUDA, 192 on CPU and
+/// Metal), a bounded dispatch between their steps.
 pub fn prefill_span(backend: crate::backends::BackendKind) -> usize {
     std::env::var(PREFILL_SPAN_ENV)
         .ok()

@@ -3652,6 +3652,16 @@ impl ModelExecutor for NativeExecutor {
                 .ok()
                 .map_or(0, |model| model.as_ref().preferred_prefill_tokens());
         }
+        // A Nemotron transcript prefilling alone takes its model's whole span
+        // (2,048 tokens on CUDA, 512 on CPU and Metal): fewer, wider GEMMs
+        // and one MoE routing readback per layer per span. While other rows
+        // decode, it takes the engine's chunk so their steps keep coming.
+        if variant.family() == crate::catalog::ModelFamily::NemotronTranscribeAsr {
+            profile.preferred_prefill_tokens =
+                crate::models::architectures::nemotron_transcribe::prefill_span(
+                    self.config.backend,
+                );
+        }
         // DS1.2b: hybrid contracts that declare committed-snapshot sharing get
         // their first prefill chunk aligned to the declared interval by the
         // scheduler so the fresh commit cursor can publish a snapshot.
