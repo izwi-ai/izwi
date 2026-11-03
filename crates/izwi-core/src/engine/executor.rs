@@ -3657,10 +3657,23 @@ impl ModelExecutor for NativeExecutor {
         // and one MoE routing readback per layer per span. While other rows
         // decode, it takes the engine's chunk so their steps keep coming.
         if variant.family() == crate::catalog::ModelFamily::NemotronTranscribeAsr {
-            profile.preferred_prefill_tokens =
-                crate::models::architectures::nemotron_transcribe::prefill_span(
-                    self.config.backend,
-                );
+            let model_arc = request
+                .prepared_asr_model_lease_for_executor()
+                .ok()
+                .flatten()
+                .map(|lease| lease.model_arc());
+            if let Some(model) = model_arc
+                .as_ref()
+                .and_then(|model| model.nemotron_transcribe().ok())
+            {
+                profile.preferred_prefill_tokens = model.prefill_span();
+                // Several decode steps per quantum, rows batched, while
+                // nothing waits; the scheduler's fairness gates drop to one
+                // step as soon as a request waits.
+                profile.preferred_decode_tokens = model.decode_quantum();
+                profile.sustained_decode_quantum = true;
+                profile.speculative_decode_batch = true;
+            }
         }
         // DS1.2b: hybrid contracts that declare committed-snapshot sharing get
         // their first prefill chunk aligned to the declared interval by the

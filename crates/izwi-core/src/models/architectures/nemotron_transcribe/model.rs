@@ -83,6 +83,35 @@ pub fn prefill_span(backend: crate::backends::BackendKind) -> usize {
         })
 }
 
+/// `IZWI_NEMOTRON_TRANSCRIBE_DECODE_QUANTUM`: the most decode steps a row
+/// runs in one engine quantum (1 to 64).
+pub const DECODE_QUANTUM_ENV: &str = "IZWI_NEMOTRON_TRANSCRIBE_DECODE_QUANTUM";
+
+/// Decode steps per engine quantum while nothing waits: 8 on Metal and
+/// CUDA, 4 on CPU, or the environment's. The scheduler grants them only
+/// when no request is waiting (one step a quantum otherwise), so a row's
+/// per-quantum engine work (Mamba staging, commit, scheduling) is paid once
+/// per several tokens without delaying anyone. Greedy decoding makes the
+/// transcript the same at any quantum.
+pub fn decode_quantum(backend: crate::backends::BackendKind) -> usize {
+    std::env::var(DECODE_QUANTUM_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|steps| (1..=64).contains(steps))
+        .unwrap_or(match backend {
+            crate::backends::BackendKind::Cpu => 4,
+            crate::backends::BackendKind::Cuda | crate::backends::BackendKind::Metal => 8,
+        })
+}
+
+fn backend_of(device: &Device) -> crate::backends::BackendKind {
+    match device {
+        Device::Cuda(_) => crate::backends::BackendKind::Cuda,
+        Device::Metal(_) => crate::backends::BackendKind::Metal,
+        Device::Cpu => crate::backends::BackendKind::Cpu,
+    }
+}
+
 /// `min(16384, ceil(8 * seconds) + 128)`, the decode a request books.
 pub fn planned_decode_tokens(audio_seconds: f32) -> usize {
     ((f64::from(audio_seconds.max(0.0)) * PLANNED_TOKENS_PER_SECOND).ceil() as usize
@@ -481,6 +510,10 @@ pub struct NemotronTranscribeModel {
     tag_ids: std::collections::HashSet<u32>,
     identity: u64,
     diagnostics: NemotronDiagnostics,
+    /// [`prefill_span`] and [`decode_quantum`] for this load's backend, read
+    /// at load.
+    prefill_span: usize,
+    decode_quantum: usize,
 }
 
 impl std::fmt::Debug for NemotronTranscribeModel {
@@ -645,7 +678,20 @@ impl NemotronTranscribeModel {
                 ..Default::default()
             },
             config,
+            prefill_span: prefill_span(backend_of(device)),
+            decode_quantum: decode_quantum(backend_of(device)),
         })
+    }
+
+    /// The prefill span a row takes while it prefills alone (read at load).
+    pub fn prefill_span(&self) -> usize {
+        self.prefill_span
+    }
+
+    /// The decode steps a row runs per engine quantum while nothing waits
+    /// (read at load).
+    pub fn decode_quantum(&self) -> usize {
+        self.decode_quantum
     }
 
     pub fn config(&self) -> &NemotronTranscribeConfig {

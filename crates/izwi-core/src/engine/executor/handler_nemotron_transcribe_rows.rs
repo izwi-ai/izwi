@@ -267,22 +267,41 @@ impl NativeExecutor {
                     Self::run_blocking(|| nemotron.retained_prefill(state, cache, span))?;
                 }
             } else {
-                let mut step_rows = Vec::with_capacity(armed);
-                for row in &mut batch.rows {
-                    if row.checkpoint.is_none() {
-                        continue;
+                // A quantum may grant a row several steps (the family's
+                // decode quantum while nothing waits): step the rows that
+                // still have steps together until each has run its own or
+                // finished.
+                let steps = batch
+                    .rows
+                    .iter()
+                    .filter(|row| row.checkpoint.is_some())
+                    .map(|row| scheduled[row.index].num_tokens.max(1))
+                    .max()
+                    .unwrap_or(1);
+                for step in 0..steps {
+                    let mut step_rows = Vec::with_capacity(armed);
+                    for row in &mut batch.rows {
+                        if row.checkpoint.is_none()
+                            || step >= scheduled[row.index].num_tokens.max(1)
+                        {
+                            continue;
+                        }
+                        let NemotronBatchRow { lease, cache, .. } = row;
+                        step_rows.push(NemotronStepRow {
+                            state: &mut lease
+                                .as_mut()
+                                .expect("armed Nemotron 3.5 Transcribe lease")
+                                .require_state_mut()?
+                                .state,
+                            cache,
+                        });
                     }
-                    let NemotronBatchRow { lease, cache, .. } = row;
-                    step_rows.push(NemotronStepRow {
-                        state: &mut lease
-                            .as_mut()
-                            .expect("armed Nemotron 3.5 Transcribe lease")
-                            .require_state_mut()?
-                            .state,
-                        cache,
-                    });
+                    let finished =
+                        Self::run_blocking(|| nemotron.retained_decode_batch(&mut step_rows))?;
+                    if finished.iter().all(|&finished| finished) {
+                        break;
+                    }
                 }
-                Self::run_blocking(|| nemotron.retained_decode_batch(&mut step_rows))?;
             }
             let mode = if is_prefill {
                 crate::engine::NativeBatchMode::Static
@@ -444,7 +463,9 @@ impl NativeExecutor {
                 } else {
                     append
                 },
-                tokens_generated: usize::from(!is_prefill),
+                // Each decode step appends the token it feeds and draws
+                // one; a decode quantum reports at least one, as before.
+                tokens_generated: if is_prefill { 0 } else { append.max(1) },
                 finished,
                 phase_timing_override: None,
                 asr_diagnostics,

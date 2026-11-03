@@ -1313,6 +1313,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Backend for the Nemotron 3.5 Transcribe L2 parity test: cpu, metal or cuda (the build must have that feature).",
     ),
     CoreEnvVar::new(
+        "IZWI_NEMOTRON_TRANSCRIBE_DECODE_QUANTUM",
+        Int,
+        "8 on Metal and CUDA, 4 on CPU",
+        Load,
+        "Most decode steps one Nemotron 3.5 Transcribe row runs per engine quantum while no request waits (1 to 64); values outside that range are ignored.",
+    ),
+    CoreEnvVar::new(
         "IZWI_NEMOTRON_TRANSCRIBE_FP8_MODE",
         Choice,
         "w8a16",

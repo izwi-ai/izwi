@@ -291,7 +291,13 @@ Every request is a retained engine row. The pieces:
 
 Decode rows run at the engine's tensor batch width for speech models: two rows
 on CPU and Metal unless `IZWI_MAX_BATCH_SIZE` sets one, and CUDA's automatic
-width.
+width. While no request waits or prefills, a decode quantum runs several steps
+(8 on Metal and CUDA, 4 on CPU; the profile's `preferred_decode_tokens` with
+`sustained_decode_quantum`), rows batched, so the engine's per-quantum work
+(Mamba staging, commit, scheduling) is paid once per several tokens. The
+scheduler drops back to one step a quantum as soon as a request waits or a
+running row is between prefill spans. Greedy decoding makes the transcript
+the same at any quantum.
 
 ### Decode step
 
@@ -552,6 +558,9 @@ are missing; a pass without them proves nothing.
 
 The family's knobs, in [`env/core.md`](env/core.md):
 
+- `IZWI_NEMOTRON_TRANSCRIBE_DECODE_QUANTUM` (read at load): the most
+  decode steps a row runs per engine quantum while no request waits, 1 to
+  64. Defaults to 8 on Metal and CUDA and 4 on CPU.
 - `IZWI_NEMOTRON_TRANSCRIBE_FP8_MODE` (read at load): `w8a16` (default) or
   `vllm-fp8`. Anything else fails the load.
 - `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN` (read at load): the most prompt

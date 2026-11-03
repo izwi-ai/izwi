@@ -225,6 +225,37 @@ async fn synthetic_single_row_resumes_prefill_across_spans() {
     assert!(!text.is_empty());
 }
 
+/// Several decode steps per engine quantum (the default while nothing
+/// waits) transcribe exactly as one step per quantum.
+// The env lock is held across awaits on purpose: it keeps the quantum
+// variable fixed while each runtime loads.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn synthetic_decode_quanta_transcribe_as_single_steps() {
+    use crate::models::architectures::nemotron_transcribe::DECODE_QUANTUM_ENV;
+    let _env = crate::env_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let models = synthetic_models_dir("quanta");
+    let clip = wav_bytes(&fox(0.0, 5.0));
+    let mut texts = Vec::new();
+    // Read at load: one runtime per quantum.
+    for steps in ["1", "4", "7"] {
+        std::env::set_var(DECODE_QUANTUM_ENV, steps);
+        let runtime = runtime_with(&models, 1).await;
+        texts.push(
+            transcribe(&runtime, &clip, None)
+                .await
+                .expect("transcribe")
+                .text,
+        );
+    }
+    std::env::remove_var(DECODE_QUANTUM_ENV);
+    assert!(!texts[0].is_empty());
+    assert_eq!(texts[1], texts[0]);
+    assert_eq!(texts[2], texts[0]);
+}
+
 /// The same rows on Metal (FP8 weights, F32 activations, F16 KV): load,
 /// resumable spans, and two concurrent rows transcribing as they do alone.
 #[cfg(feature = "metal")]
