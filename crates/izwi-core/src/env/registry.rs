@@ -438,7 +438,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Flag,
         "true",
         Load,
-        "On CUDA, Fish Audio Drama 3's fused trunk and tower steps replay a CUDA graph for each stretch between attention mixers (the trunk's DeltaNet and MoE layers; the tower's FFN, head race and next injection), captured per row count up to 4 (the tower's also per heads-policy set), checked bit for bit against the eager stretch on two steps, off for the process on any mismatch; never with a host-routed MoE layer. Any false value, or `IZWI_CUDA_DECODE_GRAPHS=off`, runs every stretch eagerly; the trunk's and tower's `decode_graphs` diagnostics report captures, replays and why the graphs are off.",
+        "On CUDA, Fish Audio Drama 3's fused trunk and tower steps replay a CUDA graph for each stretch between attention mixers (the trunk's DeltaNet and MoE layers; the tower's FFN, head race and next injection), captured per row count from 1 to 4 and at 8 (the tower's also per heads-policy set), checked bit for bit against the eager stretch on two steps, off for the process on any mismatch; never with a host-routed MoE layer. Any false value, or `IZWI_CUDA_DECODE_GRAPHS=off`, runs every stretch eagerly; the trunk's and tower's `decode_graphs` diagnostics report captures, replays and why the graphs are off.",
     ),
     CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_SLICE_DIR",
@@ -1380,7 +1380,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Flag,
         "true",
         Load,
-        "On CUDA, Nemotron 3.5 Transcribe's fused decode step replays a CUDA graph for each stretch of Mamba and MoE layers between attention layers (captured per row count up to 4, checked bit for bit against the eager stretch on two steps, off for the process on any mismatch). Any false value, or `IZWI_CUDA_DECODE_GRAPHS=off`, runs every stretch eagerly; `decode_graphs` in the diagnostics reports captures, replays and why the graphs are off.",
+        "On CUDA, Nemotron 3.5 Transcribe's fused decode step replays a CUDA graph for each stretch of Mamba and MoE layers between attention layers (captured per row count from 1 to 4 and at 8, checked bit for bit against the eager stretch on two steps, off for the process on any mismatch). Any false value, or `IZWI_CUDA_DECODE_GRAPHS=off`, runs every stretch eagerly; `decode_graphs` in the diagnostics reports captures, replays and why the graphs are off.",
     ),
     CoreEnvVar::new(
         "IZWI_NEMOTRON_TRANSCRIBE_TRANSLATION_SEGMENT_SECONDS",
