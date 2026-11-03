@@ -1581,39 +1581,22 @@ impl Qwen35FullAttention {
         let value_states = v_out.reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
         let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
         let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
-        let mut queries = Vec::with_capacity(batch_size);
-        let mut keys = Vec::with_capacity(batch_size);
-        let mut values = Vec::with_capacity(batch_size);
-        for row in 0..batch_size {
-            let q_row = query_states.i(row)?.unsqueeze(0)?;
-            let k_row = key_states.i(row)?.unsqueeze(0)?;
-            let row_rope = rope
-                .map(|table| -> Result<(Tensor, Tensor)> {
-                    Ok((
-                        table.cos.narrow(0, row, 1)?.contiguous()?,
-                        table.sin.narrow(0, row, 1)?.contiguous()?,
-                    ))
-                })
-                .transpose()?;
-            let (q_row, k_row) = self.apply_rope(
-                &q_row,
-                &k_row,
-                row_rope.as_ref().map(|(cos, sin)| (cos, sin)),
-            )?;
-            queries.push(q_row.reshape((self.num_heads, self.head_dim))?);
-            keys.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
-            values.push(
-                value_states
-                    .i(row)?
-                    .reshape((self.num_kv_heads, self.head_dim))?,
-            );
-        }
-        let query_refs = queries.iter().collect::<Vec<_>>();
-        let key_refs = keys.iter().collect::<Vec<_>>();
-        let value_refs = values.iter().collect::<Vec<_>>();
-        let queries = Tensor::stack(&query_refs, 0)?.contiguous()?;
-        let keys = Tensor::stack(&key_refs, 0)?.contiguous()?;
-        let values = Tensor::stack(&value_refs, 0)?.contiguous()?;
+        // One rotation for every row: the table is `(batch, 1, rope_dim / 2)`,
+        // so each row keeps its own position.
+        let (query_states, key_states) = self.apply_rope(
+            &query_states,
+            &key_states,
+            rope.map(|table| (&table.cos, &table.sin)),
+        )?;
+        let queries = query_states
+            .reshape((batch_size, self.num_heads, self.head_dim))?
+            .contiguous()?;
+        let keys = key_states
+            .reshape((batch_size, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let values = value_states
+            .reshape((batch_size, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
         let storage_dtype = first.arena().config().dtype;
         let output_dtype = queries.dtype();
         let queries = queries.to_dtype(storage_dtype)?;
@@ -1672,7 +1655,8 @@ impl Qwen35FullAttention {
             return Ok((query_states.clone(), key_states.clone()));
         };
         let tokens = query_states.dim(1)?;
-        if cos.dims() != [query_states.dim(0)?, tokens, self.rope_dim / 2] {
+        let rows = query_states.dim(0)?;
+        if cos.dims() != [rows, tokens, self.rope_dim / 2] {
             return Err(Error::InvalidInput(format!(
                 "Qwen3.5 rotary table {:?} does not match queries {:?}",
                 cos.dims(),
@@ -1685,13 +1669,13 @@ impl Qwen35FullAttention {
         let (query_rot, key_rot) = if self.should_try_rope_kernel(query_states.dtype()) {
             match try_apply_rope_thd(&query_rot, &key_rot, cos, sin)? {
                 Some((query_rot, key_rot)) => {
-                    for _ in 0..tokens {
+                    for _ in 0..rows * tokens {
                         record_rope_kernel();
                     }
                     (query_rot, key_rot)
                 }
                 None => {
-                    for _ in 0..tokens {
+                    for _ in 0..rows * tokens {
                         record_rope_manual();
                     }
                     (
@@ -1701,7 +1685,7 @@ impl Qwen35FullAttention {
                 }
             }
         } else {
-            for _ in 0..tokens {
+            for _ in 0..rows * tokens {
                 record_rope_manual();
             }
             (
