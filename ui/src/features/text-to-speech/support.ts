@@ -14,6 +14,40 @@ export function normalizeSpeechProcessingStatus(
   return "ready";
 }
 
+const PROCESSING_PROGRESS: Record<SpeechHistoryProcessingStatus, number> = {
+  pending: 0,
+  processing: 1,
+  ready: 2,
+  failed: 2,
+};
+
+type ProcessingState = {
+  processing_status?: SpeechHistoryProcessingStatus | null;
+  processing_error?: string | null;
+};
+
+/**
+ * The further along of a polled record's status and a local copy's. The
+ * copy (a created job's placeholder, a stream's start or final event) may
+ * run ahead of the record, never behind it: a long job created without a
+ * stream would otherwise read as queued until it finished. A tie keeps the
+ * record's.
+ */
+export function furthestSpeechProcessingStatus(
+  record: ProcessingState,
+  local: ProcessingState,
+): SpeechHistoryProcessingStatus {
+  const polled = normalizeSpeechProcessingStatus(
+    record.processing_status,
+    record.processing_error,
+  );
+  const copy = normalizeSpeechProcessingStatus(
+    local.processing_status,
+    local.processing_error,
+  );
+  return PROCESSING_PROGRESS[copy] > PROCESSING_PROGRESS[polled] ? copy : polled;
+}
+
 export function formatSpeechCreatedAt(timestampMs: number): string {
   if (!Number.isFinite(timestampMs)) {
     return "Unknown time";

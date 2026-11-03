@@ -1256,6 +1256,46 @@ describe("TextToSpeechPage", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows a job created without a stream as rendering once the server starts it", async () => {
+    hookMocks.useRouteModelSelection.mockReturnValue({
+      ...hookMocks.useRouteModelSelection(),
+      selectedModelInfo: {
+        variant: "Qwen3-TTS-12Hz-1.7B-Chat",
+        status: "ready",
+        speech_capabilities: buildSpeechCapabilities({ supports_streaming: false }),
+      },
+    });
+    apiMocks.createTextToSpeechRecord.mockResolvedValue(
+      buildRecord({ id: "tts-batch", processing_status: "pending" }),
+    );
+    apiMocks.getTextToSpeechRecord.mockResolvedValue(
+      buildRecord({ id: "tts-batch", processing_status: "processing" }),
+    );
+
+    renderRoute("/text-to-speech");
+
+    await waitFor(() =>
+      expect(apiMocks.listTextToSpeechRecords).toHaveBeenCalled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /New generation/i }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Script" }), {
+      target: { value: "A long script rendered as a job" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Create generation/i }));
+
+    await waitFor(() =>
+      expect(apiMocks.createTextToSpeechRecord).toHaveBeenCalled(),
+    );
+    expect(apiMocks.createTextToSpeechRecordStream).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(apiMocks.getTextToSpeechRecord).toHaveBeenCalledWith("tts-batch"),
+    );
+    expect(
+      await screen.findByText(/actively rendering audio/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/queued and will start shortly/)).toBeNull();
+  });
+
   it("deletes from the record detail page and navigates back to history", async () => {
     apiMocks.listTextToSpeechRecords.mockResolvedValue([buildSummary()]);
     apiMocks.getTextToSpeechRecord.mockResolvedValue(

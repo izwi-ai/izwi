@@ -31,6 +31,7 @@ import {
   speechListFilters,
 } from "@/features/text-to-speech/historyFilters";
 import {
+  furthestSpeechProcessingStatus,
   normalizeSpeechProcessingStatus,
   resolveSpeechVoiceLabel,
 } from "@/features/text-to-speech/support";
@@ -338,7 +339,7 @@ export function TextToSpeechPage({
 
     return {
       ...record,
-      processing_status: streamingRecord.processing_status,
+      processing_status: furthestSpeechProcessingStatus(record, streamingRecord),
       processing_error:
         streamingRecord.processing_error ?? record.processing_error,
       model_id: streamingRecord.model_id || record.model_id,

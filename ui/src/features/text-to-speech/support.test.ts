@@ -1,9 +1,51 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  furthestSpeechProcessingStatus,
   speechDownloadFilename,
   speechTextLabel,
 } from "@/features/text-to-speech/support";
+
+describe("furthestSpeechProcessingStatus", () => {
+  it("never holds a polled record behind a local copy", () => {
+    // A job created without a stream: its placeholder stays pending while
+    // the server renders.
+    expect(
+      furthestSpeechProcessingStatus(
+        { processing_status: "processing" },
+        { processing_status: "pending" },
+      ),
+    ).toBe("processing");
+    expect(
+      furthestSpeechProcessingStatus(
+        { processing_status: "failed", processing_error: "boom" },
+        { processing_status: "pending" },
+      ),
+    ).toBe("failed");
+  });
+
+  it("lets a stream's events run ahead of the polled record", () => {
+    expect(
+      furthestSpeechProcessingStatus(
+        { processing_status: "pending" },
+        { processing_status: "processing" },
+      ),
+    ).toBe("processing");
+    expect(
+      furthestSpeechProcessingStatus(
+        { processing_status: "processing" },
+        { processing_status: "ready" },
+      ),
+    ).toBe("ready");
+    // A tie between ends keeps the record's.
+    expect(
+      furthestSpeechProcessingStatus(
+        { processing_status: "failed", processing_error: "boom" },
+        { processing_status: "ready" },
+      ),
+    ).toBe("failed");
+  });
+});
 
 describe("speechTextLabel", () => {
   it("drops a dialogue's speaker tags and keeps performance tags", () => {
