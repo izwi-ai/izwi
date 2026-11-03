@@ -27,11 +27,13 @@ use candle_core::{DType, Device, Result, Tensor};
 pub const SPLIT_DECODE_ENV: &str = "IZWI_CUDA_SPLIT_DECODE";
 
 const MAX_GROUP: usize = 8;
+/// The wide-group kernel's cap: 16 query heads per KV head, at head dim 128.
+const WIDE_GROUP: usize = 16;
 const MAX_PARTITIONS: usize = 1024;
 /// One 32-key tile per warp of a 4-warp block.
 const MIN_PARTITION_TOKENS: usize = 128;
-/// About four resident blocks per SM on a 132-SM H100. With at most 8 query
-/// heads per KV head this also bounds the F32 partials to about 8 MiB until
+/// About four resident blocks per SM on a 132-SM H100. With at most 16 query
+/// heads per KV head this also bounds the F32 partials to about 16 MiB until
 /// the batch alone fills the GPU.
 const TARGET_BLOCKS: usize = 512;
 
@@ -41,7 +43,8 @@ pub fn enabled() -> bool {
 }
 
 /// Whether the kernel covers this geometry: F16/BF16 queries and KV, equal key
-/// and value head dims of 128 or 256, and at most 8 query heads per KV head.
+/// and value head dims of 128 or 256, and at most 8 query heads per KV head
+/// (16 at head dim 128).
 pub fn supported(
     dtype: DType,
     query_heads: usize,
@@ -54,7 +57,16 @@ pub fn supported(
         && matches!(key_dim, 128 | 256)
         && kv_heads > 0
         && query_heads.is_multiple_of(kv_heads)
-        && (1..=MAX_GROUP).contains(&(query_heads / kv_heads))
+        && (1..=group_cap(key_dim)).contains(&(query_heads / kv_heads))
+}
+
+/// The largest query-head group a head dim's kernels serve.
+fn group_cap(head_dim: usize) -> usize {
+    if head_dim == 128 {
+        WIDE_GROUP
+    } else {
+        MAX_GROUP
+    }
 }
 
 /// Partitions for the longest row: enough blocks to fill the GPU, but at least
@@ -564,8 +576,9 @@ mod cuda_impl {
                 let q = view::<$ty>(&q_storage, &queries, false)?;
                 let k = view::<$ty>(&k_storage, keys, true)?;
                 let v = view::<$ty>(&v_storage, values, true)?;
-                let partition_name = match head_dim {
-                    128 => concat!("physical_paged_decode_split_", $suffix, "_d128"),
+                let partition_name = match (head_dim, query_heads / kv_heads > super::MAX_GROUP) {
+                    (128, true) => concat!("physical_paged_decode_split_", $suffix, "_d128_g16"),
+                    (128, false) => concat!("physical_paged_decode_split_", $suffix, "_d128"),
                     _ => concat!("physical_paged_decode_split_", $suffix, "_d256"),
                 };
                 let function = device.get_or_load_custom_func(
@@ -650,7 +663,12 @@ mod tests {
             "split key/value dims"
         );
         assert!(!supported(DType::BF16, 16, 2, 64, 64));
-        assert!(!supported(DType::BF16, 64, 4, 128, 128), "group of 16");
+        assert!(
+            supported(DType::BF16, 32, 2, 128, 128),
+            "Nemotron-H: 16 at 128"
+        );
+        assert!(!supported(DType::BF16, 32, 2, 256, 256), "16 only at 128");
+        assert!(!supported(DType::BF16, 64, 2, 128, 128), "group of 32");
         assert!(!supported(DType::BF16, 12, 8, 128, 128), "ragged groups");
     }
 

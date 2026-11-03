@@ -56,6 +56,9 @@ rand = "0.10"
 rand_chacha = "0.10"
 rand_distr = "0.6"
 rayon = "1.11"
+# Candle 0.11.1's own GEMM (the same version), for the Q8_0 tile products
+# that write straight into their output columns (`kernels::cpu_q8`).
+gemm = "=0.19.0"
 regex = "1.12"
 # Chatterbox's Chinese frontend: Unicode general categories, and the
 # MessagePack feature table of its pkuseg segmenter.

@@ -154,3 +154,60 @@ EXPORT(__nv_bfloat16,bf16)
 extern "C" __global__ void qwen38_fp8_mv2_f16(const __half*x,const unsigned char*w,const float*s,__half*y,int M,int N,int K){mv2(x,w,s,y,M,N,K);}
 extern "C" __global__ void qwen38_fp8_mv2_bf16(const __nv_bfloat16*x,const unsigned char*w,const float*s,__nv_bfloat16*y,int M,int N,int K){mv2(x,w,s,y,M,N,K);}
 extern "C" __global__ void qwen38_fp8_mv_f32(const float*x,const unsigned char*w,const float*s,float*y,int M,int N,int K){mv(x,w,s,y,M,N,K);}
+
+// Vectorized decode GEMV over F32 activations and outputs, for decoders that
+// keep an F32 residual stream: one warp per output channel, eight channels a
+// block, up to four rows a block (grid.y covers more rows). Each lane loads
+// 16 E4M3 bytes at a time and 16 activations as four float4; every row sums
+// its dot product in the same order (lane sweeps of 512, then a butterfly)
+// whatever the row count, so a row's bits never depend on its batch.
+// epilogue 1 applies relu(y)^2 (a relu^2 MLP's up projection). Requires
+// K % 128 == 0 and 16-byte aligned rows.
+extern "C" __global__ void izwi_fp8_mv_f32(const float* __restrict__ x,
+                                           const unsigned char* __restrict__ w,
+                                           const float* __restrict__ s,
+                                           float* __restrict__ y, int M, int N, int K,
+                                           int epilogue) {
+  const int lane = threadIdx.x & 31, n = blockIdx.x * 8 + (threadIdx.x >> 5);
+  const int m0 = blockIdx.y * 4;
+  if (n >= N) return;
+  const unsigned char* row = w + (size_t)n * K;
+  const float* scales = s + (size_t)(n >> 7) * (K >> 7);
+  float acc[4] = {0, 0, 0, 0};
+  for (int k0 = lane * 16; k0 < K; k0 += 512) {
+    const uint4 q = *reinterpret_cast<const uint4*>(row + k0);
+    const float scale = scales[k0 >> 7];
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+      if (m0 + m < M) {
+        const float* xr = x + (size_t)(m0 + m) * K + k0;
+        float xv[16];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const float4 f = *reinterpret_cast<const float4*>(xr + 4 * i);
+          xv[4 * i] = f.x;
+          xv[4 * i + 1] = f.y;
+          xv[4 * i + 2] = f.z;
+          xv[4 * i + 3] = f.w;
+        }
+        float part = fp8_dot4(q.x, xv);
+        part += fp8_dot4(q.y, xv + 4);
+        part += fp8_dot4(q.z, xv + 8);
+        part += fp8_dot4(q.w, xv + 12);
+        acc[m] = fmaf(part, scale, acc[m]);
+      }
+    }
+  }
+#pragma unroll
+  for (int m = 0; m < 4; ++m) {
+    for (int d = 16; d; d >>= 1) acc[m] += __shfl_down_sync(0xffffffff, acc[m], d);
+    if (lane == 0 && m0 + m < M) {
+      float v = acc[m] * 256.f;
+      if (epilogue == 1) {
+        v = fmaxf(v, 0.f);
+        v = v * v;
+      }
+      y[(size_t)(m0 + m) * N + n] = v;
+    }
+  }
+}

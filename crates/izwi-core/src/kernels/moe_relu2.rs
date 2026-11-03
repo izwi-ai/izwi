@@ -34,6 +34,7 @@
 use candle_core::{DType, Device, Result, Tensor};
 
 use super::cuda::fp8::decode_e4m3fn;
+use super::metal_fp8_gemm;
 
 /// Most routed experts the router kernel holds (16 per lane, 32 lanes).
 pub const MAX_EXPERTS: usize = 512;
@@ -45,16 +46,26 @@ pub const GROUPED_MIN_PAIRS: usize = 32;
 /// Fewest tokens a call runs as dequantized GEMMs: above every decode width
 /// (CUDA's largest is 32 rows), so decode steps always take the warp kernels.
 pub const GEMM_MIN_TOKENS: usize = 64;
-/// Routed pairs per expert from which the dequantized GEMMs beat the warp
-/// kernels: the GEMM form pays one dequantization per touched expert, the
-/// warp kernels a pass over the weights per pair. Measured on an M-series
-/// GPU in the published geometry (64 experts: the warp kernels win at 128
-/// tokens, about 9 pairs per expert, the GEMMs from 256, about 18).
+/// Routed pairs per expert from which CUDA's dequantized GEMMs beat the
+/// warp kernels: the GEMM form pays one dequantization per touched expert,
+/// the warp kernels a pass over the weights per pair. Measured on an
+/// M-series GPU with the expanded form in the published geometry (64
+/// experts: the warp kernels won at 128 tokens, about 9 pairs per expert,
+/// the GEMMs from 256, about 18).
 pub const GEMM_MIN_PAIRS_PER_EXPERT: usize = 16;
+/// The same for Metal's tiled GEMMs, which read the FP8 bytes in place:
+/// they win from 64 tokens (6 pairs per expert over 64 experts; 19 against
+/// 24 ms) and lose at 32 (3 pairs; 18 against 13 ms).
+pub const TILED_GEMM_MIN_PAIRS_PER_EXPERT: usize = 5;
 
-/// Whether [`experts`] runs a call of `tokens` tokens as dequantized GEMMs.
-pub fn uses_gemm(tokens: usize, top_k: usize, experts: usize) -> bool {
-    tokens >= GEMM_MIN_TOKENS && tokens * top_k >= GEMM_MIN_PAIRS_PER_EXPERT * experts
+/// Whether [`experts`] runs a call of `tokens` tokens on `device` as GEMMs.
+pub fn uses_gemm(device: &Device, tokens: usize, top_k: usize, experts: usize) -> bool {
+    let per_expert = if device.is_metal() {
+        TILED_GEMM_MIN_PAIRS_PER_EXPERT
+    } else {
+        GEMM_MIN_PAIRS_PER_EXPERT
+    };
+    tokens >= GEMM_MIN_TOKENS && tokens * top_k >= per_expert * experts
 }
 /// Values one warp covers per sweep: 16 bytes per lane, 32 lanes.
 const SWEEP: usize = 512;
@@ -266,7 +277,7 @@ pub fn experts(
         )
     }
     let (x, routing) = (x.contiguous()?, routing.contiguous()?);
-    if uses_gemm(tokens, top_k, weights.experts) && !x.device().is_cpu() {
+    if !x.device().is_cpu() && uses_gemm(x.device(), tokens, top_k, weights.experts) {
         return experts_by_gemm(&x, &routing, top_k, weights);
     }
     let grouped = tokens * top_k >= GROUPED_MIN_PAIRS;
@@ -338,11 +349,129 @@ pub fn dequantize_expert(
     Tensor::from_vec(values, (rows, cols), stacked.device())?.to_dtype(dtype)
 }
 
+/// Whether [`experts_by_gemm`] runs on the tiled FP8 GEMMs
+/// (`kernels::metal_fp8_gemm`): Metal, with both projections' widths
+/// multiples of the tile depth.
+fn tiled_gemms(device: &Device, weights: &StackedExperts) -> bool {
+    metal_fp8_gemm::supported(device, weights.inter, weights.hidden)
+        && metal_fp8_gemm::supported(device, weights.hidden, weights.inter)
+        && u32::try_from(weights.experts * weights.inter * weights.hidden).is_ok()
+}
+
 /// The long-span form of [`experts`]: the routing read once, then per
-/// touched expert `down(relu(x_e @ up.T)^2) * w` as dense GEMMs on the
-/// expert's transiently dequantized weights (F32 on Metal, BF16 on CUDA,
-/// accumulated in F32), scattered back by token.
+/// touched expert `down(relu(x_e @ up.T)^2)` as dense GEMMs, scaled by the
+/// routing weights and summed per token in expert order. Every expert's
+/// tokens are gathered at once and their outputs collected expert-major, so
+/// a span uploads a few index arrays and never copies the whole output per
+/// expert. Metal runs every expert in two tiled launches that read the FP8
+/// bytes in place ([`tiled_gemms`]); CUDA multiplies each expert's
+/// transiently dequantized BF16 weights (accumulated in F32).
 fn experts_by_gemm(
+    x: &Tensor,
+    routing: &Tensor,
+    top_k: usize,
+    weights: &StackedExperts,
+) -> Result<Tensor> {
+    let device = x.device();
+    let (tokens, hidden) = x.dims2()?;
+    let dtype = if device.is_cuda() {
+        DType::BF16
+    } else {
+        DType::F32
+    };
+    let host = routing.flatten_all()?.to_vec1::<f32>()?;
+    // Each token's valid slots, in expert order, and each expert's tokens.
+    let mut assigned = vec![Vec::<(u32, f32)>::new(); weights.experts];
+    for (token, row) in host.chunks_exact(2 * top_k).enumerate() {
+        for slot in 0..top_k {
+            let id = row[slot];
+            if id >= 0.0 && (id as usize) < weights.experts {
+                assigned[id as usize].push((token as u32, row[top_k + slot]));
+            }
+        }
+    }
+    let pairs = assigned.iter().map(Vec::len).sum::<usize>();
+    if pairs == 0 {
+        return x.zeros_like();
+    }
+    let mut order = Vec::with_capacity(pairs);
+    let mut combine = Vec::with_capacity(pairs);
+    // `slots[s][t]`: the row of token `t`'s `s`-th expert (in expert order)
+    // among the pairs, or the zero row past them.
+    let mut slots = vec![vec![pairs as u32; tokens]; top_k];
+    let mut filled = vec![0usize; tokens];
+    for tokens_of in &assigned {
+        for &(token, weight) in tokens_of {
+            let t = token as usize;
+            slots[filled[t]][t] = order.len() as u32;
+            filled[t] += 1;
+            order.push(token);
+            combine.push(weight);
+        }
+    }
+    let used = filled.iter().copied().max().unwrap_or(0);
+    let order = Tensor::from_vec(order, pairs, device)?;
+    let slots = Tensor::from_vec(slots[..used].concat(), (used, tokens), device)?;
+    let gathered = x.index_select(&order, 0)?.to_dtype(dtype)?;
+    let y = if tiled_gemms(device, weights) {
+        // Two launches over every touched expert, reading the FP8 bytes in
+        // place: relu² and the combine weights fused into the epilogues.
+        let groups = assigned
+            .iter()
+            .enumerate()
+            .filter(|(_, tokens_of)| !tokens_of.is_empty())
+            .map(|(e, tokens_of)| (e, tokens_of.len()))
+            .collect::<Vec<_>>();
+        let combine = Tensor::from_vec(combine, pairs, device)?;
+        let h = metal_fp8_gemm::grouped_gemm(
+            &gathered,
+            &weights.up,
+            &weights.up_scale,
+            &groups,
+            metal_fp8_gemm::Epilogue::ReluSquare,
+            None,
+        )?;
+        metal_fp8_gemm::grouped_gemm(
+            &h,
+            &weights.down,
+            &weights.down_scale,
+            &groups,
+            metal_fp8_gemm::Epilogue::None,
+            Some(&combine),
+        )?
+    } else {
+        let combine = Tensor::from_vec(combine, (pairs, 1), device)?;
+        let mut ys = Vec::with_capacity(weights.experts + 1);
+        let mut at = 0;
+        for (e, tokens_of) in assigned.iter().enumerate() {
+            if tokens_of.is_empty() {
+                continue;
+            }
+            let xe = gathered.narrow(0, at, tokens_of.len())?;
+            at += tokens_of.len();
+            let up = dequantize_expert(&weights.up, &weights.up_scale, e, dtype)?;
+            let h = xe.matmul(&up.t()?)?.to_dtype(DType::F32)?.relu()?.sqr()?;
+            drop(up);
+            let down = dequantize_expert(&weights.down, &weights.down_scale, e, dtype)?;
+            ys.push(h.to_dtype(dtype)?.matmul(&down.t()?)?);
+        }
+        Tensor::cat(&ys, 0)?
+            .to_dtype(DType::F32)?
+            .broadcast_mul(&combine)?
+    };
+    let y = Tensor::cat(&[&y, &Tensor::zeros((1, hidden), DType::F32, device)?], 0)?;
+    let mut out = x.zeros_like()?;
+    for s in 0..used {
+        out = (out + y.index_select(&slots.get(s)?, 0)?)?;
+    }
+    Ok(out)
+}
+
+/// The previous long-span form: per touched expert, its own uploads and an
+/// `index_add` over the whole output. [`experts_by_gemm`] must match it
+/// bit for bit.
+#[cfg(test)]
+fn experts_by_gemm_per_expert(
     x: &Tensor,
     routing: &Tensor,
     top_k: usize,
@@ -1728,12 +1857,13 @@ mod tests {
     #[test]
     fn long_spans_switch_to_gemms_but_decode_never_does() {
         // Published geometry: 128 experts, top 6.
-        assert!(!uses_gemm(32, 6, 128));
-        assert!(!uses_gemm(256, 6, 128));
-        assert!(uses_gemm(512, 6, 128));
-        assert!(uses_gemm(2048, 6, 128));
+        let cpu = Device::Cpu;
+        assert!(!uses_gemm(&cpu, 32, 6, 128));
+        assert!(!uses_gemm(&cpu, 256, 6, 128));
+        assert!(uses_gemm(&cpu, 512, 6, 128));
+        assert!(uses_gemm(&cpu, 2048, 6, 128));
         // Few experts: still never below the decode floor.
-        assert!(!uses_gemm(GEMM_MIN_TOKENS - 1, 6, 1));
+        assert!(!uses_gemm(&cpu, GEMM_MIN_TOKENS - 1, 6, 1));
     }
 
     /// Times the warp kernels against the dequantized-GEMM form across span
@@ -1821,6 +1951,101 @@ mod tests {
             });
             let gemm = time(&|| experts_by_gemm(&x, &routing, top_k, &weights).unwrap());
             eprintln!("{tokens:>4} tokens: warp {warp:8.3} ms, gemm {gemm:8.3} ms");
+        }
+    }
+
+    /// On Metal the tiled grouped GEMMs sum each dot product in their own
+    /// order, so they match the per-expert form to rounding, including a
+    /// token with an invalid slot and experts no token picks.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_the_tiled_gemm_form_matches_its_per_expert_form() {
+        let Some((device, _lease)) = metal() else {
+            return;
+        };
+        gemm_form_matches_its_per_expert_form(&device);
+    }
+
+    /// On CUDA the batched GEMM form makes the per-expert form's output bit
+    /// for bit (same BF16 GEMM shapes through cuBLAS, the same F32 sums per
+    /// token in expert order).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_the_gemm_form_matches_its_per_expert_form_bit_for_bit() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        gemm_form_matches_its_per_expert_form(&device);
+    }
+
+    #[allow(dead_code)]
+    fn gemm_form_matches_its_per_expert_form(device: &Device) {
+        let (experts_n, top_k, tokens) = (16usize, 4usize, 96usize);
+        let bytes = |len: usize, seed: u64| {
+            xorshift_values(len, seed, 1.0)
+                .into_iter()
+                .map(|v| ((v + 1.0) * 100.0) as u8 & 0x77)
+                .collect::<Vec<u8>>()
+        };
+        let weights = StackedExperts::new(
+            Tensor::from_vec(
+                bytes(experts_n * INTER * HIDDEN, 1),
+                (experts_n, INTER, HIDDEN),
+                device,
+            )
+            .unwrap(),
+            Tensor::from_vec(vec![2e-3f32; experts_n], experts_n, device).unwrap(),
+            Tensor::from_vec(
+                bytes(experts_n * HIDDEN * INTER, 2),
+                (experts_n, HIDDEN, INTER),
+                device,
+            )
+            .unwrap(),
+            Tensor::from_vec(vec![1e-3f32; experts_n], experts_n, device).unwrap(),
+        )
+        .unwrap();
+        let spec = SigmoidRouting {
+            experts: experts_n,
+            top_k,
+            scale: 2.5,
+        };
+        let x = Tensor::from_vec(
+            xorshift_values(tokens * HIDDEN, 5, 1.0),
+            (tokens, HIDDEN),
+            device,
+        )
+        .unwrap();
+        // Half the experts only, so some are never picked.
+        let logits = xorshift_values(tokens * experts_n, 6, 2.0)
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                if i % experts_n >= experts_n / 2 {
+                    v - 50.0
+                } else {
+                    v
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut routing = route_reference(&logits, &vec![0.0; experts_n], spec);
+        routing[0] = -1.0;
+        let routing = Tensor::from_vec(routing, (tokens, 2 * top_k), device).unwrap();
+        let host = |t: Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let batched = host(experts_by_gemm(&x, &routing, top_k, &weights).unwrap());
+        let per_expert = host(experts_by_gemm_per_expert(&x, &routing, top_k, &weights).unwrap());
+        if tiled_gemms(device, &weights) {
+            assert!(
+                rel_l2(&batched, &per_expert) < 1e-5,
+                "{}",
+                rel_l2(&batched, &per_expert)
+            );
+            // Token 0's invalid slot still contributes nothing.
+            assert!(batched.iter().all(|v| v.is_finite()));
+        } else {
+            assert_eq!(
+                batched.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                per_expert.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
         }
     }
 }

@@ -948,12 +948,12 @@ mod metal {
         );
         // A row's planned codec workspace and the two reference preparations
         // are the published codec's (about 2 GB and 23 GB), so a 16 GB Mac's
-        // default budget seals one row. Width 2 raises the advisory budget so
-        // two rows seal; the synthetic rows allocate a few MB each.
-        let _budget = EnvValue::set(
-            "IZWI_METAL_MEMORY_BUDGET_BYTES",
-            width_two.then_some("51539607552"),
-        );
+        // default budget seals one row, and a CI runner's (a 7 GB VM)
+        // refuses the reference clone below outright. Both widths raise the
+        // advisory budget (width 2 so that two rows seal); the batching
+        // switch alone sets the width, and the synthetic rows allocate a few
+        // MB each.
+        let _budget = EnvValue::set("IZWI_METAL_MEMORY_BUDGET_BYTES", Some("51539607552"));
         let models = models_dir(if width_two { "width-2" } else { "width-1" });
         let baseline = RuntimeService::new(config(&models)).expect("runtime");
         let reserved_before = baseline.coordinator_snapshot().reserved_memory_bytes;

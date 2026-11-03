@@ -1323,7 +1323,8 @@ pub struct ExecutionProfile {
     /// The loaded family's own prefill grid, in prompt tokens (0: none). A
     /// resumable prefill quantum is then exactly the next cell of the grid,
     /// never cut to the engine's chunk or step budget: the family's span
-    /// bits depend on how the prompt splits (Fish Audio Drama 3).
+    /// bits depend on how the prompt splits (Fish Audio Drama 3, Nemotron
+    /// 3.5 Transcribe).
     #[serde(default)]
     pub prefill_grid_tokens: usize,
     pub resolved_from_loaded_model: bool,

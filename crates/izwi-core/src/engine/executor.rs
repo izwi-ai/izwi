@@ -3652,6 +3652,29 @@ impl ModelExecutor for NativeExecutor {
                 .ok()
                 .map_or(0, |model| model.as_ref().preferred_prefill_tokens());
         }
+        // A Nemotron transcript prefills on its model's span grid (512 tokens
+        // on CUDA, 192 on CPU and Metal): the span's rounding is part of the
+        // transcript, so a row's spans never stretch while it runs alone or
+        // shrink to a step's leftover budget beside other rows.
+        if variant.family() == crate::catalog::ModelFamily::NemotronTranscribeAsr {
+            let model_arc = request
+                .prepared_asr_model_lease_for_executor()
+                .ok()
+                .flatten()
+                .map(|lease| lease.model_arc());
+            if let Some(model) = model_arc
+                .as_ref()
+                .and_then(|model| model.nemotron_transcribe().ok())
+            {
+                profile.prefill_grid_tokens = model.prefill_span();
+                // Several decode steps per quantum, rows batched, while
+                // nothing waits; the scheduler's fairness gates drop to one
+                // step as soon as a request waits.
+                profile.preferred_decode_tokens = model.decode_quantum();
+                profile.sustained_decode_quantum = true;
+                profile.speculative_decode_batch = true;
+            }
+        }
         // DS1.2b: hybrid contracts that declare committed-snapshot sharing get
         // their first prefill chunk aligned to the declared interval by the
         // scheduler so the fresh commit cursor can publish a snapshot.
@@ -5225,6 +5248,19 @@ impl UnifiedExecutor {
         executor.execution_profile(request)
     }
 
+    /// Run `work` on the device thread and wait for it. Publishing or
+    /// discarding a pending quantum commits, restores or drops executor
+    /// state, device tensors included: a CUDA buffer freed on an engine
+    /// worker has no current context there, and the driver error it leaves
+    /// on the context fails the next device call. Short leaf work, like a KV
+    /// page op. Device-less test executors run it inline.
+    fn run_on_device<T: Send>(&self, work: impl FnOnce() -> T + Send) -> Result<T> {
+        match &self.device {
+            Some(device) => device.run_sync(work),
+            None => Ok(work()),
+        }
+    }
+
     pub(crate) fn has_pending_quantum(&self, plan_id: PlanId, session: &SessionKey) -> bool {
         self.pending_quantum_finalizer
             .as_ref()
@@ -5244,7 +5280,7 @@ impl UnifiedExecutor {
         if prepared == PendingQuantumFinalizeStatus::NotFound {
             return Ok(prepared);
         }
-        finalizer.publish(plan_id, session)
+        self.run_on_device(|| finalizer.publish(plan_id, session))?
     }
 
     pub(crate) fn prepare_pending_quantum(
@@ -5267,12 +5303,14 @@ impl UnifiedExecutor {
         let Some(finalizer) = self.pending_quantum_finalizer.as_ref() else {
             return Ok(PendingQuantumFinalizeStatus::NotFound);
         };
-        finalizer.publish(plan_id, session)
+        self.run_on_device(|| finalizer.publish(plan_id, session))?
     }
 
     pub(crate) fn discard_prepared_quantum(&self, plan_id: PlanId, session: &SessionKey) {
         if let Some(finalizer) = self.pending_quantum_finalizer.as_ref() {
-            finalizer.discard(plan_id, session);
+            if let Err(error) = self.run_on_device(|| finalizer.discard(plan_id, session)) {
+                error!("Pending quantum discard did not run: {error}");
+            }
         }
     }
 
@@ -5482,6 +5520,26 @@ mod tests {
         session: SessionKey,
         calls: Mutex<Vec<(PlanId, PendingQuantumDecision)>>,
         prepared: Mutex<bool>,
+        /// The threads publications and discards ran on.
+        threads: Mutex<Vec<Option<String>>>,
+    }
+
+    impl RecordingPendingFinalizer {
+        fn new(session: SessionKey) -> Self {
+            Self {
+                session,
+                calls: Mutex::new(Vec::new()),
+                prepared: Mutex::new(false),
+                threads: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record_thread(&self) {
+            self.threads
+                .lock()
+                .unwrap()
+                .push(std::thread::current().name().map(str::to_string));
+        }
     }
 
     impl PendingQuantumFinalizer for RecordingPendingFinalizer {
@@ -5508,6 +5566,7 @@ mod tests {
             plan_id: PlanId,
             session: &SessionKey,
         ) -> Result<PendingQuantumFinalizeStatus> {
+            self.record_thread();
             if plan_id != 41 || session != &self.session || !*self.prepared.lock().unwrap() {
                 return Ok(PendingQuantumFinalizeStatus::NotFound);
             }
@@ -5516,6 +5575,7 @@ mod tests {
         }
 
         fn discard(&self, _plan_id: PlanId, _session: &SessionKey) {
+            self.record_thread();
             *self.prepared.lock().unwrap() = false;
         }
     }
@@ -5570,11 +5630,7 @@ mod tests {
     #[test]
     fn unified_pending_quantum_finalizer_is_exact_and_model_neutral() {
         let session = SessionKey::new("pending-finalizer".to_string(), 9);
-        let finalizer = Arc::new(RecordingPendingFinalizer {
-            session: session.clone(),
-            calls: Mutex::new(Vec::new()),
-            prepared: Mutex::new(false),
-        });
+        let finalizer = Arc::new(RecordingPendingFinalizer::new(session.clone()));
         let executor = UnifiedExecutor::new_for_test(Box::new(PanickingPhysicalExecutor))
             .with_pending_quantum_finalizer_for_test(finalizer.clone());
 
@@ -5589,6 +5645,50 @@ mod tests {
         assert_eq!(
             finalizer.calls.lock().unwrap().as_slice(),
             &[(41, PendingQuantumDecision::Abort)]
+        );
+    }
+
+    /// Publishing or discarding a pending quantum commits, restores or drops
+    /// executor state, device tensors included, so it runs on the device
+    /// thread, never on the engine worker that commits the step: a CUDA
+    /// buffer freed there has no current context, and the error it leaves on
+    /// the context fails the next decode (`CUDA_ERROR_INVALID_CONTEXT`).
+    #[test]
+    fn pending_quantum_publication_and_discard_run_on_the_device_thread() {
+        let session = SessionKey::new("pending-on-device".to_string(), 3);
+        let finalizer = Arc::new(RecordingPendingFinalizer::new(session.clone()));
+        let device = DeviceThread::for_location(candle_core::DeviceLocation::Cpu).unwrap();
+        let device_name = device
+            .run_sync(|| std::thread::current().name().map(str::to_string))
+            .unwrap();
+        assert!(device_name.is_some());
+        let executor = UnifiedExecutor::new_for_test(Box::new(PanickingPhysicalExecutor))
+            .with_device_for_test(device)
+            .with_pending_quantum_finalizer_for_test(finalizer.clone());
+
+        assert_eq!(
+            executor
+                .finalize_pending_quantum(41, &session, PendingQuantumDecision::Commit)
+                .unwrap(),
+            PendingQuantumFinalizeStatus::Finalized
+        );
+        executor
+            .prepare_pending_quantum(41, &session, PendingQuantumDecision::Commit)
+            .unwrap();
+        assert_eq!(
+            executor.publish_pending_quantum(41, &session).unwrap(),
+            PendingQuantumFinalizeStatus::Finalized
+        );
+        executor
+            .prepare_pending_quantum(41, &session, PendingQuantumDecision::Abort)
+            .unwrap();
+        executor.discard_prepared_quantum(41, &session);
+
+        let threads = finalizer.threads.lock().unwrap().clone();
+        assert_eq!(threads, vec![device_name; 3]);
+        assert_ne!(
+            threads[0],
+            std::thread::current().name().map(str::to_string)
         );
     }
 

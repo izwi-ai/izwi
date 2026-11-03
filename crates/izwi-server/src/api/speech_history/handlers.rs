@@ -1804,6 +1804,13 @@ async fn execute_batch_tts_stage(
                     crate::batch_runtime::worker::DeterministicStageFailure(err.message).into(),
                 );
             }
+            // So does a segment that published audio: a retry would refuse
+            // to speak it again, and that refusal would replace this error.
+            if let Some(attempt) = attempt.as_ref() {
+                if durable::published_partial_segment(state, attempt).await {
+                    return Err(crate::batch_runtime::worker::FinalStageFailure(err.message).into());
+                }
+            }
             anyhow::bail!("{}", err.message);
         }
     };

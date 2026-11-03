@@ -3,7 +3,8 @@
 //! quanta and finished generations, on the CPU, Metal and CUDA. A device
 //! load runs its backend's self-checks (`metal::self_check`,
 //! `cuda::self_check`) before it serves, and its decode samples on the
-//! device with two readbacks a frame (`device::sampling`).
+//! device, reading each frame back once on the fused path and twice with it
+//! off (`device::sampling`).
 //!
 //! A request ([`FishDrama3RequestState`]) owns its retained state: the
 //! trunk's DeltaNet state, its two paged KV views ("trunk" and "tower",
@@ -51,6 +52,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use candle_core::{DType, Device, Tensor};
 use serde_json::json;
@@ -62,8 +64,10 @@ use super::codec::{
 };
 use super::config::{FishDrama3Config, FishDrama3ConfigPolicy};
 use super::device::sampling::{
-    count_fallback, device_cap, race as device_race, rank, read_back, DEVICE_RANKS,
+    count_fallback, device_cap, race as device_race, race_policy, rank, read_back, DEVICE_RANKS,
 };
+use super::device::tower::DeviceCodes;
+use super::device::{record_step_section, FishDrama3DecodePath, StepSection};
 use super::embed::{prompt_rows, FishDrama3Embedding};
 use super::head::FishDrama3CompactHead;
 use super::precision::{
@@ -76,20 +80,21 @@ use super::reference_cache::{FishDrama3ReferenceAudio, FishDrama3ReferenceCache,
 use super::residency::FishDrama3Residency;
 use super::sampling::{
     race as host_race, FishDrama3DrawPolicy, FishDrama3MainDraw, FishDrama3RowSampler,
-    FishDrama3SamplerCheckpoint, FishDrama3SamplingParams,
+    FishDrama3SamplerCheckpoint, FishDrama3SamplingParams, RAS_WINDOW,
 };
 use super::tokenizer::FishDrama3Tokenizer;
 use super::tower::{
-    check_lengths, FishDrama3Tower, FishDrama3TowerCheckpoint, FishDrama3TowerOptions,
-    FishDrama3TowerStepRow,
+    check_lengths, FishDrama3ResidentTowerRow, FishDrama3ResidentTowerStep, FishDrama3Tower,
+    FishDrama3TowerCheckpoint, FishDrama3TowerOptions, FishDrama3TowerStepRow,
 };
 use super::trunk::{
-    FishDrama3StepRow, FishDrama3Trunk, FishDrama3TrunkCheckpoint, FishDrama3TrunkOptions,
-    FishDrama3TrunkState,
+    FishDrama3ResidentTrunkStep, FishDrama3StepRow, FishDrama3Trunk, FishDrama3TrunkCheckpoint,
+    FishDrama3TrunkOptions, FishDrama3TrunkState,
 };
 use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
+use crate::kernels::race_sampler::race_sample;
 use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
@@ -235,6 +240,9 @@ pub struct FishDrama3ModelOptions {
     /// BF16 on CUDA, F32 on the CPU), `Some(F32)` for F32 throughout on
     /// Metal (`IZWI_FISH_DRAMA3_DTYPE`).
     pub activations: Option<DType>,
+    /// The CPU's paged KV dtype: F32, or F16 under
+    /// `IZWI_FISH_DRAMA3_CPU_F16_KV` (`physical::kv_dtype`).
+    pub cpu_kv_dtype: DType,
 }
 
 impl Default for FishDrama3ModelOptions {
@@ -245,15 +253,17 @@ impl Default for FishDrama3ModelOptions {
             prefill_span_rows: DEFAULT_PREFILL_SPAN_ROWS,
             config_policy: FishDrama3ConfigPolicy::Published,
             activations: None,
+            cpu_kv_dtype: DType::F32,
         }
     }
 }
 
 impl FishDrama3ModelOptions {
     /// The defaults with the load-time environment over them for a load on
-    /// `residency`: `IZWI_FISH_DRAMA3_DTYPE`, `IZWI_FISH_DRAMA3_MOE_BACKEND`
-    /// and `IZWI_FISH_DRAMA3_PREFILL_SPAN` (over `prefill_span_rows`, the
-    /// backend's default cell), each validated.
+    /// `residency`: `IZWI_FISH_DRAMA3_DTYPE`, `IZWI_FISH_DRAMA3_MOE_BACKEND`,
+    /// `IZWI_FISH_DRAMA3_PREFILL_SPAN` (over `prefill_span_rows`, the
+    /// backend's default cell) and `IZWI_FISH_DRAMA3_CPU_F16_KV`, each
+    /// validated.
     pub fn from_env(residency: FishDrama3Residency, prefill_span_rows: usize) -> Result<Self> {
         let read = |name: &str| std::env::var(name).ok();
         Ok(Self {
@@ -269,6 +279,7 @@ impl FishDrama3ModelOptions {
                 residency,
                 read(super::precision::DTYPE_ENV).as_deref(),
             )?),
+            cpu_kv_dtype: super::physical::kv_dtype(crate::backends::BackendKind::Cpu),
             ..Self::default()
         })
     }
@@ -684,6 +695,14 @@ pub struct FishDrama3Model {
     metal_checks: Option<FishDrama3MetalChecks>,
     /// What a CUDA load's checks found (`None` elsewhere).
     cuda_checks: Option<FishDrama3CudaChecks>,
+    /// How the device trunk and tower run (`None` on the CPU).
+    decode_path: Option<FishDrama3DecodePath>,
+    /// Each compact-head candidate's token id and code 0, `[V]` U32 on the
+    /// device (`None` on the CPU): the one-readback frame's lookups.
+    main_tables: Option<(Tensor, Tensor)>,
+    /// Two readbacks a frame where one would do, for tests that compare.
+    #[cfg(test)]
+    pub(crate) two_readbacks: bool,
     /// The content identity a durable speech checkpoint records
     /// ([`super::artifacts::pinned_fingerprint`]), set by the loader.
     artifact_fingerprint: Option<String>,
@@ -792,6 +811,32 @@ pub(crate) fn private_cache(
     PhysicalPagedKvCache::new(arena, bindings, blocks, 0)
 }
 
+/// A resident frame in flight ([`FishDrama3Model::decode_resident`]).
+struct ResidentFrame {
+    tower: FishDrama3ResidentTowerStep,
+    trunk: FishDrama3ResidentTrunkStep,
+    /// Each going row's chosen candidate, `[going]` U32.
+    token: Tensor,
+}
+
+/// The trunk rows of the requests `goes` marks, in order.
+fn going_rows<'r>(
+    rows: &'r mut [&mut FishDrama3RequestState],
+    goes: &[bool],
+) -> Vec<FishDrama3StepRow<'r>> {
+    rows.iter_mut()
+        .zip(goes)
+        .filter(|(_, goes)| **goes)
+        .map(|(state, _)| {
+            let state: &mut FishDrama3RequestState = state;
+            FishDrama3StepRow {
+                state: &mut state.trunk,
+                cache: &mut state.trunk_cache,
+            }
+        })
+        .collect()
+}
+
 fn host_values(tensor: &Tensor) -> Result<Vec<f32>> {
     Ok(tensor
         .to_dtype(DType::F32)?
@@ -844,6 +889,12 @@ impl FishDrama3Model {
         let residency = FishDrama3Residency::of(device);
         residency.require_supported(device)?;
         let activations = check_activations(residency, options.activations)?;
+        if !matches!(options.cpu_kv_dtype, DType::F32 | DType::F16) {
+            return Err(Error::ModelLoadError(format!(
+                "Fish Audio Drama 3 keeps the CPU's KV in F32 or F16, not {:?}",
+                options.cpu_kv_dtype
+            )));
+        }
         let embedding = FishDrama3Embedding::load_on(&checkpoint, &config, device)?;
         let mut trunk = FishDrama3Trunk::load(&checkpoint, &config, device, options.trunk)?;
         let mut tower = FishDrama3Tower::load(&checkpoint, &config, device, options.tower)?;
@@ -865,8 +916,40 @@ impl FishDrama3Model {
                 let checks = super::cuda::self_check::run(&checkpoint, &config, &mut trunk)?;
                 (DType::BF16, None, Some(checks))
             }
-            FishDrama3Residency::Cpu => (DType::F32, None, None),
+            FishDrama3Residency::Cpu => (options.cpu_kv_dtype, None, None),
         };
+        let decode_path = (residency != FishDrama3Residency::Cpu)
+            .then(|| FishDrama3DecodePath::select(device, &config));
+        let fused = decode_path
+            .as_ref()
+            .is_some_and(FishDrama3DecodePath::is_fused);
+        if let Some(weights) = trunk.device_trunk_mut().filter(|_| fused) {
+            weights.enable_fused(device);
+        }
+        if let Some(weights) = tower.device_tower_mut().filter(|_| fused) {
+            weights.enable_fused(device);
+        }
+        let main_tables = (residency != FishDrama3Residency::Cpu)
+            .then(|| -> Result<(Tensor, Tensor)> {
+                let ids = config.ids;
+                let n = head.len() as u32;
+                // Candidate 0 is eos, candidate `i` semantic code `i - 1`.
+                let tokens = (0..n)
+                    .map(|i| {
+                        if i == 0 {
+                            ids.eos
+                        } else {
+                            ids.semantic_start + i - 1
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let codes = (0..n).map(|i| i.saturating_sub(1)).collect::<Vec<_>>();
+                Ok((
+                    Tensor::from_vec(tokens, n as usize, device)?,
+                    Tensor::from_vec(codes, n as usize, device)?,
+                ))
+            })
+            .transpose()?;
         let geometry = FishDrama3StateGeometry::of(&config);
         if trunk.attention_layers() != geometry.trunk.layers
             || tower.attention_layers() != geometry.tower.layers
@@ -890,6 +973,10 @@ impl FishDrama3Model {
             kv_dtype,
             metal_checks,
             cuda_checks,
+            decode_path,
+            main_tables,
+            #[cfg(test)]
+            two_readbacks: false,
             artifact_fingerprint: None,
         })
     }
@@ -958,6 +1045,42 @@ impl FishDrama3Model {
         self.cuda_checks.as_ref()
     }
 
+    /// How the device trunk and tower run (`None` on the CPU).
+    pub fn decode_path(&self) -> Option<&FishDrama3DecodePath> {
+        self.decode_path.as_ref()
+    }
+
+    /// The trunk, for tests that switch its paths.
+    #[cfg(test)]
+    pub(crate) fn trunk_mut(&mut self) -> &mut FishDrama3Trunk {
+        &mut self.trunk
+    }
+
+    /// The tower, for tests that switch its paths.
+    #[cfg(test)]
+    pub(crate) fn tower_mut(&mut self) -> &mut FishDrama3Tower {
+        &mut self.tower
+    }
+
+    /// Runs the device trunk, tower and draws fused or eagerly, for tests
+    /// that compare the two.
+    #[cfg(test)]
+    pub(crate) fn force_fused(&mut self, fused: bool) {
+        self.decode_path = Some(if fused {
+            FishDrama3DecodePath::Fused { check: 0.0 }
+        } else {
+            FishDrama3DecodePath::Eager {
+                reason: "forced by a test".into(),
+            }
+        });
+        if let Some(weights) = self.trunk.device_trunk_mut() {
+            weights.fused = fused;
+        }
+        if let Some(weights) = self.tower.device_tower_mut() {
+            weights.fused = fused;
+        }
+    }
+
     /// Positions one request may use: the trunk's and §7.5's.
     pub fn max_positions(&self) -> usize {
         self.config.trunk.max_positions.min(MAX_REQUEST_POSITIONS)
@@ -982,6 +1105,9 @@ impl FishDrama3Model {
         }
         if let Some(checks) = &self.cuda_checks {
             summary["cuda_checks"] = checks.diagnostics();
+        }
+        if let Some(path) = &self.decode_path {
+            summary["decode_path"] = path.diagnostics();
         }
         if !self.device.is_cpu() {
             summary["embedding_device_bytes"] = json!(self.embedding.device_bytes());
@@ -1551,7 +1677,11 @@ impl FishDrama3Model {
             }
             mains.push(None);
         }
-        let draws = if self.device.is_cpu() {
+        let started = Instant::now();
+        let resident = self.resident_frames(rows, &drawing);
+        let draws = if resident {
+            self.decode_resident(rows, &drawing)?
+        } else if self.device.is_cpu() {
             drawing
                 .iter()
                 .map(|&index| {
@@ -1564,6 +1694,9 @@ impl FishDrama3Model {
         } else {
             self.draw_main_on_device(rows, &drawing)?
         };
+        if !resident {
+            record_step_section(StepSection::MainDraw, started.elapsed());
+        }
         for (&index, draw) in drawing.iter().zip(draws) {
             let state = &mut rows[index];
             let frames = state.frames();
@@ -1581,7 +1714,7 @@ impl FishDrama3Model {
                 mains[index] = Some(draw.token);
             }
         }
-        if mains.iter().any(Option::is_some) {
+        if !resident && mains.iter().any(Option::is_some) {
             self.advance(rows, &mains)?;
         }
         Ok(rows
@@ -1596,11 +1729,13 @@ impl FishDrama3Model {
     }
 
     /// The main draws of `rows[drawing]` on the device: each row's compact
-    /// head, ranked once, raced at the request's policy and at RAS's from
-    /// exponentials its sampler draws in the host's order, and every row's
-    /// picks read back at once (readback 1 of the frame). A draw whose kept
-    /// prefix runs past the device's ranks re-runs on the host from the
-    /// same exponentials.
+    /// head, raced at the request's policy and at RAS's from exponentials
+    /// its sampler draws in the host's order (one launch each on the fused
+    /// path, both draws' exponentials uploaded at once; else ranked once and
+    /// raced in Candle ops), and every row's picks read back at once
+    /// (readback 1 of the frame). On the composed race a draw whose kept
+    /// prefix runs past the device's ranks re-runs on the host from the same
+    /// exponentials; the one-launch race bounds any prefix on the device.
     fn draw_main_on_device(
         &self,
         rows: &mut [&mut FishDrama3RequestState],
@@ -1610,6 +1745,10 @@ impl FishDrama3Model {
             return Ok(Vec::new());
         }
         let candidates = self.head.len();
+        let fused = self
+            .decode_path
+            .as_ref()
+            .is_some_and(FishDrama3DecodePath::is_fused);
         let mut picks = Vec::with_capacity(drawing.len());
         let mut kept = Vec::with_capacity(drawing.len());
         for &index in drawing {
@@ -1619,33 +1758,68 @@ impl FishDrama3Model {
             let logits = self.head.logits(state.last_hidden()?)?.squeeze(0)?;
             let (first_noise, retry_noise) = state.sampler.main_noise()?;
             let policy = state.params.sampling.main;
-            let ranks = device_cap(&policy)
-                .unwrap_or(DEVICE_RANKS)
-                .max(FishDrama3DrawPolicy::RAS.top_k.unwrap_or(1))
-                .min(DEVICE_RANKS);
-            let ranked = rank(&logits, first_candidate, ranks)?;
-            let noise = |values: &[f32]| Tensor::from_slice(values, candidates, &self.device);
-            let first = device_race(&ranked, &policy, &noise(&first_noise)?)?;
-            let retry = device_race(&ranked, &FishDrama3DrawPolicy::RAS, &noise(&retry_noise)?)?;
-            picks.push(Tensor::cat(
-                &[
-                    &first.pick,
-                    &retry.pick,
-                    &first.non_finite,
-                    &first.overflow,
-                    &retry.overflow,
-                ],
-                0,
-            )?);
+            if fused {
+                super::device::count_uploads(1);
+                let noise = Tensor::from_vec(
+                    [first_noise.as_slice(), retry_noise.as_slice()].concat(),
+                    (2, candidates),
+                    &self.device,
+                )?;
+                let row = logits.unsqueeze(0)?;
+                let draw = |r: usize, policy: &FishDrama3DrawPolicy| {
+                    race_sample(
+                        &row,
+                        &noise.narrow(0, r, 1)?,
+                        first_candidate,
+                        race_policy(policy),
+                    )
+                };
+                picks.push(Tensor::cat(
+                    &[&draw(0, &policy)?, &draw(1, &FishDrama3DrawPolicy::RAS)?],
+                    1,
+                )?);
+            } else {
+                let ranks = device_cap(&policy)
+                    .unwrap_or(DEVICE_RANKS)
+                    .max(FishDrama3DrawPolicy::RAS.top_k.unwrap_or(1))
+                    .min(DEVICE_RANKS);
+                let ranked = rank(&logits, first_candidate, ranks)?;
+                let noise = |values: &[f32]| {
+                    super::device::count_uploads(1);
+                    Tensor::from_slice(values, candidates, &self.device)
+                };
+                let first = device_race(&ranked, &policy, &noise(&first_noise)?)?;
+                let retry =
+                    device_race(&ranked, &FishDrama3DrawPolicy::RAS, &noise(&retry_noise)?)?;
+                picks.push(Tensor::cat(
+                    &[
+                        &first.pick,
+                        &first.non_finite,
+                        &first.overflow,
+                        &retry.pick,
+                        &retry.non_finite,
+                        &retry.overflow,
+                    ],
+                    0,
+                )?);
+            }
             kept.push((logits, first_noise, retry_noise, first_candidate, policy));
         }
         let values = read_back(&Tensor::cat(&picks, 0)?)?;
         let mut draws = Vec::with_capacity(drawing.len());
-        let (rows_read, _) = values.as_chunks::<5>();
+        // Each row's draw at its policy, then RAS's: `{pick, non_finite}`,
+        // followed by an overflow flag on the composed race.
+        let width = if fused { 4 } else { 6 };
         for ((&index, row), (logits, first_noise, retry_noise, first_candidate, policy)) in
-            drawing.iter().zip(rows_read).zip(kept)
+            drawing.iter().zip(values.chunks_exact(width)).zip(kept)
         {
-            let [first, retry, non_finite, first_overflow, retry_overflow] = row;
+            let (first, non_finite, first_overflow, retry, retry_overflow) = match *row {
+                [first, non_finite, retry, _] => (first, non_finite, 0, retry, 0),
+                [first, non_finite, first_overflow, retry, _, retry_overflow] => {
+                    (first, non_finite, first_overflow, retry, retry_overflow)
+                }
+                _ => unreachable!("main draw rows hold 4 or 6 values"),
+            };
             // The row's logits on the host, read once if a fallback needs them.
             let mut host: Option<Vec<f32>> = None;
             let mut on_host = |logits: &Tensor| -> Result<Vec<f32>> {
@@ -1656,7 +1830,7 @@ impl FishDrama3Model {
                 host = Some(values.clone());
                 Ok(values)
             };
-            if *non_finite > 0 {
+            if non_finite > 0 {
                 // The host sampler's error, with its counts.
                 let state = &mut *rows[index];
                 return Err(state
@@ -1681,16 +1855,359 @@ impl FishDrama3Model {
                 count_fallback();
                 host_race(&on_host(&logits)?, policy, first_candidate, noise)
             };
-            let first = decide(*first, *first_overflow, &policy, &first_noise)?;
+            let first = decide(first, first_overflow, &policy, &first_noise)?;
             let retry = decide(
-                *retry,
-                *retry_overflow,
+                retry,
+                retry_overflow,
                 &FishDrama3DrawPolicy::RAS,
                 &retry_noise,
             )?;
             draws.push(rows[index].sampler.finish_main(first, retry));
         }
         Ok(draws)
+    }
+
+    /// Whether `rows[drawing]` decode this frame with one readback: a fused
+    /// device load whose drawing rows all draw their heads on the device.
+    fn resident_frames(&self, rows: &[&mut FishDrama3RequestState], drawing: &[usize]) -> bool {
+        #[cfg(test)]
+        if self.two_readbacks {
+            return false;
+        }
+        self.main_tables.is_some()
+            && self
+                .decode_path
+                .as_ref()
+                .is_some_and(FishDrama3DecodePath::is_fused)
+            && !drawing.is_empty()
+            && drawing
+                .iter()
+                .all(|&index| device_cap(&rows[index].sampler.params().heads).is_some())
+    }
+
+    /// One frame of `rows[drawing]` read back once: the main draws, RAS, the
+    /// tower and the trunk run on the device for every row under its frame
+    /// limit, then every pick, code and flag comes back in one transfer.
+    /// Whether a row drew eos is known only then, so its tower and trunk
+    /// step is aborted: one wasted step, never another frame. The frames,
+    /// noise and samplers are those of the two-readback path. Returns each
+    /// drawing row's main draw; the rows that go on hold their new frame.
+    fn decode_resident(
+        &self,
+        rows: &mut [&mut FishDrama3RequestState],
+        drawing: &[usize],
+    ) -> Result<Vec<FishDrama3MainDraw>> {
+        let started = Instant::now();
+        let candidates = self.head.len();
+        let mut heads = Vec::with_capacity(drawing.len());
+        let mut main = Vec::with_capacity(drawing.len());
+        for &index in drawing {
+            let state = &mut *rows[index];
+            let allow_eos = !(state.params.mask_first_eos && state.frames() == 0);
+            let first_candidate = usize::from(!allow_eos);
+            let logits = self.head.logits(state.last_hidden()?)?;
+            let (first_noise, retry_noise) = state.sampler.main_noise()?;
+            super::device::count_uploads(1);
+            let noise = Tensor::from_vec(
+                [first_noise, retry_noise].concat(),
+                (2, candidates),
+                &self.device,
+            )?;
+            let policy = state.params.sampling.main;
+            let draw = |r: usize, policy: &FishDrama3DrawPolicy| {
+                race_sample(
+                    &logits,
+                    &noise.narrow(0, r, 1)?,
+                    first_candidate,
+                    race_policy(policy),
+                )
+            };
+            main.push(Tensor::cat(
+                &[&draw(0, &policy)?, &draw(1, &FishDrama3DrawPolicy::RAS)?],
+                1,
+            )?);
+            heads.push((logits, first_candidate));
+        }
+        // Each row's draw at its policy, then RAS's: `{pick, non_finite}`.
+        let main = Tensor::cat(&main, 0)?;
+        let goes = (0..rows.len())
+            .map(|index| {
+                drawing.contains(&index) && rows[index].frames() < rows[index].params.max_frames
+            })
+            .collect::<Vec<_>>();
+        let going = drawing
+            .iter()
+            .enumerate()
+            .filter(|(_, index)| goes[**index])
+            .map(|(j, _)| j)
+            .collect::<Vec<_>>();
+        let frame = if going.is_empty() {
+            record_step_section(StepSection::MainDraw, started.elapsed());
+            None
+        } else {
+            Some(self.begin_resident_frame(rows, &goes, &going, &main, started)?)
+        };
+        let started = Instant::now();
+        let mut parts = vec![main.flatten_all()?];
+        if let Some(frame) = &frame {
+            parts.push(frame.token.clone());
+            parts.push(frame.tower.codes.packed()?);
+        }
+        let values = match Tensor::cat(&parts, 0)
+            .map_err(Error::from)
+            .and_then(|all| read_back(&all))
+        {
+            Ok(values) => values,
+            Err(error) => {
+                if let Some(frame) = frame {
+                    self.abort_resident_frame(rows, &goes, frame);
+                }
+                return Err(error);
+            }
+        };
+        let (main_values, rest) = values.split_at(4 * drawing.len());
+        let draws_read = main_values.as_chunks::<4>().0;
+        let checked = (|| {
+            for ((&index, &[_, non_finite, _, _]), (logits, first_candidate)) in
+                drawing.iter().zip(draws_read).zip(&heads)
+            {
+                if non_finite > 0 {
+                    // The host sampler's error, with its counts.
+                    return Err(rows[index]
+                        .sampler
+                        .clone()
+                        .sample_main(&host_values(logits)?, *first_candidate == 0)
+                        .err()
+                        .unwrap_or_else(|| {
+                            Error::InferenceError(format!(
+                                "Fish Audio Drama 3 main logits hold {non_finite} non-finite values"
+                            ))
+                        }));
+                }
+            }
+            let (tokens, codes) = rest.split_at(going.len());
+            let codes = if frame.is_some() {
+                DeviceCodes::rows(codes, going.len())?
+            } else {
+                Vec::new()
+            };
+            // RAS on the host decides as the device did.
+            let mut chosen = Vec::with_capacity(going.len());
+            for (&j, &token) in going.iter().zip(tokens) {
+                let [first, _, retry, _] = draws_read[j];
+                let draw = rows[drawing[j]].sampler.ras(first as usize, retry as usize);
+                let ids = self.config.ids;
+                let on_device = if token == 0 {
+                    ids.eos
+                } else {
+                    ids.semantic_start + token - 1
+                };
+                if on_device != draw.token {
+                    return Err(Error::InferenceError(format!(
+                        "Fish Audio Drama 3 device RAS chose {on_device}; the host chose {}",
+                        draw.token
+                    )));
+                }
+                chosen.push(draw.token);
+            }
+            Ok((codes, chosen))
+        })();
+        let (codes, chosen) = match checked {
+            Ok(checked) => checked,
+            Err(error) => {
+                if let Some(frame) = frame {
+                    self.abort_resident_frame(rows, &goes, frame);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(frame) = frame {
+            let eos = self.config.ids.eos;
+            let keep = chosen.iter().map(|&token| token != eos).collect::<Vec<_>>();
+            let hidden = frame.trunk.hidden.clone();
+            {
+                let mut caches = Vec::with_capacity(going.len());
+                let mut samplers = Vec::with_capacity(going.len());
+                for (state, _) in rows.iter_mut().zip(&goes).filter(|(_, goes)| **goes) {
+                    let state: &mut FishDrama3RequestState = state;
+                    caches.push(&mut state.tower_cache);
+                    samplers.push(&mut state.sampler);
+                }
+                self.tower
+                    .finish_resident_step(frame.tower, &mut caches, &mut samplers, &keep)?;
+            }
+            let mut trunk_rows = going_rows(rows, &goes);
+            self.trunk
+                .finish_resident_step(frame.trunk, &mut trunk_rows, &keep)?;
+            drop(trunk_rows);
+            let width = self.config.tower.frame_width();
+            let going_states = rows
+                .iter_mut()
+                .zip(&goes)
+                .filter(|(_, goes)| **goes)
+                .map(|(state, _)| state);
+            for (r, (state, &token)) in going_states.zip(&chosen).enumerate() {
+                if token == eos {
+                    continue;
+                }
+                let mut row = Vec::with_capacity(width);
+                row.extend([token, token - self.config.ids.semantic_start]);
+                row.extend(&codes[r]);
+                for (codebook, &code) in state.codes.iter_mut().zip(&row[1..]) {
+                    codebook.push(code);
+                }
+                state.last_row = row;
+                // On the device: no readback between a frame and the next.
+                state.last_hidden = Some(hidden.narrow(0, r, 1)?.contiguous()?);
+                state.check_lengths()?;
+            }
+        }
+        // The window takes each token after the tower installed its samplers.
+        let draws = drawing
+            .iter()
+            .zip(draws_read)
+            .map(|(&index, &[first, _, retry, _])| {
+                rows[index]
+                    .sampler
+                    .finish_main(first as usize, retry as usize)
+            })
+            .collect();
+        record_step_section(StepSection::Trunk, started.elapsed());
+        Ok(draws)
+    }
+
+    /// RAS, the tower and the trunk of a resident frame's rows that may go
+    /// on (`goes` over `rows`; `going` their indices in the main draws `[d,
+    /// 4]`), all on the device.
+    fn begin_resident_frame(
+        &self,
+        rows: &mut [&mut FishDrama3RequestState],
+        goes: &[bool],
+        going: &[usize],
+        main: &Tensor,
+        started: Instant,
+    ) -> Result<ResidentFrame> {
+        let (main_tokens, main_codes) = self.main_tables.as_ref().ok_or_else(|| {
+            Error::InferenceError("a resident frame needs the device main tables".into())
+        })?;
+        let a = going.len();
+        let picked = if a == main.dim(0)? {
+            main.clone()
+        } else {
+            super::device::count_uploads(1);
+            let at = going.iter().map(|&j| j as u32).collect::<Vec<_>>();
+            main.index_select(&Tensor::from_vec(at, a, &self.device)?, 0)?
+        };
+        let first = picked.narrow(1, 0, 1)?.squeeze(1)?.contiguous()?;
+        let retry = picked.narrow(1, 2, 1)?.squeeze(1)?.contiguous()?;
+        // RAS: the retry replaces a semantic first draw already in the
+        // row's window (padded with an id no token has).
+        let states = rows
+            .iter()
+            .zip(goes)
+            .filter(|(_, goes)| **goes)
+            .map(|(state, _)| &**state)
+            .collect::<Vec<_>>();
+        let mut window = vec![u32::MAX; a * RAS_WINDOW];
+        for (slots, state) in window
+            .as_chunks_mut::<RAS_WINDOW>()
+            .0
+            .iter_mut()
+            .zip(&states)
+        {
+            for (slot, token) in slots.iter_mut().zip(state.sampler.ras_window()) {
+                *slot = token;
+            }
+        }
+        super::device::count_uploads(1);
+        let window = Tensor::from_vec(window, (a, RAS_WINDOW), &self.device)?;
+        let first_token = main_tokens.index_select(&first, 0)?;
+        let hits = window
+            .eq(&first_token.unsqueeze(1)?.broadcast_as((a, RAS_WINDOW))?)?
+            .to_dtype(DType::U32)?
+            .sum_keepdim(1)?
+            .squeeze(1)?;
+        // Candidate 0 (eos) is never redrawn.
+        let redrawn = hits.minimum(&first)?.ne(0f64)?;
+        let token = redrawn.where_cond(&retry, &first)?;
+        let mains = main_tokens.index_select(&token, 0)?;
+        let c0 = main_codes.index_select(&token, 0)?;
+        let hidden = Tensor::cat(
+            &states
+                .iter()
+                .map(|state| state.last_hidden().cloned())
+                .collect::<Result<Vec<_>>>()?,
+            0,
+        )?;
+        drop(states);
+        record_step_section(StepSection::MainDraw, started.elapsed());
+        let started = Instant::now();
+        let tower = {
+            let mut tower_rows = rows
+                .iter_mut()
+                .zip(goes)
+                .filter(|(_, goes)| **goes)
+                .map(|(state, _)| {
+                    let state: &mut FishDrama3RequestState = state;
+                    FishDrama3ResidentTowerRow {
+                        cache: &mut state.tower_cache,
+                        input: &state.last_row,
+                        sampler: &state.sampler,
+                    }
+                })
+                .collect::<Vec<_>>();
+            self.tower
+                .begin_resident_step(&self.embedding, &hidden, &c0, &mut tower_rows)?
+        };
+        record_step_section(StepSection::Tower, started.elapsed());
+        let trunk = {
+            let embeds = tower
+                .codes
+                .picks
+                .get(0)
+                .map_err(Error::from)
+                .and_then(|codes| self.embedding.embed_semantic_device(&mains, &codes));
+            let mut trunk_rows = going_rows(rows, goes);
+            embeds.and_then(|embeds| self.trunk.begin_resident_step(&embeds, &mut trunk_rows))
+        };
+        let trunk = match trunk {
+            Ok(trunk) => trunk,
+            Err(error) => {
+                let mut caches = rows
+                    .iter_mut()
+                    .zip(goes)
+                    .filter(|(_, goes)| **goes)
+                    .map(|(state, _)| &mut state.tower_cache)
+                    .collect::<Vec<_>>();
+                self.tower.abort_resident_step(tower, &mut caches);
+                return Err(error);
+            }
+        };
+        Ok(ResidentFrame {
+            tower,
+            trunk,
+            token,
+        })
+    }
+
+    /// Aborts both halves of a resident frame.
+    fn abort_resident_frame(
+        &self,
+        rows: &mut [&mut FishDrama3RequestState],
+        goes: &[bool],
+        frame: ResidentFrame,
+    ) {
+        {
+            let mut caches = rows
+                .iter_mut()
+                .zip(goes)
+                .filter(|(_, goes)| **goes)
+                .map(|(state, _)| &mut state.tower_cache)
+                .collect::<Vec<_>>();
+            self.tower.abort_resident_step(frame.tower, &mut caches);
+        }
+        let mut trunk_rows = going_rows(rows, goes);
+        self.trunk.abort_resident_step(frame.trunk, &mut trunk_rows);
     }
 
     /// The tower and trunk steps of the rows with a main token.
@@ -1714,10 +2231,13 @@ impl FishDrama3Model {
             });
         }
         let hidden = Tensor::cat(&hidden, 0)?;
+        let started = Instant::now();
         let frames = self
             .tower
             .forward_step(&self.embedding, &hidden, &mut tower_rows)?;
         drop(tower_rows);
+        record_step_section(StepSection::Tower, started.elapsed());
+        let started = Instant::now();
         let embeds = self.embedding.embed_tensor(&frames, &self.device)?;
         let mut trunk_rows = rows
             .iter_mut()
@@ -1733,6 +2253,7 @@ impl FishDrama3Model {
             .collect::<Vec<_>>();
         let next = self.trunk.forward_step(&embeds, &mut trunk_rows)?;
         drop(trunk_rows);
+        record_step_section(StepSection::Trunk, started.elapsed());
         let going = rows
             .iter_mut()
             .zip(mains)

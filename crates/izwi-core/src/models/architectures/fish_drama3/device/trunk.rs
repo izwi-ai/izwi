@@ -26,16 +26,20 @@ use candle_core::{DType, Device, Tensor};
 use super::super::checkpoint::{expert, trunk_layer, FishDrama3Checkpoint, TRUNK_PREFIX};
 use super::super::config::{FishDrama3Config, FishDrama3LayerKind};
 use super::super::linear::{FishDrama3KernelPhase, FishDrama3Linear};
+use super::super::model::MAX_REQUEST_POSITIONS;
 use super::super::residency::FishDrama3WeightForm;
 use super::super::trunk::state::FishDrama3LinearState;
 use super::super::trunk::{norm_gain, LayerTrace, NormGain};
 use super::{
-    add_residual, count_chunked_deltanet_span, count_grouped_moe_span, record, rms_norm, swiglu,
-    vector, DeviceAttention, DeviceForms, DeviceRow, Probe,
+    add_residual, count_chunked_deltanet_span, count_grouped_moe_span,
+    count_recurrent_deltanet_span, record, rms_norm, swiglu, vector, DeviceAttention, DeviceForms,
+    DeviceRow, Probe,
 };
 use crate::error::{Error, Result};
 use crate::kernels::cuda::gdn::{self, GdnDecodeSpec};
 use crate::kernels::cuda::moe::{self, GroupedKernel, RouteSpec, SharedSlot};
+use crate::kernels::cuda::stretch_graphs::StretchGraphs;
+use crate::kernels::residual_norm;
 
 /// Rows from which a CUDA span runs the chunked DeltaNet prefill (the
 /// grouped MoE's threshold too): below it the per-row kernels cost less.
@@ -91,6 +95,23 @@ pub(crate) fn half_linear(
     FishDrama3Linear::from_half(checkpoint.bf16_tensor(name, &[rows, cols], forms.half, device)?)
 }
 
+/// BF16 projections `names` (each `[rows, cols]`) stacked into one 16-bit
+/// layer `[names.len() * rows, cols]` in `forms`, so one GEMV serves them.
+pub(crate) fn half_linear_packed(
+    checkpoint: &FishDrama3Checkpoint,
+    names: &[&str],
+    rows: usize,
+    cols: usize,
+    forms: DeviceForms,
+    device: &Device,
+) -> Result<FishDrama3Linear> {
+    let parts = names
+        .iter()
+        .map(|name| checkpoint.bf16_tensor(name, &[rows, cols], forms.half, device))
+        .collect::<Result<Vec<_>>>()?;
+    FishDrama3Linear::from_half(Tensor::cat(&parts, 0)?)
+}
+
 fn f32_linear(
     checkpoint: &FishDrama3Checkpoint,
     name: &str,
@@ -126,6 +147,10 @@ pub(crate) struct DeviceDeltaNet {
     fused: bool,
     /// Whether a long span runs the chunked prefill (CUDA, once verified).
     pub(crate) chunked: bool,
+    /// Whether a span's rows run the span kernels (`gdn::conv_span`,
+    /// `gdn::recurrent_span`: Metal): two launches per request instead of a
+    /// launch chain per token, bit for bit the token loop's result.
+    spans: bool,
     key_dim: usize,
     channels: usize,
     value_width: usize,
@@ -214,6 +239,8 @@ impl DeviceDeltaNet {
             },
             fused: gdn::supported(device, la.key_head_dim, la.value_head_dim, la.conv_kernel),
             chunked: false,
+            spans: gdn::supported(device, la.key_head_dim, la.value_head_dim, la.conv_kernel)
+                && gdn::span_supported(device),
             key_dim: la.key_head_dim,
             channels,
             value_width: vw,
@@ -384,7 +411,6 @@ impl DeviceDeltaNet {
         act: DType,
         probe: &mut Probe<'_>,
     ) -> Result<Tensor> {
-        let (c, vw) = (self.channels, self.value_width);
         let packed = self.qkvz.forward_device(x, phase, act)?;
         record(probe, || "qkvz".into(), &packed);
         let alpha = self.in_proj_a.forward_device(x, phase, DType::F32)?;
@@ -405,33 +431,35 @@ impl DeviceDeltaNet {
         let mut outputs = Vec::with_capacity(x.dim(0)?);
         let mut t = 0;
         for (row, state) in rows.iter().zip(states.iter_mut()) {
-            for _ in 0..row.rows {
-                let at = packed.narrow(0, t, 1)?;
-                let mixed = at.narrow(1, 0, c)?.contiguous()?;
-                let z = at.narrow(1, c, vw)?.to_dtype(DType::F32)?.contiguous()?;
-                let (conv, history) = gdn::conv_decode(&mixed, &self.conv, state.conv.columns()?)?;
-                let (beta, alpha) = (
-                    beta.narrow(0, t, 1)?.contiguous()?,
-                    alpha.narrow(0, t, 1)?.contiguous()?,
-                );
-                let (y, next) = if self.fused {
-                    gdn::recurrent_decode(
-                        &conv,
-                        &z,
-                        &beta,
-                        &alpha,
-                        &self.dt_bias,
-                        &self.neg_a,
-                        &self.norm,
-                        state.recurrent(),
-                        &self.spec,
-                    )?
-                } else {
-                    self.recurrence(&conv, &z, &beta, &alpha, state.recurrent())?
-                };
+            if self.spans && row.rows > 1 {
+                let (y, history, next) = self.span(
+                    &packed,
+                    &alpha,
+                    &beta,
+                    t,
+                    row.rows,
+                    state.conv.columns()?,
+                    state.recurrent(),
+                )?;
+                count_recurrent_deltanet_span();
                 state.conv.set_history(&history)?;
-                state.set_recurrent_tensor(next.reshape(self.state_shape)?)?;
-                outputs.push(y.reshape((1, vw))?);
+                state.set_recurrent_tensor(next)?;
+                outputs.push(y);
+                t += row.rows;
+                continue;
+            }
+            for _ in 0..row.rows {
+                let (y, history, next) = self.token(
+                    &packed,
+                    &alpha,
+                    &beta,
+                    t,
+                    state.conv.columns()?,
+                    state.recurrent(),
+                )?;
+                state.conv.set_history(&history)?;
+                state.set_recurrent_tensor(next)?;
+                outputs.push(y);
                 t += 1;
             }
         }
@@ -443,14 +471,134 @@ impl DeviceDeltaNet {
     }
 }
 
+impl DeviceDeltaNet {
+    /// Rows `t..t + n` of the projections as one request's span through the
+    /// span kernels: the gated outputs `[n, value_width]`, the next history
+    /// `[3, channels]` and the next recurrent state, bit for bit what
+    /// [`Self::token`] gives row by row.
+    #[allow(clippy::too_many_arguments)]
+    fn span(
+        &self,
+        packed: &Tensor,
+        alpha: &Tensor,
+        beta: &Tensor,
+        t: usize,
+        n: usize,
+        columns: [&Tensor; 3],
+        recurrent: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let (c, vw) = (self.channels, self.value_width);
+        let rows = packed.narrow(0, t, n)?;
+        let mixed = rows.narrow(1, 0, c)?.contiguous()?;
+        let z = rows.narrow(1, c, vw)?.to_dtype(DType::F32)?.contiguous()?;
+        let (conv, history) = gdn::conv_span(&mixed, &self.conv, columns)?;
+        let (y, next) = gdn::recurrent_span(
+            &conv,
+            &z,
+            &beta.narrow(0, t, n)?.contiguous()?,
+            &alpha.narrow(0, t, n)?.contiguous()?,
+            &self.dt_bias,
+            &self.neg_a,
+            &self.norm,
+            recurrent,
+            &self.spec,
+        )?;
+        Ok((y, history, next.reshape(self.state_shape)?))
+    }
+
+    /// Token `t` of the projections `packed`, `alpha` and `beta` from conv
+    /// history `columns` (oldest first) and recurrent state `recurrent`:
+    /// its gated output `[1, value_width]`, the next history `[3,
+    /// channels]` and the next recurrent state.
+    fn token(
+        &self,
+        packed: &Tensor,
+        alpha: &Tensor,
+        beta: &Tensor,
+        t: usize,
+        columns: [&Tensor; 3],
+        recurrent: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let (c, vw) = (self.channels, self.value_width);
+        let at = packed.narrow(0, t, 1)?;
+        let mixed = at.narrow(1, 0, c)?.contiguous()?;
+        let z = at.narrow(1, c, vw)?.to_dtype(DType::F32)?.contiguous()?;
+        let (conv, history) = gdn::conv_decode(&mixed, &self.conv, columns)?;
+        let (beta, alpha) = (
+            beta.narrow(0, t, 1)?.contiguous()?,
+            alpha.narrow(0, t, 1)?.contiguous()?,
+        );
+        let (y, next) = if self.fused {
+            gdn::recurrent_decode(
+                &conv,
+                &z,
+                &beta,
+                &alpha,
+                &self.dt_bias,
+                &self.neg_a,
+                &self.norm,
+                recurrent,
+                &self.spec,
+            )?
+        } else {
+            self.recurrence(&conv, &z, &beta, &alpha, recurrent)?
+        };
+        Ok((
+            y.reshape((1, vw))?,
+            history,
+            next.reshape(self.state_shape)?,
+        ))
+    }
+
+    /// A decode step of one row per request as a pure function: the mixer
+    /// output `[m, hidden]` in `act` of the normed rows `x`, and each row's
+    /// next conv history (`[3, channels]`) and recurrent state, from
+    /// `histories` and `recurrents`.
+    fn step(
+        &self,
+        x: &Tensor,
+        histories: &[Tensor],
+        recurrents: &[Tensor],
+        act: DType,
+    ) -> Result<(Tensor, Vec<Tensor>, Vec<Tensor>)> {
+        let phase = FishDrama3KernelPhase::Step;
+        let packed = self.qkvz.forward_device(x, phase, act)?;
+        let alpha = self.in_proj_a.forward_device(x, phase, DType::F32)?;
+        let beta = self.in_proj_b.forward_device(x, phase, DType::F32)?;
+        let mut outputs = Vec::with_capacity(histories.len());
+        let mut next_histories = Vec::with_capacity(histories.len());
+        let mut next_recurrents = Vec::with_capacity(histories.len());
+        for (t, (history, recurrent)) in histories.iter().zip(recurrents).enumerate() {
+            let columns = [history.get(0)?, history.get(1)?, history.get(2)?];
+            let (y, history, next) = self.token(
+                &packed,
+                &alpha,
+                &beta,
+                t,
+                [&columns[0], &columns[1], &columns[2]],
+                recurrent,
+            )?;
+            outputs.push(y);
+            next_histories.push(history);
+            next_recurrents.push(next);
+        }
+        let out = self
+            .out_proj
+            .forward_device(&Tensor::cat(&outputs, 0)?, phase, act)?;
+        Ok((out, next_histories, next_recurrents))
+    }
+}
+
 /// The sparse MoE block on the device.
 pub(crate) struct DeviceMoe {
     /// `[experts, hidden]` F32.
     router: FishDrama3Linear,
     /// `[1, hidden]` F32.
     shared_gate: FishDrama3Linear,
-    shared_gate_proj: FishDrama3Linear,
-    shared_up: FishDrama3Linear,
+    /// `[2 shared_intermediate, hidden]`: the shared expert's gate rows,
+    /// then its up rows, so one GEMV feeds SwiGLU.
+    shared_gate_up: FishDrama3Linear,
+    shared_intermediate: usize,
     shared_down: FishDrama3Linear,
     /// `[experts, 2 intermediate, hidden]` E4M3 bytes, each expert's gate
     /// rows then its up rows.
@@ -539,22 +687,18 @@ impl DeviceMoe {
                 h,
                 device,
             )?,
-            shared_gate_proj: half_linear(
+            shared_gate_up: half_linear_packed(
                 checkpoint,
-                &format!("{s}.gate_proj.weight"),
+                &[
+                    &format!("{s}.gate_proj.weight"),
+                    &format!("{s}.up_proj.weight"),
+                ],
                 si,
                 h,
                 forms,
                 device,
             )?,
-            shared_up: half_linear(
-                checkpoint,
-                &format!("{s}.up_proj.weight"),
-                si,
-                h,
-                forms,
-                device,
-            )?,
+            shared_intermediate: si,
             shared_down: half_linear(
                 checkpoint,
                 &format!("{s}.down_proj.weight"),
@@ -580,8 +724,7 @@ impl DeviceMoe {
         [
             &self.router,
             &self.shared_gate,
-            &self.shared_gate_proj,
-            &self.shared_up,
+            &self.shared_gate_up,
             &self.shared_down,
         ]
         .iter()
@@ -614,12 +757,15 @@ impl DeviceMoe {
         Ok(Tensor::cat(&[&routing.narrow(1, 0, k)?, &weights], 1)?.contiguous()?)
     }
 
-    /// The block's output `[N, hidden]` F32 for the normed rows `x`.
+    /// The block's output `[N, hidden]` F32 for the normed rows `x`; `fused`
+    /// runs the shared expert's SwiGLU in one launch over its packed gate/up
+    /// projection (`kernels::swiglu`).
     fn forward(
         &self,
         x: &Tensor,
         phase: FishDrama3KernelPhase,
         act: DType,
+        fused: bool,
         probe: &mut Probe<'_>,
     ) -> Result<Tensor> {
         let n = x.dim(0)?;
@@ -657,9 +803,13 @@ impl DeviceMoe {
                 self.expert_loop(&x.to_dtype(self.forms.loop_activations())?, &routing)?
             }
         };
-        let gate = self.shared_gate_proj.forward_device(x, phase, act)?;
-        let up = self.shared_up.forward_device(x, phase, act)?;
-        let activations = swiglu(&gate, &up, act)?;
+        let gate_up = self.shared_gate_up.forward_device(x, phase, act)?;
+        let si = self.shared_intermediate;
+        let activations = if fused {
+            crate::kernels::swiglu::swiglu(&gate_up, act)?
+        } else {
+            swiglu(&gate_up.narrow(1, 0, si)?, &gate_up.narrow(1, si, si)?, act)?
+        };
         record(probe, || "shared_activations".into(), &activations);
         let shared = self.shared_down.forward_device(&activations, phase, act)?;
         record(probe, || "shared_out".into(), &shared);
@@ -776,8 +926,65 @@ impl DeviceLayer {
 }
 
 /// The trunk's weights on the device.
+/// One piece of a fused decode step through the trunk.
+#[derive(Debug, PartialEq)]
+pub(crate) enum TrunkPiece {
+    /// Pure layers: the MoE half of attention layer `moe_of` (after its
+    /// mixer and post norm), then the whole DeltaNet layers `layers`. The
+    /// first starts from the embeddings with layer 0's input norm; the tail
+    /// ends with the final norm.
+    Stretch {
+        moe_of: Option<usize>,
+        layers: std::ops::Range<usize>,
+        first: bool,
+        tail: bool,
+    },
+    /// Attention layer `index`'s mixer and post norm, eager: it writes and
+    /// reads the paged KV.
+    Attention(usize),
+}
+
+/// The pieces of layers whose `attention` flags are given: a stretch before
+/// each attention mixer and a tail, each holding the previous attention
+/// layer's MoE half.
+pub(crate) fn trunk_pieces(attention: impl ExactSizeIterator<Item = bool>) -> Vec<TrunkPiece> {
+    let layers = attention.len();
+    let mut pieces = Vec::new();
+    let (mut start, mut moe_of) = (0, None);
+    for (i, attention) in attention.enumerate() {
+        if attention {
+            pieces.push(TrunkPiece::Stretch {
+                moe_of,
+                layers: start..i,
+                first: pieces.is_empty(),
+                tail: false,
+            });
+            pieces.push(TrunkPiece::Attention(i));
+            (start, moe_of) = (i + 1, Some(i));
+        }
+    }
+    pieces.push(TrunkPiece::Stretch {
+        moe_of,
+        layers: start..layers,
+        first: pieces.is_empty(),
+        tail: true,
+    });
+    pieces
+}
+
 pub(crate) struct DeviceTrunk {
     pub(crate) layers: Vec<DeviceLayer>,
+    /// Untraced forwards run the fused kernels (a span [`Self::run_fused`],
+    /// a step [`Self::run_pieces`]); set after the load's fused kernel check.
+    pub(crate) fused: bool,
+    /// A fused step's pieces.
+    pieces: Vec<TrunkPiece>,
+    /// CUDA graphs of a fused step's stretches, or why there are none.
+    pub(crate) graphs: std::result::Result<StretchGraphs, String>,
+    /// Fused steps through [`Self::run_fused`] instead of the pieces, for
+    /// tests that compare.
+    #[cfg(test)]
+    pub(crate) steps_whole: bool,
     final_norm: Tensor,
     /// The final norm's dtype (F32 once Metal's probe breached it).
     pub(crate) final_act: DType,
@@ -831,6 +1038,7 @@ impl DeviceTrunk {
                                 &gain_of("k_norm")?,
                                 a,
                                 t.rms_norm_eps as f32,
+                                t.max_positions.min(MAX_REQUEST_POSITIONS),
                                 forms,
                                 device,
                             )?,
@@ -866,7 +1074,16 @@ impl DeviceTrunk {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            pieces: trunk_pieces(
+                layers
+                    .iter()
+                    .map(|layer| matches!(layer.mixer, DeviceMixer::Attention { .. })),
+            ),
             layers,
+            fused: false,
+            graphs: Err("the trunk runs eagerly".into()),
+            #[cfg(test)]
+            steps_whole: false,
             final_norm: gain(
                 checkpoint,
                 &format!("{TRUNK_PREFIX}.norm.weight"),
@@ -928,7 +1145,7 @@ impl DeviceTrunk {
         let x = add_residual(x, &mixed)?;
         let normed = rms_norm(&x, &layer.post_norm, self.eps, act)?;
         record(probe, || "post_normed".into(), &normed);
-        let moe = layer.moe.forward(&normed, phase, act, probe)?;
+        let moe = layer.moe.forward(&normed, phase, act, false, probe)?;
         let x = add_residual(&x, &moe)?;
         record(probe, || "residual".into(), &x);
         if let Some(trace) = trace {
@@ -967,6 +1184,16 @@ impl DeviceTrunk {
         phase: FishDrama3KernelPhase,
         mut trace: Option<&mut LayerTrace>,
     ) -> Result<Tensor> {
+        if self.fused && trace.is_none() {
+            #[cfg(test)]
+            if self.steps_whole {
+                return self.run_fused(x, rows, states, phase);
+            }
+            return match phase {
+                FishDrama3KernelPhase::Step => self.run_pieces(x, rows, states),
+                _ => self.run_fused(x, rows, states, phase),
+            };
+        }
         let mut x = x.to_dtype(self.forms.residual)?;
         for index in 0..self.layers.len() {
             x = self.layer(
@@ -983,8 +1210,336 @@ impl DeviceTrunk {
         self.final_norm(&x, None)
     }
 
+    /// [`Self::run`] through the fused kernels: each residual add with the
+    /// next norm in one launch (`kernels::residual_norm`), attention's q/k
+    /// norm and RoPE in one from the stack's tables with one positions
+    /// upload, and the shared experts' SwiGLU in one. Matches the eager chain
+    /// to rounding.
+    fn run_fused(
+        &self,
+        x: Tensor,
+        rows: &mut [DeviceRow<'_>],
+        states: &mut [&mut [FishDrama3LinearState]],
+        phase: FishDrama3KernelPhase,
+    ) -> Result<Tensor> {
+        let positions = super::positions_tensor(rows, x.device())?;
+        let mut x = x.to_dtype(self.forms.residual)?;
+        let first = &self.layers[0];
+        let mut normed = residual_norm::rms_norm(&x, &first.input_norm, self.eps, first.act)?;
+        for (index, layer) in self.layers.iter().enumerate() {
+            let act = layer.act;
+            let mixed = match &layer.mixer {
+                DeviceMixer::Attention { slot, attention } => {
+                    attention.forward_fused(&normed, rows, *slot, phase, act, &positions)?
+                }
+                DeviceMixer::DeltaNet { slot, net } => {
+                    let mut layer_states = states
+                        .iter_mut()
+                        .map(|states| {
+                            states.get_mut(*slot).ok_or_else(|| {
+                                Error::InferenceError("a DeltaNet state is missing".into())
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    net.forward(&normed, rows, &mut layer_states, phase, act, &mut None)?
+                }
+            };
+            let (sum, post) =
+                residual_norm::add_rms_norm(&x, &mixed, &layer.post_norm, self.eps, act)?;
+            let moe = layer.moe.forward(&post, phase, act, true, &mut None)?;
+            let (gain, next_act) = self
+                .layers
+                .get(index + 1)
+                .map_or((&self.final_norm, self.final_act), |next| {
+                    (&next.input_norm, next.act)
+                });
+            (x, normed) = residual_norm::add_rms_norm(&sum, &moe, gain, self.eps, next_act)?;
+        }
+        Ok(normed.to_dtype(DType::F32)?)
+    }
+
+    /// Turns the fused kernels on, and on CUDA the step's stretch graphs
+    /// unless an MoE layer routes on the host (a readback mid-stretch).
+    pub(crate) fn enable_fused(&mut self, device: &Device) {
+        self.fused = true;
+        let stretches = self
+            .pieces
+            .iter()
+            .filter(|piece| matches!(piece, TrunkPiece::Stretch { .. }))
+            .count();
+        self.graphs = if self
+            .layers
+            .iter()
+            .any(|layer| layer.moe.backend == FishDrama3MoeBackend::Loop)
+        {
+            Err("an MoE layer routes on the host".into())
+        } else {
+            StretchGraphs::resolve(
+                "Fish Audio Drama 3",
+                super::SEGMENT_GRAPHS_ENV,
+                device,
+                stretches,
+            )
+        };
+    }
+
+    /// The stretch graphs' state and counters.
+    pub(crate) fn graph_diagnostics(&self) -> serde_json::Value {
+        match &self.graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        }
+    }
+
+    /// A fused decode step of one row per request, piece by piece: the
+    /// stretches between attention mixers (replaying their graphs on CUDA)
+    /// and each attention mixer with its post norm, eager.
+    fn run_pieces(
+        &self,
+        x: Tensor,
+        rows: &mut [DeviceRow<'_>],
+        states: &mut [&mut [FishDrama3LinearState]],
+    ) -> Result<Tensor> {
+        let m = rows.len();
+        if rows.iter().any(|row| row.rows != 1) || states.len() != m {
+            return Err(Error::InferenceError(
+                "a fused trunk step takes one row per request".into(),
+            ));
+        }
+        let phase = FishDrama3KernelPhase::Step;
+        let mut graphs = self.graphs.as_ref().ok().and_then(|graphs| graphs.begin(m));
+        let mut positions = None;
+        let mut x = x.to_dtype(self.forms.residual)?;
+        let mut h = None;
+        let mut stretch = 0;
+        for piece in &self.pieces {
+            match piece {
+                TrunkPiece::Stretch {
+                    moe_of,
+                    layers,
+                    first,
+                    tail,
+                } => {
+                    let slots = layers
+                        .clone()
+                        .map(|l| match &self.layers[l].mixer {
+                            DeviceMixer::DeltaNet { slot, .. } => Ok(*slot),
+                            DeviceMixer::Attention { .. } => Err(Error::InferenceError(format!(
+                                "trunk stretch layer {l} is attention"
+                            ))),
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let state = |r: usize, slot: usize| {
+                        states[r].get(slot).ok_or_else(|| {
+                            Error::InferenceError("a DeltaNet state is missing".into())
+                        })
+                    };
+                    let mut inputs = vec![x.clone()];
+                    if !first {
+                        inputs.push(h.clone().ok_or_else(|| {
+                            Error::InferenceError("a trunk stretch has no normed input".into())
+                        })?);
+                    }
+                    for &slot in &slots {
+                        for r in 0..m {
+                            inputs.push(state(r, slot)?.conv.history()?);
+                        }
+                    }
+                    for &slot in &slots {
+                        for r in 0..m {
+                            inputs.push(state(r, slot)?.recurrent().clone());
+                        }
+                    }
+                    let body = |inputs: &[Tensor]| {
+                        self.stretch(*moe_of, layers.clone(), *first, *tail, m, inputs)
+                    };
+                    let outputs = match graphs.as_mut() {
+                        Some(run) => run.run(stretch, &inputs, &body)?,
+                        None => body(&inputs)?,
+                    };
+                    let (front, rest) = outputs.split_at(if *tail { 1 } else { 2 });
+                    let (histories, recurrents) = rest.split_at(slots.len() * m);
+                    for (i, &slot) in slots.iter().enumerate() {
+                        for r in 0..m {
+                            let state = states[r].get_mut(slot).ok_or_else(|| {
+                                Error::InferenceError("a DeltaNet state is missing".into())
+                            })?;
+                            state.conv.set_history(&histories[i * m + r])?;
+                            state.set_recurrent_tensor(recurrents[i * m + r].clone())?;
+                        }
+                    }
+                    if *tail {
+                        return Ok(front[0].clone());
+                    }
+                    x = front[0].clone();
+                    h = Some(front[1].clone());
+                    stretch += 1;
+                }
+                TrunkPiece::Attention(index) => {
+                    let layer = &self.layers[*index];
+                    let DeviceMixer::Attention { slot, attention } = &layer.mixer else {
+                        return Err(Error::InferenceError(format!(
+                            "trunk layer {index} is not attention"
+                        )));
+                    };
+                    let normed = h.as_ref().ok_or_else(|| {
+                        Error::InferenceError("an attention mixer has no normed input".into())
+                    })?;
+                    let positions = match &positions {
+                        Some(positions) => positions,
+                        None => positions.insert(super::positions_tensor(rows, x.device())?),
+                    };
+                    let mixed = attention
+                        .forward_fused(normed, rows, *slot, phase, layer.act, positions)?;
+                    let (sum, post) = residual_norm::add_rms_norm(
+                        &x,
+                        &mixed,
+                        &layer.post_norm,
+                        self.eps,
+                        layer.act,
+                    )?;
+                    x = sum;
+                    h = Some(post);
+                }
+            }
+        }
+        Err(Error::InferenceError(
+            "the trunk's step pieces have no tail".into(),
+        ))
+    }
+
+    /// One stretch of a fused step over `m` rows, eagerly: `inputs` are the
+    /// residual, the normed hidden (unless `first`), then each DeltaNet
+    /// layer's conv histories and then its recurrent states, row by row.
+    /// Returns the residual and the normed hidden (at the tail, the final
+    /// norm's output in F32), then the next histories and recurrent states.
+    fn stretch(
+        &self,
+        moe_of: Option<usize>,
+        layers: std::ops::Range<usize>,
+        first: bool,
+        tail: bool,
+        m: usize,
+        inputs: &[Tensor],
+    ) -> Result<Vec<Tensor>> {
+        let phase = FishDrama3KernelPhase::Step;
+        let base = if first { 1 } else { 2 };
+        let nets = layers.len();
+        if inputs.len() != base + 2 * nets * m {
+            return Err(Error::InferenceError(format!(
+                "a trunk stretch took {} inputs for {nets} DeltaNet layers of {m} rows",
+                inputs.len()
+            )));
+        }
+        let next = |l: usize| {
+            self.layers
+                .get(l + 1)
+                .map_or((&self.final_norm, self.final_act), |next| {
+                    (&next.input_norm, next.act)
+                })
+        };
+        let mut x = inputs[0].clone();
+        let mut h = if first {
+            let layer = &self.layers[0];
+            residual_norm::rms_norm(&x, &layer.input_norm, self.eps, layer.act)?
+        } else {
+            inputs[1].clone()
+        };
+        let (histories, recurrents) = inputs[base..].split_at(nets * m);
+        if let Some(k) = moe_of {
+            let layer = &self.layers[k];
+            let moe = layer.moe.forward(&h, phase, layer.act, true, &mut None)?;
+            let (gain, act) = next(k);
+            (x, h) = residual_norm::add_rms_norm(&x, &moe, gain, self.eps, act)?;
+        }
+        let mut next_histories = Vec::with_capacity(nets * m);
+        let mut next_recurrents = Vec::with_capacity(nets * m);
+        for (i, l) in layers.enumerate() {
+            let layer = &self.layers[l];
+            let DeviceMixer::DeltaNet { net, .. } = &layer.mixer else {
+                return Err(Error::InferenceError(format!(
+                    "trunk stretch layer {l} is attention"
+                )));
+            };
+            let rows = i * m..(i + 1) * m;
+            let (mixed, histories, recurrents) =
+                net.step(&h, &histories[rows.clone()], &recurrents[rows], layer.act)?;
+            next_histories.extend(histories);
+            next_recurrents.extend(recurrents);
+            let (sum, post) =
+                residual_norm::add_rms_norm(&x, &mixed, &layer.post_norm, self.eps, layer.act)?;
+            let moe = layer
+                .moe
+                .forward(&post, phase, layer.act, true, &mut None)?;
+            let (gain, act) = next(l);
+            (x, h) = residual_norm::add_rms_norm(&sum, &moe, gain, self.eps, act)?;
+        }
+        let mut outputs = if tail {
+            vec![h.to_dtype(DType::F32)?]
+        } else {
+            vec![x, h]
+        };
+        outputs.extend(next_histories);
+        outputs.extend(next_recurrents);
+        Ok(outputs)
+    }
+
     /// The layers' activation dtypes and expert backends, for diagnostics.
     pub(crate) fn layer_forms(&self) -> Vec<(DType, FishDrama3MoeBackend)> {
         self.layers.iter().map(|l| (l.act, l.moe.backend)).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout(pattern: &str) -> Vec<TrunkPiece> {
+        trunk_pieces(
+            pattern
+                .chars()
+                .map(|c| c == '*')
+                .collect::<Vec<_>>()
+                .into_iter(),
+        )
+    }
+
+    fn stretch(
+        moe_of: Option<usize>,
+        layers: std::ops::Range<usize>,
+        first: bool,
+        tail: bool,
+    ) -> TrunkPiece {
+        TrunkPiece::Stretch {
+            moe_of,
+            layers,
+            first,
+            tail,
+        }
+    }
+
+    /// Each attention mixer ends a stretch; the next stretch opens with that
+    /// layer's MoE half; the first and tail stretches always exist.
+    #[test]
+    fn the_pieces_split_the_trunk_at_attention_mixers() {
+        assert_eq!(
+            layout("DDD*DDD*"),
+            [
+                stretch(None, 0..3, true, false),
+                TrunkPiece::Attention(3),
+                stretch(Some(3), 4..7, false, false),
+                TrunkPiece::Attention(7),
+                stretch(Some(7), 8..8, false, true),
+            ]
+        );
+        assert_eq!(
+            layout("*D"),
+            [
+                stretch(None, 0..0, true, false),
+                TrunkPiece::Attention(0),
+                stretch(Some(0), 1..2, false, true),
+            ]
+        );
+        assert_eq!(layout("DD"), [stretch(None, 0..2, true, true)]);
     }
 }

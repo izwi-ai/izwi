@@ -299,11 +299,17 @@ fn reference_key(
     hash.update(audio.sample_rate.to_le_bytes());
     hash.update((audio.channels as u64).to_le_bytes());
     hash.update((audio.samples.len() as u64).to_le_bytes());
+    // One update per 4,096 samples: the same bytes in the same order as a
+    // 4-byte update per sample, so the same digest, without SHA-256's
+    // per-call buffering for every sample of a long clip.
+    let mut bytes = Vec::with_capacity(4096 * 4);
     for chunk in audio.samples.chunks(4096) {
         check()?;
+        bytes.clear();
         for sample in chunk {
-            hash.update(sample.to_bits().to_le_bytes());
+            bytes.extend_from_slice(&sample.to_bits().to_le_bytes());
         }
+        hash.update(&bytes);
     }
     Ok(hash.finalize().into())
 }
@@ -329,6 +335,26 @@ mod tests {
 
     fn ok() -> Result<()> {
         Ok(())
+    }
+
+    /// Keys stay what they were: the bulk updates hash the bytes the
+    /// per-sample updates did, so a key never changes with this code.
+    #[test]
+    fn the_key_is_the_per_sample_digest() {
+        let samples = (0..10_000)
+            .map(|i| ((i as f32) * 0.37).sin())
+            .collect::<Vec<_>>();
+        let audio = mono(&samples);
+        let mut hash = Sha256::new();
+        hash.update(KEY_DOMAIN);
+        hash.update(audio.sample_rate.to_le_bytes());
+        hash.update((audio.channels as u64).to_le_bytes());
+        hash.update((audio.samples.len() as u64).to_le_bytes());
+        for sample in audio.samples {
+            hash.update(sample.to_bits().to_le_bytes());
+        }
+        let expected: [u8; 32] = hash.finalize().into();
+        assert_eq!(reference_key(&audio, &ok).unwrap(), expected);
     }
 
     /// The prepared length is known without resampling: mono frames at

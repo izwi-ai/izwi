@@ -133,10 +133,20 @@ pub(crate) fn decoder_state_contract(
     Ok(contract)
 }
 
-/// The paged KV dtype per backend: F32 on the CPU, F16 on Metal (the
-/// LFM3-Audio precedent), BF16 on CUDA.
+/// Opt-in F16 paged KV on the CPU (`1`, `on`, `true`; read at load): half
+/// the KV bytes (12 to 6 KiB per token). K, V and the queries round to F16
+/// when written; attention still accumulates in F32. Off by default until a
+/// quality run clears it.
+pub const CPU_F16_KV_ENV: &str = "IZWI_NEMOTRON_TRANSCRIBE_CPU_F16_KV";
+
+/// The paged KV dtype per backend: F32 on the CPU (F16 under
+/// [`CPU_F16_KV_ENV`]), F16 on Metal (the LFM3-Audio precedent), BF16 on
+/// CUDA.
 pub(crate) fn kv_state_dtype(backend: crate::backends::BackendKind) -> StateDType {
     match backend {
+        crate::backends::BackendKind::Cpu if crate::env::flag_or(CPU_F16_KV_ENV, false) => {
+            StateDType::F16
+        }
         crate::backends::BackendKind::Cpu => StateDType::F32,
         crate::backends::BackendKind::Metal => StateDType::F16,
         crate::backends::BackendKind::Cuda => StateDType::Bf16,

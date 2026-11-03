@@ -62,6 +62,7 @@ pub use codec::{
 };
 pub use config::{FishDrama3Config, FishDrama3ConfigPolicy};
 pub use device::trunk::FishDrama3MoeBackend;
+pub use device::FishDrama3DecodePath;
 pub use embed::FishDrama3Embedding;
 pub use head::FishDrama3CompactHead;
 pub use linear::FishDrama3KernelPhase;

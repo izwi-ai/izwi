@@ -68,8 +68,8 @@ use super::checkpoint::{
     tower_head, tower_residual_layer, tower_shared_layer, FishDrama3Checkpoint,
 };
 use super::config::{FishDrama3Config, FishDrama3TokenIds, FishDrama3TowerConfig};
-use super::device::sampling::{count_fallback, count_frames, device_cap};
-use super::device::tower::{DeviceStepCodes, DeviceTower};
+use super::device::sampling::{count_fallback, count_frames, device_cap, read_back};
+use super::device::tower::{DeviceCodes, DeviceStepCodes, DeviceTower};
 use super::device::DeviceRow;
 use super::embed::{bf16_table, FishDrama3Embedding, TRUNK_CODEBOOK};
 use super::linear::{FishDrama3KernelPhase, FishDrama3Linear};
@@ -77,7 +77,7 @@ use super::precision::{decide_cpu_forms, FishDrama3PrecisionReport, Q8_0_TOLERAN
 use super::residency::{
     FishDrama3ClassForms, FishDrama3CpuPrecision, FishDrama3ProjectionClass, FishDrama3Residency,
 };
-use super::sampling::FishDrama3RowSampler;
+use super::sampling::{FishDrama3DrawPolicy, FishDrama3RowSampler};
 use super::trunk::attention::FishDrama3Rope;
 use super::trunk::{load_linear, norm_gain, rms_norm_rows, sigmoid, silu, NormGain};
 use crate::error::{Error, Result};
@@ -272,6 +272,55 @@ pub struct FishDrama3TowerStepRow<'a> {
     /// the request stops before the tower.
     pub main: u32,
     pub sampler: &'a mut FishDrama3RowSampler,
+}
+
+/// One request's row in a resident decode step
+/// ([`FishDrama3Tower::begin_resident_step`]).
+pub(crate) struct FishDrama3ResidentTowerRow<'a> {
+    pub(crate) cache: &'a mut PhysicalPagedKvCache,
+    /// `F_t`, `[main, c0, …]`.
+    pub(crate) input: &'a [u32],
+    pub(crate) sampler: &'a FishDrama3RowSampler,
+}
+
+/// A resident decode step in flight: its appends prepared, its codes on the
+/// device, its rows' samplers past their heads' exponentials.
+pub(crate) struct FishDrama3ResidentTowerStep {
+    prepared: Vec<PreparedPhysicalPagedStep>,
+    samplers: Vec<FishDrama3RowSampler>,
+    pub(crate) codes: DeviceCodes,
+}
+
+/// Each row's heads policy and its heads' exponentials `[heads, rows, V]`
+/// F32 (head-major, so each head's rows are one contiguous block; each
+/// row's drawn from its sampler in head order), uploaded once.
+fn head_noise<'s>(
+    samplers: impl Iterator<Item = &'s mut FishDrama3RowSampler>,
+    count: usize,
+    heads: usize,
+    vocab: usize,
+    device: &Device,
+) -> Result<(Vec<FishDrama3DrawPolicy>, Tensor)> {
+    let mut noise = vec![0f32; count * heads * vocab];
+    let mut policies = Vec::with_capacity(count);
+    for (row, sampler) in samplers.enumerate() {
+        policies.push(sampler.params().heads);
+        for head in 0..heads {
+            let at = (head * count + row) * vocab;
+            noise[at..at + vocab].copy_from_slice(&sampler.exponentials(vocab)?);
+        }
+    }
+    if policies.len() != count {
+        return Err(Error::InferenceError(format!(
+            "{} samplers for {count} tower rows",
+            policies.len()
+        )));
+    }
+    super::device::count_uploads(1);
+    Ok((
+        policies,
+        Tensor::from_vec(noise, (heads, count, vocab), device)?,
+    ))
 }
 
 /// One request's row in a step under given codes (tests and parity runs).
@@ -543,6 +592,9 @@ impl FishDrama3Tower {
             "span_rows": c.span_rows.load(Ordering::Relaxed),
             "steps": c.steps.load(Ordering::Relaxed),
             "step_rows": c.step_rows.load(Ordering::Relaxed),
+            "decode_graphs": self
+                .device_tower()
+                .map_or(serde_json::Value::Null, DeviceTower::graph_diagnostics),
         })
     }
 
@@ -1328,27 +1380,30 @@ impl FishDrama3Tower {
                     prepared: step,
                 })
                 .collect::<Vec<_>>();
+            let first = weights.codes(c0.iter().copied(), &self.device)?;
+            let labelled = DeviceTower::labelled(&labelled, &self.device)?;
             if resident {
-                let mut noise = Vec::with_capacity(count * heads * vocab);
-                let mut policies = Vec::with_capacity(count);
-                for source in sources.iter_mut() {
-                    if let Codes::Sample(sampler) = source {
-                        policies.push(sampler.params().heads);
-                        for _ in 0..heads {
-                            noise.extend(sampler.exponentials(vocab)?);
-                        }
-                    }
-                }
-                let noise = Tensor::from_vec(noise, (count, heads, vocab), &self.device)?;
-                return weights.step(
+                let samplers = sources.iter_mut().filter_map(|source| match source {
+                    Codes::Sample(sampler) => Some(sampler),
+                    Codes::Forced { .. } => None,
+                });
+                let (policies, noise) = head_noise(samplers, count, heads, vocab, &self.device)?;
+                let step = weights.step(
                     embedding,
                     &hidden,
                     &inputs,
-                    &c0,
+                    &first,
                     &labelled,
                     &mut device_rows,
                     DeviceStepCodes::Device { policies, noise },
-                );
+                )?;
+                let codes = step.device.as_ref().ok_or_else(|| {
+                    Error::InferenceError("a device tower step drew no codes".into())
+                })?;
+                // Readback 2: every head's pick, then every draw's non-finite
+                // count, in one transfer.
+                let values = read_back(&codes.packed()?)?;
+                return Ok((DeviceCodes::rows(&values, count)?, step.outputs));
             }
             let mut pick = |head: usize, logits: &Tensor| -> Result<Vec<u32>> {
                 let host = logits.to_device(&Device::Cpu)?.to_vec2::<f32>()?;
@@ -1371,15 +1426,16 @@ impl FishDrama3Tower {
                     })
                     .collect()
             };
-            weights.step(
+            let step = weights.step(
                 embedding,
                 &hidden,
                 &inputs,
-                &c0,
+                &first,
                 &labelled,
                 &mut device_rows,
                 DeviceStepCodes::Host(&mut pick),
-            )
+            )?;
+            Ok((step.host_codes, step.outputs))
         })();
         let (codes, outputs) = match result {
             Ok(done) => done,
@@ -1432,6 +1488,170 @@ impl FishDrama3Tower {
             .fetch_add(count as u64, Ordering::Relaxed);
         self.counters.steps.fetch_add(1, Ordering::Relaxed);
         Ok(out)
+    }
+
+    /// A decode step whose codes stay on the device (the model's
+    /// one-readback frame): row `r` on hidden row `r`, `c0` (`[m]` U32,
+    /// clamped) each row's code 0. Each row draws its heads from a working
+    /// copy of its sampler; the appends stay prepared until
+    /// [`Self::finish_resident_step`] or [`Self::abort_resident_step`]. On an
+    /// error nothing moves.
+    pub(crate) fn begin_resident_step(
+        &self,
+        embedding: &FishDrama3Embedding,
+        hidden: &Tensor,
+        c0: &Tensor,
+        rows: &mut [FishDrama3ResidentTowerRow<'_>],
+    ) -> Result<FishDrama3ResidentTowerStep> {
+        self.check_embedding(embedding)?;
+        let Weights::Device(weights) = &self.weights else {
+            return Err(Error::InferenceError(
+                "a resident tower step needs device weights".into(),
+            ));
+        };
+        let count = rows.len();
+        if count == 0 || hidden.dims() != [count, self.config.dim] || c0.dims() != [count] {
+            return Err(Error::InvalidInput(format!(
+                "Fish Audio Drama 3 resident tower rows are {:?} and {:?} for {count} requests",
+                hidden.dims(),
+                c0.dims()
+            )));
+        }
+        let mut prepared = Vec::with_capacity(count);
+        let mut inputs = Vec::with_capacity(count * self.config.frame_width());
+        for row in rows.iter() {
+            let position = row.cache.context_len();
+            let attempt = (|| {
+                self.frame(row.input, "input")?;
+                if device_cap(&row.sampler.params().heads).is_none() {
+                    return Err(Error::InvalidInput(
+                        "a resident tower step needs device-capped heads".into(),
+                    ));
+                }
+                self.check_clocks(1, position, row.cache)?;
+                row.cache.prepare_append(position, 1)
+            })();
+            match attempt {
+                Ok(step) => {
+                    prepared.push(step);
+                    inputs.extend_from_slice(row.input);
+                }
+                Err(error) => {
+                    for (row, step) in rows.iter_mut().zip(prepared) {
+                        let _ = row.cache.abort_prepared(step);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let mut samplers = rows
+            .iter()
+            .map(|row| row.sampler.clone())
+            .collect::<Vec<_>>();
+        let hidden = hidden.to_dtype(DType::F32)?;
+        let result = (|| {
+            let (policies, noise) = head_noise(
+                samplers.iter_mut(),
+                count,
+                weights.heads(),
+                self.config.codebook_vocab,
+                &self.device,
+            )?;
+            let labelled = DeviceTower::labelled(&vec![true; count], &self.device)?;
+            let mut device_rows = rows
+                .iter()
+                .zip(prepared.iter_mut())
+                .map(|(row, step)| DeviceRow {
+                    start: row.cache.context_len(),
+                    rows: 1,
+                    cache: &*row.cache,
+                    prepared: step,
+                })
+                .collect::<Vec<_>>();
+            weights.step(
+                embedding,
+                &hidden,
+                &inputs,
+                c0,
+                &labelled,
+                &mut device_rows,
+                DeviceStepCodes::Device { policies, noise },
+            )
+        })();
+        let codes = match result.and_then(|step| {
+            step.device
+                .ok_or_else(|| Error::InferenceError("a resident tower step drew no codes".into()))
+        }) {
+            Ok(codes) => codes,
+            Err(error) => {
+                for (row, step) in rows.iter_mut().zip(prepared) {
+                    let _ = row.cache.abort_prepared(step);
+                }
+                return Err(error);
+            }
+        };
+        Ok(FishDrama3ResidentTowerStep {
+            prepared,
+            samplers,
+            codes,
+        })
+    }
+
+    /// Commits the rows of `step` where `keep` (installing their samplers)
+    /// and aborts the others; `caches` are its rows' in order.
+    pub(crate) fn finish_resident_step(
+        &self,
+        step: FishDrama3ResidentTowerStep,
+        caches: &mut [&mut PhysicalPagedKvCache],
+        samplers: &mut [&mut FishDrama3RowSampler],
+        keep: &[bool],
+    ) -> Result<()> {
+        let count = step.prepared.len();
+        if caches.len() != count || samplers.len() != count || keep.len() != count {
+            return Err(Error::InferenceError(
+                "a resident tower step finishes with other rows than it began".into(),
+            ));
+        }
+        let mut failure = None;
+        let mut kept = 0;
+        for ((((cache, prepared), sampler), working), &keep) in caches
+            .iter_mut()
+            .zip(step.prepared)
+            .zip(samplers.iter_mut())
+            .zip(step.samplers)
+            .zip(keep)
+        {
+            let outcome = if keep && failure.is_none() {
+                kept += 1;
+                **sampler = working;
+                cache.commit_prepared(prepared)
+            } else {
+                cache.abort_prepared(prepared)
+            };
+            if let Err(error) = outcome {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        count_frames(kept);
+        self.counters
+            .step_rows
+            .fetch_add(kept as u64, Ordering::Relaxed);
+        self.counters.steps.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Aborts every row of `step`.
+    pub(crate) fn abort_resident_step(
+        &self,
+        step: FishDrama3ResidentTowerStep,
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) {
+        for (cache, prepared) in caches.iter_mut().zip(step.prepared) {
+            let _ = cache.abort_prepared(prepared);
+        }
     }
 
     /// Begins a quantum: a rollback point of `cache`, the request's tower

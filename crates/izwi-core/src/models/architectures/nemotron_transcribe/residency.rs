@@ -79,6 +79,8 @@ pub fn residency(
             out.host_bytes += elements * 2;
             0
         } else if name == "lm_head.weight" {
+            // The opt-in FP8 head is priced 16-bit too: a head that fails its
+            // checks at load stays 16-bit.
             match backend {
                 ResidencyBackend::Cpu => elements / 32 * 34,
                 ResidencyBackend::Metal | ResidencyBackend::Cuda => elements * 2,

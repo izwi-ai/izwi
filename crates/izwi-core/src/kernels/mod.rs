@@ -14,12 +14,14 @@ pub mod cpu_q8;
 pub mod cuda;
 pub mod depthwise_conv;
 pub mod f16_weight_linear;
+pub mod greedy;
 pub(crate) mod lfm_shortconv_step;
 pub mod mamba2;
 pub mod metal;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_encoder;
 pub mod metal_fp8;
+pub mod metal_fp8_gemm;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_kquant_mv;
 #[cfg(feature = "metal")]
@@ -30,6 +32,10 @@ pub(crate) mod metal_paged_gqa;
 pub(crate) mod metal_qwen36moe;
 pub mod moe_relu2;
 pub mod numeric_check;
+pub mod qk_norm_rope;
+pub mod race_sampler;
+pub mod residual_norm;
+pub mod swiglu;
 
 use crate::error::Error;
 use candle_core::{Device, Tensor};

@@ -41,7 +41,7 @@ pub(crate) struct GqaDecodeVariant {
 impl GqaDecodeVariant {
     /// The variant for this geometry, or `None` when the scalar kernels must
     /// serve it (unequal key/value dims, head dim above 256, or more than
-    /// eight query heads per KV head).
+    /// eight query heads per KV head; sixteen at head dims up to 128).
     pub(crate) fn select(
         key_head_dim: usize,
         value_head_dim: usize,
@@ -67,6 +67,9 @@ impl GqaDecodeVariant {
             2 => 2,
             3 | 4 => 4,
             5..=8 => 8,
+            // Nemotron-H: 32 query heads over 2. The registers grow with
+            // group x dims per lane, so only up to 4 dims per lane.
+            9..=16 if dims_per_lane <= 4 => 16,
             _ => return None,
         };
         Some(Self {
@@ -616,6 +619,10 @@ kernel void izwi_paged_decode_gqa<T, DPL, GMAX>(                                
 IZWI_GQA_DECODE_DIMS(float, f32)
 IZWI_GQA_DECODE_DIMS(half, f16)
 
+// Groups of up to 16 query heads, at up to 4 dims per lane (head dim 128).
+IZWI_GQA_DECODE(float, f32, 4, 16)
+IZWI_GQA_DECODE(half, f16, 4, 16)
+
 // Merges each row's own partitions; the shared paged-attention reduce takes
 // one partition size for the whole batch.
 template <typename T>
@@ -717,7 +724,17 @@ mod tests {
         );
         assert_eq!(variant(2, 3, 2, 1), None, "unequal key/value dims");
         assert_eq!(variant(512, 512, 8, 8), None, "head dim above 256");
-        assert_eq!(variant(128, 128, 32, 2), None, "group of 16");
+        assert_eq!(
+            variant(128, 128, 32, 2).map(|v| (v.dims_per_lane, v.max_group)),
+            Some((4, 16)),
+            "Nemotron-H: a group of 16 at head dim 128"
+        );
+        assert_eq!(
+            variant(256, 256, 32, 2),
+            None,
+            "16 only up to 4 dims a lane"
+        );
+        assert_eq!(variant(128, 128, 64, 2), None, "group of 32");
         assert_eq!(variant(128, 128, 6, 4), None, "uneven grouping");
     }
 

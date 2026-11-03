@@ -56,8 +56,20 @@ impl NtLayerNorm {
         })
     }
 
-    /// LayerNorm over the last dimension of F32 `x`.
+    /// LayerNorm over the last dimension of F32 `x`: Candle's fused kernel
+    /// on Metal (one launch instead of seven; Welford's mean and variance,
+    /// the same math to rounding), the composed form elsewhere. Candle's
+    /// CUDA kernel takes the variance as `E[x²] - E[x]²`, which cancels on
+    /// rows whose mean dwarfs their spread, so CUDA keeps the composition.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if x.device().is_metal() && x.dtype() == candle_core::DType::F32 {
+            return Ok(candle_nn::ops::layer_norm(
+                &x.contiguous()?,
+                &self.weight,
+                &self.bias,
+                self.eps as f32,
+            )?);
+        }
         let mean = x.mean_keepdim(D::Minus1)?;
         let centred = x.broadcast_sub(&mean)?;
         let variance = centred.sqr()?.mean_keepdim(D::Minus1)?;
@@ -370,8 +382,19 @@ impl SpeechTransformer {
     }
 }
 
+static HOST_READBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Readbacks through [`host_values`] since the process started: every
+/// device-to-host copy the family makes outside the KV fences.
+pub(crate) fn host_readbacks() -> u64 {
+    HOST_READBACKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A device tensor's values on the host.
 pub(crate) fn host_values(tensor: &Tensor) -> Result<Vec<f32>> {
+    if !tensor.device().is_cpu() {
+        HOST_READBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(tensor
         .to_dtype(DType::F32)?
         .flatten_all()?

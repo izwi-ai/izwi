@@ -378,11 +378,25 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "The published codec.pth (Fish Audio Drama 3's, byte-identical to Fish S2 Pro's) for the ignored real-codec tests: the cross-family bit-identity test and the CUDA streaming test.",
     ),
     CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_CPU_F16_KV",
+        Flag,
+        "off",
+        Load,
+        "Stores the Fish Audio Drama 3 paged KV as F16 on the CPU (94 to 47 KiB per position); attention still accumulates in F32.",
+    ),
+    CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_DTYPE",
         Choice,
         "the backend's (f16 on Metal, bf16 on CUDA, f32 on CPU)",
         Load,
         "Overrides a Fish Audio Drama 3 load's activation dtype: f16 or f32 on Metal (f32 also stores the paged KV in F32 and runs every MoE layer's host loop), bf16 on CUDA, f32 on CPU; anything else fails the load.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_FUSED_DECODE",
+        Flag,
+        "true",
+        Load,
+        "Fish Audio Drama 3 on Metal or CUDA runs its trunk, tower and draws through the fused kernels (residual add + norm, q/k norm + RoPE from load-time tables, packed SwiGLU, one-launch races) and reads each frame back once. Any false value runs the eager per-layer chain with two readbacks a frame; a failed load-time kernel check does too, and `decode_path` in the diagnostics says which ran.",
     ),
     CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_MODEL_DIR",
@@ -418,6 +432,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "unset (test fails)",
         TestHarness,
         "The directory generate_fish_drama3_reference.py wrote (reference.json, reference.safetensors, audio/) for the ignored Fish Audio Drama 3 L2 parity tests.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_SEGMENT_GRAPHS",
+        Flag,
+        "true",
+        Load,
+        "On CUDA, Fish Audio Drama 3's fused trunk and tower steps replay a CUDA graph for each stretch between attention mixers (the trunk's DeltaNet and MoE layers; the tower's FFN, head race and next injection), captured per row count from 1 to 4 and at 8 (the tower's also per heads-policy set), checked bit for bit against the eager stretch on two steps, off for the process on any mismatch; never with a host-routed MoE layer. Any false value, or `IZWI_CUDA_DECODE_GRAPHS=off`, runs every stretch eagerly; the trunk's and tower's `decode_graphs` diagnostics report captures, replays and why the graphs are off.",
     ),
     CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_SLICE_DIR",
@@ -1299,11 +1320,39 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Backend for the Nemotron 3.5 Transcribe L2 parity test: cpu, metal or cuda (the build must have that feature).",
     ),
     CoreEnvVar::new(
+        "IZWI_NEMOTRON_TRANSCRIBE_CPU_F16_KV",
+        Flag,
+        "off",
+        Load,
+        "Stores the Nemotron 3.5 Transcribe paged KV as F16 on the CPU (12 to 6 KiB per token); attention still accumulates in F32.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_NEMOTRON_TRANSCRIBE_DECODE_QUANTUM",
+        Int,
+        "8 on Metal and CUDA, 4 on CPU",
+        Load,
+        "Most decode steps one Nemotron 3.5 Transcribe row runs per engine quantum while no request waits (1 to 64); values outside that range are ignored.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_NEMOTRON_TRANSCRIBE_FP8_LM_HEAD",
+        Flag,
+        "off",
+        Load,
+        "Quantizes the Nemotron 3.5 Transcribe LM head to block FP8 on Metal and CUDA (704 to 352 MB); a failed quality or device check keeps the 16-bit head.",
+    ),
+    CoreEnvVar::new(
         "IZWI_NEMOTRON_TRANSCRIBE_FP8_MODE",
         Choice,
         "w8a16",
         Load,
         "Nemotron 3.5 Transcribe FP8 linears: w8a16 (FP8 weights, wide activations) or vllm-fp8 (activations rounded to E4M3 per token, as vLLM's W8A8 path); anything else fails the load.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_NEMOTRON_TRANSCRIBE_FUSED_DECODE",
+        Flag,
+        "true",
+        Load,
+        "Nemotron 3.5 Transcribe decode steps through the fused kernels (residual add + norm, Mamba2 step kernels, device greedy pick, a single readback). Any false value runs the eager composition; a failed load-time kernel check does too, and `decode_path` in the diagnostics says which ran.",
     ),
     CoreEnvVar::new(
         "IZWI_NEMOTRON_TRANSCRIBE_MODEL_DIR",
@@ -1315,9 +1364,9 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN",
         Int,
-        "2048 on CUDA, 512 on CPU and Metal",
+        "512 on CUDA, 192 on CPU and Metal",
         Load,
-        "Most prompt tokens one Nemotron 3.5 Transcribe row prefills per engine step (16 to 16384); values outside that range are ignored.",
+        "Prompt tokens one Nemotron 3.5 Transcribe row prefills per engine step (16 to 16384), fixed per load: the scheduler's prefill grid, so every span but a prompt's last has this length alone or beside other rows; values outside that range are ignored.",
     ),
     CoreEnvVar::new(
         "IZWI_NEMOTRON_TRANSCRIBE_REFERENCE",
@@ -1325,6 +1374,20 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "tests/fixtures/nemotron_transcribe/reference.json",
         TestHarness,
         "The L2 reference JSON generate_nemotron_transcribe_reference.py wrote, for the Nemotron 3.5 Transcribe parity test.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_NEMOTRON_TRANSCRIBE_SEGMENT_GRAPHS",
+        Flag,
+        "true",
+        Load,
+        "On CUDA, Nemotron 3.5 Transcribe's fused decode step replays a CUDA graph for each stretch of Mamba and MoE layers between attention layers (captured per row count from 1 to 4 and at 8, checked bit for bit against the eager stretch on two steps, off for the process on any mismatch). Any false value, or `IZWI_CUDA_DECODE_GRAPHS=off`, runs every stretch eagerly; `decode_graphs` in the diagnostics reports captures, replays and why the graphs are off.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_NEMOTRON_TRANSCRIBE_TRANSLATION_SEGMENT_SECONDS",
+        Float,
+        "30",
+        Once,
+        "Longest segment, in seconds, of a Nemotron 3.5 Transcribe translation. The model translates sentence-length speech and falls back to a transcript on a long recording, so a longer recording is cut at pauses into segments that are translated side by side and joined in order. `0` translates in one pass; values below 5 count as 5. Transcription always runs in one pass.",
     ),
     CoreEnvVar::new(
         "IZWI_NO_UI",

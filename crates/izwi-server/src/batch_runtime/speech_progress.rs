@@ -265,13 +265,19 @@ impl SpeechCheckpoint {
             checkpoint.next_sequence <= MAX_PCM_REPLAY_ENTRIES,
             "Speech replay entry quota exceeded"
         );
-        if checkpoint.active_segment.is_some() && checkpoint.publication_started {
+        if checkpoint.published_partial_segment() {
             bail!(
                 "speech_partial_segment_interrupted: published audio cannot be regenerated safely"
             );
         }
         checkpoint.active_segment = None;
         Ok(checkpoint)
+    }
+
+    /// Whether the active segment already published audio. Listeners may
+    /// have heard it, so no later attempt may speak that segment again.
+    pub fn published_partial_segment(&self) -> bool {
+        self.active_segment.is_some() && self.publication_started
     }
 
     pub async fn save(&self, attempt: &StageExecutionContext) -> anyhow::Result<()> {

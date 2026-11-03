@@ -751,6 +751,7 @@ fn model_options(
         prefill_span_rows,
         config_policy,
         activations: None,
+        cpu_kv_dtype: DType::F32,
     }
 }
 

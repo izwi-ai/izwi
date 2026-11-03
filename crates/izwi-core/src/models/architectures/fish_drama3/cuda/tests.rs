@@ -9,8 +9,8 @@
 use candle_core::{DType, Device, Tensor};
 
 use super::super::device::test_support::{
-    decode_together, host, load, ok, options, pair, params, prompt_of, rows, trunk_caches,
-    trunk_span_error,
+    decode_requests, decode_together, fused_against_eager, host, load, ok, options, pair, params,
+    prompt_of, rows, trunk_caches, trunk_span_error, DecodeRequest,
 };
 use super::super::model::tests::write_synthetic_model_in;
 use super::super::residency::FishDrama3CpuPrecision;
@@ -188,6 +188,19 @@ fn cuda_tower_and_heads_track_the_cpu_reference() {
     assert!(head < HEAD_TOLERANCE, "compact head: {head:.3e}");
 }
 
+/// The fused trunk and tower (residual norms, q/k norm + RoPE, packed
+/// SwiGLU) against the eager chain on one load.
+#[test]
+fn cuda_fused_forwards_track_the_eager_chain() {
+    let Some(device) = device_or_skip() else {
+        return;
+    };
+    let (trunk, tower) = fused_against_eager(&device, 5);
+    eprintln!("fused against eager: trunk {trunk:.3e}, tower {tower:.3e}");
+    assert!(trunk < TRUNK_TOLERANCE, "trunk: {trunk:.3e}");
+    assert!(tower < TOWER_TOLERANCE, "tower: {tower:.3e}");
+}
+
 /// §7.4 at CUDA widths 1, 2, 4 and 8: a request's frames and `h_t` are
 /// bit-identical alone and at every row position of a batch of longer and
 /// shorter requests, through the whole decode (the row-invariant GEMV in
@@ -242,10 +255,62 @@ fn cuda_decode_rows_are_bit_identical_alone_and_together() {
     );
 }
 
-/// Two readbacks a frame: the main and RAS picks of every row, then their
-/// 9 head codes; every frame counted as sampled on the device.
+/// The trunk's and the tower's step stretches are captured, verified and
+/// replayed, and the frames are the eager stretches' own.
 #[test]
-fn cuda_decode_reads_back_twice_a_frame() {
+fn cuda_step_graphs_decode_as_the_eager_stretches() {
+    let Some(device) = device_or_skip() else {
+        return;
+    };
+    let synthetic = write_synthetic_model_in(7, SyntheticGeometry::KernelHeads, |_| {});
+    let mut model = load(&synthetic, &device, options(FishDrama3CpuPrecision::Q8_0));
+    let a = prompt_of(&model, &rows(&model, 9, 1));
+    let b = prompt_of(&model, &rows(&model, 12, 2));
+    let graphed = decode_together(&model, &[(&a, 11), (&b, 12)], 6, false);
+    let graphs = model.diagnostics_summary()["trunk"]["decode_graphs"].clone();
+    assert!(graphs["off"].is_null(), "{graphs}");
+    assert!(graphs["replays"].as_u64().unwrap() > 0, "{graphs}");
+    let tower = model.diagnostics_summary()["tower"]["decode_graphs"].clone();
+    assert!(tower["off"].is_null(), "{tower}");
+    assert!(tower["replays"].as_u64().unwrap() > 0, "{tower}");
+    model.trunk_mut().device_trunk_mut().unwrap().graphs = Err("disabled by a test".into());
+    model.tower_mut().device_tower_mut().unwrap().graphs = Err("disabled by a test".into());
+    let eager = decode_together(&model, &[(&a, 11), (&b, 12)], 6, false);
+    assert_eq!(graphed, eager);
+}
+
+/// The one-readback frame makes the two-readback path's frames bit for bit,
+/// through a frame limit and an eos whose speculative step is aborted.
+#[test]
+fn cuda_one_readback_frames_are_the_two_readback_frames() {
+    let Some(device) = device_or_skip() else {
+        return;
+    };
+    let synthetic = write_synthetic_model_in(7, SyntheticGeometry::KernelHeads, |_| {});
+    let mut model = load(&synthetic, &device, options(FishDrama3CpuPrecision::Q8_0));
+    let (a, b, c) = (
+        prompt_of(&model, &rows(&model, 9, 1)),
+        prompt_of(&model, &rows(&model, 12, 2)),
+        prompt_of(&model, &rows(&model, 5, 3)),
+    );
+    let requests = [(&a, 11, 16, None), (&b, 12, 3, None), (&c, 13, 16, Some(2))].map(
+        |(prompt, seed, max_frames, eos_at)| DecodeRequest {
+            prompt,
+            seed,
+            max_frames,
+            eos_at,
+        },
+    );
+    let one = decode_requests(&model, &requests, 6);
+    model.two_readbacks = true;
+    let two = decode_requests(&model, &requests, 6);
+    assert_eq!(one, two);
+}
+
+/// One readback a frame (every row's picks, chosen candidate, 9 head codes
+/// and flags); every frame counted as sampled on the device.
+#[test]
+fn cuda_decode_reads_back_once_a_frame() {
     let Some(device) = device_or_skip() else {
         return;
     };
@@ -274,7 +339,7 @@ fn cuda_decode_reads_back_twice_a_frame() {
     );
     let mut refs = states.iter_mut().collect::<Vec<_>>();
     model.decode_round(&mut refs).unwrap();
-    assert_eq!(fish_drama3_resident_readbacks() - readbacks, 2);
+    assert_eq!(fish_drama3_resident_readbacks() - readbacks, 1);
     assert_eq!(fish_drama3_resident_frames() - frames, 2);
     assert_eq!(fish_drama3_resident_host_fallbacks(), fallbacks);
     assert!(states.iter().all(|state| state.frames() == 1));

@@ -336,7 +336,10 @@ jobs:
   cargo-metal:
     name: Cargo Validation (${{ matrix.contract }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # The Metal lane's izwi-core and izwi-server suites alone take about 40
+    # minutes on a cold cache since Fish Audio Drama 3, before the worker
+    # parity build and the KV matrix run.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:

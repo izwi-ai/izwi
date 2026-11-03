@@ -593,6 +593,190 @@ kernel void q36m_gdn_decode_##S(                                                
 Q36M_GDN_DECODE(half, f16)
 Q36M_GDN_DECODE(float, f32)
 
+// ---- Gated DeltaNet over a span of tokens (prefill). ----
+// The same per-token arithmetic as q36m_gdn_conv / q36m_gdn_decode, written
+// out identically, so a span and the token-by-token loop agree bit for bit.
+
+// Token t's taps are s[t], s[t + 1], s[t + 2] (oldest first) of the sequence
+// s = [h0, h1, h2, x0, x1, ...]; grid (conv_dim, tokens).
+template <typename T>
+inline float q36m_gdn_tap(
+    device const T* x, device const float* h0, device const float* h1, device const float* h2,
+    uint conv_dim, uint c, uint i) {
+    if (i == 0) {
+        return h0[c];
+    }
+    if (i == 1) {
+        return h1[c];
+    }
+    if (i == 2) {
+        return h2[c];
+    }
+    return float(x[(ulong)(i - 3) * conv_dim + c]);
+}
+
+template <typename T>
+inline void q36m_gdn_conv_span(
+    device const T* x, device const float* w, device const float* h0, device const float* h1,
+    device const float* h2, device float* out, device float* history, uint conv_dim,
+    uint tokens, uint c, uint t) {
+    if (c >= conv_dim || t >= tokens) {
+        return;
+    }
+    const float xc = float(x[(ulong)t * conv_dim + c]);
+    device const float* wc = w + (ulong)c * 4;
+    const float p0 = q36m_gdn_tap(x, h0, h1, h2, conv_dim, c, t);
+    const float p1 = q36m_gdn_tap(x, h0, h1, h2, conv_dim, c, t + 1);
+    const float p2 = q36m_gdn_tap(x, h0, h1, h2, conv_dim, c, t + 2);
+    float v = xc * wc[3];
+    v = v + p0 * wc[0];
+    v = v + p1 * wc[1];
+    v = v + p2 * wc[2];
+    out[(ulong)t * conv_dim + c] = v / (1.0f + exp(-v));
+    if (t + 1 == tokens) {
+        history[c] = p1;
+        history[(ulong)conv_dim + c] = p2;
+        history[2 * (ulong)conv_dim + c] = xc;
+    }
+}
+
+#define Q36M_GDN_CONV_SPAN(T, S)                                                                   \
+kernel void q36m_gdn_conv_span_##S(                                                                \
+    device const T* x [[buffer(0)]], device const float* w [[buffer(1)]],                         \
+    device const float* h0 [[buffer(2)]], device const float* h1 [[buffer(3)]],                   \
+    device const float* h2 [[buffer(4)]], device float* out [[buffer(5)]],                        \
+    device float* history [[buffer(6)]], constant uint& conv_dim [[buffer(7)]],                   \
+    constant uint& tokens [[buffer(8)]], uint2 gid [[thread_position_in_grid]]) {                 \
+    q36m_gdn_conv_span<T>(x, w, h0, h1, h2, out, history, conv_dim, tokens, gid.x, gid.y);       \
+}
+
+Q36M_GDN_CONV_SPAN(half, f16)
+Q36M_GDN_CONV_SPAN(float, f32)
+
+// One 512-thread threadgroup per value head walks the span's tokens, the
+// state in registers between them (128-dim heads). Per token: `conv` row
+// [conv_dim], `z` row [value_heads * 128], `beta_raw` / `alpha` rows
+// [value_heads].
+template <typename T>
+inline void q36m_gdn_decode_span(
+    device const float* conv_rows, device const T* z_rows, device const T* beta_rows,
+    device const T* alpha_rows, device const float* dt_bias, device const float* a,
+    device const float* norm_w, device const float* state_in, device float* state_out,
+    device T* y_rows, uint key_heads, uint value_heads, uint grouped, float norm_eps,
+    uint tokens, uint h, uint tid, uint warp, uint lane,
+    threadgroup float* qs, threadgroup float* ks, threadgroup float* red,
+    threadgroup float* part, threadgroup float* stats) {
+    const uint repeats = value_heads / key_heads;
+    const uint kh = grouped != 0 ? h / repeats : h % key_heads;
+    const uint col = (warp & 3) * 32 + lane;
+    const uint rg = warp >> 2;
+    const uint key_width = key_heads * 128;
+    const uint conv_dim = (2 * key_heads + value_heads) * 128;
+    const ulong row0 = (ulong)h * 128 + (ulong)rg * 32;
+    device const float* sin_ = state_in + row0 * 128 + col;
+    float s[32];
+    for (uint i = 0; i < 32; ++i) {
+        s[i] = sin_[(ulong)i * 128];
+    }
+    for (uint t = 0; t < tokens; ++t) {
+        device const float* conv = conv_rows + (ulong)t * conv_dim;
+        device const T* z = z_rows + (ulong)t * value_heads * 128;
+        device const T* beta_raw = beta_rows + (ulong)t * value_heads;
+        device const T* alpha = alpha_rows + (ulong)t * value_heads;
+        device T* y = y_rows + (ulong)t * value_heads * 128;
+        if (tid < 128) {
+            qs[tid] = conv[kh * 128 + tid];
+            ks[tid] = conv[key_width + kh * 128 + tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (warp < 8) {
+            const float val = warp < 4 ? qs[warp * 32 + lane] : ks[(warp - 4) * 32 + lane];
+            const float sq = simd_sum(val * val);
+            if (lane == 0) {
+                part[warp] = sq;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            const float qsum = part[0] + part[1] + part[2] + part[3];
+            const float ksum = part[4] + part[5] + part[6] + part[7];
+            stats[0] = 1.0f / (sqrt(qsum + 1e-6f) * sqrt(128.0f));
+            stats[1] = 1.0f / sqrt(ksum + 1e-6f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float qscale = stats[0];
+        const float knorm = stats[1];
+        const float gate_in = float(alpha[h]) + dt_bias[h];
+        const float softplus = max(gate_in, 0.0f) + log(1.0f + exp(-fabs(gate_in)));
+        const float decay = exp(softplus * a[h]);
+        const float beta = 1.0f / (1.0f + exp(-float(beta_raw[h])));
+        float recalled = 0.0f;
+        for (uint i = 0; i < 32; ++i) {
+            s[i] = s[i] * decay;
+            recalled = fma(ks[rg * 32 + i] * knorm, s[i], recalled);
+        }
+        red[rg * 128 + col] = recalled;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float kv = red[col] + red[128 + col] + red[256 + col] + red[384 + col];
+        const float delta = (conv[2 * key_width + h * 128 + col] - kv) * beta;
+        float o = 0.0f;
+        for (uint i = 0; i < 32; ++i) {
+            const float updated = fma(ks[rg * 32 + i] * knorm, delta, s[i]);
+            s[i] = updated;
+            o = fma(qs[rg * 32 + i] * qscale, updated, o);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        red[rg * 128 + col] = o;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float out = 0.0f;
+        if (rg == 0) {
+            out = red[col] + red[128 + col] + red[256 + col] + red[384 + col];
+            const float sq = simd_sum(out * out);
+            if (lane == 0) {
+                part[warp] = sq;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (rg == 0) {
+            const float mean_sq = (part[0] + part[1] + part[2] + part[3]) / 128.0f;
+            const float zz = float(z[h * 128 + col]);
+            const float gate = zz / (1.0f + exp(-zz));
+            y[h * 128 + col] = T(out / sqrt(mean_sq + norm_eps) * norm_w[col] * gate);
+        }
+        // The next token rewrites qs, ks, red and part.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    device float* sout = state_out + row0 * 128 + col;
+    for (uint i = 0; i < 32; ++i) {
+        sout[(ulong)i * 128] = s[i];
+    }
+}
+
+#define Q36M_GDN_DECODE_SPAN(T, S)                                                                 \
+kernel void q36m_gdn_decode_span_##S(                                                              \
+    device const float* conv [[buffer(0)]], device const T* z [[buffer(1)]],                      \
+    device const T* beta_raw [[buffer(2)]], device const T* alpha [[buffer(3)]],                  \
+    device const float* dt_bias [[buffer(4)]], device const float* a [[buffer(5)]],               \
+    device const float* norm_w [[buffer(6)]], device const float* state_in [[buffer(7)]],         \
+    device float* state_out [[buffer(8)]], device T* y [[buffer(9)]],                             \
+    constant uint& key_heads [[buffer(10)]], constant uint& value_heads [[buffer(11)]],           \
+    constant uint& grouped [[buffer(12)]], constant float& norm_eps [[buffer(13)]],               \
+    constant uint& tokens [[buffer(14)]],                                                          \
+    uint h [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],            \
+    uint warp [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {      \
+    threadgroup float qs[128];                                                                     \
+    threadgroup float ks[128];                                                                     \
+    threadgroup float red[512];                                                                    \
+    threadgroup float part[16];                                                                    \
+    threadgroup float stats[2];                                                                    \
+    q36m_gdn_decode_span<T>(conv, z, beta_raw, alpha, dt_bias, a, norm_w, state_in, state_out,    \
+                            y, key_heads, value_heads, grouped, norm_eps, tokens, h, tid, warp,   \
+                            lane, qs, ks, red, part, stats);                                       \
+}
+
+Q36M_GDN_DECODE_SPAN(half, f16)
+Q36M_GDN_DECODE_SPAN(float, f32)
+
 // ---- RMSNorm with an F32 gain (+ optional residual add); one threadgroup per row. ----
 template <typename T>
 inline void q36m_rms_norm(
@@ -1185,6 +1369,10 @@ fn kernel_name(prefix: &str, suffix: &str) -> &'static str {
         ("q36m_gdn_conv", "f16") => "q36m_gdn_conv_f16",
         ("q36m_gdn_conv", _) => "q36m_gdn_conv_f32",
         ("q36m_gdn_decode", "f16") => "q36m_gdn_decode_f16",
+        ("q36m_gdn_conv_span", "f16") => "q36m_gdn_conv_span_f16",
+        ("q36m_gdn_conv_span", _) => "q36m_gdn_conv_span_f32",
+        ("q36m_gdn_decode_span", "f16") => "q36m_gdn_decode_span_f16",
+        ("q36m_gdn_decode_span", _) => "q36m_gdn_decode_span_f32",
         (_, _) => "q36m_gdn_decode_f32",
     }
 }
@@ -1291,6 +1479,118 @@ pub(crate) fn gdn_decode(
     drop(bound);
     Ok((
         wrap(&device, y, Shape::from(hv * d), dtype),
+        wrap(&device, next, Shape::from((1, hv, d, d)), DType::F32),
+    ))
+}
+
+/// DeltaNet causal conv over `tokens` rows of `x` (see
+/// `kernels::cuda::gdn::conv_span`).
+pub(crate) fn gdn_conv_span(
+    x: &Tensor,
+    weight: &Tensor,
+    history: [&Tensor; 3],
+    conv_dim: usize,
+    tokens: usize,
+) -> Result<(Tensor, Tensor)> {
+    let device = metal_device(x)?;
+    let suffix = f16_or_f32(x.dtype(), "DeltaNet conv span")?;
+    let (x, weight) = (x.contiguous()?, weight.contiguous()?);
+    let h = [
+        history[0].contiguous()?,
+        history[1].contiguous()?,
+        history[2].contiguous()?,
+    ];
+    let xb = bind(&x, "conv input", 2)?;
+    let wb = bind(&weight, "conv weight", 4)?;
+    let hb = [
+        bind(&h[0], "history", 4)?,
+        bind(&h[1], "history", 4)?,
+        bind(&h[2], "history", 4)?,
+    ];
+    let out = device.new_buffer(tokens * conv_dim, DType::F32, "q36m-gdn-conv-span")?;
+    let next = device.new_buffer(3 * conv_dim, DType::F32, "q36m-gdn-history")?;
+    let encoder = device.command_encoder()?;
+    encoder.set_label("q36m-gdn-conv-span");
+    encoder.set_compute_pipeline_state(&pipeline(
+        device.metal_device(),
+        kernel_name("q36m_gdn_conv_span", suffix),
+    )?);
+    encoder.set_input_buffer(0, Some(xb.buffer()?), xb.offset);
+    encoder.set_input_buffer(1, Some(wb.buffer()?), wb.offset);
+    for (index, bound) in hb.iter().enumerate() {
+        encoder.set_input_buffer(2 + index, Some(bound.buffer()?), bound.offset);
+    }
+    encoder.set_output_buffer(5, Some(&out), 0);
+    encoder.set_output_buffer(6, Some(&next), 0);
+    encoder.set_bytes(7, &u32_arg(conv_dim, "conv dim")?);
+    encoder.set_bytes(8, &u32_arg(tokens, "tokens")?);
+    encoder.dispatch_threads(grid(conv_dim, tokens), grid(256, 1));
+    drop(encoder);
+    drop((xb, wb, hb));
+    Ok((
+        wrap(&device, out, Shape::from((tokens, conv_dim)), DType::F32),
+        wrap(&device, next, Shape::from((3, conv_dim)), DType::F32),
+    ))
+}
+
+/// DeltaNet recurrence over `tokens` rows (see
+/// `kernels::cuda::gdn::recurrent_span`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gdn_decode_span(
+    conv: &Tensor,
+    z: &Tensor,
+    beta_raw: &Tensor,
+    alpha: &Tensor,
+    dt_bias: &Tensor,
+    a: &Tensor,
+    norm_weight: &Tensor,
+    state: &Tensor,
+    spec: &crate::kernels::cuda::gdn::GdnDecodeSpec,
+    tokens: usize,
+) -> Result<(Tensor, Tensor)> {
+    let device = metal_device(conv)?;
+    let dtype = z.dtype();
+    let suffix = f16_or_f32(dtype, "DeltaNet decode span")?;
+    let d = crate::kernels::cuda::gdn::HEAD_DIM;
+    let hv = spec.value_heads;
+    let tensors =
+        [conv, z, beta_raw, alpha, dt_bias, a, norm_weight, state].map(Tensor::contiguous);
+    let [conv, z, beta_raw, alpha, dt_bias, a, norm_weight, state] = tensors;
+    let (conv, z, beta_raw, alpha) = (conv?, z?, beta_raw?, alpha?);
+    let (dt_bias, a, norm_weight, state) = (dt_bias?, a?, norm_weight?, state?);
+    let bound = [
+        bind(&conv, "conv", 4)?,
+        bind(&z, "z", 2)?,
+        bind(&beta_raw, "beta", 2)?,
+        bind(&alpha, "alpha", 2)?,
+        bind(&dt_bias, "dt_bias", 4)?,
+        bind(&a, "a", 4)?,
+        bind(&norm_weight, "norm", 4)?,
+        bind(&state, "state", 4)?,
+    ];
+    let next = device.new_buffer(hv * d * d, DType::F32, "q36m-gdn-state")?;
+    let y = device.new_buffer(tokens * hv * d, dtype, "q36m-gdn-y-span")?;
+    let encoder = device.command_encoder()?;
+    encoder.set_label("q36m-gdn-decode-span");
+    encoder.set_compute_pipeline_state(&pipeline(
+        device.metal_device(),
+        kernel_name("q36m_gdn_decode_span", suffix),
+    )?);
+    for (index, b) in bound.iter().enumerate() {
+        encoder.set_input_buffer(index, Some(b.buffer()?), b.offset);
+    }
+    encoder.set_output_buffer(8, Some(&next), 0);
+    encoder.set_output_buffer(9, Some(&y), 0);
+    encoder.set_bytes(10, &u32_arg(spec.key_heads, "key heads")?);
+    encoder.set_bytes(11, &u32_arg(hv, "value heads")?);
+    encoder.set_bytes(12, &u32::from(spec.grouped));
+    encoder.set_bytes(13, &spec.norm_eps);
+    encoder.set_bytes(14, &u32_arg(tokens, "tokens")?);
+    encoder.dispatch_thread_groups(grid(hv, 1), grid(512, 1));
+    drop(encoder);
+    drop(bound);
+    Ok((
+        wrap(&device, y, Shape::from((tokens, hv * d)), dtype),
         wrap(&device, next, Shape::from((1, hv, d, d)), DType::F32),
     ))
 }

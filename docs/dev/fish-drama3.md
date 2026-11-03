@@ -161,7 +161,7 @@ eos; otherwise the request fails with `frame_limit`, never a cut-off take.
 | Embedding and code tables | BF16 host tables | F16 device tables | BF16 device tables |
 | Residual stream | F32 | F32 | BF16 |
 | Paged KV (both domains) | F32 | F16 (F32 after a breached probe) | BF16 |
-| Sampling | Host | Device, two readbacks a frame | Device, two readbacks a frame |
+| Sampling | Host | Device, one readback a frame | Device, one readback a frame |
 | Codec | F32 | F32 | F32 |
 | Resident total | about 37 GiB | about 37 GiB | about 37 GiB |
 
@@ -183,8 +183,81 @@ backend's report:
   check leaves the grouped MoE on its warp kernels. A GPU older than SM80 is
   refused before any weight is read.
 
+`IZWI_FISH_DRAMA3_CPU_F16_KV=1` stores the CPU's paged KV as F16 instead of
+F32 (94 to 47 KiB per position; read at load, off by default). K, V and the
+queries round to F16 when written; attention still accumulates in F32.
+
 `IZWI_FISH_DRAMA3_MOE_BACKEND=loop` runs the routed experts as a host-routed
 loop of one FP8 GEMV pair per expert on Metal and CUDA, for diagnosis.
+
+### Fused forwards
+
+On Metal and CUDA the trunk and tower run through fused kernels shared with
+other families (`crates/izwi-core/src/kernels/`):
+
+- `residual_norm`: each residual add with the norm after it in one launch,
+  the sum rounded once to the stream's dtype (BF16 on CUDA, F32 on Metal)
+  and the norm read through the next layer's activation dtype.
+- `qk_norm_rope`: q, k and v read straight from the packed projection, each
+  head's q/k norm and RoPE in one launch from cos/sin tables built on the
+  host at load (one set per stack and device, shared by every layer) and
+  one positions upload per stack forward.
+- `swiglu`: the shared expert's and the tower's gate and up projections are
+  packed into one `[gate | up]` projection at load; one GEMV and one launch
+  replace two GEMVs, two casts, SiLU, the product and a cast.
+- `race_sampler`: each device draw is one launch instead of a bounded sort
+  and about 40 Candle ops. A row's main draw uploads both its exponentials
+  (the request's draw and RAS's) at once; a codebook head races every row
+  that shares a policy in one launch, over exponentials uploaded head-major.
+  A kept prefix longer than the 512 sorted ranks (an uncapped main draw over
+  a flat distribution) is bounded by mass on the device, so no draw falls
+  back to the host.
+- `gdn::conv_span` / `gdn::recurrent_span` (Metal): a prefill span's
+  DeltaNet layer runs as two launches, the causal conv over every row and
+  one threadgroup per value head walking the rows with its state in
+  registers, instead of a launch chain per row (about 46,000 launches per
+  256-row cell). Each row's arithmetic is the per-row kernels', so the span
+  matches the row-by-row result bit for bit
+  (`recurrent_deltanet_spans_total` in `device_fast_paths`).
+
+A fused trunk step runs as pieces: stretches of DeltaNet and MoE layers
+between attention mixers (each opens with the previous attention layer's
+MoE half), pure functions of the residual, the normed hidden and each row's
+conv history and recurrent state, and the attention mixers with their post
+norms, eager. On CUDA each stretch replays a CUDA graph
+(`kernels::cuda::stretch_graphs`), captured per row count for steps of 1 to
+4 rows and of 8 (the default CUDA width) and checked bit for bit against the eager stretch on its capture step and the
+next; any failure turns the graphs off for the process, and a host-routed
+MoE layer keeps them off. A replay copies the DeltaNet states in and out of
+the graph's buffers. The trunk's `decode_graphs` diagnostics count warmups,
+captures, verified steps and replays. A device-drawn tower step runs as
+pieces too: each layer's attention with its FFN norm, eager, and the
+stretches between them (a layer's FFN and final norm, its head's race, the
+next layer's injection and pre-attention norms). The race takes each row's
+heads policy as launch arguments, so the tower's graphs are kept per row
+count and policy set (at most 8 shapes); the tower's `decode_graphs`
+diagnostics report them. `IZWI_FISH_DRAMA3_SEGMENT_GRAPHS=0` or
+`IZWI_CUDA_DECODE_GRAPHS=off` keeps every stretch of both eager. Prefill
+spans run the fused layers whole. The graphs have been compiled and
+type-checked but not yet run on a GPU.
+
+On the fused path a frame reads back once. The main draws, RAS (the
+retry replaces a semantic first draw already in the row's 16-token window,
+uploaded per frame), the tower and the trunk all run on the device for every
+row under its frame limit, the next trunk row is embedded from the device's
+token and codebook-1 code, and every pick, chosen candidate, code and
+non-finite count then comes back in one transfer. The tower and trunk
+appends and DeltaNet states stay prepared until then: a row that drew eos
+has its step aborted (one wasted step), and the host replays RAS to check
+the device's choice. Frames, noise and samplers are those of the
+two-readback path bit for bit.
+
+The load compares the kernels on the device with their CPU forms at the
+model's widths and dtype mixes (relative L2 at most 1e-3; the race must
+pick exactly as its CPU form does), and
+`decode_path` in the diagnostics says which path runs and why.
+`IZWI_FISH_DRAMA3_FUSED_DECODE=0` runs the eager per-layer chain. The Metal
+range probe and the trunk's traced test forwards always run eagerly.
 
 ## Engine path
 
@@ -204,6 +277,16 @@ pending coordinator (`fish_drama3_pending.rs`). The stages:
 | `tts.decode.fish_drama3` | One frame per row per quantum, rows of many users together, each row alone through every kernel |
 | `tts.audio_decode.fish_drama3` | Committed frames through the codec in batched quanta: the first after 4 frames, then 16 at a time, within each stream's output credit |
 | `tts.codec.fish_drama3.scalar` | Flush; the PCM is frames × 2,048 samples |
+
+The backend report's fast-path counters time each decode step's three parts
+on the host and count the step's host-to-device uploads
+(`step_uploads_total`), beside the resident sampler's frames and readbacks.
+On the one-readback frame `step_main_draw_ms_total` is the main head, its
+draws and RAS, `step_tower_ms_total` the tower and its heads, and
+`step_trunk_ms_total` the embedding, the trunk, the frame's readback (where
+the host waits for the GPU) and the commits. With the fused path off,
+`step_main_draw_ms_total` ends with readback 1 and `step_tower_ms_total`
+with readback 2.
 
 Every model quantum runs inside the family's quantum checkpoint, and the
 DeltaNet tensors move through the engine's transactional tensor arena, so an
@@ -464,8 +547,13 @@ load:
 - `IZWI_FISH_DRAMA3_DTYPE`: the activation dtype, f16 or f32 on Metal (f32
   also stores the paged KV in F32 and runs every MoE layer's host loop), bf16
   on CUDA, f32 on CPU. Anything else fails the load.
+- `IZWI_FISH_DRAMA3_FUSED_DECODE`: the fused trunk, tower and draws and
+  the one-readback frame on Metal and CUDA (default `true`); any false value
+  runs the eager chain with two readbacks a frame.
 - `IZWI_FISH_DRAMA3_MOE_BACKEND`: `fused` (default) or `loop`, on Metal and
   CUDA.
+- `IZWI_FISH_DRAMA3_SEGMENT_GRAPHS`: CUDA graphs of the fused trunk and
+  tower steps' stretches (default `true`).
 - `IZWI_FISH_DRAMA3_NATIVE_BATCHING`: two rows at once on Metal instead of
   one.
 - `IZWI_FISH_DRAMA3_PREFILL_SPAN`: rows per prefill cell, 1 to 8,192; 256 on

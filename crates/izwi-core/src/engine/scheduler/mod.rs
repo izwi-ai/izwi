@@ -1685,10 +1685,12 @@ impl Scheduler {
                 }
             }
 
+            // A running row between prefill spans waits too: a multi-token
+            // quantum would hold each of its spans back by the whole quantum.
             let num_tokens = self.decode_token_quanta(
                 remaining_decode_budget,
                 remaining_decode_tokens,
-                waiting_in_lanes > 0,
+                waiting_in_lanes > 0 || waiting_incremental_prefill,
                 overdue_ms,
                 workload_class,
                 preferred_decode_tokens,
@@ -7160,6 +7162,68 @@ mod tests {
                 "opted-in={speculative_decode_batch}: expected every shared row to be granted {expected} tokens"
             );
         }
+    }
+
+    /// A running row still between its prefill spans holds every decoding
+    /// row to one token per quantum, as a waiting request does: a sustained
+    /// multi-token quantum would hold each of its spans back by the whole
+    /// quantum.
+    #[test]
+    fn sustained_quanta_drop_to_one_step_while_a_running_row_prefills() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 64,
+            min_tokens_per_step: 1,
+            enable_adaptive_batching: false,
+            enable_decode_quanta: false,
+            enable_chunked_prefill: true,
+            chunked_prefill_threshold: 32,
+            ..Default::default()
+        });
+        for (name, prompt) in [("quanta-decoder", 1usize), ("quanta-prefiller", 100)] {
+            let request_id = name.to_string();
+            let mut request = EngineCoreRequest::tts("hello");
+            request.id = request_id.clone();
+            request.prompt_tokens = vec![1; prompt];
+            assert!(scheduler.add_request(&request));
+            let epoch = scheduler.get_sequence_id(&request_id).expect("epoch");
+            let mut profile =
+                ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+            profile.prefill = PrefillMode::Incremental;
+            profile.decode_batch = NativeBatchMode::Continuous;
+            profile.max_batch_size = 2;
+            profile.preferred_decode_tokens = 4;
+            profile.sustained_decode_quantum = true;
+            profile.speculative_decode_batch = true;
+            assert!(scheduler
+                .update_execution_profile(&SessionKey::new(request_id.clone(), epoch), &profile));
+        }
+        let first = scheduler.schedule();
+        let spans = first
+            .prefill_requests
+            .iter()
+            .map(|request| (request.request_id.clone(), request.num_tokens))
+            .collect::<Vec<_>>();
+        assert!(
+            spans.contains(&("quanta-decoder".to_string(), 1)),
+            "{spans:?}"
+        );
+        let (_, span) = spans
+            .iter()
+            .find(|(id, _)| id == "quanta-prefiller")
+            .expect("the long prompt starts")
+            .clone();
+        assert!(span < 100, "{spans:?}");
+        scheduler.update_after_step(&"quanta-decoder".to_string(), 1, 1, 1.0);
+        scheduler.update_after_step(&"quanta-prefiller".to_string(), span, 0, 1.0);
+
+        let next = scheduler.schedule();
+        let decoder = next
+            .decode_requests
+            .iter()
+            .find(|request| request.request_id == "quanta-decoder")
+            .expect("the decoder decodes");
+        assert_eq!(decoder.num_tokens, 1);
     }
 
     /// SCH-F2: decode selection never exceeds what the physical dispatches

@@ -206,3 +206,186 @@ pub(crate) fn trunk_span_error(
     let b = run(on_device, device, on_device.kv_dtype());
     relative_l2(&b, &a)
 }
+
+/// One load of `seed`'s checkpoint on `device`, through the fused path and
+/// then the eager one: relative L2 of the trunk's final hidden over a span
+/// and three steps, and of the tower's layer outputs and head logits over a
+/// span and a forced step.
+pub(crate) fn fused_against_eager(device: &Device, seed: u64) -> (f64, f64) {
+    use super::super::tower::FishDrama3TowerForcedRow;
+    use super::super::trunk::FishDrama3StepRow;
+    let synthetic = write_synthetic_model_in(seed, SyntheticGeometry::KernelHeads, |_| {});
+    let mut model = load(&synthetic, device, options(FishDrama3CpuPrecision::Q8_0));
+    assert!(
+        model.decode_path().is_some_and(|path| path.is_fused()),
+        "{:?}",
+        model.decode_path()
+    );
+    let config = model.config().clone();
+    let (width, n) = (config.tower.frame_width(), 12);
+    let prompt = rows(&model, n + 3, seed);
+    let frames = rows(&model, n + 2, seed + 1);
+    let d = config.tower.dim;
+    let hidden = xorshift_values((n + 1) * d, seed + 2, 1.7);
+    let run = |model: &FishDrama3Model| -> (Vec<f32>, Vec<f32>) {
+        let mut trunk_out = Vec::new();
+        let mut state = model.trunk().new_state().unwrap();
+        let mut cache = trunk_caches(model, device, model.kv_dtype(), 1).remove(0);
+        let (span, steps) = prompt.split_at(n * width);
+        let x = model.embedding().embed_tensor(span, device).unwrap();
+        let out = model
+            .trunk()
+            .forward_span(&x, 0, &mut state, &mut cache)
+            .unwrap();
+        trunk_out.extend(host(&out));
+        for row in steps.chunks_exact(width) {
+            let x = model.embedding().embed_tensor(row, device).unwrap();
+            let out = model
+                .trunk()
+                .forward_step(
+                    &x,
+                    &mut [FishDrama3StepRow {
+                        state: &mut state,
+                        cache: &mut cache,
+                    }],
+                )
+                .unwrap();
+            trunk_out.extend(host(&out));
+        }
+        let a = &config.tower.attention;
+        let mut cache = test_physical_caches_for_model_layers_on(
+            device,
+            model.kv_dtype(),
+            model.tower().attention_layers(),
+            a.kv_heads,
+            a.head_dim,
+            64,
+            1,
+        )
+        .remove(0);
+        let span = Tensor::from_slice(&hidden[..n * d], (n, d), device).unwrap();
+        let mut tower_out = model
+            .tower()
+            .forward_span_traced(
+                model.embedding(),
+                &span,
+                &frames[..(n + 1) * width],
+                0,
+                &mut cache,
+            )
+            .unwrap()
+            .concat();
+        let step = Tensor::from_slice(&hidden[n * d..], (1, d), device).unwrap();
+        tower_out.extend(
+            model
+                .tower()
+                .forward_step_forced(
+                    model.embedding(),
+                    &step,
+                    &mut [FishDrama3TowerForcedRow {
+                        cache: &mut cache,
+                        input: &frames[n * width..(n + 1) * width],
+                        label: &frames[(n + 1) * width..],
+                    }],
+                )
+                .unwrap(),
+        );
+        (trunk_out, tower_out)
+    };
+    let (trunk_fused, tower_fused) = run(&model);
+    model.force_fused(false);
+    let (trunk_eager, tower_eager) = run(&model);
+    (
+        relative_l2(&trunk_fused, &trunk_eager),
+        relative_l2(&tower_fused, &tower_eager),
+    )
+}
+
+/// One request of [`decode_requests`]: its prompt, seed and frame budget,
+/// and the frame at which recorded exponentials make it draw eos.
+pub(crate) struct DecodeRequest<'a> {
+    pub(crate) prompt: &'a FishDrama3Prompt,
+    pub(crate) seed: u64,
+    pub(crate) max_frames: usize,
+    pub(crate) eos_at: Option<usize>,
+}
+
+/// Each request prefilled, then `rounds` decode rounds of the unfinished
+/// ones together: every request's codes, `h_t` and stop reason. Requests
+/// sample at temperature 1 and top_p 1, so every candidate is kept; one
+/// with `eos_at` replays seeded exponentials, except that its main draw at
+/// that frame gives eos (candidate 0) a vanishing exponential.
+pub(crate) fn decode_requests(
+    model: &FishDrama3Model,
+    requests: &[DecodeRequest<'_>],
+    rounds: usize,
+) -> Vec<(
+    Vec<Vec<u32>>,
+    Vec<f32>,
+    Option<super::super::model::FishDrama3StopReason>,
+)> {
+    let config = model.config();
+    let candidates = model.head().len();
+    let heads = config.tower.residual_layers();
+    let vocab = config.tower.codebook_vocab;
+    let mut states = requests
+        .iter()
+        .map(|request| {
+            let sampling =
+                FishDrama3SamplingParams::from_request(Some(1.0), Some(1.0), None, request.seed)
+                    .unwrap();
+            let params = FishDrama3GenerationParams::new(sampling, request.max_frames);
+            let Some(eos_at) = request.eos_at else {
+                return model
+                    .new_private_request(request.prompt.clone(), params)
+                    .unwrap();
+            };
+            let mut noise = Vec::new();
+            for frame in 0..=request.max_frames {
+                let mut first = xorshift_values(candidates, request.seed + frame as u64, 0.5)
+                    .into_iter()
+                    .map(|u| -((u + 0.5).clamp(1e-6, 1.0 - 1e-6)).ln())
+                    .collect::<Vec<_>>();
+                if frame == eos_at {
+                    first[0] = 1e-30;
+                }
+                noise.extend(first);
+                noise.extend(
+                    xorshift_values(
+                        candidates + heads * vocab,
+                        100 + request.seed + frame as u64,
+                        0.5,
+                    )
+                    .into_iter()
+                    .map(|u| -((u + 0.5).clamp(1e-6, 1.0 - 1e-6)).ln()),
+                );
+            }
+            model
+                .new_private_replay(request.prompt.clone(), params, noise)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    for state in &mut states {
+        model.run_prefill(state, &ok).unwrap();
+    }
+    for _ in 0..rounds {
+        let mut going = states
+            .iter_mut()
+            .filter(|state| !state.is_finished())
+            .collect::<Vec<_>>();
+        if going.is_empty() {
+            break;
+        }
+        model.decode_round(&mut going).unwrap();
+    }
+    states
+        .iter()
+        .map(|state| {
+            (
+                state.codes().to_vec(),
+                state.last_hidden_values(),
+                state.stop_reason(),
+            )
+        })
+        .collect()
+}

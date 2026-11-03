@@ -333,6 +333,204 @@ pub fn verify_device(device: &Device, state: usize) -> Result<f64> {
     Ok(worst)
 }
 
+/// Where a decode step's operands sit in the in_proj output row
+/// `[z | xBC | dt]`, and the convolution's width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mamba2StepLayout {
+    /// Columns of a projected row.
+    pub width: usize,
+    pub z_offset: usize,
+    pub xbc_offset: usize,
+    pub dt_offset: usize,
+    /// Convolution taps (the history holds `taps - 1` rows).
+    pub taps: usize,
+}
+
+impl Mamba2StepLayout {
+    fn validate(&self, geometry: &Mamba2Geometry) -> Result<()> {
+        let c = geometry.conv_channels();
+        if self.taps < 2
+            || self.z_offset + geometry.inner() > self.width
+            || self.xbc_offset + c > self.width
+            || self.dt_offset + geometry.heads > self.width
+        {
+            candle_core::bail!("invalid Mamba2 step layout {self:?} for {geometry:?}")
+        }
+        Ok(())
+    }
+}
+
+/// One decode step of the causal convolution, with bias and SiLU, for
+/// `rows` rows read straight from their in_proj output `projected`
+/// `[rows, width]` (xBC and dt at the layout's offsets) after `history`
+/// `[rows, taps - 1, C]`. `weight` is `[C, taps]` and `bias` `[C]`, all F32.
+/// Returns the activations `[rows, C]`, the rows' dt `[rows, heads]`
+/// (contiguous, for the scan) and the next history. Matches
+/// [`causal_conv_silu`] of one token to rounding; the history is a fresh
+/// tensor, so the input stays a valid rollback checkpoint.
+pub fn conv_step_silu(
+    geometry: Mamba2Geometry,
+    layout: Mamba2StepLayout,
+    projected: &Tensor,
+    history: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    geometry.validate()?;
+    layout.validate(&geometry)?;
+    let (rows, width) = projected.dims2()?;
+    let c = geometry.conv_channels();
+    let k = layout.taps;
+    if width != layout.width
+        || history.dims() != [rows, k - 1, c]
+        || weight.dims() != [c, k]
+        || bias.dims() != [c]
+        || [projected, history, weight, bias]
+            .iter()
+            .any(|t| t.dtype() != DType::F32 || !t.device().same_device(projected.device()))
+    {
+        candle_core::bail!("invalid Mamba2 conv step operands for {geometry:?}")
+    }
+    let (projected, history) = (projected.contiguous()?, history.contiguous()?);
+    let (weight, bias) = (weight.contiguous()?, bias.contiguous()?);
+    match projected.device() {
+        Device::Cpu => cpu_conv_step(geometry, layout, &projected, &history, &weight, &bias),
+        #[cfg(feature = "metal")]
+        Device::Metal(_) => {
+            metal_impl::conv_step(geometry, layout, &projected, &history, &weight, &bias)
+        }
+        #[cfg(feature = "cuda")]
+        Device::Cuda(_) => {
+            cuda_impl::conv_step(geometry, layout, &projected, &history, &weight, &bias)
+        }
+        #[allow(unreachable_patterns)]
+        _ => candle_core::bail!("the Mamba2 conv step has no kernel for this device"),
+    }
+}
+
+/// The gated grouped RMSNorm of decode rows: `g = y * silu(z)`, with `z` read
+/// from `projected` at the layout's offset, then per `group` channels
+/// `g / sqrt(mean(g * g) + eps) * weight`. `y` is `[rows, inner]`, `weight`
+/// `[inner]`, all F32. Matches [`gated_group_rms_norm`] to rounding.
+pub fn gated_group_rms_norm_step(
+    y: &Tensor,
+    projected: &Tensor,
+    layout: Mamba2StepLayout,
+    weight: &Tensor,
+    group: usize,
+    eps: f64,
+) -> Result<Tensor> {
+    let (rows, inner) = y.dims2()?;
+    if projected.dims2()? != (rows, layout.width)
+        || layout.z_offset + inner > layout.width
+        || weight.dims() != [inner]
+        || group == 0
+        || group > 1024
+        || !inner.is_multiple_of(group)
+        || [y, projected, weight]
+            .iter()
+            .any(|t| t.dtype() != DType::F32 || !t.device().same_device(y.device()))
+    {
+        candle_core::bail!("invalid Mamba2 gated norm step operands")
+    }
+    let (y, projected, weight) = (
+        y.contiguous()?,
+        projected.contiguous()?,
+        weight.contiguous()?,
+    );
+    match y.device() {
+        Device::Cpu => cpu_gated_norm_step(&y, &projected, layout, &weight, group, eps as f32),
+        #[cfg(feature = "metal")]
+        Device::Metal(_) => {
+            metal_impl::gated_norm_step(&y, &projected, layout, &weight, group, eps as f32)
+        }
+        #[cfg(feature = "cuda")]
+        Device::Cuda(_) => {
+            cuda_impl::gated_norm_step(&y, &projected, layout, &weight, group, eps as f32)
+        }
+        #[allow(unreachable_patterns)]
+        _ => candle_core::bail!("the Mamba2 gated norm step has no kernel for this device"),
+    }
+}
+
+fn silu_f32(v: f32) -> f32 {
+    v / (1.0 + (-v).exp())
+}
+
+fn cpu_conv_step(
+    geometry: Mamba2Geometry,
+    layout: Mamba2StepLayout,
+    projected: &Tensor,
+    history: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let (rows, width) = projected.dims2()?;
+    let c = geometry.conv_channels();
+    let (k, heads) = (layout.taps, geometry.heads);
+    let p = projected.flatten_all()?.to_vec1::<f32>()?;
+    let h = history.flatten_all()?.to_vec1::<f32>()?;
+    let w = weight.flatten_all()?.to_vec1::<f32>()?;
+    let b = bias.to_vec1::<f32>()?;
+    let mut u = vec![0f32; rows * c];
+    let mut dt = vec![0f32; rows * heads];
+    let mut next = vec![0f32; rows * (k - 1) * c];
+    for row in 0..rows {
+        let hist = row * (k - 1) * c;
+        for ch in 0..c {
+            let mut v = b[ch];
+            for tap in 0..k - 1 {
+                v += h[hist + tap * c + ch] * w[ch * k + tap];
+            }
+            let x = p[row * width + layout.xbc_offset + ch];
+            v += x * w[ch * k + k - 1];
+            u[row * c + ch] = silu_f32(v);
+        }
+        next[hist..hist + (k - 2) * c].copy_from_slice(&h[hist + c..hist + (k - 1) * c]);
+        next[hist + (k - 2) * c..hist + (k - 1) * c].copy_from_slice(
+            &p[row * width + layout.xbc_offset..row * width + layout.xbc_offset + c],
+        );
+        dt[row * heads..(row + 1) * heads].copy_from_slice(
+            &p[row * width + layout.dt_offset..row * width + layout.dt_offset + heads],
+        );
+    }
+    Ok((
+        Tensor::from_vec(u, (rows, c), &Device::Cpu)?,
+        Tensor::from_vec(dt, (rows, heads), &Device::Cpu)?,
+        Tensor::from_vec(next, (rows, k - 1, c), &Device::Cpu)?,
+    ))
+}
+
+fn cpu_gated_norm_step(
+    y: &Tensor,
+    projected: &Tensor,
+    layout: Mamba2StepLayout,
+    weight: &Tensor,
+    group: usize,
+    eps: f32,
+) -> Result<Tensor> {
+    let (rows, inner) = y.dims2()?;
+    let yv = y.flatten_all()?.to_vec1::<f32>()?;
+    let p = projected.flatten_all()?.to_vec1::<f32>()?;
+    let w = weight.to_vec1::<f32>()?;
+    let mut out = vec![0f32; rows * inner];
+    for row in 0..rows {
+        for g0 in (0..inner).step_by(group) {
+            let gated = (g0..g0 + group)
+                .map(|i| {
+                    yv[row * inner + i] * silu_f32(p[row * layout.width + layout.z_offset + i])
+                })
+                .collect::<Vec<_>>();
+            let mean = gated.iter().map(|v| v * v).sum::<f32>() / group as f32;
+            let rms = (mean + eps).sqrt();
+            for (j, v) in gated.iter().enumerate() {
+                out[row * inner + g0 + j] = v / rms * w[g0 + j];
+            }
+        }
+    }
+    Tensor::from_vec(out, (rows, inner), &Device::Cpu)
+}
+
 #[cfg(feature = "metal")]
 mod metal_impl {
     use std::collections::HashMap;
@@ -430,6 +628,146 @@ mod metal_impl {
                 state_count,
                 Shape::from((rows, geometry.heads, geometry.head_dim, geometry.state)),
             ),
+        ))
+    }
+
+    fn metal_buffer<'a>(storage: &'a Storage, what: &str) -> Result<&'a candle_core::MetalStorage> {
+        let Storage::Metal(m) = storage else {
+            candle_core::bail!("the Metal Mamba2 {what} needs Metal tensors")
+        };
+        Ok(m)
+    }
+
+    pub(super) fn conv_step(
+        geometry: Mamba2Geometry,
+        layout: super::Mamba2StepLayout,
+        projected: &Tensor,
+        history: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let rows = projected.dim(0)?;
+        let c = geometry.conv_channels();
+        let (k, heads) = (layout.taps, geometry.heads);
+        let tensors = [projected, history, weight, bias];
+        let storages = tensors.map(|t| t.storage_and_layout());
+        let mut inputs = Vec::with_capacity(4);
+        for (storage, layout) in &storages {
+            inputs.push((
+                metal_buffer(storage, "conv step")?,
+                layout.start_offset() * 4,
+            ));
+        }
+        let device = inputs[0].0.device().clone();
+        let pipeline = pipeline(device.metal_device(), "izwi_mamba2_conv_step_silu")?;
+        let u = device.new_buffer(rows * c, DType::F32, "izwi-mamba2-u")?;
+        let dt = device.new_buffer(rows * heads, DType::F32, "izwi-mamba2-dt")?;
+        let next = device.new_buffer(rows * (k - 1) * c, DType::F32, "izwi-mamba2-history")?;
+        let dims: [u32; 6] = [
+            layout.width as u32,
+            layout.xbc_offset as u32,
+            layout.dt_offset as u32,
+            c as u32,
+            k as u32,
+            heads as u32,
+        ];
+        let encoder = device.command_encoder()?;
+        encoder.set_label("izwi-mamba2-conv-step");
+        encoder.set_compute_pipeline_state(&pipeline);
+        for (index, (buffer, offset)) in inputs.iter().enumerate() {
+            encoder.set_input_buffer(index, Some(buffer.buffer()), *offset);
+        }
+        encoder.set_output_buffer(4, Some(&u), 0);
+        encoder.set_output_buffer(5, Some(&dt), 0);
+        encoder.set_output_buffer(6, Some(&next), 0);
+        encoder.set_bytes(7, &dims);
+        encoder.dispatch_thread_groups(
+            objc2_metal::MTLSize {
+                width: c.max(heads).div_ceil(256),
+                height: rows,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        drop(encoder);
+        let wrap = |buffer, count, shape: Shape| {
+            Tensor::from_storage(
+                Storage::Metal(MetalStorage::new(buffer, device.clone(), count, DType::F32)),
+                shape,
+                BackpropOp::none(),
+                false,
+            )
+        };
+        Ok((
+            wrap(u, rows * c, Shape::from((rows, c))),
+            wrap(dt, rows * heads, Shape::from((rows, heads))),
+            wrap(next, rows * (k - 1) * c, Shape::from((rows, k - 1, c))),
+        ))
+    }
+
+    pub(super) fn gated_norm_step(
+        y: &Tensor,
+        projected: &Tensor,
+        layout: super::Mamba2StepLayout,
+        weight: &Tensor,
+        group: usize,
+        eps: f32,
+    ) -> Result<Tensor> {
+        let (rows, inner) = y.dims2()?;
+        let tensors = [y, projected, weight];
+        let storages = tensors.map(|t| t.storage_and_layout());
+        let mut inputs = Vec::with_capacity(3);
+        for (storage, layout) in &storages {
+            inputs.push((
+                metal_buffer(storage, "gated norm")?,
+                layout.start_offset() * 4,
+            ));
+        }
+        let device = inputs[0].0.device().clone();
+        let pipeline = pipeline(device.metal_device(), "izwi_mamba2_gated_norm_step")?;
+        let out = device.new_buffer(rows * inner, DType::F32, "izwi-mamba2-gated")?;
+        let dims: [u32; 5] = [
+            layout.width as u32,
+            layout.z_offset as u32,
+            inner as u32,
+            group as u32,
+            eps.to_bits(),
+        ];
+        let encoder = device.command_encoder()?;
+        encoder.set_label("izwi-mamba2-gated-norm");
+        encoder.set_compute_pipeline_state(&pipeline);
+        for (index, (buffer, offset)) in inputs.iter().enumerate() {
+            encoder.set_input_buffer(index, Some(buffer.buffer()), *offset);
+        }
+        encoder.set_output_buffer(3, Some(&out), 0);
+        encoder.set_bytes(4, &dims);
+        encoder.dispatch_thread_groups(
+            objc2_metal::MTLSize {
+                width: inner / group,
+                height: rows,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        drop(encoder);
+        Ok(Tensor::from_storage(
+            Storage::Metal(MetalStorage::new(
+                out,
+                device.clone(),
+                rows * inner,
+                DType::F32,
+            )),
+            Shape::from((rows, inner)),
+            BackpropOp::none(),
+            false,
         ))
     }
 
@@ -544,6 +882,85 @@ kernel void izwi_mamba2_scan_c##COLS(                                           
 IZWI_MAMBA2_SCAN(8)
 IZWI_MAMBA2_SCAN(16)
 IZWI_MAMBA2_SCAN(32)
+
+// One decode step of the causal convolution with bias and SiLU, read from the
+// in_proj row; also copies dt out contiguous. dims: width, xbc offset, dt
+// offset, channels, taps, heads. Grid (ceil(max(C, heads) / 256), rows).
+kernel void izwi_mamba2_conv_step_silu(
+    device const float* projected [[buffer(0)]],
+    device const float* history [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device const float* bias [[buffer(3)]],
+    device float* u [[buffer(4)]],
+    device float* dt [[buffer(5)]],
+    device float* next [[buffer(6)]],
+    constant uint* dims [[buffer(7)]],
+    uint2 local [[thread_position_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]]
+) {
+    const uint width = dims[0], xbc_offset = dims[1], dt_offset = dims[2];
+    const uint channels = dims[3], taps = dims[4], heads = dims[5];
+    const uint row = group.y, c = group.x * 256 + local.x;
+    const ulong in = ulong(row) * width;
+    const ulong hist = ulong(row) * (taps - 1) * channels;
+    if (c < channels) {
+        float v = bias[c];
+        for (uint tap = 0; tap + 1 < taps; ++tap) {
+            const float h = history[hist + ulong(tap) * channels + c];
+            v = v + h * weight[c * taps + tap];
+            if (tap > 0) {
+                next[hist + ulong(tap - 1) * channels + c] = h;
+            }
+        }
+        const float x = projected[in + xbc_offset + c];
+        v = v + x * weight[c * taps + taps - 1];
+        next[hist + ulong(taps - 2) * channels + c] = x;
+        u[ulong(row) * channels + c] = v / (1.0f + precise::exp(-v));
+    }
+    if (c < heads) {
+        dt[ulong(row) * heads + c] = projected[in + dt_offset + c];
+    }
+}
+
+// Mamba2's gated grouped RMSNorm for decode rows: g = y * silu(z), then per
+// group g / sqrt(mean(g * g) + eps) * weight. One threadgroup of 256 per
+// (group, row), group <= 1024. dims: width, z offset, inner, group, eps bits.
+kernel void izwi_mamba2_gated_norm_step(
+    device const float* y [[buffer(0)]],
+    device const float* projected [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint* dims [[buffer(4)]],
+    uint2 local [[thread_position_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]]
+) {
+    threadgroup float gated[1024];
+    threadgroup float partial[256];
+    const uint width = dims[0], z_offset = dims[1], inner = dims[2], group = dims[3];
+    const float eps = as_type<float>(dims[4]);
+    const uint tid = local.x, row = tg.y, g0 = tg.x * group;
+    const ulong yrow = ulong(row) * inner;
+    const ulong zrow = ulong(row) * width + z_offset;
+    float acc = 0.0f;
+    for (uint i = tid; i < group; i += 256) {
+        const float z = projected[zrow + g0 + i];
+        const float v = y[yrow + g0 + i] * (z / (1.0f + precise::exp(-z)));
+        gated[i] = v;
+        acc += v * v;
+    }
+    partial[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float rms = precise::sqrt(partial[0] / float(group) + eps);
+    for (uint i = tid; i < group; i += 256) {
+        out[yrow + g0 + i] = gated[i] / rms * weight[g0 + i];
+    }
+}
 "#;
 }
 
@@ -635,6 +1052,122 @@ mod cuda_impl {
                 Shape::from((rows, geometry.heads, geometry.head_dim, geometry.state)),
             ),
         ))
+    }
+
+    fn wrap(
+        slice: candle_core::cuda_backend::cudarc::driver::CudaSlice<f32>,
+        device: &candle_core::cuda_backend::CudaDevice,
+        shape: Shape,
+    ) -> Tensor {
+        Tensor::from_storage(
+            Storage::Cuda(CudaStorage::wrap_cuda_slice(slice, device.clone())),
+            shape,
+            BackpropOp::none(),
+            false,
+        )
+    }
+
+    pub(super) fn conv_step(
+        geometry: Mamba2Geometry,
+        layout: super::Mamba2StepLayout,
+        projected: &Tensor,
+        history: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let device = projected.device().as_cuda_device()?;
+        let rows = projected.dim(0)?;
+        let c = geometry.conv_channels();
+        let (k, heads) = (layout.taps, geometry.heads);
+        let storages = [projected, history, weight, bias].map(|t| t.storage_and_layout());
+        let views = [projected, history, weight, bias]
+            .iter()
+            .zip(&storages)
+            .map(|(t, (s, _))| view(s, t))
+            .collect::<Result<Vec<_>>>()?;
+        // SAFETY: the kernel writes every element of the outputs.
+        let u = unsafe { device.alloc::<f32>(rows * c)? };
+        let dt = unsafe { device.alloc::<f32>(rows * heads)? };
+        let next = unsafe { device.alloc::<f32>(rows * (k - 1) * c)? };
+        let function = device.get_or_load_custom_func(
+            "izwi_mamba2_conv_step_silu",
+            MODULE,
+            super::super::cuda::cuda_ptx_mamba2(),
+        )?;
+        let config = LaunchConfig {
+            grid_dim: (c.max(heads).div_ceil(256) as u32, rows as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = function.builder();
+        for view in &views {
+            builder.arg(view);
+        }
+        builder.arg(&u);
+        builder.arg(&dt);
+        builder.arg(&next);
+        candle_core::builder_arg!(
+            builder,
+            layout.width as i32,
+            layout.xbc_offset as i32,
+            layout.dt_offset as i32,
+            c as i32,
+            k as i32,
+            heads as i32
+        );
+        // SAFETY: argument order and types match the kernel signature.
+        unsafe { builder.launch(config) }.w()?;
+        Ok((
+            wrap(u, device, Shape::from((rows, c))),
+            wrap(dt, device, Shape::from((rows, heads))),
+            wrap(next, device, Shape::from((rows, k - 1, c))),
+        ))
+    }
+
+    pub(super) fn gated_norm_step(
+        y: &Tensor,
+        projected: &Tensor,
+        layout: super::Mamba2StepLayout,
+        weight: &Tensor,
+        group: usize,
+        eps: f32,
+    ) -> Result<Tensor> {
+        let device = y.device().as_cuda_device()?;
+        let (rows, inner) = y.dims2()?;
+        let storages = [y, projected, weight].map(|t| t.storage_and_layout());
+        let views = [y, projected, weight]
+            .iter()
+            .zip(&storages)
+            .map(|(t, (s, _))| view(s, t))
+            .collect::<Result<Vec<_>>>()?;
+        // SAFETY: the kernel writes every element of the output.
+        let out = unsafe { device.alloc::<f32>(rows * inner)? };
+        let function = device.get_or_load_custom_func(
+            "izwi_mamba2_gated_norm_step",
+            MODULE,
+            super::super::cuda::cuda_ptx_mamba2(),
+        )?;
+        let config = LaunchConfig {
+            grid_dim: ((inner / group) as u32, rows as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = function.builder();
+        for view in &views {
+            builder.arg(view);
+        }
+        builder.arg(&out);
+        candle_core::builder_arg!(
+            builder,
+            layout.width as i32,
+            layout.z_offset as i32,
+            inner as i32,
+            group as i32,
+            eps
+        );
+        // SAFETY: argument order and types match the kernel signature.
+        unsafe { builder.launch(config) }.w()?;
+        Ok(wrap(out, device, Shape::from((rows, inner))))
     }
 }
 
@@ -1146,5 +1679,158 @@ mod tests {
             assert!(relative_l2(&host(&y), &host(&y_cpu)) < 1e-5);
             assert!(relative_l2(&host(&s), &host(&s_cpu)) < 1e-5);
         }
+    }
+
+    /// The production in_proj row `[z | xBC | dt]` and its step operands.
+    struct StepCase {
+        geometry: Mamba2Geometry,
+        layout: Mamba2StepLayout,
+        projected: Tensor,
+        history: Tensor,
+        weight: Tensor,
+        bias: Tensor,
+        y: Tensor,
+        norm: Tensor,
+    }
+
+    fn step_case(rows: usize, device: &Device) -> StepCase {
+        let geometry = Mamba2Geometry {
+            heads: 64,
+            head_dim: 64,
+            groups: 8,
+            state: 128,
+        };
+        let (inner, c, k) = (geometry.inner(), geometry.conv_channels(), 4);
+        let width = inner + c + geometry.heads;
+        let layout = Mamba2StepLayout {
+            width,
+            z_offset: 0,
+            xbc_offset: inner,
+            dt_offset: inner + c,
+            taps: k,
+        };
+        let t = |values: Vec<f32>, shape: &[usize]| {
+            Tensor::from_vec(values, shape, &Device::Cpu)
+                .unwrap()
+                .to_device(device)
+                .unwrap()
+        };
+        StepCase {
+            geometry,
+            layout,
+            projected: t(xorshift_values(rows * width, 21, 2.0), &[rows, width]),
+            history: t(
+                xorshift_values(rows * (k - 1) * c, 22, 2.0),
+                &[rows, k - 1, c],
+            ),
+            weight: t(xorshift_values(c * k, 23, 0.5), &[c, k]),
+            bias: t(xorshift_values(c, 24, 0.5), &[c]),
+            y: t(xorshift_values(rows * inner, 25, 2.0), &[rows, inner]),
+            norm: t(
+                xorshift_values(inner, 26, 0.3)
+                    .iter()
+                    .map(|v| 1.0 + v)
+                    .collect(),
+                &[inner],
+            ),
+        }
+    }
+
+    fn host(t: &Tensor) -> Vec<f32> {
+        t.flatten_all()
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    /// The decode-step kernels against the span compositions of one token:
+    /// the convolution, its history, dt and the gated norm.
+    #[test]
+    fn the_step_kernels_match_the_span_compositions() {
+        let case = step_case(3, &Device::Cpu);
+        let (g, l) = (case.geometry, case.layout);
+        let (u, dt, next) = conv_step_silu(
+            g,
+            l,
+            &case.projected,
+            &case.history,
+            &case.weight,
+            &case.bias,
+        )
+        .unwrap();
+        let xbc = case
+            .projected
+            .narrow(1, l.xbc_offset, g.conv_channels())
+            .unwrap()
+            .unsqueeze(1)
+            .unwrap();
+        let (u_ref, next_ref) =
+            causal_conv_silu(&xbc, &case.history, &case.weight, &case.bias).unwrap();
+        assert!(relative_l2(&host(&u), &host(&u_ref)) < 1e-6);
+        assert_eq!(
+            host(&next),
+            host(&next_ref),
+            "the history is copied exactly"
+        );
+        let dt_ref = case.projected.narrow(1, l.dt_offset, g.heads).unwrap();
+        assert_eq!(host(&dt), host(&dt_ref));
+        let z = case.projected.narrow(1, 0, g.inner()).unwrap();
+        let gated =
+            gated_group_rms_norm_step(&case.y, &case.projected, l, &case.norm, 512, 1e-5).unwrap();
+        let gated_ref = gated_group_rms_norm(&case.y, &z, &case.norm, 512, 1e-5).unwrap();
+        assert!(relative_l2(&host(&gated), &host(&gated_ref)) < 1e-6);
+        // A row alone matches the same row among others.
+        let one = gated_group_rms_norm_step(
+            &case.y.narrow(0, 2, 1).unwrap(),
+            &case.projected.narrow(0, 2, 1).unwrap(),
+            l,
+            &case.norm,
+            512,
+            1e-5,
+        )
+        .unwrap();
+        assert_eq!(host(&gated.narrow(0, 2, 1).unwrap()), host(&one));
+    }
+
+    /// A GPU's step kernels track the CPU's.
+    #[allow(dead_code)]
+    fn step_kernels_track_the_cpu(device: &Device) {
+        let cpu = step_case(2, &Device::Cpu);
+        let gpu = step_case(2, device);
+        let (g, l) = (cpu.geometry, cpu.layout);
+        let run = |c: &StepCase| {
+            conv_step_silu(g, l, &c.projected, &c.history, &c.weight, &c.bias).unwrap()
+        };
+        let (u, dt, next) = run(&cpu);
+        let (gu, gdt, gnext) = run(&gpu);
+        assert!(relative_l2(&host(&gu), &host(&u)) < 1e-5);
+        assert_eq!(host(&gdt), host(&dt));
+        assert_eq!(host(&gnext), host(&next));
+        let norm = |c: &StepCase| {
+            host(&gated_group_rms_norm_step(&c.y, &c.projected, l, &c.norm, 512, 1e-5).unwrap())
+        };
+        assert!(relative_l2(&norm(&gpu), &norm(&cpu)) < 1e-5);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_step_kernels_track_the_cpu() {
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_step_kernels_track_the_cpu")
+        else {
+            return;
+        };
+        step_kernels_track_the_cpu(&device);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_step_kernels_track_the_cpu() {
+        let Ok(device) = Device::new_cuda(0) else {
+            return;
+        };
+        step_kernels_track_the_cpu(&device);
     }
 }

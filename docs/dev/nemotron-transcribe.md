@@ -115,7 +115,19 @@ token. The instruction is chosen in this order:
   translation runs to or from English, never between two other languages
   (31 languages translate; Turkish, Bengali, Indonesian, Marathi, Tagalog,
   Tamil, Telugu and Vietnamese do not). Context terms and speaker tags
-  cannot be combined with it (`400`).
+  cannot be combined with it (`400`). The model translates sentence-length
+  speech: NVIDIA evaluates translation on FLEURS and CoVoST 2 only, its
+  long-form training data is transcription, and on a long recording it
+  answers with a transcript in the spoken language. So a recording longer
+  than one segment (30 s) is translated in segments
+  (`runtime/asr/translation_segments.rs`): cut in pauses near 24 s with no
+  overlap, each an ordinary request with the same instruction and a decode
+  budget of 16 tokens a second plus 64 (or the request's `max_tokens` when
+  smaller), up to 8 in flight, joined in order with a space except between
+  unspaced scripts. A stream gets one delta and one `chunk_finished`
+  progress event per segment, in order; the diagnostics report the
+  segments as `chunking` (planner `translation_segments`). Transcription
+  stays one pass.
 - Speaker labels render the card's speaker-tag instruction, with context
   terms appended when given. They are refused when the named language is not
   one of the card's 13 multi-speaker languages (en, fr, de, hi, it, ko, pt,
@@ -175,6 +187,14 @@ other FP8 linears with zeros, which is exact; the stacked routed experts need
 no padding. Metal keeps F32 activations so relu² expert intermediates never
 meet F16's range.
 
+A prefill span multiplies FP8 weights without expanding them on Metal: the
+tiled simdgroup GEMM in `kernels/metal_fp8_gemm.rs` decodes each 64x32 weight
+tile in threadgroup memory to exactly the value the F16 expansion would hold.
+That covers the decoder's and the speech encoder's FP8 linears whose input
+width is a multiple of 32 (all of the published ones); 1.5x faster than the
+expansion at the published span shapes. CUDA multiplies tiles dequantized to
+BF16 through cuBLAS.
+
 FP8 linears run W8A16 by default (`IZWI_NEMOTRON_TRANSCRIBE_FP8_MODE=w8a16`):
 the checkpoint's weights exactly (`decode(byte) * weight_scale`), unquantized
 activations and a dense KV cache. That is also what vLLM's Marlin path computes
@@ -199,12 +219,15 @@ decode step has no host synchronization inside the MoE block.
   pair, or expert-major once a call has 32 or more pairs. Both sum each dot
   product in the same order, so they agree bit for bit and a row's output does
   not depend on how many rows share the step.
-- **Long prefill spans** (`uses_gemm`: at least 64 tokens and 16 routed pairs
-  per expert, so 342 or more tokens here) read the routing once and run each
-  touched expert as two dense GEMMs on its weights dequantized just for that
-  call (F32 on Metal, BF16 on CUDA). Warp kernels cannot match a tiled GEMM
-  once each expert has many tokens. CUDA's 2,048-token and Metal's 512-token
-  spans take this path; the crossover was measured on Metal only.
+- **Long prefill spans** (`uses_gemm`: at least 64 tokens and enough routed
+  pairs per expert, 5 on Metal and 16 on CUDA, so 107 or more tokens on Metal
+  and 342 or more on CUDA here) read the routing once. Metal then runs every
+  touched expert in two tiled launches that read the FP8 bytes in place
+  (`kernels/metal_fp8_gemm.rs`; relu² and the combine weights ride the
+  epilogues). CUDA runs each touched expert as two dense GEMMs on its weights
+  dequantized to BF16 just for that call. Warp kernels cannot match a tiled
+  GEMM once each expert has many tokens; both crossovers were measured on
+  Metal.
 - **CPU and `vllm-fp8`** keep the per-expert loop: routing read to the host
   every layer, then each expert's tokens through its own FP8 linear pair.
 
@@ -223,7 +246,7 @@ device-routed path compared with the per-expert loop it replaces:
 | --- | --- | --- | --- |
 | 1 (decode) | 1.6 ms | 4.4 ms | 2.7× |
 | 8 (decode step) | 3.7 ms | 22.6 ms | 6.1× |
-| 512 (prefill span) | 53 ms | 67 ms | 1.3× |
+| 512 (prefill) | 53 ms | 67 ms | 1.3× |
 
 Load admission prices the residency from the config's census before any weight
 is read (`nemotron_transcribe_plan` in
@@ -260,19 +283,78 @@ Every request is a retained engine row. The pieces:
   committed with the KV pages, so a failed or cancelled quantum rolls the row
   back to where it started. Text streams as it decodes. A finished row
   reports `finish_reason`, `raw_text`, `speaker_turns`, token counts and the
-  number of perception windows in its ASR diagnostics. Rows are cleaned up on
-  cancel, session end and purge.
+  number of perception windows in its ASR diagnostics, and `timing`: host
+  milliseconds of preparation, prefill (with the perception windows it
+  encoded), decode (with its steps and milliseconds per step) and the CTC
+  stage. A decode step ends in the logits readback and a span in the KV
+  commit fence, so on a GPU both include the device work. The model's
+  diagnostics add the totals, `host_readbacks` and `fp8_decode_kernel`. Rows
+  are cleaned up on cancel, session end and purge.
 - **Scheduler**: the family sets `ModelFamily::requires_prefill_spans`, which
   becomes the execution profile's `prefill_spans_required`
   (`engine/executor.rs`, `engine/scheduler/mod.rs`). The scheduler then
   prefills this model's prompts in resumable spans whatever the
-  chunked-prefill switch says. A one-hour prompt (about 45,000 audio tokens)
-  is 23 spans of 2,048 tokens on CUDA or 88 of 512 on CPU and Metal, so it
-  never holds the device for its whole prefill while other rows wait.
+  chunked-prefill switch says. The model's span is the profile's prefill grid
+  (`prefill_grid_tokens`): every span but a prompt's last is exactly 512
+  tokens on CUDA or 192 on CPU and Metal, whether the row prefills alone or
+  beside other rows, and never a step budget's leftover. How a prompt splits
+  changes the span's rounding and so, at a near tie, a greedy token; a fixed
+  grid keeps a request's transcript independent of server load. A one-hour
+  prompt (about 45,000 audio tokens) is 88 spans on CUDA or 234 on CPU and
+  Metal, each a bounded dispatch between other rows' decode steps.
 
 Decode rows run at the engine's tensor batch width for speech models: two rows
 on CPU and Metal unless `IZWI_MAX_BATCH_SIZE` sets one, and CUDA's automatic
-width.
+width. While no request waits or prefills, a decode quantum runs several steps
+(8 on Metal and CUDA, 4 on CPU; the profile's `preferred_decode_tokens` with
+`sustained_decode_quantum`), rows batched, so the engine's per-quantum work
+(Mamba staging, commit, scheduling) is paid once per several tokens. The
+scheduler drops back to one step a quantum as soon as a request waits or a
+running row is between prefill spans. Greedy decoding makes the transcript
+the same at any quantum.
+
+### Decode step
+
+A decode step runs the fused path by default (`decode_step` in
+`decoder/mod.rs`):
+
+- each residual add runs with the next layer's RMSNorm in one launch
+  (`kernels::residual_norm`);
+- each Mamba2 mixer is five launches: in_proj, the convolution step (read
+  straight from the projection; it also copies dt out for the scan), the
+  scan, the gated norm (z read from the projection), and out_proj
+  (`kernels::mamba2::{conv_step_silu, gated_group_rms_norm_step}`);
+- on CUDA the FP8 step projections take and return F32 in one vectorized
+  GEMV, and the shared expert's up projection applies relu² in the GEMV
+  (`fp8::block_fp8_projection_f32`);
+- the language-model head's output, in its own dtype, goes straight to the
+  device greedy pick (`kernels::greedy`), and the step reads back 8 bytes a
+  row before the rows' KV and state commit, so it drains the device once.
+
+Attention decodes groups of 16 query heads per KV head on CUDA's split
+decode and Metal's simdgroup kernel. Prefill spans use the same fused
+residual norms.
+
+At load the fused kernels run against their CPU forms in the decoder's
+geometry; above 1e-4 relative L2 (or any greedy pick that differs), the
+step runs the eager composition instead. The model diagnostics'
+`decode_path` reports which path runs and why.
+
+The fused step runs as pieces: stretches of Mamba and MoE layers, each a
+pure function of the residual, the normed hidden and its layers' Mamba
+states, and the attention layers between them (the tail stretch ends with
+the head and the greedy pick). On CUDA each stretch replays a CUDA graph
+(`decoder/graphs.rs`, on `SegmentGraph`), captured per row count for
+steps of 1 to 4 rows and of 8 (the default CUDA width; 5 to 7 rows run
+eagerly rather than hold more state copies), while attention, which writes the paged KV under per-step metadata,
+stays eager. A stretch warms once, then its capture is checked bit for bit
+against the eager stretch on the capture step and on the next one; any
+failure turns the graphs off for the process. A replay copies the Mamba
+states in and out of the graph's buffers. `decode_graphs` in the diagnostics
+counts warmups, captures, verified steps and replays, and says why the
+graphs are off; `IZWI_NEMOTRON_TRANSCRIBE_SEGMENT_GRAPHS=0` or
+`IZWI_CUDA_DECODE_GRAPHS=off` runs every stretch eagerly. The graphs have
+been compiled and type-checked but not yet run on a GPU.
 
 ### Row state
 
@@ -491,11 +573,35 @@ are missing; a pass without them proves nothing.
 
 The family's knobs, in [`env/core.md`](env/core.md):
 
+- `IZWI_NEMOTRON_TRANSCRIBE_CPU_F16_KV` (read at load, off by default):
+  stores the CPU's paged KV as F16 instead of F32 (12 to 6 KiB per token).
+  K, V and the queries round to F16 when written; attention still
+  accumulates in F32.
+- `IZWI_NEMOTRON_TRANSCRIBE_DECODE_QUANTUM` (read at load): the most
+  decode steps a row runs per engine quantum while no request waits, 1 to
+  64. Defaults to 8 on Metal and CUDA and 4 on CPU.
+- `IZWI_NEMOTRON_TRANSCRIBE_FP8_LM_HEAD` (read at load, off by default):
+  quantizes the language-model head to block FP8 on Metal and CUDA (704 to
+  352 MB, about a tenth of a decode step's weight reads) and runs it
+  through the FP8 GEMVs. A host quality gate (FP8 against exact logits on
+  probe rows) and a device check guard it; either failure keeps the 16-bit
+  head, and `lm_head` in the diagnostics gives the form and the reason, so
+  admission keeps pricing the 16-bit head. FP8 logits can swap a greedy pick
+  between near-tied tokens, so it stays off until a quality run on real
+  audio clears it.
 - `IZWI_NEMOTRON_TRANSCRIBE_FP8_MODE` (read at load): `w8a16` (default) or
   `vllm-fp8`. Anything else fails the load.
-- `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN` (read at load): the most prompt
-  tokens one row prefills per engine step, 16 to 16,384. Defaults to 2,048 on
-  CUDA and 512 on CPU and Metal; values outside the range are ignored.
+- `IZWI_NEMOTRON_TRANSCRIBE_TRANSLATION_SEGMENT_SECONDS` (read once): the
+  longest segment of a translation, 30 s by default; `0` translates the
+  whole recording in one pass, and values below 5 count as 5.
+- `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN` (read at load): the prompt tokens
+  one row prefills per engine step, 16 to 16,384: the prefill grid, so every
+  span but a prompt's last has this length. Defaults to 512 on CUDA and 192 on
+  CPU and Metal; values outside the range are ignored. A longer span prefills
+  faster and holds other rows' decode steps longer.
+- `IZWI_NEMOTRON_TRANSCRIBE_FUSED_DECODE` (read at load): any false value
+  runs decode steps through the eager composition instead of the fused
+  kernels (see [Decode step](#decode-step)).
 
 `IZWI_NEMOTRON_TRANSCRIBE_MODEL_DIR`, `_AUDIO_DIR`, `_BACKEND` and
 `_REFERENCE` are read only by the tests.

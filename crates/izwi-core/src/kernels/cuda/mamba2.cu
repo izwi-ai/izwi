@@ -88,3 +88,68 @@ __device__ void izwi_mamba2_scan(const float* __restrict__ xbc,
 IZWI_MAMBA2_SCAN(8)
 IZWI_MAMBA2_SCAN(16)
 IZWI_MAMBA2_SCAN(32)
+
+// One decode step of the causal depthwise convolution with bias and SiLU
+// (`kernels::mamba2::conv_step_silu`), read straight from the in_proj output
+// `projected` [rows, width]: xBC at `xbc_offset`, dt at `dt_offset`. Per
+// channel, in tap order as the eager chain adds them:
+//   v = (((bias + h0 * w0) + h1 * w1) + ...) + x * w[K-1];  u = v / (1 + exp(-v))
+// The next history is the last K-1 pre-convolution rows; dt is copied out
+// contiguous for the scan. The products and sums round separately (no FMA
+// contraction), as the composed ops do. Grid (ceil(C / 256), rows).
+extern "C" __global__ void izwi_mamba2_conv_step_silu(
+    const float* __restrict__ projected, const float* __restrict__ history,
+    const float* __restrict__ weight, const float* __restrict__ bias,
+    float* __restrict__ u, float* __restrict__ dt, float* __restrict__ next,
+    int width, int xbc_offset, int dt_offset, int channels, int taps, int heads) {
+  const int row = blockIdx.y;
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  const long long in = (long long)row * width;
+  const long long hist = (long long)row * (taps - 1) * channels;
+  if (c < channels) {
+    float v = bias[c];
+    for (int tap = 0; tap < taps - 1; ++tap) {
+      const float h = history[hist + (long long)tap * channels + c];
+      v = __fadd_rn(v, __fmul_rn(h, weight[c * taps + tap]));
+      if (tap > 0) next[hist + (long long)(tap - 1) * channels + c] = h;
+    }
+    const float x = projected[in + xbc_offset + c];
+    v = __fadd_rn(v, __fmul_rn(x, weight[c * taps + taps - 1]));
+    next[hist + (long long)(taps - 2) * channels + c] = x;
+    u[(long long)row * channels + c] = v / (1.0f + expf(-v));
+  }
+  if (c < heads) dt[(long long)row * heads + c] = projected[in + dt_offset + c];
+}
+
+// Mamba2's gated grouped RMSNorm for decode rows
+// (`kernels::mamba2::gated_group_rms_norm_step`): g = y * silu(z) with z read
+// from `projected` at `z_offset`, then per group of `group` channels
+// out = g / sqrt(mean(g * g) + eps) * weight. One block of 256 per
+// (row, group), group <= 1024.
+extern "C" __global__ void izwi_mamba2_gated_norm_step(
+    const float* __restrict__ y, const float* __restrict__ projected,
+    const float* __restrict__ weight, float* __restrict__ out, int width,
+    int z_offset, int inner, int group, float eps) {
+  __shared__ float gated[1024];
+  __shared__ float partial[256];
+  const int row = blockIdx.y, g0 = blockIdx.x * group;
+  const long long yrow = (long long)row * inner;
+  const long long zrow = (long long)row * width + z_offset;
+  float acc = 0.0f;
+  for (int i = threadIdx.x; i < group; i += 256) {
+    const float z = projected[zrow + g0 + i];
+    const float v = y[yrow + g0 + i] * (z / (1.0f + expf(-z)));
+    gated[i] = v;
+    acc += v * v;
+  }
+  partial[threadIdx.x] = acc;
+  __syncthreads();
+  for (int stride = 128; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+    __syncthreads();
+  }
+  const float rms = sqrtf(partial[0] / (float)group + eps);
+  for (int i = threadIdx.x; i < group; i += 256) {
+    out[yrow + g0 + i] = gated[i] / rms * weight[g0 + i];
+  }
+}

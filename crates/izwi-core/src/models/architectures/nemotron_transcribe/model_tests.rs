@@ -112,6 +112,90 @@ fn a_request_transcribes_deterministically_through_retained_spans() {
         .transcribe_with_cache(&audio, request(12), &mut cache, 64)
         .unwrap();
     assert_eq!(first.transcript, again.transcript);
+    // The timing counts the spans and steps the row ran: the first token
+    // comes from the last span, and an eos ends a step without a token.
+    let timing = &first.timing;
+    assert_eq!(
+        timing.prefill_spans as usize,
+        first.prompt_tokens.div_ceil(64)
+    );
+    let accepted =
+        first.generated_tokens + usize::from(first.finish_reason == NemotronFinishReason::Stop);
+    assert_eq!(timing.decode_steps as usize, accepted - 1);
+    assert!(timing.prefill_ms > 0.0 && timing.perception_ms > 0.0);
+    assert!(timing.perception_ms <= timing.prefill_ms);
+    // No timestamps were asked for, so the CTC stage never ran.
+    assert!(timing.ctc_ms < 50.0);
+    let json = timing.to_json();
+    assert_eq!(json["decode_steps"], timing.decode_steps);
+    assert!(model.diagnostics_summary()["decode_ms"].as_f64().unwrap() >= timing.decode_ms);
+}
+
+/// The CPU's opt-in F16 KV (`IZWI_NEMOTRON_TRANSCRIBE_CPU_F16_KV`): a
+/// prompt prefilled in 17-token spans (each span after the first attends
+/// over F16 pages) leaves the first attention layer's residual within F16
+/// rounding of the F32 pages' and not equal to it, ends with logits as
+/// close, and a row over F16 pages transcribes.
+///
+/// The rounding is checked after the attention layer: the logits come from
+/// a one-row LM head, which Candle's Q8_0 kernel multiplies with its
+/// activations quantized to int8, so whether an F16 rounding survives to
+/// them depends on the host's kernels (on CI's Linux runner the logits came
+/// out identical). Greedy tokens are not compared: on random weights one
+/// rounding flips a near-tie, and every token after it differs.
+#[test]
+fn a_row_transcribes_over_f16_pages_on_the_cpu() {
+    let dir = temp_checkpoint();
+    let model = NemotronTranscribeModel::load_on(dir.path(), None, &Device::Cpu).unwrap();
+    let audio = test_audio(2.5, 1);
+    let a = model.decoder().config().attention;
+    let f16_cache = || {
+        test_physical_caches_for_model_layers_on(
+            &Device::Cpu,
+            DType::F16,
+            model.decoder().attention_layers(),
+            a.kv_heads,
+            a.head_dim,
+            1024,
+            1,
+        )
+        .remove(0)
+    };
+    let layer = model.decoder().attention_layers()[0] as usize;
+    // Every span's residual after the first attention layer, and the
+    // prompt's last logits.
+    let prefill = |mut cache: PhysicalPagedKvCache| {
+        let artifact = Arc::new(model.prepare(&audio, request(12)).unwrap());
+        let mut state = model.new_row(artifact, 1024).unwrap();
+        let mut trace = super::decoder::DecoderTrace::default();
+        let request = super::decoder::TraceRequest {
+            routes: false,
+            hidden_after_layers: vec![layer],
+        };
+        while state.prefill_cursor() < state.prompt_tokens() {
+            let n = 17.min(state.prompt_tokens() - state.prefill_cursor());
+            model
+                .retained_prefill_traced(&mut state, &mut cache, n, Some((&request, &mut trace)))
+                .unwrap();
+        }
+        let hidden = trace
+            .hidden
+            .into_iter()
+            .flat_map(|(_, values)| values)
+            .collect::<Vec<f32>>();
+        (hidden, trace.final_logits)
+    };
+    let (half_hidden, half_logits) = prefill(f16_cache());
+    let (full_hidden, full_logits) = prefill(caches(&Device::Cpu, &model, 1, 1024).remove(0));
+    let relative_l2 = crate::kernels::numeric_check::relative_l2;
+    let error = relative_l2(&half_hidden, &full_hidden);
+    assert!(error > 0.0 && error < 1e-2, "{error}");
+    let error = relative_l2(&half_logits, &full_logits);
+    assert!(!full_logits.is_empty() && error < 1e-2, "{error}");
+    let transcript = model
+        .transcribe_with_cache(&audio, request(12), &mut f16_cache(), 64)
+        .unwrap();
+    assert!(!transcript.transcript.raw.is_empty());
 }
 
 /// The first decode logits after prefilling in spans of different sizes
@@ -325,4 +409,109 @@ fn word_timestamps_run_the_ctc_stage_and_time_the_turns() {
         assert!(plain.timestamps.is_none());
         assert_eq!(plain.transcript, result.transcript);
     }
+}
+
+/// The fused decode step (fused norms, Mamba step kernels, device greedy)
+/// transcribes as the eager composition does, and the summary names the
+/// path.
+#[test]
+fn the_fused_decode_transcribes_as_the_eager_one() {
+    use super::decoder::DecodePath;
+    let dir = temp_checkpoint();
+    let mut model = NemotronTranscribeModel::load_on(dir.path(), None, &Device::Cpu).unwrap();
+    assert_eq!(model.diagnostics_summary()["decode_path"]["path"], "fused");
+    let audio = test_audio(2.5, 3);
+    let run = |model: &NemotronTranscribeModel| {
+        let mut cache = caches(&Device::Cpu, model, 1, 1024).remove(0);
+        model
+            .transcribe_with_cache(&audio, request(16), &mut cache, 64)
+            .unwrap()
+    };
+    let fused = run(&model);
+    model.decoder_mut().force_decode_path(DecodePath::Eager {
+        reason: "test".into(),
+    });
+    let eager = run(&model);
+    assert_eq!(fused.transcript, eager.transcript);
+    assert_eq!(fused.generated_tokens, eager.generated_tokens);
+}
+
+/// On CUDA the fused step's stretches are captured, verified and replayed,
+/// and the transcript is the eager stretches' own.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_decode_graphs_transcribe_as_the_eager_stretches() {
+    let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+        return;
+    };
+    let dir = temp_checkpoint();
+    let mut model = NemotronTranscribeModel::load_on(dir.path(), None, &device).unwrap();
+    let audio = test_audio(2.5, 3);
+    let run = |model: &NemotronTranscribeModel| {
+        let mut cache = caches(&device, model, 1, 1024).remove(0);
+        model
+            .transcribe_with_cache(&audio, request(16), &mut cache, 64)
+            .unwrap()
+    };
+    let graphed = run(&model);
+    let graphs = model.diagnostics_summary()["decode_graphs"].clone();
+    assert!(graphs["off"].is_null(), "{graphs}");
+    assert!(graphs["verified"].as_u64().unwrap() >= 4, "{graphs}");
+    assert!(graphs["replays"].as_u64().unwrap() > 0, "{graphs}");
+    model.decoder_mut().disable_graphs();
+    let eager = run(&model);
+    assert_eq!(graphed.transcript, eager.transcript);
+    assert_eq!(graphed.generated_tokens, eager.generated_tokens);
+}
+
+/// On Metal the load-time kernel check passes, so decode runs fused, and a
+/// row decodes the same alone and beside another.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_decodes_fused_and_rows_alone_and_together_alike() {
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "metal_decodes_fused_and_rows_alone_and_together_alike",
+    ) else {
+        return;
+    };
+    let dir = temp_checkpoint();
+    let model = NemotronTranscribeModel::load_on(dir.path(), None, &device).unwrap();
+    let summary = model.diagnostics_summary();
+    assert_eq!(summary["decode_path"]["path"], "fused", "{summary}");
+    let audio = [test_audio(2.0, 4), test_audio(2.6, 5)];
+    let artifacts = audio
+        .iter()
+        .map(|a| Arc::new(model.prepare(a, request(10)).unwrap()))
+        .collect::<Vec<_>>();
+    let decode = |rows: &[usize]| {
+        let mut caches = caches(&device, &model, rows.len(), 1024);
+        let mut states = rows
+            .iter()
+            .map(|&i| {
+                let context = artifacts[i].max_context();
+                model.new_row(artifacts[i].clone(), context).unwrap()
+            })
+            .collect::<Vec<_>>();
+        for (state, cache) in states.iter_mut().zip(caches.iter_mut()) {
+            while state.prefill_cursor() < state.prompt_tokens() {
+                let n = 64.min(state.prompt_tokens() - state.prefill_cursor());
+                model.retained_prefill(state, cache, n).unwrap();
+            }
+        }
+        while states.iter().any(|s| !s.finished()) {
+            let mut step = states
+                .iter_mut()
+                .zip(caches.iter_mut())
+                .map(|(state, cache)| NemotronStepRow { state, cache })
+                .collect::<Vec<_>>();
+            model.retained_decode_batch(&mut step).unwrap();
+        }
+        states
+            .iter()
+            .map(|s| model.finish_row(s).unwrap().transcript)
+            .collect::<Vec<_>>()
+    };
+    let together = decode(&[0, 1]);
+    assert_eq!(decode(&[0])[0], together[0]);
+    assert_eq!(decode(&[1])[0], together[1]);
 }

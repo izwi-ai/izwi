@@ -28,6 +28,7 @@ pub mod row_gemv;
 pub mod sampling;
 pub mod segment_graph;
 pub mod split_decode;
+pub mod stretch_graphs;
 pub mod timing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3459,6 +3460,36 @@ pub(crate) fn cuda_ptx_mamba2() -> &'static str {
 #[cfg(feature = "cuda")]
 pub(crate) fn cuda_ptx_moe_relu2() -> &'static str {
     cuda_ptx::MOE_RELU2
+}
+
+/// The PTX of `kernels/cuda/residual_norm.cu` (`kernels::residual_norm`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_residual_norm() -> &'static str {
+    cuda_ptx::RESIDUAL_NORM
+}
+
+/// The PTX of `kernels/cuda/qk_norm_rope.cu` (`kernels::qk_norm_rope`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_qk_norm_rope() -> &'static str {
+    cuda_ptx::QK_NORM_ROPE
+}
+
+/// The PTX of `kernels/cuda/greedy.cu` (`kernels::greedy`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_greedy() -> &'static str {
+    cuda_ptx::GREEDY
+}
+
+/// The PTX of `kernels/cuda/race_sampler.cu` (`kernels::race_sampler`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_race_sampler() -> &'static str {
+    cuda_ptx::RACE_SAMPLER
+}
+
+/// The PTX of `kernels/cuda/swiglu.cu` (`kernels::swiglu`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_swiglu() -> &'static str {
+    cuda_ptx::SWIGLU
 }
 
 #[cfg(test)]
