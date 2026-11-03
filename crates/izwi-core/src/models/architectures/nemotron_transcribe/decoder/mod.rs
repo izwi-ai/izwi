@@ -257,7 +257,7 @@ impl NemotronDecoder {
                 reason: format!("{FUSED_DECODE_ENV} is off"),
             }
         } else {
-            match fused_kernels_check(device, d) {
+            match fused_kernels_check(device, d, lm_head.native_dtype()) {
                 Ok(check) if check <= FUSED_CHECK_LIMIT => DecodePath::Fused { check },
                 Ok(check) => DecodePath::Eager {
                     reason: format!("the fused kernels deviate by {check:.3e}"),
@@ -871,7 +871,11 @@ const FUSED_CHECK_LIMIT: f64 = 1e-4;
 /// decoder's geometry: the residual add + norm, the Mamba2 convolution step
 /// and gated norm, and the greedy pick (which must match exactly). Returns
 /// the worst relative L2 error; the CPU's kernels are the reference, 0.
-fn fused_kernels_check(device: &Device, d: &NemotronDecoderConfig) -> Result<f64> {
+fn fused_kernels_check(
+    device: &Device,
+    d: &NemotronDecoderConfig,
+    logits_dtype: DType,
+) -> Result<f64> {
     use crate::kernels::mamba2;
     use crate::kernels::numeric_check::{host_f32, relative_l2, xorshift_tensor};
     if device.is_cpu() {
@@ -942,7 +946,9 @@ fn fused_kernels_check(device: &Device, d: &NemotronDecoderConfig) -> Result<f64
         d.norm_eps,
     )?;
     track(&dgated, &gated)?;
-    let logits = xorshift_tensor(&[rows, d.vocab.min(65_536)], 10, 8.0, &cpu)?;
+    // The tail stretch picks from the head's own logits: its dtype, the
+    // whole vocabulary.
+    let logits = xorshift_tensor(&[rows, d.vocab], 10, 8.0, &cpu)?.to_dtype(logits_dtype)?;
     let picks = crate::kernels::greedy::greedy(&logits)?;
     let dpicks = crate::kernels::greedy::greedy(&on(&logits)?)?;
     if picks

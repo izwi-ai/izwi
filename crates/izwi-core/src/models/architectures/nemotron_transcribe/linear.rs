@@ -505,6 +505,14 @@ impl NtLinear {
         }
     }
 
+    /// The dtype [`Self::forward_native`] returns.
+    pub fn native_dtype(&self) -> DType {
+        match (&self.weight, &self.bias) {
+            (Weight::Dense(w), None) => w.dtype(),
+            _ => DType::F32,
+        }
+    }
+
     /// `relu(forward_padded(x))^2`: a relu² MLP's up projection. A CUDA step
     /// applies the relu² in the GEMV's epilogue (one launch).
     pub fn forward_relu2(&self, x: &Tensor, pass: Pass) -> Result<Tensor> {

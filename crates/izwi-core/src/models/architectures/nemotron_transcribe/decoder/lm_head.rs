@@ -99,13 +99,22 @@ pub(crate) fn quantize(
         }
     }
     let reference = fp8_logits(&probes[0]);
-    let linear = NtLinear::fp8_from_blocks(bytes, scales, rows, cols, device)?;
-    let input = Tensor::from_vec(probes[0].clone(), (1, cols), device)?;
-    let logits = linear
-        .forward(&input, super::super::linear::Pass::Step)?
-        .flatten_all()?
-        .to_device(&Device::Cpu)?
-        .to_vec1::<f32>()?;
+    // A device error keeps the 16-bit head too: the switch is opt-in, and
+    // must never cost the load.
+    let device_head = || -> Result<(NtLinear, Vec<f32>)> {
+        let linear = NtLinear::fp8_from_blocks(bytes, scales, rows, cols, device)?;
+        let input = Tensor::from_vec(probes[0].clone(), (1, cols), device)?;
+        let logits = linear
+            .forward(&input, super::super::linear::Pass::Step)?
+            .flatten_all()?
+            .to_device(&Device::Cpu)?
+            .to_vec1::<f32>()?;
+        Ok((linear, logits))
+    };
+    let (linear, logits) = match device_head() {
+        Ok(head) => head,
+        Err(error) => return Ok(Err(format!("device check: {error}"))),
+    };
     let device_sampled: Vec<f32> = sampled.iter().map(|&row| logits[row]).collect();
     let error = crate::kernels::numeric_check::relative_l2(&device_sampled, &reference);
     let within = error <= DEVICE_TOLERANCE;
