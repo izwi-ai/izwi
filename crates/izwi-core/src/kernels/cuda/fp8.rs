@@ -357,14 +357,24 @@ pub(crate) fn dequant_gemm_tiled(
     )
 }
 
-/// The compact projection contract shared by every entry: `[n, k]` E4M3FN
-/// bytes, their `[ceil(n/128), ceil(k/128)]` F32 scales, activations with
-/// last dimension `k` on the same device, and on CUDA the provider geometry.
+/// The 16-bit entries' contract: [`validate_contract`], and on CUDA the
+/// provider geometry and dtype.
 fn validate_projection(
     input: &Tensor,
     weights: &Tensor,
     scales: &Tensor,
 ) -> Result<(usize, usize)> {
+    let (n, k) = validate_contract(input, weights, scales)?;
+    if input.device().is_cuda() && !provider_supported(input.device(), input.dtype(), n, k) {
+        candle_core::bail!("unsupported compact FP8 CUDA provider geometry or dtype")
+    }
+    Ok((n, k))
+}
+
+/// The compact projection contract shared by every entry: `[n, k]` E4M3FN
+/// bytes, their `[ceil(n/128), ceil(k/128)]` F32 scales, and activations with
+/// last dimension `k` on the same device.
+fn validate_contract(input: &Tensor, weights: &Tensor, scales: &Tensor) -> Result<(usize, usize)> {
     let (n, k) = weights.dims2()?;
     if input.rank() == 0
         || input.dim(candle_core::D::Minus1)? != k
@@ -378,9 +388,6 @@ fn validate_projection(
         || !matches!(input.dtype(), DType::F32 | DType::F16 | DType::BF16)
     {
         candle_core::bail!("invalid compact E4M3FN projection contract")
-    }
-    if input.device().is_cuda() && !provider_supported(input.device(), input.dtype(), n, k) {
-        candle_core::bail!("unsupported compact FP8 CUDA provider geometry or dtype")
     }
     Ok((n, k))
 }
@@ -408,13 +415,14 @@ pub enum Fp8Epilogue {
 }
 
 /// Whether [`block_fp8_projection_f32`] runs its vectorized CUDA kernel for
-/// `input` (F32, `[m, k]`) over `weights` (`[n, k]`): CUDA, `k` a multiple
-/// of 128 and 16-byte aligned rows. Elsewhere it runs the portable reference.
+/// `input` (F32, `[m, k]`) over `weights` (`[n, k]`): CUDA at the PTX's
+/// sm_80 floor, `k` a multiple of 128 and 16-byte aligned rows. Elsewhere it
+/// runs the portable reference.
 pub fn f32_projection_vectorized(input: &Tensor, weights: &Tensor) -> bool {
     let Ok((_, k)) = weights.dims2() else {
         return false;
     };
-    input.device().is_cuda()
+    device_is_sm80_or_newer(input.device())
         && input.dtype() == DType::F32
         && k.is_multiple_of(128)
         && input.layout().start_offset().is_multiple_of(4)
@@ -432,7 +440,8 @@ pub fn block_fp8_projection_f32(
     scales: &Tensor,
     epilogue: Fp8Epilogue,
 ) -> Result<Tensor> {
-    let (n, k) = validate_projection(input, weights, scales)?;
+    // Not the 16-bit provider check: this kernel takes F32 activations.
+    let (n, k) = validate_contract(input, weights, scales)?;
     if input.dtype() != DType::F32 {
         candle_core::bail!("the F32 FP8 projection takes F32 activations")
     }
