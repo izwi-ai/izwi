@@ -834,6 +834,26 @@ async fn sha256_file(path: &std::path::Path) -> anyhow::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Whether `attempt`'s committed checkpoint holds a segment that published
+/// audio and never completed. Recovery refuses to speak it again, so a
+/// failure there is final. A checkpoint that cannot be read says no.
+pub(super) async fn published_partial_segment(
+    state: &AppState,
+    attempt: &StageExecutionContext,
+) -> bool {
+    let Ok(Some(stage)) = state
+        .batch_runtime_store
+        .get_stage(&attempt.lease().stage_id)
+        .await
+    else {
+        return false;
+    };
+    stage
+        .progress_json
+        .and_then(|progress| serde_json::from_value::<SpeechCheckpoint>(progress).ok())
+        .is_some_and(|checkpoint| checkpoint.published_partial_segment())
+}
+
 pub(super) async fn cleanup_expired_replay(state: &AppState) -> anyhow::Result<()> {
     let retention = crate::env_config::tuning().tts_replay_retention.as_secs();
     let now = std::time::SystemTime::now()

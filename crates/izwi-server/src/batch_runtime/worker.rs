@@ -547,6 +547,13 @@ pub struct SpeechStageYield;
 #[error("{0}")]
 pub struct DeterministicStageFailure(pub String);
 
+/// A stage failure no retry can recover, on a valid request: a speech
+/// segment failed after it published audio. It fails the stage at once as
+/// `executor_failed`, keeping its own message.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct FinalStageFailure(pub String);
+
 #[async_trait]
 pub trait StageExecutor: Send + Sync {
     fn stage_kind(&self) -> &'static str;
@@ -1001,6 +1008,7 @@ impl BatchWorkerRunner {
                 let message = err.to_string();
                 self.health.record_error(message.clone());
                 let deterministic = err.downcast_ref::<DeterministicStageFailure>().is_some();
+                let retryable = !deterministic && err.downcast_ref::<FinalStageFailure>().is_none();
                 let error_code = if deterministic {
                     "invalid_request"
                 } else {
@@ -1010,7 +1018,7 @@ impl BatchWorkerRunner {
                     .settle_with_retry("fail stage", || {
                         self.store.fail_stage(
                             &lease,
-                            !deterministic,
+                            retryable,
                             Some(error_code.to_string()),
                             Some(message.clone()),
                         )

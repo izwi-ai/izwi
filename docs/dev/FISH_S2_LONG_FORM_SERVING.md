@@ -159,7 +159,10 @@ its worker claim and rejoins the queue so short jobs can obtain worker slots as
 well as GPU permits. Continuations keep the failure retry budget and receive a
 fresh attempt token; old workers cannot publish using the reused retry count. A worker interruption inside a published
 segment cannot safely regenerate that segment: report an incomplete outcome
-instead of silently duplicating samples. Attempt fences must prevent a stale
+instead of silently duplicating samples. A failure inside a published segment
+(such as a chunk that runs out of its frame budget) therefore fails the job at
+once with its own error; a retry could only refuse with
+`speech_partial_segment_interrupted`. Attempt fences must prevent a stale
 worker from updating progress, publishing new PCM, or completing the recording.
 A final ready state requires all segments and final artifact publication.
 

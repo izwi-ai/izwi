@@ -226,6 +226,19 @@ async fn chunk_session(
     voices: Voices<'_>,
     previous: &[SpeechChunkTurn],
 ) -> izwi_core::Result<Session> {
+    let (session, error) = chunk_session_until_error(state, text, seed, voices, previous).await;
+    error.map_or(Ok(session), Err)
+}
+
+/// [`chunk_session`] up to its first failing chunk: the chunks before it,
+/// and its error.
+async fn chunk_session_until_error(
+    state: &AppState,
+    text: &str,
+    seed: u64,
+    voices: Voices<'_>,
+    previous: &[SpeechChunkTurn],
+) -> (Session, Option<izwi_core::Error>) {
     let mut history = SpeechChunkHistory::default();
     for turn in previous {
         history.push(turn.clone());
@@ -262,7 +275,9 @@ async fn chunk_session(
             (samples, codes)
         };
         let (result, (samples, codes)) = tokio::join!(run, collect);
-        result?;
+        if let Err(error) = result {
+            return (session, Some(error));
+        }
         let codes = codes.expect("a chunk's codes");
         assert_eq!(codes.frames() * STUB_SAMPLES_PER_FRAME, samples.len());
         session.pcm.extend_from_slice(&samples);
@@ -273,7 +288,27 @@ async fn chunk_session(
         history.push(turn.clone());
         session.turns.push(turn);
     }
-    Ok(session)
+    (session, None)
+}
+
+/// The first seed from `from` whose chunk session of `text` ends its first
+/// chunk on eos and runs a later chunk out of its budget, with that chunk's
+/// index.
+async fn cut_off_seed(state: &AppState, text: &str, from: u64) -> (u64, usize) {
+    for seed in from..from + 64 {
+        let (session, error) =
+            chunk_session_until_error(state, text, seed, Voices::Seeded, &[]).await;
+        match error {
+            Some(error) if error.to_string().contains("frame_limit") => {
+                if !session.turns.is_empty() {
+                    return (seed, session.turns.len());
+                }
+            }
+            Some(error) => panic!("seed {seed}: {error}"),
+            None => {}
+        }
+    }
+    panic!("no seed from {from} that cuts off a chunk after the first");
 }
 
 /// The first seed from `from` whose chunk session of `text` ends on eos
@@ -617,6 +652,94 @@ async fn durable_records_carry_history_across_stage_attempts() {
     let (rate, wav) = wav_samples(&bytes(response).await);
     assert_eq!(rate, SAMPLE_RATE);
     assert_eq!(wav, pcm_i16(&expected));
+    server
+        .state
+        .runtime
+        .unload_model(VARIANT)
+        .await
+        .expect("unload");
+}
+
+/// A durable record whose later chunk runs out of budget after its audio was
+/// journaled fails with that chunk's own error, without a retry: a retry
+/// could only refuse to speak the chunk again
+/// (`speech_partial_segment_interrupted`), and its refusal would replace the
+/// cause.
+#[test]
+fn fish_drama3_durable_records_fail_a_cut_off_chunk_with_its_own_error() {
+    run_on_large_stacks(durable_records_fail_a_cut_off_chunk_with_its_own_error());
+}
+
+async fn durable_records_fail_a_cut_off_chunk_with_its_own_error() {
+    use crate::batch_runtime::types::{RuntimeJobKind, RuntimeJobStatus, RuntimeStageStatus};
+    let _load = LOADS.lock().await;
+    let server = server("durable-cut-off");
+    server
+        .state
+        .runtime
+        .load_model(VARIANT)
+        .await
+        .expect("load");
+    let long = "one two three hello world. ".repeat(30);
+    let (seed, cut_off) = cut_off_seed(&server.state, &long, 600).await;
+    let record = create_record(
+        &server,
+        "/v1/text-to-speech",
+        json!({
+            "model_id": "FishAudio-Drama-3",
+            "text": long,
+            "temperature": TEMPERATURE,
+            "max_tokens": BUDGET,
+            "seed": seed,
+        }),
+        StatusCode::ACCEPTED,
+    )
+    .await;
+    let id = record["id"].as_str().unwrap();
+    let store = &server.state.batch_runtime_store;
+    let job = store
+        .get_latest_job_for_route_record(RuntimeJobKind::TtsSpeech, "text_to_speech", id)
+        .await
+        .unwrap()
+        .expect("a speech job");
+
+    // Run the worker until the job settles, not just the record: a retry
+    // reopens a failed record.
+    let worker = durable_worker(&server);
+    let mut attempts = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    while matches!(
+        store.get_job(&job.id).await.unwrap().unwrap().status,
+        RuntimeJobStatus::Queued | RuntimeJobStatus::Running | RuntimeJobStatus::Retrying
+    ) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the job never settled"
+        );
+        if worker.run_once().await.expect("a worker pass") {
+            attempts += 1;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    let record = get_json(&server, &format!("/v1/text-to-speech/{id}")).await;
+    assert_eq!(record["processing_status"], "failed");
+    let error = record["processing_error"].as_str().unwrap();
+    assert!(error.contains("frame_limit"), "{error}");
+    // One attempt per chunk through the cut-off one.
+    assert_eq!(attempts, cut_off + 1);
+    let stage = &store.list_stages_for_job(&job.id).await.unwrap()[0];
+    assert_eq!(stage.status, RuntimeStageStatus::Failed);
+    assert_eq!(stage.error_code.as_deref(), Some("executor_failed"));
+    assert!(
+        stage
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("frame_limit"),
+        "{stage:?}"
+    );
     server
         .state
         .runtime
