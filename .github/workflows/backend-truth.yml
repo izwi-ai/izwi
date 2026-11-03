@@ -154,7 +154,7 @@ jobs:
   serving-windows:
     name: Serving Compile (Windows)
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -187,6 +187,16 @@ jobs:
           -p izwi-model-catalog
           -p izwi-prometheus
           -p izwi-db
+
+      # izwi-server samples host memory from the OS at startup. Windows had no
+      # query, so the server exited before it bound its port (#252). The Linux
+      # and macOS jobs run this test with the rest of izwi-core.
+      - name: Test the host memory probe on Windows
+        shell: bash
+        run: >-
+          cargo --config "build.rustc-wrapper=''" test --locked
+          -p izwi-core --lib
+          runtime::coordinator::tests::cpu_capacity_provider_starts_from_operating_system_memory
 
   fleet-stores:
     name: Store Validation (PostgreSQL)

@@ -3024,8 +3024,9 @@ impl DeviceCapacityProbe {
     /// Without an explicit budget the CPU advisory ledger admitted against
     /// u64::MAX, so no reservation could ever fail and an oversized load or
     /// request surfaced as swap or the OOM killer. Bound it by physical memory
-    /// (MemTotal or the cgroup limit on Linux, hw.memsize on macOS) with the
-    /// Metal default's fraction; an operator budget wins unchanged.
+    /// (MemTotal or the cgroup limit on Linux, hw.memsize on macOS,
+    /// GlobalMemoryStatusEx on Windows) with the Metal default's fraction; an
+    /// operator budget wins unchanged.
     fn derive_default_cpu_budget(&mut self) {
         if self.backend == BackendKind::Cpu && self.configured_cap.is_none() {
             self.configured_cap = self
@@ -3352,8 +3353,8 @@ impl PhysicalCapacityProvider for DeviceCapacityProvider {
 
 /// Total and available system memory in bytes, as the operating system
 /// reports it (cgroup-limited on Linux; the kernel's memory-pressure level on
-/// macOS). On macOS this runs `sysctl`, so call it off async threads and not
-/// on hot paths.
+/// macOS; GlobalMemoryStatusEx on Windows). On macOS this runs `sysctl`, so
+/// call it off async threads and not on hot paths.
 pub fn system_memory_snapshot() -> Option<(u64, u64)> {
     host_memory_snapshot()
 }
@@ -3397,6 +3398,22 @@ fn host_memory_snapshot() -> Option<(u64, u64)> {
             CAPACITY_COMMAND_TIMEOUT,
         )?;
         return parse_macos_sysctl_memory(std::str::from_utf8(&output).ok()?);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+        let mut status = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: `status` is a writable MEMORYSTATUSEX whose dwLength is set,
+        // as the call requires.
+        if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+            return None;
+        }
+        // ullAvailPhys counts free and standby pages, like MemAvailable.
+        return Some((status.ullTotalPhys, status.ullAvailPhys));
     }
     #[allow(unreachable_code)]
     None
@@ -4235,6 +4252,36 @@ mod tests {
     fn macos_sysctl_parser_fails_closed_without_both_values() {
         assert_eq!(parse_macos_sysctl_memory("17179869184\n"), None);
         assert_eq!(parse_macos_sysctl_memory("17179869184\nlow\n"), None);
+    }
+
+    /// The CPU provider izwi-server builds at startup samples the operating
+    /// system (tests elsewhere use a fixed capacity). On a release OS with no
+    /// host-memory query that sample fails and the server exits before it
+    /// binds its port, as it did on Windows (izwi-ai/izwi#252).
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn cpu_capacity_provider_starts_from_operating_system_memory() {
+        let (total, available) =
+            host_memory_snapshot().expect("every release OS reports host memory");
+        assert!(total > 0 && available <= total, "{available} of {total}");
+
+        let mut probe = DeviceCapacityProbe {
+            backend: BackendKind::Cpu,
+            device: Some(DeviceProfile::cpu()),
+            configured_cap: None,
+            configured_host_cap: None,
+            test_capacity: None,
+            metal_load_admission: MetalLoadAdmission::default(),
+            test_host_available: None,
+        };
+        probe.derive_default_cpu_budget();
+        assert!(
+            probe
+                .configured_cap
+                .is_some_and(|cap| cap > 0 && cap <= total),
+            "the default CPU budget comes from physical memory"
+        );
+        DeviceCapacityProvider::from_probe(probe).expect("the CPU capacity probe must sample");
     }
 
     #[test]

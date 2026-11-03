@@ -91,6 +91,10 @@ hex = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.3", features = ["fs"] }
 
+# Physical memory for the CPU capacity probe (GlobalMemoryStatusEx).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+
 [features]
 default = []
 # The synthetic Fish Audio Drama 3 checkpoint for other crates' tests
