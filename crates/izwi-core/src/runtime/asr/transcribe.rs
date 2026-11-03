@@ -309,6 +309,23 @@ impl RuntimeService {
         runtime_context: RuntimeRequestContext,
         native_word_timestamps: bool,
     ) -> Result<AsrTranscription> {
+        if let Some(translation) = self
+            .translate_in_segments(
+                variant,
+                audio_bytes,
+                language,
+                prompt,
+                &task,
+                max_tokens,
+                correlation_id,
+                runtime_context,
+                &mut |_: String| {},
+                &mut |_: AsrProgress| {},
+            )
+            .await?
+        {
+            return Ok(translation);
+        }
         let translate_to = task.translate_to.clone();
         let admitted = self
             .build_asr_request(
@@ -436,8 +453,8 @@ impl RuntimeService {
         task: AsrTaskOptions,
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
-        on_delta: F,
-        on_progress: P,
+        mut on_delta: F,
+        mut on_progress: P,
         broker_streaming_required: bool,
         runtime_context: RuntimeRequestContext,
         native_word_timestamps: bool,
@@ -446,6 +463,23 @@ impl RuntimeService {
         F: FnMut(String) + Send + 'static,
         P: FnMut(AsrProgress) + Send + 'static,
     {
+        if let Some(translation) = self
+            .translate_in_segments(
+                variant,
+                audio_bytes,
+                language,
+                prompt,
+                &task,
+                max_tokens,
+                correlation_id,
+                runtime_context,
+                &mut on_delta,
+                &mut on_progress,
+            )
+            .await?
+        {
+            return Ok(translation);
+        }
         let translate_to = task.translate_to.clone();
         let admitted = self
             .build_asr_request(

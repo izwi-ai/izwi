@@ -401,3 +401,136 @@ async fn synthetic_speaker_attribution_and_one_model_diarization() {
         saa.text
     );
 }
+
+/// A translation longer than one segment runs as segments: its text is the
+/// in-order join of each segment translated alone, its stream's deltas and
+/// progress follow the segments in order, and a transcription of the same
+/// audio stays one pass.
+// The env lock is held across awaits on purpose: it keeps the span
+// variable fixed for the whole test.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn synthetic_long_translations_run_in_segments() {
+    use super::asr::{append_segment, plan_translation_segments, segment_wav};
+    use crate::engine::{AsrProgress, AsrProgressPhase, AsrTaskOptions};
+    use crate::models::architectures::nemotron_transcribe::PREFILL_SPAN_ENV;
+    use std::sync::{Arc, Mutex};
+
+    // Spans under the engine's prefill chunk, so a segment prefills in the
+    // same spans alone and beside another row (a lone row otherwise takes
+    // the model's longer span, which rounds differently).
+    let _env = crate::env_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var(PREFILL_SPAN_ENV, value),
+                None => std::env::remove_var(PREFILL_SPAN_ENV),
+            }
+        }
+    }
+    let _restore = Restore(std::env::var_os(PREFILL_SPAN_ENV));
+    std::env::set_var(PREFILL_SPAN_ENV, "64");
+    let models = synthetic_models_dir("translation-segments");
+    // Two rows, so the segments both share a batch and queue for one.
+    let runtime = runtime_with(&models, 2).await;
+    let model = VARIANT.to_string();
+    let clip = wav_bytes(&fox(0.0, 70.0));
+    let translate = AsrTaskOptions::new(Some("de".into()), Vec::new());
+    let run = |audio: Vec<u8>, task: AsrTaskOptions| {
+        let (runtime, model) = (&runtime, &model);
+        async move {
+            runtime
+                .asr_transcribe_bytes_with_runtime_context_and_word_timestamps(
+                    &audio,
+                    Some(model),
+                    None,
+                    None,
+                    task,
+                    Some(MAX_TOKENS),
+                    None,
+                    RuntimeRequestContext::default(),
+                    false,
+                )
+                .await
+                .expect("ASR request")
+        }
+    };
+
+    let translation = run(clip.clone(), translate.clone()).await;
+    assert_eq!(translation.language.as_deref(), Some("de"));
+    let chunking = &translation.asr_diagnostics.as_ref().expect("diagnostics")["chunking"];
+    assert_eq!(chunking["planner"], "translation_segments", "{chunking}");
+    let (samples, rate) =
+        crate::runtime::audio_io::decode_audio_bytes_canonical(&clip).expect("decode");
+    let segments = plan_translation_segments(&samples, rate, 30.0);
+    assert!(segments.len() >= 3, "{segments:?}");
+    assert_eq!(chunking["chunk_count"], segments.len());
+
+    let mut expected = String::new();
+    for segment in &segments {
+        let audio = segment_wav(&samples[segment.start_sample..segment.end_sample], rate).unwrap();
+        let alone = run(audio, translate.clone()).await;
+        assert!(alone.asr_diagnostics.as_ref().unwrap()["chunking"].is_null());
+        append_segment(&mut expected, &alone.text);
+    }
+    eprintln!("segmented translation: {:?}", translation.text);
+    assert!(!expected.is_empty());
+    assert_eq!(translation.text, expected);
+
+    // The stream emits each segment's text in order, ending with the whole.
+    let deltas = Arc::new(Mutex::new(Vec::new()));
+    let sink = deltas.clone();
+    let streamed = runtime
+        .asr_transcribe_streaming_bytes_with_runtime_context(
+            &clip,
+            Some(&model),
+            None,
+            None,
+            translate.clone(),
+            Some(MAX_TOKENS),
+            None,
+            RuntimeRequestContext::default(),
+            move |delta| sink.lock().unwrap().push(delta),
+        )
+        .await
+        .expect("streamed translation");
+    assert_eq!(streamed.text, expected);
+    assert_eq!(deltas.lock().unwrap().concat(), expected);
+
+    // Progress counts finished segments up to the whole recording.
+    let progress = Arc::new(Mutex::new(Vec::<AsrProgress>::new()));
+    let events = progress.clone();
+    runtime
+        .asr_transcribe_bytes_with_progress_and_runtime_context(
+            &clip,
+            Some(&model),
+            None,
+            translate,
+            None,
+            RuntimeRequestContext::default(),
+            false,
+            |_| {},
+            move |event| events.lock().unwrap().push(event),
+        )
+        .await
+        .expect("translation with progress");
+    let progress = progress.lock().unwrap();
+    let finished = progress
+        .iter()
+        .filter(|event| event.phase == AsrProgressPhase::ChunkFinished)
+        .map(|event| event.current_chunk)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        finished,
+        (1..=segments.len()).map(Some).collect::<Vec<_>>(),
+        "{progress:?}"
+    );
+    assert_eq!(progress.last().unwrap().phase, AsrProgressPhase::Complete);
+
+    // A transcription of the same recording stays one pass.
+    let transcript = run(clip, AsrTaskOptions::default()).await;
+    assert!(transcript.asr_diagnostics.as_ref().unwrap()["chunking"].is_null());
+}

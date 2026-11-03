@@ -198,7 +198,9 @@ transcripts (Granite Speech 4.1 Plus or Nemotron 3.5 Transcribe), and
 
 `Nemotron-3.5-Transcribe-30B-A4B-FP8` is NVIDIA's 30B speech language model.
 It transcribes a recording of up to 60 minutes in one pass, translates,
-takes context terms, labels speakers and times words itself.
+takes context terms, labels speakers and times words itself. It translates
+short speech best, so a translation of a recording longer than 30 seconds
+runs in segments cut at pauses and comes back joined in order.
 
 It needs about 31 GiB of memory on Metal and CUDA and about 33 GiB on CPU;
 a machine that cannot hold it is refused when the model loads.

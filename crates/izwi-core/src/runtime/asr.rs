@@ -79,6 +79,9 @@ mod realtime_session;
 mod saa_seam;
 mod speaker_attribution;
 mod transcribe;
+mod translation_segments;
+#[cfg(test)]
+pub(in crate::runtime) use translation_segments::{append_segment, plan_translation_segments, segment_wav};
 use realtime_push::{RealtimePush, RealtimePushBatcher, RealtimePushHolds, RealtimePushRow};
 use realtime_session::{
     add_realtime_stream_reservation, engine_realtime_family_name, lfm3_live_asr_language,

@@ -1383,6 +1383,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "On CUDA, Nemotron 3.5 Transcribe's fused decode step replays a CUDA graph for each stretch of Mamba and MoE layers between attention layers (captured per row count up to 4, checked bit for bit against the eager stretch on two steps, off for the process on any mismatch). Any false value, or `IZWI_CUDA_DECODE_GRAPHS=off`, runs every stretch eagerly; `decode_graphs` in the diagnostics reports captures, replays and why the graphs are off.",
     ),
     CoreEnvVar::new(
+        "IZWI_NEMOTRON_TRANSCRIBE_TRANSLATION_SEGMENT_SECONDS",
+        Float,
+        "30",
+        Once,
+        "Longest segment, in seconds, of a Nemotron 3.5 Transcribe translation. The model translates sentence-length speech and falls back to a transcript on a long recording, so a longer recording is cut at pauses into segments that are translated side by side and joined in order. `0` translates in one pass; values below 5 count as 5. Transcription always runs in one pass.",
+    ),
+    CoreEnvVar::new(
         "IZWI_NO_UI",
         Flag,
         "false (UI enabled)",

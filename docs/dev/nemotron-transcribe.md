@@ -115,7 +115,19 @@ token. The instruction is chosen in this order:
   translation runs to or from English, never between two other languages
   (31 languages translate; Turkish, Bengali, Indonesian, Marathi, Tagalog,
   Tamil, Telugu and Vietnamese do not). Context terms and speaker tags
-  cannot be combined with it (`400`).
+  cannot be combined with it (`400`). The model translates sentence-length
+  speech: NVIDIA evaluates translation on FLEURS and CoVoST 2 only, its
+  long-form training data is transcription, and on a long recording it
+  answers with a transcript in the spoken language. So a recording longer
+  than one segment (30 s) is translated in segments
+  (`runtime/asr/translation_segments.rs`): cut in pauses near 24 s with no
+  overlap, each an ordinary request with the same instruction and a decode
+  budget of 16 tokens a second plus 64 (or the request's `max_tokens` when
+  smaller), up to 8 in flight, joined in order with a space except between
+  unspaced scripts. A stream gets one delta and one `chunk_finished`
+  progress event per segment, in order; the diagnostics report the
+  segments as `chunking` (planner `translation_segments`). Transcription
+  stays one pass.
 - Speaker labels render the card's speaker-tag instruction, with context
   terms appended when given. They are refused when the named language is not
   one of the card's 13 multi-speaker languages (en, fr, de, hi, it, ko, pt,
@@ -577,6 +589,9 @@ The family's knobs, in [`env/core.md`](env/core.md):
   audio clears it.
 - `IZWI_NEMOTRON_TRANSCRIBE_FP8_MODE` (read at load): `w8a16` (default) or
   `vllm-fp8`. Anything else fails the load.
+- `IZWI_NEMOTRON_TRANSCRIBE_TRANSLATION_SEGMENT_SECONDS` (read once): the
+  longest segment of a translation, 30 s by default; `0` translates the
+  whole recording in one pass, and values below 5 count as 5.
 - `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN` (read at load): the most prompt
   tokens one row prefills per engine step, 16 to 16,384, and the span a row
   prefilling alone takes. Defaults to 2,048 on CUDA and 512 on CPU and Metal;
