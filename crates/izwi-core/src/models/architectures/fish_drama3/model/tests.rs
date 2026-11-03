@@ -258,9 +258,12 @@ fn as_f32(bits: &[u32]) -> Vec<f32> {
     bits.iter().map(|b| f32::from_bits(*b)).collect()
 }
 
-/// The opt-in F16 KV on the CPU: the load stores F16 pages, and a request
-/// decodes the frames the F32 pages give, to rounding of the cache (the
-/// same frame count and nearly all the same codes).
+/// The opt-in F16 KV on the CPU: the load stores F16 pages, a prompt
+/// prefilled in 7-row cells (each cell after the first attends over F16
+/// pages) ends within F16 rounding of the F32 pages' last hidden state, and
+/// the request decodes. Sampled codes are not compared: on random weights
+/// one rounding flips a draw, and every frame after it differs, by a margin
+/// that depends on the host's BLAS.
 #[test]
 fn cpu_f16_kv_loads_and_decodes() {
     let synthetic = write_synthetic_model(31);
@@ -269,6 +272,7 @@ fn cpu_f16_kv_loads_and_decodes() {
         &Device::Cpu,
         FishDrama3ModelOptions {
             config_policy: FishDrama3ConfigPolicy::Synthetic,
+            prefill_span_rows: 7,
             cpu_kv_dtype: DType::F16,
             ..Default::default()
         },
@@ -281,16 +285,11 @@ fn cpu_f16_kv_loads_and_decodes() {
         .new_private_request(prompt.clone(), params(5, 12))
         .unwrap();
     model.run_prefill(&mut state, &ok).unwrap();
+    let expected = prefilled(&prompt, params(5, 12), 7);
+    let error = relative_l2(&state.last_hidden_values(), &expected.last_hidden_values());
+    assert!(error > 0.0 && error < 1e-2, "{error}");
     model.run_decode(&mut [&mut state], &ok).unwrap();
-    let expected = solo(&prompt, params(5, 12), DEFAULT_PREFILL_SPAN_ROWS);
-    assert_eq!(state.frames(), expected.frames());
-    let (a, b) = (state.codes().concat(), expected.codes().concat());
-    let same = a.iter().zip(&b).filter(|(x, y)| x == y).count();
-    assert!(
-        same * 10 >= b.len() * 9,
-        "{same} of {} codes agree",
-        b.len()
-    );
+    assert!(state.frames() > 0);
 }
 
 /// Prefill grids of 1, 7 and 256 rows reach the same clocks and rows and

@@ -578,12 +578,7 @@ async fn fish_drama3_speaks_through_openai_speech() {
         }
     }
     assert!(cut.is_some(), "a seed that runs past two frames");
-    server
-        .state
-        .runtime
-        .unload_model(VARIANT)
-        .await
-        .expect("unload");
+    unload(&server).await;
 }
 
 /// A durable first-party record of long text: each chunk runs as its own
@@ -652,12 +647,7 @@ async fn durable_records_carry_history_across_stage_attempts() {
     let (rate, wav) = wav_samples(&bytes(response).await);
     assert_eq!(rate, SAMPLE_RATE);
     assert_eq!(wav, pcm_i16(&expected));
-    server
-        .state
-        .runtime
-        .unload_model(VARIANT)
-        .await
-        .expect("unload");
+    unload(&server).await;
 }
 
 /// A durable record whose later chunk runs out of budget after its audio was
@@ -740,12 +730,7 @@ async fn durable_records_fail_a_cut_off_chunk_with_its_own_error() {
             .contains("frame_limit"),
         "{stage:?}"
     );
-    server
-        .state
-        .runtime
-        .unload_model(VARIANT)
-        .await
-        .expect("unload");
+    unload(&server).await;
 }
 
 /// Runs a batch worker until record `id` of `route` is ready, one stage
@@ -772,6 +757,22 @@ async fn run_durable_record(server: &Server, route: &str, id: &str) -> usize {
         }
     }
     attempts
+}
+
+/// Unloads the model once the last request has let go of it: a response,
+/// a refusal above all, can reach the client a moment before its engine
+/// request drops its residency lease, and unload refuses a held lease.
+async fn unload(server: &Server) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match server.state.runtime.unload_model(VARIANT).await {
+            Ok(()) => return,
+            Err(izwi_core::Error::ModelBusy(_)) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("unload: {error:?}"),
+        }
+    }
 }
 
 /// A `GET` response's JSON.
@@ -1075,12 +1076,7 @@ async fn speaks_dialogue_through_openai_speech() {
         message.contains("holds 4 references in") && message.contains("fewer or shorter"),
         "{message}"
     );
-    server
-        .state
-        .runtime
-        .unload_model(VARIANT)
-        .await
-        .expect("unload");
+    unload(&server).await;
 }
 
 /// A durable first-party record of a long dialogue with two references, one
@@ -1160,12 +1156,7 @@ async fn durable_dialogue_records_recover_every_reference() {
     let (rate, wav) = wav_samples(&bytes(response).await);
     assert_eq!(rate, SAMPLE_RATE);
     assert_eq!(wav, pcm_i16(&expected));
-    server
-        .state
-        .runtime
-        .unload_model(VARIANT)
-        .await
-        .expect("unload");
+    unload(&server).await;
 }
 
 /// Every dialogue refusal is a 400 naming its cause, on `/v1/audio/speech`
@@ -1473,12 +1464,7 @@ async fn takes_continue_earlier_takes() {
         record_pcm(&server, route, &third_id).await,
         pcm_i16(&third.pcm)
     );
-    server
-        .state
-        .runtime
-        .unload_model(VARIANT)
-        .await
-        .expect("unload");
+    unload(&server).await;
 }
 
 /// A long take keeps its first and last chunks, which is all a take that
@@ -1578,12 +1564,7 @@ async fn long_takes_continue_across_stage_attempts() {
         "{error}"
     );
     assert!(record.get("editable").is_none());
-    server
-        .state
-        .runtime
-        .unload_model(VARIANT)
-        .await
-        .expect("unload");
+    unload(&server).await;
 }
 
 /// A dialogue take on the synchronous voice-cloning route keeps its voices:
@@ -1686,12 +1667,7 @@ async fn dialogue_takes_continue_with_their_stored_voices() {
         record_pcm(&server, route, edit_id).await,
         pcm_i16(&edit.pcm)
     );
-    server
-        .state
-        .runtime
-        .unload_model(VARIANT)
-        .await
-        .expect("unload");
+    unload(&server).await;
 }
 
 /// Every `previous_take_ids` refusal, before any model loads (none is on
