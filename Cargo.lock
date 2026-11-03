@@ -3334,6 +3334,7 @@ dependencies = [
  "toml 1.1.8+spec-1.1.0",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
  "yaml_serde",
  "zip",
 ]
