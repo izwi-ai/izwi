@@ -1364,9 +1364,9 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN",
         Int,
-        "2048 on CUDA, 512 on CPU and Metal",
+        "512 on CUDA, 192 on CPU and Metal",
         Load,
-        "Most prompt tokens one Nemotron 3.5 Transcribe row prefills per engine step (16 to 16384); values outside that range are ignored.",
+        "Prompt tokens one Nemotron 3.5 Transcribe row prefills per engine step (16 to 16384), fixed per load: the scheduler's prefill grid, so every span but a prompt's last has this length alone or beside other rows; values outside that range are ignored.",
     ),
     CoreEnvVar::new(
         "IZWI_NEMOTRON_TRANSCRIBE_REFERENCE",

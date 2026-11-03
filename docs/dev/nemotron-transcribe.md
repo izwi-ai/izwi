@@ -246,7 +246,7 @@ device-routed path compared with the per-expert loop it replaces:
 | --- | --- | --- | --- |
 | 1 (decode) | 1.6 ms | 4.4 ms | 2.7× |
 | 8 (decode step) | 3.7 ms | 22.6 ms | 6.1× |
-| 512 (prefill span) | 53 ms | 67 ms | 1.3× |
+| 512 (prefill) | 53 ms | 67 ms | 1.3× |
 
 Load admission prices the residency from the config's census before any weight
 is read (`nemotron_transcribe_plan` in
@@ -294,12 +294,14 @@ Every request is a retained engine row. The pieces:
   becomes the execution profile's `prefill_spans_required`
   (`engine/executor.rs`, `engine/scheduler/mod.rs`). The scheduler then
   prefills this model's prompts in resumable spans whatever the
-  chunked-prefill switch says. A row prefilling alone takes the model's span
-  as its preferred prefill (`preferred_prefill_tokens`): a one-hour prompt
-  (about 45,000 audio tokens) is 23 spans of 2,048 tokens on CUDA or 88 of 512
-  on CPU and Metal. While other rows decode, the engine's prefill chunk caps
-  the span (512 on CUDA, 192 on CPU and Metal), so a prefill never holds the
-  device long while other rows wait for their next token.
+  chunked-prefill switch says. The model's span is the profile's prefill grid
+  (`prefill_grid_tokens`): every span but a prompt's last is exactly 512
+  tokens on CUDA or 192 on CPU and Metal, whether the row prefills alone or
+  beside other rows, and never a step budget's leftover. How a prompt splits
+  changes the span's rounding and so, at a near tie, a greedy token; a fixed
+  grid keeps a request's transcript independent of server load. A one-hour
+  prompt (about 45,000 audio tokens) is 88 spans on CUDA or 234 on CPU and
+  Metal, each a bounded dispatch between other rows' decode steps.
 
 Decode rows run at the engine's tensor batch width for speech models: two rows
 on CPU and Metal unless `IZWI_MAX_BATCH_SIZE` sets one, and CUDA's automatic
@@ -592,10 +594,11 @@ The family's knobs, in [`env/core.md`](env/core.md):
 - `IZWI_NEMOTRON_TRANSCRIBE_TRANSLATION_SEGMENT_SECONDS` (read once): the
   longest segment of a translation, 30 s by default; `0` translates the
   whole recording in one pass, and values below 5 count as 5.
-- `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN` (read at load): the most prompt
-  tokens one row prefills per engine step, 16 to 16,384, and the span a row
-  prefilling alone takes. Defaults to 2,048 on CUDA and 512 on CPU and Metal;
-  values outside the range are ignored.
+- `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN` (read at load): the prompt tokens
+  one row prefills per engine step, 16 to 16,384: the prefill grid, so every
+  span but a prompt's last has this length. Defaults to 512 on CUDA and 192 on
+  CPU and Metal; values outside the range are ignored. A longer span prefills
+  faster and holds other rows' decode steps longer.
 - `IZWI_NEMOTRON_TRANSCRIBE_FUSED_DECODE` (read at load): any false value
   runs decode steps through the eager composition instead of the fused
   kernels (see [Decode step](#decode-step)).

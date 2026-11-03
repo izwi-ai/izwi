@@ -63,23 +63,24 @@ const SCAN_CHECK_LIMIT: f64 = 1e-4;
 
 static NEXT_MODEL_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
-/// `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN`: the most prompt tokens one row
+/// `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN`: the prompt tokens one row
 /// prefills in one engine quantum (16 to 16,384).
 pub const PREFILL_SPAN_ENV: &str = "IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN";
 
-/// The prefill span per row and quantum: 2,048 tokens on CUDA, 512 on CPU
-/// and Metal (an hour's 45,000-token prompt is 23 or 88 spans), or the
-/// environment's. A row takes it while it prefills alone; while other rows
-/// decode, the engine's prefill chunk caps it (512 on CUDA, 192 on CPU and
-/// Metal), a bounded dispatch between their steps.
+/// The prefill span per row and quantum, the cell of the scheduler's prefill
+/// grid: 512 tokens on CUDA, 192 on CPU and Metal (the engine's prefill
+/// chunk; an hour's 45,000-token prompt is 88 or 234 spans), or the
+/// environment's. Every span but a prompt's last is exactly this long,
+/// alone or beside other rows, so a request's transcript never depends on
+/// what else the server is running.
 pub fn prefill_span(backend: crate::backends::BackendKind) -> usize {
     std::env::var(PREFILL_SPAN_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|span| (16..=16_384).contains(span))
         .unwrap_or(match backend {
-            crate::backends::BackendKind::Cuda => 2_048,
-            crate::backends::BackendKind::Cpu | crate::backends::BackendKind::Metal => 512,
+            crate::backends::BackendKind::Cuda => 512,
+            crate::backends::BackendKind::Cpu | crate::backends::BackendKind::Metal => 192,
         })
 }
 

@@ -149,8 +149,11 @@ sets it today: a one-hour recording is a prompt of about 45,000 tokens.
 
 | Family | CPU | Metal | CUDA |
 |---|---|---|---|
-| Nemotron 3.5 Transcribe (ASR rows) | 512-token spans | 512-token spans | 2,048-token spans |
+| Nemotron 3.5 Transcribe (ASR rows) | 192-token spans | 192-token spans | 512-token spans |
 
+The span is the family's prefill grid (`ExecutionProfile::prefill_grid_tokens`):
+every span but a prompt's last has exactly that length, alone or beside other
+rows, so a transcript does not depend on server load.
 `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN` sets the span (16 to 16,384) on any
 backend. Its decode rows batch continuously at the engine's speech width, and
 it reuses no prefixes. See [Nemotron 3.5 Transcribe](nemotron-transcribe.md).

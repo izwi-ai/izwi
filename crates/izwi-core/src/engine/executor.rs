@@ -3652,10 +3652,10 @@ impl ModelExecutor for NativeExecutor {
                 .ok()
                 .map_or(0, |model| model.as_ref().preferred_prefill_tokens());
         }
-        // A Nemotron transcript prefilling alone takes its model's whole span
-        // (2,048 tokens on CUDA, 512 on CPU and Metal): fewer, wider GEMMs
-        // and one MoE routing readback per layer per span. While other rows
-        // decode, it takes the engine's chunk so their steps keep coming.
+        // A Nemotron transcript prefills on its model's span grid (512 tokens
+        // on CUDA, 192 on CPU and Metal): the span's rounding is part of the
+        // transcript, so a row's spans never stretch while it runs alone or
+        // shrink to a step's leftover budget beside other rows.
         if variant.family() == crate::catalog::ModelFamily::NemotronTranscribeAsr {
             let model_arc = request
                 .prepared_asr_model_lease_for_executor()
@@ -3666,7 +3666,7 @@ impl ModelExecutor for NativeExecutor {
                 .as_ref()
                 .and_then(|model| model.nemotron_transcribe().ok())
             {
-                profile.preferred_prefill_tokens = model.prefill_span();
+                profile.prefill_grid_tokens = model.prefill_span();
                 // Several decode steps per quantum, rows batched, while
                 // nothing waits; the scheduler's fairness gates drop to one
                 // step as soon as a request waits.

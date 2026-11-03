@@ -121,7 +121,7 @@ async fn runtime_on(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn synthetic_rows_transcribe_alone_and_concurrently_alike() {
     // Prefill in 16-token spans, so every prompt resumes across several
-    // quanta (the published model's spans are 512 or 2,048 tokens).
+    // quanta (the published model's spans are 192 or 512 tokens).
     let _env = crate::env_test_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -416,9 +416,8 @@ async fn synthetic_long_translations_run_in_segments() {
     use crate::models::architectures::nemotron_transcribe::PREFILL_SPAN_ENV;
     use std::sync::{Arc, Mutex};
 
-    // Spans under the engine's prefill chunk, so a segment prefills in the
-    // same spans alone and beside another row (a lone row otherwise takes
-    // the model's longer span, which rounds differently).
+    // The default span grid (192 tokens on the CPU): a segment prefills in
+    // the same spans alone and beside another row, so it translates alike.
     let _env = crate::env_test_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -432,7 +431,7 @@ async fn synthetic_long_translations_run_in_segments() {
         }
     }
     let _restore = Restore(std::env::var_os(PREFILL_SPAN_ENV));
-    std::env::set_var(PREFILL_SPAN_ENV, "64");
+    std::env::remove_var(PREFILL_SPAN_ENV);
     let models = synthetic_models_dir("translation-segments");
     // Two rows, so the segments both share a batch and queue for one.
     let runtime = runtime_with(&models, 2).await;
