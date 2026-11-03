@@ -198,10 +198,11 @@ impl CommittedBacking {
     }
 }
 
-/// Committed state the arena no longer holds (replaced by a commit, or
-/// released). Dropping it can free device memory, so an owner that records
-/// committed backing on a resource lease reconciles first and drops this
-/// afterwards. On CUDA it frees on the device's thread: the engine commits
+/// State the arena no longer holds (committed state replaced by a commit or
+/// released, or an aborted transaction's staged state). Dropping it can free
+/// device memory, so an owner that records committed backing on a resource
+/// lease reconciles first and drops this afterwards. On CUDA it frees on the
+/// device's thread: the engine commits
 /// on tokio workers, and a buffer freed on one that never ran CUDA work
 /// fails there and leaves the driver error on the context for the next
 /// device call (`CUDA_ERROR_INVALID_CONTEXT`).
@@ -947,11 +948,17 @@ impl TensorStateArena {
     }
 
     pub(crate) fn abort(&self, transaction: PhysicalStateTransactionId) -> Result<()> {
-        self.lock()?
+        let staged = self
+            .lock()?
             .transactions
             .remove(&transaction)
-            .map(|_| ())
-            .ok_or_else(|| invalid("physical state transaction is not active"))
+            .ok_or_else(|| invalid("physical state transaction is not active"))?;
+        // Its staged tensors free like retired state, outside the lock.
+        drop(RetiredTensorState::new(
+            &self.device,
+            staged.state.domains.into_values(),
+        ));
+        Ok(())
     }
 
     /// Release a sequence. Returns its committed state (see
