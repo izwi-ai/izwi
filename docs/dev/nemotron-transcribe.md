@@ -330,8 +330,9 @@ The fused step runs as pieces: stretches of Mamba and MoE layers, each a
 pure function of the residual, the normed hidden and its layers' Mamba
 states, and the attention layers between them (the tail stretch ends with
 the head and the greedy pick). On CUDA each stretch replays a CUDA graph
-(`decoder/graphs.rs`, on `SegmentGraph`), captured per row count up to 4
-rows, while attention, which writes the paged KV under per-step metadata,
+(`decoder/graphs.rs`, on `SegmentGraph`), captured per row count for
+steps of 1 to 4 rows and of 8 (the default CUDA width; 5 to 7 rows run
+eagerly rather than hold more state copies), while attention, which writes the paged KV under per-step metadata,
 stays eager. A stretch warms once, then its capture is checked bit for bit
 against the eager stretch on the capture step and on the next one; any
 failure turns the graphs off for the process. A replay copies the Mamba

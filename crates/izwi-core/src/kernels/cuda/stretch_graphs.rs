@@ -29,9 +29,21 @@ use super::segment_graph::{SegmentGraph, SegmentInput};
 /// The global switch for every family's decode graphs (`cuda.decode_graphs`).
 const DECODE_GRAPHS_ENV: &str = "IZWI_CUDA_DECODE_GRAPHS";
 
-/// Widest step whose stretches are captured. Each row count keeps its own
-/// graphs, with stable copies of its rows' recurrent states.
-pub const MAX_GRAPH_ROWS: usize = 4;
+/// Widest step whose stretches are captured: both families' default CUDA
+/// width, which a busy server runs at. Each row count keeps its own graphs,
+/// with stable copies of its rows' recurrent states (about 46 MB a row for
+/// Nemotron's Mamba layers, 63 MB for Drama 3's DeltaNet layers), so only
+/// [`graphed_width`]s are captured: 1 to 4 rows and 8, at most 18 rows'
+/// copies (about 0.8 or 1.1 GB, unpriced by admission). A capture that
+/// cannot allocate is a graph failure: the steps run eagerly.
+pub const MAX_GRAPH_ROWS: usize = 8;
+
+/// Whether a step of `rows` rows replays graphs: up to 4 rows, and the full
+/// default width of 8. Widths 5 to 7 run eagerly rather than hold another
+/// 15 rows' state copies.
+pub fn graphed_width(rows: usize) -> bool {
+    (1..=4).contains(&rows) || rows == MAX_GRAPH_ROWS
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Phase {
@@ -52,8 +64,9 @@ struct Stretch {
 type Runtime = std::result::Result<HashMap<(usize, u64), Vec<Stretch>>, String>;
 
 /// Most (row count, key) pairs one model keeps graphs for: a new pair past
-/// it drops another's.
-const MAX_SHAPES: usize = 8;
+/// it drops another's. Five widths under two keys (Drama 3's tower keys its
+/// graphs by sampling policy) fit without churn.
+const MAX_SHAPES: usize = 10;
 
 /// The stretch graphs of one model's decode step.
 pub struct StretchGraphs {
@@ -113,7 +126,7 @@ impl StretchGraphs {
     /// (a sampling policy, say) as launch arguments: `key` fingerprints
     /// them, and each key keeps its own graphs.
     pub fn begin_keyed(&self, rows: usize, key: u64) -> Option<StepRun<'_>> {
-        if rows == 0 || rows > MAX_GRAPH_ROWS {
+        if !graphed_width(rows) {
             return None;
         }
         let guard = self.runtime.try_lock().ok()?;
@@ -287,5 +300,19 @@ fn bits(t: &Tensor) -> candle_core::Result<Vec<u32>> {
             .into_iter()
             .map(f32::to_bits)
             .collect()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn widths_up_to_four_and_the_default_eight_are_graphed() {
+        let graphed = (0..=10)
+            .filter(|&rows| graphed_width(rows))
+            .collect::<Vec<_>>();
+        assert_eq!(graphed, [1, 2, 3, 4, 8]);
+        assert!(MAX_SHAPES >= 2 * graphed.len());
     }
 }

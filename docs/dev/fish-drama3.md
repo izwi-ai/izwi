@@ -225,8 +225,8 @@ between attention mixers (each opens with the previous attention layer's
 MoE half), pure functions of the residual, the normed hidden and each row's
 conv history and recurrent state, and the attention mixers with their post
 norms, eager. On CUDA each stretch replays a CUDA graph
-(`kernels::cuda::stretch_graphs`), captured per row count up to 4 rows and
-checked bit for bit against the eager stretch on its capture step and the
+(`kernels::cuda::stretch_graphs`), captured per row count for steps of 1 to
+4 rows and of 8 (the default CUDA width) and checked bit for bit against the eager stretch on its capture step and the
 next; any failure turns the graphs off for the process, and a host-routed
 MoE layer keeps them off. A replay copies the DeltaNet states in and out of
 the graph's buffers. The trunk's `decode_graphs` diagnostics count warmups,
