@@ -133,10 +133,16 @@ fn a_request_transcribes_deterministically_through_retained_spans() {
 
 /// The CPU's opt-in F16 KV (`IZWI_NEMOTRON_TRANSCRIBE_CPU_F16_KV`): a
 /// prompt prefilled in 17-token spans (each span after the first attends
-/// over F16 pages) ends with logits within F16 rounding of the F32 pages',
-/// and a row over F16 pages transcribes. Greedy tokens are not compared: on
-/// random weights one rounding flips a near-tie, and every token after it
-/// differs, by a margin that depends on the host's BLAS.
+/// over F16 pages) leaves the first attention layer's residual within F16
+/// rounding of the F32 pages' and not equal to it, ends with logits as
+/// close, and a row over F16 pages transcribes.
+///
+/// The rounding is checked after the attention layer: the logits come from
+/// a one-row LM head, which Candle's Q8_0 kernel multiplies with its
+/// activations quantized to int8, so whether an F16 rounding survives to
+/// them depends on the host's kernels (on CI's Linux runner the logits came
+/// out identical). Greedy tokens are not compared: on random weights one
+/// rounding flips a near-tie, and every token after it differs.
 #[test]
 fn a_row_transcribes_over_f16_pages_on_the_cpu() {
     let dir = temp_checkpoint();
@@ -155,23 +161,37 @@ fn a_row_transcribes_over_f16_pages_on_the_cpu() {
         )
         .remove(0)
     };
-    let final_logits = |mut cache: PhysicalPagedKvCache| {
+    let layer = model.decoder().attention_layers()[0] as usize;
+    // Every span's residual after the first attention layer, and the
+    // prompt's last logits.
+    let prefill = |mut cache: PhysicalPagedKvCache| {
         let artifact = Arc::new(model.prepare(&audio, request(12)).unwrap());
         let mut state = model.new_row(artifact, 1024).unwrap();
         let mut trace = super::decoder::DecoderTrace::default();
-        let request = super::decoder::TraceRequest::default();
+        let request = super::decoder::TraceRequest {
+            routes: false,
+            hidden_after_layers: vec![layer],
+        };
         while state.prefill_cursor() < state.prompt_tokens() {
             let n = 17.min(state.prompt_tokens() - state.prefill_cursor());
             model
                 .retained_prefill_traced(&mut state, &mut cache, n, Some((&request, &mut trace)))
                 .unwrap();
         }
-        trace.final_logits
+        let hidden = trace
+            .hidden
+            .into_iter()
+            .flat_map(|(_, values)| values)
+            .collect::<Vec<f32>>();
+        (hidden, trace.final_logits)
     };
-    let half = final_logits(f16_cache());
-    let full = final_logits(caches(&Device::Cpu, &model, 1, 1024).remove(0));
-    let error = crate::kernels::numeric_check::relative_l2(&half, &full);
+    let (half_hidden, half_logits) = prefill(f16_cache());
+    let (full_hidden, full_logits) = prefill(caches(&Device::Cpu, &model, 1, 1024).remove(0));
+    let relative_l2 = crate::kernels::numeric_check::relative_l2;
+    let error = relative_l2(&half_hidden, &full_hidden);
     assert!(error > 0.0 && error < 1e-2, "{error}");
+    let error = relative_l2(&half_logits, &full_logits);
+    assert!(!full_logits.is_empty() && error < 1e-2, "{error}");
     let transcript = model
         .transcribe_with_cache(&audio, request(12), &mut f16_cache(), 64)
         .unwrap();
