@@ -56,8 +56,20 @@ impl NtLayerNorm {
         })
     }
 
-    /// LayerNorm over the last dimension of F32 `x`.
+    /// LayerNorm over the last dimension of F32 `x`: Candle's fused kernel
+    /// on Metal (one launch instead of seven; Welford's mean and variance,
+    /// the same math to rounding), the composed form elsewhere. Candle's
+    /// CUDA kernel takes the variance as `E[x²] - E[x]²`, which cancels on
+    /// rows whose mean dwarfs their spread, so CUDA keeps the composition.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if x.device().is_metal() && x.dtype() == candle_core::DType::F32 {
+            return Ok(candle_nn::ops::layer_norm(
+                &x.contiguous()?,
+                &self.weight,
+                &self.bias,
+                self.eps as f32,
+            )?);
+        }
         let mean = x.mean_keepdim(D::Minus1)?;
         let centred = x.broadcast_sub(&mean)?;
         let variance = centred.sqr()?.mean_keepdim(D::Minus1)?;
