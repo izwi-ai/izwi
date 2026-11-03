@@ -3293,6 +3293,7 @@ dependencies = [
  "flate2",
  "fs4",
  "futures",
+ "gemm",
  "half",
  "hex",
  "hound",
