@@ -1621,6 +1621,14 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Enables catalog-driven automatic prefix reuse per loaded model where evidence exists.",
     ),
     CoreEnvVar::new(
+        "IZWI_QWEN35_CHUNKED_GDN",
+        Flag,
+        "true",
+        Load,
+        "Kill switch: legacy/off disables the chunked DeltaNet prefill kernels for Qwen3.5.",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
         "IZWI_QWEN35_CUDA_GRAPH",
         Flag,
         "false",

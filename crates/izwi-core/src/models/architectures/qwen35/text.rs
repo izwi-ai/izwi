@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
@@ -15,6 +16,7 @@ use crate::backends::state::{
 use crate::error::{Error, Result};
 use crate::kernels::cuda::gdn::{self, GdnDecodeSpec};
 use crate::kernels::cuda::rope;
+use crate::kernels::cuda::{try_chunked_deltanet_recurrence, verify_chunked_deltanet};
 use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
     try_fused_silu_mul, try_qwen35_causal_conv_sequence, try_tiled_deltanet_recurrence,
@@ -43,6 +45,13 @@ use super::telemetry::Qwen35Telemetry;
 /// Environment switch that forces the Candle op chain for DeltaNet decode.
 const FUSED_DECODE_ENV: &str = "IZWI_QWEN35_FUSED_DECODE";
 
+/// Environment switch that keeps DeltaNet prefill on the sequential kernel.
+const CHUNKED_GDN_ENV: &str = "IZWI_QWEN35_CHUNKED_GDN";
+
+/// Shortest prefill span the chunked DeltaNet kernels take: below one
+/// 64-token chunk's worth of work the sequential kernel is as fast.
+const CHUNKED_GDN_MIN_TOKENS: usize = 32;
+
 #[path = "decode_graph.rs"]
 mod decode_graph;
 
@@ -61,6 +70,8 @@ pub struct Qwen35TextModel {
     /// Whole-step CUDA graph decode, when resolved (opt-in).
     decode_graph: Option<decode_graph::Qwen35DecodeGraph>,
     decode_graph_path: Qwen35FastPath,
+    /// Chunked DeltaNet prefill, resolved once for every DeltaNet layer.
+    gdn_prefill_path: Qwen35FastPath,
 }
 
 /// M-RoPE cos/sin for the token positions of one forward, shaped
@@ -422,6 +433,14 @@ struct Qwen35LinearAttention {
     kernel_size: usize,
     tiled_recurrence_enabled: bool,
     tiled_recurrence_tile_size_override: Option<usize>,
+    /// Prefill spans of [`CHUNKED_GDN_MIN_TOKENS`] or more take the chunked
+    /// recurrence, set only after its load-time self-check passes (see
+    /// [`Qwen35TextModel::resolve_chunked_gdn_prefill`]).
+    chunked_recurrence: bool,
+    /// Prefill spans the chunked kernels ran, and spans they declined (the
+    /// sequential kernel ran instead), for the diagnostics.
+    chunked_spans: AtomicU64,
+    chunked_fallbacks: AtomicU64,
     /// Fused single-token decode layout, set only after a load-time
     /// self-check passes (see [`Qwen35LinearAttention::resolve_fused_decode`]).
     fused_decode: Option<GdnDecodeSpec>,
@@ -568,6 +587,7 @@ impl Qwen35TextModel {
             max_context_tokens: cfg.context_length,
             decode_graph: None,
             decode_graph_path: Qwen35FastPath::legacy("unresolved"),
+            gdn_prefill_path: Qwen35FastPath::legacy("unresolved"),
         })
     }
 
@@ -611,7 +631,63 @@ impl Qwen35TextModel {
                 );
             }
         }
+        self.resolve_chunked_gdn_prefill();
         self.resolve_decode_graph(switches.graphs_off, allow_cpu);
+    }
+
+    /// Run DeltaNet prefill spans through the chunked recurrence kernels after
+    /// they match the sequential kernel on this device at the model's head
+    /// geometry. `IZWI_QWEN35_CHUNKED_GDN=legacy` keeps the sequential kernel.
+    fn resolve_chunked_gdn_prefill(&mut self) {
+        let geometry = self.layers.iter().find_map(|layer| match &layer.mixer {
+            Qwen35Mixer::Linear(linear) => {
+                Some((linear.num_v_heads, linear.head_k_dim, linear.head_v_dim))
+            }
+            Qwen35Mixer::Full(_) => None,
+        });
+        self.gdn_prefill_path = if legacy_requested(CHUNKED_GDN_ENV) {
+            Qwen35FastPath::legacy(format!("{CHUNKED_GDN_ENV}=legacy"))
+        } else if !self.device.is_cuda() {
+            Qwen35FastPath::legacy("chunked DeltaNet prefill runs on CUDA only")
+        } else {
+            match geometry {
+                None => Qwen35FastPath::legacy("the model has no DeltaNet layer"),
+                Some((heads, key_dim, value_dim)) => {
+                    match verify_chunked_deltanet(&self.device, heads, key_dim, value_dim) {
+                        Ok(()) => Qwen35FastPath::Fused,
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "Qwen3.5 chunked DeltaNet prefill self-check failed; keeping the sequential kernel"
+                            );
+                            Qwen35FastPath::legacy(format!("self-check failed: {error}"))
+                        }
+                    }
+                }
+            }
+        };
+        let chunked = self.gdn_prefill_path == Qwen35FastPath::Fused;
+        for layer in &mut self.layers {
+            if let Qwen35Mixer::Linear(linear) = &mut layer.mixer {
+                linear.chunked_recurrence = chunked;
+            }
+        }
+    }
+
+    /// Chunked DeltaNet prefill resolution, with the layer spans the chunked
+    /// kernels ran and declined, for the admin diagnostics.
+    pub(crate) fn gdn_prefill_summary(&self) -> serde_json::Value {
+        let (mut spans, mut fallbacks) = (0, 0);
+        for layer in &self.layers {
+            if let Qwen35Mixer::Linear(linear) = &layer.mixer {
+                spans += linear.chunked_spans.load(Relaxed);
+                fallbacks += linear.chunked_fallbacks.load(Relaxed);
+            }
+        }
+        let mut summary = summarize([&self.gdn_prefill_path]);
+        summary["chunked_layer_spans"] = spans.into();
+        summary["chunked_layer_fallbacks"] = fallbacks.into();
+        summary
     }
 
     /// Resolve whole-step CUDA graph decode after the fused paths it needs.
@@ -1866,6 +1942,9 @@ impl Qwen35LinearAttention {
             kernel_size: cfg.ssm_conv_kernel,
             tiled_recurrence_enabled: qwen35_tiled_recurrence_enabled(),
             tiled_recurrence_tile_size_override: qwen35_tiled_recurrence_tile_size_override(),
+            chunked_recurrence: false,
+            chunked_spans: AtomicU64::new(0),
+            chunked_fallbacks: AtomicU64::new(0),
             fused_decode: None,
             fused_decode_path: Qwen35FastPath::legacy("unresolved"),
         })
@@ -2417,7 +2496,8 @@ impl Qwen35LinearAttention {
         let g = g.reshape((1, seq_len, self.num_v_heads))?;
         let tile_size =
             qwen35_tiled_recurrence_tile_size(seq_len, self.tiled_recurrence_tile_size_override);
-        let fused_sequence = if self.tiled_recurrence_enabled {
+        let chunked_span = self.chunked_recurrence && seq_len >= CHUNKED_GDN_MIN_TOKENS;
+        let fused_sequence = if self.tiled_recurrence_enabled && !chunked_span {
             try_tiled_deltanet_recurrence(
                 &query,
                 &key,
@@ -2445,7 +2525,28 @@ impl Qwen35LinearAttention {
                     repeat_head_states_seq(&key, repeats)?,
                 )
             };
-            if self.tiled_recurrence_enabled {
+            let chunked = if chunked_span {
+                let chunked = try_chunked_deltanet_recurrence(
+                    &query,
+                    &key,
+                    &value,
+                    &g,
+                    &beta,
+                    &current_state,
+                );
+                let counter = if chunked.is_some() {
+                    &self.chunked_spans
+                } else {
+                    &self.chunked_fallbacks
+                };
+                counter.fetch_add(1, Relaxed);
+                chunked
+            } else {
+                None
+            };
+            if let Some(chunked) = chunked {
+                chunked
+            } else if self.tiled_recurrence_enabled {
                 if let Some(fused_sequence) = try_tiled_deltanet_recurrence(
                     &query,
                     &key,
@@ -3084,6 +3185,7 @@ mod tests {
     use candle_core::{DType, Device, IndexOp, Tensor};
     use candle_nn::rotary_emb;
     use std::collections::HashSet;
+    use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Barrier};
 
     fn tensor_storage_address(tensor: &Tensor) -> usize {
@@ -3148,6 +3250,9 @@ mod tests {
             kernel_size: 4,
             tiled_recurrence_enabled: false,
             tiled_recurrence_tile_size_override: None,
+            chunked_recurrence: false,
+            chunked_spans: AtomicU64::new(0),
+            chunked_fallbacks: AtomicU64::new(0),
             fused_decode: None,
             fused_decode_path: super::Qwen35FastPath::legacy("unresolved"),
         }
@@ -3396,6 +3501,9 @@ mod tests {
             kernel_size: 4,
             tiled_recurrence_enabled: false,
             tiled_recurrence_tile_size_override: None,
+            chunked_recurrence: false,
+            chunked_spans: AtomicU64::new(0),
+            chunked_fallbacks: AtomicU64::new(0),
             fused_decode: None,
             fused_decode_path: super::Qwen35FastPath::legacy("test"),
         };
