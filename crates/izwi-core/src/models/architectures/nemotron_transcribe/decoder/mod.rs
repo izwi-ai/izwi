@@ -10,6 +10,7 @@
 
 pub mod attention;
 mod graphs;
+pub mod lm_head;
 pub mod mamba;
 pub mod moe;
 pub mod state;
@@ -172,6 +173,8 @@ pub struct NemotronDecoder {
     pieces: Vec<Piece>,
     /// CUDA graphs of the fused step's stretches, or why there are none.
     graphs: std::result::Result<crate::kernels::cuda::stretch_graphs::StretchGraphs, String>,
+    /// Why a requested FP8 head stayed 16-bit.
+    lm_head_fallback: Option<String>,
 }
 
 impl NemotronDecoder {
@@ -226,12 +229,26 @@ impl NemotronDecoder {
             });
         }
         let head = checkpoint.f32_values("lm_head.weight", &[d.vocab, d.hidden])?;
-        let lm_head = match Residency::of(device) {
-            Residency::Cpu => NtLinear::q8_from_values(&head, d.vocab, d.hidden)?,
-            Residency::Metal => {
+        let mut lm_head_fallback = None;
+        let fp8_head = if lm_head::requested(device) {
+            match lm_head::quantize(&head, d.vocab, d.hidden, device)? {
+                Ok(linear) => Some(linear),
+                Err(reason) => {
+                    tracing::warn!("Nemotron 3.5 Transcribe keeps its 16-bit LM head: {reason}");
+                    lm_head_fallback = Some(reason);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let lm_head = match (fp8_head, Residency::of(device)) {
+            (Some(linear), _) => linear,
+            (None, Residency::Cpu) => NtLinear::q8_from_values(&head, d.vocab, d.hidden)?,
+            (None, Residency::Metal) => {
                 NtLinear::dense_from_values(head, d.vocab, d.hidden, device, DType::F16)?
             }
-            Residency::Cuda => {
+            (None, Residency::Cuda) => {
                 NtLinear::dense_from_values(head, d.vocab, d.hidden, device, DType::BF16)?
             }
         };
@@ -286,7 +303,23 @@ impl NemotronDecoder {
             lm_head,
             config: d.clone(),
             device: device.clone(),
+            lm_head_fallback,
         })
+    }
+
+    /// The LM head's resident form, and why a requested FP8 head stayed
+    /// 16-bit.
+    pub fn lm_head_diagnostics(&self) -> serde_json::Value {
+        let form = if self.lm_head.is_fp8() {
+            "fp8"
+        } else {
+            match Residency::of(&self.device) {
+                Residency::Cpu => "q8_0",
+                Residency::Metal => "f16",
+                Residency::Cuda => "bf16",
+            }
+        };
+        serde_json::json!({ "form": form, "fp8_fallback": self.lm_head_fallback })
     }
 
     pub fn config(&self) -> &NemotronDecoderConfig {

@@ -245,6 +245,41 @@ impl NtLinear {
         })
     }
 
+    /// A GPU layer from block-FP8 `bytes` (`[rows, cols]`) and one F32
+    /// scale per 128x128 block, already whole tiles of the FP8 kernels
+    /// (`rows % 64 == 0`, `cols % 128 == 0`): a quantized head.
+    pub fn fp8_from_blocks(
+        bytes: Vec<u8>,
+        scales: Vec<f32>,
+        rows: usize,
+        cols: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        if device.is_cpu()
+            || !rows.is_multiple_of(64)
+            || !cols.is_multiple_of(128)
+            || bytes.len() != rows * cols
+            || scales.len() != rows.div_ceil(128) * cols.div_ceil(128)
+        {
+            return Err(load_error(format!(
+                "a block-FP8 GPU linear needs whole 64x128 tiles; [{rows}, {cols}]"
+            )));
+        }
+        Ok(Self {
+            weight: Weight::Fp8 {
+                bytes: Tensor::from_vec(bytes, (rows, cols), device)?,
+                scales: Tensor::from_vec(scales, (rows.div_ceil(128), cols.div_ceil(128)), device)?,
+            },
+            bias: None,
+            out_features: rows,
+            in_features: cols,
+            padded_out: rows,
+            padded_in: cols,
+            input_scale: None,
+            weight_scale: None,
+        })
+    }
+
     /// The BF16 linear `module` as a dense layer (F32 on CPU and Metal,
     /// BF16 on CUDA), with an optional BF16 `bias`.
     pub fn load_dense(

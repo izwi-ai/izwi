@@ -561,6 +561,15 @@ The family's knobs, in [`env/core.md`](env/core.md):
 - `IZWI_NEMOTRON_TRANSCRIBE_DECODE_QUANTUM` (read at load): the most
   decode steps a row runs per engine quantum while no request waits, 1 to
   64. Defaults to 8 on Metal and CUDA and 4 on CPU.
+- `IZWI_NEMOTRON_TRANSCRIBE_FP8_LM_HEAD` (read at load, off by default):
+  quantizes the language-model head to block FP8 on Metal and CUDA (704 to
+  352 MB, about a tenth of a decode step's weight reads) and runs it
+  through the FP8 GEMVs. A host quality gate (FP8 against exact logits on
+  probe rows) and a device check guard it; either failure keeps the 16-bit
+  head, and `lm_head` in the diagnostics gives the form and the reason, so
+  admission keeps pricing the 16-bit head. FP8 logits can swap a greedy pick
+  between near-tied tokens, so it stays off until a quality run on real
+  audio clears it.
 - `IZWI_NEMOTRON_TRANSCRIBE_FP8_MODE` (read at load): `w8a16` (default) or
   `vllm-fp8`. Anything else fails the load.
 - `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN` (read at load): the most prompt

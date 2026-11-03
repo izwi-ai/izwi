@@ -1320,6 +1320,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Most decode steps one Nemotron 3.5 Transcribe row runs per engine quantum while no request waits (1 to 64); values outside that range are ignored.",
     ),
     CoreEnvVar::new(
+        "IZWI_NEMOTRON_TRANSCRIBE_FP8_LM_HEAD",
+        Flag,
+        "off",
+        Load,
+        "Quantizes the Nemotron 3.5 Transcribe LM head to block FP8 on Metal and CUDA (704 to 352 MB); a failed quality or device check keeps the 16-bit head.",
+    ),
+    CoreEnvVar::new(
         "IZWI_NEMOTRON_TRANSCRIBE_FP8_MODE",
         Choice,
         "w8a16",

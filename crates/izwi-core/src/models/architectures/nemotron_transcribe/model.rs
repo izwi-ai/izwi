@@ -790,6 +790,7 @@ impl NemotronTranscribeModel {
             "host_readbacks": super::speech_transformer::host_readbacks(),
             "fp8_decode_kernel": self.fp8_decode_kernel(),
             "decode_graphs": self.decoder.graph_diagnostics(),
+            "lm_head": self.decoder.lm_head_diagnostics(),
             "decode_path": match self.decoder.decode_path() {
                 super::decoder::DecodePath::Fused { check } => {
                     json!({"path": "fused", "kernel_check": check})
