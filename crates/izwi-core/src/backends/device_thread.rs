@@ -2,12 +2,15 @@
 //!
 //! Candle's Metal device shares command-buffer state between the threads that
 //! use it: two threads driving one device read back wrong tokens. CUDA work
-//! runs on the calling thread's default stream, and cudarc binds the context
-//! of a freed buffer through event waits on whatever thread drops it. Device
-//! work spread over tokio workers, load tasks and blocking threads is therefore
-//! wrong on Metal and fragile on CUDA. Every device operation (model execution,
-//! KV page zero/copy, offload capture/restore, load, warm-up and unload drops)
-//! runs as a job on its device's thread instead.
+//! runs on the calling thread's default stream, and with one stream cudarc
+//! frees a dropped buffer on the dropping thread without binding its context:
+//! on a thread that never ran CUDA work the free fails, and the driver error
+//! it leaves on the context fails the next device call anywhere
+//! (`CUDA_ERROR_INVALID_CONTEXT`). Device work spread over tokio workers, load
+//! tasks and blocking threads is therefore wrong on Metal and fragile on CUDA.
+//! Every device operation (model execution, KV page zero/copy, offload
+//! capture/restore, pending-quantum commits and aborts, load, warm-up and
+//! unload drops) runs as a job on its device's thread instead.
 //!
 //! The thread for a device lives as long as the process: two threads must
 //! never drive one device, not even while a retiring thread drains its queue

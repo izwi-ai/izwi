@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, DeviceLocation, Tensor};
 
+use crate::backends::DeviceThread;
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     InferenceStateContract, ResolvedNonPagedDomainPlan, ResolvedStatePlan, ResolvedTensorComponent,
@@ -200,15 +201,34 @@ impl CommittedBacking {
 /// Committed state the arena no longer holds (replaced by a commit, or
 /// released). Dropping it can free device memory, so an owner that records
 /// committed backing on a resource lease reconciles first and drops this
-/// afterwards.
+/// afterwards. On CUDA it frees on the device's thread: the engine commits
+/// on tokio workers, and a buffer freed on one that never ran CUDA work
+/// fails there and leaves the driver error on the context for the next
+/// device call (`CUDA_ERROR_INVALID_CONTEXT`).
 pub(crate) struct RetiredTensorState {
-    _domains: Vec<StateDomainSnapshot>,
+    device: DeviceLocation,
+    domains: Vec<StateDomainSnapshot>,
 }
 
 impl RetiredTensorState {
-    fn new(domains: impl IntoIterator<Item = StateDomainSnapshot>) -> Self {
+    fn new(device: &Device, domains: impl IntoIterator<Item = StateDomainSnapshot>) -> Self {
         Self {
-            _domains: domains.into_iter().collect(),
+            device: device.location(),
+            domains: domains.into_iter().collect(),
+        }
+    }
+}
+
+impl Drop for RetiredTensorState {
+    fn drop(&mut self) {
+        let domains = std::mem::take(&mut self.domains);
+        if domains.is_empty() || !matches!(self.device, DeviceLocation::Cuda { .. }) {
+            return;
+        }
+        // Inline on the device thread itself; a job its thread cannot run
+        // is dropped, with the buffers, here.
+        if let Ok(thread) = DeviceThread::for_location(self.device) {
+            let _ = thread.run_sync(move || drop(domains));
         }
     }
 }
@@ -794,7 +814,10 @@ impl TensorStateArena {
             .for_each(|s| committed.retain(s));
         live.domains.values().for_each(|s| committed.forget(s));
         let retired = std::mem::replace(live, staged.state);
-        Ok(RetiredTensorState::new(retired.domains.into_values()))
+        Ok(RetiredTensorState::new(
+            &self.device,
+            retired.domains.into_values(),
+        ))
     }
 
     /// Seal the exact selected-group completion after all selected domains have
@@ -880,7 +903,7 @@ impl TensorStateArena {
                 }
             }
         }
-        Ok(RetiredTensorState::new(retired))
+        Ok(RetiredTensorState::new(&self.device, retired))
     }
 
     fn resolve_selections(
@@ -944,7 +967,10 @@ impl TensorStateArena {
             .domains
             .values()
             .for_each(|snapshot| state.committed.forget(snapshot));
-        Ok(RetiredTensorState::new(released.domains.into_values()))
+        Ok(RetiredTensorState::new(
+            &self.device,
+            released.domains.into_values(),
+        ))
     }
 
     pub(crate) fn validate_release(&self, sequence: PhysicalStateSequenceId) -> Result<()> {
@@ -1132,6 +1158,41 @@ mod tests {
         StateGroupId, StateGroupSpec, StateScope, TensorComponentSpec, TensorRole,
         TensorStateDomainSpec, CURRENT_INFERENCE_STATE_ABI,
     };
+
+    /// The engine commits on tokio workers, which may never have run CUDA
+    /// work, and cudarc frees a single-stream buffer on the dropping thread
+    /// without binding its context. Retired state therefore frees on the
+    /// device thread: dropped on a fresh thread, it latches no CUDA error.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_retired_state_drops_cleanly_on_threads_without_the_context() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let context = device
+            .as_cuda_device()
+            .unwrap()
+            .cuda_stream()
+            .context()
+            .clone();
+        context
+            .check_err()
+            .expect("no error latched before the drop");
+        let retired = RetiredTensorState::new(
+            &device,
+            [StateDomainSnapshot {
+                cursor: 1,
+                components: Arc::from([StateComponentValue {
+                    component: StateComponentId::new(1),
+                    tensor: Some(Tensor::zeros(1024, DType::F32, &device).unwrap()),
+                }]),
+            }],
+        );
+        std::thread::spawn(move || drop(retired)).join().unwrap();
+        context
+            .check_err()
+            .expect("retired state dropped on a fresh thread must not latch a CUDA error");
+    }
 
     fn contract() -> InferenceStateContract {
         InferenceStateContract {
@@ -1863,7 +1924,7 @@ mod tests {
         let replacement = component(1, &[3.0; 8]);
         let replacement_bytes = backing_bytes(replacement.tensor.as_ref().unwrap());
         let retired = commit(3, select(1, StateClock::DecoderTokens, 1), 1, replacement);
-        assert_eq!(retired._domains.len(), 1);
+        assert_eq!(retired.domains.len(), 1);
         assert_eq!(
             arena.committed_backing_bytes().unwrap(),
             replacement_bytes + audio_bytes
