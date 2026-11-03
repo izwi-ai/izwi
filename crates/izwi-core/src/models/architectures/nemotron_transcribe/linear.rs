@@ -25,6 +25,7 @@ use super::checkpoint::{Fp8Weight, NemotronCheckpoint};
 use super::precision::Fp8Mode;
 use crate::error::{Error, Result};
 use crate::kernels::cuda::fp8::{self, Fp8Epilogue};
+use crate::kernels::metal_fp8_gemm;
 
 /// CPU prefill expands Q8_0 weights in tiles of this many rows above
 /// [`CPU_TILE_MIN_ROWS`] activation rows.
@@ -408,6 +409,15 @@ impl NtLinear {
                             bytes,
                             scales,
                         )?,
+                        Pass::Span
+                            if metal_fp8_gemm::supported(
+                                bytes.device(),
+                                self.padded_out,
+                                self.padded_in,
+                            ) =>
+                        {
+                            metal_fp8_gemm::block_gemm(&x.contiguous()?, bytes, scales)?
+                        }
                         Pass::Span => {
                             let w = crate::kernels::metal_fp8::dequantize_f16(bytes, scales)?
                                 .to_dtype(DType::F32)?;

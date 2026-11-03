@@ -21,6 +21,7 @@ pub mod metal;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_encoder;
 pub mod metal_fp8;
+pub mod metal_fp8_gemm;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_kquant_mv;
 #[cfg(feature = "metal")]

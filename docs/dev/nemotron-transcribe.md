@@ -175,6 +175,14 @@ other FP8 linears with zeros, which is exact; the stacked routed experts need
 no padding. Metal keeps F32 activations so relu² expert intermediates never
 meet F16's range.
 
+A prefill span multiplies FP8 weights without expanding them on Metal: the
+tiled simdgroup GEMM in `kernels/metal_fp8_gemm.rs` decodes each 64x32 weight
+tile in threadgroup memory to exactly the value the F16 expansion would hold.
+That covers the decoder's and the speech encoder's FP8 linears whose input
+width is a multiple of 32 (all of the published ones); 1.5x faster than the
+expansion at the published span shapes. CUDA multiplies tiles dequantized to
+BF16 through cuBLAS.
+
 FP8 linears run W8A16 by default (`IZWI_NEMOTRON_TRANSCRIBE_FP8_MODE=w8a16`):
 the checkpoint's weights exactly (`decode(byte) * weight_scale`), unquantized
 activations and a dense KV cache. That is also what vLLM's Marlin path computes
@@ -199,12 +207,15 @@ decode step has no host synchronization inside the MoE block.
   pair, or expert-major once a call has 32 or more pairs. Both sum each dot
   product in the same order, so they agree bit for bit and a row's output does
   not depend on how many rows share the step.
-- **Long prefill spans** (`uses_gemm`: at least 64 tokens and 16 routed pairs
-  per expert, so 342 or more tokens here) read the routing once and run each
-  touched expert as two dense GEMMs on its weights dequantized just for that
-  call (F32 on Metal, BF16 on CUDA). Warp kernels cannot match a tiled GEMM
-  once each expert has many tokens. CUDA's 2,048-token and Metal's 512-token
-  spans take this path; the crossover was measured on Metal only.
+- **Long prefill spans** (`uses_gemm`: at least 64 tokens and enough routed
+  pairs per expert, 5 on Metal and 16 on CUDA, so 107 or more tokens on Metal
+  and 342 or more on CUDA here) read the routing once. Metal then runs every
+  touched expert in two tiled launches that read the FP8 bytes in place
+  (`kernels/metal_fp8_gemm.rs`; relu² and the combine weights ride the
+  epilogues). CUDA runs each touched expert as two dense GEMMs on its weights
+  dequantized to BF16 just for that call. Warp kernels cannot match a tiled
+  GEMM once each expert has many tokens; both crossovers were measured on
+  Metal.
 - **CPU and `vllm-fp8`** keep the per-expert loop: routing read to the host
   every layer, then each expert's tokens through its own FP8 linear pair.
 
