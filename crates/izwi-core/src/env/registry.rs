@@ -378,6 +378,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "The published codec.pth (Fish Audio Drama 3's, byte-identical to Fish S2 Pro's) for the ignored real-codec tests: the cross-family bit-identity test and the CUDA streaming test.",
     ),
     CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_CPU_F16_KV",
+        Flag,
+        "off",
+        Load,
+        "Stores the Fish Audio Drama 3 paged KV as F16 on the CPU (94 to 47 KiB per position); attention still accumulates in F32.",
+    ),
+    CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_DTYPE",
         Choice,
         "the backend's (f16 on Metal, bf16 on CUDA, f32 on CPU)",
@@ -1311,6 +1318,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "cpu",
         TestHarness,
         "Backend for the Nemotron 3.5 Transcribe L2 parity test: cpu, metal or cuda (the build must have that feature).",
+    ),
+    CoreEnvVar::new(
+        "IZWI_NEMOTRON_TRANSCRIBE_CPU_F16_KV",
+        Flag,
+        "off",
+        Load,
+        "Stores the Nemotron 3.5 Transcribe paged KV as F16 on the CPU (12 to 6 KiB per token); attention still accumulates in F32.",
     ),
     CoreEnvVar::new(
         "IZWI_NEMOTRON_TRANSCRIBE_DECODE_QUANTUM",

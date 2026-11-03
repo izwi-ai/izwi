@@ -131,6 +131,41 @@ fn a_request_transcribes_deterministically_through_retained_spans() {
     assert!(model.diagnostics_summary()["decode_ms"].as_f64().unwrap() >= timing.decode_ms);
 }
 
+/// The CPU's opt-in F16 KV (`IZWI_NEMOTRON_TRANSCRIBE_CPU_F16_KV`): a row
+/// over F16 pages transcribes, its tokens mostly those of F32 pages.
+#[test]
+fn a_row_transcribes_over_f16_pages_on_the_cpu() {
+    let dir = temp_checkpoint();
+    let model = NemotronTranscribeModel::load_on(dir.path(), None, &Device::Cpu).unwrap();
+    let audio = test_audio(2.5, 1);
+    let a = model.decoder().config().attention;
+    let mut f16 = test_physical_caches_for_model_layers_on(
+        &Device::Cpu,
+        DType::F16,
+        model.decoder().attention_layers(),
+        a.kv_heads,
+        a.head_dim,
+        1024,
+        1,
+    )
+    .remove(0);
+    let half = model
+        .transcribe_with_cache(&audio, request(12), &mut f16, 64)
+        .unwrap();
+    let mut f32 = caches(&Device::Cpu, &model, 1, 1024).remove(0);
+    let full = model
+        .transcribe_with_cache(&audio, request(12), &mut f32, 64)
+        .unwrap();
+    assert!(!half.transcript.raw.is_empty());
+    assert_eq!(half.prompt_tokens, full.prompt_tokens);
+    let (a, b) = (
+        half.transcript.raw.split_whitespace().collect::<Vec<_>>(),
+        full.transcript.raw.split_whitespace().collect::<Vec<_>>(),
+    );
+    let same = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    assert!(same >= b.len().min(a.len()) / 2, "{a:?} vs {b:?}");
+}
+
 /// The first decode logits after prefilling in spans of different sizes
 /// stay within float tolerance of each other (the span boundary moves the
 /// SSM chunking and the attention prefix).

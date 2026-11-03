@@ -78,11 +78,19 @@ fn as_u32(value: usize, what: &str) -> Result<u32> {
     u32::try_from(value).map_err(|_| contract_error(format!("{what} exceeds u32")))
 }
 
-/// The paged KV dtype a load on `backend` plans (§6): F32 on the CPU, F16
-/// on Metal, BF16 on CUDA (priced, not loaded yet). A Metal load whose
-/// self-check breached stores F32 instead (`FishDrama3Model::kv_dtype`).
+/// Opt-in F16 paged KV on the CPU (`1`, `on`, `true`; read at load): half
+/// the KV bytes (94 to 47 KiB per position). K, V and the queries round to
+/// F16 when written; attention still accumulates in F32. Off by default
+/// until a quality run clears it.
+pub const CPU_F16_KV_ENV: &str = "IZWI_FISH_DRAMA3_CPU_F16_KV";
+
+/// The paged KV dtype a load on `backend` plans (§6): F32 on the CPU (F16
+/// under [`CPU_F16_KV_ENV`]), F16 on Metal, BF16 on CUDA (priced, not loaded
+/// yet). A Metal load whose self-check breached stores F32 instead
+/// (`FishDrama3Model::kv_dtype`).
 pub fn kv_dtype(backend: BackendKind) -> DType {
     match backend {
+        BackendKind::Cpu if crate::env::flag_or(CPU_F16_KV_ENV, false) => DType::F16,
         BackendKind::Cpu => DType::F32,
         BackendKind::Metal => DType::F16,
         BackendKind::Cuda => DType::BF16,

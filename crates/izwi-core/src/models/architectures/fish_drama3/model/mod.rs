@@ -240,6 +240,9 @@ pub struct FishDrama3ModelOptions {
     /// BF16 on CUDA, F32 on the CPU), `Some(F32)` for F32 throughout on
     /// Metal (`IZWI_FISH_DRAMA3_DTYPE`).
     pub activations: Option<DType>,
+    /// The CPU's paged KV dtype: F32, or F16 under
+    /// `IZWI_FISH_DRAMA3_CPU_F16_KV` (`physical::kv_dtype`).
+    pub cpu_kv_dtype: DType,
 }
 
 impl Default for FishDrama3ModelOptions {
@@ -250,15 +253,17 @@ impl Default for FishDrama3ModelOptions {
             prefill_span_rows: DEFAULT_PREFILL_SPAN_ROWS,
             config_policy: FishDrama3ConfigPolicy::Published,
             activations: None,
+            cpu_kv_dtype: DType::F32,
         }
     }
 }
 
 impl FishDrama3ModelOptions {
     /// The defaults with the load-time environment over them for a load on
-    /// `residency`: `IZWI_FISH_DRAMA3_DTYPE`, `IZWI_FISH_DRAMA3_MOE_BACKEND`
-    /// and `IZWI_FISH_DRAMA3_PREFILL_SPAN` (over `prefill_span_rows`, the
-    /// backend's default cell), each validated.
+    /// `residency`: `IZWI_FISH_DRAMA3_DTYPE`, `IZWI_FISH_DRAMA3_MOE_BACKEND`,
+    /// `IZWI_FISH_DRAMA3_PREFILL_SPAN` (over `prefill_span_rows`, the
+    /// backend's default cell) and `IZWI_FISH_DRAMA3_CPU_F16_KV`, each
+    /// validated.
     pub fn from_env(residency: FishDrama3Residency, prefill_span_rows: usize) -> Result<Self> {
         let read = |name: &str| std::env::var(name).ok();
         Ok(Self {
@@ -274,6 +279,7 @@ impl FishDrama3ModelOptions {
                 residency,
                 read(super::precision::DTYPE_ENV).as_deref(),
             )?),
+            cpu_kv_dtype: super::physical::kv_dtype(crate::backends::BackendKind::Cpu),
             ..Self::default()
         })
     }
@@ -883,6 +889,12 @@ impl FishDrama3Model {
         let residency = FishDrama3Residency::of(device);
         residency.require_supported(device)?;
         let activations = check_activations(residency, options.activations)?;
+        if !matches!(options.cpu_kv_dtype, DType::F32 | DType::F16) {
+            return Err(Error::ModelLoadError(format!(
+                "Fish Audio Drama 3 keeps the CPU's KV in F32 or F16, not {:?}",
+                options.cpu_kv_dtype
+            )));
+        }
         let embedding = FishDrama3Embedding::load_on(&checkpoint, &config, device)?;
         let mut trunk = FishDrama3Trunk::load(&checkpoint, &config, device, options.trunk)?;
         let mut tower = FishDrama3Tower::load(&checkpoint, &config, device, options.tower)?;
@@ -904,7 +916,7 @@ impl FishDrama3Model {
                 let checks = super::cuda::self_check::run(&checkpoint, &config, &mut trunk)?;
                 (DType::BF16, None, Some(checks))
             }
-            FishDrama3Residency::Cpu => (DType::F32, None, None),
+            FishDrama3Residency::Cpu => (options.cpu_kv_dtype, None, None),
         };
         let decode_path = (residency != FishDrama3Residency::Cpu)
             .then(|| FishDrama3DecodePath::select(device, &config));

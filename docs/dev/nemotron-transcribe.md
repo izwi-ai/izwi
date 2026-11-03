@@ -558,6 +558,10 @@ are missing; a pass without them proves nothing.
 
 The family's knobs, in [`env/core.md`](env/core.md):
 
+- `IZWI_NEMOTRON_TRANSCRIBE_CPU_F16_KV` (read at load, off by default):
+  stores the CPU's paged KV as F16 instead of F32 (12 to 6 KiB per token).
+  K, V and the queries round to F16 when written; attention still
+  accumulates in F32.
 - `IZWI_NEMOTRON_TRANSCRIBE_DECODE_QUANTUM` (read at load): the most
   decode steps a row runs per engine quantum while no request waits, 1 to
   64. Defaults to 8 on Metal and CUDA and 4 on CPU.

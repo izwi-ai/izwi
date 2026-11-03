@@ -183,6 +183,10 @@ backend's report:
   check leaves the grouped MoE on its warp kernels. A GPU older than SM80 is
   refused before any weight is read.
 
+`IZWI_FISH_DRAMA3_CPU_F16_KV=1` stores the CPU's paged KV as F16 instead of
+F32 (94 to 47 KiB per position; read at load, off by default). K, V and the
+queries round to F16 when written; attention still accumulates in F32.
+
 `IZWI_FISH_DRAMA3_MOE_BACKEND=loop` runs the routed experts as a host-routed
 loop of one FP8 GEMV pair per expert on Metal and CUDA, for diagnosis.
 
