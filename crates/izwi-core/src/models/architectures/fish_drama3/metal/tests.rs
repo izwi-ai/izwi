@@ -70,10 +70,14 @@ fn metal_trunk_tracks_the_cpu_reference() {
         .trunk()
         .forward_span(&embed_cpu, 0, &mut cpu_state, &mut cpu_cache)
         .unwrap();
+    let spans = super::super::device::fish_drama3_recurrent_deltanet_spans();
     let b = metal
         .trunk()
         .forward_span(&embed_metal, 0, &mut metal_state, &mut metal_cache)
         .unwrap();
+    // Every DeltaNet layer took the span kernels.
+    let linear = cpu.config().trunk.linear_attention_layers().len() as u64;
+    assert!(super::super::device::fish_drama3_recurrent_deltanet_spans() - spans >= linear);
     let error = relative_l2(&host(&b), &host(&a));
     eprintln!("trunk span: {error:.3e}");
     assert!(error < TRUNK_TOLERANCE, "span: {error:.3e}");

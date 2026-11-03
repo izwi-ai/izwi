@@ -145,28 +145,19 @@ pub fn recurrent_decode(
     state: &Tensor,
     spec: &GdnDecodeSpec,
 ) -> Result<(Tensor, Tensor)> {
-    spec.validate()?;
+    recurrent_contract(
+        conv,
+        z,
+        beta_raw,
+        alpha,
+        dt_bias,
+        a,
+        norm_weight,
+        state,
+        spec,
+    )?;
     let (hv, d) = (spec.value_heads, HEAD_DIM);
     let dtype = z.dtype();
-    if conv.elem_count() != spec.conv_dim()
-        || conv.dtype() != DType::F32
-        || z.elem_count() != hv * d
-        || beta_raw.elem_count() != hv
-        || alpha.elem_count() != hv
-        || beta_raw.dtype() != dtype
-        || alpha.dtype() != dtype
-        || !matches!(dtype, DType::F32 | DType::F16 | DType::BF16)
-        || dt_bias.elem_count() != hv
-        || a.elem_count() != hv
-        || dt_bias.dtype() != DType::F32
-        || a.dtype() != DType::F32
-        || norm_weight.dims() != [d]
-        || norm_weight.dtype() != DType::F32
-        || state.elem_count() != hv * d * d
-        || state.dtype() != DType::F32
-    {
-        candle_core::bail!("invalid DeltaNet recurrent decode contract for {spec:?}")
-    }
     #[cfg(feature = "cuda")]
     if conv.device().is_cuda() {
         return cuda_impl::recurrent(
@@ -213,6 +204,172 @@ pub fn recurrent_decode(
         Tensor::from_vec(y, hv * d, conv.device())?.to_dtype(dtype)?,
         Tensor::from_vec(next, (1, hv, d, d), conv.device())?,
     ))
+}
+
+/// The contract of one token's [`recurrent_decode`] inputs.
+#[allow(clippy::too_many_arguments)]
+fn recurrent_contract(
+    conv: &Tensor,
+    z: &Tensor,
+    beta_raw: &Tensor,
+    alpha: &Tensor,
+    dt_bias: &Tensor,
+    a: &Tensor,
+    norm_weight: &Tensor,
+    state: &Tensor,
+    spec: &GdnDecodeSpec,
+) -> Result<()> {
+    spec.validate()?;
+    let (hv, d) = (spec.value_heads, HEAD_DIM);
+    let dtype = z.dtype();
+    if conv.elem_count() != spec.conv_dim()
+        || conv.dtype() != DType::F32
+        || z.elem_count() != hv * d
+        || beta_raw.elem_count() != hv
+        || alpha.elem_count() != hv
+        || beta_raw.dtype() != dtype
+        || alpha.dtype() != dtype
+        || !matches!(dtype, DType::F32 | DType::F16 | DType::BF16)
+        || dt_bias.elem_count() != hv
+        || a.elem_count() != hv
+        || dt_bias.dtype() != DType::F32
+        || a.dtype() != DType::F32
+        || norm_weight.dims() != [d]
+        || norm_weight.dtype() != DType::F32
+        || state.elem_count() != hv * d * d
+        || state.dtype() != DType::F32
+    {
+        candle_core::bail!("invalid DeltaNet recurrent decode contract for {spec:?}")
+    }
+    Ok(())
+}
+
+/// Whether [`conv_span`] and [`recurrent_span`] run on `device`'s kernels:
+/// Metal (CUDA prefills long spans with the chunked kernels instead). The
+/// CPU references run anywhere.
+pub fn span_supported(device: &Device) -> bool {
+    matches!(device, Device::Metal(_)) && cfg!(feature = "metal")
+}
+
+/// [`conv_decode`] over a span: `x` `[tokens, conv_dim]`, history the three
+/// slots before the span (oldest first). Returns `(silu(conv) [tokens,
+/// conv_dim] F32, next history [3, conv_dim] F32)`. Each token's arithmetic
+/// is [`conv_decode`]'s, so the span equals the token loop bit for bit.
+pub fn conv_span(x: &Tensor, weight: &Tensor, history: [&Tensor; 3]) -> Result<(Tensor, Tensor)> {
+    let (tokens, conv_dim) = x.dims2()?;
+    if tokens == 0
+        || weight.dims() != [conv_dim, CONV_TAPS]
+        || weight.dtype() != DType::F32
+        || history
+            .iter()
+            .any(|slot| slot.elem_count() != conv_dim || slot.dtype() != DType::F32)
+        || !matches!(x.dtype(), DType::F32 | DType::F16)
+    {
+        candle_core::bail!(
+            "invalid DeltaNet conv span contract: x {:?} {:?}, weight {:?}",
+            x.dims(),
+            x.dtype(),
+            weight.dims()
+        )
+    }
+    #[cfg(feature = "metal")]
+    if x.device().is_metal() {
+        return crate::kernels::metal_qwen36moe::gdn_conv_span(
+            x, weight, history, conv_dim, tokens,
+        );
+    }
+    if !x.device().is_cpu() {
+        candle_core::bail!("DeltaNet conv span has no implementation for this device")
+    }
+    let mut slots = [history[0].clone(), history[1].clone(), history[2].clone()];
+    let mut outputs = Vec::with_capacity(tokens);
+    for t in 0..tokens {
+        let (out, next) = conv_decode(&x.get(t)?, weight, [&slots[0], &slots[1], &slots[2]])?;
+        slots = [next.get(0)?, next.get(1)?, next.get(2)?];
+        outputs.push(out);
+    }
+    Ok((Tensor::stack(&outputs, 0)?, Tensor::stack(&slots, 0)?))
+}
+
+/// [`recurrent_decode`] over a span: `conv` `[tokens, conv_dim]` from
+/// [`conv_span`], `z` `[tokens, value_heads * 128]`, `beta_raw` and `alpha`
+/// `[tokens, value_heads]` in `z`'s dtype; the other inputs as
+/// [`recurrent_decode`]'s. Returns `(y [tokens, value_heads * 128] in z's
+/// dtype, next state [1, Hv, 128, 128] F32)`. The kernel holds each head's
+/// state in registers from token to token and does each token's arithmetic
+/// exactly as [`recurrent_decode`], so the span equals the token loop bit
+/// for bit.
+#[allow(clippy::too_many_arguments)]
+pub fn recurrent_span(
+    conv: &Tensor,
+    z: &Tensor,
+    beta_raw: &Tensor,
+    alpha: &Tensor,
+    dt_bias: &Tensor,
+    a: &Tensor,
+    norm_weight: &Tensor,
+    state: &Tensor,
+    spec: &GdnDecodeSpec,
+) -> Result<(Tensor, Tensor)> {
+    spec.validate()?;
+    let (hv, d) = (spec.value_heads, HEAD_DIM);
+    let (tokens, conv_dim) = conv.dims2()?;
+    if tokens == 0
+        || conv_dim != spec.conv_dim()
+        || z.dims() != [tokens, hv * d]
+        || beta_raw.dims() != [tokens, hv]
+        || alpha.dims() != [tokens, hv]
+    {
+        candle_core::bail!("invalid DeltaNet recurrent span contract for {spec:?}")
+    }
+    #[cfg(feature = "metal")]
+    if conv.device().is_metal() {
+        // The per-token contract checks dtypes and the other shapes.
+        recurrent_contract(
+            &conv.get(0)?,
+            &z.get(0)?,
+            &beta_raw.get(0)?,
+            &alpha.get(0)?,
+            dt_bias,
+            a,
+            norm_weight,
+            state,
+            spec,
+        )?;
+        return crate::kernels::metal_qwen36moe::gdn_decode_span(
+            conv,
+            z,
+            beta_raw,
+            alpha,
+            dt_bias,
+            a,
+            norm_weight,
+            state,
+            spec,
+            tokens,
+        );
+    }
+    if !conv.device().is_cpu() {
+        candle_core::bail!("DeltaNet recurrent span has no implementation for this device")
+    }
+    let mut state = state.clone();
+    let mut outputs = Vec::with_capacity(tokens);
+    for t in 0..tokens {
+        let (y, next) = recurrent_decode(
+            &conv.get(t)?,
+            &z.get(t)?,
+            &beta_raw.get(t)?,
+            &alpha.get(t)?,
+            dt_bias,
+            a,
+            norm_weight,
+            &state,
+            spec,
+        )?;
+        state = next;
+        outputs.push(y);
+    }
+    Ok((Tensor::stack(&outputs, 0)?, state))
 }
 
 /// Where a CUDA-graph decode step finds one layer's state: `table[slot..slot +
@@ -874,6 +1031,101 @@ mod tests {
         assert_eq!(host(&history_out), host(&history));
         assert_eq!(host(&y_t), host(&y));
         assert_eq!(host(&state_out), host(&next));
+    }
+
+    /// The span kernels against the token-by-token kernels on Metal: the
+    /// same bits for outputs, the ring and the state, in both head orders and
+    /// both input dtypes.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_spans_equal_the_token_loop_bit_for_bit() {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_spans_equal_the_token_loop_bit_for_bit",
+        ) else {
+            return;
+        };
+        assert!(span_supported(&device));
+        let d = HEAD_DIM;
+        let tokens = 37;
+        for (grouped, act) in [(true, DType::F16), (false, DType::F32), (true, DType::F32)] {
+            let spec = GdnDecodeSpec {
+                key_heads: 2,
+                value_heads: 4,
+                grouped,
+                norm_eps: 1e-6,
+            };
+            let (hv, conv_dim) = (spec.value_heads, spec.conv_dim());
+            let on = |v: Vec<f32>, shape: &[usize]| Tensor::from_vec(v, shape, &device).unwrap();
+            let x = on(values(tokens * conv_dim, 1.0, 2.0), &[tokens, conv_dim])
+                .to_dtype(act)
+                .unwrap();
+            let w = on(values(conv_dim * 4, 2.0, 0.5), &[conv_dim, 4]);
+            let h: Vec<Tensor> = (0..3)
+                .map(|i| on(values(conv_dim, 9.0 + i as f32, 1.0), &[conv_dim]))
+                .collect();
+            let z = on(values(tokens * hv * d, 5.0, 2.0), &[tokens, hv * d]);
+            let beta = on(values(tokens * hv, 6.0, 2.0), &[tokens, hv]);
+            let alpha = on(values(tokens * hv, 7.0, 3.0), &[tokens, hv]);
+            let dt = on(values(hv, 8.0, 1.0), &[hv]);
+            let a = on(
+                values(hv, 9.0, 1.0).iter().map(|v| -v.exp()).collect(),
+                &[hv],
+            );
+            let norm = on(values(d, 10.0, 0.2).iter().map(|v| 1.0 + v).collect(), &[d]);
+            let state = on(values(hv * d * d, 11.0, 0.3), &[1, hv, d, d]);
+            let bits = |t: &Tensor| {
+                host(t)
+                    .unwrap()
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>()
+            };
+            let (conv, ring) = conv_span(&x, &w, [&h[0], &h[1], &h[2]]).unwrap();
+            let (y, next) =
+                recurrent_span(&conv, &z, &beta, &alpha, &dt, &a, &norm, &state, &spec).unwrap();
+            let mut slots = [h[0].clone(), h[1].clone(), h[2].clone()];
+            let mut s = state.clone();
+            let (mut convs, mut ys) = (Vec::new(), Vec::new());
+            for t in 0..tokens {
+                let (c, r) =
+                    conv_decode(&x.get(t).unwrap(), &w, [&slots[0], &slots[1], &slots[2]]).unwrap();
+                let (yt, st) = recurrent_decode(
+                    &c,
+                    &z.get(t).unwrap(),
+                    &beta.get(t).unwrap(),
+                    &alpha.get(t).unwrap(),
+                    &dt,
+                    &a,
+                    &norm,
+                    &s,
+                    &spec,
+                )
+                .unwrap();
+                slots = [r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap()];
+                s = st;
+                convs.push(c);
+                ys.push(yt);
+            }
+            let label = format!("grouped={grouped} {act:?}");
+            assert_eq!(
+                bits(&conv),
+                bits(&Tensor::stack(&convs, 0).unwrap()),
+                "conv {label}"
+            );
+            assert_eq!(
+                bits(&ring),
+                bits(&Tensor::stack(&slots, 0).unwrap()),
+                "ring {label}"
+            );
+            assert_eq!(bits(&y), bits(&Tensor::stack(&ys, 0).unwrap()), "y {label}");
+            assert_eq!(bits(&next), bits(&s), "state {label}");
+            // The CPU references agree with each other the same way.
+            let cpu = |t: &Tensor| t.to_device(&Device::Cpu).unwrap();
+            let (cconv, cring) =
+                conv_span(&cpu(&x), &cpu(&w), [&cpu(&h[0]), &cpu(&h[1]), &cpu(&h[2])]).unwrap();
+            assert_eq!(cconv.dims(), [tokens, conv_dim]);
+            assert_eq!(cring.dims(), [3, conv_dim]);
+        }
     }
 
     #[cfg(feature = "cuda")]

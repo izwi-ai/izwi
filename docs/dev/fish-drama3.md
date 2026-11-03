@@ -208,6 +208,13 @@ other families (`crates/izwi-core/src/kernels/`):
   A kept prefix longer than the 512 sorted ranks (an uncapped main draw over
   a flat distribution) is bounded by mass on the device, so no draw falls
   back to the host.
+- `gdn::conv_span` / `gdn::recurrent_span` (Metal): a prefill span's
+  DeltaNet layer runs as two launches, the causal conv over every row and
+  one threadgroup per value head walking the rows with its state in
+  registers, instead of a launch chain per row (about 46,000 launches per
+  256-row cell). Each row's arithmetic is the per-row kernels', so the span
+  matches the row-by-row result bit for bit
+  (`recurrent_deltanet_spans_total` in `device_fast_paths`).
 
 A fused trunk step runs as pieces: stretches of DeltaNet and MoE layers
 between attention mixers (each opens with the previous attention layer's

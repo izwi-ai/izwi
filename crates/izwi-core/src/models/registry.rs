@@ -9633,6 +9633,7 @@ mod tests {
             [
                 "chunked_deltanet_spans_total",
                 "grouped_moe_spans_total",
+                "recurrent_deltanet_spans_total",
                 "resident_frames_total",
                 "resident_host_fallbacks_total",
                 "resident_readbacks_total",

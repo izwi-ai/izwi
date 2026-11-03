@@ -31,8 +31,9 @@ use super::super::residency::FishDrama3WeightForm;
 use super::super::trunk::state::FishDrama3LinearState;
 use super::super::trunk::{norm_gain, LayerTrace, NormGain};
 use super::{
-    add_residual, count_chunked_deltanet_span, count_grouped_moe_span, record, rms_norm, swiglu,
-    vector, DeviceAttention, DeviceForms, DeviceRow, Probe,
+    add_residual, count_chunked_deltanet_span, count_grouped_moe_span,
+    count_recurrent_deltanet_span, record, rms_norm, swiglu, vector, DeviceAttention, DeviceForms,
+    DeviceRow, Probe,
 };
 use crate::error::{Error, Result};
 use crate::kernels::cuda::gdn::{self, GdnDecodeSpec};
@@ -146,6 +147,10 @@ pub(crate) struct DeviceDeltaNet {
     fused: bool,
     /// Whether a long span runs the chunked prefill (CUDA, once verified).
     pub(crate) chunked: bool,
+    /// Whether a span's rows run the span kernels (`gdn::conv_span`,
+    /// `gdn::recurrent_span`: Metal): two launches per request instead of a
+    /// launch chain per token, bit for bit the token loop's result.
+    spans: bool,
     key_dim: usize,
     channels: usize,
     value_width: usize,
@@ -234,6 +239,8 @@ impl DeviceDeltaNet {
             },
             fused: gdn::supported(device, la.key_head_dim, la.value_head_dim, la.conv_kernel),
             chunked: false,
+            spans: gdn::supported(device, la.key_head_dim, la.value_head_dim, la.conv_kernel)
+                && gdn::span_supported(device),
             key_dim: la.key_head_dim,
             channels,
             value_width: vw,
@@ -424,6 +431,23 @@ impl DeviceDeltaNet {
         let mut outputs = Vec::with_capacity(x.dim(0)?);
         let mut t = 0;
         for (row, state) in rows.iter().zip(states.iter_mut()) {
+            if self.spans && row.rows > 1 {
+                let (y, history, next) = self.span(
+                    &packed,
+                    &alpha,
+                    &beta,
+                    t,
+                    row.rows,
+                    state.conv.columns()?,
+                    state.recurrent(),
+                )?;
+                count_recurrent_deltanet_span();
+                state.conv.set_history(&history)?;
+                state.set_recurrent_tensor(next)?;
+                outputs.push(y);
+                t += row.rows;
+                continue;
+            }
             for _ in 0..row.rows {
                 let (y, history, next) = self.token(
                     &packed,
@@ -448,6 +472,40 @@ impl DeviceDeltaNet {
 }
 
 impl DeviceDeltaNet {
+    /// Rows `t..t + n` of the projections as one request's span through the
+    /// span kernels: the gated outputs `[n, value_width]`, the next history
+    /// `[3, channels]` and the next recurrent state, bit for bit what
+    /// [`Self::token`] gives row by row.
+    #[allow(clippy::too_many_arguments)]
+    fn span(
+        &self,
+        packed: &Tensor,
+        alpha: &Tensor,
+        beta: &Tensor,
+        t: usize,
+        n: usize,
+        columns: [&Tensor; 3],
+        recurrent: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let (c, vw) = (self.channels, self.value_width);
+        let rows = packed.narrow(0, t, n)?;
+        let mixed = rows.narrow(1, 0, c)?.contiguous()?;
+        let z = rows.narrow(1, c, vw)?.to_dtype(DType::F32)?.contiguous()?;
+        let (conv, history) = gdn::conv_span(&mixed, &self.conv, columns)?;
+        let (y, next) = gdn::recurrent_span(
+            &conv,
+            &z,
+            &beta.narrow(0, t, n)?.contiguous()?,
+            &alpha.narrow(0, t, n)?.contiguous()?,
+            &self.dt_bias,
+            &self.neg_a,
+            &self.norm,
+            recurrent,
+            &self.spec,
+        )?;
+        Ok((y, history, next.reshape(self.state_shape)?))
+    }
+
     /// Token `t` of the projections `packed`, `alpha` and `beta` from conv
     /// history `columns` (oldest first) and recurrent state `recurrent`:
     /// its gated output `[1, value_width]`, the next history `[3,

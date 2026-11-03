@@ -12,7 +12,7 @@
 //! | Router, shared-expert gate, DeltaNet `a` / `b`, norm gains, conv, `A_log`, `dt_bias` | F32 | F32 |
 //! | RMSNorm, q/k norm, attention gate | the Qwen3.6 F16 kernels with F32 gains | their BF16 forms |
 //! | RoPE | host F64 tables rounded to F32, rotated in F32 (NeoX for the trunk, interleaved pairs for the tower) | the same |
-//! | DeltaNet | `gdn_conv` + `gdn_decode` row by row in steps and spans, F32 state | the same in steps and short spans; a span of 32 rows or more runs the causal conv over the span and the chunked prefill (FLA's chunk rule), once its device check passed |
+//! | DeltaNet | `gdn_conv` + `gdn_decode` row by row in steps; a span's rows through their span forms (two launches, the state on chip from token to token, bit for bit the row-by-row result), F32 state | row by row in steps and short spans; a span of 32 rows or more runs the causal conv over the span and the chunked prefill (FLA's chunk rule), once its device check passed |
 //! | Paged KV (both domains) | F16, F32 after a breached load-time probe | BF16 |
 //! | Embedding and code tables | F16 device tables, gathered to F32 | BF16 device tables |
 //! | Logits | F16 projections widened to F32 | BF16 projections into F32 |
@@ -368,6 +368,7 @@ impl DeviceForms {
 static STEP_ROW_GEMV_CALLS: AtomicU64 = AtomicU64::new(0);
 static STEP_ROW_LOOP_CALLS: AtomicU64 = AtomicU64::new(0);
 static CHUNKED_DELTANET_SPANS: AtomicU64 = AtomicU64::new(0);
+static RECURRENT_DELTANET_SPANS: AtomicU64 = AtomicU64::new(0);
 static GROUPED_MOE_SPANS: AtomicU64 = AtomicU64::new(0);
 
 /// Process-wide count of CUDA step projections the row-invariant multi-row
@@ -385,6 +386,12 @@ pub fn fish_drama3_step_row_loop_calls() -> u64 {
 /// Process-wide count of DeltaNet span layers through the chunked prefill.
 pub fn fish_drama3_chunked_deltanet_spans() -> u64 {
     CHUNKED_DELTANET_SPANS.load(Ordering::Relaxed)
+}
+
+/// Process-wide count of DeltaNet span layers (one request's rows) through
+/// the span kernels that walk the tokens with the state on chip (Metal).
+pub fn fish_drama3_recurrent_deltanet_spans() -> u64 {
+    RECURRENT_DELTANET_SPANS.load(Ordering::Relaxed)
 }
 
 /// Process-wide count of MoE span layers through the grouped kernels.
@@ -426,6 +433,7 @@ pub fn fast_path_counters() -> serde_json::Value {
         "step_row_gemv_calls_total": fish_drama3_step_row_gemv_calls(),
         "step_row_loop_calls_total": fish_drama3_step_row_loop_calls(),
         "chunked_deltanet_spans_total": fish_drama3_chunked_deltanet_spans(),
+        "recurrent_deltanet_spans_total": fish_drama3_recurrent_deltanet_spans(),
         "grouped_moe_spans_total": fish_drama3_grouped_moe_spans(),
         "step_uploads_total": fish_drama3_step_uploads(),
         "step_main_draw_ms_total": ms(&STEP_MAIN_DRAW_US),
@@ -457,6 +465,10 @@ pub(crate) fn count_step_row_loop() {
 
 pub(crate) fn count_chunked_deltanet_span() {
     CHUNKED_DELTANET_SPANS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn count_recurrent_deltanet_span() {
+    RECURRENT_DELTANET_SPANS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn count_grouped_moe_span() {
