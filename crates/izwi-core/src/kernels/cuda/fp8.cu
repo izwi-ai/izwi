@@ -75,7 +75,7 @@ template<class T> __device__ void mm(const T* x,const unsigned char* w,const flo
     if(m<M && n<N) y[(size_t)m*N+n]=T(out[i]);
   }
 }
-// Vectorized decode GEMV (M <= 4): each lane loads 16 E4M3 bytes at a time and
+// Vectorized decode GEMV (M <= MR, MR = 4 or 8): each lane loads 16 E4M3 bytes at a time and
 // decodes them exactly through F16 lanes (byte moved to the high byte, exponent
 // and mantissa shifted down one bit = value * 2^-8; the x256 is applied once per
 // output). Activations are read as 16-byte vectors straight from global memory
@@ -102,18 +102,24 @@ template<class T> __device__ __forceinline__ void load16(const T* x, float* out)
   #pragma unroll
   for(int i=0;i<8;++i) { out[i]=float(pa[i]); out[8+i]=float(pb[i]); }
 }
-template<class T> __device__ void mv2(const T* x,const unsigned char* w,const float* s,T* y,int M,int N,int K) {
+// Each weight chunk is loaded once for all MR rows, and every row sums in the
+// same order (lane sweeps of 512, then a butterfly) whatever M is, so a row's
+// bits do not depend on its batch: the MR = 8 form serves 5 to 8 rows with the
+// same bandwidth-bound shape instead of the tile kernel below.
+template<class T,int MR> __device__ void mv2(const T* x,const unsigned char* w,const float* s,T* y,int M,int N,int K) {
   const int lane=threadIdx.x&31, n=blockIdx.x*8+(threadIdx.x>>5);
   if(n>=N) return;
   const unsigned char* row=w+(size_t)n*K;
   const float* scales=s+(size_t)(n>>7)*(K>>7);
-  float acc[4]={0,0,0,0};
+  float acc[MR];
+  #pragma unroll
+  for(int m=0;m<MR;++m) acc[m]=0.f;
   #pragma unroll 4
   for(int k0=lane*16;k0<K;k0+=512) {
     const uint4 q=*reinterpret_cast<const uint4*>(row+k0);
     const float scale=scales[k0>>7];
     #pragma unroll
-    for(int m=0;m<4;++m) {
+    for(int m=0;m<MR;++m) {
       if(m<M) {
         float xv[16];
         load16(x+(size_t)m*K+k0,xv);
@@ -126,7 +132,7 @@ template<class T> __device__ void mv2(const T* x,const unsigned char* w,const fl
     }
   }
   #pragma unroll
-  for(int m=0;m<4;++m) {
+  for(int m=0;m<MR;++m) {
     for(int d=16;d;d>>=1) acc[m]+=__shfl_down_sync(0xffffffff,acc[m],d);
     if(lane==0 && m<M) y[(size_t)m*N+n]=T(acc[m]*256.f);
   }
@@ -151,8 +157,10 @@ extern "C" __global__ void qwen38_fp8_mv_##S(const T*x,const unsigned char*w,con
 extern "C" __global__ void qwen38_fp8_mm_##S(const T*x,const unsigned char*w,const float*s,T*y,int M,int N,int K){mm(x,w,s,y,M,N,K);}
 EXPORT(__half,f16)
 EXPORT(__nv_bfloat16,bf16)
-extern "C" __global__ void qwen38_fp8_mv2_f16(const __half*x,const unsigned char*w,const float*s,__half*y,int M,int N,int K){mv2(x,w,s,y,M,N,K);}
-extern "C" __global__ void qwen38_fp8_mv2_bf16(const __nv_bfloat16*x,const unsigned char*w,const float*s,__nv_bfloat16*y,int M,int N,int K){mv2(x,w,s,y,M,N,K);}
+extern "C" __global__ void qwen38_fp8_mv2_f16(const __half*x,const unsigned char*w,const float*s,__half*y,int M,int N,int K){mv2<__half,4>(x,w,s,y,M,N,K);}
+extern "C" __global__ void qwen38_fp8_mv2_bf16(const __nv_bfloat16*x,const unsigned char*w,const float*s,__nv_bfloat16*y,int M,int N,int K){mv2<__nv_bfloat16,4>(x,w,s,y,M,N,K);}
+extern "C" __global__ void qwen38_fp8_mv2x8_f16(const __half*x,const unsigned char*w,const float*s,__half*y,int M,int N,int K){mv2<__half,8>(x,w,s,y,M,N,K);}
+extern "C" __global__ void qwen38_fp8_mv2x8_bf16(const __nv_bfloat16*x,const unsigned char*w,const float*s,__nv_bfloat16*y,int M,int N,int K){mv2<__nv_bfloat16,8>(x,w,s,y,M,N,K);}
 extern "C" __global__ void qwen38_fp8_mv_f32(const float*x,const unsigned char*w,const float*s,float*y,int M,int N,int K){mv(x,w,s,y,M,N,K);}
 
 // Vectorized decode GEMV over F32 activations and outputs, for decoders that

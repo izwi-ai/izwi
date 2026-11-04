@@ -69,6 +69,11 @@ pub fn provider_auto_preferred(_device: &Device, _dtype: DType, _n: usize, _k: u
 static VECTORIZED_DECODE_VERIFIED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Rows the vectorized decode GEMV serves in one launch: it reads each weight
+/// once for all of them, so up to eight rows cost about one row's bandwidth.
+/// Wider calls take the tile kernel or the dequantized GEMM.
+pub const VECTORIZED_DECODE_MAX_ROWS: usize = 8;
+
 pub fn vectorized_decode_enabled() -> bool {
     VECTORIZED_DECODE_VERIFIED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -81,7 +86,8 @@ enum DecodeKernel {
     Reference,
     /// The vectorized GEMV (errors if the call is not eligible).
     Vectorized,
-    /// The vectorized GEMV for an eligible call (at most four aligned rows),
+    /// The vectorized GEMV for an eligible call (at most
+    /// [`VECTORIZED_DECODE_MAX_ROWS`] aligned rows),
     /// the reference kernels otherwise. The caller owns the verification, so
     /// the process-wide flag is neither read nor set.
     VectorizedWhenEligible,
@@ -123,7 +129,7 @@ pub fn verify_vectorized_decode(device: &Device) -> Result<()> {
         let w = Tensor::from_vec(raw, (n, k), &Device::Cpu)?.to_device(device)?;
         let s = Tensor::from_vec(scales, (n.div_ceil(128), k.div_ceil(128)), &Device::Cpu)?
             .to_device(device)?;
-        for m in 1..=4usize {
+        for m in 1..=VECTORIZED_DECODE_MAX_ROWS {
             for dtype in [DType::BF16, DType::F16] {
                 let x = Tensor::from_vec(
                     (0..m * k)
@@ -167,8 +173,9 @@ pub struct DecodeKernelGate {
 
 /// Compare every compact-FP8 kernel on `device` with the portable reference
 /// at a caller-chosen inner dimension `k` (the checkpoint's real K values) and
-/// `n_rows` synthetic output channels: the vectorized GEMV and the reference
-/// GEMV at one to four activation rows, the prefill kernel at 5, 8 and 17.
+/// `n_rows` synthetic output channels: the vectorized GEMV at one to eight
+/// activation rows (its four- and eight-row forms), the reference GEMV at one
+/// to four and the tile kernel at 5 to 8 and 17.
 /// Weights mix every finite E4M3 byte and every 128x128 block has its own
 /// scale; activations are rounded to `dtype` before the host reference runs,
 /// so the comparison sees only kernel error. Tolerance: 1% relative L2 and 2%
@@ -239,7 +246,7 @@ pub fn verify_decode_kernels_at(
         Ok(())
     };
     let mut vectorized = Ok(());
-    for m in [1usize, 2, 3, 4, 5, 8, 17] {
+    for m in [1usize, 2, 3, 4, 5, 6, 7, 8, 17] {
         let x = Tensor::from_vec(
             (0..m * k)
                 .map(|i| ((i as f32 + 0.5) * 0.754_877_7).sin() * 2.0)
@@ -263,7 +270,7 @@ pub fn verify_decode_kernels_at(
         };
         compare(&format!("FP8 {kernel} m={m}"), &reference, &expected)
             .map_err(candle_core::Error::Msg)?;
-        if m <= 4 && vectorized.is_ok() {
+        if m <= VECTORIZED_DECODE_MAX_ROWS && vectorized.is_ok() {
             vectorized = match project(&x, &w, &s, DecodeKernel::Vectorized).and_then(host) {
                 Ok(actual) => compare(&format!("FP8 vectorized GEMV m={m}"), &actual, &expected),
                 Err(error) => Err(format!("FP8 vectorized GEMV m={m}: {error}")),
@@ -279,7 +286,7 @@ pub fn block_fp8_projection(input: &Tensor, weights: &Tensor, scales: &Tensor) -
 
 /// [`block_fp8_projection`] with the decode kernel chosen per call instead of
 /// by the process-wide flag: `vectorized` runs the vectorized GEMV on eligible
-/// calls (at most four aligned rows) and the reference kernels otherwise;
+/// calls (at most [`VECTORIZED_DECODE_MAX_ROWS`] aligned rows) and the reference kernels otherwise;
 /// `false` always runs the reference kernels.
 pub fn block_fp8_projection_selecting(
     input: &Tensor,
@@ -763,7 +770,7 @@ impl CustomOp3 for Projection {
             sl.start_offset()..sl.start_offset() + self.n.div_ceil(128) * self.k.div_ceil(128),
         );
         macro_rules! run {
-            ($v:ident,$ty:ty,$mv:literal,$mv2:literal,$mm:literal) => {{
+            ($v:ident,$ty:ty,$mv:literal,$mv2:literal,$mv2x8:literal,$mm:literal) => {{
                 let CudaStorageSlice::$v(x) = &x.slice else {
                     unreachable!()
                 };
@@ -775,7 +782,7 @@ impl CustomOp3 for Projection {
                 // weight rows; K is a multiple of 128 by contract.
                 let aligned = (xl.start_offset() * 2).is_multiple_of(16)
                     && wl.start_offset().is_multiple_of(16);
-                let vectorized = small
+                let vectorized = m <= VECTORIZED_DECODE_MAX_ROWS
                     && aligned
                     && match self.kernel {
                         DecodeKernel::Auto => vectorized_decode_enabled(),
@@ -788,8 +795,10 @@ impl CustomOp3 for Projection {
                     )
                 }
                 let f = device.get_or_load_custom_func(
-                    if vectorized {
+                    if vectorized && small {
                         $mv2
+                    } else if vectorized {
+                        $mv2x8
                     } else if small {
                         $mv
                     } else {
@@ -835,6 +844,7 @@ impl CustomOp3 for Projection {
                     half::f16,
                     "qwen38_fp8_mv_f16",
                     "qwen38_fp8_mv2_f16",
+                    "qwen38_fp8_mv2x8_f16",
                     "qwen38_fp8_mm_f16"
                 )
             }
@@ -844,6 +854,7 @@ impl CustomOp3 for Projection {
                     half::bf16,
                     "qwen38_fp8_mv_bf16",
                     "qwen38_fp8_mv2_bf16",
+                    "qwen38_fp8_mv2x8_bf16",
                     "qwen38_fp8_mm_bf16"
                 )
             }
