@@ -205,7 +205,9 @@ impl CommittedBacking {
 /// device's thread: the engine commits
 /// on tokio workers, and a buffer freed on one that never ran CUDA work
 /// fails there and leaves the driver error on the context for the next
-/// device call (`CUDA_ERROR_INVALID_CONTEXT`).
+/// device call (`CUDA_ERROR_INVALID_CONTEXT`). The free is queued, not
+/// awaited: a commit drops one per row under the engine lock, and the frees
+/// are stream-ordered, so nothing needs them to have run.
 pub(crate) struct RetiredTensorState {
     device: DeviceLocation,
     domains: Vec<StateDomainSnapshot>,
@@ -226,10 +228,11 @@ impl Drop for RetiredTensorState {
         if domains.is_empty() || !matches!(self.device, DeviceLocation::Cuda { .. }) {
             return;
         }
-        // Inline on the device thread itself; a job its thread cannot run
-        // is dropped, with the buffers, here.
+        // `submit` enqueues before it returns, so the job runs whether or not
+        // its future is awaited; a job its thread cannot take is dropped,
+        // with the buffers, here.
         if let Ok(thread) = DeviceThread::for_location(self.device) {
-            let _ = thread.run_sync(move || drop(domains));
+            drop(thread.submit(move || drop(domains)));
         }
     }
 }
@@ -1196,6 +1199,11 @@ mod tests {
             }],
         );
         std::thread::spawn(move || drop(retired)).join().unwrap();
+        // The free is queued on the device thread: wait for it to run.
+        DeviceThread::for_location(device.location())
+            .unwrap()
+            .run_sync(|| ())
+            .unwrap();
         context
             .check_err()
             .expect("retired state dropped on a fresh thread must not latch a CUDA error");
