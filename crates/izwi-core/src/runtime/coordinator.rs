@@ -75,6 +75,10 @@ impl JobCancellation {
 /// has passed, then fail with the last refusal and how long it waited. Any
 /// other outcome returns at once, so a cancel or a request too large for the
 /// machine is not delayed.
+/// Longest a request without a deadline waits at admission for memory that
+/// admitted work holds ([`InferenceCoordinator::admit_observed_waiting`]).
+pub(crate) const ADMISSION_CAPACITY_WAIT: Duration = Duration::from_secs(30);
+
 pub(crate) async fn wait_for_held_capacity<T, F, Fut>(wait: Duration, mut attempt: F) -> Result<T>
 where
     F: FnMut() -> Fut,
@@ -973,6 +977,38 @@ impl InferenceCoordinator {
         self.admit_with_initial_observation(spec, Some(observation))
     }
 
+    /// [`Self::admit_observed`] for a request that should queue, not fail,
+    /// while memory that admitted work holds is the only reason it cannot
+    /// start: it retries as in [`wait_for_held_capacity`] until the request's
+    /// deadline, or [`ADMISSION_CAPACITY_WAIT`] without one. A full queue, a
+    /// draining or unhealthy runtime and a request too large for the machine
+    /// still fail at once.
+    pub async fn admit_observed_waiting(
+        self: &Arc<Self>,
+        spec: JobSpec,
+        observation: JobResourceObservation,
+    ) -> Result<JobLease> {
+        let wait = spec.deadline.map_or(ADMISSION_CAPACITY_WAIT, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        let request_id = spec.request_id.clone();
+        wait_for_held_capacity(wait, || {
+            let spec = spec.clone();
+            async move { self.admit_observed(spec, observation).await }
+        })
+        .await
+        .inspect_err(|error| {
+            if crate::engine::resources::is_held_capacity_refusal(error) {
+                crate::engine::metrics::record_engine_request_failure(
+                    &request_id,
+                    "admission",
+                    "overloaded",
+                    &error.to_string(),
+                );
+            }
+        })
+    }
+
     /// Remove preparation lane eligibility while retaining its resource
     /// authorization. The returned bridge owns no queue permit and cannot run
     /// work; its reservation remains live until a fresh admission adopts it or
@@ -1125,6 +1161,12 @@ impl InferenceCoordinator {
         let request_id = spec.request_id.clone();
         self.admit_observed_inner(spec, observation)
             .inspect_err(|error| {
+                // A held-capacity refusal is retried by waiting callers, which
+                // record it if it outlasts the wait; the resource authority
+                // records every one with its margin.
+                if crate::engine::resources::is_held_capacity_refusal(error) {
+                    return;
+                }
                 let kind = match error {
                     Error::Overloaded(_) => "overloaded",
                     Error::Timeout(_) => "timeout",
@@ -4808,6 +4850,18 @@ mod tests {
                 && failure.kind == "overloaded"
                 && failure.message.contains("draining")
         }));
+    }
+
+    #[tokio::test]
+    async fn waiting_admission_fails_at_once_when_memory_is_not_the_reason() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        coordinator.begin_drain();
+        let started = Instant::now();
+        let result = coordinator
+            .admit_observed_waiting(job("drained"), JobResourceObservation::default())
+            .await;
+        assert!(matches!(result, Err(Error::Overloaded(_))));
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
     }
 
     #[tokio::test]

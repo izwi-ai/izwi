@@ -124,6 +124,21 @@ impl ResourceVector {
             && self.compute_slots.fits(capacity.compute_slots)
     }
 
+    /// Whether `self` fits `capacity` in every domain where `growth` asks for
+    /// more than nothing. A claim that grows only host memory is not refused
+    /// because other claims already over-subscribe the device: it does not
+    /// make that any worse.
+    pub fn fits_within_growing(self, capacity: Self, growth: Self) -> bool {
+        let grows = |amount: ResourceAmount| !matches!(amount, ResourceAmount::Known(0));
+        (!grows(growth.host_bytes) || self.host_bytes.fits(capacity.host_bytes))
+            && (!grows(growth.device_bytes) || self.device_bytes.fits(capacity.device_bytes))
+            && (!grows(growth.unified_bytes) || self.unified_bytes.fits(capacity.unified_bytes))
+            && (!grows(growth.kv_bytes) || self.kv_bytes.fits(capacity.kv_bytes))
+            && (!grows(growth.temporary_bytes)
+                || self.temporary_bytes.fits(capacity.temporary_bytes))
+            && (!grows(growth.compute_slots) || self.compute_slots.fits(capacity.compute_slots))
+    }
+
     pub fn is_fully_known(self) -> bool {
         [
             self.host_bytes,
@@ -1141,7 +1156,7 @@ impl ResourceAuthority {
                 let pending = resources.positive_growth_over(materialized)?;
                 let existing_pending = state.pending_resources()?;
                 let live_claim = existing_pending.checked_add(pending)?;
-                if !live_claim.fits_within(physical.available) {
+                if !live_claim.fits_within_growing(physical.available, pending) {
                     tracing::warn!(
                         "insufficient live physical capacity for {:?}: new_pending={pending:?}, existing_pending={existing_pending:?}, live_claim={live_claim:?}, physical_available={:?}, physical_capacity={:?}, live_by_class={:?}",
                         owner.class, physical.available, physical.capacity, state.pending_by_class(None)?
@@ -1255,7 +1270,8 @@ impl ResourceAuthority {
             let live_claim = other_pending.checked_add(next_pending)?;
             let physical = self.normalized_physical_snapshot();
             state.ledger.update_capacity(physical.capacity);
-            if !live_claim.fits_within(physical.available) {
+            let growth = next_pending.positive_growth_over(current_pending)?;
+            if !live_claim.fits_within_growing(physical.available, growth) {
                 tracing::warn!(
                     "insufficient live physical capacity for resource lease growth: next_pending={next_pending:?}, other_pending={other_pending:?}, live_claim={live_claim:?}, physical_available={:?}, physical_capacity={:?}, other_live_by_class={:?}",
                     physical.available, physical.capacity, state.pending_by_class(Some(id))?
@@ -1512,6 +1528,10 @@ fn live_capacity_shortfall(
         else {
             continue;
         };
+        // A domain the claim does not grow cannot be the one it waits on.
+        if need == 0 {
+            continue;
+        }
         let claim = need.saturating_add(held);
         if ResourceAmount::Known(claim).fits(amount(available)) {
             continue;
@@ -2086,6 +2106,54 @@ mod tests {
         assert_eq!(authority.snapshot().reserved, slots(0));
     }
 
+    /// Claims are checked only where they grow: a request holding host memory
+    /// is admitted while models' pending device claims exceed free device
+    /// memory (the c32 HTTP 503s on the H100), and a device claim is still
+    /// refused there.
+    #[test]
+    fn a_host_claim_is_not_refused_for_device_headroom() {
+        #[derive(Debug)]
+        struct ShrinkingProvider(Mutex<PhysicalCapacitySnapshot>);
+        impl PhysicalCapacityProvider for ShrinkingProvider {
+            fn snapshot(&self) -> PhysicalCapacitySnapshot {
+                *self.0.lock().unwrap()
+            }
+        }
+        let vector = |host: u64, device: u64| ResourceVector {
+            host_bytes: ResourceAmount::Known(host),
+            device_bytes: ResourceAmount::Known(device),
+            ..ResourceVector::zero()
+        };
+        let provider = Arc::new(ShrinkingProvider(Mutex::new(PhysicalCapacitySnapshot {
+            capacity: vector(1_000_000, 1_000),
+            available: vector(1_000_000, 100),
+            source: CapacitySource::Test,
+        })));
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+        let _model = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "deferred-graphs"),
+                vector(0, 90),
+            )
+            .unwrap();
+        // Something allocates outside the ledger: the model's 90 pending
+        // device bytes now exceed the 50 that are free.
+        provider.0.lock().unwrap().available = vector(1_000_000, 50);
+        let _request = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "request"),
+                vector(5_000, 0),
+            )
+            .unwrap();
+        let error = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::BatchWorkspace, "batch"),
+                vector(0, 20),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("GPU memory"), "{error}");
+    }
+
     #[test]
     fn a_live_refusal_is_recorded_with_its_margin() {
         let provider = Arc::new(TestProvider {
@@ -2195,8 +2263,8 @@ mod tests {
     }
 
     /// A shrink only gives capacity back: it succeeds when a guarded resize
-    /// to the same size is refused on live headroom, it never grows a lease
-    /// and it never drops below what the lease has materialized.
+    /// that grows is refused on live headroom, it never grows a lease and it
+    /// never drops below what the lease has materialized.
     #[test]
     fn lease_shrink_returns_capacity_without_a_live_check() {
         let provider = Arc::new(LiveProvider {
@@ -2219,7 +2287,7 @@ mod tests {
             .unwrap();
         provider.set_available(1);
 
-        assert!(matches!(job.resize(slots(4)), Err(Error::Overloaded(_))));
+        assert!(matches!(job.resize(slots(7)), Err(Error::Overloaded(_))));
         job.shrink(slots(4)).unwrap();
         assert_eq!(job.resources(), slots(4));
         assert_eq!(authority.snapshot().reserved, slots(7));
