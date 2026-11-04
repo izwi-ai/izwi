@@ -1019,6 +1019,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Sets the LFM3 chat context in tokens, up to the checkpoint's 262,144; it sizes the RoPE tables and KV reservation. CUDA defaults to the whole context and fits its arena to device memory.",
     ),
     CoreEnvVar::new(
+        "IZWI_LFM_BATCHED_SHORTCONV",
+        Flag,
+        "true",
+        Once,
+        "Kill switch: false steps each row's LFM2/LFM3 ShortConv on its own in a batched decode instead of one launch for all rows (CUDA).",
+    ),
+    CoreEnvVar::new(
         "IZWI_LFM_CUDA_DEPTHWISE_CONV",
         Flag,
         "false",

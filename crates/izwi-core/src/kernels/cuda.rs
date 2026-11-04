@@ -3446,6 +3446,78 @@ pub(crate) fn launch_lfm_shortconv_gated_ring_step(
     })
 }
 
+/// Launch the fused LFM2 ShortConv decode step for `rows` rows at once
+/// (`lfm_shortconv_step.rs`): `projected` is `[rows, 3 * hidden]` F32, and
+/// `table` holds four entries per row (ring, next-ring buffer, cursor,
+/// valid). Returns `y` `[rows, hidden]` F32.
+#[cfg(feature = "cuda")]
+pub(crate) fn launch_lfm_shortconv_gated_ring_step_rows(
+    projected: &candle_core::Tensor,
+    weight: &candle_core::Tensor,
+    table: u64,
+    rows: usize,
+    hidden: usize,
+    capacity: usize,
+) -> candle_core::Result<candle_core::Tensor> {
+    use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+    use candle_core::cuda_backend::WrapErr;
+    use candle_core::Storage;
+
+    if projected.dtype() != DType::F32
+        || weight.dtype() != DType::F32
+        || projected.elem_count() != rows * 3 * hidden
+        || weight.elem_count() != hidden * capacity
+    {
+        candle_core::bail!("batched ShortConv step geometry mismatch")
+    }
+    let device = projected.device().as_cuda_device()?.clone();
+    let projected = projected.contiguous()?;
+    let weight = weight.contiguous()?;
+    let (projected_storage, projected_layout) = projected.storage_and_layout();
+    let (weight_storage, weight_layout) = weight.storage_and_layout();
+    fn view<'a>(
+        storage: &'a Storage,
+        layout: &Layout,
+    ) -> candle_core::Result<candle_core::cuda_backend::cudarc::driver::CudaView<'a, f32>> {
+        let Storage::Cuda(cuda) = storage else {
+            candle_core::bail!("batched ShortConv inputs must be CUDA tensors")
+        };
+        let Some((start, end)) = layout.contiguous_offsets() else {
+            candle_core::bail!("batched ShortConv inputs must be contiguous")
+        };
+        Ok(cuda.as_cuda_slice::<f32>()?.slice(start..end))
+    }
+    let projected_view = view(&projected_storage, projected_layout)?;
+    let weight_view = view(&weight_storage, weight_layout)?;
+    // SAFETY: every row's `hidden` threads write its whole output row.
+    let y = unsafe { device.alloc::<f32>(rows * hidden)? };
+    let function = device.get_or_load_custom_func(
+        "lfm_shortconv_gated_ring_step_rows_f32",
+        "izwi_physical_state",
+        cuda_ptx::PHYSICAL_STATE,
+    )?;
+    let config = LaunchConfig {
+        grid_dim: ((hidden as u32).div_ceil(256), rows as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = function.builder();
+    builder.arg(&projected_view);
+    candle_core::builder_arg!(builder, table);
+    builder.arg(&weight_view);
+    builder.arg(&y);
+    candle_core::builder_arg!(builder, hidden as i32, capacity as i32);
+    // SAFETY: argument types match the kernel signature; every row's table
+    // entries were checked against `hidden` and `capacity` by the caller.
+    unsafe { builder.launch(config) }.w()?;
+    Ok(candle_core::Tensor::from_storage(
+        Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(y, device)),
+        (rows, hidden),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
 #[cfg(feature = "cuda")]
 mod cuda_ptx {
     include!(concat!(env!("OUT_DIR"), "/qwen35_ptx.rs"));

@@ -536,6 +536,18 @@ impl Lfm2BatchTelemetry {
     }
 }
 
+/// The one-launch batched ShortConv decode's resolution (CUDA only).
+fn shortconv_batched_summary() -> serde_json::Value {
+    #[cfg(feature = "cuda")]
+    {
+        super::backbone::batched_shortconv::summary()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        serde_json::json!({ "backend": "per_row", "reason": "CUDA only" })
+    }
+}
+
 impl Lfm2ChatModel {
     /// Family diagnostics for the admin health view.
     pub fn runtime_diagnostics(&self) -> serde_json::Value {
@@ -543,6 +555,7 @@ impl Lfm2ChatModel {
             "family": "lfm2_chat",
             "dialect": format!("{:?}", self.dialect),
             "counters": self.batch_telemetry.snapshot(),
+            "shortconv_batched": shortconv_batched_summary(),
         })
     }
 

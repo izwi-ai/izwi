@@ -37,6 +37,108 @@ use super::config::Lfm2BackboneConfig;
 use super::physical::LFM2_SHORTCONV_STATE_DOMAIN;
 use super::physical::Lfm2StateLayout;
 
+/// One-launch batched ShortConv decode on CUDA: its switch, a one-time
+/// bitwise check against the single-row kernel, and a counter of the layer
+/// steps it ran.
+#[cfg(feature = "cuda")]
+pub(crate) mod batched_shortconv {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    use candle_core::{Device, Tensor};
+
+    use crate::error::{Error, Result};
+
+    /// Kill switch: `false` steps each row's ShortConv on its own.
+    pub(crate) const ENV: &str = "IZWI_LFM_BATCHED_SHORTCONV";
+
+    static RESOLVED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    static LAYER_STEPS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn enabled(weight: &Tensor, device: &Device) -> bool {
+        device.is_cuda()
+            && crate::kernels::use_fused_kernels_for_device(device)
+            && RESOLVED.get_or_init(|| resolve(weight, device)).is_ok()
+    }
+
+    fn resolve(weight: &Tensor, device: &Device) -> std::result::Result<(), String> {
+        if !crate::env::flag_or(ENV, true) {
+            return Err(format!("{ENV}=false"));
+        }
+        self_check(weight, device).map_err(|error| {
+            tracing::warn!(
+                %error,
+                "LFM2 batched ShortConv self-check failed; stepping rows one at a time"
+            );
+            format!("self-check failed: {error}")
+        })
+    }
+
+    /// Two rows (a ring past capacity, a ring at cursor one) through the
+    /// multi-row kernel and the single-row kernel: `y` and the next rings
+    /// must be identical.
+    fn self_check(weight: &Tensor, device: &Device) -> Result<()> {
+        use crate::kernels::lfm_shortconv_step::{
+            lfm_shortconv_gated_ring_step, lfm_shortconv_gated_ring_step_rows, ShortConvRowStep,
+        };
+        let (hidden, capacity) = weight.dims2()?;
+        let wave = |n: usize, seed: f32| {
+            (0..n)
+                .map(|i| ((i as f32 + seed) * 0.754_877_7).sin())
+                .collect::<Vec<_>>()
+        };
+        let host =
+            |tensor: &Tensor| -> Result<Vec<f32>> { Ok(tensor.flatten_all()?.to_vec1::<f32>()?) };
+        let projected = Tensor::from_vec(wave(2 * 3 * hidden, 1.0), (2, 1, 3 * hidden), device)?;
+        let rings = [
+            Tensor::from_vec(wave(capacity * hidden, 2.0), (capacity, 1, hidden), device)?,
+            Tensor::from_vec(wave(capacity * hidden, 3.0), (capacity, 1, hidden), device)?,
+        ];
+        let steps = [(capacity as u64 + 2, capacity as u64), (1, 1)];
+        let rows = [0, 1].map(|row| ShortConvRowStep {
+            ring: &rings[row],
+            cursor: steps[row].0,
+            valid: steps[row].1,
+        });
+        let (y, next) = lfm_shortconv_gated_ring_step_rows(&projected, &rows, weight)?;
+        for row in 0..2 {
+            let (expected_y, expected_next) = lfm_shortconv_gated_ring_step(
+                &projected.narrow(0, row, 1)?,
+                &rings[row],
+                weight,
+                steps[row].0,
+                steps[row].1,
+            )?;
+            if host(&y.narrow(0, row, 1)?)? != host(&expected_y)?
+                || host(&next[row])? != host(&expected_next)?
+            {
+                return Err(Error::InferenceError(format!(
+                    "batched ShortConv row {row} differs from the single-row kernel"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn record_layer_step() {
+        LAYER_STEPS.fetch_add(1, Relaxed);
+    }
+
+    /// The resolution and layer-step count, for the admin diagnostics.
+    pub(crate) fn summary() -> serde_json::Value {
+        let (backend, reason) = match RESOLVED.get() {
+            None => ("unresolved", None),
+            Some(Ok(())) => ("batched", None),
+            Some(Err(reason)) => ("per_row", Some(reason.as_str())),
+        };
+        serde_json::json!({
+            "backend": backend,
+            "reason": reason,
+            "layer_steps": LAYER_STEPS.load(Relaxed),
+        })
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Lfm2ShortConvRuntimeState {
     cursor: u64,
@@ -318,6 +420,67 @@ impl Lfm2ShortConvRuntimeState {
         )?;
         *ring = Some(next);
         Ok(Some(y))
+    }
+
+    /// The ring, cursor and valid count [`Self::apply_fused_step`] would run
+    /// this row's step on, under its checks; `None` when the fused step is
+    /// off. For the batched step, which stores the next ring with
+    /// [`Self::store_ring`].
+    #[cfg(feature = "cuda")]
+    fn fused_step_input(
+        &self,
+        component: crate::kv::v2::StateComponentId,
+        weight: &Tensor,
+        device: &Device,
+    ) -> Result<Option<(Tensor, u64, u64)>> {
+        #[cfg(test)]
+        if FORCE_UNFUSED_SHORTCONV.with(std::cell::Cell::get) {
+            return Ok(None);
+        }
+        if !crate::kernels::use_fused_kernels_for_device(device) {
+            return Ok(None);
+        }
+        if weight.dims2()? != (self.hidden, self.capacity) {
+            return Err(Error::InvalidInput(
+                "LFM2 retained ShortConv geometry mismatch".into(),
+            ));
+        }
+        let (_, ring) = self
+            .components
+            .iter()
+            .find(|(candidate, _)| *candidate == component)
+            .ok_or_else(|| Error::InferenceError("LFM2 ShortConv component is absent".into()))?;
+        let current = match ring.as_ref() {
+            Some(ring) => ring.clone(),
+            None if self.cursor == 0 => {
+                Tensor::zeros((self.capacity, 1, self.hidden), DType::F32, device)?
+            }
+            None => {
+                return Err(Error::InferenceError(
+                    "LFM2 ShortConv state is absent after cursor zero".into(),
+                ))
+            }
+        };
+        Ok(Some((
+            current,
+            self.cursor,
+            self.cursor.min(self.capacity as u64),
+        )))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn store_ring(
+        &mut self,
+        component: crate::kv::v2::StateComponentId,
+        next: Tensor,
+    ) -> Result<()> {
+        let (_, ring) = self
+            .components
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == component)
+            .ok_or_else(|| Error::InferenceError("LFM2 ShortConv component is absent".into()))?;
+        *ring = Some(next);
+        Ok(())
     }
 
     fn advance(&mut self, steps: usize) -> Result<()> {
@@ -1540,6 +1703,43 @@ impl ShortConvLayer {
         self.out_proj.forward(&conv).map_err(Error::from)
     }
 
+    /// The batched decode step's ShortConv in one launch for every row
+    /// (CUDA), or `None` when a row cannot take the fused step. Each row
+    /// gets a fresh next ring; its old ring is never written.
+    #[cfg(feature = "cuda")]
+    fn forward_fused_rows(
+        &self,
+        projected: &Tensor,
+        states: &mut [&mut Lfm2ShortConvRuntimeState],
+    ) -> Result<Option<Tensor>> {
+        use crate::kernels::lfm_shortconv_step::{
+            lfm_shortconv_gated_ring_step_rows, ShortConvRowStep,
+        };
+        let device = projected.device();
+        let mut inputs = Vec::with_capacity(states.len());
+        for state in states.iter() {
+            match state.fused_step_input(self.component, &self.conv, device)? {
+                Some(input) => inputs.push(input),
+                None => return Ok(None),
+            }
+        }
+        let rows = inputs
+            .iter()
+            .map(|(ring, cursor, valid)| ShortConvRowStep {
+                ring,
+                cursor: *cursor,
+                valid: *valid,
+            })
+            .collect::<Vec<_>>();
+        let (y, next_rings) = lfm_shortconv_gated_ring_step_rows(projected, &rows, &self.conv)?;
+        drop(rows);
+        for (state, next) in states.iter_mut().zip(next_rings) {
+            state.store_ring(self.component, next)?;
+        }
+        batched_shortconv::record_layer_step();
+        Ok(Some(y))
+    }
+
     fn forward_retained_decode_batch(
         &self,
         hidden_states: &Tensor,
@@ -1552,6 +1752,12 @@ impl ShortConvLayer {
             ));
         }
         let projected = self.in_proj.forward(hidden_states)?;
+        #[cfg(feature = "cuda")]
+        if batch > 1 && batched_shortconv::enabled(&self.conv, projected.device()) {
+            if let Some(y) = self.forward_fused_rows(&projected, states)? {
+                return self.out_proj.forward(&y).map_err(Error::from);
+            }
+        }
         let mut fused = Vec::with_capacity(batch);
         for row in 0..batch {
             match states[row].apply_fused_step(

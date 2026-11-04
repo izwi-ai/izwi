@@ -1306,21 +1306,19 @@ extern "C" __global__ void physical_ring_shortconv_f32(
   output[gid] = value;
 }
 
-// Fused LFM2 ShortConv decode step (see kernels/lfm_shortconv_step.rs):
-// output rows 0..capacity are the next ring, row capacity is y = c * conv.
-extern "C" __global__ void lfm_shortconv_gated_ring_step_f32(
+// One channel h of the fused LFM2 ShortConv decode step: next_ring is the
+// [capacity, hidden] next ring and y[h] = c * conv.
+__device__ __forceinline__ void lfm_shortconv_gated_ring_step_channel(
     const float* __restrict__ projected,
     const float* __restrict__ ring,
     const float* __restrict__ weight,
-    float* __restrict__ output,
+    float* __restrict__ next_ring,
+    float* __restrict__ y,
     int hidden,
     int capacity,
     unsigned long long cursor,
-    unsigned long long valid) {
-  const int h = blockIdx.x * blockDim.x + threadIdx.x;
-  if (h >= hidden) {
-    return;
-  }
+    unsigned long long valid,
+    int h) {
   const float bx = projected[h] * projected[2 * hidden + h];
   const unsigned long long slot = cursor % static_cast<unsigned long long>(capacity);
   const unsigned long long oldest = cursor - valid;
@@ -1336,8 +1334,51 @@ extern "C" __global__ void lfm_shortconv_gated_ring_step_f32(
     conv += ring[physical * hidden + h] * weight[h * capacity + tap];
   }
   for (int s = 0; s < capacity; ++s) {
-    output[s * hidden + h] =
+    next_ring[s * hidden + h] =
         (static_cast<unsigned long long>(s) == slot) ? bx : ring[s * hidden + h];
   }
-  output[capacity * hidden + h] = projected[hidden + h] * conv;
+  y[h] = projected[hidden + h] * conv;
+}
+
+// Fused LFM2 ShortConv decode step (see kernels/lfm_shortconv_step.rs):
+// output rows 0..capacity are the next ring, row capacity is y = c * conv.
+extern "C" __global__ void lfm_shortconv_gated_ring_step_f32(
+    const float* __restrict__ projected,
+    const float* __restrict__ ring,
+    const float* __restrict__ weight,
+    float* __restrict__ output,
+    int hidden,
+    int capacity,
+    unsigned long long cursor,
+    unsigned long long valid) {
+  const int h = blockIdx.x * blockDim.x + threadIdx.x;
+  if (h >= hidden) {
+    return;
+  }
+  lfm_shortconv_gated_ring_step_channel(projected, ring, weight, output,
+                                        output + capacity * hidden, hidden, capacity,
+                                        cursor, valid, h);
+}
+
+// The step for every row of a batched decode in one launch. Grid y is the
+// row r: table[r * 4 ..] holds its ring, its next-ring buffer
+// ([capacity, hidden]), its cursor and its valid count; its projection is
+// projected[r * 3 * hidden ..] and its output y[r * hidden ..].
+extern "C" __global__ void lfm_shortconv_gated_ring_step_rows_f32(
+    const float* __restrict__ projected,
+    const unsigned long long* __restrict__ table,
+    const float* __restrict__ weight,
+    float* __restrict__ y,
+    int hidden,
+    int capacity) {
+  const int h = blockIdx.x * blockDim.x + threadIdx.x;
+  if (h >= hidden) {
+    return;
+  }
+  const long long r = blockIdx.y;
+  const unsigned long long* e = table + r * 4;
+  lfm_shortconv_gated_ring_step_channel(projected + r * 3 * (long long)hidden,
+                                        (const float*)e[0], weight, (float*)e[1],
+                                        y + r * (long long)hidden, hidden, capacity, e[2],
+                                        e[3], h);
 }
