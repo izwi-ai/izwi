@@ -58,6 +58,8 @@ const CHUNKED_GDN_MIN_TOKENS: usize = 32;
 
 #[path = "decode_graph.rs"]
 mod decode_graph;
+#[path = "kernel_timings.rs"]
+mod kernel_timings;
 
 pub struct Qwen35TextModel {
     device: Device,
@@ -74,6 +76,8 @@ pub struct Qwen35TextModel {
     /// Whole-step CUDA graph decode, when resolved (opt-in).
     decode_graph: Option<decode_graph::Qwen35DecodeGraph>,
     decode_graph_path: Qwen35FastPath,
+    /// Load-time device timings of the decode kernels (`kernel_timings.rs`).
+    load_timings: serde_json::Value,
     /// Chunked DeltaNet prefill, resolved once for every DeltaNet layer.
     gdn_prefill_path: Qwen35FastPath,
 }
@@ -596,6 +600,7 @@ impl Qwen35TextModel {
             max_context_tokens: cfg.context_length,
             decode_graph: None,
             decode_graph_path: Qwen35FastPath::legacy("unresolved"),
+            load_timings: serde_json::Value::Null,
             gdn_prefill_path: Qwen35FastPath::legacy("unresolved"),
         })
     }
@@ -735,6 +740,19 @@ impl Qwen35TextModel {
         );
         self.decode_graph = graph;
         self.decode_graph_path = path;
+    }
+
+    /// Measure the decode kernels' device time once, after the fast paths
+    /// resolved (CUDA; see `kernel_timings.rs`).
+    pub(crate) fn record_load_timings(&mut self) {
+        self.load_timings = self.measure_load_timings();
+        if self.load_timings["status"] == "measured" {
+            tracing::info!(timings = %self.load_timings, "Qwen3.5 load-time kernel timings");
+        }
+    }
+
+    pub(crate) fn load_timings(&self) -> &serde_json::Value {
+        &self.load_timings
     }
 
     /// Graph decode resolution and runtime state, for the admin diagnostics.

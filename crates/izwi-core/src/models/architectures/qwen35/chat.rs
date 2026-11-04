@@ -1512,6 +1512,7 @@ impl Qwen35ChatModel {
             Qwen35CudaSwitches::from_performance(backend, &performance.cuda),
             false,
         );
+        text_model.record_load_timings();
 
         let projector_loader = GgufLoader::from_path_with_backend(&mmproj_path, backend)?;
         let projector_checkpoint = projector_loader.get_model_info();
@@ -1662,6 +1663,7 @@ impl Qwen35ChatModel {
             "gdn_prefill": self.exec.text_model.gdn_prefill_summary(),
             "projections": self.exec.text_model.projection_summary(),
             "decode_graph": self.exec.text_model.decode_graph_summary(),
+            "kernel_timings": self.exec.text_model.load_timings(),
             "batched_device_sampling":
                 crate::models::shared::sampling::batched_device_sampling::summary(),
             "counters": self.exec.text_model.telemetry().snapshot(),

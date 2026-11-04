@@ -1695,6 +1695,14 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     )
     .aliases(&[("legacy", false)]),
     CoreEnvVar::new(
+        "IZWI_QWEN35_LOAD_TIMINGS",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off skips the Qwen3.5 load-time CUDA decode kernel timings reported in diagnostics.",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
         "IZWI_QWEN35_PREFILL_CHUNK_SIZE",
         Int,
         "256 (Qwen3.6-MoE may prefer up to 1024)",

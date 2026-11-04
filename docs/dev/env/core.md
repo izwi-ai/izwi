@@ -250,6 +250,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_QWEN35_FINITE_DIAGNOSTICS` | flag | `false` | model load | Enables finite-value (NaN/Inf) checks on Qwen3.5 and Qwen3.6-MoE activations for debugging. |
 | `IZWI_QWEN35_FUSED_DECODE` | flag | true (fused) | model load | Kill switch: legacy/off forces the Candle op chain instead of the fused Qwen3.5 DeltaNet decode. Also: `legacy` means false. |
 | `IZWI_QWEN35_KQUANT` | flag | true (k-quant kernels) | model load | Kill switch: legacy/off keeps every Qwen3.5 projection on QMatMul instead of the CUDA k-quant kernels. Also: `legacy` means false. |
+| `IZWI_QWEN35_LOAD_TIMINGS` | flag | true (CUDA only) | model load | Kill switch: legacy/off skips the Qwen3.5 load-time CUDA decode kernel timings reported in diagnostics. Also: `legacy` means false. |
 | `IZWI_QWEN35_PREFILL_CHUNK_SIZE` | integer | 256 (Qwen3.6-MoE may prefer up to 1024) | first use | Sets the Qwen3.5/Qwen3.6-MoE prefill forward chunk size in tokens (max 2048; 0 or invalid ignored). |
 | `IZWI_QWEN35_ROPE_KERNEL` | flag | true on Metal/CUDA, false on CPU | model load | Toggles the custom RoPE kernel for Qwen3.5 and Qwen3.6-MoE attention. |
 | `IZWI_QWEN35_TILED_RECURRENCE` | flag | `true` | model load | Enables the tiled DeltaNet recurrence for Qwen3.5 and Qwen3.6-MoE prefill. |
