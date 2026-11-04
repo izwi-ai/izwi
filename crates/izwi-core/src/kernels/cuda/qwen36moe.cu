@@ -793,6 +793,130 @@ __device__ void q36_qk_norm_rope_kv_rows(
 Q36_QK_KV_ROWS_EXPORT(__half, f16)
 Q36_QK_KV_ROWS_EXPORT(__nv_bfloat16, bf16)
 
+// The rows variant over F32 projections, for a trunk whose reference chain
+// norms and rotates in F32 and rounds once (Qwen3.5): the head norm, cos/sin
+// and the rotation stay F32, and only the outputs (the queries, and the key
+// and value rows in the cache) are rounded to T.
+template <class T>
+__device__ void q36_qk_norm_rope_f32_head(
+    const float* __restrict__ q_src,
+    const float* __restrict__ k_src,
+    const float* __restrict__ q_gain,
+    const float* __restrict__ k_gain,
+    const float* __restrict__ inv_freq,
+    T* __restrict__ q_out,
+    T* __restrict__ k_out,
+    int num_heads,
+    int head_dim,
+    int rope_dim,
+    int position,
+    float eps) {
+  __shared__ float part[32];
+  __shared__ float inv_shared;
+  const int head = blockIdx.x;
+  const bool is_query = head < num_heads;
+  const float* src = is_query ? q_src + (size_t)head * 2 * head_dim
+                              : k_src + (size_t)(head - num_heads) * head_dim;
+  const float* gain = is_query ? q_gain : k_gain;
+  T* dst = is_query ? q_out + (size_t)head * head_dim
+                    : k_out + (size_t)(head - num_heads) * head_dim;
+  float ss = 0.f;
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    const float v = src[i];
+    ss = fmaf(v, v, ss);
+  }
+  ss = q36_warp_sum(ss);
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  if (lane == 0) {
+    part[warp] = ss;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    const int warps = (blockDim.x + 31) >> 5;
+    float total = lane < warps ? part[lane] : 0.f;
+    total = q36_warp_sum(total);
+    if (lane == 0) {
+      inv_shared = 1.f / sqrtf(total / (float)head_dim + eps);
+    }
+  }
+  __syncthreads();
+  const float inv = inv_shared;
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    q36_shared[i] = src[i] * inv * gain[i];
+  }
+  __syncthreads();
+  const int half = rope_dim >> 1;
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    float out = q36_shared[i];
+    if (i < rope_dim) {
+      const int j = i < half ? i : i - half;
+      const float angle = (float)position * inv_freq[j];
+      const float c = cosf(angle);
+      const float s = sinf(angle);
+      out = i < half ? q36_shared[i] * c - q36_shared[i + half] * s
+                     : q36_shared[i - half] * s + q36_shared[i] * c;
+    }
+    dst[i] = T(out);
+  }
+}
+
+template <class T>
+__device__ void q36_qk_norm_rope_kv_rows_f32(
+    const float* __restrict__ q_src,
+    const float* __restrict__ k_src,
+    const float* __restrict__ v_src,
+    const float* __restrict__ q_gain,
+    const float* __restrict__ k_gain,
+    const float* __restrict__ inv_freq,
+    const unsigned* __restrict__ positions,
+    const unsigned* __restrict__ row_slots,
+    T* __restrict__ q_out,
+    T* __restrict__ key_cache,
+    T* __restrict__ value_cache,
+    int slots,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rope_dim,
+    float eps) {
+  const int row = blockIdx.y;
+  const int position = (int)positions[row];
+  const unsigned slot = row_slots[row];
+  const bool is_key = (int)blockIdx.x >= num_heads;
+  if (is_key && slot >= (unsigned)slots) {
+    return;
+  }
+  const size_t q_row = (size_t)row * num_heads * head_dim;
+  const size_t kv_row = (size_t)row * num_kv_heads * head_dim;
+  T* key_row = key_cache + (size_t)(is_key ? slot : 0) * num_kv_heads * head_dim;
+  q36_qk_norm_rope_f32_head<T>(q_src + 2 * q_row, k_src + kv_row, q_gain, k_gain, inv_freq,
+                               q_out + q_row, key_row, num_heads, head_dim, rope_dim, position,
+                               eps);
+  if (is_key) {
+    const int head = blockIdx.x - num_heads;
+    const float* value = v_src + kv_row + (size_t)head * head_dim;
+    T* dst = value_cache + ((size_t)slot * num_kv_heads + head) * head_dim;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+      dst[i] = T(value[i]);
+    }
+  }
+}
+
+#define Q36_QK_KV_ROWS_F32_EXPORT(T, S)                                                          \
+  extern "C" __global__ void __launch_bounds__(256) qwen36moe_qk_norm_rope_kv_rows_f32_##S(     \
+      const float* q_src, const float* k_src, const float* v_src, const float* q_gain,         \
+      const float* k_gain, const float* inv_freq, const unsigned* positions,                   \
+      const unsigned* row_slots, T* q_out, T* key_cache, T* value_cache, int slots,             \
+      int num_heads, int num_kv_heads, int head_dim, int rope_dim, float eps) {                  \
+    q36_qk_norm_rope_kv_rows_f32<T>(q_src, k_src, v_src, q_gain, k_gain, inv_freq, positions,   \
+                                    row_slots, q_out, key_cache, value_cache, slots, num_heads,  \
+                                    num_kv_heads, head_dim, rope_dim, eps);                      \
+  }
+
+Q36_QK_KV_ROWS_F32_EXPORT(__half, f16)
+Q36_QK_KV_ROWS_F32_EXPORT(__nv_bfloat16, bf16)
+
 // ---------------------------------------------------------------------------
 // Router GEMV: logits[t, e] = round_T(x[t] . w[e]) as F32. Reads the 16-bit
 // activations and F32 router rows directly, replacing cast -> F32 GEMM ->

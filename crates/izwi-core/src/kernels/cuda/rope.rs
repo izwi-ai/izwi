@@ -254,7 +254,12 @@ pub fn qk_norm_rope_kv(
 /// captured launch serves every step). `q_proj` is `[rows, num_heads * 2 *
 /// head_dim]` (gated), `k_proj`/`v_proj` `[rows, num_kv_heads * head_dim]`,
 /// all row-contiguous. Returns the rotated queries `[rows, 1, num_heads,
-/// head_dim]`; a slot outside the cache writes nothing.
+/// head_dim]` in the cache dtype; a slot outside the cache writes nothing.
+///
+/// The projections are either in the cache's 16-bit dtype (rounded at each
+/// stage, like [`qk_norm_rope_kv`]) or F32: then the norm, cos/sin and the
+/// rotation stay F32 and only the outputs are rounded, as a trunk that norms
+/// and rotates in F32 before casting for the cache does.
 #[allow(clippy::too_many_arguments)]
 pub fn qk_norm_rope_kv_rows(
     q_proj: &Tensor,
@@ -270,7 +275,8 @@ pub fn qk_norm_rope_kv_rows(
     values: &Tensor,
     rows: usize,
 ) -> Result<Tensor> {
-    let dtype = q_proj.dtype();
+    let dtype = keys.dtype();
+    let input = q_proj.dtype();
     let d = spec.head_dim;
     let cache_dims = keys.dims();
     if rows == 0
@@ -278,8 +284,9 @@ pub fn qk_norm_rope_kv_rows(
         || q_proj.elem_count() != rows * spec.num_heads * 2 * d
         || k_proj.elem_count() != rows * spec.num_kv_heads * d
         || v_proj.elem_count() != rows * spec.num_kv_heads * d
-        || k_proj.dtype() != dtype
-        || v_proj.dtype() != dtype
+        || k_proj.dtype() != input
+        || v_proj.dtype() != input
+        || !(input == dtype || input == DType::F32)
         || !matches!(dtype, DType::F16 | DType::BF16)
         || q_gain.elem_count() != d
         || k_gain.elem_count() != d
@@ -298,7 +305,6 @@ pub fn qk_norm_rope_kv_rows(
         || cache_dims.len() != 4
         || cache_dims[2..] != [spec.num_kv_heads, d]
         || values.dims() != cache_dims
-        || keys.dtype() != dtype
         || values.dtype() != dtype
         || !keys.is_contiguous()
         || !values.is_contiguous()
@@ -307,7 +313,7 @@ pub fn qk_norm_rope_kv_rows(
             .any(|t| !t.device().same_device(q_proj.device()))
     {
         candle_core::bail!(
-            "invalid fused q/k norm + RoPE + KV write contract for {rows} rows of {spec:?}"
+            "invalid fused q/k norm + RoPE + KV write contract for {rows} rows of {spec:?} ({input:?} projections, {dtype:?} cache)"
         )
     }
     let cache_slots = cache_dims[0] * cache_dims[1];
@@ -326,6 +332,12 @@ pub fn qk_norm_rope_kv_rows(
             keys,
             values,
             cache_slots,
+            rows,
+        );
+    }
+    if input == DType::F32 {
+        return kv_rows_f32_host(
+            q_proj, k_proj, v_proj, q_gain, k_gain, inv_freq, spec, positions, slots, keys, values,
             rows,
         );
     }
@@ -365,6 +377,84 @@ pub fn qk_norm_rope_kv_rows(
         queries.push(q);
     }
     Tensor::cat(&queries, 0)
+}
+
+/// [`qk_norm_rope_kv_rows`] over F32 projections on the host: the norm,
+/// cos/sin and rotation in F32, the outputs rounded once to the cache dtype.
+#[allow(clippy::too_many_arguments)]
+fn kv_rows_f32_host(
+    q_proj: &Tensor,
+    k_proj: &Tensor,
+    v_proj: &Tensor,
+    q_gain: &Tensor,
+    k_gain: &Tensor,
+    inv_freq: &Tensor,
+    spec: &QkNormRopeSpec,
+    positions: &Tensor,
+    slots: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    rows: usize,
+) -> Result<Tensor> {
+    let d = spec.head_dim;
+    let dtype = keys.dtype();
+    let host = |t: &Tensor| t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>();
+    let (q, k, v) = (host(q_proj)?, host(k_proj)?, host(v_proj)?);
+    let (qg, kg, inv) = (host(q_gain)?, host(k_gain)?, host(inv_freq)?);
+    let positions = positions.flatten_all()?.to_vec1::<u32>()?;
+    let row_slots = slots.flatten_all()?.to_vec1::<u32>()?;
+    let head = |src: &[f32], gain: &[f32], position: usize| -> Vec<f32> {
+        let mean = src.iter().map(|v| v * v).sum::<f32>() / d as f32;
+        let scale = 1.0 / (mean + spec.eps).sqrt();
+        let n: Vec<f32> = src.iter().zip(gain).map(|(v, g)| v * scale * g).collect();
+        let half = spec.rope_dim / 2;
+        (0..d)
+            .map(|i| {
+                if i >= spec.rope_dim {
+                    return n[i];
+                }
+                let j = if i < half { i } else { i - half };
+                let angle = position as f32 * inv[j];
+                let (c, s) = (angle.cos(), angle.sin());
+                if i < half {
+                    n[i] * c - n[i + half] * s
+                } else {
+                    n[i - half] * s + n[i] * c
+                }
+            })
+            .collect()
+    };
+    let (q_width, kv_width) = (spec.num_heads * 2 * d, spec.num_kv_heads * d);
+    let cache_slots = keys.dims()[0] * keys.dims()[1];
+    let device = q_proj.device();
+    let mut queries = Vec::with_capacity(rows * spec.num_heads * d);
+    for row in 0..rows {
+        let position = positions[row] as usize;
+        let q_row = &q[row * q_width..(row + 1) * q_width];
+        for h in 0..spec.num_heads {
+            queries.extend(head(&q_row[h * 2 * d..h * 2 * d + d], &qg, position));
+        }
+        let slot = row_slots[row] as usize;
+        if slot < cache_slots {
+            let k_row = &k[row * kv_width..(row + 1) * kv_width];
+            let rotated: Vec<f32> = (0..spec.num_kv_heads)
+                .flat_map(|h| head(&k_row[h * d..(h + 1) * d], &kg, position))
+                .collect();
+            let shape = (1, spec.num_kv_heads, d);
+            let write = |cache: &Tensor, row: Vec<f32>| -> Result<()> {
+                cache
+                    .reshape((cache_slots, spec.num_kv_heads, d))?
+                    .slice_set(
+                        &Tensor::from_vec(row, shape, device)?.to_dtype(dtype)?,
+                        0,
+                        slot,
+                    )
+            };
+            write(keys, rotated)?;
+            write(values, v[row * kv_width..(row + 1) * kv_width].to_vec())?;
+        }
+    }
+    Tensor::from_vec(queries, (rows, 1, spec.num_heads, d), device)?.to_dtype(dtype)
 }
 
 #[cfg(feature = "cuda")]
@@ -627,10 +717,10 @@ mod cuda_impl {
             shared_mem_bytes: (d * 4) as u32,
         };
         macro_rules! run {
-            ($ty:ty, $name:literal) => {{
-                let qv = view::<$ty>(&q_s, &q)?;
-                let kv = view::<$ty>(&k_s, &k)?;
-                let vv = view::<$ty>(&v_s, &v)?;
+            ($in_ty:ty, $ty:ty, $name:literal) => {{
+                let qv = view::<$in_ty>(&q_s, &q)?;
+                let kv = view::<$in_ty>(&k_s, &k)?;
+                let vv = view::<$in_ty>(&v_s, &v)?;
                 let key_cache = address::<$ty>(keys)?;
                 let value_cache = address::<$ty>(values)?;
                 // SAFETY: one block writes every element of its row's query head.
@@ -668,10 +758,22 @@ mod cuda_impl {
                 wrap(q_out, device, Shape::from((rows, 1, spec.num_heads, d)))
             }};
         }
-        Ok(match q.dtype() {
-            DType::BF16 => run!(half::bf16, "qwen36moe_qk_norm_rope_kv_rows_bf16"),
-            DType::F16 => run!(half::f16, "qwen36moe_qk_norm_rope_kv_rows_f16"),
-            other => candle_core::bail!("fused RoPE KV rows write does not support {other:?}"),
+        Ok(match (q.dtype(), keys.dtype()) {
+            (DType::BF16, DType::BF16) => {
+                run!(half::bf16, half::bf16, "qwen36moe_qk_norm_rope_kv_rows_bf16")
+            }
+            (DType::F16, DType::F16) => {
+                run!(half::f16, half::f16, "qwen36moe_qk_norm_rope_kv_rows_f16")
+            }
+            (DType::F32, DType::BF16) => {
+                run!(f32, half::bf16, "qwen36moe_qk_norm_rope_kv_rows_f32_bf16")
+            }
+            (DType::F32, DType::F16) => {
+                run!(f32, half::f16, "qwen36moe_qk_norm_rope_kv_rows_f32_f16")
+            }
+            (input, cache) => candle_core::bail!(
+                "fused RoPE KV rows write does not support {input:?} projections into a {cache:?} cache"
+            ),
         })
     }
 }
@@ -986,6 +1088,120 @@ mod tests {
             return;
         };
         assert_rows_match_one_row(&device);
+    }
+
+    /// Three rows of F32 projections (or the same values in F16) through
+    /// [`qk_norm_rope_kv_rows`] into an F16 cache on `device`; slots 6, 1 and
+    /// 8 (past the cache). Returns (queries, keys, values), host F32.
+    fn f32_rows_case(device: &Device, input: DType) -> [Vec<f32>; 3] {
+        let spec = QkNormRopeSpec {
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 16,
+            rope_dim: 8,
+            eps: 1e-6,
+        };
+        let wave = |n: usize, seed: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i as f32 + seed) * 0.754_877_7).sin() * 40.0)
+                .collect()
+        };
+        let tensor = |values: Vec<f32>, shape: &[usize]| {
+            Tensor::from_vec(values, shape, &Device::Cpu)
+                .unwrap()
+                .to_dtype(input)
+                .unwrap()
+                .to_device(device)
+                .unwrap()
+        };
+        let q = tensor(wave(3 * 4 * 32, 1.0), &[3, 4 * 32]);
+        let k = tensor(wave(3 * 2 * 16, 2.0), &[3, 2 * 16]);
+        let v = tensor(wave(3 * 2 * 16, 3.0), &[3, 2 * 16]);
+        let gain = Tensor::from_vec(wave(16, 4.0), 16, device)
+            .unwrap()
+            .affine(0.0025, 1.0)
+            .unwrap();
+        let inv = Tensor::from_vec(vec![1.0f32, 0.1, 0.01, 0.001], 4, device).unwrap();
+        let step = Tensor::from_vec(
+            [[0u32; 3], [3, 1_017, 40_000], [6, 1, 8]].concat(),
+            9,
+            device,
+        )
+        .unwrap();
+        let cache = || Tensor::zeros((2, 4, 2, 16), DType::F16, device).unwrap();
+        let (keys, values) = (cache(), cache());
+        let queries = qk_norm_rope_kv_rows(
+            &q,
+            &k,
+            &v,
+            &gain,
+            &gain,
+            &inv,
+            &spec,
+            &step.narrow(0, 3, 3).unwrap(),
+            &step.narrow(0, 6, 3).unwrap(),
+            &keys,
+            &values,
+            3,
+        )
+        .unwrap();
+        assert_eq!(queries.dims(), [3, 1, 4, 16]);
+        assert_eq!(queries.dtype(), DType::F16);
+        let host = |t: &Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        [host(&queries), host(&keys), host(&values)]
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32, what: &str) {
+        assert_eq!(actual.len(), expected.len(), "{what}");
+        let scale = expected.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+        for (a, e) in actual.iter().zip(expected) {
+            assert!((a - e).abs() <= tolerance * scale, "{what}: {a} vs {e}");
+        }
+    }
+
+    #[test]
+    fn kv_rows_over_f32_projections_round_once_and_track_the_16_bit_path() {
+        let [q32, k32, v32] = f32_rows_case(&Device::Cpu, DType::F32);
+        let [q16, k16, v16] = f32_rows_case(&Device::Cpu, DType::F16);
+        // Rounding at every stage moves the 16-bit path by a few F16 ulps.
+        assert_close(&q32, &q16, 4e-3, "queries");
+        assert_close(&k32, &k16, 4e-3, "keys");
+        assert_close(&v32, &v16, 1e-3, "values");
+        // The same slots are written (6 and 1), none for the row past the cache.
+        let written = |cache: &[f32]| {
+            cache
+                .chunks(32)
+                .enumerate()
+                .filter(|(_, slot)| slot.iter().any(|x| *x != 0.0))
+                .map(|(slot, _)| slot)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(written(&k32), [1, 6]);
+        assert_eq!(written(&v32), [1, 6]);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_kv_rows_over_f32_projections_match_the_host() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let [q_host, k_host, v_host] = f32_rows_case(&Device::Cpu, DType::F32);
+        let [q_gpu, k_gpu, v_gpu] = f32_rows_case(&device, DType::F32);
+        // Device cosf/sinf and the warp-reduced norm differ from the host's
+        // by an F32 ulp or so before the one F16 rounding.
+        assert_close(&q_gpu, &q_host, 2e-3, "queries");
+        assert_close(&k_gpu, &k_host, 2e-3, "keys");
+        assert_eq!(v_gpu, v_host, "values are cast once");
     }
 
     #[cfg(feature = "cuda")]

@@ -199,6 +199,9 @@ struct Runtime {
     captured_for: Option<(KvArenaId, u64)>,
     /// The width has passed the full verification once.
     verified: bool,
+    /// The warm check's relative L2 error and largest error over the largest
+    /// logit, against the standard decode.
+    warm_error: Option<(f64, f32)>,
 }
 
 impl Runtime {
@@ -210,6 +213,7 @@ impl Runtime {
             step: None,
             captured_for: None,
             verified: false,
+            warm_error: None,
         }
     }
 
@@ -482,7 +486,14 @@ impl Qwen35DecodeGraph {
         let widths = graphs
             .widths
             .iter()
-            .map(|(width, runtime)| (width.to_string(), runtime.phase.name().into()))
+            .map(|(width, runtime)| {
+                let mut entry = serde_json::json!({ "phase": runtime.phase.name() });
+                if let Some((rel_l2, max_fraction)) = runtime.warm_error {
+                    entry["warm_rel_l2"] = rel_l2.into();
+                    entry["warm_max_fraction"] = max_fraction.into();
+                }
+                (width.to_string(), entry)
+            })
             .collect::<serde_json::Map<String, serde_json::Value>>();
         serde_json::json!({
             "backend": if graphs.disabled.is_some() { "legacy" } else { "fused" },
@@ -658,7 +669,6 @@ impl Qwen35DecodeGraph {
         if config.dtype != DType::F16 && config.dtype != DType::BF16 {
             return Err(graph_error("graph attention needs a 16-bit KV cache"));
         }
-        let kv_dtype = config.dtype;
         let page_tokens = config.page_tokens as usize;
         let layout = StepLayout {
             rows: width,
@@ -732,7 +742,6 @@ impl Qwen35DecodeGraph {
                     positions: &positions,
                     slots: &slots,
                     metadata: &metadata,
-                    kv_dtype,
                     page_tokens,
                     max_blocks: layout.max_blocks,
                     max_partitions,
@@ -797,7 +806,7 @@ impl Qwen35DecodeGraph {
             logits.narrow(0, 0, n)?
         };
         if let Some(expected) = expected {
-            device_compare(
+            let observed = device_compare(
                 &[(
                     "graph decode against the standard decode",
                     logits.clone(),
@@ -806,6 +815,7 @@ impl Qwen35DecodeGraph {
                 WARM_CHECK_REL_L2,
                 WARM_CHECK_MAX_FRACTION,
             )?;
+            runtime.warm_error = observed.first().copied();
         }
         runtime.phase = match runtime.phase {
             Phase::Warm => Phase::Capture,
@@ -873,7 +883,7 @@ impl Qwen35DecodeGraph {
                 eager_row.slab.clone(),
             ));
         }
-        device_compare(&pairs, 0.01, 0.02)
+        device_compare(&pairs, 0.01, 0.02).map(drop)
     }
 
     /// Block-table capacity per row: the longest context in pages, plus one
@@ -1092,7 +1102,6 @@ enum Attention<'a> {
         positions: &'a Tensor,
         slots: &'a Tensor,
         metadata: &'a Tensor,
-        kv_dtype: DType,
         page_tokens: usize,
         max_blocks: usize,
         max_partitions: usize,
@@ -1160,7 +1169,6 @@ fn attend(
             positions,
             slots,
             metadata,
-            kv_dtype,
             page_tokens,
             max_blocks,
             max_partitions,
@@ -1172,17 +1180,13 @@ fn attend(
             let (cache_keys, cache_values) = caches
                 .get(physical)
                 .ok_or_else(|| graph_error("no KV cache for an attention layer"))?;
-            // The fused q/k norm + RoPE + write and the split decode take
-            // 16-bit activations; the trunk is F32.
-            let q_proj = q_out
-                .to_dtype(*kv_dtype)?
-                .reshape((rows, full.num_heads * full.head_dim * 2))?;
-            let keys = k_out
-                .to_dtype(*kv_dtype)?
-                .reshape((rows, full.num_kv_heads * full.head_dim))?;
-            let values = v_out
-                .to_dtype(*kv_dtype)?
-                .reshape((rows, full.num_kv_heads * full.head_dim))?;
+            // The fused q/k norm + RoPE + write reads the F32 projections
+            // and rounds once into the cache dtype, as the standard decode
+            // norms and rotates in F32 before its cast; the split decode
+            // takes the 16-bit queries it returns.
+            let q_proj = q_out.reshape((rows, full.num_heads * full.head_dim * 2))?;
+            let keys = k_out.reshape((rows, full.num_kv_heads * full.head_dim))?;
+            let values = v_out.reshape((rows, full.num_kv_heads * full.head_dim))?;
             let queries = rope::qk_norm_rope_kv_rows(
                 &q_proj,
                 &keys,
@@ -1554,8 +1558,13 @@ pub(super) fn uninit_f32(len: usize, device: &Device) -> Result<Tensor> {
 /// [`compare_values`]'s check of each `(label, actual, expected)` pair,
 /// reduced on the device: four scalars per pair (squared error, squared
 /// reference, largest error, largest reference) and one readback for all of
-/// them, instead of every value on the host.
-fn device_compare(pairs: &[(&str, Tensor, Tensor)], rel_l2: f64, max_frac: f32) -> Result<()> {
+/// them, instead of every value on the host. Returns each pair's relative L2
+/// error and largest error over the largest reference magnitude.
+fn device_compare(
+    pairs: &[(&str, Tensor, Tensor)],
+    rel_l2: f64,
+    max_frac: f32,
+) -> Result<Vec<(f64, f32)>> {
     let mut stats = Vec::with_capacity(pairs.len() * 4);
     for (label, actual, expected) in pairs {
         if actual.elem_count() != expected.elem_count() {
@@ -1576,6 +1585,7 @@ fn device_compare(pairs: &[(&str, Tensor, Tensor)], rel_l2: f64, max_frac: f32) 
     let values = Tensor::stack(&stats, 0)?
         .to_device(&Device::Cpu)?
         .to_vec1::<f32>()?;
+    let mut observed_errors = Vec::with_capacity(pairs.len());
     for ((label, _, _), stat) in pairs.iter().zip(values.chunks(4)) {
         let [err, norm, max_err, max_ref] = [stat[0], stat[1], stat[2], stat[3]];
         // A NaN or infinity anywhere makes the sums non-finite.
@@ -1590,8 +1600,9 @@ fn device_compare(pairs: &[(&str, Tensor, Tensor)], rel_l2: f64, max_frac: f32) 
                 "{label}: the graph diverges from the eager step: relative L2 {observed:.3e}, max error {max_err} vs max |ref| {max_ref}"
             )));
         }
+        observed_errors.push((observed, max_err / max_ref.max(f32::MIN_POSITIVE)));
     }
-    Ok(())
+    Ok(observed_errors)
 }
 
 fn graph_error(message: &str) -> Error {
