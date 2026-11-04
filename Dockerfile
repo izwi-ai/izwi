@@ -218,12 +218,17 @@ COPY --link LICENSE NOTICE /usr/share/doc/izwi/
 
 # The base image sets NVIDIA_VISIBLE_DEVICES and NVIDIA_DRIVER_CAPABILITIES;
 # the compose device request decides which GPUs the container gets.
+# izwi's kernels ship as compute_80 PTX, which the driver compiles for the
+# GPU on first use and caches under $HOME/.nv (here /app/data, a volume, so
+# it survives restarts). The cache is raised to its 4 GiB maximum so no
+# compiled module is evicted and recompiled on a later start.
 ENV IZWI_UI_DIR=/app/ui/dist \
     IZWI_MODELS_DIR=/app/models \
     IZWI_DB_PATH=/app/data/izwi.sqlite3 \
     IZWI_MEDIA_DIR=/app/data/media \
     IZWI_HOST=0.0.0.0 \
-    IZWI_BACKEND=cuda
+    IZWI_BACKEND=cuda \
+    CUDA_CACHE_MAXSIZE=4294967296
 
 VOLUME ["/app/models", "/app/data"]
 
