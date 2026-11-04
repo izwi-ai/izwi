@@ -65,7 +65,7 @@ use admission::{
 use checkpoint::{
     census_checkpoint_file, checkpoint_resource_plan, checkpoint_tensor_inventory,
     model_memory_estimate, model_resource_plan, portable_model_memory_estimate,
-    qwen38_synthetic_fixture_estimate, retry_load_peak_bytes, CensusFile, CensusTensor,
+    qwen38_synthetic_fixture_estimate, static_load_peak_bytes, CensusFile, CensusTensor,
     StoredDType, PER_TENSOR_INSTANTIATION_SLACK_BYTES, QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES,
     QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES, QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES,
 };
@@ -720,7 +720,7 @@ impl ModelLifecycleController {
         let context = self.backend_router.context();
         let backend = context.backend_kind;
         let model_path = self.model_manager.downloaded_model_path(variant);
-        let required_bytes = retry_load_peak_bytes(
+        let required_bytes = static_load_peak_bytes(
             variant,
             backend,
             &self.config.performance,
@@ -1514,10 +1514,19 @@ impl RuntimeService {
         true
     }
 
-    /// Memory a model needs to load, from the catalog: what the app shows
-    /// before the model is on disk. A load prices the checkpoint itself.
+    /// Memory a model needs to load on this backend: what the app shows, and
+    /// checks against [`Self::model_capacity_bytes`], before the model is on
+    /// disk. Qwen3.8 and Qwen3.6 are priced by their per-backend
+    /// representation plans, not by their catalog figures (worst-case CPU F32
+    /// hints of 80 and 140 GiB, larger than any one GPU); other models by
+    /// the catalog. A load prices the checkpoint itself.
     pub fn estimated_model_load_bytes(&self, variant: ModelVariant) -> u64 {
-        checkpoint::model_memory_estimate(variant).load_peak_bytes
+        static_load_peak_bytes(
+            variant,
+            self.backend_context().backend_kind,
+            &self.config.performance,
+            None,
+        )
     }
 
     /// The memory loads are planned against on this backend: the operator's

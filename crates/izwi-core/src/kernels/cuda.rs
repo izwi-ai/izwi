@@ -23,6 +23,7 @@ pub mod graphs;
 pub mod kquant;
 pub mod moe;
 pub mod norm;
+pub mod readback;
 pub mod rope;
 pub mod row_gemv;
 pub mod sampling;

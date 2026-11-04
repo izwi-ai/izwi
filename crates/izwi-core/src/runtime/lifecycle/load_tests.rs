@@ -875,13 +875,13 @@ fn qwen38_cuda_q8_0_plan_fits_reported_l40s_available_bytes() {
 
 #[test]
 fn metal_oom_retry_judges_hybrid_checkpoints_by_their_backend_load_peak() {
-    use super::retry_load_peak_bytes;
+    use super::static_load_peak_bytes;
     const GIB: u64 = 1024 * 1024 * 1024;
     let _env_guard = crate::env_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let performance = crate::performance::PerformanceConfig::default();
-    let peak = |variant, backend| retry_load_peak_bytes(variant, backend, &performance, None);
+    let peak = |variant, backend| static_load_peak_bytes(variant, backend, &performance, None);
 
     // Qwen3.8 on Metal (raw block FP8, about 29.9 GiB at load; 51.9 GiB
     // expanded to F16) sits far below the 80 GiB catalog figure that used
@@ -898,6 +898,43 @@ fn metal_oom_retry_judges_hybrid_checkpoints_by_their_backend_load_peak() {
         peak(ModelVariant::Kokoro82M, BackendKind::Metal),
         model_memory_estimate(ModelVariant::Kokoro82M).load_peak_bytes
     );
+}
+
+/// What the app shows Qwen3.6 and Qwen3.8 need before a download, and checks
+/// against the device (`RuntimeService::estimated_model_load_bytes`): each
+/// backend's representation plan, never the catalog's worst-case CPU F32
+/// hints. The 140 GiB hint read "too large" on every GPU and hid Qwen3.6's
+/// Download button; the 80 GiB one did the same to Qwen3.8 on an 80 GB GPU.
+#[test]
+fn device_fit_prices_qwen36_and_qwen38_by_their_backend_plans() {
+    use super::{load_domain_bytes, qwen36moe_memory, static_load_peak_bytes};
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let _env_guard = crate::env_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let performance = crate::performance::PerformanceConfig::default();
+    let peak = |variant, backend| static_load_peak_bytes(variant, backend, &performance, None);
+    for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+        let qwen36 = peak(ModelVariant::Qwen36Moe35BA3BFp8, backend);
+        let plan = qwen36moe_memory::resource_plan(backend, &performance).unwrap();
+        assert_eq!(
+            ResourceAmount::Known(qwen36),
+            load_domain_bytes(plan.load_authorization, backend),
+            "Qwen3.6 on {backend:?}"
+        );
+        assert!(
+            qwen36 < model_memory_estimate(ModelVariant::Qwen36Moe35BA3BFp8).load_peak_bytes,
+            "Qwen3.6 on {backend:?}"
+        );
+        assert_eq!(
+            peak(ModelVariant::Qwen3827BFp8, backend),
+            qwen38_representation_memory_estimate(backend, &performance).load_peak_bytes,
+            "Qwen3.8 on {backend:?}"
+        );
+    }
+    // Both fit the 79.2 GiB an 80 GB H100 reports, with room for state.
+    assert!(peak(ModelVariant::Qwen36Moe35BA3BFp8, BackendKind::Cuda) < 48 * GIB);
+    assert!(peak(ModelVariant::Qwen3827BFp8, BackendKind::Cuda) < 48 * GIB);
 }
 
 #[test]

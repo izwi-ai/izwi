@@ -4665,7 +4665,7 @@ pub(super) mod tests {
             .unwrap()
             .expect("VibeVoice has a residency plan");
             let admitted = super::super::load_domain_bytes(plan.load_authorization, backend);
-            let retry = super::super::retry_load_peak_bytes(
+            let retry = super::super::static_load_peak_bytes(
                 ModelVariant::VibeVoiceAsr,
                 backend,
                 &performance,
@@ -4743,7 +4743,7 @@ pub(super) mod tests {
                     .unwrap()
                     .expect("the aligner has a residency plan");
             let admitted = super::super::load_domain_bytes(plan.load_authorization, backend);
-            let retry = super::super::retry_load_peak_bytes(
+            let retry = super::super::static_load_peak_bytes(
                 variant,
                 backend,
                 &performance,
@@ -5004,7 +5004,7 @@ pub(super) mod tests {
                 .unwrap();
                 assert_eq!(
                     super::super::load_domain_bytes(admitted.load_authorization, backend),
-                    ResourceAmount::Known(super::super::retry_load_peak_bytes(
+                    ResourceAmount::Known(super::super::static_load_peak_bytes(
                         variant,
                         backend,
                         &performance,
@@ -5083,7 +5083,7 @@ pub(super) mod tests {
         }
         let performance = crate::performance::PerformanceConfig::default();
         assert_eq!(
-            super::super::retry_load_peak_bytes(
+            super::super::static_load_peak_bytes(
                 ModelVariant::Kokoro82M,
                 BackendKind::Metal,
                 &performance,

@@ -7,14 +7,18 @@
 //! device-resident history counts, temperature, top-k and top-p over the full
 //! vocabulary, then the row's host-drawn uniform. The token goes straight
 //! into the whole-step graph's input slot, is counted in the device history,
-//! and reaches the host through a pinned buffer, all queued behind the step
-//! that produced the logits with no host synchronization. (Other devices,
-//! in tests, read the choice back directly.)
+//! and reaches the host through a readback slot (`kernels::cuda::readback`),
+//! all queued behind the step that produced the logits with no host
+//! synchronization.
 use candle_core::{DType, Device, Tensor};
 
 use crate::error::{Error, Result};
+use crate::kernels::cuda::readback::ChoiceReadback;
 use crate::kernels::cuda::sampling::{self, SamplingParams};
 use crate::models::shared::chat::ChatGenerationConfig;
+
+/// The choices of two queued steps can be in flight at once.
+const READBACK_SLOTS: usize = 2;
 
 pub(super) struct DeviceSelector {
     device: Device,
@@ -24,18 +28,8 @@ pub(super) struct DeviceSelector {
     /// Occurrences of each token in the penalty history (U32 `[vocab]`).
     counts: Option<Tensor>,
     one: Tensor,
-    readback: Readback,
+    readback: ChoiceReadback,
     next: usize,
-}
-
-/// Where queued choices land: the choices of two queued steps can be in
-/// flight at once.
-enum Readback {
-    /// Two pinned `(token, status)` buffers, filled by async copies (CUDA).
-    #[cfg(feature = "cuda")]
-    Pinned([candle_core::cuda_backend::cudarc::driver::PinnedHostSlice<u32>; 2]),
-    /// The choice tensors themselves, read on `wait`.
-    Tensors([Option<Tensor>; 2]),
 }
 
 /// A queued choice; [`DeviceSelector::wait`] returns its token.
@@ -54,7 +48,7 @@ impl DeviceSelector {
         greedy: bool,
         history: &[u32],
     ) -> Result<Self> {
-        let readback = Readback::new(device)?;
+        let readback = ChoiceReadback::new(device, READBACK_SLOTS)?;
         let (params, counts) = if greedy {
             (None, None)
         } else {
@@ -132,73 +126,5 @@ impl DeviceSelector {
             ));
         }
         Ok(token)
-    }
-}
-
-impl Readback {
-    fn new(device: &Device) -> Result<Self> {
-        #[cfg(feature = "cuda")]
-        if let Device::Cuda(cuda) = device {
-            let context = cuda.cuda_stream().context().clone();
-            let pinned = || {
-                // SAFETY: a device copy writes the buffer before every read.
-                unsafe { context.alloc_pinned::<u32>(2) }.map_err(|error| {
-                    Error::InferenceError(format!("pinned token readback: {error}"))
-                })
-            };
-            return Ok(Self::Pinned([pinned()?, pinned()?]));
-        }
-        let _ = device;
-        Ok(Self::Tensors([None, None]))
-    }
-
-    /// Start moving `chosen` (U32 `[1, 2]`) toward the host.
-    fn queue(&mut self, slot: usize, chosen: &Tensor) -> Result<()> {
-        match self {
-            #[cfg(feature = "cuda")]
-            Self::Pinned(buffers) => {
-                let (storage, layout) = chosen.storage_and_layout();
-                let candle_core::Storage::Cuda(cuda) = &*storage else {
-                    return Err(Error::InferenceError(
-                        "device token selection produced a host tensor".into(),
-                    ));
-                };
-                let (start, end) = layout.contiguous_offsets().ok_or_else(|| {
-                    Error::InferenceError("token choice is not contiguous".into())
-                })?;
-                let view = cuda.as_cuda_slice::<u32>()?.slice(start..end);
-                chosen
-                    .device()
-                    .as_cuda_device()?
-                    .cuda_stream()
-                    .memcpy_dtoh(&view, &mut buffers[slot])
-                    .map_err(|error| Error::InferenceError(format!("token readback: {error}")))
-            }
-            Self::Tensors(tensors) => {
-                tensors[slot] = Some(chosen.clone());
-                Ok(())
-            }
-        }
-    }
-
-    /// `(token, status)` of the choice in `slot`, waiting for its copy.
-    fn read(&self, slot: usize) -> Result<(u32, u32)> {
-        match self {
-            #[cfg(feature = "cuda")]
-            Self::Pinned(buffers) => {
-                let values = buffers[slot]
-                    .as_slice()
-                    .map_err(|error| Error::InferenceError(format!("token readback: {error}")))?;
-                Ok((values[0], values[1]))
-            }
-            Self::Tensors(tensors) => {
-                let values = tensors[slot]
-                    .as_ref()
-                    .ok_or_else(|| Error::InferenceError("no queued token choice".into()))?
-                    .flatten_all()?
-                    .to_vec1::<u32>()?;
-                Ok((values[0], values[1]))
-            }
-        }
     }
 }

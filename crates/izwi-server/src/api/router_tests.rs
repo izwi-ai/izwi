@@ -3749,6 +3749,19 @@ async fn admin_models_report_fit_disk_and_storage() {
         parakeet["disk_required_bytes"].as_u64(),
         parakeet["size_bytes"].as_u64().map(|bytes| bytes * 2)
     );
+    // Qwen3.6 and Qwen3.8 report their per-backend plans, not the catalog's
+    // worst-case CPU F32 hints (140 and 80 GiB), which read "too large" on
+    // every GPU and hid their Download buttons.
+    const GIB: u64 = 1024 * 1024 * 1024;
+    for (variant, catalog_hint_gib) in [("Qwen3.6-35B-A3B-FP8", 140), ("Qwen3.8-27B-FP8", 80)] {
+        let estimated = find(variant)["estimated_memory_bytes"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{variant} has a memory estimate"));
+        assert!(
+            (20 * GIB..catalog_hint_gib * GIB).contains(&estimated),
+            "{variant} needs {estimated} bytes"
+        );
+    }
 
     let storage = read_json(
         send_request(

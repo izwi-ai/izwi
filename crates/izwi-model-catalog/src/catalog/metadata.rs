@@ -911,13 +911,16 @@ impl ModelVariant {
             Self::Qwen359BGguf => 16.0,
             // Backend-specific admission replaces this coarse catalog hint:
             // packed FP8 CUDA needs less, while the CPU F32 fallback needs more.
-            // No load path reads it as Qwen3.8's footprint; it is not shown to
-            // users either (`ModelInfo` carries no memory figure).
+            // No load path reads it as Qwen3.8's footprint, and the app's
+            // memory figure and device fit use the per-backend plan
+            // (`RuntimeService::estimated_model_load_bytes`): 80 GiB is more
+            // than an 80 GB GPU reports.
             Self::Qwen3827BFp8 => 80.0,
-            // Same contract as Qwen38_27B_FP8: backend-specific admission
-            // replaces this hint. 140.0 is the worst-case CPU F32 expanded
-            // envelope (34.45B FP8 params + 1.5B BF16 params, dequantized);
-            // the qwen3_5_moe representation plan replaces it per backend.
+            // Same contract as Qwen38_27B_FP8: backend-specific admission and
+            // the app's device fit replace this hint. 140.0 is the worst-case
+            // CPU F32 expanded envelope (34.45B FP8 params + 1.5B BF16 params,
+            // dequantized); the qwen3_5_moe representation plan replaces it
+            // per backend (about 37 GiB on CUDA).
             Self::Qwen36Moe35BA3BFp8 => 140.0,
             Self::Gemma34BIt => 11.0,
             // The aligner expands to F32 on the CPU (3.42 GiB); Metal (F16
