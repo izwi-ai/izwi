@@ -301,6 +301,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Enables packed (fused) projection weights on CUDA (auto/off mode).",
     ),
     CoreEnvVar::new(
+        "IZWI_CUDA_POOL_RETAIN",
+        Flag,
+        "true",
+        Startup,
+        "Keeps freed device memory in the CUDA memory pool across synchronizations instead of returning it to the OS at each sync; false restores the driver default.",
+    ),
+    CoreEnvVar::new(
         "IZWI_CUDA_PROJECTION_BACKEND",
         Choice,
         "auto",

@@ -962,6 +962,7 @@ impl DeviceSelector {
             .ok()?
             .ok()?;
         if device.is_cuda() {
+            retain_cuda_pool_memory(&device);
             let cuda_capabilities = Self::detect_cuda_capabilities(ordinal);
             let supports_bf16 = cuda_capabilities
                 .compute_capability
@@ -1457,6 +1458,100 @@ fn detect_cuda_capabilities(ordinal: usize) -> CudaProbe {
 #[cfg(not(feature = "cuda"))]
 fn detect_cuda_capabilities(_ordinal: usize) -> CudaProbe {
     CudaProbe::default()
+}
+
+/// Kill switch for [`retain_cuda_pool_memory`] (`false` keeps the driver's
+/// default release threshold).
+pub(crate) const CUDA_POOL_RETAIN_ENV: &str = "IZWI_CUDA_POOL_RETAIN";
+
+/// Keep freed device memory in the device's default memory pool across
+/// synchronizations. cudarc allocates every tensor from that pool
+/// (`cuMemAllocAsync`), whose release threshold defaults to 0: at each stream
+/// or event synchronization the driver hands all unused pool memory back to
+/// the OS, and the next step's allocations map it again. A decode step
+/// synchronizes at least once and allocates hundreds of tensors (per-row
+/// recurrent states, rings, activations), so they would all pay the mapping
+/// every step. Memory the pool holds but no tensor uses still counts as free
+/// in the VRAM probe ([`cuda_pool_idle_bytes`]).
+#[cfg(feature = "cuda")]
+fn retain_cuda_pool_memory(device: &Device) {
+    use candle_core::cuda_backend::cudarc::driver::sys;
+
+    if !crate::env::flag_or(CUDA_POOL_RETAIN_ENV, true) {
+        info!(
+            "{CUDA_POOL_RETAIN_ENV}=false: the CUDA memory pool releases freed memory at each sync"
+        );
+        return;
+    }
+    let Ok(cuda) = device.as_cuda_device() else {
+        return;
+    };
+    let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+    let mut threshold = u64::MAX;
+    // SAFETY: the device handle comes from a live context; the driver writes
+    // the pool handle into `pool`, and reads one u64 through the attribute
+    // pointer.
+    let result = unsafe {
+        let got =
+            sys::cuDeviceGetDefaultMemPool(&mut pool, cuda.cuda_stream().context().cu_device());
+        if got != sys::CUresult::CUDA_SUCCESS {
+            got
+        } else {
+            sys::cuMemPoolSetAttribute(
+                pool,
+                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                (&mut threshold as *mut u64).cast(),
+            )
+        }
+    };
+    if result == sys::CUresult::CUDA_SUCCESS {
+        info!("CUDA memory pool keeps freed memory across synchronizations");
+    } else {
+        warn!(
+            ?result,
+            "could not raise the CUDA memory pool release threshold"
+        );
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn retain_cuda_pool_memory(_device: &Device) {}
+
+/// Bytes the device's default memory pool holds but no allocation uses: free
+/// for izwi's own allocations, though `cuMemGetInfo` counts them as used.
+/// `None` when the pool cannot be read.
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_pool_idle_bytes(
+    device: candle_core::cuda_backend::cudarc::driver::sys::CUdevice,
+) -> Option<u64> {
+    use candle_core::cuda_backend::cudarc::driver::sys;
+
+    let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+    let (mut reserved, mut used) = (0u64, 0u64);
+    // SAFETY: the driver writes the pool handle and two u64 attributes into
+    // the locals; the calls read no other memory.
+    unsafe {
+        if sys::cuDeviceGetDefaultMemPool(&mut pool, device) != sys::CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        for (attribute, value) in [
+            (
+                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+                &mut reserved,
+            ),
+            (
+                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+                &mut used,
+            ),
+        ] {
+            if sys::cuMemPoolGetAttribute(pool, attribute, (value as *mut u64).cast())
+                != sys::CUresult::CUDA_SUCCESS
+            {
+                return None;
+            }
+        }
+    }
+    Some(reserved.saturating_sub(used))
 }
 
 #[cfg(test)]

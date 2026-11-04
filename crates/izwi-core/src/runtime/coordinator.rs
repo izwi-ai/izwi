@@ -3595,9 +3595,13 @@ fn cuda_memory_snapshot(device: &DeviceProfile) -> Option<(u64, u64, CapacitySou
     let sample =
         unsafe { result::ctx::set_current(context.cu_ctx()) }.and_then(|()| result::mem_get_info());
     match sample {
+        // The memory pool keeps freed memory across synchronizations; what it
+        // holds unused is free for the next allocation.
         Ok((available, total)) => Some((
             u64::try_from(total).ok()?,
-            u64::try_from(available).ok()?,
+            u64::try_from(available).ok()?.saturating_add(
+                crate::backends::device::cuda_pool_idle_bytes(context.cu_device()).unwrap_or(0),
+            ),
             CapacitySource::CudaDriver,
         )),
         Err(error) => {

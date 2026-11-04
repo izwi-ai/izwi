@@ -52,6 +52,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_CUDA_MTP_IN_CONTINUOUS` | auto/flag | `off` | startup | Opts in (auto) to shared speculative MTP envelopes inside continuous batches; off by default because each row verifies with its own trunk pass. |
 | `IZWI_CUDA_MTP_QUANTUM` | auto/flag | `auto` | startup | Enables the quantum (multi-step) MTP decode path (auto/off mode). |
 | `IZWI_CUDA_PACKED_PROJECTIONS` | auto/flag | `auto` | startup | Enables packed (fused) projection weights on CUDA (auto/off mode). |
+| `IZWI_CUDA_POOL_RETAIN` | flag | `true` | startup | Keeps freed device memory in the CUDA memory pool across synchronizations instead of returning it to the OS at each sync; false restores the driver default. |
 | `IZWI_CUDA_PROJECTION_BACKEND` | choice | `auto` | startup | Chooses CUDA block-FP8 projection backend: auto, q8 or native_fp8; invalid = startup error. |
 | `IZWI_CUDA_RUNTIME_ACTIVE` | flag | `false` | startup | Marks that the process is running inside the packaged private CUDA runtime. |
 | `IZWI_CUDA_RUNTIME_BINARY` | path | unset (search next to the executable and lib/izwi/runtime/cuda) | startup | Path to the private CUDA runtime binary, tried first before the built-in search locations. |
