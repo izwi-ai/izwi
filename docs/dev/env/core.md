@@ -262,6 +262,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_QWEN36_FP8_LM_HEAD` | flag | true (CUDA native-FP8 residency only) | model load | Kill switch: legacy/off keeps the Qwen3.6-MoE LM head in BF16 instead of block FP8. Also: `legacy` means false. |
 | `IZWI_QWEN36_FUSED_DECODE` | flag | `true` | model load | Kill switch: legacy/off keeps Qwen3.6-MoE decode on the Candle op chain (fused DeltaNet, norms, q/k, gate, FP8 GEMV). Also: `legacy` means false. |
 | `IZWI_QWEN36_GROUPED_MMA` | flag | `true` | model load | Kill switch: legacy/off disables the tensor-core grouped MoE prefill kernels for Qwen3.6-MoE. Also: `legacy` means false. |
+| `IZWI_QWEN36_LOAD_TIMINGS` | flag | true (CUDA only) | model load | Kill switch: legacy/off skips the Qwen3.6 load-time CUDA kernel timing measurements reported in diagnostics. Also: `legacy` means false. |
 | `IZWI_QWEN36_MOE_BACKEND` | choice | `auto` | model load | Selects the Qwen3.6-MoE sparse-expert path: auto (fused kernels when allowed), or legacy or a false boolean (host-routed loop). |
 | `IZWI_QWEN36_MTP_HANDOFF` | flag | `false` | model load | Explicit opt-in that, with the MTP performance knob, lets Qwen3.6-MoE load its multi-token-prediction draft head. |
 | `IZWI_QWEN36_REAL_CHECKPOINT_E2E` | path | unset (probe skipped) | test harness | Real Qwen3.6 checkpoint directory for the ASCII-coherence end-to-end probe. |

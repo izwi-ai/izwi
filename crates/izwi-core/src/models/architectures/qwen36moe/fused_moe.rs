@@ -437,9 +437,34 @@ impl Qwen36MoeFusedExperts {
 
     /// Routed (plus folded shared) output for `flat` `[tokens, hidden]`.
     pub(crate) fn forward(&self, flat: &Tensor) -> Result<Tensor> {
-        let logits = moe::router_logits(flat, &self.router)?;
-        let routing = moe::route(&logits, &self.spec)?;
+        let routing = self.route(flat)?;
         self.combine(flat, &routing)
+    }
+
+    /// The device routing of `flat` `[tokens, hidden]`.
+    pub(crate) fn route(&self, flat: &Tensor) -> Result<Tensor> {
+        let logits = moe::router_logits(flat, &self.router)?;
+        Ok(moe::route(&logits, &self.spec)?)
+    }
+
+    /// Whether the grouped expert kernels serve calls of
+    /// [`moe::GROUPED_MIN_TOKENS`] tokens or more.
+    pub(crate) fn grouped(&self) -> bool {
+        self.grouped
+    }
+
+    /// [`Self::combine`] through the grouped kernels whatever the token count.
+    pub(crate) fn combine_grouped(&self, flat: &Tensor, routing: &Tensor) -> Result<Tensor> {
+        moe::fp8_moe_grouped(
+            flat,
+            routing,
+            self.spec.slots(),
+            &self.w13,
+            &self.s13,
+            &self.w2,
+            &self.s2,
+        )
+        .map_err(Error::from)
     }
 
     fn combine(&self, flat: &Tensor, routing: &Tensor) -> Result<Tensor> {
@@ -453,7 +478,7 @@ impl Qwen36MoeFusedExperts {
         self.combine_per_pair(flat, routing)
     }
 
-    fn combine_per_pair(&self, flat: &Tensor, routing: &Tensor) -> Result<Tensor> {
+    pub(crate) fn combine_per_pair(&self, flat: &Tensor, routing: &Tensor) -> Result<Tensor> {
         let slots = self.spec.slots();
         let act = moe::fp8_gate_up(flat, routing, slots, &self.w13, &self.s13)?;
         moe::fp8_down(&act, routing, slots, &self.w2, &self.s2).map_err(Error::from)

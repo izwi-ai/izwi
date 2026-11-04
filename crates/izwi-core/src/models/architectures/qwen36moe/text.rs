@@ -44,6 +44,8 @@ use crate::models::architectures::qwen36moe::sparse::Qwen36MoeSparseMlp;
 
 #[path = "decode_graph.rs"]
 mod decode_graph;
+#[path = "kernel_timings.rs"]
+mod kernel_timings;
 
 pub struct Qwen36TextModel {
     device: Device,
@@ -5318,6 +5320,45 @@ pub(crate) mod tests {
                     "step {step}: fused decode picks a different token"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn load_time_kernel_timings_run_every_measurement_shape() {
+        let mut model = super::Qwen36TextModel::load_with_source(
+            &SyntheticFp8Source::new(
+                crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest::Auto,
+            ),
+            &e2e_config(),
+            &Device::Cpu,
+        )
+        .unwrap();
+        assert_eq!(model.kernel_timings()["status"], "cuda_only");
+        model.enable_fused_paths_for_tests();
+        let timings = model
+            .measure_kernel_timings(std::time::Instant::now(), std::time::Duration::from_secs(600))
+            .unwrap();
+        for rows in ["1", "4", "5", "8", "16", "32"] {
+            let width = &timings["projections_by_rows"][rows];
+            for kind in [
+                "linear_attn.in_proj",
+                "linear_attn.out_proj",
+                "self_attn.qkv",
+                "self_attn.o_proj",
+                "lm_head",
+            ] {
+                assert!(width[kind]["ms"].as_f64().is_some(), "{rows} {kind}: {width}");
+            }
+            assert!(width["projection_step_ms"].as_f64().is_some());
+        }
+        assert_eq!(timings["layers"]["deltanet"], 3);
+        assert!(timings["deltanet_row_ms"].as_f64().is_some(), "{timings}");
+        assert!(timings["projections_by_rows"]["8"]["deltanet_rows_step_ms"]
+            .as_f64()
+            .is_some());
+        for tokens in ["1", "8", "32", "128"] {
+            let moe = &timings["moe_by_tokens"][tokens];
+            assert!(moe["per_pair_ms"].as_f64().is_some(), "{tokens}: {moe}");
         }
     }
 

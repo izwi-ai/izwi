@@ -1785,6 +1785,14 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     )
     .aliases(&[("legacy", false)]),
     CoreEnvVar::new(
+        "IZWI_QWEN36_LOAD_TIMINGS",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off skips the Qwen3.6 load-time CUDA kernel timing measurements reported in diagnostics.",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
         "IZWI_QWEN36_MOE_BACKEND",
         Choice,
         "auto",

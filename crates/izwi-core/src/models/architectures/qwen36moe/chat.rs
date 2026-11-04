@@ -103,6 +103,9 @@ pub struct Qwen36MoeChatModel {
     kv_storage_provider: Qwen36MoeKvStorageProvider,
     performance: crate::performance::CudaPerformanceConfig,
     exec: Qwen36ChatExec,
+    /// Load-time device timings of the decode kernels (see
+    /// `kernel_timings.rs`), reported under `kernel_timings`.
+    kernel_timings: serde_json::Value,
 }
 
 impl InferenceStateContractProvider for Qwen36MoeChatModel {
@@ -231,11 +234,16 @@ impl Qwen36MoeChatModel {
             %cuda_graphs,
             "Qwen3.6-MoE fused kernel paths"
         );
+        let kernel_timings = exec.text_model.kernel_timings();
+        if kernel_timings["status"] == "measured" {
+            tracing::info!(timings = %kernel_timings, "Qwen3.6-MoE load-time kernel timings");
+        }
         Ok(Self {
             device_kind,
             kv_storage_provider,
             performance: performance.cuda.clone(),
             exec,
+            kernel_timings,
         })
     }
 
@@ -508,6 +516,7 @@ impl Qwen36MoeChatModel {
             "fp8_gemv": self.exec.text_model.fp8_gemv_summary(),
             "lm_head": self.exec.text_model.lm_head_summary(),
             "cuda_graphs": self.exec.text_model.cuda_graphs_summary(),
+            "kernel_timings": self.kernel_timings,
             "mtp": {
                 "head_loaded": self.exec.mtp_head.is_some(),
                 "draft_depth": self.exec.mtp_head.as_ref().map(|head| head.draft_depth()),

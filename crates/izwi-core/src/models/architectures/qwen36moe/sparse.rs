@@ -256,6 +256,11 @@ impl Qwen36MoeSparseMlp {
     }
 
     /// Execution path this block resolved to at load.
+    /// The stacked fused experts, when this layer resolved them.
+    pub(crate) fn fused_experts(&self) -> Option<&super::fused_moe::Qwen36MoeFusedExperts> {
+        self.fused.as_ref()
+    }
+
     pub(crate) fn backend(&self) -> &Qwen36FusedPath {
         &self.backend
     }
