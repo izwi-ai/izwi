@@ -274,6 +274,9 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub chat_concurrency_policy: crate::engine::metrics::EngineChatConcurrencyPolicySnapshot,
     pub scheduler_queue_depth: u64,
     pub scheduler_running_requests: u64,
+    /// The queue, running and KV figures were read before the current step,
+    /// which held the engine core when telemetry asked.
+    pub scheduler_counts_stale: bool,
     pub incremental_prefill_quanta_committed_total: u64,
     pub incremental_prefill_tokens_committed_total: u64,
     pub multispan_prefill_requests_total: u64,

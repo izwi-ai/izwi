@@ -368,9 +368,12 @@ impl RuntimeService {
     }
 
     pub(super) async fn engine_telemetry_snapshot(&self) -> EngineRuntimeTelemetrySnapshot {
-        let queue_depth = self.core_engine.pending_requests().await as u64;
-        let running_requests = self.core_engine.running_requests().await as u64;
-        let kv_cache = self.core_engine.kv_cache_snapshot().await;
+        // Never waits behind a step: the last counts are served while one
+        // holds the core.
+        let core = self.core_engine.core_telemetry().await;
+        let queue_depth = core.pending_requests as u64;
+        let running_requests = core.running_requests as u64;
+        let kv_cache = core.kv_cache.clone();
         let stream = engine_stream_metrics_snapshot();
 
         let batch = engine_batch_metrics_snapshot();
@@ -378,6 +381,7 @@ impl RuntimeService {
             chat_concurrency_policy: self.chat_concurrency_policy(),
             scheduler_queue_depth: queue_depth,
             scheduler_running_requests: running_requests,
+            scheduler_counts_stale: core.stale,
             incremental_prefill_quanta_committed_total: batch
                 .incremental_prefill_quanta_committed_total,
             incremental_prefill_tokens_committed_total: batch
