@@ -164,6 +164,7 @@ pub(crate) struct RepresentationElementBucket {
 
 /// Element inventory of the published checkpoint's persistent representation,
 /// derived from the same tensor plans the loader validates against.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct PinnedRepresentationInventory {
     pub fp8_elements: u64,
     pub dense_elements: u64,
@@ -256,7 +257,16 @@ fn fold_representation_inventory(
     bucket
 }
 
+/// [`PinnedRepresentationInventory`] of the pinned checkpoint. It depends on
+/// the pinned constants alone, and folding it walks about 60k planned tensors,
+/// so it is folded once: the models list prices every row on every poll.
 pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory {
+    static INVENTORY: std::sync::OnceLock<PinnedRepresentationInventory> =
+        std::sync::OnceLock::new();
+    *INVENTORY.get_or_init(fold_pinned_representation_inventory)
+}
+
+fn fold_pinned_representation_inventory() -> PinnedRepresentationInventory {
     let config = pinned_native_config();
     let plan = expected_text_tensor_plan(&config)
         .expect("pinned config produces the validated tensor plan");

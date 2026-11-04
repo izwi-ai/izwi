@@ -101,14 +101,16 @@ pub(super) fn checkpoint_resource_plan(
     tts_memory::resource_plan(variant, model_path, device)
 }
 
-/// Static load peak that decides whether a Metal OOM retry can fit. The
-/// catalog's `memory_required_gb` is one coarse figure for every backend (80
-/// GiB for Qwen3.8, 140 GiB for Qwen3.6, sized for the CPU F32 expansion);
-/// these checkpoints use the per-backend representation estimate that load
-/// admission prices instead. A planned checkpoint (`checkpoint`: its path and
-/// the load device; Fish, ASR and TTS) is judged by the plan first admission
-/// priced ([`checkpoint_resource_plan`], with the engine's Granite overrides).
-pub(super) fn retry_load_peak_bytes(
+/// Static load peak of `variant` on `backend`: what the app shows a model
+/// needs, and what decides whether a Metal OOM retry can fit. The catalog's
+/// `memory_required_gb` is one coarse figure for every backend (80 GiB for
+/// Qwen3.8, 140 GiB for Qwen3.6, sized for the CPU F32 expansion); these
+/// checkpoints use the per-backend representation estimate that load
+/// admission prices instead, which needs no file on disk. A planned
+/// checkpoint (`checkpoint`: its path and the load device; Fish, ASR and TTS)
+/// is judged by the plan first admission priced
+/// ([`checkpoint_resource_plan`], with the engine's Granite overrides).
+pub(super) fn static_load_peak_bytes(
     variant: ModelVariant,
     backend: BackendKind,
     performance: &crate::performance::PerformanceConfig,

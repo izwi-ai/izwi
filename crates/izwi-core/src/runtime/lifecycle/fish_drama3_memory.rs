@@ -601,7 +601,7 @@ mod tests {
             .unwrap()
             .expect("a Drama 3 plan");
         assert_eq!(plan, resource_plan(&dir, BackendKind::Cpu).unwrap());
-        let peak = super::super::retry_load_peak_bytes(
+        let peak = super::super::static_load_peak_bytes(
             variant,
             BackendKind::Cpu,
             &crate::performance::PerformanceConfig::default(),

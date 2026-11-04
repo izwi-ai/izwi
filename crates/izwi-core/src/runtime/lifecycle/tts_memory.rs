@@ -1449,7 +1449,7 @@ mod tests {
                 .unwrap()
                 .expect("VibeVoice-TTS has a residency plan");
             let admitted = super::super::load_domain_bytes(plan.load_authorization, backend);
-            let retry = super::super::retry_load_peak_bytes(
+            let retry = super::super::static_load_peak_bytes(
                 variant,
                 backend,
                 &performance,
