@@ -36,11 +36,25 @@ impl ModelLifecycleController {
                 };
                 bundle_draft.seal_chat_mixed_step(token_budget as u64)?;
             }
+            // The largest stage's workspace, plus on CUDA the per-row
+            // dispatch scratch a full-width step also claims
+            // (`CUDA_DISPATCH_SCRATCH_BYTES_PER_ROW`): without it the KV fit
+            // spends that headroom, a full-width step's reservation loses the
+            // race with transient allocations, and the rows run at half width.
+            let scratch_per_row = if backend == BackendKind::Cuda {
+                crate::engine::CUDA_DISPATCH_SCRATCH_BYTES_PER_ROW
+            } else {
+                0
+            };
             let decode_workspace_reserve_bytes = bundle_draft
                 .execution_contracts(CapabilityKind::Chat)?
                 .iter()
                 .flat_map(|contract| contract.stages.iter())
-                .map(|stage| stage.max_workspace_bytes)
+                .map(|stage| {
+                    stage
+                        .max_workspace_bytes
+                        .saturating_add(scratch_per_row.saturating_mul(stage.max_batch_size as u64))
+                })
                 .max()
                 .unwrap_or(0);
             let loaded_cache = loaded.inference_state_contract()?;

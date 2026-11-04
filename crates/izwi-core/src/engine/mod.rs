@@ -34,6 +34,7 @@ pub(crate) use core::CudaResidentPool;
 pub mod execution;
 mod execution_group;
 mod executor;
+pub(crate) use executor::CUDA_DISPATCH_SCRATCH_BYTES_PER_ROW;
 #[cfg(test)]
 pub(crate) use executor::qwen3_asr_requires_long_form;
 pub(crate) use executor::{
