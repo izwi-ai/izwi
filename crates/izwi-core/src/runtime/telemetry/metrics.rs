@@ -11,8 +11,8 @@ use tokio::sync::Mutex;
 use crate::engine::{
     engine_metric_catalog, prometheus_engine_metric_name, prometheus_engine_metric_type,
     EngineDeadlinePhaseMetricsSnapshot, EngineDispatchStateMetricsSnapshot,
-    EngineFailureOriginMetricsSnapshot, EngineMetricDescriptor, EngineOutput,
-    EnginePhysicalExecutionMetricsSnapshot, EngineWorkspaceDomainMetricsSnapshot,
+    EngineDispatchWidthTime, EngineFailureOriginMetricsSnapshot, EngineMetricDescriptor,
+    EngineOutput, EnginePhysicalExecutionMetricsSnapshot, EngineWorkspaceDomainMetricsSnapshot,
     ManagedKvRuntimeSnapshot, ENGINE_EXECUTOR_PHYSICAL_BATCHES_TOTAL,
     ENGINE_EXECUTOR_PHYSICAL_BATCH_CAPACITY_ROWS_TOTAL, ENGINE_EXECUTOR_PHYSICAL_BATCH_FILL_RATIO,
     ENGINE_EXECUTOR_PHYSICAL_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
@@ -28,8 +28,9 @@ use crate::engine::{
     ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_STARTED_TOTAL,
     ENGINE_EXECUTOR_PHYSICAL_DISPATCH_OBSERVATIONS_TOTAL,
     ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_MAX, ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_TOTAL,
-    ENGINE_EXECUTOR_PHYSICAL_EXECUTION_CAP, ENGINE_EXECUTOR_PHYSICAL_EXECUTION_MODE,
-    ENGINE_EXECUTOR_PHYSICAL_FALLBACKS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_DISPATCHES_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_MICROS_TOTAL, ENGINE_EXECUTOR_PHYSICAL_EXECUTION_CAP,
+    ENGINE_EXECUTOR_PHYSICAL_EXECUTION_MODE, ENGINE_EXECUTOR_PHYSICAL_FALLBACKS_TOTAL,
     ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_OBSERVATIONS_TOTAL,
     ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_MAX,
     ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_TOTAL,
@@ -306,6 +307,8 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub model_tensor_multirow_calls_total: u64,
     /// Exact widths 1..=64; key 0 is overflow, never an exact-width proof.
     pub model_tensor_batch_width_counts: BTreeMap<u64, u64>,
+    /// Physical dispatch time by row count and phase.
+    pub physical_dispatch_widths: Vec<EngineDispatchWidthTime>,
     pub capacity_suspensions_total: u64,
     pub capacity_replay_tokens_total: u64,
     pub capacity_replay_capped_total: u64,
@@ -1254,6 +1257,37 @@ pub(crate) fn push_engine_labeled_metric_f64(
             "{prometheus_name}{{{label_name}=\"{label_value}\"}} {value:.6}\n"
         ));
     }
+}
+
+/// Physical dispatch microseconds and counts by width and phase.
+pub(crate) fn push_engine_dispatch_width_metrics(
+    payload: &mut String,
+    cells: &[EngineDispatchWidthTime],
+) {
+    let labels = |cell: &EngineDispatchWidthTime| {
+        vec![
+            ("width", cell.width.to_string()),
+            ("phase", cell.phase.label().to_string()),
+        ]
+    };
+    let micros = cells
+        .iter()
+        .map(|cell| (labels(cell), cell.micros))
+        .collect::<Vec<_>>();
+    let dispatches = cells
+        .iter()
+        .map(|cell| (labels(cell), cell.dispatches))
+        .collect::<Vec<_>>();
+    push_engine_multi_labeled_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_MICROS_TOTAL,
+        &micros,
+    );
+    push_engine_multi_labeled_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_DISPATCHES_TOTAL,
+        &dispatches,
+    );
 }
 
 pub(crate) fn push_engine_physical_execution_metrics(

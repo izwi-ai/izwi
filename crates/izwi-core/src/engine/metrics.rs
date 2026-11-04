@@ -136,6 +136,10 @@ pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCH_OBSERVATIONS_TOTAL: &str =
     "engine.executor.physical_dispatch_observations_total";
 pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_MAX: &str =
     "engine.executor.physical_dispatch_seconds_max";
+pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_MICROS_TOTAL: &str =
+    "engine.executor.physical_dispatch_width_micros_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_DISPATCHES_TOTAL: &str =
+    "engine.executor.physical_dispatch_width_dispatches_total";
 pub const ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_SECONDS_TOTAL: &str =
     "engine.executor.physical_cohort_wait_seconds_total";
 pub const ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_OBSERVATIONS_TOTAL: &str =
@@ -390,6 +394,14 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     EngineMetricDescriptor {
         name: ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL,
         description: "Proven tensor-batched model call paths that executed at least two live rows.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_MICROS_TOTAL,
+        description: "Wall microseconds of physical dispatches on the device thread, by row count (1 through 64; 0 collects wider) and phase (decode, prefill, other).",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_DISPATCHES_TOTAL,
+        description: "Physical dispatches by row count (1 through 64; 0 collects wider) and phase (decode, prefill, other); with the microseconds counter it gives each width's mean step time.",
     },
     EngineMetricDescriptor {
         name: ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_WIDTH_CALLS_TOTAL,
@@ -943,12 +955,17 @@ pub struct EnginePhysicalExecutionMetricsSnapshot {
 #[must_use = "dropping the guard closes the physical dispatch observation"]
 pub(crate) struct EnginePhysicalDispatchMetricsGuard {
     started_at: Instant,
+    shape: Option<(usize, EngineDispatchPhase)>,
 }
 
 impl Drop for EnginePhysicalDispatchMetricsGuard {
     fn drop(&mut self) {
+        let elapsed = self.started_at.elapsed();
+        if let Some((rows, phase)) = self.shape {
+            ENGINE_DISPATCH_WIDTH_TIMES.record(rows, phase, elapsed);
+        }
         record_duration(
-            self.started_at.elapsed(),
+            elapsed,
             &ENGINE_PHYSICAL_DISPATCH_DURATION_NANOS,
             &ENGINE_PHYSICAL_DISPATCH_DURATION_OBSERVATIONS,
             &ENGINE_PHYSICAL_DISPATCH_DURATION_MAX_NANOS,
@@ -985,13 +1002,132 @@ pub(crate) fn set_engine_effective_physical_execution(
 }
 
 pub(crate) fn begin_engine_physical_dispatch() -> EnginePhysicalDispatchMetricsGuard {
+    begin_dispatch_guard(None)
+}
+
+/// [`begin_engine_physical_dispatch`] for a batch of `rows` rows in `phase`:
+/// its duration is also counted under that width and phase.
+pub(crate) fn begin_engine_physical_dispatch_shaped(
+    rows: usize,
+    phase: EngineDispatchPhase,
+) -> EnginePhysicalDispatchMetricsGuard {
+    begin_dispatch_guard(Some((rows, phase)))
+}
+
+fn begin_dispatch_guard(
+    shape: Option<(usize, EngineDispatchPhase)>,
+) -> EnginePhysicalDispatchMetricsGuard {
     let active = saturating_atomic_add(&ENGINE_PHYSICAL_DISPATCHES_IN_FLIGHT, 1);
     ENGINE_PHYSICAL_DISPATCHES_MAX_IN_FLIGHT.fetch_max(active, Ordering::Relaxed);
     saturating_atomic_add(&ENGINE_PHYSICAL_DISPATCHES_STARTED, 1);
     EnginePhysicalDispatchMetricsGuard {
         started_at: Instant::now(),
+        shape,
     }
 }
+
+/// What a physical dispatch's rows do, for the per-width step times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineDispatchPhase {
+    /// Every row is a decode step.
+    Decode,
+    /// At least one row prefills.
+    Prefill,
+    /// Neither, such as preparation or audio work.
+    Other,
+}
+
+impl EngineDispatchPhase {
+    const ALL: [Self; 3] = [Self::Decode, Self::Prefill, Self::Other];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Decode => "decode",
+            Self::Prefill => "prefill",
+            Self::Other => "other",
+        }
+    }
+
+    /// The phase of a batch whose rows run `works`.
+    pub(crate) fn of_work<'a>(works: impl IntoIterator<Item = &'a super::WorkUnit>) -> Self {
+        let mut phase = None;
+        for work in works {
+            let row = match work {
+                super::WorkUnit::SequenceStep {
+                    phase: super::SequencePhase::Prefill,
+                    ..
+                } => return Self::Prefill,
+                super::WorkUnit::SequenceStep {
+                    phase: super::SequencePhase::Decode,
+                    ..
+                } => Self::Decode,
+                _ => Self::Other,
+            };
+            phase = Some(match phase {
+                None | Some(Self::Decode) => row,
+                Some(other) => other,
+            });
+        }
+        phase.unwrap_or(Self::Other)
+    }
+}
+
+/// Dispatch time of one (width, phase) cell since the process started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct EngineDispatchWidthTime {
+    pub phase: EngineDispatchPhase,
+    /// Rows in the batch, 1 through 64; 0 collects wider batches.
+    pub width: u64,
+    pub dispatches: u64,
+    pub micros: u64,
+}
+
+struct DispatchWidthTimes {
+    micros: [[AtomicU64; EXACT_MODEL_WIDTH_LIMIT + 1]; 3],
+    dispatches: [[AtomicU64; EXACT_MODEL_WIDTH_LIMIT + 1]; 3],
+}
+
+impl DispatchWidthTimes {
+    const fn new() -> Self {
+        Self {
+            micros: [const { [const { AtomicU64::new(0) }; EXACT_MODEL_WIDTH_LIMIT + 1] }; 3],
+            dispatches: [const { [const { AtomicU64::new(0) }; EXACT_MODEL_WIDTH_LIMIT + 1] }; 3],
+        }
+    }
+
+    fn record(&self, rows: usize, phase: EngineDispatchPhase, elapsed: Duration) {
+        let width = if (1..=EXACT_MODEL_WIDTH_LIMIT).contains(&rows) {
+            rows
+        } else {
+            0
+        };
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let phase = phase as usize;
+        saturating_atomic_add(&self.micros[phase][width], micros);
+        saturating_atomic_add(&self.dispatches[phase][width], 1);
+    }
+
+    fn snapshot(&self) -> Vec<EngineDispatchWidthTime> {
+        let mut cells = Vec::new();
+        for phase in EngineDispatchPhase::ALL {
+            for width in 0..=EXACT_MODEL_WIDTH_LIMIT {
+                let dispatches = self.dispatches[phase as usize][width].load(Ordering::Relaxed);
+                if dispatches > 0 {
+                    cells.push(EngineDispatchWidthTime {
+                        phase,
+                        width: width as u64,
+                        dispatches,
+                        micros: self.micros[phase as usize][width].load(Ordering::Relaxed),
+                    });
+                }
+            }
+        }
+        cells
+    }
+}
+
+static ENGINE_DISPATCH_WIDTH_TIMES: DispatchWidthTimes = DispatchWidthTimes::new();
 
 pub(crate) fn begin_engine_physical_workspace(
     resources: super::ResourceVector,
@@ -1125,6 +1261,8 @@ pub struct EngineBatchMetricsSnapshot {
     pub model_tensor_multirow_calls_total: u64,
     /// Actual forwards by exact tensor width 1..=64; key 0 is overflow above 64.
     pub model_tensor_batch_width_counts: BTreeMap<u64, u64>,
+    /// Physical dispatch time by row count and phase.
+    pub physical_dispatch_widths: Vec<EngineDispatchWidthTime>,
     pub capacity_suspensions_total: u64,
     pub capacity_replay_tokens_total: u64,
     pub capacity_replay_capped_total: u64,
@@ -1727,6 +1865,7 @@ pub fn engine_batch_metrics_snapshot() -> EngineBatchMetricsSnapshot {
         model_tensor_multirow_calls_total: ENGINE_MODEL_TENSOR_MULTIROW_CALLS
             .load(Ordering::Relaxed),
         model_tensor_batch_width_counts: ENGINE_MODEL_WIDTH_COUNTS.snapshot(),
+        physical_dispatch_widths: ENGINE_DISPATCH_WIDTH_TIMES.snapshot(),
         capacity_suspensions_total: ENGINE_CAPACITY_SUSPENSIONS.load(Ordering::Relaxed),
         capacity_replay_tokens_total: ENGINE_CAPACITY_REPLAY_TOKENS.load(Ordering::Relaxed),
         capacity_replay_capped_total: ENGINE_CAPACITY_REPLAY_CAPPED.load(Ordering::Relaxed),
@@ -2297,6 +2436,54 @@ mod tests {
         assert!(after.deadline_phases.model_execution > before.deadline_phases.model_execution);
         assert_eq!(after.failure_origins.labeled_values().len(), 9);
         assert_eq!(after.deadline_phases.labeled_values().len(), 5);
+    }
+
+    #[test]
+    fn shaped_dispatches_count_time_by_width_and_phase() {
+        let cell = |phase, width| {
+            ENGINE_DISPATCH_WIDTH_TIMES
+                .snapshot()
+                .into_iter()
+                .find(|cell| cell.phase == phase && cell.width == width)
+                .map_or((0, 0), |cell| (cell.dispatches, cell.micros))
+        };
+        let (decode_before, _) = cell(EngineDispatchPhase::Decode, 37);
+        let (wide_before, _) = cell(EngineDispatchPhase::Prefill, 0);
+        {
+            let _dispatch = begin_engine_physical_dispatch_shaped(37, EngineDispatchPhase::Decode);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drop(begin_engine_physical_dispatch_shaped(
+            EXACT_MODEL_WIDTH_LIMIT + 5,
+            EngineDispatchPhase::Prefill,
+        ));
+        let (decode_after, decode_micros) = cell(EngineDispatchPhase::Decode, 37);
+        assert!(decode_after > decode_before);
+        assert!(decode_micros >= 2_000, "{decode_micros}");
+        assert!(cell(EngineDispatchPhase::Prefill, 0).0 > wide_before);
+    }
+
+    #[test]
+    fn a_batch_prefills_when_any_row_prefills() {
+        let step = |phase| crate::engine::WorkUnit::SequenceStep {
+            phase,
+            input: crate::engine::InputRange { start: 0, end: 1 },
+            max_output_steps: 1,
+            auxiliary_state: None,
+        };
+        let decode = step(crate::engine::SequencePhase::Decode);
+        let prefill = step(crate::engine::SequencePhase::Prefill);
+        let other = crate::engine::WorkUnit::PreSequencePreparation {
+            kind: "codec".into(),
+        };
+        let of = |works: &[&crate::engine::WorkUnit]| {
+            EngineDispatchPhase::of_work(works.iter().copied())
+        };
+        assert_eq!(of(&[&decode, &decode]), EngineDispatchPhase::Decode);
+        assert_eq!(of(&[&decode, &prefill]), EngineDispatchPhase::Prefill);
+        assert_eq!(of(&[&other, &prefill]), EngineDispatchPhase::Prefill);
+        assert_eq!(of(&[&decode, &other]), EngineDispatchPhase::Other);
+        assert_eq!(of(&[]), EngineDispatchPhase::Other);
     }
 
     #[test]

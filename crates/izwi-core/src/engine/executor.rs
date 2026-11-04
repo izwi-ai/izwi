@@ -88,7 +88,7 @@ use super::execution::{
     RetryDisposition, SequencePhase, SessionKey, StageId, StageWorkSelector, WorkUnit, YieldReason,
 };
 use super::metrics::{
-    begin_engine_physical_dispatch, record_engine_physical_defer, record_engine_physical_fallback,
+    begin_engine_physical_dispatch_shaped, record_engine_physical_defer, record_engine_physical_fallback,
     EnginePhysicalDeferReason, EnginePhysicalFallbackReason,
 };
 use super::output::StreamingOutput;
@@ -5113,15 +5113,20 @@ impl UnifiedExecutor {
         {
             return (inputs, refusal);
         }
-        let (batch_id, expected_dispatch, tag, class) = inputs.with_execution(|execution| {
-            let (tag, class) = device_job_tag(&execution);
-            (
-                execution.batch.batch_id,
-                execution.batch.expected_dispatch(),
-                tag,
-                class,
-            )
-        });
+        let (batch_id, expected_dispatch, tag, class, shape) =
+            inputs.with_execution(|execution| {
+                let (tag, class) = device_job_tag(&execution);
+                let phase = super::metrics::EngineDispatchPhase::of_work(
+                    execution.batch.rows.iter().map(|row| &row.work),
+                );
+                (
+                    execution.batch.batch_id,
+                    execution.batch.expected_dispatch(),
+                    tag,
+                    class,
+                    (execution.batch.rows.len(), phase),
+                )
+            });
         let slot = Arc::new(Mutex::new(Some(inputs)));
         let job_slot = slot.clone();
         let idle = self
@@ -5138,7 +5143,7 @@ impl UnifiedExecutor {
                 );
             }
             let _device_step = idle.as_ref().map(|(clock, label)| clock.begin_step(label));
-            let _physical_dispatch = begin_engine_physical_dispatch();
+            let _physical_dispatch = begin_engine_physical_dispatch_shaped(shape.0, shape.1);
             let inputs = job_slot.lock().unwrap_or_else(|poison| poison.into_inner());
             let result = inputs
                 .as_ref()
