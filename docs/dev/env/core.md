@@ -260,6 +260,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_QWEN36_CUDA_GRAPHS` | flag | `true` | model load | Kill switch: legacy/off disables CUDA graph decode for Qwen3.6-MoE. Also: `legacy` means false. |
 | `IZWI_QWEN36_DECODE_QUANTUM` | integer | `8` | first use | Sets Qwen3.6-MoE tokens per engine step for a stream decoding alone on graph decode (1-64, else default). |
 | `IZWI_QWEN36_FP8_LM_HEAD` | flag | true (CUDA native-FP8 residency only) | model load | Kill switch: legacy/off keeps the Qwen3.6-MoE LM head in BF16 instead of block FP8. Also: `legacy` means false. |
+| `IZWI_QWEN36_FP8_PREFILL_GEMM` | flag | true (CUDA only) | model load | Kill switch: legacy/off keeps Qwen3.6 compact-FP8 projections of 9+ rows (prefill) on the tile kernel instead of the dequantized cuBLAS GEMM. Also: `legacy` means false. |
 | `IZWI_QWEN36_FUSED_DECODE` | flag | `true` | model load | Kill switch: legacy/off keeps Qwen3.6-MoE decode on the Candle op chain (fused DeltaNet, norms, q/k, gate, FP8 GEMV). Also: `legacy` means false. |
 | `IZWI_QWEN36_GROUPED_MMA` | flag | `true` | model load | Kill switch: legacy/off disables the tensor-core grouped MoE prefill kernels for Qwen3.6-MoE. Also: `legacy` means false. |
 | `IZWI_QWEN36_LOAD_TIMINGS` | flag | true (CUDA only) | model load | Kill switch: legacy/off skips the Qwen3.6 load-time CUDA kernel timing measurements reported in diagnostics. Also: `legacy` means false. |

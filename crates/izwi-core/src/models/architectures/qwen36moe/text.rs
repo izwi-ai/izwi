@@ -56,6 +56,9 @@ pub struct Qwen36TextModel {
     finite_diagnostics_enabled: bool,
     fused_norm_path: Qwen36FusedPath,
     fp8_gemv_path: Qwen36FusedPath,
+    /// Dequantized cuBLAS GEMM for wide compact-FP8 projections
+    /// (`fp8_prefill_gemm`), and why not.
+    fp8_prefill_gemm_path: Qwen36FusedPath,
     /// Chunked DeltaNet prefill kernels (`gdn_prefill`), and why not.
     gdn_prefill_path: Qwen36FusedPath,
     /// Tensor-core grouped MoE kernels for prefill (`moe_prefill`), and why
@@ -500,6 +503,10 @@ struct Qwen36LinearAttention {
 /// keeps the Candle op chain).
 const FUSED_DECODE_ENV: &str = "IZWI_QWEN36_FUSED_DECODE";
 
+/// Environment switch for routing wide compact-FP8 projections through the
+/// dequantized GEMM (`legacy`/`off`/`0` keeps the tile kernel).
+const FP8_PREFILL_GEMM_ENV: &str = "IZWI_QWEN36_FP8_PREFILL_GEMM";
+
 /// Whether the fused decode kernels run on `device` in production (CUDA, and
 /// Metal when built with it); `allow_cpu` lets tests use the portable paths.
 fn fused_device(device: &Device, allow_cpu: bool) -> bool {
@@ -840,8 +847,16 @@ impl Qwen36Projection {
         match self {
             Self::Quantized(qmatmul) => Ok(qmatmul.forward(x)?),
             Self::CompactFp8 { weights, scales } => {
-                crate::kernels::cuda::fp8::block_fp8_projection(x, weights, scales)
-                    .map_err(Error::from)
+                use crate::kernels::cuda::fp8;
+                let rows = x.elem_count() / weights.dim(1)?.max(1);
+                if rows >= fp8::DEQUANT_GEMM_MIN_ROWS
+                    && x.device().is_cuda()
+                    && fp8::dequant_gemm_enabled()
+                {
+                    return fp8::block_fp8_projection_dequant_gemm(x, weights, scales)
+                        .map_err(Error::from);
+                }
+                fp8::block_fp8_projection(x, weights, scales).map_err(Error::from)
             }
         }
     }
@@ -1061,6 +1076,7 @@ impl Qwen36TextModel {
             finite_diagnostics_enabled,
             fused_norm_path: Qwen36FusedPath::legacy("unresolved"),
             fp8_gemv_path: Qwen36FusedPath::legacy("unresolved"),
+            fp8_prefill_gemm_path: Qwen36FusedPath::legacy("unresolved"),
             gdn_prefill_path: Qwen36FusedPath::legacy("unresolved"),
             moe_prefill_path: Qwen36FusedPath::legacy("unresolved"),
             decode_graphs: None,
@@ -1072,11 +1088,13 @@ impl Qwen36TextModel {
             Some(reason) => {
                 model.fused_norm_path = Qwen36FusedPath::legacy(reason);
                 model.fp8_gemv_path = Qwen36FusedPath::legacy(reason);
+                model.fp8_prefill_gemm_path = Qwen36FusedPath::legacy(reason);
                 model.gdn_prefill_path = Qwen36FusedPath::legacy(reason);
             }
             None => {
                 model.resolve_fused_norms(false);
                 model.resolve_vectorized_fp8_decode();
+                model.resolve_fp8_prefill_gemm();
                 model.resolve_chunked_gdn_prefill();
             }
         }
@@ -1086,6 +1104,37 @@ impl Qwen36TextModel {
         model.decode_graphs = graphs;
         model.decode_graphs_path = path;
         Ok(model)
+    }
+
+    /// Route projections of [`DEQUANT_GEMM_MIN_ROWS`] rows or more (prefill
+    /// spans) through the dequantized cuBLAS GEMM, process-wide, after it
+    /// matches the reference kernels on this device: the compact tile kernel
+    /// runs prefill at about 8 TFLOP/s. `IZWI_QWEN36_FP8_PREFILL_GEMM=legacy`
+    /// keeps the tile kernel.
+    ///
+    /// [`DEQUANT_GEMM_MIN_ROWS`]: crate::kernels::cuda::fp8::DEQUANT_GEMM_MIN_ROWS
+    fn resolve_fp8_prefill_gemm(&mut self) {
+        self.fp8_prefill_gemm_path = if legacy_requested(FP8_PREFILL_GEMM_ENV) {
+            Qwen36FusedPath::legacy(format!("{FP8_PREFILL_GEMM_ENV}=legacy"))
+        } else if !self.device.is_cuda() {
+            Qwen36FusedPath::legacy("the dequantized FP8 GEMM routing runs on CUDA only")
+        } else {
+            match crate::kernels::cuda::fp8::verify_and_enable_dequant_gemm(&self.device) {
+                Ok(()) => Qwen36FusedPath::Fused,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "dequantized FP8 GEMM self-check failed; prefill keeps the tile kernel"
+                    );
+                    Qwen36FusedPath::legacy(format!("self-check failed: {error}"))
+                }
+            }
+        };
+    }
+
+    /// Whether wide compact-FP8 projections run the dequantized GEMM.
+    pub(crate) fn fp8_prefill_gemm_summary(&self) -> serde_json::Value {
+        super::fast_path::summarize([&self.fp8_prefill_gemm_path])
     }
 
     /// Enable the vectorized block-FP8 decode GEMV (process-wide) after it
@@ -5423,6 +5472,11 @@ pub(crate) mod tests {
                 "cuda.fused_decode=off",
             ),
             ("moe_prefill", model.moe_prefill_summary(), "cuda.mode=off"),
+            (
+                "fp8_prefill_gemm",
+                model.fp8_prefill_gemm_summary(),
+                "cuda.fused_decode=off",
+            ),
             (
                 "cuda_graphs",
                 model.cuda_graphs_summary(),

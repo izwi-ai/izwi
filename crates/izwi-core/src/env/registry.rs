@@ -1769,6 +1769,14 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     )
     .aliases(&[("legacy", false)]),
     CoreEnvVar::new(
+        "IZWI_QWEN36_FP8_PREFILL_GEMM",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off keeps Qwen3.6 compact-FP8 projections of 9+ rows (prefill) on the tile kernel instead of the dequantized cuBLAS GEMM.",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
         "IZWI_QWEN36_FUSED_DECODE",
         Flag,
         "true",

@@ -105,6 +105,83 @@ pub fn verify_and_enable_vectorized_decode(device: &Device) -> Result<()> {
     Ok(())
 }
 
+/// Process-wide switch for routing wide block-FP8 projections through the
+/// dequantized GEMM ([`block_fp8_projection_dequant_gemm`]) for families that
+/// select it by row count; off until [`verify_and_enable_dequant_gemm`] has
+/// compared it with the reference kernels on a real device.
+static DEQUANT_GEMM_VERIFIED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Rows from which a family routes a block-FP8 projection through the
+/// dequantized GEMM once verified: past the vectorized GEMV's rows, where the
+/// tile kernel is far slower (1.06 ms against 0.11 ms for a 5120x6144
+/// projection at 16 rows on an H100).
+pub const DEQUANT_GEMM_MIN_ROWS: usize = VECTORIZED_DECODE_MAX_ROWS + 1;
+
+pub fn dequant_gemm_enabled() -> bool {
+    DEQUANT_GEMM_VERIFIED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Enable [`dequant_gemm_enabled`] after the dequantized GEMM matches the
+/// reference kernels on `device` at the switch-over and a multi-tile span.
+pub fn verify_and_enable_dequant_gemm(device: &Device) -> Result<()> {
+    if dequant_gemm_enabled() {
+        return Ok(());
+    }
+    if !device.is_cuda() {
+        candle_core::bail!("the dequantized FP8 GEMM routing runs on CUDA only")
+    }
+    for (n, k) in [(256usize, 2048usize), (384, 4096)] {
+        let raw = (0..n * k)
+            .map(|i| {
+                let mixed = (i.wrapping_mul(0x9E37_79B1) >> 17) as u8;
+                if mixed & 0x7f == 0x7f {
+                    0x38
+                } else {
+                    mixed
+                }
+            })
+            .collect::<Vec<_>>();
+        let scales = (0..n.div_ceil(128) * k.div_ceil(128))
+            .map(|i| 0.001 + (i % 13) as f32 * 3e-4)
+            .collect::<Vec<_>>();
+        let w = Tensor::from_vec(raw, (n, k), &Device::Cpu)?.to_device(device)?;
+        let s = Tensor::from_vec(scales, (n.div_ceil(128), k.div_ceil(128)), &Device::Cpu)?
+            .to_device(device)?;
+        for m in [DEQUANT_GEMM_MIN_ROWS, 64] {
+            for dtype in [DType::BF16, DType::F16] {
+                let x = Tensor::from_vec(
+                    (0..m * k)
+                        .map(|i| ((i as f32) * 0.754_877_7).sin() * 2.0)
+                        .collect::<Vec<_>>(),
+                    (m, k),
+                    &Device::Cpu,
+                )?
+                .to_dtype(dtype)?
+                .to_device(device)?;
+                let host = |t: Tensor| -> Result<Vec<f32>> {
+                    t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
+                };
+                let reference = host(project(&x, &w, &s, DecodeKernel::Reference)?)?;
+                let gemm = host(block_fp8_projection_dequant_gemm(&x, &w, &s)?)?;
+                let scale = reference.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
+                if let Some((index, (a, b))) = gemm
+                    .iter()
+                    .zip(&reference)
+                    .enumerate()
+                    .find(|(_, (a, b))| !a.is_finite() || (*a - *b).abs() > 0.02 * scale)
+                {
+                    candle_core::bail!(
+                        "dequantized FP8 GEMM diverges at n={n} k={k} m={m} {dtype:?} index {index}: {a} vs reference {b}"
+                    )
+                }
+            }
+        }
+    }
+    DEQUANT_GEMM_VERIFIED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
 /// The check behind [`verify_and_enable_vectorized_decode`], without touching
 /// the process-wide flag: a family that selects the kernel per call (through
 /// [`block_fp8_projection_selecting`]) keeps its own verdict.
