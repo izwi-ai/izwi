@@ -158,6 +158,16 @@ pub(crate) struct Qwen36MoeSparseMlp {
     counters: Arc<ExpertActivationCounters>,
     fused: Option<Qwen36MoeFusedExperts>,
     backend: Qwen36FusedPath,
+    /// Wall time this layer spent stacking its experts for the fused kernels
+    /// and self-checking them at load.
+    load_timing: Qwen36MoeLoadTiming,
+}
+
+/// Load-time wall time of one sparse layer's fused-expert preparation.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct Qwen36MoeLoadTiming {
+    pub(crate) stack: std::time::Duration,
+    pub(crate) self_check: std::time::Duration,
 }
 
 impl Qwen36MoeSparseMlp {
@@ -204,6 +214,7 @@ impl Qwen36MoeSparseMlp {
         })?
         .with_counters(counters.clone());
 
+        let mut load_timing = Qwen36MoeLoadTiming::default();
         let (experts, shared, fused, backend) = match request {
             Qwen36MoeBackendRequest::Legacy => (
                 experts,
@@ -215,26 +226,34 @@ impl Qwen36MoeSparseMlp {
                 (experts, shared, None, Qwen36FusedPath::legacy(reason))
             }
             Qwen36MoeBackendRequest::Auto => {
-                match Qwen36MoeFusedExperts::stack(&router, experts, shared, geometry) {
+                let stacking = std::time::Instant::now();
+                let stacked = Qwen36MoeFusedExperts::stack(&router, experts, shared, geometry);
+                load_timing.stack = stacking.elapsed();
+                match stacked {
                     Qwen36MoeStacking::Stacked {
                         fused,
                         experts,
                         shared,
-                    } => match fused.self_check(&experts, &shared) {
-                        Ok(()) => (experts, shared, Some(fused), Qwen36FusedPath::Fused),
-                        Err(reason) => {
-                            tracing::warn!(
-                                reason,
-                                "Qwen3.6-MoE fused expert self-check failed; using the per-expert path"
-                            );
-                            (
-                                experts,
-                                shared,
-                                None,
-                                Qwen36FusedPath::legacy(format!("self-check failed: {reason}")),
-                            )
+                    } => {
+                        let checking = std::time::Instant::now();
+                        let checked = fused.self_check(&experts, &shared);
+                        load_timing.self_check = checking.elapsed();
+                        match checked {
+                            Ok(()) => (experts, shared, Some(fused), Qwen36FusedPath::Fused),
+                            Err(reason) => {
+                                tracing::warn!(
+                                    reason,
+                                    "Qwen3.6-MoE fused expert self-check failed; using the per-expert path"
+                                );
+                                (
+                                    experts,
+                                    shared,
+                                    None,
+                                    Qwen36FusedPath::legacy(format!("self-check failed: {reason}")),
+                                )
+                            }
                         }
-                    },
+                    }
                     Qwen36MoeStacking::Unsupported {
                         experts,
                         shared,
@@ -252,7 +271,13 @@ impl Qwen36MoeSparseMlp {
             counters,
             fused,
             backend,
+            load_timing,
         })
+    }
+
+    /// Wall time of this layer's fused-expert stacking and self-check.
+    pub(crate) fn load_timing(&self) -> Qwen36MoeLoadTiming {
+        self.load_timing
     }
 
     /// Execution path this block resolved to at load.

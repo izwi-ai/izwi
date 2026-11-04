@@ -1588,8 +1588,24 @@ impl Qwen36MoeNativeCheckpoint {
         geometry: Qwen36MoeGeometryPolicy,
         mtp: Qwen36MoeMtpLoadPolicy,
     ) -> Result<Self> {
+        Self::open_with_loading(
+            model_dir,
+            geometry,
+            mtp,
+            &crate::performance::LoadingPerformanceConfig::default(),
+        )
+    }
+
+    /// [`Self::open_with_policies`] with the server's loading options
+    /// (staging budget, I/O strategy, workers).
+    pub fn open_with_loading(
+        model_dir: &Path,
+        geometry: Qwen36MoeGeometryPolicy,
+        mtp: Qwen36MoeMtpLoadPolicy,
+        loading: &crate::performance::LoadingPerformanceConfig,
+    ) -> Result<Self> {
         let config = Qwen36MoeNativeConfig::load_with_policy(model_dir, geometry)?;
-        let tensors = IndexedSafetensors::open(model_dir)?;
+        let tensors = IndexedSafetensors::open_with_options(model_dir, loading)?;
         Self::validate_with_policies(config, tensors, mtp)
     }
 
@@ -4473,6 +4489,18 @@ mod tests {
             )
             .unwrap();
             assert_eq!(model.preferred_decode_tokens(), if mtp { 3 } else { 1 });
+            let timing = &model.runtime_diagnostics()["load_timing"];
+            assert_eq!(timing["source"], "native", "{timing}");
+            for phase in [
+                "checkpoint_open_ms",
+                "text_model_ms",
+                "weights_ms",
+                "total_ms",
+            ] {
+                assert!(timing[phase].as_f64().is_some(), "{phase}: {timing}");
+            }
+            assert!(timing["tensors"]["raw_fp8_tensors"].is_u64(), "{timing}");
+            assert!(timing["moe"]["layers"].as_u64().unwrap() > 0, "{timing}");
             (config, dir, model)
         };
 

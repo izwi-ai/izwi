@@ -76,6 +76,13 @@ pub(super) struct LoadState {
     pub uploaded_bytes: AtomicU64,
     pub pinned_upload_tiles: AtomicU64,
     pub unpinned_upload_tiles: AtomicU64,
+    /// Raw block-FP8 projections (weights kept as checkpoint bytes): time in
+    /// the byte validation and in the host-to-device copies, and their count
+    /// and bytes.
+    pub raw_fp8_validation_us: AtomicU64,
+    pub raw_fp8_upload_us: AtomicU64,
+    pub raw_fp8_tensors: AtomicU64,
+    pub raw_fp8_bytes: AtomicU64,
 }
 impl LoadState {
     pub fn new(discovery: Duration) -> Self {
@@ -96,7 +103,16 @@ impl LoadState {
             uploaded_bytes: AtomicU64::new(0),
             pinned_upload_tiles: AtomicU64::new(0),
             unpinned_upload_tiles: AtomicU64::new(0),
+            raw_fp8_validation_us: AtomicU64::new(0),
+            raw_fp8_upload_us: AtomicU64::new(0),
+            raw_fp8_tensors: AtomicU64::new(0),
+            raw_fp8_bytes: AtomicU64::new(0),
         }
+    }
+
+    /// Adds `started`'s elapsed microseconds to `counter`.
+    fn add_elapsed(counter: &AtomicU64, started: Instant) {
+        counter.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 }
 
@@ -141,8 +157,13 @@ impl IndexedSafetensors {
             "pinned_upload_tiles": n(&s.pinned_upload_tiles), "unpinned_upload_tiles": n(&s.unpinned_upload_tiles),
             "cache_hits": n(&s.cache_hits), "cache_misses": n(&s.cache_misses),
             "converted_bytes": n(&s.converted_bytes), "uploaded_bytes": n(&s.uploaded_bytes),
+            "raw_fp8_validation_ms": n(&s.raw_fp8_validation_us) as f64 / 1000.,
+            "raw_fp8_upload_ms": n(&s.raw_fp8_upload_us) as f64 / 1000.,
+            "raw_fp8_tensors": n(&s.raw_fp8_tensors),
+            "raw_fp8_bytes": n(&s.raw_fp8_bytes),
             "cache_source_authentication": "rehash-source-tiles-and-scales",
-            "conversion_upload_timing_scope": "q8-tiles-only",
+            "conversion_upload_timing_scope": "q8-tiles-only; raw block-FP8 under raw_fp8_*",
+            "validation_timing_scope": "tensor-view bookkeeping",
             "io_strategy_resolved": if self.options.io_strategy==LoadingIoStrategy::Sequential {"bounded-sequential-q8; dense-mmap"} else {"mmap"},
         })
     }
@@ -359,6 +380,7 @@ impl IndexedSafetensors {
             Some(SafeDType::F8_E4M3),
             Some(&expected_shape),
             |v| {
+                let validating = Instant::now();
                 validate_block_fp8_bytes(
                     v.data(),
                     expected_shape,
@@ -369,10 +391,20 @@ impl IndexedSafetensors {
                 .map_err(|detail| {
                     Error::ModelLoadError(format!("Block-FP8 tensor `{weight_name}`: {detail}"))
                 })?;
-                Ok(Tensor::from_slice(v.data(), &expected_shape, device)?)
+                LoadState::add_elapsed(&self.loading.raw_fp8_validation_us, validating);
+                let uploading = Instant::now();
+                let weights = Tensor::from_slice(v.data(), &expected_shape, device)?;
+                LoadState::add_elapsed(&self.loading.raw_fp8_upload_us, uploading);
+                self.loading
+                    .raw_fp8_bytes
+                    .fetch_add(v.data().len() as u64, Ordering::Relaxed);
+                Ok(weights)
             },
         )?;
+        let uploading = Instant::now();
         let scales = Tensor::from_vec(scales, &scale_shape, device)?;
+        LoadState::add_elapsed(&self.loading.raw_fp8_upload_us, uploading);
+        self.loading.raw_fp8_tensors.fetch_add(1, Ordering::Relaxed);
         Ok(RawBlockFp8Projection {
             weights,
             scales,
@@ -458,6 +490,7 @@ impl IndexedSafetensors {
             )?;
             validate_scales(&part_scales)?;
             self.with_tensor_view(name, Some(SafeDType::F8_E4M3), Some(part_shape), |v| {
+                let validating = Instant::now();
                 validate_block_fp8_bytes(
                     v.data(),
                     *part_shape,
@@ -468,6 +501,7 @@ impl IndexedSafetensors {
                 .map_err(|detail| {
                     Error::ModelLoadError(format!("Block-FP8 tensor `{name}`: {detail}"))
                 })?;
+                LoadState::add_elapsed(&self.loading.raw_fp8_validation_us, validating);
                 bytes.extend_from_slice(v.data());
                 Ok(())
             })?;
@@ -478,8 +512,14 @@ impl IndexedSafetensors {
                 "Block-FP8 group concatenation length mismatch".into(),
             ));
         }
+        let uploading = Instant::now();
         let weights = Tensor::from_vec(bytes, &shape, device)?;
         let scales = Tensor::from_vec(scales, &scale_shape, device)?;
+        LoadState::add_elapsed(&self.loading.raw_fp8_upload_us, uploading);
+        self.loading.raw_fp8_tensors.fetch_add(1, Ordering::Relaxed);
+        self.loading
+            .raw_fp8_bytes
+            .fetch_add(total as u64, Ordering::Relaxed);
         Ok(RawBlockFp8Projection {
             weights,
             scales,

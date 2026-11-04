@@ -1386,6 +1386,21 @@ impl Qwen36TextModel {
     /// Sparse-expert execution paths across the trunk's MoE layers for the
     /// admin diagnostics: how many layers run the device-routed fused kernels
     /// and why any others stayed on the per-expert loop.
+    /// Load-time wall time of the sparse layers' fused-expert stacking and
+    /// self-checks, summed over layers.
+    pub(crate) fn moe_load_timing(&self) -> serde_json::Value {
+        let (mut stack, mut check, mut layers) = (0.0, 0.0, 0);
+        for layer in &self.layers {
+            if let Qwen36FeedForward::Sparse(moe) = &layer.ffn {
+                let timing = moe.load_timing();
+                stack += timing.stack.as_secs_f64() * 1e3;
+                check += timing.self_check.as_secs_f64() * 1e3;
+                layers += 1;
+            }
+        }
+        serde_json::json!({ "layers": layers, "stack_ms": stack, "self_check_ms": check })
+    }
+
     pub(crate) fn moe_backend_summary(&self) -> serde_json::Value {
         super::fast_path::summarize(self.layers.iter().filter_map(|layer| match &layer.ffn {
             Qwen36FeedForward::Sparse(moe) => Some(moe.backend()),
