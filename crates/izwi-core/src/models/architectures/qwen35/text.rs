@@ -3440,15 +3440,17 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn fused_deltanet_decode_matches_the_candle_chain_on_metal() {
-        let _guard = crate::env_test_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::remove_var(super::FUSED_DECODE_ENV);
+        // The Metal lease first, then the env lock, as every Metal test that
+        // takes both does: the other order deadlocks against them.
         let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
             "fused_deltanet_decode_matches_the_candle_chain_on_metal",
         ) else {
             return;
         };
+        let _guard = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var(super::FUSED_DECODE_ENV);
         for (key_heads, value_heads) in [(2, 2), (2, 4)] {
             let mut layer = synthetic_fused_layer(&device, key_heads, value_heads, 64);
             // Production resolution: no CPU allowance needed on Metal.

@@ -1163,13 +1163,15 @@ mod tests {
     fn metal_causal_sdpa_never_reads_past_kv_len() {
         use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_values};
 
-        // Hold the env lock so the F32 leg keeps the default F16-cast route.
-        let _guard = crate::env_test_lock().lock().expect("env lock");
+        // The Metal lease first, then the env lock, as every Metal test that
+        // takes both does: the other order deadlocks against them. The env
+        // lock keeps the F32 leg on the default F16-cast route.
         let Some((device, _lease)) =
             crate::backends::metal_test_device_or_skip("metal_causal_sdpa_never_reads_past_kv_len")
         else {
             return;
         };
+        let _guard = crate::env_test_lock().lock().expect("env lock");
         const HEADS: usize = 16;
         const KV_HEADS: usize = 8;
         const POISON_ROWS: usize = 64;
