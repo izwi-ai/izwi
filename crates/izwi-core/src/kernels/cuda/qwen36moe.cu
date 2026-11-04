@@ -469,6 +469,39 @@ Q36_GDN_TABLE_EXPORT(__half, f16)
 Q36_GDN_TABLE_EXPORT(__nv_bfloat16, bf16)
 Q36_GDN_TABLE_EXPORT(float, f32)
 
+// Multi-row forms: one launch for every row of a batched decode step instead
+// of one per row. Grid y is the row r: its state addresses are the six table
+// entries at slot + r * 6 (the layout above), its inputs start r strides into
+// x / conv / z / beta_raw / alpha, and it writes row r of out ([rows, conv_dim])
+// and y ([rows, value_heads * 128]). Each (row, head) runs exactly the
+// single-row arithmetic.
+#define Q36_GDN_ROWS_EXPORT(T, S)                                                              \
+  extern "C" __global__ void qwen36moe_gdn_conv_rows_##S(                                      \
+      const T* x, long long x_stride, const float* w, const unsigned long long* table,        \
+      int slot, float* out, int conv_dim) {                                                    \
+    const long long r = blockIdx.y;                                                            \
+    const unsigned long long* e = table + slot + r * 6;                                        \
+    q36_gdn_conv<T>(x + r * x_stride, w, (const float*)e[0], (const float*)e[1],               \
+                    (const float*)e[2], out + r * conv_dim, (float*)e[3], conv_dim);           \
+  }                                                                                            \
+  extern "C" __global__ void __launch_bounds__(512) qwen36moe_gdn_decode_rows_##S(            \
+      const float* conv, long long conv_stride, const T* z, long long z_stride,               \
+      const T* beta_raw, long long beta_stride, const T* alpha, long long alpha_stride,       \
+      const float* dt_bias, const float* a, const float* norm_w,                               \
+      const unsigned long long* table, int slot, T* y, int key_heads, int value_heads,        \
+      int grouped, float norm_eps) {                                                           \
+    const long long r = blockIdx.y;                                                            \
+    const unsigned long long* e = table + slot + r * 6;                                        \
+    q36_gdn_decode<T>(conv + r * conv_stride, z + r * z_stride, beta_raw + r * beta_stride,   \
+                      alpha + r * alpha_stride, dt_bias, a, norm_w, (const float*)e[4],        \
+                      (float*)e[5], y + r * (long long)value_heads * 128, key_heads,          \
+                      value_heads, grouped, norm_eps);                                         \
+  }
+
+Q36_GDN_ROWS_EXPORT(__half, f16)
+Q36_GDN_ROWS_EXPORT(__nv_bfloat16, bf16)
+Q36_GDN_ROWS_EXPORT(float, f32)
+
 // ---------------------------------------------------------------------------
 // RMSNorm with an F32 gain over 16-bit activations, optionally fused with the
 // preceding residual add. Replaces cast -> rms_norm -> cast (and the add) with
