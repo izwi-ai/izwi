@@ -577,6 +577,30 @@ struct CachedExecutionProfile {
 }
 
 /// The engine core - manages the inference loop.
+/// How long a session's batch width stays at each halving after a refused
+/// workspace reservation before it doubles again.
+pub(super) const WORKSPACE_CAP_RECOVERY: Duration = Duration::from_secs(1);
+
+/// A session's batch-width cap after a refused workspace reservation. The
+/// refusal is usually transient (a prefill's activations, another claim
+/// landing first), so the cap doubles for every [`WORKSPACE_CAP_RECOVERY`]
+/// without another refusal and lifts once it reaches the model's width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WorkspaceRowCap {
+    pub(super) rows: usize,
+    pub(super) set_at: Instant,
+}
+
+impl WorkspaceRowCap {
+    /// The cap in force at `now`: `rows` doubled once per elapsed recovery
+    /// interval.
+    pub(super) fn effective(&self, now: Instant) -> usize {
+        let elapsed = now.saturating_duration_since(self.set_at);
+        let doublings = (elapsed.as_nanos() / WORKSPACE_CAP_RECOVERY.as_nanos()).min(16) as u32;
+        self.rows.saturating_mul(1usize << doublings)
+    }
+}
+
 pub struct EngineCore {
     /// Configuration
     config: EngineCoreConfig,
@@ -639,7 +663,7 @@ pub struct EngineCore {
     workspace_retry_progress: HashMap<super::SessionKey, u64>,
     /// Each session's current run of refused batch workspaces.
     workspace_waits: HashMap<super::SessionKey, WorkspaceWait>,
-    workspace_row_limits: HashMap<super::SessionKey, usize>,
+    workspace_row_limits: HashMap<super::SessionKey, WorkspaceRowCap>,
     /// While a step commits: the sessions whose device cleanup the commit
     /// deferred, so the engine awaits them after releasing the core
     /// (`None` outside a commit: cleanups run inline).

@@ -3018,6 +3018,23 @@ fn workspace_rejection(scheduled: &ScheduledRequest, width: usize) -> ExecutorSt
     result
 }
 
+/// A refused workspace halves a session's width, and the width grows back:
+/// it doubles for each recovery interval without another refusal.
+#[test]
+fn a_workspace_width_cap_recovers_over_time() {
+    use super::{WorkspaceRowCap, WORKSPACE_CAP_RECOVERY};
+    let set_at = Instant::now();
+    let cap = WorkspaceRowCap { rows: 2, set_at };
+    assert_eq!(cap.effective(set_at), 2);
+    assert_eq!(cap.effective(set_at + WORKSPACE_CAP_RECOVERY / 2), 2);
+    assert_eq!(cap.effective(set_at + WORKSPACE_CAP_RECOVERY), 4);
+    assert_eq!(cap.effective(set_at + WORKSPACE_CAP_RECOVERY * 3), 16);
+    // A clock read before the refusal never shrinks the cap further.
+    assert_eq!(cap.effective(set_at - Duration::from_millis(5)), 2);
+    // Doublings saturate rather than overflow.
+    assert!(cap.effective(set_at + WORKSPACE_CAP_RECOVERY * 1000) >= 2 << 15);
+}
+
 #[tokio::test]
 async fn workspace_backpressure_preserves_published_stream_and_shrinks_before_retry() {
     let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
@@ -3047,7 +3064,7 @@ async fn workspace_backpressure_preserves_published_stream_and_shrinks_before_re
             "unexpected terminal: {:?}",
             committed.map(|value| value.output.error)
         );
-        assert_eq!(core.workspace_row_limits[&session], expected_cap);
+        assert_eq!(core.workspace_row_limits[&session].rows, expected_cap);
         assert_eq!(core.stream_sequence_cursors[&session], 7);
         assert!(core.incremental_stream_sessions.contains(&session));
         assert_eq!(
