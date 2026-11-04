@@ -1384,6 +1384,30 @@ impl Qwen38TextModel {
         states: &mut [&mut Qwen38TextRuntimeState],
         caches: &mut [&mut PhysicalPagedKvCache],
     ) -> Result<Qwen38TextDecodeBatchOutput> {
+        self.forward_batch_at_physical(token_ids, position_ids, states, caches, false)
+    }
+
+    /// [`Self::forward_token_ids_batch_at_physical`] that always returns the
+    /// hidden rows: MTP drafting reads them, so a single row skips the
+    /// whole-step graph, which runs the LM head inside and omits them.
+    pub(super) fn forward_token_ids_batch_hidden_at_physical(
+        &self,
+        token_ids: &[u32],
+        position_ids: &[[usize; 3]],
+        states: &mut [&mut Qwen38TextRuntimeState],
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<Qwen38TextDecodeBatchOutput> {
+        self.forward_batch_at_physical(token_ids, position_ids, states, caches, true)
+    }
+
+    fn forward_batch_at_physical(
+        &self,
+        token_ids: &[u32],
+        position_ids: &[[usize; 3]],
+        states: &mut [&mut Qwen38TextRuntimeState],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        need_hidden: bool,
+    ) -> Result<Qwen38TextDecodeBatchOutput> {
         let batch_size = token_ids.len();
         if batch_size == 0
             || position_ids.len() != batch_size
@@ -1446,7 +1470,7 @@ impl Qwen38TextModel {
                 .map(|(row, cache)| cache.sequence_table(start_positions[row] + 1))
                 .collect::<Result<Vec<_>>>()?,
         };
-        if let (1, Some(graphs)) = (batch_size, &self.decode_graphs) {
+        if let (1, Some(graphs), false) = (batch_size, &self.decode_graphs, need_hidden) {
             if let Some(output) = self.graph_decode_row(
                 graphs,
                 token_ids[0],

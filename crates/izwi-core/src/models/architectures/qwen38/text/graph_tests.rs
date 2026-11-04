@@ -438,6 +438,61 @@ fn whole_step_decode_matches_the_standard_batched_path() {
     assert_ne!(diverged[6], expected[6]);
 }
 
+/// MTP drafts from the target's hidden rows. A single row on the hidden
+/// variant must skip the whole-step graph (which runs the LM head inside and
+/// returns logits only) and give the same logits as the graphed step.
+#[test]
+fn a_single_mtp_row_skips_the_whole_step_graph_for_its_hidden_states() {
+    let _counters = counters_lock();
+    let _env = env_lock();
+    let (_dir, checkpoint) = fixture();
+    let mut whole = fused_model(&checkpoint);
+    whole.enable_step_graph_for_tests();
+    let arena = GoldenArena::new(&checkpoint.config, &Device::Cpu, DType::F16);
+    let positions = (0..=PROMPT.len()).map(|p| [p; 3]).collect::<Vec<_>>();
+    let decode = |hidden: bool, session| {
+        let mut state = whole.new_state();
+        let mut cache = arena.session(session);
+        whole
+            .prefill_token_ids_physical(
+                &PROMPT,
+                &positions[..PROMPT.len()],
+                &mut state,
+                &mut cache,
+                true,
+            )
+            .unwrap();
+        let rows = (&[DECODE[0]], &[positions[PROMPT.len()]]);
+        if hidden {
+            whole.forward_token_ids_batch_hidden_at_physical(
+                rows.0,
+                rows.1,
+                &mut [&mut state],
+                &mut [&mut cache],
+            )
+        } else {
+            whole.forward_token_ids_batch_at_physical(
+                rows.0,
+                rows.1,
+                &mut [&mut state],
+                &mut [&mut cache],
+            )
+        }
+        .unwrap()
+    };
+    let graphed = decode(false, 0);
+    assert!(
+        graphed.hidden_states.is_none(),
+        "the graph omits hidden rows"
+    );
+    let drafted = decode(true, 1);
+    assert!(drafted.hidden_states.is_some());
+    assert_eq!(
+        host_values(&drafted.logits).unwrap(),
+        host_values(&graphed.logits).unwrap()
+    );
+}
+
 /// The whole-step graph's own prerequisites: without them the segments
 /// still resolve and take every step.
 #[test]

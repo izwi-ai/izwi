@@ -2124,12 +2124,23 @@ impl Qwen38ChatModel {
             text_states.push(&mut state.text_state);
             caches.push(&mut state.physical_kv);
         }
-        let target = self.text_model.forward_token_ids_batch_at_physical(
-            &token_ids,
-            &positions,
-            &mut text_states,
-            &mut caches,
-        )?;
+        // MTP drafts from the target's hidden rows, which the single-row
+        // whole-step graph does not return.
+        let target = if self.mtp_head.is_some() {
+            self.text_model.forward_token_ids_batch_hidden_at_physical(
+                &token_ids,
+                &positions,
+                &mut text_states,
+                &mut caches,
+            )?
+        } else {
+            self.text_model.forward_token_ids_batch_at_physical(
+                &token_ids,
+                &positions,
+                &mut text_states,
+                &mut caches,
+            )?
+        };
         drop(text_states);
         drop(caches);
 
