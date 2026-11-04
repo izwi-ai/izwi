@@ -640,6 +640,10 @@ pub struct EngineCore {
     /// Each session's current run of refused batch workspaces.
     workspace_waits: HashMap<super::SessionKey, WorkspaceWait>,
     workspace_row_limits: HashMap<super::SessionKey, usize>,
+    /// While a step commits: the sessions whose device cleanup the commit
+    /// deferred, so the engine awaits them after releasing the core
+    /// (`None` outside a commit: cleanups run inline).
+    deferred_release_cleanups: Option<Vec<super::SessionKey>>,
     workspace_pressure: HashMap<super::SessionKey, super::scheduler::ScheduledRequest>,
     /// Claim holders seen blocked, per model, for the claim deadlock breaker.
     claim_waiters: HashMap<ModelInstanceId, ClaimWaiters>,
@@ -797,6 +801,7 @@ impl EngineCore {
             workspace_retry_progress: HashMap::new(),
             workspace_waits: HashMap::new(),
             workspace_row_limits: HashMap::new(),
+            deferred_release_cleanups: None,
             workspace_pressure: HashMap::new(),
             claim_waiters: HashMap::new(),
             retry_policy: LifecycleRetryPolicy::default(),

@@ -1062,15 +1062,39 @@ impl OwnedStepContext {
             batches: vec![batch],
         };
         executed.apply_stream_delivery_failures(&dispatch_failures);
-        let committed = {
+        let (committed, deferred, executor) = {
             let mut core = self.core.write().await;
             let started = Instant::now();
-            let committed = core.commit_step(executed).await?;
+            core.begin_deferring_release_cleanups();
+            let committed = core.commit_step(executed).await;
+            let (deferred, executor) = core.take_deferred_release_cleanups();
             metrics::record_engine_step_phase(metrics::EngineStepPhase::Commit, started.elapsed());
-            committed
+            (committed, deferred, executor)
         };
-        self.deliver_and_route_committed(committed, defer_unregistered_terminal_ack)
-            .await
+        let delivered = match committed {
+            Ok(committed) => {
+                self.deliver_and_route_committed(committed, defer_unregistered_terminal_ack)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        // Finished sessions' device cleanups run after delivery and outside
+        // the core lock: each waits behind the dispatch the device is
+        // running, and holding the core meanwhile stalled every stream's
+        // delivery, new requests and metrics. The step gate stays held, so
+        // this lane's next step still starts after them.
+        if !deferred.is_empty() {
+            let mut reports = Vec::with_capacity(deferred.len());
+            for session in deferred {
+                let report = executor.cleanup_session(&session).await;
+                reports.push((session, report));
+            }
+            let mut core = self.core.write().await;
+            for (session, report) in reports {
+                core.finish_deferred_release_cleanup(&session, report);
+            }
+        }
+        delivered
     }
 
     /// Keep incremental deliveries still waiting on a reader when their
