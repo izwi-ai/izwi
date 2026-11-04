@@ -1311,9 +1311,8 @@ impl Qwen35ChatExec {
         let readback_started = std::time::Instant::now();
         let plans = states
             .iter()
-            .enumerate()
-            .map(|(row, state)| plan_row_readback(state, &logits.i((row, 0))?, vocab_size))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|state| plan_row_readback(state, logits.device(), vocab_size))
+            .collect::<Vec<_>>();
         let mut planned = crate::models::shared::sampling::read_planned_rows(
             &logits.reshape((states.len(), ()))?,
             vocab_size,
@@ -1663,6 +1662,8 @@ impl Qwen35ChatModel {
             "gdn_prefill": self.exec.text_model.gdn_prefill_summary(),
             "projections": self.exec.text_model.projection_summary(),
             "decode_graph": self.exec.text_model.decode_graph_summary(),
+            "batched_device_sampling":
+                crate::models::shared::sampling::batched_device_sampling::summary(),
             "counters": self.exec.text_model.telemetry().snapshot(),
         })
     }
@@ -2289,21 +2290,25 @@ fn gguf_to_f64(value: &GgufValue) -> Option<f64> {
 }
 
 /// What a decode row's sampler needs from the step's shared readback,
-/// planned exactly as [`sample_next_token_traced`] would sample the row:
-/// deterministic greedy reads its argmax, a device row its bounded
-/// candidates; grammar, logprobs and host rows read nothing here.
-fn plan_row_readback(
-    state: &ChatDecodeState,
-    row_logits: &Tensor,
+/// planned exactly as [`sample_next_token_traced`] would sample the row on
+/// `device`: deterministic greedy reads its argmax, a device row requests
+/// its bounded candidates (planned with the step's other candidate rows);
+/// grammar, logprobs and host rows read nothing here.
+fn plan_row_readback<'a>(
+    state: &'a ChatDecodeState,
+    device: &candle_core::Device,
     vocab_size: usize,
-) -> Result<crate::models::shared::sampling::PlannedReadback> {
-    use crate::models::shared::sampling::PlannedReadback;
+) -> crate::models::shared::sampling::PlannedReadback<'a> {
+    use crate::models::shared::sampling::{CandidateRequest, PlannedReadback};
     let config = &state.config;
     if state.grammar.is_some() || config.logprobs || vocab_size == 0 {
-        return Ok(PlannedReadback::None);
+        return PlannedReadback::None;
     }
     if deterministic_greedy(config) {
-        return Ok(PlannedReadback::Greedy);
+        return PlannedReadback::Greedy;
+    }
+    if !(device.is_cuda() || device.is_metal()) {
+        return PlannedReadback::None;
     }
     let history = penalty_history(
         state.track_history,
@@ -2319,18 +2324,13 @@ fn plan_row_readback(
     } else {
         (config.top_k, config.temperature)
     };
-    Ok(
-        crate::models::shared::sampling::plan_device_sampling_candidates_with_history(
-            row_logits,
-            vocab_size,
-            top_k,
-            temperature,
-            history,
-            config.repetition_penalty,
-            config.presence_penalty,
-        )?
-        .map_or(PlannedReadback::None, PlannedReadback::Candidates),
-    )
+    PlannedReadback::Candidates(CandidateRequest {
+        top_k,
+        temperature,
+        history,
+        repetition_penalty: config.repetition_penalty,
+        presence_penalty: config.presence_penalty,
+    })
 }
 
 /// Draw a row from its share of the batched readback with the same steps,

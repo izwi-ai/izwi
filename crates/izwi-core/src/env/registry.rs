@@ -112,6 +112,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Selects the execution backend: auto, cpu, metal (alias mps) or cuda (alias gpu); unknown values ignored.",
     ),
     CoreEnvVar::new(
+        "IZWI_BATCHED_DEVICE_SAMPLING",
+        Flag,
+        "true",
+        Once,
+        "Kill switch: false plans each sampled chat row's device candidates on its own in a batched decode step instead of in one pass for all rows (CUDA, Metal).",
+    ),
+    CoreEnvVar::new(
         "IZWI_BUFFER_POOL",
         Flag,
         "true",

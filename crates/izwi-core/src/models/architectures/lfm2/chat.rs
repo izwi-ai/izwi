@@ -556,6 +556,8 @@ impl Lfm2ChatModel {
             "dialect": format!("{:?}", self.dialect),
             "counters": self.batch_telemetry.snapshot(),
             "shortconv_batched": shortconv_batched_summary(),
+            "batched_device_sampling":
+                crate::models::shared::sampling::batched_device_sampling::summary(),
         })
     }
 

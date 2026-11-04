@@ -298,29 +298,27 @@ impl ChatSampler {
         &self.history
     }
 
-    /// How [`sample_chat_rows`] reads row `row` of `logits` (already cut to
-    /// the vocabulary): the route [`Self::sample_with_logprobs`] would take.
-    fn row_sampling(&self, logits: &Tensor, row: usize, vocab_size: usize) -> Result<RowSampling> {
+    /// How [`sample_chat_rows`] reads this sampler's row of logits on
+    /// `device`: the route [`Self::sample_with_logprobs`] would take. Device
+    /// candidates are only requested here, so the step can plan every
+    /// requesting row together.
+    fn row_plan(&self, device: &Device) -> PlannedReadback<'_> {
         if self.grammar.is_some() || self.config.logprobs {
-            return Ok(RowSampling::Host);
+            return PlannedReadback::None;
         }
         if is_deterministic_greedy(&self.config) {
-            return Ok(RowSampling::Greedy);
+            return PlannedReadback::Greedy;
         }
-        if !(logits.device().is_cuda() || logits.device().is_metal()) {
-            return Ok(RowSampling::Host);
+        if !(device.is_cuda() || device.is_metal()) {
+            return PlannedReadback::None;
         }
-        Ok(pending_sampling_candidates(
-            &logits.i(row)?,
-            vocab_size,
-            self.config.top_k,
-            self.config.temperature,
-            PenaltyHistory::uniform(&self.history),
-            self.config.repetition_penalty,
-            self.config.presence_penalty,
-            None,
-        )?
-        .map_or(RowSampling::Host, RowSampling::Candidates))
+        PlannedReadback::Candidates(CandidateRequest {
+            top_k: self.config.top_k,
+            temperature: self.config.temperature,
+            history: PenaltyHistory::uniform(&self.history),
+            repetition_penalty: self.config.repetition_penalty,
+            presence_penalty: self.config.presence_penalty,
+        })
     }
 
     /// The draw of a row whose logits are already on the host.
@@ -440,44 +438,50 @@ pub(crate) fn sample_chat_rows_guarded(
             .collect::<Result<Vec<_>>>()
             .map(Some);
     }
-    let plans = samplers
+    let requests = samplers
         .iter()
-        .enumerate()
-        .map(|(row, sampler)| sampler.row_sampling(&logits, row, vocab))
-        .collect::<Result<Vec<_>>>()?;
-    let mut parts = Vec::with_capacity(rows + 3);
+        .map(|sampler| sampler.row_plan(logits.device()))
+        .collect::<Vec<_>>();
+    let candidates = plan_step_candidates(full_logits, vocab, &requests)?;
+    let plans = requests
+        .iter()
+        .zip(candidates)
+        .map(|(request, candidates)| match (request, candidates) {
+            (PlannedReadback::Greedy, _) => RowSampling::Greedy,
+            (_, Some(pending)) => RowSampling::Candidates(pending),
+            _ => RowSampling::Host,
+        })
+        .collect::<Vec<_>>();
+    let mut readback = ReadbackParts::default();
     if let Some(guard) = guard {
-        parts.push(guard.to_dtype(DType::F32)?.flatten_all()?);
+        readback.push(guard.to_dtype(DType::F32)?.flatten_all()?);
     }
     let any_greedy = plans.iter().any(|plan| matches!(plan, RowSampling::Greedy));
+    let greedy_at = readback.len;
     if any_greedy {
         let ids = logits.argmax_keepdim(D::Minus1)?;
         // Gather reads contiguous rows; every id is inside the vocabulary.
         let picked = full_logits.contiguous()?.gather(&ids, D::Minus1)?;
-        parts.push(ids.to_dtype(DType::F32)?.flatten_all()?);
-        parts.push(picked.to_dtype(DType::F32)?.flatten_all()?);
+        readback.push(ids.to_dtype(DType::F32)?.flatten_all()?);
+        readback.push(picked.to_dtype(DType::F32)?.flatten_all()?);
     }
-    for (row, plan) in plans.iter().enumerate() {
-        match plan {
-            RowSampling::Greedy => {}
-            RowSampling::Candidates(pending) => parts.push(pending.packed.clone()),
-            RowSampling::Host => parts.push(logits.i(row)?.to_dtype(DType::F32)?),
-        }
-    }
-    let packed = read_f32_values_to_host(&Tensor::cat(&parts, 0)?)?;
-    let mut cursor = 0usize;
-    if guard.is_some() {
-        cursor = 1;
-        if packed.first().copied() == Some(0.0) {
-            return Ok(None);
-        }
-    }
-    let greedy_at = cursor;
-    if any_greedy {
-        cursor += rows * 2;
+    let starts = plans
+        .iter()
+        .enumerate()
+        .map(|(row, plan)| {
+            Ok(match plan {
+                RowSampling::Greedy => greedy_at,
+                RowSampling::Candidates(pending) => readback.push_candidates(pending),
+                RowSampling::Host => readback.push(logits.i(row)?.to_dtype(DType::F32)?),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let packed = readback.read()?;
+    if guard.is_some() && packed.first().copied() == Some(0.0) {
+        return Ok(None);
     }
     let mut sampled = Vec::with_capacity(rows);
-    for (row, (sampler, plan)) in samplers.iter_mut().zip(plans).enumerate() {
+    for (row, ((sampler, plan), start)) in samplers.iter_mut().zip(plans).zip(starts).enumerate() {
         let token = match plan {
             RowSampling::Greedy => {
                 let picked = packed[greedy_at + rows + row];
@@ -489,7 +493,7 @@ pub(crate) fn sample_chat_rows_guarded(
                 (token, None)
             }
             RowSampling::Candidates(pending) => {
-                let candidates = pending.unpack(take(&packed, &mut cursor, pending.len())?)?;
+                let candidates = pending.unpack(readback_slice(&packed, start, pending.len())?)?;
                 let row_logits = logits.i(row)?;
                 let token = sample_candidates_or_host(
                     candidates,
@@ -501,28 +505,68 @@ pub(crate) fn sample_chat_rows_guarded(
                 )?;
                 (token, None)
             }
-            RowSampling::Host => {
-                sampler.sample_host_row(take(&packed, &mut cursor, vocab)?.to_vec(), vocab_size)?
-            }
+            RowSampling::Host => sampler
+                .sample_host_row(readback_slice(&packed, start, vocab)?.to_vec(), vocab_size)?,
         };
         sampler.record(token.0);
         sampled.push(token);
     }
-    if cursor != packed.len() {
-        return Err(Error::InferenceError(
-            "batched sampling readback has the wrong length".into(),
-        ));
-    }
     Ok(Some(sampled))
 }
 
-/// The next `len` values of a packed readback.
-fn take<'a>(packed: &'a [f32], cursor: &mut usize, len: usize) -> Result<&'a [f32]> {
-    let slice = packed
-        .get(*cursor..*cursor + len)
-        .ok_or_else(|| Error::InferenceError("batched sampling readback is too short".into()))?;
-    *cursor += len;
-    Ok(slice)
+/// One step's device-to-host readback as it is assembled: every part once,
+/// in order, and where each lands in the host copy. A batched planning
+/// group's candidate pack is pushed by its first row and found by the rest.
+#[derive(Default)]
+struct ReadbackParts {
+    parts: Vec<Tensor>,
+    len: usize,
+    packs: Vec<(candle_core::TensorId, usize)>,
+}
+
+impl ReadbackParts {
+    /// Appends a rank-1 F32 `part` and returns where it starts.
+    fn push(&mut self, part: Tensor) -> usize {
+        let start = self.len;
+        self.len += part.elem_count();
+        self.parts.push(part);
+        start
+    }
+
+    /// Where `pending`'s values start, pushing its pack on first use.
+    fn push_candidates(&mut self, pending: &PendingCandidates) -> usize {
+        let id = pending.packed.id();
+        let start = match self.packs.iter().find(|(pushed, _)| *pushed == id) {
+            Some(&(_, start)) => start,
+            None => {
+                let start = self.push(pending.packed.clone());
+                self.packs.push((id, start));
+                start
+            }
+        };
+        start + pending.offset
+    }
+
+    /// Every part in one transfer.
+    fn read(self) -> Result<Vec<f32>> {
+        if self.parts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let packed = read_f32_values_to_host(&Tensor::cat(&self.parts, 0)?)?;
+        if packed.len() != self.len {
+            return Err(Error::InferenceError(
+                "batched sampling readback has the wrong length".into(),
+            ));
+        }
+        Ok(packed)
+    }
+}
+
+/// The `len` values of a packed readback that start at `start`.
+fn readback_slice(packed: &[f32], start: usize, len: usize) -> Result<&[f32]> {
+    packed
+        .get(start..start + len)
+        .ok_or_else(|| Error::InferenceError("batched sampling readback is too short".into()))
 }
 
 #[derive(Clone)]
@@ -1325,7 +1369,7 @@ fn pending_sampling_candidates(
     }
     let row = logits_row(logits)?;
     let vocab = row.dim(0)?.min(vocab_limit);
-    if vocab == 0 || vocab > MAX_EXACT_F32_INTEGER || top_k > DEVICE_SORT_CHUNK {
+    if !plans_bounded_candidates(vocab, top_k, temperature) {
         return Ok(None);
     }
     if allowed_mask.is_some_and(|mask| mask.len() < vocab) {
@@ -1352,13 +1396,7 @@ fn pending_sampling_candidates(
     adjusted = apply_history_penalties(&adjusted, history, repetition_penalty, presence_penalty)?;
     adjusted = (adjusted / temperature.max(1e-5) as f64)?;
 
-    let requested = if top_k == 0 {
-        DEVICE_SAMPLING_CANDIDATE_LIMIT
-    } else {
-        top_k
-    }
-    .min(vocab);
-    let (values, indices) = bounded_topk(&adjusted, requested)?;
+    let (values, indices) = bounded_topk(&adjusted, candidate_count(top_k, vocab))?;
     let logsumexp = if top_k == 0 {
         Some(adjusted.log_sum_exp(D::Minus1)?.reshape(1)?)
     } else {
@@ -1371,18 +1409,51 @@ fn pending_sampling_candidates(
     }
     Ok(Some(PendingCandidates {
         packed: Tensor::cat(&packed_parts, 0)?,
+        offset: 0,
         count: values.dim(0)?,
         has_logsumexp: logsumexp.is_some(),
     }))
 }
 
+/// Whether [`pending_sampling_candidates`] plans candidates for a row of
+/// `vocab` in-vocabulary logits, rather than leaving the row to the host.
+fn plans_bounded_candidates(vocab: usize, top_k: usize, temperature: f32) -> bool {
+    if temperature <= 1e-5 {
+        return false;
+    }
+    vocab != 0 && vocab <= MAX_EXACT_F32_INTEGER && top_k <= DEVICE_SORT_CHUNK
+}
+
+/// How many candidates a row keeps: its top-k, or the nucleus bound when
+/// top-k is off, never more than the vocabulary.
+fn candidate_count(top_k: usize, vocab: usize) -> usize {
+    if top_k == 0 {
+        DEVICE_SAMPLING_CANDIDATE_LIMIT
+    } else {
+        top_k
+    }
+    .min(vocab)
+}
+
+/// A row's request for bounded device candidates: what
+/// [`pending_sampling_candidates`] takes besides the logits.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CandidateRequest<'a> {
+    pub(crate) top_k: usize,
+    pub(crate) temperature: f32,
+    pub(crate) history: PenaltyHistory<'a>,
+    pub(crate) repetition_penalty: f32,
+    pub(crate) presence_penalty: f32,
+}
+
 /// What one row of a step's batched readback carries, as planned by a
 /// family's own per-row sampler.
-pub(crate) enum PlannedReadback {
+pub(crate) enum PlannedReadback<'a> {
     /// The row's argmax and the logit it selected.
     Greedy,
-    /// The row's bounded device candidates.
-    Candidates(PendingCandidates),
+    /// The row's bounded device candidates, planned together with the
+    /// step's other candidate rows.
+    Candidates(CandidateRequest<'a>),
     /// Nothing: the row samples on its own (grammar, logprobs, host).
     None,
 }
@@ -1398,42 +1469,16 @@ pub(crate) enum PlannedValues {
     None,
 }
 
-/// [`bounded_device_sampling_candidates_with_history`] without its readback:
-/// the candidates stay on the device for [`read_planned_rows`].
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn plan_device_sampling_candidates_with_history(
-    logits: &Tensor,
-    vocab_limit: usize,
-    top_k: usize,
-    temperature: f32,
-    history: PenaltyHistory<'_>,
-    repetition_penalty: f32,
-    presence_penalty: f32,
-) -> Result<Option<PendingCandidates>> {
-    if !(logits.device().is_cuda() || logits.device().is_metal()) || temperature <= 1e-5 {
-        return Ok(None);
-    }
-    pending_sampling_candidates(
-        logits,
-        vocab_limit,
-        top_k,
-        temperature,
-        history,
-        repetition_penalty,
-        presence_penalty,
-        None,
-    )
-}
-
 /// Read every row's planned values of one step's `[rows, width]` logits in
 /// a single device-to-host transfer: the argmax and selected logit of each
-/// greedy row (over the first `vocab_size` columns), then each row's
-/// candidates. Families with their own per-row sampler draw from the result
-/// exactly as that sampler would.
+/// greedy row (over the first `vocab_size` columns), then the candidates of
+/// every candidate row, planned together by [`plan_step_candidates`].
+/// Families with their own per-row sampler draw from the result exactly as
+/// that sampler would.
 pub(crate) fn read_planned_rows(
     logits: &Tensor,
     vocab_size: usize,
-    plans: Vec<PlannedReadback>,
+    plans: Vec<PlannedReadback<'_>>,
 ) -> Result<Vec<PlannedValues>> {
     let (rows, width) = logits.dims2()?;
     if rows != plans.len() {
@@ -1448,54 +1493,49 @@ pub(crate) fn read_planned_rows(
             "batched readback cannot carry a {vocab}-token vocabulary"
         )));
     }
+    let candidates = plan_step_candidates(logits, vocab, &plans)?;
     let greedy_rows = plans
         .iter()
         .enumerate()
         .filter(|(_, plan)| matches!(plan, PlannedReadback::Greedy))
         .map(|(row, _)| row as u32)
         .collect::<Vec<_>>();
-    let mut parts = Vec::with_capacity(plans.len() + 2);
+    let mut readback = ReadbackParts::default();
     if !greedy_rows.is_empty() {
         let selected = Tensor::from_vec(greedy_rows.clone(), greedy_rows.len(), logits.device())?;
         let greedy = logits.narrow(1, 0, vocab)?.index_select(&selected, 0)?;
         let greedy = greedy.to_dtype(DType::F32)?.contiguous()?;
         let ids = greedy.argmax_keepdim(D::Minus1)?;
         let picked = greedy.gather(&ids, D::Minus1)?;
-        parts.push(ids.to_dtype(DType::F32)?.flatten_all()?);
-        parts.push(picked.flatten_all()?);
+        readback.push(ids.to_dtype(DType::F32)?.flatten_all()?);
+        readback.push(picked.flatten_all()?);
     }
-    for plan in &plans {
-        if let PlannedReadback::Candidates(pending) = plan {
-            parts.push(pending.packed.clone());
-        }
-    }
-    let packed = if parts.is_empty() {
-        Vec::new()
-    } else {
-        read_f32_values_to_host(&Tensor::cat(&parts, 0)?)?
-    };
+    let starts = candidates
+        .iter()
+        .map(|pending| {
+            pending
+                .as_ref()
+                .map(|pending| readback.push_candidates(pending))
+        })
+        .collect::<Vec<_>>();
+    let packed = readback.read()?;
     let greedy_count = greedy_rows.len();
-    let mut cursor = greedy_count * 2;
     let mut greedy_seen = 0usize;
     let mut values = Vec::with_capacity(plans.len());
-    for plan in plans {
-        values.push(match plan {
-            PlannedReadback::Greedy => {
+    for ((plan, pending), start) in plans.iter().zip(candidates).zip(starts) {
+        values.push(match (plan, pending, start) {
+            (PlannedReadback::Greedy, _, _) => {
                 let index = packed[greedy_seen] as u32;
                 let logit = packed[greedy_count + greedy_seen];
                 greedy_seen += 1;
                 PlannedValues::Greedy { index, logit }
             }
-            PlannedReadback::Candidates(pending) => PlannedValues::Candidates(
-                pending.unpack(take(&packed, &mut cursor, pending.len())?)?,
+            (_, Some(pending), Some(start)) => PlannedValues::Candidates(
+                pending.unpack(readback_slice(&packed, start, pending.len())?)?,
             ),
-            PlannedReadback::None => PlannedValues::None,
+            // A request outside the bounded contract samples on its own.
+            _ => PlannedValues::None,
         });
-    }
-    if cursor != packed.len() {
-        return Err(Error::InferenceError(
-            "batched planned readback has the wrong length".into(),
-        ));
     }
     Ok(values)
 }
@@ -1504,7 +1544,11 @@ pub(crate) fn read_planned_rows(
 /// tensor (values, indices, then the normalizer when present), so a caller
 /// can read many rows back in a single transfer.
 pub(crate) struct PendingCandidates {
+    /// The row's own pack, or its batched planning group's (one row after
+    /// another), which the step reads back once for the whole group.
     packed: Tensor,
+    /// Where this row's values start in `packed`.
+    offset: usize,
     count: usize,
     has_logsumexp: bool,
 }
@@ -1528,6 +1572,285 @@ impl PendingCandidates {
             logsumexp,
         }))
     }
+}
+
+/// The bit patterns of one row's planned pack, read without the sampling
+/// telemetry (for the batched planner's self-check and its tests).
+fn packed_bits(pending: &PendingCandidates) -> Result<Vec<u32>> {
+    let packed = pending.packed.to_vec1::<f32>()?;
+    Ok(readback_slice(&packed, pending.offset, pending.len())?
+        .iter()
+        .map(|value| value.to_bits())
+        .collect())
+}
+
+/// The bounded candidates of every [`PlannedReadback::Candidates`] row of
+/// one step's `[rows, width]` logits (over the first `vocab_limit` columns),
+/// `None` where [`pending_sampling_candidates`] plans nothing for the row.
+fn plan_step_candidates(
+    logits: &Tensor,
+    vocab_limit: usize,
+    plans: &[PlannedReadback<'_>],
+) -> Result<Vec<Option<PendingCandidates>>> {
+    plan_step_candidates_with(logits, vocab_limit, plans, batched_device_sampling::admit)
+}
+
+/// [`plan_step_candidates`] with the batching switch passed in. Two or more
+/// rows within the bounded contract are planned in one pass by
+/// [`plan_batched_candidates`] when `batched` (asked only then, with the
+/// logits' device and the row count) allows it; every other row is planned
+/// alone, as before.
+fn plan_step_candidates_with(
+    logits: &Tensor,
+    vocab_limit: usize,
+    plans: &[PlannedReadback<'_>],
+    batched: impl FnOnce(&Device, usize) -> bool,
+) -> Result<Vec<Option<PendingCandidates>>> {
+    let (rows, width) = logits.dims2()?;
+    if rows != plans.len() {
+        return Err(Error::InvalidInput(format!(
+            "candidate planning received {} plans for {rows} logits rows",
+            plans.len()
+        )));
+    }
+    let vocab = width.min(vocab_limit);
+    let batch = plans
+        .iter()
+        .enumerate()
+        .filter_map(|(row, plan)| match plan {
+            PlannedReadback::Candidates(request)
+                if plans_bounded_candidates(vocab, request.top_k, request.temperature) =>
+            {
+                Some((row, *request))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    // Flattened penalty entries address the whole `[n, vocab]` block as U32.
+    let addressable = batch
+        .len()
+        .checked_mul(vocab)
+        .is_some_and(|len| len <= u32::MAX as usize);
+    let mut planned = (0..rows).map(|_| None).collect::<Vec<_>>();
+    if batch.len() >= 2 && addressable && batched(logits.device(), batch.len()) {
+        for ((row, _), pending) in batch
+            .iter()
+            .zip(plan_batched_candidates(logits, vocab, &batch)?)
+        {
+            planned[*row] = Some(pending);
+        }
+    }
+    for (row, plan) in plans.iter().enumerate() {
+        if let (PlannedReadback::Candidates(request), None) = (plan, &planned[row]) {
+            planned[row] = pending_sampling_candidates(
+                &logits.i(row)?,
+                vocab_limit,
+                request.top_k,
+                request.temperature,
+                request.history,
+                request.repetition_penalty,
+                request.presence_penalty,
+                None,
+            )?;
+        }
+    }
+    Ok(planned)
+}
+
+/// The candidates of `rows` (step row and request, each within the bounded
+/// contract), in `rows` order, from one planning pass over their
+/// `[n, vocab]` logits instead of one per row: one sanitize, two flattened
+/// penalty passes, one temperature affine per run of equal temperatures,
+/// then per group of equal candidate count and normalizer one row-wise
+/// [`bounded_topk_rows`] and one pack. Every op is elementwise or row-wise
+/// with the per-row path's arithmetic, so each row's pack is bit-identical
+/// to what [`pending_sampling_candidates`] plans for it alone.
+fn plan_batched_candidates(
+    logits: &Tensor,
+    vocab: usize,
+    rows: &[(usize, CandidateRequest<'_>)],
+) -> Result<Vec<PendingCandidates>> {
+    let device = logits.device();
+    let group_of = |request: &CandidateRequest<'_>| {
+        (candidate_count(request.top_k, vocab), request.top_k == 0)
+    };
+    // Slots order the rows so every group, and every temperature inside a
+    // group, is one contiguous run of rows.
+    let mut slots = (0..rows.len()).collect::<Vec<_>>();
+    slots.sort_by_key(|&index| {
+        let (row, request) = &rows[index];
+        (
+            group_of(request),
+            request.temperature.max(1e-5).to_bits(),
+            *row,
+        )
+    });
+    let selected = slots.iter().map(|&index| rows[index].0).collect::<Vec<_>>();
+    let logits = if selected.iter().copied().eq(0..logits.dim(0)?) {
+        logits.clone()
+    } else {
+        let ids = selected.iter().map(|&row| row as u32).collect::<Vec<_>>();
+        let ids = Tensor::from_vec(ids, selected.len(), device)?;
+        logits.contiguous()?.index_select(&ids, 0)?
+    };
+    let requests = slots
+        .iter()
+        .map(|&index| &rows[index].1)
+        .collect::<Vec<_>>();
+    let adjusted = sanitize_finite(&logits.narrow(1, 0, vocab)?.to_dtype(DType::F32)?)?;
+    let adjusted = apply_row_history_penalties(&adjusted, &requests)?;
+
+    let mut planned = (0..rows.len()).map(|_| None).collect::<Vec<_>>();
+    let mut start = 0;
+    while start < requests.len() {
+        let group = group_of(requests[start]);
+        let len = requests[start..]
+            .iter()
+            .take_while(|request| group_of(request) == group)
+            .count();
+        let (count, has_logsumexp) = group;
+        let scaled = scale_rows_by_temperature(
+            &adjusted.narrow(0, start, len)?,
+            &requests[start..start + len],
+        )?;
+        let (values, indices) = bounded_topk_rows(&scaled, count)?;
+        let mut parts = vec![values, indices.to_dtype(DType::F32)?];
+        if has_logsumexp {
+            parts.push(scaled.log_sum_exp(D::Minus1)?.reshape((len, 1))?);
+        }
+        let packed = Tensor::cat(&parts, 1)?.flatten_all()?;
+        let stride = count * 2 + usize::from(has_logsumexp);
+        for (slot, &index) in slots[start..start + len].iter().enumerate() {
+            planned[index] = Some(PendingCandidates {
+                packed: packed.clone(),
+                offset: slot * stride,
+                count,
+                has_logsumexp,
+            });
+        }
+        start += len;
+    }
+    planned
+        .into_iter()
+        .map(|pending| {
+            pending.ok_or_else(|| Error::InferenceError("batched planning lost a row".into()))
+        })
+        .collect()
+}
+
+/// The tokens each penalty reads for one row, as [`apply_history_penalties`]
+/// decides: `(repetition, presence)`, `None` where that penalty leaves the
+/// row alone. A uniform history runs both penalties behind one shared guard;
+/// a split history runs each on its own, so a repetition penalty within
+/// `f32::EPSILON` of 1 still applies beside a presence penalty only when the
+/// history is uniform.
+fn penalized_tokens<'a>(
+    history: PenaltyHistory<'a>,
+    repetition_penalty: f32,
+    presence_penalty: f32,
+) -> (Option<&'a [u32]>, Option<&'a [u32]>) {
+    let repeats = repetition_penalty > 1.0;
+    let presents = presence_penalty.abs() > f32::EPSILON;
+    if history.is_uniform() {
+        let tokens = history.repetition;
+        let neutral = (repetition_penalty - 1.0).abs() <= f32::EPSILON && !presents;
+        if tokens.is_empty() || neutral {
+            return (None, None);
+        }
+        return (repeats.then_some(tokens), presents.then_some(tokens));
+    }
+    let repetition = (repeats
+        && (repetition_penalty - 1.0).abs() > f32::EPSILON
+        && !history.repetition.is_empty())
+    .then_some(history.repetition);
+    let presence = (presents && !history.presence.is_empty()).then_some(history.presence);
+    (repetition, presence)
+}
+
+/// [`apply_history_penalties`] for every row of `values` (`[n, vocab]`, row
+/// `slot` under `requests[slot]`) in at most two passes over the flattened
+/// block: repetition, then presence. Rows never share an entry, and every
+/// entry rounds as the per-row scalar affines round it: `x * (1 / penalty)`
+/// for a positive `x` (the affine's `+ 0` changes nothing there),
+/// `x * penalty + 0` otherwise (the `+ 0` turns a `-0` product into `+0` as
+/// the affine does), and `x + (-presence)`, which is `x * 1 - presence`.
+fn apply_row_history_penalties(
+    values: &Tensor,
+    requests: &[&CandidateRequest<'_>],
+) -> Result<Tensor> {
+    let (rows, vocab) = values.dims2()?;
+    let device = values.device();
+    let (mut repeated_ids, mut inverses, mut factors) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut present_ids, mut negated) = (Vec::new(), Vec::new());
+    for (slot, request) in requests.iter().enumerate() {
+        let (repeated, present) = penalized_tokens(
+            request.history,
+            request.repetition_penalty,
+            request.presence_penalty,
+        );
+        let base = (slot * vocab) as u32;
+        let repeated_tokens = repeated.map(|tokens| distinct_in_vocab(tokens, vocab));
+        if let Some(tokens) = &repeated_tokens {
+            let inverse = (1.0 / request.repetition_penalty as f64) as f32;
+            repeated_ids.extend(tokens.iter().map(|token| base + token));
+            inverses.extend(std::iter::repeat_n(inverse, tokens.len()));
+            factors.extend(std::iter::repeat_n(
+                request.repetition_penalty,
+                tokens.len(),
+            ));
+        }
+        if let Some(history) = present {
+            // Over a uniform history both penalties read the same tokens.
+            let tokens = match (repeated, repeated_tokens) {
+                (Some(repeated), Some(tokens)) if std::ptr::eq(repeated, history) => tokens,
+                _ => distinct_in_vocab(history, vocab),
+            };
+            present_ids.extend(tokens.iter().map(|token| base + token));
+            negated.extend(std::iter::repeat_n(-request.presence_penalty, tokens.len()));
+        }
+    }
+    let mut flat = values.flatten_all()?;
+    if !repeated_ids.is_empty() {
+        let len = repeated_ids.len();
+        let ids = Tensor::from_vec(repeated_ids, len, device)?;
+        let selected = flat.index_select(&ids, 0)?;
+        let positive = selected.gt(0.0f64)?;
+        let divided = selected.mul(&Tensor::from_vec(inverses, len, device)?)?;
+        let multiplied = (selected.mul(&Tensor::from_vec(factors, len, device)?)? + 0.0)?;
+        flat = flat.scatter(&ids, &positive.where_cond(&divided, &multiplied)?, 0)?;
+    }
+    if !present_ids.is_empty() {
+        let len = present_ids.len();
+        let ids = Tensor::from_vec(present_ids, len, device)?;
+        let selected = flat.index_select(&ids, 0)?;
+        let penalized = selected.add(&Tensor::from_vec(negated, len, device)?)?;
+        flat = flat.scatter(&ids, &penalized, 0)?;
+    }
+    flat.reshape((rows, vocab)).map_err(Error::from)
+}
+
+/// Each row of `values` divided by its request's temperature through the
+/// per-row path's own scalar affine, one launch per run of equal
+/// temperatures. Candle's affine is `x * mul + add` (one fused multiply-add
+/// on Metal, and on CUDA as nvcc contracts it), so a broadcast multiply by
+/// per-row factors could differ from it in the sign of a zero result; the
+/// same affine keeps every bit.
+fn scale_rows_by_temperature(
+    values: &Tensor,
+    requests: &[&CandidateRequest<'_>],
+) -> Result<Tensor> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+    while start < requests.len() {
+        let temperature = requests[start].temperature.max(1e-5);
+        let len = requests[start..]
+            .iter()
+            .take_while(|request| request.temperature.max(1e-5).to_bits() == temperature.to_bits())
+            .count();
+        runs.push((values.narrow(0, start, len)? / temperature as f64)?);
+        start += len;
+    }
+    Tensor::cat(&runs, 0).map_err(Error::from)
 }
 
 fn unpack_sampling_readback(
@@ -1794,6 +2117,195 @@ fn bounded_topk(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
     }
 }
 
+/// [`bounded_topk`] of every row of `values` (`[rows, length]`) at once:
+/// the same 1024-wide chunk sorts, `-inf`/`u32::MAX` padding at each row's
+/// end and merge rounds, with all rows' chunks in one sort per round. Sorts
+/// and gathers work row by row, so each row's result equals `bounded_topk`
+/// of that row alone, ties included.
+fn bounded_topk_rows(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
+    let (rows, length) = values.dims2()?;
+    if rows == 0 || length == 0 || length > u32::MAX as usize || k == 0 || k > DEVICE_SORT_CHUNK {
+        return Err(Error::InvalidInput(format!(
+            "bounded top-k requires U32-addressable non-empty rows and 1..={DEVICE_SORT_CHUNK} candidates"
+        )));
+    }
+    let device = values.device();
+    let mut candidate_values = values.contiguous()?;
+    let mut candidate_indices =
+        cached_sampling_tensor(device, SamplingTensorCacheInput::Arange(length as u32))?
+            .unsqueeze(0)?
+            .broadcast_as((rows, length))?
+            .contiguous()?;
+    loop {
+        let length = candidate_values.dim(1)?;
+        if length <= DEVICE_SORT_CHUNK {
+            let (sorted, order) = candidate_values.sort_last_dim(false)?;
+            let keep = k.min(length);
+            return Ok((
+                sorted.narrow(1, 0, keep)?,
+                candidate_indices.gather(&order, 1)?.narrow(1, 0, keep)?,
+            ));
+        }
+
+        let chunks = length.div_ceil(DEVICE_SORT_CHUNK);
+        let padded_len = chunks * DEVICE_SORT_CHUNK;
+        if padded_len > length {
+            let padding = padded_len - length;
+            candidate_values = Tensor::cat(
+                &[
+                    &candidate_values,
+                    &Tensor::full(f32::NEG_INFINITY, (rows, padding), device)?,
+                ],
+                1,
+            )?;
+            candidate_indices = Tensor::cat(
+                &[
+                    &candidate_indices,
+                    &Tensor::full(u32::MAX, (rows, padding), device)?,
+                ],
+                1,
+            )?;
+        }
+        let values_2d = candidate_values.reshape((rows * chunks, DEVICE_SORT_CHUNK))?;
+        let indices_2d = candidate_indices.reshape((rows * chunks, DEVICE_SORT_CHUNK))?;
+        let (sorted, order) = values_2d.sort_last_dim(false)?;
+        let keep = k.min(DEVICE_SORT_CHUNK);
+        candidate_values = sorted.narrow(1, 0, keep)?.reshape((rows, chunks * keep))?;
+        candidate_indices = indices_2d
+            .gather(&order, 1)?
+            .narrow(1, 0, keep)?
+            .reshape((rows, chunks * keep))?;
+    }
+}
+
+/// Batched planning of a step's device candidates
+/// ([`plan_batched_candidates`]): its kill switch, a one-time bitwise check
+/// against per-row planning, and counters for the family diagnostics.
+pub(crate) mod batched_device_sampling {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    use candle_core::{Device, Tensor};
+
+    use super::{
+        packed_bits, plan_step_candidates_with, CandidateRequest, PenaltyHistory, PlannedReadback,
+    };
+    use crate::{Error, Result};
+
+    /// Kill switch: `false` plans each row's candidates on its own.
+    pub(crate) const ENV: &str = "IZWI_BATCHED_DEVICE_SAMPLING";
+
+    static RESOLVED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    static STEPS: AtomicU64 = AtomicU64::new(0);
+    static ROWS: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether a step plans its `rows` candidate rows together (counting it
+    /// when it does), resolved once, on the first device that asks.
+    pub(super) fn admit(device: &Device, rows: usize) -> bool {
+        let admitted = RESOLVED.get_or_init(|| resolve(device)).is_ok();
+        if admitted {
+            STEPS.fetch_add(1, Relaxed);
+            ROWS.fetch_add(rows as u64, Relaxed);
+        }
+        admitted
+    }
+
+    pub(super) fn resolve(device: &Device) -> std::result::Result<(), String> {
+        if !crate::env::flag_or(ENV, true) {
+            return Err(format!("{ENV}=false"));
+        }
+        self_check(device).map_err(|error| {
+            tracing::warn!(
+                %error,
+                "batched device sampling self-check failed; planning candidate rows one at a time"
+            );
+            format!("self-check failed: {error}")
+        })
+    }
+
+    /// Three rows of coarse logits (ties everywhere) with NaN, ±inf and
+    /// signed zeros at penalized tokens, a vocabulary narrower than the
+    /// logits, split and uniform histories, planned in mixed groups (top-k
+    /// 20, 1 and 0, so the rows are reordered) and in one group (all top-k
+    /// 0, three temperatures): every batched pack must equal its per-row
+    /// pack bit for bit.
+    pub(super) fn self_check(device: &Device) -> Result<()> {
+        const ROWS: usize = 3;
+        const WIDTH: usize = 5_003;
+        const VOCAB: usize = 5_000;
+        let logits = (0..ROWS * WIDTH)
+            .map(|index| match index % WIDTH {
+                5 => f32::NAN,
+                6 => f32::INFINITY,
+                7 => f32::NEG_INFINITY,
+                8 => -0.0,
+                9 => 0.0,
+                _ => ((index * 7_919) % 37) as f32 * 0.25 - 4.5,
+            })
+            .collect::<Vec<_>>();
+        let logits = Tensor::from_vec(logits, (ROWS, WIDTH), device)?;
+        let history = [
+            5u32, 6, 7, 8, 9, 13, 1_027, 4_999, 5_001, 13, 2_048, 8, 3_100, 9,
+        ];
+        let histories = [
+            PenaltyHistory::uniform(&history),
+            PenaltyHistory {
+                repetition: &history,
+                presence: &history[8..],
+            },
+            PenaltyHistory::uniform(&history[8..]),
+        ];
+        let temperatures = [0.7, 1.0, 1.3];
+        let repetition = [1.3, 1.2, 1.0];
+        let presence = [0.4, -0.3, 0.6];
+        for top_ks in [[20, 1, 0], [0, 0, 0]] {
+            let plans = (0..ROWS)
+                .map(|row| {
+                    PlannedReadback::Candidates(CandidateRequest {
+                        top_k: top_ks[row],
+                        temperature: temperatures[row],
+                        history: histories[row],
+                        repetition_penalty: repetition[row],
+                        presence_penalty: presence[row],
+                    })
+                })
+                .collect::<Vec<_>>();
+            let batched = plan_step_candidates_with(&logits, VOCAB, &plans, |_, _| true)?;
+            let per_row = plan_step_candidates_with(&logits, VOCAB, &plans, |_, _| false)?;
+            for (row, (batched, per_row)) in batched.iter().zip(&per_row).enumerate() {
+                let (Some(batched), Some(per_row)) = (batched, per_row) else {
+                    return Err(Error::InferenceError(format!(
+                        "row {row} was not planned on both paths"
+                    )));
+                };
+                if packed_bits(batched)? != packed_bits(per_row)? {
+                    return Err(Error::InferenceError(format!(
+                        "batched candidates of row {row} (top-k {}) differ from per-row planning",
+                        top_ks[row]
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The resolution and how many steps and rows planned together, for the
+    /// admin diagnostics.
+    pub(crate) fn summary() -> serde_json::Value {
+        let (backend, reason) = match RESOLVED.get() {
+            None => ("unresolved", None),
+            Some(Ok(())) => ("batched", None),
+            Some(Err(reason)) => ("per_row", Some(reason.as_str())),
+        };
+        serde_json::json!({
+            "backend": backend,
+            "reason": reason,
+            "steps": STEPS.load(Relaxed),
+            "rows": ROWS.load(Relaxed),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1937,8 +2449,29 @@ mod tests {
         ]
     }
 
+    /// Rows that share batched planning groups: three top-k 40 rows at two
+    /// temperatures (one penalized) and two nucleus-only rows.
+    fn grouped_samplers() -> Vec<ChatSampler> {
+        let history = [3, 17, 17, 905];
+        [
+            sampled(0.9, 40, 1.0, 11),
+            sampled(0.9, 40, 0.95, 12),
+            ChatGenerationConfig {
+                repetition_penalty: 1.3,
+                presence_penalty: 0.5,
+                ..sampled(0.6, 40, 1.0, 13)
+            },
+            sampled(1.1, 0, 0.9, 14),
+            sampled(0.8, 0, 0.5, 15),
+        ]
+        .into_iter()
+        .map(|config| ChatSampler::new(config, &history))
+        .collect()
+    }
+
     fn assert_batched_sampling_parity(device: &Device) {
         assert_batched_rows_match_single_rows(device, mixed_samplers(true), 1_500, 1_400, 24);
+        assert_batched_rows_match_single_rows(device, grouped_samplers(), 1_500, 1_400, 24);
         assert_batched_rows_match_single_rows(device, json_samplers(), 16, 13, 24);
         let reads =
             assert_batched_rows_match_single_rows(device, mixed_samplers(false), 1_500, 1_400, 24);
@@ -1987,6 +2520,246 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(batched, expected);
+    }
+
+    /// Coarse logits (ties everywhere) with NaN, ±inf, signed zeros and
+    /// subnormals on penalized tokens, and a last row that is `-inf` but for
+    /// a few tokens, so its top-k holds `-inf` and padding candidates.
+    fn planning_logits(rows: usize, width: usize) -> Vec<f32> {
+        (0..rows * width)
+            .map(|index| {
+                let (row, token) = (index / width, index % width);
+                if row == rows - 1 && token % 997 != 3 {
+                    return f32::NEG_INFINITY;
+                }
+                match token {
+                    5 => f32::NAN,
+                    6 => f32::INFINITY,
+                    7 => f32::NEG_INFINITY,
+                    8 => -0.0,
+                    9 => 0.0,
+                    10 => -1.0e-40,
+                    11 => 1.0e-40,
+                    _ => ((index * 7_919 + row * 13) % 41) as f32 * 0.25 - 5.0,
+                }
+            })
+            .collect()
+    }
+
+    fn candidates(
+        top_k: usize,
+        temperature: f32,
+        history: PenaltyHistory<'_>,
+        repetition_penalty: f32,
+        presence_penalty: f32,
+    ) -> PlannedReadback<'_> {
+        PlannedReadback::Candidates(CandidateRequest {
+            top_k,
+            temperature,
+            history,
+            repetition_penalty,
+            presence_penalty,
+        })
+    }
+
+    /// Plans `plans` over [`planning_logits`] in one batched pass and row by
+    /// row: the same rows are planned, the per-row packs are each row's own,
+    /// and every batched pack equals its per-row pack to the bit. Returns
+    /// the batched plan.
+    fn assert_batched_packs_match_per_row(
+        device: &Device,
+        width: usize,
+        vocab: usize,
+        plans: &[PlannedReadback<'_>],
+    ) -> Vec<Option<PendingCandidates>> {
+        let logits = Tensor::from_vec(
+            planning_logits(plans.len(), width),
+            (plans.len(), width),
+            device,
+        )
+        .unwrap();
+        let batched = plan_step_candidates_with(&logits, vocab, plans, |_, _| true).unwrap();
+        let per_row = plan_step_candidates_with(&logits, vocab, plans, |_, _| false).unwrap();
+        for (row, (batched, per_row)) in batched.iter().zip(&per_row).enumerate() {
+            match (batched, per_row) {
+                (None, None) => {}
+                (Some(batched), Some(per_row)) => {
+                    assert_eq!(per_row.offset, 0, "row {row}");
+                    assert_eq!(per_row.packed.elem_count(), per_row.len(), "row {row}");
+                    assert_eq!(
+                        (batched.count, batched.has_logsumexp),
+                        (per_row.count, per_row.has_logsumexp),
+                        "row {row}"
+                    );
+                    assert_eq!(
+                        packed_bits(batched).unwrap(),
+                        packed_bits(per_row).unwrap(),
+                        "row {row} on {:?}",
+                        device.location()
+                    );
+                }
+                _ => panic!("row {row}: only one path planned it"),
+            }
+        }
+        batched
+    }
+
+    /// The batched planner's self-check, then three steps: mixed groups and
+    /// temperatures over a vocabulary narrower than the logits, with rows
+    /// that are not batched in between; rows already in group order (no row
+    /// gather); and a ~70k vocabulary that takes three or more sort rounds.
+    fn assert_batched_planning(device: &Device) {
+        batched_device_sampling::self_check(device).unwrap();
+        let prompt = [
+            5u32, 6, 7, 8, 9, 10, 11, 17, 17, 1_027, 2_047, 2_049, 2_060, 905,
+        ];
+        let uniform = PenaltyHistory::uniform(&prompt);
+        let split = PenaltyHistory {
+            repetition: &prompt,
+            presence: &prompt[9..],
+        };
+        // Within `f32::EPSILON` of 1: applied beside a presence penalty only
+        // over a uniform history.
+        let near_one = 1.0 + f32::EPSILON;
+        let mixed = [
+            PlannedReadback::Greedy,
+            candidates(20, 0.7, uniform, 1.3, 0.4),
+            candidates(20, 0.7, split, 1.2, -0.3),
+            PlannedReadback::None,
+            candidates(20, 1.1, uniform, near_one, 0.5),
+            candidates(0, 0.9, split, near_one, 0.5),
+            candidates(0, 1.3, PenaltyHistory::uniform(&[]), 1.5, 0.0),
+            candidates(1, 1.0, uniform, 0.8, 0.0),
+            // Outside the bounded contract: planned by neither path.
+            candidates(2_000, 0.8, uniform, 1.3, 0.0),
+            candidates(20, 0.0, uniform, 1.3, 0.0),
+            candidates(512, 0.5, uniform, 1.0, 0.2),
+            candidates(20, 1.1, split, 1.0, 0.0),
+            candidates(20, 0.6, uniform, 1.4, 0.0),
+        ];
+        let planned = assert_batched_packs_match_per_row(device, 2_100, 2_050, &mixed);
+        let pack = |row: usize| planned[row].as_ref().unwrap().packed.id();
+        assert!([2, 4, 11, 12].into_iter().all(|row| pack(row) == pack(1)));
+        assert_eq!(pack(5), pack(6));
+        assert_ne!(pack(1), pack(5));
+        assert!(planned[8].is_none() && planned[9].is_none());
+
+        let in_order = [
+            candidates(1, 1.0, uniform, 1.3, 0.0),
+            candidates(20, 0.7, split, 1.2, 0.4),
+            candidates(20, 0.7, uniform, 1.0, 0.0),
+            candidates(0, 1.2, uniform, 1.1, -0.2),
+        ];
+        assert_batched_packs_match_per_row(device, 1_000, 1_000, &in_order);
+
+        let wide_prompt = [5u32, 8, 10, 1_023, 1_024, 40_000, 69_997, 69_999, 8, 70_001];
+        let wide_uniform = PenaltyHistory::uniform(&wide_prompt);
+        let wide_split = PenaltyHistory {
+            repetition: &wide_prompt,
+            presence: &wide_prompt[4..],
+        };
+        let wide = [
+            candidates(20, 0.8, wide_split, 1.3, 0.5),
+            candidates(0, 1.0, wide_uniform, 1.2, 0.0),
+            candidates(20, 1.3, wide_uniform, 1.0, 0.3),
+            candidates(1, 0.5, wide_uniform, 1.5, 0.0),
+        ];
+        assert_batched_packs_match_per_row(device, 70_000, 69_998, &wide);
+    }
+
+    #[test]
+    fn batched_candidate_planning_matches_per_row_packs_on_cpu() {
+        assert_batched_planning(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn batched_candidate_planning_matches_per_row_packs_on_metal() {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "batched_candidate_planning_matches_per_row_packs_on_metal",
+        ) else {
+            return;
+        };
+        assert_batched_planning(&device);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn batched_candidate_planning_matches_per_row_packs_on_cuda() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        assert_batched_planning(&device);
+    }
+
+    /// With the kill switch off a step plans every row alone, and so does a
+    /// step with one candidate row: each pack is the row's own tensor,
+    /// exactly what `pending_sampling_candidates` plans.
+    #[test]
+    fn batched_device_sampling_kill_switch_plans_every_row_alone() {
+        let _guard = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var(batched_device_sampling::ENV, "false");
+        let switched_off = batched_device_sampling::resolve(&Device::Cpu);
+        std::env::remove_var(batched_device_sampling::ENV);
+        assert_eq!(
+            switched_off,
+            Err(format!("{}=false", batched_device_sampling::ENV))
+        );
+        assert_eq!(batched_device_sampling::resolve(&Device::Cpu), Ok(()));
+
+        let device = Device::Cpu;
+        let history = [5u32, 8, 17, 17, 300];
+        let (width, vocab) = (1_500, 1_400);
+        let logits = Tensor::from_vec(planning_logits(3, width), (3, width), &device).unwrap();
+        let expect_per_row =
+            |plans: &[PlannedReadback<'_>], planned: Vec<Option<PendingCandidates>>| {
+                for (row, (plan, planned)) in plans.iter().zip(planned).enumerate() {
+                    let PlannedReadback::Candidates(request) = plan else {
+                        assert!(planned.is_none(), "row {row}");
+                        continue;
+                    };
+                    let planned = planned.unwrap();
+                    let alone = pending_sampling_candidates(
+                        &logits.i(row).unwrap(),
+                        vocab,
+                        request.top_k,
+                        request.temperature,
+                        request.history,
+                        request.repetition_penalty,
+                        request.presence_penalty,
+                        None,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(planned.offset, 0, "row {row}");
+                    assert_eq!(planned.packed.elem_count(), planned.len(), "row {row}");
+                    assert_eq!(
+                        packed_bits(&planned).unwrap(),
+                        packed_bits(&alone).unwrap(),
+                        "row {row}"
+                    );
+                }
+            };
+        let plans = [
+            candidates(20, 0.7, PenaltyHistory::uniform(&history), 1.3, 0.4),
+            candidates(20, 0.9, PenaltyHistory::uniform(&history), 1.0, 0.0),
+            candidates(0, 1.1, PenaltyHistory::uniform(&[]), 1.0, 0.0),
+        ];
+        let planned = plan_step_candidates_with(&logits, vocab, &plans, |_, _| false).unwrap();
+        expect_per_row(&plans, planned);
+
+        let one_row = [
+            PlannedReadback::Greedy,
+            candidates(20, 0.7, PenaltyHistory::uniform(&history), 1.3, 0.4),
+            PlannedReadback::None,
+        ];
+        let planned = plan_step_candidates_with(&logits, vocab, &one_row, |_, _| {
+            panic!("a step with one candidate row never batches")
+        })
+        .unwrap();
+        expect_per_row(&one_row, planned);
     }
 
     #[test]

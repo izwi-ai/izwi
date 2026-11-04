@@ -25,6 +25,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_ASR_STREAM_CHUNK_SILENCE_SEARCH_SECS` | number | 0.75 (audio <=12s) else 1.5 | first use | Overrides the silence-search window in seconds around streaming ASR chunk boundaries (capped at half the target). |
 | `IZWI_ASR_STREAM_CHUNK_TARGET_SECS` | number | 2.4 (audio <=12s) else min(long-form target, 6) | first use | Overrides the preferred chunk length in seconds for low-latency streaming ASR chunk planning. |
 | `IZWI_BACKEND` | choice | `auto` | startup | Selects the execution backend: auto, cpu, metal (alias mps) or cuda (alias gpu); unknown values ignored. |
+| `IZWI_BATCHED_DEVICE_SAMPLING` | flag | `true` | first use | Kill switch: false plans each sampled chat row's device candidates on its own in a batched decode step instead of in one pass for all rows (CUDA, Metal). |
 | `IZWI_BUFFER_POOL` | flag | `true` | model load | Enables the global pre-allocated inference buffer pool (initialized by Qwen3 ASR load). |
 | `IZWI_BUFFER_POOL_LARGE` | list | `4,262144` | model load | Sets the large buffer pool as "count,elements"; malformed values ignored. |
 | `IZWI_BUFFER_POOL_MEDIUM` | list | `8,32768` | model load | Sets the medium buffer pool as "count,elements"; malformed values ignored. |
