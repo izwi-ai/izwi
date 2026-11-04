@@ -55,7 +55,7 @@ impl ModelLifecycleController {
                     let mut capacity_policy = managed_chat_capacity_policy(variant, backend);
                     if capacity_policy.staged_transaction_rows.is_none() {
                         capacity_policy.staged_transaction_rows =
-                            self.portable_chat_staged_rows(bundle_draft, backend)?;
+                            self.chat_staged_rows(bundle_draft)?;
                     }
                     let physical = self
                         .core_engine

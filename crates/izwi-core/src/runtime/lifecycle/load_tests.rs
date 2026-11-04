@@ -1902,10 +1902,7 @@ fn portable_chat_models_stage_rows_at_their_decode_width() {
         )
         .unwrap();
         draft.seal_chat_workspace(8_192).unwrap();
-        runtime
-            .model_lifecycle
-            .portable_chat_staged_rows(&draft, BackendKind::Cpu)
-            .unwrap()
+        runtime.model_lifecycle.chat_staged_rows(&draft).unwrap()
     };
     let automatic = RuntimeService::new(EngineConfig {
         backend: BackendPreference::Cpu,

@@ -223,7 +223,7 @@ impl BatchSizePreference {
                 BackendKind::Cpu | BackendKind::Metal => {
                     crate::catalog::max_certified_decode_width(backend)
                 }
-                BackendKind::Cuda => 8,
+                BackendKind::Cuda => crate::catalog::CUDA_DEFAULT_WIDTH,
             },
         }
     }

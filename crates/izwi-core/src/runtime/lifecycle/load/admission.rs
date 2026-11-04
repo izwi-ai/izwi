@@ -755,17 +755,17 @@ impl ModelLifecycleController {
         })
     }
 
-    /// Staged rows for a chat model on CPU or Metal when the engine's are
-    /// automatic: one step's launch at the model's own decode width, which
-    /// may exceed the engine rows' portable width (`catalog::batch_width`).
-    /// `None` keeps the engine rows (CUDA, or an operator's explicit limit).
-    pub(super) fn portable_chat_staged_rows(
+    /// Staged rows for a chat model when the engine's are automatic: one
+    /// step's launch at the model's own decode width, which may exceed the
+    /// engine rows' width (`catalog::batch_width`: portable on CPU and Metal,
+    /// the CUDA ceiling for chat families certified past the engine's eight).
+    /// `None` keeps the engine rows (an operator's explicit limit).
+    pub(super) fn chat_staged_rows(
         &self,
         bundle_draft: &LoadedModelBundleDraft,
-        backend: BackendKind,
     ) -> Result<Option<u32>> {
         let engine = self.core_engine.config();
-        if backend == BackendKind::Cuda || !engine.automatic_row_limits.staged_transactions {
+        if !engine.automatic_row_limits.staged_transactions {
             return Ok(None);
         }
         let width = bundle_draft

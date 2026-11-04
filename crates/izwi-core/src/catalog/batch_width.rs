@@ -13,8 +13,11 @@
 //! chat, keep the portable width of two they have always been served at,
 //! except Fish Audio Drama 3, whose rows start at one on CPU and Metal.
 //!
-//! CUDA is not measured here: its ceiling is the kernel and metadata limit,
-//! and its automatic width stays the VRAM-tiered default of eight.
+//! On CUDA the engine and every capability but chat run the automatic eight.
+//! Chat's automatic width there is the CUDA ceiling, clamped per family:
+//! Qwen3.5, LFM2 and LFM3 batch every row's recurrent and conv state in one
+//! launch per layer (one launch per row before), so their steps stay cheap
+//! past eight rows and they take the ceiling; every other family keeps eight.
 
 use super::ModelFamily;
 use crate::backends::BackendKind;
@@ -26,16 +29,20 @@ pub(crate) const PORTABLE_BASELINE_WIDTH: usize = 2;
 /// not a measured width.
 pub(crate) const CUDA_MAX_WIDTH: usize = 32;
 
+/// The automatic CUDA width of the engine rows, and of chat families not
+/// certified for wider CUDA batches.
+pub(crate) const CUDA_DEFAULT_WIDTH: usize = 8;
+
 /// The widest decode batch `family` is certified for on `backend`. The
 /// engine clamps the automatic and `max_num_seqs` widths to it; an
 /// operator's explicit `IZWI_MAX_BATCH_SIZE` may exceed it, with a warning.
 ///
-/// | Family | CPU | Metal | Evidence (ignored real-checkpoint tests) |
-/// |---|---|---|---|
-/// | LFM2 / LFM2.5 | 8 | 8 | `lfm25_decode_matches_across_batch_widths_on_*`, `lfm25_batch_width_scaling_*` |
-/// | Qwen3.5 | 2 | 8 | `qwen35_decode_width_parity_and_throughput_*` |
-/// | Qwen3, Qwen3-MoE, Gemma3, Qwen3.6, Qwen3.8 | 2 | 2 | No checkpoint measured |
-/// | Fish Audio Drama 3 (TTS) | 1 | 1 | Defaults until its row-invariance and throughput evidence |
+/// | Family | CPU | Metal | CUDA | Evidence (ignored real-checkpoint tests) |
+/// |---|---|---|---|---|
+/// | LFM2 / LFM2.5 / LFM3 | 8 | 8 | 32 | `lfm25_decode_matches_across_batch_widths_on_*`, `lfm25_batch_width_scaling_*` |
+/// | Qwen3.5 | 2 | 8 | 32 | `qwen35_decode_width_parity_and_throughput_*` |
+/// | Qwen3, Qwen3-MoE, Gemma3, Qwen3.6, Qwen3.8 | 2 | 2 | 8 | No checkpoint measured |
+/// | Fish Audio Drama 3 (TTS) | 1 | 1 | 8 | Defaults until its row-invariance and throughput evidence |
 ///
 /// Qwen3.5 on the CPU gained nothing past two rows in a repeated run, so it
 /// stays at two. Metal's LFM2 small-batch mat-vec serves 2..=8 rows, which
@@ -45,7 +52,11 @@ pub(crate) const CUDA_MAX_WIDTH: usize = 32;
 /// `IZWI_FISH_DRAMA3_NATIVE_BATCHING`, and CUDA keeps the automatic eight.
 pub(crate) const fn certified_decode_width(family: ModelFamily, backend: BackendKind) -> usize {
     match (backend, family) {
-        (BackendKind::Cuda, _) => CUDA_MAX_WIDTH,
+        (
+            BackendKind::Cuda,
+            ModelFamily::Qwen35Chat | ModelFamily::Lfm2Chat | ModelFamily::Lfm3Chat,
+        ) => CUDA_MAX_WIDTH,
+        (BackendKind::Cuda, _) => CUDA_DEFAULT_WIDTH,
         (BackendKind::Cpu | BackendKind::Metal, ModelFamily::Lfm2Chat | ModelFamily::Lfm3Chat)
         | (BackendKind::Metal, ModelFamily::Qwen35Chat) => 8,
         (BackendKind::Cpu | BackendKind::Metal, ModelFamily::FishDrama3Tts) => 1,
@@ -68,6 +79,20 @@ pub(crate) const fn max_certified_decode_width(backend: BackendKind) -> usize {
 /// certified width runs uncertified, with a startup warning, instead of being
 /// clamped silently.
 pub(crate) const EXPLICIT_WIDTH_CEILING: usize = CUDA_MAX_WIDTH;
+
+/// The engine width chat models clamp to their family's certified width:
+/// on CUDA with no width fixed (`IZWI_MAX_BATCH_SIZE` or `max_num_seqs`) the
+/// CUDA ceiling, otherwise the engine's tensor width.
+pub(crate) const fn chat_engine_width(
+    backend: BackendKind,
+    tensor_width: usize,
+    automatic: bool,
+) -> usize {
+    match backend {
+        BackendKind::Cuda if automatic => CUDA_MAX_WIDTH,
+        _ => tensor_width,
+    }
+}
 
 /// The rows every capability but chat runs at: the certified engine rows,
 /// or an operator's explicit width as asked.
@@ -144,10 +169,34 @@ mod tests {
             certified_decode_width(ModelFamily::Qwen35Chat, BackendKind::Cpu),
             PORTABLE_BASELINE_WIDTH
         );
+        // On CUDA the families with batched state kernels take the ceiling;
+        // every other family keeps the engine's eight.
+        for family in [
+            ModelFamily::Qwen35Chat,
+            ModelFamily::Lfm2Chat,
+            ModelFamily::Lfm3Chat,
+        ] {
+            assert_eq!(
+                certified_decode_width(family, BackendKind::Cuda),
+                CUDA_MAX_WIDTH,
+                "{family:?}"
+            );
+        }
         assert_eq!(
             certified_decode_width(ModelFamily::Gemma3Chat, BackendKind::Cuda),
+            CUDA_DEFAULT_WIDTH
+        );
+    }
+
+    #[test]
+    fn cuda_chat_takes_the_ceiling_only_when_no_width_is_fixed() {
+        assert_eq!(
+            chat_engine_width(BackendKind::Cuda, 8, true),
             CUDA_MAX_WIDTH
         );
+        assert_eq!(chat_engine_width(BackendKind::Cuda, 16, false), 16);
+        assert_eq!(chat_engine_width(BackendKind::Metal, 8, true), 8);
+        assert_eq!(chat_engine_width(BackendKind::Cpu, 8, true), 8);
     }
 
     #[test]
@@ -160,7 +209,7 @@ mod tests {
         }
         assert_eq!(
             certified_decode_width(ModelFamily::FishDrama3Tts, BackendKind::Cuda),
-            CUDA_MAX_WIDTH
+            CUDA_DEFAULT_WIDTH
         );
     }
 }
