@@ -1051,6 +1051,7 @@ impl Qwen35TextModel {
                         &metadata,
                         &mut collector,
                         sparse_layers.len(),
+                        true,
                     );
                     let sealed = collector.seal();
                     let logits = logits?;
@@ -1083,6 +1084,7 @@ impl Qwen35TextModel {
                 &metadata,
                 &mut completions,
                 sparse_layers.len(),
+                false,
             )
         })();
         let logits = match execution {
@@ -1111,7 +1113,10 @@ impl Qwen35TextModel {
 
     /// The standard decode for `token_ids` (one per row): embedding, every
     /// layer through the arena's attention, the final norm and the LM head.
-    /// Returns logits `[batch, 1, vocab]`.
+    /// Returns logits `[batch, 1, vocab]`. `row_invariant` takes the arena's
+    /// batch-invariant attention, which partitions each row's context by its
+    /// own length as the decode graph's attention does (the graph's warm
+    /// check compares against it).
     #[allow(clippy::too_many_arguments)]
     fn standard_decode_logits(
         &self,
@@ -1124,6 +1129,7 @@ impl Qwen35TextModel {
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
         sparse_layers: usize,
+        row_invariant: bool,
     ) -> Result<Tensor> {
         let batch_size = token_ids.len();
         let input = Tensor::from_slice(token_ids, (batch_size, 1), &self.device)?;
@@ -1148,6 +1154,7 @@ impl Qwen35TextModel {
                 metadata,
                 completions,
                 &mut physical_layer,
+                row_invariant,
             )?;
             validate_qwen35_finite_tensor(
                 &hidden,
@@ -1470,6 +1477,7 @@ impl Qwen35Layer {
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
         physical_layer: &mut usize,
+        row_invariant: bool,
     ) -> Result<Tensor> {
         let batch_size = hidden_states.dim(0)?;
         if hidden_states.dim(1)? != 1
@@ -1496,6 +1504,7 @@ impl Qwen35Layer {
                     metadata,
                     completions,
                     *physical_layer,
+                    row_invariant,
                 )?;
                 *physical_layer = physical_layer.checked_add(1).ok_or_else(|| {
                     Error::InvalidInput("Qwen3.5 physical layer ordinal overflow".into())
@@ -1674,6 +1683,7 @@ impl Qwen35FullAttention {
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
         physical_layer: usize,
+        row_invariant: bool,
     ) -> Result<Tensor> {
         let batch_size = hidden_states.dim(0)?;
         if hidden_states.dim(1)? != 1
@@ -1712,6 +1722,7 @@ impl Qwen35FullAttention {
             metadata,
             completions,
             physical_layer,
+            row_invariant,
         )?;
         self.decode_output(&attended, &q_out)
     }
@@ -1732,6 +1743,7 @@ impl Qwen35FullAttention {
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
         physical_layer: usize,
+        row_invariant: bool,
     ) -> Result<Tensor> {
         let batch_size = q_out.dim(0)?;
         let first = caches[0];
@@ -1772,15 +1784,17 @@ impl Qwen35FullAttention {
             },
         )?;
         let (output, completion) = submit_ordered_after_write(completion, || {
-            first.arena().paged_decode(
-                binding,
-                PagedKvDecodeArgs {
-                    queries: &queries,
-                    batch: metadata,
-                    softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
-                    softcap: None,
-                },
-            )
+            let args = PagedKvDecodeArgs {
+                queries: &queries,
+                batch: metadata,
+                softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
+                softcap: None,
+            };
+            if row_invariant {
+                first.arena().paged_decode_row_invariant(binding, args)
+            } else {
+                first.arena().paged_decode(binding, args)
+            }
         })?;
         completions.collect(completion)?;
         output

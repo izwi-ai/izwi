@@ -80,6 +80,11 @@ fn graph_width(rows: usize) -> Option<usize> {
 /// A spare row's flat KV slot: past every cache, so the write skips it.
 const SPARE_SLOT: u32 = u32::MAX;
 
+/// Partitions a row's attention may take before its partitions grow past
+/// `split_decode::ROW_PARTITION_TOKENS` (8k tokens of context): at 32 rows of
+/// 16 heads of 256 dims, 34 MB of F32 partials per attention call.
+const ROW_INVARIANT_PARTITIONS: usize = 64;
+
 /// Logit agreement the warm step demands of the graph body against the
 /// standard decode. They differ in attention precision (16-bit q/k norm
 /// inputs) and summation order, so this catches composition bugs, not
@@ -720,10 +725,19 @@ impl Qwen35DecodeGraph {
         let positions = step.narrow(0, layout.positions(), width)?;
         let slots = step.narrow(0, layout.slots(), width)?;
         let metadata = step.narrow(0, layout.metadata(), layout.metadata_len())?;
+        // Each row splits its own context into 128-token partitions, as the
+        // arena's row-invariant decode does, up to this cap: the occupancy
+        // count, but at least enough for an 8k-token context, so the graph
+        // and the row-invariant decode agree on every row up to there.
         let max_partitions = split_decode::partitions(
             width,
             model.first_attention()?.num_kv_heads,
             self.max_context,
+        )
+        .max(
+            self.max_context
+                .div_ceil(split_decode::ROW_PARTITION_TOKENS)
+                .min(ROW_INVARIANT_PARTITIONS),
         );
         let mut output = None;
         let launching = HostTimes::add(&self.host.prepare_us, preparing);
@@ -1234,6 +1248,7 @@ fn attend(
             metadata,
             completions,
             physical,
+            false,
         )?,
     };
     full.decode_output(&attended, &q_out)
