@@ -1164,6 +1164,22 @@ impl WorkerConfig {
     }
 }
 
+/// Families whose loaded stage sets their batch rows instead of the
+/// engine's tensor width: Fish S2 and Drama 3 fit their own rows, and the chat
+/// families certified wider on CUDA than the engine rows
+/// (`catalog::batch_width`) decode up to their stage's width.
+fn stage_sets_batch_rows(family: crate::catalog::ModelFamily) -> bool {
+    use crate::catalog::ModelFamily;
+    matches!(
+        family,
+        ModelFamily::FishS2Tts
+            | ModelFamily::FishDrama3Tts
+            | ModelFamily::Qwen35Chat
+            | ModelFamily::Lfm2Chat
+            | ModelFamily::Lfm3Chat
+    )
+}
+
 /// Output from the executor after a forward pass.
 pub const REQUEST_DEADLINE_EXCEEDED: &str = "request deadline exceeded";
 
@@ -3569,13 +3585,10 @@ impl ModelExecutor for NativeExecutor {
             profile.prefill_batch = native_batch_support.prefill;
             profile.decode_batch = native_batch_support.decode;
             profile.concurrency = ConcurrencyClass::Batchable;
-            profile.max_batch_size = if request.model_variant.is_some_and(|variant| {
-                matches!(
-                    variant.family(),
-                    crate::catalog::ModelFamily::FishS2Tts
-                        | crate::catalog::ModelFamily::FishDrama3Tts
-                )
-            }) {
+            profile.max_batch_size = if request
+                .model_variant
+                .is_some_and(|variant| stage_sets_batch_rows(variant.family()))
+            {
                 request
                     .execution_adapter_binding()
                     .and_then(|binding| {
@@ -3706,13 +3719,9 @@ impl ModelExecutor for NativeExecutor {
                 PhysicalDispatchError::not_started(error, width, FailureOrigin::ExecutorValidation)
             })?;
             let tensor_ceiling = if execution.requests.iter().all(|request| {
-                request.model_variant.is_some_and(|variant| {
-                    matches!(
-                        variant.family(),
-                        crate::catalog::ModelFamily::FishS2Tts
-                            | crate::catalog::ModelFamily::FishDrama3Tts
-                    )
-                })
+                request
+                    .model_variant
+                    .is_some_and(|variant| stage_sets_batch_rows(variant.family()))
             }) {
                 execution
                     .requests
