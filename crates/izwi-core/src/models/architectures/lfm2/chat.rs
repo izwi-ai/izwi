@@ -7,6 +7,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::time::{Duration, Instant};
 
 use candle_core::{Tensor, D};
 pub(crate) use izwi_model_catalog::chat::tools::write_python_json;
@@ -496,9 +498,54 @@ pub struct Lfm2ChatModel {
     /// committed pages and ShortConv ring snapshots, and a request may begin
     /// on an attached prefix.
     prefix_caching: bool,
+    batch_telemetry: Lfm2BatchTelemetry,
+}
+
+/// Cumulative batched-decode counters for the admin diagnostics. Each step's
+/// host time is split at its one wait on the device (the token readback):
+/// enqueueing the forward, then waiting for it. Waits near zero mean the
+/// step is host-bound; waits that dominate mean it is device-bound.
+#[derive(Debug, Default)]
+struct Lfm2BatchTelemetry {
+    steps: AtomicU64,
+    rows: AtomicU64,
+    enqueue_us: AtomicU64,
+    device_wait_us: AtomicU64,
+}
+
+impl Lfm2BatchTelemetry {
+    fn record(&self, rows: usize, enqueue: Duration, device_wait: Duration) {
+        self.steps.fetch_add(1, Relaxed);
+        self.rows.fetch_add(rows as u64, Relaxed);
+        self.enqueue_us
+            .fetch_add(enqueue.as_micros() as u64, Relaxed);
+        self.device_wait_us
+            .fetch_add(device_wait.as_micros() as u64, Relaxed);
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        let load = |counter: &AtomicU64| counter.load(Relaxed);
+        serde_json::json!({
+            "batched_decode_steps": load(&self.steps),
+            "batched_decode_rows": load(&self.rows),
+            "batched_step_us": {
+                "enqueue": load(&self.enqueue_us),
+                "device_wait": load(&self.device_wait_us),
+            },
+        })
+    }
 }
 
 impl Lfm2ChatModel {
+    /// Family diagnostics for the admin health view.
+    pub fn runtime_diagnostics(&self) -> serde_json::Value {
+        serde_json::json!({
+            "family": "lfm2_chat",
+            "dialect": format!("{:?}", self.dialect),
+            "counters": self.batch_telemetry.snapshot(),
+        })
+    }
+
     pub fn max_context_tokens(&self) -> Result<usize> {
         if self.config.context_length == 0 {
             return Err(Error::ModelLoadError(
@@ -552,6 +599,7 @@ impl Lfm2ChatModel {
             config,
             text_model,
             prefix_caching: false,
+            batch_telemetry: Lfm2BatchTelemetry::default(),
         })
     }
 
@@ -1030,6 +1078,7 @@ impl Lfm2ChatModel {
         // The step's KV writes and ShortConv states are committed only after
         // the next tokens are read back: by then the device has drained, so
         // the whole step costs one synchronization.
+        let started = Instant::now();
         let (logits, pending) = {
             let shortconv = states
                 .iter()
@@ -1043,10 +1092,13 @@ impl Lfm2ChatModel {
                 &tokens, &positions, &shortconv, &caches,
             )?
         };
+        let enqueued = Instant::now();
         let next_tokens = match self.select_batch_tokens(states, &logits) {
             Ok(next_tokens) => next_tokens,
             Err(error) => return Err(pending.abort_with(error)),
         };
+        self.batch_telemetry
+            .record(states.len(), enqueued - started, enqueued.elapsed());
         {
             let mut shortconv = Vec::with_capacity(states.len());
             let mut caches = Vec::with_capacity(states.len());

@@ -6,6 +6,7 @@
 //! sampler path each fast path is meant to remove or change.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::time::Duration;
 
 /// Which sampler produced a decode token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,9 +34,25 @@ pub(crate) struct Qwen35Telemetry {
     sampler_grammar: AtomicU64,
     rope_host_uploads: AtomicU64,
     conv_ring_stacks: AtomicU64,
+    /// Host time of batched steps, split at the first wait on the device:
+    /// enqueueing the forward, then waiting for it (the KV-write seal and
+    /// the logits readback). Waits near zero mean the step is host-bound;
+    /// waits that dominate mean it is device-bound.
+    batched_enqueue_us: AtomicU64,
+    batched_device_wait_us: AtomicU64,
 }
 
 impl Qwen35Telemetry {
+    pub(crate) fn record_batched_enqueue(&self, elapsed: Duration) {
+        self.batched_enqueue_us
+            .fetch_add(elapsed.as_micros() as u64, Relaxed);
+    }
+
+    pub(crate) fn record_batched_device_wait(&self, elapsed: Duration) {
+        self.batched_device_wait_us
+            .fetch_add(elapsed.as_micros() as u64, Relaxed);
+    }
+
     pub(crate) fn record_solo_decode_step(&self) {
         self.solo_decode_steps.fetch_add(1, Relaxed);
     }
@@ -83,6 +100,10 @@ impl Qwen35Telemetry {
             },
             "rope_host_uploads": load(&self.rope_host_uploads),
             "conv_ring_stacks": load(&self.conv_ring_stacks),
+            "batched_step_us": {
+                "enqueue": load(&self.batched_enqueue_us),
+                "device_wait": load(&self.batched_device_wait_us),
+            },
         })
     }
 }
@@ -102,6 +123,9 @@ mod tests {
         telemetry.record_sample(SamplerPath::Grammar, 1);
         telemetry.record_rope_host_upload();
         telemetry.record_conv_ring_stacks(18);
+        telemetry.record_batched_enqueue(Duration::from_micros(700));
+        telemetry.record_batched_device_wait(Duration::from_micros(250));
+        telemetry.record_batched_device_wait(Duration::from_micros(50));
 
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot["decode_tokens"], 4);
@@ -115,5 +139,7 @@ mod tests {
         assert_eq!(snapshot["sampler"]["grammar"], 1);
         assert_eq!(snapshot["rope_host_uploads"], 1);
         assert_eq!(snapshot["conv_ring_stacks"], 18);
+        assert_eq!(snapshot["batched_step_us"]["enqueue"], 700);
+        assert_eq!(snapshot["batched_step_us"]["device_wait"], 300);
     }
 }

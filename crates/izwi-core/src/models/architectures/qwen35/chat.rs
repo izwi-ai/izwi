@@ -1308,6 +1308,7 @@ impl Qwen35ChatExec {
         // readback; grammar, logprobs and host rows sample on their own.
         let vocab_size = self.tokenizer.vocab_size;
         let reads_before = thread_host_reads();
+        let readback_started = std::time::Instant::now();
         let plans = states
             .iter()
             .enumerate()
@@ -1319,6 +1320,11 @@ impl Qwen35ChatExec {
             plans,
         )?
         .into_iter();
+        if let Some(state) = states.first() {
+            state
+                .telemetry
+                .record_batched_device_wait(readback_started.elapsed());
+        }
         let mut shared_reads = thread_host_reads().wrapping_sub(reads_before);
 
         let mut sampled = Vec::with_capacity(states.len());

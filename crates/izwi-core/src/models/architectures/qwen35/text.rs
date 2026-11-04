@@ -921,6 +921,7 @@ impl Qwen35TextModel {
         states: &mut [&mut Qwen35TextRuntimeState],
         caches: &mut [&mut PhysicalPagedKvCache],
     ) -> Result<Tensor> {
+        let started = std::time::Instant::now();
         let batch_size = token_ids.len();
         if batch_size == 0
             || position_ids.len() != batch_size
@@ -1050,7 +1051,13 @@ impl Qwen35TextModel {
                 }
             }
         };
+        // Sealing waits for the KV writes of the last attention layer, the
+        // first wait on the device: what precedes it is enqueue time.
+        let enqueued = std::time::Instant::now();
+        self.telemetry.record_batched_enqueue(enqueued - started);
         let completion = Arc::new(completions.seal()?);
+        self.telemetry
+            .record_batched_device_wait(enqueued.elapsed());
         for (row, cache) in caches.iter_mut().enumerate() {
             cache.commit_shared_completion(start_positions[row], 1, completion.clone())?;
         }
