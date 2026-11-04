@@ -17,6 +17,12 @@ use crate::{Error, Result};
 use super::chat::ChatGenerationConfig;
 
 pub(crate) const DEVICE_SORT_CHUNK: usize = 1024;
+/// The largest top-k the chunked device sort serves. Each merge round keeps
+/// `k` values of every 1024-wide chunk, so a row of 1025 to 2048 values only
+/// shrinks while `2k` is below its length: from `k = 513` a round can leave
+/// the length unchanged and the rounds never end. Larger top-k sample on the
+/// host.
+pub(crate) const DEVICE_TOP_K_LIMIT: usize = DEVICE_SORT_CHUNK / 2;
 const MAX_EXACT_F32_INTEGER: usize = 1 << 24;
 const DEVICE_SAMPLING_TENSOR_CACHE_ENTRIES: usize = 8;
 pub const DEVICE_SAMPLING_CANDIDATE_LIMIT: usize = 256;
@@ -1421,7 +1427,7 @@ fn plans_bounded_candidates(vocab: usize, top_k: usize, temperature: f32) -> boo
     if temperature <= 1e-5 {
         return false;
     }
-    vocab != 0 && vocab <= MAX_EXACT_F32_INTEGER && top_k <= DEVICE_SORT_CHUNK
+    vocab != 0 && vocab <= MAX_EXACT_F32_INTEGER && top_k <= DEVICE_TOP_K_LIMIT
 }
 
 /// How many candidates a row keeps: its top-k, or the nucleus bound when
@@ -2010,7 +2016,7 @@ pub fn resident_top_k_sample(
     temperature: f32,
     draw: &mut dyn FnMut() -> f32,
 ) -> Result<Option<Tensor>> {
-    if temperature <= 1e-5 || top_k == 0 || top_k > DEVICE_SORT_CHUNK {
+    if temperature <= 1e-5 || top_k == 0 || top_k > DEVICE_TOP_K_LIMIT {
         return Ok(None);
     }
     let row = logits_row(logits)?;
@@ -2057,7 +2063,7 @@ fn gumbel_top_k_token(scores: &Tensor, k: usize, gumbel: &[f32]) -> Result<Tenso
 /// U32 indices, computed on the values' device. `None` when `k` is 0 or above
 /// the device sort bound.
 pub(crate) fn device_top_k(values: &Tensor, k: usize) -> Result<Option<(Tensor, Tensor)>> {
-    if k == 0 || k > DEVICE_SORT_CHUNK {
+    if k == 0 || k > DEVICE_TOP_K_LIMIT {
         return Ok(None);
     }
     bounded_topk(values, k).map(Some)
@@ -2065,9 +2071,9 @@ pub(crate) fn device_top_k(values: &Tensor, k: usize) -> Result<Option<(Tensor, 
 
 fn bounded_topk(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
     let length = values.dim(0)?;
-    if length == 0 || length > u32::MAX as usize || k == 0 || k > DEVICE_SORT_CHUNK {
+    if length == 0 || length > u32::MAX as usize || k == 0 || k > DEVICE_TOP_K_LIMIT {
         return Err(Error::InvalidInput(format!(
-            "bounded top-k requires a U32-addressable non-empty row and 1..={DEVICE_SORT_CHUNK} candidates"
+            "bounded top-k requires a U32-addressable non-empty row and 1..={DEVICE_TOP_K_LIMIT} candidates"
         )));
     }
     let mut candidate_values = values.contiguous()?;
@@ -2124,9 +2130,9 @@ fn bounded_topk(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
 /// of that row alone, ties included.
 fn bounded_topk_rows(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
     let (rows, length) = values.dims2()?;
-    if rows == 0 || length == 0 || length > u32::MAX as usize || k == 0 || k > DEVICE_SORT_CHUNK {
+    if rows == 0 || length == 0 || length > u32::MAX as usize || k == 0 || k > DEVICE_TOP_K_LIMIT {
         return Err(Error::InvalidInput(format!(
-            "bounded top-k requires U32-addressable non-empty rows and 1..={DEVICE_SORT_CHUNK} candidates"
+            "bounded top-k requires U32-addressable non-empty rows and 1..={DEVICE_TOP_K_LIMIT} candidates"
         )));
     }
     let device = values.device();
@@ -3078,6 +3084,22 @@ mod tests {
             vec![9000.0, 8000.0, 7000.0]
         );
         assert_eq!(indices.to_vec1::<u32>().unwrap(), vec![3, 1027, 2499]);
+    }
+
+    /// Top-k above the device limit used to loop forever once a merge round
+    /// could not shrink the row (here 1100 values, two chunks of 600 kept
+    /// each); it is refused, and planning sends the row to the host.
+    #[test]
+    fn device_top_k_refuses_a_k_the_merge_rounds_cannot_finish() {
+        let device = Device::Cpu;
+        let tensor =
+            Tensor::from_vec((0..1100).map(|v| v as f32).collect(), 1100, &device).unwrap();
+        assert!(bounded_topk(&tensor, 600).is_err());
+        assert!(device_top_k(&tensor, 600).unwrap().is_none());
+        assert!(!plans_bounded_candidates(150_000, 600, 0.7));
+        let (values, _) = bounded_topk(&tensor, DEVICE_TOP_K_LIMIT).unwrap();
+        assert_eq!(values.dim(0).unwrap(), DEVICE_TOP_K_LIMIT);
+        assert_eq!(values.to_vec1::<f32>().unwrap()[0], 1099.0);
     }
 
     #[test]

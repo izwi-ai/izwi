@@ -10,7 +10,7 @@ use rand::{RngExt, SeedableRng};
 
 use crate::error::{Error, Result};
 use crate::models::shared::sampling::{
-    bounded_device_sampling_candidates, device_top_k, gumbel_noise, DEVICE_SORT_CHUNK,
+    bounded_device_sampling_candidates, device_top_k, gumbel_noise, DEVICE_TOP_K_LIMIT,
 };
 use crate::models::shared::telemetry;
 
@@ -87,7 +87,7 @@ impl FishS2Sampler {
         device: &candle_core::Device,
     ) -> Result<Option<FishS2ResidentDraws>> {
         validate_policy(self.temperature, self.top_p)?;
-        if self.top_k == 0 || self.top_k > DEVICE_SORT_CHUNK {
+        if self.top_k == 0 || self.top_k > DEVICE_TOP_K_LIMIT {
             return Ok(None);
         }
         let noise = if self.temperature > 0.0 {
