@@ -57,7 +57,7 @@ use crate::kernels::cuda::rope::{self, QkNormRopeSpec};
 use crate::kernels::cuda::segment_graph::{DeviceTable, SegmentGraph, SegmentInput};
 use crate::kernels::cuda::split_decode;
 use crate::kv::{KvArenaId, KvDecodeBatchMetadata, KvSlotRef};
-use crate::models::architectures::qwen35::fast_path::{compare_values, Qwen35FastPath};
+use crate::models::architectures::qwen35::fast_path::Qwen35FastPath;
 use crate::models::architectures::qwen35::linear::forward_shared;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
@@ -126,6 +126,11 @@ enum Phase {
     Warm,
     Capture,
     Verify,
+    /// A width that has passed verification captures again against moved
+    /// buffers (a grown KV arena, a new step buffer): the same body, so one
+    /// verified capture step suffices and the width replays from the next
+    /// step.
+    Recapture,
     Replay,
 }
 
@@ -135,6 +140,7 @@ impl Phase {
             Self::Warm => "warm",
             Self::Capture => "capture",
             Self::Verify => "verify",
+            Self::Recapture => "recapture",
             Self::Replay => "replay",
         }
     }
@@ -191,6 +197,8 @@ struct Runtime {
     step: Option<StepBuffer>,
     /// The arena and backing generation the graph was captured against.
     captured_for: Option<(KvArenaId, u64)>,
+    /// The width has passed the full verification once.
+    verified: bool,
 }
 
 impl Runtime {
@@ -201,15 +209,19 @@ impl Runtime {
             table: None,
             step: None,
             captured_for: None,
+            verified: false,
         }
     }
 
-    /// Drop the captured graph: the next step at this width captures again.
+    /// Drop the captured graph: the next step at this width captures again,
+    /// lightly once the width has been verified.
     fn recapture(&mut self) {
         self.graph.reset();
-        if self.phase != Phase::Warm {
-            self.phase = Phase::Capture;
-        }
+        self.phase = match self.phase {
+            Phase::Warm => Phase::Warm,
+            _ if self.verified => Phase::Recapture,
+            _ => Phase::Capture,
+        };
     }
 }
 
@@ -302,9 +314,46 @@ pub(super) struct Qwen35DecodeGraph {
     replays: AtomicU64,
     verified: AtomicU64,
     standard_steps: AtomicU64,
+    /// Light recaptures of verified widths against moved buffers.
+    recaptures: AtomicU64,
     /// Rows replayed (or run) as padding past the step's own rows.
     spare_rows: AtomicU64,
     graph_rows: AtomicU64,
+    host: HostTimes,
+}
+
+/// Host time of graph steps, by phase (microseconds, summed over steps):
+/// what the caller spent before handing the step over, gathering the rows'
+/// state, preparing the step buffer, slabs and table, the arena's graph-write
+/// window (warm, capture and verify, or the replay launch), and publishing
+/// the rows' new state.
+#[derive(Default)]
+struct HostTimes {
+    steps: AtomicU64,
+    setup_us: AtomicU64,
+    gather_us: AtomicU64,
+    prepare_us: AtomicU64,
+    launch_us: AtomicU64,
+    publish_us: AtomicU64,
+}
+
+impl HostTimes {
+    fn add(counter: &AtomicU64, since: std::time::Instant) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        counter.fetch_add((now - since).as_micros() as u64, Relaxed);
+        now
+    }
+
+    fn summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "steps": self.steps.load(Relaxed),
+            "setup": self.setup_us.load(Relaxed),
+            "gather": self.gather_us.load(Relaxed),
+            "prepare": self.prepare_us.load(Relaxed),
+            "launch": self.launch_us.load(Relaxed),
+            "publish": self.publish_us.load(Relaxed),
+        })
+    }
 }
 
 /// One step's rows, all on one KV arena.
@@ -414,8 +463,10 @@ impl Qwen35DecodeGraph {
                 replays: AtomicU64::new(0),
                 verified: AtomicU64::new(0),
                 standard_steps: AtomicU64::new(0),
+                recaptures: AtomicU64::new(0),
                 spare_rows: AtomicU64::new(0),
                 graph_rows: AtomicU64::new(0),
+                host: HostTimes::default(),
             }),
             Qwen35FastPath::Fused,
         )
@@ -443,9 +494,19 @@ impl Qwen35DecodeGraph {
             "replays": self.replays.load(Relaxed),
             "verified": self.verified.load(Relaxed),
             "standard_steps": self.standard_steps.load(Relaxed),
+            "recaptures": self.recaptures.load(Relaxed),
             "graph_rows": self.graph_rows.load(Relaxed),
             "spare_rows": self.spare_rows.load(Relaxed),
+            "host_us": self.host.summary(),
         })
+    }
+
+    /// The caller's host time before [`Self::forward`] for a step that the
+    /// graph then served (slot lowering, sequence tables, reference copies).
+    pub(super) fn record_setup(&self, elapsed: std::time::Duration) {
+        self.host
+            .setup_us
+            .fetch_add(elapsed.as_micros() as u64, Relaxed);
     }
 
     /// Run one decode step of `rows` through the graph of its width.
@@ -493,6 +554,7 @@ impl Qwen35DecodeGraph {
             return standard();
         }
         let device = model.device.clone();
+        let started = std::time::Instant::now();
         let mut inputs = Vec::with_capacity(n);
         for state in states.iter_mut() {
             for (layer, layer_state) in model.layers.iter().zip(state.layers.iter_mut()) {
@@ -503,6 +565,7 @@ impl Qwen35DecodeGraph {
             };
             inputs.push(input);
         }
+        HostTimes::add(&self.host.gather_us, started);
         graphs.order_after_previous(&device)?;
         let step = if self.capture {
             match self.captured(&mut graphs, width, model, rows, &inputs, reference) {
@@ -530,9 +593,12 @@ impl Qwen35DecodeGraph {
         };
         marked?;
         drop(graphs);
+        let publishing = std::time::Instant::now();
         for (published, state) in done.published.into_iter().zip(states.iter_mut()) {
             published.publish(model, state)?;
         }
+        HostTimes::add(&self.host.publish_us, publishing);
+        self.host.steps.fetch_add(1, Relaxed);
         Ok(Some(done.logits))
     }
 
@@ -585,6 +651,7 @@ impl Qwen35DecodeGraph {
     ) -> Result<(StepDone, Vec<KvWriteCompletion>)> {
         let n = rows.len();
         let device = model.device.clone();
+        let preparing = std::time::Instant::now();
         let cache = rows.caches[0];
         let arena = cache.arena().clone();
         let config = arena.config();
@@ -649,6 +716,7 @@ impl Qwen35DecodeGraph {
             self.max_context,
         );
         let mut output = None;
+        let launching = HostTimes::add(&self.host.prepare_us, preparing);
         let completions = arena.with_graph_writes(
             &bindings,
             rows.slot_map,
@@ -683,8 +751,8 @@ impl Qwen35DecodeGraph {
                         .into_iter()
                         .next()
                     }
-                    Phase::Capture | Phase::Verify => {
-                        if runtime.phase == Phase::Capture {
+                    Phase::Capture | Phase::Verify | Phase::Recapture => {
+                        if matches!(runtime.phase, Phase::Capture | Phase::Recapture) {
                             runtime.graph.capture(
                                 &[SegmentInput {
                                     tensor: &step,
@@ -699,6 +767,9 @@ impl Qwen35DecodeGraph {
                             runtime, spare, model, width, inputs, &published, &step, &eager,
                         )?;
                         self.verified.fetch_add(1, Relaxed);
+                        if runtime.phase == Phase::Recapture {
+                            self.recaptures.fetch_add(1, Relaxed);
+                        }
                         Some(eager)
                     }
                     Phase::Replay => {
@@ -718,6 +789,7 @@ impl Qwen35DecodeGraph {
                 Ok(())
             },
         )?;
+        HostTimes::add(&self.host.launch_us, launching);
         let logits = output.ok_or_else(|| graph_error("the step produced no output"))?;
         let logits = if logits.dim(0)? == n {
             logits
@@ -725,10 +797,12 @@ impl Qwen35DecodeGraph {
             logits.narrow(0, 0, n)?
         };
         if let Some(expected) = expected {
-            compare_values(
-                "graph decode against the standard decode",
-                &host(&logits)?,
-                &host(&expected)?,
+            device_compare(
+                &[(
+                    "graph decode against the standard decode",
+                    logits.clone(),
+                    expected,
+                )],
                 WARM_CHECK_REL_L2,
                 WARM_CHECK_MAX_FRACTION,
             )?;
@@ -736,8 +810,11 @@ impl Qwen35DecodeGraph {
         runtime.phase = match runtime.phase {
             Phase::Warm => Phase::Capture,
             Phase::Capture => Phase::Verify,
-            Phase::Verify | Phase::Replay => Phase::Replay,
+            Phase::Verify | Phase::Recapture | Phase::Replay => Phase::Replay,
         };
+        if runtime.phase == Phase::Replay {
+            runtime.verified = true;
+        }
         self.graph_rows.fetch_add(n as u64, Relaxed);
         self.spare_rows.fetch_add((width - n) as u64, Relaxed);
         Ok((StepDone { logits, published }, completions))
@@ -782,37 +859,21 @@ impl Qwen35DecodeGraph {
         let replayed = replayed
             .first()
             .ok_or_else(|| graph_error("the graph returned nothing"))?;
-        compare_values(
+        // One readback for the logits and every row's whole state slab (all
+        // layers' conv history and recurrent state).
+        let mut pairs = vec![(
             "graph decode output",
-            &host(&replayed.narrow(0, 0, n)?)?,
-            &host(&eager.narrow(0, 0, n)?)?,
-            0.01,
-            0.02,
-        )?;
-        for (row, (graph_row, eager_row)) in scratch.iter().zip(published).enumerate() {
-            for (layer, (graph_state, eager_state)) in
-                graph_row.layers.iter().zip(&eager_row.layers).enumerate()
-            {
-                let (Some(graph_state), Some(eager_state)) = (graph_state, eager_state) else {
-                    continue;
-                };
-                compare_values(
-                    &format!("graph decode row {row} layer {layer} conv history"),
-                    &host(&graph_state.history)?,
-                    &host(&eager_state.history)?,
-                    1e-6,
-                    1e-6,
-                )?;
-                compare_values(
-                    &format!("graph decode row {row} layer {layer} recurrent state"),
-                    &host(&graph_state.state)?,
-                    &host(&eager_state.state)?,
-                    0.01,
-                    0.02,
-                )?;
-            }
+            replayed.narrow(0, 0, n)?,
+            eager.narrow(0, 0, n)?,
+        )];
+        for (graph_row, eager_row) in scratch.iter().zip(published) {
+            pairs.push((
+                "graph decode DeltaNet state",
+                graph_row.slab.clone(),
+                eager_row.slab.clone(),
+            ));
         }
-        Ok(())
+        device_compare(&pairs, 0.01, 0.02)
     }
 
     /// Block-table capacity per row: the longest context in pages, plus one
@@ -1314,6 +1375,8 @@ struct LayerStateOut {
 }
 
 struct StateOutputs {
+    /// The one buffer every layer's outputs are views into.
+    slab: Tensor,
     layers: Vec<Option<LayerStateOut>>,
 }
 
@@ -1358,7 +1421,7 @@ impl StateOutputs {
                 None => None,
             });
         }
-        Ok(Self { layers })
+        Ok(Self { slab, layers })
     }
 
     /// Hand the written state to the row: each ring becomes the packed
@@ -1488,12 +1551,47 @@ pub(super) fn uninit_f32(len: usize, device: &Device) -> Result<Tensor> {
     Tensor::zeros(len, DType::F32, device).map_err(Error::from)
 }
 
-fn host(tensor: &Tensor) -> Result<Vec<f32>> {
-    Ok(tensor
-        .to_dtype(DType::F32)?
-        .flatten_all()?
+/// [`compare_values`]'s check of each `(label, actual, expected)` pair,
+/// reduced on the device: four scalars per pair (squared error, squared
+/// reference, largest error, largest reference) and one readback for all of
+/// them, instead of every value on the host.
+fn device_compare(pairs: &[(&str, Tensor, Tensor)], rel_l2: f64, max_frac: f32) -> Result<()> {
+    let mut stats = Vec::with_capacity(pairs.len() * 4);
+    for (label, actual, expected) in pairs {
+        if actual.elem_count() != expected.elem_count() {
+            return Err(graph_error(&format!(
+                "{label}: {} values vs {} in the reference",
+                actual.elem_count(),
+                expected.elem_count()
+            )));
+        }
+        let actual = actual.to_dtype(DType::F32)?.flatten_all()?;
+        let expected = expected.to_dtype(DType::F32)?.flatten_all()?;
+        let diff = (&actual - &expected)?;
+        stats.push(diff.sqr()?.sum_all()?);
+        stats.push(expected.sqr()?.sum_all()?);
+        stats.push(diff.abs()?.max(0)?);
+        stats.push(expected.abs()?.max(0)?);
+    }
+    let values = Tensor::stack(&stats, 0)?
         .to_device(&Device::Cpu)?
-        .to_vec1::<f32>()?)
+        .to_vec1::<f32>()?;
+    for ((label, _, _), stat) in pairs.iter().zip(values.chunks(4)) {
+        let [err, norm, max_err, max_ref] = [stat[0], stat[1], stat[2], stat[3]];
+        // A NaN or infinity anywhere makes the sums non-finite.
+        if !(err.is_finite() && norm.is_finite() && max_err.is_finite() && max_ref.is_finite()) {
+            return Err(graph_error(&format!(
+                "{label}: non-finite values (error sum {err}, reference sum {norm})"
+            )));
+        }
+        let observed = (f64::from(err) / f64::from(norm).max(f64::MIN_POSITIVE)).sqrt();
+        if observed > rel_l2 || max_err > max_frac * max_ref.max(f32::MIN_POSITIVE) {
+            return Err(graph_error(&format!(
+                "{label}: the graph diverges from the eager step: relative L2 {observed:.3e}, max error {max_err} vs max |ref| {max_ref}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn graph_error(message: &str) -> Error {
@@ -1551,6 +1649,47 @@ mod tests {
         assert_eq!(layout.blocks(2), 25);
         assert_eq!(layout.metadata_len(), 21);
         assert_eq!(layout.len(), 30);
+    }
+
+    #[test]
+    fn device_compare_accepts_rounding_and_refuses_divergence_and_nan() {
+        let tensor = |values: Vec<f32>| Tensor::from_vec(values, (2, 2), &Device::Cpu).unwrap();
+        let reference = tensor(vec![1.0, -2.0, 3.0, 4.0]);
+        let close = tensor(vec![1.0, -2.0, 3.0, 4.0001]);
+        let far = tensor(vec![1.0, -2.0, 3.0, 5.0]);
+        let nan = tensor(vec![1.0, f32::NAN, 3.0, 4.0]);
+        let check = |actual: &Tensor| {
+            device_compare(
+                &[
+                    ("same", reference.clone(), reference.clone()),
+                    ("candidate", actual.clone(), reference.clone()),
+                ],
+                0.01,
+                0.02,
+            )
+        };
+        assert!(check(&close).is_ok());
+        let error = check(&far).unwrap_err().to_string();
+        assert!(
+            error.contains("candidate") && error.contains("diverges"),
+            "{error}"
+        );
+        let error = check(&nan).unwrap_err().to_string();
+        assert!(error.contains("non-finite"), "{error}");
+    }
+
+    #[test]
+    fn verified_widths_recapture_in_one_step() {
+        let mut runtime = Runtime::new();
+        runtime.recapture();
+        assert_eq!(runtime.phase, Phase::Warm, "an unwarmed width stays warm");
+        runtime.phase = Phase::Verify;
+        runtime.recapture();
+        assert_eq!(runtime.phase, Phase::Capture, "unverified: the full checks");
+        runtime.verified = true;
+        runtime.phase = Phase::Replay;
+        runtime.recapture();
+        assert_eq!(runtime.phase, Phase::Recapture);
     }
 
     #[test]

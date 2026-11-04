@@ -1047,9 +1047,11 @@ impl Qwen35TextModel {
                     slot_map: lowered.as_ref(),
                     metadata: &metadata,
                 };
+                let setup = started.elapsed();
                 if let Some(logits) =
                     graph.forward(self, &rows, states, &mut completions, &mut reference)?
                 {
+                    graph.record_setup(setup);
                     return Ok(logits);
                 }
             }
