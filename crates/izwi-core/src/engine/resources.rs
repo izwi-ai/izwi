@@ -308,6 +308,18 @@ pub enum ReservationClass {
     BatchWorkspace,
 }
 
+impl ReservationClass {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Request => "request",
+            Self::Cache => "cache",
+            Self::Pipeline => "pipeline",
+            Self::BatchWorkspace => "batch_workspace",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReservationOwner {
     pub class: ReservationClass,
@@ -1134,11 +1146,12 @@ impl ResourceAuthority {
                         "insufficient live physical capacity for {:?}: new_pending={pending:?}, existing_pending={existing_pending:?}, live_claim={live_claim:?}, physical_available={:?}, physical_capacity={:?}, live_by_class={:?}",
                         owner.class, physical.available, physical.capacity, state.pending_by_class(None)?
                     );
-                    return Err(Error::Overloaded(live_capacity_reason(
+                    return Err(refused_live_claim(
+                        owner.class,
                         pending,
                         existing_pending,
                         physical.available,
-                    )));
+                    ));
                 }
                 state.ledger.reserve(resources)?
             }
@@ -1177,11 +1190,12 @@ impl ResourceAuthority {
                                 "insufficient live memory for a request: new_pending={pending:?}, existing_pending={existing_pending:?}, live_claim={live_claim:?}, physical_available={live:?}, live_by_class={:?}",
                                 state.pending_by_class(None)?
                             );
-                            return Err(Error::Overloaded(live_capacity_reason(
+                            return Err(refused_live_claim(
+                                owner.class,
                                 pending,
                                 existing_pending,
                                 live,
-                            )));
+                            ));
                         }
                     }
                 }
@@ -1246,11 +1260,16 @@ impl ResourceAuthority {
                     "insufficient live physical capacity for resource lease growth: next_pending={next_pending:?}, other_pending={other_pending:?}, live_claim={live_claim:?}, physical_available={:?}, physical_capacity={:?}, other_live_by_class={:?}",
                     physical.available, physical.capacity, state.pending_by_class(Some(id))?
                 );
-                return Err(Error::Overloaded(live_capacity_reason(
+                let class = state
+                    .owners
+                    .get(&id)
+                    .map_or(ReservationClass::Request, |owner| owner.class);
+                return Err(refused_live_claim(
+                    class,
                     next_pending,
                     other_pending,
                     physical.available,
-                )));
+                ));
             }
             state.ledger.resize(id, resources)?
         } else {
@@ -1462,16 +1481,24 @@ pub(crate) fn is_held_capacity_refusal(error: &Error) -> bool {
     )
 }
 
-/// The short reason a client sees when live memory refuses a claim: the
-/// first domain where `need` plus what is already reserved but not yet
-/// allocated (admitted requests and loaded models' pending claims)
-/// exceeds `available`, in GB. The full vectors are logged by the caller.
-fn live_capacity_reason(
+/// The first domain where a refused claim's `need` plus what is already
+/// reserved but not yet allocated (admitted requests and loaded models'
+/// pending claims) exceeds `available`. `available` is `None` when that
+/// domain's capacity is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveCapacityShortfall {
+    domain: &'static str,
+    need: u64,
+    held: u64,
+    available: Option<u64>,
+}
+
+fn live_capacity_shortfall(
     need: ResourceVector,
     held: ResourceVector,
     available: ResourceVector,
-) -> String {
-    let domains: [(&str, fn(ResourceVector) -> ResourceAmount); 6] = [
+) -> Option<LiveCapacityShortfall> {
+    let domains: [(&'static str, fn(ResourceVector) -> ResourceAmount); 6] = [
         ("memory", |vector| vector.host_bytes),
         ("memory", |vector| vector.unified_bytes),
         ("GPU memory", |vector| vector.device_bytes),
@@ -1489,22 +1516,78 @@ fn live_capacity_reason(
         if ResourceAmount::Known(claim).fits(amount(available)) {
             continue;
         }
-        let ResourceAmount::Known(available) = amount(available) else {
-            return format!("insufficient live {label}: its capacity is unknown");
+        let available = match amount(available) {
+            ResourceAmount::Known(available) => Some(available),
+            _ => None,
         };
-        let free = available.saturating_sub(held);
-        if label == "compute slots" {
-            return format!("insufficient {label}: needs {need}, {free} available");
-        }
-        let gb = |bytes: u64| bytes as f64 / 1e9;
-        return format!(
-            "insufficient live {label}: needs {:.2} GB, {:.2} GB available ({:.2} GB reserved, not yet allocated)",
-            gb(need),
-            gb(free),
-            gb(held)
+        return Some(LiveCapacityShortfall {
+            domain: label,
+            need,
+            held,
+            available,
+        });
+    }
+    None
+}
+
+/// The refusal of a `class` claim by live capacity: recorded in the engine
+/// metrics with its margin, and returned as the `Overloaded` error.
+fn refused_live_claim(
+    class: ReservationClass,
+    need: ResourceVector,
+    held: ResourceVector,
+    available: ResourceVector,
+) -> Error {
+    let shortfall = live_capacity_shortfall(need, held, available);
+    if let Some(shortfall) = &shortfall {
+        super::metrics::record_live_capacity_refusal(
+            class.label(),
+            shortfall.domain,
+            shortfall.need,
+            shortfall.held,
+            shortfall.available,
         );
     }
-    "insufficient live memory".to_string()
+    Error::Overloaded(shortfall_reason(shortfall))
+}
+
+/// The short reason a client sees when live memory refuses a claim: the
+/// first domain where `need` plus what is already reserved but not yet
+/// allocated exceeds `available`, in GB. The full vectors are logged by the
+/// caller.
+#[cfg(test)]
+fn live_capacity_reason(
+    need: ResourceVector,
+    held: ResourceVector,
+    available: ResourceVector,
+) -> String {
+    shortfall_reason(live_capacity_shortfall(need, held, available))
+}
+
+fn shortfall_reason(shortfall: Option<LiveCapacityShortfall>) -> String {
+    let Some(LiveCapacityShortfall {
+        domain: label,
+        need,
+        held,
+        available,
+    }) = shortfall
+    else {
+        return "insufficient live memory".to_string();
+    };
+    let Some(available) = available else {
+        return format!("insufficient live {label}: its capacity is unknown");
+    };
+    let free = available.saturating_sub(held);
+    if label == "compute slots" {
+        return format!("insufficient {label}: needs {need}, {free} available");
+    }
+    let gb = |bytes: u64| bytes as f64 / 1e9;
+    format!(
+        "insufficient live {label}: needs {:.2} GB, {:.2} GB available ({:.2} GB reserved, not yet allocated)",
+        gb(need),
+        gb(free),
+        gb(held)
+    )
 }
 
 fn advisory_ledger_capacity(
@@ -2001,6 +2084,39 @@ mod tests {
             "Inference capacity unavailable: insufficient compute slots: needs 1, 0 available"
         );
         assert_eq!(authority.snapshot().reserved, slots(0));
+    }
+
+    #[test]
+    fn a_live_refusal_is_recorded_with_its_margin() {
+        let provider = Arc::new(TestProvider {
+            snapshot: PhysicalCapacitySnapshot {
+                capacity: slots(9_000),
+                available: slots(7_321),
+                source: CapacitySource::Test,
+            },
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider));
+        let _held = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "held"),
+                slots(7_000),
+            )
+            .unwrap();
+        authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::BatchWorkspace, "refused"),
+                slots(4_567),
+            )
+            .unwrap_err();
+        let refusals = crate::engine::metrics::engine_batch_metrics_snapshot().capacity_refusals;
+        assert!(refusals.by_class["batch_workspace"] >= 1);
+        assert!(refusals.recent.iter().any(|refusal| {
+            refusal.class == "batch_workspace"
+                && refusal.domain == "compute slots"
+                && refusal.need == 4_567
+                && refusal.held == 7_000
+                && refusal.available == Some(7_321)
+        }));
     }
 
     #[test]

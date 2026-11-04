@@ -136,6 +136,10 @@ pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCH_OBSERVATIONS_TOTAL: &str =
     "engine.executor.physical_dispatch_observations_total";
 pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_MAX: &str =
     "engine.executor.physical_dispatch_seconds_max";
+pub const ENGINE_RESOURCES_LIVE_CAPACITY_REFUSALS_TOTAL: &str =
+    "engine.resources.live_capacity_refusals_total";
+pub const ENGINE_SCHEDULER_WORKSPACE_CAPPED_SESSIONS: &str =
+    "engine.scheduler.workspace_capped_sessions";
 pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_MICROS_TOTAL: &str =
     "engine.executor.physical_dispatch_width_micros_total";
 pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_DISPATCHES_TOTAL: &str =
@@ -394,6 +398,14 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     EngineMetricDescriptor {
         name: ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL,
         description: "Proven tensor-batched model call paths that executed at least two live rows.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_RESOURCES_LIVE_CAPACITY_REFUSALS_TOTAL,
+        description: "Claims the guarded resource authority refused for live headroom, by reservation class; /v1/metrics lists the latest ones with their margins.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_SCHEDULER_WORKSPACE_CAPPED_SESSIONS,
+        description: "Sessions whose batch width is capped below the model's width after a refused workspace reservation.",
     },
     EngineMetricDescriptor {
         name: ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_MICROS_TOTAL,
@@ -1129,6 +1141,83 @@ impl DispatchWidthTimes {
 
 static ENGINE_DISPATCH_WIDTH_TIMES: DispatchWidthTimes = DispatchWidthTimes::new();
 
+/// One claim the guarded resource authority refused for live headroom.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EngineCapacityRefusal {
+    pub unix_ms: u64,
+    /// The reservation class: request, batch_workspace, model, cache, pipeline.
+    pub class: &'static str,
+    /// The first domain that did not fit, such as "GPU memory".
+    pub domain: &'static str,
+    /// Bytes (or slots) the claim needed in that domain.
+    pub need: u64,
+    /// Already reserved there but not yet allocated.
+    pub held: u64,
+    /// Live free capacity there; `None` when unknown.
+    pub available: Option<u64>,
+}
+
+/// Refusal counts by class, and the latest refusals with their margins.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct EngineCapacityRefusalMetricsSnapshot {
+    pub by_class: BTreeMap<&'static str, u64>,
+    pub recent: Vec<EngineCapacityRefusal>,
+}
+
+const RECENT_REFUSALS: usize = 16;
+static ENGINE_CAPACITY_REFUSALS: std::sync::Mutex<(
+    BTreeMap<&'static str, u64>,
+    VecDeque<EngineCapacityRefusal>,
+)> = std::sync::Mutex::new((BTreeMap::new(), VecDeque::new()));
+
+pub(crate) fn record_live_capacity_refusal(
+    class: &'static str,
+    domain: &'static str,
+    need: u64,
+    held: u64,
+    available: Option<u64>,
+) {
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64);
+    let mut refusals = ENGINE_CAPACITY_REFUSALS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *refusals.0.entry(class).or_default() += 1;
+    if refusals.1.len() == RECENT_REFUSALS {
+        refusals.1.pop_front();
+    }
+    refusals.1.push_back(EngineCapacityRefusal {
+        unix_ms,
+        class,
+        domain,
+        need,
+        held,
+        available,
+    });
+}
+
+fn capacity_refusals_snapshot() -> EngineCapacityRefusalMetricsSnapshot {
+    let refusals = ENGINE_CAPACITY_REFUSALS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    EngineCapacityRefusalMetricsSnapshot {
+        by_class: refusals.0.clone(),
+        recent: refusals.1.iter().cloned().collect(),
+    }
+}
+
+static ENGINE_WORKSPACE_CAPPED_SESSIONS: AtomicU64 = AtomicU64::new(0);
+
+/// A session's batch width became capped (`true`) or its cap was cleared.
+pub(crate) fn record_workspace_cap_change(capped: bool) {
+    if capped {
+        saturating_atomic_add(&ENGINE_WORKSPACE_CAPPED_SESSIONS, 1);
+    } else {
+        saturating_atomic_sub(&ENGINE_WORKSPACE_CAPPED_SESSIONS, 1);
+    }
+}
+
 pub(crate) fn begin_engine_physical_workspace(
     resources: super::ResourceVector,
 ) -> EnginePhysicalWorkspaceMetricsGuard {
@@ -1263,6 +1352,8 @@ pub struct EngineBatchMetricsSnapshot {
     pub model_tensor_batch_width_counts: BTreeMap<u64, u64>,
     /// Physical dispatch time by row count and phase.
     pub physical_dispatch_widths: Vec<EngineDispatchWidthTime>,
+    pub capacity_refusals: EngineCapacityRefusalMetricsSnapshot,
+    pub workspace_capped_sessions: u64,
     pub capacity_suspensions_total: u64,
     pub capacity_replay_tokens_total: u64,
     pub capacity_replay_capped_total: u64,
@@ -1866,6 +1957,8 @@ pub fn engine_batch_metrics_snapshot() -> EngineBatchMetricsSnapshot {
             .load(Ordering::Relaxed),
         model_tensor_batch_width_counts: ENGINE_MODEL_WIDTH_COUNTS.snapshot(),
         physical_dispatch_widths: ENGINE_DISPATCH_WIDTH_TIMES.snapshot(),
+        capacity_refusals: capacity_refusals_snapshot(),
+        workspace_capped_sessions: ENGINE_WORKSPACE_CAPPED_SESSIONS.load(Ordering::Relaxed),
         capacity_suspensions_total: ENGINE_CAPACITY_SUSPENSIONS.load(Ordering::Relaxed),
         capacity_replay_tokens_total: ENGINE_CAPACITY_REPLAY_TOKENS.load(Ordering::Relaxed),
         capacity_replay_capped_total: ENGINE_CAPACITY_REPLAY_CAPPED.load(Ordering::Relaxed),

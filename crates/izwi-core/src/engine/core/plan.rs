@@ -750,7 +750,10 @@ impl EngineCore {
             let cap = self
                 .workspace_row_limits
                 .entry(session.clone())
-                .or_insert(width);
+                .or_insert_with(|| {
+                    super::super::metrics::record_workspace_cap_change(true);
+                    width
+                });
             let reduced = next < *cap;
             *cap = (*cap).min(next);
             reduced

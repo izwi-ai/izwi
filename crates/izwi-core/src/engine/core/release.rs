@@ -34,7 +34,9 @@ impl EngineCore {
         }
         self.clear_execution_state_for_capacity_replay(session);
         self.workspace_retry_progress.remove(session);
-        self.workspace_row_limits.remove(session);
+        if self.workspace_row_limits.remove(session).is_some() {
+            super::super::metrics::record_workspace_cap_change(false);
+        }
         self.workspace_pressure.remove(session);
         self.stream_sequence_cursors.remove(session);
         self.incremental_stream_sessions.remove(session);
@@ -469,7 +471,9 @@ impl EngineCore {
         self.plan_begin_attempts.clear();
         self.workspace_retry_progress.clear();
         self.workspace_waits.clear();
-        self.workspace_row_limits.clear();
+        for _ in self.workspace_row_limits.drain() {
+            super::super::metrics::record_workspace_cap_change(false);
+        }
         self.workspace_pressure.clear();
         self.initialized = false;
 

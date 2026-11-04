@@ -309,6 +309,8 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub model_tensor_batch_width_counts: BTreeMap<u64, u64>,
     /// Physical dispatch time by row count and phase.
     pub physical_dispatch_widths: Vec<EngineDispatchWidthTime>,
+    pub capacity_refusals: crate::engine::EngineCapacityRefusalMetricsSnapshot,
+    pub workspace_capped_sessions: u64,
     pub capacity_suspensions_total: u64,
     pub capacity_replay_tokens_total: u64,
     pub capacity_replay_capped_total: u64,
@@ -1287,6 +1289,30 @@ pub(crate) fn push_engine_dispatch_width_metrics(
         payload,
         ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_DISPATCHES_TOTAL,
         &dispatches,
+    );
+}
+
+/// Live capacity refusals by reservation class, and the capped sessions.
+pub(crate) fn push_engine_capacity_refusal_metrics(
+    payload: &mut String,
+    refusals: &crate::engine::EngineCapacityRefusalMetricsSnapshot,
+    capped_sessions: u64,
+) {
+    let by_class = refusals
+        .by_class
+        .iter()
+        .map(|(class, count)| (*class, *count))
+        .collect::<Vec<_>>();
+    push_engine_labeled_metric(
+        payload,
+        crate::engine::ENGINE_RESOURCES_LIVE_CAPACITY_REFUSALS_TOTAL,
+        "class",
+        &by_class,
+    );
+    push_engine_metric(
+        payload,
+        crate::engine::ENGINE_SCHEDULER_WORKSPACE_CAPPED_SESSIONS,
+        capped_sessions,
     );
 }
 

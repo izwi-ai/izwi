@@ -1977,6 +1977,8 @@ async fn runtime_prometheus_includes_engine_metric_values() {
     assert!(payload.contains("izwi_engine_executor_model_tensor_batch_width_calls_total"));
     assert!(payload.contains("izwi_engine_executor_physical_dispatch_width_micros_total"));
     assert!(payload.contains("izwi_engine_executor_physical_dispatch_width_dispatches_total"));
+    assert!(payload.contains("izwi_engine_resources_live_capacity_refusals_total"));
+    assert!(payload.contains("izwi_engine_scheduler_workspace_capped_sessions"));
     assert!(payload.contains("izwi_engine_scheduler_capacity_suspensions_total"));
     assert!(payload.contains("izwi_engine_scheduler_capacity_replay_tokens_total"));
     for kind in ["replay", "replay_capped", "recompute", "abort"] {

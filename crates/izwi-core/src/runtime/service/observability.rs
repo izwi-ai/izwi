@@ -415,6 +415,8 @@ impl RuntimeService {
             model_tensor_multirow_calls_total: batch.model_tensor_multirow_calls_total,
             model_tensor_batch_width_counts: batch.model_tensor_batch_width_counts,
             physical_dispatch_widths: batch.physical_dispatch_widths,
+            capacity_refusals: batch.capacity_refusals,
+            workspace_capped_sessions: batch.workspace_capped_sessions,
             capacity_suspensions_total: batch.capacity_suspensions_total,
             capacity_replay_tokens_total: batch.capacity_replay_tokens_total,
             capacity_replay_capped_total: batch.capacity_replay_capped_total,
@@ -671,6 +673,11 @@ impl RuntimeService {
             &width_values,
         );
         push_engine_dispatch_width_metrics(payload, &snapshot.physical_dispatch_widths);
+        push_engine_capacity_refusal_metrics(
+            payload,
+            &snapshot.capacity_refusals,
+            snapshot.workspace_capped_sessions,
+        );
         push_engine_metric(
             payload,
             ENGINE_SCHEDULER_CAPACITY_SUSPENSIONS_TOTAL,
