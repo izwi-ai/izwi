@@ -730,6 +730,69 @@ __device__ void q36_qk_norm_rope_kv(
 Q36_QK_KV_EXPORT(__half, f16)
 Q36_QK_KV_EXPORT(__nv_bfloat16, bf16)
 
+// The multi-row decode graph's variant: grid (num_heads + num_kv_heads, rows).
+// Row blockIdx.y reads its position from positions[row] and its flat KV slot
+// from row_slots[row] (both in the device step buffer), and its q/k/v from
+// row-contiguous projections: q [rows, num_heads, 2 * head_dim] (gated, query
+// half first), k and v [rows, num_kv_heads, head_dim]. It writes q_out
+// [rows, num_heads, head_dim] and the row's K/V into the paged cache, as the
+// one-row variant does. A slot past `slots` writes no K/V.
+template <class T>
+__device__ void q36_qk_norm_rope_kv_rows(
+    const T* __restrict__ q_src,
+    const T* __restrict__ k_src,
+    const T* __restrict__ v_src,
+    const float* __restrict__ q_gain,
+    const float* __restrict__ k_gain,
+    const float* __restrict__ inv_freq,
+    const unsigned* __restrict__ positions,
+    const unsigned* __restrict__ row_slots,
+    T* __restrict__ q_out,
+    T* __restrict__ key_cache,
+    T* __restrict__ value_cache,
+    int slots,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rope_dim,
+    float eps) {
+  const int row = blockIdx.y;
+  const int position = (int)positions[row];
+  const unsigned slot = row_slots[row];
+  const bool is_key = (int)blockIdx.x >= num_heads;
+  if (is_key && slot >= (unsigned)slots) {
+    return;
+  }
+  const size_t q_row = (size_t)row * num_heads * head_dim;
+  const size_t kv_row = (size_t)row * num_kv_heads * head_dim;
+  T* key_row = key_cache + (size_t)(is_key ? slot : 0) * num_kv_heads * head_dim;
+  q36_qk_norm_rope<T>(q_src + 2 * q_row, k_src + kv_row, q_gain, k_gain, inv_freq, q_out + q_row,
+                      key_row, num_heads, head_dim, rope_dim, position, position, position, 0, 0,
+                      eps);
+  if (is_key) {
+    const int head = blockIdx.x - num_heads;
+    const T* value = v_src + kv_row + (size_t)head * head_dim;
+    T* dst = value_cache + ((size_t)slot * num_kv_heads + head) * head_dim;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+      dst[i] = value[i];
+    }
+  }
+}
+
+#define Q36_QK_KV_ROWS_EXPORT(T, S)                                                              \
+  extern "C" __global__ void __launch_bounds__(256) qwen36moe_qk_norm_rope_kv_rows_##S(         \
+      const T* q_src, const T* k_src, const T* v_src, const float* q_gain,                     \
+      const float* k_gain, const float* inv_freq, const unsigned* positions,                   \
+      const unsigned* row_slots, T* q_out, T* key_cache, T* value_cache, int slots,             \
+      int num_heads, int num_kv_heads, int head_dim, int rope_dim, float eps) {                  \
+    q36_qk_norm_rope_kv_rows<T>(q_src, k_src, v_src, q_gain, k_gain, inv_freq, positions,       \
+                                row_slots, q_out, key_cache, value_cache, slots, num_heads,      \
+                                num_kv_heads, head_dim, rope_dim, eps);                          \
+  }
+
+Q36_QK_KV_ROWS_EXPORT(__half, f16)
+Q36_QK_KV_ROWS_EXPORT(__nv_bfloat16, bf16)
+
 // ---------------------------------------------------------------------------
 // Router GEMV: logits[t, e] = round_T(x[t] . w[e]) as F32. Reads the 16-bit
 // activations and F32 router rows directly, replacing cast -> F32 GEMM ->

@@ -248,6 +248,125 @@ pub fn qk_norm_rope_kv(
     Ok(q)
 }
 
+/// [`qk_norm_rope_kv`] for `rows` decode rows in one launch, for the
+/// multi-row decode graph. Row `r`'s position is `positions[r]` and its flat
+/// KV slot `slots[r]` (U32 `[rows]` each, views of the step buffer, so a
+/// captured launch serves every step). `q_proj` is `[rows, num_heads * 2 *
+/// head_dim]` (gated), `k_proj`/`v_proj` `[rows, num_kv_heads * head_dim]`,
+/// all row-contiguous. Returns the rotated queries `[rows, 1, num_heads,
+/// head_dim]`; a slot outside the cache writes nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn qk_norm_rope_kv_rows(
+    q_proj: &Tensor,
+    k_proj: &Tensor,
+    v_proj: &Tensor,
+    q_gain: &Tensor,
+    k_gain: &Tensor,
+    inv_freq: &Tensor,
+    spec: &QkNormRopeSpec,
+    positions: &Tensor,
+    slots: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    rows: usize,
+) -> Result<Tensor> {
+    let dtype = q_proj.dtype();
+    let d = spec.head_dim;
+    let cache_dims = keys.dims();
+    if rows == 0
+        || rows > u16::MAX as usize
+        || q_proj.elem_count() != rows * spec.num_heads * 2 * d
+        || k_proj.elem_count() != rows * spec.num_kv_heads * d
+        || v_proj.elem_count() != rows * spec.num_kv_heads * d
+        || k_proj.dtype() != dtype
+        || v_proj.dtype() != dtype
+        || !matches!(dtype, DType::F16 | DType::BF16)
+        || q_gain.elem_count() != d
+        || k_gain.elem_count() != d
+        || q_gain.dtype() != DType::F32
+        || k_gain.dtype() != DType::F32
+        || inv_freq.elem_count() != spec.rope_dim / 2
+        || inv_freq.dtype() != DType::F32
+        || !spec.rope_dim.is_multiple_of(2)
+        || spec.rope_dim > d
+        || spec.num_heads == 0
+        || spec.num_kv_heads == 0
+        || positions.dtype() != DType::U32
+        || slots.dtype() != DType::U32
+        || positions.elem_count() != rows
+        || slots.elem_count() != rows
+        || cache_dims.len() != 4
+        || cache_dims[2..] != [spec.num_kv_heads, d]
+        || values.dims() != cache_dims
+        || keys.dtype() != dtype
+        || values.dtype() != dtype
+        || !keys.is_contiguous()
+        || !values.is_contiguous()
+        || [k_proj, v_proj, positions, slots, keys, values]
+            .iter()
+            .any(|t| !t.device().same_device(q_proj.device()))
+    {
+        candle_core::bail!(
+            "invalid fused q/k norm + RoPE + KV write contract for {rows} rows of {spec:?}"
+        )
+    }
+    let cache_slots = cache_dims[0] * cache_dims[1];
+    #[cfg(feature = "cuda")]
+    if q_proj.device().is_cuda() {
+        return cuda_impl::launch_kv_rows(
+            q_proj,
+            k_proj,
+            v_proj,
+            q_gain,
+            k_gain,
+            inv_freq,
+            spec,
+            positions,
+            slots,
+            keys,
+            values,
+            cache_slots,
+            rows,
+        );
+    }
+    // Eager devices: each row through the one-row path on the host values.
+    let positions = positions.flatten_all()?.to_vec1::<u32>()?;
+    let row_slots = slots.flatten_all()?.to_vec1::<u32>()?;
+    let q_rows = q_proj.reshape((rows, spec.num_heads * 2 * d))?;
+    let k_rows = k_proj.reshape((rows, spec.num_kv_heads * d))?;
+    let v_rows = v_proj.reshape((rows, spec.num_kv_heads * d))?;
+    let mut queries = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let position = positions[row] as usize;
+        let (q, k) = qk_norm_rope(
+            &q_rows.narrow(0, row, 1)?,
+            &k_rows.narrow(0, row, 1)?,
+            q_gain,
+            k_gain,
+            inv_freq,
+            spec,
+            MropePosition {
+                temporal: position,
+                height: position,
+                width: position,
+                height_section: 0,
+                width_section: 0,
+            },
+        )?;
+        let slot = row_slots[row] as usize;
+        if slot < cache_slots {
+            let shape = (1, spec.num_kv_heads, d);
+            keys.reshape((cache_slots, spec.num_kv_heads, d))?
+                .slice_set(&k.reshape(shape)?, 0, slot)?;
+            values
+                .reshape((cache_slots, spec.num_kv_heads, d))?
+                .slice_set(&v_rows.narrow(0, row, 1)?.reshape(shape)?, 0, slot)?;
+        }
+        queries.push(q);
+    }
+    Tensor::cat(&queries, 0)
+}
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use super::{MropePosition, QkNormRopeSpec};
@@ -459,6 +578,102 @@ mod cuda_impl {
             other => candle_core::bail!("fused RoPE KV write does not support {other:?}"),
         })
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn launch_kv_rows(
+        q_proj: &Tensor,
+        k_proj: &Tensor,
+        v_proj: &Tensor,
+        q_gain: &Tensor,
+        k_gain: &Tensor,
+        inv_freq: &Tensor,
+        spec: &QkNormRopeSpec,
+        positions: &Tensor,
+        row_slots: &Tensor,
+        keys: &Tensor,
+        values: &Tensor,
+        slots: usize,
+        rows: usize,
+    ) -> Result<Tensor> {
+        let device = q_proj.device().as_cuda_device()?;
+        let d = spec.head_dim;
+        let int = |value: usize, name: &str| {
+            i32::try_from(value).map_err(|_| {
+                candle_core::Error::Msg(format!("fused RoPE KV rows write {name} {value}"))
+            })
+        };
+        let tensors = [
+            q_proj, k_proj, v_proj, q_gain, k_gain, inv_freq, positions, row_slots,
+        ]
+        .map(|t| t.contiguous());
+        let [q, k, v, qg, kg, inv, pos, sl] = tensors;
+        let (q, k, v, qg, kg, inv, pos, sl) = (q?, k?, v?, qg?, kg?, inv?, pos?, sl?);
+        let (q_s, _) = q.storage_and_layout();
+        let (k_s, _) = k.storage_and_layout();
+        let (v_s, _) = v.storage_and_layout();
+        let (qg_s, _) = qg.storage_and_layout();
+        let (kg_s, _) = kg.storage_and_layout();
+        let (inv_s, _) = inv.storage_and_layout();
+        let (pos_s, _) = pos.storage_and_layout();
+        let (sl_s, _) = sl.storage_and_layout();
+        let qg_v = view::<f32>(&qg_s, &qg)?;
+        let kg_v = view::<f32>(&kg_s, &kg)?;
+        let inv_v = view::<f32>(&inv_s, &inv)?;
+        let pos_v = view::<u32>(&pos_s, &pos)?;
+        let sl_v = view::<u32>(&sl_s, &sl)?;
+        let config = LaunchConfig {
+            grid_dim: ((spec.num_heads + spec.num_kv_heads) as u32, rows as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: (d * 4) as u32,
+        };
+        macro_rules! run {
+            ($ty:ty, $name:literal) => {{
+                let qv = view::<$ty>(&q_s, &q)?;
+                let kv = view::<$ty>(&k_s, &k)?;
+                let vv = view::<$ty>(&v_s, &v)?;
+                let key_cache = address::<$ty>(keys)?;
+                let value_cache = address::<$ty>(values)?;
+                // SAFETY: one block writes every element of its row's query head.
+                let q_out = unsafe { device.alloc::<$ty>(rows * spec.num_heads * d)? };
+                let function = device.get_or_load_custom_func(
+                    $name,
+                    MODULE,
+                    super::super::cuda_ptx::QWEN36MOE,
+                )?;
+                let mut builder = function.builder();
+                builder.arg(&qv);
+                builder.arg(&kv);
+                builder.arg(&vv);
+                builder.arg(&qg_v);
+                builder.arg(&kg_v);
+                builder.arg(&inv_v);
+                builder.arg(&pos_v);
+                builder.arg(&sl_v);
+                builder.arg(&q_out);
+                builder.arg(&key_cache);
+                builder.arg(&value_cache);
+                candle_core::builder_arg!(
+                    builder,
+                    int(slots, "slots")?,
+                    int(spec.num_heads, "heads")?,
+                    int(spec.num_kv_heads, "kv heads")?,
+                    int(d, "head dim")?,
+                    int(spec.rope_dim, "rope dim")?,
+                    spec.eps
+                );
+                // SAFETY: validated geometry (`rows` positions and slots, row-
+                // contiguous q/k/v of `rows` rows); argument order matches the
+                // kernel, which bounds its cache writes by `slots`.
+                unsafe { builder.launch(config) }.w()?;
+                wrap(q_out, device, Shape::from((rows, 1, spec.num_heads, d)))
+            }};
+        }
+        Ok(match q.dtype() {
+            DType::BF16 => run!(half::bf16, "qwen36moe_qk_norm_rope_kv_rows_bf16"),
+            DType::F16 => run!(half::f16, "qwen36moe_qk_norm_rope_kv_rows_f16"),
+            other => candle_core::bail!("fused RoPE KV rows write does not support {other:?}"),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -648,6 +863,129 @@ mod tests {
             .chain(&rows(&values))
             .flatten()
             .all(|x| *x == 0.0));
+    }
+
+    /// Three rows through [`qk_norm_rope_kv_rows`] and each row on its own
+    /// through [`qk_norm_rope_kv`] on `device`; slots 6, 1 and 8 (the last past
+    /// the cache). Returns (rows queries, one-row queries, rows keys, one-row
+    /// keys, rows values, one-row values), host F32.
+    fn rows_case(device: &Device) -> [Vec<f32>; 6] {
+        let spec = QkNormRopeSpec {
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 16,
+            rope_dim: 8,
+            eps: 1e-6,
+        };
+        let wave = |n: usize, seed: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i as f32 + seed) * 0.754_877_7).sin() * 2.0)
+                .collect()
+        };
+        let tensor = |values: Vec<f32>, shape: &[usize]| {
+            Tensor::from_vec(values, shape, &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap()
+                .to_device(device)
+                .unwrap()
+        };
+        let q = tensor(wave(3 * 4 * 32, 1.0), &[3, 4 * 32]);
+        let k = tensor(wave(3 * 2 * 16, 2.0), &[3, 2 * 16]);
+        let v = tensor(wave(3 * 2 * 16, 3.0), &[3, 2 * 16]);
+        let gain = Tensor::from_vec(wave(16, 4.0), 16, device)
+            .unwrap()
+            .affine(0.1, 1.0)
+            .unwrap();
+        let inv = Tensor::from_vec(vec![1.0f32, 0.1, 0.01, 0.001], 4, device).unwrap();
+        let (positions, slots) = ([3u32, 17, 40], [6u32, 1, 8]);
+        // The step buffer's layout: tokens, then positions, then slots.
+        let step = Tensor::from_vec([[0u32; 3], positions, slots].concat(), 9, device).unwrap();
+        let cache = || Tensor::zeros((2, 4, 2, 16), DType::F16, device).unwrap();
+        let (keys, values) = (cache(), cache());
+        let q_rows = qk_norm_rope_kv_rows(
+            &q,
+            &k,
+            &v,
+            &gain,
+            &gain,
+            &inv,
+            &spec,
+            &step.narrow(0, 3, 3).unwrap(),
+            &step.narrow(0, 6, 3).unwrap(),
+            &keys,
+            &values,
+            3,
+        )
+        .unwrap();
+        assert_eq!(q_rows.dims(), [3, 1, 4, 16]);
+        let (keys_one, values_one) = (cache(), cache());
+        let mut q_one = Vec::new();
+        for row in 0..3 {
+            let step = Tensor::from_vec(vec![0u32, positions[row], slots[row]], 3, device).unwrap();
+            q_one.push(
+                qk_norm_rope_kv(
+                    &q.narrow(0, row, 1).unwrap(),
+                    &k.narrow(0, row, 1).unwrap(),
+                    &v.narrow(0, row, 1).unwrap(),
+                    &gain,
+                    &gain,
+                    &inv,
+                    &spec,
+                    &step,
+                    &keys_one,
+                    &values_one,
+                )
+                .unwrap(),
+            );
+        }
+        let host = |t: &Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        [
+            host(&q_rows),
+            host(&Tensor::cat(&q_one, 0).unwrap()),
+            host(&keys),
+            host(&keys_one),
+            host(&values),
+            host(&values_one),
+        ]
+    }
+
+    fn assert_rows_match_one_row(device: &Device) {
+        let [q_rows, q_one, keys, keys_one, values, values_one] = rows_case(device);
+        assert_eq!(q_rows, q_one, "queries");
+        assert_eq!(keys, keys_one, "keys");
+        assert_eq!(values, values_one, "values");
+        // Slots 6 and 1 hold the rows' keys; the out-of-range row wrote none.
+        let written = keys
+            .chunks(32)
+            .enumerate()
+            .filter(|(_, slot)| slot.iter().any(|x| *x != 0.0))
+            .map(|(slot, _)| slot)
+            .collect::<Vec<_>>();
+        assert_eq!(written, [1, 6]);
+    }
+
+    #[test]
+    fn kv_rows_variant_matches_each_row_on_its_own() {
+        assert_rows_match_one_row(&Device::Cpu);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_kv_rows_variant_matches_each_row_on_its_own() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        assert_rows_match_one_row(&device);
     }
 
     #[cfg(feature = "cuda")]
