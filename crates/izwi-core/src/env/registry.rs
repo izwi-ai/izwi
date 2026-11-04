@@ -1628,6 +1628,14 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Enables catalog-driven automatic prefix reuse per loaded model where evidence exists.",
     ),
     CoreEnvVar::new(
+        "IZWI_QWEN35_BATCHED_GDN",
+        Flag,
+        "true",
+        Load,
+        "Kill switch: legacy/off runs Qwen3.5's batched DeltaNet decode as one launch pair per row instead of one for all rows (CUDA).",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
         "IZWI_QWEN35_CHUNKED_GDN",
         Flag,
         "true",

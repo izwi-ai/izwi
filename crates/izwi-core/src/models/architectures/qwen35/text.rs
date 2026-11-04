@@ -48,6 +48,10 @@ const FUSED_DECODE_ENV: &str = "IZWI_QWEN35_FUSED_DECODE";
 /// Environment switch that keeps DeltaNet prefill on the sequential kernel.
 const CHUNKED_GDN_ENV: &str = "IZWI_QWEN35_CHUNKED_GDN";
 
+/// Environment switch that keeps batched DeltaNet decode on one launch pair
+/// per row.
+const BATCHED_GDN_ENV: &str = "IZWI_QWEN35_BATCHED_GDN";
+
 /// Shortest prefill span the chunked DeltaNet kernels take: below one
 /// 64-token chunk's worth of work the sequential kernel is as fast.
 const CHUNKED_GDN_MIN_TOKENS: usize = 32;
@@ -445,6 +449,11 @@ struct Qwen35LinearAttention {
     /// self-check passes (see [`Qwen35LinearAttention::resolve_fused_decode`]).
     fused_decode: Option<GdnDecodeSpec>,
     fused_decode_path: Qwen35FastPath,
+    /// Batched decode rows run the fused kernels in one launch pair for all
+    /// rows (CUDA), set only after a self-check against the per-row launches
+    /// (see [`Qwen35LinearAttention::resolve_batched_decode`]).
+    batched_decode: bool,
+    batched_decode_path: Qwen35FastPath,
 }
 
 struct Qwen35GatedRmsNorm {
@@ -629,6 +638,7 @@ impl Qwen35TextModel {
                     switches.fused_decode_off,
                     allow_cpu,
                 );
+                mixer.resolve_batched_decode(hidden, &self.device);
             }
         }
         self.resolve_chunked_gdn_prefill();
@@ -833,6 +843,15 @@ impl Qwen35TextModel {
     pub(crate) fn gdn_decode_summary(&self) -> serde_json::Value {
         summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
             Qwen35Mixer::Linear(mixer) => Some(&mixer.fused_decode_path),
+            Qwen35Mixer::Full(_) => None,
+        }))
+    }
+
+    /// One-launch batched DeltaNet decode resolution, for the admin
+    /// diagnostics.
+    pub(crate) fn gdn_batched_decode_summary(&self) -> serde_json::Value {
+        summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
+            Qwen35Mixer::Linear(mixer) => Some(&mixer.batched_decode_path),
             Qwen35Mixer::Full(_) => None,
         }))
     }
@@ -1954,6 +1973,8 @@ impl Qwen35LinearAttention {
             chunked_fallbacks: AtomicU64::new(0),
             fused_decode: None,
             fused_decode_path: Qwen35FastPath::legacy("unresolved"),
+            batched_decode: false,
+            batched_decode_path: Qwen35FastPath::legacy("unresolved"),
         })
     }
 
@@ -2082,6 +2103,147 @@ impl Qwen35LinearAttention {
             1e-6,
         )?;
         Ok(())
+    }
+
+    /// Resolve one-launch batched decode after the fused decode: on CUDA the
+    /// multi-row kernels must reproduce the per-row launches bit for bit on
+    /// this layer's weights. `IZWI_QWEN35_BATCHED_GDN=legacy` keeps one launch
+    /// pair per row.
+    fn resolve_batched_decode(&mut self, hidden: usize, device: &Device) {
+        self.batched_decode = false;
+        self.batched_decode_path = if legacy_requested(BATCHED_GDN_ENV) {
+            Qwen35FastPath::legacy(format!("{BATCHED_GDN_ENV}=legacy"))
+        } else if !device.is_cuda() {
+            Qwen35FastPath::legacy("batched DeltaNet decode runs on CUDA only")
+        } else if let Some(spec) = self.fused_decode {
+            match self.batched_decode_self_check(&spec, hidden, device) {
+                Ok(()) => {
+                    self.batched_decode = true;
+                    Qwen35FastPath::Fused
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Qwen3.5 batched DeltaNet decode self-check failed; launching per row"
+                    );
+                    Qwen35FastPath::legacy(format!("self-check failed: {error}"))
+                }
+            }
+        } else {
+            Qwen35FastPath::legacy("batched DeltaNet decode needs the fused decode")
+        };
+    }
+
+    /// Three synthetic rows through the per-row fused launches and the
+    /// multi-row kernels from identical states: a ring at each cursor, one
+    /// packed ring, and two rows reading one recurrent state (a fork). The
+    /// outputs, states and histories must be identical.
+    #[cfg(feature = "cuda")]
+    fn batched_decode_self_check(
+        &self,
+        spec: &GdnDecodeSpec,
+        hidden: usize,
+        device: &Device,
+    ) -> Result<()> {
+        const ROWS: usize = 3;
+        let host = |tensor: &Tensor| -> Result<Vec<f32>> {
+            Ok(tensor
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?)
+        };
+        let exact = |name: &str, actual: &Tensor, expected: &Tensor| -> Result<()> {
+            if host(actual)? == host(expected)? {
+                Ok(())
+            } else {
+                Err(Error::InferenceError(format!(
+                    "batched DeltaNet {name} differs from the per-row launches"
+                )))
+            }
+        };
+        let conv_dim = self.conv_dim;
+        let slot = |seed: u64| -> Result<Tensor> {
+            Ok(Tensor::from_vec(
+                xorshift_values(conv_dim, seed, 1.0),
+                (conv_dim, 1),
+                device,
+            )?)
+        };
+        let state_shape = (1, self.num_v_heads, self.head_k_dim, self.head_v_dim);
+        let state_len = self.num_v_heads * self.head_k_dim * self.head_v_dim;
+        let shared = Tensor::from_vec(xorshift_values(state_len, 31, 0.3), state_shape, device)?;
+        let own = Tensor::from_vec(xorshift_values(state_len, 32, 0.3), state_shape, device)?;
+        let packed = Tensor::from_vec(
+            xorshift_values(3 * conv_dim, 33, 1.0),
+            (3, conv_dim),
+            device,
+        )?;
+        let initial = vec![
+            Qwen35LayerRuntimeState::Linear {
+                conv_state: Some(ConvRingState::new(vec![slot(22)?, slot(23)?, slot(24)?], 0)),
+                recurrent_state: Some(shared.clone()),
+            },
+            Qwen35LayerRuntimeState::Linear {
+                conv_state: Some(ConvRingState::new(vec![slot(25)?, slot(26)?, slot(27)?], 2)),
+                recurrent_state: Some(own),
+            },
+            Qwen35LayerRuntimeState::Linear {
+                conv_state: Some(ConvRingState::from_history(&packed, conv_dim)?),
+                recurrent_state: Some(shared),
+            },
+        ];
+        let x = Tensor::from_vec(
+            xorshift_values(ROWS * hidden, 21, 1.5),
+            (ROWS, 1, hidden),
+            device,
+        )?;
+        let mut per_row = initial.clone();
+        let mut batched = initial;
+        let expected = {
+            let mut rows = per_row.iter_mut().collect::<Vec<_>>();
+            self.forward_decode_batch_fused(spec, &x, &mut rows)?
+        };
+        let actual = {
+            let mut rows = batched.iter_mut().collect::<Vec<_>>();
+            self.forward_decode_batch_rows(spec, &x, &mut rows)?
+        };
+        exact("output", &actual, &expected)?;
+        for (batched, per_row) in batched.iter().zip(&per_row) {
+            let (
+                Qwen35LayerRuntimeState::Linear {
+                    conv_state: Some(batched_ring),
+                    recurrent_state: Some(batched_recurrent),
+                },
+                Qwen35LayerRuntimeState::Linear {
+                    conv_state: Some(per_row_ring),
+                    recurrent_state: Some(per_row_recurrent),
+                },
+            ) = (batched, per_row)
+            else {
+                return Err(Error::InferenceError(
+                    "batched DeltaNet self-check lost a row's state".into(),
+                ));
+            };
+            exact("recurrent state", batched_recurrent, per_row_recurrent)?;
+            exact(
+                "conv history",
+                &batched_ring.history()?,
+                &per_row_ring.history()?,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn batched_decode_self_check(
+        &self,
+        _spec: &GdnDecodeSpec,
+        _hidden: usize,
+        _device: &Device,
+    ) -> Result<()> {
+        Err(Error::InferenceError(
+            "batched DeltaNet decode needs a CUDA build".into(),
+        ))
     }
 
     /// Whether a single-token decode can take the fused kernels with this
@@ -2293,6 +2455,10 @@ impl Qwen35LinearAttention {
                 .iter()
                 .all(|state| Self::fused_decode_accepts(hidden_states, state))
         }) {
+            #[cfg(feature = "cuda")]
+            if self.batched_decode {
+                return self.forward_decode_batch_rows(spec, hidden_states, states);
+            }
             return self.forward_decode_batch_fused(spec, hidden_states, states);
         }
         let [mixed_qkv, z, beta_raw, alpha] = forward_shared(
@@ -2421,6 +2587,106 @@ impl Qwen35LinearAttention {
             self.num_v_heads * self.head_v_dim,
         ))?;
         self.out_proj.forward(&output)
+    }
+
+    /// Batched decode through the multi-row kernels: one conv launch and one
+    /// recurrence launch for every row, reading each row's state through a
+    /// device table. Each row writes a fresh slab of its own (next state,
+    /// then next history), so a published row state never shares storage
+    /// with another row's; the old states are left untouched. The output
+    /// goes straight to the out-projection, with no per-row stack.
+    #[cfg(feature = "cuda")]
+    fn forward_decode_batch_rows(
+        &self,
+        spec: &GdnDecodeSpec,
+        hidden_states: &Tensor,
+        states: &mut [&mut Qwen35LayerRuntimeState],
+    ) -> Result<Tensor> {
+        use crate::kernels::cuda::segment_graph::DeviceTable;
+
+        let batch_size = hidden_states.dim(0)?;
+        let [mixed_qkv, z, beta_raw, alpha] = forward_shared(
+            hidden_states,
+            [
+                &self.qkv_proj,
+                &self.gate_proj,
+                &self.beta_proj,
+                &self.alpha_proj,
+            ],
+        )?;
+        let device = hidden_states.device();
+        let state_shape = (1, self.num_v_heads, self.head_k_dim, self.head_v_dim);
+        let state_len = self.num_v_heads * self.head_k_dim * self.head_v_dim;
+        let history_len = (gdn::CONV_TAPS - 1) * self.conv_dim;
+        let mut entries = Vec::with_capacity(batch_size * gdn::TABLE_ENTRIES);
+        let mut outputs = Vec::with_capacity(batch_size);
+        let mut zeros = None;
+        for state in states.iter() {
+            let Qwen35LayerRuntimeState::Linear {
+                conv_state: Some(ring),
+                recurrent_state,
+            } = &**state
+            else {
+                return Err(Error::InferenceError(
+                    "Qwen3.5 batched DeltaNet decode needs an initialized linear-attention state"
+                        .into(),
+                ));
+            };
+            let history = ring.ordered_slots();
+            let previous = match recurrent_state {
+                Some(previous) => previous.clone(),
+                None => match &zeros {
+                    Some(zeros) => Tensor::clone(zeros),
+                    None => {
+                        let fresh = Tensor::zeros(state_shape, DType::F32, device)?;
+                        zeros = Some(fresh.clone());
+                        fresh
+                    }
+                },
+            };
+            let slab = decode_graph::uninit_f32(state_len + history_len, device)?;
+            let state_out = slab.narrow(0, 0, state_len)?.reshape(state_shape)?;
+            let history_out = slab
+                .narrow(0, state_len, history_len)?
+                .reshape((gdn::CONV_TAPS - 1, self.conv_dim))?;
+            entries.extend(gdn::row_entries(
+                [&history[0], &history[1], &history[2]],
+                &history_out,
+                &previous,
+                &state_out,
+                spec,
+            )?);
+            // The inputs stay referenced until both launches are queued.
+            outputs.push((history_out, state_out, history, previous));
+        }
+        let mut table = DeviceTable::new(device, entries.len())?;
+        table.write(0, &entries)?;
+        let value_width = self.num_v_heads * self.head_v_dim;
+        let y = gdn::decode_rows(
+            &mixed_qkv.reshape((batch_size, self.conv_dim))?,
+            &self.conv_kernel,
+            &z.reshape((batch_size, value_width))?,
+            &beta_raw.reshape((batch_size, self.num_v_heads))?,
+            &alpha.reshape((batch_size, self.num_v_heads))?,
+            &self.dt_bias,
+            &self.a,
+            &self.norm.weight,
+            &table,
+            batch_size,
+            spec,
+        )?;
+        for (state, (history_out, state_out, _, _)) in states.iter_mut().zip(outputs) {
+            if let Qwen35LayerRuntimeState::Linear {
+                conv_state,
+                recurrent_state,
+            } = &mut **state
+            {
+                *conv_state = Some(ConvRingState::from_history(&history_out, self.conv_dim)?);
+                *recurrent_state = Some(state_out);
+            }
+        }
+        self.out_proj
+            .forward(&y.reshape((batch_size, 1, value_width))?)
     }
 
     fn forward_sequence(
@@ -3262,6 +3528,8 @@ mod tests {
             chunked_fallbacks: AtomicU64::new(0),
             fused_decode: None,
             fused_decode_path: super::Qwen35FastPath::legacy("unresolved"),
+            batched_decode: false,
+            batched_decode_path: super::Qwen35FastPath::legacy("unresolved"),
         }
     }
 
@@ -3515,6 +3783,8 @@ mod tests {
             chunked_fallbacks: AtomicU64::new(0),
             fused_decode: None,
             fused_decode_path: super::Qwen35FastPath::legacy("test"),
+            batched_decode: false,
+            batched_decode_path: super::Qwen35FastPath::legacy("test"),
         };
         let initial_state = |row: usize| Qwen35LayerRuntimeState::Linear {
             conv_state: Some(ConvRingState::new(
