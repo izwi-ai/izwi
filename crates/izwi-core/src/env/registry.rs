@@ -1660,9 +1660,9 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_QWEN35_CUDA_GRAPH",
         Flag,
-        "false",
+        "true",
         Load,
-        "Opts Qwen3.5 decode into CUDA graph capture (off until validated on GPU).",
+        "Kill switch: off replays no whole-step CUDA graphs for Qwen3.5 decode (1-32 rows, padded to a graphed width).",
     ),
     CoreEnvVar::new(
         "IZWI_QWEN35_DECODE_QUANTUM",

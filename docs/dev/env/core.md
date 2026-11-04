@@ -245,7 +245,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_PREFIX_REUSE_AUTO` | flag | `true` | startup | Enables catalog-driven automatic prefix reuse per loaded model where evidence exists. |
 | `IZWI_QWEN35_BATCHED_GDN` | flag | `true` | model load | Kill switch: legacy/off runs Qwen3.5's batched DeltaNet decode as one launch pair per row instead of one for all rows (CUDA). Also: `legacy` means false. |
 | `IZWI_QWEN35_CHUNKED_GDN` | flag | `true` | model load | Kill switch: legacy/off disables the chunked DeltaNet prefill kernels for Qwen3.5. Also: `legacy` means false. |
-| `IZWI_QWEN35_CUDA_GRAPH` | flag | `false` | model load | Opts Qwen3.5 decode into CUDA graph capture (off until validated on GPU). |
+| `IZWI_QWEN35_CUDA_GRAPH` | flag | `true` | model load | Kill switch: off replays no whole-step CUDA graphs for Qwen3.5 decode (1-32 rows, padded to a graphed width). |
 | `IZWI_QWEN35_DECODE_QUANTUM` | integer | 8 on CUDA/Metal, 1 on CPU | first use | Sets Qwen3.5 decode tokens per engine step for a request decoding alone (capped at 16; 0 or invalid ignored). |
 | `IZWI_QWEN35_FINITE_DIAGNOSTICS` | flag | `false` | model load | Enables finite-value (NaN/Inf) checks on Qwen3.5 and Qwen3.6-MoE activations for debugging. |
 | `IZWI_QWEN35_FUSED_DECODE` | flag | true (fused) | model load | Kill switch: legacy/off forces the Candle op chain instead of the fused Qwen3.5 DeltaNet decode. Also: `legacy` means false. |

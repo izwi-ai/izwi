@@ -514,12 +514,69 @@ pub fn decode_rows(
     rows: usize,
     spec: &GdnDecodeSpec,
 ) -> Result<Tensor> {
+    decode_rows_in(
+        x,
+        weight,
+        z,
+        beta_raw,
+        alpha,
+        dt_bias,
+        a,
+        norm_weight,
+        RowsTable::of(table, 0),
+        rows,
+        spec,
+    )
+}
+
+/// A [`decode_rows_in`] table by address: one layer's rows start at entry
+/// `first_entry` of a device table of `entries` entries at `address`, so one
+/// table can address every layer of a step (a captured graph's, say).
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowsTable {
+    pub address: u64,
+    pub entries: usize,
+    pub first_entry: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl RowsTable {
+    pub fn of(table: &super::segment_graph::DeviceTable, first_entry: usize) -> Self {
+        Self {
+            address: table.address(),
+            entries: table.entries(),
+            first_entry,
+        }
+    }
+}
+
+/// [`decode_rows`] with the rows' entries from `table.first_entry` on.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn decode_rows_in(
+    x: &Tensor,
+    weight: &Tensor,
+    z: &Tensor,
+    beta_raw: &Tensor,
+    alpha: &Tensor,
+    dt_bias: &Tensor,
+    a: &Tensor,
+    norm_weight: &Tensor,
+    table: RowsTable,
+    rows: usize,
+    spec: &GdnDecodeSpec,
+) -> Result<Tensor> {
     spec.validate()?;
     let (hv, d) = (spec.value_heads, HEAD_DIM);
     let conv_dim = spec.conv_dim();
     let dtype = z.dtype();
     if rows == 0
-        || table.entries() < rows * TABLE_ENTRIES
+        || table.address == 0
+        || table
+            .first_entry
+            .checked_add(rows * TABLE_ENTRIES)
+            .is_none_or(|end| end > table.entries)
         || x.elem_count() != rows * conv_dim
         || weight.dims() != [conv_dim, CONV_TAPS]
         || weight.dtype() != DType::F32
@@ -549,7 +606,7 @@ pub fn decode_rows(
         dt_bias,
         a,
         norm_weight,
-        table.address(),
+        table.address + (table.first_entry * std::mem::size_of::<u64>()) as u64,
         rows,
         spec,
     )

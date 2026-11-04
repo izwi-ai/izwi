@@ -1005,21 +1005,29 @@ impl Qwen35TextModel {
         let mut completions =
             KvWriteCompletionCollector::new(first.arena().config(), lowered.logical_slots())?;
         let execution = (|| -> Result<Tensor> {
-            if let (1, Some(graph)) = (batch_size, &self.decode_graph) {
-                let cache = &*caches[0];
+            let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
+            if let Some(graph) = self
+                .decode_graph
+                .as_ref()
+                .filter(|_| batch_size <= decode_graph::MAX_GRAPH_ROWS)
+            {
                 // The graph's warm check: the standard decode on a copy of
-                // the row state, its writes collected and sealed apart.
-                let mut reference_state = states[0].clone();
+                // the rows' state, its writes collected and sealed apart.
+                let mut reference_states = states
+                    .iter()
+                    .map(|state| (**state).clone())
+                    .collect::<Vec<_>>();
                 let mut reference = || -> Result<Tensor> {
                     let mut collector = KvWriteCompletionCollector::new(
                         first.arena().config(),
                         lowered.logical_slots(),
                     )?;
+                    let mut reference_refs = reference_states.iter_mut().collect::<Vec<_>>();
                     let logits = self.standard_decode_logits(
                         token_ids,
                         position_ids,
-                        &mut [&mut reference_state],
-                        &[cache],
+                        &mut reference_refs,
+                        &cache_refs,
                         first_full,
                         lowered.as_ref(),
                         &metadata,
@@ -1031,22 +1039,20 @@ impl Qwen35TextModel {
                     sealed?;
                     Ok(logits)
                 };
-                if let Some(logits) = graph.forward(
-                    self,
-                    token_ids[0],
-                    position_ids[0],
-                    slots[0],
-                    states[0],
-                    cache,
-                    lowered.as_ref(),
-                    &metadata,
-                    &mut completions,
-                    &mut reference,
-                )? {
+                let rows = decode_graph::StepRows {
+                    tokens: token_ids,
+                    positions: position_ids,
+                    slots: &slots,
+                    caches: &cache_refs,
+                    slot_map: lowered.as_ref(),
+                    metadata: &metadata,
+                };
+                if let Some(logits) =
+                    graph.forward(self, &rows, states, &mut completions, &mut reference)?
+                {
                     return Ok(logits);
                 }
             }
-            let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
             self.standard_decode_logits(
                 token_ids,
                 position_ids,
