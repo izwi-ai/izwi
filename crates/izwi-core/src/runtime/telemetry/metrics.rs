@@ -311,6 +311,7 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub physical_dispatch_widths: Vec<EngineDispatchWidthTime>,
     pub capacity_refusals: crate::engine::EngineCapacityRefusalMetricsSnapshot,
     pub workspace_capped_sessions: u64,
+    pub recent_failures: Vec<crate::engine::EngineRecentFailure>,
     pub capacity_suspensions_total: u64,
     pub capacity_replay_tokens_total: u64,
     pub capacity_replay_capped_total: u64,

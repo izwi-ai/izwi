@@ -37,6 +37,10 @@ SCHEMA_VERSION = 1
 PERCENTILES = (50, 90, 95, 99)
 MAX_EVENT_BYTES = 1 << 20
 MAX_ERROR_BODY_BYTES = 4096
+# Longest server error message kept per failed request.
+MAX_ERROR_DETAIL_CHARS = 500
+# Distinct error messages a summary lists.
+MAX_SUMMARY_ERROR_DETAILS = 8
 METADATA_TIMEOUT_SECS = 10
 
 # Common English words; most BPE vocabularies map " word" to one token, so a
@@ -364,6 +368,7 @@ class StreamTrace:
         self.finish_reason = None
         self.done = False
         self.error = None
+        self.error_detail = None
 
     def on_event(self, data, at):
         if self.error is not None:
@@ -383,6 +388,7 @@ class StreamTrace:
         if error is not None:
             code = error.get("code") or error.get("type") if isinstance(error, dict) else None
             self.error = f"stream_error:{code or 'unknown'}"
+            self.error_detail = error_detail(error)
             return
         if isinstance(payload.get("usage"), dict):
             self.usage = payload["usage"]
@@ -400,8 +406,38 @@ class StreamTrace:
             self.token_times.append(at)
 
 
-def request_record(index, request, trace, started, ended, epoch, error=None):
+def error_detail(error):
+    """The server's own words for a failure: its message and request id,
+    truncated, so a run's log says why a request failed and which server log
+    line to look up."""
+    if isinstance(error, dict):
+        message = error.get("message")
+        request_id = error.get("request_id") or error.get("id")
+        detail = str(message) if message is not None else json.dumps(error)
+        if request_id:
+            detail = f"{detail} [request {request_id}]"
+    else:
+        detail = str(error)
+    return detail[:MAX_ERROR_DETAIL_CHARS]
+
+
+def http_error_detail(body):
+    """The error message of a non-200 response body (OpenAI error JSON when it
+    parses, else the raw text)."""
+    text = body.decode("utf-8", "replace")
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return text[:MAX_ERROR_DETAIL_CHARS] or None
+    if isinstance(payload, dict) and payload.get("error") is not None:
+        return error_detail(payload["error"])
+    return text[:MAX_ERROR_DETAIL_CHARS]
+
+
+def request_record(index, request, trace, started, ended, epoch, error=None, detail=None):
     """Per-request metrics from a finished stream."""
+    if error is None:
+        detail = trace.error_detail
     error = error or trace.error
     if error is None and not trace.done:
         error = "truncated"
@@ -425,6 +461,7 @@ def request_record(index, request, trace, started, ended, epoch, error=None):
         "index": index,
         "ok": error is None,
         "error": error,
+        "error_detail": detail if error is not None else None,
         "start_offset_s": started - epoch,
         "ttft_ms": ttft_ms,
         "tpot_ms": tpot_ms,
@@ -559,18 +596,23 @@ async def run_request(index, request, config, limiter, epoch):
         body = request_body(config["model"], request, index, config["temperature"], config["seed"])
         started = time.perf_counter()
         error = None
+        detail = None
         try:
-            status, _ = await asyncio.wait_for(
+            status, error_body = await asyncio.wait_for(
                 post_stream(config["url"], body, config["headers"], on_chunk),
                 config["timeout"],
             )
             if status != 200:
                 error = f"http_{status}"
+                detail = http_error_detail(error_body)
         except asyncio.TimeoutError:
             error = "timeout"
         except (OSError, ConnectionError, asyncio.IncompleteReadError, ValueError) as failure:
             error = f"client:{type(failure).__name__}"
-        return request_record(index, request, trace, started, time.perf_counter(), epoch, error)
+            detail = str(failure)[:MAX_ERROR_DETAIL_CHARS] or None
+        return request_record(
+            index, request, trace, started, time.perf_counter(), epoch, error, detail
+        )
 
 
 async def run_point(requests, rate, burstiness, max_concurrency, config, seed):
@@ -619,6 +661,20 @@ def goodput(records, duration, slo):
     }
 
 
+def error_details(records):
+    """Distinct (error, detail) pairs of the failed requests, most frequent
+    first, with how many requests each covers."""
+    counts = collections.Counter(
+        (record["error"], record.get("error_detail"))
+        for record in records
+        if not record["ok"] and record.get("error_detail")
+    )
+    return [
+        {"error": error, "detail": detail, "requests": count}
+        for (error, detail), count in counts.most_common(MAX_SUMMARY_ERROR_DETAILS)
+    ]
+
+
 def summarize(records, duration, slo):
     completed = [record for record in records if record["ok"]]
     errors = collections.Counter(record["error"] for record in records if not record["ok"])
@@ -645,6 +701,7 @@ def summarize(records, duration, slo):
         "failed": len(records) - len(completed),
         "aborted": sum(count for error, count in errors.items() if error in ABORT_ERRORS),
         "errors": dict(sorted(errors.items())),
+        "error_details": error_details(records),
         "duration_s": duration,
         "throughput_rps": per_second(len(completed)),
         "output_throughput_tps": per_second(total_output),
@@ -1095,6 +1152,8 @@ def print_point(name, summary, server_metrics, out=None):
         print(f"warning: {warning}", file=out)
     if summary["errors"]:
         print(f"errors: {json.dumps(summary['errors'])}", file=out)
+        for item in summary.get("error_details", []):
+            print(f"  {item['requests']} x {item['error']}: {item['detail']}", file=out)
     print("=" * width, file=out)
 
 

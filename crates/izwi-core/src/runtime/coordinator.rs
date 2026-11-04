@@ -1122,6 +1122,28 @@ impl InferenceCoordinator {
         spec: JobSpec,
         observation: Option<JobResourceObservation>,
     ) -> Result<JobLease> {
+        let request_id = spec.request_id.clone();
+        self.admit_observed_inner(spec, observation)
+            .inspect_err(|error| {
+                let kind = match error {
+                    Error::Overloaded(_) => "overloaded",
+                    Error::Timeout(_) => "timeout",
+                    _ => "refused",
+                };
+                crate::engine::metrics::record_engine_request_failure(
+                    &request_id,
+                    "admission",
+                    kind,
+                    &error.to_string(),
+                );
+            })
+    }
+
+    fn admit_observed_inner(
+        self: &Arc<Self>,
+        spec: JobSpec,
+        observation: Option<JobResourceObservation>,
+    ) -> Result<JobLease> {
         let _gate = self
             .admission_gate
             .lock()
@@ -4772,6 +4794,20 @@ mod tests {
             coordinator.admit(job("late")).await,
             Err(Error::Overloaded(_))
         ));
+        // The refusal is kept with its reason for /v1/metrics.
+        let _ring = crate::engine::metrics::RECENT_FAILURES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert!(coordinator
+            .admit_with_initial_observation(job("late-while-draining"), None)
+            .is_err());
+        let failures = crate::engine::engine_batch_metrics_snapshot().recent_failures;
+        assert!(failures.iter().any(|failure| {
+            failure.request_id == "late-while-draining"
+                && failure.origin == "admission"
+                && failure.kind == "overloaded"
+                && failure.message.contains("draining")
+        }));
     }
 
     #[tokio::test]

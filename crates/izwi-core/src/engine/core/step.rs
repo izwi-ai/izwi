@@ -1072,6 +1072,15 @@ impl EngineCore {
                         message = %failure.message,
                         "row failed terminally"
                     );
+                    super::super::metrics::record_engine_request_failure(
+                        &request_id,
+                        engine_output
+                            .provenance
+                            .failure_origin
+                            .map_or("engine", super::super::metrics::failure_origin_label),
+                        format!("{:?}", failure.kind),
+                        &failure.message,
+                    );
                 }
                 self.begin_terminal_release(&session, cause).await;
                 self.requests.remove(&request_id);

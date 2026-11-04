@@ -417,6 +417,7 @@ impl RuntimeService {
             physical_dispatch_widths: batch.physical_dispatch_widths,
             capacity_refusals: batch.capacity_refusals,
             workspace_capped_sessions: batch.workspace_capped_sessions,
+            recent_failures: batch.recent_failures,
             capacity_suspensions_total: batch.capacity_suspensions_total,
             capacity_replay_tokens_total: batch.capacity_replay_tokens_total,
             capacity_replay_capped_total: batch.capacity_replay_capped_total,

@@ -1170,6 +1170,12 @@ static ENGINE_CAPACITY_REFUSALS: std::sync::Mutex<(
     VecDeque<EngineCapacityRefusal>,
 )> = std::sync::Mutex::new((BTreeMap::new(), VecDeque::new()));
 
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
 pub(crate) fn record_live_capacity_refusal(
     class: &'static str,
     domain: &'static str,
@@ -1177,9 +1183,7 @@ pub(crate) fn record_live_capacity_refusal(
     held: u64,
     available: Option<u64>,
 ) {
-    let unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis() as u64);
+    let unix_ms = unix_ms();
     let mut refusals = ENGINE_CAPACITY_REFUSALS
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1204,6 +1208,79 @@ fn capacity_refusals_snapshot() -> EngineCapacityRefusalMetricsSnapshot {
     EngineCapacityRefusalMetricsSnapshot {
         by_class: refusals.0.clone(),
         recent: refusals.1.iter().cloned().collect(),
+    }
+}
+
+/// One request that failed: a row the engine failed terminally, or a request
+/// the runtime refused to admit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EngineRecentFailure {
+    pub unix_ms: u64,
+    pub request_id: String,
+    /// Where it failed: an engine failure origin such as "model" or
+    /// "workspace_admission", "engine" when none was recorded, or
+    /// "admission" for a refused request.
+    pub origin: &'static str,
+    pub kind: String,
+    /// The failure's message, truncated.
+    pub message: String,
+}
+
+const RECENT_FAILURES: usize = 32;
+const FAILURE_MESSAGE_CHARS: usize = 400;
+static ENGINE_RECENT_FAILURES: std::sync::Mutex<VecDeque<EngineRecentFailure>> =
+    std::sync::Mutex::new(VecDeque::new());
+
+/// Keep `request_id`'s failure among the latest [`RECENT_FAILURES`], so
+/// `/v1/metrics` shows why recent requests failed without the server log.
+pub(crate) fn record_engine_request_failure(
+    request_id: &str,
+    origin: &'static str,
+    kind: impl Into<String>,
+    message: &str,
+) {
+    let failure = EngineRecentFailure {
+        unix_ms: unix_ms(),
+        request_id: request_id.to_string(),
+        origin,
+        kind: kind.into(),
+        message: message.chars().take(FAILURE_MESSAGE_CHARS).collect(),
+    };
+    let mut failures = ENGINE_RECENT_FAILURES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if failures.len() == RECENT_FAILURES {
+        failures.pop_front();
+    }
+    failures.push_back(failure);
+}
+
+/// Held by tests that assert on the shared failure ring, so one test's
+/// burst of failures cannot evict another's entry mid-assertion.
+#[cfg(test)]
+pub(crate) static RECENT_FAILURES_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn recent_failures_snapshot() -> Vec<EngineRecentFailure> {
+    ENGINE_RECENT_FAILURES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .iter()
+        .cloned()
+        .collect()
+}
+
+/// The metric label of a failure origin.
+pub(crate) const fn failure_origin_label(origin: FailureOrigin) -> &'static str {
+    match origin {
+        FailureOrigin::AdapterPlanning => "adapter_planning",
+        FailureOrigin::DispatchCoordination => "dispatch_coordination",
+        FailureOrigin::WorkspaceAdmission => "workspace_admission",
+        FailureOrigin::ExecutorValidation => "executor_validation",
+        FailureOrigin::Model => "model",
+        FailureOrigin::StreamDelivery => "stream_delivery",
+        FailureOrigin::StateCommit => "state_commit",
+        FailureOrigin::Cleanup => "cleanup",
+        FailureOrigin::Panic => "panic",
     }
 }
 
@@ -1354,6 +1431,8 @@ pub struct EngineBatchMetricsSnapshot {
     pub physical_dispatch_widths: Vec<EngineDispatchWidthTime>,
     pub capacity_refusals: EngineCapacityRefusalMetricsSnapshot,
     pub workspace_capped_sessions: u64,
+    /// The latest failed and refused requests with their messages.
+    pub recent_failures: Vec<EngineRecentFailure>,
     pub capacity_suspensions_total: u64,
     pub capacity_replay_tokens_total: u64,
     pub capacity_replay_capped_total: u64,
@@ -1959,6 +2038,7 @@ pub fn engine_batch_metrics_snapshot() -> EngineBatchMetricsSnapshot {
         physical_dispatch_widths: ENGINE_DISPATCH_WIDTH_TIMES.snapshot(),
         capacity_refusals: capacity_refusals_snapshot(),
         workspace_capped_sessions: ENGINE_WORKSPACE_CAPPED_SESSIONS.load(Ordering::Relaxed),
+        recent_failures: recent_failures_snapshot(),
         capacity_suspensions_total: ENGINE_CAPACITY_SUSPENSIONS.load(Ordering::Relaxed),
         capacity_replay_tokens_total: ENGINE_CAPACITY_REPLAY_TOKENS.load(Ordering::Relaxed),
         capacity_replay_capped_total: ENGINE_CAPACITY_REPLAY_CAPPED.load(Ordering::Relaxed),
@@ -2554,6 +2634,33 @@ mod tests {
         assert!(decode_after > decode_before);
         assert!(decode_micros >= 2_000, "{decode_micros}");
         assert!(cell(EngineDispatchPhase::Prefill, 0).0 > wide_before);
+    }
+
+    #[test]
+    fn recent_failures_are_bounded_and_truncated() {
+        let _ring = RECENT_FAILURES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let long = "x".repeat(FAILURE_MESSAGE_CHARS * 2);
+        record_engine_request_failure("ring-long", "model", "Model", &long);
+        let failures = recent_failures_snapshot();
+        let recorded = failures
+            .iter()
+            .find(|failure| failure.request_id == "ring-long")
+            .unwrap();
+        assert_eq!(recorded.message.chars().count(), FAILURE_MESSAGE_CHARS);
+        for index in 0..RECENT_FAILURES + 3 {
+            record_engine_request_failure(&format!("ring-{index}"), "model", "Model", "m");
+        }
+        let failures = recent_failures_snapshot();
+        assert_eq!(failures.len(), RECENT_FAILURES);
+        assert!(failures
+            .iter()
+            .all(|failure| failure.request_id != "ring-long"));
+        assert_eq!(
+            failure_origin_label(FailureOrigin::WorkspaceAdmission),
+            "workspace_admission"
+        );
     }
 
     #[test]

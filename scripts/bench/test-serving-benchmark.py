@@ -166,6 +166,25 @@ class Records(unittest.TestCase):
         truncated = trace_of([(delta("a"), 1.0)])
         self.assertEqual(bench.request_record(0, {"max_tokens": 8}, truncated, 0, 2, 0)["error"], "truncated")
 
+    def test_failures_keep_the_servers_message(self):
+        streamed = trace_of([(json.dumps({"error": {
+            "type": "server_error", "message": "decode executor failed: OOM",
+            "request_id": "req-7"}}), 2.0)])
+        record = bench.request_record(0, {"max_tokens": 8}, streamed, 0, 2, 0)
+        self.assertEqual(record["error_detail"], "decode executor failed: OOM [request req-7]")
+        refused = bench.request_record(
+            1, {"max_tokens": 8}, bench.StreamTrace(), 0, 1, 0, "http_503",
+            bench.http_error_detail(b'{"error": {"message": "insufficient live GPU memory"}}'))
+        self.assertEqual(refused["error_detail"], "insufficient live GPU memory")
+        self.assertEqual(bench.http_error_detail(b"plain text"), "plain text")
+        self.assertEqual(len(bench.error_detail("x" * 2000)), bench.MAX_ERROR_DETAIL_CHARS)
+        ok = trace_of([(delta("a"), 1.0), ("[DONE]", 1.0)])
+        self.assertIsNone(bench.request_record(2, {"max_tokens": 8}, ok, 0, 1, 0)["error_detail"])
+        summary = bench.summarize([record, refused, dict(refused)], 1.0,
+                                  {"ttft_ms": None, "tpot_ms": None, "e2e_ms": None})
+        self.assertEqual(summary["error_details"][0],
+                         {"error": "http_503", "detail": "insufficient live GPU memory", "requests": 2})
+
 
 def record(ttft, tpot, e2e, ok=True, out=10, itl=(), error=None):
     return {"ok": ok, "error": error, "ttft_ms": ttft, "tpot_ms": tpot, "e2e_ms": e2e,

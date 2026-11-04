@@ -113,7 +113,7 @@ pub use metrics::{
     engine_stream_backpressure_total, engine_stream_metrics_snapshot,
     engine_tensor_batch_max_width, engine_tensor_batches_total, prometheus_engine_metric_name,
     prometheus_engine_metric_type, push_engine_histograms, EngineBatchMetricsSnapshot,
-    EngineCapacityRefusal, EngineCapacityRefusalMetricsSnapshot,
+    EngineCapacityRefusal, EngineCapacityRefusalMetricsSnapshot, EngineRecentFailure,
     EngineDeadlinePhaseMetricsSnapshot, EngineDispatchPhase, EngineDispatchStateMetricsSnapshot,
     EngineDispatchWidthTime,
     EngineDurationMetricsSnapshot, EngineFailureOriginMetricsSnapshot, EngineMetricDescriptor,
