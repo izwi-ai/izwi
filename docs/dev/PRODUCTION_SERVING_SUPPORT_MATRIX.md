@@ -97,11 +97,16 @@ The tests below are ignored and need the checkpoint.
 |---|---|---|---|---|
 | LFM2 / LFM2.5 | 8 | 8 | 32 (unmeasured) | Parity `lfm25_decode_matches_across_batch_widths_on_{cpu,metal}`: widths 2, 4 and 8 match width 1 on every decisive step (339–340). Worst top-8 logit delta is 0 on the CPU and 0.0096 on Metal. Throughput `lfm25_batch_width_scaling_{cpu,metal}` at widths 1/2/4/8: Metal 133/153/226/258 and 91/136/210/258 tok/s; CPU 89/113/134/155 and 90/107/136/165 tok/s. Metal's small-batch mat-vec serves 2..=8 rows, which bounds the family at 8 |
 | Qwen3.5 | 2 | 8 | 32 (unmeasured) | `qwen35_decode_width_parity_and_throughput_{cpu,metal}` (0.8B; 2B on Metal): every decisive step agrees with width 1 and the top-16 logits move by under 1e-4. Metal (2026-10-24, with the shared small-batch k-quant mat-vec on every Q4_K/Q5_K/Q6_K/Q8_0 projection and the tied head) 0.8B gives 105/180/251/285 tok/s at widths 1/2/4/8 (Candle per-row: 105/122/133/140); 2B gives 68/99/137/147 (60/69/73/77). On the CPU, 0.8B gives 21/22/25/26, then 11/16/15/15 on a repeat under load. That is no repeatable gain past two, so the CPU stays at 2 |
-| Qwen3, Qwen3-MoE, Gemma3, Qwen3.6, Qwen3.8 | 2 | 2 | 32 (unmeasured) | No checkpoint on the measuring machine; the historical portable width |
+| Qwen3.6, Qwen3.8 | 2 | 2 | 32 | CPU and Metal: no checkpoint on the measuring machine. CUDA: every row's DeltaNet state and q/k RoPE run in one launch per layer, and the block-FP8 projections run tensor-core kernels whose cost barely grows from 2 to 32 rows (about 0.013 ms per 5120x5120 projection from 2 to 16 rows on an H100). H100 greedy parity and serving-matrix evidence: see below |
+| Qwen3, Qwen3-MoE, Gemma3 | 2 | 2 | 8 | No checkpoint on the measuring machine; the historical portable width |
 
-CUDA keeps its automatic width of eight (VRAM-tiered admission) and a
-ceiling of 32. The 32 is a policy constant (`catalog/batch_width.rs`), not a
-kernel or metadata limit, and no CUDA width has been measured. An explicit
+CUDA keeps its automatic width of eight for the engine rows and every family
+not certified wider, and a ceiling of 32 for chat. The 32 is a policy
+constant (`catalog/batch_width.rs`), not a kernel or metadata limit. A
+family certified past eight decodes at its stage's width
+(`engine/executor.rs`, read from the same table), and its pre-load CUDA
+state floor prices staged rows at that width. On a smaller GPU an operator
+can keep the old width with `IZWI_MAX_BATCH_SIZE=8`. An explicit
 `IZWI_MAX_BATCH_SIZE` above a certified width is honoured up to 32 with a
 startup warning.
 

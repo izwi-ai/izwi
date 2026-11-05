@@ -15,9 +15,11 @@
 //!
 //! On CUDA the engine and every capability but chat run the automatic eight.
 //! Chat's automatic width there is the CUDA ceiling, clamped per family:
-//! Qwen3.5, LFM2 and LFM3 batch every row's recurrent and conv state in one
-//! launch per layer (one launch per row before), so their steps stay cheap
-//! past eight rows and they take the ceiling; every other family keeps eight.
+//! Qwen3.5, Qwen3.6, Qwen3.8, LFM2 and LFM3 batch every row's recurrent and
+//! conv state in one launch per layer (one launch per row before), and
+//! Qwen3.6 and Qwen3.8 run their block-FP8 projections on tensor-core kernels
+//! whose cost barely grows with the rows, so their steps stay cheap past
+//! eight rows and they take the ceiling; every other family keeps eight.
 
 use super::ModelFamily;
 use crate::backends::BackendKind;
@@ -41,7 +43,8 @@ pub(crate) const CUDA_DEFAULT_WIDTH: usize = 8;
 /// |---|---|---|---|---|
 /// | LFM2 / LFM2.5 / LFM3 | 8 | 8 | 32 | `lfm25_decode_matches_across_batch_widths_on_*`, `lfm25_batch_width_scaling_*` |
 /// | Qwen3.5 | 2 | 8 | 32 | `qwen35_decode_width_parity_and_throughput_*` |
-/// | Qwen3, Qwen3-MoE, Gemma3, Qwen3.6, Qwen3.8 | 2 | 2 | 8 | No checkpoint measured |
+/// | Qwen3.6, Qwen3.8 | 2 | 2 | 32 | H100 greedy parity and serving matrix (support matrix) |
+/// | Qwen3, Qwen3-MoE, Gemma3 | 2 | 2 | 8 | No checkpoint measured |
 /// | Fish Audio Drama 3 (TTS) | 1 | 1 | 8 | Defaults until its row-invariance and throughput evidence |
 ///
 /// Qwen3.5 on the CPU gained nothing past two rows in a repeated run, so it
@@ -54,7 +57,11 @@ pub(crate) const fn certified_decode_width(family: ModelFamily, backend: Backend
     match (backend, family) {
         (
             BackendKind::Cuda,
-            ModelFamily::Qwen35Chat | ModelFamily::Lfm2Chat | ModelFamily::Lfm3Chat,
+            ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen35MoeChat
+            | ModelFamily::Qwen38Chat
+            | ModelFamily::Lfm2Chat
+            | ModelFamily::Lfm3Chat,
         ) => CUDA_MAX_WIDTH,
         (BackendKind::Cuda, _) => CUDA_DEFAULT_WIDTH,
         (BackendKind::Cpu | BackendKind::Metal, ModelFamily::Lfm2Chat | ModelFamily::Lfm3Chat)
@@ -173,6 +180,8 @@ mod tests {
         // every other family keeps the engine's eight.
         for family in [
             ModelFamily::Qwen35Chat,
+            ModelFamily::Qwen35MoeChat,
+            ModelFamily::Qwen38Chat,
             ModelFamily::Lfm2Chat,
             ModelFamily::Lfm3Chat,
         ] {

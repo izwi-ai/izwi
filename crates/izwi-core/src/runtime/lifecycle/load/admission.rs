@@ -551,6 +551,19 @@ impl ModelLifecycleController {
         let engine = self.core_engine.config();
         let staged_rows = match policy.staged_transaction_rows {
             Some(rows) => usize::try_from(rows).unwrap_or(usize::MAX),
+            // The load stages one step's launch at the chat decode width
+            // (`chat_staged_rows`), which may exceed the engine rows' width.
+            None if engine.automatic_row_limits.staged_transactions => {
+                crate::runtime::service::automatic_staged_transaction_rows(
+                    self.adapter_registry
+                        .chat_decode_width(variant.family(), BackendKind::Cuda),
+                    engine
+                        .resolved_physical_execution_capacity()
+                        .candidate_dispatch_limit
+                        .get(),
+                    engine.max_retained_sequences,
+                )
+            }
             None => engine.max_staged_transactions,
         };
         let automatic_rows = engine.automatic_row_limits.retained_sequences;

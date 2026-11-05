@@ -1167,17 +1167,13 @@ impl WorkerConfig {
 /// Families whose loaded stage sets their batch rows instead of the
 /// engine's tensor width: Fish S2 and Drama 3 fit their own rows, and the chat
 /// families certified wider on CUDA than the engine rows
-/// (`catalog::batch_width`) decode up to their stage's width.
+/// (`catalog::batch_width`) decode up to their stage's width. Read from the
+/// certified widths, so certifying a family wider cannot leave it capped here.
 fn stage_sets_batch_rows(family: crate::catalog::ModelFamily) -> bool {
     use crate::catalog::ModelFamily;
-    matches!(
-        family,
-        ModelFamily::FishS2Tts
-            | ModelFamily::FishDrama3Tts
-            | ModelFamily::Qwen35Chat
-            | ModelFamily::Lfm2Chat
-            | ModelFamily::Lfm3Chat
-    )
+    matches!(family, ModelFamily::FishS2Tts | ModelFamily::FishDrama3Tts)
+        || crate::catalog::certified_decode_width(family, crate::backends::BackendKind::Cuda)
+            > crate::catalog::CUDA_DEFAULT_WIDTH
 }
 
 /// Output from the executor after a forward pass.
@@ -5638,6 +5634,25 @@ mod tests {
 
         fn shutdown(&mut self) -> Result<()> {
             Ok(())
+        }
+    }
+
+    #[test]
+    fn stage_rows_follow_the_certified_widths() {
+        use crate::catalog::ModelFamily;
+        for family in [
+            ModelFamily::FishS2Tts,
+            ModelFamily::FishDrama3Tts,
+            ModelFamily::Qwen35Chat,
+            ModelFamily::Qwen35MoeChat,
+            ModelFamily::Qwen38Chat,
+            ModelFamily::Lfm2Chat,
+            ModelFamily::Lfm3Chat,
+        ] {
+            assert!(stage_sets_batch_rows(family), "{family:?}");
+        }
+        for family in [ModelFamily::Qwen3Chat, ModelFamily::Gemma3Chat] {
+            assert!(!stage_sets_batch_rows(family), "{family:?}");
         }
     }
 
