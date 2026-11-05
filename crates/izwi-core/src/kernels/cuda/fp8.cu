@@ -299,7 +299,7 @@ template<class T> __device__ void fp8_tc_reduce(const float* __restrict__ partia
   y[i]=T(v);
 }
 
-// Register-direct tensor-core projection for 1 to 16 rows (SM80+), the
+// Register-direct tensor-core projection for 1 to 32 rows (SM80+), the
 // batched-decode shape: y[M, N] = x[M, K] . W[N, K]^T with W block-FP8.
 // The weights are the MMA's A operand (16 channels x 16 K) and the
 // activations its B operand (16 K x 8 rows), so up to eight rows fill one
@@ -477,6 +477,8 @@ extern "C" __global__ void __launch_bounds__(128, 4) qwen38_fp8_mma8_f16(const _
 extern "C" __global__ void __launch_bounds__(128, 4) qwen38_fp8_mma8_bf16(const __nv_bfloat16*x,const unsigned char*w,const float*s,__nv_bfloat16*y,float*partial,int M,int N,int K,int kps){fp8_mma<__nv_bfloat16,1>(x,w,s,y,partial,M,N,K,kps);}
 extern "C" __global__ void __launch_bounds__(128, 4) qwen38_fp8_mma16_f16(const __half*x,const unsigned char*w,const float*s,__half*y,float*partial,int M,int N,int K,int kps){fp8_mma<__half,2>(x,w,s,y,partial,M,N,K,kps);}
 extern "C" __global__ void __launch_bounds__(128, 4) qwen38_fp8_mma16_bf16(const __nv_bfloat16*x,const unsigned char*w,const float*s,__nv_bfloat16*y,float*partial,int M,int N,int K,int kps){fp8_mma<__nv_bfloat16,2>(x,w,s,y,partial,M,N,K,kps);}
+extern "C" __global__ void __launch_bounds__(128, 4) qwen38_fp8_mma32_f16(const __half*x,const unsigned char*w,const float*s,__half*y,float*partial,int M,int N,int K,int kps){fp8_mma<__half,4>(x,w,s,y,partial,M,N,K,kps);}
+extern "C" __global__ void __launch_bounds__(128, 4) qwen38_fp8_mma32_bf16(const __nv_bfloat16*x,const unsigned char*w,const float*s,__nv_bfloat16*y,float*partial,int M,int N,int K,int kps){fp8_mma<__nv_bfloat16,4>(x,w,s,y,partial,M,N,K,kps);}
 
 // Vectorized decode GEMV over F32 activations and outputs, for decoders that
 // keep an F32 residual stream: one warp per output channel, eight channels a

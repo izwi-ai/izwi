@@ -104,8 +104,9 @@ enum DecodeKernel {
 /// the dequantized GEMM.
 pub const TENSOR_CORE_MAX_ROWS: usize = 64;
 
-/// Rows the register-direct kernel serves: two 8-row MMA tiles.
-const MMA_MAX_ROWS: usize = 16;
+/// Rows the register-direct kernel serves: up to four 8-row MMA tiles
+/// (`qwen38_fp8_mma{8,16,32}_*` hold one, two and four).
+const MMA_MAX_ROWS: usize = 32;
 
 /// Warps per register-direct block (`MMA_WARPS` in fp8.cu); they split the
 /// block's K blocks between them.
@@ -123,7 +124,7 @@ const TENSOR_CORE_CHECK_SHAPES: [(usize, usize); 3] = [(192, 2048), (2048, 4096)
 
 /// Row counts the load-time timings sample. A row count between two samples
 /// takes the larger sample's choice.
-const TENSOR_CORE_TIMED_ROWS: [usize; 10] = [1, 2, 3, 4, 5, 6, 8, 16, 32, TENSOR_CORE_MAX_ROWS];
+const TENSOR_CORE_TIMED_ROWS: [usize; 11] = [1, 2, 3, 4, 5, 6, 8, 16, 24, 32, TENSOR_CORE_MAX_ROWS];
 
 /// Kill switch for the tensor-core projection (`legacy`/`off`/`0`).
 pub const TENSOR_CORE_ENV: &str = "IZWI_FP8_TENSOR_CORE";
@@ -170,7 +171,7 @@ impl TensorCoreKernel {
     /// The row counts its load-time check runs.
     fn check_rows(self) -> &'static [usize] {
         match self {
-            Self::Mma => &[1, 2, 5, 8, 9, 16],
+            Self::Mma => &[1, 2, 5, 8, 9, 16, 17, 32],
             Self::Wmma => &[2, 5, 8, 16, 17, 33, 64],
         }
     }
@@ -218,7 +219,7 @@ pub fn dequant_gemm_min_rows() -> usize {
 }
 
 /// Compare each tensor-core kernel with the reference kernels on `device`
-/// (the register-direct one at 1 to 16 rows, the shared-memory one at 2 to
+/// (the register-direct one at 1 to 32 rows, the shared-memory one at 2 to
 /// 64; partial tiles, split and unsplit K, BF16 and F16), then time them on a
 /// 5120x5120 projection and give each row count, process-wide, the fastest
 /// of the kernels that passed and the path it would take otherwise: the
@@ -1147,7 +1148,7 @@ impl CustomOp3 for Projection {
             sl.start_offset()..sl.start_offset() + self.n.div_ceil(128) * self.k.div_ceil(128),
         );
         macro_rules! run {
-            ($v:ident,$ty:ty,$mv:literal,$mv2:literal,$mv2x8:literal,$mm:literal,$tc:literal,$tcr:literal,$mma8:literal,$mma16:literal) => {{
+            ($v:ident,$ty:ty,$mv:literal,$mv2:literal,$mv2x8:literal,$mm:literal,$tc:literal,$tcr:literal,$mma8:literal,$mma16:literal,$mma32:literal) => {{
                 let CudaStorageSlice::$v(x) = &x.slice else {
                     unreachable!()
                 };
@@ -1195,7 +1196,13 @@ impl CustomOp3 for Projection {
                     // 64 channels.
                     let (func, n_blocks, threads, max_splits) = match kernel {
                         TensorCoreKernel::Mma => (
-                            if m <= 8 { $mma8 } else { $mma16 },
+                            if m <= 8 {
+                                $mma8
+                            } else if m <= 16 {
+                                $mma16
+                            } else {
+                                $mma32
+                            },
                             self.n / 16,
                             32 * MMA_WARPS as u32,
                             (kblocks / MMA_WARPS).max(1),
@@ -1332,7 +1339,8 @@ impl CustomOp3 for Projection {
                     "qwen38_fp8_tc_f16",
                     "qwen38_fp8_tc_reduce_f16",
                     "qwen38_fp8_mma8_f16",
-                    "qwen38_fp8_mma16_f16"
+                    "qwen38_fp8_mma16_f16",
+                    "qwen38_fp8_mma32_f16"
                 )
             }
             CudaStorageSlice::BF16(_) => {
@@ -1346,7 +1354,8 @@ impl CustomOp3 for Projection {
                     "qwen38_fp8_tc_bf16",
                     "qwen38_fp8_tc_reduce_bf16",
                     "qwen38_fp8_mma8_bf16",
-                    "qwen38_fp8_mma16_bf16"
+                    "qwen38_fp8_mma16_bf16",
+                    "qwen38_fp8_mma32_bf16"
                 )
             }
             _ => candle_core::bail!("FP8 CUDA activation requires F16/BF16"),
