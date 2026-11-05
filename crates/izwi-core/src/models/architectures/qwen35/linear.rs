@@ -1,11 +1,12 @@
 //! Qwen3.5 projections.
 //!
 //! Each projection keeps Candle's `QMatMul` and, on CUDA, an izwi-owned view
-//! of the same GGUF weight for the K-quant MMVQ kernels
-//! (`kernels/cuda/kquant.rs`). The view is used only after a self-check shows
-//! it reproduces `QMatMul` exactly. It makes the projection capturable in a
-//! CUDA graph, and it lets projections that read one input share a single
-//! Q8_1 quantization ([`forward_shared`]).
+//! of the same GGUF weight for the K-quant MMVQ kernels (up to eight rows)
+//! and MMQ kernels (more) (`kernels/cuda/kquant.rs`). The view is used only
+//! after a self-check shows it reproduces `QMatMul` exactly at both. It makes
+//! the projection capturable in a CUDA graph at any batch width, and it lets
+//! projections that read one input share a single Q8_1 quantization
+//! ([`forward_shared`]).
 
 use candle_core::quantized::QMatMul;
 use candle_core::{Module, Tensor};
@@ -50,6 +51,10 @@ impl Qwen35Linear {
             Some(weight) if kquant::accepts(x) => {
                 Ok(kquant::mat_vec(weight, &kquant::quantize(x)?)?)
             }
+            Some(weight) if kquant::accepts_tiles(x) => Ok(kquant::mat_mul(
+                weight,
+                &kquant::quantize_tiles(x, weight.tile_scales())?,
+            )?),
             _ => Ok(self.matmul.forward(x)?),
         }
     }
@@ -183,18 +188,24 @@ impl Qwen35Linear {
         };
     }
 
+    /// MMVQ at one and three rows, and MMQ tiles at 12 and 32 (the CUDA chat
+    /// width), against `QMatMul`'s own MMVQ and MMQ.
     fn kquant_self_check(&self, weight: &KQuantWeight) -> Result<()> {
         let device = weight.device();
-        for (rows, seed) in [(1usize, 31u64), (3, 32)] {
+        for (rows, seed) in [(1usize, 31u64), (3, 32), (12, 33), (32, 34)] {
             let x = Tensor::from_vec(
                 xorshift_values(rows * weight.cols(), seed, 1.0),
                 (rows, weight.cols()),
                 &device,
             )?;
             let expected = self.matmul.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
-            let actual = kquant::mat_vec(weight, &kquant::quantize(&x)?)?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
+            let actual = if rows <= kquant::MAX_ROWS {
+                kquant::mat_vec(weight, &kquant::quantize(&x)?)?
+            } else {
+                kquant::mat_mul(weight, &kquant::quantize_tiles(&x, weight.tile_scales())?)?
+            }
+            .flatten_all()?
+            .to_vec1::<f32>()?;
             if actual.len() != expected.len()
                 || actual
                     .iter()
@@ -214,18 +225,34 @@ impl Qwen35Linear {
 }
 
 /// Projections that read the same input. On the K-quant path the input is
-/// quantized to Q8_1 once and each weight runs one MMVQ launch; otherwise
-/// each projection runs on its own.
+/// quantized to Q8_1 once (above eight rows, once per tile scale layout) and
+/// each weight runs one MMVQ (MMQ) launch; otherwise each projection runs on
+/// its own.
 pub(crate) fn forward_shared<const N: usize>(
     x: &Tensor,
     linears: [&Qwen35Linear; N],
 ) -> Result<[Tensor; N]> {
     let mut outputs = Vec::with_capacity(N);
-    if kquant::accepts(x) && linears.iter().all(|linear| linear.kquant.is_some()) {
+    let all_kquant = linears.iter().all(|linear| linear.kquant.is_some());
+    if all_kquant && kquant::accepts(x) {
         let activations = kquant::quantize(x)?;
         for linear in linears {
             let weight = linear.kquant.as_ref().expect("checked above");
             outputs.push(kquant::mat_vec(weight, &activations)?);
+        }
+    } else if all_kquant && kquant::accepts_tiles(x) {
+        let mut tiles: Vec<kquant::Q8Tiles> = Vec::with_capacity(2);
+        for linear in linears {
+            let weight = linear.kquant.as_ref().expect("checked above");
+            let scales = weight.tile_scales();
+            let index = match tiles.iter().position(|tiles| tiles.scales() == scales) {
+                Some(index) => index,
+                None => {
+                    tiles.push(kquant::quantize_tiles(x, scales)?);
+                    tiles.len() - 1
+                }
+            };
+            outputs.push(kquant::mat_mul(weight, &tiles[index])?);
         }
     } else {
         for linear in linears {

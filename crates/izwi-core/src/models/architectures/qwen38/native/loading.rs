@@ -76,6 +76,13 @@ pub(super) struct LoadState {
     pub uploaded_bytes: AtomicU64,
     pub pinned_upload_tiles: AtomicU64,
     pub unpinned_upload_tiles: AtomicU64,
+    /// Raw block-FP8 projections (weights kept as checkpoint bytes): time in
+    /// the byte validation and in the host-to-device copies, and their count
+    /// and bytes.
+    pub raw_fp8_validation_us: AtomicU64,
+    pub raw_fp8_upload_us: AtomicU64,
+    pub raw_fp8_tensors: AtomicU64,
+    pub raw_fp8_bytes: AtomicU64,
 }
 impl LoadState {
     pub fn new(discovery: Duration) -> Self {
@@ -96,7 +103,16 @@ impl LoadState {
             uploaded_bytes: AtomicU64::new(0),
             pinned_upload_tiles: AtomicU64::new(0),
             unpinned_upload_tiles: AtomicU64::new(0),
+            raw_fp8_validation_us: AtomicU64::new(0),
+            raw_fp8_upload_us: AtomicU64::new(0),
+            raw_fp8_tensors: AtomicU64::new(0),
+            raw_fp8_bytes: AtomicU64::new(0),
         }
+    }
+
+    /// Adds `started`'s elapsed microseconds to `counter`.
+    fn add_elapsed(counter: &AtomicU64, started: Instant) {
+        counter.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 }
 
@@ -141,8 +157,13 @@ impl IndexedSafetensors {
             "pinned_upload_tiles": n(&s.pinned_upload_tiles), "unpinned_upload_tiles": n(&s.unpinned_upload_tiles),
             "cache_hits": n(&s.cache_hits), "cache_misses": n(&s.cache_misses),
             "converted_bytes": n(&s.converted_bytes), "uploaded_bytes": n(&s.uploaded_bytes),
+            "raw_fp8_validation_ms": n(&s.raw_fp8_validation_us) as f64 / 1000.,
+            "raw_fp8_upload_ms": n(&s.raw_fp8_upload_us) as f64 / 1000.,
+            "raw_fp8_tensors": n(&s.raw_fp8_tensors),
+            "raw_fp8_bytes": n(&s.raw_fp8_bytes),
             "cache_source_authentication": "rehash-source-tiles-and-scales",
-            "conversion_upload_timing_scope": "q8-tiles-only",
+            "conversion_upload_timing_scope": "q8-tiles-only; raw block-FP8 under raw_fp8_*",
+            "validation_timing_scope": "tensor-view bookkeeping",
             "io_strategy_resolved": if self.options.io_strategy==LoadingIoStrategy::Sequential {"bounded-sequential-q8; dense-mmap"} else {"mmap"},
         })
     }
@@ -359,20 +380,31 @@ impl IndexedSafetensors {
             Some(SafeDType::F8_E4M3),
             Some(&expected_shape),
             |v| {
-                for (i, &b) in v.data().iter().enumerate() {
-                    let value = decode_e4m3fn(b);
-                    let scale = scales[(i / expected_shape[1] / block_shape[0]) * scale_shape[1]
-                        + i % expected_shape[1] / block_shape[1]];
-                    if !value.is_finite() || !(value * scale).is_finite() {
-                        return Err(Error::ModelLoadError(format!(
-                            "Non-finite block FP8 value in `{weight_name}` at {i}"
-                        )));
-                    }
-                }
-                Ok(Tensor::from_slice(v.data(), &expected_shape, device)?)
+                let validating = Instant::now();
+                validate_block_fp8_bytes(
+                    v.data(),
+                    expected_shape,
+                    &scales,
+                    scale_shape,
+                    block_shape,
+                )
+                .map_err(|detail| {
+                    Error::ModelLoadError(format!("Block-FP8 tensor `{weight_name}`: {detail}"))
+                })?;
+                LoadState::add_elapsed(&self.loading.raw_fp8_validation_us, validating);
+                let uploading = Instant::now();
+                let weights = Tensor::from_slice(v.data(), &expected_shape, device)?;
+                LoadState::add_elapsed(&self.loading.raw_fp8_upload_us, uploading);
+                self.loading
+                    .raw_fp8_bytes
+                    .fetch_add(v.data().len() as u64, Ordering::Relaxed);
+                Ok(weights)
             },
         )?;
+        let uploading = Instant::now();
         let scales = Tensor::from_vec(scales, &scale_shape, device)?;
+        LoadState::add_elapsed(&self.loading.raw_fp8_upload_us, uploading);
+        self.loading.raw_fp8_tensors.fetch_add(1, Ordering::Relaxed);
         Ok(RawBlockFp8Projection {
             weights,
             scales,
@@ -458,6 +490,7 @@ impl IndexedSafetensors {
             )?;
             validate_scales(&part_scales)?;
             self.with_tensor_view(name, Some(SafeDType::F8_E4M3), Some(part_shape), |v| {
+                let validating = Instant::now();
                 validate_block_fp8_bytes(
                     v.data(),
                     *part_shape,
@@ -468,6 +501,7 @@ impl IndexedSafetensors {
                 .map_err(|detail| {
                     Error::ModelLoadError(format!("Block-FP8 tensor `{name}`: {detail}"))
                 })?;
+                LoadState::add_elapsed(&self.loading.raw_fp8_validation_us, validating);
                 bytes.extend_from_slice(v.data());
                 Ok(())
             })?;
@@ -478,8 +512,14 @@ impl IndexedSafetensors {
                 "Block-FP8 group concatenation length mismatch".into(),
             ));
         }
+        let uploading = Instant::now();
         let weights = Tensor::from_vec(bytes, &shape, device)?;
         let scales = Tensor::from_vec(scales, &scale_shape, device)?;
+        LoadState::add_elapsed(&self.loading.raw_fp8_upload_us, uploading);
+        self.loading.raw_fp8_tensors.fetch_add(1, Ordering::Relaxed);
+        self.loading
+            .raw_fp8_bytes
+            .fetch_add(total as u64, Ordering::Relaxed);
         Ok(RawBlockFp8Projection {
             weights,
             scales,
@@ -524,11 +564,12 @@ impl IndexedSafetensors {
     }
 }
 
-/// Parallel validation of raw block-FP8 bytes with exactly the accept set of
-/// [`IndexedSafetensors::materialize_block_fp8_raw`]: no NaN byte, and no
-/// element whose value times its block scale overflows. E4M3FN magnitude is
-/// monotonic in the low seven bits for finite bytes, so each block's check is
-/// its largest byte magnitude times its scale.
+/// Parallel validation of raw block-FP8 bytes: no NaN byte, and no element
+/// whose value times its block scale overflows. E4M3FN magnitude is monotonic
+/// in the low seven bits for finite bytes, and 0x7f (the largest) is NaN, so
+/// each block's check is its largest byte magnitude: 0x7f fails, and any other
+/// times its scale must stay finite. The per-block maxima are division-free
+/// byte reductions the compiler vectorizes, one row-block per rayon task.
 pub(super) fn validate_block_fp8_bytes(
     data: &[u8],
     shape: [usize; 2],
@@ -541,19 +582,27 @@ pub(super) fn validate_block_fp8_bytes(
     if data.len() != rows * cols || scales.len() != scale_shape[0] * scale_shape[1] {
         return Err("payload or scale length mismatch".into());
     }
+    if data.is_empty() {
+        return Ok(());
+    }
+    if block_shape.contains(&0) || cols.div_ceil(block_shape[1]) != scale_shape[1] {
+        return Err("block or scale shape mismatch".into());
+    }
     let row_block_bytes = block_shape[0] * cols;
     data.par_chunks(row_block_bytes)
         .enumerate()
         .try_for_each(|(row_block, chunk)| {
             let mut magnitudes = vec![0u8; scale_shape[1]];
-            for (offset, &b) in chunk.iter().enumerate() {
-                let magnitude = b & 0x7f;
-                if magnitude == 0x7f {
-                    let index = row_block * row_block_bytes + offset;
-                    return Err(format!("NaN E4M3FN byte at element {index}"));
+            for row in chunk.chunks_exact(cols) {
+                for (magnitude, block) in magnitudes.iter_mut().zip(row.chunks(block_shape[1])) {
+                    let block_max = block.iter().fold(0u8, |max, &b| max.max(b & 0x7f));
+                    *magnitude = (*magnitude).max(block_max);
                 }
-                let column_block = (offset % cols) / block_shape[1];
-                magnitudes[column_block] = magnitudes[column_block].max(magnitude);
+            }
+            if magnitudes.contains(&0x7f) {
+                let offset = chunk.iter().position(|&b| b & 0x7f == 0x7f).unwrap_or(0);
+                let index = row_block * row_block_bytes + offset;
+                return Err(format!("NaN E4M3FN byte at element {index}"));
             }
             for (column_block, &magnitude) in magnitudes.iter().enumerate() {
                 let scale = scales[row_block * scale_shape[1] + column_block];
@@ -934,6 +983,68 @@ mod tests {
         let scales = [1e36f32];
         assert!(validate_block_fp8_bytes(&[0x00, 0x08], [1, 2], &scales, [1, 1], [1, 2]).is_ok());
         assert!(validate_block_fp8_bytes(&[0x00, 0x7e], [1, 2], &scales, [1, 1], [1, 2]).is_err());
+    }
+
+    /// The accept set of the original per-element check: every byte decodes to
+    /// a finite value whose product with its block scale is finite.
+    fn per_element_accepts(
+        data: &[u8],
+        shape: [usize; 2],
+        scales: &[f32],
+        scale_shape: [usize; 2],
+        block_shape: [usize; 2],
+    ) -> bool {
+        data.iter().enumerate().all(|(i, &b)| {
+            let value = decode_e4m3fn(b);
+            let scale = scales
+                [(i / shape[1] / block_shape[0]) * scale_shape[1] + i % shape[1] / block_shape[1]];
+            value.is_finite() && (value * scale).is_finite()
+        })
+    }
+
+    #[test]
+    fn block_validation_matches_the_per_element_check_on_ragged_blocks() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let (mut accepted, mut rejected) = (0, 0);
+        for case in 0..400 {
+            let block_shape = [1 + (next() % 4) as usize, 1 + (next() % 6) as usize];
+            let shape = [1 + (next() % 9) as usize, 1 + (next() % 13) as usize];
+            let scale_shape = [
+                shape[0].div_ceil(block_shape[0]),
+                shape[1].div_ceil(block_shape[1]),
+            ];
+            // Mostly small magnitudes, occasionally a NaN byte or a scale
+            // large enough that only the biggest magnitudes overflow.
+            let data = (0..shape[0] * shape[1])
+                .map(|_| match next() % 64 {
+                    0 => 0x7f | ((next() as u8) & 0x80),
+                    _ => (next() as u8) & 0xf7,
+                })
+                .collect::<Vec<_>>();
+            let scales = (0..scale_shape[0] * scale_shape[1])
+                .map(|_| match next() % 8 {
+                    0 => 1e36,
+                    1 => 7.5e35,
+                    _ => (next() % 1000) as f32 / 100.0,
+                })
+                .collect::<Vec<_>>();
+            let expected = per_element_accepts(&data, shape, &scales, scale_shape, block_shape);
+            let actual =
+                validate_block_fp8_bytes(&data, shape, &scales, scale_shape, block_shape).is_ok();
+            assert_eq!(actual, expected, "case {case}: {shape:?} {block_shape:?}");
+            if expected {
+                accepted += 1;
+            } else {
+                rejected += 1;
+            }
+        }
+        assert!(accepted > 50 && rejected > 50, "{accepted} / {rejected}");
     }
 
     #[test]

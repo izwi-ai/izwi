@@ -66,6 +66,97 @@ pub(crate) fn lfm_shortconv_gated_ring_step(
     Ok((y, next_ring))
 }
 
+/// One row of [`lfm_shortconv_gated_ring_step_rows`]: its ring
+/// `[capacity, 1, hidden]`, cursor and valid count.
+#[cfg(feature = "cuda")]
+pub(crate) struct ShortConvRowStep<'a> {
+    pub(crate) ring: &'a Tensor,
+    pub(crate) cursor: u64,
+    pub(crate) valid: u64,
+}
+
+/// [`lfm_shortconv_gated_ring_step`] for every row of a batched decode in one
+/// launch (CUDA): `projected` is `[rows, 1, 3 * hidden]`. Returns `y`
+/// `[rows, 1, hidden]` and each row's fresh next ring `[capacity, 1, hidden]`;
+/// the input rings are never written. Each row's arithmetic is the single-row
+/// step's.
+#[cfg(feature = "cuda")]
+pub(crate) fn lfm_shortconv_gated_ring_step_rows(
+    projected: &Tensor,
+    rows: &[ShortConvRowStep<'_>],
+    weight: &Tensor,
+) -> Result<(Tensor, Vec<Tensor>)> {
+    use crate::kernels::cuda::segment_graph::DeviceTable;
+    use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+
+    let (hidden, capacity) = weight.dims2()?;
+    if rows.is_empty() || projected.elem_count() != rows.len() * 3 * hidden || capacity == 0 {
+        return Err(Error::InvalidInput(
+            "LFM2 batched ShortConv step geometry mismatch".into(),
+        ));
+    }
+    let address = |tensor: &Tensor| -> Result<u64> {
+        let (storage, layout) = tensor.storage_and_layout();
+        let candle_core::Storage::Cuda(cuda) = &*storage else {
+            return Err(Error::InvalidInput(
+                "ShortConv rings must be CUDA tensors".into(),
+            ));
+        };
+        if tensor.dtype() != candle_core::DType::F32 || !layout.is_contiguous() {
+            return Err(Error::InvalidInput(
+                "ShortConv rings must be contiguous F32".into(),
+            ));
+        }
+        let stream = tensor.device().as_cuda_device()?.cuda_stream();
+        let (base, _guard) = cuda.as_cuda_slice::<f32>()?.device_ptr(&stream);
+        Ok(base + (layout.start_offset() * std::mem::size_of::<f32>()) as u64)
+    };
+    let device = projected.device();
+    let mut entries = Vec::with_capacity(rows.len() * 4);
+    let mut next_rings = Vec::with_capacity(rows.len());
+    for row in rows {
+        // The kernel reads and writes these buffers through raw addresses.
+        if row.ring.dims3()? != (capacity, 1, hidden)
+            || row.valid > capacity as u64
+            || row.valid > row.cursor
+        {
+            return Err(Error::InvalidInput(
+                "LFM2 batched ShortConv ring geometry mismatch".into(),
+            ));
+        }
+        let next = {
+            use candle_core::backend::BackendDevice;
+            let candle_core::Device::Cuda(cuda) = device else {
+                return Err(Error::InvalidInput(
+                    "ShortConv rings must be CUDA tensors".into(),
+                ));
+            };
+            let shape = candle_core::Shape::from((capacity, 1, hidden));
+            // SAFETY: the kernel writes every element of each next ring.
+            let storage = unsafe { cuda.alloc_uninit(&shape, candle_core::DType::F32)? };
+            Tensor::from_storage(
+                candle_core::Storage::Cuda(storage),
+                shape,
+                candle_core::op::BackpropOp::none(),
+                false,
+            )
+        };
+        entries.extend([address(row.ring)?, address(&next)?, row.cursor, row.valid]);
+        next_rings.push(next);
+    }
+    let mut table = DeviceTable::new(device, entries.len())?;
+    table.write(0, &entries)?;
+    let y = super::cuda::launch_lfm_shortconv_gated_ring_step_rows(
+        projected,
+        weight,
+        table.address(),
+        rows.len(),
+        hidden,
+        capacity,
+    )?;
+    Ok((y.reshape((rows.len(), 1, hidden))?, next_rings))
+}
+
 struct GatedRingStepOp {
     hidden: usize,
     capacity: usize,
@@ -426,6 +517,72 @@ mod tests {
     #[ignore = "requires an NVIDIA GPU; run explicitly with --ignored"]
     fn fused_step_matches_op_by_op_on_cuda() {
         assert_matches_op_by_op(&Device::new_cuda(0).expect("CUDA device required"), 1e-5);
+    }
+
+    /// The multi-row step gives every row the single-row step's `y` and next
+    /// ring bit for bit, across cursors before, at and past capacity, and
+    /// leaves the input rings unwritten.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an NVIDIA GPU; run explicitly with --ignored"]
+    fn rows_step_matches_the_single_row_step_on_cuda() {
+        let device = Device::new_cuda(0).expect("CUDA device required");
+        let (hidden, capacity) = (300, 3);
+        let steps = [(0u64, 0u64), (2, 2), (3, 3), (7, 3)];
+        let projected = Tensor::from_vec(
+            xorshift(7, steps.len() * 3 * hidden),
+            (steps.len(), 1, 3 * hidden),
+            &device,
+        )
+        .unwrap();
+        let weight =
+            Tensor::from_vec(xorshift(8, hidden * capacity), (hidden, capacity), &device).unwrap();
+        let rings: Vec<Tensor> = (0..steps.len())
+            .map(|row| {
+                Tensor::from_vec(
+                    xorshift(20 + row as u32, capacity * hidden),
+                    (capacity, 1, hidden),
+                    &device,
+                )
+                .unwrap()
+            })
+            .collect();
+        let before: Vec<Vec<f32>> = rings
+            .iter()
+            .map(|ring| ring.flatten_all().unwrap().to_vec1().unwrap())
+            .collect();
+        let rows: Vec<ShortConvRowStep<'_>> = rings
+            .iter()
+            .zip(steps)
+            .map(|(ring, (cursor, valid))| ShortConvRowStep {
+                ring,
+                cursor,
+                valid,
+            })
+            .collect();
+        let (y, next) = lfm_shortconv_gated_ring_step_rows(&projected, &rows, &weight).unwrap();
+        let host = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (row, (cursor, valid)) in steps.into_iter().enumerate() {
+            let (expected_y, expected_next) = lfm_shortconv_gated_ring_step(
+                &projected.narrow(0, row, 1).unwrap(),
+                &rings[row],
+                &weight,
+                cursor,
+                valid,
+            )
+            .unwrap();
+            assert_eq!(
+                host(&y.narrow(0, row, 1).unwrap()),
+                host(&expected_y),
+                "y row {row}"
+            );
+            assert_eq!(host(&next[row]), host(&expected_next), "ring row {row}");
+            assert_eq!(
+                host(&rings[row]),
+                before[row],
+                "input ring row {row} was written"
+            );
+        }
     }
 
     #[test]

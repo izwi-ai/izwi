@@ -1389,7 +1389,7 @@ fn table_entries(
 }
 
 /// An F32 buffer whose every element the step's kernels write.
-fn uninit_f32(len: usize, device: &Device) -> Result<Tensor> {
+pub(super) fn uninit_f32(len: usize, device: &Device) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if let Device::Cuda(cuda) = device {
         use candle_core::backend::BackendDevice;

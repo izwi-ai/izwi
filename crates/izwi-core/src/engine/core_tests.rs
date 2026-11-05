@@ -1139,6 +1139,75 @@ async fn test_abort_requests_for_variant_only_aborts_matching_requests() {
     assert!(!calls.iter().any(|id| id == "req-b"));
 }
 
+/// During a commit a terminal release defers its device cleanup: the
+/// executor is not called while the core is held, the session is handed back,
+/// and applying the report afterwards settles it as an inline cleanup would.
+#[tokio::test]
+async fn deferred_release_cleanup_runs_outside_the_commit_and_settles_the_session() {
+    let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
+    let executor =
+        UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls.clone())));
+    let mut core =
+        EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
+    let mut request = EngineCoreRequest::tts("deferred");
+    request.id = "req-deferred".to_string();
+    request.model_variant = Some(ModelVariant::Qwen354BGguf);
+    core.add_request(request).unwrap();
+
+    core.begin_deferring_release_cleanups();
+    let aborted = core
+        .abort_requests_for_variant(ModelVariant::Qwen354BGguf)
+        .await;
+    assert_eq!(aborted, vec!["req-deferred".to_string()]);
+    let (deferred, executor) = core.take_deferred_release_cleanups();
+    assert!(
+        cleanup_calls.lock().unwrap().is_empty(),
+        "the device cleanup ran while the core was held"
+    );
+    assert_eq!(deferred.len(), 1);
+    // The same release run inline, for the state the deferred one must reach.
+    let inline_calls = Arc::new(Mutex::new(Vec::new()));
+    let mut inline = EngineCore::new_with_unified_executor(
+        EngineCoreConfig::default(),
+        UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(inline_calls.clone()))),
+    )
+    .unwrap();
+    let mut twin = EngineCoreRequest::tts("deferred");
+    twin.id = "req-deferred".to_string();
+    twin.model_variant = Some(ModelVariant::Qwen354BGguf);
+    inline.add_request(twin).unwrap();
+    inline
+        .abort_requests_for_variant(ModelVariant::Qwen354BGguf)
+        .await;
+    assert_eq!(inline_calls.lock().unwrap().len(), 1);
+    for session in deferred {
+        let report = executor.cleanup_session(&session).await;
+        core.finish_deferred_release_cleanup(&session, report);
+        assert_eq!(
+            core.scheduler
+                .pending_release_confirmation_required(&session),
+            inline
+                .scheduler
+                .pending_release_confirmation_required(&session),
+        );
+        assert_eq!(
+            core.scheduler.pending_cleanup_attempts(&session),
+            inline.scheduler.pending_cleanup_attempts(&session),
+        );
+        assert_eq!(
+            core.exact_session_cleanup_absent(&session),
+            inline.exact_session_cleanup_absent(&session),
+        );
+    }
+    assert!(cleanup_calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|id| id == "req-deferred"));
+    // Outside a commit cleanups run inline again.
+    assert!(core.take_deferred_release_cleanups().0.is_empty());
+}
+
 #[tokio::test]
 async fn stream_backpressure_deadline_preserves_delivery_provenance() {
     let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
@@ -2949,6 +3018,23 @@ fn workspace_rejection(scheduled: &ScheduledRequest, width: usize) -> ExecutorSt
     result
 }
 
+/// A refused workspace halves a session's width, and the width grows back:
+/// it doubles for each recovery interval without another refusal.
+#[test]
+fn a_workspace_width_cap_recovers_over_time() {
+    use super::{WorkspaceRowCap, WORKSPACE_CAP_RECOVERY};
+    let set_at = Instant::now();
+    let cap = WorkspaceRowCap { rows: 2, set_at };
+    assert_eq!(cap.effective(set_at), 2);
+    assert_eq!(cap.effective(set_at + WORKSPACE_CAP_RECOVERY / 2), 2);
+    assert_eq!(cap.effective(set_at + WORKSPACE_CAP_RECOVERY), 4);
+    assert_eq!(cap.effective(set_at + WORKSPACE_CAP_RECOVERY * 3), 16);
+    // A clock read before the refusal never shrinks the cap further.
+    assert_eq!(cap.effective(set_at - Duration::from_millis(5)), 2);
+    // Doublings saturate rather than overflow.
+    assert!(cap.effective(set_at + WORKSPACE_CAP_RECOVERY * 1000) >= 2 << 15);
+}
+
 #[tokio::test]
 async fn workspace_backpressure_preserves_published_stream_and_shrinks_before_retry() {
     let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
@@ -2978,7 +3064,7 @@ async fn workspace_backpressure_preserves_published_stream_and_shrinks_before_re
             "unexpected terminal: {:?}",
             committed.map(|value| value.output.error)
         );
-        assert_eq!(core.workspace_row_limits[&session], expected_cap);
+        assert_eq!(core.workspace_row_limits[&session].rows, expected_cap);
         assert_eq!(core.stream_sequence_cursors[&session], 7);
         assert!(core.incremental_stream_sessions.contains(&session));
         assert_eq!(

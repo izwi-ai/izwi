@@ -84,14 +84,7 @@ impl RuntimeAdapterRegistry {
             // A chat model runs at most its family's certified width, unless
             // the operator fixed a wider one.
             max_tensor_batch_size: if metadata.capability == CapabilityKind::Chat {
-                chat_tensor_width(
-                    self.max_chat_tensor_batch_size(),
-                    crate::catalog::certified_decode_width(
-                        metadata.model_variant.family(),
-                        backend_kind,
-                    ),
-                    self.explicit_tensor_width(),
-                )
+                self.chat_decode_width(metadata.model_variant.family(), backend_kind)
             } else {
                 self.max_tensor_batch_size()
             },
@@ -456,6 +449,22 @@ impl LoadedModelBundle {
         streaming: StreamingRequirements,
     ) -> Result<LoadedCapabilityBinding> {
         self.require_capability(capability)?.binding(streaming)
+    }
+}
+
+impl RuntimeAdapterRegistry {
+    /// The decode width a chat model of `family` loads with on `backend`:
+    /// what its stages run and its state is staged at.
+    pub(crate) fn chat_decode_width(
+        &self,
+        family: crate::catalog::ModelFamily,
+        backend: BackendKind,
+    ) -> usize {
+        chat_tensor_width(
+            self.max_chat_tensor_batch_size(),
+            crate::catalog::certified_decode_width(family, backend),
+            self.explicit_tensor_width(),
+        )
     }
 }
 

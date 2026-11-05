@@ -1902,10 +1902,7 @@ fn portable_chat_models_stage_rows_at_their_decode_width() {
         )
         .unwrap();
         draft.seal_chat_workspace(8_192).unwrap();
-        runtime
-            .model_lifecycle
-            .portable_chat_staged_rows(&draft, BackendKind::Cpu)
-            .unwrap()
+        runtime.model_lifecycle.chat_staged_rows(&draft).unwrap()
     };
     let automatic = RuntimeService::new(EngineConfig {
         backend: BackendPreference::Cpu,
@@ -1926,6 +1923,48 @@ fn portable_chat_models_stage_rows_at_their_decode_width() {
     })
     .unwrap();
     assert_eq!(staged(&explicit, ModelVariant::Lfm2512BInstructGguf), None);
+}
+
+/// On CUDA, Qwen3.6 and Qwen3.8 decode at the CUDA ceiling (EXE-F7), and the
+/// pre-load state floor prices staged rows from the same width
+/// (`chat_decode_width`) the bundle's stages run at, so the floor cannot
+/// under-count what the load allocates.
+#[test]
+fn cuda_wide_chat_families_stage_at_the_width_the_state_floor_prices() {
+    use crate::runtime::adapters::LoadedModelBundleDraft;
+    let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1)
+        .unwrap()
+        .with_chat_tensor_batch_size(crate::catalog::EXPLICIT_WIDTH_CEILING);
+    for variant in [ModelVariant::Qwen3827BFp8, ModelVariant::Qwen36Moe35BA3BFp8] {
+        let draft = LoadedModelBundleDraft::build(
+            &registry,
+            ExecutionGroupId::new(993),
+            ModelInstanceId::new(1),
+            variant,
+            BackendKind::Cuda,
+        )
+        .unwrap();
+        draft.seal_chat_workspace(8_192).unwrap();
+        let stage_width = draft
+            .execution_contracts(crate::runtime::adapters::CapabilityKind::Chat)
+            .unwrap()
+            .iter()
+            .flat_map(|contract| contract.stages.iter())
+            .map(|stage| stage.max_batch_size)
+            .max()
+            .unwrap();
+        // The CUDA ceiling (32), which is also the explicit-width ceiling.
+        assert_eq!(
+            stage_width,
+            crate::catalog::EXPLICIT_WIDTH_CEILING,
+            "{variant:?}"
+        );
+        assert_eq!(
+            registry.chat_decode_width(variant.family(), BackendKind::Cuda),
+            stage_width,
+            "{variant:?}"
+        );
+    }
 }
 
 #[test]

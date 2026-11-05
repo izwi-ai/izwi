@@ -121,6 +121,8 @@ impl RuntimeService {
         if let (Some(seqs), BatchSizePreference::Auto) = (max_num_seqs, config.max_batch_size) {
             config.max_batch_size = BatchSizePreference::fixed(seqs)?;
         }
+        // Neither the operator nor `max_num_seqs` fixed the width.
+        let automatic_tensor_width = matches!(config.max_batch_size, BatchSizePreference::Auto);
         for rows in [
             &mut config.max_scheduler_batch_size,
             &mut config.max_retained_sequences,
@@ -229,14 +231,20 @@ impl RuntimeService {
         worker_config.backend = selected_backend_kind;
         worker_config.backend_context = backend_context.clone();
         // Chat models clamp the engine width to their family's certified
-        // width; every other capability runs at the engine rows' width. An
-        // operator's explicit width applies as asked.
+        // width; every other capability runs at the engine rows' width. On
+        // CUDA an automatic chat width is the CUDA ceiling, so the families
+        // certified for wide batches decode more rows per forward than the
+        // engine rows. An operator's explicit width applies as asked.
         let adapter_registry = Arc::new(
             RuntimeAdapterRegistry::built_in_with_execution_limits(
                 non_chat_row_width,
                 worker_config.request_parallelism,
             )?
-            .with_chat_tensor_batch_size(worker_config.max_tensor_batch_size)
+            .with_chat_tensor_batch_size(crate::catalog::chat_engine_width(
+                selected_backend_kind,
+                worker_config.max_tensor_batch_size,
+                automatic_tensor_width,
+            ))
             .with_explicit_tensor_width(explicit_tensor_width),
         );
         worker_config.static_tensor_batch_variants =

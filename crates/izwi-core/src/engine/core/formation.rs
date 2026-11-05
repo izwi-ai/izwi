@@ -797,7 +797,14 @@ impl EngineCore {
             let lane = Self::batch_lane(&plan, cost);
             let (mut budget, shape_policy) = Self::batch_budget(&plan)?;
             if let Some(cap) = self.workspace_row_limits.get(&plan.session) {
-                budget.max_rows = budget.max_rows.min(*cap);
+                let rows = cap.effective(std::time::Instant::now());
+                if rows >= budget.max_rows {
+                    // Recovered to the model's width: the cap lifts.
+                    self.workspace_row_limits.remove(&plan.session);
+                    super::super::metrics::record_workspace_cap_change(false);
+                } else {
+                    budget.max_rows = rows;
+                }
             }
             let output_visibility = plan
                 .stage

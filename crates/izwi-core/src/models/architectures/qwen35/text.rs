@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
@@ -15,6 +16,7 @@ use crate::backends::state::{
 use crate::error::{Error, Result};
 use crate::kernels::cuda::gdn::{self, GdnDecodeSpec};
 use crate::kernels::cuda::rope;
+use crate::kernels::cuda::{try_chunked_deltanet_recurrence, verify_chunked_deltanet};
 use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
     try_fused_silu_mul, try_qwen35_causal_conv_sequence, try_tiled_deltanet_recurrence,
@@ -43,8 +45,21 @@ use super::telemetry::Qwen35Telemetry;
 /// Environment switch that forces the Candle op chain for DeltaNet decode.
 const FUSED_DECODE_ENV: &str = "IZWI_QWEN35_FUSED_DECODE";
 
+/// Environment switch that keeps DeltaNet prefill on the sequential kernel.
+const CHUNKED_GDN_ENV: &str = "IZWI_QWEN35_CHUNKED_GDN";
+
+/// Environment switch that keeps batched DeltaNet decode on one launch pair
+/// per row.
+const BATCHED_GDN_ENV: &str = "IZWI_QWEN35_BATCHED_GDN";
+
+/// Shortest prefill span the chunked DeltaNet kernels take: below one
+/// 64-token chunk's worth of work the sequential kernel is as fast.
+const CHUNKED_GDN_MIN_TOKENS: usize = 32;
+
 #[path = "decode_graph.rs"]
 mod decode_graph;
+#[path = "kernel_timings.rs"]
+mod kernel_timings;
 
 pub struct Qwen35TextModel {
     device: Device,
@@ -61,6 +76,10 @@ pub struct Qwen35TextModel {
     /// Whole-step CUDA graph decode, when resolved (opt-in).
     decode_graph: Option<decode_graph::Qwen35DecodeGraph>,
     decode_graph_path: Qwen35FastPath,
+    /// Load-time device timings of the decode kernels (`kernel_timings.rs`).
+    load_timings: serde_json::Value,
+    /// Chunked DeltaNet prefill, resolved once for every DeltaNet layer.
+    gdn_prefill_path: Qwen35FastPath,
 }
 
 /// M-RoPE cos/sin for the token positions of one forward, shaped
@@ -148,11 +167,7 @@ impl Qwen35TextRuntimeState {
                 Error::InferenceError("Qwen3.5 convolution component is absent".into())
             })?;
             *recurrent_state = Some(recurrent_tensor.clone());
-            let history_len = convolution_tensor.dim(0)?;
-            let slots = (0..history_len)
-                .map(|index| convolution_tensor.i(index).map_err(Error::from))
-                .collect::<Result<Vec<_>>>()?;
-            *conv_state = Some(ConvRingState { slots, next_idx: 0 });
+            *conv_state = Some(ConvRingState::from_packed(convolution_tensor.clone())?);
         }
         if recurrent_components.next().is_some() || convolution_components.next().is_some() {
             return Err(Error::InferenceError(
@@ -163,7 +178,8 @@ impl Qwen35TextRuntimeState {
     }
 
     /// Stage the recurrent and convolution state into `transaction` and
-    /// return the number of convolution rings stacked for it.
+    /// return the number of convolution rings stacked for it (a packed ring
+    /// is handed over whole).
     pub(crate) fn stage_tensor_domains(
         &mut self,
         arena: &TensorStateArena,
@@ -180,6 +196,7 @@ impl Qwen35TextRuntimeState {
             .unwrap_or(0);
         let mut recurrent = Vec::new();
         let mut convolution = Vec::new();
+        let mut conv_ring_stacks = 0;
         for layer in &self.layers {
             let Qwen35LayerRuntimeState::Linear {
                 conv_state,
@@ -199,10 +216,10 @@ impl Qwen35TextRuntimeState {
                     "Qwen3.5 convolution ring is invalid at the physical boundary".into(),
                 ));
             }
-            let ordered = (0..ring.slots.len())
-                .map(|offset| &ring.slots[(ring.next_idx + offset) % ring.slots.len()])
-                .collect::<Vec<_>>();
-            let ring_tensor = Tensor::stack(&ordered, 0)?;
+            if ring.packed.is_none() {
+                conv_ring_stacks += 1;
+            }
+            let ring_tensor = ring.history()?;
             let component = u32::try_from(recurrent.len() + 1)
                 .map_err(|_| Error::InvalidInput("Qwen3.5 state component overflow".into()))?;
             recurrent.push(StateComponentValue {
@@ -214,7 +231,6 @@ impl Qwen35TextRuntimeState {
                 tensor: Some(ring_tensor),
             });
         }
-        let conv_ring_stacks = convolution.len();
         arena.stage_replace(
             transaction,
             recurrent_domain_v2(),
@@ -258,9 +274,34 @@ fn convolution_domain_v2() -> StateDomainId {
 struct ConvRingState {
     slots: Vec<Tensor>,
     next_idx: usize,
+    /// The whole history as one `[slots, conv_dim, 1]` tensor whose rows are
+    /// `slots` in order (`next_idx == 0`), when it is held that way. The fused
+    /// conv step writes it in one launch and restore reads it whole, so
+    /// staging hands it over without a stack. Any slot mutation clears it.
+    packed: Option<Tensor>,
 }
 
 impl ConvRingState {
+    fn new(slots: Vec<Tensor>, next_idx: usize) -> Self {
+        Self {
+            slots,
+            next_idx,
+            packed: None,
+        }
+    }
+
+    /// A ring over `history` `[slots, conv_dim, 1]`, oldest first.
+    fn from_packed(history: Tensor) -> Result<Self> {
+        let slots = (0..history.dim(0)?)
+            .map(|index| history.i(index).map_err(Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            slots,
+            next_idx: 0,
+            packed: Some(history),
+        })
+    }
+
     /// The history slots oldest first.
     fn ordered_slots(&self) -> Vec<Tensor> {
         (0..self.slots.len())
@@ -268,19 +309,27 @@ impl ConvRingState {
             .collect()
     }
 
-    /// The history oldest first as one `[slots, ...]` tensor (self-checks).
+    /// The history oldest first as one `[slots, conv_dim, 1]` tensor: the
+    /// packed history when the ring holds one, else a stack of the slots.
     fn history(&self) -> Result<Tensor> {
-        Tensor::stack(&self.ordered_slots(), 0).map_err(Error::from)
+        match &self.packed {
+            Some(history) => Ok(history.clone()),
+            None => Tensor::stack(&self.ordered_slots(), 0).map_err(Error::from),
+        }
     }
 
     /// A ring over a `[slots, conv_dim]` history whose first row is the
     /// oldest, as the fused conv decode returns it. Slots are `(conv_dim, 1)`
     /// views into that one tensor.
     fn from_history(history: &Tensor, conv_dim: usize) -> Result<Self> {
-        let slots = (0..history.dim(0)?)
-            .map(|index| history.i(index)?.reshape((conv_dim, 1)))
-            .collect::<candle_core::Result<Vec<_>>>()?;
-        Ok(Self { slots, next_idx: 0 })
+        Self::from_packed(history.reshape((history.dim(0)?, conv_dim, 1))?)
+    }
+
+    /// Replace the history with `slots`, oldest first.
+    fn replace_slots(&mut self, slots: Vec<Tensor>) {
+        self.slots = slots;
+        self.next_idx = 0;
+        self.packed = None;
     }
 
     /// Move every logical history slot into independent fixed-history storage.
@@ -298,6 +347,7 @@ impl ConvRingState {
             .iter()
             .map(deep_copy_tensor_storage)
             .collect::<candle_core::Result<Vec<_>>>()?;
+        self.packed = None;
         Ok(())
     }
 
@@ -316,6 +366,7 @@ impl ConvRingState {
         }
         self.slots[self.next_idx] = current.clone();
         self.next_idx = (self.next_idx + 1) % self.slots.len();
+        self.packed = None;
         Ok(())
     }
 }
@@ -390,10 +441,23 @@ struct Qwen35LinearAttention {
     kernel_size: usize,
     tiled_recurrence_enabled: bool,
     tiled_recurrence_tile_size_override: Option<usize>,
+    /// Prefill spans of [`CHUNKED_GDN_MIN_TOKENS`] or more take the chunked
+    /// recurrence, set only after its load-time self-check passes (see
+    /// [`Qwen35TextModel::resolve_chunked_gdn_prefill`]).
+    chunked_recurrence: bool,
+    /// Prefill spans the chunked kernels ran, and spans they declined (the
+    /// sequential kernel ran instead), for the diagnostics.
+    chunked_spans: AtomicU64,
+    chunked_fallbacks: AtomicU64,
     /// Fused single-token decode layout, set only after a load-time
     /// self-check passes (see [`Qwen35LinearAttention::resolve_fused_decode`]).
     fused_decode: Option<GdnDecodeSpec>,
     fused_decode_path: Qwen35FastPath,
+    /// Batched decode rows run the fused kernels in one launch pair for all
+    /// rows (CUDA), set only after a self-check against the per-row launches
+    /// (see [`Qwen35LinearAttention::resolve_batched_decode`]).
+    batched_decode: bool,
+    batched_decode_path: Qwen35FastPath,
 }
 
 struct Qwen35GatedRmsNorm {
@@ -536,6 +600,8 @@ impl Qwen35TextModel {
             max_context_tokens: cfg.context_length,
             decode_graph: None,
             decode_graph_path: Qwen35FastPath::legacy("unresolved"),
+            load_timings: serde_json::Value::Null,
+            gdn_prefill_path: Qwen35FastPath::legacy("unresolved"),
         })
     }
 
@@ -577,9 +643,66 @@ impl Qwen35TextModel {
                     switches.fused_decode_off,
                     allow_cpu,
                 );
+                mixer.resolve_batched_decode(hidden, &self.device);
             }
         }
+        self.resolve_chunked_gdn_prefill();
         self.resolve_decode_graph(switches.graphs_off, allow_cpu);
+    }
+
+    /// Run DeltaNet prefill spans through the chunked recurrence kernels after
+    /// they match the sequential kernel on this device at the model's head
+    /// geometry. `IZWI_QWEN35_CHUNKED_GDN=legacy` keeps the sequential kernel.
+    fn resolve_chunked_gdn_prefill(&mut self) {
+        let geometry = self.layers.iter().find_map(|layer| match &layer.mixer {
+            Qwen35Mixer::Linear(linear) => {
+                Some((linear.num_v_heads, linear.head_k_dim, linear.head_v_dim))
+            }
+            Qwen35Mixer::Full(_) => None,
+        });
+        self.gdn_prefill_path = if legacy_requested(CHUNKED_GDN_ENV) {
+            Qwen35FastPath::legacy(format!("{CHUNKED_GDN_ENV}=legacy"))
+        } else if !self.device.is_cuda() {
+            Qwen35FastPath::legacy("chunked DeltaNet prefill runs on CUDA only")
+        } else {
+            match geometry {
+                None => Qwen35FastPath::legacy("the model has no DeltaNet layer"),
+                Some((heads, key_dim, value_dim)) => {
+                    match verify_chunked_deltanet(&self.device, heads, key_dim, value_dim) {
+                        Ok(()) => Qwen35FastPath::Fused,
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "Qwen3.5 chunked DeltaNet prefill self-check failed; keeping the sequential kernel"
+                            );
+                            Qwen35FastPath::legacy(format!("self-check failed: {error}"))
+                        }
+                    }
+                }
+            }
+        };
+        let chunked = self.gdn_prefill_path == Qwen35FastPath::Fused;
+        for layer in &mut self.layers {
+            if let Qwen35Mixer::Linear(linear) = &mut layer.mixer {
+                linear.chunked_recurrence = chunked;
+            }
+        }
+    }
+
+    /// Chunked DeltaNet prefill resolution, with the layer spans the chunked
+    /// kernels ran and declined, for the admin diagnostics.
+    pub(crate) fn gdn_prefill_summary(&self) -> serde_json::Value {
+        let (mut spans, mut fallbacks) = (0, 0);
+        for layer in &self.layers {
+            if let Qwen35Mixer::Linear(linear) = &layer.mixer {
+                spans += linear.chunked_spans.load(Relaxed);
+                fallbacks += linear.chunked_fallbacks.load(Relaxed);
+            }
+        }
+        let mut summary = summarize([&self.gdn_prefill_path]);
+        summary["chunked_layer_spans"] = spans.into();
+        summary["chunked_layer_fallbacks"] = fallbacks.into();
+        summary
     }
 
     /// Resolve whole-step CUDA graph decode after the fused paths it needs.
@@ -617,6 +740,19 @@ impl Qwen35TextModel {
         );
         self.decode_graph = graph;
         self.decode_graph_path = path;
+    }
+
+    /// Measure the decode kernels' device time once, after the fast paths
+    /// resolved (CUDA; see `kernel_timings.rs`).
+    pub(crate) fn record_load_timings(&mut self) {
+        self.load_timings = self.measure_load_timings();
+        if self.load_timings["status"] == "measured" {
+            tracing::info!(timings = %self.load_timings, "Qwen3.5 load-time kernel timings");
+        }
+    }
+
+    pub(crate) fn load_timings(&self) -> &serde_json::Value {
+        &self.load_timings
     }
 
     /// Graph decode resolution and runtime state, for the admin diagnostics.
@@ -729,6 +865,15 @@ impl Qwen35TextModel {
         }))
     }
 
+    /// One-launch batched DeltaNet decode resolution, for the admin
+    /// diagnostics.
+    pub(crate) fn gdn_batched_decode_summary(&self) -> serde_json::Value {
+        summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
+            Qwen35Mixer::Linear(mixer) => Some(&mixer.batched_decode_path),
+            Qwen35Mixer::Full(_) => None,
+        }))
+    }
+
     /// The RoPE table for `positions`, or `None` when attention has no
     /// rotary dimensions. Built once per forward on the host (one upload).
     fn rope_table(
@@ -813,6 +958,7 @@ impl Qwen35TextModel {
         states: &mut [&mut Qwen35TextRuntimeState],
         caches: &mut [&mut PhysicalPagedKvCache],
     ) -> Result<Tensor> {
+        let started = std::time::Instant::now();
         let batch_size = token_ids.len();
         if batch_size == 0
             || position_ids.len() != batch_size
@@ -877,48 +1023,57 @@ impl Qwen35TextModel {
         let mut completions =
             KvWriteCompletionCollector::new(first.arena().config(), lowered.logical_slots())?;
         let execution = (|| -> Result<Tensor> {
-            if let (1, Some(graph)) = (batch_size, &self.decode_graph) {
-                let cache = &*caches[0];
+            let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
+            if let Some(graph) = self
+                .decode_graph
+                .as_ref()
+                .filter(|_| batch_size <= decode_graph::MAX_GRAPH_ROWS)
+            {
                 // The graph's warm check: the standard decode on a copy of
-                // the row state, its writes collected and sealed apart.
-                let mut reference_state = states[0].clone();
+                // the rows' state, its writes collected and sealed apart.
+                let mut reference_states = states
+                    .iter()
+                    .map(|state| (**state).clone())
+                    .collect::<Vec<_>>();
                 let mut reference = || -> Result<Tensor> {
                     let mut collector = KvWriteCompletionCollector::new(
                         first.arena().config(),
                         lowered.logical_slots(),
                     )?;
+                    let mut reference_refs = reference_states.iter_mut().collect::<Vec<_>>();
                     let logits = self.standard_decode_logits(
                         token_ids,
                         position_ids,
-                        &mut [&mut reference_state],
-                        &[cache],
+                        &mut reference_refs,
+                        &cache_refs,
                         first_full,
                         lowered.as_ref(),
                         &metadata,
                         &mut collector,
                         sparse_layers.len(),
+                        true,
                     );
                     let sealed = collector.seal();
                     let logits = logits?;
                     sealed?;
                     Ok(logits)
                 };
-                if let Some(logits) = graph.forward(
-                    self,
-                    token_ids[0],
-                    position_ids[0],
-                    slots[0],
-                    states[0],
-                    cache,
-                    lowered.as_ref(),
-                    &metadata,
-                    &mut completions,
-                    &mut reference,
-                )? {
+                let rows = decode_graph::StepRows {
+                    tokens: token_ids,
+                    positions: position_ids,
+                    slots: &slots,
+                    caches: &cache_refs,
+                    slot_map: lowered.as_ref(),
+                    metadata: &metadata,
+                };
+                let setup = started.elapsed();
+                if let Some(logits) =
+                    graph.forward(self, &rows, states, &mut completions, &mut reference)?
+                {
+                    graph.record_setup(setup);
                     return Ok(logits);
                 }
             }
-            let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
             self.standard_decode_logits(
                 token_ids,
                 position_ids,
@@ -929,6 +1084,7 @@ impl Qwen35TextModel {
                 &metadata,
                 &mut completions,
                 sparse_layers.len(),
+                false,
             )
         })();
         let logits = match execution {
@@ -942,7 +1098,13 @@ impl Qwen35TextModel {
                 }
             }
         };
+        // Sealing waits for the KV writes of the last attention layer, the
+        // first wait on the device: what precedes it is enqueue time.
+        let enqueued = std::time::Instant::now();
+        self.telemetry.record_batched_enqueue(enqueued - started);
         let completion = Arc::new(completions.seal()?);
+        self.telemetry
+            .record_batched_device_wait(enqueued.elapsed());
         for (row, cache) in caches.iter_mut().enumerate() {
             cache.commit_shared_completion(start_positions[row], 1, completion.clone())?;
         }
@@ -951,7 +1113,10 @@ impl Qwen35TextModel {
 
     /// The standard decode for `token_ids` (one per row): embedding, every
     /// layer through the arena's attention, the final norm and the LM head.
-    /// Returns logits `[batch, 1, vocab]`.
+    /// Returns logits `[batch, 1, vocab]`. `row_invariant` takes the arena's
+    /// batch-invariant attention, which partitions each row's context by its
+    /// own length as the decode graph's attention does (the graph's warm
+    /// check compares against it).
     #[allow(clippy::too_many_arguments)]
     fn standard_decode_logits(
         &self,
@@ -964,6 +1129,7 @@ impl Qwen35TextModel {
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
         sparse_layers: usize,
+        row_invariant: bool,
     ) -> Result<Tensor> {
         let batch_size = token_ids.len();
         let input = Tensor::from_slice(token_ids, (batch_size, 1), &self.device)?;
@@ -988,6 +1154,7 @@ impl Qwen35TextModel {
                 metadata,
                 completions,
                 &mut physical_layer,
+                row_invariant,
             )?;
             validate_qwen35_finite_tensor(
                 &hidden,
@@ -1243,7 +1410,7 @@ impl Qwen35Layer {
                 for _ in 0..history_len {
                     slots.push(owned_zero_tensor(&[mixer.conv_dim, 1], DType::F32, device)?);
                 }
-                *conv_state = Some(ConvRingState { slots, next_idx: 0 });
+                *conv_state = Some(ConvRingState::new(slots, 0));
             }
             if recurrent_state.is_none() {
                 *recurrent_state = Some(owned_zero_tensor(
@@ -1310,6 +1477,7 @@ impl Qwen35Layer {
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
         physical_layer: &mut usize,
+        row_invariant: bool,
     ) -> Result<Tensor> {
         let batch_size = hidden_states.dim(0)?;
         if hidden_states.dim(1)? != 1
@@ -1336,6 +1504,7 @@ impl Qwen35Layer {
                     metadata,
                     completions,
                     *physical_layer,
+                    row_invariant,
                 )?;
                 *physical_layer = physical_layer.checked_add(1).ok_or_else(|| {
                     Error::InvalidInput("Qwen3.5 physical layer ordinal overflow".into())
@@ -1514,6 +1683,7 @@ impl Qwen35FullAttention {
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
         physical_layer: usize,
+        row_invariant: bool,
     ) -> Result<Tensor> {
         let batch_size = hidden_states.dim(0)?;
         if hidden_states.dim(1)? != 1
@@ -1552,6 +1722,7 @@ impl Qwen35FullAttention {
             metadata,
             completions,
             physical_layer,
+            row_invariant,
         )?;
         self.decode_output(&attended, &q_out)
     }
@@ -1572,6 +1743,7 @@ impl Qwen35FullAttention {
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
         physical_layer: usize,
+        row_invariant: bool,
     ) -> Result<Tensor> {
         let batch_size = q_out.dim(0)?;
         let first = caches[0];
@@ -1581,39 +1753,22 @@ impl Qwen35FullAttention {
         let value_states = v_out.reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
         let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
         let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
-        let mut queries = Vec::with_capacity(batch_size);
-        let mut keys = Vec::with_capacity(batch_size);
-        let mut values = Vec::with_capacity(batch_size);
-        for row in 0..batch_size {
-            let q_row = query_states.i(row)?.unsqueeze(0)?;
-            let k_row = key_states.i(row)?.unsqueeze(0)?;
-            let row_rope = rope
-                .map(|table| -> Result<(Tensor, Tensor)> {
-                    Ok((
-                        table.cos.narrow(0, row, 1)?.contiguous()?,
-                        table.sin.narrow(0, row, 1)?.contiguous()?,
-                    ))
-                })
-                .transpose()?;
-            let (q_row, k_row) = self.apply_rope(
-                &q_row,
-                &k_row,
-                row_rope.as_ref().map(|(cos, sin)| (cos, sin)),
-            )?;
-            queries.push(q_row.reshape((self.num_heads, self.head_dim))?);
-            keys.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
-            values.push(
-                value_states
-                    .i(row)?
-                    .reshape((self.num_kv_heads, self.head_dim))?,
-            );
-        }
-        let query_refs = queries.iter().collect::<Vec<_>>();
-        let key_refs = keys.iter().collect::<Vec<_>>();
-        let value_refs = values.iter().collect::<Vec<_>>();
-        let queries = Tensor::stack(&query_refs, 0)?.contiguous()?;
-        let keys = Tensor::stack(&key_refs, 0)?.contiguous()?;
-        let values = Tensor::stack(&value_refs, 0)?.contiguous()?;
+        // One rotation for every row: the table is `(batch, 1, rope_dim / 2)`,
+        // so each row keeps its own position.
+        let (query_states, key_states) = self.apply_rope(
+            &query_states,
+            &key_states,
+            rope.map(|table| (&table.cos, &table.sin)),
+        )?;
+        let queries = query_states
+            .reshape((batch_size, self.num_heads, self.head_dim))?
+            .contiguous()?;
+        let keys = key_states
+            .reshape((batch_size, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let values = value_states
+            .reshape((batch_size, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
         let storage_dtype = first.arena().config().dtype;
         let output_dtype = queries.dtype();
         let queries = queries.to_dtype(storage_dtype)?;
@@ -1629,15 +1784,17 @@ impl Qwen35FullAttention {
             },
         )?;
         let (output, completion) = submit_ordered_after_write(completion, || {
-            first.arena().paged_decode(
-                binding,
-                PagedKvDecodeArgs {
-                    queries: &queries,
-                    batch: metadata,
-                    softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
-                    softcap: None,
-                },
-            )
+            let args = PagedKvDecodeArgs {
+                queries: &queries,
+                batch: metadata,
+                softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
+                softcap: None,
+            };
+            if row_invariant {
+                first.arena().paged_decode_row_invariant(binding, args)
+            } else {
+                first.arena().paged_decode(binding, args)
+            }
         })?;
         completions.collect(completion)?;
         output
@@ -1672,7 +1829,8 @@ impl Qwen35FullAttention {
             return Ok((query_states.clone(), key_states.clone()));
         };
         let tokens = query_states.dim(1)?;
-        if cos.dims() != [query_states.dim(0)?, tokens, self.rope_dim / 2] {
+        let rows = query_states.dim(0)?;
+        if cos.dims() != [rows, tokens, self.rope_dim / 2] {
             return Err(Error::InvalidInput(format!(
                 "Qwen3.5 rotary table {:?} does not match queries {:?}",
                 cos.dims(),
@@ -1685,13 +1843,13 @@ impl Qwen35FullAttention {
         let (query_rot, key_rot) = if self.should_try_rope_kernel(query_states.dtype()) {
             match try_apply_rope_thd(&query_rot, &key_rot, cos, sin)? {
                 Some((query_rot, key_rot)) => {
-                    for _ in 0..tokens {
+                    for _ in 0..rows * tokens {
                         record_rope_kernel();
                     }
                     (query_rot, key_rot)
                 }
                 None => {
-                    for _ in 0..tokens {
+                    for _ in 0..rows * tokens {
                         record_rope_manual();
                     }
                     (
@@ -1701,7 +1859,7 @@ impl Qwen35FullAttention {
                 }
             }
         } else {
-            for _ in 0..tokens {
+            for _ in 0..rows * tokens {
                 record_rope_manual();
             }
             (
@@ -1850,8 +2008,13 @@ impl Qwen35LinearAttention {
             kernel_size: cfg.ssm_conv_kernel,
             tiled_recurrence_enabled: qwen35_tiled_recurrence_enabled(),
             tiled_recurrence_tile_size_override: qwen35_tiled_recurrence_tile_size_override(),
+            chunked_recurrence: false,
+            chunked_spans: AtomicU64::new(0),
+            chunked_fallbacks: AtomicU64::new(0),
             fused_decode: None,
             fused_decode_path: Qwen35FastPath::legacy("unresolved"),
+            batched_decode: false,
+            batched_decode_path: Qwen35FastPath::legacy("unresolved"),
         })
     }
 
@@ -1930,10 +2093,7 @@ impl Qwen35LinearAttention {
         };
         let state_len = self.num_v_heads * self.head_k_dim * self.head_v_dim;
         let initial = Qwen35LayerRuntimeState::Linear {
-            conv_state: Some(ConvRingState {
-                slots: vec![slot(2)?, slot(3)?, slot(4)?],
-                next_idx: 1,
-            }),
+            conv_state: Some(ConvRingState::new(vec![slot(2)?, slot(3)?, slot(4)?], 1)),
             recurrent_state: Some(Tensor::from_vec(
                 xorshift_values(state_len, 5, 0.3),
                 (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
@@ -1983,6 +2143,147 @@ impl Qwen35LinearAttention {
             1e-6,
         )?;
         Ok(())
+    }
+
+    /// Resolve one-launch batched decode after the fused decode: on CUDA the
+    /// multi-row kernels must reproduce the per-row launches bit for bit on
+    /// this layer's weights. `IZWI_QWEN35_BATCHED_GDN=legacy` keeps one launch
+    /// pair per row.
+    fn resolve_batched_decode(&mut self, hidden: usize, device: &Device) {
+        self.batched_decode = false;
+        self.batched_decode_path = if legacy_requested(BATCHED_GDN_ENV) {
+            Qwen35FastPath::legacy(format!("{BATCHED_GDN_ENV}=legacy"))
+        } else if !device.is_cuda() {
+            Qwen35FastPath::legacy("batched DeltaNet decode runs on CUDA only")
+        } else if let Some(spec) = self.fused_decode {
+            match self.batched_decode_self_check(&spec, hidden, device) {
+                Ok(()) => {
+                    self.batched_decode = true;
+                    Qwen35FastPath::Fused
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Qwen3.5 batched DeltaNet decode self-check failed; launching per row"
+                    );
+                    Qwen35FastPath::legacy(format!("self-check failed: {error}"))
+                }
+            }
+        } else {
+            Qwen35FastPath::legacy("batched DeltaNet decode needs the fused decode")
+        };
+    }
+
+    /// Three synthetic rows through the per-row fused launches and the
+    /// multi-row kernels from identical states: a ring at each cursor, one
+    /// packed ring, and two rows reading one recurrent state (a fork). The
+    /// outputs, states and histories must be identical.
+    #[cfg(feature = "cuda")]
+    fn batched_decode_self_check(
+        &self,
+        spec: &GdnDecodeSpec,
+        hidden: usize,
+        device: &Device,
+    ) -> Result<()> {
+        const ROWS: usize = 3;
+        let host = |tensor: &Tensor| -> Result<Vec<f32>> {
+            Ok(tensor
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?)
+        };
+        let exact = |name: &str, actual: &Tensor, expected: &Tensor| -> Result<()> {
+            if host(actual)? == host(expected)? {
+                Ok(())
+            } else {
+                Err(Error::InferenceError(format!(
+                    "batched DeltaNet {name} differs from the per-row launches"
+                )))
+            }
+        };
+        let conv_dim = self.conv_dim;
+        let slot = |seed: u64| -> Result<Tensor> {
+            Ok(Tensor::from_vec(
+                xorshift_values(conv_dim, seed, 1.0),
+                (conv_dim, 1),
+                device,
+            )?)
+        };
+        let state_shape = (1, self.num_v_heads, self.head_k_dim, self.head_v_dim);
+        let state_len = self.num_v_heads * self.head_k_dim * self.head_v_dim;
+        let shared = Tensor::from_vec(xorshift_values(state_len, 31, 0.3), state_shape, device)?;
+        let own = Tensor::from_vec(xorshift_values(state_len, 32, 0.3), state_shape, device)?;
+        let packed = Tensor::from_vec(
+            xorshift_values(3 * conv_dim, 33, 1.0),
+            (3, conv_dim),
+            device,
+        )?;
+        let initial = vec![
+            Qwen35LayerRuntimeState::Linear {
+                conv_state: Some(ConvRingState::new(vec![slot(22)?, slot(23)?, slot(24)?], 0)),
+                recurrent_state: Some(shared.clone()),
+            },
+            Qwen35LayerRuntimeState::Linear {
+                conv_state: Some(ConvRingState::new(vec![slot(25)?, slot(26)?, slot(27)?], 2)),
+                recurrent_state: Some(own),
+            },
+            Qwen35LayerRuntimeState::Linear {
+                conv_state: Some(ConvRingState::from_history(&packed, conv_dim)?),
+                recurrent_state: Some(shared),
+            },
+        ];
+        let x = Tensor::from_vec(
+            xorshift_values(ROWS * hidden, 21, 1.5),
+            (ROWS, 1, hidden),
+            device,
+        )?;
+        let mut per_row = initial.clone();
+        let mut batched = initial;
+        let expected = {
+            let mut rows = per_row.iter_mut().collect::<Vec<_>>();
+            self.forward_decode_batch_fused(spec, &x, &mut rows)?
+        };
+        let actual = {
+            let mut rows = batched.iter_mut().collect::<Vec<_>>();
+            self.forward_decode_batch_rows(spec, &x, &mut rows)?
+        };
+        exact("output", &actual, &expected)?;
+        for (batched, per_row) in batched.iter().zip(&per_row) {
+            let (
+                Qwen35LayerRuntimeState::Linear {
+                    conv_state: Some(batched_ring),
+                    recurrent_state: Some(batched_recurrent),
+                },
+                Qwen35LayerRuntimeState::Linear {
+                    conv_state: Some(per_row_ring),
+                    recurrent_state: Some(per_row_recurrent),
+                },
+            ) = (batched, per_row)
+            else {
+                return Err(Error::InferenceError(
+                    "batched DeltaNet self-check lost a row's state".into(),
+                ));
+            };
+            exact("recurrent state", batched_recurrent, per_row_recurrent)?;
+            exact(
+                "conv history",
+                &batched_ring.history()?,
+                &per_row_ring.history()?,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn batched_decode_self_check(
+        &self,
+        _spec: &GdnDecodeSpec,
+        _hidden: usize,
+        _device: &Device,
+    ) -> Result<()> {
+        Err(Error::InferenceError(
+            "batched DeltaNet decode needs a CUDA build".into(),
+        ))
     }
 
     /// Whether a single-token decode can take the fused kernels with this
@@ -2194,6 +2495,10 @@ impl Qwen35LinearAttention {
                 .iter()
                 .all(|state| Self::fused_decode_accepts(hidden_states, state))
         }) {
+            #[cfg(feature = "cuda")]
+            if self.batched_decode {
+                return self.forward_decode_batch_rows(spec, hidden_states, states);
+            }
             return self.forward_decode_batch_fused(spec, hidden_states, states);
         }
         let [mixed_qkv, z, beta_raw, alpha] = forward_shared(
@@ -2324,6 +2629,106 @@ impl Qwen35LinearAttention {
         self.out_proj.forward(&output)
     }
 
+    /// Batched decode through the multi-row kernels: one conv launch and one
+    /// recurrence launch for every row, reading each row's state through a
+    /// device table. Each row writes a fresh slab of its own (next state,
+    /// then next history), so a published row state never shares storage
+    /// with another row's; the old states are left untouched. The output
+    /// goes straight to the out-projection, with no per-row stack.
+    #[cfg(feature = "cuda")]
+    fn forward_decode_batch_rows(
+        &self,
+        spec: &GdnDecodeSpec,
+        hidden_states: &Tensor,
+        states: &mut [&mut Qwen35LayerRuntimeState],
+    ) -> Result<Tensor> {
+        use crate::kernels::cuda::segment_graph::DeviceTable;
+
+        let batch_size = hidden_states.dim(0)?;
+        let [mixed_qkv, z, beta_raw, alpha] = forward_shared(
+            hidden_states,
+            [
+                &self.qkv_proj,
+                &self.gate_proj,
+                &self.beta_proj,
+                &self.alpha_proj,
+            ],
+        )?;
+        let device = hidden_states.device();
+        let state_shape = (1, self.num_v_heads, self.head_k_dim, self.head_v_dim);
+        let state_len = self.num_v_heads * self.head_k_dim * self.head_v_dim;
+        let history_len = (gdn::CONV_TAPS - 1) * self.conv_dim;
+        let mut entries = Vec::with_capacity(batch_size * gdn::TABLE_ENTRIES);
+        let mut outputs = Vec::with_capacity(batch_size);
+        let mut zeros = None;
+        for state in states.iter() {
+            let Qwen35LayerRuntimeState::Linear {
+                conv_state: Some(ring),
+                recurrent_state,
+            } = &**state
+            else {
+                return Err(Error::InferenceError(
+                    "Qwen3.5 batched DeltaNet decode needs an initialized linear-attention state"
+                        .into(),
+                ));
+            };
+            let history = ring.ordered_slots();
+            let previous = match recurrent_state {
+                Some(previous) => previous.clone(),
+                None => match &zeros {
+                    Some(zeros) => Tensor::clone(zeros),
+                    None => {
+                        let fresh = Tensor::zeros(state_shape, DType::F32, device)?;
+                        zeros = Some(fresh.clone());
+                        fresh
+                    }
+                },
+            };
+            let slab = decode_graph::uninit_f32(state_len + history_len, device)?;
+            let state_out = slab.narrow(0, 0, state_len)?.reshape(state_shape)?;
+            let history_out = slab
+                .narrow(0, state_len, history_len)?
+                .reshape((gdn::CONV_TAPS - 1, self.conv_dim))?;
+            entries.extend(gdn::row_entries(
+                [&history[0], &history[1], &history[2]],
+                &history_out,
+                &previous,
+                &state_out,
+                spec,
+            )?);
+            // The inputs stay referenced until both launches are queued.
+            outputs.push((history_out, state_out, history, previous));
+        }
+        let mut table = DeviceTable::new(device, entries.len())?;
+        table.write(0, &entries)?;
+        let value_width = self.num_v_heads * self.head_v_dim;
+        let y = gdn::decode_rows(
+            &mixed_qkv.reshape((batch_size, self.conv_dim))?,
+            &self.conv_kernel,
+            &z.reshape((batch_size, value_width))?,
+            &beta_raw.reshape((batch_size, self.num_v_heads))?,
+            &alpha.reshape((batch_size, self.num_v_heads))?,
+            &self.dt_bias,
+            &self.a,
+            &self.norm.weight,
+            &table,
+            batch_size,
+            spec,
+        )?;
+        for (state, (history_out, state_out, _, _)) in states.iter_mut().zip(outputs) {
+            if let Qwen35LayerRuntimeState::Linear {
+                conv_state,
+                recurrent_state,
+            } = &mut **state
+            {
+                *conv_state = Some(ConvRingState::from_history(&history_out, self.conv_dim)?);
+                *recurrent_state = Some(state_out);
+            }
+        }
+        self.out_proj
+            .forward(&y.reshape((batch_size, 1, value_width))?)
+    }
+
     fn forward_sequence(
         &self,
         hidden_states: &Tensor,
@@ -2404,7 +2809,8 @@ impl Qwen35LinearAttention {
         let g = g.reshape((1, seq_len, self.num_v_heads))?;
         let tile_size =
             qwen35_tiled_recurrence_tile_size(seq_len, self.tiled_recurrence_tile_size_override);
-        let fused_sequence = if self.tiled_recurrence_enabled {
+        let chunked_span = self.chunked_recurrence && seq_len >= CHUNKED_GDN_MIN_TOKENS;
+        let fused_sequence = if self.tiled_recurrence_enabled && !chunked_span {
             try_tiled_deltanet_recurrence(
                 &query,
                 &key,
@@ -2432,7 +2838,28 @@ impl Qwen35LinearAttention {
                     repeat_head_states_seq(&key, repeats)?,
                 )
             };
-            if self.tiled_recurrence_enabled {
+            let chunked = if chunked_span {
+                let chunked = try_chunked_deltanet_recurrence(
+                    &query,
+                    &key,
+                    &value,
+                    &g,
+                    &beta,
+                    &current_state,
+                );
+                let counter = if chunked.is_some() {
+                    &self.chunked_spans
+                } else {
+                    &self.chunked_fallbacks
+                };
+                counter.fetch_add(1, Relaxed);
+                chunked
+            } else {
+                None
+            };
+            if let Some(chunked) = chunked {
+                chunked
+            } else if self.tiled_recurrence_enabled {
                 if let Some(fused_sequence) = try_tiled_deltanet_recurrence(
                     &query,
                     &key,
@@ -2492,10 +2919,11 @@ impl Qwen35LinearAttention {
                 try_qwen35_causal_conv_sequence(mixed_qkv, &self.conv_kernel, &history)
             {
                 let final_history = deep_copy_tensor_storage(&final_history)?;
-                buffer.slots = (0..history_len)
-                    .map(|idx| final_history.narrow(1, idx, 1))
-                    .collect::<candle_core::Result<Vec<_>>>()?;
-                buffer.next_idx = 0;
+                buffer.replace_slots(
+                    (0..history_len)
+                        .map(|idx| final_history.narrow(1, idx, 1))
+                        .collect::<candle_core::Result<Vec<_>>>()?,
+                );
                 return Ok(output);
             }
         }
@@ -3070,6 +3498,7 @@ mod tests {
     use candle_core::{DType, Device, IndexOp, Tensor};
     use candle_nn::rotary_emb;
     use std::collections::HashSet;
+    use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Barrier};
 
     fn tensor_storage_address(tensor: &Tensor) -> usize {
@@ -3134,8 +3563,13 @@ mod tests {
             kernel_size: 4,
             tiled_recurrence_enabled: false,
             tiled_recurrence_tile_size_override: None,
+            chunked_recurrence: false,
+            chunked_spans: AtomicU64::new(0),
+            chunked_fallbacks: AtomicU64::new(0),
             fused_decode: None,
             fused_decode_path: super::Qwen35FastPath::legacy("unresolved"),
+            batched_decode: false,
+            batched_decode_path: super::Qwen35FastPath::legacy("unresolved"),
         }
     }
 
@@ -3154,10 +3588,10 @@ mod tests {
             .unwrap()
         };
         Qwen35LayerRuntimeState::Linear {
-            conv_state: Some(ConvRingState {
-                slots: vec![slot(1), slot(2), slot(3)],
-                next_idx: (seed % 3) as usize,
-            }),
+            conv_state: Some(ConvRingState::new(
+                vec![slot(1), slot(2), slot(3)],
+                (seed % 3) as usize,
+            )),
             recurrent_state: Some(
                 Tensor::from_vec(
                     xorshift_values(layer.num_v_heads * 128 * 128, seed + 4, 0.2),
@@ -3314,15 +3748,17 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn fused_deltanet_decode_matches_the_candle_chain_on_metal() {
-        let _guard = crate::env_test_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::remove_var(super::FUSED_DECODE_ENV);
+        // The Metal lease first, then the env lock, as every Metal test that
+        // takes both does: the other order deadlocks against them.
         let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
             "fused_deltanet_decode_matches_the_candle_chain_on_metal",
         ) else {
             return;
         };
+        let _guard = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var(super::FUSED_DECODE_ENV);
         for (key_heads, value_heads) in [(2, 2), (2, 4)] {
             let mut layer = synthetic_fused_layer(&device, key_heads, value_heads, 64);
             // Production resolution: no CPU allowance needed on Metal.
@@ -3382,18 +3818,23 @@ mod tests {
             kernel_size: 4,
             tiled_recurrence_enabled: false,
             tiled_recurrence_tile_size_override: None,
+            chunked_recurrence: false,
+            chunked_spans: AtomicU64::new(0),
+            chunked_fallbacks: AtomicU64::new(0),
             fused_decode: None,
             fused_decode_path: super::Qwen35FastPath::legacy("test"),
+            batched_decode: false,
+            batched_decode_path: super::Qwen35FastPath::legacy("test"),
         };
         let initial_state = |row: usize| Qwen35LayerRuntimeState::Linear {
-            conv_state: Some(ConvRingState {
-                slots: (0..3)
+            conv_state: Some(ConvRingState::new(
+                (0..3)
                     .map(|slot| {
                         Tensor::full((row * 3 + slot + 1) as f32 * 0.01, (6, 1), device).unwrap()
                     })
                     .collect(),
-                next_idx: row,
-            }),
+                row,
+            )),
             recurrent_state: None,
         };
         let initial = [initial_state(0), initial_state(1)];
@@ -3580,7 +4021,7 @@ mod tests {
         }
         let mut state = Qwen35TextRuntimeState {
             layers: vec![Qwen35LayerRuntimeState::Linear {
-                conv_state: Some(ConvRingState { slots, next_idx: 0 }),
+                conv_state: Some(ConvRingState::new(slots, 0)),
                 recurrent_state: None,
             }],
         };
@@ -3605,7 +4046,7 @@ mod tests {
         let slots = (0..3)
             .map(|_| Tensor::zeros((32, 1), DType::F32, &Device::Cpu).unwrap())
             .collect();
-        let mut ring = ConvRingState { slots, next_idx: 0 };
+        let mut ring = ConvRingState::new(slots, 0);
         let projection = Tensor::zeros((1, 1, 32), DType::F32, &Device::Cpu).unwrap();
         let current = projection.i((0, 0)).unwrap().reshape((32, 1)).unwrap();
         let projection_storage = tensor_storage_address(&current);
@@ -3623,6 +4064,45 @@ mod tests {
             }],
         };
         assert_eq!(state.allocated_session_bytes(), Some(3 * 32 * 4));
+    }
+
+    #[test]
+    fn packed_conv_ring_hands_over_its_history_until_a_slot_changes() {
+        let device = &Device::Cpu;
+        let history =
+            Tensor::from_vec((0..24).map(|v| v as f32).collect(), (3, 8), device).unwrap();
+        let mut ring = ConvRingState::from_history(&history, 8).unwrap();
+
+        // The fused conv's history is staged whole: no copy, same rows.
+        let packed = ring.history().unwrap();
+        assert_eq!(packed.dims(), &[3, 8, 1]);
+        assert_eq!(
+            tensor_storage_address(&packed),
+            tensor_storage_address(&history)
+        );
+        let stacked = Tensor::stack(&ring.ordered_slots(), 0).unwrap();
+        assert_eq!(values(&packed), values(&stacked));
+
+        // A restore reads the staged tensor back whole, and stages it again.
+        let restored = ConvRingState::from_packed(packed.clone()).unwrap();
+        let restaged = restored.history().unwrap();
+        assert_eq!(
+            tensor_storage_address(&restaged),
+            tensor_storage_address(&history)
+        );
+        assert_eq!(values(&restaged), values(&history));
+
+        // A decode push drops the packed history; staging stacks the slots.
+        let current = Tensor::full(-1f32, (8, 1), device).unwrap();
+        ring.push_decode(&current).unwrap();
+        assert!(ring.packed.is_none());
+        let expected = [
+            values(&history.i(1).unwrap()),
+            values(&history.i(2).unwrap()),
+            vec![-1.0; 8],
+        ]
+        .concat();
+        assert_eq!(values(&ring.history().unwrap()), expected);
     }
 
     #[test]
@@ -3845,12 +4325,12 @@ mod tests {
             } else {
                 let conv_width = num_v_heads * 2;
                 layers.push(Qwen35LayerRuntimeState::Linear {
-                    conv_state: Some(ConvRingState {
-                        slots: (0..3)
+                    conv_state: Some(ConvRingState::new(
+                        (0..3)
                             .map(|_| Tensor::zeros((conv_width, 1), DType::F32, device).unwrap())
                             .collect(),
-                        next_idx: 0,
-                    }),
+                        0,
+                    )),
                     recurrent_state: Some(
                         Tensor::zeros((1, num_v_heads, 2, 2), DType::F32, device).unwrap(),
                     ),

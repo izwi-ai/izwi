@@ -88,7 +88,7 @@ use super::execution::{
     RetryDisposition, SequencePhase, SessionKey, StageId, StageWorkSelector, WorkUnit, YieldReason,
 };
 use super::metrics::{
-    begin_engine_physical_dispatch, record_engine_physical_defer, record_engine_physical_fallback,
+    begin_engine_physical_dispatch_shaped, record_engine_physical_defer, record_engine_physical_fallback,
     EnginePhysicalDeferReason, EnginePhysicalFallbackReason,
 };
 use super::output::StreamingOutput;
@@ -1162,6 +1162,18 @@ impl WorkerConfig {
             Self::request_parallelism_override(),
         )
     }
+}
+
+/// Families whose loaded stage sets their batch rows instead of the
+/// engine's tensor width: Fish S2 and Drama 3 fit their own rows, and the chat
+/// families certified wider on CUDA than the engine rows
+/// (`catalog::batch_width`) decode up to their stage's width. Read from the
+/// certified widths, so certifying a family wider cannot leave it capped here.
+fn stage_sets_batch_rows(family: crate::catalog::ModelFamily) -> bool {
+    use crate::catalog::ModelFamily;
+    matches!(family, ModelFamily::FishS2Tts | ModelFamily::FishDrama3Tts)
+        || crate::catalog::certified_decode_width(family, crate::backends::BackendKind::Cuda)
+            > crate::catalog::CUDA_DEFAULT_WIDTH
 }
 
 /// Output from the executor after a forward pass.
@@ -3569,13 +3581,10 @@ impl ModelExecutor for NativeExecutor {
             profile.prefill_batch = native_batch_support.prefill;
             profile.decode_batch = native_batch_support.decode;
             profile.concurrency = ConcurrencyClass::Batchable;
-            profile.max_batch_size = if request.model_variant.is_some_and(|variant| {
-                matches!(
-                    variant.family(),
-                    crate::catalog::ModelFamily::FishS2Tts
-                        | crate::catalog::ModelFamily::FishDrama3Tts
-                )
-            }) {
+            profile.max_batch_size = if request
+                .model_variant
+                .is_some_and(|variant| stage_sets_batch_rows(variant.family()))
+            {
                 request
                     .execution_adapter_binding()
                     .and_then(|binding| {
@@ -3706,13 +3715,9 @@ impl ModelExecutor for NativeExecutor {
                 PhysicalDispatchError::not_started(error, width, FailureOrigin::ExecutorValidation)
             })?;
             let tensor_ceiling = if execution.requests.iter().all(|request| {
-                request.model_variant.is_some_and(|variant| {
-                    matches!(
-                        variant.family(),
-                        crate::catalog::ModelFamily::FishS2Tts
-                            | crate::catalog::ModelFamily::FishDrama3Tts
-                    )
-                })
+                request
+                    .model_variant
+                    .is_some_and(|variant| stage_sets_batch_rows(variant.family()))
             }) {
                 execution
                     .requests
@@ -5104,15 +5109,20 @@ impl UnifiedExecutor {
         {
             return (inputs, refusal);
         }
-        let (batch_id, expected_dispatch, tag, class) = inputs.with_execution(|execution| {
-            let (tag, class) = device_job_tag(&execution);
-            (
-                execution.batch.batch_id,
-                execution.batch.expected_dispatch(),
-                tag,
-                class,
-            )
-        });
+        let (batch_id, expected_dispatch, tag, class, shape) =
+            inputs.with_execution(|execution| {
+                let (tag, class) = device_job_tag(&execution);
+                let phase = super::metrics::EngineDispatchPhase::of_work(
+                    execution.batch.rows.iter().map(|row| &row.work),
+                );
+                (
+                    execution.batch.batch_id,
+                    execution.batch.expected_dispatch(),
+                    tag,
+                    class,
+                    (execution.batch.rows.len(), phase),
+                )
+            });
         let slot = Arc::new(Mutex::new(Some(inputs)));
         let job_slot = slot.clone();
         let idle = self
@@ -5129,7 +5139,7 @@ impl UnifiedExecutor {
                 );
             }
             let _device_step = idle.as_ref().map(|(clock, label)| clock.begin_step(label));
-            let _physical_dispatch = begin_engine_physical_dispatch();
+            let _physical_dispatch = begin_engine_physical_dispatch_shaped(shape.0, shape.1);
             let inputs = job_slot.lock().unwrap_or_else(|poison| poison.into_inner());
             let result = inputs
                 .as_ref()
@@ -5624,6 +5634,25 @@ mod tests {
 
         fn shutdown(&mut self) -> Result<()> {
             Ok(())
+        }
+    }
+
+    #[test]
+    fn stage_rows_follow_the_certified_widths() {
+        use crate::catalog::ModelFamily;
+        for family in [
+            ModelFamily::FishS2Tts,
+            ModelFamily::FishDrama3Tts,
+            ModelFamily::Qwen35Chat,
+            ModelFamily::Qwen35MoeChat,
+            ModelFamily::Qwen38Chat,
+            ModelFamily::Lfm2Chat,
+            ModelFamily::Lfm3Chat,
+        ] {
+            assert!(stage_sets_batch_rows(family), "{family:?}");
+        }
+        for family in [ModelFamily::Qwen3Chat, ModelFamily::Gemma3Chat] {
+            assert!(!stage_sets_batch_rows(family), "{family:?}");
         }
     }
 

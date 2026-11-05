@@ -368,9 +368,12 @@ impl RuntimeService {
     }
 
     pub(super) async fn engine_telemetry_snapshot(&self) -> EngineRuntimeTelemetrySnapshot {
-        let queue_depth = self.core_engine.pending_requests().await as u64;
-        let running_requests = self.core_engine.running_requests().await as u64;
-        let kv_cache = self.core_engine.kv_cache_snapshot().await;
+        // Never waits behind a step: the last counts are served while one
+        // holds the core.
+        let core = self.core_engine.core_telemetry().await;
+        let queue_depth = core.pending_requests as u64;
+        let running_requests = core.running_requests as u64;
+        let kv_cache = core.kv_cache.clone();
         let stream = engine_stream_metrics_snapshot();
 
         let batch = engine_batch_metrics_snapshot();
@@ -378,6 +381,7 @@ impl RuntimeService {
             chat_concurrency_policy: self.chat_concurrency_policy(),
             scheduler_queue_depth: queue_depth,
             scheduler_running_requests: running_requests,
+            scheduler_counts_stale: core.stale,
             incremental_prefill_quanta_committed_total: batch
                 .incremental_prefill_quanta_committed_total,
             incremental_prefill_tokens_committed_total: batch
@@ -414,6 +418,10 @@ impl RuntimeService {
             model_decode_calls_total: batch.model_decode_calls_total,
             model_tensor_multirow_calls_total: batch.model_tensor_multirow_calls_total,
             model_tensor_batch_width_counts: batch.model_tensor_batch_width_counts,
+            physical_dispatch_widths: batch.physical_dispatch_widths,
+            capacity_refusals: batch.capacity_refusals,
+            workspace_capped_sessions: batch.workspace_capped_sessions,
+            recent_failures: batch.recent_failures,
             capacity_suspensions_total: batch.capacity_suspensions_total,
             capacity_replay_tokens_total: batch.capacity_replay_tokens_total,
             capacity_replay_capped_total: batch.capacity_replay_capped_total,
@@ -668,6 +676,12 @@ impl RuntimeService {
             ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_WIDTH_CALLS_TOTAL,
             "width",
             &width_values,
+        );
+        push_engine_dispatch_width_metrics(payload, &snapshot.physical_dispatch_widths);
+        push_engine_capacity_refusal_metrics(
+            payload,
+            &snapshot.capacity_refusals,
+            snapshot.workspace_capped_sessions,
         );
         push_engine_metric(
             payload,

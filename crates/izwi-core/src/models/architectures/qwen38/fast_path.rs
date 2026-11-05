@@ -21,6 +21,12 @@ use crate::performance::{CudaPerformanceConfig, OptimizationMode};
 pub(crate) const FUSED_NORM_ENV: &str = "IZWI_QWEN38_FUSED_NORM";
 /// Kill switch for the fused DeltaNet (GDN) decode.
 pub(crate) const FUSED_GDN_ENV: &str = "IZWI_QWEN38_FUSED_GDN";
+/// Multi-row DeltaNet decode: one conv and one recurrence launch per layer
+/// for every row of a batch (`legacy`/`off` keeps one pair per row).
+pub(crate) const BATCHED_GDN_ENV: &str = "IZWI_QWEN38_BATCHED_GDN";
+/// Multi-row q/k norm + RoPE: one launch per attention layer for every row of
+/// a batch (`legacy`/`off` keeps one launch per row).
+pub(crate) const BATCHED_QK_ROPE_ENV: &str = "IZWI_QWEN38_BATCHED_QK_ROPE";
 /// Switch for the grouped DeltaNet prefill kernel (`auto`, or `legacy`/
 /// `off`/`0`/`false`): prefill expands q/k to the value heads and runs
 /// today's recurrence.

@@ -507,7 +507,10 @@ impl RuntimeService {
     pub(crate) async fn run_request(&self, request: EngineCoreRequest) -> Result<EngineOutput> {
         self.observe_broker_request(&request)?;
         let (spec, observation) = self.coordinator_job_for_request(&request)?;
-        let job = self.coordinator.admit_observed(spec, observation).await?;
+        let job = self
+            .coordinator
+            .admit_observed_waiting(spec, observation)
+            .await?;
         let _residency_lease = match request.model_variant {
             Some(variant) => Some(self.load_model_for_job(&job, variant).await?),
             None => None,
@@ -793,7 +796,10 @@ impl RuntimeService {
             self.observe_broker_request_with_transport_streaming(&request)?;
         }
         let (spec, observation) = self.coordinator_job_for_request(&request)?;
-        let job = self.coordinator.admit_observed(spec, observation).await?;
+        let job = self
+            .coordinator
+            .admit_observed_waiting(spec, observation)
+            .await?;
         let _residency_lease = match request.model_variant {
             Some(variant) => Some(self.load_model_for_job(&job, variant).await?),
             None => None,

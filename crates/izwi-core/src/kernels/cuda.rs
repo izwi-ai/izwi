@@ -363,6 +363,111 @@ pub fn try_qwen38_causal_conv_decode(
     Some((output, next_history))
 }
 
+/// [`qwen38_causal_conv_decode_table`] for `rows` rows in one launch: row r
+/// reads row r of `input` (`[rows, C]`) and its `[C, 3]` history from entry 0
+/// of its six table entries starting at `table.first_entry + r * 6`, and
+/// writes its next history to entry 3. Returns the activated outputs
+/// `[rows, C]` F32. Each row runs the single-row kernel body.
+#[cfg(feature = "cuda")]
+pub fn qwen38_causal_conv_decode_rows(
+    input: &Tensor,
+    weight: &Tensor,
+    table: gdn::RowsTable,
+    rows: usize,
+) -> candle_core::Result<Tensor> {
+    use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+    use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
+
+    let conv_dim = input.elem_count() / rows.max(1);
+    if rows == 0
+        || input.elem_count() != rows * conv_dim
+        || !cuda_tensor_supported(input)
+        || !input.device().same_device(weight.device())
+        || !matches!(input.dtype(), DType::F32 | DType::BF16 | DType::F16)
+        || weight.dtype() != DType::F32
+        || weight.dims() != [conv_dim, 4]
+        || conv_dim == 0
+        || conv_dim
+            .checked_mul(4)
+            .is_none_or(|elements| elements > i32::MAX as usize)
+        || table.address == 0
+        || table
+            .first_entry
+            .checked_add(rows * gdn::TABLE_ENTRIES)
+            .is_none_or(|end| end > table.entries)
+    {
+        candle_core::bail!(
+            "invalid Qwen3.8 rows conv decode contract: input {:?} {:?}, weight {:?}, {rows} rows",
+            input.dims(),
+            input.dtype(),
+            weight.dims()
+        )
+    }
+    let device = input.device().as_cuda_device()?;
+    let input = input.contiguous()?;
+    let weight = weight.contiguous()?;
+    let (input_storage, input_layout) = input.storage_and_layout();
+    let (weight_storage, weight_layout) = weight.storage_and_layout();
+    let (candle_core::Storage::Cuda(input_storage), candle_core::Storage::Cuda(weight_storage)) =
+        (&*input_storage, &*weight_storage)
+    else {
+        candle_core::bail!("Qwen3.8 rows conv decode needs CUDA tensors")
+    };
+    let CudaStorageSlice::F32(weight_slice) = &weight_storage.slice else {
+        candle_core::bail!("Qwen3.8 rows conv decode weight must be F32")
+    };
+    let Some((weight_start, weight_end)) = weight_layout.contiguous_offsets() else {
+        candle_core::bail!("Qwen3.8 rows conv decode weight must be contiguous")
+    };
+    let Some((input_start, input_end)) = input_layout.contiguous_offsets() else {
+        candle_core::bail!("Qwen3.8 rows conv decode input must be contiguous")
+    };
+    let weight_view = weight_slice.slice(weight_start..weight_end);
+    // SAFETY: one thread writes each output channel of each row.
+    let output = unsafe { device.alloc::<f32>(rows * conv_dim)? };
+    let config = LaunchConfig {
+        grid_dim: (((conv_dim * 4) as u32).div_ceil(256), rows as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let address = table.address + (table.first_entry * std::mem::size_of::<u64>()) as u64;
+    macro_rules! launch {
+        ($slice:expr, $name:literal) => {{
+            let input_view = $slice.slice(input_start..input_end);
+            let function = device.get_or_load_custom_func(
+                $name,
+                "izwi_qwen38_causal_conv_decode",
+                cuda_ptx::QWEN38,
+            )?;
+            let mut builder = function.builder();
+            builder.arg(&input_view);
+            candle_core::builder_arg!(builder, conv_dim as i64);
+            builder.arg(&weight_view);
+            candle_core::builder_arg!(builder, address, 0i32);
+            builder.arg(&output);
+            candle_core::builder_arg!(builder, conv_dim as i32);
+            // SAFETY: argument order and types match the kernel; every row's
+            // table entries are F32 buffers of the documented sizes.
+            unsafe { builder.launch(config) }.w()?;
+        }};
+    }
+    match &input_storage.slice {
+        CudaStorageSlice::F32(slice) => launch!(slice, "qwen38_causal_conv_decode_rows_f32"),
+        CudaStorageSlice::BF16(slice) => launch!(slice, "qwen38_causal_conv_decode_rows_bf16"),
+        CudaStorageSlice::F16(slice) => launch!(slice, "qwen38_causal_conv_decode_rows_f16"),
+        _ => candle_core::bail!("Qwen3.8 rows conv decode input must be F32, BF16 or F16"),
+    }
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
+            output,
+            device.clone(),
+        )),
+        (rows, conv_dim),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
 /// [`try_qwen38_causal_conv_decode`] with the history in and out taken from a
 /// device state table ([`gdn::StateTable`]: entry 0 is the `[C, 3]` F32
 /// history, oldest first; entry 3 receives the next history): the CUDA-graph
@@ -3444,6 +3549,78 @@ pub(crate) fn launch_lfm_shortconv_gated_ring_step(
         slice: CudaStorageSlice::F32(output),
         device: device.clone(),
     })
+}
+
+/// Launch the fused LFM2 ShortConv decode step for `rows` rows at once
+/// (`lfm_shortconv_step.rs`): `projected` is `[rows, 3 * hidden]` F32, and
+/// `table` holds four entries per row (ring, next-ring buffer, cursor,
+/// valid). Returns `y` `[rows, hidden]` F32.
+#[cfg(feature = "cuda")]
+pub(crate) fn launch_lfm_shortconv_gated_ring_step_rows(
+    projected: &candle_core::Tensor,
+    weight: &candle_core::Tensor,
+    table: u64,
+    rows: usize,
+    hidden: usize,
+    capacity: usize,
+) -> candle_core::Result<candle_core::Tensor> {
+    use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+    use candle_core::cuda_backend::WrapErr;
+    use candle_core::Storage;
+
+    if projected.dtype() != DType::F32
+        || weight.dtype() != DType::F32
+        || projected.elem_count() != rows * 3 * hidden
+        || weight.elem_count() != hidden * capacity
+    {
+        candle_core::bail!("batched ShortConv step geometry mismatch")
+    }
+    let device = projected.device().as_cuda_device()?.clone();
+    let projected = projected.contiguous()?;
+    let weight = weight.contiguous()?;
+    let (projected_storage, projected_layout) = projected.storage_and_layout();
+    let (weight_storage, weight_layout) = weight.storage_and_layout();
+    fn view<'a>(
+        storage: &'a Storage,
+        layout: &Layout,
+    ) -> candle_core::Result<candle_core::cuda_backend::cudarc::driver::CudaView<'a, f32>> {
+        let Storage::Cuda(cuda) = storage else {
+            candle_core::bail!("batched ShortConv inputs must be CUDA tensors")
+        };
+        let Some((start, end)) = layout.contiguous_offsets() else {
+            candle_core::bail!("batched ShortConv inputs must be contiguous")
+        };
+        Ok(cuda.as_cuda_slice::<f32>()?.slice(start..end))
+    }
+    let projected_view = view(&projected_storage, projected_layout)?;
+    let weight_view = view(&weight_storage, weight_layout)?;
+    // SAFETY: every row's `hidden` threads write its whole output row.
+    let y = unsafe { device.alloc::<f32>(rows * hidden)? };
+    let function = device.get_or_load_custom_func(
+        "lfm_shortconv_gated_ring_step_rows_f32",
+        "izwi_physical_state",
+        cuda_ptx::PHYSICAL_STATE,
+    )?;
+    let config = LaunchConfig {
+        grid_dim: ((hidden as u32).div_ceil(256), rows as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = function.builder();
+    builder.arg(&projected_view);
+    candle_core::builder_arg!(builder, table);
+    builder.arg(&weight_view);
+    builder.arg(&y);
+    candle_core::builder_arg!(builder, hidden as i32, capacity as i32);
+    // SAFETY: argument types match the kernel signature; every row's table
+    // entries were checked against `hidden` and `capacity` by the caller.
+    unsafe { builder.launch(config) }.w()?;
+    Ok(candle_core::Tensor::from_storage(
+        Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(y, device)),
+        (rows, hidden),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
 }
 
 #[cfg(feature = "cuda")]

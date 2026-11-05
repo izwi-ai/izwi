@@ -116,9 +116,11 @@ use crate::runtime::lifecycle::controller::ModelLifecycleController;
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::routing::RouteSource;
 use crate::runtime::telemetry::{
-    push_engine_labeled_metric, push_engine_labeled_metric_f64, push_engine_metric,
-    push_engine_metric_f64, push_engine_multi_labeled_metric,
-    push_engine_physical_execution_metrics, EngineRuntimeTelemetrySnapshot,
+    push_engine_capacity_refusal_metrics, push_engine_dispatch_width_metrics,
+    push_engine_labeled_metric,
+    push_engine_labeled_metric_f64, push_engine_metric, push_engine_metric_f64,
+    push_engine_multi_labeled_metric, push_engine_physical_execution_metrics,
+    EngineRuntimeTelemetrySnapshot,
     RuntimeObservationContext, RuntimeStageObservation, RuntimeStageOutcome,
     RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetryCollector,
     RuntimeTelemetrySnapshot, ENGINE_REQUEST_STAGE, ENGINE_STREAMING_REQUEST_STAGE,

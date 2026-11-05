@@ -205,7 +205,9 @@ impl CommittedBacking {
 /// device's thread: the engine commits
 /// on tokio workers, and a buffer freed on one that never ran CUDA work
 /// fails there and leaves the driver error on the context for the next
-/// device call (`CUDA_ERROR_INVALID_CONTEXT`).
+/// device call (`CUDA_ERROR_INVALID_CONTEXT`). The free is queued, not
+/// awaited: a commit drops one per row under the engine lock, and the frees
+/// are stream-ordered, so nothing needs them to have run.
 pub(crate) struct RetiredTensorState {
     device: DeviceLocation,
     domains: Vec<StateDomainSnapshot>,
@@ -226,10 +228,11 @@ impl Drop for RetiredTensorState {
         if domains.is_empty() || !matches!(self.device, DeviceLocation::Cuda { .. }) {
             return;
         }
-        // Inline on the device thread itself; a job its thread cannot run
-        // is dropped, with the buffers, here.
+        // `submit` enqueues before it returns, so the job runs whether or not
+        // its future is awaited; a job its thread cannot take is dropped,
+        // with the buffers, here.
         if let Ok(thread) = DeviceThread::for_location(self.device) {
-            let _ = thread.run_sync(move || drop(domains));
+            drop(thread.submit(move || drop(domains)));
         }
     }
 }
@@ -394,6 +397,23 @@ impl std::fmt::Debug for TensorStateArena {
 }
 
 impl TensorStateArena {
+    /// Drop `value`, which may hold this arena's device tensors, on the
+    /// device's thread, as [`RetiredTensorState`] does: callers run on tokio
+    /// workers, where freeing a CUDA buffer that is the last reference latches
+    /// `CUDA_ERROR_INVALID_CONTEXT` on the context and fails the next device
+    /// call (a decode step). The drop is queued, not awaited; frees are
+    /// stream-ordered. Off CUDA it drops here.
+    pub(crate) fn drop_on_device<T: Send + 'static>(&self, value: T) {
+        if !matches!(self.device.location(), DeviceLocation::Cuda { .. }) {
+            drop(value);
+            return;
+        }
+        match DeviceThread::for_location(self.device.location()) {
+            Ok(thread) => drop(thread.submit(move || drop(value))),
+            Err(_) => drop(value),
+        }
+    }
+
     pub(crate) fn new(
         plan: Arc<ResolvedStatePlan>,
         capacity: TensorStateCapacity,
@@ -1196,6 +1216,11 @@ mod tests {
             }],
         );
         std::thread::spawn(move || drop(retired)).join().unwrap();
+        // The free is queued on the device thread: wait for it to run.
+        DeviceThread::for_location(device.location())
+            .unwrap()
+            .run_sync(|| ())
+            .unwrap();
         context
             .check_err()
             .expect("retired state dropped on a fresh thread must not latch a CUDA error");

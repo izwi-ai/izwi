@@ -44,6 +44,8 @@ use crate::models::architectures::qwen36moe::sparse::Qwen36MoeSparseMlp;
 
 #[path = "decode_graph.rs"]
 mod decode_graph;
+#[path = "kernel_timings.rs"]
+mod kernel_timings;
 
 pub struct Qwen36TextModel {
     device: Device,
@@ -54,6 +56,12 @@ pub struct Qwen36TextModel {
     finite_diagnostics_enabled: bool,
     fused_norm_path: Qwen36FusedPath,
     fp8_gemv_path: Qwen36FusedPath,
+    /// Dequantized cuBLAS GEMM for wide compact-FP8 projections
+    /// (`fp8_prefill_gemm`), and why not.
+    fp8_prefill_gemm_path: Qwen36FusedPath,
+    /// Tensor-core FP8 kernel for the projection rows it measured fastest at
+    /// (`fp8_tensor_core`), and why not.
+    fp8_tensor_core_path: Qwen36FusedPath,
     /// Chunked DeltaNet prefill kernels (`gdn_prefill`), and why not.
     gdn_prefill_path: Qwen36FusedPath,
     /// Tensor-core grouped MoE kernels for prefill (`moe_prefill`), and why
@@ -62,6 +70,10 @@ pub struct Qwen36TextModel {
     /// Piecewise CUDA graph decode for single-row steps, when resolved.
     decode_graphs: Option<decode_graph::Qwen36DecodeGraphs>,
     decode_graphs_path: Qwen36FusedPath,
+    /// Whole-step CUDA graphs for decode batches of 2 to 32 rows, and why
+    /// not.
+    batch_graphs: Option<decode_graph::batch_graph::Qwen36BatchGraphs>,
+    batch_graphs_path: Qwen36FusedPath,
     /// Whether the LM head is block FP8 (`lm_head`), and why not.
     lm_head_path: Qwen36FusedPath,
     /// Longest context the checkpoint serves (the whole-step graph sizes its
@@ -450,6 +462,11 @@ pub(crate) struct Qwen36FullAttention {
     /// inverse frequencies, when resolved at load.
     fused_qk: Option<(QkNormRopeSpec, Tensor)>,
     fused_qk_path: Qwen36FusedPath,
+    /// Every text row of a decode batch through one q/k norm + RoPE launch
+    /// (`rope::qk_norm_rope_kv_rows` into a scratch cache), when it matched
+    /// the per-row launches bit for bit at load.
+    batched_qk: bool,
+    batched_qk_path: Qwen36FusedPath,
     /// `q_proj` + `k_proj` + `v_proj` packed for one decode GEMV.
     packed_qkv: Option<Qwen36Projection>,
     /// Output gate `attn * sigmoid(gate)` in one launch, when resolved at load.
@@ -484,6 +501,11 @@ struct Qwen36LinearAttention {
     /// [`Qwen36LinearAttention::resolve_fused_decode`]).
     fused_decode: Option<GdnDecodeSpec>,
     fused_decode_path: Qwen36FusedPath,
+    /// Multi-row fused decode: one conv launch and one recurrence launch for
+    /// every row of a batch (`gdn::decode_rows`), when it matched the per-row
+    /// launches bit for bit at load.
+    batched_decode: bool,
+    batched_decode_path: Qwen36FusedPath,
     /// `qkv_proj` + `gate_proj` (and `beta_proj` + `alpha_proj`) packed for
     /// one GEMV each on the fused decode path.
     packed_in: Option<Qwen36Projection>,
@@ -497,6 +519,18 @@ struct Qwen36LinearAttention {
 /// Environment switch for the fused DeltaNet decode (`legacy`/`off`/`0`
 /// keeps the Candle op chain).
 const FUSED_DECODE_ENV: &str = "IZWI_QWEN36_FUSED_DECODE";
+
+/// Environment switch for the multi-row q/k norm + RoPE launch
+/// (`legacy`/`off`/`0` keeps one launch per row).
+const BATCHED_QK_ROPE_ENV: &str = "IZWI_QWEN36_BATCHED_QK_ROPE";
+
+/// Environment switch for multi-row DeltaNet decode (`legacy`/`off`/`0`
+/// keeps one conv and one recurrence launch per row).
+const BATCHED_GDN_ENV: &str = "IZWI_QWEN36_BATCHED_GDN";
+
+/// Environment switch for routing wide compact-FP8 projections through the
+/// dequantized GEMM (`legacy`/`off`/`0` keeps the tile kernel).
+const FP8_PREFILL_GEMM_ENV: &str = "IZWI_QWEN36_FP8_PREFILL_GEMM";
 
 /// Whether the fused decode kernels run on `device` in production (CUDA, and
 /// Metal when built with it); `allow_cpu` lets tests use the portable paths.
@@ -838,8 +872,16 @@ impl Qwen36Projection {
         match self {
             Self::Quantized(qmatmul) => Ok(qmatmul.forward(x)?),
             Self::CompactFp8 { weights, scales } => {
-                crate::kernels::cuda::fp8::block_fp8_projection(x, weights, scales)
-                    .map_err(Error::from)
+                use crate::kernels::cuda::fp8;
+                let rows = x.elem_count() / weights.dim(1)?.max(1);
+                if rows >= fp8::dequant_gemm_min_rows()
+                    && x.device().is_cuda()
+                    && fp8::dequant_gemm_enabled()
+                {
+                    return fp8::block_fp8_projection_dequant_gemm(x, weights, scales)
+                        .map_err(Error::from);
+                }
+                fp8::block_fp8_projection(x, weights, scales).map_err(Error::from)
             }
         }
     }
@@ -1059,10 +1101,14 @@ impl Qwen36TextModel {
             finite_diagnostics_enabled,
             fused_norm_path: Qwen36FusedPath::legacy("unresolved"),
             fp8_gemv_path: Qwen36FusedPath::legacy("unresolved"),
+            fp8_prefill_gemm_path: Qwen36FusedPath::legacy("unresolved"),
+            fp8_tensor_core_path: Qwen36FusedPath::legacy("unresolved"),
             gdn_prefill_path: Qwen36FusedPath::legacy("unresolved"),
             moe_prefill_path: Qwen36FusedPath::legacy("unresolved"),
             decode_graphs: None,
             decode_graphs_path: Qwen36FusedPath::legacy("unresolved"),
+            batch_graphs: None,
+            batch_graphs_path: Qwen36FusedPath::legacy("unresolved"),
             lm_head_path,
             max_context_tokens: cfg.context_length,
         };
@@ -1070,11 +1116,15 @@ impl Qwen36TextModel {
             Some(reason) => {
                 model.fused_norm_path = Qwen36FusedPath::legacy(reason);
                 model.fp8_gemv_path = Qwen36FusedPath::legacy(reason);
+                model.fp8_prefill_gemm_path = Qwen36FusedPath::legacy(reason);
+                model.fp8_tensor_core_path = Qwen36FusedPath::legacy(reason);
                 model.gdn_prefill_path = Qwen36FusedPath::legacy(reason);
             }
             None => {
                 model.resolve_fused_norms(false);
                 model.resolve_vectorized_fp8_decode();
+                model.resolve_fp8_prefill_gemm();
+                model.resolve_fp8_tensor_core();
                 model.resolve_chunked_gdn_prefill();
             }
         }
@@ -1083,7 +1133,75 @@ impl Qwen36TextModel {
             decode_graph::Qwen36DecodeGraphs::resolve(&model, &source.cuda_switches(), false, true);
         model.decode_graphs = graphs;
         model.decode_graphs_path = path;
+        let (graphs, path) = decode_graph::batch_graph::Qwen36BatchGraphs::resolve(
+            &model,
+            &source.cuda_switches(),
+            false,
+        );
+        model.batch_graphs = graphs;
+        model.batch_graphs_path = path;
         Ok(model)
+    }
+
+    /// Route projections past the tensor-core kernel's rows (else of
+    /// [`DEQUANT_GEMM_MIN_ROWS`] rows or more: prefill spans) through the
+    /// dequantized cuBLAS GEMM, process-wide, after it
+    /// matches the reference kernels on this device: the compact tile kernel
+    /// runs prefill at about 8 TFLOP/s. `IZWI_QWEN36_FP8_PREFILL_GEMM=legacy`
+    /// keeps the tile kernel.
+    ///
+    /// [`DEQUANT_GEMM_MIN_ROWS`]: crate::kernels::cuda::fp8::DEQUANT_GEMM_MIN_ROWS
+    fn resolve_fp8_prefill_gemm(&mut self) {
+        self.fp8_prefill_gemm_path = if legacy_requested(FP8_PREFILL_GEMM_ENV) {
+            Qwen36FusedPath::legacy(format!("{FP8_PREFILL_GEMM_ENV}=legacy"))
+        } else if !self.device.is_cuda() {
+            Qwen36FusedPath::legacy("the dequantized FP8 GEMM routing runs on CUDA only")
+        } else {
+            match crate::kernels::cuda::fp8::verify_and_enable_dequant_gemm(&self.device) {
+                Ok(()) => Qwen36FusedPath::Fused,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "dequantized FP8 GEMM self-check failed; prefill keeps the tile kernel"
+                    );
+                    Qwen36FusedPath::legacy(format!("self-check failed: {error}"))
+                }
+            }
+        };
+    }
+
+    /// Whether wide compact-FP8 projections run the dequantized GEMM.
+    pub(crate) fn fp8_prefill_gemm_summary(&self) -> serde_json::Value {
+        super::fast_path::summarize([&self.fp8_prefill_gemm_path])
+    }
+
+    /// Run compact-FP8 projections of 2 to 64 rows (batched decode, short
+    /// prefill spans) on the tensor-core kernel, process-wide, over the rows
+    /// where it measured faster than the vectorized GEMV and the dequantized
+    /// GEMM, after it matches the reference kernels on this device.
+    /// `IZWI_FP8_TENSOR_CORE=legacy` keeps the GEMV and GEMM.
+    fn resolve_fp8_tensor_core(&mut self) {
+        self.fp8_tensor_core_path = if !self.device.is_cuda() {
+            Qwen36FusedPath::legacy("the tensor-core FP8 kernel runs on CUDA only")
+        } else {
+            match crate::kernels::cuda::fp8::verify_and_enable_tensor_core(&self.device) {
+                Ok(()) => Qwen36FusedPath::Fused,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "tensor-core FP8 projection unavailable; keeping the GEMV and GEMM"
+                    );
+                    Qwen36FusedPath::legacy(format!("self-check failed: {error}"))
+                }
+            }
+        };
+    }
+
+    /// The tensor-core FP8 kernel's resolution, crossover rows and timings.
+    pub(crate) fn fp8_tensor_core_summary(&self) -> serde_json::Value {
+        let mut summary = super::fast_path::summarize([&self.fp8_tensor_core_path]);
+        summary["kernel"] = crate::kernels::cuda::fp8::tensor_core_summary();
+        summary
     }
 
     /// Enable the vectorized block-FP8 decode GEMV (process-wide) after it
@@ -1322,6 +1440,14 @@ impl Qwen36TextModel {
 
     /// Fused q/k norm + RoPE across the full-attention layers, for the admin
     /// diagnostics.
+    /// Whether multi-row decode norms and rotates q/k in one launch per layer.
+    pub(crate) fn qk_rope_batched_summary(&self) -> serde_json::Value {
+        super::fast_path::summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
+            Qwen36Mixer::Full(attention) => Some(&attention.batched_qk_path),
+            Qwen36Mixer::Linear(_) => None,
+        }))
+    }
+
     pub(crate) fn qk_rope_summary(&self) -> serde_json::Value {
         super::fast_path::summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
             Qwen36Mixer::Full(attention) => Some(&attention.fused_qk_path),
@@ -1341,10 +1467,15 @@ impl Qwen36TextModel {
     /// Piecewise CUDA graph decode: resolution, phase and counters, for the
     /// admin diagnostics.
     pub(crate) fn cuda_graphs_summary(&self) -> serde_json::Value {
-        match &self.decode_graphs {
+        let mut summary = match &self.decode_graphs {
             Some(graphs) => graphs.summary(),
             None => super::fast_path::summarize([&self.decode_graphs_path]),
-        }
+        };
+        summary["batch"] = match &self.batch_graphs {
+            Some(graphs) => graphs.summary(),
+            None => super::fast_path::summarize([&self.batch_graphs_path]),
+        };
+        summary
     }
 
     /// Fused RMSNorm resolution, for the admin diagnostics.
@@ -1384,11 +1515,78 @@ impl Qwen36TextModel {
     /// Sparse-expert execution paths across the trunk's MoE layers for the
     /// admin diagnostics: how many layers run the device-routed fused kernels
     /// and why any others stayed on the per-expert loop.
+    /// Load-time wall time of the sparse layers' fused-expert stacking and
+    /// self-checks, summed over layers.
+    pub(crate) fn moe_load_timing(&self) -> serde_json::Value {
+        let (mut stack, mut check, mut layers) = (0.0, 0.0, 0);
+        for layer in &self.layers {
+            if let Qwen36FeedForward::Sparse(moe) = &layer.ffn {
+                let timing = moe.load_timing();
+                stack += timing.stack.as_secs_f64() * 1e3;
+                check += timing.self_check.as_secs_f64() * 1e3;
+                layers += 1;
+            }
+        }
+        serde_json::json!({ "layers": layers, "stack_ms": stack, "self_check_ms": check })
+    }
+
     pub(crate) fn moe_backend_summary(&self) -> serde_json::Value {
-        super::fast_path::summarize(self.layers.iter().filter_map(|layer| match &layer.ffn {
-            Qwen36FeedForward::Sparse(moe) => Some(moe.backend()),
+        let mut summary =
+            super::fast_path::summarize(self.layers.iter().filter_map(|layer| match &layer.ffn {
+                Qwen36FeedForward::Sparse(moe) => Some(moe.backend()),
+                Qwen36FeedForward::Dense(_) => None,
+            }));
+        if let Some(tokens) = self.layers.iter().find_map(|layer| match &layer.ffn {
+            Qwen36FeedForward::Sparse(moe) => moe.fused_experts().map(|e| e.grouped_min_tokens()),
             Qwen36FeedForward::Dense(_) => None,
-        }))
+        }) {
+            summary["grouped_min_tokens"] = tokens.into();
+        }
+        // The register-direct decode kernels: per-layer checks, and the routed
+        // tokens they serve from (null until the timings enable them).
+        let fused = self
+            .layers
+            .iter()
+            .filter_map(|layer| match &layer.ffn {
+                Qwen36FeedForward::Sparse(moe) => moe.fused_experts(),
+                Qwen36FeedForward::Dense(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let mut decode =
+            super::fast_path::summarize(fused.iter().map(|experts| experts.decode_path()));
+        decode["min_tokens"] = fused
+            .iter()
+            .map(|experts| experts.decode_min_tokens())
+            .min()
+            .filter(|tokens| *tokens != usize::MAX)
+            .into();
+        summary["decode"] = decode;
+        summary
+    }
+
+    /// Route MoE calls of `tokens` routed tokens or more through the grouped
+    /// kernels in every sparse layer (the load-time timings' crossover).
+    /// Route MoE calls of `tokens` routed tokens or more (below the grouped
+    /// threshold) through the register-direct decode kernels, on every layer
+    /// whose kernels passed their check.
+    pub(crate) fn apply_moe_decode_min_tokens(&mut self, tokens: usize) {
+        for layer in &mut self.layers {
+            if let Qwen36FeedForward::Sparse(moe) = &mut layer.ffn {
+                if let Some(experts) = moe.fused_experts_mut() {
+                    experts.set_decode_min_tokens(tokens);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn apply_moe_grouped_crossover(&mut self, tokens: usize) {
+        for layer in &mut self.layers {
+            if let Qwen36FeedForward::Sparse(moe) = &mut layer.ffn {
+                if let Some(experts) = moe.fused_experts_mut() {
+                    experts.set_grouped_min_tokens(tokens);
+                }
+            }
+        }
     }
 
     /// Resolve every fused path against the portable CPU references (tests
@@ -1443,6 +1641,19 @@ impl Qwen36TextModel {
         );
         self.decode_graphs = graphs;
         self.decode_graphs_path = path;
+    }
+
+    /// Run decode batches of 2 to 32 rows through the multi-row graph body
+    /// eagerly off CUDA (tests of the body; CUDA resolves this at load).
+    #[cfg(test)]
+    pub(crate) fn enable_batch_graphs_for_tests(&mut self) {
+        let (graphs, path) = decode_graph::batch_graph::Qwen36BatchGraphs::resolve(
+            self,
+            &Qwen36CudaSwitches::default(),
+            true,
+        );
+        self.batch_graphs = graphs;
+        self.batch_graphs_path = path;
     }
 
     /// Whether single-row decode runs through the decode graphs (CUDA, when
@@ -1605,6 +1816,14 @@ impl Qwen36TextModel {
 
     /// Fused single-token DeltaNet decode across the linear-attention layers,
     /// for the admin diagnostics.
+    /// Whether multi-row DeltaNet decode runs one launch pair per layer.
+    pub(crate) fn gdn_batched_decode_summary(&self) -> serde_json::Value {
+        super::fast_path::summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
+            Qwen36Mixer::Linear(linear) => Some(&linear.batched_decode_path),
+            Qwen36Mixer::Full(_) => None,
+        }))
+    }
+
     pub(crate) fn gdn_decode_summary(&self) -> serde_json::Value {
         super::fast_path::summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
             Qwen36Mixer::Linear(linear) => Some(&linear.fused_decode_path),
@@ -1764,6 +1983,50 @@ impl Qwen36TextModel {
                 }
             }
             let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
+            if let (2.., Some(graphs)) = (batch_size, &self.batch_graphs) {
+                // The warm check: the standard decode on a copy of the rows'
+                // state, its writes collected and sealed apart.
+                let mut reference_states = states
+                    .iter()
+                    .map(|state| (**state).clone())
+                    .collect::<Vec<_>>();
+                let mut reference = || -> Result<Tensor> {
+                    let mut collector = KvWriteCompletionCollector::new(
+                        first.arena().config(),
+                        lowered.logical_slots(),
+                    )?;
+                    let mut rows = reference_states.iter_mut().collect::<Vec<_>>();
+                    let hidden = self.standard_decode_hidden(
+                        embedded.clone(),
+                        position_ids,
+                        &mut rows,
+                        &cache_refs,
+                        lowered.as_ref(),
+                        &metadata,
+                        &mut collector,
+                        sparse_layers.len(),
+                    );
+                    let sealed = collector.seal();
+                    let logits = self.project_hidden_span(&hidden?)?;
+                    sealed?;
+                    Ok(logits)
+                };
+                let rows = decode_graph::batch_graph::BatchRows {
+                    tokens: token_ids,
+                    positions: position_ids,
+                    slots: &slots,
+                    caches: &cache_refs,
+                    slot_map: lowered.as_ref(),
+                    metadata: &metadata,
+                };
+                match graphs.forward(self, &rows, states, &mut completions, &mut reference)? {
+                    Some(decode_graph::GraphDecodeOutput::Logits(logits)) => return Ok(logits),
+                    Some(decode_graph::GraphDecodeOutput::Hidden(hidden)) => {
+                        return self.project_hidden_span(&hidden)
+                    }
+                    None => {}
+                }
+            }
             let hidden = self.standard_decode_hidden(
                 embedded,
                 position_ids,
@@ -2374,6 +2637,8 @@ impl Qwen36FullAttention {
             )?,
             fused_qk: None,
             fused_qk_path: Qwen36FusedPath::legacy("unresolved"),
+            batched_qk: false,
+            batched_qk_path: Qwen36FusedPath::legacy("unresolved"),
             packed_qkv: None,
             fused_gate: false,
             fused_gate_path: Qwen36FusedPath::legacy("unresolved"),
@@ -2392,10 +2657,12 @@ impl Qwen36FullAttention {
         match cuda.fused_decode_off {
             Some(reason) => {
                 attention.fused_qk_path = Qwen36FusedPath::legacy(reason);
+                attention.batched_qk_path = Qwen36FusedPath::legacy(reason);
                 attention.fused_gate_path = Qwen36FusedPath::legacy(reason);
             }
             None => {
                 attention.resolve_fused_qk(device, false);
+                attention.resolve_batched_qk(device);
                 attention.resolve_fused_gate(device, false);
             }
         }
@@ -2604,6 +2871,137 @@ impl Qwen36FullAttention {
         let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
         let key_states = self.k_norm.forward(&k_proj.contiguous()?)?;
         self.apply_rope(&query_states, &key_states, position_ids)
+    }
+
+    /// q/k norm + RoPE for every text row in one launch: the KV-writing rows
+    /// kernel writes the rotated keys and the values into a scratch cache of
+    /// one slot per row, from which the arena write takes them as the per-row
+    /// path's stacks. Returns queries `[B, heads, head_dim]`, keys and values
+    /// `[B, kv_heads, head_dim]`, contiguous, in the projection dtype.
+    fn qk_norm_rope_rows(
+        &self,
+        q_proj: &Tensor,
+        key_states: &Tensor,
+        value_states: &Tensor,
+        spec: &QkNormRopeSpec,
+        inv_freq: &Tensor,
+        position_ids: &[[usize; 3]],
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let rows = position_ids.len();
+        let device = q_proj.device();
+        let dtype = q_proj.dtype();
+        let (heads, kv_heads, dim) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        let positions = position_ids
+            .iter()
+            .map(|[temporal, _, _]| u32::try_from(*temporal))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::InvalidInput("Qwen3.6 decode position exceeds u32".into()))?;
+        let positions = Tensor::from_vec(positions, rows, device)?;
+        let slots = Tensor::arange(0u32, rows as u32, device)?;
+        let keys = Tensor::zeros((1, rows, kv_heads, dim), dtype, device)?;
+        let values = keys.zeros_like()?;
+        let queries = rope::qk_norm_rope_kv_rows(
+            &q_proj.reshape((rows, heads * 2 * dim))?,
+            &key_states.reshape((rows, kv_heads * dim))?,
+            &value_states.reshape((rows, kv_heads * dim))?,
+            &self.q_norm.weight,
+            &self.k_norm.weight,
+            inv_freq,
+            spec,
+            &positions,
+            &slots,
+            &keys,
+            &values,
+            rows,
+        )?;
+        Ok((
+            queries.reshape((rows, heads, dim))?,
+            keys.reshape((rows, kv_heads, dim))?,
+            values.reshape((rows, kv_heads, dim))?,
+        ))
+    }
+
+    /// Resolve the multi-row q/k launch after the fused q/k path: on CUDA its
+    /// queries, keys and values must equal the per-row launches bit for bit
+    /// at three text positions. `IZWI_QWEN36_BATCHED_QK_ROPE=legacy` keeps one
+    /// launch per row.
+    fn resolve_batched_qk(&mut self, device: &Device) {
+        self.batched_qk = false;
+        self.batched_qk_path = if legacy_requested(BATCHED_QK_ROPE_ENV) {
+            Qwen36FusedPath::legacy(format!("{BATCHED_QK_ROPE_ENV}=legacy"))
+        } else if !device.is_cuda() {
+            Qwen36FusedPath::legacy("batched q/k norm + RoPE runs on CUDA only")
+        } else if self.fused_qk.is_none() {
+            Qwen36FusedPath::legacy("batched q/k norm + RoPE needs the fused q/k path")
+        } else {
+            match self.batched_qk_self_check(device, DType::BF16) {
+                Ok(()) => {
+                    self.batched_qk = true;
+                    Qwen36FusedPath::Fused
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Qwen3.6 batched q/k norm + RoPE self-check failed; launching per row"
+                    );
+                    Qwen36FusedPath::legacy(format!("self-check failed: {error}"))
+                }
+            }
+        };
+    }
+
+    fn batched_qk_self_check(&self, device: &Device, dtype: DType) -> Result<()> {
+        let (spec, inv_freq) = self
+            .fused_qk
+            .as_ref()
+            .ok_or_else(|| Error::InferenceError("no fused q/k path to compare".into()))?;
+        let (heads, kv_heads, dim) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        let positions = [[5usize; 3], [3000; 3], [200_000; 3]];
+        let rows = positions.len();
+        let values = |len: usize, seed: u64| -> Vec<f32> {
+            let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0) * 2.5
+                })
+                .collect()
+        };
+        let tensor = |shape: &[usize], seed: u64| -> Result<Tensor> {
+            Ok(
+                Tensor::from_vec(values(shape.iter().product(), seed), shape, device)?
+                    .to_dtype(dtype)?,
+            )
+        };
+        let q_proj = tensor(&[rows, 1, heads, 2 * dim], 3)?;
+        let k_proj = tensor(&[rows, 1, kv_heads, dim], 4)?;
+        let v_proj = tensor(&[rows, 1, kv_heads, dim], 5)?;
+        let (queries, keys, value_rows) =
+            self.qk_norm_rope_rows(&q_proj, &k_proj, &v_proj, spec, inv_freq, &positions)?;
+        let host = |tensor: &Tensor| -> Result<Vec<f32>> {
+            Ok(tensor
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?)
+        };
+        for (row, position) in positions.into_iter().enumerate() {
+            let (q, k) = self.token_qk(
+                &q_proj.i(row)?.unsqueeze(0)?,
+                &k_proj.i(row)?.unsqueeze(0)?,
+                position,
+            )?;
+            if host(&queries.i(row)?)? != host(&q.reshape((heads, dim))?)?
+                || host(&keys.i(row)?)? != host(&k.reshape((kv_heads, dim))?)?
+                || host(&value_rows.i(row)?)? != host(&v_proj.i(row)?.reshape((kv_heads, dim))?)?
+            {
+                return Err(Error::InferenceError(format!(
+                    "batched q/k norm + RoPE differs from the per-row launch at {position:?}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn fused_qk_self_check(
@@ -2832,27 +3230,45 @@ impl Qwen36FullAttention {
                 "Qwen3.5 decode received an incompatible prepared slot map".into(),
             ));
         }
-        let mut queries = Vec::with_capacity(batch_size);
-        let mut keys = Vec::with_capacity(batch_size);
-        let mut values = Vec::with_capacity(batch_size);
-        for row in 0..batch_size {
-            let q_row = q_proj.i(row)?.unsqueeze(0)?;
-            let k_row = key_states.i(row)?.unsqueeze(0)?;
-            let (q_row, k_row) = self.token_qk(&q_row, &k_row, position_ids[row])?;
-            queries.push(q_row.reshape((self.num_heads, self.head_dim))?);
-            keys.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
-            values.push(
-                value_states
-                    .i(row)?
-                    .reshape((self.num_kv_heads, self.head_dim))?,
-            );
-        }
-        let query_refs = queries.iter().collect::<Vec<_>>();
-        let key_refs = keys.iter().collect::<Vec<_>>();
-        let value_refs = values.iter().collect::<Vec<_>>();
-        let queries = Tensor::stack(&query_refs, 0)?.contiguous()?;
-        let keys = Tensor::stack(&key_refs, 0)?.contiguous()?;
-        let values = Tensor::stack(&value_refs, 0)?.contiguous()?;
+        let batched = self.batched_qk
+            && batch_size > 1
+            && matches!(q_proj.dtype(), DType::F16 | DType::BF16)
+            && position_ids.iter().all(|[t, h, w]| t == h && t == w);
+        let (queries, keys, values) = match (batched, &self.fused_qk) {
+            (true, Some((spec, inv_freq))) => self.qk_norm_rope_rows(
+                q_proj,
+                key_states,
+                value_states,
+                spec,
+                inv_freq,
+                position_ids,
+            )?,
+            _ => {
+                let mut queries = Vec::with_capacity(batch_size);
+                let mut keys = Vec::with_capacity(batch_size);
+                let mut values = Vec::with_capacity(batch_size);
+                for row in 0..batch_size {
+                    let q_row = q_proj.i(row)?.unsqueeze(0)?;
+                    let k_row = key_states.i(row)?.unsqueeze(0)?;
+                    let (q_row, k_row) = self.token_qk(&q_row, &k_row, position_ids[row])?;
+                    queries.push(q_row.reshape((self.num_heads, self.head_dim))?);
+                    keys.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
+                    values.push(
+                        value_states
+                            .i(row)?
+                            .reshape((self.num_kv_heads, self.head_dim))?,
+                    );
+                }
+                let query_refs = queries.iter().collect::<Vec<_>>();
+                let key_refs = keys.iter().collect::<Vec<_>>();
+                let value_refs = values.iter().collect::<Vec<_>>();
+                (
+                    Tensor::stack(&query_refs, 0)?.contiguous()?,
+                    Tensor::stack(&key_refs, 0)?.contiguous()?,
+                    Tensor::stack(&value_refs, 0)?.contiguous()?,
+                )
+            }
+        };
         let storage_dtype = first.arena().config().dtype;
         let output_dtype = queries.dtype();
         let queries = queries.to_dtype(storage_dtype)?;
@@ -3125,6 +3541,8 @@ impl Qwen36LinearAttention {
             chunked_recurrence: false,
             fused_decode: None,
             fused_decode_path: Qwen36FusedPath::legacy("unresolved"),
+            batched_decode: false,
+            batched_decode_path: Qwen36FusedPath::legacy("unresolved"),
             packed_in: None,
             packed_beta_alpha: None,
             beta_alpha_rows: None,
@@ -3137,8 +3555,14 @@ impl Qwen36LinearAttention {
             mixer.pack_projections();
         }
         match cuda.fused_decode_off {
-            Some(reason) => mixer.fused_decode_path = Qwen36FusedPath::legacy(reason),
-            None => mixer.resolve_fused_decode(cfg.embedding_length, device, false),
+            Some(reason) => {
+                mixer.fused_decode_path = Qwen36FusedPath::legacy(reason);
+                mixer.batched_decode_path = Qwen36FusedPath::legacy(reason);
+            }
+            None => {
+                mixer.resolve_fused_decode(cfg.embedding_length, device, false);
+                mixer.resolve_batched_decode(cfg.embedding_length, device);
+            }
         }
         Ok(mixer)
     }
@@ -3317,6 +3741,259 @@ impl Qwen36LinearAttention {
 
     /// Whether a single-token decode can take the fused kernels with this
     /// layer state (3-slot F32 ring, F32 or absent recurrent state).
+    /// Batched decode through the multi-row kernels: one conv launch and one
+    /// recurrence launch for every row, reading each row's state through a
+    /// device table. Each row writes a fresh slab of its own (next state, then
+    /// next history), so a published row state never shares storage with
+    /// another row's, and the old states are left untouched. Returns
+    /// `[rows, Hv * 128]` in z's dtype.
+    #[cfg(feature = "cuda")]
+    fn forward_decode_batch_rows(
+        &self,
+        spec: &GdnDecodeSpec,
+        mixed_qkv: &Tensor,
+        z: &Tensor,
+        beta_raw: &Tensor,
+        alpha: &Tensor,
+        states: &mut [&mut Qwen36LayerRuntimeState],
+    ) -> Result<Tensor> {
+        use crate::kernels::cuda::segment_graph::DeviceTable;
+
+        let rows = states.len();
+        let device = z.device();
+        let state_shape = (1, self.num_v_heads, self.head_k_dim, self.head_v_dim);
+        let state_len = self.num_v_heads * self.head_k_dim * self.head_v_dim;
+        let history_len = (gdn::CONV_TAPS - 1) * self.conv_dim;
+        let mut entries = Vec::with_capacity(rows * gdn::TABLE_ENTRIES);
+        let mut outputs = Vec::with_capacity(rows);
+        let mut zeros = None;
+        for state in states.iter() {
+            let Qwen36LayerRuntimeState::Linear {
+                conv_state: Some(ring),
+                recurrent_state,
+            } = &**state
+            else {
+                return Err(Error::InferenceError(
+                    "Qwen3.6 batched DeltaNet decode needs an initialized linear-attention state"
+                        .into(),
+                ));
+            };
+            let history = ring.ordered_slots().cloned().collect::<Vec<_>>();
+            let previous = match recurrent_state {
+                Some(previous) => previous.clone(),
+                None => match &zeros {
+                    Some(zeros) => Tensor::clone(zeros),
+                    None => {
+                        let fresh = Tensor::zeros(state_shape, DType::F32, device)?;
+                        zeros = Some(fresh.clone());
+                        fresh
+                    }
+                },
+            };
+            let slab = decode_graph::uninit_f32(state_len + history_len, device)?;
+            let state_out = slab.narrow(0, 0, state_len)?.reshape(state_shape)?;
+            let history_out = slab
+                .narrow(0, state_len, history_len)?
+                .reshape((gdn::CONV_TAPS - 1, self.conv_dim))?;
+            entries.extend(gdn::row_entries(
+                [&history[0], &history[1], &history[2]],
+                &history_out,
+                &previous,
+                &state_out,
+                spec,
+            )?);
+            // The inputs stay referenced until both launches are queued.
+            outputs.push((history_out, state_out, history, previous));
+        }
+        let mut table = DeviceTable::new(device, entries.len())?;
+        table.write(0, &entries)?;
+        let value_width = self.num_v_heads * self.head_v_dim;
+        let y = gdn::decode_rows(
+            &mixed_qkv.reshape((rows, self.conv_dim))?,
+            &self.conv_kernel,
+            &z.reshape((rows, value_width))?,
+            &beta_raw.reshape((rows, self.num_v_heads))?,
+            &alpha.reshape((rows, self.num_v_heads))?,
+            &self.dt_bias,
+            &self.a,
+            &self.norm.weight,
+            &table,
+            rows,
+            spec,
+        )?;
+        for (state, (history_out, state_out, _, _)) in states.iter_mut().zip(outputs) {
+            if let Qwen36LayerRuntimeState::Linear {
+                conv_state,
+                recurrent_state,
+            } = &mut **state
+            {
+                *conv_state = Some(ConvRingState::from_history(history_out.reshape((
+                    gdn::CONV_TAPS - 1,
+                    self.conv_dim,
+                    1,
+                ))?)?);
+                *recurrent_state = Some(state_out);
+            }
+        }
+        Ok(y)
+    }
+
+    /// Resolve multi-row decode after the fused decode: on CUDA the multi-row
+    /// kernels must reproduce the per-row launches bit for bit on this
+    /// layer's weights. `IZWI_QWEN36_BATCHED_GDN=legacy` keeps one launch pair
+    /// per row.
+    fn resolve_batched_decode(&mut self, hidden: usize, device: &Device) {
+        self.batched_decode = false;
+        self.batched_decode_path = if legacy_requested(BATCHED_GDN_ENV) {
+            Qwen36FusedPath::legacy(format!("{BATCHED_GDN_ENV}=legacy"))
+        } else if !device.is_cuda() {
+            Qwen36FusedPath::legacy("batched DeltaNet decode runs on CUDA only")
+        } else if let Some(spec) = self.fused_decode {
+            match self.batched_decode_self_check(&spec, hidden, device) {
+                Ok(()) => {
+                    self.batched_decode = true;
+                    Qwen36FusedPath::Fused
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Qwen3.6 batched DeltaNet decode self-check failed; launching per row"
+                    );
+                    Qwen36FusedPath::legacy(format!("self-check failed: {error}"))
+                }
+            }
+        } else {
+            Qwen36FusedPath::legacy("batched DeltaNet decode needs the fused decode")
+        };
+    }
+
+    /// Three synthetic rows through the per-row fused launches and the
+    /// multi-row kernels from identical states: a ring at each cursor and two
+    /// rows reading one recurrent state (a fork). The outputs, states and
+    /// histories must be identical.
+    #[cfg(feature = "cuda")]
+    fn batched_decode_self_check(
+        &self,
+        spec: &GdnDecodeSpec,
+        hidden: usize,
+        device: &Device,
+    ) -> Result<()> {
+        const ROWS: usize = 3;
+        let values = |len: usize, seed: u64, scale: f32| -> Vec<f32> {
+            let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0) * scale
+                })
+                .collect()
+        };
+        let host = |tensor: &Tensor| -> Result<Vec<f32>> {
+            Ok(tensor
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?)
+        };
+        let exact = |name: &str, actual: &Tensor, expected: &Tensor| -> Result<()> {
+            if host(actual)? == host(expected)? {
+                Ok(())
+            } else {
+                Err(Error::InferenceError(format!(
+                    "batched DeltaNet {name} differs from the per-row launches"
+                )))
+            }
+        };
+        let conv_dim = self.conv_dim;
+        let slot = |seed: u64| -> Result<Tensor> {
+            Ok(Tensor::from_vec(
+                values(conv_dim, seed, 1.0),
+                (conv_dim, 1),
+                device,
+            )?)
+        };
+        let state_shape = (1, self.num_v_heads, self.head_k_dim, self.head_v_dim);
+        let state_len = self.num_v_heads * self.head_k_dim * self.head_v_dim;
+        let shared = Tensor::from_vec(values(state_len, 31, 0.3), state_shape, device)?;
+        let own = Tensor::from_vec(values(state_len, 32, 0.3), state_shape, device)?;
+        let initial = vec![
+            Qwen36LayerRuntimeState::Linear {
+                conv_state: Some(ConvRingState::new(vec![slot(22)?, slot(23)?, slot(24)?], 0)),
+                recurrent_state: Some(shared.clone()),
+            },
+            Qwen36LayerRuntimeState::Linear {
+                conv_state: Some(ConvRingState::new(vec![slot(25)?, slot(26)?, slot(27)?], 2)),
+                recurrent_state: Some(own),
+            },
+            Qwen36LayerRuntimeState::Linear {
+                conv_state: Some(ConvRingState::new(vec![slot(28)?, slot(29)?, slot(30)?], 1)),
+                recurrent_state: Some(shared),
+            },
+        ];
+        let x = Tensor::from_vec(values(ROWS * hidden, 21, 1.5), (ROWS, 1, hidden), device)?
+            .to_dtype(norm_dtype(device))?;
+        let (mixed_qkv, z, beta_raw, alpha) = self.decode_projections(&x)?;
+        let mut per_row = initial.clone();
+        let mut batched = initial;
+        let expected = per_row
+            .iter_mut()
+            .enumerate()
+            .map(|(row, state)| {
+                self.fused_decode_row(
+                    spec,
+                    &mixed_qkv.i(row)?,
+                    &z.i(row)?,
+                    &beta_raw.i(row)?,
+                    &alpha.i(row)?,
+                    state,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let expected = Tensor::stack(&expected, 0)?;
+        let actual = {
+            let mut rows = batched.iter_mut().collect::<Vec<_>>();
+            self.forward_decode_batch_rows(spec, &mixed_qkv, &z, &beta_raw, &alpha, &mut rows)?
+        };
+        exact("output", &actual, &expected)?;
+        for (batched, per_row) in batched.iter().zip(&per_row) {
+            let (
+                Qwen36LayerRuntimeState::Linear {
+                    conv_state: Some(batched_ring),
+                    recurrent_state: Some(batched_recurrent),
+                },
+                Qwen36LayerRuntimeState::Linear {
+                    conv_state: Some(per_row_ring),
+                    recurrent_state: Some(per_row_recurrent),
+                },
+            ) = (batched, per_row)
+            else {
+                return Err(Error::InferenceError(
+                    "batched DeltaNet self-check lost a row's state".into(),
+                ));
+            };
+            exact("recurrent state", batched_recurrent, per_row_recurrent)?;
+            exact(
+                "conv history",
+                &batched_ring.history()?,
+                &per_row_ring.history()?,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn batched_decode_self_check(
+        &self,
+        _spec: &GdnDecodeSpec,
+        _hidden: usize,
+        _device: &Device,
+    ) -> Result<()> {
+        Err(Error::InferenceError(
+            "batched DeltaNet decode needs a CUDA build".into(),
+        ))
+    }
+
     fn fused_decode_accepts(hidden_states: &Tensor, state: &Qwen36LayerRuntimeState) -> bool {
         matches!(hidden_states.dtype(), DType::F32 | DType::F16 | DType::BF16)
             && matches!(
@@ -3537,6 +4214,17 @@ impl Qwen36LinearAttention {
                 .all(|state| Self::fused_decode_accepts(hidden_states, state))
             {
                 let (mixed_qkv, z, beta_raw, alpha) = self.decode_projections(hidden_states)?;
+                #[cfg(feature = "cuda")]
+                if self.batched_decode && batch_size > 1 {
+                    let output = self.forward_decode_batch_rows(
+                        spec, &mixed_qkv, &z, &beta_raw, &alpha, states,
+                    )?;
+                    return self.out_proj.forward(&output.reshape((
+                        batch_size,
+                        1,
+                        self.num_v_heads * self.head_v_dim,
+                    ))?);
+                }
                 let rows = states
                     .iter_mut()
                     .enumerate()
@@ -4517,6 +5205,8 @@ pub(crate) mod tests {
             chunked_recurrence: false,
             fused_decode: None,
             fused_decode_path: Qwen36FusedPath::legacy("test"),
+            batched_decode: false,
+            batched_decode_path: Qwen36FusedPath::legacy("test"),
             packed_in: None,
             packed_beta_alpha: None,
             beta_alpha_rows: None,
@@ -4653,6 +5343,8 @@ pub(crate) mod tests {
             chunked_recurrence: false,
             fused_decode: None,
             fused_decode_path: Qwen36FusedPath::legacy("test"),
+            batched_decode: false,
+            batched_decode_path: Qwen36FusedPath::legacy("test"),
             packed_in: None,
             packed_beta_alpha: None,
             beta_alpha_rows: None,
@@ -4738,6 +5430,8 @@ pub(crate) mod tests {
             rope_inv_freqs: super::build_rope_inv_freqs(16, 10_000_000.0).unwrap(),
             fused_qk: None,
             fused_qk_path: Qwen36FusedPath::legacy("test"),
+            batched_qk: false,
+            batched_qk_path: Qwen36FusedPath::legacy("test"),
             packed_qkv: None,
             fused_gate: false,
             fused_gate_path: Qwen36FusedPath::legacy("test"),
@@ -4788,6 +5482,20 @@ pub(crate) mod tests {
                 &format!("k at {position:?}"),
             );
         }
+    }
+
+    /// The multi-row q/k launch's plumbing reproduces the per-row launches
+    /// row by row; on the CPU the rows kernel runs the one-row body, so this
+    /// checks the positions, scratch slots and value copy.
+    #[test]
+    fn batched_qk_rows_match_the_per_row_launches() {
+        let mut attention = attention_for_qk(vec![11, 11, 10]);
+        attention.resolve_fused_qk(&Device::Cpu, true);
+        attention
+            .batched_qk_self_check(&Device::Cpu, DType::F16)
+            .unwrap();
+        attention.resolve_batched_qk(&Device::Cpu);
+        assert!(!attention.batched_qk, "production resolves it on CUDA only");
     }
 
     #[test]
@@ -5103,6 +5811,15 @@ pub(crate) mod tests {
     pub(crate) fn e2e_cache(
         device: &Device,
     ) -> crate::models::shared::attention::physical::PhysicalPagedKvCache {
+        e2e_caches(device, 1).remove(0)
+    }
+
+    /// `rows` sequences' caches of eight pages each on one shared arena, as
+    /// the rows of one decode batch are.
+    pub(crate) fn e2e_caches(
+        device: &Device,
+        rows: usize,
+    ) -> Vec<crate::models::shared::attention::physical::PhysicalPagedKvCache> {
         use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
         use crate::backends::BackendKind;
         use crate::engine::ModelInstanceId;
@@ -5132,7 +5849,7 @@ pub(crate) mod tests {
             id,
             group,
             page_tokens: 8,
-            capacity_pages: 8,
+            capacity_pages: 8 * rows as u32,
             growth: None,
             // The production CUDA KV dtype (the BF16 activations'), which the
             // whole-step graph writes directly; F32 elsewhere.
@@ -5162,15 +5879,72 @@ pub(crate) mod tests {
         };
         #[cfg(not(any(feature = "cuda", feature = "metal")))]
         let arena: Arc<dyn KvArena> = Arc::new(CpuKvArena::new(config).unwrap());
-        let blocks = (0..8u32)
-            .map(|index| CacheBlockRef {
-                arena: id,
-                group,
-                index,
-                slot_generation: 1,
+        (0..rows as u32)
+            .map(|row| {
+                let blocks = (8 * row..8 * (row + 1))
+                    .map(|index| CacheBlockRef {
+                        arena: id,
+                        group,
+                        index,
+                        slot_generation: 1,
+                    })
+                    .collect();
+                PhysicalPagedKvCache::new(arena.clone(), bindings.clone(), blocks, 0).unwrap()
             })
-            .collect();
-        PhysicalPagedKvCache::new(arena, bindings, blocks, 0).unwrap()
+            .collect()
+    }
+
+    /// Prefill `rows` sequences (each its own tokens and a prompt one token
+    /// longer than the last), then decode them together, one batched step
+    /// per token: each row's logits per position.
+    fn e2e_batch_logits(model: &super::Qwen36TextModel, rows: usize) -> Vec<Vec<Vec<f32>>> {
+        let tokens = (0..rows)
+            .map(|row| {
+                (0..14u32)
+                    .map(|i| (i * 7 + 3 + 5 * row as u32) % E2E_VOCAB as u32)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let prompts = (0..rows).map(|row| 4 + row).collect::<Vec<_>>();
+        let mut caches = e2e_caches(&model.device, rows);
+        let mut states = (0..rows).map(|_| model.new_state()).collect::<Vec<_>>();
+        let mut logits = (0..rows).map(|_| Vec::new()).collect::<Vec<_>>();
+        for row in 0..rows {
+            let positions: Vec<[usize; 3]> = (0..prompts[row]).map(|p| [p, p, p]).collect();
+            logits[row].push(flat(
+                &model
+                    .prefill_token_ids_physical(
+                        &tokens[row][..prompts[row]],
+                        &positions,
+                        &mut states[row],
+                        &mut caches[row],
+                        true,
+                    )
+                    .unwrap()
+                    .expect("prefill logits"),
+            ));
+        }
+        let steps = 14 - prompts.iter().max().unwrap();
+        for step in 0..steps {
+            let ids = (0..rows)
+                .map(|row| tokens[row][prompts[row] + step])
+                .collect::<Vec<_>>();
+            let positions = (0..rows)
+                .map(|row| [prompts[row] + step; 3])
+                .collect::<Vec<_>>();
+            let out = model
+                .forward_token_ids_batch_at_physical(
+                    &ids,
+                    &positions,
+                    &mut states.iter_mut().collect::<Vec<_>>(),
+                    &mut caches.iter_mut().collect::<Vec<_>>(),
+                )
+                .unwrap();
+            for (row, row_logits) in logits.iter_mut().enumerate() {
+                row_logits.push(flat(&out.i(row).unwrap()));
+            }
+        }
+        logits
     }
 
     fn argmax(values: &[f32]) -> usize {
@@ -5322,6 +6096,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn load_time_kernel_timings_run_every_measurement_shape() {
+        let mut model = super::Qwen36TextModel::load_with_source(
+            &SyntheticFp8Source::new(
+                crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest::Auto,
+            ),
+            &e2e_config(),
+            &Device::Cpu,
+        )
+        .unwrap();
+        assert_eq!(model.kernel_timings()["status"], "cuda_only");
+        model.enable_fused_paths_for_tests();
+        let timings = model
+            .measure_kernel_timings(std::time::Instant::now(), std::time::Duration::from_secs(600))
+            .unwrap();
+        for rows in ["1", "4", "5", "8", "16", "32"] {
+            let width = &timings["projections_by_rows"][rows];
+            for kind in [
+                "linear_attn.in_proj",
+                "linear_attn.out_proj",
+                "self_attn.qkv",
+                "self_attn.o_proj",
+                "lm_head",
+            ] {
+                assert!(width[kind]["ms"].as_f64().is_some(), "{rows} {kind}: {width}");
+            }
+            assert!(width["projection_step_ms"].as_f64().is_some());
+        }
+        assert_eq!(timings["layers"]["deltanet"], 3);
+        assert!(timings["deltanet_row_ms"].as_f64().is_some(), "{timings}");
+        assert!(timings["projections_by_rows"]["8"]["deltanet_rows_step_ms"]
+            .as_f64()
+            .is_some());
+        for tokens in ["1", "8", "32", "128"] {
+            let moe = &timings["moe_by_tokens"]["by_tokens"][tokens];
+            assert!(moe["per_pair_ms"].as_f64().is_some(), "{tokens}: {moe}");
+        }
+        // The crossover the load applies moves every sparse layer's switch.
+        model.apply_moe_grouped_crossover(96);
+        assert_eq!(model.moe_backend_summary()["grouped_min_tokens"], 96);
+    }
+
+    #[test]
     fn global_cuda_switches_keep_every_fast_path_off_at_load() {
         use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
         let model = super::Qwen36TextModel::load_with_source(
@@ -5367,6 +6183,26 @@ pub(crate) mod tests {
                 "cuda.fused_decode=off",
             ),
             ("moe_prefill", model.moe_prefill_summary(), "cuda.mode=off"),
+            (
+                "fp8_prefill_gemm",
+                model.fp8_prefill_gemm_summary(),
+                "cuda.fused_decode=off",
+            ),
+            (
+                "fp8_tensor_core",
+                model.fp8_tensor_core_summary(),
+                "cuda.fused_decode=off",
+            ),
+            (
+                "gdn_batched_decode",
+                model.gdn_batched_decode_summary(),
+                "cuda.fused_decode=off",
+            ),
+            (
+                "qk_rope_batched",
+                model.qk_rope_batched_summary(),
+                "cuda.fused_decode=off",
+            ),
             (
                 "cuda_graphs",
                 model.cuda_graphs_summary(),
@@ -5605,6 +6441,50 @@ pub(crate) mod tests {
         // The segments never ran.
         assert_eq!(graphs["warmups"], 0, "{graphs}");
         assert_eq!(graphs["eager_steps"], 0);
+    }
+
+    /// The multi-row whole-step body, run eagerly off CUDA with the arena's
+    /// attention: three rows at different positions decoded together, every
+    /// layer through one body over the rows, and each row's state
+    /// publication must reproduce the standard batched decode exactly, step
+    /// after step. (On CUDA the same body runs with the multi-row RoPE/KV
+    /// write, split decode and DeltaNet table kernels and is captured per
+    /// width.)
+    #[test]
+    fn batch_graph_decode_matches_the_standard_batched_path() {
+        use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
+        let load = || {
+            let mut model = super::Qwen36TextModel::load_with_source(
+                &SyntheticFp8Source::new(Qwen36MoeBackendRequest::Auto),
+                &e2e_config(),
+                &Device::Cpu,
+            )
+            .unwrap();
+            model.enable_fused_paths_for_tests();
+            model
+        };
+        let standard = load();
+        assert_eq!(
+            standard.cuda_graphs_summary()["batch"]["backend"],
+            "legacy",
+            "no multi-row graphs off CUDA unless a test asks"
+        );
+        let mut graphed = load();
+        graphed.enable_batch_graphs_for_tests();
+        assert_eq!(graphed.cuda_graphs_summary()["batch"]["backend"], "fused");
+
+        let expected = e2e_batch_logits(&standard, 3);
+        let actual = e2e_batch_logits(&graphed, 3);
+        assert_eq!(
+            actual, expected,
+            "multi-row graph decode must be bit-identical"
+        );
+        let batch = graphed.cuda_graphs_summary()["batch"].clone();
+        // 14 tokens, prompts of 4 to 6: eight batched steps of three rows.
+        assert_eq!(batch["warmups"].as_u64(), Some(8), "{batch}");
+        assert_eq!(batch["graph_rows"].as_u64(), Some(24), "{batch}");
+        assert_eq!(batch["standard_steps"].as_u64(), Some(0), "{batch}");
+        assert_eq!(batch["capture"], false);
     }
 
     /// Pipelined decode: each step is queued before the previous one is
@@ -6081,6 +6961,8 @@ pub(crate) mod tests {
             chunked_recurrence: false,
             fused_decode: None,
             fused_decode_path: Qwen36FusedPath::legacy("test"),
+            batched_decode: false,
+            batched_decode_path: Qwen36FusedPath::legacy("test"),
             packed_in: None,
             packed_beta_alpha: None,
             beta_alpha_rows: None,

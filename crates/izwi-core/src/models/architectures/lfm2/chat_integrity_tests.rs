@@ -531,6 +531,11 @@ fn lfm2_mixed_steps_with_split_shapes_are_the_split_calls() {
         assert_eq!(expected[0].delta, actual[0].delta);
         assert_eq!(summary(&split), summary(&mixed));
     }
+    // A decode-only mixed step is the split call, so both count as batched.
+    let counters = &model.runtime_diagnostics()["counters"];
+    assert_eq!(counters["batched_decode_steps"], 6);
+    assert_eq!(counters["batched_decode_rows"], 6);
+    assert!(counters["batched_step_us"]["enqueue"].is_u64());
 
     let prompt = [1, 4, 3, 6, 5];
     let fresh = || {

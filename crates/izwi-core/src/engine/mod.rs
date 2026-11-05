@@ -34,6 +34,7 @@ pub(crate) use core::CudaResidentPool;
 pub mod execution;
 mod execution_group;
 mod executor;
+pub(crate) use executor::CUDA_DISPATCH_SCRATCH_BYTES_PER_ROW;
 #[cfg(test)]
 pub(crate) use executor::qwen3_asr_requires_long_form;
 pub(crate) use executor::{
@@ -113,7 +114,9 @@ pub use metrics::{
     engine_stream_backpressure_total, engine_stream_metrics_snapshot,
     engine_tensor_batch_max_width, engine_tensor_batches_total, prometheus_engine_metric_name,
     prometheus_engine_metric_type, push_engine_histograms, EngineBatchMetricsSnapshot,
-    EngineDeadlinePhaseMetricsSnapshot, EngineDispatchStateMetricsSnapshot,
+    EngineCapacityRefusal, EngineCapacityRefusalMetricsSnapshot, EngineRecentFailure,
+    EngineDeadlinePhaseMetricsSnapshot, EngineDispatchPhase, EngineDispatchStateMetricsSnapshot,
+    EngineDispatchWidthTime,
     EngineDurationMetricsSnapshot, EngineFailureOriginMetricsSnapshot, EngineMetricDescriptor,
     EnginePhysicalDeferMetricsSnapshot, EnginePhysicalDeferReason,
     EnginePhysicalExecutionMetricsSnapshot, EnginePhysicalExecutionMode,
@@ -142,7 +145,9 @@ pub use metrics::{
     ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_STARTED_TOTAL,
     ENGINE_EXECUTOR_PHYSICAL_DISPATCH_OBSERVATIONS_TOTAL,
     ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_MAX, ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_TOTAL,
-    ENGINE_EXECUTOR_PHYSICAL_EXECUTION_CAP, ENGINE_EXECUTOR_PHYSICAL_EXECUTION_MODE,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_DISPATCHES_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_MICROS_TOTAL, ENGINE_EXECUTOR_PHYSICAL_EXECUTION_CAP,
+    ENGINE_RESOURCES_LIVE_CAPACITY_REFUSALS_TOTAL, ENGINE_SCHEDULER_WORKSPACE_CAPPED_SESSIONS, ENGINE_EXECUTOR_PHYSICAL_EXECUTION_MODE,
     ENGINE_EXECUTOR_PHYSICAL_FALLBACKS_TOTAL,
     ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_OBSERVATIONS_TOTAL,
     ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_MAX,
@@ -710,6 +715,19 @@ pub struct Engine {
     pending_aborts: Arc<PendingAborts>,
     /// Distinguishes a cancelled registration from a later reuse of the public ID.
     next_completion_registration: std::sync::atomic::AtomicU64,
+    /// The scheduler counts and KV snapshot telemetry last read, served while
+    /// a step holds the core for writing so metrics never wait behind it.
+    telemetry_cache: std::sync::Mutex<Option<EngineCoreTelemetry>>,
+}
+
+/// Scheduler counts and the managed-KV snapshot for telemetry.
+#[derive(Debug, Clone)]
+pub(crate) struct EngineCoreTelemetry {
+    pub pending_requests: usize,
+    pub running_requests: usize,
+    pub kv_cache: ManagedKvRuntimeSnapshot,
+    /// Read earlier, because a step held the core when telemetry asked.
+    pub stale: bool,
 }
 
 /// Cloneable state for one owned engine transaction. The task holding this
@@ -1045,15 +1063,39 @@ impl OwnedStepContext {
             batches: vec![batch],
         };
         executed.apply_stream_delivery_failures(&dispatch_failures);
-        let committed = {
+        let (committed, deferred, executor) = {
             let mut core = self.core.write().await;
             let started = Instant::now();
-            let committed = core.commit_step(executed).await?;
+            core.begin_deferring_release_cleanups();
+            let committed = core.commit_step(executed).await;
+            let (deferred, executor) = core.take_deferred_release_cleanups();
             metrics::record_engine_step_phase(metrics::EngineStepPhase::Commit, started.elapsed());
-            committed
+            (committed, deferred, executor)
         };
-        self.deliver_and_route_committed(committed, defer_unregistered_terminal_ack)
-            .await
+        let delivered = match committed {
+            Ok(committed) => {
+                self.deliver_and_route_committed(committed, defer_unregistered_terminal_ack)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        // Finished sessions' device cleanups run after delivery and outside
+        // the core lock: each waits behind the dispatch the device is
+        // running, and holding the core meanwhile stalled every stream's
+        // delivery, new requests and metrics. The step gate stays held, so
+        // this lane's next step still starts after them.
+        if !deferred.is_empty() {
+            let mut reports = Vec::with_capacity(deferred.len());
+            for session in deferred {
+                let report = executor.cleanup_session(&session).await;
+                reports.push((session, report));
+            }
+            let mut core = self.core.write().await;
+            for (session, report) in reports {
+                core.finish_deferred_release_cleanup(&session, report);
+            }
+        }
+        delivered
     }
 
     /// Keep incremental deliveries still waiting on a reader when their
@@ -1414,6 +1456,7 @@ impl Engine {
             delivery_lanes: Arc::new(std::sync::Mutex::new(DeliveryLaneState::default())),
             pending_aborts: Arc::new(PendingAborts::default()),
             next_completion_registration: std::sync::atomic::AtomicU64::new(1),
+            telemetry_cache: std::sync::Mutex::new(None),
         })
     }
 
@@ -3864,6 +3907,38 @@ impl Engine {
         core.running_request_count()
     }
 
+    /// Pending and running counts and the KV snapshot for telemetry without
+    /// waiting on a step: read from the core when no step holds it for
+    /// writing, else the values last read (marked stale). Only the first
+    /// call, with nothing cached, waits for the core.
+    pub(crate) async fn core_telemetry(&self) -> EngineCoreTelemetry {
+        let read = |core: &EngineCore| EngineCoreTelemetry {
+            pending_requests: core.pending_request_count(),
+            running_requests: core.running_request_count(),
+            kv_cache: core.managed_kv_runtime_snapshot(),
+            stale: false,
+        };
+        let cache = || {
+            self.telemetry_cache
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+        };
+        let fresh = match self.core.try_read() {
+            Ok(core) => read(&core),
+            Err(_) => {
+                if let Some(cached) = cache().clone() {
+                    return EngineCoreTelemetry {
+                        stale: true,
+                        ..cached
+                    };
+                }
+                read(&*self.core.read().await)
+            }
+        };
+        *cache() = Some(fresh.clone());
+        fresh
+    }
+
     /// Snapshot exact physical arena backing, page ownership, and counters.
     pub async fn kv_cache_snapshot(&self) -> ManagedKvRuntimeSnapshot {
         self.core.read().await.managed_kv_runtime_snapshot()
@@ -4645,6 +4720,7 @@ mod tests {
             delivery_lanes: Arc::new(std::sync::Mutex::new(DeliveryLaneState::default())),
             pending_aborts: Arc::new(PendingAborts::default()),
             next_completion_registration: std::sync::atomic::AtomicU64::new(1),
+            telemetry_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -6029,6 +6105,7 @@ mod tests {
             delivery_lanes: Arc::new(std::sync::Mutex::new(DeliveryLaneState::default())),
             pending_aborts: Arc::new(PendingAborts::default()),
             next_completion_registration: std::sync::atomic::AtomicU64::new(1),
+            telemetry_cache: std::sync::Mutex::new(None),
         });
 
         let policy = PhysicalLaunchPolicy::concurrent(2).unwrap();
@@ -6344,6 +6421,24 @@ mod tests {
 
         crate::backends::device_thread::watch_off_thread_ops(None);
         assert_eq!(watch.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn telemetry_never_waits_behind_a_step_holding_the_core() {
+        let engine = Engine::new(EngineCoreConfig::default()).unwrap();
+        let fresh = engine.core_telemetry().await;
+        assert!(!fresh.stale);
+        let step = engine.core.write().await;
+        let during = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            engine.core_telemetry(),
+        )
+        .await
+        .expect("telemetry waited for the step");
+        assert!(during.stale);
+        assert_eq!(during.pending_requests, fresh.pending_requests);
+        drop(step);
+        assert!(!engine.core_telemetry().await.stale);
     }
 
     #[tokio::test]

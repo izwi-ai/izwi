@@ -1,34 +1,46 @@
-//! Whole-step CUDA graph decode for one Qwen3.5 row (opt-in).
+//! Whole-step CUDA graph decode for Qwen3.5 batches of 1 to 32 rows.
 //!
 //! A decode step on CUDA is ~600-900 small launches; eager Candle pays host
 //! time for each, so the step is bound by the host, not the GPU. Here the
-//! whole step is captured once and replayed: the token embedding, every
-//! layer, the final norm and the LM head. Every per-step value lives in a
-//! device **step buffer** (U32): the token id, the position, the flat KV
-//! slot and the decode metadata `[context, first-page offset, block table]`.
-//! - Projections use the izwi-owned K-quant MMVQ (`kernels/cuda/kquant.rs`);
-//!   Candle's `QMatMul` keeps a global scratch buffer and cannot be captured.
-//! - DeltaNet layers run the fused decode kernels through a device address
-//!   table (`gdn::StateTable`). Each step allocates one slab of fresh state
-//!   outputs; committed state is never mutated in place.
-//! - Attention runs `rope::qk_norm_rope_kv` (q/k norm, RoPE and the K/V slot
-//!   write) and `split_decode::paged_decode_adaptive`, which read the step
-//!   buffer. Both take 16-bit activations, so q/k/v are cast to the KV
-//!   storage dtype (F16 on CUDA) inside the graph.
+//! whole step is captured once per batch width and replayed: the token
+//! embeddings, every layer, the final norm and the LM head. Every per-step
+//! value lives in a device **step buffer** (U32): each row's token id,
+//! position and flat KV slot, then the decode metadata `[context[rows] |
+//! first-page offset[rows] | block table[rows x max_blocks]]`.
+//! - Projections use the izwi-owned K-quant MMVQ (up to eight rows) and MMQ
+//!   (`kernels/cuda/kquant.rs`); Candle's `QMatMul` keeps global scratch
+//!   buffers and cannot be captured.
+//! - DeltaNet layers run the multi-row decode kernels through one device
+//!   address table per width (`gdn::RowsTable`, layer-major). Each step
+//!   allocates one slab of fresh state outputs per row; committed state is
+//!   never mutated in place.
+//! - Attention runs `rope::qk_norm_rope_kv_rows` (q/k norm, RoPE and each
+//!   row's K/V slot write) and `split_decode::paged_decode_adaptive`, which
+//!   read the step buffer. Both take 16-bit activations, so q/k/v are cast to
+//!   the KV storage dtype (F16 on CUDA) inside the graph.
 //!
-//! Phases: warm (eager, checked against the standard decode on a copy of the
-//! row state), capture + verify, verify again on fresh inputs (catches
-//! values a capture baked in), then replay. The step always continues on the
-//! eager result until replay. Any failure turns the graph off for the
-//! process and the step runs the standard decode.
+//! **Widths.** A step of `n` rows replays the graph of the smallest width in
+//! [`WIDTHS`] that holds it. The spare rows decode token 0 at position 0 into
+//! a KV slot past every cache (the write skips it), attend one token of page
+//! 0, and read and write a scratch DeltaNet state of their width's. Every op
+//! of the step is row-independent (per-row norms, projections, recurrences
+//! and attention), so a spare row changes no real row's values; its outputs
+//! are dropped.
+//!
+//! Phases, per width: warm (eager, checked against the standard decode on a
+//! copy of the rows' state), capture + verify, verify again on fresh inputs
+//! (catches values a capture baked in), then replay. The step always
+//! continues on the eager result until replay. Any failure turns every width
+//! off for the process and the step runs the standard decode.
 //!
 //! Off CUDA there is no capture: with `allow_eager` (tests) every step runs
-//! the same body eagerly with the arena's own attention and explicit state
-//! tensors, which checks the composition against the standard decode.
+//! the same body eagerly over its own rows with the arena's attention and
+//! explicit state tensors, which checks the composition against the standard
+//! decode.
 //!
-//! Default off: `IZWI_QWEN35_CUDA_GRAPH=1` enables it until it has been
-//! validated on the GPU, because a capture fault can leave a sticky CUDA
-//! error that only a restart clears.
+//! On by default on CUDA: `IZWI_QWEN35_CUDA_GRAPH=0` turns it off, and so
+//! does `cuda.decode_graphs=off`.
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
 
@@ -45,18 +57,33 @@ use crate::kernels::cuda::rope::{self, QkNormRopeSpec};
 use crate::kernels::cuda::segment_graph::{DeviceTable, SegmentGraph, SegmentInput};
 use crate::kernels::cuda::split_decode;
 use crate::kv::{KvArenaId, KvDecodeBatchMetadata, KvSlotRef};
-use crate::models::architectures::qwen35::fast_path::{compare_values, Qwen35FastPath};
+use crate::models::architectures::qwen35::fast_path::Qwen35FastPath;
 use crate::models::architectures::qwen35::linear::forward_shared;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
-/// Opt-in switch (a boolean; off when unset).
+/// Kill switch (a boolean; on when unset).
 pub(super) const GRAPH_ENV: &str = "IZWI_QWEN35_CUDA_GRAPH";
 
-/// Step buffer layout (U32).
-const TOKEN: usize = 0;
-const POSITION: usize = 1;
-const SLOT: usize = 2;
-const METADATA: usize = 4;
+/// The graphed batch widths. Each keeps its own graph, step buffer and table
+/// (about a megabyte of graph memory per row for the retained logits), so a
+/// step pads up to the next width rather than every width being captured.
+const WIDTHS: [usize; 10] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32];
+
+/// The widest batch a graph serves: the CUDA chat width.
+pub(super) const MAX_GRAPH_ROWS: usize = WIDTHS[WIDTHS.len() - 1];
+
+/// The width whose graph serves a step of `rows` rows.
+fn graph_width(rows: usize) -> Option<usize> {
+    WIDTHS.iter().copied().find(|width| *width >= rows.max(1))
+}
+
+/// A spare row's flat KV slot: past every cache, so the write skips it.
+const SPARE_SLOT: u32 = u32::MAX;
+
+/// Partitions a row's attention may take before its partitions grow past
+/// `split_decode::ROW_PARTITION_TOKENS` (8k tokens of context): at 32 rows of
+/// 16 heads of 256 dims, 34 MB of F32 partials per attention call.
+const ROW_INVARIANT_PARTITIONS: usize = 64;
 
 /// Logit agreement the warm step demands of the graph body against the
 /// standard decode. They differ in attention precision (16-bit q/k norm
@@ -66,7 +93,7 @@ const WARM_CHECK_REL_L2: f64 = 0.05;
 const WARM_CHECK_MAX_FRACTION: f32 = 0.1;
 
 fn graph_requested() -> bool {
-    crate::env::flag_or(GRAPH_ENV, false)
+    crate::env::flag_or(GRAPH_ENV, true)
 }
 
 /// The q/k norm + RoPE + KV write inputs one attention layer needs in the
@@ -99,13 +126,17 @@ impl GraphQk {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Warm,
     Capture,
     Verify,
+    /// A width that has passed verification captures again against moved
+    /// buffers (a grown KV arena, a new step buffer): the same body, so one
+    /// verified capture step suffices and the width replays from the next
+    /// step.
+    Recapture,
     Replay,
-    Disabled(String),
 }
 
 impl Phase {
@@ -114,32 +145,117 @@ impl Phase {
             Self::Warm => "warm",
             Self::Capture => "capture",
             Self::Verify => "verify",
+            Self::Recapture => "recapture",
             Self::Replay => "replay",
-            Self::Disabled(_) => "disabled",
         }
     }
 }
 
+/// The step buffer's layout (U32) for `rows` rows of `max_blocks` block-table
+/// entries: tokens, positions, flat KV slots, then the decode metadata
+/// `[context[rows] | first-page offset[rows] | block table[rows x max_blocks]]`
+/// that the split decode reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StepLayout {
+    rows: usize,
+    max_blocks: usize,
+}
+
+impl StepLayout {
+    fn positions(&self) -> usize {
+        self.rows
+    }
+
+    fn slots(&self) -> usize {
+        2 * self.rows
+    }
+
+    fn metadata(&self) -> usize {
+        3 * self.rows
+    }
+
+    fn metadata_len(&self) -> usize {
+        self.rows * (2 + self.max_blocks)
+    }
+
+    fn len(&self) -> usize {
+        self.metadata() + self.metadata_len()
+    }
+
+    /// The per-row values every step rewrites: tokens through the
+    /// first-page offsets.
+    fn head_len(&self) -> usize {
+        self.metadata() + 2 * self.rows
+    }
+
+    fn blocks(&self, row: usize) -> usize {
+        self.head_len() + row * self.max_blocks
+    }
+}
+
+/// One width's graph and the device buffers it reads.
 struct Runtime {
     phase: Phase,
     graph: SegmentGraph,
+    /// Every DeltaNet layer's rows: `[layer ordinal][row][TABLE_ENTRIES]`.
     table: Option<DeviceTable>,
     step: Option<StepBuffer>,
     /// The arena and backing generation the graph was captured against.
     captured_for: Option<(KvArenaId, u64)>,
-    /// Recorded after each step's queued work. The next step's stream waits
-    /// on it: consecutive steps may run on different threads, whose
-    /// per-thread streams are not ordered, while they share the table, the
-    /// step buffer and the graph's buffers.
+    /// The width has passed the full verification once.
+    verified: bool,
+    /// The warm check's relative L2 error and largest error over the largest
+    /// logit, against the standard decode.
+    warm_error: Option<(f64, f32)>,
+}
+
+impl Runtime {
+    fn new() -> Self {
+        Self {
+            phase: Phase::Warm,
+            graph: SegmentGraph::default(),
+            table: None,
+            step: None,
+            captured_for: None,
+            verified: false,
+            warm_error: None,
+        }
+    }
+
+    /// Drop the captured graph: the next step at this width captures again,
+    /// lightly once the width has been verified.
+    fn recapture(&mut self) {
+        self.graph.reset();
+        self.phase = match self.phase {
+            Phase::Warm => Phase::Warm,
+            _ if self.verified => Phase::Recapture,
+            _ => Phase::Capture,
+        };
+    }
+}
+
+/// Every width's runtime, and why graph decode was turned off, if it was.
+struct Graphs {
+    widths: BTreeMap<usize, Runtime>,
+    /// The scratch DeltaNet state every width's spare rows read and write:
+    /// graph steps never overlap (the lock and the fence order them).
+    spare: Option<StateOutputs>,
+    disabled: Option<String>,
+    /// Recorded after each graph step's queued work. The next step's stream
+    /// waits on it: consecutive steps may run on different threads, whose
+    /// per-thread streams are not ordered, while they share the tables, the
+    /// step buffers and the graphs' buffers.
     #[cfg(feature = "cuda")]
     fence: Option<candle_core::cuda_backend::cudarc::driver::CudaEvent>,
 }
 
-impl Runtime {
+impl Graphs {
     fn disable(&mut self, reason: String) {
-        self.graph.reset();
+        for runtime in self.widths.values_mut() {
+            runtime.graph.reset();
+        }
         tracing::warn!(%reason, "Qwen3.5 CUDA graph decode disabled; using the standard decode");
-        self.phase = Phase::Disabled(reason);
+        self.disabled = Some(reason);
     }
 
     /// Order this step's work after the previous step's (a GPU-side wait).
@@ -179,10 +295,10 @@ impl Runtime {
     }
 }
 
-impl Drop for Runtime {
+impl Drop for Graphs {
     fn drop(&mut self) {
         // Wait for the last step, which may have run on another thread,
-        // before the graph and the buffers it used are destroyed.
+        // before the graphs and the buffers they used are destroyed.
         #[cfg(feature = "cuda")]
         if let Some(fence) = &self.fence {
             let _ = fence.synchronize();
@@ -192,21 +308,77 @@ impl Drop for Runtime {
 
 /// Graph decode for one model (see the module docs).
 pub(super) struct Qwen35DecodeGraph {
-    /// Per layer: the DeltaNet ordinal (table slot `ordinal * TABLE_ENTRIES`).
+    /// Per layer: the DeltaNet ordinal (the layer's block of every table).
     linear_ordinal: Vec<Option<usize>>,
     linear_count: usize,
     /// Full-attention layers (arena bindings `0..attention`).
     attention: usize,
-    /// Longest context the step buffer's block table must cover.
+    /// Longest context the step buffer's block tables must cover.
     max_context: usize,
     /// Capture graphs (CUDA); otherwise the body runs eagerly every step.
     capture: bool,
-    runtime: Mutex<Runtime>,
+    graphs: Mutex<Graphs>,
     warmups: AtomicU64,
     captures: AtomicU64,
     replays: AtomicU64,
     verified: AtomicU64,
     standard_steps: AtomicU64,
+    /// Light recaptures of verified widths against moved buffers.
+    recaptures: AtomicU64,
+    /// Rows replayed (or run) as padding past the step's own rows.
+    spare_rows: AtomicU64,
+    graph_rows: AtomicU64,
+    host: HostTimes,
+}
+
+/// Host time of graph steps, by phase (microseconds, summed over steps):
+/// what the caller spent before handing the step over, gathering the rows'
+/// state, preparing the step buffer, slabs and table, the arena's graph-write
+/// window (warm, capture and verify, or the replay launch), and publishing
+/// the rows' new state.
+#[derive(Default)]
+struct HostTimes {
+    steps: AtomicU64,
+    setup_us: AtomicU64,
+    gather_us: AtomicU64,
+    prepare_us: AtomicU64,
+    launch_us: AtomicU64,
+    publish_us: AtomicU64,
+}
+
+impl HostTimes {
+    fn add(counter: &AtomicU64, since: std::time::Instant) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        counter.fetch_add((now - since).as_micros() as u64, Relaxed);
+        now
+    }
+
+    fn summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "steps": self.steps.load(Relaxed),
+            "setup": self.setup_us.load(Relaxed),
+            "gather": self.gather_us.load(Relaxed),
+            "prepare": self.prepare_us.load(Relaxed),
+            "launch": self.launch_us.load(Relaxed),
+            "publish": self.publish_us.load(Relaxed),
+        })
+    }
+}
+
+/// One step's rows, all on one KV arena.
+pub(super) struct StepRows<'a> {
+    pub(super) tokens: &'a [u32],
+    pub(super) positions: &'a [[usize; 3]],
+    pub(super) slots: &'a [KvSlotRef],
+    pub(super) caches: &'a [&'a PhysicalPagedKvCache],
+    pub(super) slot_map: &'a dyn KvSlotMap,
+    pub(super) metadata: &'a KvDecodeBatchMetadata,
+}
+
+impl StepRows<'_> {
+    fn len(&self) -> usize {
+        self.tokens.len()
+    }
 }
 
 impl Qwen35DecodeGraph {
@@ -221,9 +393,7 @@ impl Qwen35DecodeGraph {
         let device = &model.device;
         let refuse = |reason: String| (None, Qwen35FastPath::legacy(reason));
         if !graph_requested() && !allow_eager {
-            return refuse(format!(
-                "off until validated on the GPU; set {GRAPH_ENV}=1 to enable"
-            ));
+            return refuse(format!("{GRAPH_ENV} is off"));
         }
         if let Some(reason) = graphs_off {
             return refuse(reason.to_string());
@@ -236,7 +406,7 @@ impl Qwen35DecodeGraph {
         }
         if device.is_cuda() && !model.projections_all_kquant() {
             return refuse(
-                "CUDA graph decode needs the K-quant MMVQ on every projection (QMatMul cannot be captured)"
+                "CUDA graph decode needs the K-quant MMVQ/MMQ on every projection (QMatMul cannot be captured)"
                     .into(),
             );
         }
@@ -290,12 +460,10 @@ impl Qwen35DecodeGraph {
                 attention,
                 max_context,
                 capture: device.is_cuda(),
-                runtime: Mutex::new(Runtime {
-                    phase: Phase::Warm,
-                    graph: SegmentGraph::default(),
-                    table: None,
-                    step: None,
-                    captured_for: None,
+                graphs: Mutex::new(Graphs {
+                    widths: BTreeMap::new(),
+                    spare: None,
+                    disabled: None,
                     #[cfg(feature = "cuda")]
                     fence: None,
                 }),
@@ -304,84 +472,119 @@ impl Qwen35DecodeGraph {
                 replays: AtomicU64::new(0),
                 verified: AtomicU64::new(0),
                 standard_steps: AtomicU64::new(0),
+                recaptures: AtomicU64::new(0),
+                spare_rows: AtomicU64::new(0),
+                graph_rows: AtomicU64::new(0),
+                host: HostTimes::default(),
             }),
             Qwen35FastPath::Fused,
         )
     }
 
-    /// Diagnostics: phase, counters and the reason graph decode was turned
-    /// off at runtime, if it was.
+    /// Diagnostics: each width's phase, the counters and the reason graph
+    /// decode was turned off at runtime, if it was.
     pub(super) fn summary(&self) -> serde_json::Value {
-        let phase = self
-            .runtime
+        let graphs = self
+            .graphs
             .lock()
-            .map(|runtime| runtime.phase.clone())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().phase.clone());
-        let disabled = match &phase {
-            Phase::Disabled(reason) => Some(reason.clone()),
-            _ => None,
-        };
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let widths = graphs
+            .widths
+            .iter()
+            .map(|(width, runtime)| {
+                let mut entry = serde_json::json!({ "phase": runtime.phase.name() });
+                if let Some((rel_l2, max_fraction)) = runtime.warm_error {
+                    entry["warm_rel_l2"] = rel_l2.into();
+                    entry["warm_max_fraction"] = max_fraction.into();
+                }
+                (width.to_string(), entry)
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>();
         serde_json::json!({
-            "backend": if disabled.is_some() { "legacy" } else { "fused" },
-            "legacy_reasons": disabled.iter().collect::<Vec<_>>(),
-            "phase": phase.name(),
+            "backend": if graphs.disabled.is_some() { "legacy" } else { "fused" },
+            "legacy_reasons": graphs.disabled.iter().collect::<Vec<_>>(),
             "capture": self.capture,
+            "widths": widths,
             "warmups": self.warmups.load(Relaxed),
             "captures": self.captures.load(Relaxed),
             "replays": self.replays.load(Relaxed),
             "verified": self.verified.load(Relaxed),
             "standard_steps": self.standard_steps.load(Relaxed),
+            "recaptures": self.recaptures.load(Relaxed),
+            "graph_rows": self.graph_rows.load(Relaxed),
+            "spare_rows": self.spare_rows.load(Relaxed),
+            "host_us": self.host.summary(),
         })
     }
 
-    /// Run one decode row through the graph. `Ok(None)` hands the step to
-    /// the standard decode: graph decode is off or busy, the position is
-    /// multimodal, or the state is not in fused-decode form. `reference`
-    /// computes the standard decode's logits for the warm check.
-    #[allow(clippy::too_many_arguments)]
+    /// The caller's host time before [`Self::forward`] for a step that the
+    /// graph then served (slot lowering, sequence tables, reference copies).
+    pub(super) fn record_setup(&self, elapsed: std::time::Duration) {
+        self.host
+            .setup_us
+            .fetch_add(elapsed.as_micros() as u64, Relaxed);
+    }
+
+    /// Run one decode step of `rows` through the graph of its width.
+    /// `Ok(None)` hands the step to the standard decode: graph decode is off
+    /// or busy, the batch is wider than every graph, a position is
+    /// multimodal, the rows span arenas, or a state is not in fused-decode
+    /// form. `reference` computes the standard decode's logits for the warm
+    /// check. Returns logits `[rows, 1, vocab]`.
     pub(super) fn forward(
         &self,
         model: &Qwen35TextModel,
-        token: u32,
-        position: [usize; 3],
-        slot: KvSlotRef,
-        state: &mut Qwen35TextRuntimeState,
-        cache: &PhysicalPagedKvCache,
-        slots: &dyn KvSlotMap,
-        metadata: &KvDecodeBatchMetadata,
+        rows: &StepRows<'_>,
+        states: &mut [&mut Qwen35TextRuntimeState],
         completions: &mut KvWriteCompletionCollector,
         reference: &mut dyn FnMut() -> Result<Tensor>,
     ) -> Result<Option<Tensor>> {
-        let Ok(mut runtime) = self.runtime.try_lock() else {
-            self.standard_steps.fetch_add(1, Relaxed);
-            return Ok(None);
-        };
-        if matches!(runtime.phase, Phase::Disabled(_))
-            || position[0] != position[1]
-            || position[0] != position[2]
+        let n = rows.len();
+        if n == 0
+            || states.len() != n
+            || rows.positions.len() != n
+            || rows.slots.len() != n
+            || rows.caches.len() != n
+            || rows.metadata.sequences.len() != n
         {
+            return Err(graph_error("the step's rows do not match"));
+        }
+        let standard = || -> Result<Option<Tensor>> {
             self.standard_steps.fetch_add(1, Relaxed);
-            return Ok(None);
+            Ok(None)
+        };
+        let Some(width) = graph_width(n) else {
+            return standard();
+        };
+        let Ok(mut graphs) = self.graphs.try_lock() else {
+            return standard();
+        };
+        let arena = rows.caches[0].arena().id();
+        if graphs.disabled.is_some()
+            || rows
+                .positions
+                .iter()
+                .any(|position| position[0] != position[1] || position[0] != position[2])
+            || rows.caches.iter().any(|cache| cache.arena().id() != arena)
+        {
+            return standard();
         }
         let device = model.device.clone();
-        for (layer, layer_state) in model.layers.iter().zip(state.layers.iter_mut()) {
-            layer.ensure_state_initialized(layer_state, &device)?;
+        let started = std::time::Instant::now();
+        let mut inputs = Vec::with_capacity(n);
+        for state in states.iter_mut() {
+            for (layer, layer_state) in model.layers.iter().zip(state.layers.iter_mut()) {
+                layer.ensure_state_initialized(layer_state, &device)?;
+            }
+            let Some(input) = StateInputs::gather(model, state)? else {
+                return standard();
+            };
+            inputs.push(input);
         }
-        let Some(inputs) = StateInputs::gather(model, state)? else {
-            self.standard_steps.fetch_add(1, Relaxed);
-            return Ok(None);
-        };
-        runtime.order_after_previous(&device)?;
-        let request = StepRequest {
-            token,
-            position: position[0],
-            slot,
-            cache,
-            slots,
-            metadata,
-        };
+        HostTimes::add(&self.host.gather_us, started);
+        graphs.order_after_previous(&device)?;
         let step = if self.capture {
-            match self.captured(&mut runtime, model, &request, &inputs, reference) {
+            match self.captured(&mut graphs, width, model, rows, &inputs, reference) {
                 Ok((done, graph_completions)) => {
                     for completion in graph_completions {
                         completions.collect(completion)?;
@@ -389,80 +592,99 @@ impl Qwen35DecodeGraph {
                     Ok(Some(done))
                 }
                 Err(error) => {
-                    runtime.disable(format!("graph decode step failed: {error}"));
+                    graphs.disable(format!(
+                        "graph decode step of {n} rows (width {width}) failed: {error}"
+                    ));
                     Ok(None)
                 }
             }
         } else {
-            self.eager(&mut runtime, model, &request, &inputs, completions)
-                .map(Some)
+            self.eager(model, rows, &inputs, completions).map(Some)
         };
-        let marked = runtime.mark_step_end(&device);
+        let marked = graphs.mark_step_end(&device);
         let done = match step {
             Ok(Some(done)) => done,
-            Ok(None) => {
-                self.standard_steps.fetch_add(1, Relaxed);
-                return Ok(None);
-            }
+            Ok(None) => return standard(),
             Err(error) => return Err(error),
         };
         marked?;
-        drop(runtime);
-        done.published.publish(model, state)?;
+        drop(graphs);
+        let publishing = std::time::Instant::now();
+        for (published, state) in done.published.into_iter().zip(states.iter_mut()) {
+            published.publish(model, state)?;
+        }
+        HostTimes::add(&self.host.publish_us, publishing);
+        self.host.steps.fetch_add(1, Relaxed);
         Ok(Some(done.logits))
     }
 
-    /// Eager devices: the body with the arena's attention, every step.
+    /// Eager devices: the body over the step's own rows with the arena's
+    /// attention, every step.
     fn eager(
         &self,
-        runtime: &mut Runtime,
         model: &Qwen35TextModel,
-        request: &StepRequest<'_>,
-        inputs: &StateInputs,
+        rows: &StepRows<'_>,
+        inputs: &[StateInputs],
         completions: &mut KvWriteCompletionCollector,
     ) -> Result<StepDone> {
         let device = model.device.clone();
-        let max_blocks = self.max_blocks(request.cache)?;
-        let step = self.step_buffer(runtime, &device, max_blocks, request)?;
-        let published = StateOutputs::allocate(model, &device)?;
+        let n = rows.len();
+        let layout = StepLayout {
+            rows: n,
+            max_blocks: self.max_blocks(rows.caches[0])?,
+        };
+        let mut step = StepBuffer::new(&device, layout)?;
+        step.write(rows)?;
+        let published = (0..n)
+            .map(|_| StateOutputs::allocate(model, &device))
+            .collect::<Result<Vec<_>>>()?;
         let ios = direct_io(model, inputs, &published);
-        let rope = model.rope_table(
-            model.first_attention()?,
-            &[[request.position; 3]],
-            (1, 1),
-            DType::F32,
-        )?;
+        let rope =
+            model.rope_table(model.first_attention()?, rows.positions, (n, 1), DType::F32)?;
         let mut attention = Attention::Arena {
             rope: rope.as_ref(),
-            cache: request.cache,
-            slots: request.slots,
-            metadata: request.metadata,
+            caches: rows.caches,
+            slots: rows.slot_map,
+            metadata: rows.metadata,
             completions,
         };
         self.warmups.fetch_add(1, Relaxed);
-        let logits = body(model, &step, &ios, &mut attention)?;
+        let logits = body(model, &step.tensor, n, &ios, &mut attention)?;
+        self.graph_rows.fetch_add(n as u64, Relaxed);
         Ok(StepDone { logits, published })
     }
 
-    /// CUDA: warm, capture and verify, or replay, inside the arena's
-    /// graph-write bookkeeping.
+    /// CUDA: warm, capture and verify, or replay the graph of `width` rows,
+    /// inside the arena's graph-write bookkeeping.
     fn captured(
         &self,
-        runtime: &mut Runtime,
+        graphs: &mut Graphs,
+        width: usize,
         model: &Qwen35TextModel,
-        request: &StepRequest<'_>,
-        inputs: &StateInputs,
+        rows: &StepRows<'_>,
+        inputs: &[StateInputs],
         reference: &mut dyn FnMut() -> Result<Tensor>,
     ) -> Result<(StepDone, Vec<KvWriteCompletion>)> {
+        let n = rows.len();
         let device = model.device.clone();
-        let arena = request.cache.arena().clone();
+        let preparing = std::time::Instant::now();
+        let cache = rows.caches[0];
+        let arena = cache.arena().clone();
         let config = arena.config();
         if config.dtype != DType::F16 && config.dtype != DType::BF16 {
             return Err(graph_error("graph attention needs a 16-bit KV cache"));
         }
-        let kv_dtype = config.dtype;
         let page_tokens = config.page_tokens as usize;
-        let max_blocks = self.max_blocks(request.cache)?;
+        let layout = StepLayout {
+            rows: width,
+            max_blocks: self.max_blocks(cache)?,
+        };
+        let Graphs { widths, spare, .. } = graphs;
+        if width > n && spare.is_none() {
+            *spare = Some(StateOutputs::allocate(model, &device)?);
+        }
+        let spare = spare.as_ref();
+        let runtime = widths.entry(width).or_insert_with(Runtime::new);
         // The warm step checks the body against the standard decode first:
         // the standard path calls the arena, which `with_graph_writes`
         // serializes.
@@ -471,9 +693,19 @@ impl Qwen35DecodeGraph {
         } else {
             None
         };
-        let step = self.step_buffer(runtime, &device, max_blocks, request)?;
-        let published = StateOutputs::allocate(model, &device)?;
-        let entries = self.table_values(inputs, &published)?;
+        if runtime.step.as_ref().map(|step| step.layout) != Some(layout) {
+            runtime.step = Some(StepBuffer::new(&device, layout)?);
+            runtime.recapture();
+        }
+        runtime
+            .step
+            .as_mut()
+            .expect("step buffer allocated")
+            .write(rows)?;
+        let published = (0..n)
+            .map(|_| StateOutputs::allocate(model, &device))
+            .collect::<Result<Vec<_>>>()?;
+        let entries = self.table_values(width, inputs, &published, spare)?;
         if runtime.table.as_ref().map(DeviceTable::entries) != Some(entries.len()) {
             runtime.table = Some(DeviceTable::new(&device, entries.len())?);
             runtime.graph.reset();
@@ -484,46 +716,56 @@ impl Qwen35DecodeGraph {
             .as_mut()
             .expect("table allocated")
             .write(0, &entries)?;
-        let ios = self.table_io(runtime.table.as_ref().expect("table").address())?;
+        let ios = self.table_io(width, runtime.table.as_ref().expect("table"))?;
         let bindings = (0..self.attention)
-            .map(|layer| request.cache.layer_binding(layer))
+            .map(|layer| cache.layer_binding(layer))
             .collect::<Result<Vec<_>>>()?;
-        let metadata = runtime
-            .step
-            .as_ref()
-            .expect("step buffer allocated")
-            .metadata()?;
-        let max_partitions =
-            split_decode::partitions(1, model.first_attention()?.num_kv_heads, self.max_context);
+        let step_buffer = runtime.step.as_ref().expect("step buffer allocated");
+        let step = step_buffer.tensor.clone();
+        let positions = step.narrow(0, layout.positions(), width)?;
+        let slots = step.narrow(0, layout.slots(), width)?;
+        let metadata = step.narrow(0, layout.metadata(), layout.metadata_len())?;
+        // Each row splits its own context into 128-token partitions, as the
+        // arena's row-invariant decode does, up to this cap: the occupancy
+        // count, but at least enough for an 8k-token context, so the graph
+        // and the row-invariant decode agree on every row up to there.
+        let max_partitions = split_decode::partitions(
+            width,
+            model.first_attention()?.num_kv_heads,
+            self.max_context,
+        )
+        .max(
+            self.max_context
+                .div_ceil(split_decode::ROW_PARTITION_TOKENS)
+                .min(ROW_INVARIANT_PARTITIONS),
+        );
         let mut output = None;
+        let launching = HostTimes::add(&self.host.prepare_us, preparing);
         let completions = arena.with_graph_writes(
             &bindings,
-            request.slots,
+            rows.slot_map,
             self.attention as u64,
             &mut |caches| {
                 let key = (arena.id(), caches.generation);
                 if runtime.captured_for != Some(key) {
-                    runtime.graph.reset();
-                    if runtime.phase != Phase::Warm {
-                        runtime.phase = Phase::Capture;
-                    }
+                    runtime.recapture();
                     runtime.captured_for = Some(key);
                 }
                 let mut attention = Attention::Graph {
                     caches: &caches.layers,
-                    step: &step,
-                    metadata: metadata.clone(),
-                    kv_dtype,
+                    positions: &positions,
+                    slots: &slots,
+                    metadata: &metadata,
                     page_tokens,
-                    max_blocks,
+                    max_blocks: layout.max_blocks,
                     max_partitions,
                 };
                 let run_body = |attention: &mut Attention<'_>, step: &Tensor| {
-                    body(model, step, &ios, attention)
+                    body(model, step, width, &ios, attention)
                         .map(|out| vec![out])
                         .map_err(candle_core::Error::wrap)
                 };
-                output = match runtime.phase.clone() {
+                output = match runtime.phase {
                     Phase::Warm => {
                         self.warmups.fetch_add(1, Relaxed);
                         SegmentGraph::warm(&device, std::slice::from_ref(&step), |inputs| {
@@ -532,8 +774,8 @@ impl Qwen35DecodeGraph {
                         .into_iter()
                         .next()
                     }
-                    Phase::Capture | Phase::Verify => {
-                        if runtime.phase == Phase::Capture {
+                    Phase::Capture | Phase::Verify | Phase::Recapture => {
+                        if matches!(runtime.phase, Phase::Capture | Phase::Recapture) {
                             runtime.graph.capture(
                                 &[SegmentInput {
                                     tensor: &step,
@@ -543,9 +785,14 @@ impl Qwen35DecodeGraph {
                             )?;
                             self.captures.fetch_add(1, Relaxed);
                         }
-                        let eager = body(model, &step, &ios, &mut attention)?;
-                        self.verify(runtime, model, inputs, &published, &device, &step, &eager)?;
+                        let eager = body(model, &step, width, &ios, &mut attention)?;
+                        self.verify(
+                            runtime, spare, model, width, inputs, &published, &step, &eager,
+                        )?;
                         self.verified.fetch_add(1, Relaxed);
+                        if runtime.phase == Phase::Recapture {
+                            self.recaptures.fetch_add(1, Relaxed);
+                        }
                         Some(eager)
                     }
                     Phase::Replay => {
@@ -554,48 +801,70 @@ impl Qwen35DecodeGraph {
                             adopt: true,
                         }])?;
                         self.replays.fetch_add(1, Relaxed);
-                        // The retained output is overwritten by the next replay.
-                        out.into_iter().next().map(|out| out.copy()).transpose()?
+                        // The retained output is overwritten by the next
+                        // replay; only the step's own rows are kept.
+                        out.into_iter()
+                            .next()
+                            .map(|out| out.narrow(0, 0, n)?.copy())
+                            .transpose()?
                     }
-                    Phase::Disabled(_) => None,
                 };
                 Ok(())
             },
         )?;
+        HostTimes::add(&self.host.launch_us, launching);
         let logits = output.ok_or_else(|| graph_error("the step produced no output"))?;
+        let logits = if logits.dim(0)? == n {
+            logits
+        } else {
+            logits.narrow(0, 0, n)?
+        };
         if let Some(expected) = expected {
-            compare_values(
-                "graph decode against the standard decode",
-                &host(&logits)?,
-                &host(&expected)?,
+            let observed = device_compare(
+                &[(
+                    "graph decode against the standard decode",
+                    logits.clone(),
+                    expected,
+                )],
                 WARM_CHECK_REL_L2,
                 WARM_CHECK_MAX_FRACTION,
             )?;
+            runtime.warm_error = observed.first().copied();
         }
-        runtime.phase = match runtime.phase.clone() {
+        runtime.phase = match runtime.phase {
             Phase::Warm => Phase::Capture,
             Phase::Capture => Phase::Verify,
-            Phase::Verify => Phase::Replay,
-            other => other,
+            Phase::Verify | Phase::Recapture | Phase::Replay => Phase::Replay,
         };
+        if runtime.phase == Phase::Replay {
+            runtime.verified = true;
+        }
+        self.graph_rows.fetch_add(n as u64, Relaxed);
+        self.spare_rows.fetch_add((width - n) as u64, Relaxed);
         Ok((StepDone { logits, published }, completions))
     }
 
-    /// Replay into scratch DeltaNet outputs and compare with the eager run.
+    /// Replay into scratch DeltaNet outputs and compare with the eager run,
+    /// over the step's own rows.
     #[allow(clippy::too_many_arguments)]
     fn verify(
         &self,
         runtime: &mut Runtime,
+        spare: Option<&StateOutputs>,
         model: &Qwen35TextModel,
-        inputs: &StateInputs,
-        published: &StateOutputs,
-        device: &Device,
+        width: usize,
+        inputs: &[StateInputs],
+        published: &[StateOutputs],
         step: &Tensor,
         eager: &Tensor,
     ) -> Result<()> {
-        let scratch = StateOutputs::allocate(model, device)?;
-        let scratch_entries = self.table_values(inputs, &scratch)?;
-        let published_entries = self.table_values(inputs, published)?;
+        let n = inputs.len();
+        let device = model.device.clone();
+        let scratch = (0..n)
+            .map(|_| StateOutputs::allocate(model, &device))
+            .collect::<Result<Vec<_>>>()?;
+        let scratch_entries = self.table_values(width, inputs, &scratch, spare)?;
+        let published_entries = self.table_values(width, inputs, published, spare)?;
         let table = runtime
             .table
             .as_mut()
@@ -614,39 +883,25 @@ impl Qwen35DecodeGraph {
         let replayed = replayed
             .first()
             .ok_or_else(|| graph_error("the graph returned nothing"))?;
-        compare_values(
+        // One readback for the logits and every row's whole state slab (all
+        // layers' conv history and recurrent state).
+        let mut pairs = vec![(
             "graph decode output",
-            &host(replayed)?,
-            &host(eager)?,
-            0.01,
-            0.02,
-        )?;
-        for (layer, (graph_state, eager_state)) in
-            scratch.layers.iter().zip(&published.layers).enumerate()
-        {
-            let (Some(graph_state), Some(eager_state)) = (graph_state, eager_state) else {
-                continue;
-            };
-            compare_values(
-                &format!("graph decode layer {layer} conv history"),
-                &host(&graph_state.history)?,
-                &host(&eager_state.history)?,
-                1e-6,
-                1e-6,
-            )?;
-            compare_values(
-                &format!("graph decode layer {layer} recurrent state"),
-                &host(&graph_state.state)?,
-                &host(&eager_state.state)?,
-                0.01,
-                0.02,
-            )?;
+            replayed.narrow(0, 0, n)?,
+            eager.narrow(0, 0, n)?,
+        )];
+        for (graph_row, eager_row) in scratch.iter().zip(published) {
+            pairs.push((
+                "graph decode DeltaNet state",
+                graph_row.slab.clone(),
+                eager_row.slab.clone(),
+            ));
         }
-        Ok(())
+        device_compare(&pairs, 0.01, 0.02).map(drop)
     }
 
-    /// Block-table capacity of the step buffer: the longest context in pages,
-    /// plus one for a first-page offset.
+    /// Block-table capacity per row: the longest context in pages, plus one
+    /// for a first-page offset.
     fn max_blocks(&self, cache: &PhysicalPagedKvCache) -> Result<usize> {
         let page_tokens = cache.arena().config().page_tokens as usize;
         if page_tokens == 0 {
@@ -655,67 +910,37 @@ impl Qwen35DecodeGraph {
         Ok(self.max_context.div_ceil(page_tokens) + 1)
     }
 
-    /// The step buffer for `request`, allocated (or reallocated for a new
-    /// block-table capacity, which forces a recapture) and brought up to
-    /// date.
-    fn step_buffer(
+    /// Every DeltaNet layer's entries for `width` rows, layer-major: the
+    /// step's rows `inputs` to `outputs`, then the spare rows on `spare`
+    /// (CUDA).
+    fn table_values(
         &self,
-        runtime: &mut Runtime,
-        device: &Device,
-        max_blocks: usize,
-        request: &StepRequest<'_>,
-    ) -> Result<Tensor> {
-        let [sequence] = request.metadata.sequences.as_slice() else {
-            return Err(graph_error("graph decode serves one row"));
-        };
-        if sequence.blocks.len() > max_blocks {
-            return Err(graph_error("the row's block table exceeds the step buffer"));
-        }
-        if runtime.step.as_ref().map(|step| step.max_blocks) != Some(max_blocks) {
-            runtime.step = Some(StepBuffer::new(device, max_blocks)?);
-            runtime.graph.reset();
-            if runtime.phase != Phase::Warm {
-                runtime.phase = Phase::Capture;
-            }
-        }
-        let page_tokens = request.cache.arena().config().page_tokens;
-        let slot = request
-            .slot
-            .block
-            .index
-            .checked_mul(page_tokens)
-            .and_then(|base| base.checked_add(request.slot.offset))
-            .ok_or_else(|| graph_error("KV slot index overflow"))?;
-        let position = u32::try_from(request.position)
-            .map_err(|_| graph_error("decode position exceeds u32"))?;
-        let step = runtime.step.as_mut().expect("step buffer allocated");
-        let mut values = vec![0u32; METADATA + 2 + sequence.blocks.len()];
-        values[TOKEN] = request.token;
-        values[POSITION] = position;
-        values[SLOT] = slot;
-        values[METADATA] = sequence.context_len;
-        values[METADATA + 1] = sequence.first_page_offset;
-        for (entry, block) in values[METADATA + 2..].iter_mut().zip(&sequence.blocks) {
-            *entry = block.index;
-        }
-        step.update(&values)?;
-        Ok(step.tensor.clone())
-    }
-
-    /// Every DeltaNet layer's six table entries, `inputs` to `outputs`, in
-    /// table order (CUDA).
-    fn table_values(&self, inputs: &StateInputs, outputs: &StateOutputs) -> Result<Vec<u64>> {
-        let mut values = Vec::with_capacity(self.linear_count * gdn::TABLE_ENTRIES);
+        width: usize,
+        inputs: &[StateInputs],
+        outputs: &[StateOutputs],
+        spare: Option<&StateOutputs>,
+    ) -> Result<Vec<u64>> {
+        let mut values = Vec::with_capacity(self.linear_count * width * gdn::TABLE_ENTRIES);
         for (layer, ordinal) in self.linear_ordinal.iter().enumerate() {
-            if ordinal.is_some() {
-                values.extend(table_entries(inputs, outputs, layer)?);
+            if ordinal.is_none() {
+                continue;
+            }
+            for (input, output) in inputs.iter().zip(outputs) {
+                values.extend(table_entries(input, output, layer)?);
+            }
+            if width > inputs.len() {
+                let spare = spare.ok_or_else(|| graph_error("spare rows have no state"))?;
+                let entries = spare_entries(spare, layer)?;
+                for _ in inputs.len()..width {
+                    values.extend(entries);
+                }
             }
         }
         Ok(values)
     }
 
-    /// Table-addressed IO for every DeltaNet layer, the table at `address`.
-    fn table_io(&self, address: u64) -> Result<Vec<Option<LinearStateIo>>> {
+    /// Table-addressed IO for every DeltaNet layer of a `width`-row step.
+    fn table_io(&self, width: usize, table: &DeviceTable) -> Result<Vec<Option<LinearStateIo>>> {
         #[cfg(feature = "cuda")]
         {
             Ok(self
@@ -723,73 +948,115 @@ impl Qwen35DecodeGraph {
                 .iter()
                 .map(|ordinal| {
                     ordinal.map(|ordinal| {
-                        LinearStateIo::Table(gdn::StateTable {
-                            address,
-                            slot: ordinal * gdn::TABLE_ENTRIES,
-                        })
+                        LinearStateIo::Table(gdn::RowsTable::of(
+                            table,
+                            ordinal * width * gdn::TABLE_ENTRIES,
+                        ))
                     })
                 })
                 .collect())
         }
         #[cfg(not(feature = "cuda"))]
         {
-            let _ = address;
+            let _ = (width, table);
             Err(graph_error("device tables need CUDA"))
         }
     }
 }
 
-/// One decode row's inputs for the step.
-struct StepRequest<'a> {
-    token: u32,
-    position: usize,
-    slot: KvSlotRef,
-    cache: &'a PhysicalPagedKvCache,
-    slots: &'a dyn KvSlotMap,
-    metadata: &'a KvDecodeBatchMetadata,
-}
-
-/// A finished step: logits and the DeltaNet state to publish.
+/// A finished step: logits and each row's DeltaNet state to publish.
 struct StepDone {
     logits: Tensor,
-    published: StateOutputs,
+    published: Vec<StateOutputs>,
 }
 
 /// The step buffer: per-step values the graph reads on the device.
 struct StepBuffer {
     tensor: Tensor,
-    max_blocks: usize,
-    /// What the device holds, to upload only the changed range.
+    layout: StepLayout,
+    /// What the device holds, to upload only the changed ranges.
     mirror: Vec<u32>,
 }
 
 impl StepBuffer {
-    fn new(device: &Device, max_blocks: usize) -> Result<Self> {
-        let len = METADATA + 2 + max_blocks;
-        Ok(Self {
+    fn new(device: &Device, layout: StepLayout) -> Result<Self> {
+        let len = layout.len();
+        let mut buffer = Self {
             tensor: Tensor::zeros(len, DType::U32, device)?,
-            max_blocks,
+            layout,
             mirror: vec![0; len],
-        })
+        };
+        // Spare rows attend one token: a zero context would leave their
+        // split-decode partitions empty.
+        let mut head = vec![0u32; layout.head_len()];
+        for row in 0..layout.rows {
+            head[layout.slots() + row] = SPARE_SLOT;
+            head[layout.metadata() + row] = 1;
+        }
+        buffer.update(0, &head)?;
+        Ok(buffer)
     }
 
-    /// Bring the device copy to `values` (a prefix of the buffer), uploading
-    /// only the range that changed, stream-ordered after queued work.
-    fn update(&mut self, values: &[u32]) -> Result<()> {
-        let differs = |index: &usize| values[*index] != self.mirror[*index];
+    /// Write `rows` into the buffer: each row's token, position, flat slot,
+    /// context, first-page offset and block table; the rows past them stay
+    /// spare.
+    fn write(&mut self, rows: &StepRows<'_>) -> Result<()> {
+        let layout = self.layout;
+        let n = rows.len();
+        if n > layout.rows {
+            return Err(graph_error("the step has more rows than its width"));
+        }
+        let page_tokens = rows.caches[0].arena().config().page_tokens;
+        let mut head = vec![0u32; layout.head_len()];
+        for row in 0..layout.rows {
+            head[layout.slots() + row] = SPARE_SLOT;
+            head[layout.metadata() + row] = 1;
+        }
+        for row in 0..n {
+            let sequence = &rows.metadata.sequences[row];
+            if sequence.blocks.len() > layout.max_blocks {
+                return Err(graph_error("a row's block table exceeds the step buffer"));
+            }
+            let slot = rows.slots[row];
+            head[row] = rows.tokens[row];
+            head[layout.positions() + row] = u32::try_from(rows.positions[row][0])
+                .map_err(|_| graph_error("decode position exceeds u32"))?;
+            head[layout.slots() + row] = slot
+                .block
+                .index
+                .checked_mul(page_tokens)
+                .and_then(|base| base.checked_add(slot.offset))
+                .filter(|flat| *flat != SPARE_SLOT)
+                .ok_or_else(|| graph_error("KV slot index overflow"))?;
+            head[layout.metadata() + row] = sequence.context_len;
+            head[layout.metadata() + layout.rows + row] = sequence.first_page_offset;
+        }
+        self.update(0, &head)?;
+        for row in 0..layout.rows {
+            let blocks = match rows.metadata.sequences.get(row) {
+                Some(sequence) => sequence.blocks.iter().map(|block| block.index).collect(),
+                // A spare row reads page 0.
+                None => vec![0u32],
+            };
+            self.update(layout.blocks(row), &blocks)?;
+        }
+        Ok(())
+    }
+
+    /// Bring the device range at `offset` to `values`, uploading only the
+    /// span that changed, stream-ordered after queued work.
+    fn update(&mut self, offset: usize, values: &[u32]) -> Result<()> {
+        let mirror = &self.mirror[offset..offset + values.len()];
+        let differs = |index: &usize| values[*index] != mirror[*index];
         let (Some(first), Some(last)) = (
             (0..values.len()).find(differs),
             (0..values.len()).rev().find(differs),
         ) else {
             return Ok(());
         };
-        upload(&self.tensor, first, &values[first..=last])?;
-        self.mirror[first..=last].copy_from_slice(&values[first..=last]);
+        upload(&self.tensor, offset + first, &values[first..=last])?;
+        self.mirror[offset + first..=offset + last].copy_from_slice(&values[first..=last]);
         Ok(())
-    }
-
-    fn metadata(&self) -> Result<Tensor> {
-        Ok(self.tensor.narrow(0, METADATA, 2 + self.max_blocks)?)
     }
 }
 
@@ -802,6 +1069,9 @@ fn upload(tensor: &Tensor, offset: usize, values: &[u32]) -> Result<()> {
         let candle_core::Storage::Cuda(storage) = &*storage else {
             return Err(graph_error("the step buffer is not a CUDA tensor"));
         };
+        if offset + values.len() > tensor.elem_count() {
+            return Err(graph_error("a step buffer write past its end"));
+        }
         let stream = cuda.cuda_stream();
         let (base, _guard) = storage.as_cuda_slice::<u32>()?.device_ptr(&stream);
         let destination = base + ((layout.start_offset() + offset) * 4) as u64;
@@ -809,8 +1079,8 @@ fn upload(tensor: &Tensor, offset: usize, values: &[u32]) -> Result<()> {
             .context()
             .bind_to_thread()
             .map_err(|error| graph_error(&format!("step buffer bind: {error}")))?;
-        // SAFETY: the range lies inside the buffer (callers write within its
-        // length), and a pageable source is staged before the call returns.
+        // SAFETY: the range lies inside the buffer (checked above), and a
+        // pageable source is staged before the call returns.
         unsafe { result::memcpy_htod_async(destination, values, stream.cu_stream()) }
             .map_err(|error| graph_error(&format!("step buffer upload: {error}")))?;
         return Ok(());
@@ -820,18 +1090,21 @@ fn upload(tensor: &Tensor, offset: usize, values: &[u32]) -> Result<()> {
     Ok(())
 }
 
-/// Where one DeltaNet layer reads its state and writes the next one.
+/// Where one DeltaNet layer reads its rows' state and writes the next one.
 enum LinearStateIo {
-    /// CUDA: addresses in the step's device table.
+    /// CUDA: the layer's rows in the step's device table.
     #[cfg(feature = "cuda")]
-    Table(gdn::StateTable),
-    /// Other devices: explicit tensors; the outputs are written in place.
-    Direct {
-        history: [Tensor; 3],
-        state: Tensor,
-        history_out: Tensor,
-        state_out: Tensor,
-    },
+    Table(gdn::RowsTable),
+    /// Other devices: explicit tensors per row; the outputs are written in
+    /// place.
+    Direct(Vec<DirectRow>),
+}
+
+struct DirectRow {
+    history: [Tensor; 3],
+    state: Tensor,
+    history_out: Tensor,
+    state_out: Tensor,
 }
 
 /// Attention for the step body.
@@ -840,9 +1113,9 @@ enum Attention<'a> {
     /// driven by the step buffer: capturable.
     Graph {
         caches: &'a [(Tensor, Tensor)],
-        step: &'a Tensor,
-        metadata: Tensor,
-        kv_dtype: DType,
+        positions: &'a Tensor,
+        slots: &'a Tensor,
+        metadata: &'a Tensor,
         page_tokens: usize,
         max_blocks: usize,
         max_partitions: usize,
@@ -850,23 +1123,24 @@ enum Attention<'a> {
     /// The arena's own write and decode (eager devices, tests).
     Arena {
         rope: Option<&'a super::Qwen35RopeTable>,
-        cache: &'a PhysicalPagedKvCache,
+        caches: &'a [&'a PhysicalPagedKvCache],
         slots: &'a dyn KvSlotMap,
         metadata: &'a KvDecodeBatchMetadata,
         completions: &'a mut KvWriteCompletionCollector,
     },
 }
 
-/// The step body: embedding of `step[TOKEN]`, every layer, the final norm
-/// and the LM head. Returns logits `[1, 1, vocab]`, as the standard decode
-/// does.
+/// The step body over `rows` rows: the embeddings of the step buffer's
+/// tokens, every layer, the final norm and the LM head. Returns logits
+/// `[rows, 1, vocab]`, as the standard decode does.
 fn body(
     model: &Qwen35TextModel,
     step: &Tensor,
+    rows: usize,
     ios: &[Option<LinearStateIo>],
     attention: &mut Attention<'_>,
 ) -> Result<Tensor> {
-    let ids = step.narrow(0, TOKEN, 1)?.reshape((1, 1))?;
+    let ids = step.narrow(0, 0, rows)?.reshape((rows, 1))?;
     let mut hidden = model.token_table.embed(&ids)?;
     let mut physical = 0usize;
     for (index, layer) in model.layers.iter().enumerate() {
@@ -877,10 +1151,10 @@ fn body(
                 let io = ios[index]
                     .as_ref()
                     .ok_or_else(|| graph_error("DeltaNet layer has no state IO"))?;
-                mixer.forward_graph(&normalized, io)?
+                mixer.forward_graph(&normalized, io, rows)?
             }
             Qwen35Mixer::Full(full) => {
-                let mixed = attend(full, &normalized, attention, physical)?;
+                let mixed = attend(full, &normalized, attention, physical, rows)?;
                 physical += 1;
                 mixed
             }
@@ -899,15 +1173,16 @@ fn attend(
     normalized: &Tensor,
     attention: &mut Attention<'_>,
     physical: usize,
+    rows: usize,
 ) -> Result<Tensor> {
     let [q_out, k_out, v_out] =
         forward_shared(normalized, [&full.q_proj, &full.k_proj, &full.v_proj])?;
     let attended = match attention {
         Attention::Graph {
             caches,
-            step,
+            positions,
+            slots,
             metadata,
-            kv_dtype,
             page_tokens,
             max_blocks,
             max_partitions,
@@ -919,21 +1194,14 @@ fn attend(
             let (cache_keys, cache_values) = caches
                 .get(physical)
                 .ok_or_else(|| graph_error("no KV cache for an attention layer"))?;
-            // The fused q/k norm + RoPE + write and the split decode take
-            // 16-bit activations; the trunk is F32.
-            let q_proj =
-                q_out
-                    .to_dtype(*kv_dtype)?
-                    .reshape((1, 1, full.num_heads, full.head_dim * 2))?;
-            let keys =
-                k_out
-                    .to_dtype(*kv_dtype)?
-                    .reshape((1, 1, full.num_kv_heads, full.head_dim))?;
-            let values =
-                v_out
-                    .to_dtype(*kv_dtype)?
-                    .reshape((1, 1, full.num_kv_heads, full.head_dim))?;
-            let queries = rope::qk_norm_rope_kv(
+            // The fused q/k norm + RoPE + write reads the F32 projections
+            // and rounds once into the cache dtype, as the standard decode
+            // norms and rotates in F32 before its cast; the split decode
+            // takes the 16-bit queries it returns.
+            let q_proj = q_out.reshape((rows, full.num_heads * full.head_dim * 2))?;
+            let keys = k_out.reshape((rows, full.num_kv_heads * full.head_dim))?;
+            let values = v_out.reshape((rows, full.num_kv_heads * full.head_dim))?;
+            let queries = rope::qk_norm_rope_kv_rows(
                 &q_proj,
                 &keys,
                 &values,
@@ -941,16 +1209,18 @@ fn attend(
                 &qk.k_gain,
                 &qk.inv_freq,
                 &qk.spec,
-                step,
+                positions,
+                slots,
                 cache_keys,
                 cache_values,
+                rows,
             )?;
             split_decode::paged_decode_adaptive(
-                &queries.reshape((1, full.num_heads, full.head_dim))?,
+                &queries.reshape((rows, full.num_heads, full.head_dim))?,
                 cache_keys,
                 cache_values,
                 metadata,
-                1,
+                rows,
                 full.num_heads,
                 full.num_kv_heads,
                 *page_tokens,
@@ -959,12 +1229,12 @@ fn attend(
                 None,
                 *max_partitions,
             )?
-            .reshape((1, 1, full.num_heads * full.head_dim))?
+            .reshape((rows, 1, full.num_heads * full.head_dim))?
             .to_dtype(q_out.dtype())?
         }
         Attention::Arena {
             rope,
-            cache,
+            caches,
             slots,
             metadata,
             completions,
@@ -973,20 +1243,26 @@ fn attend(
             &k_out,
             &v_out,
             *rope,
-            &[*cache],
+            caches,
             *slots,
             metadata,
             completions,
             physical,
+            false,
         )?,
     };
     full.decode_output(&attended, &q_out)
 }
 
 impl Qwen35LinearAttention {
-    /// One token through the fused DeltaNet kernels with explicit state IO:
-    /// the graph form of the fused decode.
-    fn forward_graph(&self, hidden_states: &Tensor, io: &LinearStateIo) -> Result<Tensor> {
+    /// `rows` tokens through the fused DeltaNet kernels with explicit state
+    /// IO: the graph form of the batched fused decode.
+    fn forward_graph(
+        &self,
+        hidden_states: &Tensor,
+        io: &LinearStateIo,
+        rows: usize,
+    ) -> Result<Tensor> {
         let spec = self
             .fused_decode
             .as_ref()
@@ -1000,52 +1276,57 @@ impl Qwen35LinearAttention {
                 &self.alpha_proj,
             ],
         )?;
-        let (x, z, beta_raw, alpha) = (mixed_qkv.i(0)?, z.i(0)?, beta_raw.i(0)?, alpha.i(0)?);
+        let value_width = self.num_v_heads * self.head_v_dim;
         let y = match io {
             #[cfg(feature = "cuda")]
-            LinearStateIo::Table(table) => {
-                let conv = gdn::conv_decode_table(&x, &self.conv_kernel, *table)?;
-                gdn::recurrent_decode_table(
-                    &conv,
-                    &z,
-                    &beta_raw,
-                    &alpha,
-                    &self.dt_bias,
-                    &self.a,
-                    &self.norm.weight,
-                    *table,
-                    spec,
-                )?
-            }
-            LinearStateIo::Direct {
-                history,
-                state,
-                history_out,
-                state_out,
-            } => {
-                let (conv, next_history) = gdn::conv_decode(
-                    &x,
-                    &self.conv_kernel,
-                    [&history[0], &history[1], &history[2]],
-                )?;
-                let (y, next) = gdn::recurrent_decode(
-                    &conv,
-                    &z,
-                    &beta_raw,
-                    &alpha,
-                    &self.dt_bias,
-                    &self.a,
-                    &self.norm.weight,
-                    state,
-                    spec,
-                )?;
-                history_out.slice_set(&next_history.reshape(history_out.shape())?, 0, 0)?;
-                state_out.slice_set(&next.reshape(state_out.shape())?, 0, 0)?;
-                y
+            LinearStateIo::Table(table) => gdn::decode_rows_in(
+                &mixed_qkv.reshape((rows, self.conv_dim))?,
+                &self.conv_kernel,
+                &z.reshape((rows, value_width))?,
+                &beta_raw.reshape((rows, self.num_v_heads))?,
+                &alpha.reshape((rows, self.num_v_heads))?,
+                &self.dt_bias,
+                &self.a,
+                &self.norm.weight,
+                *table,
+                rows,
+                spec,
+            )?,
+            LinearStateIo::Direct(direct) => {
+                if direct.len() != rows {
+                    return Err(graph_error("DeltaNet state IO does not cover every row"));
+                }
+                let mut outputs = Vec::with_capacity(rows);
+                for (row, io) in direct.iter().enumerate() {
+                    let (conv, next_history) = gdn::conv_decode(
+                        &mixed_qkv.i(row)?,
+                        &self.conv_kernel,
+                        [&io.history[0], &io.history[1], &io.history[2]],
+                    )?;
+                    let (y, next) = gdn::recurrent_decode(
+                        &conv,
+                        &z.i(row)?,
+                        &beta_raw.i(row)?,
+                        &alpha.i(row)?,
+                        &self.dt_bias,
+                        &self.a,
+                        &self.norm.weight,
+                        &io.state,
+                        spec,
+                    )?;
+                    io.history_out.slice_set(
+                        &next_history.reshape(io.history_out.shape())?,
+                        0,
+                        0,
+                    )?;
+                    io.state_out
+                        .slice_set(&next.reshape(io.state_out.shape())?, 0, 0)?;
+                    outputs.push(y.reshape((1, value_width))?);
+                }
+                Tensor::cat(&outputs, 0)?
             }
         };
-        self.out_proj
-            .forward(&y.reshape((1, 1, self.num_v_heads * self.head_v_dim))?)
+        self.out_proj.forward(&y.reshape((rows, 1, value_width))?)
     }
 }
 
@@ -1113,6 +1394,8 @@ struct LayerStateOut {
 }
 
 struct StateOutputs {
+    /// The one buffer every layer's outputs are views into.
+    slab: Tensor,
     layers: Vec<Option<LayerStateOut>>,
 }
 
@@ -1157,7 +1440,7 @@ impl StateOutputs {
                 None => None,
             });
         }
-        Ok(Self { layers })
+        Ok(Self { slab, layers })
     }
 
     /// Hand the written state to the row: each ring becomes the packed
@@ -1186,41 +1469,45 @@ impl StateOutputs {
     }
 }
 
-/// Explicit-tensor IO for every DeltaNet layer (devices without tables).
+/// Explicit-tensor IO for every DeltaNet layer of every row (devices
+/// without tables).
 fn direct_io(
     model: &Qwen35TextModel,
-    inputs: &StateInputs,
-    outputs: &StateOutputs,
+    inputs: &[StateInputs],
+    outputs: &[StateOutputs],
 ) -> Vec<Option<LinearStateIo>> {
     (0..model.layers.len())
         .map(|layer| {
-            match (
-                inputs.layers[layer].as_ref(),
-                outputs.layers[layer].as_ref(),
-            ) {
-                (Some(input), Some(output)) => Some(LinearStateIo::Direct {
-                    history: input.history.clone(),
-                    state: input.state.clone(),
-                    history_out: output.history.clone(),
-                    state_out: output.state.clone(),
-                }),
-                _ => None,
-            }
+            inputs
+                .iter()
+                .zip(outputs)
+                .map(|(input, output)| {
+                    match (input.layers[layer].as_ref(), output.layers[layer].as_ref()) {
+                        (Some(input), Some(output)) => Some(DirectRow {
+                            history: input.history.clone(),
+                            state: input.state.clone(),
+                            history_out: output.history.clone(),
+                            state_out: output.state.clone(),
+                        }),
+                        _ => None,
+                    }
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(LinearStateIo::Direct)
         })
         .collect()
 }
 
-/// Table entries for `layer`: h0, h1, h2, next history, state in, state out.
+/// Table entries for `layer` of one row: h0, h1, h2, next history, state in,
+/// state out.
 #[cfg(feature = "cuda")]
 fn table_entries(
-    inputs: &StateInputs,
-    outputs: &StateOutputs,
+    input: &StateInputs,
+    output: &StateOutputs,
     layer: usize,
 ) -> Result<[u64; gdn::TABLE_ENTRIES]> {
-    let (Some(input), Some(output)) = (
-        inputs.layers[layer].as_ref(),
-        outputs.layers[layer].as_ref(),
-    ) else {
+    let (Some(input), Some(output)) = (input.layers[layer].as_ref(), output.layers[layer].as_ref())
+    else {
         return Err(graph_error("DeltaNet layer has no state to address"));
     };
     Ok([
@@ -1233,17 +1520,40 @@ fn table_entries(
     ])
 }
 
+/// A spare row's entries for `layer`: it reads and writes the spare slab in
+/// place, three history slots from its history rows.
+#[cfg(feature = "cuda")]
+fn spare_entries(spare: &StateOutputs, layer: usize) -> Result<[u64; gdn::TABLE_ENTRIES]> {
+    let Some(spare) = spare.layers[layer].as_ref() else {
+        return Err(graph_error("DeltaNet layer has no spare state"));
+    };
+    let history = |slot: usize| -> Result<u64> { Ok(gdn::f32_address(&spare.history.i(slot)?)?) };
+    Ok([
+        history(0)?,
+        history(1)?,
+        history(2)?,
+        gdn::f32_address(&spare.history)?,
+        gdn::f32_address(&spare.state)?,
+        gdn::f32_address(&spare.state)?,
+    ])
+}
+
 #[cfg(not(feature = "cuda"))]
 fn table_entries(
-    _inputs: &StateInputs,
-    _outputs: &StateOutputs,
+    _input: &StateInputs,
+    _output: &StateOutputs,
     _layer: usize,
 ) -> Result<[u64; gdn::TABLE_ENTRIES]> {
     Err(graph_error("device tables need CUDA"))
 }
 
+#[cfg(not(feature = "cuda"))]
+fn spare_entries(_spare: &StateOutputs, _layer: usize) -> Result<[u64; gdn::TABLE_ENTRIES]> {
+    Err(graph_error("device tables need CUDA"))
+}
+
 /// An F32 buffer whose every element the step's kernels write.
-fn uninit_f32(len: usize, device: &Device) -> Result<Tensor> {
+pub(super) fn uninit_f32(len: usize, device: &Device) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if let Device::Cuda(cuda) = device {
         use candle_core::backend::BackendDevice;
@@ -1260,12 +1570,54 @@ fn uninit_f32(len: usize, device: &Device) -> Result<Tensor> {
     Tensor::zeros(len, DType::F32, device).map_err(Error::from)
 }
 
-fn host(tensor: &Tensor) -> Result<Vec<f32>> {
-    Ok(tensor
-        .to_dtype(DType::F32)?
-        .flatten_all()?
+/// [`compare_values`]'s check of each `(label, actual, expected)` pair,
+/// reduced on the device: four scalars per pair (squared error, squared
+/// reference, largest error, largest reference) and one readback for all of
+/// them, instead of every value on the host. Returns each pair's relative L2
+/// error and largest error over the largest reference magnitude.
+fn device_compare(
+    pairs: &[(&str, Tensor, Tensor)],
+    rel_l2: f64,
+    max_frac: f32,
+) -> Result<Vec<(f64, f32)>> {
+    let mut stats = Vec::with_capacity(pairs.len() * 4);
+    for (label, actual, expected) in pairs {
+        if actual.elem_count() != expected.elem_count() {
+            return Err(graph_error(&format!(
+                "{label}: {} values vs {} in the reference",
+                actual.elem_count(),
+                expected.elem_count()
+            )));
+        }
+        let actual = actual.to_dtype(DType::F32)?.flatten_all()?;
+        let expected = expected.to_dtype(DType::F32)?.flatten_all()?;
+        let diff = (&actual - &expected)?;
+        stats.push(diff.sqr()?.sum_all()?);
+        stats.push(expected.sqr()?.sum_all()?);
+        stats.push(diff.abs()?.max(0)?);
+        stats.push(expected.abs()?.max(0)?);
+    }
+    let values = Tensor::stack(&stats, 0)?
         .to_device(&Device::Cpu)?
-        .to_vec1::<f32>()?)
+        .to_vec1::<f32>()?;
+    let mut observed_errors = Vec::with_capacity(pairs.len());
+    for ((label, _, _), stat) in pairs.iter().zip(values.chunks(4)) {
+        let [err, norm, max_err, max_ref] = [stat[0], stat[1], stat[2], stat[3]];
+        // A NaN or infinity anywhere makes the sums non-finite.
+        if !(err.is_finite() && norm.is_finite() && max_err.is_finite() && max_ref.is_finite()) {
+            return Err(graph_error(&format!(
+                "{label}: non-finite values (error sum {err}, reference sum {norm})"
+            )));
+        }
+        let observed = (f64::from(err) / f64::from(norm).max(f64::MIN_POSITIVE)).sqrt();
+        if observed > rel_l2 || max_err > max_frac * max_ref.max(f32::MIN_POSITIVE) {
+            return Err(graph_error(&format!(
+                "{label}: the graph diverges from the eager step: relative L2 {observed:.3e}, max error {max_err} vs max |ref| {max_ref}"
+            )));
+        }
+        observed_errors.push((observed, max_err / max_ref.max(f32::MIN_POSITIVE)));
+    }
+    Ok(observed_errors)
 }
 
 fn graph_error(message: &str) -> Error {
@@ -1277,23 +1629,107 @@ mod tests {
     use super::*;
 
     #[test]
-    fn graph_decode_is_opt_in() {
+    fn graph_decode_is_on_unless_switched_off() {
         let _guard = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var(GRAPH_ENV);
-        assert!(!graph_requested());
+        assert!(graph_requested());
         for (value, expected) in [
             ("1", true),
             (" ON ", true),
             ("true", true),
-            (" yes ", true),
             ("0", false),
+            ("off", false),
             ("no", false),
         ] {
             std::env::set_var(GRAPH_ENV, value);
             assert_eq!(graph_requested(), expected, "{value}");
         }
         std::env::remove_var(GRAPH_ENV);
+    }
+
+    #[test]
+    fn steps_pad_up_to_the_next_graphed_width() {
+        let widths = (1..=33).map(graph_width).collect::<Vec<_>>();
+        assert_eq!(widths[..8], [1, 2, 3, 4, 6, 6, 8, 8].map(Some));
+        assert_eq!(widths[8], Some(12)); // 9 rows
+        assert_eq!(widths[12], Some(16)); // 13 rows
+        assert_eq!(widths[16], Some(24)); // 17 rows
+        assert_eq!(widths[31], Some(32)); // 32 rows
+        assert_eq!(widths[32], None); // 33 rows run the standard decode
+        assert_eq!(MAX_GRAPH_ROWS, 32);
+    }
+
+    #[test]
+    fn the_step_layout_packs_rows_then_metadata() {
+        let layout = StepLayout {
+            rows: 3,
+            max_blocks: 5,
+        };
+        assert_eq!(layout.positions(), 3);
+        assert_eq!(layout.slots(), 6);
+        assert_eq!(layout.metadata(), 9);
+        assert_eq!(layout.head_len(), 15);
+        assert_eq!(layout.blocks(0), 15);
+        assert_eq!(layout.blocks(2), 25);
+        assert_eq!(layout.metadata_len(), 21);
+        assert_eq!(layout.len(), 30);
+    }
+
+    #[test]
+    fn device_compare_accepts_rounding_and_refuses_divergence_and_nan() {
+        let tensor = |values: Vec<f32>| Tensor::from_vec(values, (2, 2), &Device::Cpu).unwrap();
+        let reference = tensor(vec![1.0, -2.0, 3.0, 4.0]);
+        let close = tensor(vec![1.0, -2.0, 3.0, 4.0001]);
+        let far = tensor(vec![1.0, -2.0, 3.0, 5.0]);
+        let nan = tensor(vec![1.0, f32::NAN, 3.0, 4.0]);
+        let check = |actual: &Tensor| {
+            device_compare(
+                &[
+                    ("same", reference.clone(), reference.clone()),
+                    ("candidate", actual.clone(), reference.clone()),
+                ],
+                0.01,
+                0.02,
+            )
+        };
+        assert!(check(&close).is_ok());
+        let error = check(&far).unwrap_err().to_string();
+        assert!(
+            error.contains("candidate") && error.contains("diverges"),
+            "{error}"
+        );
+        let error = check(&nan).unwrap_err().to_string();
+        assert!(error.contains("non-finite"), "{error}");
+    }
+
+    #[test]
+    fn verified_widths_recapture_in_one_step() {
+        let mut runtime = Runtime::new();
+        runtime.recapture();
+        assert_eq!(runtime.phase, Phase::Warm, "an unwarmed width stays warm");
+        runtime.phase = Phase::Verify;
+        runtime.recapture();
+        assert_eq!(runtime.phase, Phase::Capture, "unverified: the full checks");
+        runtime.verified = true;
+        runtime.phase = Phase::Replay;
+        runtime.recapture();
+        assert_eq!(runtime.phase, Phase::Recapture);
+    }
+
+    #[test]
+    fn a_new_step_buffer_holds_spare_rows() {
+        let layout = StepLayout {
+            rows: 2,
+            max_blocks: 3,
+        };
+        let buffer = StepBuffer::new(&Device::Cpu, layout).unwrap();
+        let values = buffer.tensor.to_vec1::<u32>().unwrap();
+        assert_eq!(values, buffer.mirror);
+        // Slots past every cache, one-token contexts on page 0.
+        assert_eq!(values[layout.slots()..layout.metadata()], [SPARE_SLOT; 2]);
+        assert_eq!(values[layout.metadata()..layout.metadata() + 2], [1, 1]);
+        assert!(values[layout.head_len()..].iter().all(|v| *v == 0));
     }
 }

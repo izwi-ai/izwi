@@ -34,7 +34,9 @@ impl EngineCore {
         }
         self.clear_execution_state_for_capacity_replay(session);
         self.workspace_retry_progress.remove(session);
-        self.workspace_row_limits.remove(session);
+        if self.workspace_row_limits.remove(session).is_some() {
+            super::super::metrics::record_workspace_cap_change(false);
+        }
         self.workspace_pressure.remove(session);
         self.stream_sequence_cursors.remove(session);
         self.incremental_stream_sessions.remove(session);
@@ -184,7 +186,25 @@ impl EngineCore {
             }
             return;
         };
+        // During a commit the device cleanup waits behind whatever dispatch
+        // the device thread is running; the engine awaits it after releasing
+        // the core so stream delivery, admission and metrics are not held.
+        if let Some(deferred) = self.deferred_release_cleanups.as_mut() {
+            if !deferred.contains(session) {
+                deferred.push(session.clone());
+            }
+            return;
+        }
         let release = self.executor.cleanup_session(session).await;
+        self.apply_release_cleanup(session, confirmation_required, release);
+    }
+
+    fn apply_release_cleanup(
+        &mut self,
+        session: &super::super::SessionKey,
+        confirmation_required: bool,
+        release: super::super::executor::CacheReleaseReport,
+    ) {
         if (release.confirmed || !confirmation_required)
             && self.request_managed_session_release(session)
         {
@@ -192,6 +212,45 @@ impl EngineCore {
             self.resolve_cleanup_waiters(session);
         } else {
             self.record_unconfirmed_cleanup(session);
+        }
+    }
+
+    /// Defer the device cleanups that terminal releases start until
+    /// [`Self::take_deferred_release_cleanups`].
+    pub(crate) fn begin_deferring_release_cleanups(&mut self) {
+        self.deferred_release_cleanups.get_or_insert_with(Vec::new);
+    }
+
+    /// End deferral and return the sessions whose device cleanup is owed,
+    /// with the executor to run them on.
+    pub(crate) fn take_deferred_release_cleanups(
+        &mut self,
+    ) -> (
+        Vec<super::super::SessionKey>,
+        super::super::executor::UnifiedExecutor,
+    ) {
+        (
+            self.deferred_release_cleanups.take().unwrap_or_default(),
+            self.executor.clone(),
+        )
+    }
+
+    /// Apply a deferred device cleanup's report: the same transitions an
+    /// inline cleanup makes, unless another path already settled the session.
+    pub(crate) fn finish_deferred_release_cleanup(
+        &mut self,
+        session: &super::super::SessionKey,
+        release: super::super::executor::CacheReleaseReport,
+    ) {
+        if let Some(confirmation_required) = self
+            .scheduler
+            .pending_release_confirmation_required(session)
+        {
+            self.apply_release_cleanup(session, confirmation_required, release);
+            let _ = self.request_managed_session_release(session);
+        }
+        if self.exact_session_cleanup_absent(session) {
+            self.resolve_cleanup_waiters(session);
         }
     }
 
@@ -469,7 +528,9 @@ impl EngineCore {
         self.plan_begin_attempts.clear();
         self.workspace_retry_progress.clear();
         self.workspace_waits.clear();
-        self.workspace_row_limits.clear();
+        for _ in self.workspace_row_limits.drain() {
+            super::super::metrics::record_workspace_cap_change(false);
+        }
         self.workspace_pressure.clear();
         self.initialized = false;
 

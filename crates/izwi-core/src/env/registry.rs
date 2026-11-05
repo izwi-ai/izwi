@@ -112,6 +112,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Selects the execution backend: auto, cpu, metal (alias mps) or cuda (alias gpu); unknown values ignored.",
     ),
     CoreEnvVar::new(
+        "IZWI_BATCHED_DEVICE_SAMPLING",
+        Flag,
+        "true",
+        Once,
+        "Kill switch: false plans each sampled chat row's device candidates on its own in a batched decode step instead of in one pass for all rows (CUDA, Metal).",
+    ),
+    CoreEnvVar::new(
         "IZWI_BUFFER_POOL",
         Flag,
         "true",
@@ -299,6 +306,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "auto",
         Startup,
         "Enables packed (fused) projection weights on CUDA (auto/off mode).",
+    ),
+    CoreEnvVar::new(
+        "IZWI_CUDA_POOL_RETAIN",
+        Flag,
+        "true",
+        Startup,
+        "Keeps freed device memory in the CUDA memory pool across synchronizations instead of returning it to the OS at each sync; false restores the driver default.",
     ),
     CoreEnvVar::new(
         "IZWI_CUDA_PROJECTION_BACKEND",
@@ -538,6 +552,14 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         TestHarness,
         "Text the Fish S2 smoke test synthesizes.",
     ),
+    CoreEnvVar::new(
+        "IZWI_FP8_TENSOR_CORE",
+        Flag,
+        "true (CUDA SM80+)",
+        Load,
+        "Kill switch: legacy/off keeps compact block-FP8 projections of 2-64 rows on the vectorized GEMV, tile kernel or dequantized GEMM instead of the tensor-core kernel.",
+    )
+    .aliases(&[("legacy", false)]),
     CoreEnvVar::new(
         "IZWI_FUSED_KERNELS",
         Flag,
@@ -1010,6 +1032,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "32768 (CUDA: 262144)",
         Load,
         "Sets the LFM3 chat context in tokens, up to the checkpoint's 262,144; it sizes the RoPE tables and KV reservation. CUDA defaults to the whole context and fits its arena to device memory.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_LFM_BATCHED_SHORTCONV",
+        Flag,
+        "true",
+        Once,
+        "Kill switch: false steps each row's LFM2/LFM3 ShortConv on its own in a batched decode instead of one launch for all rows (CUDA).",
     ),
     CoreEnvVar::new(
         "IZWI_LFM_CUDA_DEPTHWISE_CONV",
@@ -1621,11 +1650,27 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Enables catalog-driven automatic prefix reuse per loaded model where evidence exists.",
     ),
     CoreEnvVar::new(
+        "IZWI_QWEN35_BATCHED_GDN",
+        Flag,
+        "true",
+        Load,
+        "Kill switch: legacy/off runs Qwen3.5's batched DeltaNet decode as one launch pair per row instead of one for all rows (CUDA).",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
+        "IZWI_QWEN35_CHUNKED_GDN",
+        Flag,
+        "true",
+        Load,
+        "Kill switch: legacy/off disables the chunked DeltaNet prefill kernels for Qwen3.5.",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
         "IZWI_QWEN35_CUDA_GRAPH",
         Flag,
-        "false",
+        "true",
         Load,
-        "Opts Qwen3.5 decode into CUDA graph capture (off until validated on GPU).",
+        "Kill switch: off replays no whole-step CUDA graphs for Qwen3.5 decode (1-32 rows, padded to a graphed width).",
     ),
     CoreEnvVar::new(
         "IZWI_QWEN35_DECODE_QUANTUM",
@@ -1658,6 +1703,14 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     )
     .aliases(&[("legacy", false)]),
     CoreEnvVar::new(
+        "IZWI_QWEN35_LOAD_TIMINGS",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off skips the Qwen3.5 load-time CUDA decode kernel timings reported in diagnostics.",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
         "IZWI_QWEN35_PREFILL_CHUNK_SIZE",
         Int,
         "256 (Qwen3.6-MoE may prefer up to 1024)",
@@ -1685,6 +1738,30 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Load,
         "Overrides the Qwen3.5/Qwen3.6-MoE tiled DeltaNet recurrence tile size (min 1, capped at sequence length).",
     ),
+    CoreEnvVar::new(
+        "IZWI_QWEN36_BATCHED_GDN",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off keeps one DeltaNet conv and recurrence launch per row in Qwen3.6 multi-row decode instead of one pair per layer.",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
+        "IZWI_QWEN36_BATCHED_QK_ROPE",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off keeps one q/k norm + RoPE launch per row in Qwen3.6 multi-row decode instead of one per attention layer.",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
+        "IZWI_QWEN36_BATCH_GRAPHS",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off runs Qwen3.6-MoE decode batches of 2 to 32 rows eagerly instead of through their per-width whole-step CUDA graphs.",
+    )
+    .aliases(&[("legacy", false)]),
     CoreEnvVar::new(
         "IZWI_QWEN36_CHUNKED_GDN",
         Flag,
@@ -1724,6 +1801,14 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     )
     .aliases(&[("legacy", false)]),
     CoreEnvVar::new(
+        "IZWI_QWEN36_FP8_PREFILL_GEMM",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off keeps Qwen3.6 compact-FP8 projections of 9+ rows (prefill) on the tile kernel instead of the dequantized cuBLAS GEMM.",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
         "IZWI_QWEN36_FUSED_DECODE",
         Flag,
         "true",
@@ -1740,12 +1825,28 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     )
     .aliases(&[("legacy", false)]),
     CoreEnvVar::new(
+        "IZWI_QWEN36_LOAD_TIMINGS",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off skips the Qwen3.6 load-time CUDA kernel timing measurements reported in diagnostics.",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
         "IZWI_QWEN36_MOE_BACKEND",
         Choice,
         "auto",
         Load,
         "Selects the Qwen3.6-MoE sparse-expert path: auto (fused kernels when allowed), or legacy or a false boolean (host-routed loop).",
     ),
+    CoreEnvVar::new(
+        "IZWI_QWEN36_MOE_DECODE",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off keeps Qwen3.6-MoE decode-sized expert calls on the per-pair GEMVs instead of the register-direct expert-major tensor-core kernels.",
+    )
+    .aliases(&[("legacy", false)]),
     CoreEnvVar::new(
         "IZWI_QWEN36_MTP_HANDOFF",
         Flag,
@@ -1766,6 +1867,22 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "true",
         Load,
         "Kill switch: legacy/off disables the Qwen3.6-MoE whole-step CUDA graph; piecewise graph segments remain.",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
+        "IZWI_QWEN38_BATCHED_GDN",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off keeps one DeltaNet conv and recurrence launch per row in Qwen3.8 multi-row decode instead of one pair per layer.",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
+        "IZWI_QWEN38_BATCHED_QK_ROPE",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off keeps one q/k norm + RoPE launch per row in Qwen3.8 multi-row decode instead of one per attention layer.",
     )
     .aliases(&[("legacy", false)]),
     CoreEnvVar::new(

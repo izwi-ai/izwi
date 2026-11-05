@@ -1380,12 +1380,28 @@ pub(super) fn reconcile_executor_outputs(
     let outputs = match result {
         Ok(outputs) => outputs,
         Err(err) => {
+            // The message keeps the error's own text first: callers decode
+            // its kind from that prefix (`Error::from_display`), so a CUDA
+            // allocation failure must still read as capacity, not as a
+            // generic server error.
+            let message = format!("{} ({phase} executor)", err.error);
+            let exhausted = matches!(err.error, crate::error::Error::Overloaded(_));
             return scheduled
                 .iter()
                 .map(|entry| {
-                    failed_step_result(entry, format!("{phase} executor failed: {}", err.error))
+                    let mut result = failed_step_result(entry, message.clone())
                         .with_dispatch(err.dispatch)
-                        .with_provenance(err.provenance)
+                        .with_provenance(err.provenance);
+                    if exhausted {
+                        result.disposition = ExecutionDisposition::Failed(ExecutionFailure {
+                            kind: FailureKind::ResourceExhausted,
+                            scope: FailureScope::PhysicalBatch,
+                            retry: RetryDisposition::Never,
+                            health: HealthImpact::None,
+                            message: message.clone(),
+                        });
+                    }
+                    result
                 })
                 .collect();
         }
@@ -2915,6 +2931,46 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("did not return"));
+    }
+
+    /// A CUDA allocation failure inside a batch must reach the client as a
+    /// capacity error, not as a generic server error: the row message keeps
+    /// the error's own prefix, and the rows are marked resource-exhausted.
+    #[test]
+    fn a_batch_allocation_failure_stays_a_capacity_error() {
+        let scheduled = vec![scheduled("req-a", 1, 0), scheduled("req-b", 2, 1)];
+        let oom: crate::error::Error =
+            candle_core::Error::Msg("CUDA_ERROR_OUT_OF_MEMORY: out of memory".into()).into();
+        assert!(matches!(oom, crate::error::Error::Overloaded(_)), "{oom}");
+        let reconciled = reconcile_executor_outputs(
+            "decode",
+            &scheduled,
+            BatchDispatch::new(BatchDispatchKind::TensorStatic, 2),
+            Err(PhysicalDispatchError::started(
+                oom,
+                BatchDispatch::new(BatchDispatchKind::TensorStatic, 2),
+                FailureOrigin::Model,
+            )),
+        );
+        for result in &reconciled {
+            let message = result.output.error.clone().unwrap();
+            assert!(
+                matches!(
+                    crate::error::Error::from_display(message.clone()),
+                    crate::error::Error::Overloaded(_)
+                ),
+                "{message}"
+            );
+            assert!(message.ends_with("(decode executor)"), "{message}");
+            assert!(matches!(
+                &result.disposition,
+                ExecutionDisposition::Failed(ExecutionFailure {
+                    kind: FailureKind::ResourceExhausted,
+                    retry: RetryDisposition::Never,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

@@ -1405,7 +1405,7 @@ impl Qwen38ChatModel {
                     "disabled"
                 },
                 "transient_memory_bound": "chunk_shaped",
-                "fp8_projection_path": "rows >= 16: dequantized weight tiles (<= 128 MiB) + cuBLAS once checked per projection kind (fast_paths.fp8_prefill_gemm); otherwise the compact FP8 mm kernel",
+                "fp8_projection_path": "rows the tensor-core FP8 kernel measured fastest at (fast_paths.fp8_tensor_core): that kernel; other spans of 16 rows or more: dequantized weight tiles (<= 128 MiB) + cuBLAS once checked per projection kind (fast_paths.fp8_prefill_gemm); otherwise the compact FP8 kernels",
                 "fp8_projection_switch": super::residency::FP8_PREFILL_GEMM_ENV,
                 "fp8_prefill_scratch_bytes": self.text_model.residency().prefill_scratch_bytes(),
                 "chunk_override": PREFILL_CHUNK_ENV,
@@ -1481,6 +1481,7 @@ impl Qwen38ChatModel {
                 "fp8_projections": residency_paths["fp8_projections"],
                 "fp8_gemv": residency_paths["fp8_gemv"],
                 "fp8_prefill_gemm": fp8_prefill_gemm,
+                "fp8_tensor_core": residency_paths["fp8_tensor_core"],
                 "fp8_lm_head": self.text_model.fp8_lm_head_diagnostics(),
                 "metal_fp8_gemv": super::fast_path::summarize(
                     self.text_model.fp8_gemv_checks().iter().chain(
@@ -2124,12 +2125,23 @@ impl Qwen38ChatModel {
             text_states.push(&mut state.text_state);
             caches.push(&mut state.physical_kv);
         }
-        let target = self.text_model.forward_token_ids_batch_at_physical(
-            &token_ids,
-            &positions,
-            &mut text_states,
-            &mut caches,
-        )?;
+        // MTP drafts from the target's hidden rows, which the single-row
+        // whole-step graph does not return.
+        let target = if self.mtp_head.is_some() {
+            self.text_model.forward_token_ids_batch_hidden_at_physical(
+                &token_ids,
+                &positions,
+                &mut text_states,
+                &mut caches,
+            )?
+        } else {
+            self.text_model.forward_token_ids_batch_at_physical(
+                &token_ids,
+                &positions,
+                &mut text_states,
+                &mut caches,
+            )?
+        };
         drop(text_states);
         drop(caches);
 

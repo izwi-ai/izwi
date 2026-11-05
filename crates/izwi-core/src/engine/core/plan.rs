@@ -746,13 +746,22 @@ impl EngineCore {
     ) -> bool {
         let session = scheduled.session_key();
         let reduced = if width > 1 {
+            let now = std::time::Instant::now();
             let next = (width / 2).max(1);
             let cap = self
                 .workspace_row_limits
                 .entry(session.clone())
-                .or_insert(width);
-            let reduced = next < *cap;
-            *cap = (*cap).min(next);
+                .or_insert_with(|| {
+                    super::super::metrics::record_workspace_cap_change(true);
+                    super::WorkspaceRowCap {
+                        rows: width,
+                        set_at: now,
+                    }
+                });
+            let current = cap.effective(now);
+            let reduced = next < current;
+            cap.rows = current.min(next);
+            cap.set_at = now;
             reduced
         } else if scheduled.is_prefill {
             self.scheduler

@@ -103,6 +103,11 @@ pub struct Qwen36MoeChatModel {
     kv_storage_provider: Qwen36MoeKvStorageProvider,
     performance: crate::performance::CudaPerformanceConfig,
     exec: Qwen36ChatExec,
+    /// Load-time device timings of the decode kernels (see
+    /// `kernel_timings.rs`), reported under `kernel_timings`.
+    kernel_timings: serde_json::Value,
+    /// Wall time of the load's phases, reported under `load_timing`.
+    load_timing: serde_json::Value,
 }
 
 impl InferenceStateContractProvider for Qwen36MoeChatModel {
@@ -188,24 +193,28 @@ impl Qwen36MoeChatModel {
         let mtp_enabled = mtp_policy == Qwen36MoeMtpLoadPolicy::Enabled;
         tracing::info!(mtp_enabled, "Qwen3.6-MoE MTP policy");
         let fixture_path = model_dir.join(QWEN36_MOE_FIXTURE_GGUF_FILENAME);
-        let mut exec = if fixture_path.exists() {
-            Self::load_fixture_gguf(
+        let loading_started = std::time::Instant::now();
+        let (mut exec, mut load_timing) = if fixture_path.exists() {
+            let exec = Self::load_fixture_gguf(
                 model_dir,
                 &fixture_path,
                 variant,
                 &device,
                 kv_storage_provider,
-            )?
+            )?;
+            (exec, serde_json::json!({ "source": "gguf_fixture" }))
         } else {
             Self::load_native(
                 model_dir,
                 variant,
                 &device,
-                &performance.cuda,
+                performance,
                 mtp_policy,
                 kv_storage_provider,
             )?
         };
+        load_timing["weights_ms"] = (loading_started.elapsed().as_secs_f64() * 1e3).into();
+        load_timing["moe"] = exec.text_model.moe_load_timing();
         // Phase 5a: the registry resolved cross-request prefix reuse for this
         // family and backend; the contract shares only when no MTP head loaded.
         exec.prefix_caching = prefix_reuse;
@@ -231,11 +240,39 @@ impl Qwen36MoeChatModel {
             %cuda_graphs,
             "Qwen3.6-MoE fused kernel paths"
         );
+        let timing_started = std::time::Instant::now();
+        let kernel_timings = exec.text_model.kernel_timings();
+        if kernel_timings["status"] == "measured" {
+            tracing::info!(timings = %kernel_timings, "Qwen3.6-MoE load-time kernel timings");
+            // Routed MoE calls switch to the grouped kernels where they
+            // measured faster on this device, not at a fixed token count.
+            if let Some(tokens) = kernel_timings["moe_by_tokens"]["grouped_crossover_tokens"]
+                .as_u64()
+                .and_then(|tokens| usize::try_from(tokens).ok())
+            {
+                exec.text_model.apply_moe_grouped_crossover(tokens);
+                tracing::info!(tokens, "Qwen3.6-MoE grouped expert crossover");
+            }
+            // Decode-sized calls take the register-direct expert kernels from
+            // the routed token count where they measured faster.
+            if let Some(tokens) = kernel_timings["moe_by_tokens"]["decode_min_tokens"]
+                .as_u64()
+                .and_then(|tokens| usize::try_from(tokens).ok())
+            {
+                exec.text_model.apply_moe_decode_min_tokens(tokens);
+                tracing::info!(tokens, "Qwen3.6-MoE decode expert kernels from");
+            }
+        }
+        load_timing["kernel_timings_ms"] = (timing_started.elapsed().as_secs_f64() * 1e3).into();
+        load_timing["total_ms"] = (loading_started.elapsed().as_secs_f64() * 1e3).into();
+        tracing::info!(timing = %load_timing, "Qwen3.6-MoE load timing");
         Ok(Self {
             device_kind,
             kv_storage_provider,
             performance: performance.cuda.clone(),
             exec,
+            kernel_timings,
+            load_timing,
         })
     }
 
@@ -269,21 +306,31 @@ impl Qwen36MoeChatModel {
         })
     }
 
+    /// The native bundle's executor, with the wall time of its checkpoint
+    /// open, tokenizer and text-model phases and the loader's counters.
     fn load_native(
         model_dir: &Path,
         variant: ModelVariant,
         device: &DeviceProfile,
-        performance: &crate::performance::CudaPerformanceConfig,
+        full_performance: &crate::performance::PerformanceConfig,
         mtp_policy: Qwen36MoeMtpLoadPolicy,
         kv_storage_provider: Qwen36MoeKvStorageProvider,
-    ) -> Result<Qwen36ChatExec> {
+    ) -> Result<(Qwen36ChatExec, serde_json::Value)> {
+        let performance = &full_performance.cuda;
         let mtp_enabled = mtp_policy == Qwen36MoeMtpLoadPolicy::Enabled;
-        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policies(
+        let ms = |started: std::time::Instant| started.elapsed().as_secs_f64() * 1e3;
+        let opening = std::time::Instant::now();
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_loading(
             model_dir,
             super::native::Qwen36MoeGeometryPolicy::from_env(),
             mtp_policy,
+            &full_performance.loading,
         )?;
+        let open_ms = ms(opening);
+        let tokenizing = std::time::Instant::now();
         let tokenizer = Qwen36Tokenizer::load_hf(model_dir, variant)?;
+        let tokenizer_ms = ms(tokenizing);
+        let building = std::time::Instant::now();
         let (text_config, text_model, mtp_head) = load_text_model_native(
             &checkpoint,
             device,
@@ -291,7 +338,14 @@ impl Qwen36MoeChatModel {
             performance,
             mtp_enabled,
         )?;
-        Ok(Qwen36ChatExec {
+        let load_timing = serde_json::json!({
+            "source": "native",
+            "checkpoint_open_ms": open_ms,
+            "tokenizer_ms": tokenizer_ms,
+            "text_model_ms": ms(building),
+            "tensors": checkpoint.tensors.loading_diagnostics(),
+        });
+        let exec = Qwen36ChatExec {
             variant,
             tokenizer,
             text_config,
@@ -302,7 +356,8 @@ impl Qwen36MoeChatModel {
             mtp_adaptive: performance.enabled() && performance.mtp_adaptive,
             kv_storage_dtype: kv_storage_provider.dtype(),
             prefix_caching: false,
-        })
+        };
+        Ok((exec, load_timing))
     }
 
     pub fn variant(&self) -> ModelVariant {
@@ -500,14 +555,20 @@ impl Qwen36MoeChatModel {
             },
             "moe": self.exec.text_model.moe_backend_summary(),
             "gdn_decode": self.exec.text_model.gdn_decode_summary(),
+            "gdn_batched_decode": self.exec.text_model.gdn_batched_decode_summary(),
             "gdn_prefill": self.exec.text_model.gdn_prefill_summary(),
             "moe_prefill": self.exec.text_model.moe_prefill_summary(),
             "rms_norm": self.exec.text_model.rms_norm_summary(),
             "qk_rope": self.exec.text_model.qk_rope_summary(),
+            "qk_rope_batched": self.exec.text_model.qk_rope_batched_summary(),
             "attn_gate": self.exec.text_model.attn_gate_summary(),
             "fp8_gemv": self.exec.text_model.fp8_gemv_summary(),
+            "fp8_prefill_gemm": self.exec.text_model.fp8_prefill_gemm_summary(),
+            "fp8_tensor_core": self.exec.text_model.fp8_tensor_core_summary(),
             "lm_head": self.exec.text_model.lm_head_summary(),
             "cuda_graphs": self.exec.text_model.cuda_graphs_summary(),
+            "kernel_timings": self.kernel_timings,
+            "load_timing": self.load_timing,
             "mtp": {
                 "head_loaded": self.exec.mtp_head.is_some(),
                 "draft_depth": self.exec.mtp_head.as_ref().map(|head| head.draft_depth()),

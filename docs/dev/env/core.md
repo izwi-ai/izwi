@@ -25,6 +25,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_ASR_STREAM_CHUNK_SILENCE_SEARCH_SECS` | number | 0.75 (audio <=12s) else 1.5 | first use | Overrides the silence-search window in seconds around streaming ASR chunk boundaries (capped at half the target). |
 | `IZWI_ASR_STREAM_CHUNK_TARGET_SECS` | number | 2.4 (audio <=12s) else min(long-form target, 6) | first use | Overrides the preferred chunk length in seconds for low-latency streaming ASR chunk planning. |
 | `IZWI_BACKEND` | choice | `auto` | startup | Selects the execution backend: auto, cpu, metal (alias mps) or cuda (alias gpu); unknown values ignored. |
+| `IZWI_BATCHED_DEVICE_SAMPLING` | flag | `true` | first use | Kill switch: false plans each sampled chat row's device candidates on its own in a batched decode step instead of in one pass for all rows (CUDA, Metal). |
 | `IZWI_BUFFER_POOL` | flag | `true` | model load | Enables the global pre-allocated inference buffer pool (initialized by Qwen3 ASR load). |
 | `IZWI_BUFFER_POOL_LARGE` | list | `4,262144` | model load | Sets the large buffer pool as "count,elements"; malformed values ignored. |
 | `IZWI_BUFFER_POOL_MEDIUM` | list | `8,32768` | model load | Sets the medium buffer pool as "count,elements"; malformed values ignored. |
@@ -52,6 +53,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_CUDA_MTP_IN_CONTINUOUS` | auto/flag | `off` | startup | Opts in (auto) to shared speculative MTP envelopes inside continuous batches; off by default because each row verifies with its own trunk pass. |
 | `IZWI_CUDA_MTP_QUANTUM` | auto/flag | `auto` | startup | Enables the quantum (multi-step) MTP decode path (auto/off mode). |
 | `IZWI_CUDA_PACKED_PROJECTIONS` | auto/flag | `auto` | startup | Enables packed (fused) projection weights on CUDA (auto/off mode). |
+| `IZWI_CUDA_POOL_RETAIN` | flag | `true` | startup | Keeps freed device memory in the CUDA memory pool across synchronizations instead of returning it to the OS at each sync; false restores the driver default. |
 | `IZWI_CUDA_PROJECTION_BACKEND` | choice | `auto` | startup | Chooses CUDA block-FP8 projection backend: auto, q8 or native_fp8; invalid = startup error. |
 | `IZWI_CUDA_RUNTIME_ACTIVE` | flag | `false` | startup | Marks that the process is running inside the packaged private CUDA runtime. |
 | `IZWI_CUDA_RUNTIME_BINARY` | path | unset (search next to the executable and lib/izwi/runtime/cuda) | startup | Path to the private CUDA runtime binary, tried first before the built-in search locations. |
@@ -86,6 +88,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_FISH_S2_SMOKE_TEMPERATURE` | number | `0.0` | test harness | Sampling temperature for the Fish S2 smoke request. |
 | `IZWI_FISH_S2_SMOKE_TOP_P` | number | `1.0` | test harness | Top-p for the Fish S2 smoke request. |
 | `IZWI_FISH_S2_TARGET_TEXT` | text | the reference transcript | test harness | Text the Fish S2 smoke test synthesizes. |
+| `IZWI_FP8_TENSOR_CORE` | flag | true (CUDA SM80+) | model load | Kill switch: legacy/off keeps compact block-FP8 projections of 2-64 rows on the vectorized GEMV, tile kernel or dequantized GEMM instead of the tensor-core kernel. Also: `legacy` means false. |
 | `IZWI_FUSED_KERNELS` | flag | `true` | first use | Enables fused Metal/CUDA (and some CPU) kernels. |
 | `IZWI_GEMMA3_CUDA_RMS_NORM` | flag | true on CUDA (no effect elsewhere) | model load | Toggles the Candle CUDA RMSNorm kernel for Gemma3 norms on CUDA devices. |
 | `IZWI_GGUF_MMAP` | choice | auto (mmap on all backends) | model load | Chooses GGUF file loading: auto, on (1\|true\|yes) for mmap, or off (0\|false\|no) for buffered I/O; unknown ignored. |
@@ -153,6 +156,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_LFM25_TTS_AUDIO_STOP_CHECK_INTERVAL` | integer | `20` | first use | Sets LFM2.5-Audio TTS audio frames between stop checks under greedy audio sampling (clamped 1-32). |
 | `IZWI_LFM2_DIAGNOSTICS` | flag | `false` | first use | Enables opt-in LFM2 activation finiteness checks and token diagnostics during forward passes and sampling. |
 | `IZWI_LFM3_CONTEXT_TOKENS` | integer | 32768 (CUDA: 262144) | model load | Sets the LFM3 chat context in tokens, up to the checkpoint's 262,144; it sizes the RoPE tables and KV reservation. CUDA defaults to the whole context and fits its arena to device memory. |
+| `IZWI_LFM_BATCHED_SHORTCONV` | flag | `true` | first use | Kill switch: false steps each row's LFM2/LFM3 ShortConv on its own in a batched decode instead of one launch for all rows (CUDA). |
 | `IZWI_LFM_CUDA_DEPTHWISE_CONV` | flag | `false` | first use | Enables the experimental chunked CUDA depthwise Conv1d path in the LFM2.5-Audio conformer. |
 | `IZWI_LOADING_CACHE_DIR` | path | unset (loader default location) | startup | Directory for the derived-weight loading cache. |
 | `IZWI_LOADING_CACHE_MAX_BYTES` | bytes | 68719476736 (64 GiB) | startup | Size cap in bytes for the derived-weight loading cache (u64; invalid = startup error). |
@@ -240,26 +244,37 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_PORT` | integer | `8080` | startup | Sets the HTTP server port (u16; invalid ignored). |
 | `IZWI_POWER_SAVE` | flag | `false` | startup | Forces power-save scheduling mode. |
 | `IZWI_PREFIX_REUSE_AUTO` | flag | `true` | startup | Enables catalog-driven automatic prefix reuse per loaded model where evidence exists. |
-| `IZWI_QWEN35_CUDA_GRAPH` | flag | `false` | model load | Opts Qwen3.5 decode into CUDA graph capture (off until validated on GPU). |
+| `IZWI_QWEN35_BATCHED_GDN` | flag | `true` | model load | Kill switch: legacy/off runs Qwen3.5's batched DeltaNet decode as one launch pair per row instead of one for all rows (CUDA). Also: `legacy` means false. |
+| `IZWI_QWEN35_CHUNKED_GDN` | flag | `true` | model load | Kill switch: legacy/off disables the chunked DeltaNet prefill kernels for Qwen3.5. Also: `legacy` means false. |
+| `IZWI_QWEN35_CUDA_GRAPH` | flag | `true` | model load | Kill switch: off replays no whole-step CUDA graphs for Qwen3.5 decode (1-32 rows, padded to a graphed width). |
 | `IZWI_QWEN35_DECODE_QUANTUM` | integer | 8 on CUDA/Metal, 1 on CPU | first use | Sets Qwen3.5 decode tokens per engine step for a request decoding alone (capped at 16; 0 or invalid ignored). |
 | `IZWI_QWEN35_FINITE_DIAGNOSTICS` | flag | `false` | model load | Enables finite-value (NaN/Inf) checks on Qwen3.5 and Qwen3.6-MoE activations for debugging. |
 | `IZWI_QWEN35_FUSED_DECODE` | flag | true (fused) | model load | Kill switch: legacy/off forces the Candle op chain instead of the fused Qwen3.5 DeltaNet decode. Also: `legacy` means false. |
 | `IZWI_QWEN35_KQUANT` | flag | true (k-quant kernels) | model load | Kill switch: legacy/off keeps every Qwen3.5 projection on QMatMul instead of the CUDA k-quant kernels. Also: `legacy` means false. |
+| `IZWI_QWEN35_LOAD_TIMINGS` | flag | true (CUDA only) | model load | Kill switch: legacy/off skips the Qwen3.5 load-time CUDA decode kernel timings reported in diagnostics. Also: `legacy` means false. |
 | `IZWI_QWEN35_PREFILL_CHUNK_SIZE` | integer | 256 (Qwen3.6-MoE may prefer up to 1024) | first use | Sets the Qwen3.5/Qwen3.6-MoE prefill forward chunk size in tokens (max 2048; 0 or invalid ignored). |
 | `IZWI_QWEN35_ROPE_KERNEL` | flag | true on Metal/CUDA, false on CPU | model load | Toggles the custom RoPE kernel for Qwen3.5 and Qwen3.6-MoE attention. |
 | `IZWI_QWEN35_TILED_RECURRENCE` | flag | `true` | model load | Enables the tiled DeltaNet recurrence for Qwen3.5 and Qwen3.6-MoE prefill. |
 | `IZWI_QWEN35_TILED_RECURRENCE_TILE_SIZE` | integer | auto by sequence length (16-64) | model load | Overrides the Qwen3.5/Qwen3.6-MoE tiled DeltaNet recurrence tile size (min 1, capped at sequence length). |
+| `IZWI_QWEN36_BATCHED_GDN` | flag | true (CUDA only) | model load | Kill switch: legacy/off keeps one DeltaNet conv and recurrence launch per row in Qwen3.6 multi-row decode instead of one pair per layer. Also: `legacy` means false. |
+| `IZWI_QWEN36_BATCHED_QK_ROPE` | flag | true (CUDA only) | model load | Kill switch: legacy/off keeps one q/k norm + RoPE launch per row in Qwen3.6 multi-row decode instead of one per attention layer. Also: `legacy` means false. |
+| `IZWI_QWEN36_BATCH_GRAPHS` | flag | true (CUDA only) | model load | Kill switch: legacy/off runs Qwen3.6-MoE decode batches of 2 to 32 rows eagerly instead of through their per-width whole-step CUDA graphs. Also: `legacy` means false. |
 | `IZWI_QWEN36_CHUNKED_GDN` | flag | `true` | model load | Kill switch: legacy/off disables the chunked DeltaNet prefill kernels for Qwen3.6-MoE. Also: `legacy` means false. |
 | `IZWI_QWEN36_CUDA_BF16_KV` | flag | true (CUDA SM 8.0+ only) | model load | Toggles BF16 persistent KV cache storage for Qwen3.6-MoE on CUDA; other backends keep F32. |
 | `IZWI_QWEN36_CUDA_GRAPHS` | flag | `true` | model load | Kill switch: legacy/off disables CUDA graph decode for Qwen3.6-MoE. Also: `legacy` means false. |
 | `IZWI_QWEN36_DECODE_QUANTUM` | integer | `8` | first use | Sets Qwen3.6-MoE tokens per engine step for a stream decoding alone on graph decode (1-64, else default). |
 | `IZWI_QWEN36_FP8_LM_HEAD` | flag | true (CUDA native-FP8 residency only) | model load | Kill switch: legacy/off keeps the Qwen3.6-MoE LM head in BF16 instead of block FP8. Also: `legacy` means false. |
+| `IZWI_QWEN36_FP8_PREFILL_GEMM` | flag | true (CUDA only) | model load | Kill switch: legacy/off keeps Qwen3.6 compact-FP8 projections of 9+ rows (prefill) on the tile kernel instead of the dequantized cuBLAS GEMM. Also: `legacy` means false. |
 | `IZWI_QWEN36_FUSED_DECODE` | flag | `true` | model load | Kill switch: legacy/off keeps Qwen3.6-MoE decode on the Candle op chain (fused DeltaNet, norms, q/k, gate, FP8 GEMV). Also: `legacy` means false. |
 | `IZWI_QWEN36_GROUPED_MMA` | flag | `true` | model load | Kill switch: legacy/off disables the tensor-core grouped MoE prefill kernels for Qwen3.6-MoE. Also: `legacy` means false. |
+| `IZWI_QWEN36_LOAD_TIMINGS` | flag | true (CUDA only) | model load | Kill switch: legacy/off skips the Qwen3.6 load-time CUDA kernel timing measurements reported in diagnostics. Also: `legacy` means false. |
 | `IZWI_QWEN36_MOE_BACKEND` | choice | `auto` | model load | Selects the Qwen3.6-MoE sparse-expert path: auto (fused kernels when allowed), or legacy or a false boolean (host-routed loop). |
+| `IZWI_QWEN36_MOE_DECODE` | flag | true (CUDA only) | model load | Kill switch: legacy/off keeps Qwen3.6-MoE decode-sized expert calls on the per-pair GEMVs instead of the register-direct expert-major tensor-core kernels. Also: `legacy` means false. |
 | `IZWI_QWEN36_MTP_HANDOFF` | flag | `false` | model load | Explicit opt-in that, with the MTP performance knob, lets Qwen3.6-MoE load its multi-token-prediction draft head. |
 | `IZWI_QWEN36_REAL_CHECKPOINT_E2E` | path | unset (probe skipped) | test harness | Real Qwen3.6 checkpoint directory for the ASCII-coherence end-to-end probe. |
 | `IZWI_QWEN36_STEP_GRAPH` | flag | `true` | model load | Kill switch: legacy/off disables the Qwen3.6-MoE whole-step CUDA graph; piecewise graph segments remain. Also: `legacy` means false. |
+| `IZWI_QWEN38_BATCHED_GDN` | flag | true (CUDA only) | model load | Kill switch: legacy/off keeps one DeltaNet conv and recurrence launch per row in Qwen3.8 multi-row decode instead of one pair per layer. Also: `legacy` means false. |
+| `IZWI_QWEN38_BATCHED_QK_ROPE` | flag | true (CUDA only) | model load | Kill switch: legacy/off keeps one q/k norm + RoPE launch per row in Qwen3.8 multi-row decode instead of one per attention layer. Also: `legacy` means false. |
 | `IZWI_QWEN38_CAUSAL_CONV_DECODE` | auto/flag | `auto` | startup | Legacy Qwen3.8 alias folded into IZWI_CUDA_FUSED_DECODE, used only when the canonical name is unset. |
 | `IZWI_QWEN38_CPU_LM_HEAD` | flag | true (Q8_0 head on CPU) | model load | Uses the Q8_0 Qwen3.8 CPU LM head while CPU projections are Q8_0; false keeps the head dense F32. Also: `dense` means false, `legacy` means false. |
 | `IZWI_QWEN38_CPU_PROJECTION_BACKEND` | choice | `auto` | startup | Deprecated alias of IZWI_CPU_PROJECTION_BACKEND (auto, expanded, q8), used only when the canonical name is unset. |

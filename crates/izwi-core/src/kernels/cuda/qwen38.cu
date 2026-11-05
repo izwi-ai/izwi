@@ -326,6 +326,26 @@ QWEN38_CONV_TABLE_EXPORT(float, f32)
 QWEN38_CONV_TABLE_EXPORT(__nv_bfloat16, bf16)
 QWEN38_CONV_TABLE_EXPORT(__half, f16)
 
+// Multi-row form for batched eager decode: grid y is the row r, whose history
+// addresses are the six table entries at slot + r * 6 (the layout above), whose
+// input starts r * input_stride into `input`, and which writes row r of
+// `output` ([rows, C]). Each row runs the exact single-row body.
+#define QWEN38_CONV_ROWS_EXPORT(T, S)                                                    \
+  extern "C" __global__ void qwen38_causal_conv_decode_rows_##S(                         \
+      const T* __restrict__ input, long long input_stride,                               \
+      const float* __restrict__ weight, const unsigned long long* __restrict__ table,    \
+      int slot, float* __restrict__ output, int conv_dim) {                              \
+    const long long r = blockIdx.y;                                                      \
+    const unsigned long long* entries = table + slot + r * 6;                            \
+    qwen38_causal_conv_decode_into<T>(input + r * input_stride, weight,                  \
+                                      (const float*)entries[0], output + r * conv_dim,   \
+                                      (float*)entries[3], conv_dim);                     \
+  }
+
+QWEN38_CONV_ROWS_EXPORT(float, f32)
+QWEN38_CONV_ROWS_EXPORT(__nv_bfloat16, bf16)
+QWEN38_CONV_ROWS_EXPORT(__half, f16)
+
 // Qwen3.8 single-token Gated DeltaNet recurrence for F32 tensors.
 //
 // Unlike the shared sequence kernel, this decode-specialized ABI consumes the

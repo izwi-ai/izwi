@@ -136,6 +136,14 @@ pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCH_OBSERVATIONS_TOTAL: &str =
     "engine.executor.physical_dispatch_observations_total";
 pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_MAX: &str =
     "engine.executor.physical_dispatch_seconds_max";
+pub const ENGINE_RESOURCES_LIVE_CAPACITY_REFUSALS_TOTAL: &str =
+    "engine.resources.live_capacity_refusals_total";
+pub const ENGINE_SCHEDULER_WORKSPACE_CAPPED_SESSIONS: &str =
+    "engine.scheduler.workspace_capped_sessions";
+pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_MICROS_TOTAL: &str =
+    "engine.executor.physical_dispatch_width_micros_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_DISPATCHES_TOTAL: &str =
+    "engine.executor.physical_dispatch_width_dispatches_total";
 pub const ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_SECONDS_TOTAL: &str =
     "engine.executor.physical_cohort_wait_seconds_total";
 pub const ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_OBSERVATIONS_TOTAL: &str =
@@ -390,6 +398,22 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     EngineMetricDescriptor {
         name: ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL,
         description: "Proven tensor-batched model call paths that executed at least two live rows.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_RESOURCES_LIVE_CAPACITY_REFUSALS_TOTAL,
+        description: "Claims the guarded resource authority refused for live headroom, by reservation class; /v1/metrics lists the latest ones with their margins.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_SCHEDULER_WORKSPACE_CAPPED_SESSIONS,
+        description: "Sessions whose batch width is capped below the model's width after a refused workspace reservation.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_MICROS_TOTAL,
+        description: "Wall microseconds of physical dispatches on the device thread, by row count (1 through 64; 0 collects wider) and phase (decode, prefill, other).",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_DISPATCH_WIDTH_DISPATCHES_TOTAL,
+        description: "Physical dispatches by row count (1 through 64; 0 collects wider) and phase (decode, prefill, other); with the microseconds counter it gives each width's mean step time.",
     },
     EngineMetricDescriptor {
         name: ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_WIDTH_CALLS_TOTAL,
@@ -943,12 +967,17 @@ pub struct EnginePhysicalExecutionMetricsSnapshot {
 #[must_use = "dropping the guard closes the physical dispatch observation"]
 pub(crate) struct EnginePhysicalDispatchMetricsGuard {
     started_at: Instant,
+    shape: Option<(usize, EngineDispatchPhase)>,
 }
 
 impl Drop for EnginePhysicalDispatchMetricsGuard {
     fn drop(&mut self) {
+        let elapsed = self.started_at.elapsed();
+        if let Some((rows, phase)) = self.shape {
+            ENGINE_DISPATCH_WIDTH_TIMES.record(rows, phase, elapsed);
+        }
         record_duration(
-            self.started_at.elapsed(),
+            elapsed,
             &ENGINE_PHYSICAL_DISPATCH_DURATION_NANOS,
             &ENGINE_PHYSICAL_DISPATCH_DURATION_OBSERVATIONS,
             &ENGINE_PHYSICAL_DISPATCH_DURATION_MAX_NANOS,
@@ -985,11 +1014,284 @@ pub(crate) fn set_engine_effective_physical_execution(
 }
 
 pub(crate) fn begin_engine_physical_dispatch() -> EnginePhysicalDispatchMetricsGuard {
+    begin_dispatch_guard(None)
+}
+
+/// [`begin_engine_physical_dispatch`] for a batch of `rows` rows in `phase`:
+/// its duration is also counted under that width and phase.
+pub(crate) fn begin_engine_physical_dispatch_shaped(
+    rows: usize,
+    phase: EngineDispatchPhase,
+) -> EnginePhysicalDispatchMetricsGuard {
+    begin_dispatch_guard(Some((rows, phase)))
+}
+
+fn begin_dispatch_guard(
+    shape: Option<(usize, EngineDispatchPhase)>,
+) -> EnginePhysicalDispatchMetricsGuard {
     let active = saturating_atomic_add(&ENGINE_PHYSICAL_DISPATCHES_IN_FLIGHT, 1);
     ENGINE_PHYSICAL_DISPATCHES_MAX_IN_FLIGHT.fetch_max(active, Ordering::Relaxed);
     saturating_atomic_add(&ENGINE_PHYSICAL_DISPATCHES_STARTED, 1);
     EnginePhysicalDispatchMetricsGuard {
         started_at: Instant::now(),
+        shape,
+    }
+}
+
+/// What a physical dispatch's rows do, for the per-width step times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineDispatchPhase {
+    /// Every row is a decode step.
+    Decode,
+    /// At least one row prefills.
+    Prefill,
+    /// Neither, such as preparation or audio work.
+    Other,
+}
+
+impl EngineDispatchPhase {
+    const ALL: [Self; 3] = [Self::Decode, Self::Prefill, Self::Other];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Decode => "decode",
+            Self::Prefill => "prefill",
+            Self::Other => "other",
+        }
+    }
+
+    /// The phase of a batch whose rows run `works`.
+    pub(crate) fn of_work<'a>(works: impl IntoIterator<Item = &'a super::WorkUnit>) -> Self {
+        let mut phase = None;
+        for work in works {
+            let row = match work {
+                super::WorkUnit::SequenceStep {
+                    phase: super::SequencePhase::Prefill,
+                    ..
+                } => return Self::Prefill,
+                super::WorkUnit::SequenceStep {
+                    phase: super::SequencePhase::Decode,
+                    ..
+                } => Self::Decode,
+                _ => Self::Other,
+            };
+            phase = Some(match phase {
+                None | Some(Self::Decode) => row,
+                Some(other) => other,
+            });
+        }
+        phase.unwrap_or(Self::Other)
+    }
+}
+
+/// Dispatch time of one (width, phase) cell since the process started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct EngineDispatchWidthTime {
+    pub phase: EngineDispatchPhase,
+    /// Rows in the batch, 1 through 64; 0 collects wider batches.
+    pub width: u64,
+    pub dispatches: u64,
+    pub micros: u64,
+}
+
+struct DispatchWidthTimes {
+    micros: [[AtomicU64; EXACT_MODEL_WIDTH_LIMIT + 1]; 3],
+    dispatches: [[AtomicU64; EXACT_MODEL_WIDTH_LIMIT + 1]; 3],
+}
+
+impl DispatchWidthTimes {
+    const fn new() -> Self {
+        Self {
+            micros: [const { [const { AtomicU64::new(0) }; EXACT_MODEL_WIDTH_LIMIT + 1] }; 3],
+            dispatches: [const { [const { AtomicU64::new(0) }; EXACT_MODEL_WIDTH_LIMIT + 1] }; 3],
+        }
+    }
+
+    fn record(&self, rows: usize, phase: EngineDispatchPhase, elapsed: Duration) {
+        let width = if (1..=EXACT_MODEL_WIDTH_LIMIT).contains(&rows) {
+            rows
+        } else {
+            0
+        };
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let phase = phase as usize;
+        saturating_atomic_add(&self.micros[phase][width], micros);
+        saturating_atomic_add(&self.dispatches[phase][width], 1);
+    }
+
+    fn snapshot(&self) -> Vec<EngineDispatchWidthTime> {
+        let mut cells = Vec::new();
+        for phase in EngineDispatchPhase::ALL {
+            for width in 0..=EXACT_MODEL_WIDTH_LIMIT {
+                let dispatches = self.dispatches[phase as usize][width].load(Ordering::Relaxed);
+                if dispatches > 0 {
+                    cells.push(EngineDispatchWidthTime {
+                        phase,
+                        width: width as u64,
+                        dispatches,
+                        micros: self.micros[phase as usize][width].load(Ordering::Relaxed),
+                    });
+                }
+            }
+        }
+        cells
+    }
+}
+
+static ENGINE_DISPATCH_WIDTH_TIMES: DispatchWidthTimes = DispatchWidthTimes::new();
+
+/// One claim the guarded resource authority refused for live headroom.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EngineCapacityRefusal {
+    pub unix_ms: u64,
+    /// The reservation class: request, batch_workspace, model, cache, pipeline.
+    pub class: &'static str,
+    /// The first domain that did not fit, such as "GPU memory".
+    pub domain: &'static str,
+    /// Bytes (or slots) the claim needed in that domain.
+    pub need: u64,
+    /// Already reserved there but not yet allocated.
+    pub held: u64,
+    /// Live free capacity there; `None` when unknown.
+    pub available: Option<u64>,
+}
+
+/// Refusal counts by class, and the latest refusals with their margins.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct EngineCapacityRefusalMetricsSnapshot {
+    pub by_class: BTreeMap<&'static str, u64>,
+    pub recent: Vec<EngineCapacityRefusal>,
+}
+
+const RECENT_REFUSALS: usize = 16;
+static ENGINE_CAPACITY_REFUSALS: std::sync::Mutex<(
+    BTreeMap<&'static str, u64>,
+    VecDeque<EngineCapacityRefusal>,
+)> = std::sync::Mutex::new((BTreeMap::new(), VecDeque::new()));
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
+pub(crate) fn record_live_capacity_refusal(
+    class: &'static str,
+    domain: &'static str,
+    need: u64,
+    held: u64,
+    available: Option<u64>,
+) {
+    let unix_ms = unix_ms();
+    let mut refusals = ENGINE_CAPACITY_REFUSALS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *refusals.0.entry(class).or_default() += 1;
+    if refusals.1.len() == RECENT_REFUSALS {
+        refusals.1.pop_front();
+    }
+    refusals.1.push_back(EngineCapacityRefusal {
+        unix_ms,
+        class,
+        domain,
+        need,
+        held,
+        available,
+    });
+}
+
+fn capacity_refusals_snapshot() -> EngineCapacityRefusalMetricsSnapshot {
+    let refusals = ENGINE_CAPACITY_REFUSALS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    EngineCapacityRefusalMetricsSnapshot {
+        by_class: refusals.0.clone(),
+        recent: refusals.1.iter().cloned().collect(),
+    }
+}
+
+/// One request that failed: a row the engine failed terminally, or a request
+/// the runtime refused to admit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EngineRecentFailure {
+    pub unix_ms: u64,
+    pub request_id: String,
+    /// Where it failed: an engine failure origin such as "model" or
+    /// "workspace_admission", "engine" when none was recorded, or
+    /// "admission" for a refused request.
+    pub origin: &'static str,
+    pub kind: String,
+    /// The failure's message, truncated.
+    pub message: String,
+}
+
+const RECENT_FAILURES: usize = 32;
+const FAILURE_MESSAGE_CHARS: usize = 400;
+static ENGINE_RECENT_FAILURES: std::sync::Mutex<VecDeque<EngineRecentFailure>> =
+    std::sync::Mutex::new(VecDeque::new());
+
+/// Keep `request_id`'s failure among the latest [`RECENT_FAILURES`], so
+/// `/v1/metrics` shows why recent requests failed without the server log.
+pub(crate) fn record_engine_request_failure(
+    request_id: &str,
+    origin: &'static str,
+    kind: impl Into<String>,
+    message: &str,
+) {
+    let failure = EngineRecentFailure {
+        unix_ms: unix_ms(),
+        request_id: request_id.to_string(),
+        origin,
+        kind: kind.into(),
+        message: message.chars().take(FAILURE_MESSAGE_CHARS).collect(),
+    };
+    let mut failures = ENGINE_RECENT_FAILURES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if failures.len() == RECENT_FAILURES {
+        failures.pop_front();
+    }
+    failures.push_back(failure);
+}
+
+/// Held by tests that assert on the shared failure ring, so one test's
+/// burst of failures cannot evict another's entry mid-assertion.
+#[cfg(test)]
+pub(crate) static RECENT_FAILURES_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn recent_failures_snapshot() -> Vec<EngineRecentFailure> {
+    ENGINE_RECENT_FAILURES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .iter()
+        .cloned()
+        .collect()
+}
+
+/// The metric label of a failure origin.
+pub(crate) const fn failure_origin_label(origin: FailureOrigin) -> &'static str {
+    match origin {
+        FailureOrigin::AdapterPlanning => "adapter_planning",
+        FailureOrigin::DispatchCoordination => "dispatch_coordination",
+        FailureOrigin::WorkspaceAdmission => "workspace_admission",
+        FailureOrigin::ExecutorValidation => "executor_validation",
+        FailureOrigin::Model => "model",
+        FailureOrigin::StreamDelivery => "stream_delivery",
+        FailureOrigin::StateCommit => "state_commit",
+        FailureOrigin::Cleanup => "cleanup",
+        FailureOrigin::Panic => "panic",
+    }
+}
+
+static ENGINE_WORKSPACE_CAPPED_SESSIONS: AtomicU64 = AtomicU64::new(0);
+
+/// A session's batch width became capped (`true`) or its cap was cleared.
+pub(crate) fn record_workspace_cap_change(capped: bool) {
+    if capped {
+        saturating_atomic_add(&ENGINE_WORKSPACE_CAPPED_SESSIONS, 1);
+    } else {
+        saturating_atomic_sub(&ENGINE_WORKSPACE_CAPPED_SESSIONS, 1);
     }
 }
 
@@ -1125,6 +1427,12 @@ pub struct EngineBatchMetricsSnapshot {
     pub model_tensor_multirow_calls_total: u64,
     /// Actual forwards by exact tensor width 1..=64; key 0 is overflow above 64.
     pub model_tensor_batch_width_counts: BTreeMap<u64, u64>,
+    /// Physical dispatch time by row count and phase.
+    pub physical_dispatch_widths: Vec<EngineDispatchWidthTime>,
+    pub capacity_refusals: EngineCapacityRefusalMetricsSnapshot,
+    pub workspace_capped_sessions: u64,
+    /// The latest failed and refused requests with their messages.
+    pub recent_failures: Vec<EngineRecentFailure>,
     pub capacity_suspensions_total: u64,
     pub capacity_replay_tokens_total: u64,
     pub capacity_replay_capped_total: u64,
@@ -1727,6 +2035,10 @@ pub fn engine_batch_metrics_snapshot() -> EngineBatchMetricsSnapshot {
         model_tensor_multirow_calls_total: ENGINE_MODEL_TENSOR_MULTIROW_CALLS
             .load(Ordering::Relaxed),
         model_tensor_batch_width_counts: ENGINE_MODEL_WIDTH_COUNTS.snapshot(),
+        physical_dispatch_widths: ENGINE_DISPATCH_WIDTH_TIMES.snapshot(),
+        capacity_refusals: capacity_refusals_snapshot(),
+        workspace_capped_sessions: ENGINE_WORKSPACE_CAPPED_SESSIONS.load(Ordering::Relaxed),
+        recent_failures: recent_failures_snapshot(),
         capacity_suspensions_total: ENGINE_CAPACITY_SUSPENSIONS.load(Ordering::Relaxed),
         capacity_replay_tokens_total: ENGINE_CAPACITY_REPLAY_TOKENS.load(Ordering::Relaxed),
         capacity_replay_capped_total: ENGINE_CAPACITY_REPLAY_CAPPED.load(Ordering::Relaxed),
@@ -2297,6 +2609,81 @@ mod tests {
         assert!(after.deadline_phases.model_execution > before.deadline_phases.model_execution);
         assert_eq!(after.failure_origins.labeled_values().len(), 9);
         assert_eq!(after.deadline_phases.labeled_values().len(), 5);
+    }
+
+    #[test]
+    fn shaped_dispatches_count_time_by_width_and_phase() {
+        let cell = |phase, width| {
+            ENGINE_DISPATCH_WIDTH_TIMES
+                .snapshot()
+                .into_iter()
+                .find(|cell| cell.phase == phase && cell.width == width)
+                .map_or((0, 0), |cell| (cell.dispatches, cell.micros))
+        };
+        let (decode_before, _) = cell(EngineDispatchPhase::Decode, 37);
+        let (wide_before, _) = cell(EngineDispatchPhase::Prefill, 0);
+        {
+            let _dispatch = begin_engine_physical_dispatch_shaped(37, EngineDispatchPhase::Decode);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drop(begin_engine_physical_dispatch_shaped(
+            EXACT_MODEL_WIDTH_LIMIT + 5,
+            EngineDispatchPhase::Prefill,
+        ));
+        let (decode_after, decode_micros) = cell(EngineDispatchPhase::Decode, 37);
+        assert!(decode_after > decode_before);
+        assert!(decode_micros >= 2_000, "{decode_micros}");
+        assert!(cell(EngineDispatchPhase::Prefill, 0).0 > wide_before);
+    }
+
+    #[test]
+    fn recent_failures_are_bounded_and_truncated() {
+        let _ring = RECENT_FAILURES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let long = "x".repeat(FAILURE_MESSAGE_CHARS * 2);
+        record_engine_request_failure("ring-long", "model", "Model", &long);
+        let failures = recent_failures_snapshot();
+        let recorded = failures
+            .iter()
+            .find(|failure| failure.request_id == "ring-long")
+            .unwrap();
+        assert_eq!(recorded.message.chars().count(), FAILURE_MESSAGE_CHARS);
+        for index in 0..RECENT_FAILURES + 3 {
+            record_engine_request_failure(&format!("ring-{index}"), "model", "Model", "m");
+        }
+        let failures = recent_failures_snapshot();
+        assert_eq!(failures.len(), RECENT_FAILURES);
+        assert!(failures
+            .iter()
+            .all(|failure| failure.request_id != "ring-long"));
+        assert_eq!(
+            failure_origin_label(FailureOrigin::WorkspaceAdmission),
+            "workspace_admission"
+        );
+    }
+
+    #[test]
+    fn a_batch_prefills_when_any_row_prefills() {
+        let step = |phase| crate::engine::WorkUnit::SequenceStep {
+            phase,
+            input: crate::engine::InputRange { start: 0, end: 1 },
+            max_output_steps: 1,
+            auxiliary_state: None,
+        };
+        let decode = step(crate::engine::SequencePhase::Decode);
+        let prefill = step(crate::engine::SequencePhase::Prefill);
+        let other = crate::engine::WorkUnit::PreSequencePreparation {
+            kind: "codec".into(),
+        };
+        let of = |works: &[&crate::engine::WorkUnit]| {
+            EngineDispatchPhase::of_work(works.iter().copied())
+        };
+        assert_eq!(of(&[&decode, &decode]), EngineDispatchPhase::Decode);
+        assert_eq!(of(&[&decode, &prefill]), EngineDispatchPhase::Prefill);
+        assert_eq!(of(&[&other, &prefill]), EngineDispatchPhase::Prefill);
+        assert_eq!(of(&[&decode, &other]), EngineDispatchPhase::Other);
+        assert_eq!(of(&[]), EngineDispatchPhase::Other);
     }
 
     #[test]
