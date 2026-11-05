@@ -1731,6 +1731,14 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the Qwen3.5/Qwen3.6-MoE tiled DeltaNet recurrence tile size (min 1, capped at sequence length).",
     ),
     CoreEnvVar::new(
+        "IZWI_QWEN36_BATCHED_GDN",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off keeps one DeltaNet conv and recurrence launch per row in Qwen3.6 multi-row decode instead of one pair per layer.",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
         "IZWI_QWEN36_CHUNKED_GDN",
         Flag,
         "true",
