@@ -1477,10 +1477,30 @@ impl Qwen36TextModel {
     }
 
     pub(crate) fn moe_backend_summary(&self) -> serde_json::Value {
-        super::fast_path::summarize(self.layers.iter().filter_map(|layer| match &layer.ffn {
-            Qwen36FeedForward::Sparse(moe) => Some(moe.backend()),
+        let mut summary =
+            super::fast_path::summarize(self.layers.iter().filter_map(|layer| match &layer.ffn {
+                Qwen36FeedForward::Sparse(moe) => Some(moe.backend()),
+                Qwen36FeedForward::Dense(_) => None,
+            }));
+        if let Some(tokens) = self.layers.iter().find_map(|layer| match &layer.ffn {
+            Qwen36FeedForward::Sparse(moe) => moe.fused_experts().map(|e| e.grouped_min_tokens()),
             Qwen36FeedForward::Dense(_) => None,
-        }))
+        }) {
+            summary["grouped_min_tokens"] = tokens.into();
+        }
+        summary
+    }
+
+    /// Route MoE calls of `tokens` routed tokens or more through the grouped
+    /// kernels in every sparse layer (the load-time timings' crossover).
+    pub(crate) fn apply_moe_grouped_crossover(&mut self, tokens: usize) {
+        for layer in &mut self.layers {
+            if let Qwen36FeedForward::Sparse(moe) = &mut layer.ffn {
+                if let Some(experts) = moe.fused_experts_mut() {
+                    experts.set_grouped_min_tokens(tokens);
+                }
+            }
+        }
     }
 
     /// Resolve every fused path against the portable CPU references (tests
@@ -5900,9 +5920,12 @@ pub(crate) mod tests {
             .as_f64()
             .is_some());
         for tokens in ["1", "8", "32", "128"] {
-            let moe = &timings["moe_by_tokens"][tokens];
+            let moe = &timings["moe_by_tokens"]["by_tokens"][tokens];
             assert!(moe["per_pair_ms"].as_f64().is_some(), "{tokens}: {moe}");
         }
+        // The crossover the load applies moves every sparse layer's switch.
+        model.apply_moe_grouped_crossover(96);
+        assert_eq!(model.moe_backend_summary()["grouped_min_tokens"], 96);
     }
 
     #[test]

@@ -84,6 +84,10 @@ pub(crate) struct Qwen36MoeFusedExperts {
     /// Expert-major kernels for prefill-sized calls (see
     /// [`moe::GROUPED_MIN_TOKENS`]); verified by the self-check.
     grouped: bool,
+    /// Routed tokens from which [`Self::combine`] takes the grouped kernels:
+    /// [`moe::GROUPED_MIN_TOKENS`] until the load-time timings measure where
+    /// they overtake the per-(token, slot) GEMVs on this device.
+    grouped_min_tokens: usize,
 }
 
 /// Result of [`Qwen36MoeFusedExperts::stack`]. Unsupported layouts hand the
@@ -297,6 +301,7 @@ impl Qwen36MoeFusedExperts {
         Qwen36MoeStacking::Stacked {
             fused: Self {
                 grouped: moe::grouped_supported(hidden, inter, w13.dim(0).unwrap_or(0)),
+                grouped_min_tokens: moe::GROUPED_MIN_TOKENS,
                 router: router_tensor,
                 spec,
                 hidden,
@@ -453,6 +458,16 @@ impl Qwen36MoeFusedExperts {
         self.grouped
     }
 
+    /// Routed tokens from which calls take the grouped kernels.
+    pub(crate) fn grouped_min_tokens(&self) -> usize {
+        self.grouped_min_tokens
+    }
+
+    /// Take the grouped kernels from `tokens` routed tokens on.
+    pub(crate) fn set_grouped_min_tokens(&mut self, tokens: usize) {
+        self.grouped_min_tokens = tokens.max(1);
+    }
+
     /// [`Self::combine`] through the grouped kernels whatever the token count.
     pub(crate) fn combine_grouped(&self, flat: &Tensor, routing: &Tensor) -> Result<Tensor> {
         moe::fp8_moe_grouped(
@@ -469,7 +484,7 @@ impl Qwen36MoeFusedExperts {
 
     fn combine(&self, flat: &Tensor, routing: &Tensor) -> Result<Tensor> {
         let slots = self.spec.slots();
-        if self.grouped && flat.dim(0)? >= moe::GROUPED_MIN_TOKENS {
+        if self.grouped && flat.dim(0)? >= self.grouped_min_tokens {
             return moe::fp8_moe_grouped(
                 flat, routing, slots, &self.w13, &self.s13, &self.w2, &self.s2,
             )

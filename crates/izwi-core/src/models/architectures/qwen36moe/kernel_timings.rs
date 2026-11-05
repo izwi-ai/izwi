@@ -276,6 +276,7 @@ impl Qwen36TextModel {
         budget: Duration,
     ) -> Result<serde_json::Value> {
         let mut by_tokens = serde_json::Map::new();
+        let mut crossover = None;
         for tokens in MOE_TOKENS {
             if started.elapsed() > budget {
                 by_tokens.insert(
@@ -293,23 +294,32 @@ impl Qwen36TextModel {
             } else {
                 None
             };
-            let production =
-                if experts.grouped() && tokens >= crate::kernels::cuda::moe::GROUPED_MIN_TOKENS {
-                    "grouped"
-                } else {
-                    "per_pair"
-                };
+            if crossover.is_none() && grouped.is_some_and(|grouped| grouped < per_pair) {
+                crossover = Some(tokens);
+            }
             by_tokens.insert(
                 tokens.to_string(),
                 serde_json::json!({
                     "per_pair_ms": per_pair,
                     "grouped_ms": grouped,
-                    "production": production,
                     "per_pair_step_ms": per_pair * sparse_layers as f64,
                     "grouped_step_ms": grouped.map(|ms| ms * sparse_layers as f64),
                 }),
             );
         }
-        Ok(serde_json::Value::Object(by_tokens))
+        // Where the grouped kernels overtook the per-pair GEMVs; past the
+        // largest measurement when they never did. Prefill spans are larger.
+        let measured_all = by_tokens
+            .values()
+            .all(|entry| entry.get("skipped").is_none());
+        let crossover = match crossover {
+            Some(tokens) => Some(tokens),
+            None if experts.grouped() && measured_all => MOE_TOKENS.last().map(|tokens| tokens * 2),
+            None => None,
+        };
+        Ok(serde_json::json!({
+            "by_tokens": by_tokens,
+            "grouped_crossover_tokens": crossover,
+        }))
     }
 }

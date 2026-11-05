@@ -244,6 +244,15 @@ impl Qwen36MoeChatModel {
         let kernel_timings = exec.text_model.kernel_timings();
         if kernel_timings["status"] == "measured" {
             tracing::info!(timings = %kernel_timings, "Qwen3.6-MoE load-time kernel timings");
+            // Routed MoE calls switch to the grouped kernels where they
+            // measured faster on this device, not at a fixed token count.
+            if let Some(tokens) = kernel_timings["moe_by_tokens"]["grouped_crossover_tokens"]
+                .as_u64()
+                .and_then(|tokens| usize::try_from(tokens).ok())
+            {
+                exec.text_model.apply_moe_grouped_crossover(tokens);
+                tracing::info!(tokens, "Qwen3.6-MoE grouped expert crossover");
+            }
         }
         load_timing["kernel_timings_ms"] = (timing_started.elapsed().as_secs_f64() * 1e3).into();
         load_timing["total_ms"] = (loading_started.elapsed().as_secs_f64() * 1e3).into();

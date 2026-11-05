@@ -286,6 +286,12 @@ impl Qwen36MoeSparseMlp {
         self.fused.as_ref()
     }
 
+    pub(crate) fn fused_experts_mut(
+        &mut self,
+    ) -> Option<&mut super::fused_moe::Qwen36MoeFusedExperts> {
+        self.fused.as_mut()
+    }
+
     pub(crate) fn backend(&self) -> &Qwen36FusedPath {
         &self.backend
     }
