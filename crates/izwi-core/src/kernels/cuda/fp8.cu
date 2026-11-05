@@ -299,6 +299,151 @@ template<class T> __device__ void fp8_tc_reduce(const float* __restrict__ partia
   y[i]=T(v);
 }
 
+// Register-direct tensor-core projection for 1 to 16 rows (SM80+), the
+// batched-decode shape: y[M, N] = x[M, K] . W[N, K]^T with W block-FP8.
+// The weights are the MMA's A operand (16 channels x 16 K) and the
+// activations its B operand (16 K x 8 rows), so up to eight rows fill one
+// mma.sync.m16n8k16 and nothing is padded to 16. Each lane loads 16 weight
+// bytes per 64-wide K chunk for each of its two channels (g and g + 8) and
+// decodes them in registers, exactly, to the MMA's 16-bit type (value * 2^-8
+// through F16 lanes, as fp8_dot4 does); no shared memory or block barrier
+// sits in the loop. Within a chunk, lane q's k-slots {2q, 2q+1, 2q+8, 2q+9}
+// of step j stand for k = 16q + 4j + {0..3}; the activations are read with the
+// same permutation, so the dot product is unchanged. Each warp takes every
+// MMA_WARPS-th 128-wide K block of the split, loading the next while it
+// multiplies the current one, and applies the block scale per K block as the
+// reference kernels do. The block's warps then sum in warp order (shared
+// memory), and split K writes F32 partials for qwen38_fp8_tc_reduce, so
+// results are deterministic. Four warps per block and at most 128 registers
+// let four blocks share an SM, so a 5120-channel projection (320 blocks)
+// runs in one wave on an H100. Requires K % 128 == 0, N % 16 == 0 and 16-byte
+// aligned rows.
+#define MMA_WARPS 4
+
+__device__ __forceinline__ unsigned fp8x2_f16(unsigned w, unsigned sel) {
+  const unsigned x = __byte_perm(w, 0u, sel);
+  return (x & 0x80008000u) | ((x & 0x7F007F00u) >> 1);
+}
+template<class T> __device__ __forceinline__ unsigned fp8x2(unsigned w, unsigned sel);
+template<> __device__ __forceinline__ unsigned fp8x2<__half>(unsigned w, unsigned sel) {
+  return fp8x2_f16(w, sel);
+}
+template<> __device__ __forceinline__ unsigned fp8x2<__nv_bfloat16>(unsigned w, unsigned sel) {
+  const unsigned h = fp8x2_f16(w, sel);
+  const __nv_bfloat162 b = __float22bfloat162_rn(__half22float2(*reinterpret_cast<const __half2*>(&h)));
+  return *reinterpret_cast<const unsigned*>(&b);
+}
+template<class T> __device__ __forceinline__ void mma16816(float* d, const unsigned* a, const unsigned* b);
+template<> __device__ __forceinline__ void mma16816<__half>(float* d, const unsigned* a, const unsigned* b) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+    : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+template<> __device__ __forceinline__ void mma16816<__nv_bfloat16>(float* d, const unsigned* a, const unsigned* b) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+    : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+template<class T,int MT8> __device__ void fp8_mma(const T* __restrict__ x,const unsigned char* __restrict__ w,
+    const float* __restrict__ s,T* __restrict__ y,float* __restrict__ partial,int M,int N,int K,
+    int kblocks_per_split) {
+  __shared__ float red[MMA_WARPS][MT8*4][32];
+  const int warp=threadIdx.x>>5, lane=threadIdx.x&31, g=lane>>2, q=lane&3;
+  const int n0=blockIdx.x*16, split=blockIdx.y, kblocks=K>>7;
+  const int kb_begin=split*kblocks_per_split;
+  const int kb_end=min(kblocks,kb_begin+kblocks_per_split);
+  const float* scales=s+(size_t)(n0>>7)*kblocks;
+  const unsigned char* w_lo=w+(size_t)(n0+g)*K+16*q;
+  const unsigned char* w_hi=w_lo+(size_t)8*K;
+  float total[MT8][4];
+  #pragma unroll
+  for(int t=0;t<MT8;++t) { total[t][0]=0.f; total[t][1]=0.f; total[t][2]=0.f; total[t][3]=0.f; }
+  uint4 cur[4];
+  int kb=kb_begin+warp;
+  if(kb<kb_end) {
+    const size_t o=(size_t)kb*128;
+    cur[0]=*reinterpret_cast<const uint4*>(w_lo+o);
+    cur[1]=*reinterpret_cast<const uint4*>(w_lo+o+64);
+    cur[2]=*reinterpret_cast<const uint4*>(w_hi+o);
+    cur[3]=*reinterpret_cast<const uint4*>(w_hi+o+64);
+  }
+  for(;kb<kb_end;kb+=MMA_WARPS) {
+    const int next=kb+MMA_WARPS;
+    uint4 nxt[4];
+    if(next<kb_end) {
+      const size_t o=(size_t)next*128;
+      nxt[0]=*reinterpret_cast<const uint4*>(w_lo+o);
+      nxt[1]=*reinterpret_cast<const uint4*>(w_lo+o+64);
+      nxt[2]=*reinterpret_cast<const uint4*>(w_hi+o);
+      nxt[3]=*reinterpret_cast<const uint4*>(w_hi+o+64);
+    }
+    float part[MT8][4];
+    #pragma unroll
+    for(int t=0;t<MT8;++t) { part[t][0]=0.f; part[t][1]=0.f; part[t][2]=0.f; part[t][3]=0.f; }
+    #pragma unroll
+    for(int c=0;c<2;++c) {
+      const unsigned lo[4]={cur[c].x,cur[c].y,cur[c].z,cur[c].w};
+      const unsigned hi[4]={cur[2+c].x,cur[2+c].y,cur[2+c].z,cur[2+c].w};
+      unsigned a[4][4];
+      #pragma unroll
+      for(int j=0;j<4;++j) {
+        a[j][0]=fp8x2<T>(lo[j],0x1404);
+        a[j][1]=fp8x2<T>(hi[j],0x1404);
+        a[j][2]=fp8x2<T>(lo[j],0x3424);
+        a[j][3]=fp8x2<T>(hi[j],0x3424);
+      }
+      #pragma unroll
+      for(int t=0;t<MT8;++t) {
+        const int row=t*8+g;
+        uint4 xa=make_uint4(0u,0u,0u,0u), xb=make_uint4(0u,0u,0u,0u);
+        if(row<M) {
+          const T* xp=x+(size_t)row*K+(size_t)kb*128+c*64+16*q;
+          xa=*reinterpret_cast<const uint4*>(xp);
+          xb=*reinterpret_cast<const uint4*>(xp+8);
+        }
+        const unsigned xw[8]={xa.x,xa.y,xa.z,xa.w,xb.x,xb.y,xb.z,xb.w};
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+          const unsigned b[2]={xw[2*j],xw[2*j+1]};
+          mma16816<T>(part[t],a[j],b);
+        }
+      }
+    }
+    const float scale=scales[kb];
+    #pragma unroll
+    for(int t=0;t<MT8;++t) {
+      #pragma unroll
+      for(int i=0;i<4;++i) total[t][i]=fmaf(part[t][i],scale,total[t][i]);
+    }
+    if(next<kb_end) { cur[0]=nxt[0]; cur[1]=nxt[1]; cur[2]=nxt[2]; cur[3]=nxt[3]; }
+  }
+  #pragma unroll
+  for(int t=0;t<MT8;++t) {
+    #pragma unroll
+    for(int i=0;i<4;++i) red[warp][t*4+i][lane]=total[t][i];
+  }
+  __syncthreads();
+  if(warp!=0) return;
+  // Accumulator element i of row tile t: channel g (+8 for i >= 2), row
+  // t*8 + 2q + (i & 1).
+  #pragma unroll
+  for(int t=0;t<MT8;++t) {
+    #pragma unroll
+    for(int i=0;i<4;++i) {
+      float v=0.f;
+      #pragma unroll
+      for(int wp=0;wp<MMA_WARPS;++wp) v+=red[wp][t*4+i][lane];
+      const int row=t*8+2*q+(i&1), n=n0+g+((i&2)?8:0);
+      if(row<M) {
+        v*=256.f;
+        if(partial) partial[((size_t)split*M+row)*N+n]=v;
+        else y[(size_t)row*N+n]=T(v);
+      }
+    }
+  }
+}
+
 // Long-span prefill: output rows [row0, row0 + rows) of a block-FP8 matrix
 // expanded to T (value * block scale, rounded once) into a [rows, K] tile that
 // a dense GEMM (cuBLAS) then multiplies. Elementwise: each thread expands four
@@ -328,6 +473,10 @@ extern "C" __global__ void __launch_bounds__(128) qwen38_fp8_tc_f16(const __half
 extern "C" __global__ void __launch_bounds__(128) qwen38_fp8_tc_bf16(const __nv_bfloat16*x,const unsigned char*w,const float*s,__nv_bfloat16*y,float*partial,int M,int N,int K,int kps){fp8_tc<__nv_bfloat16>(x,w,s,y,partial,M,N,K,kps);}
 extern "C" __global__ void qwen38_fp8_tc_reduce_f16(const float*p,__half*y,int splits,int MN){fp8_tc_reduce<__half>(p,y,splits,MN);}
 extern "C" __global__ void qwen38_fp8_tc_reduce_bf16(const float*p,__nv_bfloat16*y,int splits,int MN){fp8_tc_reduce<__nv_bfloat16>(p,y,splits,MN);}
+extern "C" __global__ void __launch_bounds__(128, 4) qwen38_fp8_mma8_f16(const __half*x,const unsigned char*w,const float*s,__half*y,float*partial,int M,int N,int K,int kps){fp8_mma<__half,1>(x,w,s,y,partial,M,N,K,kps);}
+extern "C" __global__ void __launch_bounds__(128, 4) qwen38_fp8_mma8_bf16(const __nv_bfloat16*x,const unsigned char*w,const float*s,__nv_bfloat16*y,float*partial,int M,int N,int K,int kps){fp8_mma<__nv_bfloat16,1>(x,w,s,y,partial,M,N,K,kps);}
+extern "C" __global__ void __launch_bounds__(128, 4) qwen38_fp8_mma16_f16(const __half*x,const unsigned char*w,const float*s,__half*y,float*partial,int M,int N,int K,int kps){fp8_mma<__half,2>(x,w,s,y,partial,M,N,K,kps);}
+extern "C" __global__ void __launch_bounds__(128, 4) qwen38_fp8_mma16_bf16(const __nv_bfloat16*x,const unsigned char*w,const float*s,__nv_bfloat16*y,float*partial,int M,int N,int K,int kps){fp8_mma<__nv_bfloat16,2>(x,w,s,y,partial,M,N,K,kps);}
 
 // Vectorized decode GEMV over F32 activations and outputs, for decoders that
 // keep an F32 residual stream: one warp per output channel, eight channels a

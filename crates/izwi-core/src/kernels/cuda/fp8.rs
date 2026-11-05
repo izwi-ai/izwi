@@ -87,18 +87,29 @@ enum DecodeKernel {
     /// The vectorized GEMV (errors if the call is not eligible).
     Vectorized,
     /// The vectorized GEMV for an eligible call (at most
-    /// [`VECTORIZED_DECODE_MAX_ROWS`] aligned rows),
-    /// the reference kernels otherwise. The caller owns the verification, so
-    /// the process-wide flag is neither read nor set.
+    /// [`VECTORIZED_DECODE_MAX_ROWS`] aligned rows), the reference kernels
+    /// otherwise, unless the process-wide tensor-core table picks a kernel for
+    /// the row count. The caller owns the GEMV's verification, so its
+    /// process-wide flag is neither read nor set.
     VectorizedWhenEligible,
-    /// The tensor-core kernel (errors if the call is not eligible); for its
-    /// load-time check and timings.
-    TensorCore,
+    /// The register-direct tensor-core kernel (`qwen38_fp8_mma*`; errors if
+    /// the call is not eligible), for its load-time check and timings.
+    Mma,
+    /// The shared-memory tensor-core kernel (`qwen38_fp8_tc_*`; errors if
+    /// the call is not eligible), for its load-time check and timings.
+    Wmma,
 }
 
-/// Rows the tensor-core projection can serve in one launch (four 16-row
-/// tiles). Wider calls take the dequantized GEMM.
+/// Rows a tensor-core projection can serve in one launch. Wider calls take
+/// the dequantized GEMM.
 pub const TENSOR_CORE_MAX_ROWS: usize = 64;
+
+/// Rows the register-direct kernel serves: two 8-row MMA tiles.
+const MMA_MAX_ROWS: usize = 16;
+
+/// Warps per register-direct block (`MMA_WARPS` in fp8.cu); they split the
+/// block's K blocks between them.
+const MMA_WARPS: usize = 4;
 
 /// Blocks a tensor-core launch aims for (about two per H100 SM): projections
 /// with few output channels split K until they fill the device.
@@ -106,32 +117,89 @@ const TENSOR_CORE_TARGET_BLOCKS: usize = 264;
 
 /// `(n, k)` of the tensor-core load-time check, each within
 /// [`provider_supported`]: three 64-channel blocks (the last owns half a
-/// 128-row scale block) with K split to one block per split, K split across
-/// a wide projection, and enough channels that K is not split.
+/// 128-row scale block) with K split, K split across a wide projection, and
+/// enough channels that K is not split (register-direct warps left idle).
 const TENSOR_CORE_CHECK_SHAPES: [(usize, usize); 3] = [(192, 2048), (2048, 4096), (16_960, 256)];
+
+/// Row counts the load-time timings sample. A row count between two samples
+/// takes the larger sample's choice.
+const TENSOR_CORE_TIMED_ROWS: [usize; 10] = [1, 2, 3, 4, 5, 6, 8, 16, 32, TENSOR_CORE_MAX_ROWS];
 
 /// Kill switch for the tensor-core projection (`legacy`/`off`/`0`).
 pub const TENSOR_CORE_ENV: &str = "IZWI_FP8_TENSOR_CORE";
 
-static TENSOR_CORE_VERIFIED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static TENSOR_CORE_MIN_ROWS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(usize::MAX);
-static TENSOR_CORE_SERVED_MAX_ROWS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static TENSOR_CORE_SUMMARY: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
-
-/// Whether a compact-FP8 projection of `rows` rows takes the tensor-core
-/// kernel: it passed its load-time check, and the timings measured it faster
-/// than the vectorized GEMV below and the dequantized GEMM above.
-pub fn tensor_core_serves(rows: usize) -> bool {
-    TENSOR_CORE_VERIFIED.load(std::sync::atomic::Ordering::Relaxed)
-        && rows >= TENSOR_CORE_MIN_ROWS.load(std::sync::atomic::Ordering::Relaxed)
-        && rows <= TENSOR_CORE_SERVED_MAX_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+/// A tensor-core FP8 projection kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TensorCoreKernel {
+    /// `qwen38_fp8_mma*`: weights decoded in registers straight into
+    /// `mma.sync`, up to [`MMA_MAX_ROWS`] rows.
+    Mma = 1,
+    /// `qwen38_fp8_tc_*`: weights decoded into shared memory for WMMA, up to
+    /// [`TENSOR_CORE_MAX_ROWS`] rows.
+    Wmma = 2,
 }
 
-/// The check, crossover and timings behind [`tensor_core_serves`], for the
-/// diagnostics (`null` until a load ran them).
+impl TensorCoreKernel {
+    const ALL: [Self; 2] = [Self::Mma, Self::Wmma];
+
+    fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|kernel| *kernel as u8 == code)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Mma => "mma",
+            Self::Wmma => "wmma",
+        }
+    }
+
+    fn max_rows(self) -> usize {
+        match self {
+            Self::Mma => MMA_MAX_ROWS,
+            Self::Wmma => TENSOR_CORE_MAX_ROWS,
+        }
+    }
+
+    fn forced(self) -> DecodeKernel {
+        match self {
+            Self::Mma => DecodeKernel::Mma,
+            Self::Wmma => DecodeKernel::Wmma,
+        }
+    }
+
+    /// The row counts its load-time check runs.
+    fn check_rows(self) -> &'static [usize] {
+        match self {
+            Self::Mma => &[1, 2, 5, 8, 9, 16],
+            Self::Wmma => &[2, 5, 8, 16, 17, 33, 64],
+        }
+    }
+}
+
+/// The tensor-core kernel each row count runs (index = rows; 0 = none: the
+/// vectorized GEMV, the reference kernels or the family's dequantized GEMM),
+/// filled by [`verify_and_enable_tensor_core`].
+static TENSOR_CORE_ROWS: [std::sync::atomic::AtomicU8; TENSOR_CORE_MAX_ROWS + 1] =
+    [const { std::sync::atomic::AtomicU8::new(0) }; TENSOR_CORE_MAX_ROWS + 1];
+static TENSOR_CORE_VERIFIED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static TENSOR_CORE_SUMMARY: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+
+fn tensor_core_kernel(rows: usize) -> Option<TensorCoreKernel> {
+    TENSOR_CORE_ROWS.get(rows).and_then(|code| {
+        TensorCoreKernel::from_code(code.load(std::sync::atomic::Ordering::Relaxed))
+    })
+}
+
+/// Whether a compact-FP8 projection of `rows` rows takes a tensor-core
+/// kernel: one passed its load-time check and measured fastest at that row
+/// count.
+pub fn tensor_core_serves(rows: usize) -> bool {
+    tensor_core_kernel(rows).is_some()
+}
+
+/// The checks, per-row kernels and timings behind [`tensor_core_serves`],
+/// for the diagnostics (`null` until a load ran them).
 pub fn tensor_core_summary() -> serde_json::Value {
     TENSOR_CORE_SUMMARY
         .get()
@@ -140,26 +208,24 @@ pub fn tensor_core_summary() -> serde_json::Value {
 }
 
 /// Rows from which a family should route a compact-FP8 projection through
-/// the dequantized GEMM: past the tensor-core kernel's rows when it serves
-/// rows beyond the vectorized GEMV's, else [`DEQUANT_GEMM_MIN_ROWS`].
+/// the dequantized GEMM: past the tensor-core rows that follow the vectorized
+/// GEMV's, else [`DEQUANT_GEMM_MIN_ROWS`].
 pub fn dequant_gemm_min_rows() -> usize {
-    let served = TENSOR_CORE_SERVED_MAX_ROWS.load(std::sync::atomic::Ordering::Relaxed);
-    if tensor_core_serves(served) {
-        served.max(VECTORIZED_DECODE_MAX_ROWS) + 1
-    } else {
-        DEQUANT_GEMM_MIN_ROWS
-    }
+    (VECTORIZED_DECODE_MAX_ROWS + 1..=TENSOR_CORE_MAX_ROWS)
+        .take_while(|rows| tensor_core_serves(*rows))
+        .last()
+        .map_or(DEQUANT_GEMM_MIN_ROWS, |rows| rows + 1)
 }
 
-/// Compare the tensor-core projection with the reference kernels on `device`
-/// (row counts 2 to 64 including partial tiles, channel tails, split and
-/// unsplit K, BF16 and F16), then time it on a 5120x5120 projection and
-/// enable it, process-wide, over the rows where it measured faster: against
-/// the vectorized GEMV at 8 down to 2 rows (from the smallest count at which
-/// it is faster at that and every larger one, else from 9), and against the
-/// dequantized GEMM at 16, 32 and 64 rows (up to the largest count at which
-/// it is faster at that and every smaller one, else up to 8).
-/// Idempotent; `IZWI_FP8_TENSOR_CORE=legacy` leaves it off.
+/// Compare each tensor-core kernel with the reference kernels on `device`
+/// (the register-direct one at 1 to 16 rows, the shared-memory one at 2 to
+/// 64; partial tiles, split and unsplit K, BF16 and F16), then time them on a
+/// 5120x5120 projection and give each row count, process-wide, the fastest
+/// of the kernels that passed and the path it would take otherwise: the
+/// vectorized GEMV up to 8 rows, the dequantized GEMM above. From the first
+/// sample above 8 rows that the GEMM wins, the GEMM keeps every wider count.
+/// A kernel that fails its check is left out; the call fails only when both
+/// do. Idempotent; `IZWI_FP8_TENSOR_CORE=legacy` leaves them off.
 pub fn verify_and_enable_tensor_core(device: &Device) -> Result<()> {
     if TENSOR_CORE_VERIFIED.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(());
@@ -203,72 +269,124 @@ pub fn verify_and_enable_tensor_core(device: &Device) -> Result<()> {
     };
     let host =
         |t: Tensor| -> Result<Vec<f32>> { t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>() };
-    for (index, (n, k)) in TENSOR_CORE_CHECK_SHAPES.into_iter().enumerate() {
-        let (w, s) = weights(n, k, index)?;
-        for m in [2usize, 5, 8, 16, 17, 33, 64] {
-            for dtype in [DType::BF16, DType::F16] {
-                let x = input(m, k, dtype, m as f32)?;
-                let reference = host(project(&x, &w, &s, DecodeKernel::Reference)?)?;
-                let actual = host(project(&x, &w, &s, DecodeKernel::TensorCore)?)?;
-                let scale = reference.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
-                if let Some((at, (a, b))) = actual
-                    .iter()
-                    .zip(&reference)
-                    .enumerate()
-                    .find(|(_, (a, b))| !a.is_finite() || (*a - *b).abs() > 0.02 * scale)
-                {
-                    candle_core::bail!(
-                        "tensor-core FP8 projection diverges at n={n} k={k} m={m} {dtype:?} index {at}: {a} vs reference {b}"
-                    )
+    let check = |kernel: TensorCoreKernel| -> Result<()> {
+        for (index, (n, k)) in TENSOR_CORE_CHECK_SHAPES.into_iter().enumerate() {
+            let (w, s) = weights(n, k, index)?;
+            for &m in kernel.check_rows() {
+                for dtype in [DType::BF16, DType::F16] {
+                    let x = input(m, k, dtype, m as f32)?;
+                    let reference = host(project(&x, &w, &s, DecodeKernel::Reference)?)?;
+                    let actual = host(project(&x, &w, &s, kernel.forced())?)?;
+                    let scale = reference.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
+                    if let Some((at, (a, b))) = actual
+                        .iter()
+                        .zip(&reference)
+                        .enumerate()
+                        .find(|(_, (a, b))| !a.is_finite() || (*a - *b).abs() > 0.02 * scale)
+                    {
+                        candle_core::bail!(
+                            "{} diverges at n={n} k={k} m={m} {dtype:?} index {at}: {a} vs reference {b}",
+                            kernel.name()
+                        )
+                    }
                 }
             }
         }
+        Ok(())
+    };
+    let mut checks = serde_json::Map::new();
+    let mut passed = Vec::new();
+    for kernel in TensorCoreKernel::ALL {
+        match check(kernel) {
+            Ok(()) => {
+                checks.insert(kernel.name().into(), "passed".into());
+                passed.push(kernel);
+            }
+            Err(error) => {
+                tracing::warn!(%error, kernel = kernel.name(), "tensor-core FP8 kernel failed its check; left out");
+                checks.insert(kernel.name().into(), error.to_string().into());
+            }
+        }
+    }
+    if passed.is_empty() {
+        candle_core::bail!(
+            "every tensor-core FP8 kernel failed its check: {}",
+            serde_json::Value::Object(checks)
+        )
     }
     let (n, k) = (5120usize, 5120usize);
     let (w, s) = weights(n, k, 7)?;
     let ms = |call: &mut dyn FnMut() -> Result<()>| -> Result<f64> {
         Ok(super::timing::device_ms_per_call(device, 1, 10, call)?.unwrap_or(f64::INFINITY))
     };
+    let mut table = [0u8; TENSOR_CORE_MAX_ROWS + 1];
     let mut timings = Vec::new();
-    let mut min_rows = VECTORIZED_DECODE_MAX_ROWS + 1;
-    let mut faster = true;
-    for m in [8usize, 6, 5, 4, 3, 2] {
-        let x = input(m, k, DType::BF16, 1.5)?;
-        let vectorized = ms(&mut || project(&x, &w, &s, DecodeKernel::Vectorized).map(drop))?;
-        let tensor_core = ms(&mut || project(&x, &w, &s, DecodeKernel::TensorCore).map(drop))?;
-        faster &= tensor_core < vectorized;
-        if faster {
-            min_rows = m;
+    let mut previous = 0usize;
+    for sample in TENSOR_CORE_TIMED_ROWS {
+        let x = input(sample, k, DType::BF16, 1.5)?;
+        let decode = sample <= VECTORIZED_DECODE_MAX_ROWS;
+        let (fallback, fallback_ms) = if decode {
+            (
+                "vectorized",
+                ms(&mut || project(&x, &w, &s, DecodeKernel::Vectorized).map(drop))?,
+            )
+        } else {
+            (
+                "dequant_gemm",
+                ms(&mut || block_fp8_projection_dequant_gemm(&x, &w, &s).map(drop))?,
+            )
+        };
+        let mut entry = serde_json::Map::new();
+        entry.insert("rows".into(), sample.into());
+        entry.insert(format!("{fallback}_ms"), fallback_ms.into());
+        let mut best = (None, fallback_ms);
+        // Each kernel is timed only over the rows its check covered.
+        for &kernel in passed
+            .iter()
+            .filter(|kernel| (kernel.check_rows()[0]..=kernel.max_rows()).contains(&sample))
+        {
+            let took = ms(&mut || project(&x, &w, &s, kernel.forced()).map(drop))?;
+            entry.insert(format!("{}_ms", kernel.name()), took.into());
+            if took < best.1 {
+                best = (Some(kernel), took);
+            }
         }
-        timings.push(serde_json::json!({
-            "rows": m,
-            "vectorized_ms": vectorized,
-            "tensor_core_ms": tensor_core,
-        }));
-    }
-    let mut max_rows = VECTORIZED_DECODE_MAX_ROWS;
-    faster = true;
-    for m in [16usize, 32, TENSOR_CORE_MAX_ROWS] {
-        let x = input(m, k, DType::BF16, 1.5)?;
-        let dequant_gemm = ms(&mut || block_fp8_projection_dequant_gemm(&x, &w, &s).map(drop))?;
-        let tensor_core = ms(&mut || project(&x, &w, &s, DecodeKernel::TensorCore).map(drop))?;
-        faster &= tensor_core < dequant_gemm;
-        if faster {
-            max_rows = m;
+        entry.insert(
+            "chosen".into(),
+            best.0.map_or(fallback, TensorCoreKernel::name).into(),
+        );
+        timings.push(serde_json::Value::Object(entry));
+        match best.0 {
+            Some(kernel) => table[previous + 1..=sample].fill(kernel as u8),
+            None if !decode => break,
+            None => {}
         }
-        timings.push(serde_json::json!({
-            "rows": m,
-            "dequant_gemm_ms": dequant_gemm,
-            "tensor_core_ms": tensor_core,
-        }));
+        previous = sample;
     }
-    TENSOR_CORE_MIN_ROWS.store(min_rows, std::sync::atomic::Ordering::Relaxed);
-    TENSOR_CORE_SERVED_MAX_ROWS.store(max_rows, std::sync::atomic::Ordering::Relaxed);
+    for (rows, code) in table.iter().enumerate() {
+        TENSOR_CORE_ROWS[rows].store(*code, std::sync::atomic::Ordering::Relaxed);
+    }
     TENSOR_CORE_VERIFIED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut ranges: Vec<serde_json::Value> = Vec::new();
+    let mut from = 1usize;
+    for rows in 1..=TENSOR_CORE_MAX_ROWS {
+        if rows == TENSOR_CORE_MAX_ROWS || table[rows + 1] != table[rows] {
+            let kernel = match TensorCoreKernel::from_code(table[rows]) {
+                Some(kernel) => kernel.name(),
+                None if rows <= VECTORIZED_DECODE_MAX_ROWS => "vectorized",
+                None => "dequant_gemm",
+            };
+            ranges.push(serde_json::json!({ "rows": format!("{from}-{rows}"), "kernel": kernel }));
+            from = rows + 1;
+        }
+    }
+    let served = (1..=TENSOR_CORE_MAX_ROWS).filter(|rows| table[*rows] != 0);
     let _ = TENSOR_CORE_SUMMARY.set(serde_json::json!({
         "verified": true,
-        "min_rows": min_rows,
-        "max_rows": max_rows,
+        "checks": checks,
+        "min_rows": served.clone().min(),
+        "max_rows": served.max(),
+        "rows": ranges,
         "timings_5120x5120": timings,
         "switch": TENSOR_CORE_ENV,
     }));
@@ -1029,7 +1147,7 @@ impl CustomOp3 for Projection {
             sl.start_offset()..sl.start_offset() + self.n.div_ceil(128) * self.k.div_ceil(128),
         );
         macro_rules! run {
-            ($v:ident,$ty:ty,$mv:literal,$mv2:literal,$mv2x8:literal,$mm:literal,$tc:literal,$tcr:literal) => {{
+            ($v:ident,$ty:ty,$mv:literal,$mv2:literal,$mv2x8:literal,$mm:literal,$tc:literal,$tcr:literal,$mma8:literal,$mma16:literal) => {{
                 let CudaStorageSlice::$v(x) = &x.slice else {
                     unreachable!()
                 };
@@ -1041,26 +1159,28 @@ impl CustomOp3 for Projection {
                 // weight rows; K is a multiple of 128 by contract.
                 let aligned = (xl.start_offset() * 2).is_multiple_of(16)
                     && wl.start_offset().is_multiple_of(16);
-                let tensor_core = aligned
-                    && m <= TENSOR_CORE_MAX_ROWS
-                    && match self.kernel {
-                        DecodeKernel::TensorCore => true,
-                        DecodeKernel::Auto | DecodeKernel::VectorizedWhenEligible => {
-                            tensor_core_serves(m)
-                        }
-                        DecodeKernel::Reference | DecodeKernel::Vectorized => false,
-                    };
-                if self.kernel == DecodeKernel::TensorCore && !tensor_core {
+                let tensor_core = match self.kernel {
+                    DecodeKernel::Mma => Some(TensorCoreKernel::Mma),
+                    DecodeKernel::Wmma => Some(TensorCoreKernel::Wmma),
+                    DecodeKernel::Auto | DecodeKernel::VectorizedWhenEligible => {
+                        tensor_core_kernel(m)
+                    }
+                    DecodeKernel::Reference | DecodeKernel::Vectorized => None,
+                }
+                .filter(|kernel| aligned && m <= kernel.max_rows());
+                if matches!(self.kernel, DecodeKernel::Mma | DecodeKernel::Wmma)
+                    && tensor_core.is_none()
+                {
                     candle_core::bail!(
                         "tensor-core FP8 projection requested for an ineligible call"
                     )
                 }
-                let vectorized = !tensor_core
+                let vectorized = tensor_core.is_none()
                     && m <= VECTORIZED_DECODE_MAX_ROWS
                     && aligned
                     && match self.kernel {
                         DecodeKernel::Auto => vectorized_decode_enabled(),
-                        DecodeKernel::Reference | DecodeKernel::TensorCore => false,
+                        DecodeKernel::Reference | DecodeKernel::Mma | DecodeKernel::Wmma => false,
                         DecodeKernel::Vectorized | DecodeKernel::VectorizedWhenEligible => true,
                     };
                 if self.kernel == DecodeKernel::Vectorized && !vectorized {
@@ -1068,12 +1188,23 @@ impl CustomOp3 for Projection {
                         "vectorized FP8 decode GEMV requested for an ineligible call"
                     )
                 }
-                if tensor_core {
+                if let Some(kernel) = tensor_core {
                     let kblocks = self.k / 128;
-                    let n_blocks = self.n.div_ceil(64);
+                    // The register-direct block owns 16 channels and splits
+                    // its K blocks over MMA_WARPS warps; the WMMA block owns
+                    // 64 channels.
+                    let (func, n_blocks, threads, max_splits) = match kernel {
+                        TensorCoreKernel::Mma => (
+                            if m <= 8 { $mma8 } else { $mma16 },
+                            self.n / 16,
+                            32 * MMA_WARPS as u32,
+                            (kblocks / MMA_WARPS).max(1),
+                        ),
+                        TensorCoreKernel::Wmma => ($tc, self.n.div_ceil(64), 128, kblocks.max(1)),
+                    };
                     let wanted = TENSOR_CORE_TARGET_BLOCKS
                         .div_ceil(n_blocks)
-                        .clamp(1, kblocks.max(1));
+                        .clamp(1, max_splits);
                     let per_split = kblocks.div_ceil(wanted).max(1);
                     let splits = kblocks.div_ceil(per_split).max(1);
                     // SAFETY: each split writes every (row, channel) partial it owns.
@@ -1084,7 +1215,7 @@ impl CustomOp3 for Projection {
                     };
                     {
                         let f = device.get_or_load_custom_func(
-                            $tc,
+                            func,
                             "izwi_qwen38_fp8",
                             super::cuda_ptx::FP8,
                         )?;
@@ -1108,11 +1239,12 @@ impl CustomOp3 for Projection {
                         );
                         let cfg = LaunchConfig {
                             grid_dim: (n_blocks as u32, splits as u32, 1),
-                            block_dim: (128, 1, 1),
+                            block_dim: (threads, 1, 1),
                             shared_mem_bytes: 0,
                         };
                         // SAFETY: compact bytes, block-scale grid, row count
-                        // (at most 64) and alignment have been validated.
+                        // (within the kernel's maximum), channels (a multiple
+                        // of 64) and alignment have been validated.
                         unsafe { b.launch(cfg) }.w()?;
                     }
                     if let Some(partial) = &partial {
@@ -1198,7 +1330,9 @@ impl CustomOp3 for Projection {
                     "qwen38_fp8_mv2x8_f16",
                     "qwen38_fp8_mm_f16",
                     "qwen38_fp8_tc_f16",
-                    "qwen38_fp8_tc_reduce_f16"
+                    "qwen38_fp8_tc_reduce_f16",
+                    "qwen38_fp8_mma8_f16",
+                    "qwen38_fp8_mma16_f16"
                 )
             }
             CudaStorageSlice::BF16(_) => {
@@ -1210,7 +1344,9 @@ impl CustomOp3 for Projection {
                     "qwen38_fp8_mv2x8_bf16",
                     "qwen38_fp8_mm_bf16",
                     "qwen38_fp8_tc_bf16",
-                    "qwen38_fp8_tc_reduce_bf16"
+                    "qwen38_fp8_tc_reduce_bf16",
+                    "qwen38_fp8_mma8_bf16",
+                    "qwen38_fp8_mma16_bf16"
                 )
             }
             _ => candle_core::bail!("FP8 CUDA activation requires F16/BF16"),
