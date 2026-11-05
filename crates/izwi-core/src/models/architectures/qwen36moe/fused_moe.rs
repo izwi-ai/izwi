@@ -526,8 +526,10 @@ impl Qwen36MoeFusedExperts {
     }
 
     /// Enable the register-direct decode kernels on CUDA once they match the
-    /// per-pair GEMVs on this layer's own weights at 1, 5 and
-    /// [`moe::DECODE_MAX_TOKENS`] routed tokens. They serve calls only from
+    /// per-pair GEMVs on this layer's own weights at 1, 5,
+    /// [`moe::DECODE_MAX_TOKENS`] and 48 routed tokens (48: the shared expert's
+    /// rows take a second pass, as short prefill chunks below the grouped
+    /// threshold do). They serve calls only from
     /// the token count the load-time timings set ([`Self::set_decode_min_tokens`]).
     /// `IZWI_QWEN36_MOE_DECODE=legacy` keeps the GEMVs.
     pub(crate) fn resolve_decode(&mut self) {
@@ -559,7 +561,7 @@ impl Qwen36MoeFusedExperts {
                 .to_device(&Device::Cpu)?
                 .to_vec1::<f32>()?)
         };
-        for tokens in [1usize, 5, moe::DECODE_MAX_TOKENS] {
+        for tokens in [1usize, 5, moe::DECODE_MAX_TOKENS, 48] {
             let values = (0..tokens * self.hidden)
                 .map(|i| ((i as f32 + tokens as f32) * 0.618_034).sin() * 1.5)
                 .collect::<Vec<_>>();

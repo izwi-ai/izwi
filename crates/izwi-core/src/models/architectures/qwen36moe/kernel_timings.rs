@@ -289,8 +289,7 @@ impl Qwen36TextModel {
     ) -> Result<serde_json::Value> {
         let mut by_tokens = serde_json::Map::new();
         let mut crossover = None;
-        // (tokens, decode faster than the per-pair GEMVs) up to the decode
-        // kernels' size.
+        // (tokens, decode faster than the per-pair GEMVs) at every sample.
         let mut decode_wins = Vec::new();
         for tokens in MOE_TOKENS {
             if started.elapsed() > budget {
@@ -309,18 +308,19 @@ impl Qwen36TextModel {
             } else {
                 None
             };
-            if crossover.is_none() && grouped.is_some_and(|grouped| grouped < per_pair) {
-                crossover = Some(tokens);
-            }
-            let decode = if experts.decode_ready()
-                && tokens <= crate::kernels::cuda::moe::DECODE_MAX_TOKENS
-            {
+            let decode = if experts.decode_ready() {
                 let ms = self.timed(&mut || experts.combine_decode(&flat, &routing).map(drop))?;
                 decode_wins.push((tokens, ms < per_pair));
                 Some(ms)
             } else {
                 None
             };
+            // The grouped kernels take over only where they beat what calls
+            // below them would run: the per-pair GEMVs or the decode kernels.
+            let below = decode.map_or(per_pair, |decode| decode.min(per_pair));
+            if crossover.is_none() && grouped.is_some_and(|grouped| grouped < below) {
+                crossover = Some(tokens);
+            }
             by_tokens.insert(
                 tokens.to_string(),
                 serde_json::json!({
@@ -334,8 +334,9 @@ impl Qwen36TextModel {
             );
         }
         let decode_min_tokens = decode_min_tokens(&decode_wins);
-        // Where the grouped kernels overtook the per-pair GEMVs; past the
-        // largest measurement when they never did. Prefill spans are larger.
+        // Where the grouped kernels overtook the per-pair GEMVs and the
+        // decode kernels; past the largest measurement when they never did.
+        // Prefill spans are larger.
         let measured_all = by_tokens
             .values()
             .all(|entry| entry.get("skipped").is_none());
