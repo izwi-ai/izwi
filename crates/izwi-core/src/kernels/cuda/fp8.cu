@@ -123,7 +123,11 @@ template<class T> __device__ __forceinline__ void load16(const T* x, float* out)
 // same order (lane sweeps of 512, then a butterfly) whatever M is, so a row's
 // bits do not depend on its batch: the MR = 8 form serves 5 to 8 rows with the
 // same bandwidth-bound shape instead of the tile kernel below.
-template<class T,int MR> __device__ void mv2(const T* x,const unsigned char* w,const float* s,T* y,int M,int N,int K) {
+// ONCE decodes each weight chunk a single time for all rows; without it each
+// row decodes inline, which keeps the one-row path at full bandwidth (2.57
+// against 2.18 TB/s on an H100 for Qwen3.8: the hoisted decode's registers
+// cost the unrolled loop more than the repeated decode saves at one row).
+template<class T,int MR,bool ONCE> __device__ void mv2(const T* x,const unsigned char* w,const float* s,T* y,int M,int N,int K) {
   const int lane=threadIdx.x&31, n=blockIdx.x*8+(threadIdx.x>>5);
   if(n>=N) return;
   const unsigned char* row=w+(size_t)n*K;
@@ -135,23 +139,38 @@ template<class T,int MR> __device__ void mv2(const T* x,const unsigned char* w,c
   for(int k0=lane*16;k0<K;k0+=512) {
     const uint4 q=*reinterpret_cast<const uint4*>(row+k0);
     const float scale=scales[k0>>7];
-    // Decode the chunk once for every row: the same values and the same
-    // multiply-add order as fp8_dot4 per row, so the bits are unchanged.
-    float wv[16];
-    fp8_decode4(q.x,wv);
-    fp8_decode4(q.y,wv+4);
-    fp8_decode4(q.z,wv+8);
-    fp8_decode4(q.w,wv+12);
-    #pragma unroll
-    for(int m=0;m<MR;++m) {
-      if(m<M) {
-        float xv[16];
-        load16(x+(size_t)m*K+k0,xv);
-        float part=dot4(wv,xv);
-        part+=dot4(wv+4,xv+4);
-        part+=dot4(wv+8,xv+8);
-        part+=dot4(wv+12,xv+12);
-        acc[m]=fmaf(part,scale,acc[m]);
+    if constexpr (ONCE) {
+      // Decode the chunk once for every row: the same values and the same
+      // multiply-add order as fp8_dot4 per row, so the bits are unchanged.
+      float wv[16];
+      fp8_decode4(q.x,wv);
+      fp8_decode4(q.y,wv+4);
+      fp8_decode4(q.z,wv+8);
+      fp8_decode4(q.w,wv+12);
+      #pragma unroll
+      for(int m=0;m<MR;++m) {
+        if(m<M) {
+          float xv[16];
+          load16(x+(size_t)m*K+k0,xv);
+          float part=dot4(wv,xv);
+          part+=dot4(wv+4,xv+4);
+          part+=dot4(wv+8,xv+8);
+          part+=dot4(wv+12,xv+12);
+          acc[m]=fmaf(part,scale,acc[m]);
+        }
+      }
+    } else {
+      #pragma unroll
+      for(int m=0;m<MR;++m) {
+        if(m<M) {
+          float xv[16];
+          load16(x+(size_t)m*K+k0,xv);
+          float part=fp8_dot4(q.x,xv);
+          part+=fp8_dot4(q.y,xv+4);
+          part+=fp8_dot4(q.z,xv+8);
+          part+=fp8_dot4(q.w,xv+12);
+          acc[m]=fmaf(part,scale,acc[m]);
+        }
       }
     }
   }
@@ -181,10 +200,10 @@ extern "C" __global__ void qwen38_fp8_mv_##S(const T*x,const unsigned char*w,con
 extern "C" __global__ void qwen38_fp8_mm_##S(const T*x,const unsigned char*w,const float*s,T*y,int M,int N,int K){mm(x,w,s,y,M,N,K);}
 EXPORT(__half,f16)
 EXPORT(__nv_bfloat16,bf16)
-extern "C" __global__ void qwen38_fp8_mv2_f16(const __half*x,const unsigned char*w,const float*s,__half*y,int M,int N,int K){mv2<__half,4>(x,w,s,y,M,N,K);}
-extern "C" __global__ void qwen38_fp8_mv2_bf16(const __nv_bfloat16*x,const unsigned char*w,const float*s,__nv_bfloat16*y,int M,int N,int K){mv2<__nv_bfloat16,4>(x,w,s,y,M,N,K);}
-extern "C" __global__ void qwen38_fp8_mv2x8_f16(const __half*x,const unsigned char*w,const float*s,__half*y,int M,int N,int K){mv2<__half,8>(x,w,s,y,M,N,K);}
-extern "C" __global__ void qwen38_fp8_mv2x8_bf16(const __nv_bfloat16*x,const unsigned char*w,const float*s,__nv_bfloat16*y,int M,int N,int K){mv2<__nv_bfloat16,8>(x,w,s,y,M,N,K);}
+extern "C" __global__ void qwen38_fp8_mv2_f16(const __half*x,const unsigned char*w,const float*s,__half*y,int M,int N,int K){mv2<__half,4,false>(x,w,s,y,M,N,K);}
+extern "C" __global__ void qwen38_fp8_mv2_bf16(const __nv_bfloat16*x,const unsigned char*w,const float*s,__nv_bfloat16*y,int M,int N,int K){mv2<__nv_bfloat16,4,false>(x,w,s,y,M,N,K);}
+extern "C" __global__ void qwen38_fp8_mv2x8_f16(const __half*x,const unsigned char*w,const float*s,__half*y,int M,int N,int K){mv2<__half,8,true>(x,w,s,y,M,N,K);}
+extern "C" __global__ void qwen38_fp8_mv2x8_bf16(const __nv_bfloat16*x,const unsigned char*w,const float*s,__nv_bfloat16*y,int M,int N,int K){mv2<__nv_bfloat16,8,true>(x,w,s,y,M,N,K);}
 extern "C" __global__ void qwen38_fp8_mv_f32(const float*x,const unsigned char*w,const float*s,float*y,int M,int N,int K){mv(x,w,s,y,M,N,K);}
 
 // Vectorized decode GEMV over F32 activations and outputs, for decoders that
