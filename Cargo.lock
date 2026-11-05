@@ -3220,7 +3220,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "izwi-agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3232,7 +3232,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-asr-toolkit"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hound",
  "izwi-vad",
@@ -3240,7 +3240,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3275,7 +3275,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3341,7 +3341,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-db"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",
@@ -3354,7 +3354,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-desktop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -3381,14 +3381,14 @@ dependencies = [
 
 [[package]]
 name = "izwi-env"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "izwi-gateway"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3434,7 +3434,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-hooks"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "sea-orm",
@@ -3446,7 +3446,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-model-catalog"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3454,11 +3454,11 @@ dependencies = [
 
 [[package]]
 name = "izwi-prometheus"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "izwi-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3505,7 +3505,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-serving-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytes",
  "futures",
@@ -3524,7 +3524,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-serving-fence"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "izwi-serving-protocol",
  "libc",
@@ -3535,7 +3535,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-serving-protocol"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "izwi-env",
  "serde",
@@ -3548,7 +3548,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-serving-supervisor"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hex",
  "izwi-env",
@@ -3573,7 +3573,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-serving-worker"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3613,14 +3613,14 @@ dependencies = [
 
 [[package]]
 name = "izwi-test-process"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "izwi-vad"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "earshot",
  "hound",
