@@ -242,7 +242,7 @@ impl StepBuffer {
 }
 
 /// Write `values` into the U32 `tensor` at `offset`, in place.
-fn upload(tensor: &Tensor, offset: usize, values: &[u32]) -> Result<()> {
+pub(super) fn upload(tensor: &Tensor, offset: usize, values: &[u32]) -> Result<()> {
     #[cfg(feature = "cuda")]
     if let Device::Cuda(cuda) = tensor.device() {
         use candle_core::cuda_backend::cudarc::driver::{result, DevicePtr};

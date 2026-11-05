@@ -58,6 +58,9 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 #[path = "step_graph.rs"]
 mod step_graph;
 
+#[path = "batch_graph.rs"]
+pub(super) mod batch_graph;
+
 /// Environment switch for graph decode (`legacy`, `off`, `0`, `false`).
 pub(super) const GRAPHS_ENV: &str = "IZWI_QWEN36_CUDA_GRAPHS";
 
@@ -1059,6 +1062,9 @@ struct LayerStateOut {
 
 struct StateOutputs {
     layers: Vec<Option<LayerStateOut>>,
+    /// The one buffer every layer's outputs are views of (`None` without
+    /// DeltaNet layers): what a verification compares in one readback.
+    slab: Option<Tensor>,
 }
 
 impl StateOutputs {
@@ -1088,6 +1094,7 @@ impl StateOutputs {
         if total == 0 {
             return Ok(Self {
                 layers: sizes.iter().map(|_| None).collect(),
+                slab: None,
             });
         }
         let slab = uninit_f32(total, device)?;
@@ -1110,7 +1117,14 @@ impl StateOutputs {
                 None => None,
             });
         }
-        Ok(Self { layers })
+        Ok(Self {
+            layers,
+            slab: Some(slab),
+        })
+    }
+
+    fn slab(&self) -> Option<&Tensor> {
+        self.slab.as_ref()
     }
 
     /// Hand the written state to the row: each ring becomes the packed history.

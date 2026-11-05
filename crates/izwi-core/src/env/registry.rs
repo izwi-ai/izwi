@@ -1755,6 +1755,14 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     )
     .aliases(&[("legacy", false)]),
     CoreEnvVar::new(
+        "IZWI_QWEN36_BATCH_GRAPHS",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off runs Qwen3.6-MoE decode batches of 2 to 32 rows eagerly instead of through their per-width whole-step CUDA graphs.",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
         "IZWI_QWEN36_CHUNKED_GDN",
         Flag,
         "true",

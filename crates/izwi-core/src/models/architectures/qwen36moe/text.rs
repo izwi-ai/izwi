@@ -70,6 +70,10 @@ pub struct Qwen36TextModel {
     /// Piecewise CUDA graph decode for single-row steps, when resolved.
     decode_graphs: Option<decode_graph::Qwen36DecodeGraphs>,
     decode_graphs_path: Qwen36FusedPath,
+    /// Whole-step CUDA graphs for decode batches of 2 to 32 rows, and why
+    /// not.
+    batch_graphs: Option<decode_graph::batch_graph::Qwen36BatchGraphs>,
+    batch_graphs_path: Qwen36FusedPath,
     /// Whether the LM head is block FP8 (`lm_head`), and why not.
     lm_head_path: Qwen36FusedPath,
     /// Longest context the checkpoint serves (the whole-step graph sizes its
@@ -1103,6 +1107,8 @@ impl Qwen36TextModel {
             moe_prefill_path: Qwen36FusedPath::legacy("unresolved"),
             decode_graphs: None,
             decode_graphs_path: Qwen36FusedPath::legacy("unresolved"),
+            batch_graphs: None,
+            batch_graphs_path: Qwen36FusedPath::legacy("unresolved"),
             lm_head_path,
             max_context_tokens: cfg.context_length,
         };
@@ -1127,6 +1133,13 @@ impl Qwen36TextModel {
             decode_graph::Qwen36DecodeGraphs::resolve(&model, &source.cuda_switches(), false, true);
         model.decode_graphs = graphs;
         model.decode_graphs_path = path;
+        let (graphs, path) = decode_graph::batch_graph::Qwen36BatchGraphs::resolve(
+            &model,
+            &source.cuda_switches(),
+            false,
+        );
+        model.batch_graphs = graphs;
+        model.batch_graphs_path = path;
         Ok(model)
     }
 
@@ -1454,10 +1467,15 @@ impl Qwen36TextModel {
     /// Piecewise CUDA graph decode: resolution, phase and counters, for the
     /// admin diagnostics.
     pub(crate) fn cuda_graphs_summary(&self) -> serde_json::Value {
-        match &self.decode_graphs {
+        let mut summary = match &self.decode_graphs {
             Some(graphs) => graphs.summary(),
             None => super::fast_path::summarize([&self.decode_graphs_path]),
-        }
+        };
+        summary["batch"] = match &self.batch_graphs {
+            Some(graphs) => graphs.summary(),
+            None => super::fast_path::summarize([&self.batch_graphs_path]),
+        };
+        summary
     }
 
     /// Fused RMSNorm resolution, for the admin diagnostics.
@@ -1591,6 +1609,19 @@ impl Qwen36TextModel {
         );
         self.decode_graphs = graphs;
         self.decode_graphs_path = path;
+    }
+
+    /// Run decode batches of 2 to 32 rows through the multi-row graph body
+    /// eagerly off CUDA (tests of the body; CUDA resolves this at load).
+    #[cfg(test)]
+    pub(crate) fn enable_batch_graphs_for_tests(&mut self) {
+        let (graphs, path) = decode_graph::batch_graph::Qwen36BatchGraphs::resolve(
+            self,
+            &Qwen36CudaSwitches::default(),
+            true,
+        );
+        self.batch_graphs = graphs;
+        self.batch_graphs_path = path;
     }
 
     /// Whether single-row decode runs through the decode graphs (CUDA, when
@@ -1920,6 +1951,50 @@ impl Qwen36TextModel {
                 }
             }
             let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
+            if let (2.., Some(graphs)) = (batch_size, &self.batch_graphs) {
+                // The warm check: the standard decode on a copy of the rows'
+                // state, its writes collected and sealed apart.
+                let mut reference_states = states
+                    .iter()
+                    .map(|state| (**state).clone())
+                    .collect::<Vec<_>>();
+                let mut reference = || -> Result<Tensor> {
+                    let mut collector = KvWriteCompletionCollector::new(
+                        first.arena().config(),
+                        lowered.logical_slots(),
+                    )?;
+                    let mut rows = reference_states.iter_mut().collect::<Vec<_>>();
+                    let hidden = self.standard_decode_hidden(
+                        embedded.clone(),
+                        position_ids,
+                        &mut rows,
+                        &cache_refs,
+                        lowered.as_ref(),
+                        &metadata,
+                        &mut collector,
+                        sparse_layers.len(),
+                    );
+                    let sealed = collector.seal();
+                    let logits = self.project_hidden_span(&hidden?)?;
+                    sealed?;
+                    Ok(logits)
+                };
+                let rows = decode_graph::batch_graph::BatchRows {
+                    tokens: token_ids,
+                    positions: position_ids,
+                    slots: &slots,
+                    caches: &cache_refs,
+                    slot_map: lowered.as_ref(),
+                    metadata: &metadata,
+                };
+                match graphs.forward(self, &rows, states, &mut completions, &mut reference)? {
+                    Some(decode_graph::GraphDecodeOutput::Logits(logits)) => return Ok(logits),
+                    Some(decode_graph::GraphDecodeOutput::Hidden(hidden)) => {
+                        return self.project_hidden_span(&hidden)
+                    }
+                    None => {}
+                }
+            }
             let hidden = self.standard_decode_hidden(
                 embedded,
                 position_ids,
@@ -5704,6 +5779,15 @@ pub(crate) mod tests {
     pub(crate) fn e2e_cache(
         device: &Device,
     ) -> crate::models::shared::attention::physical::PhysicalPagedKvCache {
+        e2e_caches(device, 1).remove(0)
+    }
+
+    /// `rows` sequences' caches of eight pages each on one shared arena, as
+    /// the rows of one decode batch are.
+    pub(crate) fn e2e_caches(
+        device: &Device,
+        rows: usize,
+    ) -> Vec<crate::models::shared::attention::physical::PhysicalPagedKvCache> {
         use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
         use crate::backends::BackendKind;
         use crate::engine::ModelInstanceId;
@@ -5733,7 +5817,7 @@ pub(crate) mod tests {
             id,
             group,
             page_tokens: 8,
-            capacity_pages: 8,
+            capacity_pages: 8 * rows as u32,
             growth: None,
             // The production CUDA KV dtype (the BF16 activations'), which the
             // whole-step graph writes directly; F32 elsewhere.
@@ -5763,15 +5847,72 @@ pub(crate) mod tests {
         };
         #[cfg(not(any(feature = "cuda", feature = "metal")))]
         let arena: Arc<dyn KvArena> = Arc::new(CpuKvArena::new(config).unwrap());
-        let blocks = (0..8u32)
-            .map(|index| CacheBlockRef {
-                arena: id,
-                group,
-                index,
-                slot_generation: 1,
+        (0..rows as u32)
+            .map(|row| {
+                let blocks = (8 * row..8 * (row + 1))
+                    .map(|index| CacheBlockRef {
+                        arena: id,
+                        group,
+                        index,
+                        slot_generation: 1,
+                    })
+                    .collect();
+                PhysicalPagedKvCache::new(arena.clone(), bindings.clone(), blocks, 0).unwrap()
             })
-            .collect();
-        PhysicalPagedKvCache::new(arena, bindings, blocks, 0).unwrap()
+            .collect()
+    }
+
+    /// Prefill `rows` sequences (each its own tokens and a prompt one token
+    /// longer than the last), then decode them together, one batched step
+    /// per token: each row's logits per position.
+    fn e2e_batch_logits(model: &super::Qwen36TextModel, rows: usize) -> Vec<Vec<Vec<f32>>> {
+        let tokens = (0..rows)
+            .map(|row| {
+                (0..14u32)
+                    .map(|i| (i * 7 + 3 + 5 * row as u32) % E2E_VOCAB as u32)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let prompts = (0..rows).map(|row| 4 + row).collect::<Vec<_>>();
+        let mut caches = e2e_caches(&model.device, rows);
+        let mut states = (0..rows).map(|_| model.new_state()).collect::<Vec<_>>();
+        let mut logits = (0..rows).map(|_| Vec::new()).collect::<Vec<_>>();
+        for row in 0..rows {
+            let positions: Vec<[usize; 3]> = (0..prompts[row]).map(|p| [p, p, p]).collect();
+            logits[row].push(flat(
+                &model
+                    .prefill_token_ids_physical(
+                        &tokens[row][..prompts[row]],
+                        &positions,
+                        &mut states[row],
+                        &mut caches[row],
+                        true,
+                    )
+                    .unwrap()
+                    .expect("prefill logits"),
+            ));
+        }
+        let steps = 14 - prompts.iter().max().unwrap();
+        for step in 0..steps {
+            let ids = (0..rows)
+                .map(|row| tokens[row][prompts[row] + step])
+                .collect::<Vec<_>>();
+            let positions = (0..rows)
+                .map(|row| [prompts[row] + step; 3])
+                .collect::<Vec<_>>();
+            let out = model
+                .forward_token_ids_batch_at_physical(
+                    &ids,
+                    &positions,
+                    &mut states.iter_mut().collect::<Vec<_>>(),
+                    &mut caches.iter_mut().collect::<Vec<_>>(),
+                )
+                .unwrap();
+            for (row, row_logits) in logits.iter_mut().enumerate() {
+                row_logits.push(flat(&out.i(row).unwrap()));
+            }
+        }
+        logits
     }
 
     fn argmax(values: &[f32]) -> usize {
@@ -6268,6 +6409,50 @@ pub(crate) mod tests {
         // The segments never ran.
         assert_eq!(graphs["warmups"], 0, "{graphs}");
         assert_eq!(graphs["eager_steps"], 0);
+    }
+
+    /// The multi-row whole-step body, run eagerly off CUDA with the arena's
+    /// attention: three rows at different positions decoded together, every
+    /// layer through one body over the rows, and each row's state
+    /// publication must reproduce the standard batched decode exactly, step
+    /// after step. (On CUDA the same body runs with the multi-row RoPE/KV
+    /// write, split decode and DeltaNet table kernels and is captured per
+    /// width.)
+    #[test]
+    fn batch_graph_decode_matches_the_standard_batched_path() {
+        use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
+        let load = || {
+            let mut model = super::Qwen36TextModel::load_with_source(
+                &SyntheticFp8Source::new(Qwen36MoeBackendRequest::Auto),
+                &e2e_config(),
+                &Device::Cpu,
+            )
+            .unwrap();
+            model.enable_fused_paths_for_tests();
+            model
+        };
+        let standard = load();
+        assert_eq!(
+            standard.cuda_graphs_summary()["batch"]["backend"],
+            "legacy",
+            "no multi-row graphs off CUDA unless a test asks"
+        );
+        let mut graphed = load();
+        graphed.enable_batch_graphs_for_tests();
+        assert_eq!(graphed.cuda_graphs_summary()["batch"]["backend"], "fused");
+
+        let expected = e2e_batch_logits(&standard, 3);
+        let actual = e2e_batch_logits(&graphed, 3);
+        assert_eq!(
+            actual, expected,
+            "multi-row graph decode must be bit-identical"
+        );
+        let batch = graphed.cuda_graphs_summary()["batch"].clone();
+        // 14 tokens, prompts of 4 to 6: eight batched steps of three rows.
+        assert_eq!(batch["warmups"].as_u64(), Some(8), "{batch}");
+        assert_eq!(batch["graph_rows"].as_u64(), Some(24), "{batch}");
+        assert_eq!(batch["standard_steps"].as_u64(), Some(0), "{batch}");
+        assert_eq!(batch["capture"], false);
     }
 
     /// Pipelined decode: each step is queued before the previous one is
