@@ -29,7 +29,9 @@ use candle_nn::ops;
 
 use crate::error::{Error, Result};
 use crate::kernels::cuda::moe::{self, RouteSpec, SharedSlot};
-use crate::models::architectures::qwen36moe::fast_path::compare_values;
+use crate::models::architectures::qwen36moe::fast_path::{
+    compare_values, legacy_requested, Qwen36FusedPath,
+};
 use crate::models::architectures::qwen36moe::sparse::{
     Qwen36MoeExpertWeights, Qwen36MoeLinear, Qwen36MoeSharedExpertWeights,
 };
@@ -37,6 +39,8 @@ use crate::models::architectures::qwen36moe::text::Qwen36MoeFfnGeometry;
 
 /// Environment switch for the sparse-expert execution path.
 pub(crate) const BACKEND_ENV: &str = "IZWI_QWEN36_MOE_BACKEND";
+/// Kill switch for the register-direct decode kernels (`legacy`, `off`).
+pub(crate) const DECODE_ENV: &str = "IZWI_QWEN36_MOE_DECODE";
 const BLOCK: usize = 128;
 
 /// Requested sparse-expert execution path.
@@ -88,6 +92,13 @@ pub(crate) struct Qwen36MoeFusedExperts {
     /// [`moe::GROUPED_MIN_TOKENS`] until the load-time timings measure where
     /// they overtake the per-(token, slot) GEMVs on this device.
     grouped_min_tokens: usize,
+    /// The register-direct decode kernels ([`moe::fp8_moe_decode`]): checked
+    /// against the per-pair GEMVs on this layer's weights, and why not.
+    decode: Qwen36FusedPath,
+    /// Routed tokens from which [`Self::combine`] takes the decode kernels
+    /// (below the grouped threshold): none until the load-time timings
+    /// measure them faster than the per-pair GEMVs.
+    decode_min_tokens: usize,
 }
 
 /// Result of [`Qwen36MoeFusedExperts::stack`]. Unsupported layouts hand the
@@ -302,6 +313,8 @@ impl Qwen36MoeFusedExperts {
             fused: Self {
                 grouped: moe::grouped_supported(hidden, inter, w13.dim(0).unwrap_or(0)),
                 grouped_min_tokens: moe::GROUPED_MIN_TOKENS,
+                decode: Qwen36FusedPath::legacy("unresolved"),
+                decode_min_tokens: usize::MAX,
                 router: router_tensor,
                 spec,
                 hidden,
@@ -484,13 +497,106 @@ impl Qwen36MoeFusedExperts {
 
     fn combine(&self, flat: &Tensor, routing: &Tensor) -> Result<Tensor> {
         let slots = self.spec.slots();
-        if self.grouped && flat.dim(0)? >= self.grouped_min_tokens {
+        let tokens = flat.dim(0)?;
+        if self.grouped && tokens >= self.grouped_min_tokens {
             return moe::fp8_moe_grouped(
                 flat, routing, slots, &self.w13, &self.s13, &self.w2, &self.s2,
             )
             .map_err(Error::from);
         }
+        if self.decode.is_fused() && tokens >= self.decode_min_tokens {
+            return self.combine_decode(flat, routing);
+        }
         self.combine_per_pair(flat, routing)
+    }
+
+    /// [`Self::combine`] through the register-direct decode kernels whatever
+    /// the token count (the load-time timings and checks).
+    pub(crate) fn combine_decode(&self, flat: &Tensor, routing: &Tensor) -> Result<Tensor> {
+        moe::fp8_moe_decode(
+            flat,
+            routing,
+            self.spec.slots(),
+            &self.w13,
+            &self.s13,
+            &self.w2,
+            &self.s2,
+        )
+        .map_err(Error::from)
+    }
+
+    /// Enable the register-direct decode kernels on CUDA once they match the
+    /// per-pair GEMVs on this layer's own weights at 1, 5 and
+    /// [`moe::DECODE_MAX_TOKENS`] routed tokens. They serve calls only from
+    /// the token count the load-time timings set ([`Self::set_decode_min_tokens`]).
+    /// `IZWI_QWEN36_MOE_DECODE=legacy` keeps the GEMVs.
+    pub(crate) fn resolve_decode(&mut self) {
+        let device = self.w13.device();
+        let experts_total = self.w13.dim(0).unwrap_or(0);
+        self.decode = if legacy_requested(DECODE_ENV) {
+            Qwen36FusedPath::legacy(format!("{DECODE_ENV}=legacy"))
+        } else if !device.is_cuda() {
+            Qwen36FusedPath::legacy("the MoE decode kernels run on CUDA only")
+        } else if !moe::decode_supported(self.hidden, self.inter, experts_total) {
+            Qwen36FusedPath::legacy("the MoE decode kernels do not cover this geometry")
+        } else {
+            match self.decode_self_check() {
+                Ok(()) => Qwen36FusedPath::Fused,
+                Err(error) => {
+                    tracing::warn!(%error, "Qwen3.6 MoE decode kernels failed their check; keeping the per-pair GEMVs");
+                    Qwen36FusedPath::legacy(format!("self-check failed: {error}"))
+                }
+            }
+        };
+    }
+
+    fn decode_self_check(&self) -> Result<()> {
+        let device = self.w13.device().clone();
+        let dtype = activation_dtype(&device);
+        let host = |t: Tensor| -> Result<Vec<f32>> {
+            Ok(t.to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_device(&Device::Cpu)?
+                .to_vec1::<f32>()?)
+        };
+        for tokens in [1usize, 5, moe::DECODE_MAX_TOKENS] {
+            let values = (0..tokens * self.hidden)
+                .map(|i| ((i as f32 + tokens as f32) * 0.618_034).sin() * 1.5)
+                .collect::<Vec<_>>();
+            let x = Tensor::from_vec(values, (tokens, self.hidden), &Device::Cpu)?
+                .to_dtype(dtype)?
+                .to_device(&device)?;
+            let routing = moe::route(&moe::router_logits(&x, &self.router)?, &self.spec)?;
+            compare_values(
+                &format!("register-direct MoE decode (T={tokens})"),
+                &host(self.combine_decode(&x, &routing)?)?,
+                &host(self.combine_per_pair(&x, &routing)?)?,
+                0.01,
+                0.02,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The decode kernels' resolution, for the diagnostics.
+    pub(crate) fn decode_path(&self) -> &Qwen36FusedPath {
+        &self.decode
+    }
+
+    /// Whether the decode kernels passed their check (they serve calls from
+    /// [`Self::set_decode_min_tokens`] on).
+    pub(crate) fn decode_ready(&self) -> bool {
+        self.decode.is_fused()
+    }
+
+    /// Routed tokens from which calls take the decode kernels.
+    pub(crate) fn decode_min_tokens(&self) -> usize {
+        self.decode_min_tokens
+    }
+
+    /// Take the decode kernels from `tokens` routed tokens on.
+    pub(crate) fn set_decode_min_tokens(&mut self, tokens: usize) {
+        self.decode_min_tokens = tokens.max(1);
     }
 
     pub(crate) fn combine_per_pair(&self, flat: &Tensor, routing: &Tensor) -> Result<Tensor> {

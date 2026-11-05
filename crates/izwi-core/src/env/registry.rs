@@ -1840,6 +1840,14 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Selects the Qwen3.6-MoE sparse-expert path: auto (fused kernels when allowed), or legacy or a false boolean (host-routed loop).",
     ),
     CoreEnvVar::new(
+        "IZWI_QWEN36_MOE_DECODE",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off keeps Qwen3.6-MoE decode-sized expert calls on the per-pair GEMVs instead of the register-direct expert-major tensor-core kernels.",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
         "IZWI_QWEN36_MTP_HANDOFF",
         Flag,
         "false",

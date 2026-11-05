@@ -133,6 +133,66 @@ pub fn grouped_supported(hidden: usize, inter: usize, experts_total: usize) -> b
         && experts_total <= MAX_GROUPED_EXPERTS
 }
 
+/// Most routed tokens [`fp8_moe_decode`] is meant for (one pass of its
+/// kernels covers 32 rows per expert; more take further passes).
+pub const DECODE_MAX_TOKENS: usize = 32;
+
+/// Whether the decode kernels support this geometry: hidden and expert width
+/// multiples of 128 (whole block-scale K blocks; 8-channel gate/up and
+/// 16-channel down tiles) and at most 520 stacked experts.
+pub fn decode_supported(hidden: usize, inter: usize, experts_total: usize) -> bool {
+    hidden.is_multiple_of(128)
+        && inter.is_multiple_of(128)
+        && hidden > 0
+        && inter > 0
+        && (1..=MAX_GROUPED_EXPERTS).contains(&experts_total)
+}
+
+/// Expert-major routed MoE for decode-sized calls: the same result as
+/// [`fp8_gate_up`] followed by [`fp8_down`]. On CUDA each active expert's
+/// weights are read once for every row routed to it (the shared expert once
+/// per call, not once per row), decoded in registers straight into the
+/// tensor cores; see `qwen36moe_group_active` and the `_rd` kernels. Other
+/// devices run the per-pair composition.
+pub fn fp8_moe_decode(
+    x: &Tensor,
+    routing: &Tensor,
+    slots: usize,
+    w13: &Tensor,
+    s13: &Tensor,
+    w2: &Tensor,
+    s2: &Tensor,
+) -> Result<Tensor> {
+    let (tokens, hidden) = x.dims2()?;
+    let (experts_total, rows, _) = w13.dims3()?;
+    let inter = rows / 2;
+    check_routing(routing, tokens, slots)?;
+    if !decode_supported(hidden, inter, experts_total)
+        || w2.dims3()? != (experts_total, hidden, inter)
+    {
+        candle_core::bail!(
+            "MoE decode kernels do not support hidden {hidden}, expert width {inter}, {experts_total} experts"
+        )
+    }
+    #[cfg(feature = "cuda")]
+    if x.device().is_cuda() {
+        return cuda_impl::decode(
+            x,
+            routing,
+            slots,
+            w13,
+            s13,
+            w2,
+            s2,
+            experts_total,
+            hidden,
+            inter,
+        );
+    }
+    let act = fp8_gate_up(x, routing, slots, w13, s13)?;
+    fp8_down(&act, routing, slots, w2, s2)
+}
+
 /// Which grouped expert kernels run a CUDA prefill call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupedKernel {
@@ -712,6 +772,194 @@ mod cuda_impl {
     fn i32_arg(value: usize, name: &str) -> Result<i32> {
         i32::try_from(value)
             .map_err(|_| candle_core::Error::Msg(format!("fused MoE {name} {value} exceeds i32")))
+    }
+
+    /// [`super::fp8_moe_decode`] on CUDA: group the routed pairs by active
+    /// expert, the register-direct gate/up and down kernels over each active
+    /// expert's rows, then the slot-order combine.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode(
+        x: &Tensor,
+        routing: &Tensor,
+        slots: usize,
+        w13: &Tensor,
+        s13: &Tensor,
+        w2: &Tensor,
+        s2: &Tensor,
+        experts_total: usize,
+        hidden: usize,
+        inter: usize,
+    ) -> Result<Tensor> {
+        let device = x.device().as_cuda_device()?;
+        let tokens = x.dim(0)?;
+        let pairs = tokens * slots;
+        if pairs == 0 {
+            candle_core::bail!("MoE decode needs at least one routed pair")
+        }
+        // At most one active expert per routed pair.
+        let max_active = pairs.min(experts_total);
+        let (x, routing, w13, s13, w2, s2) = (
+            x.contiguous()?,
+            routing.contiguous()?,
+            w13.contiguous()?,
+            s13.contiguous()?,
+            w2.contiguous()?,
+            s2.contiguous()?,
+        );
+        let (x_storage, x_layout) = x.storage_and_layout();
+        let (r_storage, r_layout) = routing.storage_and_layout();
+        let (w13_storage, w13_layout) = w13.storage_and_layout();
+        let (s13_storage, s13_layout) = s13.storage_and_layout();
+        let (w2_storage, w2_layout) = w2.storage_and_layout();
+        let (s2_storage, s2_layout) = s2.storage_and_layout();
+        aligned(w13_layout, "w13")?;
+        aligned(w2_layout, "w2")?;
+        if !(x_layout.start_offset() * 2).is_multiple_of(16) {
+            candle_core::bail!("MoE decode activations must start on a 16-byte boundary")
+        }
+        let r = view::<f32>(&r_storage, r_layout, "routing")?;
+        let w13v = view::<u8>(&w13_storage, w13_layout, "w13")?;
+        let s13v = view::<f32>(&s13_storage, s13_layout, "s13")?;
+        let w2v = view::<u8>(&w2_storage, w2_layout, "w2")?;
+        let s2v = view::<f32>(&s2_storage, s2_layout, "s2")?;
+        // SAFETY: the grouping kernel writes the active count, every active
+        // slot's expert and start, the end after the last, and every routed
+        // pair index (routing ids are in range by contract); the kernels read
+        // only active slots.
+        let active_count = unsafe { device.alloc::<i32>(1)? };
+        let active_expert = unsafe { device.alloc::<i32>(max_active)? };
+        let active_begin = unsafe { device.alloc::<i32>(max_active + 1)? };
+        let sorted = unsafe { device.alloc::<i32>(pairs)? };
+        // SAFETY: the down kernel writes every (pair, channel) partial.
+        let partial = unsafe { device.alloc::<f32>(pairs * hidden)? };
+        let group = device.get_or_load_custom_func(
+            "qwen36moe_group_active",
+            MODULE,
+            super::super::cuda_ptx::QWEN36MOE,
+        )?;
+        let mut builder = group.builder();
+        builder.arg(&r);
+        builder.arg(&active_count);
+        builder.arg(&active_expert);
+        builder.arg(&active_begin);
+        builder.arg(&sorted);
+        candle_core::builder_arg!(
+            builder,
+            i32_arg(tokens, "tokens")?,
+            slots as i32,
+            experts_total as i32
+        );
+        let single_block = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1024, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: argument order matches `qwen36moe_group_active`; at most
+        // 520 experts, one per thread of the block for its scans.
+        unsafe { builder.launch(single_block) }.w()?;
+        let active_grid = u32::try_from(max_active)
+            .map_err(|_| candle_core::Error::Msg("MoE decode active grid".into()))?;
+        macro_rules! run {
+            ($ty:ty, $gate_up:literal, $down:literal, $combine:literal) => {{
+                let xv = view::<$ty>(&x_storage, x_layout, "activations")?;
+                // SAFETY: every routed pair's activation row is written.
+                let act = unsafe { device.alloc::<$ty>(pairs * inter)? };
+                // SAFETY: every (token, channel) output is written.
+                let out = unsafe { device.alloc::<$ty>(tokens * hidden)? };
+                let gate_up = device.get_or_load_custom_func(
+                    $gate_up,
+                    MODULE,
+                    super::super::cuda_ptx::QWEN36MOE,
+                )?;
+                let mut builder = gate_up.builder();
+                builder.arg(&xv);
+                builder.arg(&active_count);
+                builder.arg(&active_expert);
+                builder.arg(&active_begin);
+                builder.arg(&sorted);
+                builder.arg(&w13v);
+                builder.arg(&s13v);
+                builder.arg(&act);
+                candle_core::builder_arg!(builder, slots as i32, hidden as i32, inter as i32);
+                let config = LaunchConfig {
+                    grid_dim: (active_grid, (inter / 8) as u32, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                // SAFETY: validated decode geometry (multiples of 128, 16-byte
+                // aligned rows); argument order matches the gate/up kernel.
+                unsafe { builder.launch(config) }.w()?;
+                let down = device.get_or_load_custom_func(
+                    $down,
+                    MODULE,
+                    super::super::cuda_ptx::QWEN36MOE,
+                )?;
+                let mut builder = down.builder();
+                builder.arg(&act);
+                builder.arg(&active_count);
+                builder.arg(&active_expert);
+                builder.arg(&active_begin);
+                builder.arg(&sorted);
+                builder.arg(&w2v);
+                builder.arg(&s2v);
+                builder.arg(&partial);
+                candle_core::builder_arg!(builder, hidden as i32, inter as i32);
+                let config = LaunchConfig {
+                    grid_dim: (active_grid, (hidden / 16) as u32, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                // SAFETY: as above, for the down kernel.
+                unsafe { builder.launch(config) }.w()?;
+                let combine = device.get_or_load_custom_func(
+                    $combine,
+                    MODULE,
+                    super::super::cuda_ptx::QWEN36MOE,
+                )?;
+                let mut builder = combine.builder();
+                builder.arg(&partial);
+                builder.arg(&r);
+                builder.arg(&out);
+                candle_core::builder_arg!(builder, slots as i32, hidden as i32);
+                let config = LaunchConfig {
+                    grid_dim: (
+                        u32::try_from(tokens)
+                            .map_err(|_| candle_core::Error::Msg("combine grid".into()))?,
+                        (hidden as u32).div_ceil(256),
+                        1,
+                    ),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                // SAFETY: argument order matches the combine kernel.
+                unsafe { builder.launch(config) }.w()?;
+                out
+            }};
+        }
+        let tensor = match x.dtype() {
+            DType::BF16 => wrap(
+                run!(
+                    half::bf16,
+                    "qwen36moe_gate_up_rd_bf16",
+                    "qwen36moe_down_rd_bf16",
+                    "qwen36moe_combine_bf16"
+                ),
+                device,
+                Shape::from((tokens, hidden)),
+            ),
+            DType::F16 => wrap(
+                run!(
+                    half::f16,
+                    "qwen36moe_gate_up_rd_f16",
+                    "qwen36moe_down_rd_f16",
+                    "qwen36moe_combine_f16"
+                ),
+                device,
+                Shape::from((tokens, hidden)),
+            ),
+            other => candle_core::bail!("MoE decode needs F16/BF16 activations, got {other:?}"),
+        };
+        Ok(tensor)
     }
 
     #[allow(clippy::too_many_arguments)]

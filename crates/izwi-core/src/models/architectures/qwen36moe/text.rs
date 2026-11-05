@@ -1542,11 +1542,43 @@ impl Qwen36TextModel {
         }) {
             summary["grouped_min_tokens"] = tokens.into();
         }
+        // The register-direct decode kernels: per-layer checks, and the routed
+        // tokens they serve from (null until the timings enable them).
+        let fused = self
+            .layers
+            .iter()
+            .filter_map(|layer| match &layer.ffn {
+                Qwen36FeedForward::Sparse(moe) => moe.fused_experts(),
+                Qwen36FeedForward::Dense(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let mut decode =
+            super::fast_path::summarize(fused.iter().map(|experts| experts.decode_path()));
+        decode["min_tokens"] = fused
+            .iter()
+            .map(|experts| experts.decode_min_tokens())
+            .min()
+            .filter(|tokens| *tokens != usize::MAX)
+            .into();
+        summary["decode"] = decode;
         summary
     }
 
     /// Route MoE calls of `tokens` routed tokens or more through the grouped
     /// kernels in every sparse layer (the load-time timings' crossover).
+    /// Route MoE calls of `tokens` routed tokens or more (below the grouped
+    /// threshold) through the register-direct decode kernels, on every layer
+    /// whose kernels passed their check.
+    pub(crate) fn apply_moe_decode_min_tokens(&mut self, tokens: usize) {
+        for layer in &mut self.layers {
+            if let Qwen36FeedForward::Sparse(moe) = &mut layer.ffn {
+                if let Some(experts) = moe.fused_experts_mut() {
+                    experts.set_decode_min_tokens(tokens);
+                }
+            }
+        }
+    }
+
     pub(crate) fn apply_moe_grouped_crossover(&mut self, tokens: usize) {
         for layer in &mut self.layers {
             if let Qwen36FeedForward::Sparse(moe) = &mut layer.ffn {

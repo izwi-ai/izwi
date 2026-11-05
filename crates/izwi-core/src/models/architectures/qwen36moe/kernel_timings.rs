@@ -36,6 +36,18 @@ const MOE_TOKENS: [usize; 6] = [1, 4, 8, 32, 64, 128];
 /// Timed calls per measurement, after one warm-up call.
 const ITERATIONS: usize = 5;
 
+/// The smallest measured routed-token count from which the decode kernels
+/// beat the per-pair GEMVs at it and at every larger measured count (`wins`:
+/// ascending `(tokens, decode faster)`); `None` when they lose at the largest
+/// or nothing was measured.
+fn decode_min_tokens(wins: &[(usize, bool)]) -> Option<usize> {
+    let first = wins
+        .iter()
+        .rposition(|(_, faster)| !faster)
+        .map_or(0, |last_loss| last_loss + 1);
+    wins.get(first).map(|(tokens, _)| *tokens)
+}
+
 /// Deterministic unstructured inputs in [-1, 1).
 fn xorshift_values(len: usize, seed: u64) -> Vec<f32> {
     let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
@@ -277,6 +289,9 @@ impl Qwen36TextModel {
     ) -> Result<serde_json::Value> {
         let mut by_tokens = serde_json::Map::new();
         let mut crossover = None;
+        // (tokens, decode faster than the per-pair GEMVs) up to the decode
+        // kernels' size.
+        let mut decode_wins = Vec::new();
         for tokens in MOE_TOKENS {
             if started.elapsed() > budget {
                 by_tokens.insert(
@@ -297,16 +312,28 @@ impl Qwen36TextModel {
             if crossover.is_none() && grouped.is_some_and(|grouped| grouped < per_pair) {
                 crossover = Some(tokens);
             }
+            let decode = if experts.decode_ready()
+                && tokens <= crate::kernels::cuda::moe::DECODE_MAX_TOKENS
+            {
+                let ms = self.timed(&mut || experts.combine_decode(&flat, &routing).map(drop))?;
+                decode_wins.push((tokens, ms < per_pair));
+                Some(ms)
+            } else {
+                None
+            };
             by_tokens.insert(
                 tokens.to_string(),
                 serde_json::json!({
                     "per_pair_ms": per_pair,
                     "grouped_ms": grouped,
+                    "decode_ms": decode,
                     "per_pair_step_ms": per_pair * sparse_layers as f64,
                     "grouped_step_ms": grouped.map(|ms| ms * sparse_layers as f64),
+                    "decode_step_ms": decode.map(|ms| ms * sparse_layers as f64),
                 }),
             );
         }
+        let decode_min_tokens = decode_min_tokens(&decode_wins);
         // Where the grouped kernels overtook the per-pair GEMVs; past the
         // largest measurement when they never did. Prefill spans are larger.
         let measured_all = by_tokens
@@ -320,6 +347,34 @@ impl Qwen36TextModel {
         Ok(serde_json::json!({
             "by_tokens": by_tokens,
             "grouped_crossover_tokens": crossover,
+            "decode_min_tokens": decode_min_tokens,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_min_tokens;
+
+    #[test]
+    fn decode_kernels_serve_from_where_they_win_at_every_larger_count() {
+        assert_eq!(decode_min_tokens(&[]), None);
+        assert_eq!(
+            decode_min_tokens(&[(1, true), (4, true), (8, true), (32, true)]),
+            Some(1)
+        );
+        assert_eq!(
+            decode_min_tokens(&[(1, false), (4, true), (8, true), (32, true)]),
+            Some(4)
+        );
+        // A win below a loss does not count: only the wins up to the largest.
+        assert_eq!(
+            decode_min_tokens(&[(1, true), (4, false), (8, true), (32, true)]),
+            Some(8)
+        );
+        assert_eq!(
+            decode_min_tokens(&[(1, true), (4, true), (8, true), (32, false)]),
+            None
+        );
     }
 }

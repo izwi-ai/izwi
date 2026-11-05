@@ -1200,6 +1200,419 @@ Q36_GROUPED_EXPORT(__half, f16)
 Q36_GROUPED_EXPORT(__nv_bfloat16, bf16)
 
 // ---------------------------------------------------------------------------
+// Expert-major register-direct MoE for decode (a few to Q36_RD_ROWS routed
+// rows per expert). The per-pair GEMVs above re-read an expert for every row
+// routed to it (the shared expert once per row) and run each warp's loads
+// one round trip at a time; the grouped kernels below tile for prefill. Here:
+//   group_active : one block; per-expert counts, a block-wide scan, the
+//                  compact list of experts with routed pairs (their start in
+//                  expert-major pair order) and the pair scatter.
+//   gate_up_rd   : grid (active slots, inter / 8). Each block reads 8 gate
+//                  and the matching 8 up rows of its expert once, decoding the
+//                  E4M3 bytes in registers straight into mma.sync m16n8k16
+//                  A fragments (gate rows g, up rows g + 8), against up to 32
+//                  of the expert's rows per pass as the B operand; SwiGLU in
+//                  the epilogue writes act[pair].
+//   down_rd      : grid (active slots, hidden / 16); 16 down rows per block,
+//                  the unweighted F32 projection of each routed pair.
+//   combine      : as for the grouped kernels (slot order, deterministic).
+// As in fp8.cu's fp8_mma: lane q's k-slots {2q, 2q+1, 2q+8, 2q+9} of step j
+// stand for k = 16q + 4j + {0..3} within each 64-wide chunk, the activations
+// are read with the same permutation, each warp takes every Q36_RD_WARPS-th
+// 128-wide K block (loading the next while it multiplies the current), the
+// block scale is applied per K block, and the warps sum in warp order. Every
+// output element depends only on its own row, so the pair order the scatter's
+// atomics produce does not change any value. Blocks past the active count
+// exit at once. Requires hidden % 128 == 0, inter % 128 == 0 and at most
+// Q36_MAX_GROUPED_EXPERTS experts.
+
+#define Q36_RD_WARPS 4
+#define Q36_RD_MAX_TILES 4
+#define Q36_RD_ROWS (8 * Q36_RD_MAX_TILES)
+
+// The E4M3 pair decode and the m16n8k16 MMA of fp8.cu (each .cu file builds
+// its own PTX module).
+__device__ __forceinline__ unsigned q36_fp8x2_f16(unsigned w, unsigned sel) {
+  const unsigned x = __byte_perm(w, 0u, sel);
+  return (x & 0x80008000u) | ((x & 0x7F007F00u) >> 1);
+}
+template <class T>
+__device__ __forceinline__ unsigned q36_fp8x2(unsigned w, unsigned sel);
+template <>
+__device__ __forceinline__ unsigned q36_fp8x2<__half>(unsigned w, unsigned sel) {
+  return q36_fp8x2_f16(w, sel);
+}
+template <>
+__device__ __forceinline__ unsigned q36_fp8x2<__nv_bfloat16>(unsigned w, unsigned sel) {
+  const unsigned h = q36_fp8x2_f16(w, sel);
+  const __nv_bfloat162 b =
+      __float22bfloat162_rn(__half22float2(*reinterpret_cast<const __half2*>(&h)));
+  return *reinterpret_cast<const unsigned*>(&b);
+}
+template <class T>
+__device__ __forceinline__ void q36_mma16816(float* d, const unsigned* a, const unsigned* b);
+template <>
+__device__ __forceinline__ void q36_mma16816<__half>(float* d, const unsigned* a, const unsigned* b) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+template <>
+__device__ __forceinline__ void q36_mma16816<__nv_bfloat16>(float* d, const unsigned* a, const unsigned* b) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// Inclusive warp scan of v.
+__device__ __forceinline__ int q36_warp_scan(int v, int lane) {
+#pragma unroll
+  for (int d = 1; d < 32; d <<= 1) {
+    const int up = __shfl_up_sync(0xffffffffu, v, d);
+    if (lane >= d) {
+      v += up;
+    }
+  }
+  return v;
+}
+
+// One block of 1024 threads (one expert per thread for the scans).
+extern "C" __global__ void __launch_bounds__(Q36_GROUP_THREADS) qwen36moe_group_active(
+    const float* __restrict__ routing,
+    int* __restrict__ active_count,
+    int* __restrict__ active_expert,
+    int* __restrict__ active_begin,
+    int* __restrict__ sorted_pairs,
+    int tokens,
+    int slots,
+    int experts_total) {
+  __shared__ int counts[Q36_MAX_GROUPED_EXPERTS];
+  __shared__ int start[Q36_MAX_GROUPED_EXPERTS];
+  __shared__ int fill[Q36_MAX_GROUPED_EXPERTS];
+  __shared__ int warp_pairs[32];
+  __shared__ int warp_active[32];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  for (int e = threadIdx.x; e < experts_total; e += blockDim.x) {
+    counts[e] = 0;
+    fill[e] = 0;
+  }
+  __syncthreads();
+  const int pairs = tokens * slots;
+  for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
+    const int token = p / slots;
+    const int expert = (int)routing[(size_t)token * 2 * slots + (p - token * slots)];
+    if (expert >= 0 && expert < experts_total) {
+      atomicAdd(&counts[expert], 1);
+    }
+  }
+  __syncthreads();
+  const int e = threadIdx.x;
+  const int count = e < experts_total ? counts[e] : 0;
+  const int active = count > 0 ? 1 : 0;
+  const int pairs_incl = q36_warp_scan(count, lane);
+  const int active_incl = q36_warp_scan(active, lane);
+  if (lane == 31) {
+    warp_pairs[warp] = pairs_incl;
+    warp_active[warp] = active_incl;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    const int nwarps = blockDim.x >> 5;
+    const int wp = lane < nwarps ? warp_pairs[lane] : 0;
+    const int wa = lane < nwarps ? warp_active[lane] : 0;
+    const int wp_incl = q36_warp_scan(wp, lane);
+    const int wa_incl = q36_warp_scan(wa, lane);
+    warp_pairs[lane] = wp_incl - wp;
+    warp_active[lane] = wa_incl - wa;
+    if (lane == 31) {
+      // The ends: the active count, and the last active expert's end.
+      active_count[0] = wa_incl;
+      active_begin[wa_incl] = wp_incl;
+    }
+  }
+  __syncthreads();
+  if (e < experts_total) {
+    const int pairs_excl = warp_pairs[warp] + pairs_incl - count;
+    start[e] = pairs_excl;
+    if (active) {
+      const int slot = warp_active[warp] + active_incl - 1;
+      active_expert[slot] = e;
+      active_begin[slot] = pairs_excl;
+    }
+  }
+  __syncthreads();
+  for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
+    const int token = p / slots;
+    const int expert = (int)routing[(size_t)token * 2 * slots + (p - token * slots)];
+    if (expert >= 0 && expert < experts_total) {
+      sorted_pairs[start[expert] + atomicAdd(&fill[expert], 1)] = p;
+    }
+  }
+}
+
+// One register-direct pass: the 16 weight rows a lane group reads (lo: row g,
+// hi: row g + 8) against up to Q36_RD_MAX_TILES tiles of 8 activation rows,
+// `row_ptr[t]` the start of tile t's row g (null for a row past the pass).
+// `lo_scale` / `hi_scale` give each half its 128x128 block scale per K block.
+template <class T>
+__device__ __forceinline__ void q36_rd_pass(
+    const unsigned char* __restrict__ w_lo,
+    const unsigned char* __restrict__ w_hi,
+    const float* __restrict__ lo_scale,
+    const float* __restrict__ hi_scale,
+    const T* const* row_ptr,
+    int tiles,
+    int kblocks,
+    int warp,
+    float (&total)[Q36_RD_MAX_TILES][4]) {
+#pragma unroll
+  for (int t = 0; t < Q36_RD_MAX_TILES; ++t) {
+    total[t][0] = 0.f;
+    total[t][1] = 0.f;
+    total[t][2] = 0.f;
+    total[t][3] = 0.f;
+  }
+  uint4 cur[4];
+  int kb = warp;
+  if (kb < kblocks) {
+    const size_t o = (size_t)kb * 128;
+    cur[0] = *reinterpret_cast<const uint4*>(w_lo + o);
+    cur[1] = *reinterpret_cast<const uint4*>(w_lo + o + 64);
+    cur[2] = *reinterpret_cast<const uint4*>(w_hi + o);
+    cur[3] = *reinterpret_cast<const uint4*>(w_hi + o + 64);
+  }
+  for (; kb < kblocks; kb += Q36_RD_WARPS) {
+    const int next = kb + Q36_RD_WARPS;
+    uint4 nxt[4];
+    if (next < kblocks) {
+      const size_t o = (size_t)next * 128;
+      nxt[0] = *reinterpret_cast<const uint4*>(w_lo + o);
+      nxt[1] = *reinterpret_cast<const uint4*>(w_lo + o + 64);
+      nxt[2] = *reinterpret_cast<const uint4*>(w_hi + o);
+      nxt[3] = *reinterpret_cast<const uint4*>(w_hi + o + 64);
+    }
+    float part[Q36_RD_MAX_TILES][4];
+#pragma unroll
+    for (int t = 0; t < Q36_RD_MAX_TILES; ++t) {
+      part[t][0] = 0.f;
+      part[t][1] = 0.f;
+      part[t][2] = 0.f;
+      part[t][3] = 0.f;
+    }
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+      const unsigned lo[4] = {cur[c].x, cur[c].y, cur[c].z, cur[c].w};
+      const unsigned hi[4] = {cur[2 + c].x, cur[2 + c].y, cur[2 + c].z, cur[2 + c].w};
+      unsigned a[4][4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        a[j][0] = q36_fp8x2<T>(lo[j], 0x1404);
+        a[j][1] = q36_fp8x2<T>(hi[j], 0x1404);
+        a[j][2] = q36_fp8x2<T>(lo[j], 0x3424);
+        a[j][3] = q36_fp8x2<T>(hi[j], 0x3424);
+      }
+#pragma unroll
+      for (int t = 0; t < Q36_RD_MAX_TILES; ++t) {
+        if (t < tiles) {
+          uint4 xa = make_uint4(0u, 0u, 0u, 0u), xb = make_uint4(0u, 0u, 0u, 0u);
+          if (row_ptr[t] != nullptr) {
+            const T* xp = row_ptr[t] + (size_t)kb * 128 + c * 64;
+            xa = *reinterpret_cast<const uint4*>(xp);
+            xb = *reinterpret_cast<const uint4*>(xp + 8);
+          }
+          const unsigned xw[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            const unsigned b[2] = {xw[2 * j], xw[2 * j + 1]};
+            q36_mma16816<T>(part[t], a[j], b);
+          }
+        }
+      }
+    }
+    const float ls = lo_scale[kb];
+    const float hs = hi_scale[kb];
+#pragma unroll
+    for (int t = 0; t < Q36_RD_MAX_TILES; ++t) {
+      if (t < tiles) {
+        total[t][0] = fmaf(part[t][0], ls, total[t][0]);
+        total[t][1] = fmaf(part[t][1], ls, total[t][1]);
+        total[t][2] = fmaf(part[t][2], hs, total[t][2]);
+        total[t][3] = fmaf(part[t][3], hs, total[t][3]);
+      }
+    }
+    if (next < kblocks) {
+      cur[0] = nxt[0];
+      cur[1] = nxt[1];
+      cur[2] = nxt[2];
+      cur[3] = nxt[3];
+    }
+  }
+}
+
+template <class T>
+__device__ void q36_gate_up_rd(
+    const T* __restrict__ x,
+    const int* __restrict__ active_count,
+    const int* __restrict__ active_expert,
+    const int* __restrict__ active_begin,
+    const int* __restrict__ sorted_pairs,
+    const unsigned char* __restrict__ w13,
+    const float* __restrict__ s13,
+    T* __restrict__ act,
+    int slots,
+    int hidden,
+    int inter) {
+  __shared__ float red[Q36_RD_WARPS][Q36_RD_MAX_TILES * 4][32];
+  const int a = blockIdx.x;
+  if (a >= active_count[0]) {
+    return;
+  }
+  const int e = active_expert[a];
+  const int begin = active_begin[a];
+  const int count = active_begin[a + 1] - begin;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
+  const int n0 = blockIdx.y * 8;
+  const int kblocks = hidden >> 7;
+  const unsigned char* w_gate = w13 + ((size_t)e * 2 * inter + n0 + g) * hidden + 16 * q;
+  const unsigned char* w_up = w_gate + (size_t)inter * hidden;
+  const float* scales = s13 + (size_t)e * ((2 * inter) >> 7) * kblocks;
+  const float* gate_scale = scales + (size_t)(n0 >> 7) * kblocks;
+  const float* up_scale = scales + (size_t)((inter + n0) >> 7) * kblocks;
+  for (int r0 = 0; r0 < count; r0 += Q36_RD_ROWS) {
+    const int rows = min(count - r0, Q36_RD_ROWS);
+    const int tiles = (rows + 7) >> 3;
+    const T* row_ptr[Q36_RD_MAX_TILES];
+#pragma unroll
+    for (int t = 0; t < Q36_RD_MAX_TILES; ++t) {
+      const int r = t * 8 + g;
+      row_ptr[t] = r < rows
+          ? x + (size_t)(sorted_pairs[begin + r0 + r] / slots) * hidden + 16 * q
+          : nullptr;
+    }
+    float total[Q36_RD_MAX_TILES][4];
+    q36_rd_pass<T>(w_gate, w_up, gate_scale, up_scale, row_ptr, tiles, kblocks, warp, total);
+#pragma unroll
+    for (int t = 0; t < Q36_RD_MAX_TILES; ++t) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        red[warp][t * 4 + i][lane] = total[t][i];
+      }
+    }
+    __syncthreads();
+    if (warp == 0) {
+      // Element i of tile t: channel n0 + g, gate for i < 2 and up for
+      // i >= 2, row t * 8 + 2q + (i & 1).
+      for (int t = 0; t < tiles; ++t) {
+#pragma unroll
+        for (int rr = 0; rr < 2; ++rr) {
+          const int row = t * 8 + 2 * q + rr;
+          if (row < rows) {
+            float gate = 0.f, up = 0.f;
+#pragma unroll
+            for (int w = 0; w < Q36_RD_WARPS; ++w) {
+              gate += red[w][t * 4 + rr][lane];
+              up += red[w][t * 4 + 2 + rr][lane];
+            }
+            gate *= 256.f;
+            up *= 256.f;
+            const int pair = sorted_pairs[begin + r0 + row];
+            act[(size_t)pair * inter + n0 + g] = T(gate / (1.f + expf(-gate)) * up);
+          }
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
+template <class T>
+__device__ void q36_down_rd(
+    const T* __restrict__ act,
+    const int* __restrict__ active_count,
+    const int* __restrict__ active_expert,
+    const int* __restrict__ active_begin,
+    const int* __restrict__ sorted_pairs,
+    const unsigned char* __restrict__ w2,
+    const float* __restrict__ s2,
+    float* __restrict__ partial,
+    int hidden,
+    int inter) {
+  __shared__ float red[Q36_RD_WARPS][Q36_RD_MAX_TILES * 4][32];
+  const int a = blockIdx.x;
+  if (a >= active_count[0]) {
+    return;
+  }
+  const int e = active_expert[a];
+  const int begin = active_begin[a];
+  const int count = active_begin[a + 1] - begin;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
+  const int h0 = blockIdx.y * 16;
+  const int kblocks = inter >> 7;
+  const unsigned char* w_lo = w2 + ((size_t)e * hidden + h0 + g) * inter + 16 * q;
+  const unsigned char* w_hi = w_lo + (size_t)8 * inter;
+  const float* scale = s2 + ((size_t)e * (hidden >> 7) + (h0 >> 7)) * kblocks;
+  for (int r0 = 0; r0 < count; r0 += Q36_RD_ROWS) {
+    const int rows = min(count - r0, Q36_RD_ROWS);
+    const int tiles = (rows + 7) >> 3;
+    const T* row_ptr[Q36_RD_MAX_TILES];
+#pragma unroll
+    for (int t = 0; t < Q36_RD_MAX_TILES; ++t) {
+      const int r = t * 8 + g;
+      row_ptr[t] =
+          r < rows ? act + (size_t)sorted_pairs[begin + r0 + r] * inter + 16 * q : nullptr;
+    }
+    float total[Q36_RD_MAX_TILES][4];
+    q36_rd_pass<T>(w_lo, w_hi, scale, scale, row_ptr, tiles, kblocks, warp, total);
+#pragma unroll
+    for (int t = 0; t < Q36_RD_MAX_TILES; ++t) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        red[warp][t * 4 + i][lane] = total[t][i];
+      }
+    }
+    __syncthreads();
+    if (warp == 0) {
+      // Element i of tile t: channel h0 + g (+ 8 for i >= 2), row
+      // t * 8 + 2q + (i & 1).
+      for (int t = 0; t < tiles; ++t) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const int row = t * 8 + 2 * q + (i & 1);
+          if (row < rows) {
+            float v = 0.f;
+#pragma unroll
+            for (int w = 0; w < Q36_RD_WARPS; ++w) {
+              v += red[w][t * 4 + i][lane];
+            }
+            const int pair = sorted_pairs[begin + r0 + row];
+            partial[(size_t)pair * hidden + h0 + g + ((i & 2) ? 8 : 0)] = v * 256.f;
+          }
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
+#define Q36_RD_EXPORT(T, S)                                                                      \
+  extern "C" __global__ void __launch_bounds__(128, 4) qwen36moe_gate_up_rd_##S(               \
+      const T* x, const int* count, const int* experts, const int* begin, const int* sorted,     \
+      const unsigned char* w, const float* s, T* act, int slots, int hidden, int inter) {        \
+    q36_gate_up_rd<T>(x, count, experts, begin, sorted, w, s, act, slots, hidden, inter);        \
+  }                                                                                              \
+  extern "C" __global__ void __launch_bounds__(128, 4) qwen36moe_down_rd_##S(                  \
+      const T* act, const int* count, const int* experts, const int* begin, const int* sorted,   \
+      const unsigned char* w, const float* s, float* partial, int hidden, int inter) {           \
+    q36_down_rd<T>(act, count, experts, begin, sorted, w, s, partial, hidden, inter);            \
+  }
+
+Q36_RD_EXPORT(__half, f16)
+Q36_RD_EXPORT(__nv_bfloat16, bf16)
+
+// ---------------------------------------------------------------------------
 // Tensor-core grouped MoE for prefill. The warp-per-channel kernels above keep
 // each expert's weights in registers but spend CUDA-core FMAs and a warp
 // reduction on every (pair, channel) dot product; at prefill chunk sizes the

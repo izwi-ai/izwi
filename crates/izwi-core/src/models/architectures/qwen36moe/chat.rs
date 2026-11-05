@@ -253,6 +253,15 @@ impl Qwen36MoeChatModel {
                 exec.text_model.apply_moe_grouped_crossover(tokens);
                 tracing::info!(tokens, "Qwen3.6-MoE grouped expert crossover");
             }
+            // Decode-sized calls take the register-direct expert kernels from
+            // the routed token count where they measured faster.
+            if let Some(tokens) = kernel_timings["moe_by_tokens"]["decode_min_tokens"]
+                .as_u64()
+                .and_then(|tokens| usize::try_from(tokens).ok())
+            {
+                exec.text_model.apply_moe_decode_min_tokens(tokens);
+                tracing::info!(tokens, "Qwen3.6-MoE decode expert kernels from");
+            }
         }
         load_timing["kernel_timings_ms"] = (timing_started.elapsed().as_secs_f64() * 1e3).into();
         load_timing["total_ms"] = (loading_started.elapsed().as_secs_f64() * 1e3).into();

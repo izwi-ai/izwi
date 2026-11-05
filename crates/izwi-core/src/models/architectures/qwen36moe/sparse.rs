@@ -239,7 +239,12 @@ impl Qwen36MoeSparseMlp {
                         let checked = fused.self_check(&experts, &shared);
                         load_timing.self_check = checking.elapsed();
                         match checked {
-                            Ok(()) => (experts, shared, Some(fused), Qwen36FusedPath::Fused),
+                            Ok(()) => {
+                                let mut fused = fused;
+                                fused.resolve_decode();
+                                load_timing.self_check = checking.elapsed();
+                                (experts, shared, Some(fused), Qwen36FusedPath::Fused)
+                            }
                             Err(reason) => {
                                 tracing::warn!(
                                     reason,
