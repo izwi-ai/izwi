@@ -270,6 +270,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_QWEN36_REAL_CHECKPOINT_E2E` | path | unset (probe skipped) | test harness | Real Qwen3.6 checkpoint directory for the ASCII-coherence end-to-end probe. |
 | `IZWI_QWEN36_STEP_GRAPH` | flag | `true` | model load | Kill switch: legacy/off disables the Qwen3.6-MoE whole-step CUDA graph; piecewise graph segments remain. Also: `legacy` means false. |
 | `IZWI_QWEN38_BATCHED_GDN` | flag | true (CUDA only) | model load | Kill switch: legacy/off keeps one DeltaNet conv and recurrence launch per row in Qwen3.8 multi-row decode instead of one pair per layer. Also: `legacy` means false. |
+| `IZWI_QWEN38_BATCHED_QK_ROPE` | flag | true (CUDA only) | model load | Kill switch: legacy/off keeps one q/k norm + RoPE launch per row in Qwen3.8 multi-row decode instead of one per attention layer. Also: `legacy` means false. |
 | `IZWI_QWEN38_CAUSAL_CONV_DECODE` | auto/flag | `auto` | startup | Legacy Qwen3.8 alias folded into IZWI_CUDA_FUSED_DECODE, used only when the canonical name is unset. |
 | `IZWI_QWEN38_CPU_LM_HEAD` | flag | true (Q8_0 head on CPU) | model load | Uses the Q8_0 Qwen3.8 CPU LM head while CPU projections are Q8_0; false keeps the head dense F32. Also: `dense` means false, `legacy` means false. |
 | `IZWI_QWEN38_CPU_PROJECTION_BACKEND` | choice | `auto` | startup | Deprecated alias of IZWI_CPU_PROJECTION_BACKEND (auto, expanded, q8), used only when the canonical name is unset. |

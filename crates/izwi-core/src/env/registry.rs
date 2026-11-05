@@ -1846,6 +1846,14 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     )
     .aliases(&[("legacy", false)]),
     CoreEnvVar::new(
+        "IZWI_QWEN38_BATCHED_QK_ROPE",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off keeps one q/k norm + RoPE launch per row in Qwen3.8 multi-row decode instead of one per attention layer.",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
         "IZWI_QWEN38_CAUSAL_CONV_DECODE",
         Mode,
         "auto",

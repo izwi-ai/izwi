@@ -100,6 +100,8 @@ fn model_with_value_heads(value_heads: usize) -> Qwen38TextModel {
         rope_kernel_enabled: false,
         rope_inv_freqs: build_rope_inv_freqs(2, 10_000.0).unwrap(),
         fused_qk: None,
+        batched_qk: false,
+        batched_qk_path: Default::default(),
         fused_qk_path: Default::default(),
         fused_kv_write: false,
         fused_kv_write_path: Default::default(),

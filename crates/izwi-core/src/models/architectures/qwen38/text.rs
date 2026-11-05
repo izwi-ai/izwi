@@ -12,8 +12,8 @@ use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
 use super::chat::Qwen38TextConfig;
 use super::fast_path::{
     compare_values, decode_gate, summarize, Qwen38CudaSwitches, Qwen38FastPath, BATCHED_GDN_ENV,
-    FUSED_AB_GEMV_ENV, FUSED_ATTN_GATE_ENV, FUSED_GDN_ENV, FUSED_KV_WRITE_ENV, FUSED_NORM_ENV,
-    FUSED_QK_ROPE_ENV, GDN_PREFILL_ENV,
+    BATCHED_QK_ROPE_ENV, FUSED_AB_GEMV_ENV, FUSED_ATTN_GATE_ENV, FUSED_GDN_ENV, FUSED_KV_WRITE_ENV,
+    FUSED_NORM_ENV, FUSED_QK_ROPE_ENV, GDN_PREFILL_ENV,
 };
 use super::native::{
     IndexedSafetensors, ProjectionMaterialization, Qwen38LayerType, Qwen38NativeConfig,
@@ -1060,6 +1060,11 @@ pub(super) struct Qwen38FullAttention {
     /// inverse frequencies on the device. Resolved at load.
     fused_qk: Option<(QkNormRopeSpec, Tensor)>,
     fused_qk_path: Qwen38FastPath,
+    /// Every text row of a decode batch through one q/k norm + RoPE launch
+    /// (`rope::qk_norm_rope_kv_rows` into a scratch cache), when it matched
+    /// the per-row launches bit for bit at load.
+    batched_qk: bool,
+    batched_qk_path: Qwen38FastPath,
     /// The fused q/k launch also writes the rotated key and the value into
     /// the paged cache (`write_fused_and_attend`).
     fused_kv_write: bool,
@@ -1958,7 +1963,8 @@ impl Qwen38TextModel {
                     linear.resolve_gdn_prefill(switches, &self.device, allow_cpu, &mut gdn_prefill);
                 }
                 Qwen38Mixer::Full(attention) => {
-                    attention.resolve_fused_attention(switches, &self.device, dtype, allow_cpu)
+                    attention.resolve_fused_attention(switches, &self.device, dtype, allow_cpu);
+                    attention.resolve_batched_qk(switches, &self.device, dtype);
                 }
             }
         }
@@ -1978,6 +1984,10 @@ impl Qwen38TextModel {
             "gdn_decode": summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
                 Qwen38Mixer::Linear(linear) => Some(&linear.fused_gdn_path),
                 Qwen38Mixer::Full(_) => None,
+            })),
+            "qk_rope_batched": summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
+                Qwen38Mixer::Full(attention) => Some(&attention.batched_qk_path),
+                Qwen38Mixer::Linear(_) => None,
             })),
             "gdn_batched_decode": summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
                 Qwen38Mixer::Linear(linear) => Some(&linear.batched_gdn_path),
@@ -2642,6 +2652,8 @@ impl Qwen38FullAttention {
                 cfg.rope_freq_base,
             )?,
             fused_qk: None,
+            batched_qk: false,
+            batched_qk_path: Qwen38FastPath::default(),
             fused_qk_path: Qwen38FastPath::default(),
             fused_kv_write: false,
             fused_kv_write_path: Qwen38FastPath::default(),
@@ -2774,6 +2786,118 @@ impl Qwen38FullAttention {
     /// host angles, rotary op, pass-through concat) for one token at
     /// positions 5, 3000 and 200000, and at the image position [7, 3, 11]
     /// when the sections allow it.
+    /// q/k norm + RoPE for every text row in one launch: the KV-writing rows
+    /// kernel writes the rotated keys and the values into a scratch cache of
+    /// one slot per row, from which the arena write takes them as the per-row
+    /// path's stacks. Returns queries `[B, heads, head_dim]`, keys and values
+    /// `[B, kv_heads, head_dim]`, contiguous, in the projection dtype.
+    fn qk_norm_rope_rows(
+        &self,
+        q_proj: &Tensor,
+        key_states: &Tensor,
+        value_states: &Tensor,
+        spec: &QkNormRopeSpec,
+        inv_freq: &Tensor,
+        position_ids: &[[usize; 3]],
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let rows = position_ids.len();
+        let device = q_proj.device();
+        let dtype = q_proj.dtype();
+        let (heads, kv_heads, dim) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        let positions = position_ids
+            .iter()
+            .map(|[temporal, _, _]| u32::try_from(*temporal))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::InvalidInput("Qwen3.8 decode position exceeds u32".into()))?;
+        let positions = Tensor::from_vec(positions, rows, device)?;
+        let slots = Tensor::arange(0u32, rows as u32, device)?;
+        let keys = Tensor::zeros((1, rows, kv_heads, dim), dtype, device)?;
+        let values = keys.zeros_like()?;
+        let queries = rope::qk_norm_rope_kv_rows(
+            &q_proj.reshape((rows, heads * 2 * dim))?,
+            &key_states.reshape((rows, kv_heads * dim))?,
+            &value_states.reshape((rows, kv_heads * dim))?,
+            &self.q_norm.weight,
+            &self.k_norm.weight,
+            inv_freq,
+            spec,
+            &positions,
+            &slots,
+            &keys,
+            &values,
+            rows,
+        )?;
+        Ok((
+            queries.reshape((rows, heads, dim))?,
+            keys.reshape((rows, kv_heads, dim))?,
+            values.reshape((rows, kv_heads, dim))?,
+        ))
+    }
+
+    /// Resolve the multi-row q/k launch after the fused q/k path: on CUDA its
+    /// queries, keys and values must equal the per-row launches bit for bit
+    /// at three text positions. `IZWI_QWEN38_BATCHED_QK_ROPE=legacy` keeps one
+    /// launch per row.
+    fn resolve_batched_qk(&mut self, switches: &Qwen38CudaSwitches, device: &Device, dtype: DType) {
+        self.batched_qk = false;
+        self.batched_qk_path = if let Some(path) =
+            decode_gate(BATCHED_QK_ROPE_ENV, switches, device, false)
+        {
+            path
+        } else if self.fused_qk.is_none() {
+            Qwen38FastPath::legacy("batched q/k norm + RoPE needs the fused q/k path")
+        } else {
+            match self.batched_qk_self_check(device, dtype) {
+                Ok(()) => {
+                    self.batched_qk = true;
+                    Qwen38FastPath::Fused
+                }
+                Err(error) => Qwen38FastPath::self_check_failed("batched q/k norm + RoPE", &error),
+            }
+        };
+    }
+
+    fn batched_qk_self_check(&self, device: &Device, dtype: DType) -> Result<()> {
+        let (spec, inv_freq) = self
+            .fused_qk
+            .as_ref()
+            .ok_or_else(|| Error::InferenceError("no fused q/k path to compare".into()))?;
+        let (heads, kv_heads, dim) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        let positions = [[5usize; 3], [3000; 3], [200_000; 3]];
+        let rows = positions.len();
+        let q_proj = Self::self_check_tensor(&[rows, 1, heads, 2 * dim], 3.0, device, dtype)?;
+        let k_proj = Self::self_check_tensor(&[rows, 1, kv_heads, dim], 4.0, device, dtype)?;
+        let v_proj = Self::self_check_tensor(&[rows, 1, kv_heads, dim], 5.0, device, dtype)?;
+        let (queries, keys, values) =
+            self.qk_norm_rope_rows(&q_proj, &k_proj, &v_proj, spec, inv_freq, &positions)?;
+        for (row, position) in positions.into_iter().enumerate() {
+            let mrope = self
+                .mrope_position(position)
+                .ok_or_else(|| Error::InferenceError("text position refused".into()))?;
+            let (q, k) = rope::qk_norm_rope(
+                &q_proj.i(row)?,
+                &k_proj.i(row)?,
+                &self.q_norm.weight,
+                &self.k_norm.weight,
+                inv_freq,
+                spec,
+                mrope,
+            )?;
+            let same = |actual: &Tensor, expected: &Tensor| -> Result<bool> {
+                Ok(host_values(actual)? == host_values(expected)?)
+            };
+            if !same(&queries.i(row)?, &q.reshape((heads, dim))?)?
+                || !same(&keys.i(row)?, &k.reshape((kv_heads, dim))?)?
+                || !same(&values.i(row)?, &v_proj.i(row)?.reshape((kv_heads, dim))?)?
+            {
+                return Err(Error::InferenceError(format!(
+                    "batched q/k norm + RoPE differs from the per-row launch at {position:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn fused_qk_self_check(
         &self,
         spec: &QkNormRopeSpec,
@@ -3256,7 +3380,32 @@ impl Qwen38FullAttention {
             .iter()
             .map(|position| self.fused_qk_for(q_proj, key_states, *position))
             .collect::<Option<Vec<_>>>();
-        if let Some(rows) = fused {
+        let batched = fused.as_ref().is_some_and(|_| {
+            self.batched_qk
+                && batch_size > 1
+                && position_ids.iter().all(|[t, h, w]| t == h && t == w)
+        });
+        let stacked = if batched {
+            let (spec, inv_freq) = self.fused_qk.as_ref().ok_or_else(|| {
+                Error::InferenceError("Qwen3.8 batched q/k RoPE lost its fused path".into())
+            })?;
+            for _ in 0..batch_size {
+                record_fused_qk_norm_rope(false);
+            }
+            Some(self.qk_norm_rope_rows(
+                q_proj,
+                key_states,
+                value_states,
+                spec,
+                inv_freq,
+                position_ids,
+            )?)
+        } else {
+            None
+        };
+        if stacked.is_some() {
+            // The batched launch produced every row's query, key and value.
+        } else if let Some(rows) = fused {
             // One launch per row with host positions; the arena writes K/V.
             for (row, (spec, inv_freq, position)) in rows.into_iter().enumerate() {
                 let (q_row, k_row) = rope::qk_norm_rope(
@@ -3301,12 +3450,19 @@ impl Qwen38FullAttention {
                 );
             }
         }
-        let query_refs = queries.iter().collect::<Vec<_>>();
-        let key_refs = keys.iter().collect::<Vec<_>>();
-        let value_refs = values.iter().collect::<Vec<_>>();
-        let queries = Tensor::stack(&query_refs, 0)?.contiguous()?;
-        let keys = Tensor::stack(&key_refs, 0)?.contiguous()?;
-        let values = Tensor::stack(&value_refs, 0)?.contiguous()?;
+        let (queries, keys, values) = match stacked {
+            Some(stacked) => stacked,
+            None => {
+                let query_refs = queries.iter().collect::<Vec<_>>();
+                let key_refs = keys.iter().collect::<Vec<_>>();
+                let value_refs = values.iter().collect::<Vec<_>>();
+                (
+                    Tensor::stack(&query_refs, 0)?.contiguous()?,
+                    Tensor::stack(&key_refs, 0)?.contiguous()?,
+                    Tensor::stack(&value_refs, 0)?.contiguous()?,
+                )
+            }
+        };
         let storage_dtype = first.arena().config().dtype;
         let output_dtype = queries.dtype();
         if queries.device().is_cuda() && storage_dtype != output_dtype {

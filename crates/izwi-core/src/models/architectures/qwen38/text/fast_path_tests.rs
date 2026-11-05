@@ -1324,6 +1324,8 @@ fn attention_block(hidden: usize, device: &Device, dtype: DType) -> Qwen38FullAt
         rope_kernel_enabled: qwen38_rope_kernel_enabled(device),
         rope_inv_freqs: build_rope_inv_freqs(rope_dim, 10_000_000.0).unwrap(),
         fused_qk: None,
+        batched_qk: false,
+        batched_qk_path: Default::default(),
         fused_qk_path: Qwen38FastPath::default(),
         fused_kv_write: false,
         fused_kv_write_path: Qwen38FastPath::default(),
@@ -1452,6 +1454,24 @@ fn attention_inputs(
 /// fused q/k (eager on the CPU arena, which declines the fused K/V write)
 /// and the fused gate track today's chain at the 27B attention geometry,
 /// scalar and batched.
+/// The multi-row q/k launch's plumbing (positions, the scratch cache of one
+/// slot per row, the value copy) reproduces the per-row launches row by row.
+/// On the CPU the rows kernel falls back to the one-row body, so this checks
+/// the plumbing; the CUDA kernel's arithmetic is checked at load.
+#[test]
+fn batched_qk_rows_match_the_per_row_launches() {
+    let _guard = counters_lock();
+    let (hidden, dtype) = (64, DType::F16);
+    let mut attention = attention_block(hidden, &Device::Cpu, dtype);
+    attention.resolve_fused_attention(&Qwen38CudaSwitches::default(), &Device::Cpu, dtype, true);
+    attention
+        .batched_qk_self_check(&Device::Cpu, dtype)
+        .unwrap();
+    // Production resolves the batched launch on CUDA only.
+    attention.resolve_batched_qk(&Qwen38CudaSwitches::default(), &Device::Cpu, dtype);
+    assert!(!attention.batched_qk);
+}
+
 #[test]
 fn fused_attention_tracks_the_chain_at_qwen38_geometry() {
     let _guard = counters_lock();
