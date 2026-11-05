@@ -94,6 +94,23 @@ __device__ __forceinline__ float fp8_dot4(unsigned w, const float* x) {
   acc = fmaf(b.x, x[2], acc);
   return fmaf(b.y, x[3], acc);
 }
+// fp8_dot4 in two halves: decode four bytes once (exactly as fp8_dot4 does),
+// then the same multiply-add chain against any number of activation rows.
+__device__ __forceinline__ void fp8_decode4(unsigned w, float* out) {
+  unsigned lo = __byte_perm(w, 0u, 0x1404);
+  unsigned hi = __byte_perm(w, 0u, 0x3424);
+  lo = (lo & 0x80008000u) | ((lo & 0x7F007F00u) >> 1);
+  hi = (hi & 0x80008000u) | ((hi & 0x7F007F00u) >> 1);
+  const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&lo));
+  const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&hi));
+  out[0] = a.x; out[1] = a.y; out[2] = b.x; out[3] = b.y;
+}
+__device__ __forceinline__ float dot4(const float* w, const float* x) {
+  float acc = w[0] * x[0];
+  acc = fmaf(w[1], x[1], acc);
+  acc = fmaf(w[2], x[2], acc);
+  return fmaf(w[3], x[3], acc);
+}
 template<class T> __device__ __forceinline__ void load16(const T* x, float* out) {
   const uint4 a = *reinterpret_cast<const uint4*>(x);
   const uint4 b = *reinterpret_cast<const uint4*>(x + 8);
@@ -118,15 +135,22 @@ template<class T,int MR> __device__ void mv2(const T* x,const unsigned char* w,c
   for(int k0=lane*16;k0<K;k0+=512) {
     const uint4 q=*reinterpret_cast<const uint4*>(row+k0);
     const float scale=scales[k0>>7];
+    // Decode the chunk once for every row: the same values and the same
+    // multiply-add order as fp8_dot4 per row, so the bits are unchanged.
+    float wv[16];
+    fp8_decode4(q.x,wv);
+    fp8_decode4(q.y,wv+4);
+    fp8_decode4(q.z,wv+8);
+    fp8_decode4(q.w,wv+12);
     #pragma unroll
     for(int m=0;m<MR;++m) {
       if(m<M) {
         float xv[16];
         load16(x+(size_t)m*K+k0,xv);
-        float part=fp8_dot4(q.x,xv);
-        part+=fp8_dot4(q.y,xv+4);
-        part+=fp8_dot4(q.z,xv+8);
-        part+=fp8_dot4(q.w,xv+12);
+        float part=dot4(wv,xv);
+        part+=dot4(wv+4,xv+4);
+        part+=dot4(wv+8,xv+8);
+        part+=dot4(wv+12,xv+12);
         acc[m]=fmaf(part,scale,acc[m]);
       }
     }
