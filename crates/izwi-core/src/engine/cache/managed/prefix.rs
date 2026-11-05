@@ -426,7 +426,9 @@ pub(super) fn publish_tensor_snapshot(
     if !publication.evicted.is_empty() {
         reconcile_tensor_materialization(state);
     }
-    drop(publication.evicted);
+    // An evicted snapshot can hold the last reference to its DeltaNet state:
+    // free it on the device thread, never on this tokio worker.
+    arena.drop_on_device(publication.evicted);
     Ok(publication.inserted)
 }
 
@@ -446,7 +448,7 @@ pub(super) fn clear_tensor_snapshots(state: &mut ManagedKvModelState) -> Result<
         }
     }
     reconcile_tensor_materialization(state);
-    drop(cleared);
+    arena.drop_on_device(cleared);
     Ok(())
 }
 

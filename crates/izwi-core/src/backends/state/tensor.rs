@@ -397,6 +397,23 @@ impl std::fmt::Debug for TensorStateArena {
 }
 
 impl TensorStateArena {
+    /// Drop `value`, which may hold this arena's device tensors, on the
+    /// device's thread, as [`RetiredTensorState`] does: callers run on tokio
+    /// workers, where freeing a CUDA buffer that is the last reference latches
+    /// `CUDA_ERROR_INVALID_CONTEXT` on the context and fails the next device
+    /// call (a decode step). The drop is queued, not awaited; frees are
+    /// stream-ordered. Off CUDA it drops here.
+    pub(crate) fn drop_on_device<T: Send + 'static>(&self, value: T) {
+        if !matches!(self.device.location(), DeviceLocation::Cuda { .. }) {
+            drop(value);
+            return;
+        }
+        match DeviceThread::for_location(self.device.location()) {
+            Ok(thread) => drop(thread.submit(move || drop(value))),
+            Err(_) => drop(value),
+        }
+    }
+
     pub(crate) fn new(
         plan: Arc<ResolvedStatePlan>,
         capacity: TensorStateCapacity,
