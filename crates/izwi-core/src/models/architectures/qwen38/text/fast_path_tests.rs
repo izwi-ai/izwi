@@ -459,6 +459,8 @@ fn gdn_mixer(
         tiled_recurrence_tile_size_override: None,
         fused_gdn: None,
         fused_gdn_path: Qwen38FastPath::default(),
+        batched_gdn: false,
+        batched_gdn_path: Default::default(),
         alpha_beta_rows: None,
         alpha_beta_gemv_path: Qwen38FastPath::default(),
         gdn_prefill: false,

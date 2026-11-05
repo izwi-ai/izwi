@@ -11,9 +11,9 @@ use std::sync::Arc;
 use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
 use super::chat::Qwen38TextConfig;
 use super::fast_path::{
-    compare_values, decode_gate, summarize, Qwen38CudaSwitches, Qwen38FastPath, FUSED_AB_GEMV_ENV,
-    FUSED_ATTN_GATE_ENV, FUSED_GDN_ENV, FUSED_KV_WRITE_ENV, FUSED_NORM_ENV, FUSED_QK_ROPE_ENV,
-    GDN_PREFILL_ENV,
+    compare_values, decode_gate, summarize, Qwen38CudaSwitches, Qwen38FastPath, BATCHED_GDN_ENV,
+    FUSED_AB_GEMV_ENV, FUSED_ATTN_GATE_ENV, FUSED_GDN_ENV, FUSED_KV_WRITE_ENV, FUSED_NORM_ENV,
+    FUSED_QK_ROPE_ENV, GDN_PREFILL_ENV,
 };
 use super::native::{
     IndexedSafetensors, ProjectionMaterialization, Qwen38LayerType, Qwen38NativeConfig,
@@ -1169,6 +1169,11 @@ struct Qwen38LinearAttention {
     /// `kernels/cuda/gdn.rs` recurrence. Resolved at load.
     fused_gdn: Option<GdnDecodeSpec>,
     fused_gdn_path: Qwen38FastPath,
+    /// Multi-row fused decode: q38's rows conv kernel, then the generic
+    /// multi-row recurrence, one launch each per layer for a whole batch;
+    /// on when it matched the per-row launches bit for bit at load.
+    batched_gdn: bool,
+    batched_gdn_path: Qwen38FastPath,
     /// The dense `in_proj_a`/`in_proj_b` weights as F32 rows `[2 * value
     /// heads, hidden]` (alpha rows, then beta rows) for the router GEMV
     /// (`moe::router_logits`): one izwi launch per decode token instead of a
@@ -1948,6 +1953,7 @@ impl Qwen38TextModel {
             match &mut layer.mixer {
                 Qwen38Mixer::Linear(linear) => {
                     linear.resolve_fused_gdn(switches, &self.device, dtype, allow_cpu);
+                    linear.resolve_batched_gdn(switches, &self.device, dtype);
                     linear.resolve_alpha_beta_gemv(switches, &self.device, dtype, allow_cpu);
                     linear.resolve_gdn_prefill(switches, &self.device, allow_cpu, &mut gdn_prefill);
                 }
@@ -1971,6 +1977,10 @@ impl Qwen38TextModel {
             "rms_norm": summarize([&self.fused_norm_path]),
             "gdn_decode": summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
                 Qwen38Mixer::Linear(linear) => Some(&linear.fused_gdn_path),
+                Qwen38Mixer::Full(_) => None,
+            })),
+            "gdn_batched_decode": summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
+                Qwen38Mixer::Linear(linear) => Some(&linear.batched_gdn_path),
                 Qwen38Mixer::Full(_) => None,
             })),
             "gdn_prefill": summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
@@ -3548,6 +3558,8 @@ impl Qwen38LinearAttention {
             tiled_recurrence_tile_size_override: qwen38_tiled_recurrence_tile_size_override(),
             fused_gdn: None,
             fused_gdn_path: Qwen38FastPath::default(),
+            batched_gdn: false,
+            batched_gdn_path: Qwen38FastPath::default(),
             alpha_beta_rows: None,
             alpha_beta_gemv_path: Qwen38FastPath::default(),
             gdn_prefill: false,
@@ -3585,6 +3597,296 @@ impl Qwen38LinearAttention {
                     "fused DeltaNet decode needs SM80+, 128-dim heads, a 4-tap conv and value heads grouped over key heads",
                 )
         };
+    }
+
+    /// Resolve multi-row decode after the fused decode: on CUDA the rows
+    /// kernels must reproduce the per-row fused launches bit for bit on this
+    /// layer's weights. `IZWI_QWEN38_BATCHED_GDN=legacy` keeps one launch
+    /// pair per row.
+    fn resolve_batched_gdn(
+        &mut self,
+        switches: &Qwen38CudaSwitches,
+        device: &Device,
+        dtype: DType,
+    ) {
+        self.batched_gdn = false;
+        self.batched_gdn_path = if let Some(path) =
+            decode_gate(BATCHED_GDN_ENV, switches, device, false)
+        {
+            path
+        } else if let Some(spec) = self.fused_gdn {
+            match self.batched_gdn_self_check(&spec, device, dtype) {
+                Ok(()) => {
+                    self.batched_gdn = true;
+                    Qwen38FastPath::Fused
+                }
+                Err(error) => Qwen38FastPath::self_check_failed("batched DeltaNet decode", &error),
+            }
+        } else {
+            Qwen38FastPath::legacy("batched DeltaNet decode needs the fused decode")
+        };
+    }
+
+    /// Batched decode through the rows kernels: q38's conv over every row's
+    /// `[C, 3]` history, then the generic recurrence, each one launch, reading
+    /// each row's state through a device table (entry 0 the history, 3 the
+    /// next history, 4 and 5 the recurrent state in and out). Each row writes
+    /// a fresh slab of its own, so a published row state never shares storage
+    /// with another row's, and the old states are left untouched. Returns
+    /// `[rows, Hv * 128]` in z's dtype.
+    #[cfg(feature = "cuda")]
+    fn forward_decode_batch_rows(
+        &self,
+        spec: &GdnDecodeSpec,
+        mixed_qkv: &Tensor,
+        z: &Tensor,
+        beta_raw: &Tensor,
+        alpha: &Tensor,
+        states: &mut [&mut Qwen38LayerRuntimeState],
+    ) -> Result<Tensor> {
+        use crate::kernels::cuda::segment_graph::DeviceTable;
+
+        let rows = states.len();
+        let device = z.device();
+        let state_shape = (1, self.num_v_heads, self.head_k_dim, self.head_v_dim);
+        let state_len = self.num_v_heads * self.head_k_dim * self.head_v_dim;
+        let taps = gdn::CONV_TAPS - 1;
+        let history_len = taps * self.conv_dim;
+        let mut entries = Vec::with_capacity(rows * gdn::TABLE_ENTRIES);
+        let mut outputs = Vec::with_capacity(rows);
+        let mut zeros = None;
+        for state in states.iter() {
+            let Qwen38LayerRuntimeState::Linear {
+                conv_state: Some(ring),
+                recurrent_state,
+            } = &**state
+            else {
+                return Err(Error::InferenceError(
+                    "Qwen3.8 batched DeltaNet decode needs an initialized convolution history"
+                        .into(),
+                ));
+            };
+            let history = ring.contiguous_history()?.contiguous()?;
+            let previous = match recurrent_state {
+                Some(previous) => previous.clone(),
+                None => match &zeros {
+                    Some(zeros) => Tensor::clone(zeros),
+                    None => {
+                        record_cuda_state_initial_allocation();
+                        let fresh = Tensor::zeros(state_shape, DType::F32, device)?;
+                        zeros = Some(fresh.clone());
+                        fresh
+                    }
+                },
+            };
+            if history.elem_count() != history_len
+                || history.dtype() != DType::F32
+                || previous.elem_count() != state_len
+                || previous.dtype() != DType::F32
+            {
+                return Err(Error::InferenceError(
+                    "Qwen3.8 batched DeltaNet decode got a state of the wrong size".into(),
+                ));
+            }
+            let slab = decode_graph::uninit_f32(state_len + history_len, device)?;
+            let state_out = slab.narrow(0, 0, state_len)?.reshape(state_shape)?;
+            let history_out = slab
+                .narrow(0, state_len, history_len)?
+                .reshape((self.conv_dim, taps))?;
+            let history_address = gdn::f32_address(&history)?;
+            entries.extend([
+                history_address,
+                history_address,
+                history_address,
+                gdn::f32_address(&history_out)?,
+                gdn::f32_address(&previous)?,
+                gdn::f32_address(&state_out)?,
+            ]);
+            // The inputs stay referenced until both launches are queued.
+            outputs.push((history_out, state_out, history, previous));
+        }
+        let mut table = DeviceTable::new(device, entries.len())?;
+        table.write(0, &entries)?;
+        let rows_table = gdn::RowsTable::of(&table, 0);
+        let value_width = self.num_v_heads * self.head_v_dim;
+        let conv = crate::kernels::cuda::qwen38_causal_conv_decode_rows(
+            &mixed_qkv.reshape((rows, self.conv_dim))?,
+            &self.conv_kernel,
+            rows_table,
+            rows,
+        )?;
+        let y = gdn::recurrent_decode_rows_in(
+            &conv,
+            &z.reshape((rows, value_width))?,
+            &beta_raw.reshape((rows, self.num_v_heads))?,
+            &alpha.reshape((rows, self.num_v_heads))?,
+            &self.dt_bias,
+            &self.a,
+            &self.norm.weight,
+            rows_table,
+            rows,
+            spec,
+        )?;
+        for (state, (history_out, state_out, _, _)) in states.iter_mut().zip(outputs) {
+            let (conv_state, recurrent_state) = linear_state(state)?;
+            if let Some(ring) = conv_state.as_mut() {
+                ring.replace_contiguous(history_out, taps)?;
+            }
+            *recurrent_state = Some(state_out);
+        }
+        Ok(y)
+    }
+
+    /// Three synthetic rows through the per-row fused launches and the rows
+    /// kernels from identical states: a portable ring, a contiguous history,
+    /// and two rows reading one recurrent state (a fork). The outputs,
+    /// recurrent states and histories must be identical.
+    #[cfg(feature = "cuda")]
+    fn batched_gdn_self_check(
+        &self,
+        spec: &GdnDecodeSpec,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<()> {
+        const ROWS: usize = 3;
+        let values = |len: usize, seed: u64, scale: f32| -> Vec<f32> {
+            let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0) * scale
+                })
+                .collect()
+        };
+        let host = |tensor: &Tensor| -> Result<Vec<f32>> {
+            Ok(tensor
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?)
+        };
+        let exact = |name: &str, actual: &Tensor, expected: &Tensor| -> Result<()> {
+            if host(actual)? == host(expected)? {
+                Ok(())
+            } else {
+                Err(Error::InferenceError(format!(
+                    "batched DeltaNet {name} differs from the per-row launches"
+                )))
+            }
+        };
+        let conv_dim = self.conv_dim;
+        let value_width = self.num_v_heads * self.head_v_dim;
+        let state_len = self.num_v_heads * self.head_k_dim * self.head_v_dim;
+        let tensor = |len: usize, shape: &[usize], seed: u64, scale: f32| -> Result<Tensor> {
+            Ok(Tensor::from_vec(values(len, seed, scale), shape, device)?)
+        };
+        let slot = |seed: u64| tensor(conv_dim, &[conv_dim, 1], seed, 1.0);
+        let shared = tensor(
+            state_len,
+            &[1, self.num_v_heads, self.head_k_dim, self.head_v_dim],
+            31,
+            0.3,
+        )?;
+        let own = tensor(
+            state_len,
+            &[1, self.num_v_heads, self.head_k_dim, self.head_v_dim],
+            32,
+            0.3,
+        )?;
+        let initial = vec![
+            Qwen38LayerRuntimeState::Linear {
+                conv_state: Some(ConvRingState {
+                    storage: ConvHistoryStorage::Ring {
+                        slots: vec![slot(22)?, slot(23)?, slot(24)?],
+                        next_idx: 1,
+                    },
+                }),
+                recurrent_state: Some(shared.clone()),
+            },
+            Qwen38LayerRuntimeState::Linear {
+                conv_state: Some(ConvRingState::from_staged(tensor(
+                    3 * conv_dim,
+                    &[conv_dim, 3],
+                    25,
+                    1.0,
+                )?)?),
+                recurrent_state: Some(own),
+            },
+            Qwen38LayerRuntimeState::Linear {
+                conv_state: Some(ConvRingState::from_staged(tensor(
+                    3 * conv_dim,
+                    &[conv_dim, 3],
+                    26,
+                    1.0,
+                )?)?),
+                recurrent_state: Some(shared),
+            },
+        ];
+        let input = |len: usize, seed: u64, scale: f32| -> Result<Tensor> {
+            Ok(tensor(ROWS * len, &[ROWS, 1, len], seed, scale)?.to_dtype(dtype)?)
+        };
+        let mixed_qkv = input(conv_dim, 41, 1.0)?;
+        let z = input(value_width, 42, 1.5)?;
+        let beta = input(self.num_v_heads, 43, 2.0)?;
+        let alpha = input(self.num_v_heads, 44, 2.0)?;
+        let mut per_row = initial.clone();
+        let mut batched = initial;
+        let mut expected = Vec::with_capacity(ROWS);
+        for (row, state) in per_row.iter_mut().enumerate() {
+            let (conv_state, recurrent_state) = linear_state(state)?;
+            expected.push(self.fused_decode_row(
+                spec,
+                &mixed_qkv.i(row)?,
+                &z.i(row)?,
+                &beta.i(row)?,
+                &alpha.i(row)?,
+                conv_state,
+                recurrent_state,
+            )?);
+        }
+        let expected = Tensor::stack(&expected, 0)?;
+        let actual = {
+            let mut rows = batched.iter_mut().collect::<Vec<_>>();
+            self.forward_decode_batch_rows(spec, &mixed_qkv, &z, &beta, &alpha, &mut rows)?
+        };
+        exact("output", &actual, &expected)?;
+        for (batched, per_row) in batched.iter().zip(&per_row) {
+            let (
+                Qwen38LayerRuntimeState::Linear {
+                    conv_state: Some(batched_ring),
+                    recurrent_state: Some(batched_recurrent),
+                },
+                Qwen38LayerRuntimeState::Linear {
+                    conv_state: Some(per_row_ring),
+                    recurrent_state: Some(per_row_recurrent),
+                },
+            ) = (batched, per_row)
+            else {
+                return Err(Error::InferenceError(
+                    "batched DeltaNet self-check lost a row's state".into(),
+                ));
+            };
+            exact("recurrent state", batched_recurrent, per_row_recurrent)?;
+            exact(
+                "conv history",
+                &batched_ring.contiguous_history()?,
+                &per_row_ring.contiguous_history()?,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn batched_gdn_self_check(
+        &self,
+        _spec: &GdnDecodeSpec,
+        _device: &Device,
+        _dtype: DType,
+    ) -> Result<()> {
+        Err(Error::InferenceError(
+            "batched DeltaNet decode needs a CUDA build".into(),
+        ))
     }
 
     /// The fused decode's view of this layer, when the generic kernel serves
@@ -4132,6 +4434,16 @@ impl Qwen38LinearAttention {
             })
             .collect::<Result<Vec<_>>>()?;
         if let Some(spec) = self.fused_gdn_for(&mixed_qkv, &z, &alpha, &beta, rows) {
+            #[cfg(feature = "cuda")]
+            if self.batched_gdn && batch_size > 1 {
+                // Two launches for the whole batch.
+                let output =
+                    self.forward_decode_batch_rows(spec, &mixed_qkv, &z, &beta, &alpha, states)?;
+                let output = output
+                    .reshape((batch_size, 1, value_width))?
+                    .to_dtype(residual_dtype)?;
+                return self.out_proj.forward(&output).map_err(Error::from);
+            }
             // Two launches per row; the projections stay batched.
             let mut outputs = Vec::with_capacity(batch_size);
             for (row, state) in states.iter_mut().enumerate() {
@@ -6311,6 +6623,8 @@ mod tests {
             tiled_recurrence_tile_size_override: None,
             fused_gdn: None,
             fused_gdn_path: Default::default(),
+            batched_gdn: false,
+            batched_gdn_path: Default::default(),
             alpha_beta_rows: None,
             alpha_beta_gemv_path: Default::default(),
             gdn_prefill: false,

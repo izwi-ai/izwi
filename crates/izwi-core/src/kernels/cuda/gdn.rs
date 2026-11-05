@@ -612,6 +612,69 @@ pub fn decode_rows_in(
     )
 }
 
+/// The recurrence and gated norm half of [`decode_rows_in`] for `rows` rows
+/// whose conv step already ran: `conv` is `[rows, conv_dim]` F32 (the
+/// activated conv outputs), and each row's recurrent state in and out comes
+/// from entries 4 and 5 of its table entries. For a family whose conv
+/// history layout differs from [`conv_decode`]'s (Qwen3.8's channel-major
+/// `[C, 3]`), which runs its own conv over the same table. CUDA only.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn recurrent_decode_rows_in(
+    conv: &Tensor,
+    z: &Tensor,
+    beta_raw: &Tensor,
+    alpha: &Tensor,
+    dt_bias: &Tensor,
+    a: &Tensor,
+    norm_weight: &Tensor,
+    table: RowsTable,
+    rows: usize,
+    spec: &GdnDecodeSpec,
+) -> Result<Tensor> {
+    spec.validate()?;
+    let (hv, d) = (spec.value_heads, HEAD_DIM);
+    let dtype = z.dtype();
+    if rows == 0
+        || table.address == 0
+        || table
+            .first_entry
+            .checked_add(rows * TABLE_ENTRIES)
+            .is_none_or(|end| end > table.entries)
+        || conv.elem_count() != rows * spec.conv_dim()
+        || conv.dtype() != DType::F32
+        || z.elem_count() != rows * hv * d
+        || beta_raw.elem_count() != rows * hv
+        || alpha.elem_count() != rows * hv
+        || beta_raw.dtype() != dtype
+        || alpha.dtype() != dtype
+        || !matches!(dtype, DType::F32 | DType::F16 | DType::BF16)
+        || dt_bias.elem_count() != hv
+        || a.elem_count() != hv
+        || dt_bias.dtype() != DType::F32
+        || a.dtype() != DType::F32
+        || norm_weight.dims() != [d]
+        || norm_weight.dtype() != DType::F32
+        || !conv.device().is_cuda()
+    {
+        candle_core::bail!(
+            "invalid batched DeltaNet recurrence contract for {rows} rows of {spec:?}"
+        )
+    }
+    cuda_impl::recurrent_rows(
+        conv,
+        z,
+        beta_raw,
+        alpha,
+        dt_bias,
+        a,
+        norm_weight,
+        table.address + (table.first_entry * std::mem::size_of::<u64>()) as u64,
+        rows,
+        spec,
+    )
+}
+
 /// Device address of a contiguous F32 CUDA tensor's first element, for a
 /// [`StateTable`].
 #[cfg(feature = "cuda")]
@@ -986,6 +1049,91 @@ mod cuda_impl {
             DType::F16 => launch!(half::f16, "qwen36moe_gdn_decode_table_f16"),
             DType::F32 => launch!(f32, "qwen36moe_gdn_decode_table_f32"),
             other => candle_core::bail!("fused DeltaNet decode does not support {other:?}"),
+        })
+    }
+
+    /// The decode half of [`decode_rows`]: the multi-row recurrence over an
+    /// already computed `[rows, conv_dim]` F32 conv buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn recurrent_rows(
+        conv: &Tensor,
+        z: &Tensor,
+        beta_raw: &Tensor,
+        alpha: &Tensor,
+        dt_bias: &Tensor,
+        a: &Tensor,
+        norm_weight: &Tensor,
+        table: u64,
+        rows: usize,
+        spec: &GdnDecodeSpec,
+    ) -> Result<Tensor> {
+        let device = z.device().as_cuda_device()?;
+        let (hv, d) = (spec.value_heads, HEAD_DIM);
+        let conv_dim = spec.conv_dim();
+        let tensors = [conv, z, beta_raw, alpha, dt_bias, a, norm_weight].map(|t| t.contiguous());
+        let [conv, z, beta_raw, alpha, dt_bias, a, norm_weight] = tensors;
+        let (conv, z, beta_raw, alpha) = (conv?, z?, beta_raw?, alpha?);
+        let (dt_bias, a, norm_weight) = (dt_bias?, a?, norm_weight?);
+        let (c_s, _) = conv.storage_and_layout();
+        let (z_s, _) = z.storage_and_layout();
+        let (b_s, _) = beta_raw.storage_and_layout();
+        let (al_s, _) = alpha.storage_and_layout();
+        let (dt_s, _) = dt_bias.storage_and_layout();
+        let (a_s, _) = a.storage_and_layout();
+        let (n_s, _) = norm_weight.storage_and_layout();
+        let conv_v = view::<f32>(&c_s, &conv)?;
+        let dt_v = view::<f32>(&dt_s, &dt_bias)?;
+        let a_v = view::<f32>(&a_s, &a)?;
+        let n_v = view::<f32>(&n_s, &norm_weight)?;
+        let decode_config = LaunchConfig {
+            grid_dim: (hv as u32, rows as u32, 1),
+            block_dim: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        macro_rules! launch {
+            ($ty:ty, $decode:literal) => {{
+                let zv = view::<$ty>(&z_s, &z)?;
+                let bv = view::<$ty>(&b_s, &beta_raw)?;
+                let alv = view::<$ty>(&al_s, &alpha)?;
+                // SAFETY: the decode kernel writes every output channel.
+                let y = unsafe { device.alloc::<$ty>(rows * hv * d)? };
+                let function = device.get_or_load_custom_func(
+                    $decode,
+                    MODULE,
+                    super::super::cuda_ptx::QWEN36MOE,
+                )?;
+                let mut builder = function.builder();
+                builder.arg(&conv_v);
+                candle_core::builder_arg!(builder, conv_dim as i64);
+                builder.arg(&zv);
+                candle_core::builder_arg!(builder, (hv * d) as i64);
+                builder.arg(&bv);
+                candle_core::builder_arg!(builder, hv as i64);
+                builder.arg(&alv);
+                candle_core::builder_arg!(builder, hv as i64);
+                builder.arg(&dt_v);
+                builder.arg(&a_v);
+                builder.arg(&n_v);
+                candle_core::builder_arg!(builder, table, 0i32);
+                builder.arg(&y);
+                candle_core::builder_arg!(
+                    builder,
+                    spec.key_heads as i32,
+                    spec.value_heads as i32,
+                    i32::from(spec.grouped),
+                    spec.norm_eps
+                );
+                // SAFETY: argument order and types match the kernel; every
+                // row's table entries address valid F32 state buffers.
+                unsafe { builder.launch(decode_config) }.w()?;
+                wrap(y, device, Shape::from((rows, hv * d)))
+            }};
+        }
+        Ok(match z.dtype() {
+            DType::BF16 => launch!(half::bf16, "qwen36moe_gdn_decode_rows_bf16"),
+            DType::F16 => launch!(half::f16, "qwen36moe_gdn_decode_rows_f16"),
+            DType::F32 => launch!(f32, "qwen36moe_gdn_decode_rows_f32"),
+            other => candle_core::bail!("batched DeltaNet decode does not support {other:?}"),
         })
     }
 
