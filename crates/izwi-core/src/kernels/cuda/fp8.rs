@@ -104,6 +104,12 @@ pub const TENSOR_CORE_MAX_ROWS: usize = 64;
 /// with few output channels split K until they fill the device.
 const TENSOR_CORE_TARGET_BLOCKS: usize = 264;
 
+/// `(n, k)` of the tensor-core load-time check, each within
+/// [`provider_supported`]: three 64-channel blocks (the last owns half a
+/// 128-row scale block) with K split to one block per split, K split across
+/// a wide projection, and enough channels that K is not split.
+const TENSOR_CORE_CHECK_SHAPES: [(usize, usize); 3] = [(192, 2048), (2048, 4096), (16_960, 256)];
+
 /// Kill switch for the tensor-core projection (`legacy`/`off`/`0`).
 pub const TENSOR_CORE_ENV: &str = "IZWI_FP8_TENSOR_CORE";
 
@@ -197,12 +203,7 @@ pub fn verify_and_enable_tensor_core(device: &Device) -> Result<()> {
     };
     let host =
         |t: Tensor| -> Result<Vec<f32>> { t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>() };
-    // (n, k): a channel tail with K split to one block per split, K split
-    // across a wide projection, and enough channels that K is not split.
-    for (index, (n, k)) in [(200usize, 2048usize), (2048, 4096), (16_960, 256)]
-        .into_iter()
-        .enumerate()
-    {
+    for (index, (n, k)) in TENSOR_CORE_CHECK_SHAPES.into_iter().enumerate() {
         let (w, s) = weights(n, k, index)?;
         for m in [2usize, 5, 8, 16, 17, 33, 64] {
             for dtype in [DType::BF16, DType::F16] {
@@ -1439,6 +1440,16 @@ impl CustomOp3 for DequantGemm {
 
 #[cfg(test)]
 mod tests {
+    /// The load-time check only proves something if the projection contract
+    /// admits its shapes (a 200-channel shape once failed it on an H100
+    /// before any kernel ran).
+    #[test]
+    fn tensor_core_check_shapes_meet_the_provider_contract() {
+        for (n, k) in super::TENSOR_CORE_CHECK_SHAPES {
+            assert!(n.is_multiple_of(64) && k.is_multiple_of(128), "({n}, {k})");
+        }
+    }
+
     use super::*;
 
     /// A compact projection `[n, k]` of real E4M3 bytes with varied block
