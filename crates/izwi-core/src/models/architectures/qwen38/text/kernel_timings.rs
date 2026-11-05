@@ -248,8 +248,8 @@ impl Qwen38TextModel {
         let compact_vs_gemm = match compare {
             Some(_) if over_budget() => serde_json::json!({ "skipped": "time budget" }),
             Some((kind, projection, [n, k])) => {
-                let compact = projection.with_prefill_gemm(false).expect("native FP8");
-                let gemm = projection.with_prefill_gemm(true).expect("native FP8");
+                let compact = projection.with_reference_paths(false).expect("native FP8");
+                let gemm = projection.with_reference_paths(true).expect("native FP8");
                 let (wide, narrow) = (input(PREFILL_ROWS, k, 13)?, input(16, k, 17)?);
                 // `mm` is the slow path being measured: one timed 256-row
                 // call, no warm-up of its own (the 16-row call loads it).
@@ -257,6 +257,9 @@ impl Qwen38TextModel {
                 let mm_wide = timed(0, 1, &mut || Ok(compact.forward(&wide)?))?;
                 let gemm_wide = timed(1, 3, &mut || Ok(gemm.forward(&wide)?))?;
                 let gemm_narrow = timed(1, 3, &mut || Ok(gemm.forward(&narrow)?))?;
+                // What 16 rows run in production (the tensor-core kernel
+                // where it serves them).
+                let served_narrow = timed(1, 3, &mut || Ok(projection.forward(&narrow)?))?;
                 serde_json::json!({
                     "kind": kind, "n": n, "k": k,
                     "mm_ms_256_rows": mm_wide,
@@ -265,6 +268,7 @@ impl Qwen38TextModel {
                     "mm_ms_16_rows": mm_narrow,
                     "gemm_ms_16_rows": gemm_narrow,
                     "gemm_faster_at_16_rows": gemm_narrow < mm_narrow,
+                    "served_ms_16_rows": served_narrow,
                 })
             }
             None => serde_json::json!({ "skipped": "no native block-FP8 output projection" }),

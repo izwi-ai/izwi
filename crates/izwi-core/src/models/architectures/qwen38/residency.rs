@@ -211,6 +211,9 @@ pub(crate) struct Qwen38ResidencyPolicy {
     /// The dequantized prefill GEMM (CUDA): planned and not switched off.
     /// Each projection kind still passes its own load-time check first.
     fp8_prefill_gemm: Qwen38FastPath,
+    /// The tensor-core FP8 kernel (CUDA) for the rows it measured fastest
+    /// at, on projections that run the vectorized GEMV.
+    fp8_tensor_core: Qwen38FastPath,
     /// Pack row-compatible projections into one matrix.
     packing: bool,
     /// The LM head quantized to block FP8 (with native FP8 projections).
@@ -487,6 +490,7 @@ impl Qwen38ResidencyPolicy {
             } else {
                 "native block FP8 not selected"
             }),
+            fp8_tensor_core: Qwen38FastPath::legacy("native block FP8 on CUDA not selected"),
             packing: metal_native
                 || (backend == BackendKind::Cpu && plan == Qwen38ProjectionPlan::Q8)
                 || backend == BackendKind::Cuda
@@ -643,6 +647,22 @@ impl Qwen38ResidencyPolicy {
             Qwen38FastPath::legacy("the dequantized prefill GEMM runs on CUDA only")
         } else {
             Qwen38FastPath::Fused
+        };
+        self.fp8_tensor_core = if !device.is_cuda() {
+            Qwen38FastPath::legacy("the tensor-core FP8 kernel runs on CUDA only")
+        } else if !self.fp8_gemv.is_fused() {
+            Qwen38FastPath::legacy("runs only on projections with the vectorized GEMV")
+        } else {
+            match fp8::verify_and_enable_tensor_core(device) {
+                Ok(()) => Qwen38FastPath::Fused,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "tensor-core FP8 projection unavailable; keeping the GEMV and GEMM"
+                    );
+                    Qwen38FastPath::legacy(format!("self_check_failed: {error}"))
+                }
+            }
         };
     }
 
@@ -963,6 +983,10 @@ impl Qwen38ResidencyPolicy {
             "fp8_projections": summarize([&projections]),
             "fp8_gemv": summarize([&self.fp8_gemv]),
             "fp8_prefill_gemm": summarize([&self.fp8_prefill_gemm]),
+            "fp8_tensor_core": {
+                "path": summarize([&self.fp8_tensor_core]),
+                "kernel": fp8::tensor_core_summary(),
+            },
             "fp8_execution_mode": self.execution_mode(),
         })
     }

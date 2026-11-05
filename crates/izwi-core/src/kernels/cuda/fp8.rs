@@ -91,6 +91,187 @@ enum DecodeKernel {
     /// the reference kernels otherwise. The caller owns the verification, so
     /// the process-wide flag is neither read nor set.
     VectorizedWhenEligible,
+    /// The tensor-core kernel (errors if the call is not eligible); for its
+    /// load-time check and timings.
+    TensorCore,
+}
+
+/// Rows the tensor-core projection can serve in one launch (four 16-row
+/// tiles). Wider calls take the dequantized GEMM.
+pub const TENSOR_CORE_MAX_ROWS: usize = 64;
+
+/// Blocks a tensor-core launch aims for (about two per H100 SM): projections
+/// with few output channels split K until they fill the device.
+const TENSOR_CORE_TARGET_BLOCKS: usize = 264;
+
+/// Kill switch for the tensor-core projection (`legacy`/`off`/`0`).
+pub const TENSOR_CORE_ENV: &str = "IZWI_FP8_TENSOR_CORE";
+
+static TENSOR_CORE_VERIFIED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static TENSOR_CORE_MIN_ROWS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+static TENSOR_CORE_SERVED_MAX_ROWS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static TENSOR_CORE_SUMMARY: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+
+/// Whether a compact-FP8 projection of `rows` rows takes the tensor-core
+/// kernel: it passed its load-time check, and the timings measured it faster
+/// than the vectorized GEMV below and the dequantized GEMM above.
+pub fn tensor_core_serves(rows: usize) -> bool {
+    TENSOR_CORE_VERIFIED.load(std::sync::atomic::Ordering::Relaxed)
+        && rows >= TENSOR_CORE_MIN_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+        && rows <= TENSOR_CORE_SERVED_MAX_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The check, crossover and timings behind [`tensor_core_serves`], for the
+/// diagnostics (`null` until a load ran them).
+pub fn tensor_core_summary() -> serde_json::Value {
+    TENSOR_CORE_SUMMARY
+        .get()
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Rows from which a family should route a compact-FP8 projection through
+/// the dequantized GEMM: past the tensor-core kernel's rows when it serves
+/// rows beyond the vectorized GEMV's, else [`DEQUANT_GEMM_MIN_ROWS`].
+pub fn dequant_gemm_min_rows() -> usize {
+    let served = TENSOR_CORE_SERVED_MAX_ROWS.load(std::sync::atomic::Ordering::Relaxed);
+    if tensor_core_serves(served) {
+        served.max(VECTORIZED_DECODE_MAX_ROWS) + 1
+    } else {
+        DEQUANT_GEMM_MIN_ROWS
+    }
+}
+
+/// Compare the tensor-core projection with the reference kernels on `device`
+/// (row counts 2 to 64 including partial tiles, channel tails, split and
+/// unsplit K, BF16 and F16), then time it on a 5120x5120 projection and
+/// enable it, process-wide, over the rows where it measured faster: against
+/// the vectorized GEMV at 8 down to 2 rows (from the smallest count at which
+/// it is faster at that and every larger one, else from 9), and against the
+/// dequantized GEMM at 16, 32 and 64 rows (up to the largest count at which
+/// it is faster at that and every smaller one, else up to 8).
+/// Idempotent; `IZWI_FP8_TENSOR_CORE=legacy` leaves it off.
+pub fn verify_and_enable_tensor_core(device: &Device) -> Result<()> {
+    if TENSOR_CORE_VERIFIED.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
+    if !crate::env::flag_or(TENSOR_CORE_ENV, true) {
+        candle_core::bail!("{TENSOR_CORE_ENV}=legacy")
+    }
+    if !device.is_cuda() || !device_is_sm80_or_newer(device) {
+        candle_core::bail!("the tensor-core FP8 projection needs CUDA SM80+")
+    }
+    let weights = |n: usize, k: usize, seed: usize| -> Result<(Tensor, Tensor)> {
+        let raw = (0..n * k)
+            .map(|i| {
+                let mixed = ((i ^ seed).wrapping_mul(0x9E37_79B1) >> 17) as u8;
+                if mixed & 0x7f == 0x7f {
+                    0x38
+                } else {
+                    mixed
+                }
+            })
+            .collect::<Vec<_>>();
+        let scales = (0..n.div_ceil(128) * k.div_ceil(128))
+            .map(|i| 0.001 + ((i + seed) % 13) as f32 * 3e-4)
+            .collect::<Vec<_>>();
+        Ok((
+            Tensor::from_vec(raw, (n, k), &Device::Cpu)?.to_device(device)?,
+            Tensor::from_vec(scales, (n.div_ceil(128), k.div_ceil(128)), &Device::Cpu)?
+                .to_device(device)?,
+        ))
+    };
+    let input = |m: usize, k: usize, dtype: DType, seed: f32| -> Result<Tensor> {
+        Tensor::from_vec(
+            (0..m * k)
+                .map(|i| ((i as f32 + seed) * 0.754_877_7).sin() * 2.0)
+                .collect::<Vec<_>>(),
+            (m, k),
+            &Device::Cpu,
+        )?
+        .to_dtype(dtype)?
+        .to_device(device)
+    };
+    let host =
+        |t: Tensor| -> Result<Vec<f32>> { t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>() };
+    // (n, k): a channel tail with K split to one block per split, K split
+    // across a wide projection, and enough channels that K is not split.
+    for (index, (n, k)) in [(200usize, 2048usize), (2048, 4096), (16_960, 256)]
+        .into_iter()
+        .enumerate()
+    {
+        let (w, s) = weights(n, k, index)?;
+        for m in [2usize, 5, 8, 16, 17, 33, 64] {
+            for dtype in [DType::BF16, DType::F16] {
+                let x = input(m, k, dtype, m as f32)?;
+                let reference = host(project(&x, &w, &s, DecodeKernel::Reference)?)?;
+                let actual = host(project(&x, &w, &s, DecodeKernel::TensorCore)?)?;
+                let scale = reference.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
+                if let Some((at, (a, b))) = actual
+                    .iter()
+                    .zip(&reference)
+                    .enumerate()
+                    .find(|(_, (a, b))| !a.is_finite() || (*a - *b).abs() > 0.02 * scale)
+                {
+                    candle_core::bail!(
+                        "tensor-core FP8 projection diverges at n={n} k={k} m={m} {dtype:?} index {at}: {a} vs reference {b}"
+                    )
+                }
+            }
+        }
+    }
+    let (n, k) = (5120usize, 5120usize);
+    let (w, s) = weights(n, k, 7)?;
+    let ms = |call: &mut dyn FnMut() -> Result<()>| -> Result<f64> {
+        Ok(super::timing::device_ms_per_call(device, 1, 10, call)?.unwrap_or(f64::INFINITY))
+    };
+    let mut timings = Vec::new();
+    let mut min_rows = VECTORIZED_DECODE_MAX_ROWS + 1;
+    let mut faster = true;
+    for m in [8usize, 6, 5, 4, 3, 2] {
+        let x = input(m, k, DType::BF16, 1.5)?;
+        let vectorized = ms(&mut || project(&x, &w, &s, DecodeKernel::Vectorized).map(drop))?;
+        let tensor_core = ms(&mut || project(&x, &w, &s, DecodeKernel::TensorCore).map(drop))?;
+        faster &= tensor_core < vectorized;
+        if faster {
+            min_rows = m;
+        }
+        timings.push(serde_json::json!({
+            "rows": m,
+            "vectorized_ms": vectorized,
+            "tensor_core_ms": tensor_core,
+        }));
+    }
+    let mut max_rows = VECTORIZED_DECODE_MAX_ROWS;
+    faster = true;
+    for m in [16usize, 32, TENSOR_CORE_MAX_ROWS] {
+        let x = input(m, k, DType::BF16, 1.5)?;
+        let dequant_gemm = ms(&mut || block_fp8_projection_dequant_gemm(&x, &w, &s).map(drop))?;
+        let tensor_core = ms(&mut || project(&x, &w, &s, DecodeKernel::TensorCore).map(drop))?;
+        faster &= tensor_core < dequant_gemm;
+        if faster {
+            max_rows = m;
+        }
+        timings.push(serde_json::json!({
+            "rows": m,
+            "dequant_gemm_ms": dequant_gemm,
+            "tensor_core_ms": tensor_core,
+        }));
+    }
+    TENSOR_CORE_MIN_ROWS.store(min_rows, std::sync::atomic::Ordering::Relaxed);
+    TENSOR_CORE_SERVED_MAX_ROWS.store(max_rows, std::sync::atomic::Ordering::Relaxed);
+    TENSOR_CORE_VERIFIED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = TENSOR_CORE_SUMMARY.set(serde_json::json!({
+        "verified": true,
+        "min_rows": min_rows,
+        "max_rows": max_rows,
+        "timings_5120x5120": timings,
+        "switch": TENSOR_CORE_ENV,
+    }));
+    Ok(())
 }
 
 /// Compare the vectorized decode GEMV against the reference kernel on
@@ -847,7 +1028,7 @@ impl CustomOp3 for Projection {
             sl.start_offset()..sl.start_offset() + self.n.div_ceil(128) * self.k.div_ceil(128),
         );
         macro_rules! run {
-            ($v:ident,$ty:ty,$mv:literal,$mv2:literal,$mv2x8:literal,$mm:literal) => {{
+            ($v:ident,$ty:ty,$mv:literal,$mv2:literal,$mv2x8:literal,$mm:literal,$tc:literal,$tcr:literal) => {{
                 let CudaStorageSlice::$v(x) = &x.slice else {
                     unreachable!()
                 };
@@ -859,17 +1040,109 @@ impl CustomOp3 for Projection {
                 // weight rows; K is a multiple of 128 by contract.
                 let aligned = (xl.start_offset() * 2).is_multiple_of(16)
                     && wl.start_offset().is_multiple_of(16);
-                let vectorized = m <= VECTORIZED_DECODE_MAX_ROWS
+                let tensor_core = aligned
+                    && m <= TENSOR_CORE_MAX_ROWS
+                    && match self.kernel {
+                        DecodeKernel::TensorCore => true,
+                        DecodeKernel::Auto | DecodeKernel::VectorizedWhenEligible => {
+                            tensor_core_serves(m)
+                        }
+                        DecodeKernel::Reference | DecodeKernel::Vectorized => false,
+                    };
+                if self.kernel == DecodeKernel::TensorCore && !tensor_core {
+                    candle_core::bail!(
+                        "tensor-core FP8 projection requested for an ineligible call"
+                    )
+                }
+                let vectorized = !tensor_core
+                    && m <= VECTORIZED_DECODE_MAX_ROWS
                     && aligned
                     && match self.kernel {
                         DecodeKernel::Auto => vectorized_decode_enabled(),
-                        DecodeKernel::Reference => false,
+                        DecodeKernel::Reference | DecodeKernel::TensorCore => false,
                         DecodeKernel::Vectorized | DecodeKernel::VectorizedWhenEligible => true,
                     };
                 if self.kernel == DecodeKernel::Vectorized && !vectorized {
                     candle_core::bail!(
                         "vectorized FP8 decode GEMV requested for an ineligible call"
                     )
+                }
+                if tensor_core {
+                    let kblocks = self.k / 128;
+                    let n_blocks = self.n.div_ceil(64);
+                    let wanted = TENSOR_CORE_TARGET_BLOCKS
+                        .div_ceil(n_blocks)
+                        .clamp(1, kblocks.max(1));
+                    let per_split = kblocks.div_ceil(wanted).max(1);
+                    let splits = kblocks.div_ceil(per_split).max(1);
+                    // SAFETY: each split writes every (row, channel) partial it owns.
+                    let partial = if splits > 1 {
+                        Some(unsafe { device.alloc::<f32>(splits * m * self.n)? })
+                    } else {
+                        None
+                    };
+                    {
+                        let f = device.get_or_load_custom_func(
+                            $tc,
+                            "izwi_qwen38_fp8",
+                            super::cuda_ptx::FP8,
+                        )?;
+                        // A null partials pointer makes the kernel write `out`.
+                        let no_partial = 0u64;
+                        let mut b = f.builder();
+                        b.arg(&x);
+                        b.arg(&w);
+                        b.arg(&s);
+                        b.arg(&mut out);
+                        match &partial {
+                            Some(partial) => b.arg(partial),
+                            None => b.arg(&no_partial),
+                        };
+                        candle_core::builder_arg!(
+                            b,
+                            m as i32,
+                            self.n as i32,
+                            self.k as i32,
+                            per_split as i32
+                        );
+                        let cfg = LaunchConfig {
+                            grid_dim: (n_blocks as u32, splits as u32, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        // SAFETY: compact bytes, block-scale grid, row count
+                        // (at most 64) and alignment have been validated.
+                        unsafe { b.launch(cfg) }.w()?;
+                    }
+                    if let Some(partial) = &partial {
+                        let f = device.get_or_load_custom_func(
+                            $tcr,
+                            "izwi_qwen38_fp8",
+                            super::cuda_ptx::FP8,
+                        )?;
+                        let mut b = f.builder();
+                        b.arg(partial);
+                        b.arg(&mut out);
+                        candle_core::builder_arg!(b, splits as i32, (m * self.n) as i32);
+                        let cfg = LaunchConfig {
+                            grid_dim: ((m * self.n).div_ceil(256) as u32, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        // SAFETY: the partials cover every output element.
+                        unsafe { b.launch(cfg) }.w()?;
+                    }
+                    return Ok((
+                        candle_core::CudaStorage {
+                            slice: CudaStorageSlice::$v(out),
+                            device: device.clone(),
+                        },
+                        {
+                            let mut dims = xl.dims().to_vec();
+                            *dims.last_mut().unwrap() = self.n;
+                            Shape::from(dims)
+                        },
+                    ));
                 }
                 let f = device.get_or_load_custom_func(
                     if vectorized && small {
@@ -922,7 +1195,9 @@ impl CustomOp3 for Projection {
                     "qwen38_fp8_mv_f16",
                     "qwen38_fp8_mv2_f16",
                     "qwen38_fp8_mv2x8_f16",
-                    "qwen38_fp8_mm_f16"
+                    "qwen38_fp8_mm_f16",
+                    "qwen38_fp8_tc_f16",
+                    "qwen38_fp8_tc_reduce_f16"
                 )
             }
             CudaStorageSlice::BF16(_) => {
@@ -932,7 +1207,9 @@ impl CustomOp3 for Projection {
                     "qwen38_fp8_mv_bf16",
                     "qwen38_fp8_mv2_bf16",
                     "qwen38_fp8_mv2x8_bf16",
-                    "qwen38_fp8_mm_bf16"
+                    "qwen38_fp8_mm_bf16",
+                    "qwen38_fp8_tc_bf16",
+                    "qwen38_fp8_tc_reduce_bf16"
                 )
             }
             _ => candle_core::bail!("FP8 CUDA activation requires F16/BF16"),

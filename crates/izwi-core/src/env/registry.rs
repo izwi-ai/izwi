@@ -553,6 +553,14 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Text the Fish S2 smoke test synthesizes.",
     ),
     CoreEnvVar::new(
+        "IZWI_FP8_TENSOR_CORE",
+        Flag,
+        "true (CUDA SM80+)",
+        Load,
+        "Kill switch: legacy/off keeps compact block-FP8 projections of 2-64 rows on the vectorized GEMV, tile kernel or dequantized GEMM instead of the tensor-core kernel.",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
         "IZWI_FUSED_KERNELS",
         Flag,
         "true",

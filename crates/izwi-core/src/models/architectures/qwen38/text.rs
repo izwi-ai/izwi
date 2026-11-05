@@ -911,8 +911,15 @@ impl Module for Qwen38Projection {
                 prefill_gemm,
             } => {
                 let vectorized = *kernel == Qwen38Fp8Kernel::Vectorized;
+                let rows = input.elem_count() / raw.shape[1].max(1);
+                // The tensor-core kernel serves the rows it measured faster
+                // at than the dequantized GEMM (through the vectorized
+                // selection below).
                 if *prefill_gemm
-                    && input.elem_count() / raw.shape[1].max(1) >= FP8_PREFILL_GEMM_MIN_ROWS
+                    && rows >= FP8_PREFILL_GEMM_MIN_ROWS
+                    && !(vectorized
+                        && input.device().is_cuda()
+                        && crate::kernels::cuda::fp8::tensor_core_serves(rows))
                 {
                     if input.device().is_cuda() {
                         record_cuda_fp8_prefill_gemm();
@@ -927,7 +934,6 @@ impl Module for Qwen38Projection {
                     return Ok(output);
                 }
                 if input.device().is_metal() {
-                    let rows = input.elem_count() / raw.shape[1].max(1);
                     if *kernel == Qwen38Fp8Kernel::DequantOnly || rows > METAL_FP8_GEMV_MAX_ROWS {
                         record_metal_fp8_projection(false);
                         let dense =
@@ -937,11 +943,8 @@ impl Module for Qwen38Projection {
                     }
                     record_metal_fp8_projection(true);
                 }
-                if input.device().is_cuda() {
-                    let rows = input.elem_count() / raw.shape[1].max(1);
-                    if rows <= 4 {
-                        record_cuda_fp8_gemv(vectorized);
-                    }
+                if input.device().is_cuda() && rows <= 4 {
+                    record_cuda_fp8_gemv(vectorized);
                 }
                 crate::kernels::cuda::fp8::block_fp8_projection_selecting(
                     input,
@@ -984,6 +987,22 @@ impl Qwen38Projection {
                 raw: raw.clone(),
                 kernel: *kernel,
                 prefill_gemm: enabled,
+            }),
+            Self::Quantized(_) | Self::Dense(_) => None,
+        }
+    }
+
+    /// The paths a check or timing compares, pinned: with `prefill_gemm`
+    /// every span of [`FP8_PREFILL_GEMM_MIN_ROWS`] rows or more runs the
+    /// dequantized GEMM, without it the compact reference kernels (`mm`
+    /// above four rows); neither takes the tensor-core kernel the vectorized
+    /// selection would. `None` for other forms.
+    pub(super) fn with_reference_paths(&self, prefill_gemm: bool) -> Option<Self> {
+        match self {
+            Self::NativeFp8 { raw, .. } => Some(Self::NativeFp8 {
+                raw: raw.clone(),
+                kernel: Qwen38Fp8Kernel::Reference,
+                prefill_gemm,
             }),
             Self::Quantized(_) | Self::Dense(_) => None,
         }
@@ -5692,8 +5711,8 @@ pub(super) fn fp8_prefill_gemm_check(
     device: &Device,
 ) -> Result<()> {
     let (gemm, compact) = match (
-        projection.with_prefill_gemm(true),
-        projection.with_prefill_gemm(false),
+        projection.with_reference_paths(true),
+        projection.with_reference_paths(false),
     ) {
         (Some(gemm), Some(compact)) => (gemm, compact),
         _ => {

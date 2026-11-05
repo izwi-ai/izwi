@@ -88,6 +88,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_FISH_S2_SMOKE_TEMPERATURE` | number | `0.0` | test harness | Sampling temperature for the Fish S2 smoke request. |
 | `IZWI_FISH_S2_SMOKE_TOP_P` | number | `1.0` | test harness | Top-p for the Fish S2 smoke request. |
 | `IZWI_FISH_S2_TARGET_TEXT` | text | the reference transcript | test harness | Text the Fish S2 smoke test synthesizes. |
+| `IZWI_FP8_TENSOR_CORE` | flag | true (CUDA SM80+) | model load | Kill switch: legacy/off keeps compact block-FP8 projections of 2-64 rows on the vectorized GEMV, tile kernel or dequantized GEMM instead of the tensor-core kernel. Also: `legacy` means false. |
 | `IZWI_FUSED_KERNELS` | flag | `true` | first use | Enables fused Metal/CUDA (and some CPU) kernels. |
 | `IZWI_GEMMA3_CUDA_RMS_NORM` | flag | true on CUDA (no effect elsewhere) | model load | Toggles the Candle CUDA RMSNorm kernel for Gemma3 norms on CUDA devices. |
 | `IZWI_GGUF_MMAP` | choice | auto (mmap on all backends) | model load | Chooses GGUF file loading: auto, on (1\|true\|yes) for mmap, or off (0\|false\|no) for buffered I/O; unknown ignored. |

@@ -59,6 +59,9 @@ pub struct Qwen36TextModel {
     /// Dequantized cuBLAS GEMM for wide compact-FP8 projections
     /// (`fp8_prefill_gemm`), and why not.
     fp8_prefill_gemm_path: Qwen36FusedPath,
+    /// Tensor-core FP8 kernel for the projection rows it measured fastest at
+    /// (`fp8_tensor_core`), and why not.
+    fp8_tensor_core_path: Qwen36FusedPath,
     /// Chunked DeltaNet prefill kernels (`gdn_prefill`), and why not.
     gdn_prefill_path: Qwen36FusedPath,
     /// Tensor-core grouped MoE kernels for prefill (`moe_prefill`), and why
@@ -867,7 +870,7 @@ impl Qwen36Projection {
             Self::CompactFp8 { weights, scales } => {
                 use crate::kernels::cuda::fp8;
                 let rows = x.elem_count() / weights.dim(1)?.max(1);
-                if rows >= fp8::DEQUANT_GEMM_MIN_ROWS
+                if rows >= fp8::dequant_gemm_min_rows()
                     && x.device().is_cuda()
                     && fp8::dequant_gemm_enabled()
                 {
@@ -1095,6 +1098,7 @@ impl Qwen36TextModel {
             fused_norm_path: Qwen36FusedPath::legacy("unresolved"),
             fp8_gemv_path: Qwen36FusedPath::legacy("unresolved"),
             fp8_prefill_gemm_path: Qwen36FusedPath::legacy("unresolved"),
+            fp8_tensor_core_path: Qwen36FusedPath::legacy("unresolved"),
             gdn_prefill_path: Qwen36FusedPath::legacy("unresolved"),
             moe_prefill_path: Qwen36FusedPath::legacy("unresolved"),
             decode_graphs: None,
@@ -1107,12 +1111,14 @@ impl Qwen36TextModel {
                 model.fused_norm_path = Qwen36FusedPath::legacy(reason);
                 model.fp8_gemv_path = Qwen36FusedPath::legacy(reason);
                 model.fp8_prefill_gemm_path = Qwen36FusedPath::legacy(reason);
+                model.fp8_tensor_core_path = Qwen36FusedPath::legacy(reason);
                 model.gdn_prefill_path = Qwen36FusedPath::legacy(reason);
             }
             None => {
                 model.resolve_fused_norms(false);
                 model.resolve_vectorized_fp8_decode();
                 model.resolve_fp8_prefill_gemm();
+                model.resolve_fp8_tensor_core();
                 model.resolve_chunked_gdn_prefill();
             }
         }
@@ -1124,8 +1130,9 @@ impl Qwen36TextModel {
         Ok(model)
     }
 
-    /// Route projections of [`DEQUANT_GEMM_MIN_ROWS`] rows or more (prefill
-    /// spans) through the dequantized cuBLAS GEMM, process-wide, after it
+    /// Route projections past the tensor-core kernel's rows (else of
+    /// [`DEQUANT_GEMM_MIN_ROWS`] rows or more: prefill spans) through the
+    /// dequantized cuBLAS GEMM, process-wide, after it
     /// matches the reference kernels on this device: the compact tile kernel
     /// runs prefill at about 8 TFLOP/s. `IZWI_QWEN36_FP8_PREFILL_GEMM=legacy`
     /// keeps the tile kernel.
@@ -1153,6 +1160,35 @@ impl Qwen36TextModel {
     /// Whether wide compact-FP8 projections run the dequantized GEMM.
     pub(crate) fn fp8_prefill_gemm_summary(&self) -> serde_json::Value {
         super::fast_path::summarize([&self.fp8_prefill_gemm_path])
+    }
+
+    /// Run compact-FP8 projections of 2 to 64 rows (batched decode, short
+    /// prefill spans) on the tensor-core kernel, process-wide, over the rows
+    /// where it measured faster than the vectorized GEMV and the dequantized
+    /// GEMM, after it matches the reference kernels on this device.
+    /// `IZWI_FP8_TENSOR_CORE=legacy` keeps the GEMV and GEMM.
+    fn resolve_fp8_tensor_core(&mut self) {
+        self.fp8_tensor_core_path = if !self.device.is_cuda() {
+            Qwen36FusedPath::legacy("the tensor-core FP8 kernel runs on CUDA only")
+        } else {
+            match crate::kernels::cuda::fp8::verify_and_enable_tensor_core(&self.device) {
+                Ok(()) => Qwen36FusedPath::Fused,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "tensor-core FP8 projection unavailable; keeping the GEMV and GEMM"
+                    );
+                    Qwen36FusedPath::legacy(format!("self-check failed: {error}"))
+                }
+            }
+        };
+    }
+
+    /// The tensor-core FP8 kernel's resolution, crossover rows and timings.
+    pub(crate) fn fp8_tensor_core_summary(&self) -> serde_json::Value {
+        let mut summary = super::fast_path::summarize([&self.fp8_tensor_core_path]);
+        summary["kernel"] = crate::kernels::cuda::fp8::tensor_core_summary();
+        summary
     }
 
     /// Enable the vectorized block-FP8 decode GEMV (process-wide) after it
@@ -5977,6 +6013,11 @@ pub(crate) mod tests {
             (
                 "fp8_prefill_gemm",
                 model.fp8_prefill_gemm_summary(),
+                "cuda.fused_decode=off",
+            ),
+            (
+                "fp8_tensor_core",
+                model.fp8_tensor_core_summary(),
                 "cuda.fused_decode=off",
             ),
             (

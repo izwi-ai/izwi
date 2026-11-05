@@ -555,6 +555,7 @@ impl Qwen36MoeChatModel {
             "attn_gate": self.exec.text_model.attn_gate_summary(),
             "fp8_gemv": self.exec.text_model.fp8_gemv_summary(),
             "fp8_prefill_gemm": self.exec.text_model.fp8_prefill_gemm_summary(),
+            "fp8_tensor_core": self.exec.text_model.fp8_tensor_core_summary(),
             "lm_head": self.exec.text_model.lm_head_summary(),
             "cuda_graphs": self.exec.text_model.cuda_graphs_summary(),
             "kernel_timings": self.kernel_timings,

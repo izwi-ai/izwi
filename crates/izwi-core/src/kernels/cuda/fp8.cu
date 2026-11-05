@@ -180,6 +180,125 @@ template<class T,int MR,bool ONCE> __device__ void mv2(const T* x,const unsigned
     if(lane==0 && m<M) y[(size_t)m*N+n]=T(acc[m]*256.f);
   }
 }
+// Tensor-core projection for short spans (SM80+): y[M, N] = x[M, K] . W[N, K]^T
+// with W block-FP8 (E4M3 bytes, an F32 scale per 128x128 block), M <= 64.
+// Each block owns TC_N output channels and a range of whole 128-wide K
+// blocks; its four warps each own 16 channels across every 16-row M tile.
+// Per K block the weights are read once with 16-byte loads and decoded
+// exactly into shared memory (value * 2^-8, which F16 and BF16 hold exactly;
+// the x256 is applied once per output), then multiplied against every M tile
+// with WMMA 16x16x16 into F32. The block scale is applied after each K block,
+// as the reference kernels do. With split K (gridDim.y > 1) each split writes
+// F32 partials [splits, M, N] that qwen38_fp8_tc_reduce sums in split order,
+// so results are deterministic. Requires K % 128 == 0 and 16-byte aligned
+// activation and weight rows.
+#define TC_N 64
+#define TC_K 128
+#define TC_MAX_MT 4
+#define TC_LD (TC_K + 8)
+
+template<class T> __device__ __forceinline__ void fp8_decode16_to(const uint4 q, T* dst) {
+  const unsigned words[4] = {q.x, q.y, q.z, q.w};
+  #pragma unroll
+  for(int i=0;i<4;++i) {
+    float v[4];
+    fp8_decode4(words[i], v);
+    dst[4*i]=T(v[0]); dst[4*i+1]=T(v[1]); dst[4*i+2]=T(v[2]); dst[4*i+3]=T(v[3]);
+  }
+}
+
+template<class T> __device__ void fp8_tc(const T* __restrict__ x,const unsigned char* __restrict__ w,
+    const float* __restrict__ s,T* __restrict__ y,float* __restrict__ partial,int M,int N,int K,
+    int kblocks_per_split) {
+  using namespace nvcuda;
+  __shared__ __align__(32) T a_sh[TC_MAX_MT*16][TC_LD];
+  __shared__ __align__(32) T b_sh[TC_N][TC_LD];
+  __shared__ __align__(32) float out_sh[4][16*16];
+  const int warp=threadIdx.x>>5, lane=threadIdx.x&31;
+  const int n0=blockIdx.x*TC_N;
+  const int split=blockIdx.y;
+  const int kblocks=K/TC_K;
+  const int kb_begin=split*kblocks_per_split;
+  const int kb_end=min(kblocks,kb_begin+kblocks_per_split);
+  const int mtiles=(M+15)/16;
+  // Padding rows of the last M tile stay zero for the whole launch.
+  for(int i=threadIdx.x;i<(mtiles*16-M)*TC_LD;i+=blockDim.x) {
+    a_sh[M+i/TC_LD][i%TC_LD]=T(0.f);
+  }
+  wmma::fragment<wmma::accumulator,16,16,16,float> total[TC_MAX_MT];
+  #pragma unroll
+  for(int mt=0;mt<TC_MAX_MT;++mt) wmma::fill_fragment(total[mt],0.f);
+  for(int kb=kb_begin;kb<kb_end;++kb) {
+    const int k0=kb*TC_K;
+    for(int i=threadIdx.x;i<M*(TC_K/8);i+=blockDim.x) {
+      const int r=i/(TC_K/8), c=(i%(TC_K/8))*8;
+      *reinterpret_cast<uint4*>(&a_sh[r][c])=*reinterpret_cast<const uint4*>(x+(size_t)r*K+k0+c);
+    }
+    for(int i=threadIdx.x;i<TC_N*(TC_K/16);i+=blockDim.x) {
+      const int r=i/(TC_K/16), c=(i%(TC_K/16))*16;
+      const int n=n0+r;
+      if(n<N) {
+        const uint4 q=*reinterpret_cast<const uint4*>(w+(size_t)n*K+k0+c);
+        fp8_decode16_to(q,&b_sh[r][c]);
+      } else {
+        #pragma unroll
+        for(int j=0;j<16;++j) b_sh[r][c+j]=T(0.f);
+      }
+    }
+    __syncthreads();
+    const float scale=s[(size_t)(n0>>7)*kblocks+kb];
+    wmma::fragment<wmma::accumulator,16,16,16,float> part[TC_MAX_MT];
+    #pragma unroll
+    for(int mt=0;mt<TC_MAX_MT;++mt) wmma::fill_fragment(part[mt],0.f);
+    #pragma unroll
+    for(int kk=0;kk<TC_K;kk+=16) {
+      wmma::fragment<wmma::matrix_b,16,16,16,T,wmma::col_major> bf;
+      wmma::load_matrix_sync(bf,&b_sh[warp*16][kk],TC_LD);
+      #pragma unroll
+      for(int mt=0;mt<TC_MAX_MT;++mt) {
+        if(mt<mtiles) {
+          wmma::fragment<wmma::matrix_a,16,16,16,T,wmma::row_major> af;
+          wmma::load_matrix_sync(af,&a_sh[mt*16][kk],TC_LD);
+          wmma::mma_sync(part[mt],af,bf,part[mt]);
+        }
+      }
+    }
+    #pragma unroll
+    for(int mt=0;mt<TC_MAX_MT;++mt) {
+      if(mt<mtiles) {
+        #pragma unroll
+        for(int i=0;i<part[mt].num_elements;++i) total[mt].x[i]=fmaf(part[mt].x[i],scale,total[mt].x[i]);
+      }
+    }
+    __syncthreads();
+  }
+  #pragma unroll
+  for(int mt=0;mt<TC_MAX_MT;++mt) {
+    if(mt<mtiles) {
+      wmma::store_matrix_sync(out_sh[warp],total[mt],16,wmma::mem_row_major);
+      __syncwarp();
+      for(int i=lane;i<256;i+=32) {
+        const int m=mt*16+i/16, n=n0+warp*16+i%16;
+        if(m<M && n<N) {
+          const float v=out_sh[warp][i]*256.f;
+          if(partial) partial[((size_t)split*M+m)*N+n]=v;
+          else y[(size_t)m*N+n]=T(v);
+        }
+      }
+      __syncwarp();
+    }
+  }
+}
+
+// Sum the split-K partials of qwen38_fp8_tc in split order and round once.
+template<class T> __device__ void fp8_tc_reduce(const float* __restrict__ partial,T* __restrict__ y,int splits,int MN) {
+  const int i=blockIdx.x*blockDim.x+threadIdx.x;
+  if(i>=MN) return;
+  float v=0.f;
+  for(int sp=0;sp<splits;++sp) v+=partial[(size_t)sp*MN+i];
+  y[i]=T(v);
+}
+
 // Long-span prefill: output rows [row0, row0 + rows) of a block-FP8 matrix
 // expanded to T (value * block scale, rounded once) into a [rows, K] tile that
 // a dense GEMM (cuBLAS) then multiplies. Elementwise: each thread expands four
@@ -205,6 +324,10 @@ extern "C" __global__ void qwen38_fp8_mv2_bf16(const __nv_bfloat16*x,const unsig
 extern "C" __global__ void qwen38_fp8_mv2x8_f16(const __half*x,const unsigned char*w,const float*s,__half*y,int M,int N,int K){mv2<__half,8,true>(x,w,s,y,M,N,K);}
 extern "C" __global__ void qwen38_fp8_mv2x8_bf16(const __nv_bfloat16*x,const unsigned char*w,const float*s,__nv_bfloat16*y,int M,int N,int K){mv2<__nv_bfloat16,8,true>(x,w,s,y,M,N,K);}
 extern "C" __global__ void qwen38_fp8_mv_f32(const float*x,const unsigned char*w,const float*s,float*y,int M,int N,int K){mv(x,w,s,y,M,N,K);}
+extern "C" __global__ void __launch_bounds__(128) qwen38_fp8_tc_f16(const __half*x,const unsigned char*w,const float*s,__half*y,float*partial,int M,int N,int K,int kps){fp8_tc<__half>(x,w,s,y,partial,M,N,K,kps);}
+extern "C" __global__ void __launch_bounds__(128) qwen38_fp8_tc_bf16(const __nv_bfloat16*x,const unsigned char*w,const float*s,__nv_bfloat16*y,float*partial,int M,int N,int K,int kps){fp8_tc<__nv_bfloat16>(x,w,s,y,partial,M,N,K,kps);}
+extern "C" __global__ void qwen38_fp8_tc_reduce_f16(const float*p,__half*y,int splits,int MN){fp8_tc_reduce<__half>(p,y,splits,MN);}
+extern "C" __global__ void qwen38_fp8_tc_reduce_bf16(const float*p,__nv_bfloat16*y,int splits,int MN){fp8_tc_reduce<__nv_bfloat16>(p,y,splits,MN);}
 
 // Vectorized decode GEMV over F32 activations and outputs, for decoders that
 // keep an F32 residual stream: one warp per output channel, eight channels a
