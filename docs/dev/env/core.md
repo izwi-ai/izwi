@@ -256,6 +256,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_QWEN35_TILED_RECURRENCE` | flag | `true` | model load | Enables the tiled DeltaNet recurrence for Qwen3.5 and Qwen3.6-MoE prefill. |
 | `IZWI_QWEN35_TILED_RECURRENCE_TILE_SIZE` | integer | auto by sequence length (16-64) | model load | Overrides the Qwen3.5/Qwen3.6-MoE tiled DeltaNet recurrence tile size (min 1, capped at sequence length). |
 | `IZWI_QWEN36_BATCHED_GDN` | flag | true (CUDA only) | model load | Kill switch: legacy/off keeps one DeltaNet conv and recurrence launch per row in Qwen3.6 multi-row decode instead of one pair per layer. Also: `legacy` means false. |
+| `IZWI_QWEN36_BATCHED_QK_ROPE` | flag | true (CUDA only) | model load | Kill switch: legacy/off keeps one q/k norm + RoPE launch per row in Qwen3.6 multi-row decode instead of one per attention layer. Also: `legacy` means false. |
 | `IZWI_QWEN36_CHUNKED_GDN` | flag | `true` | model load | Kill switch: legacy/off disables the chunked DeltaNet prefill kernels for Qwen3.6-MoE. Also: `legacy` means false. |
 | `IZWI_QWEN36_CUDA_BF16_KV` | flag | true (CUDA SM 8.0+ only) | model load | Toggles BF16 persistent KV cache storage for Qwen3.6-MoE on CUDA; other backends keep F32. |
 | `IZWI_QWEN36_CUDA_GRAPHS` | flag | `true` | model load | Kill switch: legacy/off disables CUDA graph decode for Qwen3.6-MoE. Also: `legacy` means false. |

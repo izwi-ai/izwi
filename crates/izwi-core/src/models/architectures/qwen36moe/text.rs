@@ -455,6 +455,11 @@ pub(crate) struct Qwen36FullAttention {
     /// inverse frequencies, when resolved at load.
     fused_qk: Option<(QkNormRopeSpec, Tensor)>,
     fused_qk_path: Qwen36FusedPath,
+    /// Every text row of a decode batch through one q/k norm + RoPE launch
+    /// (`rope::qk_norm_rope_kv_rows` into a scratch cache), when it matched
+    /// the per-row launches bit for bit at load.
+    batched_qk: bool,
+    batched_qk_path: Qwen36FusedPath,
     /// `q_proj` + `k_proj` + `v_proj` packed for one decode GEMV.
     packed_qkv: Option<Qwen36Projection>,
     /// Output gate `attn * sigmoid(gate)` in one launch, when resolved at load.
@@ -507,6 +512,10 @@ struct Qwen36LinearAttention {
 /// Environment switch for the fused DeltaNet decode (`legacy`/`off`/`0`
 /// keeps the Candle op chain).
 const FUSED_DECODE_ENV: &str = "IZWI_QWEN36_FUSED_DECODE";
+
+/// Environment switch for the multi-row q/k norm + RoPE launch
+/// (`legacy`/`off`/`0` keeps one launch per row).
+const BATCHED_QK_ROPE_ENV: &str = "IZWI_QWEN36_BATCHED_QK_ROPE";
 
 /// Environment switch for multi-row DeltaNet decode (`legacy`/`off`/`0`
 /// keeps one conv and one recurrence launch per row).
@@ -1382,6 +1391,14 @@ impl Qwen36TextModel {
 
     /// Fused q/k norm + RoPE across the full-attention layers, for the admin
     /// diagnostics.
+    /// Whether multi-row decode norms and rotates q/k in one launch per layer.
+    pub(crate) fn qk_rope_batched_summary(&self) -> serde_json::Value {
+        super::fast_path::summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
+            Qwen36Mixer::Full(attention) => Some(&attention.batched_qk_path),
+            Qwen36Mixer::Linear(_) => None,
+        }))
+    }
+
     pub(crate) fn qk_rope_summary(&self) -> serde_json::Value {
         super::fast_path::summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
             Qwen36Mixer::Full(attention) => Some(&attention.fused_qk_path),
@@ -2457,6 +2474,8 @@ impl Qwen36FullAttention {
             )?,
             fused_qk: None,
             fused_qk_path: Qwen36FusedPath::legacy("unresolved"),
+            batched_qk: false,
+            batched_qk_path: Qwen36FusedPath::legacy("unresolved"),
             packed_qkv: None,
             fused_gate: false,
             fused_gate_path: Qwen36FusedPath::legacy("unresolved"),
@@ -2475,10 +2494,12 @@ impl Qwen36FullAttention {
         match cuda.fused_decode_off {
             Some(reason) => {
                 attention.fused_qk_path = Qwen36FusedPath::legacy(reason);
+                attention.batched_qk_path = Qwen36FusedPath::legacy(reason);
                 attention.fused_gate_path = Qwen36FusedPath::legacy(reason);
             }
             None => {
                 attention.resolve_fused_qk(device, false);
+                attention.resolve_batched_qk(device);
                 attention.resolve_fused_gate(device, false);
             }
         }
@@ -2687,6 +2708,137 @@ impl Qwen36FullAttention {
         let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
         let key_states = self.k_norm.forward(&k_proj.contiguous()?)?;
         self.apply_rope(&query_states, &key_states, position_ids)
+    }
+
+    /// q/k norm + RoPE for every text row in one launch: the KV-writing rows
+    /// kernel writes the rotated keys and the values into a scratch cache of
+    /// one slot per row, from which the arena write takes them as the per-row
+    /// path's stacks. Returns queries `[B, heads, head_dim]`, keys and values
+    /// `[B, kv_heads, head_dim]`, contiguous, in the projection dtype.
+    fn qk_norm_rope_rows(
+        &self,
+        q_proj: &Tensor,
+        key_states: &Tensor,
+        value_states: &Tensor,
+        spec: &QkNormRopeSpec,
+        inv_freq: &Tensor,
+        position_ids: &[[usize; 3]],
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let rows = position_ids.len();
+        let device = q_proj.device();
+        let dtype = q_proj.dtype();
+        let (heads, kv_heads, dim) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        let positions = position_ids
+            .iter()
+            .map(|[temporal, _, _]| u32::try_from(*temporal))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::InvalidInput("Qwen3.6 decode position exceeds u32".into()))?;
+        let positions = Tensor::from_vec(positions, rows, device)?;
+        let slots = Tensor::arange(0u32, rows as u32, device)?;
+        let keys = Tensor::zeros((1, rows, kv_heads, dim), dtype, device)?;
+        let values = keys.zeros_like()?;
+        let queries = rope::qk_norm_rope_kv_rows(
+            &q_proj.reshape((rows, heads * 2 * dim))?,
+            &key_states.reshape((rows, kv_heads * dim))?,
+            &value_states.reshape((rows, kv_heads * dim))?,
+            &self.q_norm.weight,
+            &self.k_norm.weight,
+            inv_freq,
+            spec,
+            &positions,
+            &slots,
+            &keys,
+            &values,
+            rows,
+        )?;
+        Ok((
+            queries.reshape((rows, heads, dim))?,
+            keys.reshape((rows, kv_heads, dim))?,
+            values.reshape((rows, kv_heads, dim))?,
+        ))
+    }
+
+    /// Resolve the multi-row q/k launch after the fused q/k path: on CUDA its
+    /// queries, keys and values must equal the per-row launches bit for bit
+    /// at three text positions. `IZWI_QWEN36_BATCHED_QK_ROPE=legacy` keeps one
+    /// launch per row.
+    fn resolve_batched_qk(&mut self, device: &Device) {
+        self.batched_qk = false;
+        self.batched_qk_path = if legacy_requested(BATCHED_QK_ROPE_ENV) {
+            Qwen36FusedPath::legacy(format!("{BATCHED_QK_ROPE_ENV}=legacy"))
+        } else if !device.is_cuda() {
+            Qwen36FusedPath::legacy("batched q/k norm + RoPE runs on CUDA only")
+        } else if self.fused_qk.is_none() {
+            Qwen36FusedPath::legacy("batched q/k norm + RoPE needs the fused q/k path")
+        } else {
+            match self.batched_qk_self_check(device, DType::BF16) {
+                Ok(()) => {
+                    self.batched_qk = true;
+                    Qwen36FusedPath::Fused
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Qwen3.6 batched q/k norm + RoPE self-check failed; launching per row"
+                    );
+                    Qwen36FusedPath::legacy(format!("self-check failed: {error}"))
+                }
+            }
+        };
+    }
+
+    fn batched_qk_self_check(&self, device: &Device, dtype: DType) -> Result<()> {
+        let (spec, inv_freq) = self
+            .fused_qk
+            .as_ref()
+            .ok_or_else(|| Error::InferenceError("no fused q/k path to compare".into()))?;
+        let (heads, kv_heads, dim) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        let positions = [[5usize; 3], [3000; 3], [200_000; 3]];
+        let rows = positions.len();
+        let values = |len: usize, seed: u64| -> Vec<f32> {
+            let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0) * 2.5
+                })
+                .collect()
+        };
+        let tensor = |shape: &[usize], seed: u64| -> Result<Tensor> {
+            Ok(
+                Tensor::from_vec(values(shape.iter().product(), seed), shape, device)?
+                    .to_dtype(dtype)?,
+            )
+        };
+        let q_proj = tensor(&[rows, 1, heads, 2 * dim], 3)?;
+        let k_proj = tensor(&[rows, 1, kv_heads, dim], 4)?;
+        let v_proj = tensor(&[rows, 1, kv_heads, dim], 5)?;
+        let (queries, keys, value_rows) =
+            self.qk_norm_rope_rows(&q_proj, &k_proj, &v_proj, spec, inv_freq, &positions)?;
+        let host = |tensor: &Tensor| -> Result<Vec<f32>> {
+            Ok(tensor
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?)
+        };
+        for (row, position) in positions.into_iter().enumerate() {
+            let (q, k) = self.token_qk(
+                &q_proj.i(row)?.unsqueeze(0)?,
+                &k_proj.i(row)?.unsqueeze(0)?,
+                position,
+            )?;
+            if host(&queries.i(row)?)? != host(&q.reshape((heads, dim))?)?
+                || host(&keys.i(row)?)? != host(&k.reshape((kv_heads, dim))?)?
+                || host(&value_rows.i(row)?)? != host(&v_proj.i(row)?.reshape((kv_heads, dim))?)?
+            {
+                return Err(Error::InferenceError(format!(
+                    "batched q/k norm + RoPE differs from the per-row launch at {position:?}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn fused_qk_self_check(
@@ -2915,27 +3067,45 @@ impl Qwen36FullAttention {
                 "Qwen3.5 decode received an incompatible prepared slot map".into(),
             ));
         }
-        let mut queries = Vec::with_capacity(batch_size);
-        let mut keys = Vec::with_capacity(batch_size);
-        let mut values = Vec::with_capacity(batch_size);
-        for row in 0..batch_size {
-            let q_row = q_proj.i(row)?.unsqueeze(0)?;
-            let k_row = key_states.i(row)?.unsqueeze(0)?;
-            let (q_row, k_row) = self.token_qk(&q_row, &k_row, position_ids[row])?;
-            queries.push(q_row.reshape((self.num_heads, self.head_dim))?);
-            keys.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
-            values.push(
-                value_states
-                    .i(row)?
-                    .reshape((self.num_kv_heads, self.head_dim))?,
-            );
-        }
-        let query_refs = queries.iter().collect::<Vec<_>>();
-        let key_refs = keys.iter().collect::<Vec<_>>();
-        let value_refs = values.iter().collect::<Vec<_>>();
-        let queries = Tensor::stack(&query_refs, 0)?.contiguous()?;
-        let keys = Tensor::stack(&key_refs, 0)?.contiguous()?;
-        let values = Tensor::stack(&value_refs, 0)?.contiguous()?;
+        let batched = self.batched_qk
+            && batch_size > 1
+            && matches!(q_proj.dtype(), DType::F16 | DType::BF16)
+            && position_ids.iter().all(|[t, h, w]| t == h && t == w);
+        let (queries, keys, values) = match (batched, &self.fused_qk) {
+            (true, Some((spec, inv_freq))) => self.qk_norm_rope_rows(
+                q_proj,
+                key_states,
+                value_states,
+                spec,
+                inv_freq,
+                position_ids,
+            )?,
+            _ => {
+                let mut queries = Vec::with_capacity(batch_size);
+                let mut keys = Vec::with_capacity(batch_size);
+                let mut values = Vec::with_capacity(batch_size);
+                for row in 0..batch_size {
+                    let q_row = q_proj.i(row)?.unsqueeze(0)?;
+                    let k_row = key_states.i(row)?.unsqueeze(0)?;
+                    let (q_row, k_row) = self.token_qk(&q_row, &k_row, position_ids[row])?;
+                    queries.push(q_row.reshape((self.num_heads, self.head_dim))?);
+                    keys.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
+                    values.push(
+                        value_states
+                            .i(row)?
+                            .reshape((self.num_kv_heads, self.head_dim))?,
+                    );
+                }
+                let query_refs = queries.iter().collect::<Vec<_>>();
+                let key_refs = keys.iter().collect::<Vec<_>>();
+                let value_refs = values.iter().collect::<Vec<_>>();
+                (
+                    Tensor::stack(&query_refs, 0)?.contiguous()?,
+                    Tensor::stack(&key_refs, 0)?.contiguous()?,
+                    Tensor::stack(&value_refs, 0)?.contiguous()?,
+                )
+            }
+        };
         let storage_dtype = first.arena().config().dtype;
         let output_dtype = queries.dtype();
         let queries = queries.to_dtype(storage_dtype)?;
@@ -5097,6 +5267,8 @@ pub(crate) mod tests {
             rope_inv_freqs: super::build_rope_inv_freqs(16, 10_000_000.0).unwrap(),
             fused_qk: None,
             fused_qk_path: Qwen36FusedPath::legacy("test"),
+            batched_qk: false,
+            batched_qk_path: Qwen36FusedPath::legacy("test"),
             packed_qkv: None,
             fused_gate: false,
             fused_gate_path: Qwen36FusedPath::legacy("test"),
@@ -5147,6 +5319,20 @@ pub(crate) mod tests {
                 &format!("k at {position:?}"),
             );
         }
+    }
+
+    /// The multi-row q/k launch's plumbing reproduces the per-row launches
+    /// row by row; on the CPU the rows kernel runs the one-row body, so this
+    /// checks the positions, scratch slots and value copy.
+    #[test]
+    fn batched_qk_rows_match_the_per_row_launches() {
+        let mut attention = attention_for_qk(vec![11, 11, 10]);
+        attention.resolve_fused_qk(&Device::Cpu, true);
+        attention
+            .batched_qk_self_check(&Device::Cpu, DType::F16)
+            .unwrap();
+        attention.resolve_batched_qk(&Device::Cpu);
+        assert!(!attention.batched_qk, "production resolves it on CUDA only");
     }
 
     #[test]
@@ -5773,6 +5959,11 @@ pub(crate) mod tests {
             (
                 "gdn_batched_decode",
                 model.gdn_batched_decode_summary(),
+                "cuda.fused_decode=off",
+            ),
+            (
+                "qk_rope_batched",
+                model.qk_rope_batched_summary(),
                 "cuda.fused_decode=off",
             ),
             (

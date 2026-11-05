@@ -542,6 +542,7 @@ impl Qwen36MoeChatModel {
             "moe_prefill": self.exec.text_model.moe_prefill_summary(),
             "rms_norm": self.exec.text_model.rms_norm_summary(),
             "qk_rope": self.exec.text_model.qk_rope_summary(),
+            "qk_rope_batched": self.exec.text_model.qk_rope_batched_summary(),
             "attn_gate": self.exec.text_model.attn_gate_summary(),
             "fp8_gemv": self.exec.text_model.fp8_gemv_summary(),
             "fp8_prefill_gemm": self.exec.text_model.fp8_prefill_gemm_summary(),
