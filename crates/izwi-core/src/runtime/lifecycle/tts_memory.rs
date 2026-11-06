@@ -711,7 +711,8 @@ fn price_voxtral_tts(
 #[cfg(test)]
 mod tests {
     use super::super::asr_memory::tests::{
-        assert_gib, env_lock, fixture, gib, profile, stored, temp_dir, write_vibevoice_checkpoint,
+        assert_catalog_figures_cover_empty_devices, assert_gib, empty_device_requirement, env_lock,
+        fixture, gib, profile, stored, temp_dir, write_vibevoice_checkpoint,
     };
     use super::*;
     use crate::engine::ResourceAmount;
@@ -810,6 +811,19 @@ mod tests {
             })
         });
         fixture(&serde_json::json!({ "files": files }).to_string())
+    }
+
+    /// VibeVoice 1.5B's per-backend catalog figures cover what its published
+    /// checkpoint needs free on an empty device (`empty_device_requirement`):
+    /// 6.0 GiB on Metal, where the one 12 GiB figure hid it on 16 GB Macs,
+    /// against 11.1 GiB for the CPU's F32 load.
+    #[test]
+    fn tts_catalog_figures_cover_an_empty_device() {
+        let _env = env_lock();
+        let variant = ModelVariant::VibeVoice15BTts;
+        let requirements =
+            BACKENDS.map(|backend| empty_device_requirement(variant, &vibevoice(backend), backend));
+        assert_catalog_figures_cover_empty_devices(&[(variant, requirements)]);
     }
 
     /// Report 08 table B, resident weights per backend (CPU, Metal as

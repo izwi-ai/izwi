@@ -23,9 +23,23 @@ pub(super) fn qwen38_representation_memory_estimate(
 }
 
 pub(super) fn model_memory_estimate(variant: ModelVariant) -> ModelMemoryEstimate {
+    catalog_memory_estimate(variant, variant.memory_required_gb())
+}
+
+/// [`model_memory_estimate`] by the catalog's figure for `backend`
+/// (`ModelVariant::memory_required_gb_on`): what a model is judged by on
+/// this device before its checkpoint is on disk.
+pub(super) fn backend_model_memory_estimate(
+    variant: ModelVariant,
+    backend: BackendKind,
+) -> ModelMemoryEstimate {
+    catalog_memory_estimate(variant, variant.memory_required_gb_on(backend))
+}
+
+fn catalog_memory_estimate(variant: ModelVariant, memory_required_gb: f32) -> ModelMemoryEstimate {
     const GIB: u64 = 1024 * 1024 * 1024;
 
-    let inference_bytes = (variant.memory_required_gb() as f64 * GIB as f64).ceil() as u64;
+    let inference_bytes = (memory_required_gb as f64 * GIB as f64).ceil() as u64;
     let base = ModelMemoryEstimate {
         load_peak_bytes: inference_bytes,
         resident_bytes: inference_bytes,
@@ -102,11 +116,13 @@ pub(super) fn checkpoint_resource_plan(
 }
 
 /// Static load peak of `variant` on `backend`: what the app shows a model
-/// needs, and what decides whether a Metal OOM retry can fit. The catalog's
-/// `memory_required_gb` is one coarse figure for every backend (80 GiB for
-/// Qwen3.8, 140 GiB for Qwen3.6, sized for the CPU F32 expansion); these
-/// checkpoints use the per-backend representation estimate that load
-/// admission prices instead, which needs no file on disk. A planned
+/// needs, and what decides whether a Metal OOM retry can fit. Without a
+/// checkpoint it is the catalog's figure for `backend`
+/// (`memory_required_gb_on`: one figure for most models, one per backend for
+/// the ASR models and VibeVoice 1.5B). Qwen3.8 and Qwen3.6 instead use the
+/// per-backend representation estimate that load admission prices, which
+/// needs no file on disk (their catalog figures, 80 and 140 GiB, are sized
+/// for the CPU F32 expansion). A planned
 /// checkpoint (`checkpoint`: its path and the load device; Fish, ASR and TTS)
 /// is judged by the plan first admission priced
 /// ([`checkpoint_resource_plan`], with the engine's Granite overrides).
@@ -120,7 +136,7 @@ pub(super) fn static_load_peak_bytes(
         &crate::config::GraniteSpeechOptions,
     )>,
 ) -> u64 {
-    let catalog = || model_memory_estimate(variant).load_peak_bytes;
+    let catalog = || backend_model_memory_estimate(variant, backend).load_peak_bytes;
     if let Some((model_path, device, granite)) = checkpoint {
         if let Ok(Some(plan)) = checkpoint_resource_plan(variant, model_path, device, granite) {
             if let ResourceAmount::Known(bytes) =

@@ -62,17 +62,17 @@ use admission::{
     admit_cuda_state_floor, load_authorization_with_request_floor, portable_preload_bytes,
     reconcile_observed_growth,
 };
+#[cfg(test)]
+use checkpoint::{
+    backend_model_memory_estimate, checkpoint_census, estimate_from_tensor_inventory,
+    fish_s2_resource_plan, qwen38_representation_memory_estimate, CheckpointCensus,
+};
 use checkpoint::{
     census_checkpoint_file, checkpoint_resource_plan, checkpoint_tensor_inventory,
     model_memory_estimate, model_resource_plan, portable_model_memory_estimate,
     qwen38_synthetic_fixture_estimate, static_load_peak_bytes, CensusFile, CensusTensor,
     StoredDType, PER_TENSOR_INSTANTIATION_SLACK_BYTES, QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES,
     QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES, QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES,
-};
-#[cfg(test)]
-use checkpoint::{
-    checkpoint_census, estimate_from_tensor_inventory, fish_s2_resource_plan,
-    qwen38_representation_memory_estimate, CheckpointCensus,
 };
 use invocation::{invocation_state_bytes, LaterStateGroups};
 #[cfg(test)]

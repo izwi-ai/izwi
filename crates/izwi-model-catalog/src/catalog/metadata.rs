@@ -857,7 +857,8 @@ impl ModelVariant {
         }
     }
 
-    /// Memory required for inference
+    /// Memory required for inference, in GiB: for a model with a figure per
+    /// backend ([`Self::memory_required_gb_on`]), the largest of them.
     pub fn memory_required_gb(&self) -> f32 {
         match self {
             Self::Qwen3Tts12Hz06BBase
@@ -873,23 +874,26 @@ impl ModelVariant {
             | Self::Qwen3Tts12Hz17BVoiceDesignBf16 => 6.0,
             Self::Qwen3TtsTokenizer12Hz => 1.0,
             Self::Lfm2512BInstructGguf | Self::Lfm2512BThinkingGguf => 2.0,
-            Self::Lfm25Audio15BGguf => 5.0,
+            // The ASR models and VibeVoice 1.5B: the largest of their
+            // per-backend figures (`memory_required_gb_by_backend`).
+            Self::Lfm25Audio15BGguf => 2.5,
             Self::Lfm317BGguf => 2.0,
             Self::Lfm317BQ8Gguf => 3.0,
             Self::Lfm3Audio2BGguf => 3.0,
             Self::Lfm3Audio2BQ8Gguf => 4.0,
             Self::Kokoro82M => 2.0,
-            Self::ParakeetTdt06BV3 => 12.0,
-            Self::WhisperLargeV3Turbo => 4.0,
-            Self::Qwen3Asr06BGguf => 4.0,
-            Self::Qwen3Asr17BGguf => 8.0,
-            Self::VibeVoiceAsr => 36.0,
-            Self::Nemotron35AsrStreaming06B => 6.0,
+            Self::ParakeetTdt06BV3 => 4.0,
+            Self::WhisperLargeV3Turbo => 4.5,
+            Self::Qwen3Asr06BGguf => 2.5,
+            Self::Qwen3Asr17BGguf => 4.0,
+            Self::VibeVoiceAsr => 32.5,
+            Self::Nemotron35AsrStreaming06B => 4.0,
             // Same architecture as plus; base's untied head adds 0.4 GB BF16.
-            Self::GraniteSpeech412B | Self::GraniteSpeech412BPlus => 10.0,
+            Self::GraniteSpeech412B => 10.0,
+            Self::GraniteSpeech412BPlus => 9.0,
             // The same weights as 4.1 with a 16k-token decoder context.
-            Self::GraniteSpeech502B => 12.0,
-            Self::GraniteSpeech502BGguf => 8.0,
+            Self::GraniteSpeech502B => 10.0,
+            Self::GraniteSpeech502BGguf => 5.0,
             // About 31 GiB resident as raw FP8 on Metal and CUDA, 33 GiB as
             // CPU Q8_0, before rows.
             Self::Nemotron35Transcribe30BA4BFp8 => 36.0,
@@ -905,10 +909,18 @@ impl ModelVariant {
             Self::Qwen317B4Bit => 3.0,
             Self::Qwen314BGguf => 16.0,
             Self::Qwen3Moe30bA3bGguf => 32.0,
-            Self::Qwen3508BGguf => 3.5,
-            Self::Qwen352BGguf => 5.5,
-            Self::Qwen354BGguf => 9.0,
-            Self::Qwen359BGguf => 16.0,
+            // Qwen3.5 GGUF: what a load needs free on an empty device on the
+            // backend that needs most (the CPU, which holds the vision tower
+            // in F32; Metal and CUDA keep its linears in F16 and the text
+            // weights quantized everywhere): the residents beside the 1 GiB
+            // context reserve, rounded up to the next half GiB. The app
+            // checks device fit against this before a download, so the
+            // `qwen35_catalog_figures_follow_the_checkpoints` test pins it to
+            // the published headers. CUDA admits by it too.
+            Self::Qwen3508BGguf => 2.0,
+            Self::Qwen352BGguf => 3.5,
+            Self::Qwen354BGguf => 5.0,
+            Self::Qwen359BGguf => 8.0,
             // Backend-specific admission replaces this coarse catalog hint:
             // packed FP8 CUDA needs less, while the CPU F32 fallback needs more.
             // No load path reads it as Qwen3.8's footprint, and the app's
@@ -926,9 +938,9 @@ impl ModelVariant {
             // The aligner expands to F32 on the CPU (3.42 GiB); Metal (F16
             // text) holds 2.69 GiB and CUDA (BF16 text) 2.30 GiB.
             Self::Qwen3ForcedAligner06B => 3.5,
-            Self::VoxtralMini4BRealtime2602 => 16.0,
+            Self::VoxtralMini4BRealtime2602 => 18.5,
             Self::Voxtral4BTts2603 => 16.0,
-            Self::VibeVoice15BTts => 12.0,
+            Self::VibeVoice15BTts => 11.5,
             Self::FishAudioS2Pro => 24.0,
             // About 37.4 GiB resident as raw FP8 experts with F16/BF16 dense
             // weights on Metal and CUDA (37.2 GiB as CPU Q8_0), the F32 codec
@@ -949,6 +961,49 @@ impl ModelVariant {
             // 2,048-position request.
             Self::Maya2Native25B => 7.0,
         }
+    }
+
+    /// The memory a load of the model needs free on an otherwise empty
+    /// `backend` device, in GiB: what the app shows and checks device fit
+    /// against before the model is downloaded. It is
+    /// [`Self::memory_required_gb`] on every backend unless the model has a
+    /// figure per backend.
+    pub fn memory_required_gb_on(&self, backend: crate::BackendKind) -> f32 {
+        let Some([cpu, metal, cuda]) = self.memory_required_gb_by_backend() else {
+            return self.memory_required_gb();
+        };
+        match backend {
+            crate::BackendKind::Cpu => cpu,
+            crate::BackendKind::Metal => metal,
+            crate::BackendKind::Cuda => cuda,
+        }
+    }
+
+    /// `[CPU, Metal, CUDA]` figures for models whose need differs by backend:
+    /// these speech checkpoints load F32 on the CPU, at up to twice their
+    /// accelerator size, so one figure either hides them on a Mac that fits
+    /// them or under-prices the CPU. Each is what load admission prices from
+    /// the published checkpoint: its load peak, or its residents beside one
+    /// request and the 1 GiB context reserve (Nemotron's memo is added on
+    /// top), rounded up to the next half GiB. izwi-core's
+    /// `*_catalog_figures_cover_an_empty_device` tests pin them to the
+    /// checkpoints' headers.
+    fn memory_required_gb_by_backend(&self) -> Option<[f32; 3]> {
+        Some(match self {
+            Self::ParakeetTdt06BV3 => [4.0, 3.0, 3.0],
+            Self::Nemotron35AsrStreaming06B => [4.0, 3.0, 1.5],
+            Self::WhisperLargeV3Turbo => [4.5, 3.0, 2.0],
+            Self::Qwen3Asr06BGguf => [2.5, 2.5, 1.5],
+            Self::Qwen3Asr17BGguf => [4.0, 3.5, 3.0],
+            Self::GraniteSpeech412BPlus => [9.0, 5.5, 4.5],
+            Self::GraniteSpeech412B | Self::GraniteSpeech502B => [10.0, 6.0, 4.5],
+            Self::GraniteSpeech502BGguf => [5.0, 4.0, 3.0],
+            Self::VibeVoiceAsr => [32.5, 17.5, 16.0],
+            Self::VoxtralMini4BRealtime2602 => [18.5, 10.0, 9.0],
+            Self::Lfm25Audio15BGguf => [2.5, 2.5, 1.5],
+            Self::VibeVoice15BTts => [11.5, 6.5, 5.5],
+            _ => return None,
+        })
     }
 
     /// Whether this is a tokenizer/codec model
@@ -2118,6 +2173,20 @@ mod tests {
 
     use super::{ChatReasoningEffort, ModelVariant, SpeechModelCapabilities};
 
+    /// A model's single memory figure is the largest of its per-backend
+    /// ones, so a display that shows one figure never understates a backend.
+    #[test]
+    fn memory_figure_is_the_largest_per_backend_figure() {
+        use crate::BackendKind;
+        for variant in ModelVariant::all() {
+            let largest = [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda]
+                .map(|backend| variant.memory_required_gb_on(backend))
+                .into_iter()
+                .fold(0.0_f32, f32::max);
+            assert_eq!(variant.memory_required_gb(), largest, "{variant}");
+        }
+    }
+
     /// TPIPE-22: the announced realtime rate is each family's real output
     /// rate (Fish's codec runs at 44.1 kHz; izwi-core checks the hint
     /// against the codec's own configuration).
@@ -2733,7 +2802,7 @@ mod tests {
         assert_eq!(variant.dir_name(), "Nemotron-3.5-ASR-Streaming-0.6B");
         assert_eq!(variant.license_label(), Some("OpenMDW-1.1"));
         assert!(!variant.is_quantized());
-        assert_eq!(variant.memory_required_gb(), 6.0);
+        assert_eq!(variant.memory_required_gb(), 4.0);
     }
 
     #[test]
@@ -2753,9 +2822,10 @@ mod tests {
             variant.artifact_revision(),
             Some("de575db64086f84fdc79da4932d1076e965bc546")
         );
-        assert_eq!(
-            variant.memory_required_gb(),
-            ModelVariant::GraniteSpeech412BPlus.memory_required_gb()
+        // The base's untied head (0.4 GB BF16, twice that in F32 on the
+        // CPU) needs more than the plus's tied one.
+        assert!(
+            variant.memory_required_gb() > ModelVariant::GraniteSpeech412BPlus.memory_required_gb()
         );
         assert_eq!(variant.license_label(), Some("Apache-2.0"));
         // Speaker turns are a plus-only capability.

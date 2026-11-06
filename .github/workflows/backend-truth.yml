@@ -344,22 +344,14 @@ jobs:
           retention-days: 90
 
   cargo-metal:
-    name: Cargo Validation (${{ matrix.contract }})
-    runs-on: ${{ matrix.os }}
+    name: Cargo Validation (macOS 15+ Metal)
+    # GitHub retired its last macOS 12-14 runner (macos-14) on 2026-11-02, so
+    # no hosted lane can run the CPU fallback on a real pre-15 macOS any more.
+    runs-on: macos-15
     # The Metal lane's izwi-core and izwi-server suites alone take about 40
     # minutes on a cold cache since Fish Audio Drama 3, before the worker
     # parity build and the KV matrix run.
     timeout-minutes: 75
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-14
-            contract: macOS 12-14 CPU fallback
-            command: cargo-metal-fallback
-          - os: macos-15
-            contract: macOS 15+ Metal
-            command: cargo-metal
     env:
       MACOSX_DEPLOYMENT_TARGET: "12.0"
 
@@ -380,7 +372,7 @@ jobs:
             . -> target
 
       - name: Run Metal backend validation
-        run: scripts/ci/check-backend-truth.sh ${{ matrix.command }}
+        run: scripts/ci/check-backend-truth.sh cargo-metal
 
   docker-cpu:
     name: Docker Build (CPU)
