@@ -1,0 +1,17 @@
+norm {"connection_epoch":0,"owner_instance_id":"<volatile>","protocol":"voice_realtime_v1","resumable":false,"resume_window_ms":0,"session_id":"<volatile>","type":"session_ready"}
+text {"output_audio_format":"pcm_i16","type":"input_stream_ready","vad":{"backend":"earshot","barge_in_min_speech_ms":300,"min_speech_ms":50,"score_frame_ms":16.0,"score_sample_rate":16000,"silence_duration_ms":400,"snr_margin_db":0.0,"threshold":0.009999999776482582}}
+norm {"elapsed_ms":"<volatile>","models":[{"error":"Model not found: Model Parakeet TDT 0.6B v3 not downloaded. Please download it first.","model_id":"Parakeet-TDT-0.6B-v3","ready":false,"stage":"asr"},{"error":"Model not found: Model Qwen3.5 0.8B GGUF not downloaded. Please download it first.","model_id":"Qwen3.5-0.8B","ready":false,"stage":"text"},{"error":"Model not found: Model Kokoro 82M not downloaded. Please download it first.","model_id":"Kokoro-82M","ready":false,"stage":"tts"}],"type":"models_ready"}
+text {"type":"user_speech_start","utterance_id":"utt-1","utterance_seq":1}
+text {"action":"continue","expected_frame_sequence":13,"missing_frames":1,"received_frame_sequence":14,"type":"input_sequence_gap"}
+text {"reason":"stream_stopped","type":"user_speech_end","utterance_id":"utt-1","utterance_seq":1}
+text {"type":"input_stream_stopped"}
+text {"type":"turn_processing","utterance_id":"utt-1","utterance_seq":1}
+text {"type":"user_transcript_start","utterance_id":"utt-1","utterance_seq":1}
+text {"code":"model_unavailable","message":"Failed to load ASR model: Model not found: Model Parakeet TDT 0.6B v3 not downloaded. Please download it first.","type":"error","utterance_id":"utt-1","utterance_seq":1}
+text {"status":"error","type":"turn_done","utterance_id":"utt-1","utterance_seq":1}
+text {"code":null,"message":"No assistant reply of utterance 99 to truncate","type":"error","utterance_id":null,"utterance_seq":null}
+text {"audio_end_ms":10,"text":"","type":"conversation_item_truncated","utterance_seq":1}
+text {"reason":"client_interrupt","type":"turn_interrupted","utterance_id":"utt-1","utterance_seq":1}
+text {"code":null,"message":"No tool call `call_x` awaits an output (unknown, settled or timed out)","type":"error","utterance_id":null,"utterance_seq":null}
+norm {"server_time_ms":"<volatile>","timestamp_ms":"<volatile>","type":"pong"}
+text {"code":null,"message":"Invalid websocket payload: unknown variant `no_such_event`, expected one of `session_start`, `input_stream_start`, `input_stream_stop`, `function_call_output`, `interrupt`, `conversation.item.truncate`, `conversation_item_truncate`, `ping` at line 1 column 23","type":"error","utterance_id":null,"utterance_seq":null}

@@ -74,6 +74,10 @@ pub struct GatewayState {
     /// Realtime relay surface (DS3.6). `None` keeps the gateway
     /// byte-identical to the pre-realtime shape.
     pub realtime_relay: Option<std::sync::Arc<crate::app::realtime_relay::GatewayRealtimeRelay>>,
+    /// OpenAI Realtime pass-through to izwi-servers (`/v1/realtime`). `None`
+    /// leaves the route off.
+    pub openai_realtime:
+        Option<std::sync::Arc<crate::app::openai_realtime_proxy::OpenAiRealtimeUpstreams>>,
     /// The adopted approvals view, for the admin status route.
     approvals: Option<crate::gateway_shared_approvals::GatewayApprovalsReporter>,
     /// Set during the pre-stop window: readiness reports draining while
@@ -114,6 +118,7 @@ impl GatewayState {
             body_read_timeout: DEFAULT_GATEWAY_BODY_READ_TIMEOUT,
             metrics: GatewayMetrics::default(),
             realtime_relay: None,
+            openai_realtime: None,
             approvals: None,
             prestop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stream_shutdown,
@@ -232,6 +237,16 @@ impl GatewayState {
         relay: crate::app::realtime_relay::GatewayRealtimeRelay,
     ) -> Self {
         self.realtime_relay = Some(std::sync::Arc::new(relay));
+        self
+    }
+
+    /// Serve OpenAI Realtime at `/v1/realtime` by handing each session to
+    /// one of `upstreams` (izwi-servers).
+    pub fn with_openai_realtime(
+        mut self,
+        upstreams: crate::app::openai_realtime_proxy::OpenAiRealtimeUpstreams,
+    ) -> Self {
+        self.openai_realtime = Some(std::sync::Arc::new(upstreams));
         self
     }
 
@@ -717,6 +732,7 @@ fn gateway_route_label(path: &str) -> &'static str {
     match path {
         "/v1/chat/completions" => "/v1/chat/completions",
         "/v1/realtime/ws" => "/v1/realtime/ws",
+        "/v1/realtime" => "/v1/realtime",
         "/v1/speech-to-text/realtime/ws" => "/v1/speech-to-text/realtime/ws",
         "/livez" => "/livez",
         "/readyz" => "/readyz",
@@ -1444,6 +1460,19 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &GatewayServeCon
                 .route(
                     "/speech-to-text/realtime/ws",
                     get(crate::app::realtime_relay::relay_socket),
+                )
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    bounded_gateway_admission,
+                )),
+        );
+    }
+    if state.openai_realtime.is_some() {
+        inference_routes = inference_routes.merge(
+            Router::new()
+                .route(
+                    "/realtime",
+                    get(crate::app::openai_realtime_proxy::proxy_socket),
                 )
                 .layer(middleware::from_fn_with_state(
                     state.clone(),

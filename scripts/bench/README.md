@@ -522,6 +522,23 @@ scripts/bench/run-voice-realtime-load.py --base-url http://127.0.0.1:8080 \
     --metrics-url http://127.0.0.1:8080/v1/metrics/prometheus --json-out target/voice-load.json
 ```
 
+`--protocol openai` runs the same voice turns over the OpenAI Realtime socket,
+`/v1/realtime?model=<--realtime-model>`. It sends 24 kHz PCM16 appends with
+`server_vad` and the same silence window, and takes the same marks from
+`input_audio_buffer.speech_stopped`, the input transcription's `completed`, the
+first `response.output_audio.delta` and `response.done`. A chat model id (the
+default is `--text-model`) runs with the server's default ASR and TTS,
+Parakeet-TDT-0.6B-v3 and Kokoro-82M. Those are this script's defaults too, so
+two runs that differ only in `--protocol` compare the protocols on one stack:
+
+```bash
+for protocol in izwi openai; do
+  scripts/bench/run-voice-realtime-load.py --base-url http://127.0.0.1:8080 \
+      --protocol "$protocol" --sessions 8 --turns 4 --text-model Qwen3.5-9B \
+      --json-out "target/voice-load-$protocol-c8.json"
+done
+```
+
 With `--metrics-url` the report also carries the server's voice latency
 histograms (`izwi_voice_turn_first_audio_seconds` and the ASR, reply and TTS
 stages) as p50/p95 of their bucket deltas over the run. Run one warm-up

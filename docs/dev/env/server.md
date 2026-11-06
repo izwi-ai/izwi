@@ -36,6 +36,9 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_MAX_BATCH_REQUESTS` | the global request limit minus one | Concurrent batch-class requests. |
 | `IZWI_MAX_BACKGROUND_REQUESTS` | the global request limit minus one | Concurrent background-class requests. |
 | `IZWI_MAX_REALTIME_SESSIONS` | `32` | Open realtime websocket sessions. |
+| `IZWI_REALTIME_PROFILES` | `unset` | Extra OpenAI Realtime profiles `?model=` can name: a JSON array of `{id, asr_model_id, text_model_id, tts_model_id}` (modular) or `{id, s2s_model_id}` (speech-to-speech), each with an optional default `voice`; an id equal to a built-in (`izwi-voice`, `izwi-voice-compact`) replaces it. |
+| `IZWI_REALTIME_DEFAULT_PROFILE` | ``izwi-voice`` | The OpenAI Realtime profile a session gets when `model` is absent, empty or an OpenAI model name (`gpt-realtime*`). |
+| `IZWI_REALTIME_PERSIST` | `off` | `1` records OpenAI Realtime sessions and their turns in the voice history; off, they leave nothing behind. |
 | `IZWI_MAX_RESPONSE_STORE_ENTRIES` | `512` | Stored Responses API responses kept in memory. |
 | `IZWI_MAX_AGENT_SESSION_STORE_ENTRIES` | `512` | Agent sessions kept in memory. |
 | `IZWI_OPENAI_COMPAT_PROFILE` | `strict` | OpenAI compatibility profile: `strict` or `relaxed`. |

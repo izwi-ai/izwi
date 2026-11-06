@@ -1150,6 +1150,39 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Upgrade to the preview voice realtime WebSocket protocol.",
         websocket_response(),
     );
+    add_operation(
+        paths,
+        "/v1/realtime",
+        "get",
+        "Realtime",
+        "Open OpenAI Realtime WebSocket",
+        "Upgrade to an OpenAI Realtime (GA) session: JSON events with base64 24 kHz PCM16 or G.711 \
+         audio. `?model=` selects a realtime profile (a modular ASR, chat and TTS stack, or a \
+         speech-to-speech model); OpenAI model names select the default profile. \
+         `?intent=transcription` opens a transcription session.",
+        websocket_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/realtime/client_secrets",
+        "post",
+        "Realtime",
+        "Create a realtime client secret",
+        "Mint an ephemeral `ek_` key, bound to a session config, that admits `/v1/realtime` for \
+         10 seconds to 2 hours (default 10 minutes). Browsers present it as the \
+         `openai-insecure-api-key.<key>` WebSocket subprotocol.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/realtime/capabilities",
+        "get",
+        "Realtime",
+        "List realtime capabilities",
+        "The realtime profiles `model` may name, the voices, audio formats and turn detection \
+         types, and the session limits.",
+        preview_response(),
+    );
 }
 
 fn add_speech_history_family(

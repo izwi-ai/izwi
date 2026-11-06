@@ -5,6 +5,7 @@
 pub mod chat;
 pub mod chat_content;
 pub mod fleet_coordinator;
+pub mod openai_realtime_proxy;
 pub mod prefix_router;
 pub mod realtime_protocol;
 pub mod realtime_relay;

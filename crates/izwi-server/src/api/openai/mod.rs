@@ -5,6 +5,7 @@ pub mod chat;
 pub mod compat;
 pub use izwi_gateway::api::openai::convert;
 pub mod models;
+pub mod realtime;
 pub mod responses;
 pub(crate) use izwi_gateway::api::openai::tool_calls;
 pub(crate) use izwi_gateway::api::openai::tool_response;
@@ -18,6 +19,7 @@ pub fn router() -> Router<AppState> {
         .merge(audio::router())
         .merge(chat::router())
         .merge(models::router())
+        .merge(realtime::router())
         .merge(responses::router())
 }
 

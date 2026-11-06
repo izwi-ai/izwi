@@ -34,6 +34,7 @@ When `izwi serve` is running:
 | `/v1/metrics/batch-runtime` | Preview | Durable batch runtime queue, job, stage, and worker telemetry. |
 | `/v1/admin/*` | Preview | Local model-management APIs. Bind carefully on shared hosts. |
 | WebSocket realtime routes | Preview | Browser-facing low-latency protocols that may evolve. |
+| `/v1/realtime`, `/v1/realtime/client_secrets` | Preview | OpenAI Realtime API (GA) over WebSocket, served by local models. |
 | `/internal/*` aliases | Internal | Compatibility aliases for tooling. Prefer `/v1/*` or root probes where available. |
 
 ## Common Conventions
@@ -193,7 +194,8 @@ after a restart.
 The gateway serves chat completions only: `/v1/audio/*` and `/v1/responses`
 answer `404` there, because the worker protocol has no unary speech or
 Responses invocation. Use a local-role server for those routes (realtime
-speech goes through the gateway's realtime socket).
+speech goes through the gateway's realtime socket, and OpenAI Realtime
+sessions through its `/v1/realtime` pass-through to izwi-servers).
 
 The gateway is the standalone `izwi-gateway` binary, which runs no model, or
 `izwi-server --role gateway`; both serve the same API. Its `/openapi.json`
@@ -1820,3 +1822,69 @@ How a unified turn with tools runs (LFM3-Audio):
 - Text events and the remembered reply carry what the reply says, never its call markup. Audio chunk numbers count on across rounds, and only the last round's last chunk is marked final.
 
 Voice realtime persists voice sessions and turns in the local store. Modular turns can also update observational memory when that feature is enabled.
+
+## OpenAI Realtime API
+
+`GET /v1/realtime` speaks the OpenAI Realtime API (GA) over WebSocket, so an unmodified OpenAI Realtime client holds a speech-to-speech session with local models: the OpenAI SDKs, LiveKit Agents' OpenAI realtime plugin and Pipecat's OpenAI realtime service. Point the client's base URL at Izwi:
+
+```python
+from openai import AsyncOpenAI
+
+client = AsyncOpenAI(base_url="http://127.0.0.1:8080/v1", api_key="your-izwi-key")
+async with client.realtime.connect(model="izwi-voice") as connection:
+    ...
+```
+
+LiveKit: `openai.realtime.RealtimeModel(base_url="http://127.0.0.1:8080/v1", ...)`. Pipecat: `OpenAIRealtimeLLMService(base_url="ws://127.0.0.1:8080/v1/realtime", ...)`.
+
+Events are the GA protocol's: `session.update`, `input_audio_buffer.*`, `conversation.item.*` (create, retrieve, truncate, delete), `response.create` and `response.cancel` from the client; `session.*`, `conversation.*`, `input_audio_buffer.*`, input transcription, `response.*` (output items, content parts, audio, transcript and text deltas, function-call arguments) and `error` from the server. The beta interface (`OpenAI-Beta: realtime=v1`, flat session fields) is not served: OpenAI retired it.
+
+### Choosing models with `model`
+
+`?model=` names a realtime profile:
+
+| `model` | Session |
+| --- | --- |
+| `izwi-voice` (the default) | Modular: Parakeet-TDT-0.6B-v3 → Qwen3.5-4B → Kokoro-82M |
+| `izwi-voice-compact` | Speech-to-speech: LFM3-Audio-2B-GGUF |
+| an audio-chat model id (`LFM3-Audio-2B-GGUF`, `LFM2.5-Audio-1.5B-GGUF`) | Speech-to-speech with that model |
+| a chat model id (`Qwen3.5-9B`) | Modular, with that chat model and the default ASR and TTS |
+| an OpenAI model name (`gpt-realtime`, `gpt-realtime-2.1`, `gpt-4o-realtime-preview`), or none | The default profile (`IZWI_REALTIME_DEFAULT_PROFILE`) |
+
+`IZWI_REALTIME_PROFILES` adds profiles (a JSON array of `{id, asr_model_id, text_model_id, tts_model_id}` or `{id, s2s_model_id}`). An unknown `model` refuses the upgrade with `400`. The resolved models are in the upgrade response's `x-izwi-realtime-profile` header, and `GET /v1/realtime/capabilities` lists the profiles, voices, audio formats and limits.
+
+### Audio, voices and turns
+
+- Audio is base64 in JSON: `audio/pcm` at 24 kHz (16-bit mono), or G.711 `audio/pcmu` / `audio/pcma` at 8 kHz, in both directions. Speech from a model at another rate is resampled to 24 kHz; output deltas carry at most 100 ms each.
+- `audio.output.voice` takes OpenAI's names (`alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`, `marin`, `cedar`), mapped onto each TTS model's own voices; any other name is the model's own voice (`af_heart` for Kokoro). `{"id": "<saved voice id>"}` speaks in a saved voice when the profile's TTS model clones voices. The voice is fixed once the session has spoken. `speed` is accepted and ignored.
+- `turn_detection` is `server_vad` (the default; threshold, `prefix_padding_ms`, `silence_duration_ms`, `idle_timeout_ms`, `create_response`, `interrupt_response`), `semantic_vad` (its `eagerness` picks the trailing-silence window: `high` 350 ms, `medium`/`auto` 800 ms, `low` 1500 ms), or `null` for manual turns (`input_audio_buffer.commit`, then `response.create`). Voice activity is Izwi's VAD; `input_audio_buffer.speech_started` is sent once speech is confirmed (about 300 ms of voiced speech) and dated back to where it began, and with `interrupt_response` it cancels the response in progress.
+- `audio.input.transcription` turns on `conversation.item.input_audio_transcription.*` events. OpenAI transcription model names (`whisper-1`, `gpt-4o-mini-transcribe`, …) run on the profile's ASR; an Izwi ASR model id picks that model.
+
+### Responses, tools and history
+
+- Responses run on the conversation's items. Clients may add items with `conversation.item.create` (`previous_item_id`, `"root"`), including `function_call` and `function_call_output` items; `response.create` takes `instructions` (replacing the session's for that response), `tools`, `tool_choice`, `max_output_tokens`, `output_modalities` (`["audio"]` or `["text"]`), `metadata` (echoed on `response.created` and `response.done`), and `conversation: "none"` with `input` (items or `item_reference`s) for an out-of-band response kept out of the conversation.
+- A response that calls functions ends there with its `function_call` items. The client answers with `function_call_output` items and a new `response.create`. Function tools need a chat model that calls tools (Qwen3.5, LFM2.5) or LFM3-Audio; `tool_choice: "required"` and named tools are asked for in the prompt, which local models may not obey. MCP tools are refused.
+- One response at a time writes to the conversation, and one out-of-band response may run beside it. `conversation.item.truncate` cuts an assistant item's transcript to what the client played.
+- `response.done` reports usage: the chat model's text tokens, and audio tokens estimated at OpenAI's rates (1 per 100 ms of user audio, 1 per 50 ms of assistant audio).
+
+### Sessions, admission and errors
+
+- Each socket takes a realtime session slot (`IZWI_MAX_REALTIME_SESSIONS`); a full server answers with an `error` and close `1013`. Each stage of a turn (transcription, the reply, each speech segment) takes its own realtime admission permit.
+- Errors are `error` events with `type`, `code`, `message`, `param` and the client's `event_id`; the session stays open. Requests that conflict harmlessly (a different `model` in `session.update`, a voice change after the session has spoken, a truncate past the end) are accepted and ignored.
+- Sessions are not written to the voice history unless `IZWI_REALTIME_PERSIST=1`.
+- `?intent=transcription` opens a transcription session: input audio, VAD or manual commits and transcription events, no responses.
+- WebRTC (`/v1/realtime/calls`), SIP, MCP tools and image input are not served.
+
+### Browser clients and client secrets
+
+A browser cannot set `Authorization` on a WebSocket. `POST /v1/realtime/client_secrets` (authenticated with the API key) mints an `ek_` key bound to a session config, valid for `expires_after.seconds` (10 to 7200, default 600). The browser offers it as the `openai-insecure-api-key.<key>` subprotocol beside `realtime`; the key admits `/v1/realtime` only, and its session config applies to each session it opens. Browser pages on other origins still need the server's CORS and origin settings.
+
+```bash
+curl -s http://127.0.0.1:8080/v1/realtime/client_secrets \
+  -H "Authorization: Bearer $IZWI_API_KEY" -H "Content-Type: application/json" \
+  -d '{"session": {"type": "realtime", "model": "izwi-voice", "instructions": "Be brief."}}'
+```
+
+### Through the gateway
+
+With `IZWI_GATEWAY_OPENAI_REALTIME_UPSTREAMS` (izwi-server base URLs) the gateway serves `/v1/realtime` too: it authenticates and admits each session, then relays it to an upstream izwi-server (round robin, `IZWI_GATEWAY_OPENAI_REALTIME_UPSTREAM_API_KEY` as the upstream's key, capped by `IZWI_GATEWAY_REALTIME_MAX_SESSIONS`). The session itself runs on the izwi-server.

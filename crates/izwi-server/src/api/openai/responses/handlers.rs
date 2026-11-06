@@ -875,7 +875,7 @@ struct NormalizedInputItem {
 /// The input's messages as the runtime's. `tools` are the request's tool
 /// definitions, deferred ones included, which an LFM3 tool result's
 /// `tool_reference` items name.
-fn build_input_messages(
+pub(crate) fn build_input_messages(
     model_variant: ModelVariant,
     instructions: Option<&str>,
     input: Option<ResponseInput>,

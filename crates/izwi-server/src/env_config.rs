@@ -186,6 +186,21 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "Open realtime websocket sessions.",
     ),
     var(
+        "IZWI_REALTIME_PROFILES",
+        "unset",
+        "Extra OpenAI Realtime profiles `?model=` can name: a JSON array of `{id, asr_model_id, text_model_id, tts_model_id}` (modular) or `{id, s2s_model_id}` (speech-to-speech), each with an optional default `voice`; an id equal to a built-in (`izwi-voice`, `izwi-voice-compact`) replaces it.",
+    ),
+    var(
+        "IZWI_REALTIME_DEFAULT_PROFILE",
+        "`izwi-voice`",
+        "The OpenAI Realtime profile a session gets when `model` is absent, empty or an OpenAI model name (`gpt-realtime*`).",
+    ),
+    var(
+        "IZWI_REALTIME_PERSIST",
+        "off",
+        "`1` records OpenAI Realtime sessions and their turns in the voice history; off, they leave nothing behind.",
+    ),
+    var(
         "IZWI_MAX_RESPONSE_STORE_ENTRIES",
         "512",
         "Stored Responses API responses kept in memory.",
