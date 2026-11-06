@@ -1719,7 +1719,7 @@ fn bounded_model_memos_are_part_of_resident_authorization() {
     let nemotron = model_memory_estimate(ModelVariant::Nemotron35AsrStreaming06B);
     assert_eq!(
         nemotron.resident_bytes,
-        6 * GIB + crate::models::architectures::nemotron::asr::NEMOTRON_MODEL_MEMO_MAX_BYTES
+        4 * GIB + crate::models::architectures::nemotron::asr::NEMOTRON_MODEL_MEMO_MAX_BYTES
     );
     let kokoro = model_memory_estimate(ModelVariant::Kokoro82M);
     assert_eq!(

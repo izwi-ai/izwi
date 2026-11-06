@@ -125,6 +125,27 @@ pub(super) fn portable_preload_bytes(
     Ok(load_peak_bytes.max(beside))
 }
 
+/// Whether a CPU or Metal load of `variant` keeps a state floor beside its
+/// weights (the context reserve, and Qwen3-TTS's and Fish Audio Drama 3's
+/// minimum state): chat, ASR and the TTS families that fit retained state.
+/// Kokoro, the aligner and the diarizers fit none.
+pub(super) fn fits_portable_state(variant: ModelVariant) -> bool {
+    use crate::catalog::ModelFamily;
+    variant.is_chat()
+        || asr_memory::is_asr_variant(variant)
+        || matches!(
+            variant.family(),
+            ModelFamily::Qwen3Tts
+                | ModelFamily::VibeVoiceTts
+                | ModelFamily::VoxtralTts
+                | ModelFamily::FishS2Tts
+                | ModelFamily::ChatterboxTts
+                | ModelFamily::Maya1Tts
+                | ModelFamily::Maya2Tts
+                | ModelFamily::FishDrama3Tts
+        )
+}
+
 /// The load authorization admission checks for `variant`: the plan's, with
 /// an ASR model's per-slot request floor folded in ([`admit_asr_request_floor`]).
 pub(super) fn load_authorization_with_request_floor(
@@ -902,20 +923,7 @@ impl ModelLifecycleController {
         backend: BackendKind,
     ) -> Result<u64> {
         use crate::catalog::ModelFamily;
-        let fits_state = variant.is_chat()
-            || asr_memory::is_asr_variant(variant)
-            || matches!(
-                variant.family(),
-                ModelFamily::Qwen3Tts
-                    | ModelFamily::VibeVoiceTts
-                    | ModelFamily::VoxtralTts
-                    | ModelFamily::FishS2Tts
-                    | ModelFamily::ChatterboxTts
-                    | ModelFamily::Maya1Tts
-                    | ModelFamily::Maya2Tts
-                    | ModelFamily::FishDrama3Tts
-            );
-        if backend == BackendKind::Cuda || !fits_state {
+        if backend == BackendKind::Cuda || !fits_portable_state(variant) {
             return Ok(0);
         }
         let configured = self.config.portable_context_reserve_bytes;

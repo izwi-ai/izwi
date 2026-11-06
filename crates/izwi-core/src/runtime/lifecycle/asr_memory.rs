@@ -3441,6 +3441,7 @@ pub(super) mod tests {
                 "Q8_0" => GgmlDType::Q8_0,
                 "Q4_0" => GgmlDType::Q4_0,
                 "Q4_K" => GgmlDType::Q4K,
+                "Q5_K" => GgmlDType::Q5K,
                 "Q6_K" => GgmlDType::Q6K,
                 other => panic!("unexpected GGUF dtype {other}"),
             })
@@ -3507,6 +3508,90 @@ pub(super) mod tests {
         crate::env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// What a load of `variant`, priced by `plan`, must find free on an
+    /// otherwise empty `backend` device under the default engine config (one
+    /// request slot, the 1 GiB context reserve), by the functions admission
+    /// itself uses: the load authorization with an ASR model's request floor
+    /// on CUDA; on CPU and Metal the larger of that and the residents beside
+    /// one request envelope and the state floor (`portable_preload_bytes`).
+    /// Before a download, the app judges device fit by the catalog memory
+    /// figure, so the figure has to cover this. Qwen3-TTS's minimum state
+    /// needs the loaded model's contract and is left out.
+    pub(in super::super) fn empty_device_requirement(
+        variant: ModelVariant,
+        plan: &AsrResidencyPlan,
+        backend: BackendKind,
+    ) -> u64 {
+        use super::super::admission::{
+            fits_portable_state, load_authorization_with_request_floor, portable_preload_bytes,
+        };
+        let plan = plan.resource_plan().unwrap();
+        let authorization =
+            load_authorization_with_request_floor(variant, &plan, backend, 1).unwrap();
+        let ResourceAmount::Known(required) =
+            super::super::load_domain_bytes(authorization, backend)
+        else {
+            panic!("{variant}: an unpriced load on {backend:?}");
+        };
+        if backend == BackendKind::Cuda {
+            return required;
+        }
+        let envelope =
+            crate::runtime::lifecycle::asr_envelope::deferred_request_envelope(variant, backend, 1)
+                .unwrap()
+                .map_or(0, |envelope| envelope.total_bytes().unwrap());
+        let state_floor = if fits_portable_state(variant) {
+            crate::config::EngineConfig::default().portable_context_reserve_bytes
+        } else {
+            0
+        };
+        portable_preload_bytes(&plan, backend, required, envelope, state_floor).unwrap()
+    }
+
+    /// Asserts the catalog memory figure each backend judges a variant by
+    /// (`backend_model_memory_estimate`) covers its
+    /// [`empty_device_requirement`] there, rounded up to the next half GiB
+    /// and no further, after printing every row: a figure that falls short
+    /// shows a model that cannot load, and one far above hides a model that
+    /// fits (16 GB Macs plan loads against 10.66 GiB). A variant with one
+    /// figure for every backend is held to the largest requirement.
+    pub(in super::super) fn assert_catalog_figures_cover_empty_devices(
+        rows: &[(ModelVariant, [u64; 3])],
+    ) {
+        const HALF_GIB: u64 = 1 << 29;
+        const BACKENDS: [BackendKind; 3] =
+            [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda];
+        let figures = |variant: ModelVariant| {
+            BACKENDS.map(|backend| {
+                super::super::backend_model_memory_estimate(variant, backend).load_peak_bytes
+            })
+        };
+        for (variant, [cpu, metal, cuda]) in rows {
+            let [on_cpu, on_metal, on_cuda] = figures(*variant).map(gib);
+            eprintln!(
+                "{variant}: empty device needs GiB CPU {:.3}, Metal {:.3}, CUDA {:.3}; \
+                 catalog {on_cpu:.2} / {on_metal:.2} / {on_cuda:.2}",
+                gib(*cpu),
+                gib(*metal),
+                gib(*cuda),
+            );
+        }
+        for (variant, requirements) in rows {
+            let figures = figures(*variant);
+            let single = figures.iter().all(|figure| *figure == figures[0]);
+            let largest = requirements.iter().copied().max().unwrap();
+            for ((backend, figure), needed) in BACKENDS.iter().zip(figures).zip(requirements) {
+                let bound = if single { largest } else { *needed };
+                assert!(
+                    figure >= *needed && figure.saturating_sub(bound) < HALF_GIB,
+                    "{variant} on {backend:?}: catalog {:.3} GiB, empty device needs {:.3} GiB",
+                    gib(figure),
+                    gib(*needed)
+                );
+            }
+        }
     }
 
     fn whisper(backend: BackendKind) -> AsrResidencyPlan {
@@ -3613,6 +3698,88 @@ pub(super) mod tests {
             tied_lm_head: true,
             encoder_attention_dists: (16, 200),
         }
+    }
+
+    /// Granite Speech 5.0's published safetensors: 4.1's base weights (the
+    /// same 4,626,414,392 bytes) with an untied head, priced through either
+    /// family's switches.
+    fn granite_untied(family: GraniteCheckpointFamily, backend: BackendKind) -> AsrResidencyPlan {
+        let mut load = granite_load(backend);
+        load.family = family;
+        load.tied_lm_head = false;
+        price_granite(&census!("granite_speech_5_0_2b.json"), backend, &load).unwrap()
+    }
+
+    /// Granite Speech 5.0's GGUF release: BF16 on CUDA, F32 on the CPU, and
+    /// on Metal F32 with weight-only F16 encoder projections.
+    fn granite5_gguf(backend: BackendKind) -> AsrResidencyPlan {
+        let files = census!("granite_speech_5_0_2b_gguf_q8_0.json");
+        let (dtype, f16_encoder_projections) = match backend {
+            BackendKind::Cuda => (DType::BF16, false),
+            BackendKind::Cpu => (DType::F32, false),
+            BackendKind::Metal => (DType::F32, true),
+        };
+        let load = GraniteSpeech5GgufLoad {
+            dtype,
+            audio_dtype: if f16_encoder_projections {
+                DType::F32
+            } else {
+                dtype
+            },
+            f16_encoder_projections,
+            encoder_attention_dists: (16, 200),
+            layers: 40,
+        };
+        price_granite_speech5_gguf(&files[0], &files[1], backend, &load).unwrap()
+    }
+
+    /// The ASR catalog figures, one per backend, cover what each published
+    /// checkpoint needs free on an empty device
+    /// ([`empty_device_requirement`]): Parakeet v3 needs 2.7 GiB on Metal,
+    /// where its one 12 GiB figure hid it on 16 GB Macs.
+    #[test]
+    fn asr_catalog_figures_cover_an_empty_device() {
+        let _env = env_lock();
+        let qwen06 = census!("qwen3_asr_0_6b_q8_0.json");
+        let qwen17 = census!("qwen3_asr_1_7b_q8_0.json");
+        type Plan<'a> = Box<dyn Fn(BackendKind) -> AsrResidencyPlan + 'a>;
+        let plans: Vec<(ModelVariant, Plan)> = vec![
+            (ModelVariant::ParakeetTdt06BV3, Box::new(parakeet)),
+            (ModelVariant::Nemotron35AsrStreaming06B, Box::new(nemotron)),
+            (ModelVariant::WhisperLargeV3Turbo, Box::new(whisper)),
+            (
+                ModelVariant::Qwen3Asr06BGguf,
+                Box::new(|b| qwen3_asr(&qwen06, b)),
+            ),
+            (
+                ModelVariant::Qwen3Asr17BGguf,
+                Box::new(|b| qwen3_asr(&qwen17, b)),
+            ),
+            (ModelVariant::GraniteSpeech412BPlus, Box::new(granite)),
+            (
+                ModelVariant::GraniteSpeech412B,
+                Box::new(|b| granite_untied(GraniteCheckpointFamily::Speech41, b)),
+            ),
+            (
+                ModelVariant::GraniteSpeech502B,
+                Box::new(|b| granite_untied(GraniteCheckpointFamily::Speech5, b)),
+            ),
+            (ModelVariant::GraniteSpeech502BGguf, Box::new(granite5_gguf)),
+            (ModelVariant::VibeVoiceAsr, Box::new(vibevoice)),
+            (ModelVariant::VoxtralMini4BRealtime2602, Box::new(voxtral)),
+            (ModelVariant::Lfm25Audio15BGguf, Box::new(lfm25_audio)),
+        ];
+        let rows = plans
+            .iter()
+            .map(|(variant, plan)| {
+                (
+                    *variant,
+                    BACKENDS
+                        .map(|backend| empty_device_requirement(*variant, &plan(backend), backend)),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_catalog_figures_cover_empty_devices(&rows);
     }
 
     fn vibevoice(backend: BackendKind) -> AsrResidencyPlan {
@@ -5335,7 +5502,20 @@ mod metal_residency_tests {
 
 #[cfg(test)]
 mod qwen35_plan_tests {
+    use super::tests::{
+        assert_catalog_figures_cover_empty_devices, empty_device_requirement, fixture,
+    };
     use super::*;
+
+    /// Census fixtures from the published checkpoints' headers.
+    macro_rules! census {
+        ($file:literal) => {
+            fixture(include_str!(concat!(
+                "../../../tests/fixtures/chat_residency/",
+                $file
+            )))
+        };
+    }
 
     fn tensor(name: &str, dtype: GgmlDType, shape: &[usize]) -> CensusTensor {
         let elements = shape.iter().product::<usize>() as u64;
@@ -5408,6 +5588,61 @@ mod qwen35_plan_tests {
             "v.post_ln",
         ] {
             assert!(!qwen35_vision_linear_layer(layer), "{layer}");
+        }
+    }
+
+    /// The Qwen3.5 catalog figures follow the published GGUF headers: each
+    /// covers what the checkpoint needs free on an empty device
+    /// ([`empty_device_requirement`]; 16 GiB for the 9B, which needs under
+    /// 8, hid it on 16 GB Macs). The size exceeds the census payload by the
+    /// GGUF headers alone, which carry the tokenizer (11 MB).
+    #[test]
+    fn qwen35_catalog_figures_follow_the_checkpoints() {
+        const BACKENDS: [BackendKind; 3] =
+            [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda];
+        const HEADERS: u64 = 16 << 20;
+        let rows = [
+            (
+                ModelVariant::Qwen3508BGguf,
+                census!("qwen3_5_0_8b_q4_k_m.json"),
+            ),
+            (
+                ModelVariant::Qwen352BGguf,
+                census!("qwen3_5_2b_q4_k_m.json"),
+            ),
+            (
+                ModelVariant::Qwen354BGguf,
+                census!("qwen3_5_4b_q4_k_m.json"),
+            ),
+            (
+                ModelVariant::Qwen359BGguf,
+                census!("qwen3_5_9b_q4_k_m.json"),
+            ),
+        ]
+        .map(|(variant, files)| {
+            let [text, vision] = files.as_slice() else {
+                panic!("{variant}: a text and a vision census");
+            };
+            let requirements = BACKENDS.map(|backend| {
+                let plan = price_qwen35_chat(text, vision, backend).unwrap();
+                empty_device_requirement(variant, &plan, backend)
+            });
+            let payload: u64 = files
+                .iter()
+                .flat_map(|file| file.tensors.iter())
+                .map(|tensor| tensor.stored_bytes)
+                .sum();
+            (variant, requirements, payload)
+        });
+        assert_catalog_figures_cover_empty_devices(
+            &rows.map(|(variant, requirements, _)| (variant, requirements)),
+        );
+        for (variant, _, payload) in rows {
+            let size = variant.estimated_size();
+            assert!(
+                size >= payload && size - payload < HEADERS,
+                "{variant}: catalog {size} B, payload {payload} B"
+            );
         }
     }
 }
