@@ -15,8 +15,6 @@ Commands:
                 (requires IZWI_TEST_FLEET_PG_URL and IZWI_TEST_STORE_PG_URL at
                 disposable databases)
   cargo-metal   Require macOS 15+ and run Metal-focused validation
-  cargo-metal-fallback
-                Require macOS 12-14 and prove Metal-enabled code falls back to CPU
   cargo-cuda-compile
                 Compile/link CUDA harnesses without executing CUDA-linked binaries
   cargo-cuda    Compatibility alias for cargo-cuda-compile
@@ -587,28 +585,6 @@ run_cargo_metal() {
     scripts/bench/run_kv_cache_matrix.sh --lane metal --iterations 1 --warmup 0 --require-device
 }
 
-run_cargo_metal_fallback() {
-    require_command cargo
-
-    if [[ "$(uname -s)" != "Darwin" ]]; then
-        echo "macOS fallback checks require macOS." >&2
-        exit 1
-    fi
-    if [[ "$(sw_vers -productVersion | cut -d. -f1)" -ge 15 ]]; then
-        echo "The legacy CPU fallback lane requires macOS 12-14." >&2
-        exit 1
-    fi
-
-    cargo check --locked -p izwi-core --features metal
-    cargo check --locked -p izwi-cli
-    cargo check --locked -p izwi-server
-    cargo test --locked -p izwi-core --features metal \
-        pre_macos15_auto_and_explicit_metal_preferences_fall_back_to_cpu --lib
-    cargo test --locked -p izwi-core --features metal \
-        unsupported_metal_runtime_never_invokes_candle_probe --lib
-    cargo test --locked -p izwi-server --lib
-}
-
 run_hygiene() {
     require_command cargo
     require_command rg
@@ -839,9 +815,6 @@ main() {
             ;;
         cargo-metal)
             run_cargo_metal
-            ;;
-        cargo-metal-fallback)
-            run_cargo_metal_fallback
             ;;
         cargo-cuda-compile)
             run_cargo_cuda_compile
