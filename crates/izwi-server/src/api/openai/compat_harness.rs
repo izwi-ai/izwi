@@ -25,6 +25,7 @@ const CONTRACT_JSON: &str = include_str!(concat!(
 
 const OPENAI_MOD_SRC: &str = include_str!("mod.rs");
 const OPENAI_AUDIO_MOD_SRC: &str = include_str!("audio/mod.rs");
+const OPENAI_REALTIME_SRC: &str = include_str!("realtime.rs");
 const OPENAI_CHAT_MOD_SRC: &str = include_str!("chat/mod.rs");
 const OPENAI_RESPONSES_MOD_SRC: &str = include_str!("responses/mod.rs");
 // The chat stream renderer is izwi-gateway's, shared by both roles.
@@ -176,6 +177,8 @@ fn contract_supported_scope_matches_expected_endpoints() {
         "/v1/responses/:response_id/input_items",
         "/v1/audio/transcriptions",
         "/v1/audio/speech",
+        "/v1/realtime",
+        "/v1/realtime/client_secrets",
     ]
     .into_iter()
     .collect();
@@ -193,7 +196,6 @@ fn out_of_scope_endpoints_are_documented_and_not_routed() {
         .collect();
     let expected: HashSet<&str> = vec![
         "/v1/audio/translations",
-        "/v1/realtime/client_secrets",
         "/v1/realtime/sessions",
         "/v1/realtime/transcription_sessions",
     ]
@@ -202,11 +204,14 @@ fn out_of_scope_endpoints_are_documented_and_not_routed() {
     assert_eq!(actual, expected);
 
     let routed_src = format!(
-        "{}\n{}\n{}\n{}",
-        OPENAI_MOD_SRC, OPENAI_AUDIO_MOD_SRC, OPENAI_CHAT_MOD_SRC, OPENAI_RESPONSES_MOD_SRC
+        "{}\n{}\n{}\n{}\n{}",
+        OPENAI_MOD_SRC,
+        OPENAI_AUDIO_MOD_SRC,
+        OPENAI_CHAT_MOD_SRC,
+        OPENAI_RESPONSES_MOD_SRC,
+        OPENAI_REALTIME_SRC
     );
     assert!(!routed_src.contains("/audio/translations"));
-    assert!(!routed_src.contains("/realtime/client_secrets"));
     assert!(!routed_src.contains("/realtime/sessions"));
     assert!(!routed_src.contains("/realtime/transcription_sessions"));
 }

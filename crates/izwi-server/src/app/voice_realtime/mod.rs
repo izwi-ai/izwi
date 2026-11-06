@@ -67,10 +67,18 @@ use crate::voice_defaults::{
 };
 use crate::voice_memory::extract_observation_candidates;
 use crate::voice_store::CreateVoiceTurnRequest;
+mod input;
+mod speak;
+mod turn;
+
+pub(crate) use input::*;
+pub(crate) use speak::*;
+pub(crate) use turn::*;
+
 const DEFAULT_CHAT_MODEL: &str = "Qwen3.5-4B";
 /// A spoken reply's default token budget: a few sentences, not an essay
 /// (SPK-F2). Clients may raise it with `max_output_tokens`.
-const VOICE_DEFAULT_MAX_OUTPUT_TOKENS: usize = 384;
+pub(crate) const VOICE_DEFAULT_MAX_OUTPUT_TOKENS: usize = 384;
 const VOICE_EMPTY_REPLY_ERROR: &str =
     "The model gave no answer to speak. Try again, or choose another chat model.";
 /// The conversation history a voice turn's prompt carries (SPK-F13).
@@ -78,27 +86,27 @@ const VOICE_HISTORY_BUDGET: HistoryBudget = HistoryBudget {
     max_messages: 24,
     max_tokens: 3_000,
 };
-const MAX_UTTERANCE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_UTTERANCE_PCM16_SAMPLES: usize = (MAX_UTTERANCE_BYTES - 44) / 2;
+pub(crate) const MAX_UTTERANCE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_UTTERANCE_PCM16_SAMPLES: usize = (MAX_UTTERANCE_BYTES - 44) / 2;
 const WS_BIN_MAGIC: &[u8; 4] = b"IVWS";
 const WS_BIN_KIND_ASSISTANT_PCM16: u8 = 2;
 const WS_BIN_KIND_ASSISTANT_G711_ULAW: u8 = 3;
 const WS_BIN_KIND_ASSISTANT_G711_ALAW: u8 = 4;
 const WS_BIN_ASSISTANT_HEADER_LEN: usize = 24;
-const DEFAULT_STREAM_VAD_THRESHOLD: f32 = DEFAULT_SPEECH_THRESHOLD;
-const DEFAULT_STREAM_MIN_SPEECH_MS: u32 = DEFAULT_MIN_SPEECH_MS;
-const DEFAULT_STREAM_SILENCE_MS: u32 = DEFAULT_SILENCE_MS;
-const DEFAULT_STREAM_MAX_UTTERANCE_MS: u32 = DEFAULT_MAX_UTTERANCE_MS;
-const DEFAULT_STREAM_PRE_ROLL_MS: u32 = DEFAULT_PRE_ROLL_MS;
+pub(crate) const DEFAULT_STREAM_VAD_THRESHOLD: f32 = DEFAULT_SPEECH_THRESHOLD;
+pub(crate) const DEFAULT_STREAM_MIN_SPEECH_MS: u32 = DEFAULT_MIN_SPEECH_MS;
+pub(crate) const DEFAULT_STREAM_SILENCE_MS: u32 = DEFAULT_SILENCE_MS;
+pub(crate) const DEFAULT_STREAM_MAX_UTTERANCE_MS: u32 = DEFAULT_MAX_UTTERANCE_MS;
+pub(crate) const DEFAULT_STREAM_PRE_ROLL_MS: u32 = DEFAULT_PRE_ROLL_MS;
 /// Voiced speech that confirms a barge-in. A speech start alone does not
 /// interrupt the assistant: a cough, a door or speaker echo also starts one.
-const DEFAULT_BARGE_IN_MIN_SPEECH_MS: u32 = 300;
+pub(crate) const DEFAULT_BARGE_IN_MIN_SPEECH_MS: u32 = 300;
 /// How long past the silence window frames may stop before the server
 /// assumes the client paused without `input_stream_stop`. Silence is measured
 /// in audio time, so this only has to cover network stalls and jitter.
-const CLIENT_PAUSE_STALL_ALLOWANCE_MS: u64 = 1_500;
-const TURN_CANCELLATION_TIMEOUT: Duration = Duration::from_millis(750);
-const SESSION_ACTOR_TICK: Duration = Duration::from_millis(100);
+pub(crate) const CLIENT_PAUSE_STALL_ALLOWANCE_MS: u64 = 1_500;
+pub(crate) const TURN_CANCELLATION_TIMEOUT: Duration = Duration::from_millis(750);
+pub(crate) const SESSION_ACTOR_TICK: Duration = Duration::from_millis(100);
 /// Assistant audio sent this long after the audio already sent had finished
 /// playing counts as a playback underrun.
 const PLAYBACK_UNDERRUN_TOLERANCE: Duration = Duration::from_millis(20);
@@ -225,7 +233,7 @@ struct VoiceOutboundWireState {
 }
 
 #[derive(Clone)]
-struct OutboundTx {
+pub(crate) struct OutboundTx {
     mailbox: Arc<OutboundMailbox>,
     wire: Arc<Mutex<VoiceOutboundWireState>>,
     runtime: Arc<RuntimeService>,
@@ -540,7 +548,7 @@ impl RealtimeVoiceMode {
 }
 
 #[derive(Debug, Clone)]
-struct ModularVoiceTurnConfig {
+pub(crate) struct ModularVoiceTurnConfig {
     asr_model_id: String,
     text_model_id: String,
     tts_model_id: String,
@@ -551,7 +559,7 @@ struct ModularVoiceTurnConfig {
 }
 
 #[derive(Debug, Clone)]
-struct UnifiedVoiceTurnConfig {
+pub(crate) struct UnifiedVoiceTurnConfig {
     s2s_model_id: String,
     speaker: Option<String>,
     max_output_tokens: usize,
@@ -561,13 +569,13 @@ struct UnifiedVoiceTurnConfig {
 }
 
 #[derive(Debug, Clone)]
-enum VoiceTurnConfig {
+pub(crate) enum VoiceTurnConfig {
     Modular(ModularVoiceTurnConfig),
     Unified(UnifiedVoiceTurnConfig),
 }
 
 #[derive(Debug, Clone)]
-struct PendingAudioCommit {
+pub(crate) struct PendingAudioCommit {
     utterance_id: String,
     utterance_seq: u64,
     turn_config: VoiceTurnConfig,
@@ -590,252 +598,6 @@ struct ActiveTurn {
     output_generation: u64,
 }
 
-/// The connection's spoken conversation: the latest assistant replies,
-/// held until what the user heard of them is known, then stored in order
-/// (SPK-F13). Replies are stored when the next turn needs the history, or
-/// when the stream or socket ends; until then the client may truncate them.
-#[derive(Default)]
-struct VoiceConversation {
-    pending: Mutex<VecDeque<(u64, TurnControl)>>,
-}
-
-impl VoiceConversation {
-    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<(u64, TurnControl)>> {
-        self.pending
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
-
-    /// Hold `utterance_seq`'s reply until it is stored.
-    fn hold(&self, utterance_seq: u64, control: TurnControl) {
-        let mut pending = self.lock();
-        pending.retain(|(seq, _)| *seq != utterance_seq);
-        pending.push_back((utterance_seq, control));
-    }
-
-    /// The held replies, oldest first.
-    fn take(&self) -> Vec<TurnControl> {
-        self.lock().drain(..).map(|(_, control)| control).collect()
-    }
-
-    /// The held reply of `utterance_seq`.
-    fn reply_of(&self, utterance_seq: u64) -> Option<TurnControl> {
-        self.lock()
-            .iter()
-            .find(|(seq, _)| *seq == utterance_seq)
-            .map(|(_, control)| control.clone())
-    }
-
-    /// The user interrupted playback: the latest held reply was heard up to
-    /// where the client's playback had got.
-    fn interrupt_playback(&self) {
-        if let Some((_, control)) = self.lock().back() {
-            control.stop_playback();
-        }
-    }
-
-    /// Store the held replies in order.
-    async fn store(&self, state: &AppState) {
-        for control in self.take() {
-            store_reply(state, &control).await;
-        }
-    }
-
-    /// Store the held replies in the background.
-    fn store_in_background(self: &Arc<Self>, state: &AppState) {
-        let conversation = self.clone();
-        let state = state.clone();
-        tokio::spawn(async move { conversation.store(&state).await });
-    }
-}
-
-#[derive(Clone)]
-struct TurnControl {
-    inner: Arc<TurnControlInner>,
-}
-
-struct TurnControlInner {
-    cancelled: AtomicBool,
-    reason: Mutex<Option<String>>,
-    notify: Notify,
-    endpointed_at: Instant,
-    /// Set once the turn has sent assistant audio.
-    speaking: AtomicBool,
-    playback: Mutex<PlaybackClock>,
-    reply: Mutex<ReplyRecord>,
-}
-
-/// What the turn's assistant reply said, and how much of it was heard.
-#[derive(Default)]
-struct ReplyRecord {
-    /// The agent session (thread) the reply belongs to.
-    session: Option<AgentSession>,
-    turn_record_id: Option<String>,
-    /// The whole reply as generated, and without its reasoning.
-    raw_text: Option<String>,
-    text: Option<String>,
-    meta: MemoryMessageMeta,
-    ledger: SpokenLedger,
-    /// How much of the reply's audio the user heard, when not all of it.
-    heard_ms: Option<f64>,
-}
-
-impl ReplyRecord {
-    /// The text to remember: all of it, or what was heard.
-    fn remembered_text(&self) -> Option<String> {
-        match self.heard_ms {
-            Some(heard_ms) => Some(self.ledger.heard_text(heard_ms)),
-            None => self.text.clone(),
-        }
-    }
-}
-
-impl TurnControl {
-    fn new(endpointed_at: Instant) -> Self {
-        Self {
-            inner: Arc::new(TurnControlInner {
-                cancelled: AtomicBool::new(false),
-                reason: Mutex::new(None),
-                notify: Notify::new(),
-                endpointed_at,
-                speaking: AtomicBool::new(false),
-                playback: Mutex::new(PlaybackClock::default()),
-                reply: Mutex::new(ReplyRecord::default()),
-            }),
-        }
-    }
-
-    fn reply(&self) -> std::sync::MutexGuard<'_, ReplyRecord> {
-        self.inner
-            .reply
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
-
-    /// The client stopped playing the reply now: it was heard as far as its
-    /// playback had got, unless the client already said how far.
-    fn stop_playback(&self) {
-        let played = self
-            .inner
-            .playback
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .played(Instant::now());
-        let mut reply = self.reply();
-        if reply.heard_ms.is_none() && played.as_secs_f64() * 1000.0 < reply.ledger.audio_ms() {
-            reply.heard_ms = Some(played.as_secs_f64() * 1000.0);
-        }
-    }
-
-    /// The client says it played `audio_end_ms` of the reply; returns the
-    /// text that covers.
-    fn truncate(&self, audio_end_ms: u64) -> String {
-        let mut reply = self.reply();
-        reply.heard_ms = Some(audio_end_ms as f64);
-        reply.ledger.heard_text(audio_end_ms as f64)
-    }
-
-    fn endpointed_at(&self) -> Instant {
-        self.inner.endpointed_at
-    }
-
-    fn is_speaking(&self) -> bool {
-        self.inner.speaking.load(Ordering::Acquire)
-    }
-
-    /// Account for `duration` of assistant audio just sent: the first audio
-    /// is the turn's response latency, and a chunk that found the client's
-    /// playback already drained is an underrun.
-    fn audio_sent(&self, runtime: &RuntimeService, duration: Duration) {
-        let now = Instant::now();
-        if !self.inner.speaking.swap(true, Ordering::AcqRel) {
-            runtime.record_voice_latency(
-                VoiceLatency::TurnFirstAudio,
-                now.saturating_duration_since(self.inner.endpointed_at),
-            );
-        }
-        let underrun = self
-            .inner
-            .playback
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .sent(now, duration);
-        if underrun {
-            runtime.record_voice_egress_underrun();
-        }
-    }
-
-    fn cancel(&self, reason: impl Into<String>) {
-        let mut stored_reason = self
-            .inner
-            .reason
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if self.inner.cancelled.load(Ordering::Acquire) {
-            return;
-        }
-        *stored_reason = Some(reason.into());
-        self.inner.cancelled.store(true, Ordering::Release);
-        drop(stored_reason);
-        self.inner.notify.notify_waiters();
-    }
-
-    fn is_cancelled(&self) -> bool {
-        self.inner.cancelled.load(Ordering::Acquire)
-    }
-
-    fn reason(&self) -> Option<String> {
-        self.inner
-            .reason
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone()
-    }
-
-    async fn cancelled(&self) {
-        loop {
-            let notified = self.inner.notify.notified();
-            if self.is_cancelled() {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
-
-/// The server's view of the client's playback: the audio sent so far finishes
-/// playing at `playing_until`, assuming the client plays it as it arrives.
-#[derive(Debug, Default)]
-struct PlaybackClock {
-    playing_until: Option<Instant>,
-    sent: Duration,
-}
-
-impl PlaybackClock {
-    /// Account for `duration` of audio sent at `now`; returns whether the
-    /// audio sent before it had already finished playing (an underrun).
-    fn sent(&mut self, now: Instant, duration: Duration) -> bool {
-        let underrun = self
-            .playing_until
-            .is_some_and(|until| now > until + PLAYBACK_UNDERRUN_TOLERANCE);
-        let starts = self
-            .playing_until
-            .filter(|until| *until > now)
-            .unwrap_or(now);
-        self.playing_until = Some(starts + duration);
-        self.sent += duration;
-        underrun
-    }
-
-    /// How much of the audio sent has played by `now`.
-    fn played(&self, now: Instant) -> Duration {
-        let queued = self
-            .playing_until
-            .map_or(Duration::ZERO, |until| until.saturating_duration_since(now));
-        self.sent.saturating_sub(queued)
-    }
-}
-
 /// Move the session phase along with its active turn: Speaking once the turn
 /// has sent audio, Listening once it has ended. `turn` is the active turn's
 /// record id, whether it is still running and whether it has spoken.
@@ -854,18 +616,18 @@ fn follow_turn_phase(session: &mut VoiceSession, turn: Option<(&str, bool, bool)
     }
 }
 
-struct AbortOnDropTask<T> {
+pub(crate) struct AbortOnDropTask<T> {
     handle: Option<tokio::task::JoinHandle<T>>,
 }
 
 impl<T> AbortOnDropTask<T> {
-    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+    pub(crate) fn new(handle: tokio::task::JoinHandle<T>) -> Self {
         Self {
             handle: Some(handle),
         }
     }
 
-    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+    pub(crate) async fn join(mut self) -> Result<T, tokio::task::JoinError> {
         self.handle.take().expect("task handle must exist").await
     }
 }
@@ -874,97 +636,6 @@ impl<T> Drop for AbortOnDropTask<T> {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.as_ref() {
             handle.abort();
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct StreamingInputConfig {
-    turn_config: VoiceTurnConfig,
-    vad_threshold: f32,
-    min_speech_ms: u32,
-    silence_duration_ms: u32,
-    max_utterance_ms: u32,
-    pre_roll_ms: u32,
-    barge_in_min_speech_ms: u32,
-    snr_margin_db: f32,
-    input_sample_rate_hint: Option<u32>,
-}
-
-impl StreamingInputConfig {
-    fn evidence_config(&self) -> SpeechEvidenceConfig {
-        SpeechEvidenceConfig {
-            threshold: self.vad_threshold,
-            snr_margin_db: self.snr_margin_db,
-            ..SpeechEvidenceConfig::default()
-        }
-    }
-
-    fn endpoint_config(&self) -> EndpointConfig {
-        EndpointConfig {
-            start_threshold: self.vad_threshold,
-            end_threshold: (self.vad_threshold * 0.7).min(self.vad_threshold),
-            min_speech_ms: self.min_speech_ms,
-            silence_ms: self.silence_duration_ms,
-            max_utterance_ms: self.max_utterance_ms,
-            snr_margin_db: self.snr_margin_db,
-            continue_snr_margin_db: self.snr_margin_db * 0.5,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct StreamingActiveUtterance {
-    utterance_id: String,
-    utterance_seq: u64,
-    samples_i16: Vec<i16>,
-    voiced_ms: f32,
-    total_ms: f32,
-    silence_ms: f32,
-    barge_in_confirmed: bool,
-    /// The offline no-speech gate's rule over this utterance's frames. An
-    /// utterance without it never becomes a turn, for modular and unified
-    /// (speech-to-speech) turns alike.
-    evidence: SpeechEvidence,
-}
-
-struct StreamingInputState {
-    config: StreamingInputConfig,
-    vad_scorer: VadScorer,
-    endpoint: EndpointDetector,
-    next_utterance_seq: u64,
-    frame_seq_last: Option<u32>,
-    current_sample_rate: Option<u32>,
-    pre_roll: VecDeque<i16>,
-    active: Option<StreamingActiveUtterance>,
-    last_frame_at: Option<Instant>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum UtteranceEndReason {
-    Silence,
-    MaxDuration,
-    ClientPause,
-    StreamStopped,
-}
-
-impl UtteranceEndReason {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Silence => "silence",
-            Self::MaxDuration => "max_duration",
-            Self::ClientPause => "client_pause",
-            Self::StreamStopped => "stream_stopped",
-        }
-    }
-}
-
-impl From<EndpointEndReason> for UtteranceEndReason {
-    fn from(reason: EndpointEndReason) -> Self {
-        match reason {
-            EndpointEndReason::Silence => Self::Silence,
-            EndpointEndReason::MaxDuration => Self::MaxDuration,
-            EndpointEndReason::StreamStopped => Self::StreamStopped,
         }
     }
 }
@@ -1091,6 +762,8 @@ struct ConnectionState {
     agent_session: Arc<AgentSessionSlot>,
     conversation: Arc<VoiceConversation>,
     streaming_input: Option<StreamingInputState>,
+    /// How the input stream's turns are answered.
+    turn_config: Option<VoiceTurnConfig>,
     /// Keeps the input stream's models resident between turns without
     /// pinning them; turns in flight hold their own clone.
     model_leases: SessionModelLeases,
@@ -1119,6 +792,7 @@ impl Default for ConnectionState {
             agent_session: Arc::default(),
             conversation: Arc::default(),
             streaming_input: None,
+            turn_config: None,
             model_leases: SessionModelLeases::default(),
             model_warmup: None,
             active_turn: None,
@@ -1194,316 +868,6 @@ impl ConnectionState {
     }
 }
 
-#[derive(Debug)]
-struct SpeechStartEvent {
-    utterance_id: String,
-    utterance_seq: u64,
-}
-
-/// How an active utterance ended.
-#[derive(Debug)]
-enum UtteranceOutcome {
-    /// Enough voiced speech: it becomes a turn.
-    Finalized(PendingAudioCommit, Vec<u8>, UtteranceEndReason),
-    /// Too little voiced speech, or no speech evidence: the client resumes
-    /// whatever it ducked on `user_speech_start`.
-    Rejected(SpeechStartEvent),
-}
-
-#[derive(Debug)]
-struct StreamingFrameResult {
-    sequence_gap: Option<(u32, u32)>,
-    speech_start: Option<SpeechStartEvent>,
-    /// The active utterance has just confirmed a barge-in.
-    barge_in: bool,
-    utterance_end: Option<UtteranceOutcome>,
-}
-
-impl StreamingInputState {
-    fn new(config: StreamingInputConfig) -> Self {
-        let endpoint = EndpointDetector::new(config.endpoint_config());
-        Self {
-            config,
-            vad_scorer: VadScorer::new(),
-            endpoint,
-            next_utterance_seq: 0,
-            frame_seq_last: None,
-            current_sample_rate: None,
-            pre_roll: VecDeque::new(),
-            active: None,
-            last_frame_at: None,
-        }
-    }
-
-    fn handle_pcm16_frame(
-        &mut self,
-        frame_seq: u32,
-        sample_rate: u32,
-        payload: &[u8],
-    ) -> Result<StreamingFrameResult, String> {
-        if !(8_000..=192_000).contains(&sample_rate) {
-            return Err(format!("Invalid input sample_rate {sample_rate}"));
-        }
-        let sequence_gap = if let Some(last) = self.frame_seq_last {
-            if frame_seq <= last {
-                return Err(format!(
-                    "Stale or duplicate input frame sequence {frame_seq}; last accepted was {last}"
-                ));
-            }
-            (frame_seq > last.saturating_add(1)).then_some((last.saturating_add(1), frame_seq))
-        } else {
-            None
-        };
-        self.frame_seq_last = Some(frame_seq);
-        self.last_frame_at = Some(Instant::now());
-
-        if payload.is_empty() {
-            return Ok(StreamingFrameResult {
-                sequence_gap,
-                speech_start: None,
-                barge_in: false,
-                utterance_end: None,
-            });
-        }
-        if !payload.len().is_multiple_of(2) {
-            return Err("PCM16 payload length must be even".to_string());
-        }
-
-        if let Some(current_sr) = self.current_sample_rate {
-            if current_sr != sample_rate {
-                return Err(format!(
-                    "Input stream sample rate changed mid-stream ({current_sr} -> {sample_rate})"
-                ));
-            }
-        } else {
-            self.current_sample_rate = Some(sample_rate);
-        }
-
-        let samples = pcm16_bytes_to_i16(payload);
-        if samples.is_empty() {
-            return Ok(StreamingFrameResult {
-                sequence_gap,
-                speech_start: None,
-                barge_in: false,
-                utterance_end: None,
-            });
-        }
-
-        let frame_ms = (samples.len() as f32 * 1000.0) / (sample_rate as f32);
-        let vad_frames = self
-            .vad_scorer
-            .push_i16(&samples, sample_rate)
-            .map_err(|err| format!("VAD scoring error: {err}"))?;
-        let mut chunk_has_speech = false;
-        let mut chunk_voiced_ms = 0.0f32;
-        let mut speech_started = false;
-        let mut noise_rejected = false;
-        let mut end_reason: Option<UtteranceEndReason> = None;
-
-        for vad_frame in &vad_frames {
-            // Voiced time, which confirms barge-in, counts only frames that
-            // clear the SNR margin as well as the score threshold.
-            let decision = self.endpoint.process_frame(vad_frame);
-            if decision.is_speech {
-                chunk_has_speech = true;
-                chunk_voiced_ms += vad_frame.duration_ms();
-            }
-            for event in decision.events {
-                match event {
-                    EndpointEvent::SpeechStart => speech_started = true,
-                    EndpointEvent::SpeechEnd(reason) => end_reason = Some(reason.into()),
-                    EndpointEvent::NoiseRejected => noise_rejected = true,
-                }
-            }
-        }
-
-        let mut result = StreamingFrameResult {
-            sequence_gap,
-            speech_start: None,
-            barge_in: false,
-            utterance_end: None,
-        };
-
-        if speech_started && self.active.is_none() {
-            let utterance_seq = self.next_utterance_seq.saturating_add(1);
-            self.next_utterance_seq = utterance_seq;
-            let utterance_id = format!("utt-{utterance_seq}");
-
-            let mut capture = StreamingActiveUtterance {
-                utterance_id: utterance_id.clone(),
-                utterance_seq,
-                samples_i16: Vec::new(),
-                voiced_ms: 0.0,
-                total_ms: 0.0,
-                silence_ms: 0.0,
-                barge_in_confirmed: false,
-                evidence: SpeechEvidence::new(self.config.evidence_config()),
-            };
-            if !self.pre_roll.is_empty() {
-                capture.samples_i16.extend(self.pre_roll.iter().copied());
-            }
-            if capture.samples_i16.len().saturating_add(samples.len()) > MAX_UTTERANCE_PCM16_SAMPLES
-            {
-                return Err("Streamed utterance exceeded the PCM16 buffer limit".to_string());
-            }
-            capture.samples_i16.extend_from_slice(&samples);
-            self.active = Some(capture);
-
-            result.speech_start = Some(SpeechStartEvent {
-                utterance_id,
-                utterance_seq,
-            });
-        } else if let Some(active) = self.active.as_mut() {
-            if active.samples_i16.len().saturating_add(samples.len()) > MAX_UTTERANCE_PCM16_SAMPLES
-            {
-                return Err("Streamed utterance exceeded the PCM16 buffer limit".to_string());
-            }
-            active.samples_i16.extend_from_slice(&samples);
-        } else {
-            self.push_pre_roll(&samples, sample_rate);
-            return Ok(result);
-        }
-
-        if let Some(active) = self.active.as_mut() {
-            for vad_frame in &vad_frames {
-                active.evidence.push(vad_frame);
-            }
-            active.voiced_ms += chunk_voiced_ms;
-            active.total_ms += frame_ms;
-            if chunk_has_speech {
-                active.silence_ms = 0.0;
-            } else {
-                active.silence_ms += frame_ms;
-            }
-            // An utterance that ends or is rejected in this frame never
-            // barges in; finalizing one preempts the turn on its own.
-            if !active.barge_in_confirmed
-                && end_reason.is_none()
-                && !noise_rejected
-                && active.voiced_ms >= self.config.barge_in_min_speech_ms as f32
-            {
-                active.barge_in_confirmed = true;
-                result.barge_in = true;
-            }
-        }
-
-        if let Some(reason) = end_reason {
-            result.utterance_end = self.finalize_active_utterance(reason)?;
-        } else if noise_rejected {
-            result.utterance_end = self.reject_active_utterance();
-        }
-
-        if !chunk_has_speech {
-            self.push_pre_roll(&samples, sample_rate);
-        }
-
-        Ok(result)
-    }
-
-    fn reject_active_utterance(&mut self) -> Option<UtteranceOutcome> {
-        let active = self.active.take()?;
-        Some(UtteranceOutcome::Rejected(SpeechStartEvent {
-            utterance_id: active.utterance_id,
-            utterance_seq: active.utterance_seq,
-        }))
-    }
-
-    fn finish_stream(&mut self) -> Result<Option<UtteranceOutcome>, String> {
-        match self.endpoint.finish() {
-            Some(EndpointEvent::NoiseRejected) => Ok(self.reject_active_utterance()),
-            _ => self.finalize_active_utterance(UtteranceEndReason::StreamStopped),
-        }
-    }
-
-    /// Ends the active utterance when the client stops sending audio without
-    /// `input_stream_stop`. Silence and the utterance cap are measured in
-    /// audio time by the endpoint detector, so delayed but contiguous frames
-    /// (a network stall) cannot end an utterance early.
-    fn on_tick(&mut self) -> Result<Option<UtteranceOutcome>, String> {
-        if self.active.is_none() {
-            return Ok(None);
-        }
-        let pause_limit = Duration::from_millis(
-            u64::from(self.config.silence_duration_ms) + CLIENT_PAUSE_STALL_ALLOWANCE_MS,
-        );
-        if self
-            .last_frame_at
-            .is_some_and(|last_frame| last_frame.elapsed() >= pause_limit)
-        {
-            return self.finalize_active_utterance(UtteranceEndReason::ClientPause);
-        }
-        Ok(None)
-    }
-
-    /// End the active utterance: a turn when it holds enough voiced speech,
-    /// otherwise a rejection the client must hear about, since it already saw
-    /// `user_speech_start`.
-    fn finalize_active_utterance(
-        &mut self,
-        reason: UtteranceEndReason,
-    ) -> Result<Option<UtteranceOutcome>, String> {
-        let Some(active) = self.active.take() else {
-            return Ok(None);
-        };
-        self.endpoint = EndpointDetector::new(self.config.endpoint_config());
-        if active.voiced_ms < self.config.min_speech_ms as f32 || !active.evidence.is_sufficient() {
-            return Ok(Some(UtteranceOutcome::Rejected(SpeechStartEvent {
-                utterance_id: active.utterance_id,
-                utterance_seq: active.utterance_seq,
-            })));
-        }
-        let sample_rate = self
-            .current_sample_rate
-            .or(self.config.input_sample_rate_hint)
-            .ok_or_else(|| "Missing input sample rate for streamed audio".to_string())?;
-
-        let wav_bytes = wav_bytes_from_pcm16_mono(&active.samples_i16, sample_rate)?;
-        if wav_bytes.len() > MAX_UTTERANCE_BYTES {
-            return Err(format!(
-                "Streamed utterance exceeded max encoded size ({} > {})",
-                wav_bytes.len(),
-                MAX_UTTERANCE_BYTES
-            ));
-        }
-
-        let trailing_silence =
-            Duration::from_micros((active.silence_ms.max(0.0) * 1000.0).round() as u64);
-        let endpointing_delay = match reason {
-            UtteranceEndReason::Silence => Some(trailing_silence),
-            UtteranceEndReason::ClientPause => Some(
-                trailing_silence
-                    + self
-                        .last_frame_at
-                        .map_or(Duration::ZERO, |last_frame| last_frame.elapsed()),
-            ),
-            UtteranceEndReason::MaxDuration | UtteranceEndReason::StreamStopped => None,
-        };
-        let commit = PendingAudioCommit {
-            utterance_id: active.utterance_id,
-            utterance_seq: active.utterance_seq,
-            turn_config: self.config.turn_config.clone(),
-            endpointed_at: Instant::now(),
-            endpointing_delay,
-        };
-
-        Ok(Some(UtteranceOutcome::Finalized(commit, wav_bytes, reason)))
-    }
-
-    fn push_pre_roll(&mut self, samples: &[i16], sample_rate: u32) {
-        let max_samples = ((sample_rate as u64 * self.config.pre_roll_ms as u64) / 1000) as usize;
-        if max_samples == 0 {
-            self.pre_roll.clear();
-            return;
-        }
-
-        self.pre_roll.extend(samples.iter().copied());
-        if self.pre_roll.len() > max_samples {
-            let drain = self.pre_roll.len() - max_samples;
-            self.pre_roll.drain(0..drain);
-        }
-    }
-}
-
 /// Tell the client how an utterance ended and, for a finished one, start its
 /// turn.
 fn dispatch_utterance_outcome(
@@ -1514,7 +878,19 @@ fn dispatch_utterance_outcome(
     outcome: UtteranceOutcome,
 ) -> Result<(), String> {
     match outcome {
-        UtteranceOutcome::Finalized(commit, wav_bytes, end_reason) => {
+        UtteranceOutcome::Finalized(ended, end_reason) => {
+            let turn_config = conn
+                .turn_config
+                .clone()
+                .ok_or_else(|| "Received an utterance before `input_stream_start`.".to_string())?;
+            let wav_bytes = ended.wav_bytes;
+            let commit = PendingAudioCommit {
+                utterance_id: ended.utterance_id,
+                utterance_seq: ended.utterance_seq,
+                turn_config,
+                endpointed_at: ended.endpointed_at,
+                endpointing_delay: ended.endpointing_delay,
+            };
             send_json(
                 out_tx,
                 json!({
@@ -1628,13 +1004,6 @@ fn finalize_stream_vad_utterance(
     conn.voice_session.begin_processing(turn_record_id);
 
     Ok(())
-}
-
-fn normalize_stream_vad_threshold(value: Option<f32>) -> f32 {
-    value
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .map(sanitize_score_threshold)
-        .unwrap_or(DEFAULT_STREAM_VAD_THRESHOLD)
 }
 
 /// An assistant audio frame: the 24-byte header (magic, version, kind,
@@ -1993,8 +1362,8 @@ async fn handle_text_message(
 
             let warm_models = turn_config_models(&turn_config)?;
             conn.model_leases = SessionModelLeases::default();
+            conn.turn_config = Some(turn_config);
             conn.streaming_input = Some(StreamingInputState::new(StreamingInputConfig {
-                turn_config,
                 vad_threshold: normalize_stream_vad_threshold(vad_threshold),
                 min_speech_ms: min_speech_ms
                     .unwrap_or(DEFAULT_STREAM_MIN_SPEECH_MS)
@@ -2463,12 +1832,11 @@ fn spawn_turn_task(
                     };
                     let tts_variant = parse_tts_model_variant(&config.tts_model_id)
                         .map_err(|err| format!("Unsupported TTS model: {err}"))?;
+                    let mut sink = VoiceSocketReplySink::new(&out_tx, &commit, output_generation);
                     let speech = speak_reply(
                         &state,
-                        &out_tx,
-                        &commit,
+                        &mut sink,
                         &control,
-                        output_generation,
                         delta_rx,
                         transcript_final_at,
                         |text| {
@@ -2476,7 +1844,7 @@ fn spawn_turn_task(
                                 &state,
                                 &correlation_id,
                                 tts_variant,
-                                config.speaker.clone(),
+                                TtsVoice::speaker(config.speaker.clone()),
                                 &model_leases,
                                 text,
                             )
@@ -2757,7 +2125,7 @@ fn spawn_turn_task(
 /// stage (ASR, the reply, each TTS segment) instead of one for its whole
 /// life, so the time it spends waiting between stages, or on the client,
 /// does not hold a slot other traffic could use (SPK-F22).
-async fn acquire_stage_permit(state: &AppState) -> Result<OwnedAdmissionPermit, String> {
+pub(crate) async fn acquire_stage_permit(state: &AppState) -> Result<OwnedAdmissionPermit, String> {
     state
         .acquire_owned_workload_permit(WorkloadClass::Realtime)
         .await
@@ -2766,312 +2134,12 @@ async fn acquire_stage_permit(state: &AppState) -> Result<OwnedAdmissionPermit, 
 
 /// Run one turn stage under its own admission permit, released when the
 /// stage ends.
-async fn with_stage_permit<T>(
+pub(crate) async fn with_stage_permit<T>(
     state: &AppState,
     stage: impl AsyncFnOnce(RuntimeRequestContext) -> Result<T, String>,
 ) -> Result<T, String> {
     let permit = acquire_stage_permit(state).await?;
     stage(permit.runtime_context()).await
-}
-
-/// One reply segment being synthesized: its audio arrives on `chunks` while
-/// the synthesis task, holding its own admission permit, runs ahead.
-struct SegmentSynthesis {
-    text: String,
-    chunks: tokio::sync::mpsc::Receiver<izwi_core::AudioChunk>,
-    task: AbortOnDropTask<Result<(), String>>,
-}
-
-impl SegmentSynthesis {
-    fn start(
-        state: &AppState,
-        correlation_id: &str,
-        variant: izwi_core::ModelVariant,
-        speaker: Option<String>,
-        model_leases: &SessionModelLeases,
-        text: String,
-    ) -> Self {
-        let mut request = GenerationRequest {
-            id: uuid::Uuid::new_v4().to_string(),
-            model_variant: Some(variant),
-            correlation_id: Some(correlation_id.to_string()),
-            runtime_context: RuntimeRequestContext::default(),
-            text: text.clone(),
-            config: GenerationConfig {
-                streaming: true,
-                options: GenerationParams {
-                    max_tokens: 0,
-                    speaker: speaker.clone(),
-                    voice: speaker,
-                    ..Default::default()
-                },
-            },
-            language: None,
-            reference_audio: None,
-            reference_text: None,
-            reference_language: None,
-            voice_description: None,
-            speaker_references: Vec::new(),
-            chunk_history: Vec::new(),
-        };
-        let (chunk_tx, chunks) = tokio::sync::mpsc::channel(32);
-        let state = state.clone();
-        let model_leases = model_leases.clone();
-        let task = AbortOnDropTask::new(tokio::spawn(async move {
-            model_leases
-                .hold(&state.runtime, variant)
-                .await
-                .map_err(|err| model_load_error("TTS", err))?;
-            let permit = acquire_stage_permit(&state).await?;
-            request.runtime_context = permit.runtime_context();
-            state
-                .runtime
-                .generate_streaming(request, chunk_tx)
-                .await
-                .map_err(|err| format!("TTS failed: {err}"))
-        }));
-        Self { text, chunks, task }
-    }
-
-    async fn finish(self) -> Result<(), String> {
-        drop(self.chunks);
-        self.task
-            .join()
-            .await
-            .map_err(|err| format!("TTS streaming task failed: {err}"))?
-    }
-}
-
-/// The next audio chunk of the segment playing, if one is.
-async fn next_chunk(segment: Option<&mut SegmentSynthesis>) -> Option<izwi_core::AudioChunk> {
-    match segment {
-        Some(segment) => segment.chunks.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Assistant audio of one turn as it goes out: the rate it is announced
-/// at, its frame sequence, and the turn's latency accounting.
-struct ReplyAudio<'a> {
-    state: &'a AppState,
-    out_tx: &'a OutboundTx,
-    control: &'a TurnControl,
-    utterance_id: &'a str,
-    utterance_seq: u64,
-    output_generation: u64,
-    format: OutputAudioFormat,
-    encoder: Option<AudioOutputEncoder>,
-    announced_rate: Option<u32>,
-    chunk_seq: u32,
-    first_text_at: Option<Instant>,
-}
-
-impl ReplyAudio<'_> {
-    /// The rate `chunk_rate` audio goes out at, announcing the first.
-    fn rate(&mut self, chunk_rate: u32) -> Result<u32, String> {
-        let (sample_rate, first) = realtime_chunk_rate(&mut self.announced_rate, chunk_rate)?;
-        if first {
-            self.encoder = Some(AudioOutputEncoder::new(self.format, sample_rate)?);
-            send_turn_json(
-                self.out_tx,
-                self.output_generation,
-                json!({
-                    "type": "assistant_audio_start",
-                    "utterance_id": self.utterance_id,
-                    "utterance_seq": self.utterance_seq,
-                    "sample_rate": self.format.wire_rate(sample_rate),
-                    "audio_format": self.format.as_str(),
-                }),
-            );
-        }
-        Ok(sample_rate)
-    }
-
-    async fn send(&mut self, samples: &[f32], is_final: bool) -> Result<(), String> {
-        let Some(sample_rate) = self.announced_rate else {
-            return Ok(());
-        };
-        if samples.is_empty() && !is_final {
-            return Ok(());
-        }
-        let Some(encoder) = self.encoder.as_mut() else {
-            return Ok(());
-        };
-        let mut encoded = encoder.encode(samples)?;
-        if is_final {
-            encoded.extend(encoder.finish()?);
-        } else if encoded.is_empty() {
-            // The resampler holds this audio for the next chunk.
-            return Ok(());
-        }
-        let frame = encode_assistant_audio_binary_frame(
-            self.format,
-            self.utterance_seq,
-            self.chunk_seq,
-            self.format.wire_rate(sample_rate),
-            is_final,
-            &encoded,
-        );
-        self.chunk_seq = self.chunk_seq.saturating_add(1);
-        let duration = Duration::from_secs_f64(samples.len() as f64 / sample_rate.max(1) as f64);
-        self.out_tx
-            .send_audio(
-                self.output_generation,
-                Message::Binary(frame.into()),
-                encoded.len(),
-                duration.as_millis() as u64,
-            )
-            .await
-            .map_err(|err| format!("Outbound audio delivery failed: {err:?}"))?;
-        if !samples.is_empty() {
-            if let Some(first_text_at) = self.first_text_at.take() {
-                self.state
-                    .runtime
-                    .record_voice_latency(VoiceLatency::TtsFirstAudio, first_text_at.elapsed());
-            }
-            self.control
-                .reply()
-                .ledger
-                .audio_sent(duration.as_secs_f64() * 1000.0);
-            self.control.audio_sent(&self.state.runtime, duration);
-        }
-        Ok(())
-    }
-}
-
-/// Speak a reply while the text model writes it (SPK-F2): its text, minus
-/// any reasoning, is cut into segments as sentences complete, and the next
-/// segment is synthesized while the one before it plays. Segments are
-/// joined with the long-form pause and fades (SPK-F20), and each spoken
-/// segment is entered in the turn's ledger, so an interruption knows what
-/// was heard (SPK-F13).
-#[allow(clippy::too_many_arguments)]
-async fn speak_reply(
-    state: &AppState,
-    out_tx: &OutboundTx,
-    commit: &PendingAudioCommit,
-    control: &TurnControl,
-    output_generation: u64,
-    mut deltas: tokio::sync::mpsc::UnboundedReceiver<String>,
-    text_requested_at: Instant,
-    synthesize: impl Fn(String) -> SegmentSynthesis,
-) -> Result<(), String> {
-    let fallback_sample_rate = state.runtime.sample_rate().await;
-    let mut reasoning = ReasoningFilter::default();
-    let mut segmenter = SpeechSegmenter::default();
-    let mut joiner = SegmentJoiner::default();
-    let mut visible = String::new();
-    let mut text_done = false;
-    let mut spoke = false;
-    let mut playing: Option<SegmentSynthesis> = None;
-    let mut lookahead: Option<SegmentSynthesis> = None;
-    let mut audio = ReplyAudio {
-        state,
-        out_tx,
-        control,
-        utterance_id: &commit.utterance_id,
-        utterance_seq: commit.utterance_seq,
-        output_generation,
-        format: commit.turn_config.output_format(),
-        encoder: None,
-        announced_rate: None,
-        chunk_seq: 0,
-        first_text_at: None,
-    };
-
-    loop {
-        if lookahead.is_none() {
-            if let Some(text) = segmenter.next_segment(text_done) {
-                if !spoke {
-                    spoke = true;
-                    state.runtime.record_voice_latency(
-                        VoiceLatency::LlmFirstToken,
-                        text_requested_at.elapsed(),
-                    );
-                    audio.first_text_at = Some(Instant::now());
-                }
-                lookahead = Some(synthesize(text));
-            }
-        }
-        if playing.is_none() {
-            if let Some(next) = lookahead.take() {
-                joiner.begin_segment();
-                control.reply().ledger.begin_segment(&next.text);
-                playing = Some(next);
-                continue;
-            }
-            if text_done {
-                break;
-            }
-        }
-
-        tokio::select! {
-            biased;
-            _ = control.cancelled() => return Err("Turn cancelled".to_string()),
-            chunk = next_chunk(playing.as_mut()) => match chunk {
-                Some(chunk) => {
-                    if chunk.samples.is_empty() {
-                        continue;
-                    }
-                    let sample_rate = audio.rate(chunk.sample_rate_or(fallback_sample_rate))?;
-                    let samples = joiner.push(&chunk.samples, sample_rate);
-                    audio.send(&samples, false).await?;
-                }
-                None => {
-                    if let Some(finished) = playing.take() {
-                        finished.finish().await?;
-                    }
-                    if let Some(sample_rate) = audio.announced_rate {
-                        let tail = joiner.end_segment(sample_rate);
-                        audio.send(&tail, false).await?;
-                    }
-                }
-            },
-            delta = deltas.recv(), if !text_done => {
-                let text = match delta {
-                    Some(delta) => reasoning.push(&delta),
-                    None => {
-                        text_done = true;
-                        reasoning.finish()
-                    }
-                };
-                if !text.is_empty() {
-                    visible.push_str(&text);
-                    segmenter.push(&text);
-                    send_turn_text_snapshot(
-                        out_tx,
-                        output_generation,
-                        format!("assistant-text-{}", commit.utterance_seq),
-                        json!({
-                            "type": "assistant_text_snapshot",
-                            "utterance_id": commit.utterance_id,
-                            "utterance_seq": commit.utterance_seq,
-                            "text": visible.trim_start(),
-                        }),
-                    );
-                }
-            }
-        }
-    }
-
-    if audio.announced_rate.is_none() {
-        if !spoke {
-            // Nothing to say.
-            return Ok(());
-        }
-        audio.rate(fallback_sample_rate)?;
-    }
-    audio.send(&[], true).await?;
-    send_turn_json(
-        out_tx,
-        output_generation,
-        json!({
-            "type": "assistant_audio_done",
-            "utterance_id": commit.utterance_id,
-            "utterance_seq": commit.utterance_seq,
-        }),
-    );
-    Ok(())
 }
 
 /// Realtime voice speaks with a built-in voice and streams its audio: a
@@ -3109,26 +2177,6 @@ pub(crate) fn validate_realtime_tts_model(variant: izwi_core::ModelVariant) -> R
         ));
     }
     Ok(())
-}
-
-/// The rate a realtime utterance's audio is labelled with: its first chunk's
-/// (`true` when this chunk announces it). A later chunk at another rate is
-/// refused rather than mislabelled.
-fn realtime_chunk_rate(
-    announced: &mut Option<u32>,
-    chunk_rate: u32,
-) -> Result<(u32, bool), String> {
-    let chunk_rate = chunk_rate.max(1);
-    match *announced {
-        None => {
-            *announced = Some(chunk_rate);
-            Ok((chunk_rate, true))
-        }
-        Some(rate) if rate == chunk_rate => Ok((rate, false)),
-        Some(rate) => Err(format!(
-            "TTS audio changed sample rate mid-utterance ({rate} Hz to {chunk_rate} Hz)"
-        )),
-    }
 }
 
 async fn build_unified_history(
@@ -4259,7 +3307,7 @@ fn send_diagnostic_json(out_tx: &OutboundTx, value: serde_json::Value) -> bool {
 const MODEL_LOAD_ERROR_PREFIX: &str = "Failed to load ";
 
 /// The error a turn reports when one of its models cannot be loaded.
-fn model_load_error(stage: &str, err: impl std::fmt::Display) -> String {
+pub(crate) fn model_load_error(stage: &str, err: impl std::fmt::Display) -> String {
     format!("{MODEL_LOAD_ERROR_PREFIX}{stage} model: {err}")
 }
 
@@ -4467,12 +3515,15 @@ impl ModelBackend for IzwiRuntimeBackend {
 }
 
 #[cfg(test)]
+mod golden_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     /// An app state on a temporary database with `realtime` realtime
     /// admission permits.
-    fn test_app_state(realtime: usize) -> (tempfile::TempDir, AppState) {
+    pub(super) fn test_app_state(realtime: usize) -> (tempfile::TempDir, AppState) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let models_dir = temp_dir.path().join("models");
         std::fs::create_dir_all(&models_dir).expect("models dir");
@@ -5015,7 +4066,7 @@ mod tests {
     /// samples of value `n / 10` at 1 kHz; the first segment is slow (30 ms
     /// between chunks), later ones instant. Records each segment's start and
     /// the moment its synthesis ends.
-    fn fake_synthesis(
+    pub(super) fn fake_synthesis(
         log: Arc<Mutex<Vec<(String, Instant, Option<Instant>)>>>,
     ) -> impl Fn(String) -> SegmentSynthesis {
         move |text| {
@@ -5074,7 +4125,7 @@ mod tests {
         let commit = PendingAudioCommit {
             utterance_id: "utt-1".to_string(),
             utterance_seq: 1,
-            turn_config: test_streaming_input().config.turn_config,
+            turn_config: unified_test_config(),
             endpointed_at: Instant::now(),
             endpointing_delay: None,
         };
@@ -5092,12 +4143,11 @@ mod tests {
             deltas.send(" Third and last.".to_string()).expect("delta");
             drop(deltas);
         };
+        let mut sink = VoiceSocketReplySink::new(&out_tx, &commit, 1);
         let speech = speak_reply(
             &state,
-            &out_tx,
-            &commit,
+            &mut sink,
             &control,
-            1,
             delta_rx,
             Instant::now(),
             fake_synthesis(log.clone()),
@@ -5164,10 +4214,8 @@ mod tests {
         drop(deltas);
         speak_reply(
             &state,
-            &out_tx,
-            &commit,
+            &mut VoiceSocketReplySink::new(&out_tx, &commit, 1),
             &control,
-            1,
             delta_rx,
             Instant::now(),
             fake_synthesis(Arc::default()),
@@ -5206,13 +4254,6 @@ mod tests {
 
     fn test_streaming_input() -> StreamingInputState {
         StreamingInputState::new(StreamingInputConfig {
-            turn_config: VoiceTurnConfig::Unified(UnifiedVoiceTurnConfig {
-                s2s_model_id: "LFM2.5-Audio-1.5B".to_string(),
-                speaker: None,
-                max_output_tokens: 32,
-                output_format: OutputAudioFormat::PcmI16,
-                tools: None,
-            }),
             vad_threshold: DEFAULT_STREAM_VAD_THRESHOLD,
             min_speech_ms: 50,
             silence_duration_ms: 200,
@@ -5235,13 +4276,24 @@ mod tests {
 
     fn finalized(
         outcome: Option<UtteranceOutcome>,
-    ) -> Option<(PendingAudioCommit, Vec<u8>, UtteranceEndReason)> {
+    ) -> Option<(EndedUtterance, Vec<u8>, UtteranceEndReason)> {
         match outcome {
-            Some(UtteranceOutcome::Finalized(commit, wav_bytes, reason)) => {
-                Some((commit, wav_bytes, reason))
+            Some(UtteranceOutcome::Finalized(ended, reason)) => {
+                let wav_bytes = ended.wav_bytes.clone();
+                Some((ended, wav_bytes, reason))
             }
             _ => None,
         }
+    }
+
+    fn unified_test_config() -> VoiceTurnConfig {
+        VoiceTurnConfig::Unified(UnifiedVoiceTurnConfig {
+            s2s_model_id: "LFM2.5-Audio-1.5B".to_string(),
+            speaker: None,
+            max_output_tokens: 32,
+            output_format: OutputAudioFormat::PcmI16,
+            tools: None,
+        })
     }
 
     /// Realtime voice refuses a reference-only TTS model at session
@@ -5411,7 +4463,7 @@ mod tests {
         envelope.timestamp_ms = 1_725_000_000_123;
 
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../ui/src/features/voice/realtime/voice_v2_session_ready.fixture.json"
+            "../../../../../ui/src/features/voice/realtime/voice_v2_session_ready.fixture.json"
         ))
         .expect("shared voice v2 SessionReady fixture");
         assert_eq!(

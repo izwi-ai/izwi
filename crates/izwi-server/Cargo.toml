@@ -101,4 +101,5 @@ izwi-test-process = { path = "../izwi-test-process" }
 izwi-vad = { path = "../izwi-vad", features = ["test-signals"] }
 reqwest = { workspace = true }
 rustls = { workspace = true }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 serde_json = { workspace = true }

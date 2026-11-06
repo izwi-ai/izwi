@@ -1,0 +1,6 @@
+text {"text":"Hello there, it is lovely to hear from you. The second sentence is longer than the first. Last one.","type":"assistant_text_snapshot","utterance_id":"utt-1","utterance_seq":1}
+text {"audio_format":"g711_ulaw","sample_rate":8000,"type":"assistant_audio_start","utterance_id":"utt-1","utterance_seq":1}
+bin len=1944 head=4956575301030000010000000000000000000000401f0000 payload=e7c61b72a2365b67
+bin len=3864 head=4956575301030000010000000000000001000000401f0000 payload=775df2d6b16680c9
+bin len=3384 head=4956575301030100010000000000000002000000401f0000 payload=2d9ef0992f1c3d9a
+text {"type":"assistant_audio_done","utterance_id":"utt-1","utterance_seq":1}

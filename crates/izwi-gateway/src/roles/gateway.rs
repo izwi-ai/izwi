@@ -664,6 +664,24 @@ pub async fn gateway_state(
     } else {
         state
     };
+    let state = if args.gateway_openai_realtime_upstreams.is_empty() {
+        state
+    } else {
+        let upstreams = app::openai_realtime_proxy::OpenAiRealtimeUpstreams::new(
+            args.gateway_openai_realtime_upstreams.clone(),
+            args.gateway_openai_realtime_upstream_api_key.clone(),
+            args.gateway_realtime_max_sessions,
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+        info!(
+            service = service_name(),
+            version = SERVICE_VERSION,
+            upstreams = args.gateway_openai_realtime_upstreams.len(),
+            max_sessions = args.gateway_realtime_max_sessions,
+            "Gateway OpenAI Realtime pass-through enabled at /v1/realtime"
+        );
+        state.with_openai_realtime(upstreams)
+    };
     let poller = GatewayWorkerStatusPoller {
         poller_count: boot_poller_count,
         tasks,

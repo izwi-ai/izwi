@@ -70,6 +70,19 @@ impl AudioOutputEncoder {
         Ok(Self { format, resampler })
     }
 
+    /// 16-bit PCM at `target_rate` whatever the model's rate: OpenAI
+    /// Realtime's `audio/pcm` is 24 kHz only, so audio from a model at
+    /// another rate is resampled rather than mislabelled.
+    pub(crate) fn pcm_at(model_rate: u32, target_rate: u32) -> Result<Self, String> {
+        let resampler = (model_rate != target_rate)
+            .then(|| StreamResampler::new(model_rate, target_rate))
+            .transpose()?;
+        Ok(Self {
+            format: OutputAudioFormat::PcmI16,
+            resampler,
+        })
+    }
+
     /// The payload for `samples` (some audio may be held for the next call).
     pub(crate) fn encode(&mut self, samples: &[f32]) -> Result<Vec<u8>, String> {
         let samples = match self.resampler.as_mut() {
@@ -226,31 +239,31 @@ pub(crate) fn linear_to_alaw(sample: i16) -> u8 {
     (value as u8) ^ mask
 }
 
+/// ITU-T G.711 μ-law decoder: the 16-bit linear sample of one code.
+pub(crate) fn ulaw_to_linear(code: u8) -> i16 {
+    let code = !code;
+    let exponent = (code >> 4) & 0x07;
+    let magnitude = ((((code & 0x0F) as i32) << 3) + 0x84) << exponent;
+    let value = magnitude - 0x84;
+    (if code & 0x80 != 0 { -value } else { value }) as i16
+}
+
+/// ITU-T G.711 A-law decoder: the 16-bit linear sample of one code.
+pub(crate) fn alaw_to_linear(code: u8) -> i16 {
+    let code = code ^ 0x55;
+    let segment = (code & 0x70) >> 4;
+    let mut value = ((code & 0x0F) as i32) << 4;
+    value = match segment {
+        0 => value + 8,
+        1 => value + 0x108,
+        _ => (value + 0x108) << (segment - 1),
+    };
+    (if code & 0x80 != 0 { value } else { -value }) as i16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Reference μ-law decoder (ITU-T G.711), for round trips.
-    fn ulaw_to_linear(code: u8) -> i16 {
-        let code = !code;
-        let exponent = (code >> 4) & 0x07;
-        let magnitude = ((((code & 0x0F) as i32) << 3) + 0x84) << exponent;
-        let value = magnitude - 0x84;
-        (if code & 0x80 != 0 { -value } else { value }) as i16
-    }
-
-    /// Reference A-law decoder (ITU-T G.711), for round trips.
-    fn alaw_to_linear(code: u8) -> i16 {
-        let code = code ^ 0x55;
-        let segment = (code & 0x70) >> 4;
-        let mut value = ((code & 0x0F) as i32) << 4;
-        value = match segment {
-            0 => value + 8,
-            1 => value + 0x108,
-            _ => (value + 0x108) << (segment - 1),
-        };
-        (if code & 0x80 != 0 { value } else { -value }) as i16
-    }
 
     #[test]
     fn g711_codes_match_the_standard_anchors() {

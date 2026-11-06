@@ -221,6 +221,14 @@ impl AuthProvider for LocalApiKeyAuth {
     async fn authenticate(&self, request: &RequestEnvelope) -> HookResult<Principal> {
         if !is_public_request(&request.method, &request.path)
             && !presented_api_keys(request).any(|candidate| self.key.matches(&candidate))
+            && !crate::app::openai_realtime::secrets::admits(
+                &request.method,
+                &request.path,
+                request
+                    .headers
+                    .iter()
+                    .map(|header| (header.name.as_str(), header.value.as_str())),
+            )
         {
             return Err(HookError::Denied(
                 "a valid API key is required (Authorization: Bearer <key> or x-api-key)"
@@ -615,6 +623,42 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{} should authenticate: {err}", header.0));
             assert_eq!(principal, Principal::local_anonymous());
         }
+    }
+
+    /// A browser cannot set `Authorization` on a WebSocket: a live realtime
+    /// client secret, presented as OpenAI's subprotocol or a bearer token,
+    /// admits `/v1/realtime` and nothing else.
+    #[tokio::test]
+    async fn realtime_client_secrets_admit_only_the_realtime_socket() {
+        let auth = auth();
+        let (key, _) =
+            crate::app::openai_realtime::secrets::mint(serde_json::json!({"type": "realtime"}), 60)
+                .expect("mint");
+        let protocol = format!("realtime, openai-insecure-api-key.{key}");
+        let bearer = format!("Bearer {key}");
+        for header in [
+            ("sec-websocket-protocol", protocol.as_str()),
+            ("authorization", bearer.as_str()),
+        ] {
+            auth.authenticate(&envelope("GET", "/v1/realtime", &[header]))
+                .await
+                .unwrap_or_else(|err| panic!("{} should admit the socket: {err}", header.0));
+            assert!(matches!(
+                auth.authenticate(&envelope("GET", "/v1/models", &[header]))
+                    .await,
+                Err(HookError::Denied(_))
+            ));
+        }
+        let unknown = "realtime, openai-insecure-api-key.ek_unknown";
+        assert!(matches!(
+            auth.authenticate(&envelope(
+                "GET",
+                "/v1/realtime",
+                &[("sec-websocket-protocol", unknown)]
+            ))
+            .await,
+            Err(HookError::Denied(_))
+        ));
     }
 
     #[tokio::test]

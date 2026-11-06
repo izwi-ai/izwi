@@ -2882,3 +2882,138 @@ async fn a_body_that_does_not_arrive_in_time_is_refused_and_frees_admission() {
     assert_eq!(state.tenant_concurrency.active_owned_work(), 0);
     assert_eq!(state.metrics.snapshot().body_timeout_rejections, 1);
 }
+
+/// The OpenAI Realtime pass-through: the gateway authenticates the client,
+/// dials an izwi-server upstream with the upstream's own key and the
+/// client's query, and relays frames both ways; the upstream's refusal of an
+/// upgrade reaches the client with its status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openai_realtime_sessions_pass_through_to_an_izwi_server() {
+    use crate::app::openai_realtime_proxy::OpenAiRealtimeUpstreams;
+    use axum::extract::ws::{Message as AxumMessage, WebSocketUpgrade};
+    use axum::extract::RawQuery;
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
+
+    // A stand-in izwi-server: checks the gateway's key, refuses an unknown
+    // model, and echoes every client event after `session.created`.
+    async fn upstream(
+        headers: axum::http::HeaderMap,
+        RawQuery(query): RawQuery,
+        upgrade: WebSocketUpgrade,
+    ) -> Response {
+        let authorized = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            == Some("Bearer upstream-key-123");
+        if !authorized {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        let query = query.unwrap_or_default();
+        if query.contains("model=no-such-model") {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({"error": {"message": "Unknown realtime model"}})),
+            )
+                .into_response();
+        }
+        upgrade
+            .protocols(["realtime"])
+            .on_upgrade(move |mut socket| async move {
+                let created =
+                    json!({"type": "session.created", "event_id": "event_1", "query": query});
+                let _ = socket
+                    .send(AxumMessage::Text(created.to_string().into()))
+                    .await;
+                while let Some(Ok(message)) = socket.next().await {
+                    match message {
+                        AxumMessage::Text(text) => {
+                            let _ = socket
+                                .send(AxumMessage::Text(format!("echo:{}", text.as_str()).into()))
+                                .await;
+                        }
+                        AxumMessage::Close(_) => break,
+                        _ => {}
+                    }
+                }
+            })
+    }
+    let upstream_app = Router::new().route("/v1/realtime", axum::routing::get(upstream));
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream_listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(upstream_listener, upstream_app).await });
+
+    let (state, _worker) = registry_gateway_state(ModelVariant::Qwen354BGguf).await;
+    let upstreams = OpenAiRealtimeUpstreams::new(
+        vec![format!("http://127.0.0.1:{upstream_port}")],
+        Some("upstream-key-123".to_string()),
+        2,
+    )
+    .unwrap();
+    let app = create_gateway_router(
+        state.with_openai_realtime(upstreams),
+        &GatewayServeConfig::default(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let request = |model: &str, authorized: bool| {
+        let mut request = format!("ws://127.0.0.1:{port}/v1/realtime?model={model}")
+            .into_client_request()
+            .unwrap();
+        if authorized {
+            request.headers_mut().insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {TEST_API_KEY}")).unwrap(),
+            );
+        }
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_static("realtime"),
+        );
+        request
+    };
+
+    let (mut ws, response) = tokio_tungstenite::connect_async(request("izwi-voice", true))
+        .await
+        .unwrap();
+    assert_eq!(
+        response
+            .headers()
+            .get("sec-websocket-protocol")
+            .and_then(|value| value.to_str().ok()),
+        Some("realtime")
+    );
+    let created = ws.next().await.unwrap().unwrap();
+    let created: serde_json::Value = serde_json::from_str(created.to_text().unwrap()).unwrap();
+    assert_eq!(created["type"], "session.created");
+    assert_eq!(
+        created["query"], "model=izwi-voice",
+        "the client's query reaches the upstream"
+    );
+    ws.send(Message::Text(
+        r#"{"type":"input_audio_buffer.clear"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let echo = ws.next().await.unwrap().unwrap();
+    assert_eq!(
+        echo.to_text().unwrap(),
+        r#"echo:{"type":"input_audio_buffer.clear"}"#
+    );
+
+    match tokio_tungstenite::connect_async(request("no-such-model", true)).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), 400)
+        }
+        other => panic!("expected the upstream's 400, got {other:?}"),
+    }
+    match tokio_tungstenite::connect_async(request("izwi-voice", false)).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), 401)
+        }
+        other => panic!("expected 401 without the gateway key, got {other:?}"),
+    }
+    ws.close(None).await.unwrap();
+}

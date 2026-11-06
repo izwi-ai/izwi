@@ -4,7 +4,9 @@ frames, statistics, Prometheus histogram deltas, per-turn latencies, and one
 end-to-end voice run against a local fake voice socket."""
 import argparse
 import asyncio
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -121,6 +123,30 @@ class Statistics(unittest.TestCase):
         self.assertAlmostEqual(record["transcript_latency_ms"], 300.0)
         self.assertAlmostEqual(record["turn_ms"], 2000.0)
         self.assertEqual(record["errors"], ["boom"])
+
+    def test_openai_turns_use_the_same_marks(self):
+        events = [
+            (10.0, {"type": "input_audio_buffer.speech_started"}),
+            (11.0, {"type": "input_audio_buffer.speech_stopped"}),
+            (11.2, {"type": "response.created", "response": {"status": "in_progress"}}),
+            (11.3, {"type": "conversation.item.input_audio_transcription.completed"}),
+            (11.9, {"type": "response.output_audio.delta", "delta": "AAA="}),
+            (12.0, {"type": "response.output_audio.delta", "delta": "AAA="}),
+            (12.5, {"type": "error", "error": {"message": "boom"}}),
+            (13.0, {"type": "response.done", "response": {"status": "completed"}}),
+        ]
+        record = load.turn_record(load.openai_marks(events))
+        self.assertEqual(record["status"], "ok")
+        self.assertAlmostEqual(record["time_to_first_audio_ms"], 900.0)
+        self.assertAlmostEqual(record["transcript_latency_ms"], 300.0)
+        self.assertAlmostEqual(record["turn_ms"], 2000.0)
+        self.assertEqual(record["errors"], ["boom"])
+        cancelled = [(1.0, {"type": "response.done", "response": {"status": "cancelled"}})]
+        self.assertEqual(load.turn_record(load.openai_marks(cancelled))["status"], "cancelled")
+
+    def test_openai_protocol_is_voice_only(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            load.parse_args(["--protocol", "openai", "--mode", "transcription"])
 
 
 class FakeVoiceServer:

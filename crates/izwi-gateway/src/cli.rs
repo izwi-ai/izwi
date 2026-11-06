@@ -277,6 +277,26 @@ pub struct GatewayArgs {
         default_value_t = 600_000
     )]
     pub gateway_realtime_session_budget_ms: u64,
+
+    /// OpenAI Realtime pass-through: izwi-server base URLs (comma-separated)
+    /// that run `/v1/realtime` sessions. Set, the gateway serves
+    /// `/v1/realtime`, admits each session and relays it to one of them,
+    /// round robin, capped by `--gateway-realtime-max-sessions`.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_OPENAI_REALTIME_UPSTREAMS",
+        value_delimiter = ','
+    )]
+    pub gateway_openai_realtime_upstreams: Vec<String>,
+
+    /// The upstream izwi-servers' API key (their `IZWI_API_KEY`), sent as
+    /// a bearer token on each relayed session.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_OPENAI_REALTIME_UPSTREAM_API_KEY",
+        hide_env_values = true
+    )]
+    pub gateway_openai_realtime_upstream_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

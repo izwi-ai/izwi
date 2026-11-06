@@ -8,6 +8,15 @@ the utterance (`user_speech_end`), finished the transcript
 (`user_transcript_final`), sent the first assistant audio frame and finished
 the turn (`turn_done`). It repeats for --turns turns.
 
+With --protocol openai, `voice` mode speaks the same turns over the OpenAI
+Realtime socket (`/v1/realtime?model=...`) instead: 24 kHz PCM16 appends,
+`server_vad` with the same silence window, and the same marks from its events
+(`input_audio_buffer.speech_stopped`, the input transcription's `completed`,
+the first `response.output_audio.delta` and `response.done`). `--realtime-model`
+picks the profile; a chat model id (the default, --text-model) runs that model
+with the server's default ASR and TTS, Parakeet-TDT-0.6B-v3 and Kokoro-82M,
+which are this script's defaults too, so both protocols can run the same stack.
+
 `transcription` mode opens N concurrent `/v1/speech-to-text/realtime/ws`
 sessions, streams the WAV in real time and records the first partial
 transcript after the first frame and the session end after `session_stop`.
@@ -47,6 +56,13 @@ CLIENT_PCM16_KIND = 1
 ASSISTANT_HEADER_BYTES = 24
 ASSISTANT_AUDIO_KINDS = {2: "pcm_i16", 3: "g711_ulaw", 4: "g711_alaw"}
 MAX_MESSAGE_BYTES = 16 << 20
+OPENAI_SAMPLE_RATE = 24_000
+# OpenAI Realtime events that carry the marks the legacy protocol's events do.
+OPENAI_MARKS = {
+    "input_audio_buffer.speech_stopped": "user_speech_end",
+    "conversation.item.input_audio_transcription.completed": "user_transcript_final",
+    "response.done": "turn_done",
+}
 VOICE_HISTOGRAMS = (
     "izwi_voice_turn_first_audio_seconds",
     "izwi_voice_asr_final_seconds",
@@ -315,13 +331,31 @@ async def wait_for(ws, wanted, deadline, events):
             events.append((now, message))
 
 
+def openai_marks(events):
+    """An OpenAI Realtime turn's (time, event) log with the legacy protocol's
+    mark names: speech end, final transcript, turn done (with `ok` for a
+    completed response) and a first-audio marker."""
+    marked = []
+    for now, event in events:
+        kind = event.get("type")
+        if kind == "response.output_audio.delta":
+            marked.append((now, b"first_audio"))
+        elif kind in OPENAI_MARKS:
+            status = (event.get("response") or {}).get("status")
+            marked.append((now, {"type": OPENAI_MARKS[kind],
+                                 "status": "ok" if status == "completed" else status}))
+        elif kind == "error":
+            marked.append((now, {"type": "error", "message": (event.get("error") or {}).get("message")}))
+    return marked
+
+
 def turn_record(events, speech_end_type="user_speech_end"):
     """Latencies of one voice turn from its (time, event) log."""
     marks = {}
     for now, event in events:
         if isinstance(event, dict):
             marks.setdefault(event.get("type"), now)
-        elif parse_assistant_audio_frame(event) is not None:
+        elif event == b"first_audio" or parse_assistant_audio_frame(event) is not None:
             marks.setdefault("first_audio", now)
     start = marks.get(speech_end_type)
     done = [event for _, event in events if isinstance(event, dict) and event.get("type") == "turn_done"]
@@ -386,6 +420,71 @@ async def run_voice_session(index, args, frames, sample_rate):
     return [{"session": index, "turn": turn, **record} for turn, record in enumerate(records)]
 
 
+async def stream_openai_audio(ws, frames, silence_frames):
+    """Send `frames` then `silence_frames` of silence as real-time
+    `input_audio_buffer.append` events."""
+    silence = bytes(len(frames[0])) if frames else b""
+    started = time.monotonic()
+    for index, payload in enumerate(list(frames) + [silence] * silence_frames):
+        await ws.send_json({"type": "input_audio_buffer.append",
+                            "audio": base64.b64encode(payload).decode()})
+        delay = started + (index + 1) * FRAME_MS / 1000 - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+
+async def run_openai_voice_session(index, args, frames, sample_rate):
+    """One `/v1/realtime` session speaking --turns turns, recorded with the
+    legacy protocol's marks."""
+    if sample_rate != OPENAI_SAMPLE_RATE:
+        raise ValueError(f"--protocol openai needs 24 kHz audio; {args.audio} is {sample_rate} Hz")
+    query = urllib.parse.urlencode({"model": args.realtime_model or args.text_model})
+    ws = await WebSocket.connect(args.base_url.replace("http", "ws", 1) + f"/v1/realtime?{query}")
+    records, deadline = [], time.monotonic() + args.timeout
+    try:
+        events = []
+        await wait_for(ws, "session.created", deadline, events)
+        session = {
+            "type": "realtime",
+            "output_modalities": ["audio"],
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcm", "rate": OPENAI_SAMPLE_RATE},
+                    # As stock clients send it: the profile's own ASR.
+                    "transcription": {"model": "gpt-4o-transcribe"},
+                    "turn_detection": {"type": "server_vad",
+                                       "silence_duration_ms": args.silence_ms},
+                },
+                "output": {"format": {"type": "audio/pcm", "rate": OPENAI_SAMPLE_RATE}},
+            },
+        }
+        if args.speaker:
+            session["audio"]["output"]["voice"] = args.speaker
+        if args.system_prompt:
+            session["instructions"] = args.system_prompt
+        if args.max_output_tokens:
+            session["max_output_tokens"] = args.max_output_tokens
+        if args.output_audio_format:
+            session["audio"]["output"]["format"] = {"type": args.output_audio_format}
+        await ws.send_json({"type": "session.update", "session": session})
+        await wait_for(ws, "session.updated", deadline, events)
+        silence_frames = (args.silence_ms + args.trailing_silence_ms) // FRAME_MS
+        for _ in range(args.turns):
+            events = []
+            sender = asyncio.ensure_future(stream_openai_audio(ws, frames, silence_frames))
+            try:
+                await wait_for(ws, "response.done", deadline, events)
+            finally:
+                await sender
+            records.append(turn_record(openai_marks(
+                [(now, event) for now, event in events if isinstance(event, dict)])))
+    except Exception as error:  # noqa: BLE001 - one failed session is a result
+        records.append({"status": "failed", "error": f"{type(error).__name__}: {error}"})
+    finally:
+        await ws.close()
+    return [{"session": index, "turn": turn, **record} for turn, record in enumerate(records)]
+
+
 async def run_transcription_session(index, args, frames, sample_rate):
     ws = await WebSocket.connect(
         args.base_url.replace("http", "ws", 1) + "/v1/speech-to-text/realtime/ws")
@@ -425,9 +524,12 @@ def build_report(args, records, server):
         "schema": SCHEMA,
         "schema_version": SCHEMA_VERSION,
         "mode": args.mode,
+        "protocol": args.protocol,
         "sessions": args.sessions,
         "turns": args.turns if args.mode == "voice" else 1,
-        "models": {"asr": args.asr_model, "text": args.text_model, "tts": args.tts_model},
+        "models": ({"realtime": args.realtime_model or args.text_model}
+                   if args.protocol == "openai"
+                   else {"asr": args.asr_model, "text": args.text_model, "tts": args.tts_model}),
         "statuses": statuses,
         "summary": {field: summarize([record.get(field) for record in records]) for field in fields},
         "server": server,
@@ -439,7 +541,12 @@ async def run(args):
     pcm, sample_rate = read_wav(args.audio)
     frames = pcm_frames(pcm, sample_rate)
     before = scrape(args.metrics_url) if args.metrics_url else None
-    session = run_voice_session if args.mode == "voice" else run_transcription_session
+    if args.mode == "transcription":
+        session = run_transcription_session
+    elif args.protocol == "openai":
+        session = run_openai_voice_session
+    else:
+        session = run_voice_session
     results = await asyncio.gather(*(session(index, args, frames, sample_rate)
                                      for index in range(args.sessions)))
     server = server_view(before, scrape(args.metrics_url)) if before else None
@@ -450,6 +557,11 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--base-url", default="http://127.0.0.1:8080")
     parser.add_argument("--mode", choices=("voice", "transcription"), default="voice")
+    parser.add_argument("--protocol", choices=("izwi", "openai"), default="izwi",
+                        help="voice mode's socket: izwi's own or the OpenAI Realtime one")
+    parser.add_argument("--realtime-model",
+                        help="--protocol openai: the `model` (a profile, a speech-to-speech model "
+                             "or a chat model id); default --text-model")
     parser.add_argument("--sessions", type=int, default=1)
     parser.add_argument("--turns", type=int, default=3)
     parser.add_argument("--audio", default="data/fox.wav")
@@ -471,6 +583,8 @@ def parse_args(argv):
     args = parser.parse_args(argv)
     if args.sessions < 1 or args.turns < 1:
         parser.error("--sessions and --turns must be at least 1")
+    if args.protocol == "openai" and args.mode != "voice":
+        parser.error("--protocol openai is for voice mode")
     return args
 
 

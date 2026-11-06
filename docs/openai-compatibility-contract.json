@@ -10,7 +10,9 @@
       "/v1/responses/:response_id/cancel",
       "/v1/responses/:response_id/input_items",
       "/v1/audio/transcriptions",
-      "/v1/audio/speech"
+      "/v1/audio/speech",
+      "/v1/realtime",
+      "/v1/realtime/client_secrets"
     ],
     "preview_endpoints": {
       "/v1/responses": {
@@ -32,11 +34,20 @@
         "contract": "input-item lookup for process-local stored response records",
         "durability": "process_local",
         "retention": "not available after server restart or memory-store eviction"
+      },
+      "/v1/realtime": {
+        "contract": "OpenAI Realtime GA events over WebSocket: session, input audio buffer, conversation items, responses, transcription; no WebRTC, SIP or MCP",
+        "durability": "process_local",
+        "retention": "the conversation lives as long as the socket"
+      },
+      "/v1/realtime/client_secrets": {
+        "contract": "ephemeral ek_ keys bound to a session config, admitting /v1/realtime only",
+        "durability": "process_local",
+        "retention": "keys live in memory for at most two hours and are lost on server restart"
       }
     },
     "out_of_scope_endpoints": [
       "/v1/audio/translations",
-      "/v1/realtime/client_secrets",
       "/v1/realtime/sessions",
       "/v1/realtime/transcription_sessions"
     ]

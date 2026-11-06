@@ -1,7 +1,7 @@
 //! OpenAI-compatible responses resources.
 
-mod dto;
-mod handlers;
+pub(crate) mod dto;
+pub(crate) mod handlers;
 
 use axum::{extract::DefaultBodyLimit, routing::get, routing::post, Router};
 

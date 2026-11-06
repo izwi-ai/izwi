@@ -815,7 +815,11 @@ through their existing local/desktop profile where applicable:
 Multimodal chat is also local-only. Realtime transcription/voice, agent and chat
 workflows, durable jobs/history, media, saved voices, Studio, and model administration
 must not be published through the gateway until their state, artifact,
-streaming, ownership, and cancellation contracts are migrated.
+streaming, ownership, and cancellation contracts are migrated. The one realtime
+voice exception is OpenAI Realtime (`/v1/realtime`): with
+`IZWI_GATEWAY_OPENAI_REALTIME_UPSTREAMS` the gateway authenticates and admits each
+session and relays it whole to an izwi-server, which keeps the session's state;
+the gateway runs no part of the voice turn.
 
 Do not replace the local server with the gateway for desktop or local workflows.
 `--role local` remains the compatibility profile and continues to own its
