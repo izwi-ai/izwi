@@ -576,7 +576,13 @@ async fn persisted_sessions_record_their_turns_in_the_voice_history() {
                 .await
                 .expect("session")
                 .expect("stored");
-            if let Some(turn) = session.turns.first() {
+            // A turn is written in steps (created, transcript, reply, then
+            // completed), so wait until it leaves `processing`.
+            if let Some(turn) = session
+                .turns
+                .first()
+                .filter(|turn| turn.status != "processing")
+            {
                 assert_eq!(turn.user_text.as_deref(), Some("Remember me."));
                 assert_eq!(
                     turn.status, "error",
