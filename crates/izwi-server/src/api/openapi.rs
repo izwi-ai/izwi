@@ -1183,6 +1183,155 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
          types, and the session limits.",
         preview_response(),
     );
+    add_speech_api_paths(paths);
+}
+
+/// The speech API beyond `/v1/audio/speech` and `/transcriptions`:
+/// translations, batch, lookup, the text-in socket, voices and consents.
+fn add_speech_api_paths(paths: &mut Map<String, Value>) {
+    add_operation(
+        paths,
+        "/v1/audio/translations",
+        "post",
+        "OpenAI Compatible",
+        "Create translation",
+        "OpenAI's translation route: multipart `file`, `model` (a model that translates speech: \
+         Granite Speech 5.0, Nemotron 3.5 Transcribe), `prompt`, `response_format` (json, text, \
+         srt, verbose_json, vtt), `temperature`. The target is English unless `to_language` / \
+         `target_language` names another; `language` hints the source; `stream` gives \
+         `transcript.text.*` events.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/audio/speech/batch",
+        "post",
+        "OpenAI Compatible",
+        "Create speech in a batch",
+        "Up to IZWI_TTS_BATCH_MAX_ITEMS speech requests: top-level fields are defaults each of \
+         `items` overrides. Returns `{id, object, results[], total, succeeded, failed}`; each \
+         result carries base64 `audio_data` or an OpenAI `error` object, and an `id` for \
+         `GET /v1/audio/speech/{speech_id}`.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/audio/speech/{speech_id}",
+        "get",
+        "OpenAI Compatible",
+        "Get a speech request's outcome",
+        "Status, finish reason, usage, audio duration and timings of a /v1/audio/speech request \
+         (any delivery), by its `X-Izwi-Speech-Id`. Process-local and bounded \
+         (IZWI_SPEECH_OUTCOME_CAPACITY, IZWI_SPEECH_OUTCOME_TTL_SECS); no audio is kept.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/audio/speech/stream",
+        "get",
+        "Realtime",
+        "Open the text-in speech WebSocket",
+        "Text in, audio out: `session.config`, then `input.text` as text arrives, \
+         `input.commit` to speak what is buffered, `input.done` to end the utterance, \
+         `input.cancel`, `session.close`. Audio arrives per segment between `audio.start` and \
+         `audio.done`. `?dialect=sglang-omni|vllm-omni` serves those stacks' clients.",
+        websocket_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/audio/voices",
+        "get",
+        "OpenAI Compatible",
+        "List voices",
+        "Every saved voice, as OpenAI `audio.voice` objects in `data` and SGLang-Omni's \
+         `voices`/`uploaded_voices`.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/audio/voices",
+        "post",
+        "OpenAI Compatible",
+        "Create a voice",
+        "Multipart `name`, `audio_sample` (at most 10 MiB) and `consent` (a consent id from \
+         /v1/audio/voice_consents, or an attestation, per IZWI_VOICE_CONSENT_MODE); optional \
+         `ref_text`, `reference_language`. Speak it with `voice: {\"id\": ...}`.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/audio/voices/{voice_id}",
+        "get",
+        "OpenAI Compatible",
+        "Get a voice",
+        "A voice by id or by name.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/audio/voices/{voice_id}",
+        "delete",
+        "OpenAI Compatible",
+        "Delete a voice",
+        "Deletes a voice by id (OpenAI) or by name (SGLang-Omni, vLLM-Omni).",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/audio/voice_consents",
+        "get",
+        "OpenAI Compatible",
+        "List voice consents",
+        "Consent recordings, newest first; `after` and `limit` (1 to 100) page them.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/audio/voice_consents",
+        "post",
+        "OpenAI Compatible",
+        "Create a voice consent",
+        "Multipart `name`, `recording` (at most 10 MiB) and `language` (BCP 47). Under \
+         IZWI_VOICE_CONSENT_MODE=verified the recording must say a consent phrase \
+         (GET /v1/audio/consent_phrases).",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/audio/voice_consents/{consent_id}",
+        "get",
+        "OpenAI Compatible",
+        "Get a voice consent",
+        "A consent recording's metadata and verification.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/audio/voice_consents/{consent_id}",
+        "post",
+        "OpenAI Compatible",
+        "Update a voice consent",
+        "JSON `{\"name\"}`.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/audio/voice_consents/{consent_id}",
+        "delete",
+        "OpenAI Compatible",
+        "Delete a voice consent",
+        "Deletes the recording and revokes every voice made with it.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/audio/consent_phrases",
+        "get",
+        "OpenAI Compatible",
+        "List consent phrases",
+        "What a verified consent recording says, per language.",
+        preview_response(),
+    );
 }
 
 fn add_speech_history_family(
@@ -1853,7 +2002,7 @@ fn create_chat_completion() {}
     summary = "Create speech",
     request_body = SpeechRequest,
     responses(
-        (status = 200, description = "Generated audio bytes, or server-sent audio events when stream_format is sse"),
+        (status = 200, description = "Encoded audio (Content-Type per response_format; a chunked body for stream_format audio), or server-sent audio events for stream_format sse. X-Izwi-Speech-Id names the request for GET /v1/audio/speech/{speech_id}."),
         (status = 400, description = "Invalid request", body = ApiErrorEnvelope),
         (status = 500, description = "Server error", body = ApiErrorEnvelope)
     )
@@ -2244,9 +2393,23 @@ pub struct SpeechRequest {
     /// `<|speaker:15|>` tags in it as a dialogue. Required unless a
     /// `script` gives the text.
     pub input: Option<String>,
-    pub voice: Option<String>,
+    /// A voice name, or OpenAI's custom-voice object `{"id": "..."}` naming
+    /// a saved voice (`/v1/audio/voices`). A model that clones and has no
+    /// built-in voices reads a name as an uploaded voice's.
+    #[schema(value_type = Option<Object>)]
+    pub voice: Option<serde_json::Value>,
+    /// `mp3`, `opus` (Ogg), `flac`, `wav`, `pcm` (OpenAI's: 24 kHz PCM16),
+    /// `pcm_i16` / `pcm_f32` (the model's rate), `g711_ulaw`, `g711_alaw`.
+    /// `aac` is refused: AAC encoders need a patent licence. The default is
+    /// IZWI_SPEECH_DEFAULT_FORMAT (`wav`).
     pub response_format: Option<String>,
+    /// Return WAV for a recognized format this build cannot encode (`aac`).
     pub allow_format_fallback: Option<bool>,
+    /// The rate to encode at (resampled when the model's differs); opus
+    /// takes 8000/12000/16000/24000/48000, mp3 its MPEG rates.
+    pub sample_rate: Option<u32>,
+    /// Target bitrate in bit/s for mp3 and opus.
+    pub bitrate: Option<u32>,
     pub speed: Option<f32>,
     /// A language hint. Fish Audio Drama 3 reads the language from the text
     /// and is not given this; a `[language: xx]` tag in the text steers it.
@@ -2259,10 +2422,15 @@ pub struct SpeechRequest {
     pub max_output_tokens: Option<usize>,
     /// Top-k sampling. Fish Audio Drama 3 reads 0 as no cap.
     pub top_k: Option<usize>,
+    /// `true` streams server-sent events (as `stream_format: "sse"`).
     pub stream: Option<bool>,
+    /// `audio`: the encoded file as a chunked body while it is generated;
+    /// `sse`: base64 deltas of the same bytes (`speech.audio.delta`).
     pub stream_format: Option<String>,
+    /// At most 4096 characters.
     pub instructions: Option<String>,
-    /// A reference clip to clone, base64 audio. Fish Audio Drama 3 takes one
+    /// A reference clip to clone: base64 audio, a data URL, or an http(s)
+    /// URL on IZWI_ALLOWED_MEDIA_DOMAINS (`ref_audio` elsewhere). Fish Audio Drama 3 takes one
     /// up to 60 s (saved voices hold 30 s) and speaks in a voice its `seed`
     /// sets when given none.
     pub reference_audio: Option<String>,
@@ -2482,7 +2650,9 @@ mod tests {
     use std::collections::HashSet;
 
     /// The gateway's document: this one restricted to the routes the gateway
-    /// serves.
+    /// serves. `/v1/realtime` needs OpenAI Realtime upstreams, the audio
+    /// routes need audio upstreams (or Realtime ones), and voices and
+    /// consents also need `--gateway-audio-shared-state`.
     fn gateway_document() -> Value {
         let mut doc = document();
         if let Some(paths) = doc.get_mut("paths").and_then(Value::as_object_mut) {
@@ -2497,6 +2667,18 @@ mod tests {
                         | "/v1/chat/completions"
                         | "/v1/models"
                         | "/v1/models/{model}"
+                        | "/v1/realtime"
+                        | "/v1/audio/speech"
+                        | "/v1/audio/speech/batch"
+                        | "/v1/audio/speech/stream"
+                        | "/v1/audio/speech/{speech_id}"
+                        | "/v1/audio/transcriptions"
+                        | "/v1/audio/translations"
+                        | "/v1/audio/voices"
+                        | "/v1/audio/voices/{voice_id}"
+                        | "/v1/audio/voice_consents"
+                        | "/v1/audio/voice_consents/{consent_id}"
+                        | "/v1/audio/consent_phrases"
                 )
             });
         }

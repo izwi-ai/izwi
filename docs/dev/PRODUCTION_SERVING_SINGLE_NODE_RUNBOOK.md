@@ -802,8 +802,8 @@ representative routes return 404 in gateway mode and remain available only
 through their existing local/desktop profile where applicable:
 
 - `/v1/models`
-- `/v1/audio/speech`
-- `/v1/audio/transcriptions`
+- `/v1/audio/speech` and `/v1/audio/transcriptions` (unless the speech API
+  pass-through below is configured)
 - `/v1/responses`
 - `/v1/media`
 - `/v1/voices`
@@ -820,6 +820,32 @@ voice exception is OpenAI Realtime (`/v1/realtime`): with
 `IZWI_GATEWAY_OPENAI_REALTIME_UPSTREAMS` the gateway authenticates and admits each
 session and relays it whole to an izwi-server, which keeps the session's state;
 the gateway runs no part of the voice turn.
+
+The speech API is relayed the same way. With `IZWI_GATEWAY_AUDIO_UPSTREAMS`,
+the gateway relays these routes to izwi-servers, round robin, after its own
+authentication, admission and tenant lease:
+
+- `POST /v1/audio/speech` (buffered, chunked `audio` and SSE);
+- `/v1/audio/speech/batch`;
+- `GET /v1/audio/speech/{id}`;
+- the `/v1/audio/speech/stream` WebSocket;
+- `/v1/audio/transcriptions` and `/v1/audio/translations`.
+
+Without `IZWI_GATEWAY_AUDIO_UPSTREAMS`, the Realtime upstreams serve these
+routes when those are set.
+
+Bodies stream through unbuffered. A speech id's lookup goes to the upstream
+that served it; the gateway asks each upstream in turn for an id it has not
+seen.
+
+Voices and consents (`/v1/audio/voices`, `/v1/audio/voice_consents`) are
+relayed only with `IZWI_GATEWAY_AUDIO_SHARED_STATE=true`. Set it when every
+upstream shares one records database (PostgreSQL) and one media store.
+Otherwise a voice made through one upstream would be missing on the next.
+Encoding always happens on the upstream.
+
+The gateway's `/openapi.json` lists `/v1/realtime` and these audio routes only
+when its configuration relays them.
 
 Do not replace the local server with the gateway for desktop or local workflows.
 `--role local` remains the compatibility profile and continues to own its

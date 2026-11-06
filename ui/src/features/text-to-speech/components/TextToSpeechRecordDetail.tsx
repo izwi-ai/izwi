@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   CalendarDays,
   Check,
+  ChevronDown,
   Clock,
   Copy,
   Cpu,
@@ -27,6 +28,12 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
   formatClockDuration,
   formatHistoryDate,
 } from "@/components/history/format";
@@ -40,6 +47,10 @@ import {
   speechDownloadFilename,
   speechTextLabel,
 } from "@/features/text-to-speech/support";
+import {
+  AUDIO_DOWNLOAD_FORMATS,
+  type AudioDownloadFormat,
+} from "@/shared/audioFormats";
 
 const TITLE_MAX_CHARS = 60;
 
@@ -179,11 +190,19 @@ export function TextToSpeechRecordDetail({
     window.setTimeout(() => setCopied(false), 1800);
   }
 
-  async function handleDownloadAudio(): Promise<void> {
+  async function handleDownloadAudio(format: AudioDownloadFormat): Promise<void> {
     if (!hasAudio || !audioUrl || !record) {
       return;
     }
-    await api.downloadAudioFile(audioUrl, speechDownloadFilename(record));
+    // WAV is the saved audio itself; the server encodes the others.
+    if (format === "wav") {
+      await api.downloadAudioFile(audioUrl, speechDownloadFilename(record));
+      return;
+    }
+    await api.downloadAudioFile(
+      api.textToSpeechRecordAudioUrl(record.id, { format }),
+      speechDownloadFilename(record, format),
+    );
   }
 
   async function handleConfirmDelete(): Promise<void> {
@@ -288,16 +307,30 @@ export function TextToSpeechRecordDetail({
             {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
             Copy text
           </Button>
-          <Button
-            type="button"
-            size="sm"
-            className="h-9 gap-2"
-            onClick={() => void handleDownloadAudio()}
-            disabled={!hasAudio}
-          >
-            <Download className="h-4 w-4" />
-            Download
-          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                size="sm"
+                className="h-9 gap-2"
+                disabled={!hasAudio}
+              >
+                <Download className="h-4 w-4" />
+                Download
+                <ChevronDown className="h-3.5 w-3.5 opacity-70" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-36">
+              {AUDIO_DOWNLOAD_FORMATS.map((option) => (
+                <DropdownMenuItem
+                  key={option.id}
+                  onSelect={() => void handleDownloadAudio(option.id)}
+                >
+                  {option.label}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
         </>
       }
     >

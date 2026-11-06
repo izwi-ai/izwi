@@ -682,6 +682,41 @@ pub async fn gateway_state(
         );
         state.with_openai_realtime(upstreams)
     };
+    // The speech API rides the Realtime upstreams unless it has its own.
+    let (audio_urls, audio_key) = if args.gateway_audio_upstreams.is_empty() {
+        (
+            args.gateway_openai_realtime_upstreams.clone(),
+            args.gateway_audio_upstream_api_key
+                .clone()
+                .or_else(|| args.gateway_openai_realtime_upstream_api_key.clone()),
+        )
+    } else {
+        (
+            args.gateway_audio_upstreams.clone(),
+            args.gateway_audio_upstream_api_key
+                .clone()
+                .or_else(|| args.gateway_openai_realtime_upstream_api_key.clone()),
+        )
+    };
+    let state = if audio_urls.is_empty() {
+        state
+    } else {
+        let upstreams = app::audio_proxy::AudioUpstreams::new(
+            audio_urls.clone(),
+            audio_key,
+            args.gateway_audio_shared_state,
+            args.gateway_realtime_max_sessions,
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+        info!(
+            service = service_name(),
+            version = SERVICE_VERSION,
+            upstreams = audio_urls.len(),
+            shared_state = args.gateway_audio_shared_state,
+            "Gateway speech API pass-through enabled at /v1/audio/*"
+        );
+        state.with_audio_upstreams(upstreams)
+    };
     let poller = GatewayWorkerStatusPoller {
         poller_count: boot_poller_count,
         tasks,

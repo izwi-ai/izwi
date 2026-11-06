@@ -1,15 +1,16 @@
 //! Assistant audio encodings a realtime voice session may ask for (SPK-F11):
 //! 16-bit PCM at the model's rate (the default, 384 kb/s at 24 kHz), or
-//! G.711 μ-law or A-law at 8 kHz (64 kb/s, telephony). Opus would need a C
-//! encoder; there is none in the dependency tree.
+//! G.711 μ-law or A-law at 8 kHz (64 kb/s, telephony). The companding and
+//! the resampler are `izwi-audio-codec`'s, shared with `/v1/audio/speech`.
 
-use rubato::audioadapter_buffers::direct::SequentialSlice;
-use rubato::{Fft, FixedSync, Resampler, WindowFunction};
+use izwi_audio_codec::StreamResampler;
+
+pub(crate) use izwi_audio_codec::g711::{
+    alaw_to_linear, linear_to_alaw, linear_to_ulaw, ulaw_to_linear,
+};
 
 /// G.711's sample rate.
-pub(crate) const G711_SAMPLE_RATE: u32 = 8_000;
-/// Input frames the G.711 resampler takes at a time (20 ms at 24 kHz).
-const RESAMPLE_CHUNK_FRAMES: usize = 480;
+pub(crate) const G711_SAMPLE_RATE: u32 = izwi_audio_codec::g711::SAMPLE_RATE;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum OutputAudioFormat {
@@ -65,7 +66,10 @@ impl AudioOutputEncoder {
             {
                 None
             }
-            _ => Some(StreamResampler::new(model_rate, G711_SAMPLE_RATE)?),
+            _ => Some(
+                StreamResampler::new(model_rate, G711_SAMPLE_RATE)
+                    .map_err(|err| err.to_string())?,
+            ),
         };
         Ok(Self { format, resampler })
     }
@@ -76,7 +80,8 @@ impl AudioOutputEncoder {
     pub(crate) fn pcm_at(model_rate: u32, target_rate: u32) -> Result<Self, String> {
         let resampler = (model_rate != target_rate)
             .then(|| StreamResampler::new(model_rate, target_rate))
-            .transpose()?;
+            .transpose()
+            .map_err(|err| err.to_string())?;
         Ok(Self {
             format: OutputAudioFormat::PcmI16,
             resampler,
@@ -86,7 +91,7 @@ impl AudioOutputEncoder {
     /// The payload for `samples` (some audio may be held for the next call).
     pub(crate) fn encode(&mut self, samples: &[f32]) -> Result<Vec<u8>, String> {
         let samples = match self.resampler.as_mut() {
-            Some(resampler) => resampler.push(samples)?,
+            Some(resampler) => resampler.push(samples).map_err(|err| err.to_string())?,
             None => samples.to_vec(),
         };
         Ok(self.compand(&samples))
@@ -95,7 +100,7 @@ impl AudioOutputEncoder {
     /// The payload for the audio still held at the end of the reply.
     pub(crate) fn finish(&mut self) -> Result<Vec<u8>, String> {
         let samples = match self.resampler.as_mut() {
-            Some(resampler) => resampler.finish()?,
+            Some(resampler) => resampler.finish().map_err(|err| err.to_string())?,
             None => Vec::new(),
         };
         Ok(self.compand(&samples))
@@ -111,154 +116,6 @@ impl AudioOutputEncoder {
             OutputAudioFormat::G711Alaw => linear.map(linear_to_alaw).collect(),
         }
     }
-}
-
-/// A band-limited resampler fed in arbitrary pieces.
-struct StreamResampler {
-    resampler: Fft<f32>,
-    from: u32,
-    to: u32,
-    pending: Vec<f32>,
-    /// Leading output samples that are the resampler's delay, not audio.
-    delay: usize,
-    input_total: usize,
-    output_total: usize,
-}
-
-impl StreamResampler {
-    fn new(from: u32, to: u32) -> Result<Self, String> {
-        // Fixed input chunks with one FFT block each and the BlackmanHarris2
-        // window: rubato 0.15's FftFixedIn with one sub-chunk.
-        let resampler = Fft::<f32>::new_custom(
-            from as usize,
-            to as usize,
-            RESAMPLE_CHUNK_FRAMES,
-            1,
-            1,
-            WindowFunction::BlackmanHarris2,
-            FixedSync::Input,
-        )
-        .map_err(|err| format!("Failed to build the output resampler: {err}"))?;
-        Ok(Self {
-            delay: resampler.output_delay(),
-            resampler,
-            from,
-            to,
-            pending: Vec::new(),
-            input_total: 0,
-            output_total: 0,
-        })
-    }
-
-    fn push(&mut self, samples: &[f32]) -> Result<Vec<f32>, String> {
-        self.input_total += samples.len();
-        self.pending.extend_from_slice(samples);
-        let mut out = Vec::new();
-        loop {
-            let needed = self.resampler.input_frames_next();
-            if self.pending.len() < needed {
-                break;
-            }
-            let chunk: Vec<f32> = self.pending.drain(..needed).collect();
-            let produced = self.process_chunk(&chunk)?;
-            out.extend_from_slice(&produced);
-        }
-        let out = self.skip_delay(out);
-        self.output_total += out.len();
-        Ok(out)
-    }
-
-    /// The rest of the output: the held input and the resampler's delay
-    /// line flushed with silence, cut to the input's duration.
-    fn finish(&mut self) -> Result<Vec<f32>, String> {
-        let expected =
-            (self.input_total as u64 * u64::from(self.to)).div_ceil(u64::from(self.from)) as usize;
-        let mut out = Vec::new();
-        let mut pending = std::mem::take(&mut self.pending);
-        while self.output_total + out.len() < expected + self.delay {
-            pending.resize(self.resampler.input_frames_next(), 0.0);
-            let produced = self.process_chunk(&std::mem::take(&mut pending))?;
-            out.extend_from_slice(&produced);
-        }
-        let mut out = self.skip_delay(out);
-        out.truncate(expected.saturating_sub(self.output_total));
-        self.output_total += out.len();
-        Ok(out)
-    }
-
-    /// Resample one `input_frames_next()`-frame chunk.
-    fn process_chunk(&mut self, chunk: &[f32]) -> Result<Vec<f32>, String> {
-        let input = SequentialSlice::new(chunk, 1, chunk.len())
-            .map_err(|err| format!("Output resampling failed: {err}"))?;
-        self.resampler
-            .process(&input, None)
-            .map(|produced| produced.take_data())
-            .map_err(|err| format!("Output resampling failed: {err}"))
-    }
-
-    fn skip_delay(&mut self, mut out: Vec<f32>) -> Vec<f32> {
-        let skip = self.delay.min(out.len());
-        self.delay -= skip;
-        out.drain(..skip);
-        out
-    }
-}
-
-/// ITU-T G.711 μ-law of one 16-bit linear sample.
-pub(crate) fn linear_to_ulaw(sample: i16) -> u8 {
-    const BIAS: i32 = 0x84;
-    const CLIP: i32 = 32_635;
-    let mut pcm = i32::from(sample);
-    let sign = if pcm < 0 {
-        pcm = -pcm;
-        0x80
-    } else {
-        0
-    };
-    let pcm = pcm.min(CLIP) + BIAS;
-    let exponent = (15 - (pcm as u16).leading_zeros() as i32 - 7).max(0);
-    let mantissa = (pcm >> (exponent + 3)) & 0x0F;
-    !((sign | (exponent << 4) | mantissa) as u8)
-}
-
-/// ITU-T G.711 A-law of one 16-bit linear sample.
-pub(crate) fn linear_to_alaw(sample: i16) -> u8 {
-    const SEGMENT_ENDS: [i32; 8] = [0x1F, 0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF];
-    let mut pcm = i32::from(sample) >> 3;
-    let mask = if pcm >= 0 {
-        0xD5
-    } else {
-        pcm = -pcm - 1;
-        0x55
-    };
-    let Some(segment) = SEGMENT_ENDS.iter().position(|end| pcm <= *end) else {
-        return 0x7F ^ mask;
-    };
-    let shift = if segment < 2 { 1 } else { segment };
-    let value = ((segment as i32) << 4) | ((pcm >> shift) & 0x0F);
-    (value as u8) ^ mask
-}
-
-/// ITU-T G.711 μ-law decoder: the 16-bit linear sample of one code.
-pub(crate) fn ulaw_to_linear(code: u8) -> i16 {
-    let code = !code;
-    let exponent = (code >> 4) & 0x07;
-    let magnitude = ((((code & 0x0F) as i32) << 3) + 0x84) << exponent;
-    let value = magnitude - 0x84;
-    (if code & 0x80 != 0 { -value } else { value }) as i16
-}
-
-/// ITU-T G.711 A-law decoder: the 16-bit linear sample of one code.
-pub(crate) fn alaw_to_linear(code: u8) -> i16 {
-    let code = code ^ 0x55;
-    let segment = (code & 0x70) >> 4;
-    let mut value = ((code & 0x0F) as i32) << 4;
-    value = match segment {
-        0 => value + 8,
-        1 => value + 0x108,
-        _ => (value + 0x108) << (segment - 1),
-    };
-    (if code & 0x80 != 0 { value } else { -value }) as i16
 }
 
 #[cfg(test)]

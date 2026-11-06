@@ -54,6 +54,7 @@ pub mod error;
 #[allow(dead_code)]
 pub mod kernels;
 pub mod kv;
+pub mod media_policy;
 pub mod model;
 #[allow(dead_code)]
 mod models;
@@ -62,6 +63,7 @@ pub mod residency;
 pub mod runtime;
 pub mod runtime_models;
 pub mod serve_runtime;
+pub mod text_segments;
 pub mod tokenizer;
 
 // Re-export main types from the new engine module

@@ -94,6 +94,10 @@ const DURABLE_REFERENCE_TTS_IDEMPOTENCY_RESERVATION_TTL_MS: u64 = 5 * 60 * 1_000
 pub(crate) struct RecordAudioQuery {
     #[serde(default)]
     download: bool,
+    /// Transcode the stored WAV: `mp3`, `opus`, `flac`, `pcm_i16`, ... (the
+    /// `/v1/audio/speech` names). Unset, the audio is sent as stored.
+    #[serde(default)]
+    format: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -565,13 +569,7 @@ pub async fn get_text_to_speech_record_audio(
     Path(record_id): Path<String>,
     Query(query): Query<RecordAudioQuery>,
 ) -> Result<Response, ApiError> {
-    get_record_audio(
-        state,
-        SpeechRouteKind::TextToSpeech,
-        record_id,
-        query.download,
-    )
-    .await
+    get_record_audio(state, SpeechRouteKind::TextToSpeech, record_id, query).await
 }
 
 pub async fn get_voice_design_record_audio(
@@ -579,13 +577,7 @@ pub async fn get_voice_design_record_audio(
     Path(record_id): Path<String>,
     Query(query): Query<RecordAudioQuery>,
 ) -> Result<Response, ApiError> {
-    get_record_audio(
-        state,
-        SpeechRouteKind::VoiceDesign,
-        record_id,
-        query.download,
-    )
-    .await
+    get_record_audio(state, SpeechRouteKind::VoiceDesign, record_id, query).await
 }
 
 pub async fn get_voice_cloning_record_audio(
@@ -593,13 +585,7 @@ pub async fn get_voice_cloning_record_audio(
     Path(record_id): Path<String>,
     Query(query): Query<RecordAudioQuery>,
 ) -> Result<Response, ApiError> {
-    get_record_audio(
-        state,
-        SpeechRouteKind::VoiceCloning,
-        record_id,
-        query.download,
-    )
-    .await
+    get_record_audio(state, SpeechRouteKind::VoiceCloning, record_id, query).await
 }
 
 pub async fn delete_text_to_speech_record(
@@ -751,8 +737,18 @@ async fn get_record_audio(
     state: AppState,
     route_kind: SpeechRouteKind,
     record_id: String,
-    as_attachment: bool,
+    query: RecordAudioQuery,
 ) -> Result<Response, ApiError> {
+    let as_attachment = query.download;
+    let output = match query.format.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(name) => Some(crate::api::openai::audio::speech::SpeechOutput::resolve(
+            Some(name),
+            false,
+            None,
+            None,
+        )?),
+    };
     let audio = state
         .speech_history_store
         .get_audio_stream(route_kind, record_id)
@@ -760,6 +756,40 @@ async fn get_record_audio(
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::not_found("History audio not found"))?;
     let mut reader = audio.audio.reader;
+    if let Some(output) = output {
+        use tokio::io::AsyncReadExt;
+        let mut stored = Vec::new();
+        reader
+            .read_to_end(&mut stored)
+            .await
+            .map_err(|err| ApiError::internal(format!("Failed reading history audio: {err}")))?;
+        let filename = audio.audio_filename.as_deref().map(|name| {
+            let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+            format!("{stem}.{}", output.format.format.extension())
+        });
+        let encoded = tokio::task::spawn_blocking(move || {
+            let (samples, rate) = decode_wav_to_f32(&stored)?;
+            output
+                .encode_file(&samples, rate)
+                .map(|bytes| (bytes, output))
+        })
+        .await
+        .map_err(|err| ApiError::internal(format!("Audio encoding failed: {err}")))??;
+        let (bytes, output) = encoded;
+        let length = bytes.len();
+        let mut response = audio_response(
+            StoredSpeechAudio {
+                audio_bytes: bytes,
+                audio_mime_type: output.content_type().to_string(),
+                audio_filename: filename,
+            },
+            as_attachment,
+        );
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+        return Ok(response);
+    }
     let mut response = audio_response(
         StoredSpeechAudio {
             audio_bytes: Vec::new(),
@@ -3127,6 +3157,34 @@ fn stream_terminal_failure_message(message: Option<String>) -> String {
 
 fn to_stream_json(event: SpeechStreamEvent) -> String {
     serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Mono samples and rate of a stored WAV (16-bit or float; channels are
+/// averaged).
+fn decode_wav_to_f32(bytes: &[u8]) -> Result<(Vec<f32>, u32), ApiError> {
+    let reader = hound::WavReader::new(std::io::Cursor::new(bytes)).map_err(|err| {
+        ApiError::bad_request(format!(
+            "This audio is not WAV, so it can only be downloaded as stored: {err}"
+        ))
+    })?;
+    let spec = reader.spec();
+    let channels = usize::from(spec.channels.max(1));
+    let interleaved: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Int => {
+            let scale = (1i64 << (spec.bits_per_sample.max(1) - 1)) as f32;
+            reader
+                .into_samples::<i32>()
+                .map(|sample| sample.map(|value| value as f32 / scale))
+                .collect::<Result<_, _>>()
+        }
+        hound::SampleFormat::Float => reader.into_samples::<f32>().collect::<Result<_, _>>(),
+    }
+    .map_err(|err| ApiError::internal(format!("Failed reading history audio: {err}")))?;
+    let samples = interleaved
+        .chunks(channels)
+        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+        .collect();
+    Ok((samples, spec.sample_rate))
 }
 
 fn audio_response(audio: StoredSpeechAudio, as_attachment: bool) -> Response {

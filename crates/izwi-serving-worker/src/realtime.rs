@@ -27,6 +27,7 @@ use futures::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
 };
+use izwi_core::text_segments::SpeechSegmenter;
 use izwi_serving_protocol::{
     decode_realtime_audio_frame, encode_realtime_audio_frame, AttemptState, InvocationErrorCode,
     InvocationEvent, InvocationEventKind, ModelReadiness, PermittedAction, RealtimeAudioSpec,
@@ -835,6 +836,10 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
         let mut synthesis: Option<tokio::task::JoinHandle<()>> = None;
         let deadline_at =
             (tokio::time::Instant::from_std(self.started_at) + self.remaining_time).into_std();
+        // An incremental stream speaks each segment as soon as the shared
+        // segmenter finds it; otherwise the utterance is one piece at
+        // `Finish`.
+        let mut segmenter = SpeechSegmenter::default();
         let mut text = String::new();
         let mut text_bytes = 0u64;
         let mut finish_submitted = false;
@@ -880,13 +885,18 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
                                 });
                             } else {
                                 finish_submitted = true;
-                                let rest = std::mem::take(&mut text).trim().to_string();
-                                if !rest.is_empty() {
+                                let rest: Vec<String> = if incremental {
+                                    std::iter::from_fn(|| segmenter.next_segment(true)).collect()
+                                } else {
+                                    let rest = std::mem::take(&mut text).trim().to_string();
+                                    (!rest.is_empty()).then_some(rest).into_iter().collect()
+                                };
+                                for piece in rest {
                                     self.synthesize_piece(
                                         runner,
                                         &options,
                                         deadline_at,
-                                        rest,
+                                        piece,
                                         &mut pieces_tx,
                                         &mut chunks_tx,
                                         &mut synthesis,
@@ -922,12 +932,9 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
                                         code: InvocationErrorCode::InvalidInput,
                                         message: "session text budget exhausted".into(),
                                     });
-                                } else {
-                                    text.push_str(&incoming);
-                                    while let Some(piece) = incremental
-                                        .then(|| take_complete_sentences(&mut text))
-                                        .flatten()
-                                    {
+                                } else if incremental {
+                                    segmenter.push(&incoming);
+                                    while let Some(piece) = segmenter.next_segment(false) {
                                         self.synthesize_piece(
                                             runner,
                                             &options,
@@ -938,6 +945,8 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
                                             &mut synthesis,
                                         );
                                     }
+                                } else {
+                                    text.push_str(&incoming);
                                 }
                             }
                         }
@@ -1269,29 +1278,6 @@ async fn drive_synthesis(
             }
         }
     }
-}
-
-/// Takes the complete sentences off the front of `text`: everything up to
-/// its last sentence end (`.`, `!` or `?` before whitespace, a CJK full stop,
-/// or a line break). `None` while no sentence is complete.
-fn take_complete_sentences(text: &mut String) -> Option<String> {
-    let mut chars = text.char_indices().peekable();
-    let mut end = None;
-    while let Some((index, ch)) = chars.next() {
-        let after = index + ch.len_utf8();
-        let ends = match ch {
-            '\n' | '。' | '！' | '？' => true,
-            '.' | '!' | '?' => chars.peek().is_some_and(|(_, next)| next.is_whitespace()),
-            _ => false,
-        };
-        if ends {
-            end = Some(after);
-        }
-    }
-    let end = end?;
-    let piece: String = text.drain(..end).collect();
-    let piece = piece.trim().to_string();
-    (!piece.is_empty()).then_some(piece)
 }
 
 fn language_arg(admit: &RealtimeSessionAdmit) -> Option<&str> {

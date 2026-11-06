@@ -167,16 +167,44 @@ def transcribe(config, clip):
     return {"text": payload.get("text", ""), "audio_secs": clip["audio_secs"]}
 
 
+def decode_with_ffmpeg(payload):
+    """Rate and 16-bit mono samples of any encoded audio, through ffmpeg (an
+    independent decoder), for compressed `--tts-format` runs."""
+    import subprocess
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=sample_rate", "-of", "csv=p=0", "pipe:0"],
+        input=payload, capture_output=True, check=True)
+    rate = int(probe.stdout.decode().strip().splitlines()[0] or 0)
+    pcm = subprocess.run(["ffmpeg", "-v", "error", "-i", "pipe:0", "-f", "s16le", "-ac", "1", "pipe:1"],
+                         input=payload, capture_output=True, check=True)
+    samples = array.array("h")
+    samples.frombytes(pcm.stdout[:len(pcm.stdout) // 2 * 2])
+    return rate, list(samples)
+
+
 def synthesize(config, text, seed):
     request = dict(config.get("tts_extra") or {})
-    request.update({"model": config["model"], "input": text, "response_format": "wav", "seed": seed})
+    tts_format = config.get("tts_format") or "wav"
+    request.update({"model": config["model"], "input": text, "response_format": tts_format, "seed": seed})
+    if config.get("tts_stream_format"):
+        request["stream_format"] = config["tts_stream_format"]
     for key in ("voice", "temperature"):
         if config.get(key) is not None:
             request[key] = config[key]
     headers = dict(config["headers"], **{"Content-Type": "application/json"})
-    rate, samples = wav_samples(post(config["base_url"] + "/v1/audio/speech",
-                                     json.dumps(request).encode(), headers, config["timeout"]))
-    return {"samples": samples, "audio_secs": len(samples) / rate if rate else 0.0}
+    started = time.monotonic()
+    http_request = urllib.request.Request(config["base_url"] + "/v1/audio/speech",
+                                          data=json.dumps(request).encode(), headers=headers, method="POST")
+    with urllib.request.urlopen(http_request, timeout=config["timeout"]) as response:
+        first = response.read(1)
+        first_byte_s = time.monotonic() - started
+        payload = first + response.read()
+    if tts_format == "wav" and not config.get("tts_stream_format"):
+        rate, samples = wav_samples(payload)
+    else:
+        rate, samples = decode_with_ffmpeg(payload)
+    return {"samples": samples, "audio_secs": len(samples) / rate if rate else 0.0,
+            "first_byte_s": first_byte_s, "bytes": len(payload)}
 
 
 def request_seed(base, index):
@@ -297,6 +325,11 @@ def summarize(config, records, duration, solo):
         "request_throughput": len(ok) / duration if duration > 0 else None,
         "audio_throughput": audio_secs / duration if duration > 0 else None,
         "latency_s": serving.distribution([record["latency_s"] for record in ok]),
+        "first_byte_s": serving.distribution(
+            [record["first_byte_s"] for record in ok if "first_byte_s" in record]) if any(
+            "first_byte_s" in record for record in ok) else None,
+        "bytes_per_audio_sec": (sum(record.get("bytes", 0) for record in ok) / audio_secs
+                                if audio_secs > 0 else None),
         "rtf": serving.distribution([
             record["latency_s"] / record["audio_secs"] for record in ok if record["audio_secs"] > 0
         ]),
@@ -396,6 +429,11 @@ def parse_args(argv=None):
     parser.add_argument("--min-words", type=int, default=4, help="shortest TTS input (default 4)")
     parser.add_argument("--max-words", type=int, default=40, help="longest TTS input (default 40)")
     parser.add_argument("--voice", help="TTS voice")
+    parser.add_argument("--tts-format", default="wav",
+                        help="TTS response_format (wav, mp3, opus, flac, pcm_i16, ...); "
+                             "compressed audio is decoded with ffmpeg for parity (default wav)")
+    parser.add_argument("--tts-stream-format", choices=("audio", "sse"),
+                        help="TTS stream_format; `audio` measures the chunked body's first byte")
     parser.add_argument("--temperature", type=float, help="TTS sampling temperature")
     parser.add_argument("--tts-extra", type=json.loads, default={},
                         help="JSON object of extra speech fields sent with every TTS request, "
@@ -438,6 +476,8 @@ def main(argv=None):
         "seed": args.seed,
         "tts_tolerance": args.tts_tolerance,
         "tts_extra": args.tts_extra,
+        "tts_format": args.tts_format,
+        "tts_stream_format": args.tts_stream_format,
     }
     rates = [serving.parse_rate(raw) for raw in args.request_rate.split(",")]
     inputs = build_inputs(args, random.Random(args.seed))

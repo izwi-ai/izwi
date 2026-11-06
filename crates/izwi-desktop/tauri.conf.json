@@ -35,6 +35,11 @@
     "publisher": "Izwi AI",
     "copyright": "Copyright 2026 Izwi AI",
     "createUpdaterArtifacts": true,
+    "resources": {
+      "../../LICENSE": "licenses/LICENSE",
+      "../../NOTICE": "licenses/NOTICE",
+      "../../THIRD_PARTY_LICENSES": "licenses/THIRD_PARTY_LICENSES"
+    },
     "targets": [
       "deb",
       "dmg",

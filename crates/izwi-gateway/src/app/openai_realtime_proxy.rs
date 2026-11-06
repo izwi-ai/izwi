@@ -88,7 +88,7 @@ impl OpenAiRealtimeUpstreams {
 }
 
 /// `url` as a `ws(s)://host[:port]` base.
-fn websocket_base(url: &str) -> Result<String, String> {
+pub(crate) fn websocket_base(url: &str) -> Result<String, String> {
     let url = url.trim().trim_end_matches('/');
     let base = if let Some(rest) = url.strip_prefix("https://") {
         format!("wss://{rest}")
@@ -119,7 +119,7 @@ fn offers_realtime(headers: &HeaderMap) -> bool {
         .any(|protocol| protocol.trim() == REALTIME_SUBPROTOCOL)
 }
 
-fn json_error(status: StatusCode, message: &str) -> Response {
+pub(crate) fn json_error(status: StatusCode, message: &str) -> Response {
     (
         status,
         axum::Json(serde_json::json!({"error": {"message": message, "type": "server_error", "code": null}})),
@@ -244,11 +244,11 @@ pub async fn proxy_socket(
     response
 }
 
-type Upstream =
+pub(crate) type Upstream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Relay frames both ways until either side closes or fails.
-async fn relay(client: WebSocket, upstream: Upstream, _permit: OwnedSemaphorePermit) {
+pub(crate) async fn relay(client: WebSocket, upstream: Upstream, _permit: OwnedSemaphorePermit) {
     let (mut client_tx, mut client_rx) = client.split();
     let (mut upstream_tx, mut upstream_rx) = upstream.split();
     let to_upstream = async {

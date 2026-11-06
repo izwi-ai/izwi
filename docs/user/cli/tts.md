@@ -55,7 +55,7 @@ Converts text to speech using a TTS model. The OSS server emits WAV audio for th
 | `--seed <N>` | Sampling seed: the same seed and inputs give the same audio; with `FishAudio-Drama-3` it also sets the voice of a speaker without a reference | random |
 | `--instructions <TEXT>`, `--voice-description <TEXT>` | Voice direction for voice-design models; for `Maya1-3B`, the description of the voice to speak with (replaces `--speaker`) | — |
 | `-o, --output <PATH>` | Output file path | `izwi_output_<timestamp>.wav` in the current directory |
-| `-f, --format <FORMAT>` | `wav` or `pcm` (raw 16-bit little-endian mono, no header) | `wav` |
+| `-f, --format <FORMAT>` | `wav`, `mp3`, `opus` (Ogg; `ogg` also works), `flac`, or `pcm` (raw 16-bit little-endian mono at the model's rate, no header). `--stream` writes WAV. | `wav` |
 | `-r, --speed <SPEED>` | Speech speed multiplier (models with speed control) | model default |
 | `-t, --temperature <TEMP>` | Sampling temperature | model default |
 | `--language <LANG>` | Language of the text, as a code or name: required for non-English text with `Chatterbox-Multilingual-500M` (e.g. `fr`); a hint for Qwen3-TTS (e.g. `English`); for `Maya2-Native-2.5B`, a code (e.g. `hi`) or `auto` to read it from the text's script; for `LFM3-Audio-2B-GGUF`, one of its 19 locales (e.g. `en-GB`, `ja`; `en-US` when unset) | model default |
@@ -100,6 +100,7 @@ Izwi saves the generated audio, then plays it with the system player.
 
 ```bash
 izwi tts "Hello, world!" --format wav --output hello.wav
+izwi tts "Hello, world!" --format mp3 --output hello.mp3
 ```
 
 ### Adjust speed

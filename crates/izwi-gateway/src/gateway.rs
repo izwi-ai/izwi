@@ -78,6 +78,8 @@ pub struct GatewayState {
     /// leaves the route off.
     pub openai_realtime:
         Option<std::sync::Arc<crate::app::openai_realtime_proxy::OpenAiRealtimeUpstreams>>,
+    /// Speech API pass-through (`/v1/audio/*`) to izwi-server upstreams.
+    pub audio_upstreams: Option<std::sync::Arc<crate::app::audio_proxy::AudioUpstreams>>,
     /// The adopted approvals view, for the admin status route.
     approvals: Option<crate::gateway_shared_approvals::GatewayApprovalsReporter>,
     /// Set during the pre-stop window: readiness reports draining while
@@ -119,6 +121,7 @@ impl GatewayState {
             metrics: GatewayMetrics::default(),
             realtime_relay: None,
             openai_realtime: None,
+            audio_upstreams: None,
             approvals: None,
             prestop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stream_shutdown,
@@ -242,6 +245,14 @@ impl GatewayState {
 
     /// Serve OpenAI Realtime at `/v1/realtime` by handing each session to
     /// one of `upstreams` (izwi-servers).
+    pub fn with_audio_upstreams(
+        mut self,
+        upstreams: crate::app::audio_proxy::AudioUpstreams,
+    ) -> Self {
+        self.audio_upstreams = Some(std::sync::Arc::new(upstreams));
+        self
+    }
+
     pub fn with_openai_realtime(
         mut self,
         upstreams: crate::app::openai_realtime_proxy::OpenAiRealtimeUpstreams,
@@ -1480,8 +1491,47 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &GatewayServeCon
                 )),
         );
     }
-    let inference_routes =
+    let mut inference_routes =
         inference_routes.layer(DefaultBodyLimit::max(state.perimeter.max_chat_body_bytes()));
+    if let Some(audio) = state.audio_upstreams.clone() {
+        use crate::app::audio_proxy::{proxy_http, proxy_speech_lookup, proxy_speech_stream};
+        let mut audio_routes = Router::new()
+            .route("/audio/speech", post(proxy_http))
+            .route("/audio/speech/batch", post(proxy_http))
+            .route("/audio/speech/stream", get(proxy_speech_stream))
+            .route("/audio/speech/{speech_id}", get(proxy_speech_lookup))
+            .route("/audio/transcriptions", post(proxy_http))
+            .route("/audio/translations", post(proxy_http));
+        if audio.shared_state() {
+            audio_routes = audio_routes
+                .route("/audio/voices", get(proxy_http).post(proxy_http))
+                .route(
+                    "/audio/voices/{voice_id}",
+                    get(proxy_http).delete(proxy_http),
+                )
+                .route("/audio/voice_consents", get(proxy_http).post(proxy_http))
+                .route(
+                    "/audio/voice_consents/{consent_id}",
+                    get(proxy_http).post(proxy_http).delete(proxy_http),
+                )
+                .route("/audio/consent_phrases", get(proxy_http));
+        }
+        // Uploads stream through to the upstream, which enforces its own
+        // limits; the gateway bounds them at the largest the server takes.
+        inference_routes = inference_routes.merge(
+            audio_routes
+                .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    bounded_gateway_admission,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    tenant_pre_admission,
+                )),
+        );
+    }
+    let inference_routes = inference_routes;
     // The model listing is authenticated like inference but takes no
     // inference capacity.
     let v1_routes = Router::new()

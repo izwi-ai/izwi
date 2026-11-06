@@ -1182,6 +1182,20 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     );
   });
 
+  it("asks for saved speech in another format, keeping WAV as stored", () => {
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+
+    expect(client.textToSpeechRecordAudioUrl("tts-1", { format: "mp3" })).toBe(
+      "http://localhost/v1/text-to-speech/tts-1/audio?format=mp3",
+    );
+    expect(
+      client.textToSpeechRecordAudioUrl("tts-1", { download: true, format: "flac" }),
+    ).toBe("http://localhost/v1/text-to-speech/tts-1/audio?download=true&format=flac");
+    expect(client.textToSpeechRecordAudioUrl("tts-1", { format: "wav" })).toBe(
+      "http://localhost/v1/text-to-speech/tts-1/audio",
+    );
+  });
+
   it("builds canonical voice clone audio urls", () => {
     const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
 

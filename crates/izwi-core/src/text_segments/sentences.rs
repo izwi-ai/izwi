@@ -1,4 +1,5 @@
-//! Sentence segmentation shared by long-form TTS and Studio (P3.1, TPIPE-5).
+//! Sentence segmentation shared by long-form TTS, Studio, the voice loop,
+//! the text-in speech socket and the serving worker (P3.1, TPIPE-5).
 //!
 //! A sentence ends at `!`, `?`, a full stop or an ellipsis followed by
 //! whitespace (and, for an ellipsis, a capitalized next word), an Indic
@@ -59,7 +60,7 @@ fn is_danda(ch: char) -> bool {
 }
 
 /// Byte ranges of the sentences of `text`, trimmed, in order.
-pub(crate) fn sentence_spans(text: &str) -> Vec<Range<usize>> {
+pub fn sentence_spans(text: &str) -> Vec<Range<usize>> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let mut spans = Vec::new();
     let mut start = 0usize;
@@ -252,11 +253,7 @@ fn pack(
 /// The segments of `text`: whole sentences packed up to `max_chars` and
 /// `fits`; a sentence too long alone is split at its clauses, then at
 /// words, then at characters.
-pub(crate) fn pack_sentences(
-    text: &str,
-    max_chars: usize,
-    fits: &dyn Fn(&str) -> bool,
-) -> Vec<String> {
+pub fn pack_sentences(text: &str, max_chars: usize, fits: &dyn Fn(&str) -> bool) -> Vec<String> {
     let max_chars = max_chars.max(1);
     let split_sentence = |sentence: &str| {
         pack(

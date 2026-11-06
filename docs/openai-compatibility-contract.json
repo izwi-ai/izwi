@@ -1,5 +1,5 @@
 {
-  "version": "2026-04-13",
+  "version": "2026-11-06",
   "scope": {
     "supported_endpoints": [
       "/v1/models",
@@ -12,7 +12,12 @@
       "/v1/audio/transcriptions",
       "/v1/audio/speech",
       "/v1/realtime",
-      "/v1/realtime/client_secrets"
+      "/v1/realtime/client_secrets",
+      "/v1/audio/translations",
+      "/v1/audio/voices",
+      "/v1/audio/voices/{voice_id}",
+      "/v1/audio/voice_consents",
+      "/v1/audio/voice_consents/{consent_id}"
     ],
     "preview_endpoints": {
       "/v1/responses": {
@@ -44,10 +49,24 @@
         "contract": "ephemeral ek_ keys bound to a session config, admitting /v1/realtime only",
         "durability": "process_local",
         "retention": "keys live in memory for at most two hours and are lost on server restart"
+      },
+      "/v1/audio/speech/batch": {
+        "contract": "SGLang-Omni/vLLM-Omni batch envelope {id, results[], total, succeeded, failed}; inline base64 audio; at most IZWI_TTS_BATCH_MAX_ITEMS items",
+        "durability": "none",
+        "retention": "results are returned in the response only"
+      },
+      "/v1/audio/speech/{speech_id}": {
+        "contract": "outcome of a /v1/audio/speech request (any delivery mode), keyed by X-Izwi-Speech-Id",
+        "durability": "process_local",
+        "retention": "bounded in-memory store; outcomes are evicted after IZWI_SPEECH_OUTCOME_TTL_SECS and lost on server restart"
+      },
+      "/v1/audio/speech/stream": {
+        "contract": "text-in TTS WebSocket: session.config, input.text, input.commit, input.done, input.cancel, session.close; dialects izwi, sglang-omni, vllm-omni",
+        "durability": "process_local",
+        "retention": "the session lives as long as the socket"
       }
     },
     "out_of_scope_endpoints": [
-      "/v1/audio/translations",
       "/v1/realtime/sessions",
       "/v1/realtime/transcription_sessions"
     ]
@@ -83,9 +102,53 @@
     },
     "audio_speech": {
       "required_events": [
+        "speech.audio.delta",
+        "speech.audio.done|audio.failed"
+      ],
+      "legacy_events": [
+        "audio.started",
         "audio.chunk",
-        "audio.done|audio.failed"
+        "audio.done"
       ]
+    },
+    "audio_translations": {
+      "required_events": [
+        "transcript.text.delta",
+        "transcript.text.done"
+      ]
+    },
+    "audio_speech_stream": {
+      "required_events": [
+        "session.configured",
+        "audio.start",
+        "audio.done",
+        "session.done"
+      ]
+    }
+  },
+  "formats": {
+    "audio_speech": {
+      "response_format": [
+        "mp3",
+        "opus",
+        "flac",
+        "wav",
+        "pcm"
+      ],
+      "izwi_response_format": [
+        "pcm_i16",
+        "pcm_f32",
+        "g711_ulaw",
+        "g711_alaw"
+      ],
+      "refused_response_format": [
+        "aac"
+      ],
+      "stream_format": [
+        "audio",
+        "sse"
+      ],
+      "pcm_sample_rate": 24000
     }
   }
 }

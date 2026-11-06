@@ -297,6 +297,29 @@ pub struct GatewayArgs {
         hide_env_values = true
     )]
     pub gateway_openai_realtime_upstream_api_key: Option<String>,
+
+    /// Speech API pass-through: izwi-server base URLs (comma-separated) that
+    /// serve `/v1/audio/*`. Set, the gateway relays speech, batch, lookup,
+    /// the text-in speech socket, transcriptions and translations to them,
+    /// round robin. Unset, the OpenAI Realtime upstreams serve them when
+    /// those are set.
+    #[arg(long, env = "IZWI_GATEWAY_AUDIO_UPSTREAMS", value_delimiter = ',')]
+    pub gateway_audio_upstreams: Vec<String>,
+
+    /// The audio upstreams' API key (their `IZWI_API_KEY`); defaults to the
+    /// Realtime upstreams' key.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_AUDIO_UPSTREAM_API_KEY",
+        hide_env_values = true
+    )]
+    pub gateway_audio_upstream_api_key: Option<String>,
+
+    /// The audio upstreams share one records database and media store, so
+    /// voices and consents (`/v1/audio/voices`, `/v1/audio/voice_consents`)
+    /// are relayed too.
+    #[arg(long, env = "IZWI_GATEWAY_AUDIO_SHARED_STATE", default_value_t = false)]
+    pub gateway_audio_shared_state: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

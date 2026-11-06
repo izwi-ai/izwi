@@ -1,0 +1,55 @@
+# cargo-deny: licence gate for every dependency the workspace builds.
+# CI runs `cargo deny check licenses` (.github/workflows/dependency-audit.yml);
+# advisories stay with cargo-audit and .cargo/audit.toml.
+
+[graph]
+all-features = false
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    # symphonia, among others: file-level copyleft, unmodified.
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+# LAME, statically linked for MP3 output (izwi-audio-codec's default `mp3`
+# feature). The LGPL terms are met by publishing the full source and listing
+# LAME in THIRD_PARTY_LICENSES; a closed-source build turns `mp3` off. Only
+# these two crates may carry the LGPL.
+exceptions = [
+    { allow = ["LGPL-3.0-only"], crate = "mp3lame-encoder" },
+    { allow = ["LGPL-3.0-only", "LGPL-2.0-or-later"], crate = "mp3lame-sys" },
+]
+
+# Both crates declare the deprecated id `LGPL-3.0` (their LICENSE is the
+# LGPL 3.0 text). mp3lame-sys also bundles LAME 4.0, which is "version 2 of
+# the License, or (at your option) any later version" (lame-4.0/libmp3lame/
+# lame.c); Cargo metadata does not say so.
+[[licenses.clarify]]
+crate = "mp3lame-encoder"
+expression = "LGPL-3.0-only"
+license-files = []
+
+[[licenses.clarify]]
+crate = "mp3lame-sys"
+expression = "LGPL-3.0-only AND LGPL-2.0-or-later"
+license-files = []
+
+[licenses.private]
+# Workspace crates are Apache-2.0 and unpublished.
+ignore = true

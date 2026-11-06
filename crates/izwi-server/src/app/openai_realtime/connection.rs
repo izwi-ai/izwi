@@ -34,7 +34,7 @@ use super::session_config::{
     Voice,
 };
 use super::transcribe::Transcription;
-use super::voices::resolve_custom_voice;
+use super::voices::{resolve_custom_voice, resolve_named_voice};
 use crate::app::realtime_transport::{spawn_writer, OutboundLimits, OutboundMailbox};
 use crate::app::voice_realtime::{
     normalize_stream_vad_threshold, StreamingInputConfig, StreamingInputState, TtsVoice,
@@ -470,18 +470,19 @@ impl Session {
             self.input = input_for(&self.config);
             self.speech = None;
         }
-        if let Voice::Custom(id) = &self.config.voice {
-            self.custom_voice = Some(
+        self.custom_voice = match &self.config.voice {
+            Voice::Custom(id) => Some(
                 resolve_custom_voice(&self.state, &self.profile, id)
                     .await
                     .unwrap_or_else(|reason| {
                         warn!(voice = %id, "realtime custom voice not used: {reason}");
                         TtsVoice::speaker(None)
                     }),
-            );
-        } else {
-            self.custom_voice = None;
-        }
+            ),
+            // An uploaded voice by name, for a TTS model that clones and has
+            // no built-in voices.
+            Voice::Named(name) => resolve_named_voice(&self.state, &self.profile, name).await,
+        };
         Ok(())
     }
 
@@ -1063,6 +1064,10 @@ impl Session {
             _ => self.config.voice.clone(),
         };
         let tts_voice = match &voice {
+            // The session's own name resolved to an uploaded voice.
+            Voice::Named(_) if voice == self.config.voice && self.custom_voice.is_some() => {
+                self.custom_voice.clone().unwrap_or_default()
+            }
             Voice::Named(name) => TtsVoice::speaker(speaker_for(self.profile.speech_model(), name)),
             Voice::Custom(_) => self.custom_voice.clone().unwrap_or_default(),
         };

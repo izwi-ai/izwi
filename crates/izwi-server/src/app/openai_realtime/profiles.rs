@@ -365,16 +365,32 @@ pub(crate) fn is_openai_transcription_model(model: &str) -> bool {
 }
 
 /// The ASR model that transcribes a session's input: the transcription
-/// model the client named when it is an Izwi live ASR model, else the
-/// profile's (a modular stack's ASR, LFM3-Audio itself, or the default ASR
-/// beside LFM2.5-Audio, which has no turn transcript).
+/// model the client named when it is an Izwi live ASR model (after the
+/// operator's `IZWI_OPENAI_MODEL_ALIASES`, so `gpt-4o-transcribe=…` picks
+/// that model), else the profile's (a modular stack's ASR, LFM3-Audio
+/// itself, or the default ASR beside LFM2.5-Audio, which has no turn
+/// transcript).
 pub(crate) fn transcription_model(
     profile: &RealtimeProfile,
     requested: Option<&str>,
 ) -> Result<String, String> {
-    if let Some(requested) = requested
+    transcription_model_with(profile, requested, |model| {
+        crate::api::openai::model_aliases::resolve_model_alias(model).to_string()
+    })
+}
+
+fn transcription_model_with(
+    profile: &RealtimeProfile,
+    requested: Option<&str>,
+    resolve_alias: impl Fn(&str) -> String,
+) -> Result<String, String> {
+    let requested = requested
         .map(str::trim)
-        .filter(|model| !model.is_empty() && !is_openai_transcription_model(model))
+        .filter(|model| !model.is_empty())
+        .map(resolve_alias);
+    if let Some(requested) = requested
+        .as_deref()
+        .filter(|model| !is_openai_transcription_model(model))
     {
         let variant = parse_model_variant(requested)
             .map_err(|_| format!("Unknown transcription model `{requested}`"))?;
@@ -482,5 +498,29 @@ mod tests {
             DEFAULT_ASR_MODEL
         );
         assert!(transcription_model(&modular, Some("Kokoro-82M")).is_err());
+    }
+
+    /// An operator alias for an OpenAI transcription name picks that model
+    /// instead of the profile's ASR.
+    #[test]
+    fn transcription_aliases_pick_the_mapped_asr() {
+        let modular = resolve_profile(None).expect("default");
+        let alias = |model: &str| {
+            if model == "gpt-4o-transcribe" {
+                "Parakeet-TDT-0.6B-v3".to_string()
+            } else {
+                model.to_string()
+            }
+        };
+        let mapped =
+            transcription_model_with(&modular, Some("gpt-4o-transcribe"), alias).expect("mapped");
+        assert_eq!(
+            parse_model_variant(&mapped).expect("variant"),
+            parse_model_variant("Parakeet-TDT-0.6B-v3").expect("parakeet")
+        );
+        assert_eq!(
+            transcription_model_with(&modular, Some("whisper-1"), alias).expect("unmapped"),
+            DEFAULT_ASR_MODEL
+        );
     }
 }

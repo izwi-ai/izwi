@@ -202,7 +202,7 @@ voice.
 ### Features
 
 - **Live preview** — Hear audio as it generates
-- **Download** — Save audio files locally
+- **Download** — Save audio files locally as WAV, MP3, FLAC or Opus
 - **History** — Access recent generations
 
 ---
@@ -374,8 +374,13 @@ license from Fish Audio; see [Models](/models).
 | Format | Extension | Notes |
 |--------|-----------|-------|
 | WAV | `.wav` | Uncompressed, highest quality |
+| MP3 | `.mp3` | Compressed (LAME, constant bitrate), widely compatible |
+| Opus | `.opus` | Opus in Ogg: small and low-latency, good for streaming |
+| FLAC | `.flac` | Lossless compression |
 | PCM | `.pcm` | Raw PCM for low-level playback pipelines |
-| MP3, OPUS, OGG, FLAC, AAC | Matching extension | Recognized request names. The OSS server does not bundle compressed encoders yet, so API clients must set `allow_format_fallback: true` if they intentionally want WAV bytes returned for these names. |
+
+AAC is not offered: AAC encoders need a patent licence. Studio exports and
+speech history downloads (`?format=mp3`) take the same formats.
 
 ---
 

@@ -50,6 +50,7 @@ impl Schema {
                 (13, "saved voices without a transcript"),
                 (14, "saved voice reference language"),
                 (15, "speech take codes, voices and parent"),
+                (16, "voice consent recordings"),
             ],
             Self::Fleet => &[
                 (1, "fleet coordination"),
@@ -225,6 +226,13 @@ async fn apply_migration<C: ConnectionTrait>(
             for column in SPEECH_TAKE_COLUMNS {
                 ensure_column(db, column).await?;
             }
+        }
+        (Schema::App, 16) => {
+            for statement in VOICE_CONSENT_SCHEMA {
+                db.execute_unprepared(&dialect_ddl(backend, statement))
+                    .await?;
+            }
+            ensure_column(db, &SAVED_VOICE_CONSENT_COLUMN).await?;
         }
         (Schema::App, 13) => {
             if backend == DbBackend::Postgres {
@@ -1206,6 +1214,34 @@ const SAVED_VOICE_REFERENCE_LANGUAGE_COLUMN: CompatibilityColumn = Compatibility
     definition: "TEXT NULL",
 };
 
+/// Migration 16: consent recordings for `/v1/audio/voice_consents`, and the
+/// consent a saved voice was made with. A consent's recording lives in
+/// media storage; `status` is `recorded` until a transcript check marks it
+/// `verified` or `rejected` (`verification_json` keeps that check). Voices
+/// made before carry no consent id.
+const VOICE_CONSENT_SCHEMA: &[&str] = &[
+    r#"
+    CREATE TABLE IF NOT EXISTS voice_consents (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        language TEXT NOT NULL,
+        recording_storage_path TEXT NOT NULL,
+        recording_mime_type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        verification_json TEXT NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_voice_consents_created_at ON voice_consents(created_at DESC, id DESC);",
+];
+
+const SAVED_VOICE_CONSENT_COLUMN: CompatibilityColumn = CompatibilityColumn {
+    table: "saved_voices",
+    column: "consent_id",
+    definition: "TEXT NULL",
+};
+
 /// Migration 15: what a speech take keeps so a later take can continue it
 /// (Fish Audio Drama 3 take editing): its generated codes, the voices it
 /// used and its seed, and the take it continued. Null on every other
@@ -1830,6 +1866,11 @@ pub(crate) fn postgres_schema_sql() -> String {
     for column in SPEECH_TAKE_COLUMNS {
         push(&add_column(column));
     }
+    // Migration 16.
+    for statement in VOICE_CONSENT_SCHEMA {
+        push(statement);
+    }
+    push(&add_column(&SAVED_VOICE_CONSENT_COLUMN));
     push(SCHEMA_MIGRATIONS_DDL);
     for (version, name) in Schema::App.migrations() {
         push(&format!(

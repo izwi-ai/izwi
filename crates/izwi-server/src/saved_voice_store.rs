@@ -92,6 +92,8 @@ pub struct SavedVoice {
     /// across languages (Maya 2 Native); absent, they read it from the
     /// transcript.
     pub reference_language: Option<String>,
+    /// The consent recording the voice was made with, if any.
+    pub consent_id: Option<String>,
 }
 
 impl SavedVoice {
@@ -123,6 +125,13 @@ pub struct StoredSavedVoiceAudio {
 #[derive(Debug, Clone)]
 pub struct NewSavedVoice {
     pub name: String,
+    /// The consent recording (`/v1/audio/voice_consents`) the voice was made
+    /// with; deleting that consent revokes the voice.
+    pub consent_id: Option<String>,
+    /// Where the permission came from when the creator states it (an
+    /// attestation or a consent id); otherwise the source record or
+    /// `local_upload`.
+    pub permission_provenance: Option<String>,
     pub reference_text: Option<String>,
     pub reference_language: Option<String>,
     pub audio_mime_type: String,
@@ -291,11 +300,16 @@ impl SavedVoiceStore {
             .source_route_kind
             .map(|kind| kind.as_db_value().to_string());
         let source_record_id = sanitize_optional_text(voice.source_record_id.as_deref(), 200);
-        let permission_provenance = source_route_kind
-            .as_ref()
-            .zip(source_record_id.as_ref())
-            .map(|(kind, record_id)| format!("{kind}:{record_id}"))
-            .or_else(|| Some("local_upload".to_string()));
+        let permission_provenance =
+            sanitize_optional_text(voice.permission_provenance.as_deref(), 500)
+                .or_else(|| {
+                    source_route_kind
+                        .as_ref()
+                        .zip(source_record_id.as_ref())
+                        .map(|(kind, record_id)| format!("{kind}:{record_id}"))
+                })
+                .or_else(|| Some("local_upload".to_string()));
+        let consent_id = sanitize_optional_text(voice.consent_id.as_deref(), 200);
 
         if voice.audio_bytes.is_empty() {
             return Err(StoreError::invalid("Audio payload cannot be empty").into());
@@ -343,6 +357,15 @@ impl SavedVoiceStore {
             }
             return Err(err).context("Failed to insert saved voice");
         }
+        if let Some(consent_id) = consent_id {
+            db.execute_raw(raw::statement(
+                db,
+                "UPDATE saved_voices SET consent_id = ?1 WHERE id = ?2",
+                vec![consent_id.into(), voice_id.clone().into()],
+            )?)
+            .await
+            .context("Failed to link the saved voice to its consent")?;
+        }
 
         fetch_voice_without_audio(db, &voice_id)
             .await?
@@ -376,6 +399,243 @@ impl SavedVoiceStore {
     }
 }
 
+/// A consent recording (`/v1/audio/voice_consents`): someone saying, in their
+/// own voice, that a copy of it may be made. `status` is `recorded` until a
+/// transcript check marks it `verified` or `rejected`.
+#[derive(Debug, Clone, Serialize)]
+pub struct VoiceConsent {
+    pub id: String,
+    /// Epoch milliseconds.
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub name: String,
+    pub language: String,
+    pub recording_mime_type: String,
+    pub status: String,
+    pub verification: Option<serde_json::Value>,
+    #[serde(skip)]
+    pub recording_storage_path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewVoiceConsent {
+    pub name: String,
+    pub language: String,
+    pub recording_bytes: Vec<u8>,
+    pub recording_mime_type: String,
+    pub recording_filename: Option<String>,
+}
+
+/// The id prefix consent recordings get, as OpenAI's do.
+pub const VOICE_CONSENT_ID_PREFIX: &str = "cons_";
+
+const VOICE_CONSENT_COLUMNS: &str = "id, created_at, updated_at, name, language, \
+    recording_storage_path, recording_mime_type, status, verification_json";
+
+fn map_voice_consent(row: &QueryResult) -> anyhow::Result<VoiceConsent> {
+    let verification: Option<String> = row.try_get_by_index(8)?;
+    Ok(VoiceConsent {
+        id: row.try_get_by_index(0)?,
+        created_at: i64_to_u64(row.try_get_by_index(1)?),
+        updated_at: i64_to_u64(row.try_get_by_index(2)?),
+        name: row.try_get_by_index(3)?,
+        language: row.try_get_by_index(4)?,
+        recording_storage_path: row.try_get_by_index(5)?,
+        recording_mime_type: row.try_get_by_index(6)?,
+        status: row.try_get_by_index(7)?,
+        verification: verification.and_then(|raw| serde_json::from_str(&raw).ok()),
+    })
+}
+
+impl SavedVoiceStore {
+    /// The saved voice named `name` (names are unique without regard to
+    /// case).
+    pub async fn find_voice_by_name(&self, name: &str) -> anyhow::Result<Option<SavedVoice>> {
+        let db = self.db.connection().await?;
+        let row = db
+            .query_one_raw(raw::statement(
+                db,
+                format!(
+                    "SELECT {SAVED_VOICE_COLUMNS} FROM saved_voices WHERE LOWER(name) = LOWER(?1)"
+                ),
+                vec![name.trim().into()],
+            )?)
+            .await
+            .context("Failed to look up saved voice by name")?;
+        row.as_ref().map(map_saved_voice).transpose()
+    }
+
+    pub async fn create_consent(&self, consent: NewVoiceConsent) -> anyhow::Result<VoiceConsent> {
+        let db = self.db.connection().await?;
+        let now = now_unix_millis_i64();
+        let id = format!("{VOICE_CONSENT_ID_PREFIX}{}", new_uuid().replace('-', ""));
+        let name = sanitize_required_text(consent.name.as_str(), 256, "name")?;
+        let language = sanitize_required_text(consent.language.as_str(), 35, "language")?;
+        if consent.recording_bytes.is_empty() {
+            return Err(StoreError::invalid("The consent recording is empty").into());
+        }
+        let mime_type = sanitize_audio_mime_type(consent.recording_mime_type.as_str());
+        let storage_path = persist_audio_object(
+            &self.media_storage,
+            MediaNamespace::SavedVoice,
+            &id,
+            consent.recording_filename.as_deref(),
+            mime_type.as_str(),
+            &consent.recording_bytes,
+            HookMetadata::new(),
+        )
+        .await?;
+        if let Err(err) = db
+            .execute_raw(raw::statement(
+                db,
+                "INSERT INTO voice_consents (id, created_at, updated_at, name, language, \
+                 recording_storage_path, recording_mime_type, status, verification_json) \
+                 VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 'recorded', NULL)",
+                vec![
+                    id.clone().into(),
+                    now.into(),
+                    name.into(),
+                    language.into(),
+                    storage_path.clone().into(),
+                    mime_type.into(),
+                ],
+            )?)
+            .await
+        {
+            let _ = delete_media_object(&self.media_storage, Some(&storage_path)).await;
+            return Err(err).context("Failed to insert voice consent");
+        }
+        self.get_consent(&id)
+            .await?
+            .ok_or_else(|| anyhow!("Failed to fetch created voice consent"))
+    }
+
+    pub async fn get_consent(&self, id: &str) -> anyhow::Result<Option<VoiceConsent>> {
+        let db = self.db.connection().await?;
+        let row = db
+            .query_one_raw(raw::statement(
+                db,
+                format!("SELECT {VOICE_CONSENT_COLUMNS} FROM voice_consents WHERE id = ?1"),
+                vec![id.trim().into()],
+            )?)
+            .await
+            .context("Failed to load voice consent")?;
+        row.as_ref().map(map_voice_consent).transpose()
+    }
+
+    /// Up to `limit` consents, newest first, after the consent `after`.
+    /// Returns whether more follow.
+    pub async fn list_consents(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<(Vec<VoiceConsent>, bool)> {
+        let db = self.db.connection().await?;
+        let cursor = match after {
+            Some(after) => Some(
+                self.get_consent(after)
+                    .await?
+                    .ok_or_else(|| StoreError::invalid(format!("Unknown cursor `{after}`")))?,
+            ),
+            None => None,
+        };
+        let limit = limit.clamp(1, 100);
+        let rows = db
+            .query_all_raw(raw::statement(
+                db,
+                format!(
+                    "SELECT {VOICE_CONSENT_COLUMNS} FROM voice_consents \
+                     WHERE ?1 IS NULL OR created_at < ?1 OR (created_at = ?1 AND id < ?2) \
+                     ORDER BY created_at DESC, id DESC LIMIT ?3"
+                ),
+                vec![
+                    cursor
+                        .as_ref()
+                        .map(|consent| i64::try_from(consent.created_at).unwrap_or(i64::MAX))
+                        .into(),
+                    cursor.map(|consent| consent.id).into(),
+                    i64::try_from(limit + 1).unwrap_or(101).into(),
+                ],
+            )?)
+            .await
+            .context("Failed to list voice consents")?;
+        let mut consents = rows
+            .iter()
+            .map(map_voice_consent)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let has_more = consents.len() > limit;
+        consents.truncate(limit);
+        Ok((consents, has_more))
+    }
+
+    pub async fn rename_consent(
+        &self,
+        id: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<VoiceConsent>> {
+        let db = self.db.connection().await?;
+        let name = sanitize_required_text(name, 256, "name")?;
+        db.execute_raw(raw::statement(
+            db,
+            "UPDATE voice_consents SET name = ?1, updated_at = ?2 WHERE id = ?3",
+            vec![name.into(), now_unix_millis_i64().into(), id.trim().into()],
+        )?)
+        .await
+        .context("Failed to rename voice consent")?;
+        self.get_consent(id).await
+    }
+
+    pub async fn set_consent_verification(
+        &self,
+        id: &str,
+        status: &str,
+        verification: &serde_json::Value,
+    ) -> anyhow::Result<Option<VoiceConsent>> {
+        let db = self.db.connection().await?;
+        db.execute_raw(raw::statement(
+            db,
+            "UPDATE voice_consents SET status = ?1, verification_json = ?2, updated_at = ?3 WHERE id = ?4",
+            vec![
+                status.into(),
+                verification.to_string().into(),
+                now_unix_millis_i64().into(),
+                id.trim().into(),
+            ],
+        )?)
+        .await
+        .context("Failed to record voice consent verification")?;
+        self.get_consent(id).await
+    }
+
+    /// Deletes a consent and its recording, and revokes every voice made
+    /// with it (they stay listed, but `/v1/audio/speech` and Realtime
+    /// refuse them). Returns whether the consent existed.
+    pub async fn delete_consent(&self, id: &str) -> anyhow::Result<bool> {
+        let Some(consent) = self.get_consent(id).await? else {
+            return Ok(false);
+        };
+        let db = self.db.connection().await?;
+        let now = now_unix_millis_i64();
+        db.execute_raw(raw::statement(
+            db,
+            "UPDATE saved_voices SET permission_revoked_at = ?1, consent_status = 'revoked', \
+             updated_at = ?1 WHERE consent_id = ?2 AND permission_revoked_at IS NULL",
+            vec![now.into(), consent.id.clone().into()],
+        )?)
+        .await
+        .context("Failed to revoke the consent's voices")?;
+        db.execute_raw(raw::statement(
+            db,
+            "DELETE FROM voice_consents WHERE id = ?1",
+            vec![consent.id.into()],
+        )?)
+        .await
+        .context("Failed to delete voice consent")?;
+        delete_media_object(&self.media_storage, Some(&consent.recording_storage_path)).await?;
+        Ok(true)
+    }
+}
+
 const SAVED_VOICE_COLUMNS: &str = r#"
     id,
     created_at,
@@ -391,7 +651,8 @@ const SAVED_VOICE_COLUMNS: &str = r#"
     allowed_uses_json,
     permission_provenance,
     permission_revoked_at,
-    reference_language
+    reference_language,
+    consent_id
 "#;
 
 /// ?1 search pattern (or NULL), ?2-?4 cursor (or NULL), ?5 limit.
@@ -469,6 +730,7 @@ fn map_saved_voice(row: &QueryResult) -> anyhow::Result<SavedVoice> {
         permission_provenance: row.try_get_by_index(12)?,
         permission_revoked_at: row.try_get_by_index::<Option<i64>>(13)?.map(i64_to_u64),
         reference_language: row.try_get_by_index(14)?,
+        consent_id: row.try_get_by_index(15)?,
     })
 }
 
@@ -609,6 +871,8 @@ mod tests {
         );
         let voice = |name: &str| NewSavedVoice {
             name: name.to_string(),
+            consent_id: None,
+            permission_provenance: None,
             reference_text: Some("A calm reference sample".to_string()),
             reference_language: None,
             audio_mime_type: "audio/wav".to_string(),
@@ -640,6 +904,8 @@ mod tests {
         let (_temp, store) = setup_store();
         let voice = |name: &str, transcript: Option<&str>| NewSavedVoice {
             name: name.to_string(),
+            consent_id: None,
+            permission_provenance: None,
             reference_text: transcript.map(str::to_string),
             reference_language: None,
             audio_mime_type: "audio/wav".to_string(),
@@ -684,6 +950,8 @@ mod tests {
         let created = store
             .create_voice(NewSavedVoice {
                 name: "  Demo Voice ".to_string(),
+                consent_id: None,
+                permission_provenance: None,
                 reference_text: Some(" A calm reference sample ".to_string()),
                 reference_language: Some("hi".to_string()),
                 audio_mime_type: "audio/wav".to_string(),

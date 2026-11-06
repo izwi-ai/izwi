@@ -2047,8 +2047,18 @@
           {
             "properties": {
               "allow_format_fallback": {
+                "description": "Return WAV for a recognized format this build cannot encode (`aac`).",
                 "type": [
                   "boolean",
+                  "null"
+                ]
+              },
+              "bitrate": {
+                "description": "Target bitrate in bit/s for mp3 and opus.",
+                "format": "int32",
+                "minimum": 0,
+                "type": [
+                  "integer",
                   "null"
                 ]
               },
@@ -2060,6 +2070,7 @@
                 ]
               },
               "instructions": {
+                "description": "At most 4096 characters.",
                 "type": [
                   "string",
                   "null"
@@ -2091,7 +2102,7 @@
                 "type": "string"
               },
               "reference_audio": {
-                "description": "A reference clip to clone, base64 audio. Fish Audio Drama 3 takes one\nup to 60 s (saved voices hold 30 s) and speaks in a voice its `seed`\nsets when given none.",
+                "description": "A reference clip to clone: base64 audio, a data URL, or an http(s)\nURL on IZWI_ALLOWED_MEDIA_DOMAINS (`ref_audio` elsewhere). Fish Audio Drama 3 takes one\nup to 60 s (saved voices hold 30 s) and speaks in a voice its `seed`\nsets when given none.",
                 "type": [
                   "string",
                   "null"
@@ -2122,8 +2133,18 @@
                 ]
               },
               "response_format": {
+                "description": "`mp3`, `opus` (Ogg), `flac`, `wav`, `pcm` (OpenAI's: 24 kHz PCM16),\n`pcm_i16` / `pcm_f32` (the model's rate), `g711_ulaw`, `g711_alaw`.\n`aac` is refused: AAC encoders need a patent licence. The default is\nIZWI_SPEECH_DEFAULT_FORMAT (`wav`).",
                 "type": [
                   "string",
+                  "null"
+                ]
+              },
+              "sample_rate": {
+                "description": "The rate to encode at (resampled when the model's differs); opus\ntakes 8000/12000/16000/24000/48000, mp3 its MPEG rates.",
+                "format": "int32",
+                "minimum": 0,
+                "type": [
+                  "integer",
                   "null"
                 ]
               },
@@ -2151,12 +2172,14 @@
                 ]
               },
               "stream": {
+                "description": "`true` streams server-sent events (as `stream_format: \"sse\"`).",
                 "type": [
                   "boolean",
                   "null"
                 ]
               },
               "stream_format": {
+                "description": "`audio`: the encoded file as a chunked body while it is generated;\n`sse`: base64 deltas of the same bytes (`speech.audio.delta`).",
                 "type": [
                   "string",
                   "null"
@@ -2178,8 +2201,9 @@
                 ]
               },
               "voice": {
+                "description": "A voice name, or OpenAI's custom-voice object `{\"id\": \"...\"}` naming\na saved voice (`/v1/audio/voices`). A model that clones and has no\nbuilt-in voices reads a name as an uploaded voice's.",
                 "type": [
-                  "string",
+                  "object",
                   "null"
                 ]
               }
@@ -2928,6 +2952,413 @@
         ]
       }
     },
+    "/v1/audio/consent_phrases": {
+      "get": {
+        "description": "What a verified consent recording says, per language.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "List consent phrases",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/audio/speech": {
+      "post": {
+        "operationId": "create_speech",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpeechRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Encoded audio (Content-Type per response_format; a chunked body for stream_format audio), or server-sent audio events for stream_format sse. X-Izwi-Speech-Id names the request for GET /v1/audio/speech/{speech_id}."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            },
+            "description": "Server error"
+          }
+        },
+        "summary": "Create speech",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/audio/speech/batch": {
+      "post": {
+        "description": "Up to IZWI_TTS_BATCH_MAX_ITEMS speech requests: top-level fields are defaults each of `items` overrides. Returns `{id, object, results[], total, succeeded, failed}`; each result carries base64 `audio_data` or an OpenAI `error` object, and an `id` for `GET /v1/audio/speech/{speech_id}`.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Create speech in a batch",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/audio/speech/stream": {
+      "get": {
+        "description": "Text in, audio out: `session.config`, then `input.text` as text arrives, `input.commit` to speak what is buffered, `input.done` to end the utterance, `input.cancel`, `session.close`. Audio arrives per segment between `audio.start` and `audio.done`. `?dialect=sglang-omni|vllm-omni` serves those stacks' clients.",
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade"
+          },
+          "400": {
+            "description": "Invalid WebSocket request"
+          }
+        },
+        "summary": "Open the text-in speech WebSocket",
+        "tags": [
+          "Realtime"
+        ]
+      }
+    },
+    "/v1/audio/speech/{speech_id}": {
+      "get": {
+        "description": "Status, finish reason, usage, audio duration and timings of a /v1/audio/speech request (any delivery), by its `X-Izwi-Speech-Id`. Process-local and bounded (IZWI_SPEECH_OUTCOME_CAPACITY, IZWI_SPEECH_OUTCOME_TTL_SECS); no audio is kept.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Get a speech request's outcome",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/audio/transcriptions": {
+      "post": {
+        "operationId": "create_transcription",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TranscriptionJsonRequest"
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/TranscriptionMultipartRequest"
+              }
+            }
+          },
+          "description": "Transcription input. Send application/json with audio_base64, or multipart/form-data with an audio file or audio_base64 field.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscriptionResponse"
+                }
+              }
+            },
+            "description": "Transcription result as JSON, verbose JSON, text, SRT, VTT, or server-sent events"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            },
+            "description": "Server error"
+          }
+        },
+        "summary": "Create transcription",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/audio/translations": {
+      "post": {
+        "description": "OpenAI's translation route: multipart `file`, `model` (a model that translates speech: Granite Speech 5.0, Nemotron 3.5 Transcribe), `prompt`, `response_format` (json, text, srt, verbose_json, vtt), `temperature`. The target is English unless `to_language` / `target_language` names another; `language` hints the source; `stream` gives `transcript.text.*` events.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Create translation",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/audio/voice_consents": {
+      "get": {
+        "description": "Consent recordings, newest first; `after` and `limit` (1 to 100) page them.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "List voice consents",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      },
+      "post": {
+        "description": "Multipart `name`, `recording` (at most 10 MiB) and `language` (BCP 47). Under IZWI_VOICE_CONSENT_MODE=verified the recording must say a consent phrase (GET /v1/audio/consent_phrases).",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Create a voice consent",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/audio/voice_consents/{consent_id}": {
+      "delete": {
+        "description": "Deletes the recording and revokes every voice made with it.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Delete a voice consent",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      },
+      "get": {
+        "description": "A consent recording's metadata and verification.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Get a voice consent",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      },
+      "post": {
+        "description": "JSON `{\"name\"}`.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Update a voice consent",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/audio/voices": {
+      "get": {
+        "description": "Every saved voice, as OpenAI `audio.voice` objects in `data` and SGLang-Omni's `voices`/`uploaded_voices`.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "List voices",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      },
+      "post": {
+        "description": "Multipart `name`, `audio_sample` (at most 10 MiB) and `consent` (a consent id from /v1/audio/voice_consents, or an attestation, per IZWI_VOICE_CONSENT_MODE); optional `ref_text`, `reference_language`. Speak it with `voice: {\"id\": ...}`.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Create a voice",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/audio/voices/{voice_id}": {
+      "delete": {
+        "description": "Deletes a voice by id (OpenAI) or by name (SGLang-Omni, vLLM-Omni).",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Delete a voice",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      },
+      "get": {
+        "description": "A voice by id or by name.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Get a voice",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
     "/v1/chat/completions": {
       "post": {
         "operationId": "create_chat_completion",
@@ -3049,6 +3480,23 @@
         "summary": "Get model",
         "tags": [
           "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/realtime": {
+      "get": {
+        "description": "Upgrade to an OpenAI Realtime (GA) session: JSON events with base64 24 kHz PCM16 or G.711 audio. `?model=` selects a realtime profile (a modular ASR, chat and TTS stack, or a speech-to-speech model); OpenAI model names select the default profile. `?intent=transcription` opens a transcription session.",
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade"
+          },
+          "400": {
+            "description": "Invalid WebSocket request"
+          }
+        },
+        "summary": "Open OpenAI Realtime WebSocket",
+        "tags": [
+          "Realtime"
         ]
       }
     }

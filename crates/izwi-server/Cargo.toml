@@ -61,6 +61,10 @@ izwi-agent = { path = "../izwi-agent" }
 izwi-vad = { path = "../izwi-vad" }
 rubato = { workspace = true }
 izwi-db = { path = "../izwi-db" }
+izwi-audio-codec = { path = "../izwi-audio-codec" }
+# Reference audio fetched by URL (api/remote_audio.rs).
+reqwest = { workspace = true }
+rustls = { workspace = true }
 izwi-gateway = { path = "../izwi-gateway" }
 izwi-serving-client = { path = "../izwi-serving-client" }
 izwi-serving-protocol = { path = "../izwi-serving-protocol" }

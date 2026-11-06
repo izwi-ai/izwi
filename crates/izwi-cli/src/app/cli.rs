@@ -921,8 +921,15 @@ pub enum OutputFormat {
 pub enum AudioFormat {
     /// WAV (16-bit PCM)
     Wav,
-    /// Raw 16-bit little-endian mono PCM, no header
+    /// Raw 16-bit little-endian mono PCM at the model's rate, no header
     Pcm,
+    /// MP3 (constant bitrate)
+    Mp3,
+    /// Opus in an Ogg container
+    #[value(alias = "ogg")]
+    Opus,
+    /// FLAC (lossless)
+    Flac,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -1165,13 +1172,14 @@ mod tests {
     /// The speech formats offered are the ones the server encodes.
     #[test]
     fn tts_formats_are_the_ones_the_server_encodes() {
-        assert!(Cli::try_parse_from(["izwi", "tts", "hi", "--format", "pcm"]).is_ok());
-        for format in ["mp3", "ogg", "flac", "aac"] {
+        for format in ["wav", "pcm", "mp3", "opus", "ogg", "flac"] {
             assert!(
-                Cli::try_parse_from(["izwi", "tts", "hi", "--format", format]).is_err(),
+                Cli::try_parse_from(["izwi", "tts", "hi", "--format", format]).is_ok(),
                 "{format}"
             );
         }
+        // AAC encoders need a patent licence; the server does not ship one.
+        assert!(Cli::try_parse_from(["izwi", "tts", "hi", "--format", "aac"]).is_err());
         assert!(Cli::try_parse_from(["izwi", "--output-format", "yaml", "list"]).is_err());
     }
 
