@@ -813,6 +813,19 @@ mod tests {
         fixture(&serde_json::json!({ "files": files }).to_string())
     }
 
+    /// VibeVoice 1.5B's per-backend catalog figures cover what its published
+    /// checkpoint needs free on an empty device (`empty_device_requirement`):
+    /// 6.0 GiB on Metal, where the one 12 GiB figure hid it on 16 GB Macs,
+    /// against 11.1 GiB for the CPU's F32 load.
+    #[test]
+    fn tts_catalog_figures_cover_an_empty_device() {
+        let _env = env_lock();
+        let variant = ModelVariant::VibeVoice15BTts;
+        let requirements =
+            BACKENDS.map(|backend| empty_device_requirement(variant, &vibevoice(backend), backend));
+        assert_catalog_figures_cover_empty_devices(&[(variant, requirements)]);
+    }
+
     /// Report 08 table B, resident weights per backend (CPU, Metal as
     /// allocated, CUDA), with the load peak each must stay under:
     /// - Qwen3-TTS CustomVoice/Base load F32 on CPU: 0.6B Base is 4.01 GiB,
@@ -834,19 +847,6 @@ mod tests {
     ///   F32 and runs T3 F32 on CPU, F16 on Metal (host-cast) and BF16 on
     ///   CUDA, plus the default voice and 16 cached clones: 2.99 GiB on CPU,
     ///   2.00 GiB elsewhere.
-    /// VibeVoice 1.5B's per-backend catalog figures cover what its published
-    /// checkpoint needs free on an empty device (`empty_device_requirement`):
-    /// 6.0 GiB on Metal, where the one 12 GiB figure hid it on 16 GB Macs,
-    /// against 11.1 GiB for the CPU's F32 load.
-    #[test]
-    fn tts_catalog_figures_cover_an_empty_device() {
-        let _env = env_lock();
-        let variant = ModelVariant::VibeVoice15BTts;
-        let requirements =
-            BACKENDS.map(|backend| empty_device_requirement(variant, &vibevoice(backend), backend));
-        assert_catalog_figures_cover_empty_devices(&[(variant, requirements)]);
-    }
-
     #[test]
     fn plans_match_the_per_backend_residency_table() {
         let _env = env_lock();
