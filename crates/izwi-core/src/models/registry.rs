@@ -1650,6 +1650,37 @@ impl NativeAsrModel {
         }
     }
 
+    /// One continuous decode step of retained Whisper rows together.
+    pub(crate) fn decode_whisper_retained_step_batch(
+        &self,
+        states: &mut [&mut NativeAsrDecodeState],
+    ) -> Result<Vec<NativeAsrDecodeStep>> {
+        let Self::WhisperTurbo(model) = self else {
+            return Err(Error::InvalidInput(
+                "Whisper decode batch was routed to another ASR model".into(),
+            ));
+        };
+        let mut typed = states
+            .iter_mut()
+            .map(|state| match &mut **state {
+                NativeAsrDecodeState::Whisper(state) => Ok(state),
+                _ => Err(Error::InvalidInput(
+                    "continuous Whisper ASR batch contains a foreign state".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(model
+            .decode_step_retained_batch(&mut typed)?
+            .into_iter()
+            .map(|step| NativeAsrDecodeStep {
+                delta: step.delta,
+                text: step.text,
+                tokens_generated: step.tokens_generated,
+                finished: step.finished,
+            })
+            .collect())
+    }
+
     pub(crate) fn resolve_whisper_terminal_transition(
         &self,
         state: &mut NativeAsrDecodeState,
@@ -2885,6 +2916,7 @@ impl NativeAsrModel {
             Self::VibeVoice(model) => model.supports_continuous_decode_batch(),
             Self::GraniteSpeech(model) => model.supports_continuous_decode_batch(),
             Self::NemotronTranscribe(_) => true,
+            Self::WhisperTurbo(model) => model.supports_continuous_decode_batch(),
             _ => false,
         }
     }
@@ -2903,7 +2935,10 @@ impl NativeAsrModel {
         matches!(self, Self::Qwen3(model) if model.continuous_decode_is_tensor_batched())
             || matches!(
                 self,
-                Self::VibeVoice(_) | Self::GraniteSpeech(_) | Self::NemotronTranscribe(_)
+                Self::VibeVoice(_)
+                    | Self::GraniteSpeech(_)
+                    | Self::NemotronTranscribe(_)
+                    | Self::WhisperTurbo(_)
             )
     }
 
@@ -2916,6 +2951,7 @@ impl NativeAsrModel {
             Self::VibeVoice(model) => model.continuous_decode_workspace_per_row_bytes(),
             Self::GraniteSpeech(model) => model.continuous_decode_workspace_per_row_bytes(),
             Self::NemotronTranscribe(model) => Ok(model.decode_workspace_per_row_bytes()),
+            Self::WhisperTurbo(model) => model.continuous_decode_workspace_per_row_bytes(),
             _ => Err(Error::InvalidInput(
                 "Loaded ASR model does not expose continuous tensor decode".to_string(),
             )),

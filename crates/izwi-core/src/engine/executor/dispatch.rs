@@ -1694,6 +1694,210 @@ mod tests {
         );
     }
 
+    /// A continuous decode batch can carry a fallback restart beside an
+    /// ordinary row (Whisper's temperature fallback): the restart row
+    /// publishes no receipt or output and asks for a restart, while its
+    /// neighbour acknowledges its own reserved write.
+    #[test]
+    fn continuous_batch_restart_row_beside_a_decoding_row_settles_each_alone() {
+        let executor = NativeExecutor::new(super::super::WorkerConfig::default());
+        let arena = KvArenaId {
+            model_instance: ModelInstanceId::new(4),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 2,
+        };
+        let lane = BatchLaneKey {
+            execution_group: ExecutionGroupId::new(1),
+            model_instance: ModelInstanceId::new(4),
+            adapter_instance: AdapterInstanceId::new(1),
+            adapter_abi: AdapterAbiRevision::new(1),
+            capability_id: "asr".to_string(),
+            stage_id: StageId::new(2),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            compute_dtype: "f32".to_string(),
+            state_dtype: "f32".to_string(),
+            tensor_layout: "paged".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "whisper".to_string(),
+            kernel_mode: "asr.decode.whisper.tensor_continuous".to_string(),
+            semantic_mode: "greedy".to_string(),
+            shape_bucket: "tokens.1".to_string(),
+        };
+        let binding = crate::kv::KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let arena_config = KvArenaConfig {
+            id: arena,
+            group: KvGroupId::new(0),
+            page_tokens: 4,
+            capacity_pages: 4,
+            growth: None,
+            dtype: DType::F32,
+            layers: vec![KvLayerConfig {
+                binding,
+                num_kv_heads: 1,
+                key_head_dim: 2,
+                value_head_dim: 2,
+            }],
+        };
+        let physical_arena = CpuKvBackendRuntime
+            .allocate_arena(arena_config.clone())
+            .unwrap();
+        let mut requests = Vec::new();
+        let mut scheduled_rows = Vec::new();
+        let mut rows = Vec::new();
+        let mut blocks = Vec::new();
+        for (row, name) in ["restarting", "decoding", "finishing"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+            request.id = format!("whisper-{name}");
+            let mut scheduled = scheduled(&request.id, 20 + row as u64);
+            scheduled.is_prefill = false;
+            scheduled.work = WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: InputRange { start: 0, end: 1 },
+                max_output_steps: 1,
+                auxiliary_state: None,
+            };
+            let block = CacheBlockRef {
+                arena,
+                group: KvGroupId::new(0),
+                index: row as u32,
+                slot_generation: 5,
+            };
+            rows.push(ReadyQuantum {
+                plan_id: scheduled.plan_id,
+                session: scheduled.session_key(),
+                lane: lane.clone(),
+                work: scheduled.work.clone(),
+                cost: WorkCost::new(1, 1, 0),
+                managed_cache: Some(ManagedCacheReservation {
+                    txn_id: scheduled.plan_id,
+                    session: scheduled.session_key(),
+                    session_generation: crate::engine::ManagedSessionGeneration::INITIAL,
+                    domains: vec![ManagedCacheDomainReservation {
+                        arena,
+                        domain: CacheDomainId::new(0),
+                        expected_version: 0,
+                        expected_committed_tokens: 0,
+                        execution_start_tokens: 0,
+                        target_committed_tokens: 1,
+                        target_window_start: 0,
+                        first_page_offset: 0,
+                        provisional_groups: vec![GroupBlockTable {
+                            group: KvGroupId::new(0),
+                            blocks: vec![block],
+                        }],
+                        writable_blocks: vec![block],
+                    }],
+                    clocked_state: None,
+                    // Decode rows may end without appending (EOT).
+                    allow_unchanged_prefix: true,
+                }),
+            });
+            requests.push(request);
+            scheduled_rows.push(scheduled);
+            blocks.push(block);
+        }
+        let slots = physical_arena
+            .lower_slots(&[crate::kv::KvSlotRef {
+                block: blocks[1],
+                offset: 0,
+            }])
+            .unwrap();
+        let keys = Tensor::zeros((1, 1, 2), DType::F32, &Device::Cpu).unwrap();
+        let completion = physical_arena
+            .write_slots(
+                binding,
+                KvWriteArgs {
+                    keys: &keys,
+                    values: &keys,
+                    slots: slots.as_ref(),
+                },
+            )
+            .unwrap();
+        let mut collector =
+            KvWriteCompletionCollector::new(&arena_config, slots.logical_slots()).unwrap();
+        collector.collect(completion).unwrap();
+        let decoded = ModelSessionResult::yielded(
+            ExecutorOutput {
+                request_id: requests[1].id.clone(),
+                audio: None,
+                text: Some(String::new()),
+                input_transcription: None,
+                tokens_processed: 1,
+                tokens_generated: 1,
+                finished: false,
+                phase_timing_override: None,
+                asr_diagnostics: None,
+                error: None,
+                logprobs: Vec::new(),
+            },
+            crate::engine::YieldReason::QuantumExhausted,
+        )
+        .with_managed_cache_completions(vec![Arc::new(collector.seal().unwrap())]);
+        let restart = ModelSessionResult::restart_sequence(
+            requests[0].id.clone(),
+            crate::engine::SequenceRestartReason::ModelFallback,
+        );
+        // A row that ends at EOT decodes no further token: it reports no
+        // progress and no write, and finishes.
+        let finished = ModelSessionResult::sequence(ExecutorOutput {
+            request_id: requests[2].id.clone(),
+            audio: None,
+            text: Some("transcript".to_string()),
+            input_transcription: None,
+            tokens_processed: 0,
+            tokens_generated: 0,
+            finished: true,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+            logprobs: Vec::new(),
+        });
+        let request_refs = requests.iter().collect::<Vec<_>>();
+        let result = executor
+            .finish_scheduled_execution(
+                &request_refs,
+                &scheduled_rows,
+                vec![restart, decoded, finished],
+                BatchDispatch::new(BatchDispatchKind::TensorContinuous, 3),
+                Some(&rows),
+            )
+            .unwrap();
+        assert!(matches!(
+            result[0].disposition,
+            crate::engine::ExecutionDisposition::RestartSequence(_)
+        ));
+        assert!(result[0].managed_cache.is_none());
+        assert!(result[0].managed_cache_completions.is_empty());
+        assert_eq!(result[0].output.tokens_processed, 0);
+        let receipt = result[1]
+            .managed_cache
+            .as_ref()
+            .expect("the decoding neighbour acknowledges its write");
+        assert_eq!(receipt.domains[0].written_blocks, vec![blocks[1]]);
+        assert!(result[1].output.error.is_none());
+        assert!(
+            result[2].output.error.is_none(),
+            "{:?}",
+            result[2].output.error
+        );
+        assert!(result[2].output.finished);
+        assert!(result[2]
+            .managed_cache
+            .as_ref()
+            .expect("a finished row acknowledges its reservation")
+            .domains[0]
+            .written_blocks
+            .is_empty());
+    }
+
     #[test]
     fn successful_native_row_emits_receipt_for_its_exact_reserved_blocks() {
         let executor = NativeExecutor::new(super::super::WorkerConfig::default());

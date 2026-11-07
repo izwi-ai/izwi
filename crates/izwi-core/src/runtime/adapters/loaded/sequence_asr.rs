@@ -677,7 +677,10 @@ pub(super) struct WhisperAsrExecutionAdapter {
     pub(super) adapter_instance_id: AdapterInstanceId,
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
+    /// The encoder preparation's width: the engine rows.
     pub(super) max_batch_size: usize,
+    /// The continuous decode's width, at least `max_batch_size`.
+    pub(super) decode_batch_size: usize,
     pub(super) audio_preparation:
         OnceLock<crate::models::architectures::whisper::asr::WhisperAudioPreparationStageSeal>,
 }
@@ -699,8 +702,16 @@ impl WhisperAsrExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
             audio_preparation: OnceLock::new(),
         }
+    }
+
+    /// Decode up to `rows` rows per step; the encoder keeps the width the
+    /// adapter was built with.
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
     }
 }
 
@@ -749,6 +760,7 @@ impl LoadedExecutionAdapter for WhisperAsrExecutionAdapter {
                     dtype: "f32".into(),
                     max_batch_size,
                     max_workspace_bytes: 64 * 1024 * 1024,
+                    decode_workspace_per_row_bytes: 8_192,
                 },
             )
             .map_err(|_| Error::ModelLoadError("test Whisper seal was already installed".into()))
@@ -808,6 +820,7 @@ impl LoadedExecutionAdapter for WhisperAsrExecutionAdapter {
         if seal.backend != self.backend_kind
             || seal.max_batch_size != self.max_batch_size
             || seal.dtype.is_empty()
+            || seal.decode_workspace_per_row_bytes == 0
         {
             return Err(Error::ModelLoadError(
                 "Whisper audio preparation seal does not match its loaded adapter identity".into(),
@@ -818,7 +831,7 @@ impl LoadedExecutionAdapter for WhisperAsrExecutionAdapter {
         execution_profile.prefill = PrefillMode::Incremental;
         execution_profile.incremental_decode = true;
         execution_profile.prefill_batch = NativeBatchMode::None;
-        execution_profile.decode_batch = NativeBatchMode::None;
+        execution_profile.decode_batch = NativeBatchMode::Continuous;
         execution_profile.cache_mode = CacheMode::ExternalPaged;
         execution_profile.cache_namespace = Some(format!(
             "{}:{}:state-v2",
@@ -827,12 +840,13 @@ impl LoadedExecutionAdapter for WhisperAsrExecutionAdapter {
         ));
         execution_profile.kv_dtype = "state_v2_resolved".to_string();
         execution_profile.cancellation = CancellationGranularity::SequenceStep;
-        execution_profile.concurrency = ConcurrencyClass::Exclusive;
+        execution_profile.concurrency = ConcurrencyClass::Batchable;
         execution_profile.recompute_safe = true;
         execution_profile.cache_release_safe = true;
-        // The capability envelope exposes the independently batchable encoder
-        // width; decoder stages below remain explicitly scalar width one.
-        execution_profile.max_batch_size = self.max_batch_size;
+        execution_profile.prefix_reuse_safe = false;
+        // The encoder batches at the engine rows and the decode at its own
+        // width; the prompt prefill stays scalar.
+        execution_profile.max_batch_size = self.decode_batch_size;
         execution_profile.resolved_from_loaded_model = true;
 
         let mut preparation = StageDescriptor::from_execution_profile(
@@ -845,6 +859,7 @@ impl LoadedExecutionAdapter for WhisperAsrExecutionAdapter {
         preparation.progress = StageProgressKind::Atomic;
         preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
         preparation.shape_policy = StageShapePolicy::Padded;
+        preparation.concurrency = ConcurrencyClass::Batchable;
         preparation.max_batch_size = seal.max_batch_size;
         preparation.max_workspace_bytes = seal.max_workspace_bytes;
         preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
@@ -862,14 +877,23 @@ impl LoadedExecutionAdapter for WhisperAsrExecutionAdapter {
 
         let mut decode = StageDescriptor::from_execution_profile(
             StageId::new(2),
-            "asr.decode.scalar",
+            "asr.decode.whisper.tensor_continuous",
             &execution_profile,
-            NativeBatchMode::None,
+            NativeBatchMode::Continuous,
         );
         decode.selector = StageWorkSelector::SequenceDecode;
-        decode.max_batch_size = 1;
-        decode.concurrency = ConcurrencyClass::Exclusive;
-        decode.shape_policy = StageShapePolicy::Exact;
+        decode.max_work_units = u64::try_from(decode.max_batch_size).map_err(|_| {
+            Error::Overloaded("Whisper decode width exceeds work accounting".into())
+        })?;
+        let decode_workspace_per_row =
+            continuous_asr_workspace_per_row_bytes(seal.decode_workspace_per_row_bytes)?;
+        decode.workspace_per_row_bytes = decode_workspace_per_row;
+        decode.max_workspace_bytes = decode_workspace_per_row
+            .checked_mul(
+                u64::try_from(self.decode_batch_size)
+                    .map_err(|_| Error::Overloaded("Whisper decode width exceeds u64".into()))?,
+            )
+            .ok_or_else(|| Error::Overloaded("Whisper decode workspace overflow".into()))?;
         preparation.validate()?;
         prefill.validate()?;
         decode.validate()?;

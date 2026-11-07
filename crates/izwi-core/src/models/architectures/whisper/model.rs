@@ -9,12 +9,15 @@ use candle_transformers::models::with_tracing::{linear, linear_no_bias, Linear};
 
 use crate::backends::state::{StaticAttentionLayerValue, StaticAttentionRaggedRow};
 use crate::engine::{
-    InvocationStaticAttentionLease, RetainedStaticAttentionRuntimeV2,
+    InvocationStaticAttentionLease, RetainedStaticAttentionBatch, RetainedStaticAttentionRuntimeV2,
     RetainedStaticAttentionSequenceId,
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{DomainStepIntent, StateUpdateKind};
 use crate::models::shared::attention::flash::try_fused_self_attention;
+use crate::models::shared::attention::mixed::{
+    MixedRowLayout, MixedRowSpan, PreparedPhysicalMixedStep,
+};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::memory::accounting::deep_copy_tensor_storage;
 use crate::models::shared::memory::exact::exact_zeros;
@@ -411,13 +414,16 @@ impl ResidualAttentionBlock {
         })
     }
 
-    fn forward_decoder_physical(
+    /// One decoder block over token-major rows `x` (`[1, tokens, d]`):
+    /// `self_attend(q, k, v, scale)` runs causal self attention on the rows'
+    /// paged state and `cross_attend(layer, q, scale)` attends their audio
+    /// memories; both take and return `[tokens, heads, head_dim]`.
+    fn forward_decoder_step(
         &self,
         model_layer: usize,
         x: &Tensor,
-        self_kv: &PhysicalPagedKvCache,
-        prepared: &mut PreparedPhysicalPagedStep,
-        cross_kv: &InvocationStaticAttentionLease,
+        self_attend: impl FnOnce(&Tensor, &Tensor, &Tensor, f32) -> Result<Tensor>,
+        cross_attend: impl FnOnce(u32, &Tensor, f32) -> Result<Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let self_input = self.attn_ln.forward(x)?;
@@ -426,26 +432,16 @@ impl ResidualAttentionBlock {
             .project_self_attention_qkv_token_major(&self_input)?;
         let head_dim = q.dim(2)?;
         let scale = 1.0_f32 / (head_dim as f32).sqrt();
-        let attended = self_kv.write_and_attend(model_layer, prepared, &q, &k, &v, scale)?;
+        let attended = self_attend(&q, &k, &v, scale)?;
         let mut x = (x + self.attn.project_output_token_major(&attended)?)?;
 
         let (cross_attn, cross_ln) = self.cross_attn.as_ref().ok_or_else(|| {
             Error::InvalidInput("Whisper decoder layer has no cross attention".into())
         })?;
         let cross_query = cross_attn.project_cross_attention_query(&cross_ln.forward(&x)?)?;
-        let query_len = u32::try_from(cross_query.dim(0)?)
-            .map_err(|_| Error::InvalidInput("Whisper query length exceeds u32".into()))?;
         let model_layer = u32::try_from(model_layer)
             .map_err(|_| Error::InvalidInput("Whisper layer index exceeds u32".into()))?;
-        let cross_attended = cross_kv.attend(
-            model_layer,
-            &cross_query,
-            &[StaticAttentionRaggedRow {
-                query_start: 0,
-                query_len,
-            }],
-            scale,
-        )?;
+        let cross_attended = cross_attend(model_layer, &cross_query, scale)?;
         x = (&x + cross_attn.project_output_token_major(&cross_attended)?)?;
 
         let mlp = self.mlp_linear2.forward(&gelu(
@@ -454,6 +450,25 @@ impl ResidualAttentionBlock {
         Ok((x + mlp)?)
     }
 
+    fn forward_decoder_physical(
+        &self,
+        model_layer: usize,
+        x: &Tensor,
+        self_kv: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+        cross_kv: &InvocationStaticAttentionLease,
+    ) -> Result<Tensor> {
+        self.forward_decoder_step(
+            model_layer,
+            x,
+            |q, k, v, scale| self_kv.write_and_attend(model_layer, prepared, q, k, v, scale),
+            |layer, query, scale| cross_kv.attend(layer, query, &[one_query_row(query)?], scale),
+        )
+    }
+
+    /// One block of a retained sequence. Decode tokens attend
+    /// batch-invariantly, as a row of [`Self::forward_decoder_retained_batch`]
+    /// does.
     fn forward_decoder_retained(
         &self,
         model_layer: usize,
@@ -463,41 +478,51 @@ impl ResidualAttentionBlock {
         cross_runtime: &RetainedStaticAttentionRuntimeV2,
         cross_sequence: RetainedStaticAttentionSequenceId,
     ) -> Result<Tensor> {
-        let _enter = self.span.enter();
-        let self_input = self.attn_ln.forward(x)?;
-        let (q, k, v) = self
-            .attn
-            .project_self_attention_qkv_token_major(&self_input)?;
-        let head_dim = q.dim(2)?;
-        let scale = 1.0_f32 / (head_dim as f32).sqrt();
-        let attended = self_kv.write_and_attend(model_layer, prepared, &q, &k, &v, scale)?;
-        let mut x = (x + self.attn.project_output_token_major(&attended)?)?;
-
-        let (cross_attn, cross_ln) = self.cross_attn.as_ref().ok_or_else(|| {
-            Error::InvalidInput("Whisper decoder layer has no cross attention".into())
-        })?;
-        let cross_query = cross_attn.project_cross_attention_query(&cross_ln.forward(&x)?)?;
-        let query_len = u32::try_from(cross_query.dim(0)?)
-            .map_err(|_| Error::InvalidInput("Whisper query length exceeds u32".into()))?;
-        let model_layer = u32::try_from(model_layer)
-            .map_err(|_| Error::InvalidInput("Whisper layer index exceeds u32".into()))?;
-        let cross_attended = cross_runtime.attend(
-            cross_sequence,
+        self.forward_decoder_step(
             model_layer,
-            &cross_query,
-            &[StaticAttentionRaggedRow {
-                query_start: 0,
-                query_len,
-            }],
-            scale,
-        )?;
-        x = (&x + cross_attn.project_output_token_major(&cross_attended)?)?;
-
-        let mlp = self.mlp_linear2.forward(&gelu(
-            &self.mlp_linear1.forward(&self.mlp_ln.forward(&x)?)?,
-        )?)?;
-        Ok((x + mlp)?)
+            x,
+            |q, k, v, scale| {
+                self_kv.write_and_attend_row_invariant(model_layer, prepared, q, k, v, scale)
+            },
+            |layer, query, scale| {
+                cross_runtime.attend(
+                    cross_sequence,
+                    layer,
+                    query,
+                    &[one_query_row(query)?],
+                    scale,
+                )
+            },
+        )
     }
+
+    /// One block of a decode step whose row `i` is one token of the
+    /// retained sequence `caches[i]` / `cross`'s row `i`.
+    fn forward_decoder_retained_batch(
+        &self,
+        model_layer: usize,
+        x: &Tensor,
+        caches: &[&PhysicalPagedKvCache],
+        step: &mut PreparedPhysicalMixedStep,
+        cross: &RetainedStaticAttentionBatch<'_>,
+    ) -> Result<Tensor> {
+        self.forward_decoder_step(
+            model_layer,
+            x,
+            |q, k, v, scale| step.write_and_attend(caches, model_layer, q, k, v, scale, None, None),
+            |layer, query, scale| cross.attend(layer, query, scale),
+        )
+    }
+}
+
+/// The one ragged row covering every query of `queries` (`[tokens, heads,
+/// head_dim]`): one sequence's span.
+fn one_query_row(queries: &Tensor) -> Result<StaticAttentionRaggedRow> {
+    Ok(StaticAttentionRaggedRow {
+        query_start: 0,
+        query_len: u32::try_from(queries.dim(0)?)
+            .map_err(|_| Error::InvalidInput("Whisper query length exceeds u32".into()))?,
+    })
 }
 
 /// Exact (erf) GELU, as OpenAI Whisper's `nn.GELU()`/`F.gelu` and HF's
@@ -832,6 +857,99 @@ impl TextDecoder {
         let x = self.ln.forward(&x)?;
         self_kv.commit_prepared(prepared)?;
         Ok(x)
+    }
+
+    /// One decode step of `tokens.len()` retained sequences together: row
+    /// `i` appends `tokens[i]` at `positions[i]` (its cache's context) to
+    /// `caches[i]` and attends `cross`'s row `i`. Each layer writes every
+    /// row's K/V and attends all rows in one paged call (batch-invariant
+    /// decode, as a lone row's) and one cross-attention batch. Returns the
+    /// F32 logits `[rows, vocab]`. The caches advance only when the whole
+    /// step succeeds.
+    pub(crate) fn forward_retained_decode_batch(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        cross: &RetainedStaticAttentionBatch<'_>,
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let rows = tokens.len();
+        if rows == 0 || positions.len() != rows || caches.len() != rows || cross.len() != rows {
+            return Err(Error::InvalidInput(format!(
+                "Whisper decode batch needs one position, cache and memory per token, got {rows} tokens, {} positions, {} caches and {} memories",
+                positions.len(),
+                caches.len(),
+                cross.len()
+            )));
+        }
+        let hidden_size = self.token_embedding.embeddings().dim(1)?;
+        if self.n_head == 0 || hidden_size % self.n_head != 0 {
+            return Err(Error::InvalidInput(
+                "Whisper decoder hidden size is not divisible by its head count".into(),
+            ));
+        }
+        let capacity = self.positional_embedding.dim(0)?;
+        for (cache, position) in caches.iter().zip(positions) {
+            if *position != cache.context_len() {
+                return Err(Error::InvalidInput(format!(
+                    "Whisper decoder position {position} does not match physical cache cursor {}",
+                    cache.context_len()
+                )));
+            }
+            if *position >= capacity {
+                return Err(Error::InvalidInput(format!(
+                    "Whisper decoder position {} exceeds its positional capacity",
+                    position + 1
+                )));
+            }
+            cache.validate_model(self.blocks.len(), self.n_head, hidden_size / self.n_head)?;
+        }
+        let device = self.positional_embedding.device();
+        let token_ids = Tensor::from_slice(tokens, rows, device)?;
+        let position_ids = positions
+            .iter()
+            .map(|position| {
+                u32::try_from(*position)
+                    .map_err(|_| Error::InvalidInput("Whisper decoder position exceeds u32".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let position_ids = Tensor::from_vec(position_ids, rows, device)?;
+        let layout = MixedRowLayout::new(
+            positions
+                .iter()
+                .map(|start_pos| MixedRowSpan {
+                    start_pos: *start_pos,
+                    q_len: 1,
+                })
+                .collect(),
+            rows,
+        )?;
+        let (step, logits) = {
+            let refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
+            let mut step =
+                PreparedPhysicalMixedStep::new(&refs, layout)?.with_row_invariant_decode();
+            let logits = (|| -> Result<Tensor> {
+                let token_embedding = self.token_embedding.forward(&token_ids)?;
+                let positional_embedding = to_add_dtype(
+                    self.positional_embedding.index_select(&position_ids, 0)?,
+                    token_embedding.dtype(),
+                )?;
+                let mut x = (token_embedding + positional_embedding)?.unsqueeze(0)?;
+                for (model_layer, block) in self.blocks.iter().enumerate() {
+                    x = block.forward_decoder_retained_batch(
+                        model_layer,
+                        &x,
+                        &refs,
+                        &mut step,
+                        cross,
+                    )?;
+                }
+                Ok(self.final_linear(&self.ln.forward(&x)?)?.squeeze(0)?)
+            })();
+            (step, logits)
+        };
+        step.finish(caches, logits)
     }
 
     /// One decoder step for `token` at position 0 over `audio_features`
@@ -1275,6 +1393,201 @@ mod tests {
             "{:?}",
             &values[..4]
         );
+    }
+
+    fn argmax_rows(logits: &Tensor) -> Vec<u32> {
+        logits
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap()
+            .iter()
+            .map(|row| argmax(row) as u32)
+            .collect()
+    }
+
+    /// Rows of the tiny Whisper with different audio memories, prompt
+    /// lengths and join steps, decoded greedily one row at a time
+    /// (`forward_retained_at`) and together (`forward_retained_decode_batch`,
+    /// whose batch changes as rows join): every step picks the same tokens,
+    /// with logits within `tolerance` of the lone rows'. Returns the largest
+    /// logit difference seen.
+    fn retained_decode_rows_match_alone(device: &Device, dtype: DType, tolerance: f32) -> f32 {
+        use super::test_fixture::{tiny_config, tiny_tensors};
+        use crate::engine::test_retained_static_runtime;
+        use crate::kernels::numeric_check::xorshift_tensor;
+        use crate::kv::v2::StateDType;
+        use crate::models::shared::attention::physical::test_physical_caches_with_dtype_on;
+
+        let mut config = tiny_config();
+        config.max_target_positions = 32;
+        let vb = candle_nn::VarBuilder::from_tensors(tiny_tensors(&config, 0.2), dtype, device);
+        let whisper = super::Whisper::load(&vb, config.clone()).expect("tiny whisper");
+        let decoder = &whisper.decoder;
+        let heads = config.decoder_attention_heads;
+        let head_dim = config.d_model / heads;
+        // (prompt tokens, step the row joins the batch at)
+        let rows = [
+            (vec![3u32], 0usize),
+            (vec![5, 2, 7], 0),
+            (vec![9, 4, 11, 6, 2], 2),
+        ];
+        let steps = 6;
+        let mut caches = test_physical_caches_with_dtype_on(
+            device,
+            dtype,
+            config.decoder_layers,
+            heads,
+            head_dim,
+            config.max_target_positions,
+            2 * rows.len(),
+        );
+        let state_dtype = if dtype == DType::F32 {
+            StateDType::F32
+        } else {
+            StateDType::F16
+        };
+        let runtime = test_retained_static_runtime(
+            device,
+            state_dtype,
+            &(0..config.decoder_layers as u32).collect::<Vec<_>>(),
+            heads as u32,
+            head_dim as u32,
+            config.max_source_positions as u64,
+            2 * rows.len() as u32,
+        );
+        // Sequence `2i` decodes row `i` alone; `2i + 1` decodes it batched.
+        let mut sequences = Vec::new();
+        let mut alone_logits = Vec::new();
+        for (row, (prompt, _)) in rows.iter().enumerate() {
+            let features = xorshift_tensor(
+                &[1, config.max_source_positions, config.d_model],
+                40 + row as u64,
+                1.0,
+                device,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let memory = decoder.prepare_cross_attention_memory(&features).unwrap();
+            let mut prompt_logits = None;
+            for copy in 0..2 {
+                let sequence = runtime.register_sequence().unwrap();
+                runtime
+                    .install(sequence, [row as u8 + 1; 32], memory.clone())
+                    .unwrap();
+                let tokens = Tensor::new(prompt.as_slice(), device)
+                    .unwrap()
+                    .unsqueeze(0)
+                    .unwrap();
+                let hidden = decoder
+                    .forward_retained_at(
+                        &tokens,
+                        0,
+                        &mut caches[2 * row + copy],
+                        &runtime,
+                        sequence,
+                    )
+                    .unwrap();
+                let last = hidden.narrow(1, prompt.len() - 1, 1).unwrap();
+                prompt_logits = Some(decoder.final_linear(&last).unwrap().flatten_all().unwrap());
+                sequences.push(sequence);
+            }
+            alone_logits.push(prompt_logits.unwrap());
+        }
+        let mut batched_logits = alone_logits.clone();
+        let mut largest = 0.0f32;
+        for step in 0..steps {
+            let live = (0..rows.len())
+                .filter(|row| rows[*row].1 <= step)
+                .collect::<Vec<_>>();
+            let mut tokens = Vec::new();
+            let mut positions = Vec::new();
+            for row in &live {
+                let alone = argmax_rows(&alone_logits[*row].unsqueeze(0).unwrap())[0];
+                let together = argmax_rows(&batched_logits[*row].unsqueeze(0).unwrap())[0];
+                assert_eq!(alone, together, "step {step} row {row}");
+                let position = caches[2 * row].context_len();
+                assert_eq!(caches[2 * row + 1].context_len(), position);
+                let token = Tensor::new(&[[alone]], device).unwrap();
+                let hidden = decoder
+                    .forward_retained_at(
+                        &token,
+                        position,
+                        &mut caches[2 * row],
+                        &runtime,
+                        sequences[2 * row],
+                    )
+                    .unwrap();
+                alone_logits[*row] = decoder
+                    .final_linear(&hidden)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap();
+                tokens.push(together);
+                positions.push(position);
+            }
+            let batch_sequences = live
+                .iter()
+                .map(|row| sequences[2 * row + 1])
+                .collect::<Vec<_>>();
+            let cross = runtime.prepare_batch(&batch_sequences).unwrap();
+            let mut batch_caches = caches
+                .iter_mut()
+                .enumerate()
+                .filter(|(index, _)| index % 2 == 1 && live.contains(&(index / 2)))
+                .map(|(_, cache)| cache)
+                .collect::<Vec<_>>();
+            let logits = decoder
+                .forward_retained_decode_batch(&tokens, &positions, &mut batch_caches, &cross)
+                .unwrap();
+            drop(cross);
+            assert_eq!(logits.dims(), &[live.len(), config.vocab_size]);
+            assert_eq!(logits.dtype(), DType::F32);
+            for (index, row) in live.iter().enumerate() {
+                batched_logits[*row] = logits.get(index).unwrap();
+                let difference = (&batched_logits[*row] - &alone_logits[*row])
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap();
+                assert!(
+                    difference <= tolerance,
+                    "step {step} row {row}: {difference}"
+                );
+                largest = largest.max(difference);
+            }
+        }
+        for row in 0..rows.len() {
+            assert_eq!(
+                caches[2 * row].context_len(),
+                caches[2 * row + 1].context_len()
+            );
+        }
+        largest
+    }
+
+    #[test]
+    fn batched_retained_decode_matches_rows_alone_on_cpu() {
+        let largest = retained_decode_rows_match_alone(&Device::Cpu, DType::F32, 1e-4);
+        eprintln!("CPU F32 batched vs alone: largest logit difference {largest:e}");
+    }
+
+    /// The batched decoder step on Metal in F16 (Whisper's Metal dtype):
+    /// the same tokens as each row alone, logits within F16 rounding.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_f16_batched_retained_decode_matches_rows_alone() {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_f16_batched_retained_decode_matches_rows_alone",
+        ) else {
+            return;
+        };
+        let largest = retained_decode_rows_match_alone(&device, DType::F16, 2e-2);
+        eprintln!("Metal F16 batched vs alone: largest logit difference {largest:e}");
     }
 
     /// The tiny model in F16 on the GPU: finite throughout, and within F16

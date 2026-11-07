@@ -758,7 +758,7 @@ impl LoadedExecutionAdapterFactory for WhisperPhysicalAsrAdapterFactory {
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
-        NativeBatchMode::Static
+        NativeBatchMode::Continuous
     }
 
     fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
@@ -770,13 +770,16 @@ impl LoadedExecutionAdapterFactory for WhisperPhysicalAsrAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(WhisperAsrExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            WhisperAsrExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 

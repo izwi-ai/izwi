@@ -5695,13 +5695,13 @@ mod tests {
             ModelFamily::VibeVoiceAsr,
             ModelFamily::ParakeetAsr,
             ModelFamily::NemotronAsr,
+            ModelFamily::WhisperAsr,
         ] {
             assert!(stage_sets_batch_rows(family), "{family:?}");
         }
         for family in [
             ModelFamily::Qwen3Chat,
             ModelFamily::Gemma3Chat,
-            ModelFamily::WhisperAsr,
             ModelFamily::GraniteSpeechAsr,
             ModelFamily::GraniteSpeech5Asr,
             ModelFamily::NemotronTranscribeAsr,

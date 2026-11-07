@@ -7183,6 +7183,7 @@ fn load_owned_composite_survives_weak_request_upgrade_until_ordered_unload() {
             &crate::engine::cache::composite::tests::contract(),
             crate::kv::v2::StateDomainId::new(2),
             Some(32),
+            (2, 2),
             0,
         )
         .unwrap();

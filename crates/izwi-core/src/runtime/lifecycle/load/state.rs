@@ -518,6 +518,10 @@ impl ModelLifecycleController {
                             &physical_spec.retained,
                             physical_spec.retained_static_domain,
                             Some(physical_spec.retained_max_tokens),
+                            // As many sequences (cross-attention pool slots
+                            // and decoder rows) as the other ASR families,
+                            // never fewer than one decode batch.
+                            self.asr_state_rows(bundle_draft)?,
                             asr_minimum_tokens(variant),
                         )
                         .await?;

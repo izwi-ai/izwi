@@ -642,6 +642,12 @@ const BF16_BYTES: u64 = 2;
 /// Parakeet-TDT-0.6B-v3's encoder: 1,024 wide at 12.5 positions per second.
 const PARAKEET_ENCODER_HIDDEN: u64 = 1024;
 const PARAKEET_ENCODER_POSITIONS_PER_SEC: f32 = 12.5;
+/// Whisper Large v3 Turbo's decoder layers (each with self and cross
+/// attention over 1,280-wide K and V).
+const WHISPER_DECODER_LAYERS: u64 = 4;
+/// Whisper's CUDA cross-attention memory: 1,500 encoder positions padded
+/// to the 32-token flash-attention block.
+const WHISPER_CUDA_CROSS_TOKENS: u64 = 1_504;
 /// Allowance for one VibeVoice-ASR row's acoustic and semantic tokenizer
 /// streaming caches (convolution histories of a few MiB).
 const VIBEVOICE_TOKENIZER_STATE_BYTES: u64 = 16 * 1024 * 1024;
@@ -681,8 +687,12 @@ fn decoder_kv_geometry(variant: ModelVariant) -> Option<DecoderKvGeometry> {
 /// an F32 logits row (VibeVoice also its tokenizer caches). A transducer
 /// holds one pass's F32 encoder output (Parakeet one encoder window,
 /// Nemotron one 30 s chunk) and its sealed per-row decode workspace; its
-/// predictor state is a few KiB. `None` for a variant whose decode does not
-/// run wider than the engine rows.
+/// predictor state is a few KiB. Whisper holds F16 K and V of its whole
+/// target window in self attention, its slot of the retained
+/// cross-attention pool, its prepared cross-attention memory (the encoder
+/// output projected per layer) until the request ends, and an F32 logits
+/// row. `None` for a variant whose decode does not run wider than the
+/// engine rows.
 pub(crate) fn cuda_decode_row_bytes(variant: ModelVariant) -> Result<Option<u64>> {
     use crate::models::architectures::nemotron::asr::NEMOTRON_RETAINED_WORKSPACE_PER_ROW_BYTES;
     use crate::models::architectures::parakeet::asr::PARAKEET_RETAINED_WORKSPACE_PER_ROW_BYTES;
@@ -709,6 +719,30 @@ pub(crate) fn cuda_decode_row_bytes(variant: ModelVariant) -> Result<Option<u64>
                 geometry.encoder.hidden,
                 NEMOTRON_RETAINED_WORKSPACE_PER_ROW_BYTES,
             )?
+        }
+        ModelVariant::WhisperLargeV3Turbo => {
+            let Some(geometry) = envelope_geometry(variant) else {
+                return Ok(None);
+            };
+            let per_token = product(&[
+                2,
+                WHISPER_DECODER_LAYERS,
+                geometry.decoder.hidden,
+                BF16_BYTES,
+            ])?;
+            let memory_tokens =
+                positions(geometry.encoder_positions_per_sec, geometry.max_chunk_secs);
+            sum(&[
+                product(&[
+                    sum(&[
+                        geometry.prompt_tokens,
+                        WHISPER_CUDA_CROSS_TOKENS,
+                        memory_tokens,
+                    ])?,
+                    per_token,
+                ])?,
+                product(&[geometry.vocab, F32_BYTES])?,
+            ])?
         }
         _ => {
             let (Some(kv), Some(geometry), Some(tokens)) = (
@@ -939,7 +973,10 @@ mod tests {
     /// row estimate; no other speech variant does. A Qwen3-ASR row is
     /// dominated by its one-chunk KV (1,307 tokens at 112 KiB), so 32 rows
     /// take about 4.6 GiB; a transducer row is its workspace and one pass's
-    /// encoder output.
+    /// encoder output. A Whisper row is its F16 self-attention window (448
+    /// tokens), its cross-attention pool slot (1,504) and its prepared
+    /// memory (1,500) at 20 KiB a token over 4 layers, about 68 MiB, so 32
+    /// rows take about 2.1 GiB.
     #[test]
     fn cuda_decode_rows_price_their_state_input_and_workspace() {
         const MIB: u64 = 1024 * 1024;
@@ -953,6 +990,7 @@ mod tests {
                         | ModelFamily::VibeVoiceAsr
                         | ModelFamily::ParakeetAsr
                         | ModelFamily::NemotronAsr
+                        | ModelFamily::WhisperAsr
                 );
             assert_eq!(row(variant).is_some(), wide, "{variant}");
         }
@@ -970,6 +1008,29 @@ mod tests {
             row(ModelVariant::Nemotron35AsrStreaming06B).unwrap() / MIB,
             17
         );
+        let whisper = row(ModelVariant::WhisperLargeV3Turbo).unwrap();
+        assert_eq!(
+            whisper,
+            (448 + 1_504 + 1_500) * (2 * 4 * 1_280 * 2) + 51_866 * 4
+        );
+        assert_eq!(whisper / MIB, 67);
+        const GIB: u64 = 1024 * MIB;
+        // H100 80 GB and L4 24 GB take the full 32 rows after the ~1.6 GB
+        // of weights; it takes a device with under ~4.5 GiB of headroom to
+        // narrow the decode.
+        assert_eq!(
+            crate::catalog::fit_asr_decode_width(32, 8, whisper, 75 * GIB),
+            32
+        );
+        assert_eq!(
+            crate::catalog::fit_asr_decode_width(32, 8, whisper, 20 * GIB),
+            32
+        );
+        assert_eq!(
+            crate::catalog::fit_asr_decode_width(32, 8, whisper, 3 * GIB),
+            16
+        );
+        assert_eq!(crate::catalog::fit_asr_decode_width(32, 8, whisper, GIB), 8);
     }
 
     /// The pinned decoder KV widths match the checkpoints' K projections.

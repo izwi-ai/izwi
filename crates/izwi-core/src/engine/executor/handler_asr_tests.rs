@@ -349,6 +349,175 @@ fn whisper_generation_two_restarts_only_at_context_zero_prefill() {
     ));
 }
 
+/// One continuous Whisper batch's rows settle independently through the
+/// shared per-row settlement: a row still decoding publishes nothing, a
+/// finished row the policy accepts publishes its text and diagnostics, a
+/// rejected attempt restarts (on its authenticated generation, publishing
+/// nothing), and a row cancelled while its policy ran is cancelled without
+/// reading diagnostics. A failing policy fails only its own row.
+#[test]
+fn whisper_batch_rows_settle_continue_publish_restart_and_cancel_independently() {
+    struct FakeRow {
+        transition: Option<WhisperTerminalTransition>,
+        cancel_during_policy: Option<Arc<AtomicBool>>,
+        policy_runs: usize,
+        diagnostic_reads: Cell<usize>,
+    }
+    let row = |transition, cancel_during_policy| FakeRow {
+        transition,
+        cancel_during_policy,
+        policy_runs: 0,
+        diagnostic_reads: Cell::new(0),
+    };
+    let step = |finished| crate::models::registry::NativeAsrDecodeStep {
+        delta: "provisional".into(),
+        text: "provisional".into(),
+        tokens_generated: 3,
+        finished,
+    };
+    let generation_two = ManagedSessionGeneration::INITIAL.next().unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut cancelled_request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+    cancelled_request.set_cancellation_signal(cancel.clone());
+    let live = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+    // (request, step finished, row, generation, expected settlement)
+    let mut rows = vec![
+        (
+            &live,
+            false,
+            row(None, None),
+            ManagedSessionGeneration::INITIAL,
+        ),
+        (
+            &live,
+            true,
+            row(
+                Some(WhisperTerminalTransition::Accept {
+                    text: "accepted".into(),
+                    selected_temperature: 0.0,
+                }),
+                None,
+            ),
+            ManagedSessionGeneration::INITIAL,
+        ),
+        (
+            &live,
+            true,
+            row(
+                Some(WhisperTerminalTransition::RetryRequired {
+                    next_temperature: 0.4,
+                    reasons: vec!["compression_ratio"],
+                    expected_generation: 2,
+                    new_generation: 3,
+                }),
+                None,
+            ),
+            generation_two,
+        ),
+        (
+            &cancelled_request,
+            true,
+            row(
+                Some(WhisperTerminalTransition::Accept {
+                    text: "must not publish".into(),
+                    selected_temperature: 0.0,
+                }),
+                Some(cancel.clone()),
+            ),
+            ManagedSessionGeneration::INITIAL,
+        ),
+        (
+            &live,
+            true,
+            row(None, None),
+            ManagedSessionGeneration::INITIAL,
+        ),
+    ];
+    let mut settled = Vec::new();
+    let mut steps = Vec::new();
+    for (request, finished, fake, generation) in &mut rows {
+        let mut step = step(*finished);
+        let settlement = super::settle_whisper_step(
+            request,
+            &mut step,
+            *generation,
+            fake,
+            |fake| {
+                fake.policy_runs += 1;
+                if let Some(cancel) = &fake.cancel_during_policy {
+                    cancel.store(true, Ordering::Release);
+                }
+                fake.transition
+                    .clone()
+                    .ok_or_else(|| crate::error::Error::InferenceError("policy failed".into()))
+            },
+            |fake| {
+                fake.diagnostic_reads.set(fake.diagnostic_reads.get() + 1);
+                Ok(Some(serde_json::json!({ "row": "diagnostics" })))
+            },
+        );
+        settled.push(settlement);
+        steps.push(step);
+    }
+    assert_eq!(
+        settled[0].as_ref().unwrap(),
+        &super::WhisperStepSettlement::Continue
+    );
+    assert!(steps[0].text.is_empty() && steps[0].delta.is_empty());
+    assert_eq!(rows[0].2.policy_runs, 0);
+
+    assert_eq!(
+        settled[1].as_ref().unwrap(),
+        &super::WhisperStepSettlement::Publish {
+            diagnostics: Some(serde_json::json!({ "row": "diagnostics" }))
+        }
+    );
+    assert_eq!(steps[1].text, "accepted");
+    assert_eq!(steps[1].delta, "accepted");
+
+    assert_eq!(
+        settled[2].as_ref().unwrap(),
+        &super::WhisperStepSettlement::Restart
+    );
+    assert!(steps[2].text.is_empty() && steps[2].delta.is_empty());
+    assert_eq!(rows[2].2.diagnostic_reads.get(), 0);
+
+    assert_eq!(
+        settled[3].as_ref().unwrap(),
+        &super::WhisperStepSettlement::Cancelled
+    );
+    assert_eq!(rows[3].2.diagnostic_reads.get(), 0);
+    assert_eq!(
+        steps[3].text, "provisional",
+        "a cancelled row publishes nothing new"
+    );
+
+    assert!(settled[4].is_err(), "a failing policy fails its own row");
+    for (index, (_, finished, fake, _)) in rows.iter().enumerate() {
+        assert_eq!(fake.policy_runs, usize::from(*finished), "row {index}");
+    }
+
+    // A restart on a stale generation is refused rather than restarting.
+    let mut stale = row(
+        Some(WhisperTerminalTransition::RetryRequired {
+            next_temperature: 0.4,
+            reasons: vec!["log_probability"],
+            expected_generation: 1,
+            new_generation: 2,
+        }),
+        None,
+    );
+    assert!(super::settle_whisper_step(
+        &live,
+        &mut step(true),
+        generation_two,
+        &mut stale,
+        |fake| Ok(fake.transition.clone().unwrap()),
+        |_| Ok(None),
+    )
+    .is_err());
+}
+
 #[test]
 fn whisper_cancellation_after_terminal_policy_prevents_publication() {
     let signal = Arc::new(AtomicBool::new(false));

@@ -1019,6 +1019,7 @@ fn batched_asr_families_decode_at_the_asr_width_and_prepare_at_the_engine_rows()
         (ModelVariant::VibeVoiceAsr, 1, 8),
         (ModelVariant::ParakeetTdt06BV3, 8, 8),
         (ModelVariant::Nemotron35AsrStreaming06B, 8, 8),
+        (ModelVariant::WhisperLargeV3Turbo, 8, 1),
     ] {
         for (fitted, decode_rows) in [(None, 32), (Some(32), 32), (Some(16), 16), (Some(8), 8)] {
             let contract = sequence_graph(variant, fitted);
@@ -1056,7 +1057,6 @@ fn batched_asr_families_decode_at_the_asr_width_and_prepare_at_the_engine_rows()
     assert_eq!(prefill.max_work_units, 8);
     assert_eq!(prefill.max_workspace_bytes, 8 * 16 * 1024 * 1024);
     for variant in [
-        ModelVariant::WhisperLargeV3Turbo,
         ModelVariant::GraniteSpeech412BPlus,
         ModelVariant::Lfm25Audio15BGguf,
     ] {
@@ -1103,7 +1103,7 @@ fn batched_asr_families_decode_at_the_asr_width_and_prepare_at_the_engine_rows()
 }
 
 #[test]
-fn missing_concurrency_evidence_keeps_whisper_decoder_scalar_while_encoder_is_static() {
+fn whisper_batches_its_encoder_and_decode_while_its_prompt_prefill_stays_scalar() {
     let request_parallelism = 4;
     let registry =
         RuntimeAdapterRegistry::built_in_with_execution_limits(2, request_parallelism).unwrap();
@@ -1120,25 +1120,36 @@ fn missing_concurrency_evidence_keeps_whisper_decoder_scalar_while_encoder_is_st
         .execution_contracts(CapabilityKind::Asr)
         .unwrap()
         .remove(0);
+    assert_eq!(whisper.adapter_abi_revision, WHISPER_ASR_ADAPTER_ABI);
     assert_eq!(whisper.execution_profile.max_batch_size, 2);
     assert_eq!(
         whisper.execution_profile.concurrency,
-        ConcurrencyClass::Exclusive
+        ConcurrencyClass::Batchable
     );
     assert_eq!(
-        whisper.execution_profile.physical_launch_policy,
-        PhysicalLaunchPolicy::ExecutionGroupExclusive
+        whisper.execution_profile.decode_batch,
+        NativeBatchMode::Continuous
     );
     assert_eq!(whisper.stages[0].batch_mode, NativeBatchMode::Static);
     assert_eq!(whisper.stages[0].max_batch_size, 2);
     assert_eq!(whisper.stages[0].concurrency, ConcurrencyClass::Batchable);
-    assert!(whisper.stages[1..].iter().all(|stage| {
-        stage.batch_mode == NativeBatchMode::None
-            && stage.max_batch_size == 1
-            && stage.concurrency == ConcurrencyClass::Exclusive
-            && stage.shape_policy == StageShapePolicy::Exact
-            && stage.physical_launch_policy == PhysicalLaunchPolicy::ExecutionGroupExclusive
-    }));
+    let prefill = &whisper.stages[1];
+    assert_eq!(prefill.selector, StageWorkSelector::SequencePrefill);
+    assert_eq!(prefill.batch_mode, NativeBatchMode::None);
+    assert_eq!(prefill.max_batch_size, 1);
+    assert_eq!(prefill.concurrency, ConcurrencyClass::Exclusive);
+    assert_eq!(prefill.shape_policy, StageShapePolicy::Exact);
+    let decode = &whisper.stages[2];
+    assert_eq!(decode.selector, StageWorkSelector::SequenceDecode);
+    assert_eq!(decode.name, "asr.decode.whisper.tensor_continuous");
+    assert_eq!(decode.batch_mode, NativeBatchMode::Continuous);
+    assert_eq!(decode.max_batch_size, 2);
+    assert_eq!(decode.concurrency, ConcurrencyClass::Batchable);
+    assert!(decode.workspace_per_row_bytes > 0);
+    assert_eq!(
+        decode.max_workspace_bytes,
+        2 * decode.workspace_per_row_bytes
+    );
 
     for (index, variant) in [ModelVariant::Kokoro82M].into_iter().enumerate() {
         let tts = LoadedModelBundleDraft::build(
@@ -1296,6 +1307,7 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                     if (qwen3_asr
                         || vibevoice_asr
                         || granite_asr
+                        || whisper_asr
                         || lfm_audio_asr
                         || qwen3_tts
                         || retained_tts
@@ -1320,15 +1332,6 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                         assert_eq!(contract.execution_profile.max_batch_size, 8);
                         assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::None);
                         assert_eq!(contract.stages[2].batch_mode, NativeBatchMode::Continuous);
-                    } else if whisper_asr
-                        && contract.execution_profile.mode == ExecutionMode::Sequence
-                    {
-                        assert_eq!(contract.execution_profile.max_batch_size, 8);
-                        assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
-                        assert_eq!(contract.stages[0].max_batch_size, 8);
-                        assert!(contract.stages[1..]
-                            .iter()
-                            .all(|stage| stage.batch_mode == NativeBatchMode::None));
                     } else if kokoro_tts
                         && contract
                             .stages
@@ -1455,6 +1458,7 @@ fn whisper_metadata_and_adapter_abi_cannot_manufacture_concurrent_decode_policy(
                 dtype: "f32".into(),
                 max_batch_size: 3,
                 max_workspace_bytes: 1024,
+                decode_workspace_per_row_bytes: 512,
             },
         )
         .unwrap();
@@ -2808,21 +2812,35 @@ fn whisper_normal_and_long_form_graphs_are_distinct_and_scalar() {
                 dtype: "f32".into(),
                 max_batch_size: 4,
                 max_workspace_bytes: 1024,
+                decode_workspace_per_row_bytes: 512,
             },
         )
         .unwrap();
     let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
     assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
     assert_eq!(normal.execution_profile.max_batch_size, 4);
-    assert_eq!(normal.execution_profile.decode_batch, NativeBatchMode::None);
+    assert_eq!(
+        normal.execution_profile.decode_batch,
+        NativeBatchMode::Continuous
+    );
     assert_eq!(normal.stages[0].name, "asr.encoder.whisper");
     assert_eq!(normal.stages[0].batch_mode, NativeBatchMode::Static);
     assert_eq!(
         normal.stages[1].selector,
         StageWorkSelector::SequencePrefill
     );
+    assert_eq!(normal.stages[1].batch_mode, NativeBatchMode::None);
+    assert_eq!(normal.stages[1].max_batch_size, 1);
     assert_eq!(normal.stages[2].selector, StageWorkSelector::SequenceDecode);
-    assert_eq!(normal.stages[2].batch_mode, NativeBatchMode::None);
+    assert_eq!(normal.stages[2].batch_mode, NativeBatchMode::Continuous);
+    assert_eq!(normal.stages[2].concurrency, ConcurrencyClass::Batchable);
+    assert_eq!(normal.stages[2].max_batch_size, 4);
+    assert_eq!(normal.stages[2].max_work_units, 4);
+    assert!(normal.stages[2].workspace_per_row_bytes > 512);
+    assert_eq!(
+        normal.stages[2].max_workspace_bytes,
+        4 * normal.stages[2].workspace_per_row_bytes
+    );
 
     let long = adapter
         .contract(StreamingRequirements::NONE.with_asr_long_form(true))

@@ -497,6 +497,7 @@ impl EngineCore {
         full_contract: &crate::kv::v2::InferenceStateContract,
         static_domain: crate::kv::v2::StateDomainId,
         logical_context_tokens: Option<usize>,
+        (retained_rows, staged_rows): (usize, usize),
         minimum_tokens: u64,
     ) -> Result<Arc<CompositeRetainedStateRuntimeV2>> {
         if self.composite_retained_state.contains_key(&model_instance) {
@@ -504,13 +505,31 @@ impl EngineCore {
                 "composite retained state already owns this model generation".into(),
             ));
         }
+        // An automatic staged limit is sized for the engine rows' launch
+        // width; a decode fitted wider stages its own launch width, bounded
+        // by its retained rows instead.
+        let staged_ceiling = if self.config.automatic_row_limits.staged_transactions {
+            self.config.max_retained_sequences
+        } else {
+            self.config.max_staged_transactions
+        };
+        if retained_rows == 0
+            || staged_rows == 0
+            || retained_rows > self.config.max_retained_sequences
+            || staged_rows > staged_ceiling
+        {
+            return Err(Error::ModelLoadError(
+                "composite retained state row limits exceed configured capacity".into(),
+            ));
+        }
         let backend = self.managed_kv_cache.worker_backend();
-        let logical_token_reach = self.resolve_managed_token_reach_for_contract(
+        let logical_token_reach = self.resolve_managed_token_reach_for_contract_with_rows(
             backend,
             model_instance,
             &project_composite_paged_contract(full_contract, static_domain)?,
             logical_context_tokens,
             1,
+            (retained_rows, staged_rows),
             // Whisper's decoder state: ASR, fitted within live memory. Its
             // load reconciles observed weight growth.
             PortableFitHeadroom::Live {
@@ -519,7 +538,7 @@ impl EngineCore {
                 later_minimum_bytes: 0,
             },
         )?;
-        let sequence_capacity = u32::try_from(self.config.max_retained_sequences)
+        let sequence_capacity = u32::try_from(retained_rows)
             .map_err(|_| Error::InvalidInput("managed state sequence limit exceeds u32".into()))?;
         let runtime = allocate_composite_retained_state(
             &mut self.managed_kv_cache,
@@ -532,10 +551,9 @@ impl EngineCore {
                 })?,
                 logical_token_reach,
                 retained_sequence_rows: sequence_capacity,
-                staged_transaction_rows: u32::try_from(self.config.max_staged_transactions)
-                    .map_err(|_| {
-                        Error::InvalidInput("managed state transaction limit exceeds u32".into())
-                    })?,
+                staged_transaction_rows: u32::try_from(staged_rows).map_err(|_| {
+                    Error::InvalidInput("managed state transaction limit exceeds u32".into())
+                })?,
             },
             self.config.block_size,
             full_contract,

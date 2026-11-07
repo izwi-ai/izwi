@@ -98,7 +98,8 @@ use whisper::with_whisper_invocation_state;
 #[cfg(test)]
 use whisper::{
     apply_whisper_terminal_transition, begins_whisper_managed_generation,
-    resolve_whisper_terminal_action, whisper_prefill_boundary_step, WhisperTerminalAction,
+    resolve_whisper_terminal_action, settle_whisper_step, whisper_prefill_boundary_step,
+    WhisperStepSettlement, WhisperTerminalAction,
 };
 
 const MAX_ASR_NEW_TOKENS: usize = 512;
