@@ -1429,7 +1429,10 @@ impl SConv1d {
             stride,
             dilation,
             groups,
-            ..Default::default()
+            // cuDNN's first heuristic algorithm sizes its workspace from the
+            // input length without bound, and a 60 s chunk is 1.44M samples;
+            // implicit GEMM needs none. Only cuDNN builds read the field.
+            cudnn_fwd_algo: Some(candle_core::conv::CudnnFwdAlgo::ImplicitGemm),
         };
         let conv_vb = vb.pp("conv.conv");
         let conv = if with_bias {
@@ -1817,7 +1820,9 @@ impl SConv1dStreamingCache {
         }
         let input_len = x.dim(2)?;
         let start = input_len.saturating_sub(len);
-        self.prefix = Some(x.narrow(2, start, input_len - start)?);
+        // A copy: a view would keep the layer's whole padded chunk input
+        // alive until the next chunk, for every layer at once.
+        self.prefix = Some(x.narrow(2, start, input_len - start)?.force_contiguous()?);
         Ok(())
     }
 }
@@ -3104,6 +3109,74 @@ mod tests {
         let streamed = Tensor::cat(&chunks, 2).unwrap();
 
         assert_tensor_close(&streamed, &full, 1e-6);
+    }
+
+    /// A streaming convolution keeps a copy of its causal prefix, not a view
+    /// that holds the layer's whole padded chunk input until the next chunk.
+    #[test]
+    fn streaming_prefix_owns_only_its_frames() {
+        let layer = test_sconv1d(&[0.25, -0.5, 0.75], 0.1);
+        let mut cache = layer.streaming_cache();
+        let chunk = Tensor::from_vec(
+            (0..12).map(|value| value as f32).collect::<Vec<_>>(),
+            (1, 1, 12),
+            &Device::Cpu,
+        )
+        .unwrap();
+        layer.forward_streaming(&chunk, &mut cache).unwrap();
+
+        let prefix = cache.prefix.as_ref().unwrap();
+        assert_eq!(prefix.dims(), [1, 1, 2]);
+        let (storage, layout) = prefix.storage_and_layout();
+        let candle_core::Storage::Cpu(storage) = &*storage else {
+            panic!("the prefix of a CPU convolution is a CPU tensor");
+        };
+        assert_eq!(layout.start_offset(), 0);
+        assert_eq!(storage.as_slice::<f32>().unwrap(), [10.0, 11.0]);
+    }
+
+    /// The legacy route encodes in 60 s chunks; the latents do not depend on
+    /// the chunk length (60 s against 10 s, scaled down) and match one
+    /// whole-input encode.
+    #[test]
+    fn physical_streaming_latents_do_not_depend_on_chunk_length() {
+        let tokenizer = xorshift_acoustic_tokenizer();
+        let samples = 48;
+        let audio =
+            crate::kernels::numeric_check::xorshift_tensor(&[1, 1, samples], 11, 0.5, &Device::Cpu)
+                .unwrap();
+        let domain = StateDomainId::new(1);
+        let encode_in_chunks = |chunk: usize| {
+            let owner = tensor_owner(
+                domain,
+                &tokenizer.encoder_state_geometry(),
+                StateClock::AudioSamples,
+            );
+            let mut lease = owner.lease().unwrap();
+            let means = (0..samples)
+                .step_by(chunk)
+                .map(|start| {
+                    tokenizer
+                        .encode_streaming_physical(
+                            &audio.narrow(2, start, chunk).unwrap(),
+                            domain,
+                            chunk as u64,
+                            &mut lease,
+                        )
+                        .unwrap()
+                        .mean
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(lease.arena().unwrap().absolute_cursor(), samples as u64);
+            Tensor::cat(&means, 1).unwrap()
+        };
+
+        let long = encode_in_chunks(24);
+        let short = encode_in_chunks(4);
+        let whole = tokenizer.encode(&audio).unwrap().mean;
+        assert_eq!(long.dims(), [1, samples / 4, 64]);
+        assert_tensor_close(&long, &short, 1e-6);
+        assert_tensor_close(&long, &whole, 1e-5);
     }
 
     #[test]
