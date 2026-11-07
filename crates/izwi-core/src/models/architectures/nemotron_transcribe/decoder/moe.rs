@@ -25,7 +25,7 @@ use candle_core::{DType, Device, Tensor};
 
 use super::super::checkpoint::NemotronCheckpoint;
 use super::super::config::{MoeConfig, NemotronTranscribeConfig};
-use super::super::linear::{NtLinear, Pass};
+use super::super::linear::{by_row_class, NtLinear, Pass};
 use super::super::precision::Fp8Mode;
 use super::super::residency::{stacks_routed_experts, ResidencyBackend};
 use super::super::speech_transformer::host_values;
@@ -81,6 +81,13 @@ impl Expert {
     fn forward(&self, x: &Tensor, pass: Pass) -> Result<Tensor> {
         let h = self.up.forward_relu2(x, pass)?;
         self.down.forward(&h, pass)
+    }
+
+    /// [`Self::forward`] of packed spans, each row through the kernels its
+    /// span alone takes ([`NtLinear::forward_rows`]).
+    fn forward_rows(&self, x: &Tensor, lengths: &[usize]) -> Result<Tensor> {
+        let h = self.up.forward_rows(x, lengths, true)?;
+        self.down.forward_rows(&h, lengths, false)
     }
 }
 
@@ -269,36 +276,118 @@ impl MoeMixer {
             }
             RoutedExperts::PerExpert(experts) => {
                 let routes = self.routes(x)?;
-                let mut assigned = vec![Vec::<(u32, f32)>::new(); self.config.experts];
-                for (token, routing) in routes.iter().enumerate() {
-                    for (&e, &w) in routing.experts.iter().zip(&routing.weights) {
-                        assigned[e].push((token as u32, w));
-                    }
-                }
-                let device = x.device();
-                let mut out = shared;
-                for (expert, tokens) in experts.iter().zip(&assigned) {
-                    if tokens.is_empty() {
-                        continue;
-                    }
-                    let ids = Tensor::from_vec(
-                        tokens.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
-                        tokens.len(),
-                        device,
-                    )?;
-                    let weights = Tensor::from_vec(
-                        tokens.iter().map(|(_, w)| *w).collect::<Vec<_>>(),
-                        (tokens.len(), 1),
-                        device,
-                    )?;
-                    let y = expert
-                        .forward(&x.index_select(&ids, 0)?, pass)?
-                        .broadcast_mul(&weights)?;
-                    out = out.index_add(&ids, &y, 0)?;
-                }
+                let out = self.per_expert(experts, x, shared, &routes, |expert, x, _| {
+                    expert.forward(x, pass)
+                })?;
                 Ok((out, if want_routes { routes } else { Vec::new() }))
             }
         }
+    }
+
+    /// [`Self::forward`] of several rows' spans packed into `x` (row `r`'s
+    /// `lengths[r]` tokens in turn), each row's tokens through the kernels
+    /// its span takes alone: on Metal and CUDA the warp kernels or the GEMMs
+    /// as [`moe_relu2::uses_gemm`] picks for the row's own span, on the CPU
+    /// each expert's Q8_0 kernel by the row's own token count. The router
+    /// and the warp kernels are per token, so a row differs from its span
+    /// alone only in the rounding of the GEMMs its tokens share with other
+    /// rows.
+    pub fn forward_packed(&self, x: &Tensor, lengths: &[usize]) -> Result<Tensor> {
+        let shared = self.shared.forward_rows(x, lengths)?;
+        match &self.routed {
+            RoutedExperts::Stacked { experts, bias } => {
+                let x = x.to_dtype(DType::F32)?;
+                let logits = moe_relu2::router_logits(&x, &self.gate)?;
+                let spec = moe_relu2::SigmoidRouting {
+                    experts: self.config.experts,
+                    top_k: self.config.top_k,
+                    scale: self.config.routed_scaling,
+                };
+                let routing = moe_relu2::route(&logits, bias, spec)?;
+                let (device, top_k) = (x.device(), self.config.top_k);
+                let routed = by_row_class(
+                    lengths,
+                    device,
+                    |tokens| moe_relu2::uses_gemm(device, tokens, top_k, self.config.experts),
+                    |ids, gemm| {
+                        match ids {
+                            Some(ids) => moe_relu2::experts_on_path(
+                                &x.index_select(ids, 0)?,
+                                &routing.index_select(ids, 0)?,
+                                top_k,
+                                experts,
+                                gemm,
+                            ),
+                            None => moe_relu2::experts_on_path(&x, &routing, top_k, experts, gemm),
+                        }
+                        .map_err(Into::into)
+                    },
+                )?;
+                Ok((shared + routed)?)
+            }
+            RoutedExperts::PerExpert(experts) => {
+                let routes = self.routes(x)?;
+                let row_of = lengths
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(row, &tokens)| std::iter::repeat_n(row, tokens))
+                    .collect::<Vec<_>>();
+                self.per_expert(experts, x, shared, &routes, |expert, x, tokens| {
+                    // The expert's tokens of each row, rows in turn: what
+                    // each row's span alone hands this expert.
+                    let mut counts = Vec::<usize>::new();
+                    let mut last_row = None;
+                    for &(token, _) in tokens {
+                        let row = row_of[token as usize];
+                        if last_row != Some(row) {
+                            counts.push(0);
+                            last_row = Some(row);
+                        }
+                        *counts.last_mut().expect("pushed above") += 1;
+                    }
+                    expert.forward_rows(x, &counts)
+                })
+            }
+        }
+    }
+
+    /// The routed experts of the host-routed path, added to `out` (the
+    /// shared expert's output): each expert's tokens `(token, weight)` in
+    /// token order through `run(expert, x of those tokens, tokens)`, weighed
+    /// and added back, experts in order.
+    fn per_expert(
+        &self,
+        experts: &[Expert],
+        x: &Tensor,
+        mut out: Tensor,
+        routes: &[Routing],
+        run: impl Fn(&Expert, &Tensor, &[(u32, f32)]) -> Result<Tensor>,
+    ) -> Result<Tensor> {
+        let mut assigned = vec![Vec::<(u32, f32)>::new(); self.config.experts];
+        for (token, routing) in routes.iter().enumerate() {
+            for (&e, &w) in routing.experts.iter().zip(&routing.weights) {
+                assigned[e].push((token as u32, w));
+            }
+        }
+        let device = x.device();
+        for (expert, tokens) in experts.iter().zip(&assigned) {
+            if tokens.is_empty() {
+                continue;
+            }
+            let ids = Tensor::from_vec(
+                tokens.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+                tokens.len(),
+                device,
+            )?;
+            let weights = Tensor::from_vec(
+                tokens.iter().map(|(_, w)| *w).collect::<Vec<_>>(),
+                (tokens.len(), 1),
+                device,
+            )?;
+            let y = run(expert, &x.index_select(&ids, 0)?, tokens)?.broadcast_mul(&weights)?;
+            out = out.index_add(&ids, &y, 0)?;
+        }
+        Ok(out)
     }
 }
 

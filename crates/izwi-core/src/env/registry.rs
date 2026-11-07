@@ -1356,6 +1356,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Backend for the Nemotron 3.5 Transcribe L2 parity test: cpu, metal or cuda (the build must have that feature).",
     ),
     CoreEnvVar::new(
+        "IZWI_NEMOTRON_TRANSCRIBE_BATCHED_PREFILL",
+        Flag,
+        "true",
+        Load,
+        "Runs the prompt spans of a Nemotron 3.5 Transcribe prefill quantum's rows as one packed decoder forward (projections and experts over every row's tokens, Mamba scan and attention per row, one greedy readback). The wider GEMMs can round a row's values differently in the last bits than when it prefills alone, so a near-tied greedy token may depend on the rows beside it. Any false value prefills the rows one after another, each exactly as alone; `batched_prefill` in the diagnostics counts packed quanta and rows.",
+    ),
+    CoreEnvVar::new(
         "IZWI_NEMOTRON_TRANSCRIBE_CPU_F16_KV",
         Flag,
         "off",

@@ -295,6 +295,25 @@ pub fn experts(
     top_k: usize,
     weights: &StackedExperts,
 ) -> Result<Tensor> {
+    let gemm = x
+        .dims2()
+        .is_ok_and(|(tokens, _)| uses_gemm(x.device(), tokens, top_k, weights.experts));
+    experts_on_path(x, routing, top_k, weights, gemm)
+}
+
+/// [`experts`] on the path the caller picks rather than the one the call's
+/// token count picks: `gemm` runs the GEMMs on Metal and CUDA, otherwise the
+/// warp kernels at any token count (the CPU always runs the reference).
+/// Several rows' spans packed into one call keep each row on the path its
+/// span alone takes, so a row's warp-kernel tokens stay bit for bit what
+/// they are alone.
+pub fn experts_on_path(
+    x: &Tensor,
+    routing: &Tensor,
+    top_k: usize,
+    weights: &StackedExperts,
+    gemm: bool,
+) -> Result<Tensor> {
     let (tokens, hidden) = x.dims2()?;
     if hidden != weights.hidden
         || x.dtype() != DType::F32
@@ -312,7 +331,7 @@ pub fn experts(
         )
     }
     let (x, routing) = (x.contiguous()?, routing.contiguous()?);
-    if !x.device().is_cpu() && uses_gemm(x.device(), tokens, top_k, weights.experts) {
+    if gemm && !x.device().is_cpu() {
         return experts_by_gemm(&x, &routing, top_k, weights);
     }
     let grouped = tokens * top_k >= GROUPED_MIN_PAIRS;
