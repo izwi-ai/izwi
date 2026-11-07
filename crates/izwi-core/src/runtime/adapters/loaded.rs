@@ -667,6 +667,9 @@ struct VibeVoiceAsrExecutionSeal {
     prefill_max_batch_work_units: u64,
     prefill_max_batch_workspace_bytes: u64,
     decode_workspace_per_row_bytes: u64,
+    /// The long-form (legacy) invocation's workspace: one exclusive pass over
+    /// the whole file.
+    legacy_workspace_bytes: u64,
 }
 
 /// One-shot execution identity built before physical state allocation.

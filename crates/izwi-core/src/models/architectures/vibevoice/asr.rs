@@ -931,6 +931,19 @@ impl VibeVoiceAsrModel {
         })
     }
 
+    /// Bytes the legacy invocation (`asr.scalar`) reserves when it dispatches,
+    /// beside its typed decoder and tokenizer state, for the longest audio
+    /// this device takes in one pass ([`vibevoice_legacy_workspace_bytes`]).
+    pub(crate) fn legacy_invocation_workspace_bytes(&self) -> Result<u64> {
+        vibevoice_legacy_workspace_bytes(
+            &self.config,
+            &self.preprocessor,
+            self.dtype,
+            self.lm_dtype,
+            vibevoice_asr_max_audio_seconds_hint(self.device.kind),
+        )
+    }
+
     /// Tokens one retained-route sequence needs (P2.5): its text prompt, one
     /// tokenizer chunk of audio placeholders and that chunk's duration
     /// budget, within the decoder context. The retained route takes no more
@@ -2578,6 +2591,88 @@ fn checked_tensor_elements(frames: usize, channels: usize, live_factor: u64) -> 
         .ok_or_else(|| Error::Overloaded("VibeVoice tokenizer workspace elements overflow".into()))
 }
 
+/// Bytes one legacy invocation holds beside its typed decoder and tokenizer
+/// state, for the longest audio it takes in one pass (`max_audio_secs`,
+/// within the decoder context). The padded input and the tokenizer means
+/// stay resident, beside the largest of:
+/// - one tokenizer chunk, in F32: the norms accumulate half-precision
+///   activations in F32;
+/// - both connectors over every audio token;
+/// - the prompt assembly: the embeddings, their feature-spliced copy and the
+///   features;
+/// - the prompt embeddings, one prefill span's activations (eight hidden and
+///   three feed-forward planes, in F32 at most) and the last logits row.
+fn vibevoice_legacy_workspace_bytes(
+    config: &VibeVoiceConfig,
+    preprocessor: &VibeVoicePreprocessorConfig,
+    audio_dtype: DType,
+    lm_dtype: DType,
+    max_audio_secs: f32,
+) -> Result<u64> {
+    let overflow = || Error::Overloaded("VibeVoice ASR legacy workspace overflow".into());
+    let to_u64 = |value: usize| u64::try_from(value).map_err(|_| overflow());
+    let product = |values: &[u64]| {
+        values
+            .iter()
+            .try_fold(1u64, |total, value| total.checked_mul(*value))
+            .ok_or_else(overflow)
+    };
+    let sum = |values: &[u64]| {
+        values
+            .iter()
+            .try_fold(0u64, |total, value| total.checked_add(*value))
+            .ok_or_else(overflow)
+    };
+    if !max_audio_secs.is_finite() || max_audio_secs <= 0.0 {
+        return Err(Error::ModelLoadError(format!(
+            "VibeVoice ASR legacy audio bound {max_audio_secs} s is not positive"
+        )));
+    }
+    let decoder = &config.decoder_config;
+    let context = decoder.max_position_embeddings.ok_or_else(|| {
+        Error::ModelLoadError("VibeVoice ASR decoder context is unbounded".into())
+    })?;
+    let sample_rate = preprocessor.target_sample_rate();
+    let ratio = preprocessor.speech_tok_compress_ratio.max(1);
+    let samples = (f64::from(max_audio_secs) * f64::from(sample_rate)).ceil() as usize;
+    let audio_tokens = asr_placeholder_count(samples, ratio).min(context);
+    let prompt_tokens = audio_tokens
+        .saturating_add(RETAINED_PROMPT_TEXT_TOKENS)
+        .min(context);
+    let span = vibevoice_retained_prompt_token_bound(sample_rate, ratio, context);
+    let chunk = tokenizer_streaming_chunk_samples(sample_rate, ratio);
+    let tokenizer_elements =
+        tokenizer_encoder_workspace_elements(&config.acoustic_tokenizer_config, chunk)?.max(
+            tokenizer_encoder_workspace_elements(&config.semantic_tokenizer_config, chunk)?,
+        );
+    let [audio_bytes, lm_bytes, f32_bytes] =
+        [audio_dtype, lm_dtype, DType::F32].map(|dtype| dtype.size_in_bytes() as u64);
+    let (audio_tokens, prompt_tokens, span) =
+        (to_u64(audio_tokens)?, to_u64(prompt_tokens)?, to_u64(span)?);
+    let hidden = to_u64(decoder.hidden_size)?;
+    let feed_forward = to_u64(decoder.intermediate_size)?;
+    let vocab = to_u64(decoder.lm_head_size.unwrap_or(decoder.vocab_size))?;
+    let latents = to_u64(config.acoustic_vae_dim() + config.semantic_vae_dim())?;
+
+    let resident = sum(&[
+        product(&[audio_tokens, to_u64(ratio)?, audio_bytes])?,
+        product(&[audio_tokens, latents, audio_bytes])?,
+    ])?;
+    let tokenizer = product(&[tokenizer_elements, f32_bytes])?;
+    let connectors = product(&[audio_tokens, hidden, 8, audio_bytes])?;
+    let prompt = sum(&[
+        product(&[prompt_tokens, hidden, 3, lm_bytes])?,
+        product(&[audio_tokens, hidden, audio_bytes])?,
+    ])?;
+    let span_planes = sum(&[product(&[8, hidden])?, product(&[3, feed_forward])?])?;
+    let prefill = sum(&[
+        product(&[prompt_tokens, hidden, lm_bytes])?,
+        product(&[span, span_planes, f32_bytes])?,
+        product(&[vocab, f32_bytes])?,
+    ])?;
+    sum(&[resident, tokenizer.max(connectors).max(prompt).max(prefill)])
+}
+
 fn validate_vibevoice_artifact_storage(artifact: &VibeVoiceAsrPreparedArtifact) -> Result<()> {
     let [batch, tokens, _hidden] = artifact.prompt_embeddings.dims() else {
         return Err(Error::InvalidInput(
@@ -3593,6 +3688,68 @@ mod tests {
             elements < input_elements * 512,
             "workspace peak {elements} is not viable relative to {input_elements} input elements"
         );
+    }
+
+    /// The published VibeVoice-ASR geometry: a Qwen2.5-7B decoder and the
+    /// default σ-VAE tokenizers (32 filters, ratios 8·5·5·4·2·2).
+    fn published_asr_config() -> VibeVoiceConfig {
+        serde_json::from_value(json!({
+            "decoder_config": {
+                "hidden_size": 3584,
+                "intermediate_size": 18944,
+                "num_attention_heads": 28,
+                "num_hidden_layers": 28,
+                "num_key_value_heads": 4,
+                "max_position_embeddings": 131072,
+                "rms_norm_eps": 0.000001,
+                "rope_theta": 1000000.0,
+                "vocab_size": 152064
+            },
+            "acoustic_tokenizer_config": {"vae_dim": 64, "fix_std": 0.5},
+            "semantic_tokenizer_config": {"vae_dim": 128, "std_dist_type": "none"}
+        }))
+        .unwrap()
+    }
+
+    /// The legacy route's sealed workspace covers one 60 s tokenizer chunk
+    /// in F32 and both connectors over the longest single pass (3,600 s:
+    /// 27,000 audio tokens), stops growing at the decoder context, and stays
+    /// a few GiB.
+    #[test]
+    fn legacy_workspace_covers_a_tokenizer_chunk_and_the_longest_pass() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let config = published_asr_config();
+        let preprocessor = reference_rate_preprocessor();
+        let bytes = |audio: DType, lm: DType, secs: f32| {
+            vibevoice_legacy_workspace_bytes(&config, &preprocessor, audio, lm, secs)
+        };
+        let chunk = tokenizer_streaming_chunk_samples(24_000, 3_200);
+        assert_eq!(chunk, 1_440_000);
+        let tokenizer_elements = [
+            &config.acoustic_tokenizer_config,
+            &config.semantic_tokenizer_config,
+        ]
+        .map(|tokenizer| tokenizer_encoder_workspace_elements(tokenizer, chunk).unwrap());
+        let tokenizer_f32 = 4 * tokenizer_elements[0].max(tokenizer_elements[1]);
+        let connectors = |dtype_bytes: u64| 27_000 * 3_584 * 8 * dtype_bytes;
+
+        let cuda = bytes(DType::BF16, DType::BF16, 3_600.0).unwrap();
+        assert!(cuda >= tokenizer_f32, "{cuda} < {tokenizer_f32}");
+        assert!(cuda >= connectors(2), "{cuda}");
+        assert!(cuda < 3 * GIB, "{cuda}");
+        let portable = bytes(DType::F32, DType::F16, 3_600.0).unwrap();
+        assert!(portable >= connectors(4) && portable >= cuda, "{portable}");
+        assert!(portable < 4 * GIB, "{portable}");
+
+        let ten_minutes = bytes(DType::BF16, DType::BF16, 600.0).unwrap();
+        assert!(ten_minutes >= tokenizer_f32 && ten_minutes <= cuda);
+        // 131,072 tokens of context hold 17,476 s of audio tokens.
+        assert_eq!(
+            bytes(DType::BF16, DType::BF16, 20_000.0).unwrap(),
+            bytes(DType::BF16, DType::BF16, 1.0e9).unwrap()
+        );
+        assert!(bytes(DType::BF16, DType::BF16, 0.0).is_err());
+        assert!(bytes(DType::BF16, DType::BF16, f32::NAN).is_err());
     }
 
     #[test]

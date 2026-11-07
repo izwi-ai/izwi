@@ -3067,6 +3067,7 @@ fn vibevoice_normal_graph_has_scalar_preparation_and_ragged_decode() {
             prefill_max_batch_work_units: 4 * 1_500,
             prefill_max_batch_workspace_bytes: 4 * 64 * 1024 * 1024,
             decode_workspace_per_row_bytes: 8_192,
+            legacy_workspace_bytes: 96 * 1024 * 1024,
         })
         .unwrap();
 
@@ -3126,6 +3127,23 @@ fn vibevoice_normal_graph_has_scalar_preparation_and_ragged_decode() {
     assert_eq!(legacy.stages.len(), 1);
     assert_eq!(legacy.stages[0].name, "asr.scalar");
     assert_eq!(legacy.stages[0].selector, StageWorkSelector::Atomic);
+    // The one exclusive pass over a long file reserves its sealed workspace
+    // as each dispatch's row cost.
+    assert_eq!(legacy.stages[0].max_batch_size, 1);
+    assert_eq!(legacy.stages[0].workspace_per_row_bytes, 96 * 1024 * 1024);
+    assert_eq!(legacy.stages[0].max_workspace_bytes, 96 * 1024 * 1024);
+
+    // The weight-free route probe reads the long-form graph before any seal.
+    let probe = VibeVoiceAsrExecutionAdapter::new(
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(3),
+        metadata,
+        BackendKind::Cpu,
+        4,
+    )
+    .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+    .unwrap();
+    assert!(contract_supports_atomic_blocking(&probe));
 }
 
 #[test]

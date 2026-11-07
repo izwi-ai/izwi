@@ -417,6 +417,7 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
             })?,
             preparation,
             decode_workspace_per_row_bytes: model.continuous_decode_workspace_per_row_bytes()?,
+            legacy_workspace_bytes: model.legacy_invocation_workspace_bytes()?,
         };
         if let Some(existing) = self.seal.get() {
             return if existing == &seal {
@@ -460,6 +461,7 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
                         )
                     })?,
                 decode_workspace_per_row_bytes: 8_192,
+                legacy_workspace_bytes: 96 * 1024 * 1024,
             })
             .map_err(|_| Error::ModelLoadError("test VibeVoice seal was already installed".into()))
     }
@@ -507,6 +509,14 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
                 profile.mode,
                 NativeBatchMode::None,
             );
+            // One exclusive pass over the whole file reserves its sealed
+            // workspace when it dispatches, so a file the device cannot hold
+            // waits or is refused instead of failing mid-pass. Only the
+            // weight-free route probe reads this graph before a load seals it.
+            if let Some(seal) = self.seal.get() {
+                stage.workspace_per_row_bytes = seal.legacy_workspace_bytes;
+                stage.max_workspace_bytes = seal.legacy_workspace_bytes;
+            }
             stage.validate()?;
             return Ok(LoadedExecutionContract {
                 execution_group_id: self.execution_group_id,
@@ -531,6 +541,7 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
             || seal.prefill_max_batch_work_units == 0
             || seal.prefill_max_batch_workspace_bytes == 0
             || seal.decode_workspace_per_row_bytes == 0
+            || seal.legacy_workspace_bytes == 0
         {
             return Err(Error::ModelLoadError(
                 "VibeVoice ASR execution seal does not match its loaded adapter".into(),
