@@ -1,5 +1,5 @@
 use super::{
-    admit_asr_request_floor, asr_state_rows, automatic_state_group_budget,
+    admit_asr_request_floor, asr_state_rows, automatic_state_group_budget, cuda_invocation_context,
     estimate_from_tensor_inventory, fish_s2_resource_plan, is_metal_command_buffer_oom,
     kokoro_effective_context_tokens, loaded_asr_state_publication_route,
     managed_chat_capacity_policy, materialization_tolerance_bytes, model_memory_estimate,
@@ -1755,6 +1755,45 @@ fn automatic_invocation_context_treats_published_reach_as_a_ceiling() {
             65_536
         ),
         PortableInvocationContextIntent::Automatic { ceiling: 65_536 }
+    );
+}
+
+#[test]
+fn cuda_invocation_context_publishes_the_ceiling_without_a_memory_fit() {
+    // Automatic: the model-authored maximum, narrowed by a published reach.
+    assert_eq!(
+        cuda_invocation_context(ContextLengthPreference::Auto, None, Some((448, 448))),
+        Some(448)
+    );
+    assert_eq!(
+        cuda_invocation_context(
+            ContextLengthPreference::Auto,
+            Some(4_096),
+            Some((64, 8_192))
+        ),
+        Some(4_096)
+    );
+    // Explicit: the configured length, capped at the maximum.
+    assert_eq!(
+        cuda_invocation_context(
+            ContextLengthPreference::explicit(2_048).unwrap(),
+            None,
+            Some((64, 8_192))
+        ),
+        Some(2_048)
+    );
+    assert_eq!(
+        cuda_invocation_context(
+            ContextLengthPreference::explicit(16_384).unwrap(),
+            None,
+            Some((64, 8_192))
+        ),
+        Some(8_192)
+    );
+    // Fixed-size state has no decoder-context axis to publish.
+    assert_eq!(
+        cuda_invocation_context(ContextLengthPreference::Auto, None, None),
+        None
     );
 }
 

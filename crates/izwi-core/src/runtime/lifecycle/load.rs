@@ -210,6 +210,27 @@ fn kokoro_effective_context_tokens(
         .map_err(|_| Error::ModelLoadError("Kokoro effective context exceeds u64".into()))
 }
 
+/// The decoder context CUDA publishes for an invocation-only route. CUDA
+/// sizes invocation workspace per request, so the memory fit the portable
+/// backends run is skipped and the decoder-context axis stays unresolved; the
+/// routes still plan chunks against a published context, which is the
+/// model-authored maximum narrowed by an explicit `max_sequence_length` and by
+/// any context already published for this generation. `None` when the
+/// descriptor has no decoder-context axis (fixed-size state).
+fn cuda_invocation_context(
+    preference: ContextLengthPreference,
+    published_context: Option<usize>,
+    axis_bounds: Option<(u64, u64)>,
+) -> Option<u64> {
+    let (_, maximum) = axis_bounds?;
+    Some(
+        match portable_invocation_context_intent(preference, published_context, maximum) {
+            PortableInvocationContextIntent::Explicit { selected } => selected,
+            PortableInvocationContextIntent::Automatic { ceiling } => ceiling,
+        },
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PortableInvocationContextIntent {
     Automatic { ceiling: u64 },
