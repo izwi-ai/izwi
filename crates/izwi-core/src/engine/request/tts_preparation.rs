@@ -1367,7 +1367,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::Lfm3Audio(_)
-                | PreparedIncrementalModel::KokoroTts(_) => None,
+                | PreparedIncrementalModel::KokoroTts(_)
+                | PreparedIncrementalModel::Voxtral(_) => None,
             }))
     }
 
@@ -1391,7 +1392,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::Lfm3Audio(_)
-                | PreparedIncrementalModel::KokoroTts(_) => None,
+                | PreparedIncrementalModel::KokoroTts(_)
+                | PreparedIncrementalModel::Voxtral(_) => None,
             }))
     }
 

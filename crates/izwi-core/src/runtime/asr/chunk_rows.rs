@@ -58,8 +58,8 @@ pub(crate) fn chunk_row_permit_count(row_width: usize, max_queued_requests: usiz
 /// audio with the model call the sequential chunk route makes:
 /// - Qwen3-ASR and Whisper: a batched encoder, then a retained decode row;
 /// - Nemotron ASR: a batched encoder and batched RNNT rows;
-/// - Voxtral: one offline invocation per row, for fairness only (other users
-///   wait at most one chunk instead of a whole file).
+/// - Voxtral: a chunk within the realtime session ceiling encoded once, then
+///   a retained row whose frames decode batched across rows.
 ///
 /// Not the others: Parakeet, VibeVoice and Nemotron 3.5 Transcribe cover a
 /// long file in one pass; Granite 4.1 can replay earlier text into a chunk

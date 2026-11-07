@@ -57,7 +57,7 @@ use crate::models::registry::{
     AsrModelLease, ChatModelLease, ChatterboxTtsModelLease, FishDrama3TtsModelLease,
     FishS2TtsModelLease, KokoroTtsModelLease, Lfm25AudioModelLease, Maya1TtsModelLease,
     Maya2TtsModelLease, NativeAsrModel, NativeChatModel, NativeChatPreparedPrompt,
-    QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralTtsModelLease,
+    QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralModelLease, VoxtralTtsModelLease,
 };
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig, ChatRole};
 use crate::runtime::audio_io::{
@@ -455,6 +455,8 @@ enum PreparedIncrementalModel {
     /// LFM3-Audio speech as a retained row (the audio-chat model's lease).
     Lfm3Audio(Lfm25AudioModelLease),
     KokoroTts(KokoroTtsModelLease),
+    /// Voxtral offline transcription as a retained row, or its atomic route.
+    Voxtral(VoxtralModelLease),
 }
 
 impl fmt::Debug for PreparedIncrementalModel {
@@ -473,6 +475,7 @@ impl fmt::Debug for PreparedIncrementalModel {
             Self::Maya2Tts(model) => write!(formatter, "Maya2Tts({:p})", &**model),
             Self::Lfm3Audio(model) => write!(formatter, "Lfm3Audio({:p})", &**model),
             Self::KokoroTts(model) => write!(formatter, "KokoroTts({:p})", &**model),
+            Self::Voxtral(model) => write!(formatter, "Voxtral({:p})", &**model),
         }
     }
 }
@@ -929,6 +932,7 @@ enum PreparedAsrEncoderArtifactValue {
     Lfm25Audio(Arc<Lfm25AudioPreparedAsrArtifact>),
     Parakeet(Arc<ParakeetPreparedEncoderArtifact>),
     Nemotron(Arc<NemotronPreparedEncoderArtifact>),
+    Voxtral(Arc<crate::models::architectures::voxtral::realtime::VoxtralOfflinePreparedAudio>),
 }
 
 impl fmt::Debug for PreparedAsrEncoderArtifact {
@@ -952,6 +956,7 @@ impl crate::backends::DeviceResident for PreparedAsrEncoderArtifactValue {
             Self::Lfm25Audio(value) => Some(value.device_location()),
             Self::Parakeet(value) => Some(value.device_location()),
             Self::Nemotron(value) => Some(value.device_location()),
+            Self::Voxtral(value) => Some(value.device_location()),
         }
     }
 }
@@ -966,6 +971,7 @@ impl PreparedAsrEncoderArtifactValue {
             Self::Lfm25Audio(_) => "lfm25_audio",
             Self::Parakeet(_) => "parakeet",
             Self::Nemotron(_) => "nemotron",
+            Self::Voxtral(_) => "voxtral",
         }
     }
 
@@ -984,6 +990,7 @@ impl PreparedAsrEncoderArtifactValue {
             }
             Self::Parakeet(value) => Ok((0, value.resident_tensor_bytes()?)),
             Self::Nemotron(value) => Ok((0, value.resident_tensor_bytes()?)),
+            Self::Voxtral(value) => Ok((0, value.tensor_bytes()?)),
         }
     }
 
@@ -995,7 +1002,8 @@ impl PreparedAsrEncoderArtifactValue {
             | Self::GraniteSpeech(_)
             | Self::Lfm25Audio(_)
             | Self::Parakeet(_)
-            | Self::Nemotron(_) => &[],
+            | Self::Nemotron(_)
+            | Self::Voxtral(_) => &[],
         }
     }
 }

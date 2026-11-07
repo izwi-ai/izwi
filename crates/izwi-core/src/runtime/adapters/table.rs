@@ -28,6 +28,7 @@ pub(crate) enum LoadedAdapterKind {
     Lfm25AudioAsr,
     ParakeetAsr,
     NemotronAsr,
+    VoxtralAsr,
     Lfm25AudioTts,
     VibeVoiceTts,
     FishS2Tts,
@@ -59,6 +60,7 @@ impl LoadedAdapterKind {
             Self::Lfm25AudioAsr => "builtin.lfm25_audio_asr.physical_sequence",
             Self::ParakeetAsr => "builtin.parakeet_asr.physical_recurrent",
             Self::NemotronAsr => "builtin.nemotron_asr.physical_recurrent",
+            Self::VoxtralAsr => "builtin.voxtral_asr.physical_paged",
             Self::Lfm25AudioTts => "builtin.lfm25_audio_tts.physical_sequence",
             Self::VibeVoiceTts => "builtin.vibevoice_tts.physical_sequence",
             Self::FishS2Tts => "builtin.fish_s2_tts.physical_sequence",
@@ -387,8 +389,19 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         )
         .sequence()
         .resumable(),
-        // Long audio is chunked inside the dispatch.
-        row(F::Voxtral, C::Asr, Loaded::Scalar, Invocation).chunked(),
+        // Audio within the realtime session ceiling transcribes as a closed
+        // realtime stream: prepared once, prompt prefilled alone, frames
+        // decoded batched across rows on the pages realtime sessions use.
+        // Longer audio is chunked inside one atomic dispatch.
+        row(
+            F::Voxtral,
+            C::Asr,
+            Loaded::VoxtralAsr,
+            RetainedAndInvocation,
+        )
+        .chunked()
+        .sequence()
+        .resumable(),
         row(
             F::Voxtral,
             C::RealtimeAsr,

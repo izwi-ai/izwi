@@ -294,15 +294,54 @@ impl ModelLifecycleController {
                     .iter()
                     .map(|contract| contract.stages.as_ref())
                     .collect::<Vec<_>>();
-                let physical_spec = loaded.physical_state_spec(&stage_graphs)?;
+                let physical_spec = loaded.offline_physical_state_spec(&stage_graphs)?;
+                // Offline rows and realtime sessions share one arena (the
+                // same retained contract binds the same runtime): it keeps
+                // the engine's retained rows realtime has always had, and
+                // stages one step of the offline decode width.
+                let engine = self.core_engine.config();
+                let rows = (
+                    engine.max_retained_sequences,
+                    self.asr_state_rows(bundle_draft)?.1,
+                );
+                let retained = self
+                    .core_engine
+                    .load_managed_model_state_with_portable_copies(
+                        model_instance_id,
+                        &physical_spec.retained,
+                        Some(physical_spec.retained_max_tokens),
+                        1,
+                        rows,
+                        asr_minimum_tokens(variant),
+                    )
+                    .await?;
+                let retained_uses = contracts
+                    .iter()
+                    .map(|contract| {
+                        let graph = stage_graph_fingerprint(&contract.stages)?;
+                        let use_kind = match contract.execution_profile.mode {
+                            crate::engine::ExecutionMode::Sequence => {
+                                RetainedStateUseV2::ExternalPaged
+                            }
+                            crate::engine::ExecutionMode::Atomic => RetainedStateUseV2::Inactive,
+                            _ => {
+                                return Err(Error::ModelLoadError(
+                                    "Voxtral ASR graph has an incompatible retained-state profile"
+                                        .into(),
+                                ));
+                            }
+                        };
+                        Ok((graph, use_kind))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
                 let publication = self
                     .load_invocation_workspace_publication(
                         model_instance_id,
                         &contracts,
                         physical_spec.descriptor,
                         &physical_spec.invocation,
-                        None,
-                        HashMap::new(),
+                        Some(retained.into()),
+                        retained_uses,
                     )
                     .await?;
                 state_publications.insert(CapabilityKind::Asr, publication);

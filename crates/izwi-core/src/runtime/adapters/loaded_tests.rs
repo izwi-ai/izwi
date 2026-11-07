@@ -1291,6 +1291,8 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                         && variant.family() == crate::catalog::ModelFamily::ParakeetAsr;
                     let nemotron_asr = execution.metadata().capability == CapabilityKind::Asr
                         && variant.family() == crate::catalog::ModelFamily::NemotronAsr;
+                    let voxtral_asr = execution.metadata().capability == CapabilityKind::Asr
+                        && variant.family() == crate::catalog::ModelFamily::Voxtral;
                     let nemotron_transcribe_asr = execution.metadata().capability
                         == CapabilityKind::Asr
                         && variant.family() == crate::catalog::ModelFamily::NemotronTranscribeAsr;
@@ -1313,6 +1315,7 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                         || retained_tts
                         || parakeet_asr
                         || nemotron_asr
+                        || voxtral_asr
                         || nemotron_transcribe_asr
                         || engine_realtime
                         || nemotron_realtime)
@@ -1585,6 +1588,145 @@ fn scalar_adapters_remain_exact_width_one_without_concurrency_evidence() {
     assert_eq!(contract.stages.len(), 2);
     assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::Continuous);
     assert_eq!(contract.stages[1].max_batch_size, 1);
+}
+
+/// Voxtral offline ASR binds a row graph (width-1 preparation, scalar
+/// prompt prefill, continuous decode at its decode width) for audio within
+/// the realtime ceiling, and the one-stage atomic graph for long audio and
+/// pipelines under the same adapter identity; the offline state accepts
+/// both, on the realtime sessions' retained contract.
+#[test]
+fn voxtral_offline_rows_bind_a_row_graph_and_long_audio_the_atomic_graph() {
+    use crate::models::architectures::voxtral::{
+        voxtral_offline_physical_state_spec, voxtral_retained_contract,
+        VOXTRAL_OFFLINE_DECODE_STAGE, VOXTRAL_OFFLINE_PREFILL_STAGE,
+        VOXTRAL_OFFLINE_PREPARATION_STAGE,
+    };
+    let variant = ModelVariant::VoxtralMini4BRealtime2602;
+    let metadata = *RuntimeAdapterRegistry::built_in()
+        .require(CapabilityKind::Asr, variant)
+        .unwrap();
+    assert_eq!(
+        metadata.state_requirement,
+        InferenceStateRequirement::RetainedAndInvocation
+    );
+    for (backend, engine_rows, decode_rows) in [
+        (BackendKind::Cpu, 2, 2),
+        (BackendKind::Metal, 2, 2),
+        (BackendKind::Cuda, 8, 32),
+    ] {
+        let adapter = VoxtralAsrExecutionAdapter::new(
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(9),
+            metadata,
+            backend,
+            engine_rows,
+        )
+        .with_decode_batch_size(decode_rows);
+        // Long audio needs no preparation geometry; rows do.
+        let long = adapter
+            .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+            .unwrap();
+        assert!(adapter.contract(StreamingRequirements::NONE).is_err());
+        adapter
+            .install_test_preparation_seal(backend, engine_rows)
+            .unwrap();
+        assert_eq!(long.adapter_abi_revision, VOXTRAL_ASR_ADAPTER_ABI);
+        assert_eq!(long.stages.len(), 1);
+        assert_eq!(long.stages[0].selector, StageWorkSelector::Atomic);
+        assert_eq!(long.execution_profile.max_batch_size, 1);
+
+        for streaming in [
+            StreamingRequirements::NONE,
+            StreamingRequirements::transport_only(),
+        ] {
+            let row = adapter.contract(streaming).unwrap();
+            assert_eq!(row.adapter_abi_revision, VOXTRAL_ASR_ADAPTER_ABI);
+            assert_eq!(row.execution_profile.mode, ExecutionMode::Sequence);
+            assert_eq!(row.execution_profile.cache_mode, CacheMode::ExternalPaged);
+            assert_eq!(row.execution_profile.max_batch_size, decode_rows);
+            let shape = row
+                .stages
+                .iter()
+                .map(|stage| {
+                    (
+                        stage.name.as_str(),
+                        stage.selector,
+                        stage.batch_mode,
+                        stage.max_batch_size,
+                        stage.concurrency,
+                        stage.output_visibility,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                shape,
+                [
+                    (
+                        VOXTRAL_OFFLINE_PREPARATION_STAGE,
+                        StageWorkSelector::PreSequencePreparation,
+                        NativeBatchMode::None,
+                        1,
+                        ConcurrencyClass::Exclusive,
+                        OutputVisibility::AfterQuantumCommit,
+                    ),
+                    (
+                        VOXTRAL_OFFLINE_PREFILL_STAGE,
+                        StageWorkSelector::SequencePrefill,
+                        NativeBatchMode::None,
+                        1,
+                        ConcurrencyClass::Exclusive,
+                        OutputVisibility::AfterQuantumCommit,
+                    ),
+                    (
+                        VOXTRAL_OFFLINE_DECODE_STAGE,
+                        StageWorkSelector::SequenceDecode,
+                        NativeBatchMode::Continuous,
+                        decode_rows,
+                        ConcurrencyClass::Batchable,
+                        OutputVisibility::AfterQuantumCommit,
+                    ),
+                ]
+            );
+            assert_eq!(row.stages[0].max_workspace_bytes, 4_000_000);
+            assert_eq!(
+                row.stages[2].max_workspace_bytes,
+                asr::VOXTRAL_OFFLINE_DECODE_ROW_WORKSPACE_BYTES * decode_rows as u64
+            );
+
+            let mut invocation = crate::kv::v2::test_contract();
+            for domain in &mut invocation.domains {
+                if let crate::kv::v2::StateDomainSpec::PagedAttention(domain) = domain {
+                    domain.header.scope = crate::kv::v2::StateScope::Invocation;
+                    domain.header.prefix = crate::kv::v2::PrefixPolicy::Disabled;
+                    domain.header.checkpoint = crate::kv::v2::CheckpointPolicy::None;
+                }
+            }
+            for group in &mut invocation.groups {
+                group.prefix_shareable = false;
+            }
+            let retained = voxtral_retained_contract(invocation.clone()).unwrap();
+            let spec = voxtral_offline_physical_state_spec(
+                &[&row.stages, &long.stages],
+                invocation,
+                retained.clone(),
+                1_024,
+            )
+            .unwrap();
+            assert_eq!(
+                spec.descriptor.retained,
+                RetainedStateCapability::Managed { contract: retained }
+            );
+            // The realtime graph is not an offline graph.
+            assert!(voxtral_offline_physical_state_spec(
+                &[&row.stages[1..]],
+                spec.invocation.clone(),
+                spec.retained.clone(),
+                1_024,
+            )
+            .is_err());
+        }
+    }
 }
 
 #[test]

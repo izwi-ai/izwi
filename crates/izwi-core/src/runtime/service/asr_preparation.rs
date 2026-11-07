@@ -1432,6 +1432,197 @@ impl RuntimeService {
             .map_err(|failure| failure.error)
     }
 
+    /// Voxtral Mini 4B Realtime offline transcription. Audio within the
+    /// realtime session ceiling runs as a closed realtime stream: it is
+    /// decoded on a host worker and encoded once, alone (the ragged encoder
+    /// batch attends with an eager quadratic softmax, and the decode
+    /// dominates anyway); its prompt then prefills alone and its frames
+    /// decode batched across rows. Longer audio and speaker attribution keep
+    /// the atomic route, which chunks long audio inside its dispatch.
+    pub(super) async fn prepare_voxtral_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::Voxtral)
+            || request.prepared_asr_execution_shape().is_some()
+            || request.is_realtime_asr_session()
+        {
+            return Ok((request, job));
+        }
+        let variant = request.model_variant.expect("validated Voxtral variant");
+        let model = self
+            .model_registry
+            .get_voxtral_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("Voxtral model {variant} is not loaded"))
+            })?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Voxtral ASR preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let prompt_tokens = model.offline_prompt_tokens()?;
+        let model_for_plan = model.clone();
+        let (prepared, row_frames) = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let (samples, sample_rate) =
+                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let plan = crate::engine::asr_route_plan(
+                    &samples,
+                    sample_rate,
+                    &model_for_plan
+                        .asr_route_capabilities()
+                        .for_request(&request),
+                    request.streaming,
+                );
+                let row_frames =
+                    if plan.requires_chunk_path() || request.asr_task.speaker_attribution {
+                        None
+                    } else {
+                        model_for_plan.offline_row_frames(samples.len(), sample_rate)?
+                    };
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                if row_frames.is_none() {
+                    request.install_prepared_asr_long_form_atomic(plan)?;
+                }
+                Ok((request, row_frames))
+            })
+            .await?;
+        let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
+            .map_err(|_| Error::Overloaded("Voxtral ASR retained input exceeds u64".into()))?;
+        // The decoded audio joins the request: its usage only rises here.
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let Some(frames) = row_frames else {
+            let mut prepared = prepared;
+            prepared.install_voxtral_asr_execution_model(variant, model, None, prompt_tokens)?;
+            let (spec, observation) = self.coordinator_job_for_request(&prepared)?;
+            return self
+                .coordinator
+                .admit_observed_from_preparation(bridge, spec, observation)
+                .await
+                .map(|job| (prepared, job))
+                .map_err(|failure| failure.error);
+        };
+        let (samples, sample_rate) = prepared
+            .prepared_asr_audio_for_executor()?
+            .ok_or_else(|| Error::InferenceError("Voxtral decoded audio was lost".into()))?;
+        let (workspace, embedding_bytes) =
+            model.offline_preparation_bytes(samples.len(), sample_rate)?;
+        let backend = self.backend_router.context().backend_kind;
+        // The preparation job holds the request and, once the encode
+        // commits, the prepared embeddings; the encoder's working set is the
+        // stage row's own workspace.
+        let preparation_job = self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                JobSpec {
+                    request_id: prepared.id.clone(),
+                    lane: CoordinatorLane::Atomic,
+                    priority: prepared.priority,
+                    workload_class: prepared.workload_class,
+                    deadline: prepared.deadline,
+                    resources: asr_encoder_retained_resources(
+                        backend,
+                        retained_request_bytes,
+                        embedding_bytes,
+                    )?,
+                },
+                JobResourceObservation::host(retained_request_bytes),
+            )
+            .await
+            .map_err(|failure| failure.error)?;
+        let work = WorkUnit::PreSequencePreparation {
+            kind: crate::models::architectures::voxtral::VOXTRAL_OFFLINE_PREPARATION_STAGE.into(),
+        };
+        let units = u64::try_from(frames)
+            .map_err(|_| Error::Overloaded("Voxtral preparation frames exceed u64".into()))?;
+        let cost = crate::engine::WorkCost::with_workspace(
+            units,
+            units,
+            super::tts_preparation::lfm25_audio_tts_preparation_workspace(backend, workspace),
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &contract,
+            &work,
+            cost,
+            units,
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "Voxtral ASR preparation must remain scalar".into(),
+                    ));
+                }
+                let artifact =
+                    model_for_preparation.prepare_offline_audio(&samples, sample_rate)?;
+                // What the row keeps: the request and its prepared
+                // embeddings, a rise over the request alone.
+                let retained = JobResourceObservation {
+                    host_bytes: retained_request_bytes,
+                    accelerator_bytes: artifact.tensor_bytes()?,
+                };
+                Ok(vec![Ok(PreparationArtifact {
+                    retained,
+                    value: Arc::new(artifact),
+                })])
+            })
+            .await?;
+        cancellation_guard.armed = false;
+        let (artifact, bridge) = match outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("Voxtral ASR preparation returned no outcome".into())
+        })? {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let retained = artifact.retained;
+        let mut prepared = prepared;
+        prepared.install_voxtral_asr_execution_model(
+            variant,
+            model,
+            Some(artifact.value),
+            prompt_tokens,
+        )?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        self.coordinator
+            .admit_observed_from_preparation(bridge, execution, retained)
+            .await
+            .map(|job| (prepared, job))
+            .map_err(|failure| failure.error)
+    }
+
     pub(super) async fn prepare_parakeet_asr_shape_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -1873,6 +2064,9 @@ impl RuntimeService {
             .await?;
         let (request, job) = self
             .prepare_lfm3_audio_asr_shape_for_binding(request, job, residency_lease)
+            .await?;
+        let (request, job) = self
+            .prepare_voxtral_asr_shape_for_binding(request, job, residency_lease)
             .await?;
         self.prepare_nemotron_transcribe_asr_shape_for_binding(request, job)
             .await

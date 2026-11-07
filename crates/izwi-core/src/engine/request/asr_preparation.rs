@@ -3,6 +3,8 @@
 
 use super::*;
 use crate::backends::DeviceOwned;
+use crate::models::architectures::voxtral::realtime::VoxtralOfflinePreparedAudio;
+use crate::models::registry::VoxtralModelLease;
 
 impl EngineCoreRequest {
     pub(crate) fn install_asr_execution_model(
@@ -517,7 +519,8 @@ impl EngineCoreRequest {
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
             | PreparedAsrEncoderArtifactValue::Parakeet(_)
-            | PreparedAsrEncoderArtifactValue::Nemotron(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Nemotron(_)
+            | PreparedAsrEncoderArtifactValue::Voxtral(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Qwen3 accessor".into(),
             )),
         }
@@ -576,7 +579,8 @@ impl EngineCoreRequest {
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
             | PreparedAsrEncoderArtifactValue::Parakeet(_)
-            | PreparedAsrEncoderArtifactValue::Nemotron(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Nemotron(_)
+            | PreparedAsrEncoderArtifactValue::Voxtral(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Whisper accessor".into(),
             )),
         }
@@ -635,7 +639,8 @@ impl EngineCoreRequest {
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
             | PreparedAsrEncoderArtifactValue::Parakeet(_)
-            | PreparedAsrEncoderArtifactValue::Nemotron(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Nemotron(_)
+            | PreparedAsrEncoderArtifactValue::Voxtral(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the VibeVoice accessor".into(),
             )),
         }
@@ -694,7 +699,8 @@ impl EngineCoreRequest {
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
             | PreparedAsrEncoderArtifactValue::Parakeet(_)
-            | PreparedAsrEncoderArtifactValue::Nemotron(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Nemotron(_)
+            | PreparedAsrEncoderArtifactValue::Voxtral(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Granite Speech accessor".into(),
             )),
         }
@@ -773,7 +779,8 @@ impl EngineCoreRequest {
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
             | PreparedAsrEncoderArtifactValue::Parakeet(_)
-            | PreparedAsrEncoderArtifactValue::Nemotron(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Nemotron(_)
+            | PreparedAsrEncoderArtifactValue::Voxtral(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the LFM2.5 Audio accessor".into(),
             )),
         }
@@ -887,6 +894,132 @@ impl EngineCoreRequest {
         }
     }
 
+    /// A Voxtral offline request's execution model. Audio the realtime
+    /// ceiling covers becomes a retained row over its prepared audio (a
+    /// prompt prefill, then one decode step per remaining audio frame, the
+    /// last one finishing the row); other audio runs the atomic route
+    /// (`artifact` `None`, after `install_prepared_asr_long_form_atomic`).
+    pub(crate) fn install_voxtral_asr_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: VoxtralModelLease,
+        artifact: Option<Arc<VoxtralOfflinePreparedAudio>>,
+        prompt_tokens: usize,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::Voxtral
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} Voxtral preparation does not match its routed model",
+                self.id
+            )));
+        }
+        match artifact {
+            Some(artifact) => {
+                let frames = artifact.prepared_frames();
+                if self.uses_asr_long_form_atomic()
+                    || prompt_tokens == 0
+                    || frames < prompt_tokens
+                    || self.prepared_asr_encoder_artifact.is_some()
+                    || self
+                        .prepared_sequence_input_tokens
+                        .is_some_and(|tokens| tokens != prompt_tokens)
+                {
+                    return Err(Error::InvalidInput(format!(
+                        "ASR request {} Voxtral row does not match its prepared audio",
+                        self.id
+                    )));
+                }
+                let source_fingerprint =
+                    self.refresh_asr_execution_source_fingerprint(model_variant)?;
+                self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+                    model_variant,
+                    artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::Voxtral(artifact)),
+                    source_fingerprint,
+                });
+                // The prefill predicts one token and every remaining audio
+                // frame one more; the decode stops when the audio runs out,
+                // as the atomic route's does, never at a caller's budget.
+                self.params.max_tokens = frames - prompt_tokens + 1;
+                self.prepared_sequence_input_tokens = Some(prompt_tokens);
+                self.prepared_asr_execution_shape =
+                    Some(PreparedAsrExecutionShape::RetainedSequence {
+                        input_tokens: prompt_tokens,
+                    });
+            }
+            None if self.uses_asr_long_form_atomic() => {}
+            None => {
+                return Err(Error::InvalidInput(format!(
+                    "ASR request {} Voxtral atomic route has no prepared long-form shape",
+                    self.id
+                )));
+            }
+        }
+        self.prepared_stage_costs.clear();
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::Voxtral(model),
+            qwen_tts: None,
+            lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
+            fish_s2_tts: None,
+            fish_s2_tts_params: None,
+            fish_drama3_tts: None,
+            fish_drama3_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
+            chatterbox_tts: None,
+            chatterbox_tts_params: None,
+            maya1_tts: None,
+            maya1_tts_params: None,
+            maya2_tts: None,
+            maya2_tts_params: None,
+            lfm3_audio: None,
+            nemotron_transcribe: None,
+            kokoro_tts: None,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_voxtral_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<VoxtralModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::Voxtral(model) => Some(model.clone()),
+                _ => None,
+            }))
+    }
+
+    pub(crate) fn prepared_voxtral_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<VoxtralOfflinePreparedAudio>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after Voxtral preparation",
+                self.id
+            )));
+        }
+        match &*prepared.artifact {
+            PreparedAsrEncoderArtifactValue::Voxtral(value) => Ok(Some(value.clone())),
+            _ => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the Voxtral accessor".into(),
+            )),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn prepared_asr_encoder_artifact_retained_bytes(&self) -> Result<u64> {
         self.prepared_asr_encoder_artifact
@@ -973,7 +1106,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::Lfm3Audio(_)
-                | PreparedIncrementalModel::KokoroTts(_) => None,
+                | PreparedIncrementalModel::KokoroTts(_)
+                | PreparedIncrementalModel::Voxtral(_) => None,
             }))
     }
 
@@ -995,7 +1129,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::Lfm3Audio(_)
-                | PreparedIncrementalModel::KokoroTts(_) => None,
+                | PreparedIncrementalModel::KokoroTts(_)
+                | PreparedIncrementalModel::Voxtral(_) => None,
             }))
     }
 
@@ -1033,7 +1168,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::Lfm3Audio(_)
-                | PreparedIncrementalModel::KokoroTts(_) => None,
+                | PreparedIncrementalModel::KokoroTts(_)
+                | PreparedIncrementalModel::Voxtral(_) => None,
             }))
     }
 }

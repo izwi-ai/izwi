@@ -22,12 +22,18 @@ pub mod tts;
 
 use lm::VoxtralLM;
 
-pub(crate) const VOXTRAL_REALTIME_EXECUTION_ABI: u32 = 24;
+pub(crate) const VOXTRAL_REALTIME_EXECUTION_ABI: u32 = 25;
 pub(crate) const VOXTRAL_REALTIME_PREPARATION_STAGE: &str = "asr.realtime.voxtral.preparation";
 pub(crate) const VOXTRAL_REALTIME_PROMPT_PREFILL_STAGE: &str =
     "asr.realtime.voxtral.prompt_prefill";
 pub(crate) const VOXTRAL_REALTIME_DECODE_STAGE: &str = "asr.realtime.voxtral.decode";
 pub(crate) const VOXTRAL_REALTIME_COMPLETION_STAGE: &str = "asr.realtime.voxtral.completion";
+/// An offline request as a closed stream: its whole audio encoded once,
+/// its prompt prefilled alone, then one frame per decode step with other
+/// rows.
+pub(crate) const VOXTRAL_OFFLINE_PREPARATION_STAGE: &str = "asr.encoder.voxtral";
+pub(crate) const VOXTRAL_OFFLINE_PREFILL_STAGE: &str = "asr.prefill.voxtral.scalar";
+pub(crate) const VOXTRAL_OFFLINE_DECODE_STAGE: &str = "asr.decode.voxtral.tensor_continuous";
 
 pub(crate) fn authenticate_voxtral_realtime_execution_binding(
     binding: &crate::engine::ExecutionAdapterBinding,
@@ -108,6 +114,17 @@ pub(crate) struct VoxtralTtsPhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) retained: InferenceStateContract,
     pub(crate) retained_max_tokens: usize,
+}
+
+/// Offline Voxtral ASR state: the realtime sessions' retained paged
+/// contract (one arena serves both) for row graphs, and per-invocation pages
+/// for the atomic graph of long audio and pipelines.
+#[derive(Debug, Clone)]
+pub(crate) struct VoxtralOfflinePhysicalStateSpec {
+    pub(crate) descriptor: CapabilityStateDescriptorV2,
+    pub(crate) retained: InferenceStateContract,
+    pub(crate) retained_max_tokens: usize,
+    pub(crate) invocation: InferenceStateContract,
 }
 
 #[derive(Debug, Clone)]
@@ -375,6 +392,136 @@ pub(crate) fn voxtral_realtime_physical_state_spec(
         descriptor,
         retained,
         retained_max_tokens: max_context_tokens,
+    })
+}
+
+/// The offline ASR state for its sealed graphs: an atomic graph (one stage
+/// leasing the language model's pages for one invocation, as before) or the
+/// row graph (width-1 preparation, scalar prompt prefill and continuous
+/// decode on `retained` pages, each stage leasing per-row scratch).
+pub(crate) fn voxtral_offline_physical_state_spec(
+    stage_graphs: &[&[StageDescriptor]],
+    invocation: InferenceStateContract,
+    retained: InferenceStateContract,
+    max_context_tokens: usize,
+) -> Result<VoxtralOfflinePhysicalStateSpec> {
+    if stage_graphs.is_empty() || max_context_tokens == 0 {
+        return Err(Error::ModelLoadError(
+            "Voxtral offline state requires stages and a non-zero context".into(),
+        ));
+    }
+    let atomic = |stages: &[StageDescriptor]| {
+        stages.len() == 1 && stages[0].selector == StageWorkSelector::Atomic
+    };
+    for stages in stage_graphs {
+        if atomic(stages) {
+            continue;
+        }
+        let find = |name: &str, selector: StageWorkSelector| {
+            stages
+                .iter()
+                .find(|stage| stage.name == name && stage.selector == selector)
+        };
+        let preparation = find(
+            VOXTRAL_OFFLINE_PREPARATION_STAGE,
+            StageWorkSelector::PreSequencePreparation,
+        );
+        let prefill = find(
+            VOXTRAL_OFFLINE_PREFILL_STAGE,
+            StageWorkSelector::SequencePrefill,
+        );
+        let decode = find(
+            VOXTRAL_OFFLINE_DECODE_STAGE,
+            StageWorkSelector::SequenceDecode,
+        );
+        let valid = stages.len() == 3
+            && preparation.is_some_and(|stage| {
+                stage.id.get() == 0
+                    && stage.batch_mode == NativeBatchMode::None
+                    && stage.max_batch_size == 1
+                    && stage.concurrency == ConcurrencyClass::Exclusive
+                    && stage.workspace_per_row_bytes > 0
+            })
+            && prefill.is_some_and(|stage| {
+                stage.id.get() == 1
+                    && stage.batch_mode == NativeBatchMode::None
+                    && stage.max_batch_size == 1
+                    && stage.concurrency == ConcurrencyClass::Exclusive
+                    && stage.workspace_per_row_bytes > 0
+            })
+            && decode.is_some_and(|stage| {
+                stage.id.get() == 2
+                    && stage.batch_mode == NativeBatchMode::Continuous
+                    && stage.concurrency == ConcurrencyClass::Batchable
+                    && stage.shape_policy == StageShapePolicy::Ragged
+                    && stage.workspace_per_row_bytes > 0
+                    && u64::try_from(stage.max_batch_size)
+                        .ok()
+                        .and_then(|width| stage.workspace_per_row_bytes.checked_mul(width))
+                        == Some(stage.max_workspace_bytes)
+            })
+            && stages
+                .iter()
+                .all(|stage| stage.output_visibility == OutputVisibility::AfterQuantumCommit);
+        if !valid {
+            return Err(Error::ModelLoadError(
+                "Voxtral offline ASR requires its exact sealed preparation, prefill and decode graph"
+                    .into(),
+            ));
+        }
+    }
+    let rows = stage_graphs
+        .iter()
+        .copied()
+        .filter(|stages| !atomic(stages))
+        .collect::<Vec<_>>();
+    let invocations = stage_graphs
+        .iter()
+        .copied()
+        .filter(|stages| atomic(stages))
+        .collect::<Vec<_>>();
+    let mut profiles = Vec::new();
+    if !rows.is_empty() {
+        let InvocationWorkspaceSet::Bounded {
+            profiles: row_profiles,
+        } = voxtral_retained_scratch_descriptor(&rows, &retained, "Voxtral offline")?.invocation
+        else {
+            return Err(Error::ModelLoadError(
+                "Voxtral offline row graph leased no scratch".into(),
+            ));
+        };
+        profiles.extend(row_profiles);
+    }
+    if !invocations.is_empty() {
+        let InvocationWorkspaceSet::Bounded {
+            profiles: atomic_profiles,
+        } = voxtral_physical_state_spec(&invocations, invocation.clone(), max_context_tokens)?
+            .descriptor
+            .invocation
+        else {
+            return Err(Error::ModelLoadError(
+                "Voxtral atomic graph leased no invocation pages".into(),
+            ));
+        };
+        profiles.extend(atomic_profiles);
+    }
+    profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
+    profiles.dedup();
+    let descriptor = CapabilityStateDescriptorV2 {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        retained: RetainedStateCapability::Managed {
+            contract: retained.clone(),
+        },
+        invocation: InvocationWorkspaceSet::Bounded { profiles },
+    };
+    for stages in stage_graphs {
+        descriptor.validate_against_stages(stages)?;
+    }
+    Ok(VoxtralOfflinePhysicalStateSpec {
+        descriptor,
+        retained,
+        retained_max_tokens: max_context_tokens,
+        invocation,
     })
 }
 

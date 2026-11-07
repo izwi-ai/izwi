@@ -79,6 +79,8 @@ mod qwen3;
 mod vibevoice;
 #[path = "handler_asr/voxtral.rs"]
 mod voxtral;
+#[path = "handler_asr/voxtral_offline.rs"]
+mod voxtral_offline;
 #[path = "handler_asr/whisper.rs"]
 mod whisper;
 #[cfg(test)]
@@ -163,6 +165,7 @@ fn resolve_asr_execution_audio(
             | ModelFamily::Lfm25Audio
             | ModelFamily::Lfm3Audio
             | ModelFamily::NemotronAsr
+            | ModelFamily::Voxtral
     ) {
         if let Some((samples, sample_rate)) = request.prepared_asr_audio_for_executor()? {
             return Ok((AsrExecutionAudio::Prepared(samples), sample_rate, 0.0));
@@ -547,6 +550,21 @@ impl NativeExecutor {
                 scheduled,
                 managed_state.take(),
             );
+        }
+        if family == ModelFamily::Voxtral && request.uses_asr_retained_sequence() {
+            if scheduled.is_prefill {
+                return self.voxtral_asr_prefill_row(request, scheduled, managed_state.take());
+            }
+            return self
+                .voxtral_asr_decode_batch_with_managed(
+                    &[request],
+                    std::slice::from_ref(scheduled),
+                    vec![managed_state.take()],
+                )?
+                .pop()
+                .ok_or_else(|| {
+                    Error::InferenceError("Voxtral offline row lost its output".into())
+                });
         }
         if family == ModelFamily::NemotronTranscribeAsr {
             return self.nemotron_transcribe_request_with_managed_cache(

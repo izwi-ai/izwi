@@ -325,6 +325,8 @@ impl LoadedModelBundleDraft {
         execution.seal_lfm25_audio_tts_preparation(model)
     }
 
+    /// Seal the preparation geometry of Voxtral's realtime sessions and of
+    /// its offline rows, which prepare audio the same way.
     pub(crate) fn seal_voxtral_realtime_preparation(
         &self,
         model: &crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel,
@@ -337,7 +339,11 @@ impl LoadedModelBundleDraft {
                     "Voxtral loaded bundle has no realtime ASR capability to seal".into(),
                 )
             })?;
-        execution.seal_voxtral_realtime_preparation(model)
+        execution.seal_voxtral_realtime_preparation(model)?;
+        if let Some(offline) = self.capabilities.get(&CapabilityKind::Asr) {
+            offline.seal_voxtral_realtime_preparation(model)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn seal(

@@ -442,14 +442,14 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            73
+            74
         );
         assert_eq!(
             manifest
                 .iter()
                 .filter(|case| case.retained_state == Stateless)
                 .count(),
-            12
+            11
         );
 
         assert_eq!(
@@ -550,6 +550,7 @@ mod tests {
             (ModelVariant::VibeVoiceAsr, CapabilityKind::Asr),
             (ModelVariant::ParakeetTdt06BV3, CapabilityKind::Asr),
             (ModelVariant::Nemotron35AsrStreaming06B, CapabilityKind::Asr),
+            (ModelVariant::VoxtralMini4BRealtime2602, CapabilityKind::Asr),
             (ModelVariant::GraniteSpeech412B, CapabilityKind::Asr),
             (ModelVariant::Lfm25Audio15BGguf, CapabilityKind::Asr),
             (ModelVariant::Lfm25Audio15BGguf, CapabilityKind::Tts),
@@ -572,17 +573,6 @@ mod tests {
             assert_eq!(case.retained_state, Managed, "{variant} {capability:?}");
             assert_eq!(case.workspace, InvocationStateRequired);
         }
-        // Voxtral's offline ASR keeps only invocation state; its retained
-        // state belongs to the realtime capability.
-        assert_eq!(
-            manifest_case(
-                &manifest,
-                ModelVariant::VoxtralMini4BRealtime2602,
-                CapabilityKind::Asr,
-            )
-            .retained_state,
-            Stateless
-        );
         for capability in [CapabilityKind::Asr, CapabilityKind::SpeakerAttributedAsr] {
             assert_eq!(
                 manifest_case(&manifest, ModelVariant::GraniteSpeech412BPlus, capability,)

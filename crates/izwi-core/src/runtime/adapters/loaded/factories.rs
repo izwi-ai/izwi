@@ -218,6 +218,40 @@ pub(super) struct ParakeetPhysicalAsrAdapterFactory;
 pub(super) struct NemotronPhysicalAsrAdapterFactory;
 
 #[derive(Debug, Clone, Copy)]
+pub(super) struct VoxtralPhysicalAsrAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for VoxtralPhysicalAsrAdapterFactory {
+    fn id(&self) -> &'static str {
+        LoadedAdapterKind::VoxtralAsr.factory_id()
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Continuous
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::VoxtralAsr, metadata, backend_kind)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(
+            VoxtralAsrExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(super) struct Lfm25AudioPhysicalTtsAdapterFactory;
 
 #[derive(Debug, Clone, Copy)]
@@ -824,6 +858,7 @@ pub(in crate::runtime::adapters) fn built_in_loaded_adapter_factories() -> Vec<A
         Arc::new(Lfm25AudioPhysicalAsrAdapterFactory),
         Arc::new(ParakeetPhysicalAsrAdapterFactory),
         Arc::new(NemotronPhysicalAsrAdapterFactory),
+        Arc::new(VoxtralPhysicalAsrAdapterFactory),
         Arc::new(Lfm25AudioPhysicalTtsAdapterFactory),
         Arc::new(VibeVoicePhysicalTtsAdapterFactory),
         Arc::new(FishS2PhysicalTtsAdapterFactory),

@@ -188,6 +188,7 @@ impl CertifiedTopology {
 const UNCHECKED_RETAINED_PAGE_ROUTES: &[(ModelFamily, CapabilityKind)] = &[
     (ModelFamily::WhisperAsr, CapabilityKind::Asr),
     (ModelFamily::Voxtral, CapabilityKind::RealtimeAsr),
+    (ModelFamily::Voxtral, CapabilityKind::Asr),
 ];
 
 fn certified_topology(
@@ -246,7 +247,10 @@ fn certified_topology(
         // Qwen ASR commits decoder pages and immutable prepared inputs under
         // one retained transaction; long-form leases invocation pages only.
         (Qwen3Asr, Asr) => RetainedPagedTensorAndInvocationPaged,
-        (Voxtral, Asr) => InvocationPaged,
+        // Offline Voxtral rows retain transactional pages in the arena its
+        // realtime sessions use; long audio and pipelines lease the language
+        // model's pages for one atomic invocation.
+        (Voxtral, Asr) => RetainedPagedAndInvocationPaged,
         // Realtime Voxtral retains transactional external pages while its
         // absolute-position sliding window rotates the visible cache view.
         (Voxtral, RealtimeAsr) => RetainedPagedRotatingAndInvocationScratch,

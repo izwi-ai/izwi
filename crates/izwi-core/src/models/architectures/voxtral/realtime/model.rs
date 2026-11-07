@@ -24,8 +24,9 @@ use crate::kv::CacheDomainId;
 use crate::models::architectures::qwen3::core::build_rope_cache;
 use crate::models::architectures::voxtral::lm::{VoxtralAdaScales, VoxtralLM};
 use crate::models::architectures::voxtral::{
-    voxtral_invocation_contract, voxtral_physical_state_spec, voxtral_realtime_physical_state_spec,
-    voxtral_retained_contract, VoxtralPhysicalStateSpec, VoxtralRealtimePhysicalStateSpec,
+    voxtral_invocation_contract, voxtral_offline_physical_state_spec, voxtral_physical_state_spec,
+    voxtral_realtime_physical_state_spec, voxtral_retained_contract,
+    VoxtralOfflinePhysicalStateSpec, VoxtralPhysicalStateSpec, VoxtralRealtimePhysicalStateSpec,
 };
 use crate::models::shared::attention::flash::{
     flash_attention_compiled, flash_attention_requested, try_fused_self_attention,
@@ -519,6 +520,35 @@ impl VoxtralRealtimeModel {
             .checked_add(default_kv_page_size())
             .ok_or_else(|| Error::ModelLoadError("Voxtral cache capacity overflow".into()))?;
         voxtral_physical_state_spec(stage_graphs, invocation, rotating_capacity_tokens)
+    }
+
+    /// Offline ASR state: the realtime sessions' retained contract and
+    /// rotating capacity for row graphs (the two share one arena), and the
+    /// invocation pages of the atomic graph.
+    pub(crate) fn offline_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<VoxtralOfflinePhysicalStateSpec> {
+        let invocation = voxtral_invocation_contract(
+            &self.language_model,
+            self.dtype,
+            default_kv_page_size(),
+            &[CacheDomainId::new(1)],
+        )?;
+        let retained = voxtral_retained_contract(invocation.clone())?;
+        let attention_window_tokens = self
+            .language_model
+            .physical_context_limit()
+            .ok_or_else(|| Error::ModelLoadError("Voxtral has no context limit".into()))?;
+        let rotating_capacity_tokens = attention_window_tokens
+            .checked_add(default_kv_page_size())
+            .ok_or_else(|| Error::ModelLoadError("Voxtral cache capacity overflow".into()))?;
+        voxtral_offline_physical_state_spec(
+            stage_graphs,
+            invocation,
+            retained,
+            rotating_capacity_tokens,
+        )
     }
 
     pub(crate) fn realtime_physical_state_spec(

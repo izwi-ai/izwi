@@ -279,6 +279,20 @@ fn asr_transient_resources(
     input_bytes: usize,
     audio_secs: Option<f32>,
 ) -> Result<Option<ResourceVector>> {
+    asr_transient_resources_for_route(backend, variant, input_bytes, audio_secs, false)
+}
+
+/// [`asr_transient_resources`] for a request whose encoder already ran in a
+/// preparation stage that priced it (`encoder_prepared`): a Voxtral row
+/// keeps only its prepared embeddings, which the request prices as its
+/// artifact.
+fn asr_transient_resources_for_route(
+    backend: BackendKind,
+    variant: ModelVariant,
+    input_bytes: usize,
+    audio_secs: Option<f32>,
+    encoder_prepared: bool,
+) -> Result<Option<ResourceVector>> {
     use super::lifecycle::asr_envelope;
     let Some(secs) = audio_secs.or_else(|| asr_envelope::max_chunk_secs(variant)) else {
         return Ok(None);
@@ -286,10 +300,11 @@ fn asr_transient_resources(
     let Some(envelope) = asr_envelope::request_envelope(variant, secs, backend)? else {
         return Ok(None);
     };
-    let unpriced_encoder = matches!(
-        variant.family(),
-        ModelFamily::NemotronAsr | ModelFamily::Voxtral
-    );
+    let unpriced_encoder = match variant.family() {
+        ModelFamily::NemotronAsr => true,
+        ModelFamily::Voxtral => !encoder_prepared,
+        _ => false,
+    };
     let accelerator_bytes = if unpriced_encoder {
         envelope.accelerator_bytes
     } else {
@@ -1046,6 +1061,7 @@ fn bind_request_to_residency(
                 | ModelFamily::GraniteSpeech5Asr
                 | ModelFamily::Lfm25Audio
                 | ModelFamily::Lfm3Audio
+                | ModelFamily::Voxtral
         ) && request.prepared_asr_execution_shape().is_some()
     }) && request.prepared_asr_audio_for_executor()?.is_none()
     {
@@ -1107,6 +1123,16 @@ fn bind_request_to_residency(
     {
         return Err(Error::InvalidInput(
             "LFM3-Audio normal execution shape has no matching prepared artifact".into(),
+        ));
+    }
+    if request.model_variant.is_some_and(|variant| {
+        variant.family() == ModelFamily::Voxtral
+            && request.prepared_asr_execution_shape().is_some()
+            && !request.uses_asr_long_form_atomic()
+    }) && request.prepared_voxtral_artifact_for_executor()?.is_none()
+    {
+        return Err(Error::InvalidInput(
+            "Voxtral normal execution shape has no matching prepared audio".into(),
         ));
     }
     let streaming = if request.streaming && !model_streaming_required {

@@ -388,6 +388,30 @@ impl EngineCoreRequest {
                 }
             }
         }
+        if matches!(&ready.model, PreparedIncrementalModel::Voxtral(_)) {
+            if ready.model_variant.family() != ModelFamily::Voxtral
+                || self.prepared_asr_audio_for_executor()?.is_none()
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Voxtral ASR request {} is missing its exact decoded-audio artifact",
+                    self.id
+                )));
+            }
+            match self.prepared_asr_execution_shape {
+                Some(PreparedAsrExecutionShape::RetainedSequence { input_tokens })
+                    if self.prepared_sequence_input_tokens == Some(input_tokens)
+                        && self.prepared_voxtral_artifact_for_executor()?.is_some() => {}
+                Some(PreparedAsrExecutionShape::LongFormAtomic)
+                    if self.prepared_sequence_input_tokens.is_none()
+                        && self.prepared_asr_encoder_artifact.is_none() => {}
+                _ => {
+                    return Err(Error::InvalidInput(format!(
+                        "Voxtral ASR request {} is missing a consistent exact media execution shape",
+                        self.id
+                    )));
+                }
+            }
+        }
         if matches!(&ready.model, PreparedIncrementalModel::Lfm25AudioAsr(_)) {
             if ready.model_variant.family() != ModelFamily::Lfm25Audio
                 || self.prepared_asr_audio_for_executor()?.is_none()
@@ -823,7 +847,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::Lfm3Audio(_)
-                | PreparedIncrementalModel::KokoroTts(_) => None,
+                | PreparedIncrementalModel::KokoroTts(_)
+                | PreparedIncrementalModel::Voxtral(_) => None,
             })
             .filter(|_| self.uses_asr_retained_sequence())
             .map(|model| Self::continuous_asr_stage_cost(Some(&binding), model))

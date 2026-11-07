@@ -1,6 +1,6 @@
 //! Continuous ASR decode: one batched decode step over retained rows,
-//! dispatching LFM2.5-Audio, Parakeet, Nemotron and Whisper rows to their
-//! own batches.
+//! dispatching LFM2.5-Audio, Parakeet, Nemotron, Whisper and Voxtral rows to
+//! their own batches.
 
 use super::*;
 
@@ -199,6 +199,15 @@ impl NativeExecutor {
             == ModelFamily::WhisperAsr
         {
             return self.whisper_asr_decode_batch_with_managed(
+                &ordered_requests,
+                scheduled,
+                managed_caches,
+            );
+        }
+        if Self::resolve_variant(ordered_requests[live_indices[0]])?.family()
+            == ModelFamily::Voxtral
+        {
+            return self.voxtral_asr_decode_batch_with_managed(
                 &ordered_requests,
                 scheduled,
                 managed_caches,

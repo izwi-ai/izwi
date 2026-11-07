@@ -767,7 +767,7 @@ mod tests {
                 .require(CapabilityKind::Asr, variant)
                 .expect("voxtral asr adapter")
                 .state_requirement,
-            InferenceStateRequirement::Invocation
+            InferenceStateRequirement::RetainedAndInvocation
         );
         let realtime = registry
             .require(CapabilityKind::RealtimeAsr, variant)

@@ -204,11 +204,13 @@ impl RuntimeService {
         );
         if request.task_type == TaskType::ASR {
             if let Some(variant) = request.model_variant {
-                if let Some(resources) = asr_transient_resources(
+                if let Some(resources) = asr_transient_resources_for_route(
                     self.backend_router.context().backend_kind,
                     variant,
                     input_bytes,
                     request.prepared_asr_input_duration_secs(),
+                    variant.family() == ModelFamily::Voxtral
+                        && request.uses_asr_retained_sequence(),
                 )? {
                     spec.resources = resources;
                 }
@@ -249,6 +251,7 @@ impl RuntimeService {
                             | ModelFamily::VibeVoiceAsr
                             | ModelFamily::GraniteSpeechAsr
                             | ModelFamily::Lfm25Audio
+                            | ModelFamily::Voxtral
                     )
                 })
                 && request.prepared_asr_audio_for_executor()?.is_some());

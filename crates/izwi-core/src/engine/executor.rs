@@ -3101,6 +3101,15 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
                     .flatten()
                     .map(|_| (true, true))
             })
+            // A Voxtral row prefills its prompt alone and decodes batched.
+            .or_else(|| {
+                request
+                    .prepared_voxtral_model_lease_for_executor()
+                    .ok()
+                    .flatten()
+                    .filter(|_| request.uses_asr_retained_sequence())
+                    .map(|_| (false, true))
+            })
             .unwrap_or((false, false)),
         // Drama 3 decodes rows of many users together, but a prefill cell
         // is never batched across requests (§7.4).
@@ -3470,6 +3479,15 @@ impl ModelExecutor for NativeExecutor {
                         .ok()
                         .flatten()
                         .map(|_| true)
+                })
+                // A Voxtral prompt prefills whole: its realtime prefill has
+                // no resumable safe point.
+                .or_else(|| {
+                    request
+                        .prepared_voxtral_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| false)
                 }),
             super::types::TaskType::TTS => request
                 .prepared_qwen_tts_model_for_executor()
