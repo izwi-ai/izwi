@@ -20,11 +20,13 @@ pub(crate) use invocation::{
     InvocationTensorSnapshot, InvocationTensorStepValues, InvocationTensorUpdateV2,
 };
 #[cfg(test)]
+pub(crate) use static_attention::device_ordinal as static_attention_device_ordinal;
+#[cfg(test)]
 pub(crate) use static_attention::FAIL_NEXT_RESET as FAIL_NEXT_STATIC_ATTENTION_RESET;
 #[allow(unused_imports)]
 pub(crate) use static_attention::{
-    InvocationStaticAttentionArena, StaticAttentionLayerValue, StaticAttentionMetadata,
-    StaticAttentionRaggedRow,
+    InvocationStaticAttentionArena, StaticAttentionDecodeRows, StaticAttentionLayerValue,
+    StaticAttentionMetadata, StaticAttentionRaggedRow,
 };
 #[allow(unused_imports)]
 pub(crate) use tensor::{

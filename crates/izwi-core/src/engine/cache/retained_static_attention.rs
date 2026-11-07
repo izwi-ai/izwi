@@ -7,14 +7,14 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use candle_core::{Device, Tensor};
 use serde::Serialize;
 
 use crate::backends::state::{
-    InvocationStaticAttentionArena, StaticAttentionLayerValue, StaticAttentionMetadata,
-    StaticAttentionRaggedRow,
+    InvocationStaticAttentionArena, StaticAttentionDecodeRows, StaticAttentionLayerValue,
+    StaticAttentionMetadata, StaticAttentionRaggedRow,
 };
 use crate::engine::ModelInstanceId;
 use crate::error::{Error, Result};
@@ -107,15 +107,18 @@ impl RetainedStaticAttentionRuntimeV2 {
         }
         let capacity = usize::try_from(sequence_capacity)
             .map_err(|_| invalid("retained static-attention capacity exceeds usize"))?;
-        let mut arenas = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            arenas.push(Mutex::new(InvocationStaticAttentionArena::new_retained(
-                contract,
-                plan.clone(),
-                domain,
-                device.clone(),
-            )?));
-        }
+        // One backing for every slot, so a batch of sequences attends their
+        // memories as one paged tensor per layer.
+        let arenas = InvocationStaticAttentionArena::new_retained_pool(
+            contract,
+            plan.clone(),
+            domain,
+            device,
+            capacity,
+        )?
+        .into_iter()
+        .map(Mutex::new)
+        .collect::<Vec<_>>();
         let per_sequence_bytes = arenas
             .first()
             .ok_or_else(|| invalid("retained static-attention runtime has no arenas"))?
@@ -380,6 +383,71 @@ impl RetainedStaticAttentionRuntimeV2 {
         arena.attend(model_layer, queries, rows, softmax_scale)
     }
 
+    /// Lock `sequences`' installed memories for one decode step of one
+    /// query each (row `i` is `sequences[i]`) and lower their rows once for
+    /// every layer. Slots lock in ascending order; while the batch lives,
+    /// none of them can be reset or reassigned.
+    pub(crate) fn prepare_batch(
+        &self,
+        sequences: &[RetainedStaticAttentionSequenceId],
+    ) -> Result<RetainedStaticAttentionBatch<'_>> {
+        if sequences.is_empty() {
+            return Err(invalid(
+                "retained static-attention batch needs at least one sequence",
+            ));
+        }
+        let (guards, row_guard) = {
+            let state = self.lock_state()?;
+            let slots = sequences
+                .iter()
+                .map(|sequence| self.committed_slot(&state, *sequence))
+                .collect::<Result<Vec<_>>>()?;
+            let mut order = (0..slots.len()).collect::<Vec<_>>();
+            order.sort_unstable_by_key(|row| slots[*row]);
+            if order
+                .windows(2)
+                .any(|pair| slots[pair[0]] == slots[pair[1]])
+            {
+                return Err(invalid(
+                    "retained static-attention batch names one sequence twice",
+                ));
+            }
+            let mut guards = Vec::with_capacity(order.len());
+            let mut row_guard = vec![0; order.len()];
+            for (guard, row) in order.into_iter().enumerate() {
+                guards.push(self.lock_arena(slots[row])?);
+                row_guard[row] = guard;
+            }
+            (guards, row_guard)
+        };
+        let rows = {
+            let arenas = row_guard
+                .iter()
+                .map(|guard| &*guards[*guard])
+                .collect::<Vec<_>>();
+            InvocationStaticAttentionArena::decode_rows(&arenas)?
+        };
+        Ok(RetainedStaticAttentionBatch {
+            guards,
+            row_guard,
+            rows,
+        })
+    }
+
+    /// [`Self::prepare_batch`] for one layer: each row's query attends its
+    /// own sequence's memory.
+    #[cfg(test)]
+    pub(crate) fn attend_batch(
+        &self,
+        sequences: &[RetainedStaticAttentionSequenceId],
+        model_layer: u32,
+        queries: &Tensor,
+        softmax_scale: f32,
+    ) -> Result<Tensor> {
+        self.prepare_batch(sequences)?
+            .attend(model_layer, queries, softmax_scale)
+    }
+
     pub(crate) fn release_sequence(
         &self,
         sequence: RetainedStaticAttentionSequenceId,
@@ -501,6 +569,123 @@ impl RetainedStaticAttentionRuntimeV2 {
     }
 }
 
+/// Installed memories locked for one decode step: row `i`'s arena is
+/// `guards[row_guard[i]]`.
+pub(crate) struct RetainedStaticAttentionBatch<'a> {
+    guards: Vec<MutexGuard<'a, InvocationStaticAttentionArena>>,
+    row_guard: Vec<usize>,
+    rows: StaticAttentionDecodeRows,
+}
+
+impl RetainedStaticAttentionBatch<'_> {
+    pub(crate) fn len(&self) -> usize {
+        self.row_guard.len()
+    }
+
+    /// Row `i` of `queries` (`[rows, query_heads, key_dim]`) attends its
+    /// sequence's memory at `model_layer`; returns `[rows, query_heads,
+    /// value_dim]`.
+    pub(crate) fn attend(
+        &self,
+        model_layer: u32,
+        queries: &Tensor,
+        softmax_scale: f32,
+    ) -> Result<Tensor> {
+        let arenas = self
+            .row_guard
+            .iter()
+            .map(|guard| &*self.guards[*guard])
+            .collect::<Vec<_>>();
+        InvocationStaticAttentionArena::attend_decode_rows(
+            &arenas,
+            &self.rows,
+            model_layer,
+            queries,
+            softmax_scale,
+        )
+    }
+}
+
+/// A retained static-attention pool of `capacity` sequences on `device`,
+/// one `dtype` layer per entry of `model_layers` with `heads` heads of
+/// `head_dim` and room for `max_memory_tokens`, for model tests.
+#[cfg(test)]
+pub(crate) fn test_retained_static_runtime(
+    device: &Device,
+    dtype: crate::kv::v2::StateDType,
+    model_layers: &[u32],
+    heads: u32,
+    head_dim: u32,
+    max_memory_tokens: u64,
+    capacity: u32,
+) -> RetainedStaticAttentionRuntimeV2 {
+    use crate::backends::state::{
+        negotiate_state_plan, static_attention_device_ordinal, StateBackendPlanRequest,
+    };
+    use crate::kv::v2::{
+        CheckpointPolicy, KeyEncoding, PlacementPolicy, PrefixPolicy, StateClock,
+        StateDomainHeader, StateDomainSpec, StateGroupId, StateGroupSpec, StateScope,
+        StaticAttentionDomainSpec, StaticAttentionLayerSpec, CURRENT_INFERENCE_STATE_ABI,
+    };
+    static NEXT_TEST_MODEL: AtomicU64 = AtomicU64::new(7_000_000);
+    let domain = StateDomainId::new(1);
+    let contract = InferenceStateContract {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        domains: vec![StateDomainSpec::StaticAttention(
+            StaticAttentionDomainSpec {
+                header: StateDomainHeader {
+                    id: domain,
+                    scope: StateScope::Retained,
+                    clock: StateClock::EncoderTokens,
+                    placement: PlacementPolicy::BackendLocal,
+                    prefix: PrefixPolicy::Disabled,
+                    checkpoint: CheckpointPolicy::Transactional,
+                },
+                layers: model_layers
+                    .iter()
+                    .map(|model_layer| StaticAttentionLayerSpec {
+                        model_layer: *model_layer,
+                        query_heads: heads,
+                        kv_heads: heads,
+                        key_head_dim: head_dim,
+                        value_head_dim: head_dim,
+                        key_encoding: KeyEncoding::Raw,
+                    })
+                    .collect(),
+                max_memory_tokens,
+                accepted_dtypes: vec![dtype],
+            },
+        )],
+        groups: vec![StateGroupSpec {
+            id: StateGroupId::new(1),
+            domains: vec![domain],
+            prefix_shareable: false,
+        }],
+    };
+    let plan = Arc::new(
+        negotiate_state_plan(
+            &contract,
+            &StateBackendPlanRequest {
+                backend: crate::backends::backend_kind_for_device(device),
+                device_ordinal: static_attention_device_ordinal(device).unwrap(),
+                page_tokens_hint: None,
+                storage_dtype_hint: Some(dtype),
+            },
+        )
+        .unwrap(),
+    );
+    RetainedStaticAttentionRuntimeV2::new(
+        ModelInstanceId::new(NEXT_TEST_MODEL.fetch_add(1, Ordering::Relaxed)),
+        1,
+        &contract,
+        plan,
+        domain,
+        capacity,
+        device.clone(),
+    )
+    .unwrap()
+}
+
 fn next_identity(counter: &AtomicU64, label: &str) -> Result<u64> {
     counter
         .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -610,6 +795,120 @@ mod tests {
             )
             .unwrap(),
         }
+    }
+
+    /// A batch of sequences attends each row's own memory exactly as
+    /// `attend` does for that sequence alone, whatever the row order, and
+    /// one row is the single-sequence call. A sequence released and a slot
+    /// reused leave the other rows' outputs unchanged.
+    #[test]
+    fn batched_attention_matches_each_sequence_alone() {
+        let runtime = build_runtime(8, 4);
+        let sequences = (0..3)
+            .map(|index| {
+                let sequence = runtime.register_sequence().unwrap();
+                runtime
+                    .install(
+                        sequence,
+                        [index as u8 + 1; 32],
+                        vec![layer(index + 2, index as f32 * 3.0)],
+                    )
+                    .unwrap();
+                sequence
+            })
+            .collect::<Vec<_>>();
+        let rows = [sequences[2], sequences[0], sequences[1]];
+        let queries = Tensor::from_vec(
+            (0..3 * 4 * 2)
+                .map(|index| (index as f32 * 0.43).sin())
+                .collect::<Vec<_>>(),
+            (3, 4, 2),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let row = [StaticAttentionRaggedRow {
+            query_start: 0,
+            query_len: 1,
+        }];
+        let alone = |sequence, index: usize| {
+            runtime
+                .attend(
+                    sequence,
+                    0,
+                    &queries.narrow(0, index, 1).unwrap(),
+                    &row,
+                    0.5,
+                )
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let batch = runtime.prepare_batch(&rows).unwrap();
+        assert_eq!(batch.len(), 3);
+        let batched = batch.attend(0, &queries, 0.5).unwrap();
+        drop(batch);
+        for (index, sequence) in rows.iter().enumerate() {
+            assert_eq!(
+                batched
+                    .narrow(0, index, 1)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                alone(*sequence, index)
+            );
+        }
+        let single = runtime
+            .attend_batch(&rows[..1], 0, &queries.narrow(0, 0, 1).unwrap(), 0.5)
+            .unwrap();
+        assert_eq!(
+            single.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            alone(rows[0], 0)
+        );
+
+        runtime.release_sequence(sequences[0]).unwrap();
+        let replacement = runtime.register_sequence().unwrap();
+        runtime
+            .install(replacement, [9; 32], vec![layer(4, 40.0)])
+            .unwrap();
+        let rows = [sequences[2], replacement, sequences[1]];
+        let batched = runtime.attend_batch(&rows, 0, &queries, 0.5).unwrap();
+        for index in [0, 2] {
+            assert_eq!(
+                batched
+                    .narrow(0, index, 1)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                alone(rows[index], index)
+            );
+        }
+    }
+
+    #[test]
+    fn batch_rejects_repeated_released_and_uninstalled_sequences() {
+        let runtime = build_runtime(9, 3);
+        let installed = runtime.register_sequence().unwrap();
+        runtime
+            .install(installed, [1; 32], vec![layer(2, 0.0)])
+            .unwrap();
+        let empty = runtime.register_sequence().unwrap();
+        assert!(runtime.prepare_batch(&[]).is_err());
+        assert!(runtime.prepare_batch(&[installed, installed]).is_err());
+        assert!(runtime.prepare_batch(&[installed, empty]).is_err());
+        let foreign = build_runtime(10, 1);
+        let stranger = foreign.register_sequence().unwrap();
+        assert!(runtime.prepare_batch(&[installed, stranger]).is_err());
+        // A failed batch leaves no slot locked.
+        runtime.prepare_batch(&[installed]).unwrap();
+        runtime.release_sequence(empty).unwrap();
+        runtime.release_sequence(installed).unwrap();
+        assert!(runtime.prepare_batch(&[installed]).is_err());
     }
 
     #[test]

@@ -75,8 +75,11 @@ pub use cache::managed::{
 #[cfg(test)]
 pub(crate) use cache::physical::PhysicalStateManager;
 pub(crate) use cache::physical::{RetainedTensorStateRuntimeIdV2, RetainedTensorStateRuntimeV2};
+#[cfg(test)]
+pub(crate) use cache::retained_static_attention::test_retained_static_runtime;
 pub(crate) use cache::retained_static_attention::{
-    RetainedStaticAttentionRuntimeV2, RetainedStaticAttentionSequenceId,
+    RetainedStaticAttentionBatch, RetainedStaticAttentionRuntimeV2,
+    RetainedStaticAttentionSequenceId,
 };
 pub use cache::telemetry::ManagedKvTelemetrySnapshot;
 pub(crate) use config::backend_step_sizes;
@@ -3799,6 +3802,7 @@ impl Engine {
         contract: &crate::kv::v2::InferenceStateContract,
         static_domain: crate::kv::v2::StateDomainId,
         logical_context_tokens: Option<usize>,
+        rows: (usize, usize),
         minimum_tokens: u64,
     ) -> Result<Arc<CompositeRetainedStateRuntimeV2>> {
         self.with_core_on_device(Some(Some(model_instance)), |core| {
@@ -3807,6 +3811,7 @@ impl Engine {
                 contract,
                 static_domain,
                 logical_context_tokens,
+                rows,
                 minimum_tokens,
             )
         })
