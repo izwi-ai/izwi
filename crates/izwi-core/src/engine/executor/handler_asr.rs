@@ -316,7 +316,7 @@ fn asr_execution_route_plan(
     Ok(Arc::new(NativeExecutor::asr_route_plan(
         samples,
         sample_rate,
-        &capabilities()?,
+        &capabilities()?.for_request(request),
         request.streaming,
     )))
 }

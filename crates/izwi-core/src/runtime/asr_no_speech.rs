@@ -26,10 +26,13 @@ use crate::engine::{
 
 /// Whether the gate decides this request: offline ASR on a model family that
 /// hallucinates on non-speech, before its route is prepared. Realtime sessions
-/// receive audio incrementally and are not gated here.
+/// receive audio incrementally and are not gated here, nor is a long-form
+/// chunk row: its parent gated the whole input, and the sequential chunk
+/// route never gates a chunk.
 pub(crate) fn asr_no_speech_gate_applies(request: &EngineCoreRequest) -> bool {
     request.task_type == TaskType::ASR
         && !request.is_realtime_asr_session()
+        && !request.asr_chunk_row
         && request.prepared_asr_execution_shape().is_none()
         && request
             .model_variant

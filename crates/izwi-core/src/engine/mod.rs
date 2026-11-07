@@ -37,8 +37,11 @@ mod executor;
 pub(crate) use executor::CUDA_DISPATCH_SCRATCH_BYTES_PER_ROW;
 #[cfg(test)]
 pub(crate) use executor::qwen3_asr_requires_long_form;
+#[cfg(test)]
+pub(crate) use executor::AsrChunkPlannerKind;
 pub(crate) use executor::{
-    asr_route_plan, decode_request_audio_with_rate, AsrRouteCapabilities, PlannedAsrChunks,
+    asr_route_plan, decode_request_audio_with_rate, timestamp_words_json, AsrChunkTranscription,
+    AsrRouteCapabilities, ChunkedAsrRun, ChunkedAsrTranscription, NativeExecutor, PlannedAsrChunks,
 };
 pub mod metrics;
 mod output;

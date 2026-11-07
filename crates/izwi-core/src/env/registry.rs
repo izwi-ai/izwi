@@ -42,6 +42,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Sets the preferred long-form ASR chunk length in seconds before silence-split search; also used by diarization and LFM2.5.",
     ),
     CoreEnvVar::new(
+        "IZWI_ASR_LONG_FORM_FANOUT",
+        Flag,
+        "true",
+        Once,
+        "Transcribes a long file's chunks as concurrent requests (up to the ASR row width at once, committed in order) on Qwen3-ASR, Whisper, Nemotron ASR and Voxtral, so one file batches with itself and others wait at most one chunk; false runs each file's chunks one after another in one request.",
+    ),
+    CoreEnvVar::new(
         "IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS",
         Duration,
         "engine per-backend default",

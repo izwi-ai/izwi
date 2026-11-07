@@ -51,7 +51,12 @@ pub(crate) fn decode_request_audio_with_rate(
     audio::decode_request_audio_with_rate(request)
 }
 
-pub(crate) use audio::{AsrRouteCapabilities, PlannedAsrChunks};
+#[cfg(test)]
+pub(crate) use audio::AsrChunkPlannerKind;
+pub(crate) use audio::{
+    timestamp_words_json, AsrChunkTranscription, AsrRouteCapabilities, ChunkedAsrRun,
+    ChunkedAsrTranscription, PlannedAsrChunks,
+};
 
 /// Route plan for a request's audio; see [`NativeExecutor::asr_route_plan`].
 pub(crate) fn asr_route_plan(

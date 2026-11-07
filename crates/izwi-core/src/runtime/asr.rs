@@ -73,6 +73,7 @@ use crate::serve_runtime::{
 };
 use izwi_asr_toolkit::{clean_transcript_text, plan_audio_chunks, AsrLongFormConfig, AudioChunk};
 
+mod chunk_rows;
 mod realtime;
 mod realtime_push;
 mod realtime_session;
@@ -80,6 +81,7 @@ mod saa_seam;
 mod speaker_attribution;
 mod transcribe;
 mod translation_segments;
+pub(crate) use chunk_rows::chunk_row_permit_count;
 #[cfg(test)]
 pub(in crate::runtime) use translation_segments::{append_segment, plan_translation_segments, segment_wav};
 use realtime_push::{RealtimePush, RealtimePushBatcher, RealtimePushHolds, RealtimePushRow};
@@ -117,11 +119,15 @@ use speaker_attribution::{
 pub(super) enum AsrAudioInput<'a> {
     Base64(&'a str),
     Bytes(&'a [u8]),
+    /// Canonical 16 kHz mono samples already decoded (a long file's chunk
+    /// row), which the request neither encodes nor decodes.
+    Samples(&'a Arc<[f32]>),
 }
 
 enum OwnedAsrAudioInput {
     Base64(String),
     Bytes(Vec<u8>),
+    Samples(Arc<[f32]>),
 }
 
 impl AsrAudioInput<'_> {
@@ -129,6 +135,7 @@ impl AsrAudioInput<'_> {
         match self {
             Self::Base64(audio) => audio.len(),
             Self::Bytes(audio) => audio.len(),
+            Self::Samples(samples) => std::mem::size_of_val::<[f32]>(samples),
         }
     }
 
@@ -147,6 +154,16 @@ impl AsrAudioInput<'_> {
                 )))
             }
             Self::Bytes(_) => Ok(()),
+            Self::Samples(samples) if samples.is_empty() => Err(Error::InvalidInput(
+                "ASR request missing audio samples".to_string(),
+            )),
+            Self::Samples(samples) if self.input_bytes() > MAX_AUDIO_SOURCE_BYTES => {
+                Err(Error::InvalidInput(format!(
+                    "ASR audio is {} samples, exceeding the {MAX_AUDIO_SOURCE_BYTES}-byte source limit",
+                    samples.len()
+                )))
+            }
+            Self::Samples(_) => Ok(()),
         }
     }
 
@@ -158,6 +175,8 @@ impl AsrAudioInput<'_> {
             Self::Bytes(audio) => Ok(OwnedAsrAudioInput::Bytes(
                 copy_preparation_bytes(job, audio, "ASR encoded audio").await?,
             )),
+            // Shared, not copied: the caller hands over its own buffer.
+            Self::Samples(samples) => Ok(OwnedAsrAudioInput::Samples(samples.clone())),
         }
     }
 }
@@ -167,6 +186,7 @@ impl OwnedAsrAudioInput {
         match self {
             Self::Base64(audio) => audio.capacity(),
             Self::Bytes(audio) => audio.capacity(),
+            Self::Samples(samples) => std::mem::size_of_val::<[f32]>(samples),
         }
     }
 
@@ -177,6 +197,10 @@ impl OwnedAsrAudioInput {
                 decode_audio_bytes_canonical(&audio)
             }
             Self::Bytes(audio) => decode_audio_bytes_canonical(audio),
+            Self::Samples(samples) => Ok((
+                samples.to_vec(),
+                crate::runtime::audio_io::CANONICAL_SPEECH_SAMPLE_RATE,
+            )),
         }
     }
 
@@ -191,7 +215,7 @@ impl OwnedAsrAudioInput {
                     audio.len()
                 )))
             }
-            Self::Bytes(_) => Ok(()),
+            Self::Bytes(_) | Self::Samples(_) => Ok(()),
         }
     }
 }

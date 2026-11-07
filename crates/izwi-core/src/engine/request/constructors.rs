@@ -50,6 +50,7 @@ impl EngineCoreRequest {
             asr_auto_max_tokens: false,
             asr_native_word_timestamps: false,
             asr_task: AsrTaskOptions::default(),
+            asr_chunk_row: false,
             reference_audio: None,
             reference_text: None,
             reference_language: None,
@@ -122,6 +123,7 @@ impl EngineCoreRequest {
             asr_auto_max_tokens: false,
             asr_native_word_timestamps: false,
             asr_task: AsrTaskOptions::default(),
+            asr_chunk_row: false,
             reference_audio: None,
             reference_text: None,
             reference_language: None,
@@ -194,6 +196,7 @@ impl EngineCoreRequest {
             asr_auto_max_tokens: false,
             asr_native_word_timestamps: false,
             asr_task: AsrTaskOptions::default(),
+            asr_chunk_row: false,
             reference_audio: None,
             reference_text: None,
             reference_language: None,
@@ -218,6 +221,19 @@ impl EngineCoreRequest {
             tts_chunk_history: Vec::new(),
             tts_generated_codes: None,
         }
+    }
+
+    /// Create a new ASR request from canonical 16 kHz mono samples the
+    /// runtime already decoded ([`EngineAudioInput::Samples`]).
+    pub(crate) fn asr_samples(samples: Arc<[f32]>) -> Self {
+        let mut request = Self::asr_bytes(Vec::new());
+        request.audio_bytes = None;
+        request.task = EngineTask::Asr(AsrEngineInput {
+            audio: EngineAudioInput::Samples(samples),
+            language: None,
+            prompt: None,
+        });
+        request
     }
 
     /// Create a new chat request.
@@ -263,6 +279,7 @@ impl EngineCoreRequest {
             asr_auto_max_tokens: false,
             asr_native_word_timestamps: false,
             asr_task: AsrTaskOptions::default(),
+            asr_chunk_row: false,
             reference_audio: None,
             reference_text: None,
             reference_language: None,
@@ -333,6 +350,7 @@ impl EngineCoreRequest {
             asr_auto_max_tokens: false,
             asr_native_word_timestamps: false,
             asr_task: AsrTaskOptions::default(),
+            asr_chunk_row: false,
             reference_audio: None,
             reference_text: None,
             reference_language: None,
@@ -403,6 +421,7 @@ impl EngineCoreRequest {
             asr_auto_max_tokens: false,
             asr_native_word_timestamps: false,
             asr_task: AsrTaskOptions::default(),
+            asr_chunk_row: false,
             reference_audio: None,
             reference_text: None,
             reference_language: None,

@@ -104,6 +104,64 @@ fn prepared_asr_audio_is_arc_retained_exactly_and_rejects_source_drift() {
         .contains("changed after decoded-audio preparation"));
 }
 
+/// A request built from decoded samples (a long file's chunk row) decodes
+/// to exactly those samples at the canonical rate without an audio codec,
+/// canonicalizes as typed audio, and pins its prepared audio to them.
+#[test]
+fn asr_requests_from_decoded_samples_skip_the_audio_codec() {
+    let limits = DirectPayloadLimits {
+        audio_source_bytes: 64,
+        reference_source_bytes: 64,
+        reference_text_chars: 64,
+        metadata_bytes: 128,
+        collection_items: 64,
+    };
+    let variant = ModelVariant::Qwen3Asr06BGguf;
+    let samples: Arc<[f32]> = vec![0.25, -0.5, 0.75, 0.0].into();
+    let mut request = EngineCoreRequest::asr_samples(samples.clone()).with_model_variant(variant);
+    request
+        .canonicalize_direct_payloads_with_limits(limits)
+        .expect("samples canonicalize as typed audio");
+    assert_eq!(request.audio_samples_for_execution(), Some(&samples[..]));
+    assert!(request.audio_bytes_for_execution().is_none());
+    assert!(request.audio_base64_for_execution().is_none());
+    let (decoded, rate) = crate::engine::decode_request_audio_with_rate(&request).unwrap();
+    assert_eq!(decoded, samples.to_vec());
+    assert_eq!(rate, 16_000);
+    request
+        .install_prepared_asr_audio(variant, decoded, rate)
+        .unwrap();
+    request.prepared_asr_audio_for_executor().unwrap().unwrap();
+    // A clone shares the samples, so its prepared audio still matches.
+    request
+        .clone()
+        .prepared_asr_audio_for_executor()
+        .unwrap()
+        .unwrap();
+    // Other samples are another source.
+    request.task = EngineTask::Asr(AsrEngineInput {
+        audio: EngineAudioInput::Samples(vec![0.25, -0.5, 0.75, 1.0].into()),
+        language: None,
+        prompt: None,
+    });
+    assert!(request
+        .prepared_asr_audio_for_executor()
+        .unwrap_err()
+        .to_string()
+        .contains("changed after decoded-audio preparation"));
+    // Samples past the source limit are refused like an oversized upload.
+    let mut oversized = EngineCoreRequest::asr_samples(vec![0.0; 17].into());
+    assert!(oversized
+        .canonicalize_direct_payloads_with_limits(limits)
+        .unwrap_err()
+        .to_string()
+        .contains("source limit"));
+    // No samples are no audio.
+    let empty = EngineCoreRequest::asr_samples(Vec::new().into());
+    assert!(empty.audio_samples_for_execution().is_none());
+    assert!(crate::engine::decode_request_audio_with_rate(&empty).is_err());
+}
+
 #[test]
 fn prepared_asr_accessors_reuse_the_preparation_digest_of_the_upload() {
     let full_hashes = || super::ASR_SOURCE_AUDIO_FULL_HASHES.with(|count| count.get());

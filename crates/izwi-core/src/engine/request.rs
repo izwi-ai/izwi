@@ -195,6 +195,10 @@ impl WorkloadClass {
 pub enum EngineAudioInput {
     Base64(String),
     Bytes(Vec<u8>),
+    /// Canonical 16 kHz mono samples the runtime already decoded (one chunk
+    /// of a long file it transcribes as chunk rows), so the request neither
+    /// encodes nor decodes its audio.
+    Samples(Arc<[f32]>),
 }
 
 #[derive(Debug, Clone)]
@@ -781,6 +785,7 @@ impl DirectPayloadLimits {
 enum BorrowedEngineAudioInput<'a> {
     Base64(&'a String),
     Bytes(&'a Vec<u8>),
+    Samples(&'a Arc<[f32]>),
 }
 
 /// Which upload field a digest was computed from, and that buffer's address
@@ -788,7 +793,8 @@ enum BorrowedEngineAudioInput<'a> {
 /// the accessors then hash the new bytes in full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct AsrSourceAudioIdentity {
-    base64: bool,
+    /// 0 base64, 1 bytes, 2 samples.
+    representation: u8,
     address: usize,
     len: usize,
 }
@@ -797,12 +803,17 @@ impl AsrSourceAudioIdentity {
     fn of(audio: BorrowedEngineAudioInput<'_>) -> Self {
         match audio {
             BorrowedEngineAudioInput::Base64(value) => Self {
-                base64: true,
+                representation: 0,
                 address: value.as_ptr() as usize,
                 len: value.len(),
             },
             BorrowedEngineAudioInput::Bytes(value) => Self {
-                base64: false,
+                representation: 1,
+                address: value.as_ptr() as usize,
+                len: value.len(),
+            },
+            BorrowedEngineAudioInput::Samples(value) => Self {
+                representation: 2,
                 address: value.as_ptr() as usize,
                 len: value.len(),
             },
@@ -830,6 +841,13 @@ fn asr_source_audio_digest(audio: BorrowedEngineAudioInput<'_>) -> u64 {
             1_u8.hash(&mut hasher);
             value.as_slice().hash(&mut hasher);
         }
+        BorrowedEngineAudioInput::Samples(value) => {
+            2_u8.hash(&mut hasher);
+            value.len().hash(&mut hasher);
+            for sample in value.iter() {
+                hasher.write_u32(sample.to_bits());
+            }
+        }
     }
     hasher.finish()
 }
@@ -845,6 +863,7 @@ impl EngineAudioInput {
         match self {
             Self::Base64(value) => value.is_empty(),
             Self::Bytes(value) => value.is_empty(),
+            Self::Samples(value) => value.is_empty(),
         }
     }
 }
@@ -1096,6 +1115,11 @@ pub struct EngineCoreRequest {
     pub asr_native_word_timestamps: bool,
     /// Translation target and keyword list, for families that support them.
     pub asr_task: AsrTaskOptions,
+    /// One chunk of a long file the runtime transcribes as concurrent chunk
+    /// rows: it runs in one pass (it never chunks again), skips the
+    /// whole-input no-speech gate as a chunk of the sequential route does,
+    /// and counts in no request metric (its parent request counts once).
+    pub(crate) asr_chunk_row: bool,
     /// Reference audio for voice cloning (base64 encoded). Processing may move
     /// this buffer into [`Self::task`] and clear this field.
     pub reference_audio: Option<String>,

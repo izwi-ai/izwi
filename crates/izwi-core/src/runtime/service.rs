@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify, RwLock, Semaphore};
 use tokio::task::yield_now;
 use tracing::{debug, error, info_span, warn};
 
@@ -110,7 +110,7 @@ use crate::runtime::adapters::{
     LoadedCapabilityBinding, LoadedExecutionContract, LoadedModelBundle, RuntimeAdapterRegistry,
     StreamingRequirements,
 };
-use crate::runtime::asr::RealtimeAsrSessionPolicy;
+use crate::runtime::asr::{chunk_row_permit_count, RealtimeAsrSessionPolicy};
 use crate::runtime::asr_no_speech::{asr_no_speech_gate_applies, AsrNoSpeechGate};
 use crate::runtime::audio_io::decode_reference_audio_base64;
 use crate::runtime::broker::{InferenceBroker, InferenceBrokerObservation};
@@ -534,6 +534,9 @@ fn add_audio_input_allocation(
         EngineAudioInput::Base64(value) => add_owned_string_capacity(total, value, label),
         EngineAudioInput::Bytes(value) => {
             add_retained_allocation(total, value.capacity(), std::mem::size_of::<u8>(), label)
+        }
+        EngineAudioInput::Samples(value) => {
+            add_retained_allocation(total, value.len(), std::mem::size_of::<f32>(), label)
         }
     }
 }
@@ -971,6 +974,9 @@ pub struct RuntimeService {
     granite_speech_encoder_batcher: Arc<GraniteSpeechEncoderBatcher>,
     parakeet_encoder_batcher: Arc<ParakeetEncoderBatcher>,
     nemotron_encoder_batcher: Arc<NemotronEncoderBatcher>,
+    /// Long-form chunk rows in flight across every file (see
+    /// `asr::chunk_row_permit_count`).
+    pub(crate) asr_chunk_row_permits: Arc<Semaphore>,
     pub(super) asr_realtime_sessions: RealtimeAsrSessionPolicy,
     telemetry: Arc<RuntimeTelemetryCollector>,
     completion_waiters: Arc<RuntimeCompletionWaiters>,
@@ -991,6 +997,15 @@ pub(crate) struct AdmittedEngineRequest {
     request: EngineCoreRequest,
     job: JobLease,
     residency_lease: ModelResidencyLease,
+}
+
+impl AdmittedEngineRequest {
+    /// This request as one chunk of a long file its caller transcribes as
+    /// chunk rows (see `EngineCoreRequest::asr_chunk_row`).
+    pub(crate) fn into_asr_chunk_row(mut self) -> Self {
+        self.request.asr_chunk_row = true;
+        self
+    }
 }
 
 fn bind_request_to_residency(

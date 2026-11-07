@@ -3464,3 +3464,111 @@ fn qwen_tts_coordinator_reserves_request_max_output_exactly() {
     let (spec, _) = runtime.coordinator_job_for_request(&request).unwrap();
     assert_eq!(spec.resources, expected);
 }
+
+/// The total of a Prometheus series over all its label sets.
+fn prometheus_total(payload: &str, series: &str) -> f64 {
+    payload
+        .lines()
+        .filter(|line| line.starts_with(&format!("{series}{{")))
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
+        .sum()
+}
+
+fn asr_request_output(request_id: &str, input_audio_secs: f32) -> EngineOutput {
+    let mut output = OutputProcessor::new(16_000).process(
+        ExecutorOutput {
+            text: Some("words".to_string()),
+            ..ExecutorOutput::terminal(request_id.to_string())
+        },
+        0,
+        Duration::from_millis(50),
+    );
+    output.input_audio_duration_secs = Some(input_audio_secs);
+    output
+}
+
+/// A long file's chunk rows count in no request metric; their parent counts
+/// once, with the whole file's audio.
+#[tokio::test]
+async fn chunk_rows_count_once_in_the_request_metrics() {
+    let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+    let mut parent = EngineCoreRequest::asr_bytes(Vec::new());
+    parent.model_variant = Some(ModelVariant::Qwen3Asr06BGguf);
+    let metrics = runtime
+        .begin_composite_request_metrics(&parent, false)
+        .await
+        .expect("parent metrics");
+    for _ in 0..3 {
+        let mut row = parent.clone();
+        row.id = uuid::Uuid::new_v4().to_string();
+        row.asr_chunk_row = true;
+        runtime.observe_broker_request(&row).unwrap();
+        runtime.record_engine_output_observation(&row, &asr_request_output(&row.id, 30.0), false);
+        runtime.record_engine_error_observation(&row, false, "row failed");
+    }
+    metrics
+        .complete(&asr_request_output(&parent.id, 600.0))
+        .await;
+    let snapshot = runtime.telemetry_snapshot().await;
+    assert_eq!(snapshot.requests_queued, 1);
+    assert_eq!(snapshot.requests_completed, 1);
+    assert_eq!(snapshot.requests_failed, 0);
+    assert_eq!(snapshot.requests_active, 0);
+    let payload = runtime.telemetry_prometheus().await;
+    assert_eq!(
+        prometheus_total(&payload, "izwi_request_input_audio_seconds_count"),
+        1.0
+    );
+    assert_eq!(
+        prometheus_total(&payload, "izwi_request_input_audio_seconds_sum"),
+        600.0
+    );
+    assert_eq!(
+        prometheus_total(&payload, "izwi_request_duration_seconds_count"),
+        1.0
+    );
+}
+
+/// A parent that fails counts as failed, one that times out or is dropped
+/// unfinished as cancelled.
+#[tokio::test]
+async fn a_chunk_row_parent_counts_its_failure_once() {
+    let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+    let parent = || {
+        let mut parent = EngineCoreRequest::asr_bytes(Vec::new());
+        parent.model_variant = Some(ModelVariant::Qwen3Asr06BGguf);
+        parent
+    };
+    runtime
+        .begin_composite_request_metrics(&parent(), true)
+        .await
+        .unwrap()
+        .fail(&Error::InferenceError("row failed".into()))
+        .await;
+    let timed_out = parent();
+    runtime
+        .begin_composite_request_metrics(&timed_out, true)
+        .await
+        .unwrap()
+        .fail(&Error::Timeout(timed_out.id.clone()))
+        .await;
+    drop(
+        runtime
+            .begin_composite_request_metrics(&parent(), false)
+            .await
+            .unwrap(),
+    );
+    // The drop records its cancellation on a task of its own.
+    for _ in 0..100 {
+        if runtime.telemetry_snapshot().await.requests_active == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let snapshot = runtime.telemetry_snapshot().await;
+    assert_eq!(snapshot.requests_queued, 3);
+    assert_eq!(snapshot.requests_completed, 3);
+    assert_eq!(snapshot.requests_failed, 1);
+    assert_eq!(snapshot.requests_cancelled, 2);
+    assert_eq!(snapshot.requests_active, 0);
+}

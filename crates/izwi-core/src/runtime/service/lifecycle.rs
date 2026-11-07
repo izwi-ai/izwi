@@ -335,6 +335,10 @@ impl RuntimeService {
             .max_loaded_models
             .or_else(|| positive_usize_env("IZWI_MAX_LOADED_MODELS"));
 
+        let asr_chunk_row_permits = Arc::new(Semaphore::new(chunk_row_permit_count(
+            non_chat_row_width,
+            config.max_queued_requests,
+        )));
         Ok(Self {
             config,
             cache_policy,
@@ -352,6 +356,7 @@ impl RuntimeService {
             granite_speech_encoder_batcher,
             parakeet_encoder_batcher,
             nemotron_encoder_batcher,
+            asr_chunk_row_permits,
             asr_realtime_sessions,
             telemetry: Arc::new(RuntimeTelemetryCollector::new(2048)),
             completion_waiters: Arc::new(Mutex::new(HashMap::new())),
