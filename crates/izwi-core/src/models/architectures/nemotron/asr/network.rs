@@ -100,7 +100,7 @@ pub(super) fn default_realtime_state_shape() -> NemotronRealtimeStateShape {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct NemotronDecodeStats {
     pub encoded_frames: usize,
     pub emitted_tokens: usize,
@@ -1037,6 +1037,158 @@ impl NemotronNetwork {
         Ok(projection)
     }
 
+    /// Retained RNNT rows for inputs of `encoded_lens` encoder frames, each
+    /// with its predictor after the blank start symbol: one predictor step
+    /// for every row.
+    pub(super) fn start_rnnt_rows(&self, encoded_lens: &[usize]) -> Result<Vec<NemotronRnntRow>> {
+        let batch = encoded_lens.len();
+        if batch == 0 {
+            return Err(Error::InvalidInput(
+                "Nemotron RNNT rows need at least one input".into(),
+            ));
+        }
+        let device = self.predictor.embed.device();
+        let mut cohort = self.predictor.initial_state(batch, device)?;
+        let outputs =
+            self.predictor
+                .step_batch(&vec![self.blank_idx; batch], &mut cohort, device)?;
+        let projections = self.joint.project_predictor(&outputs)?;
+        encoded_lens
+            .iter()
+            .enumerate()
+            .map(|(row, encoded_len)| {
+                Ok(NemotronRnntRow {
+                    predictor: cohort.row(row)?,
+                    projection: projections.narrow(0, row, 1)?.contiguous()?,
+                    t: 0,
+                    symbols_this_frame: 0,
+                    token_ids: Vec::new(),
+                    stats: NemotronDecodeStats {
+                        encoded_frames: *encoded_len,
+                        max_symbols_per_frame: self.max_symbols_per_frame,
+                        ..Default::default()
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// One joint step of every row at its cursor, as the greedy decode takes
+    /// it, with one readback of every row's label: a blank moves a row to its
+    /// next frame; a label is emitted and steps the row's predictor (one
+    /// predictor call for every emitting row), and a row that has emitted
+    /// `max_symbols_per_frame` labels on its frame moves on. Returns the
+    /// label each row emitted. No row changes unless every row's step
+    /// succeeds.
+    pub(super) fn rnnt_joint_step_batch(
+        &self,
+        rows: &mut [NemotronRnntBatchRow<'_>],
+    ) -> Result<Vec<Option<usize>>> {
+        let width = rows.len();
+        if width == 0 {
+            return Err(Error::InvalidInput("Nemotron RNNT step has no rows".into()));
+        }
+        let encoder_rows = rows
+            .iter()
+            .map(|row| {
+                if row.state.t >= row.encoded_len {
+                    return Err(Error::InferenceError(
+                        "Nemotron retained RNNT cursor passed its last encoder frame".into(),
+                    ));
+                }
+                row.projection
+                    .narrow(0, row.state.t, 1)
+                    .map_err(Error::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let encoder_rows = Tensor::cat(&encoder_rows, 0)?.unsqueeze(1)?;
+        let predictor_rows = rows
+            .iter()
+            .map(|row| &row.state.projection)
+            .collect::<Vec<_>>();
+        let predictor_rows = Tensor::cat(&predictor_rows, 0)?;
+        let logits = self
+            .joint
+            .joint_from_projections(&encoder_rows, &predictor_rows)?;
+        let classes = logits.dim(D::Minus1)?;
+        let logits = logits.reshape((width, classes))?;
+        let device_read = argmax_uses_device(&logits);
+        // One device-to-host read for every row's label.
+        let labels = crate::kernels::greedy::greedy(&logits)?
+            .into_iter()
+            .map(|(label, _margin)| label as usize)
+            .collect::<Vec<_>>();
+        if labels.len() != width {
+            return Err(Error::InferenceError(
+                "Nemotron RNNT step read back the wrong row count".into(),
+            ));
+        }
+        if let Some(label) = labels.iter().find(|label| **label > self.blank_idx) {
+            return Err(Error::InferenceError(format!(
+                "Nemotron RNNT emitted invalid label {label}; blank_idx={}",
+                self.blank_idx
+            )));
+        }
+        let emitting = (0..width)
+            .filter(|row| labels[*row] != self.blank_idx)
+            .collect::<Vec<_>>();
+        let stepped = if emitting.is_empty() {
+            Vec::new()
+        } else {
+            let selected = emitting
+                .iter()
+                .map(|row| &rows[*row].state.predictor)
+                .collect::<Vec<_>>();
+            let mut cohort = PredictorState::gather_rows(&selected)?;
+            let emitted_labels = emitting.iter().map(|row| labels[*row]).collect::<Vec<_>>();
+            let outputs = self.predictor.step_batch(
+                &emitted_labels,
+                &mut cohort,
+                self.predictor.embed.device(),
+            )?;
+            let projections = self.joint.project_predictor(&outputs)?;
+            (0..emitting.len())
+                .map(|index| {
+                    Ok((
+                        cohort.row(index)?,
+                        projections.narrow(0, index, 1)?.contiguous()?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let mut stepped = stepped.into_iter();
+        let mut emitted = vec![None; width];
+        for (index, row) in rows.iter_mut().enumerate() {
+            let state = &mut *row.state;
+            state.stats.joint_steps = state.stats.joint_steps.saturating_add(1);
+            if device_read {
+                state.stats.device_argmax_reads = state.stats.device_argmax_reads.saturating_add(1);
+            } else {
+                state.stats.host_argmax_reads = state.stats.host_argmax_reads.saturating_add(1);
+            }
+            let label = labels[index];
+            if label == self.blank_idx {
+                state.stats.blank_frames = state.stats.blank_frames.saturating_add(1);
+                state.advance_frame();
+                continue;
+            }
+            let (predictor, projection) = stepped.next().ok_or_else(|| {
+                Error::InferenceError("Nemotron RNNT step lost an emitting row".into())
+            })?;
+            state.predictor = predictor;
+            state.projection = projection;
+            state.token_ids.push(label);
+            state.stats.emitted_tokens = state.token_ids.len();
+            state.symbols_this_frame = state.symbols_this_frame.saturating_add(1);
+            if state.symbols_this_frame >= self.max_symbols_per_frame {
+                state.stats.guard_exits = state.stats.guard_exits.saturating_add(1);
+                state.advance_frame();
+            }
+            emitted[index] = Some(label);
+        }
+        Ok(emitted)
+    }
+
     pub(super) fn start_rnnt_stream(
         &self,
         max_output_tokens: usize,
@@ -1694,6 +1846,50 @@ pub(super) struct NemotronStreamingEncoderChunk {
     pub frames: usize,
     pub total_ready_frames: usize,
     pub is_final: bool,
+}
+
+/// One request's retained RNNT greedy decode between scheduler steps: the
+/// predictor after its last emitted label, that output's joint projection
+/// and the cursor over the encoder frames.
+#[derive(Clone)]
+pub(super) struct NemotronRnntRow {
+    predictor: PredictorState,
+    /// `[1, 1, JOINT_HIDDEN]`: the joint projection of the predictor output.
+    projection: Tensor,
+    /// The encoder frame the next joint step reads.
+    t: usize,
+    /// Labels emitted on frame `t` so far.
+    symbols_this_frame: usize,
+    token_ids: Vec<usize>,
+    stats: NemotronDecodeStats,
+}
+
+impl NemotronRnntRow {
+    fn advance_frame(&mut self) {
+        self.t = self.t.saturating_add(1);
+        self.symbols_this_frame = 0;
+    }
+
+    /// The encoder frame the next joint step reads.
+    pub(super) const fn cursor(&self) -> usize {
+        self.t
+    }
+
+    pub(super) fn token_ids(&self) -> &[usize] {
+        &self.token_ids
+    }
+
+    pub(super) const fn stats(&self) -> &NemotronDecodeStats {
+        &self.stats
+    }
+}
+
+/// One row of a retained RNNT step: its encoder projection
+/// `[encoded_len, JOINT_HIDDEN]` and its decode.
+pub(super) struct NemotronRnntBatchRow<'a> {
+    pub projection: &'a Tensor,
+    pub encoded_len: usize,
+    pub state: &'a mut NemotronRnntRow,
 }
 
 #[derive(Clone)]
@@ -3553,6 +3749,63 @@ pub(super) struct PredictorState {
     c1: Option<Tensor>,
 }
 
+impl PredictorState {
+    fn components(&self) -> Result<[&Tensor; 4]> {
+        fn required<'a>(value: &'a Option<Tensor>, name: &str) -> Result<&'a Tensor> {
+            value.as_ref().ok_or_else(|| {
+                Error::InferenceError(format!("Nemotron predictor {name} is not hydrated"))
+            })
+        }
+        Ok([
+            required(&self.h0, "h0")?,
+            required(&self.c0, "c0")?,
+            required(&self.h1, "h1")?,
+            required(&self.c1, "c1")?,
+        ])
+    }
+
+    /// The rows' states stacked into one batch, in order.
+    fn gather_rows(rows: &[&Self]) -> Result<Self> {
+        if rows.is_empty() {
+            return Err(Error::InvalidInput(
+                "Nemotron predictor cohort cannot be empty".into(),
+            ));
+        }
+        let components = rows
+            .iter()
+            .map(|row| row.components())
+            .collect::<Result<Vec<_>>>()?;
+        let gather = |index: usize| {
+            let parts = components.iter().map(|row| row[index]).collect::<Vec<_>>();
+            Tensor::cat(&parts, 0).map(Some).map_err(Error::from)
+        };
+        Ok(Self {
+            h0: gather(0)?,
+            c0: gather(1)?,
+            h1: gather(2)?,
+            c1: gather(3)?,
+        })
+    }
+
+    /// Row `row` of a batch state, in its own storage.
+    fn row(&self, row: usize) -> Result<Self> {
+        let [h0, c0, h1, c1] = self.components()?;
+        let take = |value: &Tensor| {
+            value
+                .narrow(0, row, 1)
+                .and_then(|value| value.contiguous())
+                .map(Some)
+                .map_err(Error::from)
+        };
+        Ok(Self {
+            h0: take(h0)?,
+            c0: take(c0)?,
+            h1: take(h1)?,
+            c1: take(c1)?,
+        })
+    }
+}
+
 impl Predictor {
     fn load(vb: VarBuilder) -> Result<Self> {
         let embed = vb.pp("embed").get_unchecked_dtype("weight", vb.dtype())?;
@@ -4339,7 +4592,7 @@ fn normalize_per_feature(mel: &mut [f32], n_mels: usize, frames: usize, valid_fr
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -4600,7 +4853,10 @@ mod tests {
         }
     }
 
-    fn rnnt_test_network(output_bias: Vec<f32>, max_symbols_per_frame: usize) -> NemotronNetwork {
+    pub(in super::super) fn rnnt_test_network(
+        output_bias: Vec<f32>,
+        max_symbols_per_frame: usize,
+    ) -> NemotronNetwork {
         let device = Device::Cpu;
         let vocab_plus_blank = output_bias.len();
         NemotronNetwork {
@@ -4696,7 +4952,11 @@ mod tests {
             .collect()
     }
 
-    fn hashed_tensor<S: Into<candle_core::Shape>>(seed: u32, shape: S, scale: f32) -> Tensor {
+    pub(in super::super) fn hashed_tensor<S: Into<candle_core::Shape>>(
+        seed: u32,
+        shape: S,
+        scale: f32,
+    ) -> Tensor {
         let shape = shape.into();
         let values = hashed_values(seed, shape.elem_count(), scale);
         Tensor::from_vec(values, shape, &Device::Cpu).unwrap()
@@ -6187,5 +6447,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An RNNT predictor and joint with hashed weights over
+    /// `vocab_plus_blank` classes (blank last), whose labels follow the
+    /// encoder frames and the emitted history; `blank_bias` shifts how often
+    /// the blank wins.
+    pub(in super::super) fn hashed_rnnt_network(
+        vocab_plus_blank: usize,
+        max_symbols_per_frame: usize,
+        blank_bias: f32,
+    ) -> NemotronNetwork {
+        let mut network = rnnt_test_network(vec![0.0; vocab_plus_blank], max_symbols_per_frame);
+        let lstm = |seed: u32| LstmCell {
+            w_ih: hashed_tensor(seed, (PRED_HIDDEN * 4, PRED_HIDDEN), 1.0 / 16.0),
+            w_hh: hashed_tensor(seed + 1, (PRED_HIDDEN * 4, PRED_HIDDEN), 1.0 / 16.0),
+            b_ih: hashed_tensor(seed + 2, PRED_HIDDEN * 4, 0.1),
+            b_hh: hashed_tensor(seed + 3, PRED_HIDDEN * 4, 0.1),
+            cuda_views: None,
+        };
+        network.predictor = Predictor {
+            embed: hashed_tensor(700, (vocab_plus_blank, PRED_HIDDEN), 1.0),
+            lstm_l0: lstm(710),
+            lstm_l1: lstm(720),
+            blank_idx: vocab_plus_blank - 1,
+        };
+        let mut out_bias = hashed_values(733, vocab_plus_blank, 0.25);
+        out_bias[vocab_plus_blank - 1] += blank_bias;
+        network.joint = Joint {
+            pred: Linear::new(
+                hashed_tensor(730, (JOINT_HIDDEN, PRED_HIDDEN), 1.0 / 8.0),
+                Some(hashed_tensor(731, JOINT_HIDDEN, 0.1)),
+            ),
+            enc: Linear::new(
+                hashed_tensor(732, (JOINT_HIDDEN, ENCODER_DIM), 1.0 / 16.0),
+                Some(hashed_tensor(734, JOINT_HIDDEN, 0.1)),
+            ),
+            out: Linear::new(
+                hashed_tensor(735, (vocab_plus_blank, JOINT_HIDDEN), 1.0 / 4.0),
+                Some(Tensor::from_vec(out_bias, vocab_plus_blank, &Device::Cpu).unwrap()),
+            ),
+        };
+        network
+    }
+
+    /// The joint encoder projection `[T, JOINT_HIDDEN]` of `encoded`
+    /// `[1, T, D]`, as the offline encode stores it.
+    pub(in super::super) fn joint_encoder_projection(
+        network: &NemotronNetwork,
+        encoded: &Tensor,
+    ) -> Tensor {
+        network
+            .joint
+            .project_encoder(&encoded.squeeze(0).unwrap())
+            .unwrap()
     }
 }

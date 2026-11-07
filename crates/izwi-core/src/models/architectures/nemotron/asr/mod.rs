@@ -42,8 +42,9 @@ pub(crate) use nemo::{nemotron_checkpoint_paths, nemotron_native_artifacts_compl
 use network::{
     causal_subsampled_len, default_realtime_state_shape, resample_linear,
     resample_linear_output_len, NemotronEncodeProfile, NemotronEncoderBatchInput, NemotronHostMel,
-    NemotronNetwork, NemotronRealtimeStateShape, NemotronRnntStreamState,
-    NemotronStreamingEncoderState, NemotronStreamingFeatureState, NemotronStreamingPreEncodeState,
+    NemotronNetwork, NemotronRealtimeStateShape, NemotronRnntBatchRow, NemotronRnntRow,
+    NemotronRnntStreamState, NemotronStreamingEncoderState, NemotronStreamingFeatureState,
+    NemotronStreamingPreEncodeState,
 };
 pub(crate) use network::{nemotron_stem_bytes, NEMOTRON_MODEL_MEMO_MAX_BYTES};
 pub(crate) use physical::NemotronOfflinePhysicalStateSpec;
@@ -1760,6 +1761,122 @@ pub(crate) struct NemotronEncoderBatchRow<'a> {
     pub(crate) checkpoint: &'a dyn Fn() -> Result<()>,
 }
 
+/// One request's retained offline RNNT decode between scheduler steps.
+#[derive(Clone)]
+pub(crate) struct NemotronRetainedDecodeState {
+    rnnt: NemotronRnntRow,
+    detokenizer: IncrementalDetokenizer,
+    assembled: String,
+    finished: bool,
+    stop_reason: Option<&'static str>,
+}
+
+pub(crate) struct NemotronRetainedDecodeBatchRow<'a> {
+    pub(crate) artifact: &'a NemotronPreparedEncoderArtifact,
+    pub(crate) state: &'a mut NemotronRetainedDecodeState,
+    /// The request's decode budget. The scheduler stops scheduling a row at
+    /// this many tokens, so the row must finish here rather than strand.
+    pub(crate) max_tokens: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NemotronRetainedDecodeStep {
+    pub(crate) delta: String,
+    pub(crate) text: String,
+    pub(crate) tokens_generated: usize,
+    pub(crate) finished: bool,
+}
+
+/// Retained decodes of `artifacts`, each predictor after the blank start
+/// symbol, started with one predictor call.
+fn start_retained_decode_rows(
+    network: &NemotronNetwork,
+    artifacts: &[&NemotronPreparedEncoderArtifact],
+) -> Result<Vec<NemotronRetainedDecodeState>> {
+    let encoded_lens = artifacts
+        .iter()
+        .map(|artifact| artifact.encoded_len)
+        .collect::<Vec<_>>();
+    Ok(network
+        .start_rnnt_rows(&encoded_lens)?
+        .into_iter()
+        .map(|rnnt| NemotronRetainedDecodeState {
+            rnnt,
+            detokenizer: IncrementalDetokenizer::new(),
+            assembled: String::new(),
+            finished: false,
+            stop_reason: None,
+        })
+        .collect())
+}
+
+/// One scheduler step of retained RNNT greedy decodes: joint steps run for
+/// every row together until a row emits a label or finishes, so each row
+/// emits at most one label per step and blank frames cost no scheduler
+/// round. A row finishes when its cursor passes its last frame, or at its
+/// decode budget (`stop_reason` "max_tokens"). An error restores every row.
+fn retained_decode_step_rows(
+    network: &NemotronNetwork,
+    decode_text: &dyn Fn(&[usize]) -> String,
+    rows: &mut [NemotronRetainedDecodeBatchRow<'_>],
+) -> Result<Vec<NemotronRetainedDecodeStep>> {
+    if rows.is_empty() || rows.iter().any(|row| row.state.finished) {
+        return Err(Error::InvalidInput(
+            "Nemotron retained cohort requires live rows".into(),
+        ));
+    }
+    let max_symbols = network.realtime_state_shape().max_symbols_per_frame;
+    let checkpoints = rows.iter().map(|row| row.state.clone()).collect::<Vec<_>>();
+    let result = (|| loop {
+        let mut joint_rows = rows
+            .iter_mut()
+            .map(|row| NemotronRnntBatchRow {
+                projection: &row.artifact.projection,
+                encoded_len: row.artifact.encoded_len,
+                state: &mut row.state.rnnt,
+            })
+            .collect::<Vec<_>>();
+        let emitted = network.rnnt_joint_step_batch(&mut joint_rows)?;
+        drop(joint_rows);
+        let mut steps = Vec::with_capacity(rows.len());
+        for row in rows.iter_mut() {
+            let state = &mut *row.state;
+            let decode = |ids: &[usize]| Ok(decode_text(ids));
+            let mut delta = state.detokenizer.step(state.rnnt.token_ids(), decode)?;
+            let tokens = state.rnnt.token_ids().len();
+            let encoded_len = row.artifact.encoded_len;
+            // Every frame emitting `max_symbols` labels exhausts the input as
+            // surely as the cursor passing its end does.
+            let exhausted = state.rnnt.cursor() >= encoded_len
+                || tokens >= encoded_len.saturating_mul(max_symbols);
+            let budget_reached = !exhausted && tokens >= row.max_tokens.max(1);
+            if budget_reached {
+                state.stop_reason = Some("max_tokens");
+            }
+            state.finished = exhausted || budget_reached;
+            if state.finished {
+                delta.push_str(&state.detokenizer.finish(state.rnnt.token_ids(), decode)?);
+            }
+            state.assembled.push_str(&delta);
+            steps.push(NemotronRetainedDecodeStep {
+                delta,
+                text: state.assembled.clone(),
+                tokens_generated: tokens,
+                finished: state.finished,
+            });
+        }
+        if emitted.iter().any(Option::is_some) || steps.iter().any(|step| step.finished) {
+            break Ok(steps);
+        }
+    })();
+    if result.is_err() {
+        for (row, checkpoint) in rows.iter_mut().zip(checkpoints) {
+            *row.state = checkpoint;
+        }
+    }
+    result
+}
+
 /// Upper bound on the labels RNNT greedy decoding can emit: at most
 /// `max_symbols` per encoder frame, so `E × max_symbols` bounds every
 /// transcript of this input.
@@ -2381,6 +2498,71 @@ impl NemotronAsrModel {
             .into_iter()
             .map(|outcome| outcome.expect("every Nemotron batch row has an outcome"))
             .collect())
+    }
+
+    /// Starts the retained decodes of `artifacts` with one predictor call.
+    pub(crate) fn start_retained_decode_batch(
+        &self,
+        artifacts: &[&NemotronPreparedEncoderArtifact],
+    ) -> Result<Vec<NemotronRetainedDecodeState>> {
+        start_retained_decode_rows(&self.network, artifacts)
+    }
+
+    pub(crate) const fn retained_decode_finished(state: &NemotronRetainedDecodeState) -> bool {
+        state.finished
+    }
+
+    /// One scheduler step of retained decodes; see
+    /// [`retained_decode_step_rows`].
+    pub(crate) fn retained_decode_step_batch(
+        &self,
+        rows: &mut [NemotronRetainedDecodeBatchRow<'_>],
+    ) -> Result<Vec<NemotronRetainedDecodeStep>> {
+        retained_decode_step_rows(&self.network, &|ids| self.decoder.decode(ids), rows)
+    }
+
+    /// The transcription of a finished retained decode.
+    pub(crate) fn retained_decode_output(
+        &self,
+        artifact: &NemotronPreparedEncoderArtifact,
+        state: &NemotronRetainedDecodeState,
+    ) -> NemotronAsrTranscriptionOutput {
+        let mut diagnostics = json!({
+            "audio": {
+                "input_sample_rate": artifact.input_sample_rate,
+                "target_sample_rate": self.runtime_plan.sample_rate,
+                "input_samples": artifact.input_samples,
+                "resampled_samples": artifact.resampled_samples,
+                "acoustic_frames": artifact.feature_frames,
+            },
+            "encode": {
+                "feature_frames": artifact.feature_frames,
+                "encoded_frames": artifact.encoded_len,
+                "encoder_batch_rows": artifact.batch_rows,
+            },
+            "prompt": artifact.prompt.diagnostics(),
+            "prompt_id": artifact.prompt_id,
+            "blank_id": self.network.blank_idx(),
+            "dtype_plan": nemotron_dtype_diagnostics(&self.dtype_selection, &self.device_profile, self.network.dtype(), &self.weight_precision),
+            "native_forward_status": "enabled_offline_fastconformer_rnnt",
+            "decode_mode": "retained_continuous",
+            "decode": state.rnnt.stats().diagnostics(),
+            "timings_ms": {
+                "mel_prepare": artifact.feature_ms,
+                "audio_encode": artifact.encode_ms,
+                "encode_ms": artifact.encode_ms,
+                "detokenized_tokens": state.detokenizer.decoded_tokens(),
+            },
+            "supports_realtime_cache_decode": true,
+        });
+        if let Some(stop_reason) = state.stop_reason {
+            diagnostics["stop_reason"] = stop_reason.into();
+        }
+        NemotronAsrTranscriptionOutput {
+            text: state.assembled.clone(),
+            language: Some(artifact.prompt.target_lang.clone()),
+            diagnostics: Some(diagnostics),
+        }
     }
 
     fn encoder_batch_input(
@@ -4582,5 +4764,224 @@ mod tests {
             .all(|events| events.iter().any(|event| !event.text.is_empty())));
         assert_eq!(together[0], solo[0], "test.wav pushed with fox.wav");
         assert_eq!(together[1], solo[1], "fox.wav pushed with test.wav");
+    }
+
+    use super::network::tests::{
+        hashed_rnnt_network, hashed_tensor, joint_encoder_projection, rnnt_test_network,
+    };
+
+    fn rnnt_text(ids: &[usize]) -> String {
+        ids.iter().map(|id| format!("<{id}>")).collect()
+    }
+
+    /// The artifact of hashed encoder frames `[1, len, D]` (seed `seed`).
+    fn rnnt_artifact(
+        network: &NemotronNetwork,
+        seed: u32,
+        len: usize,
+    ) -> (Tensor, NemotronPreparedEncoderArtifact) {
+        let encoded = hashed_tensor(seed, (1, len, 1024), 1.0);
+        let projection = joint_encoder_projection(network, &encoded);
+        let artifact = NemotronPreparedEncoderArtifact {
+            projection,
+            encoded_len: len,
+            input_samples: len * 1280,
+            input_sample_rate: SAMPLE_RATE,
+            resampled_samples: len * 1280,
+            feature_frames: len * 8,
+            prompt: NemotronPromptCondition::resolve(None, None).unwrap(),
+            prompt_id: 0,
+            feature_ms: 0.0,
+            encode_ms: 0.0,
+            batch_rows: 1,
+        };
+        (encoded, artifact)
+    }
+
+    /// Runs retained decodes to the end, stepping only unfinished rows as
+    /// the scheduler does, and returns each row's state, streamed text and
+    /// the steps it took.
+    fn run_retained(
+        network: &NemotronNetwork,
+        artifacts: &[&NemotronPreparedEncoderArtifact],
+        max_tokens: &[usize],
+    ) -> (Vec<NemotronRetainedDecodeState>, Vec<String>, Vec<usize>) {
+        let mut states = start_retained_decode_rows(network, artifacts).unwrap();
+        let mut streamed = vec![String::new(); states.len()];
+        let mut steps_taken = vec![0usize; states.len()];
+        loop {
+            let live = (0..states.len())
+                .filter(|row| !states[*row].finished)
+                .collect::<Vec<_>>();
+            if live.is_empty() {
+                break;
+            }
+            let before = live
+                .iter()
+                .map(|row| states[*row].rnnt.token_ids().len())
+                .collect::<Vec<_>>();
+            let mut rows = states
+                .iter_mut()
+                .enumerate()
+                .filter(|(_, state)| !state.finished)
+                .map(|(row, state)| NemotronRetainedDecodeBatchRow {
+                    artifact: artifacts[row],
+                    state,
+                    max_tokens: max_tokens[row],
+                })
+                .collect::<Vec<_>>();
+            let steps = retained_decode_step_rows(network, &rnnt_text, &mut rows).unwrap();
+            drop(rows);
+            assert_eq!(steps.len(), live.len());
+            for ((row, step), before) in live.iter().zip(steps).zip(before) {
+                // A step emits at most one label per row.
+                assert!(step.tokens_generated <= before + 1);
+                assert_eq!(step.tokens_generated, states[*row].rnnt.token_ids().len());
+                assert_eq!(step.finished, states[*row].finished);
+                streamed[*row].push_str(&step.delta);
+                assert_eq!(step.text, streamed[*row]);
+                steps_taken[*row] += 1;
+            }
+        }
+        (states, streamed, steps_taken)
+    }
+
+    /// Retained rows of different lengths, stepped together, decode every
+    /// row's tokens and stats exactly as the greedy decode of that row
+    /// alone: blanks, emissions and guard exits at `max_symbols`.
+    #[test]
+    fn retained_decode_rows_match_the_greedy_decode_of_each_row() {
+        let network = hashed_rnnt_network(6, 2, 0.4);
+        let rows = [(11u32, 9usize), (12, 4), (13, 17), (14, 1)]
+            .into_iter()
+            .map(|(seed, len)| rnnt_artifact(&network, seed, len))
+            .collect::<Vec<_>>();
+        let artifacts = rows
+            .iter()
+            .map(|(_, artifact)| artifact)
+            .collect::<Vec<_>>();
+        let (states, streamed, _) = run_retained(&network, &artifacts, &[usize::MAX; 4]);
+        let (mut blanks, mut emitted, mut guards) = (0, 0, 0);
+        for ((encoded, artifact), (state, streamed)) in
+            rows.iter().zip(states.iter().zip(&streamed))
+        {
+            let solo = network
+                .decode_rnnt_greedy(encoded, artifact.encoded_len, &mut |_| {})
+                .unwrap();
+            assert_eq!(state.rnnt.token_ids(), solo.token_ids.as_slice());
+            assert_eq!(state.rnnt.stats(), &solo.stats);
+            assert_eq!(streamed, &rnnt_text(&solo.token_ids));
+            assert_eq!(state.assembled, *streamed);
+            assert_eq!(state.stop_reason, None);
+            blanks += solo.stats.blank_frames;
+            emitted += solo.stats.emitted_tokens;
+            guards += solo.stats.guard_exits;
+        }
+        // The fixture exercises every RNNT transition.
+        assert!(
+            blanks > 0 && emitted > 0 && guards > 0,
+            "{blanks} {emitted} {guards}"
+        );
+    }
+
+    /// A label every frame emits `max_symbols` labels per frame and guard
+    /// exits each frame; all-blank decodes take no step per frame.
+    #[test]
+    fn retained_decode_forced_emissions_and_blanks_match_the_greedy_decode() {
+        for (bias, max_symbols) in [
+            (vec![0.0, 2.0, 1.0, -1.0], 3usize),
+            (vec![0.0, 1.0, 0.5, 4.0], 2),
+        ] {
+            let network = rnnt_test_network(bias, max_symbols);
+            let rows = [(21u32, 5usize), (22, 2)]
+                .into_iter()
+                .map(|(seed, len)| rnnt_artifact(&network, seed, len))
+                .collect::<Vec<_>>();
+            let artifacts = rows
+                .iter()
+                .map(|(_, artifact)| artifact)
+                .collect::<Vec<_>>();
+            let (states, _, steps) = run_retained(&network, &artifacts, &[usize::MAX; 2]);
+            for ((encoded, artifact), state) in rows.iter().zip(&states) {
+                let solo = network
+                    .decode_rnnt_greedy(encoded, artifact.encoded_len, &mut |_| {})
+                    .unwrap();
+                assert_eq!(state.rnnt.token_ids(), solo.token_ids.as_slice());
+                assert_eq!(state.rnnt.stats(), &solo.stats);
+            }
+            if states[0].rnnt.token_ids().is_empty() {
+                // Blank frames cost no step: the first step ends when the
+                // short row finishes, the second finishes the long one.
+                assert_eq!(steps, [2, 1]);
+            } else {
+                assert_eq!(states[0].rnnt.stats().guard_exits, 5);
+                assert_eq!(states[0].rnnt.token_ids(), vec![1; 5 * max_symbols]);
+            }
+        }
+    }
+
+    /// A row stops at its decode budget with the greedy decode's first
+    /// tokens and "max_tokens", while its peers decode to the end.
+    #[test]
+    fn retained_decode_stops_at_max_tokens() {
+        let network = hashed_rnnt_network(6, 2, 0.4);
+        let rows = [(13u32, 17usize), (11, 9)]
+            .into_iter()
+            .map(|(seed, len)| rnnt_artifact(&network, seed, len))
+            .collect::<Vec<_>>();
+        let artifacts = rows
+            .iter()
+            .map(|(_, artifact)| artifact)
+            .collect::<Vec<_>>();
+        let solo = rows
+            .iter()
+            .map(|(encoded, artifact)| {
+                network
+                    .decode_rnnt_greedy(encoded, artifact.encoded_len, &mut |_| {})
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(solo[0].token_ids.len() > 3);
+        let (states, streamed, _) = run_retained(&network, &artifacts, &[3, usize::MAX]);
+        assert_eq!(states[0].rnnt.token_ids(), &solo[0].token_ids[..3]);
+        assert_eq!(states[0].stop_reason, Some("max_tokens"));
+        assert_eq!(streamed[0], rnnt_text(&solo[0].token_ids[..3]));
+        assert_eq!(states[1].rnnt.token_ids(), solo[1].token_ids.as_slice());
+        assert_eq!(states[1].stop_reason, None);
+    }
+
+    /// An error part-way through a step restores every row of the step, so
+    /// blank frames the step had already consumed are decoded again.
+    #[test]
+    fn retained_decode_error_rolls_every_row_back() {
+        let network = rnnt_test_network(vec![0.0, 1.0, 0.5, 4.0], 2);
+        let (_, healthy) = rnnt_artifact(&network, 31, 5);
+        let (_, mut truncated) = rnnt_artifact(&network, 32, 3);
+        // Claims more frames than it holds: the fourth joint step fails.
+        truncated.encoded_len = 6;
+        let artifacts = [&healthy, &truncated];
+        let mut states = start_retained_decode_rows(&network, &artifacts).unwrap();
+        let before = states.clone();
+        let mut rows = states
+            .iter_mut()
+            .zip(artifacts)
+            .map(|(state, artifact)| NemotronRetainedDecodeBatchRow {
+                artifact,
+                state,
+                max_tokens: usize::MAX,
+            })
+            .collect::<Vec<_>>();
+        assert!(retained_decode_step_rows(&network, &rnnt_text, &mut rows).is_err());
+        drop(rows);
+        for (after, before) in states.iter().zip(&before) {
+            assert_eq!(after.rnnt.cursor(), 0);
+            assert_eq!(after.rnnt.cursor(), before.rnnt.cursor());
+            assert_eq!(after.rnnt.stats(), before.rnnt.stats());
+            assert_eq!(after.rnnt.token_ids(), before.rnnt.token_ids());
+            assert!(!after.finished);
+        }
+        // The healthy row alone decodes as before.
+        let (states, _, _) = run_retained(&network, &[&healthy], &[usize::MAX]);
+        assert_eq!(states[0].rnnt.stats().blank_frames, 5);
     }
 }
