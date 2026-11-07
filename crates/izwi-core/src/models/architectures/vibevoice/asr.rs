@@ -289,6 +289,11 @@ impl VibeVoiceAsrRetainedTokenizerQuantum {
 }
 
 impl VibeVoiceAsrPreparedArtifact {
+    /// The device holding the prepared prompt embeddings.
+    pub(crate) fn device_location(&self) -> candle_core::DeviceLocation {
+        self.prompt_embeddings.device().location()
+    }
+
     pub(crate) const fn geometry(&self) -> VibeVoiceAsrPreparedGeometry {
         self.geometry
     }

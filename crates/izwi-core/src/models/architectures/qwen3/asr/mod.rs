@@ -1120,6 +1120,11 @@ pub(crate) struct Qwen3AsrPreparedAudio {
 }
 
 impl Qwen3AsrPreparedAudio {
+    /// The device holding the prepared audio embeddings.
+    pub(crate) fn device_location(&self) -> candle_core::DeviceLocation {
+        self.audio_embeddings.device().location()
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(tokens: usize, width: usize) -> Result<Self> {
         if tokens == 0 || width == 0 {

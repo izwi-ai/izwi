@@ -462,6 +462,11 @@ impl GraniteSpeechPreparedAudio {
 }
 
 impl GraniteSpeechPreparedPromptArtifact {
+    /// The device holding the prepared prompt embeddings.
+    pub(crate) fn device_location(&self) -> candle_core::DeviceLocation {
+        self.embeddings.device().location()
+    }
+
     pub(crate) fn prompt_tokens(&self) -> usize {
         self.prompt_tokens
     }

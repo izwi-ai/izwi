@@ -379,6 +379,11 @@ pub(crate) struct ParakeetPreparedEncoderArtifact {
 }
 
 impl ParakeetPreparedEncoderArtifact {
+    /// The device holding the encoder output.
+    pub(crate) fn device_location(&self) -> candle_core::DeviceLocation {
+        self.encoded.device().location()
+    }
+
     pub(crate) fn resident_tensor_bytes(&self) -> Result<u64> {
         let mut accounting = TensorStorageAccounting::default();
         accounting.add_tensor(&self.encoded).ok_or_else(|| {

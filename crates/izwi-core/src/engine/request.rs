@@ -893,7 +893,10 @@ pub(super) struct PreparedAsrAudio {
 #[derive(Clone)]
 pub(super) struct PreparedAsrEncoderArtifact {
     model_variant: ModelVariant,
-    artifact: PreparedAsrEncoderArtifactValue,
+    /// Held as [`DeviceOwned`]: the request is usually the artifact's last
+    /// owner and is dropped on a tokio worker, where a CUDA free fails and
+    /// latches `CUDA_ERROR_INVALID_CONTEXT` for the next device call.
+    artifact: crate::backends::DeviceOwned<PreparedAsrEncoderArtifactValue>,
     source_fingerprint: u64,
 }
 
@@ -915,6 +918,19 @@ impl fmt::Debug for PreparedAsrEncoderArtifact {
             .field("artifact", &self.artifact.family_name())
             .field("source_fingerprint", &self.source_fingerprint)
             .finish()
+    }
+}
+
+impl crate::backends::DeviceResident for PreparedAsrEncoderArtifactValue {
+    fn device_location(&self) -> Option<candle_core::DeviceLocation> {
+        match self {
+            Self::Qwen3(value) => Some(value.device_location()),
+            Self::Whisper(value) => value.device_location(),
+            Self::VibeVoice(value) => Some(value.device_location()),
+            Self::GraniteSpeech(value) => Some(value.device_location()),
+            Self::Lfm25Audio(value) => Some(value.device_location()),
+            Self::Parakeet(value) => Some(value.device_location()),
+        }
     }
 }
 

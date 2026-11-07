@@ -1591,6 +1591,52 @@ mod tests {
             .expect("dropping a tensor on a fresh thread must not latch a CUDA error");
     }
 
+    /// A request-owned ASR encoder artifact is dropped with its request on a
+    /// tokio worker. Held as `DeviceOwned`, its last free runs on the device
+    /// thread, so a fresh thread's drop latches nothing (B2: Parakeet at 32
+    /// streams failed whole decode batches with `CUDA_ERROR_INVALID_CONTEXT`).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_owned_cuda_values_free_on_the_device_thread() {
+        struct Resident(candle_core::Tensor);
+        impl crate::backends::DeviceResident for Resident {
+            fn device_location(&self) -> Option<candle_core::DeviceLocation> {
+                Some(self.0.device().location())
+            }
+        }
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let context = device
+            .as_cuda_device()
+            .unwrap()
+            .cuda_stream()
+            .context()
+            .clone();
+        context
+            .check_err()
+            .expect("no error latched before the drop");
+        let before = crate::backends::device_frees_rerouted_total();
+        let owned = crate::backends::DeviceOwned::new(std::sync::Arc::new(Resident(
+            candle_core::Tensor::zeros(1024, candle_core::DType::F32, &device).unwrap(),
+        )));
+        std::thread::spawn(move || drop(owned)).join().unwrap();
+        assert!(crate::backends::device_frees_rerouted_total() > before);
+        // The queued free runs on the device thread; wait for it there.
+        let thread =
+            crate::backends::DeviceThread::for_location(device.location()).expect("device thread");
+        crate::backends::recv_serving_device({
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            drop(thread.submit(move || {
+                let _ = sender.send(());
+            }));
+            receiver
+        });
+        context
+            .check_err()
+            .expect("a device-owned CUDA value dropped on a fresh thread must not latch an error");
+    }
+
     #[test]
     fn assigned_cpu_selects_cpu_without_accelerator_discovery() {
         let profile =

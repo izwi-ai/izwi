@@ -1684,6 +1684,14 @@ pub fn push_engine_histograms(payload: &mut String) {
         "izwi_engine_device_ops_off_thread_total {}\n",
         crate::backends::device_ops_off_thread_total()
     ));
+    payload.push_str(
+        "# HELP izwi_engine_device_frees_rerouted_total Device buffers whose last drop began off their CUDA device thread and was moved onto it (request-owned ASR encoder artifacts).\n\
+         # TYPE izwi_engine_device_frees_rerouted_total counter\n",
+    );
+    payload.push_str(&format!(
+        "izwi_engine_device_frees_rerouted_total {}\n",
+        crate::backends::device_frees_rerouted_total()
+    ));
 }
 
 pub fn engine_metric_catalog() -> &'static [EngineMetricDescriptor] {

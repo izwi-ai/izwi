@@ -2,6 +2,7 @@
 //! artifacts, and stage costs.
 
 use super::*;
+use crate::backends::DeviceOwned;
 
 impl EngineCoreRequest {
     pub(crate) fn install_asr_execution_model(
@@ -458,7 +459,7 @@ impl EngineCoreRequest {
         if let Some(current) = self.prepared_asr_encoder_artifact.as_ref() {
             if current.model_variant == model_variant
                 && current.source_fingerprint == source_fingerprint
-                && matches!(&current.artifact, PreparedAsrEncoderArtifactValue::Qwen3(value) if Arc::ptr_eq(value, &artifact))
+                && matches!(&*current.artifact, PreparedAsrEncoderArtifactValue::Qwen3(value) if Arc::ptr_eq(value, &artifact))
             {
                 return Ok(());
             }
@@ -469,7 +470,7 @@ impl EngineCoreRequest {
         }
         self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
             model_variant,
-            artifact: PreparedAsrEncoderArtifactValue::Qwen3(artifact),
+            artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::Qwen3(artifact)),
             source_fingerprint,
         });
         Ok(())
@@ -491,7 +492,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        match &prepared.artifact {
+        match &*prepared.artifact {
             PreparedAsrEncoderArtifactValue::Qwen3(value) => Ok(Some(value.clone())),
             PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
@@ -527,7 +528,7 @@ impl EngineCoreRequest {
         }
         self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
             model_variant,
-            artifact: PreparedAsrEncoderArtifactValue::Whisper(artifact),
+            artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::Whisper(artifact)),
             source_fingerprint,
         });
         Ok(())
@@ -549,7 +550,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        match &prepared.artifact {
+        match &*prepared.artifact {
             PreparedAsrEncoderArtifactValue::Whisper(value) => Ok(Some(value.clone())),
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
@@ -585,7 +586,7 @@ impl EngineCoreRequest {
         }
         self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
             model_variant,
-            artifact: PreparedAsrEncoderArtifactValue::VibeVoice(artifact),
+            artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::VibeVoice(artifact)),
             source_fingerprint,
         });
         Ok(())
@@ -607,7 +608,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        match &prepared.artifact {
+        match &*prepared.artifact {
             PreparedAsrEncoderArtifactValue::VibeVoice(value) => Ok(Some(value.clone())),
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::Whisper(_)
@@ -643,7 +644,7 @@ impl EngineCoreRequest {
         }
         self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
             model_variant,
-            artifact: PreparedAsrEncoderArtifactValue::GraniteSpeech(artifact),
+            artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::GraniteSpeech(artifact)),
             source_fingerprint,
         });
         Ok(())
@@ -665,7 +666,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        match &prepared.artifact {
+        match &*prepared.artifact {
             PreparedAsrEncoderArtifactValue::GraniteSpeech(value) => Ok(Some(value.clone())),
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::Whisper(_)
@@ -718,7 +719,7 @@ impl EngineCoreRequest {
             .unwrap_or_default();
         self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
             model_variant,
-            artifact: PreparedAsrEncoderArtifactValue::Lfm25Audio(artifact),
+            artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::Lfm25Audio(artifact)),
             source_fingerprint,
         });
         for (stage_id, cost) in prepared_costs {
@@ -743,7 +744,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        match &prepared.artifact {
+        match &*prepared.artifact {
             PreparedAsrEncoderArtifactValue::Lfm25Audio(value) => Ok(Some(value.clone())),
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::Whisper(_)
@@ -779,7 +780,7 @@ impl EngineCoreRequest {
         }
         self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
             model_variant,
-            artifact: PreparedAsrEncoderArtifactValue::Parakeet(artifact),
+            artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::Parakeet(artifact)),
             source_fingerprint,
         });
         Ok(())
@@ -801,7 +802,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        match &prepared.artifact {
+        match &*prepared.artifact {
             PreparedAsrEncoderArtifactValue::Parakeet(value) => Ok(Some(value.clone())),
             _ => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Parakeet accessor".into(),

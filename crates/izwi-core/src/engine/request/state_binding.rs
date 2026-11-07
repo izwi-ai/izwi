@@ -833,7 +833,7 @@ impl EngineCoreRequest {
                 _ => None,
             })
             .zip(self.prepared_asr_encoder_artifact.as_ref())
-            .and_then(|(model, prepared)| match &prepared.artifact {
+            .and_then(|(model, prepared)| match &*prepared.artifact {
                 PreparedAsrEncoderArtifactValue::Lfm25Audio(artifact) => {
                     Some((model, artifact.prompt_tokens))
                 }

@@ -168,6 +168,12 @@ pub(crate) struct WhisperPreparedWindow {
 }
 
 impl WhisperPreparedWindow {
+    /// The device holding the prepared cross-attention memory, if any layer
+    /// has one.
+    pub(crate) fn device_location(&self) -> Option<candle_core::DeviceLocation> {
+        self.layers.first().map(|layer| layer.keys.device().location())
+    }
+
     pub(crate) const fn cross_memory_tokens(&self) -> usize {
         self.memory_tokens
     }
