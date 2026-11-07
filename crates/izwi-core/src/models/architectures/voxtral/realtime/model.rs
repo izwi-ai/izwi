@@ -959,29 +959,30 @@ impl VoxtralRealtimeModel {
             .map(|row| row.cache.logical_checkpoint())
             .collect::<Vec<_>>();
         let execution = (|| -> Result<Vec<VoxtralRealtimeStep>> {
-            let mut embed_rows = Vec::with_capacity(rows.len());
-            let mut positions = Vec::with_capacity(rows.len());
-            for row in rows.iter() {
-                let input_token = row
-                    .state
-                    .pending_input_token
-                    .expect("validated pending token");
-                let input = Tensor::from_vec(vec![input_token], (1, 1), &self.device.device)?;
-                let text_embed = self.language_model.embeddings(&input)?;
-                let audio_embeds = row.state.audio_embeds.as_ref().ok_or_else(|| {
-                    Error::InferenceError(
-                        "Voxtral realtime audio embeddings are unavailable".into(),
-                    )
-                })?;
-                let mut audio_step = audio_embeds.narrow(1, row.state.next_audio_frame, 1)?;
-                if audio_step.dtype() != text_embed.dtype() {
-                    audio_step = audio_step.to_dtype(text_embed.dtype())?;
-                }
-                let step_embeds = audio_step.broadcast_add(&text_embed)?;
-                embed_rows.push(step_embeds);
-                positions.push(row.state.next_audio_frame);
-            }
-            let embeds = Tensor::cat(&embed_rows.iter().collect::<Vec<_>>(), 0)?;
+            let embeds = {
+                let inputs = rows
+                    .iter()
+                    .map(|row| -> Result<RealtimeDecodeInput<'_>> {
+                        Ok(RealtimeDecodeInput {
+                            token: row
+                                .state
+                                .pending_input_token
+                                .expect("validated pending token"),
+                            audio_embeds: row.state.audio_embeds.as_ref().ok_or_else(|| {
+                                Error::InferenceError(
+                                    "Voxtral realtime audio embeddings are unavailable".into(),
+                                )
+                            })?,
+                            frame: row.state.next_audio_frame,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                realtime_step_embeds(&self.language_model, &self.device.device, &inputs)?
+            };
+            let positions = rows
+                .iter()
+                .map(|row| row.state.next_audio_frame)
+                .collect::<Vec<_>>();
             let output = {
                 let mut caches = rows
                     .iter_mut()
@@ -1001,12 +1002,7 @@ impl VoxtralRealtimeModel {
                     "Voxtral realtime decode batch returned incompatible logits".into(),
                 ));
             }
-            let sampled = (0..batch)
-                .map(|row| -> Result<u32> {
-                    let logits = output.i((row, 0))?;
-                    argmax(&logits)
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let sampled = argmax_rows(&output)?;
             for row in rows.iter_mut() {
                 row.state.next_audio_frame += 1;
             }
@@ -1070,13 +1066,15 @@ impl VoxtralRealtimeModel {
         let audio_embeds = state.audio_embeds.as_ref().ok_or_else(|| {
             Error::InferenceError("Voxtral realtime audio embeddings are unavailable".into())
         })?;
-        let input_tensor = Tensor::from_vec(vec![input_token], (1, 1), &self.device.device)?;
-        let text_embed = self.language_model.embeddings(&input_tensor)?;
-        let mut audio_step = audio_embeds.narrow(1, state.next_audio_frame, 1)?;
-        if audio_step.dtype() != text_embed.dtype() {
-            audio_step = audio_step.to_dtype(text_embed.dtype())?;
-        }
-        let step_embeds = audio_step.broadcast_add(&text_embed)?;
+        let step_embeds = realtime_step_embeds(
+            &self.language_model,
+            &self.device.device,
+            &[RealtimeDecodeInput {
+                token: input_token,
+                audio_embeds,
+                frame: state.next_audio_frame,
+            }],
+        )?;
         let logits = self.language_model.forward_managed_with_embeds(
             &step_embeds,
             state.next_audio_frame,
@@ -3035,6 +3033,54 @@ fn advance_assembled_text(
     delta
 }
 
+/// One realtime decode row's step input: its pending token and the audio
+/// frame (of its `[1, frames, hidden]` embeddings) the step consumes.
+struct RealtimeDecodeInput<'a> {
+    token: u32,
+    audio_embeds: &'a Tensor,
+    frame: usize,
+}
+
+/// The `[rows, 1, hidden]` step embeddings: each row's audio frame plus its
+/// token's embedding. One upload carries every row's token and one gather
+/// embeds them (a row's sum is elementwise, the same alone or batched).
+fn realtime_step_embeds(
+    language_model: &VoxtralLM,
+    device: &candle_core::Device,
+    inputs: &[RealtimeDecodeInput<'_>],
+) -> Result<Tensor> {
+    let tokens = inputs.iter().map(|input| input.token).collect::<Vec<_>>();
+    let tokens = Tensor::from_vec(tokens, (inputs.len(), 1), device)?;
+    let text_embeds = language_model.embeddings(&tokens)?;
+    let audio_steps = inputs
+        .iter()
+        .map(|input| input.audio_embeds.narrow(1, input.frame, 1))
+        .collect::<candle_core::Result<Vec<_>>>()?;
+    let mut audio_steps = Tensor::cat(&audio_steps, 0)?;
+    if audio_steps.dtype() != text_embeds.dtype() {
+        audio_steps = audio_steps.to_dtype(text_embeds.dtype())?;
+    }
+    audio_steps.broadcast_add(&text_embeds).map_err(Error::from)
+}
+
+/// Each row's greedy token from `[rows, 1, vocab]` logits in one
+/// device-to-host read (each row's argmax is computed as on its own).
+fn argmax_rows(logits: &Tensor) -> Result<Vec<u32>> {
+    let (rows, sequence, vocab) = logits.dims3()?;
+    if sequence != 1 || vocab == 0 {
+        return Err(Error::InferenceError(format!(
+            "Voxtral batched argmax expects [rows, 1, vocab] logits, got {:?}",
+            logits.dims()
+        )));
+    }
+    crate::models::shared::telemetry::record_host_read(DType::U32, rows);
+    logits
+        .squeeze(1)?
+        .argmax(D::Minus1)?
+        .to_vec1::<u32>()
+        .map_err(Error::from)
+}
+
 fn argmax(logits: &Tensor) -> Result<u32> {
     let logits = match logits.rank() {
         1 => logits.clone(),
@@ -4610,6 +4656,78 @@ mod tests {
     #[test]
     fn voxtral_numeric_probe_runs_encoder_adapter_and_lm_on_cpu() {
         assert_voxtral_probe_tracks_f32(&Device::Cpu, DType::F32);
+    }
+
+    /// The realtime batched decode (one token upload and embedding gather
+    /// for every row, one argmax readback) picks each row's token as the
+    /// one-row decode does, step after step, with ragged positions, on the
+    /// tiny Ada-norm LM: the numeric core of `decode_realtime_step_batch`
+    /// against `decode_realtime_step_physical`.
+    #[test]
+    fn realtime_batched_decode_tokens_match_single_row_decode() {
+        use super::{argmax_rows, realtime_step_embeds, RealtimeDecodeInput};
+        use crate::kernels::numeric_check::xorshift_tensor;
+        use crate::models::architectures::voxtral::lm::tests::{
+            deterministic_embeds, shared_decode_caches, tiny_ada_model_with_dtype,
+        };
+        use candle_core::IndexOp;
+
+        let device = Device::Cpu;
+        let lm = tiny_ada_model_with_dtype(&device, 1, DType::F32);
+        let t_cond = Tensor::from_vec(vec![0.25f32, -0.5, 0.75, 0.125], (1, 4), &device).unwrap();
+        let ada = lm.ada_scales(&t_cond).unwrap();
+        let audio = [
+            xorshift_tensor(&[1, 8, 4], 0xA1, 1.0, &device).unwrap(),
+            xorshift_tensor(&[1, 8, 4], 0xB2, 1.0, &device).unwrap(),
+        ];
+        let (_, mut caches) = shared_decode_caches(4, 979, 16);
+        let mut batch_b = caches.pop().unwrap();
+        let mut batch_a = caches.pop().unwrap();
+        let mut solo_b = caches.pop().unwrap();
+        let mut solo_a = caches.pop().unwrap();
+        let prompts = [
+            deterministic_embeds(2, 3, &device),
+            deterministic_embeds(3, 7, &device),
+        ];
+        for (cache, prompt) in [
+            (&mut solo_a, &prompts[0]),
+            (&mut batch_a, &prompts[0]),
+            (&mut solo_b, &prompts[1]),
+            (&mut batch_b, &prompts[1]),
+        ] {
+            lm.forward_managed_with_embeds(prompt, 0, cache, None, Some(&ada))
+                .unwrap();
+            cache.take_completed_writes();
+        }
+        let mut frames = [2usize, 3];
+        let mut tokens = [5u32, 9];
+        for step in 0..4 {
+            let input = |row: usize| RealtimeDecodeInput {
+                token: tokens[row],
+                audio_embeds: &audio[row],
+                frame: frames[row],
+            };
+            let mut solo = Vec::new();
+            for (row, cache) in [&mut solo_a, &mut solo_b].into_iter().enumerate() {
+                let embeds = realtime_step_embeds(&lm, &device, &[input(row)]).unwrap();
+                let logits = lm
+                    .forward_managed_with_embeds(&embeds, frames[row], cache, None, Some(&ada))
+                    .unwrap();
+                solo.push(argmax(&logits.i((0, 0)).unwrap()).unwrap());
+            }
+            let embeds = realtime_step_embeds(&lm, &device, &[input(0), input(1)]).unwrap();
+            let logits = lm
+                .forward_managed_decode_batch_with_embeds(
+                    &embeds,
+                    &frames,
+                    &mut [&mut batch_a, &mut batch_b],
+                    Some(&ada),
+                )
+                .unwrap();
+            assert_eq!(argmax_rows(&logits).unwrap(), solo, "step {step}");
+            tokens = [solo[0], solo[1]];
+            frames = [frames[0] + 1, frames[1] + 1];
+        }
     }
 
     #[cfg(feature = "metal")]

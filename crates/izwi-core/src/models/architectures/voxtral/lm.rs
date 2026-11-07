@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
+use candle_nn::{ops, rotary_emb, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::backends::kv::{
     submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
@@ -838,19 +838,36 @@ impl VoxtralAttention {
         q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, 1)?;
         k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, 1)?;
 
-        let mut query_rows = Vec::with_capacity(batch);
-        let mut key_rows = Vec::with_capacity(batch);
-        let mut value_rows = Vec::with_capacity(batch);
-        for (row, position) in start_positions.iter().copied().enumerate() {
-            let q_row = self.apply_rope(q.i(row)?.unsqueeze(0)?, position, None, rope)?;
-            let k_row = self.apply_rope(k.i(row)?.unsqueeze(0)?, position, None, rope)?;
-            query_rows.push(q_row.reshape((self.num_heads, self.head_dim))?);
-            key_rows.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
-            value_rows.push(v.i(row)?.reshape((self.num_kv_heads, self.head_dim))?);
-        }
-        let queries = Tensor::stack(&query_rows.iter().collect::<Vec<_>>(), 0)?.contiguous()?;
-        let keys = Tensor::stack(&key_rows.iter().collect::<Vec<_>>(), 0)?.contiguous()?;
-        let values = Tensor::stack(&value_rows.iter().collect::<Vec<_>>(), 0)?.contiguous()?;
+        let (q, k) = if self.use_mrope {
+            // MRoPE tables are built per position span, not gathered from
+            // the plain-RoPE position table: rotate each row on its own.
+            let mut query_rows = Vec::with_capacity(batch);
+            let mut key_rows = Vec::with_capacity(batch);
+            for (row, position) in start_positions.iter().copied().enumerate() {
+                query_rows.push(self.apply_rope(q.i(row)?.unsqueeze(0)?, position, None, rope)?);
+                key_rows.push(self.apply_rope(k.i(row)?.unsqueeze(0)?, position, None, rope)?);
+            }
+            (Tensor::cat(&query_rows, 0)?, Tensor::cat(&key_rows, 0)?)
+        } else {
+            // Every row's cos/sin come from one gather of the position table
+            // per step (shared by q, k and every layer), and one call
+            // rotates the whole batch.
+            let (cos, sin) =
+                rope.decode_rows(self.head_dim, self.rope_theta, start_positions, &q)?;
+            (
+                apply_interleaved_rope_rows(&q, &cos, &sin)?,
+                apply_interleaved_rope_rows(&k, &cos, &sin)?,
+            )
+        };
+        let queries = q
+            .reshape((batch, self.num_heads, self.head_dim))?
+            .contiguous()?;
+        let keys = k
+            .reshape((batch, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let values = v
+            .reshape((batch, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
         let completion = first.arena.write_slots(
             binding,
             KvWriteArgs {
@@ -930,10 +947,10 @@ impl VoxtralAttention {
                 ),
                 _ => self.rope_tables(&x, start_pos, None),
             })?;
-            return apply_interleaved_rotary_emb(&x, &cos, &sin);
+            return apply_interleaved_rope_rows(&x, &cos, &sin);
         }
         let (cos, sin) = self.rope_tables(&x, start_pos, position_ids)?;
-        apply_interleaved_rotary_emb(&x, &cos, &sin)
+        apply_interleaved_rope_rows(&x, &cos, &sin)
     }
 
     fn rope_tables(
@@ -1002,6 +1019,8 @@ struct LmRopeTables<'a> {
     builds: Cell<usize>,
     /// The model's position table, when the forward has one.
     positions: Option<&'a LmRopePositionTable>,
+    /// A batched decode step's per-row cos/sin, gathered once.
+    step_rows: RefCell<Option<(LmRopeKey, (Tensor, Tensor))>>,
 }
 
 impl<'a> LmRopeTables<'a> {
@@ -1029,6 +1048,40 @@ impl<'a> LmRopeTables<'a> {
         self.builds.set(self.builds.get() + 1);
         self.tables.borrow_mut().push((key, tables.clone()));
         Ok(tables)
+    }
+
+    /// A decode batch's `[rows, head_dim / 2]` cos/sin, row `i` at
+    /// `positions[i]`, in `x`'s dtype and on its device: one gather from the
+    /// model's position table per forward, shared by q, k and every layer.
+    fn decode_rows(
+        &self,
+        head_dim: usize,
+        rope_theta: f64,
+        positions: &[usize],
+        x: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let key = LmRopeKey {
+            seq_len: positions.len(),
+            start_pos: 0,
+            head_dim,
+            rope_theta_bits: rope_theta.to_bits(),
+            use_mrope: false,
+            mrope_section: None,
+            dtype: x.dtype(),
+            device: x.device().location(),
+        };
+        if let Some((cached, rows)) = self.step_rows.borrow().as_ref() {
+            if *cached == key {
+                return Ok(rows.clone());
+            }
+        }
+        let table = self.positions.ok_or_else(|| {
+            Error::InferenceError("Voxtral decode RoPE rows need the position table".into())
+        })?;
+        let rows = table.rows(head_dim, rope_theta, positions, x.dtype(), x.device())?;
+        self.builds.set(self.builds.get() + 1);
+        *self.step_rows.borrow_mut() = Some((key, rows.clone()));
+        Ok(rows)
     }
 }
 
@@ -1091,6 +1144,51 @@ impl LmRopePositionTable {
         let end = start_pos
             .checked_add(seq_len)
             .ok_or_else(|| Error::InvalidInput("Voxtral RoPE position overflow".into()))?;
+        self.with_table(head_dim, rope_theta, end, dtype, device, |table| {
+            Ok((
+                table.cos.narrow(0, start_pos, seq_len)?,
+                table.sin.narrow(0, start_pos, seq_len)?,
+            ))
+        })
+    }
+
+    /// The `[positions, head_dim / 2]` cos/sin rows at `positions`: one
+    /// upload of the positions and one gather per table. Each row is the
+    /// table's row, bit for bit what [`Self::slice`] gives at that position.
+    fn rows(
+        &self,
+        head_dim: usize,
+        rope_theta: f64,
+        positions: &[usize],
+        dtype: DType,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor)> {
+        let ids = positions
+            .iter()
+            .map(|&pos| u32::try_from(pos))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::InvalidInput("Voxtral RoPE position exceeds u32".into()))?;
+        let end = ids.iter().max().map_or(0, |&pos| pos as usize + 1);
+        let ids = Tensor::from_vec(ids, positions.len(), device)?;
+        self.with_table(head_dim, rope_theta, end, dtype, device, |table| {
+            Ok((
+                table.cos.index_select(&ids, 0)?,
+                table.sin.index_select(&ids, 0)?,
+            ))
+        })
+    }
+
+    /// Runs `read` on the table for this geometry, dtype and device, built
+    /// or grown first when it does not cover positions `0..end`.
+    fn with_table<T>(
+        &self,
+        head_dim: usize,
+        rope_theta: f64,
+        end: usize,
+        dtype: DType,
+        device: &Device,
+        read: impl FnOnce(&LmRopePositions) -> Result<T>,
+    ) -> Result<T> {
         let mut tables = self
             .tables
             .lock()
@@ -1141,11 +1239,7 @@ impl LmRopePositionTable {
                 }
             }
         };
-        let table = &tables[index];
-        Ok((
-            table.cos.narrow(0, start_pos, seq_len)?,
-            table.sin.narrow(0, start_pos, seq_len)?,
-        ))
+        read(&tables[index])
     }
 }
 
@@ -1180,6 +1274,36 @@ fn apply_ada_scale(
     }
 }
 
+/// Interleaved RoPE (pairs `x[2i], x[2i + 1]`) on `x` `[batch, seq, heads,
+/// head_dim]`, token `t` of the flattened `batch * seq` rotated by row `t`
+/// of `cos`/`sin` `[batch * seq, head_dim / 2]`: a prefill span by its
+/// positions, a decode batch by each row's. One fused `rope_i` call, which
+/// computes every element as `x0 * cos - x1 * sin` / `x0 * sin + x1 * cos`
+/// of its own pair and row whatever the token count, so a row rotates the
+/// same alone or in a batch. On the CPU it is bit-identical to the composed
+/// ops it replaced at F32 (Rust does not contract them into FMAs).
+fn apply_interleaved_rope_rows(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let (batch, seq_len, heads, head_dim) = x.dims4()?;
+    let tokens = batch * seq_len;
+    let half_dim = head_dim / 2;
+    if cos.dims() != [tokens, half_dim] || sin.dims() != [tokens, half_dim] {
+        return Err(Error::InferenceError(format!(
+            "Voxtral RoPE rows {:?}/{:?} do not match {tokens} tokens of head_dim {head_dim}",
+            cos.dims(),
+            sin.dims()
+        )));
+    }
+    let x = x.contiguous()?.reshape((tokens, heads, 1, head_dim))?;
+    let cos = cos.reshape((tokens, 1, half_dim))?.contiguous()?;
+    let sin = sin.reshape((tokens, 1, half_dim))?.contiguous()?;
+    rotary_emb::rope_i(&x, &cos, &sin)?
+        .reshape((batch, seq_len, heads, head_dim))
+        .map_err(Error::from)
+}
+
+/// The composed interleaved RoPE [`apply_interleaved_rope_rows`] replaced,
+/// kept as its reference.
+#[cfg(test)]
 fn apply_interleaved_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let bsz = x.dim(0)?;
     let seq_len = x.dim(1)?;
@@ -1563,7 +1687,9 @@ pub(crate) mod tests {
     }
 
     /// Precomputed Ada gains drive prefill, scalar decode and batched decode;
-    /// a batched step matches the scalar steps row for row.
+    /// batched steps match the scalar steps row for row: logits within F32
+    /// GEMM rounding (the CPU product rounds by its row count) and the same
+    /// greedy token at every step, with ragged positions.
     #[test]
     fn ada_conditioned_batch_decode_matches_scalar_rows() {
         let device = Device::Cpu;
@@ -1609,6 +1735,105 @@ pub(crate) mod tests {
             .unwrap();
         assert_close(&scalar_a_logits, &batch_logits.narrow(0, 0, 1).unwrap());
         assert_close(&scalar_b_logits, &batch_logits.narrow(0, 1, 1).unwrap());
+
+        let greedy = |logits: &Tensor| {
+            logits
+                .flatten_all()
+                .unwrap()
+                .argmax(0)
+                .unwrap()
+                .to_scalar::<u32>()
+                .unwrap()
+        };
+        for step in 0..4 {
+            let positions = [3 + step, 4 + step];
+            let step_a = deterministic_embeds(1, 23 + step, &device);
+            let step_b = deterministic_embeds(1, 41 + 3 * step, &device);
+            let scalar_a_logits = model
+                .forward_managed_with_embeds(
+                    &step_a,
+                    positions[0],
+                    &mut scalar_a,
+                    None,
+                    Some(&scales),
+                )
+                .unwrap();
+            let scalar_b_logits = model
+                .forward_managed_with_embeds(
+                    &step_b,
+                    positions[1],
+                    &mut scalar_b,
+                    None,
+                    Some(&scales),
+                )
+                .unwrap();
+            let batch_logits = model
+                .forward_managed_decode_batch_with_embeds(
+                    &Tensor::cat(&[&step_a, &step_b], 0).unwrap(),
+                    &positions,
+                    &mut [&mut batch_a, &mut batch_b],
+                    Some(&scales),
+                )
+                .unwrap();
+            for (row, scalar) in [scalar_a_logits, scalar_b_logits].iter().enumerate() {
+                let batched = batch_logits.narrow(0, row, 1).unwrap();
+                assert_close(scalar, &batched);
+                assert_eq!(greedy(scalar), greedy(&batched), "step {step} row {row}");
+            }
+        }
+    }
+
+    /// The fused interleaved RoPE equals the composed ops it replaced bit for
+    /// bit at F32 on the CPU, for a prefill span (rows are its positions) and
+    /// for a decode batch (rows are each row's position, gathered from the
+    /// position table), and a batched row equals that row rotated alone.
+    #[test]
+    fn fused_interleaved_rope_matches_composed_rope_bit_for_bit_on_cpu() {
+        let device = Device::Cpu;
+        let (heads, head_dim) = (3, 8);
+        let table = LmRopePositionTable::default();
+        let prefill = Tensor::from_vec(
+            xorshift_values(5 * heads * head_dim, 0x9B05),
+            (1, 5, heads, head_dim),
+            &device,
+        )
+        .unwrap();
+        let (cos, sin) = table
+            .slice(head_dim, 1_000_000.0, 7, 5, DType::F32, &device)
+            .unwrap();
+        assert_eq!(
+            bits(&apply_interleaved_rotary_emb(&prefill, &cos, &sin).unwrap()),
+            bits(&apply_interleaved_rope_rows(&prefill, &cos, &sin).unwrap())
+        );
+
+        let positions = [0usize, 9, 3, 300, 9];
+        let decode = Tensor::from_vec(
+            xorshift_values(positions.len() * heads * head_dim, 0x1F83),
+            (positions.len(), 1, heads, head_dim),
+            &device,
+        )
+        .unwrap();
+        let (cos, sin) = table
+            .rows(head_dim, 1_000_000.0, &positions, DType::F32, &device)
+            .unwrap();
+        let batched = apply_interleaved_rope_rows(&decode, &cos, &sin).unwrap();
+        for (row, &position) in positions.iter().enumerate() {
+            let x = decode.narrow(0, row, 1).unwrap();
+            let (cos, sin) = table
+                .slice(head_dim, 1_000_000.0, position, 1, DType::F32, &device)
+                .unwrap();
+            let expected = bits(&apply_interleaved_rotary_emb(&x, &cos, &sin).unwrap());
+            assert_eq!(
+                expected,
+                bits(&apply_interleaved_rope_rows(&x, &cos, &sin).unwrap()),
+                "row {row} alone"
+            );
+            assert_eq!(
+                expected,
+                bits(&batched.narrow(0, row, 1).unwrap()),
+                "row {row} batched"
+            );
+        }
     }
 
     pub(crate) fn shared_decode_caches(
@@ -2079,16 +2304,20 @@ pub(crate) mod tests {
         let cos = Tensor::from_vec(vec![0.5f32, 0.25], (1, 2), &device).unwrap();
         let sin = Tensor::from_vec(vec![0.1f32, 0.2], (1, 2), &device).unwrap();
 
-        let rotated = apply_interleaved_rotary_emb(&x, &cos, &sin).unwrap();
-
-        assert_eq!(
-            rotated.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            vec![
-                1.0 * 0.5 - 10.0 * 0.1,
-                1.0 * 0.1 + 10.0 * 0.5,
-                2.0 * 0.25 - 20.0 * 0.2,
-                2.0 * 0.2 + 20.0 * 0.25,
-            ]
-        );
+        let expected = vec![
+            1.0 * 0.5 - 10.0 * 0.1,
+            1.0 * 0.1 + 10.0 * 0.5,
+            2.0 * 0.25 - 20.0 * 0.2,
+            2.0 * 0.2 + 20.0 * 0.25,
+        ];
+        for rotated in [
+            apply_interleaved_rotary_emb(&x, &cos, &sin).unwrap(),
+            apply_interleaved_rope_rows(&x, &cos, &sin).unwrap(),
+        ] {
+            assert_eq!(
+                rotated.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                expected
+            );
+        }
     }
 }
