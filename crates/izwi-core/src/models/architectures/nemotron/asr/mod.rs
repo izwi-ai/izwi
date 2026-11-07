@@ -41,9 +41,9 @@ pub use nemo::{ensure_nemotron_artifacts, NemotronArtifacts, NEMOTRON_NEMO_FILEN
 pub(crate) use nemo::{nemotron_checkpoint_paths, nemotron_native_artifacts_complete};
 use network::{
     causal_subsampled_len, default_realtime_state_shape, resample_linear,
-    resample_linear_output_len, NemotronEncodeProfile, NemotronNetwork, NemotronRealtimeStateShape,
-    NemotronRnntStreamState, NemotronStreamingEncoderState, NemotronStreamingFeatureState,
-    NemotronStreamingPreEncodeState,
+    resample_linear_output_len, NemotronEncodeProfile, NemotronEncoderBatchInput, NemotronHostMel,
+    NemotronNetwork, NemotronRealtimeStateShape, NemotronRnntStreamState,
+    NemotronStreamingEncoderState, NemotronStreamingFeatureState, NemotronStreamingPreEncodeState,
 };
 pub(crate) use network::{nemotron_stem_bytes, NEMOTRON_MODEL_MEMO_MAX_BYTES};
 pub(crate) use physical::NemotronOfflinePhysicalStateSpec;
@@ -1648,6 +1648,135 @@ impl NemotronPromptCondition {
     }
 }
 
+/// One request's encoder input, computed on a host worker: the 16 kHz
+/// log-mel of its audio and the prompt it encodes with, so its device job
+/// runs only the encoder.
+pub(crate) struct NemotronHostFeatures {
+    mel: NemotronHostMel,
+    prompt: NemotronPromptCondition,
+    prompt_id: usize,
+    input_samples: usize,
+    input_sample_rate: u32,
+    resampled_samples: usize,
+    feature_ms: f64,
+}
+
+impl NemotronHostFeatures {
+    /// Encoder frames (E) these features encode to.
+    pub(crate) fn encoded_len(&self) -> usize {
+        self.mel.encoded_len()
+    }
+
+    /// The input sample count, at the request's own rate.
+    pub(crate) const fn input_samples(&self) -> usize {
+        self.input_samples
+    }
+
+    /// Log-mel columns, including the STFT padding column.
+    pub(crate) const fn feature_frames(&self) -> usize {
+        self.mel.frames()
+    }
+
+    /// Host bytes the features hold until the encode drops them.
+    pub(crate) fn host_bytes(&self) -> Result<u64> {
+        self.mel
+            .host_bytes()
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| Error::Overloaded("Nemotron log-mel bytes overflowed".into()))
+    }
+
+    fn artifact(
+        &self,
+        projection: Tensor,
+        encode_ms: f64,
+        batch_rows: usize,
+    ) -> Result<NemotronPreparedEncoderArtifact> {
+        let encoded_len = self.encoded_len();
+        if projection.dims() != [encoded_len, network::JOINT_HIDDEN] {
+            return Err(Error::InferenceError(format!(
+                "Nemotron encoder produced a {:?} projection for {encoded_len} frames",
+                projection.dims()
+            )));
+        }
+        Ok(NemotronPreparedEncoderArtifact {
+            projection,
+            encoded_len,
+            input_samples: self.input_samples,
+            input_sample_rate: self.input_sample_rate,
+            resampled_samples: self.resampled_samples,
+            feature_frames: self.mel.valid_frames(),
+            prompt: self.prompt.clone(),
+            prompt_id: self.prompt_id,
+            feature_ms: self.feature_ms,
+            encode_ms,
+            batch_rows,
+        })
+    }
+}
+
+/// One request's encoded audio as the retained RNNT decode reads it: the
+/// joint network's encoder projection `[E, JOINT_HIDDEN]`, in its own
+/// storage.
+#[derive(Clone)]
+pub(crate) struct NemotronPreparedEncoderArtifact {
+    projection: Tensor,
+    encoded_len: usize,
+    input_samples: usize,
+    input_sample_rate: u32,
+    resampled_samples: usize,
+    feature_frames: usize,
+    prompt: NemotronPromptCondition,
+    prompt_id: usize,
+    feature_ms: f64,
+    encode_ms: f64,
+    /// Requests the encoder batch that produced this artifact held.
+    batch_rows: usize,
+}
+
+impl NemotronPreparedEncoderArtifact {
+    /// The device holding the encoder projection.
+    pub(crate) fn device_location(&self) -> candle_core::DeviceLocation {
+        self.projection.device().location()
+    }
+
+    pub(crate) fn resident_tensor_bytes(&self) -> Result<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        accounting.add_tensor(&self.projection).ok_or_else(|| {
+            Error::Overloaded("Nemotron encoder artifact storage accounting overflowed".into())
+        })?;
+        Ok(accounting.bytes())
+    }
+
+    /// Encoder frames (E) the decode walks.
+    pub(crate) const fn encoded_len(&self) -> usize {
+        self.encoded_len
+    }
+}
+
+/// One request of a Nemotron encoder batch.
+pub(crate) struct NemotronEncoderBatchRow<'a> {
+    pub(crate) features: &'a NemotronHostFeatures,
+    /// Fails when the request is cancelled or past its deadline.
+    pub(crate) checkpoint: &'a dyn Fn() -> Result<()>,
+}
+
+/// Upper bound on the labels RNNT greedy decoding can emit: at most
+/// `max_symbols` per encoder frame, so `E × max_symbols` bounds every
+/// transcript of this input.
+pub(crate) fn nemotron_max_emittable_tokens(
+    encoded_len: usize,
+    max_symbols: usize,
+) -> Result<usize> {
+    if encoded_len == 0 {
+        return Err(Error::InvalidInput(
+            "Nemotron audio encodes to no encoder frame".into(),
+        ));
+    }
+    encoded_len
+        .checked_mul(max_symbols.max(1))
+        .ok_or_else(|| Error::Overloaded("Nemotron decode budget overflowed".into()))
+}
+
 #[derive(Debug, Clone)]
 struct NemotronDecodeRequest {
     samples: usize,
@@ -2145,6 +2274,124 @@ impl NemotronAsrModel {
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
         Some(DEFAULT_MAX_AUDIO_SECONDS_HINT)
+    }
+
+    /// Labels RNNT greedy decoding may emit per encoder frame.
+    pub(crate) fn max_symbols_per_frame(&self) -> usize {
+        self.network.realtime_state_shape().max_symbols_per_frame
+    }
+
+    /// Resolves the prompt, resamples the audio to 16 kHz and computes its
+    /// log-mel on the host, so a request's device job runs only the encoder.
+    pub(crate) fn prepare_host_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<NemotronHostFeatures> {
+        let request = self.prepare_decode_request(audio, sample_rate, language, prompt)?;
+        let prompt_id = self.network.prompt_id(&request.prompt.target_lang)?;
+        let started = Instant::now();
+        let audio_16khz = if request.input_sample_rate == request.target_sample_rate {
+            audio.to_vec()
+        } else {
+            resample_linear(audio, request.input_sample_rate, request.target_sample_rate)
+        };
+        let resampled_samples = audio_16khz.len();
+        let mel = self.network.compute_host_mel(&audio_16khz)?;
+        drop(audio_16khz);
+        Ok(NemotronHostFeatures {
+            mel,
+            prompt: request.prompt,
+            prompt_id,
+            input_samples: audio.len(),
+            input_sample_rate: sample_rate,
+            resampled_samples,
+            feature_ms: duration_ms(started.elapsed()),
+        })
+    }
+
+    /// Encodes one request's host features alone, as the offline decode
+    /// encodes its audio. `checkpoint` runs before the encode.
+    pub(crate) fn encode_host_features(
+        &self,
+        features: &NemotronHostFeatures,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<NemotronPreparedEncoderArtifact> {
+        checkpoint()?;
+        let started = Instant::now();
+        let input = self.encoder_batch_input(features)?;
+        let projection = self
+            .network
+            .encode_projection_batch(std::slice::from_ref(&input))?
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Nemotron encode returned no row".into()))?;
+        features.artifact(projection, duration_ms(started.elapsed()), 1)
+    }
+
+    /// Encodes the rows of one preparation batch. A single row runs
+    /// [`Self::encode_host_features`]; wider batches encode as one padded
+    /// batch. A row whose checkpoint fails before the encode fails alone;
+    /// an encoder error fails the batch.
+    pub(crate) fn prepare_retained_encoder_batch(
+        &self,
+        rows: &[NemotronEncoderBatchRow<'_>],
+    ) -> Result<Vec<Result<NemotronPreparedEncoderArtifact>>> {
+        if let [row] = rows {
+            return match self.encode_host_features(row.features, row.checkpoint) {
+                Ok(artifact) => Ok(vec![Ok(artifact)]),
+                Err(error @ (Error::Cancelled(_) | Error::Timeout(_))) => Ok(vec![Err(error)]),
+                Err(error) => Err(error),
+            };
+        }
+        let mut outcomes = rows
+            .iter()
+            .map(|row| (row.checkpoint)().err().map(Err))
+            .collect::<Vec<Option<Result<NemotronPreparedEncoderArtifact>>>>();
+        let live = (0..rows.len())
+            .filter(|index| outcomes[*index].is_none())
+            .collect::<Vec<_>>();
+        if let [index] = live[..] {
+            let row = &rows[index];
+            outcomes[index] = Some(self.encode_host_features(row.features, row.checkpoint));
+        } else if !live.is_empty() {
+            let started = Instant::now();
+            let inputs = live
+                .iter()
+                .map(|index| self.encoder_batch_input(rows[*index].features))
+                .collect::<Result<Vec<_>>>()?;
+            let projections = self.network.encode_projection_batch(&inputs)?;
+            drop(inputs);
+            let encode_ms = duration_ms(started.elapsed());
+            if projections.len() != live.len() {
+                return Err(Error::InferenceError(
+                    "Nemotron encoder batch returned the wrong row count".into(),
+                ));
+            }
+            for (index, projection) in live.iter().zip(projections) {
+                outcomes[*index] = Some(rows[*index].features.artifact(
+                    projection,
+                    encode_ms,
+                    live.len(),
+                ));
+            }
+        }
+        Ok(outcomes
+            .into_iter()
+            .map(|outcome| outcome.expect("every Nemotron batch row has an outcome"))
+            .collect())
+    }
+
+    fn encoder_batch_input(
+        &self,
+        features: &NemotronHostFeatures,
+    ) -> Result<NemotronEncoderBatchInput> {
+        Ok(NemotronEncoderBatchInput {
+            features: self.network.upload_host_mel(&features.mel)?,
+            valid_frames: features.mel.valid_frames(),
+            prompt_id: features.prompt_id,
+        })
     }
 
     /// Stateless streaming encoder — no decoder prompt to budget.

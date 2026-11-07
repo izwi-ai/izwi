@@ -27,7 +27,9 @@ use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
     StateComponentId, StateUpdateKind,
 };
-use crate::models::shared::memory::accounting::TensorStorageAccounting;
+use crate::models::shared::memory::accounting::{
+    deep_copy_tensor_storage, TensorStorageAccounting,
+};
 use crate::models::shared::memory::exact::exact_zeros;
 use crate::models::shared::weights::mlx;
 
@@ -39,7 +41,7 @@ const ENCODER_HEAD_DIM: usize = ENCODER_DIM / ENCODER_HEADS;
 const FF_DIM: usize = ENCODER_DIM * 4;
 const PRED_HIDDEN: usize = 640;
 const PRED_LAYERS: usize = 2;
-const JOINT_HIDDEN: usize = 640;
+pub(super) const JOINT_HIDDEN: usize = 640;
 const PROMPT_DIM: usize = 128;
 const PROMPT_HIDDEN: usize = 2048;
 const CONV_SUB_CHANNELS: usize = 256;
@@ -185,6 +187,44 @@ struct NemotronFeatureOutput {
     features: Tensor,
     valid_frames: usize,
     timings: NemotronFeatureTimings,
+}
+
+/// One request's offline log-mel, computed on the host before any device
+/// work: `[N_MELS, frames]` row-major, zero past `valid_frames`.
+pub(super) struct NemotronHostMel {
+    mel: Vec<f32>,
+    frames: usize,
+    valid_frames: usize,
+}
+
+impl NemotronHostMel {
+    /// Log-mel columns, including the STFT padding column.
+    pub(super) const fn frames(&self) -> usize {
+        self.frames
+    }
+
+    /// Feature frames the encoder reads (NeMo `get_seq_len`).
+    pub(super) const fn valid_frames(&self) -> usize {
+        self.valid_frames
+    }
+
+    /// Encoder frames these features encode to.
+    pub(super) fn encoded_len(&self) -> usize {
+        subsampled_len_3x(self.valid_frames)
+    }
+
+    /// Host bytes the log-mel holds.
+    pub(super) fn host_bytes(&self) -> Option<usize> {
+        self.mel.capacity().checked_mul(std::mem::size_of::<f32>())
+    }
+}
+
+/// One row of an offline encoder batch: its uploaded `[1, N_MELS, F]`
+/// features, the real frames among them and its prompt.
+pub(super) struct NemotronEncoderBatchInput {
+    pub features: Tensor,
+    pub valid_frames: usize,
+    pub prompt_id: usize,
 }
 
 pub(super) struct NemotronNetwork {
@@ -450,9 +490,26 @@ impl NemotronNetwork {
         profile.timings.feature_extract = feature_output.timings.feature_extract;
         profile.timings.feature_upload = feature_output.timings.feature_upload;
         profile.stats.feature_frames = feature_output.valid_frames;
+        let (encoded, encoded_len) = self.encode_features_profile(
+            feature_output.features,
+            feature_output.valid_frames,
+            prompt_id,
+            &mut profile,
+        )?;
+        Ok((encoded, encoded_len, profile))
+    }
 
+    /// The encoder output `[1, T, D]` and its length for uploaded features
+    /// `[1, N_MELS, F]` of `valid_frames` real frames: the stem, the layers
+    /// and the prompt kernel.
+    fn encode_features_profile(
+        &self,
+        features: Tensor,
+        valid_frames: usize,
+        prompt_id: usize,
+        profile: &mut NemotronEncodeProfile,
+    ) -> Result<(Tensor, usize)> {
         let dtype_start = Instant::now();
-        let features = feature_output.features;
         let features = if features.dtype() == self.dtype {
             features
         } else {
@@ -461,9 +518,7 @@ impl NemotronNetwork {
         profile.timings.dtype_cast = dtype_start.elapsed();
 
         let subsample_start = Instant::now();
-        let (x, encoded_len) = self
-            .pre_encode
-            .forward(&features, feature_output.valid_frames)?;
+        let (x, encoded_len) = self.pre_encode.forward(&features, valid_frames)?;
         profile.timings.subsample = subsample_start.elapsed();
         profile.stats.encoded_frames = encoded_len;
         if encoded_len == 0 {
@@ -478,10 +533,158 @@ impl NemotronNetwork {
             prompt_id,
             self.left_context_frames,
             self.right_context_frames,
-            &mut profile,
+            profile,
         )?;
         profile.stats.encoded_frames = encoded_len;
-        Ok((encoded, encoded_len, profile))
+        Ok((encoded, encoded_len))
+    }
+
+    /// The host half of the offline front end: the log-mel of 16 kHz audio,
+    /// computed before any device work.
+    pub(super) fn compute_host_mel(&self, audio_16khz: &[f32]) -> Result<NemotronHostMel> {
+        self.preprocessor.compute_host_mel(audio_16khz)
+    }
+
+    /// `[1, N_MELS, F]` F32 features of `host` on the encoder's device.
+    pub(super) fn upload_host_mel(&self, host: &NemotronHostMel) -> Result<Tensor> {
+        self.preprocessor.upload_host_mel(host)
+    }
+
+    /// Encodes the rows of one offline batch and returns each row's joint
+    /// encoder projection `[t, JOINT_HIDDEN]` in its own storage, the
+    /// acoustic input the RNNT decode reads. A single row runs the solo
+    /// encode bit for bit; wider batches run [`Self::encode_padded_rows`].
+    pub(super) fn encode_projection_batch(
+        &self,
+        rows: &[NemotronEncoderBatchInput],
+    ) -> Result<Vec<Tensor>> {
+        let (encoded, lengths) = self.encode_rows(rows)?;
+        let projected = match lengths.as_slice() {
+            [len] => vec![self.joint.project_encoder(&encoded.i((0, ..*len, ..))?)?],
+            lengths => {
+                let projection = self.joint.project_encoder(&encoded)?;
+                drop(encoded);
+                lengths
+                    .iter()
+                    .enumerate()
+                    .map(|(row, len)| projection.i((row, ..*len, ..)).map_err(Error::from))
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+        // Each row's projection is copied out, so no artifact keeps the
+        // batch buffer alive.
+        projected
+            .iter()
+            .map(|projection| deep_copy_tensor_storage(projection).map_err(Error::from))
+            .collect()
+    }
+
+    /// The `[t, D]` encoder output of each row of one batch, as
+    /// [`Self::encode_projection_batch`] encodes them.
+    #[cfg(test)]
+    fn encode_batch_with_prompts(&self, rows: &[NemotronEncoderBatchInput]) -> Result<Vec<Tensor>> {
+        let (encoded, lengths) = self.encode_rows(rows)?;
+        lengths
+            .iter()
+            .enumerate()
+            .map(|(row, len)| encoded.i((row, ..*len, ..)).map_err(Error::from))
+            .collect()
+    }
+
+    /// The `[B, T, D]` encoder output of `rows` and each row's length.
+    fn encode_rows(&self, rows: &[NemotronEncoderBatchInput]) -> Result<(Tensor, Vec<usize>)> {
+        match rows {
+            [] => Err(Error::InvalidInput(
+                "Nemotron encoder batch has no rows".into(),
+            )),
+            [row] => {
+                let (encoded, len) = self.encode_features_profile(
+                    row.features.clone(),
+                    row.valid_frames,
+                    row.prompt_id,
+                    &mut NemotronEncodeProfile::default(),
+                )?;
+                Ok((encoded, vec![len]))
+            }
+            rows => self.encode_padded_rows(rows),
+        }
+    }
+
+    /// Encodes rows of different lengths as one batch. Each row runs the
+    /// stem alone (about 1.5% of the work), exactly as a solo encode does:
+    /// the stem is causal and zeroes its stages past their valid frames, so
+    /// padded log-mel columns would reach its last real frames. The stem
+    /// outputs are zero-padded to the longest row and the layers run once
+    /// over `[B, T, D]`. A padded frame reaches no real frame: attention adds
+    /// a key mask to the cached chunked-limited mask, so a padded key's
+    /// weight is exactly zero, and the causal convolution only reads earlier
+    /// frames. Padded frames stay finite (each padded query keeps itself as
+    /// a finite key), since a non-finite value times a zero weight would
+    /// still poison a sum. The prompt kernel takes each row's own prompt.
+    fn encode_padded_rows(
+        &self,
+        rows: &[NemotronEncoderBatchInput],
+    ) -> Result<(Tensor, Vec<usize>)> {
+        let mut stems = Vec::with_capacity(rows.len());
+        let mut lengths = Vec::with_capacity(rows.len());
+        for row in rows {
+            let features = if row.features.dtype() == self.dtype {
+                row.features.clone()
+            } else {
+                row.features.to_dtype(self.dtype)?
+            };
+            let (x, len) = self.pre_encode.forward(&features, row.valid_frames)?;
+            if len == 0 {
+                return Err(Error::InferenceError(
+                    "Nemotron encoder produced zero frames".to_string(),
+                ));
+            }
+            stems.push(x);
+            lengths.push(len);
+        }
+        let padded = lengths.iter().copied().max().unwrap_or(0);
+        let stems = stems
+            .into_iter()
+            .zip(&lengths)
+            .map(|(x, len)| {
+                if *len == padded {
+                    Ok(x)
+                } else {
+                    x.pad_with_zeros(1, 0, padded - len).map_err(Error::from)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let x = Tensor::cat(&stems, 0)?;
+        drop(stems);
+        let prompt_ids = rows.iter().map(|row| row.prompt_id).collect::<Vec<_>>();
+        let encoded = self.encode_padded_stems(x, &lengths, &prompt_ids)?;
+        Ok((encoded, lengths))
+    }
+
+    /// The layers and prompt kernel over stem outputs `[B, T, D]` whose row
+    /// `b` holds `lengths[b]` real frames; the frames past them never reach
+    /// a real frame, whatever they hold.
+    fn encode_padded_stems(
+        &self,
+        mut x: Tensor,
+        lengths: &[usize],
+        prompt_ids: &[usize],
+    ) -> Result<Tensor> {
+        let padded = x.dim(1)?;
+        let pos_emb = self.rel_positional_embedding(padded, x.dtype(), x.device())?;
+        let att_mask = self
+            .limited_context_mask(
+                padded,
+                self.left_context_frames,
+                self.right_context_frames,
+                x.dtype(),
+                x.device(),
+            )?
+            .broadcast_add(&padded_key_mask(lengths, padded, x.dtype(), x.device())?)?;
+        for layer in &self.layers {
+            x = layer.forward(&x, &pos_emb, &att_mask)?;
+        }
+        self.prompt_kernel.forward_rows(&x, prompt_ids)
     }
 
     fn encode_preencoded_with_prompt(
@@ -2197,6 +2400,38 @@ impl NemotronPreprocessor {
 
     fn compute_features_profile(&self, audio: &[f32]) -> Result<NemotronFeatureOutput> {
         let feature_start = Instant::now();
+        let NemotronHostMel {
+            mel,
+            frames,
+            valid_frames,
+        } = self.compute_host_mel(audio)?;
+        let feature_extract = feature_start.elapsed();
+        let upload_start = Instant::now();
+        let features = Tensor::from_vec(mel, (1, N_MELS, frames), &self.device)?;
+        let feature_upload = upload_start.elapsed();
+        Ok(NemotronFeatureOutput {
+            features,
+            valid_frames,
+            timings: NemotronFeatureTimings {
+                feature_extract,
+                feature_upload,
+            },
+        })
+    }
+
+    /// `[1, N_MELS, frames]` features of `host` on the encoder's device.
+    fn upload_host_mel(&self, host: &NemotronHostMel) -> Result<Tensor> {
+        if host.mel.len() != N_MELS * host.frames {
+            return Err(Error::InvalidInput(
+                "Nemotron host log-mel has inconsistent geometry".into(),
+            ));
+        }
+        Tensor::from_slice(&host.mel, (1, N_MELS, host.frames), &self.device).map_err(Error::from)
+    }
+
+    /// The normalized log-mel of `audio` on the host: everything the
+    /// offline front end computes before its upload.
+    fn compute_host_mel(&self, audio: &[f32]) -> Result<NemotronHostMel> {
         if audio.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
         }
@@ -2264,17 +2499,10 @@ impl NemotronPreprocessor {
             }
         }
 
-        let feature_extract = feature_start.elapsed();
-        let upload_start = Instant::now();
-        let features = Tensor::from_vec(mel, (1, N_MELS, frame_count), &self.device)?;
-        let feature_upload = upload_start.elapsed();
-        Ok(NemotronFeatureOutput {
-            features,
+        Ok(NemotronHostMel {
+            mel,
+            frames: frame_count,
             valid_frames,
-            timings: NemotronFeatureTimings {
-                feature_extract,
-                feature_upload,
-            },
         })
     }
 
@@ -3067,11 +3295,14 @@ impl RelPosSelfAttention {
         let matrix_ac = q
             .broadcast_add(&pos_bias_u)?
             .matmul(&k.transpose(2, 3)?.contiguous()?)?;
-        let matrix_bd = rel_shift(
-            &q.broadcast_add(&pos_bias_v)?
-                .matmul(&p.transpose(2, 3)?.contiguous()?)?,
-        )?
-        .narrow(3, 0, t)?;
+        let mut p_t = p.transpose(2, 3)?.contiguous()?;
+        if b > 1 {
+            // Every row of a padded batch shares the positional projection.
+            p_t = p_t
+                .broadcast_as((b, ENCODER_HEADS, ENCODER_HEAD_DIM, 2 * t - 1))?
+                .contiguous()?;
+        }
+        let matrix_bd = rel_shift(&q.broadcast_add(&pos_bias_v)?.matmul(&p_t)?)?.narrow(3, 0, t)?;
 
         let scores = matrix_ac
             .broadcast_add(&matrix_bd)?
@@ -3200,7 +3431,49 @@ impl PromptKernel {
 
         let (b, t, _d) = encoded.dims3()?;
         let prompt = self.prompt_tensor(encoded, prompt_id, b, t)?;
-        let x = Tensor::cat(&[encoded, &prompt], 2)?;
+        self.forward_with_prompt(encoded, &prompt)
+    }
+
+    /// [`Self::forward`] over a batch whose row `b` takes `prompt_ids[b]`.
+    fn forward_rows(&self, encoded: &Tensor, prompt_ids: &[usize]) -> Result<Tensor> {
+        let (b, t, _d) = encoded.dims3()?;
+        if prompt_ids.len() != b {
+            return Err(Error::InvalidInput(format!(
+                "Nemotron prompt kernel got {} prompts for {b} rows",
+                prompt_ids.len()
+            )));
+        }
+        if let Some(&first) = prompt_ids.first() {
+            if prompt_ids.iter().all(|id| *id == first) {
+                return self.forward(encoded, first);
+            }
+        }
+        if let Some(id) = prompt_ids.iter().find(|id| **id >= PROMPT_DIM) {
+            return Err(Error::InvalidInput(format!(
+                "Nemotron prompt id {id} exceeds prompt feature dimension {PROMPT_DIM}"
+            )));
+        }
+        let prompt = if encoded.device().is_cuda() {
+            let rows = prompt_ids
+                .iter()
+                .map(|id| self.cached_one_hot(*id, encoded))
+                .collect::<Result<Vec<_>>>()?;
+            Tensor::cat(&rows, 0)?.broadcast_as((b, t, PROMPT_DIM))?
+        } else {
+            let mut prompt = vec![0f32; b * t * PROMPT_DIM];
+            for (bi, id) in prompt_ids.iter().enumerate() {
+                for ti in 0..t {
+                    prompt[(bi * t + ti) * PROMPT_DIM + id] = 1.0;
+                }
+            }
+            Tensor::from_vec(prompt, (b, t, PROMPT_DIM), encoded.device())?
+                .to_dtype(encoded.dtype())?
+        };
+        self.forward_with_prompt(encoded, &prompt)
+    }
+
+    fn forward_with_prompt(&self, encoded: &Tensor, prompt: &Tensor) -> Result<Tensor> {
+        let x = Tensor::cat(&[encoded, prompt], 2)?;
         let x = self.linear0.forward(&x)?.relu()?;
         self.linear2
             .forward(&x)
@@ -3225,6 +3498,14 @@ impl PromptKernel {
                 .map_err(Error::from);
         }
 
+        self.cached_one_hot(prompt_id, encoded)?
+            .broadcast_as((b, t, PROMPT_DIM))
+            .map_err(Error::from)
+    }
+
+    /// The `[1, 1, PROMPT_DIM]` one-hot of `prompt_id` at `encoded`'s dtype,
+    /// cached per prompt.
+    fn cached_one_hot(&self, prompt_id: usize, encoded: &Tensor) -> Result<Tensor> {
         let key = PromptCacheKey {
             prompt_id,
             dtype: encoded.dtype(),
@@ -3253,7 +3534,7 @@ impl PromptKernel {
             );
             tensor
         };
-        base.broadcast_as((b, t, PROMPT_DIM)).map_err(Error::from)
+        Ok(base)
     }
 }
 
@@ -3881,6 +4162,32 @@ fn build_streaming_limited_context_mask_for_dtype(
     )?
     .to_dtype(dtype)
     .map_err(Error::from)
+}
+
+/// The `[B, 1, 1, T]` additive key mask of rows zero-padded to `padded`
+/// frames: 0 on each row's real frames and a large negative score on its
+/// padding, which leaves a padded key exactly zero weight. F16 cannot hold
+/// -1e9 (it would become -inf, and a padded query left with only masked
+/// keys would softmax to NaN); -3e4 still zeroes the weight there.
+fn padded_key_mask(
+    lengths: &[usize],
+    padded: usize,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
+    let masked = if dtype == DType::F16 { -3.0e4 } else { -1.0e9 };
+    if lengths.is_empty() || lengths.iter().any(|len| *len == 0 || *len > padded) {
+        return Err(Error::InvalidInput(format!(
+            "Nemotron batch rows {lengths:?} do not fit {padded} padded frames"
+        )));
+    }
+    let mask = lengths
+        .iter()
+        .flat_map(|len| (0..padded).map(move |frame| if frame < *len { 0.0 } else { masked }))
+        .collect::<Vec<f32>>();
+    Tensor::from_vec(mask, (lengths.len(), 1, 1, padded), device)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
 }
 
 fn build_prompt_one_hot(prompt_id: usize, device: &Device, dtype: DType) -> Result<Tensor> {
@@ -5607,5 +5914,278 @@ mod tests {
         assert_eq!(limited.stats.joint_steps, checkpoint.0.stats.joint_steps);
         limited.rollback(&checkpoint);
         assert_eq!(limited.token_ids(), checkpoint.0.token_ids());
+    }
+
+    /// A prompt kernel with hashed weights, so each prompt id moves the
+    /// encoder output.
+    fn hashed_prompt_kernel(device: &Device) -> PromptKernel {
+        let linear = |seed: u32, out: usize, input: usize, scale: f32| {
+            Linear::new(
+                hashed_tensor(seed, (out, input), scale)
+                    .to_device(device)
+                    .unwrap(),
+                Some(
+                    hashed_tensor(seed + 1, out, 0.125)
+                        .to_device(device)
+                        .unwrap(),
+                ),
+            )
+        };
+        PromptKernel {
+            linear0: linear(300, PROMPT_HIDDEN, ENCODER_DIM + PROMPT_DIM, 1.0 / 32.0),
+            linear2: linear(302, ENCODER_DIM, PROMPT_HIDDEN, 1.0 / 64.0),
+            prompt_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The real-shape hashed stem, two hashed conformer layers, a hashed
+    /// prompt kernel and a hashed joint encoder projection on `device`.
+    fn hashed_batch_network(device: &Device, f16: bool) -> NemotronNetwork {
+        let (mut network, vb) = hashed_encoder_network(device, f16, hashed_conformer_tensors());
+        network
+            .layers
+            .push(ConformerLayer::load(vb.pp("encoder.layers.0"), f16.then_some(device)).unwrap());
+        network.prompt_kernel = hashed_prompt_kernel(device);
+        network.joint.enc = Linear::new(
+            hashed_tensor(310, (JOINT_HIDDEN, ENCODER_DIM), 1.0 / 32.0)
+                .to_device(device)
+                .unwrap(),
+            Some(
+                hashed_tensor(311, JOINT_HIDDEN, 0.125)
+                    .to_device(device)
+                    .unwrap(),
+            ),
+        );
+        network.preprocessor.device = device.clone();
+        network
+    }
+
+    /// `[1, N_MELS, valid + 1]` hashed features whose STFT padding column
+    /// is zero, as the front end emits them.
+    fn hashed_batch_input(
+        seed: u32,
+        valid: usize,
+        prompt_id: usize,
+        device: &Device,
+    ) -> NemotronEncoderBatchInput {
+        NemotronEncoderBatchInput {
+            features: hashed_tensor(seed, (1, N_MELS, valid), 2.0)
+                .pad_with_zeros(2, 0, 1)
+                .unwrap()
+                .to_device(device)
+                .unwrap(),
+            valid_frames: valid,
+            prompt_id,
+        }
+    }
+
+    fn max_abs_of(tensor: &Tensor) -> f32 {
+        tensor
+            .to_dtype(DType::F32)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    fn max_abs_difference(lhs: &Tensor, rhs: &Tensor) -> f32 {
+        assert_eq!(lhs.dims(), rhs.dims());
+        let rhs = rhs.to_device(lhs.device()).unwrap();
+        max_abs_of(
+            &(lhs.to_dtype(DType::F32).unwrap() - rhs.to_dtype(DType::F32).unwrap()).unwrap(),
+        )
+    }
+
+    /// Feature frames and prompts of rows whose encoded lengths are 28, 15,
+    /// 27 and 43: t mod 14 = 0, 1, 13 and 1, so each row's padding starts
+    /// on, just past and just before a 14-frame attention chunk boundary.
+    const BATCH_ROWS: [(usize, usize); 4] = [(216, 0), (112, 3), (208, 7), (336, 3)];
+
+    /// Each row of a padded batch with mixed prompts encodes as it does
+    /// alone, to 1e-6 of its scale on CPU F32, and so does its joint
+    /// encoder projection, which the batch copies into its own storage.
+    #[test]
+    fn batched_encode_matches_solo_rows_across_chunk_phases_and_prompts() {
+        let network = hashed_batch_network(&Device::Cpu, false);
+        let rows = BATCH_ROWS
+            .iter()
+            .enumerate()
+            .map(|(row, (valid, prompt))| {
+                hashed_batch_input(400 + row as u32, *valid, *prompt, &Device::Cpu)
+            })
+            .collect::<Vec<_>>();
+        let lengths = rows
+            .iter()
+            .map(|row| causal_subsampled_len(row.valid_frames, SUBSAMPLING_FACTOR))
+            .collect::<Vec<_>>();
+        assert_eq!(lengths, [28, 15, 27, 43]);
+        assert_eq!(
+            lengths.iter().map(|len| len % 14).collect::<Vec<_>>(),
+            [0, 1, 13, 1]
+        );
+
+        let encoded = network.encode_batch_with_prompts(&rows).unwrap();
+        let projected = network.encode_projection_batch(&rows).unwrap();
+        let mut worst = 0.0f32;
+        for (row, input) in rows.iter().enumerate() {
+            let solo = network
+                .encode_batch_with_prompts(std::slice::from_ref(input))
+                .unwrap()
+                .remove(0);
+            let solo_projection = network
+                .encode_projection_batch(std::slice::from_ref(input))
+                .unwrap()
+                .remove(0);
+            assert_eq!(solo.dims(), [lengths[row], ENCODER_DIM]);
+            assert_eq!(solo_projection.dims(), [lengths[row], JOINT_HIDDEN]);
+            for (batched, alone) in [(&encoded[row], &solo), (&projected[row], &solo_projection)] {
+                let difference = max_abs_difference(batched, alone);
+                let bound = 1e-6 * max_abs_of(alone).max(1.0);
+                assert!(
+                    difference <= bound,
+                    "row {row}: {difference:e} above {bound:e}"
+                );
+                worst = worst.max(difference / max_abs_of(alone).max(1.0));
+            }
+            // The artifact owns exactly its row.
+            assert_eq!(projected[row].layout().start_offset(), 0);
+            assert!(projected[row].is_contiguous());
+        }
+        eprintln!("Nemotron batched vs solo encode: worst relative difference {worst:e}");
+    }
+
+    /// Whatever the padded stem frames hold, the real frames encode
+    /// identically: padded keys get no weight and the convolution is
+    /// causal. The padded frames themselves stay finite.
+    #[test]
+    fn padded_frames_never_reach_real_frames() {
+        let network = hashed_batch_network(&Device::Cpu, false);
+        let lengths = [28usize, 15, 27];
+        let prompts = [0usize, 3, 7];
+        let padded = 28;
+        let real = (0..lengths.len())
+            .map(|row| hashed_tensor(500 + row as u32, (1, lengths[row], ENCODER_DIM), 1.0))
+            .collect::<Vec<_>>();
+        let stems = |fill: f32| {
+            let rows = real
+                .iter()
+                .zip(lengths)
+                .map(|(x, len)| {
+                    let pad = padded - len;
+                    if pad == 0 {
+                        return x.clone();
+                    }
+                    let poison = (0..pad * ENCODER_DIM)
+                        .map(|index| if index % 2 == 0 { fill } else { -fill })
+                        .collect::<Vec<f32>>();
+                    let poison =
+                        Tensor::from_vec(poison, (1, pad, ENCODER_DIM), &Device::Cpu).unwrap();
+                    Tensor::cat(&[x, &poison], 1).unwrap()
+                })
+                .collect::<Vec<_>>();
+            Tensor::cat(&rows, 0).unwrap()
+        };
+        let clean = network
+            .encode_padded_stems(stems(0.0), &lengths, &prompts)
+            .unwrap();
+        let poisoned = network
+            .encode_padded_stems(stems(1.0e3), &lengths, &prompts)
+            .unwrap();
+        for (row, len) in lengths.iter().enumerate() {
+            let values = |encoded: &Tensor| {
+                encoded
+                    .i((row, ..*len, ..))
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            assert_eq!(values(&clean), values(&poisoned), "row {row}");
+        }
+        assert!(poisoned
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|value| value.is_finite()));
+    }
+
+    /// A batch of one is today's offline encode, bit for bit: the host
+    /// log-mel uploaded as the solo front end uploads it, the stem, the
+    /// layers, the prompt kernel and the joint encoder projection.
+    #[test]
+    fn single_row_batch_is_the_solo_encode_bit_for_bit() {
+        let network = hashed_batch_network(&Device::Cpu, false);
+        let audio = hashed_values(77, 17_123, 0.5);
+        let prompt_id = 3;
+        let (encoded, encoded_len) = network.encode_with_prompt(&audio, prompt_id).unwrap();
+        let solo = network
+            .joint
+            .project_encoder(&encoded.i((0, ..encoded_len, ..)).unwrap())
+            .unwrap();
+        let host = network.compute_host_mel(&audio).unwrap();
+        assert_eq!(host.encoded_len(), encoded_len);
+        let batched = network
+            .encode_projection_batch(&[NemotronEncoderBatchInput {
+                features: network.upload_host_mel(&host).unwrap(),
+                valid_frames: host.valid_frames(),
+                prompt_id,
+            }])
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            batched.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            solo.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+    }
+
+    /// On Metal (F32 activations, F16 encoder projections) each row of a
+    /// padded batch tracks its solo Metal encode and the CPU F32 encode.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_batched_encode_tracks_solo_rows() {
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_batched_encode_tracks_solo_rows")
+        else {
+            return;
+        };
+        let network = hashed_batch_network(&device, true);
+        let reference = hashed_batch_network(&Device::Cpu, false);
+        let rows = BATCH_ROWS
+            .iter()
+            .enumerate()
+            .map(|(row, (valid, prompt))| {
+                hashed_batch_input(400 + row as u32, *valid, *prompt, &device)
+            })
+            .collect::<Vec<_>>();
+        let projected = network.encode_projection_batch(&rows).unwrap();
+        for (row, input) in rows.iter().enumerate() {
+            let solo = network
+                .encode_projection_batch(std::slice::from_ref(input))
+                .unwrap()
+                .remove(0);
+            let cpu_input = NemotronEncoderBatchInput {
+                features: input.features.to_device(&Device::Cpu).unwrap(),
+                valid_frames: input.valid_frames,
+                prompt_id: input.prompt_id,
+            };
+            let cpu = reference
+                .encode_projection_batch(std::slice::from_ref(&cpu_input))
+                .unwrap()
+                .remove(0);
+            for (label, expected) in [("solo Metal", &solo), ("CPU F32", &cpu)] {
+                let difference = max_abs_difference(&projected[row], expected);
+                let bound = 1e-2 * max_abs_of(expected).max(1.0);
+                assert!(
+                    difference <= bound,
+                    "row {row} vs {label}: {difference:e} above {bound:e}"
+                );
+            }
+        }
     }
 }
