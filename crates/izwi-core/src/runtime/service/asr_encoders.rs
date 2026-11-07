@@ -467,6 +467,21 @@ impl ParakeetEncoderBatcher {
         let work = WorkUnit::PreSequencePreparation {
             kind: "asr.encoder.parakeet".into(),
         };
+        // The host stage recorded the request bytes plus its log-mel
+        // features, which the encode consumes; each row's commit records
+        // only what its artifact keeps (request bytes and the encoder
+        // output). Restore the features' claim to pending first: usage may
+        // only rise through an observation, and the reservation still covers
+        // the features until the batch ends.
+        for row in &rows {
+            if let Err(error) = row
+                .job
+                .prepare_materialized_release(JobResourceObservation::host(row.retained_host_bytes))
+            {
+                Self::fail(rows, &error);
+                return;
+            }
+        }
         let mut sealed = Vec::with_capacity(width);
         for row in &rows {
             let seal =
@@ -765,6 +780,21 @@ impl NemotronEncoderBatcher {
         let work = WorkUnit::PreSequencePreparation {
             kind: NEMOTRON_ENCODER_STAGE.into(),
         };
+        // The host stage recorded the request bytes plus its log-mel
+        // features, which the encode consumes; each row's commit records
+        // only what its artifact keeps (request bytes and the encoder
+        // output). Restore the features' claim to pending first: usage may
+        // only rise through an observation, and the reservation still covers
+        // the features until the batch ends.
+        for row in &rows {
+            if let Err(error) = row
+                .job
+                .prepare_materialized_release(JobResourceObservation::host(row.retained_host_bytes))
+            {
+                Self::fail(rows, &error);
+                return;
+            }
+        }
         let mut sealed = Vec::with_capacity(width);
         for row in &rows {
             let seal =
