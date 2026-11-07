@@ -1580,6 +1580,7 @@ mod tests {
             default_compute_dtype: "bf16".to_string(),
             default_dtype_reason: "CUDA policy prefers BF16".to_string(),
             effective_context_tokens: None,
+            asr_decode_width: None,
             weight_residency: None,
             kv_storage: None,
             supports_incremental_decode: Some(true),

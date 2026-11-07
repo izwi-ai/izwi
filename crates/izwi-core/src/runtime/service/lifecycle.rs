@@ -295,6 +295,7 @@ impl RuntimeService {
             staged_transactions: core_config.max_staged_transactions,
             tensor_width: worker_config.max_tensor_batch_size,
             non_chat_row_width,
+            asr_row_width,
             realtime_asr_sessions: asr_realtime_sessions.max_sessions(),
             chunked_prefill: core_config.effective_chunked_prefill(),
         };
@@ -306,6 +307,7 @@ impl RuntimeService {
             staged_transactions = concurrency.staged_transactions,
             tensor_width = concurrency.tensor_width,
             non_chat_row_width = concurrency.non_chat_row_width,
+            asr_row_width = concurrency.asr_row_width,
             realtime_asr_sessions = concurrency.realtime_asr_sessions,
             chunked_prefill = concurrency.chunked_prefill,
             "resolved runtime concurrency"

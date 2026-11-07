@@ -951,6 +951,9 @@ impl ModelLifecycleController {
                 model_instance_id,
                 asr_decode_width,
             )?;
+            if let Some(rows) = asr_decode_width {
+                self.model_registry.publish_asr_decode_width(variant, rows);
+            }
             // This is the first operation allowed to allocate model tensors;
             // the peak host/device authorization and authoritative Loading slot
             // are both installed above.

@@ -173,8 +173,14 @@ pub struct ResolvedConcurrency {
     pub staged_transactions: usize,
     /// Engine tensor width before each chat family's certified cap.
     pub tensor_width: usize,
-    /// Rows of every non-chat capability (ASR, TTS, realtime).
+    /// Rows of every non-chat capability (ASR, TTS, realtime), and of the
+    /// encoders, preparation and prefill of the ASR families below.
     pub non_chat_row_width: usize,
+    /// The widest continuous decode an ASR model loads with before its
+    /// memory fit: the CUDA ceiling when the width is automatic (each
+    /// family then clamps to its certified width, and each load to what its
+    /// memory holds, reported per loaded model), else `non_chat_row_width`.
+    pub asr_row_width: usize,
     pub realtime_asr_sessions: usize,
     pub chunked_prefill: bool,
 }

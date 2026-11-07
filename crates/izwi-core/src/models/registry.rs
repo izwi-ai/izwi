@@ -7130,6 +7130,8 @@ pub struct ModelRegistry {
     qwen_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<Qwen3TtsModel>>>>>,
     kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<KokoroTtsModel>>>>>,
     effective_contexts: Arc<std::sync::RwLock<HashMap<ModelVariant, usize>>>,
+    /// The continuous decode width each loaded ASR model fitted at load.
+    asr_decode_widths: Arc<std::sync::RwLock<HashMap<ModelVariant, usize>>>,
     kv_storage: Arc<std::sync::RwLock<HashMap<ModelVariant, Vec<KvStorageReport>>>>,
     /// Which loaded variant owns each managed KV model instance (metric labels).
     kv_instances: Arc<std::sync::RwLock<HashMap<crate::engine::ModelInstanceId, ModelVariant>>>,
@@ -7161,6 +7163,11 @@ pub struct LoadedModelDiagnostics {
     pub default_dtype_reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_context_tokens: Option<usize>,
+    /// Rows the model's ASR decode batches, as its load fitted them to
+    /// memory (on CUDA with an automatic width, up to 32 for the families
+    /// certified wider; its encoders and prefill run at the engine rows).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asr_decode_width: Option<usize>,
     /// The KV page size and storage dtype each managed paged domain actually
     /// uses. The process-wide cache policy reports the requested dtype, but a
     /// family may store wider KV (Qwen3.5 stores F32 on CPU/Metal).
@@ -7302,6 +7309,7 @@ fn loaded_model_diagnostics_entry(
         default_compute_dtype: format!("{:?}", dtype_selection.dtype).to_ascii_lowercase(),
         default_dtype_reason: dtype_selection.reason.into_owned(),
         effective_context_tokens: None,
+        asr_decode_width: None,
         kv_storage: None,
         weight_residency: None,
         supports_incremental_decode,
@@ -7451,6 +7459,7 @@ impl ModelRegistry {
             qwen_tts_models: Arc::new(RwLock::new(HashMap::new())),
             kokoro_models: Arc::new(RwLock::new(HashMap::new())),
             effective_contexts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            asr_decode_widths: Arc::new(std::sync::RwLock::new(HashMap::new())),
             kv_storage: Arc::new(std::sync::RwLock::new(HashMap::new())),
             kv_instances: Arc::new(std::sync::RwLock::new(HashMap::new())),
             weight_residency: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -7551,6 +7560,15 @@ impl ModelRegistry {
         Ok(())
     }
 
+    /// Record the continuous decode width a loaded ASR model fitted, for
+    /// `/v1/health` model diagnostics.
+    pub(crate) fn publish_asr_decode_width(&self, variant: ModelVariant, rows: usize) {
+        self.asr_decode_widths
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(variant, rows);
+    }
+
     pub(crate) fn effective_context(&self, variant: ModelVariant) -> Option<usize> {
         self.effective_contexts
             .read()
@@ -7581,6 +7599,10 @@ impl ModelRegistry {
 
     pub(crate) fn clear_effective_context(&self, variant: ModelVariant) {
         self.effective_contexts
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&variant);
+        self.asr_decode_widths
             .write()
             .unwrap_or_else(|poison| poison.into_inner())
             .remove(&variant);
@@ -7940,6 +7962,14 @@ impl ModelRegistry {
                 .iter()
                 .find_map(|(variant, tokens)| {
                     (variant.dir_name() == entry.variant_id).then_some(*tokens)
+                });
+            entry.asr_decode_width = self
+                .asr_decode_widths
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .iter()
+                .find_map(|(variant, rows)| {
+                    (variant.dir_name() == entry.variant_id).then_some(*rows)
                 });
         }
         diagnostics.sort_by(|left, right| {

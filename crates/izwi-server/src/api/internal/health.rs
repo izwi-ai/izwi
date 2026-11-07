@@ -249,6 +249,7 @@ mod tests {
                 staged_transactions: 8,
                 tensor_width: 16,
                 non_chat_row_width: 16,
+                asr_row_width: 16,
                 realtime_asr_sessions: 16,
                 chunked_prefill: true,
             },
@@ -327,6 +328,7 @@ mod tests {
                 default_compute_dtype: "bf16".to_string(),
                 default_dtype_reason: "CUDA default uses BF16".to_string(),
                 effective_context_tokens: None,
+                asr_decode_width: None,
                 weight_residency: None,
                 kv_storage: None,
                 supports_incremental_decode: None,
@@ -352,6 +354,7 @@ mod tests {
         );
         assert_eq!(value["concurrency"]["profile"], "multi_user");
         assert_eq!(value["concurrency"]["max_num_seqs"], 16);
+        assert_eq!(value["concurrency"]["asr_row_width"], 16);
         assert_eq!(
             value["chat_concurrency_policy"]["cuda_incremental_chat_effective"],
             true
