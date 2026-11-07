@@ -1482,6 +1482,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Encodes concurrent Parakeet clips of one encoder window (82 s) as one padded batch; false encodes every request alone.",
     ),
     CoreEnvVar::new(
+        "IZWI_PARAKEET_ENCODER_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Parakeet runs its 24 conformer layers over a clip of one encoder window (82 s), alone or batched, as a CUDA graph per padded shape: rows up to 1, 2, 3, 4, 6, 8, 12, 16, 24 or 32 and frames up to a power of two, as many as fit 576 MiB of graph working memory (every width of 10 s clips), at most 24 graphs kept, least recently used dropped. Each graph is checked bit for bit against the eager layers on its first two batches; a mismatch or CUDA error turns the graphs off for the process. Loads price 768 MiB for them. Any false value runs every encode eagerly at its unpadded shape; `encoder_graphs` in the diagnostics reports captures, replays, fallbacks and why the graphs are off.",
+    ),
+    CoreEnvVar::new(
         "IZWI_PARAKEET_METAL_CONV1D_BN_SWISH",
         Flag,
         "true (Metal only)",

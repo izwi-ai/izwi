@@ -636,7 +636,8 @@ fn parakeet_preparation_row_cost(
         parakeet_encode_row_bytes, parakeet_encode_row_elements,
     };
     let bytes = parakeet_encode_row_bytes(features, padded_frames, rows, backend)?;
-    let (useful, materialized) = parakeet_encode_row_elements(features, padded_frames)?;
+    let (useful, materialized) =
+        parakeet_encode_row_elements(features, padded_frames, rows, backend)?;
     let samples = u64::try_from(features.input_samples())
         .map_err(|_| Error::Overloaded("Parakeet sample work exceeds u64".into()))?;
     let cost = crate::engine::WorkCost::with_workspace(

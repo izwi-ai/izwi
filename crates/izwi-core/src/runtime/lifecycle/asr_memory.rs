@@ -92,9 +92,9 @@ use crate::models::architectures::nemotron::asr::{
     resolve_nemotron_projection_precision, NEMOTRON_MODEL_MEMO_MAX_BYTES,
 };
 use crate::models::architectures::parakeet::asr::{
-    parakeet_checkpoint_paths, parakeet_tensor_is_bf16_projection,
-    parakeet_tensor_is_f16_projection, resolve_parakeet_projection_precision,
-    PARAKEET_WEIGHT_DTYPE,
+    parakeet_checkpoint_paths, parakeet_encoder_graph_device_bytes,
+    parakeet_tensor_is_bf16_projection, parakeet_tensor_is_f16_projection,
+    resolve_parakeet_projection_precision, PARAKEET_WEIGHT_DTYPE,
 };
 use crate::models::architectures::qwen3::asr::{
     qwen3_asr_safetensors_load, qwen3_asr_use_gguf_qmatmul_text, qwen3_asr_weight_dtypes,
@@ -228,7 +228,10 @@ pub(super) fn residency_plan(
             qwen3_asr_plan(variant, model_path, device, backend, Precision::Selected)
         }
         ModelVariant::ParakeetTdt06BV3 => {
+            // The encoder's CUDA graphs allocate their memory on first use.
+            let graphs = parakeet_encoder_graph_device_bytes(backend);
             parakeet_plan(variant, model_path, device, backend, Precision::Selected)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
         ModelVariant::Nemotron35AsrStreaming06B => {
             nemotron_plan(variant, model_path, device, backend, Precision::Selected)
@@ -277,6 +280,9 @@ pub(super) struct AsrResidencyPlan {
     load_peak_bytes: u64,
     /// CUDA only: high-water mark of host staging.
     host_staging_bytes: u64,
+    /// Device memory the model allocates lazily after the load (Parakeet's
+    /// encoder graphs): resident, but a pending claim until it is used.
+    deferred_device_bytes: u64,
 }
 
 impl AsrResidencyPlan {
@@ -298,7 +304,14 @@ impl AsrResidencyPlan {
             memo_bytes,
             load_peak_bytes: ledger.peak,
             host_staging_bytes: ledger.host_peak,
+            deferred_device_bytes: 0,
         })
+    }
+
+    /// This plan with `bytes` of device memory the model allocates lazily.
+    fn with_deferred_device_bytes(mut self, bytes: u64) -> Self {
+        self.deferred_device_bytes = bytes;
+        self
     }
 
     /// This plan in `backend`'s domains: weights priced on the host (a
@@ -311,8 +324,16 @@ impl AsrResidencyPlan {
 
     pub(super) fn estimate(&self) -> Result<ModelMemoryEstimate> {
         Ok(ModelMemoryEstimate {
-            resident_bytes: sum(&[self.resident_bytes, self.memo_bytes])?,
-            load_peak_bytes: sum(&[self.load_peak_bytes, self.memo_bytes])?,
+            resident_bytes: sum(&[
+                self.resident_bytes,
+                self.memo_bytes,
+                self.deferred_device_bytes,
+            ])?,
+            load_peak_bytes: sum(&[
+                self.load_peak_bytes,
+                self.memo_bytes,
+                self.deferred_device_bytes,
+            ])?,
         })
     }
 
@@ -321,6 +342,10 @@ impl AsrResidencyPlan {
         if self.backend == BackendKind::Cuda {
             // The device holds the weights; the host only stages them.
             plan.load_authorization.host_bytes = ResourceAmount::Known(self.host_staging_bytes);
+            // Allocated on first use: kept pending so state fits cannot
+            // spend it.
+            plan.deferred_resident_authorization.device_bytes =
+                ResourceAmount::Known(self.deferred_device_bytes);
         }
         Ok(plan)
     }
@@ -2474,6 +2499,7 @@ fn nemotron_transcribe_plan(
         memo_bytes: 0,
         load_peak_bytes: sum(&[resident, priced.largest_tensor_bytes])?,
         host_staging_bytes: host_staging,
+        deferred_device_bytes: 0,
     }))
 }
 

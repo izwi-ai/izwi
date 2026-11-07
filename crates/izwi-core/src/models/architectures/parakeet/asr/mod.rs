@@ -22,6 +22,7 @@ use crate::backends::state::{
 use crate::backends::{BackendKind, DTypeSelection, DeviceProfile};
 use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
+use crate::kernels::cuda::shape_graphs::{ShapeGraphLimits, ShapeGraphs};
 use crate::kernels::depthwise_conv::{depthwise_conv1d, DepthwiseConv1dSpec};
 use crate::kernels::f16_weight_linear::{
     load_weight_only_f16, F16WeightLinear, PointwiseConv1d, ProjectionLinear, WeightOnlyF16Load,
@@ -449,15 +450,34 @@ pub(crate) fn parakeet_preparation_bytes(
         .ok()
         .and_then(|samples| samples.checked_mul(HOST_BYTES_PER_SAMPLE))
         .ok_or_else(|| Error::Overloaded("Parakeet preparation bytes overflowed".into()))?;
+    // A lone window of one 82 s window or less runs at its graph's shape.
+    let (batch_rows, window) = encoder_batch_shape(1, window, backend);
     Ok(ParakeetPreparationBytes {
         host_bytes,
-        window_bytes: encoder_window_row_bytes(window, 1, backend)?,
+        window_bytes: encoder_window_row_bytes(window, batch_rows, 1, backend)?,
         output_bytes: encoder_output_bytes(subsampled_len_3x(valid_frames), backend)?,
     })
 }
 
+/// The `(rows, frames)` the encoder runs a batch of `rows` rows padded to
+/// `padded_frames` at: single-window rows at their graph's shape where
+/// [`encoder_batch_shape`] gives one, a longer row (always alone) as is.
+fn encode_row_shape(
+    features: &ParakeetHostFeatures,
+    padded_frames: usize,
+    rows: usize,
+    backend: BackendKind,
+) -> (usize, usize) {
+    if features.single_window() {
+        encoder_batch_shape(rows, padded_frames, backend)
+    } else {
+        (rows, padded_frames)
+    }
+}
+
 /// Prices one row's device job in an encoder batch of `rows` rows whose
-/// windows are padded to `padded_frames` encoder frames: its share of the
+/// windows are padded to `padded_frames` encoder frames (on CUDA, to the
+/// graph shape [`encoder_batch_shape`] gives): its share of the
 /// batch's window peak, its own retained output, and on the host the
 /// normalized feature copy each window uploads. The log-mel pipeline itself
 /// ran on a host worker before the row was admitted.
@@ -477,20 +497,25 @@ pub(crate) fn parakeet_encode_row_bytes(
         .and_then(|elements| elements.checked_mul(F32_BYTES))
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or_else(|| Error::Overloaded("Parakeet preparation bytes overflowed".into()))?;
+    let (batch_rows, frames) = encode_row_shape(features, padded_frames, rows, backend);
     Ok(ParakeetPreparationBytes {
         host_bytes,
-        window_bytes: encoder_window_row_bytes(padded_frames, rows, backend)?,
+        window_bytes: encoder_window_row_bytes(frames, batch_rows, rows, backend)?,
         output_bytes: encoder_output_bytes(features.encoded_len(), backend)?,
     })
 }
 
 /// Useful and materialized encoder-output elements of one row in a batch
-/// padded to `padded_frames`: a single-window row is padded up to the
-/// batch's longest row, a longer row (always alone) never.
+/// of `rows` rows padded to `padded_frames`: a single-window row is padded
+/// up to the batch's longest row (on CUDA, to its graph's frames), a longer
+/// row (always alone) never.
 pub(crate) fn parakeet_encode_row_elements(
     features: &ParakeetHostFeatures,
     padded_frames: usize,
+    rows: usize,
+    backend: BackendKind,
 ) -> Result<(u64, u64)> {
+    let (_, padded_frames) = encode_row_shape(features, padded_frames, rows, backend);
     let padding = padded_frames.saturating_sub(features.window_frames());
     let elements = |frames: usize| {
         frames
@@ -505,11 +530,34 @@ pub(crate) fn parakeet_encode_row_elements(
     ))
 }
 
-/// One row's share of the peak of an encoder batch of `rows` windows of
-/// `window` frames: the stem runs row by row, so its planes count once per
-/// batch; the attention and layer buffers hold every row. Metal rounds each
-/// whole batch buffer up to a power of two.
-fn encoder_window_row_bytes(window: usize, rows: usize, backend: BackendKind) -> Result<u64> {
+/// One row's share of the peak of an encoder batch of `batch_rows` windows
+/// of `window` frames that holds `rows` real rows (the rest pad it to a
+/// graph's width).
+fn encoder_window_row_bytes(
+    window: usize,
+    batch_rows: usize,
+    rows: usize,
+    backend: BackendKind,
+) -> Result<u64> {
+    let bytes = encoder_window_batch_bytes(window, batch_rows, backend)?;
+    let rows = u64::try_from(rows.max(1))
+        .map_err(|_| Error::Overloaded("Parakeet preparation bytes overflowed".into()))?;
+    Ok(bytes
+        .stem
+        .checked_add(bytes.layers)
+        .ok_or_else(|| Error::Overloaded("Parakeet preparation bytes overflowed".into()))?
+        .div_ceil(rows))
+}
+
+/// The peak of an encoder batch of `rows` windows of `window` frames: the
+/// stem runs row by row, so its planes count once per batch; the attention
+/// and layer buffers hold every row. Metal rounds each whole batch buffer up
+/// to a power of two.
+fn encoder_window_batch_bytes(
+    window: usize,
+    rows: usize,
+    backend: BackendKind,
+) -> Result<EncoderBatchBytes> {
     const F32_BYTES: u64 = 4;
     // About six [T, ff_dim] activations are live inside a layer at once: the
     // feed-forward block's linear, sigmoid and product, plus residual and
@@ -552,21 +600,103 @@ fn encoder_window_row_bytes(window: usize, rows: usize, backend: BackendKind) ->
     // q_v·pᵀ, its zero pad and the reshaped copy, each [H, T, 2T].
     let rel_shift = multiply(&[rows, heads, window, 2 * window, F32_BYTES])?;
     let activation = multiply(&[rows, window, ff_dim, F32_BYTES])?;
-    let mut terms = vec![
-        multiply(&[3, round(stem_plane)?])?,
+    let mut layers = vec![
         round(scores)?,
         multiply(&[3, round(rel_shift)?])?,
         multiply(&[LAYER_ACTIVATIONS, round(activation)?])?,
     ];
     if rows > 1 {
         // The positional projection pᵀ, copied out for every row.
-        terms.push(round(multiply(&[rows, dim, 2 * window, F32_BYTES])?)?);
+        layers.push(round(multiply(&[rows, dim, 2 * window, F32_BYTES])?)?);
     }
-    let batch_bytes = terms
+    let layers = layers
         .into_iter()
         .try_fold(0u64, |total, bytes| total.checked_add(bytes))
         .ok_or_else(overflow)?;
-    Ok(batch_bytes.div_ceil(rows))
+    Ok(EncoderBatchBytes {
+        stem: multiply(&[3, round(stem_plane)?])?,
+        layers,
+    })
+}
+
+/// The peak of an encoder batch, in its two parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EncoderBatchBytes {
+    /// The stem's planes over one slice of one row.
+    stem: u64,
+    /// The conformer layers' attention and activation buffers over every
+    /// row: a graphed batch's working set.
+    layers: u64,
+}
+
+/// Kill switch for the Parakeet encoder's CUDA graphs (a boolean; on when
+/// unset). Read once: admission prices the graphed shapes from it, and the
+/// encoder captures them.
+pub(crate) const PARAKEET_ENCODER_GRAPHS_ENV: &str = "IZWI_PARAKEET_ENCODER_GRAPHS";
+
+fn encoder_graphs_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(PARAKEET_ENCODER_GRAPHS_ENV, true));
+    ON.get()
+}
+
+/// Batch widths the encoder graphs are captured at. A graphed batch pads
+/// its rows up to the next, so a busy server's varying widths share ten
+/// graphs per length bucket rather than one graph per width.
+const ENCODER_GRAPH_ROWS: [usize; 10] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32];
+
+const MIB: u64 = 1024 * 1024;
+
+/// What the encoder graphs may hold. The pool budget bounds a graph's
+/// working set ([`EncoderBatchBytes::layers`]): 32 rows of 128 frames
+/// (10 s clips) need 528 MiB, so every width of 10 s clips, 12 rows of
+/// 20 s clips and a lone 82 s window are graphed. The retained budget holds
+/// the kept graphs' input copies and outputs: 33 MiB for 32 rows of 128
+/// frames.
+const ENCODER_GRAPH_LIMITS: ShapeGraphLimits = ShapeGraphLimits {
+    max_graphs: 24,
+    retained_bytes: 192 * MIB,
+    pool_bytes: 576 * MIB,
+};
+
+/// Device bytes a load on `backend` prices for the encoder graphs, which
+/// allocate lazily on their first batches: zero off CUDA or with the graphs
+/// switched off.
+pub(crate) fn parakeet_encoder_graph_device_bytes(backend: BackendKind) -> u64 {
+    if backend == BackendKind::Cuda && encoder_graphs_requested() {
+        ENCODER_GRAPH_LIMITS.device_bytes()
+    } else {
+        0
+    }
+}
+
+/// The `(rows, frames)` a graph runs a batch of `rows` single-window rows
+/// whose longest has `frames` frames at: rows up to the next graph width,
+/// frames up to a power of two. `None` past 32 rows, past one window, or
+/// past the pool budget.
+fn encoder_graph_shape(rows: usize, frames: usize) -> Option<(usize, usize)> {
+    let rows = ENCODER_GRAPH_ROWS
+        .into_iter()
+        .find(|width| *width >= rows.max(1))?;
+    let frames = frames.max(1).checked_next_power_of_two()?;
+    if frames > EncoderWindowing::V3.frames {
+        return None;
+    }
+    let bytes = encoder_window_batch_bytes(frames, rows, BackendKind::Cuda).ok()?;
+    (bytes.layers <= ENCODER_GRAPH_LIMITS.pool_bytes).then_some((rows, frames))
+}
+
+/// The `(rows, frames)` an encoder batch of `rows` single-window rows
+/// padded to `frames` frames runs at on `backend`: a graph's shape on CUDA
+/// with the encoder graphs on, else as given. Admission prices this shape;
+/// the encoder runs it, or the given one once its graphs are off.
+fn encoder_batch_shape(rows: usize, frames: usize, backend: BackendKind) -> (usize, usize) {
+    if backend == BackendKind::Cuda && encoder_graphs_requested() {
+        if let Some(shape) = encoder_graph_shape(rows, frames) {
+            return shape;
+        }
+    }
+    (rows, frames)
 }
 
 /// The retained `[1, E, D]` encoder output.
@@ -1291,6 +1421,7 @@ impl ParakeetAsrModel {
             "host_argmax_reads": state.counters.host_argmax_reads,
             "device_argmax_scalar_reads": state.counters.device_argmax_scalar_reads,
             "weight_precision": self.weight_precision_diagnostics(),
+            "encoder_graphs": self.network.encoder.graphs_diagnostics(),
         });
         if let Some(stop_reason) = state.stop_reason {
             diagnostics["stop_reason"] = stop_reason.into();
@@ -1777,6 +1908,7 @@ impl ParakeetAsrModel {
         );
         diagnostics["timestamp_words"] = self.decoder.timestamp_words(&token_ids, &token_frames);
         diagnostics["execution"]["weight_precision"] = self.weight_precision_diagnostics();
+        diagnostics["execution"]["encoder_graphs"] = self.network.encoder.graphs_diagnostics();
 
         Ok(ParakeetAsrTranscriptionOutput {
             text: assembled,
@@ -2120,6 +2252,10 @@ struct ParakeetEncoder {
     /// The dtype the projection GEMMs run in: BF16 in the CUDA tier, else
     /// F32 (weight-only F16 projections take and return F32).
     projection_dtype: DType,
+    /// CUDA graphs of the conformer layers over a padded single-window
+    /// batch, one per `(rows, frames)` shape ([`encoder_graph_shape`]), or
+    /// why there are none.
+    graphs: std::result::Result<ShapeGraphs<(usize, usize)>, String>,
 }
 
 impl ParakeetEncoder {
@@ -2129,12 +2265,43 @@ impl ParakeetEncoder {
         let layers = (0..geometry.layers)
             .map(|idx| ConformerLayer::load(vb.pp(format!("layers.{idx}")), geometry, projections))
             .collect::<Result<Vec<_>>>()?;
+        let graphs = if encoder_graphs_requested() {
+            ShapeGraphs::resolve("Parakeet encoder", vb.device(), ENCODER_GRAPH_LIMITS)
+        } else {
+            Err(format!("{PARAKEET_ENCODER_GRAPHS_ENV} is off"))
+        };
         Ok(Self {
             geometry,
             pre_encode,
             layers,
             projection_dtype: projections.dtype(),
+            graphs,
         })
+    }
+
+    /// Whether single-window batches run through the CUDA graphs: on CUDA
+    /// with the graphs switched on and no graph failure yet.
+    fn graphs_on(&self) -> bool {
+        self.graphs.as_ref().is_ok_and(ShapeGraphs::is_on)
+    }
+
+    /// The `(rows, frames)` a batch of `rows` single-window rows whose
+    /// longest has `frames` frames runs at: its graph's shape while the
+    /// graphs are on (at most what admission priced, [`encoder_batch_shape`]),
+    /// else as given.
+    fn batch_shape(&self, rows: usize, frames: usize) -> (usize, usize) {
+        if self.graphs_on() {
+            encoder_graph_shape(rows, frames).unwrap_or((rows, frames))
+        } else {
+            (rows, frames)
+        }
+    }
+
+    fn graphs_diagnostics(&self) -> serde_json::Value {
+        match &self.graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        }
     }
 
     /// Loads the encoder at `precision`: BF16 projections and GEMMs, or
@@ -2260,6 +2427,21 @@ impl ParakeetEncoder {
             drop(features);
             timings.pre_encode_ms += elapsed_ms(pre_encode_started);
 
+            if plan.len() == 1 && self.graphs_on() {
+                // A lone window runs as a padded batch of one, through its
+                // graph; its real frames come back as a view.
+                let layers_started = Instant::now();
+                let (_, padded) = self.batch_shape(1, frames);
+                let x = x.pad_with_zeros(1, 0, padded - frames)?;
+                let encoded = self.encode_padded(x, &[frames])?.narrow(1, 0, frames)?;
+                timings.encoder_layers_ms += elapsed_ms(layers_started);
+                return Ok(ParakeetEncoded {
+                    encoded,
+                    encoded_len,
+                    windows: 1,
+                });
+            }
+
             // Relative positions depend only on i - j, so one embedding of
             // the window length serves every window.
             let pos_started = Instant::now();
@@ -2330,12 +2512,29 @@ impl ParakeetEncoder {
     /// would leave its first convolution as ReLU(bias), not zero, and the
     /// next convolution would read them into real frames. The stem outputs
     /// are zero-padded to the longest row and the layers run once over
-    /// `[B, T, D]` with the padding masked (see [`EncoderPadding`]). Each
+    /// `[B, T, D]` with the padding masked (see [`EncoderPadding`]). While
+    /// the CUDA graphs are on, the batch pads further, to its graph's shape
+    /// ([`Self::batch_shape`]): frames to a power of two and zero rows up to
+    /// the next graph width, all of whose frames count as real. Each real
     /// row's frames are copied out, so no output keeps the batch buffer
     /// alive.
     fn encode_single_window_batch(&self, rows: &[(Tensor, usize)]) -> Result<Vec<Tensor>> {
-        let lengths = rows.iter().map(|(_, frames)| *frames).collect::<Vec<_>>();
-        let padded = lengths.iter().copied().max().unwrap_or(0);
+        let longest = rows.iter().map(|(_, frames)| *frames).max().unwrap_or(0);
+        self.encode_single_window_batch_at(rows, self.batch_shape(rows.len(), longest))
+    }
+
+    /// [`Self::encode_single_window_batch`] padded to `(batch_rows, padded)`.
+    fn encode_single_window_batch_at(
+        &self,
+        rows: &[(Tensor, usize)],
+        (batch_rows, padded): (usize, usize),
+    ) -> Result<Vec<Tensor>> {
+        let mut lengths = rows.iter().map(|(_, frames)| *frames).collect::<Vec<_>>();
+        if batch_rows < rows.len() || lengths.iter().any(|frames| *frames > padded) {
+            return Err(Error::InvalidInput(format!(
+                "Parakeet batch rows {lengths:?} do not fit {batch_rows} rows of {padded} frames"
+            )));
+        }
         let stems = rows
             .iter()
             .map(|(features, frames)| {
@@ -2344,11 +2543,16 @@ impl ParakeetEncoder {
                     .map_err(Error::from)
             })
             .collect::<Result<Vec<_>>>()?;
-        let x = Tensor::cat(&stems, 0)?;
+        let mut x = Tensor::cat(&stems, 0)?;
         drop(stems);
+        if batch_rows > rows.len() {
+            x = x.pad_with_zeros(0, 0, batch_rows - rows.len())?;
+            lengths.resize(batch_rows, padded);
+        }
         let encoded = self.encode_padded(x, &lengths)?;
         lengths
             .iter()
+            .take(rows.len())
             .enumerate()
             .map(|(row, frames)| {
                 let frames = encoded.narrow(0, row, 1)?.narrow(1, 0, *frames)?;
@@ -2358,13 +2562,50 @@ impl ParakeetEncoder {
     }
 
     /// The conformer layers over a zero-padded `[B, T, D]` batch whose row
-    /// `b` holds `lengths[b]` real frames.
-    fn encode_padded(&self, mut x: Tensor, lengths: &[usize]) -> Result<Tensor> {
-        let padded = x.dim(1)?;
+    /// `b` holds `lengths[b]` real frames: through the CUDA graph of a
+    /// graph's shape, eagerly otherwise. The stem, the positional embedding
+    /// and the masks (host uploads) stay outside the graph, as its inputs.
+    fn encode_padded(&self, x: Tensor, lengths: &[usize]) -> Result<Tensor> {
+        let (rows, padded) = (x.dim(0)?, x.dim(1)?);
         let padding = EncoderPadding::new(lengths, padded, x.dtype(), x.device())?;
         let pos = self.positions(padded, x.device())?;
+        let graphs = match &self.graphs {
+            Ok(graphs) if encoder_graph_shape(rows, padded) == Some((rows, padded)) => graphs,
+            _ => return self.layers_forward(x, &pos, Some(&padding)),
+        };
+        let inputs = [x, pos, padding.key_bias, padding.frames];
+        // The graph keeps a stable copy of each input and an output the size
+        // of `x`.
+        let tensor_bytes = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+        let retained = inputs.iter().map(tensor_bytes).sum::<u64>() + tensor_bytes(&inputs[0]);
+        let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+            let [x, pos, key_bias, frames] = inputs else {
+                return Err(Error::InferenceError(format!(
+                    "Parakeet encoder graph received {} inputs, expected 4",
+                    inputs.len()
+                )));
+            };
+            let padding = EncoderPadding {
+                key_bias: key_bias.clone(),
+                frames: frames.clone(),
+            };
+            Ok(vec![self.layers_forward(x.clone(), pos, Some(&padding))?])
+        };
+        graphs
+            .run((rows, padded), retained, &inputs, &body)?
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Parakeet encoder graph returned nothing".into()))
+    }
+
+    /// The conformer layers over `x`; `padding` masks a padded batch.
+    fn layers_forward(
+        &self,
+        mut x: Tensor,
+        pos: &Tensor,
+        padding: Option<&EncoderPadding>,
+    ) -> Result<Tensor> {
         for layer in &self.layers {
-            x = layer.forward(&x, &pos, Some(&padding))?;
+            x = layer.forward(&x, pos, padding)?;
         }
         Ok(x)
     }
@@ -3563,6 +3804,12 @@ mod tests {
         ParakeetPreparedEncoderArtifact, ParakeetPreprocessor, ParakeetRetainedDecodeBatchRow,
         ParakeetRetainedDecodeStep, ParakeetTimings, Predictor, TdtTokenFrame, DEFAULT_MAX_SYMBOLS,
         PRED_HIDDEN,
+    };
+    use super::{
+        encoder_batch_shape, encoder_graph_shape, encoder_graphs_requested,
+        encoder_window_batch_bytes, parakeet_encode_row_elements,
+        parakeet_encoder_graph_device_bytes, ENCODER_GRAPH_LIMITS, ENCODER_GRAPH_ROWS,
+        PARAKEET_ENCODER_GRAPHS_ENV,
     };
     use super::{
         parakeet_cuda_projection_precision, parakeet_tensor_is_bf16_projection,
@@ -4997,6 +5244,10 @@ mod tests {
 
     #[test]
     fn preparation_pricing_is_bounded_by_the_window() {
+        // Pricing and the encoder read `IZWI_PARAKEET_ENCODER_GRAPHS`.
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         const GIB: u64 = 1 << 30;
         let minute = 60 * 16_000;
         let total = |samples: usize, backend: BackendKind| {
@@ -5047,6 +5298,10 @@ mod tests {
     /// window's normalized copy instead of the whole log-mel pipeline.
     #[test]
     fn host_features_price_the_log_mel_and_one_window_upload() {
+        // Pricing and the encoder read `IZWI_PARAKEET_ENCODER_GRAPHS`.
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let device = Device::Cpu;
         let model = forced_label_model(&device);
         // 3 s at 8 kHz: 300 valid feature frames, 38 encoder frames.
@@ -5562,5 +5817,192 @@ mod tests {
             batch.to_vec2::<f32>().unwrap(),
             expected.to_vec2::<f32>().unwrap()
         );
+    }
+
+    /// A graph's shape: rows up to the next graph width, frames up to a
+    /// power of two, and nothing past 32 rows, one window or the pool.
+    #[test]
+    fn encoder_graph_shapes_pad_rows_to_a_width_and_frames_to_a_power_of_two() {
+        assert_eq!(encoder_graph_shape(1, 125), Some((1, 128)));
+        assert_eq!(encoder_graph_shape(0, 0), Some((1, 1)));
+        assert_eq!(encoder_graph_shape(5, 64), Some((6, 64)));
+        assert_eq!(encoder_graph_shape(17, 100), Some((24, 128)));
+        // Every width of 10 s clips, 12 rows of 20 s, a lone 82 s window.
+        assert_eq!(encoder_graph_shape(32, 125), Some((32, 128)));
+        assert_eq!(encoder_graph_shape(12, 250), Some((12, 256)));
+        assert_eq!(encoder_graph_shape(1, 1000), Some((1, 1024)));
+        assert_eq!(encoder_graph_shape(33, 8), None);
+        assert_eq!(encoder_graph_shape(13, 250), None, "16 rows of 256 frames");
+        assert_eq!(encoder_graph_shape(2, 1000), None);
+        assert_eq!(encoder_graph_shape(1, 1025), None, "past one window");
+        for rows in ENCODER_GRAPH_ROWS {
+            for frames in (0..=10).map(|exp| 1usize << exp) {
+                let Some(shape) = encoder_graph_shape(rows, frames) else {
+                    continue;
+                };
+                assert_eq!(shape, (rows, frames), "a graph's shape is its own");
+                let bytes = encoder_window_batch_bytes(frames, rows, BackendKind::Cuda).unwrap();
+                assert!(bytes.layers <= ENCODER_GRAPH_LIMITS.pool_bytes);
+            }
+        }
+    }
+
+    /// Admission prices the graphed shape on CUDA only, each real row
+    /// carrying its share of the padded batch; the graphs' own memory is a
+    /// CUDA load's.
+    #[test]
+    fn cuda_admission_prices_the_graphed_shape() {
+        // Pricing and the encoder read `IZWI_PARAKEET_ENCODER_GRAPHS`.
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(parakeet_encoder_graph_device_bytes(BackendKind::Cpu), 0);
+        assert_eq!(parakeet_encoder_graph_device_bytes(BackendKind::Metal), 0);
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            assert_eq!(encoder_batch_shape(5, 100, backend), (5, 100));
+        }
+        if !encoder_graphs_requested() {
+            assert_eq!(parakeet_encoder_graph_device_bytes(BackendKind::Cuda), 0);
+            assert_eq!(encoder_batch_shape(5, 100, BackendKind::Cuda), (5, 100));
+            return;
+        }
+        assert_eq!(
+            parakeet_encoder_graph_device_bytes(BackendKind::Cuda),
+            768 << 20
+        );
+        assert_eq!(encoder_batch_shape(5, 100, BackendKind::Cuda), (6, 128));
+        assert_eq!(encoder_batch_shape(13, 250, BackendKind::Cuda), (13, 250));
+
+        let model = forced_label_model(&Device::Cpu);
+        let features = features_of_frames(&model, 38, 5);
+        for rows in [1usize, 3, 5, 17, 32, 40] {
+            let (batch_rows, frames) = encoder_batch_shape(rows, 38, BackendKind::Cuda);
+            let batch = encoder_window_batch_bytes(frames, batch_rows, BackendKind::Cuda).unwrap();
+            let row = parakeet_encode_row_bytes(&features, 38, rows, BackendKind::Cuda).unwrap();
+            let eager = parakeet_encode_row_bytes(&features, 38, rows, BackendKind::Cpu).unwrap();
+            assert!(row.window_bytes * rows as u64 >= batch.stem + batch.layers);
+            assert!(row.window_bytes >= eager.window_bytes, "{rows} rows");
+            let (useful, materialized) =
+                parakeet_encode_row_elements(&features, 38, rows, BackendKind::Cuda).unwrap();
+            assert_eq!(useful, (38 * EncoderGeometry::V3.dim) as u64);
+            assert_eq!(materialized, (frames * EncoderGeometry::V3.dim) as u64);
+        }
+    }
+
+    /// `IZWI_PARAKEET_ENCODER_GRAPHS=0` reaches admission (no graph memory,
+    /// the eager shape) and the loader (no graphs, naming the switch).
+    #[test]
+    fn the_kill_switch_turns_the_graphs_and_their_pricing_off() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(PARAKEET_ENCODER_GRAPHS_ENV);
+        std::env::set_var(PARAKEET_ENCODER_GRAPHS_ENV, "0");
+        let bytes = parakeet_encoder_graph_device_bytes(BackendKind::Cuda);
+        let shape = encoder_batch_shape(5, 100, BackendKind::Cuda);
+        let reason = random_encoder(TINY, 1, &Device::Cpu).graphs.err();
+        std::env::remove_var(PARAKEET_ENCODER_GRAPHS_ENV);
+        let on = (
+            parakeet_encoder_graph_device_bytes(BackendKind::Cuda),
+            encoder_batch_shape(5, 100, BackendKind::Cuda),
+        );
+        if let Some(previous) = previous {
+            std::env::set_var(PARAKEET_ENCODER_GRAPHS_ENV, previous);
+        }
+        assert_eq!(bytes, 0);
+        assert_eq!(shape, (5, 100));
+        let reason = reason.expect("no graphs");
+        assert!(reason.contains(PARAKEET_ENCODER_GRAPHS_ENV), "{reason}");
+        assert_eq!(on, (768 << 20, (6, 128)), "on when unset");
+    }
+
+    /// Off CUDA the encoder has no graphs, and says why.
+    #[test]
+    fn cpu_encoder_runs_without_graphs() {
+        let encoder = random_encoder(TINY, 1, &Device::Cpu);
+        assert!(!encoder.graphs_on());
+        assert_eq!(encoder.batch_shape(5, 100), (5, 100));
+        let off = encoder.graphs_diagnostics()["off"].clone();
+        assert!(
+            off.as_str().is_some_and(|reason| !reason.is_empty()),
+            "{off}"
+        );
+    }
+
+    /// On CUDA, a padded batch (spare rows included) and a lone window run
+    /// through their graphs: capture, verify, then two replays, each bit for
+    /// bit the eager layers at the same padded shape, over fresh inputs.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_encoder_graphs_replay_the_eager_layers_bit_for_bit() {
+        // Pricing and the encoder read `IZWI_PARAKEET_ENCODER_GRAPHS`.
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        if !encoder_graphs_requested() {
+            return;
+        }
+        let mut model = forced_label_model(&device);
+        model.network.encoder = bf16_encoder(1, &device);
+        assert!(
+            model.network.encoder.graphs_on(),
+            "{}",
+            model.network.encoder.graphs_diagnostics()
+        );
+        let mut eager = bf16_encoder(1, &device);
+        eager.graphs = Err("eager reference".into());
+        let bits = |t: &Tensor| -> Vec<u32> {
+            host_f32(t).unwrap().into_iter().map(f32::to_bits).collect()
+        };
+        let upload = |features: &ParakeetHostFeatures| {
+            let len = features.encoded_len();
+            let columns = EncoderWindow::whole(len).feature_columns(features.feature_frames());
+            let window = features
+                .log_mel
+                .normalize_and_upload(columns, &device)
+                .unwrap();
+            (window, len)
+        };
+        for step in 0..4u64 {
+            // Five rows pad to the six-row graph of 64 frames.
+            let lengths = [37usize, 64, 50, 12, 61];
+            let features = lengths
+                .iter()
+                .zip(0..)
+                .map(|(len, index)| features_of_frames(&model, *len, 100 * step + index + 1))
+                .collect::<Vec<_>>();
+            let rows = features
+                .iter()
+                .map(|features| batch_row(features, &ready))
+                .collect::<Vec<_>>();
+            let graphed = model.prepare_retained_encoder_batch(&rows).unwrap();
+            let uploaded = features.iter().map(upload).collect::<Vec<_>>();
+            assert_eq!(model.network.encoder.batch_shape(5, 64), (6, 64));
+            let want = eager
+                .encode_single_window_batch_at(&uploaded, (6, 64))
+                .unwrap();
+            for (index, (got, want)) in graphed.into_iter().zip(&want).enumerate() {
+                let got = got.unwrap();
+                assert_eq!(got.encoded.dims(), want.dims());
+                assert_eq!(bits(&got.encoded), bits(want), "step {step} row {index}");
+            }
+
+            // A lone 125-frame window runs the one-row graph of 128 frames.
+            let solo = features_of_frames(&model, 125, 7 + step);
+            let got = model.encode_host_features(&solo, None, &ready).unwrap();
+            let want = eager
+                .encode_single_window_batch_at(&[upload(&solo)], (1, 128))
+                .unwrap();
+            assert_eq!(bits(&got.encoded), bits(&want[0]), "step {step} solo");
+        }
+        let diagnostics = model.network.encoder.graphs_diagnostics();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        assert_eq!(diagnostics["captures"], 2, "{diagnostics}");
+        assert_eq!(diagnostics["verified"], 2, "{diagnostics}");
+        assert_eq!(diagnostics["replays"], 4, "{diagnostics}");
+        assert_eq!(diagnostics["fallbacks"], 0, "{diagnostics}");
     }
 }
