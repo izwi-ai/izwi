@@ -6373,7 +6373,7 @@ pub(super) mod tests {
     const BATCH_ROWS: [(usize, usize); 4] = [(216, 0), (112, 3), (208, 7), (336, 3)];
 
     /// Each row of a padded batch with mixed prompts encodes as it does
-    /// alone, to 1e-6 of its scale on CPU F32, and so does its joint
+    /// alone, to 4e-6 of its scale on CPU F32, and so does its joint
     /// encoder projection, which the batch copies into its own storage.
     #[test]
     fn batched_encode_matches_solo_rows_across_chunk_phases_and_prompts() {
@@ -6409,7 +6409,10 @@ pub(super) mod tests {
             assert_eq!(solo_projection.dims(), [lengths[row], JOINT_HIDDEN]);
             for (batched, alone) in [(&encoded[row], &solo), (&projected[row], &solo_projection)] {
                 let difference = max_abs_difference(batched, alone);
-                let bound = 1e-6 * max_abs_of(alone).max(1.0);
+                // Padded rows' softmax sums over the padded length, which the
+                // SIMD reduction regroups (9.5e-7 of scale on this Mac); x86
+                // CI may regroup differently, so the bound leaves room.
+                let bound = 4e-6 * max_abs_of(alone).max(1.0);
                 assert!(
                     difference <= bound,
                     "row {row}: {difference:e} above {bound:e}"

@@ -3544,6 +3544,9 @@ mod tests {
     }
 
     /// Largest absolute difference; NaN or infinity counts as infinitely far.
+    /// Batched vs solo encodes on CPU F32, as a fraction of the row's scale.
+    const BATCHED_ENCODE_TOLERANCE: f32 = 4e-6;
+
     fn max_abs_diff(left: &Tensor, right: &Tensor) -> f32 {
         assert_eq!(left.dims(), right.dims());
         let values = |tensor: &Tensor| tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -4484,8 +4487,11 @@ mod tests {
                 "not bit-exact"
             }
         );
+        // A padded row's softmax sums over the padded length, which the SIMD
+        // reduction regroups: 7e-7 of scale here, and another CPU (x86 CI)
+        // can regroup differently, so the bound leaves room.
         assert!(
-            worst <= 1e-6 * scale.max(1.0),
+            worst <= BATCHED_ENCODE_TOLERANCE * scale.max(1.0),
             "max |diff| {worst} of {scale}"
         );
     }
@@ -4658,7 +4664,18 @@ mod tests {
         assert!(matches!(outcomes[1], Err(Error::Cancelled(_))));
         for index in [0, 2] {
             let artifact = outcomes[index].as_ref().unwrap();
-            assert!(max_abs_diff(&artifact.encoded, &solo(index).encoded) <= 1e-6);
+            let alone = solo(index).encoded;
+            let scale = alone
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                max_abs_diff(&artifact.encoded, &alone)
+                    <= BATCHED_ENCODE_TOLERANCE * scale.max(1.0)
+            );
         }
 
         let rows = [
