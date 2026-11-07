@@ -1664,8 +1664,8 @@ impl Qwen3AsrModel {
         let mel = MelSpectrogram::new(mel_cfg)?;
 
         // Quantized text checkpoints are trained/evaluated in bf16 and can
-        // degrade when forced through fp32 dequant paths. CUDA audio kernels are
-        // stricter around f32 boundaries, so select audio/text dtypes separately.
+        // degrade when forced through fp32 dequant paths. The audio and text
+        // dtypes are selected (and probed) separately.
         let is_gguf = gguf_loader.is_some();
         let checkpoint_format = if is_gguf { "gguf" } else { "safetensors" };
         let is_quantized = is_gguf || config.is_mlx_quantized();
@@ -1689,8 +1689,10 @@ impl Qwen3AsrModel {
         let text_context_tokens = text_cfg.context_length();
         let gguf_qmatmul_text_enabled = is_gguf && qwen3_asr_use_gguf_qmatmul_text(&device.device);
         // On Metal a lowered audio or text dtype must pass its own load-time
-        // probe, or that component alone reloads in F32 (report 13).
-        let check = device.kind.is_metal();
+        // probe, or that component alone reloads in F32 (report 13); on CUDA
+        // the lowered GGUF audio tower does.
+        let (check_audio, check_text) =
+            (qwen3_asr_audio_probe(device.kind), device.kind.is_metal());
         let (audio_tower, audio_precision, text_model, text_precision) =
             if let Some(gguf_path) = gguf_path.as_ref() {
                 let loader = gguf_loader.as_ref().ok_or_else(|| {
@@ -1700,7 +1702,7 @@ impl Qwen3AsrModel {
                 load_qwen3_asr_components(
                     &audio_selection,
                     &text_selection,
-                    check,
+                    (check_audio, check_text),
                     &device.device,
                     |audio_dtype| {
                         let vb_audio = var_builder_from_gguf_filtered(
@@ -1758,7 +1760,7 @@ impl Qwen3AsrModel {
                 load_qwen3_asr_components(
                     &audio_selection,
                     &text_selection,
-                    check,
+                    (check_audio, check_text),
                     &device.device,
                     |audio_dtype| {
                         AudioTower::load(
@@ -3512,17 +3514,18 @@ fn infer_downsample_hidden_size(loader: &GgufLoader) -> Result<usize> {
 }
 
 /// The audio tower and the text model, each read at its selected dtype by
-/// `load_audio` / `load_text`. With `check` (Metal), a dtype below F32 must
-/// pass that component's load-time probe, or the component alone reloads in
-/// F32 (report 13), for GGUF and safetensors checkpoints alike. Admission
-/// prices the selected dtypes, so a reload asks the load's
+/// `load_audio` / `load_text`. With a component's check set (the audio tower
+/// on Metal and CUDA, the text on Metal), a dtype below F32 must pass that
+/// component's load-time probe, or the component alone reloads in F32
+/// (report 13), for GGUF and safetensors checkpoints alike. Admission prices
+/// the selected dtypes, so a reload asks the load's
 /// [`admit_precision_reload`] gate for its memory
 /// (`load_with_precision_fallback` does), which first synchronizes the device
 /// so Candle frees the dropped component's buffers.
 fn load_qwen3_asr_components(
     audio_selection: &DTypeSelection,
     text_selection: &DTypeSelection,
-    check: bool,
+    (check_audio, check_text): (bool, bool),
     device: &candle_core::Device,
     mut load_audio: impl FnMut(DType) -> Result<AudioTower>,
     mut load_text: impl FnMut(DType) -> Result<Qwen3Model>,
@@ -3530,7 +3533,7 @@ fn load_qwen3_asr_components(
     let (audio_tower, audio_precision) = load_with_precision_fallback(
         "Qwen3-ASR audio tower",
         audio_selection,
-        check,
+        check_audio,
         DType::F32,
         &mut load_audio,
         |tower| qwen3_asr_audio_self_check(tower, audio_selection.dtype, device),
@@ -3538,7 +3541,7 @@ fn load_qwen3_asr_components(
     let (text_model, text_precision) = load_with_precision_fallback(
         "Qwen3-ASR text",
         text_selection,
-        check,
+        check_text,
         DType::F32,
         &mut load_text,
         qwen3_asr_text_self_check,
@@ -3738,8 +3741,8 @@ fn qwen3_asr_weight_precisions(
             }
         }
         _ => DTypeSelection {
-            dtype: qwen3_asr_default_audio_dtype(device.kind, is_gguf, text_dtype),
-            reason: if is_gguf && !device.kind.is_cuda() {
+            dtype: qwen3_asr_default_audio_dtype(is_gguf, text_dtype),
+            reason: if is_gguf {
                 "the GGUF audio tower runs at the text dtype; it falls back to F32 alone if its probe fails".into()
             } else {
                 format!("{:?} default audio dtype", device.kind).into()
@@ -3820,18 +3823,23 @@ fn qwen3_asr_text_self_check(model: &Qwen3Model) -> NumericSelfCheckReport {
     })
 }
 
-fn qwen3_asr_default_audio_dtype(
-    device_kind: DeviceKind,
-    is_gguf: bool,
-    text_dtype: DType,
-) -> DType {
-    if is_gguf && device_kind.is_cuda() {
-        return DType::F32;
-    }
+/// The GGUF audio tower runs at the text activation dtype on every backend
+/// (BF16 on CUDA, where an F32 tower also left FlashAttention-2's varlen
+/// kernel unused and ran its attention windows one by one); a load-time probe
+/// on Metal and CUDA reloads it alone at F32 if it fails. Safetensors towers
+/// stay F32.
+fn qwen3_asr_default_audio_dtype(is_gguf: bool, text_dtype: DType) -> DType {
     if is_gguf {
-        return text_dtype;
+        text_dtype
+    } else {
+        DType::F32
     }
-    DType::F32
+}
+
+/// Whether a lowered audio tower runs its load-time probe on `kind`: on
+/// Metal and CUDA, the backends that lower it.
+fn qwen3_asr_audio_probe(kind: DeviceKind) -> bool {
+    kind.is_metal() || kind.is_cuda()
 }
 
 fn infer_lm_head_size_from_gguf(
@@ -5974,32 +5982,51 @@ mod tests {
         assert_eq!(parse_asr_dtype(Some("unknown")), None);
     }
 
+    /// The GGUF audio tower runs at the text dtype on CUDA (BF16), behind
+    /// its load-time probe; `IZWI_QWEN_ASR_AUDIO_DTYPE=f32` restores the F32
+    /// tower, and safetensors towers stay F32.
     #[test]
-    fn qwen_asr_cuda_gguf_audio_defaults_to_f32() {
+    fn qwen_asr_cuda_gguf_audio_follows_the_text_dtype_unless_f32_is_pinned() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var("IZWI_QWEN_ASR_AUDIO_DTYPE");
+        let cuda = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cuda,
+            capabilities: crate::backends::DeviceCapabilities {
+                supports_bf16: true,
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+        let precisions = |is_gguf: bool| {
+            qwen3_asr_weight_precisions(&cuda, ModelFamily::Qwen3Asr, is_gguf, true, None).unwrap()
+        };
+        let (text, audio) = precisions(true);
+        assert_eq!(text.dtype, DType::BF16);
+        assert_eq!(audio.dtype, DType::BF16);
+        assert!(audio.reason.contains("probe"), "{}", audio.reason);
+        assert!(qwen3_asr_audio_probe(DeviceKind::Cuda));
         assert_eq!(
-            qwen3_asr_default_audio_dtype(DeviceKind::Cuda, true, DType::BF16),
+            qwen3_asr_default_audio_dtype(false, DType::BF16),
             DType::F32
         );
-        assert_eq!(
-            qwen3_asr_default_audio_dtype(DeviceKind::Cuda, true, DType::F16),
-            DType::F32
-        );
-        assert_eq!(
-            qwen3_asr_default_audio_dtype(DeviceKind::Cuda, false, DType::BF16),
-            DType::F32
-        );
+
+        std::env::set_var("IZWI_QWEN_ASR_AUDIO_DTYPE", "f32");
+        let (_, pinned) = precisions(true);
+        std::env::remove_var("IZWI_QWEN_ASR_AUDIO_DTYPE");
+        assert_eq!(pinned.dtype, DType::F32);
+        assert!(pinned.reason.contains("override"), "{}", pinned.reason);
     }
 
     #[test]
     fn qwen_asr_non_cuda_gguf_audio_policy_is_unchanged() {
-        assert_eq!(
-            qwen3_asr_default_audio_dtype(DeviceKind::Metal, true, DType::F16),
-            DType::F16
-        );
-        assert_eq!(
-            qwen3_asr_default_audio_dtype(DeviceKind::Cpu, true, DType::F32),
-            DType::F32
-        );
+        assert_eq!(qwen3_asr_default_audio_dtype(true, DType::F16), DType::F16);
+        assert_eq!(qwen3_asr_default_audio_dtype(true, DType::F32), DType::F32);
+        assert!(qwen3_asr_audio_probe(DeviceKind::Metal));
+        assert!(!qwen3_asr_audio_probe(DeviceKind::Cpu));
     }
 
     fn qwen3_test_mel(n_mels: usize) -> MelSpectrogram {
@@ -6756,36 +6783,48 @@ mod precision_tests {
     /// QFA-7 / ADM-11: both checkpoint formats load through one helper, so
     /// a safetensors checkpoint's lowered tier (the 4-bit aligner's F16 text
     /// on Metal) runs its load-time probe, as the GGUF one always did. F32
-    /// is the reference and is never probed; off Metal nothing is.
+    /// is the reference and is never probed. Metal probes both components,
+    /// CUDA the audio tower (its GGUF BF16 tower), CPU neither. The lowered
+    /// tower here is F16: Candle's CPU conv2d has no BF16 kernel.
     #[test]
     fn lowered_tiers_run_their_load_time_probe_on_metal() {
         let device = Device::Cpu;
-        for check in [true, false] {
-            let mut audio_loads = Vec::new();
-            let mut text_loads = Vec::new();
-            let (_, audio, _, text) = load_qwen3_asr_components(
-                &selection(DType::F32),
-                &selection(DType::F16),
-                check,
-                &device,
-                |dtype| {
-                    audio_loads.push(dtype);
-                    Ok(super::audio::tiny_audio_tower_for_test(&device))
-                },
-                |dtype| {
-                    text_loads.push(dtype);
-                    Ok(tiny_qwen3_model_for_test(&device))
-                },
-            )
-            .unwrap();
-            assert_eq!(audio_loads, [DType::F32]);
-            // A passing probe keeps the tier: one load, no F32 reload.
-            assert_eq!(text_loads, [DType::F16]);
-            assert!(audio.self_check.is_none());
-            assert_eq!(text.loaded, DType::F16);
-            match text.self_check {
-                Some(report) => assert!(check && report.passed, "{}", report.reason),
-                None => assert!(!check),
+        for (check_audio, check_text) in [(true, true), (true, false), (false, false)] {
+            for audio_dtype in [DType::F32, DType::F16] {
+                let mut audio_loads = Vec::new();
+                let mut text_loads = Vec::new();
+                let (_, audio, _, text) = load_qwen3_asr_components(
+                    &selection(audio_dtype),
+                    &selection(DType::F16),
+                    (check_audio, check_text),
+                    &device,
+                    |dtype| {
+                        audio_loads.push(dtype);
+                        Ok(super::audio::tiny_audio_tower_at_for_test(&device, dtype))
+                    },
+                    |dtype| {
+                        text_loads.push(dtype);
+                        Ok(tiny_qwen3_model_for_test(&device))
+                    },
+                )
+                .unwrap();
+                // A passing probe keeps the tier: one load, no F32 reload.
+                assert_eq!(audio_loads, [audio_dtype]);
+                assert_eq!(text_loads, [DType::F16]);
+                assert_eq!(audio.loaded, audio_dtype);
+                assert_eq!(text.loaded, DType::F16);
+                match audio.self_check {
+                    Some(report) => assert!(
+                        check_audio && audio_dtype == DType::F16 && report.passed,
+                        "{}",
+                        report.reason
+                    ),
+                    None => assert!(!check_audio || audio_dtype == DType::F32),
+                }
+                match text.self_check {
+                    Some(report) => assert!(check_text && report.passed, "{}", report.reason),
+                    None => assert!(!check_text),
+                }
             }
         }
     }
@@ -6818,7 +6857,7 @@ mod precision_tests {
                 load_qwen3_asr_components(
                     &selection(DType::F32),
                     &selection(DType::F16),
-                    true,
+                    (true, true),
                     &device,
                     |_| Ok(super::audio::tiny_audio_tower_for_test(&device)),
                     |dtype| {

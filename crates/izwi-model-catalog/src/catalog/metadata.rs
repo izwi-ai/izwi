@@ -990,11 +990,11 @@ impl ModelVariant {
     /// checkpoints' headers.
     fn memory_required_gb_by_backend(&self) -> Option<[f32; 3]> {
         Some(match self {
-            Self::ParakeetTdt06BV3 => [4.0, 3.0, 3.0],
+            Self::ParakeetTdt06BV3 => [4.0, 3.0, 2.0],
             Self::Nemotron35AsrStreaming06B => [4.0, 3.0, 1.5],
             Self::WhisperLargeV3Turbo => [4.5, 3.0, 2.0],
-            Self::Qwen3Asr06BGguf => [2.5, 2.5, 1.5],
-            Self::Qwen3Asr17BGguf => [4.0, 3.5, 3.0],
+            Self::Qwen3Asr06BGguf => [2.5, 2.5, 1.0],
+            Self::Qwen3Asr17BGguf => [4.0, 3.5, 2.5],
             Self::GraniteSpeech412BPlus => [9.0, 5.5, 4.5],
             Self::GraniteSpeech412B | Self::GraniteSpeech502B => [10.0, 6.0, 4.5],
             Self::GraniteSpeech502BGguf => [5.0, 4.0, 3.0],

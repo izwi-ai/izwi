@@ -1470,9 +1470,9 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_PARAKEET_ASR_DTYPE",
         Choice,
-        "F16 encoder projections on Metal, else F32",
+        "F16 encoder projections on Metal, BF16 on CUDA with BF16, else F32",
         Load,
-        "Parakeet dtype override: on Metal f32 keeps every weight F32 and f16 stores encoder projections in F16.",
+        "Parakeet dtype override: f32 keeps every weight F32 on Metal and CUDA; on Metal f16 stores the encoder projections in F16, on CUDA bf16 runs them and their GEMMs in BF16 with an F32 residual stream.",
     ),
     CoreEnvVar::new(
         "IZWI_PARAKEET_ENCODER_BATCHING",
@@ -2331,9 +2331,9 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_QWEN_ASR_AUDIO_DTYPE",
         Choice,
-        "backend default (GGUF: text dtype)",
+        "GGUF: the text dtype (BF16 on CUDA), behind a load-time probe on Metal and CUDA; safetensors: F32",
         Load,
-        "Overrides the Qwen3-ASR audio tower dtype (e.g. f32, f16, bf16).",
+        "Overrides the Qwen3-ASR audio tower dtype (e.g. f32, f16, bf16); f32 restores the F32 tower on CUDA.",
     ),
     CoreEnvVar::new(
         "IZWI_QWEN_ASR_STREAM_CHARS_PER_TOKEN",

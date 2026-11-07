@@ -886,6 +886,30 @@ mod tests {
         ));
     }
 
+    /// The Qwen3-ASR audio tower's attention windows (head_dim 64: 896/14
+    /// and 1024/16) take FlashAttention-2 on an H100 once the GGUF tower runs
+    /// in BF16 on CUDA, and fell back to the eager per-window loop in F32.
+    #[test]
+    fn qwen3_asr_audio_windows_take_flash_attention_only_below_f32() {
+        let decide = |dtype| {
+            should_try_cuda_flash_attention(
+                true,
+                true,
+                false,
+                64,
+                dtype,
+                dtype,
+                dtype,
+                Some((9, 0)),
+            )
+        };
+        assert_eq!(decide(DType::BF16), CudaFlashAttentionDecision::Try);
+        assert_eq!(
+            decide(DType::F32),
+            CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashDTypeUnsupported)
+        );
+    }
+
     #[test]
     fn cuda_flash_attention_policy_has_explicit_fallback_reasons() {
         assert_eq!(

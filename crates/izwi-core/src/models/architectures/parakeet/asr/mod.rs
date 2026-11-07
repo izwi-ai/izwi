@@ -24,7 +24,7 @@ use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
 use crate::kernels::depthwise_conv::{depthwise_conv1d, DepthwiseConv1dSpec};
 use crate::kernels::f16_weight_linear::{
-    load_weight_only_f16, PointwiseConv1d, ProjectionLinear, WeightOnlyF16Load,
+    load_weight_only_f16, F16WeightLinear, PointwiseConv1d, ProjectionLinear, WeightOnlyF16Load,
     F16_PROJECTION_MAX_RELATIVE_L2,
 };
 use crate::kernels::numeric_check::{
@@ -51,32 +51,83 @@ pub(crate) use physical::{parakeet_physical_state_spec, PARAKEET_PREDICTOR_STATE
 pub(crate) use physical::{ParakeetPhysicalStateSpec, PARAKEET_PREDICTOR_STATE_GROUP};
 use preprocessor::{ParakeetLogMel, ParakeetPreprocessor};
 
-/// The dtype the Parakeet loader reads every weight in, and the activation
-/// dtype on every backend. On Metal the encoder's projection weights are then
-/// stored in F16 (see [`resolve_parakeet_projection_precision`]). Load
-/// admission prices the checkpoint from both
-/// (`runtime/lifecycle/asr_memory.rs`).
+/// The dtype the Parakeet loader reads every weight in, and the dtype of the
+/// encoder's residual stream on every backend. The encoder's projection
+/// weights are then stored in F16 on Metal or BF16 on CUDA (see
+/// [`resolve_parakeet_projection_precision`]). Load admission prices the
+/// checkpoint from both (`runtime/lifecycle/asr_memory.rs`).
 pub(crate) const PARAKEET_WEIGHT_DTYPE: DType = DType::F32;
 
 /// Parakeet's dtype override. On Metal, `f32` keeps every weight in F32 and
-/// `f16` stores the encoder projections in F16; see
+/// `f16` stores the encoder projections in F16; on CUDA, `f32` keeps every
+/// weight in F32 and `bf16` (the default) runs the projections in BF16; see
 /// [`resolve_parakeet_projection_precision`].
 pub(crate) const PARAKEET_ASR_DTYPE_ENV: &str = "IZWI_PARAKEET_ASR_DTYPE";
 
-/// Whether the encoder's projection weights (FFN, attention q/k/v/out/pos,
-/// pointwise convs and the subsampling output projection) load in F16 on
-/// `device`: F16 when they do, F32 when every weight stays F32. The rest
-/// stays F32 as in whisper.cpp's Parakeet converter: subsampling convs,
-/// depthwise conv and BatchNorm, LayerNorms, biases, positional biases, and
-/// the TDT predictor and joint. Activations are F32 throughout. A failed
-/// load-time self-check still falls back to F32 ([`load_weight_only_f16`]).
+/// The precision of the encoder's projections (FFN, attention q/k/v/out/pos,
+/// pointwise convs and the subsampling output projection) on `device`:
+/// - F16 on Metal: weight-only F16 with F32 activations, as in whisper.cpp's
+///   Parakeet converter. A failed load-time self-check still falls back to
+///   F32 ([`load_weight_only_f16`]).
+/// - BF16 on CUDA ([`parakeet_cuda_projection_precision`]): BF16 weights and
+///   GEMMs, each encoder block casting its input to BF16 once and its output
+///   back to the F32 residual stream.
+/// - F32 otherwise: every weight stays F32.
+///
+/// Subsampling convs, depthwise conv and BatchNorm, LayerNorms, positional
+/// biases, the relative-position attention core, and the TDT predictor and
+/// joint stay F32 in every tier.
 pub(crate) fn resolve_parakeet_projection_precision(device: &DeviceProfile) -> DTypeSelection {
     let family = std::env::var(PARAKEET_ASR_DTYPE_ENV).ok();
+    if device.kind.is_cuda() {
+        return parakeet_cuda_projection_precision(
+            device.capabilities.supports_bf16,
+            family.as_deref(),
+        );
+    }
     device.resolve_metal_weight_only_f16(
         family
             .as_deref()
             .map(|value| (PARAKEET_ASR_DTYPE_ENV, value)),
     )
+}
+
+/// The CUDA projection tier: BF16 on a device that supports it, unless the
+/// family override `raw` names F32. The F32 encoder is launch-bound on an
+/// H100 (122 ms per 10 s clip); BF16 keeps F32's range, so it needs no
+/// load-time range probe.
+fn parakeet_cuda_projection_precision(supports_bf16: bool, raw: Option<&str>) -> DTypeSelection {
+    let raw = raw.map(str::trim).filter(|raw| !raw.is_empty());
+    let note = match raw {
+        Some(raw) => match crate::backends::parse_dtype_name(raw) {
+            Some(DType::F32) => {
+                return DTypeSelection {
+                    dtype: DType::F32,
+                    reason: format!("{PARAKEET_ASR_DTYPE_ENV}={raw} keeps every weight in F32")
+                        .into(),
+                };
+            }
+            Some(DType::BF16) => format!("; {PARAKEET_ASR_DTYPE_ENV}={raw}"),
+            _ => format!(
+                "; {PARAKEET_ASR_DTYPE_ENV}={raw} is not a CUDA Parakeet precision and is ignored"
+            ),
+        },
+        None => String::new(),
+    };
+    if !supports_bf16 {
+        return DTypeSelection {
+            dtype: DType::F32,
+            reason: format!("the CUDA device reports no BF16 support; weights stay F32{note}")
+                .into(),
+        };
+    }
+    DTypeSelection {
+        dtype: DType::BF16,
+        reason: format!(
+            "CUDA default: BF16 encoder projections and GEMMs with an F32 residual stream{note}"
+        )
+        .into(),
+    }
 }
 
 /// Whether checkpoint tensor `name` is one of the encoder projections that
@@ -112,12 +163,99 @@ pub(crate) fn parakeet_tensor_is_f16_projection(name: &str) -> bool {
         )
 }
 
-/// The host-side builder for weights that load in F16: they are read on the
-/// CPU and converted there, so their F32 form never reaches the GPU.
-fn projection_vb<'a>(vb: &VarBuilder<'a>, f16: Option<&Device>) -> VarBuilder<'a> {
-    match f16 {
-        Some(_) => vb.clone().set_device(Device::Cpu),
-        None => vb.clone(),
+/// Whether checkpoint tensor `name` loads in BF16 when
+/// [`resolve_parakeet_projection_precision`] selects BF16: the F16 set plus
+/// the subsampling output projection's bias, which its BF16 GEMM adds.
+/// Admission prices these at BF16.
+pub(crate) fn parakeet_tensor_is_bf16_projection(name: &str) -> bool {
+    name == "encoder.pre_encode.out.bias" || parakeet_tensor_is_f16_projection(name)
+}
+
+/// How the encoder's projections load: the tier
+/// [`resolve_parakeet_projection_precision`] selects, on its device.
+#[derive(Debug, Clone, Copy)]
+enum Projections<'a> {
+    /// Every weight dense F32 on the checkpoint's device.
+    F32,
+    /// Weight-only F16 on the device: F32 activations.
+    F16(&'a Device),
+    /// BF16 weights and GEMMs on the device: each block casts its input to
+    /// BF16 once and its output back to F32.
+    Bf16(&'a Device),
+}
+
+impl<'a> Projections<'a> {
+    /// The builder projections read from: the host for a converted tier, so
+    /// the weight is converted there and its F32 form never reaches the GPU.
+    fn vb<'v>(self, vb: &VarBuilder<'v>) -> VarBuilder<'v> {
+        match self {
+            Self::F32 => vb.clone(),
+            Self::F16(_) | Self::Bf16(_) => vb.clone().set_device(Device::Cpu),
+        }
+    }
+
+    fn f16_device(self) -> Option<&'a Device> {
+        match self {
+            Self::F16(device) => Some(device),
+            Self::F32 | Self::Bf16(_) => None,
+        }
+    }
+
+    /// The dtype the projection GEMMs run in.
+    fn dtype(self) -> DType {
+        match self {
+            Self::Bf16(_) => DType::BF16,
+            Self::F32 | Self::F16(_) => DType::F32,
+        }
+    }
+
+    /// `linear`, read through [`Self::vb`], in this tier.
+    fn linear(self, linear: Linear) -> Result<ProjectionLinear> {
+        match self {
+            Self::Bf16(device) => Ok(ProjectionLinear::Dense(bf16_linear(
+                linear.weight(),
+                linear.bias(),
+                device,
+            )?)),
+            Self::F32 | Self::F16(_) => {
+                ProjectionLinear::new(linear, self.f16_device()).map_err(Error::from)
+            }
+        }
+    }
+
+    /// The pointwise conv `conv`, read through [`Self::vb`], in this tier.
+    fn pointwise(self, conv: Conv1d) -> Result<ConvPointwise> {
+        match self {
+            Self::Bf16(device) => {
+                let (out_channels, in_channels, _) = conv.weight().dims3()?;
+                Ok(ConvPointwise::Bf16(bf16_linear(
+                    &conv.weight().reshape((out_channels, in_channels))?,
+                    conv.bias(),
+                    device,
+                )?))
+            }
+            Self::F32 | Self::F16(_) => Ok(ConvPointwise::Conv(PointwiseConv1d::new(
+                conv,
+                self.f16_device(),
+            )?)),
+        }
+    }
+}
+
+/// A BF16 copy of a host weight (and bias) on `device`, converted on the host
+/// and uploaded once at its exact size.
+fn bf16_linear(weight: &Tensor, bias: Option<&Tensor>, device: &Device) -> Result<Linear> {
+    let upload = |tensor: &Tensor| tensor.to_dtype(DType::BF16)?.to_device(device);
+    Ok(Linear::new(upload(weight)?, bias.map(upload).transpose()?))
+}
+
+/// `x` as a contiguous tensor of `dtype`. A cast writes contiguous output, so
+/// a strided view costs one kernel either way.
+fn contiguous_as(x: &Tensor, dtype: DType) -> candle_core::Result<Tensor> {
+    if x.dtype() == dtype {
+        x.contiguous()
+    } else {
+        x.to_dtype(dtype)
     }
 }
 
@@ -1152,7 +1290,7 @@ impl ParakeetAsrModel {
             "tdt_blank_steps": state.counters.tdt_blank_steps,
             "host_argmax_reads": state.counters.host_argmax_reads,
             "device_argmax_scalar_reads": state.counters.device_argmax_scalar_reads,
-            "weight_precision": self.weight_precision.diagnostics(),
+            "weight_precision": self.weight_precision_diagnostics(),
         });
         if let Some(stop_reason) = state.stop_reason {
             diagnostics["stop_reason"] = stop_reason.into();
@@ -1338,6 +1476,19 @@ impl ParakeetAsrModel {
         result
     }
 
+    /// The encoder's projection precision for diagnostics: weight-only F16
+    /// or F32 as loaded, or the BF16 tier's mixed precision.
+    fn weight_precision_diagnostics(&self) -> serde_json::Value {
+        let mut diagnostics = self.weight_precision.diagnostics();
+        if self.network.encoder.projection_dtype == DType::BF16 {
+            diagnostics["projection_weights"] = "BF16".into();
+            diagnostics["activations"] =
+                "BF16 projection GEMMs; F32 residual stream, norms, depthwise conv and attention core"
+                    .into();
+        }
+        diagnostics
+    }
+
     pub fn load(
         model_dir: &Path,
         variant: ModelVariant,
@@ -1391,11 +1542,7 @@ impl ParakeetAsrModel {
         let (network, weight_precision) = ParakeetNetwork::load(&vb, projection_precision)?;
         tracing::info!(
             "Parakeet encoder projections load in {}: {}",
-            if weight_precision.projections_f16 {
-                "F16"
-            } else {
-                "F32"
-            },
+            network.encoder.projection_weights(),
             weight_precision.reason
         );
 
@@ -1629,7 +1776,7 @@ impl ParakeetAsrModel {
             self.max_symbols,
         );
         diagnostics["timestamp_words"] = self.decoder.timestamp_words(&token_ids, &token_frames);
-        diagnostics["execution"]["weight_precision"] = self.weight_precision.diagnostics();
+        diagnostics["execution"]["weight_precision"] = self.weight_precision_diagnostics();
 
         Ok(ParakeetAsrTranscriptionOutput {
             text: assembled,
@@ -1970,36 +2117,69 @@ struct ParakeetEncoder {
     geometry: EncoderGeometry,
     pre_encode: ConvSubsamplingDw,
     layers: Vec<ConformerLayer>,
+    /// The dtype the projection GEMMs run in: BF16 in the CUDA tier, else
+    /// F32 (weight-only F16 projections take and return F32).
+    projection_dtype: DType,
 }
 
 impl ParakeetEncoder {
-    /// Loads the encoder with its projections in F16 on `f16` when given.
-    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
-        let pre_encode = ConvSubsamplingDw::load(vb.pp("pre_encode"), geometry, f16)?;
+    /// Loads the encoder with its projections in `projections`' tier.
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, projections: Projections) -> Result<Self> {
+        let pre_encode = ConvSubsamplingDw::load(vb.pp("pre_encode"), geometry, projections)?;
         let layers = (0..geometry.layers)
-            .map(|idx| ConformerLayer::load(vb.pp(format!("layers.{idx}")), geometry, f16))
+            .map(|idx| ConformerLayer::load(vb.pp(format!("layers.{idx}")), geometry, projections))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             geometry,
             pre_encode,
             layers,
+            projection_dtype: projections.dtype(),
         })
     }
 
-    /// Loads the encoder at `precision` (F16 = weight-only F16 projections),
-    /// keeping F16 only if [`Self::weight_only_f16_self_check`] passes.
+    /// Loads the encoder at `precision`: BF16 projections and GEMMs, or
+    /// weight-only F16 projections kept only if
+    /// [`Self::weight_only_f16_self_check`] passes, or F32.
     fn load_with_precision(
         vb: VarBuilder,
         geometry: EncoderGeometry,
         precision: DTypeSelection,
     ) -> Result<(Self, WeightOnlyF16Load)> {
+        let device = vb.device().clone();
+        if precision.dtype == DType::BF16 {
+            let encoder = Self::load(vb, geometry, Projections::Bf16(&device))?;
+            return Ok((encoder, WeightOnlyF16Load::dense(precision.reason)));
+        }
         load_weight_only_f16(
             "Parakeet",
             &precision,
-            &vb.device().clone(),
-            |f16| Self::load(vb.clone(), geometry, f16),
+            &device,
+            |f16| {
+                let projections = f16.map_or(Projections::F32, Projections::F16);
+                Self::load(vb.clone(), geometry, projections)
+            },
             |encoder| encoder.weight_only_f16_self_check(&vb),
         )
+    }
+
+    /// The projection weights' dtype, as diagnostics report it.
+    fn projection_weights(&self) -> &'static str {
+        if self.pre_encode.out.as_f16().is_some() {
+            "F16"
+        } else if self.projection_dtype == DType::BF16 {
+            "BF16"
+        } else {
+            "F32"
+        }
+    }
+
+    /// The relative positional embedding of a `frames`-frame input, in the
+    /// projection dtype: `linear_pos` reads it in every layer, so it is cast
+    /// once per encode, not once per layer.
+    fn positions(&self, frames: usize, device: &Device) -> Result<Tensor> {
+        build_rel_positional_embedding(frames, self.geometry.dim, device)?
+            .to_dtype(self.projection_dtype)
+            .map_err(Error::from)
     }
 
     /// Checks the F16 conversion against the original F32 weight of the first
@@ -2017,7 +2197,9 @@ impl ParakeetEncoder {
                 let original = mlx::load_linear_no_bias(
                     geometry.dim,
                     geometry.ff_dim,
-                    projection_vb(vb, Some(&Device::Cpu)).pp("layers.0.feed_forward1.linear1"),
+                    Projections::F16(&Device::Cpu)
+                        .vb(vb)
+                        .pp("layers.0.feed_forward1.linear1"),
                 )?;
                 let relative = converted.check_against(original.weight(), None, 8)?;
                 if !relative.is_finite() || relative > F16_PROJECTION_MAX_RELATIVE_L2 {
@@ -2030,7 +2212,7 @@ impl ParakeetEncoder {
             let features = xorshift_tensor(&[1, geometry.mel_bins, 64], 0xA5A5, 2.0, device)?;
             let mut x = self.pre_encode.forward(&features)?;
             let mut outputs = vec![("pre_encode".to_string(), x.clone())];
-            let pos = build_rel_positional_embedding(x.dim(1)?, geometry.dim, device)?;
+            let pos = self.positions(x.dim(1)?, device)?;
             for (index, layer) in self.layers.iter().enumerate() {
                 x = layer.forward(&x, &pos, None)?;
                 outputs.push((format!("layers.{index}"), x.clone()));
@@ -2083,7 +2265,7 @@ impl ParakeetEncoder {
             let pos_started = Instant::now();
             let pos = match pos_emb.take() {
                 Some(pos) if pos.dim(1)? == 2 * frames - 1 => pos,
-                _ => build_rel_positional_embedding(frames, self.geometry.dim, x.device())?,
+                _ => self.positions(frames, x.device())?,
             };
             timings.pos_emb_ms += elapsed_ms(pos_started);
 
@@ -2180,7 +2362,7 @@ impl ParakeetEncoder {
     fn encode_padded(&self, mut x: Tensor, lengths: &[usize]) -> Result<Tensor> {
         let padded = x.dim(1)?;
         let padding = EncoderPadding::new(lengths, padded, x.dtype(), x.device())?;
-        let pos = build_rel_positional_embedding(padded, self.geometry.dim, x.device())?;
+        let pos = self.positions(padded, x.device())?;
         for layer in &self.layers {
             x = layer.forward(&x, &pos, Some(&padding))?;
         }
@@ -2250,10 +2432,12 @@ struct ConvSubsamplingDw {
     conv5: Conv2d,
     conv6: Conv2d,
     out: ProjectionLinear,
+    /// The dtype `out` runs in; the convolutions and the output stay F32.
+    dtype: DType,
 }
 
 impl ConvSubsamplingDw {
-    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, projections: Projections) -> Result<Self> {
         let channels = geometry.subsampling_channels;
         let stride_cfg = Conv2dConfig {
             stride: 2,
@@ -2277,14 +2461,11 @@ impl ConvSubsamplingDw {
         let conv5 = mlx::load_conv2d(1, channels, 3, dw_stride_cfg, vb.pp("conv.5"))?;
         let conv6 = mlx::load_conv2d(channels, channels, 1, point_cfg, vb.pp("conv.6"))?;
 
-        let out = ProjectionLinear::new(
-            mlx::load_linear(
-                channels * geometry.subsampled_mel_bins(),
-                geometry.dim,
-                projection_vb(&vb, f16).pp("out"),
-            )?,
-            f16,
-        )?;
+        let out = projections.linear(mlx::load_linear(
+            channels * geometry.subsampled_mel_bins(),
+            geometry.dim,
+            projections.vb(&vb).pp("out"),
+        )?)?;
 
         Ok(Self {
             conv0,
@@ -2293,6 +2474,7 @@ impl ConvSubsamplingDw {
             conv5,
             conv6,
             out,
+            dtype: projections.dtype(),
         })
     }
 
@@ -2357,10 +2539,13 @@ impl ConvSubsamplingDw {
         x = self.conv6.forward(&x)?;
         x = x.relu()?;
 
+        // The layout copy before `out` is also its cast to the projection
+        // dtype; the stem output joins the F32 residual stream.
         let (b, c, t, f) = x.dims4()?;
-        x.transpose(1, 2)?
+        contiguous_as(&x.transpose(1, 2)?, self.dtype)?
             .reshape((b, t, c * f))?
-            .apply(&self.out)
+            .apply(&self.out)?
+            .to_dtype(DType::F32)
             .map_err(Error::from)
     }
 }
@@ -2404,19 +2589,19 @@ struct ConformerLayer {
 }
 
 impl ConformerLayer {
-    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, projections: Projections) -> Result<Self> {
         let dim = geometry.dim;
         let norm_ff1 = layer_norm(dim, 1e-5, vb.pp("norm_feed_forward1"))?;
-        let ff1 = FeedForward::load(vb.pp("feed_forward1"), geometry, f16)?;
+        let ff1 = FeedForward::load(vb.pp("feed_forward1"), geometry, projections)?;
 
         let norm_self_att = layer_norm(dim, 1e-5, vb.pp("norm_self_att"))?;
-        let self_attn = RelPosSelfAttention::load(vb.pp("self_attn"), geometry, f16)?;
+        let self_attn = RelPosSelfAttention::load(vb.pp("self_attn"), geometry, projections)?;
 
         let norm_conv = layer_norm(dim, 1e-5, vb.pp("norm_conv"))?;
-        let conv = ConformerConv::load(vb.pp("conv"), geometry, f16)?;
+        let conv = ConformerConv::load(vb.pp("conv"), geometry, projections)?;
 
         let norm_ff2 = layer_norm(dim, 1e-5, vb.pp("norm_feed_forward2"))?;
-        let ff2 = FeedForward::load(vb.pp("feed_forward2"), geometry, f16)?;
+        let ff2 = FeedForward::load(vb.pp("feed_forward2"), geometry, projections)?;
 
         let norm_out = layer_norm(dim, 1e-5, vb.pp("norm_out"))?;
 
@@ -2471,55 +2656,107 @@ impl ConformerLayer {
 struct FeedForward {
     linear1: ProjectionLinear,
     linear2: ProjectionLinear,
+    /// The dtype both linears and the swish between them run in.
+    dtype: DType,
 }
 
 impl FeedForward {
-    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
-        let vb = projection_vb(&vb, f16);
-        let linear1 = ProjectionLinear::new(
-            mlx::load_linear_no_bias(geometry.dim, geometry.ff_dim, vb.pp("linear1"))?,
-            f16,
-        )?;
-        let linear2 = ProjectionLinear::new(
-            mlx::load_linear_no_bias(geometry.ff_dim, geometry.dim, vb.pp("linear2"))?,
-            f16,
-        )?;
-        Ok(Self { linear1, linear2 })
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, projections: Projections) -> Result<Self> {
+        let vb = projections.vb(&vb);
+        let linear1 = projections.linear(mlx::load_linear_no_bias(
+            geometry.dim,
+            geometry.ff_dim,
+            vb.pp("linear1"),
+        )?)?;
+        let linear2 = projections.linear(mlx::load_linear_no_bias(
+            geometry.ff_dim,
+            geometry.dim,
+            vb.pp("linear2"),
+        )?)?;
+        Ok(Self {
+            linear1,
+            linear2,
+            dtype: projections.dtype(),
+        })
     }
 
+    /// The block over F32 `x`, cast to the block's dtype once on the way in
+    /// and back to F32 once on the way out.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.linear1.forward(x)?;
+        let x = self.linear1.forward(&x.to_dtype(self.dtype)?)?;
         let x = swish(&x)?;
         self.linear2
             .forward(&x)
+            .and_then(|x| x.to_dtype(DType::F32))
             .map_err(|e| Error::InferenceError(e.to_string()))
+    }
+}
+
+/// A pointwise convolution of [`ConformerConv`]: dense F32 or weight-only F16
+/// over `[B, C, T]`, or the BF16 tier's `[out, in]` linear over the channels
+/// of `[B, T, C]`.
+enum ConvPointwise {
+    Conv(PointwiseConv1d),
+    Bf16(Linear),
+}
+
+impl ConvPointwise {
+    fn as_f16(&self) -> Option<&F16WeightLinear> {
+        match self {
+            Self::Conv(conv) => conv.as_f16(),
+            Self::Bf16(_) => None,
+        }
+    }
+
+    /// F32 `[B, T, C_in]` to F32 `[B, C_out, T]` (a strided view in the F32
+    /// and F16 tiers). The BF16 tier casts in, runs one GEMM, and writes the
+    /// channels-first F32 copy in the cast back.
+    fn channels_first(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Conv(conv) => conv.forward(&x.transpose(1, 2)?).map_err(Error::from),
+            Self::Bf16(linear) => linear
+                .forward(&x.to_dtype(DType::BF16)?)?
+                .transpose(1, 2)?
+                .to_dtype(DType::F32)
+                .map_err(Error::from),
+        }
+    }
+
+    /// F32 `[B, C_in, T]` to F32 `[B, T, C_out]` (a strided view in the F32
+    /// and F16 tiers). The BF16 tier writes the channels-last BF16 copy in
+    /// its cast in, runs one GEMM and casts back.
+    fn channels_last(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Conv(conv) => conv.forward(x)?.transpose(1, 2).map_err(Error::from),
+            Self::Bf16(linear) => linear
+                .forward(&contiguous_as(&x.transpose(1, 2)?, DType::BF16)?)?
+                .to_dtype(DType::F32)
+                .map_err(Error::from),
+        }
     }
 }
 
 struct ConformerConv {
     dim: usize,
-    pointwise_conv1: PointwiseConv1d,
+    pointwise_conv1: ConvPointwise,
     depthwise_conv: Conv1d,
     folded_depthwise_weight: Tensor,
     folded_depthwise_bias: Tensor,
     batch_norm: candle_nn::BatchNorm,
-    pointwise_conv2: PointwiseConv1d,
+    pointwise_conv2: ConvPointwise,
 }
 
 impl ConformerConv {
-    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, projections: Projections) -> Result<Self> {
         let dim = geometry.dim;
-        let pointwise_vb = projection_vb(&vb, f16);
-        let pointwise_conv1 = PointwiseConv1d::new(
-            mlx::load_conv1d_no_bias(
-                dim,
-                dim * 2,
-                1,
-                Conv1dConfig::default(),
-                pointwise_vb.pp("pointwise_conv1"),
-            )?,
-            f16,
-        )?;
+        let pointwise_vb = projections.vb(&vb);
+        let pointwise_conv1 = projections.pointwise(mlx::load_conv1d_no_bias(
+            dim,
+            dim * 2,
+            1,
+            Conv1dConfig::default(),
+            pointwise_vb.pp("pointwise_conv1"),
+        )?)?;
 
         let depthwise_conv = mlx::load_conv1d_no_bias(
             dim,
@@ -2539,16 +2776,13 @@ impl ConformerConv {
         // The CUDA depthwise kernel's per-device self-check, once, at load.
         crate::kernels::depthwise_conv::prepare_cuda_kernel(vb.device());
 
-        let pointwise_conv2 = PointwiseConv1d::new(
-            mlx::load_conv1d_no_bias(
-                dim,
-                dim,
-                1,
-                Conv1dConfig::default(),
-                pointwise_vb.pp("pointwise_conv2"),
-            )?,
-            f16,
-        )?;
+        let pointwise_conv2 = projections.pointwise(mlx::load_conv1d_no_bias(
+            dim,
+            dim,
+            1,
+            Conv1dConfig::default(),
+            pointwise_vb.pp("pointwise_conv2"),
+        )?)?;
 
         Ok(Self {
             dim,
@@ -2561,13 +2795,13 @@ impl ConformerConv {
         })
     }
 
-    /// The convolution module over `[B, T, C]`; `frame_mask` (`[B, 1, T]`)
-    /// zeroes a padded batch's padded frames before the depthwise conv.
+    /// The convolution module over F32 `[B, T, C]`; `frame_mask`
+    /// (`[B, 1, T]`) zeroes a padded batch's padded frames before the
+    /// depthwise conv. The GLU, the depthwise conv with its folded BatchNorm
+    /// and the swish run in F32 in every tier.
     fn forward(&self, x: &Tensor, frame_mask: Option<&Tensor>) -> Result<Tensor> {
-        // [B, T, C] -> [B, C, T]
-        let mut x = x.transpose(1, 2)?;
-
-        x = self.pointwise_conv1.forward(&x)?;
+        // [B, T, C] -> [B, 2C, T]
+        let mut x = self.pointwise_conv1.channels_first(x)?;
         let x_a = x.i((.., ..self.dim, ..))?;
         let x_b = x.i((.., self.dim.., ..))?;
         x = x_a.broadcast_mul(&ops::sigmoid(&x_b)?)?;
@@ -2606,9 +2840,8 @@ impl ConformerConv {
             }
             x = swish(&x)?;
         }
-        x = self.pointwise_conv2.forward(&x)?;
-
-        x.transpose(1, 2).map_err(Error::from)
+        // [B, C, T] -> [B, T, C]
+        self.pointwise_conv2.channels_last(&x)
     }
 }
 
@@ -2638,35 +2871,76 @@ fn fold_depthwise_conv1d_batch_norm(
     Ok((folded_weight, folded_bias))
 }
 
+/// The query, key and value projections of [`RelPosSelfAttention`]: one
+/// each (F32 or weight-only F16), or the BF16 tier's single `[3D, D]` GEMM.
+enum QkvProjection {
+    Split([ProjectionLinear; 3]),
+    Fused(Linear),
+}
+
+impl QkvProjection {
+    /// The projections, when they are separate.
+    fn split(&self) -> Option<&[ProjectionLinear; 3]> {
+        match self {
+            Self::Split(projections) => Some(projections),
+            Self::Fused(_) => None,
+        }
+    }
+
+    /// Q, K and V of F32 `x` (`[B, T, D]`), each a contiguous F32
+    /// `[B, H, T, Dh]`. The fused GEMM's head-major F32 copies are its casts
+    /// back.
+    fn heads(&self, x: &Tensor, heads: usize, head_dim: usize) -> Result<[Tensor; 3]> {
+        let (b, t, _) = x.dims3()?;
+        let head_major = |x: &Tensor| contiguous_as(&x.transpose(1, 2)?, DType::F32);
+        let [q, k, v] = match self {
+            Self::Split(projections) => projections.each_ref().map(|projection| {
+                head_major(&projection.forward(x)?.reshape((b, t, heads, head_dim))?)
+            }),
+            Self::Fused(linear) => {
+                let qkv = linear
+                    .forward(&x.to_dtype(DType::BF16)?)?
+                    .reshape((b, t, 3, heads, head_dim))?;
+                [0, 1, 2].map(|index| head_major(&qkv.i((.., .., index))?))
+            }
+        };
+        Ok([q?, k?, v?])
+    }
+}
+
 struct RelPosSelfAttention {
     heads: usize,
     head_dim: usize,
-    linear_q: ProjectionLinear,
-    linear_k: ProjectionLinear,
-    linear_v: ProjectionLinear,
+    qkv: QkvProjection,
     linear_out: ProjectionLinear,
     linear_pos: ProjectionLinear,
     pos_bias_u: Tensor,
     pos_bias_v: Tensor,
+    /// The dtype the projections run in. The attention core (`ac + bd`,
+    /// `rel_shift`, softmax and the value product) runs in F32.
+    dtype: DType,
 }
 
 impl RelPosSelfAttention {
-    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, projections: Projections) -> Result<Self> {
         let dim = geometry.dim;
         let (heads, head_dim) = (geometry.heads, geometry.head_dim());
-        let projection_vb = projection_vb(&vb, f16);
-        let projection = |name: &str| {
-            ProjectionLinear::new(
-                mlx::load_linear_no_bias(dim, dim, projection_vb.pp(name))?,
-                f16,
-            )
-            .map_err(Error::from)
+        let projection_vb = projections.vb(&vb);
+        let read = |name: &str| mlx::load_linear_no_bias(dim, dim, projection_vb.pp(name));
+        let (q, k, v) = (read("linear_q")?, read("linear_k")?, read("linear_v")?);
+        let qkv = match projections {
+            Projections::Bf16(device) => {
+                let weight = Tensor::cat(&[q.weight(), k.weight(), v.weight()], 0)?;
+                QkvProjection::Fused(bf16_linear(&weight, None, device)?)
+            }
+            Projections::F32 | Projections::F16(_) => QkvProjection::Split([
+                projections.linear(q)?,
+                projections.linear(k)?,
+                projections.linear(v)?,
+            ]),
         };
-        let linear_q = projection("linear_q")?;
-        let linear_k = projection("linear_k")?;
-        let linear_v = projection("linear_v")?;
-        let linear_out = projection("linear_out")?;
-        let linear_pos = projection("linear_pos")?;
+        let linear_out = projections.linear(read("linear_out")?)?;
+        let linear_pos = projections.linear(read("linear_pos")?)?;
 
         // In Parakeet checkpoints these are direct tensors under self_attn.*.
         let pos_bias_u = vb.get((heads, head_dim), "pos_bias_u")?;
@@ -2675,44 +2949,27 @@ impl RelPosSelfAttention {
         Ok(Self {
             heads,
             head_dim,
-            linear_q,
-            linear_k,
-            linear_v,
+            qkv,
             linear_out,
             linear_pos,
             pos_bias_u,
             pos_bias_v,
+            dtype: projections.dtype(),
         })
     }
 
-    /// Attention over `x`; `key_bias` (`[B, 1, 1, T]`) is added to the
-    /// scores of a padded batch, before the softmax.
+    /// Attention over F32 `x`; `key_bias` (`[B, 1, 1, T]`) is added to the
+    /// scores of a padded batch, before the softmax. `pos_emb` is in the
+    /// projection dtype ([`ParakeetEncoder::positions`]).
     fn forward(&self, x: &Tensor, pos_emb: &Tensor, key_bias: Option<&Tensor>) -> Result<Tensor> {
         let (b, t, d) = x.dims3()?;
         let (heads, head_dim) = (self.heads, self.head_dim);
 
-        let q = self
-            .linear_q
-            .forward(x)?
-            .reshape((b, t, heads, head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?; // [B, H, T, Dh]
-        let k = self
-            .linear_k
-            .forward(x)?
-            .reshape((b, t, heads, head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let v = self
-            .linear_v
-            .forward(x)?
-            .reshape((b, t, heads, head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
+        let [q, k, v] = self.qkv.heads(x, heads, head_dim)?; // [B, H, T, Dh]
 
         let p = self
             .linear_pos
-            .forward(pos_emb)?
+            .forward(&pos_emb.to_dtype(self.dtype)?)?
             .reshape((1, 2 * t - 1, heads, head_dim))?
             .transpose(1, 2)?; // [1, H, 2T-1, Dh]
 
@@ -2723,15 +2980,15 @@ impl RelPosSelfAttention {
         let q_v = q.broadcast_add(&pos_bias_v)?;
 
         let k_t = k.transpose(2, 3)?.contiguous()?;
-        let p_t = p.transpose(2, 3)?.contiguous()?;
         // Every row of a batch reads the same projection; the matmul takes
-        // equal batch dimensions.
+        // equal batch dimensions. One copy writes the F32 layout.
+        let p_t = p.transpose(2, 3)?;
         let p_t = if b > 1 {
             p_t.broadcast_as((b, heads, head_dim, 2 * t - 1))?
-                .contiguous()?
         } else {
             p_t
         };
+        let p_t = contiguous_as(&p_t, DType::F32)?;
         let matrix_ac = q_u.matmul(&k_t)?;
         let matrix_bd = rel_shift(&q_v.matmul(&p_t)?)?;
         let matrix_bd = matrix_bd.narrow(3, 0, t)?;
@@ -2750,11 +3007,13 @@ impl RelPosSelfAttention {
         };
         let attn = ops::softmax_last_dim(&scores)?;
 
+        // The token-major copy before `linear_out` is also its cast in.
         let out = attn.matmul(&v)?;
-        let out = out.transpose(1, 2)?.reshape((b, t, d))?;
+        let out = contiguous_as(&out.transpose(1, 2)?, self.dtype)?.reshape((b, t, d))?;
 
         self.linear_out
             .forward(&out)
+            .and_then(|out| out.to_dtype(DType::F32))
             .map_err(|e| Error::InferenceError(e.to_string()))
     }
 }
@@ -3305,6 +3564,11 @@ mod tests {
         ParakeetRetainedDecodeStep, ParakeetTimings, Predictor, TdtTokenFrame, DEFAULT_MAX_SYMBOLS,
         PRED_HIDDEN,
     };
+    use super::{
+        parakeet_cuda_projection_precision, parakeet_tensor_is_bf16_projection,
+        resolve_parakeet_projection_precision, ConvPointwise, Projections, QkvProjection,
+        PARAKEET_ASR_DTYPE_ENV,
+    };
     use super::{tdt_batch_labels_and_durations, tdt_label_and_duration};
     use crate::backends::{BackendKind, DTypeSelection};
     use crate::error::{Error, Result};
@@ -3312,7 +3576,7 @@ mod tests {
     use candle_core::{DType, Device, Tensor};
     use candle_nn::{Linear, VarBuilder};
 
-    use crate::kernels::f16_weight_linear::WeightOnlyF16Load;
+    use crate::kernels::f16_weight_linear::{ProjectionLinear, WeightOnlyF16Load};
     use crate::kernels::numeric_check::{host_f32, relative_l2};
 
     /// Small enough to run on CPU in milliseconds; two layers keep conv edge
@@ -3375,7 +3639,7 @@ mod tests {
         let stem = super::ConvSubsamplingDw::load(
             random_encoder_vb(TINY, 0x5EED, &device).pp("pre_encode"),
             TINY,
-            None,
+            Projections::F32,
         )
         .unwrap();
         for frames in [8 * super::SUBSAMPLING_SLICE_FRAMES * 2 + 3, 5_001] {
@@ -3413,7 +3677,12 @@ mod tests {
     /// A NeMo-layout encoder checkpoint with random weights, loaded through
     /// the production loaders.
     fn random_encoder(geometry: EncoderGeometry, seed: u64, device: &Device) -> ParakeetEncoder {
-        ParakeetEncoder::load(random_encoder_vb(geometry, seed, device), geometry, None).unwrap()
+        ParakeetEncoder::load(
+            random_encoder_vb(geometry, seed, device),
+            geometry,
+            Projections::F32,
+        )
+        .unwrap()
     }
 
     /// The random encoder checkpoint of [`random_encoder`] as a VarBuilder.
@@ -3550,6 +3819,8 @@ mod tests {
     /// Largest absolute difference; NaN or infinity counts as infinitely far.
     /// Batched vs solo encodes on CPU F32, as a fraction of the row's scale.
     const BATCHED_ENCODE_TOLERANCE: f32 = 4e-6;
+    /// BF16-tier encodes on CPU, as relative L2 against the reference.
+    const BF16_ENCODE_RELATIVE_L2: f64 = 2e-2;
 
     fn max_abs_diff(left: &Tensor, right: &Tensor) -> f32 {
         assert_eq!(left.dims(), right.dims());
@@ -3585,10 +3856,7 @@ mod tests {
             let actual = conv.forward(&x, None).unwrap();
             assert!(crate::kernels::depthwise_conv::depthwise_conv1d_calls() > calls);
 
-            let h = conv
-                .pointwise_conv1
-                .forward(&x.transpose(1, 2).unwrap())
-                .unwrap();
+            let h = conv.pointwise_conv1.channels_first(&x).unwrap();
             let gate = h.narrow(1, 0, TINY.dim).unwrap();
             let value = h.narrow(1, TINY.dim, TINY.dim).unwrap();
             let h = gate
@@ -3597,12 +3865,7 @@ mod tests {
             let h = conv.depthwise_conv.forward(&h).unwrap();
             let h = conv.batch_norm.forward_t(&h, false).unwrap();
             let h = super::swish(&h).unwrap();
-            let expected = conv
-                .pointwise_conv2
-                .forward(&h)
-                .unwrap()
-                .transpose(1, 2)
-                .unwrap();
+            let expected = conv.pointwise_conv2.channels_last(&h).unwrap();
             let diff = max_abs_diff(&expected, &actual);
             assert!(diff <= 1e-5, "max |diff| {diff}");
         }
@@ -3846,21 +4109,28 @@ mod tests {
         }
     }
 
+    /// A layer's linear projections in the F32 and F16 tiers (q, k and v
+    /// separate).
+    fn split_projections(layer: &super::ConformerLayer) -> Vec<&ProjectionLinear> {
+        let [q, k, v] = layer.self_attn.qkv.split().expect("separate q, k and v");
+        vec![
+            &layer.ff1.linear1,
+            &layer.ff1.linear2,
+            &layer.ff2.linear1,
+            &layer.ff2.linear2,
+            q,
+            k,
+            v,
+            &layer.self_attn.linear_out,
+            &layer.self_attn.linear_pos,
+        ]
+    }
+
     /// Every projection the recipe lists is F16 and nothing else is.
     fn assert_projection_split(encoder: &ParakeetEncoder, f16: bool) {
         assert_eq!(encoder.pre_encode.out.as_f16().is_some(), f16);
         for layer in &encoder.layers {
-            for projection in [
-                &layer.ff1.linear1,
-                &layer.ff1.linear2,
-                &layer.ff2.linear1,
-                &layer.ff2.linear2,
-                &layer.self_attn.linear_q,
-                &layer.self_attn.linear_k,
-                &layer.self_attn.linear_v,
-                &layer.self_attn.linear_out,
-                &layer.self_attn.linear_pos,
-            ] {
+            for projection in split_projections(layer) {
                 assert_eq!(projection.as_f16().is_some(), f16);
             }
             assert_eq!(layer.conv.pointwise_conv1.as_f16().is_some(), f16);
@@ -3917,23 +4187,13 @@ mod tests {
         .unwrap();
         let f16_weights = std::iter::once(encoder.pre_encode.out.as_f16().unwrap())
             .chain(encoder.layers.iter().flat_map(|layer| {
-                [
-                    &layer.ff1.linear1,
-                    &layer.ff1.linear2,
-                    &layer.ff2.linear1,
-                    &layer.ff2.linear2,
-                    &layer.self_attn.linear_q,
-                    &layer.self_attn.linear_k,
-                    &layer.self_attn.linear_v,
-                    &layer.self_attn.linear_out,
-                    &layer.self_attn.linear_pos,
-                ]
-                .into_iter()
-                .map(|projection| projection.as_f16().unwrap())
-                .chain([
-                    layer.conv.pointwise_conv1.as_f16().unwrap(),
-                    layer.conv.pointwise_conv2.as_f16().unwrap(),
-                ])
+                split_projections(layer)
+                    .into_iter()
+                    .map(|projection| projection.as_f16().unwrap())
+                    .chain([
+                        layer.conv.pointwise_conv1.as_f16().unwrap(),
+                        layer.conv.pointwise_conv2.as_f16().unwrap(),
+                    ])
             }))
             .map(|linear| linear.out_features() * linear.in_features())
             .sum::<usize>();
@@ -3977,6 +4237,425 @@ mod tests {
         assert!(!precision.projections_f16);
         assert!(precision.self_check.is_none());
         assert_projection_split(&encoder, false);
+    }
+
+    fn bf16_precision() -> DTypeSelection {
+        DTypeSelection {
+            dtype: DType::BF16,
+            reason: "test: BF16 projections".into(),
+        }
+    }
+
+    fn bf16_encoder(seed: u64, device: &Device) -> ParakeetEncoder {
+        let (encoder, precision) = ParakeetEncoder::load_with_precision(
+            random_encoder_vb(TINY, seed, device),
+            TINY,
+            bf16_precision(),
+        )
+        .unwrap();
+        assert!(!precision.projections_f16);
+        assert!(precision.self_check.is_none());
+        assert_eq!(encoder.projection_dtype, DType::BF16);
+        encoder
+    }
+
+    /// The BF16 tensors of a BF16-tier encoder, by role. Everything else it
+    /// holds stays F32.
+    fn bf16_tensors(encoder: &ParakeetEncoder) -> Vec<Tensor> {
+        fn dense(projection: &ProjectionLinear) -> &Linear {
+            match projection {
+                ProjectionLinear::Dense(linear) => linear,
+                ProjectionLinear::F16(_) => panic!("weight-only F16 projection in the BF16 tier"),
+            }
+        }
+        let linear_tensors = |linear: &Linear| {
+            std::iter::once(linear.weight().clone()).chain(linear.bias().cloned())
+        };
+        let mut tensors = linear_tensors(dense(&encoder.pre_encode.out)).collect::<Vec<_>>();
+        for layer in &encoder.layers {
+            let QkvProjection::Fused(qkv) = &layer.self_attn.qkv else {
+                panic!("separate q, k and v in the BF16 tier");
+            };
+            assert_eq!(qkv.weight().dims(), [3 * TINY.dim, TINY.dim]);
+            for linear in [
+                dense(&layer.ff1.linear1),
+                dense(&layer.ff1.linear2),
+                dense(&layer.ff2.linear1),
+                dense(&layer.ff2.linear2),
+                qkv,
+                dense(&layer.self_attn.linear_out),
+                dense(&layer.self_attn.linear_pos),
+            ] {
+                tensors.extend(linear_tensors(linear));
+            }
+            for pointwise in [&layer.conv.pointwise_conv1, &layer.conv.pointwise_conv2] {
+                let ConvPointwise::Bf16(linear) = pointwise else {
+                    panic!("pointwise conv outside the BF16 tier");
+                };
+                tensors.extend(linear_tensors(linear));
+            }
+        }
+        tensors
+    }
+
+    /// The BF16 tier converts exactly the tensors admission prices at BF16
+    /// (`parakeet_tensor_is_bf16_projection`), and keeps the recipe's F32
+    /// tensors F32.
+    #[test]
+    fn bf16_projection_names_match_the_loader() {
+        let device = Device::Cpu;
+        let tensors = random_encoder_tensors(TINY, 38, &device);
+        let encoder = bf16_encoder(38, &device);
+        let converted = bf16_tensors(&encoder);
+        assert!(converted.iter().all(|tensor| tensor.dtype() == DType::BF16));
+        let named = |filter: fn(&str) -> bool| {
+            tensors
+                .iter()
+                .filter(|(name, _)| filter(&format!("encoder.{name}")))
+                .map(|(_, tensor)| tensor.elem_count())
+                .sum::<usize>()
+        };
+        assert_eq!(
+            converted.iter().map(Tensor::elem_count).sum::<usize>(),
+            named(parakeet_tensor_is_bf16_projection)
+        );
+        assert_eq!(
+            named(parakeet_tensor_is_bf16_projection) - named(parakeet_tensor_is_f16_projection),
+            TINY.dim
+        );
+        assert!(parakeet_tensor_is_bf16_projection(
+            "encoder.pre_encode.out.bias"
+        ));
+        for name in [
+            "encoder.pre_encode.conv.3.weight",
+            "encoder.layers.0.conv.depthwise_conv.weight",
+            "encoder.layers.0.self_attn.pos_bias_u",
+            "encoder.layers.0.norm_out.weight",
+            "joint.enc.weight",
+            "decoder.prediction.dec_rnn.lstm.weight_ih_l0",
+        ] {
+            assert!(!parakeet_tensor_is_bf16_projection(name), "{name}");
+        }
+        assert!(encoder.pre_encode.out.as_f16().is_none());
+        assert_eq!(encoder.pre_encode.conv0.weight().dtype(), DType::F32);
+        assert_eq!(encoder.pre_encode.conv6.weight().dtype(), DType::F32);
+        for layer in &encoder.layers {
+            assert_eq!(layer.conv.depthwise_conv.weight().dtype(), DType::F32);
+            assert_eq!(layer.conv.folded_depthwise_weight.dtype(), DType::F32);
+            assert_eq!(layer.conv.folded_depthwise_bias.dtype(), DType::F32);
+            assert_eq!(layer.self_attn.pos_bias_u.dtype(), DType::F32);
+            assert_eq!(layer.self_attn.pos_bias_v.dtype(), DType::F32);
+            assert_eq!(layer.norm_ff1.weight().dtype(), DType::F32);
+            assert_eq!(layer.norm_out.weight().dtype(), DType::F32);
+        }
+    }
+
+    /// A model over `encoder` whose joint reads the encoder output through
+    /// random weights (the zero predictor adds nothing), so its TDT decode
+    /// decisions follow the encoder.
+    fn encoder_driven_model(device: &Device, encoder: ParakeetEncoder) -> ParakeetAsrModel {
+        let mut rng = XorShift(0x7D7_0001);
+        let mut random = |shape: &[usize], scale: f32| {
+            let values = rng.values(shape.iter().product(), scale, 0.0);
+            Tensor::from_vec(values, shape, device).unwrap()
+        };
+        let enc = random(&[PRED_HIDDEN, TINY.dim], 2.0 / (TINY.dim as f32).sqrt());
+        let out = random(&[5, PRED_HIDDEN], 4.0 / (PRED_HIDDEN as f32).sqrt());
+        let bias = random(&[5], 0.5);
+        let mut model = forced_label_model(device);
+        model.network.encoder = encoder;
+        model.network.joint.enc = Linear::new(enc, None);
+        model.network.joint.out = Linear::new(out, Some(bias));
+        model
+    }
+
+    /// The joint's `[T, labels + durations]` logits over `encoded` with a
+    /// zero predictor output.
+    fn joint_logits(model: &ParakeetAsrModel, encoded: &Tensor) -> Tensor {
+        let predictor = Tensor::zeros((1, 1, PRED_HIDDEN), DType::F32, encoded.device()).unwrap();
+        model
+            .network
+            .joint
+            .joint_after_projection(encoded, &predictor)
+            .unwrap()
+            .squeeze(2)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+    }
+
+    /// Sets the joint output bias of `models` to minus the mean logit of the
+    /// first over the frames of `encoded`, so a frame's decisions turn on
+    /// what sets it apart from the others (frames of one input share most of
+    /// their encoding).
+    fn center_joint(models: [&mut ParakeetAsrModel; 2], encoded: &Tensor) {
+        let without_bias = {
+            let out = &models[0].network.joint.out;
+            let bias = out.bias().unwrap();
+            joint_logits(models[0], encoded)
+                .broadcast_sub(bias)
+                .unwrap()
+        };
+        let bias = without_bias.mean(0).unwrap().neg().unwrap();
+        for model in models {
+            let weight = model.network.joint.out.weight().clone();
+            model.network.joint.out = Linear::new(weight, Some(bias.clone()));
+        }
+    }
+
+    /// Each frame's TDT decisions (label, duration) by the joint over
+    /// `encoded` with a zero predictor output, with the gap between each
+    /// winning logit and its runner-up.
+    fn frame_decisions(
+        model: &ParakeetAsrModel,
+        encoded: &Tensor,
+    ) -> Vec<((usize, usize), [f32; 2])> {
+        let classes = model.network.joint.num_classes_with_blank;
+        let margin = |values: &[f32]| {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            sorted[0] - sorted[1]
+        };
+        joint_logits(model, encoded)
+            .to_vec2::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                let frame = Tensor::new(row.as_slice(), encoded.device()).unwrap();
+                (
+                    tdt_label_and_duration(&frame, classes).unwrap(),
+                    [margin(&row[..classes]), margin(&row[classes..])],
+                )
+            })
+            .collect()
+    }
+
+    /// The BF16 tier (BF16 projections and GEMMs, F32 residual stream,
+    /// norms, depthwise conv and attention core) stays within BF16 rounding
+    /// of the F32 encoder and keeps the TDT decisions of a tiny decode: a
+    /// confident joint decodes identically, and a joint centred on the
+    /// input changes no decision whose F32 margin exceeds twice the largest
+    /// logit change BF16 makes (a decision inside that band is a tie to
+    /// within BF16 rounding).
+    #[test]
+    fn bf16_encoder_matches_f32_and_keeps_decode_decisions() {
+        let device = Device::Cpu;
+        let f32_encoder = random_encoder(TINY, 31, &device);
+        let bf16 = bf16_encoder(31, &device);
+        let reference = encode_probe(&f32_encoder, &device);
+        let actual = encode_probe(&bf16, &device);
+        let rel = relative_l2(&actual, &reference);
+        let max_abs = actual
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let scale = reference
+            .iter()
+            .fold(0f32, |max, value| max.max(value.abs()));
+        eprintln!(
+            "Parakeet BF16 vs F32 encoder (TINY, CPU): relative L2 {rel:.3e}, max |diff| {max_abs:.3e} of max |x| {scale:.3}"
+        );
+        assert!(
+            rel > 0.0 && rel < BF16_ENCODE_RELATIVE_L2,
+            "relative L2 {rel:e}"
+        );
+
+        let mut f32_model = encoder_driven_model(&device, f32_encoder);
+        let mut bf16_model = encoder_driven_model(&device, bf16);
+        // 4 s of audio, 50 encoder frames: a tone that changes pitch and
+        // level every quarter second over faint noise.
+        let noise = XorShift(13).values(64_037, 0.01, 0.0);
+        let audio = noise
+            .iter()
+            .enumerate()
+            .map(|(n, noise)| {
+                let segment = n / 4_000;
+                let pitch = 200.0 + 600.0 * (segment % 7) as f32;
+                let level = 0.05 + 0.1 * (segment % 3) as f32;
+                let phase = 2.0 * std::f32::consts::PI * pitch * n as f32 / 16_000.0;
+                level * phase.sin() + noise
+            })
+            .collect::<Vec<_>>();
+        let artifacts = [&f32_model, &bf16_model].map(|model| {
+            model
+                .prepare_retained_encoder(&audio, 16_000, Some("en"), &ready)
+                .unwrap()
+        });
+        assert_eq!(artifacts[1].encoded.dtype(), DType::F32);
+        let compare = |f32_model: &ParakeetAsrModel, bf16_model: &ParakeetAsrModel| {
+            let perturbation = max_abs_diff(
+                &joint_logits(f32_model, &artifacts[0].encoded),
+                &joint_logits(bf16_model, &artifacts[1].encoded),
+            );
+            let f32_decisions = frame_decisions(f32_model, &artifacts[0].encoded);
+            let bf16_decisions = frame_decisions(bf16_model, &artifacts[1].encoded);
+            assert_eq!(f32_decisions.len(), 50);
+            (f32_decisions, bf16_decisions, perturbation)
+        };
+
+        // A confident joint: every decision clears the band, so the whole
+        // retained decode (labels, durations, timestamps) is identical.
+        let (f32_decisions, bf16_decisions, perturbation) = compare(&f32_model, &bf16_model);
+        let smallest = f32_decisions
+            .iter()
+            .flat_map(|(_, margins)| *margins)
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            smallest > 2.0 * perturbation,
+            "margin {smallest} vs logit change {perturbation}"
+        );
+        assert_eq!(
+            bf16_decisions.iter().map(|d| d.0).collect::<Vec<_>>(),
+            f32_decisions.iter().map(|d| d.0).collect::<Vec<_>>()
+        );
+        let (f32_steps, f32_diagnostics) = decode_until_finished(&f32_model, &artifacts[0], 500);
+        let (bf16_steps, bf16_diagnostics) = decode_until_finished(&bf16_model, &artifacts[1], 500);
+        assert_eq!(
+            bf16_steps.last().unwrap().text,
+            f32_steps.last().unwrap().text
+        );
+        for key in [
+            "tdt_joint_steps",
+            "tdt_emitted_tokens",
+            "tdt_blank_steps",
+            "timestamp_words",
+        ] {
+            assert_eq!(bf16_diagnostics[key], f32_diagnostics[key], "{key}");
+        }
+        eprintln!(
+            "Parakeet BF16 vs F32 confident decode: identical over {} joint steps ({} tokens), smallest margin {smallest:.3e}, largest logit change {perturbation:.3e}",
+            f32_diagnostics["tdt_joint_steps"], f32_diagnostics["tdt_emitted_tokens"]
+        );
+
+        // A centred joint: decisions vary frame to frame.
+        center_joint([&mut f32_model, &mut bf16_model], &artifacts[0].encoded);
+        let (f32_decisions, bf16_decisions, perturbation) = compare(&f32_model, &bf16_model);
+        let band = 2.0 * perturbation;
+        let (mut decisive, mut ties, mut flipped) = (0, 0, 0);
+        for (frame, ((f32_decision, margins), (bf16_decision, _))) in
+            f32_decisions.iter().zip(&bf16_decisions).enumerate()
+        {
+            let heads = [
+                (f32_decision.0, bf16_decision.0),
+                (f32_decision.1, bf16_decision.1),
+            ];
+            for ((f32_choice, bf16_choice), margin) in heads.into_iter().zip(margins) {
+                if *margin > band {
+                    decisive += 1;
+                    assert_eq!(bf16_choice, f32_choice, "frame {frame}: margin {margin}");
+                } else {
+                    ties += 1;
+                    flipped += usize::from(bf16_choice != f32_choice);
+                }
+            }
+        }
+        eprintln!(
+            "Parakeet BF16 vs F32 centred joint: {decisive} decisive decisions identical; {flipped} of {ties} within {band:.3e} of a tie flipped"
+        );
+        let labels = f32_decisions.iter().map(|d| d.0 .0).collect::<Vec<_>>();
+        let durations = f32_decisions.iter().map(|d| d.0 .1).collect::<Vec<_>>();
+        assert!(labels.iter().any(|label| *label != labels[0]));
+        assert!(durations.iter().any(|duration| *duration != durations[0]));
+        // Centring leaves small logits: 69 of 100 decisions clear the band
+        // here, and none of those changes.
+        assert!(decisive >= 60, "{decisive} of 100 decisions decisive");
+        assert_eq!(
+            bf16_model.weight_precision_diagnostics()["projection_weights"],
+            serde_json::json!("BF16")
+        );
+    }
+
+    /// A padded BF16 batch encodes each row as the row alone does in BF16,
+    /// within BF16 rounding: the CPU product regroups its F32 sums by batch
+    /// shape before narrowing to BF16, so one rounding step can differ.
+    #[test]
+    fn bf16_batched_encode_matches_solo_bf16_encode() {
+        let device = Device::Cpu;
+        let mut model = forced_label_model(&device);
+        model.network.encoder = bf16_encoder(1, &device);
+        let lengths = [1usize, 3, 37, 64, 125];
+        let features = lengths
+            .iter()
+            .zip(31..)
+            .map(|(len, seed)| features_of_frames(&model, *len, seed))
+            .collect::<Vec<_>>();
+        let solo = features
+            .iter()
+            .map(|features| model.encode_host_features(features, None, &ready).unwrap())
+            .collect::<Vec<_>>();
+        let rows = features
+            .iter()
+            .map(|features| batch_row(features, &ready))
+            .collect::<Vec<_>>();
+        let batched = model.prepare_retained_encoder_batch(&rows).unwrap();
+        let mut worst = 0f64;
+        for ((artifact, solo), len) in batched.into_iter().zip(&solo).zip(lengths) {
+            let artifact = artifact.unwrap();
+            assert_eq!(artifact.encoded.dtype(), DType::F32);
+            assert_eq!(artifact.encoded.dims(), solo.encoded.dims());
+            assert_eq!(
+                artifact.resident_tensor_bytes().unwrap(),
+                (len * TINY.dim * 4) as u64
+            );
+            let rel = relative_l2(
+                &host_f32(&artifact.encoded).unwrap(),
+                &host_f32(&solo.encoded).unwrap(),
+            );
+            worst = worst.max(rel);
+        }
+        eprintln!("Parakeet BF16 batched vs solo encode on CPU: worst relative L2 {worst:.3e}");
+        assert!(worst < BF16_ENCODE_RELATIVE_L2, "relative L2 {worst:e}");
+    }
+
+    /// `IZWI_PARAKEET_ASR_DTYPE` on CUDA: BF16 by default and for `bf16`,
+    /// F32 for `f32` (today's path), anything else ignored visibly; a device
+    /// without BF16 stays F32. CPU stays F32 and Metal keeps weight-only F16.
+    #[test]
+    fn cuda_projection_precision_defaults_to_bf16_with_an_f32_kill_switch() {
+        let select = parakeet_cuda_projection_precision;
+        assert_eq!(select(true, None).dtype, DType::BF16);
+        assert_eq!(select(true, Some("  ")).dtype, DType::BF16);
+        assert_eq!(select(true, Some("bf16")).dtype, DType::BF16);
+        let pinned = select(true, Some("f32"));
+        assert_eq!(pinned.dtype, DType::F32);
+        assert!(
+            pinned.reason.contains("IZWI_PARAKEET_ASR_DTYPE=f32"),
+            "{}",
+            pinned.reason
+        );
+        let ignored = select(true, Some("f16"));
+        assert_eq!(ignored.dtype, DType::BF16);
+        assert!(ignored.reason.contains("ignored"), "{}", ignored.reason);
+        assert_eq!(select(false, None).dtype, DType::F32);
+
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let profile = |kind| crate::backends::DeviceProfile {
+            device: Device::Cpu,
+            kind,
+            capabilities: crate::backends::DeviceCapabilities {
+                supports_bf16: kind == crate::backends::DeviceKind::Cuda,
+                supports_f16: kind != crate::backends::DeviceKind::Cpu,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+        use crate::backends::DeviceKind::{Cpu, Cuda, Metal};
+        let resolve = |kind| resolve_parakeet_projection_precision(&profile(kind)).dtype;
+        std::env::remove_var(PARAKEET_ASR_DTYPE_ENV);
+        assert_eq!(
+            [resolve(Cuda), resolve(Metal), resolve(Cpu)],
+            [DType::BF16, DType::F16, DType::F32]
+        );
+        std::env::set_var(PARAKEET_ASR_DTYPE_ENV, "f32");
+        let pinned = [resolve(Cuda), resolve(Metal), resolve(Cpu)];
+        std::env::set_var(PARAKEET_ASR_DTYPE_ENV, "bf16");
+        let bf16 = [resolve(Cuda), resolve(Cpu)];
+        std::env::remove_var(PARAKEET_ASR_DTYPE_ENV);
+        assert_eq!(pinned, [DType::F32; 3]);
+        assert_eq!(bf16, [DType::BF16, DType::F32]);
     }
 
     /// A weight F16 cannot represent turns the F16 encoder non-finite; the
@@ -4025,9 +4704,12 @@ mod tests {
             f16_precision(),
         )
         .unwrap();
-        let other =
-            ParakeetEncoder::load(random_encoder_vb(TINY, 35, &device), TINY, Some(&device))
-                .unwrap();
+        let other = ParakeetEncoder::load(
+            random_encoder_vb(TINY, 35, &device),
+            TINY,
+            Projections::F16(&device),
+        )
+        .unwrap();
         encoder.layers[0].ff1.linear1 = other.layers[0].ff1.linear1.clone();
         let report = encoder.weight_only_f16_self_check(&random_encoder_vb(TINY, 34, &device));
         assert!(!report.passed);

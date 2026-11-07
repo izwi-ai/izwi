@@ -218,7 +218,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_NO_UI` | flag | false (UI enabled) | startup | Disables serving the web UI when true (inverted into ui_enabled). |
 | `IZWI_NUM_THREADS` | integer | min(available cores, 8) (4 if unknown) | startup | Number of compute threads (0 or invalid ignored; floor 1). |
 | `IZWI_OFFLINE` | flag | `false` | startup | Never contacts Hugging Face: downloads are refused and download sizes come from the built-in estimates. |
-| `IZWI_PARAKEET_ASR_DTYPE` | choice | F16 encoder projections on Metal, else F32 | model load | Parakeet dtype override: on Metal f32 keeps every weight F32 and f16 stores encoder projections in F16. |
+| `IZWI_PARAKEET_ASR_DTYPE` | choice | F16 encoder projections on Metal, BF16 on CUDA with BF16, else F32 | model load | Parakeet dtype override: f32 keeps every weight F32 on Metal and CUDA; on Metal f16 stores the encoder projections in F16, on CUDA bf16 runs them and their GEMMs in BF16 with an F32 residual stream. |
 | `IZWI_PARAKEET_ENCODER_BATCHING` | flag | `true` | first use | Encodes concurrent Parakeet clips of one encoder window (82 s) as one padded batch; false encodes every request alone. |
 | `IZWI_PARAKEET_METAL_CONV1D_BN_SWISH` | flag | true (Metal only) | first use | Enables the fused Metal depthwise Conv1d + bias + Swish kernel for Parakeet ASR conformer convs. |
 | `IZWI_PARAKEET_METAL_DEPTHWISE_CONV1D` | flag | true (Metal only) | first use | Enables the custom Metal depthwise Conv1d kernel for Parakeet ASR. |
@@ -336,7 +336,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_QWEN3_QK_RMS_NORM_FUSION` | flag | true on Metal/CUDA, false on CPU | first use | Toggles the fused Q/K RMSNorm kernel in Qwen3 single-token decode attention. |
 | `IZWI_QWEN3_QUANTIZED_PROJECTION_GROUPING` | flag | Metal: true when hidden_size<=1024; always false off Metal | model load | Packs quantized Qwen3 Q/K/V and gate/up projections into one QMatMul each on Metal. |
 | `IZWI_QWEN3_ROPE_KERNEL` | flag | true on Metal/CUDA, false on CPU | model load | Toggles the custom RoPE kernel for Qwen3 attention. |
-| `IZWI_QWEN_ASR_AUDIO_DTYPE` | choice | backend default (GGUF: text dtype) | model load | Overrides the Qwen3-ASR audio tower dtype (e.g. f32, f16, bf16). |
+| `IZWI_QWEN_ASR_AUDIO_DTYPE` | choice | GGUF: the text dtype (BF16 on CUDA), behind a load-time probe on Metal and CUDA; safetensors: F32 | model load | Overrides the Qwen3-ASR audio tower dtype (e.g. f32, f16, bf16); f32 restores the F32 tower on CUDA. |
 | `IZWI_QWEN_ASR_STREAM_CHARS_PER_TOKEN` | integer | 4 (clamped 1..12) | first use | Sets chars per rollback token used to derive streaming ASR text holdback when HOLDBACK_CHARS is unset (all families). |
 | `IZWI_QWEN_ASR_STREAM_HOLDBACK_CHARS` | integer | ROLLBACK_TOKENS x CHARS_PER_TOKEN = 20 | first use | Sets characters of streamed ASR chunk text held back as unstable before emission (applies to all families). |
 | `IZWI_QWEN_ASR_STREAM_ROLLBACK_TOKENS` | integer | 5 (max 32) | first use | Sets rollback tokens used to derive streaming ASR text holdback when HOLDBACK_CHARS is unset (all families). |
