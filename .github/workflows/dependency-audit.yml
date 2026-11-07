@@ -5,6 +5,7 @@ on:
     paths:
       - ".github/workflows/dependency-audit.yml"
       - ".cargo/audit.toml"
+      - "deny.toml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**/Cargo.toml"
@@ -15,6 +16,7 @@ on:
     paths:
       - ".github/workflows/dependency-audit.yml"
       - ".cargo/audit.toml"
+      - "deny.toml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**/Cargo.toml"
@@ -55,3 +57,27 @@ jobs:
         # Fails on vulnerabilities. Accepted advisories, each with its
         # reason, are in .cargo/audit.toml.
         run: cargo audit
+
+  cargo-deny-licenses:
+    name: Licence gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
+
+      # Before checkout, as for cargo-audit: the workspace rustc-wrapper must
+      # not apply to this build.
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version 0.19.0
+
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Check dependency licences against deny.toml
+        # Every crate's licence must be on the allow list; LGPL is allowed
+        # only for the LAME crates behind the `mp3` feature.
+        run: cargo deny --locked check licenses

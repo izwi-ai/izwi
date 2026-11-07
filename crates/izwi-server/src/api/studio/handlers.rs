@@ -21,7 +21,8 @@ use crate::studio_project_store::{
     StudioProjectVoiceMode, StudioSegmentVoiceOverride, UpdateStudioProjectRecord,
     UpsertStudioProjectMetaRecord,
 };
-use izwi_core::audio::{resample_mono_high_quality, AudioEncoder, AudioFormat};
+use izwi_audio_codec::{AudioFormat, EncoderOptions};
+use izwi_core::audio::resample_mono_high_quality;
 use izwi_core::parse_tts_model_variant;
 
 const PROJECT_LIST_LIMIT: usize = 100;
@@ -1025,7 +1026,7 @@ pub async fn get_studio_project_audio(
     Ok(audio_response(
         StoredSpeechAudio {
             audio_bytes: bytes,
-            audio_mime_type: AudioEncoder::content_type(export_format).to_string(),
+            audio_mime_type: export_format.content_type().to_string(),
             audio_filename: Some(filename),
         },
         query.download,
@@ -1043,7 +1044,8 @@ fn paragraph_list(paragraphs: &[usize]) -> String {
 
 /// Join WAV takes into one file at the highest sample rate among them,
 /// with `pause_ms` of silence between takes. Samples are kept as 16-bit
-/// PCM while joining, so a long project holds one copy of its audio.
+/// PCM while joining, so a long project holds one copy of its audio; a
+/// compressed export (mp3, opus, flac) is encoded from it once.
 fn join_takes(takes: &[Vec<u8>], pause_ms: u32, format: AudioFormat) -> Result<Vec<u8>, ApiError> {
     let mut target_rate = 0;
     for take in takes {
@@ -1095,11 +1097,20 @@ fn join_takes(takes: &[Vec<u8>], pause_ms: u32, format: AudioFormat) -> Result<V
             bytes.extend(pcm.iter().flat_map(|sample| sample.to_le_bytes()));
             bytes
         }
-        AudioFormat::RawI16 => pcm.iter().flat_map(|sample| sample.to_le_bytes()).collect(),
-        AudioFormat::RawF32 => pcm
+        AudioFormat::PcmI16 => pcm.iter().flat_map(|sample| sample.to_le_bytes()).collect(),
+        AudioFormat::PcmF32 => pcm
             .iter()
             .flat_map(|sample| (f32::from(*sample) / f32::from(i16::MAX)).to_le_bytes())
             .collect(),
+        compressed => {
+            let samples = pcm
+                .iter()
+                .map(|sample| f32::from(*sample) / f32::from(i16::MAX))
+                .collect::<Vec<_>>();
+            drop(pcm);
+            izwi_audio_codec::encode_file(&EncoderOptions::new(compressed, target_rate), &samples)
+                .map_err(crate::api::openai::audio::speech::codec_api_error)?
+        }
     })
 }
 
@@ -1367,11 +1378,7 @@ fn project_audio_filename(name: &str, format: AudioFormat) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("-");
-    let extension = match format {
-        AudioFormat::Wav => "wav",
-        AudioFormat::RawI16 => "pcm",
-        AudioFormat::RawF32 => "f32",
-    };
+    let extension = format.extension();
     if slug.is_empty() {
         format!("studio-project.{extension}")
     } else {
@@ -1475,14 +1482,23 @@ pub(super) fn map_speech_store_error(err: anyhow::Error) -> ApiError {
 
 fn parse_project_audio_format(raw: Option<&str>) -> Result<AudioFormat, ApiError> {
     let value = raw.unwrap_or("wav").trim().to_lowercase();
-    match value.as_str() {
-        "" | "wav" => Ok(AudioFormat::Wav),
-        "raw_i16" | "pcm" => Ok(AudioFormat::RawI16),
-        "raw_f32" | "f32" => Ok(AudioFormat::RawF32),
-        _ => Err(ApiError::bad_request(format!(
-            "Unsupported project export format: {value}.",
-        ))),
-    }
+    let format = match value.as_str() {
+        "" | "wav" => AudioFormat::Wav,
+        "raw_i16" | "pcm" => AudioFormat::PcmI16,
+        "raw_f32" | "f32" => AudioFormat::PcmF32,
+        "mp3" | "opus" | "ogg" | "flac" | "aac" => {
+            AudioFormat::parse(&value).expect("known format name")
+        }
+        _ => {
+            return Err(ApiError::bad_request(format!(
+                "Unsupported project export format: {value}. Use wav, mp3, opus, flac, raw_i16 or raw_f32.",
+            )))
+        }
+    };
+    EncoderOptions::new(format, 24_000)
+        .validate()
+        .map_err(crate::api::openai::audio::speech::codec_api_error)?;
+    Ok(format)
 }
 
 fn parse_segment_filter(raw: Option<&str>) -> Option<HashSet<String>> {
@@ -1500,7 +1516,7 @@ fn parse_segment_filter(raw: Option<&str>) -> Option<HashSet<String>> {
 #[cfg(test)]
 mod tests {
     use super::{join_takes, paragraph_list};
-    use izwi_core::audio::AudioFormat;
+    use izwi_audio_codec::AudioFormat;
 
     fn wav(sample_rate: u32, samples: usize) -> Vec<u8> {
         let mut bytes = std::io::Cursor::new(Vec::new());
@@ -1538,6 +1554,26 @@ mod tests {
         assert!(
             (length - expected).abs() <= 64,
             "joined {length} samples, expected about {expected}"
+        );
+    }
+
+    #[test]
+    fn projects_export_to_compressed_formats() {
+        let takes = [wav(16_000, 16_000), wav(24_000, 12_000)];
+        let flac = join_takes(&takes, 500, AudioFormat::Flac).expect("flac");
+        assert_eq!(&flac[..4], b"fLaC");
+        let opus = join_takes(&takes, 500, AudioFormat::Opus).expect("opus");
+        assert_eq!(&opus[..4], b"OggS");
+        let mp3 = join_takes(&takes, 500, AudioFormat::Mp3).expect("mp3");
+        assert_eq!(mp3[0], 0xFF, "an MPEG frame sync");
+        assert_eq!(
+            super::parse_project_audio_format(Some("FLAC")).unwrap(),
+            AudioFormat::Flac
+        );
+        assert!(super::parse_project_audio_format(Some("aac")).is_err());
+        assert_eq!(
+            super::project_audio_filename("My Show", AudioFormat::Opus),
+            "my-show.opus"
         );
     }
 

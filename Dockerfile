@@ -43,6 +43,11 @@ ARG TARGETARCH
 # Reported by /internal/health; CUDA runtime evidence fails closed without it.
 ARG IZWI_BUILD_GIT_SHA=
 
+# cmake: libopus (izwi-audio-codec's Opus encoder) is built with it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
@@ -98,7 +103,8 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 
 WORKDIR /app
 
-# git: the FlashAttention build fetches CUTLASS. Nothing here comes from
+# git: the FlashAttention build fetches CUTLASS. cmake: libopus
+# (izwi-audio-codec's Opus encoder) is built with it. Nothing here comes from
 # NVIDIA's apt repository (the image already has the CUDA toolkit), so its
 # source goes first: a mirror NVIDIA is still syncing fails `apt-get update`
 # with a size mismatch.
@@ -107,6 +113,7 @@ RUN rm -f /etc/apt/sources.list.d/cuda* \
     && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
+        cmake \
         git \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -157,7 +164,7 @@ RUN apt-get update \
 
 COPY --link --from=rust-builder-cpu /out/ /usr/local/bin/
 COPY --link --from=ui-builder /app/ui/dist /app/ui/dist
-COPY --link LICENSE NOTICE /usr/share/doc/izwi/
+COPY --link LICENSE NOTICE THIRD_PARTY_LICENSES /usr/share/doc/izwi/
 
 # The server is configured through IZWI_* variables (docker run -e / compose
 # environment). History (the database) and media live on the /app/data
@@ -214,7 +221,7 @@ RUN rm -f /etc/apt/sources.list.d/cuda* \
 
 COPY --link --from=rust-builder-cuda /out/ /usr/local/bin/
 COPY --link --from=ui-builder /app/ui/dist /app/ui/dist
-COPY --link LICENSE NOTICE /usr/share/doc/izwi/
+COPY --link LICENSE NOTICE THIRD_PARTY_LICENSES /usr/share/doc/izwi/
 
 # The base image sets NVIDIA_VISIBLE_DEVICES and NVIDIA_DRIVER_CAPABILITIES;
 # the compose device request decides which GPUs the container gets.
@@ -259,7 +266,7 @@ COPY --link --from=rust-builder-gateway /out/izwi-gateway /usr/local/bin/izwi-ga
 # The scoped principal-key store (read when a key manifest is set) lives on
 # the /app/data volume, so it survives the container being recreated.
 COPY --link --chown=1000:1000 --from=rust-builder-gateway /out/data /app/data
-COPY --link LICENSE NOTICE /usr/share/doc/izwi/
+COPY --link LICENSE NOTICE THIRD_PARTY_LICENSES /usr/share/doc/izwi/
 
 ENV IZWI_DB_PATH=/app/data/izwi.sqlite3 \
     IZWI_HOST=0.0.0.0

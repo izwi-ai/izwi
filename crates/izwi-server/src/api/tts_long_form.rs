@@ -6,6 +6,7 @@ use izwi_core::runtime_models::architectures::fish_drama3::chunking::{
     plan_chunk_spans, split_text as fish_drama3_split_text, CHUNK_MAX_SPEAKERS,
     HISTORY_RECENT_TURNS,
 };
+use izwi_core::text_segments::pack_sentences;
 use izwi_core::{
     GenerationRequest, GenerationResult, ModelVariant, RuntimeService, SpeechChunkTurn,
     SpeechFrameCodes, TtsStopReason,
@@ -704,11 +705,9 @@ pub fn split_tts_text_for_long_form(
 
     // Whole sentences, packed up to the character cap and what one request
     // of this family can speak (TPIPE-5).
-    let chunks = crate::api::sentence_split::pack_sentences(
-        trimmed,
-        segment_max_chars(variant),
-        &|segment| !crate::api::tts_policy::tts_text_exceeds_one_request(variant, segment),
-    );
+    let chunks = pack_sentences(trimmed, segment_max_chars(variant), &|segment| {
+        !crate::api::tts_policy::tts_text_exceeds_one_request(variant, segment)
+    });
 
     if chunks.is_empty() {
         vec![trimmed.to_string()]

@@ -15,6 +15,7 @@ import {
   type CursorPageResult,
   type CursorPaginationQuery,
 } from "@/shared/api/pagination";
+import type { AudioDownloadFormat } from "@/shared/audioFormats";
 
 const FIRST_PARTY_AUDIO_UPLOAD_LIMIT_BYTES = 64 * 1024 * 1024;
 
@@ -57,7 +58,8 @@ export interface TTSRequest {
    * the voice of a speaker without a reference. */
   seed?: number;
   max_tokens?: number;
-  format?: "wav" | "pcm" | "raw_f32" | "raw_i16";
+  /** `pcm` is OpenAI's 24 kHz PCM; `pcm_i16` keeps the model's rate. */
+  format?: "wav" | "pcm" | "pcm_i16" | "raw_f32" | "raw_i16" | "mp3" | "opus" | "flac";
   temperature?: number;
   speed?: number;
 }
@@ -1487,7 +1489,8 @@ export class AudioApiClient {
             max_tokens: request.max_tokens,
             temperature: request.temperature,
             speed: request.speed,
-            response_format: request.format ?? "pcm",
+            // The model's own rate, which the stream's events report.
+            response_format: request.format ?? "pcm_i16",
             stream: true,
           }),
           signal: abortController.signal,
@@ -1912,15 +1915,21 @@ export class AudioApiClient {
   speechHistoryRecordAudioUrl(
     route: SpeechHistoryRoute,
     recordId: string,
-    options?: { download?: boolean },
+    options?: { download?: boolean; format?: AudioDownloadFormat },
   ): string {
     const base = this.http.url(
       `${this.speechHistoryRecordPath(route, recordId)}/audio`,
     );
+    const query = new URLSearchParams();
     if (options?.download) {
-      return `${base}?download=true`;
+      query.set("download", "true");
     }
-    return base;
+    // Saved speech is WAV; another format is encoded on the way out.
+    if (options?.format && options.format !== "wav") {
+      query.set("format", options.format);
+    }
+    const search = query.toString();
+    return search ? `${base}?${search}` : base;
   }
 
   /** Save audio the user asked for; false when the save dialog was cancelled. */
@@ -2006,7 +2015,7 @@ export class AudioApiClient {
 
   textToSpeechRecordAudioUrl(
     recordId: string,
-    options?: { download?: boolean },
+    options?: { download?: boolean; format?: AudioDownloadFormat },
   ): string {
     return this.speechHistoryRecordAudioUrl("text-to-speech", recordId, options);
   }
@@ -2352,7 +2361,7 @@ export class AudioApiClient {
     projectId: string,
     options?: {
       download?: boolean;
-      format?: "wav" | "raw_i16" | "raw_f32";
+      format?: "wav" | "mp3" | "flac" | "opus" | "raw_i16" | "raw_f32";
       segment_ids?: string[];
       pause_ms?: number;
     },

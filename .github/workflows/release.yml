@@ -228,7 +228,9 @@ jobs:
             -C "${{ github.workspace }}/target/release" \
             izwi izwi-server izwi-gateway izwi-serving-supervisor izwi-serving-worker izwi-desktop \
             -C "${{ github.workspace }}/config/serving" \
-            izwi-serving-node.example.toml
+            izwi-serving-node.example.toml \
+            -C "${{ github.workspace }}" \
+            LICENSE NOTICE THIRD_PARTY_LICENSES
 
       - name: Package terminal binaries (Windows)
         if: runner.os == 'Windows'
@@ -242,6 +244,9 @@ jobs:
             target/release/izwi-serving-supervisor.exe, `
             target/release/izwi-serving-worker.exe, `
             config/serving/izwi-serving-node.example.toml, `
+            LICENSE, `
+            NOTICE, `
+            THIRD_PARTY_LICENSES, `
             target/release/izwi-desktop.exe `
             -DestinationPath "release-assets/izwi-cli-$($env:GITHUB_REF_NAME)-${{ matrix.asset_suffix }}.zip" `
             -Force

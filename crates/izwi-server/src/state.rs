@@ -437,6 +437,8 @@ pub struct AppState {
     pub response_store: Arc<RwLock<HashMap<String, StoredResponseRecord>>>,
     /// In-memory store for minimal agent sessions.
     pub agent_session_store: Arc<RwLock<HashMap<String, StoredAgentSessionRecord>>>,
+    /// Outcomes of `/v1/audio/speech` requests, process-local and bounded.
+    pub(crate) speech_outcomes: Arc<crate::speech_outcomes::SpeechOutcomeStore>,
     /// SQLite-backed chat thread/message store.
     pub chat_store: Arc<ChatStore>,
     /// SQLite-backed transcription history store.
@@ -543,6 +545,7 @@ impl AppState {
             agent_session_store_limit,
             response_store: Arc::new(RwLock::new(HashMap::new())),
             agent_session_store: Arc::new(RwLock::new(HashMap::new())),
+            speech_outcomes: Arc::new(crate::speech_outcomes::SpeechOutcomeStore::from_tuning()),
             chat_store,
             transcription_store,
             diarization_store,
@@ -651,6 +654,7 @@ impl AppState {
             agent_session_store_limit,
             response_store: Arc::new(RwLock::new(HashMap::new())),
             agent_session_store: Arc::new(RwLock::new(HashMap::new())),
+            speech_outcomes: Arc::new(crate::speech_outcomes::SpeechOutcomeStore::from_tuning()),
             chat_store,
             transcription_store,
             diarization_store,

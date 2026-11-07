@@ -35,7 +35,8 @@ jobs:
       # every cargo invocation in this container dies at startup. Nothing
       # here comes from NVIDIA's apt repository (the image already has the
       # CUDA toolkit), so its source goes first: a mirror NVIDIA is still
-      # syncing fails `apt-get update` with a size mismatch.
+      # syncing fails `apt-get update` with a size mismatch. cmake builds
+      # libopus, izwi-audio-codec's Opus encoder.
       - name: Install container build dependencies
         run: |
           rm -f /etc/apt/sources.list.d/cuda*
@@ -43,6 +44,7 @@ jobs:
           apt-get install -y \
             build-essential \
             ca-certificates \
+            cmake \
             curl \
             git \
             pkg-config \

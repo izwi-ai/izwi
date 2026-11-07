@@ -66,7 +66,7 @@ export function useReadAloud(onError: (message: string) => void) {
           text,
           model_id: voice.modelId,
           speaker: voice.speaker,
-          format: "pcm",
+          format: "pcm_i16",
         },
         {
           onStart: (event) => {

@@ -57,6 +57,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+# Speech API pass-through to izwi-server upstreams (app/audio_proxy.rs).
+reqwest = { workspace = true }
+rustls = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }

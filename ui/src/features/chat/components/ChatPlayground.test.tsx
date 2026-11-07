@@ -1900,7 +1900,7 @@ describe("ChatPlayground", () => {
       fireEvent.click(await screen.findByRole("button", { name: "Read aloud" }));
 
       expect(apiMocks.generateTTSStream).toHaveBeenCalledWith(
-        { text: "Hi there", model_id: "Kokoro-82M", speaker: "af_heart", format: "pcm" },
+        { text: "Hi there", model_id: "Kokoro-82M", speaker: "af_heart", format: "pcm_i16" },
         expect.any(Object),
       );
       expect(

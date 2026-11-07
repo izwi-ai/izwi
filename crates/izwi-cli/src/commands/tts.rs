@@ -364,7 +364,7 @@ async fn save_audio(
         PathBuf::from(format!(
             "izwi_output_{}.{}",
             timestamp,
-            format_label(format)
+            format_extension(format)
         ))
     });
     tokio::fs::write(&output_path, &audio_data)
@@ -442,11 +442,26 @@ fn audio_players(path: &Path) -> Vec<(&'static str, Vec<OsString>)> {
     }
 }
 
-/// The format's name in requests and its file extension.
+/// The format's name in requests. `pcm_i16` keeps the model's rate (the
+/// API's bare `pcm` is OpenAI's 24 kHz PCM).
 fn format_label(format: &AudioFormat) -> &'static str {
     match format {
         AudioFormat::Wav => "wav",
+        AudioFormat::Pcm => "pcm_i16",
+        AudioFormat::Mp3 => "mp3",
+        AudioFormat::Opus => "opus",
+        AudioFormat::Flac => "flac",
+    }
+}
+
+/// The format's file extension.
+fn format_extension(format: &AudioFormat) -> &'static str {
+    match format {
+        AudioFormat::Wav => "wav",
         AudioFormat::Pcm => "pcm",
+        AudioFormat::Mp3 => "mp3",
+        AudioFormat::Opus => "opus",
+        AudioFormat::Flac => "flac",
     }
 }
 
@@ -500,8 +515,9 @@ fn build_request_body(args: BuildRequestArgs<'_>) -> Result<Value> {
 
     let mut request_body = json!({
         "model": args.model,
-        // A stream carries raw 16-bit PCM chunks, assembled into a WAV.
-        "response_format": if args.stream { "pcm" } else { format_label(args.format) },
+        // A stream carries raw 16-bit PCM chunks at the model's rate,
+        // assembled into a WAV.
+        "response_format": if args.stream { "pcm_i16" } else { format_label(args.format) },
         "stream": args.stream,
     });
     let dialogue = args.dialogue;
@@ -752,7 +768,8 @@ mod tests {
             .expect("request body")
         };
         assert_eq!(body(&AudioFormat::Wav)["response_format"], "wav");
-        assert_eq!(body(&AudioFormat::Pcm)["response_format"], "pcm");
+        assert_eq!(body(&AudioFormat::Pcm)["response_format"], "pcm_i16");
+        assert_eq!(body(&AudioFormat::Opus)["response_format"], "opus");
         assert!(body(&AudioFormat::Wav)
             .get("allow_format_fallback")
             .is_none());
@@ -821,7 +838,7 @@ mod tests {
         })
         .expect("request body");
         assert!(body.get("speed").is_none() && body.get("temperature").is_none());
-        assert_eq!(body["response_format"], "pcm");
+        assert_eq!(body["response_format"], "pcm_i16");
     }
 
     #[test]

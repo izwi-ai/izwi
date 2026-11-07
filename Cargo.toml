@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/izwi-asr-toolkit",
+    "crates/izwi-audio-codec",
     "crates/izwi-agent",
     "crates/izwi-core",
     "crates/izwi-db",

@@ -12,6 +12,7 @@
 !ui/
 !LICENSE
 !NOTICE
+!THIRD_PARTY_LICENSES
 
 # Inside the allowed directories: build output and local state.
 **/target/

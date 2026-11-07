@@ -168,6 +168,8 @@ struct TranscriptionRequest {
     max_tokens: Option<usize>,
     _temperature: Option<f32>,
     timestamp_granularities: Option<Vec<String>>,
+    /// Served by `/v1/audio/translations`: `verbose_json` says `translate`.
+    translate: bool,
 }
 
 impl TranscriptionRequest {
@@ -204,6 +206,8 @@ struct JsonTranscriptionResponse {
 
 #[derive(Debug, serde::Serialize)]
 struct VerboseJsonTranscriptionResponse {
+    /// `transcribe` or `translate`, as OpenAI's verbose responses say.
+    task: &'static str,
     text: String,
     language: Option<String>,
     duration: f32,
@@ -275,7 +279,85 @@ pub async fn transcriptions(
     Extension(ctx): Extension<RequestContext>,
     req: Request,
 ) -> Result<Response<Body>, ApiError> {
+    let req = parse_transcription_request(req).await?;
+    run_transcription(state, ctx, req).await
+}
+
+/// `POST /v1/audio/translations`: OpenAI's translation route (deprecated
+/// upstream, `whisper-1` only there), served by the catalog's speech
+/// translation models through the transcription pipeline. The target is
+/// English unless `to_language` (vLLM) or `target_language` (Izwi) names
+/// another language the model translates into.
+pub async fn translations(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
+    req: Request,
+) -> Result<Response<Body>, ApiError> {
     let mut req = parse_transcription_request(req).await?;
+    if req
+        .timestamp_granularities
+        .as_ref()
+        .is_some_and(|values| values.iter().any(|value| !value.trim().is_empty()))
+    {
+        return Err(ApiError::invalid_param(
+            "timestamp_granularities",
+            "Translations have no word timestamps; omit `timestamp_granularities`.",
+        ));
+    }
+    if req.speaker_labels {
+        return Err(ApiError::invalid_param(
+            "speaker_labels",
+            "Translations do not tag speakers; omit `speaker_labels`.",
+        ));
+    }
+    if req
+        .model
+        .as_deref()
+        .is_none_or(|model| model.trim().is_empty())
+    {
+        return Err(ApiError::invalid_param(
+            "model",
+            format!(
+                "`model` is required: one that translates speech ({})",
+                translation_model_names()
+            ),
+        ));
+    }
+    let model = req.model.as_deref().unwrap_or_default();
+    let translates = izwi_core::parse_model_variant(model)
+        .is_ok_and(|variant| variant.supports_asr_translation());
+    if !translates {
+        return Err(ApiError::invalid_param(
+            "model",
+            format!(
+                "{} does not translate speech. Models that do: {}",
+                req.model.as_deref().unwrap_or_default(),
+                translation_model_names()
+            ),
+        ));
+    }
+    if req.target_language.is_none() {
+        req.target_language = Some("en".to_string());
+    }
+    req.translate = true;
+    run_transcription(state, ctx, req).await
+}
+
+/// The catalog's speech translation models, for error messages.
+fn translation_model_names() -> String {
+    izwi_core::ModelVariant::all()
+        .iter()
+        .filter(|variant| variant.supports_asr_translation())
+        .map(|variant| variant.dir_name().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+async fn run_transcription(
+    state: AppState,
+    ctx: RequestContext,
+    mut req: TranscriptionRequest,
+) -> Result<Response<Body>, ApiError> {
     validate_transcription_model(req.model.as_deref())?;
     validate_transcription_language(req.model.as_deref(), req.language.as_deref())?;
     crate::api::transcript_alignment::reject_removed_aligner(req.aligner_model.as_deref())?;
@@ -470,6 +552,11 @@ pub async fn transcriptions(
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 serde_json::to_string(&VerboseJsonTranscriptionResponse {
+                    task: if req.translate {
+                        "translate"
+                    } else {
+                        "transcribe"
+                    },
                     text: output.text,
                     // The model's detected language, else the one asked for.
                     language: output.language.or_else(|| req.language.clone()),
@@ -660,8 +747,12 @@ struct JsonRequestBody {
     stream: Option<bool>,
     #[serde(default)]
     prompt: Option<String>,
-    #[serde(default)]
+    /// vLLM's name for it is `to_language`.
+    #[serde(default, alias = "to_language")]
     target_language: Option<String>,
+    /// OpenAI's `gpt-transcribe` hint list; the first is the language.
+    #[serde(default)]
+    languages: Option<Vec<String>>,
     #[serde(default)]
     keywords: Option<KeywordsField>,
     #[serde(default)]
@@ -692,9 +783,15 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
 
         return Ok(TranscriptionRequest {
             audio: Some(audio_payload),
-            model: payload.model,
+            model: payload.model.map(|model| {
+                crate::api::openai::model_aliases::resolve_model_alias(&model).to_string()
+            }),
             aligner_model: payload.aligner_model,
-            language: payload.language,
+            language: payload.language.or_else(|| {
+                payload.languages.and_then(|languages| {
+                    languages.into_iter().find(|code| !code.trim().is_empty())
+                })
+            }),
             response_format: payload.response_format,
             stream: payload.stream.unwrap_or(false),
             prompt: payload.prompt,
@@ -707,6 +804,7 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
             max_tokens: payload.max_tokens,
             _temperature: payload.temperature,
             timestamp_granularities: payload.timestamp_granularities,
+            translate: false,
         });
     }
 
@@ -717,6 +815,7 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
             .map_err(|e| ApiError::bad_request(format!("Invalid multipart payload: {e}")))?;
 
         let mut out = TranscriptionRequest::default();
+        let mut languages_hint = None;
 
         while let Some(field) = multipart
             .next_field()
@@ -764,7 +863,10 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                         ))
                     })?;
                     if !text.trim().is_empty() {
-                        out.model = Some(text.trim().to_string());
+                        out.model = Some(
+                            crate::api::openai::model_aliases::resolve_model_alias(text.trim())
+                                .to_string(),
+                        );
                     }
                 }
                 "aligner_model" | "aligner_model_id" => {
@@ -788,6 +890,18 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                         out.language = Some(text.trim().to_string());
                     }
                 }
+                // OpenAI's `gpt-transcribe` hint list: the first one is the
+                // language, unless `language` names it.
+                "languages" | "languages[]" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart '{name}' field: {e}"
+                        ))
+                    })?;
+                    if !text.trim().is_empty() {
+                        languages_hint.get_or_insert_with(|| text.trim().to_string());
+                    }
+                }
                 "response_format" => {
                     let text = field.text().await.map_err(|e| {
                         ApiError::bad_request(format!(
@@ -808,10 +922,10 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                         out.prompt = Some(text.trim().to_string());
                     }
                 }
-                "target_language" => {
+                "target_language" | "to_language" => {
                     let text = field.text().await.map_err(|e| {
                         ApiError::bad_request(format!(
-                            "Failed reading multipart 'target_language' field: {e}"
+                            "Failed reading multipart '{name}' field: {e}"
                         ))
                     })?;
                     if !text.trim().is_empty() {
@@ -891,6 +1005,9 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
             }
         }
 
+        if out.language.is_none() {
+            out.language = languages_hint;
+        }
         return Ok(out);
     }
 

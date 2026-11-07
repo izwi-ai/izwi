@@ -24,7 +24,9 @@ When `izwi serve` is running:
 |---------|--------|-------|
 | `/v1/models`, `/v1/models/{model}` | Stable | OpenAI-compatible model catalog. |
 | `/v1/chat/completions` | Stable | OpenAI-compatible chat completions. |
-| `/v1/audio/speech` | Stable | OpenAI-compatible text-to-speech endpoint with Izwi voice extensions. |
+| `/v1/audio/speech` | Stable | OpenAI-compatible text-to-speech endpoint (mp3, opus, flac, wav, pcm; buffered, chunked `audio` or SSE) with Izwi voice extensions. |
+| `/v1/audio/translations`, `/v1/audio/voices*`, `/v1/audio/voice_consents*` | Stable | OpenAI-compatible translation and custom-voice routes. |
+| `/v1/audio/speech/batch`, `/v1/audio/speech/{id}`, `/v1/audio/speech/stream` | Preview | Batch speech, outcome lookup (process-local) and the text-in speech WebSocket. |
 | `/v1/audio/transcriptions` | Stable | OpenAI-compatible transcription endpoint with local streaming support. |
 | `/livez`, `/readyz`, `/v1/live`, `/v1/ready`, `/v1/health` | Stable | Operational health and readiness endpoints. |
 | `/v1/responses*` | Preview | OpenAI-compatible Responses API shape with process-local response retention. |
@@ -363,11 +365,13 @@ Request fields:
 
 | Field | Notes |
 |-------|-------|
-| `model` | Required TTS model variant. |
+| `model` | Required TTS model variant, or an OpenAI model name an operator mapped with `IZWI_OPENAI_MODEL_ALIASES` (`tts-1=Kokoro-82M,…`). Unmapped OpenAI names return `400`. |
 | `input` | Required text to synthesize, unless `script` gives it. |
-| `voice` | Built-in voice/speaker name where the model supports presets. |
-| `response_format` | Native OSS formats: `wav` (default), `pcm`, `pcm16`, `pcm_i16`, `raw_i16`, `raw_f32`, `pcm_f32`. Recognized compressed names `mp3`, `opus`, `ogg`, `aac`, and `flac` require explicit fallback opt-in because compressed encoders are not bundled. |
-| `allow_format_fallback` | Optional boolean. When `true`, recognized compressed `response_format` values return WAV bytes with `X-Actual-Response-Format: wav`, `X-Response-Format-Fallback`, and `Warning` headers. When omitted or `false`, compressed formats return `400`. |
+| `voice` | A built-in voice/speaker name where the model has presets; OpenAI's custom-voice object `{"id": "<voice id>"}` for a saved voice (`/v1/audio/voices`, `/v1/voices`); or, for a model that clones and has no built-in voices, an uploaded voice's name. |
+| `response_format` | `mp3`, `opus` (Ogg Opus), `flac`, `wav` (the default; `IZWI_SPEECH_DEFAULT_FORMAT` changes it), `pcm` (OpenAI's: 16-bit mono at 24 kHz, resampled when the model runs at another rate), `pcm_i16`/`pcm16`/`raw_i16` and `pcm_f32`/`raw_f32` (headerless, at the model's rate), `g711_ulaw`, `g711_alaw` (8 kHz). `aac` returns `400`: AAC encoders need a patent licence. |
+| `sample_rate` | Optional rate to encode at, resampled when the model's differs. Opus takes 8000, 12000, 16000, 24000 or 48000; MP3 its MPEG rates (8000 to 48000); other formats 8000 to 192000. Unset, the model's rate is kept where the format carries it (Opus: 44.1 kHz becomes 48 kHz, 22.05 kHz becomes 24 kHz). |
+| `bitrate` | Optional bit rate for `mp3` (CBR; 8 to 160 kbit/s at 24 kHz, 32 to 320 at 44.1/48 kHz; default 64 or 128) and `opus` (6 to 510 kbit/s; default 32 kbit/s at 24 kHz). |
+| `allow_format_fallback` | Optional boolean. When `true`, a recognized format this build cannot encode (`aac`, or `mp3`/`opus` in a build without them) returns WAV bytes with `X-Actual-Response-Format: wav`, `X-Response-Format-Fallback` and `Warning` headers instead of `400`. |
 | `speed` | Optional model-dependent speed control. |
 | `language` | Optional language hint such as `English`, `Chinese`, or `Auto`. `Chatterbox-Multilingual-500M` speaks the language it names, as a code or English name (`fr`, `French`), and returns `400` for one it does not support; `Chatterbox-500M` returns `400` for any language but English. `Maya2-Native-2.5B` takes one of its 12 language codes (`hi`, `ta`, …), or none or `auto` to read the language from the text's script, and returns `400` for anything else. LFM3 Audio takes one of its 19 locales (`en-US` when unset, `en-GB`, `fr`, `ja`, …) and returns `400` for anything else. `GET /v1/admin/models` lists a Chatterbox, Maya 2 Native or LFM3 Audio model's languages in `speech_capabilities.languages`. |
 | `temperature`, `top_k` | Optional sampling controls. |
@@ -375,14 +379,14 @@ Request fields:
 | `cfg_weight` | Chatterbox only. Classifier-free guidance weight, 0 to 1 (default `0.5`); `0` turns guidance off. For expressive or fast-talking reference voices, try about `0.3` with `exaggeration` around `0.7` or higher. |
 | `min_p` | Chatterbox only. Min-p sampling threshold, 0 to 1 (default `0.05`). |
 | `max_tokens`, `max_output_tokens` | Optional output token budget aliases. |
-| `instructions` | Voice-design prompt for voice-design models; for `Maya1-3B`, the description of the voice to speak with, replacing `voice`. |
-| `reference_audio` | Base64 audio for voice cloning. |
-| `reference_text` | Transcript of the reference audio. Optional for Chatterbox, which ignores it. |
+| `instructions` | Voice-design prompt for voice-design models; for `Maya1-3B`, the description of the voice to speak with, replacing `voice`. At most 4,096 characters. |
+| `reference_audio` (`ref_audio`) | Audio for voice cloning: base64, a data URL, or an `http(s)` URL on a host `IZWI_ALLOWED_MEDIA_DOMAINS` allows (unset, URLs return `400`). URLs must resolve to public addresses only, and at most 10 MiB is fetched in 30 s. |
+| `reference_text` (`ref_text`) | Transcript of the reference audio. Optional for Chatterbox, which ignores it. |
 | `reference_language` | `Maya2-Native-2.5B` only. The language the reference audio is spoken in, one of its 12 codes; unset, it is read from the transcript's script. Any other model returns `400` if it is set. The speech history create routes accept it too. |
 | `saved_voice_id` | Server-side saved voice reference to reuse. |
 | `references` | Izwi extension, for models that voice several speakers (`speech_capabilities.supports_speaker_dialogue`: `FishAudio-Drama-3`). Reference voices per speaker, each `{speaker, audio, text}` or `{speaker, saved_voice_id}`; it replaces `reference_audio`, `reference_text` and `saved_voice_id`. See the Drama 3 dialogue notes below. |
 | `script` | Izwi extension, for the same models. A dialogue as `[{speaker, text}]` lines, instead of `input`. |
-| `stream`, `stream_format` | `stream: true` or `stream_format: "sse"` enables SSE audio chunks. Text one request cannot speak streams as consecutive long-form segments, as a final-only request splits it. |
+| `stream`, `stream_format` | `stream_format: "audio"` sends the encoded file as a chunked body while it is generated (OpenAI's streaming). `stream_format: "sse"` or `stream: true` sends server-sent events whose deltas are base64 slices of the same bytes. Without either, the whole file arrives after generation, with `Content-Length` and statistics headers. Text one request cannot speak streams as consecutive long-form segments, as a final-only request splits it. |
 
 `exaggeration`, `cfg_weight` and `min_p` are also accepted by the speech
 history create routes. Any other model returns `400` if one is set, and a value
@@ -511,9 +515,8 @@ Japanese returns `400` until Izwi has its text processing.
   last up to 60 s, and saved voices hold up to 30 s. `reference_audio` and
   `reference_text` (or `saved_voice_id`) give one reference, for speaker 0;
   `references` gives up to 8 for a dialogue (below).
-- `response_format` is `wav`, `pcm_i16` or `pcm_f32`, at 44.1 kHz. `mp3`,
-  `opus`, `ogg`, `aac` and `flac` need `allow_format_fallback: true` and
-  return WAV.
+- Audio is generated at 44.1 kHz; `response_format` and `sample_rate`
+  apply as for any model (Opus goes out at 48 kHz).
 - `language` is accepted as a hint and not passed to the model, which reads
   the language from the text; a `[language: xx]` tag in `input` steers it.
 - Tags in `input` reach the model as text: `[sighs]`, `[laughs]`, `[pause]`,
@@ -650,18 +653,27 @@ references is cut into shorter chunks instead.
 
 Non-stream response:
 
-- Body is binary audio.
-- Content type follows the actual generated format.
+- Body is binary audio with exact headers (WAV sizes, FLAC totals and MD5, the MP3 LAME tag).
+- `Content-Type` is the format's: `audio/mpeg`, `audio/ogg` (Opus), `audio/flac`, `audio/wav`, `audio/pcm` (`pcm`), `application/octet-stream` (`pcm_i16`, `pcm_f32`).
+- `X-Audio-Sample-Rate` is the rate the audio plays at; `X-Izwi-Speech-Id` names the request for `GET /v1/audio/speech/{speech_id}`.
 - `X-Requested-Response-Format` and `X-Actual-Response-Format` are exposed. Explicit fallbacks also include `X-Response-Format-Fallback` and an HTTP `Warning` header.
 
-SSE events:
+`stream_format: "audio"` response: the same bytes as a chunked body. Headers
+(`Content-Type`, `X-Audio-Sample-Rate`, `X-Izwi-Speech-Id` and its alias
+`X-SGLang-Omni-Speech-Id`) go out with the first audio; a failure before it is
+an ordinary error response, and a failure after it ends the body early. The
+lookup then reports `status: "failed"`. A streamed WAV's RIFF sizes are
+`0xFFFFFFFF` ("unknown"), FLAC's STREAMINFO has no totals, and an MP3 stream
+has no LAME tag.
 
-| Event | Fields |
-|-------|--------|
-| `audio.started` | `request_id`, `sample_rate`, `audio_format`, optional explicit fallback note in `error`. |
-| `audio.chunk` | `request_id`, `sequence`, `audio_base64`, `sample_count`, `is_final`. |
-| `audio.done` | `request_id`, `tokens_generated`, `generation_time_ms`, `audio_duration_secs`, `rtf`. |
-| `audio.failed` | `request_id`, `error`. |
+SSE events (each is also an OpenAI event, by its `type`):
+
+| Event | `type` | Fields |
+|-------|--------|--------|
+| `audio.started` | | `request_id`, `sample_rate` (output), `audio_format`, optional explicit fallback note in `error`. |
+| `audio.chunk` | `speech.audio.delta` | `audio` and `audio_base64` (base64 of the next encoded bytes: concatenated, the deltas are one file), `request_id`, `sequence`, `sample_count`, `is_final`, `sample_rate`. |
+| `audio.done` | `speech.audio.done` | `usage` (`input_tokens`, which Izwi reports as 0; `output_tokens`; `total_tokens`), `tokens_generated`, `generation_time_ms`, `audio_duration_secs`, `rtf`, `stop_reason`, `timing`. |
+| `audio.failed` | `error` | `request_id`, `error`. |
 
 Example SSE request:
 
@@ -670,6 +682,130 @@ curl -N http://localhost:8080/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{"model":"Kokoro-82M","input":"Stream this.","stream_format":"sse"}'
 ```
+
+### Audio Speech Lookup
+
+`GET /v1/audio/speech/{speech_id}` returns the outcome of a `/v1/audio/speech`
+request this server ran, in any delivery (and of batch items and speech
+socket utterances), by its `X-Izwi-Speech-Id`:
+
+```json
+{"id": "speech_…", "object": "audio.speech", "status": "completed", "model": "Kokoro-82M",
+ "mode": "audio_stream", "response_format": "mp3", "sample_rate": 24000,
+ "audio_duration_secs": 3.4, "finish_reason": "stop",
+ "usage": {"input_tokens": 0, "output_tokens": 120, "total_tokens": 120, "prompt_tokens": 0, "completion_tokens": 120},
+ "created_at": 1762430000, "completed_at": 1762430001, "request_id": "speech_…"}
+```
+
+`status` is `in_progress`, `completed`, `failed` or `cancelled` (the client
+went away); `finish_reason` is `stop`, `length` (the output budget cut it),
+`cancelled` or `error`. Outcomes are kept in memory: at most
+`IZWI_SPEECH_OUTCOME_CAPACITY` (1024), for `IZWI_SPEECH_OUTCOME_TTL_SECS`
+(an hour), and not across restarts. A missing id is `404`. No audio is kept.
+
+### Audio Speech Batch
+
+`POST /v1/audio/speech/batch` speaks up to `IZWI_TTS_BATCH_MAX_ITEMS` (32)
+requests, in the envelope SGLang-Omni and vLLM-Omni share. Top-level speech
+fields are defaults each item overrides:
+
+```json
+{"model": "Kokoro-82M", "voice": "af_heart", "response_format": "mp3",
+ "items": [{"input": "One."}, {"input": "Two.", "speed": 1.1}]}
+```
+
+The response keeps the items' order. A failed item carries an OpenAI error
+object, with `param` prefixed `items.<i>.`:
+
+```json
+{"id": "speech_batch_…", "object": "audio.speech.batch",
+ "results": [
+   {"index": 0, "status": "success", "id": "speech_…", "audio_data": "<base64>", "format": "mp3",
+    "media_type": "audio/mpeg", "sample_rate": 24000, "audio_duration_secs": 0.8,
+    "finish_reason": "stop", "usage": {"input_tokens": 0, "output_tokens": 40, "total_tokens": 40}},
+   {"index": 1, "status": "error", "error": {"message": "…", "type": "invalid_request_error", "param": "items.1.speed", "code": null}}],
+ "total": 2, "succeeded": 1, "failed": 1}
+```
+
+Items run `IZWI_TTS_BATCH_CONCURRENCY` (8) at a time, each admitted on its
+own. An empty `items`, too many items, or `stream`/`stream_format` anywhere
+fails the whole request with `400`. Items whose audio would pass
+`IZWI_TTS_BATCH_MAX_OUTPUT_MB` (256) fail with `413`-class errors.
+
+### Audio Speech Stream
+
+`GET /v1/audio/speech/stream` is a WebSocket that takes text in and sends audio
+out. Send text as you have it (an LLM's tokens, say). Izwi cuts it into
+segments and synthesizes the next while the last plays: the first sentence
+goes alone, then complete sentences up to 240 characters, and abbreviations
+and decimals do not end a sentence.
+
+Client messages (JSON text frames):
+
+| `type` | Fields | Effect |
+|--------|--------|--------|
+| `session.config` | The speech fields of `/v1/audio/speech` except `input`, either nested under `session` or flat; plus `stream_audio` (default `true`), `split_granularity` (`sentence`, the default, then `clause` or `none`), `audio_transport` (`binary`, the default, or `base64`), and `close_on_done`. | Must be first, within 10 s. It may be sent again between utterances. `response_format` defaults to `pcm`. |
+| `input.text` | `text` (at most 128 KiB) | Adds text. Segments that are complete start synthesizing. |
+| `input.commit` | | Speaks the buffered text now, even without a sentence end; the utterance continues. |
+| `input.done` | | Speaks the rest and ends the utterance (`session.done`). |
+| `input.cancel` | | Drops buffered text and stops the segments in flight. |
+| `session.close` | | Finishes the utterance, then closes. |
+| `ping` | | Returns `pong`. |
+
+Server events: `session.configured`, then for each segment `audio.start`
+(`id`, `utterance_index`, `sentence_index`, `sentence_text`, `format`,
+`sample_rate`, `channels`). Its audio follows as binary frames, or
+`audio.chunk` events with `audio_b64` when `audio_transport` is `base64`.
+Each segment ends with `audio.done` (`total_bytes`, `error`, `cancelled`).
+After an utterance comes `input.committed` (after a commit) and
+`session.done` (`total_sentences`, `speech_id`, `cancelled`). Errors are
+`{"type": "error", "message", "error_type", "code", "fatal"}`. A fatal error
+closes the socket; any other leaves it usable.
+
+Each segment's audio is one complete file of the format, so segments can be
+played one by one. Concatenated, they still decode: Ogg streams chain, and
+MP3 frames join.
+
+`?dialect=sglang-omni` closes the socket after `session.done`, as
+SGLang-Omni's `input.done` does. `izwi` (the default) and `vllm-omni` keep it
+open for the next utterance.
+
+Limits:
+
+- A session takes a realtime session slot (`IZWI_MAX_REALTIME_SESSIONS`).
+- At most two segments are in flight.
+- A reader slower than the audio pauses synthesis, and one stalled past
+  `IZWI_AUDIO_STREAM_STALL_TIMEOUT_SECS` is closed.
+- Unspoken text is capped at `IZWI_SPEECH_STREAM_MAX_PENDING_CHARS` (65,536;
+  past it, `input_buffer_full`), and a session's text at 1 MiB.
+- An idle session closes after `IZWI_SPEECH_STREAM_IDLE_TIMEOUT_SECS` (30).
+
+### Audio Voices and Consents
+
+OpenAI's custom-voice routes, which also serve SGLang-Omni and vLLM-Omni voice
+clients. They sit over the saved-voice store, so a voice made here is in
+`/v1/voices` too, and `/v1/realtime` sessions can speak it.
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `POST` | `/v1/audio/voice_consents` | Multipart `name`, `recording` (at most 10 MiB) and `language` (BCP 47). Returns `{"object": "audio.voice_consent", "id": "cons_…", "name", "language", "created_at", "status"}`. |
+| `GET` | `/v1/audio/voice_consents` | `after`, `limit` (1 to 100). Returns `{"object": "list", "data", "first_id", "last_id", "has_more"}`. |
+| `GET`, `POST`, `DELETE` | `/v1/audio/voice_consents/{consent_id}` | Fetch it, rename it (JSON `{"name"}`), or delete it. Deleting a consent revokes every voice made with it. |
+| `GET` | `/v1/audio/consent_phrases` | The phrases a verified recording says, per language. |
+| `POST` | `/v1/audio/voices` | Multipart `name`, `audio_sample` (at most 10 MiB) and `consent`, plus optional `ref_text` and `reference_language`. Returns `{"object": "audio.voice", "id", "name", "type": "audio_sample", "created_at", "consent", "usable", …}`. `type=prompt` returns `400`; use `/v1/voice-designs` instead. OpenAI's voice names (`alloy`, `marin`, …) and `default` are reserved. |
+| `GET` | `/v1/audio/voices` | OpenAI-style `data`, plus SGLang-Omni's `voices` and `uploaded_voices` (`?names_only=true` gives `uploaded_voice_names`). |
+| `GET`, `DELETE` | `/v1/audio/voices/{voice_id}` | By id or by name. |
+
+`IZWI_VOICE_CONSENT_MODE` sets what `consent` must be:
+
+- `attestation`: any non-empty `consent`, kept as the voice's provenance.
+- `recording`: the id of a consent recording.
+- `verified`: the id of a consent recording whose transcript matched a
+  published phrase.
+
+Unset, a server protected by an API key uses `recording` and an open local
+server `attestation`. Speak a voice with `voice: {"id": "<id>"}` on
+`/v1/audio/speech`, or with `session.audio.output.voice` on `/v1/realtime`.
 
 ### Audio Transcriptions
 
@@ -793,6 +929,32 @@ curl -X POST http://localhost:8080/v1/audio/transcriptions \
   -F "model=Parakeet-TDT-0.6B-v3" \
   -F "response_format=verbose_json"
 ```
+
+### Audio Translations
+
+`POST /v1/audio/translations` is OpenAI's translation route, served by the
+catalog's speech translation models through the transcription pipeline:
+`Granite-Speech-5.0-2B` (and its GGUF) and
+`Nemotron-3.5-Transcribe-30B-A4B-FP8`. Any other model returns `400`, naming
+the ones that translate. Whisper Large v3 Turbo was not trained to translate.
+
+Multipart (or JSON with `audio_base64`):
+
+- `file` and `model`, both required. `model` may be an
+  `IZWI_OPENAI_MODEL_ALIASES` name such as `whisper-1`.
+- `prompt` and `temperature`.
+- `response_format`: `json`, `text`, `srt`, `verbose_json` or `vtt`.
+- `language`: a hint for the source language.
+- `to_language` or `target_language`: the target. English unless set; a
+  model that translates out of English takes others.
+- `stream`: `transcript.text.delta` and `transcript.text.done` events.
+
+`verbose_json` carries `"task": "translate"`. Translations have no word
+timestamps.
+
+`/v1/audio/transcriptions` also takes `languages[]` (OpenAI `gpt-transcribe`'s
+hint list; the first becomes `language`), and `to_language` as a name for
+`target_language`.
 
 ### Audio Alignment
 

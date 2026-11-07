@@ -18,6 +18,11 @@ import {
   projectDurationSecs,
   scriptFilename,
 } from "@/features/studio/studio";
+import {
+  AUDIO_DOWNLOAD_FORMATS as FORMATS,
+  audioDownloadFormatLabel as formatLabel,
+  type AudioDownloadFormat as ExportFormat,
+} from "@/shared/audioFormats";
 import { saveFile } from "@/shared/saveFile";
 
 const PAUSES = [
@@ -35,7 +40,7 @@ interface StudioExportDialogProps {
   onRender: (segmentIds?: string[]) => Promise<boolean>;
 }
 
-/** One WAV of the project, rendering what's missing first. */
+/** One audio file of the project, rendering what's missing first. */
 export function StudioExportDialog({
   open,
   onClose,
@@ -44,6 +49,7 @@ export function StudioExportDialog({
   onRender,
 }: StudioExportDialogProps) {
   const [pauseMs, setPauseMs] = useState(500);
+  const [format, setFormat] = useState<ExportFormat>("wav");
   const [includeScript, setIncludeScript] = useState(false);
   const [phase, setPhase] = useState<"idle" | "rendering" | "saving">("idle");
   const [error, setError] = useState<string | null>(null);
@@ -72,11 +78,11 @@ export function StudioExportDialog({
       const saved = await api.downloadAudioFile(
         api.studioProjectAudioUrl(project.id, {
           download: true,
-          format: "wav",
+          format,
           segment_ids: segmentIds,
           pause_ms: pauseMs,
         }),
-        scriptFilename(project.name, "wav"),
+        scriptFilename(project.name, format),
       );
       // A cancelled save dialog leaves this one open to try again.
       if (!saved) {
@@ -139,7 +145,7 @@ export function StudioExportDialog({
       title="Export audio"
       description={
         <>
-          One WAV file
+          One {formatLabel(format)} file
           {waiting.length === 0
             ? ` · ${formatClockDuration(segmentIds ? duration : projectDurationSecs(project))}`
             : ""}
@@ -168,6 +174,14 @@ export function StudioExportDialog({
         ) : null}
 
         <ExportSettings>
+          <ExportChoiceRow
+            label="Format"
+            hint="WAV and FLAC are lossless; MP3 and Opus are smaller"
+            options={FORMATS}
+            value={format}
+            onChange={setFormat}
+            disabled={busy}
+          />
           <ExportChoiceRow
             label="Pause between paragraphs"
             hint="A short breath at each break"

@@ -1250,7 +1250,8 @@ async fn drive_tts_session_to_completion(
 
 /// SPK-F10: an incremental text stream synthesizes each complete sentence
 /// as its input arrives, before `Finish`, with the admission's voice and
-/// language; the session still ends with exactly one final frame.
+/// language; the session still ends with exactly one final frame. A title
+/// ("Dr.") at the end of an input does not end the sentence.
 #[tokio::test]
 async fn incremental_tts_session_speaks_each_sentence_with_its_voice() {
     let runner = FakeTtsRunner::new();
@@ -1278,13 +1279,9 @@ async fn incremental_tts_session_speaks_each_sentence_with_its_voice() {
     assert!(matches!(next_frame(&mut ws).await, NextFrame::Admitted));
     assert!(matches!(next_frame(&mut ws).await, NextFrame::Event(_)));
 
-    send_json(
-        &mut ws,
-        &RealtimeClientFrame::Input {
-            text: "Hello there. How ".into(),
-        },
-    )
-    .await;
+    for text in ["Hello there, Dr. ", "Lee. How "] {
+        send_json(&mut ws, &RealtimeClientFrame::Input { text: text.into() }).await;
+    }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while runner.counters.start_calls.load(Ordering::Acquire) == 0 {
         assert!(
@@ -1319,7 +1316,7 @@ async fn incremental_tts_session_speaks_each_sentence_with_its_voice() {
 
     let started = runner.started.lock().unwrap().clone();
     let texts: Vec<&str> = started.iter().map(|(text, _)| text.as_str()).collect();
-    assert_eq!(texts, ["Hello there.", "How are you?", "Fine"]);
+    assert_eq!(texts, ["Hello there, Dr. Lee.", "How are you?", "Fine"]);
     let voice = RealtimeTtsOptions {
         speaker: Some("af_heart".into()),
         language: Some("en".into()),

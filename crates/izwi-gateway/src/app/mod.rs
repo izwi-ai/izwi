@@ -2,6 +2,7 @@
 //! prefix-aware routing, fleet coordination, and the realtime relay with its
 //! wire protocol.
 
+pub mod audio_proxy;
 pub mod chat;
 pub mod chat_content;
 pub mod fleet_coordinator;

@@ -4,6 +4,7 @@ pub mod audio;
 pub mod chat;
 pub mod compat;
 pub use izwi_gateway::api::openai::convert;
+pub(crate) mod model_aliases;
 pub mod models;
 pub mod realtime;
 pub mod responses;

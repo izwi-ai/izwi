@@ -1,6 +1,6 @@
 //! Persistent saved voice routes for reusable voice cloning references.
 
-mod handlers;
+pub(crate) mod handlers;
 
 use axum::{extract::DefaultBodyLimit, routing::get, Router};
 use base64::Engine;

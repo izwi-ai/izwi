@@ -134,7 +134,7 @@ pub async fn get_saved_voice_audio(
 /// A saved voice is a voice-clone reference, so it is held to the reference
 /// limit at upload: a longer clip was accepted and then failed every use
 /// (TPIPE-23).
-fn validate_saved_voice_reference(duration_secs: f32) -> Result<(), ApiError> {
+pub(crate) fn validate_saved_voice_reference(duration_secs: f32) -> Result<(), ApiError> {
     let limit = izwi_core::catalog::SpeechModelCapabilities::MAX_REFERENCE_AUDIO_SECS;
     if duration_secs > limit as f32 {
         return Err(ApiError::bad_request(format!(
@@ -146,7 +146,9 @@ fn validate_saved_voice_reference(duration_secs: f32) -> Result<(), ApiError> {
 
 /// A saved voice's language, stored as the catalog's code: a voice outlives
 /// any one model, so it names a language a cross-lingual cloner knows.
-fn saved_voice_reference_language(raw: Option<&str>) -> Result<Option<String>, ApiError> {
+pub(crate) fn saved_voice_reference_language(
+    raw: Option<&str>,
+) -> Result<Option<String>, ApiError> {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
@@ -198,6 +200,8 @@ pub async fn create_saved_voice(
         .saved_voice_store
         .create_voice(NewSavedVoice {
             name,
+            consent_id: None,
+            permission_provenance: None,
             reference_text,
             reference_language,
             audio_mime_type,

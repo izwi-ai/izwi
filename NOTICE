@@ -200,3 +200,14 @@ The BSD-licensed SciPy code above is used under these terms:
   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Audio encoders
+--------------
+
+izwi-audio-codec links LAME 4.0 (MP3; GNU LGPL, version 2 or later), libopus
+(Opus; BSD 3-Clause, Copyright Xiph.Org, Skype Limited, Octasic, Jean-Marc
+Valin, Timothy B. Terriberry, CSIRO, Gregory Maxwell, Mark Borgerding, Erik de
+Castro Lopo, Mozilla, Amazon), the ogg crate (BSD 3-Clause, Copyright est31
+and contributors, Xiph.org Foundation) and flacenc (Apache 2.0). Their
+licence texts, and where to get LAME's source to relink, are in
+THIRD_PARTY_LICENSES.

@@ -3017,3 +3017,168 @@ async fn openai_realtime_sessions_pass_through_to_an_izwi_server() {
     }
     ws.close(None).await.unwrap();
 }
+
+/// The speech API pass-through: speech bodies stream back from an izwi-server
+/// upstream with its headers, the lookup reaches the upstream that served an
+/// id, voices stay off without shared state, and the text-in socket relays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn speech_api_passes_through_to_izwi_servers() {
+    use crate::app::audio_proxy::AudioUpstreams;
+    use axum::extract::ws::{Message as AxumMessage, WebSocketUpgrade};
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
+
+    async fn speech(headers: axum::http::HeaderMap, body: String) -> Response {
+        let authorized = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            == Some("Bearer audio-key");
+        if !authorized {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        (
+            [
+                ("content-type", "audio/mpeg"),
+                ("x-izwi-speech-id", "speech_up1"),
+            ],
+            format!("MP3:{body}"),
+        )
+            .into_response()
+    }
+    async fn lookup(axum::extract::Path(id): axum::extract::Path<String>) -> Response {
+        if id == "speech_up1" {
+            axum::Json(json!({"id": id, "status": "completed"})).into_response()
+        } else {
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
+    async fn socket(upgrade: WebSocketUpgrade) -> Response {
+        upgrade.on_upgrade(|mut socket| async move {
+            while let Some(Ok(AxumMessage::Text(text))) = socket.next().await {
+                let _ = socket
+                    .send(AxumMessage::Text(
+                        format!("audio-for:{}", text.as_str()).into(),
+                    ))
+                    .await;
+            }
+        })
+    }
+    let upstream_app = Router::new()
+        .route("/v1/audio/speech", axum::routing::post(speech))
+        .route("/v1/audio/speech/stream", axum::routing::get(socket))
+        .route("/v1/audio/speech/{id}", axum::routing::get(lookup));
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream_listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(upstream_listener, upstream_app).await });
+
+    let (state, _worker) = registry_gateway_state(ModelVariant::Qwen354BGguf).await;
+    let upstreams = AudioUpstreams::new(
+        vec![format!("http://127.0.0.1:{upstream_port}")],
+        Some("audio-key".to_string()),
+        false,
+        2,
+    )
+    .unwrap();
+    let app = create_gateway_router(
+        state.with_audio_upstreams(upstreams),
+        &GatewayServeConfig::default(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/v1/audio/speech"))
+        .bearer_auth(TEST_API_KEY)
+        .header("content-type", "application/json")
+        .body(r#"{"model":"Kokoro-82M","input":"hi"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], "audio/mpeg");
+    assert_eq!(response.headers()["x-izwi-speech-id"], "speech_up1");
+    assert_eq!(
+        response.text().await.unwrap(),
+        r#"MP3:{"model":"Kokoro-82M","input":"hi"}"#
+    );
+
+    let lookup = client
+        .get(format!(
+            "http://127.0.0.1:{port}/v1/audio/speech/speech_up1"
+        ))
+        .bearer_auth(TEST_API_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(lookup.status(), 200);
+    let missing = client
+        .get(format!(
+            "http://127.0.0.1:{port}/v1/audio/speech/speech_other"
+        ))
+        .bearer_auth(TEST_API_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+
+    let unauthenticated = client
+        .post(format!("http://127.0.0.1:{port}/v1/audio/speech"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), 401);
+
+    let voices = client
+        .get(format!("http://127.0.0.1:{port}/v1/audio/voices"))
+        .bearer_auth(TEST_API_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(voices.status(), 404, "voices need shared upstream state");
+
+    // The served document lists the relayed routes and leaves out the ones
+    // this gateway does not serve.
+    let document: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{port}/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let paths = document["paths"].as_object().unwrap();
+    for served in [
+        "/v1/audio/speech",
+        "/v1/audio/speech/stream",
+        "/v1/audio/translations",
+    ] {
+        assert!(paths.contains_key(served), "{served}");
+    }
+    for unserved in ["/v1/audio/voices", "/v1/realtime"] {
+        assert!(!paths.contains_key(unserved), "{unserved}");
+    }
+
+    let mut request = format!("ws://127.0.0.1:{port}/v1/audio/speech/stream?dialect=izwi")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {TEST_API_KEY}")).unwrap(),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    ws.send(Message::Text(
+        r#"{"type":"input.text","text":"Hello."}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let echoed = ws.next().await.unwrap().unwrap();
+    assert_eq!(
+        echoed.to_text().unwrap(),
+        r#"audio-for:{"type":"input.text","text":"Hello."}"#
+    );
+    ws.close(None).await.unwrap();
+}

@@ -1,7 +1,10 @@
 //! Custom voices: OpenAI's `audio.output.voice: {"id": ...}` names an Izwi
-//! saved voice (`/v1/voices`), spoken by a TTS model that clones a reference
-//! clip. A profile whose speaking model cannot clone (built-in voices only,
-//! or LFM-Audio) keeps its default voice.
+//! saved voice (`/v1/voices`, or `/v1/audio/voices` where OpenAI SDK code
+//! creates them), spoken by a TTS model that clones a reference clip. A
+//! voice *name* that is an uploaded voice works too when the profile's TTS
+//! model clones and has no built-in voices of its own. A profile whose
+//! speaking model cannot clone (built-in voices only, or LFM-Audio) keeps
+//! its default voice.
 
 use super::profiles::RealtimeProfile;
 use crate::app::voice_realtime::TtsVoice;
@@ -45,4 +48,27 @@ pub(crate) async fn resolve_custom_voice(
         reference_audio: Some(reference.reference_audio_base64),
         reference_text: reference.reference_text,
     })
+}
+
+/// The uploaded voice `name` stands for, when the profile's TTS model clones
+/// and has no built-in voices (where a name always means a built-in voice).
+pub(crate) async fn resolve_named_voice(
+    state: &AppState,
+    profile: &RealtimeProfile,
+    name: &str,
+) -> Option<TtsVoice> {
+    if profile.is_unified() {
+        return None;
+    }
+    let capabilities = profile.speech_model().speech_capabilities()?;
+    if capabilities.supports_builtin_voices || !capabilities.supports_reference_voice {
+        return None;
+    }
+    let voice = state
+        .saved_voice_store
+        .find_voice_by_name(name)
+        .await
+        .ok()
+        .flatten()?;
+    resolve_custom_voice(state, profile, &voice.id).await.ok()
 }

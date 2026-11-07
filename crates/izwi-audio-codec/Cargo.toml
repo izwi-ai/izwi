@@ -1,0 +1,30 @@
+[package]
+name = "izwi-audio-codec"
+description = "Streaming audio encoders (WAV, PCM, G.711, MP3, Ogg Opus, FLAC) shared by Izwi's speech surfaces"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+# MP3 through LAME (LGPL, statically linked; see THIRD_PARTY_LICENSES) and
+# Opus through libopus (BSD-3, built with cmake). Both are on by default; a
+# build that must not carry LAME turns `mp3` off and its formats report
+# themselves unavailable.
+default = ["mp3", "opus"]
+mp3 = ["dep:mp3lame-encoder"]
+opus = ["dep:opus", "dep:ogg"]
+
+[dependencies]
+flacenc = { version = "0.5.1", default-features = false }
+mp3lame-encoder = { version = "0.3.0", optional = true }
+ogg = { version = "0.9.2", optional = true }
+opus = { version = "0.4.0", optional = true }
+rubato = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hound = { workspace = true }
+symphonia = { workspace = true, features = ["all-formats", "all-codecs"] }

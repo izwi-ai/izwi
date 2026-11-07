@@ -185,6 +185,62 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "32",
         "Open realtime websocket sessions.",
     ),
+    // The speech API (api/openai/audio), captured in ServerTuning.
+    var(
+        "IZWI_OPENAI_MODEL_ALIASES",
+        "",
+        "OpenAI model names mapped to Izwi models for /v1/audio/*: comma-separated `name=Model`, e.g. `tts-1=Kokoro-82M,whisper-1=Parakeet-TDT-0.6B-v3`. Unmapped OpenAI names are refused.",
+    ),
+    var(
+        "IZWI_SPEECH_DEFAULT_FORMAT",
+        "wav",
+        "The /v1/audio/speech `response_format` when a request names none (`mp3` gives OpenAI's default).",
+    ),
+    var(
+        "IZWI_TTS_BATCH_MAX_ITEMS",
+        "32",
+        "Items one /v1/audio/speech/batch request may hold.",
+    ),
+    var(
+        "IZWI_TTS_BATCH_CONCURRENCY",
+        "8",
+        "Items of one speech batch synthesized at once.",
+    ),
+    var(
+        "IZWI_TTS_BATCH_MAX_OUTPUT_MB",
+        "256",
+        "Encoded audio one speech batch may return, in MiB.",
+    ),
+    var(
+        "IZWI_SPEECH_OUTCOME_CAPACITY",
+        "1024",
+        "Speech request outcomes GET /v1/audio/speech/{id} remembers (process-local).",
+    ),
+    var(
+        "IZWI_SPEECH_OUTCOME_TTL_SECS",
+        "3600",
+        "How long a speech request outcome is remembered.",
+    ),
+    var(
+        "IZWI_SPEECH_STREAM_MAX_PENDING_CHARS",
+        "65536",
+        "Text a /v1/audio/speech/stream session may hold unspoken.",
+    ),
+    var(
+        "IZWI_SPEECH_STREAM_IDLE_TIMEOUT_SECS",
+        "30",
+        "How long an idle /v1/audio/speech/stream session stays open.",
+    ),
+    var(
+        "IZWI_VOICE_CONSENT_MODE",
+        "`attestation` (local role), `recording` (server role)",
+        "What creating a voice on /v1/audio/voices requires: `attestation` (a non-empty `consent`), `recording` (a stored consent recording's id) or `verified` (a consent recording whose transcript matches a published consent phrase).",
+    ),
+    var(
+        "IZWI_ALLOWED_MEDIA_DOMAINS",
+        "unset (no URLs)",
+        "Hosts reference audio may be fetched from by URL, comma-separated; `.example.com` also allows subdomains. Unset, reference audio URLs are refused.",
+    ),
     var(
         "IZWI_REALTIME_PROFILES",
         "unset",
@@ -439,6 +495,129 @@ pub(crate) struct ServerTuning {
     pub(crate) idempotency_limits: QuotaLimits,
     pub(crate) provider_write_limits: QuotaLimits,
     pub(crate) retention: RetentionPolicy,
+    pub(crate) speech_api: SpeechApiTuning,
+}
+
+/// How a voice upload proves its speaker agreed (`IZWI_VOICE_CONSENT_MODE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VoiceConsentMode {
+    /// Any non-empty `consent`, kept as provenance.
+    Attestation,
+    /// `consent` names a stored consent recording.
+    Recording,
+    /// `consent` names a consent recording whose transcript matched a
+    /// published consent phrase.
+    Verified,
+}
+
+/// Settings of the speech API (`/v1/audio/*`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SpeechApiTuning {
+    /// Lower-cased OpenAI model name to Izwi model id.
+    pub(crate) model_aliases: Vec<(String, String)>,
+    pub(crate) default_format: String,
+    pub(crate) batch_max_items: usize,
+    pub(crate) batch_concurrency: usize,
+    pub(crate) batch_max_output_bytes: usize,
+    pub(crate) outcome_capacity: usize,
+    pub(crate) outcome_ttl: Duration,
+    pub(crate) stream_max_pending_chars: usize,
+    pub(crate) stream_idle_timeout: Duration,
+    /// `None` takes the role's default.
+    pub(crate) voice_consent_mode: Option<VoiceConsentMode>,
+    /// Lower-cased hosts; a leading `.` allows subdomains. Empty refuses URLs.
+    pub(crate) allowed_media_domains: Vec<String>,
+}
+
+impl SpeechApiTuning {
+    fn from_env(env: &EnvSnapshot) -> anyhow::Result<Self> {
+        Ok(Self {
+            model_aliases: model_aliases(env.get("IZWI_OPENAI_MODEL_ALIASES")?.unwrap_or(""))?,
+            default_format: env
+                .get("IZWI_SPEECH_DEFAULT_FORMAT")?
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "wav".to_string()),
+            batch_max_items: at_least(env, "IZWI_TTS_BATCH_MAX_ITEMS", 1, 32)?,
+            batch_concurrency: at_least(env, "IZWI_TTS_BATCH_CONCURRENCY", 1, 8)?,
+            batch_max_output_bytes: at_least(env, "IZWI_TTS_BATCH_MAX_OUTPUT_MB", 1usize, 256)?
+                .saturating_mul(1024 * 1024),
+            outcome_capacity: at_least(env, "IZWI_SPEECH_OUTCOME_CAPACITY", 1, 1024)?,
+            outcome_ttl: Duration::from_secs(at_least(
+                env,
+                "IZWI_SPEECH_OUTCOME_TTL_SECS",
+                1,
+                3600,
+            )?),
+            stream_max_pending_chars: at_least(
+                env,
+                "IZWI_SPEECH_STREAM_MAX_PENDING_CHARS",
+                1,
+                65_536,
+            )?,
+            stream_idle_timeout: Duration::from_secs(at_least(
+                env,
+                "IZWI_SPEECH_STREAM_IDLE_TIMEOUT_SECS",
+                1,
+                30,
+            )?),
+            voice_consent_mode: match env
+                .get("IZWI_VOICE_CONSENT_MODE")?
+                .map(|value| value.trim().to_ascii_lowercase())
+                .as_deref()
+            {
+                None | Some("") => None,
+                Some("attestation") => Some(VoiceConsentMode::Attestation),
+                Some("recording") => Some(VoiceConsentMode::Recording),
+                Some("verified") => Some(VoiceConsentMode::Verified),
+                Some(other) => bail!(
+                    "IZWI_VOICE_CONSENT_MODE must be attestation, recording or verified, not {other:?}"
+                ),
+            },
+            allowed_media_domains: media_domains(
+                env.get("IZWI_ALLOWED_MEDIA_DOMAINS")?.unwrap_or(""),
+            )?,
+        })
+    }
+}
+
+/// `IZWI_OPENAI_MODEL_ALIASES`: `name=Model` pairs, comma-separated.
+fn model_aliases(value: &str) -> anyhow::Result<Vec<(String, String)>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let Some((name, model)) = entry.split_once('=') else {
+                bail!("IZWI_OPENAI_MODEL_ALIASES entries are `name=Model`, not {entry:?}");
+            };
+            let (name, model) = (name.trim(), model.trim());
+            if name.is_empty() || model.is_empty() {
+                bail!("IZWI_OPENAI_MODEL_ALIASES entries are `name=Model`, not {entry:?}");
+            }
+            Ok((name.to_ascii_lowercase(), model.to_string()))
+        })
+        .collect()
+}
+
+/// `IZWI_ALLOWED_MEDIA_DOMAINS`: lower-cased host names, `.suffix` allowed.
+fn media_domains(value: &str) -> anyhow::Result<Vec<String>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let host = entry.trim_end_matches('.').to_ascii_lowercase();
+            let bare = host.strip_prefix('.').unwrap_or(&host);
+            if bare.is_empty()
+                || bare.contains(['/', '*', '@', ':'])
+                || bare.chars().any(char::is_whitespace)
+            {
+                bail!("IZWI_ALLOWED_MEDIA_DOMAINS entries must be host names, not {entry:?}");
+            }
+            Ok(host)
+        })
+        .collect()
 }
 
 impl ServerTuning {
@@ -584,6 +763,7 @@ impl ServerTuning {
                 )?,
                 legacy_idempotency_ms: RetentionPolicy::LEGACY_IDEMPOTENCY_MS,
             },
+            speech_api: SpeechApiTuning::from_env(env)?,
         })
     }
 }

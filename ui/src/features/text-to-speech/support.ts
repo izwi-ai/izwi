@@ -1,4 +1,5 @@
 import { type SavedVoiceSummary, type SpeechHistoryProcessingStatus } from "@/api";
+import type { AudioDownloadFormat } from "@/shared/audioFormats";
 import { getSpeakerProfilesForVariant } from "@/types";
 
 export function normalizeSpeechProcessingStatus(
@@ -138,12 +139,15 @@ const DOWNLOAD_NAME_MAX_CHARS = 60;
  * A take's file name: the opening words of what it says, which name it
  * better than its id. Characters file systems refuse are dropped.
  */
-export function speechDownloadFilename(record: {
-  id: string;
-  input_text?: string | null;
-  input_preview?: string | null;
-  audio_mime_type: string;
-}): string {
+export function speechDownloadFilename(
+  record: {
+    id: string;
+    input_text?: string | null;
+    input_preview?: string | null;
+    audio_mime_type: string;
+  },
+  format?: AudioDownloadFormat,
+): string {
   const text = speechTextLabel(record.input_text ?? record.input_preview ?? "")
     .replace(/[\\/:*?"<>|]/g, " ")
     .replace(/\p{Cc}/gu, " ")
@@ -154,6 +158,9 @@ export function speechDownloadFilename(record: {
       ? text.slice(0, DOWNLOAD_NAME_MAX_CHARS).replace(/\s+\S*$/, "")
       : text;
   const base = cut.replace(/[.\s]+$/, "") || `speech-${record.id.slice(0, 8)}`;
+  if (format) {
+    return `${base}.${format}`;
+  }
   const subtype = record.audio_mime_type.split("/")[1]?.split(";")[0] ?? "";
   const extension = subtype.includes("wav") ? "wav" : subtype || "audio";
   return `${base}.${extension}`;

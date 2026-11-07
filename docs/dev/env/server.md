@@ -36,6 +36,17 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_MAX_BATCH_REQUESTS` | the global request limit minus one | Concurrent batch-class requests. |
 | `IZWI_MAX_BACKGROUND_REQUESTS` | the global request limit minus one | Concurrent background-class requests. |
 | `IZWI_MAX_REALTIME_SESSIONS` | `32` | Open realtime websocket sessions. |
+| `IZWI_OPENAI_MODEL_ALIASES` | unset | OpenAI model names mapped to Izwi models for /v1/audio/*: comma-separated `name=Model`, e.g. `tts-1=Kokoro-82M,whisper-1=Parakeet-TDT-0.6B-v3`. Unmapped OpenAI names are refused. |
+| `IZWI_SPEECH_DEFAULT_FORMAT` | `wav` | The /v1/audio/speech `response_format` when a request names none (`mp3` gives OpenAI's default). |
+| `IZWI_TTS_BATCH_MAX_ITEMS` | `32` | Items one /v1/audio/speech/batch request may hold. |
+| `IZWI_TTS_BATCH_CONCURRENCY` | `8` | Items of one speech batch synthesized at once. |
+| `IZWI_TTS_BATCH_MAX_OUTPUT_MB` | `256` | Encoded audio one speech batch may return, in MiB. |
+| `IZWI_SPEECH_OUTCOME_CAPACITY` | `1024` | Speech request outcomes GET /v1/audio/speech/{id} remembers (process-local). |
+| `IZWI_SPEECH_OUTCOME_TTL_SECS` | `3600` | How long a speech request outcome is remembered. |
+| `IZWI_SPEECH_STREAM_MAX_PENDING_CHARS` | `65536` | Text a /v1/audio/speech/stream session may hold unspoken. |
+| `IZWI_SPEECH_STREAM_IDLE_TIMEOUT_SECS` | `30` | How long an idle /v1/audio/speech/stream session stays open. |
+| `IZWI_VOICE_CONSENT_MODE` | `attestation` (local role), `recording` (server role) | What creating a voice on /v1/audio/voices requires: `attestation` (a non-empty `consent`), `recording` (a stored consent recording's id) or `verified` (a consent recording whose transcript matches a published consent phrase). |
+| `IZWI_ALLOWED_MEDIA_DOMAINS` | unset (no URLs) | Hosts reference audio may be fetched from by URL, comma-separated; `.example.com` also allows subdomains. Unset, reference audio URLs are refused. |
 | `IZWI_REALTIME_PROFILES` | `unset` | Extra OpenAI Realtime profiles `?model=` can name: a JSON array of `{id, asr_model_id, text_model_id, tts_model_id}` (modular) or `{id, s2s_model_id}` (speech-to-speech), each with an optional default `voice`; an id equal to a built-in (`izwi-voice`, `izwi-voice-compact`) replaces it. |
 | `IZWI_REALTIME_DEFAULT_PROFILE` | ``izwi-voice`` | The OpenAI Realtime profile a session gets when `model` is absent, empty or an OpenAI model name (`gpt-realtime*`). |
 | `IZWI_REALTIME_PERSIST` | `off` | `1` records OpenAI Realtime sessions and their turns in the voice history; off, they leave nothing behind. |

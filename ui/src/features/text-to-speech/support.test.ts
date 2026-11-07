@@ -88,4 +88,13 @@ describe("speechDownloadFilename", () => {
       speechDownloadFilename({ id: "5c3b4f99-aaaa", input_text: "", audio_mime_type: "audio/wav" }),
     ).toBe("speech-5c3b4f99.wav");
   });
+
+  it("names a download in another format after that format", () => {
+    expect(
+      speechDownloadFilename(
+        { id: "5c3b4f99-aaaa", input_text: "Hello there.", audio_mime_type: "audio/wav" },
+        "opus",
+      ),
+    ).toBe("Hello there.opus");
+  });
 });

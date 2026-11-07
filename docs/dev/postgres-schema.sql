@@ -836,6 +836,22 @@ ALTER TABLE speech_history_records ADD COLUMN IF NOT EXISTS seed BIGINT NULL;
 
 ALTER TABLE speech_history_records ADD COLUMN IF NOT EXISTS parent_take_id TEXT NULL;
 
+CREATE TABLE IF NOT EXISTS voice_consents (
+    id TEXT PRIMARY KEY,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    name TEXT NOT NULL,
+    language TEXT NOT NULL,
+    recording_storage_path TEXT NOT NULL,
+    recording_mime_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    verification_json TEXT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_voice_consents_created_at ON voice_consents(created_at DESC, id DESC);
+
+ALTER TABLE saved_voices ADD COLUMN IF NOT EXISTS consent_id TEXT NULL;
+
 CREATE TABLE IF NOT EXISTS schema_migrations (
     component TEXT NOT NULL,
     version BIGINT NOT NULL,
@@ -873,6 +889,8 @@ INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('ap
 INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('app', 14, 'saved voice reference language', 0) ON CONFLICT DO NOTHING;
 
 INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('app', 15, 'speech take codes, voices and parent', 0) ON CONFLICT DO NOTHING;
+
+INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('app', 16, 'voice consent recordings', 0) ON CONFLICT DO NOTHING;
 
 INSERT INTO voice_profiles (id, name, system_prompt, observational_memory_enabled, created_at, updated_at) VALUES ('voice_profile_default', 'Primary Voice Profile', 'You are a helpful voice assistant. Reply with concise spoken-friendly language. Avoid markdown. Do not output <think> tags or internal reasoning. Return only the final spoken answer. Keep responses brief unless asked for details.', 1, 0, 0) ON CONFLICT (id) DO NOTHING;
 

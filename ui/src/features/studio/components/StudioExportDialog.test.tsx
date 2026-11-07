@@ -100,6 +100,26 @@ describe("StudioExportDialog", () => {
     );
   });
 
+  it("exports the chosen format with its extension", async () => {
+    apiMocks.downloadAudioFile.mockResolvedValue(true);
+    const { onClose } = renderDialog();
+
+    expect(screen.getByText(/One WAV file/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("radio", { name: "MP3" }));
+    expect(screen.getByText(/One MP3 file/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /Export…/ }));
+
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+    expect(apiMocks.studioProjectAudioUrl).toHaveBeenLastCalledWith(
+      "project-1",
+      expect.objectContaining({ format: "mp3", download: true }),
+    );
+    expect(apiMocks.downloadAudioFile).toHaveBeenCalledWith(
+      expect.any(String),
+      "chapter-1.mp3",
+    );
+  });
+
   it("stays open, saving nothing else, when the save dialog is cancelled", async () => {
     apiMocks.downloadAudioFile.mockResolvedValue(false);
     const { onClose } = renderDialog();
