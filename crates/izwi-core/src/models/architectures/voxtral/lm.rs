@@ -1499,10 +1499,22 @@ pub(crate) mod tests {
         layers: usize,
         dtype: DType,
     ) -> VoxtralLM {
+        tiny_ada_model_sized(device, layers, dtype, 16, 32)
+    }
+
+    /// [`tiny_ada_model_with_dtype`] over `vocab` tokens and
+    /// `max_positions` positions.
+    pub(crate) fn tiny_ada_model_sized(
+        device: &Device,
+        layers: usize,
+        dtype: DType,
+        vocab: usize,
+        max_positions: usize,
+    ) -> VoxtralLM {
         let mut cfg = tiny_cfg();
         cfg.num_hidden_layers = layers;
-        cfg.vocab_size = 16;
-        cfg.max_position_embeddings = Some(32);
+        cfg.vocab_size = vocab;
+        cfg.max_position_embeddings = Some(max_positions);
         cfg.ada_rms_norm_t_cond = true;
         cfg.ada_rms_norm_t_cond_dim = 2;
         let mut tensors = HashMap::new();
@@ -1512,8 +1524,8 @@ pub(crate) mod tests {
             let values = xorshift_values(shape.0 * shape.1, seed);
             tensors.insert(name, Tensor::from_vec(values, shape, device).unwrap());
         };
-        put("tok_embeddings.weight".into(), (16, 4));
-        put("output.weight".into(), (16, 4));
+        put("tok_embeddings.weight".into(), (vocab, 4));
+        put("output.weight".into(), (vocab, 4));
         for layer in 0..layers {
             for (name, shape) in [
                 ("attention.wq.weight", (4, 4)),

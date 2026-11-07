@@ -51,6 +51,17 @@ static NEXT_VOXTRAL_MODEL_LOAD_NONCE: AtomicU64 = AtomicU64::new(1);
 pub(crate) enum VoxtralRealtimePreparationMode {
     Push,
     Finish,
+    /// A whole offline input on a fresh stream: every sample and the final
+    /// padding in one encode, so an offline request is not encoded twice
+    /// (push, then finish). The stream closes with it.
+    Complete,
+}
+
+impl VoxtralRealtimePreparationMode {
+    /// Whether the preparation appends the final padding and closes input.
+    pub(crate) const fn closes_input(self) -> bool {
+        matches!(self, Self::Finish | Self::Complete)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +117,48 @@ pub(crate) struct VoxtralRealtimePreparationBatchRow<'a> {
     pub(crate) appended_samples: &'a [f32],
     pub(crate) sample_rate: u32,
     pub(crate) mode: VoxtralRealtimePreparationMode,
+}
+
+/// One offline request's audio, prepared once as a closed stream: every
+/// sample and the final padding through the encoder and the adapter
+/// ([`VoxtralRealtimePreparationMode::Complete`]). Immutable, so a row's
+/// state can be rebuilt from it; the source samples are not kept.
+#[derive(Debug, Clone)]
+pub(crate) struct VoxtralOfflinePreparedAudio {
+    model_load_nonce: u64,
+    source_sample_rate: u32,
+    source_samples: usize,
+    prepared_frames: usize,
+    embeddings: Tensor,
+}
+
+impl VoxtralOfflinePreparedAudio {
+    /// Audio frames the decoder consumes (prompt included).
+    pub(crate) fn prepared_frames(&self) -> usize {
+        self.prepared_frames
+    }
+
+    pub(crate) fn source_samples(&self) -> usize {
+        self.source_samples
+    }
+
+    pub(crate) fn source_sample_rate(&self) -> u32 {
+        self.source_sample_rate
+    }
+
+    /// Bytes of the retained `[1, frames, hidden]` embeddings.
+    pub(crate) fn tensor_bytes(&self) -> Result<u64> {
+        u64::try_from(self.embeddings.elem_count())
+            .ok()
+            .and_then(|elements| {
+                elements.checked_mul(self.embeddings.dtype().size_in_bytes() as u64)
+            })
+            .ok_or_else(|| Error::Overloaded("Voxtral offline embedding bytes overflowed".into()))
+    }
+
+    pub(crate) fn device_location(&self) -> candle_core::DeviceLocation {
+        self.embeddings.device().location()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -912,7 +965,10 @@ impl VoxtralRealtimeModel {
 
     /// Advance one ready token for each retained row. Every row must already
     /// own an active outer quantum; the caller remains responsible for sealing
-    /// or rolling that quantum back after this method returns.
+    /// or rolling that quantum back after this method returns. A row whose
+    /// input is closed and whose audio frames are all consumed completes
+    /// without a forward, as it would alone; only the rows that advance run
+    /// the language model, together.
     pub(crate) fn decode_realtime_step_batch(
         &self,
         rows: &mut [VoxtralRealtimeDecodeBatchRow<'_>],
@@ -932,8 +988,17 @@ impl VoxtralRealtimeModel {
                 });
         }
 
+        let mut advancing = Vec::with_capacity(rows.len());
         for (row_index, row) in rows.iter().enumerate() {
             self.ensure_active_realtime_quantum(row.state, row.cache)?;
+            let exhausted = row.state.prompt_initialized
+                && !row.state.finished
+                && row.state.input_closed
+                && row.state.next_audio_frame >= row.state.prepared_audio_frames;
+            if exhausted {
+                advancing.push(false);
+                continue;
+            }
             if !row.state.prompt_initialized
                 || row.state.finished
                 || row.state.next_audio_frame >= row.state.prepared_audio_frames
@@ -948,6 +1013,7 @@ impl VoxtralRealtimeModel {
                 .next_audio_frame
                 .checked_add(1)
                 .ok_or_else(|| Error::InvalidInput("Voxtral realtime cursor overflow".into()))?;
+            advancing.push(true);
         }
 
         let host_checkpoints = rows
@@ -959,57 +1025,85 @@ impl VoxtralRealtimeModel {
             .map(|row| row.cache.logical_checkpoint())
             .collect::<Vec<_>>();
         let execution = (|| -> Result<Vec<VoxtralRealtimeStep>> {
-            let embeds = {
-                let inputs = rows
-                    .iter()
-                    .map(|row| -> Result<RealtimeDecodeInput<'_>> {
-                        Ok(RealtimeDecodeInput {
-                            token: row
-                                .state
-                                .pending_input_token
-                                .expect("validated pending token"),
-                            audio_embeds: row.state.audio_embeds.as_ref().ok_or_else(|| {
-                                Error::InferenceError(
-                                    "Voxtral realtime audio embeddings are unavailable".into(),
-                                )
-                            })?,
-                            frame: row.state.next_audio_frame,
+            let width = advancing.iter().filter(|advance| **advance).count();
+            let mut sampled = if width == 0 {
+                Vec::new()
+            } else {
+                let embeds = {
+                    let inputs = rows
+                        .iter()
+                        .zip(&advancing)
+                        .filter(|(_, advance)| **advance)
+                        .map(|(row, _)| -> Result<RealtimeDecodeInput<'_>> {
+                            Ok(RealtimeDecodeInput {
+                                token: row
+                                    .state
+                                    .pending_input_token
+                                    .expect("validated pending token"),
+                                audio_embeds: row.state.audio_embeds.as_ref().ok_or_else(|| {
+                                    Error::InferenceError(
+                                        "Voxtral realtime audio embeddings are unavailable".into(),
+                                    )
+                                })?,
+                                frame: row.state.next_audio_frame,
+                            })
                         })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                realtime_step_embeds(&self.language_model, &self.device.device, &inputs)?
-            };
-            let positions = rows
-                .iter()
-                .map(|row| row.state.next_audio_frame)
-                .collect::<Vec<_>>();
-            let output = {
-                let mut caches = rows
-                    .iter_mut()
-                    .map(|row| &mut *row.cache)
+                        .collect::<Result<Vec<_>>>()?;
+                    realtime_step_embeds(&self.language_model, &self.device.device, &inputs)?
+                };
+                let positions = rows
+                    .iter()
+                    .zip(&advancing)
+                    .filter(|(_, advance)| **advance)
+                    .map(|(row, _)| row.state.next_audio_frame)
                     .collect::<Vec<_>>();
-                self.language_model
-                    .forward_managed_decode_batch_with_embeds(
-                        &embeds,
-                        &positions,
-                        &mut caches,
-                        Some(&self.ada_scales),
-                    )?
-            };
-            let (batch, sequence, _) = output.dims3()?;
-            if batch != rows.len() || sequence != 1 {
-                return Err(Error::InferenceError(
-                    "Voxtral realtime decode batch returned incompatible logits".into(),
-                ));
+                let output = {
+                    let mut caches = rows
+                        .iter_mut()
+                        .zip(&advancing)
+                        .filter(|(_, advance)| **advance)
+                        .map(|(row, _)| &mut *row.cache)
+                        .collect::<Vec<_>>();
+                    if width == 1 {
+                        self.language_model.forward_managed_with_embeds(
+                            &embeds,
+                            positions[0],
+                            caches[0],
+                            None,
+                            Some(&self.ada_scales),
+                        )?
+                    } else {
+                        self.language_model
+                            .forward_managed_decode_batch_with_embeds(
+                                &embeds,
+                                &positions,
+                                &mut caches,
+                                Some(&self.ada_scales),
+                            )?
+                    }
+                };
+                let (batch, sequence, _) = output.dims3()?;
+                if batch != width || sequence != 1 {
+                    return Err(Error::InferenceError(
+                        "Voxtral realtime decode batch returned incompatible logits".into(),
+                    ));
+                }
+                argmax_rows(&output)?
             }
-            let sampled = argmax_rows(&output)?;
-            for row in rows.iter_mut() {
+            .into_iter();
+            let mut steps = Vec::with_capacity(rows.len());
+            for (row, advance) in rows.iter_mut().zip(&advancing) {
+                if !*advance {
+                    steps.push(self.finish_realtime_text(row.state)?);
+                    continue;
+                }
+                let token = sampled.next().ok_or_else(|| {
+                    Error::InferenceError("Voxtral realtime decode batch lost a row".into())
+                })?;
                 row.state.next_audio_frame += 1;
+                steps.push(self.accept_realtime_prediction(row.state, token)?);
             }
-            rows.iter_mut()
-                .zip(sampled)
-                .map(|(row, token)| self.accept_realtime_prediction(row.state, token))
-                .collect()
+            Ok(steps)
         })();
         match execution {
             Ok(output) => Ok(output),
@@ -1275,6 +1369,7 @@ impl VoxtralRealtimeModel {
         }
         let mut generated = Vec::new();
         let mut assembled = String::new();
+        let mut held = Vec::new();
         let specials = self.tokenizer.specials().clone();
 
         let lm_prefill_start = Instant::now();
@@ -1308,6 +1403,7 @@ impl VoxtralRealtimeModel {
                 &self.tokenizer,
                 &mut generated,
                 &mut assembled,
+                &mut held,
                 next,
                 &mut on_delta,
             )?;
@@ -1335,7 +1431,7 @@ impl VoxtralRealtimeModel {
             next = argmax(&next_logits)?;
             frame_idx += 1;
         }
-        flush_generated_text(&self.tokenizer, &generated, &mut assembled, &mut on_delta)?;
+        flush_generated_text(&mut assembled, &mut held, &mut on_delta);
         let token_decode_duration = decode_start.elapsed();
         let timings = VoxtralRealtimeTimings {
             preprocess: preprocess_duration,
@@ -1703,11 +1799,142 @@ impl VoxtralRealtimeModel {
         state.source_samples = prepared.source_samples;
         state.audio_embeds = Some(prepared.embeddings);
         state.prepared_audio_frames = stable_frames;
-        if prepared.mode == VoxtralRealtimePreparationMode::Finish {
+        if prepared.mode.closes_input() {
             state.input_closed = true;
             state.final_padding_applied = true;
         }
         Ok(added)
+    }
+
+    /// The audio frames an offline request of `source_samples` at
+    /// `sample_rate` decodes as a closed stream, or `None` when it cannot run
+    /// as one: audio past the realtime sample ceiling, or too short to cover
+    /// the transcription prompt (both keep the atomic offline route).
+    pub(crate) fn offline_row_frames(
+        &self,
+        source_samples: usize,
+        sample_rate: u32,
+    ) -> Result<Option<usize>> {
+        if source_samples == 0 || sample_rate == 0 {
+            return Ok(None);
+        }
+        let resampled = resampled_length(source_samples, sample_rate, self.layout.target_rate)?;
+        if resampled > self.realtime_max_source_samples {
+            return Ok(None);
+        }
+        let geometry = realtime_preparation_geometry_for(
+            source_samples,
+            sample_rate,
+            &self.layout,
+            VoxtralRealtimePreparationMode::Complete,
+        )?;
+        let prompt = self.offline_prompt_tokens()?;
+        Ok((geometry.stable_frames >= prompt).then_some(geometry.stable_frames))
+    }
+
+    /// Prompt tokens an offline row prefills.
+    pub(crate) fn offline_prompt_tokens(&self) -> Result<usize> {
+        Ok(self.tokenizer.build_transcription_prompt()?.len())
+    }
+
+    /// The encoder workspace one offline row's preparation takes and the
+    /// bytes its prepared embeddings keep.
+    pub(crate) fn offline_preparation_bytes(
+        &self,
+        source_samples: usize,
+        sample_rate: u32,
+    ) -> Result<(u64, u64)> {
+        let geometry = realtime_preparation_geometry_for(
+            source_samples,
+            sample_rate,
+            &self.layout,
+            VoxtralRealtimePreparationMode::Complete,
+        )?;
+        let workspace = realtime_workspace_bytes_for(
+            &self.layout,
+            geometry.mel_frames,
+            geometry.conv2_frames,
+            self.dtype.size_in_bytes(),
+        )?;
+        let embeddings = geometry
+            .embedding_elements
+            .checked_mul(self.dtype.size_in_bytes() as u64)
+            .ok_or_else(|| {
+                Error::Overloaded("Voxtral offline embedding bytes overflowed".into())
+            })?;
+        Ok((workspace, embeddings))
+    }
+
+    /// Prepare one offline request: its whole audio and the final padding
+    /// encoded once, as a fresh stream closed by the preparation.
+    pub(crate) fn prepare_offline_audio(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<VoxtralOfflinePreparedAudio> {
+        let state = VoxtralRealtimeState::new(None);
+        let prepared = self
+            .prepare_realtime_audio_batch(&[VoxtralRealtimePreparationBatchRow {
+                state: &state,
+                appended_samples: samples,
+                sample_rate,
+                mode: VoxtralRealtimePreparationMode::Complete,
+            }])?
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Voxtral preparation omitted its row".into()))?;
+        Ok(VoxtralOfflinePreparedAudio {
+            model_load_nonce: prepared.model_load_nonce,
+            source_sample_rate: prepared.source_sample_rate,
+            source_samples: samples.len(),
+            prepared_frames: prepared.geometry.stable_frames,
+            embeddings: prepared.embeddings,
+        })
+    }
+
+    /// A fresh row state over an offline request's prepared audio: input
+    /// closed, every frame prepared, the prompt still to prefill.
+    pub(crate) fn start_offline_state(
+        &self,
+        prepared: &VoxtralOfflinePreparedAudio,
+        language: Option<&str>,
+    ) -> Result<VoxtralRealtimeState> {
+        if prepared.model_load_nonce != self.model_load_nonce {
+            return Err(Error::InferenceError(
+                "Voxtral offline audio was prepared by another model load".into(),
+            ));
+        }
+        let mut state = VoxtralRealtimeState::new(language);
+        state.source_sample_rate = Some(prepared.source_sample_rate);
+        state.audio_embeds = Some(prepared.embeddings.clone());
+        state.prepared_audio_frames = prepared.prepared_frames;
+        state.input_closed = true;
+        state.final_padding_applied = true;
+        Ok(state)
+    }
+
+    /// Finish an offline row whose last audio frame was just consumed: the
+    /// tensor-free completion a closed stream takes next, folded into the
+    /// same step, so the row ends without another quantum (an offline
+    /// decode stops once its frames run out).
+    pub(crate) fn finish_exhausted_offline_row(
+        &self,
+        state: &mut VoxtralRealtimeState,
+        mut step: VoxtralRealtimeStep,
+    ) -> Result<VoxtralRealtimeStep> {
+        if step.finished
+            || state.finished
+            || !state.input_closed
+            || !state.prompt_initialized
+            || state.next_audio_frame < state.prepared_audio_frames
+        {
+            return Ok(step);
+        }
+        let tail = self.finish_realtime_text(state)?;
+        step.delta.push_str(&tail.delta);
+        step.text = tail.text;
+        step.tokens_generated = tail.tokens_generated;
+        step.finished = true;
+        Ok(step)
     }
 
     fn validate_realtime_preparation_row(
@@ -1740,6 +1967,30 @@ impl VoxtralRealtimeModel {
                 "Voxtral realtime push requires non-empty audio".into(),
             ));
         }
+        if mode == VoxtralRealtimePreparationMode::Complete {
+            // A whole offline input on a fresh stream. Its source is not kept
+            // for a later re-encode, so only the model-rate audio the encoder
+            // sees is bounded by the session ceiling.
+            if appended_samples == 0
+                || !state.source_samples.is_empty()
+                || state.prepared_audio_frames != 0
+                || state.prompt_initialized
+            {
+                return Err(Error::InvalidInput(
+                    "Voxtral complete preparation requires non-empty audio on a fresh stream"
+                        .into(),
+                ));
+            }
+            let resampled =
+                resampled_length(appended_samples, sample_rate, self.layout.target_rate)?;
+            if resampled > self.realtime_max_source_samples {
+                return Err(Error::InvalidInput(format!(
+                    "Voxtral offline row has {resampled} samples at {} Hz, exceeding the {}-sample realtime ceiling",
+                    self.layout.target_rate, self.realtime_max_source_samples
+                )));
+            }
+            return Ok(());
+        }
         let total = state
             .source_samples
             .len()
@@ -1769,6 +2020,7 @@ impl VoxtralRealtimeModel {
             &self.tokenizer,
             &mut state.generated,
             &mut state.assembled,
+            &mut state.held_text_bytes,
             token,
             &mut no_callback,
         )?;
@@ -1784,11 +2036,10 @@ impl VoxtralRealtimeModel {
     ) -> Result<VoxtralRealtimeStep> {
         let mut no_callback = None;
         let delta = flush_generated_text(
-            &self.tokenizer,
-            &state.generated,
             &mut state.assembled,
+            &mut state.held_text_bytes,
             &mut no_callback,
-        )?;
+        );
         state.finished = true;
         Ok(self.realtime_step(state, delta))
     }
@@ -2992,44 +3243,45 @@ fn append_generated_token(
     tokenizer: &VoxtralTokenizer,
     generated: &mut Vec<u32>,
     assembled: &mut String,
+    held: &mut Vec<u8>,
     token: u32,
     on_delta: &mut Option<&mut dyn FnMut(&str)>,
 ) -> Result<String> {
     // Extend the transcript to its last complete character: a character
     // whose bytes span several tokens appears once its last byte arrives.
+    // Only the new token's bytes are decoded (Tekken pieces are bytes), so a
+    // step costs the same however long the transcript is.
     generated.push(token);
-    let decoded = tokenizer.decode_text_prefix(generated)?;
-    Ok(advance_assembled_text(assembled, decoded, on_delta))
+    let delta = tokenizer.decode_text_increment(held, token)?;
+    Ok(advance_assembled_text(assembled, delta, on_delta))
 }
 
 /// Decode every generated byte once generation ends, so a trailing partial
 /// character surfaces as U+FFFD instead of vanishing; returns the appended
 /// text.
 fn flush_generated_text(
-    tokenizer: &VoxtralTokenizer,
-    generated: &[u32],
     assembled: &mut String,
-    on_delta: &mut Option<&mut dyn FnMut(&str)>,
-) -> Result<String> {
-    let decoded = tokenizer.decode_text_final(generated)?;
-    Ok(advance_assembled_text(assembled, decoded, on_delta))
-}
-
-/// Replace the transcript with `decoded`, report the appended text to
-/// `on_delta` one character at a time, and return it.
-fn advance_assembled_text(
-    assembled: &mut String,
-    decoded: String,
+    held: &mut Vec<u8>,
     on_delta: &mut Option<&mut dyn FnMut(&str)>,
 ) -> String {
-    let delta = text_delta(assembled, &decoded);
+    let delta = VoxtralTokenizer::decode_text_flush(held);
+    advance_assembled_text(assembled, delta, on_delta)
+}
+
+/// Append `delta` to the transcript, report it to `on_delta` one character
+/// at a time, and return it.
+fn advance_assembled_text(
+    assembled: &mut String,
+    delta: String,
+    on_delta: &mut Option<&mut dyn FnMut(&str)>,
+) -> String {
     if let Some(on_delta) = on_delta.as_deref_mut() {
         for ch in delta.chars() {
             let mut buf = [0u8; 4];
             on_delta(ch.encode_utf8(&mut buf));
         }
     }
-    *assembled = decoded;
+    assembled.push_str(&delta);
     delta
 }
 
@@ -3116,18 +3368,6 @@ fn argmax(logits: &Tensor) -> Result<u32> {
     idx.to_dtype(DType::U32)?
         .to_scalar::<u32>()
         .map_err(Error::from)
-}
-
-fn text_delta(previous: &str, current: &str) -> String {
-    if let Some(delta) = current.strip_prefix(previous) {
-        return delta.to_string();
-    }
-    let common = previous
-        .chars()
-        .zip(current.chars())
-        .take_while(|(a, b)| a == b)
-        .count();
-    current.chars().skip(common).collect()
 }
 
 fn resample_audio(audio: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32>> {
@@ -3299,7 +3539,7 @@ fn realtime_preparation_geometry_for(
         .raw_audio_length_per_tok
         .checked_mul(layout.left_pad_tokens)
         .ok_or_else(|| Error::InvalidInput("Voxtral left padding overflow".into()))?;
-    let right_pad = if mode == VoxtralRealtimePreparationMode::Finish {
+    let right_pad = if mode.closes_input() {
         offline_streaming_padding_samples(
             resampled_samples,
             layout.raw_audio_length_per_tok,
@@ -3318,7 +3558,7 @@ fn realtime_preparation_geometry_for(
     let conv1_frames = conv_output_length(mel_frames, layout.conv1)?;
     let conv2_frames = conv_output_length(conv1_frames, layout.conv2)?;
     let pooled_frames = conv2_frames / layout.pool_size;
-    let stable_frames = if mode == VoxtralRealtimePreparationMode::Finish {
+    let stable_frames = if mode.closes_input() {
         pooled_frames
     } else {
         pooled_frames.saturating_sub(layout.right_pad_tokens)
@@ -3833,7 +4073,7 @@ mod tests {
         offline_streaming_padding_samples, pool_audio_embeddings_by_block,
         prepare_realtime_conv_input, realtime_audio_geometry, realtime_preparation_geometry_for,
         realtime_preparation_stage_seal_for, realtime_source_sample_ceiling, resample_audio,
-        select_voxtral_dtype, text_delta, validate_realtime_sample_ceiling,
+        select_voxtral_dtype, validate_realtime_sample_ceiling,
         voxtral_realtime_cuda_sliding_flash_options, voxtral_realtime_offline_frame_limit,
         Conv1dGeometry, VoxtralRealtimeLayout, VoxtralRealtimePreparationMode,
     };
@@ -4196,11 +4436,6 @@ mod tests {
     }
 
     #[test]
-    fn text_delta_preserves_word_boundary_space() {
-        assert_eq!(text_delta("hello", "hello world"), " world");
-    }
-
-    #[test]
     fn realtime_conv_input_keeps_mels_as_channels() {
         let device = Device::Cpu;
         let mel = Tensor::zeros((80, 7), DType::F32, &device).unwrap();
@@ -4501,6 +4736,7 @@ mod tests {
         let mut on_delta: Option<&mut dyn FnMut(&str)> = Some(&mut record);
         let mut generated = Vec::new();
         let mut assembled = String::new();
+        let mut held = Vec::new();
         // "你" (E4 BD A0), then the first byte of another CJK character.
         let mut appended = Vec::new();
         for token in published_byte_ids(&["你".as_bytes(), &[0xE5]].concat()) {
@@ -4509,6 +4745,7 @@ mod tests {
                     &tokenizer,
                     &mut generated,
                     &mut assembled,
+                    &mut held,
                     token,
                     &mut on_delta,
                 )
@@ -4518,8 +4755,7 @@ mod tests {
         assert_eq!(appended, ["", "", "你", ""]);
         assert_eq!(assembled, "你");
 
-        let flushed =
-            flush_generated_text(&tokenizer, &generated, &mut assembled, &mut on_delta).unwrap();
+        let flushed = flush_generated_text(&mut assembled, &mut held, &mut on_delta);
         assert_eq!(flushed, "\u{FFFD}");
         assert_eq!(assembled, "你\u{FFFD}");
         assert_eq!(deltas, ["你", "\u{FFFD}"]);
@@ -4727,6 +4963,370 @@ mod tests {
             assert_eq!(argmax_rows(&logits).unwrap(), solo, "step {step}");
             tokens = [solo[0], solo[1]];
             frames = [frames[0] + 1, frames[1] + 1];
+        }
+    }
+
+    /// A whole Voxtral realtime model at test size, F32 on the CPU: the
+    /// probe's tiny encoder and adapter, a one-layer Ada-norm LM over the
+    /// 265-token test tokenizer, two left-pad tokens and one delay token (a
+    /// four-token prompt) and a 4 s session ceiling.
+    fn tiny_realtime_model() -> super::VoxtralRealtimeModel {
+        use super::super::audio::AudioLanguageAdapter;
+        use super::super::tokenizer::tests::test_tokenizer;
+        use super::{conv_stem_geometry, WhisperEncoder, NEXT_VOXTRAL_MODEL_LOAD_NONCE};
+        use crate::audio::{MelConfig, MelNorm, MelScale, MelSpectrogram};
+        use crate::models::architectures::voxtral::lm::tests::tiny_ada_model_sized;
+
+        let device = Device::Cpu;
+        let encoder = voxtral_probe_encoder_config();
+        let vb = candle_nn::VarBuilder::from_tensors(voxtral_probe_weights(), DType::F32, &device);
+        let whisper_encoder = WhisperEncoder::load_voxtral(&encoder, vb.pp("encoder")).unwrap();
+        let audio_adapter = AudioLanguageAdapter::load(4 * 32, 4, vb.pp("adapter")).unwrap();
+        let language_model = tiny_ada_model_sized(&device, 1, DType::F32, 265, 128);
+        let t_cond = Tensor::from_vec(vec![0.25f32, -0.5, 0.75, 0.125], (1, 4), &device).unwrap();
+        let ada_scales = language_model.ada_scales(&t_cond).unwrap();
+        let audio = AudioConfig {
+            num_mel_bins: 8,
+            n_delay_tokens: 1,
+            streaming_left_pad_tokens: 2,
+            ..AudioConfig::default()
+        };
+        let tokenizer = test_tokenizer(audio.clone());
+        let (conv1, conv2) = conv_stem_geometry(&encoder, true);
+        let layout = VoxtralRealtimeLayout {
+            target_rate: 16_000,
+            hop_length: 160,
+            n_mels: 8,
+            raw_audio_length_per_tok: audio.raw_audio_length_per_tok(),
+            left_pad_tokens: audio.streaming_left_pad_tokens,
+            right_pad_tokens: 2,
+            pool_size: 4,
+            text_dim: 4,
+            conv1,
+            conv2,
+            encoder_hidden: encoder.d_model,
+            encoder_ffn: encoder.encoder_ffn_dim,
+            encoder_heads: encoder.encoder_attention_heads,
+            encoder_sliding_window: Some(encoder.sliding_window),
+        };
+        layout.validate_frame_contract(8).unwrap();
+        let params = std::fs::read_to_string(published_fixture_dir().join("params.json")).unwrap();
+        let max_decoded_token_bytes = tokenizer.max_decoded_token_bytes().unwrap();
+        super::VoxtralRealtimeModel {
+            model_load_nonce: NEXT_VOXTRAL_MODEL_LOAD_NONCE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            device: DeviceProfile::cpu(),
+            dtype: DType::F32,
+            tokenizer,
+            config: serde_json::from_str(&params).unwrap(),
+            whisper_encoder,
+            audio_adapter,
+            language_model,
+            ada_scales,
+            mel: MelSpectrogram::new(MelConfig {
+                sample_rate: 16_000,
+                n_fft: 400,
+                win_length: None,
+                hop_length: 160,
+                n_mels: 8,
+                f_min: 0.0,
+                f_max: 8000.0,
+                normalize: true,
+                mel_scale: MelScale::Slaney,
+                mel_norm: MelNorm::Slaney,
+            })
+            .unwrap(),
+            global_log_mel_max: None,
+            num_delay_tokens: 1,
+            streaming_left_pad_tokens: 2,
+            audio_length_per_tok: 8,
+            layout,
+            realtime_max_source_samples: 4 * 16_000,
+            max_decoded_token_bytes,
+            precision: crate::kernels::numeric_check::PrecisionLoad::unchecked(
+                &crate::backends::DTypeSelection {
+                    dtype: DType::F32,
+                    reason: "tiny test model".into(),
+                },
+            ),
+        }
+    }
+
+    /// Deterministic speech-band audio of `samples` at 16 kHz.
+    fn tiny_audio(samples: usize, seed: u32) -> Vec<f32> {
+        (0..samples)
+            .map(|index| {
+                let t = index as f32 / 16_000.0;
+                0.4 * (t * (220.0 + seed as f32 * 37.0) * std::f32::consts::TAU).sin()
+                    + 0.1
+                        * ((index as u32)
+                            .wrapping_mul(2_654_435_761)
+                            .wrapping_add(seed)
+                            >> 16) as f32
+                        / 65_536.0
+            })
+            .collect()
+    }
+
+    /// A step's observable outcome.
+    fn step_key(step: &super::VoxtralRealtimeStep) -> (String, String, usize, bool) {
+        (
+            step.delta.clone(),
+            step.text.clone(),
+            step.tokens_generated,
+            step.finished,
+        )
+    }
+
+    /// One offline input prepared in one Complete encode equals the same
+    /// input pushed and then finished (the encode a finish runs over the
+    /// whole stream): the same embeddings bit for bit and the same frames,
+    /// and the row starts closed with every frame prepared.
+    #[test]
+    fn complete_preparation_matches_push_then_finish() {
+        use super::{VoxtralRealtimePreparationBatchRow, VoxtralRealtimeState};
+        let model = tiny_realtime_model();
+        for (samples, rate) in [(16_000, 16_000), (7_000, 16_000), (26_460, 44_100)] {
+            let audio = tiny_audio(samples, samples as u32);
+            let mut streamed = VoxtralRealtimeState::new(None);
+            model
+                .push_realtime_samples(&mut streamed, &audio, rate)
+                .unwrap();
+            assert!(!streamed.input_closed());
+            model.finish_realtime_input(&mut streamed).unwrap();
+            assert!(streamed.input_closed());
+
+            let complete = model.prepare_offline_audio(&audio, rate).unwrap();
+            let row = model.start_offline_state(&complete, None).unwrap();
+            assert!(row.input_closed() && row.final_padding_applied);
+            assert_eq!(
+                row.prepared_audio_frames(),
+                streamed.prepared_audio_frames()
+            );
+            assert_eq!(complete.prepared_frames(), streamed.prepared_audio_frames());
+            assert_eq!(
+                Some(complete.prepared_frames()),
+                model.offline_row_frames(samples, rate).unwrap()
+            );
+            let bits = |tensor: &Tensor| {
+                tensor
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                bits(row.audio_embeds.as_ref().unwrap()),
+                bits(streamed.audio_embeds.as_ref().unwrap())
+            );
+            assert_eq!(
+                complete.tensor_bytes().unwrap(),
+                model.offline_preparation_bytes(samples, rate).unwrap().1
+            );
+
+            // Complete prepares a fresh stream only.
+            let error = model
+                .prepare_realtime_audio_batch(&[VoxtralRealtimePreparationBatchRow {
+                    state: &streamed,
+                    appended_samples: &audio,
+                    sample_rate: rate,
+                    mode: super::VoxtralRealtimePreparationMode::Complete,
+                }])
+                .unwrap_err();
+            assert!(format!("{error}").contains("closed"), "{error}");
+        }
+        // Past the session ceiling, or short of the prompt, an input keeps
+        // the atomic route.
+        assert_eq!(
+            model.offline_row_frames(4 * 16_000 + 1, 16_000).unwrap(),
+            None
+        );
+        assert!(model
+            .offline_row_frames(4 * 16_000, 16_000)
+            .unwrap()
+            .is_some());
+        assert_eq!(model.offline_row_frames(0, 16_000).unwrap(), None);
+    }
+
+    /// Offline rows decoded together, joining at different steps and running
+    /// out of audio at different steps, emit exactly what each row emits on
+    /// its own through `decode_realtime_step_physical`: every step's delta,
+    /// text, token count and finish. A row whose frames ran out completes in
+    /// the batch without a forward (its cache does not grow) beside rows that
+    /// still advance. Folding that completion into the row's last step
+    /// (`finish_exhausted_offline_row`) gives the same transcript one step
+    /// sooner.
+    #[test]
+    fn realtime_batch_decode_matches_one_row_decode_with_ragged_and_exhausted_rows() {
+        use super::VoxtralRealtimeDecodeBatchRow;
+        use crate::models::architectures::voxtral::lm::tests::shared_decode_caches;
+
+        let model = tiny_realtime_model();
+        let inputs = [(9_600usize, 3u32), (16_000, 5), (4_800, 7)];
+        let prepared = inputs
+            .iter()
+            .map(|(samples, seed)| {
+                model
+                    .prepare_offline_audio(&tiny_audio(*samples, *seed), 16_000)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let (_, mut caches) = shared_decode_caches(3 * prepared.len(), 990, 16);
+        let mut eager_caches = caches.split_off(2 * prepared.len());
+        let mut batch_caches = caches.split_off(prepared.len());
+        let mut solo_caches = caches;
+
+        // Each row alone.
+        let mut solo = Vec::new();
+        let mut ran_out = Vec::new();
+        for (artifact, cache) in prepared.iter().zip(&mut solo_caches) {
+            let mut state = model.start_offline_state(artifact, None).unwrap();
+            let mut steps = vec![step_key(
+                &model
+                    .prefill_realtime_physical(&mut state, cache)
+                    .unwrap()
+                    .unwrap(),
+            )];
+            cache.take_completed_writes();
+            let mut exhausted = false;
+            while !state.is_finished() {
+                exhausted = state.next_audio_frame() >= state.prepared_audio_frames();
+                let step = model
+                    .decode_realtime_step_physical(&mut state, cache)
+                    .unwrap()
+                    .unwrap();
+                cache.take_completed_writes();
+                steps.push(step_key(&step));
+            }
+            solo.push(steps);
+            ran_out.push(exhausted);
+        }
+        assert!(ran_out.iter().any(|ran_out| *ran_out), "{ran_out:?}");
+        assert!(
+            solo.iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|w| w[0] != w[1]),
+            "rows must run out of audio at different steps"
+        );
+
+        // Rows batched: row 2 joins two steps late.
+        let joins = [0usize, 0, 2];
+        let mut states = prepared
+            .iter()
+            .map(|artifact| model.start_offline_state(artifact, None).unwrap())
+            .collect::<Vec<_>>();
+        let mut batched = vec![Vec::new(); prepared.len()];
+        let mut mixed_exhausted_steps = 0usize;
+        for step in 0.. {
+            for (row, join) in joins.iter().enumerate() {
+                if *join == step {
+                    let first = model
+                        .prefill_realtime_physical(&mut states[row], &mut batch_caches[row])
+                        .unwrap()
+                        .unwrap();
+                    batch_caches[row].take_completed_writes();
+                    batched[row].push(step_key(&first));
+                }
+            }
+            let live = (0..prepared.len())
+                .filter(|row| joins[*row] < step && !states[*row].is_finished())
+                .collect::<Vec<_>>();
+            if live.is_empty() {
+                if states.iter().all(|state| state.is_finished()) {
+                    break;
+                }
+                continue;
+            }
+            let exhausted = live
+                .iter()
+                .map(|row| states[*row].next_audio_frame() >= states[*row].prepared_audio_frames())
+                .collect::<Vec<_>>();
+            if live.len() > 1 && exhausted.iter().any(|e| *e) && exhausted.iter().any(|e| !*e) {
+                mixed_exhausted_steps += 1;
+            }
+            let before = live
+                .iter()
+                .map(|row| batch_caches[*row].context_len())
+                .collect::<Vec<_>>();
+            let mut checkpoints = Vec::new();
+            for row in &live {
+                checkpoints.push(
+                    model
+                        .begin_realtime_quantum(&mut states[*row], &batch_caches[*row])
+                        .unwrap(),
+                );
+            }
+            let steps = {
+                let mut rows = states
+                    .iter_mut()
+                    .zip(batch_caches.iter_mut())
+                    .enumerate()
+                    .filter(|(row, _)| live.contains(row))
+                    .map(|(_, (state, cache))| VoxtralRealtimeDecodeBatchRow { state, cache })
+                    .collect::<Vec<_>>();
+                model.decode_realtime_step_batch(&mut rows).unwrap()
+            };
+            for (index, row) in live.iter().enumerate() {
+                model
+                    .commit_realtime_quantum(
+                        &mut states[*row],
+                        &batch_caches[*row],
+                        &mut checkpoints[index],
+                    )
+                    .unwrap();
+                batch_caches[*row].take_completed_writes();
+                let grew = batch_caches[*row].context_len() - before[index];
+                assert_eq!(
+                    grew,
+                    usize::from(!exhausted[index]),
+                    "row {row} step {step}"
+                );
+                batched[*row].push(step_key(&steps[index]));
+            }
+        }
+        assert_eq!(batched, solo);
+        assert!(
+            mixed_exhausted_steps > 0,
+            "an exhausted row must complete beside an advancing row"
+        );
+
+        // The offline row flow: each step's exhausted completion folded in.
+        for (((artifact, cache), solo), ran_out) in prepared
+            .iter()
+            .zip(&mut eager_caches)
+            .zip(&solo)
+            .zip(&ran_out)
+        {
+            let mut state = model.start_offline_state(artifact, None).unwrap();
+            let first = model
+                .prefill_realtime_physical(&mut state, cache)
+                .unwrap()
+                .unwrap();
+            let mut step = model
+                .finish_exhausted_offline_row(&mut state, first)
+                .unwrap();
+            let mut steps = 1;
+            while !step.finished {
+                let next = model
+                    .decode_realtime_step_physical(&mut state, cache)
+                    .unwrap()
+                    .unwrap();
+                step = model
+                    .finish_exhausted_offline_row(&mut state, next)
+                    .unwrap();
+                steps += 1;
+            }
+            let last = solo.last().unwrap();
+            assert_eq!(
+                (step.text.clone(), step.tokens_generated),
+                (last.1.clone(), last.2)
+            );
+            assert_eq!(steps, solo.len() - usize::from(*ran_out));
         }
     }
 

@@ -41,6 +41,9 @@ pub(crate) struct VoxtralRealtimeState {
     pub(super) pending_input_token: Option<u32>,
     pub(super) generated: Vec<u32>,
     pub(super) assembled: String,
+    /// Bytes of a character whose tokens are still arriving: the tail of
+    /// `generated`'s text that `assembled` does not hold yet.
+    pub(super) held_text_bytes: Vec<u8>,
     pub(super) input_closed: bool,
     pub(super) final_padding_applied: bool,
     pub(super) finished: bool,
@@ -63,6 +66,7 @@ pub(super) struct VoxtralRealtimeHostCheckpoint {
     pending_input_token: Option<u32>,
     generated_len: usize,
     assembled: String,
+    held_text_bytes: Vec<u8>,
     input_closed: bool,
     final_padding_applied: bool,
     finished: bool,
@@ -88,6 +92,7 @@ impl VoxtralRealtimeState {
             pending_input_token: None,
             generated: Vec::new(),
             assembled: String::new(),
+            held_text_bytes: Vec::new(),
             input_closed: false,
             final_padding_applied: false,
             finished: false,
@@ -220,6 +225,7 @@ impl VoxtralRealtimeState {
             pending_input_token: self.pending_input_token,
             generated_len: self.generated.len(),
             assembled: self.assembled.clone(),
+            held_text_bytes: self.held_text_bytes.clone(),
             input_closed: self.input_closed,
             final_padding_applied: self.final_padding_applied,
             finished: self.finished,
@@ -236,6 +242,7 @@ impl VoxtralRealtimeState {
         self.pending_input_token = checkpoint.pending_input_token;
         self.generated.truncate(checkpoint.generated_len);
         self.assembled = checkpoint.assembled;
+        self.held_text_bytes = checkpoint.held_text_bytes;
         self.input_closed = checkpoint.input_closed;
         self.final_padding_applied = checkpoint.final_padding_applied;
         self.finished = checkpoint.finished;
