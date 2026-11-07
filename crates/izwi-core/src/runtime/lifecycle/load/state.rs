@@ -195,7 +195,7 @@ impl ModelLifecycleController {
                         retained_contract,
                         Some(retained_max_tokens),
                         2,
-                        self.asr_state_rows(),
+                        self.asr_state_rows(bundle_draft)?,
                         asr_minimum_tokens(variant),
                     )
                     .await?;
@@ -330,7 +330,7 @@ impl ModelLifecycleController {
                             Qwen3AsrContextBound::Configured
                         } else {
                             Qwen3AsrContextBound::Automatic {
-                                retained_rows: self.asr_state_rows().0,
+                                retained_rows: self.asr_state_rows(bundle_draft)?.0,
                             }
                         };
                     let physical_spec =
@@ -343,7 +343,7 @@ impl ModelLifecycleController {
                             &physical_spec.retained,
                             Some(retained_max_tokens),
                             2,
-                            self.asr_state_rows(),
+                            self.asr_state_rows(bundle_draft)?,
                             asr_minimum_tokens(variant),
                         )
                         .await?;
@@ -436,7 +436,7 @@ impl ModelLifecycleController {
                             crate::runtime::asr_automatic_context(
                                 native_tokens,
                                 loaded.vibevoice_retained_sequence_ceiling()?,
-                                self.asr_state_rows().0,
+                                self.asr_state_rows(bundle_draft)?.0,
                             )
                             .1
                         };
@@ -447,7 +447,7 @@ impl ModelLifecycleController {
                             retained_contract,
                             Some(retained_max_tokens),
                             2,
-                            self.asr_state_rows(),
+                            self.asr_state_rows(bundle_draft)?,
                             asr_minimum_tokens(variant),
                         )
                         .await?;
@@ -571,7 +571,7 @@ impl ModelLifecycleController {
                         .load_retained_tensor_state(
                             model_instance_id,
                             retained_contract,
-                            self.realtime_asr_sequence_capacity,
+                            self.transducer_retained_sequences(bundle_draft)?,
                         )
                         .await?;
                     let effective_context = self.config.portable_context_ceiling();
@@ -625,7 +625,7 @@ impl ModelLifecycleController {
                         .load_retained_tensor_state(
                             model_instance_id,
                             retained_contract,
-                            self.realtime_asr_sequence_capacity,
+                            self.transducer_retained_sequences(bundle_draft)?,
                         )
                         .await?;
                     let effective_context = self.config.portable_context_ceiling();
@@ -892,7 +892,7 @@ impl ModelLifecycleController {
                             &physical_spec.retained,
                             Some(retained_max_tokens),
                             2,
-                            self.asr_state_rows(),
+                            self.asr_state_rows(bundle_draft)?,
                             asr_minimum_tokens(variant),
                         )
                         .await?;

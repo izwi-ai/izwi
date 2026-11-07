@@ -637,6 +637,106 @@ pub(crate) fn deferred_request_envelope(
     envelope.scaled_by(slots).map(Some)
 }
 
+/// BF16: the KV and prepared-input dtype of the CUDA ASR decoders.
+const BF16_BYTES: u64 = 2;
+/// Parakeet-TDT-0.6B-v3's encoder: 1,024 wide at 12.5 positions per second.
+const PARAKEET_ENCODER_HIDDEN: u64 = 1024;
+const PARAKEET_ENCODER_POSITIONS_PER_SEC: f32 = 12.5;
+/// Allowance for one VibeVoice-ASR row's acoustic and semantic tokenizer
+/// streaming caches (convolution histories of a few MiB).
+const VIBEVOICE_TOKENIZER_STATE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A language-model decoder's KV width: its layers and the K (or V) width of
+/// one layer (`num_key_value_heads × head_dim`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecoderKvGeometry {
+    layers: u64,
+    kv_width: u64,
+}
+
+/// The pinned decoder KV geometry of the ASR variants whose decode runs
+/// wider than the engine rows on CUDA (checked against the checkpoint
+/// census in the tests).
+fn decoder_kv_geometry(variant: ModelVariant) -> Option<DecoderKvGeometry> {
+    Some(match variant {
+        // Qwen3-0.6B and Qwen3-1.7B: 28 layers, 8 KV heads of 128.
+        ModelVariant::Qwen3Asr06BGguf | ModelVariant::Qwen3Asr17BGguf => DecoderKvGeometry {
+            layers: 28,
+            kv_width: 1024,
+        },
+        // Qwen2.5-7B: 28 layers, 4 KV heads of 128.
+        ModelVariant::VibeVoiceAsr => DecoderKvGeometry {
+            layers: 28,
+            kv_width: 512,
+        },
+        _ => return None,
+    })
+}
+
+/// What one continuous decode row of `variant` holds on CUDA, for the
+/// load's decode-width fit (`catalog::fit_asr_decode_width`): its retained
+/// sequence state, one prepared-input row and its decode workspace. A
+/// language-model decoder holds BF16 K and V over one planned chunk
+/// ([`minimum_sequence_tokens`]), that chunk's BF16 prepared embeddings and
+/// an F32 logits row (VibeVoice also its tokenizer caches). A transducer
+/// holds one pass's F32 encoder output (Parakeet one encoder window,
+/// Nemotron one 30 s chunk) and its sealed per-row decode workspace; its
+/// predictor state is a few KiB. `None` for a variant whose decode does not
+/// run wider than the engine rows.
+pub(crate) fn cuda_decode_row_bytes(variant: ModelVariant) -> Result<Option<u64>> {
+    use crate::models::architectures::nemotron::asr::NEMOTRON_RETAINED_WORKSPACE_PER_ROW_BYTES;
+    use crate::models::architectures::parakeet::asr::PARAKEET_RETAINED_WORKSPACE_PER_ROW_BYTES;
+    let transducer = |positions_per_sec: f32, secs: f32, hidden: u64, workspace: u64| {
+        sum(&[
+            product(&[positions(positions_per_sec, secs), hidden, F32_BYTES])?,
+            workspace,
+        ])
+    };
+    let bytes = match variant {
+        ModelVariant::ParakeetTdt06BV3 => transducer(
+            PARAKEET_ENCODER_POSITIONS_PER_SEC,
+            PARAKEET_WINDOW_SECS,
+            PARAKEET_ENCODER_HIDDEN,
+            PARAKEET_RETAINED_WORKSPACE_PER_ROW_BYTES,
+        )?,
+        ModelVariant::Nemotron35AsrStreaming06B => {
+            let Some(geometry) = envelope_geometry(variant) else {
+                return Ok(None);
+            };
+            transducer(
+                geometry.encoder_positions_per_sec,
+                geometry.max_chunk_secs,
+                geometry.encoder.hidden,
+                NEMOTRON_RETAINED_WORKSPACE_PER_ROW_BYTES,
+            )?
+        }
+        _ => {
+            let (Some(kv), Some(geometry), Some(tokens)) = (
+                decoder_kv_geometry(variant),
+                envelope_geometry(variant),
+                minimum_sequence_tokens(variant),
+            ) else {
+                return Ok(None);
+            };
+            let per_token = sum(&[
+                product(&[2, kv.layers, kv.kv_width, BF16_BYTES])?,
+                product(&[geometry.decoder.hidden, BF16_BYTES])?,
+            ])?;
+            let tokenizer = if variant == ModelVariant::VibeVoiceAsr {
+                VIBEVOICE_TOKENIZER_STATE_BYTES
+            } else {
+                0
+            };
+            sum(&[
+                product(&[tokens, per_token])?,
+                product(&[geometry.vocab, F32_BYTES])?,
+                tokenizer,
+            ])?
+        }
+    };
+    Ok(Some(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,6 +933,88 @@ mod tests {
             minimum_sequence_tokens(ModelVariant::Nemotron35AsrStreaming06B),
             None
         );
+    }
+
+    /// Every variant of the families certified wider on CUDA has a decode
+    /// row estimate; no other speech variant does. A Qwen3-ASR row is
+    /// dominated by its one-chunk KV (1,307 tokens at 112 KiB), so 32 rows
+    /// take about 4.6 GiB; a transducer row is its workspace and one pass's
+    /// encoder output.
+    #[test]
+    fn cuda_decode_rows_price_their_state_input_and_workspace() {
+        const MIB: u64 = 1024 * 1024;
+        let row = |variant| cuda_decode_row_bytes(variant).unwrap();
+        for variant in crate::model::ModelVariant::all().iter().copied() {
+            let wide = crate::catalog::certified_decode_width(variant.family(), BackendKind::Cuda)
+                > crate::catalog::CUDA_DEFAULT_WIDTH
+                && matches!(
+                    variant.family(),
+                    ModelFamily::Qwen3Asr
+                        | ModelFamily::VibeVoiceAsr
+                        | ModelFamily::ParakeetAsr
+                        | ModelFamily::NemotronAsr
+                );
+            assert_eq!(row(variant).is_some(), wide, "{variant}");
+        }
+        let qwen_17b = row(ModelVariant::Qwen3Asr17BGguf).unwrap();
+        assert_eq!(
+            qwen_17b,
+            1_307 * (2 * 28 * 1024 * 2 + 2048 * 2) + 151_936 * 4
+        );
+        assert_eq!(qwen_17b / MIB, 148);
+        assert_eq!(row(ModelVariant::Qwen3Asr06BGguf).unwrap() / MIB, 146);
+        // VibeVoice: 1,938 tokens of 56 KiB KV and 7 KiB of embeddings.
+        assert_eq!(row(ModelVariant::VibeVoiceAsr).unwrap() / MIB, 135);
+        assert_eq!(row(ModelVariant::ParakeetTdt06BV3).unwrap() / MIB, 21);
+        assert_eq!(
+            row(ModelVariant::Nemotron35AsrStreaming06B).unwrap() / MIB,
+            17
+        );
+    }
+
+    /// The pinned decoder KV widths match the checkpoints' K projections.
+    #[test]
+    fn decoder_kv_geometry_matches_the_checkpoint_census() {
+        fn k_projection(fixture: &str, name: &str) -> (u64, u64) {
+            let value: serde_json::Value = serde_json::from_str(fixture).unwrap();
+            let entries = value["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|file| file["tensors"].as_array().unwrap())
+                .filter(|tensor| tensor[0] == name)
+                .collect::<Vec<_>>();
+            assert!(!entries.is_empty(), "{name} missing");
+            let layers = entries
+                .iter()
+                .map(|tensor| tensor[4].as_u64().unwrap())
+                .sum();
+            (layers, entries[0][2][0].as_u64().unwrap())
+        }
+        for (variant, fixture, name) in [
+            (
+                ModelVariant::Qwen3Asr06BGguf,
+                include_str!("../../../tests/fixtures/asr_residency/qwen3_asr_0_6b_q8_0.json"),
+                "thinker.model.layers.{i}.self_attn.k_proj.weight",
+            ),
+            (
+                ModelVariant::Qwen3Asr17BGguf,
+                include_str!("../../../tests/fixtures/asr_residency/qwen3_asr_1_7b_q8_0.json"),
+                "thinker.model.layers.{i}.self_attn.k_proj.weight",
+            ),
+            (
+                ModelVariant::VibeVoiceAsr,
+                include_str!("../../../tests/fixtures/asr_residency/vibevoice_asr.json"),
+                "model.language_model.layers.{i}.self_attn.k_proj.weight",
+            ),
+        ] {
+            let geometry = decoder_kv_geometry(variant).unwrap();
+            assert_eq!(
+                k_projection(fixture, name),
+                (geometry.layers, geometry.kv_width),
+                "{variant}"
+            );
+        }
     }
 
     /// The pinned dimensions match the published checkpoints' tensor shapes.

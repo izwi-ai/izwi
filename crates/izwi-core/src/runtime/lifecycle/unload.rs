@@ -594,7 +594,7 @@ mod tests {
                 .expect("managed physical state");
             let draft = runtime
                 .model_lifecycle
-                .draft_loaded_model_bundle(variant, model_instance)
+                .draft_loaded_model_bundle(variant, model_instance, None)
                 .unwrap();
             draft.seal_chat_workspace(8_192).unwrap();
             let bundle = runtime

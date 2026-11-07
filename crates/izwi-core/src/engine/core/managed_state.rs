@@ -364,10 +364,18 @@ impl EngineCore {
         reserve: StateFitReserve,
         later_minimum_bytes: u64,
     ) -> Result<Arc<super::super::ManagedKvModelRuntime>> {
+        // An automatic staged limit is sized for the engine rows' launch
+        // width; an ASR decode fitted wider stages its own launch width,
+        // bounded by its retained rows instead.
+        let staged_ceiling = if self.config.automatic_row_limits.staged_transactions {
+            self.config.max_retained_sequences
+        } else {
+            self.config.max_staged_transactions
+        };
         if retained_rows == 0
             || staged_rows == 0
             || retained_rows > self.config.max_retained_sequences
-            || staged_rows > self.config.max_staged_transactions
+            || staged_rows > staged_ceiling
         {
             return Err(Error::ModelLoadError(
                 "retained state row limits exceed configured capacity".into(),

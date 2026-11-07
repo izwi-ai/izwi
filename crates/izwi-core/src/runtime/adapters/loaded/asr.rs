@@ -10,7 +10,10 @@ pub(super) struct ContinuousAsrExecutionAdapter {
     pub(super) adapter_instance_id: AdapterInstanceId,
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
+    /// The audio preparation's width: the engine rows.
     pub(super) max_batch_size: usize,
+    /// The continuous decode's width, at least `max_batch_size`.
+    pub(super) decode_batch_size: usize,
     pub(super) audio_preparation:
         OnceLock<crate::models::architectures::qwen3::asr::Qwen3AsrAudioPreparationStageSeal>,
 }
@@ -32,8 +35,16 @@ impl ContinuousAsrExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
             audio_preparation: OnceLock::new(),
         }
+    }
+
+    /// Decode up to `rows` rows per step; the audio preparation keeps the
+    /// width the adapter was built with.
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
     }
 
     pub(super) fn install_audio_preparation_seal(
@@ -178,7 +189,7 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
         execution_profile.recompute_safe = true;
         execution_profile.cache_release_safe = true;
         execution_profile.prefix_reuse_safe = false;
-        execution_profile.max_batch_size = self.max_batch_size;
+        execution_profile.max_batch_size = self.decode_batch_size;
         execution_profile.resolved_from_loaded_model = true;
 
         let mut preparation = StageDescriptor::from_execution_profile(
@@ -188,6 +199,8 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
             NativeBatchMode::Static,
         );
         preparation.selector = StageWorkSelector::PreSequencePreparation;
+        // The encoder's workspace is sealed at the engine rows' width.
+        preparation.max_batch_size = self.max_batch_size;
         preparation.progress = StageProgressKind::Atomic;
         preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
         preparation.shape_policy = StageShapePolicy::Padded;
@@ -251,7 +264,10 @@ pub(super) struct ParakeetAsrExecutionAdapter {
     pub(super) adapter_instance_id: AdapterInstanceId,
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
+    /// The encoder preparation's and prefill's width: the engine rows.
     pub(super) max_batch_size: usize,
+    /// The continuous decode's width, at least `max_batch_size`.
+    pub(super) decode_batch_size: usize,
 }
 
 impl ParakeetAsrExecutionAdapter {
@@ -271,7 +287,15 @@ impl ParakeetAsrExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
         }
+    }
+
+    /// Decode up to `rows` rows per step; the encoder and prefill keep the
+    /// width the adapter was built with.
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
     }
 }
 
@@ -342,6 +366,11 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
         let batch_workspace = workspace_per_row
             .checked_mul(width)
             .ok_or_else(|| Error::Overloaded("Parakeet batch workspace overflowed".into()))?;
+        let decode_width = u64::try_from(self.decode_batch_size)
+            .map_err(|_| Error::Overloaded("Parakeet decode width exceeds u64".into()))?;
+        let decode_workspace = workspace_per_row
+            .checked_mul(decode_width)
+            .ok_or_else(|| Error::Overloaded("Parakeet decode workspace overflowed".into()))?;
 
         let mut profile = scalar_execution_profile(metadata, self.backend_kind);
         profile.mode = ExecutionMode::Sequence;
@@ -359,7 +388,7 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
         profile.recompute_safe = true;
         profile.cache_release_safe = true;
         profile.prefix_reuse_safe = false;
-        profile.max_batch_size = self.max_batch_size;
+        profile.max_batch_size = self.decode_batch_size;
         profile.resolved_from_loaded_model = true;
 
         // Concurrent clips of one window encode as one padded batch of up to
@@ -372,6 +401,7 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
             NativeBatchMode::Static,
         );
         preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.max_batch_size = self.max_batch_size;
         preparation.progress = StageProgressKind::Atomic;
         preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
         preparation.max_work_units = PARAKEET_PREPARATION_ROW_WORK_UNITS
@@ -394,6 +424,7 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
             NativeBatchMode::Static,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.max_batch_size = self.max_batch_size;
         prefill.progress = StageProgressKind::Iterative;
         prefill.membership_safe_point = MembershipSafePoint::QuantumBoundary;
         prefill.max_work_units = width;
@@ -413,9 +444,9 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
         decode.selector = StageWorkSelector::SequenceDecode;
         decode.progress = StageProgressKind::Iterative;
         decode.membership_safe_point = MembershipSafePoint::QuantumBoundary;
-        decode.max_work_units = width;
+        decode.max_work_units = decode_width;
         decode.workspace_per_row_bytes = workspace_per_row;
-        decode.max_workspace_bytes = batch_workspace;
+        decode.max_workspace_bytes = decode_workspace;
         decode.shape_policy = StageShapePolicy::Ragged;
         decode.max_padding_basis_points = 0;
         decode.retained_state_selections = Some(vec![selection]);
@@ -457,7 +488,10 @@ pub(super) struct NemotronAsrExecutionAdapter {
     pub(super) adapter_instance_id: AdapterInstanceId,
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
+    /// The encoder preparation's and prefill's width: the engine rows.
     pub(super) max_batch_size: usize,
+    /// The continuous decode's width, at least `max_batch_size`.
+    pub(super) decode_batch_size: usize,
 }
 
 impl NemotronAsrExecutionAdapter {
@@ -477,7 +511,15 @@ impl NemotronAsrExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
         }
+    }
+
+    /// Decode up to `rows` rows per step; the encoder and prefill keep the
+    /// width the adapter was built with.
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
     }
 }
 
@@ -523,6 +565,11 @@ impl LoadedExecutionAdapter for NemotronAsrExecutionAdapter {
         let batch_workspace = workspace_per_row
             .checked_mul(width)
             .ok_or_else(|| Error::Overloaded("Nemotron batch workspace overflowed".into()))?;
+        let decode_width = u64::try_from(self.decode_batch_size)
+            .map_err(|_| Error::Overloaded("Nemotron decode width exceeds u64".into()))?;
+        let decode_workspace = workspace_per_row
+            .checked_mul(decode_width)
+            .ok_or_else(|| Error::Overloaded("Nemotron decode workspace overflowed".into()))?;
 
         let mut profile = scalar_execution_profile(metadata, self.backend_kind);
         profile.mode = ExecutionMode::Sequence;
@@ -540,7 +587,7 @@ impl LoadedExecutionAdapter for NemotronAsrExecutionAdapter {
         profile.recompute_safe = true;
         profile.cache_release_safe = true;
         profile.prefix_reuse_safe = false;
-        profile.max_batch_size = self.max_batch_size;
+        profile.max_batch_size = self.decode_batch_size;
         profile.resolved_from_loaded_model = true;
 
         // Concurrent clips encode as one padded batch of up to the engine's
@@ -552,6 +599,7 @@ impl LoadedExecutionAdapter for NemotronAsrExecutionAdapter {
             NativeBatchMode::Static,
         );
         preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.max_batch_size = self.max_batch_size;
         preparation.progress = StageProgressKind::Atomic;
         preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
         preparation.max_work_units = NEMOTRON_PREPARATION_ROW_WORK_UNITS
@@ -574,6 +622,7 @@ impl LoadedExecutionAdapter for NemotronAsrExecutionAdapter {
             NativeBatchMode::Static,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.max_batch_size = self.max_batch_size;
         prefill.progress = StageProgressKind::Iterative;
         prefill.membership_safe_point = MembershipSafePoint::QuantumBoundary;
         prefill.max_work_units = width;
@@ -593,9 +642,9 @@ impl LoadedExecutionAdapter for NemotronAsrExecutionAdapter {
         decode.selector = StageWorkSelector::SequenceDecode;
         decode.progress = StageProgressKind::Iterative;
         decode.membership_safe_point = MembershipSafePoint::QuantumBoundary;
-        decode.max_work_units = width;
+        decode.max_work_units = decode_width;
         decode.workspace_per_row_bytes = workspace_per_row;
-        decode.max_workspace_bytes = batch_workspace;
+        decode.max_workspace_bytes = decode_workspace;
         decode.shape_policy = StageShapePolicy::Ragged;
         decode.max_padding_basis_points = 0;
         decode.retained_state_selections = Some(vec![selection]);

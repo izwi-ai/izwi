@@ -2006,6 +2006,110 @@ fn cuda_wide_chat_families_stage_at_the_width_the_state_floor_prices() {
     }
 }
 
+/// An ASR decode fitted past the engine rows (CUDA, EXE-F7) stages and
+/// retains one launch at its width, so all its rows can be admitted and
+/// stepped together; a decode at the engine rows keeps today's rows. Engine
+/// rows here are an H100's: hundreds of automatic retained rows and staged
+/// rows at the engine width.
+#[test]
+fn asr_state_rows_cover_the_asr_decode_width() {
+    use crate::runtime::adapters::LoadedModelBundleDraft;
+    let draft = |asr_width: usize, variant: ModelVariant, backend: BackendKind| {
+        LoadedModelBundleDraft::build(
+            &RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1)
+                .unwrap()
+                .with_asr_tensor_batch_size(asr_width),
+            ExecutionGroupId::new(994),
+            ModelInstanceId::new(1),
+            variant,
+            backend,
+        )
+        .unwrap()
+    };
+    let wide = RuntimeService::new(EngineConfig {
+        backend: BackendPreference::Cpu,
+        max_num_seqs: Some(320),
+        ..Default::default()
+    })
+    .unwrap();
+    let engine = wide.core_engine.config();
+    assert!(engine.automatic_row_limits.retained_sequences);
+    assert!(engine.automatic_row_limits.staged_transactions);
+    assert_eq!(engine.max_retained_sequences, 320);
+    let lifecycle = &wide.model_lifecycle;
+    for variant in [
+        ModelVariant::ParakeetTdt06BV3,
+        ModelVariant::Nemotron35AsrStreaming06B,
+    ] {
+        let fitted = draft(32, variant, BackendKind::Cuda);
+        assert_eq!(lifecycle.asr_state_rows(&fitted).unwrap(), (32, 32));
+        assert_eq!(
+            lifecycle
+                .asr_state_rows(&draft(16, variant, BackendKind::Cuda))
+                .unwrap(),
+            (16, 16)
+        );
+        assert_eq!(
+            lifecycle
+                .asr_state_rows(&draft(8, variant, BackendKind::Cuda))
+                .unwrap(),
+            (8, 8)
+        );
+    }
+
+    // A transducer's predictor rows: its realtime sessions (4 on the CPU),
+    // and at least its decode width.
+    let portable = RuntimeService::new(EngineConfig {
+        backend: BackendPreference::Cpu,
+        ..Default::default()
+    })
+    .unwrap();
+    let lifecycle = &portable.model_lifecycle;
+    for variant in [
+        ModelVariant::ParakeetTdt06BV3,
+        ModelVariant::Nemotron35AsrStreaming06B,
+    ] {
+        assert_eq!(
+            lifecycle
+                .transducer_retained_sequences(&draft(32, variant, BackendKind::Cuda))
+                .unwrap(),
+            32
+        );
+        let cpu = LoadedModelBundleDraft::build(
+            &portable.adapter_registry,
+            ExecutionGroupId::new(995),
+            ModelInstanceId::new(1),
+            variant,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        assert_eq!(lifecycle.transducer_retained_sequences(&cpu).unwrap(), 4);
+        // The CPU's ASR rows are today's: the engine's staged rows.
+        assert_eq!(lifecycle.asr_state_rows(&cpu).unwrap(), (8, 2));
+    }
+    // Without a CUDA width to fit, a load keeps the registry's ASR width
+    // and a model without ASR has none.
+    let plan = model_resource_plan(
+        BackendKind::Cpu,
+        ModelMemoryEstimate {
+            load_peak_bytes: 1_000,
+            resident_bytes: 800,
+        },
+    );
+    assert_eq!(
+        lifecycle
+            .fit_asr_decode_width(ModelVariant::Qwen3Asr17BGguf, &plan)
+            .unwrap(),
+        Some(2)
+    );
+    assert_eq!(
+        lifecycle
+            .fit_asr_decode_width(ModelVariant::Qwen306B, &plan)
+            .unwrap(),
+        None
+    );
+}
+
 #[test]
 fn asr_state_rows_come_from_the_asr_policy_not_chat_rows() {
     assert_eq!(asr_state_rows(true, 320, 4), (8, 4));

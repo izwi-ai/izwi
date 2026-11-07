@@ -1166,9 +1166,13 @@ impl WorkerConfig {
 
 /// Families whose loaded stage sets their batch rows instead of the
 /// engine's tensor width: Fish S2 and Drama 3 fit their own rows, and the chat
-/// families certified wider on CUDA than the engine rows
-/// (`catalog::batch_width`) decode up to their stage's width. Read from the
-/// certified widths, so certifying a family wider cannot leave it capped here.
+/// and ASR families certified wider on CUDA than the engine rows
+/// (`catalog::batch_width`) decode up to their stage's width (an ASR model's
+/// encoder and prefill stages keep the engine rows). Read from the certified
+/// widths, so certifying a family wider cannot leave it capped here. Every
+/// stage of such a family is bound by its own width, which on CPU and Metal
+/// (and for a family's realtime capability) is the engine rows the formation
+/// already planned it at.
 fn stage_sets_batch_rows(family: crate::catalog::ModelFamily) -> bool {
     use crate::catalog::ModelFamily;
     matches!(family, ModelFamily::FishS2Tts | ModelFamily::FishDrama3Tts)
@@ -5682,10 +5686,25 @@ mod tests {
             ModelFamily::Qwen38Chat,
             ModelFamily::Lfm2Chat,
             ModelFamily::Lfm3Chat,
+            ModelFamily::Qwen3Asr,
+            ModelFamily::VibeVoiceAsr,
+            ModelFamily::ParakeetAsr,
+            ModelFamily::NemotronAsr,
         ] {
             assert!(stage_sets_batch_rows(family), "{family:?}");
         }
-        for family in [ModelFamily::Qwen3Chat, ModelFamily::Gemma3Chat] {
+        for family in [
+            ModelFamily::Qwen3Chat,
+            ModelFamily::Gemma3Chat,
+            ModelFamily::WhisperAsr,
+            ModelFamily::GraniteSpeechAsr,
+            ModelFamily::GraniteSpeech5Asr,
+            ModelFamily::NemotronTranscribeAsr,
+            ModelFamily::Voxtral,
+            ModelFamily::Lfm25Audio,
+            ModelFamily::Lfm3Audio,
+            ModelFamily::Qwen3Tts,
+        ] {
             assert!(!stage_sets_batch_rows(family), "{family:?}");
         }
     }

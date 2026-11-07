@@ -65,29 +65,46 @@ impl RuntimeAdapterRegistry {
             ModelInstanceId::new(0),
             metadata,
             backend_kind,
+            None,
         )?;
         let contract = adapter.contract(StreamingRequirements::NONE.with_asr_long_form(true))?;
         Ok(contract_supports_atomic_blocking(&contract))
     }
 
+    /// `asr_decode_width` is the decode width a load fitted the ASR
+    /// capability to; `None` takes the registry's
+    /// ([`Self::asr_decode_width`]).
     pub(super) fn create_loaded_adapter(
         &self,
         execution_group_id: ExecutionGroupId,
         model_instance_id: ModelInstanceId,
         metadata: AdapterMetadata,
         backend_kind: BackendKind,
+        asr_decode_width: Option<usize>,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        let family = metadata.model_variant.family();
+        // A chat model runs at most its family's certified width, unless the
+        // operator fixed a wider one. ASR decodes at its fitted width, its
+        // other stages at the engine rows.
+        let (max_tensor_batch_size, max_decode_batch_size) = match metadata.capability {
+            CapabilityKind::Chat => {
+                let width = self.chat_decode_width(family, backend_kind);
+                (width, width)
+            }
+            CapabilityKind::Asr => (
+                self.max_tensor_batch_size(),
+                asr_decode_width
+                    .unwrap_or_else(|| self.asr_decode_width(family, backend_kind))
+                    .max(1),
+            ),
+            _ => (self.max_tensor_batch_size(), self.max_tensor_batch_size()),
+        };
         let context = LoadedAdapterFactoryContext {
             execution_group_id,
             model_instance_id,
             backend_kind,
-            // A chat model runs at most its family's certified width, unless
-            // the operator fixed a wider one.
-            max_tensor_batch_size: if metadata.capability == CapabilityKind::Chat {
-                self.chat_decode_width(metadata.model_variant.family(), backend_kind)
-            } else {
-                self.max_tensor_batch_size()
-            },
+            max_tensor_batch_size,
+            max_decode_batch_size,
             request_parallelism: self.request_parallelism(),
         };
         let adapter = self
@@ -117,12 +134,34 @@ impl fmt::Debug for LoadedModelBundleDraft {
 }
 
 impl LoadedModelBundleDraft {
+    /// [`Self::build_with_asr_decode_width`] at the registry's ASR width.
+    #[cfg(test)]
     pub(crate) fn build(
         registry: &RuntimeAdapterRegistry,
         execution_group_id: ExecutionGroupId,
         model_instance_id: ModelInstanceId,
         model_variant: ModelVariant,
         backend_kind: BackendKind,
+    ) -> Result<Self> {
+        Self::build_with_asr_decode_width(
+            registry,
+            execution_group_id,
+            model_instance_id,
+            model_variant,
+            backend_kind,
+            None,
+        )
+    }
+
+    /// [`Self::build`] with the ASR decode width the load fitted (`None`:
+    /// the registry's).
+    pub(crate) fn build_with_asr_decode_width(
+        registry: &RuntimeAdapterRegistry,
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        model_variant: ModelVariant,
+        backend_kind: BackendKind,
+        asr_decode_width: Option<usize>,
     ) -> Result<Self> {
         let metadata = registry.capabilities_for(model_variant);
         if metadata.is_empty() {
@@ -137,6 +176,7 @@ impl LoadedModelBundleDraft {
                 model_instance_id,
                 metadata,
                 backend_kind,
+                asr_decode_width,
             )?;
             if capabilities.insert(metadata.capability, adapter).is_some() {
                 return Err(Error::ModelLoadError(format!(
@@ -464,6 +504,25 @@ impl RuntimeAdapterRegistry {
             self.max_chat_tensor_batch_size(),
             crate::catalog::certified_decode_width(family, backend),
             self.explicit_tensor_width(),
+        )
+    }
+}
+
+impl RuntimeAdapterRegistry {
+    /// The widest continuous decode an ASR model of `family` loads with on
+    /// `backend` before its memory fit: the ASR engine width clamped to the
+    /// family's certified width, never below the engine rows its encoder and
+    /// prefill run at.
+    pub(crate) fn asr_decode_width(
+        &self,
+        family: crate::catalog::ModelFamily,
+        backend: BackendKind,
+    ) -> usize {
+        crate::catalog::asr_decode_width(
+            family,
+            backend,
+            self.max_tensor_batch_size(),
+            self.max_asr_tensor_batch_size(),
         )
     }
 }

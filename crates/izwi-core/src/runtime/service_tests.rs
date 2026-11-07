@@ -2872,6 +2872,9 @@ fn max_num_seqs_sizes_every_automatic_limit() {
     assert_eq!(concurrency.max_num_seqs, None);
     assert_eq!(concurrency.scheduler_rows, 8);
     assert_eq!(concurrency.realtime_asr_sessions, 4);
+    // ASR decode widens only on CUDA; the CPU keeps the portable rows.
+    assert_eq!(concurrency.non_chat_row_width, 2);
+    assert_eq!(single.adapter_registry.max_asr_tensor_batch_size(), 2);
 
     let multi = RuntimeService::new(EngineConfig {
         backend: crate::backends::BackendPreference::Cpu,
@@ -2920,6 +2923,18 @@ fn max_num_seqs_sizes_every_automatic_limit() {
     assert_eq!(concurrency.tensor_width, 12);
     assert_eq!(concurrency.non_chat_row_width, 12);
     assert_eq!(wide.tts_row_width(), 12);
+    // ASR decode runs the explicit width as asked, like every other stage.
+    for registry in [&wide.adapter_registry, &multi.adapter_registry] {
+        for variant in [
+            ModelVariant::Qwen3Asr17BGguf,
+            ModelVariant::WhisperLargeV3Turbo,
+        ] {
+            assert_eq!(
+                registry.asr_decode_width(variant.family(), BackendKind::Cpu),
+                registry.max_tensor_batch_size()
+            );
+        }
+    }
 }
 
 #[test]

@@ -234,7 +234,14 @@ impl RuntimeService {
         // width; every other capability runs at the engine rows' width. On
         // CUDA an automatic chat width is the CUDA ceiling, so the families
         // certified for wide batches decode more rows per forward than the
-        // engine rows. An operator's explicit width applies as asked.
+        // engine rows. ASR decode does the same (its encoders and prefill
+        // keep the engine rows), and each ASR load fits its decode width to
+        // its memory. An operator's explicit width applies as asked.
+        let asr_row_width = crate::catalog::asr_engine_width(
+            selected_backend_kind,
+            non_chat_row_width,
+            automatic_tensor_width,
+        );
         let adapter_registry = Arc::new(
             RuntimeAdapterRegistry::built_in_with_execution_limits(
                 non_chat_row_width,
@@ -245,6 +252,7 @@ impl RuntimeService {
                 worker_config.max_tensor_batch_size,
                 automatic_tensor_width,
             ))
+            .with_asr_tensor_batch_size(asr_row_width)
             .with_explicit_tensor_width(explicit_tensor_width),
         );
         worker_config.static_tensor_batch_variants =

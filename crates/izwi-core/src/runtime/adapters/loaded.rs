@@ -507,6 +507,11 @@ pub(super) struct LoadedAdapterFactoryContext {
     model_instance_id: ModelInstanceId,
     backend_kind: BackendKind,
     max_tensor_batch_size: usize,
+    /// The width of a continuous decode stage: `max_tensor_batch_size`, or
+    /// for ASR its fitted decode width (`RuntimeAdapterRegistry::
+    /// asr_decode_width`), which only the ASR adapters that batch their
+    /// decode read.
+    max_decode_batch_size: usize,
     request_parallelism: usize,
 }
 

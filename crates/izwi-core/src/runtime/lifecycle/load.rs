@@ -537,6 +537,19 @@ fn precision_reload_gate(
     (gate, receiver)
 }
 
+/// The widest continuous decode stage of a loaded model's ASR graphs: the
+/// rows one ASR decode step batches (1 without one).
+fn asr_decode_stage_width(bundle_draft: &LoadedModelBundleDraft) -> Result<usize> {
+    Ok(bundle_draft
+        .execution_contracts(CapabilityKind::Asr)?
+        .iter()
+        .flat_map(|contract| contract.stages.iter())
+        .filter(|stage| stage.batch_mode == crate::engine::NativeBatchMode::Continuous)
+        .map(|stage| stage.max_batch_size)
+        .max()
+        .unwrap_or(1))
+}
+
 /// `(retained, staged)` rows of ASR retained state (ADM-6). Automatic engine
 /// rows are sized for chat (on CUDA one per 256 MiB of device memory, about
 /// 320 on an H100), and every ASR retained row owns a prepared-input tensor
@@ -930,9 +943,14 @@ impl ModelLifecycleController {
             let admission_ms = admission_started.elapsed().as_secs_f64() * 1000.0;
             // Adapter factories are one-shot. Freeze their exact identities
             // and selectable stage graphs before model-derived state planning
-            // or any physical state allocation can occur.
-            let bundle_draft =
-                self.draft_loaded_model_bundle(variant, model_instance_id)?;
+            // or any physical state allocation can occur. An ASR decode that
+            // may run past the engine rows takes the width its memory fits.
+            let asr_decode_width = self.fit_asr_decode_width(variant, &resource_plan)?;
+            let bundle_draft = self.draft_loaded_model_bundle(
+                variant,
+                model_instance_id,
+                asr_decode_width,
+            )?;
             // This is the first operation allowed to allocate model tensors;
             // the peak host/device authorization and authoritative Loading slot
             // are both installed above.

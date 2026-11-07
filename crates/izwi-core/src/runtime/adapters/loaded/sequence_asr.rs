@@ -356,7 +356,10 @@ pub(super) struct VibeVoiceAsrExecutionAdapter {
     pub(super) adapter_instance_id: AdapterInstanceId,
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
+    /// The native prefill's width: the engine rows.
     pub(super) max_batch_size: usize,
+    /// The continuous decode's width, at least `max_batch_size`.
+    pub(super) decode_batch_size: usize,
     pub(super) seal: OnceLock<VibeVoiceAsrExecutionSeal>,
 }
 
@@ -377,8 +380,16 @@ impl VibeVoiceAsrExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
             seal: OnceLock::new(),
         }
+    }
+
+    /// Decode up to `rows` rows per step; the prefill keeps the width the
+    /// adapter was built with.
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
     }
 }
 
@@ -551,7 +562,7 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
             continuous_asr_workspace_per_row_bytes(seal.decode_workspace_per_row_bytes)?;
         let decode_workspace = decode_workspace_per_row
             .checked_mul(
-                u64::try_from(self.max_batch_size).map_err(|_| {
+                u64::try_from(self.decode_batch_size).map_err(|_| {
                     Error::Overloaded("VibeVoice ASR batch width exceeds u64".into())
                 })?,
             )
@@ -579,7 +590,7 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
         profile.recompute_safe = true;
         profile.cache_release_safe = true;
         profile.prefix_reuse_safe = false;
-        profile.max_batch_size = self.max_batch_size;
+        profile.max_batch_size = self.decode_batch_size;
         profile.resolved_from_loaded_model = true;
 
         let mut preparation = StageDescriptor::from_execution_profile(

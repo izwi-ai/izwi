@@ -956,6 +956,15 @@ fn loaded_models_clamp_to_their_family_certified_width() {
         assert_eq!(widest(ModelVariant::Lfm2512BInstructGguf, backend), 8);
         assert_eq!(widest(ModelVariant::Qwen306B, backend), 2);
         assert_eq!(widest(ModelVariant::WhisperLargeV3Turbo, backend), 2);
+        // ASR families certified wider on CUDA keep the portable rows.
+        for variant in [
+            ModelVariant::Qwen3Asr17BGguf,
+            ModelVariant::VibeVoiceAsr,
+            ModelVariant::ParakeetTdt06BV3,
+            ModelVariant::Nemotron35AsrStreaming06B,
+        ] {
+            assert_eq!(widest(variant, backend), 2, "{variant} {backend:?}");
+        }
     }
     assert_eq!(widest(ModelVariant::Qwen3508BGguf, BackendKind::Metal), 8);
     assert_eq!(widest(ModelVariant::Qwen3508BGguf, BackendKind::Cpu), 2);
@@ -964,6 +973,133 @@ fn loaded_models_clamp_to_their_family_certified_width() {
         widest(ModelVariant::WhisperLargeV3Turbo, BackendKind::Cuda),
         8
     );
+}
+
+/// On CUDA with an automatic width (the registry's ASR engine width at the
+/// CUDA ceiling), Qwen3-ASR, VibeVoice-ASR, Parakeet and Nemotron ASR decode
+/// up to 32 rows per step while their encoder preparation and prefill stay
+/// at the engine's eight, so neither workspace scales with the decode; a
+/// load's fitted width narrows only the decode. Every other ASR family keeps
+/// the engine rows.
+#[test]
+fn batched_asr_families_decode_at_the_asr_width_and_prepare_at_the_engine_rows() {
+    let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1)
+        .unwrap()
+        .with_asr_tensor_batch_size(crate::catalog::asr_engine_width(BackendKind::Cuda, 8, true));
+    let sequence_graph = |variant: ModelVariant, fitted: Option<usize>| {
+        let draft = LoadedModelBundleDraft::build_with_asr_decode_width(
+            &registry,
+            ExecutionGroupId::new(47),
+            ModelInstanceId::new(1),
+            variant,
+            BackendKind::Cuda,
+            fitted,
+        )
+        .unwrap();
+        install_test_preparation_seals(&draft, BackendKind::Cuda, 8);
+        draft
+            .execution_contracts(CapabilityKind::Asr)
+            .unwrap()
+            .into_iter()
+            .find(|contract| contract.execution_profile.mode == ExecutionMode::Sequence)
+            .unwrap_or_else(|| panic!("{variant} has a retained sequence graph"))
+    };
+    let stage = |contract: &LoadedExecutionContract, selector| {
+        contract
+            .stages
+            .iter()
+            .find(|stage| stage.selector == selector)
+            .unwrap_or_else(|| panic!("{selector:?} stage"))
+            .clone()
+    };
+    // (variant, preparation rows, prefill rows)
+    for (variant, preparation_rows, prefill_rows) in [
+        (ModelVariant::Qwen3Asr06BGguf, 8, 1),
+        (ModelVariant::Qwen3Asr17BGguf, 8, 1),
+        (ModelVariant::VibeVoiceAsr, 1, 8),
+        (ModelVariant::ParakeetTdt06BV3, 8, 8),
+        (ModelVariant::Nemotron35AsrStreaming06B, 8, 8),
+    ] {
+        for (fitted, decode_rows) in [(None, 32), (Some(32), 32), (Some(16), 16), (Some(8), 8)] {
+            let contract = sequence_graph(variant, fitted);
+            let decode = stage(&contract, StageWorkSelector::SequenceDecode);
+            assert_eq!(decode.batch_mode, NativeBatchMode::Continuous, "{variant}");
+            assert_eq!(decode.max_batch_size, decode_rows, "{variant} {fitted:?}");
+            assert_eq!(decode.max_work_units, decode_rows as u64, "{variant}");
+            if decode.workspace_per_row_bytes > 0 {
+                assert_eq!(
+                    decode.max_workspace_bytes,
+                    decode.workspace_per_row_bytes * decode_rows as u64,
+                    "{variant}"
+                );
+            }
+            assert_eq!(contract.execution_profile.max_batch_size, decode_rows);
+            assert_eq!(
+                stage(&contract, StageWorkSelector::PreSequencePreparation).max_batch_size,
+                preparation_rows,
+                "{variant} {fitted:?}"
+            );
+            assert_eq!(
+                stage(&contract, StageWorkSelector::SequencePrefill).max_batch_size,
+                prefill_rows,
+                "{variant} {fitted:?}"
+            );
+        }
+    }
+    // The encoder batchers form at most the preparation width, with the
+    // per-row budget a batch of eight had.
+    let parakeet = sequence_graph(ModelVariant::ParakeetTdt06BV3, None);
+    let preparation = stage(&parakeet, StageWorkSelector::PreSequencePreparation);
+    assert_eq!(preparation.max_work_units, 8 * 64 * 1024 * 1024);
+    assert_eq!(preparation.max_workspace_bytes, 8 * 4 * 1024 * 1024 * 1024);
+    let prefill = stage(&parakeet, StageWorkSelector::SequencePrefill);
+    assert_eq!(prefill.max_work_units, 8);
+    assert_eq!(prefill.max_workspace_bytes, 8 * 16 * 1024 * 1024);
+    for variant in [
+        ModelVariant::WhisperLargeV3Turbo,
+        ModelVariant::GraniteSpeech412BPlus,
+        ModelVariant::Lfm25Audio15BGguf,
+    ] {
+        assert_eq!(
+            registry.asr_decode_width(variant.family(), BackendKind::Cuda),
+            8,
+            "{variant}"
+        );
+        let draft = LoadedModelBundleDraft::build(
+            &registry,
+            ExecutionGroupId::new(48),
+            ModelInstanceId::new(1),
+            variant,
+            BackendKind::Cuda,
+        )
+        .unwrap();
+        install_test_preparation_seals(&draft, BackendKind::Cuda, 8);
+        let widest = draft
+            .execution_contracts(CapabilityKind::Asr)
+            .unwrap()
+            .iter()
+            .flat_map(|contract| contract.stages.to_vec())
+            .map(|stage| stage.max_batch_size)
+            .max()
+            .unwrap();
+        assert!(widest <= 8, "{variant}: {widest}");
+    }
+    // Nemotron's realtime sessions keep the engine rows beside its wide
+    // offline decode.
+    let nemotron = LoadedModelBundleDraft::build(
+        &registry,
+        ExecutionGroupId::new(49),
+        ModelInstanceId::new(1),
+        ModelVariant::Nemotron35AsrStreaming06B,
+        BackendKind::Cuda,
+    )
+    .unwrap();
+    assert!(nemotron
+        .execution_contracts(CapabilityKind::RealtimeAsr)
+        .unwrap()
+        .iter()
+        .flat_map(|contract| contract.stages.iter())
+        .all(|stage| stage.max_batch_size <= 8));
 }
 
 #[test]
