@@ -238,6 +238,11 @@ impl ParakeetLogMel {
         self.valid_frames
     }
 
+    /// Bytes of the spectrogram's host allocation.
+    pub(super) fn resident_bytes(&self) -> Option<usize> {
+        self.mel.capacity().checked_mul(std::mem::size_of::<f32>())
+    }
+
     /// Normalizes the `columns` slice per feature over its own valid frames,
     /// zeroes its padding frames and uploads it as `[1, n_mels, columns]`.
     /// The full range reproduces NeMo's whole-utterance normalization.

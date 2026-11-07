@@ -83,7 +83,8 @@ use crate::models::architectures::nemotron::asr::{
     NemotronRealtimeStreamEvent, NemotronStreamingState,
 };
 use crate::models::architectures::parakeet::asr::{
-    ParakeetAsrModel, ParakeetAsrTranscriptionOutput, ParakeetPhysicalStateSpec,
+    ParakeetAsrModel, ParakeetAsrTranscriptionOutput, ParakeetHostFeatures,
+    ParakeetPhysicalStateSpec,
 };
 pub(crate) use crate::models::architectures::qwen3::asr::AlignmentUnit;
 use crate::models::architectures::qwen3::asr::{
@@ -1505,6 +1506,21 @@ impl NativeAsrModel {
             Self::WhisperTurbo(model) => model.prepare_window_batch(rows),
             _ => Err(Error::InvalidInput(
                 "Whisper window preparation was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
+    /// Resamples and turns one Parakeet request's audio into its log-mel on
+    /// the host.
+    pub(crate) fn prepare_parakeet_host_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<ParakeetHostFeatures> {
+        match self {
+            Self::Parakeet(model) => model.prepare_host_features(audio, sample_rate),
+            _ => Err(Error::InvalidInput(
+                "Parakeet features were requested from another ASR model".into(),
             )),
         }
     }

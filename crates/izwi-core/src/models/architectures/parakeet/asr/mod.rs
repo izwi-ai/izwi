@@ -268,8 +268,10 @@ fn plan_encoder_windows(
 /// Peak preparation memory beyond the weights and the retained artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ParakeetPreparationBytes {
-    /// Host log-mel pipeline: mono copy, pre-emphasis and padded copies,
-    /// power spectrum and log-mel.
+    /// Host bytes: the log-mel pipeline of a whole request (mono copy,
+    /// pre-emphasis and padded copies, power spectrum and log-mel) in
+    /// [`parakeet_preparation_bytes`]; one window's normalized feature copy
+    /// in a device job's [`parakeet_encode_row_bytes`].
     pub(crate) host_bytes: u64,
     /// One encoder window's peak: the first subsampling convolution and its
     /// ReLU copy over one stem slice, the attention scores and `rel_shift`
@@ -295,8 +297,55 @@ pub(crate) fn parakeet_preparation_bytes(
     samples: usize,
     backend: BackendKind,
 ) -> Result<ParakeetPreparationBytes> {
-    const F32_BYTES: u64 = 4;
     const HOST_BYTES_PER_SAMPLE: u64 = 22;
+    let valid_frames = preprocessor::valid_feature_frames(samples);
+    // The STFT emits one padding frame past the valid ones.
+    let window = subsampled_len_3x(valid_frames + 1).min(EncoderWindowing::V3.frames);
+    let host_bytes = u64::try_from(samples)
+        .ok()
+        .and_then(|samples| samples.checked_mul(HOST_BYTES_PER_SAMPLE))
+        .ok_or_else(|| Error::Overloaded("Parakeet preparation bytes overflowed".into()))?;
+    Ok(ParakeetPreparationBytes {
+        host_bytes,
+        window_bytes: encoder_window_row_bytes(window, 1, backend)?,
+        output_bytes: encoder_output_bytes(subsampled_len_3x(valid_frames), backend)?,
+    })
+}
+
+/// Prices one row's device job in an encoder batch of `rows` rows whose
+/// windows are padded to `padded_frames` encoder frames: its share of the
+/// batch's window peak, its own retained output, and on the host the
+/// normalized feature copy each window uploads. The log-mel pipeline itself
+/// ran on a host worker before the row was admitted.
+pub(crate) fn parakeet_encode_row_bytes(
+    features: &ParakeetHostFeatures,
+    padded_frames: usize,
+    rows: usize,
+    backend: BackendKind,
+) -> Result<ParakeetPreparationBytes> {
+    const F32_BYTES: usize = 4;
+    let columns = features
+        .feature_frames()
+        .min(features.window_frames().saturating_mul(SUBSAMPLING_FACTOR));
+    let host_bytes = EncoderGeometry::V3
+        .mel_bins
+        .checked_mul(columns)
+        .and_then(|elements| elements.checked_mul(F32_BYTES))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| Error::Overloaded("Parakeet preparation bytes overflowed".into()))?;
+    Ok(ParakeetPreparationBytes {
+        host_bytes,
+        window_bytes: encoder_window_row_bytes(padded_frames, rows, backend)?,
+        output_bytes: encoder_output_bytes(features.encoded_len(), backend)?,
+    })
+}
+
+/// One row's share of the peak of an encoder batch of `rows` windows of
+/// `window` frames: the stem runs row by row, so its planes count once per
+/// batch; the attention and layer buffers hold every row. Metal rounds each
+/// whole batch buffer up to a power of two.
+fn encoder_window_row_bytes(window: usize, rows: usize, backend: BackendKind) -> Result<u64> {
+    const F32_BYTES: u64 = 4;
     // About six [T, ff_dim] activations are live inside a layer at once: the
     // feed-forward block's linear, sigmoid and product, plus residual and
     // convolution-module buffers (report 11 sizes them as 98,304·T bytes).
@@ -311,10 +360,7 @@ pub(crate) fn parakeet_preparation_bytes(
         }
     };
     let as_u64 = |value: usize| u64::try_from(value).map_err(|_| overflow());
-    let valid_frames = preprocessor::valid_feature_frames(samples);
-    let encoded_len = as_u64(subsampled_len_3x(valid_frames))?;
-    // The STFT emits one padding frame past the valid ones.
-    let window = as_u64(subsampled_len_3x(valid_frames + 1).min(EncoderWindowing::V3.frames))?;
+    let (window, rows) = (as_u64(window)?, as_u64(rows.max(1))?);
     let (channels, mel_bins) = (
         as_u64(geometry.subsampling_channels)?,
         as_u64(geometry.mel_bins)?,
@@ -337,24 +383,38 @@ pub(crate) fn parakeet_preparation_bytes(
         SUBSAMPLING_SLICE_FRAMES + 2 * SUBSAMPLING_HALO_FRAMES,
     )?);
     let stem_plane = multiply(&[channels, 4 * stem_frames, mel_bins / 2, F32_BYTES])?;
-    let scores = multiply(&[heads, window, window, F32_BYTES])?;
+    let scores = multiply(&[rows, heads, window, window, F32_BYTES])?;
     // q_v·pᵀ, its zero pad and the reshaped copy, each [H, T, 2T].
-    let rel_shift = multiply(&[heads, window, 2 * window, F32_BYTES])?;
-    let activation = multiply(&[window, ff_dim, F32_BYTES])?;
-    let window_bytes = [
+    let rel_shift = multiply(&[rows, heads, window, 2 * window, F32_BYTES])?;
+    let activation = multiply(&[rows, window, ff_dim, F32_BYTES])?;
+    let mut terms = vec![
         multiply(&[3, round(stem_plane)?])?,
         round(scores)?,
         multiply(&[3, round(rel_shift)?])?,
         multiply(&[LAYER_ACTIVATIONS, round(activation)?])?,
-    ]
-    .into_iter()
-    .try_fold(0u64, |total, bytes| total.checked_add(bytes))
-    .ok_or_else(overflow)?;
-    Ok(ParakeetPreparationBytes {
-        host_bytes: multiply(&[as_u64(samples)?, HOST_BYTES_PER_SAMPLE])?,
-        window_bytes,
-        output_bytes: round(multiply(&[encoded_len, dim, F32_BYTES])?)?,
-    })
+    ];
+    if rows > 1 {
+        // The positional projection pᵀ, copied out for every row.
+        terms.push(round(multiply(&[rows, dim, 2 * window, F32_BYTES])?)?);
+    }
+    let batch_bytes = terms
+        .into_iter()
+        .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(overflow)?;
+    Ok(batch_bytes.div_ceil(rows))
+}
+
+/// The retained `[1, E, D]` encoder output.
+fn encoder_output_bytes(encoded_len: usize, backend: BackendKind) -> Result<u64> {
+    let bytes = encoded_len
+        .checked_mul(EncoderGeometry::V3.dim)
+        .and_then(|elements| elements.checked_mul(4))
+        .and_then(|bytes| u64::try_from(bytes).ok());
+    match (bytes, backend) {
+        (Some(bytes), BackendKind::Metal) => bytes.checked_next_power_of_two(),
+        (bytes, _) => bytes,
+    }
+    .ok_or_else(|| Error::Overloaded("Parakeet preparation bytes overflowed".into()))
 }
 
 pub struct ParakeetAsrTranscriptionOutput {
@@ -390,6 +450,78 @@ impl ParakeetPreparedEncoderArtifact {
             Error::Overloaded("Parakeet encoder artifact storage accounting overflowed".into())
         })?;
         Ok(accounting.bytes())
+    }
+}
+
+/// One request's encoder input, computed on a host worker: the 16 kHz
+/// log-mel of its audio, before per-window normalization.
+pub(crate) struct ParakeetHostFeatures {
+    log_mel: ParakeetLogMel,
+    input_samples: usize,
+    input_sample_rate: u32,
+    resampled_samples: usize,
+    log_mel_ms: f64,
+    /// Frames of one encoder window.
+    window_frames: usize,
+}
+
+impl ParakeetHostFeatures {
+    /// Encoder frames (E) these features encode to.
+    pub(crate) fn encoded_len(&self) -> usize {
+        subsampled_len_3x(self.log_mel.valid_frames())
+    }
+
+    /// Whether the audio fits one encoder window, the only rows a batch of
+    /// more than one request holds.
+    pub(crate) fn single_window(&self) -> bool {
+        self.encoded_len() <= self.window_frames
+    }
+
+    /// Encoder frames attention spans at once: the whole input when it fits
+    /// one window, else one window.
+    pub(crate) fn window_frames(&self) -> usize {
+        self.encoded_len().min(self.window_frames)
+    }
+
+    /// The input sample count, at the request's own rate.
+    pub(crate) const fn input_samples(&self) -> usize {
+        self.input_samples
+    }
+
+    /// Log-mel columns, including the STFT padding column.
+    pub(crate) const fn feature_frames(&self) -> usize {
+        self.log_mel.frames()
+    }
+
+    /// Host bytes the features hold until the encode drops them.
+    pub(crate) fn host_bytes(&self) -> Result<u64> {
+        self.log_mel
+            .resident_bytes()
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| Error::Overloaded("Parakeet log-mel bytes overflowed".into()))
+    }
+
+    fn artifact(
+        &self,
+        encoded: Tensor,
+        encoder_windows: usize,
+        language: Option<&str>,
+        windowing: EncoderWindowing,
+        encode_ms: f64,
+    ) -> ParakeetPreparedEncoderArtifact {
+        ParakeetPreparedEncoderArtifact {
+            encoded,
+            encoded_len: self.encoded_len(),
+            input_samples: self.input_samples,
+            input_sample_rate: self.input_sample_rate,
+            resampled_samples: self.resampled_samples,
+            feature_frames: self.log_mel.valid_frames(),
+            language: language.map(ToOwned::to_owned),
+            windowing,
+            encoder_windows,
+            log_mel_ms: self.log_mel_ms,
+            encode_ms,
+        }
     }
 }
 
@@ -675,6 +807,7 @@ impl ParakeetAsrModel {
 
     /// Encodes the audio into the artifact the retained decode reads.
     /// `checkpoint` runs between encoder windows; its error aborts the encode.
+    #[cfg(test)]
     pub(crate) fn prepare_retained_encoder(
         &self,
         audio: &[f32],
@@ -682,6 +815,17 @@ impl ParakeetAsrModel {
         language: Option<&str>,
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<ParakeetPreparedEncoderArtifact> {
+        let features = self.prepare_host_features(audio, sample_rate)?;
+        self.encode_host_features(&features, language, checkpoint)
+    }
+
+    /// Resamples the audio to 16 kHz and computes its log-mel on the host,
+    /// so a request's device job runs only the encoder.
+    pub(crate) fn prepare_host_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<ParakeetHostFeatures> {
         if audio.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".into()));
         }
@@ -700,30 +844,47 @@ impl ParakeetAsrModel {
         let log_mel = self.preprocessor.compute_log_mel(&mono)?;
         drop(mono);
         let log_mel_ms = elapsed_ms(log_mel_started);
-        let encode_started = Instant::now();
-        let encoded = self.encode_log_mel(&log_mel, &mut ParakeetTimings::default(), checkpoint)?;
-        let encode_ms = elapsed_ms(encode_started);
+        let encoded_len = subsampled_len_3x(log_mel.valid_frames());
         // Preparation sized the decode budget from the sample count alone.
         let budgeted_len = parakeet_encoded_len_for_samples(audio.len(), sample_rate);
-        if encoded.encoded_len != budgeted_len {
+        if encoded_len != budgeted_len {
             return Err(Error::InferenceError(format!(
-                "Parakeet encoder produced {} frames but its decode budget assumed {budgeted_len}",
-                encoded.encoded_len
+                "Parakeet encoder produced {encoded_len} frames but its decode budget assumed {budgeted_len}"
             )));
         }
-        Ok(ParakeetPreparedEncoderArtifact {
-            encoded: deep_copy_tensor_storage(&encoded.encoded)?,
-            encoded_len: encoded.encoded_len,
+        Ok(ParakeetHostFeatures {
+            log_mel,
             input_samples: audio.len(),
             input_sample_rate: sample_rate,
             resampled_samples,
-            feature_frames: log_mel.valid_frames(),
-            language: language.map(ToOwned::to_owned),
-            windowing: self.encoder_windowing,
-            encoder_windows: encoded.windows,
             log_mel_ms,
-            encode_ms,
+            window_frames: self.encoder_windowing.frames,
         })
+    }
+
+    /// Encodes one request's host features into the artifact the retained
+    /// decode reads, window by window. `checkpoint` runs before every
+    /// window; its error aborts the encode.
+    pub(crate) fn encode_host_features(
+        &self,
+        features: &ParakeetHostFeatures,
+        language: Option<&str>,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<ParakeetPreparedEncoderArtifact> {
+        let encode_started = Instant::now();
+        let encoded = self.encode_log_mel(
+            &features.log_mel,
+            &mut ParakeetTimings::default(),
+            checkpoint,
+        )?;
+        let encode_ms = elapsed_ms(encode_started);
+        Ok(features.artifact(
+            deep_copy_tensor_storage(&encoded.encoded)?,
+            encoded.windows,
+            language,
+            self.encoder_windowing,
+            encode_ms,
+        ))
     }
 
     /// Runs the windowed encoder over a host log-mel, normalizing each
@@ -2910,12 +3071,12 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        build_rel_positional_embedding, parakeet_encoded_len_for_samples,
-        parakeet_max_emittable_tokens, parakeet_preparation_bytes,
-        parakeet_tensor_is_f16_projection, plan_encoder_windows, subsampled_len_3x,
-        tdt_word_timestamps, EncoderGeometry, EncoderWindow, EncoderWindowing, Joint, LstmCell,
-        ParakeetAsrModel, ParakeetDecoder, ParakeetEncoded, ParakeetEncoder, ParakeetLogMel,
-        ParakeetNetwork, ParakeetPreparedEncoderArtifact, ParakeetPreprocessor,
+        build_rel_positional_embedding, parakeet_encode_row_bytes,
+        parakeet_encoded_len_for_samples, parakeet_max_emittable_tokens,
+        parakeet_preparation_bytes, parakeet_tensor_is_f16_projection, plan_encoder_windows,
+        subsampled_len_3x, tdt_word_timestamps, EncoderGeometry, EncoderWindow, EncoderWindowing,
+        Joint, LstmCell, ParakeetAsrModel, ParakeetDecoder, ParakeetEncoded, ParakeetEncoder,
+        ParakeetLogMel, ParakeetNetwork, ParakeetPreparedEncoderArtifact, ParakeetPreprocessor,
         ParakeetRetainedDecodeBatchRow, ParakeetRetainedDecodeStep, ParakeetTimings, Predictor,
         TdtTokenFrame, DEFAULT_MAX_SYMBOLS, PRED_HIDDEN,
     };
@@ -3970,6 +4131,47 @@ mod tests {
         for samples in [16_000, 7 * minute + 4_321, 60 * minute] {
             assert!(total(samples, BackendKind::Metal) >= total(samples, BackendKind::Cpu));
         }
+    }
+
+    /// The host worker computes the log-mel; the device job then holds one
+    /// window's normalized copy instead of the whole log-mel pipeline.
+    #[test]
+    fn host_features_price_the_log_mel_and_one_window_upload() {
+        let device = Device::Cpu;
+        let model = forced_label_model(&device);
+        // 3 s at 8 kHz: 300 valid feature frames, 38 encoder frames.
+        let audio = XorShift(17).values(24_000, 0.1, 0.0);
+        let features = model.prepare_host_features(&audio, 8_000).unwrap();
+        assert_eq!(features.encoded_len(), 38);
+        assert_eq!(features.feature_frames(), 301);
+        assert_eq!(features.input_samples(), 24_000);
+        assert!(features.single_window());
+        assert_eq!(features.window_frames(), 38);
+        assert!(features.host_bytes().unwrap() >= 128 * 301 * 4);
+
+        let artifact = model
+            .encode_host_features(&features, Some("en"), &|| Ok(()))
+            .unwrap();
+        let reference = model
+            .prepare_retained_encoder(&audio, 8_000, Some("en"), &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            artifact.encoded.to_vec3::<f32>().unwrap(),
+            reference.encoded.to_vec3::<f32>().unwrap()
+        );
+        assert_eq!(artifact.feature_frames, 300);
+        assert_eq!(artifact.resampled_samples, 48_000);
+
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let solo = parakeet_preparation_bytes(48_000, backend).unwrap();
+            let device_job = parakeet_encode_row_bytes(&features, 38, 1, backend).unwrap();
+            assert_eq!(device_job.host_bytes, 128 * 301 * 4);
+            assert!(device_job.window_bytes <= solo.window_bytes);
+            assert_eq!(device_job.output_bytes, solo.output_bytes);
+        }
+        // An empty or rate-less input never reaches the device.
+        assert!(model.prepare_host_features(&[], 16_000).is_err());
+        assert!(model.prepare_host_features(&audio, 0).is_err());
     }
 
     /// The pre-change per-head argmax: one scalar readback per head.

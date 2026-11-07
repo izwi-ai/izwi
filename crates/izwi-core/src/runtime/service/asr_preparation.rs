@@ -1448,7 +1448,8 @@ impl RuntimeService {
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
         )?;
-        let prepared = self
+        let model_for_features = model.clone();
+        let (prepared, features) = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
@@ -1460,14 +1461,23 @@ impl RuntimeService {
                         sample_rate,
                         max_symbols,
                     )?;
+                // The resample and log-mel run here, on a host worker, so the
+                // device job runs only the encoder.
+                let features =
+                    model_for_features.prepare_parakeet_host_features(&samples, sample_rate)?;
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
                 install_parakeet_decode_budget(&mut request, max_emittable_tokens)?;
-                Ok(request)
+                Ok((request, features))
             })
             .await?;
         let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
             .map_err(|_| Error::Overloaded("Parakeet retained input exceeds u64".into()))?;
-        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        // The log-mel features are held beside the request until the encode
+        // drops them.
+        let prepared_host_bytes = retained_host_bytes
+            .checked_add(features.host_bytes()?)
+            .ok_or_else(|| Error::Overloaded("Parakeet prepared host bytes overflowed".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
         let (samples, sample_rate) = prepared
             .prepared_asr_audio_for_executor()?
             .ok_or_else(|| Error::InferenceError("Parakeet decoded audio was lost".into()))?;
@@ -1495,10 +1505,12 @@ impl RuntimeService {
             .and_then(|frames| frames.checked_mul(1024 * 16))
             .ok_or_else(|| Error::Overloaded("Parakeet preparation geometry overflowed".into()))?;
         // Windowed encoding caps the quadratic attention terms at one window;
-        // only the host features and the stitched output grow with length.
+        // only the stitched output grows with length.
         let preparation_bytes =
-            crate::models::architectures::parakeet::asr::parakeet_preparation_bytes(
-                resampled,
+            crate::models::architectures::parakeet::asr::parakeet_encode_row_bytes(
+                &features,
+                features.window_frames(),
+                1,
                 self.backend_router.context().backend_kind,
             )?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
@@ -1510,7 +1522,7 @@ impl RuntimeService {
             deadline: prepared.deadline,
             resources: asr_encoder_retained_resources(
                 self.backend_router.context().backend_kind,
-                retained_host_bytes,
+                prepared_host_bytes,
                 retained_device_ceiling,
             )?,
         };
@@ -1519,7 +1531,7 @@ impl RuntimeService {
             .admit_observed_from_preparation(
                 bridge,
                 prep_spec,
-                JobResourceObservation::host(retained_host_bytes),
+                JobResourceObservation::host(prepared_host_bytes),
             )
             .await
         {
@@ -1583,9 +1595,8 @@ impl RuntimeService {
                     }
                     Ok(())
                 };
-                let artifact = match model.prepare_retained_encoder(
-                    samples.as_ref(),
-                    sample_rate,
+                let artifact = match model.encode_host_features(
+                    &features,
                     language.as_deref(),
                     &checkpoint,
                 ) {
