@@ -972,6 +972,13 @@ impl VibeVoiceAsrModel {
         ))
     }
 
+    /// Tokens the legacy route prefills per decoder call: the retained
+    /// route's largest prompt, so a long file's prefill activations are those
+    /// of one retained prompt, not of the whole file.
+    fn legacy_prefill_span_tokens(&self) -> Result<usize> {
+        self.retained_prompt_token_bound()
+    }
+
     pub(crate) fn continuous_decode_workspace_per_row_bytes(&self) -> Result<u64> {
         u64::try_from(self.language_model.hidden_size())
             .ok()
@@ -1885,6 +1892,7 @@ impl VibeVoiceAsrModel {
                 semantic.typed_mut::<InvocationTensorLease>()?,
             )?
         };
+        drop(speech);
         let physical_cache = leases
             .lease_mut(crate::models::architectures::vibevoice::VIBEVOICE_ASR_DECODER_DOMAIN)?
             .paged_cache_mut()?;
@@ -1912,6 +1920,7 @@ impl VibeVoiceAsrModel {
             prompt.acoustic_input_range.clone(),
             &speech_features.to_dtype(input_embeds.dtype())?,
         )?;
+        drop(speech_features);
 
         if physical_cache.context_len() != 0 {
             return Err(Error::InvalidInput(
@@ -1921,9 +1930,13 @@ impl VibeVoiceAsrModel {
         let decode_cache_dense_max_tokens = 0;
         let cuda_device_argmax = self.device.kind.is_cuda();
         let prefill_started = Instant::now();
-        let logits = self
-            .language_model
-            .forward_managed_last_logits_with_embeds(&input_embeds, 0, physical_cache, None)?;
+        let prefill_span = self.legacy_prefill_span_tokens()?;
+        let logits = prefill_managed_in_spans(
+            &self.language_model,
+            &input_embeds,
+            physical_cache,
+            prefill_span,
+        )?;
         let prefill_ms = elapsed_ms(prefill_started);
         let mut next = argmax_last_logits(&logits, cuda_device_argmax)?;
         let mut generated = Vec::new();
@@ -2046,6 +2059,7 @@ impl VibeVoiceAsrModel {
                     "cuda_dense_decode_cache": decode_cache_dense_max_tokens > 0,
                     "dense_decode_max_tokens": decode_cache_dense_max_tokens,
                     "cuda_device_argmax": cuda_device_argmax,
+                    "prefill_span_tokens": prefill_span,
                 },
                 "timings_ms": {
                     "preprocess": preprocess_ms,
@@ -2393,6 +2407,40 @@ fn take_vibevoice_quantum_argmax(output: &mut Option<Tensor>, on_device: bool) -
         Error::InferenceError("VibeVoice ASR decode quantum has no model output".into())
     })?;
     argmax_last_logits(&output, on_device)
+}
+
+/// Prefill `embeds` (`[1, tokens, hidden]`) into the empty `cache` in
+/// decoder calls of at most `span` tokens and return the last position's
+/// logits, as one call over every token would. Each call's activations cover
+/// its span alone; the spans before it are only committed K/V.
+fn prefill_managed_in_spans(
+    model: &Qwen3Model,
+    embeds: &Tensor,
+    cache: &mut PhysicalPagedKvCache,
+    span: usize,
+) -> Result<Tensor> {
+    let tokens = embeds.dim(1)?;
+    if tokens == 0 || span == 0 || cache.context_len() != 0 {
+        return Err(Error::InvalidInput(format!(
+            "VibeVoice ASR span prefill of {tokens} tokens in spans of {span} needs an empty cache"
+        )));
+    }
+    let mut start = 0;
+    while tokens - start > span {
+        model.forward_managed_prefill_only_with_embeds(
+            &embeds.narrow(1, start, span)?,
+            start,
+            cache,
+            None,
+        )?;
+        start += span;
+    }
+    model.forward_managed_last_logits_with_embeds(
+        &embeds.narrow(1, start, tokens - start)?,
+        start,
+        cache,
+        None,
+    )
 }
 
 fn forward_vibevoice_pending_decode_batch(
@@ -3578,6 +3626,40 @@ mod tests {
             &full_logits.i((.., 4..5, ..)).unwrap(),
             &split_logits.i((.., 2..3, ..)).unwrap(),
         );
+    }
+
+    /// The legacy route's span prefill samples the same next token and
+    /// commits the same K/V as one call over the whole prompt, whether the
+    /// spans divide the prompt, leave a ragged last span or cover it whole.
+    #[test]
+    fn span_prefill_matches_one_shot_prefill_and_the_next_decode() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model_for_test(&device);
+        let ids = Tensor::from_vec(vec![0u32, 1, 2, 3, 4, 5, 6], (1, 7), &device).unwrap();
+        let embeddings = model.embeddings(&ids).unwrap();
+        let next = Tensor::from_vec(vec![7u32], (1, 1), &device).unwrap();
+        let (arena, bindings) = test_managed_arena();
+        let mut one_shot = test_managed_cache(arena, bindings, 0, 0);
+        let expected = model
+            .forward_managed_last_logits_with_embeds(&embeddings, 0, &mut one_shot, None)
+            .unwrap();
+        let expected_decode = model.forward_managed(&next, 7, &mut one_shot).unwrap();
+
+        for span in [1, 2, 3, 7, 64] {
+            let (arena, bindings) = test_managed_arena();
+            let mut cache = test_managed_cache(arena, bindings, 0, 0);
+            let logits = prefill_managed_in_spans(&model, &embeddings, &mut cache, span).unwrap();
+            assert_eq!(cache.context_len(), 7, "span {span}");
+            assert_eq!(logits.dims(), expected.dims(), "span {span}");
+            assert_tensor_close(&logits, &expected);
+            let decode = model.forward_managed(&next, 7, &mut cache).unwrap();
+            assert_tensor_close(&decode, &expected_decode);
+        }
+
+        let (arena, bindings) = test_managed_arena();
+        let mut cache = test_managed_cache(arena, bindings, 0, 0);
+        assert!(prefill_managed_in_spans(&model, &embeddings, &mut cache, 0).is_err());
+        assert_eq!(cache.context_len(), 0);
     }
 
     #[test]
