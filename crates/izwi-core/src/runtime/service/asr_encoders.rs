@@ -1,6 +1,6 @@
 //! Cross-request ASR encoder batchers: Qwen3-ASR, Whisper, Granite Speech,
-//! VibeVoice and Parakeet encoder work queued by request preparation and run
-//! as one batch.
+//! VibeVoice, Parakeet and Nemotron encoder work queued by request
+//! preparation and run as one batch.
 
 use super::*;
 
@@ -86,6 +86,40 @@ pub(super) struct ParakeetEncoderPending {
     pub(super) retained_device_ceiling: u64,
     pub(super) cancellation: PreparationCancellation,
     pub(super) response: Option<oneshot::Sender<ParakeetEncoderOutcome>>,
+}
+
+pub(super) type NemotronEncoderOutcome =
+    PreparationRowOutcome<Arc<NemotronPreparedEncoderArtifact>>;
+
+pub(super) struct NemotronEncoderPending {
+    pub(super) job: JobLease,
+    pub(super) contract: LoadedExecutionContract,
+    pub(super) model: AsrModelLease,
+    /// The model's catalog name, for the batch-width metric.
+    pub(super) model_label: &'static str,
+    pub(super) backend: BackendKind,
+    /// The host log-mel and prompt, dropped once the encode has read them.
+    pub(super) features: NemotronHostFeatures,
+    /// Host bytes the request keeps after the encode: its input, not the
+    /// features.
+    pub(super) retained_host_bytes: u64,
+    /// The admitted ceiling of the row's encoder projection.
+    pub(super) retained_device_ceiling: u64,
+    pub(super) cancellation: PreparationCancellation,
+    pub(super) response: Option<oneshot::Sender<NemotronEncoderOutcome>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct NemotronEncoderQueueKey {
+    pub(super) binding: AdapterBindingKey,
+    /// Encoder frames rounded up to a power of two, so padding a row to
+    /// its batch's longest row adds less than its own length.
+    pub(super) encoded_len_bucket: usize,
+}
+
+pub(super) struct NemotronEncoderBatcher {
+    pub(super) coordinator: Arc<InferenceCoordinator>,
+    pub(super) formation: EncoderBatchFormation<NemotronEncoderQueueKey, NemotronEncoderPending>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -594,6 +628,306 @@ fn parakeet_preparation_row_cost(
         samples,
         useful,
         retained_artifact_resources(backend, bytes.host_bytes, bytes.device_bytes()?)?,
+    );
+    Ok((cost, materialized))
+}
+
+/// Whether concurrent Nemotron clips encode as one batch
+/// (`IZWI_NEMOTRON_ASR_ENCODER_BATCHING`, on by default); off, every request
+/// encodes alone, as before batching.
+fn nemotron_encoder_batching_enabled() -> bool {
+    static ENABLED: crate::env::ReadOnce<bool> = crate::env::ReadOnce::new(|| {
+        crate::env::flag_or("IZWI_NEMOTRON_ASR_ENCODER_BATCHING", true)
+    });
+    ENABLED.get()
+}
+
+impl NemotronEncoderBatcher {
+    pub(super) fn new(coordinator: Arc<InferenceCoordinator>) -> Self {
+        Self {
+            coordinator,
+            formation: EncoderBatchFormation::new(),
+        }
+    }
+
+    /// The queue a row joins: its binding and power-of-two length bucket,
+    /// or `None` when it encodes alone (batching off, or a width-1 stage).
+    fn queue_key(
+        binding: &crate::engine::ExecutionAdapterBinding,
+        stage: &crate::engine::StageDescriptor,
+        features: &NemotronHostFeatures,
+        batching: bool,
+    ) -> Result<Option<NemotronEncoderQueueKey>> {
+        if stage.max_batch_size <= 1 || !batching {
+            return Ok(None);
+        }
+        Ok(Some(NemotronEncoderQueueKey {
+            binding: binding.key_for_stage(stage.id)?,
+            encoded_len_bucket: features
+                .encoded_len()
+                .checked_next_power_of_two()
+                .ok_or_else(|| Error::Overloaded("Nemotron length bucket overflow".into()))?,
+        }))
+    }
+
+    /// Encodes one request's features: a row waits for its length bucket's
+    /// running batch and joins the next one; with batching off, it runs as
+    /// a batch of its own.
+    pub(super) async fn submit(
+        self: &Arc<Self>,
+        mut pending: NemotronEncoderPending,
+    ) -> Result<NemotronEncoderOutcome> {
+        let work = WorkUnit::PreSequencePreparation {
+            kind: NEMOTRON_ENCODER_STAGE.into(),
+        };
+        let binding = pending.contract.adapter_binding()?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.name != NEMOTRON_ENCODER_STAGE {
+            return Err(Error::InvalidInput(format!(
+                "Nemotron loaded contract did not select {NEMOTRON_ENCODER_STAGE}"
+            )));
+        }
+        let max_width = stage.max_batch_size.max(1);
+        let key = Self::queue_key(
+            &binding,
+            stage,
+            &pending.features,
+            nemotron_encoder_batching_enabled(),
+        )?;
+        let cancellation = pending.cancellation.clone();
+        let (sender, receiver) = oneshot::channel();
+        pending.response = Some(sender);
+        let batcher = self.clone();
+        match key {
+            Some(key) => {
+                if self.formation.push(key.clone(), pending) {
+                    tokio::spawn(async move {
+                        batcher
+                            .formation
+                            .run(&key, max_width, |batch| batcher.run_batch(batch))
+                            .await;
+                    });
+                }
+            }
+            None => {
+                tokio::spawn(async move { batcher.run_batch(vec![pending]).await });
+            }
+        }
+        let mut guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let outcome = receiver.await.map_err(|_| {
+            Error::InferenceError("Nemotron encoder batch worker stopped before reply".into())
+        })?;
+        guard.armed = false;
+        Ok(outcome)
+    }
+
+    /// Runs one formed batch: rows cancelled or expired while they waited
+    /// answer at once, and the rest are priced at the batch's padded
+    /// length and encoded in one physical call.
+    async fn run_batch(&self, rows: Vec<NemotronEncoderPending>) {
+        let now = Instant::now();
+        let rows = rows
+            .into_iter()
+            .filter_map(|mut row| {
+                let terminal = if row.cancellation.is_cancelled() {
+                    PreparationRowOutcome::Cancelled
+                } else if row
+                    .job
+                    .spec
+                    .deadline
+                    .is_some_and(|deadline| deadline <= now)
+                {
+                    PreparationRowOutcome::TimedOut
+                } else {
+                    return Some(row);
+                };
+                if let Some(response) = row.response.take() {
+                    let _ = response.send(terminal);
+                }
+                None
+            })
+            .collect::<Vec<_>>();
+        let Some(first) = rows.first() else {
+            return;
+        };
+        let contract = first.contract.clone();
+        let model = first.model.clone();
+        let model_label = first.model_label;
+        let width = rows.len();
+        let padded_frames = rows
+            .iter()
+            .map(|row| row.features.encoded_len())
+            .max()
+            .unwrap_or(0);
+        let work = WorkUnit::PreSequencePreparation {
+            kind: NEMOTRON_ENCODER_STAGE.into(),
+        };
+        let mut sealed = Vec::with_capacity(width);
+        for row in &rows {
+            let seal =
+                nemotron_preparation_row_cost(&row.features, padded_frames, width, row.backend)
+                    .and_then(|(cost, materialized)| {
+                        self.coordinator.seal_preparation_row(
+                            row.job.clone(),
+                            &row.contract,
+                            &work,
+                            cost,
+                            materialized,
+                            row.cancellation.clone(),
+                        )
+                    });
+            match seal {
+                Ok(seal) => sealed.push(seal),
+                Err(error) => {
+                    Self::fail(rows, &error);
+                    return;
+                }
+            }
+        }
+        // The sealed rows now own the only job leases the physical call
+        // uses; the queued originals drop here, before committed rows
+        // become admission bridges.
+        let mut senders = Vec::with_capacity(width);
+        let mut inputs = Vec::with_capacity(width);
+        for mut row in rows {
+            senders.push(
+                row.response
+                    .take()
+                    .expect("queued Nemotron row has a response channel"),
+            );
+            inputs.push(NemotronEncoderInput {
+                request_id: row.job.spec.request_id.clone(),
+                deadline: row.job.spec.deadline,
+                features: row.features,
+                cancellation: row.cancellation,
+                retained_host_bytes: row.retained_host_bytes,
+                retained_device_ceiling: row.retained_device_ceiling,
+            });
+        }
+        let result = self
+            .coordinator
+            .run_loaded_native_preparation_batch(sealed, contract, work, move |live| {
+                crate::engine::metrics::record_asr_preparation_batch_rows(model_label, live.len());
+                // Checked before the encode, so a disconnected or expired
+                // request fails alone.
+                let checkpoints = live
+                    .iter()
+                    .map(|index| {
+                        let input = &inputs[*index];
+                        move || {
+                            if input.cancellation.is_cancelled() {
+                                return Err(Error::Cancelled(input.request_id.clone()));
+                            }
+                            if input
+                                .deadline
+                                .is_some_and(|deadline| Instant::now() >= deadline)
+                            {
+                                return Err(Error::Timeout(input.request_id.clone()));
+                            }
+                            Ok(())
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let rows = live
+                    .iter()
+                    .zip(&checkpoints)
+                    .map(|(index, checkpoint)| NemotronEncoderBatchRow {
+                        features: &inputs[*index].features,
+                        checkpoint,
+                    })
+                    .collect::<Vec<_>>();
+                let prepared = model.prepare_nemotron_encoder_batch(&rows)?;
+                if prepared.len() != live.len() {
+                    return Err(Error::InferenceError(
+                        "Nemotron encoder batch returned the wrong row count".into(),
+                    ));
+                }
+                Ok(prepared
+                    .into_iter()
+                    .zip(live)
+                    .map(|(artifact, index)| {
+                        let artifact = Arc::new(artifact?);
+                        let accelerator_bytes = artifact.resident_tensor_bytes()?;
+                        let ceiling = inputs[*index].retained_device_ceiling;
+                        if accelerator_bytes > ceiling {
+                            return Err(Error::InferenceError(format!(
+                                "Nemotron encoder artifact exceeded its admitted ceiling: {accelerator_bytes} > {ceiling}"
+                            )));
+                        }
+                        Ok(PreparationArtifact {
+                            retained: JobResourceObservation {
+                                host_bytes: inputs[*index].retained_host_bytes,
+                                accelerator_bytes,
+                            },
+                            value: artifact,
+                        })
+                    })
+                    .collect::<Vec<_>>())
+            })
+            .await;
+        match result {
+            Ok(outcomes) => {
+                for (sender, outcome) in senders.into_iter().zip(outcomes) {
+                    let _ = sender.send(outcome);
+                }
+            }
+            Err(error) => {
+                for sender in senders {
+                    let _ = sender.send(PreparationRowOutcome::Failed(error.replicate()));
+                }
+            }
+        }
+    }
+
+    fn fail(rows: Vec<NemotronEncoderPending>, error: &Error) {
+        for row in rows {
+            if let Some(response) = row.response {
+                let _ = response.send(PreparationRowOutcome::Failed(error.replicate()));
+            }
+        }
+    }
+}
+
+/// A sealed Nemotron row's input to the physical call.
+struct NemotronEncoderInput {
+    request_id: String,
+    deadline: Option<Instant>,
+    features: NemotronHostFeatures,
+    cancellation: PreparationCancellation,
+    retained_host_bytes: u64,
+    retained_device_ceiling: u64,
+}
+
+/// Prices one Nemotron row in an encoder batch of `rows` rows padded to
+/// `padded_frames` encoder frames: its input samples as work, its padded
+/// encoder output as materialized tensor work, its share of the batch's
+/// device peak and its retained projection, and on the host the feature
+/// copy its upload reads.
+fn nemotron_preparation_row_cost(
+    features: &NemotronHostFeatures,
+    padded_frames: usize,
+    rows: usize,
+    backend: BackendKind,
+) -> Result<(crate::engine::WorkCost, u64)> {
+    use crate::models::architectures::nemotron::asr::{
+        nemotron_encoder_batch_row_bytes, nemotron_encoder_projection_bytes,
+        nemotron_encoder_row_elements,
+    };
+    let metal = backend == BackendKind::Metal;
+    let encoded_len = features.encoded_len();
+    let device_bytes = nemotron_encoder_batch_row_bytes(padded_frames, rows, metal)?
+        .checked_add(nemotron_encoder_projection_bytes(encoded_len, metal)?)
+        .ok_or_else(|| Error::Overloaded("Nemotron preparation bytes overflowed".into()))?;
+    let (useful, materialized) = nemotron_encoder_row_elements(encoded_len, padded_frames)?;
+    let samples = u64::try_from(features.input_samples())
+        .map_err(|_| Error::Overloaded("Nemotron sample work exceeds u64".into()))?;
+    let cost = crate::engine::WorkCost::with_workspace(
+        samples,
+        useful,
+        retained_artifact_resources(backend, features.host_bytes()?, device_bytes)?,
     );
     Ok((cost, materialized))
 }
@@ -1531,5 +1865,94 @@ mod tests {
         assert!(runner.await.is_err());
         assert_eq!(dropped.load(Ordering::SeqCst), 3);
         assert!(formation.push(3, Row(dropped.clone())));
+    }
+
+    /// Concurrent Nemotron clips of one power-of-two length bucket share a
+    /// queue and form one batch of up to the stage's width; a longer clip
+    /// queues apart, and with batching off (or a width-1 stage) every clip
+    /// encodes alone.
+    #[tokio::test]
+    async fn concurrent_nemotron_clips_of_one_bucket_form_one_batch() {
+        use crate::catalog::ModelVariant;
+        use crate::engine::{ExecutionGroupId, ModelInstanceId, WorkUnit};
+        use crate::models::architectures::nemotron::asr::{
+            NemotronHostFeatures, NEMOTRON_ENCODER_STAGE,
+        };
+        use crate::runtime::{CapabilityKind, LoadedModelBundleDraft, RuntimeAdapterRegistry};
+
+        let draft = LoadedModelBundleDraft::build(
+            &RuntimeAdapterRegistry::built_in_with_execution_limits(4, 4).unwrap(),
+            ExecutionGroupId::new(3),
+            ModelInstanceId::new(9),
+            ModelVariant::Nemotron35AsrStreaming06B,
+            crate::backends::BackendKind::Cpu,
+        )
+        .unwrap();
+        let contract = draft
+            .execution_contracts(CapabilityKind::Asr)
+            .unwrap()
+            .into_iter()
+            .find(|contract| contract.stages.len() == 3)
+            .expect("the retained-row graph");
+        let binding = contract.adapter_binding().unwrap();
+        let stage = binding
+            .stage_for_work(&WorkUnit::PreSequencePreparation {
+                kind: NEMOTRON_ENCODER_STAGE.into(),
+            })
+            .unwrap();
+        assert_eq!(stage.max_batch_size, 4);
+        // 10, 8 and 6 s clips (126, 101 and 76 encoder frames) bucket to
+        // 128; a 20 s clip (251 frames) to 256.
+        let features =
+            [1_000usize, 800, 600, 2_000, 900].map(NemotronHostFeatures::silent_for_test);
+        let keys = features
+            .iter()
+            .map(|features| {
+                super::NemotronEncoderBatcher::queue_key(&binding, stage, features, true)
+                    .unwrap()
+                    .expect("batched key")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys.iter()
+                .map(|key| key.encoded_len_bucket)
+                .collect::<Vec<_>>(),
+            [128, 128, 128, 256, 128]
+        );
+        assert!(
+            super::NemotronEncoderBatcher::queue_key(&binding, stage, &features[0], false)
+                .unwrap()
+                .is_none()
+        );
+        let mut solo_stage = stage.clone();
+        solo_stage.max_batch_size = 1;
+        assert!(super::NemotronEncoderBatcher::queue_key(
+            &binding,
+            &solo_stage,
+            &features[0],
+            true
+        )
+        .unwrap()
+        .is_none());
+
+        let formation = Arc::new(EncoderBatchFormation::new());
+        let mut runners = Vec::new();
+        for (row, key) in keys.iter().enumerate() {
+            if formation.push(key.clone(), row) {
+                runners.push(key.clone());
+            }
+        }
+        assert_eq!(runners.len(), 2, "one runner per key");
+        let batches = Batches::default();
+        for key in runners {
+            let recorded = batches.clone();
+            formation
+                .run(&key, stage.max_batch_size, |batch| {
+                    recorded.lock().unwrap().push(batch);
+                    async {}
+                })
+                .await;
+        }
+        assert_eq!(*batches.lock().unwrap(), vec![vec![0, 1, 2, 4], vec![3]]);
     }
 }

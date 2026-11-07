@@ -611,14 +611,38 @@ impl ModelLifecycleController {
                         .collect::<Vec<_>>();
                     let physical_spec =
                         loaded.nemotron_offline_physical_state_spec(&stage_graphs)?;
+                    // Short clips decode as rows whose predictor the executor
+                    // session retains, as Parakeet's does; their decode
+                    // budget is the clip's emittable labels, not a context.
+                    let retained_contract = physical_spec.retained.as_ref().ok_or_else(|| {
+                        Error::ModelLoadError(
+                            "Nemotron sequence graph did not author retained predictor state"
+                                .into(),
+                        )
+                    })?;
+                    let retained = self
+                        .core_engine
+                        .load_retained_tensor_state(
+                            model_instance_id,
+                            retained_contract,
+                            self.realtime_asr_sequence_capacity,
+                        )
+                        .await?;
+                    let effective_context = self.config.portable_context_ceiling();
+                    self.model_registry.publish_effective_context(
+                        variant,
+                        u64::try_from(effective_context).map_err(|_| {
+                            Error::ModelLoadError("Nemotron effective context exceeds u64".into())
+                        })?,
+                    )?;
                     let publication = self
                         .load_invocation_workspace_publication(
                             model_instance_id,
                             &contracts,
                             physical_spec.descriptor,
                             &physical_spec.invocation,
-                            None,
-                            HashMap::new(),
+                            Some(retained.into()),
+                            nemotron_offline_retained_uses(&contracts)?,
                         )
                         .await?;
                     state_publications.insert(CapabilityKind::Asr, publication);

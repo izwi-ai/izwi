@@ -344,6 +344,7 @@ impl EngineCoreRequest {
                     | ModelFamily::VibeVoiceAsr
                     | ModelFamily::GraniteSpeechAsr
                     | ModelFamily::ParakeetAsr
+                    | ModelFamily::NemotronAsr
             )
         {
             if self.prepared_asr_audio_for_executor()?.is_none() {
@@ -370,6 +371,9 @@ impl EngineCoreRequest {
                                 .is_some(),
                             ModelFamily::ParakeetAsr => {
                                 self.prepared_parakeet_artifact_for_executor()?.is_some()
+                            }
+                            ModelFamily::NemotronAsr => {
+                                self.prepared_nemotron_artifact_for_executor()?.is_some()
                             }
                             _ => false,
                         } => {}

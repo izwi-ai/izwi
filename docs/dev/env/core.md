@@ -196,6 +196,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_MODELS_DIR` | path | `<data_local_dir>/izwi/models` | startup | Directory where model weights are stored and looked up. |
 | `IZWI_MODEL_KEEP_ALIVE_SECS` | duration | `600` | startup | Idle keep-alive in seconds before auto-loaded models are unloaded; 0 disables the reaper. |
 | `IZWI_NEMOTRON_ASR_DTYPE` | choice | family/backend default (IZWI_METAL_DTYPE on Metal) | model load | Overrides the Nemotron ASR dtype (e.g. f32, f16, bf16); on Metal f32 also keeps encoder projections F32. |
+| `IZWI_NEMOTRON_ASR_ENCODER_BATCHING` | flag | `true` | first use | Encodes concurrent Nemotron 3.5 ASR clips of up to 30 s as one padded batch; false encodes every request alone. |
 | `IZWI_NEMOTRON_METAL_DEPTHWISE_CONV1D` | flag | true (Metal only) | first use | Enables the custom Metal depthwise Conv1d kernel for Nemotron ASR. |
 | `IZWI_NEMOTRON_METAL_DEPTHWISE_CONV2D` | flag | true (Metal only) | first use | Enables the custom Metal depthwise Conv2d kernel for Nemotron ASR. |
 | `IZWI_NEMOTRON_REALTIME_MAX_SECONDS` | integer | `3600` | first use | Caps a Nemotron realtime ASR session length in seconds and sizes its reservation; a non-integer value is a config error. |

@@ -27,6 +27,7 @@ pub(crate) enum LoadedAdapterKind {
     GraniteSpeechAsr,
     Lfm25AudioAsr,
     ParakeetAsr,
+    NemotronAsr,
     Lfm25AudioTts,
     VibeVoiceTts,
     FishS2Tts,
@@ -57,6 +58,7 @@ impl LoadedAdapterKind {
             Self::GraniteSpeechAsr => "builtin.granite_speech_asr.physical_sequence",
             Self::Lfm25AudioAsr => "builtin.lfm25_audio_asr.physical_sequence",
             Self::ParakeetAsr => "builtin.parakeet_asr.physical_recurrent",
+            Self::NemotronAsr => "builtin.nemotron_asr.physical_recurrent",
             Self::Lfm25AudioTts => "builtin.lfm25_audio_tts.physical_sequence",
             Self::VibeVoiceTts => "builtin.vibevoice_tts.physical_sequence",
             Self::FishS2Tts => "builtin.fish_s2_tts.physical_sequence",
@@ -338,7 +340,15 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         )
         .sequence()
         .resumable(),
-        row(F::NemotronAsr, C::Asr, Loaded::Scalar, Invocation),
+        // A clip of at most 30 s transcribes as a retained row whose encoder
+        // batches across requests and whose RNNT decode batches across rows;
+        // longer audio and diarization run one atomic invocation.
+        row(
+            F::NemotronAsr,
+            C::Asr,
+            Loaded::NemotronAsr,
+            RetainedAndInvocation,
+        ),
         row(
             F::NemotronAsr,
             C::RealtimeAsr,

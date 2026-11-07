@@ -7,6 +7,9 @@ use crate::models::architectures::granite_speech::asr::{
 use crate::models::architectures::lfm25_audio::asr_retained::{
     Lfm25AudioAsrDecodeStep, Lfm25AudioAsrQuantumCheckpoint, Lfm25AudioAsrStopReason,
 };
+use crate::models::architectures::nemotron::asr::{
+    NemotronPreparedEncoderArtifact, NemotronRetainedDecodeBatchRow, NemotronRetainedDecodeState,
+};
 use crate::models::architectures::parakeet::asr::{
     ParakeetRetainedDecodeBatchRow, ParakeetRetainedDecodeState,
 };
@@ -43,7 +46,8 @@ use super::audio::{
 };
 use super::long_form::LongFormAsrState;
 use super::state::{
-    ActiveAsrDecode, ActiveLfm25AsrDecode, ActiveParakeetAsrDecode, ActiveVoxtralRealtime,
+    ActiveAsrDecode, ActiveLfm25AsrDecode, ActiveNemotronAsrDecode, ActiveParakeetAsrDecode,
+    ActiveVoxtralRealtime,
 };
 use super::{
     ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
@@ -65,6 +69,8 @@ mod lfm25_audio;
 mod lfm3_audio;
 #[path = "handler_asr/lfm3_live.rs"]
 mod lfm3_live;
+#[path = "handler_asr/nemotron.rs"]
+mod nemotron;
 #[path = "handler_asr/parakeet.rs"]
 mod parakeet;
 #[path = "handler_asr/qwen3.rs"]
@@ -155,6 +161,7 @@ fn resolve_asr_execution_audio(
             | ModelFamily::GraniteSpeech5Asr
             | ModelFamily::Lfm25Audio
             | ModelFamily::Lfm3Audio
+            | ModelFamily::NemotronAsr
     ) {
         if let Some((samples, sample_rate)) = request.prepared_asr_audio_for_executor()? {
             return Ok((AsrExecutionAudio::Prepared(samples), sample_rate, 0.0));
@@ -563,6 +570,24 @@ impl NativeExecutor {
             };
             return outputs.pop().ok_or_else(|| {
                 Error::InferenceError("Parakeet B1 fallback returned no output".into())
+            });
+        }
+        if family == ModelFamily::NemotronAsr && request.uses_asr_retained_sequence() {
+            let mut outputs = if scheduled.is_prefill {
+                self.nemotron_asr_prefill_batch_with_managed(
+                    &[request],
+                    std::slice::from_ref(scheduled),
+                    vec![managed_state.take()],
+                )?
+            } else {
+                self.nemotron_asr_decode_batch_with_managed(
+                    &[request],
+                    std::slice::from_ref(scheduled),
+                    vec![managed_state.take()],
+                )?
+            };
+            return outputs.pop().ok_or_else(|| {
+                Error::InferenceError("Nemotron B1 fallback returned no output".into())
             });
         }
         if managed_state.is_some() {

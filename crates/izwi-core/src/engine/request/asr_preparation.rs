@@ -265,6 +265,24 @@ impl EngineCoreRequest {
             }
             return Ok(Some((stage.id, cost)));
         }
+        if matches!(model, NativeAsrModel::Nemotron(_)) {
+            let cost = WorkCost::new(
+                1,
+                1,
+                crate::models::architectures::nemotron::asr::NEMOTRON_RETAINED_WORKSPACE_PER_ROW_BYTES,
+            );
+            if !cost
+                .workspace
+                .workspace_bytes()
+                .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
+            {
+                return Err(Error::Overloaded(
+                    "Nemotron retained decode workspace exceeds its loaded adapter budget"
+                        .to_string(),
+                ));
+            }
+            return Ok(Some((stage.id, cost)));
+        }
         if !model.supports_continuous_decode_batch() {
             return Err(Error::InvalidInput(
                 "loaded adapter selected continuous decode for an incompatible ASR model"
@@ -498,7 +516,8 @@ impl EngineCoreRequest {
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
-            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Parakeet(_)
+            | PreparedAsrEncoderArtifactValue::Nemotron(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Qwen3 accessor".into(),
             )),
         }
@@ -556,7 +575,8 @@ impl EngineCoreRequest {
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
-            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Parakeet(_)
+            | PreparedAsrEncoderArtifactValue::Nemotron(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Whisper accessor".into(),
             )),
         }
@@ -614,7 +634,8 @@ impl EngineCoreRequest {
             | PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
-            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Parakeet(_)
+            | PreparedAsrEncoderArtifactValue::Nemotron(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the VibeVoice accessor".into(),
             )),
         }
@@ -672,7 +693,8 @@ impl EngineCoreRequest {
             | PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
-            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Parakeet(_)
+            | PreparedAsrEncoderArtifactValue::Nemotron(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Granite Speech accessor".into(),
             )),
         }
@@ -750,7 +772,8 @@ impl EngineCoreRequest {
             | PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
-            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Parakeet(_)
+            | PreparedAsrEncoderArtifactValue::Nemotron(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the LFM2.5 Audio accessor".into(),
             )),
         }
@@ -806,6 +829,60 @@ impl EngineCoreRequest {
             PreparedAsrEncoderArtifactValue::Parakeet(value) => Ok(Some(value.clone())),
             _ => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Parakeet accessor".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn install_prepared_nemotron_artifact(
+        &mut self,
+        model_variant: ModelVariant,
+        artifact: Arc<NemotronPreparedEncoderArtifact>,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::NemotronAsr
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} Nemotron artifact does not match its normal routed model",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
+        if self.prepared_asr_encoder_artifact.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} already owns an encoder artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+            model_variant,
+            artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::Nemotron(artifact)),
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_nemotron_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<NemotronPreparedEncoderArtifact>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after Nemotron preparation",
+                self.id
+            )));
+        }
+        match &*prepared.artifact {
+            PreparedAsrEncoderArtifactValue::Nemotron(value) => Ok(Some(value.clone())),
+            _ => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the Nemotron accessor".into(),
             )),
         }
     }

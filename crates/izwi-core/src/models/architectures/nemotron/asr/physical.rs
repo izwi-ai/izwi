@@ -1,14 +1,18 @@
-//! Invocation-only physical state for Nemotron's offline RNNT decoder.
+//! Physical state for Nemotron's offline RNNT decoder: the retained
+//! predictor of short clips decoded as rows, and the invocation predictor
+//! and acoustic state of the atomic long-form graph.
 
 use crate::engine::InvocationTensorLease;
-use crate::engine::StageDescriptor;
+use crate::engine::{StageDescriptor, StageWorkSelector};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    BoundedShape, CapabilityStateDescriptorV2, CheckpointPolicy, InferenceStateContract,
-    PlacementPolicy, PrefixPolicy, ShapeAxis, ShapeDimension, ShapeExtent, StateClock,
-    StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId,
-    StateGroupSpec, StateScope, StaticTensorDomainSpec, TensorComponentSpec, TensorRole,
-    TensorStateDomainSpec, CURRENT_INFERENCE_STATE_ABI,
+    stage_graph_fingerprint, BoundedShape, CapabilityStateDescriptorV2, CheckpointPolicy,
+    InferenceStateContract, InvocationLeaseScope, InvocationStageWorkspace,
+    InvocationWorkspaceProfile, InvocationWorkspaceSet, PlacementPolicy, PrefixPolicy, ShapeAxis,
+    ShapeDimension, ShapeExtent, StateClock, StateComponentId, StateDType, StateDomainHeader,
+    StateDomainId, StateDomainSpec, StateGroupId, StateGroupSpec, StateScope,
+    StaticTensorDomainSpec, TensorComponentSpec, TensorRole, TensorStateDomainSpec,
+    CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::models::shared::state::typed_invocation_descriptor;
 
@@ -17,7 +21,7 @@ use super::{NemotronRealtimeStateShape, DEFAULT_MAX_AUDIO_SECONDS_HINT, SAMPLE_R
 
 pub(crate) const NEMOTRON_OFFLINE_PREDICTOR_DOMAIN: StateDomainId = StateDomainId::new(1);
 pub(crate) const NEMOTRON_OFFLINE_ACOUSTIC_DOMAIN: StateDomainId = StateDomainId::new(2);
-const NEMOTRON_OFFLINE_GROUP: StateGroupId = StateGroupId::new(1);
+pub(crate) const NEMOTRON_OFFLINE_GROUP: StateGroupId = StateGroupId::new(1);
 const NEMOTRON_OFFLINE_ENCODER_MEMORY: StateComponentId = StateComponentId::new(1);
 
 /// Encoder frames the offline encoder emits for `samples_16khz` samples:
@@ -55,6 +59,11 @@ pub(super) fn ensure_offline_acoustic_capacity(
 #[derive(Debug, Clone)]
 pub(crate) struct NemotronOfflinePhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
+    /// Sequence graphs (short clips decoded as rows) own the predictor
+    /// tensors as retained state and publish scratch-free stage workspace.
+    pub(crate) retained: Option<InferenceStateContract>,
+    /// Atomic graphs (long audio and diarization) lease the predictor and
+    /// the encoder projection per invocation.
     pub(crate) invocation: InferenceStateContract,
 }
 
@@ -64,11 +73,127 @@ pub(crate) fn nemotron_offline_physical_state_spec(
     stage_graphs: &[&[StageDescriptor]],
 ) -> Result<NemotronOfflinePhysicalStateSpec> {
     let invocation = nemotron_offline_invocation_contract(shape, dtype)?;
-    let descriptor = typed_invocation_descriptor(stage_graphs, &invocation)?;
+    let retained = nemotron_retained_predictor_contract(&invocation)?;
+    let is_retained_stage = |stage: &StageDescriptor| {
+        matches!(
+            stage.selector,
+            StageWorkSelector::SequencePrefill | StageWorkSelector::SequenceDecode
+        )
+    };
+    let (retained_graphs, atomic_graphs): (Vec<_>, Vec<_>) = stage_graphs
+        .iter()
+        .copied()
+        .partition(|stages| stages.iter().any(is_retained_stage));
+    let descriptor = match (retained_graphs.is_empty(), atomic_graphs.is_empty()) {
+        (true, _) => typed_invocation_descriptor(stage_graphs, &invocation)?,
+        (false, true) => {
+            CapabilityStateDescriptorV2::managed_for_stage_graphs(retained.clone(), stage_graphs)?
+        }
+        (false, false) => retained_with_atomic_profiles(
+            CapabilityStateDescriptorV2::managed_for_stage_graphs(
+                retained.clone(),
+                &retained_graphs,
+            )?,
+            &retained_graphs,
+            typed_invocation_descriptor(&atomic_graphs, &invocation)?,
+            stage_graphs,
+        )?,
+    };
     Ok(NemotronOfflinePhysicalStateSpec {
         descriptor,
+        retained: (!retained_graphs.is_empty()).then_some(retained),
         invocation,
     })
+}
+
+/// One publication for both lifetimes: the sequence graphs keep their
+/// scratch-free profiles under the retained contract, and each atomic graph
+/// adds its invocation predictor and acoustic profile.
+fn retained_with_atomic_profiles(
+    retained: CapabilityStateDescriptorV2,
+    retained_graphs: &[&[StageDescriptor]],
+    atomic: CapabilityStateDescriptorV2,
+    stage_graphs: &[&[StageDescriptor]],
+) -> Result<CapabilityStateDescriptorV2> {
+    let mut profiles = match retained.invocation {
+        InvocationWorkspaceSet::Bounded { profiles } => profiles,
+        // Sequence graphs without stage scratch still need an exact,
+        // domain-free profile once the publication is bounded.
+        InvocationWorkspaceSet::None { .. } => retained_graphs
+            .iter()
+            .map(|stages| {
+                let mut ids = stages.iter().map(|stage| stage.id).collect::<Vec<_>>();
+                ids.sort_unstable();
+                Ok(InvocationWorkspaceProfile {
+                    stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
+                    stages: ids
+                        .into_iter()
+                        .map(|stage| InvocationStageWorkspace {
+                            stage,
+                            lease_scope: InvocationLeaseScope::PerStageBatch,
+                            groups: Vec::new(),
+                            domains: Vec::new(),
+                        })
+                        .collect(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    };
+    let InvocationWorkspaceSet::Bounded {
+        profiles: atomic_profiles,
+    } = atomic.invocation
+    else {
+        return Err(model_load(
+            "Nemotron atomic graph must bound its invocation workspace",
+        ));
+    };
+    profiles.extend(atomic_profiles);
+    profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
+    profiles.dedup();
+    let descriptor = CapabilityStateDescriptorV2 {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        retained: retained.retained,
+        invocation: InvocationWorkspaceSet::Bounded { profiles },
+    };
+    for stages in stage_graphs {
+        descriptor.validate_against_stages(stages)?;
+    }
+    Ok(descriptor)
+}
+
+/// The predictor domain of the invocation contract, retained and
+/// transactional: the recurrent state a row's decode carries between
+/// scheduler steps.
+fn nemotron_retained_predictor_contract(
+    invocation: &InferenceStateContract,
+) -> Result<InferenceStateContract> {
+    let predictor = invocation
+        .domains
+        .iter()
+        .find(|domain| domain.id() == NEMOTRON_OFFLINE_PREDICTOR_DOMAIN)
+        .cloned()
+        .ok_or_else(|| model_load("Nemotron offline state has no predictor domain"))?;
+    let StateDomainSpec::Tensor(mut predictor) = predictor else {
+        return Err(model_load(
+            "Nemotron retained predictor state must be tensor state",
+        ));
+    };
+    predictor.header.scope = StateScope::Retained;
+    predictor.header.checkpoint = CheckpointPolicy::Transactional;
+    predictor.header.prefix = PrefixPolicy::Disabled;
+    let contract = InferenceStateContract {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        domains: vec![StateDomainSpec::Tensor(predictor)],
+        groups: vec![StateGroupSpec {
+            id: NEMOTRON_OFFLINE_GROUP,
+            domains: vec![NEMOTRON_OFFLINE_PREDICTOR_DOMAIN],
+            prefix_shareable: false,
+        }],
+    };
+    contract
+        .validate()
+        .map_err(|error| model_load(format!("invalid retained Nemotron state: {error}")))?;
+    Ok(contract)
 }
 
 fn nemotron_offline_invocation_contract(
@@ -310,5 +435,75 @@ mod tests {
             !arena.is_dirty(),
             "a rejected request must not touch the state"
         );
+    }
+
+    /// The offline graphs publish the retained predictor for the graph that
+    /// decodes short clips as rows, beside the invocation predictor and
+    /// encoder projection the atomic graphs lease.
+    #[test]
+    fn offline_spec_retains_the_predictor_for_rows_beside_the_atomic_invocation() {
+        use crate::engine::{ExecutionGroupId, ExecutionMode};
+        use crate::kv::v2::{
+            stage_graph_fingerprint, InvocationWorkspaceDomain, InvocationWorkspaceSet,
+        };
+        use crate::runtime::{CapabilityKind, LoadedModelBundleDraft, RuntimeAdapterRegistry};
+
+        let draft = LoadedModelBundleDraft::build(
+            &RuntimeAdapterRegistry::built_in_with_execution_limits(4, 4).unwrap(),
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(1),
+            crate::model::ModelVariant::Nemotron35AsrStreaming06B,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let contracts = draft.execution_contracts(CapabilityKind::Asr).unwrap();
+        let graphs = contracts
+            .iter()
+            .map(|contract| contract.stages.as_ref())
+            .collect::<Vec<_>>();
+        let spec = nemotron_offline_physical_state_spec(
+            default_realtime_state_shape(),
+            StateDType::F32,
+            &graphs,
+        )
+        .unwrap();
+        let retained = spec
+            .retained
+            .as_ref()
+            .expect("row graphs retain the predictor");
+        let [StateDomainSpec::Tensor(predictor)] = retained.domains.as_slice() else {
+            panic!("the retained state is the predictor's tensor domain alone");
+        };
+        assert_eq!(predictor.header.id, NEMOTRON_OFFLINE_PREDICTOR_DOMAIN);
+        assert_eq!(predictor.header.scope, StateScope::Retained);
+        assert_eq!(predictor.header.checkpoint, CheckpointPolicy::Transactional);
+        assert_eq!(predictor.components.len(), 6);
+        for graph in &graphs {
+            spec.descriptor.validate_against_stages(graph).unwrap();
+        }
+        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
+            panic!("the atomic graphs bound their invocation workspace");
+        };
+        let mut atomic_graphs = 0;
+        for contract in &contracts {
+            let fingerprint = stage_graph_fingerprint(&contract.stages).unwrap();
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.stage_graph_fingerprint == fingerprint)
+                .expect("every graph has a profile");
+            let domains = profile
+                .stages
+                .iter()
+                .flat_map(|stage| &stage.domains)
+                .filter(|domain| matches!(domain, InvocationWorkspaceDomain::State { .. }))
+                .count();
+            if contract.execution_profile.mode == ExecutionMode::Atomic {
+                atomic_graphs += 1;
+                assert_eq!(domains, 2, "predictor and encoder projection");
+            } else {
+                assert_eq!(domains, 0, "a row's predictor is retained");
+            }
+        }
+        assert!(atomic_graphs > 0);
     }
 }

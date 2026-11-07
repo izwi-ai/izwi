@@ -165,6 +165,22 @@ fn loaded_asr_state_publication_route(variant: ModelVariant) -> LoadedAsrStatePu
 fn parakeet_retained_uses(
     contracts: &[LoadedExecutionContract],
 ) -> Result<HashMap<[u8; 32], RetainedStateUseV2>> {
+    session_retained_uses(contracts, "Parakeet")
+}
+
+/// Nemotron's offline predictor is retained the way Parakeet's is: by the
+/// exact executor session of a short clip's row; the atomic long-form graph
+/// leases invocation tensors.
+fn nemotron_offline_retained_uses(
+    contracts: &[LoadedExecutionContract],
+) -> Result<HashMap<[u8; 32], RetainedStateUseV2>> {
+    session_retained_uses(contracts, "Nemotron offline")
+}
+
+fn session_retained_uses(
+    contracts: &[LoadedExecutionContract],
+    family: &str,
+) -> Result<HashMap<[u8; 32], RetainedStateUseV2>> {
     contracts
         .iter()
         .map(|contract| {
@@ -173,9 +189,9 @@ fn parakeet_retained_uses(
                 crate::engine::ExecutionMode::Sequence | crate::engine::ExecutionMode::Atomic => {
                     Ok((graph, RetainedStateUseV2::Inactive))
                 }
-                _ => Err(Error::ModelLoadError(
-                    "Parakeet graph has an incompatible execution mode".into(),
-                )),
+                _ => Err(Error::ModelLoadError(format!(
+                    "{family} graph has an incompatible execution mode"
+                ))),
             }
         })
         .collect()

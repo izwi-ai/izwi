@@ -46,8 +46,11 @@ use network::{
     NemotronRnntStreamState, NemotronStreamingEncoderState, NemotronStreamingFeatureState,
     NemotronStreamingPreEncodeState,
 };
-pub(crate) use network::{nemotron_stem_bytes, NEMOTRON_MODEL_MEMO_MAX_BYTES};
-pub(crate) use physical::NemotronOfflinePhysicalStateSpec;
+pub(crate) use network::{
+    nemotron_encoder_batch_row_bytes, nemotron_encoder_projection_bytes,
+    nemotron_encoder_row_elements, nemotron_stem_bytes, NEMOTRON_MODEL_MEMO_MAX_BYTES,
+};
+pub(crate) use physical::{NemotronOfflinePhysicalStateSpec, NEMOTRON_OFFLINE_GROUP};
 
 const SAMPLE_RATE: u32 = 16_000;
 const DEFAULT_STRIP_LANG_TAGS: bool = true;
@@ -70,6 +73,15 @@ const CONSERVATIVE_NEMOTRON_DECODER_TOKEN_BYTES: usize = 256;
 const REALTIME_HOST_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024;
 const REALTIME_PEAK_TEXT_COPIES: u64 = 4;
 pub(crate) const NEMOTRON_REALTIME_STAGE_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
+/// The offline encoder preparation of a short clip decoded as a row.
+pub(crate) const NEMOTRON_ENCODER_STAGE: &str = "asr.encoder.nemotron";
+/// Starts the predictors of short clips decoded as rows.
+pub(crate) const NEMOTRON_RETAINED_PREFILL_STAGE: &str = "asr.prefill.nemotron.predictor";
+/// One RNNT step of short clips decoded as rows.
+pub(crate) const NEMOTRON_RETAINED_DECODE_STAGE: &str = "asr.decode.nemotron.joint";
+/// One row's decode workspace: a joint step's logits and the predictor's
+/// activations, far under this bound.
+pub(crate) const NEMOTRON_RETAINED_WORKSPACE_PER_ROW_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const NEMOTRON_REALTIME_ENCODER_STAGE: &str = "asr.realtime.encoder";
 pub(crate) const NEMOTRON_REALTIME_RNNT_STAGE: &str = "asr.realtime.rnnt";
 pub(crate) const NEMOTRON_REALTIME_FALLBACK_STAGE: &str = "asr.realtime.scalar_fallback";
@@ -1663,6 +1675,22 @@ pub(crate) struct NemotronHostFeatures {
 }
 
 impl NemotronHostFeatures {
+    /// Silent 16 kHz features of `valid_frames` feature frames, for tests of
+    /// the preparation route that need only their geometry.
+    #[cfg(test)]
+    pub(crate) fn silent_for_test(valid_frames: usize) -> Self {
+        Self {
+            mel: NemotronHostMel::silent(valid_frames),
+            prompt: NemotronPromptCondition::resolve(None, None)
+                .expect("the automatic language resolves"),
+            prompt_id: 0,
+            input_samples: valid_frames * 160,
+            input_sample_rate: SAMPLE_RATE,
+            resampled_samples: valid_frames * 160,
+            feature_ms: 0.0,
+        }
+    }
+
     /// Encoder frames (E) these features encode to.
     pub(crate) fn encoded_len(&self) -> usize {
         self.mel.encoded_len()

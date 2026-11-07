@@ -112,7 +112,7 @@ use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
 use state::{
     ActiveAsrDecode, ActiveChatDecode, ActiveChatterboxTtsDecode, ActiveFishDrama3TtsDecode,
     ActiveFishS2TtsDecode, ActiveLfm25AsrDecode, ActiveLfm25TtsDecode, ActiveLfm3AudioDecode,
-    ActiveLfm3AudioRealtime, ActiveMaya1TtsDecode, ActiveMaya2TtsDecode,
+    ActiveLfm3AudioRealtime, ActiveMaya1TtsDecode, ActiveMaya2TtsDecode, ActiveNemotronAsrDecode,
     ActiveNemotronTranscribeDecode, ActiveParakeetAsrDecode, ActiveQwenTtsDecode,
     ActiveVibeVoiceTtsDecode, ActiveVoxtralRealtime, ActiveVoxtralTtsDecode,
     PendingLfm3AudioRealtimeQuantum, PendingVoxtralRealtimeQuantum,
@@ -2774,6 +2774,7 @@ pub struct NativeExecutor {
     suspended_chat_states: Mutex<HashMap<SessionKey, state::SuspendedChatDecode>>,
     asr_decode_states: ExecutorStateStore<ActiveAsrDecode>,
     parakeet_asr_decode_states: ExecutorStateStore<ActiveParakeetAsrDecode>,
+    nemotron_asr_decode_states: ExecutorStateStore<ActiveNemotronAsrDecode>,
     lfm25_asr_decode_states: ExecutorStateStore<ActiveLfm25AsrDecode>,
     lfm25_tts_decode_states: ExecutorStateStore<ActiveLfm25TtsDecode>,
     vibevoice_tts_decode_states: ExecutorStateStore<ActiveVibeVoiceTtsDecode>,
@@ -2885,6 +2886,7 @@ impl NativeExecutor {
             suspended_chat_states: Mutex::new(HashMap::new()),
             asr_decode_states: Mutex::new(HashMap::new()),
             parakeet_asr_decode_states: Mutex::new(HashMap::new()),
+            nemotron_asr_decode_states: Mutex::new(HashMap::new()),
             lfm25_asr_decode_states: Mutex::new(HashMap::new()),
             lfm25_tts_decode_states: Mutex::new(HashMap::new()),
             vibevoice_tts_decode_states: Mutex::new(HashMap::new()),
@@ -3858,6 +3860,25 @@ impl ModelExecutor for NativeExecutor {
                     stage: NativeAudioStage::SequencePrefill,
                     mode: NativeBatchMode::Static,
                     ..
+                } if execution.batch.lane.kernel_mode
+                    == crate::models::architectures::nemotron::asr::NEMOTRON_RETAINED_PREFILL_STAGE
+                    && execution.requests.iter().all(|request| {
+                        request.model_variant.is_some_and(|variant| {
+                            variant.family() == crate::catalog::ModelFamily::NemotronAsr
+                        })
+                    }) =>
+                {
+                    self.execute_static_nemotron_asr_prefill_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
                 } if execution.requests.iter().all(|request| {
                     request.model_variant.is_some_and(|variant| {
                         variant.family() == crate::catalog::ModelFamily::Lfm25Audio
@@ -4273,6 +4294,9 @@ impl ModelExecutor for NativeExecutor {
         let mut parakeet_asr = self.parakeet_asr_decode_states.lock().map_err(|_| {
             Error::InferenceError("Parakeet ASR decode state mutex poisoned".to_string())
         })?;
+        let mut nemotron_asr = self.nemotron_asr_decode_states.lock().map_err(|_| {
+            Error::InferenceError("Nemotron ASR decode state mutex poisoned".to_string())
+        })?;
         let mut lfm25_asr = self.lfm25_asr_decode_states.lock().map_err(|_| {
             Error::InferenceError("LFM2.5 Audio ASR decode state mutex poisoned".to_string())
         })?;
@@ -4340,6 +4364,7 @@ impl ModelExecutor for NativeExecutor {
         chat.clear();
         asr.clear();
         parakeet_asr.clear();
+        nemotron_asr.clear();
         lfm25_asr.clear();
         lfm25_tts.clear();
         vibevoice_tts.clear();
@@ -4358,6 +4383,7 @@ impl ModelExecutor for NativeExecutor {
             chat,
             asr,
             parakeet_asr,
+            nemotron_asr,
             lfm25_asr,
             lfm25_tts,
             vibevoice_tts,
@@ -4410,6 +4436,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut chat),
             Ok(mut asr),
             Ok(mut parakeet_asr),
+            Ok(mut nemotron_asr),
             Ok(mut lfm25_asr),
             Ok(mut lfm25_tts),
             Ok(mut vibevoice_tts),
@@ -4428,6 +4455,7 @@ impl ModelExecutor for NativeExecutor {
             self.chat_decode_states.lock(),
             self.asr_decode_states.lock(),
             self.parakeet_asr_decode_states.lock(),
+            self.nemotron_asr_decode_states.lock(),
             self.lfm25_asr_decode_states.lock(),
             self.lfm25_tts_decode_states.lock(),
             self.vibevoice_tts_decode_states.lock(),
@@ -4450,6 +4478,7 @@ impl ModelExecutor for NativeExecutor {
         let chat = cleanup_request_states_locked(&mut chat, request_id);
         let asr = cleanup_request_states_locked(&mut asr, request_id);
         let parakeet_asr = cleanup_request_states_locked(&mut parakeet_asr, request_id);
+        let nemotron_asr = cleanup_request_states_locked(&mut nemotron_asr, request_id);
         let lfm25_asr = cleanup_request_states_locked(&mut lfm25_asr, request_id);
         let lfm25_tts = cleanup_request_states_locked(&mut lfm25_tts, request_id);
         let vibevoice_tts = cleanup_request_states_locked(&mut vibevoice_tts, request_id);
@@ -4467,6 +4496,7 @@ impl ModelExecutor for NativeExecutor {
         cleanup_report(
             chat.combine(asr)
                 .combine(parakeet_asr)
+                .combine(nemotron_asr)
                 .combine(lfm25_asr)
                 .combine(lfm25_tts)
                 .combine(vibevoice_tts)
@@ -4516,6 +4546,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut chat),
             Ok(mut asr),
             Ok(mut parakeet_asr),
+            Ok(mut nemotron_asr),
             Ok(mut lfm25_asr),
             Ok(mut lfm25_tts),
             Ok(mut vibevoice_tts),
@@ -4534,6 +4565,7 @@ impl ModelExecutor for NativeExecutor {
             self.chat_decode_states.lock(),
             self.asr_decode_states.lock(),
             self.parakeet_asr_decode_states.lock(),
+            self.nemotron_asr_decode_states.lock(),
             self.lfm25_asr_decode_states.lock(),
             self.lfm25_tts_decode_states.lock(),
             self.vibevoice_tts_decode_states.lock(),
@@ -4560,6 +4592,7 @@ impl ModelExecutor for NativeExecutor {
         let chat = cleanup_session_state_locked(&mut chat, session);
         let asr = cleanup_session_state_locked(&mut asr, session);
         let parakeet_asr = cleanup_session_state_locked(&mut parakeet_asr, session);
+        let nemotron_asr = cleanup_session_state_locked(&mut nemotron_asr, session);
         let lfm25_asr = cleanup_session_state_locked(&mut lfm25_asr, session);
         let lfm25_tts = cleanup_session_state_locked(&mut lfm25_tts, session);
         let vibevoice_tts = cleanup_session_state_locked(&mut vibevoice_tts, session);
@@ -4577,6 +4610,7 @@ impl ModelExecutor for NativeExecutor {
         cleanup_report(
             chat.combine(asr)
                 .combine(parakeet_asr)
+                .combine(nemotron_asr)
                 .combine(lfm25_asr)
                 .combine(lfm25_tts)
                 .combine(vibevoice_tts)

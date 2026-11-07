@@ -78,7 +78,8 @@ use crate::models::architectures::maya1::Maya1TtsModel;
 use crate::models::architectures::maya2::Maya2TtsModel;
 use crate::models::architectures::nemotron::asr::{
     NemotronAsrDecodeStep, NemotronAsrModel, NemotronAsrTranscriptionOutput,
-    NemotronOfflinePhysicalStateSpec, NemotronRealtimeBatchInput, NemotronRealtimeBatchRow,
+    NemotronEncoderBatchRow, NemotronHostFeatures, NemotronOfflinePhysicalStateSpec,
+    NemotronPreparedEncoderArtifact, NemotronRealtimeBatchInput, NemotronRealtimeBatchRow,
     NemotronRealtimePhysicalStateSpec, NemotronRealtimeResourceReservation,
     NemotronRealtimeStreamEvent, NemotronStreamingState,
 };
@@ -1539,6 +1540,39 @@ impl NativeAsrModel {
         }
     }
 
+    /// Resolves one Nemotron request's prompt and turns its audio into its
+    /// log-mel on the host.
+    pub(crate) fn prepare_nemotron_host_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<NemotronHostFeatures> {
+        match self {
+            Self::Nemotron(model) => {
+                model.prepare_host_features(audio, sample_rate, language, prompt)
+            }
+            _ => Err(Error::InvalidInput(
+                "Nemotron features were requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    /// Encodes one Nemotron preparation batch; see
+    /// [`NemotronAsrModel::prepare_retained_encoder_batch`].
+    pub(crate) fn prepare_nemotron_encoder_batch(
+        &self,
+        rows: &[NemotronEncoderBatchRow<'_>],
+    ) -> Result<Vec<Result<NemotronPreparedEncoderArtifact>>> {
+        match self {
+            Self::Nemotron(model) => model.prepare_retained_encoder_batch(rows),
+            _ => Err(Error::InvalidInput(
+                "Nemotron encoder rows were supplied to another ASR model".into(),
+            )),
+        }
+    }
+
     pub(crate) fn whisper_incremental_prompt_token_count(
         &self,
         prepared: &WhisperPreparedWindow,
@@ -2847,7 +2881,7 @@ impl NativeAsrModel {
     pub fn supports_continuous_decode_batch(&self) -> bool {
         match self {
             Self::Qwen3(model) => model.supports_continuous_decode_batch(),
-            Self::Parakeet(_) => true,
+            Self::Parakeet(_) | Self::Nemotron(_) => true,
             Self::VibeVoice(model) => model.supports_continuous_decode_batch(),
             Self::GraniteSpeech(model) => model.supports_continuous_decode_batch(),
             Self::NemotronTranscribe(_) => true,
@@ -2858,7 +2892,10 @@ impl NativeAsrModel {
     pub fn supports_static_prefill_batch(&self) -> bool {
         matches!(
             self,
-            Self::Parakeet(_) | Self::VibeVoice(_) | Self::NemotronTranscribe(_)
+            Self::Parakeet(_)
+                | Self::Nemotron(_)
+                | Self::VibeVoice(_)
+                | Self::NemotronTranscribe(_)
         )
     }
 

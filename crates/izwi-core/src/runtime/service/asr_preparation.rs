@@ -28,6 +28,33 @@ pub(super) fn install_parakeet_decode_budget(
     request.install_prepared_sequence_input_tokens(1, sequence_tokens)
 }
 
+/// Nemotron's decode budget is a short clip's emittable-label bound
+/// (`E × max_symbols`), not the portable token context: its recurrent
+/// predictor keeps no per-token state. A caller's `max_tokens` is kept below
+/// the bound by the sequence clamp.
+pub(super) fn install_nemotron_decode_budget(
+    request: &mut EngineCoreRequest,
+    max_emittable_tokens: usize,
+) -> Result<()> {
+    if request.asr_auto_max_tokens {
+        request.params.max_tokens = max_emittable_tokens;
+    }
+    let sequence_tokens = max_emittable_tokens
+        .checked_add(1)
+        .ok_or_else(|| Error::Overloaded("Nemotron decode budget overflowed".into()))?;
+    request.install_prepared_sequence_input_tokens(1, sequence_tokens)
+}
+
+/// Whether a Nemotron request decodes as a retained row: audio one pass
+/// covers (at most the 30 s chunk hint) without speaker attribution. Longer
+/// audio, chunked streams and speaker attribution keep the atomic graph.
+pub(super) fn nemotron_decodes_as_row(
+    plan: &crate::engine::PlannedAsrChunks,
+    request: &EngineCoreRequest,
+) -> bool {
+    !plan.requires_chunk_path() && !request.asr_task.speaker_attribution
+}
+
 impl RuntimeService {
     pub(super) async fn prepare_qwen3_asr_shape_for_binding(
         &self,
@@ -1561,6 +1588,181 @@ impl RuntimeService {
         }
     }
 
+    /// Nemotron 3.5 ASR Streaming, offline: a clip one pass covers decodes
+    /// as a retained row. Its audio is decoded, resampled and turned into
+    /// its log-mel on a host worker, concurrent clips encode as one padded
+    /// batch, and the decode batches across rows. Longer audio and speaker
+    /// attribution keep the atomic graph, whose single dispatch encodes and
+    /// decodes the whole file in 30 s chunks.
+    pub(super) async fn prepare_nemotron_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::NemotronAsr)
+            || request.prepared_asr_execution_shape().is_some()
+            || request.is_realtime_asr_session()
+        {
+            return Ok((request, job));
+        }
+        let variant = request.model_variant.expect("validated Nemotron variant");
+        let model = self
+            .model_registry
+            .get_asr_lease(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not loaded")))?;
+        let max_symbols = match model.model_arc().as_ref() {
+            crate::models::registry::NativeAsrModel::Nemotron(nemotron) => {
+                nemotron.max_symbols_per_frame()
+            }
+            _ => {
+                return Err(Error::ModelLoadError(
+                    "Nemotron registry lease crossed model family".into(),
+                ))
+            }
+        };
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Nemotron preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let effective_context = self.model_registry.effective_context(variant);
+        let model_for_features = model.clone();
+        let (prepared, features) = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let (samples, sample_rate) =
+                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
+                    &model_for_features,
+                    variant,
+                    &request,
+                    effective_context,
+                )?;
+                let plan = crate::engine::asr_route_plan(
+                    &samples,
+                    sample_rate,
+                    &capabilities,
+                    request.streaming,
+                );
+                if !nemotron_decodes_as_row(&plan, &request) {
+                    request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                    request.install_prepared_asr_long_form_atomic(plan)?;
+                    return Ok((request, None));
+                }
+                // The resample and log-mel run here, on a host worker, so the
+                // device job runs only the encoder.
+                let features = model_for_features.prepare_nemotron_host_features(
+                    &samples,
+                    sample_rate,
+                    request.asr_language_for_execution(),
+                    request.asr_prompt_for_execution(),
+                )?;
+                let max_emittable_tokens =
+                    crate::models::architectures::nemotron::asr::nemotron_max_emittable_tokens(
+                        features.encoded_len(),
+                        max_symbols,
+                    )?;
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                install_nemotron_decode_budget(&mut request, max_emittable_tokens)?;
+                Ok((request, Some(features)))
+            })
+            .await?;
+        let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
+            .map_err(|_| Error::Overloaded("Nemotron retained input exceeds u64".into()))?;
+        let Some(features) = features else {
+            job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+            let bridge = self.coordinator.bridge_preparation_admission(job)?;
+            let (spec, observation) = self.coordinator_job_for_request(&prepared)?;
+            return self
+                .coordinator
+                .admit_observed_from_preparation(bridge, spec, observation)
+                .await
+                .map(|job| (prepared, job))
+                .map_err(|failure| failure.error);
+        };
+        // The log-mel features are held beside the request until the encode
+        // drops them.
+        let prepared_host_bytes = retained_host_bytes
+            .checked_add(features.host_bytes()?)
+            .ok_or_else(|| Error::Overloaded("Nemotron prepared host bytes overflowed".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
+        let backend = self.backend_router.context().backend_kind;
+        let retained_device_ceiling =
+            crate::models::architectures::nemotron::asr::nemotron_encoder_projection_bytes(
+                features.encoded_len(),
+                backend == BackendKind::Metal,
+            )?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let prep_spec = JobSpec {
+            request_id: prepared.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: prepared.priority,
+            workload_class: prepared.workload_class,
+            deadline: prepared.deadline,
+            resources: asr_encoder_retained_resources(
+                backend,
+                prepared_host_bytes,
+                retained_device_ceiling,
+            )?,
+        };
+        let prep_job = self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                prep_spec,
+                JobResourceObservation::host(prepared_host_bytes),
+            )
+            .await
+            .map_err(|failure| failure.error)?;
+        // Concurrent clips encode as one padded batch.
+        let outcome = self
+            .nemotron_encoder_batcher
+            .submit(NemotronEncoderPending {
+                job: prep_job,
+                contract,
+                model: model.clone(),
+                model_label: variant.dir_name(),
+                backend,
+                features,
+                retained_host_bytes,
+                retained_device_ceiling,
+                cancellation: PreparationCancellation::default(),
+                response: None,
+            })
+            .await?;
+        let (artifact, bridge) = match outcome {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let mut prepared = prepared;
+        prepared.install_prepared_nemotron_artifact(variant, artifact.value)?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        self.coordinator
+            .admit_observed_from_preparation(bridge, execution, artifact.retained)
+            .await
+            .map(|job| (prepared, job))
+            .map_err(|failure| failure.error)
+    }
+
     /// Granite Speech 5.0: decode the audio and plan its chunks on a host
     /// worker, then dispatch the chunked atomic stage one chunk at a time, so
     /// a long file no longer holds the device for its whole length and the
@@ -1662,6 +1864,9 @@ impl RuntimeService {
             .await?;
         let (request, job) = self
             .prepare_parakeet_asr_shape_for_binding(request, job, residency_lease)
+            .await?;
+        let (request, job) = self
+            .prepare_nemotron_asr_shape_for_binding(request, job, residency_lease)
             .await?;
         let (request, job) = self
             .prepare_lfm25_audio_asr_shape_for_binding(request, job, residency_lease)

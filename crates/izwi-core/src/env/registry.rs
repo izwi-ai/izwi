@@ -1314,6 +1314,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the Nemotron ASR dtype (e.g. f32, f16, bf16); on Metal f32 also keeps encoder projections F32.",
     ),
     CoreEnvVar::new(
+        "IZWI_NEMOTRON_ASR_ENCODER_BATCHING",
+        Flag,
+        "true",
+        Once,
+        "Encodes concurrent Nemotron 3.5 ASR clips of up to 30 s as one padded batch; false encodes every request alone.",
+    ),
+    CoreEnvVar::new(
         "IZWI_NEMOTRON_METAL_DEPTHWISE_CONV1D",
         Flag,
         "true (Metal only)",

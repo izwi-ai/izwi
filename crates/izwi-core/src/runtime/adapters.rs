@@ -625,7 +625,7 @@ mod tests {
                 .require(CapabilityKind::Asr, ModelVariant::Nemotron35AsrStreaming06B)
                 .expect("nemotron offline asr adapter")
                 .state_requirement,
-            InferenceStateRequirement::Invocation
+            InferenceStateRequirement::RetainedAndInvocation
         );
         assert_eq!(
             registry

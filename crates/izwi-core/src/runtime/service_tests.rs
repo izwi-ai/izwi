@@ -2253,6 +2253,53 @@ fn parakeet_decode_budget_tracks_emittable_labels() {
     assert_eq!(request(50_000, false), max_emittable);
 }
 
+#[test]
+fn nemotron_decode_budget_tracks_emittable_labels() {
+    let variant = ModelVariant::Nemotron35AsrStreaming06B;
+    // 30 s at 16 kHz: 376 encoder frames × 10 labels.
+    let max_emittable =
+        crate::models::architectures::nemotron::asr::nemotron_max_emittable_tokens(376, 10)
+            .unwrap();
+    assert_eq!(max_emittable, 3_760);
+    let request = |max_tokens: usize, auto: bool| {
+        let mut request = EngineCoreRequest::asr("audio").with_model_variant(variant);
+        request.params.max_tokens = max_tokens;
+        request.asr_auto_max_tokens = auto;
+        install_nemotron_decode_budget(&mut request, max_emittable).unwrap();
+        assert!(request.uses_asr_retained_sequence());
+        request.params.max_tokens
+    };
+
+    assert_eq!(request(2048, true), max_emittable);
+    assert_eq!(request(5, false), 5);
+    assert_eq!(request(50_000, false), max_emittable);
+}
+
+/// Nemotron clips one pass covers decode as retained rows, streamed or
+/// not; longer audio and speaker attribution keep the atomic graph.
+#[test]
+fn nemotron_short_clips_decode_as_rows_and_long_audio_stays_atomic() {
+    let variant = ModelVariant::Nemotron35AsrStreaming06B;
+    let capabilities =
+        crate::engine::AsrRouteCapabilities::for_family(ModelFamily::NemotronAsr, Some(30.0));
+    let decodes_as_row = |secs: usize, streaming: bool, speaker_attribution: bool| {
+        let samples = vec![0.0f32; 16_000 * secs];
+        let mut request = EngineCoreRequest::asr("audio").with_model_variant(variant);
+        request.streaming = streaming;
+        request.asr_task.speaker_attribution = speaker_attribution;
+        let plan = crate::engine::asr_route_plan(&samples, 16_000, &capabilities, streaming);
+        nemotron_decodes_as_row(&plan, &request)
+    };
+    for streaming in [false, true] {
+        assert!(decodes_as_row(1, streaming, false));
+        assert!(decodes_as_row(10, streaming, false));
+        assert!(decodes_as_row(20, streaming, false));
+        assert!(!decodes_as_row(60, streaming, false));
+        assert!(!decodes_as_row(600, streaming, false));
+        assert!(!decodes_as_row(10, streaming, true));
+    }
+}
+
 async fn admitted_asr_job(runtime: &RuntimeService, request: &EngineCoreRequest) -> JobLease {
     let (spec, observation) = runtime
         .coordinator_job_for_request(request)

@@ -442,14 +442,14 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            72
+            73
         );
         assert_eq!(
             manifest
                 .iter()
                 .filter(|case| case.retained_state == Stateless)
                 .count(),
-            13
+            12
         );
 
         assert_eq!(
@@ -484,15 +484,6 @@ mod tests {
             )
             .retained_state,
             Managed
-        );
-        assert_eq!(
-            manifest_case(
-                &manifest,
-                ModelVariant::Nemotron35AsrStreaming06B,
-                CapabilityKind::Asr,
-            )
-            .retained_state,
-            Stateless
         );
         // Nemotron 3.5 Transcribe keeps its decoder's pages and Mamba state
         // in the managed arena between quanta.
@@ -558,6 +549,7 @@ mod tests {
             (ModelVariant::WhisperLargeV3Turbo, CapabilityKind::Asr),
             (ModelVariant::VibeVoiceAsr, CapabilityKind::Asr),
             (ModelVariant::ParakeetTdt06BV3, CapabilityKind::Asr),
+            (ModelVariant::Nemotron35AsrStreaming06B, CapabilityKind::Asr),
             (ModelVariant::GraniteSpeech412B, CapabilityKind::Asr),
             (ModelVariant::Lfm25Audio15BGguf, CapabilityKind::Asr),
             (ModelVariant::Lfm25Audio15BGguf, CapabilityKind::Tts),

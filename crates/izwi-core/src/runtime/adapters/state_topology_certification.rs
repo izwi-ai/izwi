@@ -19,6 +19,7 @@ enum CertifiedTopology {
     RetainedPagedTensorAndInvocationPaged,
     RetainedPagedPagedTensorAndInvocationPagedPagedTensor,
     RetainedTensorAndInvocationTensor,
+    RetainedTensorAndInvocationTensorStatic,
     RetainedPagedAndInvocationPagedTensor,
     RetainedPagedAndInvocationPaged,
     RetainedPagedRingAndInvocationPagedRing,
@@ -30,7 +31,6 @@ enum CertifiedTopology {
     InvocationPaged,
     InvocationPagedRing,
     InvocationTensor,
-    InvocationTensorStatic,
 }
 
 impl CertifiedTopology {
@@ -55,13 +55,13 @@ impl CertifiedTopology {
             Self::RetainedPagedPagedTensorAndInvocationPagedPagedTensor => {
                 InferenceStateRequirement::RetainedAndInvocation
             }
-            Self::RetainedTensorAndInvocationTensor => {
+            Self::RetainedTensorAndInvocationTensor
+            | Self::RetainedTensorAndInvocationTensorStatic => {
                 InferenceStateRequirement::RetainedAndInvocation
             }
-            Self::InvocationPaged
-            | Self::InvocationPagedRing
-            | Self::InvocationTensor
-            | Self::InvocationTensorStatic => InferenceStateRequirement::Invocation,
+            Self::InvocationPaged | Self::InvocationPagedRing | Self::InvocationTensor => {
+                InferenceStateRequirement::Invocation
+            }
         }
     }
 
@@ -85,11 +85,11 @@ impl CertifiedTopology {
             | Self::RetainedPagedTensorTensorAndInvocationScratch => true,
             Self::Stateless
             | Self::RetainedTensorAndInvocationTensor
+            | Self::RetainedTensorAndInvocationTensorStatic
             | Self::RetainedAppendRingTensor
             | Self::InvocationPaged
             | Self::InvocationPagedRing
-            | Self::InvocationTensor
-            | Self::InvocationTensorStatic => false,
+            | Self::InvocationTensor => false,
         }
     }
 }
@@ -264,7 +264,10 @@ fn certified_topology(
         // state and the convolution history as one transaction; each stage
         // leases its activations as per-row scratch.
         (NemotronTranscribeAsr, Asr) => RetainedPagedTensorTensorAndInvocationScratch,
-        (NemotronAsr, Asr) => InvocationTensorStatic,
+        // Short clips retain the RNNT predictor between quanta in the
+        // executor session; long audio and diarization lease the predictor
+        // and the static encoder projection per invocation.
+        (NemotronAsr, Asr) => RetainedTensorAndInvocationTensorStatic,
         // Realtime Nemotron retains append/ring/tensor streaming state and
         // uses invocation-scoped workspace for the exact graph.
         (NemotronAsr, RealtimeAsr) => RetainedAppendRingTensor,

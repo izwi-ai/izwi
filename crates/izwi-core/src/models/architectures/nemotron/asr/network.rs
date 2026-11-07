@@ -198,6 +198,18 @@ pub(super) struct NemotronHostMel {
 }
 
 impl NemotronHostMel {
+    /// Silent features of `valid_frames` frames, for tests that need only
+    /// their geometry.
+    #[cfg(test)]
+    pub(super) fn silent(valid_frames: usize) -> Self {
+        let frames = valid_frames + 1;
+        Self {
+            mel: vec![0.0; N_MELS * frames],
+            frames,
+            valid_frames,
+        }
+    }
+
     /// Log-mel columns, including the STFT padding column.
     pub(super) const fn frames(&self) -> usize {
         self.frames
@@ -3108,6 +3120,102 @@ pub(crate) fn nemotron_stem_bytes(feature_frames: usize) -> Result<u64> {
     .try_fold(STEM_PLANES, usize::checked_mul)
     .and_then(|bytes| u64::try_from(bytes).ok())
     .ok_or_else(|| Error::Overloaded("Nemotron stem bytes overflowed".into()))
+}
+
+/// Peak device bytes of one row's share of an offline encoder batch of
+/// `rows` rows padded to `padded` encoder frames: the stem runs row by row,
+/// so its planes count once per batch; the attention scores and masks, the
+/// `rel_shift` buffers, the positional projection copied for every row, a
+/// layer's per-frame activations, the prompt kernel and the joint encoder
+/// projection hold every row. Priced at F32; Metal rounds each whole batch
+/// buffer up to a power of two.
+pub(crate) fn nemotron_encoder_batch_row_bytes(
+    padded: usize,
+    rows: usize,
+    metal: bool,
+) -> Result<u64> {
+    const F32_BYTES: u64 = 4;
+    // About six [T, ff_dim] activations are live inside a layer at once:
+    // the feed-forward block's linear, swish and product, plus residual and
+    // convolution-module buffers.
+    const LAYER_ACTIVATIONS: u64 = 6;
+    let overflow = || Error::Overloaded("Nemotron preparation bytes overflowed".into());
+    let as_u64 = |value: usize| u64::try_from(value).map_err(|_| overflow());
+    let round = |bytes: u64| -> Result<u64> {
+        if metal {
+            bytes.checked_next_power_of_two().ok_or_else(overflow)
+        } else {
+            Ok(bytes)
+        }
+    };
+    let multiply = |values: &[u64]| {
+        values
+            .iter()
+            .try_fold(1u64, |product, value| product.checked_mul(*value))
+            .ok_or_else(overflow)
+    };
+    let (t, rows) = (as_u64(padded.max(1))?, as_u64(rows.max(1))?);
+    let (heads, dim, ff_dim) = (
+        as_u64(ENCODER_HEADS)?,
+        as_u64(ENCODER_DIM)?,
+        as_u64(FF_DIM)?,
+    );
+    let stem = nemotron_stem_bytes(padded.saturating_mul(SUBSAMPLING_FACTOR))?;
+    let terms = [
+        round(stem)?,
+        // The scores and their softmax.
+        multiply(&[2, round(multiply(&[rows, heads, t, t, F32_BYTES])?)?])?,
+        // The chunked-limited mask with each row's key mask.
+        round(multiply(&[rows, t, t, F32_BYTES])?)?,
+        // q_v·pᵀ, its zero pad and the reshaped copy, each [H, T, 2T].
+        multiply(&[3, round(multiply(&[rows, heads, t, 2 * t, F32_BYTES])?)?])?,
+        // The positional projection pᵀ, copied out for every row.
+        round(multiply(&[rows, dim, 2 * t, F32_BYTES])?)?,
+        multiply(&[
+            LAYER_ACTIVATIONS,
+            round(multiply(&[rows, t, ff_dim, F32_BYTES])?)?,
+        ])?,
+        // The prompt kernel's hidden layer and its ReLU.
+        multiply(&[
+            2,
+            round(multiply(&[rows, t, as_u64(PROMPT_HIDDEN)?, F32_BYTES])?)?,
+        ])?,
+        round(multiply(&[rows, t, as_u64(JOINT_HIDDEN)?, F32_BYTES])?)?,
+    ];
+    let batch = terms
+        .into_iter()
+        .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(overflow)?;
+    Ok(batch.div_ceil(rows))
+}
+
+/// Useful and materialized encoder-output elements of a row of
+/// `encoded_len` frames in a batch padded to `padded` frames.
+pub(crate) fn nemotron_encoder_row_elements(
+    encoded_len: usize,
+    padded: usize,
+) -> Result<(u64, u64)> {
+    let elements = |frames: usize| {
+        frames
+            .checked_mul(ENCODER_DIM)
+            .and_then(|elements| u64::try_from(elements).ok())
+            .ok_or_else(|| Error::Overloaded("Nemotron preparation geometry overflowed".into()))
+    };
+    Ok((elements(encoded_len)?, elements(padded.max(encoded_len))?))
+}
+
+/// The retained `[E, JOINT_HIDDEN]` joint encoder projection of one row.
+pub(crate) fn nemotron_encoder_projection_bytes(encoded_len: usize, metal: bool) -> Result<u64> {
+    let bytes = encoded_len
+        .checked_mul(JOINT_HIDDEN)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+        .and_then(|bytes| u64::try_from(bytes).ok());
+    match (bytes, metal) {
+        (Some(bytes), true) => bytes.checked_next_power_of_two(),
+        (bytes, false) => bytes,
+        (None, true) => None,
+    }
+    .ok_or_else(|| Error::Overloaded("Nemotron projection bytes overflowed".into()))
 }
 
 fn causal_stride2_conv_config() -> Conv2dConfig {
@@ -6295,10 +6403,8 @@ pub(super) mod tests {
                 .encode_batch_with_prompts(std::slice::from_ref(input))
                 .unwrap()
                 .remove(0);
-            let solo_projection = network
-                .encode_projection_batch(std::slice::from_ref(input))
-                .unwrap()
-                .remove(0);
+            // A batch of one projects its encode as the decode always has.
+            let solo_projection = network.joint.project_encoder(&solo).unwrap();
             assert_eq!(solo.dims(), [lengths[row], ENCODER_DIM]);
             assert_eq!(solo_projection.dims(), [lengths[row], JOINT_HIDDEN]);
             for (batched, alone) in [(&encoded[row], &solo), (&projected[row], &solo_projection)] {

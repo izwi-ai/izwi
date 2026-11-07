@@ -1142,6 +1142,8 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                         );
                     let parakeet_asr = execution.metadata().capability == CapabilityKind::Asr
                         && variant.family() == crate::catalog::ModelFamily::ParakeetAsr;
+                    let nemotron_asr = execution.metadata().capability == CapabilityKind::Asr
+                        && variant.family() == crate::catalog::ModelFamily::NemotronAsr;
                     let nemotron_transcribe_asr = execution.metadata().capability
                         == CapabilityKind::Asr
                         && variant.family() == crate::catalog::ModelFamily::NemotronTranscribeAsr;
@@ -1162,6 +1164,7 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                         || qwen3_tts
                         || retained_tts
                         || parakeet_asr
+                        || nemotron_asr
                         || nemotron_transcribe_asr
                         || engine_realtime
                         || nemotron_realtime)
@@ -2595,7 +2598,7 @@ fn lfm25_audio_asr_factory_publishes_sealed_retained_graph_and_atomic_long_form(
 /// chunked atomic stage for every request: a long file dispatches one chunk
 /// at a time (it used to hold the device for the whole file), and the normal
 /// and long-form requirements seal the same graph, so the load keeps one
-/// invocation pool. Nemotron's scalar ASR keeps its single-dispatch stage.
+/// invocation pool. Nemotron's long-form ASR keeps its single-dispatch stage.
 #[test]
 fn granite_speech5_scalar_asr_dispatches_one_chunk_at_a_time() {
     let registry = RuntimeAdapterRegistry::built_in();
@@ -2642,7 +2645,7 @@ fn granite_speech5_scalar_asr_dispatches_one_chunk_at_a_time() {
         .capabilities
         .get(&CapabilityKind::Asr)
         .unwrap()
-        .contract(StreamingRequirements::NONE)
+        .contract(StreamingRequirements::NONE.with_asr_long_form(true))
         .unwrap();
     assert_eq!(scalar.stages[0].name, "asr.scalar");
     assert_eq!(scalar.stages[0].progress, StageProgressKind::Atomic);
@@ -2786,6 +2789,133 @@ fn parakeet_long_form_graph_is_one_atomic_stage_beside_the_sequence_graph() {
             kind: "diarization.transcribe".into(),
         })
         .is_ok());
+}
+
+/// Nemotron 3.5 ASR Streaming's offline graph decodes short clips as
+/// retained rows (a static encoder preparation batched across requests, a
+/// static predictor prefill and a continuous RNNT decode), while long audio
+/// and diarization keep the one-stage atomic graph the scalar adapter
+/// sealed, bit for bit, under the new adapter's identity.
+#[test]
+fn nemotron_offline_graph_is_retained_rows_beside_the_scalar_atomic_graph() {
+    let registry = RuntimeAdapterRegistry::built_in();
+    let metadata = *registry
+        .require(CapabilityKind::Asr, ModelVariant::Nemotron35AsrStreaming06B)
+        .unwrap();
+    assert_eq!(
+        metadata.state_requirement,
+        InferenceStateRequirement::RetainedAndInvocation
+    );
+    let adapter = NemotronAsrExecutionAdapter::new(
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(2),
+        metadata,
+        BackendKind::Cpu,
+        4,
+    );
+    let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
+    assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
+    assert_eq!(normal.execution_profile.cache_mode, CacheMode::None);
+    assert_eq!(normal.adapter_abi_revision, AdapterAbiRevision::new(1));
+    assert_eq!(
+        normal
+            .stages
+            .iter()
+            .map(|stage| (stage.name.as_str(), stage.selector, stage.batch_mode))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "asr.encoder.nemotron",
+                StageWorkSelector::PreSequencePreparation,
+                NativeBatchMode::Static
+            ),
+            (
+                "asr.prefill.nemotron.predictor",
+                StageWorkSelector::SequencePrefill,
+                NativeBatchMode::Static
+            ),
+            (
+                "asr.decode.nemotron.joint",
+                StageWorkSelector::SequenceDecode,
+                NativeBatchMode::Continuous
+            ),
+        ]
+    );
+    // Concurrent clips encode as one padded batch of the engine's width,
+    // each row with the budget a lone row had.
+    let preparation = &normal.stages[0];
+    assert_eq!(preparation.concurrency, ConcurrencyClass::Batchable);
+    assert_eq!(preparation.shape_policy, StageShapePolicy::Padded);
+    assert_eq!(preparation.progress, StageProgressKind::Atomic);
+    assert_eq!(preparation.max_batch_size, 4);
+    assert_eq!(preparation.max_work_units, 4 * 64 * 1024 * 1024);
+    assert_eq!(preparation.max_workspace_bytes, 4 * 1024 * 1024 * 1024);
+    for stage in &normal.stages[1..] {
+        assert_eq!(stage.max_batch_size, 4);
+        assert_eq!(stage.concurrency, ConcurrencyClass::Batchable);
+        assert_eq!(stage.shape_policy, StageShapePolicy::Ragged);
+        assert_eq!(stage.workspace_per_row_bytes, 16 * 1024 * 1024);
+        assert_eq!(stage.max_workspace_bytes, 4 * 16 * 1024 * 1024);
+        assert_eq!(
+            stage.retained_state_selections,
+            Some(vec![ClockedStateSelection::new(
+                crate::models::architectures::nemotron::asr::NEMOTRON_OFFLINE_GROUP,
+                StateClock::DecoderTokens,
+            )
+            .unwrap()])
+        );
+    }
+    let solo = NemotronAsrExecutionAdapter::new(
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(2),
+        metadata,
+        BackendKind::Cpu,
+        1,
+    )
+    .contract(StreamingRequirements::NONE)
+    .unwrap();
+    assert_eq!(solo.stages[0].max_batch_size, 1);
+    assert_eq!(solo.stages[0].max_workspace_bytes, 1024 * 1024 * 1024);
+
+    for streaming in [
+        StreamingRequirements::NONE,
+        StreamingRequirements::transport_only(),
+    ] {
+        let long = adapter
+            .contract(streaming.with_asr_long_form(true))
+            .unwrap();
+        let scalar = scalar_contract(
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            adapter.adapter_instance_id(),
+            adapter.adapter_abi_revision(),
+            metadata,
+            BackendKind::Cpu,
+            1,
+            streaming,
+        )
+        .unwrap();
+        assert_eq!(long.execution_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(long.adapter_abi_revision, AdapterAbiRevision::new(1));
+        assert_eq!(long.stages.len(), 1);
+        assert_eq!(long.stages[0].name, "asr.scalar");
+        assert_eq!(long.stages[0].batch_mode, NativeBatchMode::None);
+        assert_eq!(long.stages[0].max_batch_size, 1);
+        assert_eq!(
+            crate::kv::v2::stage_graph_fingerprint(&long.stages).unwrap(),
+            crate::kv::v2::stage_graph_fingerprint(&scalar.stages).unwrap(),
+        );
+        assert!(long
+            .adapter_binding()
+            .unwrap()
+            .stage_for_work(&crate::engine::WorkUnit::AtomicJob {
+                kind: "diarization.transcribe".into(),
+            })
+            .is_ok());
+    }
+    assert!(adapter
+        .contract(StreamingRequirements::native(true))
+        .is_err());
 }
 
 /// A Granite Speech ASR adapter with its retained sequence route on. The

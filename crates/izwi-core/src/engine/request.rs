@@ -40,6 +40,7 @@ use crate::models::architectures::maya1::retained::Maya1PreparedArtifact;
 use crate::models::architectures::maya1::Maya1GenerationParams;
 use crate::models::architectures::maya2::retained::Maya2PreparedArtifact;
 use crate::models::architectures::maya2::Maya2GenerationParams;
+use crate::models::architectures::nemotron::asr::NemotronPreparedEncoderArtifact;
 use crate::models::architectures::parakeet::asr::ParakeetPreparedEncoderArtifact;
 use crate::models::architectures::qwen3::asr::Qwen3AsrPreparedAudio;
 use crate::models::architectures::qwen3::tts::{
@@ -908,6 +909,7 @@ enum PreparedAsrEncoderArtifactValue {
     GraniteSpeech(Arc<GraniteSpeechPreparedPromptArtifact>),
     Lfm25Audio(Arc<Lfm25AudioPreparedAsrArtifact>),
     Parakeet(Arc<ParakeetPreparedEncoderArtifact>),
+    Nemotron(Arc<NemotronPreparedEncoderArtifact>),
 }
 
 impl fmt::Debug for PreparedAsrEncoderArtifact {
@@ -930,6 +932,7 @@ impl crate::backends::DeviceResident for PreparedAsrEncoderArtifactValue {
             Self::GraniteSpeech(value) => Some(value.device_location()),
             Self::Lfm25Audio(value) => Some(value.device_location()),
             Self::Parakeet(value) => Some(value.device_location()),
+            Self::Nemotron(value) => Some(value.device_location()),
         }
     }
 }
@@ -943,6 +946,7 @@ impl PreparedAsrEncoderArtifactValue {
             Self::GraniteSpeech(_) => "granite_speech",
             Self::Lfm25Audio(_) => "lfm25_audio",
             Self::Parakeet(_) => "parakeet",
+            Self::Nemotron(_) => "nemotron",
         }
     }
 
@@ -960,6 +964,7 @@ impl PreparedAsrEncoderArtifactValue {
                 Ok((value.retained_host_bytes, value.retained_resident_bytes))
             }
             Self::Parakeet(value) => Ok((0, value.resident_tensor_bytes()?)),
+            Self::Nemotron(value) => Ok((0, value.resident_tensor_bytes()?)),
         }
     }
 
@@ -970,7 +975,8 @@ impl PreparedAsrEncoderArtifactValue {
             | Self::Whisper(_)
             | Self::GraniteSpeech(_)
             | Self::Lfm25Audio(_)
-            | Self::Parakeet(_) => &[],
+            | Self::Parakeet(_)
+            | Self::Nemotron(_) => &[],
         }
     }
 }
@@ -1294,14 +1300,17 @@ impl RequestProcessor {
 
         request.stream_policy.validate()?;
 
-        // Parakeet preparation already bounded max_tokens by the input's
-        // emittable labels (E × max_symbols). Long audio exceeds the token
-        // context, which limits nothing in Parakeet's decode, so only an
-        // unprepared Parakeet request keeps the context clamp.
+        // Parakeet and Nemotron preparation already bounded max_tokens by
+        // the input's emittable labels (E × max_symbols). Long audio exceeds
+        // the token context, which limits nothing in their recurrent decode,
+        // so only an unprepared request keeps the context clamp.
         let output_bound_prepared = request.task_type == TaskType::ASR
-            && request
-                .model_variant
-                .is_some_and(|variant| variant.family() == ModelFamily::ParakeetAsr)
+            && request.model_variant.is_some_and(|variant| {
+                matches!(
+                    variant.family(),
+                    ModelFamily::ParakeetAsr | ModelFamily::NemotronAsr
+                )
+            })
             && request.prepared_sequence_input_tokens.is_some();
 
         // Validate and clamp parameters

@@ -82,6 +82,10 @@ use crate::models::architectures::maya1::{
 use crate::models::architectures::maya2::{
     resolve_language, Maya2GenerationParams, Maya2SamplingParams, Maya2Voice,
 };
+use crate::models::architectures::nemotron::asr::{
+    NemotronEncoderBatchRow, NemotronHostFeatures, NemotronPreparedEncoderArtifact,
+    NEMOTRON_ENCODER_STAGE,
+};
 use crate::models::architectures::parakeet::asr::{
     ParakeetEncoderBatchRow, ParakeetHostFeatures, ParakeetPreparedEncoderArtifact,
 };
@@ -145,13 +149,16 @@ mod tts_preparation;
 #[cfg(test)]
 use asr_encoders::granite_speech_deadline_budget_bucket;
 use asr_encoders::{
-    GraniteSpeechEncoderBatcher, GraniteSpeechEncoderPending, ParakeetEncoderBatcher,
-    ParakeetEncoderPending, QwenAsrEncoderBatcher, QwenAsrEncoderPending, VibeVoiceEncoderBatcher,
-    VibeVoiceEncoderPending, WhisperEncoderBatcher, WhisperEncoderPending,
+    GraniteSpeechEncoderBatcher, GraniteSpeechEncoderPending, NemotronEncoderBatcher,
+    NemotronEncoderPending, ParakeetEncoderBatcher, ParakeetEncoderPending, QwenAsrEncoderBatcher,
+    QwenAsrEncoderPending, VibeVoiceEncoderBatcher, VibeVoiceEncoderPending, WhisperEncoderBatcher,
+    WhisperEncoderPending,
 };
 use asr_preparation::asr_encoder_retained_resources;
 #[cfg(test)]
 use asr_preparation::install_parakeet_decode_budget;
+#[cfg(test)]
+use asr_preparation::{install_nemotron_decode_budget, nemotron_decodes_as_row};
 #[cfg(test)]
 use chat_invocation::RuntimeChatInvocationDriver;
 pub use chat_invocation::{
@@ -963,6 +970,7 @@ pub struct RuntimeService {
     vibevoice_encoder_batcher: Arc<VibeVoiceEncoderBatcher>,
     granite_speech_encoder_batcher: Arc<GraniteSpeechEncoderBatcher>,
     parakeet_encoder_batcher: Arc<ParakeetEncoderBatcher>,
+    nemotron_encoder_batcher: Arc<NemotronEncoderBatcher>,
     pub(super) asr_realtime_sessions: RealtimeAsrSessionPolicy,
     telemetry: Arc<RuntimeTelemetryCollector>,
     completion_waiters: Arc<RuntimeCompletionWaiters>,
