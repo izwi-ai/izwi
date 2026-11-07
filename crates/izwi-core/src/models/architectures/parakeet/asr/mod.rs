@@ -204,6 +204,17 @@ struct EncoderWindow {
 }
 
 impl EncoderWindow {
+    /// The one window of an input of at most one window: every frame is
+    /// encoded and kept.
+    const fn whole(encoded_len: usize) -> Self {
+        Self {
+            start: 0,
+            end: encoded_len,
+            keep_start: 0,
+            keep_end: encoded_len,
+        }
+    }
+
     /// The log-mel columns that produce this window's frames: whole groups
     /// of the ×8 subsampling, clipped to the spectrogram. Stopping at
     /// `8 · end` also drops the STFT padding column when the valid frames are
@@ -226,12 +237,7 @@ fn plan_encoder_windows(
 ) -> Result<Vec<EncoderWindow>> {
     if encoded_len <= window {
         return Ok((encoded_len > 0)
-            .then_some(EncoderWindow {
-                start: 0,
-                end: encoded_len,
-                keep_start: 0,
-                keep_end: encoded_len,
-            })
+            .then_some(EncoderWindow::whole(encoded_len))
             .into_iter()
             .collect());
     }
@@ -338,6 +344,27 @@ pub(crate) fn parakeet_encode_row_bytes(
         window_bytes: encoder_window_row_bytes(padded_frames, rows, backend)?,
         output_bytes: encoder_output_bytes(features.encoded_len(), backend)?,
     })
+}
+
+/// Useful and materialized encoder-output elements of one row in a batch
+/// padded to `padded_frames`: a single-window row is padded up to the
+/// batch's longest row, a longer row (always alone) never.
+pub(crate) fn parakeet_encode_row_elements(
+    features: &ParakeetHostFeatures,
+    padded_frames: usize,
+) -> Result<(u64, u64)> {
+    let padding = padded_frames.saturating_sub(features.window_frames());
+    let elements = |frames: usize| {
+        frames
+            .checked_mul(EncoderGeometry::V3.dim)
+            .and_then(|elements| u64::try_from(elements).ok())
+            .ok_or_else(|| Error::Overloaded("Parakeet preparation geometry overflowed".into()))
+    };
+    let encoded_len = features.encoded_len();
+    Ok((
+        elements(encoded_len)?,
+        elements(encoded_len.saturating_add(padding))?,
+    ))
 }
 
 /// One row's share of the peak of an encoder batch of `rows` windows of
@@ -752,6 +779,14 @@ fn tdt_word_timestamps(
     words
 }
 
+/// One request of a Parakeet encoder batch.
+pub(crate) struct ParakeetEncoderBatchRow<'a> {
+    pub(crate) features: &'a ParakeetHostFeatures,
+    pub(crate) language: Option<&'a str>,
+    /// Fails when the request is cancelled or past its deadline.
+    pub(crate) checkpoint: &'a dyn Fn() -> Result<()>,
+}
+
 impl ParakeetAsrModel {
     pub(crate) fn new_predictor_batch_state(
         &self,
@@ -885,6 +920,71 @@ impl ParakeetAsrModel {
             self.encoder_windowing,
             encode_ms,
         ))
+    }
+
+    /// Encodes the rows of one preparation batch. A single row runs
+    /// [`Self::encode_host_features`]; wider batches hold only single-window
+    /// rows, which encode as one padded batch. A row whose checkpoint fails
+    /// before the encode fails alone; an encoder error fails the batch.
+    pub(crate) fn prepare_retained_encoder_batch(
+        &self,
+        rows: &[ParakeetEncoderBatchRow<'_>],
+    ) -> Result<Vec<Result<ParakeetPreparedEncoderArtifact>>> {
+        if let [row] = rows {
+            return match self.encode_host_features(row.features, row.language, row.checkpoint) {
+                Ok(artifact) => Ok(vec![Ok(artifact)]),
+                Err(error @ (Error::Cancelled(_) | Error::Timeout(_))) => Ok(vec![Err(error)]),
+                Err(error) => Err(error),
+            };
+        }
+        if rows.iter().any(|row| !row.features.single_window()) {
+            return Err(Error::InvalidInput(
+                "Parakeet encoder batches hold only single-window rows".into(),
+            ));
+        }
+        let mut outcomes = rows
+            .iter()
+            .map(|row| (row.checkpoint)().err().map(Err))
+            .collect::<Vec<Option<Result<ParakeetPreparedEncoderArtifact>>>>();
+        let live = (0..rows.len())
+            .filter(|index| outcomes[*index].is_none())
+            .collect::<Vec<_>>();
+        if let [index] = live[..] {
+            let row = &rows[index];
+            outcomes[index] =
+                Some(self.encode_host_features(row.features, row.language, row.checkpoint));
+        } else if !live.is_empty() {
+            let device = self.preprocessor.device();
+            let encode_started = Instant::now();
+            let inputs = live
+                .iter()
+                .map(|index| {
+                    let features = rows[*index].features;
+                    let encoded_len = features.encoded_len();
+                    let columns = EncoderWindow::whole(encoded_len)
+                        .feature_columns(features.feature_frames());
+                    let window = features.log_mel.normalize_and_upload(columns, device)?;
+                    Ok((window, encoded_len))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let encoded = self.network.encoder.encode_single_window_batch(&inputs)?;
+            drop(inputs);
+            let encode_ms = elapsed_ms(encode_started);
+            for (index, encoded) in live.into_iter().zip(encoded) {
+                let row = &rows[index];
+                outcomes[index] = Some(Ok(row.features.artifact(
+                    encoded,
+                    1,
+                    row.language,
+                    self.encoder_windowing,
+                    encode_ms,
+                )));
+            }
+        }
+        Ok(outcomes
+            .into_iter()
+            .map(|outcome| outcome.expect("every Parakeet batch row has an outcome"))
+            .collect())
     }
 
     /// Runs the windowed encoder over a host log-mel, normalizing each
@@ -1930,7 +2030,7 @@ impl ParakeetEncoder {
             let mut outputs = vec![("pre_encode".to_string(), x.clone())];
             let pos = build_rel_positional_embedding(x.dim(1)?, geometry.dim, device)?;
             for (index, layer) in self.layers.iter().enumerate() {
-                x = layer.forward(&x, &pos)?;
+                x = layer.forward(&x, &pos, None)?;
                 outputs.push((format!("layers.{index}"), x.clone()));
             }
             Ok::<_, Error>(outputs)
@@ -1972,17 +2072,8 @@ impl ParakeetEncoder {
 
             let frames = window.end - window.start;
             let pre_encode_started = Instant::now();
-            let x = self.pre_encode.forward(&features)?;
+            let mut x = self.stem_window(&features, frames)?;
             drop(features);
-            if x.dim(1)? < frames {
-                return Err(Error::InferenceError(format!(
-                    "Parakeet window produced {} encoder frames, expected {frames}",
-                    x.dim(1)?
-                )));
-            }
-            // Attention must see only this window's frames, never one made
-            // purely of STFT padding.
-            let mut x = x.narrow(1, 0, frames)?;
             timings.pre_encode_ms += elapsed_ms(pre_encode_started);
 
             // Relative positions depend only on i - j, so one embedding of
@@ -1996,7 +2087,7 @@ impl ParakeetEncoder {
 
             let layers_started = Instant::now();
             for layer in &self.layers {
-                x = layer.forward(&x, &pos)?;
+                x = layer.forward(&x, &pos, None)?;
             }
             timings.encoder_layers_ms += elapsed_ms(layers_started);
             pos_emb = Some(pos);
@@ -2031,6 +2122,104 @@ impl ParakeetEncoder {
             })?,
             encoded_len,
             windows: plan.len(),
+        })
+    }
+
+    /// The stem over one window's `[1, mel_bins, columns]` features, cut to
+    /// the window's `frames` encoder frames.
+    fn stem_window(&self, features: &Tensor, frames: usize) -> Result<Tensor> {
+        let x = self.pre_encode.forward(features)?;
+        if x.dim(1)? < frames {
+            return Err(Error::InferenceError(format!(
+                "Parakeet window produced {} encoder frames, expected {frames}",
+                x.dim(1)?
+            )));
+        }
+        // Attention must see only this window's frames, never one made
+        // purely of STFT padding.
+        x.narrow(1, 0, frames).map_err(Error::from)
+    }
+
+    /// Encodes single-window rows, each `(features, frames)` as
+    /// [`Self::encode_windows`] takes its one window, in one batch. Each row
+    /// runs the stem alone (about 1.5% of the work): padded log-mel columns
+    /// would leave its first convolution as ReLU(bias), not zero, and the
+    /// next convolution would read them into real frames. The stem outputs
+    /// are zero-padded to the longest row and the layers run once over
+    /// `[B, T, D]` with the padding masked (see [`EncoderPadding`]). Each
+    /// row's frames are copied out, so no output keeps the batch buffer
+    /// alive.
+    fn encode_single_window_batch(&self, rows: &[(Tensor, usize)]) -> Result<Vec<Tensor>> {
+        let lengths = rows.iter().map(|(_, frames)| *frames).collect::<Vec<_>>();
+        let padded = lengths.iter().copied().max().unwrap_or(0);
+        let stems = rows
+            .iter()
+            .map(|(features, frames)| {
+                self.stem_window(features, *frames)?
+                    .pad_with_zeros(1, 0, padded - frames)
+                    .map_err(Error::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let x = Tensor::cat(&stems, 0)?;
+        drop(stems);
+        let encoded = self.encode_padded(x, &lengths)?;
+        lengths
+            .iter()
+            .enumerate()
+            .map(|(row, frames)| {
+                let frames = encoded.narrow(0, row, 1)?.narrow(1, 0, *frames)?;
+                deep_copy_tensor_storage(&frames).map_err(Error::from)
+            })
+            .collect()
+    }
+
+    /// The conformer layers over a zero-padded `[B, T, D]` batch whose row
+    /// `b` holds `lengths[b]` real frames.
+    fn encode_padded(&self, mut x: Tensor, lengths: &[usize]) -> Result<Tensor> {
+        let padded = x.dim(1)?;
+        let padding = EncoderPadding::new(lengths, padded, x.dtype(), x.device())?;
+        let pos = build_rel_positional_embedding(padded, self.geometry.dim, x.device())?;
+        for layer in &self.layers {
+            x = layer.forward(&x, &pos, Some(&padding))?;
+        }
+        Ok(x)
+    }
+}
+
+/// The padding of a batch of encoder rows zero-padded to one length. A
+/// padded frame must reach no real frame: attention adds `key_bias` to its
+/// scores, so a padded key's weight is exactly zero, and the convolution
+/// module zeroes padded frames before its depthwise convolution, whose
+/// kernel would otherwise read them from the last real frames. Padded
+/// frames stay finite (every query has a real key), since a non-finite
+/// value times a zero weight would still poison a sum.
+struct EncoderPadding {
+    /// `[B, 1, 1, T]`: 0 on real keys, -1e9 on padding.
+    key_bias: Tensor,
+    /// `[B, 1, T]`: 1 on real frames, 0 on padding.
+    frames: Tensor,
+}
+
+impl EncoderPadding {
+    fn new(lengths: &[usize], padded: usize, dtype: DType, device: &Device) -> Result<Self> {
+        const MASKED_SCORE: f32 = -1e9;
+        if lengths.is_empty() || lengths.iter().any(|len| *len == 0 || *len > padded) {
+            return Err(Error::InvalidInput(format!(
+                "Parakeet batch rows {lengths:?} do not fit {padded} padded frames"
+            )));
+        }
+        let frames = lengths
+            .iter()
+            .flat_map(|len| (0..padded).map(move |frame| f32::from(u8::from(frame < *len))))
+            .collect::<Vec<_>>();
+        let key_bias = frames
+            .iter()
+            .map(|real| if *real > 0.0 { 0.0 } else { MASKED_SCORE })
+            .collect::<Vec<_>>();
+        let rows = lengths.len();
+        Ok(Self {
+            key_bias: Tensor::from_vec(key_bias, (rows, 1, 1, padded), device)?.to_dtype(dtype)?,
+            frames: Tensor::from_vec(frames, (rows, 1, padded), device)?.to_dtype(dtype)?,
         })
     }
 }
@@ -2242,18 +2431,30 @@ impl ConformerLayer {
         })
     }
 
-    fn forward(&self, x: &Tensor, pos_emb: &Tensor) -> Result<Tensor> {
+    /// One layer over `x`; `padding` masks the padded frames of a batch,
+    /// and `None` runs an unpadded input.
+    fn forward(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        padding: Option<&EncoderPadding>,
+    ) -> Result<Tensor> {
         let mut residual = x.clone();
 
         let ff1 = self.ff1.forward(&self.norm_ff1.forward(&residual)?)?;
         residual = residual.broadcast_add(&ff1.affine(0.5, 0.0)?)?;
 
-        let attn = self
-            .self_attn
-            .forward(&self.norm_self_att.forward(&residual)?, pos_emb)?;
+        let attn = self.self_attn.forward(
+            &self.norm_self_att.forward(&residual)?,
+            pos_emb,
+            padding.map(|padding| &padding.key_bias),
+        )?;
         residual = residual.broadcast_add(&attn)?;
 
-        let conv = self.conv.forward(&self.norm_conv.forward(&residual)?)?;
+        let conv = self.conv.forward(
+            &self.norm_conv.forward(&residual)?,
+            padding.map(|padding| &padding.frames),
+        )?;
         residual = residual.broadcast_add(&conv)?;
 
         let ff2 = self.ff2.forward(&self.norm_ff2.forward(&residual)?)?;
@@ -2356,7 +2557,9 @@ impl ConformerConv {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    /// The convolution module over `[B, T, C]`; `frame_mask` (`[B, 1, T]`)
+    /// zeroes a padded batch's padded frames before the depthwise conv.
+    fn forward(&self, x: &Tensor, frame_mask: Option<&Tensor>) -> Result<Tensor> {
         // [B, T, C] -> [B, C, T]
         let mut x = x.transpose(1, 2)?;
 
@@ -2364,6 +2567,9 @@ impl ConformerConv {
         let x_a = x.i((.., ..self.dim, ..))?;
         let x_b = x.i((.., self.dim.., ..))?;
         x = x_a.broadcast_mul(&ops::sigmoid(&x_b)?)?;
+        if let Some(frame_mask) = frame_mask {
+            x = x.broadcast_mul(frame_mask)?;
+        }
 
         if let Some(fused) = metal_kernels::try_depthwise_conv1d_bias_swish(
             &x,
@@ -2475,7 +2681,9 @@ impl RelPosSelfAttention {
         })
     }
 
-    fn forward(&self, x: &Tensor, pos_emb: &Tensor) -> Result<Tensor> {
+    /// Attention over `x`; `key_bias` (`[B, 1, 1, T]`) is added to the
+    /// scores of a padded batch, before the softmax.
+    fn forward(&self, x: &Tensor, pos_emb: &Tensor, key_bias: Option<&Tensor>) -> Result<Tensor> {
         let (b, t, d) = x.dims3()?;
         let (heads, head_dim) = (self.heads, self.head_dim);
 
@@ -2512,6 +2720,14 @@ impl RelPosSelfAttention {
 
         let k_t = k.transpose(2, 3)?.contiguous()?;
         let p_t = p.transpose(2, 3)?.contiguous()?;
+        // Every row of a batch reads the same projection; the matmul takes
+        // equal batch dimensions.
+        let p_t = if b > 1 {
+            p_t.broadcast_as((b, heads, head_dim, 2 * t - 1))?
+                .contiguous()?
+        } else {
+            p_t
+        };
         let matrix_ac = q_u.matmul(&k_t)?;
         let matrix_bd = rel_shift(&q_v.matmul(&p_t)?)?;
         let matrix_bd = matrix_bd.narrow(3, 0, t)?;
@@ -2519,6 +2735,10 @@ impl RelPosSelfAttention {
         let scores = matrix_ac
             .broadcast_add(&matrix_bd)?
             .affine(1.0 / (head_dim as f64).sqrt(), 0.0)?;
+        let scores = match key_bias {
+            Some(key_bias) => scores.broadcast_add(key_bias)?,
+            None => scores,
+        };
         let scores = if scores.is_contiguous() {
             scores
         } else {
@@ -3076,9 +3296,10 @@ mod tests {
         parakeet_preparation_bytes, parakeet_tensor_is_f16_projection, plan_encoder_windows,
         subsampled_len_3x, tdt_word_timestamps, EncoderGeometry, EncoderWindow, EncoderWindowing,
         Joint, LstmCell, ParakeetAsrModel, ParakeetDecoder, ParakeetEncoded, ParakeetEncoder,
-        ParakeetLogMel, ParakeetNetwork, ParakeetPreparedEncoderArtifact, ParakeetPreprocessor,
-        ParakeetRetainedDecodeBatchRow, ParakeetRetainedDecodeStep, ParakeetTimings, Predictor,
-        TdtTokenFrame, DEFAULT_MAX_SYMBOLS, PRED_HIDDEN,
+        ParakeetEncoderBatchRow, ParakeetHostFeatures, ParakeetLogMel, ParakeetNetwork,
+        ParakeetPreparedEncoderArtifact, ParakeetPreprocessor, ParakeetRetainedDecodeBatchRow,
+        ParakeetRetainedDecodeStep, ParakeetTimings, Predictor, TdtTokenFrame, DEFAULT_MAX_SYMBOLS,
+        PRED_HIDDEN,
     };
     use super::{tdt_batch_labels_and_durations, tdt_label_and_duration};
     use crate::backends::{BackendKind, DTypeSelection};
@@ -3299,7 +3520,7 @@ mod tests {
             build_rel_positional_embedding(x.dim(1).unwrap(), encoder.geometry.dim, x.device())
                 .unwrap();
         for layer in &encoder.layers {
-            x = layer.forward(&x, &pos).unwrap();
+            x = layer.forward(&x, &pos, None).unwrap();
         }
         x.narrow(1, 0, encoded_len).unwrap()
     }
@@ -3354,7 +3575,7 @@ mod tests {
         for layer in &encoder.layers {
             let conv = &layer.conv;
             let calls = crate::kernels::depthwise_conv::depthwise_conv1d_calls();
-            let actual = conv.forward(&x).unwrap();
+            let actual = conv.forward(&x, None).unwrap();
             assert!(crate::kernels::depthwise_conv::depthwise_conv1d_calls() > calls);
 
             let h = conv
@@ -4172,6 +4393,296 @@ mod tests {
         // An empty or rate-less input never reaches the device.
         assert!(model.prepare_host_features(&[], 16_000).is_err());
         assert!(model.prepare_host_features(&audio, 0).is_err());
+    }
+
+    /// Host features of a 16 kHz input that encodes to `encoded_len` frames;
+    /// its STFT padding column shares the last encoder frame.
+    fn features_of_frames(
+        model: &ParakeetAsrModel,
+        encoded_len: usize,
+        seed: u64,
+    ) -> ParakeetHostFeatures {
+        let samples = (8 * encoded_len - 3) * 160 + 77;
+        let audio = XorShift(seed).values(samples, 0.1, 0.0);
+        let features = model.prepare_host_features(&audio, 16_000).unwrap();
+        assert_eq!(features.encoded_len(), encoded_len);
+        features
+    }
+
+    fn batch_row<'a>(
+        features: &'a ParakeetHostFeatures,
+        checkpoint: &'a dyn Fn() -> Result<()>,
+    ) -> ParakeetEncoderBatchRow<'a> {
+        ParakeetEncoderBatchRow {
+            features,
+            language: Some("en"),
+            checkpoint,
+        }
+    }
+
+    fn ready() -> Result<()> {
+        Ok(())
+    }
+
+    /// A padded batch encodes each single-window row as the row alone does,
+    /// whatever lengths share it. Rows of one length batch bit for bit on
+    /// the dev Mac; padding regroups the CPU softmax's vectorized sum (its
+    /// tail joins the SIMD lanes), so padded rows agree within a few F32
+    /// ulps of the output's scale.
+    #[test]
+    fn batched_encode_matches_solo_encode_for_mixed_lengths() {
+        let device = Device::Cpu;
+        let model = forced_label_model(&device);
+        let lengths = [1usize, 3, 37, 64, 125];
+        let features = lengths
+            .iter()
+            .zip(31..)
+            .map(|(len, seed)| features_of_frames(&model, *len, seed))
+            .collect::<Vec<_>>();
+        let solo = features
+            .iter()
+            .map(|features| model.encode_host_features(features, None, &ready).unwrap())
+            .collect::<Vec<_>>();
+        let scale = solo
+            .iter()
+            .map(|artifact| {
+                let values = artifact.encoded.flatten_all().unwrap().to_vec1::<f32>();
+                values
+                    .unwrap()
+                    .into_iter()
+                    .fold(0f32, |max, value| max.max(value.abs()))
+            })
+            .fold(0f32, f32::max);
+        let mut worst = 0f32;
+        for batch in [&[0usize, 1, 2, 3, 4][..], &[2, 3], &[4, 0, 1]] {
+            let rows = batch
+                .iter()
+                .map(|index| batch_row(&features[*index], &ready))
+                .collect::<Vec<_>>();
+            let batched = model.prepare_retained_encoder_batch(&rows).unwrap();
+            assert_eq!(batched.len(), batch.len());
+            for (index, artifact) in batch.iter().zip(batched) {
+                let artifact = artifact.unwrap();
+                assert_eq!(artifact.encoded.dims(), solo[*index].encoded.dims());
+                assert_eq!(artifact.encoded_len, lengths[*index]);
+                assert_eq!(artifact.encoder_windows, 1);
+                assert_eq!(artifact.language.as_deref(), Some("en"));
+                assert_eq!(artifact.feature_frames, solo[*index].feature_frames);
+                // Its own exact storage, not a view pinning the batch buffer.
+                assert_eq!(
+                    artifact.resident_tensor_bytes().unwrap(),
+                    (lengths[*index] * TINY.dim * 4) as u64
+                );
+                worst = worst.max(max_abs_diff(&artifact.encoded, &solo[*index].encoded));
+            }
+        }
+        eprintln!(
+            "Parakeet batched vs solo encode on CPU: max |diff| {worst:e} over max |x| {scale} ({})",
+            if worst == 0.0 {
+                "bit-exact"
+            } else {
+                "not bit-exact"
+            }
+        );
+        assert!(
+            worst <= 1e-6 * scale.max(1.0),
+            "max |diff| {worst} of {scale}"
+        );
+    }
+
+    /// The padded batch on Metal: the fused depthwise kernel reads the masked
+    /// frames, and each row's output is an exact-size copy.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_batched_encode_matches_solo_encode() {
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_batched_encode_matches_solo_encode")
+        else {
+            return;
+        };
+        let model = forced_label_model(&device);
+        let lengths = [3usize, 37, 64];
+        let features = lengths
+            .iter()
+            .zip(51..)
+            .map(|(len, seed)| features_of_frames(&model, *len, seed))
+            .collect::<Vec<_>>();
+        let rows = features
+            .iter()
+            .map(|features| batch_row(features, &ready))
+            .collect::<Vec<_>>();
+        let batched = model.prepare_retained_encoder_batch(&rows).unwrap();
+        for ((features, len), artifact) in features.iter().zip(lengths).zip(batched) {
+            let artifact = artifact.unwrap();
+            let solo = model.encode_host_features(features, None, &ready).unwrap();
+            let scale = host_f32(&solo.encoded)
+                .unwrap()
+                .into_iter()
+                .fold(0f32, |max, value| max.max(value.abs()));
+            let diff = max_abs_diff(&artifact.encoded, &solo.encoded);
+            assert!(diff <= 1e-5 * scale.max(1.0), "{len}: {diff:e} of {scale}");
+            assert_eq!(
+                artifact.resident_tensor_bytes().unwrap(),
+                (len * TINY.dim * 4) as u64
+            );
+        }
+    }
+
+    /// Padded frames reach no real frame: poisoning them with ±1e3 after the
+    /// stem leaves every real frame's output bit for bit, and every padded
+    /// frame stays finite. The same layers without the masks let it in.
+    #[test]
+    fn padded_frames_never_reach_real_frames() {
+        let device = Device::Cpu;
+        let encoder = random_encoder(TINY, 0xBAD5, &device);
+        let lengths = [37usize, 64, 5];
+        let padded = 64;
+        let stems = lengths
+            .iter()
+            .zip(7..)
+            .map(|(len, seed)| {
+                let values = XorShift(seed).values(len * TINY.dim, 1.0, 0.0);
+                Tensor::from_vec(values, (1, *len, TINY.dim), &device).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let batch = |poison: f32| {
+            let rows = stems
+                .iter()
+                .zip(lengths)
+                .map(|(stem, len)| {
+                    if len == padded {
+                        return stem.clone();
+                    }
+                    let fill = (0..(padded - len) * TINY.dim)
+                        .map(|index| if index % 2 == 0 { poison } else { -poison })
+                        .collect::<Vec<_>>();
+                    let fill = Tensor::from_vec(fill, (1, padded - len, TINY.dim), &device);
+                    Tensor::cat(&[stem, &fill.unwrap()], 1).unwrap()
+                })
+                .collect::<Vec<_>>();
+            Tensor::cat(&rows, 0).unwrap()
+        };
+        let clean = encoder.encode_padded(batch(0.0), &lengths).unwrap();
+        let poisoned = encoder.encode_padded(batch(1e3), &lengths).unwrap();
+        let real = |x: &Tensor, row: usize| {
+            x.narrow(0, row, 1)
+                .unwrap()
+                .narrow(1, 0, lengths[row])
+                .unwrap()
+        };
+        for row in 0..lengths.len() {
+            assert_eq!(
+                real(&clean, row).to_vec3::<f32>().unwrap(),
+                real(&poisoned, row).to_vec3::<f32>().unwrap(),
+                "row {row}"
+            );
+        }
+        for x in [&clean, &poisoned] {
+            let values = x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert!(values.iter().all(|value| value.is_finite()));
+        }
+
+        let pos = build_rel_positional_embedding(padded, TINY.dim, &device).unwrap();
+        let mut unmasked = batch(1e3);
+        for layer in &encoder.layers {
+            unmasked = layer.forward(&unmasked, &pos, None).unwrap();
+        }
+        assert!(max_abs_diff(&real(&unmasked, 0), &real(&clean, 0)) > 1e-3);
+    }
+
+    /// A batch of one request runs today's windowed encode, bit for bit,
+    /// whether its input fits one window or not; a multi-window input never
+    /// joins a wider batch.
+    #[test]
+    fn width_one_batch_is_the_solo_encode() {
+        let device = Device::Cpu;
+        let mut model = forced_label_model(&device);
+        // 4 s: 50 encoder frames.
+        let audio = XorShift(13).values(64_037, 0.1, 0.0);
+        let windowed = EncoderWindowing {
+            frames: 32,
+            left_context: 10,
+            right_context: 10,
+        };
+        for (windowing, windows) in [(EncoderWindowing::V3, 1), (windowed, 3)] {
+            model.encoder_windowing = windowing;
+            let features = model.prepare_host_features(&audio, 16_000).unwrap();
+            assert_eq!(features.single_window(), windows == 1);
+            let batched = model
+                .prepare_retained_encoder_batch(&[batch_row(&features, &ready)])
+                .unwrap()
+                .pop()
+                .unwrap()
+                .unwrap();
+            let solo = model
+                .prepare_retained_encoder(&audio, 16_000, Some("en"), &ready)
+                .unwrap();
+            assert_eq!(batched.encoder_windows, windows);
+            assert_eq!(
+                batched.encoded.to_vec3::<f32>().unwrap(),
+                solo.encoded.to_vec3::<f32>().unwrap()
+            );
+        }
+        let multi_window = model.prepare_host_features(&audio, 16_000).unwrap();
+        let single_window = features_of_frames(&model, 20, 3);
+        let mixed = [
+            batch_row(&single_window, &ready),
+            batch_row(&multi_window, &ready),
+        ];
+        assert!(model.prepare_retained_encoder_batch(&mixed).is_err());
+    }
+
+    /// A row cancelled before the encode fails alone: the others encode as
+    /// they would have without it, and a lone survivor runs the solo encode.
+    #[test]
+    fn a_cancelled_batch_row_fails_alone() {
+        let model = forced_label_model(&Device::Cpu);
+        let features = [5usize, 7, 6]
+            .into_iter()
+            .zip(41..)
+            .map(|(len, seed)| features_of_frames(&model, len, seed))
+            .collect::<Vec<_>>();
+        let cancelled = || -> Result<()> { Err(Error::Cancelled("parakeet-row".into())) };
+        let solo = |index: usize| {
+            model
+                .encode_host_features(&features[index], None, &ready)
+                .unwrap()
+        };
+
+        let rows = [
+            batch_row(&features[0], &ready),
+            batch_row(&features[1], &cancelled),
+            batch_row(&features[2], &ready),
+        ];
+        let outcomes = model.prepare_retained_encoder_batch(&rows).unwrap();
+        assert!(matches!(outcomes[1], Err(Error::Cancelled(_))));
+        for index in [0, 2] {
+            let artifact = outcomes[index].as_ref().unwrap();
+            assert!(max_abs_diff(&artifact.encoded, &solo(index).encoded) <= 1e-6);
+        }
+
+        let rows = [
+            batch_row(&features[0], &cancelled),
+            batch_row(&features[1], &ready),
+            batch_row(&features[2], &cancelled),
+        ];
+        let outcomes = model.prepare_retained_encoder_batch(&rows).unwrap();
+        assert!(matches!(outcomes[0], Err(Error::Cancelled(_))));
+        assert!(matches!(outcomes[2], Err(Error::Cancelled(_))));
+        assert_eq!(
+            outcomes[1]
+                .as_ref()
+                .unwrap()
+                .encoded
+                .to_vec3::<f32>()
+                .unwrap(),
+            solo(1).encoded.to_vec3::<f32>().unwrap()
+        );
+
+        let outcomes = model
+            .prepare_retained_encoder_batch(&[batch_row(&features[0], &cancelled)])
+            .unwrap();
+        assert!(matches!(outcomes[..], [Err(Error::Cancelled(_))]));
     }
 
     /// The pre-change per-head argmax: one scalar readback per head.
