@@ -1,7 +1,8 @@
 //! Nemotron 3.5 Transcribe requests as retained continuous rows: each
-//! quantum prefills a row's prompt span (encoding the perception windows its
-//! audio positions need) or steps every row one token with the decoder
-//! batched across rows, over each row's retained paged KV and Mamba state.
+//! quantum prefills every row's prompt span (encoding the perception windows
+//! its audio positions need), the rows' spans packed into one decoder
+//! forward, or steps every row one token with the decoder batched across
+//! rows, over each row's retained paged KV and Mamba state.
 //! The Mamba state is staged into the tensor-state arena every quantum and
 //! committed with the KV pages, so a failed or cancelled quantum rolls the
 //! row back to where it started.
@@ -9,7 +10,7 @@
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::models::architectures::nemotron_transcribe::{
-    NemotronRetainedCheckpoint, NemotronRetainedState, NemotronStepRow,
+    NemotronPrefillRow, NemotronRetainedCheckpoint, NemotronRetainedState, NemotronStepRow,
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
@@ -253,19 +254,26 @@ impl NativeExecutor {
             .count();
         if armed > 0 {
             if is_prefill {
+                // Every row's span in one call: packed into one forward
+                // unless the family's switch is off.
+                let mut prefill_rows = Vec::with_capacity(armed);
                 for row in &mut batch.rows {
                     if row.checkpoint.is_none() {
                         continue;
                     }
                     let span = scheduled[row.index].num_tokens;
                     let NemotronBatchRow { lease, cache, .. } = row;
-                    let state = &mut lease
-                        .as_mut()
-                        .expect("armed Nemotron 3.5 Transcribe lease")
-                        .require_state_mut()?
-                        .state;
-                    Self::run_blocking(|| nemotron.retained_prefill(state, cache, span))?;
+                    prefill_rows.push(NemotronPrefillRow {
+                        state: &mut lease
+                            .as_mut()
+                            .expect("armed Nemotron 3.5 Transcribe lease")
+                            .require_state_mut()?
+                            .state,
+                        cache,
+                        span,
+                    });
                 }
+                Self::run_blocking(|| nemotron.retained_prefill_batch(&mut prefill_rows))?;
             } else {
                 // A quantum may grant a row several steps (the family's
                 // decode quantum while nothing waits): step the rows that

@@ -173,6 +173,23 @@ async fn synthetic_rows_transcribe_alone_and_concurrently_alike() {
     for (result, expected) in concurrent.into_iter().zip(&solo) {
         assert_eq!(&result.expect("concurrent transcribe").text, expected);
     }
+    // Packed prefill is on; whether the concurrent rows shared a prefill
+    // quantum depends on when each arrived (most runs pack several).
+    let packed = packed_prefill(&runtime).await;
+    eprintln!("packed prefill: {packed}");
+    assert_eq!(packed["on"], true);
+    assert!(packed["packed_rows"].as_u64() >= packed["packed_quanta"].as_u64().map(|q| 2 * q));
+}
+
+/// The model's packed-prefill diagnostics (`batched_prefill`).
+async fn packed_prefill(runtime: &RuntimeService) -> serde_json::Value {
+    runtime
+        .loaded_model_diagnostics()
+        .await
+        .into_iter()
+        .find_map(|loaded| loaded.family_diagnostics)
+        .map(|diagnostics| diagnostics["batched_prefill"].clone())
+        .expect("the model's diagnostics")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -285,6 +302,7 @@ async fn synthetic_rows_transcribe_alike_on_metal() {
     for (result, expected) in concurrent.into_iter().zip(&solo) {
         assert_eq!(&result.expect("concurrent transcribe").text, expected);
     }
+    eprintln!("packed prefill: {}", packed_prefill(&runtime).await);
 }
 
 /// Word timestamps through the transcription route: the CTC stage runs on
