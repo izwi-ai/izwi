@@ -2003,6 +2003,19 @@ impl WhisperTurboAsrModel {
                 state.finished = true;
             }
         }
+        // Text is decoded only when the attempt finishes: the terminal policy
+        // reads `assembled` then, and the executor publishes no provisional
+        // text (the fallback policy can still reject the attempt at EOS).
+        // Decoding the whole sequence on every step cost one full
+        // detokenization per token.
+        if !state.finished {
+            return Ok(WhisperDecodeStep {
+                delta: String::new(),
+                text: String::new(),
+                tokens_generated: state.generated_tokens.len(),
+                finished: false,
+            });
+        }
         let decoded = self.decode_generated_text(&state.generated_tokens)?;
         let text = decoded.trim().to_string();
         let delta = text_delta(&state.assembled, &text);
@@ -2011,7 +2024,7 @@ impl WhisperTurboAsrModel {
             delta: delta.to_string(),
             text,
             tokens_generated: state.generated_tokens.len(),
-            finished: state.finished,
+            finished: true,
         })
     }
 
@@ -3579,14 +3592,21 @@ fn tensor_to_f32_vec1(tensor: &Tensor) -> Result<Vec<f32>> {
 }
 
 /// Device greedy step over decode-filtered logits. The log-probability is
-/// taken at temperature 1, as on the host.
+/// taken at temperature 1, as on the host. The token, its logit, the
+/// maximum and the log-sum-exp come back in one transfer: the token index
+/// travels as an F32, exact for any vocabulary below 2^24.
 fn greedy_decode_step_from_masked_logits(masked: &Tensor, eot: u32) -> Result<(u32, f32)> {
+    if masked.dim(0)? > 1 << f32::MANTISSA_DIGITS {
+        return Err(Error::InvalidInput(
+            "Whisper vocabulary exceeds the exact F32 token range".into(),
+        ));
+    }
     let masked_f32 = if masked.dtype() == DType::F32 {
         masked.clone()
     } else {
         masked.to_dtype(DType::F32)?
     };
-    let next = masked.argmax(0)?.to_scalar::<u32>()?;
+    let next = masked.argmax(0)?;
     let max_logit = masked_f32.max(0)?;
     let logsumexp = masked_f32
         .broadcast_sub(&max_logit)?
@@ -3594,12 +3614,21 @@ fn greedy_decode_step_from_masked_logits(masked: &Tensor, eot: u32) -> Result<(u
         .sum_all()?
         .log()?
         .broadcast_add(&max_logit)?;
-    let next_logit = masked_f32.i(next as usize)?;
-    let stats = Tensor::stack(&[&max_logit, &logsumexp, &next_logit], 0)?.to_vec1::<f32>()?;
+    let next_logit = masked_f32.index_select(&next.reshape(1)?, 0)?.squeeze(0)?;
+    let stats = Tensor::stack(
+        &[
+            &max_logit,
+            &logsumexp,
+            &next_logit,
+            &next.to_dtype(DType::F32)?,
+        ],
+        0,
+    )?
+    .to_vec1::<f32>()?;
     if !stats[0].is_finite() {
         return Ok((eot, f32::NEG_INFINITY));
     }
-    let (logsumexp, next_logit) = (stats[1], stats[2]);
+    let (logsumexp, next_logit, next) = (stats[1], stats[2], stats[3] as u32);
     let next_logprob = if next_logit.is_finite() && logsumexp.is_finite() {
         next_logit - logsumexp
     } else {
@@ -4694,6 +4723,113 @@ mod tests {
             .map(|logit| (f64::from(*logit) - max).exp())
             .sum::<f64>();
         f64::from(logits[token as usize]) - (max + sum.ln())
+    }
+
+    /// The greedy step as it was before its readbacks merged: the token read
+    /// back first, then its logit, the maximum and the log-sum-exp.
+    fn two_readback_greedy_step(masked: &Tensor, eot: u32) -> (u32, f32) {
+        use candle_core::IndexOp;
+        let masked_f32 = masked.to_dtype(DType::F32).unwrap();
+        let next = masked.argmax(0).unwrap().to_scalar::<u32>().unwrap();
+        let max_logit = masked_f32.max(0).unwrap();
+        let logsumexp = masked_f32
+            .broadcast_sub(&max_logit)
+            .unwrap()
+            .exp()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .log()
+            .unwrap()
+            .broadcast_add(&max_logit)
+            .unwrap();
+        let next_logit = masked_f32.i(next as usize).unwrap();
+        let stats = Tensor::stack(&[&max_logit, &logsumexp, &next_logit], 0)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        if !stats[0].is_finite() {
+            return (eot, f32::NEG_INFINITY);
+        }
+        let logprob = if stats[2].is_finite() && stats[1].is_finite() {
+            stats[2] - stats[1]
+        } else {
+            f32::NEG_INFINITY
+        };
+        (next, logprob)
+    }
+
+    /// One readback per greedy step picks the same token with the same
+    /// log-probability bits as the two-readback step, on the tiny Whisper's
+    /// logits (F32 and F16, constrained as decode constrains them) and on
+    /// ties, masked rows and non-finite logits.
+    #[test]
+    fn single_readback_greedy_step_matches_two_readback_step_bit_for_bit() {
+        use crate::kernels::numeric_check::xorshift_tensor;
+        use crate::models::architectures::whisper::model::test_fixture::{
+            tiny_config, tiny_tensors,
+        };
+
+        let device = Device::Cpu;
+        let special = decode_test_special_tokens();
+        let config = tiny_config();
+        let vb =
+            candle_nn::VarBuilder::from_tensors(tiny_tensors(&config, 0.2), DType::F32, &device);
+        let whisper = super::LocalWhisper::load(&vb, config.clone()).expect("tiny whisper");
+        let mut cases = Vec::new();
+        for seed in 0..4 {
+            let frames = config.max_source_positions * 2;
+            let mel =
+                xorshift_tensor(&[1, config.num_mel_bins, frames], seed, 1.5, &device).unwrap();
+            for token in [0u32, 3, 7] {
+                let (_, logits) = whisper
+                    .numeric_probe(&mel, token)
+                    .expect("probe")
+                    .pop()
+                    .expect("logits");
+                let mut logits = logits.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                apply_whisper_decode_constraints(
+                    &mut logits,
+                    token == 0,
+                    &[],
+                    &[],
+                    &[],
+                    &special,
+                    true,
+                    &[],
+                );
+                cases.push(logits);
+            }
+        }
+        let vocab = config.vocab_size;
+        let mut tied = vec![f32::NEG_INFINITY; vocab];
+        tied[2] = 1.5;
+        tied[5] = 1.5;
+        cases.push(tied);
+        cases.push(vec![f32::NEG_INFINITY; vocab]);
+        let mut leading_nan = vec![0.25; vocab];
+        leading_nan[0] = f32::NAN;
+        cases.push(leading_nan);
+        let mut inner_nan = vec![0.25; vocab];
+        inner_nan[3] = f32::NAN;
+        inner_nan[4] = 2.0;
+        cases.push(inner_nan);
+        for (index, logits) in cases.iter().enumerate() {
+            for dtype in [DType::F32, DType::F16] {
+                let masked = Tensor::from_vec(logits.clone(), vocab, &device)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                let expected = two_readback_greedy_step(&masked, special.eot);
+                let actual = greedy_decode_step_from_masked_logits(&masked, special.eot).unwrap();
+                assert_eq!(actual.0, expected.0, "case {index} {dtype:?}");
+                assert_eq!(
+                    actual.1.to_bits(),
+                    expected.1.to_bits(),
+                    "case {index} {dtype:?}"
+                );
+            }
+        }
     }
 
     #[test]

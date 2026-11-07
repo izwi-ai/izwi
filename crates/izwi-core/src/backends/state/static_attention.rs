@@ -52,6 +52,26 @@ struct StaticAttentionLayerBacking {
     values: Var,
 }
 
+/// The CUDA flash-attention row metadata for `rows` over an installed
+/// memory: cumulative query and key lengths and a one-block table.
+#[cfg(feature = "flash-attn")]
+#[derive(Debug)]
+struct StaticAttentionCudaRows {
+    rows: Vec<StaticAttentionRaggedRow>,
+    seqlens_q: Tensor,
+    seqlens_k: Tensor,
+    block_table: Tensor,
+    max_query_len: usize,
+}
+
+/// The one-query row of a decode step, whose CUDA metadata an installed
+/// memory builds once for every layer and token.
+#[cfg(feature = "flash-attn")]
+const STATIC_ATTENTION_DECODE_ROW: StaticAttentionRaggedRow = StaticAttentionRaggedRow {
+    query_start: 0,
+    query_len: 1,
+};
+
 #[derive(Debug)]
 struct PendingStaticAttentionInstall {
     source_identity: [u8; 32],
@@ -81,6 +101,10 @@ pub(crate) struct InvocationStaticAttentionArena {
     initialized: bool,
     dirty: bool,
     pending_install: Option<PendingStaticAttentionInstall>,
+    /// CUDA: the decode row's metadata over the installed memory, built at
+    /// commit (three small uploads otherwise repeated per layer per token).
+    #[cfg(feature = "flash-attn")]
+    cuda_decode_rows: Option<StaticAttentionCudaRows>,
 }
 
 impl InvocationStaticAttentionArena {
@@ -279,6 +303,8 @@ impl InvocationStaticAttentionArena {
             initialized: false,
             dirty: false,
             pending_install: None,
+            #[cfg(feature = "flash-attn")]
+            cuda_decode_rows: None,
         })
     }
 
@@ -475,6 +501,19 @@ impl InvocationStaticAttentionArena {
             self.mark_pending_failed();
             return Err(error.into());
         }
+        #[cfg(feature = "flash-attn")]
+        let cuda_decode_rows = match self.backend {
+            BackendKind::Cuda => {
+                match self.cuda_rows(&[STATIC_ATTENTION_DECODE_ROW], pending.target_cursor) {
+                    Ok(rows) => Some(rows),
+                    Err(error) => {
+                        self.mark_pending_failed();
+                        return Err(error);
+                    }
+                }
+            }
+            BackendKind::Cpu | BackendKind::Metal => None,
+        };
         let pending = self
             .pending_install
             .take()
@@ -483,6 +522,10 @@ impl InvocationStaticAttentionArena {
         self.absolute_cursor = pending.target_cursor;
         self.initialized = true;
         self.dirty = false;
+        #[cfg(feature = "flash-attn")]
+        {
+            self.cuda_decode_rows = cuda_decode_rows;
+        }
         Ok(())
     }
 
@@ -546,6 +589,10 @@ impl InvocationStaticAttentionArena {
         self.initialized = false;
         self.pending_install = None;
         self.dirty = false;
+        #[cfg(feature = "flash-attn")]
+        {
+            self.cuda_decode_rows = None;
+        }
         Ok(())
     }
 
@@ -854,20 +901,20 @@ impl InvocationStaticAttentionArena {
         Err(invalid("static-attention Metal operation is not compiled"))
     }
 
+    /// The flash-attention metadata of `rows` over `memory_tokens` installed
+    /// tokens.
     #[cfg(feature = "flash-attn")]
-    fn attend_cuda(
+    fn cuda_rows(
         &self,
-        layer: &StaticAttentionLayerBacking,
-        queries: &Tensor,
         rows: &[StaticAttentionRaggedRow],
-        softmax_scale: f32,
-    ) -> Result<Tensor> {
+        memory_tokens: u64,
+    ) -> Result<StaticAttentionCudaRows> {
         let batch_size = rows.len();
         let mut seqlens_q = Vec::with_capacity(batch_size + 1);
         let mut seqlens_k = Vec::with_capacity(batch_size + 1);
         seqlens_q.push(0_u32);
         seqlens_k.push(0_u32);
-        let memory_tokens = u32::try_from(self.absolute_cursor)
+        let memory_tokens = u32::try_from(memory_tokens)
             .map_err(|_| invalid("static-attention CUDA cursor exceeds u32"))?;
         let mut cumulative_q = 0_u32;
         let mut cumulative_k = 0_u32;
@@ -886,9 +933,33 @@ impl InvocationStaticAttentionArena {
                     .map_err(|_| invalid("static-attention query length exceeds usize"))?,
             );
         }
-        let seqlens_q = Tensor::from_vec(seqlens_q, batch_size + 1, &self.device)?;
-        let seqlens_k = Tensor::from_vec(seqlens_k, batch_size + 1, &self.device)?;
-        let block_table = Tensor::zeros((batch_size, 1), DType::U32, &self.device)?;
+        Ok(StaticAttentionCudaRows {
+            rows: rows.to_vec(),
+            seqlens_q: Tensor::from_vec(seqlens_q, batch_size + 1, &self.device)?,
+            seqlens_k: Tensor::from_vec(seqlens_k, batch_size + 1, &self.device)?,
+            block_table: Tensor::zeros((batch_size, 1), DType::U32, &self.device)?,
+            max_query_len,
+        })
+    }
+
+    #[cfg(feature = "flash-attn")]
+    fn attend_cuda(
+        &self,
+        layer: &StaticAttentionLayerBacking,
+        queries: &Tensor,
+        rows: &[StaticAttentionRaggedRow],
+        softmax_scale: f32,
+    ) -> Result<Tensor> {
+        let built;
+        let metadata = match &self.cuda_decode_rows {
+            Some(decode) if decode.rows == rows => decode,
+            _ => {
+                built = self.cuda_rows(rows, self.absolute_cursor)?;
+                &built
+            }
+        };
+        let memory_tokens = usize::try_from(self.absolute_cursor)
+            .map_err(|_| invalid("static-attention CUDA memory length exceeds usize"))?;
         let kv_heads = usize::try_from(layer.semantic.kv_heads)
             .map_err(|_| invalid("static-attention KV heads exceed usize"))?;
         let head_dim = usize::try_from(layer.semantic.key_head_dim)
@@ -907,13 +978,12 @@ impl InvocationStaticAttentionArena {
             queries,
             &keys,
             &values,
-            &seqlens_q,
-            &seqlens_k,
-            &block_table,
+            &metadata.seqlens_q,
+            &metadata.seqlens_k,
+            &metadata.block_table,
             None,
-            max_query_len,
-            usize::try_from(memory_tokens)
-                .map_err(|_| invalid("static-attention CUDA memory length exceeds usize"))?,
+            metadata.max_query_len,
+            memory_tokens,
             softmax_scale,
             None,
             None,
