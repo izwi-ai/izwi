@@ -83,8 +83,8 @@ use crate::models::architectures::nemotron::asr::{
     NemotronRealtimeStreamEvent, NemotronStreamingState,
 };
 use crate::models::architectures::parakeet::asr::{
-    ParakeetAsrModel, ParakeetAsrTranscriptionOutput, ParakeetHostFeatures,
-    ParakeetPhysicalStateSpec,
+    ParakeetAsrModel, ParakeetAsrTranscriptionOutput, ParakeetEncoderBatchRow,
+    ParakeetHostFeatures, ParakeetPhysicalStateSpec, ParakeetPreparedEncoderArtifact,
 };
 pub(crate) use crate::models::architectures::qwen3::asr::AlignmentUnit;
 use crate::models::architectures::qwen3::asr::{
@@ -1521,6 +1521,20 @@ impl NativeAsrModel {
             Self::Parakeet(model) => model.prepare_host_features(audio, sample_rate),
             _ => Err(Error::InvalidInput(
                 "Parakeet features were requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    /// Encodes one Parakeet preparation batch; see
+    /// [`ParakeetAsrModel::prepare_retained_encoder_batch`].
+    pub(crate) fn prepare_parakeet_encoder_batch(
+        &self,
+        rows: &[ParakeetEncoderBatchRow<'_>],
+    ) -> Result<Vec<Result<ParakeetPreparedEncoderArtifact>>> {
+        match self {
+            Self::Parakeet(model) => model.prepare_retained_encoder_batch(rows),
+            _ => Err(Error::InvalidInput(
+                "Parakeet encoder rows were supplied to another ASR model".into(),
             )),
         }
     }

@@ -1447,6 +1447,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Parakeet dtype override: on Metal f32 keeps every weight F32 and f16 stores encoder projections in F16.",
     ),
     CoreEnvVar::new(
+        "IZWI_PARAKEET_ENCODER_BATCHING",
+        Flag,
+        "true",
+        Once,
+        "Encodes concurrent Parakeet clips of one encoder window (82 s) as one padded batch; false encodes every request alone.",
+    ),
+    CoreEnvVar::new(
         "IZWI_PARAKEET_METAL_CONV1D_BN_SWISH",
         Flag,
         "true (Metal only)",

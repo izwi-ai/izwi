@@ -1,5 +1,6 @@
-//! Cross-request ASR encoder batchers: Qwen3-ASR, Whisper, Granite Speech and
-//! VibeVoice encoder work queued by request preparation and run as one batch.
+//! Cross-request ASR encoder batchers: Qwen3-ASR, Whisper, Granite Speech,
+//! VibeVoice and Parakeet encoder work queued by request preparation and run
+//! as one batch.
 
 use super::*;
 
@@ -64,6 +65,131 @@ pub(super) struct WhisperEncoderBatcher {
 }
 
 pub(super) type VibeVoiceEncoderOutcome = PreparationRowOutcome<VibeVoiceAsrPreparedArtifact>;
+
+pub(super) type ParakeetEncoderOutcome =
+    PreparationRowOutcome<Arc<ParakeetPreparedEncoderArtifact>>;
+
+pub(super) struct ParakeetEncoderPending {
+    pub(super) job: JobLease,
+    pub(super) contract: LoadedExecutionContract,
+    pub(super) model: AsrModelLease,
+    /// The model's catalog name, for the batch-width metric.
+    pub(super) model_label: &'static str,
+    pub(super) backend: BackendKind,
+    /// The host log-mel, dropped once the encode has read it.
+    pub(super) features: ParakeetHostFeatures,
+    pub(super) language: Option<String>,
+    /// Host bytes the request keeps after the encode: its input, not the
+    /// features.
+    pub(super) retained_host_bytes: u64,
+    /// The admitted ceiling of the row's encoder output.
+    pub(super) retained_device_ceiling: u64,
+    pub(super) cancellation: PreparationCancellation,
+    pub(super) response: Option<oneshot::Sender<ParakeetEncoderOutcome>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct ParakeetEncoderQueueKey {
+    pub(super) binding: AdapterBindingKey,
+    /// Encoder frames rounded up to a power of two, so padding a row to
+    /// its batch's longest row adds less than its own length.
+    pub(super) encoded_len_bucket: usize,
+}
+
+pub(super) struct ParakeetEncoderBatcher {
+    pub(super) coordinator: Arc<InferenceCoordinator>,
+    pub(super) formation: EncoderBatchFormation<ParakeetEncoderQueueKey, ParakeetEncoderPending>,
+}
+
+/// Forms one encoder's cross-request batches with at most one batch in
+/// flight per key. Rows that arrive while their key's batch runs wait, and
+/// form the key's next batch when it completes, so requests that arrive
+/// staggered still batch under load. (The other batchers here drain a queue
+/// one yield after its first row arrives, so behind a busy device each row
+/// runs as a batch of one.)
+pub(super) struct EncoderBatchFormation<K, P> {
+    /// A key's queue exists exactly while a runner drains it.
+    queues: std::sync::Mutex<HashMap<K, VecDeque<P>>>,
+}
+
+impl<K: Eq + std::hash::Hash, P> EncoderBatchFormation<K, P> {
+    pub(super) fn new() -> Self {
+        Self {
+            queues: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn queues(&self) -> std::sync::MutexGuard<'_, HashMap<K, VecDeque<P>>> {
+        self.queues
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Queues `row` under `key`. True when the key had no runner: the
+    /// caller then starts one with [`Self::run`].
+    pub(super) fn push(&self, key: K, row: P) -> bool {
+        let mut queues = self.queues();
+        match queues.get_mut(&key) {
+            Some(queue) => {
+                queue.push_back(row);
+                false
+            }
+            None => {
+                queues.insert(key, VecDeque::from([row]));
+                true
+            }
+        }
+    }
+
+    /// Runs `key`'s batches of at most `max_width` rows one after another
+    /// until its queue is empty. Rows already runnable in this executor
+    /// turn join the first batch.
+    pub(super) async fn run<F, Fut>(&self, key: &K, max_width: usize, mut run_batch: F)
+    where
+        F: FnMut(Vec<P>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        /// A runner that unwinds drops its key's waiting rows, whose
+        /// submitters then fail, and frees the key for a new runner.
+        struct Abandon<'a, K: Eq + std::hash::Hash, P> {
+            formation: &'a EncoderBatchFormation<K, P>,
+            key: &'a K,
+            armed: bool,
+        }
+
+        impl<K: Eq + std::hash::Hash, P> Drop for Abandon<'_, K, P> {
+            fn drop(&mut self) {
+                if self.armed {
+                    let rows = self.formation.queues().remove(self.key);
+                    drop(rows);
+                }
+            }
+        }
+
+        let mut abandon = Abandon {
+            formation: self,
+            key,
+            armed: true,
+        };
+        yield_now().await;
+        while let Some(batch) = self.next_batch(key, max_width) {
+            run_batch(batch).await;
+        }
+        abandon.armed = false;
+    }
+
+    /// The key's next batch, or `None` after retiring its empty queue.
+    fn next_batch(&self, key: &K, max_width: usize) -> Option<Vec<P>> {
+        let mut queues = self.queues();
+        let queue = queues.get_mut(key)?;
+        if queue.is_empty() {
+            queues.remove(key);
+            return None;
+        }
+        let width = queue.len().min(max_width.max(1));
+        Some(queue.drain(..width).collect())
+    }
+}
 
 pub(super) type GraniteSpeechEncoderOutcome = PreparationRowOutcome<Arc<GraniteSpeechPreparedPromptArtifact>>;
 
@@ -185,6 +311,291 @@ impl VibeVoiceEncoderBatcher {
             Error::InferenceError("VibeVoice scalar preparation returned no outcome".into())
         })
     }
+}
+
+/// Whether concurrent single-window Parakeet requests encode as one batch
+/// (`IZWI_PARAKEET_ENCODER_BATCHING`, on by default); off, every request
+/// encodes alone, as before batching.
+fn parakeet_encoder_batching_enabled() -> bool {
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_PARAKEET_ENCODER_BATCHING", true));
+    ENABLED.get()
+}
+
+impl ParakeetEncoderBatcher {
+    pub(super) fn new(coordinator: Arc<InferenceCoordinator>) -> Self {
+        Self {
+            coordinator,
+            formation: EncoderBatchFormation::new(),
+        }
+    }
+
+    /// Encodes one request's features: a single-window row waits for its
+    /// length bucket's running batch and joins the next one; a longer row,
+    /// or any row with batching off, runs as a batch of its own.
+    pub(super) async fn submit(
+        self: &Arc<Self>,
+        mut pending: ParakeetEncoderPending,
+    ) -> Result<ParakeetEncoderOutcome> {
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.parakeet".into(),
+        };
+        let binding = pending.contract.adapter_binding()?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.name != "asr.encoder.parakeet" {
+            return Err(Error::InvalidInput(
+                "Parakeet loaded contract did not select asr.encoder.parakeet".into(),
+            ));
+        }
+        let max_width = stage.max_batch_size.max(1);
+        let key = (max_width > 1
+            && pending.features.single_window()
+            && parakeet_encoder_batching_enabled())
+        .then(|| {
+            Ok::<_, Error>(ParakeetEncoderQueueKey {
+                binding: binding.key_for_stage(stage.id)?,
+                encoded_len_bucket: pending
+                    .features
+                    .encoded_len()
+                    .checked_next_power_of_two()
+                    .ok_or_else(|| Error::Overloaded("Parakeet length bucket overflow".into()))?,
+            })
+        })
+        .transpose()?;
+        let cancellation = pending.cancellation.clone();
+        let (sender, receiver) = oneshot::channel();
+        pending.response = Some(sender);
+        let batcher = self.clone();
+        match key {
+            Some(key) => {
+                if self.formation.push(key.clone(), pending) {
+                    tokio::spawn(async move {
+                        batcher
+                            .formation
+                            .run(&key, max_width, |batch| batcher.run_batch(batch))
+                            .await;
+                    });
+                }
+            }
+            None => {
+                tokio::spawn(async move { batcher.run_batch(vec![pending]).await });
+            }
+        }
+        let mut guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let outcome = receiver.await.map_err(|_| {
+            Error::InferenceError("Parakeet encoder batch worker stopped before reply".into())
+        })?;
+        guard.armed = false;
+        Ok(outcome)
+    }
+
+    /// Runs one formed batch: rows cancelled or expired while they waited
+    /// answer at once, and the rest are priced at the batch's padded
+    /// length and encoded in one physical call.
+    async fn run_batch(&self, rows: Vec<ParakeetEncoderPending>) {
+        let now = Instant::now();
+        let rows = rows
+            .into_iter()
+            .filter_map(|mut row| {
+                let terminal = if row.cancellation.is_cancelled() {
+                    PreparationRowOutcome::Cancelled
+                } else if row
+                    .job
+                    .spec
+                    .deadline
+                    .is_some_and(|deadline| deadline <= now)
+                {
+                    PreparationRowOutcome::TimedOut
+                } else {
+                    return Some(row);
+                };
+                if let Some(response) = row.response.take() {
+                    let _ = response.send(terminal);
+                }
+                None
+            })
+            .collect::<Vec<_>>();
+        let Some(first) = rows.first() else {
+            return;
+        };
+        let contract = first.contract.clone();
+        let model = first.model.clone();
+        let model_label = first.model_label;
+        let width = rows.len();
+        let padded_frames = rows
+            .iter()
+            .map(|row| row.features.window_frames())
+            .max()
+            .unwrap_or(0);
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.parakeet".into(),
+        };
+        let mut sealed = Vec::with_capacity(width);
+        for row in &rows {
+            let seal =
+                parakeet_preparation_row_cost(&row.features, padded_frames, width, row.backend)
+                    .and_then(|(cost, materialized)| {
+                        self.coordinator.seal_preparation_row(
+                            row.job.clone(),
+                            &row.contract,
+                            &work,
+                            cost,
+                            materialized,
+                            row.cancellation.clone(),
+                        )
+                    });
+            match seal {
+                Ok(seal) => sealed.push(seal),
+                Err(error) => {
+                    Self::fail(rows, &error);
+                    return;
+                }
+            }
+        }
+        // The sealed rows now own the only job leases the physical call
+        // uses; the queued originals drop here, before committed rows
+        // become admission bridges.
+        let mut senders = Vec::with_capacity(width);
+        let mut inputs = Vec::with_capacity(width);
+        for mut row in rows {
+            senders.push(
+                row.response
+                    .take()
+                    .expect("queued Parakeet row has a response channel"),
+            );
+            inputs.push(ParakeetEncoderInput {
+                request_id: row.job.spec.request_id.clone(),
+                deadline: row.job.spec.deadline,
+                features: row.features,
+                language: row.language,
+                cancellation: row.cancellation,
+                retained_host_bytes: row.retained_host_bytes,
+                retained_device_ceiling: row.retained_device_ceiling,
+            });
+        }
+        let result = self
+            .coordinator
+            .run_loaded_native_preparation_batch(sealed, contract, work, move |live| {
+                crate::engine::metrics::record_asr_preparation_batch_rows(model_label, live.len());
+                // Checked before the encode and between a long row's
+                // windows, so a disconnected or expired request fails
+                // alone and releases the device within one window.
+                let checkpoints = live
+                    .iter()
+                    .map(|index| {
+                        let input = &inputs[*index];
+                        move || {
+                            if input.cancellation.is_cancelled() {
+                                return Err(Error::Cancelled(input.request_id.clone()));
+                            }
+                            if input
+                                .deadline
+                                .is_some_and(|deadline| Instant::now() >= deadline)
+                            {
+                                return Err(Error::Timeout(input.request_id.clone()));
+                            }
+                            Ok(())
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let rows = live
+                    .iter()
+                    .zip(&checkpoints)
+                    .map(|(index, checkpoint)| ParakeetEncoderBatchRow {
+                        features: &inputs[*index].features,
+                        language: inputs[*index].language.as_deref(),
+                        checkpoint,
+                    })
+                    .collect::<Vec<_>>();
+                let prepared = model.prepare_parakeet_encoder_batch(&rows)?;
+                if prepared.len() != live.len() {
+                    return Err(Error::InferenceError(
+                        "Parakeet encoder batch returned the wrong row count".into(),
+                    ));
+                }
+                Ok(prepared
+                    .into_iter()
+                    .zip(live)
+                    .map(|(artifact, index)| {
+                        let artifact = Arc::new(artifact?);
+                        let accelerator_bytes = artifact.resident_tensor_bytes()?;
+                        let ceiling = inputs[*index].retained_device_ceiling;
+                        if accelerator_bytes > ceiling {
+                            return Err(Error::InferenceError(format!(
+                                "Parakeet encoder artifact exceeded its admitted ceiling: {accelerator_bytes} > {ceiling}"
+                            )));
+                        }
+                        Ok(PreparationArtifact {
+                            retained: JobResourceObservation {
+                                host_bytes: inputs[*index].retained_host_bytes,
+                                accelerator_bytes,
+                            },
+                            value: artifact,
+                        })
+                    })
+                    .collect::<Vec<_>>())
+            })
+            .await;
+        match result {
+            Ok(outcomes) => {
+                for (sender, outcome) in senders.into_iter().zip(outcomes) {
+                    let _ = sender.send(outcome);
+                }
+            }
+            Err(error) => {
+                for sender in senders {
+                    let _ = sender.send(PreparationRowOutcome::Failed(error.replicate()));
+                }
+            }
+        }
+    }
+
+    fn fail(rows: Vec<ParakeetEncoderPending>, error: &Error) {
+        for row in rows {
+            if let Some(response) = row.response {
+                let _ = response.send(PreparationRowOutcome::Failed(error.replicate()));
+            }
+        }
+    }
+}
+
+/// A sealed Parakeet row's input to the physical call.
+struct ParakeetEncoderInput {
+    request_id: String,
+    deadline: Option<Instant>,
+    features: ParakeetHostFeatures,
+    language: Option<String>,
+    cancellation: PreparationCancellation,
+    retained_host_bytes: u64,
+    retained_device_ceiling: u64,
+}
+
+/// Prices one Parakeet row in an encoder batch of `rows` rows padded to
+/// `padded_frames` encoder frames: its input samples as work, its padded
+/// encoder output as materialized tensor work, and its share of the
+/// batch's workspace.
+fn parakeet_preparation_row_cost(
+    features: &ParakeetHostFeatures,
+    padded_frames: usize,
+    rows: usize,
+    backend: BackendKind,
+) -> Result<(crate::engine::WorkCost, u64)> {
+    use crate::models::architectures::parakeet::asr::{
+        parakeet_encode_row_bytes, parakeet_encode_row_elements,
+    };
+    let bytes = parakeet_encode_row_bytes(features, padded_frames, rows, backend)?;
+    let (useful, materialized) = parakeet_encode_row_elements(features, padded_frames)?;
+    let samples = u64::try_from(features.input_samples())
+        .map_err(|_| Error::Overloaded("Parakeet sample work exceeds u64".into()))?;
+    let cost = crate::engine::WorkCost::with_workspace(
+        samples,
+        useful,
+        retained_artifact_resources(backend, bytes.host_bytes, bytes.device_bytes()?)?,
+    );
+    Ok((cost, materialized))
 }
 
 impl WhisperEncoderBatcher {
@@ -984,5 +1395,141 @@ impl QwenAsrEncoderBatcher {
                 )));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::Notify;
+
+    use super::EncoderBatchFormation;
+
+    type Batches = Arc<Mutex<Vec<Vec<usize>>>>;
+
+    /// Drains `key` with a runner whose first batch waits for `release`
+    /// after signalling `started`; every batch is recorded in order.
+    fn start_runner(
+        formation: &Arc<EncoderBatchFormation<u32, usize>>,
+        key: u32,
+        max_width: usize,
+        started: &Arc<Notify>,
+        release: &Arc<Notify>,
+    ) -> (Batches, tokio::task::JoinHandle<()>) {
+        let batches = Batches::default();
+        let (formation, recorded) = (formation.clone(), batches.clone());
+        let (started, release) = (started.clone(), release.clone());
+        let runner = tokio::spawn(async move {
+            formation
+                .run(&key, max_width, |batch| {
+                    let first = {
+                        let mut recorded = recorded.lock().unwrap();
+                        recorded.push(batch);
+                        recorded.len() == 1
+                    };
+                    let (started, release) = (started.clone(), release.clone());
+                    async move {
+                        if first {
+                            started.notify_one();
+                            release.notified().await;
+                        }
+                    }
+                })
+                .await;
+        });
+        (batches, runner)
+    }
+
+    /// Rows submitted together form one batch, and rows that arrive while
+    /// it runs wait and form the next one instead of running alone.
+    #[tokio::test]
+    async fn rows_arriving_while_a_batch_runs_form_the_next_batch() {
+        let formation = Arc::new(EncoderBatchFormation::new());
+        let (started, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        assert!(formation.push(7, 0));
+        let (batches, runner) = start_runner(&formation, 7, 8, &started, &release);
+        for row in 1..5 {
+            assert!(!formation.push(7, row));
+        }
+        started.notified().await;
+        for row in 5..8 {
+            assert!(!formation.push(7, row));
+        }
+        release.notify_one();
+        runner.await.unwrap();
+        assert_eq!(
+            *batches.lock().unwrap(),
+            vec![vec![0, 1, 2, 3, 4], vec![5, 6, 7]]
+        );
+        // The drained key is retired: its next row starts a new runner.
+        assert!(formation.push(7, 8));
+    }
+
+    /// A key's queue drains in batches of at most its width, oldest first,
+    /// while another key runs beside it.
+    #[tokio::test]
+    async fn batches_hold_at_most_the_width_and_keys_run_apart() {
+        let formation = Arc::new(EncoderBatchFormation::new());
+        let (started, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        assert!(formation.push(1, 0));
+        assert!(formation.push(2, 100));
+        let (batches, runner) = start_runner(&formation, 1, 4, &started, &release);
+        for row in 1..10 {
+            assert!(!formation.push(1, row));
+        }
+        release.notify_one();
+        runner.await.unwrap();
+        assert_eq!(
+            *batches.lock().unwrap(),
+            vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9]]
+        );
+        let (other, runner) = start_runner(&formation, 2, 4, &started, &release);
+        release.notify_one();
+        runner.await.unwrap();
+        assert_eq!(*other.lock().unwrap(), vec![vec![100]]);
+    }
+
+    struct Row(Arc<AtomicUsize>);
+
+    impl Drop for Row {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A runner that panics drops the rows waiting on its key, so their
+    /// submitters fail instead of hanging, and frees the key.
+    #[tokio::test]
+    async fn a_failed_runner_drops_its_waiting_rows_and_frees_the_key() {
+        let formation = Arc::new(EncoderBatchFormation::<u32, Row>::new());
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (started, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        assert!(formation.push(3, Row(dropped.clone())));
+        let runner = {
+            let (formation, started, release) =
+                (formation.clone(), started.clone(), release.clone());
+            tokio::spawn(async move {
+                formation
+                    .run(&3, 8, |batch| {
+                        let (started, release) = (started.clone(), release.clone());
+                        async move {
+                            started.notify_one();
+                            release.notified().await;
+                            drop(batch);
+                            panic!("encoder batch failed");
+                        }
+                    })
+                    .await;
+            })
+        };
+        started.notified().await;
+        assert!(!formation.push(3, Row(dropped.clone())));
+        assert!(!formation.push(3, Row(dropped.clone())));
+        release.notify_one();
+        assert!(runner.await.is_err());
+        assert_eq!(dropped.load(Ordering::SeqCst), 3);
+        assert!(formation.push(3, Row(dropped.clone())));
     }
 }

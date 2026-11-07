@@ -1550,6 +1550,25 @@ static ENGINE_BATCH_TOKENS: HistogramFamily = HistogramFamily::new(
     &[],
     buckets::BATCH_TOKENS,
 );
+static ASR_PREPARATION_BATCH_ROWS: HistogramFamily = HistogramFamily::new(
+    "izwi_asr_preparation_batch_rows",
+    "Requests one cross-request ASR encoder batch ran in one device call.",
+    &["model"],
+    buckets::BATCH_ROWS,
+);
+
+/// Record the requests one ASR encoder preparation batch of `model` ran.
+pub(crate) fn record_asr_preparation_batch_rows(model: &str, rows: usize) {
+    ASR_PREPARATION_BATCH_ROWS.observe(&[model], rows as f64);
+}
+
+/// Observations and total rows of `model`'s preparation batch histogram.
+#[cfg(test)]
+pub(crate) fn asr_preparation_batch_rows_totals(model: &str) -> (u64, f64) {
+    let snapshot = ASR_PREPARATION_BATCH_ROWS.series(&[model]).snapshot();
+    (snapshot.count, snapshot.sum)
+}
+
 static ENGINE_MODEL_CALLS_PER_STEP: HistogramFamily = HistogramFamily::new(
     "izwi_engine_model_calls_per_step",
     "Model calls one engine step dispatched: one per tensor batch or serial row, one per row of a request-parallel batch.",
@@ -1672,6 +1691,7 @@ pub fn push_engine_histograms(payload: &mut String) {
     ENGINE_BATCH_ROWS.render(payload);
     ENGINE_BATCH_TOKENS.render(payload);
     ENGINE_MODEL_CALLS_PER_STEP.render(payload);
+    ASR_PREPARATION_BATCH_ROWS.render(payload);
     ENGINE_MIXED_ROWS.render(payload);
     ENGINE_MIXED_TOKENS.render(payload);
     ENGINE_DEVICE_IDLE_SECONDS.render(payload);
@@ -2372,6 +2392,19 @@ mod tests {
         let snapshot = collector.snapshot().await;
         assert_eq!(snapshot.total_requests, 2);
         assert_eq!(snapshot.total_tokens, 150);
+    }
+
+    #[test]
+    fn asr_preparation_batch_rows_are_exported_per_model() {
+        let model = "asr-preparation-batch-rows-test";
+        record_asr_preparation_batch_rows(model, 1);
+        record_asr_preparation_batch_rows(model, 7);
+        assert_eq!(asr_preparation_batch_rows_totals(model), (2, 8.0));
+        let mut payload = String::new();
+        push_engine_histograms(&mut payload);
+        assert!(payload.contains(&format!(
+            "izwi_asr_preparation_batch_rows_count{{model=\"{model}\"}} 2"
+        )));
     }
 
     #[test]

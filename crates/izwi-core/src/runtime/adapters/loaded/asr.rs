@@ -236,6 +236,13 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
     }
 }
 
+/// Input samples one Parakeet preparation row may encode: over an hour at
+/// 16 kHz, above the decoded-audio cap.
+const PARAKEET_PREPARATION_ROW_WORK_UNITS: u64 = 64 * 1024 * 1024;
+/// Workspace bound of one Parakeet preparation row: one encoder window, its
+/// feature copy and the stitched output of the longest input.
+const PARAKEET_PREPARATION_ROW_WORKSPACE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 #[derive(Debug)]
 pub(super) struct ParakeetAsrExecutionAdapter {
     pub(super) execution_group_id: ExecutionGroupId,
@@ -354,20 +361,25 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
         profile.max_batch_size = self.max_batch_size;
         profile.resolved_from_loaded_model = true;
 
+        // Concurrent clips of one window encode as one padded batch of up to
+        // the engine's width (`ParakeetEncoderBatcher`); longer audio encodes
+        // alone. Each row may bring an hour of samples and its own workspace.
         let mut preparation = StageDescriptor::from_execution_profile(
             StageId::new(0),
             "asr.encoder.parakeet",
             &profile,
-            NativeBatchMode::None,
+            NativeBatchMode::Static,
         );
         preparation.selector = StageWorkSelector::PreSequencePreparation;
         preparation.progress = StageProgressKind::Atomic;
         preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
-        preparation.max_batch_size = 1;
-        preparation.max_work_units = 64 * 1024 * 1024;
-        preparation.max_workspace_bytes = 4 * 1024 * 1024 * 1024;
-        preparation.concurrency = ConcurrencyClass::Exclusive;
-        preparation.shape_policy = StageShapePolicy::Exact;
+        preparation.max_work_units = PARAKEET_PREPARATION_ROW_WORK_UNITS
+            .checked_mul(width)
+            .ok_or_else(|| Error::Overloaded("Parakeet preparation work overflowed".into()))?;
+        preparation.max_workspace_bytes = PARAKEET_PREPARATION_ROW_WORKSPACE_BYTES
+            .checked_mul(width)
+            .ok_or_else(|| Error::Overloaded("Parakeet preparation workspace overflowed".into()))?;
+        preparation.shape_policy = StageShapePolicy::Padded;
         preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
 
         let selection = ClockedStateSelection::new(

@@ -1500,19 +1500,6 @@ impl RuntimeService {
             .ok_or_else(|| {
                 Error::Overloaded("Parakeet retained tensor estimate overflowed".into())
             })?;
-        let materialized_elements = u64::try_from(feature_frames)
-            .ok()
-            .and_then(|frames| frames.checked_mul(1024 * 16))
-            .ok_or_else(|| Error::Overloaded("Parakeet preparation geometry overflowed".into()))?;
-        // Windowed encoding caps the quadratic attention terms at one window;
-        // only the stitched output grows with length.
-        let preparation_bytes =
-            crate::models::architectures::parakeet::asr::parakeet_encode_row_bytes(
-                &features,
-                features.window_frames(),
-                1,
-                self.backend_router.context().backend_kind,
-            )?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
         let prep_spec = JobSpec {
             request_id: prepared.id.clone(),
@@ -1538,95 +1525,23 @@ impl RuntimeService {
             Ok(job) => job,
             Err(failure) => return Err(failure.error),
         };
-        let work = WorkUnit::PreSequencePreparation {
-            kind: "asr.encoder.parakeet".into(),
-        };
-        let cost = crate::engine::WorkCost::with_workspace(
-            u64::try_from(samples.len())
-                .map_err(|_| Error::Overloaded("Parakeet sample work exceeds u64".into()))?,
-            materialized_elements,
-            retained_artifact_resources(
-                self.backend_router.context().backend_kind,
-                preparation_bytes.host_bytes,
-                preparation_bytes.device_bytes()?,
-            )?,
-        );
-        let cancellation = PreparationCancellation::default();
-        let row = self.coordinator.seal_preparation_row(
-            prep_job,
-            &contract,
-            &work,
-            cost,
-            materialized_elements,
-            cancellation.clone(),
-        )?;
-        let language = prepared.asr_language_for_execution().map(str::to_owned);
-        let model_for_preparation = model.clone();
-        let encoder_cancellation = cancellation.clone();
-        let encoder_request_id = prepared.id.clone();
-        let encoder_deadline = prepared.deadline;
-        let mut guard = PreparationCancellationGuard {
-            cancellation,
-            armed: true,
-        };
-        let mut outcomes = self
-            .coordinator
-            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
-                if live != [0] {
-                    return Err(Error::InferenceError(
-                        "Parakeet encoder preparation must remain scalar".into(),
-                    ));
-                }
-                let model_arc = model_for_preparation.model_arc();
-                let crate::models::registry::NativeAsrModel::Parakeet(model) = model_arc.as_ref()
-                else {
-                    return Err(Error::InferenceError(
-                        "Parakeet preparation crossed model family".into(),
-                    ));
-                };
-                // Checked between encoder windows, so a disconnected or
-                // expired request releases the device within one window.
-                let checkpoint = || {
-                    if encoder_cancellation.is_cancelled() {
-                        return Err(Error::Cancelled(encoder_request_id.clone()));
-                    }
-                    if encoder_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        return Err(Error::Timeout(encoder_request_id.clone()));
-                    }
-                    Ok(())
-                };
-                let artifact = match model.encode_host_features(
-                    &features,
-                    language.as_deref(),
-                    &checkpoint,
-                ) {
-                    Ok(artifact) => Arc::new(artifact),
-                    // A row error keeps its kind; a batch error is reported
-                    // as an inference failure.
-                    Err(error @ (Error::Cancelled(_) | Error::Timeout(_))) => {
-                        return Ok(vec![Err(error)]);
-                    }
-                    Err(error) => return Err(error),
-                };
-                let accelerator_bytes = artifact.resident_tensor_bytes()?;
-                if accelerator_bytes > retained_device_ceiling {
-                    return Err(Error::InferenceError(format!(
-                        "Parakeet encoder artifact exceeded its admitted ceiling: {accelerator_bytes} > {retained_device_ceiling}"
-                    )));
-                }
-                Ok(vec![Ok(PreparationArtifact {
-                    retained: JobResourceObservation {
-                        host_bytes: retained_host_bytes,
-                        accelerator_bytes,
-                    },
-                    value: artifact,
-                })])
+        // Concurrent clips of one window encode as one padded batch.
+        let outcome = self
+            .parakeet_encoder_batcher
+            .submit(ParakeetEncoderPending {
+                job: prep_job,
+                contract,
+                model: model.clone(),
+                model_label: variant.dir_name(),
+                backend: self.backend_router.context().backend_kind,
+                features,
+                language: prepared.asr_language_for_execution().map(str::to_owned),
+                retained_host_bytes,
+                retained_device_ceiling,
+                cancellation: PreparationCancellation::default(),
+                response: None,
             })
             .await?;
-        guard.armed = false;
-        let outcome = outcomes.pop().ok_or_else(|| {
-            Error::InferenceError("Parakeet preparation returned no outcome".into())
-        })?;
         let (artifact, bridge) = match outcome {
             PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
             PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),

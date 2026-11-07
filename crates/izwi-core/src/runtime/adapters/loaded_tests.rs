@@ -1504,7 +1504,7 @@ fn offline_asr_transport_progress_does_not_require_native_streaming() {
     assert_eq!(transport.execution_profile.mode, ExecutionMode::Sequence);
     assert_eq!(transport.execution_profile.cache_mode, CacheMode::None);
     assert_eq!(transport.stages.len(), 3);
-    assert_eq!(transport.stages[0].batch_mode, NativeBatchMode::None);
+    assert_eq!(transport.stages[0].batch_mode, NativeBatchMode::Static);
     assert_eq!(transport.stages[1].batch_mode, NativeBatchMode::Static);
     assert_eq!(transport.stages[2].batch_mode, NativeBatchMode::Continuous);
     assert_eq!(
@@ -2743,6 +2743,32 @@ fn parakeet_long_form_graph_is_one_atomic_stage_beside_the_sequence_graph() {
         .stages
         .iter()
         .all(|stage| stage.selector != StageWorkSelector::Atomic));
+    // Concurrent short clips encode as one padded batch of the engine's
+    // width, each row with the budget a lone row had.
+    let preparation = &normal.stages[0];
+    assert_eq!(
+        preparation.selector,
+        StageWorkSelector::PreSequencePreparation
+    );
+    assert_eq!(preparation.batch_mode, NativeBatchMode::Static);
+    assert_eq!(preparation.concurrency, ConcurrencyClass::Batchable);
+    assert_eq!(preparation.shape_policy, StageShapePolicy::Padded);
+    assert_eq!(preparation.max_padding_basis_points, 10_000);
+    assert_eq!(preparation.max_batch_size, 4);
+    assert_eq!(preparation.max_work_units, 4 * 64 * 1024 * 1024);
+    assert_eq!(preparation.max_workspace_bytes, 4 * 4 * 1024 * 1024 * 1024);
+    assert_eq!(normal.adapter_abi_revision, AdapterAbiRevision::new(29));
+    let solo = ParakeetAsrExecutionAdapter::new(
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(2),
+        metadata,
+        BackendKind::Cpu,
+        1,
+    )
+    .contract(StreamingRequirements::NONE)
+    .unwrap();
+    assert_eq!(solo.stages[0].max_batch_size, 1);
+    assert_eq!(solo.stages[0].max_workspace_bytes, 4 * 1024 * 1024 * 1024);
 
     let long = adapter
         .contract(StreamingRequirements::NONE.with_asr_long_form(true))

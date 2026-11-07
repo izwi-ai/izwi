@@ -82,6 +82,9 @@ use crate::models::architectures::maya1::{
 use crate::models::architectures::maya2::{
     resolve_language, Maya2GenerationParams, Maya2SamplingParams, Maya2Voice,
 };
+use crate::models::architectures::parakeet::asr::{
+    ParakeetEncoderBatchRow, ParakeetHostFeatures, ParakeetPreparedEncoderArtifact,
+};
 use crate::models::architectures::qwen3::asr::{
     Qwen3AsrAudioBatchRow, Qwen3AsrAudioPreparationGeometry, Qwen3AsrPreparedAudio,
 };
@@ -142,9 +145,9 @@ mod tts_preparation;
 #[cfg(test)]
 use asr_encoders::granite_speech_deadline_budget_bucket;
 use asr_encoders::{
-    GraniteSpeechEncoderBatcher, GraniteSpeechEncoderPending, QwenAsrEncoderBatcher,
-    QwenAsrEncoderPending, VibeVoiceEncoderBatcher, VibeVoiceEncoderPending, WhisperEncoderBatcher,
-    WhisperEncoderPending,
+    GraniteSpeechEncoderBatcher, GraniteSpeechEncoderPending, ParakeetEncoderBatcher,
+    ParakeetEncoderPending, QwenAsrEncoderBatcher, QwenAsrEncoderPending, VibeVoiceEncoderBatcher,
+    VibeVoiceEncoderPending, WhisperEncoderBatcher, WhisperEncoderPending,
 };
 use asr_preparation::asr_encoder_retained_resources;
 #[cfg(test)]
@@ -959,6 +962,7 @@ pub struct RuntimeService {
     whisper_encoder_batcher: Arc<WhisperEncoderBatcher>,
     vibevoice_encoder_batcher: Arc<VibeVoiceEncoderBatcher>,
     granite_speech_encoder_batcher: Arc<GraniteSpeechEncoderBatcher>,
+    parakeet_encoder_batcher: Arc<ParakeetEncoderBatcher>,
     pub(super) asr_realtime_sessions: RealtimeAsrSessionPolicy,
     telemetry: Arc<RuntimeTelemetryCollector>,
     completion_waiters: Arc<RuntimeCompletionWaiters>,

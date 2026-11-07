@@ -215,6 +215,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_NUM_THREADS` | integer | min(available cores, 8) (4 if unknown) | startup | Number of compute threads (0 or invalid ignored; floor 1). |
 | `IZWI_OFFLINE` | flag | `false` | startup | Never contacts Hugging Face: downloads are refused and download sizes come from the built-in estimates. |
 | `IZWI_PARAKEET_ASR_DTYPE` | choice | F16 encoder projections on Metal, else F32 | model load | Parakeet dtype override: on Metal f32 keeps every weight F32 and f16 stores encoder projections in F16. |
+| `IZWI_PARAKEET_ENCODER_BATCHING` | flag | `true` | first use | Encodes concurrent Parakeet clips of one encoder window (82 s) as one padded batch; false encodes every request alone. |
 | `IZWI_PARAKEET_METAL_CONV1D_BN_SWISH` | flag | true (Metal only) | first use | Enables the fused Metal depthwise Conv1d + bias + Swish kernel for Parakeet ASR conformer convs. |
 | `IZWI_PARAKEET_METAL_DEPTHWISE_CONV1D` | flag | true (Metal only) | first use | Enables the custom Metal depthwise Conv1d kernel for Parakeet ASR. |
 | `IZWI_PARAKEET_METAL_DEPTHWISE_CONV2D` | flag | true (Metal only) | first use | Enables the custom Metal depthwise Conv2d kernel for Parakeet ASR. |

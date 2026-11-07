@@ -268,6 +268,7 @@ impl RuntimeService {
         let vibevoice_encoder_batcher = Arc::new(VibeVoiceEncoderBatcher::new(coordinator.clone()));
         let granite_speech_encoder_batcher =
             Arc::new(GraniteSpeechEncoderBatcher::new(coordinator.clone()));
+        let parakeet_encoder_batcher = Arc::new(ParakeetEncoderBatcher::new(coordinator.clone()));
         let asr_realtime_sessions = RealtimeAsrSessionPolicy::resolve_for_sequences(
             config.asr_realtime,
             selected_backend_kind,
@@ -338,6 +339,7 @@ impl RuntimeService {
             whisper_encoder_batcher,
             vibevoice_encoder_batcher,
             granite_speech_encoder_batcher,
+            parakeet_encoder_batcher,
             asr_realtime_sessions,
             telemetry: Arc::new(RuntimeTelemetryCollector::new(2048)),
             completion_waiters: Arc::new(Mutex::new(HashMap::new())),
