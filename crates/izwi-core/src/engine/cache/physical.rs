@@ -265,7 +265,10 @@ struct OwnedRetainedStaticAttention {
 struct ModelPhysicalState {
     invocation_paged: HashMap<InvocationPhysicalKey, OwnedInvocationPool>,
     invocation_slots: HashMap<InvocationPhysicalKey, OwnedInvocationSlotPool>,
-    retained_tensor: Option<OwnedRetainedTensorState>,
+    /// One allocation per distinct contract: a transducer's offline decode
+    /// rows (predictor state) and its realtime sessions (streaming encoder
+    /// and predictor state) are different contracts on one generation.
+    retained_tensor: Vec<OwnedRetainedTensorState>,
     retained_static_attention: Option<OwnedRetainedStaticAttention>,
 }
 
@@ -359,14 +362,17 @@ impl PhysicalStateManager {
                 "retained tensor allocation requires non-zero sequence capacity and retained tensor, append, ring, or static-tensor domains only",
             ));
         }
-        if let Some(existing) = self
-            .models
-            .get(&model_instance)
-            .and_then(|model| model.retained_tensor.as_ref())
-        {
-            if existing.runtime.state_plan_v2().contract_fingerprint != contract.fingerprint()?
-                || existing.runtime.sequence_capacity() != sequence_capacity
-            {
+        let fingerprint = contract.fingerprint()?;
+        if let Some(existing) = self.models.get(&model_instance).and_then(|model| {
+            model
+                .retained_tensor
+                .iter()
+                .find(|existing| existing.runtime.state_plan_v2().contract_fingerprint == fingerprint)
+        }) {
+            // Capabilities sharing a contract share its allocation (Parakeet's
+            // offline rows and realtime sessions); the first request sizes it,
+            // so a later one may only need fewer sequences.
+            if existing.runtime.sequence_capacity() < sequence_capacity {
                 return Err(invalid(
                     "one model generation requested incompatible retained tensor allocation",
                 ));
@@ -402,7 +408,13 @@ impl PhysicalStateManager {
             .resource_authority
             .as_ref()
             .map(|authority| {
-                reserve_retained_tensor(authority, model_instance, self.worker_backend, resources)
+                reserve_retained_tensor(
+                    authority,
+                    model_instance,
+                    generation,
+                    self.worker_backend,
+                    resources,
+                )
             })
             .transpose()?
             .map(Arc::new);
@@ -430,19 +442,11 @@ impl PhysicalStateManager {
             }),
         });
         let model = self.models.entry(model_instance).or_default();
-        if model
-            .retained_tensor
-            .replace(OwnedRetainedTensorState {
-                runtime: runtime.clone(),
-                resource_lease,
-                resources,
-            })
-            .is_some()
-        {
-            return Err(invalid(
-                "one model generation allocated retained tensor state twice",
-            ));
-        }
+        model.retained_tensor.push(OwnedRetainedTensorState {
+            runtime: runtime.clone(),
+            resource_lease,
+            resources,
+        });
         self.next_allocation_generation = next_generation;
         Ok(runtime)
     }
@@ -986,7 +990,7 @@ impl PhysicalStateManager {
                 drain_error.get_or_insert(error);
             }
         }
-        if let Some(retained) = model.retained_tensor.as_ref() {
+        for retained in &model.retained_tensor {
             if let Err(error) = retained.runtime.close_and_validate_drained() {
                 drain_error.get_or_insert(error);
             }
@@ -1027,7 +1031,7 @@ impl PhysicalStateManager {
                 lease.prepare_materialized_release(ResourceVector::zero())?;
             }
         }
-        if let Some(retained) = model.retained_tensor.as_ref() {
+        for retained in &model.retained_tensor {
             if let Some(lease) = retained.resource_lease.as_ref() {
                 if lease.resources() != retained.resources {
                     return Err(Error::InferenceError(
@@ -1256,12 +1260,16 @@ fn reserve_arena(
 fn reserve_retained_tensor(
     authority: &Arc<ResourceAuthority>,
     model_instance: ModelInstanceId,
+    allocation_generation: u32,
     backend: BackendKind,
     resources: ResourceVector,
 ) -> Result<ResourceLease> {
     let owner = ReservationOwner::new(
         ReservationClass::Model,
-        format!("retained-tensor-state:{}:{backend:?}", model_instance.get()),
+        format!(
+            "retained-tensor-state:{}:{allocation_generation}:{backend:?}",
+            model_instance.get()
+        ),
     );
     authority.reserve(owner, resources)
 }
@@ -2188,11 +2196,19 @@ mod tests {
         assert_eq!(runtime.state_plan_v2().non_paged.len(), 1);
         assert_eq!(runtime.sequence_capacity(), 2);
         assert_eq!(runtime.maximum_bytes(), 4 * 8 * 4);
-        assert!(manager
-            .allocate_retained_tensor(model, &retained_tensor_contract(4), 2)
-            .is_err());
-        assert!(manager
+        // Another contract gets its own allocation on the same generation; a
+        // request for fewer sequences shares this one; more is refused.
+        let other = manager
+            .allocate_retained_tensor(model, &retained_tensor_contract(4), 3)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&runtime, &other));
+        assert_eq!(other.sequence_capacity(), 3);
+        let fewer = manager
             .allocate_retained_tensor(model, &contract, 1)
+            .unwrap();
+        assert!(Arc::ptr_eq(&runtime, &fewer));
+        assert!(manager
+            .allocate_retained_tensor(model, &contract, 3)
             .is_err());
 
         let sequence = runtime.register_sequence().unwrap();
