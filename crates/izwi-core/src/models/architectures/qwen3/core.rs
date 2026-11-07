@@ -484,7 +484,31 @@ fn record_qwen3_silu_mul_profile(fused: bool) {
 
 enum Qwen3Projection {
     Dense(Qwen3DenseProjection),
-    Quantized(QMatMul),
+    Quantized(Qwen3QuantizedProjection),
+}
+
+/// A quantized projection, with how its activations reach the kernel
+/// decided once at load.
+struct Qwen3QuantizedProjection {
+    qmatmul: QMatMul,
+    /// On CUDA, Candle's GGUF kernels take this weight's BF16/F16
+    /// activations as they are ([`qwen3_cuda_qmatmul_takes_half_activations`]),
+    /// so no F32 casts wrap the call.
+    cuda_half_activations: bool,
+}
+
+impl Qwen3QuantizedProjection {
+    fn new(qmatmul: QMatMul) -> Self {
+        let on_cuda = match &qmatmul {
+            QMatMul::QTensor(weight) => weight.device().is_cuda(),
+            QMatMul::Tensor(weight) | QMatMul::TensorF16(weight) => weight.device().is_cuda(),
+        };
+        let cuda_half_activations = on_cuda && qwen3_cuda_qmatmul_takes_half_activations(&qmatmul);
+        Self {
+            qmatmul,
+            cuda_half_activations,
+        }
+    }
 }
 
 /// The text model's token embedding: a dense table (safetensors and MLX
@@ -529,7 +553,7 @@ impl Qwen3TokenEmbedding {
             Self::Dense(embedding) => {
                 Ok(Qwen3Projection::tied_dense(embedding.embeddings().clone()))
             }
-            Self::Quantized { table, .. } => Ok(Qwen3Projection::Quantized(table.tied_head()?)),
+            Self::Quantized { table, .. } => Ok(Qwen3Projection::from_qmatmul(table.tied_head()?)),
         }
     }
 
@@ -629,14 +653,18 @@ impl Qwen3Projection {
         let resolved = qwen3_gguf_tensor_name(loader, name).unwrap_or_else(|| name.to_string());
         let weights = Arc::new(loader.load_qtensor(&resolved, device)?);
         QMatMul::from_arc(weights)
-            .map(Self::Quantized)
+            .map(Self::from_qmatmul)
             .map_err(Error::from)
     }
 
     fn from_qtensor(qtensor: QTensor) -> Result<Self> {
         QMatMul::from_qtensor(qtensor)
-            .map(Self::Quantized)
+            .map(Self::from_qmatmul)
             .map_err(Error::from)
+    }
+
+    fn from_qmatmul(qmatmul: QMatMul) -> Self {
+        Self::Quantized(Qwen3QuantizedProjection::new(qmatmul))
     }
 
     fn packed_quantized(loader: &GgufLoader, device: &Device, names: &[&str]) -> Result<Self> {
@@ -645,7 +673,7 @@ impl Qwen3Projection {
             .map(|name| qwen3_gguf_tensor_name(loader, name).unwrap_or_else(|| (*name).to_string()))
             .collect::<Vec<_>>();
         let resolved = resolved.iter().map(String::as_str).collect::<Vec<_>>();
-        packed_quantized_qmatmul(loader, device, &resolved).map(Self::Quantized)
+        packed_quantized_qmatmul(loader, device, &resolved).map(Self::from_qmatmul)
     }
 
     fn tied_dense(weight: Tensor) -> Self {
@@ -697,34 +725,86 @@ fn qwen3_metal_qmatmul_f32_input_policy(is_metal: bool, override_enabled: Option
     is_metal && override_enabled.unwrap_or(true)
 }
 
-fn qwen3_qmatmul_input_dtype(device: &Device, activation_dtype: DType) -> Option<DType> {
+fn qwen3_qmatmul_input_dtype(
+    device: &Device,
+    cuda_half_activations: bool,
+    activation_dtype: DType,
+) -> Option<DType> {
     qwen3_qmatmul_input_dtype_policy(
         device.is_cuda(),
+        cuda_half_activations,
         qwen3_metal_qmatmul_f32_input_enabled(device),
         activation_dtype,
     )
 }
 
+/// The dtype a quantized projection's activations are cast to before the
+/// call (and its output cast back from), or `None` to pass them as they are.
 fn qwen3_qmatmul_input_dtype_policy(
     is_cuda: bool,
+    cuda_half_activations: bool,
     metal_f32_input_enabled: bool,
     activation_dtype: DType,
 ) -> Option<DType> {
     if activation_dtype == DType::F32 {
         return None;
     }
-    (is_cuda || metal_f32_input_enabled).then_some(DType::F32)
+    if is_cuda {
+        let native = cuda_half_activations && matches!(activation_dtype, DType::BF16 | DType::F16);
+        return (!native).then_some(DType::F32);
+    }
+    metal_f32_input_enabled.then_some(DType::F32)
+}
+
+/// Whether Candle 0.11.1's CUDA `QMatMul` takes BF16/F16 activations for
+/// `qmatmul` and gives bit-for-bit what casting them to F32, running the F32
+/// kernel and casting the result back gives:
+/// - a `QTensor` of a type its fast GGUF kernels cover (Q4_0, Q4_1, Q5_0,
+///   Q5_1, Q8_0, Q2_K to Q6_K), whose rows are whole blocks. Up to 8 rows
+///   MMVQ quantizes the activations to Q8_1 from their exact F32 values,
+///   sums in F32 and rounds each sum to the output dtype to nearest even,
+///   as the cast kernel does; more rows run MMQ, which makes those casts
+///   itself.
+/// - not a dequantized `Tensor` (an F16/BF16/F32 GGUF weight, an F32
+///   matmul), `TensorF16`, or another quantized type: their fallback kernels
+///   read F32 only.
+fn qwen3_cuda_qmatmul_takes_half_activations(qmatmul: &QMatMul) -> bool {
+    let QMatMul::QTensor(weight) = qmatmul else {
+        return false;
+    };
+    let dtype = weight.dtype();
+    let fast_kernels = matches!(
+        dtype,
+        GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K
+    );
+    fast_kernels
+        && weight
+            .shape()
+            .dims2()
+            .is_ok_and(|(_, cols)| cols.is_multiple_of(dtype.block_size()))
 }
 
 impl Module for Qwen3Projection {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         match self {
             Self::Dense(dense) => dense.linear.forward(x),
-            Self::Quantized(qmatmul) => {
+            Self::Quantized(projection) => {
                 let activation_dtype = x.dtype();
                 let profile = qwen3_runtime_profiling_enabled();
-                let x = if let Some(dtype) = qwen3_qmatmul_input_dtype(x.device(), activation_dtype)
-                {
+                let x = if let Some(dtype) = qwen3_qmatmul_input_dtype(
+                    x.device(),
+                    projection.cuda_half_activations,
+                    activation_dtype,
+                ) {
                     let started = profile.then(Instant::now);
                     let casted = x.to_dtype(dtype)?;
                     if let Some(started) = started {
@@ -733,11 +813,15 @@ impl Module for Qwen3Projection {
                             .fetch_add(elapsed_ns(started), Ordering::Relaxed);
                     }
                     casted
+                } else if projection.cuda_half_activations {
+                    // The fast kernels read contiguous rows; the cast this
+                    // replaces always produced them.
+                    x.contiguous()?
                 } else {
                     x.clone()
                 };
                 let qmatmul_started = profile.then(Instant::now);
-                let out = qmatmul.forward(&x)?;
+                let out = projection.qmatmul.forward(&x)?;
                 if let Some(started) = qmatmul_started {
                     QWEN3_PROFILE_QMATMUL_CALLS.fetch_add(1, Ordering::Relaxed);
                     QWEN3_PROFILE_QMATMUL_NS.fetch_add(elapsed_ns(started), Ordering::Relaxed);
@@ -2603,12 +2687,13 @@ impl Qwen3Model {
         // exactly the dense table's rows.
         let embed_tokens =
             match qwen3_mlx_q4_1_projection(&embed_vb, &[("", cfg.vocab_size)], cfg.hidden_size)? {
-                Some(Qwen3Projection::Quantized(QMatMul::QTensor(table))) => {
-                    Qwen3TokenEmbedding::Quantized {
-                        table: QuantizedTokenTable::from_arc(table)?,
-                        dtype: vb.dtype(),
-                    }
-                }
+                Some(Qwen3Projection::Quantized(Qwen3QuantizedProjection {
+                    qmatmul: QMatMul::QTensor(table),
+                    ..
+                })) => Qwen3TokenEmbedding::Quantized {
+                    table: QuantizedTokenTable::from_arc(table)?,
+                    dtype: vb.dtype(),
+                },
                 _ => Qwen3TokenEmbedding::Dense(mlx::load_embedding(
                     cfg.vocab_size,
                     cfg.hidden_size,
@@ -2709,7 +2794,7 @@ impl Qwen3Model {
             }
             // A tied head (a stored copy of the table, as Qwen3-ASR
             // checkpoints carry, is not read) shares the token table.
-            Qwen3Projection::Quantized(table.tied_head()?)
+            Qwen3Projection::from_qmatmul(table.tied_head()?)
         };
         let embed_tokens = Qwen3TokenEmbedding::Quantized { table, dtype };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -5248,26 +5333,107 @@ mod tests {
 
     #[test]
     fn qwen3_qmatmul_uses_f32_input_for_accelerated_lower_precision_activations() {
+        // CUDA weights without half-activation kernels, and Metal: cast.
         assert_eq!(
-            qwen3_qmatmul_input_dtype_policy(true, false, DType::BF16),
+            qwen3_qmatmul_input_dtype_policy(true, false, false, DType::BF16),
             Some(DType::F32)
         );
         assert_eq!(
-            qwen3_qmatmul_input_dtype_policy(true, false, DType::F16),
+            qwen3_qmatmul_input_dtype_policy(true, false, false, DType::F16),
             Some(DType::F32)
         );
         assert_eq!(
-            qwen3_qmatmul_input_dtype_policy(true, false, DType::F32),
+            qwen3_qmatmul_input_dtype_policy(true, false, false, DType::F32),
             None
         );
         assert_eq!(
-            qwen3_qmatmul_input_dtype_policy(false, true, DType::F16),
+            qwen3_qmatmul_input_dtype_policy(false, false, true, DType::F16),
             Some(DType::F32)
         );
         assert_eq!(
-            qwen3_qmatmul_input_dtype_policy(false, false, DType::BF16),
+            qwen3_qmatmul_input_dtype_policy(false, false, false, DType::BF16),
             None
         );
+    }
+
+    #[test]
+    fn qwen3_cuda_qmatmul_passes_half_activations_only_to_weights_that_take_them() {
+        for dtype in [DType::BF16, DType::F16] {
+            assert_eq!(
+                qwen3_qmatmul_input_dtype_policy(true, true, false, dtype),
+                None
+            );
+        }
+        assert_eq!(
+            qwen3_qmatmul_input_dtype_policy(true, true, false, DType::F32),
+            None
+        );
+        // Any other activation dtype still reaches the F32 kernels.
+        assert_eq!(
+            qwen3_qmatmul_input_dtype_policy(true, true, false, DType::F64),
+            Some(DType::F32)
+        );
+        // The flag means nothing off CUDA: Metal keeps its own policy.
+        assert_eq!(
+            qwen3_qmatmul_input_dtype_policy(false, true, true, DType::BF16),
+            Some(DType::F32)
+        );
+        assert_eq!(
+            qwen3_qmatmul_input_dtype_policy(false, true, false, DType::BF16),
+            None
+        );
+    }
+
+    #[test]
+    fn qwen3_cuda_half_activation_weights_are_fast_kernel_qtensors() {
+        let device = Device::Cpu;
+        let weight = Tensor::from_vec(
+            crate::kernels::numeric_check::xorshift_values(4 * 256, 9, 1.0),
+            (4, 256),
+            &device,
+        )
+        .unwrap();
+        let qmatmul =
+            |dtype| QMatMul::QTensor(Arc::new(QTensor::quantize(&weight, dtype).unwrap()));
+        for dtype in [
+            GgmlDType::Q4_0,
+            GgmlDType::Q4_1,
+            GgmlDType::Q5_0,
+            GgmlDType::Q5_1,
+            GgmlDType::Q8_0,
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+        ] {
+            assert!(
+                qwen3_cuda_qmatmul_takes_half_activations(&qmatmul(dtype)),
+                "{dtype:?}"
+            );
+        }
+        // Types with no fast kernel fall back to F32-only kernels.
+        for dtype in [GgmlDType::Q8_1, GgmlDType::Q8K] {
+            assert!(
+                !qwen3_cuda_qmatmul_takes_half_activations(&qmatmul(dtype)),
+                "{dtype:?}"
+            );
+        }
+        // A dense (dequantized F16/BF16/F32 GGUF) weight is an F32 matmul.
+        let dense =
+            QMatMul::from_qtensor(QTensor::quantize(&weight, GgmlDType::F16).unwrap()).unwrap();
+        assert!(matches!(dense, QMatMul::Tensor(_)));
+        assert!(!qwen3_cuda_qmatmul_takes_half_activations(&dense));
+        assert!(!qwen3_cuda_qmatmul_takes_half_activations(
+            &QMatMul::TensorF16(weight.to_dtype(DType::F16).unwrap())
+        ));
+        // Decided at load, and only for a CUDA weight.
+        let Qwen3Projection::Quantized(projection) =
+            Qwen3Projection::from_qmatmul(qmatmul(GgmlDType::Q8_0))
+        else {
+            panic!("a QMatMul loads as a quantized projection");
+        };
+        assert!(!projection.cuda_half_activations);
     }
 
     #[test]
