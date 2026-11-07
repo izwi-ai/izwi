@@ -54,6 +54,7 @@ pub(crate) const CUDA_DEFAULT_WIDTH: usize = 8;
 /// | Fish Audio Drama 3 (TTS) | 1 | 1 | 8 | Defaults until its row-invariance and throughput evidence |
 /// | Qwen3-ASR, VibeVoice-ASR, Parakeet, Nemotron ASR (decode only) | 2 | 2 | 32 | Unmeasured past 8. H100 (`e8f189691`): Qwen3-ASR and VibeVoice-ASR scaled 2.4–2.9x from 1 to 8 streams, then stayed flat at the width (Qwen3-ASR ~82 audio-s/s); each decode step runs all rows per launch |
 /// | Whisper (decode only) | 2 | 2 | 32 | Unmeasured. Its ~316 MB decoder was launch-bound at one row per step; rows now share each launch, one flash-attention call per layer for cross attention, and a row decodes the same alone as beside others (CPU tiny-model parity test) |
+/// | Voxtral (offline decode only) | 2 | 2 | 32 | Unmeasured past one row. H100: an offline request held the device for its whole decode (about 6.3 ms a frame), 9.6 audio-s/s flat from 1 to 32 streams; offline rows now step together (one token upload, LM forward and argmax readback for every row), and a row emits the same alone as beside others (CPU tiny-model test) |
 ///
 /// Qwen3.5 on the CPU gained nothing past two rows in a repeated run, so it
 /// stays at two. Metal's LFM2 small-batch mat-vec serves 2..=8 rows, which
@@ -74,7 +75,8 @@ pub(crate) const fn certified_decode_width(family: ModelFamily, backend: Backend
             | ModelFamily::VibeVoiceAsr
             | ModelFamily::ParakeetAsr
             | ModelFamily::NemotronAsr
-            | ModelFamily::WhisperAsr,
+            | ModelFamily::WhisperAsr
+            | ModelFamily::Voxtral,
         ) => CUDA_MAX_WIDTH,
         (BackendKind::Cuda, _) => CUDA_DEFAULT_WIDTH,
         (BackendKind::Cpu | BackendKind::Metal, ModelFamily::Lfm2Chat | ModelFamily::Lfm3Chat)
@@ -285,17 +287,18 @@ mod tests {
         assert_eq!(chat_engine_width(BackendKind::Cpu, 8, true), 8);
     }
 
-    /// The five ASR families whose decode steps every row per launch take
+    /// The six ASR families whose decode steps every row per launch take
     /// the CUDA ceiling; every other speech family keeps the engine rows, and
     /// none changes on CPU or Metal.
     #[test]
     fn batched_asr_decode_families_take_the_cuda_ceiling() {
-        const WIDE: [ModelFamily; 5] = [
+        const WIDE: [ModelFamily; 6] = [
             ModelFamily::Qwen3Asr,
             ModelFamily::VibeVoiceAsr,
             ModelFamily::ParakeetAsr,
             ModelFamily::NemotronAsr,
             ModelFamily::WhisperAsr,
+            ModelFamily::Voxtral,
         ];
         for family in WIDE {
             assert_eq!(
@@ -315,7 +318,6 @@ mod tests {
             ModelFamily::GraniteSpeechAsr,
             ModelFamily::GraniteSpeech5Asr,
             ModelFamily::NemotronTranscribeAsr,
-            ModelFamily::Voxtral,
             ModelFamily::Lfm25Audio,
             ModelFamily::Lfm3Audio,
             ModelFamily::Qwen3Tts,

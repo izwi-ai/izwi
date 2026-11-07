@@ -5714,6 +5714,7 @@ mod tests {
             ModelFamily::ParakeetAsr,
             ModelFamily::NemotronAsr,
             ModelFamily::WhisperAsr,
+            ModelFamily::Voxtral,
         ] {
             assert!(stage_sets_batch_rows(family), "{family:?}");
         }
@@ -5723,7 +5724,6 @@ mod tests {
             ModelFamily::GraniteSpeechAsr,
             ModelFamily::GraniteSpeech5Asr,
             ModelFamily::NemotronTranscribeAsr,
-            ModelFamily::Voxtral,
             ModelFamily::Lfm25Audio,
             ModelFamily::Lfm3Audio,
             ModelFamily::Qwen3Tts,

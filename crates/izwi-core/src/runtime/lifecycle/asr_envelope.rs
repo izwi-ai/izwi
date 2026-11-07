@@ -675,6 +675,11 @@ fn decoder_kv_geometry(variant: ModelVariant) -> Option<DecoderKvGeometry> {
             layers: 28,
             kv_width: 512,
         },
+        // Voxtral's Ministral decoder: 26 layers, 8 KV heads of 128.
+        ModelVariant::VoxtralMini4BRealtime2602 => DecoderKvGeometry {
+            layers: 26,
+            kv_width: 1024,
+        },
         _ => return None,
     })
 }
@@ -991,6 +996,7 @@ mod tests {
                         | ModelFamily::ParakeetAsr
                         | ModelFamily::NemotronAsr
                         | ModelFamily::WhisperAsr
+                        | ModelFamily::Voxtral
                 );
             assert_eq!(row(variant).is_some(), wide, "{variant}");
         }
@@ -1031,6 +1037,31 @@ mod tests {
             16
         );
         assert_eq!(crate::catalog::fit_asr_decode_width(32, 8, whisper, GIB), 8);
+        // A Voxtral row holds BF16 K and V of its 26 layers and its BF16
+        // prepared audio embedding (3,072 wide) over one 30 s chunk's 918
+        // tokens, and an F32 logits row: about 99 MiB, so 32 rows take about
+        // 3.1 GiB. Beside ~8.9 GB of BF16 weights an H100 80 GB (about 70
+        // GiB of headroom) and an L4 24 GB (about 13 GiB) both take 32 rows;
+        // under ~6.2 GiB of headroom the decode narrows.
+        let voxtral = row(ModelVariant::VoxtralMini4BRealtime2602).unwrap();
+        assert_eq!(voxtral, 918 * (2 * 26 * 1024 * 2 + 3072 * 2) + 131_072 * 4);
+        assert_eq!(voxtral / MIB, 99);
+        assert_eq!(
+            crate::catalog::fit_asr_decode_width(32, 8, voxtral, 70 * GIB),
+            32
+        );
+        assert_eq!(
+            crate::catalog::fit_asr_decode_width(32, 8, voxtral, 13 * GIB),
+            32
+        );
+        assert_eq!(
+            crate::catalog::fit_asr_decode_width(32, 8, voxtral, 6 * GIB),
+            16
+        );
+        assert_eq!(
+            crate::catalog::fit_asr_decode_width(32, 8, voxtral, 3 * GIB),
+            8
+        );
     }
 
     /// The pinned decoder KV widths match the checkpoints' K projections.
@@ -1067,6 +1098,13 @@ mod tests {
                 ModelVariant::VibeVoiceAsr,
                 include_str!("../../../tests/fixtures/asr_residency/vibevoice_asr.json"),
                 "model.language_model.layers.{i}.self_attn.k_proj.weight",
+            ),
+            (
+                ModelVariant::VoxtralMini4BRealtime2602,
+                include_str!(
+                    "../../../tests/fixtures/asr_residency/voxtral_mini_4b_realtime_2602.json"
+                ),
+                "layers.{i}.attention.wk.weight",
             ),
         ] {
             let geometry = decoder_kv_geometry(variant).unwrap();
