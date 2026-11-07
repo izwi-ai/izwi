@@ -11,7 +11,7 @@ use candle_nn::{ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 #[cfg(test)]
@@ -1519,11 +1519,24 @@ impl Qwen3Attention {
         let Some((cos_half, sin_half)) = tables.as_ref() else {
             return Err(Error::InferenceError("Qwen3 RoPE tables missing".into()));
         };
+        self.apply_rope_pair_with_tables(&q, &k, cos_half, sin_half)
+    }
 
+    /// Rotates contiguous `[batch, seq, heads, head_dim]` `q` and `k` by the
+    /// `[seq, head_dim / 2]` `cos_half`/`sin_half` rows: the fused kernel
+    /// where enabled, else the composed ops. Each output element reads only
+    /// its own row's cos/sin, so the rows may come from any positions.
+    fn apply_rope_pair_with_tables(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        cos_half: &Tensor,
+        sin_half: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
         if self.should_try_rope_kernel(q.dtype()) {
             let cos = cos_half.unsqueeze(0)?.contiguous()?;
             let sin = sin_half.unsqueeze(0)?.contiguous()?;
-            if let Some((q_out, k_out)) = try_apply_rope_pair_thd(&q, &k, &cos, &sin)? {
+            if let Some((q_out, k_out)) = try_apply_rope_pair_thd(q, k, &cos, &sin)? {
                 record_rope_kernel();
                 record_rope_kernel();
                 return Ok((q_out, k_out));
@@ -1533,9 +1546,121 @@ impl Qwen3Attention {
         record_rope_manual();
 
         Ok((
-            apply_rotary_emb(&q, cos_half, sin_half)?,
-            apply_rotary_emb(&k, cos_half, sin_half)?,
+            apply_rotary_emb(q, cos_half, sin_half)?,
+            apply_rotary_emb(k, cos_half, sin_half)?,
         ))
+    }
+
+    /// RoPE over a whole decode batch in one call per tensor: `[rows, 1,
+    /// heads, head_dim]` `q`/`k` rotate as one `[1, rows, heads, head_dim]`
+    /// sequence whose token `i` takes `rope`'s row `i`. Each element sees
+    /// exactly the cos/sin and ops a one-row call at that row's position
+    /// does. Returns the `[rows, heads, head_dim]` queries and keys.
+    fn apply_decode_rope(
+        &self,
+        q: Tensor,
+        k: Tensor,
+        rope: &Qwen3DecodeRopeRows,
+    ) -> Result<(Tensor, Tensor)> {
+        let rows = q.dim(0)?;
+        if rope.cos.dtype() != q.dtype() {
+            return Err(Error::InferenceError(format!(
+                "Qwen3 decode RoPE rows are {:?} but the queries are {:?}",
+                rope.cos.dtype(),
+                q.dtype()
+            )));
+        }
+        let q = q
+            .reshape((1, rows, self.num_heads, self.head_dim))?
+            .contiguous()?;
+        let k = k
+            .reshape((1, rows, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let (q, k) = self.apply_rope_pair_with_tables(&q, &k, &rope.cos, &rope.sin)?;
+        Ok((
+            q.reshape((rows, self.num_heads, self.head_dim))?
+                .contiguous()?,
+            k.reshape((rows, self.num_kv_heads, self.head_dim))?
+                .contiguous()?,
+        ))
+    }
+
+    /// The position whose angles a one-token decode row at `start_pos`
+    /// rotates by in [`Self::rope_tables`]: MRoPE with fewer than three
+    /// sections builds its table from position zero.
+    fn decode_rope_position(&self, start_pos: usize) -> usize {
+        if self.use_mrope && !self.sequential_mrope_uses_host_tables() {
+            0
+        } else {
+            start_pos
+        }
+    }
+
+    /// cos/sin rows for positions `0..rows`, built by the builder
+    /// [`Self::rope_tables`] runs for one decode token. Every element is
+    /// computed on its own (`pos as f32 * inv`, then cos/sin elementwise),
+    /// so row `p` is bit-identical to the table that path builds at `p`.
+    fn decode_rope_table(
+        &self,
+        rows: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        if self.sequential_mrope_uses_host_tables() {
+            build_sequential_rope_host_tables(rows, 0, device, dtype, &self.rope_inv_freqs)
+        } else {
+            build_rope_cache_with_inv_freqs(rows, 0, device, dtype, &self.rope_inv_freqs)
+        }
+    }
+
+    /// Each decode row's `[rows, head_dim / 2]` cos/sin: one upload of the
+    /// rows' positions and one gather per table from the model's decode
+    /// table, which grows (rebuilt from zero by the same builder) when a
+    /// position passes its end.
+    fn decode_rope_rows(
+        &self,
+        table: &Mutex<Option<Qwen3DecodeRopeTable>>,
+        start_positions: &[usize],
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Qwen3DecodeRopeRows> {
+        let positions = start_positions
+            .iter()
+            .map(|&pos| {
+                u32::try_from(self.decode_rope_position(pos))
+                    .map_err(|_| Error::InvalidInput("Qwen3 RoPE position exceeds u32".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let needed = positions.iter().max().map_or(1, |&pos| pos as usize + 1);
+        let mut table = table
+            .lock()
+            .map_err(|_| Error::InferenceError("Qwen3 decode RoPE table lock poisoned".into()))?;
+        let stale = !table
+            .as_ref()
+            .is_some_and(|table| table.dtype == dtype && table.rows >= needed);
+        if stale {
+            let rows = needed
+                .next_power_of_two()
+                .max(QWEN3_DECODE_ROPE_TABLE_MIN_ROWS);
+            let (cos, sin) = self.decode_rope_table(rows, device, dtype)?;
+            *table = Some(Qwen3DecodeRopeTable {
+                dtype,
+                rows,
+                cos,
+                sin,
+            });
+        }
+        let Some(table) = table.as_ref() else {
+            return Err(Error::InferenceError(
+                "Qwen3 decode RoPE table missing".into(),
+            ));
+        };
+        let rows = positions.len();
+        let positions = Tensor::from_vec(positions, rows, device)?;
+        Ok(Qwen3DecodeRopeRows {
+            cos: table.cos.index_select(&positions, 0)?,
+            sin: table.sin.index_select(&positions, 0)?,
+        })
     }
 
     /// The `[seq, head_dim / 2]` cos/sin tables for `q`'s positions, in its
@@ -1732,7 +1857,7 @@ impl Qwen3Attention {
     fn forward_managed_decode_batch(
         &self,
         x: &Tensor,
-        start_positions: &[usize],
+        rope: &Qwen3DecodeRopeRows,
         caches: &[&PhysicalPagedKvCache],
         slots: &dyn KvSlotMap,
         metadata: &KvDecodeBatchMetadata,
@@ -1740,7 +1865,7 @@ impl Qwen3Attention {
         layer_idx: usize,
     ) -> Result<Tensor> {
         let bsz = x.dim(0)?;
-        if x.dim(1)? != 1 || bsz == 0 || start_positions.len() != bsz || caches.len() != bsz {
+        if x.dim(1)? != 1 || bsz == 0 || rope.cos.dim(0)? != bsz || caches.len() != bsz {
             return Err(Error::InvalidInput(
                 "Qwen3 managed decode batch dimensions do not match".to_string(),
             ));
@@ -1760,25 +1885,10 @@ impl Qwen3Attention {
         let k = k.reshape((bsz, 1, self.num_kv_heads, self.head_dim))?;
         let v = v.reshape((bsz, 1, self.num_kv_heads, self.head_dim))?;
         let (q, k) = self.apply_qk_norm_pair(q, k, 1)?;
-
-        let mut query_rows = Vec::with_capacity(bsz);
-        let mut key_rows = Vec::with_capacity(bsz);
-        let mut value_rows = Vec::with_capacity(bsz);
-        for row in 0..bsz {
-            let q_row = q.i(row)?.unsqueeze(0)?;
-            let k_row = k.i(row)?.unsqueeze(0)?;
-            let (q_row, k_row) = self.apply_rope_pair(q_row, k_row, start_positions[row], None)?;
-            query_rows.push(q_row.reshape((self.num_heads, self.head_dim))?);
-            key_rows.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
-            value_rows.push(v.i(row)?.reshape((self.num_kv_heads, self.head_dim))?);
-        }
-
-        let query_rows = query_rows.iter().collect::<Vec<_>>();
-        let key_rows = key_rows.iter().collect::<Vec<_>>();
-        let value_rows = value_rows.iter().collect::<Vec<_>>();
-        let queries = Tensor::stack(&query_rows, 0)?.contiguous()?;
-        let keys = Tensor::stack(&key_rows, 0)?.contiguous()?;
-        let values = Tensor::stack(&value_rows, 0)?.contiguous()?;
+        let (queries, keys) = self.apply_decode_rope(q, k, rope)?;
+        let values = v
+            .reshape((bsz, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
         if slots.arena_id() != first.arena.id() || slots.len() != bsz {
             return Err(Error::InvalidInput(
                 "Qwen3 managed decode received an incompatible prepared slot map".into(),
@@ -2329,7 +2439,7 @@ impl Qwen3Layer {
     fn forward_managed_decode_batch(
         &self,
         x: &Tensor,
-        start_positions: &[usize],
+        rope: &Qwen3DecodeRopeRows,
         caches: &[&PhysicalPagedKvCache],
         slots: &dyn KvSlotMap,
         metadata: &KvDecodeBatchMetadata,
@@ -2339,7 +2449,7 @@ impl Qwen3Layer {
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = self.self_attn.forward_managed_decode_batch(
             &normed,
-            start_positions,
+            rope,
             caches,
             slots,
             metadata,
@@ -2378,6 +2488,29 @@ pub struct Qwen3Model {
     device: Device,
     cfg: Qwen3Config,
     use_mrope: bool,
+    /// Decode cos/sin by position, built at the first batched decode step.
+    decode_rope_table: Mutex<Option<Qwen3DecodeRopeTable>>,
+}
+
+/// Rows a decode RoPE table starts with. A position past its end rebuilds it
+/// at the next power of two (same builder from zero, so the old rows are
+/// unchanged).
+const QWEN3_DECODE_ROPE_TABLE_MIN_ROWS: usize = 4096;
+
+/// A model's decode cos/sin, `[rows, head_dim / 2]` each, for positions
+/// `0..rows` in one dtype.
+struct Qwen3DecodeRopeTable {
+    dtype: DType,
+    rows: usize,
+    cos: Tensor,
+    sin: Tensor,
+}
+
+/// One decode step's `[rows, head_dim / 2]` cos/sin, row `i` for decode row
+/// `i`'s position; every layer reads the same rows.
+struct Qwen3DecodeRopeRows {
+    cos: Tensor,
+    sin: Tensor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2539,6 +2672,7 @@ impl Qwen3Model {
             device: vb.device().clone(),
             cfg,
             use_mrope,
+            decode_rope_table: Mutex::new(None),
         })
     }
 
@@ -2606,6 +2740,7 @@ impl Qwen3Model {
             device: device.clone(),
             cfg,
             use_mrope,
+            decode_rope_table: Mutex::new(None),
         })
     }
 
@@ -2864,20 +2999,30 @@ impl Qwen3Model {
         let mut completions =
             KvWriteCompletionCollector::new(first.arena.config(), lowered.logical_slots())?;
         let mut x = self.embeddings(input_ids)?;
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
+        if let Some(first_layer) = self.layers.first() {
+            // Every layer shares one RoPE geometry: gather the rows' cos/sin
+            // once for the whole step.
+            let rope = first_layer.self_attn.decode_rope_rows(
+                &self.decode_rope_table,
+                start_positions,
+                &self.device,
+                x.dtype(),
+            )?;
             let cache_refs = caches
                 .iter()
                 .map(|cache| &**cache)
                 .collect::<Vec<&PhysicalPagedKvCache>>();
-            x = layer.forward_managed_decode_batch(
-                &x,
-                start_positions,
-                &cache_refs,
-                lowered.as_ref(),
-                &metadata,
-                &mut completions,
-                layer_idx,
-            )?;
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                x = layer.forward_managed_decode_batch(
+                    &x,
+                    &rope,
+                    &cache_refs,
+                    lowered.as_ref(),
+                    &metadata,
+                    &mut completions,
+                    layer_idx,
+                )?;
+            }
         }
         let hidden = self.norm.forward(&x)?;
         let logits = self.logits_from_hidden(&hidden)?;
@@ -3752,6 +3897,7 @@ mod tests {
             device: device.clone(),
             cfg,
             use_mrope: false,
+            decode_rope_table: Mutex::new(None),
         }
     }
 
@@ -4136,6 +4282,7 @@ mod tests {
             device: device.clone(),
             cfg,
             use_mrope: false,
+            decode_rope_table: Mutex::new(None),
         }
     }
 
@@ -4502,6 +4649,208 @@ mod tests {
         assert_eq!(arena.operation_stats().slot_write_dispatches, 3);
         assert_eq!(arena.operation_stats().paged_prefill_dispatches, 2);
         assert_eq!(arena.operation_stats().paged_decode_dispatches, 1);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RopeTestMode {
+        Plain,
+        /// Qwen3-ASR: three MRoPE sections, sequential positions on host tables.
+        Mrope,
+        /// MRoPE with fewer than three sections: tables from position zero.
+        ShortMrope,
+    }
+
+    /// The tiny model's attention with 3 query heads, 2 KV heads and a
+    /// head_dim of 8 (four frequencies), for RoPE-only tests.
+    fn rope_test_attention(mode: RopeTestMode, kernel: bool) -> Qwen3Attention {
+        let mut attention = tiny_qwen3_model(&Device::Cpu).layers.remove(0).self_attn;
+        attention.num_heads = 3;
+        attention.num_kv_heads = 2;
+        attention.head_dim = 8;
+        attention.rope_inv_freqs = build_rope_inv_freqs(8, 1_000_000.0);
+        attention.rope_kernel_enabled = kernel;
+        (attention.use_mrope, attention.mrope_section) = match mode {
+            RopeTestMode::Plain => (false, None),
+            RopeTestMode::Mrope => (true, Some(vec![24, 20, 20])),
+            RopeTestMode::ShortMrope => (true, Some(vec![2])),
+        };
+        attention
+    }
+
+    fn f32_bits(tensor: &Tensor) -> Vec<u32> {
+        bitwise(&tensor.to_dtype(DType::F32).unwrap())
+    }
+
+    fn decode_rope_table_rows(table: &Mutex<Option<Qwen3DecodeRopeTable>>) -> usize {
+        table.lock().unwrap().as_ref().map_or(0, |table| table.rows)
+    }
+
+    /// Row `p` of the decode table is exactly the table the one-token path
+    /// builds at position `p`, in every RoPE mode and dtype.
+    #[test]
+    fn decode_rope_table_rows_match_per_token_tables_bit_for_bit() {
+        let device = Device::Cpu;
+        for mode in [
+            RopeTestMode::Plain,
+            RopeTestMode::Mrope,
+            RopeTestMode::ShortMrope,
+        ] {
+            let attention = rope_test_attention(mode, false);
+            for dtype in [DType::F32, DType::BF16] {
+                let probe = Tensor::zeros((1, 1, 3, 8), dtype, &device).unwrap();
+                let (cos, sin) = attention.decode_rope_table(300, &device, dtype).unwrap();
+                for pos in [0, 1, 2, 17, 255, 299] {
+                    let (expected_cos, expected_sin) =
+                        attention.rope_tables(1, pos, None, &probe).unwrap();
+                    let row = attention.decode_rope_position(pos);
+                    assert_eq!(
+                        f32_bits(&cos.narrow(0, row, 1).unwrap()),
+                        f32_bits(&expected_cos),
+                        "{mode:?} {dtype:?} cos at {pos}"
+                    );
+                    assert_eq!(
+                        f32_bits(&sin.narrow(0, row, 1).unwrap()),
+                        f32_bits(&expected_sin),
+                        "{mode:?} {dtype:?} sin at {pos}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// One RoPE call over a ragged decode batch equals rotating each row on
+    /// its own (the pre-batching loop: `apply_rope_pair` per row, then a
+    /// stack), bit for bit, through the fused kernel (Metal and CUDA) and
+    /// the composed ops (CPU), including a step that grows the table.
+    ///
+    /// The composed ops run only at F32, the CPU activation dtype: Candle's
+    /// CPU BF16 binary ops round a NEON vector body and a scalar tail
+    /// differently, so their bits depend on the tensor's length.
+    #[test]
+    fn batched_decode_rope_matches_per_row_rope_bit_for_bit() {
+        let device = Device::Cpu;
+        let positions = [0usize, 9, 3, 4_100, 9];
+        let rows = positions.len();
+        for mode in [
+            RopeTestMode::Plain,
+            RopeTestMode::Mrope,
+            RopeTestMode::ShortMrope,
+        ] {
+            for (kernel, dtype) in [
+                (false, DType::F32),
+                (true, DType::F32),
+                (true, DType::BF16),
+                (true, DType::F16),
+            ] {
+                let attention = rope_test_attention(mode, kernel);
+                let values =
+                    |count, seed| crate::kernels::numeric_check::xorshift_values(count, seed, 1.0);
+                let q = Tensor::from_vec(values(rows * 3 * 8, 11), (rows, 1, 3, 8), &device)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                let k = Tensor::from_vec(values(rows * 2 * 8, 12), (rows, 1, 2, 8), &device)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                let mut expected_q = Vec::new();
+                let mut expected_k = Vec::new();
+                for (row, &pos) in positions.iter().enumerate() {
+                    let (q_row, k_row) = attention
+                        .apply_rope_pair(
+                            q.i(row).unwrap().unsqueeze(0).unwrap(),
+                            k.i(row).unwrap().unsqueeze(0).unwrap(),
+                            pos,
+                            None,
+                        )
+                        .unwrap();
+                    expected_q.push(q_row.reshape((3, 8)).unwrap());
+                    expected_k.push(k_row.reshape((2, 8)).unwrap());
+                }
+                let expected_q = Tensor::stack(&expected_q, 0).unwrap();
+                let expected_k = Tensor::stack(&expected_k, 0).unwrap();
+
+                let table = Mutex::new(None);
+                attention
+                    .decode_rope_rows(&table, &[1], &device, dtype)
+                    .unwrap();
+                assert_eq!(decode_rope_table_rows(&table), 4_096);
+                let rope = attention
+                    .decode_rope_rows(&table, &positions, &device, dtype)
+                    .unwrap();
+                let grown = match mode {
+                    RopeTestMode::ShortMrope => 4_096,
+                    RopeTestMode::Plain | RopeTestMode::Mrope => 8_192,
+                };
+                assert_eq!(decode_rope_table_rows(&table), grown);
+                let (actual_q, actual_k) = attention
+                    .apply_decode_rope(q.clone(), k.clone(), &rope)
+                    .unwrap();
+                let label = format!("{mode:?} kernel={kernel} {dtype:?}");
+                assert_eq!(f32_bits(&expected_q), f32_bits(&actual_q), "q {label}");
+                assert_eq!(f32_bits(&expected_k), f32_bits(&actual_k), "k {label}");
+            }
+        }
+    }
+
+    /// A batched decode step gathers its RoPE rows from the model's table
+    /// (no per-row table builds; the table is built once and reused), and
+    /// each row matches that row decoded alone, with plain RoPE and with
+    /// Qwen3-ASR's MRoPE. Within a tolerance: Candle's CPU GEMM rounds a
+    /// one-row product differently from a two-row one.
+    #[test]
+    fn managed_decode_batch_gathers_rope_once_and_matches_single_rows() {
+        let device = Device::Cpu;
+        for mrope in [false, true] {
+            let mut model = tiny_qwen3_model(&device);
+            if mrope {
+                model.use_mrope = true;
+                for layer in &mut model.layers {
+                    layer.self_attn.use_mrope = true;
+                    layer.self_attn.mrope_section = Some(vec![1, 1, 1]);
+                }
+            }
+            let prefilled = || {
+                let (arena, bindings) = test_managed_arena();
+                let mut a = test_managed_cache(arena.clone(), bindings.clone(), 0);
+                let mut b = test_managed_cache(arena, bindings, 4);
+                for (cache, prompt) in [(&mut a, vec![0u32, 1]), (&mut b, vec![2u32, 3, 4])] {
+                    let len = prompt.len();
+                    let prompt = Tensor::from_vec(prompt, (1, len), &device).unwrap();
+                    model.forward_managed(&prompt, 0, cache).unwrap();
+                }
+                (a, b)
+            };
+            let (mut solo_a, mut solo_b) = prefilled();
+            let (mut batch_a, mut batch_b) = prefilled();
+            let mut solo = Vec::new();
+            for (cache, token, pos) in [(&mut solo_a, 5u32, 2usize), (&mut solo_b, 6, 3)] {
+                let token = Tensor::from_vec(vec![token], (1, 1), &device).unwrap();
+                solo.push(
+                    model
+                        .forward_managed_decode_batch(&token, &[pos], &mut [cache])
+                        .unwrap(),
+                );
+            }
+            let table_id = |model: &Qwen3Model| {
+                let table = model.decode_rope_table.lock().unwrap();
+                table.as_ref().unwrap().cos.id()
+            };
+            let table = table_id(&model);
+            let builds = thread_rope_table_builds();
+            let batched = model
+                .forward_managed_decode_batch(
+                    &Tensor::from_vec(vec![5u32, 6], (2, 1), &device).unwrap(),
+                    &[2, 3],
+                    &mut [&mut batch_a, &mut batch_b],
+                )
+                .unwrap();
+            assert_eq!(thread_rope_table_builds(), builds, "mrope={mrope}");
+            assert_eq!(table_id(&model), table, "mrope={mrope}");
+            for (row, solo) in solo.iter().enumerate() {
+                assert_tensor_close(solo, &batched.narrow(0, row, 1).unwrap());
+            }
+        }
     }
 
     #[test]
