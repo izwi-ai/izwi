@@ -3424,6 +3424,8 @@ impl ConformerConv {
             },
             vb.pp("depthwise_conv"),
         )?;
+        // The CUDA depthwise kernel's per-device self-check, once, at load.
+        crate::kernels::depthwise_conv::prepare_cuda_kernel(vb.device());
 
         Ok(Self {
             pointwise_conv1,

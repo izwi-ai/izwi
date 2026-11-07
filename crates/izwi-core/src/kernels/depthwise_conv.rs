@@ -17,16 +17,31 @@
 //! A folded inference BatchNorm (or any per-channel affine applied after the
 //! convolution) is expressed through [`fold_channel_affine`] at load time and
 //! passed as `weight`/`bias`.
+//!
+//! On CUDA, [`depthwise_conv1d`] runs as one kernel
+//! (`kernels/cuda/depthwise_conv.cu`) instead of the composition's 2K + 2
+//! launches plus its padding copies and dtype casts: the conformer encoders
+//! are launch-bound there. The kernel forms the same F32 products and partial
+//! sums in the same order (never an FMA), so it matches the composition bit
+//! for bit. Each CUDA device checks it against the composition once
+//! ([`prepare_cuda_kernel`]) and keeps the composition on any difference;
+//! `IZWI_CUDA_DEPTHWISE_CONV=0` keeps it too. CPU and Metal always run the
+//! composition.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use candle_core::{DType, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 
 static SHIFT_ACCUMULATE_CALLS: AtomicU64 = AtomicU64::new(0);
 static SHIFT_ACCUMULATE_TAPS: AtomicU64 = AtomicU64::new(0);
+static CUDA_KERNEL_CALLS: AtomicU64 = AtomicU64::new(0);
 
-/// Process-wide count of depthwise convolutions served by the shared
-/// shift-and-accumulate op (diagnostics: shows the path engaged).
+/// Kill switch for the single-launch CUDA kernel (any false boolean, e.g.
+/// `0`), read once per process.
+pub const CUDA_DEPTHWISE_CONV_ENV: &str = "IZWI_CUDA_DEPTHWISE_CONV";
+
+/// Process-wide count of depthwise convolutions served by the shared op
+/// (diagnostics: shows the path engaged), on either path.
 pub fn depthwise_conv1d_calls() -> u64 {
     SHIFT_ACCUMULATE_CALLS.load(Ordering::Relaxed)
 }
@@ -35,6 +50,29 @@ pub fn depthwise_conv1d_calls() -> u64 {
 /// multiply plus one add, independent of the channel count.
 pub fn depthwise_conv1d_taps() -> u64 {
     SHIFT_ACCUMULATE_TAPS.load(Ordering::Relaxed)
+}
+
+/// Process-wide count of [`depthwise_conv1d`] calls that ran as the single
+/// CUDA kernel (a subset of [`depthwise_conv1d_calls`]).
+pub fn depthwise_conv1d_cuda_kernel_calls() -> u64 {
+    CUDA_KERNEL_CALLS.load(Ordering::Relaxed)
+}
+
+/// Whether [`depthwise_conv1d`] runs as one CUDA kernel on `device`. The
+/// first call for a CUDA device runs the kernel's self-check against the
+/// composition and logs the verdict; later calls read it. Loaders call this
+/// so the check runs at load, not in the first request. False off CUDA,
+/// without the `cuda` feature, or with `IZWI_CUDA_DEPTHWISE_CONV=0`.
+pub fn prepare_cuda_kernel(device: &Device) -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        cuda_impl::enabled(device)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = device;
+        false
+    }
 }
 
 /// Memory layout of the activation.
@@ -92,36 +130,95 @@ pub fn is_depthwise_conv1d(weight: &Tensor, channels: usize, groups: usize, stri
         && matches!(weight.dims(), [c, 1, k] if *c == channels && *k > 0)
 }
 
+/// The checked geometry of one [`depthwise_conv1d`] call.
+#[derive(Debug, Clone, Copy)]
+struct Geometry {
+    channels: usize,
+    taps: usize,
+    dilation: usize,
+    out_len: usize,
+}
+
+impl Geometry {
+    fn of(x: &Tensor, weight: &Tensor, spec: DepthwiseConv1dSpec) -> Result<Self> {
+        let (channel_dim, time_dim) = channel_and_time_dims(spec.layout);
+        let (_batch, _, _) = x.dims3()?;
+        let channels = x.dim(channel_dim)?;
+        let taps = match weight.dims() {
+            [c, 1, k] | [c, k] if *c == channels && *k > 0 => *k,
+            dims => candle_core::bail!(
+                "depthwise conv1d weight {dims:?} does not match {channels} channels"
+            ),
+        };
+        let dilation = spec.dilation.max(1);
+        let padded_len = x.dim(time_dim)? + spec.pad_left + spec.pad_right;
+        let span = dilation * (taps - 1) + 1;
+        if padded_len < span {
+            candle_core::bail!(
+                "depthwise conv1d input of padded length {padded_len} is shorter than the kernel span {span}"
+            );
+        }
+        Ok(Self {
+            channels,
+            taps,
+            dilation,
+            out_len: padded_len - span + 1,
+        })
+    }
+}
+
+/// `(channel_dim, time_dim)` of the activation.
+fn channel_and_time_dims(layout: ConvLayout) -> (usize, usize) {
+    match layout {
+        ConvLayout::ChannelsFirst => (1, 2),
+        ConvLayout::ChannelsLast => (2, 1),
+    }
+}
+
 /// Depthwise 1-D convolution. `weight` is `(C, 1, K)` or `(C, K)`; `bias` is
 /// `(C,)`. Matches `conv1d(pad(x), weight, padding=0, stride=1, dilation,
-/// groups=C) + bias` up to summation order.
+/// groups=C) + bias` up to summation order. One kernel launch on CUDA once
+/// [`prepare_cuda_kernel`] has passed there, the composition otherwise.
 pub fn depthwise_conv1d(
     x: &Tensor,
     weight: &Tensor,
     bias: Option<&Tensor>,
     spec: DepthwiseConv1dSpec,
 ) -> Result<Tensor> {
-    let (channel_dim, time_dim) = match spec.layout {
-        ConvLayout::ChannelsFirst => (1, 2),
-        ConvLayout::ChannelsLast => (2, 1),
-    };
-    let (_batch, _, _) = x.dims3()?;
-    let channels = x.dim(channel_dim)?;
-    let taps = match weight.dims() {
-        [c, 1, k] | [c, k] if *c == channels && *k > 0 => *k,
-        dims => candle_core::bail!(
-            "depthwise conv1d weight {dims:?} does not match {channels} channels"
-        ),
-    };
-    let dilation = spec.dilation.max(1);
-    let padded_len = x.dim(time_dim)? + spec.pad_left + spec.pad_right;
-    let span = dilation * (taps - 1) + 1;
-    if padded_len < span {
-        candle_core::bail!(
-            "depthwise conv1d input of padded length {padded_len} is shorter than the kernel span {span}"
-        );
+    let geometry = Geometry::of(x, weight, spec)?;
+    #[cfg(feature = "cuda")]
+    if x.device().is_cuda() && cuda_impl::enabled(x.device()) {
+        if let Some(y) = cuda_impl::run(x, weight, bias, spec, geometry)? {
+            CUDA_KERNEL_CALLS.fetch_add(1, Ordering::Relaxed);
+            SHIFT_ACCUMULATE_CALLS.fetch_add(1, Ordering::Relaxed);
+            SHIFT_ACCUMULATE_TAPS.fetch_add(geometry.taps as u64, Ordering::Relaxed);
+            return Ok(y);
+        }
     }
-    let out_len = padded_len - span + 1;
+    let y = shift_accumulate(x, weight, bias, spec, geometry)?;
+    SHIFT_ACCUMULATE_CALLS.fetch_add(1, Ordering::Relaxed);
+    SHIFT_ACCUMULATE_TAPS.fetch_add(geometry.taps as u64, Ordering::Relaxed);
+    Ok(y)
+}
+
+/// The composition: 2K + 2 element-wise ops whatever the channel count, on
+/// every backend and dtype. The first tap's product starts the sum, each
+/// further tap adds its product, then the bias: the order the CUDA kernel
+/// keeps.
+fn shift_accumulate(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    spec: DepthwiseConv1dSpec,
+    geometry: Geometry,
+) -> Result<Tensor> {
+    let (_, time_dim) = channel_and_time_dims(spec.layout);
+    let Geometry {
+        channels,
+        taps,
+        dilation,
+        out_len,
+    } = geometry;
 
     let out_dtype = x.dtype();
     let acc_dtype = match out_dtype {
@@ -162,10 +259,386 @@ pub fn depthwise_conv1d(
         };
         acc = acc.broadcast_add(&bias)?;
     }
-
-    SHIFT_ACCUMULATE_CALLS.fetch_add(1, Ordering::Relaxed);
-    SHIFT_ACCUMULATE_TAPS.fetch_add(taps as u64, Ordering::Relaxed);
     acc.to_dtype(out_dtype)
+}
+
+/// The single-launch CUDA form of [`depthwise_conv1d`] and its per-device
+/// self-check.
+#[cfg(feature = "cuda")]
+mod cuda_impl {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::{Mutex, PoisonError};
+
+    use candle_core::cuda_backend::cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+    use candle_core::cuda_backend::{CudaDType, CudaStorage, WrapErr};
+    use candle_core::op::BackpropOp;
+    use candle_core::{DType, Device, DeviceLocation, Result, Shape, Storage, Tensor};
+
+    use super::{
+        shift_accumulate, ConvLayout, DepthwiseConv1dSpec, Geometry, CUDA_DEPTHWISE_CONV_ENV,
+    };
+
+    const MODULE: &str = "izwi_depthwise_conv";
+    const THREADS: u32 = 256;
+    /// Devices past this ordinal keep the composition.
+    const MAX_DEVICES: usize = 16;
+    const UNCHECKED: u8 = 0;
+    const ON: u8 = 1;
+    const OFF: u8 = 2;
+    /// Each device's self-check verdict.
+    static VERDICT: [AtomicU8; MAX_DEVICES] = [const { AtomicU8::new(UNCHECKED) }; MAX_DEVICES];
+    static CHECKING: Mutex<()> = Mutex::new(());
+
+    fn switched_on() -> bool {
+        static SWITCH: crate::env::ReadOnce<bool> =
+            crate::env::ReadOnce::new(|| crate::env::flag_or(CUDA_DEPTHWISE_CONV_ENV, true));
+        SWITCH.get()
+    }
+
+    /// Whether the kernel serves `device`, running its self-check first if
+    /// this device has none yet.
+    pub(super) fn enabled(device: &Device) -> bool {
+        if !switched_on() {
+            return false;
+        }
+        let DeviceLocation::Cuda { gpu_id } = device.location() else {
+            return false;
+        };
+        let Some(verdict) = VERDICT.get(gpu_id) else {
+            return false;
+        };
+        match verdict.load(Ordering::Acquire) {
+            ON => true,
+            OFF => false,
+            _ => decide(device, gpu_id, verdict),
+        }
+    }
+
+    fn decide(device: &Device, gpu_id: usize, verdict: &AtomicU8) -> bool {
+        let _checking = CHECKING.lock().unwrap_or_else(PoisonError::into_inner);
+        match verdict.load(Ordering::Acquire) {
+            ON => return true,
+            OFF => return false,
+            _ => {}
+        }
+        let passed = match self_check(device) {
+            Ok(report) => match &report.failure {
+                None => {
+                    tracing::info!(
+                        "depthwise conv1d CUDA kernel passed its self-check on cuda:{gpu_id}: \
+                         {} cases, {} values, {} differ from the shift-and-accumulate \
+                         composition (max |diff| {:e}); one launch per depthwise conv",
+                        report.cases,
+                        report.values,
+                        report.differing,
+                        report.max_abs_diff,
+                    );
+                    true
+                }
+                Some(failure) => {
+                    tracing::warn!(
+                        "depthwise conv1d CUDA kernel failed its self-check on cuda:{gpu_id} \
+                         ({failure}; {} of {} values differ); keeping the shift-and-accumulate \
+                         composition",
+                        report.differing,
+                        report.values,
+                    );
+                    false
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "depthwise conv1d CUDA kernel self-check could not run on cuda:{gpu_id}; \
+                     keeping the shift-and-accumulate composition"
+                );
+                false
+            }
+        };
+        verdict.store(if passed { ON } else { OFF }, Ordering::Release);
+        passed
+    }
+
+    fn slice<T: CudaDType>(storage: &Storage) -> Result<&CudaSlice<T>> {
+        let Storage::Cuda(cuda) = storage else {
+            candle_core::bail!("the CUDA depthwise conv1d needs CUDA tensors")
+        };
+        cuda.as_cuda_slice::<T>()
+    }
+
+    /// One launch: `None` for what the kernel does not take (F64 or integer
+    /// activations, operands on another device, an empty output, sizes past
+    /// `i32`), which the composition then serves.
+    pub(super) fn run(
+        x: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        spec: DepthwiseConv1dSpec,
+        geometry: Geometry,
+    ) -> Result<Option<Tensor>> {
+        let x_dtype = x.dtype();
+        let x_tag = match x_dtype {
+            DType::F32 => "f32",
+            DType::F16 => "f16",
+            DType::BF16 => "bf16",
+            _ => return Ok(None),
+        };
+        let on_device = |t: &Tensor| t.device().same_device(x.device());
+        if !on_device(weight) || bias.is_some_and(|b| !on_device(b)) {
+            return Ok(None);
+        }
+        let Geometry {
+            channels,
+            taps,
+            dilation,
+            out_len,
+        } = geometry;
+        let (batch, _, _) = x.dims3()?;
+        let len = x.dim(super::channel_and_time_dims(spec.layout).1)?;
+        let total = batch * channels * out_len;
+        let fits = |v: usize| i32::try_from(v).is_ok();
+        if total == 0
+            || ![channels, len, out_len, taps, dilation, spec.pad_left]
+                .into_iter()
+                .all(fits)
+        {
+            return Ok(None);
+        }
+        let Ok(blocks) = u32::try_from(total.div_ceil(THREADS as usize)) else {
+            return Ok(None);
+        };
+        // The weight and bias stay in the activation's dtype when both already
+        // are, else go to F32: exact either way, as the composition widens
+        // them to F32 too.
+        let w_dtype = if weight.dtype() == x_dtype && bias.is_none_or(|b| b.dtype() == x_dtype) {
+            x_dtype
+        } else {
+            DType::F32
+        };
+        let w_tag = if w_dtype == DType::F32 { "f32" } else { x_tag };
+        let weight = weight.to_dtype(w_dtype)?.contiguous()?;
+        let bias = bias
+            .map(|b| b.to_dtype(w_dtype)?.contiguous())
+            .transpose()?;
+
+        let device = x.device().as_cuda_device()?;
+        let function = device.get_or_load_custom_func(
+            &format!("izwi_depthwise_conv1d_{x_tag}_{w_tag}"),
+            MODULE,
+            crate::kernels::cuda::cuda_ptx_depthwise_conv(),
+        )?;
+        let (x_storage, x_layout) = x.storage_and_layout();
+        let (w_storage, w_layout) = weight.storage_and_layout();
+        let bias_storage = bias.as_ref().map(Tensor::storage_and_layout);
+        let strides = x_layout.stride();
+        let (stride_b, stride_c, stride_t, shape) = match spec.layout {
+            ConvLayout::ChannelsFirst => (
+                strides[0],
+                strides[1],
+                strides[2],
+                Shape::from((batch, channels, out_len)),
+            ),
+            ConvLayout::ChannelsLast => (
+                strides[0],
+                strides[2],
+                strides[1],
+                Shape::from((batch, out_len, channels)),
+            ),
+        };
+        let config = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let null = 0u64;
+        macro_rules! go {
+            ($x:ty, $w:ty) => {{
+                let xs = slice::<$x>(&x_storage)?.slice(x_layout.start_offset()..);
+                let w_start = w_layout.start_offset();
+                let ws = slice::<$w>(&w_storage)?.slice(w_start..w_start + channels * taps);
+                let bs = match &bias_storage {
+                    Some((storage, layout)) => {
+                        let start = layout.start_offset();
+                        Some(slice::<$w>(storage)?.slice(start..start + channels))
+                    }
+                    None => None,
+                };
+                // SAFETY: the kernel writes every output element.
+                let y = unsafe { device.alloc::<$x>(total)? };
+                let mut builder = function.builder();
+                builder.arg(&xs);
+                builder.arg(&ws);
+                match &bs {
+                    Some(bs) => builder.arg(bs),
+                    None => builder.arg(&null),
+                };
+                builder.arg(&y);
+                candle_core::builder_arg!(
+                    builder,
+                    channels as i32,
+                    len as i32,
+                    out_len as i32,
+                    taps as i32,
+                    dilation as i32,
+                    spec.pad_left as i32,
+                    stride_b as i64,
+                    stride_c as i64,
+                    stride_t as i64,
+                    i32::from(spec.layout == ConvLayout::ChannelsLast),
+                    total as i64
+                );
+                // SAFETY: argument order and types match the kernel. It reads
+                // x only through its layout's strides from its start offset,
+                // C·K weights and C biases, and writes `total` outputs.
+                unsafe { builder.launch(config) }.w()?;
+                Tensor::from_storage(
+                    Storage::Cuda(CudaStorage::wrap_cuda_slice(y, device.clone())),
+                    shape,
+                    BackpropOp::none(),
+                    false,
+                )
+            }};
+        }
+        use half::{bf16, f16};
+        Ok(Some(match (x_dtype, w_dtype) {
+            (DType::F32, _) => go!(f32, f32),
+            (DType::F16, DType::F16) => go!(f16, f16),
+            (DType::BF16, DType::BF16) => go!(bf16, bf16),
+            (DType::F16, _) => go!(f16, f32),
+            _ => go!(bf16, f32),
+        }))
+    }
+
+    /// What [`self_check`] compared.
+    pub(super) struct SelfCheck {
+        pub(super) cases: usize,
+        pub(super) values: usize,
+        /// Values whose bits differ from the composition's.
+        pub(super) differing: usize,
+        pub(super) max_abs_diff: f32,
+        /// The first case past the tolerance, if any.
+        pub(super) failure: Option<String>,
+    }
+
+    /// The kernel against the composition on `device`, for every exported
+    /// dtype mix over the callers' geometries: symmetric, causal and
+    /// pre-padded, K from 4 to 31, dilation, one frame, an input shorter than
+    /// the kernel, a transposed view and the channels-last layout, with
+    /// xorshift values. A case passes within the output's rounding of the
+    /// composition (F32: 1e-5 of the largest magnitude; 16-bit: 2 units of
+    /// its last place); the two are expected to agree bit for bit. Sets no
+    /// verdict.
+    pub(super) fn self_check(device: &Device) -> Result<SelfCheck> {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_values};
+
+        #[derive(Clone, Copy)]
+        enum View {
+            First,
+            Transposed,
+            Last,
+        }
+        // (batch, channels, len, taps, pad_left, pad_right, dilation, bias, view)
+        const CASES: [(usize, usize, usize, usize, usize, usize, usize, bool, View); 7] = [
+            (2, 24, 37, 9, 4, 4, 1, true, View::First), // Parakeet / FastConformer
+            (2, 16, 29, 9, 8, 0, 1, false, View::First), // causal
+            (1, 16, 21, 9, 0, 0, 1, false, View::First), // pre-padded (Nemotron)
+            (1, 12, 1, 15, 7, 7, 1, true, View::First), // Granite, one frame
+            (2, 8, 5, 31, 15, 15, 1, true, View::Transposed), // shorter than K
+            (1, 10, 20, 4, 2, 1, 2, true, View::First), // even kernel, dilated
+            (1, 20, 33, 9, 4, 4, 1, true, View::Last),  // channels-last
+        ];
+        const MIXES: [(DType, DType); 5] = [
+            (DType::F32, DType::F32),
+            (DType::BF16, DType::BF16),
+            (DType::F16, DType::F16),
+            (DType::BF16, DType::F32),
+            (DType::F16, DType::F32),
+        ];
+        let mut report = SelfCheck {
+            cases: 0,
+            values: 0,
+            differing: 0,
+            max_abs_diff: 0.0,
+            failure: None,
+        };
+        let mut seed = 0xD3_5700u64;
+        for (x_dtype, w_dtype) in MIXES {
+            for (batch, channels, len, taps, left, right, dilation, with_bias, view) in CASES {
+                seed += 3;
+                let values = xorshift_values(batch * channels * len, seed, 2.0);
+                let mut spec = DepthwiseConv1dSpec::padded(left, right).with_dilation(dilation);
+                let x = match view {
+                    View::First => Tensor::from_vec(values, (batch, channels, len), device)?
+                        .to_dtype(x_dtype)?,
+                    View::Transposed => Tensor::from_vec(values, (batch, len, channels), device)?
+                        .to_dtype(x_dtype)?
+                        .transpose(1, 2)?,
+                    View::Last => {
+                        spec = spec.with_layout(ConvLayout::ChannelsLast);
+                        Tensor::from_vec(values, (batch, len, channels), device)?
+                            .to_dtype(x_dtype)?
+                    }
+                };
+                let weight = Tensor::from_vec(
+                    xorshift_values(channels * taps, seed + 1, 1.0),
+                    (channels, 1, taps),
+                    device,
+                )?
+                .to_dtype(w_dtype)?;
+                let bias = with_bias
+                    .then(|| {
+                        Tensor::from_vec(
+                            xorshift_values(channels, seed + 2, 1.0),
+                            channels,
+                            device,
+                        )?
+                        .to_dtype(w_dtype)
+                    })
+                    .transpose()?;
+                let geometry = Geometry::of(&x, &weight, spec)?;
+                let Some(kernel) = run(&x, &weight, bias.as_ref(), spec, geometry)? else {
+                    report.failure = Some(format!("the kernel refused {x_dtype:?}/{w_dtype:?}"));
+                    return Ok(report);
+                };
+                let composed = shift_accumulate(&x, &weight, bias.as_ref(), spec, geometry)?;
+                if kernel.dims() != composed.dims() || kernel.dtype() != composed.dtype() {
+                    report.failure = Some(format!(
+                        "the kernel returned {:?} {:?} for {:?} {:?}",
+                        kernel.dims(),
+                        kernel.dtype(),
+                        composed.dims(),
+                        composed.dtype()
+                    ));
+                    return Ok(report);
+                }
+                let (got, want) = (host_f32(&kernel)?, host_f32(&composed)?);
+                let diff = max_abs_diff(&got, &want);
+                let peak = want.iter().fold(0f32, |peak, v| peak.max(v.abs()));
+                let unit = match x_dtype {
+                    DType::F16 => 2f32.powi(-9),
+                    DType::BF16 => 2f32.powi(-6),
+                    _ => 1e-5,
+                };
+                report.cases += 1;
+                report.values += got.len();
+                report.differing += got
+                    .iter()
+                    .zip(&want)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                report.max_abs_diff = report.max_abs_diff.max(diff);
+                // `diff` is infinite, never NaN, for a non-finite value.
+                let limit = unit * peak.max(1e-6);
+                if diff > limit && report.failure.is_none() {
+                    report.failure = Some(format!(
+                        "{x_dtype:?} activations, {w_dtype:?} weights, K={taps}: max |diff| \
+                         {diff:e} above {limit:e}"
+                    ));
+                }
+            }
+        }
+        Ok(report)
+    }
 }
 
 static TRANSPOSED_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -602,6 +1075,225 @@ mod tests {
         assert!(is_depthwise_conv1d(&long, 4, 4, 1));
         assert!(!is_depthwise_conv1d(&long, 4, 4, 2));
         assert!(!is_depthwise_conv1d(&long, 4, 1, 1));
+    }
+
+    fn host(t: &Tensor) -> Vec<f32> {
+        crate::kernels::numeric_check::host_f32(t).unwrap()
+    }
+
+    /// The composition against a float64 sum of the same (rounded) inputs,
+    /// for K = 3, 9, 15 and 31 under symmetric and causal padding, over one
+    /// frame, inputs shorter than the kernel and longer ones, with and
+    /// without bias, in F32, BF16 and F16. The bound is F32 accumulation over
+    /// K + 1 terms plus one rounding to the output dtype.
+    #[test]
+    fn shift_accumulate_matches_a_float64_reference() {
+        let mut rng = XorShift(0x6A09_E667_F3BC_C908);
+        let shapes = [(1, 1, 1), (2, 5, 1), (1, 7, 2), (2, 6, 13), (1, 16, 40)];
+        for taps in [3, 9, 15, 31] {
+            let half = (taps - 1) / 2;
+            for (batch, channels, time) in shapes {
+                for (left, right) in [(half, half), (taps - 1, 0)] {
+                    for with_bias in [false, true] {
+                        for dtype in [DType::F32, DType::BF16, DType::F16] {
+                            let x = rng
+                                .tensor(&[batch, channels, time])
+                                .to_dtype(dtype)
+                                .unwrap();
+                            let w = rng.tensor(&[channels, 1, taps]).to_dtype(dtype).unwrap();
+                            let bias =
+                                with_bias.then(|| rng.tensor(&[channels]).to_dtype(dtype).unwrap());
+                            let spec = DepthwiseConv1dSpec::padded(left, right);
+                            let y = depthwise_conv1d(&x, &w, bias.as_ref(), spec).unwrap();
+                            assert_eq!(y.dims(), [batch, channels, time]);
+                            assert_eq!(y.dtype(), dtype);
+                            let (xs, ws, ys) = (host(&x), host(&w), host(&y));
+                            let bs = bias.as_ref().map(host);
+                            let output_rounding = match dtype {
+                                DType::F16 => 2f64.powi(-11),
+                                DType::BF16 => 2f64.powi(-8),
+                                _ => 0.0,
+                            };
+                            for (i, &got) in ys.iter().enumerate() {
+                                let (t, c, b) =
+                                    (i % time, (i / time) % channels, i / time / channels);
+                                let mut sum = bs.as_ref().map_or(0.0, |bs| f64::from(bs[c]));
+                                let mut scale = sum.abs();
+                                for k in 0..taps {
+                                    let Some(s) = (t + k).checked_sub(left).filter(|s| *s < time)
+                                    else {
+                                        continue;
+                                    };
+                                    let term = f64::from(xs[(b * channels + c) * time + s])
+                                        * f64::from(ws[c * taps + k]);
+                                    sum += term;
+                                    scale += term.abs();
+                                }
+                                let tolerance = (taps + 2) as f64 * scale * 2f64.powi(-24)
+                                    + sum.abs() * output_rounding
+                                    + 1e-7;
+                                assert!(
+                                    (f64::from(got) - sum).abs() <= tolerance,
+                                    "{dtype:?} K={taps} pad {left}/{right} {:?} at {i}: {got} vs {sum}",
+                                    (batch, channels, time)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The CUDA kernel's per-element arithmetic
+    /// (`kernels/cuda/depthwise_conv.cu`), on the host: F32 products in tap
+    /// order, the first product as the start value, each further one added,
+    /// then the bias, then one rounding to the activation's dtype.
+    fn kernel_order(
+        x: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        spec: DepthwiseConv1dSpec,
+    ) -> Tensor {
+        let (batch, channels, len) = x.dims3().unwrap();
+        let taps = weight.dim(2).unwrap();
+        let out_len = len + spec.pad_left + spec.pad_right - spec.dilation * (taps - 1);
+        let (xs, ws) = (host(x), host(weight));
+        let bs = bias.map(host);
+        let mut out = Vec::with_capacity(batch * channels * out_len);
+        for b in 0..batch {
+            for c in 0..channels {
+                for t in 0..out_len {
+                    let mut acc = 0f32;
+                    for k in 0..taps {
+                        let v = (t + k * spec.dilation)
+                            .checked_sub(spec.pad_left)
+                            .filter(|s| *s < len)
+                            .map_or(0.0, |s| xs[(b * channels + c) * len + s]);
+                        let term = v * ws[c * taps + k];
+                        acc = if k == 0 { term } else { acc + term };
+                    }
+                    if let Some(bs) = &bs {
+                        acc += bs[c];
+                    }
+                    out.push(acc);
+                }
+            }
+        }
+        Tensor::from_vec(out, (batch, channels, out_len), &Device::Cpu)
+            .unwrap()
+            .to_dtype(x.dtype())
+            .unwrap()
+    }
+
+    /// The composition and the kernel's arithmetic agree bit for bit (what
+    /// the CUDA self-check expects), signed zeros and a transposed view
+    /// included.
+    #[test]
+    fn shift_accumulate_is_the_kernel_order_bit_for_bit() {
+        let mut rng = XorShift(0xBB67_AE85_84CA_A73B);
+        // (batch, channels, time, taps, pad_left, pad_right, dilation, bias)
+        let cases = [
+            (2, 24, 37, 9, 4, 4, 1, true),
+            (2, 16, 29, 9, 8, 0, 1, false),
+            (1, 16, 21, 9, 0, 0, 1, false),
+            (1, 12, 1, 15, 7, 7, 1, true),
+            (2, 8, 5, 31, 15, 15, 1, true),
+            (1, 10, 20, 4, 2, 1, 2, true),
+            (1, 6, 30, 7, 12, 0, 2, false),
+        ];
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            for (batch, channels, time, taps, left, right, dilation, with_bias) in cases {
+                let x = rng
+                    .tensor(&[batch, channels, time])
+                    .to_dtype(dtype)
+                    .unwrap();
+                let w = rng.tensor(&[channels, 1, taps]).to_dtype(dtype).unwrap();
+                let bias = with_bias.then(|| rng.tensor(&[channels]).to_dtype(dtype).unwrap());
+                let spec = DepthwiseConv1dSpec::padded(left, right).with_dilation(dilation);
+                let want = host(&kernel_order(&x, &w, bias.as_ref(), spec));
+                let got = host(&depthwise_conv1d(&x, &w, bias.as_ref(), spec).unwrap());
+                let differing = got
+                    .iter()
+                    .zip(&want)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(
+                    differing,
+                    0,
+                    "{dtype:?} {:?}",
+                    (batch, channels, time, taps, left, right, dilation)
+                );
+            }
+        }
+        // All-zero input with negative weights: every output is -0.0.
+        let x = Tensor::zeros((1, 3, 6), DType::F32, &Device::Cpu).unwrap();
+        let w = rng
+            .tensor(&[3, 1, 5])
+            .abs()
+            .unwrap()
+            .affine(-1.0, -0.5)
+            .unwrap();
+        let spec = DepthwiseConv1dSpec::symmetric(2);
+        let got = host(&depthwise_conv1d(&x, &w, None, spec).unwrap());
+        let want = host(&kernel_order(&x, &w, None, spec));
+        assert!(got.iter().all(|v| v.to_bits() == (-0.0f32).to_bits()));
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        // A transposed (strided) view gives the same bits as its copy.
+        let x = rng.tensor(&[2, 33, 24]).transpose(1, 2).unwrap();
+        let w = rng.tensor(&[24, 1, 9]);
+        let spec = DepthwiseConv1dSpec::symmetric(4);
+        let got = host(&depthwise_conv1d(&x, &w, None, spec).unwrap());
+        let want = host(&kernel_order(&x.contiguous().unwrap(), &w, None, spec));
+        assert!(got
+            .iter()
+            .zip(&want)
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+
+    #[test]
+    fn the_cuda_kernel_is_off_the_cpu() {
+        assert!(!prepare_cuda_kernel(&Device::Cpu));
+    }
+
+    /// On a CUDA device: the self-check passes bit for bit, and the shared op
+    /// then serves a Parakeet-sized convolution with one launch, equal to the
+    /// CPU composition bit for bit.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_kernel_matches_the_composition_bit_for_bit() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let report = cuda_impl::self_check(&device).unwrap();
+        assert!(report.failure.is_none(), "{:?}", report.failure);
+        assert!(report.cases > 0 && report.values > 0);
+        assert_eq!(report.differing, 0, "max |diff| {}", report.max_abs_diff);
+        if !prepare_cuda_kernel(&device) {
+            return; // IZWI_CUDA_DEPTHWISE_CONV=0
+        }
+        let mut rng = XorShift(0x3C6E_F372_FE94_F82B);
+        let x = rng.tensor(&[2, 1024, 125]);
+        let w = rng.tensor(&[1024, 1, 9]);
+        let bias = rng.tensor(&[1024]);
+        let spec = DepthwiseConv1dSpec::symmetric(4);
+        let before = depthwise_conv1d_cuda_kernel_calls();
+        let on_device = depthwise_conv1d(
+            &x.to_device(&device).unwrap(),
+            &w.to_device(&device).unwrap(),
+            Some(&bias.to_device(&device).unwrap()),
+            spec,
+        )
+        .unwrap();
+        assert!(depthwise_conv1d_cuda_kernel_calls() > before);
+        let cpu = depthwise_conv1d(&x, &w, Some(&bias), spec).unwrap();
+        assert!(host(&on_device)
+            .iter()
+            .zip(&host(&cpu))
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
     }
 
     #[test]

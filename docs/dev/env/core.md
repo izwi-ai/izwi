@@ -41,6 +41,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_CPU_PROJECTION_BACKEND` | choice | `auto` | startup | Chooses CPU block-FP8 projection residency: auto, q8 (requantize to Q8_0) or expanded (F32); invalid = startup error. |
 | `IZWI_CUDA_CONTEXT_RESERVE_BYTES` | bytes | unset (max of 1 GiB reserve and 3% of device memory) | startup | Overrides CUDA memory kept free by the resident-context fit, in bytes; non-positive or unparsable values warn and are ignored. |
 | `IZWI_CUDA_DECODE_GRAPHS` | auto/flag | `auto` | startup | Enables CUDA graph capture for decode (auto/off mode). |
+| `IZWI_CUDA_DEPTHWISE_CONV` | flag | `true` | first use | On CUDA, runs each depthwise 1-D convolution (the conformer convolutions of Parakeet, Nemotron ASR, Granite Speech, Sortformer and LFM2.5, and the codec depthwise layers) as one kernel instead of 2K + 2 element-wise launches, after a per-device self-check against that composition (bit-exact expected; off for the device on any difference). Any false value keeps the composition. |
 | `IZWI_CUDA_DEVICE_ORDINAL` | integer | `0` | startup | Selects which CUDA device ordinal to open; invalid values warn and fall back to 0. |
 | `IZWI_CUDA_DEVICE_SAMPLING` | auto/flag | `auto` | startup | Enables on-device token sampling on CUDA (auto/off mode). |
 | `IZWI_CUDA_FUSED_DECODE` | auto/flag | `auto` | startup | Enables CUDA fused decode kernels (auto/off mode). |

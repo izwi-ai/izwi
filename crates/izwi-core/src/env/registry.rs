@@ -224,6 +224,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Enables CUDA graph capture for decode (auto/off mode).",
     ),
     CoreEnvVar::new(
+        "IZWI_CUDA_DEPTHWISE_CONV",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, runs each depthwise 1-D convolution (the conformer convolutions of Parakeet, Nemotron ASR, Granite Speech, Sortformer and LFM2.5, and the codec depthwise layers) as one kernel instead of 2K + 2 element-wise launches, after a per-device self-check against that composition (bit-exact expected; off for the device on any difference). Any false value keeps the composition.",
+    ),
+    CoreEnvVar::new(
         "IZWI_CUDA_DEVICE_ORDINAL",
         Int,
         "0",

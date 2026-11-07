@@ -3670,6 +3670,12 @@ pub(crate) fn cuda_ptx_swiglu() -> &'static str {
     cuda_ptx::SWIGLU
 }
 
+/// The PTX of `kernels/cuda/depthwise_conv.cu` (`kernels::depthwise_conv`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_depthwise_conv() -> &'static str {
+    cuda_ptx::DEPTHWISE_CONV
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

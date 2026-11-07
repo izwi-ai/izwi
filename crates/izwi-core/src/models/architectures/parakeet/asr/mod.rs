@@ -1725,6 +1725,8 @@ fn parakeet_diagnostics_json(
             "metal_depthwise_conv2d": metal_kernels::depthwise_conv2d_enabled_for_device(device),
             "conformer_conv_fused": metal_kernels::depthwise_conv1d_bias_swish_enabled_for_device(device),
             "shared_depthwise_conv1d_calls_total": crate::kernels::depthwise_conv::depthwise_conv1d_calls(),
+            "cuda_depthwise_conv1d_kernel": crate::kernels::depthwise_conv::prepare_cuda_kernel(device),
+            "cuda_depthwise_conv1d_kernel_calls_total": crate::kernels::depthwise_conv::depthwise_conv1d_cuda_kernel_calls(),
         },
         "timings_ms": {
             "resample": timings.resample_ms,
@@ -2534,6 +2536,8 @@ impl ConformerConv {
         let batch_norm = batch_norm(dim, 1e-5, vb.pp("batch_norm"))?;
         let (folded_depthwise_weight, folded_depthwise_bias) =
             fold_depthwise_conv1d_batch_norm(&depthwise_conv, &batch_norm)?;
+        // The CUDA depthwise kernel's per-device self-check, once, at load.
+        crate::kernels::depthwise_conv::prepare_cuda_kernel(vb.device());
 
         let pointwise_conv2 = PointwiseConv1d::new(
             mlx::load_conv1d_no_bias(

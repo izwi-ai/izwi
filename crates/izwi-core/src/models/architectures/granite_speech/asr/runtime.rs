@@ -2164,6 +2164,8 @@ impl GraniteConformerConv {
         )?;
         let (depth_weight, depth_bias) =
             fold_channel_affine(depth_conv.weight(), None, &scale, &shift)?;
+        // The CUDA depthwise kernel's per-device self-check, once, at load.
+        crate::kernels::depthwise_conv::prepare_cuda_kernel(vb.device());
         // Same-length output: K / 2 on the left, one fewer on the right for
         // an even kernel.
         let width = config.conv_kernel_size;
