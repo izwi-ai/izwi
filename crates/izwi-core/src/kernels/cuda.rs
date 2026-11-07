@@ -28,6 +28,7 @@ pub mod rope;
 pub mod row_gemv;
 pub mod sampling;
 pub mod segment_graph;
+pub mod shape_graphs;
 pub mod split_decode;
 pub mod stretch_graphs;
 pub mod timing;

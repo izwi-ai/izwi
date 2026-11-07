@@ -275,7 +275,7 @@ fn failed(
 }
 
 /// Whether `a` and `b` hold the same tensors bit for bit.
-fn bitwise(a: &[Tensor], b: &[Tensor]) -> std::result::Result<(), String> {
+pub(super) fn bitwise(a: &[Tensor], b: &[Tensor]) -> std::result::Result<(), String> {
     if a.len() != b.len() {
         return Err(format!("{} outputs against {}", b.len(), a.len()));
     }
