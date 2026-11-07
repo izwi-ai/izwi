@@ -115,6 +115,10 @@ pub(super) fn engine_output_observation(
         prompt_tokens: Some(output.token_stats.prompt_tokens as u64),
         generated_tokens: Some(output.token_stats.generated_tokens as u64),
         audio_samples: Some(output.audio.samples.len() as u64),
+        input_audio_ms: output
+            .input_audio_duration_secs
+            .filter(|secs| secs.is_finite() && *secs > 0.0)
+            .map(|secs| (f64::from(secs) * 1000.0).round() as u64),
         transcript_chars: output.text.as_ref().map(|text| text.chars().count() as u64),
         stop_reason: output.finish_reason.map(|reason| format!("{reason:?}")),
         ..RuntimeStageOutputCounters::default()

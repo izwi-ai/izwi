@@ -1615,6 +1615,8 @@ tenant IDs are used.
 | `izwi_request_ttft_seconds` | `model`, `backend`, `task` | Server admission to the first user-visible output. |
 | `izwi_request_queue_wait_seconds` | `model`, `backend`, `task` | Server admission until the engine first schedules the request, including the runtime coordinator, input preparation and model residency. |
 | `izwi_request_prefill_seconds` | `model`, `backend`, `task` | Engine prefill time of one request. |
+| `izwi_request_decode_seconds` | `model`, `backend`, `task` | Engine decode time of one request, after its prefill. |
+| `izwi_request_input_audio_seconds` | `model`, `backend`, `task` | Input audio length of completed transcription and audio-chat requests. `rate(_sum)` is the audio seconds the server transcribes per second (its RTFx under load). |
 | `izwi_request_prompt_tokens_total`, `izwi_request_generation_tokens_total` | `model`, `task` | Counters for completed requests (generation counts audio frames for speech models). |
 | `izwi_engine_inter_token_latency_seconds` | `model`, `task` | Gap between successive committed tokens of one request; a commit of k tokens after a gap g counts k gaps of g/k. |
 | `izwi_engine_step_host_seconds` | `phase` (`prepare`, `commit`, `deliver`) | Host time of engine step phases under the step gate. |

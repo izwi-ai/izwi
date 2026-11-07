@@ -42,6 +42,10 @@ pub mod buckets {
     pub const BATCH_TOKENS: &[f64] = &[
         1.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0,
     ];
+    /// Length of a request's input audio, from short commands to hour-long files.
+    pub const INPUT_AUDIO_SECONDS: &[f64] = &[
+        1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
+    ];
     /// Conversational voice latencies.
     pub const VOICE_SECONDS: &[f64] = &[
         0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0,

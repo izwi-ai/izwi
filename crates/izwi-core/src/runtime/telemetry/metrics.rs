@@ -88,8 +88,10 @@ struct RequestHistograms {
     ttft: HistogramFamily,
     queue_wait: HistogramFamily,
     prefill: HistogramFamily,
+    decode: HistogramFamily,
     prompt_tokens: CounterFamily,
     generation_tokens: CounterFamily,
+    input_audio: HistogramFamily,
     stage_duration: HistogramFamily,
 }
 
@@ -120,6 +122,12 @@ impl RequestHistograms {
                 REQUEST_LABELS,
                 buckets::FIRST_OUTPUT_SECONDS,
             ),
+            decode: HistogramFamily::new(
+                "izwi_request_decode_seconds",
+                "Engine decode time attributed to one request (after its prefill).",
+                REQUEST_LABELS,
+                buckets::REQUEST_SECONDS,
+            ),
             prompt_tokens: CounterFamily::new(
                 "izwi_request_prompt_tokens_total",
                 "Prompt tokens of completed requests.",
@@ -129,6 +137,12 @@ impl RequestHistograms {
                 "izwi_request_generation_tokens_total",
                 "Generated tokens (or audio frames) of completed requests.",
                 TOKEN_LABELS,
+            ),
+            input_audio: HistogramFamily::new(
+                "izwi_request_input_audio_seconds",
+                "Input audio length of completed requests (transcription, audio chat). Its _sum over a window divided by the window is the server's audio throughput (RTFx).",
+                REQUEST_LABELS,
+                buckets::INPUT_AUDIO_SECONDS,
             ),
             stage_duration: HistogramFamily::new(
                 "izwi_runtime_stage_duration_seconds",
@@ -176,6 +190,9 @@ impl RequestHistograms {
         if let Some(prefill_ms) = timing.prefill_ms {
             self.prefill.observe(&labels, prefill_ms / 1000.0);
         }
+        if let Some(decode_ms) = timing.decode_ms {
+            self.decode.observe(&labels, decode_ms / 1000.0);
+        }
         if observation.outcome.is_failure() {
             return;
         }
@@ -185,6 +202,9 @@ impl RequestHistograms {
         if let Some(tokens) = observation.outputs.generated_tokens {
             self.generation_tokens.add(&[model, task], tokens);
         }
+        if let Some(ms) = observation.outputs.input_audio_ms.filter(|ms| *ms > 0) {
+            self.input_audio.observe(&labels, ms as f64 / 1000.0);
+        }
     }
 
     fn render(&self, payload: &mut String) {
@@ -192,8 +212,10 @@ impl RequestHistograms {
         self.ttft.render(payload);
         self.queue_wait.render(payload);
         self.prefill.render(payload);
+        self.decode.render(payload);
         self.prompt_tokens.render(payload);
         self.generation_tokens.render(payload);
+        self.input_audio.render(payload);
         self.stage_duration.render(payload);
     }
 }
@@ -429,6 +451,9 @@ pub struct RuntimeStageOutputCounters {
     pub audio_frames: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_samples: Option<u64>,
+    /// Length of the request's input audio in milliseconds (ASR, audio chat).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_audio_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript_chars: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2076,6 +2101,36 @@ mod tests {
             "izwi_request_generation_tokens_total{model=\"Qwen3-0.6B\",task=\"chat\"} 20"
         ));
         assert!(!payload.contains("req-Qwen3"));
+    }
+
+    #[tokio::test]
+    async fn prometheus_sums_input_audio_of_completed_requests() {
+        let telemetry = RuntimeTelemetryCollector::new(64);
+        for (outcome, input_audio_ms) in [
+            (RuntimeStageOutcome::Completed, Some(10_000)),
+            (RuntimeStageOutcome::Completed, Some(30_500)),
+            (RuntimeStageOutcome::Completed, None),
+            (RuntimeStageOutcome::Failed, Some(600_000)),
+        ] {
+            let mut observation = engine_request_observation(
+                "Parakeet-TDT-0.6B-v3",
+                outcome,
+                RuntimeStageTiming {
+                    total_ms: Some(200.0),
+                    ..RuntimeStageTiming::default()
+                },
+            );
+            observation.outputs.input_audio_ms = input_audio_ms;
+            telemetry.record_stage_observation(observation);
+        }
+        let payload = telemetry.prometheus().await;
+        let counts = check_histograms(&payload).expect("valid histogram exposition");
+        let series = "izwi_request_input_audio_seconds{backend=\"cpu\",model=\"Parakeet-TDT-0.6B-v3\",task=\"chat\"}";
+        // Only completed requests with a known input length count.
+        assert_eq!(counts[series], 2);
+        assert!(payload.contains(
+            "izwi_request_input_audio_seconds_sum{model=\"Parakeet-TDT-0.6B-v3\",backend=\"cpu\",task=\"chat\"} 40.5"
+        ));
     }
 
     #[tokio::test]
