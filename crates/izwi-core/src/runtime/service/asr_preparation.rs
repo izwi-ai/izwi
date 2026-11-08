@@ -141,7 +141,7 @@ impl RuntimeService {
                 ))
             })?;
         let model_for_shape = model.clone();
-        let (prepared, geometry) = self
+        let (prepared, geometry, features) = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
@@ -164,6 +164,17 @@ impl RuntimeService {
                         model_for_shape.audio_preparation_row_geometry(samples.len(), sample_rate)
                     })
                     .transpose()?;
+                // The resample and log-mel run here, on a host worker, so the
+                // device job runs only the upload and the audio tower.
+                let features = (!long_form)
+                    .then(|| {
+                        let started = Instant::now();
+                        let features =
+                            model_for_shape.prepare_qwen3_host_features(&samples, sample_rate);
+                        record_host_features(variant, started);
+                        features
+                    })
+                    .transpose()?;
                 let input_tokens = (!long_form)
                     .then(|| {
                         model_for_shape.incremental_prompt_token_count(
@@ -183,12 +194,21 @@ impl RuntimeService {
                         context_limit,
                     )?;
                 }
-                Ok((request, geometry))
+                Ok((request, geometry, features))
             })
             .await?;
         let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
             .map_err(|_| Error::Overloaded("Qwen3 ASR retained host input exceeds u64".into()))?;
-        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        // The features are held beside the request until the encode drops
+        // them.
+        let prepared_host_bytes = features
+            .as_ref()
+            .map(Qwen3AsrHostFeatures::host_bytes)
+            .transpose()?
+            .unwrap_or(0)
+            .checked_add(retained_host_bytes)
+            .ok_or_else(|| Error::Overloaded("Qwen3 ASR prepared host bytes overflow".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
         let initial_bridge = self.coordinator.bridge_preparation_admission(job)?;
 
         if prepared.uses_asr_long_form_atomic() {
@@ -214,7 +234,7 @@ impl RuntimeService {
         })?;
         let encoder_resources = asr_encoder_retained_resources(
             self.backend_router.context().backend_kind,
-            retained_host_bytes,
+            prepared_host_bytes,
             geometry.retained_artifact_bytes,
         )?;
         let encoder_spec = JobSpec {
@@ -230,7 +250,7 @@ impl RuntimeService {
             .admit_observed_from_preparation(
                 initial_bridge,
                 encoder_spec,
-                JobResourceObservation::host(retained_host_bytes),
+                JobResourceObservation::host(prepared_host_bytes),
             )
             .await
         {
@@ -242,9 +262,9 @@ impl RuntimeService {
                 return Err(error);
             }
         };
-        let (samples, sample_rate) = prepared
-            .prepared_asr_audio_for_executor()?
-            .ok_or_else(|| Error::InferenceError("Qwen3 ASR decoded audio was lost".into()))?;
+        let features = features.ok_or_else(|| {
+            Error::InferenceError("normal Qwen3 ASR route lost its host features".to_string())
+        })?;
         let outcome = self
             .qwen_asr_encoder_batcher
             .submit(QwenAsrEncoderPending {
@@ -252,8 +272,7 @@ impl RuntimeService {
                 contract: encoder_contract,
                 model,
                 model_label: variant.dir_name(),
-                samples,
-                sample_rate,
+                features,
                 geometry,
                 retained_host_bytes,
                 cancellation: PreparationCancellation::default(),

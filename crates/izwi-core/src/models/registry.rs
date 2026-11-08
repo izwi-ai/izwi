@@ -94,8 +94,8 @@ pub(crate) use crate::models::architectures::qwen3::asr::AlignmentUnit;
 use crate::models::architectures::qwen3::asr::{
     AsrDecodeCheckpoint as Qwen3AsrDecodeCheckpoint, AsrDecodeState as Qwen3AsrDecodeState,
     AsrDecodeStep as Qwen3AsrDecodeStep, AsrTranscriptionOutput as Qwen3AsrTranscriptionOutput,
-    Qwen3AsrAudioBatchRow, Qwen3AsrContextBound, Qwen3AsrModel, Qwen3AsrPhysicalStateSpec,
-    Qwen3AsrPreparedAudio,
+    Qwen3AsrAudioBatchRow, Qwen3AsrContextBound, Qwen3AsrHostFeatures, Qwen3AsrModel,
+    Qwen3AsrPhysicalStateSpec, Qwen3AsrPreparedAudio,
 };
 use crate::models::architectures::qwen3::chat::{
     ChatDecodeCheckpoint as Qwen3ChatDecodeCheckpoint, ChatDecodeState as Qwen3ChatDecodeState,
@@ -1544,6 +1544,34 @@ impl NativeAsrModel {
             Self::GraniteSpeech5(model) => model.preparation_row_cost_for_batch(index, rows, batch),
             _ => Err(Error::InvalidInput(
                 "Granite Speech 5.0 batch cost was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    /// Resamples and turns one Qwen3-ASR request's audio into its log-mel on
+    /// the host.
+    pub(crate) fn prepare_qwen3_host_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<Qwen3AsrHostFeatures> {
+        match self {
+            Self::Qwen3(model) => model.prepare_host_features(audio, sample_rate),
+            _ => Err(Error::InvalidInput(
+                "Qwen3 ASR features were requested from another ASR model".to_string(),
+            )),
+        }
+    }
+
+    /// Runs the Qwen3-ASR audio tower over host-computed features.
+    pub(crate) fn prepare_qwen3_audio_tower_from_features(
+        &self,
+        rows: &[&Qwen3AsrHostFeatures],
+    ) -> Result<Vec<Qwen3AsrPreparedAudio>> {
+        match self {
+            Self::Qwen3(model) => model.prepare_audio_tower_from_features(rows),
+            _ => Err(Error::InvalidInput(
+                "Qwen3 ASR audio-tower preparation was supplied to another ASR model".to_string(),
             )),
         }
     }

@@ -394,18 +394,9 @@ impl Qwen3AsrModel {
             .map_err(|_| Error::Overloaded("Qwen3 ASR audio dtype width exceeds u64".into()))?;
         let text_dtype_bytes = u64::try_from(self.text_dtype.size_in_bytes())
             .map_err(|_| Error::Overloaded("Qwen3 ASR text dtype width exceeds u64".into()))?;
-        let host_elements = rows.iter().try_fold(padded_mel_elements, |total, row| {
-            let row_elements =
-                checked_product_u64(&[row.resampled_samples], "Qwen3 ASR resample geometry")?
-                    .checked_add(checked_product_u64(
-                        &[row.mel_frames, n_mels],
-                        "Qwen3 ASR host mel geometry",
-                    )?)
-                    .ok_or_else(|| Error::Overloaded("Qwen3 ASR host frontend overflow".into()))?;
-            total
-                .checked_add(row_elements)
-                .ok_or_else(|| Error::Overloaded("Qwen3 ASR host workspace overflow".into()))
-        })?;
+        // Each row's resample and log-mel ran on a host worker, priced with
+        // its request; the batch builds only the padded upload copy.
+        let host_elements = padded_mel_elements;
         let device_audio_elements = padded_mel_elements
             .checked_add(conv_elements)
             .and_then(|value| value.checked_add(packed_elements))
@@ -1105,6 +1096,29 @@ pub struct AsrTranscriptionOutput {
 pub(crate) struct Qwen3AsrAudioBatchRow<'a> {
     pub(crate) audio: &'a [f32],
     pub(crate) sample_rate: u32,
+}
+
+/// One request's audio front end, computed on a host worker: its 16 kHz
+/// log-mel, frame-major and truncated to the tower's input frames.
+pub(crate) struct Qwen3AsrHostFeatures {
+    flat: Vec<f32>,
+    frontend: Qwen3AsrPreparedFrontend,
+}
+
+impl Qwen3AsrHostFeatures {
+    /// Mel frames the audio tower reads.
+    pub(crate) fn mel_frames(&self) -> usize {
+        self.frontend.mel_frames
+    }
+
+    /// Host bytes the features hold until the encode drops them.
+    pub(crate) fn host_bytes(&self) -> Result<u64> {
+        self.flat
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| Error::Overloaded("Qwen3 ASR host feature bytes overflow".into()))
+    }
 }
 
 /// Immutable, exact-row output of the Qwen3 ASR audio tower.
@@ -2194,15 +2208,105 @@ impl Qwen3AsrModel {
         Ok(state)
     }
 
-    /// Run the independently schedulable audio front end for a ragged group.
-    ///
-    /// Resampling and mel extraction remain host-side per row. Their exact
-    /// frame-major outputs are padded once for a single device upload, then the
-    /// audio tower packs all logical rows into one convolution/encoder pass.
-    /// No decoder KV is allocated or mutated by this operation.
+    /// Resamples one request's audio to 16 kHz and computes its log-mel on
+    /// the host, so a device job runs only the upload and the audio tower.
+    pub(crate) fn prepare_host_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<Qwen3AsrHostFeatures> {
+        if self.is_forced_aligner {
+            return Err(Error::InvalidInput(
+                "Qwen3-ForcedAligner models do not support transcription audio preparation."
+                    .to_string(),
+            ));
+        }
+        let mel_config = self.mel.config();
+        let n_mels = mel_config.n_mels;
+        let geometry = qwen3_asr_frontend_geometry(
+            audio.len(),
+            sample_rate,
+            QWEN3_ASR_SAMPLE_RATE,
+            mel_config.n_fft,
+            mel_config.hop_length,
+            self.device.device.is_cuda(),
+            self.preprocessor.nb_max_frames,
+        )?;
+        if geometry.mel_frames == 0 {
+            return Err(Error::InvalidInput("Empty audio input".to_string()));
+        }
+
+        let resample_started = Instant::now();
+        let resampled = if sample_rate != QWEN3_ASR_SAMPLE_RATE {
+            resample(audio, sample_rate, QWEN3_ASR_SAMPLE_RATE)?
+        } else {
+            audio.to_vec()
+        };
+        let resample_ms = elapsed_ms(resample_started);
+        if resampled.len() != geometry.resampled_samples {
+            return Err(Error::InferenceError(format!(
+                "Qwen3 ASR resample geometry drifted: predicted={}, actual={}",
+                geometry.resampled_samples,
+                resampled.len()
+            )));
+        }
+
+        let mel_started = Instant::now();
+        let (mut flat, actual_frames) = qwen3_log_mel(&self.mel, &resampled)?;
+        if actual_frames != geometry.mel_frames_before_truncate {
+            return Err(Error::InferenceError(format!(
+                "Qwen3 ASR mel geometry drifted: predicted={}, actual={actual_frames}",
+                geometry.mel_frames_before_truncate
+            )));
+        }
+        flat.truncate(
+            geometry
+                .mel_frames
+                .checked_mul(n_mels)
+                .ok_or_else(|| Error::Overloaded("Qwen3 ASR mel size overflow".to_string()))?,
+        );
+        let mel_ms = elapsed_ms(mel_started);
+        Ok(Qwen3AsrHostFeatures {
+            flat,
+            frontend: Qwen3AsrPreparedFrontend {
+                input_sample_rate: sample_rate,
+                input_samples: audio.len(),
+                resampled_sample_rate: QWEN3_ASR_SAMPLE_RATE,
+                resampled_samples: geometry.resampled_samples,
+                mel_frames: geometry.mel_frames,
+                mel_frames_before_drop: geometry.mel_frames_before_drop,
+                mel_frames_before_truncate: geometry.mel_frames_before_truncate,
+                mel_last_frame_dropped: geometry.mel_last_frame_dropped,
+                mel_frames_truncated: geometry.mel_frames_before_truncate > geometry.mel_frames,
+                resample_ms,
+                mel_ms,
+                ..Default::default()
+            },
+        })
+    }
+
+    /// Run the independently schedulable audio front end for a ragged group:
+    /// each row's host features, then one tower pass over all of them.
     pub(crate) fn prepare_audio_tower_batch(
         &self,
         rows: &[Qwen3AsrAudioBatchRow<'_>],
+    ) -> Result<Vec<Qwen3AsrPreparedAudio>> {
+        let features = rows
+            .iter()
+            .map(|row| self.prepare_host_features(row.audio, row.sample_rate))
+            .collect::<Result<Vec<_>>>()?;
+        self.prepare_audio_tower_from_features(&features.iter().collect::<Vec<_>>())
+    }
+
+    /// Run the audio tower over rows whose features a host worker computed.
+    ///
+    /// The frame-major features are padded once for a single device upload,
+    /// then the audio tower packs all logical rows into one
+    /// convolution/encoder pass. No decoder KV is allocated or mutated by
+    /// this operation.
+    pub(crate) fn prepare_audio_tower_from_features(
+        &self,
+        rows: &[&Qwen3AsrHostFeatures],
     ) -> Result<Vec<Qwen3AsrPreparedAudio>> {
         if self.is_forced_aligner {
             return Err(Error::InvalidInput(
@@ -2216,78 +2320,8 @@ impl Qwen3AsrModel {
             ));
         }
         let batch_started = Instant::now();
-
-        struct HostFrontendRow {
-            flat: Vec<f32>,
-            frontend: Qwen3AsrPreparedFrontend,
-        }
-
-        let mel_config = self.mel.config();
-        let n_mels = mel_config.n_mels;
-        let mut host_rows = Vec::with_capacity(rows.len());
-        for row in rows {
-            let geometry = qwen3_asr_frontend_geometry(
-                row.audio.len(),
-                row.sample_rate,
-                QWEN3_ASR_SAMPLE_RATE,
-                mel_config.n_fft,
-                mel_config.hop_length,
-                self.device.device.is_cuda(),
-                self.preprocessor.nb_max_frames,
-            )?;
-            if geometry.mel_frames == 0 {
-                return Err(Error::InvalidInput("Empty audio input".to_string()));
-            }
-
-            let resample_started = Instant::now();
-            let resampled = if row.sample_rate != QWEN3_ASR_SAMPLE_RATE {
-                resample(row.audio, row.sample_rate, QWEN3_ASR_SAMPLE_RATE)?
-            } else {
-                row.audio.to_vec()
-            };
-            let resample_ms = elapsed_ms(resample_started);
-            if resampled.len() != geometry.resampled_samples {
-                return Err(Error::InferenceError(format!(
-                    "Qwen3 ASR resample geometry drifted: predicted={}, actual={}",
-                    geometry.resampled_samples,
-                    resampled.len()
-                )));
-            }
-
-            let mel_started = Instant::now();
-            let (mut flat, actual_frames) = qwen3_log_mel(&self.mel, &resampled)?;
-            if actual_frames != geometry.mel_frames_before_truncate {
-                return Err(Error::InferenceError(format!(
-                    "Qwen3 ASR mel geometry drifted: predicted={}, actual={actual_frames}",
-                    geometry.mel_frames_before_truncate
-                )));
-            }
-            flat.truncate(
-                geometry
-                    .mel_frames
-                    .checked_mul(n_mels)
-                    .ok_or_else(|| Error::Overloaded("Qwen3 ASR mel size overflow".to_string()))?,
-            );
-            let mel_ms = elapsed_ms(mel_started);
-            host_rows.push(HostFrontendRow {
-                flat,
-                frontend: Qwen3AsrPreparedFrontend {
-                    input_sample_rate: row.sample_rate,
-                    input_samples: row.audio.len(),
-                    resampled_sample_rate: QWEN3_ASR_SAMPLE_RATE,
-                    resampled_samples: geometry.resampled_samples,
-                    mel_frames: geometry.mel_frames,
-                    mel_frames_before_drop: geometry.mel_frames_before_drop,
-                    mel_frames_before_truncate: geometry.mel_frames_before_truncate,
-                    mel_last_frame_dropped: geometry.mel_last_frame_dropped,
-                    mel_frames_truncated: geometry.mel_frames_before_truncate > geometry.mel_frames,
-                    resample_ms,
-                    mel_ms,
-                    ..Default::default()
-                },
-            });
-        }
-
+        let n_mels = self.mel.config().n_mels;
+        let host_rows = rows;
         let max_frames = host_rows
             .iter()
             .map(|row| row.frontend.mel_frames)
@@ -2354,16 +2388,17 @@ impl Qwen3AsrModel {
         let frontend_total_ms = elapsed_ms(batch_started);
 
         Ok(host_rows
-            .into_iter()
+            .iter()
             .zip(exact_rows)
-            .map(|(mut row, audio_embeddings)| {
-                row.frontend.mel_flatten_upload_ms = upload_ms;
-                row.frontend.audio_encode_ms = encode_ms;
-                row.frontend.frontend_total_ms = frontend_total_ms;
+            .map(|(row, audio_embeddings)| {
+                let mut frontend = row.frontend.clone();
+                frontend.mel_flatten_upload_ms = upload_ms;
+                frontend.audio_encode_ms = encode_ms;
+                frontend.frontend_total_ms = frontend_total_ms;
                 Qwen3AsrPreparedAudio {
                     preparation_id: self.audio_preparation_id,
                     audio_embeddings,
-                    frontend: row.frontend,
+                    frontend,
                 }
             })
             .collect())
@@ -6779,6 +6814,62 @@ mod precision_tests {
             audio_precision: PrecisionLoad::unchecked(&selection(DType::F32)),
             text_precision: PrecisionLoad::unchecked(&selection(DType::F32)),
         }
+    }
+
+    /// The host-worker features fed to the tower give bit-identical
+    /// embeddings to the in-job front end, at 16 kHz and after a resample,
+    /// and are priced as the host copy they hold.
+    #[test]
+    fn host_features_encode_exactly_like_the_in_job_front_end() {
+        let model = tiny_model(false);
+        let tone = |rate: u32, seconds: f32| {
+            (0..(rate as f32 * seconds) as usize)
+                .map(|index| (index as f32 * 0.013).sin() * 0.2)
+                .collect::<Vec<f32>>()
+        };
+        let (a, b) = (tone(16_000, 1.3), tone(8_000, 0.7));
+        let reference = model
+            .prepare_audio_tower_batch(&[
+                super::Qwen3AsrAudioBatchRow {
+                    audio: &a,
+                    sample_rate: 16_000,
+                },
+                super::Qwen3AsrAudioBatchRow {
+                    audio: &b,
+                    sample_rate: 8_000,
+                },
+            ])
+            .unwrap();
+        let features = [
+            model.prepare_host_features(&a, 16_000).unwrap(),
+            model.prepare_host_features(&b, 8_000).unwrap(),
+        ];
+        let rows = model
+            .prepare_audio_tower_from_features(&[&features[0], &features[1]])
+            .unwrap();
+        for (row, expected) in rows.iter().zip(&reference) {
+            assert_eq!(
+                row.audio_embeddings
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                expected
+                    .audio_embeddings
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            );
+        }
+        for feature in &features {
+            assert_eq!(
+                feature.host_bytes().unwrap(),
+                (feature.mel_frames() * 8 * 4) as u64
+            );
+        }
+        assert!(model.prepare_host_features(&[], 16_000).is_err());
+        assert!(model.prepare_audio_tower_from_features(&[]).is_err());
     }
 
     /// QFA-7 / ADM-11: both checkpoint formats load through one helper, so

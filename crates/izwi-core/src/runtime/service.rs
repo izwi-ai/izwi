@@ -94,7 +94,7 @@ use crate::models::architectures::parakeet::asr::{
     ParakeetEncoderBatchRow, ParakeetHostFeatures, ParakeetPreparedEncoderArtifact,
 };
 use crate::models::architectures::qwen3::asr::{
-    Qwen3AsrAudioBatchRow, Qwen3AsrAudioPreparationGeometry, Qwen3AsrPreparedAudio,
+    Qwen3AsrAudioPreparationGeometry, Qwen3AsrHostFeatures, Qwen3AsrPreparedAudio,
 };
 use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrPreparationDecision, VibeVoiceAsrPreparedArtifact, VibeVoiceAsrPreparedGeometry,
