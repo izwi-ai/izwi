@@ -1678,7 +1678,13 @@ impl WhisperTurboAsrModel {
             .collect::<Result<Vec<_>>>()?;
         let identities = rows
             .iter()
-            .map(|row| (row.source_identity, row.input_samples, row.input_sample_rate))
+            .map(|row| {
+                (
+                    row.source_identity,
+                    row.input_samples,
+                    row.input_sample_rate,
+                )
+            })
             .collect::<Vec<_>>();
         let mel_refs = mels.iter().collect::<Vec<_>>();
         let mel_batch = Tensor::cat(&mel_refs, 0)?;

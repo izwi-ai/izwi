@@ -963,14 +963,16 @@ impl RuntimeService {
         // The features are held beside the request until the encode drops
         // them.
         let features_host_bytes = match &shaped {
-            Some((features, _)) => features.host_bytes().ok_or_else(|| {
-                Error::Overloaded("Granite Speech feature bytes overflow".into())
-            })?,
+            Some((features, _)) => features
+                .host_bytes()
+                .ok_or_else(|| Error::Overloaded("Granite Speech feature bytes overflow".into()))?,
             None => 0,
         };
         let prepared_host_bytes = retained_host_bytes
             .checked_add(features_host_bytes)
-            .ok_or_else(|| Error::Overloaded("Granite Speech prepared host bytes overflow".into()))?;
+            .ok_or_else(|| {
+                Error::Overloaded("Granite Speech prepared host bytes overflow".into())
+            })?;
         job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
         if prepared.uses_asr_long_form_atomic() {
@@ -1581,7 +1583,7 @@ impl RuntimeService {
         )?;
         let prompt_tokens = model.offline_prompt_tokens()?;
         let model_for_plan = model.clone();
-        let (prepared, row_frames) = self
+        let (prepared, row_frames, features) = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
@@ -1600,17 +1602,38 @@ impl RuntimeService {
                     } else {
                         model_for_plan.offline_row_frames(samples.len(), sample_rate)?
                     };
+                // The resample and log-mel run here, on a host worker, so the
+                // device job runs only the encoder.
+                let features = row_frames
+                    .is_some()
+                    .then(|| {
+                        let started = Instant::now();
+                        let features =
+                            model_for_plan.prepare_offline_features(&samples, sample_rate);
+                        record_host_features(variant, started);
+                        features
+                    })
+                    .transpose()?;
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
                 if row_frames.is_none() {
                     request.install_prepared_asr_long_form_atomic(plan)?;
                 }
-                Ok((request, row_frames))
+                Ok((request, row_frames, features))
             })
             .await?;
         let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
             .map_err(|_| Error::Overloaded("Voxtral ASR retained input exceeds u64".into()))?;
-        // The decoded audio joins the request: its usage only rises here.
-        job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
+        // The decoded audio joins the request, and the features are held
+        // beside it until the encode drops them: usage only rises here.
+        let features_host_bytes = features
+            .as_ref()
+            .map(VoxtralOfflineFeatures::host_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        let prepared_host_bytes = retained_request_bytes
+            .checked_add(features_host_bytes)
+            .ok_or_else(|| Error::Overloaded("Voxtral ASR prepared host bytes overflow".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
         let Some(frames) = row_frames else {
             let mut prepared = prepared;
@@ -1644,11 +1667,11 @@ impl RuntimeService {
                     deadline: prepared.deadline,
                     resources: asr_encoder_retained_resources(
                         backend,
-                        retained_request_bytes,
+                        prepared_host_bytes,
                         embedding_bytes,
                     )?,
                 },
-                JobResourceObservation::host(retained_request_bytes),
+                JobResourceObservation::host(prepared_host_bytes),
             )
             .await
             .map_err(|failure| failure.error)?;
@@ -1662,6 +1685,15 @@ impl RuntimeService {
             units,
             super::tts_preparation::lfm25_audio_tts_preparation_workspace(backend, workspace),
         );
+        let features = features.ok_or_else(|| {
+            Error::InferenceError("Voxtral offline row lost its host features".into())
+        })?;
+        // The encode consumes the features and the row commits only the
+        // request and its embeddings. Restore the features' claim to pending
+        // first: usage may only rise through an observation, and the
+        // reservation still covers the features until the encode ends.
+        preparation_job
+            .prepare_materialized_release(JobResourceObservation::host(retained_request_bytes))?;
         let cancellation = PreparationCancellation::default();
         let row = self.coordinator.seal_preparation_row(
             preparation_job,
@@ -1687,7 +1719,7 @@ impl RuntimeService {
                 }
                 let encode_started = Instant::now();
                 let artifact =
-                    model_for_preparation.prepare_offline_audio(&samples, sample_rate)?;
+                    model_for_preparation.prepare_offline_audio_from_features(features)?;
                 crate::engine::metrics::record_asr_device_phase(
                     model_label,
                     crate::engine::metrics::AsrPhase::Encoder,

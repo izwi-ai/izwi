@@ -103,6 +103,7 @@ use crate::models::architectures::vibevoice::tts::{
     vibevoice_tts_auto_max_frames_for_text, VibeVoiceSpeakerReference,
     VibeVoiceTtsGenerationParams, VIBEVOICE_TTS_DEFAULT_CFG_SCALE,
 };
+use crate::models::architectures::voxtral::realtime::VoxtralOfflineFeatures;
 use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
 use crate::models::architectures::whisper::asr::{
     WhisperHostFeatures, WhisperPreparedWindow, WhisperWindowPreparationGeometry,
