@@ -48,19 +48,69 @@ pub fn gumbel(keys: &[u64], per_row: usize, device: &Device) -> Result<Tensor> {
     }
 }
 
+/// [`gumbel`] with the keys already on the device: `keys` is `[rows]` I64,
+/// each the bits of a row's `u64` key. Nothing is uploaded on CUDA, so a CUDA
+/// graph can capture it and take the keys as an input; elsewhere the keys
+/// are read back and the host computes the noise.
+pub fn gumbel_rows(keys: &Tensor, per_row: usize) -> Result<Tensor> {
+    let rows = keys.dims1()?;
+    if rows == 0 || per_row == 0 || keys.dtype() != DType::I64 {
+        candle_core::bail!("counter noise needs [rows] I64 keys and columns")
+    }
+    match keys.device() {
+        #[cfg(feature = "cuda")]
+        Device::Cuda(_) => cuda_impl::run_rows(keys, per_row),
+        device => {
+            let keys = keys
+                .to_vec1::<i64>()?
+                .into_iter()
+                .map(|key| key as u64)
+                .collect::<Vec<_>>();
+            gumbel(&keys, per_row, device)
+        }
+    }
+}
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
-    use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+    use candle_core::cuda_backend::cudarc::driver::{
+        CudaSlice, CudaView, LaunchConfig, PushKernelArg,
+    };
     use candle_core::cuda_backend::{CudaStorage, WrapErr};
     use candle_core::op::BackpropOp;
-    use candle_core::{Device, Result, Shape, Storage, Tensor};
+    use candle_core::{CudaDevice, Device, Result, Shape, Storage, Tensor};
 
     const MODULE: &str = "izwi_counter_noise";
 
     pub(super) fn run(keys: &[u64], per_row: usize, device: &Device) -> Result<Tensor> {
         let device = device.as_cuda_device()?;
-        let total = keys.len() * per_row;
-        let keys_on_device = device.clone_htod(keys)?;
+        let keys_on_device: CudaSlice<u64> = device.clone_htod(keys)?;
+        launch(device, &keys_on_device.slice(..), keys.len(), per_row)
+    }
+
+    /// [`super::gumbel_rows`] on CUDA: the keys read in place.
+    pub(super) fn run_rows(keys: &Tensor, per_row: usize) -> Result<Tensor> {
+        let device = keys.device().as_cuda_device()?;
+        let rows = keys.dims1()?;
+        let (storage, layout) = keys.storage_and_layout();
+        let Storage::Cuda(cuda) = &*storage else {
+            candle_core::bail!("counter noise keys need a CUDA tensor")
+        };
+        let Some((start, end)) = layout.contiguous_offsets() else {
+            candle_core::bail!("counter noise keys must be contiguous")
+        };
+        // The kernel reads each I64 key's bits as an unsigned 64-bit key.
+        let view = cuda.as_cuda_slice::<i64>()?.slice(start..end);
+        launch(device, &view, rows, per_row)
+    }
+
+    fn launch<T>(
+        device: &CudaDevice,
+        keys: &CudaView<'_, T>,
+        rows: usize,
+        per_row: usize,
+    ) -> Result<Tensor> {
+        let total = rows * per_row;
         // SAFETY: the kernel writes every element.
         let out = unsafe { device.alloc::<f32>(total)? };
         let function = device.get_or_load_custom_func(
@@ -69,7 +119,7 @@ mod cuda_impl {
             super::super::cuda::cuda_ptx_counter_noise(),
         )?;
         let mut builder = function.builder();
-        builder.arg(&keys_on_device);
+        builder.arg(keys);
         builder.arg(&out);
         candle_core::builder_arg!(builder, per_row as i64, total as i64);
         let config = LaunchConfig {
@@ -77,11 +127,12 @@ mod cuda_impl {
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        // SAFETY: argument order and types match the kernel.
+        // SAFETY: argument order and types match the kernel; the keys are
+        // `rows` 64-bit words.
         unsafe { builder.launch(config) }.w()?;
         Ok(Tensor::from_storage(
             Storage::Cuda(CudaStorage::wrap_cuda_slice(out, device.clone())),
-            Shape::from((keys.len(), per_row)),
+            Shape::from((rows, per_row)),
             BackpropOp::none(),
             false,
         ))
@@ -117,6 +168,28 @@ mod tests {
         assert!((mean - std::f64::consts::EULER_GAMMA).abs() < 0.02, "{mean}");
     }
 
+    /// Keys passed as an I64 tensor give the slice keys' noise, the top
+    /// bit included.
+    #[test]
+    fn device_keys_give_the_same_noise() {
+        let device = Device::Cpu;
+        let keys = [3u64, u64::MAX - 5, 1 << 63];
+        let tensor = Tensor::from_vec(
+            keys.iter().map(|&key| key as i64).collect::<Vec<_>>(),
+            keys.len(),
+            &device,
+        )
+        .unwrap();
+        assert_eq!(
+            gumbel_rows(&tensor, 300).unwrap().to_vec2::<f32>().unwrap(),
+            gumbel(&keys, 300, &device)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap()
+        );
+        assert!(gumbel_rows(&tensor.to_dtype(DType::U32).unwrap(), 3).is_err());
+    }
+
     #[test]
     fn uniforms_stay_strictly_inside_the_unit_interval() {
         assert_eq!(uniform(0, u64::MAX), uniform(0, u64::MAX));
@@ -139,6 +212,17 @@ mod tests {
             .unwrap()
             .to_vec2::<f32>()
             .unwrap();
+        let tensor = Tensor::from_vec(
+            keys.iter().map(|&key| key as i64).collect::<Vec<_>>(),
+            keys.len(),
+            &device,
+        )
+        .unwrap();
+        let rows = gumbel_rows(&tensor, 4_096)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        assert_eq!(rows, got);
         for (row, &key) in got.iter().zip(&keys) {
             for (index, &value) in row.iter().enumerate() {
                 let expected = host_gumbel(key, index as u64);

@@ -47,7 +47,8 @@ use crate::models::architectures::maya2::config::{
     MIMI_DIR as MAYA2_MIMI_DIR, WEIGHT_SHARDS as MAYA2_WEIGHT_SHARDS,
 };
 use crate::models::architectures::maya2::{
-    maya2_backbone_precision, maya2_depth_dtype, maya2_reloads_in_f32,
+    maya2_backbone_precision, maya2_depth_dtype, maya2_depth_graph_device_bytes,
+    maya2_reloads_in_f32,
 };
 use crate::models::architectures::qwen3::core::qwen3_dense_projection_fusion_enabled;
 use crate::models::architectures::qwen3::tts::speech_tokenizer::{
@@ -546,7 +547,10 @@ fn maya2_tts_plan(
         return Ok(None);
     };
     let dtype = maya2_backbone_precision(device).dtype;
-    let plan = price_maya2_tts(&files, backend, dtype, maya2_depth_dtype(device, dtype))?;
+    // The depth decoder's CUDA graphs allocate at the load's self-check.
+    let graphs = maya2_depth_graph_device_bytes(backend);
+    let plan = price_maya2_tts(&files, backend, dtype, maya2_depth_dtype(device, dtype))?
+        .with_deferred_device_bytes(graphs);
     if maya2_reloads_in_f32(device, dtype) {
         // A backbone that fails its load-time probe reloads in F32 (never on
         // Metal, where the load is refused instead).

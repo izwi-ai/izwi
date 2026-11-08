@@ -28,8 +28,8 @@ use super::guards::{LoopGuard, Maya2PieceBudget, Maya2StopReason};
 use super::inputs::Maya2Inputs;
 use super::runtime::{cap_reason, Maya2GenerationParams, Maya2Stream, Maya2Voice};
 use super::sampling::{
-    cb0_device_candidates, depth_counter_gumbel, depth_gumbel, depth_noise_key,
-    device_cb0_sampling, device_noise, sample_cb0, sample_cb0_candidates, Cb0Draw, Cb0State,
+    cb0_device_candidates, depth_gumbel, depth_noise_key, device_cb0_sampling, device_noise,
+    sample_cb0, sample_cb0_candidates, Cb0Draw, Cb0State,
 };
 use crate::error::{Error, Result};
 use crate::kernels::penalized_topk::{self, CandidateRow};
@@ -584,7 +584,9 @@ pub(crate) fn maya2_decode_batch(
             })
             .collect::<Result<Vec<_>>>()?;
         let cross = Tensor::stack(&cross, 0)?;
-        let gumbel = if device_noise(device) {
+        let cb0 = Tensor::from_vec(cb0, going.len(), device)?;
+        let (temperature, top_k) = (MAYA2_DEFAULTS.depth_temperature, MAYA2_DEFAULTS.depth_top_k);
+        let frames = if device_noise(device) {
             let keys = going
                 .iter()
                 .map(|&index| {
@@ -592,7 +594,10 @@ pub(crate) fn maya2_decode_batch(
                     depth_noise_key(state.params.seed, state.frames())
                 })
                 .collect::<Vec<_>>();
-            depth_counter_gumbel(&keys, DEPTH_LEVELS, CODEBOOK_SIZE, device)?
+            // Through the depth frame graph on CUDA when it is on.
+            networks
+                .depth
+                .generate_frame_keyed(&h, &cb0, &cross, &keys, temperature, top_k)?
         } else {
             let mut rngs = Vec::with_capacity(going.len());
             let mut cursor = 0;
@@ -602,17 +607,11 @@ pub(crate) fn maya2_decode_batch(
                     cursor += 1;
                 }
             }
-            depth_gumbel(&mut rngs, DEPTH_LEVELS, CODEBOOK_SIZE, device)?
+            let gumbel = depth_gumbel(&mut rngs, DEPTH_LEVELS, CODEBOOK_SIZE, device)?;
+            networks
+                .depth
+                .generate_frame(&h, &cb0, &cross, &gumbel, temperature, top_k)?
         };
-        let cb0 = Tensor::from_vec(cb0, going.len(), device)?;
-        let frames = networks.depth.generate_frame(
-            &h,
-            &cb0,
-            &cross,
-            &gumbel,
-            MAYA2_DEFAULTS.depth_temperature,
-            MAYA2_DEFAULTS.depth_top_k,
-        )?;
         let host = frames.to_vec2::<u32>()?;
 
         let mut feed = Vec::with_capacity(going.len());

@@ -18,13 +18,82 @@
 //! and every level is sampled on the device ([`super::sampling`]), so a frame
 //! is read back once.
 
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
 use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{LayerNorm, VarBuilder};
 
 use super::config::{CODEBOOKS, CODEBOOK_SIZE, DEPTH_LEVELS};
 use super::sampling::sample_depth_level;
+use crate::backends::BackendKind;
 use crate::error::{Error, Result};
+use crate::kernels::counter_noise;
+use crate::kernels::cuda::shape_graphs::{ShapeGraphLimits, ShapeGraphs};
 use crate::models::shared::attention::flash::try_fused_self_attention;
+
+/// Kill switch for the depth decoder's CUDA frame graphs (a boolean; on
+/// when unset). Load pricing and the decoder read it.
+pub(crate) const MAYA2_DEPTH_GRAPHS_ENV: &str = "IZWI_MAYA2_DEPTH_GRAPHS";
+
+fn depth_graphs_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(MAYA2_DEPTH_GRAPHS_ENV, true));
+    ON.get()
+}
+
+/// The rows every graphed frame runs: the padded row group, so a graphed
+/// frame's matmuls are the eager frame's shapes, and spare rows are zero
+/// rows (key 0, code 0), so a row's codes never depend on the rows beside
+/// it.
+pub(crate) const DEPTH_GRAPH_ROWS: usize = DEPTH_ROW_GROUP;
+
+const MIB: u64 = 1024 * 1024;
+
+/// What the depth graphs may hold: one graph per input dtype (the sampling
+/// is the fixed depth policy). A 32-row frame's working set is the frame's
+/// Gumbel noise (`[32, 31, 2048]` F32, 8 MiB), 31 levels of `[32, 2048]`
+/// logits and their sorts, and a band's dense K/V (at most 8 positions of
+/// `[32, 16, 64]` per layer); the retained buffers are its inputs and its
+/// `[32, 32]` codes.
+const DEPTH_GRAPH_LIMITS: ShapeGraphLimits = ShapeGraphLimits {
+    max_graphs: 2,
+    retained_bytes: 16 * MIB,
+    pool_bytes: 112 * MIB,
+};
+
+/// Device bytes a load on `backend` prices for the depth graphs, which the
+/// load's self-check allocates: zero off CUDA or with the graphs switched
+/// off.
+pub(crate) fn maya2_depth_graph_device_bytes(backend: BackendKind) -> u64 {
+    if backend == BackendKind::Cuda && depth_graphs_requested() {
+        DEPTH_GRAPH_LIMITS.device_bytes()
+    } else {
+        0
+    }
+}
+
+/// A frame graph's key: its hidden states' dtype and the depth policy
+/// (temperature bits, top-k), which the graph bakes in.
+type DepthGraphKey = (DType, u32, usize);
+
+/// The depth decoder's frame graphs ([`Maya2Depth::resolve_graphs`]), or why
+/// there are none, and how many frames ran through them.
+struct DepthGraphs {
+    graphs: std::result::Result<ShapeGraphs<DepthGraphKey>, String>,
+    graphed_frames: AtomicU64,
+    /// Frames of more rows than [`DEPTH_GRAPH_ROWS`], run eagerly.
+    eager_frames: AtomicU64,
+}
+
+impl DepthGraphs {
+    fn off(reason: &str) -> Self {
+        Self {
+            graphs: Err(reason.into()),
+            graphed_frames: AtomicU64::new(0),
+            eager_frames: AtomicU64::new(0),
+        }
+    }
+}
 
 const LAYERS: usize = 4;
 const GROUPS: usize = 11;
@@ -120,6 +189,7 @@ pub struct Maya2Depth {
     heads: Vec<Tensor>,
     spk_proj: Tensor,
     null_mem: Tensor,
+    graphs: DepthGraphs,
 }
 
 fn linear(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
@@ -264,6 +334,7 @@ impl Maya2Depth {
             geometry,
             dtype,
             device,
+            graphs: DepthGraphs::off("not resolved"),
         })
     }
 
@@ -325,6 +396,228 @@ impl Maya2Depth {
             let noise = gumbel.narrow(1, level - 1, 1)?.squeeze(1)?;
             sample_depth_level(logits, temperature, top_k, &noise)
         })
+    }
+
+    /// [`Self::generate_frame`] with each row's Gumbel noise generated on
+    /// the device from its key ([`super::sampling::depth_noise_key`]), as
+    /// `depth_counter_gumbel` generates it: through the frame graph when the
+    /// graphs are on and the frame has at most [`DEPTH_GRAPH_ROWS`] rows
+    /// (spare rows zero), else eagerly. The codes are the same bits either
+    /// way: the graph runs the eager frame's matmul shapes, and every other
+    /// op works row by row.
+    pub fn generate_frame_keyed(
+        &self,
+        h: &Tensor,
+        cb0: &Tensor,
+        cross: &Tensor,
+        keys: &[u64],
+        temperature: f32,
+        top_k: usize,
+    ) -> Result<Tensor> {
+        let rows = h.dim(0)?;
+        if keys.len() != rows {
+            return Err(Error::InvalidInput(
+                "Maya2 depth rows and noise keys disagree".into(),
+            ));
+        }
+        let graphs = match &self.graphs.graphs {
+            Ok(graphs) if graphs.is_on() => Some(graphs),
+            _ => None,
+        };
+        match graphs {
+            Some(graphs) if rows <= DEPTH_GRAPH_ROWS => {
+                let codes = self.run_padded(h, cb0, cross, keys, &|inputs: &[Tensor]| {
+                    self.run_frame_graph(graphs, temperature, top_k, inputs)
+                })?;
+                self.graphs.graphed_frames.fetch_add(1, Relaxed);
+                Ok(codes)
+            }
+            graphs => {
+                if graphs.is_some() {
+                    self.graphs.eager_frames.fetch_add(1, Relaxed);
+                }
+                let keys = Tensor::from_vec(
+                    keys.iter().map(|&key| key as i64).collect::<Vec<_>>(),
+                    rows,
+                    &self.device,
+                )?;
+                self.keyed_frame(
+                    &[h.clone(), cb0.clone(), cross.clone(), keys],
+                    temperature,
+                    top_k,
+                )
+            }
+        }
+    }
+
+    /// `run` over a frame's inputs padded to [`DEPTH_GRAPH_ROWS`] rows (zero
+    /// hiddens, codes, speakers and keys), its codes narrowed back to the
+    /// frame's rows.
+    fn run_padded(
+        &self,
+        h: &Tensor,
+        cb0: &Tensor,
+        cross: &Tensor,
+        keys: &[u64],
+        run: &dyn Fn(&[Tensor]) -> Result<Tensor>,
+    ) -> Result<Tensor> {
+        let rows = h.dim(0)?;
+        let spare = DEPTH_GRAPH_ROWS - rows;
+        let mut padded_keys = keys.iter().map(|&key| key as i64).collect::<Vec<_>>();
+        padded_keys.resize(DEPTH_GRAPH_ROWS, 0);
+        let inputs = [
+            h.pad_with_zeros(0, 0, spare)?,
+            cb0.pad_with_zeros(0, 0, spare)?,
+            cross.pad_with_zeros(0, 0, spare)?,
+            Tensor::from_vec(padded_keys, DEPTH_GRAPH_ROWS, &self.device)?,
+        ];
+        Ok(run(&inputs)?.narrow(0, 0, rows)?.contiguous()?)
+    }
+
+    /// One frame's codes `[B, 32]` from `inputs`: hidden states `[B, 2048]`,
+    /// codebook-0 codes `[B]` (U32), cross constants `[B, 4, 1024]` and each
+    /// row's noise key `[B]` (I64, the key's bits). The noise is generated
+    /// on the device (`counter_noise::gumbel_rows`), so the frame is a pure
+    /// function of its inputs and the weights and a CUDA graph can capture
+    /// it.
+    fn keyed_frame(&self, inputs: &[Tensor], temperature: f32, top_k: usize) -> Result<Tensor> {
+        let [h, cb0, cross, keys] = inputs else {
+            return Err(Error::InferenceError(format!(
+                "Maya2 depth frame received {} inputs, expected 4",
+                inputs.len()
+            )));
+        };
+        let codes = self.geometry.codebook_size;
+        let gumbel = counter_noise::gumbel_rows(keys, DEPTH_LEVELS * codes)?.reshape((
+            keys.dim(0)?,
+            DEPTH_LEVELS,
+            codes,
+        ))?;
+        self.generate_frame(h, cb0, cross, &gumbel, temperature, top_k)
+    }
+
+    /// [`Self::keyed_frame`] over `inputs` through the graph of its key,
+    /// pricing what the graph keeps: its stable copy of each input and its
+    /// codes.
+    fn run_frame_graph(
+        &self,
+        graphs: &ShapeGraphs<DepthGraphKey>,
+        temperature: f32,
+        top_k: usize,
+        inputs: &[Tensor],
+    ) -> Result<Tensor> {
+        let bytes = |tensor: &Tensor| (tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64;
+        let codes = (DEPTH_GRAPH_ROWS * CODEBOOKS * DType::U32.size_in_bytes()) as u64;
+        let retained = inputs.iter().map(bytes).sum::<u64>() + codes;
+        let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+            Ok(vec![self.keyed_frame(inputs, temperature, top_k)?])
+        };
+        let key = (inputs[0].dtype(), temperature.to_bits(), top_k);
+        graphs
+            .run(key, retained, inputs, &body)?
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Maya2 depth graph returned nothing".into()))
+    }
+
+    /// Turns the frame graphs on (CUDA only, unless
+    /// [`MAYA2_DEPTH_GRAPHS_ENV`] is off) once a self-check passes: two
+    /// frames of xorshift inputs at `input_dtype` (the backbone's hidden
+    /// dtype) under the depth policy, the first captured, both replays
+    /// compared with the eager frame bit for bit ([`ShapeGraphs::run`]). A
+    /// mismatch or a CUDA error leaves every frame eager, with the reason in
+    /// the diagnostics.
+    pub(crate) fn resolve_graphs(&mut self, input_dtype: DType, temperature: f32, top_k: usize) {
+        let resolved = if depth_graphs_requested() {
+            ShapeGraphs::resolve("Maya2 depth decoder", &self.device, DEPTH_GRAPH_LIMITS)
+        } else {
+            Err(format!("{MAYA2_DEPTH_GRAPHS_ENV} is off"))
+        };
+        let resolved = resolved.and_then(|graphs| {
+            match self.self_check_graphs(&graphs, input_dtype, temperature, top_k) {
+                Ok(()) if graphs.is_on() => Ok(graphs),
+                Ok(()) => Err(format!(
+                    "self-check failed: {}",
+                    graphs.diagnostics()["off"]
+                )),
+                Err(error) => Err(format!("self-check failed: {error}")),
+            }
+        });
+        match &resolved {
+            Ok(_) => tracing::info!(
+                rows = DEPTH_GRAPH_ROWS,
+                "Maya2 depth frames run as CUDA graphs"
+            ),
+            Err(reason) if self.device.is_cuda() => {
+                tracing::warn!(%reason, "Maya2 depth frames run eagerly")
+            }
+            Err(_) => {}
+        }
+        self.graphs.graphs = resolved;
+    }
+
+    /// Two frames of xorshift inputs through `graphs` (see
+    /// [`Self::resolve_graphs`]): the first captures the graph and checks a
+    /// replay against the eager frame, the second checks a replay over new
+    /// inputs, so a value baked into the graph shows.
+    fn self_check_graphs(
+        &self,
+        graphs: &ShapeGraphs<DepthGraphKey>,
+        input_dtype: DType,
+        temperature: f32,
+        top_k: usize,
+    ) -> Result<()> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let rows = DEPTH_GRAPH_ROWS;
+        let geometry = self.geometry;
+        for _ in 0..2 {
+            let mut uniform = |count: usize, scale: f32| {
+                (0..count)
+                    .map(|_| ((next() >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * scale)
+                    .collect::<Vec<_>>()
+            };
+            let h = Tensor::from_vec(
+                uniform(rows * geometry.backbone_width, 1.0),
+                (rows, geometry.backbone_width),
+                &self.device,
+            )?
+            .to_dtype(input_dtype)?;
+            let cross = Tensor::from_vec(
+                uniform(rows * LAYERS * geometry.width, 0.1),
+                (rows, LAYERS, geometry.width),
+                &self.device,
+            )?
+            .to_dtype(self.dtype)?;
+            let cb0 = (0..rows)
+                .map(|_| (next() % geometry.codebook_size as u64) as u32)
+                .collect::<Vec<_>>();
+            let keys = (0..rows).map(|_| next() as i64).collect::<Vec<_>>();
+            let inputs = [
+                h,
+                Tensor::from_vec(cb0, rows, &self.device)?,
+                cross,
+                Tensor::from_vec(keys, rows, &self.device)?,
+            ];
+            self.run_frame_graph(graphs, temperature, top_k, &inputs)?;
+        }
+        Ok(())
+    }
+
+    /// The frame graphs' state and counters, for the model diagnostics.
+    pub fn graphs_diagnostics(&self) -> serde_json::Value {
+        let mut diagnostics = match &self.graphs.graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        };
+        diagnostics["rows"] = DEPTH_GRAPH_ROWS.into();
+        diagnostics["graphed_frames"] = self.graphs.graphed_frames.load(Relaxed).into();
+        diagnostics["eager_frames"] = self.graphs.eager_frames.load(Relaxed).into();
+        diagnostics
     }
 
     /// The levels of one frame, `pick` choosing each level's codes `[B]`
@@ -550,7 +843,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::models::architectures::maya2::sampling::depth_gumbel;
+    use crate::models::architectures::maya2::sampling::{depth_counter_gumbel, depth_gumbel};
     use crate::models::shared::noise::{mix, SplitMix64};
 
     const TINY: DepthGeometry = DepthGeometry {
@@ -803,6 +1096,90 @@ mod tests {
                 "row {row} moves by {diff} beside other rows, first at level {first_level:?}"
             );
         }
+    }
+
+    /// A frame run as the graph runs it (rows padded to 32 with zero rows,
+    /// the noise generated from key tensors inside the frame) gives each
+    /// row the eager frame's codes bit for bit, as does the keyed entry
+    /// point without graphs.
+    #[test]
+    fn padded_keyed_frames_match_the_eager_frame() {
+        let depth = tiny_depth();
+        for rows in [1usize, 3, DEPTH_GRAPH_ROWS] {
+            let h = random(rows, TINY.backbone_width, 40 + rows as u64);
+            let cb0 = (0..rows)
+                .map(|row| (mix(row as u64 + 7) % TINY.codebook_size as u64) as u32)
+                .collect::<Vec<_>>();
+            let cb0 = Tensor::from_vec(cb0, rows, &Device::Cpu).unwrap();
+            let speakers = (0..rows)
+                .map(|row| {
+                    let ecapa = random(1, TINY.ecapa_dim, 90 + row as u64)
+                        .reshape(TINY.ecapa_dim)
+                        .unwrap();
+                    depth.cross_constants(Some(&ecapa)).unwrap()
+                })
+                .collect::<Vec<_>>();
+            let cross = Tensor::stack(&speakers, 0).unwrap();
+            // The top bit set in some keys: they travel as I64 bits.
+            let keys = (0..rows)
+                .map(|row| mix(row as u64 + 1000) | ((row as u64 % 2) << 63))
+                .collect::<Vec<_>>();
+            let gumbel =
+                depth_counter_gumbel(&keys, DEPTH_LEVELS, TINY.codebook_size, &Device::Cpu)
+                    .unwrap();
+            let eager = depth
+                .generate_frame(&h, &cb0, &cross, &gumbel, 0.7, 4)
+                .unwrap()
+                .to_vec2::<u32>()
+                .unwrap();
+            let padded = depth
+                .run_padded(&h, &cb0, &cross, &keys, &|inputs: &[Tensor]| {
+                    assert_eq!(inputs[0].dim(0)?, DEPTH_GRAPH_ROWS);
+                    depth.keyed_frame(inputs, 0.7, 4)
+                })
+                .unwrap()
+                .to_vec2::<u32>()
+                .unwrap();
+            assert_eq!(padded, eager, "rows {rows}");
+            let keyed = depth
+                .generate_frame_keyed(&h, &cb0, &cross, &keys, 0.7, 4)
+                .unwrap()
+                .to_vec2::<u32>()
+                .unwrap();
+            assert_eq!(keyed, eager, "rows {rows}");
+        }
+    }
+
+    /// Off CUDA the graphs never resolve and price nothing; the kill switch
+    /// turns their pricing off on CUDA and names itself.
+    #[test]
+    fn depth_graphs_run_on_cuda_only_and_obey_the_kill_switch() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(MAYA2_DEPTH_GRAPHS_ENV);
+        std::env::remove_var(MAYA2_DEPTH_GRAPHS_ENV);
+        assert_eq!(maya2_depth_graph_device_bytes(BackendKind::Cpu), 0);
+        assert_eq!(maya2_depth_graph_device_bytes(BackendKind::Metal), 0);
+        assert_eq!(maya2_depth_graph_device_bytes(BackendKind::Cuda), 128 * MIB);
+        let mut depth = tiny_depth();
+        depth.resolve_graphs(DType::F32, 0.7, 4);
+        assert_eq!(
+            depth.graphs_diagnostics()["off"],
+            "shape graphs run on CUDA only"
+        );
+        std::env::set_var(MAYA2_DEPTH_GRAPHS_ENV, "0");
+        assert_eq!(maya2_depth_graph_device_bytes(BackendKind::Cuda), 0);
+        depth.resolve_graphs(DType::F32, 0.7, 4);
+        let off = depth.graphs_diagnostics()["off"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        match previous {
+            Some(value) => std::env::set_var(MAYA2_DEPTH_GRAPHS_ENV, value),
+            None => std::env::remove_var(MAYA2_DEPTH_GRAPHS_ENV),
+        }
+        assert!(off.contains(MAYA2_DEPTH_GRAPHS_ENV), "{off}");
     }
 
     #[test]

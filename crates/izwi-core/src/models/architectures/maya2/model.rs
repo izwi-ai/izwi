@@ -51,6 +51,9 @@ pub struct Maya2TtsDiagnostics {
     pub backbone_dtype: String,
     pub depth_dtype: String,
     pub context_tokens: usize,
+    /// The depth decoder's CUDA frame graphs: why they are off, or their
+    /// captures, replays, fallbacks and graphed and eager frames.
+    pub depth_graphs: serde_json::Value,
 }
 
 /// What one audio-window quantum did.
@@ -104,7 +107,7 @@ impl Maya2TtsModel {
                 maya2_depth_dtype(&device, dtype),
             )
         };
-        let runtime = if reloads {
+        let mut runtime = if reloads {
             let (runtime, precision) = load_with_precision_fallback(
                 "Maya2 backbone",
                 &selection,
@@ -140,6 +143,8 @@ impl Maya2TtsModel {
             );
             runtime
         };
+        // A depth frame's input is the loaded backbone's hidden state.
+        runtime.resolve_depth_graphs();
         Ok(Self {
             model_identity: NEXT_MAYA2_MODEL_IDENTITY.fetch_add(1, Ordering::Relaxed),
             variant,
@@ -180,6 +185,7 @@ impl Maya2TtsModel {
             backbone_dtype: format!("{:?}", self.runtime.backbone().dtype()),
             depth_dtype: format!("{:?}", self.runtime.depth().dtype()),
             context_tokens: self.context_tokens(),
+            depth_graphs: self.runtime.depth().graphs_diagnostics(),
         }
     }
 

@@ -32,6 +32,7 @@ pub mod text;
 mod weights;
 
 pub use config::{MAYA2_DEFAULTS, SAMPLE_RATE};
+pub(crate) use depth::maya2_depth_graph_device_bytes;
 pub use guards::Maya2StopReason;
 pub(crate) use model::maya2_reloads_in_f32;
 pub(crate) use model::Maya2AudioProgress;

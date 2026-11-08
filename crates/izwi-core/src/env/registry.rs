@@ -1293,6 +1293,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Kill switch: false decodes one Maya1 audio window per SNAC call and one request's window per audio quantum on CUDA, instead of every SNAC call at four rows and the due windows of up to the engine rows in one quantum, windows of one length sharing calls.",
     ),
     CoreEnvVar::new(
+        "IZWI_MAYA2_DEPTH_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Maya 2 runs each frame's depth decoder (31 levels x 4 layers, each band's K/V dense inside the frame, the Gumbel noise generated inside it from each row's key, and every level's draw) as a CUDA graph at 32 rows, spare rows zero; frames of more rows, or with IZWI_MAYA2_DEVICE_NOISE off, run eagerly. The graph runs the eager frame's matmul shapes, so the codes are the same bits. A load-time self-check captures it over xorshift inputs and compares replays with the eager frame bit for bit; a mismatch or CUDA error keeps every frame eager. Loads price 128 MiB for the graphs. Any false value turns them off; `depth_graphs` in the model diagnostics reports why they are off, captures, replays, fallbacks and graphed and eager frames.",
+    ),
+    CoreEnvVar::new(
         "IZWI_MAYA2_DEVICE_NOISE",
         Flag,
         "true",

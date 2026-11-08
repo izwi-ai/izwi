@@ -20,8 +20,7 @@ use super::guards::{piece_budget, suspend_windows, LoopGuard, Maya2PieceBudget, 
 use super::inputs::Maya2Inputs;
 use super::prompt::{Maya2Prompt, Maya2Reference, Maya2Tokenizer};
 use super::sampling::{
-    depth_counter_gumbel, depth_gumbel, depth_noise_key, device_noise, sample_cb0, Cb0State,
-    Maya2SamplingParams,
+    depth_gumbel, depth_noise_key, device_noise, sample_cb0, Cb0State, Maya2SamplingParams,
 };
 use super::weights::mmap_release;
 use crate::error::{Error, Result};
@@ -205,6 +204,18 @@ impl Maya2Runtime {
         &self.depth
     }
 
+    /// Resolves the depth decoder's CUDA frame graphs for this runtime's
+    /// backbone hidden dtype and the depth policy (see
+    /// [`Maya2Depth::resolve_graphs`]).
+    pub(crate) fn resolve_depth_graphs(&mut self) {
+        let dtype = self.backbone.dtype();
+        self.depth.resolve_graphs(
+            dtype,
+            MAYA2_DEFAULTS.depth_temperature,
+            MAYA2_DEFAULTS.depth_top_k,
+        );
+    }
+
     pub fn mimi(&self) -> &MimiDecoder {
         &self.mimi
     }
@@ -362,30 +373,28 @@ impl Maya2Runtime {
                 break reason;
             }
             // As the engine's decode steps draw it (`retained`).
-            let gumbel = if device_noise(&self.device) {
-                depth_counter_gumbel(
+            let cb0 = Tensor::new(&[draw.code], &self.device)?;
+            let (temperature, top_k) =
+                (MAYA2_DEFAULTS.depth_temperature, MAYA2_DEFAULTS.depth_top_k);
+            let frame = if device_noise(&self.device) {
+                self.depth.generate_frame_keyed(
+                    &hidden,
+                    &cb0,
+                    &cross,
                     &[depth_noise_key(params.seed, frames)],
-                    DEPTH_LEVELS,
-                    CODEBOOK_SIZE,
-                    &self.device,
+                    temperature,
+                    top_k,
                 )?
             } else {
-                depth_gumbel(
+                let gumbel = depth_gumbel(
                     &mut [&mut depth_rng],
                     DEPTH_LEVELS,
                     CODEBOOK_SIZE,
                     &self.device,
-                )?
+                )?;
+                self.depth
+                    .generate_frame(&hidden, &cb0, &cross, &gumbel, temperature, top_k)?
             };
-            let cb0 = Tensor::new(&[draw.code], &self.device)?;
-            let frame = self.depth.generate_frame(
-                &hidden,
-                &cb0,
-                &cross,
-                &gumbel,
-                MAYA2_DEFAULTS.depth_temperature,
-                MAYA2_DEFAULTS.depth_top_k,
-            )?;
             codes.extend(frame.to_vec2::<u32>()?.remove(0));
             frames += 1;
             if frames >= budget.cap {
