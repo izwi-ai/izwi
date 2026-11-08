@@ -2895,7 +2895,9 @@ fn lfm25_audio_asr_factory_publishes_sealed_retained_graph_and_atomic_long_form(
 /// graph (GRN-8). Nemotron's long-form ASR keeps its single-dispatch stage.
 #[test]
 fn granite_speech5_asr_offers_its_retained_graph_and_chunked_atomic_graph() {
-    use crate::models::architectures::granite_speech5::asr::granite_speech5_retained_decode_enabled;
+    use crate::models::architectures::granite_speech5::asr::{
+        granite_speech5_retained_decode_enabled, granite_speech5_test_physical_state_spec,
+    };
     let retained_route = granite_speech5_retained_decode_enabled();
     let registry = RuntimeAdapterRegistry::built_in();
     for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
@@ -2968,6 +2970,41 @@ fn granite_speech5_asr_offers_its_retained_graph_and_chunked_atomic_graph() {
             assert_eq!(normal.stages[0].max_batch_size, 1);
             assert_eq!(normal.stages[1].max_batch_size, 1);
         }
+    }
+    // At four engine rows the encoder batches four requests' audio, padded,
+    // its ceilings four times one request's.
+    if retained_route {
+        let draft = LoadedModelBundleDraft::build(
+            &RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap(),
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(3),
+            ModelVariant::GraniteSpeech502BGguf,
+            BackendKind::Cuda,
+        )
+        .unwrap();
+        install_test_preparation_seals(&draft, BackendKind::Cuda, 4);
+        let normal = draft
+            .capabilities
+            .get(&CapabilityKind::Asr)
+            .unwrap()
+            .contract(StreamingRequirements::NONE)
+            .unwrap();
+        let preparation = &normal.stages[0];
+        assert_eq!(preparation.batch_mode, NativeBatchMode::Static);
+        assert_eq!(preparation.shape_policy, StageShapePolicy::Padded);
+        assert_eq!(preparation.concurrency, ConcurrencyClass::Batchable);
+        assert_eq!(preparation.max_batch_size, 4);
+        assert_eq!(preparation.max_workspace_bytes, 4 * 1024 * 1024 * 1024);
+        assert_eq!(preparation.max_work_units, 4 * 10_000);
+        assert_eq!(normal.stages[1].max_batch_size, 1);
+        let long = draft
+            .capabilities
+            .get(&CapabilityKind::Asr)
+            .unwrap()
+            .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+            .unwrap();
+        granite_speech5_test_physical_state_spec(&[normal.stages.as_ref(), long.stages.as_ref()])
+            .unwrap();
     }
     let nemotron = LoadedModelBundleDraft::build(
         &registry,

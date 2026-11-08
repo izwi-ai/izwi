@@ -596,22 +596,42 @@ impl LoadedExecutionAdapter for GraniteSpeech5AsrExecutionAdapter {
         profile.max_batch_size = self.decode_batch_size;
         profile.resolved_from_loaded_model = true;
 
-        // One request's encode at a time; the encoder batches across
-        // requests once its batch geometry is sealed.
+        // Concurrent requests' audio encodes as one padded batch at the
+        // engine rows, each row priced at the batch's padded geometry.
+        let native_preparation = self.max_batch_size > 1;
         let mut preparation = StageDescriptor::from_execution_profile(
             StageId::new(0),
             "asr.encoder.granite_speech5",
             &profile,
-            NativeBatchMode::None,
+            if native_preparation {
+                NativeBatchMode::Static
+            } else {
+                NativeBatchMode::None
+            },
         );
         preparation.selector = StageWorkSelector::PreSequencePreparation;
         preparation.progress = StageProgressKind::Atomic;
         preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
-        preparation.max_batch_size = 1;
-        preparation.max_work_units = seal.preparation.max_work_units;
-        preparation.max_workspace_bytes = seal.preparation.max_workspace_bytes;
-        preparation.concurrency = ConcurrencyClass::Exclusive;
-        preparation.shape_policy = StageShapePolicy::Exact;
+        if native_preparation {
+            let width = u64::try_from(self.max_batch_size).map_err(|_| {
+                Error::Overloaded("Granite Speech 5.0 batch width exceeds u64".into())
+            })?;
+            let ceiling = |value: u64, what: &str| {
+                value.checked_mul(width).ok_or_else(|| {
+                    Error::Overloaded(format!("Granite Speech 5.0 batch {what} ceiling overflow"))
+                })
+            };
+            preparation.max_batch_size = self.max_batch_size;
+            preparation.max_work_units = ceiling(seal.preparation.max_work_units, "work")?;
+            preparation.max_workspace_bytes =
+                ceiling(seal.preparation.max_workspace_bytes, "workspace")?;
+        } else {
+            preparation.max_batch_size = 1;
+            preparation.max_work_units = seal.preparation.max_work_units;
+            preparation.max_workspace_bytes = seal.preparation.max_workspace_bytes;
+            preparation.concurrency = ConcurrencyClass::Exclusive;
+            preparation.shape_policy = StageShapePolicy::Exact;
+        }
         preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
 
         let mut prefill = StageDescriptor::from_execution_profile(
