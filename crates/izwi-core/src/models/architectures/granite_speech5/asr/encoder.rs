@@ -113,6 +113,42 @@ impl ConformerEncoder {
         Ok(x)
     }
 
+    /// [`Self::forward`] over a padded batch: row `r` holds
+    /// `valid_lengths[r]` frames, zero-padded to the batch's longest. Each
+    /// row's valid frames get its solo encoding up to the rounding of the
+    /// batch's matmul shapes: the rows share one block partition from frame
+    /// 0, padded keys are masked out of attention, padded frames are zeroed
+    /// before the depthwise convolution reads them, and every block leaves
+    /// padded frames at zero.
+    pub(super) fn forward_valid_lengths(
+        &self,
+        input: &Tensor,
+        valid_lengths: &[usize],
+    ) -> Result<Tensor> {
+        let (batch, frames, _) = input.dims3()?;
+        validate_frame_lengths(batch, frames, valid_lengths)?;
+        let x = self.input_linear.forward(input)?;
+        let mask = frame_valid_mask(valid_lengths, frames, x.device(), x.dtype())?;
+        let key_mask = valid_key_mask(
+            valid_lengths,
+            frames.div_ceil(self.context_size().max(1)),
+            self.context_size(),
+            x.device(),
+            x.dtype(),
+        )?;
+        let mut x = x.broadcast_mul(&mask)?;
+        let midpoint = self.layers.len() / 2;
+        for (idx, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_masked(&x, &mask, &key_mask)?;
+            if idx + 1 == midpoint {
+                let mid = ops::softmax_last_dim(&self.out.forward(&x)?)?;
+                let mid = self.out_mid.forward(&mid)?.broadcast_mul(&mask)?;
+                x = x.broadcast_add(&mid)?;
+            }
+        }
+        Ok(x)
+    }
+
     pub(super) fn context_size(&self) -> usize {
         self.layers
             .first()
@@ -204,6 +240,21 @@ impl ConformerBlock {
         out = out.broadcast_add(&(ff2 * 0.5)?)?;
         self.post_norm.forward(&out).map_err(Error::from)
     }
+
+    /// [`Self::forward`] over a padded batch with its `[batch, frames, 1]`
+    /// frame mask and attention key mask; padded frames leave as zeros.
+    fn forward_masked(&self, x: &Tensor, mask: &Tensor, key_mask: &Tensor) -> Result<Tensor> {
+        let ff1 = self.ff1.forward(x)?.broadcast_mul(mask)?;
+        let mut out = x.broadcast_add(&(ff1 * 0.5)?)?;
+        out = out.broadcast_add(&self.attn.forward_masked(&out, mask, key_mask)?)?;
+        out = out.broadcast_add(&self.conv.forward_masked(&out, mask)?)?;
+        let ff2 = self.ff2.forward(&out)?.broadcast_mul(mask)?;
+        out = out.broadcast_add(&(ff2 * 0.5)?)?;
+        self.post_norm
+            .forward(&out)?
+            .broadcast_mul(mask)
+            .map_err(Error::from)
+    }
 }
 
 struct ConformerFeedForward {
@@ -274,6 +325,22 @@ impl ConformerAttention {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.attend(x, None)
+    }
+
+    /// [`Self::forward`] over a padded batch: `key_mask`
+    /// (`[batch, blocks, 1, 1, context]`) keeps each row's queries off its
+    /// padded keys, and `mask` zeroes padded frames' output.
+    fn forward_masked(&self, x: &Tensor, mask: &Tensor, key_mask: &Tensor) -> Result<Tensor> {
+        self.attend(x, Some(key_mask))?
+            .broadcast_mul(mask)
+            .map_err(Error::from)
+    }
+
+    /// Block-local attention. Without `key_mask` the one row's zero-padded
+    /// final block is masked as the solo route has always masked it; with
+    /// it, each row's keys past its valid frames are.
+    fn attend(&self, x: &Tensor, key_mask: Option<&Tensor>) -> Result<Tensor> {
         let x = self.pre_norm.forward(x)?;
         let (batch, seq_len, _) = x.dims3()?;
         let blocks = seq_len.div_ceil(self.context_size);
@@ -308,7 +375,9 @@ impl ConformerAttention {
         let pos_bias = relative_position_bias(&q, &rel)?;
         let scale = 1.0 / (self.dim_head as f64).sqrt();
         let mut scores = (attention_scores(&q, &k)? * scale)?.broadcast_add(&pos_bias)?;
-        if pad > 0 {
+        if let Some(key_mask) = key_mask {
+            scores = scores.broadcast_add(key_mask)?;
+        } else if pad > 0 {
             let mask = padding_mask(
                 self.context_size,
                 seq_len % self.context_size,
@@ -431,6 +500,60 @@ fn padding_mask(
         .map_err(Error::from)
 }
 
+fn validate_frame_lengths(batch: usize, frames: usize, valid_lengths: &[usize]) -> Result<()> {
+    if batch == 0
+        || frames == 0
+        || valid_lengths.len() != batch
+        || valid_lengths
+            .iter()
+            .any(|length| *length == 0 || *length > frames)
+    {
+        return Err(Error::InvalidInput(format!(
+            "Granite Speech 5.0 valid frame lengths {valid_lengths:?} do not fit a batch of {batch} x {frames} frames"
+        )));
+    }
+    Ok(())
+}
+
+/// `[batch, frames, 1]`: 1 for each row's valid frames, 0 for its padding.
+fn frame_valid_mask(
+    valid_lengths: &[usize],
+    frames: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let data = valid_lengths
+        .iter()
+        .flat_map(|&length| (0..frames).map(move |frame| f32::from(u8::from(frame < length))))
+        .collect::<Vec<_>>();
+    Tensor::from_vec(data, (valid_lengths.len(), frames, 1), device)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
+}
+
+/// `[batch, blocks, 1, 1, context]`: `-1e4` on each row's keys past its
+/// valid frames, broadcast over heads and queries. A valid query's scores
+/// get exactly what the solo route adds (0 or the same `-1e4` on its final
+/// block's padding). Built as F32 on the host (Candle's Metal backend
+/// cannot cast F64).
+fn valid_key_mask(
+    valid_lengths: &[usize],
+    blocks: usize,
+    context: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let data = valid_lengths
+        .iter()
+        .flat_map(|&length| {
+            (0..blocks * context).map(move |key| if key < length { 0.0f32 } else { -1e4 })
+        })
+        .collect::<Vec<_>>();
+    Tensor::from_vec(data, (valid_lengths.len(), blocks, 1, 1, context), device)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
+}
+
 struct ConformerConv {
     norm: LayerNorm,
     up_conv: PointwiseConv1d,
@@ -510,8 +633,27 @@ impl ConformerConv {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.convolve(x, None)
+    }
+
+    /// [`Self::forward`] over a padded batch: padded frames enter the
+    /// depthwise convolution as the zeros a solo row is padded with, and
+    /// leave as zeros.
+    fn forward_masked(&self, x: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        let channel_mask = mask.transpose(1, 2)?.contiguous()?;
+        self.convolve(x, Some(&channel_mask))?
+            .broadcast_mul(mask)
+            .map_err(Error::from)
+    }
+
+    /// The module, with `channel_mask` (`[batch, 1, frames]`) applied to the
+    /// GLU output before the depthwise convolution reads it.
+    fn convolve(&self, x: &Tensor, channel_mask: Option<&Tensor>) -> Result<Tensor> {
         let x = self.norm.forward(x)?.transpose(1, 2)?.contiguous()?;
-        let x = glu_channels(&self.up_conv.forward(&x)?)?;
+        let mut x = glu_channels(&self.up_conv.forward(&x)?)?;
+        if let Some(channel_mask) = channel_mask {
+            x = x.broadcast_mul(channel_mask)?;
+        }
         let x = depthwise_conv1d(
             &x,
             &self.depth_weight,
@@ -773,6 +915,135 @@ mod tests {
             return;
         };
         assert_f16_encoder_tracks_cpu_f32(&device);
+    }
+
+    /// The 4-frame-block test encoder with seeded random weights.
+    fn seeded_block_encoder(device: &Device) -> (GraniteSpeech5EncoderConfig, ConformerEncoder) {
+        let config = GraniteSpeech5EncoderConfig {
+            hidden_dim: 16,
+            input_dim: 12,
+            output_dim: 7,
+            dim_head: 4,
+            num_heads: 4,
+            context_size: 4,
+            max_pos_emb: 8,
+            conv_kernel_size: 5,
+            ..tiny_encoder_config()
+        };
+        let vars = VarMap::new();
+        ConformerEncoder::load(
+            &config,
+            VarBuilder::from_varmap(&vars, DType::F32, device),
+            None,
+        )
+        .unwrap();
+        let mut seed = 50;
+        let tensors = vars
+            .data()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, tensor)| {
+                seed += 1;
+                let positive = name.ends_with("running_var") || name.ends_with("norm.weight");
+                let scale = if positive { 0.1 } else { 0.3 };
+                let mut value = xorshift_tensor(tensor.dims(), seed, scale, device).unwrap();
+                if positive {
+                    value = (value.abs().unwrap() + 1.0).unwrap();
+                }
+                (name.clone(), value)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let encoder = ConformerEncoder::load(
+            &config,
+            VarBuilder::from_tensors(tensors, DType::F32, device),
+            None,
+        )
+        .unwrap();
+        (config, encoder)
+    }
+
+    /// Rows of 1 to 13 frames (inside one 4-frame block, at and across block
+    /// boundaries) encoded as one padded batch get each row's solo encoding,
+    /// up to the rounding of the batch's matmul shapes, and padded frames
+    /// leave as zeros.
+    #[test]
+    fn batched_rows_match_each_row_encoded_alone() {
+        let device = Device::Cpu;
+        let (config, encoder) = seeded_block_encoder(&device);
+        let lengths = [1usize, 3, 4, 5, 9, 13];
+        let frames = 13;
+        let rows = lengths
+            .iter()
+            .enumerate()
+            .map(|(row, &length)| {
+                xorshift_tensor(
+                    &[1, length, config.input_dim],
+                    90 + row as u64,
+                    1.0,
+                    &device,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let padded = |fill: f64| {
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    let pad = frames - row.dim(1).unwrap();
+                    let tail = (Tensor::ones((1, pad, config.input_dim), DType::F32, &device)
+                        .unwrap()
+                        * fill)
+                        .unwrap();
+                    Tensor::cat(&[row, &tail], 1).unwrap()
+                })
+                .collect::<Vec<_>>();
+            Tensor::cat(&rows, 0).unwrap()
+        };
+        let batched = encoder
+            .forward_valid_lengths(&padded(0.0), &lengths)
+            .unwrap();
+        assert_eq!(batched.dims(), &[lengths.len(), frames, config.hidden_dim]);
+        for (row, (&length, input)) in lengths.iter().zip(&rows).enumerate() {
+            let alone = encoder.forward(input).unwrap();
+            let together = batched.narrow(0, row, 1).unwrap();
+            assert_close(&together.narrow(1, 0, length).unwrap(), &alone, 1e-4);
+            let padding = together
+                .narrow(1, length, frames - length)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert!(padding.iter().all(|value| *value == 0.0), "row {row}");
+        }
+        // Whatever the padded frames hold, the valid frames are the same.
+        let poisoned = encoder
+            .forward_valid_lengths(&padded(1e3), &lengths)
+            .unwrap();
+        assert_eq!(
+            poisoned.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            batched.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        assert!(encoder
+            .forward_valid_lengths(&padded(0.0), &[1, 3, 4, 5, 9, 14])
+            .is_err());
+    }
+
+    #[test]
+    fn valid_key_mask_masks_each_rows_padded_keys() {
+        let mask = valid_key_mask(&[3, 1], 2, 2, &Device::Cpu, DType::F32).unwrap();
+        assert_eq!(mask.dims(), &[2, 2, 1, 1, 2]);
+        assert_eq!(
+            mask.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![0.0, 0.0, 0.0, -1e4, 0.0, -1e4, -1e4, -1e4]
+        );
+        let frames = frame_valid_mask(&[2, 1], 3, &Device::Cpu, DType::F32).unwrap();
+        assert_eq!(frames.dims(), &[2, 3, 1]);
+        assert_eq!(
+            frames.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![1.0, 1.0, 0.0, 1.0, 0.0, 0.0]
+        );
     }
 
     fn tiny_encoder_config() -> GraniteSpeech5EncoderConfig {

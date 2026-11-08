@@ -396,6 +396,82 @@ impl GraniteSpeech5Runtime {
         ))
     }
 
+    /// [`Self::audio_embeddings`] for several inputs in one encoder and one
+    /// Q-Former pass: the rows are zero-padded to the longest and masked to
+    /// their own frames (`ConformerEncoder::forward_valid_lengths`). One
+    /// input is exactly [`Self::audio_embeddings`].
+    pub fn audio_embeddings_batch(
+        &self,
+        features: &[GraniteSpeech5AudioFeatures],
+    ) -> Result<Vec<(Tensor, GraniteSpeech5AudioStats)>> {
+        if let [single] = features {
+            return self.audio_embeddings(single).map(|output| vec![output]);
+        }
+        let dim = features.first().map_or(0, |row| row.encoder_dim);
+        let frames = features
+            .iter()
+            .map(|row| row.encoder_frames)
+            .max()
+            .unwrap_or(0);
+        if dim == 0
+            || frames == 0
+            || features.iter().any(|row| {
+                row.encoder_frames == 0
+                    || row.encoder_dim != dim
+                    || row.input_features.len() != row.encoder_frames
+                    || row.input_features.iter().any(|frame| frame.len() != dim)
+            })
+        {
+            return Err(Error::InvalidInput(
+                "Granite Speech 5.0 audio batch has inconsistent frame geometry".into(),
+            ));
+        }
+        let valid_lengths = features
+            .iter()
+            .map(|row| row.encoder_frames)
+            .collect::<Vec<_>>();
+        let mut flat = Vec::with_capacity(features.len() * frames * dim);
+        for row in features {
+            for frame in &row.input_features {
+                flat.extend_from_slice(frame);
+            }
+            flat.resize(flat.len() + (frames - row.encoder_frames) * dim, 0.0);
+        }
+        let started = Instant::now();
+        let input = Tensor::from_vec(flat, (features.len(), frames, dim), &self.device)?
+            .to_dtype(self.audio_dtype)?;
+        let upload = started.elapsed();
+        let started = Instant::now();
+        let encoded = self.encoder.forward_valid_lengths(&input, &valid_lengths)?;
+        let encoder = started.elapsed();
+        let started = Instant::now();
+        let embeddings = self
+            .projector
+            .forward_compact_valid_lengths(&encoded, &valid_lengths)?;
+        let projector = started.elapsed();
+        Ok(embeddings
+            .into_iter()
+            .zip(&valid_lengths)
+            .map(|(embeddings, &frames)| {
+                (
+                    embeddings,
+                    GraniteSpeech5AudioStats {
+                        upload,
+                        encoder,
+                        projector,
+                        encoder_frames: frames,
+                        conformer_context_size: self.encoder.context_size(),
+                        conformer_layers: self.encoder.layer_count(),
+                        qformer_windows: self.projector.window_count(frames),
+                        qformer_window_size: self.projector.window_size(),
+                        qformer_queries_per_window: self.projector.num_queries(),
+                        qformer_layers: self.projector.layer_count(),
+                    },
+                )
+            })
+            .collect())
+    }
+
     /// The prompt's token ids with the audio placeholder expanded to one id
     /// per projected audio frame.
     pub(super) fn expanded_input_ids(
