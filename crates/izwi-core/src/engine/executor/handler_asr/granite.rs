@@ -286,6 +286,20 @@ pub(super) fn with_granite_truncation_retry_diagnostics(
     Some(diagnostics)
 }
 
+/// The prepared prompt a retained Granite Speech row starts from.
+enum GraniteRetainedPrompt {
+    Speech41(
+        std::sync::Arc<
+            crate::models::architectures::granite_speech::asr::GraniteSpeechPreparedPromptArtifact,
+        >,
+    ),
+    Speech50(
+        std::sync::Arc<
+            crate::models::architectures::granite_speech5::asr::GraniteSpeech5PreparedPromptArtifact,
+        >,
+    ),
+}
+
 impl NativeExecutor {
     pub(super) fn granite_speech_asr_sequence_request(
         &self,
@@ -297,8 +311,14 @@ impl NativeExecutor {
         let model = request.prepared_asr_model_for_executor()?.ok_or_else(|| {
             Error::InferenceError("Granite Speech sequence lost its loaded model".into())
         })?;
-        if variant.family() != ModelFamily::GraniteSpeechAsr
-            || !model.supports_resumable_prefill()
+        // Granite Speech 4.1 and 5.0 run the same retained sequence: only
+        // their prepared prompt and the model call that starts the row
+        // differ.
+        let family = variant.family();
+        if !matches!(
+            family,
+            ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr
+        ) || !model.supports_resumable_prefill()
             || !model.supports_incremental_decode()
         {
             return Err(Error::InvalidInput(
@@ -353,20 +373,31 @@ impl NativeExecutor {
                     request.id.clone(),
                 )));
             }
-            let artifact = request
-                .prepared_granite_speech_artifact_for_executor()?
-                .ok_or_else(|| {
-                    Error::InferenceError(
-                        "Granite Speech sequence lost its prepared prompt artifact".into(),
-                    )
-                })?;
+            let lost_artifact = || {
+                Error::InferenceError(
+                    "Granite Speech sequence lost its prepared prompt artifact".into(),
+                )
+            };
+            let prompt = if family == ModelFamily::GraniteSpeech5Asr {
+                GraniteRetainedPrompt::Speech50(
+                    request
+                        .prepared_granite_speech5_artifact_for_executor()?
+                        .ok_or_else(lost_artifact)?,
+                )
+            } else {
+                GraniteRetainedPrompt::Speech41(
+                    request
+                        .prepared_granite_speech_artifact_for_executor()?
+                        .ok_or_else(lost_artifact)?,
+                )
+            };
             let (samples, sample_rate) =
                 request.prepared_asr_audio_for_executor()?.ok_or_else(|| {
                     Error::InferenceError("Granite Speech sequence lost decoded audio".into())
                 })?;
             let options = Self::asr_chunk_generation_options(
                 request,
-                ModelFamily::GraniteSpeechAsr,
+                family,
                 samples.len(),
                 sample_rate,
                 &Self::asr_generation_options(request),
@@ -374,8 +405,11 @@ impl NativeExecutor {
                     .zip(model.audio_token_rate()),
             );
             let Some(decode_state) = run_asr_model_call(request, || {
-                Self::run_blocking(|| {
-                    model.start_granite_speech_resumable_prefill_managed(artifact, options, cache)
+                Self::run_blocking(|| match prompt {
+                    GraniteRetainedPrompt::Speech41(artifact) => model
+                        .start_granite_speech_resumable_prefill_managed(artifact, options, cache),
+                    GraniteRetainedPrompt::Speech50(artifact) => model
+                        .start_granite_speech5_resumable_prefill_managed(artifact, options, cache),
                 })
             })?
             else {

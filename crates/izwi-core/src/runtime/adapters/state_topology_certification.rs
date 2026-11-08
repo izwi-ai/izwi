@@ -262,8 +262,9 @@ fn certified_topology(
         (ParakeetAsr, Asr) => RetainedTensorAndInvocationTensor,
         (GraniteSpeechAsr, Asr) => RetainedPagedAndInvocationPaged,
         (GraniteSpeechAsr, SpeakerAttributedAsr) => InvocationPaged,
-        // Granite Speech 5.0 runs one atomic invocation on leased pages.
-        (GraniteSpeech5Asr, Asr) => InvocationPaged,
+        // Granite Speech 5.0 retains decoder pages for single-segment rows;
+        // long audio leases them for one atomic invocation per chunk.
+        (GraniteSpeech5Asr, Asr) => RetainedPagedAndInvocationPaged,
         // Nemotron 3.5 Transcribe rows commit attention pages, the Mamba SSM
         // state and the convolution history as one transaction; each stage
         // leases its activations as per-row scratch.

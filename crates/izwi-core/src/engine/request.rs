@@ -30,6 +30,7 @@ use crate::models::architectures::fish_drama3::{
 };
 use crate::models::architectures::fish_s2::{FishS2GenerationParams, FishS2PreparedArtifact};
 use crate::models::architectures::granite_speech::asr::GraniteSpeechPreparedPromptArtifact;
+use crate::models::architectures::granite_speech5::asr::GraniteSpeech5PreparedPromptArtifact;
 use crate::models::architectures::kokoro::KokoroPreparedRequest;
 use crate::models::architectures::lfm25_audio::{
     lfm25_audio_tts_system_prompt, model::Lfm25AudioPreparedAsrArtifact,
@@ -929,6 +930,7 @@ enum PreparedAsrEncoderArtifactValue {
     Whisper(Arc<WhisperPreparedWindow>),
     VibeVoice(Arc<VibeVoiceAsrPreparedArtifact>),
     GraniteSpeech(Arc<GraniteSpeechPreparedPromptArtifact>),
+    GraniteSpeech5(Arc<GraniteSpeech5PreparedPromptArtifact>),
     Lfm25Audio(Arc<Lfm25AudioPreparedAsrArtifact>),
     Parakeet(Arc<ParakeetPreparedEncoderArtifact>),
     Nemotron(Arc<NemotronPreparedEncoderArtifact>),
@@ -953,6 +955,7 @@ impl crate::backends::DeviceResident for PreparedAsrEncoderArtifactValue {
             Self::Whisper(value) => value.device_location(),
             Self::VibeVoice(value) => Some(value.device_location()),
             Self::GraniteSpeech(value) => Some(value.device_location()),
+            Self::GraniteSpeech5(value) => Some(value.device_location()),
             Self::Lfm25Audio(value) => Some(value.device_location()),
             Self::Parakeet(value) => Some(value.device_location()),
             Self::Nemotron(value) => Some(value.device_location()),
@@ -968,6 +971,7 @@ impl PreparedAsrEncoderArtifactValue {
             Self::Whisper(_) => "whisper",
             Self::VibeVoice(_) => "vibevoice",
             Self::GraniteSpeech(_) => "granite_speech",
+            Self::GraniteSpeech5(_) => "granite_speech5",
             Self::Lfm25Audio(_) => "lfm25_audio",
             Self::Parakeet(_) => "parakeet",
             Self::Nemotron(_) => "nemotron",
@@ -985,6 +989,9 @@ impl PreparedAsrEncoderArtifactValue {
             Self::GraniteSpeech(value) => {
                 Ok((value.resident_host_bytes(), value.resident_tensor_bytes()?))
             }
+            Self::GraniteSpeech5(value) => {
+                Ok((value.resident_host_bytes(), value.resident_tensor_bytes()?))
+            }
             Self::Lfm25Audio(value) => {
                 Ok((value.retained_host_bytes, value.retained_resident_bytes))
             }
@@ -1000,6 +1007,7 @@ impl PreparedAsrEncoderArtifactValue {
             Self::Qwen3(_)
             | Self::Whisper(_)
             | Self::GraniteSpeech(_)
+            | Self::GraniteSpeech5(_)
             | Self::Lfm25Audio(_)
             | Self::Parakeet(_)
             | Self::Nemotron(_)

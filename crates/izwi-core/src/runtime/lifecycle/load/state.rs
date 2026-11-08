@@ -275,6 +275,104 @@ impl ModelLifecycleController {
         Ok(publications)
     }
 
+    /// Publish the state Granite Speech 5.0's ASR graphs need, as
+    /// `physical_state_spec` authors it for them: retained decoder pages
+    /// for its retained sequence graph (none when the route is off, GRN-8)
+    /// beside the atomic graph's invocation pages.
+    pub(super) async fn load_granite_speech5_state_publication(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        bundle_draft: &LoadedModelBundleDraft,
+        physical_state_spec: impl Fn(
+            &[&[StageDescriptor]],
+        ) -> Result<
+            crate::models::architectures::granite_speech5::asr::GraniteSpeech5PhysicalStateSpec,
+        >,
+    ) -> Result<LoadedStatePublication> {
+        let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
+        let stage_graphs = contracts
+            .iter()
+            .map(|contract| contract.stages.as_ref())
+            .collect::<Vec<_>>();
+        let physical_spec = physical_state_spec(&stage_graphs)?;
+        let (retained, retained_uses) = match (
+            physical_spec.retained.as_ref(),
+            physical_spec.retained_max_tokens,
+        ) {
+            (Some(retained_contract), Some(context_tokens)) => {
+                // Every row claims its pages from one shared pool, so it
+                // holds one automatic sequence (a 30 s chunk's prompt, audio
+                // and budget) per retained row, and never less than one
+                // sequence of the decoder's whole context.
+                let rows = self.asr_state_rows(bundle_draft)?;
+                let retained = self
+                    .core_engine
+                    .load_managed_model_state_with_portable_copies(
+                        model_instance_id,
+                        retained_contract,
+                        Some(asr_shared_pool_tokens(
+                            context_tokens,
+                            asr_minimum_tokens(variant),
+                            rows.0,
+                        )),
+                        2,
+                        rows,
+                        asr_minimum_tokens(variant),
+                    )
+                    .await?;
+                // One sequence never reaches past the decoder's context.
+                self.model_registry.publish_effective_context(
+                    variant,
+                    retained.logical_token_reach().min(context_tokens as u64),
+                )?;
+                self.model_registry.publish_kv_storage(variant, &retained);
+                crate::runtime::rollout::validate_managed_state_plan_eligibility(
+                    variant,
+                    CapabilityKind::Asr,
+                    retained.state_plan_v2(),
+                )?;
+                let uses = contracts
+                    .iter()
+                    .map(|contract| {
+                        let graph = stage_graph_fingerprint(&contract.stages)?;
+                        let use_kind = match contract.execution_profile.mode {
+                            crate::engine::ExecutionMode::Sequence => {
+                                RetainedStateUseV2::ExternalPaged
+                            }
+                            crate::engine::ExecutionMode::Atomic => {
+                                RetainedStateUseV2::Inactive
+                            }
+                            _ => {
+                                return Err(Error::ModelLoadError(
+                                    "Granite Speech 5.0 ASR graph has an incompatible retained-state profile"
+                                        .into(),
+                                ));
+                            }
+                        };
+                        Ok((graph, use_kind))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
+                (Some(retained.into()), uses)
+            }
+            (None, None) => (None, HashMap::new()),
+            _ => {
+                return Err(Error::ModelLoadError(
+                    "Granite Speech 5.0 retained state has no context bound".into(),
+                ));
+            }
+        };
+        self.load_invocation_workspace_publication(
+            model_instance_id,
+            &contracts,
+            physical_spec.descriptor,
+            &physical_spec.invocation,
+            retained,
+            retained_uses,
+        )
+        .await
+    }
+
     /// Offline ASR (every family but Granite Speech): retained and invocation
     /// state per loaded ASR capability.
     pub(super) async fn allocate_asr_state(
@@ -715,28 +813,23 @@ impl ModelLifecycleController {
                         .await?;
                     state_publications.insert(CapabilityKind::Asr, publication);
                 } else if publication_route == LoadedAsrStatePublicationRoute::GraniteSpeech5 {
-                    // One atomic invocation per request on leased decoder
-                    // pages of the model's full context.
+                    // Single segments decode as retained rows on managed
+                    // decoder pages; long audio runs one atomic invocation
+                    // per chunk on leased decoder pages of the model's full
+                    // context. With the retained route off the capability
+                    // offers only the atomic graph and no retained state is
+                    // fitted (GRN-8).
                     if !managed_kv_backend_compiled(backend) {
                         return Err(Error::ModelLoadError(format!(
                             "loaded model {variant} requires physical ASR invocation state, but the {backend:?} build has no direct paged-attention runtime"
                         )));
                     }
-                    let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
-                    let stage_graphs = contracts
-                        .iter()
-                        .map(|contract| contract.stages.as_ref())
-                        .collect::<Vec<_>>();
-                    let physical_spec =
-                        loaded.granite_speech5_physical_state_spec(&stage_graphs)?;
                     let publication = self
-                        .load_invocation_workspace_publication(
+                        .load_granite_speech5_state_publication(
+                            variant,
                             model_instance_id,
-                            &contracts,
-                            physical_spec.descriptor,
-                            &physical_spec.invocation,
-                            None,
-                            HashMap::new(),
+                            bundle_draft,
+                            |graphs| loaded.granite_speech5_physical_state_spec(graphs),
                         )
                         .await?;
                     state_publications.insert(CapabilityKind::Asr, publication);

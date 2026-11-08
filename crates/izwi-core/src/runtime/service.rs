@@ -73,6 +73,10 @@ use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechPreparationBatchRow, GraniteSpeechPreparedGeometry,
     GraniteSpeechPreparedPromptArtifact,
 };
+use crate::models::architectures::granite_speech5::asr::{
+    GraniteSpeech5AsrModel, GraniteSpeech5PreparationBatchRow, GraniteSpeech5PreparedGeometry,
+    GraniteSpeech5PreparedPromptArtifact, GraniteSpeech5RequestOptions,
+};
 use crate::models::architectures::kokoro::kokoro_output_budget;
 use crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload;
 use crate::models::architectures::maya1::{
@@ -149,7 +153,8 @@ mod tts_preparation;
 #[cfg(test)]
 use asr_encoders::granite_speech_deadline_budget_bucket;
 use asr_encoders::{
-    GraniteSpeechEncoderBatcher, GraniteSpeechEncoderPending, NemotronEncoderBatcher,
+    GraniteSpeech5EncoderBatcher, GraniteSpeech5EncoderPending, GraniteSpeechEncoderBatcher,
+    GraniteSpeechEncoderPending, NemotronEncoderBatcher,
     NemotronEncoderPending, ParakeetEncoderBatcher, ParakeetEncoderPending, QwenAsrEncoderBatcher,
     QwenAsrEncoderPending, VibeVoiceEncoderBatcher, VibeVoiceEncoderPending, WhisperEncoderBatcher,
     WhisperEncoderPending,
@@ -987,6 +992,7 @@ pub struct RuntimeService {
     whisper_encoder_batcher: Arc<WhisperEncoderBatcher>,
     vibevoice_encoder_batcher: Arc<VibeVoiceEncoderBatcher>,
     granite_speech_encoder_batcher: Arc<GraniteSpeechEncoderBatcher>,
+    granite_speech5_encoder_batcher: Arc<GraniteSpeech5EncoderBatcher>,
     parakeet_encoder_batcher: Arc<ParakeetEncoderBatcher>,
     nemotron_encoder_batcher: Arc<NemotronEncoderBatcher>,
     /// Long-form chunk rows in flight across every file (see
@@ -1089,6 +1095,18 @@ fn bind_request_to_residency(
     {
         return Err(Error::InvalidInput(
             "Granite Speech normal execution shape has no matching prepared artifact".into(),
+        ));
+    }
+    if request.model_variant.is_some_and(|variant| {
+        variant.family() == ModelFamily::GraniteSpeech5Asr
+            && request.prepared_asr_execution_shape().is_some()
+            && !request.uses_asr_long_form_atomic()
+    }) && request
+        .prepared_granite_speech5_artifact_for_executor()?
+        .is_none()
+    {
+        return Err(Error::InvalidInput(
+            "Granite Speech 5.0 normal execution shape has no matching prepared artifact".into(),
         ));
     }
     if request.model_variant.is_some_and(|variant| {

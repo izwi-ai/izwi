@@ -1,4 +1,5 @@
-//! Sequence ASR execution adapters: Granite Speech, VibeVoice and Whisper.
+//! Sequence ASR execution adapters: Granite Speech 4.1 and 5.0, VibeVoice
+//! and Whisper.
 
 use super::*;
 
@@ -346,6 +347,303 @@ impl LoadedExecutionAdapter for GraniteSpeechAsrExecutionAdapter {
             })?)
             .ok_or_else(|| {
                 Error::Overloaded("Granite Speech ASR decode workspace overflow".into())
+            })?;
+        preparation.validate()?;
+        prefill.validate()?;
+        decode.validate()?;
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id(),
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata,
+            execution_profile: profile,
+            stages: Arc::from([preparation, prefill, decode]),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct GraniteSpeech5AsrExecutionSeal {
+    pub(super) preparation:
+        crate::models::architectures::granite_speech5::asr::GraniteSpeech5AsrPreparationStageSeal,
+    pub(super) decode_workspace_per_row_bytes: u64,
+}
+
+/// Granite Speech 5.0's ASR graphs: a retained sequence graph (encoder
+/// preparation, scalar exact prefill, continuous decode) for single-segment
+/// requests, and the chunked atomic graph for long audio. With the retained
+/// route off (`IZWI_GRANITE_SPEECH5_RETAINED_DECODE`) the atomic graph is
+/// the only graph and the load fits no retained state (GRN-8).
+#[derive(Debug)]
+pub(super) struct GraniteSpeech5AsrExecutionAdapter {
+    pub(super) execution_group_id: ExecutionGroupId,
+    pub(super) model_instance_id: ModelInstanceId,
+    pub(super) adapter_instance_id: AdapterInstanceId,
+    pub(super) metadata: AdapterMetadata,
+    pub(super) backend_kind: BackendKind,
+    /// The encoder preparation's width: the engine rows.
+    pub(super) max_batch_size: usize,
+    /// The continuous decode's width, at least `max_batch_size`.
+    pub(super) decode_batch_size: usize,
+    pub(super) retained_route: bool,
+    pub(super) seal: OnceLock<GraniteSpeech5AsrExecutionSeal>,
+}
+
+impl GraniteSpeech5AsrExecutionAdapter {
+    pub(super) fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        max_batch_size: usize,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
+            retained_route:
+                crate::models::architectures::granite_speech5::asr::granite_speech5_retained_decode_enabled(),
+            seal: OnceLock::new(),
+        }
+    }
+
+    /// Decode up to `rows` rows per step; the encoder preparation keeps the
+    /// width the adapter was built with.
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
+    }
+
+    pub(super) fn install_preparation_seal(
+        &self,
+        seal: GraniteSpeech5AsrExecutionSeal,
+    ) -> Result<()> {
+        if let Some(existing) = self.seal.get() {
+            return if existing.preparation == seal.preparation
+                && existing.decode_workspace_per_row_bytes == seal.decode_workspace_per_row_bytes
+            {
+                Ok(())
+            } else {
+                Err(Error::ModelLoadError(
+                    "Granite Speech 5.0 ASR preparation was resealed with different geometry"
+                        .into(),
+                ))
+            };
+        }
+        self.seal.set(seal).map_err(|_| {
+            Error::ModelLoadError(
+                "Granite Speech 5.0 ASR preparation seal raced publication".into(),
+            )
+        })
+    }
+
+    /// The chunked atomic graph: every long file, and every request with the
+    /// retained route off.
+    fn atomic_contract(
+        &self,
+        metadata: AdapterMetadata,
+        streaming: StreamingRequirements,
+    ) -> Result<LoadedExecutionContract> {
+        let mut profile = scalar_execution_profile(metadata, self.backend_kind);
+        profile.mode = ExecutionMode::Atomic;
+        profile.prefill = PrefillMode::None;
+        profile.incremental_decode = false;
+        profile.prefill_batch = NativeBatchMode::None;
+        profile.decode_batch = NativeBatchMode::None;
+        profile.cache_mode = CacheMode::None;
+        profile.cache_namespace = None;
+        profile.kv_dtype = "none".into();
+        profile.cancellation = CancellationGranularity::OperationBoundary;
+        profile.concurrency = ConcurrencyClass::Exclusive;
+        profile.recompute_safe = false;
+        profile.cache_release_safe = false;
+        profile.prefix_reuse_safe = false;
+        profile.max_batch_size = 1;
+        profile.resolved_from_loaded_model = true;
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            "asr.granite_speech5.long_form.atomic",
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.selector = StageWorkSelector::Atomic;
+        stage.shape_policy = StageShapePolicy::Exact;
+        stage.output_visibility = output_visibility_for(
+            streaming.transport_output,
+            profile.mode,
+            NativeBatchMode::None,
+        );
+        dispatch_long_form_asr_by_chunk(
+            &mut stage,
+            &metadata,
+            "asr.granite_speech5.long_form.chunked",
+        );
+        stage.validate()?;
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id(),
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata,
+            execution_profile: profile,
+            stages: Arc::from([stage]),
+        })
+    }
+}
+
+impl LoadedExecutionAdapter for GraniteSpeech5AsrExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        GRANITE_SPEECH5_ASR_ADAPTER_ABI
+    }
+
+    fn seal_granite_speech5_asr_preparation(
+        &self,
+        model: &crate::models::architectures::granite_speech5::asr::GraniteSpeech5AsrModel,
+    ) -> Result<()> {
+        self.install_preparation_seal(GraniteSpeech5AsrExecutionSeal {
+            preparation: model.scalar_preparation_stage_seal(self.backend_kind)?,
+            decode_workspace_per_row_bytes: model.continuous_decode_workspace_per_row_bytes()?,
+        })
+    }
+
+    #[cfg(test)]
+    fn install_test_preparation_seal(
+        &self,
+        backend: BackendKind,
+        _max_batch_size: usize,
+    ) -> Result<()> {
+        self.install_preparation_seal(GraniteSpeech5AsrExecutionSeal {
+            preparation:
+                crate::models::architectures::granite_speech5::asr::GraniteSpeech5AsrPreparationStageSeal {
+                    backend,
+                    dtype: "f32".into(),
+                    max_work_units: 10_000,
+                    max_materialized_tensor_elements_per_row: 2_000_000,
+                    max_workspace_bytes: 1024 * 1024 * 1024,
+                },
+            decode_workspace_per_row_bytes: 8_192,
+        })
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        let metadata = self.metadata();
+        // Both graphs stream text as they decode: the atomic graph per
+        // token, the retained graph per committed quantum.
+        if streaming.model_native && metadata.streaming_mode == StreamingMode::None {
+            return Err(Error::InvalidInput(format!(
+                "Model {} has no streaming ASR contract",
+                metadata.model_variant
+            )));
+        }
+        // Without its retained route the atomic graph is the capability's
+        // only graph, so every requirement re-seals it (identical identities).
+        if streaming.asr_long_form || !self.retained_route {
+            return self.atomic_contract(metadata, streaming);
+        }
+        let seal = self.seal.get().ok_or_else(|| {
+            Error::ModelLoadError(
+                "Granite Speech 5.0 ASR retained graph is unavailable before preparation is sealed"
+                    .into(),
+            )
+        })?;
+        if seal.preparation.backend != self.backend_kind
+            || seal.preparation.dtype.is_empty()
+            || seal.decode_workspace_per_row_bytes == 0
+            || seal.preparation.max_work_units == 0
+            || seal.preparation.max_materialized_tensor_elements_per_row == 0
+            || seal.preparation.max_workspace_bytes == 0
+        {
+            return Err(Error::ModelLoadError(
+                "Granite Speech 5.0 ASR preparation seal does not match its loaded adapter identity"
+                    .into(),
+            ));
+        }
+        let mut profile = scalar_execution_profile(metadata, self.backend_kind);
+        profile.mode = ExecutionMode::Sequence;
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        profile.prefill_batch = NativeBatchMode::None;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.cache_namespace = Some(format!(
+            "{}:{}:state-v2",
+            metadata.model_variant,
+            self.backend_kind.as_str()
+        ));
+        profile.kv_dtype = "state_v2_resolved".into();
+        profile.cancellation = CancellationGranularity::SequenceStep;
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.recompute_safe = true;
+        profile.cache_release_safe = true;
+        profile.prefix_reuse_safe = false;
+        // The encoder batches at the engine rows and the decode at its own
+        // width; the prompt prefill stays scalar.
+        profile.max_batch_size = self.decode_batch_size;
+        profile.resolved_from_loaded_model = true;
+
+        // One request's encode at a time; the encoder batches across
+        // requests once its batch geometry is sealed.
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            "asr.encoder.granite_speech5",
+            &profile,
+            NativeBatchMode::None,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
+        preparation.max_batch_size = 1;
+        preparation.max_work_units = seal.preparation.max_work_units;
+        preparation.max_workspace_bytes = seal.preparation.max_workspace_bytes;
+        preparation.concurrency = ConcurrencyClass::Exclusive;
+        preparation.shape_policy = StageShapePolicy::Exact;
+        preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "asr.granite_speech5.prefill.scalar",
+            &profile,
+            NativeBatchMode::None,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.max_batch_size = 1;
+        prefill.concurrency = ConcurrencyClass::Exclusive;
+        prefill.shape_policy = StageShapePolicy::Exact;
+
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            "asr.granite_speech5.decode.tensor_continuous",
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.max_work_units = u64::try_from(decode.max_batch_size).map_err(|_| {
+            Error::Overloaded("Granite Speech 5.0 ASR batch width exceeds work accounting".into())
+        })?;
+        let decode_workspace_per_row =
+            continuous_asr_workspace_per_row_bytes(seal.decode_workspace_per_row_bytes)?;
+        decode.workspace_per_row_bytes = decode_workspace_per_row;
+        decode.max_workspace_bytes = decode_workspace_per_row
+            .checked_mul(u64::try_from(self.decode_batch_size).map_err(|_| {
+                Error::Overloaded("Granite Speech 5.0 ASR batch width exceeds u64".into())
+            })?)
+            .ok_or_else(|| {
+                Error::Overloaded("Granite Speech 5.0 ASR decode workspace overflow".into())
             })?;
         preparation.validate()?;
         prefill.validate()?;

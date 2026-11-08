@@ -80,9 +80,10 @@ pub use prompt::{
     GRANITE_SPEECH5_TRANSLATION_TARGETS,
 };
 pub(crate) use retained::{
-    GraniteSpeech5DecodeCheckpoint, GraniteSpeech5DecodeState, GraniteSpeech5DecodeStep,
-    GraniteSpeech5PreparationBatchGeometry, GraniteSpeech5PreparationBatchRow,
-    GraniteSpeech5PreparedGeometry, GraniteSpeech5PreparedPromptArtifact,
+    GraniteSpeech5AsrPreparationStageSeal, GraniteSpeech5DecodeCheckpoint,
+    GraniteSpeech5DecodeState, GraniteSpeech5DecodeStep, GraniteSpeech5PreparationBatchGeometry,
+    GraniteSpeech5PreparationBatchRow, GraniteSpeech5PreparedGeometry,
+    GraniteSpeech5PreparedPromptArtifact,
 };
 pub use runtime::{
     GraniteSpeech5AudioStats, GraniteSpeech5Generation, GraniteSpeech5GenerationStats,

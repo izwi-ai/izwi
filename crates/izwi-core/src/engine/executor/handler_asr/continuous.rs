@@ -233,7 +233,10 @@ impl NativeExecutor {
         let batch_family = Self::resolve_variant(ordered_requests[live_indices[0]])?.family();
         if !matches!(
             batch_family,
-            ModelFamily::Qwen3Asr | ModelFamily::VibeVoiceAsr | ModelFamily::GraniteSpeechAsr
+            ModelFamily::Qwen3Asr
+                | ModelFamily::VibeVoiceAsr
+                | ModelFamily::GraniteSpeechAsr
+                | ModelFamily::GraniteSpeech5Asr
         ) {
             return Err(Error::InvalidInput(
                 "continuous ASR batch contains a model without retained tensor decode".into(),

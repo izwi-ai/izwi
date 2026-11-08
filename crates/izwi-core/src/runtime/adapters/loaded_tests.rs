@@ -1262,7 +1262,11 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                     let vibevoice_asr = execution.metadata().capability == CapabilityKind::Asr
                         && variant.family() == crate::catalog::ModelFamily::VibeVoiceAsr;
                     let granite_asr = execution.metadata().capability == CapabilityKind::Asr
-                        && variant.family() == crate::catalog::ModelFamily::GraniteSpeechAsr;
+                        && matches!(
+                            variant.family(),
+                            crate::catalog::ModelFamily::GraniteSpeechAsr
+                                | crate::catalog::ModelFamily::GraniteSpeech5Asr
+                        );
                     let whisper_asr = execution.metadata().capability == CapabilityKind::Asr
                         && variant.family() == crate::catalog::ModelFamily::WhisperAsr;
                     let lfm_audio_asr = execution.metadata().capability
@@ -2883,13 +2887,16 @@ fn lfm25_audio_asr_factory_publishes_sealed_retained_graph_and_atomic_long_form(
     }
 }
 
-/// Granite Speech 5.0 runs on the scalar adapter, whose ASR graph is the
-/// chunked atomic stage for every request: a long file dispatches one chunk
-/// at a time (it used to hold the device for the whole file), and the normal
-/// and long-form requirements seal the same graph, so the load keeps one
-/// invocation pool. Nemotron's long-form ASR keeps its single-dispatch stage.
+/// Granite Speech 5.0's normal requirement (with or without native
+/// streaming) binds its retained sequence graph: scalar encoder
+/// preparation, scalar exact prefill, and continuous decode priced per row.
+/// A long-form requirement binds the chunked atomic stage, which dispatches
+/// one chunk at a time; with the retained route switched off it is the only
+/// graph (GRN-8). Nemotron's long-form ASR keeps its single-dispatch stage.
 #[test]
-fn granite_speech5_scalar_asr_dispatches_one_chunk_at_a_time() {
+fn granite_speech5_asr_offers_its_retained_graph_and_chunked_atomic_graph() {
+    use crate::models::architectures::granite_speech5::asr::granite_speech5_retained_decode_enabled;
+    let retained_route = granite_speech5_retained_decode_enabled();
     let registry = RuntimeAdapterRegistry::built_in();
     for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
         let draft = LoadedModelBundleDraft::build(
@@ -2900,27 +2907,67 @@ fn granite_speech5_scalar_asr_dispatches_one_chunk_at_a_time() {
             backend,
         )
         .unwrap();
+        install_test_preparation_seals(&draft, backend, 1);
         let adapter = draft.capabilities.get(&CapabilityKind::Asr).unwrap();
-        let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
         let long = adapter
             .contract(StreamingRequirements::NONE.with_asr_long_form(true))
             .unwrap();
-        for contract in [&normal, &long] {
-            assert_eq!(contract.execution_profile.mode, ExecutionMode::Atomic);
-            assert_eq!(contract.stages.len(), 1);
-            let stage = &contract.stages[0];
-            assert_eq!(stage.name, "asr.long_form.chunked", "{backend:?}");
-            assert_eq!(stage.selector, StageWorkSelector::Atomic);
-            assert_eq!(stage.progress, StageProgressKind::Iterative);
-            assert_eq!(
-                stage.membership_safe_point,
-                MembershipSafePoint::QuantumBoundary
-            );
-        }
+        assert_eq!(long.execution_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(long.stages.len(), 1);
+        let stage = &long.stages[0];
+        assert_eq!(stage.name, "asr.granite_speech5.long_form.chunked");
+        assert_eq!(stage.selector, StageWorkSelector::Atomic);
+        assert_eq!(stage.progress, StageProgressKind::Iterative);
         assert_eq!(
-            crate::kv::v2::stage_graph_fingerprint(&normal.stages).unwrap(),
-            crate::kv::v2::stage_graph_fingerprint(&long.stages).unwrap(),
+            stage.membership_safe_point,
+            MembershipSafePoint::QuantumBoundary
         );
+        for streaming in [
+            StreamingRequirements::NONE,
+            StreamingRequirements::transport_only(),
+            StreamingRequirements::native(true),
+        ] {
+            let normal = adapter.contract(streaming).unwrap();
+            if !retained_route {
+                assert_eq!(
+                    crate::kv::v2::stage_graph_fingerprint(&normal.stages).unwrap(),
+                    crate::kv::v2::stage_graph_fingerprint(&long.stages).unwrap(),
+                );
+                continue;
+            }
+            assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
+            let names = normal
+                .stages
+                .iter()
+                .map(|stage| (stage.name.as_str(), stage.selector))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                vec![
+                    (
+                        "asr.encoder.granite_speech5",
+                        StageWorkSelector::PreSequencePreparation
+                    ),
+                    (
+                        "asr.granite_speech5.prefill.scalar",
+                        StageWorkSelector::SequencePrefill
+                    ),
+                    (
+                        "asr.granite_speech5.decode.tensor_continuous",
+                        StageWorkSelector::SequenceDecode
+                    ),
+                ]
+            );
+            let decode = &normal.stages[2];
+            assert_eq!(decode.batch_mode, NativeBatchMode::Continuous);
+            assert!(decode.workspace_per_row_bytes > 0);
+            assert_eq!(
+                decode.max_workspace_bytes,
+                decode.workspace_per_row_bytes * decode.max_batch_size as u64
+            );
+            assert_eq!(normal.stages[0].max_batch_size, 1);
+            assert_eq!(normal.stages[1].max_batch_size, 1);
+        }
     }
     let nemotron = LoadedModelBundleDraft::build(
         &registry,

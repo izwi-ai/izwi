@@ -57,7 +57,8 @@ use realtime::{
     VoxtralRealtimeExecutionAdapter,
 };
 use sequence_asr::{
-    GraniteSpeechAsrExecutionAdapter, VibeVoiceAsrExecutionAdapter, WhisperAsrExecutionAdapter,
+    GraniteSpeech5AsrExecutionAdapter, GraniteSpeechAsrExecutionAdapter,
+    VibeVoiceAsrExecutionAdapter, WhisperAsrExecutionAdapter,
 };
 use tts::{
     ChatterboxTtsExecutionAdapter, FishDrama3TtsExecutionAdapter, FishS2TtsExecutionAdapter,
@@ -75,6 +76,7 @@ const CONTINUOUS_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1
 const WHISPER_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(18);
 const VIBEVOICE_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(19);
 const GRANITE_SPEECH_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(22);
+const GRANITE_SPEECH5_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const LFM25_AUDIO_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(23);
 const LFM25_AUDIO_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(24);
 const VIBEVOICE_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(26);
@@ -376,6 +378,15 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
     ) -> Result<()> {
         Err(Error::ModelLoadError(
             "loaded adapter does not own Granite Speech ASR preparation".into(),
+        ))
+    }
+
+    fn seal_granite_speech5_asr_preparation(
+        &self,
+        _model: &crate::models::architectures::granite_speech5::asr::GraniteSpeech5AsrModel,
+    ) -> Result<()> {
+        Err(Error::ModelLoadError(
+            "loaded adapter does not own Granite Speech 5.0 ASR preparation".into(),
         ))
     }
 

@@ -2982,6 +2982,7 @@ impl NativeAsrModel {
             Self::Qwen3(_) => true,
             Self::NemotronTranscribe(_) => true,
             Self::GraniteSpeech(model) => model.supports_incremental_decode(),
+            Self::GraniteSpeech5(model) => model.supports_incremental_decode(),
             _ => false,
         }
     }
@@ -2991,6 +2992,7 @@ impl NativeAsrModel {
             Self::Qwen3(model) => model.supports_resumable_prefill(),
             Self::VibeVoice(_) => true,
             Self::GraniteSpeech(model) => model.supports_resumable_prefill(),
+            Self::GraniteSpeech5(model) => model.supports_resumable_prefill(),
             Self::NemotronTranscribe(_) => true,
             _ => false,
         }
@@ -3002,9 +3004,9 @@ impl NativeAsrModel {
             Self::Parakeet(_) | Self::Nemotron(_) => true,
             Self::VibeVoice(model) => model.supports_continuous_decode_batch(),
             Self::GraniteSpeech(model) => model.supports_continuous_decode_batch(),
+            Self::GraniteSpeech5(model) => model.supports_continuous_decode_batch(),
             Self::NemotronTranscribe(_) => true,
             Self::WhisperTurbo(model) => model.supports_continuous_decode_batch(),
-            _ => false,
         }
     }
 
@@ -3024,6 +3026,7 @@ impl NativeAsrModel {
                 self,
                 Self::VibeVoice(_)
                     | Self::GraniteSpeech(_)
+                    | Self::GraniteSpeech5(_)
                     | Self::NemotronTranscribe(_)
                     | Self::WhisperTurbo(_)
             )
@@ -3037,6 +3040,7 @@ impl NativeAsrModel {
             ),
             Self::VibeVoice(model) => model.continuous_decode_workspace_per_row_bytes(),
             Self::GraniteSpeech(model) => model.continuous_decode_workspace_per_row_bytes(),
+            Self::GraniteSpeech5(model) => model.continuous_decode_workspace_per_row_bytes(),
             Self::NemotronTranscribe(model) => Ok(model.decode_workspace_per_row_bytes()),
             Self::WhisperTurbo(model) => model.continuous_decode_workspace_per_row_bytes(),
             _ => Err(Error::InvalidInput(

@@ -1,6 +1,6 @@
-//! Cross-request ASR encoder batchers: Qwen3-ASR, Whisper, Granite Speech,
-//! VibeVoice, Parakeet and Nemotron encoder work queued by request
-//! preparation and run as one batch.
+//! Cross-request ASR encoder batchers: Qwen3-ASR, Whisper, Granite Speech
+//! 4.1 and 5.0, VibeVoice, Parakeet and Nemotron encoder work queued by
+//! request preparation and run as one batch.
 
 use super::*;
 
@@ -244,6 +244,36 @@ pub(super) struct GraniteSpeechEncoderBatcher {
     pub(super) coordinator: Arc<InferenceCoordinator>,
     pub(super) formation:
         EncoderBatchFormation<GraniteSpeechEncoderQueueKey, GraniteSpeechEncoderPending>,
+}
+
+pub(super) type GraniteSpeech5EncoderOutcome = PreparationRowOutcome<Arc<GraniteSpeech5PreparedPromptArtifact>>;
+
+pub(super) struct GraniteSpeech5EncoderPending {
+    pub(super) job: JobLease,
+    pub(super) contract: LoadedExecutionContract,
+    pub(super) model: AsrModelLease,
+    pub(super) samples: Arc<[f32]>,
+    pub(super) sample_rate: u32,
+    pub(super) request: GraniteSpeech5RequestOptions,
+    pub(super) geometry: GraniteSpeech5PreparedGeometry,
+    pub(super) retained_host_bytes: u64,
+    pub(super) artifact_host_bytes: u64,
+    pub(super) cancellation: PreparationCancellation,
+    pub(super) response: Option<oneshot::Sender<GraniteSpeech5EncoderOutcome>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct GraniteSpeech5EncoderQueueKey {
+    pub(super) binding: AdapterBindingKey,
+    pub(super) audio_token_bucket: usize,
+    pub(super) prompt_token_bucket: usize,
+    pub(super) deadline_budget_bucket: Option<u64>,
+}
+
+pub(super) struct GraniteSpeech5EncoderBatcher {
+    pub(super) coordinator: Arc<InferenceCoordinator>,
+    pub(super) formation:
+        EncoderBatchFormation<GraniteSpeech5EncoderQueueKey, GraniteSpeech5EncoderPending>,
 }
 
 pub(super) fn granite_speech_deadline_budget_bucket(deadline: Option<Instant>, now: Instant) -> Option<u64> {
@@ -1350,6 +1380,243 @@ impl GraniteSpeechEncoderBatcher {
     }
 
     pub(super) fn fail_batch(batch: Vec<GraniteSpeechEncoderPending>, error: Error) {
+        let message = error.to_string();
+        for row in batch {
+            if let Some(response) = row.response {
+                let _ = response.send(PreparationRowOutcome::Failed(Error::InferenceError(
+                    message.clone(),
+                )));
+            }
+        }
+    }
+}
+
+impl GraniteSpeech5EncoderBatcher {
+    pub(super) fn new(coordinator: Arc<InferenceCoordinator>) -> Self {
+        Self {
+            coordinator,
+            formation: EncoderBatchFormation::new(),
+        }
+    }
+
+    pub(super) async fn submit(
+        self: &Arc<Self>,
+        mut pending: GraniteSpeech5EncoderPending,
+    ) -> Result<GraniteSpeech5EncoderOutcome> {
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.granite_speech5".into(),
+        };
+        let binding = pending.contract.adapter_binding()?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.name != "asr.encoder.granite_speech5" {
+            return Err(Error::InvalidInput(
+                "Granite Speech 5.0 loaded contract did not select asr.encoder.granite_speech5".into(),
+            ));
+        }
+        let deadline = pending.job.spec.deadline;
+        let now = Instant::now();
+        let key = GraniteSpeech5EncoderQueueKey {
+            binding: binding.key_for_stage(stage.id)?,
+            audio_token_bucket: pending
+                .geometry
+                .audio_tokens
+                .checked_next_power_of_two()
+                .ok_or_else(|| {
+                    Error::Overloaded("Granite Speech 5.0 audio-token bucket overflow".into())
+                })?,
+            prompt_token_bucket: pending
+                .geometry
+                .prompt_tokens
+                .checked_next_power_of_two()
+                .ok_or_else(|| {
+                    Error::Overloaded("Granite Speech 5.0 prompt-token bucket overflow".into())
+                })?,
+            deadline_budget_bucket: granite_speech_deadline_budget_bucket(deadline, now),
+        };
+        let max_width = stage.max_batch_size.max(1);
+        let cancellation = pending.cancellation.clone();
+        let (sender, receiver) = oneshot::channel();
+        pending.response = Some(sender);
+        // A row waits for its bucket's running batch and joins the next one,
+        // so requests that arrive while the device is busy still batch.
+        if self.formation.push(key.clone(), pending) {
+            let batcher = self.clone();
+            tokio::spawn(async move {
+                batcher
+                    .formation
+                    .run(&key, max_width, |batch| batcher.run_batch(batch))
+                    .await;
+            });
+        }
+
+        let mut guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let outcome = receiver.await.map_err(|_| {
+            Error::InferenceError("Granite Speech 5.0 encoder batch worker stopped before reply".into())
+        })?;
+        guard.armed = false;
+        Ok(outcome)
+    }
+
+    pub(super) async fn run_batch(&self, mut batch: Vec<GraniteSpeech5EncoderPending>) {
+        let now = Instant::now();
+        let mut live = Vec::with_capacity(batch.len());
+        for mut row in batch.drain(..) {
+            let terminal = if row.cancellation.is_cancelled() {
+                Some(PreparationRowOutcome::Cancelled)
+            } else if row
+                .job
+                .spec
+                .deadline
+                .is_some_and(|deadline| deadline <= now)
+            {
+                Some(PreparationRowOutcome::TimedOut)
+            } else {
+                None
+            };
+            if let Some(outcome) = terminal {
+                if let Some(response) = row.response.take() {
+                    let _ = response.send(outcome);
+                }
+            } else {
+                live.push(row);
+            }
+        }
+        batch = live;
+        let Some(first) = batch.first() else {
+            return;
+        };
+        let contract = first.contract.clone();
+        let model = first.model.clone();
+        let geometries = batch.iter().map(|row| row.geometry).collect::<Vec<_>>();
+        let batch_geometry = match model.granite_speech5_preparation_batch_geometry(&geometries) {
+            Ok(geometry) => geometry,
+            Err(error) => {
+                Self::fail_batch(batch, error);
+                return;
+            }
+        };
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.granite_speech5".into(),
+        };
+        let mut sealed = Vec::with_capacity(batch.len());
+        for (index, row) in batch.iter().enumerate() {
+            let cost = match model.granite_speech5_preparation_row_cost_for_batch(
+                index,
+                &geometries,
+                batch_geometry,
+            ) {
+                Ok(cost) => cost,
+                Err(error) => {
+                    Self::fail_batch(batch, error);
+                    return;
+                }
+            };
+            match self.coordinator.seal_preparation_row(
+                row.job.clone(),
+                &row.contract,
+                &work,
+                cost,
+                batch_geometry.materialized_tensor_elements_per_row,
+                row.cancellation.clone(),
+            ) {
+                Ok(seal) => sealed.push(seal),
+                Err(error) => {
+                    Self::fail_batch(batch, error);
+                    return;
+                }
+            }
+        }
+
+        let inputs = batch
+            .iter()
+            .map(|row| {
+                (
+                    row.samples.clone(),
+                    row.sample_rate,
+                    row.request.clone(),
+                    row.geometry,
+                    row.retained_host_bytes,
+                    row.artifact_host_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        let senders = batch
+            .drain(..)
+            .map(|mut row| {
+                row.response
+                    .take()
+                    .expect("queued Granite Speech row has response channel")
+            })
+            .collect::<Vec<_>>();
+        let physical_model = model.clone();
+        let result = self
+            .coordinator
+            .run_loaded_native_preparation_batch(sealed, contract, work, move |live| {
+                let selected = live
+                    .iter()
+                    .map(|index| GraniteSpeech5PreparationBatchRow {
+                        audio: inputs[*index].0.as_ref(),
+                        sample_rate: inputs[*index].1,
+                        request: &inputs[*index].2,
+                    })
+                    .collect::<Vec<_>>();
+                let prepared =
+                    physical_model.prepare_granite_speech5_prompt_artifact_batch(&selected)?;
+                if prepared.len() != live.len() {
+                    return Err(Error::InferenceError(
+                        "Granite Speech 5.0 preparation batch returned the wrong row count".into(),
+                    ));
+                }
+                Ok(prepared
+                    .into_iter()
+                    .zip(live.iter().copied())
+                    .map(|(artifact, index)| {
+                        let geometry = inputs[index].3;
+                        let resident_tensor_bytes = artifact.resident_tensor_bytes()?;
+                        if artifact.prompt_tokens() != geometry.prompt_tokens
+                            || artifact.audio_tokens() != geometry.audio_tokens
+                            || artifact.resident_host_bytes() != inputs[index].5
+                            || resident_tensor_bytes != geometry.retained_device_bytes
+                        {
+                            return Err(Error::InferenceError(
+                                "Granite Speech 5.0 batch artifact drifted from admitted geometry"
+                                    .into(),
+                            ));
+                        }
+                        Ok(PreparationArtifact {
+                            retained: JobResourceObservation {
+                                host_bytes: inputs[index].4,
+                                accelerator_bytes: resident_tensor_bytes,
+                            },
+                            value: artifact,
+                        })
+                    })
+                    .collect::<Vec<Result<PreparationArtifact<
+                        Arc<GraniteSpeech5PreparedPromptArtifact>,
+                    >>>>())
+            })
+            .await;
+        match result {
+            Ok(outcomes) => {
+                for (sender, outcome) in senders.into_iter().zip(outcomes) {
+                    let _ = sender.send(outcome);
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                for sender in senders {
+                    let _ = sender.send(PreparationRowOutcome::Failed(Error::InferenceError(
+                        message.clone(),
+                    )));
+                }
+            }
+        }
+    }
+
+    pub(super) fn fail_batch(batch: Vec<GraniteSpeech5EncoderPending>, error: Error) {
         let message = error.to_string();
         for row in batch {
             if let Some(response) = row.response {

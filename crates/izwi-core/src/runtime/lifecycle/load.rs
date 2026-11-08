@@ -1064,6 +1064,22 @@ impl ModelLifecycleController {
                     )));
                 };
                 bundle_draft.seal_granite_speech_asr_preparation(model)?;
+            } else if variant.family() == crate::catalog::ModelFamily::GraniteSpeech5Asr {
+                let loaded = self
+                    .model_registry
+                    .get_loading_asr(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "instantiated Granite Speech 5.0 ASR model {variant} is missing before adapter sealing"
+                        ))
+                    })?;
+                let NativeAsrModel::GraniteSpeech5(model) = loaded.as_ref() else {
+                    return Err(Error::ModelLoadError(format!(
+                        "instantiated model {variant} does not expose Granite Speech 5.0 ASR geometry"
+                    )));
+                };
+                bundle_draft.seal_granite_speech5_asr_preparation(model)?;
             } else if variant.family() == crate::catalog::ModelFamily::Lfm25Audio {
                 let model = self
                     .model_registry

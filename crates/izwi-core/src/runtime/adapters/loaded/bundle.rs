@@ -305,6 +305,18 @@ impl LoadedModelBundleDraft {
         execution.seal_granite_speech_asr_preparation(model)
     }
 
+    pub(crate) fn seal_granite_speech5_asr_preparation(
+        &self,
+        model: &crate::models::architectures::granite_speech5::asr::GraniteSpeech5AsrModel,
+    ) -> Result<()> {
+        let execution = self.capabilities.get(&CapabilityKind::Asr).ok_or_else(|| {
+            Error::ModelLoadError(
+                "Granite Speech 5.0 loaded bundle has no ASR capability to seal".into(),
+            )
+        })?;
+        execution.seal_granite_speech5_asr_preparation(model)
+    }
+
     /// Installs each capability's test preparation seal at `max_batch_size`
     /// rows, as a load seals the model's measured preparation.
     #[cfg(test)]
