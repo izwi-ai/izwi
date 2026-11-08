@@ -1555,7 +1555,7 @@ impl ModelLifecycleController {
             let native_batching = match crate::env::value("IZWI_FISH_NATIVE_BATCHING") {
                 Some(value) => izwi_env::parse_bool("IZWI_FISH_NATIVE_BATCHING", &value)
                     .map_err(|error| Error::ConfigError(error.to_string()))?,
-                None => false,
+                None => crate::runtime::fish_capacity::fish_native_batching_default(backend),
             };
             // Automatic staged rows are sized for tensor-width launches. Fish
             // fits its own autoregressive width (no tensor arena backs its

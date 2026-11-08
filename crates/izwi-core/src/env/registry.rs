@@ -485,9 +485,9 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_FISH_NATIVE_BATCHING",
         Flag,
-        "false",
+        "true on CUDA, false on CPU and Metal",
         Load,
-        "Enables native batched decoding for Fish S2 TTS when the model loads.",
+        "Decodes concurrent Fish S2 TTS requests as rows of one batch when the model loads; false keeps one row at a time.",
     ),
     CoreEnvVar::new(
         "IZWI_FISH_S2_BACKEND",
