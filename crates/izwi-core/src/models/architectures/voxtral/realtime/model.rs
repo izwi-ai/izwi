@@ -30,7 +30,8 @@ use crate::models::architectures::voxtral::{
 };
 use crate::models::shared::attention::flash::{
     flash_attention_compiled, flash_attention_requested, try_fused_self_attention,
-    try_fused_self_attention_with_options, CudaFlashAttentionOptions,
+    try_fused_self_attention_with_options, try_fused_varlen_self_attention_with_options,
+    CudaFlashAttentionOptions,
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
@@ -3055,6 +3056,17 @@ impl WhisperAttention {
             q = apply_interleaved_rotary_emb(&q, &cos, &sin)?;
             k = apply_interleaved_rotary_emb(&k, &cos, &sin)?;
         }
+        // On CUDA the valid frames of every row attend as packed spans, the
+        // way one row attends alone, instead of through a padded mask.
+        if let Some(output) =
+            self.varlen_flash_attention(&q, &k, &v, valid_lengths, is_causal, tables)?
+        {
+            return self
+                .out_proj
+                .forward(&output)?
+                .broadcast_mul(frame_mask)
+                .map_err(Error::from);
+        }
         let q = q
             .transpose(1, 2)?
             .reshape((batch * self.num_heads, seq_len, self.head_dim))?;
@@ -3086,6 +3098,66 @@ impl WhisperAttention {
     }
 }
 
+impl WhisperAttention {
+    /// FlashAttention varlen over the valid frames of a padded batch, with
+    /// the window and causality one row uses alone: `q` and `k` are
+    /// `[batch, frames, heads, head_dim]`, `v` is `[batch, heads, frames,
+    /// head_dim]`, and the result is `[batch, frames, heads * head_dim]` with
+    /// zeros past each row's length. `None` off CUDA, for a non-causal
+    /// sliding window (which the single row does not fuse either), or when
+    /// FlashAttention declines; the caller then attends through the mask.
+    fn varlen_flash_attention(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        valid_lengths: &[usize],
+        is_causal: bool,
+        tables: &EncoderForwardTables,
+    ) -> Result<Option<Tensor>> {
+        let options = match (self.sliding_window, is_causal) {
+            (None, _) => CudaFlashAttentionOptions::default(),
+            (Some(_), true) => voxtral_realtime_cuda_sliding_flash_options(self.sliding_window),
+            (Some(_), false) => return Ok(None),
+        };
+        if !q.device().is_cuda() || !flash_attention_requested() {
+            return Ok(None);
+        }
+        let (batch, frames, heads, head_dim) = q.dims4()?;
+        let (index, cu_seqlens, max_seqlen) = tables.varlen_spans(valid_lengths, frames, q)?;
+        let total = index.dim(0)?;
+        let width = heads * head_dim;
+        let pack = |x: &Tensor| -> Result<Tensor> {
+            Ok(x.contiguous()?
+                .reshape((batch * frames, width))?
+                .index_select(&index, 0)?
+                .reshape((1, total, heads, head_dim))?
+                .transpose(1, 2)?)
+        };
+        let v = v.transpose(1, 2)?;
+        let Some(output) = try_fused_varlen_self_attention_with_options(
+            &pack(q)?,
+            &pack(k)?,
+            &pack(&v)?,
+            &cu_seqlens,
+            max_seqlen,
+            head_dim,
+            is_causal,
+            options,
+        )?
+        else {
+            return Ok(None);
+        };
+        let output = output
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((total, width))?;
+        let padded = Tensor::zeros((batch * frames, width), output.dtype(), output.device())?
+            .index_add(&index, &output, 0)?;
+        Ok(Some(padded.reshape((batch, frames, width))?))
+    }
+}
+
 /// Attention inputs that depend only on the sequence geometry, built at most
 /// once per encoder forward and shared by every layer. Each layer used to
 /// rebuild them: the RoPE cos/sin tables (host angles, upload, device
@@ -3098,7 +3170,52 @@ struct EncoderForwardTables {
     rope: RefCell<Option<(RopeTableKey, (Tensor, Tensor))>>,
     causal_mask: RefCell<Option<(CausalMaskKey, Tensor)>>,
     valid_mask: RefCell<Option<(ValidMaskKey, Tensor)>>,
+    varlen: RefCell<Option<(VarlenKey, VarlenSpans)>>,
     builds: Cell<usize>,
+}
+
+type VarlenKey = (Vec<usize>, usize, candle_core::DeviceLocation);
+/// The valid rows of a padded `[batch * frames]` axis as packed spans: their
+/// gather index, cumulative lengths and longest span.
+type VarlenSpans = (Tensor, Vec<u32>, usize);
+
+/// The packed spans of rows with `valid_lengths` frames each, padded to
+/// `frames`.
+fn varlen_spans_for(
+    valid_lengths: &[usize],
+    frames: usize,
+    device: &candle_core::Device,
+) -> Result<VarlenSpans> {
+    let mut index = Vec::with_capacity(valid_lengths.iter().sum());
+    let mut cu_seqlens = Vec::with_capacity(valid_lengths.len() + 1);
+    cu_seqlens.push(0u32);
+    for (row, &length) in valid_lengths.iter().enumerate() {
+        if length > frames {
+            return Err(Error::InvalidInput(
+                "Voxtral varlen row is longer than its padded batch".into(),
+            ));
+        }
+        let start = row
+            .checked_mul(frames)
+            .ok_or_else(|| Error::Overloaded("Voxtral varlen index overflow".into()))?;
+        for frame in start..start + length {
+            index.push(
+                u32::try_from(frame)
+                    .map_err(|_| Error::Overloaded("Voxtral varlen index exceeds u32".into()))?,
+            );
+        }
+        cu_seqlens.push(
+            u32::try_from(index.len())
+                .map_err(|_| Error::Overloaded("Voxtral varlen length exceeds u32".into()))?,
+        );
+    }
+    let max_seqlen = valid_lengths.iter().copied().max().unwrap_or(0);
+    let count = index.len();
+    Ok((
+        Tensor::from_vec(index, count, device)?,
+        cu_seqlens,
+        max_seqlen,
+    ))
 }
 
 type RopeTableKey = (usize, usize, u64, DType, candle_core::DeviceLocation);
@@ -3171,6 +3288,30 @@ impl EncoderForwardTables {
                 reference.dtype(),
             )
         })
+    }
+
+    /// [`varlen_spans_for`], built once per forward and shared by every
+    /// layer.
+    fn varlen_spans(
+        &self,
+        valid_lengths: &[usize],
+        frames: usize,
+        reference: &Tensor,
+    ) -> Result<VarlenSpans> {
+        let key = (
+            valid_lengths.to_vec(),
+            frames,
+            reference.device().location(),
+        );
+        if let Some((cached, spans)) = self.varlen.borrow().as_ref() {
+            if *cached == key {
+                return Ok(spans.clone());
+            }
+        }
+        let spans = varlen_spans_for(valid_lengths, frames, reference.device())?;
+        self.builds.set(self.builds.get() + 1);
+        *self.varlen.borrow_mut() = Some((key, spans.clone()));
+        Ok(spans)
     }
 
     fn valid_attention_mask(
@@ -5300,6 +5441,19 @@ mod tests {
                 .to_vec1::<f32>()
                 .unwrap()
         );
+    }
+
+    /// A padded batch's valid frames pack as spans in row order: the gather
+    /// index skips each row's padding and the cumulative lengths bound each
+    /// row, as FlashAttention varlen reads them.
+    #[test]
+    fn varlen_spans_pack_each_rows_valid_frames() {
+        let (index, cu_seqlens, max_seqlen) =
+            super::varlen_spans_for(&[3, 1, 2], 4, &candle_core::Device::Cpu).unwrap();
+        assert_eq!(index.to_vec1::<u32>().unwrap(), vec![0, 1, 2, 4, 8, 9]);
+        assert_eq!(cu_seqlens, vec![0, 3, 4, 6]);
+        assert_eq!(max_seqlen, 3);
+        assert!(super::varlen_spans_for(&[5], 4, &candle_core::Device::Cpu).is_err());
     }
 
     /// Offline rows decoded together, joining at different steps and running
