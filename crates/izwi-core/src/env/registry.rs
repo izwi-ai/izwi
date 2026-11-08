@@ -518,6 +518,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Backend for Fish S2 smoke tests: auto, cpu, metal, cuda (streaming smoke rejects auto).",
     ),
     CoreEnvVar::new(
+        "IZWI_FISH_S2_BATCHED_SAMPLING",
+        Flag,
+        "true",
+        Once,
+        "Draws a Fish S2 step's semantic tokens (CUDA and Metal) and fast codes (each depth) for every row from one device pass and one readback, uploading each frame's sampling noise once for all rows; false samples each row on its own.",
+    ),
+    CoreEnvVar::new(
         "IZWI_FISH_S2_DTYPE",
         Choice,
         "Fish S2 per-backend dtype policy",

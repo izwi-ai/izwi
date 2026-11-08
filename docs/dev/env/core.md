@@ -83,6 +83,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_FISH_DRAMA3_TOKENIZER_PATH` | path | unset (test fails) | test harness | The published Fish Audio Drama 3 tokenizer.json (fishaudio/drama-3@78e5ab79) for the ignored golden-id tests. |
 | `IZWI_FISH_NATIVE_BATCHING` | flag | true on CUDA, false on CPU and Metal | model load | Decodes concurrent Fish S2 TTS requests as rows of one batch when the model loads; false keeps one row at a time. |
 | `IZWI_FISH_S2_BACKEND` | choice | auto (smoke.rs); required in streaming_smoke.rs | test harness | Backend for Fish S2 smoke tests: auto, cpu, metal, cuda (streaming smoke rejects auto). |
+| `IZWI_FISH_S2_BATCHED_SAMPLING` | flag | `true` | first use | Draws a Fish S2 step's semantic tokens (CUDA and Metal) and fast codes (each depth) for every row from one device pass and one readback, uploading each frame's sampling noise once for all rows; false samples each row on its own. |
 | `IZWI_FISH_S2_DTYPE` | choice | Fish S2 per-backend dtype policy | model load | Overrides the Fish Audio S2 Pro weight dtype (e.g. f32, f16, bf16); also used by the load memory estimate. |
 | `IZWI_FISH_S2_MODEL_DIR` | path | unset (test fails) | test harness | Fish S2 Pro model directory; must end in the variant directory name. |
 | `IZWI_FISH_S2_REFERENCE_TEXT` | text | contents of data/fox.md | test harness | Transcript of the reference WAV; required when IZWI_FISH_S2_REFERENCE_WAV is set. |

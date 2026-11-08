@@ -6,7 +6,10 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 pub use super::sampling::FishS2Sampler;
-use super::sampling::{sample_resident, FishS2ResidentDraws, FishS2SamplingDistribution};
+use super::sampling::{
+    sample_resident, sample_resident_rows, FishS2ResidentDraws, FishS2ResidentRowDraws,
+    FishS2SamplingDistribution,
+};
 use crate::error::{Error, Result};
 use crate::models::architectures::fish_s2::config::FishS2Config;
 use crate::models::architectures::fish_s2::rotary::FishS2RotaryCache;
@@ -366,11 +369,18 @@ impl FishS2FastDecoder {
             .collect::<Vec<_>>();
         let ids = Tensor::from_slice(&semantic_codes, (rows, 1), slow_hidden.device())?;
         let mut current = self.embeddings.forward(&ids)?;
-        let draws = self.resident_draws(samplers, slow_hidden.device(), resident)?;
+        let row_draws = self.resident_row_draws(samplers, slow_hidden.device(), resident)?;
+        let draws = match row_draws {
+            Some(_) => None,
+            None => self.resident_draws(samplers, slow_hidden.device(), resident)?,
+        };
         let mut resident = ResidentCodes::default();
         for depth in 1..self.cfg.num_codebooks {
             let logits = self.forward_step_batch(&current, depth, caches, true)?;
-            let next_ids = if let Some(draws) = &draws {
+            let next_ids = if let Some(row_draws) = &row_draws {
+                // Every row's code at this depth from one pass.
+                resident.sample_rows(&logits.i((.., 0))?, row_draws, depth - 1)?
+            } else if let Some(draws) = &draws {
                 let mut codes = Vec::with_capacity(rows);
                 for (row, (sampler, draws)) in samplers.iter().zip(draws).enumerate() {
                     codes.push(resident.sample(&logits.i((row, 0))?, sampler, draws, depth - 1)?);
@@ -390,7 +400,7 @@ impl FishS2FastDecoder {
                 current = self.embeddings.forward(&next_ids.reshape((rows, 1))?)?;
             }
         }
-        if draws.is_some() {
+        if row_draws.is_some() || draws.is_some() {
             // Codes were drawn depth by depth, rows within a depth.
             let codes = resident.read_back()?;
             for (index, code) in codes.into_iter().enumerate() {
@@ -446,6 +456,21 @@ impl FishS2FastDecoder {
         Ok(Some(draws))
     }
 
+    /// One frame's draws for every row at once, or `None` for the per-row
+    /// draws (host path, differing policies, or
+    /// `IZWI_FISH_S2_BATCHED_SAMPLING=false`).
+    fn resident_row_draws(
+        &self,
+        samplers: &mut [&mut FishS2Sampler],
+        device: &Device,
+        resident: bool,
+    ) -> Result<Option<FishS2ResidentRowDraws>> {
+        if !resident || !super::fish_s2_batched_sampling_enabled() {
+            return Ok(None);
+        }
+        FishS2ResidentRowDraws::new(samplers, self.cfg.num_codebooks.saturating_sub(1), device)
+    }
+
     pub fn generate_frame(
         &self,
         semantic_token_id: u32,
@@ -474,7 +499,11 @@ impl FishS2FastDecoder {
         let mut codebooks = vec![semantic_code];
         let mut current = self.codebook_embedding(semantic_code)?;
         let tokens = self.cfg.num_codebooks.saturating_sub(1);
-        let draws = if resident {
+        // A row alone draws with the batched sampler at width one, so it
+        // samples as it does beside others.
+        let row_draws =
+            self.resident_row_draws(&mut [&mut *sampler], slow_hidden.device(), resident)?;
+        let draws = if resident && row_draws.is_none() {
             sampler.resident_draws(tokens, slow_hidden.device())?
         } else {
             None
@@ -483,9 +512,12 @@ impl FishS2FastDecoder {
         for codebook_idx in 1..self.cfg.num_codebooks {
             let logits = self.forward_step(&current, codebook_idx, cache)?;
             let row = logits.i((0, 0))?;
-            let next = match &draws {
-                Some(draws) => resident.sample(&row, sampler, draws, codebook_idx - 1)?,
-                None => {
+            let next = match (&row_draws, &draws) {
+                (Some(row_draws), _) => {
+                    resident.sample_rows(&row.unsqueeze(0)?, row_draws, codebook_idx - 1)?
+                }
+                (None, Some(draws)) => resident.sample(&row, sampler, draws, codebook_idx - 1)?,
+                (None, None) => {
                     let code = sample_logits(&row, sampler)?;
                     codebooks.push(code);
                     Tensor::from_vec(vec![code], 1, row.device())?
@@ -495,7 +527,7 @@ impl FishS2FastDecoder {
                 current = self.embeddings.forward(&next.reshape((1, 1))?)?;
             }
         }
-        if draws.is_some() {
+        if row_draws.is_some() || draws.is_some() {
             codebooks.extend(resident.read_back()?);
         }
         Ok(FishS2GeneratedFrame {
@@ -757,10 +789,24 @@ impl ResidentCodes {
         Ok(code)
     }
 
+    /// Draw every row's code at one depth (left on the device as a `[rows]`
+    /// U32 tensor).
+    fn sample_rows(
+        &mut self,
+        logits: &Tensor,
+        draws: &FishS2ResidentRowDraws,
+        token: usize,
+    ) -> Result<Tensor> {
+        let (codes, non_finite) = sample_resident_rows(logits, draws, token)?;
+        self.codes.push(codes.clone());
+        self.non_finite.push(non_finite);
+        Ok(codes)
+    }
+
     /// The codes in draw order, from one readback; an error if any sampled
     /// row held a non-finite logit.
     fn read_back(self) -> Result<Vec<u32>> {
-        let count = self.codes.len();
+        let count = self.codes.iter().map(Tensor::elem_count).sum::<usize>();
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -1096,6 +1142,71 @@ mod tests {
             scalar_samplers.reverse();
             batch_caches.reverse();
             scalar_caches.reverse();
+        }
+    }
+
+    /// The batched resident sampler: a batch of frames equals each row's
+    /// frame drawn alone with the resident sampler (which takes the same
+    /// sampler at width one), rows reordered between frames.
+    #[test]
+    fn resident_fast_batch_matches_rows_drawn_alone() {
+        let decoder = tiny_decoder(&Device::Cpu);
+        let cfg = decoder.config();
+        let cache = || {
+            super::super::physical::test_physical_caches(
+                904,
+                cfg.num_hidden_layers,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                cfg.num_codebooks,
+                5,
+            )
+        };
+        let mut batch_caches = cache();
+        let mut scalar_caches = cache();
+        let mut samplers = (0..5)
+            .map(|row| FishS2Sampler::new(0.8, 0.85, row + 3))
+            .collect::<Vec<_>>();
+        let mut scalar_samplers = samplers.clone();
+        for iteration in 0..3 {
+            let ids = (0..5)
+                .map(|row| 20 + (row * 3 + iteration) % 8)
+                .collect::<Vec<_>>();
+            let hidden = Tensor::from_vec(
+                (0..15)
+                    .map(|i| ((i + iteration) as f32 * 0.47).cos())
+                    .collect::<Vec<_>>(),
+                (5, 1, 3),
+                &Device::Cpu,
+            )
+            .unwrap();
+            let expected = (0..5)
+                .map(|row| {
+                    decoder
+                        .generate_frame_with(
+                            ids[row],
+                            &hidden.narrow(0, row, 1).unwrap(),
+                            &mut scalar_samplers[row],
+                            &mut scalar_caches[row],
+                            true,
+                        )
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let actual = decoder
+                .generate_frames_batch_with(
+                    &ids,
+                    &hidden,
+                    &mut samplers.iter_mut().collect::<Vec<_>>(),
+                    &mut batch_caches.iter_mut().collect::<Vec<_>>(),
+                    true,
+                )
+                .unwrap();
+            assert_eq!(actual, expected);
+            samplers.rotate_left(2);
+            scalar_samplers.rotate_left(2);
+            batch_caches.rotate_left(2);
+            scalar_caches.rotate_left(2);
         }
     }
 
