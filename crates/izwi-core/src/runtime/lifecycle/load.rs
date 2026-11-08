@@ -297,6 +297,18 @@ fn asr_minimum_tokens(variant: ModelVariant) -> u64 {
     super::asr_envelope::minimum_sequence_tokens(variant).unwrap_or(0)
 }
 
+/// Tokens of a retained ASR pool that every sequence claims its pages from:
+/// one `sequence_tokens` sequence per retained row, and never less than one
+/// sequence of the model's whole `context_tokens`, which still bounds each
+/// sequence on its own.
+fn asr_shared_pool_tokens(context_tokens: usize, sequence_tokens: u64, rows: usize) -> usize {
+    usize::try_from(sequence_tokens)
+        .unwrap_or(usize::MAX)
+        .min(context_tokens)
+        .saturating_mul(rows.max(1))
+        .max(context_tokens)
+}
+
 /// The retained-state floor of a TTS variant, in tokens per sequence: one
 /// prompt plus the family's largest automatic output budget (per CFG domain
 /// for VibeVoice). `0` (the page minimum) for every other variant.

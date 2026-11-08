@@ -4290,3 +4290,25 @@ fn unevictable_residents_are_pinned_or_busy_and_never_the_request() {
         vec![ModelVariant::Kokoro82M, ModelVariant::WhisperLargeV3Turbo]
     );
 }
+
+/// A retained ASR pool every sequence claims its pages from holds one
+/// automatic sequence per retained row, so concurrent requests' claims fit
+/// side by side, and never less than one sequence of the model's context.
+/// A pool of one context admitted one Granite Speech 4.1 (4,096 tokens
+/// against a 2,048-token automatic claim) or Whisper (its whole 448-position
+/// window) request at a time, and every decode step carried one row.
+#[test]
+fn shared_asr_pools_hold_one_automatic_sequence_per_row() {
+    let granite = super::asr_minimum_tokens(ModelVariant::GraniteSpeech412BPlus);
+    assert!((444..1024).contains(&granite), "{granite}");
+    let sequence = usize::try_from(granite).unwrap();
+    assert_eq!(super::asr_shared_pool_tokens(4096, granite, 1), 4096);
+    assert_eq!(super::asr_shared_pool_tokens(4096, granite, 8), 8 * sequence);
+    assert_eq!(super::asr_shared_pool_tokens(4096, granite, 32), 32 * sequence);
+    let whisper = super::asr_minimum_tokens(ModelVariant::WhisperLargeV3Turbo);
+    assert_eq!(whisper, 448);
+    assert_eq!(super::asr_shared_pool_tokens(448, whisper, 1), 448);
+    assert_eq!(super::asr_shared_pool_tokens(448, whisper, 8), 8 * 448);
+    // A sequence never counts for more than the model's context.
+    assert_eq!(super::asr_shared_pool_tokens(448, 10_000, 3), 3 * 448);
+}

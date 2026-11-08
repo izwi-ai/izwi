@@ -550,17 +550,25 @@ impl ModelLifecycleController {
                         .map(|contract| contract.stages.as_ref())
                         .collect::<Vec<_>>();
                     let physical_spec = loaded.whisper_physical_state_spec(&stage_graphs)?;
+                    // As many sequences (cross-attention pool slots and
+                    // decoder rows) as the other ASR families, never fewer
+                    // than one decode batch. Each decoder row claims its
+                    // whole 448-position window from the shared self-attention
+                    // pool, so the pool holds one window per row; one window
+                    // admitted one request at a time.
+                    let rows = self.asr_state_rows(bundle_draft)?;
                     let retained = self
                         .core_engine
                         .load_composite_retained_state(
                             model_instance_id,
                             &physical_spec.retained,
                             physical_spec.retained_static_domain,
-                            Some(physical_spec.retained_max_tokens),
-                            // As many sequences (cross-attention pool slots
-                            // and decoder rows) as the other ASR families,
-                            // never fewer than one decode batch.
-                            self.asr_state_rows(bundle_draft)?,
+                            Some(asr_shared_pool_tokens(
+                                physical_spec.retained_max_tokens,
+                                asr_minimum_tokens(variant),
+                                rows.0,
+                            )),
+                            rows,
                             asr_minimum_tokens(variant),
                         )
                         .await?;
