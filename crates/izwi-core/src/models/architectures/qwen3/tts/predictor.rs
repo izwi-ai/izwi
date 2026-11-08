@@ -1000,7 +1000,81 @@ struct Attention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    rope_inv_freq: Vec<f32>,
+    rope: PredictorRope,
+}
+
+/// Positions whose RoPE tables [`PredictorRope`] keeps: a frame runs
+/// positions 0 to 16 (the two-token prefill, then one per codebook).
+const ROPE_CACHED_POSITIONS: usize = 32;
+
+/// The predictor's RoPE tables. Every frame runs the same few positions, so
+/// the cos/sin rows of the first [`ROPE_CACHED_POSITIONS`] positions are
+/// built once per dtype and device by [`build_rope_window_full`] (host
+/// angles, device cos/sin) and each call takes a view of its rows: each
+/// position's row depends on that position alone, so the values are the
+/// ones a per-call build gives, without its upload and six kernels for q
+/// and for k in every layer at every codebook.
+struct PredictorRope {
+    inv_freq: Vec<f32>,
+    tables: std::sync::Mutex<Vec<RopeTable>>,
+}
+
+struct RopeTable {
+    dtype: DType,
+    device: candle_core::DeviceLocation,
+    cos: Tensor,
+    sin: Tensor,
+}
+
+impl PredictorRope {
+    fn new(inv_freq: Vec<f32>) -> Self {
+        Self {
+            inv_freq,
+            tables: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// cos/sin `[seq_len, head_dim]` for positions `start_pos..`.
+    fn window(
+        &self,
+        seq_len: usize,
+        start_pos: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        if start_pos + seq_len > ROPE_CACHED_POSITIONS {
+            return build_rope_window_full(seq_len, start_pos, &self.inv_freq, device, dtype);
+        }
+        let mut tables = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+        let location = device.location();
+        let index = match tables
+            .iter()
+            .position(|table| table.dtype == dtype && table.device == location)
+        {
+            Some(index) => index,
+            None => {
+                let (cos, sin) = build_rope_window_full(
+                    ROPE_CACHED_POSITIONS,
+                    0,
+                    &self.inv_freq,
+                    device,
+                    dtype,
+                )?;
+                tables.push(RopeTable {
+                    dtype,
+                    device: location,
+                    cos,
+                    sin,
+                });
+                tables.len() - 1
+            }
+        };
+        let table = &tables[index];
+        Ok((
+            table.cos.narrow(0, start_pos, seq_len)?,
+            table.sin.narrow(0, start_pos, seq_len)?,
+        ))
+    }
 }
 
 impl Attention {
@@ -1053,7 +1127,7 @@ impl Attention {
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim,
-            rope_inv_freq: build_rope_inv_freq(head_dim, cfg.rope_theta),
+            rope: PredictorRope::new(build_rope_inv_freq(head_dim, cfg.rope_theta)),
         })
     }
 
@@ -1076,13 +1150,9 @@ impl Attention {
         let seq_len = x.dim(1)?;
         let half_dim = self.head_dim / 2;
 
-        let (cos, sin) = build_rope_window_full(
-            seq_len,
-            start_pos,
-            &self.rope_inv_freq,
-            x.device(),
-            x.dtype(),
-        )?;
+        let (cos, sin) = self
+            .rope
+            .window(seq_len, start_pos, x.device(), x.dtype())?;
 
         let cos = cos.unsqueeze(0)?.unsqueeze(2)?;
         let sin = sin.unsqueeze(0)?.unsqueeze(2)?;
@@ -1569,7 +1639,7 @@ mod tests {
             num_heads: 2,
             num_kv_heads: 1,
             head_dim: 2,
-            rope_inv_freq: build_rope_inv_freq(2, cfg.rope_theta),
+            rope: PredictorRope::new(build_rope_inv_freq(2, cfg.rope_theta)),
         };
         let layer = Layer {
             input_layernorm: RmsNorm::new(Tensor::ones(4, DType::F32, device).unwrap(), 1e-5),
@@ -1894,6 +1964,40 @@ mod tests {
 
         assert_eq!(actual, vec![expected]);
         assert_eq!(fallback.context_len(), scalar.context_len());
+    }
+
+    /// The cached RoPE rows are the per-call tables bit for bit, for every
+    /// window a frame runs and beyond the cache, in each compute dtype.
+    #[test]
+    fn cached_rope_windows_equal_per_call_tables() {
+        let device = Device::Cpu;
+        let inv_freq = build_rope_inv_freq(128, 1_000_000.0);
+        let rope = PredictorRope::new(inv_freq.clone());
+        let bits = |tensor: &Tensor| {
+            tensor
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            for (seq_len, start_pos) in [(2, 0), (1, 2), (1, 9), (1, 16), (3, 29), (2, 31)] {
+                let (cos, sin) = rope.window(seq_len, start_pos, &device, dtype).unwrap();
+                let (expected_cos, expected_sin) =
+                    build_rope_window_full(seq_len, start_pos, &inv_freq, &device, dtype).unwrap();
+                let window = format!("{dtype:?} {start_pos}+{seq_len}");
+                assert_eq!(cos.dtype(), dtype);
+                assert_eq!(cos.dims(), expected_cos.dims());
+                assert_eq!(bits(&cos), bits(&expected_cos), "{window}");
+                assert_eq!(bits(&sin), bits(&expected_sin), "{window}");
+            }
+        }
+        assert_eq!(rope.tables.lock().unwrap().len(), 3);
     }
 
     /// A step's acoustic embedding sums gathered for all rows at once equal
