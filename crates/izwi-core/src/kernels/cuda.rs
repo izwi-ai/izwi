@@ -3677,6 +3677,12 @@ pub(crate) fn cuda_ptx_depthwise_conv() -> &'static str {
     cuda_ptx::DEPTHWISE_CONV
 }
 
+/// The PTX of `kernels/cuda/penalized_topk.cu` (`kernels::penalized_topk`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_penalized_topk() -> &'static str {
+    cuda_ptx::PENALIZED_TOPK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -222,6 +222,21 @@ impl Maya1Trunk {
         Ok(logits)
     }
 
+    /// [`Self::forward_batch`] left on the device: `[rows, HEAD_ROWS]` F32
+    /// in row order, from the same forwards.
+    pub(crate) fn forward_batch_logits(&self, rows: &mut [Maya1ForwardRow<'_>]) -> Result<Tensor> {
+        let decode = rows.iter().all(|row| row.tokens.len() == 1);
+        let group = if decode { MAX_DECODE_GROUP } else { 1 };
+        let mut parts = rows
+            .chunks_mut(group)
+            .map(|chunk| self.forward(chunk))
+            .collect::<Result<Vec<_>>>()?;
+        if parts.len() == 1 {
+            return Ok(parts.pop().expect("one forward"));
+        }
+        Ok(Tensor::cat(&parts, 0)?)
+    }
+
     /// Run `rows` through the decoder and return each row's head logits at
     /// its last position, `[rows, HEAD_ROWS]` in row order (F32).
     pub fn forward(&self, rows: &mut [Maya1ForwardRow<'_>]) -> Result<Tensor> {

@@ -38,6 +38,9 @@ pub struct Maya1TtsDiagnostics {
     pub dtype: String,
     pub context_tokens: usize,
     pub max_new_tokens: usize,
+    /// Where draws read their logits: device candidates on CUDA, and how
+    /// many rows read whole logits instead.
+    pub sampling: serde_json::Value,
 }
 
 /// What one audio-window quantum did.
@@ -159,6 +162,7 @@ impl Maya1TtsModel {
             },
             context_tokens: self.context_tokens(),
             max_new_tokens: config::MAX_NEW_TOKENS,
+            sampling: crate::kernels::penalized_topk::device_path::summary(),
         }
     }
 

@@ -12,6 +12,7 @@
 
 use super::config::{HEAD_ROWS, MAYA1_DEFAULTS};
 use crate::error::{Error, Result};
+use crate::kernels::penalized_topk::{CandidatePenalty, CandidateRow, MAX_CANDIDATES};
 use crate::models::shared::noise::SplitMix64;
 
 /// Head row of the stop token; rows 1..=7 are control ids.
@@ -69,12 +70,15 @@ impl Maya1SamplingParams {
 #[derive(Debug, Clone)]
 pub struct HeadHistory {
     counts: Vec<u32>,
+    /// The rows with a non-zero count, ascending.
+    distinct: Vec<u32>,
 }
 
 impl Default for HeadHistory {
     fn default() -> Self {
         Self {
             counts: vec![0; HEAD_ROWS],
+            distinct: Vec::new(),
         }
     }
 }
@@ -83,18 +87,33 @@ impl HeadHistory {
     pub fn record(&mut self, row: usize) {
         if let Some(count) = self.counts.get_mut(row) {
             *count += 1;
+            if *count == 1 {
+                if let Err(at) = self.distinct.binary_search(&(row as u32)) {
+                    self.distinct.insert(at, row as u32);
+                }
+            }
         }
     }
 
     /// Undo one [`Self::record`] of `row`.
     pub fn forget(&mut self, row: usize) {
         if let Some(count) = self.counts.get_mut(row) {
+            if *count == 1 {
+                if let Ok(at) = self.distinct.binary_search(&(row as u32)) {
+                    self.distinct.remove(at);
+                }
+            }
             *count = count.saturating_sub(1);
         }
     }
 
     pub fn contains(&self, row: usize) -> bool {
         self.counts.get(row).is_some_and(|&count| count > 0)
+    }
+
+    /// Every row [`Self::contains`], ascending.
+    pub fn distinct(&self) -> &[u32] {
+        &self.distinct
     }
 }
 
@@ -196,6 +215,12 @@ pub fn sample_next(
     rng: &mut SplitMix64,
 ) -> Result<usize> {
     let scores = process_logits(logits, history, generated, params)?;
+    Ok(draw(&scores, rng))
+}
+
+/// The draw of [`sample_next`] from processed `scores` (`-inf` removed;
+/// ties go to the lower position).
+fn draw(scores: &[f32], rng: &mut SplitMix64) -> usize {
     let mut live = scores
         .iter()
         .enumerate()
@@ -213,10 +238,112 @@ pub fn sample_next(
     for (index, &(row, _)) in live.iter().enumerate() {
         cumulative += weights[index];
         if target < cumulative {
-            return Ok(row);
+            return row;
         }
     }
-    Ok(live.last().expect("at least one survivor").0)
+    live.last().expect("at least one survivor").0
+}
+
+/// The device's share of a request's next draw: the head logits with the
+/// repetition penalty applied to its history and the stop and control rows
+/// banned, exactly as [`process_logits`] writes them before the
+/// temperature, and how many of the largest to return. `None` when top-k is
+/// off or wider than the candidates a row returns: that row reads its whole
+/// logits.
+pub(crate) fn device_candidates<'a>(
+    history: &'a HeadHistory,
+    generated: usize,
+    params: &Maya1SamplingParams,
+) -> Option<(CandidateRow<'a>, usize)> {
+    let count = candidate_count(params)?;
+    let penalty = if params.repetition_penalty != 1.0 {
+        CandidatePenalty::Repetition(params.repetition_penalty)
+    } else {
+        CandidatePenalty::None
+    };
+    let first = if generated < params.min_new_tokens {
+        STOP_ROW
+    } else {
+        *CONTROL_ROWS.start()
+    };
+    Some((
+        CandidateRow {
+            penalty,
+            penalized: history.distinct(),
+            banned: first..*CONTROL_ROWS.end() + 1,
+            ..CandidateRow::plain(0)
+        },
+        count,
+    ))
+}
+
+/// Candidates a row returns for `params`: more than its top-k (so the last
+/// one can prove the cut), at least 64.
+fn candidate_count(params: &Maya1SamplingParams) -> Option<usize> {
+    if params.top_k == 0 || params.top_k >= HEAD_ROWS {
+        return None;
+    }
+    let count = (params.top_k + 1).next_power_of_two().max(64);
+    (count <= MAX_CANDIDATES).then_some(count)
+}
+
+/// The rows top-k keeps, from a row's device candidates (`values` its
+/// penalised and banned logits, largest first, at head rows `indices`),
+/// with their tempered scores in row order: exactly the finite rows
+/// [`process_logits`] leaves before top-p, or `None` when the candidates
+/// cannot show that nothing past them survives (the last candidate ties
+/// the k-th score) and the row must be sampled from its whole logits.
+pub(crate) fn candidate_survivors(
+    values: &[f32],
+    indices: &[u32],
+    params: &Maya1SamplingParams,
+) -> Option<Vec<(u32, f32)>> {
+    let k = params.top_k;
+    if k == 0 || k >= values.len() || values.len() != indices.len() || values.len() >= HEAD_ROWS {
+        return None;
+    }
+    let scores = values
+        .iter()
+        .map(|&value| value / params.temperature)
+        .collect::<Vec<_>>();
+    let mut sorted = scores.clone();
+    let (_, kth, _) = sorted.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+    let kth = *kth;
+    // Every row past the candidates scores at most the last one.
+    let last = *scores.last()?;
+    if !last.lt(&kth) {
+        return None;
+    }
+    let mut kept = indices
+        .iter()
+        .zip(scores)
+        .filter(|&(_, score)| !score.lt(&kth))
+        .map(|(&row, score)| (row, score))
+        .collect::<Vec<_>>();
+    kept.sort_by_key(|&(row, _)| row);
+    Some(kept)
+}
+
+/// [`sample_next`]'s top-p and draw over [`candidate_survivors`]: the same
+/// head row and the same uniform consumed.
+pub(crate) fn sample_survivors(
+    survivors: &[(u32, f32)],
+    params: &Maya1SamplingParams,
+    rng: &mut SplitMix64,
+) -> Result<usize> {
+    let mut scores = survivors
+        .iter()
+        .map(|&(_, score)| score)
+        .collect::<Vec<_>>();
+    if params.top_p < 1.0 {
+        apply_top_p(&mut scores, params.top_p);
+    }
+    if scores.iter().all(|score| *score == f32::NEG_INFINITY) {
+        return Err(Error::InferenceError(
+            "Maya1 sampler removed every token".into(),
+        ));
+    }
+    Ok(survivors[draw(&scores, rng)].0 as usize)
 }
 
 #[cfg(test)]
@@ -302,6 +429,118 @@ mod tests {
         let scores = process_logits(&logits, &HeadHistory::default(), 100, &params).unwrap();
         assert!(scores[30].is_finite());
         assert_eq!(scores[31], f32::NEG_INFINITY);
+    }
+
+    /// The device path's draw: candidates packed by the kernel's host
+    /// reference, survivors, then top-p and the draw. `None` where the
+    /// candidates cannot prove the cut.
+    fn candidate_draw(
+        logits: &[f32],
+        history: &HeadHistory,
+        generated: usize,
+        params: &Maya1SamplingParams,
+        rng: &mut SplitMix64,
+    ) -> Option<Result<usize>> {
+        use crate::kernels::penalized_topk::{candidates_packed, unpack};
+        let (row, count) = device_candidates(history, generated, params)?;
+        let tensor = candle_core::Tensor::from_vec(
+            logits.to_vec(),
+            (1, HEAD_ROWS),
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+        let packed = candidates_packed(&tensor, HEAD_ROWS, &[row], count)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
+        let candidates = unpack(&packed, count).remove(0);
+        assert_eq!(candidates.non_finite, 0);
+        let survivors = candidate_survivors(&candidates.values, &candidates.indices, params)?;
+        Some(sample_survivors(&survivors, params, rng))
+    }
+
+    #[test]
+    fn device_candidates_draw_the_host_samplers_token() {
+        let mut source = SplitMix64::new(91);
+        let (mut drawn, mut whole) = (0, 0);
+        for case in 0..300u64 {
+            let scale = [0.5f32, 2.0, 6.0][case as usize % 3];
+            let mut logits = source
+                .standard_normals(HEAD_ROWS)
+                .into_iter()
+                .map(|value| value * scale)
+                .collect::<Vec<_>>();
+            logits[STOP_ROW] = 1.0 + (case % 5) as f32;
+            // Coarse values in some rows: ties everywhere, also at the cut.
+            if case % 4 == 0 {
+                for value in &mut logits {
+                    *value = (*value * 2.0).round() / 2.0;
+                }
+            }
+            if case % 7 == 0 {
+                logits[11] = -0.0;
+                logits[12] = 0.0;
+            }
+            let mut history = HeadHistory::default();
+            for _ in 0..(case as usize * 13) % 600 {
+                history.record(source.next_u64() as usize % HEAD_ROWS);
+            }
+            let params = Maya1SamplingParams {
+                temperature: [0.4, 0.01, 1.3, 2.0][case as usize % 4],
+                top_p: [0.9, 1.0, 0.3, 0.999][(case / 4) as usize % 4],
+                top_k: [50, 1, 7, 63, 64, 200][(case / 3) as usize % 6],
+                repetition_penalty: [1.1, 1.0, 2.0][(case / 2) as usize % 3],
+                min_new_tokens: 28,
+            };
+            let generated = [0, 27, 28, 400][(case / 5) as usize % 4];
+            let seed = 1 + case;
+            let mut host_rng = SplitMix64::new(seed);
+            let expected =
+                sample_next(&logits, &history, generated, &params, &mut host_rng).unwrap();
+            let mut rng = SplitMix64::new(seed);
+            match candidate_draw(&logits, &history, generated, &params, &mut rng) {
+                Some(token) => {
+                    assert_eq!(token.unwrap(), expected, "case {case}: {params:?}");
+                    assert_eq!(rng.next_u64(), host_rng.next_u64(), "case {case}: stream");
+                    drawn += 1;
+                }
+                None => whole += 1,
+            }
+        }
+        // Only rows tied at the cut read their whole logits.
+        assert!(drawn >= 250, "{drawn} drawn from candidates, {whole} whole");
+    }
+
+    #[test]
+    fn candidates_tied_at_the_cut_ask_for_the_whole_row() {
+        // 64 equal leaders: the k-th score ties the last candidate, so a
+        // tie past the candidates could survive top-k.
+        let mut logits = vec![-5.0; HEAD_ROWS];
+        for row in 100..200 {
+            logits[row] = 3.0;
+        }
+        let params = Maya1SamplingParams::default();
+        let mut rng = SplitMix64::new(3);
+        assert!(candidate_draw(&logits, &HeadHistory::default(), 100, &params, &mut rng).is_none());
+        // Top-k off: no candidates at all.
+        let params = Maya1SamplingParams { top_k: 0, ..params };
+        assert!(device_candidates(&HeadHistory::default(), 0, &params).is_none());
+    }
+
+    #[test]
+    fn history_lists_its_distinct_rows_through_rollbacks() {
+        let mut history = HeadHistory::default();
+        for row in [9, 3, 9, 200, 3] {
+            history.record(row);
+        }
+        assert_eq!(history.distinct(), &[3, 9, 200]);
+        history.forget(9);
+        assert_eq!(history.distinct(), &[3, 9, 200]);
+        history.forget(9);
+        history.forget(200);
+        assert_eq!(history.distinct(), &[3]);
     }
 
     #[test]

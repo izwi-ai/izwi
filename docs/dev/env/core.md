@@ -185,6 +185,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_MAX_SEQUENCE_LENGTH` | choice | `auto` | startup | Context-length cap: auto (model's context) or a positive token count; invalid ignored. |
 | `IZWI_MAX_STAGED_TRANSACTIONS` | integer | 0 (automatic device ceiling) | startup | Maximum staged transactions; 0 or invalid ignored, leaving the automatic ceiling. |
 | `IZWI_MAX_TOKENS_PER_STEP` | integer | 0 (backend automatic budget) | startup | Scheduler token budget per step; 0 or invalid ignored, leaving the backend's automatic budget. |
+| `IZWI_MAYA1_DEVICE_SAMPLING` | flag | `true` | first use | Kill switch: false reads each Maya1 row's whole head logits (~115 KB) back every step and samples on the host, instead of its top candidates under the repetition penalty and bans computed on the device (CUDA). |
 | `IZWI_MAYA2_MODEL_DIR` | path | unset (test skipped) | test harness | Maya 2 Native model directory (with its mimi/ and ecapa/ companions) for the ignored real-weight tests. |
 | `IZWI_MEDIA_LOCAL_ROOT` | path | unset (local file media disabled) | first use | Sets the absolute directory Qwen3.5 vision may read file:// media from; unset disables local media. |
 | `IZWI_METAL_DTYPE` | choice | `auto` | model load | Overrides the Metal compute dtype for all families: auto, f32, f16 or bf16 (aliases accepted); invalid warns, uses auto. |

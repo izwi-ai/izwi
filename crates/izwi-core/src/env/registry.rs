@@ -1237,6 +1237,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Scheduler token budget per step; 0 or invalid ignored, leaving the backend's automatic budget.",
     ),
     CoreEnvVar::new(
+        "IZWI_MAYA1_DEVICE_SAMPLING",
+        Flag,
+        "true",
+        Once,
+        "Kill switch: false reads each Maya1 row's whole head logits (~115 KB) back every step and samples on the host, instead of its top candidates under the repetition penalty and bans computed on the device (CUDA).",
+    ),
+    CoreEnvVar::new(
         "IZWI_MAYA2_MODEL_DIR",
         Path,
         "unset (test skipped)",
