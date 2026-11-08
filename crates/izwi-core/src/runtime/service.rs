@@ -97,7 +97,8 @@ use crate::models::architectures::qwen3::asr::{
     Qwen3AsrAudioPreparationGeometry, Qwen3AsrHostFeatures, Qwen3AsrPreparedAudio,
 };
 use crate::models::architectures::vibevoice::asr::{
-    VibeVoiceAsrPreparationDecision, VibeVoiceAsrPreparedArtifact, VibeVoiceAsrPreparedGeometry,
+    VibeVoiceAsrHostAudio, VibeVoiceAsrPreparationDecision, VibeVoiceAsrPreparedArtifact,
+    VibeVoiceAsrPreparedGeometry,
 };
 use crate::models::architectures::vibevoice::tts::{
     vibevoice_tts_auto_max_frames_for_text, VibeVoiceSpeakerReference,

@@ -297,8 +297,8 @@ pub(super) struct VibeVoiceEncoderPending {
     pub(super) model: AsrModelLease,
     /// The model's catalog name, for the ASR metrics.
     pub(super) model_label: &'static str,
-    pub(super) samples: Arc<[f32]>,
-    pub(super) sample_rate: u32,
+    /// The host encoder audio, dropped once the upload has read it.
+    pub(super) host_audio: VibeVoiceAsrHostAudio,
     pub(super) language: Option<String>,
     pub(super) prompt: Option<String>,
     pub(super) geometry: VibeVoiceAsrPreparedGeometry,
@@ -321,6 +321,15 @@ impl VibeVoiceEncoderBatcher {
         };
         let cost = pending.geometry.work_cost();
         let cancellation = pending.cancellation.clone();
+        // The upload consumes the host audio and the row commits only the
+        // request and its artifact. Restore the audio's claim to pending
+        // first: usage may only rise through an observation, and the
+        // reservation still covers the audio until the upload ends.
+        pending
+            .job
+            .prepare_materialized_release(JobResourceObservation::host(
+                pending.retained_request_host_bytes,
+            ))?;
         let row = self.coordinator.seal_preparation_row(
             pending.job,
             &pending.contract,
@@ -331,8 +340,7 @@ impl VibeVoiceEncoderBatcher {
         )?;
         let model = pending.model;
         let model_label = pending.model_label;
-        let samples = pending.samples;
-        let sample_rate = pending.sample_rate;
+        let host_audio = pending.host_audio;
         let language = pending.language;
         let prompt = pending.prompt;
         let retained_request_host_bytes = pending.retained_request_host_bytes;
@@ -349,9 +357,8 @@ impl VibeVoiceEncoderBatcher {
                     ));
                 }
                 let encode_started = Instant::now();
-                let artifact = model.prepare_vibevoice_retained_artifact(
-                    samples.as_ref(),
-                    sample_rate,
+                let artifact = model.prepare_vibevoice_retained_artifact_from_host_audio(
+                    host_audio,
                     language.as_deref(),
                     prompt.as_deref(),
                 )?;

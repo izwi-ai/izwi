@@ -34,9 +34,9 @@ use crate::models::architectures::gemma3::chat::{
 use crate::models::architectures::granite_speech::asr::granite_speech_request_plan;
 use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechAsrGenerationOptions, GraniteSpeechAsrModel, GraniteSpeechAsrTranscriptionOutput,
-    GraniteSpeechDecodeCheckpoint, GraniteSpeechDecodeState, GraniteSpeechDecodeStep,
-    GraniteSpeechPhysicalStateSpec, GraniteSpeechPreparationBatchGeometry,
-    GraniteSpeechAudioFeatures, GraniteSpeechFeatureRow, GraniteSpeechPreparationBatchRow,
+    GraniteSpeechAudioFeatures, GraniteSpeechDecodeCheckpoint, GraniteSpeechDecodeState,
+    GraniteSpeechDecodeStep, GraniteSpeechFeatureRow, GraniteSpeechPhysicalStateSpec,
+    GraniteSpeechPreparationBatchGeometry, GraniteSpeechPreparationBatchRow,
     GraniteSpeechPreparedGeometry, GraniteSpeechPreparedPromptArtifact, GraniteSpeechTask,
 };
 use crate::models::architectures::granite_speech5::asr::{
@@ -120,10 +120,11 @@ use crate::models::architectures::sortformer::diarization::{
 };
 use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrDecodeCheckpoint, VibeVoiceAsrDecodeState, VibeVoiceAsrDecodeStep,
-    VibeVoiceAsrGenerationOptions, VibeVoiceAsrModel, VibeVoiceAsrPreparationDecision,
-    VibeVoiceAsrPreparationStageSeal, VibeVoiceAsrPreparedArtifact,
-    VibeVoiceAsrPreparedTokenizerSpan, VibeVoiceAsrRetainedPrefillBatchRow,
-    VibeVoiceAsrRetainedTokenizerQuantum, VibeVoiceAsrTranscriptionOutput,
+    VibeVoiceAsrGenerationOptions, VibeVoiceAsrHostAudio, VibeVoiceAsrModel,
+    VibeVoiceAsrPreparationDecision, VibeVoiceAsrPreparationStageSeal,
+    VibeVoiceAsrPreparedArtifact, VibeVoiceAsrPreparedTokenizerSpan,
+    VibeVoiceAsrRetainedPrefillBatchRow, VibeVoiceAsrRetainedTokenizerQuantum,
+    VibeVoiceAsrTranscriptionOutput,
 };
 use crate::models::architectures::vibevoice::tts::VibeVoiceTtsModel;
 use crate::models::architectures::vibevoice::VibeVoicePhysicalStateSpec;
@@ -140,9 +141,8 @@ use crate::models::architectures::voxtral::realtime::{
 use crate::models::architectures::voxtral::tts::VoxtralTtsModel;
 use crate::models::architectures::whisper::asr::{
     AsrTranscriptionOutput as WhisperAsrTranscriptionOutput, WhisperAudioBatchRow,
-    WhisperHostFeatures,
     WhisperAudioPreparationStageSeal, WhisperDecodeCheckpoint, WhisperDecodeState,
-    WhisperPreparedWindow, WhisperTerminalTransition, WhisperTurboAsrModel,
+    WhisperHostFeatures, WhisperPreparedWindow, WhisperTerminalTransition, WhisperTurboAsrModel,
     WhisperWindowPreparationBatchGeometry, WhisperWindowPreparationGeometry,
 };
 use crate::models::architectures::whisper::WhisperPhysicalStateSpec;
@@ -2489,6 +2489,42 @@ impl NativeAsrModel {
             ),
             _ => Err(Error::InvalidInput(
                 "VibeVoice preparation route was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    /// Resamples, normalizes and pads one VibeVoice request's audio on the
+    /// host.
+    pub(crate) fn prepare_vibevoice_retained_host_audio(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<VibeVoiceAsrHostAudio> {
+        match self {
+            Self::VibeVoice(model) => {
+                model.prepare_retained_host_audio(audio, sample_rate, language, prompt)
+            }
+            _ => Err(Error::InvalidInput(
+                "VibeVoice audio was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    /// Builds one VibeVoice request's retained artifact from its host audio.
+    pub(crate) fn prepare_vibevoice_retained_artifact_from_host_audio(
+        &self,
+        host: VibeVoiceAsrHostAudio,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<VibeVoiceAsrPreparedArtifact> {
+        match self {
+            Self::VibeVoice(model) => {
+                model.prepare_retained_artifact_from_host_audio(host, language, prompt)
+            }
+            _ => Err(Error::InvalidInput(
+                "VibeVoice preparation was requested from another ASR model".into(),
             )),
         }
     }

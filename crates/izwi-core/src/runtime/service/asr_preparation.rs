@@ -654,7 +654,7 @@ impl RuntimeService {
                 ))
             })?;
         let model_for_shape = model.clone();
-        let (prepared, geometry) = self
+        let (prepared, geometry, host_audio) = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
@@ -665,6 +665,21 @@ impl RuntimeService {
                     request.asr_language_for_execution(),
                     request.asr_prompt_for_execution(),
                 )?;
+                // The resample, normalization and padding run here, on a host
+                // worker, so the device job runs only the upload.
+                let host_audio = matches!(decision, VibeVoiceAsrPreparationDecision::Retained(_))
+                    .then(|| {
+                        let started = Instant::now();
+                        let host_audio = model_for_shape.prepare_vibevoice_retained_host_audio(
+                            &samples,
+                            sample_rate,
+                            request.asr_language_for_execution(),
+                            request.asr_prompt_for_execution(),
+                        );
+                        record_host_features(variant, started);
+                        host_audio
+                    })
+                    .transpose()?;
                 let audio_seconds = samples.len() as f32 / sample_rate.max(1) as f32;
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
                 match decision {
@@ -680,7 +695,7 @@ impl RuntimeService {
                             geometry.prompt_tokens,
                             context_limit,
                         )?;
-                        Ok((request, Some(geometry)))
+                        Ok((request, Some(geometry), host_audio))
                     }
                     VibeVoiceAsrPreparationDecision::LegacyInvocation => {
                         let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
@@ -702,7 +717,7 @@ impl RuntimeService {
                             request.streaming,
                         );
                         request.install_prepared_asr_long_form_atomic(plan)?;
-                        Ok((request, None))
+                        Ok((request, None, None))
                     }
                 }
             })
@@ -711,7 +726,17 @@ impl RuntimeService {
             u64::try_from(retained_engine_request_input_bytes(&prepared)?).map_err(|_| {
                 Error::Overloaded("VibeVoice ASR retained input exceeds u64".into())
             })?;
-        job.record_materialized_usage(JobResourceObservation::host(retained_request_host_bytes))?;
+        // The host audio is held beside the request until the upload drops
+        // it.
+        let host_audio_bytes = host_audio
+            .as_ref()
+            .map(VibeVoiceAsrHostAudio::host_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        let prepared_host_bytes = retained_request_host_bytes
+            .checked_add(host_audio_bytes)
+            .ok_or_else(|| Error::Overloaded("VibeVoice prepared host bytes overflow".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
         if prepared.uses_asr_long_form_atomic() {
             let (spec, observation) = match self.coordinator_job_for_request(&prepared) {
@@ -744,7 +769,11 @@ impl RuntimeService {
             .ok_or_else(|| Error::Overloaded("VibeVoice retained host bytes overflow".into()))?;
         let resources = asr_encoder_retained_resources(
             self.backend_router.context().backend_kind,
-            retained_host_bytes,
+            retained_host_bytes
+                .checked_add(host_audio_bytes)
+                .ok_or_else(|| {
+                    Error::Overloaded("VibeVoice prepared host bytes overflow".into())
+                })?,
             geometry.retained_device_bytes,
         )?;
         let preparation_spec = JobSpec {
@@ -760,7 +789,7 @@ impl RuntimeService {
             .admit_observed_from_preparation(
                 bridge,
                 preparation_spec,
-                JobResourceObservation::host(retained_request_host_bytes),
+                JobResourceObservation::host(prepared_host_bytes),
             )
             .await
         {
@@ -772,9 +801,9 @@ impl RuntimeService {
                 return Err(error);
             }
         };
-        let (samples, sample_rate) = prepared
-            .prepared_asr_audio_for_executor()?
-            .ok_or_else(|| Error::InferenceError("VibeVoice decoded audio was lost".into()))?;
+        let host_audio = host_audio.ok_or_else(|| {
+            Error::InferenceError("VibeVoice normal route lost its host audio".into())
+        })?;
         let outcome = self
             .vibevoice_encoder_batcher
             .submit(VibeVoiceEncoderPending {
@@ -782,8 +811,7 @@ impl RuntimeService {
                 contract: preparation_contract,
                 model: model.clone(),
                 model_label: variant.dir_name(),
-                samples,
-                sample_rate,
+                host_audio,
                 language: prepared.asr_language_for_execution().map(str::to_owned),
                 prompt: prepared.asr_prompt_for_execution().map(str::to_owned),
                 geometry,
