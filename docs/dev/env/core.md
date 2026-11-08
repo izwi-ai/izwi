@@ -385,6 +385,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_VIBEVOICE_REFERENCE_TEXT` | text | required (no default) | test harness | Transcript of the VibeVoice smoke reference WAV. |
 | `IZWI_VIBEVOICE_REFERENCE_WAV` | path | required (no default) | test harness | Reference voice WAV for the VibeVoice clone smoke test. |
 | `IZWI_VIBEVOICE_TEXT` | text | built-in TARGET sentence | test harness | Text the VibeVoice clone smoke test synthesizes. |
+| `IZWI_VIBEVOICE_TTS_BATCHED_DECODE` | flag | `true` | first use | Decodes a VibeVoice TTS frame's positive and negative LM rows of every request in one launch per cache arena and scores their control tokens with one readback; false runs two single-row forwards and a control-token readback per request. |
 | `IZWI_VIBEVOICE_TTS_DTYPE` | choice | VibeVoice family/backend default | model load | Overrides the VibeVoice TTS weight dtype (e.g. f32, f16, bf16); also used by load memory planning. |
 | `IZWI_VOXTRAL_DTYPE` | choice | backend default | model load | Fallback Voxtral TTS dtype override used when IZWI_VOXTRAL_TTS_DTYPE is unset. |
 | `IZWI_VOXTRAL_TTS_DTYPE` | choice | IZWI_VOXTRAL_DTYPE, else backend default | model load | Overrides the Voxtral TTS model dtype (e.g. f32, f16, bf16). |

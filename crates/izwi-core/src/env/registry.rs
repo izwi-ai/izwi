@@ -2672,6 +2672,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Text the VibeVoice clone smoke test synthesizes.",
     ),
     CoreEnvVar::new(
+        "IZWI_VIBEVOICE_TTS_BATCHED_DECODE",
+        Flag,
+        "true",
+        Once,
+        "Decodes a VibeVoice TTS frame's positive and negative LM rows of every request in one launch per cache arena and scores their control tokens with one readback; false runs two single-row forwards and a control-token readback per request.",
+    ),
+    CoreEnvVar::new(
         "IZWI_VIBEVOICE_TTS_DTYPE",
         Choice,
         "VibeVoice family/backend default",

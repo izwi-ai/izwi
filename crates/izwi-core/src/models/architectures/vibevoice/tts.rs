@@ -72,6 +72,7 @@ pub const VIBEVOICE_TTS_DEFAULT_CFG_SCALE: f32 = 1.3;
 pub const VIBEVOICE_TTS_DEFAULT_DIFFUSION_STEPS: usize = 10;
 const VIBEVOICE_CFG_BATCHING_ENV: &str = "IZWI_VIBEVOICE_CFG_BATCHING";
 const VIBEVOICE_CUDA_DDPM_STEPS_ENV: &str = "IZWI_VIBEVOICE_CUDA_DDPM_STEPS";
+const VIBEVOICE_TTS_BATCHED_DECODE_ENV: &str = "IZWI_VIBEVOICE_TTS_BATCHED_DECODE";
 static NEXT_VIBEVOICE_TTS_STATE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_VIBEVOICE_TTS_MODEL_LOAD_NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -808,34 +809,23 @@ impl VibeVoiceTtsModel {
             state.semantic_clock,
             tokenizer_quantum,
         )?;
-        let hidden = self.language_model.forward_managed_hidden_with_embeds(
-            &feedback.embed,
-            state.positive_position,
-            &mut state.positive_cache,
-            None,
-        )?;
-        let negative_hidden = self.language_model.forward_managed_hidden_with_embeds(
-            &feedback.embed,
-            state.negative_position,
-            &mut state.negative_cache,
-            None,
-        )?;
+        let mut hidden = decode_lm_rows_hidden(
+            &self.language_model,
+            &[&feedback.embed, &feedback.embed],
+            &[state.positive_position, state.negative_position],
+            &mut [&mut state.positive_cache, &mut state.negative_cache],
+        )?
+        .into_iter();
         state.positive_position += 1;
         state.negative_position += 1;
         state.acoustic_clock += 1;
         state.semantic_clock += 1;
-        state.last_hidden = Some(last_sequence_hidden(
-            &hidden,
-            "VibeVoice retained TTS positive decode",
-        )?);
-        state.negative_last_hidden = Some(last_sequence_hidden(
-            &negative_hidden,
-            "VibeVoice retained TTS negative decode",
-        )?);
+        state.last_hidden = hidden.next();
+        state.negative_last_hidden = hidden.next();
         state.scaled_latents.push(latent_frame);
         state.frame_audio.push(feedback.audio);
         state.managed_completions_drained = false;
-        state.finished = self.retained_frame_ends_row(state)?;
+        state.finished = self.retained_frames_end_rows(&[&*state])?[0];
         let step = VibeVoiceTtsRetainedDecodeStep {
             frames_generated: state.scaled_latents.len(),
             finished: state.finished,
@@ -876,18 +866,9 @@ impl VibeVoiceTtsModel {
                     "VibeVoice retained diffusion batch requires compatible live rows".into(),
                 ));
             }
-            if state.scaled_latents.len() >= MIN_FRAMES_BEFORE_STOP {
-                let predicted = next_tts_control_token_from_hidden(
-                    &self.language_model,
-                    state.last_hidden.as_ref().unwrap(),
-                    self.tokenizer.specials(),
-                )?;
-                if predicted != self.tokenizer.specials().speech_pad {
-                    return Err(Error::InvalidInput(
-                        "VibeVoice terminal control rows require scalar fallback".into(),
-                    ));
-                }
-            }
+            // An unfinished row's last step found `speech_pad` next (see
+            // `retained_frames_end_rows`), so its control token is not
+            // scored again here.
         }
         let plan = vibevoice_diffusion_plan(
             &self.prediction_head,
@@ -901,7 +882,7 @@ impl VibeVoiceTtsModel {
             self.device.kind,
         )?;
         let latents = self.sample_speech_latent_cross_request_batch(states, &plan)?;
-        let mut steps = Vec::with_capacity(states.len());
+        let mut feedback_embeds = Vec::with_capacity(states.len());
         for ((state, quantum), latent) in states.iter_mut().zip(tokenizer_quanta).zip(latents) {
             let latent_frame = latent.unsqueeze(1)?;
             let feedback = self.generated_speech_embed_retained(
@@ -911,38 +892,52 @@ impl VibeVoiceTtsModel {
                 state.semantic_clock,
                 quantum,
             )?;
-            let hidden = self.language_model.forward_managed_hidden_with_embeds(
-                &feedback.embed,
-                state.positive_position,
-                &mut state.positive_cache,
-                None,
-            )?;
-            let negative_hidden = self.language_model.forward_managed_hidden_with_embeds(
-                &feedback.embed,
-                state.negative_position,
-                &mut state.negative_cache,
-                None,
-            )?;
+            state.scaled_latents.push(latent_frame);
+            state.frame_audio.push(feedback.audio);
+            feedback_embeds.push(feedback.embed);
+        }
+        // Every row's positive and negative LM step: one launch per arena
+        // (two for N requests), not 2N single-row forwards.
+        let rows = states.len();
+        let mut positions = Vec::with_capacity(rows * 2);
+        positions.extend(states.iter().map(|state| state.positive_position));
+        positions.extend(states.iter().map(|state| state.negative_position));
+        let mut hidden = {
+            let mut positive = Vec::with_capacity(rows * 2);
+            let mut negative = Vec::with_capacity(rows);
+            for state in states.iter_mut() {
+                let state = &mut **state;
+                positive.push(&mut state.positive_cache);
+                negative.push(&mut state.negative_cache);
+            }
+            positive.extend(negative);
+            let embeds = feedback_embeds
+                .iter()
+                .chain(&feedback_embeds)
+                .collect::<Vec<_>>();
+            decode_lm_rows_hidden(&self.language_model, &embeds, &positions, &mut positive)?
+        };
+        let negative_hidden = hidden.split_off(rows);
+        for ((state, positive), negative) in states.iter_mut().zip(hidden).zip(negative_hidden) {
             state.positive_position += 1;
             state.negative_position += 1;
             state.acoustic_clock += 1;
             state.semantic_clock += 1;
-            state.last_hidden = Some(last_sequence_hidden(
-                &hidden,
-                "VibeVoice retained TTS batched positive decode",
-            )?);
-            state.negative_last_hidden = Some(last_sequence_hidden(
-                &negative_hidden,
-                "VibeVoice retained TTS batched negative decode",
-            )?);
-            state.scaled_latents.push(latent_frame);
-            state.frame_audio.push(feedback.audio);
+            state.last_hidden = Some(positive);
+            state.negative_last_hidden = Some(negative);
             state.managed_completions_drained = false;
-            // Same stop rule as the scalar step: a row whose next control
-            // token is speech_end / endoftext finishes now, instead of
-            // falling back to the scalar step next quantum and sampling one
-            // more latent from its end-of-speech state (VVT-6).
-            state.finished = self.retained_frame_ends_row(state)?;
+        }
+        // Same stop rule as the scalar step: a row whose next control token
+        // is speech_end / endoftext finishes now, instead of falling back to
+        // the scalar step next quantum and sampling one more latent from its
+        // end-of-speech state (VVT-6). Every row is scored at once.
+        let finished = {
+            let views = states.iter().map(|state| &**state).collect::<Vec<_>>();
+            self.retained_frames_end_rows(&views)?
+        };
+        let mut steps = Vec::with_capacity(rows);
+        for (state, finished) in states.iter_mut().zip(finished) {
+            state.finished = finished;
             let step = VibeVoiceTtsRetainedDecodeStep {
                 frames_generated: state.scaled_latents.len(),
                 finished: state.finished,
@@ -953,30 +948,37 @@ impl VibeVoiceTtsModel {
         Ok(steps)
     }
 
-    /// Whether a row is done after committing a frame: the frame cap, or,
+    /// Whether each row is done after committing a frame: the frame cap, or,
     /// from [`MIN_FRAMES_BEFORE_STOP`] frames on, the LM predicting a
     /// non-diffusion control token next. The reference stops there and
-    /// never samples a latent for `speech_end` / `endoftext`.
-    fn retained_frame_ends_row(&self, state: &VibeVoiceTtsRetainedState) -> Result<bool> {
-        let frames = state.scaled_latents.len();
-        if frames >= state.params.max_frames.max(1) {
-            return Ok(true);
+    /// never samples a latent for `speech_end` / `endoftext`. The rows that
+    /// need a control token are scored together with one readback. This is
+    /// the only place a row's control token is scored: an unfinished row
+    /// past the minimum therefore predicted `speech_pad`.
+    fn retained_frames_end_rows(&self, states: &[&VibeVoiceTtsRetainedState]) -> Result<Vec<bool>> {
+        let mut ends = Vec::with_capacity(states.len());
+        let mut scored = Vec::new();
+        let mut hidden = Vec::new();
+        for (row, state) in states.iter().enumerate() {
+            let frames = state.scaled_latents.len();
+            ends.push(frames >= state.params.max_frames.max(1));
+            if !ends[row] && frames >= MIN_FRAMES_BEFORE_STOP {
+                scored.push(row);
+                hidden.push(state.last_hidden.as_ref().ok_or_else(|| {
+                    Error::InferenceError("VibeVoice retained TTS has no positive hidden".into())
+                })?);
+            }
         }
-        if frames < MIN_FRAMES_BEFORE_STOP {
-            return Ok(false);
+        if scored.is_empty() {
+            return Ok(ends);
         }
-        let predicted = next_tts_control_token_from_hidden(
-            &self.language_model,
-            state.last_hidden.as_ref().ok_or_else(|| {
-                Error::InferenceError("VibeVoice retained TTS has no positive hidden".into())
-            })?,
-            self.tokenizer.specials(),
-        )?;
-        Ok(control_token_ends_speech(
-            frames,
-            predicted,
-            self.tokenizer.specials(),
-        ))
+        let specials = self.tokenizer.specials();
+        let predicted = next_tts_control_tokens_for_rows(&self.language_model, &hidden, specials)?;
+        for (row, predicted) in scored.into_iter().zip(predicted) {
+            ends[row] =
+                control_token_ends_speech(states[row].scaled_latents.len(), predicted, specials);
+        }
+        Ok(ends)
     }
 
     pub(crate) fn retained_decode_batch_eligible(
@@ -994,16 +996,9 @@ impl VibeVoiceTtsModel {
         {
             return Ok(false);
         }
-        if state.scaled_latents.len() < MIN_FRAMES_BEFORE_STOP {
-            return Ok(true);
-        }
-        Ok(next_tts_control_token_from_hidden(
-            &self.language_model,
-            state.last_hidden.as_ref().ok_or_else(|| {
-                Error::InferenceError("VibeVoice retained TTS has no positive hidden".into())
-            })?,
-            self.tokenizer.specials(),
-        )? == self.tokenizer.specials().speech_pad)
+        // An unfinished row's last step already found `speech_pad` next
+        // (`retained_frames_end_rows`): no control token is scored here.
+        Ok(state.last_hidden.is_some())
     }
 
     pub(crate) fn finalize_retained_state(
@@ -2172,6 +2167,120 @@ fn next_tts_control_token_from_hidden(
     select_next_tts_control_token(&scores)
 }
 
+/// Each row's next control token from its `[1, hidden]` state, scored in
+/// one `[rows, 3]` head call and read back once. With
+/// `IZWI_VIBEVOICE_TTS_BATCHED_DECODE=false`, one call and readback per row.
+fn next_tts_control_tokens_for_rows(
+    language_model: &Qwen3Model,
+    hidden: &[&Tensor],
+    specials: &VibeVoiceSpecialTokens,
+) -> Result<Vec<u32>> {
+    if !vibevoice_tts_batched_decode_enabled() {
+        return hidden
+            .iter()
+            .map(|hidden| next_tts_control_token_from_hidden(language_model, hidden, specials))
+            .collect();
+    }
+    let tokens = tts_control_tokens(specials);
+    let rows = Tensor::cat(hidden, 0)?;
+    let scores = language_model
+        .logits_rows_for_tokens(&rows, &tokens)?
+        .to_dtype(DType::F32)?
+        .to_vec2::<f32>()?;
+    if scores.len() != hidden.len() {
+        return Err(Error::InferenceError(format!(
+            "VibeVoice TTS scored {} control rows for {}",
+            scores.len(),
+            hidden.len()
+        )));
+    }
+    scores
+        .iter()
+        .map(|row| {
+            let pairs = tokens
+                .iter()
+                .copied()
+                .zip(row.iter().copied())
+                .collect::<Vec<_>>();
+            select_next_tts_control_token(&pairs)
+        })
+        .collect()
+}
+
+/// Decoder rows `[1, 1, hidden]` at `positions` against `caches`, returning
+/// each row's `[1, hidden]` state. Rows that share a physical arena (every
+/// request's positive rows, and every request's negative rows) decode in one
+/// managed launch per op; a request's positive and negative rows live in two
+/// arenas, so N requests take two launches instead of 2N single-row
+/// forwards. With `IZWI_VIBEVOICE_TTS_BATCHED_DECODE=false`, one forward per
+/// row as before.
+fn decode_lm_rows_hidden(
+    language_model: &Qwen3Model,
+    embeds: &[&Tensor],
+    positions: &[usize],
+    caches: &mut [&mut PhysicalPagedKvCache],
+) -> Result<Vec<Tensor>> {
+    if embeds.len() != positions.len() || embeds.len() != caches.len() {
+        return Err(Error::InvalidInput(
+            "VibeVoice TTS decode rows, positions and caches differ".into(),
+        ));
+    }
+    if !vibevoice_tts_batched_decode_enabled() {
+        return embeds
+            .iter()
+            .zip(positions)
+            .zip(caches.iter_mut())
+            .map(|((embed, &position), cache)| {
+                let hidden = language_model
+                    .forward_managed_hidden_with_embeds(embed, position, cache, None)?;
+                last_sequence_hidden(&hidden, "VibeVoice retained TTS decode")
+            })
+            .collect();
+    }
+    let mut groups: Vec<(crate::kv::KvArenaId, Vec<usize>)> = Vec::new();
+    for (row, cache) in caches.iter().enumerate() {
+        let arena = cache.arena().id();
+        match groups.iter_mut().find(|(id, _)| *id == arena) {
+            Some((_, rows)) => rows.push(row),
+            None => groups.push((arena, vec![row])),
+        }
+    }
+    let mut hidden = vec![None; embeds.len()];
+    let mut slots = caches.iter_mut().map(Some).collect::<Vec<_>>();
+    for (_, rows) in groups {
+        let group_embeds = rows.iter().map(|&row| embeds[row]).collect::<Vec<_>>();
+        let group_positions = rows.iter().map(|&row| positions[row]).collect::<Vec<_>>();
+        let mut group_caches =
+            rows.iter()
+                .map(|&row| {
+                    slots[row].take().map(|cache| &mut **cache).ok_or_else(|| {
+                        Error::InvalidInput("VibeVoice TTS decode row repeats".into())
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+        let output = language_model.forward_managed_decode_batch_hidden_with_embeds(
+            &Tensor::cat(&group_embeds, 0)?,
+            &group_positions,
+            &mut group_caches,
+        )?;
+        for (index, &row) in rows.iter().enumerate() {
+            hidden[row] = Some(output.i((index, 0, ..))?.unsqueeze(0)?);
+        }
+    }
+    hidden
+        .into_iter()
+        .map(|row| row.ok_or_else(|| Error::InferenceError("VibeVoice TTS lost a row".into())))
+        .collect()
+}
+
+/// `IZWI_VIBEVOICE_TTS_BATCHED_DECODE` (default on): decode a frame's LM rows
+/// and score its control tokens for every row together.
+fn vibevoice_tts_batched_decode_enabled() -> bool {
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(VIBEVOICE_TTS_BATCHED_DECODE_ENV, true));
+    ENABLED.get()
+}
+
 /// The stop rule shared by the scalar and batched decode steps: after
 /// `frames` committed frames, a predicted `speech_end` or `endoftext` ends the
 /// row once the minimum length is reached; `speech_pad` continues it.
@@ -2486,6 +2595,103 @@ fn take_streamed_frame_audio(frame_audio: &[Tensor], streamed: &mut usize) -> Re
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn tensor_values(tensor: &Tensor) -> Vec<f32> {
+        tensor
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    /// A frame's LM rows decode together: a row's hidden state is what it
+    /// decodes alone and what the single-row forward gives (three rows of
+    /// unequal lengths; to GEMM rounding, ~1e-7 here, as a one-row matmul
+    /// accumulates differently from a three-row one), and the control-token
+    /// scores of all rows at once are each row's own.
+    #[test]
+    fn batched_lm_rows_decode_like_each_row_alone() {
+        use crate::kernels::numeric_check::{max_abs_diff, xorshift_tensor};
+        use crate::models::architectures::qwen3::core::tiny_qwen3_model_for_test;
+        use crate::models::shared::attention::physical::test_physical_caches_on;
+
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model_for_test(&device);
+        let rows = 3;
+        // A world's rows share one arena, as every request's positive rows do.
+        let world = || test_physical_caches_on(&device, 1, 1, 2, 64, rows);
+        let (mut batched, mut alone, mut reference) = (world(), world(), world());
+        let embed =
+            |seed: u64, len: usize| xorshift_tensor(&[1, len, 4], seed, 0.5, &device).unwrap();
+        let mut positions = vec![5usize, 2, 9];
+        for (row, &len) in positions.iter().enumerate() {
+            let prompt = embed(row as u64 + 1, len);
+            for caches in [&mut batched, &mut alone, &mut reference] {
+                model
+                    .forward_managed_hidden_with_embeds(&prompt, 0, &mut caches[row], None)
+                    .unwrap();
+                caches[row].take_completed_writes();
+            }
+        }
+        for step in 0..4u64 {
+            let embeds = (0..rows)
+                .map(|row| embed(100 + step * 10 + row as u64, 1))
+                .collect::<Vec<_>>();
+            let together = decode_lm_rows_hidden(
+                &model,
+                &embeds.iter().collect::<Vec<_>>(),
+                &positions,
+                &mut batched.iter_mut().collect::<Vec<_>>(),
+            )
+            .unwrap();
+            for row in 0..rows {
+                let single = decode_lm_rows_hidden(
+                    &model,
+                    &[&embeds[row]],
+                    &[positions[row]],
+                    &mut [&mut alone[row]],
+                )
+                .unwrap();
+                let diff = max_abs_diff(&tensor_values(&together[row]), &tensor_values(&single[0]));
+                assert!(diff <= 1e-5, "row {row} step {step}: alone |diff| {diff}");
+                let forward = model
+                    .forward_managed_hidden_with_embeds(
+                        &embeds[row],
+                        positions[row],
+                        &mut reference[row],
+                        None,
+                    )
+                    .unwrap();
+                let forward = last_sequence_hidden(&forward, "reference").unwrap();
+                let diff = max_abs_diff(&tensor_values(&together[row]), &tensor_values(&forward));
+                assert!(diff <= 1e-5, "row {row} step {step}: |diff| {diff}");
+            }
+            for caches in [&mut batched, &mut alone, &mut reference] {
+                for cache in caches.iter_mut() {
+                    cache.take_completed_writes();
+                }
+            }
+            let tokens = [1u32, 4, 6];
+            let scores = tensor_values(
+                &model
+                    .logits_rows_for_tokens(&Tensor::cat(&together, 0).unwrap(), &tokens)
+                    .unwrap(),
+            );
+            for (row, hidden) in together.iter().enumerate() {
+                let own = model
+                    .logits_from_hidden_for_tokens(hidden, &tokens)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(_, score)| score)
+                    .collect::<Vec<_>>();
+                let diff = max_abs_diff(&scores[row * 3..row * 3 + 3], &own);
+                assert!(diff <= 1e-5, "row {row} step {step}: score |diff| {diff}");
+            }
+            positions.iter_mut().for_each(|position| *position += 1);
+        }
+    }
 
     /// VVT-10: streaming hands out each committed frame's waveform once, in
     /// order, so the stream concatenates to the final waveform.

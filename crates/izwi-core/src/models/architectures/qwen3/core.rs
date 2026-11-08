@@ -3322,6 +3322,109 @@ impl Qwen3Model {
         self.lm_head.logits_for_tokens(hidden, token_ids)
     }
 
+    /// [`Self::logits_from_hidden_for_tokens`] for every row of `hidden`
+    /// (`[rows, hidden]` or `[rows, 1, hidden]`): `[rows, token_ids.len()]`
+    /// logits left on the device, so one readback scores every row.
+    pub(crate) fn logits_rows_for_tokens(
+        &self,
+        hidden: &Tensor,
+        token_ids: &[u32],
+    ) -> Result<Tensor> {
+        let hidden = hidden.flatten_to(hidden.rank().saturating_sub(2))?;
+        match &self.lm_head {
+            Qwen3Projection::Dense(dense) => dense_logits_for_tokens(dense, &hidden, token_ids),
+            Qwen3Projection::Quantized(_) => self
+                .lm_head
+                .forward(&hidden)?
+                .index_select(&token_index_tensor(token_ids, hidden.device())?, 1)
+                .map_err(Error::from),
+        }
+    }
+
+    /// [`Self::forward_managed_decode_batch`] for caller-provided embeddings
+    /// (`[batch, 1, hidden]`), returning the normalized hidden states
+    /// (`[batch, 1, hidden]`) without `lm_head`: diffusion-conditioned
+    /// decode rows (VibeVoice TTS) step every row in one launch per op. The
+    /// rows share one physical arena; every cache advances only when the
+    /// whole forward succeeds.
+    pub(crate) fn forward_managed_decode_batch_hidden_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_positions: &[usize],
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<Tensor> {
+        let (batch_size, sequence_len, hidden_size) = embeds.dims3()?;
+        if sequence_len != 1
+            || batch_size == 0
+            || hidden_size != self.cfg.hidden_size
+            || start_positions.len() != batch_size
+            || caches.len() != batch_size
+        {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 managed embedding decode expects matching [batch,1,{}] rows, got {:?}",
+                self.cfg.hidden_size,
+                embeds.dims()
+            )));
+        }
+        if self.cfg.sliding_window().is_some() {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed execution does not yet support sliding-window block tables"
+                    .to_string(),
+            ));
+        }
+        let key_head_dim = self.cfg.attention_geometry()?.key_head_dim();
+        let mut combined_slots = Vec::with_capacity(batch_size);
+        for (cache, &start) in caches.iter().zip(start_positions) {
+            cache.validate_model(
+                self.cfg.num_hidden_layers,
+                self.cfg.num_key_value_heads,
+                key_head_dim,
+            )?;
+            combined_slots.push(cache.slots_for_append(start, 1)?[0]);
+        }
+        let first = &*caches[0];
+        let lowered = first.arena.lower_slots(&combined_slots)?;
+        let metadata = KvDecodeBatchMetadata {
+            sequences: caches
+                .iter()
+                .zip(start_positions)
+                .map(|(cache, &start)| cache.sequence_table(start + 1))
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let mut completions =
+            KvWriteCompletionCollector::new(first.arena.config(), lowered.logical_slots())?;
+        let mut x = embeds.clone();
+        if let Some(first_layer) = self.layers.first() {
+            let rope = first_layer.self_attn.decode_rope_rows(
+                &self.decode_rope_table,
+                start_positions,
+                &self.device,
+                x.dtype(),
+            )?;
+            let cache_refs = caches
+                .iter()
+                .map(|cache| &**cache)
+                .collect::<Vec<&PhysicalPagedKvCache>>();
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                x = layer.forward_managed_decode_batch(
+                    &x,
+                    &rope,
+                    &cache_refs,
+                    lowered.as_ref(),
+                    &metadata,
+                    &mut completions,
+                    layer_idx,
+                )?;
+            }
+        }
+        let hidden = self.norm.forward(&x)?;
+        let completion = Arc::new(completions.seal()?);
+        for (cache, &start) in caches.iter_mut().zip(start_positions) {
+            cache.commit_shared_completion(start, 1, completion.clone())?;
+        }
+        Ok(hidden)
+    }
+
     pub fn uses_mrope(&self) -> bool {
         self.use_mrope
     }
