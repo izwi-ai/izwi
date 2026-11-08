@@ -529,6 +529,7 @@ impl Tokenizer {
         decoder: &mut IncrementalDecoder,
         token_id: u32,
     ) -> Result<String> {
+        let _detok = crate::engine::metrics::asr_detok_scope();
         if decoder.finished {
             return Err(Error::TokenizationError(
                 "Cannot decode another token after incremental decoding was finished".to_string(),
@@ -581,6 +582,7 @@ impl Tokenizer {
     /// A decoder that is not prefix-stable can have rewritten emitted text;
     /// the suffix then follows the longest shared prefix.
     pub fn finish_incremental_decode(&self, decoder: &mut IncrementalDecoder) -> Result<String> {
+        let _detok = crate::engine::metrics::asr_detok_scope();
         if decoder.finished {
             return Ok(String::new());
         }

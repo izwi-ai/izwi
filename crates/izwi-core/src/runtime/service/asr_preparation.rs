@@ -69,6 +69,30 @@ pub(super) fn granite_speech5_decodes_as_row(
         && prompt_tokens < context_limit
 }
 
+/// Decodes a request's audio on the host worker, recording the time as its
+/// model's `decode_audio` phase.
+fn decode_asr_request_audio(request: &EngineCoreRequest) -> Result<(Vec<f32>, u32)> {
+    let started = Instant::now();
+    let decoded = crate::engine::decode_request_audio_with_rate(request)?;
+    if let Some(variant) = request.model_variant {
+        crate::engine::metrics::record_asr_phase(
+            variant.dir_name(),
+            crate::engine::metrics::AsrPhase::DecodeAudio,
+            started.elapsed(),
+        );
+    }
+    Ok(decoded)
+}
+
+/// Records `started`'s elapsed time as `variant`'s host `features` phase.
+fn record_host_features(variant: ModelVariant, started: Instant) {
+    crate::engine::metrics::record_asr_phase(
+        variant.dir_name(),
+        crate::engine::metrics::AsrPhase::Features,
+        started.elapsed(),
+    );
+}
+
 impl RuntimeService {
     pub(super) async fn prepare_qwen3_asr_shape_for_binding(
         &self,
@@ -121,8 +145,7 @@ impl RuntimeService {
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
                     &model_for_shape,
                     variant,
@@ -228,6 +251,7 @@ impl RuntimeService {
                 job: encoder_job,
                 contract: encoder_contract,
                 model,
+                model_label: variant.dir_name(),
                 samples,
                 sample_rate,
                 geometry,
@@ -352,8 +376,7 @@ impl RuntimeService {
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
                     &model_for_shape,
                     variant,
@@ -460,6 +483,7 @@ impl RuntimeService {
                 job: prep_job,
                 contract: encoder_contract,
                 model: model.clone(),
+                model_label: variant.dir_name(),
                 samples,
                 sample_rate,
                 geometry,
@@ -596,8 +620,7 @@ impl RuntimeService {
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let decision = model_for_shape.vibevoice_retained_preparation_decision(
                     samples.len(),
                     sample_rate,
@@ -720,6 +743,7 @@ impl RuntimeService {
                 job: preparation_job,
                 contract: preparation_contract,
                 model: model.clone(),
+                model_label: variant.dir_name(),
                 samples,
                 sample_rate,
                 language: prepared.asr_language_for_execution().map(str::to_owned),
@@ -832,8 +856,7 @@ impl RuntimeService {
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
                     &model_for_shape,
                     variant,
@@ -963,6 +986,7 @@ impl RuntimeService {
                 job: prep_job,
                 contract: preparation_contract,
                 model: model.clone(),
+                model_label: variant.dir_name(),
                 samples,
                 sample_rate,
                 language: prepared.asr_language_for_execution().map(str::to_owned),
@@ -1070,8 +1094,7 @@ impl RuntimeService {
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let plan = crate::engine::asr_route_plan(
                     &samples,
                     sample_rate,
@@ -1329,8 +1352,7 @@ impl RuntimeService {
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let plan = crate::engine::asr_route_plan(
                     &samples,
                     sample_rate,
@@ -1509,8 +1531,7 @@ impl RuntimeService {
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let plan = crate::engine::asr_route_plan(
                     &samples,
                     sample_rate,
@@ -1597,6 +1618,7 @@ impl RuntimeService {
             cancellation.clone(),
         )?;
         let model_for_preparation = model.clone();
+        let model_label = variant.dir_name();
         let mut cancellation_guard = PreparationCancellationGuard {
             cancellation,
             armed: true,
@@ -1609,8 +1631,14 @@ impl RuntimeService {
                         "Voxtral ASR preparation must remain scalar".into(),
                     ));
                 }
+                let encode_started = Instant::now();
                 let artifact =
                     model_for_preparation.prepare_offline_audio(&samples, sample_rate)?;
+                crate::engine::metrics::record_asr_device_phase(
+                    model_label,
+                    crate::engine::metrics::AsrPhase::Encoder,
+                    encode_started,
+                );
                 // What the row keeps: the request and its prepared
                 // embeddings, a rise over the request alone.
                 let retained = JobResourceObservation {
@@ -1696,8 +1724,7 @@ impl RuntimeService {
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let max_emittable_tokens =
                     crate::models::architectures::parakeet::asr::parakeet_max_emittable_tokens(
                         samples.len(),
@@ -1706,8 +1733,10 @@ impl RuntimeService {
                     )?;
                 // The resample and log-mel run here, on a host worker, so the
                 // device job runs only the encoder.
+                let features_started = Instant::now();
                 let features =
                     model_for_features.prepare_parakeet_host_features(&samples, sample_rate)?;
+                record_host_features(variant, features_started);
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
                 install_parakeet_decode_budget(&mut request, max_emittable_tokens)?;
                 Ok((request, features))
@@ -1863,8 +1892,7 @@ impl RuntimeService {
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
                     &model_for_features,
                     variant,
@@ -1884,12 +1912,14 @@ impl RuntimeService {
                 }
                 // The resample and log-mel run here, on a host worker, so the
                 // device job runs only the encoder.
+                let features_started = Instant::now();
                 let features = model_for_features.prepare_nemotron_host_features(
                     &samples,
                     sample_rate,
                     request.asr_language_for_execution(),
                     request.asr_prompt_for_execution(),
                 )?;
+                record_host_features(variant, features_started);
                 let max_emittable_tokens =
                     crate::models::architectures::nemotron::asr::nemotron_max_emittable_tokens(
                         features.encoded_len(),
@@ -2021,8 +2051,7 @@ impl RuntimeService {
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
                     &model_for_shape,
                     variant,
@@ -2169,6 +2198,7 @@ impl RuntimeService {
                 job: prep_job,
                 contract: preparation_contract,
                 model: model.clone(),
+                model_label: variant.dir_name(),
                 samples,
                 sample_rate,
                 request: options,
@@ -2295,7 +2325,9 @@ impl RuntimeService {
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
+                let features_started = Instant::now();
                 request.prepare_nemotron_transcribe_row(variant, model, context_limit)?;
+                record_host_features(variant, features_started);
                 Ok(request)
             })
             .await?;

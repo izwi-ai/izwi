@@ -1620,6 +1620,26 @@ fn device_job_tag(execution: &PhysicalBatchExecution<'_>) -> (DeviceJobTag, Work
     (tag, class)
 }
 
+/// Records one ASR dispatch's prefill or decode time and the
+/// detokenisation inside it as `model`'s phases.
+fn record_asr_dispatch_phases(
+    model: &str,
+    phase: super::metrics::EngineDispatchPhase,
+    started: std::time::Instant,
+) {
+    use super::metrics::{AsrPhase, EngineDispatchPhase};
+    let phase = match phase {
+        EngineDispatchPhase::Prefill => AsrPhase::Prefill,
+        EngineDispatchPhase::Decode => AsrPhase::Decode,
+        EngineDispatchPhase::Other => return,
+    };
+    super::metrics::record_asr_device_phase(model, phase, started);
+    let detok = super::metrics::take_asr_detok();
+    if !detok.is_zero() {
+        super::metrics::record_asr_phase(model, AsrPhase::Detok, detok);
+    }
+}
+
 /// When the device last finished a model step while the engine stayed busy.
 /// The next step's start records the gap as device idle time
 /// (`izwi_engine_device_idle_seconds`); an engine going idle clears it.
@@ -5170,9 +5190,17 @@ impl UnifiedExecutor {
         {
             return (inputs, refusal);
         }
-        let (batch_id, expected_dispatch, tag, class, shape) =
+        let (batch_id, expected_dispatch, tag, class, shape, asr_model) =
             inputs.with_execution(|execution| {
                 let (tag, class) = device_job_tag(&execution);
+                // ASR dispatches record their prefill or decode time, and
+                // the detokenisation inside it, under the model's name.
+                let asr_model = execution
+                    .requests
+                    .first()
+                    .filter(|request| request.task_type == TaskType::ASR)
+                    .and_then(|request| request.model_variant)
+                    .map(|variant| variant.dir_name());
                 let phase = super::metrics::EngineDispatchPhase::of_work(
                     execution.batch.rows.iter().map(|row| &row.work),
                 );
@@ -5182,6 +5210,7 @@ impl UnifiedExecutor {
                     tag,
                     class,
                     (execution.batch.rows.len(), phase),
+                    asr_model,
                 )
             });
         let slot = Arc::new(Mutex::new(Some(inputs)));
@@ -5201,6 +5230,11 @@ impl UnifiedExecutor {
             }
             let _device_step = idle.as_ref().map(|(clock, label)| clock.begin_step(label));
             let _physical_dispatch = begin_engine_physical_dispatch_shaped(shape.0, shape.1);
+            let asr_started = std::time::Instant::now();
+            if asr_model.is_some() {
+                // Drop detokenisation another dispatch left on this thread.
+                let _ = super::metrics::take_asr_detok();
+            }
             let inputs = job_slot.lock().unwrap_or_else(|poison| poison.into_inner());
             let result = inputs
                 .as_ref()
@@ -5211,6 +5245,9 @@ impl UnifiedExecutor {
                     }))
                 });
             drop(inputs);
+            if let Some(model) = asr_model {
+                record_asr_dispatch_phases(model, shape.1, asr_started);
+            }
             drop(admitted);
             drop(retained);
             result
@@ -5751,6 +5788,43 @@ mod tests {
             finalizer.calls.lock().unwrap().as_slice(),
             &[(41, PendingQuantumDecision::Abort)]
         );
+    }
+
+    /// An ASR decode dispatch records its time and the detokenisation inside
+    /// it; work that is neither prefill nor decode records nothing.
+    #[test]
+    fn asr_dispatches_record_their_phase_and_detokenisation() {
+        use crate::engine::metrics::{asr_detok_scope, asr_phase_totals, AsrPhase};
+        let model = "asr-dispatch-phase-test";
+        drop(asr_detok_scope());
+        record_asr_dispatch_phases(
+            model,
+            super::super::metrics::EngineDispatchPhase::Other,
+            std::time::Instant::now(),
+        );
+        assert_eq!(asr_phase_totals(model, AsrPhase::Decode).0, 0);
+        assert_eq!(asr_phase_totals(model, AsrPhase::Prefill).0, 0);
+        {
+            let _detok = asr_detok_scope();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        record_asr_dispatch_phases(
+            model,
+            super::super::metrics::EngineDispatchPhase::Decode,
+            std::time::Instant::now(),
+        );
+        assert_eq!(asr_phase_totals(model, AsrPhase::Decode).0, 1);
+        let (detoks, detok_seconds) = asr_phase_totals(model, AsrPhase::Detok);
+        assert_eq!(detoks, 1);
+        assert!(detok_seconds >= 0.001);
+        // The clock was drained: a dispatch without detokenisation adds none.
+        record_asr_dispatch_phases(
+            model,
+            super::super::metrics::EngineDispatchPhase::Prefill,
+            std::time::Instant::now(),
+        );
+        assert_eq!(asr_phase_totals(model, AsrPhase::Prefill).0, 1);
+        assert_eq!(asr_phase_totals(model, AsrPhase::Detok).0, 1);
     }
 
     /// Publishing or discarding a pending quantum commits, restores or drops

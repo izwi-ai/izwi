@@ -3047,6 +3047,7 @@ impl WhisperTurboAsrModel {
     }
 
     fn decode_generated_text(&self, token_ids: &[u32]) -> Result<String> {
+        let _detok = crate::engine::metrics::asr_detok_scope();
         self.tokenizer.decode(token_ids)
     }
 

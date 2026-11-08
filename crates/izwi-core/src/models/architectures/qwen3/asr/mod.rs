@@ -2565,6 +2565,7 @@ impl Qwen3AsrModel {
     }
 
     fn decode_incremental_delta(&self, state: &mut AsrDecodeState) -> Result<String> {
+        let _detok = crate::engine::metrics::asr_detok_scope();
         if state.visible_generated_ids.len() <= state.decoded_visible_tokens {
             return Ok(String::new());
         }

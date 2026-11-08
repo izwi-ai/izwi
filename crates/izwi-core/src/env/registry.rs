@@ -49,6 +49,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Transcribes a long file's chunks as concurrent requests (up to the ASR row width at once, committed in order) on Qwen3-ASR, Whisper, Nemotron ASR and Voxtral, so one file batches with itself and others wait at most one chunk; false runs each file's chunks one after another in one request.",
     ),
     CoreEnvVar::new(
+        "IZWI_ASR_PHASE_SYNC",
+        Flag,
+        "false",
+        Once,
+        "Makes each device-thread ASR phase in izwi_asr_phase_seconds wait for its CUDA work first, so it records device time instead of launch time; costs throughput, for profiling runs only.",
+    ),
+    CoreEnvVar::new(
         "IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS",
         Duration,
         "engine per-backend default",

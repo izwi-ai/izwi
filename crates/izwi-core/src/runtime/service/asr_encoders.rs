@@ -10,6 +10,8 @@ pub(super) struct QwenAsrEncoderPending {
     pub(super) job: JobLease,
     pub(super) contract: LoadedExecutionContract,
     pub(super) model: AsrModelLease,
+    /// The model's catalog name, for the ASR metrics.
+    pub(super) model_label: &'static str,
     pub(super) samples: Arc<[f32]>,
     pub(super) sample_rate: u32,
     pub(super) geometry: Qwen3AsrAudioPreparationGeometry,
@@ -35,6 +37,8 @@ pub(super) struct WhisperEncoderPending {
     pub(super) job: JobLease,
     pub(super) contract: LoadedExecutionContract,
     pub(super) model: AsrModelLease,
+    /// The model's catalog name, for the ASR metrics.
+    pub(super) model_label: &'static str,
     pub(super) samples: Arc<[f32]>,
     pub(super) sample_rate: u32,
     pub(super) geometry: WhisperWindowPreparationGeometry,
@@ -221,6 +225,8 @@ pub(super) struct GraniteSpeechEncoderPending {
     pub(super) job: JobLease,
     pub(super) contract: LoadedExecutionContract,
     pub(super) model: AsrModelLease,
+    /// The model's catalog name, for the ASR metrics.
+    pub(super) model_label: &'static str,
     pub(super) samples: Arc<[f32]>,
     pub(super) sample_rate: u32,
     pub(super) language: Option<String>,
@@ -253,6 +259,8 @@ pub(super) struct GraniteSpeech5EncoderPending {
     pub(super) job: JobLease,
     pub(super) contract: LoadedExecutionContract,
     pub(super) model: AsrModelLease,
+    /// The model's catalog name, for the ASR metrics.
+    pub(super) model_label: &'static str,
     pub(super) samples: Arc<[f32]>,
     pub(super) sample_rate: u32,
     pub(super) request: GraniteSpeech5RequestOptions,
@@ -287,6 +295,8 @@ pub(super) struct VibeVoiceEncoderPending {
     pub(super) job: JobLease,
     pub(super) contract: LoadedExecutionContract,
     pub(super) model: AsrModelLease,
+    /// The model's catalog name, for the ASR metrics.
+    pub(super) model_label: &'static str,
     pub(super) samples: Arc<[f32]>,
     pub(super) sample_rate: u32,
     pub(super) language: Option<String>,
@@ -320,6 +330,7 @@ impl VibeVoiceEncoderBatcher {
             pending.cancellation,
         )?;
         let model = pending.model;
+        let model_label = pending.model_label;
         let samples = pending.samples;
         let sample_rate = pending.sample_rate;
         let language = pending.language;
@@ -337,12 +348,18 @@ impl VibeVoiceEncoderBatcher {
                         "VibeVoice scalar preparation received a non-scalar live set".into(),
                     ));
                 }
+                let encode_started = Instant::now();
                 let artifact = model.prepare_vibevoice_retained_artifact(
                     samples.as_ref(),
                     sample_rate,
                     language.as_deref(),
                     prompt.as_deref(),
                 )?;
+                crate::engine::metrics::record_asr_device_phase(
+                    model_label,
+                    crate::engine::metrics::AsrPhase::Encoder,
+                    encode_started,
+                );
                 let host_bytes = retained_request_host_bytes
                     .checked_add(artifact.resident_host_bytes())
                     .ok_or_else(|| {
@@ -576,7 +593,13 @@ impl ParakeetEncoderBatcher {
                         checkpoint,
                     })
                     .collect::<Vec<_>>();
+                let encode_started = Instant::now();
                 let prepared = model.prepare_parakeet_encoder_batch(&rows)?;
+                crate::engine::metrics::record_asr_device_phase(
+                    model_label,
+                    crate::engine::metrics::AsrPhase::Encoder,
+                    encode_started,
+                );
                 if prepared.len() != live.len() {
                     return Err(Error::InferenceError(
                         "Parakeet encoder batch returned the wrong row count".into(),
@@ -887,7 +910,13 @@ impl NemotronEncoderBatcher {
                         checkpoint,
                     })
                     .collect::<Vec<_>>();
+                let encode_started = Instant::now();
                 let prepared = model.prepare_nemotron_encoder_batch(&rows)?;
+                crate::engine::metrics::record_asr_device_phase(
+                    model_label,
+                    crate::engine::metrics::AsrPhase::Encoder,
+                    encode_started,
+                );
                 if prepared.len() != live.len() {
                     return Err(Error::InferenceError(
                         "Nemotron encoder batch returned the wrong row count".into(),
@@ -1042,6 +1071,7 @@ impl WhisperEncoderBatcher {
         };
         let contract = first.contract.clone();
         let model = first.model.clone();
+        let model_label = first.model_label;
         let geometries = rows.iter().map(|row| row.geometry).collect::<Vec<_>>();
         let batch_geometry = match model.whisper_window_preparation_batch_geometry(&geometries) {
             Ok(value) => value,
@@ -1110,7 +1140,14 @@ impl WhisperEncoderBatcher {
                         sample_rate: inputs[*index].1,
                     })
                     .collect::<Vec<_>>();
+                crate::engine::metrics::record_asr_preparation_batch_rows(model_label, live.len());
+                let encode_started = Instant::now();
                 let prepared = physical.prepare_whisper_window_batch(&selected)?;
+                crate::engine::metrics::record_asr_device_phase(
+                    model_label,
+                    crate::engine::metrics::AsrPhase::Encoder,
+                    encode_started,
+                );
                 Ok(prepared
                     .into_iter()
                     .zip(live)
@@ -1252,6 +1289,7 @@ impl GraniteSpeechEncoderBatcher {
         };
         let contract = first.contract.clone();
         let model = first.model.clone();
+        let model_label = first.model_label;
         let geometries = batch.iter().map(|row| row.geometry).collect::<Vec<_>>();
         let batch_geometry = match model.granite_speech_preparation_batch_geometry(&geometries) {
             Ok(geometry) => geometry,
@@ -1327,8 +1365,15 @@ impl GraniteSpeechEncoderBatcher {
                         prompt: inputs[*index].3.as_deref(),
                     })
                     .collect::<Vec<_>>();
+                crate::engine::metrics::record_asr_preparation_batch_rows(model_label, live.len());
+                let encode_started = Instant::now();
                 let prepared =
                     physical_model.prepare_granite_speech_prompt_artifact_batch(&selected)?;
+                crate::engine::metrics::record_asr_device_phase(
+                    model_label,
+                    crate::engine::metrics::AsrPhase::Encoder,
+                    encode_started,
+                );
                 if prepared.len() != live.len() {
                     return Err(Error::InferenceError(
                         "Granite Speech preparation batch returned the wrong row count".into(),
@@ -1492,6 +1537,7 @@ impl GraniteSpeech5EncoderBatcher {
         };
         let contract = first.contract.clone();
         let model = first.model.clone();
+        let model_label = first.model_label;
         let geometries = batch.iter().map(|row| row.geometry).collect::<Vec<_>>();
         let batch_geometry = match model.granite_speech5_preparation_batch_geometry(&geometries) {
             Ok(geometry) => geometry,
@@ -1565,8 +1611,15 @@ impl GraniteSpeech5EncoderBatcher {
                         request: &inputs[*index].2,
                     })
                     .collect::<Vec<_>>();
+                crate::engine::metrics::record_asr_preparation_batch_rows(model_label, live.len());
+                let encode_started = Instant::now();
                 let prepared =
                     physical_model.prepare_granite_speech5_prompt_artifact_batch(&selected)?;
+                crate::engine::metrics::record_asr_device_phase(
+                    model_label,
+                    crate::engine::metrics::AsrPhase::Encoder,
+                    encode_started,
+                );
                 if prepared.len() != live.len() {
                     return Err(Error::InferenceError(
                         "Granite Speech 5.0 preparation batch returned the wrong row count".into(),
@@ -1699,6 +1752,7 @@ impl QwenAsrEncoderBatcher {
         };
         let contract = first.contract.clone();
         let model = first.model.clone();
+        let model_label = first.model_label;
         let geometries = batch.iter().map(|row| row.geometry).collect::<Vec<_>>();
         let batch_geometry = match model.audio_preparation_batch_geometry(&geometries) {
             Ok(geometry) => geometry,
@@ -1783,7 +1837,14 @@ impl QwenAsrEncoderBatcher {
                         sample_rate: samples[*index].1,
                     })
                     .collect::<Vec<_>>();
+                crate::engine::metrics::record_asr_preparation_batch_rows(model_label, live.len());
+                let encode_started = Instant::now();
                 let prepared = physical_model.prepare_qwen3_audio_tower_batch(&selected)?;
+                crate::engine::metrics::record_asr_device_phase(
+                    model_label,
+                    crate::engine::metrics::AsrPhase::Encoder,
+                    encode_started,
+                );
                 Ok(prepared
                     .into_iter()
                     .zip(live.iter())
