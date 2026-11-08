@@ -45,6 +45,9 @@ pub struct Maya1TtsDiagnostics {
     /// Where draws read their logits: device candidates on CUDA, and how
     /// many rows read whole logits instead.
     pub sampling: serde_json::Value,
+    /// What SNAC runs in (BF16 only on an operator's opt-in that its load
+    /// check kept), and the check's measured error.
+    pub snac_precision: serde_json::Value,
 }
 
 /// What one audio-window quantum did.
@@ -189,6 +192,7 @@ impl Maya1TtsModel {
             context_tokens: self.context_tokens(),
             max_new_tokens: config::MAX_NEW_TOKENS,
             sampling: crate::kernels::penalized_topk::device_path::summary(),
+            snac_precision: self.runtime.snac().precision().diagnostics(),
         }
     }
 

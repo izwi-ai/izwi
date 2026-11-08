@@ -10,15 +10,19 @@
 //! * the depthwise convolutions run as one shift-and-accumulate op
 //!   ([`depthwise_conv1d`]), not one convolution per channel.
 //!
-//! Every activation is F32 on every backend.
+//! Every activation is F32 on every backend, unless an operator opts a
+//! CUDA load into BF16 (`IZWI_MAYA1_SNAC_BF16`) and its load-time check
+//! against F32 keeps it.
 
 use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 
+use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::kernels::depthwise_conv::{depthwise_conv1d, DepthwiseConv1dSpec};
+use crate::models::shared::codecs::reduced_precision::{self, CodecPrecision};
 use crate::models::shared::weights::pytorch::PthTensorMap;
 
 use super::frames::SnacCodes;
@@ -261,9 +265,31 @@ pub(crate) fn snac_batching_enabled() -> bool {
     *ENABLED.get_or_init(|| crate::env::flag_or(SNAC_BATCHING_ENV, true))
 }
 
+/// Opt-in for a BF16 SNAC on CUDA (a boolean; off when unset).
+pub(crate) const SNAC_BF16_ENV: &str = "IZWI_MAYA1_SNAC_BF16";
+
+fn snac_bf16_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(SNAC_BF16_ENV, false));
+    ON.get()
+}
+
+/// Device bytes a load on `backend` prices for SNAC's BF16 copy of
+/// `elements` weights, built beside the F32 decoder for the load check:
+/// zero off CUDA or unless an operator asked for it.
+pub(crate) fn snac_bf16_device_bytes(backend: BackendKind, elements: u64) -> u64 {
+    if backend == BackendKind::Cuda && snac_bf16_requested() {
+        elements.saturating_mul(DType::BF16.size_in_bytes() as u64)
+    } else {
+        0
+    }
+}
+
 pub struct SnacDecoder {
     cfg: SnacConfig,
     device: Device,
+    /// What the weights and activations run in, and why.
+    precision: CodecPrecision,
     /// Rows every call runs, padded with copies of its first row, so a
     /// window's shapes (and with them Candle's batched GEMM and im2col
     /// kernels, which cuBLAS may pick by batch count) are the same however
@@ -299,20 +325,77 @@ impl SnacDecoder {
         if device.is_cuda() && snac_batching_enabled() {
             decoder.call_rows = Some(SNAC_CUDA_CALL_ROWS);
         }
-        Ok(decoder)
+        let requested = snac_bf16_requested();
+        Ok(if device.is_cuda() {
+            decoder.with_bf16_if(requested, reduced_precision::MAX_REL_L2)
+        } else {
+            decoder.precision = CodecPrecision::f32(
+                requested,
+                if requested {
+                    "a BF16 SNAC runs on CUDA only"
+                } else {
+                    "F32"
+                },
+            );
+            decoder
+        })
     }
 
-    /// Rows every call runs (padding included), when fixed.
-    pub fn call_rows(&self) -> Option<usize> {
-        self.call_rows
+    /// This decoder in BF16 when `requested` and the load-time check keeps
+    /// it: three seeded six-frame windows decoded through both, the BF16
+    /// samples within `max_rel_l2` relative L2 error of the F32 ones
+    /// ([`reduced_precision::MAX_REL_L2`] at load). Otherwise the F32
+    /// decoder, with why.
+    pub(crate) fn with_bf16_if(mut self, requested: bool, max_rel_l2: f64) -> Self {
+        if !requested {
+            self.precision = CodecPrecision::f32(false, format!("F32 ({SNAC_BF16_ENV} is off)"));
+            return self;
+        }
+        let checked = self.with_dtype(DType::BF16).and_then(|candidate| {
+            let reference = self.check_samples()?;
+            let samples = candidate.check_samples()?;
+            let verdict = reduced_precision::judge(&reference, &samples, DType::BF16, max_rel_l2);
+            Ok((candidate, verdict))
+        });
+        match checked {
+            Ok((mut candidate, (precision, true))) => {
+                tracing::info!(reason = %precision.reason, "SNAC runs in BF16");
+                candidate.precision = precision;
+                candidate
+            }
+            Ok((_, (precision, false))) => {
+                tracing::warn!(reason = %precision.reason, "SNAC stays F32");
+                self.precision = precision;
+                self
+            }
+            Err(error) => {
+                tracing::warn!(%error, "SNAC's BF16 check failed; SNAC stays F32");
+                self.precision = CodecPrecision::f32(true, format!("BF16 check failed: {error}"));
+                self
+            }
+        }
     }
 
-    /// Whether rows sharing a call decode exactly as each does alone on this
-    /// device: three seeded six-frame windows in one call against each in a
-    /// call of its own, bit for bit.
-    pub(crate) fn rows_are_independent(&self) -> Result<bool> {
+    /// What the decoder runs in, and why.
+    pub(crate) fn precision(&self) -> &CodecPrecision {
+        &self.precision
+    }
+
+    /// Every sample of three seeded six-frame windows decoded in one call,
+    /// the precision check's input.
+    fn check_samples(&self) -> Result<Vec<f32>> {
+        let codes = self.check_codes();
+        let samples = self.decode(
+            &codes.iter().collect::<Vec<_>>(),
+            &super::noise::snac_noise(&self.cfg, &check_windows(&codes)),
+        )?;
+        Ok(samples.into_iter().flatten().collect())
+    }
+
+    /// Three seeded six-frame windows of codes, the load checks' input.
+    fn check_codes(&self) -> Vec<SnacCodes> {
         use crate::models::shared::noise::SplitMix64;
-        let codes = (0..3u64)
+        (0..3u64)
             .map(|row| {
                 let mut rng = SplitMix64::new(0x5eed + row);
                 let size = self.cfg.codebook_size as u64;
@@ -327,12 +410,20 @@ impl SnacDecoder {
                     fine: codes(24),
                 }
             })
-            .collect::<Vec<_>>();
-        let windows = codes
-            .iter()
-            .enumerate()
-            .map(|(row, codes)| (0, codes, row as u64 + 1))
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    /// Rows every call runs (padding included), when fixed.
+    pub fn call_rows(&self) -> Option<usize> {
+        self.call_rows
+    }
+
+    /// Whether rows sharing a call decode exactly as each does alone on this
+    /// device: three seeded six-frame windows in one call against each in a
+    /// call of its own, bit for bit.
+    pub(crate) fn rows_are_independent(&self) -> Result<bool> {
+        let codes = self.check_codes();
+        let windows = check_windows(&codes);
         let together = self.decode(
             &codes.iter().collect::<Vec<_>>(),
             &super::noise::snac_noise(&self.cfg, &windows),
@@ -387,6 +478,7 @@ impl SnacDecoder {
             quantizers,
             blocks,
             device: Device::Cpu,
+            precision: CodecPrecision::f32(false, "F32"),
             call_rows: None,
             cfg,
         })
@@ -396,7 +488,23 @@ impl SnacDecoder {
         if device.same_device(&self.device) {
             return Ok(self);
         }
-        let move_t = |t: &Tensor| -> Result<Tensor> { Ok(t.to_device(device)?) };
+        self.map_tensors(device, &|t| Ok(t.to_device(device)?))
+    }
+
+    /// Every weight in `dtype` (the activations follow them; samples come
+    /// back F32).
+    fn with_dtype(&self, dtype: DType) -> Result<Self> {
+        let mut decoder = self.map_tensors(&self.device, &|t| Ok(t.to_dtype(dtype)?))?;
+        decoder.precision.dtype = dtype;
+        Ok(decoder)
+    }
+
+    /// This decoder with `move_t` applied to every tensor, on `device`.
+    fn map_tensors(
+        &self,
+        device: &Device,
+        move_t: &dyn Fn(&Tensor) -> Result<Tensor>,
+    ) -> Result<Self> {
         let move_snake = |s: &Snake| -> Result<Snake> {
             Ok(Snake {
                 alpha: move_t(&s.alpha)?,
@@ -460,8 +568,9 @@ impl SnacDecoder {
             conv_out: move_t(&self.conv_out)?,
             conv_out_bias: move_t(&self.conv_out_bias)?,
             device: device.clone(),
+            precision: self.precision.clone(),
             call_rows: self.call_rows,
-            cfg: self.cfg,
+            cfg: self.cfg.clone(),
         })
     }
 
@@ -578,14 +687,16 @@ impl SnacDecoder {
         let mut x = self.expand.forward(&self.conv_in.forward(&latent)?)?;
         for (block, decoder_block) in self.blocks.iter().enumerate() {
             let steps = frames * self.cfg.block_steps_per_frame(block);
-            let noise = Tensor::from_slice(&noise[block], (batch, 1, steps), &self.device)?;
+            let noise = Tensor::from_slice(&noise[block], (batch, 1, steps), &self.device)?
+                .to_dtype(self.precision.dtype)?;
             x = decoder_block.forward(&x, &noise)?;
         }
         let x = self.snake_out.forward(&x)?;
         let x = x
             .conv1d(&self.conv_out, 3, 1, 1, 1)?
             .broadcast_add(&self.conv_out_bias.reshape((1, 1, 1))?)?
-            .tanh()?;
+            .tanh()?
+            .to_dtype(DType::F32)?;
         let samples = x
             .to_device(&Device::Cpu)?
             .reshape((batch, ()))?
@@ -597,6 +708,16 @@ impl SnacDecoder {
         }
         Ok(samples)
     }
+}
+
+/// The load checks' noise windows of `codes`: each at frame 0, seeded by
+/// its row.
+fn check_windows(codes: &[SnacCodes]) -> Vec<(usize, &SnacCodes, u64)> {
+    codes
+        .iter()
+        .enumerate()
+        .map(|(row, codes)| (0, codes, row as u64 + 1))
+        .collect()
 }
 
 /// `x` [batch, channels, time] with every step repeated `factor` times.
@@ -785,6 +906,80 @@ pub(crate) mod tests {
                 Some(expected) => assert_eq!(expected, &together),
             }
         }
+    }
+
+    /// The BF16 check keeps a BF16 SNAC within its bound and refuses one
+    /// past it. The toy SNAC's random weights are ill-conditioned (rounding
+    /// them to BF16 alone moves its samples ~23%), so at the load's 5% bound
+    /// it stays F32 with the measured error recorded, and at a loose bound
+    /// the BF16 decoder is kept and decodes finite samples that are not
+    /// F32's bits (so BF16 ran), rows still decoding together as alone.
+    /// Without the request the decoder stays F32.
+    #[test]
+    fn the_bf16_check_keeps_a_close_snac_and_refuses_a_far_one() {
+        use super::super::noise::snac_noise;
+        let rows = (0..3)
+            .map(|seed| random_codes(seed + 70, 5))
+            .collect::<Vec<_>>();
+        let windows = rows
+            .iter()
+            .enumerate()
+            .map(|(index, codes)| (index * 2, codes, 90 + index as u64))
+            .collect::<Vec<_>>();
+        let decode = |snac: &SnacDecoder| {
+            let noise = snac_noise(snac.config(), &windows);
+            snac.decode(&rows.iter().collect::<Vec<_>>(), &noise)
+                .unwrap()
+                .concat()
+        };
+        let reference = decode(&tiny_decoder(&Device::Cpu, Some(4)));
+
+        let refused =
+            tiny_decoder(&Device::Cpu, Some(4)).with_bf16_if(true, reduced_precision::MAX_REL_L2);
+        let precision = refused.precision();
+        assert_eq!(precision.dtype, DType::F32, "{precision:?}");
+        assert!(precision.requested);
+        assert!(precision.rel_l2.unwrap() > reduced_precision::MAX_REL_L2);
+        assert!(precision.reason.contains("past"), "{}", precision.reason);
+        assert_eq!(decode(&refused), reference);
+
+        let kept = tiny_decoder(&Device::Cpu, Some(4)).with_bf16_if(true, 1.0);
+        assert_eq!(
+            kept.precision().dtype,
+            DType::BF16,
+            "{:?}",
+            kept.precision()
+        );
+        assert!(kept.precision().rel_l2.unwrap() <= 1.0);
+        assert!(kept.rows_are_independent().unwrap());
+        let reduced = decode(&kept);
+        assert_eq!(reduced.len(), reference.len());
+        assert!(reduced.iter().all(|sample| sample.is_finite()));
+        assert_ne!(reduced, reference, "BF16 ran");
+
+        let off = tiny_decoder(&Device::Cpu, Some(4)).with_bf16_if(false, 1.0);
+        assert_eq!(off.precision().dtype, DType::F32);
+        assert!(off.precision().reason.contains(SNAC_BF16_ENV));
+        assert_eq!(decode(&off), reference);
+    }
+
+    /// Only a CUDA load that asks for BF16 prices its copy.
+    #[test]
+    fn only_a_cuda_bf16_request_prices_the_copy() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(SNAC_BF16_ENV);
+        std::env::remove_var(SNAC_BF16_ENV);
+        let off = snac_bf16_device_bytes(BackendKind::Cuda, 1_000);
+        std::env::set_var(SNAC_BF16_ENV, "1");
+        let cuda = snac_bf16_device_bytes(BackendKind::Cuda, 1_000);
+        let metal = snac_bf16_device_bytes(BackendKind::Metal, 1_000);
+        match previous {
+            Some(value) => std::env::set_var(SNAC_BF16_ENV, value),
+            None => std::env::remove_var(SNAC_BF16_ENV),
+        }
+        assert_eq!((off, cuda, metal), (0, 2_000, 0));
     }
 
     #[test]

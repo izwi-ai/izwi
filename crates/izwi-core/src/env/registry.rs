@@ -1293,6 +1293,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Kill switch: false decodes one Maya1 audio window per SNAC call and one request's window per audio quantum on CUDA, instead of every SNAC call at four rows and the due windows of up to the engine rows in one quantum, windows of one length sharing calls.",
     ),
     CoreEnvVar::new(
+        "IZWI_MAYA1_SNAC_BF16",
+        Flag,
+        "false",
+        Once,
+        "On CUDA, true runs Maya1's SNAC decoder in BF16 (weights and activations; samples come back F32) when its load-time check keeps it: three seeded six-frame windows decoded through the F32 and BF16 decoders, the BF16 samples within 5% relative L2 error of F32 and all finite; otherwise SNAC stays F32. Off by default until GPU parity, a speech-recognition round trip and listening confirm it. Loads that ask for it price the BF16 copy built beside the F32 one. `snac_precision` in the model diagnostics reports the dtype, why, and the check's measured error.",
+    ),
+    CoreEnvVar::new(
         "IZWI_MAYA2_DEPTH_GRAPHS",
         Flag,
         "true",

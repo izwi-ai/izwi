@@ -39,6 +39,7 @@ use crate::models::architectures::kokoro::{
 use crate::models::architectures::maya1::config::{
     HEAD_FIRST_TOKEN, HEAD_ROWS, SNAC_WEIGHTS_FILE, WEIGHT_SHARDS,
 };
+use crate::models::architectures::maya1::snac::snac_bf16_device_bytes;
 use crate::models::architectures::maya1::{
     maya1_lm_precision, maya1_reloads_in_f32, Maya1LmConfig, MAYA1_GGUF_FILE,
 };
@@ -471,9 +472,12 @@ fn maya1_tts_plan(
     if !snac.is_file() {
         return Ok(None);
     }
-    files.push(snac_decoder_census(&snac)?);
+    let snac = snac_decoder_census(&snac)?;
+    let snac_bf16 = snac_bf16_device_bytes(backend, census_elements(&snac));
+    files.push(snac);
     let dtype = maya1_lm_precision(device).dtype;
-    let plan = price_maya1_tts(&files, backend, dtype)?;
+    // An opt-in BF16 SNAC is built beside the F32 one for its load check.
+    let plan = price_maya1_tts(&files, backend, dtype)?.with_deferred_device_bytes(snac_bf16);
     if maya1_reloads_in_f32(device, dtype) {
         // A decoder that fails its load-time probe reloads in F32 (never on
         // Metal, where the load is refused instead).
@@ -611,7 +615,19 @@ fn maya1_gguf_plan(model_path: &Path, backend: BackendKind) -> Result<Option<Asr
         return Ok(None);
     }
     let layers = Maya1LmConfig::load(model_path)?.num_hidden_layers;
-    price_maya1_gguf(&files, &snac_decoder_census(&snac)?, backend, layers).map(Some)
+    let snac = snac_decoder_census(&snac)?;
+    // An opt-in BF16 SNAC is built beside the F32 one for its load check.
+    let snac_bf16 = snac_bf16_device_bytes(backend, census_elements(&snac));
+    price_maya1_gguf(&files, &snac, backend, layers)
+        .map(|plan| Some(plan.with_deferred_device_bytes(snac_bf16)))
+}
+
+/// Elements of every tensor in `file`.
+fn census_elements(file: &CensusFile) -> u64 {
+    file.tensors
+        .iter()
+        .map(|tensor| tensor.shape.iter().product::<usize>() as u64)
+        .sum()
 }
 
 /// Maya1's GGUF release (`maya1/gguf.rs`): the Q8_0 projections read on
