@@ -55,6 +55,20 @@ pub(super) fn nemotron_decodes_as_row(
     !plan.requires_chunk_path() && !request.asr_task.speaker_attribution
 }
 
+/// Whether a Granite Speech 5.0 request of `prompt_tokens` and a
+/// `planned_budget` runs as a retained row: its KV claim (prompt and budget)
+/// must fit one retained sequence, which the retained pool always holds, so
+/// no row can wait on KV admission for good. Its prompt must also leave room
+/// in the context. Otherwise it runs as one atomic invocation.
+pub(super) fn granite_speech5_decodes_as_row(
+    prompt_tokens: usize,
+    planned_budget: usize,
+    context_limit: usize,
+) -> bool {
+    GraniteSpeech5AsrModel::retained_sequence_fits(prompt_tokens, planned_budget)
+        && prompt_tokens < context_limit
+}
+
 impl RuntimeService {
     pub(super) async fn prepare_qwen3_asr_shape_for_binding(
         &self,
@@ -2047,8 +2061,7 @@ impl RuntimeService {
                 })
                 .transpose()?
                 .filter(|geometry| {
-                    GraniteSpeech5AsrModel::retained_sequence_fits(geometry.prompt_tokens, budget)
-                        && geometry.prompt_tokens < context_limit
+                    granite_speech5_decodes_as_row(geometry.prompt_tokens, budget, context_limit)
                 });
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
                 match geometry {

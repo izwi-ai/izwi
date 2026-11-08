@@ -300,11 +300,14 @@ impl ModelLifecycleController {
             physical_spec.retained.as_ref(),
             physical_spec.retained_max_tokens,
         ) {
-            (Some(retained_contract), Some(context_tokens)) => {
-                // Every row claims its pages from one shared pool, so it
-                // holds one automatic sequence (a 30 s chunk's prompt, audio
-                // and budget) per retained row, and never less than one
-                // sequence of the decoder's whole context.
+            (Some(retained_contract), Some(sequence_tokens)) => {
+                // Every row claims its pages from one shared pool. A row is
+                // at most one retained sequence (2,528 tokens): preparation
+                // runs a longer request atomically. So the pool holds one
+                // automatic sequence (a 30 s chunk's prompt, audio and
+                // budget) per retained row and never less than one longest
+                // retained sequence, with no floor of the 16k context, which
+                // stays the atomic route's (its invocation fit publishes it).
                 let rows = self.asr_state_rows(bundle_draft)?;
                 let retained = self
                     .core_engine
@@ -312,19 +315,18 @@ impl ModelLifecycleController {
                         model_instance_id,
                         retained_contract,
                         Some(asr_shared_pool_tokens(
-                            context_tokens,
+                            sequence_tokens,
                             asr_minimum_tokens(variant),
                             rows.0,
                         )),
                         2,
                         rows,
-                        asr_minimum_tokens(variant),
+                        sequence_tokens as u64,
                     )
                     .await?;
-                // One sequence never reaches past the decoder's context.
-                self.model_registry.publish_effective_context(
-                    variant,
-                    retained.logical_token_reach().min(context_tokens as u64),
+                granite_speech5_retained_reach_holds_a_sequence(
+                    retained.logical_token_reach(),
+                    sequence_tokens,
                 )?;
                 self.model_registry.publish_kv_storage(variant, &retained);
                 crate::runtime::rollout::validate_managed_state_plan_eligibility(

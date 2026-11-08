@@ -4452,3 +4452,32 @@ fn shared_asr_pools_hold_one_automatic_sequence_per_row() {
     // A sequence never counts for more than the model's context.
     assert_eq!(super::asr_shared_pool_tokens(448, 10_000, 3), 3 * 448);
 }
+
+/// Granite Speech 5.0's retained pool is bounded by its retained ceiling,
+/// not its 16k context (the atomic route's): one automatic sequence per
+/// retained row and never less than one longest retained sequence. 8 rows
+/// take 5,952 tokens (465 MiB of F16 K/V per portable copy) where a pool
+/// with the context floor took 16,384 (1.25 GiB). A fit short of one
+/// retained sequence refuses the load, since a request routed to a row
+/// could then wait on KV admission forever.
+#[test]
+fn granite_speech5_retained_pool_holds_one_longest_sequence_without_a_context_floor() {
+    use crate::models::architectures::granite_speech5::asr::GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS as CEILING;
+    let minimum = super::asr_minimum_tokens(ModelVariant::GraniteSpeech502BGguf);
+    assert_eq!(minimum, 744);
+    let pool = |rows| super::asr_shared_pool_tokens(CEILING, minimum, rows);
+    assert_eq!(pool(1), CEILING);
+    assert_eq!(pool(2), CEILING);
+    assert_eq!(pool(8), 8 * 744);
+    assert_eq!(pool(32), 32 * 744);
+    assert!(pool(8) < 16_384);
+    // 40 layers x 4 KV heads x (128 + 128) x 2 bytes per token.
+    assert_eq!(pool(8) as u64 * 40 * 4 * 256 * 2, 465 * 1024 * 1024);
+    super::granite_speech5_retained_reach_holds_a_sequence(CEILING as u64, CEILING).unwrap();
+    super::granite_speech5_retained_reach_holds_a_sequence(pool(8) as u64, CEILING).unwrap();
+    let short = super::granite_speech5_retained_reach_holds_a_sequence(CEILING as u64 - 1, CEILING);
+    assert!(short
+        .unwrap_err()
+        .to_string()
+        .contains("IZWI_GRANITE_SPEECH5_RETAINED_DECODE"));
+}

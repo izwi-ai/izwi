@@ -246,7 +246,8 @@ pub(super) struct GraniteSpeechEncoderBatcher {
         EncoderBatchFormation<GraniteSpeechEncoderQueueKey, GraniteSpeechEncoderPending>,
 }
 
-pub(super) type GraniteSpeech5EncoderOutcome = PreparationRowOutcome<Arc<GraniteSpeech5PreparedPromptArtifact>>;
+pub(super) type GraniteSpeech5EncoderOutcome =
+    PreparationRowOutcome<Arc<GraniteSpeech5PreparedPromptArtifact>>;
 
 pub(super) struct GraniteSpeech5EncoderPending {
     pub(super) job: JobLease,
@@ -1410,7 +1411,8 @@ impl GraniteSpeech5EncoderBatcher {
         let stage = binding.stage_for_work(&work)?;
         if stage.name != "asr.encoder.granite_speech5" {
             return Err(Error::InvalidInput(
-                "Granite Speech 5.0 loaded contract did not select asr.encoder.granite_speech5".into(),
+                "Granite Speech 5.0 loaded contract did not select asr.encoder.granite_speech5"
+                    .into(),
             ));
         }
         let deadline = pending.job.spec.deadline;

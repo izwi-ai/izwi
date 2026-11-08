@@ -263,6 +263,8 @@ pub struct GraniteSpeech5Transcription {
 pub(crate) struct GraniteSpeech5PhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) retained: Option<InferenceStateContract>,
+    /// The longest retained sequence: the retained ceiling, within the
+    /// context.
     pub(crate) retained_max_tokens: Option<usize>,
     pub(crate) invocation: InferenceStateContract,
 }
@@ -850,7 +852,10 @@ fn granite_speech5_physical_state_spec(
     Ok(GraniteSpeech5PhysicalStateSpec {
         descriptor,
         retained: uses_retained.then_some(retained),
-        retained_max_tokens: uses_retained.then_some(max_context_tokens),
+        // A retained sequence never outgrows the retained ceiling:
+        // preparation sends longer requests to the atomic graph.
+        retained_max_tokens: uses_retained
+            .then_some(max_context_tokens.min(GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS)),
         invocation,
     })
 }
@@ -1172,6 +1177,35 @@ mod tests {
         assert_eq!(
             batched_preparation.stages[0].lease_scope,
             InvocationLeaseScope::PerStageBatch
+        );
+    }
+
+    /// The published checkpoint's retained sequences are bounded by the
+    /// retained ceiling, not its 16k context, which stays the atomic
+    /// graph's invocation bound.
+    #[test]
+    fn retained_sequences_are_bounded_by_the_retained_ceiling() {
+        let config = published_config();
+        let invocation =
+            granite_speech5_invocation_contract(&config, DType::F16, default_kv_page_size())
+                .unwrap();
+        let retained = granite_speech5_retained_contract(invocation.clone()).unwrap();
+        let normal = vec![
+            sequence_stage(0, StageWorkSelector::PreSequencePreparation),
+            sequence_stage(1, StageWorkSelector::SequencePrefill),
+            sequence_stage(2, StageWorkSelector::SequenceDecode),
+        ];
+        let atomic = vec![atomic_stage(0)];
+        let spec = granite_speech5_physical_state_spec(
+            &[normal.as_slice(), atomic.as_slice()],
+            retained,
+            invocation,
+            config.text_config.max_position_embeddings,
+        )
+        .unwrap();
+        assert_eq!(
+            spec.retained_max_tokens,
+            Some(GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS)
         );
     }
 

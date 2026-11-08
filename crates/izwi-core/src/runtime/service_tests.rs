@@ -2277,6 +2277,23 @@ fn nemotron_decode_budget_tracks_emittable_labels() {
 
 /// Nemotron clips one pass covers decode as retained rows, streamed or
 /// not; longer audio and speaker attribution keep the atomic graph.
+/// A Granite Speech 5.0 row's KV claim (prompt and planned budget) never
+/// exceeds one retained sequence, which the retained pool always holds: a
+/// request at the 2,528-token ceiling decodes as a row, one token over it
+/// (a long prompt, or a caller's large `max_tokens`) runs atomically.
+#[test]
+fn granite_speech5_rows_never_claim_more_than_one_retained_sequence() {
+    use crate::models::architectures::granite_speech5::asr::GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS as CEILING;
+    let context = 16_384;
+    assert!(granite_speech5_decodes_as_row(1_328, 1_200, context));
+    assert!(granite_speech5_decodes_as_row(400, CEILING - 400, context));
+    assert!(!granite_speech5_decodes_as_row(400, CEILING - 399, context));
+    assert!(!granite_speech5_decodes_as_row(1_329, 1_200, context));
+    assert!(!granite_speech5_decodes_as_row(100, 8_000, context));
+    // A prompt that leaves the context no room never becomes a row.
+    assert!(!granite_speech5_decodes_as_row(300, 200, 300));
+}
+
 #[test]
 fn nemotron_short_clips_decode_as_rows_and_long_audio_stays_atomic() {
     let variant = ModelVariant::Nemotron35AsrStreaming06B;

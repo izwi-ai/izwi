@@ -309,6 +309,23 @@ fn asr_shared_pool_tokens(context_tokens: usize, sequence_tokens: u64, rows: usi
         .max(context_tokens)
 }
 
+/// Refuses a Granite Speech 5.0 retained pool whose `reach` is short of one
+/// longest retained sequence (`sequence_tokens`): preparation sends a
+/// request to the retained route whenever its prompt and budget fit that
+/// sequence, and a claim the pool can never hold would wait on KV
+/// admission forever.
+fn granite_speech5_retained_reach_holds_a_sequence(
+    reach: u64,
+    sequence_tokens: usize,
+) -> Result<()> {
+    if reach < sequence_tokens as u64 {
+        return Err(Error::ModelLoadError(format!(
+            "Granite Speech 5.0 retained decoder pages reach {reach} tokens, short of one {sequence_tokens}-token retained sequence; free memory, raise the context, or set IZWI_GRANITE_SPEECH5_RETAINED_DECODE=false"
+        )));
+    }
+    Ok(())
+}
+
 /// The retained-state floor of a TTS variant, in tokens per sequence: one
 /// prompt plus the family's largest automatic output budget (per CFG domain
 /// for VibeVoice). `0` (the page minimum) for every other variant.

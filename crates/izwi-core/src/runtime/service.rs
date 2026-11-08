@@ -163,7 +163,9 @@ use asr_preparation::asr_encoder_retained_resources;
 #[cfg(test)]
 use asr_preparation::install_parakeet_decode_budget;
 #[cfg(test)]
-use asr_preparation::{install_nemotron_decode_budget, nemotron_decodes_as_row};
+use asr_preparation::{
+    granite_speech5_decodes_as_row, install_nemotron_decode_budget, nemotron_decodes_as_row,
+};
 #[cfg(test)]
 use chat_invocation::RuntimeChatInvocationDriver;
 pub use chat_invocation::{
