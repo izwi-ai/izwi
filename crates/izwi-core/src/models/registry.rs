@@ -36,8 +36,8 @@ use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechAsrGenerationOptions, GraniteSpeechAsrModel, GraniteSpeechAsrTranscriptionOutput,
     GraniteSpeechDecodeCheckpoint, GraniteSpeechDecodeState, GraniteSpeechDecodeStep,
     GraniteSpeechPhysicalStateSpec, GraniteSpeechPreparationBatchGeometry,
-    GraniteSpeechPreparationBatchRow, GraniteSpeechPreparedGeometry,
-    GraniteSpeechPreparedPromptArtifact, GraniteSpeechTask,
+    GraniteSpeechAudioFeatures, GraniteSpeechFeatureRow, GraniteSpeechPreparationBatchRow,
+    GraniteSpeechPreparedGeometry, GraniteSpeechPreparedPromptArtifact, GraniteSpeechTask,
 };
 use crate::models::architectures::granite_speech5::asr::{
     GraniteSpeech5AsrModel, GraniteSpeech5DecodeCheckpoint, GraniteSpeech5DecodeState,
@@ -1456,6 +1456,20 @@ fn granite_speech_asr_options(
 }
 
 impl NativeAsrModel {
+    /// Encodes Granite Speech prompt rows whose audio features a host worker
+    /// computed.
+    pub(crate) fn prepare_granite_speech_prompt_artifact_batch_from_features(
+        &self,
+        rows: Vec<GraniteSpeechFeatureRow<'_>>,
+    ) -> Result<Vec<Arc<GraniteSpeechPreparedPromptArtifact>>> {
+        match self {
+            Self::GraniteSpeech(model) => model.prepare_prompt_artifact_batch_from_features(rows),
+            _ => Err(Error::InvalidInput(
+                "Granite Speech batch preparation was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
     pub(crate) fn prepare_granite_speech_prompt_artifact_batch(
         &self,
         rows: &[GraniteSpeechPreparationBatchRow<'_>],
@@ -2243,6 +2257,32 @@ impl NativeAsrModel {
             }
             _ => Err(Error::InvalidInput(
                 "Granite Speech preparation was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    /// One Granite Speech request's audio features, computed on the host,
+    /// and the retained geometry they give.
+    pub(crate) fn granite_speech_retained_preparation_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<(GraniteSpeechAudioFeatures, GraniteSpeechPreparedGeometry)> {
+        match self {
+            Self::GraniteSpeech(model) => {
+                let features = model.prepare_audio_features(audio, sample_rate)?;
+                let geometry = model.retained_preparation_geometry_for_features(
+                    &features,
+                    audio.len(),
+                    language,
+                    prompt,
+                )?;
+                Ok((features, geometry))
+            }
+            _ => Err(Error::InvalidInput(
+                "Granite Speech features were requested from another ASR model".into(),
             )),
         }
     }

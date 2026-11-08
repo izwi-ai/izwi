@@ -70,7 +70,7 @@ use crate::model::ModelResidencyLease;
 use crate::models::architectures::chatterbox::{ChatterboxGenerationParams, T3SamplingParams};
 use crate::models::architectures::fish_s2::{FishS2GenerationParams, FishS2Reference};
 use crate::models::architectures::granite_speech::asr::{
-    GraniteSpeechPreparationBatchRow, GraniteSpeechPreparedGeometry,
+    GraniteSpeechAudioFeatures, GraniteSpeechFeatureRow, GraniteSpeechPreparedGeometry,
     GraniteSpeechPreparedPromptArtifact,
 };
 use crate::models::architectures::granite_speech5::asr::{

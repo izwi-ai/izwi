@@ -890,7 +890,7 @@ impl RuntimeService {
                 ))
             })?;
         let model_for_shape = model.clone();
-        let (prepared, geometry) = self
+        let (prepared, shaped) = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
@@ -919,19 +919,24 @@ impl RuntimeService {
                 let retained = !long_form
                     && !request.asr_native_word_timestamps
                     && model_for_shape.supports_resumable_prefill();
-                let geometry = retained
+                // The log-mel runs here, on a host worker, and travels with
+                // the request, so the device job runs only the encoder.
+                let shaped = retained
                     .then(|| {
-                        model_for_shape.granite_speech_retained_preparation_geometry(
+                        let started = Instant::now();
+                        let shaped = model_for_shape.granite_speech_retained_preparation_features(
                             &samples,
                             sample_rate,
                             request.asr_language_for_execution(),
                             request.asr_prompt_for_execution(),
-                        )
+                        );
+                        record_host_features(variant, started);
+                        shaped
                     })
                     .transpose()?;
                 let audio_seconds = samples.len() as f32 / sample_rate.max(1) as f32;
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
-                if let Some(geometry) = geometry {
+                if let Some((features, geometry)) = shaped {
                     // Admission claims the sequence's pages for `max_tokens`
                     // in full: narrow an omitted budget to the one the
                     // decode uses for this audio's duration, so concurrent
@@ -946,7 +951,7 @@ impl RuntimeService {
                         geometry.prompt_tokens,
                         context_limit,
                     )?;
-                    Ok((request, Some(geometry)))
+                    Ok((request, Some((features, geometry))))
                 } else {
                     request.install_prepared_asr_long_form_atomic(plan)?;
                     Ok((request, None))
@@ -955,7 +960,18 @@ impl RuntimeService {
             .await?;
         let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
             .map_err(|_| Error::Overloaded("Granite Speech retained input exceeds u64".into()))?;
-        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        // The features are held beside the request until the encode drops
+        // them.
+        let features_host_bytes = match &shaped {
+            Some((features, _)) => features.host_bytes().ok_or_else(|| {
+                Error::Overloaded("Granite Speech feature bytes overflow".into())
+            })?,
+            None => 0,
+        };
+        let prepared_host_bytes = retained_host_bytes
+            .checked_add(features_host_bytes)
+            .ok_or_else(|| Error::Overloaded("Granite Speech prepared host bytes overflow".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
         if prepared.uses_asr_long_form_atomic() {
             let (spec, observation) = self.coordinator_job_for_request(&prepared)?;
@@ -973,7 +989,7 @@ impl RuntimeService {
                 }
             };
         }
-        let geometry = geometry.ok_or_else(|| {
+        let (features, geometry) = shaped.ok_or_else(|| {
             Error::InferenceError("Granite Speech normal route lost preparation geometry".into())
         })?;
         let artifact_host_bytes = u64::try_from(
@@ -987,7 +1003,11 @@ impl RuntimeService {
             })?;
         let resources = asr_encoder_retained_resources(
             self.backend_router.context().backend_kind,
-            total_retained_host_bytes,
+            total_retained_host_bytes
+                .checked_add(features_host_bytes)
+                .ok_or_else(|| {
+                    Error::Overloaded("Granite Speech prepared host bytes overflow".into())
+                })?,
             geometry.retained_device_bytes,
         )?;
         let prep_spec = JobSpec {
@@ -1003,7 +1023,7 @@ impl RuntimeService {
             .admit_observed_from_preparation(
                 bridge,
                 prep_spec,
-                JobResourceObservation::host(retained_host_bytes),
+                JobResourceObservation::host(prepared_host_bytes),
             )
             .await
         {
@@ -1015,9 +1035,6 @@ impl RuntimeService {
                 return Err(error);
             }
         };
-        let (samples, sample_rate) = prepared
-            .prepared_asr_audio_for_executor()?
-            .ok_or_else(|| Error::InferenceError("Granite Speech decoded audio was lost".into()))?;
         let outcome = self
             .granite_speech_encoder_batcher
             .submit(GraniteSpeechEncoderPending {
@@ -1025,8 +1042,7 @@ impl RuntimeService {
                 contract: preparation_contract,
                 model: model.clone(),
                 model_label: variant.dir_name(),
-                samples,
-                sample_rate,
+                features,
                 language: prepared.asr_language_for_execution().map(str::to_owned),
                 prompt: prepared.asr_prompt_for_execution().map(str::to_owned),
                 geometry,
