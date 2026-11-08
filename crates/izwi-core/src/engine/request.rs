@@ -508,6 +508,67 @@ pub(super) struct IncrementalModelExecutionReady {
     kokoro_tts: Option<Arc<KokoroPreparedText>>,
 }
 
+/// A request is usually the last owner of its prepared TTS artifacts and is
+/// dropped on a tokio worker. Those that keep tensors on the device (Kokoro's
+/// style rows, VibeVoice, Chatterbox, Voxtral and LFM2.5/LFM3-Audio prompt
+/// embeddings) would then free CUDA memory without the context, and the
+/// latched `CUDA_ERROR_INVALID_CONTEXT` fails the next device call: Kokoro
+/// lost 35 of 64 requests at 32 streams on the H100 this way. Hand them to
+/// [`DeviceOwned`](crate::backends::DeviceOwned) so the last free runs on the
+/// device thread, as the ASR encoder artifacts do.
+impl Drop for IncrementalModelExecutionReady {
+    fn drop(&mut self) {
+        drop(crate::backends::DeviceOwned::new(RetiredTtsArtifacts {
+            kokoro: self.kokoro_tts.take(),
+            vibevoice: self.vibevoice_tts.take(),
+            voxtral: self.voxtral_tts.take(),
+            chatterbox: self.chatterbox_tts.take(),
+            lfm25_audio: self.lfm25_audio_tts.take(),
+            lfm3_audio: self.lfm3_audio.take(),
+        }));
+    }
+}
+
+/// The device-resident prepared TTS artifacts of one dropped request.
+struct RetiredTtsArtifacts {
+    kokoro: Option<Arc<KokoroPreparedText>>,
+    vibevoice: Option<Arc<VibeVoiceTtsPreparedArtifact>>,
+    voxtral: Option<Arc<VoxtralTtsPreparedArtifact>>,
+    chatterbox: Option<Arc<ChatterboxPreparedArtifact>>,
+    lfm25_audio: Option<Arc<Lfm25AudioPreparedTtsArtifact>>,
+    lfm3_audio: Option<Arc<Lfm3AudioPreparedArtifact>>,
+}
+
+impl crate::backends::DeviceResident for RetiredTtsArtifacts {
+    fn device_location(&self) -> Option<candle_core::DeviceLocation> {
+        let kokoro = self
+            .kokoro
+            .as_ref()
+            .and_then(|artifact| artifact.chunks.first())
+            .map(|chunk| &chunk.ref_style);
+        [
+            kokoro,
+            self.vibevoice
+                .as_ref()
+                .map(|artifact| artifact.input_embeds()),
+            self.voxtral
+                .as_ref()
+                .map(|artifact| &artifact.prompt_embeddings),
+            self.chatterbox
+                .as_ref()
+                .map(|artifact| &artifact.conditional),
+            self.lfm25_audio
+                .as_ref()
+                .map(|artifact| &artifact.prompt_embeddings),
+            self.lfm3_audio.as_ref().map(|artifact| &artifact.embeds),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|tensor| tensor.device().location())
+        .find(|location| matches!(location, candle_core::DeviceLocation::Cuda { .. }))
+    }
+}
+
 /// Speech-rate range every TTS request is clamped to. Clients may send
 /// OpenAI's 0.25–4.0; the engine supports 0.5–2.0 (as `izwi tts --speed`
 /// documents).

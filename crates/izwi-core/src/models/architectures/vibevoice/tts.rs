@@ -1666,6 +1666,11 @@ impl VibeVoiceTtsPreparedArtifact {
         self.input_ids.len()
     }
 
+    /// The prompt embeddings, on the model's device.
+    pub(crate) fn input_embeds(&self) -> &Tensor {
+        &self.input_embeds
+    }
+
     pub(crate) fn retained_tensor_bytes(&self) -> Result<u64> {
         [&self.input_embeds, &self.negative_embed]
             .into_iter()

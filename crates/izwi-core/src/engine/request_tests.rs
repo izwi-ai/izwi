@@ -1623,3 +1623,83 @@ fn invalid_speech_sampling_is_rejected_before_preparation() {
         ));
     }
 }
+
+fn kokoro_artifact_on(device: &candle_core::Device) -> Arc<super::KokoroPreparedText> {
+    let chunk = crate::models::architectures::kokoro::KokoroPreparedRequest {
+        source_text: "Probe.".into(),
+        requested_speaker: None,
+        requested_language: None,
+        requested_speed: 1.0,
+        phonemes: "p".into(),
+        token_ids: vec![1; 4],
+        ref_style: candle_core::Tensor::zeros((1, 256), candle_core::DType::F32, device).unwrap(),
+        speed: 1.0,
+        rng_seed: None,
+    };
+    Arc::new(super::KokoroPreparedText {
+        source_text: "Probe.".into(),
+        requested_speaker: None,
+        requested_language: None,
+        requested_speed: 1.0,
+        chunks: vec![chunk],
+    })
+}
+
+fn retired(kokoro: Arc<super::KokoroPreparedText>) -> super::RetiredTtsArtifacts {
+    super::RetiredTtsArtifacts {
+        kokoro: Some(kokoro),
+        vibevoice: None,
+        voxtral: None,
+        chatterbox: None,
+        lfm25_audio: None,
+        lfm3_audio: None,
+    }
+}
+
+/// Off CUDA a retired request's prepared TTS artifacts report no device to
+/// move to, so they drop in place on whatever thread drops the request.
+#[test]
+fn retired_tts_artifacts_off_cuda_drop_in_place() {
+    use crate::backends::DeviceResident;
+    let artifact = kokoro_artifact_on(&candle_core::Device::Cpu);
+    let weak = Arc::downgrade(&artifact);
+    let owned = crate::backends::DeviceOwned::new(retired(artifact));
+    assert_eq!(owned.device_location(), None);
+    std::thread::spawn(move || drop(owned)).join().unwrap();
+    assert!(weak.upgrade().is_none(), "the artifact dropped with its owner");
+}
+
+/// On CUDA a Kokoro request's style rows report their device, so a request
+/// dropped on a tokio worker moves its last free to the device thread
+/// instead of freeing without the context (B2: Kokoro lost 35 of 64
+/// requests at 32 streams to the latched `CUDA_ERROR_INVALID_CONTEXT`).
+#[cfg(feature = "cuda")]
+#[test]
+fn retired_kokoro_style_rows_on_cuda_free_on_the_device_thread() {
+    use crate::backends::DeviceResident;
+    let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+        return;
+    };
+    let context = device.as_cuda_device().unwrap().cuda_stream().context().clone();
+    context.check_err().expect("no error latched before the drop");
+    let owned = crate::backends::DeviceOwned::new(retired(kokoro_artifact_on(&device)));
+    assert!(matches!(
+        owned.device_location(),
+        Some(candle_core::DeviceLocation::Cuda { .. })
+    ));
+    let before = crate::backends::device_frees_rerouted_total();
+    std::thread::spawn(move || drop(owned)).join().unwrap();
+    assert!(crate::backends::device_frees_rerouted_total() > before);
+    let thread =
+        crate::backends::DeviceThread::for_location(device.location()).expect("device thread");
+    crate::backends::recv_serving_device({
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        drop(thread.submit(move || {
+            let _ = sender.send(());
+        }));
+        receiver
+    });
+    context
+        .check_err()
+        .expect("retired Kokoro style rows dropped on a fresh thread must not latch an error");
+}
