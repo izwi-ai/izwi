@@ -33,6 +33,7 @@ use super::acoustic::{
 };
 use super::codec::{
     VoxtralCodecConfig, VoxtralCodecDecoder, VoxtralCodecTimeline, VOXTRAL_CODEC_CHUNK_FRAMES,
+    VOXTRAL_CODEC_STREAM_FIRST_FRAMES,
 };
 use super::config::VoxtralTtsConfig;
 use super::retained::{
@@ -550,8 +551,14 @@ impl VoxtralTtsModel {
             ));
         }
         let frames_generated = state.frames.len();
-        let timeline = VoxtralCodecTimeline::new(frames_to_codebooks(state.frames.clone())?)?;
-        let samples = pipeline.codec_decoder.decode_timeline(&timeline)?;
+        // Whole chunks, as `decode_timeline`, read from the frames in place.
+        let (samples, _) = pipeline.codec_decoder.decode_stream_frames(
+            &state.frames,
+            0,
+            true,
+            VOXTRAL_CODEC_CHUNK_FRAMES,
+            usize::MAX,
+        )?;
         state.phase = VoxtralTtsRetainedPhase::Finished;
         Ok(VoxtralTtsOutput {
             samples,
@@ -562,12 +569,14 @@ impl VoxtralTtsModel {
 }
 
 impl VoxtralTtsModel {
-    /// Per-chunk emission for a retained state: the audio of codec chunks
-    /// completed since the last call, exactly as
-    /// [`Self::retained_codec_finalize`] decodes them (chunks decode
-    /// independently). In the codec phase, it also decodes the last
-    /// partial chunk and finishes the state. Call between quanta; a request
-    /// streamed this way finishes with this call instead of the finalize.
+    /// Streamed emission for a retained state: the audio of the frames
+    /// committed since the last emission, exactly as
+    /// [`Self::retained_codec_finalize`] decodes them. The first audio goes
+    /// out after `VOXTRAL_CODEC_STREAM_FIRST_FRAMES` frames, not after a
+    /// whole 30 s codec chunk (see `decode_stream_frames`). In the codec
+    /// phase, it also decodes the rest and finishes the state. Call between
+    /// quanta; a request streamed this way finishes with this call instead
+    /// of the finalize.
     pub(crate) fn stream_retained_codec_chunks(
         &self,
         state: &mut VoxtralTtsRetainedState,
@@ -579,12 +588,12 @@ impl VoxtralTtsModel {
             return Ok(Vec::new());
         }
         let finished = state.phase == VoxtralTtsRetainedPhase::Codec;
-        let timeline = VoxtralCodecTimeline::new(frames_to_codebooks(state.frames.clone())?)?;
-        let (samples, next) = pipeline.codec_decoder.decode_timeline_chunks(
-            &timeline,
+        let (samples, next) = pipeline.codec_decoder.decode_stream_frames(
+            &state.frames,
             state.codec_emitted_frames,
             finished,
             VOXTRAL_CODEC_CHUNK_FRAMES,
+            VOXTRAL_CODEC_STREAM_FIRST_FRAMES,
         )?;
         state.codec_emitted_frames = next;
         if finished {

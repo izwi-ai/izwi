@@ -95,12 +95,14 @@ pub(crate) struct VoxtralTtsStageCeiling {
     pub(crate) num_codebooks: usize,
 }
 
+/// Host state to restore. Frames are only ever appended, so a checkpoint
+/// keeps their count instead of a copy of every frame.
 #[derive(Clone)]
 struct VoxtralTtsHostCheckpoint {
     prefill_cursor: usize,
     lm_position: usize,
     last_hidden: Option<Tensor>,
-    frames: Vec<Vec<u32>>,
+    frames: usize,
     phase: VoxtralTtsRetainedPhase,
     codec_emitted_frames: usize,
 }
@@ -122,7 +124,7 @@ pub(crate) struct VoxtralTtsRetainedState {
     pub(crate) last_hidden: Option<Tensor>,
     pub(crate) frames: Vec<Vec<u32>>,
     pub(crate) phase: VoxtralTtsRetainedPhase,
-    /// Frames whose codec chunks have been streamed (a chunk boundary).
+    /// Frames whose audio has been streamed.
     pub(crate) codec_emitted_frames: usize,
 }
 
@@ -228,7 +230,7 @@ impl VoxtralTtsRetainedState {
             prefill_cursor: self.prefill_cursor,
             lm_position: self.lm_position,
             last_hidden: self.last_hidden.clone(),
-            frames: self.frames.clone(),
+            frames: self.frames.len(),
             phase: self.phase,
             codec_emitted_frames: self.codec_emitted_frames,
         }
@@ -238,7 +240,7 @@ impl VoxtralTtsRetainedState {
         self.prefill_cursor = checkpoint.prefill_cursor;
         self.lm_position = checkpoint.lm_position;
         self.last_hidden = checkpoint.last_hidden.clone();
-        self.frames.clone_from(&checkpoint.frames);
+        self.frames.truncate(checkpoint.frames);
         self.phase = checkpoint.phase;
         self.codec_emitted_frames = checkpoint.codec_emitted_frames;
     }
@@ -447,11 +449,24 @@ mod tests {
         state.phase = VoxtralTtsRetainedPhase::Codec;
         let checkpoint = state.begin_codec_quantum().unwrap();
         state.phase = VoxtralTtsRetainedPhase::Finished;
-        state.frames.clear();
+        state.codec_emitted_frames = 1;
         assert!(state.commit_codec_quantum(&checkpoint).is_ok());
 
         state.rollback_codec_quantum(&checkpoint);
         assert!(state.codec_ready());
+        assert_eq!(state.codec_emitted_frames, 0);
         assert_eq!(state.frames, vec![vec![1, 2]]);
+    }
+
+    /// A checkpoint keeps the frame count, not a copy of every frame: a
+    /// rolled-back quantum drops the frames it appended.
+    #[test]
+    fn host_checkpoint_drops_frames_appended_after_it() {
+        let mut state = decode_state(1.2, 3);
+        let checkpoint = state.host_checkpoint();
+        state.frames.push(vec![3, 4]);
+        state.frames.push(vec![5, 6]);
+        state.restore_host(&checkpoint);
+        assert_eq!(state.frames, vec![vec![1, 2]; 3]);
     }
 }

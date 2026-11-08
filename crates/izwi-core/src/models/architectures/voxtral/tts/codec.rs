@@ -21,6 +21,11 @@ use super::config::{VoxtralTtsAudioTokenizerArgs, VoxtralTtsConfig};
 
 pub const VOXTRAL_CODEC_CHUNK_FRAMES: usize = 375;
 
+/// Frames a streamed request's first audio waits for: 0.48 s at 12.5 Hz.
+/// Later emissions wait for as many new frames as were already sent (see
+/// [`VoxtralCodecDecoder::decode_stream_frames`]).
+pub const VOXTRAL_CODEC_STREAM_FIRST_FRAMES: usize = 6;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct VoxtralCodecConfig {
     pub channels: usize,
@@ -314,16 +319,113 @@ impl VoxtralCodecDecoder {
                 range.clone(),
                 self.quantizer.semantic_codebook.embeddings().device(),
             )?;
-            let audio = self.decode_unshifted_codes(&codes)?;
-            let mut chunk = audio
-                .to_dtype(DType::F32)?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
-            trim_samples_to_frames(&mut chunk, chunk_len, &self.config)?;
-            samples.extend(chunk);
+            samples.extend(self.decode_codes_to_samples(&codes, chunk_len)?);
             next = range.end;
         }
         Ok((samples, next))
+    }
+
+    /// Streamed emission over frame-major shifted frames (each frame holds
+    /// one code per codebook), read in place: the audio of frames
+    /// `emitted..end` and `end`.
+    ///
+    /// Audio is defined by [`Self::decode_timeline`]: codec chunks of
+    /// `chunk_frames` decode independently. A complete chunk is emitted as
+    /// that decode. Inside the open chunk, the codec is causal (causal
+    /// convolutions, transposed convolutions trimmed on the right, causal
+    /// sliding-window attention), so decoding the chunk's frames so far
+    /// gives each of them the samples the whole chunk gives it: once
+    /// `first_frames` frames exist, and then whenever as many new frames as
+    /// were already sent exist (6, 12, 24, ... frames), the open chunk's
+    /// prefix is decoded and its new frames' samples are emitted. With
+    /// `finished` (or an end-of-audio code) the last partial chunk is
+    /// emitted too. `first_frames == usize::MAX` emits whole chunks only.
+    pub fn decode_stream_frames(
+        &self,
+        frames: &[Vec<u32>],
+        emitted: usize,
+        finished: bool,
+        chunk_frames: usize,
+        first_frames: usize,
+    ) -> Result<(Vec<f32>, usize)> {
+        if emitted > frames.len() {
+            return Err(Error::AudioError(format!(
+                "Voxtral codec stream emitted {emitted} of {} frames",
+                frames.len()
+            )));
+        }
+        // Emitted frames were audible, so only the rest can end the audio.
+        let audible = frames[emitted..]
+            .iter()
+            .position(|frame| {
+                frame
+                    .first()
+                    .is_some_and(|token| strip_audio_token_offset(*token) == AudioCodeValue::End)
+            })
+            .map_or(frames.len(), |end| emitted + end);
+        // Frames past end-of-audio are trimmed, so the audio is final.
+        let finished = finished || audible < frames.len();
+        let chunk_frames = chunk_frames.max(1);
+        let mut samples = Vec::new();
+        let mut emitted = emitted;
+        while emitted < audible {
+            let chunk_start = emitted - emitted % chunk_frames;
+            let chunk_end = chunk_start.saturating_add(chunk_frames);
+            let end = if audible >= chunk_end {
+                chunk_end
+            } else if finished || audible - emitted >= first_frames.max(emitted) {
+                audible
+            } else {
+                break;
+            };
+            let window = &frames[chunk_start..end];
+            let codes = self.unshifted_codes_for_frames(window)?;
+            let decoded = self.decode_codes_to_samples(&codes, window.len())?;
+            let skip = self
+                .config
+                .samples_for_frames(emitted - chunk_start)?
+                .min(decoded.len());
+            samples.extend_from_slice(&decoded[skip..]);
+            emitted = end;
+        }
+        Ok((samples, emitted))
+    }
+
+    /// `[1, codebooks, frames]` unshifted codes for frame-major shifted
+    /// frames, as [`VoxtralCodecTimeline`] builds them from codebook rows.
+    fn unshifted_codes_for_frames(&self, frames: &[Vec<u32>]) -> Result<Tensor> {
+        let codebooks = self.quantizer.num_codebooks;
+        let count = frames.len();
+        let mut values = vec![0u32; codebooks * count];
+        for (index, frame) in frames.iter().enumerate() {
+            if frame.len() != codebooks {
+                return Err(Error::AudioError(format!(
+                    "Voxtral codec expected {codebooks} codebooks, got {}",
+                    frame.len()
+                )));
+            }
+            for (codebook, token) in frame.iter().enumerate() {
+                if let AudioCodeValue::Code(code) = strip_audio_token_offset(*token) {
+                    values[codebook * count + index] = code;
+                }
+            }
+        }
+        Tensor::from_vec(
+            values,
+            (1, codebooks, count),
+            self.quantizer.semantic_codebook.embeddings().device(),
+        )
+        .map_err(Error::from)
+    }
+
+    fn decode_codes_to_samples(&self, codes: &Tensor, frames: usize) -> Result<Vec<f32>> {
+        let audio = self.decode_unshifted_codes(codes)?;
+        let mut samples = audio
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        trim_samples_to_frames(&mut samples, frames, &self.config)?;
+        Ok(samples)
     }
 
     pub fn decode_unshifted_codes(&self, codes: &Tensor) -> Result<Tensor> {
@@ -1298,6 +1400,182 @@ mod tests {
         decoder.config.samples_for_frames(frames).unwrap()
     }
 
+    /// A codec with the real one's layer kinds and xorshift weights: two
+    /// stride-2 transposed convolutions, causal sliding-window attention at
+    /// three rates, and the reflect-padded kernel-7 output projection (zero
+    /// weights would decode every frame to silence).
+    fn random_codec_decoder(device: &Device) -> VoxtralCodecDecoder {
+        use crate::kernels::numeric_check::xorshift_tensor;
+
+        let mut value = tiny_codec_config_value();
+        let tokenizer = &mut value["multimodal"]["audio_tokenizer_args"];
+        let (dim, hidden, heads, kv_heads, head_dim) = (8usize, 16usize, 2usize, 1usize, 4usize);
+        tokenizer["dim"] = json!(dim);
+        tokenizer["hidden_dim"] = json!(hidden);
+        tokenizer["n_heads"] = json!(heads);
+        tokenizer["n_kv_heads"] = json!(kv_heads);
+        tokenizer["head_dim"] = json!(head_dim);
+        tokenizer["pretransform_patch_size"] = json!(4);
+        tokenizer["patch_proj_kernel_size"] = json!(7);
+        tokenizer["decoder_transformer_lengths_str"] = json!("1,1,1");
+        tokenizer["decoder_convs_kernels_str"] = json!("3,4,4");
+        tokenizer["decoder_convs_strides_str"] = json!("1,2,2");
+        let config = VoxtralTtsConfig::from_json_str(&value.to_string()).unwrap();
+        let latent = config.multimodal.audio_tokenizer_args.semantic_dim
+            + config.multimodal.audio_tokenizer_args.acoustic_dim;
+
+        let mut seed = 0x5EED_C0DEu64;
+        let mut random = |shape: &[usize]| {
+            seed += 1;
+            xorshift_tensor(shape, seed, 0.5, device).unwrap()
+        };
+        let ones = |shape: &[usize]| Tensor::ones(shape, DType::F32, device).unwrap();
+        let mut tensors = HashMap::from([
+            (
+                "audio_tokenizer.quantizer.semantic_codebook.cluster_usage".to_string(),
+                ones(&[4]),
+            ),
+            (
+                "audio_tokenizer.quantizer.semantic_codebook.embedding_sum".to_string(),
+                random(&[4, 2]),
+            ),
+            (
+                "audio_tokenizer.decoder_blocks.0.conv.weight".to_string(),
+                random(&[dim, latent, 3]),
+            ),
+            (
+                "audio_tokenizer.decoder_blocks.2.conv.weight".to_string(),
+                random(&[dim, dim, 4]),
+            ),
+            (
+                "audio_tokenizer.decoder_blocks.4.conv.weight".to_string(),
+                random(&[dim, dim, 4]),
+            ),
+            (
+                "audio_tokenizer.output_proj.conv.weight".to_string(),
+                random(&[4, dim, 7]),
+            ),
+        ]);
+        for block in [1usize, 3, 5] {
+            let prefix = format!("audio_tokenizer.decoder_blocks.{block}.layers.0");
+            for (name, shape) in [
+                ("attention.wq.weight", vec![heads * head_dim, dim]),
+                ("attention.wk.weight", vec![kv_heads * head_dim, dim]),
+                ("attention.wv.weight", vec![kv_heads * head_dim, dim]),
+                ("attention.wo.weight", vec![dim, heads * head_dim]),
+                ("feed_forward.w1.weight", vec![hidden, dim]),
+                ("feed_forward.w2.weight", vec![dim, hidden]),
+                ("feed_forward.w3.weight", vec![hidden, dim]),
+                ("attention_scale", vec![dim]),
+                ("ffn_scale", vec![dim]),
+            ] {
+                tensors.insert(format!("{prefix}.{name}"), random(&shape));
+            }
+            for (name, width) in [
+                ("attention.q_norm.weight", heads * head_dim),
+                ("attention.k_norm.weight", kv_heads * head_dim),
+                ("attention_norm.weight", dim),
+                ("ffn_norm.weight", dim),
+            ] {
+                tensors.insert(format!("{prefix}.{name}"), ones(&[width]));
+            }
+        }
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, device).pp("audio_tokenizer");
+        VoxtralCodecDecoder::load(&config, vb).unwrap()
+    }
+
+    fn random_frames(count: usize) -> Vec<Vec<u32>> {
+        (0..count)
+            .map(|i| {
+                (0..3)
+                    .map(|k| apply_audio_token_offset(((i * 7 + k * 5 + i * i) % 3) as u32))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn timeline_of_frames(frames: &[Vec<u32>]) -> VoxtralCodecTimeline {
+        VoxtralCodecTimeline::new(
+            (0..frames[0].len())
+                .map(|k| frames.iter().map(|frame| frame[k]).collect())
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    /// A streamed request hears audio after `first` frames instead of a
+    /// whole codec chunk, the windows grow with the audio already sent, and
+    /// the streamed samples are the whole decode's: the codec is causal, so
+    /// a chunk's prefix decodes each of its frames as the whole chunk does
+    /// (to the last bits a shorter GEMM rounds differently: ~1e-7 here),
+    /// and whole chunks decode bit for bit as before.
+    #[test]
+    fn streamed_frames_reproduce_the_timeline_decode_with_early_first_audio() {
+        let device = Device::Cpu;
+        let decoder = random_codec_decoder(&device);
+        let (total, chunk, first) = (27usize, 12usize, 2usize);
+        let frames = random_frames(total);
+        let whole = decoder
+            .decode_timeline_chunks(&timeline_of_frames(&frames), 0, true, chunk)
+            .unwrap()
+            .0;
+        assert_eq!(whole.len(), config_samples(&decoder, total));
+        assert!(whole.iter().any(|sample| sample.abs() > 1e-3));
+
+        let mut streamed = Vec::new();
+        let mut emitted = 0;
+        let mut emissions = Vec::new();
+        for available in 1..=total {
+            let (samples, next) = decoder
+                .decode_stream_frames(&frames[..available], emitted, false, chunk, first)
+                .unwrap();
+            assert_eq!(samples.len(), config_samples(&decoder, next - emitted));
+            if next != emitted {
+                emissions.push(next);
+            }
+            streamed.extend(samples);
+            emitted = next;
+        }
+        // 2, then as many new frames as were sent (4, 8), then the chunk end
+        // (12), then whole chunks (24).
+        assert_eq!(emissions, vec![2, 4, 8, 12, 24]);
+        let (tail, next) = decoder
+            .decode_stream_frames(&frames, emitted, true, chunk, first)
+            .unwrap();
+        assert_eq!(next, total);
+        streamed.extend(tail);
+        assert_eq!(streamed.len(), whole.len());
+        let open_chunk = config_samples(&decoder, 8);
+        let diff = crate::kernels::numeric_check::max_abs_diff(
+            &streamed[..open_chunk],
+            &whole[..open_chunk],
+        );
+        assert!(diff <= 1e-5, "prefix windows differ by {diff}");
+        // From the first chunk's end on, every emission is a whole-chunk
+        // decode (and the last partial chunk the finalize's).
+        assert_eq!(streamed[open_chunk..], whole[open_chunk..]);
+
+        // Whole chunks only, as the decode before streamed windows.
+        let (chunks_only, next) = decoder
+            .decode_stream_frames(&frames[..20], 0, false, chunk, usize::MAX)
+            .unwrap();
+        assert_eq!(next, chunk);
+        assert_eq!(chunks_only, whole[..config_samples(&decoder, chunk)]);
+
+        // End-of-audio finishes the stream at the code before it.
+        let mut ended = frames.clone();
+        ended[17][0] = AudioSpecialToken::End.id();
+        let (samples, next) = decoder
+            .decode_stream_frames(&ended, 12, false, chunk, first)
+            .unwrap();
+        assert_eq!(next, 17);
+        let ended_whole = decoder
+            .decode_timeline_chunks(&timeline_of_frames(&ended), 0, true, chunk)
+            .unwrap()
+            .0;
+        assert_eq!(samples, ended_whole[config_samples(&decoder, 12)..]);
+    }
+
     /// VXT-8: reflect padding matches the reference `pad1d` (NumPy
     /// `np.pad(mode="reflect")` goldens), including the zero extension of
     /// inputs no longer than the padding.
@@ -1531,6 +1809,10 @@ mod tests {
     }
 
     fn tiny_codec_config() -> VoxtralTtsConfig {
+        VoxtralTtsConfig::from_json_str(&tiny_codec_config_value().to_string()).unwrap()
+    }
+
+    fn tiny_codec_config_value() -> serde_json::Value {
         let mut value: serde_json::Value = serde_json::from_str(fixture_json()).unwrap();
         value["dim"] = json!(4);
         value["hidden_dim"] = json!(8);
@@ -1564,7 +1846,7 @@ mod tests {
         tokenizer["decoder_transformer_lengths_str"] = json!("1,1");
         tokenizer["decoder_convs_kernels_str"] = json!("3,4");
         tokenizer["decoder_convs_strides_str"] = json!("1,2");
-        VoxtralTtsConfig::from_json_str(&value.to_string()).unwrap()
+        value
     }
 
     fn tiny_codec_tensors(device: &Device) -> HashMap<String, Tensor> {
