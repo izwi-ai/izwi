@@ -7795,6 +7795,7 @@ impl ModelRegistry {
                         "precision": model
                             .precision()
                             .map(crate::kernels::numeric_check::PrecisionLoad::diagnostics),
+                        "flow_graphs": model.flow_graphs_diagnostics(),
                     });
                     diagnostics.push(loaded_model_diagnostics_entry(
                         &self.device,

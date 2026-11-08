@@ -58,6 +58,7 @@ use crate::models::architectures::qwen3::tts::{
     qwen3_tts_text_embedding_reads_in_place, Qwen3TtsLoadLayout,
 };
 use crate::models::architectures::vibevoice::tts::vibevoice_tts_weight_dtype;
+use crate::models::architectures::voxtral::tts::acoustic::voxtral_tts_flow_graph_device_bytes;
 use crate::models::architectures::voxtral::tts::model::{VoxtralTtsDTypePlan, VoxtralTtsModel};
 use crate::models::shared::codecs::mimi::MIMI_WEIGHTS_FILE;
 
@@ -660,7 +661,10 @@ fn voxtral_tts_plan(
     let Some(files) = census_of(&[model_path.join("consolidated.safetensors")])? else {
         return Ok(None);
     };
-    price_voxtral_tts_as_loaded(&files, backend, &metadata.dtype_plan).map(Some)
+    // The acoustic flow's CUDA graphs allocate at the load's self-check.
+    let graphs = voxtral_tts_flow_graph_device_bytes(backend);
+    price_voxtral_tts_as_loaded(&files, backend, &metadata.dtype_plan)
+        .map(|plan| Some(plan.with_deferred_device_bytes(graphs)))
 }
 
 /// The Voxtral-TTS plan as loaded: a lower-precision Metal tier is kept

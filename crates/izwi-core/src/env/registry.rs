@@ -2721,6 +2721,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the Voxtral TTS model dtype (e.g. f32, f16, bf16).",
     ),
     CoreEnvVar::new(
+        "IZWI_VOXTRAL_TTS_FLOW_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Voxtral TTS runs each frame's acoustic flow (every Euler step's CFG velocity and update, at the 32 padded decode rows, spare rows zero) as one CUDA graph per step count, CFG strength and dtype, with the frame's noise drawn before it as a graph input. A load-time self-check captures the request-default graph over xorshift inputs and compares replays with the eager flow bit for bit; a mismatch or CUDA error keeps every frame eager. Loads price 64 MiB for the graphs. Any false value turns them off; `flow_graphs` in the model diagnostics reports why they are off, captures, replays and graphed and eager frames.",
+    ),
+    CoreEnvVar::new(
         "IZWI_WHISPER_ADAPTIVE_MAX_NEW_TOKENS",
         Flag,
         "true",

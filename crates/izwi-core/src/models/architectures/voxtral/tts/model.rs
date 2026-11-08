@@ -187,7 +187,7 @@ impl VoxtralTtsModel {
             voxtral_tts_precision(&device, voxtral_tts_dtype_override().as_deref())?;
         let codec_dtype = model.dtype_plan.codec;
         let config = &model.config;
-        let (pipeline, precision) = load_with_precision_fallback(
+        let (mut pipeline, precision) = load_with_precision_fallback(
             "Voxtral TTS",
             &selection,
             device.kind.is_metal(),
@@ -213,9 +213,22 @@ impl VoxtralTtsModel {
             model.dtype_plan.codec,
             precision.reason
         );
+        // A frame's flow inputs are the LM's hidden states.
+        pipeline
+            .acoustic_transformer
+            .resolve_flow_graphs(precision.loaded, &pipeline.device);
         model.pipeline = Some(pipeline);
         model.precision = Some(precision);
         Ok(model)
+    }
+
+    /// The acoustic flow's CUDA graphs: why they are off, or their captures,
+    /// replays and graphed and eager frames.
+    pub fn flow_graphs_diagnostics(&self) -> serde_json::Value {
+        match &self.pipeline {
+            Some(pipeline) => pipeline.acoustic_transformer.flow_graphs_diagnostics(),
+            None => serde_json::json!({ "off": "not loaded" }),
+        }
     }
 
     /// The transformer precision this model loaded with and why, including
