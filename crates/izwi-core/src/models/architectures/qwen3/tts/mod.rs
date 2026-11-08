@@ -303,6 +303,9 @@ pub struct TtsStreamingConfig {
     pub min_frames_before_stream: usize,
     /// Minimum newly generated codec frames before decoding again.
     pub decode_interval_frames: usize,
+    /// Largest interval the emission cadence grows to (see
+    /// [`Self::emission_interval`]).
+    pub max_decode_interval_frames: usize,
     /// Keep a small decode lookahead to reduce boundary artifacts.
     pub decode_lookahead_frames: usize,
 }
@@ -312,6 +315,7 @@ impl Default for TtsStreamingConfig {
         Self {
             min_frames_before_stream: 6,
             decode_interval_frames: 4,
+            max_decode_interval_frames: 32,
             decode_lookahead_frames: 2,
         }
     }
@@ -326,8 +330,26 @@ impl TtsStreamingConfig {
         Self {
             min_frames_before_stream: usize::MAX,
             decode_interval_frames: usize::MAX,
+            max_decode_interval_frames: usize::MAX,
             decode_lookahead_frames: 0,
         }
+    }
+
+    /// New frames to wait for before the next streamed decode, once
+    /// `emitted` frames have been sent.
+    ///
+    /// Every streamed decode re-runs the vocoder over its receptive-field
+    /// context and synchronizes the device, so 4-frame windows cost several
+    /// times their own frames: on the H100 a streamed request took 2.4× as
+    /// long as the same request buffered. The interval grows with the audio
+    /// already sent (6, 12, 24, then 32 frames by default), so a listener
+    /// always holds at least as much audio as the next window takes to
+    /// generate while the first chunk still arrives after
+    /// `min_frames_before_stream` frames.
+    pub fn emission_interval(&self, emitted: usize) -> usize {
+        self.decode_interval_frames
+            .max(emitted)
+            .min(self.max_decode_interval_frames.max(self.decode_interval_frames))
     }
 }
 
@@ -3848,7 +3870,7 @@ impl Qwen3TtsModel {
                 return Ok(Vec::new());
             }
             let newly_generated = total_frames.saturating_sub(*emitted_frames);
-            if newly_generated < stream_config.decode_interval_frames {
+            if newly_generated < stream_config.emission_interval(*emitted_frames) {
                 return Ok(Vec::new());
             }
         }
@@ -4738,6 +4760,30 @@ pub(crate) mod tests {
 
     use super::config::{CodePredictorConfig, TalkerConfig};
     use super::*;
+
+    /// Streamed emissions: the first after 6 frames, then windows that grow
+    /// with the audio already sent up to 32 frames; buffered decoding never
+    /// emits early.
+    #[test]
+    fn streamed_emission_windows_grow_with_sent_audio() {
+        let config = TtsStreamingConfig::default();
+        let mut emitted = 0;
+        let mut windows = Vec::new();
+        for total in 1..=200 {
+            if total < config.min_frames_before_stream {
+                continue;
+            }
+            if total - emitted >= config.emission_interval(emitted) {
+                windows.push(total - emitted);
+                emitted = total;
+            }
+        }
+        assert_eq!(&windows[..6], &[6, 6, 12, 24, 32, 32]);
+        assert!(windows.iter().all(|&window| window <= 32));
+        let buffered = TtsStreamingConfig::final_only();
+        assert_eq!(buffered.emission_interval(0), usize::MAX);
+        assert_eq!(buffered.emission_interval(500), usize::MAX);
+    }
 
     fn dtype_test_profile(
         kind: DeviceKind,
