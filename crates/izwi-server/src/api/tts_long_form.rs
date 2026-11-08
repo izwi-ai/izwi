@@ -1356,6 +1356,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
             0.0
         },
         stop_reason: TtsStopReason::combine(stop_reasons),
+        diagnostics: None,
     });
     output
         .send(terminal)
@@ -1402,6 +1403,7 @@ mod tests {
             tokens_generated: tokens,
             rtf: 0.0,
             stop_reason,
+            diagnostics: None,
         };
         let segments = vec![
             GenerationRequest::new("first"),
