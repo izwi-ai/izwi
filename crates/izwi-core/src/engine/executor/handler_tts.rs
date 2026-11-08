@@ -347,6 +347,18 @@ fn late_cancelled_tts_rows(cancelled: &[bool], checkpoint_armed: &[bool]) -> Vec
         .collect()
 }
 
+/// The phase times one continuous TTS step adds to its request: the step's
+/// sampling and codec milliseconds, which the engine sums into the
+/// request's latency breakdown (`X-Izwi-Tts-Diagnostics`). Nothing else:
+/// the engine times the decode step itself, and prefill reported its own.
+fn continuous_tts_step_timing(sampling_ms: f64, codec_ms: f64) -> ExecutorPhaseTiming {
+    ExecutorPhaseTiming {
+        sampling_ms: Some(sampling_ms),
+        codec_ms: Some(codec_ms),
+        ..ExecutorPhaseTiming::default()
+    }
+}
+
 fn continuous_tts_model_call(
     live_kernel_rows: usize,
     tensor_batched: bool,
@@ -4227,7 +4239,10 @@ impl NativeExecutor {
                     tokens_processed: accepted,
                     tokens_generated: accepted,
                     finished: step.finished,
-                    phase_timing_override: None,
+                    phase_timing_override: Some(continuous_tts_step_timing(
+                        step.sampling_ms,
+                        step.codec_ms,
+                    )),
                     asr_diagnostics: None,
                     error: None,
                     logprobs: Vec::new(),
@@ -4685,6 +4700,22 @@ mod tests {
         assert_eq!(accepted_tts_talker_tokens(17, 18, 1).unwrap(), 1);
         assert!(accepted_tts_talker_tokens(18, 17, 1).is_err());
         assert!(accepted_tts_talker_tokens(17, 19, 1).is_err());
+    }
+
+    /// A continuous TTS step reports its own sampling and codec time, which
+    /// the engine adds up per request (they were missing from every
+    /// continuously decoded Qwen3-TTS request's diagnostics), and leaves the
+    /// decode and prefill time the engine measures itself alone.
+    #[test]
+    fn continuous_tts_steps_report_their_sampling_and_codec_time() {
+        let timing = continuous_tts_step_timing(1.5, 42.0);
+        assert_eq!(timing.sampling_ms, Some(1.5));
+        assert_eq!(timing.codec_ms, Some(42.0));
+        assert_eq!(timing.decode_ms, None);
+        assert_eq!(timing.prefill_ms, None);
+        assert_eq!(timing.decode_steps, None);
+        assert_eq!(timing.prefill_steps, None);
+        assert_eq!(timing.first_output_ms_since_start, None);
     }
 
     #[test]
