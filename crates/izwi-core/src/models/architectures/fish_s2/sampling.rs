@@ -10,8 +10,8 @@ use rand::{RngExt, SeedableRng};
 
 use crate::error::{Error, Result};
 use crate::models::shared::sampling::{
-    bounded_device_sampling_candidates, device_top_k, device_top_k_rows, gumbel_noise,
-    DeviceSamplingCandidates, DEVICE_TOP_K_LIMIT,
+    bounded_device_sampling_candidates, device_top_k, device_top_k_rows,
+    device_top_k_rows_with_ids, gumbel_noise, DeviceSamplingCandidates, DEVICE_TOP_K_LIMIT,
 };
 use crate::models::shared::telemetry;
 
@@ -261,6 +261,81 @@ pub(crate) fn sample_resident_rows(
     draws: &FishS2ResidentRowDraws,
     token: usize,
 ) -> Result<(Tensor, Tensor)> {
+    let noise = match &draws.noise {
+        Some(noise) => Some(noise.i((.., token))?),
+        None => None,
+    };
+    let policy = FishS2FastPolicy {
+        temperature: draws.temperature,
+        top_p: draws.top_p,
+        top_k: draws.top_k,
+    };
+    resident_rows_codes(logits, policy, &draws.upper, noise.as_ref(), None)
+}
+
+/// One fast-AR sampling policy the device serves (top-k within the device
+/// sort bound), shared by every row it draws: a graph key.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FishS2FastPolicy {
+    pub(crate) temperature: f32,
+    pub(crate) top_p: f32,
+    pub(crate) top_k: usize,
+}
+
+impl PartialEq for FishS2FastPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        self.temperature.to_bits() == other.temperature.to_bits()
+            && self.top_p.to_bits() == other.top_p.to_bits()
+            && self.top_k == other.top_k
+    }
+}
+
+impl FishS2FastPolicy {
+    /// Whether a frame draws noise (a positive temperature) or is greedy.
+    pub(crate) fn samples(self) -> bool {
+        self.temperature > 0.0
+    }
+}
+
+impl FishS2Sampler {
+    /// This sampler's fast policy, or `None` when only the host path serves
+    /// it (top-k 0 or above the device sort bound), as
+    /// [`Self::resident_draws`] decides.
+    pub(crate) fn fast_policy(&self) -> Result<Option<FishS2FastPolicy>> {
+        validate_policy(self.temperature, self.top_p)?;
+        if self.top_k == 0 || self.top_k > DEVICE_TOP_K_LIMIT {
+            return Ok(None);
+        }
+        Ok(Some(FishS2FastPolicy {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+        }))
+    }
+
+    /// One frame's Gumbel noise for `out.len() / top_k` tokens, drawn from
+    /// this sampler's stream exactly as [`Self::resident_draws`] draws it
+    /// (nothing when greedy).
+    pub(crate) fn draw_fast_noise(&mut self, out: &mut [f32]) {
+        if self.temperature > 0.0 {
+            let rng = &mut self.rng;
+            let mut draw = || rng.random::<f32>();
+            out.copy_from_slice(&gumbel_noise(out.len(), &mut draw));
+        }
+    }
+}
+
+/// [`sample_resident_rows`] for one depth from its parts: `noise` is that
+/// depth's `[rows, top_k]` Gumbel noise (`None` when greedy) and
+/// `column_ids`, when given, the logits' column ids `0..vocab` (U32), so
+/// nothing is read from a per-thread cache and a CUDA graph can capture it.
+pub(crate) fn resident_rows_codes(
+    logits: &Tensor,
+    policy: FishS2FastPolicy,
+    upper: &Tensor,
+    noise: Option<&Tensor>,
+    column_ids: Option<&Tensor>,
+) -> Result<(Tensor, Tensor)> {
     let (rows, vocab) = logits.dims2()?;
     if vocab == 0 {
         return Err(Error::InferenceError(
@@ -274,7 +349,11 @@ pub(crate) fn sample_resident_rows(
         .to_dtype(DType::U32)?
         .sum_keepdim(1)?
         .reshape(rows)?;
-    let (values, indices) = device_top_k_rows(&logits, draws.top_k)?.ok_or_else(|| {
+    let top_k = match column_ids {
+        Some(ids) => device_top_k_rows_with_ids(&logits, policy.top_k, ids)?,
+        None => device_top_k_rows(&logits, policy.top_k)?,
+    };
+    let (values, indices) = top_k.ok_or_else(|| {
         Error::InferenceError("Fish S2 batched fast sampler lost its policy".into())
     })?;
     let k = values.dim(1)?;
@@ -288,20 +367,20 @@ pub(crate) fn sample_resident_rows(
     let raw = values.broadcast_sub(&log_sum_exp)?.exp()?;
     let cumulative = raw
         .unsqueeze(1)?
-        .broadcast_matmul(&draws.upper.narrow(0, 0, k)?.narrow(1, 0, k)?)?
+        .broadcast_matmul(&upper.narrow(0, 0, k)?.narrow(1, 0, k)?)?
         .squeeze(1)?;
     let keep = cumulative
-        .le(draws.top_p as f64)?
+        .le(policy.top_p as f64)?
         .maximum(&(&cumulative - &raw)?.le(0.0)?)?
         .to_dtype(DType::F32)?;
-    let tempered = (values.broadcast_sub(&max)? / f64::from(draws.temperature.max(1e-5)))?;
+    let tempered = (values.broadcast_sub(&max)? / f64::from(policy.temperature.max(1e-5)))?;
     let masked = (tempered + keep.affine(1e30, -1e30)?)?;
     let indices = indices.to_dtype(DType::U32)?.contiguous()?;
-    let codes = match &draws.noise {
+    let codes = match noise {
         None => indices.narrow(1, 0, 1)?.reshape(rows)?,
         Some(noise) => {
             let pick = masked
-                .broadcast_add(&noise.i((.., token))?.narrow(1, 0, k)?)?
+                .broadcast_add(&noise.narrow(1, 0, k)?)?
                 .argmax_keepdim(1)?
                 .to_dtype(DType::U32)?;
             indices.gather(&pick, 1)?.reshape(rows)?

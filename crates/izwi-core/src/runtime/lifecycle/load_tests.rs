@@ -1550,7 +1550,7 @@ fn fish_s2_cuda_weight_lease_leaves_room_for_separately_charged_state() {
         metal_device_load_peak_bytes: 10_712_372_164,
         cuda_host_load_peak_bytes: 9_944_351_744,
     };
-    let plan = fish_s2_resource_plan(BackendKind::Cuda, memory).unwrap();
+    let plan = fish_s2_resource_plan(BackendKind::Cuda, memory, 0).unwrap();
     assert_eq!(
         plan.resident_authorization,
         ResourceVector {
@@ -1599,6 +1599,43 @@ fn fish_s2_cuda_weight_lease_leaves_room_for_separately_charged_state() {
     drop(state);
 }
 
+/// The fast AR's CUDA graphs are device memory in the load and resident
+/// authorizations, and stay pending until they allocate; with no graphs the
+/// plan is unchanged.
+#[test]
+fn fish_s2_cuda_plan_prices_the_fast_graphs_as_pending_device_memory() {
+    let memory = FishS2ModelMemory {
+        resident_bytes: 10_000,
+        load_peak_bytes: 12_000,
+        metal_device_load_peak_bytes: 10_000,
+        cuda_host_load_peak_bytes: 9_000,
+    };
+    let graphs = 128 * 1024 * 1024;
+    let without = fish_s2_resource_plan(BackendKind::Cuda, memory, 0).unwrap();
+    let with = fish_s2_resource_plan(BackendKind::Cuda, memory, graphs).unwrap();
+    let device = |vector: &ResourceVector| match vector.device_bytes {
+        ResourceAmount::Known(bytes) => bytes,
+        other => panic!("device bytes {other:?}"),
+    };
+    assert_eq!(
+        device(&with.load_authorization),
+        device(&without.load_authorization) + graphs
+    );
+    assert_eq!(
+        device(&with.resident_authorization),
+        device(&without.resident_authorization) + graphs
+    );
+    assert_eq!(device(&with.deferred_resident_authorization), graphs);
+    assert_eq!(
+        with.deferred_resident_authorization.host_bytes,
+        without.deferred_resident_authorization.host_bytes
+    );
+    assert_eq!(
+        crate::models::architectures::fish_s2::fish_s2_fast_graph_device_bytes(BackendKind::Cpu),
+        0
+    );
+}
+
 #[test]
 fn fish_s2_lazy_reference_cache_keeps_headroom_reserved_after_weight_load() {
     let cache = crate::models::architectures::fish_s2::FISH_S2_REFERENCE_CACHE_BYTES;
@@ -1614,6 +1651,7 @@ fn fish_s2_lazy_reference_cache_keeps_headroom_reserved_after_weight_load() {
             metal_device_load_peak_bytes: 100,
             cuda_host_load_peak_bytes: 0,
         },
+        0,
     )
     .unwrap();
     assert_eq!(plan.deferred_resident_authorization, host(cache));
@@ -1663,7 +1701,7 @@ fn fish_s2_portable_weight_plan_charges_the_expanded_representation() {
         metal_device_load_peak_bytes: 19_836_076_996,
         cuda_host_load_peak_bytes: 9_944_351_744,
     };
-    let cpu = fish_s2_resource_plan(BackendKind::Cpu, cpu_memory).unwrap();
+    let cpu = fish_s2_resource_plan(BackendKind::Cpu, cpu_memory, 0).unwrap();
     assert_eq!(
         cpu.resident_authorization.host_bytes,
         ResourceAmount::Known(
@@ -1690,7 +1728,7 @@ fn fish_s2_portable_weight_plan_charges_the_expanded_representation() {
     };
     // On Metal the unified authorization books what the GPU allocates; the
     // host staging (1.6 GB) is checked against host memory instead.
-    let metal = fish_s2_resource_plan(BackendKind::Metal, half_memory).unwrap();
+    let metal = fish_s2_resource_plan(BackendKind::Metal, half_memory, 0).unwrap();
     assert_eq!(
         metal.load_authorization.unified_bytes,
         ResourceAmount::Known(half_memory.metal_device_load_peak_bytes)

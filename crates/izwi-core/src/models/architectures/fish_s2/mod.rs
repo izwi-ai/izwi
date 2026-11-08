@@ -43,6 +43,7 @@ pub use contracts::{
     semantic_token_id, FishS2DacContract, FishS2PromptTensorShape,
 };
 pub use dac::{FishS2DacConfig, FishS2DacDecoder};
+pub(crate) use fast::fish_s2_fast_graph_device_bytes;
 pub use fast::{FishS2FastConfig, FishS2FastDecoder, FishS2GeneratedFrame, FishS2Sampler};
 #[cfg(test)]
 pub(crate) use physical::fish_s2_physical_state_spec;
@@ -136,6 +137,10 @@ pub struct FishS2TtsDiagnostics {
     /// The slow/fast transformers' load precision and self-check (FSH-11);
     /// `None` without the native runtime.
     pub precision: Option<serde_json::Value>,
+    /// The fast AR's CUDA frame graphs: why they are off, or their captures,
+    /// replays, fallbacks and graphed and eager frames; `None` without the
+    /// native runtime.
+    pub fast_graphs: Option<serde_json::Value>,
 }
 
 /// Model-authored terminal reason. Exhausting a budget is incomplete speech.
@@ -286,6 +291,10 @@ impl FishS2TtsModel {
                 .runtime
                 .as_ref()
                 .map(|runtime| runtime.precision.diagnostics()),
+            fast_graphs: self
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.fast.graphs_diagnostics()),
         }
     }
 
@@ -450,7 +459,7 @@ impl FishS2NativeRuntime {
         // On Metal a dtype below F32 must keep the trunk's activations finite
         // and in range (FSH-11: norm gains reach 48), or the slow and fast
         // transformers reload in F32.
-        let ((slow, fast, device), precision) = load_with_precision_fallback(
+        let ((slow, mut fast, device), precision) = load_with_precision_fallback(
             "Fish S2",
             &selection,
             device.kind.is_metal(),
@@ -475,6 +484,8 @@ impl FishS2NativeRuntime {
             precision.loaded,
             precision.reason
         );
+        // A fast frame's input is the slow transformer's hidden state.
+        fast.resolve_graphs(precision.loaded);
         let codec_weights = codec.load_weights(&device, DType::F32)?;
         let dac = FishS2DacDecoder::load(FishS2DacConfig::current(), codec_weights.var_builder())?;
         let semantic_allowed_mask = slow.semantic_allowed_mask(eos)?;

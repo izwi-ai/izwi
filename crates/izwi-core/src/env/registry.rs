@@ -539,6 +539,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the Fish Audio S2 Pro weight dtype (e.g. f32, f16, bf16); also used by the load memory estimate.",
     ),
     CoreEnvVar::new(
+        "IZWI_FISH_S2_FAST_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Fish S2 runs each frame's fast AR (the slow hidden state and nine codebook depths, with each row's KV dense inside the frame, and each depth's codes drawn on the device from noise drawn before the frame) as a CUDA graph at 32 rows, spare rows zero, one graph per input dtype and sampling policy; rows are grouped by policy in chunks of 32. A load-time self-check captures greedy and default-sampling graphs over xorshift inputs and compares replays with the eager frame bit for bit; a mismatch or CUDA error keeps every frame on the eager paged path. Loads price 128 MiB for the graphs. Any false value turns them off; `fast_graphs` in the model diagnostics reports why they are off, captures, replays, fallbacks and graphed and eager frames.",
+    ),
+    CoreEnvVar::new(
         "IZWI_FISH_S2_MODEL_DIR",
         Path,
         "unset (test fails)",

@@ -2399,6 +2399,19 @@ pub(crate) fn device_top_k_rows(values: &Tensor, k: usize) -> Result<Option<(Ten
     bounded_topk_rows(values, k).map(Some)
 }
 
+/// [`device_top_k_rows`] with the column ids `0..length` (U32) passed in, not
+/// read from the per-thread cache, so a CUDA graph can take them as an input.
+pub(crate) fn device_top_k_rows_with_ids(
+    values: &Tensor,
+    k: usize,
+    column_ids: &Tensor,
+) -> Result<Option<(Tensor, Tensor)>> {
+    if k == 0 || k > DEVICE_TOP_K_LIMIT {
+        return Ok(None);
+    }
+    bounded_topk_rows_from(values, k, Some(column_ids)).map(Some)
+}
+
 fn bounded_topk(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
     let length = values.dim(0)?;
     if length == 0 || length > u32::MAX as usize || k == 0 || k > DEVICE_TOP_K_LIMIT {
