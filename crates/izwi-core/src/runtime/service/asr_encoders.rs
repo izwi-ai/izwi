@@ -18,11 +18,6 @@ pub(super) struct QwenAsrEncoderPending {
     pub(super) response: Option<oneshot::Sender<QwenAsrEncoderOutcome>>,
 }
 
-#[derive(Default)]
-pub(super) struct QwenAsrEncoderBatcherState {
-    pub(super) pending: HashMap<QwenAsrEncoderQueueKey, VecDeque<QwenAsrEncoderPending>>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct QwenAsrEncoderQueueKey {
     pub(super) binding: AdapterBindingKey,
@@ -31,7 +26,7 @@ pub(super) struct QwenAsrEncoderQueueKey {
 
 pub(super) struct QwenAsrEncoderBatcher {
     pub(super) coordinator: Arc<InferenceCoordinator>,
-    pub(super) state: Mutex<QwenAsrEncoderBatcherState>,
+    pub(super) formation: EncoderBatchFormation<QwenAsrEncoderQueueKey, QwenAsrEncoderPending>,
 }
 
 pub(super) type WhisperEncoderOutcome = PreparationRowOutcome<WhisperPreparedWindow>;
@@ -48,11 +43,6 @@ pub(super) struct WhisperEncoderPending {
     pub(super) response: Option<oneshot::Sender<WhisperEncoderOutcome>>,
 }
 
-#[derive(Default)]
-pub(super) struct WhisperEncoderBatcherState {
-    pub(super) pending: HashMap<WhisperEncoderQueueKey, VecDeque<WhisperEncoderPending>>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct WhisperEncoderQueueKey {
     pub(super) binding: AdapterBindingKey,
@@ -61,7 +51,7 @@ pub(super) struct WhisperEncoderQueueKey {
 
 pub(super) struct WhisperEncoderBatcher {
     pub(super) coordinator: Arc<InferenceCoordinator>,
-    pub(super) state: Mutex<WhisperEncoderBatcherState>,
+    pub(super) formation: EncoderBatchFormation<WhisperEncoderQueueKey, WhisperEncoderPending>,
 }
 
 pub(super) type VibeVoiceEncoderOutcome = PreparationRowOutcome<VibeVoiceAsrPreparedArtifact>;
@@ -138,9 +128,9 @@ pub(super) struct ParakeetEncoderBatcher {
 /// Forms one encoder's cross-request batches with at most one batch in
 /// flight per key. Rows that arrive while their key's batch runs wait, and
 /// form the key's next batch when it completes, so requests that arrive
-/// staggered still batch under load. (The other batchers here drain a queue
-/// one yield after its first row arrives, so behind a busy device each row
-/// runs as a batch of one.)
+/// staggered still batch under load. Every batched encoder here forms its
+/// batches this way; a queue drained one yield after its first row (the
+/// older shape) runs each row as a batch of one behind a busy device.
 pub(super) struct EncoderBatchFormation<K, P> {
     /// A key's queue exists exactly while a runner drains it.
     queues: std::sync::Mutex<HashMap<K, VecDeque<P>>>,
@@ -242,11 +232,6 @@ pub(super) struct GraniteSpeechEncoderPending {
     pub(super) response: Option<oneshot::Sender<GraniteSpeechEncoderOutcome>>,
 }
 
-#[derive(Default)]
-pub(super) struct GraniteSpeechEncoderBatcherState {
-    pub(super) pending: HashMap<GraniteSpeechEncoderQueueKey, VecDeque<GraniteSpeechEncoderPending>>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct GraniteSpeechEncoderQueueKey {
     pub(super) binding: AdapterBindingKey,
@@ -257,7 +242,8 @@ pub(super) struct GraniteSpeechEncoderQueueKey {
 
 pub(super) struct GraniteSpeechEncoderBatcher {
     pub(super) coordinator: Arc<InferenceCoordinator>,
-    pub(super) state: Mutex<GraniteSpeechEncoderBatcherState>,
+    pub(super) formation:
+        EncoderBatchFormation<GraniteSpeechEncoderQueueKey, GraniteSpeechEncoderPending>,
 }
 
 pub(super) fn granite_speech_deadline_budget_bucket(deadline: Option<Instant>, now: Instant) -> Option<u64> {
@@ -967,7 +953,7 @@ impl WhisperEncoderBatcher {
     pub(super) fn new(coordinator: Arc<InferenceCoordinator>) -> Self {
         Self {
             coordinator,
-            state: Mutex::new(WhisperEncoderBatcherState::default()),
+            formation: EncoderBatchFormation::new(),
         }
     }
 
@@ -994,77 +980,29 @@ impl WhisperEncoderBatcher {
                 .ok_or_else(|| Error::Overloaded("Whisper mel-frame bucket overflow".into()))?,
         };
         let max_width = stage.max_batch_size.max(1);
-        let formation_delay = stage.max_formation_delay;
-        let deadline = pending.job.spec.deadline;
         let cancellation = pending.cancellation.clone();
         let (sender, receiver) = oneshot::channel();
         pending.response = Some(sender);
-        let mut immediate = None;
-        let first;
-        {
-            let mut state = self.state.lock().await;
-            let queue = state.pending.entry(key.clone()).or_default();
-            first = queue.is_empty();
-            queue.push_back(pending);
-            let pressure = deadline.is_some_and(|deadline| {
-                deadline
-                    <= Instant::now()
-                        .checked_add(formation_delay)
-                        .unwrap_or(deadline)
-            });
-            if queue.len() >= max_width || pressure {
-                immediate = Some(queue.drain(..queue.len().min(max_width)).collect());
-                if queue.is_empty() {
-                    state.pending.remove(&key);
-                }
-            }
-        }
-        if let Some(batch) = immediate {
-            self.spawn(batch);
-        } else if first {
+        // A row waits for its bucket's running batch and joins the next one,
+        // so requests that arrive while the device is busy still batch.
+        if self.formation.push(key.clone(), pending) {
             let batcher = self.clone();
             tokio::spawn(async move {
-                yield_now().await;
-                if !formation_delay.is_zero() {
-                    tokio::time::sleep(formation_delay).await;
-                }
-                let batch = {
-                    let mut state = batcher.state.lock().await;
-                    let Some(queue) = state.pending.get_mut(&key) else {
-                        return;
-                    };
-                    let batch = queue
-                        .drain(..queue.len().min(max_width))
-                        .collect::<Vec<_>>();
-                    if queue.is_empty() {
-                        state.pending.remove(&key);
-                    }
-                    batch
-                };
-                batcher.spawn(batch);
+                batcher
+                    .formation
+                    .run(&key, max_width, |batch| batcher.run_batch(batch))
+                    .await;
             });
         }
-        struct CancelOnDrop(PreparationCancellation, bool);
-        impl Drop for CancelOnDrop {
-            fn drop(&mut self) {
-                if self.1 {
-                    self.0.cancel();
-                }
-            }
-        }
-        let mut guard = CancelOnDrop(cancellation, true);
+        let mut guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
         let outcome = receiver.await.map_err(|_| {
             Error::InferenceError("Whisper encoder batch worker stopped before reply".into())
         })?;
-        guard.1 = false;
+        guard.armed = false;
         Ok(outcome)
-    }
-
-    pub(super) fn spawn(self: &Arc<Self>, batch: Vec<WhisperEncoderPending>) {
-        let this = self.clone();
-        tokio::spawn(async move {
-            this.run_batch(batch).await;
-        });
     }
 
     pub(super) async fn run_batch(&self, mut rows: Vec<WhisperEncoderPending>) {
@@ -1188,7 +1126,7 @@ impl GraniteSpeechEncoderBatcher {
     pub(super) fn new(coordinator: Arc<InferenceCoordinator>) -> Self {
         Self {
             coordinator,
-            state: Mutex::new(GraniteSpeechEncoderBatcherState::default()),
+            formation: EncoderBatchFormation::new(),
         }
     }
 
@@ -1227,58 +1165,18 @@ impl GraniteSpeechEncoderBatcher {
             deadline_budget_bucket: granite_speech_deadline_budget_bucket(deadline, now),
         };
         let max_width = stage.max_batch_size.max(1);
-        let formation_delay = stage.max_formation_delay;
         let cancellation = pending.cancellation.clone();
         let (sender, receiver) = oneshot::channel();
         pending.response = Some(sender);
-
-        let mut immediate = None;
-        let first;
-        {
-            let mut state = self.state.lock().await;
-            let queue = state.pending.entry(key.clone()).or_default();
-            first = queue.is_empty();
-            queue.push_back(pending);
-            let deadline_pressure = deadline.is_some_and(|deadline| {
-                deadline
-                    <= Instant::now()
-                        .checked_add(formation_delay)
-                        .unwrap_or(deadline)
-            });
-            if queue.len() >= max_width || deadline_pressure {
-                immediate = Some(Self::drain(queue, max_width));
-                if queue.is_empty() {
-                    state.pending.remove(&key);
-                }
-            }
-        }
-        if let Some(batch) = immediate {
-            self.spawn_batch(batch);
-        } else if first {
+        // A row waits for its bucket's running batch and joins the next one,
+        // so requests that arrive while the device is busy still batch.
+        if self.formation.push(key.clone(), pending) {
             let batcher = self.clone();
             tokio::spawn(async move {
-                yield_now().await;
-                if !formation_delay.is_zero() {
-                    let should_wait = {
-                        let state = batcher.state.lock().await;
-                        state.pending.get(&key).is_some_and(|queue| {
-                            !queue.iter().any(|row| {
-                                row.job.spec.deadline.is_some_and(|deadline| {
-                                    deadline
-                                        <= Instant::now()
-                                            .checked_add(formation_delay)
-                                            .unwrap_or(deadline)
-                                })
-                            })
-                        })
-                    };
-                    if should_wait {
-                        tokio::time::sleep(formation_delay).await;
-                    }
-                }
-                if let Some(batch) = batcher.take_batch(&key, max_width).await {
-                    batcher.spawn_batch(batch);
-                }
+                batcher
+                    .formation
+                    .run(&key, max_width, |batch| batcher.run_batch(batch))
+                    .await;
             });
         }
 
@@ -1291,34 +1189,6 @@ impl GraniteSpeechEncoderBatcher {
         })?;
         guard.armed = false;
         Ok(outcome)
-    }
-
-    pub(super) fn drain(
-        queue: &mut VecDeque<GraniteSpeechEncoderPending>,
-        max_width: usize,
-    ) -> Vec<GraniteSpeechEncoderPending> {
-        queue.drain(..queue.len().min(max_width)).collect()
-    }
-
-    pub(super) async fn take_batch(
-        &self,
-        key: &GraniteSpeechEncoderQueueKey,
-        max_width: usize,
-    ) -> Option<Vec<GraniteSpeechEncoderPending>> {
-        let mut state = self.state.lock().await;
-        let queue = state.pending.get_mut(key)?;
-        let batch = Self::drain(queue, max_width);
-        if queue.is_empty() {
-            state.pending.remove(key);
-        }
-        (!batch.is_empty()).then_some(batch)
-    }
-
-    pub(super) fn spawn_batch(self: &Arc<Self>, batch: Vec<GraniteSpeechEncoderPending>) {
-        let batcher = self.clone();
-        tokio::spawn(async move {
-            batcher.run_batch(batch).await;
-        });
     }
 
     pub(super) async fn run_batch(&self, mut batch: Vec<GraniteSpeechEncoderPending>) {
@@ -1495,7 +1365,7 @@ impl QwenAsrEncoderBatcher {
     pub(super) fn new(coordinator: Arc<InferenceCoordinator>) -> Self {
         Self {
             coordinator,
-            state: Mutex::new(QwenAsrEncoderBatcherState::default()),
+            formation: EncoderBatchFormation::new(),
         }
     }
 
@@ -1527,64 +1397,19 @@ impl QwenAsrEncoderBatcher {
                 })?,
         };
         let max_width = stage.max_batch_size.max(1);
-        let formation_delay = stage.max_formation_delay;
-        let deadline = pending.job.spec.deadline;
         let cancellation = pending.cancellation.clone();
         let (response, receiver) = oneshot::channel();
         let mut pending = pending;
         pending.response = Some(response);
-
-        let mut immediate = None;
-        let first;
-        {
-            let mut state = self.state.lock().await;
-            let queue = state.pending.entry(key.clone()).or_default();
-            first = queue.is_empty();
-            queue.push_back(pending);
-            let deadline_pressure = deadline.is_some_and(|deadline| {
-                deadline
-                    <= Instant::now()
-                        .checked_add(formation_delay)
-                        .unwrap_or(deadline)
-            });
-            if queue.len() >= max_width || deadline_pressure {
-                immediate = Some(Self::drain(queue, max_width));
-                if queue.is_empty() {
-                    state.pending.remove(&key);
-                }
-            }
-        }
-
-        if let Some(batch) = immediate {
-            self.spawn_batch(batch);
-        } else if first {
+        // A row waits for its bucket's running batch and joins the next one,
+        // so requests that arrive while the device is busy still batch.
+        if self.formation.push(key.clone(), pending) {
             let batcher = self.clone();
             tokio::spawn(async move {
-                // A zero-delay stage still yields once so requests already
-                // runnable in this executor turn can join without imposing a
-                // timer-derived latency floor.
-                yield_now().await;
-                if !formation_delay.is_zero() {
-                    let should_wait = {
-                        let state = batcher.state.lock().await;
-                        state.pending.get(&key).is_some_and(|queue| {
-                            !queue.iter().any(|row| {
-                                row.job.spec.deadline.is_some_and(|deadline| {
-                                    deadline
-                                        <= Instant::now()
-                                            .checked_add(formation_delay)
-                                            .unwrap_or(deadline)
-                                })
-                            })
-                        })
-                    };
-                    if should_wait {
-                        tokio::time::sleep(formation_delay).await;
-                    }
-                }
-                if let Some(batch) = batcher.take_batch(&key, max_width).await {
-                    batcher.spawn_batch(batch);
-                }
+                batcher
+                    .formation
+                    .run(&key, max_width, |batch| batcher.run_batch(batch))
+                    .await;
             });
         }
 
@@ -1597,35 +1422,6 @@ impl QwenAsrEncoderBatcher {
         })?;
         guard.armed = false;
         Ok(outcome)
-    }
-
-    pub(super) fn drain(
-        queue: &mut VecDeque<QwenAsrEncoderPending>,
-        max_width: usize,
-    ) -> Vec<QwenAsrEncoderPending> {
-        let width = queue.len().min(max_width);
-        queue.drain(..width).collect()
-    }
-
-    pub(super) async fn take_batch(
-        &self,
-        key: &QwenAsrEncoderQueueKey,
-        max_width: usize,
-    ) -> Option<Vec<QwenAsrEncoderPending>> {
-        let mut state = self.state.lock().await;
-        let queue = state.pending.get_mut(key)?;
-        let batch = Self::drain(queue, max_width);
-        if queue.is_empty() {
-            state.pending.remove(key);
-        }
-        (!batch.is_empty()).then_some(batch)
-    }
-
-    pub(super) fn spawn_batch(self: &Arc<Self>, batch: Vec<QwenAsrEncoderPending>) {
-        let batcher = self.clone();
-        tokio::spawn(async move {
-            batcher.run_batch(batch).await;
-        });
     }
 
     pub(super) async fn run_batch(&self, mut batch: Vec<QwenAsrEncoderPending>) {
