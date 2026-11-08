@@ -39,8 +39,8 @@ pub(super) struct WhisperEncoderPending {
     pub(super) model: AsrModelLease,
     /// The model's catalog name, for the ASR metrics.
     pub(super) model_label: &'static str,
-    pub(super) samples: Arc<[f32]>,
-    pub(super) sample_rate: u32,
+    /// The host log-mel, dropped once the encode has read it.
+    pub(super) features: WhisperHostFeatures,
     pub(super) geometry: WhisperWindowPreparationGeometry,
     pub(super) retained_host_bytes: u64,
     pub(super) cancellation: PreparationCancellation,
@@ -1084,6 +1084,20 @@ impl WhisperEncoderBatcher {
         let work = WorkUnit::PreSequencePreparation {
             kind: "asr.encoder.whisper".into(),
         };
+        // The host stage recorded the request bytes plus its features, which
+        // the encode consumes; each row's commit records only the request
+        // bytes and its encoder output. Restore the features' claim to
+        // pending first: usage may only rise through an observation, and the
+        // reservation still covers the features until the batch ends.
+        for row in &rows {
+            if let Err(error) = row
+                .job
+                .prepare_materialized_release(JobResourceObservation::host(row.retained_host_bytes))
+            {
+                Self::fail(rows, error);
+                return;
+            }
+        }
         for (index, row) in rows.iter().enumerate() {
             let cost = match model.whisper_window_preparation_row_cost_for_batch(
                 index,
@@ -1111,38 +1125,27 @@ impl WhisperEncoderBatcher {
                 }
             }
         }
-        let inputs = rows
-            .iter()
-            .map(|row| {
-                (
-                    row.samples.clone(),
-                    row.sample_rate,
-                    row.retained_host_bytes,
-                )
-            })
-            .collect::<Vec<_>>();
-        let senders = rows
-            .drain(..)
-            .map(|mut row| {
+        let mut senders = Vec::with_capacity(rows.len());
+        let mut inputs = Vec::with_capacity(rows.len());
+        for mut row in rows.drain(..) {
+            senders.push(
                 row.response
                     .take()
-                    .expect("queued Whisper row has response channel")
-            })
-            .collect::<Vec<_>>();
+                    .expect("queued Whisper row has response channel"),
+            );
+            inputs.push((row.features, row.retained_host_bytes));
+        }
         let physical = model.clone();
         let result = self
             .coordinator
             .run_loaded_native_preparation_batch(sealed, contract, work, move |live| {
                 let selected = live
                     .iter()
-                    .map(|index| WhisperAudioBatchRow {
-                        audio: inputs[*index].0.as_ref(),
-                        sample_rate: inputs[*index].1,
-                    })
+                    .map(|index| &inputs[*index].0)
                     .collect::<Vec<_>>();
                 crate::engine::metrics::record_asr_preparation_batch_rows(model_label, live.len());
                 let encode_started = Instant::now();
-                let prepared = physical.prepare_whisper_window_batch(&selected)?;
+                let prepared = physical.prepare_whisper_window_batch_from_features(&selected)?;
                 crate::engine::metrics::record_asr_device_phase(
                     model_label,
                     crate::engine::metrics::AsrPhase::Encoder,
@@ -1154,7 +1157,7 @@ impl WhisperEncoderBatcher {
                     .map(|(artifact, index)| {
                         Ok(PreparationArtifact {
                             retained: JobResourceObservation {
-                                host_bytes: inputs[*index].2,
+                                host_bytes: inputs[*index].1,
                                 accelerator_bytes: artifact.resident_tensor_bytes()?,
                             },
                             value: artifact,

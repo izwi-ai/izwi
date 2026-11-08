@@ -391,7 +391,7 @@ impl RuntimeService {
                 Error::ModelLoadError(format!("Whisper model {variant} has no effective context"))
             })?;
         let model_for_shape = model.clone();
-        let (prepared, geometry) = self
+        let (prepared, geometry, features) = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
@@ -414,16 +414,36 @@ impl RuntimeService {
                         model_for_shape.whisper_window_preparation_geometry(&samples, sample_rate)
                     })
                     .transpose()?;
+                // The resample and log-mel run here, on a host worker, so the
+                // device job runs only the upload and the encoder.
+                let features = (!long_form)
+                    .then(|| {
+                        let started = Instant::now();
+                        let features =
+                            model_for_shape.prepare_whisper_host_features(&samples, sample_rate);
+                        record_host_features(variant, started);
+                        features
+                    })
+                    .transpose()?;
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
                 if long_form {
                     request.install_prepared_asr_long_form_atomic(plan)?;
                 }
-                Ok((request, geometry))
+                Ok((request, geometry, features))
             })
             .await?;
         let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
             .map_err(|_| Error::Overloaded("Whisper retained input exceeds u64".into()))?;
-        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        // The features are held beside the request until the encode drops
+        // them.
+        let prepared_host_bytes = features
+            .as_ref()
+            .map(WhisperHostFeatures::host_bytes)
+            .transpose()?
+            .unwrap_or(0)
+            .checked_add(retained_host_bytes)
+            .ok_or_else(|| Error::Overloaded("Whisper prepared host bytes overflow".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
         if prepared.uses_asr_long_form_atomic() {
             let (spec, observation) = match self.coordinator_job_for_request(&prepared) {
@@ -458,7 +478,7 @@ impl RuntimeService {
         };
         let resources = match asr_encoder_retained_resources(
             self.backend_router.context().backend_kind,
-            retained_host_bytes,
+            prepared_host_bytes,
             geometry.retained_artifact_bytes,
         ) {
             Ok(resources) => resources,
@@ -481,7 +501,7 @@ impl RuntimeService {
             .admit_observed_from_preparation(
                 bridge,
                 prep_spec,
-                JobResourceObservation::host(retained_host_bytes),
+                JobResourceObservation::host(prepared_host_bytes),
             )
             .await
         {
@@ -493,9 +513,9 @@ impl RuntimeService {
                 return Err(error);
             }
         };
-        let (samples, sample_rate) = prepared
-            .prepared_asr_audio_for_executor()?
-            .ok_or_else(|| Error::InferenceError("Whisper decoded audio was lost".into()))?;
+        let features = features.ok_or_else(|| {
+            Error::InferenceError("Whisper normal route lost its host features".into())
+        })?;
         let outcome = self
             .whisper_encoder_batcher
             .submit(WhisperEncoderPending {
@@ -503,8 +523,7 @@ impl RuntimeService {
                 contract: encoder_contract,
                 model: model.clone(),
                 model_label: variant.dir_name(),
-                samples,
-                sample_rate,
+                features,
                 geometry,
                 retained_host_bytes,
                 cancellation: PreparationCancellation::default(),

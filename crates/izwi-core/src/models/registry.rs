@@ -140,6 +140,7 @@ use crate::models::architectures::voxtral::realtime::{
 use crate::models::architectures::voxtral::tts::VoxtralTtsModel;
 use crate::models::architectures::whisper::asr::{
     AsrTranscriptionOutput as WhisperAsrTranscriptionOutput, WhisperAudioBatchRow,
+    WhisperHostFeatures,
     WhisperAudioPreparationStageSeal, WhisperDecodeCheckpoint, WhisperDecodeState,
     WhisperPreparedWindow, WhisperTerminalTransition, WhisperTurboAsrModel,
     WhisperWindowPreparationBatchGeometry, WhisperWindowPreparationGeometry,
@@ -1610,6 +1611,34 @@ impl NativeAsrModel {
             Self::WhisperTurbo(model) => model.window_preparation_stage_seal(backend, width),
             _ => Err(Error::InvalidInput(
                 "Whisper preparation seal was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    /// Trims, resamples and turns one Whisper request's audio into its
+    /// window's log-mel on the host.
+    pub(crate) fn prepare_whisper_host_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<WhisperHostFeatures> {
+        match self {
+            Self::WhisperTurbo(model) => model.prepare_host_features(audio, sample_rate),
+            _ => Err(Error::InvalidInput(
+                "Whisper features were requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    /// Encodes Whisper windows whose log-mel a host worker computed.
+    pub(crate) fn prepare_whisper_window_batch_from_features(
+        &self,
+        rows: &[&WhisperHostFeatures],
+    ) -> Result<Vec<WhisperPreparedWindow>> {
+        match self {
+            Self::WhisperTurbo(model) => model.prepare_window_batch_from_features(rows),
+            _ => Err(Error::InvalidInput(
+                "Whisper window preparation was supplied to another ASR model".into(),
             )),
         }
     }

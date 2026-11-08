@@ -105,7 +105,7 @@ use crate::models::architectures::vibevoice::tts::{
 };
 use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
 use crate::models::architectures::whisper::asr::{
-    WhisperAudioBatchRow, WhisperPreparedWindow, WhisperWindowPreparationGeometry,
+    WhisperHostFeatures, WhisperPreparedWindow, WhisperWindowPreparationGeometry,
 };
 use crate::models::registry::AsrModelLease;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
