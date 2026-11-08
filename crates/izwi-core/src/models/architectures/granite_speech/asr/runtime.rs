@@ -1026,8 +1026,13 @@ impl GraniteSpeechRuntime {
             )));
         }
         let span = embeddings.narrow(1, span_start, span_end - span_start)?;
-        self.text_model
-            .forward_with_embeds_profiled(&span, span_start, cache, None, None)
+        self.text_model.forward_with_embeds_profiled(
+            &span,
+            span_start,
+            cache,
+            self.text_model.rope_table(),
+            None,
+        )
     }
 
     pub(crate) fn decode_token(
@@ -1037,8 +1042,13 @@ impl GraniteSpeechRuntime {
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
         let token = Tensor::from_vec(vec![token], (1, 1), &self.device)?;
-        self.text_model
-            .forward_profiled(&token, position, cache, None, None)
+        self.text_model.forward_profiled(
+            &token,
+            position,
+            cache,
+            self.text_model.rope_table(),
+            None,
+        )
     }
 
     pub(crate) fn decode_tokens_batch(
@@ -1054,8 +1064,13 @@ impl GraniteSpeechRuntime {
         }
         let input = Tensor::from_vec(tokens.to_vec(), (tokens.len(), 1), &self.device)?;
         if tokens.len() == 1 {
-            self.text_model
-                .forward_profiled(&input, positions[0], caches[0], None, None)
+            self.text_model.forward_profiled(
+                &input,
+                positions[0],
+                caches[0],
+                self.text_model.rope_table(),
+                None,
+            )
         } else {
             self.text_model
                 .forward_managed_decode_batch(&input, positions, caches)
@@ -2603,6 +2618,11 @@ struct GraniteLanguageModel {
     device: Device,
     residual_branches_prescaled: bool,
     execution_plan: GraniteTextExecutionPlan,
+    /// RoPE rows for every position of the decoder context, built once at
+    /// load in the dtype a request's precomputed cache takes. The retained
+    /// route slices its prefill spans and scalar steps from it and gathers a
+    /// batched step's rows from it with one index upload.
+    rope_table: Option<GraniteRopeCache>,
 }
 
 impl GraniteLanguageModel {
@@ -2660,7 +2680,7 @@ impl GraniteLanguageModel {
             )?
         };
         let lm_head = GraniteLinearNoBias::new(lm_head)?;
-        Ok(Self {
+        let mut model = Self {
             embed_tokens,
             layers,
             norm,
@@ -2669,7 +2689,10 @@ impl GraniteLanguageModel {
             device: vb.device().clone(),
             residual_branches_prescaled,
             execution_plan,
-        })
+            rope_table: None,
+        };
+        model.rope_table = model.precompute_rope_cache(config.decoder_context())?;
+        Ok(model)
     }
 
     fn num_layers(&self) -> usize {
@@ -2733,6 +2756,20 @@ impl GraniteLanguageModel {
         );
         GraniteRopeCache::build(total_len, &layer.self_attn.rope, &self.device, dtype)
         .map(Some)
+    }
+
+    /// The load-time RoPE table, for the retained route's scalar spans.
+    fn rope_table(&self) -> Option<&GraniteRopeCache> {
+        self.rope_table.as_ref()
+    }
+
+    /// One batched decode step's RoPE rows, one per row's position, gathered
+    /// from the load-time table with a single index upload.
+    fn decode_rope_rows(&self, positions: &[usize]) -> Result<GraniteRopeSlice> {
+        let table = self.rope_table.as_ref().ok_or_else(|| {
+            Error::InferenceError("Granite Speech decoder has no RoPE table".into())
+        })?;
+        table.gather(positions)
     }
 
     fn embeddings(&self, input_ids: &[u32]) -> Result<Tensor> {
@@ -2871,6 +2908,7 @@ impl GraniteLanguageModel {
             .iter()
             .map(|cache| cache.logical_checkpoint())
             .collect::<Vec<_>>();
+        let rope = self.decode_rope_rows(start_positions)?;
         let execution = (|| -> Result<Tensor> {
             let embeds = self.embed_tokens.forward(input_ids)?;
             let mut x = (embeds * self.cfg.embedding_multiplier as f64)?;
@@ -2881,7 +2919,7 @@ impl GraniteLanguageModel {
                     .collect::<Vec<&PhysicalPagedKvCache>>();
                 x = layer.forward_managed_decode_batch(
                     &x,
-                    start_positions,
+                    &rope,
                     &cache_refs,
                     lowered.as_ref(),
                     &metadata,
@@ -3219,7 +3257,7 @@ impl GraniteDecoderLayer {
     fn forward_managed_decode_batch(
         &self,
         x: &Tensor,
-        start_positions: &[usize],
+        rope: &GraniteRopeSlice,
         caches: &[&PhysicalPagedKvCache],
         slots: &dyn KvSlotMap,
         metadata: &KvDecodeBatchMetadata,
@@ -3230,7 +3268,7 @@ impl GraniteDecoderLayer {
         let normed = granite_rms_norm_forward(&self.input_layernorm, x)?;
         let attn = self.self_attn.forward_managed_decode_batch(
             &normed,
-            start_positions,
+            rope,
             caches,
             slots,
             metadata,
@@ -3524,16 +3562,62 @@ impl GraniteTextAttention {
                 GraniteRopeSlice::new(cos, sin)?
             }
         };
-        let (cos, sin, packed) = if rope_slice.cos.dtype() == q.dtype()
-            && rope_slice.sin.dtype() == q.dtype()
-            && rope_slice.packed.dtype() == q.dtype()
+        (q, k) = self.apply_rope(q, k, rope_slice)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.rope += profile_elapsed(rope_start);
+        }
+        let cache_start = profile_start(profiling);
+        let queries = q
+            .reshape((seq_len, self.num_heads, self.head_dim))?
+            .contiguous()?;
+        let keys = k
+            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let values = v
+            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let out = cache.write_and_attend(
+            layer_idx,
+            prepared,
+            &queries,
+            &keys,
+            &values,
+            self.attention_multiplier,
+        )?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.cache += profile_elapsed(cache_start);
+            if seq_len > 1 {
+                profile.prefill_attention_calls += 1;
+            }
+        }
+        record_decode_attention_path(DecodeAttentionPath::Paged);
+        let out = out.reshape((batch, seq_len, self.num_heads * self.head_dim))?;
+        let output_start = profile_start(profiling);
+        let out = self.output_projection(&out, x.dtype())?;
+        if let Some(profile) = profile {
+            profile.output += profile_elapsed(output_start);
+        }
+        Ok(out)
+    }
+
+    /// Rotates `q` and `k` (`[batch, seq, heads, head_dim]`) by `rope`, one
+    /// row per sequence position, on the fused kernel the device takes.
+    fn apply_rope(
+        &self,
+        mut q: Tensor,
+        mut k: Tensor,
+        rope: GraniteRopeSlice,
+    ) -> Result<(Tensor, Tensor)> {
+        let (cos, sin, packed) = if rope.cos.dtype() == q.dtype()
+            && rope.sin.dtype() == q.dtype()
+            && rope.packed.dtype() == q.dtype()
         {
-            (rope_slice.cos, rope_slice.sin, rope_slice.packed)
+            (rope.cos, rope.sin, rope.packed)
         } else {
             (
-                rope_slice.cos.to_dtype(q.dtype())?,
-                rope_slice.sin.to_dtype(q.dtype())?,
-                rope_slice.packed.to_dtype(q.dtype())?,
+                rope.cos.to_dtype(q.dtype())?,
+                rope.sin.to_dtype(q.dtype())?,
+                rope.packed.to_dtype(q.dtype())?,
             )
         };
         let direct_rope =
@@ -3579,47 +3663,16 @@ impl GraniteTextAttention {
             q = apply_rotary_emb(&q, &cos, &sin)?;
             k = apply_rotary_emb(&k, &cos, &sin)?;
         }
-        if let Some(profile) = profile.as_deref_mut() {
-            profile.rope += profile_elapsed(rope_start);
-        }
-        let cache_start = profile_start(profiling);
-        let queries = q
-            .reshape((seq_len, self.num_heads, self.head_dim))?
-            .contiguous()?;
-        let keys = k
-            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
-            .contiguous()?;
-        let values = v
-            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
-            .contiguous()?;
-        let out = cache.write_and_attend(
-            layer_idx,
-            prepared,
-            &queries,
-            &keys,
-            &values,
-            self.attention_multiplier,
-        )?;
-        if let Some(profile) = profile.as_deref_mut() {
-            profile.cache += profile_elapsed(cache_start);
-            if seq_len > 1 {
-                profile.prefill_attention_calls += 1;
-            }
-        }
-        record_decode_attention_path(DecodeAttentionPath::Paged);
-        let out = out.reshape((batch, seq_len, self.num_heads * self.head_dim))?;
-        let output_start = profile_start(profiling);
-        let out = self.output_projection(&out, x.dtype())?;
-        if let Some(profile) = profile {
-            profile.output += profile_elapsed(output_start);
-        }
-        Ok(out)
+        Ok((q, k))
     }
 
+    /// One token for each of `batch` rows: `rope` holds each row's RoPE row
+    /// (gathered once per step for every layer), and the rows' K/V append and
+    /// paged attention run as one launch each.
     fn forward_managed_decode_batch(
         &self,
         x: &Tensor,
-        start_positions: &[usize],
+        rope: &GraniteRopeSlice,
         caches: &[&PhysicalPagedKvCache],
         slots: &dyn KvSlotMap,
         metadata: &KvDecodeBatchMetadata,
@@ -3629,7 +3682,7 @@ impl GraniteTextAttention {
         let (batch, sequence_len, _) = x.dims3()?;
         if batch == 0
             || sequence_len != 1
-            || start_positions.len() != batch
+            || rope.cos.dim(0)? != batch
             || caches.len() != batch
             || metadata.sequences.len() != batch
         {
@@ -3661,28 +3714,20 @@ impl GraniteTextAttention {
             x.dtype()
         };
         let (q, k, v) = self.qkv_proj.forward_to_dtype(x, qkv_dtype)?;
-        let q = q.reshape((batch, 1, self.num_heads, self.head_dim))?;
-        let k = k.reshape((batch, 1, self.num_kv_heads, self.head_dim))?;
-        let v = v.reshape((batch, 1, self.num_kv_heads, self.head_dim))?;
-        let mut query_rows = Vec::with_capacity(batch);
-        let mut key_rows = Vec::with_capacity(batch);
-        let mut value_rows = Vec::with_capacity(batch);
-        for (row, position) in start_positions.iter().copied().enumerate() {
-            let (q_row, k_row) = self.apply_decode_rope_pair(
-                &q.i(row)?.unsqueeze(0)?,
-                &k.i(row)?.unsqueeze(0)?,
-                position,
-            )?;
-            query_rows.push(q_row.reshape((self.num_heads, self.head_dim))?);
-            key_rows.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
-            value_rows.push(v.i(row)?.reshape((self.num_kv_heads, self.head_dim))?);
-        }
-        let query_refs = query_rows.iter().collect::<Vec<_>>();
-        let key_refs = key_rows.iter().collect::<Vec<_>>();
-        let value_refs = value_rows.iter().collect::<Vec<_>>();
-        let queries = Tensor::stack(&query_refs, 0)?.contiguous()?;
-        let keys = Tensor::stack(&key_refs, 0)?.contiguous()?;
-        let values = Tensor::stack(&value_refs, 0)?.contiguous()?;
+        // The rows are the sequence axis of one sequence, so row `i` turns by
+        // RoPE row `i`, its own position.
+        let q = q.reshape((1, batch, self.num_heads, self.head_dim))?;
+        let k = k.reshape((1, batch, self.num_kv_heads, self.head_dim))?;
+        let (q, k) = self.apply_rope(q, k, rope.clone())?;
+        let queries = q
+            .reshape((batch, self.num_heads, self.head_dim))?
+            .contiguous()?;
+        let keys = k
+            .reshape((batch, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let values = v
+            .reshape((batch, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
         let completion = first.arena.write_slots(
             first_binding,
             KvWriteArgs {
@@ -3706,44 +3751,6 @@ impl GraniteTextAttention {
         record_decode_attention_path(DecodeAttentionPath::Paged);
         let out = out.reshape((batch, 1, self.num_heads * self.head_dim))?;
         self.output_projection(&out, x.dtype())
-    }
-
-    fn apply_decode_rope_pair(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        position: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        let (cos, sin) = build_rope_cache(1, position, &self.rope, q.device(), q.dtype())?;
-        let rope = GraniteRopeSlice::new(cos, sin)?;
-        if granite_rope_pair_bshd_kernel_enabled(q.device(), q.dtype(), self.head_dim) {
-            if let Some((q, k)) = try_fused_rope_pair_bshd(q, k, &rope.packed) {
-                record_rope_kernel();
-                record_rope_kernel();
-                return Ok((q, k));
-            }
-        }
-        if granite_rope_bhtd_kernel_enabled(q.device(), q.dtype(), self.head_dim) {
-            if let Some((q, k)) = try_apply_granite_rope_pair_bhtd(q, k, &rope.cos, &rope.sin)? {
-                record_rope_kernel();
-                record_rope_kernel();
-                return Ok((q, k));
-            }
-        } else if granite_rope_kernel_enabled(q.device(), q.dtype(), self.head_dim) {
-            let cos = rope.cos.unsqueeze(0)?.contiguous()?;
-            let sin = rope.sin.unsqueeze(0)?.contiguous()?;
-            if let Some((q, k)) = try_apply_granite_rope_pair_thd(q, k, &cos, &sin)? {
-                record_rope_kernel();
-                record_rope_kernel();
-                return Ok((q, k));
-            }
-        }
-        record_rope_manual();
-        record_rope_manual();
-        Ok((
-            apply_rotary_emb(q, &rope.cos, &rope.sin)?,
-            apply_rotary_emb(k, &rope.cos, &rope.sin)?,
-        ))
     }
 
     fn qkv_projection_fused(&self) -> bool {
@@ -3800,6 +3807,31 @@ impl GraniteRopeCache {
         let (cos, sin) = build_rope_cache(total_len, 0, rope, device, dtype)?;
         let packed = Tensor::cat(&[&cos, &sin], 1)?;
         Ok(Self { cos, sin, packed })
+    }
+
+    /// The rows at `positions`, in order: one upload of the indices and one
+    /// gather per table.
+    fn gather(&self, positions: &[usize]) -> Result<GraniteRopeSlice> {
+        let rows = self.cos.dim(0)?;
+        let indices = positions
+            .iter()
+            .map(|&position| {
+                u32::try_from(position)
+                    .ok()
+                    .filter(|_| position < rows)
+                    .ok_or_else(|| {
+                        Error::InferenceError(format!(
+                            "Granite RoPE table has {rows} positions, not {position}"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let indices = Tensor::from_vec(indices, positions.len(), self.cos.device())?;
+        Ok(GraniteRopeSlice {
+            cos: self.cos.index_select(&indices, 0)?,
+            sin: self.sin.index_select(&indices, 0)?,
+            packed: self.packed.index_select(&indices, 0)?,
+        })
     }
 
     fn slice(&self, start_pos: usize, seq_len: usize) -> Result<GraniteRopeSlice> {
@@ -4635,6 +4667,96 @@ mod tests {
         );
         assert_eq!(batch_a.context_len(), 4);
         assert_eq!(batch_b.context_len(), 5);
+    }
+
+    /// The batched step's RoPE rows, gathered from the load-time table,
+    /// are exactly the rows the host builds for each position, and a
+    /// position past the decoder context is refused.
+    #[test]
+    fn rope_table_gather_matches_host_built_rows() {
+        let device = Device::Cpu;
+        let model = tiny_granite_language_model(&device);
+        let table = model.rope_table().unwrap();
+        assert_eq!(table.cos.dim(0).unwrap(), 32);
+        let rope = &model.layers[0].self_attn.rope;
+        let positions = [5usize, 0, 31, 5];
+        let gathered = model.decode_rope_rows(&positions).unwrap();
+        for (row, position) in positions.into_iter().enumerate() {
+            let (cos, sin) = build_rope_cache(1, position, rope, &device, DType::F32).unwrap();
+            let host = GraniteRopeSlice::new(cos, sin).unwrap();
+            for (gathered, host) in [
+                (&gathered.cos, &host.cos),
+                (&gathered.sin, &host.sin),
+                (&gathered.packed, &host.packed),
+            ] {
+                assert_eq!(
+                    gathered.i(row).unwrap().to_vec1::<f32>().unwrap(),
+                    host.i(0).unwrap().to_vec1::<f32>().unwrap(),
+                    "position {position}"
+                );
+            }
+        }
+        assert!(model.decode_rope_rows(&[3, 32]).is_err());
+    }
+
+    /// Three rows, one starting at position zero, decode in one step with
+    /// each row's logits and K/V those of the row decoded alone.
+    #[test]
+    fn three_ragged_rows_decode_together_as_each_decodes_alone() {
+        let device = Device::Cpu;
+        let model = tiny_granite_language_model(&device);
+        let mut caches = tiny_shared_granite_caches(6);
+        let mut batch = caches.split_off(3);
+        let mut scalar = caches;
+        let prompts = [vec![], vec![1u32, 2], vec![3u32, 4, 5]];
+        for (row, prompt) in prompts.iter().enumerate() {
+            if prompt.is_empty() {
+                continue;
+            }
+            let prompt = Tensor::from_vec(prompt.clone(), (1, prompt.len()), &device).unwrap();
+            for cache in [&mut scalar[row], &mut batch[row]] {
+                model
+                    .forward_profiled(&prompt, 0, cache, model.rope_table(), None)
+                    .unwrap();
+                cache.take_completed_writes();
+            }
+        }
+        for (step, tokens) in [[6u32, 7, 8], [9, 10, 11]].into_iter().enumerate() {
+            let positions = prompts
+                .iter()
+                .map(|prompt| prompt.len() + step)
+                .collect::<Vec<_>>();
+            let alone = tokens
+                .iter()
+                .zip(&positions)
+                .zip(scalar.iter_mut())
+                .map(|((&token, &position), cache)| {
+                    let token = Tensor::from_vec(vec![token], (1, 1), &device).unwrap();
+                    let logits = model
+                        .forward_profiled(&token, position, cache, None, None)
+                        .unwrap();
+                    cache.take_completed_writes();
+                    logits
+                })
+                .collect::<Vec<_>>();
+            let input = Tensor::from_vec(tokens.to_vec(), (3, 1), &device).unwrap();
+            let together = {
+                let (first, rest) = batch.split_at_mut(1);
+                let (second, third) = rest.split_at_mut(1);
+                model
+                    .forward_managed_decode_batch(
+                        &input,
+                        &positions,
+                        &mut [&mut first[0], &mut second[0], &mut third[0]],
+                    )
+                    .unwrap()
+            };
+            for (row, logits) in alone.iter().enumerate() {
+                assert_tensor_close(logits, &together.i(row).unwrap().unsqueeze(0).unwrap());
+                assert_eq!(batch[row].context_len(), positions[row] + 1);
+                assert_eq!(batch[row].take_completed_writes().len(), 1);
+            }
+        }
     }
 
     #[test]
