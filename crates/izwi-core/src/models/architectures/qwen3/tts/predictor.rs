@@ -119,6 +119,13 @@ impl CodeSelection<'_> {
     }
 }
 
+/// One frame's acoustic codes for a batch of rows: on the device, one row
+/// of codes per codebook (`[groups, rows]` U32), and read back per row.
+pub struct AcousticCodeRows {
+    pub by_group: Tensor,
+    pub rows: Vec<Vec<u32>>,
+}
+
 /// Code Predictor model
 pub struct CodePredictor {
     codec_embeddings: Vec<CodecEmbedding>,
@@ -490,6 +497,25 @@ impl CodePredictor {
         caches: &mut [&mut CodePredictorPhysicalCache],
         selections: &mut [CodeSelection<'_>],
     ) -> Result<Vec<Vec<u32>>> {
+        self.generate_acoustic_code_rows_physical_batch(
+            talker_hidden,
+            semantic_embeds,
+            caches,
+            selections,
+        )
+        .map(|codes| codes.rows)
+    }
+
+    /// [`Self::generate_acoustic_codes_physical_batch`] that also keeps the
+    /// frame's codes on the device, `[groups, rows]`, for
+    /// [`Self::acoustic_embeddings_sum_rows`].
+    pub fn generate_acoustic_code_rows_physical_batch(
+        &self,
+        talker_hidden: &Tensor,
+        semantic_embeds: &Tensor,
+        caches: &mut [&mut CodePredictorPhysicalCache],
+        selections: &mut [CodeSelection<'_>],
+    ) -> Result<AcousticCodeRows> {
         // Inputs arrive at the talker's width; `small_to_mtp_projection`
         // narrows them to the predictor's `hidden_size` below.
         let input_hidden_size = self.cfg.input_hidden_size();
@@ -512,14 +538,17 @@ impl CodePredictor {
             )));
         }
         if batch_size == 1 {
-            return self
-                .generate_acoustic_codes_physical(
-                    talker_hidden,
-                    semantic_embeds,
-                    caches[0],
-                    &mut selections[0],
-                )
-                .map(|codes| vec![codes]);
+            let codes = self.generate_acoustic_codes_physical(
+                talker_hidden,
+                semantic_embeds,
+                caches[0],
+                &mut selections[0],
+            )?;
+            let by_group = Tensor::from_vec(codes.clone(), (codes.len(), 1), &self.device)?;
+            return Ok(AcousticCodeRows {
+                by_group,
+                rows: vec![codes],
+            });
         }
         for cache in caches.iter() {
             self.validate_physical_workspace(cache)?;
@@ -561,7 +590,10 @@ impl CodePredictor {
                 .contiguous()?;
             let num_acoustic = self.lm_heads.len();
             if num_acoustic == 0 {
-                return Ok(vec![Vec::new(); batch_size]);
+                return Ok(AcousticCodeRows {
+                    by_group: Tensor::zeros((0, batch_size), DType::U32, &self.device)?,
+                    rows: vec![Vec::new(); batch_size],
+                });
             }
 
             let first_logits = self.lm_heads[0].forward(&last_hidden)?;
@@ -601,9 +633,12 @@ impl CodePredictor {
                 )));
             }
             super::record_qwen3_tts_host_readback();
-            Tensor::stack(&steps, 1)?
-                .to_vec2::<u32>()
-                .map_err(Error::from)
+            let by_group = Tensor::stack(&steps, 0)?;
+            let codes = by_group.to_vec2::<u32>()?;
+            let rows = (0..batch_size)
+                .map(|row| codes.iter().map(|group| group[row]).collect())
+                .collect();
+            Ok(AcousticCodeRows { by_group, rows })
         })();
         if let Err(error) = result {
             let mut rollback_error = None;
@@ -839,6 +874,27 @@ impl CodePredictor {
         }
 
         Ok(sum)
+    }
+
+    /// [`Self::get_acoustic_embeddings_sum`] of every row at once, from
+    /// `codes_by_group` (`[groups, rows]` U32 on the device): one gather per
+    /// codebook for all rows, added in the per-row order, so each row of the
+    /// `[rows, 1, codec_embed_dim]` result is bit for bit its per-row sum. A
+    /// step runs 15 gathers and 14 adds instead of that many per row.
+    pub fn acoustic_embeddings_sum_rows(&self, codes_by_group: &Tensor) -> Result<Tensor> {
+        let (groups, _rows) = codes_by_group.dims2()?;
+        if groups == 0 || groups != self.codec_embeddings.len() {
+            return Err(Error::InvalidInput(format!(
+                "Expected {} acoustic code groups, got {groups}",
+                self.codec_embeddings.len()
+            )));
+        }
+        let codes = codes_by_group.contiguous()?;
+        let mut sum = self.codec_embeddings[0].forward(&codes.i(0)?)?;
+        for (group_idx, embedding) in self.codec_embeddings.iter().enumerate().skip(1) {
+            sum = sum.broadcast_add(&embedding.forward(&codes.i(group_idx)?)?)?;
+        }
+        sum.unsqueeze(1).map_err(Error::from)
     }
 
     fn codec_embedding_row(&self, group_idx: usize, code: u32) -> Result<Tensor> {
@@ -1707,7 +1763,7 @@ mod tests {
         let semantic = Tensor::cat(&[&semantic_a, &semantic_b], 0).unwrap();
         let mut caches = [&mut batch_a, &mut batch_b];
         let batch_codes = model
-            .generate_acoustic_codes_physical_batch(
+            .generate_acoustic_code_rows_physical_batch(
                 &talker,
                 &semantic,
                 &mut caches,
@@ -1715,7 +1771,12 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(batch_codes, vec![scalar_codes_a, scalar_codes_b]);
+        assert_eq!(batch_codes.rows, vec![scalar_codes_a, scalar_codes_b]);
+        // The device codes are the same codes, one row per codebook.
+        assert_eq!(
+            batch_codes.by_group.t().unwrap().to_vec2::<u32>().unwrap(),
+            batch_codes.rows
+        );
         assert_eq!((batch_a.context_len(), batch_b.context_len()), (4, 4));
         let completions_a = batch_a.take_completed_writes();
         let completions_b = batch_b.take_completed_writes();
@@ -1833,6 +1894,69 @@ mod tests {
 
         assert_eq!(actual, vec![expected]);
         assert_eq!(fallback.context_len(), scalar.context_len());
+    }
+
+    /// A step's acoustic embedding sums gathered for all rows at once equal
+    /// each row's own sum bit for bit (the same codebook order), over 15
+    /// xorshift tables of mixed magnitudes, dense F32 and widened F16, so a
+    /// different order would round differently.
+    #[test]
+    fn batched_acoustic_embedding_sums_equal_each_rows_own() {
+        let device = Device::Cpu;
+        let mut state = 0x51ED_2701_9E37_79B9u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let (groups, vocab, width, rows) = (15, 8, 4, 5);
+        for f16 in [false, true] {
+            let mut model = tiny_predictor(&device);
+            model.codec_embeddings = (0..groups)
+                .map(|_| {
+                    let values = (0..vocab * width)
+                        .map(|_| {
+                            let unit = (next() >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0;
+                            unit * 2f32.powi((next() % 12) as i32 - 6)
+                        })
+                        .collect::<Vec<_>>();
+                    let table = Tensor::from_vec(values, (vocab, width), &device).unwrap();
+                    CodecEmbedding::new(Embedding::new(table, width), f16.then_some(&device))
+                        .unwrap()
+                })
+                .collect();
+            let codes = (0..rows)
+                .map(|_| {
+                    (0..groups)
+                        .map(|_| (next() % vocab as u64) as u32)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let by_group = (0..groups)
+                .flat_map(|group| codes.iter().map(move |row| row[group]))
+                .collect::<Vec<_>>();
+            let by_group = Tensor::from_vec(by_group, (groups, rows), &device).unwrap();
+            let batched = model.acoustic_embeddings_sum_rows(&by_group).unwrap();
+            assert_eq!(batched.dims(), &[rows, 1, width]);
+            for (row, row_codes) in codes.iter().enumerate() {
+                let bits = |tensor: Tensor| {
+                    tensor
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                        .into_iter()
+                        .map(f32::to_bits)
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    bits(batched.i(row).unwrap()),
+                    bits(model.get_acoustic_embeddings_sum(row_codes).unwrap()),
+                    "row {row}, f16 tables {f16}"
+                );
+            }
+        }
     }
 
     /// QTTS-4: one predictor frame reads its codes back once (it read one

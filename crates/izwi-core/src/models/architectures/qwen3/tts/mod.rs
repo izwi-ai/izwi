@@ -22,8 +22,9 @@ pub use budget::{
 pub(crate) use budget::{qwen3_tts_retained_memory_tokens, qwen3_tts_state_floor_tokens};
 pub use config::Qwen3TtsConfig;
 pub use predictor::{
-    code_predictor_physical_context_tokens, CodePredictor, CodePredictorPhysicalCache,
-    CodeSelection, SubtalkerSampling, CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS,
+    code_predictor_physical_context_tokens, AcousticCodeRows, CodePredictor,
+    CodePredictorPhysicalCache, CodeSelection, SubtalkerSampling,
+    CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS,
 };
 pub use speech_tokenizer::{
     SpeechTokenizerDecodeStats, SpeechTokenizerDecoder, SpeechTokenizerStream,
@@ -3021,21 +3022,20 @@ impl Qwen3TtsModel {
                     draw,
                 })
                 .collect::<Vec<_>>();
-            self.code_predictor.generate_acoustic_codes_physical_batch(
-                &talker_hidden,
-                &semantic_embeds,
-                caches,
-                &mut selections,
-            )?
+            self.code_predictor
+                .generate_acoustic_code_rows_physical_batch(
+                    &talker_hidden,
+                    &semantic_embeds,
+                    caches,
+                    &mut selections,
+                )?
         };
         for (row, rng) in rows.iter_mut().zip(rngs) {
             row.next_rng = rng;
         }
         let predictor_ms = predictor_started.elapsed().as_secs_f64() * 1000.0;
-        let result = rows
-            .into_iter()
-            .zip(acoustic)
-            .map(|(predictor, acoustic_codes)| {
+        let result = (|| {
+            for acoustic_codes in &acoustic.rows {
                 if acoustic_codes.len() != self.code_predictor.num_acoustic_groups() {
                     return Err(Error::InferenceError(format!(
                         "Qwen3-TTS predictor row returned {} acoustic groups, expected {}",
@@ -3043,21 +3043,36 @@ impl Qwen3TtsModel {
                         self.code_predictor.num_acoustic_groups()
                     )));
                 }
-                let acoustic_embed_sum = self
-                    .code_predictor
-                    .get_acoustic_embeddings_sum(&acoustic_codes)?;
-                let step_input = predictor
-                    .semantic_embed
-                    .broadcast_add(&acoustic_embed_sum)?
-                    .broadcast_add(&predictor.text_addition)?;
-                Ok(PreparedTtsTalkerStage {
-                    predictor,
-                    acoustic_codes,
-                    step_input,
-                    predictor_ms,
+            }
+            // Every row's step input in one pass: the codes stay on the
+            // device for the gather, and each sum is elementwise in the
+            // per-row order.
+            let acoustic_embed_sums = self
+                .code_predictor
+                .acoustic_embeddings_sum_rows(&acoustic.by_group)?;
+            let text_additions = rows
+                .iter()
+                .map(|row| &row.text_addition)
+                .collect::<Vec<_>>();
+            let step_inputs = semantic_embeds
+                .broadcast_add(&acoustic_embed_sums)?
+                .broadcast_add(&Tensor::cat(&text_additions, 0)?)?;
+            Ok((step_inputs, acoustic.rows))
+        })()
+        .and_then(|(step_inputs, acoustic_rows)| {
+            rows.into_iter()
+                .zip(acoustic_rows)
+                .enumerate()
+                .map(|(row, (predictor, acoustic_codes))| {
+                    Ok(PreparedTtsTalkerStage {
+                        predictor,
+                        acoustic_codes,
+                        step_input: step_inputs.narrow(0, row, 1)?,
+                        predictor_ms,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>();
+                .collect::<Result<Vec<_>>>()
+        });
         if let Err(error) = result {
             let mut rollback_error = None;
             for (row, cache) in caches.iter_mut().enumerate() {
