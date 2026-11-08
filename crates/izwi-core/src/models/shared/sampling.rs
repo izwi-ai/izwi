@@ -2031,6 +2031,52 @@ pub fn resident_top_k_sample(
     gumbel_top_k_token(&adjusted, k, &gumbel).map(Some)
 }
 
+/// [`resident_top_k_sample`] for every row of `logits` (`[rows, vocab]`) in
+/// one pass, all rows sharing `top_k` and `temperature`: the same
+/// sanitizing and scaling, row-wise top-k ([`bounded_topk_rows`] equals
+/// [`bounded_topk`] row by row), each row's Gumbel noise from its own
+/// `draws` closure in the same order, and one argmax per row. Each row's code
+/// is the one [`resident_top_k_sample`] picks for that row alone, and the
+/// noise for all rows goes up in one upload instead of one per row. Returns
+/// a `[rows]` U32 tensor, or `None` where the single-row sampler would (and
+/// the caller falls back to it row by row).
+pub fn resident_top_k_sample_rows<'d>(
+    logits: &Tensor,
+    top_k: usize,
+    temperature: f32,
+    draws: &mut [&mut (dyn FnMut() -> f32 + 'd)],
+) -> Result<Option<Tensor>> {
+    if temperature <= 1e-5 || top_k == 0 || top_k > DEVICE_TOP_K_LIMIT {
+        return Ok(None);
+    }
+    let (rows, vocab) = logits.dims2()?;
+    if rows == 0 || vocab == 0 || draws.len() != rows {
+        return Ok(None);
+    }
+    let adjusted = sanitize_finite(&logits.to_dtype(DType::F32)?)?;
+    let adjusted = (adjusted / temperature as f64)?;
+    let k = top_k.min(vocab);
+    let (values, indices) = bounded_topk_rows(&adjusted, k)?;
+    let keep = values.dim(1)?;
+    let mut noise = Vec::with_capacity(rows * keep);
+    for draw in draws.iter_mut() {
+        noise.extend_from_slice(&gumbel_noise(k, &mut **draw)[..keep]);
+    }
+    let noise = Tensor::from_vec(noise, (rows, keep), logits.device())?;
+    let picks = values
+        .broadcast_add(&noise)?
+        .argmax(D::Minus1)?
+        .to_dtype(DType::U32)?
+        .reshape((rows, 1))?;
+    Ok(Some(
+        indices
+            .to_dtype(DType::U32)?
+            .contiguous()?
+            .gather(&picks, 1)?
+            .reshape(rows)?,
+    ))
+}
+
 /// `-ln(-ln(u))` for `count` uniforms, the Gumbel(0, 1) noise of the
 /// Gumbel-max trick.
 pub(crate) fn gumbel_noise(count: usize, draw: &mut dyn FnMut() -> f32) -> Vec<f32> {
@@ -2315,6 +2361,50 @@ pub(crate) mod batched_device_sampling {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn xorshift(seed: u64) -> impl FnMut() -> f32 {
+        let mut state = seed | 1;
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 24) as f32
+        }
+    }
+
+    /// Each row of the batched sampler picks the code the single-row sampler
+    /// picks for that row with the same noise stream, at widths that take one
+    /// sort chunk and several (the predictor's 2,048-code heads), with ties.
+    #[test]
+    fn resident_top_k_rows_match_each_row_alone() {
+        let device = Device::Cpu;
+        for (rows, vocab, top_k) in [(1, 64, 8), (5, 2048, 50), (8, 3000, 1), (3, 700, 512)] {
+            let mut values = xorshift(vocab as u64 * 31 + rows as u64);
+            let mut logits: Vec<f32> = (0..rows * vocab).map(|_| values() * 8.0 - 4.0).collect();
+            // A tie inside the candidates of row 0.
+            logits[3] = logits[5];
+            let logits = Tensor::from_vec(logits, (rows, vocab), &device).unwrap();
+            let mut batched_draws = (0..rows).map(|row| xorshift(row as u64 + 7)).collect::<Vec<_>>();
+            let mut draws = batched_draws
+                .iter_mut()
+                .map(|draw| draw as &mut dyn FnMut() -> f32)
+                .collect::<Vec<_>>();
+            let batched = resident_top_k_sample_rows(&logits, top_k, 0.9, &mut draws)
+                .unwrap()
+                .expect("sampled on the device")
+                .to_vec1::<u32>()
+                .unwrap();
+            for (row, &code) in batched.iter().enumerate() {
+                let mut draw = xorshift(row as u64 + 7);
+                let alone = resident_top_k_sample(&logits.i(row).unwrap(), vocab, top_k, 0.9, &mut draw)
+                    .unwrap()
+                    .expect("sampled on the device")
+                    .to_vec1::<u32>()
+                    .unwrap();
+                assert_eq!(code, alone[0], "rows={rows} vocab={vocab} top_k={top_k} row={row}");
+            }
+        }
+    }
 
     /// Unstructured logits: xorshift values in [-4, 4).
     fn xorshift_logits(state: &mut u64, len: usize) -> Vec<f32> {

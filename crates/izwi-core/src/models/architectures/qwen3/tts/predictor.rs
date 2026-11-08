@@ -24,7 +24,7 @@ pub use crate::models::shared::attention::physical::PhysicalPagedKvCache as Code
 use crate::models::shared::attention::physical::PreparedPhysicalPagedStep;
 use crate::models::shared::sampling::{
     bounded_device_sampling_candidates, device_candidates_cover_top_p, resident_top_k_sample,
-    sample_device_candidates,
+    resident_top_k_sample_rows, sample_device_candidates,
 };
 use crate::models::shared::weights::mlx;
 
@@ -1294,12 +1294,47 @@ fn select_codes(
     if selections.iter().all(CodeSelection::is_greedy) {
         return argmax_device(&logits);
     }
+    if let Some(codes) = select_resident_top_k_rows(&logits, selections)? {
+        return Ok(codes);
+    }
     let codes = selections
         .iter_mut()
         .enumerate()
         .map(|(row, selection)| selection.select(&logits.i(row)?))
         .collect::<Result<Vec<_>>>()?;
     Tensor::cat(&codes, 0).map_err(Error::from)
+}
+
+/// Every row's code in one device pass when all rows sample the sub-talker
+/// way (top-k with top-p 1) with the same `top_k` and temperature, which
+/// every request with default sub-talker settings does: each row's code is
+/// the one [`CodeSelection::select`] picks for it alone, but the 15
+/// codebooks of a frame no longer run a sampling chain and a noise upload per
+/// row. `None` sends the rows through [`CodeSelection::select`] one by one.
+fn select_resident_top_k_rows(
+    logits: &Tensor,
+    selections: &mut [CodeSelection<'_>],
+) -> Result<Option<Tensor>> {
+    let shared = |selection: &CodeSelection<'_>| match selection {
+        CodeSelection::Sample { params, .. } if !params.is_greedy() && params.top_p >= 1.0 => {
+            Some((params.top_k, params.temperature.to_bits()))
+        }
+        _ => None,
+    };
+    let Some(first) = selections.first().and_then(shared) else {
+        return Ok(None);
+    };
+    if selections.len() < 2 || selections.iter().any(|selection| shared(selection) != Some(first)) {
+        return Ok(None);
+    }
+    let mut draws = selections
+        .iter_mut()
+        .map(|selection| match selection {
+            CodeSelection::Sample { draw, .. } => &mut **draw,
+            CodeSelection::Greedy => unreachable!("every row samples"),
+        })
+        .collect::<Vec<&mut (dyn FnMut() -> f32 + '_)>>();
+    resident_top_k_sample_rows(logits, first.0, f32::from_bits(first.1), &mut draws)
 }
 
 /// Argmax over the last axis as U32 on the logits' device: `[1]` for one row,
