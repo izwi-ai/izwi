@@ -19,7 +19,9 @@ use crate::models::shared::weights::staged;
 use super::config::GraniteSpeech5Config;
 use super::encoder::ConformerEncoder;
 use super::gguf::{check_gguf_metadata, mmproj_var_builder, open_gguf};
-use super::language_model::{argmax_last_token, text_attention_geometry, GraniteLanguageModel};
+use super::language_model::{
+    argmax_last_token, argmax_rows, text_attention_geometry, GraniteLanguageModel,
+};
 use super::precision::{self, LmExecutionPlan};
 use super::preprocessor::GraniteSpeech5AudioFeatures;
 use super::projector::QFormerProjector;
@@ -549,6 +551,22 @@ impl GraniteSpeech5Runtime {
             },
             token_ids: generated,
         })
+    }
+
+    /// One decode step for several retained rows sharing one arena: row
+    /// `i` appends `tokens[i]` at `positions[i]` of `caches[i]`. Returns each
+    /// row's greedy next token, read back once for every row.
+    pub(crate) fn decode_tokens_batch(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<Vec<u32>> {
+        let input = Tensor::from_vec(tokens.to_vec(), tokens.len(), &self.device)?;
+        let logits = self
+            .language_model
+            .forward_decode_rows(&input, positions, caches)?;
+        argmax_rows(&logits)
     }
 
     #[cfg(test)]

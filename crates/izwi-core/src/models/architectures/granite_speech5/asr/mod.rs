@@ -131,6 +131,11 @@ const AUTO_TOKENS_PER_WINDOW: f64 = 300.0;
 const AUTO_WINDOW_SECONDS: f64 = 30.0;
 /// The admitted ceiling of the automatic budget.
 pub const GRANITE_SPEECH5_AUTO_MAX_TOKENS: usize = 2048;
+/// The longest sequence the retained route decodes: the 128-token prompt
+/// reserve, 120 s of audio tokens and that audio's automatic budget
+/// (128 + 1,200 + 1,200). A request whose prompt and budget need more runs
+/// as one atomic invocation.
+pub(crate) const GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS: usize = 2_528;
 const DEFAULT_MAX_NEW_TOKENS: usize = 768;
 
 static NEXT_MODEL_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -779,6 +784,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn retained_sequences_hold_the_longest_automatic_segment() {
+        assert_eq!(
+            GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS,
+            crate::runtime::asr_sequence_ceiling(
+                crate::runtime::ASR_TEXT_PROMPT_TOKEN_RESERVE,
+                GRANITE_SPEECH5_AUDIO_TOKENS_PER_SECOND,
+                GRANITE_SPEECH5_MAX_AUDIO_SECONDS,
+                granite_speech5_auto_max_tokens_for_duration(GRANITE_SPEECH5_MAX_AUDIO_SECONDS),
+            )
+        );
     }
 
     #[test]
