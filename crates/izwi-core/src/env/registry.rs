@@ -161,6 +161,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Enables recompute preemption: under managed KV pressure, suspend a low-priority session and replay its tokens instead of failing.",
     ),
     CoreEnvVar::new(
+        "IZWI_CHATTERBOX_DEVICE_SAMPLING",
+        Flag,
+        "true",
+        Once,
+        "Kill switch: false reads both of each Chatterbox row's whole T3 logits rows (2 x 8,194 values with guidance) back every step and samples on the host, instead of its top candidates under guidance and the repetition penalty computed on the device (CUDA).",
+    ),
+    CoreEnvVar::new(
         "IZWI_CHATTERBOX_WATERMARK",
         Flag,
         "true",
