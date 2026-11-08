@@ -1,6 +1,7 @@
 //! Exact incremental decoding. Histories are immutable, independently allocated
 //! tensors: cloning a checkpoint shares storage until the next successful push.
 use super::*;
+use std::sync::Arc;
 
 type AttentionState = (Tensor, Tensor);
 
@@ -8,24 +9,86 @@ type AttentionState = (Tensor, Tensor);
 pub(crate) struct FishS2DacStreamState {
     histories: Vec<Tensor>,
     attention: Vec<AttentionState>,
+    /// After a batched push: this row's histories and attention are lane
+    /// `.1` of the batch's tensors (and the two vectors above are empty), so
+    /// the rows that decoded together keep one `[rows, ...]` copy instead of
+    /// splitting it per row, and hand it back whole if they push together
+    /// again in the same order.
+    shared: Option<(Arc<FishS2DacBatchedHistory>, usize)>,
     frames: usize,
     samples: usize,
     finished: bool,
 }
 
+/// The retained state a codec batch produced: every history and attention
+/// tensor with one row per lane.
+#[derive(Debug)]
+struct FishS2DacBatchedHistory {
+    histories: Vec<Tensor>,
+    attention: Vec<AttentionState>,
+    rows: usize,
+}
+
 impl FishS2DacStreamState {
+    /// This row's histories and attention as its own `[1, ...]` tensors
+    /// (views of a shared batch's lane; no copy).
+    fn row_tensors(&self) -> Result<(Vec<Tensor>, Vec<AttentionState>)> {
+        match &self.shared {
+            None => Ok((self.histories.clone(), self.attention.clone())),
+            Some((batch, lane)) => Ok((
+                batch
+                    .histories
+                    .iter()
+                    .map(|history| history.narrow(0, *lane, 1))
+                    .collect::<candle_core::Result<Vec<_>>>()?,
+                batch
+                    .attention
+                    .iter()
+                    .map(|(k, v)| Ok((k.narrow(0, *lane, 1)?, v.narrow(0, *lane, 1)?)))
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+        }
+    }
+
+    /// This row as its own tensors (lane views of a shared batch).
+    fn unshared(&self) -> Result<Self> {
+        let (histories, attention) = self.row_tensors()?;
+        Ok(Self {
+            histories,
+            attention,
+            shared: None,
+            frames: self.frames,
+            samples: self.samples,
+            finished: self.finished,
+        })
+    }
+
+    fn history_counts(&self) -> (usize, usize) {
+        match &self.shared {
+            None => (self.histories.len(), self.attention.len()),
+            Some((batch, _)) => (batch.histories.len(), batch.attention.len()),
+        }
+    }
+
     pub(crate) fn decoded_frames(&self) -> usize {
         self.frames
     }
     pub(crate) fn emitted_samples(&self) -> usize {
         self.samples
     }
+    /// This row's retained bytes; a shared batch's are split evenly between
+    /// its lanes (each lane holds the same shapes).
     pub(crate) fn retained_tensor_bytes(&self) -> u64 {
-        self.histories
+        let (histories, attention, rows) = match &self.shared {
+            None => (&self.histories, &self.attention, 1),
+            Some((batch, _)) => (&batch.histories, &batch.attention, batch.rows.max(1)),
+        };
+        histories
             .iter()
-            .chain(self.attention.iter().flat_map(|(k, v)| [k, v]))
+            .chain(attention.iter().flat_map(|(k, v)| [k, v]))
             .map(|t| (t.elem_count() * t.dtype().size_in_bytes()) as u64)
-            .sum()
+            .sum::<u64>()
+            / rows as u64
     }
     /// The full oracle discards the causal transpose tail. All stable samples
     /// have already been emitted; repeated terminal flushes therefore are empty.
@@ -33,6 +96,7 @@ impl FishS2DacStreamState {
         self.finished = true;
         self.histories.clear();
         self.attention.clear();
+        self.shared = None;
         Vec::new()
     }
 }
@@ -89,7 +153,7 @@ impl FishS2DacDecoder {
             ));
         }
         let codes = codebooks_to_tensor(codebooks, &self.config, self.decoder_device()?)?;
-        let mut candidate = state.clone();
+        let mut candidate = state.unshared()?;
         let z = self.push_tensor(&mut candidate, &codes, check_cancelled)?;
         let samples = z.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         check_cancelled()?;
@@ -100,6 +164,11 @@ impl FishS2DacDecoder {
     /// Exact shape buckets share all codec projections/convolutions/attention.
     /// Different stream ages remain separate buckets, never concatenated in time.
     /// No candidate history is published unless every group and readback succeeds.
+    /// A group keeps its retained state as one batch the rows share by lane:
+    /// when the same rows push together again in the same order, the batch is
+    /// used as it is, instead of concatenating every row's history and
+    /// attention tensors and splitting them again after the push (one copy
+    /// of each per row per push).
     pub(crate) fn push_frames_batch(
         &self,
         states: &mut [FishS2DacStreamState],
@@ -141,43 +210,53 @@ impl FishS2DacDecoder {
         let mut outputs = vec![Vec::new(); states.len()];
         for rows in groups.values() {
             let first = &states[rows[0]];
-            let mut combined = first.clone();
-            combined.histories = (0..first.histories.len())
-                .map(|history| {
-                    let tensors = rows
-                        .iter()
-                        .map(|&row| {
-                            states[row].histories.get(history).ok_or_else(|| {
-                                Error::InvalidInput("Fish codec history layouts differ".into())
-                            })
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    Tensor::cat(&tensors, 0).map_err(Error::from)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            combined.attention = (0..first.attention.len())
-                .map(|layer| {
-                    let kv = rows
-                        .iter()
-                        .map(|&row| {
-                            states[row].attention.get(layer).ok_or_else(|| {
-                                Error::InvalidInput("Fish codec attention layouts differ".into())
-                            })
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let k = kv.iter().map(|(k, _)| k).collect::<Vec<_>>();
-                    let v = kv.iter().map(|(_, v)| v).collect::<Vec<_>>();
-                    Ok((Tensor::cat(&k, 0)?, Tensor::cat(&v, 0)?))
-                })
-                .collect::<Result<Vec<_>>>()?;
             for &row in rows {
-                if states[row].histories.len() != first.histories.len()
-                    || states[row].attention.len() != first.attention.len()
+                if states[row].history_counts() != first.history_counts()
                     || states[row].samples != first.samples
                 {
                     return Err(Error::InvalidInput(
                         "Fish codec batch history metadata differs".into(),
                     ));
+                }
+            }
+            let mut combined = FishS2DacStreamState {
+                shared: None,
+                ..first.clone()
+            };
+            match shared_batch(states, rows) {
+                // The rows pushed together last time, in this order: their
+                // batch is this push's input as it is.
+                Some(batch) => {
+                    combined.histories = batch.histories.clone();
+                    combined.attention = batch.attention.clone();
+                }
+                None => {
+                    let row_tensors = rows
+                        .iter()
+                        .map(|&row| states[row].row_tensors())
+                        .collect::<Result<Vec<_>>>()?;
+                    combined.histories = (0..row_tensors[0].0.len())
+                        .map(|history| {
+                            let tensors = row_tensors
+                                .iter()
+                                .map(|(histories, _)| &histories[history])
+                                .collect::<Vec<_>>();
+                            Tensor::cat(&tensors, 0).map_err(Error::from)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    combined.attention = (0..row_tensors[0].1.len())
+                        .map(|layer| {
+                            let k = row_tensors
+                                .iter()
+                                .map(|(_, attention)| &attention[layer].0)
+                                .collect::<Vec<_>>();
+                            let v = row_tensors
+                                .iter()
+                                .map(|(_, attention)| &attention[layer].1)
+                                .collect::<Vec<_>>();
+                            Ok((Tensor::cat(&k, 0)?, Tensor::cat(&v, 0)?))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
                 }
             }
             let codes = Tensor::cat(
@@ -194,21 +273,17 @@ impl FishS2DacDecoder {
             let audio = self
                 .push_tensor(&mut combined, &codes, check_cancelled)?
                 .to_dtype(DType::F32)?;
+            let batch = Arc::new(FishS2DacBatchedHistory {
+                histories: std::mem::take(&mut combined.histories),
+                attention: std::mem::take(&mut combined.attention),
+                rows: rows.len(),
+            });
             for (lane, &row) in rows.iter().enumerate() {
                 outputs[row] = audio.narrow(0, lane, 1)?.flatten_all()?.to_vec1::<f32>()?;
                 candidates[row] = FishS2DacStreamState {
-                    histories: combined
-                        .histories
-                        .iter()
-                        .map(|h| h.narrow(0, lane, 1)?.copy())
-                        .collect::<candle_core::Result<Vec<_>>>()?,
-                    attention: combined
-                        .attention
-                        .iter()
-                        .map(|(k, v)| {
-                            Ok((k.narrow(0, lane, 1)?.copy()?, v.narrow(0, lane, 1)?.copy()?))
-                        })
-                        .collect::<Result<Vec<_>>>()?,
+                    histories: Vec::new(),
+                    attention: Vec::new(),
+                    shared: Some((batch.clone(), lane)),
                     frames: combined.frames,
                     samples: combined.samples,
                     finished: false,
@@ -298,6 +373,25 @@ impl FishS2DacDecoder {
         *state = next;
         Ok(z)
     }
+}
+
+/// The batch `rows` (in this order) share as lanes `0..rows.len()`, if they
+/// are exactly its rows.
+fn shared_batch<'a>(
+    states: &'a [FishS2DacStreamState],
+    rows: &[usize],
+) -> Option<&'a Arc<FishS2DacBatchedHistory>> {
+    let (batch, _) = states[rows[0]].shared.as_ref()?;
+    (batch.rows == rows.len()
+        && rows.iter().enumerate().all(|(lane, &row)| {
+            states[row]
+                .shared
+                .as_ref()
+                .is_some_and(|(shared, shared_lane)| {
+                    Arc::ptr_eq(shared, batch) && *shared_lane == lane
+                })
+        }))
+    .then_some(batch)
 }
 
 fn history(
@@ -711,5 +805,81 @@ mod tests {
                 "chunk {chunk}: maximum sample error {max_error}"
             );
         }
+    }
+
+    /// Rows that push together keep one shared batch, lane by lane, push
+    /// after push (their histories are never split per row or concatenated
+    /// again) and decode bit for bit as from their own concatenated tensors,
+    /// reordered rows included; each lane reports its own retained bytes and
+    /// decodes as its row does alone; a row pushed alone leaves the batch for
+    /// its own tensors.
+    #[test]
+    fn rows_pushed_together_keep_one_shared_batch() {
+        let device = Device::Cpu;
+        let codec = super::super::tests::tiny_decoder_fixture(&device, true);
+        let codes = |step: usize| {
+            (0..3)
+                .map(|row| {
+                    (0..2)
+                        .map(|book| {
+                            (0..2)
+                                .map(|frame| ((step + 2 * row + book + frame) % 8) as u32)
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut states = vec![FishS2DacStreamState::default(); 3];
+        let mut scalar = states.clone();
+        let mut previous: Option<Arc<FishS2DacBatchedHistory>> = None;
+        for step in 0..4 {
+            if step == 2 {
+                // The same rows in another order cannot reuse their lanes.
+                states.rotate_left(1);
+                scalar.rotate_left(1);
+            }
+            let codes = codes(step);
+            // The same push from each row's own tensors (concatenated):
+            // reusing the shared batch must give the same bits.
+            let mut unshared = states
+                .iter()
+                .map(|state| state.unshared().unwrap())
+                .collect::<Vec<_>>();
+            let concatenated = codec
+                .push_frames_batch(&mut unshared, &codes, &|| Ok(()))
+                .unwrap();
+            let actual = codec
+                .push_frames_batch(&mut states, &codes, &|| Ok(()))
+                .unwrap();
+            assert_eq!(actual, concatenated, "step {step}");
+            for (row, (state, codes)) in scalar.iter_mut().zip(&codes).enumerate() {
+                let expected = codec.push_frames(state, codes, &|| Ok(())).unwrap();
+                let error = crate::kernels::numeric_check::max_abs_diff(&actual[row], &expected);
+                assert!(error < 1e-5, "step {step} row {row}: {error}");
+            }
+            let (batch, _) = states[0].shared.as_ref().expect("a shared batch");
+            for (lane, state) in states.iter().enumerate() {
+                let (shared, shared_lane) = state.shared.as_ref().unwrap();
+                assert!(Arc::ptr_eq(shared, batch));
+                assert_eq!(*shared_lane, lane);
+                assert!(state.histories.is_empty() && state.attention.is_empty());
+                assert_eq!(
+                    state.retained_tensor_bytes(),
+                    scalar[lane].retained_tensor_bytes()
+                );
+            }
+            // Each push publishes a new batch; the last one is released.
+            if let Some(previous) = previous.take() {
+                assert!(!Arc::ptr_eq(&previous, batch));
+                assert_eq!(Arc::strong_count(&previous), 1);
+            }
+            previous = Some(batch.clone());
+        }
+        let alone = codes(9).swap_remove(1);
+        codec
+            .push_frames(&mut states[1], &alone, &|| Ok(()))
+            .unwrap();
+        assert!(states[1].shared.is_none() && !states[1].histories.is_empty());
     }
 }
