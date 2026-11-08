@@ -123,6 +123,9 @@ pub struct Maya2Depth {
 }
 
 fn linear(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    if x.device().is_cuda() {
+        return padded_group_linear(x, weight);
+    }
     // Each request's rows on their own: a matmul's kernel and tiles follow
     // its row count, so rows folded with another request's would round
     // differently from the same rows alone, and a request would sound
@@ -140,6 +143,39 @@ fn linear(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
     let inner = dims.pop().unwrap_or(0);
     let rows = dims.iter().product::<usize>();
     let out = x.reshape((rows, inner))?.matmul(&weight.t()?)?;
+    dims.push(weight.dim(0)?);
+    Ok(out.reshape(dims)?)
+}
+
+/// Rows per padded matmul on CUDA (as Maya 2's backbone and Maya1 pad).
+const DEPTH_ROW_GROUP: usize = super::backbone::MAX_DECODE_GROUP;
+
+/// `x` `[.., in]` · `weight`ᵀ with every request's rows in fixed groups of
+/// [`DEPTH_ROW_GROUP`], the last padded with zeros. Every call, a lone
+/// request's included, runs the same `[DEPTH_ROW_GROUP, in]` matmul shape,
+/// so each row rounds the same however many requests share the call, and N
+/// requests cost one launch per group instead of one per request (the
+/// per-request split ran 31 levels × 4 layers × N matmuls a frame).
+fn padded_group_linear(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    let mut dims = x.dims().to_vec();
+    let inner = dims.pop().unwrap_or(0);
+    let rows = dims.iter().product::<usize>();
+    let flat = x.reshape((rows, inner))?;
+    let weight_t = weight.t()?;
+    let mut groups = Vec::with_capacity(rows.div_ceil(DEPTH_ROW_GROUP).max(1));
+    let mut start = 0;
+    while start < rows {
+        let count = (rows - start).min(DEPTH_ROW_GROUP);
+        let group = flat.narrow(0, start, count)?;
+        let group = if count < DEPTH_ROW_GROUP {
+            group.pad_with_zeros(0, 0, DEPTH_ROW_GROUP - count)?
+        } else {
+            group.contiguous()?
+        };
+        groups.push(group.matmul(&weight_t)?.narrow(0, 0, count)?);
+        start += count;
+    }
+    let out = Tensor::cat(&groups, 0)?;
     dims.push(weight.dim(0)?);
     Ok(out.reshape(dims)?)
 }
@@ -483,6 +519,35 @@ impl Maya2Depth {
 #[cfg(test)]
 mod tests {
     use candle_nn::VarMap;
+
+    /// Each row of a grouped call equals the same row alone, inside the
+    /// first group and past it, and the shape is kept.
+    #[test]
+    fn padded_group_rows_match_each_row_alone() {
+        let device = candle_core::Device::Cpu;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 2001) as f32 / 1000.0 - 1.0
+        };
+        let (requests, positions, inner, outer) = (5, 9, 48, 40);
+        let x_values: Vec<f32> = (0..requests * positions * inner).map(|_| next()).collect();
+        let w_values: Vec<f32> = (0..outer * inner).map(|_| next()).collect();
+        let x = Tensor::from_vec(x_values, (requests, positions, inner), &device).unwrap();
+        let weight = Tensor::from_vec(w_values, (outer, inner), &device).unwrap();
+        let batched = super::padded_group_linear(&x, &weight).unwrap();
+        assert_eq!(batched.dims(), &[requests, positions, outer]);
+        let batched = batched.to_vec3::<f32>().unwrap();
+        for request in 0..requests {
+            let alone = super::padded_group_linear(&x.narrow(0, request, 1).unwrap(), &weight)
+                .unwrap()
+                .to_vec3::<f32>()
+                .unwrap();
+            assert_eq!(batched[request], alone[0], "request {request}");
+        }
+    }
 
     use super::*;
     use crate::models::architectures::maya2::sampling::depth_gumbel;
