@@ -5762,6 +5762,7 @@ mod tests {
             ModelFamily::Maya1Tts,
             ModelFamily::Maya2Tts,
             ModelFamily::ChatterboxTts,
+            ModelFamily::VoxtralTts,
         ] {
             assert!(stage_sets_batch_rows(family), "{family:?}");
         }

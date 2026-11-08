@@ -65,6 +65,16 @@ const _: () = assert!(
         >= crate::catalog::ModelVariant::VOXTRAL_TTS_CUDA_MAX_OUTPUT_FRAMES + 1_024
 );
 
+/// The rows every dense op of a retained decode frame runs at on CUDA: the
+/// acoustic step (semantic head and flow) and the LM feedback, spare rows
+/// zero. Candle picks a matmul's kernel and tiles from its row count, and
+/// each rounds a row's sums differently, so at one shape a seeded request
+/// decodes the same alone as beside other requests (Maya1 pads its decode
+/// the same way). Covers the widest decode an engine can step.
+pub(crate) const VOXTRAL_TTS_PADDED_ROWS: usize = 32;
+
+const _: () = assert!(VOXTRAL_TTS_PADDED_ROWS >= crate::catalog::EXPLICIT_WIDTH_CEILING);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoxtralTtsDTypePlan {
     pub language_model: DType,
@@ -540,6 +550,7 @@ impl VoxtralTtsModel {
             acoustic_transformer: &pipeline.acoustic_transformer,
             audio_embeddings: &pipeline.audio_embeddings,
             n_acoustic_codebook: self.config.multimodal.audio_model_args.n_acoustic_codebook,
+            padded_rows: pipeline.device.is_cuda().then_some(VOXTRAL_TTS_PADDED_ROWS),
         })
     }
 
@@ -858,6 +869,9 @@ struct VoxtralTtsDecodeParts<'a> {
     acoustic_transformer: &'a FlowMatchingAudioTransformer,
     audio_embeddings: &'a VoxtralAudioTokenEmbeddings,
     n_acoustic_codebook: usize,
+    /// Rows every dense op of a frame runs at ([`VOXTRAL_TTS_PADDED_ROWS`]
+    /// on CUDA); `None` runs each launch at its own rows.
+    padded_rows: Option<usize>,
 }
 
 /// Decode one frame for every row: one acoustic launch per compatible
@@ -914,14 +928,24 @@ fn decode_acoustic_cohorts(
             .enumerate()
             .filter_map(|(row, cache)| feedback[row].is_some().then_some(&mut **cache))
             .collect::<Vec<_>>();
-        let hidden = parts
-            .language_model
-            .forward_managed_decode_batch_hidden_with_embeds(
-                &embeds,
-                &positions,
-                &mut cache_refs,
-                None,
-            )?;
+        let hidden = match parts.padded_rows {
+            Some(rows) => parts
+                .language_model
+                .forward_managed_decode_batch_hidden_padded(
+                    &embeds,
+                    &positions,
+                    &mut cache_refs,
+                    rows,
+                )?,
+            None => parts
+                .language_model
+                .forward_managed_decode_batch_hidden_with_embeds(
+                    &embeds,
+                    &positions,
+                    &mut cache_refs,
+                    None,
+                )?,
+        };
         for (batch_row, &row) in feedback_rows.iter().enumerate() {
             let state = &mut states[row];
             state.lm_position += 1;
@@ -947,7 +971,8 @@ fn decode_acoustic_cohorts(
         } else {
             vec![feedback_rows.len()]
         },
-        scalar_lm_launches: usize::from(feedback_rows.len() == 1),
+        // A padded lone row takes the batched decode.
+        scalar_lm_launches: usize::from(feedback_rows.len() == 1 && parts.padded_rows.is_none()),
     })
 }
 
@@ -983,15 +1008,14 @@ fn decode_cohort_frames(
         parts.n_acoustic_codebook,
         hidden.device(),
     )?;
-    let generated = parts
-        .acoustic_transformer
-        .forward_audio_codes_with_feedback_tensor(
-            &hidden,
-            first.params.cfg_alpha,
-            first.params.n_decoding_steps,
-            !first.frames.is_empty(),
-            noise.as_ref(),
-        )?;
+    let generated = parts.acoustic_transformer.forward_audio_codes_padded(
+        &hidden,
+        first.params.cfg_alpha,
+        first.params.n_decoding_steps,
+        !first.frames.is_empty(),
+        noise.as_ref(),
+        parts.padded_rows,
+    )?;
     if generated.frames.len() != states.len() {
         return Err(Error::InferenceError(format!(
             "Voxtral TTS acoustic batch returned {} rows for width {}",
@@ -1942,6 +1966,7 @@ mod tests {
             acoustic_transformer: &acoustic,
             audio_embeddings: &embeddings,
             n_acoustic_codebook,
+            padded_rows: None,
         };
         let request = |prompt_len: usize, offset: usize, seed: u64| {
             let prompt = deterministic_embeds(prompt_len, offset, &device);
@@ -2037,6 +2062,139 @@ mod tests {
             .unwrap();
             assert_eq!(joined.acoustic_launch_widths, vec![2]);
             assert_eq!(joined.steps.len(), 2);
+        }
+    }
+
+    /// D3 on CUDA, forced on the CPU: with every dense op of a frame padded
+    /// to [`VOXTRAL_TTS_PADDED_ROWS`] rows, a seeded request's frames and LM
+    /// hidden states are bit-identical alone and beside other requests: on
+    /// its first frame beside a streaming row (two acoustic cohorts, one LM
+    /// launch), and in one cohort of three.
+    #[test]
+    fn padded_decode_rows_are_bit_identical_alone_and_in_mixed_batches() {
+        use crate::models::architectures::voxtral::lm::tests::{
+            deterministic_embeds, shared_decode_caches,
+        };
+        use crate::models::architectures::voxtral::tts::retained::VoxtralTtsPreparedArtifact;
+
+        const FRAMES: usize = 5;
+        let device = Device::Cpu;
+        let (lm, acoustic, embeddings, n_acoustic_codebook) = tiny_decode_parts(&device);
+        let parts = VoxtralTtsDecodeParts {
+            language_model: &lm,
+            acoustic_transformer: &acoustic,
+            audio_embeddings: &embeddings,
+            n_acoustic_codebook,
+            padded_rows: Some(VOXTRAL_TTS_PADDED_ROWS),
+        };
+        // (prompt tokens, embedding offset, seed)
+        let specs = [(5usize, 3usize, 11u64), (3, 17, 29), (4, 9, 41)];
+        let request = |&(prompt_len, offset, seed): &(usize, usize, u64)| {
+            let prompt = deterministic_embeds(prompt_len, offset, &device);
+            VoxtralTtsRetainedState::new(
+                Arc::new(VoxtralTtsPreparedArtifact {
+                    prompt_embeddings: prompt,
+                    prompt_tokens: prompt_len,
+                    source_text: Arc::from("hello"),
+                    voice: Arc::from("default"),
+                    retained_resident_bytes: 64,
+                }),
+                VoxtralTtsGenerationParams {
+                    max_frames: FRAMES + 1,
+                    seed,
+                    ..Default::default()
+                },
+                16,
+            )
+            .unwrap()
+        };
+        let hidden_bits = |state: &VoxtralTtsRetainedState| {
+            state
+                .last_hidden
+                .as_ref()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        let (_, mut caches) = shared_decode_caches(2 * specs.len(), 983, 8);
+        let mut solo_caches = caches.split_off(specs.len());
+        let mut states = specs.iter().map(request).collect::<Vec<_>>();
+        let mut solo_states = specs.iter().map(request).collect::<Vec<_>>();
+        for (states, caches) in [
+            (&mut states, &mut caches),
+            (&mut solo_states, &mut solo_caches),
+        ] {
+            prefill_cohort_spans(
+                &lm,
+                &mut states.iter_mut().collect::<Vec<_>>(),
+                &mut caches.iter_mut().collect::<Vec<_>>(),
+                &specs.map(|(prompt_len, _, _)| prompt_len),
+            )
+            .unwrap();
+        }
+        // Rows still decoding with fewer than FRAMES frames, among `rows`.
+        type Trace = Vec<(VoxtralTtsDecodeStep, Vec<u32>)>;
+        let open = |states: &[VoxtralTtsRetainedState], rows: &[usize], traces: &[Trace]| {
+            rows.iter()
+                .copied()
+                .filter(|&row| {
+                    states[row].phase == VoxtralTtsRetainedPhase::Decode
+                        && traces[row].len() < FRAMES
+                })
+                .collect::<Vec<usize>>()
+        };
+        // One frame for `rows`; each row's step and hidden state go to its
+        // trace.
+        let decode = |states: &mut [VoxtralTtsRetainedState],
+                      caches: &mut [PhysicalPagedKvCache],
+                      rows: &[usize],
+                      traces: &mut [Trace]| {
+            let mut state_refs = states
+                .iter_mut()
+                .enumerate()
+                .filter(|(row, _)| rows.contains(row))
+                .map(|(_, state)| state)
+                .collect::<Vec<_>>();
+            let mut cache_refs = caches
+                .iter_mut()
+                .enumerate()
+                .filter(|(row, _)| rows.contains(row))
+                .map(|(_, cache)| cache)
+                .collect::<Vec<_>>();
+            let batch = decode_acoustic_cohorts(parts, &mut state_refs, &mut cache_refs).unwrap();
+            drop((state_refs, cache_refs));
+            for (&row, step) in rows.iter().zip(batch.steps.iter().cloned()) {
+                traces[row].push((step, hidden_bits(&states[row])));
+            }
+            batch
+        };
+
+        let mut solo = vec![Vec::new(); specs.len()];
+        for row in 0..specs.len() {
+            while !open(&solo_states, &[row], &solo).is_empty() {
+                decode(&mut solo_states, &mut solo_caches, &[row], &mut solo);
+            }
+        }
+        let mut mixed = vec![Vec::new(); specs.len()];
+        // The first request streams a frame alone; the others join it on
+        // their first frame (their own cohort), then all share one.
+        decode(&mut states, &mut caches, &[0], &mut mixed);
+        let joined = decode(&mut states, &mut caches, &[0, 1, 2], &mut mixed);
+        assert_eq!(joined.acoustic_launch_widths, vec![1, 2]);
+        assert_eq!(joined.scalar_lm_launches, 0);
+        loop {
+            let rows = open(&states, &[0, 1, 2], &mixed);
+            if rows.is_empty() {
+                break;
+            }
+            decode(&mut states, &mut caches, &rows, &mut mixed);
+        }
+        assert!(solo.iter().all(|trace| trace.len() >= 2), "{solo:?}");
+        for (row, (mixed, solo)) in mixed.iter().zip(&solo).enumerate() {
+            assert_eq!(mixed, solo, "request {row}");
         }
     }
 

@@ -323,6 +323,31 @@ impl FlowMatchingAudioTransformer {
         allow_end_audio: bool,
         initial_noise: Option<&Tensor>,
     ) -> Result<VoxtralGeneratedAudioCodes> {
+        self.forward_audio_codes_padded(
+            llm_hidden,
+            cfg_alpha,
+            n_decoding_steps,
+            allow_end_audio,
+            initial_noise,
+            None,
+        )
+    }
+
+    /// [`Self::forward_audio_codes_with_feedback_tensor`] with the frame's
+    /// dense ops (the semantic head and the whole flow) over `padded_rows`
+    /// rows when given, the spare rows zero (zero noise too): every matmul
+    /// sees one shape however many rows share the frame, so a row's codes
+    /// never depend on the rows beside it. The codes are picked for the real
+    /// rows only. More rows than `padded_rows` run unpadded.
+    pub(crate) fn forward_audio_codes_padded(
+        &self,
+        llm_hidden: &Tensor,
+        cfg_alpha: f32,
+        n_decoding_steps: usize,
+        allow_end_audio: bool,
+        initial_noise: Option<&Tensor>,
+        padded_rows: Option<usize>,
+    ) -> Result<VoxtralGeneratedAudioCodes> {
         let llm_hidden = match llm_hidden.rank() {
             1 => llm_hidden.unsqueeze(0)?,
             2 => llm_hidden.clone(),
@@ -340,8 +365,22 @@ impl FlowMatchingAudioTransformer {
             )));
         }
 
+        let rows = llm_hidden.dim(0)?;
+        let spare = padded_rows
+            .filter(|&padded| padded >= rows)
+            .map_or(0, |padded| padded - rows);
+        let llm_hidden = if spare > 0 {
+            llm_hidden.pad_with_zeros(0, 0, spare)?
+        } else {
+            llm_hidden
+        };
         let semantic_logits = linear_forward_last_dim(&self.semantic_codebook_output, &llm_hidden)
             .map_err(|err| Error::InferenceError(format!("semantic projection failed: {err}")))?;
+        let semantic_logits = if spare > 0 {
+            semantic_logits.narrow(0, 0, rows)?
+        } else {
+            semantic_logits
+        };
         if llm_hidden.device().is_cuda() {
             return self
                 .packed_frame(
@@ -396,6 +435,8 @@ impl FlowMatchingAudioTransformer {
         })
     }
 
+    /// The acoustic codes of `semantic_codes`' rows, the first rows of
+    /// `llm_hidden` (see [`Self::flow_state_rows`]).
     fn decode_one_frame(
         &self,
         semantic_codes: &[u32],
@@ -404,13 +445,45 @@ impl FlowMatchingAudioTransformer {
         n_decoding_steps: usize,
         initial_noise: Option<&Tensor>,
     ) -> Result<DecodedAcousticCodes> {
-        let sampled = self.initial_flow_state(semantic_codes.len(), llm_hidden, initial_noise)?;
-        let sampled = self.integrate_flow(sampled, llm_hidden, cfg_alpha, n_decoding_steps)?;
+        let sampled = self.flow_state_rows(
+            llm_hidden,
+            semantic_codes.len(),
+            cfg_alpha,
+            n_decoding_steps,
+            initial_noise,
+        )?;
         shifted_acoustic_codes_from_sampled_tensor(
             &sampled,
             semantic_codes,
             self.generation.acoustic_codebook_size,
         )
+    }
+
+    /// The integrated flow state of the first `rows` rows of `llm_hidden`,
+    /// the flow run over every row of it: `initial_noise` (`[rows,
+    /// n_acoustic_codebooks]`) gets zero rows for the spare ones, and with no
+    /// noise every row draws device `randn`.
+    fn flow_state_rows(
+        &self,
+        llm_hidden: &Tensor,
+        rows: usize,
+        cfg_alpha: f32,
+        n_decoding_steps: usize,
+        initial_noise: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let dense = llm_hidden.dim(0)?;
+        let noise = match initial_noise {
+            Some(noise) if dense > rows && noise.dim(0)? == rows => {
+                Some(noise.pad_with_zeros(0, 0, dense - rows)?)
+            }
+            noise => noise.cloned(),
+        };
+        let sampled = self.initial_flow_state(dense, llm_hidden, noise.as_ref())?;
+        let sampled = self.integrate_flow(sampled, llm_hidden, cfg_alpha, n_decoding_steps)?;
+        if dense > rows {
+            return Ok(sampled.narrow(0, 0, rows)?);
+        }
+        Ok(sampled)
     }
 
     /// The flow's starting state for `batch` rows: `initial_noise` when given
@@ -452,12 +525,18 @@ impl FlowMatchingAudioTransformer {
         allow_end_audio: bool,
         initial_noise: Option<&Tensor>,
     ) -> Result<VoxtralGeneratedAudioCodes> {
-        let batch = llm_hidden.dim(0)?;
+        // `llm_hidden` may carry spare rows past the logits' rows.
+        let batch = semantic_logits.dim(0)?;
         let allowed = (self.generation.semantic_codebook_size + AUDIO_SPECIAL_TOKEN_COUNT as usize)
             .min(semantic_logits.dim(1)?);
         let (indices, scores) = semantic_argmax_tensors(semantic_logits, allowed, allow_end_audio)?;
-        let sampled = self.initial_flow_state(batch, llm_hidden, initial_noise)?;
-        let sampled = self.integrate_flow(sampled, llm_hidden, cfg_alpha, n_decoding_steps)?;
+        let sampled = self.flow_state_rows(
+            llm_hidden,
+            batch,
+            cfg_alpha,
+            n_decoding_steps,
+            initial_noise,
+        )?;
         let acoustic =
             shifted_acoustic_code_tensor(&sampled, self.generation.acoustic_codebook_size)?;
         let packed = Tensor::cat(
@@ -1606,6 +1685,110 @@ pub(crate) mod tests {
             .unwrap();
         // dim 4: half 2, inv_freq[1] = 10000^(-1/2).
         assert!((inv_freq[1] - 0.01).abs() < 1e-7, "{inv_freq:?}");
+    }
+
+    /// A transformer of width `dim` (its LLM input too) and `layers` layers,
+    /// with xorshift weights: wide enough that a matmul's row count changes
+    /// how the CPU rounds a row.
+    pub(crate) fn sized_acoustic_transformer(
+        dim: usize,
+        layers: usize,
+        device: &Device,
+    ) -> FlowMatchingAudioTransformer {
+        use crate::kernels::numeric_check::xorshift_tensor;
+
+        let mut config = tiny_acoustic_config();
+        let args = &mut config.multimodal.audio_model_args.acoustic_transformer_args;
+        (args.dim, args.input_dim, args.hidden_dim) = (dim, dim, 2 * dim);
+        (args.n_heads, args.n_kv_heads, args.head_dim) = (4, 2, dim / 4);
+        args.n_layers = layers;
+        let (heads, kv) = (4 * (dim / 4), 2 * (dim / 4));
+        let codebooks = config.n_acoustic_codebooks();
+        let mut shapes = [
+            ("input_projection", vec![dim, codebooks]),
+            ("time_projection", vec![dim, dim]),
+            ("llm_projection", vec![dim, dim]),
+            ("semantic_codebook_output", vec![128, dim]),
+            ("acoustic_codebook_output", vec![codebooks, dim]),
+            ("norm", vec![dim]),
+        ]
+        .map(|(name, shape)| (name.to_string(), shape))
+        .to_vec();
+        for layer in 0..layers {
+            shapes.extend(
+                [
+                    ("attention.wq", vec![heads, dim]),
+                    ("attention.wk", vec![kv, dim]),
+                    ("attention.wv", vec![kv, dim]),
+                    ("attention.wo", vec![dim, heads]),
+                    ("feed_forward.w1", vec![2 * dim, dim]),
+                    ("feed_forward.w2", vec![dim, 2 * dim]),
+                    ("feed_forward.w3", vec![2 * dim, dim]),
+                    ("attention_norm", vec![dim]),
+                    ("ffn_norm", vec![dim]),
+                ]
+                .map(|(part, shape)| (format!("layers.{layer}.{part}"), shape)),
+            );
+        }
+        let tensors = shapes
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, shape))| {
+                let tensor = if name.ends_with("norm") {
+                    Tensor::ones(shape, DType::F32, device).unwrap()
+                } else {
+                    xorshift_tensor(&shape, 0xACE5 + index as u64, 0.3, device).unwrap()
+                };
+                (format!("{name}.weight"), tensor)
+            })
+            .collect::<HashMap<_, _>>();
+        FlowMatchingAudioTransformer::load(
+            &config,
+            VarBuilder::from_tensors(tensors, DType::F32, device),
+        )
+        .unwrap()
+    }
+
+    /// D3: with the frame's dense ops padded to 32 rows, a row's flow state
+    /// and codes are bit-identical alone and at any position of a batch.
+    #[test]
+    fn padded_frames_are_bit_identical_alone_and_in_a_batch() {
+        use crate::kernels::numeric_check::xorshift_tensor;
+
+        let device = Device::Cpu;
+        let padded_rows = Some(32);
+        let transformer = sized_acoustic_transformer(64, 2, &device);
+        let hidden = xorshift_tensor(&[3, 64], 0xD3, 1.0, &device).unwrap();
+        let noise = xorshift_tensor(&[3, 2], 0xD4, 1.0, &device).unwrap();
+        let frame = |rows: &[u32]| {
+            let ids = Tensor::from_vec(rows.to_vec(), rows.len(), &device).unwrap();
+            let hidden = hidden.index_select(&ids, 0).unwrap();
+            let noise = noise.index_select(&ids, 0).unwrap();
+            let dense = match padded_rows {
+                Some(padded) => hidden.pad_with_zeros(0, 0, padded - rows.len()).unwrap(),
+                None => hidden.clone(),
+            };
+            let state = transformer
+                .flow_state_rows(&dense, rows.len(), 1.2, 7, Some(&noise))
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(|row| row.into_iter().map(f32::to_bits).collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            let codes = transformer
+                .forward_audio_codes_padded(&hidden, 1.2, 7, true, Some(&noise), padded_rows)
+                .unwrap()
+                .frames;
+            (state, codes)
+        };
+        let order = [2u32, 0, 1];
+        let (states, codes) = frame(&order);
+        for (position, &row) in order.iter().enumerate() {
+            let (alone_state, alone_codes) = frame(&[row]);
+            assert_eq!(alone_state[0], states[position], "row {row} state");
+            assert_eq!(alone_codes[0], codes[position], "row {row} codes");
+        }
     }
 
     pub(crate) fn tiny_acoustic_config() -> VoxtralTtsConfig {

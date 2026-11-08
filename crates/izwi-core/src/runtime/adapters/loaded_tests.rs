@@ -3776,6 +3776,7 @@ fn batched_tts_families_decode_at_the_tts_width_and_prefill_at_the_engine_rows()
         (ModelVariant::Maya13B, 8),
         (ModelVariant::Maya2Native25B, 8),
         (ModelVariant::Chatterbox500M, 8),
+        (ModelVariant::Voxtral4BTts2603, 8),
     ] {
         assert_eq!(
             registry.tts_decode_width(variant.family(), BackendKind::Cuda),
@@ -3801,7 +3802,6 @@ fn batched_tts_families_decode_at_the_tts_width_and_prefill_at_the_engine_rows()
     for variant in [
         ModelVariant::Kokoro82M,
         ModelVariant::FishAudioS2Pro,
-        ModelVariant::Voxtral4BTts2603,
         ModelVariant::VibeVoice15BTts,
     ] {
         assert_eq!(

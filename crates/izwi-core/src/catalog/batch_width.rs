@@ -158,8 +158,9 @@ pub(crate) const fn asr_decode_width(
 /// whose decode steps every row in one launch per op on CUDA, padded to one
 /// row-invariant shape so a request sounds the same at any width (Qwen3-TTS's
 /// talker and code predictor, Maya1's and Maya 2's backbones and Maya 2's
-/// depth groups, Chatterbox's T3); the non-chat rows for every other family
-/// and backend. Never below the non-chat rows.
+/// depth groups, Chatterbox's T3, Voxtral TTS's LM feedback and acoustic
+/// flow); the non-chat rows for every other family and backend. Never below
+/// the non-chat rows.
 ///
 /// H100 (`e8f189691`): every Qwen3-TTS variant stayed at ~5 audio-s/s from 8
 /// to 64 streams, the width of eight; Maya 2 at ~5.2 from 16 streams.
@@ -175,7 +176,8 @@ pub(crate) const fn tts_decode_width(
             ModelFamily::Qwen3Tts
             | ModelFamily::Maya1Tts
             | ModelFamily::Maya2Tts
-            | ModelFamily::ChatterboxTts,
+            | ModelFamily::ChatterboxTts
+            | ModelFamily::VoxtralTts,
         ) => CUDA_MAX_WIDTH,
         _ => non_chat_width,
     };

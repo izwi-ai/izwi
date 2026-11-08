@@ -278,7 +278,7 @@ impl VoxtralLM {
         caches: &mut [&mut PhysicalPagedKvCache],
         ada: Option<&VoxtralAdaScales>,
     ) -> Result<Tensor> {
-        self.forward_managed_decode_batch_impl(embeds, start_positions, caches, ada, true)
+        self.forward_managed_decode_batch_impl(embeds, start_positions, caches, ada, true, None)
     }
 
     /// Decode one embedded token per retained row and return the normalized
@@ -290,7 +290,31 @@ impl VoxtralLM {
         caches: &mut [&mut PhysicalPagedKvCache],
         ada: Option<&VoxtralAdaScales>,
     ) -> Result<Tensor> {
-        self.forward_managed_decode_batch_impl(embeds, start_positions, caches, ada, false)
+        self.forward_managed_decode_batch_impl(embeds, start_positions, caches, ada, false, None)
+    }
+
+    /// [`Self::forward_managed_decode_batch_hidden_with_embeds`] with every
+    /// dense op (projections, norms, MLP) at `padded_rows` rows, the spare
+    /// rows zero, and a lone row through the same batched decode: a row's
+    /// matmuls see one shape however many rows share the step, so its hidden
+    /// state never depends on the rows beside it. Attention runs on the real
+    /// rows, each reading its own cache. More rows than `padded_rows` decode
+    /// unpadded.
+    pub(crate) fn forward_managed_decode_batch_hidden_padded(
+        &self,
+        embeds: &Tensor,
+        start_positions: &[usize],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        padded_rows: usize,
+    ) -> Result<Tensor> {
+        self.forward_managed_decode_batch_impl(
+            embeds,
+            start_positions,
+            caches,
+            None,
+            false,
+            Some(padded_rows),
+        )
     }
 
     fn forward_managed_decode_batch_impl(
@@ -300,6 +324,7 @@ impl VoxtralLM {
         caches: &mut [&mut PhysicalPagedKvCache],
         ada: Option<&VoxtralAdaScales>,
         project_logits: bool,
+        padded_rows: Option<usize>,
     ) -> Result<Tensor> {
         let (batch_size, sequence_len, hidden_size) = embeds.dims3()?;
         if batch_size == 0
@@ -314,7 +339,8 @@ impl VoxtralLM {
                 embeds.dims()
             )));
         }
-        if batch_size == 1 {
+        let padded_rows = padded_rows.filter(|&rows| rows >= batch_size);
+        if batch_size == 1 && padded_rows.is_none() {
             return if project_logits {
                 self.forward_managed_with_embeds(embeds, start_positions[0], caches[0], None, ada)
             } else {
@@ -410,7 +436,14 @@ impl VoxtralLM {
                 KvWriteCompletionCollector::new(arena.config(), lowered.logical_slots())?;
             let layer_result = (|| -> Result<Tensor> {
                 let rope = LmRopeTables::with_positions(&self.rope_positions);
-                let mut x = embeds.clone();
+                // Spare rows ride through every dense op; attention reads
+                // only the real rows.
+                let mut x = match padded_rows {
+                    Some(rows) if rows > batch_size => {
+                        embeds.pad_with_zeros(0, 0, rows - batch_size)?
+                    }
+                    _ => embeds.clone(),
+                };
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     let cache_refs = caches
                         .iter()
@@ -429,11 +462,15 @@ impl VoxtralLM {
                     )?;
                 }
                 let hidden = self.norm.forward(&x)?;
-                if project_logits {
-                    self.logits_from_hidden(&hidden)
+                let output = if project_logits {
+                    self.logits_from_hidden(&hidden)?
                 } else {
-                    Ok(hidden)
+                    hidden
+                };
+                if output.dim(0)? > batch_size {
+                    return Ok(output.narrow(0, 0, batch_size)?);
                 }
+                Ok(output)
             })();
             let logits = match layer_result {
                 Ok(logits) => logits,
@@ -789,10 +826,14 @@ impl VoxtralAttention {
         layer_idx: usize,
         rope: &LmRopeTables,
     ) -> Result<Tensor> {
-        let (batch, sequence_len, _) = x.dims3()?;
+        // `x` may carry spare zero rows past the batch's (see
+        // `forward_managed_decode_batch_hidden_padded`): the projections run
+        // over every row, attention over the real ones.
+        let (padded, sequence_len, _) = x.dims3()?;
+        let batch = start_positions.len();
         if batch == 0
+            || batch > padded
             || sequence_len != 1
-            || start_positions.len() != batch
             || caches.len() != batch
             || metadata.sequences.len() != batch
         {
@@ -817,24 +858,17 @@ impl VoxtralAttention {
             ));
         }
 
-        let mut q = linear_forward_last_dim(&self.q_proj, x)?.reshape((
-            batch,
-            1,
-            self.num_heads,
-            self.head_dim,
-        ))?;
-        let mut k = linear_forward_last_dim(&self.k_proj, x)?.reshape((
-            batch,
-            1,
-            self.num_kv_heads,
-            self.head_dim,
-        ))?;
-        let v = linear_forward_last_dim(&self.v_proj, x)?.reshape((
-            batch,
-            1,
-            self.num_kv_heads,
-            self.head_dim,
-        ))?;
+        let rows = |projection: &Linear| -> Result<Tensor> {
+            let projected = linear_forward_last_dim(projection, x)?;
+            Ok(if padded > batch {
+                projected.narrow(0, 0, batch)?
+            } else {
+                projected
+            })
+        };
+        let mut q = rows(&self.q_proj)?.reshape((batch, 1, self.num_heads, self.head_dim))?;
+        let mut k = rows(&self.k_proj)?.reshape((batch, 1, self.num_kv_heads, self.head_dim))?;
+        let v = rows(&self.v_proj)?.reshape((batch, 1, self.num_kv_heads, self.head_dim))?;
         q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, 1)?;
         k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, 1)?;
 
@@ -891,6 +925,11 @@ impl VoxtralAttention {
         completions.collect(completion)?;
         record_decode_attention_path(DecodeAttentionPath::Paged);
         let out = out.reshape((batch, 1, self.num_heads * self.head_dim))?;
+        let out = if padded > batch {
+            out.pad_with_zeros(0, 0, padded - batch)?
+        } else {
+            out
+        };
         linear_forward_last_dim(&self.o_proj, &out)
     }
 

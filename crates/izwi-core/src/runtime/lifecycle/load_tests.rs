@@ -4327,6 +4327,7 @@ fn tts_staged_rows_cover_the_tts_decode_width() {
     for variant in [
         ModelVariant::Maya13B,
         ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+        ModelVariant::Voxtral4BTts2603,
     ] {
         assert_eq!(
             lifecycle.tts_staged_rows(&draft(32, variant)).unwrap(),
