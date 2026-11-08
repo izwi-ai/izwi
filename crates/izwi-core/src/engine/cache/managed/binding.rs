@@ -251,13 +251,21 @@ pub(super) fn ensure_capacity_claim(
         .ok_or_else(|| Error::Overloaded("request token capacity demand overflowed".into()))?;
     let requested_tokens = u64::try_from(requested_tokens)
         .map_err(|_| Error::Overloaded("request token capacity demand exceeds u64".into()))?;
-
+    // An arena pooled across rows holds more than one context; a request
+    // still retains at most one (a sliding window rotates within its own).
+    let sequence_tokens = state.runtime.maximum_sequence_tokens();
     let mut requested_by_arena = HashMap::<KvArenaId, u64>::new();
     for group in &state.runtime.plan.groups {
         let window_tokens = sliding_window_for_domain(&state.contract, group.domain)?
             .map(u64::from)
             .unwrap_or(requested_tokens);
         let retained_tokens = requested_tokens.min(window_tokens);
+        if retained_tokens > sequence_tokens {
+            return Err(Error::Overloaded(format!(
+                "request {} needs {retained_tokens} retained prompt-plus-output tokens, but one sequence holds at most {sequence_tokens}",
+                request.id
+            )));
+        }
         let required_pages = retained_tokens.div_ceil(u64::from(group.page_tokens));
         let requested = requested_by_arena.entry(group.arena).or_default();
         *requested = requested.saturating_add(required_pages);

@@ -368,7 +368,7 @@ impl ModelLifecycleController {
                 }
             };
             self.model_registry
-                .publish_effective_context(variant, retained.logical_token_reach())?;
+                .publish_effective_context(variant, retained.maximum_sequence_tokens())?;
             self.model_registry.publish_kv_storage(variant, &retained);
             crate::runtime::rollout::validate_managed_state_plan_eligibility(
                 variant,

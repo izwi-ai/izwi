@@ -1012,4 +1012,105 @@ impl ManagedKvCacheManager {
                 authority.snapshot().physical.capacity.device_bytes
             })
     }
+
+    /// The logical token reach of a retained (ASR/TTS) CUDA arena: as many
+    /// whole `per_sequence_tokens` contexts as `capacity`'s retained rows,
+    /// at most what fits `budget_fraction` of planning headroom at the
+    /// arena's load-time peak (its steady maximum plus the largest
+    /// contiguous replacement while it grows), and never fewer than one.
+    ///
+    /// The arena's pages are its reach divided by the page size, shared by
+    /// every row. A reach of one context let a single request's
+    /// prompt-plus-output claim most of the arena, so a model ran one
+    /// request at a time (Maya1 on the H100: each request waited out the
+    /// whole of the one before it).
+    pub(crate) fn fit_cuda_retained_pool_tokens(
+        &self,
+        model_instance: ModelInstanceId,
+        contract: &InferenceStateContract,
+        per_sequence_tokens: u64,
+        capacity: ManagedStateCapacityRequest,
+        page_tokens_hint: usize,
+        budget_fraction: f64,
+    ) -> Result<u64> {
+        let rows = u64::from(capacity.retained_sequence_rows);
+        if self.worker_backend != BackendKind::Cuda || per_sequence_tokens == 0 || rows <= 1 {
+            return Ok(per_sequence_tokens);
+        }
+        let Some(authority) = self.resource_authority.as_ref() else {
+            return Ok(per_sequence_tokens);
+        };
+        let ResourceAmount::Known(headroom_bytes) =
+            authority.planning_headroom_bytes(BackendKind::Cuda)?
+        else {
+            return Ok(per_sequence_tokens);
+        };
+        let budget_bytes = (headroom_bytes as f64 * budget_fraction.clamp(0.0, 1.0)) as u64;
+        let page_tokens_hint = u32::try_from(page_tokens_hint)
+            .map_err(|_| Error::InvalidInput("managed KV page size exceeds u32".into()))?;
+        let state_plan = negotiate_state_plan(
+            contract,
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cuda,
+                device_ordinal: self.worker_device_ordinal,
+                page_tokens_hint: Some(page_tokens_hint),
+                storage_dtype_hint: None,
+            },
+        )?;
+        let prefix_snapshot_rows = self.prefix_snapshot_rows_for(contract);
+        let peak_bytes = |sequences: u64| -> Result<u64> {
+            let reach = per_sequence_tokens
+                .checked_mul(sequences)
+                .ok_or_else(|| Error::ModelLoadError("CUDA retained pool overflow".into()))?;
+            let (allocation, _) = plan_managed_state_capacity_with_policy(
+                &state_plan,
+                model_instance,
+                ManagedStateCapacityRequest {
+                    logical_token_reach: Some(reach),
+                    ..capacity
+                },
+                false,
+                prefix_snapshot_rows,
+            )?;
+            let plan = ResolvedKvPlan::from_runtime_allocation(
+                self.next_arena_generation,
+                &state_plan,
+                &allocation,
+            )?;
+            let steady = managed_state_resources(
+                BackendKind::Cuda,
+                allocation.maximum_resources(&state_plan)?,
+            )?;
+            match cuda_managed_state_peak_authorization(steady, &plan.groups)?.device_bytes {
+                ResourceAmount::Known(bytes) => Ok(bytes),
+                ResourceAmount::Unknown => Err(Error::ModelLoadError(
+                    "CUDA retained pool has an unknown peak".into(),
+                )),
+            }
+        };
+        Ok(per_sequence_tokens * fit_pool_sequences(rows, budget_bytes, peak_bytes)?)
+    }
+}
+
+/// The most whole sequences, from 1 to `rows`, whose `peak_bytes` fit
+/// `budget_bytes`; 1 when even one does not (the load then decides, as it
+/// did for a one-context arena). `peak_bytes` must grow with the count.
+pub(super) fn fit_pool_sequences(
+    rows: u64,
+    budget_bytes: u64,
+    peak_bytes: impl Fn(u64) -> Result<u64>,
+) -> Result<u64> {
+    if rows <= 1 || peak_bytes(1)? > budget_bytes {
+        return Ok(1);
+    }
+    let (mut low, mut high) = (1_u64, rows);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if peak_bytes(middle)? <= budget_bytes {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Ok(low)
 }

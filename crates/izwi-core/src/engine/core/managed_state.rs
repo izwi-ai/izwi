@@ -388,6 +388,20 @@ impl EngineCore {
         {
             return Ok(runtime);
         }
+        // The arena's pages are its logical reach divided by the page size,
+        // shared by every row, so a one-context reach ran a model one request
+        // at a time once a request's prompt-plus-output claim took most of it
+        // (Maya1). As for chat, the arena pools a context per sequence the
+        // memory holds, and each request is held to one context (below).
+        // Single-user portable state keeps one context: its arena is
+        // resident from load.
+        let pool_context = logical_context_tokens.map(|context| {
+            if self.config.portable_context_auto && backend != BackendKind::Cuda {
+                portable_pool_tokens(context, self.config.max_num_seqs)
+            } else {
+                context
+            }
+        });
         // ASR and TTS retained state fit within live memory so the requests
         // they serve can run beside them; the floor is admitted against
         // planning headroom.
@@ -395,7 +409,7 @@ impl EngineCore {
             backend,
             model_instance,
             retained_state,
-            logical_context_tokens,
+            pool_context,
             portable_state_copies,
             (retained_rows, staged_rows),
             PortableFitHeadroom::Live {
@@ -404,24 +418,48 @@ impl EngineCore {
                 later_minimum_bytes,
             },
         )?;
+        let mut capacity = ManagedStateCapacityRequest {
+            total_paged_pages: u32::try_from(self.config.max_blocks)
+                .map_err(|_| Error::InvalidInput("managed KV page budget exceeds u32".into()))?,
+            logical_token_reach,
+            retained_sequence_rows: u32::try_from(retained_rows).map_err(|_| {
+                Error::InvalidInput("managed state sequence limit exceeds u32".into())
+            })?,
+            staged_transaction_rows: u32::try_from(staged_rows).map_err(|_| {
+                Error::InvalidInput("managed state transaction limit exceeds u32".into())
+            })?,
+        };
+        if backend == BackendKind::Cuda {
+            if let Some(per_sequence) = logical_token_reach {
+                capacity.logical_token_reach =
+                    Some(self.managed_kv_cache.fit_cuda_retained_pool_tokens(
+                        model_instance,
+                        retained_state,
+                        per_sequence,
+                        capacity,
+                        self.config.block_size,
+                        self.config.cuda_state_budget_fraction,
+                    )?);
+            }
+        }
         let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
             model_instance,
             backend,
-            ManagedStateCapacityRequest {
-                total_paged_pages: u32::try_from(self.config.max_blocks).map_err(|_| {
-                    Error::InvalidInput("managed KV page budget exceeds u32".into())
-                })?,
-                logical_token_reach,
-                retained_sequence_rows: u32::try_from(retained_rows).map_err(|_| {
-                    Error::InvalidInput("managed state sequence limit exceeds u32".into())
-                })?,
-                staged_transaction_rows: u32::try_from(staged_rows).map_err(|_| {
-                    Error::InvalidInput("managed state transaction limit exceeds u32".into())
-                })?,
-            },
+            capacity,
             self.config.block_size,
             retained_state,
         )?;
+        if let Some(context) = logical_context_tokens {
+            // CUDA's per-sequence context was already bounded by the
+            // configured maximum (`resolve_managed_token_reach`).
+            let context = if backend == BackendKind::Cuda {
+                context.min(self.config.max_seq_len)
+            } else {
+                context
+            };
+            runtime
+                .set_maximum_sequence_tokens((context as u64).min(runtime.logical_token_reach()));
+        }
         runtime.synchronize_backing()?;
         Ok(runtime)
     }

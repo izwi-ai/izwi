@@ -6400,3 +6400,56 @@ fn cuda_arena_accounting_is_guarded_while_cpu_and_metal_are_advisory() {
         .is_err()
     );
 }
+
+/// A retained (ASR/TTS) CUDA arena pools the most whole contexts whose
+/// load-time peak fits the budget, at most its rows and at least one.
+#[test]
+fn retained_pool_fits_whole_sequences_within_rows_and_budget() {
+    let peak = |sequences: u64| Ok(sequences * 300 + 50);
+    assert_eq!(fit_pool_sequences(32, 10_000, peak).unwrap(), 32);
+    assert_eq!(fit_pool_sequences(32, 2_000, peak).unwrap(), 6);
+    assert_eq!(fit_pool_sequences(32, 349, peak).unwrap(), 1);
+    assert_eq!(fit_pool_sequences(32, 100, peak).unwrap(), 1);
+    assert_eq!(fit_pool_sequences(1, 10_000, peak).unwrap(), 1);
+}
+
+/// An arena pooled across rows admits several full-context requests at once
+/// (a one-context arena ran Maya1 one request at a time), and still refuses
+/// one request larger than a single context.
+#[test]
+fn pooled_arena_admits_concurrent_contexts_but_not_an_oversized_request() {
+    let model = ModelInstanceId::new(431);
+    let mut manager = ManagedKvCacheManager::default();
+    let runtime = manager
+        .bind_request(
+            model,
+            BackendKind::Cpu,
+            8,
+            16,
+            &CacheCapability::Managed(test_contract()),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(runtime.logical_token_reach(), 128);
+    runtime.set_maximum_sequence_tokens(32);
+    let request = |max_tokens| {
+        let mut request = EngineCoreRequest::asr_bytes(Vec::new());
+        request.params.max_tokens = max_tokens;
+        request
+    };
+    let full = request(32 - request(0).num_prompt_tokens());
+    let state = manager.models.get_mut(&model).unwrap();
+    for row in 0..4 {
+        let session = SessionKey::new(format!("pooled-{row}"), 1);
+        assert!(
+            ensure_capacity_claim(state, &session, &full).unwrap(),
+            "row {row}"
+        );
+    }
+    let oversized = request(33 - request(0).num_prompt_tokens());
+    let session = SessionKey::new("pooled-oversized".into(), 1);
+    assert!(matches!(
+        ensure_capacity_claim(state, &session, &oversized),
+        Err(Error::Overloaded(message)) if message.contains("one sequence holds at most 32")
+    ));
+}

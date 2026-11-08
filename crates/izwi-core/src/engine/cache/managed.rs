@@ -72,8 +72,8 @@ use binding::{
 use capacity::{
     cuda_contiguous_replacement_peak_pages, cuda_contiguous_replacement_required_bytes,
     cuda_largest_contiguous_replacement_extra, cuda_resident_required_bytes,
-    fit_cuda_contiguous_token_reach, fit_cuda_resident_token_reach, fit_resident_rows_and_reach,
-    managed_paged_capacity_strategy, CudaContiguousPagedGeometry,
+    fit_cuda_contiguous_token_reach, fit_cuda_resident_token_reach, fit_pool_sequences,
+    fit_resident_rows_and_reach, managed_paged_capacity_strategy, CudaContiguousPagedGeometry,
 };
 use capacity::{
     cuda_managed_state_peak_authorization, managed_state_resources,
