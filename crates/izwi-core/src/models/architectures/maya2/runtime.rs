@@ -19,7 +19,10 @@ use super::ecapa::Maya2Ecapa;
 use super::guards::{piece_budget, suspend_windows, LoopGuard, Maya2PieceBudget, Maya2StopReason};
 use super::inputs::Maya2Inputs;
 use super::prompt::{Maya2Prompt, Maya2Reference, Maya2Tokenizer};
-use super::sampling::{depth_gumbel, sample_cb0, Cb0State, Maya2SamplingParams};
+use super::sampling::{
+    depth_counter_gumbel, depth_gumbel, depth_noise_key, device_noise, sample_cb0, Cb0State,
+    Maya2SamplingParams,
+};
 use super::weights::mmap_release;
 use crate::error::{Error, Result};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
@@ -358,12 +361,22 @@ impl Maya2Runtime {
             if let Some(reason) = draw.stop {
                 break reason;
             }
-            let gumbel = depth_gumbel(
-                &mut [&mut depth_rng],
-                DEPTH_LEVELS,
-                CODEBOOK_SIZE,
-                &self.device,
-            )?;
+            // As the engine's decode steps draw it (`retained`).
+            let gumbel = if device_noise(&self.device) {
+                depth_counter_gumbel(
+                    &[depth_noise_key(params.seed, frames)],
+                    DEPTH_LEVELS,
+                    CODEBOOK_SIZE,
+                    &self.device,
+                )?
+            } else {
+                depth_gumbel(
+                    &mut [&mut depth_rng],
+                    DEPTH_LEVELS,
+                    CODEBOOK_SIZE,
+                    &self.device,
+                )?
+            };
             let cb0 = Tensor::new(&[draw.code], &self.device)?;
             let frame = self.depth.generate_frame(
                 &hidden,

@@ -1251,6 +1251,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Kill switch: false decodes one Maya1 audio window per SNAC call and one request's window per audio quantum on CUDA, instead of every SNAC call at four rows and the due windows of up to the engine rows in one quantum, windows of one length sharing calls.",
     ),
     CoreEnvVar::new(
+        "IZWI_MAYA2_DEVICE_NOISE",
+        Flag,
+        "true",
+        Once,
+        "Kill switch: false draws Maya 2's depth-decoder Gumbel noise from each request's host stream and uploads it every frame (31 x 2,048 values a row), instead of generating it on the device from the request's seed and frame index (CUDA; seeded CUDA output differs between the two).",
+    ),
+    CoreEnvVar::new(
         "IZWI_MAYA2_MODEL_DIR",
         Path,
         "unset (test skipped)",

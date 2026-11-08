@@ -27,7 +27,9 @@ use super::depth::Maya2Depth;
 use super::guards::{LoopGuard, Maya2PieceBudget, Maya2StopReason};
 use super::inputs::Maya2Inputs;
 use super::runtime::{cap_reason, Maya2GenerationParams, Maya2Stream, Maya2Voice};
-use super::sampling::{depth_gumbel, sample_cb0, Cb0State};
+use super::sampling::{
+    depth_counter_gumbel, depth_gumbel, depth_noise_key, device_noise, sample_cb0, Cb0State,
+};
 use crate::error::{Error, Result};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PhysicalPagedKvCheckpoint};
 use crate::models::shared::codecs::mimi::{MimiDecoder, MimiDecoderState};
@@ -500,7 +502,16 @@ pub(crate) fn maya2_decode_batch(
             })
             .collect::<Result<Vec<_>>>()?;
         let cross = Tensor::stack(&cross, 0)?;
-        let gumbel = {
+        let gumbel = if device_noise(device) {
+            let keys = going
+                .iter()
+                .map(|&index| {
+                    let state = &rows[index].state;
+                    depth_noise_key(state.params.seed, state.frames())
+                })
+                .collect::<Vec<_>>();
+            depth_counter_gumbel(&keys, DEPTH_LEVELS, CODEBOOK_SIZE, device)?
+        } else {
             let mut rngs = Vec::with_capacity(going.len());
             let mut cursor = 0;
             for (index, row) in rows.iter_mut().enumerate() {

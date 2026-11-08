@@ -3683,6 +3683,12 @@ pub(crate) fn cuda_ptx_penalized_topk() -> &'static str {
     cuda_ptx::PENALIZED_TOPK
 }
 
+/// The PTX of `kernels/cuda/counter_noise.cu` (`kernels::counter_noise`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_counter_noise() -> &'static str {
+    cuda_ptx::COUNTER_NOISE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

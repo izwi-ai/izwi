@@ -10,6 +10,7 @@
 
 pub mod buffer_pool;
 pub mod conv_tiling;
+pub mod counter_noise;
 pub mod cpu_q8;
 pub mod cuda;
 pub mod depthwise_conv;

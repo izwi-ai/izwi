@@ -22,8 +22,10 @@ use super::config::{
     PRESENCE_PENALTY_RANGE, STOP_HAZARD, STOP_TAU, TEMPERATURE_RANGE,
 };
 use super::guards::Maya2StopReason;
+use super::runtime::Maya2Stream;
 use crate::error::{Error, Result};
-use crate::models::shared::noise::SplitMix64;
+use crate::kernels::counter_noise;
+use crate::models::shared::noise::{mix, stream_seed, SplitMix64};
 
 /// A request's cb0 sampler settings.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -229,6 +231,42 @@ pub fn sample_cb0(
     }
     state.recent.push(code);
     Ok(Cb0Draw { code, stop, p_aeos })
+}
+
+/// Whether the depth decoder's noise is generated on `device` from each
+/// row's seed and frame ([`depth_counter_gumbel`]): on CUDA, unless
+/// `IZWI_MAYA2_DEVICE_NOISE=false`. Elsewhere each row's host stream draws it
+/// and it is uploaded ([`depth_gumbel`]).
+pub(crate) fn device_noise(device: &Device) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    device.is_cuda()
+        && *ENABLED.get_or_init(|| crate::env::flag_or("IZWI_MAYA2_DEVICE_NOISE", true))
+}
+
+/// The depth noise key of a request's frame `frame`: its depth stream mixed
+/// with the frame index, so a frame's noise is the same however it is
+/// batched or retried.
+pub fn depth_noise_key(seed: u64, frame: usize) -> u64 {
+    mix(stream_seed(seed, Maya2Stream::Depth.into()) ^ mix(frame as u64 + 1))
+}
+
+/// [`depth_gumbel`]'s `[rows, levels, codes]` from counter noise generated
+/// on `device` (`kernels::counter_noise`), row `r` keyed `keys[r]`
+/// ([`depth_noise_key`]): one 8-byte key a row goes up instead of the
+/// noise.
+pub fn depth_counter_gumbel(
+    keys: &[u64],
+    levels: usize,
+    codes: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    Ok(
+        counter_noise::gumbel(keys, levels * codes, device)?.reshape((
+            keys.len(),
+            levels,
+            codes,
+        ))?,
+    )
 }
 
 fn softmax(logits: &[f32]) -> Vec<f32> {
@@ -472,6 +510,15 @@ mod tests {
         .to_vec1::<u32>()
         .unwrap();
         assert_eq!(solo[0], codes[0]);
+    }
+
+    #[test]
+    fn depth_noise_keys_follow_the_seed_and_frame() {
+        assert_eq!(depth_noise_key(5, 3), depth_noise_key(5, 3));
+        assert_ne!(depth_noise_key(5, 3), depth_noise_key(5, 4));
+        assert_ne!(depth_noise_key(5, 3), depth_noise_key(6, 3));
+        let noise = depth_counter_gumbel(&[depth_noise_key(5, 3)], 2, 8, &Device::Cpu).unwrap();
+        assert_eq!(noise.dims(), [1, 2, 8]);
     }
 
     #[test]
