@@ -11,8 +11,8 @@ use serde::Serialize;
 use super::config::{self, MAYA1_VOICE_PRESETS, SAMPLE_RATE, STATE_CONTEXT_TOKENS};
 use super::physical::{maya1_physical_state_spec, maya1_retained_contract, Maya1PhysicalStateSpec};
 use super::retained::{
-    maya1_decode_batch, maya1_prefill_batch, Maya1DecodeStep, Maya1Phase, Maya1PrefillStep,
-    Maya1PreparedArtifact, Maya1RetainedState, Maya1StepRow,
+    decode_due_windows, maya1_decode_batch, maya1_prefill_batch, Maya1DecodeStep, Maya1Phase,
+    Maya1PrefillStep, Maya1PreparedArtifact, Maya1RetainedState, Maya1StepRow,
 };
 use super::{Maya1GenerationParams, Maya1Runtime};
 use crate::backends::{BackendKind, DTypeSelection, DTypeSelectionRequest, DeviceProfile};
@@ -28,6 +28,10 @@ pub struct Maya1TtsModel {
     model_identity: u64,
     variant: ModelVariant,
     runtime: Maya1Runtime,
+    /// Whether several requests' audio windows share SNAC calls: SNAC's
+    /// calls have fixed rows (CUDA) and its rows decoded together matched
+    /// each alone at load.
+    share_snac_calls: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,10 +123,32 @@ impl Maya1TtsModel {
             );
             runtime
         };
+        let share_snac_calls = match runtime.snac().call_rows() {
+            None => false,
+            Some(rows) => match runtime.snac().rows_are_independent() {
+                Ok(true) => {
+                    tracing::info!("Maya1 audio windows share {rows}-row SNAC calls");
+                    true
+                }
+                Ok(false) => {
+                    tracing::warn!(
+                        "SNAC rows decoded together differ from each alone on {:?}; Maya1 \
+                         decodes one window per call",
+                        device.kind
+                    );
+                    false
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "SNAC row check failed; one window per call");
+                    false
+                }
+            },
+        };
         Ok(Self {
             model_identity: NEXT_MAYA1_MODEL_IDENTITY.fetch_add(1, Ordering::Relaxed),
             variant,
             runtime,
+            share_snac_calls,
         })
     }
 
@@ -237,6 +263,24 @@ impl Maya1TtsModel {
             Some(samples) => Maya1AudioProgress::Window(samples),
             None => Maya1AudioProgress::Idle,
         })
+    }
+
+    /// [`Self::retained_audio_step`] for several requests at once: windows
+    /// of one length share SNAC calls when the load-time check allowed it,
+    /// and each request gets the samples it would alone.
+    pub(crate) fn retained_audio_batch(
+        &self,
+        states: &mut [&mut Maya1RetainedState],
+    ) -> Result<Vec<Maya1AudioProgress>> {
+        let windows = decode_due_windows(self.runtime.snac(), states, self.share_snac_calls)?;
+        self.runtime.device().synchronize()?;
+        Ok(windows
+            .into_iter()
+            .map(|samples| match samples {
+                Some(samples) => Maya1AudioProgress::Window(samples),
+                None => Maya1AudioProgress::Idle,
+            })
+            .collect())
     }
 
     /// Mark a request whose last window is out as finished.

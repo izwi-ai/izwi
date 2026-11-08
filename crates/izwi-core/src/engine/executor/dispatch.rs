@@ -1296,6 +1296,30 @@ impl NativeExecutor {
         )
     }
 
+    pub(super) fn execute_static_maya1_audio_requests_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: Option<&[ReadyQuantum]>,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let ordered = scheduled
+            .iter()
+            .map(|scheduled| {
+                Self::find_request(requests, scheduled).ok_or_else(|| {
+                    Error::InferenceError("static Maya1 audio row lost request".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outputs = self.maya1_tts_audio_batch(&ordered, scheduled)?;
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            outputs,
+            BatchDispatch::new(BatchDispatchKind::TensorStatic, scheduled.len()),
+            rows,
+        )
+    }
+
     pub(super) fn execute_static_fish_drama3_codec_requests_with_rows(
         &self,
         requests: &[&EngineCoreRequest],

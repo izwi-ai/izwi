@@ -756,23 +756,46 @@ impl LoadedExecutionAdapter for Maya1TtsExecutionAdapter {
         finalize.concurrency = ConcurrencyClass::Exclusive;
         finalize.max_work_units = 1;
         finalize.max_workspace_bytes = 0;
-        // One SNAC window per quantum, so other requests' quanta run between
-        // them.
+        // One SNAC window per request and quantum, so other requests' quanta
+        // run between them. On CUDA the due windows of up to the engine rows
+        // decode in one quantum, sharing fixed-row SNAC calls
+        // (`maya1::snac::SNAC_CUDA_CALL_ROWS`).
+        let batched_audio = self.backend_kind == BackendKind::Cuda
+            && self.max_batch_size > 1
+            && crate::models::architectures::maya1::snac::snac_batching_enabled();
         let mut acoustic = StageDescriptor::from_execution_profile(
             StageId::new(4),
-            "tts.audio.maya1.scalar",
+            if batched_audio {
+                "tts.audio.maya1.tensor_static"
+            } else {
+                "tts.audio.maya1.scalar"
+            },
             &profile,
-            NativeBatchMode::None,
+            if batched_audio {
+                NativeBatchMode::Static
+            } else {
+                NativeBatchMode::None
+            },
         );
         acoustic.selector = StageWorkSelector::SequenceAudioDecode;
         acoustic.progress = StageProgressKind::Iterative;
         acoustic.shape_policy = StageShapePolicy::Exact;
-        acoustic.max_batch_size = 1;
-        acoustic.concurrency = ConcurrencyClass::Exclusive;
-        acoustic.max_work_units = 1;
+        acoustic.max_padding_basis_points = 0;
+        let rows = if batched_audio {
+            self.max_batch_size
+        } else {
+            1
+        };
+        acoustic.max_batch_size = rows;
+        acoustic.concurrency = if batched_audio {
+            ConcurrencyClass::Batchable
+        } else {
+            ConcurrencyClass::Exclusive
+        };
+        acoustic.max_work_units = rows as u64;
         // SNAC's activations over a window of up to 22 frames (45,056
-        // samples), the widest 12 MB a tensor.
-        acoustic.max_workspace_bytes = 256 * 1024 * 1024;
+        // samples), the widest 12 MB a tensor, a window a row.
+        acoustic.max_workspace_bytes = (256 * 1024 * 1024_u64).saturating_mul(rows as u64);
         for stage in [
             &mut preparation,
             &mut prefill,

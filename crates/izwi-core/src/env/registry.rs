@@ -1244,6 +1244,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Kill switch: false reads each Maya1 row's whole head logits (~115 KB) back every step and samples on the host, instead of its top candidates under the repetition penalty and bans computed on the device (CUDA).",
     ),
     CoreEnvVar::new(
+        "IZWI_MAYA1_SNAC_BATCHING",
+        Flag,
+        "true",
+        Once,
+        "Kill switch: false decodes one Maya1 audio window per SNAC call and one request's window per audio quantum on CUDA, instead of every SNAC call at four rows and the due windows of up to the engine rows in one quantum, windows of one length sharing calls.",
+    ),
+    CoreEnvVar::new(
         "IZWI_MAYA2_MODEL_DIR",
         Path,
         "unset (test skipped)",

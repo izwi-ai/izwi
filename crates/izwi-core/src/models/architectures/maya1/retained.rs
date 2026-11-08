@@ -19,7 +19,7 @@ use super::config::{
     AUDIO_CODE_START, END_OF_SPEECH, HEAD_FIRST_TOKEN, HEAD_ROWS, TOKENS_PER_FRAME,
 };
 use super::frames::{unpack_frames, SnacCodes};
-use super::noise::Maya1Stream;
+use super::noise::{snac_noise, Maya1Stream};
 use super::sampling::{self, HeadHistory, Maya1SamplingParams};
 use super::snac::SnacDecoder;
 use super::stream::{Maya1AudioStream, Maya1Window, MAYA1_WINDOW_PLAN};
@@ -185,6 +185,86 @@ impl Maya1RetainedState {
         self.audio.decode(snac, &self.codes, window).map(Some)
     }
 
+    /// The SNAC input of `window`: its frames' codes, from frame
+    /// `window.first`.
+    fn window_codes(&self, window: &Maya1Window) -> Result<SnacCodes> {
+        if window.decoded_end > self.codes.frames() {
+            return Err(Error::InferenceError(
+                "Maya1 audio window outran its frames".into(),
+            ));
+        }
+        Ok(self.codes.slice(window.first, window.decoded_frames()))
+    }
+}
+
+/// Decode the due window of each of `states` (`None` where none is due), as
+/// [`Maya1RetainedState::decode_window`] does one. With `share_calls`,
+/// windows of one length share SNAC calls; each row's samples are its
+/// window's alone only where SNAC's rows are independent on the device
+/// ([`SnacDecoder::rows_are_independent`]), which the caller checks.
+pub(crate) fn decode_due_windows(
+    snac: &SnacDecoder,
+    states: &mut [&mut Maya1RetainedState],
+    share_calls: bool,
+) -> Result<Vec<Option<Vec<f32>>>> {
+    let windows = states
+        .iter()
+        .map(|state| state.next_window())
+        .collect::<Vec<_>>();
+    // Rows with frames to decode, grouped by decoded length.
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    for (index, window) in windows.iter().enumerate() {
+        let Some(window) = window.filter(|window| window.end > window.start) else {
+            continue;
+        };
+        let frames = window.decoded_frames();
+        match groups
+            .iter_mut()
+            .find(|(length, _)| share_calls && *length == frames)
+        {
+            Some((_, members)) => members.push(index),
+            None => groups.push((frames, vec![index])),
+        }
+    }
+    let mut decoded = vec![None; states.len()];
+    for (_, members) in groups {
+        let codes = members
+            .iter()
+            .map(|&index| {
+                let window = windows[index].expect("grouped rows have windows");
+                states[index].window_codes(&window)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let noise_rows = members
+            .iter()
+            .zip(&codes)
+            .map(|(&index, codes)| {
+                let window = windows[index].expect("grouped rows have windows");
+                (window.first, codes, states[index].params.seed)
+            })
+            .collect::<Vec<_>>();
+        let noise = snac_noise(snac.config(), &noise_rows);
+        let samples = snac.decode(&codes.iter().collect::<Vec<_>>(), &noise)?;
+        for (&index, samples) in members.iter().zip(samples) {
+            decoded[index] = Some(samples);
+        }
+    }
+    let per_frame = snac.config().samples_per_frame();
+    states
+        .iter_mut()
+        .zip(windows)
+        .zip(decoded)
+        .map(|((state, window), decoded)| match window {
+            None => Ok(None),
+            Some(window) => state
+                .audio
+                .accept(window, decoded.as_deref().unwrap_or(&[]), per_frame)
+                .map(Some),
+        })
+        .collect()
+}
+
+impl Maya1RetainedState {
     /// Positions the cache must hold now.
     fn position(&self) -> usize {
         match self.phase {
@@ -638,6 +718,77 @@ mod tests {
             decode_batch(trunk, &mut rows, device_candidates).unwrap();
         }
         states.iter().map(|state| state.tokens().to_vec()).collect()
+    }
+
+    /// A request holding `frames` frames of audio codes from `seed`, its
+    /// decoder `stopped` or not.
+    fn audio_state(seed: u64, frames: usize, stopped: bool) -> Maya1RetainedState {
+        let artifact = Arc::new(Maya1PreparedArtifact {
+            text_tokens: 1,
+            prompt: vec![128_259],
+        });
+        let params = Maya1GenerationParams {
+            sampling: Default::default(),
+            max_new_tokens: 2_000,
+            seed,
+        };
+        let mut state = Maya1RetainedState::new(artifact, params, 4_096).unwrap();
+        let mut rng = SplitMix64::new(seed);
+        for _ in 0..frames {
+            for slot in 0..TOKENS_PER_FRAME as u32 {
+                let code = (rng.next_u64() % 4_096) as u32;
+                state.push_token(AUDIO_CODE_START + slot * 4_096 + code);
+            }
+        }
+        state.phase = if stopped {
+            Maya1Phase::Audio
+        } else {
+            Maya1Phase::Decode
+        };
+        state
+    }
+
+    /// Requests' due windows decoded together, sharing calls by length,
+    /// hand over what each request's own window decode does: first windows
+    /// (6 frames), a stopped request's last window, and one with no window
+    /// due.
+    #[test]
+    fn shared_snac_calls_hand_each_request_its_own_window() {
+        use crate::models::architectures::maya1::snac::tests::tiny_decoder;
+        let requests = [
+            (3, 7, false),
+            (4, 6, false),
+            (5, 9, true),
+            (6, 5, false),
+            (7, 9, true),
+        ];
+        let fresh = || {
+            requests
+                .iter()
+                .map(|&(seed, frames, stopped)| audio_state(seed, frames, stopped))
+                .collect::<Vec<_>>()
+        };
+        let solo_snac = tiny_decoder(&Device::Cpu, None);
+        let alone = fresh()
+            .iter_mut()
+            .map(|state| state.decode_window(&solo_snac).unwrap())
+            .collect::<Vec<_>>();
+        assert!(alone[3].is_none(), "five frames wait for the first window");
+        assert!(alone.iter().filter(|samples| samples.is_some()).count() == 4);
+        for call_rows in [None, Some(4), Some(2)] {
+            let snac = tiny_decoder(&Device::Cpu, call_rows);
+            for share in [true, false] {
+                let mut states = fresh();
+                let mut rows = states.iter_mut().collect::<Vec<_>>();
+                let together = decode_due_windows(&snac, &mut rows, share).unwrap();
+                assert_eq!(together, alone, "{call_rows:?} rows a call, shared {share}");
+                for (state, expected) in states.iter().zip(fresh().iter_mut()) {
+                    expected.decode_window(&solo_snac).unwrap();
+                    assert_eq!(state.audio.samples(), expected.audio.samples());
+                    assert_eq!(state.next_window(), expected.next_window());
+                }
+            }
+        }
     }
 
     /// A request draws the same tokens from device candidates as from its

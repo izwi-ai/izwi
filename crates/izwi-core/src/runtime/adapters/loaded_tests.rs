@@ -3811,3 +3811,59 @@ fn batched_tts_families_decode_at_the_tts_width_and_prefill_at_the_engine_rows()
         );
     }
 }
+
+/// Maya1's audio windows decode for up to the engine rows per quantum on
+/// CUDA (SNAC calls of fixed rows keep each request's samples its own); on
+/// Metal and the CPU one request's window a quantum, as before.
+#[test]
+fn maya1_audio_windows_batch_across_requests_on_cuda_only() {
+    let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
+    for variant in [ModelVariant::Maya13B, ModelVariant::Maya13BGguf] {
+        for (backend, rows, mode, concurrency) in [
+            (
+                BackendKind::Cuda,
+                8,
+                NativeBatchMode::Static,
+                ConcurrencyClass::Batchable,
+            ),
+            (
+                BackendKind::Metal,
+                1,
+                NativeBatchMode::None,
+                ConcurrencyClass::Exclusive,
+            ),
+            (
+                BackendKind::Cpu,
+                1,
+                NativeBatchMode::None,
+                ConcurrencyClass::Exclusive,
+            ),
+        ] {
+            let contract = LoadedModelBundleDraft::build(
+                &registry,
+                ExecutionGroupId::new(58),
+                ModelInstanceId::new(1),
+                variant,
+                backend,
+            )
+            .unwrap()
+            .execution_contracts(CapabilityKind::Tts)
+            .unwrap()
+            .into_iter()
+            .find(|contract| contract.execution_profile.mode == ExecutionMode::Sequence)
+            .unwrap();
+            let audio = contract
+                .stages
+                .iter()
+                .find(|stage| stage.selector == StageWorkSelector::SequenceAudioDecode)
+                .unwrap();
+            assert_eq!(
+                (audio.batch_mode, audio.max_batch_size, audio.concurrency),
+                (mode, rows, concurrency),
+                "{variant} on {backend:?}"
+            );
+            assert_eq!(audio.max_work_units, rows as u64);
+            assert_eq!(audio.max_workspace_bytes, 256 * 1024 * 1024 * rows as u64);
+        }
+    }
+}

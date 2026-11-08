@@ -247,9 +247,28 @@ struct Quantizer {
     stride: usize,
 }
 
+/// Rows every SNAC call runs on CUDA when windows batch
+/// ([`SnacDecoder::call_rows`]).
+pub const SNAC_CUDA_CALL_ROWS: usize = 4;
+
+/// Kill switch for batching windows on CUDA.
+pub(crate) const SNAC_BATCHING_ENV: &str = "IZWI_MAYA1_SNAC_BATCHING";
+
+/// Whether CUDA SNAC calls run [`SNAC_CUDA_CALL_ROWS`] rows and audio
+/// quanta batch across requests (`IZWI_MAYA1_SNAC_BATCHING`, default on).
+pub(crate) fn snac_batching_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| crate::env::flag_or(SNAC_BATCHING_ENV, true))
+}
+
 pub struct SnacDecoder {
     cfg: SnacConfig,
     device: Device,
+    /// Rows every call runs, padded with copies of its first row, so a
+    /// window's shapes (and with them Candle's batched GEMM and im2col
+    /// kernels, which cuBLAS may pick by batch count) are the same however
+    /// many windows share the call. `None`: each call runs its own rows.
+    call_rows: Option<usize>,
     quantizers: Vec<Quantizer>,
     conv_in: Depthwise,
     expand: Pointwise,
@@ -275,7 +294,60 @@ impl SnacDecoder {
             name.starts_with("decoder.") || name.starts_with("quantizer.")
         })?;
         let vb = VarBuilder::from_tensors(tensors.into_iter().collect(), DType::F32, &Device::Cpu);
-        Self::from_var_builder(SnacConfig::snac_24khz(), &vb)?.into_device(device)
+        let mut decoder =
+            Self::from_var_builder(SnacConfig::snac_24khz(), &vb)?.into_device(device)?;
+        if device.is_cuda() && snac_batching_enabled() {
+            decoder.call_rows = Some(SNAC_CUDA_CALL_ROWS);
+        }
+        Ok(decoder)
+    }
+
+    /// Rows every call runs (padding included), when fixed.
+    pub fn call_rows(&self) -> Option<usize> {
+        self.call_rows
+    }
+
+    /// Whether rows sharing a call decode exactly as each does alone on this
+    /// device: three seeded six-frame windows in one call against each in a
+    /// call of its own, bit for bit.
+    pub(crate) fn rows_are_independent(&self) -> Result<bool> {
+        use crate::models::shared::noise::SplitMix64;
+        let codes = (0..3u64)
+            .map(|row| {
+                let mut rng = SplitMix64::new(0x5eed + row);
+                let size = self.cfg.codebook_size as u64;
+                let mut codes = |count: usize| {
+                    (0..count)
+                        .map(|_| (rng.next_u64() % size) as u32)
+                        .collect::<Vec<_>>()
+                };
+                SnacCodes {
+                    coarse: codes(6),
+                    medium: codes(12),
+                    fine: codes(24),
+                }
+            })
+            .collect::<Vec<_>>();
+        let windows = codes
+            .iter()
+            .enumerate()
+            .map(|(row, codes)| (0, codes, row as u64 + 1))
+            .collect::<Vec<_>>();
+        let together = self.decode(
+            &codes.iter().collect::<Vec<_>>(),
+            &super::noise::snac_noise(&self.cfg, &windows),
+        )?;
+        for (window, together) in windows.iter().zip(&together) {
+            let alone = self.decode(
+                &[window.1],
+                &super::noise::snac_noise(&self.cfg, &[*window]),
+            )?;
+            let bits = |samples: &[f32]| samples.iter().map(|s| s.to_bits()).collect::<Vec<_>>();
+            if bits(&alone[0]) != bits(together) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn from_var_builder(cfg: SnacConfig, vb: &VarBuilder) -> Result<Self> {
@@ -315,6 +387,7 @@ impl SnacDecoder {
             quantizers,
             blocks,
             device: Device::Cpu,
+            call_rows: None,
             cfg,
         })
     }
@@ -387,6 +460,7 @@ impl SnacDecoder {
             conv_out: move_t(&self.conv_out)?,
             conv_out_bias: move_t(&self.conv_out_bias)?,
             device: device.clone(),
+            call_rows: self.call_rows,
             cfg: self.cfg,
         })
     }
@@ -420,6 +494,46 @@ impl SnacDecoder {
                 )));
             }
         }
+        let Some(call_rows) = self.call_rows else {
+            return self.decode_rows(rows, noise, frames);
+        };
+        // Every call runs `call_rows` rows: the rows in order, then copies
+        // of each call's first row.
+        let mut samples = Vec::with_capacity(batch);
+        for (chunk, start) in rows.chunks(call_rows).zip((0..batch).step_by(call_rows)) {
+            let mut padded = chunk.to_vec();
+            padded.resize(call_rows, chunk[0]);
+            let take = |block: usize, row: usize| {
+                let len = frames * self.cfg.block_steps_per_frame(block);
+                &noise[block][row * len..(row + 1) * len]
+            };
+            let padded_noise: SnacNoise = std::array::from_fn(|block| {
+                (0..call_rows)
+                    .flat_map(|slot| {
+                        let row = if slot < chunk.len() {
+                            start + slot
+                        } else {
+                            start
+                        };
+                        take(block, row).iter().copied()
+                    })
+                    .collect()
+            });
+            let mut decoded = self.decode_rows(&padded, &padded_noise, frames)?;
+            decoded.truncate(chunk.len());
+            samples.extend(decoded);
+        }
+        Ok(samples)
+    }
+
+    /// [`Self::decode`]'s rows (checked) in one call as they are.
+    fn decode_rows(
+        &self,
+        rows: &[&SnacCodes],
+        noise: &SnacNoise,
+        frames: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let batch = rows.len();
         let levels: [Vec<u32>; 3] = [
             rows.iter()
                 .flat_map(|row| row.coarse.iter().copied())
@@ -516,8 +630,162 @@ fn weight_norm(vb: &VarBuilder) -> Result<Tensor> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::models::shared::noise::SplitMix64;
+
+    /// SNAC's layout at toy width (decoder 32 channels, latent 16), random
+    /// weights, every `call_rows` rows a call.
+    pub(crate) fn tiny_decoder(device: &Device, call_rows: Option<usize>) -> SnacDecoder {
+        let cfg = SnacConfig {
+            latent_dim: 16,
+            decoder_dim: 32,
+            ..SnacConfig::snac_24khz()
+        };
+        let mut rng = SplitMix64::new(23);
+        let mut tensors = HashMap::new();
+        let mut put = |name: String, shape: &[usize], scale: f32, offset: f32| {
+            let count = shape.iter().product();
+            let values = rng
+                .standard_normals(count)
+                .into_iter()
+                .map(|v| v * scale + offset)
+                .collect::<Vec<_>>();
+            tensors.insert(name, Tensor::from_vec(values, shape, &Device::Cpu).unwrap());
+        };
+        let latent = cfg.latent_dim;
+        for index in 0..3 {
+            put(
+                format!("quantizer.quantizers.{index}.codebook.weight"),
+                &[cfg.codebook_size, cfg.codebook_dim],
+                1.0,
+                0.0,
+            );
+        }
+        let mut conv = |prefix: String, shape: [usize; 3], bias: Option<usize>| {
+            put(
+                format!("{prefix}.parametrizations.weight.original0"),
+                &[shape[0], 1, 1],
+                0.1,
+                1.0,
+            );
+            put(
+                format!("{prefix}.parametrizations.weight.original1"),
+                &shape,
+                1.0,
+                0.0,
+            );
+            if let Some(len) = bias {
+                put(format!("{prefix}.bias"), &[len], 0.1, 0.0);
+            }
+        };
+        for index in 0..3 {
+            conv(
+                format!("quantizer.quantizers.{index}.out_proj"),
+                [latent, cfg.codebook_dim, 1],
+                Some(latent),
+            );
+        }
+        let m = "decoder.model";
+        conv(format!("{m}.0"), [latent, 1, 7], Some(latent));
+        conv(
+            format!("{m}.1"),
+            [cfg.decoder_dim, latent, 1],
+            Some(cfg.decoder_dim),
+        );
+        let mut channels = cfg.decoder_dim;
+        for (index, &stride) in cfg.decoder_rates.iter().enumerate() {
+            let (input, output) = (channels, channels / 2);
+            let b = format!("{m}.{}.block", 2 + index);
+            conv(format!("{b}.1"), [input, output, 2 * stride], Some(output));
+            conv(format!("{b}.2.linear"), [output, output, 1], None);
+            for unit in 3..6 {
+                let u = format!("{b}.{unit}.block");
+                conv(format!("{u}.1"), [output, 1, 7], Some(output));
+                conv(format!("{u}.3"), [output, output, 1], Some(output));
+            }
+            channels = output;
+        }
+        conv(format!("{m}.7"), [1, channels, 7], Some(1));
+        drop(conv);
+        let mut channels = cfg.decoder_dim;
+        for index in 0..4 {
+            let b = format!("{m}.{}.block", 2 + index);
+            put(format!("{b}.0.alpha"), &[1, channels, 1], 0.1, 1.0);
+            channels /= 2;
+            for unit in 3..6 {
+                for snake in [0, 2] {
+                    put(
+                        format!("{b}.{unit}.block.{snake}.alpha"),
+                        &[1, channels, 1],
+                        0.1,
+                        1.0,
+                    );
+                }
+            }
+        }
+        put(format!("{m}.6.alpha"), &[1, channels, 1], 0.1, 1.0);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+        let mut decoder = SnacDecoder::from_var_builder(cfg, &vb)
+            .unwrap()
+            .into_device(device)
+            .unwrap();
+        decoder.call_rows = call_rows;
+        decoder
+    }
+
+    /// `frames` random frames of codes.
+    pub(crate) fn random_codes(seed: u64, frames: usize) -> SnacCodes {
+        let mut rng = SplitMix64::new(seed);
+        let mut codes = |count: usize| {
+            (0..count)
+                .map(|_| (rng.next_u64() % 4_096) as u32)
+                .collect::<Vec<_>>()
+        };
+        SnacCodes {
+            coarse: codes(frames),
+            medium: codes(2 * frames),
+            fine: codes(4 * frames),
+        }
+    }
+
+    /// Rows decode the same in one call as each alone, with and without the
+    /// fixed call rows, and the fixed rows change nothing on the CPU.
+    #[test]
+    fn cpu_rows_decode_alone_as_together_with_any_call_rows() {
+        use super::super::noise::snac_noise;
+        let rows = (0..5).map(|seed| random_codes(seed, 6)).collect::<Vec<_>>();
+        let windows = rows
+            .iter()
+            .enumerate()
+            .map(|(index, codes)| (index * 3, codes, 40 + index as u64))
+            .collect::<Vec<_>>();
+        let mut expected = None;
+        for call_rows in [None, Some(4), Some(2)] {
+            let snac = tiny_decoder(&Device::Cpu, call_rows);
+            assert!(snac.rows_are_independent().unwrap());
+            let together = snac
+                .decode(
+                    &rows.iter().collect::<Vec<_>>(),
+                    &snac_noise(snac.config(), &windows),
+                )
+                .unwrap();
+            assert_eq!(together.len(), rows.len());
+            for (window, together) in windows.iter().zip(&together) {
+                let alone = snac
+                    .decode(&[window.1], &snac_noise(snac.config(), &[*window]))
+                    .unwrap();
+                assert_eq!(&alone[0], together);
+                assert_eq!(together.len(), 6 * 2_048);
+            }
+            match &expected {
+                None => expected = Some(together),
+                Some(expected) => assert_eq!(expected, &together),
+            }
+        }
+    }
 
     #[test]
     fn frame_geometry_matches_snac_24khz() {
