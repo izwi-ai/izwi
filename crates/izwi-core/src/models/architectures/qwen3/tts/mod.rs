@@ -21,6 +21,7 @@ pub use budget::{
 };
 pub(crate) use budget::{qwen3_tts_retained_memory_tokens, qwen3_tts_state_floor_tokens};
 pub use config::Qwen3TtsConfig;
+pub(crate) use predictor::qwen3_tts_predictor_graph_device_bytes;
 pub use predictor::{
     code_predictor_physical_context_tokens, AcousticCodeRows, CodePredictor,
     CodePredictorPhysicalCache, CodeSelection, SubtalkerSampling,
@@ -1467,6 +1468,9 @@ pub struct Qwen3TtsDiagnostics {
     pub host_readbacks_total: u64,
     /// Voice-clone references prepared from the cache vs encoded.
     pub reference_cache: reference_cache::ReferenceCacheStats,
+    /// The code predictor's CUDA frame graphs: why they are off, or their
+    /// captures, replays and graphed and eager frames.
+    pub predictor_graphs: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2064,7 +2068,7 @@ impl Qwen3TtsModel {
             code_predictor_config.text_hidden_size = Some(config.talker_config.text_hidden_size);
         }
         let weight_only = qwen3_tts_weight_only_f16(&device, dtype_plan);
-        let ((talker, code_predictor), weight_precision) = load_weight_only_f16(
+        let ((talker, mut code_predictor), weight_precision) = load_weight_only_f16(
             "Qwen3-TTS",
             &weight_only,
             &device.device,
@@ -2098,6 +2102,8 @@ impl Qwen3TtsModel {
             },
             weight_precision.reason
         );
+        // A frame's inputs are the talker's hidden state and codec embedding.
+        code_predictor.resolve_graphs(dtype_plan.talker);
 
         // Load speech tokenizer decoder
         info!("Loading speech tokenizer decoder...");
@@ -2462,6 +2468,7 @@ impl Qwen3TtsModel {
             codec_decode: self.speech_tokenizer.decode_stats(),
             host_readbacks_total: qwen3_tts_host_readbacks(),
             reference_cache: self.reference_cache.stats(),
+            predictor_graphs: self.code_predictor.graphs_diagnostics(),
         }
     }
 

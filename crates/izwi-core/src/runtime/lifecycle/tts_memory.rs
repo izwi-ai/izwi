@@ -54,7 +54,8 @@ use crate::models::architectures::qwen3::tts::speech_tokenizer::{
     encoder_reads_tensor, read_encoder_acoustic_codebooks,
 };
 use crate::models::architectures::qwen3::tts::{
-    qwen3_tts_load_layout, qwen3_tts_text_embedding_reads_in_place, Qwen3TtsLoadLayout,
+    qwen3_tts_load_layout, qwen3_tts_predictor_graph_device_bytes,
+    qwen3_tts_text_embedding_reads_in_place, Qwen3TtsLoadLayout,
 };
 use crate::models::architectures::vibevoice::tts::vibevoice_tts_weight_dtype;
 use crate::models::architectures::voxtral::tts::model::{VoxtralTtsDTypePlan, VoxtralTtsModel};
@@ -177,7 +178,10 @@ fn qwen3_tts_plan_with(
     } else {
         0
     };
-    price_qwen3_tts(&files, backend, &layout, encoder_acoustic_codebooks).map(Some)
+    // The code predictor's CUDA graphs allocate at the load's self-check.
+    let graphs = qwen3_tts_predictor_graph_device_bytes(backend);
+    price_qwen3_tts(&files, backend, &layout, encoder_acoustic_codebooks)
+        .map(|plan| Some(plan.with_deferred_device_bytes(graphs)))
 }
 
 /// Whether a Qwen3-TTS tensor loads as weight-only F16 when the layout asks

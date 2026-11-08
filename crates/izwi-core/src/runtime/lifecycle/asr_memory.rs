@@ -309,7 +309,7 @@ impl AsrResidencyPlan {
     }
 
     /// This plan with `bytes` of device memory the model allocates lazily.
-    fn with_deferred_device_bytes(mut self, bytes: u64) -> Self {
+    pub(super) fn with_deferred_device_bytes(mut self, bytes: u64) -> Self {
         self.deferred_device_bytes = bytes;
         self
     }

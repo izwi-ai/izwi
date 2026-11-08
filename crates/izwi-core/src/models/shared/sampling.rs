@@ -2239,6 +2239,50 @@ pub fn resident_top_k_sample_rows<'d>(
     ))
 }
 
+/// [`resident_top_k_sample_rows`] with every row's Gumbel noise already on
+/// the logits' device, `[rows, top_k.min(vocab)]` (each row's
+/// [`gumbel_noise`] of that many draws, as that function draws it), and the
+/// column ids `0..vocab` (U32) passed in: the same arithmetic with nothing
+/// uploaded or cached, so a CUDA graph can capture it and take the noise and
+/// ids as inputs. `None` where that function returns `None`.
+pub fn resident_top_k_rows_with_noise(
+    logits: &Tensor,
+    top_k: usize,
+    temperature: f32,
+    noise: &Tensor,
+    column_ids: &Tensor,
+) -> Result<Option<Tensor>> {
+    if temperature <= 1e-5 || top_k == 0 || top_k > DEVICE_TOP_K_LIMIT {
+        return Ok(None);
+    }
+    let (rows, vocab) = logits.dims2()?;
+    if rows == 0 || vocab == 0 {
+        return Ok(None);
+    }
+    let adjusted = sanitize_finite(&logits.to_dtype(DType::F32)?)?;
+    let adjusted = (adjusted / temperature as f64)?;
+    let (values, indices) = bounded_topk_rows_from(&adjusted, top_k.min(vocab), Some(column_ids))?;
+    if noise.dims() != values.dims() {
+        return Err(Error::InvalidInput(format!(
+            "top-k noise {:?} does not match the candidates {:?}",
+            noise.dims(),
+            values.dims()
+        )));
+    }
+    let picks = values
+        .broadcast_add(noise)?
+        .argmax(D::Minus1)?
+        .to_dtype(DType::U32)?
+        .reshape((rows, 1))?;
+    Ok(Some(
+        indices
+            .to_dtype(DType::U32)?
+            .contiguous()?
+            .gather(&picks, 1)?
+            .reshape(rows)?,
+    ))
+}
+
 /// `-ln(-ln(u))` for `count` uniforms, the Gumbel(0, 1) noise of the
 /// Gumbel-max trick.
 pub(crate) fn gumbel_noise(count: usize, draw: &mut dyn FnMut() -> f32) -> Vec<f32> {
@@ -2337,6 +2381,18 @@ fn bounded_topk(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
 /// and gathers work row by row, so each row's result equals `bounded_topk`
 /// of that row alone, ties included.
 fn bounded_topk_rows(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
+    bounded_topk_rows_from(values, k, None)
+}
+
+/// [`bounded_topk_rows`] whose column ids come from `indices` (`0..length`
+/// as U32) when given, not from the per-thread tensor cache: a CUDA graph
+/// takes them as an input, since a cached tensor evicted after the capture
+/// would free memory the graph still reads.
+fn bounded_topk_rows_from(
+    values: &Tensor,
+    k: usize,
+    indices: Option<&Tensor>,
+) -> Result<(Tensor, Tensor)> {
     let (rows, length) = values.dims2()?;
     if rows == 0 || length == 0 || length > u32::MAX as usize || k == 0 || k > DEVICE_TOP_K_LIMIT {
         return Err(Error::InvalidInput(format!(
@@ -2345,11 +2401,23 @@ fn bounded_topk_rows(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
     }
     let device = values.device();
     let mut candidate_values = values.contiguous()?;
-    let mut candidate_indices =
-        cached_sampling_tensor(device, SamplingTensorCacheInput::Arange(length as u32))?
-            .unsqueeze(0)?
-            .broadcast_as((rows, length))?
-            .contiguous()?;
+    let indices = match indices {
+        Some(indices) if indices.dims() == [length] && indices.dtype() == DType::U32 => {
+            indices.clone()
+        }
+        Some(indices) => {
+            return Err(Error::InvalidInput(format!(
+                "bounded top-k column ids {:?} {:?} do not cover {length} columns",
+                indices.dims(),
+                indices.dtype()
+            )))
+        }
+        None => cached_sampling_tensor(device, SamplingTensorCacheInput::Arange(length as u32))?,
+    };
+    let mut candidate_indices = indices
+        .unsqueeze(0)?
+        .broadcast_as((rows, length))?
+        .contiguous()?;
     loop {
         let length = candidate_values.dim(1)?;
         if length <= DEVICE_SORT_CHUNK {
@@ -2565,6 +2633,42 @@ mod tests {
                     .unwrap();
                 assert_eq!(code, alone[0], "rows={rows} vocab={vocab} top_k={top_k} row={row}");
             }
+        }
+    }
+
+    /// Noise drawn up front and passed in picks what the drawing sampler
+    /// picks for every row, at one and several sort chunks.
+    #[test]
+    fn resident_top_k_rows_with_noise_match_the_drawing_sampler() {
+        let device = Device::Cpu;
+        for (rows, vocab, top_k) in [(4, 64, 8), (6, 2048, 50), (3, 700, 512), (2, 30, 50)] {
+            let mut values = xorshift(vocab as u64 * 17 + rows as u64);
+            let logits: Vec<f32> = (0..rows * vocab).map(|_| values() * 8.0 - 4.0).collect();
+            let logits = Tensor::from_vec(logits, (rows, vocab), &device).unwrap();
+            let mut streams = (0..rows)
+                .map(|row| xorshift(row as u64 + 11))
+                .collect::<Vec<_>>();
+            let mut draws = streams
+                .iter_mut()
+                .map(|draw| draw as &mut dyn FnMut() -> f32)
+                .collect::<Vec<_>>();
+            let drawn = resident_top_k_sample_rows(&logits, top_k, 1.1, &mut draws)
+                .unwrap()
+                .unwrap()
+                .to_vec1::<u32>()
+                .unwrap();
+            let keep = top_k.min(vocab);
+            let noise = (0..rows)
+                .flat_map(|row| gumbel_noise(keep, &mut xorshift(row as u64 + 11)))
+                .collect::<Vec<_>>();
+            let noise = Tensor::from_vec(noise, (rows, keep), &device).unwrap();
+            let ids = Tensor::arange(0u32, vocab as u32, &device).unwrap();
+            let passed = resident_top_k_rows_with_noise(&logits, top_k, 1.1, &noise, &ids)
+                .unwrap()
+                .unwrap()
+                .to_vec1::<u32>()
+                .unwrap();
+            assert_eq!(passed, drawn, "rows={rows} vocab={vocab} top_k={top_k}");
         }
     }
 

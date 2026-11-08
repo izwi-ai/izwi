@@ -2343,6 +2343,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Toggles the custom RoPE kernel for Qwen3 attention.",
     ),
     CoreEnvVar::new(
+        "IZWI_QWEN3_TTS_PREDICTOR_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Qwen3-TTS runs each code-predictor frame (the two-token prefill and the 15 acoustic codebooks, with each row's KV dense inside the frame) as a CUDA graph at 32 rows, spare rows zero, one graph per input dtype and sampling setting (greedy, or one sub-talker top-k and temperature at top-p 1, with each row's Gumbel noise drawn before the frame); frames whose rows sample differently run eagerly. A load-time self-check captures greedy and default-sampling graphs over xorshift inputs and compares replays with the eager frame bit for bit; a mismatch or CUDA error keeps every frame on the eager paged path. Loads price 128 MiB for the graphs. Any false value turns them off; `predictor_graphs` in the model diagnostics reports why they are off, captures, replays and graphed and eager frames.",
+    ),
+    CoreEnvVar::new(
         "IZWI_QWEN_ASR_AUDIO_DTYPE",
         Choice,
         "GGUF: the text dtype (BF16 on CUDA), behind a load-time probe on Metal and CUDA; safetensors: F32",
