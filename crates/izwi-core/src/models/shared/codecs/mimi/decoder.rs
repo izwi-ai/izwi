@@ -4,7 +4,7 @@
 //! Every layer is causal, so a stream decoded a few frames at a time is the
 //! whole-sequence decode (up to summation order) and needs no lookahead.
 
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 
 use super::config::MimiConfig;
@@ -12,20 +12,49 @@ use super::conv::{CausalConv1d, CausalConvTranspose1d, PadMode, ResnetBlock};
 use super::quantizer::MimiQuantizer;
 use super::transformer::{MimiTransformer, MimiTransformerState};
 use crate::error::{Error, Result};
+use crate::models::shared::codecs::reduced_precision::{self, CodecPrecision};
 
 struct UpBlock {
     conv: CausalConvTranspose1d,
     resnet: ResnetBlock,
 }
 
+/// The SEANet decoder after the transformer (the first convolution, the
+/// upsampling blocks, the last convolution) and the dtype it runs in.
+struct Seanet {
+    first: CausalConv1d,
+    blocks: Vec<UpBlock>,
+    last: CausalConv1d,
+    dtype: DType,
+}
+
+impl Seanet {
+    fn with_dtype(&self, dtype: DType) -> Result<Self> {
+        Ok(Self {
+            first: self.first.with_dtype(dtype)?,
+            blocks: self
+                .blocks
+                .iter()
+                .map(|block| -> Result<UpBlock> {
+                    Ok(UpBlock {
+                        conv: block.conv.with_dtype(dtype)?,
+                        resnet: block.resnet.with_dtype(dtype)?,
+                    })
+                })
+                .collect::<Result<_>>()?,
+            last: self.last.with_dtype(dtype)?,
+            dtype,
+        })
+    }
+}
+
 pub struct MimiDecoder {
     quantizer: MimiQuantizer,
     upsample: CausalConvTranspose1d,
     transformer: MimiTransformer,
-    first: CausalConv1d,
-    blocks: Vec<UpBlock>,
-    last: CausalConv1d,
+    seanet: Seanet,
     samples_per_frame: usize,
+    codebook_size: usize,
     device: Device,
 }
 
@@ -109,12 +138,70 @@ impl MimiDecoder {
             quantizer,
             upsample,
             transformer,
-            first,
-            blocks,
-            last,
+            seanet: Seanet {
+                first,
+                blocks,
+                last,
+                dtype: DType::F32,
+            },
             samples_per_frame: cfg.samples_per_frame(),
+            codebook_size: cfg.codebook_size,
             device,
         })
+    }
+
+    /// The dtype the SEANet decoder runs in (the quantizer, upsample and
+    /// transformer stay F32; samples come back F32).
+    pub fn seanet_dtype(&self) -> DType {
+        self.seanet.dtype
+    }
+
+    /// Runs the SEANet decoder in `dtype` when its samples stay within
+    /// `max_rel_l2` relative L2 error of F32's ([`reduced_precision::judge`]
+    /// over [`Self::check_samples`]; [`reduced_precision::MAX_REL_L2`] at
+    /// load), else keeps it as it is; returns the verdict.
+    pub(crate) fn try_seanet_dtype(&mut self, dtype: DType, max_rel_l2: f64) -> CodecPrecision {
+        let checked = self.seanet.with_dtype(dtype).and_then(|reduced| {
+            let reference = self.check_samples()?;
+            let kept = std::mem::replace(&mut self.seanet, reduced);
+            match self.check_samples() {
+                Ok(samples) => Ok((kept, reference, samples)),
+                Err(error) => {
+                    self.seanet = kept;
+                    Err(error)
+                }
+            }
+        });
+        match checked {
+            Ok((kept, reference, samples)) => {
+                let (precision, keep) =
+                    reduced_precision::judge(&reference, &samples, dtype, max_rel_l2);
+                if !keep {
+                    self.seanet = kept;
+                }
+                precision
+            }
+            Err(error) => CodecPrecision::f32(true, format!("{dtype:?} check failed: {error}")),
+        }
+    }
+
+    /// The precision check's input: twelve seeded frames streamed in three
+    /// chunks of four from a new stream.
+    fn check_samples(&self) -> Result<Vec<f32>> {
+        let books = self.codebooks();
+        let mut seed = 0x6d69_6d69u64;
+        let codes = (0..12 * books)
+            .map(|_| {
+                seed = crate::models::shared::noise::mix(seed.wrapping_add(1));
+                (seed % self.codebook_size as u64) as u32
+            })
+            .collect::<Vec<_>>();
+        let mut state = self.new_state()?;
+        let mut samples = Vec::with_capacity(12 * self.samples_per_frame);
+        for chunk in codes.chunks(4 * books) {
+            samples.extend(self.decode_stream(&mut state, chunk)?.to_vec1::<f32>()?);
+        }
+        Ok(samples)
     }
 
     pub fn samples_per_frame(&self) -> usize {
@@ -130,33 +217,49 @@ impl MimiDecoder {
     }
 
     pub fn new_state(&self) -> Result<MimiDecoderState> {
-        let zeros = |channels: usize, length: usize| -> Result<Tensor> {
-            Ok(Tensor::zeros(
-                (1, channels, length),
-                candle_core::DType::F32,
-                &self.device,
-            )?)
+        let zeros = |channels: usize, length: usize, dtype: DType| -> Result<Tensor> {
+            Ok(Tensor::zeros((1, channels, length), dtype, &self.device)?)
         };
+        let seanet = &self.seanet;
         Ok(MimiDecoderState {
-            upsample_tail: zeros(self.upsample.out_channels(), self.upsample.overlap())?,
+            upsample_tail: zeros(
+                self.upsample.out_channels(),
+                self.upsample.overlap(),
+                DType::F32,
+            )?,
             transformer: MimiTransformerState::new(self.transformer.num_layers()),
-            first_history: zeros(self.first.in_channels(), self.first.history())?,
-            block_tails: self
+            first_history: zeros(
+                seanet.first.in_channels(),
+                seanet.first.history(),
+                seanet.dtype,
+            )?,
+            block_tails: seanet
                 .blocks
                 .iter()
-                .map(|block| zeros(block.conv.out_channels(), block.conv.overlap()))
+                .map(|block| {
+                    zeros(
+                        block.conv.out_channels(),
+                        block.conv.overlap(),
+                        seanet.dtype,
+                    )
+                })
                 .collect::<Result<_>>()?,
-            block_histories: self
+            block_histories: seanet
                 .blocks
                 .iter()
                 .map(|block| {
                     zeros(
                         block.resnet.conv1.in_channels(),
                         block.resnet.conv1.history(),
+                        seanet.dtype,
                     )
                 })
                 .collect::<Result<_>>()?,
-            last_history: zeros(self.last.in_channels(), self.last.history())?,
+            last_history: zeros(
+                seanet.last.in_channels(),
+                seanet.last.history(),
+                seanet.dtype,
+            )?,
             frames: 0,
         })
     }
@@ -182,9 +285,11 @@ impl MimiDecoder {
             .forward_stream(&x.squeeze(0)?.t()?.contiguous()?, &mut state.transformer)?
             .t()?
             .unsqueeze(0)?
-            .contiguous()?;
-        let mut x = self.first.forward_stream(&x, &mut state.first_history)?;
-        for ((block, tail), history) in self
+            .contiguous()?
+            .to_dtype(self.seanet.dtype)?;
+        let seanet = &self.seanet;
+        let mut x = seanet.first.forward_stream(&x, &mut state.first_history)?;
+        for ((block, tail), history) in seanet
             .blocks
             .iter()
             .zip(state.block_tails.iter_mut())
@@ -193,11 +298,12 @@ impl MimiDecoder {
             x = block.conv.forward_stream(&x.elu(1.0)?, tail)?;
             x = block.resnet.forward_stream(&x, history)?;
         }
-        let audio = self
+        let audio = seanet
             .last
-            .forward_stream(&x.elu(1.0)?, &mut state.last_history)?;
+            .forward_stream(&x.elu(1.0)?, &mut state.last_history)?
+            .to_dtype(DType::F32)?;
         state.frames += frames;
-        self.check_samples(audio.flatten_all()?, frames)
+        self.check_length(audio.flatten_all()?, frames)
     }
 
     /// Every frame of `codes` at once (the reference the stream must equal).
@@ -209,17 +315,22 @@ impl MimiDecoder {
             .forward(&x.squeeze(0)?.t()?.contiguous()?)?
             .t()?
             .unsqueeze(0)?
-            .contiguous()?;
-        let mut x = self.first.forward(&x)?;
-        for block in &self.blocks {
+            .contiguous()?
+            .to_dtype(self.seanet.dtype)?;
+        let mut x = self.seanet.first.forward(&x)?;
+        for block in &self.seanet.blocks {
             x = block.conv.forward(&x.elu(1.0)?)?;
             x = block.resnet.forward(&x)?;
         }
-        let audio = self.last.forward(&x.elu(1.0)?)?;
-        self.check_samples(audio.flatten_all()?, frames)
+        let audio = self
+            .seanet
+            .last
+            .forward(&x.elu(1.0)?)?
+            .to_dtype(DType::F32)?;
+        self.check_length(audio.flatten_all()?, frames)
     }
 
-    fn check_samples(&self, audio: Tensor, frames: usize) -> Result<Tensor> {
+    fn check_length(&self, audio: Tensor, frames: usize) -> Result<Tensor> {
         let expected = frames * self.samples_per_frame;
         if audio.dim(0)? != expected {
             return Err(Error::InferenceError(format!(

@@ -1321,6 +1321,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Kill switch: false reads each Maya 2 row's whole codebook-0 logits back every frame and samples on the host, instead of its top candidates under the temperature, end-of-audio bias and presence penalty computed on the device (CUDA).",
     ),
     CoreEnvVar::new(
+        "IZWI_MAYA2_MIMI_BF16",
+        Flag,
+        "false",
+        Once,
+        "On CUDA, true runs the SEANet half of Maya 2's Mimi decoder (the convolutions after its transformer; the quantizer, upsample and transformer stay F32, samples come back F32) in BF16 when its load-time check keeps it: twelve seeded frames streamed through the F32 and BF16 decoders, the BF16 samples within 5% relative L2 error of F32 and all finite; otherwise it stays F32. Off by default until GPU parity, a speech-recognition round trip and listening confirm it. Loads that ask for it price the BF16 copy built beside the F32 one. `mimi_precision` in the model diagnostics reports the dtype, why, and the check's measured error.",
+    ),
+    CoreEnvVar::new(
         "IZWI_MAYA2_MODEL_DIR",
         Path,
         "unset (test skipped)",

@@ -54,6 +54,9 @@ pub struct Maya2TtsDiagnostics {
     /// The depth decoder's CUDA frame graphs: why they are off, or their
     /// captures, replays, fallbacks and graphed and eager frames.
     pub depth_graphs: serde_json::Value,
+    /// What Mimi's SEANet decoder runs in (BF16 only on an operator's
+    /// opt-in that its load check kept), and the check's measured error.
+    pub mimi_precision: serde_json::Value,
 }
 
 /// What one audio-window quantum did.
@@ -145,6 +148,7 @@ impl Maya2TtsModel {
         };
         // A depth frame's input is the loaded backbone's hidden state.
         runtime.resolve_depth_graphs();
+        runtime.resolve_mimi_precision();
         Ok(Self {
             model_identity: NEXT_MAYA2_MODEL_IDENTITY.fetch_add(1, Ordering::Relaxed),
             variant,
@@ -186,6 +190,7 @@ impl Maya2TtsModel {
             depth_dtype: format!("{:?}", self.runtime.depth().dtype()),
             context_tokens: self.context_tokens(),
             depth_graphs: self.runtime.depth().graphs_diagnostics(),
+            mimi_precision: self.runtime.mimi_precision().diagnostics(),
         }
     }
 

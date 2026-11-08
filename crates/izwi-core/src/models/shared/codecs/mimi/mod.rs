@@ -169,6 +169,50 @@ mod tests {
         }
     }
 
+    /// The BF16 check over one decoder: within a loose bound the BF16
+    /// SEANet is kept and streams finite samples, whole or in chunks, that
+    /// are not F32's bits (so BF16 ran); past a bound (zero) the decoder
+    /// stays F32 with the measured error recorded and streams F32's samples.
+    #[test]
+    fn the_bf16_check_keeps_or_refuses_a_bf16_seanet() {
+        let cfg = tiny_config();
+        let codes = codes(7, 4, 16);
+        let stream = |decoder: &MimiDecoder| {
+            let mut state = decoder.new_state().unwrap();
+            let mut samples = Vec::new();
+            for chunk in codes.chunks(8) {
+                samples.extend(
+                    decoder
+                        .decode_stream(&mut state, chunk)
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap(),
+                );
+            }
+            samples
+        };
+        let mut decoder = random(|vb| MimiDecoder::load(&cfg, vb));
+        let reference = stream(&decoder);
+
+        let refused = decoder.try_seanet_dtype(DType::BF16, 0.0);
+        assert_eq!(refused.dtype, DType::F32, "{refused:?}");
+        assert!(refused.requested && refused.rel_l2.unwrap() > 0.0);
+        assert_eq!(decoder.seanet_dtype(), DType::F32);
+        assert_eq!(stream(&decoder), reference);
+
+        let kept = decoder.try_seanet_dtype(DType::BF16, 10.0);
+        assert_eq!(kept.dtype, DType::BF16, "{kept:?}");
+        assert_eq!(kept.rel_l2, refused.rel_l2);
+        assert_eq!(decoder.seanet_dtype(), DType::BF16);
+        let reduced = stream(&decoder);
+        assert_eq!(reduced.len(), reference.len());
+        assert!(reduced.iter().all(|sample| sample.is_finite()));
+        assert_ne!(reduced, reference, "BF16 ran");
+        let whole = decoder.decode(&codes).unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(whole.len(), reference.len());
+        assert!(whole.iter().all(|sample| sample.is_finite()));
+    }
+
     #[test]
     fn a_stream_depends_only_on_its_own_frames() {
         let cfg = tiny_config();

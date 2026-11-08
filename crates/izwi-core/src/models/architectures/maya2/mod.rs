@@ -39,6 +39,7 @@ pub(crate) use model::Maya2AudioProgress;
 pub use model::{maya2_backbone_precision, maya2_depth_dtype, Maya2TtsDiagnostics, Maya2TtsModel};
 pub(crate) use physical::MAYA2_DOMAIN;
 pub use prompt::{detect_language, resolve_language, Maya2Prompt, Maya2Reference};
+pub(crate) use runtime::maya2_mimi_bf16_device_bytes;
 pub use runtime::{
     Maya2ClonedVoice, Maya2GenerationOutput, Maya2GenerationParams, Maya2Runtime, Maya2Voice,
 };
