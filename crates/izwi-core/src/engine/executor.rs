@@ -3138,6 +3138,9 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
                     .prepared_maya2_tts_model_lease_for_executor()
                     .is_ok_and(|model| model.is_some())
                 || request
+                    .prepared_voxtral_tts_model_lease_for_executor()
+                    .is_ok_and(|model| model.is_some())
+                || request
                     .prepared_lfm3_audio_model_lease_for_executor()
                     .is_ok_and(|model| model.is_some()) =>
         {
@@ -3393,6 +3396,9 @@ impl ModelExecutor for NativeExecutor {
                         .prepared_maya2_tts_model_lease_for_executor()
                         .is_ok_and(|model| model.is_some())
                     || request
+                        .prepared_voxtral_tts_model_lease_for_executor()
+                        .is_ok_and(|model| model.is_some())
+                    || request
                         .prepared_lfm3_audio_model_lease_for_executor()
                         .is_ok_and(|model| model.is_some())
                     || (self.config.model_registry.is_none() && self.loaded_tts_model.is_some());
@@ -3406,6 +3412,7 @@ impl ModelExecutor for NativeExecutor {
                         | crate::catalog::ModelFamily::ChatterboxTts
                         | crate::catalog::ModelFamily::Maya1Tts
                         | crate::catalog::ModelFamily::Maya2Tts
+                        | crate::catalog::ModelFamily::VoxtralTts
                         | crate::catalog::ModelFamily::Lfm3Audio
                 ))
             }
@@ -3454,6 +3461,7 @@ impl ModelExecutor for NativeExecutor {
                             | crate::catalog::ModelFamily::ChatterboxTts
                             | crate::catalog::ModelFamily::Maya1Tts
                             | crate::catalog::ModelFamily::Maya2Tts
+                            | crate::catalog::ModelFamily::VoxtralTts
                             | crate::catalog::ModelFamily::Lfm3Audio
                     )
                 }
@@ -3545,6 +3553,14 @@ impl ModelExecutor for NativeExecutor {
                 .or_else(|| {
                     request
                         .prepared_maya2_tts_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| true)
+                })
+                // A Voxtral TTS prompt prefills in spans from its own cursor.
+                .or_else(|| {
+                    request
+                        .prepared_voxtral_tts_model_lease_for_executor()
                         .ok()
                         .flatten()
                         .map(|_| true)
@@ -7796,6 +7812,27 @@ mod tests {
         assert_eq!(profile.prefill, PrefillMode::Full);
         assert!(profile.prefill_spans_required);
         assert_eq!(profile.prefill_grid_tokens, 0);
+    }
+
+    /// Voxtral TTS publishes only sequence stages (preparation, prefill,
+    /// decode, codec): an atomic profile matched none of them, so the engine
+    /// forced every request scalar.
+    #[test]
+    fn voxtral_tts_raw_profile_uses_the_sequence_execution_route() {
+        let executor = NativeExecutor::new(WorkerConfig {
+            backend: BackendKind::Cpu,
+            request_parallelism: 4,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        });
+        let mut request = EngineCoreRequest::tts("The quick brown fox jumps over the lazy dog");
+        request.model_variant = Some(ModelVariant::Voxtral4BTts2603);
+
+        let profile = executor.execution_profile(&request).unwrap();
+
+        assert_eq!(profile.mode, ExecutionMode::Sequence);
+        assert!(profile.incremental_decode);
+        assert_eq!(profile.prefill, PrefillMode::Full);
     }
 
     #[test]
