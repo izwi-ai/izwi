@@ -2242,6 +2242,25 @@ impl VibeVoiceAsrModel {
 }
 
 impl VibeVoiceAsrDecodeState {
+    /// The diagnostics of a row that ends on the retained route.
+    pub(crate) fn retained_terminal_diagnostics(&self) -> serde_json::Value {
+        let geometry = self.prepared.as_ref().map(|artifact| artifact.geometry);
+        serde_json::json!({
+            "model_family": "vibevoice_asr",
+            "audio": {
+                "input_samples": geometry.map(|geometry| geometry.input_samples),
+                "input_sample_rate": geometry.map(|geometry| geometry.input_sample_rate),
+                "processed_samples": geometry.map(|geometry| geometry.processed_samples),
+                "acoustic_frames": geometry.map(|geometry| geometry.acoustic_frames),
+            },
+            "prompt": { "prompt_tokens": self.prompt_tokens },
+            "decode": {
+                "max_new_tokens": self.max_new_tokens,
+                "generated_tokens": self.generated.len(),
+            },
+        })
+    }
+
     pub(crate) fn prepared_artifact(&self) -> Option<Arc<VibeVoiceAsrPreparedArtifact>> {
         self.prepared.clone()
     }

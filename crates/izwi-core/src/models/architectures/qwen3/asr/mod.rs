@@ -892,6 +892,16 @@ pub(crate) struct AsrDecodeCheckpoint {
 }
 
 impl AsrDecodeState {
+    /// The diagnostics of a row that ends on the retained route: its front
+    /// end, prompt and prefill as prepared, and the tokens it generated.
+    pub(crate) fn retained_terminal_diagnostics(&self) -> serde_json::Value {
+        let mut diagnostics = self.diagnostics.clone();
+        diagnostics.generated_tokens = self.generated_ids.len();
+        diagnostics.to_json()
+    }
+}
+
+impl AsrDecodeState {
     pub(crate) fn prefill_progress(&self) -> usize {
         self.prefill_progress
     }

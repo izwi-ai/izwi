@@ -1096,6 +1096,16 @@ pub(crate) enum NativeAsrDecodeCheckpoint {
 }
 
 impl NativeAsrDecodeState {
+    /// The family's own diagnostics for a row that ends on the retained
+    /// route, where it publishes any.
+    pub(crate) fn retained_terminal_diagnostics(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Qwen3(state) => Some(state.retained_terminal_diagnostics()),
+            Self::VibeVoice(state) => Some(state.retained_terminal_diagnostics()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn vibevoice_prepared_artifact(&self) -> Option<Arc<VibeVoiceAsrPreparedArtifact>> {
         match self {
             Self::VibeVoice(state) => state.prepared_artifact(),

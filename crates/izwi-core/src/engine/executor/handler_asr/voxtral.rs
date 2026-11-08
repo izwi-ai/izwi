@@ -72,6 +72,7 @@ impl NativeExecutor {
                         last_tokens_generated: 0,
                         stream_sequence: 0,
                         input_sample_rate: 0,
+                        clock: Default::default(),
                     })?;
                 }
                 leases.push(lease);
@@ -887,6 +888,7 @@ impl NativeExecutor {
                 last_tokens_generated: 0,
                 stream_sequence: 0,
                 input_sample_rate: 0,
+                clock: Default::default(),
             })?;
         }
 
@@ -1236,6 +1238,7 @@ impl NativeExecutor {
                 last_tokens_generated: 0,
                 stream_sequence: 0,
                 input_sample_rate: 0,
+                clock: Default::default(),
             })?;
         }
         let (prior_tokens, prior_stream_sequence, prior_input_sample_rate, prior_cache_len) = {

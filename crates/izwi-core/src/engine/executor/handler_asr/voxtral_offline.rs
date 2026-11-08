@@ -188,6 +188,14 @@ impl VoxtralOfflineStepRow for VoxtralOfflineRow<'_> {
         let text = active.state.text().to_string();
         let finished = active.state.is_finished();
         let sample_rate = active.input_sample_rate;
+        // A finishing row publishes its diagnostics once.
+        let diagnostics = finished.then(|| {
+            active.clock.diagnostics(Some(serde_json::json!({
+                "model_family": "voxtral_realtime",
+                "audio": { "prepared_frames": active.state.prepared_audio_frames() },
+                "decode": { "tokens_generated": step.tokens_generated },
+            })))
+        });
         lease.validate_defer()?;
         // Nothing below fails: the row leaves its rollback-capable lease.
         let completions = cache.take_completed_writes();
@@ -220,7 +228,7 @@ impl VoxtralOfflineStepRow for VoxtralOfflineRow<'_> {
             tokens_generated: self.tokens_generated,
             finished,
             phase_timing_override: None,
-            asr_diagnostics: None,
+            asr_diagnostics: diagnostics,
             error: None,
             logprobs: Vec::new(),
         })
@@ -321,6 +329,7 @@ impl NativeExecutor {
                 last_tokens_generated: 0,
                 stream_sequence: 0,
                 input_sample_rate: artifact.source_sample_rate(),
+                clock: Default::default(),
             })?;
             (prompt, prompt, 1)
         } else {
@@ -384,6 +393,7 @@ impl NativeExecutor {
             ));
         }
         let mut row = self.voxtral_offline_row(0, request, scheduled, managed)?;
+        let prefill_started = std::time::Instant::now();
         let prefill = Self::run_blocking(|| {
             let VoxtralOfflineRow { lease, cache, .. } = &mut row;
             let active = lease
@@ -398,7 +408,12 @@ impl NativeExecutor {
                 .prefill_realtime_in_quantum(&mut active.state, cache)
         });
         let step = match prefill {
-            Ok(step) => step,
+            Ok(step) => {
+                row.active_mut()?
+                    .clock
+                    .record_prefill(prefill_started.elapsed());
+                step
+            }
             Err(error) => {
                 return match row.rollback() {
                     Ok(()) => Err(error),
@@ -488,6 +503,7 @@ impl NativeExecutor {
             }
         }
         if let Some(model) = model.filter(|_| !live.is_empty()) {
+            let decode_started = std::time::Instant::now();
             let forward = {
                 let mut batch = live
                     .iter_mut()
@@ -531,6 +547,10 @@ impl NativeExecutor {
                     };
                 }
             };
+            let decode_elapsed = decode_started.elapsed();
+            for row in &mut live {
+                row.active_mut()?.clock.record_decode(decode_elapsed);
+            }
             crate::engine::metrics::record_engine_model_call(
                 crate::engine::metrics::EngineModelCall::NativeTensor {
                     mode: crate::engine::NativeBatchMode::Continuous,

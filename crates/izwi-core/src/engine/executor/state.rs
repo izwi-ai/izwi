@@ -110,6 +110,50 @@ pub(super) struct ActiveAsrDecode {
     pub(super) stream_sequence: usize,
     pub(super) input_sample_rate: u32,
     pub(super) input_sample_count: usize,
+    pub(super) clock: RetainedAsrClock,
+}
+
+/// Wall time a retained ASR row spent in the prefill and decode dispatches
+/// that carried it, for its final `asr_diagnostics`. A batched step counts
+/// in full for every row it carried.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct RetainedAsrClock {
+    prefill_ms: f64,
+    prefill_dispatches: usize,
+    decode_wall_ms: f64,
+    decode_steps: usize,
+}
+
+impl RetainedAsrClock {
+    pub(super) fn record_prefill(&mut self, elapsed: std::time::Duration) {
+        self.prefill_ms += elapsed.as_secs_f64() * 1000.0;
+        self.prefill_dispatches += 1;
+    }
+
+    pub(super) fn record_decode(&mut self, elapsed: std::time::Duration) {
+        self.decode_wall_ms += elapsed.as_secs_f64() * 1000.0;
+        self.decode_steps += 1;
+    }
+
+    /// The row's final diagnostics: the family's own (if it publishes any)
+    /// with the retained route and its dispatch times.
+    pub(super) fn diagnostics(&self, family: Option<serde_json::Value>) -> serde_json::Value {
+        let mut diagnostics = match family {
+            Some(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        diagnostics.insert("route".into(), "retained_sequence".into());
+        diagnostics.insert(
+            "retained_timings_ms".into(),
+            serde_json::json!({
+                "prefill": self.prefill_ms,
+                "prefill_dispatches": self.prefill_dispatches,
+                "decode_wall": self.decode_wall_ms,
+                "decode_steps": self.decode_steps,
+            }),
+        );
+        serde_json::Value::Object(diagnostics)
+    }
 }
 
 pub(super) struct ActiveLfm25AsrDecode {
@@ -305,6 +349,8 @@ pub(super) struct ActiveVoxtralRealtime {
     pub(super) last_tokens_generated: usize,
     pub(super) stream_sequence: usize,
     pub(super) input_sample_rate: u32,
+    /// Prefill and decode time of an offline row, for its diagnostics.
+    pub(super) clock: RetainedAsrClock,
 }
 
 /// A Voxtral host/cache transaction that has completed model execution but is
@@ -369,5 +415,27 @@ mod tests {
         let tokens: Vec<&str> = terminal.iter().map(|entry| entry.token.as_str()).collect();
         assert_eq!(tokens, ["a", "b", "c"]);
         assert!(accumulated.is_empty());
+    }
+
+    /// A retained row's diagnostics keep the family's own fields and add the
+    /// route and the dispatch times it was carried through.
+    #[test]
+    fn retained_clock_extends_the_family_diagnostics() {
+        let mut clock = super::RetainedAsrClock::default();
+        clock.record_prefill(std::time::Duration::from_millis(4));
+        clock.record_decode(std::time::Duration::from_millis(2));
+        clock.record_decode(std::time::Duration::from_millis(3));
+        let diagnostics =
+            clock.diagnostics(Some(serde_json::json!({ "model_family": "qwen3_asr" })));
+        assert_eq!(diagnostics["model_family"], "qwen3_asr");
+        assert_eq!(diagnostics["route"], "retained_sequence");
+        let timings = &diagnostics["retained_timings_ms"];
+        assert_eq!(timings["prefill_dispatches"], 1);
+        assert_eq!(timings["decode_steps"], 2);
+        assert!((timings["decode_wall"].as_f64().unwrap() - 5.0).abs() < 1e-9);
+        assert!((timings["prefill"].as_f64().unwrap() - 4.0).abs() < 1e-9);
+        let bare = super::RetainedAsrClock::default().diagnostics(None);
+        assert_eq!(bare["route"], "retained_sequence");
+        assert_eq!(bare["retained_timings_ms"]["decode_steps"], 0);
     }
 }

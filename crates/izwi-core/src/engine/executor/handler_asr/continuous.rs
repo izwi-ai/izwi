@@ -366,6 +366,7 @@ impl NativeExecutor {
             .map(|(_, _, lease, _)| lease.require_state_mut().map(|state| &mut state.state))
             .collect::<Result<Vec<_>>>()?;
         let live_width = state_refs.len();
+        let decode_started = std::time::Instant::now();
         let steps = if state_refs.is_empty() {
             Vec::new()
         } else if state_refs.len() == 1 {
@@ -374,6 +375,14 @@ impl NativeExecutor {
             Self::run_blocking(|| model.decode_step_batch(&mut state_refs))?
         };
         drop(state_refs);
+        let decode_elapsed = decode_started.elapsed();
+        for row in &call_rows {
+            active_states.rows[*row]
+                .2
+                .require_state_mut()?
+                .clock
+                .record_decode(decode_elapsed);
+        }
         // One native batch call may outlive cancellation of any subset of its
         // rows. Observe every row before staging tensor state, emitting text,
         // or detaching write completions while all checkpoints remain armed.
@@ -456,8 +465,20 @@ impl NativeExecutor {
                 continue;
             }
 
-            let (step_tokens_generated, input_sample_rate, input_sample_count, stream_result) = {
+            let (
+                step_tokens_generated,
+                input_sample_rate,
+                input_sample_count,
+                stream_result,
+                diagnostics,
+            ) = {
                 let active_state = active_states.rows[row].2.require_state_mut()?;
+                // A finishing row publishes its diagnostics once.
+                let diagnostics = step.finished.then(|| {
+                    active_state
+                        .clock
+                        .diagnostics(active_state.state.retained_terminal_diagnostics())
+                });
                 let step_tokens_generated = step
                     .tokens_generated
                     .saturating_sub(active_state.last_tokens_generated);
@@ -490,6 +511,7 @@ impl NativeExecutor {
                     active_state.input_sample_rate,
                     active_state.input_sample_count,
                     stream_result,
+                    diagnostics,
                 )
             };
             if let Err(error) = stream_result {
@@ -542,7 +564,7 @@ impl NativeExecutor {
                     tokens_generated: step_tokens_generated,
                     finished: step.finished,
                     phase_timing_override: None,
-                    asr_diagnostics: None,
+                    asr_diagnostics: diagnostics,
                     error: None,
                     logprobs: Vec::new(),
                 })
