@@ -1440,6 +1440,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Checkpoint directory of NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-FP8 for the ignored real-checkpoint tests.",
     ),
     CoreEnvVar::new(
+        "IZWI_NEMOTRON_TRANSCRIBE_PREFILL_PROFILE",
+        Flag,
+        "false",
+        Once,
+        "Times Nemotron 3.5 Transcribe prefill by decoder layer kind (Mamba, MoE, attention), waiting for the device around every layer; reported in the request diagnostics and izwi_asr_phase_seconds. Costs prefill throughput, for profiling runs only.",
+    ),
+    CoreEnvVar::new(
         "IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN",
         Int,
         "512 on CUDA, 192 on CPU and Metal",

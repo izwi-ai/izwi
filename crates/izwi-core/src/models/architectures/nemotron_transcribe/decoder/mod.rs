@@ -32,6 +32,72 @@ use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedP
 use attention::AttentionMixer;
 use mamba::MambaMixer;
 use moe::{MoeMixer, Routing};
+
+/// Prefill time by decoder layer kind, measured only when
+/// `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_PROFILE` is on: each layer then waits
+/// for the device before and after it, so the split is device time.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct PrefillLayerTimes {
+    pub(crate) mamba: std::time::Duration,
+    pub(crate) moe: std::time::Duration,
+    pub(crate) attention: std::time::Duration,
+}
+
+thread_local! {
+    static PREFILL_LAYER_TIMES: std::cell::Cell<PrefillLayerTimes> =
+        const { std::cell::Cell::new(PrefillLayerTimes {
+            mamba: std::time::Duration::ZERO,
+            moe: std::time::Duration::ZERO,
+            attention: std::time::Duration::ZERO,
+        }) };
+}
+
+/// Whether prefill spans time each layer kind
+/// (`IZWI_NEMOTRON_TRANSCRIBE_PREFILL_PROFILE`, off by default).
+pub(crate) fn prefill_profile_enabled() -> bool {
+    static ENABLED: crate::env::ReadOnce<bool> = crate::env::ReadOnce::new(|| {
+        crate::env::flag_or("IZWI_NEMOTRON_TRANSCRIBE_PREFILL_PROFILE", false)
+    });
+    ENABLED.get()
+}
+
+/// The layer-kind prefill time this thread measured since the last call.
+pub(crate) fn take_prefill_layer_times() -> PrefillLayerTimes {
+    PREFILL_LAYER_TIMES.with(|times| times.replace(PrefillLayerTimes::default()))
+}
+
+/// Starts timing one prefill layer when profiling: waits for the device so
+/// earlier layers' work is not counted.
+fn begin_profiled_layer(x: &Tensor) -> Result<Option<std::time::Instant>> {
+    if !prefill_profile_enabled() {
+        return Ok(None);
+    }
+    x.device().synchronize()?;
+    Ok(Some(std::time::Instant::now()))
+}
+
+/// Ends timing one prefill layer of `mixer`'s kind.
+fn end_profiled_layer(
+    started: Option<std::time::Instant>,
+    mixer: &Mixer,
+    out: &Tensor,
+) -> Result<()> {
+    let Some(started) = started else {
+        return Ok(());
+    };
+    out.device().synchronize()?;
+    let elapsed = started.elapsed();
+    PREFILL_LAYER_TIMES.with(|times| {
+        let mut total = times.get();
+        match mixer {
+            Mixer::Mamba { .. } => total.mamba += elapsed,
+            Mixer::Moe(_) => total.moe += elapsed,
+            Mixer::Attention { .. } => total.attention += elapsed,
+        }
+        times.set(total);
+    });
+    Ok(())
+}
 pub use state::NemotronMambaState;
 
 enum Mixer {
@@ -506,6 +572,7 @@ impl NemotronDecoder {
                     Some(h) => h,
                     None => candle_nn::ops::rms_norm(&x, &layer.norm, eps)?,
                 };
+                let profiled = begin_profiled_layer(&h)?;
                 let out = match &layer.mixer {
                     Mixer::Mamba { index, mixer } => {
                         let (out, conv, ssm) = mixer.forward(
@@ -537,6 +604,7 @@ impl NemotronDecoder {
                         mixer.output(&attended, Pass::Span)?
                     }
                 };
+                end_profiled_layer(profiled, &layer.mixer, &out)?;
                 if self.fused() {
                     // The next layer's norm (or the final one) with the add.
                     let gain = self.layers.get(index + 1).map_or(&self.norm_f, |l| &l.norm);
@@ -630,6 +698,7 @@ impl NemotronDecoder {
                     Some(h) => h,
                     None => candle_nn::ops::rms_norm(&x, &layer.norm, eps)?,
                 };
+                let profiled = begin_profiled_layer(&h)?;
                 let out = match &layer.mixer {
                     Mixer::Mamba { index, mixer } => {
                         let conv = next.iter().map(|s| &s.conv[*index]).collect::<Vec<_>>();
@@ -663,6 +732,7 @@ impl NemotronDecoder {
                         mixer.output_packed(&Tensor::cat(&attended, 0)?, &lengths)?
                     }
                 };
+                end_profiled_layer(profiled, &layer.mixer, &out)?;
                 if self.fused() {
                     let gain = self.layers.get(index + 1).map_or(&self.norm_f, |l| &l.norm);
                     let (sum, h) = residual_norm::add_rms_norm(&x, &out, gain, eps, DType::F32)?;

@@ -221,6 +221,48 @@ fn span_size_does_not_change_the_prefill() {
     assert_eq!(run(64), whole);
 }
 
+/// The layer-kind prefill split appears in a row's timing only once a
+/// profiled span added to it; an unprofiled prefill leaves no times behind.
+#[test]
+fn prefill_layer_times_report_only_when_profiled() {
+    use super::decoder::{prefill_profile_enabled, take_prefill_layer_times, PrefillLayerTimes};
+    use super::model::NemotronRowTiming;
+    use std::time::Duration;
+
+    let mut timing = NemotronRowTiming::default();
+    assert!(timing.to_json().get("prefill_by_layer_ms").is_none());
+    timing.add_prefill_layers(PrefillLayerTimes {
+        mamba: Duration::from_millis(3),
+        moe: Duration::from_millis(5),
+        attention: Duration::from_millis(1),
+    });
+    let json = timing.to_json();
+    assert_eq!(json["prefill_by_layer_ms"]["mamba"], 3.0);
+    assert_eq!(json["prefill_by_layer_ms"]["moe"], 5.0);
+    assert_eq!(json["prefill_by_layer_ms"]["attention"], 1.0);
+
+    // With IZWI_NEMOTRON_TRANSCRIBE_PREFILL_PROFILE=1 the same prefill
+    // fills the split instead.
+    let dir = temp_checkpoint();
+    let model = NemotronTranscribeModel::load_on(dir.path(), None, &Device::Cpu).unwrap();
+    let artifact = Arc::new(model.prepare(&test_audio(1.0, 3), request(4)).unwrap());
+    let mut cache = caches(&Device::Cpu, &model, 1, 1024).remove(0);
+    let mut state = model.new_row(artifact, 1024).unwrap();
+    let span = state.prompt_tokens();
+    model
+        .retained_prefill(&mut state, &mut cache, span)
+        .unwrap();
+    assert_eq!(take_prefill_layer_times(), PrefillLayerTimes::default());
+    let timing = state.timing();
+    let split = timing.prefill_mamba_ms + timing.prefill_moe_ms + timing.prefill_attention_ms;
+    if prefill_profile_enabled() {
+        assert!(timing.prefill_mamba_ms > 0.0 && timing.prefill_moe_ms > 0.0);
+        assert!(split <= timing.prefill_ms);
+    } else {
+        assert_eq!(split, 0.0);
+    }
+}
+
 /// A row decoded beside other rows is bit-identical to the row decoded
 /// alone, at every step.
 #[test]

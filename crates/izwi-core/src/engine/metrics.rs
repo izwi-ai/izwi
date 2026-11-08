@@ -1591,6 +1591,11 @@ pub(crate) enum AsrPhase {
     Decode,
     /// Detokenisation inside one engine dispatch.
     Detok,
+    /// Nemotron Transcribe prefill by decoder layer kind, under
+    /// `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_PROFILE` only.
+    PrefillMamba,
+    PrefillMoe,
+    PrefillAttention,
 }
 
 impl AsrPhase {
@@ -1602,6 +1607,9 @@ impl AsrPhase {
             Self::Prefill => "prefill",
             Self::Decode => "decode",
             Self::Detok => "detok",
+            Self::PrefillMamba => "prefill_mamba",
+            Self::PrefillMoe => "prefill_moe",
+            Self::PrefillAttention => "prefill_attention",
         }
     }
 }

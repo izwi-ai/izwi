@@ -27,7 +27,8 @@ use super::ctc::{
 };
 use super::ctc_head::NemotronCtcHead;
 use super::decoder::{
-    DecodeRow, DecoderTrace, NemotronDecoder, NemotronMambaState, SpanRow, TraceRequest,
+    take_prefill_layer_times, DecodeRow, DecoderTrace, NemotronDecoder, NemotronMambaState,
+    PrefillLayerTimes, SpanRow, TraceRequest,
 };
 use super::frontend::NemotronMelFrontend;
 use super::linear::Residency;
@@ -187,6 +188,11 @@ pub struct NemotronPreparedArtifact {
 pub struct NemotronRowTiming {
     pub preparation_ms: f64,
     pub prefill_ms: f64,
+    /// Prefill device time by decoder layer kind, measured only under
+    /// `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_PROFILE`.
+    pub prefill_mamba_ms: f64,
+    pub prefill_moe_ms: f64,
+    pub prefill_attention_ms: f64,
     pub perception_ms: f64,
     pub prefill_spans: u64,
     pub decode_ms: f64,
@@ -195,8 +201,18 @@ pub struct NemotronRowTiming {
 }
 
 impl NemotronRowTiming {
+    /// Adds one profiled span's layer-kind times.
+    pub(crate) fn add_prefill_layers(&mut self, layers: PrefillLayerTimes) {
+        let ms = |duration: std::time::Duration| duration.as_secs_f64() * 1e3;
+        self.prefill_mamba_ms += ms(layers.mamba);
+        self.prefill_moe_ms += ms(layers.moe);
+        self.prefill_attention_ms += ms(layers.attention);
+    }
+
     pub fn to_json(&self) -> serde_json::Value {
-        json!({
+        let profiled =
+            self.prefill_mamba_ms + self.prefill_moe_ms + self.prefill_attention_ms > 0.0;
+        let mut timing = json!({
             "preparation_ms": self.preparation_ms,
             "prefill_ms": self.prefill_ms,
             "perception_ms": self.perception_ms,
@@ -206,7 +222,15 @@ impl NemotronRowTiming {
             "ms_per_decode_step": (self.decode_steps > 0)
                 .then(|| self.decode_ms / self.decode_steps as f64),
             "ctc_ms": self.ctc_ms,
-        })
+        });
+        if profiled {
+            timing["prefill_by_layer_ms"] = json!({
+                "mamba": self.prefill_mamba_ms,
+                "moe": self.prefill_moe_ms,
+                "attention": self.prefill_attention_ms,
+            });
+        }
+        timing
     }
 }
 
@@ -746,6 +770,21 @@ impl NemotronTranscribeModel {
     }
 
     /// The prefill span a row takes while it prefills alone (read at load).
+    /// Records one prefill call's profiled layer-kind times as the model's
+    /// `prefill_<kind>` phases; nothing when profiling is off.
+    fn record_prefill_layers(&self, layers: PrefillLayerTimes) {
+        use crate::engine::metrics::{record_asr_phase, AsrPhase};
+        let Some(model) = self.variant.as_ref().map(ModelVariant::dir_name) else {
+            return;
+        };
+        if layers == PrefillLayerTimes::default() {
+            return;
+        }
+        record_asr_phase(model, AsrPhase::PrefillMamba, layers.mamba);
+        record_asr_phase(model, AsrPhase::PrefillMoe, layers.moe);
+        record_asr_phase(model, AsrPhase::PrefillAttention, layers.attention);
+    }
+
     pub fn prefill_span(&self) -> usize {
         self.prefill_span
     }
@@ -1085,6 +1124,7 @@ impl NemotronTranscribeModel {
         }
         let embeds = self.span_embeddings(state, start, span)?;
         let mut trace = trace;
+        let _ = take_prefill_layer_times();
         let hidden = self.decoder.forward_span(
             &embeds,
             &mut state.mamba,
@@ -1110,6 +1150,9 @@ impl NemotronTranscribeModel {
         let elapsed = started.elapsed();
         state.timing.prefill_ms += elapsed.as_secs_f64() * 1e3;
         state.timing.prefill_spans += 1;
+        let layers = take_prefill_layer_times();
+        state.timing.add_prefill_layers(layers);
+        self.record_prefill_layers(layers);
         self.diagnostics
             .prefill_us
             .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
@@ -1181,6 +1224,7 @@ impl NemotronTranscribeModel {
                 cache: &mut *row.cache,
             })
             .collect::<Vec<_>>();
+        let _ = take_prefill_layer_times();
         let packed = self.decoder.forward_spans(&mut spans)?;
         drop(spans);
         for (row, pick) in rows.iter_mut().zip(packed.picks) {
@@ -1190,10 +1234,13 @@ impl NemotronTranscribeModel {
             }
         }
         let elapsed = started.elapsed();
+        let layers = take_prefill_layer_times();
         for row in rows.iter_mut() {
             row.state.timing.prefill_ms += elapsed.as_secs_f64() * 1e3;
             row.state.timing.prefill_spans += 1;
+            row.state.timing.add_prefill_layers(layers);
         }
+        self.record_prefill_layers(layers);
         let d = &self.diagnostics;
         d.prefill_spans
             .fetch_add(rows.len() as u64, Ordering::Relaxed);
