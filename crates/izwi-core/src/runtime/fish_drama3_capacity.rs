@@ -41,6 +41,30 @@ use crate::runtime::fish_capacity::ResolvedFishServingCapacity;
 pub(crate) const NATIVE_BATCHING_ENV: &str = "IZWI_FISH_DRAMA3_NATIVE_BATCHING";
 /// CUDA's automatic decode width (D12).
 pub(crate) const CUDA_WIDTH: usize = 8;
+/// CUDA decode rows an operator may ask for (`IZWI_FISH_DRAMA3_CUDA_WIDTH`).
+pub(crate) const CUDA_WIDTH_ENV: &str = "IZWI_FISH_DRAMA3_CUDA_WIDTH";
+
+/// CUDA decode rows: `value` (1 to the CUDA ceiling), else [`CUDA_WIDTH`].
+/// On the H100 Drama 3 stayed at ~4.9 audio-s/s from 8 to 64 streams, the
+/// width of eight; its decode graphs cover 1 to 4 rows and 8, so a wider
+/// step runs eagerly, and whether that pays is measured per GPU. An invalid
+/// value keeps the default (with a warning).
+pub(crate) fn cuda_width(value: Option<&str>) -> usize {
+    let Some(value) = value else {
+        return CUDA_WIDTH;
+    };
+    match value.trim().parse::<usize>() {
+        Ok(rows) if (1..=crate::catalog::EXPLICIT_WIDTH_CEILING).contains(&rows) => rows,
+        _ => {
+            tracing::warn!(
+                value,
+                default = CUDA_WIDTH,
+                "Ignoring {CUDA_WIDTH_ENV} outside 1..=32"
+            );
+            CUDA_WIDTH
+        }
+    }
+}
 /// Prefill rows per span on CUDA (the CPU and Metal take
 /// [`DEFAULT_PREFILL_SPAN_ROWS`]).
 pub(crate) const CUDA_PREFILL_SPAN_ROWS: usize = 1_024;
@@ -71,13 +95,15 @@ pub(crate) fn native_batching_from_env() -> Result<bool> {
 
 /// The widest decode batch the family serves on `backend`.
 pub(crate) fn decode_width(backend: BackendKind, native_batching: bool) -> usize {
+    if backend == BackendKind::Cuda {
+        return cuda_width(crate::env::value(CUDA_WIDTH_ENV).as_deref());
+    }
     let certified =
         crate::catalog::certified_decode_width(crate::catalog::ModelFamily::FishDrama3Tts, backend);
-    match backend {
-        BackendKind::Cpu => certified,
-        BackendKind::Metal if native_batching => certified.max(2),
-        BackendKind::Metal => certified,
-        BackendKind::Cuda => certified.min(CUDA_WIDTH),
+    if backend == BackendKind::Metal && native_batching {
+        certified.max(2)
+    } else {
+        certified
     }
 }
 
@@ -379,6 +405,16 @@ impl ResolvedFishDrama3Capacity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cuda_width_takes_one_to_thirty_two_rows_else_eight() {
+        assert_eq!(cuda_width(None), 8);
+        assert_eq!(cuda_width(Some("16")), 16);
+        assert_eq!(cuda_width(Some(" 32 ")), 32);
+        for invalid in ["0", "33", "wide"] {
+            assert_eq!(cuda_width(Some(invalid)), 8, "{invalid}");
+        }
+    }
     use crate::models::architectures::fish_drama3::config::FishDrama3ConfigPolicy;
 
     const GIB: u64 = 1024 * 1024 * 1024;

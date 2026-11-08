@@ -413,6 +413,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Stores the Fish Audio Drama 3 paged KV as F16 on the CPU (94 to 47 KiB per position); attention still accumulates in F32.",
     ),
     CoreEnvVar::new(
+        "IZWI_FISH_DRAMA3_CUDA_WIDTH",
+        Int,
+        "8",
+        Load,
+        "Fish Audio Drama 3 decode rows per CUDA step (1 to 32), fixed per load; steps wider than eight rows run without decode graphs.",
+    ),
+    CoreEnvVar::new(
         "IZWI_FISH_DRAMA3_DTYPE",
         Choice,
         "the backend's (f16 on Metal, bf16 on CUDA, f32 on CPU)",
