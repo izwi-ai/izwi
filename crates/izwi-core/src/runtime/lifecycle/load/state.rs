@@ -188,19 +188,36 @@ impl ModelLifecycleController {
                         "Granite Speech retained decoder has no context bound".into(),
                     )
                 })?;
+                // Every sequence claims its pages from one shared pool, so
+                // the pool holds one automatic sequence (its prompt, one
+                // planned chunk's audio and its budget) per retained row, as
+                // Qwen3-ASR's does, and never less than one sequence of the
+                // decoder's whole context. A pool of one context admitted
+                // one request at a time.
+                let rows = self.asr_state_rows(bundle_draft)?;
+                let pool_tokens = asr_shared_pool_tokens(
+                    retained_max_tokens,
+                    asr_minimum_tokens(variant),
+                    rows.0,
+                );
                 let retained = self
                     .core_engine
                     .load_managed_model_state_with_portable_copies(
                         model_instance_id,
                         retained_contract,
-                        Some(retained_max_tokens),
+                        Some(pool_tokens),
                         2,
-                        self.asr_state_rows(bundle_draft)?,
+                        rows,
                         asr_minimum_tokens(variant),
                     )
                     .await?;
-                self.model_registry
-                    .publish_effective_context(variant, retained.logical_token_reach())?;
+                // One sequence never reaches past the decoder's context.
+                self.model_registry.publish_effective_context(
+                    variant,
+                    retained
+                        .logical_token_reach()
+                        .min(retained_max_tokens as u64),
+                )?;
                 self.model_registry.publish_kv_storage(variant, &retained);
                 crate::runtime::rollout::validate_managed_state_plan_eligibility(
                     variant,

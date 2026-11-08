@@ -813,6 +813,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Forces the Granite Speech dtype (f32, f16, bf16 and aliases; --granite-speech-dtype wins); f32 also disables the Metal F16 encoder and LM paths.",
     ),
     CoreEnvVar::new(
+        "IZWI_GRANITE_SPEECH_RETAINED_DECODE",
+        Flag,
+        "true",
+        Once,
+        "Runs single-segment Granite Speech 4.1 ASR on its retained route, where concurrent requests decode together (one batched step per token, up to 32 rows on CUDA); false runs every request as one atomic invocation and fits no retained decoder state.",
+    ),
+    CoreEnvVar::new(
         "IZWI_GRANITE_TOKEN_DEBUG",
         Flag,
         "false",

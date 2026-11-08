@@ -726,10 +726,10 @@ impl LoadedExecutionAdapterFactory for GraniteSpeechPhysicalAsrAdapterFactory {
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
+        use crate::models::architectures::granite_speech::asr::granite_speech_retained_decode_enabled;
         // Continuous decode batching lives on the retained sequence graph,
         // which the adapter offers only with resumable prefill (GRN-8).
-        if crate::models::architectures::granite_speech::asr::GraniteSpeechAsrModel::RESUMABLE_PREFILL
-        {
+        if granite_speech_retained_decode_enabled() {
             NativeBatchMode::Continuous
         } else {
             NativeBatchMode::None
@@ -745,13 +745,16 @@ impl LoadedExecutionAdapterFactory for GraniteSpeechPhysicalAsrAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(GraniteSpeechAsrExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            GraniteSpeechAsrExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 

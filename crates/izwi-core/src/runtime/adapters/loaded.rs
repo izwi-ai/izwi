@@ -49,8 +49,8 @@ pub(super) use factories::built_in_loaded_adapter_factories;
 #[cfg(test)]
 use factories::{
     ContinuousPhysicalChatAdapterFactory, FishS2PhysicalTtsAdapterFactory,
-    Lfm25AudioPhysicalAsrAdapterFactory, Lfm25AudioPhysicalTtsAdapterFactory,
-    ScalarExecutionAdapterFactory,
+    GraniteSpeechPhysicalAsrAdapterFactory, Lfm25AudioPhysicalAsrAdapterFactory,
+    Lfm25AudioPhysicalTtsAdapterFactory, ScalarExecutionAdapterFactory,
 };
 use realtime::{
     Lfm3AudioRealtimeExecutionAdapter, NemotronRealtimeExecutionAdapter,

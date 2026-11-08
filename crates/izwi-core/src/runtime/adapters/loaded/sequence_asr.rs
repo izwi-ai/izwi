@@ -19,7 +19,10 @@ pub(super) struct GraniteSpeechAsrExecutionAdapter {
     pub(super) adapter_instance_id: AdapterInstanceId,
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
+    /// The encoder preparation's width: the engine rows.
     pub(super) max_batch_size: usize,
+    /// The continuous decode's width, at least `max_batch_size`.
+    pub(super) decode_batch_size: usize,
     /// Whether the capability offers its retained sequence graph. Request
     /// preparation routes ASR there only for a model with resumable prefill,
     /// so without it every requirement resolves to the atomic graph and the
@@ -45,10 +48,18 @@ impl GraniteSpeechAsrExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
             retained_route:
-                crate::models::architectures::granite_speech::asr::GraniteSpeechAsrModel::RESUMABLE_PREFILL,
+                crate::models::architectures::granite_speech::asr::granite_speech_retained_decode_enabled(),
             seal: OnceLock::new(),
         }
+    }
+
+    /// Decode up to `rows` rows per step; the encoder preparation keeps the
+    /// width the adapter was built with.
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
     }
 
     pub(super) fn install_preparation_seal(&self, seal: GraniteSpeechAsrExecutionSeal) -> Result<()> {
@@ -273,7 +284,9 @@ impl LoadedExecutionAdapter for GraniteSpeechAsrExecutionAdapter {
         profile.recompute_safe = true;
         profile.cache_release_safe = true;
         profile.prefix_reuse_safe = false;
-        profile.max_batch_size = self.max_batch_size;
+        // The encoder batches at the engine rows and the decode at its own
+        // width; the prompt prefill stays scalar.
+        profile.max_batch_size = self.decode_batch_size;
         profile.resolved_from_loaded_model = true;
 
         let native_preparation = self.max_batch_size > 1;
@@ -328,7 +341,7 @@ impl LoadedExecutionAdapter for GraniteSpeechAsrExecutionAdapter {
             continuous_asr_workspace_per_row_bytes(seal.decode_workspace_per_row_bytes)?;
         decode.workspace_per_row_bytes = decode_workspace_per_row;
         decode.max_workspace_bytes = decode_workspace_per_row
-            .checked_mul(u64::try_from(self.max_batch_size).map_err(|_| {
+            .checked_mul(u64::try_from(self.decode_batch_size).map_err(|_| {
                 Error::Overloaded("Granite Speech ASR batch width exceeds u64".into())
             })?)
             .ok_or_else(|| {

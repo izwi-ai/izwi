@@ -833,14 +833,14 @@ impl RuntimeService {
                     request.streaming,
                 );
                 let long_form = plan.requires_chunk_path();
-                // Granite's retained decoder is not quality-certified: the
-                // real model can collapse to tokenizer id 0 for every output
-                // step while its invocation-scoped physical route produces
-                // the expected transcript. Keep retained preparation behind
-                // the model's truthful capability declaration so production
-                // requests use the correctness-proven atomic route.
-                // A native-timestamp request needs the atomic route, which
-                // selects the timestamp task; retained preparation is ASR-only.
+                // A single-segment request runs on the retained route when
+                // the loaded model offers it (`IZWI_GRANITE_SPEECH_RETAINED_DECODE`):
+                // the route emits the atomic route's tokens on the real
+                // checkpoint, and neither route recovers a single segment
+                // from a loop or truncation, which only the chunk route
+                // (always atomic) does. A native-timestamp request needs the
+                // atomic route, which selects the timestamp task; retained
+                // preparation is ASR-only.
                 let retained = !long_form
                     && !request.asr_native_word_timestamps
                     && model_for_shape.supports_resumable_prefill();
@@ -854,8 +854,19 @@ impl RuntimeService {
                         )
                     })
                     .transpose()?;
+                let audio_seconds = samples.len() as f32 / sample_rate.max(1) as f32;
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
                 if let Some(geometry) = geometry {
+                    // Admission claims the sequence's pages for `max_tokens`
+                    // in full: narrow an omitted budget to the one the
+                    // decode uses for this audio's duration, so concurrent
+                    // rows share the retained pool instead of one row
+                    // claiming the automatic 2,048 tokens.
+                    request.params.max_tokens =
+                        crate::runtime::asr::granite_asr_planned_max_tokens(
+                            &request,
+                            audio_seconds,
+                        );
                     request.install_prepared_sequence_input_tokens(
                         geometry.prompt_tokens,
                         context_limit,

@@ -166,20 +166,24 @@ async fn fish_s2_load_publishes_and_seals_both_tts_capabilities() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
-/// A Granite Speech load without resumable prefill publishes invocation
-/// state only, and the bundle seals it: its ASR capability offers no
-/// retained graph (GRN-8), so no graph declares retained cache state beside
-/// the stateless publication, and speaker attribution publishes as before.
+/// A Granite Speech load publishes retained decoder state for its ASR
+/// capability beside invocation-only speaker attribution, and the bundle
+/// seals it: an ordinary requirement binds the retained sequence graph on
+/// the managed decoder pages, a long-form one the atomic graph and its
+/// invocation state. With the retained route switched off
+/// (`IZWI_GRANITE_SPEECH_RETAINED_DECODE`) the ASR capability publishes
+/// invocation state only and every requirement binds the atomic graph
+/// (GRN-8).
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn granite_speech_load_without_resumable_prefill_seals_invocation_only_state() {
+async fn granite_speech_load_publishes_retained_asr_state_beside_attribution() {
     use crate::models::architectures::granite_speech::asr::{
-        granite_speech_test_physical_state_spec, GraniteSpeechAsrModel,
+        granite_speech_retained_decode_enabled, granite_speech_test_physical_state_spec,
     };
     use crate::runtime::adapters::{
         LoadedModelBundleDraft, LoadedStatePublication, StreamingRequirements,
     };
-    const { assert!(!GraniteSpeechAsrModel::RESUMABLE_PREFILL) };
+    let retained_route = granite_speech_retained_decode_enabled();
     // Serialize against OOM-ladder poison windows and load-transaction
     // reservations on the process-global resource authority.
     let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
@@ -191,7 +195,9 @@ async fn granite_speech_load_without_resumable_prefill_seals_invocation_only_sta
     let runtime = RuntimeService::new(EngineConfig {
         models_dir: directory.clone(),
         backend: BackendPreference::Cpu,
-        max_sequence_length: ContextLengthPreference::explicit(32).unwrap(),
+        max_sequence_length: ContextLengthPreference::explicit(1024).unwrap(),
+        max_retained_sequences: 2,
+        max_staged_transactions: 2,
         ..Default::default()
     })
     .unwrap();
@@ -208,13 +214,16 @@ async fn granite_speech_load_without_resumable_prefill_seals_invocation_only_sta
         .install_loading_slot(variant, lease)
         .unwrap();
     let draft = LoadedModelBundleDraft::build(
-        &RuntimeAdapterRegistry::built_in(),
+        &RuntimeAdapterRegistry::built_in_with_execution_limits(2, 1).unwrap(),
         ExecutionGroupId::new(992),
         instance,
         variant,
         BackendKind::Cpu,
     )
     .unwrap();
+    draft
+        .install_test_preparation_seals(BackendKind::Cpu, 2)
+        .unwrap();
     let publications = runtime
         .model_lifecycle
         .load_granite_speech_state_publications(
@@ -236,19 +245,21 @@ async fn granite_speech_load_without_resumable_prefill_seals_invocation_only_sta
         else {
             panic!("Granite Speech {capability:?} must publish physical state");
         };
-        assert!(retained.is_none(), "{capability:?}");
-        assert!(retained_uses.is_empty(), "{capability:?}");
-        assert!(
-            matches!(descriptor.retained, RetainedStateCapability::Stateless),
+        let holds_retained = retained_route && capability == CapabilityKind::Asr;
+        assert_eq!(retained.is_some(), holds_retained, "{capability:?}");
+        assert_eq!(!retained_uses.is_empty(), holds_retained, "{capability:?}");
+        assert_eq!(
+            !matches!(descriptor.retained, RetainedStateCapability::Stateless),
+            holds_retained,
             "{capability:?}"
         );
     }
     let bundle = draft
         .seal(publications)
-        .expect("a Granite Speech load without resumable prefill must seal");
+        .expect("a Granite Speech load must seal");
 
-    // Every ASR requirement, ordinary or long-form, with or without
-    // transport output, binds the atomic graph and its invocation state.
+    // An ordinary requirement binds the retained graph (with or without
+    // transport output); a long-form one the atomic graph.
     for streaming in [
         StreamingRequirements::NONE,
         StreamingRequirements::transport_only(),
@@ -258,7 +269,15 @@ async fn granite_speech_load_without_resumable_prefill_seals_invocation_only_sta
         let contract = bundle
             .contract_for_streaming(CapabilityKind::Asr, streaming)
             .unwrap();
-        assert_eq!(contract.execution_profile.mode, ExecutionMode::Atomic);
+        let sequence = retained_route && !streaming.asr_long_form;
+        assert_eq!(
+            contract.execution_profile.mode,
+            if sequence {
+                ExecutionMode::Sequence
+            } else {
+                ExecutionMode::Atomic
+            }
+        );
         let binding = bundle
             .capability_binding_for_streaming(CapabilityKind::Asr, streaming)
             .unwrap();
@@ -267,7 +286,7 @@ async fn granite_speech_load_without_resumable_prefill_seals_invocation_only_sta
             .state
             .validate_against(BackendKind::Cpu, &binding.execution)
             .unwrap();
-        assert!(binding.state.managed_kv_runtime().is_none());
+        assert_eq!(binding.state.managed_kv_runtime().is_some(), sequence);
     }
     let attributed = bundle
         .capability_binding_for_streaming(

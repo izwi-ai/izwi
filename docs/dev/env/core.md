@@ -125,6 +125,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_GRANITE_SAA_CHUNK_TARGET_SECS` | number | 240 (at most the max chunk length minus the silence-search window) | first use | Sets the preferred chunk length in seconds for Granite speaker-attributed ASR long-form planning. |
 | `IZWI_GRANITE_SAA_MAX_NEW_TOKENS` | integer | 256 + 8 per audio second, clamped 800..4608 | first use | Overrides the max new tokens per Granite speaker-attributed ASR chunk (positive integer). |
 | `IZWI_GRANITE_SPEECH_DTYPE` | choice | auto (family/backend default) | startup | Forces the Granite Speech dtype (f32, f16, bf16 and aliases; --granite-speech-dtype wins); f32 also disables the Metal F16 encoder and LM paths. |
+| `IZWI_GRANITE_SPEECH_RETAINED_DECODE` | flag | `true` | first use | Runs single-segment Granite Speech 4.1 ASR on its retained route, where concurrent requests decode together (one batched step per token, up to 32 rows on CUDA); false runs every request as one atomic invocation and fits no retained decoder state. |
 | `IZWI_GRANITE_TOKEN_DEBUG` | flag | `false` | first use | Adds per-token debug detail to Granite diagnostics; IZWI_GRANITE_TOKEN_DIAGNOSTICS is an alias. |
 | `IZWI_GRANITE_TOKEN_DIAGNOSTICS` | flag | `false` | first use | Alias of IZWI_GRANITE_TOKEN_DEBUG, consulted only when that variable is unset. |
 | `IZWI_HOST` | text | `127.0.0.1` | startup | Sets the HTTP server bind address. |

@@ -5715,13 +5715,13 @@ mod tests {
             ModelFamily::NemotronAsr,
             ModelFamily::WhisperAsr,
             ModelFamily::Voxtral,
+            ModelFamily::GraniteSpeechAsr,
         ] {
             assert!(stage_sets_batch_rows(family), "{family:?}");
         }
         for family in [
             ModelFamily::Qwen3Chat,
             ModelFamily::Gemma3Chat,
-            ModelFamily::GraniteSpeechAsr,
             ModelFamily::GraniteSpeech5Asr,
             ModelFamily::NemotronTranscribeAsr,
             ModelFamily::Lfm25Audio,

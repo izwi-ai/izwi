@@ -35,6 +35,8 @@ use crate::tokenizer::IncrementalDecoder;
 mod config;
 mod preprocessor;
 mod prompt;
+#[cfg(test)]
+mod retained_tests;
 mod runtime;
 mod transcript;
 
@@ -91,6 +93,21 @@ const TIMESTAMP_MAX_AUDIO_SECONDS: f32 = 3.5 * 60.0;
 /// 4096-token decoder context.
 const TIMESTAMP_MAX_CHUNK_SECONDS: f32 = 60.0;
 static NEXT_GRANITE_SPEECH_MODEL_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The retained route's switch for Granite Speech 4.1 (on by default).
+pub(crate) const GRANITE_SPEECH_RETAINED_DECODE_ENV: &str = "IZWI_GRANITE_SPEECH_RETAINED_DECODE";
+
+/// Whether a Granite Speech 4.1 load offers the retained sequence route:
+/// a single-segment ASR request resumes prefill on retained decoder pages
+/// and decodes beside the other rows, one batched step per token. Off, every
+/// request runs as one atomic invocation and the load fits no retained
+/// decoder state (GRN-8). Read once per process: the loaded adapter and the
+/// model it seals both take it, so their routes agree.
+pub(crate) fn granite_speech_retained_decode_enabled() -> bool {
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(GRANITE_SPEECH_RETAINED_DECODE_ENV, true));
+    ENABLED.get()
+}
 
 /// Reject a request language the variant's checkpoint was not trained on
 /// (IBM's alias table; plus drops Japanese) before the request is admitted.
@@ -185,6 +202,7 @@ pub struct GraniteSpeechAsrModel {
     prompt_tokenizer: GraniteSpeechPromptTokenizer,
     preprocessor: GraniteSpeechPreprocessor,
     runtime: GraniteSpeechRuntime,
+    retained_decode: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -493,6 +511,18 @@ impl GraniteSpeechPreparedPromptArtifact {
     }
 }
 
+fn granite_decode_workspace_per_row_bytes(text: &GraniteTextConfig, dtype: DType) -> Result<u64> {
+    let bytes = |elements: usize, element_bytes: usize| {
+        u64::try_from(elements)
+            .ok()
+            .and_then(|elements| elements.checked_mul(u64::try_from(element_bytes).ok()?))
+    };
+    bytes(text.hidden_size, dtype.size_in_bytes())
+        .zip(bytes(text.vocab_size, std::mem::size_of::<f32>()))
+        .and_then(|(hidden, logits)| hidden.checked_add(logits))
+        .ok_or_else(|| Error::Overloaded("Granite Speech decode workspace overflow".into()))
+}
+
 fn granite_decode_step(state: &GraniteSpeechDecodeState, delta: String) -> GraniteSpeechDecodeStep {
     GraniteSpeechDecodeStep {
         delta,
@@ -645,6 +675,7 @@ impl GraniteSpeechAsrModel {
             prompt_tokenizer,
             preprocessor,
             runtime,
+            retained_decode: granite_speech_retained_decode_enabled(),
         })
     }
 
@@ -656,19 +687,16 @@ impl GraniteSpeechAsrModel {
         self.checkpoint_kind
     }
 
-    /// Granite's retained decoder is not quality-certified, so no Granite
-    /// checkpoint resumes prefill: request preparation routes every ASR
-    /// request to the atomic graph, and the loaded ASR adapter offers no
-    /// retained sequence graph whose decoder state would be fitted,
-    /// allocated and held for nothing (GRN-8).
-    pub(crate) const RESUMABLE_PREFILL: bool = false;
-
+    /// Whether a single-segment ASR request resumes prefill on the retained
+    /// route ([`granite_speech_retained_decode_enabled`], read at load).
     pub(crate) const fn supports_resumable_prefill(&self) -> bool {
-        Self::RESUMABLE_PREFILL
+        self.retained_decode
     }
 
+    /// The retained route's decode steps; the same switch as
+    /// [`Self::supports_resumable_prefill`], so the two never disagree.
     pub(crate) const fn supports_incremental_decode(&self) -> bool {
-        false
+        self.retained_decode
     }
 
     pub(crate) fn physical_state_spec(
@@ -1405,11 +1433,11 @@ impl GraniteSpeechAsrModel {
         true
     }
 
+    /// Bytes one row of a continuous decode step uses beside its retained
+    /// state: its hidden row in the model dtype and its logits row over the
+    /// 100k vocabulary, priced at F32.
     pub(crate) fn continuous_decode_workspace_per_row_bytes(&self) -> Result<u64> {
-        u64::try_from(self.config.text_config.hidden_size)
-            .ok()
-            .and_then(|hidden| hidden.checked_mul(u64::try_from(self.dtype.size_in_bytes()).ok()?))
-            .ok_or_else(|| Error::Overloaded("Granite Speech decode workspace overflow".into()))
+        granite_decode_workspace_per_row_bytes(&self.config.text_config, self.dtype)
     }
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
@@ -2795,9 +2823,10 @@ mod tests {
             .all(|stage| !stage.groups.is_empty()));
     }
 
-    /// Without resumable prefill the ASR capability offers only its atomic
-    /// graph, so the load authors no retained state at all (GRN-8). A
-    /// stateless descriptor beside a retained graph cannot be published.
+    /// With the retained route switched off the ASR capability offers only
+    /// its atomic graph, so the load authors no retained state at all
+    /// (GRN-8). A stateless descriptor beside a retained graph cannot be
+    /// published.
     #[test]
     fn atomic_only_asr_graphs_author_no_retained_state() {
         let invocation = granite_test_invocation_contract();
