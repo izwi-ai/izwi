@@ -5,6 +5,7 @@
 
 mod budget;
 mod config;
+mod decode_rows;
 mod predictor;
 mod reference_cache;
 mod rope;
@@ -3316,7 +3317,10 @@ impl Qwen3TtsModel {
 
     /// Execute a changing set of TTS rows while preserving input/output order.
     /// Terminal/EOS rows are finalized independently, live rows form one native
-    /// predictor/talker batch, and a single live row uses scalar model kernels.
+    /// predictor/talker batch, and off CUDA a single request uses scalar model
+    /// kernels. On CUDA a single request runs this batch path too, so its
+    /// semantic draw, predictor frame and talker step are the ones it gets
+    /// beside other requests ([`decode_rows`]).
     pub fn tts_decode_step_batch_physical(
         &self,
         states: &mut [&mut PhysicalTtsDecodeState],
@@ -3328,9 +3332,9 @@ impl Qwen3TtsModel {
                     .into(),
             ));
         }
-        if states.len() == 1 {
+        if states.len() == 1 && !decode_rows::row_invariant(self.talker.device()) {
             return self
-                .tts_decode_step_physical(states[0], predictor_caches[0])
+                .tts_decode_step_physical_scalar(states[0], predictor_caches[0])
                 .map(|step| vec![step]);
         }
         run_tts_decode_batch_transaction(states, predictor_caches, |states, predictor_caches| {
@@ -3409,7 +3413,26 @@ impl Qwen3TtsModel {
     /// cursor-zero invocation cache reserved for this frame. Predictor pages
     /// are never stored in the returned state and may be released immediately
     /// after this call, including terminal EOS calls where they remain unused.
+    /// On CUDA the quantum runs the batch path as a batch of one
+    /// ([`Self::tts_decode_step_batch_physical`]).
     pub fn tts_decode_step_physical(
+        &self,
+        state: &mut PhysicalTtsDecodeState,
+        predictor_cache: &mut CodePredictorPhysicalCache,
+    ) -> Result<TtsDecodeStep> {
+        if decode_rows::row_invariant(self.talker.device()) {
+            return self
+                .tts_decode_step_batch_physical(&mut [state], &mut [predictor_cache])?
+                .pop()
+                .ok_or_else(|| {
+                    Error::InferenceError("Qwen3-TTS decode batch returned no row".into())
+                });
+        }
+        self.tts_decode_step_physical_scalar(state, predictor_cache)
+    }
+
+    /// The single-row quantum of the CPU and Metal.
+    fn tts_decode_step_physical_scalar(
         &self,
         state: &mut PhysicalTtsDecodeState,
         predictor_cache: &mut CodePredictorPhysicalCache,
@@ -3493,7 +3516,6 @@ impl Qwen3TtsModel {
         let next_semantic_history =
             record_semantic_history(&state.semantic_history, semantic_token);
 
-        let predictor_start = Instant::now();
         let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
         let last_hidden = state.last_hidden.as_ref().ok_or_else(|| {
             Error::InferenceError("Qwen3-TTS last hidden state is not hydrated".into())
@@ -3513,7 +3535,6 @@ impl Qwen3TtsModel {
         let acoustic_embed_sum = self
             .code_predictor
             .get_acoustic_embeddings_sum(&acoustic_codes)?;
-        let predictor_ms = predictor_start.elapsed().as_secs_f64() * 1000.0;
 
         let text_addition = if state.frame_idx < state.trailing_text_len {
             state
@@ -3532,11 +3553,9 @@ impl Qwen3TtsModel {
             .broadcast_add(&acoustic_embed_sum)?
             .broadcast_add(&text_addition)?;
 
-        let talker_start = Instant::now();
         let (new_hidden, new_logits) = self
             .talker
             .generate_physical_step_with_embed(&step_input, &mut state.talker_cache)?;
-        let talker_ms = talker_start.elapsed().as_secs_f64() * 1000.0;
 
         state.rng = next_rng;
         state.semantic_history = next_semantic_history;
@@ -3563,19 +3582,6 @@ impl Qwen3TtsModel {
             samples.extend(final_samples);
         }
         let audio_ms = audio_start.elapsed().as_secs_f64() * 1000.0;
-
-        if self.device.kind.is_cuda() {
-            debug!(
-                frame_idx = state.frame_idx,
-                semantic_ms,
-                predictor_ms,
-                talker_ms,
-                audio_ms,
-                total_ms = step_start.elapsed().as_secs_f64() * 1000.0,
-                emitted_samples = samples.len(),
-                "Qwen3-TTS physical CUDA decode step timings"
-            );
-        }
 
         let total_ms = step_start.elapsed().as_secs_f64() * 1000.0;
         Ok(TtsDecodeStep {
