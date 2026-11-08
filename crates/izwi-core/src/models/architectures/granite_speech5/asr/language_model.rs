@@ -534,6 +534,11 @@ impl GraniteLanguageModel {
         rope_table_dtype(self.plan, &self.device, self.embed_tokens.dtype)
     }
 
+    /// The dtype of the token embeddings and of a prepared prompt.
+    pub(super) fn embedding_dtype(&self) -> DType {
+        self.embed_tokens.dtype
+    }
+
     /// The load-time RoPE table over a retained sequence's positions.
     pub(super) fn rope_table(&self) -> &RopeCache {
         &self.rope_table

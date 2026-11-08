@@ -806,6 +806,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the max new tokens per Granite speaker-attributed ASR chunk (positive integer).",
     ),
     CoreEnvVar::new(
+        "IZWI_GRANITE_SPEECH5_RETAINED_DECODE",
+        Flag,
+        "true",
+        Once,
+        "Runs single-segment Granite Speech 5.0 ASR on its retained route, where concurrent requests encode and decode together (one batched step per token); false runs every request as one atomic invocation and fits no retained decoder state.",
+    ),
+    CoreEnvVar::new(
         "IZWI_GRANITE_SPEECH_DTYPE",
         Choice,
         "auto (family/backend default)",

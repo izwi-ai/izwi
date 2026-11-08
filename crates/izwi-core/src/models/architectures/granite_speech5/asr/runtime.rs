@@ -321,6 +321,11 @@ impl GraniteSpeech5Runtime {
         self.dtype
     }
 
+    /// The dtype a prepared prompt's embeddings take.
+    pub(crate) fn embedding_dtype(&self) -> DType {
+        self.language_model.embedding_dtype()
+    }
+
     pub(crate) fn kv_dtype(&self) -> DType {
         self.language_model.kv_dtype()
     }
@@ -627,6 +632,63 @@ impl GraniteSpeech5Runtime {
             },
             token_ids: generated,
         })
+    }
+
+    /// The prompt's embeddings with `audio_embeds` spliced over its expanded
+    /// audio placeholder, as `generate` prefills them: `(embeddings
+    /// [1, tokens, hidden], tokens, audio tokens)`.
+    pub(crate) fn prompt_embeddings(
+        &self,
+        prompt: &GraniteSpeech5Prompt,
+        special_tokens: &GraniteSpeech5SpecialTokens,
+        audio_embeds: &Tensor,
+    ) -> Result<(Tensor, usize, usize)> {
+        let audio_tokens = audio_embeds.dim(1)?;
+        let input_ids =
+            Self::expanded_input_ids(prompt, audio_tokens, special_tokens.audio_token_id)?;
+        let embeddings = self.language_model.prompt_embeddings_with_audio(
+            &input_ids,
+            prompt.audio_token_position,
+            audio_embeds,
+        )?;
+        Ok((embeddings, input_ids.len(), audio_tokens))
+    }
+
+    /// Prefill `[span_start, span_end)` of prepared prompt `embeddings` onto
+    /// `cache`, whose cursor must sit at `span_start`, with RoPE rows from the
+    /// load-time table. Returns the span's last logits.
+    pub(crate) fn prefill_prompt_span(
+        &self,
+        embeddings: &Tensor,
+        span_start: usize,
+        span_end: usize,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Tensor> {
+        let prompt_tokens = embeddings.dim(1)?;
+        if span_start != cache.context_len() || span_start >= span_end || span_end > prompt_tokens {
+            return Err(Error::InvalidInput(format!(
+                "Granite Speech 5.0 prefill span [{span_start},{span_end}) does not continue cache cursor {} within prompt length {prompt_tokens}",
+                cache.context_len()
+            )));
+        }
+        let span = embeddings.narrow(1, span_start, span_end - span_start)?;
+        self.language_model.forward_embeds(
+            &span,
+            span_start,
+            cache,
+            Some(self.language_model.rope_table()),
+            None,
+        )
+    }
+
+    /// The greedy next token of prefill logits, read back.
+    pub(crate) fn greedy_token(&self, logits: &Tensor) -> Result<u32> {
+        argmax_last_token(logits)?
+            .flatten_all()?
+            .to_vec1::<u32>()?
+            .first()
+            .copied()
+            .ok_or_else(|| Error::InferenceError("Granite Speech 5.0 argmax is empty".into()))
     }
 
     /// One decode step for several retained rows sharing one arena: row
