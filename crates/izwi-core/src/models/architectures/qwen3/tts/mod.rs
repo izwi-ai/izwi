@@ -110,6 +110,28 @@ pub(crate) fn thread_qwen3_tts_host_readbacks() -> u64 {
     QWEN3_TTS_HOST_READBACKS_THREAD.with(std::cell::Cell::get)
 }
 
+/// The prompt tokens of one Qwen3-TTS prefill span on CUDA: the CUDA
+/// engine's prefill chunk, so a prompt of up to 512 tokens (most) still
+/// prefills in one span.
+pub(crate) const QWEN3_TTS_CUDA_PREFILL_SPAN: usize = 512;
+
+/// The cell of the scheduler's prefill grid for Qwen3-TTS prompts: with a
+/// row-invariant decode (CUDA), [`QWEN3_TTS_CUDA_PREFILL_SPAN`], so every
+/// span but a prompt's last is exactly that long whatever else the step
+/// runs. A span's length is its projections' row count and where the
+/// paged prefill resumes, so a span cut to a step's leftover token budget
+/// or to the adaptive chunk changed the prompt's bits under load. Prefill
+/// is never batched across requests (one exclusive row per prefill
+/// stage), so the grid is all a request's prefill needs to be the same
+/// alone and beside others. 0 (no grid) on the CPU and Metal.
+pub(crate) const fn qwen3_tts_prefill_grid_tokens(row_invariant: bool) -> usize {
+    if row_invariant {
+        QWEN3_TTS_CUDA_PREFILL_SPAN
+    } else {
+        0
+    }
+}
+
 const NEWLINE_TOKEN_ID: u32 = 198;
 const MIN_QWEN_TTS_TOKENS_BEFORE_EOS: usize = 8;
 const MAX_VOICE_CLONE_REFERENCE_FRAMES: usize = 320;
@@ -2207,6 +2229,12 @@ impl Qwen3TtsModel {
 
     pub fn supports_resumable_prefill(&self) -> bool {
         true
+    }
+
+    /// The cell of the scheduler's prefill grid for this model's prompts
+    /// ([`qwen3_tts_prefill_grid_tokens`]).
+    pub fn prefill_grid_tokens(&self) -> usize {
+        qwen3_tts_prefill_grid_tokens(decode_rows::row_invariant(self.talker.device()))
     }
 
     pub fn supports_continuous_decode_batch(&self) -> bool {
@@ -5849,6 +5877,15 @@ pub(crate) mod tests {
             (predictor_a.context_len(), predictor_b.context_len()),
             (1, 1)
         );
+    }
+
+    /// D3: on CUDA (a row-invariant decode) a prompt prefills on a fixed
+    /// 512-token grid, so its spans never depend on the step's other work;
+    /// the CPU and Metal keep the engine's chunking.
+    #[test]
+    fn row_invariant_prompts_prefill_on_a_fixed_grid() {
+        assert_eq!(qwen3_tts_prefill_grid_tokens(true), 512);
+        assert_eq!(qwen3_tts_prefill_grid_tokens(false), 0);
     }
 
     #[test]

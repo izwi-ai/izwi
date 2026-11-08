@@ -3595,6 +3595,12 @@ impl ModelExecutor for NativeExecutor {
             if let Ok(Some(model)) = request.prepared_fish_drama3_tts_model_lease_for_executor() {
                 profile.prefill_grid_tokens = model.prefill_span_rows();
             }
+            // A Qwen3-TTS prompt prefills on its model's grid on CUDA, so its
+            // spans never shrink to a step's leftover budget beside other
+            // requests (a request sounds the same under load).
+            if let Ok(Some(model)) = request.prepared_qwen_tts_model_for_executor() {
+                profile.prefill_grid_tokens = model.prefill_grid_tokens();
+            }
             profile.incremental_decode = true;
             profile.recompute_safe = profile.resolved_from_loaded_model;
             profile.cache_release_safe = profile.resolved_from_loaded_model;
