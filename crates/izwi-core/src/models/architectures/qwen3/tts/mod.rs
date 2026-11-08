@@ -70,7 +70,9 @@ use crate::models::architectures::qwen3::core::{
     qwen3_decoder_cache_domain, Qwen3DecoderCacheGeometry,
 };
 use crate::models::shared::sampling::{
-    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+    bounded_device_sampling_candidates, device_candidates_cover_top_p, read_masked_planned_rows,
+    sample_device_candidates, CandidateRequest, DeviceSamplingCandidates, MaskedReadback,
+    PenaltyHistory, PlannedReadback, PlannedValues,
 };
 use crate::models::shared::state::exact_stage_scratch_domain;
 use crate::models::shared::weights::staged::metal_staged_safetensors;
@@ -2802,59 +2804,119 @@ impl Qwen3TtsModel {
         )
     }
 
-    /// Prepare one row-local semantic decision without mutating retained state.
+    /// Prepare every row's semantic decision for one decode step without
+    /// mutating retained state, drawing all live rows' semantic tokens with
+    /// one device readback ([`sample_semantic_rows`]): each row's stage is
+    /// the one it would get alone, and every row reports the step's sampling
+    /// time.
     ///
     /// Terminal rows carry their row-local RNG transition and bypass
     /// predictor/talker work; codec finalization remains outside that transaction.
-    pub fn prepare_tts_predictor_stage(
+    pub fn prepare_tts_frame_stages(
+        &self,
+        states: &[&mut PhysicalTtsDecodeState],
+    ) -> Result<Vec<PreparedTtsFrameStage>> {
+        let sampling_started = Instant::now();
+        let mut stages = Vec::with_capacity(states.len());
+        let mut live = Vec::new();
+        for (row, state) in states.iter().enumerate() {
+            let terminal = Self::terminal_stage_before_sampling(state)?;
+            if terminal.is_none() {
+                live.push(row);
+            }
+            stages.push(terminal.map(PreparedTtsFrameStage::Terminal));
+        }
+        if !live.is_empty() {
+            let logits = live
+                .iter()
+                .map(|&row| {
+                    let logits = states[row].last_logits.as_ref().ok_or_else(|| {
+                        Error::InferenceError("Qwen3-TTS last logits are not hydrated".into())
+                    })?;
+                    logits.i((0, 0..1))?.contiguous().map_err(Error::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let logits = Tensor::cat(&logits, 0)?;
+            let mut next_rngs = live.iter().map(|&row| states[row].rng).collect::<Vec<_>>();
+            let tokens = {
+                let mut rows = live
+                    .iter()
+                    .zip(next_rngs.iter_mut())
+                    .map(|(&row, rng)| {
+                        let state = &*states[row];
+                        SemanticRowSampling {
+                            semantic_vocab_size: state.semantic_vocab_size,
+                            allow_eos: qwen_tts_allows_eos(state.frames_generated()),
+                            params: &state.params,
+                            history: &state.semantic_history,
+                            rng,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                sample_semantic_rows(
+                    &logits,
+                    self.specials.codec_eos_token_id,
+                    &mut rows,
+                    qwen_tts_uses_device_sampling(&self.device),
+                )?
+            };
+            let sampling_ms = sampling_started.elapsed().as_secs_f64() * 1000.0;
+            for ((row, token), next_rng) in live.into_iter().zip(tokens).zip(next_rngs) {
+                stages[row] =
+                    Some(self.stage_after_semantic(&*states[row], token, next_rng, sampling_ms)?);
+            }
+        }
+        stages
+            .into_iter()
+            .map(|stage| {
+                stage.ok_or_else(|| {
+                    Error::InferenceError("Qwen3-TTS frame preparation lost a row".into())
+                })
+            })
+            .collect()
+    }
+
+    /// The terminal stage of a row that draws no semantic token (already
+    /// finished, or at its frame limit); `None` for a row that draws one.
+    fn terminal_stage_before_sampling(
+        state: &PhysicalTtsDecodeState,
+    ) -> Result<Option<PreparedTtsTerminalStage>> {
+        let reason = if state.finished {
+            TtsTerminalReason::AlreadyFinished
+        } else if state.frame_idx >= state.max_frames {
+            TtsTerminalReason::FrameLimit
+        } else {
+            if state.offset != state.talker_cache.context_len() {
+                return Err(Error::InferenceError(format!(
+                    "Qwen3-TTS physical state offset {} diverged from retained talker cursor {}",
+                    state.offset,
+                    state.talker_cache.context_len()
+                )));
+            }
+            return Ok(None);
+        };
+        Ok(Some(PreparedTtsTerminalStage {
+            reason,
+            expected_talker_context: state.talker_cache.context_len(),
+            expected_frame_idx: state.frame_idx,
+            expected_rng: state.rng,
+            expected_semantic_history: state.semantic_history.clone(),
+            next_rng: state.rng,
+            sampling_ms: 0.0,
+        }))
+    }
+
+    /// A live row's stage once its semantic token is drawn (`next_rng` is
+    /// its generator after the draw): semantic EOS ends it, any other token
+    /// feeds the predictor.
+    fn stage_after_semantic(
         &self,
         state: &PhysicalTtsDecodeState,
+        semantic_token: u32,
+        next_rng: SimpleRng,
+        sampling_ms: f64,
     ) -> Result<PreparedTtsFrameStage> {
-        if state.finished {
-            return Ok(PreparedTtsFrameStage::Terminal(PreparedTtsTerminalStage {
-                reason: TtsTerminalReason::AlreadyFinished,
-                expected_talker_context: state.talker_cache.context_len(),
-                expected_frame_idx: state.frame_idx,
-                expected_rng: state.rng,
-                expected_semantic_history: state.semantic_history.clone(),
-                next_rng: state.rng,
-                sampling_ms: 0.0,
-            }));
-        }
-        if state.frame_idx >= state.max_frames {
-            return Ok(PreparedTtsFrameStage::Terminal(PreparedTtsTerminalStage {
-                reason: TtsTerminalReason::FrameLimit,
-                expected_talker_context: state.talker_cache.context_len(),
-                expected_frame_idx: state.frame_idx,
-                expected_rng: state.rng,
-                expected_semantic_history: state.semantic_history.clone(),
-                next_rng: state.rng,
-                sampling_ms: 0.0,
-            }));
-        }
-        if state.offset != state.talker_cache.context_len() {
-            return Err(Error::InferenceError(format!(
-                "Qwen3-TTS physical state offset {} diverged from retained talker cursor {}",
-                state.offset,
-                state.talker_cache.context_len()
-            )));
-        }
-        let sampling_started = Instant::now();
         let allow_eos = qwen_tts_allows_eos(state.frames_generated());
-        let mut next_rng = state.rng;
-        let last_logits = state.last_logits.as_ref().ok_or_else(|| {
-            Error::InferenceError("Qwen3-TTS last logits are not hydrated".into())
-        })?;
-        let semantic_token = sample_semantic(
-            &last_logits.i((0, 0))?,
-            state.semantic_vocab_size,
-            self.specials.codec_eos_token_id,
-            allow_eos,
-            &state.params,
-            &state.semantic_history,
-            &mut next_rng,
-            qwen_tts_uses_device_sampling(&self.device),
-        )?;
         if allow_eos && semantic_token == self.specials.codec_eos_token_id {
             return Ok(PreparedTtsFrameStage::Terminal(PreparedTtsTerminalStage {
                 reason: TtsTerminalReason::SemanticEos,
@@ -2863,9 +2925,12 @@ impl Qwen3TtsModel {
                 expected_rng: state.rng,
                 expected_semantic_history: state.semantic_history.clone(),
                 next_rng,
-                sampling_ms: sampling_started.elapsed().as_secs_f64() * 1000.0,
+                sampling_ms,
             }));
         }
+        let last_logits = state.last_logits.as_ref().ok_or_else(|| {
+            Error::InferenceError("Qwen3-TTS last logits are not hydrated".into())
+        })?;
         let next_semantic_history =
             record_semantic_history(&state.semantic_history, semantic_token);
         let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
@@ -2900,7 +2965,7 @@ impl Qwen3TtsModel {
                 next_rng,
                 next_semantic_history,
                 subtalker: state.params.subtalker,
-                sampling_ms: sampling_started.elapsed().as_secs_f64() * 1000.0,
+                sampling_ms,
             },
         ))
     }
@@ -3249,10 +3314,7 @@ impl Qwen3TtsModel {
                 .map(|step| vec![step]);
         }
         run_tts_decode_batch_transaction(states, predictor_caches, |states, predictor_caches| {
-            let prepared = states
-                .iter()
-                .map(|state| self.prepare_tts_predictor_stage(state))
-                .collect::<Result<Vec<_>>>()?;
+            let prepared = self.prepare_tts_frame_stages(states)?;
             let row_count = states.len();
             let mut live_mask = vec![false; row_count];
             let mut live_indices = Vec::new();
@@ -4303,6 +4365,7 @@ fn argmax_semantic_values(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_semantic(
     logits: &Tensor,
     semantic_vocab_size: u32,
@@ -4312,6 +4375,47 @@ fn sample_semantic(
     history: &[u32],
     rng: &mut SimpleRng,
     prefer_device_sampling: bool,
+) -> Result<u32> {
+    sample_semantic_planned(
+        logits,
+        semantic_vocab_size,
+        eos_token_id,
+        allow_eos,
+        params,
+        history,
+        rng,
+        prefer_device_sampling,
+        bounded_device_sampling_candidates,
+    )
+}
+
+/// How [`sample_semantic`] plans a sampled row's device candidates:
+/// [`bounded_device_sampling_candidates`]'s signature.
+type SemanticCandidatePlanner = fn(
+    &Tensor,
+    usize,
+    usize,
+    f32,
+    &[u32],
+    f32,
+    f32,
+    Option<&[bool]>,
+) -> Result<Option<DeviceSamplingCandidates>>;
+
+/// [`sample_semantic`] with its candidate planner passed in, so a test can
+/// run the accelerator path (which plans candidates only on CUDA and Metal)
+/// on the CPU.
+#[allow(clippy::too_many_arguments)]
+fn sample_semantic_planned(
+    logits: &Tensor,
+    semantic_vocab_size: u32,
+    eos_token_id: u32,
+    allow_eos: bool,
+    params: &TtsGenerationParams,
+    history: &[u32],
+    rng: &mut SimpleRng,
+    prefer_device_sampling: bool,
+    plan_candidates: SemanticCandidatePlanner,
 ) -> Result<u32> {
     if !prefer_device_sampling {
         return sample_semantic_reference(
@@ -4353,7 +4457,7 @@ fn sample_semantic(
     let semantic_len = (semantic_vocab_size as usize).min(vocab_len);
     let (sampling_vocab, allowed_mask) =
         semantic_sampling_vocab_and_mask(vocab_len, semantic_len, eos_token_id, allow_eos);
-    if let Some(candidates) = bounded_device_sampling_candidates(
+    let candidates = plan_candidates(
         &logits,
         sampling_vocab,
         params.top_k,
@@ -4362,8 +4466,172 @@ fn sample_semantic(
         params.repetition_penalty,
         0.0,
         Some(&allowed_mask),
-    )? {
+    )?;
+    if candidates.is_some() {
         record_qwen3_tts_host_readback();
+    }
+    finish_sampled_semantic(
+        &logits,
+        candidates,
+        semantic_vocab_size,
+        eos_token_id,
+        allow_eos,
+        params,
+        history,
+        rng,
+    )
+}
+
+/// One row of [`sample_semantic_rows`]: what [`sample_semantic`] takes for
+/// it besides its logits.
+struct SemanticRowSampling<'a> {
+    semantic_vocab_size: u32,
+    allow_eos: bool,
+    params: &'a TtsGenerationParams,
+    history: &'a [u32],
+    rng: &'a mut SimpleRng,
+}
+
+/// [`sample_semantic`] for every row of one decode step's `[rows, vocab]`
+/// logits with one device-to-host readback instead of one per row: greedy
+/// rows read the argmax of their allowed codes and sampled rows their
+/// bounded device candidates, planned together ([`read_masked_planned_rows`]),
+/// and each row then finishes on the host as `sample_semantic` does (the
+/// top-p cover check, the same draws from its own generator, the same host
+/// fallback). Each row's token, and where its generator ends, is what
+/// `sample_semantic` gives that row alone. Off the accelerators every row
+/// samples on its own.
+fn sample_semantic_rows(
+    logits: &Tensor,
+    eos_token_id: u32,
+    rows: &mut [SemanticRowSampling<'_>],
+    prefer_device_sampling: bool,
+) -> Result<Vec<u32>> {
+    let device = logits.device();
+    sample_semantic_rows_planned(
+        logits,
+        eos_token_id,
+        rows,
+        prefer_device_sampling,
+        device.is_cuda() || device.is_metal(),
+    )
+}
+
+/// [`sample_semantic_rows`] planning device candidates iff
+/// `plan_candidates` (as [`bounded_device_sampling_candidates`] does on CUDA
+/// and Metal only), so a test can run the accelerator path on the CPU.
+fn sample_semantic_rows_planned(
+    logits: &Tensor,
+    eos_token_id: u32,
+    rows: &mut [SemanticRowSampling<'_>],
+    prefer_device_sampling: bool,
+    plan_candidates: bool,
+) -> Result<Vec<u32>> {
+    let (row_count, vocab_len) = logits.dims2()?;
+    if row_count != rows.len() {
+        return Err(Error::InvalidInput(format!(
+            "Qwen3-TTS semantic sampling received {row_count} logits rows for {} rows",
+            rows.len()
+        )));
+    }
+    if !prefer_device_sampling {
+        return rows
+            .iter_mut()
+            .enumerate()
+            .map(|(index, row)| {
+                sample_semantic(
+                    &logits.i(index)?,
+                    row.semantic_vocab_size,
+                    eos_token_id,
+                    row.allow_eos,
+                    row.params,
+                    row.history,
+                    row.rng,
+                    false,
+                )
+            })
+            .collect();
+    }
+    let masks = rows
+        .iter()
+        .map(|row| {
+            let semantic_len = (row.semantic_vocab_size as usize).min(vocab_len);
+            semantic_sampling_vocab_and_mask(vocab_len, semantic_len, eos_token_id, row.allow_eos)
+        })
+        .collect::<Vec<_>>();
+    let plans = rows
+        .iter()
+        .zip(&masks)
+        .map(|(row, (vocab, allowed))| MaskedReadback {
+            vocab: *vocab,
+            allowed: Some(allowed),
+            plan: if row.params.temperature <= 1e-5 {
+                PlannedReadback::Greedy
+            } else if plan_candidates {
+                PlannedReadback::Candidates(CandidateRequest {
+                    top_k: row.params.top_k,
+                    temperature: row.params.temperature,
+                    history: PenaltyHistory::uniform(row.history),
+                    repetition_penalty: row.params.repetition_penalty,
+                    presence_penalty: 0.0,
+                })
+            } else {
+                PlannedReadback::None
+            },
+        })
+        .collect();
+    let values = read_masked_planned_rows(logits, plans)?;
+    if values
+        .iter()
+        .any(|value| !matches!(value, PlannedValues::None))
+    {
+        record_qwen3_tts_host_readback();
+    }
+    rows.iter_mut()
+        .zip(values)
+        .enumerate()
+        .map(|(position, (row, value))| match value {
+            PlannedValues::Greedy { index, .. } => Ok(index),
+            // A greedy row that read nothing (an empty or too wide
+            // vocabulary) takes the single-row argmax.
+            _ if row.params.temperature <= 1e-5 => argmax_semantic(
+                &logits.i(position)?,
+                row.semantic_vocab_size,
+                eos_token_id,
+                row.allow_eos,
+            ),
+            value => finish_sampled_semantic(
+                &logits.i(position)?.to_dtype(DType::F32)?,
+                match value {
+                    PlannedValues::Candidates(candidates) => candidates,
+                    _ => None,
+                },
+                row.semantic_vocab_size,
+                eos_token_id,
+                row.allow_eos,
+                row.params,
+                row.history,
+                row.rng,
+            ),
+        })
+        .collect()
+}
+
+/// The host half of a sampled (non-greedy) semantic draw from a row's F32
+/// `logits` (`[vocab]`): a draw from its device `candidates` when they cover
+/// the top-p nucleus, else the exact host sampler over the row.
+#[allow(clippy::too_many_arguments)]
+fn finish_sampled_semantic(
+    logits: &Tensor,
+    candidates: Option<DeviceSamplingCandidates>,
+    semantic_vocab_size: u32,
+    eos_token_id: u32,
+    allow_eos: bool,
+    params: &TtsGenerationParams,
+    history: &[u32],
+    rng: &mut SimpleRng,
+) -> Result<u32> {
+    if let Some(candidates) = candidates {
         if device_candidates_cover_top_p(&candidates, params.top_p) {
             if let Some(token) = sample_device_candidates(&candidates, params.top_p, rng.next_f32())
             {
@@ -4371,11 +4639,13 @@ fn sample_semantic(
             }
         }
     }
-    let mut values = collect_semantic_sampling_values(&logits, semantic_len, params, history)?;
+    let vocab_len = logits.dim(0)?;
+    let semantic_len = (semantic_vocab_size as usize).min(vocab_len);
+    let mut values = collect_semantic_sampling_values(logits, semantic_len, params, history)?;
 
     let eos_idx = eos_token_id as usize;
     if allow_eos && eos_idx < vocab_len && eos_idx >= semantic_len {
-        values.push((eos_token_id, logit_scalar_f32(&logits, eos_token_id)?));
+        values.push((eos_token_id, logit_scalar_f32(logits, eos_token_id)?));
     }
 
     // Repetition penalty over recent semantic history.
@@ -4428,7 +4698,7 @@ fn sample_semantic(
 
     let mut sum: f32 = probs.iter().map(|(_, p)| *p).sum();
     if !sum.is_finite() || sum <= 0.0 {
-        return argmax_semantic(&logits, semantic_vocab_size, eos_token_id, allow_eos);
+        return argmax_semantic(logits, semantic_vocab_size, eos_token_id, allow_eos);
     }
     for (_, p) in probs.iter_mut() {
         *p /= sum;
@@ -6303,6 +6573,111 @@ pub(crate) mod tests {
                 "temperature {temperature}, device {prefer_device}"
             );
         }
+    }
+
+    /// One decode step's semantic draws for all rows at once give every row
+    /// the token `sample_semantic` gives it alone on an accelerator (bounded
+    /// device candidates; the CPU plans them here too) and leave its
+    /// generator where that leaves it: xorshift logits with ties, NaN and
+    /// infinities, random histories and settings (greedy, top-k on and off,
+    /// above the device bound, top-p below 1), EOS allowed or not, at a toy
+    /// and the real vocabulary geometry. Greedy rows and sampled rows whose
+    /// candidates cover the nucleus read back once for the whole step.
+    #[test]
+    fn batched_semantic_sampling_matches_each_row_alone() {
+        use crate::models::shared::sampling::bounded_sampling_candidates_on_any_device;
+
+        let device = candle_core::Device::Cpu;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut sampled_rows = 0;
+        for (trial, (vocab, semantic, eos)) in [(300usize, 256u32, 290u32), (3_072, 2_048, 2_150)]
+            .into_iter()
+            .cycle()
+            .take(40)
+            .enumerate()
+        {
+            let rows = 1 + trial % 9;
+            let logits = (0..rows * vocab)
+                .map(|index| match next() % 97 {
+                    0 if index % 5 == 0 => f32::NAN,
+                    1 if index % 7 == 0 => f32::INFINITY,
+                    2 => f32::NEG_INFINITY,
+                    // Coarse values: ties everywhere.
+                    3..=40 => (next() % 25) as f32 * 0.5 - 6.0,
+                    _ => (next() % 1_000_000) as f32 / 1_000_000.0 * 12.0 - 6.0,
+                })
+                .collect::<Vec<_>>();
+            let logits = Tensor::from_vec(logits, (rows, vocab), &device).unwrap();
+            let settings = (0..rows)
+                .map(|_| {
+                    let params = TtsGenerationParams {
+                        temperature: [0.0, 0.5, 0.9, 1.3][(next() % 4) as usize],
+                        top_k: [0, 1, 7, 50, 700][(next() % 5) as usize],
+                        top_p: [1.0, 0.9, 0.3][(next() % 3) as usize],
+                        repetition_penalty: [1.0, 1.05, 1.5][(next() % 3) as usize],
+                        ..Default::default()
+                    };
+                    let history = (0..next() % 40)
+                        .map(|_| (next() % (vocab as u64 + 3)) as u32)
+                        .fold(Vec::new(), |history, token| {
+                            record_semantic_history(&history, token)
+                        });
+                    let allow_eos = next() % 3 != 0;
+                    let rng = SimpleRng { state: next() | 1 };
+                    (params, history, allow_eos, rng)
+                })
+                .collect::<Vec<_>>();
+            let mut rngs = settings.iter().map(|setting| setting.3).collect::<Vec<_>>();
+            let before = thread_qwen3_tts_host_readbacks();
+            let batched = {
+                let mut rows = settings
+                    .iter()
+                    .zip(rngs.iter_mut())
+                    .map(|(setting, rng)| SemanticRowSampling {
+                        semantic_vocab_size: semantic,
+                        allow_eos: setting.2,
+                        params: &setting.0,
+                        history: &setting.1,
+                        rng,
+                    })
+                    .collect::<Vec<_>>();
+                sample_semantic_rows_planned(&logits, eos, &mut rows, true, true).unwrap()
+            };
+            let readbacks = thread_qwen3_tts_host_readbacks() - before;
+            for (row, (params, history, allow_eos, rng)) in settings.iter().enumerate() {
+                let mut alone_rng = *rng;
+                let alone = sample_semantic_planned(
+                    &logits.i(row).unwrap(),
+                    semantic,
+                    eos,
+                    *allow_eos,
+                    params,
+                    history,
+                    &mut alone_rng,
+                    true,
+                    bounded_sampling_candidates_on_any_device,
+                )
+                .unwrap();
+                assert_eq!(batched[row], alone, "trial {trial} row {row} {params:?}");
+                assert_eq!(rngs[row].state, alone_rng.state, "trial {trial} row {row}");
+                sampled_rows += usize::from(params.temperature > 0.0);
+            }
+            // Top-k off or past the device bound, or a top-p below 1, can
+            // fall back to the host; nothing else does.
+            if settings.iter().all(|(params, ..)| {
+                params.temperature == 0.0
+                    || (params.top_p >= 1.0 && (1..=512).contains(&params.top_k))
+            }) {
+                assert_eq!(readbacks, 1, "trial {trial}");
+            }
+        }
+        assert!(sampled_rows > 100, "{sampled_rows} sampled rows");
     }
 
     /// The semantic repetition penalty covers every code generated so far,

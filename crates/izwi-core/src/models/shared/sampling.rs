@@ -1546,6 +1546,168 @@ pub(crate) fn read_planned_rows(
     Ok(values)
 }
 
+/// One row of [`read_masked_planned_rows`]: its plan over the first `vocab`
+/// columns of its logits, of which it may pick only the `allowed` ones
+/// (every one when `None`).
+pub(crate) struct MaskedReadback<'a> {
+    pub(crate) vocab: usize,
+    pub(crate) allowed: Option<&'a [bool]>,
+    pub(crate) plan: PlannedReadback<'a>,
+}
+
+/// [`read_planned_rows`] for rows that each read their own vocabulary
+/// prefix under their own allowed mask, all in one device-to-host transfer.
+/// A disallowed column reads as `-inf`: a greedy row's index is the argmax
+/// of its masked prefix, and a candidate row's candidates are bit for bit
+/// what [`bounded_device_sampling_candidates`] plans for it alone with that
+/// `allowed_mask` (masking before the `-inf` sanitizing or after it gives
+/// the same values). Rows with the same prefix and mask are planned
+/// together. A row with an empty or too wide prefix reads nothing (`None`).
+pub(crate) fn read_masked_planned_rows(
+    logits: &Tensor,
+    rows: Vec<MaskedReadback<'_>>,
+) -> Result<Vec<PlannedValues>> {
+    let (row_count, width) = logits.dims2()?;
+    if row_count != rows.len() {
+        return Err(Error::InvalidInput(format!(
+            "masked readback planned {} rows for {row_count} logits rows",
+            rows.len()
+        )));
+    }
+    // Rows sharing a prefix and mask, in first-seen order.
+    let mut groups: Vec<(usize, Option<&[bool]>, Vec<usize>)> = Vec::new();
+    for (row, request) in rows.iter().enumerate() {
+        let vocab = request.vocab.min(width);
+        if matches!(request.plan, PlannedReadback::None)
+            || vocab == 0
+            || vocab > MAX_EXACT_F32_INTEGER
+        {
+            continue;
+        }
+        let allowed = match request.allowed {
+            Some(mask) if mask.len() < vocab => {
+                return Err(Error::InvalidInput(
+                    "sampling mask is shorter than the selected vocabulary".into(),
+                ))
+            }
+            // Allowing every column changes no value.
+            Some(mask) if mask[..vocab].iter().all(|allowed| *allowed) => None,
+            Some(mask) => Some(&mask[..vocab]),
+            None => None,
+        };
+        match groups
+            .iter_mut()
+            .find(|(group_vocab, group_mask, _)| *group_vocab == vocab && *group_mask == allowed)
+        {
+            Some((_, _, members)) => members.push(row),
+            None => groups.push((vocab, allowed, vec![row])),
+        }
+    }
+    let device = logits.device();
+    let mut readback = ReadbackParts::default();
+    let mut greedy_at = vec![None; row_count];
+    let mut pending = (0..row_count).map(|_| None).collect::<Vec<_>>();
+    for (vocab, allowed, members) in &groups {
+        let block = if members.iter().copied().eq(0..row_count) {
+            logits.clone()
+        } else {
+            let ids = members.iter().map(|&row| row as u32).collect::<Vec<_>>();
+            let ids = Tensor::from_vec(ids, members.len(), device)?;
+            logits.contiguous()?.index_select(&ids, 0)?
+        };
+        let mut block = block.narrow(1, 0, *vocab)?.to_dtype(DType::F32)?;
+        if let Some(allowed) = allowed {
+            let mask = cached_sampling_tensor(
+                device,
+                SamplingTensorCacheInput::Mask(allowed.iter().map(|a| u8::from(*a)).collect()),
+            )?;
+            let negative = negative_infinity(device)?.broadcast_as(block.shape())?;
+            block = mask
+                .broadcast_as(block.shape())?
+                .where_cond(&block, &negative)?;
+        }
+        let greedy = |row: &usize| matches!(rows[*row].plan, PlannedReadback::Greedy);
+        if members.iter().any(greedy) {
+            let block = block.contiguous()?;
+            let ids = block.argmax_keepdim(D::Minus1)?;
+            let picked = block.gather(&ids, D::Minus1)?;
+            let ids_at = readback.push(ids.to_dtype(DType::F32)?.flatten_all()?);
+            let picked_at = readback.push(picked.flatten_all()?);
+            for (slot, row) in members.iter().enumerate().filter(|(_, row)| greedy(row)) {
+                greedy_at[*row] = Some((ids_at + slot, picked_at + slot));
+            }
+        }
+        let plans = members
+            .iter()
+            .map(|&row| match &rows[row].plan {
+                PlannedReadback::Candidates(request) => PlannedReadback::Candidates(*request),
+                _ => PlannedReadback::None,
+            })
+            .collect::<Vec<_>>();
+        if plans
+            .iter()
+            .any(|plan| matches!(plan, PlannedReadback::Candidates(_)))
+        {
+            for (&row, planned) in members
+                .iter()
+                .zip(plan_step_candidates(&block, *vocab, &plans)?)
+            {
+                pending[row] = planned.map(|planned| {
+                    let start = readback.push_candidates(&planned);
+                    (planned, start)
+                });
+            }
+        }
+    }
+    let packed = readback.read()?;
+    rows.iter()
+        .zip(greedy_at.into_iter().zip(pending))
+        .map(|(request, (greedy, pending))| {
+            Ok(match (&request.plan, greedy, pending) {
+                (PlannedReadback::Greedy, Some((index, logit)), _) => PlannedValues::Greedy {
+                    index: packed[index] as u32,
+                    logit: packed[logit],
+                },
+                (PlannedReadback::Candidates(_), _, Some((pending, start))) => {
+                    let values = readback_slice(&packed, start, pending.len())?;
+                    PlannedValues::Candidates(pending.unpack(values)?)
+                }
+                _ => PlannedValues::None,
+            })
+        })
+        .collect()
+}
+
+/// [`bounded_device_sampling_candidates`] on any device, the CPU included,
+/// so a family's batched sampler can be checked against the single-row
+/// accelerator path on the CPU.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bounded_sampling_candidates_on_any_device(
+    logits: &Tensor,
+    vocab_limit: usize,
+    top_k: usize,
+    temperature: f32,
+    history: &[u32],
+    repetition_penalty: f32,
+    presence_penalty: f32,
+    allowed_mask: Option<&[bool]>,
+) -> Result<Option<DeviceSamplingCandidates>> {
+    if temperature <= 1e-5 {
+        return Ok(None);
+    }
+    bounded_sampling_candidates(
+        logits,
+        vocab_limit,
+        top_k,
+        temperature,
+        PenaltyHistory::uniform(history),
+        repetition_penalty,
+        presence_penalty,
+        allowed_mask,
+    )
+}
+
 /// One row's bounded candidates, still on the device as one packed F32
 /// tensor (values, indices, then the normalizer when present), so a caller
 /// can read many rows back in a single transfer.
@@ -2856,6 +3018,123 @@ mod tests {
         })
         .unwrap();
         expect_per_row(&one_row, planned);
+    }
+
+    fn candidate_bits(candidates: &Option<DeviceSamplingCandidates>) -> Option<Vec<u32>> {
+        candidates.as_ref().map(|candidates| {
+            let mut bits = candidates
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>();
+            bits.extend(&candidates.indices);
+            bits.extend(candidates.logsumexp.map(f32::to_bits));
+            bits
+        })
+    }
+
+    /// Rows with their own vocabulary prefixes and masks, greedy and
+    /// candidate rows mixed, in one transfer: each greedy row reads the
+    /// argmax of its masked prefix and its logit, and each candidate row
+    /// exactly the candidates the single-row accelerator planner gives it
+    /// with that mask (one row nearly all `-inf`, so it falls back).
+    fn assert_masked_rows_match_single_rows(device: &Device) {
+        let (rows, width) = (8, 2_100);
+        let logits = Tensor::from_vec(planning_logits(rows, width), (rows, width), device).unwrap();
+        let history = [5u32, 6, 7, 8, 9, 17, 1_027, 2_000, 2_049];
+        let masked = (0..2_050)
+            .map(|token| token < 2_000 || token == 2_049)
+            .collect::<Vec<_>>();
+        let open = vec![true; 2_000];
+        let (eos, all) = (Some(masked.as_slice()), Some(open.as_slice()));
+        let uniform = PenaltyHistory::uniform(&history);
+        let plan = |row: usize| -> (usize, Option<&[bool]>, PlannedReadback<'_>) {
+            match row {
+                0 => (2_050, eos, PlannedReadback::Greedy),
+                1 => (2_050, eos, candidates(50, 0.9, uniform, 1.05, 0.0)),
+                2 => (2_000, all, candidates(50, 0.9, uniform, 1.05, 0.0)),
+                3 => (2_000, None, PlannedReadback::Greedy),
+                4 => (2_050, eos, candidates(0, 1.2, uniform, 1.3, 0.0)),
+                5 => (2_050, eos, PlannedReadback::None),
+                6 => (2_000, None, candidates(1, 0.7, uniform, 1.0, 0.0)),
+                _ => (2_050, eos, candidates(20, 0.8, uniform, 1.2, 0.0)),
+            }
+        };
+        let read = read_masked_planned_rows(
+            &logits,
+            (0..rows)
+                .map(|row| {
+                    let (vocab, allowed, plan) = plan(row);
+                    MaskedReadback {
+                        vocab,
+                        allowed,
+                        plan,
+                    }
+                })
+                .collect(),
+        )
+        .unwrap();
+        for (row, value) in read.into_iter().enumerate() {
+            let (vocab, allowed, plan) = plan(row);
+            let row_logits = logits.i(row).unwrap();
+            match (plan, value) {
+                (PlannedReadback::Greedy, PlannedValues::Greedy { index, logit }) => {
+                    let mut alone = row_logits.narrow(0, 0, vocab).unwrap();
+                    if let Some(allowed) = allowed.filter(|mask| mask.iter().any(|a| !a)) {
+                        let mask = allowed.iter().map(|a| u8::from(*a)).collect::<Vec<_>>();
+                        let mask = Tensor::from_vec(mask, vocab, device).unwrap();
+                        let blocked = Tensor::full(f32::NEG_INFINITY, vocab, device).unwrap();
+                        alone = mask.where_cond(&alone, &blocked).unwrap();
+                    }
+                    let expected = alone.argmax(0).unwrap().to_scalar::<u32>().unwrap();
+                    let values = alone.to_vec1::<f32>().unwrap();
+                    assert_eq!(index, expected, "row {row}");
+                    assert_eq!(
+                        logit.to_bits(),
+                        values[expected as usize].to_bits(),
+                        "row {row}"
+                    );
+                }
+                (PlannedReadback::Candidates(request), PlannedValues::Candidates(candidates)) => {
+                    let alone = bounded_sampling_candidates(
+                        &row_logits,
+                        vocab,
+                        request.top_k,
+                        request.temperature,
+                        request.history,
+                        request.repetition_penalty,
+                        request.presence_penalty,
+                        allowed,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        candidate_bits(&candidates),
+                        candidate_bits(&alone),
+                        "row {row} on {:?}",
+                        device.location()
+                    );
+                    assert_eq!(candidates.is_none(), row == rows - 1, "row {row}");
+                }
+                (PlannedReadback::None, PlannedValues::None) => {}
+                _ => panic!("row {row} read the wrong kind of values"),
+            }
+        }
+    }
+
+    #[test]
+    fn masked_rows_read_what_each_row_reads_alone_on_cpu() {
+        assert_masked_rows_match_single_rows(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn masked_rows_read_what_each_row_reads_alone_on_metal() {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "masked_rows_read_what_each_row_reads_alone_on_metal",
+        ) else {
+            return;
+        };
+        assert_masked_rows_match_single_rows(&device);
     }
 
     #[test]
