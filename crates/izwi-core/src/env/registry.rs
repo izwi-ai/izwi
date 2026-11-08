@@ -161,6 +161,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Enables recompute preemption: under managed KV pressure, suspend a low-priority session and replay its tokens instead of failing.",
     ),
     CoreEnvVar::new(
+        "IZWI_CHATTERBOX_ACOUSTIC_SYNC",
+        Flag,
+        "false",
+        Once,
+        "Kill switch for CUDA: true makes each Chatterbox acoustic quantum (S3Gen encoder, Euler step, HiFT) wait for the device before it ends, as CPU and Metal always do; by default the next quantum's launches queue behind it on the device thread's stream.",
+    ),
+    CoreEnvVar::new(
         "IZWI_CHATTERBOX_DEVICE_SAMPLING",
         Flag,
         "true",

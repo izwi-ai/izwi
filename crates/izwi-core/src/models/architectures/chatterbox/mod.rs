@@ -572,8 +572,27 @@ impl ChatterboxRuntime {
             tokens,
             stopped,
         )?;
-        self.device.synchronize()?;
+        self.end_acoustic_quantum()?;
         Ok(unit)
+    }
+
+    /// Wait for the device at the end of an acoustic quantum, so its cost
+    /// lands in its own quantum: on CPU and Metal (where it also commits
+    /// Metal's command buffer). On CUDA every unit runs on the device
+    /// thread's one stream, so the next unit, any other request's quantum
+    /// and every free are ordered after it already, and a vocoder unit has
+    /// read its samples back; waiting would only keep the host from queueing
+    /// the next quantum's launches behind it (`IZWI_CHATTERBOX_ACOUSTIC_SYNC`
+    /// restores the wait).
+    fn end_acoustic_quantum(&self) -> Result<()> {
+        static SYNC_ON_CUDA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if self.device.is_cuda()
+            && !*SYNC_ON_CUDA
+                .get_or_init(|| crate::env::flag_or("IZWI_CHATTERBOX_ACOUSTIC_SYNC", false))
+        {
+            return Ok(());
+        }
+        Ok(self.device.synchronize()?)
     }
 
     /// Acoustic units one utterance takes: the encoder, each Euler step and
@@ -641,7 +660,7 @@ impl ChatterboxRuntime {
         if let Some(next) = next {
             *progress = next;
         }
-        self.device.synchronize()?;
+        self.end_acoustic_quantum()?;
         Ok(matches!(progress, ChatterboxAcoustic::Rendered(_)))
     }
 }
