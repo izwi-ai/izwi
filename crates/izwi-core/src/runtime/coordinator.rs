@@ -6985,3 +6985,7 @@ mod tests {
 #[cfg(test)]
 #[path = "fish_s2_preparation_tests.rs"]
 mod fish_s2_preparation_tests;
+
+#[cfg(test)]
+#[path = "tts_prepared_artifact_admission_tests.rs"]
+mod tts_prepared_artifact_admission_tests;

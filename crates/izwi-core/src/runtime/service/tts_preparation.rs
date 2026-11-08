@@ -739,7 +739,13 @@ impl RuntimeService {
             params,
             context_limit,
         )?;
-        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        let (mut execution, _) = self.coordinator_job_for_request(&prepared)?;
+        add_prepared_tts_artifact_to_admission(
+            self.backend_router.context().backend_kind,
+            &mut execution,
+            0,
+            accelerator_bytes,
+        )?;
         match self
             .coordinator
             .admit_observed_from_preparation(
@@ -1464,7 +1470,13 @@ impl RuntimeService {
             params,
             context_limit,
         )?;
-        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        let (mut execution, _) = self.coordinator_job_for_request(&prepared)?;
+        add_prepared_tts_artifact_to_admission(
+            self.backend_router.context().backend_kind,
+            &mut execution,
+            0,
+            retained.accelerator_bytes,
+        )?;
         self.coordinator
             .admit_observed_from_preparation(bridge, execution, retained)
             .await
@@ -1632,7 +1644,13 @@ impl RuntimeService {
             params,
             context_limit,
         )?;
-        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        let (mut execution, _) = self.coordinator_job_for_request(&prepared)?;
+        add_prepared_tts_artifact_to_admission(
+            self.backend_router.context().backend_kind,
+            &mut execution,
+            0,
+            retained.accelerator_bytes,
+        )?;
         self.coordinator
             .admit_observed_from_preparation(bridge, execution, retained)
             .await
@@ -2358,7 +2376,13 @@ impl RuntimeService {
             artifact,
             context_limit,
         )?;
-        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        let (mut execution, _) = self.coordinator_job_for_request(&prepared)?;
+        add_prepared_tts_artifact_to_admission(
+            self.backend_router.context().backend_kind,
+            &mut execution,
+            artifact_host_bytes,
+            accelerator_bytes,
+        )?;
         match self
             .coordinator
             .admit_observed_from_preparation(

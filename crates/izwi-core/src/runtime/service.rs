@@ -785,6 +785,29 @@ pub(super) fn add_fish_s2_artifact_to_admission(
     Ok(())
 }
 
+/// Price a prepared TTS artifact into its execution admission.
+///
+/// Preparation records the artifact's conditioning (voice and reference
+/// tensors, resident on the device on CUDA) as materialized usage, and the
+/// coordinator refuses to resize a reservation below what is materialized.
+/// The generic request estimate prices only the request input, so without
+/// this every Chatterbox, VibeVoice, Voxtral and LFM2.5-Audio request was
+/// refused on CUDA. `host_bytes` is the artifact's host share beyond the
+/// request input; `accelerator_bytes` its resident tensors.
+pub(super) fn add_prepared_tts_artifact_to_admission(
+    backend: BackendKind,
+    spec: &mut JobSpec,
+    host_bytes: u64,
+    accelerator_bytes: u64,
+) -> Result<()> {
+    spec.resources = spec.resources.checked_add(retained_artifact_resources(
+        backend,
+        host_bytes,
+        accelerator_bytes,
+    )?)?;
+    Ok(())
+}
+
 fn ensure_preparation_copy_deadline(job: &JobLease) -> Result<()> {
     if job
         .spec
