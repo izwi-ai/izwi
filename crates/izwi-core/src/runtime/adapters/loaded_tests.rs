@@ -1063,34 +1063,31 @@ fn batched_asr_families_decode_at_the_asr_width_and_prepare_at_the_engine_rows()
     let prefill = stage(&parakeet, StageWorkSelector::SequencePrefill);
     assert_eq!(prefill.max_work_units, 8);
     assert_eq!(prefill.max_workspace_bytes, 8 * 16 * 1024 * 1024);
-    for variant in [
-        ModelVariant::GraniteSpeech502B,
-        ModelVariant::Lfm25Audio15BGguf,
-    ] {
-        assert_eq!(
-            registry.asr_decode_width(variant.family(), BackendKind::Cuda),
-            8,
-            "{variant}"
-        );
-        let draft = LoadedModelBundleDraft::build(
-            &registry,
-            ExecutionGroupId::new(48),
-            ModelInstanceId::new(1),
-            variant,
-            BackendKind::Cuda,
-        )
+    // LFM2.5 Audio keeps the engine rows on CUDA.
+    let variant = ModelVariant::Lfm25Audio15BGguf;
+    assert_eq!(
+        registry.asr_decode_width(variant.family(), BackendKind::Cuda),
+        8,
+        "{variant}"
+    );
+    let draft = LoadedModelBundleDraft::build(
+        &registry,
+        ExecutionGroupId::new(48),
+        ModelInstanceId::new(1),
+        variant,
+        BackendKind::Cuda,
+    )
+    .unwrap();
+    install_test_preparation_seals(&draft, BackendKind::Cuda, 8);
+    let widest = draft
+        .execution_contracts(CapabilityKind::Asr)
+        .unwrap()
+        .iter()
+        .flat_map(|contract| contract.stages.to_vec())
+        .map(|stage| stage.max_batch_size)
+        .max()
         .unwrap();
-        install_test_preparation_seals(&draft, BackendKind::Cuda, 8);
-        let widest = draft
-            .execution_contracts(CapabilityKind::Asr)
-            .unwrap()
-            .iter()
-            .flat_map(|contract| contract.stages.to_vec())
-            .map(|stage| stage.max_batch_size)
-            .max()
-            .unwrap();
-        assert!(widest <= 8, "{variant}: {widest}");
-    }
+    assert!(widest <= 8, "{variant}: {widest}");
     // Nemotron's realtime sessions keep the engine rows beside its wide
     // offline decode.
     let nemotron = LoadedModelBundleDraft::build(

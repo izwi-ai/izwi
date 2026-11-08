@@ -24,7 +24,8 @@
 //! continuous decode steps every row in one launch per op (Qwen3-ASR and
 //! VibeVoice-ASR through the Qwen3 core, Parakeet's TDT and Nemotron ASR's
 //! RNNT joints, Whisper's decoder with one cross-attention call per layer,
-//! Voxtral's offline rows and Granite Speech 4.1's retained rows);
+//! Voxtral's offline rows and Granite Speech 4.1's and 5.0's retained
+//! rows);
 //! their encoders, preparation and prefill stay at the engine rows, and each
 //! load fits the width to its memory.
 
@@ -56,6 +57,7 @@ pub(crate) const CUDA_DEFAULT_WIDTH: usize = 8;
 /// | Qwen3-ASR, VibeVoice-ASR, Parakeet, Nemotron ASR (decode only) | 2 | 2 | 32 | Unmeasured past 8. H100 (`e8f189691`): Qwen3-ASR and VibeVoice-ASR scaled 2.4–2.9x from 1 to 8 streams, then stayed flat at the width (Qwen3-ASR ~82 audio-s/s); each decode step runs all rows per launch |
 /// | Whisper (decode only) | 2 | 2 | 32 | Unmeasured. Its ~316 MB decoder was launch-bound at one row per step; rows now share each launch, one flash-attention call per layer for cross attention, and a row decodes the same alone as beside others (CPU tiny-model parity test) |
 /// | Granite Speech 4.1 (decode only) | 2 | 2 | 32 | Unmeasured past one row. Each request held the device for its whole decode; retained rows now step together (one token upload, one RoPE gather, one paged append and attention per layer, one argmax readback for every row), and the real 2B Plus checkpoint emits the atomic route's tokens through spans, scalar steps and a two-row batch on CPU and Metal (`granite_speech_retained_decode_matches_atomic_on_*`) |
+/// | Granite Speech 5.0 (decode only) | 2 | 2 | 32 | Unmeasured past one row. Each request held the device for its whole decode on a 16k-token KV lease; retained rows now step together (one token upload, one RoPE gather, one paged append and attention per layer, one argmax readback for every row), a row decodes bit-identically alone and beside others on the CPU, and the real GGUF checkpoint emits the atomic route's tokens through spans, scalar steps and a three-row batch on Metal (`granite_speech5_retained_decode_matches_atomic_on_metal`) |
 /// | Voxtral (offline decode only) | 2 | 2 | 32 | Unmeasured past one row. H100: an offline request held the device for its whole decode (about 6.3 ms a frame), 9.6 audio-s/s flat from 1 to 32 streams; offline rows now step together (one token upload, LM forward and argmax readback for every row), and a row emits the same alone as beside others (CPU tiny-model test) |
 ///
 /// Qwen3.5 on the CPU gained nothing past two rows in a repeated run, so it
@@ -79,7 +81,8 @@ pub(crate) const fn certified_decode_width(family: ModelFamily, backend: Backend
             | ModelFamily::NemotronAsr
             | ModelFamily::WhisperAsr
             | ModelFamily::Voxtral
-            | ModelFamily::GraniteSpeechAsr,
+            | ModelFamily::GraniteSpeechAsr
+            | ModelFamily::GraniteSpeech5Asr,
         ) => CUDA_MAX_WIDTH,
         (BackendKind::Cuda, _) => CUDA_DEFAULT_WIDTH,
         (BackendKind::Cpu | BackendKind::Metal, ModelFamily::Lfm2Chat | ModelFamily::Lfm3Chat)
@@ -290,12 +293,12 @@ mod tests {
         assert_eq!(chat_engine_width(BackendKind::Cpu, 8, true), 8);
     }
 
-    /// The seven ASR families whose decode steps every row per launch take
+    /// The eight ASR families whose decode steps every row per launch take
     /// the CUDA ceiling; every other speech family keeps the engine rows, and
     /// none changes on CPU or Metal.
     #[test]
     fn batched_asr_decode_families_take_the_cuda_ceiling() {
-        const WIDE: [ModelFamily; 7] = [
+        const WIDE: [ModelFamily; 8] = [
             ModelFamily::Qwen3Asr,
             ModelFamily::VibeVoiceAsr,
             ModelFamily::ParakeetAsr,
@@ -303,6 +306,7 @@ mod tests {
             ModelFamily::WhisperAsr,
             ModelFamily::Voxtral,
             ModelFamily::GraniteSpeechAsr,
+            ModelFamily::GraniteSpeech5Asr,
         ];
         for family in WIDE {
             assert_eq!(
@@ -319,7 +323,6 @@ mod tests {
             }
         }
         for family in [
-            ModelFamily::GraniteSpeech5Asr,
             ModelFamily::NemotronTranscribeAsr,
             ModelFamily::Lfm25Audio,
             ModelFamily::Lfm3Audio,
@@ -363,6 +366,15 @@ mod tests {
         );
         assert_eq!(
             decode(ModelFamily::GraniteSpeech5Asr, BackendKind::Cuda, 8, true),
+            CUDA_MAX_WIDTH
+        );
+        assert_eq!(
+            decode(
+                ModelFamily::NemotronTranscribeAsr,
+                BackendKind::Cuda,
+                8,
+                true
+            ),
             8
         );
         // An explicit or `max_num_seqs` width applies as it always has, above

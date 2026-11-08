@@ -688,6 +688,14 @@ fn decoder_kv_geometry(variant: ModelVariant) -> Option<DecoderKvGeometry> {
                 kv_width: 512,
             }
         }
+        // Granite Speech 5.0's YaRN-extended granite-4.0-1b: 40 layers, 4
+        // KV heads of 128, in both releases.
+        ModelVariant::GraniteSpeech502B | ModelVariant::GraniteSpeech502BGguf => {
+            DecoderKvGeometry {
+                layers: 40,
+                kv_width: 512,
+            }
+        }
         _ => return None,
     })
 }
@@ -1006,6 +1014,7 @@ mod tests {
                         | ModelFamily::WhisperAsr
                         | ModelFamily::Voxtral
                         | ModelFamily::GraniteSpeechAsr
+                        | ModelFamily::GraniteSpeech5Asr
                 );
             assert_eq!(row(variant).is_some(), wide, "{variant}");
         }
@@ -1103,6 +1112,31 @@ mod tests {
             );
             assert_eq!(crate::catalog::fit_asr_decode_width(32, 8, granite, GIB), 8);
         }
+        // A Granite Speech 5.0 row holds the same 40 layers' BF16 K and V
+        // and BF16 prompt embedding over one 30 s chunk's 744 tokens (the
+        // 128-token prompt reserve, 316 audio tokens and its 300-token
+        // automatic budget) and an F32 logits row: about 61 MiB, so 32 rows
+        // take about 1.9 GiB, against the 1.25 GiB 16k lease one request
+        // held on the atomic route.
+        for variant in [
+            ModelVariant::GraniteSpeech502B,
+            ModelVariant::GraniteSpeech502BGguf,
+        ] {
+            let granite = row(variant).unwrap();
+            assert_eq!(
+                granite,
+                744 * (2 * 40 * 512 * 2 + 2048 * 2) + 100_353 * 4,
+                "{variant}"
+            );
+            assert_eq!(granite / MIB, 61);
+            for (headroom, width) in [(70 * GIB, 32), (13 * GIB, 32), (3 * GIB, 16), (GIB, 8)] {
+                assert_eq!(
+                    crate::catalog::fit_asr_decode_width(32, 8, granite, headroom),
+                    width,
+                    "{variant} {headroom}"
+                );
+            }
+        }
     }
 
     /// The pinned decoder KV widths match the checkpoints' K projections.
@@ -1153,6 +1187,18 @@ mod tests {
                     "../../../tests/fixtures/asr_residency/granite_speech_4_1_2b_plus.json"
                 ),
                 "language_model.model.layers.{i}.self_attn.k_proj.weight",
+            ),
+            (
+                ModelVariant::GraniteSpeech502B,
+                include_str!("../../../tests/fixtures/asr_residency/granite_speech_5_0_2b.json"),
+                "language_model.model.layers.{i}.self_attn.k_proj.weight",
+            ),
+            (
+                ModelVariant::GraniteSpeech502BGguf,
+                include_str!(
+                    "../../../tests/fixtures/asr_residency/granite_speech_5_0_2b_gguf_q8_0.json"
+                ),
+                "blk.{i}.attn_k.weight",
             ),
         ] {
             let geometry = decoder_kv_geometry(variant).unwrap();
