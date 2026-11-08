@@ -1510,6 +1510,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Enables the custom Metal depthwise Conv2d kernel for Parakeet ASR.",
     ),
     CoreEnvVar::new(
+        "IZWI_PARAKEET_WINDOW_BATCHING",
+        Flag,
+        "true",
+        Once,
+        "Encodes a Parakeet input longer than one encoder window (82 s) on CUDA as batches of up to 4 of its windows; false (and Metal and the CPU always) encodes the windows one after another.",
+    ),
+    CoreEnvVar::new(
         "IZWI_PERFORMANCE_CPU_PROJECTION_BACKEND",
         Choice,
         "auto",

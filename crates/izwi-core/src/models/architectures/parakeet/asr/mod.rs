@@ -410,6 +410,55 @@ fn plan_encoder_windows(
     }
 }
 
+/// Windows [`plan_encoder_windows`] plans over `encoded_len` frames.
+fn encoder_window_count(encoded_len: usize, windowing: EncoderWindowing) -> Result<usize> {
+    Ok(plan_encoder_windows(
+        encoded_len,
+        windowing.frames,
+        windowing.left_context,
+        windowing.right_context,
+    )?
+    .len()
+    .max(1))
+}
+
+/// Kill switch for stacking a long input's encoder windows as batch rows (a
+/// boolean; on when unset). Off, the windows encode one after another.
+/// Read once: admission prices the stacked rows from it, and the encoder
+/// runs them.
+pub(crate) const PARAKEET_WINDOW_BATCHING_ENV: &str = "IZWI_PARAKEET_WINDOW_BATCHING";
+
+fn window_batching_enabled() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(PARAKEET_WINDOW_BATCHING_ENV, true));
+    ON.get()
+}
+
+/// The most windows of one long input the encoder runs as the rows of one
+/// batch on `backend`. Every window of a long input has the same frames, so
+/// the rows need no padding and a batch costs about one window's launches,
+/// which is what a launch-bound GPU pays for. A full 1,024-frame window's
+/// layer buffers are about 416 MiB, so CUDA stacks four (about 1.4 GiB).
+/// Metal and the CPU are compute-bound at this length and run the windows
+/// one after another, as before: on an M-series Mac two stacked windows
+/// encoded a 600 s file in 17.3 s against 14.7 s one at a time.
+fn window_batch_rows(backend: BackendKind) -> usize {
+    match backend {
+        BackendKind::Cuda if window_batching_enabled() => 4,
+        _ => 1,
+    }
+}
+
+/// The `(rows, frames)` one batch of a long input's `windows` windows of
+/// `frames` frames runs at on `backend`.
+fn window_batch_shape(windows: usize, frames: usize, backend: BackendKind) -> (usize, usize) {
+    encoder_batch_shape(
+        windows.clamp(1, window_batch_rows(backend)),
+        frames,
+        backend,
+    )
+}
+
 /// Peak preparation memory beyond the weights and the retained artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ParakeetPreparationBytes {
@@ -450,8 +499,10 @@ pub(crate) fn parakeet_preparation_bytes(
         .ok()
         .and_then(|samples| samples.checked_mul(HOST_BYTES_PER_SAMPLE))
         .ok_or_else(|| Error::Overloaded("Parakeet preparation bytes overflowed".into()))?;
-    // A lone window of one 82 s window or less runs at its graph's shape.
-    let (batch_rows, window) = encoder_batch_shape(1, window, backend);
+    // A lone window of one 82 s window or less runs at its graph's shape; a
+    // longer input stacks its windows as the rows of one batch.
+    let windows = encoder_window_count(subsampled_len_3x(valid_frames), EncoderWindowing::V3)?;
+    let (batch_rows, window) = window_batch_shape(windows, window, backend);
     Ok(ParakeetPreparationBytes {
         host_bytes,
         window_bytes: encoder_window_row_bytes(window, batch_rows, 1, backend)?,
@@ -461,7 +512,8 @@ pub(crate) fn parakeet_preparation_bytes(
 
 /// The `(rows, frames)` the encoder runs a batch of `rows` rows padded to
 /// `padded_frames` at: single-window rows at their graph's shape where
-/// [`encoder_batch_shape`] gives one, a longer row (always alone) as is.
+/// [`encoder_batch_shape`] gives one; a longer row (always alone) stacks
+/// its windows as the rows of one batch ([`window_batch_shape`]).
 fn encode_row_shape(
     features: &ParakeetHostFeatures,
     padded_frames: usize,
@@ -471,7 +523,7 @@ fn encode_row_shape(
     if features.single_window() {
         encoder_batch_shape(rows, padded_frames, backend)
     } else {
-        (rows, padded_frames)
+        window_batch_shape(features.encoder_windows(), padded_frames, backend)
     }
 }
 
@@ -491,9 +543,18 @@ pub(crate) fn parakeet_encode_row_bytes(
     let columns = features
         .feature_frames()
         .min(features.window_frames().saturating_mul(SUBSAMPLING_FACTOR));
+    // A long row uploads the features of every window it stacks.
+    let uploads = if features.single_window() {
+        1
+    } else {
+        features
+            .encoder_windows()
+            .clamp(1, window_batch_rows(backend))
+    };
     let host_bytes = EncoderGeometry::V3
         .mel_bins
         .checked_mul(columns)
+        .and_then(|elements| elements.checked_mul(uploads))
         .and_then(|elements| elements.checked_mul(F32_BYTES))
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or_else(|| Error::Overloaded("Parakeet preparation bytes overflowed".into()))?;
@@ -758,6 +819,8 @@ pub(crate) struct ParakeetHostFeatures {
     log_mel_ms: f64,
     /// Frames of one encoder window.
     window_frames: usize,
+    /// Encoder windows the input spans (one when it fits a window).
+    windows: usize,
 }
 
 impl ParakeetHostFeatures {
@@ -776,6 +839,11 @@ impl ParakeetHostFeatures {
     /// one window, else one window.
     pub(crate) fn window_frames(&self) -> usize {
         self.encoded_len().min(self.window_frames)
+    }
+
+    /// Encoder windows the input spans: one when it fits a window.
+    pub(crate) const fn encoder_windows(&self) -> usize {
+        self.windows
     }
 
     /// The input sample count, at the request's own rate.
@@ -1162,6 +1230,7 @@ impl ParakeetAsrModel {
             resampled_samples,
             log_mel_ms,
             window_frames: self.encoder_windowing.frames,
+            windows: encoder_window_count(encoded_len, self.encoder_windowing)?,
         })
     }
 
@@ -1268,6 +1337,7 @@ impl ParakeetAsrModel {
             log_mel.frames(),
             subsampled_len_3x(log_mel.valid_frames()),
             self.encoder_windowing,
+            window_batch_rows(crate::backends::backend_kind_for_device(device)),
             &mut |columns| log_mel.normalize_and_upload(columns, device),
             timings,
             checkpoint,
@@ -2398,6 +2468,7 @@ impl ParakeetEncoder {
         feature_frames: usize,
         encoded_len: usize,
         windowing: EncoderWindowing,
+        window_rows: usize,
         window_features: &mut dyn FnMut(Range<usize>) -> Result<Tensor>,
         timings: &mut ParakeetTimings,
         checkpoint: &dyn Fn() -> Result<()>,
@@ -2412,6 +2483,17 @@ impl ParakeetEncoder {
             return Err(Error::InferenceError(
                 "Parakeet encoder produced no decodable frames".into(),
             ));
+        }
+        if plan.len() > 1 && window_rows > 1 {
+            return self.encode_stacked_windows(
+                &plan,
+                feature_frames,
+                encoded_len,
+                window_rows,
+                window_features,
+                timings,
+                checkpoint,
+            );
         }
         let mut stitched: Option<Tensor> = None;
         let mut pos_emb: Option<Tensor> = None;
@@ -2478,6 +2560,77 @@ impl ParakeetEncoder {
             )?;
             output.slice_set(&kept, 1, window.keep_start)?;
             drop((kept, x));
+            // Metal returns pooled buffers only at a synchronization point.
+            output.device().synchronize()?;
+            stitched = Some(output);
+        }
+        Ok(ParakeetEncoded {
+            encoded: stitched.ok_or_else(|| {
+                Error::InferenceError("Parakeet windowed encode stitched no frames".into())
+            })?,
+            encoded_len,
+            windows: plan.len(),
+        })
+    }
+
+    /// [`Self::encode_windows`] over a long input's windows, `rows` at a time
+    /// as the rows of one batch ([`Self::encode_single_window_batch`]): every
+    /// window has the same frames, so no row is padded, and each window's
+    /// kept frames are stitched as the sequential loop stitches them. The
+    /// stems run inside the batch, so their time counts as layer time.
+    /// `checkpoint` runs before every batch.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_stacked_windows(
+        &self,
+        plan: &[EncoderWindow],
+        feature_frames: usize,
+        encoded_len: usize,
+        rows: usize,
+        window_features: &mut dyn FnMut(Range<usize>) -> Result<Tensor>,
+        timings: &mut ParakeetTimings,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<ParakeetEncoded> {
+        let mut stitched: Option<Tensor> = None;
+        for group in plan.chunks(rows.max(1)) {
+            checkpoint()?;
+            let upload_started = Instant::now();
+            let inputs = group
+                .iter()
+                .map(|window| {
+                    Ok((
+                        window_features(window.feature_columns(feature_frames))?,
+                        window.end - window.start,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            timings.feature_upload_ms += elapsed_ms(upload_started);
+
+            let layers_started = Instant::now();
+            let encoded = self.encode_single_window_batch(&inputs)?;
+            drop(inputs);
+            timings.encoder_layers_ms += elapsed_ms(layers_started);
+
+            let output = match stitched.take() {
+                Some(output) => output,
+                None => {
+                    let first = encoded.first().ok_or_else(|| {
+                        Error::InferenceError("Parakeet window batch encoded no rows".into())
+                    })?;
+                    Tensor::zeros(
+                        (1, encoded_len, self.geometry.dim),
+                        first.dtype(),
+                        first.device(),
+                    )?
+                }
+            };
+            for (window, x) in group.iter().zip(encoded) {
+                let kept = x.narrow(
+                    1,
+                    window.keep_start - window.start,
+                    window.keep_end - window.keep_start,
+                )?;
+                output.slice_set(&kept, 1, window.keep_start)?;
+            }
             // Metal returns pooled buffers only at a synchronization point.
             output.device().synchronize()?;
             stitched = Some(output);
@@ -3795,15 +3948,15 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        build_rel_positional_embedding, parakeet_encode_row_bytes,
+        build_rel_positional_embedding, encoder_window_row_bytes, parakeet_encode_row_bytes,
         parakeet_encoded_len_for_samples, parakeet_max_emittable_tokens,
         parakeet_preparation_bytes, parakeet_tensor_is_f16_projection, plan_encoder_windows,
-        subsampled_len_3x, tdt_word_timestamps, EncoderGeometry, EncoderWindow, EncoderWindowing,
-        Joint, LstmCell, ParakeetAsrModel, ParakeetDecoder, ParakeetEncoded, ParakeetEncoder,
-        ParakeetEncoderBatchRow, ParakeetHostFeatures, ParakeetLogMel, ParakeetNetwork,
-        ParakeetPreparedEncoderArtifact, ParakeetPreprocessor, ParakeetRetainedDecodeBatchRow,
-        ParakeetRetainedDecodeStep, ParakeetTimings, Predictor, TdtTokenFrame, DEFAULT_MAX_SYMBOLS,
-        PRED_HIDDEN,
+        subsampled_len_3x, tdt_word_timestamps, window_batch_rows, EncoderGeometry, EncoderWindow,
+        EncoderWindowing, Joint, LstmCell, ParakeetAsrModel, ParakeetDecoder, ParakeetEncoded,
+        ParakeetEncoder, ParakeetEncoderBatchRow, ParakeetHostFeatures, ParakeetLogMel,
+        ParakeetNetwork, ParakeetPreparedEncoderArtifact, ParakeetPreprocessor,
+        ParakeetRetainedDecodeBatchRow, ParakeetRetainedDecodeStep, ParakeetTimings, Predictor,
+        TdtTokenFrame, DEFAULT_MAX_SYMBOLS, PRED_HIDDEN,
     };
     use super::{
         encoder_batch_shape, encoder_graph_shape, encoder_graphs_requested,
@@ -4053,10 +4206,32 @@ mod tests {
         window_features: &mut dyn FnMut(std::ops::Range<usize>) -> Result<Tensor>,
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<ParakeetEncoded> {
+        encode_windows_stacked(
+            encoder,
+            feature_frames,
+            encoded_len,
+            windowing,
+            1,
+            window_features,
+            checkpoint,
+        )
+    }
+
+    /// [`encode_windows`] with up to `window_rows` windows per batch.
+    fn encode_windows_stacked(
+        encoder: &ParakeetEncoder,
+        feature_frames: usize,
+        encoded_len: usize,
+        windowing: EncoderWindowing,
+        window_rows: usize,
+        window_features: &mut dyn FnMut(std::ops::Range<usize>) -> Result<Tensor>,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<ParakeetEncoded> {
         encoder.encode_windows(
             feature_frames,
             encoded_len,
             windowing,
+            window_rows,
             window_features,
             &mut ParakeetTimings::default(),
             checkpoint,
@@ -5163,6 +5338,65 @@ mod tests {
         assert!(max_abs_diff(&windowed(2).encoded, &reference) > 1e-3);
     }
 
+    /// A long input's windows stacked as the rows of one batch encode as the
+    /// sequential windows do (within the batched-encode bound), and the
+    /// stacked encode checks for cancellation before every batch.
+    #[test]
+    fn stacked_windows_match_sequential_windows() {
+        let device = Device::Cpu;
+        let encoder = random_encoder(TINY, 11, &device);
+        let valid = 8 * 120 + 3;
+        let frames = valid + 1;
+        let encoded_len = subsampled_len_3x(valid);
+        let log_mel = random_log_mel(frames, valid, 33);
+        let windowing = EncoderWindowing {
+            frames: 32,
+            left_context: 8,
+            right_context: 8,
+        };
+        let run = |rows: usize, checks: &Cell<usize>| {
+            encode_windows_stacked(
+                &encoder,
+                frames,
+                encoded_len,
+                windowing,
+                rows,
+                &mut |columns| log_mel.normalize_and_upload(columns, &device),
+                &|| {
+                    checks.set(checks.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap()
+        };
+        let sequential_checks = Cell::new(0);
+        let sequential = run(1, &sequential_checks);
+        assert!(sequential.windows >= 5, "{} windows", sequential.windows);
+        assert_eq!(sequential_checks.get(), sequential.windows);
+        let scale = sequential
+            .encoded
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        for rows in [2, 3, sequential.windows + 4] {
+            let checks = Cell::new(0);
+            let stacked = run(rows, &checks);
+            assert_eq!(stacked.windows, sequential.windows);
+            assert_eq!(stacked.encoded.dims(), sequential.encoded.dims());
+            assert_eq!(checks.get(), sequential.windows.div_ceil(rows), "{rows} rows");
+            let diff = max_abs_diff(&stacked.encoded, &sequential.encoded);
+            assert!(
+                diff <= BATCHED_ENCODE_TOLERANCE * scale.max(1.0),
+                "{rows} rows: max |diff| {diff} of {scale}"
+            );
+        }
+    }
+
     #[test]
     fn windowed_encode_stops_at_a_cancelled_checkpoint() {
         let device = Device::Cpu;
@@ -5269,7 +5503,9 @@ mod tests {
                 assert!(bytes >= previous, "{backend:?} pricing fell at {samples}");
                 previous = bytes;
             }
-            assert!(total(60 * minute, backend) <= 5 * GIB / 2, "{backend:?}");
+            // CUDA stacks four windows of a long input (about 1.4 GiB).
+            let bound = if backend == BackendKind::Cuda { 3 * GIB } else { 5 * GIB / 2 };
+            assert!(total(60 * minute, backend) <= bound, "{backend:?}");
         }
 
         // E = 1024 frames: the window term is final from here on. It was
@@ -5283,11 +5519,26 @@ mod tests {
         };
         assert_eq!(full_window(BackendKind::Cpu), (832 - 512 + 96) << 20);
         assert_eq!(full_window(BackendKind::Metal), (832 - 512 + 96) << 20);
+        // A longer input stacks its windows as the rows of one batch on
+        // CUDA: two windows at 2 minutes, then four; the CPU and Metal run
+        // them one at a time, at the one-window price.
+        assert_eq!(backends.map(window_batch_rows), [1, 1, 4]);
         for minutes in [2, 10, 30, 60] {
             for backend in backends {
                 let bytes = parakeet_preparation_bytes(minutes * minute, backend).unwrap();
-                assert_eq!(bytes.window_bytes, full_window(backend));
+                let rows = if minutes == 2 { 2 } else { 4 }.min(window_batch_rows(backend));
+                assert_eq!(
+                    bytes.window_bytes,
+                    encoder_window_row_bytes(1024, rows, 1, backend).unwrap(),
+                    "{backend:?} at {minutes} minutes"
+                );
             }
+            assert_eq!(
+                parakeet_preparation_bytes(minutes * minute, BackendKind::Cpu)
+                    .unwrap()
+                    .window_bytes,
+                full_window(BackendKind::Cpu)
+            );
         }
         for samples in [16_000, 7 * minute + 4_321, 60 * minute] {
             assert!(total(samples, BackendKind::Metal) >= total(samples, BackendKind::Cpu));

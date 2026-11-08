@@ -224,6 +224,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_PARAKEET_METAL_CONV1D_BN_SWISH` | flag | true (Metal only) | first use | Enables the fused Metal depthwise Conv1d + bias + Swish kernel for Parakeet ASR conformer convs. |
 | `IZWI_PARAKEET_METAL_DEPTHWISE_CONV1D` | flag | true (Metal only) | first use | Enables the custom Metal depthwise Conv1d kernel for Parakeet ASR. |
 | `IZWI_PARAKEET_METAL_DEPTHWISE_CONV2D` | flag | true (Metal only) | first use | Enables the custom Metal depthwise Conv2d kernel for Parakeet ASR. |
+| `IZWI_PARAKEET_WINDOW_BATCHING` | flag | `true` | first use | Encodes a Parakeet input longer than one encoder window (82 s) on CUDA as batches of up to 4 of its windows; false (and Metal and the CPU always) encodes the windows one after another. |
 | `IZWI_PERFORMANCE_CPU_PROJECTION_BACKEND` | choice | `auto` | startup | Deprecated alias of IZWI_CPU_PROJECTION_BACKEND, used only when the canonical name is unset. |
 | `IZWI_PERFORMANCE_CUDA_DECODE_GRAPHS` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_DECODE_GRAPHS, used only when the canonical name is unset. |
 | `IZWI_PERFORMANCE_CUDA_DEVICE_SAMPLING` | auto/flag | `auto` | startup | Deprecated alias of IZWI_CUDA_DEVICE_SAMPLING, used only when the canonical name is unset. |
