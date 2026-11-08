@@ -353,11 +353,22 @@ fn chatterbox_tts_plan(
         files.push(perth_encoder_census(&perth)?);
     }
     let t3_dtype = chatterbox_t3_precision(device).dtype;
-    let plan = price_chatterbox_tts(&files, backend, t3_file, t3_dtype)?;
+    let mut plan = price_chatterbox_tts(&files, backend, t3_file, t3_dtype)?;
     if t3_dtype != DType::F32 {
         // A T3 that fails its load-time self-check reloads in F32.
         let dense = price_chatterbox_tts(&files, backend, t3_file, DType::F32)?;
-        return Ok(Some(plan.with_fallback_peak(&dense)));
+        plan = plan.with_fallback_peak(&dense);
+    }
+    if backend == BackendKind::Cuda
+        && crate::env::flag_or(
+            crate::models::architectures::chatterbox::CHATTERBOX_ACOUSTIC_BF16_ENV,
+            false,
+        )
+    {
+        // The opt-in BF16 copy of S3Gen's flow and HiFT loads beside the F32
+        // one for its check; either may stay, so F32 stays priced resident.
+        let both = price_chatterbox_tts_with(&files, backend, t3_file, t3_dtype, true)?;
+        plan = plan.with_fallback_peak(&both);
     }
     Ok(Some(plan))
 }
@@ -404,6 +415,18 @@ fn price_chatterbox_tts(
     t3_file: &str,
     t3_dtype: DType,
 ) -> Result<AsrResidencyPlan> {
+    price_chatterbox_tts_with(files, backend, t3_file, t3_dtype, false)
+}
+
+/// [`price_chatterbox_tts`], with `acoustic_bf16_copy` a BF16 copy of
+/// S3Gen's flow and HiFT resident beside the F32 one.
+fn price_chatterbox_tts_with(
+    files: &[CensusFile],
+    backend: BackendKind,
+    t3_file: &str,
+    t3_dtype: DType,
+    acoustic_bf16_copy: bool,
+) -> Result<AsrResidencyPlan> {
     const UNREAD: [&str; 2] = ["text_head.", "tfmr.embed_tokens."];
     let mut ledger = Ledger::staged(backend);
     for file in files {
@@ -423,6 +446,12 @@ fn price_chatterbox_tts(
                 Source::Mapped
             };
             ledger.var(tensor, source, &[dtype])?;
+            if acoustic_bf16_copy
+                && file.path.ends_with(S3GEN_WEIGHTS_FILE)
+                && (tensor.name.starts_with("flow.") || tensor.name.starts_with("mel2wav."))
+            {
+                ledger.var(tensor, source, &[DType::BF16])?;
+            }
         }
     }
     let voices = 1 + CHATTERBOX_REFERENCE_VOICE_CACHE as u64;
@@ -837,6 +866,43 @@ mod tests {
         let requirements =
             BACKENDS.map(|backend| empty_device_requirement(variant, &vibevoice(backend), backend));
         assert_catalog_figures_cover_empty_devices(&[(variant, requirements)]);
+    }
+
+    /// The opt-in BF16 copy of Chatterbox's S3Gen flow and HiFT loads beside
+    /// the F32 one: priced with it, the load peak holds both, about half the
+    /// flow and HiFT's F32 bytes more (`chatterbox_tts_plan` takes only that
+    /// peak and keeps F32 priced resident).
+    #[test]
+    fn chatterbox_bf16_acoustic_copy_prices_both_copies_at_the_load_peak() {
+        let chatterbox = chatterbox_census();
+        let price = |copy| {
+            price_chatterbox_tts_with(
+                &chatterbox,
+                BackendKind::Cuda,
+                T3_WEIGHTS_FILE,
+                DType::BF16,
+                copy,
+            )
+            .unwrap()
+            .estimate()
+            .unwrap()
+        };
+        let (alone, both) = (price(false), price(true));
+        let acoustic_f32 = chatterbox
+            .iter()
+            .filter(|file| file.path.ends_with(S3GEN_WEIGHTS_FILE))
+            .flat_map(|file| file.tensors.iter())
+            .filter(|tensor| {
+                tensor.name.starts_with("flow.") || tensor.name.starts_with("mel2wav.")
+            })
+            .map(|tensor| tensor.stored_bytes)
+            .sum::<u64>();
+        let extra = both.load_peak_bytes - alone.load_peak_bytes;
+        assert!(acoustic_f32 > 0);
+        assert!(
+            extra >= acoustic_f32 / 2 && extra <= acoustic_f32 / 2 + (64 << 20),
+            "extra {extra} for {acoustic_f32} F32 bytes"
+        );
     }
 
     /// Report 08 table B, resident weights per backend (CPU, Metal as

@@ -161,6 +161,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Enables recompute preemption: under managed KV pressure, suspend a low-priority session and replay its tokens instead of failing.",
     ),
     CoreEnvVar::new(
+        "IZWI_CHATTERBOX_ACOUSTIC_BF16",
+        Flag,
+        "false",
+        Load,
+        "On CUDA, loads a BF16 copy of Chatterbox's S3Gen flow and HiFT vocoder beside the F32 one and serves it when a load-time probe (the default voice and fixed xorshift tokens and noise through the flow, the mel's F0, and HiFT's waveform from one fixed 200 Hz source) stays within 0.05 relative L2 of F32 on the mel, F0 and waveform; otherwise F32 serves. Off by default until H100 parity, an ASR round-trip WER and a listening check support it. Loads price both copies at the load peak. `acoustic_precision` in the model diagnostics reports the copy serving, why, and each probed output's relative L2.",
+    ),
+    CoreEnvVar::new(
         "IZWI_CHATTERBOX_ACOUSTIC_SYNC",
         Flag,
         "false",

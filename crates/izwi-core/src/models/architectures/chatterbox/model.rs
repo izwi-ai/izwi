@@ -58,6 +58,10 @@ pub struct ChatterboxTtsDiagnostics {
     pub max_speech_tokens: usize,
     /// Rendered audio carries the PerTh watermark.
     pub watermarked: bool,
+    /// Which copy of S3Gen's flow and HiFT serves (F32, or BF16 on CUDA
+    /// with `IZWI_CHATTERBOX_ACOUSTIC_BF16`), why, and the load-time probe's
+    /// relative L2 against F32.
+    pub acoustic_precision: serde_json::Value,
 }
 
 /// What one acoustic unit did.
@@ -91,7 +95,8 @@ impl ChatterboxTtsModel {
         }
         // T3 at the device's Chatterbox dtype (F16 on Metal, BF16 on CUDA
         // with BF16) when its load-time self-check passes, else F32; every
-        // other network stays F32.
+        // other network stays F32, except that S3Gen's flow and HiFT may
+        // take a checked BF16 copy on CUDA (`IZWI_CHATTERBOX_ACOUSTIC_BF16`).
         let selection = chatterbox_t3_precision(&device);
         let (runtime, precision) = load_with_precision_fallback(
             "Chatterbox T3",
@@ -201,6 +206,7 @@ impl ChatterboxTtsModel {
             context_tokens: self.context_tokens(),
             max_speech_tokens: ModelVariant::CHATTERBOX_MAX_OUTPUT_FRAMES,
             watermarked: self.runtime.watermarked(),
+            acoustic_precision: self.runtime.acoustic_precision().diagnostics(),
         }
     }
 
