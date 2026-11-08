@@ -18,9 +18,9 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::tokenizer::IncrementalDecoder;
 
 use super::{
-    clean_granite_speech5_output, GraniteSpeech5AsrModel, GraniteSpeech5GenerationOptions,
-    GraniteSpeech5RequestOptions, GraniteSpeech5Task, GRANITE_SPEECH5_MAX_AUDIO_SECONDS,
-    GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS,
+    clean_granite_speech5_output, GraniteSpeech5AsrModel, GraniteSpeech5AudioFeatures,
+    GraniteSpeech5GenerationOptions, GraniteSpeech5RequestOptions, GraniteSpeech5Task,
+    GRANITE_SPEECH5_MAX_AUDIO_SECONDS, GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS,
 };
 
 static NEXT_DECODE_STATE_ID: AtomicU64 = AtomicU64::new(1);
@@ -110,6 +110,13 @@ impl GraniteSpeech5PreparedGeometry {
 pub(crate) struct GraniteSpeech5PreparationBatchRow<'a> {
     pub(crate) audio: &'a [f32],
     pub(crate) sample_rate: u32,
+    pub(crate) request: &'a GraniteSpeech5RequestOptions,
+}
+
+/// One request of a preparation batch whose audio features a host worker
+/// computed.
+pub(crate) struct GraniteSpeech5FeatureRow<'a> {
+    pub(crate) features: GraniteSpeech5AudioFeatures,
     pub(crate) request: &'a GraniteSpeech5RequestOptions,
 }
 
@@ -465,6 +472,31 @@ impl GraniteSpeech5AsrModel {
         request: &GraniteSpeech5RequestOptions,
     ) -> Result<GraniteSpeech5PreparedGeometry> {
         let features = self.preprocessor.prepare(audio, sample_rate)?;
+        self.retained_preparation_geometry_for_features(&features, audio.len(), request)
+    }
+
+    /// One request's audio features, computed on the host, and the retained
+    /// geometry they give.
+    pub(crate) fn retained_preparation_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        request: &GraniteSpeech5RequestOptions,
+    ) -> Result<(GraniteSpeech5AudioFeatures, GraniteSpeech5PreparedGeometry)> {
+        let features = self.preprocessor.prepare(audio, sample_rate)?;
+        let geometry =
+            self.retained_preparation_geometry_for_features(&features, audio.len(), request)?;
+        Ok((features, geometry))
+    }
+
+    /// The retained geometry of a request of `audio_samples` input samples
+    /// whose audio features a host worker already computed.
+    pub(crate) fn retained_preparation_geometry_for_features(
+        &self,
+        features: &GraniteSpeech5AudioFeatures,
+        audio_samples: usize,
+        request: &GraniteSpeech5RequestOptions,
+    ) -> Result<GraniteSpeech5PreparedGeometry> {
         if features.audio_seconds > GRANITE_SPEECH5_MAX_AUDIO_SECONDS {
             return Err(Error::InvalidInput(format!(
                 "Granite Speech 5.0 transcribes up to {GRANITE_SPEECH5_MAX_AUDIO_SECONDS:.0}s per invocation, got {:.1}s",
@@ -501,7 +533,7 @@ impl GraniteSpeech5AsrModel {
         let language_bytes =
             Self::output_language(request)?.map_or(0, |language| language.len() as u64);
         Ok(GraniteSpeech5PreparedGeometry {
-            audio_samples: audio.len(),
+            audio_samples,
             encoder_frames: features.encoder_frames,
             encoder_dim: features.encoder_dim,
             prompt_tokens,
@@ -709,6 +741,25 @@ impl GraniteSpeech5AsrModel {
         &self,
         rows: &[GraniteSpeech5PreparationBatchRow<'_>],
     ) -> Result<Vec<Arc<GraniteSpeech5PreparedPromptArtifact>>> {
+        let rows = rows
+            .iter()
+            .map(|row| {
+                Ok(GraniteSpeech5FeatureRow {
+                    features: self.preprocessor.prepare(row.audio, row.sample_rate)?,
+                    request: row.request,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.prepare_prompt_artifact_batch_from_features(rows)
+    }
+
+    /// Encode rows whose audio features a host worker computed (one batch
+    /// through the encoder and Q-Former) and splice each row's audio into its
+    /// own prompt.
+    pub(crate) fn prepare_prompt_artifact_batch_from_features(
+        &self,
+        rows: Vec<GraniteSpeech5FeatureRow<'_>>,
+    ) -> Result<Vec<Arc<GraniteSpeech5PreparedPromptArtifact>>> {
         if rows.is_empty() {
             return Err(Error::InvalidInput(
                 "Granite Speech 5.0 prompt preparation batch is empty".into(),
@@ -717,7 +768,7 @@ impl GraniteSpeech5AsrModel {
         let mut features = Vec::with_capacity(rows.len());
         let mut prompts = Vec::with_capacity(rows.len());
         for row in rows {
-            let row_features = self.preprocessor.prepare(row.audio, row.sample_rate)?;
+            let row_features = row.features;
             if row_features.audio_seconds > GRANITE_SPEECH5_MAX_AUDIO_SECONDS {
                 return Err(Error::InvalidInput(format!(
                     "Granite Speech 5.0 transcribes up to {GRANITE_SPEECH5_MAX_AUDIO_SECONDS:.0}s per invocation, got {:.1}s",

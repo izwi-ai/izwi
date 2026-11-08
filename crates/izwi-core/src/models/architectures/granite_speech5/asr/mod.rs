@@ -81,9 +81,9 @@ pub use prompt::{
 };
 pub(crate) use retained::{
     GraniteSpeech5AsrPreparationStageSeal, GraniteSpeech5DecodeCheckpoint,
-    GraniteSpeech5DecodeState, GraniteSpeech5DecodeStep, GraniteSpeech5PreparationBatchGeometry,
-    GraniteSpeech5PreparationBatchRow, GraniteSpeech5PreparedGeometry,
-    GraniteSpeech5PreparedPromptArtifact,
+    GraniteSpeech5DecodeState, GraniteSpeech5DecodeStep, GraniteSpeech5FeatureRow,
+    GraniteSpeech5PreparationBatchGeometry, GraniteSpeech5PreparationBatchRow,
+    GraniteSpeech5PreparedGeometry, GraniteSpeech5PreparedPromptArtifact,
 };
 pub use runtime::{
     GraniteSpeech5AudioStats, GraniteSpeech5Generation, GraniteSpeech5GenerationStats,

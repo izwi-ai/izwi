@@ -261,8 +261,8 @@ pub(super) struct GraniteSpeech5EncoderPending {
     pub(super) model: AsrModelLease,
     /// The model's catalog name, for the ASR metrics.
     pub(super) model_label: &'static str,
-    pub(super) samples: Arc<[f32]>,
-    pub(super) sample_rate: u32,
+    /// The host audio features, dropped once the encode has read them.
+    pub(super) features: GraniteSpeech5AudioFeatures,
     pub(super) request: GraniteSpeech5RequestOptions,
     pub(super) geometry: GraniteSpeech5PreparedGeometry,
     pub(super) retained_host_bytes: u64,
@@ -1575,6 +1575,20 @@ impl GraniteSpeech5EncoderBatcher {
         let work = WorkUnit::PreSequencePreparation {
             kind: "asr.encoder.granite_speech5".into(),
         };
+        // The host stage recorded the request bytes plus its features, which
+        // the encode consumes; each row's commit records only what its
+        // artifact keeps. Restore the features' claim to pending first: usage
+        // may only rise through an observation, and the reservation still
+        // covers the features until the batch ends.
+        for row in &batch {
+            if let Err(error) = row
+                .job
+                .prepare_materialized_release(JobResourceObservation::host(row.retained_host_bytes))
+            {
+                Self::fail_batch(batch, error);
+                return;
+            }
+        }
         let mut sealed = Vec::with_capacity(batch.len());
         for (index, row) in batch.iter().enumerate() {
             let cost = match model.granite_speech5_preparation_row_cost_for_batch(
@@ -1604,43 +1618,46 @@ impl GraniteSpeech5EncoderBatcher {
             }
         }
 
-        let inputs = batch
-            .iter()
-            .map(|row| {
-                (
-                    row.samples.clone(),
-                    row.sample_rate,
-                    row.request.clone(),
-                    row.geometry,
-                    row.retained_host_bytes,
-                    row.artifact_host_bytes,
-                )
-            })
-            .collect::<Vec<_>>();
-        let senders = batch
-            .drain(..)
-            .map(|mut row| {
+        let mut senders = Vec::with_capacity(batch.len());
+        let mut features = Vec::with_capacity(batch.len());
+        let mut inputs = Vec::with_capacity(batch.len());
+        for mut row in batch.drain(..) {
+            senders.push(
                 row.response
                     .take()
-                    .expect("queued Granite Speech row has response channel")
-            })
-            .collect::<Vec<_>>();
+                    .expect("queued Granite Speech row has response channel"),
+            );
+            features.push(Some(row.features));
+            inputs.push((
+                row.request,
+                row.geometry,
+                row.retained_host_bytes,
+                row.artifact_host_bytes,
+            ));
+        }
         let physical_model = model.clone();
         let result = self
             .coordinator
             .run_loaded_native_preparation_batch(sealed, contract, work, move |live| {
+                let mut features = features;
                 let selected = live
                     .iter()
-                    .map(|index| GraniteSpeech5PreparationBatchRow {
-                        audio: inputs[*index].0.as_ref(),
-                        sample_rate: inputs[*index].1,
-                        request: &inputs[*index].2,
+                    .map(|index| {
+                        Ok(GraniteSpeech5FeatureRow {
+                            features: features[*index].take().ok_or_else(|| {
+                                Error::InferenceError(
+                                    "Granite Speech 5.0 batch row features were already used"
+                                        .into(),
+                                )
+                            })?,
+                            request: &inputs[*index].0,
+                        })
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>>>()?;
                 crate::engine::metrics::record_asr_preparation_batch_rows(model_label, live.len());
                 let encode_started = Instant::now();
-                let prepared =
-                    physical_model.prepare_granite_speech5_prompt_artifact_batch(&selected)?;
+                let prepared = physical_model
+                    .prepare_granite_speech5_prompt_artifact_batch_from_features(selected)?;
                 crate::engine::metrics::record_asr_device_phase(
                     model_label,
                     crate::engine::metrics::AsrPhase::Encoder,
@@ -1655,11 +1672,11 @@ impl GraniteSpeech5EncoderBatcher {
                     .into_iter()
                     .zip(live.iter().copied())
                     .map(|(artifact, index)| {
-                        let geometry = inputs[index].3;
+                        let geometry = inputs[index].1;
                         let resident_tensor_bytes = artifact.resident_tensor_bytes()?;
                         if artifact.prompt_tokens() != geometry.prompt_tokens
                             || artifact.audio_tokens() != geometry.audio_tokens
-                            || artifact.resident_host_bytes() != inputs[index].5
+                            || artifact.resident_host_bytes() != inputs[index].3
                             || resident_tensor_bytes != geometry.retained_device_bytes
                         {
                             return Err(Error::InferenceError(
@@ -1669,7 +1686,7 @@ impl GraniteSpeech5EncoderBatcher {
                         }
                         Ok(PreparationArtifact {
                             retained: JobResourceObservation {
-                                host_bytes: inputs[index].4,
+                                host_bytes: inputs[index].2,
                                 accelerator_bytes: resident_tensor_bytes,
                             },
                             value: artifact,

@@ -40,8 +40,9 @@ use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechPreparedGeometry, GraniteSpeechPreparedPromptArtifact, GraniteSpeechTask,
 };
 use crate::models::architectures::granite_speech5::asr::{
-    GraniteSpeech5AsrModel, GraniteSpeech5DecodeCheckpoint, GraniteSpeech5DecodeState,
-    GraniteSpeech5DecodeStep, GraniteSpeech5GenerationOptions, GraniteSpeech5PhysicalStateSpec,
+    GraniteSpeech5AsrModel, GraniteSpeech5AudioFeatures, GraniteSpeech5DecodeCheckpoint,
+    GraniteSpeech5DecodeState, GraniteSpeech5DecodeStep, GraniteSpeech5FeatureRow,
+    GraniteSpeech5GenerationOptions, GraniteSpeech5PhysicalStateSpec,
     GraniteSpeech5PreparationBatchGeometry, GraniteSpeech5PreparationBatchRow,
     GraniteSpeech5PreparedGeometry, GraniteSpeech5PreparedPromptArtifact,
     GraniteSpeech5RequestOptions, GraniteSpeech5Transcription, GRANITE_SPEECH5_MAX_AUDIO_SECONDS,
@@ -1504,6 +1505,38 @@ impl NativeAsrModel {
             Self::GraniteSpeech(model) => model.preparation_row_cost_for_batch(index, rows, batch),
             _ => Err(Error::InvalidInput(
                 "Granite Speech batch cost was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    /// Encodes Granite Speech 5.0 rows whose audio features a host worker
+    /// computed.
+    pub(crate) fn prepare_granite_speech5_prompt_artifact_batch_from_features(
+        &self,
+        rows: Vec<GraniteSpeech5FeatureRow<'_>>,
+    ) -> Result<Vec<Arc<GraniteSpeech5PreparedPromptArtifact>>> {
+        match self {
+            Self::GraniteSpeech5(model) => model.prepare_prompt_artifact_batch_from_features(rows),
+            _ => Err(Error::InvalidInput(
+                "Granite Speech 5.0 batch preparation was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
+    /// One Granite Speech 5.0 request's audio features, computed on the
+    /// host, and the retained geometry they give.
+    pub(crate) fn granite_speech5_retained_preparation_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        request: &GraniteSpeech5RequestOptions,
+    ) -> Result<(GraniteSpeech5AudioFeatures, GraniteSpeech5PreparedGeometry)> {
+        match self {
+            Self::GraniteSpeech5(model) => {
+                model.retained_preparation_features(audio, sample_rate, request)
+            }
+            _ => Err(Error::InvalidInput(
+                "Granite Speech 5.0 features were requested from another ASR model".into(),
             )),
         }
     }

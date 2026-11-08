@@ -2193,22 +2193,27 @@ impl RuntimeService {
                 let audio_seconds = samples.len() as f32 / sample_rate.max(1) as f32;
                 let budget =
                     crate::runtime::granite_speech5_asr_planned_max_tokens(&request, audio_seconds);
-                let geometry = (!plan.requires_chunk_path()
+                // The log-mel runs here, on a host worker, and travels with
+                // the request, so the device job runs only the encoder.
+                let shaped = (!plan.requires_chunk_path()
                     && model_for_shape.supports_resumable_prefill())
                 .then(|| {
-                    model_for_shape.granite_speech5_retained_preparation_geometry(
+                    let started = Instant::now();
+                    let shaped = model_for_shape.granite_speech5_retained_preparation_features(
                         &samples,
                         sample_rate,
                         &options,
-                    )
+                    );
+                    record_host_features(variant, started);
+                    shaped
                 })
                 .transpose()?
-                .filter(|geometry| {
+                .filter(|(_, geometry)| {
                     granite_speech5_decodes_as_row(geometry.prompt_tokens, budget, context_limit)
                 });
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
-                match geometry {
-                    Some(geometry) => {
+                match shaped {
+                    Some((features, geometry)) => {
                         // Admission claims the sequence's pages for
                         // `max_tokens` in full: narrow an omitted budget to
                         // the one the decode uses for this audio's duration,
@@ -2218,7 +2223,7 @@ impl RuntimeService {
                             geometry.prompt_tokens,
                             context_limit,
                         )?;
-                        Ok((request, Some((geometry, options))))
+                        Ok((request, Some((geometry, options, features))))
                     }
                     None => {
                         request.install_prepared_asr_long_form_atomic(plan)?;
@@ -2231,9 +2236,22 @@ impl RuntimeService {
             .map_err(|_| {
                 Error::Overloaded("Granite Speech 5.0 retained input exceeds u64".into())
             })?;
-        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        // The features are held beside the request until the encode drops
+        // them.
+        let features_host_bytes = match &row {
+            Some((_, _, features)) => features.host_bytes().ok_or_else(|| {
+                Error::Overloaded("Granite Speech 5.0 feature bytes overflow".into())
+            })?,
+            None => 0,
+        };
+        let prepared_host_bytes = retained_host_bytes
+            .checked_add(features_host_bytes)
+            .ok_or_else(|| {
+                Error::Overloaded("Granite Speech 5.0 prepared host bytes overflow".into())
+            })?;
+        job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
-        let Some((geometry, options)) = row else {
+        let Some((geometry, options, features)) = row else {
             let (spec, observation) = self.coordinator_job_for_request(&prepared)?;
             return match self
                 .coordinator
@@ -2273,7 +2291,11 @@ impl RuntimeService {
             })?;
         let resources = asr_encoder_retained_resources(
             self.backend_router.context().backend_kind,
-            total_retained_host_bytes,
+            total_retained_host_bytes
+                .checked_add(features_host_bytes)
+                .ok_or_else(|| {
+                    Error::Overloaded("Granite Speech 5.0 prepared host bytes overflow".into())
+                })?,
             geometry.retained_device_bytes,
         )?;
         let prep_spec = JobSpec {
@@ -2289,7 +2311,7 @@ impl RuntimeService {
             .admit_observed_from_preparation(
                 bridge,
                 prep_spec,
-                JobResourceObservation::host(retained_host_bytes),
+                JobResourceObservation::host(prepared_host_bytes),
             )
             .await
         {
@@ -2301,11 +2323,6 @@ impl RuntimeService {
                 return Err(error);
             }
         };
-        let (samples, sample_rate) = prepared
-            .prepared_asr_audio_for_executor()?
-            .ok_or_else(|| {
-                Error::InferenceError("Granite Speech 5.0 decoded audio was lost".into())
-            })?;
         let outcome = self
             .granite_speech5_encoder_batcher
             .submit(GraniteSpeech5EncoderPending {
@@ -2313,8 +2330,7 @@ impl RuntimeService {
                 contract: preparation_contract,
                 model: model.clone(),
                 model_label: variant.dir_name(),
-                samples,
-                sample_rate,
+                features,
                 request: options,
                 geometry,
                 retained_host_bytes: total_retained_host_bytes,

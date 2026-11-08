@@ -74,8 +74,9 @@ use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechPreparedPromptArtifact,
 };
 use crate::models::architectures::granite_speech5::asr::{
-    GraniteSpeech5AsrModel, GraniteSpeech5PreparationBatchRow, GraniteSpeech5PreparedGeometry,
-    GraniteSpeech5PreparedPromptArtifact, GraniteSpeech5RequestOptions,
+    GraniteSpeech5AsrModel, GraniteSpeech5AudioFeatures, GraniteSpeech5FeatureRow,
+    GraniteSpeech5PreparedGeometry, GraniteSpeech5PreparedPromptArtifact,
+    GraniteSpeech5RequestOptions,
 };
 use crate::models::architectures::kokoro::kokoro_output_budget;
 use crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload;
