@@ -1629,6 +1629,7 @@ pub(crate) fn record_asr_device_phase(model: &str, phase: AsrPhase, started: Ins
 
 /// Whether device-thread ASR phases synchronize the device before they are
 /// recorded (`IZWI_ASR_PHASE_SYNC`, off by default: it costs throughput).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn asr_phase_sync_enabled() -> bool {
     static ENABLED: crate::env::ReadOnce<bool> =
         crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_ASR_PHASE_SYNC", false));
@@ -1638,12 +1639,11 @@ fn asr_phase_sync_enabled() -> bool {
 /// Waits for the calling thread's current CUDA context when phase sync is on.
 /// A no-op on other backends and off a device thread.
 pub(crate) fn asr_phase_sync() {
-    if !asr_phase_sync_enabled() {
-        return;
-    }
     #[cfg(feature = "cuda")]
-    if let Err(error) = cudarc::driver::result::ctx::synchronize() {
-        tracing::debug!("ASR phase sync skipped: {error}");
+    if asr_phase_sync_enabled() {
+        if let Err(error) = cudarc::driver::result::ctx::synchronize() {
+            tracing::debug!("ASR phase sync skipped: {error}");
+        }
     }
 }
 
