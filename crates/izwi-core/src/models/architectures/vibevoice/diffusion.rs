@@ -478,26 +478,102 @@ impl VibeVoiceDiffusionScheduler {
         step: &VibeVoiceDiffusionStepTensors,
         state: &mut DpmSolverState,
     ) -> Result<Tensor> {
-        let dtype = sample.dtype();
-        let x = sample.to_dtype(DType::F32)?;
-        let v = model_output.to_dtype(DType::F32)?;
-        let data = x
-            .broadcast_mul(&step.data_sample)?
-            .broadcast_add(&v.broadcast_mul(&step.data_model)?)?;
-        let mut next = x
-            .broadcast_mul(&step.sample)?
-            .broadcast_add(&data.broadcast_mul(&step.current)?)?;
-        if let Some(previous) = &step.previous {
-            let previous_data = state.previous_data.as_ref().ok_or_else(|| {
-                Error::InferenceError(
-                    "VibeVoice DPM-Solver second-order step has no previous prediction".into(),
-                )
-            })?;
-            next = next.broadcast_add(&previous_data.broadcast_mul(previous)?)?;
-        }
-        state.previous_data = Some(data);
-        next.to_dtype(dtype).map_err(Error::from)
+        solver_step(
+            model_output,
+            sample,
+            [
+                &step.data_sample,
+                &step.data_model,
+                &step.sample,
+                &step.current,
+            ],
+            step.previous.as_ref(),
+            state,
+        )
     }
+
+    /// Every step's solver scalars as one `[steps, 5]` F32 table (data
+    /// sample, data model, sample, current, previous; previous is zero at a
+    /// first-order step): a graphed trajectory reads them as its input.
+    pub fn coefficient_table(&self, device: &Device) -> Result<Tensor> {
+        let values = self
+            .coefficients
+            .iter()
+            .flat_map(|step| {
+                [
+                    step.data_sample,
+                    step.data_model,
+                    step.sample,
+                    step.current,
+                    step.previous,
+                ]
+                .map(|value| value as f32)
+            })
+            .collect::<Vec<_>>();
+        Tensor::from_vec(values, (self.coefficients.len(), 5), device).map_err(Error::from)
+    }
+
+    /// [`Self::step`] for step `index`, its scalars read from `table`
+    /// ([`Self::coefficient_table`]) as `[1, 1]` views: the same F32 values
+    /// and operations, so the same sample bit for bit.
+    pub fn step_from_table(
+        &self,
+        model_output: &Tensor,
+        sample: &Tensor,
+        table: &Tensor,
+        index: usize,
+        state: &mut DpmSolverState,
+    ) -> Result<Tensor> {
+        let coefficients = self.coefficients.get(index).ok_or_else(|| {
+            Error::InferenceError(format!(
+                "VibeVoice DPM-Solver has no step {index} of {}",
+                self.coefficients.len()
+            ))
+        })?;
+        let row = table.narrow(0, index, 1)?;
+        let scalar = |column: usize| row.narrow(1, column, 1);
+        let previous = (coefficients.previous != 0.0)
+            .then(|| scalar(4))
+            .transpose()?;
+        solver_step(
+            model_output,
+            sample,
+            [&scalar(0)?, &scalar(1)?, &scalar(2)?, &scalar(3)?],
+            previous.as_ref(),
+            state,
+        )
+    }
+}
+
+/// One DPM-Solver++ update in F32 from the step's `[data_sample,
+/// data_model, sample, current]` scalars and, at a second-order step,
+/// `previous`; returns the next sample in the sample's dtype.
+fn solver_step(
+    model_output: &Tensor,
+    sample: &Tensor,
+    [data_sample, data_model, sample_scale, current]: [&Tensor; 4],
+    previous: Option<&Tensor>,
+    state: &mut DpmSolverState,
+) -> Result<Tensor> {
+    let dtype = sample.dtype();
+    let x = sample.to_dtype(DType::F32)?;
+    let v = model_output.to_dtype(DType::F32)?;
+    let data = x
+        .broadcast_mul(data_sample)?
+        .broadcast_add(&v.broadcast_mul(data_model)?)?;
+    let mut next = x
+        .broadcast_mul(sample_scale)?
+        .broadcast_add(&data.broadcast_mul(current)?)?;
+    if let Some(previous) = previous {
+        let previous_data = state.previous_data.as_ref().ok_or_else(|| {
+            Error::InferenceError(
+                "VibeVoice DPM-Solver second-order step has no previous prediction".into(),
+            )
+        })?;
+        next = next.broadcast_add(&previous_data.broadcast_mul(previous)?)?;
+    }
+    state.previous_data = Some(data);
+    next.to_dtype(dtype).map_err(Error::from)
 }
 
 /// The reference `step` per index: the first step and the final step (to
@@ -664,6 +740,48 @@ mod tests {
             }
             let error = max_abs_diff(&host_f32(&x).unwrap(), &golden);
             assert!(error < 1e-5, "{steps} steps: max abs error {error}");
+        }
+    }
+
+    /// A trajectory stepped from the coefficient table (a graph's input) is
+    /// the per-step scalars' trajectory bit for bit, through the first-,
+    /// second-order and final steps.
+    #[test]
+    fn table_steps_match_the_per_step_scalars_bit_for_bit() {
+        use crate::kernels::numeric_check::xorshift_values;
+
+        let device = Device::Cpu;
+        let bits = |tensor: &Tensor| {
+            tensor
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        for steps in [1, 3, 10] {
+            let scheduler = VibeVoiceDiffusionScheduler::new(1000, steps);
+            let tensors = scheduler.step_tensors(&device, DType::F32).unwrap();
+            let table = scheduler.coefficient_table(&device).unwrap();
+            assert_eq!(table.dims(), [steps, 5]);
+            let start = Tensor::from_vec(xorshift_values(12, 7, 1.0), (3, 4), &device).unwrap();
+            let (mut scalars, mut tabled) = (start.clone(), start);
+            let (mut scalar_state, mut table_state) =
+                (DpmSolverState::default(), DpmSolverState::default());
+            for (index, step) in tensors.iter().enumerate() {
+                let v =
+                    Tensor::from_vec(xorshift_values(12, 50 + index as u64, 1.0), (3, 4), &device)
+                        .unwrap();
+                scalars = scheduler
+                    .step(&v, &scalars, step, &mut scalar_state)
+                    .unwrap();
+                tabled = scheduler
+                    .step_from_table(&v, &tabled, &table, index, &mut table_state)
+                    .unwrap();
+                assert_eq!(bits(&tabled), bits(&scalars), "{steps} steps, step {index}");
+            }
         }
     }
 

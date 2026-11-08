@@ -57,7 +57,9 @@ use crate::models::architectures::qwen3::tts::{
     qwen3_tts_load_layout, qwen3_tts_predictor_graph_device_bytes,
     qwen3_tts_text_embedding_reads_in_place, Qwen3TtsLoadLayout,
 };
-use crate::models::architectures::vibevoice::tts::vibevoice_tts_weight_dtype;
+use crate::models::architectures::vibevoice::tts::{
+    vibevoice_tts_diffusion_graph_device_bytes, vibevoice_tts_weight_dtype,
+};
 use crate::models::architectures::voxtral::tts::acoustic::voxtral_tts_flow_graph_device_bytes;
 use crate::models::architectures::voxtral::tts::model::{VoxtralTtsDTypePlan, VoxtralTtsModel};
 use crate::models::shared::codecs::mimi::MIMI_WEIGHTS_FILE;
@@ -647,7 +649,10 @@ fn vibevoice_tts_plan(
         vibevoice_tts_weight_dtype(device)?,
         qwen3_dense_projection_fusion_enabled(&device.device),
     );
-    price_vibevoice(&files, backend, &load).map(Some)
+    // The diffusion head's CUDA graphs allocate at the load's self-check.
+    let graphs = vibevoice_tts_diffusion_graph_device_bytes(backend);
+    price_vibevoice(&files, backend, &load)
+        .map(|plan| Some(plan.with_deferred_device_bytes(graphs)))
 }
 
 fn voxtral_tts_plan(

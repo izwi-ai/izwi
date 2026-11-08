@@ -2700,6 +2700,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Decodes a VibeVoice TTS frame's positive and negative LM rows of every request in one launch per cache arena and scores their control tokens with one readback; false runs two single-row forwards and a control-token readback per request.",
     ),
     CoreEnvVar::new(
+        "IZWI_VIBEVOICE_TTS_DIFFUSION_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, VibeVoice TTS runs each frame's diffusion (every DPM-Solver++ step's guided prediction and update) as one CUDA graph per step count, guidance and dtype, its requests' rows padded to 32 with zero conditions and noise; the pre-drawn noise, conditions, step embeddings, solver scalars and CFG scale are graph inputs. A load-time self-check captures the request-default graph over xorshift inputs and compares replays with the eager trajectory bit for bit; a mismatch or CUDA error keeps every frame eager. Loads price 64 MiB for the graphs. Any false value turns them off; `diffusion_graphs` in the model diagnostics reports why they are off, captures, replays and graphed and eager frames.",
+    ),
+    CoreEnvVar::new(
         "IZWI_VIBEVOICE_TTS_DTYPE",
         Choice,
         "VibeVoice family/backend default",

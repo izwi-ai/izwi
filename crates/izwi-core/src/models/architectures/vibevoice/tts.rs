@@ -12,10 +12,11 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::backends::state::{PhysicalStateTransactionId, TensorStateArena};
-use crate::backends::{DeviceKind, DeviceProfile};
+use crate::backends::{BackendKind, DeviceKind, DeviceProfile};
 use crate::catalog::{ModelFamily, ModelVariant};
 use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
+use crate::kernels::cuda::shape_graphs::{ShapeGraphLimits, ShapeGraphs};
 use crate::kv::v2::{
     InvocationStateBackingKindV2, InvocationWorkspaceLeaseSetV2, StateClock, StateGroupId,
 };
@@ -75,6 +76,67 @@ const VIBEVOICE_CUDA_DDPM_STEPS_ENV: &str = "IZWI_VIBEVOICE_CUDA_DDPM_STEPS";
 const VIBEVOICE_TTS_BATCHED_DECODE_ENV: &str = "IZWI_VIBEVOICE_TTS_BATCHED_DECODE";
 static NEXT_VIBEVOICE_TTS_STATE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_VIBEVOICE_TTS_MODEL_LOAD_NONCE: AtomicU64 = AtomicU64::new(1);
+
+/// Kill switch for the diffusion head's CUDA graphs (a boolean; on when
+/// unset). Read once: load pricing and the model read it.
+pub(crate) const VIBEVOICE_TTS_DIFFUSION_GRAPHS_ENV: &str = "IZWI_VIBEVOICE_TTS_DIFFUSION_GRAPHS";
+
+fn diffusion_graphs_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(VIBEVOICE_TTS_DIFFUSION_GRAPHS_ENV, true));
+    ON.get()
+}
+
+/// The rows every graphed frame runs: its requests' rows, then zero
+/// conditions and noise, so one graph per step count serves every width.
+const DIFFUSION_GRAPH_ROWS: usize = 32;
+
+const MIB: u64 = 1024 * 1024;
+
+/// What the diffusion graphs may hold: one graph per step count, guidance
+/// and dtype in use. A 32-row frame's working set is a few MiB (the CFG's 64
+/// rows through the head's FFN, `[64, 3 x hidden]`); a graph retains its
+/// inputs (two `[32, hidden]` conditions, the noise, the step embeddings
+/// and scalars) and its latents, under 1 MiB.
+const DIFFUSION_GRAPH_LIMITS: ShapeGraphLimits = ShapeGraphLimits {
+    max_graphs: 4,
+    retained_bytes: 8 * MIB,
+    pool_bytes: 56 * MIB,
+};
+
+/// Device bytes a load on `backend` prices for the diffusion graphs, which
+/// the load's self-check allocates: zero off CUDA or with the graphs off.
+pub(crate) fn vibevoice_tts_diffusion_graph_device_bytes(backend: BackendKind) -> u64 {
+    if backend == BackendKind::Cuda && diffusion_graphs_requested() {
+        DIFFUSION_GRAPH_LIMITS.device_bytes()
+    } else {
+        0
+    }
+}
+
+/// A diffusion graph's key: its DPM-Solver++ steps, whether it guides (CFG
+/// on), and its dtype. The CFG scale is an input.
+type DiffusionGraphKey = (usize, bool, DType);
+
+/// The diffusion graphs ([`VibeVoiceTtsModel::resolve_diffusion_graphs`]),
+/// or why there are none, and how many frames ran through them.
+struct DiffusionGraphs {
+    graphs: std::result::Result<ShapeGraphs<DiffusionGraphKey>, String>,
+    graphed_frames: AtomicU64,
+    /// Frames the graphs could not take: more rows than
+    /// [`DIFFUSION_GRAPH_ROWS`].
+    eager_frames: AtomicU64,
+}
+
+impl DiffusionGraphs {
+    fn off(reason: &str) -> Self {
+        Self {
+            graphs: Err(reason.into()),
+            graphed_frames: AtomicU64::new(0),
+            eager_frames: AtomicU64::new(0),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct VibeVoiceSpeakerReference {
@@ -170,6 +232,9 @@ pub struct VibeVoiceTtsDiagnostics {
     pub cuda_flash_attention_compiled: bool,
     pub cuda_flash_attention_head_dim_supported: bool,
     pub cuda_flash_attention_active: bool,
+    /// The diffusion head's CUDA frame graphs: why they are off, or their
+    /// captures, replays and graphed and eager frames.
+    pub diffusion_graphs: serde_json::Value,
 }
 
 #[derive(Clone)]
@@ -327,6 +392,7 @@ pub struct VibeVoiceTtsModel {
     language_model: Qwen3Model,
     prediction_head: VibeVoiceDiffusionHead,
     model_identity: [u8; 32],
+    diffusion_graphs: DiffusionGraphs,
 }
 
 /// The dtype [`VibeVoiceTtsModel::load`] reads every weight at on `device`
@@ -425,7 +491,7 @@ impl VibeVoiceTtsModel {
             projection_diagnostics.dense_bias_projection_count,
             projection_diagnostics.quantized_projection_count
         );
-        Ok(Self {
+        let mut model = Self {
             model_dir: model_dir.to_path_buf(),
             device,
             dtype,
@@ -440,7 +506,237 @@ impl VibeVoiceTtsModel {
             language_model,
             prediction_head,
             model_identity,
-        })
+            diffusion_graphs: DiffusionGraphs::off("not resolved"),
+        };
+        model.resolve_diffusion_graphs();
+        Ok(model)
+    }
+
+    /// Turns the diffusion graphs on (CUDA only, unless
+    /// [`VIBEVOICE_TTS_DIFFUSION_GRAPHS_ENV`] is off) once a self-check
+    /// passes: two padded frames of xorshift inputs at a request's default
+    /// steps and guidance, each captured or replayed and compared with the
+    /// eager trajectory bit for bit ([`ShapeGraphs::run`]). A mismatch or a
+    /// CUDA error leaves every frame eager, with the reason in the
+    /// diagnostics.
+    fn resolve_diffusion_graphs(&mut self) {
+        let resolved = if diffusion_graphs_requested() {
+            ShapeGraphs::resolve(
+                "VibeVoice TTS diffusion head",
+                &self.device.device,
+                DIFFUSION_GRAPH_LIMITS,
+            )
+        } else {
+            Err(format!("{VIBEVOICE_TTS_DIFFUSION_GRAPHS_ENV} is off"))
+        };
+        let resolved =
+            resolved.and_then(|graphs| match self.self_check_diffusion_graphs(&graphs) {
+                Ok(()) if graphs.is_on() => Ok(graphs),
+                Ok(()) => Err(format!(
+                    "self-check failed: {}",
+                    graphs.diagnostics()["off"]
+                )),
+                Err(error) => Err(format!("self-check failed: {error}")),
+            });
+        match &resolved {
+            Ok(_) => info!(
+                rows = DIFFUSION_GRAPH_ROWS,
+                "VibeVoice TTS diffusion frames run as CUDA graphs"
+            ),
+            Err(reason) if self.device.device.is_cuda() => warn!(
+                %reason,
+                "VibeVoice TTS diffusion frames run eagerly"
+            ),
+            Err(_) => {}
+        }
+        self.diffusion_graphs.graphs = resolved;
+    }
+
+    /// Two frames through `graphs` (see [`Self::resolve_diffusion_graphs`]):
+    /// the first captures the graph and checks a replay against the eager
+    /// trajectory, the second checks a replay over new inputs, so a value
+    /// baked into the graph shows.
+    fn self_check_diffusion_graphs(&self, graphs: &ShapeGraphs<DiffusionGraphKey>) -> Result<()> {
+        use crate::kernels::numeric_check::xorshift_tensor;
+        let plan = vibevoice_diffusion_plan(
+            &self.prediction_head,
+            VibeVoiceDiffusionScheduler::new(
+                self.prediction_head.config().ddpm_num_steps,
+                vibevoice_effective_diffusion_steps(
+                    self.device.kind,
+                    VIBEVOICE_TTS_DEFAULT_DIFFUSION_STEPS,
+                ),
+            ),
+            &self.device.device,
+            self.dtype,
+            VIBEVOICE_TTS_DEFAULT_CFG_SCALE,
+            self.device.kind,
+        )?;
+        let hidden = self.config.decoder_config.hidden_size;
+        let latent = self.config.acoustic_vae_dim();
+        for seed in [0xD1FF_0001u64, 0xD1FF_0002] {
+            let input = |seed: u64, width: usize| -> Result<Tensor> {
+                Ok(xorshift_tensor(
+                    &[DIFFUSION_GRAPH_ROWS, width],
+                    seed,
+                    1.0,
+                    &self.device.device,
+                )?
+                .to_dtype(self.dtype)?)
+            };
+            self.run_diffusion_graph(
+                graphs,
+                &plan,
+                &input(seed, hidden)?,
+                Some(&input(seed ^ 0x11, hidden)?),
+                &input(seed ^ 0x22, latent)?,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The diffusion graphs' state and counters, for the model diagnostics.
+    pub fn diffusion_graphs_diagnostics(&self) -> serde_json::Value {
+        let mut diagnostics = match &self.diffusion_graphs.graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        };
+        diagnostics["rows"] = DIFFUSION_GRAPH_ROWS.into();
+        diagnostics["graphed_frames"] = self
+            .diffusion_graphs
+            .graphed_frames
+            .load(Ordering::Relaxed)
+            .into();
+        diagnostics["eager_frames"] = self
+            .diffusion_graphs
+            .eager_frames
+            .load(Ordering::Relaxed)
+            .into();
+        diagnostics
+    }
+
+    /// Each row's speech latent (`[1, latent]`) through the diffusion graph
+    /// of `plan`'s steps, the rows padded to [`DIFFUSION_GRAPH_ROWS`] with
+    /// zero conditions and noise: `conditions`, `negatives` (under CFG) and
+    /// `noises` are each row's `[1, ..]` tensors. `None` runs the frame
+    /// eagerly: the graphs are off, or the frame has more rows.
+    fn graphed_latents(
+        &self,
+        conditions: &[&Tensor],
+        negatives: Option<&[&Tensor]>,
+        noises: &[&Tensor],
+        plan: &VibeVoiceDiffusionPlan,
+    ) -> Result<Option<Vec<Tensor>>> {
+        let Ok(graphs) = &self.diffusion_graphs.graphs else {
+            return Ok(None);
+        };
+        if !graphs.is_on() {
+            return Ok(None);
+        }
+        let rows = conditions.len();
+        if rows == 0
+            || rows > DIFFUSION_GRAPH_ROWS
+            || noises.len() != rows
+            || negatives.is_some_and(|negatives| negatives.len() != rows)
+            || negatives.is_some() != plan.cfg_tensor.is_some()
+        {
+            self.diffusion_graphs
+                .eager_frames
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+        let padded = |rows_of: &[&Tensor]| -> Result<Tensor> {
+            Ok(Tensor::cat(rows_of, 0)?
+                .to_dtype(self.dtype)?
+                .pad_with_zeros(0, 0, DIFFUSION_GRAPH_ROWS - rows)?)
+        };
+        let latents = self.run_diffusion_graph(
+            graphs,
+            plan,
+            &padded(conditions)?,
+            negatives.map(padded).transpose()?.as_ref(),
+            &padded(noises)?,
+        )?;
+        self.diffusion_graphs
+            .graphed_frames
+            .fetch_add(1, Ordering::Relaxed);
+        (0..rows)
+            .map(|row| Ok(latents.narrow(0, row, 1)?.contiguous()?))
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    }
+
+    /// [`diffuse_rows`] over padded `conditions`, `negatives` (under CFG)
+    /// and `noise` through the graph of its key. The step embeddings and
+    /// solver scalars are inputs too, so the graph reads nothing a frame's
+    /// plan owns.
+    fn run_diffusion_graph(
+        &self,
+        graphs: &ShapeGraphs<DiffusionGraphKey>,
+        plan: &VibeVoiceDiffusionPlan,
+        conditions: &Tensor,
+        negatives: Option<&Tensor>,
+        noise: &Tensor,
+    ) -> Result<Tensor> {
+        let timesteps = Tensor::cat(
+            &plan
+                .steps
+                .iter()
+                .map(|step| &step.timestep_embedding)
+                .collect::<Vec<_>>(),
+            0,
+        )?;
+        let coefficients = plan.scheduler.coefficient_table(&self.device.device)?;
+        let mut inputs = vec![
+            conditions.contiguous()?,
+            noise.contiguous()?,
+            timesteps,
+            coefficients,
+        ];
+        let guided = match (negatives, plan.cfg_tensor.as_ref()) {
+            (Some(negatives), Some(cfg)) => {
+                inputs.push(negatives.contiguous()?);
+                inputs.push(cfg.reshape(1)?);
+                true
+            }
+            (None, None) => false,
+            _ => {
+                return Err(Error::InferenceError(
+                    "VibeVoice diffusion graph needs negative conditions exactly under CFG".into(),
+                ))
+            }
+        };
+        let bytes = |tensor: &Tensor| (tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64;
+        // A graph keeps a stable copy of each input, and its latents.
+        let retained = inputs.iter().map(bytes).sum::<u64>() + bytes(noise);
+        let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+            let guidance = match inputs {
+                [_, _, _, _, negatives, cfg] => Some((negatives, cfg)),
+                [_, _, _, _] => None,
+                _ => {
+                    return Err(Error::InferenceError(format!(
+                        "VibeVoice diffusion graph received {} inputs",
+                        inputs.len()
+                    )))
+                }
+            };
+            Ok(vec![diffuse_rows(
+                &self.prediction_head,
+                &plan.scheduler,
+                &inputs[0],
+                guidance,
+                &inputs[1],
+                &inputs[2],
+                &inputs[3],
+            )?])
+        };
+        let key = (plan.steps.len(), guided, conditions.dtype());
+        graphs
+            .run(key, retained, &inputs, &body)?
+            .pop()
+            .ok_or_else(|| {
+                Error::InferenceError("VibeVoice diffusion graph returned nothing".into())
+            })
     }
 
     pub(crate) fn physical_state_spec(
@@ -526,6 +822,7 @@ impl VibeVoiceTtsModel {
             cuda_flash_attention_head_dim_supported,
             cuda_flash_attention_active: should_enable_flash_attention_v2(&self.device.device)
                 && cuda_flash_attention_head_dim_supported,
+            diffusion_graphs: self.diffusion_graphs_diagnostics(),
         }
     }
 
@@ -795,12 +1092,27 @@ impl VibeVoiceTtsModel {
             self.device.kind,
         )?;
         let frame = state.scaled_latents.len();
-        let latent = self.sample_speech_latent_from_noise(
-            state.last_hidden.as_ref().unwrap(),
-            state.negative_last_hidden.as_ref(),
+        // A lone row takes the batch's graph at the same padded rows.
+        let condition = state.last_hidden.as_ref().unwrap();
+        let negatives = plan
+            .cfg_tensor
+            .as_ref()
+            .and(state.negative_last_hidden.as_ref())
+            .map(|negative| [negative]);
+        let latent = match self.graphed_latents(
+            &[condition],
+            negatives.as_ref().map(|negative| negative.as_slice()),
+            &[&state.frame_noises[frame]],
             &plan,
-            &state.frame_noises[frame],
-        )?;
+        )? {
+            Some(mut latents) => latents.remove(0),
+            None => self.sample_speech_latent_from_noise(
+                condition,
+                state.negative_last_hidden.as_ref(),
+                &plan,
+                &state.frame_noises[frame],
+            )?,
+        };
         let latent_frame = latent.unsqueeze(1)?;
         let feedback = self.generated_speech_embed_retained(
             &latent_frame,
@@ -1601,51 +1913,41 @@ impl VibeVoiceTtsModel {
             .iter()
             .map(|state| state.last_hidden.as_ref().unwrap())
             .collect::<Vec<_>>();
-        let condition = self
-            .prediction_head
-            .condition_projection(&Tensor::cat(&conditions, 0)?)?;
-        let negative_condition = if plan.cfg_tensor.is_some() {
-            let negative = states
+        let negatives = plan.cfg_tensor.as_ref().map(|_| {
+            states
                 .iter()
                 .map(|state| state.negative_last_hidden.as_ref().unwrap())
-                .collect::<Vec<_>>();
-            Some(
-                self.prediction_head
-                    .condition_projection(&Tensor::cat(&negative, 0)?)?,
-            )
-        } else {
-            None
-        };
-        let noises = states
+                .collect::<Vec<_>>()
+        });
+        let frame_noises = states
             .iter()
             .map(|state| &state.frame_noises[state.scaled_latents.len()])
             .collect::<Vec<_>>();
-        let mut speech = Tensor::cat(&noises, 0)?;
-        let mut solver = DpmSolverState::default();
-        for step in &plan.steps {
-            let model_output = if let (Some(negative), Some(cfg)) =
-                (negative_condition.as_ref(), plan.cfg_tensor.as_ref())
-            {
-                let all_conditions = Tensor::cat(&[condition.clone(), negative.clone()], 0)?;
-                let all_latents = Tensor::cat(&[speech.clone(), speech.clone()], 0)?;
-                let timestep = step
-                    .timestep_embedding
-                    .broadcast_as((batch * 2, step.timestep_embedding.dim(1)?))?;
-                let outputs = self.prediction_head.forward_with_precomputed(
-                    &all_latents,
-                    &timestep,
-                    &all_conditions,
-                )?;
-                let positive = outputs.narrow(0, 0, batch)?;
-                let negative = outputs.narrow(0, batch, batch)?;
-                negative.broadcast_add(&positive.broadcast_sub(&negative)?.broadcast_mul(cfg)?)?
-            } else {
-                let timestep = step
-                    .timestep_embedding
-                    .broadcast_as((batch, step.timestep_embedding.dim(1)?))?;
+        if let Some(latents) =
+            self.graphed_latents(&conditions, negatives.as_deref(), &frame_noises, plan)?
+        {
+            return Ok(latents);
+        }
+        let condition = self
+            .prediction_head
+            .condition_projection(&Tensor::cat(&conditions, 0)?)?;
+        let negative_condition = negatives
+            .map(|negative| {
                 self.prediction_head
-                    .forward_with_precomputed(&speech, &timestep, &condition)?
-            };
+                    .condition_projection(&Tensor::cat(&negative, 0)?)
+            })
+            .transpose()?;
+        let mut speech = Tensor::cat(&frame_noises, 0)?;
+        let mut solver = DpmSolverState::default();
+        let guidance = negative_condition.as_ref().zip(plan.cfg_tensor.as_ref());
+        for step in &plan.steps {
+            let model_output = guided_prediction(
+                &self.prediction_head,
+                &speech,
+                &step.timestep_embedding,
+                &condition,
+                guidance,
+            )?;
             speech = plan
                 .scheduler
                 .step(&model_output, &speech, &step.tensors, &mut solver)?;
@@ -1909,6 +2211,70 @@ fn sample_latent_from_noise(
         speech = plan
             .scheduler
             .step(&model_output, &speech, &step.tensors, &mut solver)?;
+    }
+    Ok(speech)
+}
+
+/// One step's v-prediction for `speech`'s rows (`timestep` `[1, hidden]`,
+/// `condition` projected): under guidance (the projected negative
+/// conditions and the CFG scale), the positive and negative rows in one
+/// head call, blended.
+fn guided_prediction(
+    prediction_head: &VibeVoiceDiffusionHead,
+    speech: &Tensor,
+    timestep: &Tensor,
+    condition: &Tensor,
+    guidance: Option<(&Tensor, &Tensor)>,
+) -> Result<Tensor> {
+    let rows = speech.dim(0)?;
+    let width = timestep.dim(1)?;
+    let Some((negative, cfg)) = guidance else {
+        let timestep = timestep.broadcast_as((rows, width))?;
+        return prediction_head.forward_with_precomputed(speech, &timestep, condition);
+    };
+    let all_conditions = Tensor::cat(&[condition.clone(), negative.clone()], 0)?;
+    let all_latents = Tensor::cat(&[speech.clone(), speech.clone()], 0)?;
+    let timestep = timestep.broadcast_as((rows * 2, width))?;
+    let outputs =
+        prediction_head.forward_with_precomputed(&all_latents, &timestep, &all_conditions)?;
+    let positive = outputs.narrow(0, 0, rows)?;
+    let negative = outputs.narrow(0, rows, rows)?;
+    Ok(negative.broadcast_add(&positive.broadcast_sub(&negative)?.broadcast_mul(cfg)?)?)
+}
+
+/// The speech latents of `noise`'s rows (`[rows, latent]`) through every
+/// DPM-Solver++ step of `scheduler`, the conditions (`[rows, hidden]`) and,
+/// under guidance, the negative conditions projected first: the diffusion
+/// graphs' body. `timesteps` (`[steps, hidden]`) and `coefficients`
+/// ([`VibeVoiceDiffusionScheduler::coefficient_table`]) hold each step's
+/// embedding and solver scalars; every step runs the cross-request batch's
+/// operations.
+fn diffuse_rows(
+    prediction_head: &VibeVoiceDiffusionHead,
+    scheduler: &VibeVoiceDiffusionScheduler,
+    conditions: &Tensor,
+    guidance: Option<(&Tensor, &Tensor)>,
+    noise: &Tensor,
+    timesteps: &Tensor,
+    coefficients: &Tensor,
+) -> Result<Tensor> {
+    let condition = prediction_head.condition_projection(conditions)?;
+    let negative = guidance
+        .map(|(negative, _)| prediction_head.condition_projection(negative))
+        .transpose()?;
+    let guidance = negative.as_ref().zip(guidance.map(|(_, cfg)| cfg));
+    let mut speech = noise.clone();
+    let mut solver = DpmSolverState::default();
+    for index in 0..scheduler.timesteps().len() {
+        let model_output = guided_prediction(
+            prediction_head,
+            &speech,
+            &timesteps.narrow(0, index, 1)?,
+            &condition,
+            guidance,
+        )?;
+        speech =
+            scheduler.step_from_table(&model_output, &speech, coefficients, index, &mut solver)?;
     }
     Ok(speech)
 }
@@ -2870,6 +3236,106 @@ mod tests {
         assert!(cpu_no_cfg.cfg_tensor.is_none());
     }
 
+    /// The diffusion graphs' body: each row's latent at the padded 32 rows is
+    /// the same bit for bit alone and at any position of a batch, and
+    /// matches the eager per-request trajectory (`sample_latent_from_noise`,
+    /// its own rows) within F32 rounding, with and without guidance.
+    #[test]
+    fn padded_diffusion_rows_match_each_request_alone() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let device = Device::Cpu;
+        let head = tiny_diffusion_head(&device);
+        let conditions = xorshift_tensor(&[3, 4], 0xC0, 1.0, &device).unwrap();
+        let negatives = xorshift_tensor(&[3, 4], 0xC1, 1.0, &device).unwrap();
+        let noise = xorshift_tensor(&[3, 2], 0xC2, 1.0, &device).unwrap();
+        for cfg_scale in [1.5f32, 1.0] {
+            let plan = vibevoice_diffusion_plan(
+                &head,
+                VibeVoiceDiffusionScheduler::new(1000, 5),
+                &device,
+                DType::F32,
+                cfg_scale,
+                DeviceKind::Cuda,
+            )
+            .unwrap();
+            let timesteps = Tensor::cat(
+                &plan
+                    .steps
+                    .iter()
+                    .map(|step| &step.timestep_embedding)
+                    .collect::<Vec<_>>(),
+                0,
+            )
+            .unwrap();
+            let coefficients = plan.scheduler.coefficient_table(&device).unwrap();
+            let cfg = plan.cfg_tensor.as_ref().map(|cfg| cfg.reshape(1).unwrap());
+            let padded = |rows: &[u32]| {
+                let ids = Tensor::from_vec(rows.to_vec(), rows.len(), &device).unwrap();
+                let pad = |tensor: &Tensor| {
+                    tensor
+                        .index_select(&ids, 0)
+                        .unwrap()
+                        .pad_with_zeros(0, 0, DIFFUSION_GRAPH_ROWS - rows.len())
+                        .unwrap()
+                };
+                let negative = pad(&negatives);
+                let latents = diffuse_rows(
+                    &head,
+                    &plan.scheduler,
+                    &pad(&conditions),
+                    cfg.as_ref().map(|cfg| (&negative, cfg)),
+                    &pad(&noise),
+                    &timesteps,
+                    &coefficients,
+                )
+                .unwrap();
+                (0..rows.len())
+                    .map(|row| host_f32(&latents.narrow(0, row, 1).unwrap()).unwrap())
+                    .collect::<Vec<_>>()
+            };
+            let order = [2u32, 0, 1];
+            let batch = padded(&order);
+            for (position, &row) in order.iter().enumerate() {
+                let alone = padded(&[row]);
+                let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&alone[0]), bits(&batch[position]), "row {row}");
+                let row = row as usize;
+                let eager = sample_latent_from_noise(
+                    &head,
+                    &conditions.narrow(0, row, 1).unwrap(),
+                    Some(&negatives.narrow(0, row, 1).unwrap()),
+                    &plan,
+                    &noise.narrow(0, row, 1).unwrap(),
+                )
+                .unwrap();
+                let diff = max_abs_diff(&alone[0], &host_f32(&eager).unwrap());
+                assert!(diff <= 1e-5, "cfg {cfg_scale} row {row}: max |diff| {diff}");
+            }
+        }
+    }
+
+    /// Off CUDA the diffusion graphs price nothing; the kill switch turns
+    /// their pricing off on CUDA.
+    #[test]
+    fn diffusion_graphs_price_on_cuda_only_and_obey_the_kill_switch() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(VIBEVOICE_TTS_DIFFUSION_GRAPHS_ENV);
+        std::env::remove_var(VIBEVOICE_TTS_DIFFUSION_GRAPHS_ENV);
+        let cpu = vibevoice_tts_diffusion_graph_device_bytes(BackendKind::Cpu);
+        let metal = vibevoice_tts_diffusion_graph_device_bytes(BackendKind::Metal);
+        let cuda = vibevoice_tts_diffusion_graph_device_bytes(BackendKind::Cuda);
+        std::env::set_var(VIBEVOICE_TTS_DIFFUSION_GRAPHS_ENV, "off");
+        let killed = vibevoice_tts_diffusion_graph_device_bytes(BackendKind::Cuda);
+        match previous {
+            Some(value) => std::env::set_var(VIBEVOICE_TTS_DIFFUSION_GRAPHS_ENV, value),
+            None => std::env::remove_var(VIBEVOICE_TTS_DIFFUSION_GRAPHS_ENV),
+        }
+        assert_eq!((cpu, metal, cuda, killed), (0, 0, 64 * MIB, 0));
+    }
+
     #[test]
     fn cuda_diffusion_steps_override_is_cuda_only() {
         assert_eq!(
@@ -3316,5 +3782,73 @@ mod tests {
         let metal = sample(&metal_device, DeviceKind::Metal, DType::F16);
         let relative = relative_l2(&metal, &reference);
         assert!(relative < 1e-2, "Metal F16 latent relative L2 {relative}");
+    }
+
+    /// The diffusion graphs' body through the shape-keyed graph cache:
+    /// capture, verify and replay each return the eager trajectory bit for
+    /// bit over fresh inputs at the padded rows, with guidance.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_diffusion_graph_body_replays_the_eager_trajectory() {
+        use crate::kernels::numeric_check::{host_f32, xorshift_tensor};
+
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let head = tiny_diffusion_head(&device);
+        let plan = vibevoice_diffusion_plan(
+            &head,
+            VibeVoiceDiffusionScheduler::new(1000, 10),
+            &device,
+            DType::F32,
+            VIBEVOICE_TTS_DEFAULT_CFG_SCALE,
+            DeviceKind::Cuda,
+        )
+        .unwrap();
+        let graphs = ShapeGraphs::resolve("test", &device, DIFFUSION_GRAPH_LIMITS).unwrap();
+        let timesteps = Tensor::cat(
+            &plan
+                .steps
+                .iter()
+                .map(|step| &step.timestep_embedding)
+                .collect::<Vec<_>>(),
+            0,
+        )
+        .unwrap();
+        let coefficients = plan.scheduler.coefficient_table(&device).unwrap();
+        let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+            Ok(vec![diffuse_rows(
+                &head,
+                &plan.scheduler,
+                &inputs[0],
+                Some((&inputs[4], &inputs[5])),
+                &inputs[1],
+                &inputs[2],
+                &inputs[3],
+            )?])
+        };
+        for frame in 0..4u64 {
+            let input = |seed: u64, width: usize| {
+                xorshift_tensor(&[DIFFUSION_GRAPH_ROWS, width], seed, 1.0, &device).unwrap()
+            };
+            let inputs = [
+                input(10 * frame, 4),
+                input(10 * frame + 1, 2),
+                timesteps.clone(),
+                coefficients.clone(),
+                input(10 * frame + 2, 4),
+                plan.cfg_tensor.as_ref().unwrap().reshape(1).unwrap(),
+            ];
+            let expected = host_f32(&body(&inputs).unwrap()[0]).unwrap();
+            let graphed = graphs
+                .run((10, true, DType::F32), 1 << 16, &inputs, &body)
+                .unwrap();
+            let actual = host_f32(&graphed[0]).unwrap();
+            let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&actual), bits(&expected), "frame {frame}");
+        }
+        let diagnostics = graphs.diagnostics();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        assert_eq!(diagnostics["replays"], 2, "{diagnostics}");
     }
 }
