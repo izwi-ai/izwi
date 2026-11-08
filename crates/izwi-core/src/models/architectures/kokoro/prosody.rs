@@ -247,9 +247,7 @@ impl KokoroProsodyPredictor {
             )));
         }
 
-        let style = ref_style
-            .i((.., self.style_dim..(self.style_dim * 2)))
-            .map_err(Error::from)?; // predictor uses second half (128 dims)
+        let style = predictor_style(ref_style, self.style_dim)?;
 
         let d = self.duration_encoder.forward(d_en, &style)?; // [B, T, hidden+style]
         let x = self.duration_lstm.forward(&d)?; // [B, T, hidden]
@@ -1480,9 +1478,34 @@ pub(crate) fn fuse_weight_norm_dim0(weight_v: &Tensor, weight_g: &Tensor) -> Res
     weight_v.broadcast_mul(&scale).map_err(Error::from)
 }
 
+/// The predictor's half of a `[B, 2 * style_dim]` reference style: its
+/// second `style_dim` columns, made contiguous. With two or more rows the
+/// column slice is a strided view (row stride `2 * style_dim`), which CUDA's
+/// matmul refuses ("matmul is only supported for contiguous tensors"): every
+/// batched Kokoro prefill on CUDA failed that way from two rows up.
+fn predictor_style(ref_style: &Tensor, style_dim: usize) -> Result<Tensor> {
+    ref_style
+        .i((.., style_dim..(style_dim * 2)))
+        .and_then(|style| style.contiguous())
+        .map_err(Error::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batched_predictor_style_is_the_contiguous_second_half() {
+        let device = candle_core::Device::Cpu;
+        let values: Vec<f32> = (0..2 * 8).map(|value| value as f32).collect();
+        let ref_style = Tensor::from_vec(values, (2, 8), &device).unwrap();
+        let style = predictor_style(&ref_style, 4).unwrap();
+        assert!(style.is_contiguous(), "{:?}", style.layout());
+        assert_eq!(
+            style.to_vec2::<f32>().unwrap(),
+            vec![vec![4.0, 5.0, 6.0, 7.0], vec![12.0, 13.0, 14.0, 15.0]]
+        );
+    }
 
     /// The previous BiLstm1: two Candle `LSTM`s stepped one direction at a
     /// time, the backward one over an index-selected reversed copy.
