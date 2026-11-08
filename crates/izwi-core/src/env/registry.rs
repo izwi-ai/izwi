@@ -2399,6 +2399,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Toggles the custom RoPE kernel for Qwen3 attention.",
     ),
     CoreEnvVar::new(
+        "IZWI_QWEN3_TTS_CODEC_BF16",
+        Flag,
+        "false",
+        Load,
+        "On CUDA with BF16, Qwen3-TTS decodes its codec (the speech-tokenizer decoder: quantizer, pre-transformer, upsampler and vocoder) at BF16 instead of F32; the reference encoder stays at F32 and loads still price the F32 decoder. A load-time self-check decodes 40 frames of xorshift codes with the F32 decoder, then with the BF16 decoder, and keeps BF16 only when the waveform's relative L2 against F32 is at most 0.05; otherwise, or off CUDA, the decoder stays at F32. Off by default until H100 parity, ASR round-trip and listening evidence; `codec_precision` in the model diagnostics reports the dtype, the reason and the self-check's relative L2.",
+    ),
+    CoreEnvVar::new(
         "IZWI_QWEN3_TTS_PREDICTOR_GRAPHS",
         Flag,
         "true",

@@ -1495,7 +1495,7 @@ impl EncoderSplitResidualVectorQuantizer {
     }
 }
 
-struct SpeechTokenizerEncoder {
+pub(crate) struct SpeechTokenizerEncoder {
     encoder_net: SpeechTokenizerEncoderNet,
     encoder_transformer: EncoderTransformer,
     downsample: Option<MimiConv1d>,
@@ -1971,6 +1971,35 @@ impl SpeechTokenizerDecoder {
             vocoder_windows: AtomicU64::new(0),
             vocoder_peak_window_frames: AtomicUsize::new(0),
         })
+    }
+
+    /// `frames` frames of xorshift codes for every quantizer, each within
+    /// its codebook: unstructured input for a decoder self-check.
+    pub(crate) fn self_check_codes(&self, frames: usize) -> Vec<Vec<u32>> {
+        let size = self.config.codebook_size.max(1) as u64;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        (0..self.config.num_quantizers)
+            .map(|_| {
+                (0..frames)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        (state % size) as u32
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Moves the reference encoder (voice cloning's) out, so another
+    /// decoder of these weights can take it ([`Self::set_encoder`]).
+    pub(crate) fn take_encoder(&mut self) -> Option<SpeechTokenizerEncoder> {
+        self.encoder.take()
+    }
+
+    pub(crate) fn set_encoder(&mut self, encoder: Option<SpeechTokenizerEncoder>) {
+        self.encoder = encoder;
     }
 
     pub fn decode_stats(&self) -> SpeechTokenizerDecodeStats {
@@ -2940,6 +2969,127 @@ mod tests {
             decoder.decode(&short).unwrap(),
             decoder.decode_windowed(&short, usize::MAX).unwrap()
         );
+    }
+
+    /// The BF16 codec self-check (D4): the tiny decoder at BF16 decodes its
+    /// xorshift check codes within the tolerance of its F32 decode, while
+    /// the F32 waveform of other codes, or a cut one, fails it.
+    #[test]
+    fn bf16_codec_check_admits_bf16_rounding_and_rejects_other_audio() {
+        use super::super::{qwen3_tts_codec_bf16_check, QWEN3_TTS_CODEC_BF16_MAX_RELATIVE_L2};
+
+        let f32_decoder = tiny_decoder();
+        let bf16_decoder = SpeechTokenizerDecoder::from_config(
+            tiny_speech_tokenizer_config(),
+            VarBuilder::from_backend(Box::new(XorshiftWeights), DType::BF16, Device::Cpu),
+            Device::Cpu,
+        )
+        .unwrap();
+        let codes = f32_decoder.self_check_codes(40);
+        assert_eq!(codes.len(), 4);
+        assert!(codes
+            .iter()
+            .all(|group| group.len() == 40 && group.iter().all(|code| *code < 32)));
+        let reference = f32_decoder.decode(&codes).unwrap();
+        assert!(
+            reference.iter().filter(|v| v.abs() < 0.99).count() > reference.len() / 2,
+            "decoder output is saturated; the comparison would be vacuous"
+        );
+        let (relative, passed) =
+            qwen3_tts_codec_bf16_check(&bf16_decoder.decode(&codes).unwrap(), &reference);
+        assert!(
+            passed && relative > 0.0,
+            "BF16 relative L2 {relative}, tolerance {QWEN3_TTS_CODEC_BF16_MAX_RELATIVE_L2}"
+        );
+        // A decoder whose weights are wrong (every tensor's values drawn
+        // apart) decodes the same codes far outside the tolerance.
+        let wrong = SpeechTokenizerDecoder::from_config(
+            tiny_speech_tokenizer_config(),
+            VarBuilder::from_backend(Box::new(SaltedXorshiftWeights), DType::F32, Device::Cpu),
+            Device::Cpu,
+        )
+        .unwrap();
+        let (relative, passed) =
+            qwen3_tts_codec_bf16_check(&wrong.decode(&codes).unwrap(), &reference);
+        assert!(
+            !passed && relative > 0.3,
+            "a wrong decoder passed at {relative}"
+        );
+        assert!(!qwen3_tts_codec_bf16_check(&reference[1..], &reference).1);
+        assert!(!qwen3_tts_codec_bf16_check(&[], &[]).1);
+    }
+
+    /// [`XorshiftWeights`] with every tensor's seed salted: a decoder of
+    /// the same geometry whose weights are all wrong.
+    struct SaltedXorshiftWeights;
+
+    impl candle_nn::var_builder::SimpleBackend for SaltedXorshiftWeights {
+        fn get(
+            &self,
+            shape: candle_core::Shape,
+            name: &str,
+            init: candle_nn::Init,
+            dtype: DType,
+            device: &Device,
+        ) -> candle_core::Result<Tensor> {
+            XorshiftWeights.get(shape, &format!("salted.{name}"), init, dtype, device)
+        }
+
+        fn get_unchecked(&self, name: &str, _: DType, _: &Device) -> candle_core::Result<Tensor> {
+            candle_core::bail!("unexpected unchecked tensor request {name}")
+        }
+
+        fn contains_tensor(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    /// Without the switch, or off CUDA, a load keeps the F32 decoder it
+    /// read and says why; neither reads the checkpoint again.
+    #[test]
+    fn bf16_codec_decoder_stays_off_unless_asked_on_cuda() {
+        use super::super::{
+            qwen3_tts_codec_bf16_allowed, resolve_qwen3_tts_codec_precision,
+            tests::dtype_test_profile, QWEN3_TTS_CODEC_BF16_ENV,
+        };
+        use crate::backends::DeviceKind;
+
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(QWEN3_TTS_CODEC_BF16_ENV);
+        let missing = std::path::Path::new("/nonexistent/speech_tokenizer");
+        let cpu = dtype_test_profile(DeviceKind::Cpu, true, true);
+        std::env::remove_var(QWEN3_TTS_CODEC_BF16_ENV);
+        let (_, precision) =
+            resolve_qwen3_tts_codec_precision(tiny_decoder(), missing, &cpu, DType::F32).unwrap();
+        assert_eq!(precision.dtype, "F32");
+        assert!(!precision.bf16_requested);
+        assert!(precision.reason.contains(QWEN3_TTS_CODEC_BF16_ENV));
+        assert_eq!(precision.relative_l2, None);
+        std::env::set_var(QWEN3_TTS_CODEC_BF16_ENV, "1");
+        let (_, precision) =
+            resolve_qwen3_tts_codec_precision(tiny_decoder(), missing, &cpu, DType::F32).unwrap();
+        assert_eq!(precision.dtype, "F32");
+        assert!(precision.bf16_requested);
+        assert!(
+            precision.reason.contains("CUDA only"),
+            "{}",
+            precision.reason
+        );
+        match previous {
+            Some(value) => std::env::set_var(QWEN3_TTS_CODEC_BF16_ENV, value),
+            None => std::env::remove_var(QWEN3_TTS_CODEC_BF16_ENV),
+        }
+
+        let cuda = dtype_test_profile(DeviceKind::Cuda, true, true);
+        assert!(qwen3_tts_codec_bf16_allowed(true, &cuda, DType::F32).is_ok());
+        assert!(qwen3_tts_codec_bf16_allowed(false, &cuda, DType::F32).is_err());
+        assert!(qwen3_tts_codec_bf16_allowed(true, &cuda, DType::F16).is_err());
+        let no_bf16 = dtype_test_profile(DeviceKind::Cuda, false, true);
+        assert!(qwen3_tts_codec_bf16_allowed(true, &no_bf16, DType::F32).is_err());
+        let metal = dtype_test_profile(DeviceKind::Metal, true, true);
+        assert!(qwen3_tts_codec_bf16_allowed(true, &metal, DType::F32).is_err());
     }
 
     /// QTTS-5: decoding a stream in uneven steps (single frames, steps

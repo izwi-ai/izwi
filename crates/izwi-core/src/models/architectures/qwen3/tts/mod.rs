@@ -1145,6 +1145,8 @@ pub struct Qwen3TtsModel {
     /// Whether the talker and predictor projections loaded as weight-only
     /// F16, why, and the self-check that decided.
     weight_precision: WeightOnlyF16Load,
+    /// The codec decoder's precision and the BF16 self-check, if one ran.
+    codec_precision: Qwen3TtsCodecPrecision,
     /// Prepared voice-clone references, by reference audio.
     reference_cache: reference_cache::ReferenceCache,
 }
@@ -1494,6 +1496,148 @@ pub struct Qwen3TtsDiagnostics {
     /// The code predictor's CUDA frame graphs: why they are off, or their
     /// captures, replays and graphed and eager frames.
     pub predictor_graphs: serde_json::Value,
+    /// The codec decoder's compute precision, and the BF16 self-check.
+    pub codec_precision: Qwen3TtsCodecPrecision,
+}
+
+/// Opt-in BF16 codec (speech-tokenizer) decoder on CUDA: a boolean, off
+/// when unset, read at load. The decoder runs at F32 otherwise; BF16 needs
+/// H100 parity, ASR round-trip and listening evidence before it can be the
+/// default.
+pub(crate) const QWEN3_TTS_CODEC_BF16_ENV: &str = "IZWI_QWEN3_TTS_CODEC_BF16";
+
+/// The largest relative L2 the BF16 decoder's waveform may differ from the
+/// F32 decoder's on the load self-check's codes. BF16 rounding through the
+/// decoder's transformer and vocoder lands well inside it; a broken
+/// conversion lands near or above 1.
+pub(crate) const QWEN3_TTS_CODEC_BF16_MAX_RELATIVE_L2: f64 = 0.05;
+
+/// Codec frames the BF16 self-check decodes: two vocoder windows.
+const QWEN3_TTS_CODEC_CHECK_FRAMES: usize = 40;
+
+/// The codec decoder's precision as loaded, for the diagnostics.
+#[derive(Debug, Clone, Serialize)]
+pub struct Qwen3TtsCodecPrecision {
+    /// The decoder's compute dtype (the reference encoder stays at the
+    /// speech tokenizer's dtype).
+    pub dtype: String,
+    /// Whether [`QWEN3_TTS_CODEC_BF16_ENV`] asked for BF16.
+    pub bf16_requested: bool,
+    /// Why the decoder runs at `dtype`.
+    pub reason: String,
+    /// The self-check's relative L2 of the BF16 waveform against F32.
+    pub relative_l2: Option<f64>,
+    pub max_relative_l2: f64,
+    /// Frames of xorshift codes the self-check decodes.
+    pub check_frames: usize,
+}
+
+/// Whether a load may try the BF16 codec decoder, or why not: asked for,
+/// on CUDA with BF16, over an F32 decoder.
+fn qwen3_tts_codec_bf16_allowed(
+    requested: bool,
+    device: &DeviceProfile,
+    decoder_dtype: DType,
+) -> std::result::Result<(), String> {
+    if !requested {
+        return Err(format!("{QWEN3_TTS_CODEC_BF16_ENV} is off"));
+    }
+    if !device.kind.is_cuda() {
+        return Err("the BF16 codec decoder runs on CUDA only".into());
+    }
+    if !device.capabilities.supports_bf16 {
+        return Err("the device has no BF16".into());
+    }
+    if decoder_dtype != DType::F32 {
+        return Err(format!(
+            "the codec already decodes at {decoder_dtype:?} ({QWEN3_TTS_DTYPE_ENV})"
+        ));
+    }
+    Ok(())
+}
+
+/// The BF16 self-check over two decodes of the same codes: the relative L2
+/// of `candidate` (BF16) against `reference` (F32), and whether it passes
+/// (finite, the same length, within
+/// [`QWEN3_TTS_CODEC_BF16_MAX_RELATIVE_L2`]).
+fn qwen3_tts_codec_bf16_check(candidate: &[f32], reference: &[f32]) -> (f64, bool) {
+    let relative = crate::kernels::numeric_check::relative_l2(candidate, reference);
+    let passed = !reference.is_empty()
+        && candidate.len() == reference.len()
+        && relative.is_finite()
+        && relative <= QWEN3_TTS_CODEC_BF16_MAX_RELATIVE_L2;
+    (relative, passed)
+}
+
+/// The codec decoder a load runs: `decoder` (as loaded at `dtype`), or with
+/// [`QWEN3_TTS_CODEC_BF16_ENV`] on CUDA a BF16 decoder read from `path`
+/// once its waveform on xorshift codes is within tolerance of `decoder`'s.
+/// The F32 decoder's reference waveform is read back and the decoder
+/// dropped before the BF16 one loads, so the load never holds more than
+/// the F32 decoder it prices; a failed check reads the F32 decoder back.
+/// The reference encoder moves to whichever decoder runs.
+fn resolve_qwen3_tts_codec_precision(
+    decoder: SpeechTokenizerDecoder,
+    path: &Path,
+    device: &DeviceProfile,
+    dtype: DType,
+) -> Result<(SpeechTokenizerDecoder, Qwen3TtsCodecPrecision)> {
+    let requested = crate::env::flag_or(QWEN3_TTS_CODEC_BF16_ENV, false);
+    let mut precision = Qwen3TtsCodecPrecision {
+        dtype: format!("{dtype:?}"),
+        bf16_requested: requested,
+        reason: String::new(),
+        relative_l2: None,
+        max_relative_l2: QWEN3_TTS_CODEC_BF16_MAX_RELATIVE_L2,
+        check_frames: QWEN3_TTS_CODEC_CHECK_FRAMES,
+    };
+    if let Err(reason) = qwen3_tts_codec_bf16_allowed(requested, device, dtype) {
+        precision.reason = reason;
+        return Ok((decoder, precision));
+    }
+    let codes = decoder.self_check_codes(QWEN3_TTS_CODEC_CHECK_FRAMES);
+    let reference = decoder.decode(&codes)?;
+    let mut decoder = decoder;
+    let encoder = decoder.take_encoder();
+    drop(decoder);
+    let checked = SpeechTokenizerDecoder::load(path, device.device.clone(), DType::BF16, false)
+        .and_then(|bf16| {
+            let samples = bf16.decode(&codes)?;
+            Ok((bf16, qwen3_tts_codec_bf16_check(&samples, &reference)))
+        });
+    match checked {
+        Ok((mut bf16, (relative, true))) => {
+            bf16.set_encoder(encoder);
+            info!(
+                relative_l2 = relative,
+                tolerance = QWEN3_TTS_CODEC_BF16_MAX_RELATIVE_L2,
+                "Qwen3-TTS codec decoder runs at BF16 ({QWEN3_TTS_CODEC_BF16_ENV})"
+            );
+            precision.dtype = format!("{:?}", DType::BF16);
+            precision.reason = "BF16 self-check passed".into();
+            precision.relative_l2 = Some(relative);
+            Ok((bf16, precision))
+        }
+        failed => {
+            precision.reason = match failed {
+                Ok((_, (relative, _))) => {
+                    precision.relative_l2 = Some(relative);
+                    format!(
+                        "BF16 self-check failed: relative L2 {relative} against F32, tolerance {QWEN3_TTS_CODEC_BF16_MAX_RELATIVE_L2}"
+                    )
+                }
+                Err(error) => format!("BF16 self-check failed: {error}"),
+            };
+            tracing::warn!(
+                reason = %precision.reason,
+                "Qwen3-TTS codec decoder stays at F32"
+            );
+            let mut decoder =
+                SpeechTokenizerDecoder::load(path, device.device.clone(), dtype, false)?;
+            decoder.set_encoder(encoder);
+            Ok((decoder, precision))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2137,6 +2281,12 @@ impl Qwen3TtsModel {
             dtype_plan.speech_tokenizer,
             layout.tokenizer_encoder,
         )?;
+        let (speech_tokenizer, codec_precision) = resolve_qwen3_tts_codec_precision(
+            speech_tokenizer,
+            &speech_tokenizer_path,
+            &device,
+            dtype_plan.speech_tokenizer,
+        )?;
 
         info!(
             "Qwen3-TTS model loaded successfully on {:?} (talker {:?}, predictor {:?}, speech tokenizer {:?}, talker state {:?}, predictor state {:?})",
@@ -2168,6 +2318,7 @@ impl Qwen3TtsModel {
             speaker_encoder,
             config,
             weight_precision,
+            codec_precision,
             kv_page_size: kv_page_size.max(1),
             reference_cache: reference_cache::ReferenceCache::default(),
         })
@@ -2498,6 +2649,7 @@ impl Qwen3TtsModel {
             host_readbacks_total: qwen3_tts_host_readbacks(),
             reference_cache: self.reference_cache.stats(),
             predictor_graphs: self.code_predictor.graphs_diagnostics(),
+            codec_precision: self.codec_precision.clone(),
         }
     }
 
@@ -5109,7 +5261,7 @@ pub(crate) mod tests {
         assert_eq!(buffered.emission_interval(500), usize::MAX);
     }
 
-    fn dtype_test_profile(
+    pub(crate) fn dtype_test_profile(
         kind: DeviceKind,
         supports_bf16: bool,
         supports_f16: bool,
