@@ -182,32 +182,53 @@ impl FrameSelection {
     /// The selection every row shares, or `None` when rows pick apart (or
     /// draw on the host).
     fn of(selections: &[CodeSelection<'_>]) -> Option<Self> {
-        if selections.is_empty() {
-            return None;
-        }
-        if selections.iter().all(CodeSelection::is_greedy) {
-            return Some(Self::Greedy);
-        }
-        let resident = |selection: &CodeSelection<'_>| match selection {
-            CodeSelection::Sample { params, .. }
-                if !params.is_greedy()
-                    && params.top_p >= 1.0
-                    && (1..=DEVICE_TOP_K_LIMIT).contains(&params.top_k) =>
-            {
-                Some((params.top_k, params.temperature.to_bits()))
-            }
-            _ => None,
-        };
-        let first = resident(&selections[0])?;
+        let first = Self::of_row(selections.first()?)?;
         selections
             .iter()
-            .all(|selection| resident(selection) == Some(first))
-            .then(|| Self::TopK {
-                top_k: first.0,
-                temperature: f32::from_bits(first.1),
-            })
+            .all(|selection| Self::of_row(selection).is_some_and(|row| row.same(first)))
+            .then_some(first)
+    }
+
+    /// How one row picks its codes on the device: greedy, or a top-k draw
+    /// at top-p 1 within the device sort bound; `None` for a host draw.
+    fn of_row(selection: &CodeSelection<'_>) -> Option<Self> {
+        if selection.is_greedy() {
+            return Some(Self::Greedy);
+        }
+        match selection {
+            CodeSelection::Sample { params, .. }
+                if params.top_p >= 1.0 && (1..=DEVICE_TOP_K_LIMIT).contains(&params.top_k) =>
+            {
+                Some(Self::TopK {
+                    top_k: params.top_k,
+                    temperature: params.temperature,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The same selection, temperatures compared bit for bit.
+    fn same(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Greedy, Self::Greedy) => true,
+            (
+                Self::TopK { top_k, temperature },
+                Self::TopK {
+                    top_k: other_k,
+                    temperature: other_temperature,
+                },
+            ) => top_k == other_k && temperature.to_bits() == other_temperature.to_bits(),
+            _ => false,
+        }
     }
 }
+
+/// The most ways a graphed frame's rows may pick their codes: one graph
+/// replay per way, and every way's graph kept
+/// ([`PREDICTOR_GRAPH_LIMITS`]`.max_graphs`, with greedy and the default
+/// draw among them).
+const MAX_FRAME_GROUPS: usize = PREDICTOR_GRAPH_LIMITS.max_graphs;
 
 /// A frame graph's key: its selection and its inputs' dtype.
 type PredictorGraphKey = (FrameSelection, DType);
@@ -217,8 +238,13 @@ type PredictorGraphKey = (FrameSelection, DType);
 struct PredictorGraphs {
     graphs: std::result::Result<ShapeGraphs<PredictorGraphKey>, String>,
     graphed_frames: AtomicU64,
-    /// Frames the graphs could not take: rows that pick apart, or more rows
-    /// than [`PREDICTOR_GRAPH_ROWS`].
+    /// Graphed frames whose rows picked their codes more than one way, and
+    /// their graph replays (one per way).
+    mixed_frames: AtomicU64,
+    mixed_replays: AtomicU64,
+    /// Frames the graphs could not take: a row that draws on the host, rows
+    /// that pick more than [`MAX_FRAME_GROUPS`] ways, or more rows than
+    /// [`PREDICTOR_GRAPH_ROWS`].
     eager_frames: AtomicU64,
     /// The heads' column ids `0..vocab` (U32), every frame's last input:
     /// the top-k reads them from the graph's own copy, never from a cache
@@ -231,6 +257,8 @@ impl PredictorGraphs {
         Self {
             graphs: Err(reason.into()),
             graphed_frames: AtomicU64::new(0),
+            mixed_frames: AtomicU64::new(0),
+            mixed_replays: AtomicU64::new(0),
             eager_frames: AtomicU64::new(0),
             column_ids: std::sync::OnceLock::new(),
         }
@@ -246,25 +274,27 @@ impl PredictorGraphs {
     }
 }
 
-/// Every sampling row's Gumbel noise for all `groups` codebooks of a frame,
-/// `[groups, PREDICTOR_GRAPH_ROWS, keep]`: drawn from each row's own source
-/// codebook after codebook, `keep` draws each, as the eager frame draws it
-/// ([`resident_top_k_sample`]); spare rows get zeros.
+/// The Gumbel noise for all `groups` codebooks of a frame of the sampling
+/// rows `members` of `selections`, `[groups, PREDICTOR_GRAPH_ROWS, keep]`
+/// (row `slot` of the frame is `members[slot]`): drawn from each row's own
+/// source codebook after codebook, `keep` draws each, as the eager frame
+/// draws it ([`resident_top_k_sample`]); spare rows get zeros.
 fn frame_noise(
     selections: &mut [CodeSelection<'_>],
+    members: &[usize],
     groups: usize,
     keep: usize,
     device: &Device,
 ) -> Result<Tensor> {
     let mut noise = vec![0f32; groups * PREDICTOR_GRAPH_ROWS * keep];
-    for (row, selection) in selections.iter_mut().enumerate() {
-        let CodeSelection::Sample { draw, .. } = selection else {
+    for (slot, &member) in members.iter().enumerate() {
+        let Some(CodeSelection::Sample { draw, .. }) = selections.get_mut(member) else {
             return Err(Error::InferenceError(
                 "a sampled Qwen3-TTS predictor frame has a greedy row".into(),
             ));
         };
         for group in 0..groups {
-            let start = (group * PREDICTOR_GRAPH_ROWS + row) * keep;
+            let start = (group * PREDICTOR_GRAPH_ROWS + slot) * keep;
             noise[start..start + keep].copy_from_slice(&gumbel_noise(keep, &mut **draw));
         }
     }
@@ -912,7 +942,8 @@ impl CodePredictor {
     /// Two frames per default selection through `graphs` (see
     /// [`Self::resolve_graphs`]): the first captures the graph and checks a
     /// replay against the eager frame, the second checks a replay over new
-    /// inputs, so a value baked into the graph shows.
+    /// inputs, so a value baked into the graph shows. Then a frame whose
+    /// rows sample apart ([`Self::self_check_mixed_frame`]).
     fn self_check_graphs(
         &self,
         graphs: &ShapeGraphs<PredictorGraphKey>,
@@ -964,6 +995,85 @@ impl CodePredictor {
                 )?;
             }
         }
+        self.self_check_mixed_frame(graphs, input_dtype, &mut uniform)
+    }
+
+    /// A frame of 6 rows that pick apart (greedy and the default draw,
+    /// interleaved) through `graphs` by group ([`Self::grouped_frame`],
+    /// both graphs captured by now) must pick the eager frame's codes and
+    /// leave every row's draw source where the eager frame leaves it.
+    fn self_check_mixed_frame(
+        &self,
+        graphs: &ShapeGraphs<PredictorGraphKey>,
+        input_dtype: DType,
+        uniform: &mut dyn FnMut() -> f32,
+    ) -> Result<()> {
+        const ROWS: usize = 6;
+        let width = self.cfg.input_hidden_size();
+        let mut hidden = || -> Result<Tensor> {
+            let values = (0..ROWS * width)
+                .map(|_| uniform() * 2.0 - 1.0)
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, (ROWS, 1, width), &self.device)?
+                .to_dtype(input_dtype)
+                .map_err(Error::from)
+        };
+        let talker_hidden = hidden()?;
+        let semantic = hidden()?;
+        let seeds = (0..ROWS as u64)
+            .map(|row| 0xD1B5_4A32_D192_ED03u64 ^ (row + 1))
+            .collect::<Vec<_>>();
+        let run = |graphed: bool| -> Result<(Vec<Vec<u32>>, Vec<u64>)> {
+            let mut states = seeds.clone();
+            let mut draws = states
+                .iter_mut()
+                .map(|state| {
+                    move || {
+                        *state ^= *state << 13;
+                        *state ^= *state >> 7;
+                        *state ^= *state << 17;
+                        (*state >> 40) as f32 / (1u64 << 24) as f32
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut selections = draws
+                .iter_mut()
+                .enumerate()
+                .map(|(row, draw)| {
+                    if row % 2 == 0 {
+                        CodeSelection::Greedy
+                    } else {
+                        CodeSelection::Sample {
+                            params: SubtalkerSampling::default(),
+                            draw,
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+            let codes = if graphed {
+                self.grouped_frame(
+                    &talker_hidden,
+                    &semantic,
+                    &mut selections,
+                    &mut |selection, inputs| self.run_frame_graph(graphs, selection, inputs),
+                )?
+                .ok_or_else(|| {
+                    Error::InferenceError("the mixed frame did not run as groups".into())
+                })?
+            } else {
+                self.eager_dense_frame(&talker_hidden, &semantic, &mut selections)?
+            };
+            drop(selections);
+            drop(draws);
+            Ok((codes.rows, states))
+        };
+        let graphed = run(true)?;
+        if graphed != run(false)? {
+            return Err(Error::InferenceError(
+                "a frame of rows that sample apart picked other codes through the graphs than eagerly"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -975,16 +1085,16 @@ impl CodePredictor {
         };
         diagnostics["rows"] = PREDICTOR_GRAPH_ROWS.into();
         diagnostics["graphed_frames"] = self.graphs.graphed_frames.load(Relaxed).into();
+        diagnostics["mixed_frames"] = self.graphs.mixed_frames.load(Relaxed).into();
+        diagnostics["mixed_replays"] = self.graphs.mixed_replays.load(Relaxed).into();
         diagnostics["eager_frames"] = self.graphs.eager_frames.load(Relaxed).into();
         diagnostics
     }
 
-    /// One frame through the graphs, when they are on and every row shares
-    /// a selection: rows padded to [`PREDICTOR_GRAPH_ROWS`] with zero rows,
-    /// every sampling row's noise for all codebooks drawn up front in the
-    /// eager frame's order, the codes read back once. The invocation caches
-    /// are not touched (a frame's KV is dense, inside the graph). `None`
-    /// runs the eager frame.
+    /// One frame through the graphs, when they are on and every row picks
+    /// its codes on the device ([`Self::grouped_frame`]): one graph replay
+    /// per way the rows pick them. The invocation caches are not touched (a
+    /// frame's KV is dense, inside the graph). `None` runs the eager frame.
     fn graphed_frame(
         &self,
         talker_hidden: &Tensor,
@@ -998,38 +1108,121 @@ impl CodePredictor {
             return Ok(None);
         }
         let rows = talker_hidden.dim(0)?;
-        let selection = FrameSelection::of(selections).filter(|_| {
-            rows == selections.len()
-                && rows <= PREDICTOR_GRAPH_ROWS
-                && !self.lm_heads.is_empty()
-                && semantic_embeds.dims() == talker_hidden.dims()
-        });
-        let Some(selection) = selection else {
-            self.graphs.eager_frames.fetch_add(1, Relaxed);
-            return Ok(None);
-        };
-        let groups = self.lm_heads.len();
-        let spare = PREDICTOR_GRAPH_ROWS - rows;
-        let noise = match selection {
-            FrameSelection::Greedy => Tensor::zeros(1, DType::F32, &self.device)?,
-            FrameSelection::TopK { top_k, .. } => frame_noise(
+        let fits = rows == selections.len()
+            && rows <= PREDICTOR_GRAPH_ROWS
+            && !self.lm_heads.is_empty()
+            && semantic_embeds.dims() == talker_hidden.dims();
+        let mut replays = 0u64;
+        let codes = if fits {
+            self.grouped_frame(
+                talker_hidden,
+                semantic_embeds,
                 selections,
-                groups,
-                top_k.min(self.cfg.vocab_size),
-                &self.device,
-            )?,
+                &mut |selection, inputs| {
+                    replays += 1;
+                    self.run_frame_graph(graphs, selection, inputs)
+                },
+            )?
+        } else {
+            None
         };
-        let inputs = [
-            talker_hidden.pad_with_zeros(0, 0, spare)?,
-            semantic_embeds.pad_with_zeros(0, 0, spare)?,
-            noise,
-            self.graphs.column_ids(self.cfg.vocab_size, &self.device)?,
-        ];
-        let codes = self.run_frame_graph(graphs, selection, &inputs)?;
-        let by_group = codes.narrow(1, 0, rows)?.contiguous()?;
+        match &codes {
+            Some(_) => {
+                self.graphs.graphed_frames.fetch_add(1, Relaxed);
+                if replays > 1 {
+                    self.graphs.mixed_frames.fetch_add(1, Relaxed);
+                    self.graphs.mixed_replays.fetch_add(replays, Relaxed);
+                }
+            }
+            None => {
+                self.graphs.eager_frames.fetch_add(1, Relaxed);
+            }
+        }
+        Ok(codes)
+    }
+
+    /// One frame of rows that all pick their codes on the device, grouped
+    /// by how they pick them (greedy, or each top-k and temperature, first
+    /// seen first). Each group's rows, padded with zero rows to
+    /// [`PREDICTOR_GRAPH_ROWS`], run `run` with the group's selection and
+    /// frame inputs (talker hidden, semantic embeddings, the group's noise
+    /// drawn as the eager frame draws it, column ids), which returns its
+    /// `[codebooks, PREDICTOR_GRAPH_ROWS]` codes; every row's codes come
+    /// back in row order, read back once. A row's codes are its group's
+    /// frame's, which a padded frame makes those of the row alone, so rows
+    /// that sample apart stay on the graphs. `None` when a row draws on the
+    /// host or the rows pick more than [`MAX_FRAME_GROUPS`] ways.
+    fn grouped_frame(
+        &self,
+        talker_hidden: &Tensor,
+        semantic_embeds: &Tensor,
+        selections: &mut [CodeSelection<'_>],
+        run: &mut dyn FnMut(FrameSelection, &[Tensor]) -> Result<Tensor>,
+    ) -> Result<Option<AcousticCodeRows>> {
+        let rows = talker_hidden.dim(0)?;
+        let mut groups: Vec<(FrameSelection, Vec<usize>)> = Vec::new();
+        for (row, selection) in selections.iter().enumerate() {
+            let Some(selection) = FrameSelection::of_row(selection) else {
+                return Ok(None);
+            };
+            match groups.iter_mut().find(|(group, _)| group.same(selection)) {
+                Some((_, members)) => members.push(row),
+                None => groups.push((selection, vec![row])),
+            }
+        }
+        if groups.is_empty() || groups.len() > MAX_FRAME_GROUPS {
+            return Ok(None);
+        }
+        let codebooks = self.lm_heads.len();
+        let column_ids = self.graphs.column_ids(self.cfg.vocab_size, &self.device)?;
+        let single = groups.len() == 1;
+        let mut parts = Vec::with_capacity(groups.len());
+        let mut grouped_order = Vec::with_capacity(rows);
+        for (selection, members) in &groups {
+            let (talker, semantic) = if single {
+                (talker_hidden.clone(), semantic_embeds.clone())
+            } else {
+                let ids = members.iter().map(|&row| row as u32).collect::<Vec<_>>();
+                let ids = Tensor::from_vec(ids, members.len(), &self.device)?;
+                (
+                    talker_hidden.index_select(&ids, 0)?,
+                    semantic_embeds.index_select(&ids, 0)?,
+                )
+            };
+            let spare = PREDICTOR_GRAPH_ROWS - members.len();
+            let noise = match *selection {
+                FrameSelection::Greedy => Tensor::zeros(1, DType::F32, &self.device)?,
+                FrameSelection::TopK { top_k, .. } => frame_noise(
+                    selections,
+                    members,
+                    codebooks,
+                    top_k.min(self.cfg.vocab_size),
+                    &self.device,
+                )?,
+            };
+            let inputs = [
+                talker.pad_with_zeros(0, 0, spare)?,
+                semantic.pad_with_zeros(0, 0, spare)?,
+                noise,
+                column_ids.clone(),
+            ];
+            parts.push(run(*selection, &inputs)?.narrow(1, 0, members.len())?);
+            grouped_order.extend_from_slice(members);
+        }
+        let by_group = if single {
+            parts.remove(0).contiguous()?
+        } else {
+            // Grouped columns back in row order.
+            let mut position = vec![0u32; rows];
+            for (column, &row) in grouped_order.iter().enumerate() {
+                position[row] = column as u32;
+            }
+            Tensor::cat(&parts, 1)?
+                .index_select(&Tensor::from_vec(position, rows, &self.device)?, 1)?
+                .contiguous()?
+        };
         super::record_qwen3_tts_host_readback();
         let host = by_group.to_vec2::<u32>()?;
-        self.graphs.graphed_frames.fetch_add(1, Relaxed);
         Ok(Some(AcousticCodeRows {
             rows: (0..rows)
                 .map(|row| host.iter().map(|group| group[row]).collect())
@@ -2945,6 +3138,124 @@ mod tests {
         }
     }
 
+    /// Rows that pick their codes apart (greedy, the sub-talker draw, two
+    /// other top-k and temperatures) run one padded frame per way through
+    /// the graphs (here the dense frame they capture, run directly): every
+    /// row's codes and draw source are those of the eager frame over the
+    /// same rows and of its own frame alone, wherever it sits. A host draw,
+    /// or more ways than the graphs keep, leaves the frame to the eager
+    /// path.
+    #[test]
+    fn grouped_frames_pick_each_rows_own_codes() {
+        let device = Device::Cpu;
+        let (model, _, _) = wide_predictor(1, 0, &device);
+        let sample = |top_k: usize, temperature: f32, top_p: f32| {
+            Some(SubtalkerSampling {
+                do_sample: true,
+                temperature,
+                top_k,
+                top_p,
+            })
+        };
+        let ways = [
+            None,
+            Some(SubtalkerSampling::default()),
+            sample(7, 0.7, 1.0),
+            sample(20, 1.1, 1.0),
+        ];
+        let requests = 8;
+        let inputs = (0..requests)
+            .map(|request| {
+                let mut state = 0x6E0F_u64 + request as u64;
+                (
+                    random_tensor(&mut state, &[1, 1, 64], &device),
+                    random_tensor(&mut state, &[1, 1, 64], &device),
+                )
+            })
+            .collect::<Vec<_>>();
+        // Each request's codes and draw-source state, or `None` when the
+        // grouped frame turns the frame down.
+        let run = |order: &[usize], settings: &[Option<SubtalkerSampling>], grouped: bool| {
+            let mut rngs = order
+                .iter()
+                .map(|&request| super::super::SimpleRng::seeded(request as u64 + 9))
+                .collect::<Vec<_>>();
+            let mut draws = rngs
+                .iter_mut()
+                .map(|rng| move || rng.next_f32())
+                .collect::<Vec<_>>();
+            let mut selections = order
+                .iter()
+                .zip(draws.iter_mut())
+                .map(
+                    |(&request, draw)| match settings[request % settings.len()] {
+                        Some(params) => CodeSelection::Sample { params, draw },
+                        None => CodeSelection::Greedy,
+                    },
+                )
+                .collect::<Vec<_>>();
+            let talker =
+                Tensor::cat(&order.iter().map(|&r| &inputs[r].0).collect::<Vec<_>>(), 0).unwrap();
+            let semantic =
+                Tensor::cat(&order.iter().map(|&r| &inputs[r].1).collect::<Vec<_>>(), 0).unwrap();
+            let codes = if grouped {
+                model
+                    .grouped_frame(
+                        &talker,
+                        &semantic,
+                        &mut selections,
+                        &mut |selection, inputs| {
+                            let [talker, semantic, noise, ids] = inputs else {
+                                panic!("four frame inputs");
+                            };
+                            model.dense_frame_codes(talker, semantic, selection, noise, ids)
+                        },
+                    )
+                    .unwrap()
+            } else {
+                Some(
+                    model
+                        .eager_dense_frame(&talker, &semantic, &mut selections)
+                        .unwrap(),
+                )
+            };
+            drop(selections);
+            drop(draws);
+            codes.map(|codes| {
+                let mut by_request = vec![(Vec::new(), 0u64); requests];
+                for ((&request, codes), rng) in order.iter().zip(codes.rows).zip(&rngs) {
+                    by_request[request] = (codes, rng.state);
+                }
+                by_request
+            })
+        };
+        let alone = (0..requests)
+            .map(|request| run(&[request], &ways, true).unwrap().swap_remove(request))
+            .collect::<Vec<_>>();
+        for order in [vec![1, 0, 2], vec![5, 2, 7, 0, 3, 6, 1, 4]] {
+            let grouped = run(&order, &ways, true).unwrap();
+            let eager = run(&order, &ways, false).unwrap();
+            for &request in &order {
+                assert_eq!(
+                    grouped[request], alone[request],
+                    "request {request} grouped"
+                );
+                assert_eq!(eager[request], alone[request], "request {request} eagerly");
+            }
+        }
+        let host = [None, sample(50, 0.9, 0.8)];
+        assert!(run(&[0, 1], &host, true).is_none());
+        let five = [
+            None,
+            Some(SubtalkerSampling::default()),
+            sample(7, 0.7, 1.0),
+            sample(20, 1.1, 1.0),
+            sample(3, 0.5, 1.0),
+        ];
+        assert!(run(&[0, 1, 2, 3, 4], &five, true).is_none());
+        assert!(run(&[0, 1, 2, 3], &five, true).is_some());
+    }
+
     /// The dense layers (the graphs' body) give the paged layers' hidden
     /// states, every position of the two-token prefill (so the causal mask)
     /// and the next codebook positions, within F32 rounding.
@@ -3053,7 +3364,7 @@ mod tests {
                         .collect::<Vec<_>>();
                     let selection = FrameSelection::of(&selections).unwrap();
                     let noise = if sampled {
-                        frame_noise(&mut selections, 4, 5, &device).unwrap()
+                        frame_noise(&mut selections, &[0, 1, 2], 4, 5, &device).unwrap()
                     } else {
                         Tensor::zeros(1, DType::F32, &device).unwrap()
                     };
