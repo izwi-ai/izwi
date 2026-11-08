@@ -497,20 +497,20 @@ pub(crate) fn chatterbox_decode_batch(
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     if !continuing.is_empty() {
-        let embeds = continuing
+        // Every continuing row's token at its speech position, gathered in
+        // one upload and one lookup per table.
+        let (tokens, positions): (Vec<u32>, Vec<usize>) = continuing
             .iter()
-            .map(|&index| {
-                let position = rows[index].state.tokens_generated();
-                model.speech_step_embed(sampled[index], position)
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .map(|&index| (sampled[index], rows[index].state.tokens_generated()))
+            .unzip();
+        let embeds = model.speech_step_embeds(&tokens, &positions)?;
         let mut forward = Vec::with_capacity(continuing.len() * 2);
         let mut cursor = 0usize;
         for (index, row) in rows.iter_mut().enumerate() {
             if continuing.get(cursor) != Some(&index) {
                 continue;
             }
-            let embed = embeds[cursor].clone();
+            let embed = embeds.narrow(0, cursor, 1)?;
             cursor += 1;
             forward.push(T3ForwardRow {
                 embeds: embed.clone(),

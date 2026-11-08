@@ -809,3 +809,34 @@ fn chatterbox_estimator_cost_by_rows_and_frames_on_metal() {
         }
     }
 }
+
+/// The batched next-token embeddings are each row's single-row embedding,
+/// bit for bit.
+#[test]
+#[ignore = "needs the Chatterbox checkpoint (IZWI_CHATTERBOX_MODEL_DIR)"]
+fn batched_speech_step_embeds_equal_each_row_alone() {
+    let device = candle_core::Device::Cpu;
+    let vb = weights::mmap_safetensors(
+        &model_dir().join(config::T3_WEIGHTS_FILE),
+        DType::F32,
+        &device,
+    )
+    .unwrap();
+    let t3 = t3::T3Model::load(T3Config::english(), vb).unwrap();
+    let tokens = [6_561u32, 0, 17, 4_095, 6_562];
+    let positions = [1usize, 0, 300, 41, 2];
+    let batched = t3
+        .speech_step_embeds(&tokens, &positions)
+        .unwrap()
+        .to_vec2::<f32>()
+        .unwrap();
+    for (row, (&token, &position)) in tokens.iter().zip(&positions).enumerate() {
+        let alone = t3
+            .speech_step_embed(token, position)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap()
+            .remove(0);
+        assert_eq!(batched[row], alone, "row {row}");
+    }
+}
