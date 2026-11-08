@@ -1258,6 +1258,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Kill switch: false draws Maya 2's depth-decoder Gumbel noise from each request's host stream and uploads it every frame (31 x 2,048 values a row), instead of generating it on the device from the request's seed and frame index (CUDA; seeded CUDA output differs between the two).",
     ),
     CoreEnvVar::new(
+        "IZWI_MAYA2_DEVICE_SAMPLING",
+        Flag,
+        "true",
+        Once,
+        "Kill switch: false reads each Maya 2 row's whole codebook-0 logits back every frame and samples on the host, instead of its top candidates under the temperature, end-of-audio bias and presence penalty computed on the device (CUDA).",
+    ),
+    CoreEnvVar::new(
         "IZWI_MAYA2_MODEL_DIR",
         Path,
         "unset (test skipped)",
