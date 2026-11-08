@@ -97,6 +97,10 @@ impl RuntimeAdapterRegistry {
                     .unwrap_or_else(|| self.asr_decode_width(family, backend_kind))
                     .max(1),
             ),
+            CapabilityKind::Tts => (
+                self.max_tensor_batch_size(),
+                self.tts_decode_width(family, backend_kind),
+            ),
             _ => (self.max_tensor_batch_size(), self.max_tensor_batch_size()),
         };
         let context = LoadedAdapterFactoryContext {
@@ -529,6 +533,21 @@ impl RuntimeAdapterRegistry {
             backend,
             self.max_tensor_batch_size(),
             self.max_asr_tensor_batch_size(),
+        )
+    }
+    /// The continuous decode width a TTS model of `family` loads with on
+    /// `backend`: the TTS engine width for the families certified wider
+    /// (`catalog::tts_decode_width`), the engine rows otherwise.
+    pub(crate) fn tts_decode_width(
+        &self,
+        family: crate::catalog::ModelFamily,
+        backend: BackendKind,
+    ) -> usize {
+        crate::catalog::tts_decode_width(
+            family,
+            backend,
+            self.max_tensor_batch_size(),
+            self.max_tts_tensor_batch_size(),
         )
     }
 }

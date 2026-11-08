@@ -290,6 +290,33 @@ impl EngineCore {
         )
     }
 
+    /// [`Self::load_managed_model_state`] staging `staged_rows` transactions
+    /// instead of the engine's: a TTS decode certified wider than the engine
+    /// rows (`catalog::tts_decode_width`) stages one launch at its own width.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_managed_model_state_with_staged_rows(
+        &mut self,
+        model_instance: super::super::ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        logical_context_tokens: Option<usize>,
+        staged_rows: usize,
+        minimum_tokens: u64,
+        reserve: StateFitReserve,
+        later_minimum_bytes: u64,
+    ) -> Result<Arc<super::super::ManagedKvModelRuntime>> {
+        let retained_rows = self.config.max_retained_sequences;
+        self.load_managed_model_state_with_portable_copies_and_rows(
+            model_instance,
+            retained_state,
+            logical_context_tokens,
+            1,
+            (retained_rows, staged_rows.clamp(1, retained_rows.max(1))),
+            minimum_tokens,
+            reserve,
+            later_minimum_bytes,
+        )
+    }
+
     /// What `retained_state` takes at `minimum_tokens` per sequence on the
     /// engine's own rows, priced as the live retained fit of
     /// [`Self::load_managed_model_state`] prices it, so pre-load admission

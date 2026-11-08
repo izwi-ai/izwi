@@ -540,8 +540,17 @@ fn precision_reload_gate(
 /// The widest continuous decode stage of a loaded model's ASR graphs: the
 /// rows one ASR decode step batches (1 without one).
 fn asr_decode_stage_width(bundle_draft: &LoadedModelBundleDraft) -> Result<usize> {
+    decode_stage_width(bundle_draft, CapabilityKind::Asr)
+}
+
+/// The widest continuous decode stage of a loaded model's `capability`
+/// graphs (1 without one).
+fn decode_stage_width(
+    bundle_draft: &LoadedModelBundleDraft,
+    capability: CapabilityKind,
+) -> Result<usize> {
     Ok(bundle_draft
-        .execution_contracts(CapabilityKind::Asr)?
+        .execution_contracts(capability)?
         .iter()
         .flat_map(|contract| contract.stages.iter())
         .filter(|stage| stage.batch_mode == crate::engine::NativeBatchMode::Continuous)

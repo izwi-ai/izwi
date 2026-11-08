@@ -153,6 +153,44 @@ pub(crate) const fn asr_decode_width(
     }
 }
 
+/// The continuous decode width a TTS model of `family` loads with: the TTS
+/// engine width (the CUDA ceiling when no width is fixed) for the families
+/// whose decode steps every row in one launch per op on CUDA, padded to one
+/// row-invariant shape so a request sounds the same at any width (Qwen3-TTS's
+/// talker and code predictor, Maya1's and Maya 2's backbones and Maya 2's
+/// depth groups, Chatterbox's T3); the non-chat rows for every other family
+/// and backend. Never below the non-chat rows.
+///
+/// H100 (`e8f189691`): every Qwen3-TTS variant stayed at ~5 audio-s/s from 8
+/// to 64 streams, the width of eight; Maya 2 at ~5.2 from 16 streams.
+pub(crate) const fn tts_decode_width(
+    family: ModelFamily,
+    backend: BackendKind,
+    non_chat_width: usize,
+    tts_engine_width: usize,
+) -> usize {
+    let certified = match (backend, family) {
+        (
+            BackendKind::Cuda,
+            ModelFamily::Qwen3Tts
+            | ModelFamily::Maya1Tts
+            | ModelFamily::Maya2Tts
+            | ModelFamily::ChatterboxTts,
+        ) => CUDA_MAX_WIDTH,
+        _ => non_chat_width,
+    };
+    let widened = if tts_engine_width < certified {
+        tts_engine_width
+    } else {
+        certified
+    };
+    if widened > non_chat_width {
+        widened
+    } else {
+        non_chat_width
+    }
+}
+
 /// Widths a load fits an ASR decode wider than the engine rows to, widest
 /// first.
 const ASR_FIT_WIDTHS: [usize; 3] = [CUDA_MAX_WIDTH, 16, CUDA_DEFAULT_WIDTH];

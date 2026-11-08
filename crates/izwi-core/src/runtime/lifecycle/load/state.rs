@@ -1230,10 +1230,11 @@ impl ModelLifecycleController {
         for (capability, contracts, spec) in plans {
             let retained = self
                 .core_engine
-                .load_managed_model_state(
+                .load_managed_model_state_with_staged_rows(
                     model_instance_id,
                     &spec.retained,
                     logical_context,
+                    self.tts_staged_rows(bundle_draft)?,
                     tts_state_minimum_tokens(variant),
                     state_fit_reserve,
                     0,
@@ -1365,10 +1366,11 @@ impl ModelLifecycleController {
                 // gets the bound runtime back.
                 let retained = self
                     .core_engine
-                    .load_managed_model_state(
+                    .load_managed_model_state_with_staged_rows(
                         model_instance_id,
                         &physical_spec.retained,
                         Some(retained_max_tokens),
+                        self.tts_staged_rows(bundle_draft)?,
                         tts_state_minimum_tokens(variant),
                         state_fit_reserve,
                         later_predictor_bytes,
@@ -1479,10 +1481,11 @@ impl ModelLifecycleController {
             let retained_max_tokens = physical_spec.retained_max_tokens;
             let retained = self
                 .core_engine
-                .load_managed_model_state(
+                .load_managed_model_state_with_staged_rows(
                     model_instance_id,
                     retained_contract,
                     retained_max_tokens,
+                    self.tts_staged_rows(bundle_draft)?,
                     tts_state_minimum_tokens(variant),
                     state_fit_reserve,
                     0,
@@ -1798,10 +1801,11 @@ impl ModelLifecycleController {
             // context per request, shared by prefill and decode).
             let retained = self
                 .core_engine
-                .load_managed_model_state(
+                .load_managed_model_state_with_staged_rows(
                     model_instance_id,
                     &physical_spec.retained,
                     Some(physical_spec.retained_max_tokens),
+                    self.tts_staged_rows(bundle_draft)?,
                     tts_state_minimum_tokens(variant),
                     state_fit_reserve,
                     0,
@@ -1874,10 +1878,11 @@ impl ModelLifecycleController {
         let physical_spec = model.physical_state_spec(&stage_graphs)?;
         let retained = self
             .core_engine
-            .load_managed_model_state(
+            .load_managed_model_state_with_staged_rows(
                 model_instance_id,
                 &physical_spec.retained,
                 Some(physical_spec.retained_max_tokens),
+                self.tts_staged_rows(bundle_draft)?,
                 tts_state_minimum_tokens(variant),
                 state_fit_reserve,
                 0,
@@ -1946,10 +1951,11 @@ impl ModelLifecycleController {
         let physical_spec = model.physical_state_spec(&stage_graphs)?;
         let retained = self
             .core_engine
-            .load_managed_model_state(
+            .load_managed_model_state_with_staged_rows(
                 model_instance_id,
                 &physical_spec.retained,
                 Some(physical_spec.retained_max_tokens),
+                self.tts_staged_rows(bundle_draft)?,
                 tts_state_minimum_tokens(variant),
                 state_fit_reserve,
                 0,
@@ -2018,10 +2024,11 @@ impl ModelLifecycleController {
         let physical_spec = model.physical_state_spec(&stage_graphs)?;
         let retained = self
             .core_engine
-            .load_managed_model_state(
+            .load_managed_model_state_with_staged_rows(
                 model_instance_id,
                 &physical_spec.retained,
                 Some(physical_spec.retained_max_tokens),
+                self.tts_staged_rows(bundle_draft)?,
                 tts_state_minimum_tokens(variant),
                 state_fit_reserve,
                 0,

@@ -854,6 +854,27 @@ impl ModelLifecycleController {
         ))
     }
 
+    /// Staged rows of a loaded model's TTS state. With automatic staged
+    /// rows, one step's launch at its widest continuous TTS decode stage,
+    /// which may exceed the engine rows' width (`catalog::tts_decode_width`);
+    /// never fewer than the engine's staged rows. Operator-set rows are kept.
+    pub(super) fn tts_staged_rows(&self, bundle_draft: &LoadedModelBundleDraft) -> Result<usize> {
+        let engine = self.core_engine.config();
+        if !engine.automatic_row_limits.staged_transactions {
+            return Ok(engine.max_staged_transactions);
+        }
+        Ok(engine.max_staged_transactions.max(
+            crate::runtime::service::automatic_staged_transaction_rows(
+                super::decode_stage_width(bundle_draft, CapabilityKind::Tts)?,
+                engine
+                    .resolved_physical_execution_capacity()
+                    .candidate_dispatch_limit
+                    .get(),
+                engine.max_retained_sequences,
+            ),
+        ))
+    }
+
     /// The ASR decode width a load of `variant` drafts its adapters with,
     /// or `None` for a model without an ASR capability. Where the registry
     /// lets the decode run past the engine rows (CUDA with an automatic

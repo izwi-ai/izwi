@@ -3735,3 +3735,79 @@ fn voxtral_tts_factory_publishes_retained_batched_graph_on_all_backends() {
             .all(|stage| { stage.output_visibility == OutputVisibility::AfterQuantumCommit }));
     }
 }
+
+/// On CUDA with an automatic width, Qwen3-TTS, Maya1, Maya 2 and Chatterbox
+/// decode up to 32 rows per step (their decode steps every row in one launch
+/// per op, padded to one row-invariant shape) while preparation and prefill
+/// stay at the engine's eight; other TTS families keep the engine rows, and
+/// on Metal every family does.
+#[test]
+fn batched_tts_families_decode_at_the_tts_width_and_prefill_at_the_engine_rows() {
+    let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1)
+        .unwrap()
+        .with_tts_tensor_batch_size(crate::catalog::asr_engine_width(BackendKind::Cuda, 8, true));
+    let sequence_graph = |variant: ModelVariant, backend: BackendKind| {
+        LoadedModelBundleDraft::build(
+            &registry,
+            ExecutionGroupId::new(57),
+            ModelInstanceId::new(1),
+            variant,
+            backend,
+        )
+        .unwrap()
+        .execution_contracts(CapabilityKind::Tts)
+        .unwrap()
+        .into_iter()
+        .find(|contract| contract.execution_profile.mode == ExecutionMode::Sequence)
+        .unwrap_or_else(|| panic!("{variant} has a sequence graph"))
+    };
+    let stage = |contract: &LoadedExecutionContract, selector| {
+        contract
+            .stages
+            .iter()
+            .find(|stage| stage.selector == selector)
+            .unwrap_or_else(|| panic!("{selector:?} stage"))
+            .clone()
+    };
+    // (variant, prefill rows)
+    for (variant, prefill_rows) in [
+        (ModelVariant::Qwen3Tts12Hz06BCustomVoice, 1),
+        (ModelVariant::Qwen3Tts12Hz17BBase, 1),
+        (ModelVariant::Maya13B, 8),
+        (ModelVariant::Maya2Native25B, 8),
+        (ModelVariant::Chatterbox500M, 8),
+    ] {
+        assert_eq!(
+            registry.tts_decode_width(variant.family(), BackendKind::Cuda),
+            32
+        );
+        let contract = sequence_graph(variant, BackendKind::Cuda);
+        let decode = stage(&contract, StageWorkSelector::SequenceDecode);
+        assert_eq!(decode.batch_mode, NativeBatchMode::Continuous, "{variant}");
+        assert_eq!(decode.max_batch_size, 32, "{variant}");
+        assert_eq!(contract.execution_profile.max_batch_size, 32, "{variant}");
+        assert_eq!(
+            stage(&contract, StageWorkSelector::SequencePrefill).max_batch_size,
+            prefill_rows,
+            "{variant}"
+        );
+        let portable = sequence_graph(variant, BackendKind::Metal);
+        assert_eq!(
+            stage(&portable, StageWorkSelector::SequenceDecode).max_batch_size,
+            8,
+            "{variant} on Metal"
+        );
+    }
+    for variant in [
+        ModelVariant::Kokoro82M,
+        ModelVariant::FishAudioS2Pro,
+        ModelVariant::Voxtral4BTts2603,
+        ModelVariant::VibeVoice15BTts,
+    ] {
+        assert_eq!(
+            registry.tts_decode_width(variant.family(), BackendKind::Cuda),
+            8,
+            "{variant}"
+        );
+    }
+}

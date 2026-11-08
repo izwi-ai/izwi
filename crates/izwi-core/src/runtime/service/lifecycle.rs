@@ -253,6 +253,8 @@ impl RuntimeService {
                 automatic_tensor_width,
             ))
             .with_asr_tensor_batch_size(asr_row_width)
+            // TTS decode widens on the same terms as ASR decode.
+            .with_tts_tensor_batch_size(asr_row_width)
             .with_explicit_tensor_width(explicit_tensor_width),
         );
         worker_config.static_tensor_batch_variants =

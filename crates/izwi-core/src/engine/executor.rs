@@ -1180,8 +1180,12 @@ impl WorkerConfig {
 /// already planned it at.
 fn stage_sets_batch_rows(family: crate::catalog::ModelFamily) -> bool {
     use crate::catalog::ModelFamily;
+    let cuda = crate::backends::BackendKind::Cuda;
     matches!(family, ModelFamily::FishS2Tts | ModelFamily::FishDrama3Tts)
-        || crate::catalog::certified_decode_width(family, crate::backends::BackendKind::Cuda)
+        || crate::catalog::certified_decode_width(family, cuda) > crate::catalog::CUDA_DEFAULT_WIDTH
+        // TTS decodes certified past the engine rows: their loaded decode
+        // stage carries the width (the engine rows off CUDA).
+        || crate::catalog::tts_decode_width(family, cuda, 1, usize::MAX)
             > crate::catalog::CUDA_DEFAULT_WIDTH
 }
 
@@ -5715,6 +5719,10 @@ mod tests {
             ModelFamily::NemotronAsr,
             ModelFamily::WhisperAsr,
             ModelFamily::Voxtral,
+            ModelFamily::Qwen3Tts,
+            ModelFamily::Maya1Tts,
+            ModelFamily::Maya2Tts,
+            ModelFamily::ChatterboxTts,
         ] {
             assert!(stage_sets_batch_rows(family), "{family:?}");
         }
@@ -5726,7 +5734,8 @@ mod tests {
             ModelFamily::NemotronTranscribeAsr,
             ModelFamily::Lfm25Audio,
             ModelFamily::Lfm3Audio,
-            ModelFamily::Qwen3Tts,
+            ModelFamily::KokoroTts,
+            ModelFamily::VibeVoiceTts,
         ] {
             assert!(!stage_sets_batch_rows(family), "{family:?}");
         }

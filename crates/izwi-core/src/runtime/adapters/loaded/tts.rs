@@ -11,6 +11,9 @@ pub(super) struct PhysicalQwenTtsExecutionAdapter {
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
     pub(super) max_batch_size: usize,
+    /// Rows of the continuous decode stage: `max_batch_size`, or the wider
+    /// width the family is certified for (`catalog::tts_decode_width`).
+    pub(super) decode_batch_size: usize,
 }
 
 impl PhysicalQwenTtsExecutionAdapter {
@@ -30,7 +33,15 @@ impl PhysicalQwenTtsExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
         }
+    }
+
+    /// Decode `rows` per continuous step (never fewer than the other
+    /// stages' rows).
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
     }
 }
 
@@ -74,7 +85,7 @@ impl LoadedExecutionAdapter for PhysicalQwenTtsExecutionAdapter {
         execution_profile.recompute_safe = true;
         execution_profile.cache_release_safe = true;
         execution_profile.prefix_reuse_safe = false;
-        execution_profile.max_batch_size = self.max_batch_size;
+        execution_profile.max_batch_size = self.decode_batch_size;
         execution_profile.resolved_from_loaded_model = true;
 
         let mut prefill = StageDescriptor::from_execution_profile(
@@ -432,6 +443,9 @@ pub(super) struct ChatterboxTtsExecutionAdapter {
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
     pub(super) max_batch_size: usize,
+    /// Rows of the continuous decode stage: `max_batch_size`, or the wider
+    /// width the family is certified for (`catalog::tts_decode_width`).
+    pub(super) decode_batch_size: usize,
 }
 
 impl ChatterboxTtsExecutionAdapter {
@@ -451,7 +465,15 @@ impl ChatterboxTtsExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
         }
+    }
+
+    /// Decode `rows` per continuous step (never fewer than the other
+    /// stages' rows).
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
     }
 }
 
@@ -492,7 +514,7 @@ impl LoadedExecutionAdapter for ChatterboxTtsExecutionAdapter {
         profile.concurrency = ConcurrencyClass::Batchable;
         profile.recompute_safe = true;
         profile.cache_release_safe = true;
-        profile.max_batch_size = self.max_batch_size;
+        profile.max_batch_size = self.decode_batch_size;
         profile.resolved_from_loaded_model = true;
 
         let mut preparation = StageDescriptor::from_execution_profile(
@@ -516,6 +538,8 @@ impl LoadedExecutionAdapter for ChatterboxTtsExecutionAdapter {
             NativeBatchMode::Static,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
+        // Prefill stays at the engine rows; only decode widens.
+        prefill.max_batch_size = self.max_batch_size;
         prefill.progress = StageProgressKind::Iterative;
         prefill.shape_policy = StageShapePolicy::Ragged;
         prefill.max_padding_basis_points = 0;
@@ -533,10 +557,10 @@ impl LoadedExecutionAdapter for ChatterboxTtsExecutionAdapter {
         decode.selector = StageWorkSelector::SequenceDecode;
         decode.progress = StageProgressKind::Iterative;
         decode.shape_policy = StageShapePolicy::Ragged;
-        decode.max_work_units = 64_u64.saturating_mul(self.max_batch_size as u64);
+        decode.max_work_units = 64_u64.saturating_mul(self.decode_batch_size as u64);
         decode.max_workspace_bytes = 512_u64
             .saturating_mul(1024 * 1024)
-            .saturating_mul(self.max_batch_size as u64);
+            .saturating_mul(self.decode_batch_size as u64);
         // Hands over the rendered waveform.
         let mut finalize = StageDescriptor::from_execution_profile(
             StageId::new(3),
@@ -599,6 +623,9 @@ pub(super) struct Maya1TtsExecutionAdapter {
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
     pub(super) max_batch_size: usize,
+    /// Rows of the continuous decode stage: `max_batch_size`, or the wider
+    /// width the family is certified for (`catalog::tts_decode_width`).
+    pub(super) decode_batch_size: usize,
 }
 
 impl Maya1TtsExecutionAdapter {
@@ -618,7 +645,15 @@ impl Maya1TtsExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
         }
+    }
+
+    /// Decode `rows` per continuous step (never fewer than the other
+    /// stages' rows).
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
     }
 }
 
@@ -659,7 +694,7 @@ impl LoadedExecutionAdapter for Maya1TtsExecutionAdapter {
         profile.concurrency = ConcurrencyClass::Batchable;
         profile.recompute_safe = true;
         profile.cache_release_safe = true;
-        profile.max_batch_size = self.max_batch_size;
+        profile.max_batch_size = self.decode_batch_size;
         profile.resolved_from_loaded_model = true;
 
         let mut preparation = StageDescriptor::from_execution_profile(
@@ -684,6 +719,8 @@ impl LoadedExecutionAdapter for Maya1TtsExecutionAdapter {
             NativeBatchMode::Static,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
+        // Prefill stays at the engine rows; only decode widens.
+        prefill.max_batch_size = self.max_batch_size;
         prefill.progress = StageProgressKind::Iterative;
         prefill.shape_policy = StageShapePolicy::Ragged;
         prefill.max_padding_basis_points = 0;
@@ -701,10 +738,10 @@ impl LoadedExecutionAdapter for Maya1TtsExecutionAdapter {
         decode.selector = StageWorkSelector::SequenceDecode;
         decode.progress = StageProgressKind::Iterative;
         decode.shape_policy = StageShapePolicy::Ragged;
-        decode.max_work_units = 64_u64.saturating_mul(self.max_batch_size as u64);
+        decode.max_work_units = 64_u64.saturating_mul(self.decode_batch_size as u64);
         decode.max_workspace_bytes = 512_u64
             .saturating_mul(1024 * 1024)
-            .saturating_mul(self.max_batch_size as u64);
+            .saturating_mul(self.decode_batch_size as u64);
         // Hands over the audio (a stream's end-of-stream marker).
         let mut finalize = StageDescriptor::from_execution_profile(
             StageId::new(3),
@@ -766,6 +803,9 @@ pub(super) struct Maya2TtsExecutionAdapter {
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
     pub(super) max_batch_size: usize,
+    /// Rows of the continuous decode stage: `max_batch_size`, or the wider
+    /// width the family is certified for (`catalog::tts_decode_width`).
+    pub(super) decode_batch_size: usize,
 }
 
 impl Maya2TtsExecutionAdapter {
@@ -785,7 +825,15 @@ impl Maya2TtsExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
         }
+    }
+
+    /// Decode `rows` per continuous step (never fewer than the other
+    /// stages' rows).
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
     }
 }
 
@@ -826,7 +874,7 @@ impl LoadedExecutionAdapter for Maya2TtsExecutionAdapter {
         profile.concurrency = ConcurrencyClass::Batchable;
         profile.recompute_safe = true;
         profile.cache_release_safe = true;
-        profile.max_batch_size = self.max_batch_size;
+        profile.max_batch_size = self.decode_batch_size;
         profile.resolved_from_loaded_model = true;
 
         let mut preparation = StageDescriptor::from_execution_profile(
@@ -852,6 +900,8 @@ impl LoadedExecutionAdapter for Maya2TtsExecutionAdapter {
             NativeBatchMode::Static,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
+        // Prefill stays at the engine rows; only decode widens.
+        prefill.max_batch_size = self.max_batch_size;
         prefill.progress = StageProgressKind::Iterative;
         prefill.shape_policy = StageShapePolicy::Ragged;
         prefill.max_padding_basis_points = 0;
@@ -869,10 +919,10 @@ impl LoadedExecutionAdapter for Maya2TtsExecutionAdapter {
         decode.selector = StageWorkSelector::SequenceDecode;
         decode.progress = StageProgressKind::Iterative;
         decode.shape_policy = StageShapePolicy::Ragged;
-        decode.max_work_units = 64_u64.saturating_mul(self.max_batch_size as u64);
+        decode.max_work_units = 64_u64.saturating_mul(self.decode_batch_size as u64);
         decode.max_workspace_bytes = 512_u64
             .saturating_mul(1024 * 1024)
-            .saturating_mul(self.max_batch_size as u64);
+            .saturating_mul(self.decode_batch_size as u64);
         // Hands over the audio (a stream's end-of-stream marker).
         let mut finalize = StageDescriptor::from_execution_profile(
             StageId::new(3),

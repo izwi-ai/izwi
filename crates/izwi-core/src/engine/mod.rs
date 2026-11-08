@@ -3727,6 +3727,32 @@ impl Engine {
     /// [`Self::load_managed_model_state`] on the model's own sealed
     /// `(retained, staged)` rows instead of the engine's: the same live fit
     /// above `minimum_tokens` per row, keeping `reserve`.
+    /// See `EngineCore::load_managed_model_state_with_staged_rows`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn load_managed_model_state_with_staged_rows(
+        &self,
+        model_instance: ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        logical_context_tokens: Option<usize>,
+        staged_rows: usize,
+        minimum_tokens: u64,
+        reserve: StateFitReserve,
+        later_minimum_bytes: u64,
+    ) -> Result<Arc<ManagedKvModelRuntime>> {
+        self.with_core_on_device(Some(Some(model_instance)), |core| {
+            core.load_managed_model_state_with_staged_rows(
+                model_instance,
+                retained_state,
+                logical_context_tokens,
+                staged_rows,
+                minimum_tokens,
+                reserve,
+                later_minimum_bytes,
+            )
+        })
+        .await
+    }
+
     pub(crate) async fn load_managed_model_state_with_rows(
         &self,
         model_instance: ModelInstanceId,

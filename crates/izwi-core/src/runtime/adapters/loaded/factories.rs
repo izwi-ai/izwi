@@ -23,13 +23,16 @@ impl LoadedExecutionAdapterFactory for PhysicalQwenTtsAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(PhysicalQwenTtsExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            PhysicalQwenTtsExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 
@@ -284,13 +287,16 @@ impl LoadedExecutionAdapterFactory for ChatterboxPhysicalTtsAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(ChatterboxTtsExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            ChatterboxTtsExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 
@@ -312,13 +318,16 @@ impl LoadedExecutionAdapterFactory for Maya1PhysicalTtsAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(Maya1TtsExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            Maya1TtsExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 
@@ -340,13 +349,16 @@ impl LoadedExecutionAdapterFactory for Maya2PhysicalTtsAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(Maya2TtsExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            Maya2TtsExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 

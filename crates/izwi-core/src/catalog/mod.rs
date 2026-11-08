@@ -13,7 +13,7 @@ mod mixed_step;
 pub(crate) use batch_width::{
     asr_decode_width, asr_engine_width, certified_decode_width, chat_engine_width,
     engine_row_width, fit_asr_decode_width, max_certified_decode_width, non_chat_row_width,
-    CUDA_DEFAULT_WIDTH, EXPLICIT_WIDTH_CEILING,
+    tts_decode_width, CUDA_DEFAULT_WIDTH, EXPLICIT_WIDTH_CEILING,
 };
 pub use izwi_model_catalog::catalog::*;
 pub(crate) use mixed_step::mixed_step_enabled;

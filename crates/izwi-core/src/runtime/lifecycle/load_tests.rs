@@ -4290,3 +4290,59 @@ fn unevictable_residents_are_pinned_or_busy_and_never_the_request() {
         vec![ModelVariant::Kokoro82M, ModelVariant::WhisperLargeV3Turbo]
     );
 }
+
+/// With automatic staged rows a TTS load stages one launch at its widest
+/// continuous decode stage, so a decode certified past the engine rows
+/// (`catalog::tts_decode_width`) is not held to the engine's staged width;
+/// a family at the engine rows keeps the engine's staged rows.
+#[test]
+fn tts_staged_rows_cover_the_tts_decode_width() {
+    use crate::runtime::adapters::LoadedModelBundleDraft;
+    let draft = |tts_width: usize, variant: ModelVariant| {
+        LoadedModelBundleDraft::build(
+            &RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1)
+                .unwrap()
+                .with_tts_tensor_batch_size(tts_width),
+            ExecutionGroupId::new(995),
+            ModelInstanceId::new(1),
+            variant,
+            BackendKind::Cuda,
+        )
+        .unwrap()
+    };
+    let wide = RuntimeService::new(EngineConfig {
+        backend: BackendPreference::Cpu,
+        max_num_seqs: Some(320),
+        ..Default::default()
+    })
+    .unwrap();
+    let engine_staged = wide.core_engine.config().max_staged_transactions;
+    assert!(
+        wide.core_engine
+            .config()
+            .automatic_row_limits
+            .staged_transactions
+    );
+    let lifecycle = &wide.model_lifecycle;
+    for variant in [
+        ModelVariant::Maya13B,
+        ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+    ] {
+        assert_eq!(
+            lifecycle.tts_staged_rows(&draft(32, variant)).unwrap(),
+            32.max(engine_staged),
+            "{variant}"
+        );
+        assert_eq!(
+            lifecycle.tts_staged_rows(&draft(8, variant)).unwrap(),
+            engine_staged.max(8),
+            "{variant}"
+        );
+    }
+    assert_eq!(
+        lifecycle
+            .tts_staged_rows(&draft(32, ModelVariant::Kokoro82M))
+            .unwrap(),
+        engine_staged
+    );
+}
