@@ -900,6 +900,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     )
     .aliases(&[("serial", false), ("sequential", false)]),
     CoreEnvVar::new(
+        "IZWI_KOKORO_DEVICE_ISTFT",
+        Flag,
+        "true on CUDA, false on CPU and Metal",
+        Once,
+        "Runs the Kokoro generator's inverse STFT on the device (one transposed convolution and one waveform readback per batch); false reads the magnitude and phase back and runs the host FFT.",
+    ),
+    CoreEnvVar::new(
         "IZWI_KOKORO_METAL_HARMONIC_OVERLAP",
         Flag,
         "true",

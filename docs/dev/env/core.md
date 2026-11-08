@@ -137,6 +137,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_KOKORO_CPU_PREDECODER` | flag | `true` | first use | Runs the Kokoro CPU pre-decoder stages in parallel; off/serial runs them sequentially. Also: `serial` means false, `sequential` means false. |
 | `IZWI_KOKORO_CPU_RESBLOCKS` | flag | `true` | first use | Runs Kokoro decoder residual-block kernels in parallel on CPU; off/serial runs them sequentially. Also: `serial` means false, `sequential` means false. |
 | `IZWI_KOKORO_CPU_STAGE_BRANCHES` | flag | `true` | first use | Runs the two branches of each Kokoro generator upsample stage in parallel on CPU; off/serial runs them sequentially. Also: `serial` means false, `sequential` means false. |
+| `IZWI_KOKORO_DEVICE_ISTFT` | flag | true on CUDA, false on CPU and Metal | first use | Runs the Kokoro generator's inverse STFT on the device (one transposed convolution and one waveform readback per batch); false reads the magnitude and phase back and runs the host FFT. |
 | `IZWI_KOKORO_METAL_HARMONIC_OVERLAP` | flag | `true` | first use | Overlaps Kokoro harmonic-source generation with decoder blocks on Metal; off/serial disables the overlap. Also: `serial` means false, `sequential` means false. |
 | `IZWI_KOKORO_PROFILE` | flag | `false` | first use | Logs per-stage Kokoro TTS timings to stderr. |
 | `IZWI_KOKORO_PROFILE_SYNC` | flag | `false` | first use | Synchronizes the device before each Kokoro generator-stage profile timing so stage times are accurate. |
