@@ -984,7 +984,6 @@ pub struct TtsDecodeStep {
 /// schedulable predictor stage. Construction never mutates decode state.
 pub struct PreparedTtsPredictorStage {
     semantic_token: u32,
-    semantic_embed: Tensor,
     talker_hidden: Tensor,
     source_logits: Tensor,
     text_addition: Tensor,
@@ -2934,7 +2933,6 @@ impl Qwen3TtsModel {
         })?;
         let next_semantic_history =
             record_semantic_history(&state.semantic_history, semantic_token);
-        let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
         let talker_hidden = state.last_hidden.as_ref().ok_or_else(|| {
             Error::InferenceError("Qwen3-TTS last hidden state is not hydrated".into())
         })?;
@@ -2954,7 +2952,6 @@ impl Qwen3TtsModel {
         Ok(PreparedTtsFrameStage::Predictor(
             PreparedTtsPredictorStage {
                 semantic_token,
-                semantic_embed,
                 talker_hidden: talker_hidden.clone(),
                 source_logits: last_logits.clone(),
                 text_addition,
@@ -2991,12 +2988,13 @@ impl Qwen3TtsModel {
             .iter()
             .map(|row| &row.talker_hidden)
             .collect::<Vec<_>>();
-        let semantic_refs = rows
-            .iter()
-            .map(|row| &row.semantic_embed)
-            .collect::<Vec<_>>();
         let talker_hidden = Tensor::cat(&talker_refs, 0)?;
-        let semantic_embeds = Tensor::cat(&semantic_refs, 0)?;
+        // Every row's semantic embedding in one upload and one lookup.
+        let semantic_tokens = rows
+            .iter()
+            .map(|row| row.semantic_token)
+            .collect::<Vec<_>>();
+        let semantic_embeds = self.talker.get_codec_embedding_rows(&semantic_tokens)?;
         let checkpoints = caches
             .iter()
             .map(|cache| cache.logical_checkpoint())
@@ -5603,7 +5601,6 @@ pub(crate) mod tests {
         PreparedTtsTalkerStage {
             predictor: PreparedTtsPredictorStage {
                 semantic_token,
-                semantic_embed: Tensor::zeros((1, 1, 4), DType::F32, &device).unwrap(),
                 talker_hidden: state.last_hidden.as_ref().unwrap().clone(),
                 source_logits: state.last_logits.as_ref().unwrap().clone(),
                 text_addition: Tensor::zeros((1, 1, 4), DType::F32, &device).unwrap(),

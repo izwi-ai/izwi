@@ -1153,6 +1153,18 @@ impl TalkerModel {
         embed.unsqueeze(0).map_err(Error::from)
     }
 
+    /// The codec embedding of one token per batch row, `[rows, 1, hidden]`:
+    /// one id upload and one lookup for the whole step, each row bit for bit
+    /// [`Self::get_codec_embedding`] of its token.
+    pub fn get_codec_embedding_rows(&self, token_ids: &[u32]) -> Result<Tensor> {
+        let rows = token_ids.len();
+        let ids = Tensor::from_vec(token_ids.to_vec(), rows, &self.device)?;
+        let embed = self.codec_embedding.forward(&ids)?;
+        embed
+            .reshape((rows, 1, self.cfg.hidden_size))
+            .map_err(Error::from)
+    }
+
     /// Get codec embeddings for a sequence of codec token IDs.
     /// Output shape: [1, seq_len, hidden_size].
     pub fn get_codec_embedding_batch(&self, token_ids: &[u32]) -> Result<Tensor> {
@@ -1734,6 +1746,25 @@ pub(crate) mod tests {
     /// allocating only the F16 table, and checked on sampled rows against
     /// the stored values (an F16 overflow on a sampled row is infinite).
     /// Other forms are left to the builder; a wrong shape is an error.
+    /// A step's semantic embeddings, looked up for all rows at once, are
+    /// each row's own lookup.
+    #[test]
+    fn codec_embedding_rows_are_each_tokens_own_embedding() {
+        let device = Device::Cpu;
+        let talker = tiny_talker(&device);
+        let tokens = [3u32, 0, 7, 3, 5];
+        let rows = talker.get_codec_embedding_rows(&tokens).unwrap();
+        assert_eq!(rows.dims(), &[tokens.len(), 1, 4]);
+        let values = |tensor: Tensor| tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (row, &token) in tokens.iter().enumerate() {
+            assert_eq!(
+                values(rows.i(row).unwrap()),
+                values(talker.get_codec_embedding(token).unwrap()),
+                "row {row}"
+            );
+        }
+    }
+
     #[test]
     fn f16_embedding_reads_each_float_form_in_place() {
         use crate::kernels::numeric_check::xorshift_tensor;
