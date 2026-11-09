@@ -412,16 +412,22 @@ been compiled and type-checked but not yet run on a GPU.
 
 The Mamba state is about 47.6 MiB per row. The state is allocated through the
 managed arena at load (`allocate_nemotron_transcribe_state` in
-`runtime/lifecycle/load/state.rs`). Prompt and completion share a
-65,536-token context. A request that omits `max_tokens`, and each segment
-of a long translation, decodes at most `min(16384, ceil(16 × seconds) + 64)`
-tokens (`planned_decode_tokens` in `model.rs`): several times what dense
-speech needs in any script or target language. An explicit `max_tokens` may
-reach `65,536 − prompt`. Admission claims a row's KV for its prompt and that
-budget in full, so a 30 s row claims about 975 tokens and the 65,536-token
-pool holds 32 such rows beside a 600 s one; with the card's 16,384-token
-budget it held three. Prefixes are not shared: prompts share only about 15 tokens
-before the audio, and vLLM serves this model without prefix caching too.
+`runtime/lifecycle/load/state.rs`) for the ASR rows (`asr_state_rows`), not
+the engine's: on CUDA with automatic rows, 8 retained rows (the decode
+width) and 8 staged ones, 762 MiB. The engine rows reserved about 15 GiB on
+an H100 (316 retained and 8 staged). A request beyond the rows waits for
+one.
+
+Prompt and completion share a 65,536-token context. A request that omits
+`max_tokens`, and each segment of a long translation, decodes at most
+`min(16384, ceil(16 × seconds) + 64)` tokens (`planned_decode_tokens` in
+`model.rs`): several times what dense speech needs in any script or target
+language. An explicit `max_tokens` may reach `65,536 − prompt`. Admission
+claims a row's KV for its prompt and that budget in full, so a 30 s row
+claims about 975 tokens and the 65,536-token pool holds 32 such rows beside
+a 600 s one; with the card's 16,384-token budget it held three. Prefixes
+are not shared: prompts share only about 15 tokens before the audio, and
+vLLM serves this model without prefix caching too.
 
 ## Word timestamps
 

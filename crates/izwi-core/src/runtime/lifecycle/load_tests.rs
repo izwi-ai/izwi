@@ -4494,3 +4494,78 @@ fn granite_speech5_retained_pool_holds_one_longest_sequence_without_a_context_fl
         .to_string()
         .contains("IZWI_GRANITE_SPEECH5_RETAINED_DECODE"));
 }
+
+/// Nemotron 3.5 Transcribe's Mamba state takes the ASR rows, not the
+/// engine's. Beside an H100's automatic engine rows (320 here; 316 retained
+/// and 8 staged in the 2026-11-08 matrix), its 8-row decode takes 8
+/// retained and 8 staged rows: 16 x 47.6 MiB = 762 MiB of recurrent and
+/// convolution state beside its 384 MiB K/V pool, where the engine rows
+/// reserved 324 x 47.6 MiB = 15.1 GiB.
+#[test]
+fn nemotron_transcribe_state_takes_the_asr_rows_not_the_engine_rows() {
+    use crate::models::architectures::nemotron_transcribe::config::tests::published;
+    use crate::models::architectures::nemotron_transcribe::decoder::state::{
+        decoder_state_contract, kv_bytes_per_token, recurrent_state_bytes,
+    };
+    use crate::runtime::adapters::LoadedModelBundleDraft;
+    const MIB: u64 = 1024 * 1024;
+    let variant = ModelVariant::Nemotron35Transcribe30BA4BFp8;
+    let width = crate::catalog::certified_decode_width(variant.family(), BackendKind::Cuda);
+    assert_eq!(width, 8);
+    let wide = RuntimeService::new(EngineConfig {
+        backend: BackendPreference::Cpu,
+        max_num_seqs: Some(320),
+        ..Default::default()
+    })
+    .unwrap();
+    let draft = LoadedModelBundleDraft::build(
+        &RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1)
+            .unwrap()
+            .with_asr_tensor_batch_size(width),
+        ExecutionGroupId::new(996),
+        ModelInstanceId::new(1),
+        variant,
+        BackendKind::Cuda,
+    )
+    .unwrap();
+    let rows = wide.model_lifecycle.asr_state_rows(&draft).unwrap();
+    assert_eq!(rows, (8, 8));
+
+    let config = published();
+    let row_bytes = recurrent_state_bytes(&config.decoder);
+    assert_eq!(row_bytes, 49_930_240);
+    let contract = decoder_state_contract(&config.decoder, StateDType::F16, 64).unwrap();
+    let plan = crate::backends::state::negotiate_state_plan(
+        &contract,
+        &crate::backends::state::StateBackendPlanRequest {
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            page_tokens_hint: Some(64),
+            storage_dtype_hint: None,
+        },
+    )
+    .unwrap();
+    let state_bytes = |(retained, staged): (usize, usize)| {
+        let (_, tensor) = crate::engine::plan_managed_state_capacity(
+            &plan,
+            ModelInstanceId::new(35),
+            crate::engine::ManagedStateCapacityRequest {
+                total_paged_pages: 1 << 20,
+                logical_token_reach: Some(65_536),
+                retained_sequence_rows: u32::try_from(retained).unwrap(),
+                staged_transaction_rows: u32::try_from(staged).unwrap(),
+            },
+        )
+        .unwrap();
+        tensor.unwrap().authorized_bytes()
+    };
+    assert_eq!(state_bytes(rows), 16 * row_bytes);
+    assert_eq!(state_bytes(rows) / MIB, 761);
+    assert_eq!(state_bytes((316, 8)), 324 * row_bytes);
+    assert_eq!(state_bytes((316, 8)) / MIB, 15_427);
+    // The 65,536-token K/V pool: 6 KiB of BF16 K/V a token.
+    assert_eq!(
+        65_536 * kv_bytes_per_token(&config.decoder, candle_core::DType::BF16),
+        384 * MIB
+    );
+}

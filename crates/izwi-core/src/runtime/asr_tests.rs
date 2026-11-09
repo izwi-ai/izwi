@@ -1517,6 +1517,26 @@ fn nemotron_transcribe_pool_admits_32_automatic_30s_rows() {
     assert!(backpressure(refusal));
 }
 
+/// A Nemotron 3.5 Transcribe load holds 8 retained rows on CUDA (its decode
+/// width; 8 more stage): a ninth concurrent request waits for a row instead
+/// of failing, and binds once a row is released.
+#[test]
+fn nemotron_transcribe_requests_beyond_the_rows_wait_for_one() {
+    use crate::models::architectures::nemotron_transcribe::MAX_CONTEXT_TOKENS;
+    let rows = (0..9)
+        .map(|_| transcribe_row(431, 30.0, true))
+        .collect::<Vec<_>>();
+    let mut pool = FullClaimPool::new(MAX_CONTEXT_TOKENS, (8, 8));
+    let (admitted, refusal) = pool.admit_all(&rows);
+    assert_eq!(admitted, 8);
+    assert!(
+        matches!(&refusal, Some(crate::error::Error::Backpressure(reason)) if reason.contains("sequence capacity")),
+        "{refusal:?}"
+    );
+    pool.release(3);
+    pool.admit(8, &rows[8]).unwrap();
+}
+
 /// Every automatic Qwen3-ASR request claims its whole sequence (the 2,048
 /// default budget clamped to the 1,307-token context): 21 pages of 64. The
 /// pool held 32 unrounded sequences, 654 pages, so 31 rows fit and the H100

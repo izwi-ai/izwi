@@ -1209,6 +1209,11 @@ impl ModelLifecycleController {
     /// Nemotron 3.5 Transcribe rows: the family's state contract (paged KV
     /// of the six attention layers, the Mamba SSM and convolution states) in
     /// one managed arena, each row up to the model's 65,536-token context.
+    /// The rows are the ASR rows ([`Self::asr_state_rows`]), not the
+    /// engine's: each holds 47.6 MiB of Mamba state, and the automatic
+    /// engine rows (316 retained and 8 staged on an H100) reserved about
+    /// 15 GiB of it for a decode 8 rows wide. A request beyond the rows
+    /// waits for one.
     pub(super) async fn allocate_nemotron_transcribe_state(
         &self,
         variant: ModelVariant,
@@ -1256,13 +1261,13 @@ impl ModelLifecycleController {
             .min(nemotron.max_context_tokens());
         let retained = self
             .core_engine
-            .load_managed_model_state(
+            .load_managed_model_state_with_rows(
                 model_instance_id,
                 &contract,
                 Some(context),
+                self.asr_state_rows(bundle_draft)?,
                 asr_minimum_tokens(variant),
                 state_fit_reserve,
-                0,
             )
             .await?;
         self.model_registry.publish_effective_context(
