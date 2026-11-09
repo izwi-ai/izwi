@@ -2582,6 +2582,54 @@ fn fish_capacity_seals_both_routes_and_rejects_rebinding() {
     assert!(draft.seal_fish_capacity(capacity).is_err());
 }
 
+/// A natively batched Fish load publishes an invocation workspace whose
+/// per-row scratch, times each stage's rows, is that stage's ceiling. The
+/// prefill stage prices its whole batch in `max_workspace_bytes` with no
+/// per-row figure; reading that ceiling as one row's scratch made every load
+/// with more than one prefill row fail its workspace check (HTTP 400 on the
+/// H100 once Fish batched by default on CUDA).
+#[test]
+fn batched_fish_workspace_matches_every_loaded_stage() {
+    let registry = RuntimeAdapterRegistry::built_in();
+    let draft = LoadedModelBundleDraft::build(
+        &registry,
+        ExecutionGroupId::new(17),
+        ModelInstanceId::new(19),
+        ModelVariant::FishAudioS2Pro,
+        BackendKind::Cuda,
+    )
+    .unwrap();
+    let mut capacity =
+        crate::runtime::fish_capacity::ResolvedFishServingCapacity::scalar().unwrap();
+    capacity.ar_rows = 4;
+    capacity.prefill_tokens = 312;
+    capacity.codec_rows = 4;
+    capacity.active_rows = 4;
+    capacity.staged_rows = 4;
+    capacity.native_batching = true;
+    draft.seal_fish_capacity(capacity).unwrap();
+    let config = crate::models::architectures::fish_s2::config::current_config();
+    for capability in [CapabilityKind::Tts, CapabilityKind::StreamingTts] {
+        for contract in draft.execution_contracts(capability).unwrap() {
+            let prefill = contract
+                .stages
+                .iter()
+                .find(|stage| stage.selector == StageWorkSelector::SequencePrefill)
+                .unwrap();
+            assert_eq!(prefill.max_batch_size, 4);
+            let spec = crate::models::architectures::fish_s2::fish_s2_physical_state_spec(
+                &config,
+                candle_core::DType::BF16,
+                &[&contract.stages],
+            )
+            .unwrap();
+            spec.descriptor
+                .validate_against_stages(&contract.stages)
+                .unwrap();
+        }
+    }
+}
+
 #[test]
 fn fish_s2_loaded_contracts_have_only_retained_state_and_codec_finalization() {
     let registry = RuntimeAdapterRegistry::built_in();
