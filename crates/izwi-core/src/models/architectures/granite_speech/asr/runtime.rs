@@ -27,6 +27,7 @@ use crate::kernels::numeric_check::{
     load_with_precision_fallback, run_numeric_self_check, xorshift_tensor, xorshift_values,
     NumericSelfCheckReport, PrecisionLoad, F16_SAFE_MAX_ABS,
 };
+use crate::kernels::relpos_attention::{self, KeyBand, KeyLengths};
 use crate::kernels::{
     try_fused_rms_norm, try_fused_rope_pair_bshd, try_fused_silu_mul_with_status,
 };
@@ -1799,8 +1800,22 @@ struct GraniteConformerAttention {
     rel_pos_emb: Embedding,
     attention_dists: Tensor,
     context_size: usize,
+    max_pos_emb: usize,
     num_heads: usize,
     dim_head: usize,
+}
+
+/// Whether the conformer attention runs [`relpos_attention::reference`] on
+/// the host in place of the CUDA kernel: the in-family tests of the fused
+/// path's wiring on a machine without a GPU.
+#[cfg(test)]
+fn fused_attention_on_the_host() -> bool {
+    tests::FUSED_ATTENTION_ON_THE_HOST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn fused_attention_on_the_host() -> bool {
+    false
 }
 
 impl GraniteConformerAttention {
@@ -1813,6 +1828,9 @@ impl GraniteConformerAttention {
         let hidden = config.hidden_dim;
         let attention_dists =
             encoder_attention_dists(config.context_size, config.max_pos_emb, vb.device())?;
+        // The kernel's self-check runs at load, before admission prices the
+        // encoder from its verdict.
+        relpos_attention::prepare_cuda_kernel(vb.device());
         Ok(Self {
             pre_norm: layer_norm(hidden, 1e-5, vb.pp("pre_norm"))?,
             to_q: encoder_projection(hidden, inner, false, &vb.pp("to_q"), f16)?,
@@ -1825,13 +1843,73 @@ impl GraniteConformerAttention {
             )?,
             attention_dists,
             context_size: config.context_size,
+            max_pos_emb: config.max_pos_emb,
             num_heads: config.num_heads,
             dim_head: config.dim_head,
         })
     }
 
+    /// The attention core of normed `x` (`[B, T, D]`) as one CUDA launch
+    /// ([`relpos_attention::relpos_attention`]) once its self-check passed:
+    /// each query scores the keys of its own block (cut at its row's
+    /// `valid_lengths`, when given) against the position table itself, with
+    /// eager's BF16 roundings in a BF16 encoder, and no block padding.
+    /// `[B, T, H·Dh]`, or `None` where the eager core runs.
+    fn fused(&self, x: &Tensor, valid_lengths: Option<&[usize]>) -> Result<Option<Tensor>> {
+        let dtype = x.dtype();
+        let on = fused_attention_on_the_host()
+            || (x.device().is_cuda() && relpos_attention::eager_reason(x.device()).is_none());
+        if !on || !matches!(dtype, DType::F32 | DType::BF16) {
+            return Ok(None);
+        }
+        let (batch, seq_len, _) = x.dims3()?;
+        let (heads, dim_head) = (self.num_heads, self.dim_head);
+        let q = self
+            .to_q
+            .forward(x)?
+            .reshape((batch, seq_len, heads, dim_head))?;
+        let kv = self
+            .to_kv
+            .forward(x)?
+            .reshape((batch, seq_len, 2, heads, dim_head))?;
+        let (k, v) = (kv.i((.., .., 0))?, kv.i((.., .., 1))?);
+        let table = self.rel_pos_emb.embeddings().to_dtype(dtype)?;
+        let lengths = valid_lengths
+            .map(|lengths| {
+                let real = lengths.iter().map(|len| *len as u32).collect::<Vec<_>>();
+                Tensor::from_vec(real, batch, x.device())
+            })
+            .transpose()?;
+        let spec = relpos_attention::RelPosAttention {
+            q: &q,
+            k: &k,
+            v: &v,
+            pos: &table,
+            position: relpos_attention::RelPosition::Shaw {
+                clamp: self.context_size,
+                center: self.max_pos_emb,
+            },
+            band: KeyBand::Block {
+                size: self.context_size,
+            },
+            key_lengths: lengths.as_ref().map_or(KeyLengths::All, KeyLengths::PerRow),
+            scale: 1.0 / (dim_head as f64).sqrt(),
+            core: dtype,
+            out_dtype: dtype,
+        };
+        if fused_attention_on_the_host() {
+            return Ok(Some(
+                relpos_attention::reference(&spec)?.to_device(x.device())?,
+            ));
+        }
+        Ok(relpos_attention::relpos_attention(&spec)?)
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = self.pre_norm.forward(x)?;
+        if let Some(out) = self.fused(&x, None)? {
+            return self.to_out.forward(&out).map_err(Error::from);
+        }
         let (batch, seq_len, _) = x.dims3()?;
         let nblocks = seq_len.saturating_add(self.context_size - 1) / self.context_size;
         let padded_len = nblocks * self.context_size;
@@ -1903,6 +1981,13 @@ impl GraniteConformerAttention {
         validate_frame_lengths(batch, seq_len, valid_lengths)?;
         let input_mask = frame_valid_mask(valid_lengths, seq_len, x.device(), x.dtype())?;
         let x = self.pre_norm.forward(x)?.broadcast_mul(&input_mask)?;
+        if let Some(out) = self.fused(&x, Some(valid_lengths))? {
+            return self
+                .to_out
+                .forward(&out.broadcast_mul(&input_mask)?)?
+                .broadcast_mul(&input_mask)
+                .map_err(Error::from);
+        }
         let nblocks = seq_len.div_ceil(self.context_size);
         let padded_len = nblocks * self.context_size;
         let padded = if padded_len > seq_len {
@@ -4177,6 +4262,13 @@ fn maybe_prescale_residual_linear(
 mod tests {
     use super::*;
     use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
+
+    thread_local! {
+        /// Runs the conformer attention through the fused kernel's host
+        /// reference (see `fused_attention_on_the_host`).
+        pub(super) static FUSED_ATTENTION_ON_THE_HOST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
     use crate::backends::BackendKind;
     use crate::engine::ModelInstanceId;
     use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
@@ -5872,6 +5964,42 @@ mod tests {
     #[test]
     fn weight_only_f16_encoder_tracks_f32_on_cpu() {
         assert_weight_only_f16_encoder_tracks_f32(&Device::Cpu);
+    }
+
+    /// The fused Shaw attention's wiring: with the kernel's host reference in
+    /// place of the eager core (the table itself, its clamp and center, the
+    /// block band, each row's valid length, no block padding), a lone input
+    /// whose last block is partial and a padded batch encode as the eager
+    /// layers do. The kernel takes head dims in multiples of 32.
+    #[test]
+    fn fused_attention_matches_the_eager_encoder() {
+        let config = GraniteSpeechEncoderConfig {
+            dim_head: 32,
+            num_heads: 2,
+            ..weight_only_f16_encoder_config()
+        };
+        let tensors = weight_only_f16_encoder_tensors(&config);
+        let (encoder, _) = encoder_on(&config, &tensors, &Device::Cpu, false);
+        let input = xorshift_tensor(&[2, 21, config.input_dim], 9, 2.0, &Device::Cpu).unwrap();
+        let fused = |f: &dyn Fn() -> Tensor| {
+            FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(true));
+            let out = f();
+            FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(false));
+            out
+        };
+        let lone = input.i(0..1).unwrap();
+        let eager = encoder.forward(&lone).unwrap();
+        let rel = relative_l2_of(&fused(&|| encoder.forward(&lone).unwrap()), &eager);
+        assert!(rel < 1e-5, "lone input relative L2 {rel:e}");
+        let lengths = [13, 21];
+        let eager = encoder.forward_valid_lengths(&input, &lengths).unwrap();
+        let batched = fused(&|| encoder.forward_valid_lengths(&input, &lengths).unwrap());
+        for (row, len) in lengths.iter().enumerate() {
+            let real = |t: &Tensor| t.i((row..row + 1, ..*len)).unwrap();
+            let rel = relative_l2_of(&real(&batched), &real(&eager));
+            eprintln!("Granite fused vs eager attention, row {row}: relative L2 {rel:e}");
+            assert!(rel < 1e-5, "row {row} relative L2 {rel:e}");
+        }
     }
 
     #[cfg(feature = "metal")]

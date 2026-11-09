@@ -31,6 +31,7 @@
 use crate::backends::BackendKind;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
+use crate::kernels::relpos_attention;
 use crate::model::ModelVariant;
 use crate::models::architectures::nemotron::asr::nemotron_stem_bytes;
 use crate::models::architectures::parakeet::asr::parakeet_preparation_bytes;
@@ -494,6 +495,33 @@ fn shaw_rel_pos_bytes(
     ])
 }
 
+/// One encoder layer's live bytes: [`layer_bytes`], plus a Shaw encoder's
+/// position copies ([`shaw_rel_pos_bytes`]). With the fused attention
+/// kernel (`fused_attention`: on CUDA once its self-check passed) the layer
+/// holds neither the score planes nor those copies.
+fn encoder_layer_bytes(
+    geometry: AsrEnvelopeGeometry,
+    length: u64,
+    context: u64,
+    fused_attention: bool,
+) -> Result<u64> {
+    let encoder = geometry.encoder;
+    if fused_attention {
+        return sum(&[
+            product(&[HIDDEN_PLANES, length, encoder.hidden, F32_BYTES])?,
+            product(&[FF_PLANES, length, encoder.ff, F32_BYTES])?,
+        ]);
+    }
+    let layer = layer_bytes(encoder, length, context)?;
+    match geometry.encoder_rel_pos {
+        Some(rel_pos) => sum(&[
+            layer,
+            shaw_rel_pos_bytes(encoder, rel_pos, length, context)?,
+        ]),
+        None => Ok(layer),
+    }
+}
+
 /// One causal prefill layer over `length` positions whose attention runs
 /// `block` query rows at a time against the keys before them.
 fn blocked_prefill_bytes(geometry: StackGeometry, length: u64, block: u64) -> Result<u64> {
@@ -639,13 +667,8 @@ fn geometry_envelope(
             positions(geometry.encoder_positions_per_sec, window).min(encoder_length)
         })
         .max(1);
-    let mut encoder = layer_bytes(geometry.encoder, encoder_length, encoder_context)?;
-    if let Some(rel_pos) = geometry.encoder_rel_pos {
-        encoder = sum(&[
-            encoder,
-            shaw_rel_pos_bytes(geometry.encoder, rel_pos, encoder_length, encoder_context)?,
-        ])?;
-    }
+    let fused = geometry.encoder_rel_pos.is_some() && relpos_attention::fused_priced(backend);
+    let encoder = encoder_layer_bytes(geometry, encoder_length, encoder_context, fused)?;
     let words = u64::try_from(words.unwrap_or(0)).map_err(|_| overflow())?;
     let text_tokens = geometry.forced_alignment.map_or(0, |alignment| {
         (alignment.tokens_per_word * words as f32).ceil() as u64
@@ -1085,6 +1108,13 @@ mod tests {
                 );
                 assert_eq!(priced.host_bytes, without.host_bytes);
             }
+            // With the fused kernel, neither the score planes nor the copies.
+            let fused = encoder_layer_bytes(geometry, 1_500, 200, true).unwrap();
+            let scores = 2 * 8 * 1_500 * 200 * 4;
+            assert_eq!(
+                fused + scores + rel_pos,
+                encoder_layer_bytes(geometry, 1_500, 200, false).unwrap()
+            );
         }
         for variant in ENVELOPE_VARIANTS {
             let granite = matches!(
