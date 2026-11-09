@@ -1356,6 +1356,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Encodes concurrent Nemotron 3.5 ASR clips of up to 30 s as one padded batch; false encodes every request alone.",
     ),
     CoreEnvVar::new(
+        "IZWI_NEMOTRON_ASR_ENCODER_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Nemotron 3.5 ASR runs the 24 conformer layers of an offline encode, alone or batched, as a CUDA graph per padded shape: rows up to 1, 2, 3, 4, 6 or 8 and encoder frames up to a power of two, as many as fit 640 MiB of graph working memory (every width of 20 s clips), at most 24 graphs kept, least recently used dropped. Each graph is checked bit for bit against the eager layers on its first two batches; a mismatch or CUDA error turns the graphs off for the process. Loads price 768 MiB for them. Any false value runs every encode eagerly at its unpadded shape; `encode.encoder_graphs` in the diagnostics reports captures, replays, fallbacks and why the graphs are off.",
+    ),
+    CoreEnvVar::new(
         "IZWI_NEMOTRON_METAL_DEPTHWISE_CONV1D",
         Flag,
         "true (Metal only)",

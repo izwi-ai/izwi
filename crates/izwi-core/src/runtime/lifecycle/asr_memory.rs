@@ -88,7 +88,8 @@ use crate::models::architectures::granite_speech5::asr::{
 use crate::models::architectures::lfm25_audio::conformer::lfm25_audio_conformer_projection;
 use crate::models::architectures::lfm25_audio::lfm25_audio_load_layout;
 use crate::models::architectures::nemotron::asr::{
-    nemotron_checkpoint_paths, nemotron_tensor_is_f16_projection, resolve_nemotron_asr_dtype,
+    nemotron_checkpoint_paths, nemotron_encoder_graph_device_bytes,
+    nemotron_tensor_is_f16_projection, resolve_nemotron_asr_dtype,
     resolve_nemotron_projection_precision, NEMOTRON_MODEL_MEMO_MAX_BYTES,
 };
 use crate::models::architectures::parakeet::asr::{
@@ -234,7 +235,10 @@ pub(super) fn residency_plan(
                 .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
         ModelVariant::Nemotron35AsrStreaming06B => {
+            // The offline encoder's CUDA graphs allocate their memory on first use.
+            let graphs = nemotron_encoder_graph_device_bytes(backend);
             nemotron_plan(variant, model_path, device, backend, Precision::Selected)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
         // Plus and base share the loader; the census carries their differences
         // (base: no layer-3 concatenation in the projector, an untied LM head).

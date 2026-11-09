@@ -997,12 +997,14 @@ fn nemotron_preparation_row_cost(
     backend: BackendKind,
 ) -> Result<(crate::engine::WorkCost, u64)> {
     use crate::models::architectures::nemotron::asr::{
-        nemotron_encoder_batch_row_bytes, nemotron_encoder_projection_bytes,
-        nemotron_encoder_row_elements,
+        nemotron_encoder_batch_row_bytes, nemotron_encoder_batch_shape,
+        nemotron_encoder_projection_bytes, nemotron_encoder_row_elements,
     };
     let metal = backend == BackendKind::Metal;
     let encoded_len = features.encoded_len();
-    let device_bytes = nemotron_encoder_batch_row_bytes(padded_frames, rows, metal)?
+    // On CUDA a batch runs at its encoder graph's padded shape.
+    let (batch_rows, padded_frames) = nemotron_encoder_batch_shape(rows, padded_frames, backend);
+    let device_bytes = nemotron_encoder_batch_row_bytes(padded_frames, batch_rows, rows, metal)?
         .checked_add(nemotron_encoder_projection_bytes(encoded_len, metal)?)
         .ok_or_else(|| Error::Overloaded("Nemotron preparation bytes overflowed".into()))?;
     let (useful, materialized) = nemotron_encoder_row_elements(encoded_len, padded_frames)?;

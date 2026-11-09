@@ -15,8 +15,10 @@ use serde_json::json;
 use super::config::NemotronConfigInventory;
 use super::physical::{NEMOTRON_OFFLINE_ACOUSTIC_DOMAIN, NEMOTRON_OFFLINE_PREDICTOR_DOMAIN};
 use crate::backends::state::{InvocationTensorComponentValue, InvocationTensorUpdateV2};
+use crate::backends::BackendKind;
 use crate::engine::InvocationTensorLease;
 use crate::error::{Error, Result};
+use crate::kernels::cuda::shape_graphs::{ShapeGraphLimits, ShapeGraphs};
 use crate::kernels::f16_weight_linear::{
     PointwiseConv1d, ProjectionLinear, F16_PROJECTION_MAX_RELATIVE_L2,
 };
@@ -256,6 +258,10 @@ pub(super) struct NemotronNetwork {
     stream_rel_pos_cache: Mutex<HashMap<StreamingRelPosCacheKey, Tensor>>,
     stream_att_mask_cache: Mutex<HashMap<StreamingMaskCacheKey, Tensor>>,
     dtype: DType,
+    /// CUDA graphs of the conformer layers over a padded offline batch, one
+    /// per `(rows, frames)` shape ([`encoder_graph_shape`]), or why there
+    /// are none.
+    encoder_graphs: std::result::Result<ShapeGraphs<(usize, usize)>, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -410,6 +416,7 @@ impl NemotronNetwork {
             stream_rel_pos_cache: Mutex::new(HashMap::new()),
             stream_att_mask_cache: Mutex::new(HashMap::new()),
             dtype: vb.dtype(),
+            encoder_graphs: resolve_encoder_graphs(vb.device()),
         })
     }
 
@@ -609,7 +616,7 @@ impl NemotronNetwork {
             [] => Err(Error::InvalidInput(
                 "Nemotron encoder batch has no rows".into(),
             )),
-            [row] => {
+            [row] if !self.encoder_graphs_on() => {
                 let (encoded, len) = self.encode_features_profile(
                     row.features.clone(),
                     row.valid_frames,
@@ -618,7 +625,9 @@ impl NemotronNetwork {
                 )?;
                 Ok((encoded, vec![len]))
             }
-            rows => self.encode_padded_rows(rows),
+            rows => {
+                self.encode_padded_rows(rows, |rows, frames| self.encoder_batch_shape(rows, frames))
+            }
         }
     }
 
@@ -633,9 +642,14 @@ impl NemotronNetwork {
     /// frames. Padded frames stay finite (each padded query keeps itself as
     /// a finite key), since a non-finite value times a zero weight would
     /// still poison a sum. The prompt kernel takes each row's own prompt.
+    ///
+    /// `shape` gives the `(rows, frames)` a batch of that many rows whose
+    /// longest has that many frames runs at: an encoder graph's padded shape
+    /// ([`Self::encoder_batch_shape`]) or the batch's own.
     fn encode_padded_rows(
         &self,
         rows: &[NemotronEncoderBatchInput],
+        shape: impl Fn(usize, usize) -> (usize, usize),
     ) -> Result<(Tensor, Vec<usize>)> {
         let mut stems = Vec::with_capacity(rows.len());
         let mut lengths = Vec::with_capacity(rows.len());
@@ -654,7 +668,8 @@ impl NemotronNetwork {
             stems.push(x);
             lengths.push(len);
         }
-        let padded = lengths.iter().copied().max().unwrap_or(0);
+        let longest = lengths.iter().copied().max().unwrap_or(0);
+        let (batch_rows, padded) = shape(rows.len(), longest);
         let stems = stems
             .into_iter()
             .zip(&lengths)
@@ -666,10 +681,17 @@ impl NemotronNetwork {
                 }
             })
             .collect::<Result<Vec<_>>>()?;
-        let x = Tensor::cat(&stems, 0)?;
+        let mut x = Tensor::cat(&stems, 0)?;
         drop(stems);
         let prompt_ids = rows.iter().map(|row| row.prompt_id).collect::<Vec<_>>();
-        let encoded = self.encode_padded_stems(x, &lengths, &prompt_ids)?;
+        // A graph's spare rows are zero stems of full length: every key is
+        // real, so they stay finite, and the prompt kernel never sees them.
+        let mut batch_lengths = lengths.clone();
+        if batch_rows > rows.len() {
+            x = x.pad_with_zeros(0, 0, batch_rows - rows.len())?;
+            batch_lengths.resize(batch_rows, padded);
+        }
+        let encoded = self.encode_padded_stems(x, &batch_lengths, &prompt_ids)?;
         Ok((encoded, lengths))
     }
 
@@ -682,21 +704,93 @@ impl NemotronNetwork {
         lengths: &[usize],
         prompt_ids: &[usize],
     ) -> Result<Tensor> {
-        let padded = x.dim(1)?;
+        let (rows, padded) = (x.dim(0)?, x.dim(1)?);
         let pos_emb = self.rel_positional_embedding(padded, x.dtype(), x.device())?;
-        let att_mask = self
-            .limited_context_mask(
-                padded,
-                self.left_context_frames,
-                self.right_context_frames,
-                x.dtype(),
-                x.device(),
-            )?
-            .broadcast_add(&padded_key_mask(lengths, padded, x.dtype(), x.device())?)?;
-        for layer in &self.layers {
-            x = layer.forward(&x, &pos_emb, &att_mask)?;
+        let limited_mask = self.limited_context_mask(
+            padded,
+            self.left_context_frames,
+            self.right_context_frames,
+            x.dtype(),
+            x.device(),
+        )?;
+        let key_mask = padded_key_mask(lengths, padded, x.dtype(), x.device())?;
+        x = match &self.encoder_graphs {
+            Ok(graphs) if encoder_graph_shape(rows, padded) == Some((rows, padded)) => {
+                // The graph keeps a stable copy of each input and an output
+                // the size of `x`.
+                let inputs = [x, pos_emb, limited_mask, key_mask];
+                let tensor_bytes = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+                let retained =
+                    inputs.iter().map(tensor_bytes).sum::<u64>() + tensor_bytes(&inputs[0]);
+                let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+                    let [x, pos_emb, limited_mask, key_mask] = inputs else {
+                        return Err(Error::InferenceError(format!(
+                            "Nemotron encoder graph received {} inputs, expected 4",
+                            inputs.len()
+                        )));
+                    };
+                    Ok(vec![self.layers_forward(
+                        x.clone(),
+                        pos_emb,
+                        limited_mask,
+                        key_mask,
+                    )?])
+                };
+                graphs
+                    .run((rows, padded), retained, &inputs, &body)?
+                    .pop()
+                    .ok_or_else(|| {
+                        Error::InferenceError("Nemotron encoder graph returned nothing".into())
+                    })?
+            }
+            _ => self.layers_forward(x, &pos_emb, &limited_mask, &key_mask)?,
+        };
+        // A graph's spare rows end here.
+        if prompt_ids.len() < rows {
+            x = x.narrow(0, 0, prompt_ids.len())?;
         }
         self.prompt_kernel.forward_rows(&x, prompt_ids)
+    }
+
+    /// The conformer layers over stem outputs `x` under the chunked-limited
+    /// mask and each row's key mask: the eager form of the encoder graphs.
+    fn layers_forward(
+        &self,
+        mut x: Tensor,
+        pos_emb: &Tensor,
+        limited_mask: &Tensor,
+        key_mask: &Tensor,
+    ) -> Result<Tensor> {
+        let att_mask = limited_mask.broadcast_add(key_mask)?;
+        for layer in &self.layers {
+            x = layer.forward(&x, pos_emb, &att_mask)?;
+        }
+        Ok(x)
+    }
+
+    /// Whether offline batches run through the CUDA encoder graphs: on CUDA
+    /// with the graphs switched on and no graph failure yet.
+    fn encoder_graphs_on(&self) -> bool {
+        self.encoder_graphs.as_ref().is_ok_and(ShapeGraphs::is_on)
+    }
+
+    /// The `(rows, frames)` a batch of `rows` rows whose longest has
+    /// `frames` encoder frames runs at: its graph's shape while the graphs
+    /// are on (at most what admission priced, [`nemotron_encoder_batch_shape`]),
+    /// else as given.
+    fn encoder_batch_shape(&self, rows: usize, frames: usize) -> (usize, usize) {
+        if self.encoder_graphs_on() {
+            encoder_graph_shape(rows, frames).unwrap_or((rows, frames))
+        } else {
+            (rows, frames)
+        }
+    }
+
+    pub(super) fn encoder_graphs_diagnostics(&self) -> serde_json::Value {
+        match &self.encoder_graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => json!({ "off": reason }),
+        }
     }
 
     fn encode_preencoded_with_prompt(
@@ -3122,8 +3216,9 @@ pub(crate) fn nemotron_stem_bytes(feature_frames: usize) -> Result<u64> {
     .ok_or_else(|| Error::Overloaded("Nemotron stem bytes overflowed".into()))
 }
 
-/// Peak device bytes of one row's share of an offline encoder batch of
-/// `rows` rows padded to `padded` encoder frames: the stem runs row by row,
+/// Peak device bytes of one real row's share of an offline encoder batch of
+/// `batch_rows` rows padded to `padded` encoder frames, `rows` of them real
+/// (the rest pad it to a graph's width and pay nothing): the stem runs row by row,
 /// so its planes count once per batch; the attention scores and masks, the
 /// `rel_shift` buffers, the positional projection copied for every row, a
 /// layer's per-frame activations, the prompt kernel and the joint encoder
@@ -3131,9 +3226,19 @@ pub(crate) fn nemotron_stem_bytes(feature_frames: usize) -> Result<u64> {
 /// buffer up to a power of two.
 pub(crate) fn nemotron_encoder_batch_row_bytes(
     padded: usize,
+    batch_rows: usize,
     rows: usize,
     metal: bool,
 ) -> Result<u64> {
+    let rows = u64::try_from(rows.clamp(1, batch_rows.max(1)))
+        .map_err(|_| Error::Overloaded("Nemotron preparation bytes overflowed".into()))?;
+    Ok(nemotron_encoder_batch_bytes(padded, batch_rows, metal)?.div_ceil(rows))
+}
+
+/// Peak device bytes of an offline encoder batch of `rows` rows padded to
+/// `padded` encoder frames, as [`nemotron_encoder_batch_row_bytes`] shares
+/// them out.
+fn nemotron_encoder_batch_bytes(padded: usize, rows: usize, metal: bool) -> Result<u64> {
     const F32_BYTES: u64 = 4;
     // About six [T, ff_dim] activations are live inside a layer at once:
     // the feed-forward block's linear, swish and product, plus residual and
@@ -3182,11 +3287,92 @@ pub(crate) fn nemotron_encoder_batch_row_bytes(
         ])?,
         round(multiply(&[rows, t, as_u64(JOINT_HIDDEN)?, F32_BYTES])?)?,
     ];
-    let batch = terms
+    terms
         .into_iter()
         .try_fold(0u64, |total, bytes| total.checked_add(bytes))
-        .ok_or_else(overflow)?;
-    Ok(batch.div_ceil(rows))
+        .ok_or_else(overflow)
+}
+
+/// Kill switch for the offline encoder's CUDA graphs (a boolean; on when
+/// unset). Read once: admission prices the graphed shapes from it, and the
+/// encoder captures them.
+pub(crate) const NEMOTRON_ENCODER_GRAPHS_ENV: &str = "IZWI_NEMOTRON_ASR_ENCODER_GRAPHS";
+
+fn encoder_graphs_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(NEMOTRON_ENCODER_GRAPHS_ENV, true));
+    ON.get()
+}
+
+/// Batch widths the encoder graphs are captured at, up to the CUDA encoder
+/// stage's width of 8. A graphed batch pads its rows up to the next, so a
+/// busy server's varying widths share six graphs per length bucket.
+const ENCODER_GRAPH_ROWS: [usize; 6] = [1, 2, 3, 4, 6, 8];
+
+const MIB: u64 = 1024 * 1024;
+
+/// What the encoder graphs may hold. The pool budget bounds a graph's
+/// working set, the whole batch's peak as [`nemotron_encoder_batch_bytes`]
+/// prices it at F32 (twice what a BF16 encoder holds): every width of 20 s
+/// clips (256 frames), 4 rows of 41 s and a lone 82 s clip are graphed. The
+/// retained budget holds the kept graphs' input copies and outputs: about
+/// 9 MiB for 8 rows of 256 frames in BF16.
+const ENCODER_GRAPH_LIMITS: ShapeGraphLimits = ShapeGraphLimits {
+    max_graphs: 24,
+    retained_bytes: 128 * MIB,
+    pool_bytes: 640 * MIB,
+};
+
+/// Device bytes a load on `backend` prices for the encoder graphs, which
+/// allocate lazily on their first batches: zero off CUDA or with the graphs
+/// switched off.
+pub(crate) fn nemotron_encoder_graph_device_bytes(backend: BackendKind) -> u64 {
+    if backend == BackendKind::Cuda && encoder_graphs_requested() {
+        ENCODER_GRAPH_LIMITS.device_bytes()
+    } else {
+        0
+    }
+}
+
+/// The offline encoder's CUDA graphs on `device`, or why it has none.
+fn resolve_encoder_graphs(
+    device: &Device,
+) -> std::result::Result<ShapeGraphs<(usize, usize)>, String> {
+    if encoder_graphs_requested() {
+        ShapeGraphs::resolve("Nemotron encoder", device, ENCODER_GRAPH_LIMITS)
+    } else {
+        Err(format!("{NEMOTRON_ENCODER_GRAPHS_ENV} is off"))
+    }
+}
+
+/// The `(rows, frames)` a graph runs an offline batch of `rows` rows whose
+/// longest has `frames` encoder frames at: rows up to the next graph width,
+/// frames up to a power of two, which the batcher's length bucket already
+/// is. `None` past 8 rows or past the pool budget.
+fn encoder_graph_shape(rows: usize, frames: usize) -> Option<(usize, usize)> {
+    let rows = ENCODER_GRAPH_ROWS
+        .into_iter()
+        .find(|width| *width >= rows.max(1))?;
+    let frames = frames.max(1).checked_next_power_of_two()?;
+    let bytes = nemotron_encoder_batch_bytes(frames, rows, false).ok()?;
+    (bytes <= ENCODER_GRAPH_LIMITS.pool_bytes).then_some((rows, frames))
+}
+
+/// The `(rows, frames)` an offline encoder batch of `rows` rows padded to
+/// `frames` frames runs at on `backend`: a graph's shape on CUDA with the
+/// encoder graphs on, else as given. Admission prices this shape; the
+/// encoder runs it, or the given one once its graphs are off.
+pub(crate) fn nemotron_encoder_batch_shape(
+    rows: usize,
+    frames: usize,
+    backend: BackendKind,
+) -> (usize, usize) {
+    if backend == BackendKind::Cuda && encoder_graphs_requested() {
+        if let Some(shape) = encoder_graph_shape(rows, frames) {
+            return shape;
+        }
+    }
+    (rows, frames)
 }
 
 /// Useful and materialized encoder-output elements of a row of
@@ -4999,6 +5185,7 @@ pub(super) mod tests {
             stream_rel_pos_cache: Mutex::new(HashMap::new()),
             stream_att_mask_cache: Mutex::new(HashMap::new()),
             dtype: DType::F32,
+            encoder_graphs: Err("test network".into()),
         }
     }
 
@@ -6426,6 +6613,192 @@ pub(super) mod tests {
             assert!(projected[row].is_contiguous());
         }
         eprintln!("Nemotron batched vs solo encode: worst relative difference {worst:e}");
+    }
+
+    /// A batch padded to an encoder graph's shape (spare rows of zero stems,
+    /// frames to a power of two) encodes each real row as the unpadded batch
+    /// does, to the batched bound; a lone row padded to its graph's shape
+    /// encodes as it does alone.
+    #[test]
+    fn graph_padded_batches_encode_their_real_rows_unchanged() {
+        let network = hashed_batch_network(&Device::Cpu, false);
+        let rows = BATCH_ROWS[..3]
+            .iter()
+            .enumerate()
+            .map(|(row, (valid, prompt))| {
+                hashed_batch_input(500 + row as u32, *valid, *prompt, &Device::Cpu)
+            })
+            .collect::<Vec<_>>();
+        let graph_shape = |rows: usize, frames: usize| encoder_graph_shape(rows, frames).unwrap();
+        assert_eq!(graph_shape(3, 28), (3, 32));
+        let (padded, padded_lengths) = network.encode_padded_rows(&rows, graph_shape).unwrap();
+        let (eager, lengths) = network
+            .encode_padded_rows(&rows, |rows, frames| (rows, frames))
+            .unwrap();
+        assert_eq!(padded_lengths, lengths);
+        assert_eq!(padded.dims(), [3, 32, ENCODER_DIM]);
+        assert_eq!(eager.dims(), [3, 28, ENCODER_DIM]);
+        for (row, len) in lengths.iter().enumerate() {
+            let alone = eager.i((row, ..*len, ..)).unwrap();
+            let difference = max_abs_difference(&padded.i((row, ..*len, ..)).unwrap(), &alone);
+            let bound = 4e-6 * max_abs_of(&alone).max(1.0);
+            assert!(
+                difference <= bound,
+                "row {row}: {difference:e} above {bound:e}"
+            );
+        }
+        let lone = std::slice::from_ref(&rows[1]);
+        let (padded, lengths) = network.encode_padded_rows(lone, graph_shape).unwrap();
+        assert_eq!(padded.dims(), [1, 16, ENCODER_DIM]);
+        let solo = network.encode_batch_with_prompts(lone).unwrap().remove(0);
+        let difference = max_abs_difference(&padded.i((0, ..lengths[0], ..)).unwrap(), &solo);
+        let bound = 4e-6 * max_abs_of(&solo).max(1.0);
+        assert!(
+            difference <= bound,
+            "lone row: {difference:e} above {bound:e}"
+        );
+    }
+
+    #[test]
+    fn encoder_graph_shapes_pad_rows_to_a_width_and_frames_to_a_power_of_two() {
+        assert_eq!(encoder_graph_shape(1, 126), Some((1, 128)));
+        assert_eq!(encoder_graph_shape(0, 0), Some((1, 1)));
+        assert_eq!(encoder_graph_shape(5, 64), Some((6, 64)));
+        // Every width of 20 s clips, 4 rows of 41 s, a lone 82 s clip.
+        assert_eq!(encoder_graph_shape(7, 250), Some((8, 256)));
+        assert_eq!(encoder_graph_shape(4, 375), Some((4, 512)));
+        assert_eq!(encoder_graph_shape(1, 1000), Some((1, 1024)));
+        assert_eq!(encoder_graph_shape(9, 8), None, "past the stage width");
+        assert_eq!(encoder_graph_shape(5, 375), None, "6 rows of 512 frames");
+        assert_eq!(encoder_graph_shape(2, 1000), None);
+        for rows in ENCODER_GRAPH_ROWS {
+            for frames in (0..=11).map(|exp| 1usize << exp) {
+                let Some(shape) = encoder_graph_shape(rows, frames) else {
+                    continue;
+                };
+                assert_eq!(shape, (rows, frames), "a graph's shape is its own");
+                let bytes = nemotron_encoder_batch_bytes(frames, rows, false).unwrap();
+                assert!(bytes <= ENCODER_GRAPH_LIMITS.pool_bytes);
+            }
+        }
+        // The retained budget holds a full-width 20 s graph's copies at F32.
+        let copies =
+            (2 * 8 * 256 * ENCODER_DIM + (2 * 256 - 1) * ENCODER_DIM + 256 * 256 + 8 * 256) * 4;
+        assert!((copies as u64) * 4 <= ENCODER_GRAPH_LIMITS.retained_bytes);
+    }
+
+    /// Admission prices the graphed shape on CUDA only, each real row
+    /// carrying its share of the padded batch; the graphs' own memory is a
+    /// CUDA load's.
+    #[test]
+    fn cuda_admission_prices_the_graphed_shape() {
+        // Pricing and the encoder read `IZWI_NEMOTRON_ASR_ENCODER_GRAPHS`.
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(nemotron_encoder_graph_device_bytes(BackendKind::Cpu), 0);
+        assert_eq!(nemotron_encoder_graph_device_bytes(BackendKind::Metal), 0);
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            assert_eq!(nemotron_encoder_batch_shape(5, 100, backend), (5, 100));
+        }
+        if !encoder_graphs_requested() {
+            assert_eq!(nemotron_encoder_graph_device_bytes(BackendKind::Cuda), 0);
+            assert_eq!(
+                nemotron_encoder_batch_shape(5, 100, BackendKind::Cuda),
+                (5, 100)
+            );
+            return;
+        }
+        assert_eq!(
+            nemotron_encoder_graph_device_bytes(BackendKind::Cuda),
+            768 << 20
+        );
+        assert_eq!(
+            nemotron_encoder_batch_shape(5, 100, BackendKind::Cuda),
+            (6, 128)
+        );
+        assert_eq!(
+            nemotron_encoder_batch_shape(5, 375, BackendKind::Cuda),
+            (5, 375)
+        );
+        for rows in [1usize, 3, 5, 8, 9] {
+            let (batch_rows, frames) = nemotron_encoder_batch_shape(rows, 100, BackendKind::Cuda);
+            let batch = nemotron_encoder_batch_bytes(frames, batch_rows, false).unwrap();
+            let row = nemotron_encoder_batch_row_bytes(frames, batch_rows, rows, false).unwrap();
+            let eager = nemotron_encoder_batch_row_bytes(100, rows, rows, false).unwrap();
+            assert!(row * rows as u64 >= batch, "{rows} rows");
+            assert!(row >= eager, "{rows} rows");
+        }
+    }
+
+    /// On CUDA the encoder graphs return the eager padded batch bit for bit
+    /// through capture, verification and replay, over fresh inputs.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_encoder_graphs_match_the_eager_padded_batch() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let mut graphed = hashed_batch_network(&device, false);
+        graphed.encoder_graphs = ShapeGraphs::resolve("test", &device, ENCODER_GRAPH_LIMITS);
+        let eager = hashed_batch_network(&device, false);
+        let shape = |rows: usize, frames: usize| encoder_graph_shape(rows, frames).unwrap();
+        let bits = |t: &Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        for step in 0..4u32 {
+            let rows = BATCH_ROWS[..3]
+                .iter()
+                .enumerate()
+                .map(|(row, (valid, prompt))| {
+                    hashed_batch_input(600 + 10 * step + row as u32, *valid, *prompt, &device)
+                })
+                .collect::<Vec<_>>();
+            let (out, _) = graphed.encode_rows(&rows).unwrap();
+            let (expected, _) = eager.encode_padded_rows(&rows, shape).unwrap();
+            assert_eq!(bits(&out), bits(&expected), "step {step}");
+        }
+        let diagnostics = graphed.encoder_graphs_diagnostics();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        assert_eq!(diagnostics["captures"], 1, "{diagnostics}");
+        assert_eq!(diagnostics["verified"], 1, "{diagnostics}");
+        assert_eq!(diagnostics["replays"], 2, "{diagnostics}");
+    }
+
+    /// `IZWI_NEMOTRON_ASR_ENCODER_GRAPHS=0` reaches admission (no graph
+    /// memory, the eager shape) and the loader (no graphs, naming the
+    /// switch); off CUDA there are never graphs.
+    #[test]
+    fn the_kill_switch_turns_the_encoder_graphs_and_their_pricing_off() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(NEMOTRON_ENCODER_GRAPHS_ENV);
+        std::env::set_var(NEMOTRON_ENCODER_GRAPHS_ENV, "0");
+        let bytes = nemotron_encoder_graph_device_bytes(BackendKind::Cuda);
+        let shape = nemotron_encoder_batch_shape(5, 100, BackendKind::Cuda);
+        let reason = resolve_encoder_graphs(&Device::Cpu).err();
+        std::env::remove_var(NEMOTRON_ENCODER_GRAPHS_ENV);
+        let cpu = resolve_encoder_graphs(&Device::Cpu).err();
+        if let Some(previous) = previous {
+            std::env::set_var(NEMOTRON_ENCODER_GRAPHS_ENV, previous);
+        }
+        assert_eq!(bytes, 0);
+        assert_eq!(shape, (5, 100));
+        let reason = reason.expect("no graphs");
+        assert!(reason.contains(NEMOTRON_ENCODER_GRAPHS_ENV), "{reason}");
+        assert!(cpu.expect("no graphs on CPU").contains("CUDA only"));
+        let network = hashed_batch_network(&Device::Cpu, false);
+        assert!(!network.encoder_graphs_on());
+        assert_eq!(network.encoder_batch_shape(5, 100), (5, 100));
     }
 
     /// Whatever the padded stem frames hold, the real frames encode

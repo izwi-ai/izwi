@@ -47,7 +47,8 @@ use network::{
     NemotronStreamingPreEncodeState,
 };
 pub(crate) use network::{
-    nemotron_encoder_batch_row_bytes, nemotron_encoder_projection_bytes,
+    nemotron_encoder_batch_row_bytes, nemotron_encoder_batch_shape,
+    nemotron_encoder_graph_device_bytes, nemotron_encoder_projection_bytes,
     nemotron_encoder_row_elements, nemotron_stem_bytes, NEMOTRON_MODEL_MEMO_MAX_BYTES,
 };
 pub(crate) use physical::{NemotronOfflinePhysicalStateSpec, NEMOTRON_OFFLINE_GROUP};
@@ -2567,6 +2568,7 @@ impl NemotronAsrModel {
                 "feature_frames": artifact.feature_frames,
                 "encoded_frames": artifact.encoded_len,
                 "encoder_batch_rows": artifact.batch_rows,
+                "encoder_graphs": self.network.encoder_graphs_diagnostics(),
             },
             "prompt": artifact.prompt.diagnostics(),
             "prompt_id": artifact.prompt_id,
