@@ -1297,12 +1297,15 @@ impl ModelLifecycleController {
             .explicit_tokens()
             .unwrap_or(nemotron.max_context_tokens())
             .min(nemotron.max_context_tokens());
+        // The one context is the pool every row's automatic 30 s request
+        // claims from (32 of them fit), so it loads as given rather than
+        // pooled again per row.
         let retained = self
             .core_engine
-            .load_managed_model_state_with_rows(
+            .load_pooled_managed_model_state_with_rows(
                 model_instance_id,
                 &contract,
-                Some(context),
+                context,
                 self.asr_state_rows(bundle_draft)?,
                 asr_minimum_tokens(variant),
                 state_fit_reserve,
