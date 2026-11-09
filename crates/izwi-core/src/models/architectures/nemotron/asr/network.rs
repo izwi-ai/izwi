@@ -6777,13 +6777,14 @@ pub(super) mod tests {
         let pos_emb = build_rel_positional_embedding(len, ENCODER_DIM, &Device::Cpu).unwrap();
         let mask = build_limited_context_mask(len, 56, 13, &Device::Cpu).unwrap();
         let reference = hashed_conformer_layer()
-            .forward(&x, &pos_emb, &mask)
+            .forward(&x, &pos_emb, &AttentionKeys::solo(&mask, 56, 13))
             .unwrap();
+        let metal_mask = mask.to_device(&device).unwrap();
         let on_metal = layer
             .forward(
                 &x.to_device(&device).unwrap(),
                 &pos_emb.to_device(&device).unwrap(),
-                &mask.to_device(&device).unwrap(),
+                &AttentionKeys::solo(&metal_mask, 56, 13),
             )
             .unwrap();
         let rel = relative_l2_of(&on_metal, &reference);
