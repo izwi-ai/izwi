@@ -3678,6 +3678,12 @@ pub(crate) fn cuda_ptx_depthwise_conv() -> &'static str {
     cuda_ptx::DEPTHWISE_CONV
 }
 
+/// The PTX of `kernels/cuda/relpos_attention.cu` (`kernels::relpos_attention`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_relpos_attention() -> &'static str {
+    cuda_ptx::RELPOS_ATTENTION
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

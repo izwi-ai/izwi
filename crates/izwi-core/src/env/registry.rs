@@ -343,6 +343,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Chooses CUDA block-FP8 projection backend: auto, q8 or native_fp8; invalid = startup error.",
     ),
     CoreEnvVar::new(
+        "IZWI_CUDA_RELPOS_ATTENTION",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, runs the relative-position self-attention of the conformer ASR encoders (Transformer-XL in Parakeet and Nemotron ASR, Shaw block-local in Granite Speech 4.1 and 5.0) as one kernel per layer that scores only each query's visible keys, instead of the eager matmuls, rel_shift copies, masks and softmax, after a per-device self-check against the eager composition within its tolerance (off for the device, with the reason in the encoders' diagnostics, on any failure). Admission then prices the encoders without the eager score planes. Any false value keeps the eager attention.",
+    ),
+    CoreEnvVar::new(
         "IZWI_CUDA_RUNTIME_ACTIVE",
         Flag,
         "false",
@@ -2432,6 +2439,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "backend default",
         Load,
         "Overrides the Qwen3-TTS model dtype (e.g. f32, f16, bf16); does not inherit IZWI_QWEN_DTYPE.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_RELPOS_ATTENTION_EMULATOR_DIR",
+        Path,
+        "unset (test skipped)",
+        TestHarness,
+        "Directory the ignored kernels::relpos_attention emulator test writes every self-check call to (inputs and the host reference's output), for the C++ harness that runs kernels/cuda/relpos_attention.cu thread by thread on a machine without a GPU.",
     ),
     CoreEnvVar::new(
         "IZWI_REQUEST_PARALLELISM",

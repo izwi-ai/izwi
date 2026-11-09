@@ -20,6 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=src/kernels/cuda/race_sampler.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/swiglu.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/depthwise_conv.cu");
+    println!("cargo:rerun-if-changed=src/kernels/cuda/relpos_attention.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return Ok(());
@@ -52,6 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "src/kernels/cuda/race_sampler.cu",
             "src/kernels/cuda/swiglu.cu",
             "src/kernels/cuda/depthwise_conv.cu",
+            "src/kernels/cuda/relpos_attention.cu",
         ])
         .arg("-std=c++17")
         .arg("-O3")
