@@ -119,6 +119,7 @@ use crate::models::architectures::vibevoice::asr::{
     vibevoice_asr_weight_dtype, vibevoice_tensor_is_f16_tokenizer_projection,
     vibevoice_tensor_is_language_model,
 };
+use crate::models::architectures::voxtral::decode_graph::voxtral_decode_graph_device_bytes;
 use crate::models::architectures::voxtral::realtime::model::{
     voxtral_realtime_weight_dtype, voxtral_realtime_weight_files,
 };
@@ -283,7 +284,13 @@ pub(super) fn residency_plan(
         _ if variant.family() == ModelFamily::NemotronTranscribeAsr => {
             nemotron_transcribe_plan(model_path, backend)
         }
-        ModelVariant::VoxtralMini4BRealtime2602 => voxtral_plan(model_path, device, backend),
+        ModelVariant::VoxtralMini4BRealtime2602 => {
+            // The language model's CUDA decode graphs allocate their memory
+            // on first use.
+            let graphs = voxtral_decode_graph_device_bytes(backend);
+            voxtral_plan(model_path, device, backend)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
+        }
         ModelVariant::Lfm25Audio15BGguf => lfm25_audio_plan(model_path, backend),
         // Priced here, but not an ASR variant: the aligner is stateless and
         // has no request floor or state fit.

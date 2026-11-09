@@ -2728,6 +2728,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the VibeVoice TTS weight dtype (e.g. f32, f16, bf16); also used by load memory planning.",
     ),
     CoreEnvVar::new(
+        "IZWI_VOXTRAL_DECODE_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Voxtral's language model replays each decode step of its realtime rows (live streams and offline rows alike), from the frame embeddings to the logits, as one CUDA graph per padded width (1, 2, 3, 4, 6, 8, 12, 16, 24 or 32 rows), attention on the split decode with row-invariant partitions. Each graph is checked bit for bit against the eager body on its first two steps, and a width's first step against the standard decode (relative L2 within 0.05, same greedy token per row); a mismatch or CUDA error turns the graphs off for the process. Loads price 256 MiB for them. Any false value (or cuda.decode_graphs=off) keeps the standard decode; `execution.decode_graph` in the diagnostics reports captures, replays and why the graphs are off.",
+    ),
+    CoreEnvVar::new(
         "IZWI_VOXTRAL_DTYPE",
         Choice,
         "backend default",

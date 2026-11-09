@@ -1126,7 +1126,9 @@ impl VoxtralRealtimeModel {
                         .filter(|(_, advance)| **advance)
                         .map(|(row, _)| &mut *row.cache)
                         .collect::<Vec<_>>();
-                    if width == 1 {
+                    // With the decode graphs on, a lone row decodes through the
+                    // width-1 graph.
+                    if width == 1 && !self.language_model.decode_graph_on() {
                         self.language_model.forward_managed_with_embeds(
                             &embeds,
                             positions[0],
@@ -2218,6 +2220,7 @@ impl VoxtralRealtimeModel {
                 "precision": self.precision.diagnostics(),
                 "flash_attention_requested": flash_attention_requested(),
                 "flash_attention_compiled": flash_attention_compiled(),
+                "decode_graph": self.language_model.decode_graph_diagnostics(),
                 "cache": cache,
                 "timings_ms": timings.map(VoxtralRealtimeTimings::to_json)
             },

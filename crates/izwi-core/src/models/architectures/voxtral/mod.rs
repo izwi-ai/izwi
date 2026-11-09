@@ -15,6 +15,7 @@ use crate::kv::v2::{
     WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
 };
 
+pub(crate) mod decode_graph;
 mod layers;
 pub mod lm;
 pub mod realtime;
