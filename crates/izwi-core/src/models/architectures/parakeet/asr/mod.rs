@@ -1,4 +1,5 @@
 mod decode;
+mod device_decode;
 pub(crate) mod metal_kernels;
 mod nemo;
 mod physical;
@@ -961,6 +962,9 @@ pub(crate) struct ParakeetRetainedDecodeBatchRow<'a> {
     /// The request's decode budget. The scheduler stops scheduling a row at
     /// this many tokens, so the row must finish here rather than strand.
     pub(crate) max_tokens: usize,
+    /// Tokens this engine step may emit for the row (the scheduler's
+    /// quantum, at least one). The eager step emits at most one.
+    pub(crate) quota: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1536,6 +1540,15 @@ impl ParakeetAsrModel {
             ));
         }
         let checkpoints = rows.iter().map(|row| row.state.clone()).collect::<Vec<_>>();
+        if self.device_decode_on() {
+            let result = self.retained_decode_step_batch_device(rows);
+            if result.is_err() {
+                for (row, checkpoint) in rows.iter_mut().zip(checkpoints) {
+                    *row.state = checkpoint;
+                }
+            }
+            return result;
+        }
         let result = (|| {
             loop {
                 let encoded_rows = rows
@@ -1625,46 +1638,7 @@ impl ParakeetAsrModel {
                             outputs.narrow(0, cohort_index, 1)?.contiguous()?;
                     }
                 }
-                let mut steps = Vec::with_capacity(rows.len());
-                for row in rows.iter_mut() {
-                    let mut delta = row
-                        .state
-                        .detokenizer
-                        .step(&row.state.token_ids, |ids| Ok(self.decoder.decode(ids)))?;
-                    let guard_limit = row
-                        .artifact
-                        .encoded_len
-                        .saturating_mul(self.max_symbols)
-                        .saturating_mul(8)
-                        .max(512);
-                    let tokens = row.state.token_ids.len();
-                    // Every frame emitting `max_symbols` labels exhausts the
-                    // input as surely as the cursor passing its end does.
-                    let exhausted = row.state.cursor.t >= row.artifact.encoded_len
-                        || tokens >= row.artifact.encoded_len.saturating_mul(self.max_symbols);
-                    let budget_reached = !exhausted && tokens >= row.max_tokens.max(1);
-                    if budget_reached {
-                        row.state.stop_reason = Some("max_tokens");
-                    }
-                    row.state.finished =
-                        exhausted || budget_reached || row.state.cursor.guard_steps >= guard_limit;
-                    if row.state.finished {
-                        delta.push_str(
-                            &row.state
-                                .detokenizer
-                                .finish(&row.state.token_ids, |ids| Ok(self.decoder.decode(ids)))?,
-                        );
-                    }
-                    row.state.assembled.push_str(&delta);
-                    row.state.counters.detokenized_tokens = row.state.detokenizer.decoded_tokens();
-                    row.state.counters.tdt_emitted_tokens = tokens;
-                    steps.push(ParakeetRetainedDecodeStep {
-                        delta,
-                        text: row.state.assembled.clone(),
-                        tokens_generated: row.state.token_ids.len(),
-                        finished: row.state.finished,
-                    });
-                }
+                let steps = self.retained_decode_steps(rows)?;
                 // A scheduler quantum produces at most one token per row, but
                 // blank-only joint evaluations are consumed inside that
                 // quantum. This matches the original greedy decoder and
@@ -1680,6 +1654,56 @@ impl ParakeetAsrModel {
             }
         }
         result
+    }
+
+    /// Each row's step after its joint steps: the detokenized delta and
+    /// text, and whether it finished (its cursor past its frames, every frame
+    /// at `max_symbols` labels, its token budget, or the joint-step limit).
+    fn retained_decode_steps(
+        &self,
+        rows: &mut [ParakeetRetainedDecodeBatchRow<'_>],
+    ) -> Result<Vec<ParakeetRetainedDecodeStep>> {
+        let mut steps = Vec::with_capacity(rows.len());
+        for row in rows.iter_mut() {
+            let mut delta = row
+                .state
+                .detokenizer
+                .step(&row.state.token_ids, |ids| Ok(self.decoder.decode(ids)))?;
+            let guard_limit = row
+                .artifact
+                .encoded_len
+                .saturating_mul(self.max_symbols)
+                .saturating_mul(8)
+                .max(512);
+            let tokens = row.state.token_ids.len();
+            // Every frame emitting `max_symbols` labels exhausts the
+            // input as surely as the cursor passing its end does.
+            let exhausted = row.state.cursor.t >= row.artifact.encoded_len
+                || tokens >= row.artifact.encoded_len.saturating_mul(self.max_symbols);
+            let budget_reached = !exhausted && tokens >= row.max_tokens.max(1);
+            if budget_reached {
+                row.state.stop_reason = Some("max_tokens");
+            }
+            row.state.finished =
+                exhausted || budget_reached || row.state.cursor.guard_steps >= guard_limit;
+            if row.state.finished {
+                delta.push_str(
+                    &row.state
+                        .detokenizer
+                        .finish(&row.state.token_ids, |ids| Ok(self.decoder.decode(ids)))?,
+                );
+            }
+            row.state.assembled.push_str(&delta);
+            row.state.counters.detokenized_tokens = row.state.detokenizer.decoded_tokens();
+            row.state.counters.tdt_emitted_tokens = tokens;
+            steps.push(ParakeetRetainedDecodeStep {
+                delta,
+                text: row.state.assembled.clone(),
+                tokens_generated: row.state.token_ids.len(),
+                finished: row.state.finished,
+            });
+        }
+        Ok(steps)
     }
 
     /// The encoder's projection precision for diagnostics: weight-only F16
@@ -2082,6 +2106,7 @@ fn parakeet_diagnostics_json(
             "cuda_depthwise_conv1d_kernel": crate::kernels::depthwise_conv::prepare_cuda_kernel(device),
             "cuda_depthwise_conv1d_kernel_calls_total": crate::kernels::depthwise_conv::depthwise_conv1d_cuda_kernel_calls(),
             "cuda_relpos_attention": relpos_attention::diagnostics(device),
+            "cuda_transducer_decode": device_decode::device_decode_diagnostics(device),
         },
         "timings_ms": {
             "resample": timings.resample_ms,
@@ -3608,6 +3633,8 @@ impl Predictor {
         let lstm_l0 = LstmCell::load(vb.pp("dec_rnn.lstm"), 0)?;
         let lstm_l1 = LstmCell::load(vb.pp("dec_rnn.lstm"), 1)?;
 
+        // The device decode's select kernel checks itself at load.
+        crate::kernels::transducer_greedy::prepare_cuda_kernel(vb.device());
         Ok(Self {
             embed,
             lstm_l0,
@@ -4016,6 +4043,20 @@ fn tdt_batch_labels_and_durations(
             "Parakeet TDT joint output of width {width} cannot hold {token_end} token and {num_durations} duration logits"
         )));
     }
+    if logits.device().is_cuda() {
+        // Ties to the lowest id and NaN never picked, as the device decode's
+        // select step and the CPU's argmax pick (Candle's CUDA argmax breaks
+        // ties by its strided reduction).
+        use crate::kernels::greedy::greedy_packed;
+        let labels = greedy_packed(&logits.narrow(1, 0, token_end)?.contiguous()?)?;
+        let durations = greedy_packed(&logits.narrow(1, token_end, num_durations)?.contiguous()?)?;
+        crate::models::shared::telemetry::record_host_read(DType::U32, 4 * rows);
+        let picks = Tensor::cat(&[labels, durations], 1)?.to_vec2::<u32>()?;
+        return Ok(picks
+            .iter()
+            .map(|pick| (pick[0] as usize, pick[2] as usize))
+            .collect());
+    }
     let labels = logits.narrow(1, 0, token_end)?.argmax(D::Minus1)?;
     let durations = logits
         .narrow(1, token_end, num_durations)?
@@ -4091,6 +4132,10 @@ mod tests {
         /// Runs the conformer attention through the fused kernel's host
         /// reference (see `fused_attention_on_the_host`).
         pub(super) static FUSED_ATTENTION_ON_THE_HOST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Runs the retained decode's dispatches with the select step on
+        /// the host (see `device_decode::host_select`).
+        pub(super) static DEVICE_DECODE_ON_THE_HOST: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
     }
     use crate::backends::{BackendKind, DTypeSelection};
@@ -4510,6 +4555,7 @@ mod tests {
                 artifact,
                 state: &mut state,
                 max_tokens,
+                quota: 1,
             }];
             steps.extend(model.retained_decode_step_batch(&mut rows).unwrap());
         }
@@ -4518,6 +4564,138 @@ mod tests {
             .diagnostics
             .unwrap();
         (steps, diagnostics)
+    }
+
+    /// A TDT model whose picks depend on the encoder frames and the
+    /// predictor state: random predictor, joint and embeddings, labels
+    /// `[0, 4)`, blank 4 and durations `0..5`.
+    fn random_decoder_model(device: &Device, seed: u64) -> ParakeetAsrModel {
+        let mut rng = XorShift(seed);
+        let mut tensor = |shape: &[usize], scale: f32| {
+            let len = shape.iter().product();
+            Tensor::from_vec(rng.values(len, scale, 0.0), shape, device).unwrap()
+        };
+        let mut lstm = || LstmCell {
+            w_ih: tensor(&[PRED_HIDDEN * 4, PRED_HIDDEN], 0.05),
+            w_hh: tensor(&[PRED_HIDDEN * 4, PRED_HIDDEN], 0.05),
+            b_ih: tensor(&[PRED_HIDDEN * 4], 0.1),
+            b_hh: tensor(&[PRED_HIDDEN * 4], 0.1),
+        };
+        let (lstm_l0, lstm_l1) = (lstm(), lstm());
+        let predictor = Predictor {
+            embed: tensor(&[5, PRED_HIDDEN], 1.0),
+            lstm_l0,
+            lstm_l1,
+            blank_idx: 4,
+        };
+        let joint = Joint {
+            pred: Linear::new(tensor(&[PRED_HIDDEN, PRED_HIDDEN], 0.05), None),
+            enc: Linear::new(tensor(&[PRED_HIDDEN, TINY.dim], 0.3), None),
+            out: Linear::new(tensor(&[10, PRED_HIDDEN], 0.1), Some(tensor(&[10], 0.5))),
+            num_classes_with_blank: 5,
+            num_durations: 5,
+        };
+        let mut model = forced_label_model(device);
+        model.network.predictor = predictor;
+        model.network.joint = joint;
+        model.network.blank_idx = 4;
+        model.network.num_durations = 5;
+        model.blank_idx = 4;
+        model.num_durations = 5;
+        model.decoder = ParakeetDecoder::Vocab(
+            ["\u{2581}a", "\u{2581}b", "c", "\u{2581}d"]
+                .map(String::from)
+                .to_vec(),
+        );
+        model
+    }
+
+    /// Decodes `artifacts` as one retained cohort (finished rows leave it)
+    /// until every row finishes: each row's tokens, frames, text and joint
+    /// and blank steps.
+    fn decode_cohort(
+        model: &ParakeetAsrModel,
+        artifacts: &[ParakeetPreparedEncoderArtifact],
+        max_tokens: &[usize],
+        quota: usize,
+    ) -> Vec<(Vec<usize>, Vec<TdtTokenFrame>, String, usize, usize)> {
+        let mut states = artifacts
+            .iter()
+            .map(|_| model.start_retained_decode().unwrap())
+            .collect::<Vec<_>>();
+        for _ in 0..10_000 {
+            let mut rows = states
+                .iter_mut()
+                .zip(artifacts)
+                .zip(max_tokens)
+                .filter(|((state, _), _)| !state.finished)
+                .map(
+                    |((state, artifact), max_tokens)| ParakeetRetainedDecodeBatchRow {
+                        artifact,
+                        state,
+                        max_tokens: *max_tokens,
+                        quota,
+                    },
+                )
+                .collect::<Vec<_>>();
+            if rows.is_empty() {
+                break;
+            }
+            let steps = model.retained_decode_step_batch(&mut rows).unwrap();
+            for step in &steps {
+                assert!(step.tokens_generated <= 10_000);
+            }
+        }
+        states
+            .into_iter()
+            .map(|state| {
+                assert!(state.finished, "a row never finished");
+                (
+                    state.token_ids,
+                    state.token_frames,
+                    state.assembled,
+                    state.counters.tdt_joint_steps,
+                    state.counters.tdt_blank_steps,
+                )
+            })
+            .collect()
+    }
+
+    /// The dispatches of many joint steps decode every row of a cohort as
+    /// the eager step does, with the select step on the host: the same
+    /// tokens, frames, text and joint and blank steps, across window
+    /// boundaries (a 70-frame row; windows hold 64), a token budget, rows finishing at
+    /// different steps, and a quota of several tokens per engine step.
+    #[test]
+    fn device_decode_dispatches_match_the_eager_retained_decode() {
+        let device = Device::Cpu;
+        let model = random_decoder_model(&device, 0xDEC0_DE01);
+        let mut rng = XorShift(0xA77_1FAC7);
+        let artifacts = [12usize, 70, 5, 20]
+            .map(|len| {
+                let mut artifact = zero_artifact(&device, len);
+                artifact.encoded = Tensor::from_vec(
+                    rng.values(len * TINY.dim, 2.0, 0.0),
+                    (1, len, TINY.dim),
+                    &device,
+                )
+                .unwrap();
+                artifact
+            })
+            .to_vec();
+        let max_tokens = [1_000, 1_000, 1_000, 3];
+        let eager = decode_cohort(&model, &artifacts, &max_tokens, 1);
+        assert!(eager.iter().map(|row| row.0.len()).sum::<usize>() > 10);
+        assert!(eager.iter().any(|row| row.4 > 0), "no blanks");
+        assert_eq!(eager[3].0.len(), 3, "the budget stops the last row");
+        for quota in [1, 3] {
+            DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(true));
+            let dispatched = decode_cohort(&model, &artifacts, &max_tokens, quota);
+            DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(false));
+            for (row, (eager, dispatched)) in eager.iter().zip(&dispatched).enumerate() {
+                assert_eq!(eager, dispatched, "row {row}, quota {quota}");
+            }
+        }
     }
 
     #[test]
