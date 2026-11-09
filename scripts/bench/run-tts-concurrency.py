@@ -300,7 +300,9 @@ def diagnostics_medians(records):
     """Median of each numeric `*_ms` field in X-Izwi-Tts-Diagnostics' latency breakdown."""
     fields = {}
     for record in records:
-        raw = (record.get('headers') or {}).get('X-Izwi-Tts-Diagnostics')
+        # Header names arrive in whatever case the server sends (lowercase).
+        raw = next((value for name, value in (record.get('headers') or {}).items()
+                    if name.lower() == 'x-izwi-tts-diagnostics'), None)
         try:
             breakdown = json.loads(raw).get('latency_breakdown') or {} if raw else {}
         except (ValueError, AttributeError):

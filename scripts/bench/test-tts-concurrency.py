@@ -144,9 +144,11 @@ class Parsing(unittest.TestCase):
         self.assertAlmostEqual(s['audio_s_per_s'], 2.2)
 
     def test_diagnostics_medians_take_numeric_ms_fields_only(self):
-        records = [{'headers': {'X-Izwi-Tts-Diagnostics': json.dumps(
+        # izwi-server sends lowercase header names.
+        records = [{'headers': {name: json.dumps(
             {'latency_breakdown': {'codec_ms': v, 'decode_ms': 2 * v, 'label': 'x'}})}}
-            for v in (1.0, 3.0, 5.0)]
+            for name, v in (('X-Izwi-Tts-Diagnostics', 1.0), ('x-izwi-tts-diagnostics', 3.0),
+                            ('x-izwi-tts-diagnostics', 5.0))]
         records.append({'headers': {'X-Izwi-Tts-Diagnostics': 'not json'}})
         records.append({'headers': {}})
         self.assertEqual(driver.diagnostics_medians(records), {'codec_ms': 3.0, 'decode_ms': 6.0})
