@@ -19,6 +19,17 @@ pub struct GraniteSpeech5AudioFeatures {
     pub input_features: Vec<Vec<f32>>,
 }
 
+impl GraniteSpeech5AudioFeatures {
+    /// Host bytes the stacked encoder input holds.
+    pub fn host_bytes(&self) -> Option<u64> {
+        let elements = self
+            .input_features
+            .iter()
+            .try_fold(0usize, |total, row| total.checked_add(row.len()))?;
+        u64::try_from(elements.checked_mul(std::mem::size_of::<f32>())?).ok()
+    }
+}
+
 pub struct GraniteSpeech5Preprocessor {
     config: GraniteSpeech5ProcessorConfig,
     mel: MelSpectrogram,
@@ -125,6 +136,12 @@ mod tests {
             .iter()
             .flatten()
             .all(|value| value.is_finite()));
+        // Preparation holds the stacked input until the encoder batch reads
+        // it, priced as its elements.
+        assert_eq!(
+            features.host_bytes(),
+            Some((features.encoder_frames * features.encoder_dim * 4) as u64)
+        );
     }
 
     #[test]

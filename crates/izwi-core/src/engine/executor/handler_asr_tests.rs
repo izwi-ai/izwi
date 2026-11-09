@@ -61,6 +61,40 @@ fn retained_lfm_asr_prefill_mixed_cancellation_selects_only_armed_rows() {
     );
 }
 
+/// A continuous ASR batch takes several tokens per row only for the
+/// transducer families, never a prefill or an empty quantum.
+#[test]
+fn continuous_asr_batches_take_quanta_only_for_transducers() {
+    let row = |num_tokens: usize, is_prefill: bool| ScheduledRequest {
+        plan_id: 1,
+        request_id: "row".into(),
+        sequence_id: 1,
+        num_tokens,
+        is_prefill,
+        num_computed_tokens: 0,
+        work: WorkUnit::SequenceStep {
+            phase: if is_prefill {
+                SequencePhase::Prefill
+            } else {
+                SequencePhase::Decode
+            },
+            input: InputRange {
+                start: 0,
+                end: num_tokens,
+            },
+            max_output_steps: num_tokens,
+            auxiliary_state: None,
+        },
+    };
+    let validate = super::continuous::validate_continuous_asr_batch_shape;
+    assert!(validate(&[row(1, false), row(1, false)], false).is_ok());
+    assert!(validate(&[row(1, false), row(4, false)], false).is_err());
+    assert!(validate(&[row(1, false), row(4, false)], true).is_ok());
+    assert!(validate(&[row(0, false)], true).is_err());
+    assert!(validate(&[row(4, true)], true).is_err());
+    assert!(validate(&[], true).is_err());
+}
+
 #[test]
 fn parakeet_mixed_cancellation_selects_only_armed_rows() {
     assert_eq!(

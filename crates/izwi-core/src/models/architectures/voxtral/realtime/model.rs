@@ -30,7 +30,8 @@ use crate::models::architectures::voxtral::{
 };
 use crate::models::shared::attention::flash::{
     flash_attention_compiled, flash_attention_requested, try_fused_self_attention,
-    try_fused_self_attention_with_options, CudaFlashAttentionOptions,
+    try_fused_self_attention_with_options, try_fused_varlen_self_attention_with_options,
+    CudaFlashAttentionOptions,
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
@@ -125,6 +126,37 @@ pub(crate) struct VoxtralRealtimePreparationBatchRow<'a> {
 /// ([`VoxtralRealtimePreparationMode::Complete`]). Immutable, so a row's
 /// state can be rebuilt from it; the source samples are not kept.
 #[derive(Debug, Clone)]
+/// One row's encoder input, computed on the host: its source audio and its
+/// padded log-mel.
+pub(crate) struct VoxtralPreparedFeatures {
+    source: Arc<Vec<f32>>,
+    mel: Vec<Vec<f32>>,
+    geometry: VoxtralRealtimePreparationGeometry,
+}
+
+/// One offline request's encoder input, computed on a host worker.
+pub(crate) struct VoxtralOfflineFeatures {
+    features: VoxtralPreparedFeatures,
+    sample_rate: u32,
+    source_samples: usize,
+}
+
+impl VoxtralOfflineFeatures {
+    /// Host bytes the features hold until the encode drops them: the source
+    /// copy and the log-mel.
+    pub(crate) fn host_bytes(&self) -> Result<u64> {
+        self.features
+            .mel
+            .iter()
+            .try_fold(self.features.source.len(), |total, frame| {
+                total.checked_add(frame.len())
+            })
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| Error::Overloaded("Voxtral host feature bytes overflow".into()))
+    }
+}
+
 pub(crate) struct VoxtralOfflinePreparedAudio {
     model_load_nonce: u64,
     source_sample_rate: u32,
@@ -1094,7 +1126,9 @@ impl VoxtralRealtimeModel {
                         .filter(|(_, advance)| **advance)
                         .map(|(row, _)| &mut *row.cache)
                         .collect::<Vec<_>>();
-                    if width == 1 {
+                    // With the decode graphs on, a lone row decodes through the
+                    // width-1 graph.
+                    if width == 1 && !self.language_model.decode_graph_on() {
                         self.language_model.forward_managed_with_embeds(
                             &embeds,
                             positions[0],
@@ -1663,8 +1697,7 @@ impl VoxtralRealtimeModel {
                 "Voxtral preparation batch must contain at least one row".into(),
             ));
         }
-        let mut inputs = Vec::with_capacity(rows.len());
-        let mut geometries = Vec::with_capacity(rows.len());
+        let mut features = Vec::with_capacity(rows.len());
         for (index, row) in rows.iter().enumerate() {
             if rows[..index]
                 .iter()
@@ -1674,61 +1707,88 @@ impl VoxtralRealtimeModel {
                     "Voxtral preparation batch contains the same stream more than once".into(),
                 ));
             }
-            let geometry = self.realtime_preparation_geometry(
-                row.state,
-                row.appended_samples.len(),
-                row.sample_rate,
-                row.mode,
-            )?;
-            let mut source = Vec::with_capacity(geometry.source_samples);
-            source.extend_from_slice(row.state.source_samples.as_slice());
-            source.extend_from_slice(row.appended_samples);
-            let target_rate = self.mel.config().sample_rate as u32;
-            let audio = if row.sample_rate == target_rate {
-                Cow::Borrowed(source.as_slice())
-            } else {
-                Cow::Owned(resample_audio(&source, row.sample_rate, target_rate)?)
-            };
-            if audio.len() != geometry.resampled_samples {
-                return Err(Error::InferenceError(
-                    "Voxtral resampler violated preparation geometry".into(),
-                ));
-            }
-            let left_pad = self
-                .layout
-                .raw_audio_length_per_tok
-                .checked_mul(self.layout.left_pad_tokens)
-                .ok_or_else(|| Error::InvalidInput("Voxtral left padding overflow".into()))?;
-            let right_pad = geometry
-                .padded_samples
-                .checked_sub(left_pad)
-                .and_then(|len| len.checked_sub(audio.len()))
-                .ok_or_else(|| {
-                    Error::InferenceError("Voxtral padding geometry underflow".into())
-                })?;
-            let mut padded = Vec::with_capacity(geometry.padded_samples);
-            padded.extend(std::iter::repeat_n(0.0, left_pad));
-            padded.extend_from_slice(&audio);
-            padded.extend(std::iter::repeat_n(0.0, right_pad));
-            let mut mel_spec = self.mel.compute(&padded)?;
-            drop_last_mel_frame_for_voxtral(&mut mel_spec);
-            if let Some(max_val) = self.global_log_mel_max {
-                normalize_log_mel_with_max(&mut mel_spec, max_val);
-            }
-            if mel_spec.len() != geometry.mel_frames {
-                return Err(Error::InferenceError(format!(
-                    "Voxtral mel frontend produced {} frames, expected {}",
-                    mel_spec.len(),
-                    geometry.mel_frames
-                )));
-            }
-            inputs.push((Arc::new(source), mel_spec));
-            geometries.push(geometry);
+            features.push(self.realtime_preparation_features(row)?);
         }
+        self.encode_realtime_preparation_features(rows, features)
+    }
 
+    /// One row's encoder input on the host: its source audio, resampled,
+    /// padded and turned into its log-mel.
+    fn realtime_preparation_features(
+        &self,
+        row: &VoxtralRealtimePreparationBatchRow<'_>,
+    ) -> Result<VoxtralPreparedFeatures> {
+        let geometry = self.realtime_preparation_geometry(
+            row.state,
+            row.appended_samples.len(),
+            row.sample_rate,
+            row.mode,
+        )?;
+        let mut source = Vec::with_capacity(geometry.source_samples);
+        source.extend_from_slice(row.state.source_samples.as_slice());
+        source.extend_from_slice(row.appended_samples);
+        let target_rate = self.mel.config().sample_rate as u32;
+        let audio = if row.sample_rate == target_rate {
+            Cow::Borrowed(source.as_slice())
+        } else {
+            Cow::Owned(resample_audio(&source, row.sample_rate, target_rate)?)
+        };
+        if audio.len() != geometry.resampled_samples {
+            return Err(Error::InferenceError(
+                "Voxtral resampler violated preparation geometry".into(),
+            ));
+        }
+        let left_pad = self
+            .layout
+            .raw_audio_length_per_tok
+            .checked_mul(self.layout.left_pad_tokens)
+            .ok_or_else(|| Error::InvalidInput("Voxtral left padding overflow".into()))?;
+        let right_pad = geometry
+            .padded_samples
+            .checked_sub(left_pad)
+            .and_then(|len| len.checked_sub(audio.len()))
+            .ok_or_else(|| Error::InferenceError("Voxtral padding geometry underflow".into()))?;
+        let mut padded = Vec::with_capacity(geometry.padded_samples);
+        padded.extend(std::iter::repeat_n(0.0, left_pad));
+        padded.extend_from_slice(&audio);
+        padded.extend(std::iter::repeat_n(0.0, right_pad));
+        let mut mel_spec = self.mel.compute(&padded)?;
+        drop_last_mel_frame_for_voxtral(&mut mel_spec);
+        if let Some(max_val) = self.global_log_mel_max {
+            normalize_log_mel_with_max(&mut mel_spec, max_val);
+        }
+        if mel_spec.len() != geometry.mel_frames {
+            return Err(Error::InferenceError(format!(
+                "Voxtral mel frontend produced {} frames, expected {}",
+                mel_spec.len(),
+                geometry.mel_frames
+            )));
+        }
+        Ok(VoxtralPreparedFeatures {
+            source: Arc::new(source),
+            mel: mel_spec,
+            geometry,
+        })
+    }
+
+    /// Encodes rows whose log-mel the host computed, as one batch.
+    fn encode_realtime_preparation_features(
+        &self,
+        rows: &[VoxtralRealtimePreparationBatchRow<'_>],
+        features: Vec<VoxtralPreparedFeatures>,
+    ) -> Result<Vec<VoxtralRealtimePreparedAudio>> {
+        if rows.is_empty() || rows.len() != features.len() {
+            return Err(Error::InvalidInput(
+                "Voxtral preparation rows and features disagree".into(),
+            ));
+        }
+        let geometries = features
+            .iter()
+            .map(|features| features.geometry)
+            .collect::<Vec<_>>();
         let batch_geometry = self.realtime_preparation_batch_geometry(&geometries)?;
         let mut mel_rows = Vec::with_capacity(rows.len());
-        for (_, mel_spec) in &inputs {
+        for VoxtralPreparedFeatures { mel: mel_spec, .. } in &features {
             let mel = mel_frames_to_tensor(
                 mel_spec,
                 self.mel.config().n_mels,
@@ -1784,7 +1844,7 @@ impl VoxtralRealtimeModel {
                 expected_source_identity: row.state.source_samples.clone(),
                 preparation_generation: row.state.preparation_generation,
                 source_sample_rate: row.sample_rate,
-                source_samples: inputs[index].0.clone(),
+                source_samples: features[index].source.clone(),
                 mode: row.mode,
                 geometry,
                 embeddings,
@@ -1902,20 +1962,53 @@ impl VoxtralRealtimeModel {
         samples: &[f32],
         sample_rate: u32,
     ) -> Result<VoxtralOfflinePreparedAudio> {
+        let features = self.prepare_offline_features(samples, sample_rate)?;
+        self.prepare_offline_audio_from_features(features)
+    }
+
+    /// One offline request's encoder input, computed on a host worker: its
+    /// whole audio with the final padding, resampled, as its log-mel.
+    pub(crate) fn prepare_offline_features(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<VoxtralOfflineFeatures> {
         let state = VoxtralRealtimeState::new(None);
+        let features = self.realtime_preparation_features(&VoxtralRealtimePreparationBatchRow {
+            state: &state,
+            appended_samples: samples,
+            sample_rate,
+            mode: VoxtralRealtimePreparationMode::Complete,
+        })?;
+        Ok(VoxtralOfflineFeatures {
+            features,
+            sample_rate,
+            source_samples: samples.len(),
+        })
+    }
+
+    /// Encodes one offline request from its host features, as a fresh
+    /// stream closed by the preparation.
+    pub(crate) fn prepare_offline_audio_from_features(
+        &self,
+        features: VoxtralOfflineFeatures,
+    ) -> Result<VoxtralOfflinePreparedAudio> {
+        let state = VoxtralRealtimeState::new(None);
+        let (sample_rate, samples) = (features.sample_rate, features.source_samples);
+        let row = VoxtralRealtimePreparationBatchRow {
+            state: &state,
+            appended_samples: &[],
+            sample_rate,
+            mode: VoxtralRealtimePreparationMode::Complete,
+        };
         let prepared = self
-            .prepare_realtime_audio_batch(&[VoxtralRealtimePreparationBatchRow {
-                state: &state,
-                appended_samples: samples,
-                sample_rate,
-                mode: VoxtralRealtimePreparationMode::Complete,
-            }])?
+            .encode_realtime_preparation_features(&[row], vec![features.features])?
             .pop()
             .ok_or_else(|| Error::InferenceError("Voxtral preparation omitted its row".into()))?;
         Ok(VoxtralOfflinePreparedAudio {
             model_load_nonce: prepared.model_load_nonce,
             source_sample_rate: prepared.source_sample_rate,
-            source_samples: samples.len(),
+            source_samples: samples,
             prepared_frames: prepared.geometry.stable_frames,
             embeddings: prepared.embeddings,
         })
@@ -2127,6 +2220,7 @@ impl VoxtralRealtimeModel {
                 "precision": self.precision.diagnostics(),
                 "flash_attention_requested": flash_attention_requested(),
                 "flash_attention_compiled": flash_attention_compiled(),
+                "decode_graph": self.language_model.decode_graph_diagnostics(),
                 "cache": cache,
                 "timings_ms": timings.map(VoxtralRealtimeTimings::to_json)
             },
@@ -2965,6 +3059,17 @@ impl WhisperAttention {
             q = apply_interleaved_rotary_emb(&q, &cos, &sin)?;
             k = apply_interleaved_rotary_emb(&k, &cos, &sin)?;
         }
+        // On CUDA the valid frames of every row attend as packed spans, the
+        // way one row attends alone, instead of through a padded mask.
+        if let Some(output) =
+            self.varlen_flash_attention(&q, &k, &v, valid_lengths, is_causal, tables)?
+        {
+            return self
+                .out_proj
+                .forward(&output)?
+                .broadcast_mul(frame_mask)
+                .map_err(Error::from);
+        }
         let q = q
             .transpose(1, 2)?
             .reshape((batch * self.num_heads, seq_len, self.head_dim))?;
@@ -2996,6 +3101,66 @@ impl WhisperAttention {
     }
 }
 
+impl WhisperAttention {
+    /// FlashAttention varlen over the valid frames of a padded batch, with
+    /// the window and causality one row uses alone: `q` and `k` are
+    /// `[batch, frames, heads, head_dim]`, `v` is `[batch, heads, frames,
+    /// head_dim]`, and the result is `[batch, frames, heads * head_dim]` with
+    /// zeros past each row's length. `None` off CUDA, for a non-causal
+    /// sliding window (which the single row does not fuse either), or when
+    /// FlashAttention declines; the caller then attends through the mask.
+    fn varlen_flash_attention(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        valid_lengths: &[usize],
+        is_causal: bool,
+        tables: &EncoderForwardTables,
+    ) -> Result<Option<Tensor>> {
+        let options = match (self.sliding_window, is_causal) {
+            (None, _) => CudaFlashAttentionOptions::default(),
+            (Some(_), true) => voxtral_realtime_cuda_sliding_flash_options(self.sliding_window),
+            (Some(_), false) => return Ok(None),
+        };
+        if !q.device().is_cuda() || !flash_attention_requested() {
+            return Ok(None);
+        }
+        let (batch, frames, heads, head_dim) = q.dims4()?;
+        let (index, cu_seqlens, max_seqlen) = tables.varlen_spans(valid_lengths, frames, q)?;
+        let total = index.dim(0)?;
+        let width = heads * head_dim;
+        let pack = |x: &Tensor| -> Result<Tensor> {
+            Ok(x.contiguous()?
+                .reshape((batch * frames, width))?
+                .index_select(&index, 0)?
+                .reshape((1, total, heads, head_dim))?
+                .transpose(1, 2)?)
+        };
+        let v = v.transpose(1, 2)?;
+        let Some(output) = try_fused_varlen_self_attention_with_options(
+            &pack(q)?,
+            &pack(k)?,
+            &pack(&v)?,
+            &cu_seqlens,
+            max_seqlen,
+            head_dim,
+            is_causal,
+            options,
+        )?
+        else {
+            return Ok(None);
+        };
+        let output = output
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((total, width))?;
+        let padded = Tensor::zeros((batch * frames, width), output.dtype(), output.device())?
+            .index_add(&index, &output, 0)?;
+        Ok(Some(padded.reshape((batch, frames, width))?))
+    }
+}
+
 /// Attention inputs that depend only on the sequence geometry, built at most
 /// once per encoder forward and shared by every layer. Each layer used to
 /// rebuild them: the RoPE cos/sin tables (host angles, upload, device
@@ -3008,7 +3173,52 @@ struct EncoderForwardTables {
     rope: RefCell<Option<(RopeTableKey, (Tensor, Tensor))>>,
     causal_mask: RefCell<Option<(CausalMaskKey, Tensor)>>,
     valid_mask: RefCell<Option<(ValidMaskKey, Tensor)>>,
+    varlen: RefCell<Option<(VarlenKey, VarlenSpans)>>,
     builds: Cell<usize>,
+}
+
+type VarlenKey = (Vec<usize>, usize, candle_core::DeviceLocation);
+/// The valid rows of a padded `[batch * frames]` axis as packed spans: their
+/// gather index, cumulative lengths and longest span.
+type VarlenSpans = (Tensor, Vec<u32>, usize);
+
+/// The packed spans of rows with `valid_lengths` frames each, padded to
+/// `frames`.
+fn varlen_spans_for(
+    valid_lengths: &[usize],
+    frames: usize,
+    device: &candle_core::Device,
+) -> Result<VarlenSpans> {
+    let mut index = Vec::with_capacity(valid_lengths.iter().sum());
+    let mut cu_seqlens = Vec::with_capacity(valid_lengths.len() + 1);
+    cu_seqlens.push(0u32);
+    for (row, &length) in valid_lengths.iter().enumerate() {
+        if length > frames {
+            return Err(Error::InvalidInput(
+                "Voxtral varlen row is longer than its padded batch".into(),
+            ));
+        }
+        let start = row
+            .checked_mul(frames)
+            .ok_or_else(|| Error::Overloaded("Voxtral varlen index overflow".into()))?;
+        for frame in start..start + length {
+            index.push(
+                u32::try_from(frame)
+                    .map_err(|_| Error::Overloaded("Voxtral varlen index exceeds u32".into()))?,
+            );
+        }
+        cu_seqlens.push(
+            u32::try_from(index.len())
+                .map_err(|_| Error::Overloaded("Voxtral varlen length exceeds u32".into()))?,
+        );
+    }
+    let max_seqlen = valid_lengths.iter().copied().max().unwrap_or(0);
+    let count = index.len();
+    Ok((
+        Tensor::from_vec(index, count, device)?,
+        cu_seqlens,
+        max_seqlen,
+    ))
 }
 
 type RopeTableKey = (usize, usize, u64, DType, candle_core::DeviceLocation);
@@ -3081,6 +3291,30 @@ impl EncoderForwardTables {
                 reference.dtype(),
             )
         })
+    }
+
+    /// [`varlen_spans_for`], built once per forward and shared by every
+    /// layer.
+    fn varlen_spans(
+        &self,
+        valid_lengths: &[usize],
+        frames: usize,
+        reference: &Tensor,
+    ) -> Result<VarlenSpans> {
+        let key = (
+            valid_lengths.to_vec(),
+            frames,
+            reference.device().location(),
+        );
+        if let Some((cached, spans)) = self.varlen.borrow().as_ref() {
+            if *cached == key {
+                return Ok(spans.clone());
+            }
+        }
+        let spans = varlen_spans_for(valid_lengths, frames, reference.device())?;
+        self.builds.set(self.builds.get() + 1);
+        *self.varlen.borrow_mut() = Some((key, spans.clone()));
+        Ok(spans)
     }
 
     fn valid_attention_mask(
@@ -5179,6 +5413,50 @@ mod tests {
             .unwrap()
             .is_some());
         assert_eq!(model.offline_row_frames(0, 16_000).unwrap(), None);
+    }
+
+    /// An offline request's host features are priced as the source copy and
+    /// log-mel they hold, and encode to the one-call preparation's
+    /// embeddings bit for bit.
+    #[test]
+    fn offline_host_features_price_their_buffers_and_encode_identically() {
+        let model = tiny_realtime_model();
+        let audio = tiny_audio(16_000, 7);
+        let features = model.prepare_offline_features(&audio, 16_000).unwrap();
+        let elements = features.features.source.len()
+            + features.features.mel.iter().map(Vec::len).sum::<usize>();
+        assert_eq!(features.host_bytes().unwrap(), (elements * 4) as u64);
+        assert!(features.features.source.len() >= audio.len());
+        let split = model.prepare_offline_audio_from_features(features).unwrap();
+        let reference = model.prepare_offline_audio(&audio, 16_000).unwrap();
+        assert_eq!(split.prepared_frames(), reference.prepared_frames());
+        assert_eq!(
+            split
+                .embeddings
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            reference
+                .embeddings
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        );
+    }
+
+    /// A padded batch's valid frames pack as spans in row order: the gather
+    /// index skips each row's padding and the cumulative lengths bound each
+    /// row, as FlashAttention varlen reads them.
+    #[test]
+    fn varlen_spans_pack_each_rows_valid_frames() {
+        let (index, cu_seqlens, max_seqlen) =
+            super::varlen_spans_for(&[3, 1, 2], 4, &candle_core::Device::Cpu).unwrap();
+        assert_eq!(index.to_vec1::<u32>().unwrap(), vec![0, 1, 2, 4, 8, 9]);
+        assert_eq!(cu_seqlens, vec![0, 3, 4, 6]);
+        assert_eq!(max_seqlen, 3);
+        assert!(super::varlen_spans_for(&[5], 4, &candle_core::Device::Cpu).is_err());
     }
 
     /// Offline rows decoded together, joining at different steps and running

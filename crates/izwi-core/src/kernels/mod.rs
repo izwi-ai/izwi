@@ -35,9 +35,11 @@ pub mod moe_relu2;
 pub mod numeric_check;
 pub mod penalized_topk;
 pub mod qk_norm_rope;
+pub mod relpos_attention;
 pub mod race_sampler;
 pub mod residual_norm;
 pub mod swiglu;
+pub mod transducer_greedy;
 
 use crate::error::Error;
 use candle_core::{Device, Tensor};

@@ -976,8 +976,9 @@ fn loaded_models_clamp_to_their_family_certified_width() {
 }
 
 /// On CUDA with an automatic width (the registry's ASR engine width at the
-/// CUDA ceiling), Qwen3-ASR, VibeVoice-ASR, Parakeet and Nemotron ASR decode
-/// up to 32 rows per step while their encoder preparation and prefill stay
+/// CUDA ceiling), Qwen3-ASR, VibeVoice-ASR, Parakeet, Nemotron ASR, Whisper
+/// and Granite Speech 4.1 (on its retained route) decode up to 32 rows per
+/// step while their encoder preparation and prefill stay
 /// at the engine's eight, so neither workspace scales with the decode; a
 /// load's fitted width narrows only the decode. Every other ASR family keeps
 /// the engine rows.
@@ -1013,6 +1014,8 @@ fn batched_asr_families_decode_at_the_asr_width_and_prepare_at_the_engine_rows()
             .clone()
     };
     // (variant, preparation rows, prefill rows)
+    let granite_retained =
+        crate::models::architectures::granite_speech::asr::granite_speech_retained_decode_enabled();
     for (variant, preparation_rows, prefill_rows) in [
         (ModelVariant::Qwen3Asr06BGguf, 8, 1),
         (ModelVariant::Qwen3Asr17BGguf, 8, 1),
@@ -1020,7 +1023,11 @@ fn batched_asr_families_decode_at_the_asr_width_and_prepare_at_the_engine_rows()
         (ModelVariant::ParakeetTdt06BV3, 8, 8),
         (ModelVariant::Nemotron35AsrStreaming06B, 8, 8),
         (ModelVariant::WhisperLargeV3Turbo, 8, 1),
-    ] {
+        (ModelVariant::GraniteSpeech412BPlus, 8, 1),
+    ]
+    .into_iter()
+    .filter(|(variant, _, _)| granite_retained || *variant != ModelVariant::GraniteSpeech412BPlus)
+    {
         for (fitted, decode_rows) in [(None, 32), (Some(32), 32), (Some(16), 16), (Some(8), 8)] {
             let contract = sequence_graph(variant, fitted);
             let decode = stage(&contract, StageWorkSelector::SequenceDecode);
@@ -1056,34 +1063,31 @@ fn batched_asr_families_decode_at_the_asr_width_and_prepare_at_the_engine_rows()
     let prefill = stage(&parakeet, StageWorkSelector::SequencePrefill);
     assert_eq!(prefill.max_work_units, 8);
     assert_eq!(prefill.max_workspace_bytes, 8 * 16 * 1024 * 1024);
-    for variant in [
-        ModelVariant::GraniteSpeech412BPlus,
-        ModelVariant::Lfm25Audio15BGguf,
-    ] {
-        assert_eq!(
-            registry.asr_decode_width(variant.family(), BackendKind::Cuda),
-            8,
-            "{variant}"
-        );
-        let draft = LoadedModelBundleDraft::build(
-            &registry,
-            ExecutionGroupId::new(48),
-            ModelInstanceId::new(1),
-            variant,
-            BackendKind::Cuda,
-        )
+    // LFM2.5 Audio keeps the engine rows on CUDA.
+    let variant = ModelVariant::Lfm25Audio15BGguf;
+    assert_eq!(
+        registry.asr_decode_width(variant.family(), BackendKind::Cuda),
+        8,
+        "{variant}"
+    );
+    let draft = LoadedModelBundleDraft::build(
+        &registry,
+        ExecutionGroupId::new(48),
+        ModelInstanceId::new(1),
+        variant,
+        BackendKind::Cuda,
+    )
+    .unwrap();
+    install_test_preparation_seals(&draft, BackendKind::Cuda, 8);
+    let widest = draft
+        .execution_contracts(CapabilityKind::Asr)
+        .unwrap()
+        .iter()
+        .flat_map(|contract| contract.stages.to_vec())
+        .map(|stage| stage.max_batch_size)
+        .max()
         .unwrap();
-        install_test_preparation_seals(&draft, BackendKind::Cuda, 8);
-        let widest = draft
-            .execution_contracts(CapabilityKind::Asr)
-            .unwrap()
-            .iter()
-            .flat_map(|contract| contract.stages.to_vec())
-            .map(|stage| stage.max_batch_size)
-            .max()
-            .unwrap();
-        assert!(widest <= 8, "{variant}: {widest}");
-    }
+    assert!(widest <= 8, "{variant}: {widest}");
     // Nemotron's realtime sessions keep the engine rows beside its wide
     // offline decode.
     let nemotron = LoadedModelBundleDraft::build(
@@ -1255,7 +1259,11 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                     let vibevoice_asr = execution.metadata().capability == CapabilityKind::Asr
                         && variant.family() == crate::catalog::ModelFamily::VibeVoiceAsr;
                     let granite_asr = execution.metadata().capability == CapabilityKind::Asr
-                        && variant.family() == crate::catalog::ModelFamily::GraniteSpeechAsr;
+                        && matches!(
+                            variant.family(),
+                            crate::catalog::ModelFamily::GraniteSpeechAsr
+                                | crate::catalog::ModelFamily::GraniteSpeech5Asr
+                        );
                     let whisper_asr = execution.metadata().capability == CapabilityKind::Asr
                         && variant.family() == crate::catalog::ModelFamily::WhisperAsr;
                     let lfm_audio_asr = execution.metadata().capability
@@ -3011,13 +3019,18 @@ fn lfm25_audio_asr_factory_publishes_sealed_retained_graph_and_atomic_long_form(
     }
 }
 
-/// Granite Speech 5.0 runs on the scalar adapter, whose ASR graph is the
-/// chunked atomic stage for every request: a long file dispatches one chunk
-/// at a time (it used to hold the device for the whole file), and the normal
-/// and long-form requirements seal the same graph, so the load keeps one
-/// invocation pool. Nemotron's long-form ASR keeps its single-dispatch stage.
+/// Granite Speech 5.0's normal requirement (with or without native
+/// streaming) binds its retained sequence graph: scalar encoder
+/// preparation, scalar exact prefill, and continuous decode priced per row.
+/// A long-form requirement binds the chunked atomic stage, which dispatches
+/// one chunk at a time; with the retained route switched off it is the only
+/// graph (GRN-8). Nemotron's long-form ASR keeps its single-dispatch stage.
 #[test]
-fn granite_speech5_scalar_asr_dispatches_one_chunk_at_a_time() {
+fn granite_speech5_asr_offers_its_retained_graph_and_chunked_atomic_graph() {
+    use crate::models::architectures::granite_speech5::asr::{
+        granite_speech5_retained_decode_enabled, granite_speech5_test_physical_state_spec,
+    };
+    let retained_route = granite_speech5_retained_decode_enabled();
     let registry = RuntimeAdapterRegistry::built_in();
     for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
         let draft = LoadedModelBundleDraft::build(
@@ -3028,27 +3041,102 @@ fn granite_speech5_scalar_asr_dispatches_one_chunk_at_a_time() {
             backend,
         )
         .unwrap();
+        install_test_preparation_seals(&draft, backend, 1);
         let adapter = draft.capabilities.get(&CapabilityKind::Asr).unwrap();
-        let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
         let long = adapter
             .contract(StreamingRequirements::NONE.with_asr_long_form(true))
             .unwrap();
-        for contract in [&normal, &long] {
-            assert_eq!(contract.execution_profile.mode, ExecutionMode::Atomic);
-            assert_eq!(contract.stages.len(), 1);
-            let stage = &contract.stages[0];
-            assert_eq!(stage.name, "asr.long_form.chunked", "{backend:?}");
-            assert_eq!(stage.selector, StageWorkSelector::Atomic);
-            assert_eq!(stage.progress, StageProgressKind::Iterative);
-            assert_eq!(
-                stage.membership_safe_point,
-                MembershipSafePoint::QuantumBoundary
-            );
-        }
+        assert_eq!(long.execution_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(long.stages.len(), 1);
+        let stage = &long.stages[0];
+        assert_eq!(stage.name, "asr.granite_speech5.long_form.chunked");
+        assert_eq!(stage.selector, StageWorkSelector::Atomic);
+        assert_eq!(stage.progress, StageProgressKind::Iterative);
         assert_eq!(
-            crate::kv::v2::stage_graph_fingerprint(&normal.stages).unwrap(),
-            crate::kv::v2::stage_graph_fingerprint(&long.stages).unwrap(),
+            stage.membership_safe_point,
+            MembershipSafePoint::QuantumBoundary
         );
+        for streaming in [
+            StreamingRequirements::NONE,
+            StreamingRequirements::transport_only(),
+            StreamingRequirements::native(true),
+        ] {
+            let normal = adapter.contract(streaming).unwrap();
+            if !retained_route {
+                assert_eq!(
+                    crate::kv::v2::stage_graph_fingerprint(&normal.stages).unwrap(),
+                    crate::kv::v2::stage_graph_fingerprint(&long.stages).unwrap(),
+                );
+                continue;
+            }
+            assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
+            let names = normal
+                .stages
+                .iter()
+                .map(|stage| (stage.name.as_str(), stage.selector))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                vec![
+                    (
+                        "asr.encoder.granite_speech5",
+                        StageWorkSelector::PreSequencePreparation
+                    ),
+                    (
+                        "asr.granite_speech5.prefill.scalar",
+                        StageWorkSelector::SequencePrefill
+                    ),
+                    (
+                        "asr.granite_speech5.decode.tensor_continuous",
+                        StageWorkSelector::SequenceDecode
+                    ),
+                ]
+            );
+            let decode = &normal.stages[2];
+            assert_eq!(decode.batch_mode, NativeBatchMode::Continuous);
+            assert!(decode.workspace_per_row_bytes > 0);
+            assert_eq!(
+                decode.max_workspace_bytes,
+                decode.workspace_per_row_bytes * decode.max_batch_size as u64
+            );
+            assert_eq!(normal.stages[0].max_batch_size, 1);
+            assert_eq!(normal.stages[1].max_batch_size, 1);
+        }
+    }
+    // At four engine rows the encoder batches four requests' audio, padded,
+    // its ceilings four times one request's.
+    if retained_route {
+        let draft = LoadedModelBundleDraft::build(
+            &RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap(),
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(3),
+            ModelVariant::GraniteSpeech502BGguf,
+            BackendKind::Cuda,
+        )
+        .unwrap();
+        install_test_preparation_seals(&draft, BackendKind::Cuda, 4);
+        let normal = draft
+            .capabilities
+            .get(&CapabilityKind::Asr)
+            .unwrap()
+            .contract(StreamingRequirements::NONE)
+            .unwrap();
+        let preparation = &normal.stages[0];
+        assert_eq!(preparation.batch_mode, NativeBatchMode::Static);
+        assert_eq!(preparation.shape_policy, StageShapePolicy::Padded);
+        assert_eq!(preparation.concurrency, ConcurrencyClass::Batchable);
+        assert_eq!(preparation.max_batch_size, 4);
+        assert_eq!(preparation.max_workspace_bytes, 4 * 1024 * 1024 * 1024);
+        assert_eq!(preparation.max_work_units, 4 * 10_000);
+        assert_eq!(normal.stages[1].max_batch_size, 1);
+        let long = draft
+            .capabilities
+            .get(&CapabilityKind::Asr)
+            .unwrap()
+            .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+            .unwrap();
+        granite_speech5_test_physical_state_spec(&[normal.stages.as_ref(), long.stages.as_ref()])
+            .unwrap();
     }
     let nemotron = LoadedModelBundleDraft::build(
         &registry,
@@ -3349,13 +3437,14 @@ fn nemotron_offline_graph_is_retained_rows_beside_the_scalar_atomic_graph() {
         .is_err());
 }
 
-/// A Granite Speech ASR adapter with its retained sequence route on. The
-/// route is dormant until Granite resumes prefill (GRN-8); these tests keep
-/// its graph honest for that day.
-fn granite_retained_route_adapter(
+/// A Granite Speech ASR adapter with its retained sequence route on or off
+/// (`IZWI_GRANITE_SPEECH_RETAINED_DECODE`, on by default), whatever this
+/// process's switch reads.
+fn granite_adapter(
     metadata: AdapterMetadata,
     backend: BackendKind,
     max_batch_size: usize,
+    retained_route: bool,
 ) -> GraniteSpeechAsrExecutionAdapter {
     let mut adapter = GraniteSpeechAsrExecutionAdapter::new(
         ExecutionGroupId::new(1),
@@ -3364,12 +3453,24 @@ fn granite_retained_route_adapter(
         backend,
         max_batch_size,
     );
-    adapter.retained_route = true;
+    adapter.retained_route = retained_route;
     adapter
 }
 
+fn granite_retained_route_adapter(
+    metadata: AdapterMetadata,
+    backend: BackendKind,
+    max_batch_size: usize,
+) -> GraniteSpeechAsrExecutionAdapter {
+    granite_adapter(metadata, backend, max_batch_size, true)
+}
+
+/// The built-in Granite Speech ASR adapter follows the process switch, and
+/// its factory's batch mode with it.
 #[test]
-fn granite_speech_without_resumable_prefill_offers_only_its_atomic_graph() {
+fn granite_speech_adapter_follows_the_retained_decode_switch() {
+    let enabled =
+        crate::models::architectures::granite_speech::asr::granite_speech_retained_decode_enabled();
     let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
     let draft = LoadedModelBundleDraft::build(
         &registry,
@@ -3379,10 +3480,38 @@ fn granite_speech_without_resumable_prefill_offers_only_its_atomic_graph() {
         BackendKind::Metal,
     )
     .unwrap();
+    install_test_preparation_seals(&draft, BackendKind::Metal, 8);
+    let normal = draft.capabilities[&CapabilityKind::Asr]
+        .contract(StreamingRequirements::NONE)
+        .unwrap();
+    assert_eq!(
+        normal.execution_profile.mode,
+        if enabled {
+            ExecutionMode::Sequence
+        } else {
+            ExecutionMode::Atomic
+        }
+    );
+    assert_eq!(
+        GraniteSpeechPhysicalAsrAdapterFactory.batch_mode(),
+        if enabled {
+            NativeBatchMode::Continuous
+        } else {
+            NativeBatchMode::None
+        }
+    );
+}
+
+#[test]
+fn granite_speech_without_resumable_prefill_offers_only_its_atomic_graph() {
+    let metadata = *RuntimeAdapterRegistry::built_in()
+        .require(CapabilityKind::Asr, ModelVariant::GraniteSpeech412BPlus)
+        .unwrap();
+    let adapter = granite_adapter(metadata, BackendKind::Metal, 8, false);
     // Every selectable graph is known when the bundle is drafted, before the
     // weights load: none waits on the preparation seal.
-    let contracts = draft.execution_contracts(CapabilityKind::Asr).unwrap();
-    let atomic = draft.capabilities[&CapabilityKind::Asr]
+    let contracts = loaded_execution_contracts(&adapter).unwrap();
+    let atomic = adapter
         .contract(StreamingRequirements::NONE.with_asr_long_form(true))
         .unwrap();
     for contract in &contracts {
@@ -3398,25 +3527,22 @@ fn granite_speech_without_resumable_prefill_offers_only_its_atomic_graph() {
         )));
     }
     // An ordinary requirement re-seals the long-form graph exactly.
-    let normal = draft.capabilities[&CapabilityKind::Asr]
-        .contract(StreamingRequirements::NONE)
-        .unwrap();
+    let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
     assert_eq!(
         stage_graph_fingerprint(&normal.stages).unwrap(),
         stage_graph_fingerprint(&atomic.stages).unwrap()
     );
     // The model's preparation seal still installs, and changes no graph.
-    install_test_preparation_seals(&draft, BackendKind::Metal, 8);
+    adapter
+        .install_test_preparation_seal(BackendKind::Metal, 8)
+        .unwrap();
     assert_eq!(
-        draft
-            .execution_contracts(CapabilityKind::Asr)
-            .unwrap()
-            .len(),
+        loaded_execution_contracts(&adapter).unwrap().len(),
         contracts.len()
     );
     assert_eq!(
         stage_graph_fingerprint(
-            &draft.capabilities[&CapabilityKind::Asr]
+            &adapter
                 .contract(StreamingRequirements::NONE)
                 .unwrap()
                 .stages

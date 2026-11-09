@@ -216,6 +216,7 @@ impl NativeExecutor {
                 stream_sequence: 0,
                 input_sample_rate: sample_rate,
                 input_sample_count: samples_len,
+                clock: Default::default(),
             })?;
             fresh_state = true;
         }
@@ -253,6 +254,7 @@ impl NativeExecutor {
                     cancelled = true;
                     break;
                 }
+                let call_started = std::time::Instant::now();
                 let step = if let Some((span_start, span_end)) = resumable_span {
                     let Some(prefill_complete) = run_asr_model_call(request, || {
                         Self::run_blocking(|| {
@@ -298,6 +300,11 @@ impl NativeExecutor {
                     };
                     step
                 };
+                if scheduled.is_prefill {
+                    active_state.clock.record_prefill(call_started.elapsed());
+                } else {
+                    active_state.clock.record_decode(call_started.elapsed());
+                }
                 if request.is_cancelled() {
                     cancelled = true;
                     break;
@@ -368,6 +375,17 @@ impl NativeExecutor {
             } else {
                 active_state.state.take_managed_write_completions()
             };
+            // A finishing row publishes its diagnostics once.
+            let diagnostics = (finished && !cancelled).then(|| {
+                let mut diagnostics = active_state.state.retained_terminal_diagnostics();
+                if let (Some(diagnostics), Some(graph)) = (
+                    diagnostics.as_mut(),
+                    active_state.model.decode_graph_diagnostics(),
+                ) {
+                    diagnostics["decode_graph"] = graph;
+                }
+                active_state.clock.diagnostics(diagnostics)
+            });
             Ok((
                 decode_steps_ran,
                 total_tokens_generated,
@@ -377,6 +395,7 @@ impl NativeExecutor {
                 active_state.input_sample_rate,
                 active_state.input_sample_count,
                 completions,
+                diagnostics,
             ))
         })();
 
@@ -389,6 +408,7 @@ impl NativeExecutor {
             input_sample_rate,
             input_sample_count,
             managed_cache_completions,
+            diagnostics,
         ) = match execution {
             Ok(execution) => execution,
             Err(error) => {
@@ -446,7 +466,7 @@ impl NativeExecutor {
             finished,
             phase_timing_override: initial_media_decode_ms
                 .map(ExecutorPhaseTiming::with_media_decode_ms),
-            asr_diagnostics: None,
+            asr_diagnostics: diagnostics,
             error: None,
             logprobs: Vec::new(),
         })

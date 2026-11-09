@@ -34,13 +34,17 @@ use crate::models::architectures::gemma3::chat::{
 use crate::models::architectures::granite_speech::asr::granite_speech_request_plan;
 use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechAsrGenerationOptions, GraniteSpeechAsrModel, GraniteSpeechAsrTranscriptionOutput,
-    GraniteSpeechDecodeCheckpoint, GraniteSpeechDecodeState, GraniteSpeechDecodeStep,
-    GraniteSpeechPhysicalStateSpec, GraniteSpeechPreparationBatchGeometry,
-    GraniteSpeechPreparationBatchRow, GraniteSpeechPreparedGeometry,
-    GraniteSpeechPreparedPromptArtifact, GraniteSpeechTask,
+    GraniteSpeechAudioFeatures, GraniteSpeechDecodeCheckpoint, GraniteSpeechDecodeState,
+    GraniteSpeechDecodeStep, GraniteSpeechFeatureRow, GraniteSpeechPhysicalStateSpec,
+    GraniteSpeechPreparationBatchGeometry, GraniteSpeechPreparationBatchRow,
+    GraniteSpeechPreparedGeometry, GraniteSpeechPreparedPromptArtifact, GraniteSpeechTask,
 };
 use crate::models::architectures::granite_speech5::asr::{
-    GraniteSpeech5AsrModel, GraniteSpeech5GenerationOptions, GraniteSpeech5PhysicalStateSpec,
+    GraniteSpeech5AsrModel, GraniteSpeech5AudioFeatures, GraniteSpeech5DecodeCheckpoint,
+    GraniteSpeech5DecodeState, GraniteSpeech5DecodeStep, GraniteSpeech5FeatureRow,
+    GraniteSpeech5GenerationOptions, GraniteSpeech5PhysicalStateSpec,
+    GraniteSpeech5PreparationBatchGeometry, GraniteSpeech5PreparationBatchRow,
+    GraniteSpeech5PreparedGeometry, GraniteSpeech5PreparedPromptArtifact,
     GraniteSpeech5RequestOptions, GraniteSpeech5Transcription, GRANITE_SPEECH5_MAX_AUDIO_SECONDS,
 };
 use crate::models::architectures::kokoro::KokoroTtsModel;
@@ -91,8 +95,8 @@ pub(crate) use crate::models::architectures::qwen3::asr::AlignmentUnit;
 use crate::models::architectures::qwen3::asr::{
     AsrDecodeCheckpoint as Qwen3AsrDecodeCheckpoint, AsrDecodeState as Qwen3AsrDecodeState,
     AsrDecodeStep as Qwen3AsrDecodeStep, AsrTranscriptionOutput as Qwen3AsrTranscriptionOutput,
-    Qwen3AsrAudioBatchRow, Qwen3AsrContextBound, Qwen3AsrModel, Qwen3AsrPhysicalStateSpec,
-    Qwen3AsrPreparedAudio,
+    Qwen3AsrAudioBatchRow, Qwen3AsrContextBound, Qwen3AsrHostFeatures, Qwen3AsrModel,
+    Qwen3AsrPhysicalStateSpec, Qwen3AsrPreparedAudio,
 };
 use crate::models::architectures::qwen3::chat::{
     ChatDecodeCheckpoint as Qwen3ChatDecodeCheckpoint, ChatDecodeState as Qwen3ChatDecodeState,
@@ -117,10 +121,11 @@ use crate::models::architectures::sortformer::diarization::{
 };
 use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrDecodeCheckpoint, VibeVoiceAsrDecodeState, VibeVoiceAsrDecodeStep,
-    VibeVoiceAsrGenerationOptions, VibeVoiceAsrModel, VibeVoiceAsrPreparationDecision,
-    VibeVoiceAsrPreparationStageSeal, VibeVoiceAsrPreparedArtifact,
-    VibeVoiceAsrPreparedTokenizerSpan, VibeVoiceAsrRetainedPrefillBatchRow,
-    VibeVoiceAsrRetainedTokenizerQuantum, VibeVoiceAsrTranscriptionOutput,
+    VibeVoiceAsrGenerationOptions, VibeVoiceAsrHostAudio, VibeVoiceAsrModel,
+    VibeVoiceAsrPreparationDecision, VibeVoiceAsrPreparationStageSeal,
+    VibeVoiceAsrPreparedArtifact, VibeVoiceAsrPreparedTokenizerSpan,
+    VibeVoiceAsrRetainedPrefillBatchRow, VibeVoiceAsrRetainedTokenizerQuantum,
+    VibeVoiceAsrTranscriptionOutput,
 };
 use crate::models::architectures::vibevoice::tts::VibeVoiceTtsModel;
 use crate::models::architectures::vibevoice::VibeVoicePhysicalStateSpec;
@@ -138,7 +143,7 @@ use crate::models::architectures::voxtral::tts::VoxtralTtsModel;
 use crate::models::architectures::whisper::asr::{
     AsrTranscriptionOutput as WhisperAsrTranscriptionOutput, WhisperAudioBatchRow,
     WhisperAudioPreparationStageSeal, WhisperDecodeCheckpoint, WhisperDecodeState,
-    WhisperPreparedWindow, WhisperTerminalTransition, WhisperTurboAsrModel,
+    WhisperHostFeatures, WhisperPreparedWindow, WhisperTerminalTransition, WhisperTurboAsrModel,
     WhisperWindowPreparationBatchGeometry, WhisperWindowPreparationGeometry,
 };
 use crate::models::architectures::whisper::WhisperPhysicalStateSpec;
@@ -1078,6 +1083,7 @@ pub enum NativeAsrDecodeState {
     Whisper(WhisperDecodeState),
     VibeVoice(VibeVoiceAsrDecodeState),
     GraniteSpeech(GraniteSpeechDecodeState),
+    GraniteSpeech5(GraniteSpeech5DecodeState),
     Nemotron(NemotronStreamingState),
 }
 
@@ -1086,9 +1092,20 @@ pub(crate) enum NativeAsrDecodeCheckpoint {
     Whisper(WhisperDecodeCheckpoint),
     VibeVoice(VibeVoiceAsrDecodeCheckpoint),
     GraniteSpeech(GraniteSpeechDecodeCheckpoint),
+    GraniteSpeech5(GraniteSpeech5DecodeCheckpoint),
 }
 
 impl NativeAsrDecodeState {
+    /// The family's own diagnostics for a row that ends on the retained
+    /// route, where it publishes any.
+    pub(crate) fn retained_terminal_diagnostics(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Qwen3(state) => Some(state.retained_terminal_diagnostics()),
+            Self::VibeVoice(state) => Some(state.retained_terminal_diagnostics()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn vibevoice_prepared_artifact(&self) -> Option<Arc<VibeVoiceAsrPreparedArtifact>> {
         match self {
             Self::VibeVoice(state) => state.prepared_artifact(),
@@ -1102,6 +1119,7 @@ impl NativeAsrDecodeState {
             Self::Whisper(state) => state.uses_managed_kv(),
             Self::VibeVoice(_) => true,
             Self::GraniteSpeech(state) => state.uses_managed_kv(),
+            Self::GraniteSpeech5(state) => state.uses_managed_kv(),
             Self::Nemotron(_) => false,
         }
     }
@@ -1114,6 +1132,7 @@ impl NativeAsrDecodeState {
             Self::Whisper(state) => state.take_managed_write_completions(),
             Self::VibeVoice(state) => state.take_managed_write_completions(),
             Self::GraniteSpeech(state) => state.take_managed_write_completions(),
+            Self::GraniteSpeech5(state) => state.take_managed_write_completions(),
             Self::Nemotron(_) => Vec::new(),
         }
     }
@@ -1124,6 +1143,7 @@ impl NativeAsrDecodeState {
             Self::Whisper(state) => Some(state.self_context_len()),
             Self::VibeVoice(state) => Some(state.sequence_position()),
             Self::GraniteSpeech(state) => Some(state.sequence_position()),
+            Self::GraniteSpeech5(state) => Some(state.sequence_position()),
             Self::Nemotron(_) => None,
         }
     }
@@ -1145,6 +1165,9 @@ impl NativeAsrDecodeState {
             Self::GraniteSpeech(state) => state
                 .begin_managed_quantum(cache)
                 .map(NativeAsrDecodeCheckpoint::GraniteSpeech),
+            Self::GraniteSpeech5(state) => state
+                .begin_managed_quantum(cache)
+                .map(NativeAsrDecodeCheckpoint::GraniteSpeech5),
             Self::Nemotron(_) => Err(Error::InvalidInput(
                 "managed Qwen3 KV cache was supplied to a non-Qwen3 ASR state".to_string(),
             )),
@@ -1166,11 +1189,13 @@ impl NativeAsrDecodeState {
             Self::Whisper(state) => state
                 .begin_managed_generation(cache, expected_generation, new_generation)
                 .map(NativeAsrDecodeCheckpoint::Whisper),
-            Self::Qwen3(_) | Self::VibeVoice(_) | Self::GraniteSpeech(_) | Self::Nemotron(_) => {
-                Err(Error::InvalidInput(
-                    "Whisper managed generation was supplied to another ASR state".into(),
-                ))
-            }
+            Self::Qwen3(_)
+            | Self::VibeVoice(_)
+            | Self::GraniteSpeech(_)
+            | Self::GraniteSpeech5(_)
+            | Self::Nemotron(_) => Err(Error::InvalidInput(
+                "Whisper managed generation was supplied to another ASR state".into(),
+            )),
         }
     }
 
@@ -1193,6 +1218,10 @@ impl NativeAsrDecodeState {
                 Self::GraniteSpeech(state),
                 NativeAsrDecodeCheckpoint::GraniteSpeech(mut checkpoint),
             ) => state.rollback_managed_quantum(&mut checkpoint),
+            (
+                Self::GraniteSpeech5(state),
+                NativeAsrDecodeCheckpoint::GraniteSpeech5(mut checkpoint),
+            ) => state.rollback_managed_quantum(&mut checkpoint),
             _ => Err(Error::InvalidInput(
                 "ASR managed checkpoint was supplied to a different decoder state".to_string(),
             )),
@@ -1214,6 +1243,10 @@ impl NativeAsrDecodeState {
                 Self::GraniteSpeech(state),
                 NativeAsrDecodeCheckpoint::GraniteSpeech(mut checkpoint),
             ) => state.commit_managed_quantum(&mut checkpoint),
+            (
+                Self::GraniteSpeech5(state),
+                NativeAsrDecodeCheckpoint::GraniteSpeech5(mut checkpoint),
+            ) => state.commit_managed_quantum(&mut checkpoint),
             (Self::Qwen3(_), NativeAsrDecodeCheckpoint::Qwen3(_)) => Ok(()),
             _ => Err(Error::InvalidInput(
                 "ASR managed checkpoint does not match its decoder state".into(),
@@ -1224,12 +1257,13 @@ impl NativeAsrDecodeState {
     pub(crate) fn bind_qwen3_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
         match self {
             Self::Qwen3(state) => state.bind_tensor_sequence(sequence),
-            Self::Whisper(_) | Self::VibeVoice(_) | Self::GraniteSpeech(_) | Self::Nemotron(_) => {
-                Err(Error::InvalidInput(
-                    "Qwen3 ASR tensor-state reservation was supplied to a non-Qwen3 state"
-                        .to_string(),
-                ))
-            }
+            Self::Whisper(_)
+            | Self::VibeVoice(_)
+            | Self::GraniteSpeech(_)
+            | Self::GraniteSpeech5(_)
+            | Self::Nemotron(_) => Err(Error::InvalidInput(
+                "Qwen3 ASR tensor-state reservation was supplied to a non-Qwen3 state".to_string(),
+            )),
         }
     }
 
@@ -1239,11 +1273,13 @@ impl NativeAsrDecodeState {
     ) -> Result<()> {
         match self {
             Self::Qwen3(state) => state.restore_prepared_tensor_state(arena),
-            Self::Whisper(_) | Self::VibeVoice(_) | Self::GraniteSpeech(_) | Self::Nemotron(_) => {
-                Err(Error::InvalidInput(
-                    "Qwen3 ASR tensor-state arena was supplied to a non-Qwen3 state".to_string(),
-                ))
-            }
+            Self::Whisper(_)
+            | Self::VibeVoice(_)
+            | Self::GraniteSpeech(_)
+            | Self::GraniteSpeech5(_)
+            | Self::Nemotron(_) => Err(Error::InvalidInput(
+                "Qwen3 ASR tensor-state arena was supplied to a non-Qwen3 state".to_string(),
+            )),
         }
     }
 
@@ -1254,11 +1290,13 @@ impl NativeAsrDecodeState {
     ) -> Result<()> {
         match self {
             Self::Qwen3(state) => state.stage_prepared_tensor_state(arena, transaction),
-            Self::Whisper(_) | Self::VibeVoice(_) | Self::GraniteSpeech(_) | Self::Nemotron(_) => {
-                Err(Error::InvalidInput(
-                    "Qwen3 ASR tensor-state arena was supplied to a non-Qwen3 state".to_string(),
-                ))
-            }
+            Self::Whisper(_)
+            | Self::VibeVoice(_)
+            | Self::GraniteSpeech(_)
+            | Self::GraniteSpeech5(_)
+            | Self::Nemotron(_) => Err(Error::InvalidInput(
+                "Qwen3 ASR tensor-state arena was supplied to a non-Qwen3 state".to_string(),
+            )),
         }
     }
 
@@ -1268,6 +1306,7 @@ impl NativeAsrDecodeState {
             Self::Whisper(state) => Some(state.prefill_progress()),
             Self::VibeVoice(state) => Some(state.prefill_progress()),
             Self::GraniteSpeech(state) => Some(state.prefill_progress()),
+            Self::GraniteSpeech5(state) => Some(state.prefill_progress()),
             Self::Nemotron(_) => None,
         }
     }
@@ -1278,6 +1317,7 @@ impl NativeAsrDecodeState {
             Self::Whisper(state) => Some(state.prefill_token_count()),
             Self::VibeVoice(state) => Some(state.prefill_token_count()),
             Self::GraniteSpeech(state) => Some(state.prefill_token_count()),
+            Self::GraniteSpeech5(state) => Some(state.prefill_token_count()),
             Self::Nemotron(_) => None,
         }
     }
@@ -1294,7 +1334,11 @@ impl NativeAsrDecodeState {
                         finished: step.finished,
                     })
             }
-            Self::Qwen3(_) | Self::Whisper(_) | Self::GraniteSpeech(_) | Self::Nemotron(_) => None,
+            Self::Qwen3(_)
+            | Self::Whisper(_)
+            | Self::GraniteSpeech(_)
+            | Self::GraniteSpeech5(_)
+            | Self::Nemotron(_) => None,
         }
     }
 }
@@ -1423,6 +1467,31 @@ fn granite_speech_asr_options(
 }
 
 impl NativeAsrModel {
+    /// The CUDA decode graphs of the Qwen3 trunk (Qwen3-ASR and
+    /// VibeVoice-ASR) and Whisper's decoder, `None` for every other family.
+    pub(crate) fn decode_graph_diagnostics(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Qwen3(model) => Some(model.decode_graph_diagnostics()),
+            Self::VibeVoice(model) => Some(model.decode_graph_diagnostics()),
+            Self::WhisperTurbo(model) => Some(model.decode_graph_diagnostics()),
+            _ => None,
+        }
+    }
+
+    /// Encodes Granite Speech prompt rows whose audio features a host worker
+    /// computed.
+    pub(crate) fn prepare_granite_speech_prompt_artifact_batch_from_features(
+        &self,
+        rows: Vec<GraniteSpeechFeatureRow<'_>>,
+    ) -> Result<Vec<Arc<GraniteSpeechPreparedPromptArtifact>>> {
+        match self {
+            Self::GraniteSpeech(model) => model.prepare_prompt_artifact_batch_from_features(rows),
+            _ => Err(Error::InvalidInput(
+                "Granite Speech batch preparation was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
     pub(crate) fn prepare_granite_speech_prompt_artifact_batch(
         &self,
         rows: &[GraniteSpeechPreparationBatchRow<'_>],
@@ -1461,6 +1530,121 @@ impl NativeAsrModel {
         }
     }
 
+    /// Encodes Granite Speech 5.0 rows whose audio features a host worker
+    /// computed.
+    pub(crate) fn prepare_granite_speech5_prompt_artifact_batch_from_features(
+        &self,
+        rows: Vec<GraniteSpeech5FeatureRow<'_>>,
+    ) -> Result<Vec<Arc<GraniteSpeech5PreparedPromptArtifact>>> {
+        match self {
+            Self::GraniteSpeech5(model) => model.prepare_prompt_artifact_batch_from_features(rows),
+            _ => Err(Error::InvalidInput(
+                "Granite Speech 5.0 batch preparation was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
+    /// One Granite Speech 5.0 request's audio features, computed on the
+    /// host, and the retained geometry they give.
+    pub(crate) fn granite_speech5_retained_preparation_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        request: &GraniteSpeech5RequestOptions,
+    ) -> Result<(GraniteSpeech5AudioFeatures, GraniteSpeech5PreparedGeometry)> {
+        match self {
+            Self::GraniteSpeech5(model) => {
+                model.retained_preparation_features(audio, sample_rate, request)
+            }
+            _ => Err(Error::InvalidInput(
+                "Granite Speech 5.0 features were requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn prepare_granite_speech5_prompt_artifact_batch(
+        &self,
+        rows: &[GraniteSpeech5PreparationBatchRow<'_>],
+    ) -> Result<Vec<Arc<GraniteSpeech5PreparedPromptArtifact>>> {
+        match self {
+            Self::GraniteSpeech5(model) => model.prepare_prompt_artifact_batch(rows),
+            _ => Err(Error::InvalidInput(
+                "Granite Speech 5.0 batch preparation was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn granite_speech5_retained_preparation_geometry(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        request: &GraniteSpeech5RequestOptions,
+    ) -> Result<GraniteSpeech5PreparedGeometry> {
+        match self {
+            Self::GraniteSpeech5(model) => {
+                model.retained_preparation_geometry(audio, sample_rate, request)
+            }
+            _ => Err(Error::InvalidInput(
+                "Granite Speech 5.0 preparation geometry was requested from another ASR model"
+                    .into(),
+            )),
+        }
+    }
+
+    pub(crate) fn granite_speech5_preparation_batch_geometry(
+        &self,
+        rows: &[GraniteSpeech5PreparedGeometry],
+    ) -> Result<GraniteSpeech5PreparationBatchGeometry> {
+        match self {
+            Self::GraniteSpeech5(model) => model.preparation_batch_geometry(rows),
+            _ => Err(Error::InvalidInput(
+                "Granite Speech 5.0 batch geometry was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn granite_speech5_preparation_row_cost_for_batch(
+        &self,
+        index: usize,
+        rows: &[GraniteSpeech5PreparedGeometry],
+        batch: GraniteSpeech5PreparationBatchGeometry,
+    ) -> Result<WorkCost> {
+        match self {
+            Self::GraniteSpeech5(model) => model.preparation_row_cost_for_batch(index, rows, batch),
+            _ => Err(Error::InvalidInput(
+                "Granite Speech 5.0 batch cost was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    /// Resamples and turns one Qwen3-ASR request's audio into its log-mel on
+    /// the host.
+    pub(crate) fn prepare_qwen3_host_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<Qwen3AsrHostFeatures> {
+        match self {
+            Self::Qwen3(model) => model.prepare_host_features(audio, sample_rate),
+            _ => Err(Error::InvalidInput(
+                "Qwen3 ASR features were requested from another ASR model".to_string(),
+            )),
+        }
+    }
+
+    /// Runs the Qwen3-ASR audio tower over host-computed features.
+    pub(crate) fn prepare_qwen3_audio_tower_from_features(
+        &self,
+        rows: &[&Qwen3AsrHostFeatures],
+    ) -> Result<Vec<Qwen3AsrPreparedAudio>> {
+        match self {
+            Self::Qwen3(model) => model.prepare_audio_tower_from_features(rows),
+            _ => Err(Error::InvalidInput(
+                "Qwen3 ASR audio-tower preparation was supplied to another ASR model".to_string(),
+            )),
+        }
+    }
+
     pub(crate) fn prepare_qwen3_audio_tower_batch(
         &self,
         rows: &[Qwen3AsrAudioBatchRow<'_>],
@@ -1495,6 +1679,34 @@ impl NativeAsrModel {
             Self::WhisperTurbo(model) => model.window_preparation_stage_seal(backend, width),
             _ => Err(Error::InvalidInput(
                 "Whisper preparation seal was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    /// Trims, resamples and turns one Whisper request's audio into its
+    /// window's log-mel on the host.
+    pub(crate) fn prepare_whisper_host_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<WhisperHostFeatures> {
+        match self {
+            Self::WhisperTurbo(model) => model.prepare_host_features(audio, sample_rate),
+            _ => Err(Error::InvalidInput(
+                "Whisper features were requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    /// Encodes Whisper windows whose log-mel a host worker computed.
+    pub(crate) fn prepare_whisper_window_batch_from_features(
+        &self,
+        rows: &[&WhisperHostFeatures],
+    ) -> Result<Vec<WhisperPreparedWindow>> {
+        match self {
+            Self::WhisperTurbo(model) => model.prepare_window_batch_from_features(rows),
+            _ => Err(Error::InvalidInput(
+                "Whisper window preparation was supplied to another ASR model".into(),
             )),
         }
     }
@@ -2103,6 +2315,32 @@ impl NativeAsrModel {
         }
     }
 
+    /// One Granite Speech request's audio features, computed on the host,
+    /// and the retained geometry they give.
+    pub(crate) fn granite_speech_retained_preparation_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<(GraniteSpeechAudioFeatures, GraniteSpeechPreparedGeometry)> {
+        match self {
+            Self::GraniteSpeech(model) => {
+                let features = model.prepare_audio_features(audio, sample_rate)?;
+                let geometry = model.retained_preparation_geometry_for_features(
+                    &features,
+                    audio.len(),
+                    language,
+                    prompt,
+                )?;
+                Ok((features, geometry))
+            }
+            _ => Err(Error::InvalidInput(
+                "Granite Speech features were requested from another ASR model".into(),
+            )),
+        }
+    }
+
     pub(crate) fn granite_speech_retained_preparation_geometry(
         &self,
         audio: &[f32],
@@ -2305,6 +2543,42 @@ impl NativeAsrModel {
             ),
             _ => Err(Error::InvalidInput(
                 "VibeVoice preparation route was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    /// Resamples, normalizes and pads one VibeVoice request's audio on the
+    /// host.
+    pub(crate) fn prepare_vibevoice_retained_host_audio(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<VibeVoiceAsrHostAudio> {
+        match self {
+            Self::VibeVoice(model) => {
+                model.prepare_retained_host_audio(audio, sample_rate, language, prompt)
+            }
+            _ => Err(Error::InvalidInput(
+                "VibeVoice audio was requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    /// Builds one VibeVoice request's retained artifact from its host audio.
+    pub(crate) fn prepare_vibevoice_retained_artifact_from_host_audio(
+        &self,
+        host: VibeVoiceAsrHostAudio,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<VibeVoiceAsrPreparedArtifact> {
+        match self {
+            Self::VibeVoice(model) => {
+                model.prepare_retained_artifact_from_host_audio(host, language, prompt)
+            }
+            _ => Err(Error::InvalidInput(
+                "VibeVoice preparation was requested from another ASR model".into(),
             )),
         }
     }
@@ -2878,6 +3152,17 @@ impl NativeAsrModel {
         }
     }
 
+    /// Tokens per row and engine step a transducer's retained decode asks
+    /// the scheduler for (Parakeet and Nemotron ASR on CUDA with their
+    /// device dispatches); one for every other model.
+    pub(crate) fn transducer_decode_quantum(&self) -> usize {
+        match self {
+            Self::Parakeet(model) => model.decode_quantum(),
+            Self::Nemotron(model) => model.decode_quantum(),
+            _ => 1,
+        }
+    }
+
     /// The loaded Nemotron 3.5 Transcribe model.
     pub(crate) fn nemotron_transcribe(
         &self,
@@ -2895,6 +3180,7 @@ impl NativeAsrModel {
             Self::Qwen3(_) => true,
             Self::NemotronTranscribe(_) => true,
             Self::GraniteSpeech(model) => model.supports_incremental_decode(),
+            Self::GraniteSpeech5(model) => model.supports_incremental_decode(),
             _ => false,
         }
     }
@@ -2904,6 +3190,7 @@ impl NativeAsrModel {
             Self::Qwen3(model) => model.supports_resumable_prefill(),
             Self::VibeVoice(_) => true,
             Self::GraniteSpeech(model) => model.supports_resumable_prefill(),
+            Self::GraniteSpeech5(model) => model.supports_resumable_prefill(),
             Self::NemotronTranscribe(_) => true,
             _ => false,
         }
@@ -2915,9 +3202,9 @@ impl NativeAsrModel {
             Self::Parakeet(_) | Self::Nemotron(_) => true,
             Self::VibeVoice(model) => model.supports_continuous_decode_batch(),
             Self::GraniteSpeech(model) => model.supports_continuous_decode_batch(),
+            Self::GraniteSpeech5(model) => model.supports_continuous_decode_batch(),
             Self::NemotronTranscribe(_) => true,
             Self::WhisperTurbo(model) => model.supports_continuous_decode_batch(),
-            _ => false,
         }
     }
 
@@ -2937,6 +3224,7 @@ impl NativeAsrModel {
                 self,
                 Self::VibeVoice(_)
                     | Self::GraniteSpeech(_)
+                    | Self::GraniteSpeech5(_)
                     | Self::NemotronTranscribe(_)
                     | Self::WhisperTurbo(_)
             )
@@ -2950,6 +3238,7 @@ impl NativeAsrModel {
             ),
             Self::VibeVoice(model) => model.continuous_decode_workspace_per_row_bytes(),
             Self::GraniteSpeech(model) => model.continuous_decode_workspace_per_row_bytes(),
+            Self::GraniteSpeech5(model) => model.continuous_decode_workspace_per_row_bytes(),
             Self::NemotronTranscribe(model) => Ok(model.decode_workspace_per_row_bytes()),
             Self::WhisperTurbo(model) => model.continuous_decode_workspace_per_row_bytes(),
             _ => Err(Error::InvalidInput(
@@ -3439,6 +3728,30 @@ impl NativeAsrModel {
         }
     }
 
+    pub(crate) fn start_granite_speech5_resumable_prefill_managed(
+        &self,
+        prepared: Arc<GraniteSpeech5PreparedPromptArtifact>,
+        options: NativeAsrGenerationOptions,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeAsrDecodeState> {
+        match self {
+            Self::GraniteSpeech5(model) => Ok(NativeAsrDecodeState::GraniteSpeech5(
+                model.begin_resumable_prefill_managed(
+                    prepared,
+                    GraniteSpeech5GenerationOptions {
+                        max_new_tokens: options.max_new_tokens,
+                        stop_token_ids: options.stop_token_ids,
+                        stop_sequences: options.stop_sequences,
+                    },
+                    cache,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "prepared Granite Speech 5.0 input was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
     pub(crate) fn continue_resumable_prefill(
         &self,
         state: &mut NativeAsrDecodeState,
@@ -3453,6 +3766,9 @@ impl NativeAsrModel {
                 model.continue_resumable_prefill(state, span_start, span_end)
             }
             (Self::GraniteSpeech(model), NativeAsrDecodeState::GraniteSpeech(state)) => {
+                model.continue_resumable_prefill(state, span_start, span_end)
+            }
+            (Self::GraniteSpeech5(model), NativeAsrDecodeState::GraniteSpeech5(state)) => {
                 model.continue_resumable_prefill(state, span_start, span_end)
             }
             _ => Err(Error::InvalidInput(
@@ -3555,6 +3871,15 @@ impl NativeAsrModel {
                     finished: step.finished,
                 })
             }
+            (Self::GraniteSpeech5(model), NativeAsrDecodeState::GraniteSpeech5(state)) => {
+                let step: GraniteSpeech5DecodeStep = model.decode_step(state)?;
+                Ok(NativeAsrDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    finished: step.finished,
+                })
+            }
             _ => Err(Error::InvalidInput(
                 "ASR decode state does not match loaded ASR model".to_string(),
             )),
@@ -3617,6 +3942,29 @@ impl NativeAsrModel {
                         NativeAsrDecodeState::GraniteSpeech(state) => Ok(state),
                         _ => Err(Error::InvalidInput(
                             "continuous Granite Speech ASR batch contains a foreign state"
+                                .to_string(),
+                        )),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                model.decode_step_batch(&mut typed).map(|steps| {
+                    steps
+                        .into_iter()
+                        .map(|step| NativeAsrDecodeStep {
+                            delta: step.delta,
+                            text: step.text,
+                            tokens_generated: step.tokens_generated,
+                            finished: step.finished,
+                        })
+                        .collect()
+                })
+            }
+            Self::GraniteSpeech5(model) => {
+                let mut typed = states
+                    .iter_mut()
+                    .map(|state| match &mut **state {
+                        NativeAsrDecodeState::GraniteSpeech5(state) => Ok(state),
+                        _ => Err(Error::InvalidInput(
+                            "continuous Granite Speech 5.0 ASR batch contains a foreign state"
                                 .to_string(),
                         )),
                     })

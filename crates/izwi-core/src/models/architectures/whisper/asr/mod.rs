@@ -129,6 +129,26 @@ pub(crate) struct WhisperAudioBatchRow<'a> {
     pub(crate) sample_rate: u32,
 }
 
+/// One request's encoder input, computed on a host worker: the 30 s window's
+/// log-mel of its trimmed 16 kHz audio, mel-major as the encoder reads it.
+pub(crate) struct WhisperHostFeatures {
+    mel: Vec<f32>,
+    source_identity: [u8; 32],
+    input_samples: usize,
+    input_sample_rate: u32,
+}
+
+impl WhisperHostFeatures {
+    /// Host bytes the features hold until the encode drops them.
+    pub(crate) fn host_bytes(&self) -> Result<u64> {
+        self.mel
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| Error::Overloaded("Whisper host feature bytes overflow".into()))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WhisperWindowPreparationGeometry {
     pub(crate) input_samples: usize,
@@ -915,6 +935,12 @@ impl WhisperModel {
         LocalWhisper::load(vb, config).map(Self::Local)
     }
 
+    fn decode_graphs_diagnostics(&self) -> serde_json::Value {
+        match self {
+            Self::Local(model) => model.decoder.decode_graphs_diagnostics(),
+        }
+    }
+
     fn encoder_forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Local(model) => model.encoder.forward(x),
@@ -1229,6 +1255,12 @@ pub(crate) fn whisper_weight_files(model_dir: &Path) -> Result<Vec<std::path::Pa
 }
 
 impl WhisperTurboAsrModel {
+    /// The decoder's CUDA step graphs: captures, replays and why they are
+    /// off.
+    pub(crate) fn decode_graph_diagnostics(&self) -> serde_json::Value {
+        self.whisper.decode_graphs_diagnostics()
+    }
+
     pub fn load(model_dir: &Path, device: DeviceProfile) -> Result<Self> {
         let config_path = model_dir.join("config.json");
         let config_data = fs::read_to_string(config_path)?;
@@ -1518,14 +1550,11 @@ impl WhisperTurboAsrModel {
             .ok_or_else(|| {
                 Error::Overloaded("Whisper device workspace geometry overflow".into())
             })?;
+        // Each row's resample and log-mel ran on a host worker, priced with
+        // its request; the batch holds only each window's upload copy.
         let host_elements = rows.iter().try_fold(0_u64, |total, row| {
             total
-                .checked_add(
-                    u64::try_from(row.resampled_samples).map_err(|_| {
-                        Error::Overloaded("Whisper resampled row exceeds u64".into())
-                    })?,
-                )
-                .and_then(|value| value.checked_add(row.materialized_mel_elements))
+                .checked_add(row.materialized_mel_elements)
                 .ok_or_else(|| Error::Overloaded("Whisper host workspace geometry overflow".into()))
         })?;
         let workspace_bytes = device_elements
@@ -1613,31 +1642,62 @@ impl WhisperTurboAsrModel {
         })
     }
 
+    /// Trims, resamples and turns one request's audio into its window's
+    /// log-mel on the host, so a device job runs only the upload and encoder.
+    pub(crate) fn prepare_host_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<WhisperHostFeatures> {
+        if audio.is_empty() || sample_rate == 0 {
+            return Err(Error::InvalidInput(
+                "Whisper window preparation received an empty row".into(),
+            ));
+        }
+        let trimmed = self.trimmed_audio_slice(audio, sample_rate);
+        Ok(WhisperHostFeatures {
+            mel: self.log_mel_host(trimmed, sample_rate)?,
+            source_identity: whisper_cross_source_identity(trimmed, sample_rate),
+            input_samples: audio.len(),
+            input_sample_rate: sample_rate,
+        })
+    }
+
     pub(crate) fn prepare_window_batch(
         &self,
         rows: &[WhisperAudioBatchRow<'_>],
+    ) -> Result<Vec<WhisperPreparedWindow>> {
+        let features = rows
+            .iter()
+            .map(|row| self.prepare_host_features(row.audio, row.sample_rate))
+            .collect::<Result<Vec<_>>>()?;
+        self.prepare_window_batch_from_features(&features.iter().collect::<Vec<_>>())
+    }
+
+    /// Encodes windows whose log-mel a host worker computed, as one batch.
+    pub(crate) fn prepare_window_batch_from_features(
+        &self,
+        rows: &[&WhisperHostFeatures],
     ) -> Result<Vec<WhisperPreparedWindow>> {
         if rows.is_empty() {
             return Err(Error::InvalidInput(
                 "Whisper window preparation requires at least one row".into(),
             ));
         }
-        let mut mels = Vec::with_capacity(rows.len());
-        let mut identities = Vec::with_capacity(rows.len());
-        for row in rows {
-            if row.audio.is_empty() || row.sample_rate == 0 {
-                return Err(Error::InvalidInput(
-                    "Whisper window preparation received an empty row".into(),
-                ));
-            }
-            let trimmed = self.trimmed_audio_slice(row.audio, row.sample_rate);
-            mels.push(self.prepare_mel(trimmed, row.sample_rate)?);
-            identities.push((
-                whisper_cross_source_identity(trimmed, row.sample_rate),
-                row.audio.len(),
-                row.sample_rate,
-            ));
-        }
+        let mels = rows
+            .iter()
+            .map(|row| self.upload_mel(&row.mel))
+            .collect::<Result<Vec<_>>>()?;
+        let identities = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.source_identity,
+                    row.input_samples,
+                    row.input_sample_rate,
+                )
+            })
+            .collect::<Vec<_>>();
         let mel_refs = mels.iter().collect::<Vec<_>>();
         let mel_batch = Tensor::cat(&mel_refs, 0)?;
         let encoded = self.whisper.encoder_forward_batch(&mel_batch)?;
@@ -2806,6 +2866,11 @@ impl WhisperTurboAsrModel {
     }
 
     fn prepare_mel(&self, audio: &[f32], sample_rate: u32) -> Result<Tensor> {
+        self.upload_mel(&self.log_mel_host(audio, sample_rate)?)
+    }
+
+    /// The window's log-mel of `audio`, resampled to 16 kHz, mel-major.
+    fn log_mel_host(&self, audio: &[f32], sample_rate: u32) -> Result<Vec<f32>> {
         let mono_16khz = if sample_rate == SAMPLE_RATE {
             audio.to_vec()
         } else {
@@ -2827,7 +2892,14 @@ impl WhisperTurboAsrModel {
             }
         }
 
-        let mel = Tensor::from_vec(flat, (1, n_mels, frames), &self.device.device)?;
+        Ok(flat)
+    }
+
+    /// Uploads one window's mel-major log-mel as the encoder's input.
+    fn upload_mel(&self, mel: &[f32]) -> Result<Tensor> {
+        let frames = self.config.max_source_positions.saturating_mul(2).max(1);
+        let n_mels = self.config.num_mel_bins;
+        let mel = Tensor::from_slice(mel, (1, n_mels, frames), &self.device.device)?;
         if mel.dtype() != self.model_dtype {
             return Ok(mel.to_dtype(self.model_dtype)?);
         }
@@ -3047,6 +3119,7 @@ impl WhisperTurboAsrModel {
     }
 
     fn decode_generated_text(&self, token_ids: &[u32]) -> Result<String> {
+        let _detok = crate::engine::metrics::asr_detok_scope();
         self.tokenizer.decode(token_ids)
     }
 
@@ -5987,6 +6060,37 @@ mod tests {
         }
     }
 
+    /// The host-worker log-mel uploads to exactly the tensor the in-job
+    /// front end builds, at 16 kHz and after a resample, and is priced as the
+    /// mel-major window it holds.
+    #[test]
+    fn host_features_upload_exactly_like_the_in_job_front_end() {
+        let model = tiny_asr_model(&Device::Cpu);
+        let frames = model.config.max_source_positions.saturating_mul(2).max(1);
+        let window = frames * model.config.num_mel_bins;
+        for rate in [16_000_u32, 8_000] {
+            let audio = (0..rate as usize)
+                .map(|index| (index as f32 * 0.011).sin() * 0.3)
+                .collect::<Vec<f32>>();
+            let features = model.prepare_host_features(&audio, rate).unwrap();
+            assert_eq!(features.host_bytes().unwrap(), (window * 4) as u64);
+            assert_eq!(features.input_samples, audio.len());
+            let trimmed = model.trimmed_audio_slice(&audio, rate);
+            let reference = model.prepare_mel(trimmed, rate).unwrap();
+            let uploaded = model.upload_mel(&features.mel).unwrap();
+            assert_eq!(
+                uploaded.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                reference.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            );
+            assert_eq!(
+                features.source_identity,
+                super::whisper_cross_source_identity(trimmed, rate)
+            );
+        }
+        assert!(model.prepare_host_features(&[], 16_000).is_err());
+        assert!(model.prepare_window_batch_from_features(&[]).is_err());
+    }
+
     /// A retained row of the tiny model over its own audio memory and
     /// `prompt`, prefilled and ready to decode.
     fn tiny_prefilled_state(
@@ -6180,6 +6284,62 @@ mod tests {
             3,
             "the short budget ends row 2"
         );
+    }
+
+    /// A retained step through the CUDA graphs' segments (rows padded to a
+    /// graph width of 6, attention eager over the real rows; run eagerly here)
+    /// decodes each row as it decodes alone: the same steps and tokens, and
+    /// next logits within F32 rounding.
+    #[test]
+    fn graph_segmented_retained_steps_decode_each_row_as_alone() {
+        use crate::models::architectures::whisper::model::SEGMENTED_STEP_FOR_TEST;
+        let model = tiny_asr_model(&Device::Cpu);
+        let mut alone = batch_test_states(&model);
+        let mut together = batch_test_states(&model);
+        for step in 0..14 {
+            let live = (0..alone.len())
+                .filter(|row| !alone[*row].finished)
+                .collect::<Vec<_>>();
+            if live.is_empty() {
+                break;
+            }
+            let expected = live
+                .iter()
+                .map(|row| model.decode_step_retained(&mut alone[*row]).unwrap())
+                .collect::<Vec<_>>();
+            let mut refs = together
+                .iter_mut()
+                .enumerate()
+                .filter(|(row, _)| live.contains(row))
+                .map(|(_, state)| state)
+                .collect::<Vec<_>>();
+            // Six rows at least: two or more spare rows every step.
+            SEGMENTED_STEP_FOR_TEST.with(|width| width.set(6));
+            let actual = model.decode_step_retained_batch(&mut refs);
+            SEGMENTED_STEP_FOR_TEST.with(|width| width.set(0));
+            assert_eq!(actual.unwrap(), expected, "step {step}");
+            for row in &live {
+                let (a, b) = (&alone[*row], &together[*row]);
+                assert_eq!(
+                    a.generated_tokens, b.generated_tokens,
+                    "step {step} row {row}"
+                );
+                assert_eq!(a.finished, b.finished);
+                assert_eq!(a.self_kv.context_len(), b.self_kv.context_len());
+                if let (Some(a), Some(b)) = (&a.pending_logits, &b.pending_logits) {
+                    let difference = (a - b)
+                        .unwrap()
+                        .abs()
+                        .unwrap()
+                        .max_all()
+                        .unwrap()
+                        .to_scalar::<f32>()
+                        .unwrap();
+                    assert!(difference <= 1e-4, "step {step} row {row}: {difference}");
+                }
+            }
+        }
+        assert!(together.iter().all(|state| state.finished));
     }
 
     /// A step that fails after the rows picked their tokens (here one

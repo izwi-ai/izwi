@@ -17,7 +17,7 @@ mod tokenizer;
 pub use model::VoxtralRealtimeModel;
 pub(crate) use model::VOXTRAL_REALTIME_OFFLINE_AUDIO_SECONDS_HINT;
 pub(crate) use model::{
-    VoxtralOfflinePreparedAudio, VoxtralRealtimeCheckpoint, VoxtralRealtimeDecodeBatchRow,
+    VoxtralOfflineFeatures, VoxtralOfflinePreparedAudio, VoxtralRealtimeCheckpoint, VoxtralRealtimeDecodeBatchRow,
     VoxtralRealtimePreparationBatchGeometry, VoxtralRealtimePreparationBatchRow,
     VoxtralRealtimePreparationGeometry, VoxtralRealtimePreparationMode,
     VoxtralRealtimePreparationStageSeal, VoxtralRealtimePreparedAudio,

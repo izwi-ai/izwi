@@ -17,6 +17,9 @@ use crate::kernels::{
     try_fused_rms_norm, try_fused_rope_pair_bshd, try_fused_silu_mul_with_status,
 };
 use crate::models::shared::attention::geometry::AttentionGeometry;
+use crate::models::shared::attention::mixed::{
+    MixedRowLayout, MixedRowSpan, PreparedPhysicalMixedStep,
+};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::memory::exact::exact_concat_rows;
 use crate::models::shared::rope::{rope_frequencies, RopeFrequencies, RopeScaling};
@@ -29,6 +32,7 @@ use crate::models::shared::weights::token_table::QuantizedTokenTable;
 
 use super::config::GraniteSpeech5TextConfig;
 use super::precision::{self, LmExecutionPlan};
+use super::GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS;
 
 /// Attention geometry, checked before any head-dimension division.
 pub(super) fn text_attention_geometry(
@@ -106,11 +110,26 @@ impl LinearNoBias {
 
     /// Run in the compute dtype, returning `output_dtype`.
     fn forward_cast(&self, x: &Tensor, output_dtype: DType) -> Result<Tensor> {
+        self.forward_cast_in(x, output_dtype, RowMode::Sequence)
+    }
+
+    /// [`Self::forward`] over `x` laid out as `mode` says.
+    fn forward_in(&self, x: &Tensor, mode: RowMode) -> Result<Tensor> {
+        match mode {
+            RowMode::Sequence => self.forward(x),
+            RowMode::DecodeRows => {
+                project_decode_rows(x, matches!(self, Self::Quantized(_)), |x| self.forward(x))
+            }
+        }
+    }
+
+    /// [`Self::forward_cast`] over `x` laid out as `mode` says.
+    fn forward_cast_in(&self, x: &Tensor, output_dtype: DType, mode: RowMode) -> Result<Tensor> {
         let compute_dtype = self.compute_dtype();
         let out = if x.dtype() == compute_dtype {
-            self.forward(x)?
+            self.forward_in(x, mode)?
         } else {
-            self.forward(&x.to_dtype(compute_dtype)?)?
+            self.forward_in(&x.to_dtype(compute_dtype)?, mode)?
         };
         if out.dtype() == output_dtype {
             Ok(out)
@@ -118,6 +137,46 @@ impl LinearNoBias {
             out.to_dtype(output_dtype).map_err(Error::from)
         }
     }
+}
+
+/// How a projection's input is laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowMode {
+    /// One request's positions (`[1, sequence, in]`): one call.
+    Sequence,
+    /// One decode step's rows, one per request (`[1, rows, in]`): each row
+    /// rounds as it would alone (see [`project_decode_rows`]).
+    DecodeRows,
+}
+
+/// Runs `project` over a decode step's rows `x` (`[1, rows, in]`) so each
+/// row's sums round the same however many requests share the step: Candle
+/// picks a matmul kernel and its tiles from the row count, so a row beside
+/// others would otherwise get other bits than alone and greedy decoding
+/// could flip on a near-tie. On the CPU and Metal each dense row runs as the
+/// `[1, 1, in]` call a lone decode step makes (Metal's `gemv`; the few rows
+/// those devices batch cost little); a quantized projection runs one call
+/// on the CPU, whose quantized matmul already works row by row, and on
+/// Metal takes Candle's single-row `mv` kernel for each row through a
+/// `[rows, 1, in]` layout. CUDA runs every row in one call.
+fn project_decode_rows(
+    x: &Tensor,
+    quantized: bool,
+    project: impl Fn(&Tensor) -> Result<Tensor>,
+) -> Result<Tensor> {
+    let (_, rows, columns) = x.dims3()?;
+    let device = x.device();
+    if rows == 1 || device.is_cuda() || (device.is_cpu() && quantized) {
+        return project(x);
+    }
+    if quantized {
+        let products = project(&x.reshape((rows, 1, columns))?)?;
+        return products.reshape((1, rows, ())).map_err(Error::from);
+    }
+    let products = (0..rows)
+        .map(|row| project(&x.narrow(1, row, 1)?.contiguous()?))
+        .collect::<Result<Vec<_>>>()?;
+    Tensor::cat(&products, 1).map_err(Error::from)
 }
 
 fn cached_linear_forward(x: &Tensor, weight_t: &Tensor) -> Result<Tensor> {
@@ -180,6 +239,31 @@ impl RopeCache {
             packed: self.packed.narrow(0, start, len)?,
         })
     }
+
+    /// The rows at `positions`, in order: one index upload and one gather
+    /// per table.
+    fn gather(&self, positions: &[usize]) -> Result<RopeSlice> {
+        let rows = self.cos.dim(0)?;
+        let indices = positions
+            .iter()
+            .map(|&position| {
+                u32::try_from(position)
+                    .ok()
+                    .filter(|_| position < rows)
+                    .ok_or_else(|| {
+                        Error::InferenceError(format!(
+                            "Granite Speech 5.0 RoPE table has {rows} positions, not {position}"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let indices = Tensor::from_vec(indices, positions.len(), self.cos.device())?;
+        Ok(RopeSlice {
+            cos: self.cos.index_select(&indices, 0)?,
+            sin: self.sin.index_select(&indices, 0)?,
+            packed: self.packed.index_select(&indices, 0)?,
+        })
+    }
 }
 
 /// The token table: dense, or the GGUF release's quantized table.
@@ -219,6 +303,30 @@ pub(super) struct GraniteLanguageModel {
     device: Device,
     residual_branches_prescaled: bool,
     plan: LmExecutionPlan,
+    /// RoPE rows for every position a retained sequence reaches
+    /// ([`retained_rope_positions`]), built once at load in the dtype a
+    /// request's own table takes. Retained prefill spans slice it, and a
+    /// batched decode step gathers its rows' positions from it.
+    rope_table: RopeCache,
+}
+
+/// Positions the load-time RoPE table covers: a retained sequence's longest
+/// prompt and budget ([`GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS`]), within
+/// the decoder context. Longer sequences run on the atomic route, which
+/// builds its own table.
+fn retained_rope_positions(config: &GraniteSpeech5TextConfig) -> usize {
+    config
+        .max_position_embeddings
+        .min(GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS)
+}
+
+/// The dtype of a RoPE table for a model with `plan` and base `dtype`.
+fn rope_table_dtype(plan: LmExecutionPlan, device: &Device, dtype: DType) -> DType {
+    if plan.f16_attention_core && precision::rope_cache_in_attention_dtype(device) {
+        DType::F16
+    } else {
+        dtype
+    }
 }
 
 impl GraniteLanguageModel {
@@ -265,6 +373,13 @@ impl GraniteLanguageModel {
             };
             linear_no_bias(config.hidden_size, config.vocab_size, head_vb.pp("lm_head"))?
         };
+        let rope_table = RopeCache::build(
+            &rope,
+            0,
+            retained_rope_positions(config),
+            vb.device(),
+            rope_table_dtype(plan, vb.device(), vb.dtype()),
+        )?;
         Ok(Self {
             embed_tokens: TokenEmbedding {
                 table: TokenTable::Dense(table),
@@ -279,6 +394,7 @@ impl GraniteLanguageModel {
             device: vb.device().clone(),
             residual_branches_prescaled,
             plan,
+            rope_table,
         })
     }
 
@@ -369,6 +485,13 @@ impl GraniteLanguageModel {
                 config.hidden_size
             )));
         }
+        let rope_table = RopeCache::build(
+            &rope,
+            0,
+            retained_rope_positions(config),
+            device,
+            rope_table_dtype(plan, device, dtype),
+        )?;
         Ok(Self {
             embed_tokens: TokenEmbedding {
                 table: TokenTable::Quantized(table),
@@ -383,6 +506,7 @@ impl GraniteLanguageModel {
             device: device.clone(),
             residual_branches_prescaled: false,
             plan,
+            rope_table,
         })
     }
 
@@ -407,11 +531,17 @@ impl GraniteLanguageModel {
     }
 
     fn rope_dtype(&self) -> DType {
-        if self.plan.f16_attention_core && precision::rope_cache_in_attention_dtype(&self.device) {
-            DType::F16
-        } else {
-            self.embed_tokens.dtype
-        }
+        rope_table_dtype(self.plan, &self.device, self.embed_tokens.dtype)
+    }
+
+    /// The dtype of the token embeddings and of a prepared prompt.
+    pub(super) fn embedding_dtype(&self) -> DType {
+        self.embed_tokens.dtype
+    }
+
+    /// The load-time RoPE table over a retained sequence's positions.
+    pub(super) fn rope_table(&self) -> &RopeCache {
+        &self.rope_table
     }
 
     /// The RoPE table for positions `0..total_len`, built once per invocation.
@@ -533,6 +663,73 @@ impl GraniteLanguageModel {
         Ok(logits)
     }
 
+    /// One decode step for several requests: row `i` appends `tokens[i]`
+    /// (`[rows]` U32) at `positions[i]` of `caches[i]`, which all share one
+    /// arena. Returns each row's (unscaled) logits, `[rows, vocab]`. RoPE
+    /// rows are gathered once from the load-time table, the K/V append and
+    /// paged attention run once per layer for every row
+    /// (row-invariantly), and projections keep each row's rounding its own
+    /// ([`project_decode_rows`]), so a row decodes the same alone as beside
+    /// others. Every row's cache advances by one, or none does.
+    pub(super) fn forward_decode_rows(
+        &self,
+        tokens: &Tensor,
+        positions: &[usize],
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<Tensor> {
+        let rows = tokens.dims1()?;
+        if rows == 0 || positions.len() != rows || caches.len() != rows {
+            return Err(Error::InvalidInput(format!(
+                "Granite Speech 5.0 decode step needs one position and cache per token, got {rows} tokens, {} positions and {} caches",
+                positions.len(),
+                caches.len()
+            )));
+        }
+        for (cache, &position) in caches.iter().zip(positions) {
+            cache.validate_model(
+                self.cfg.num_hidden_layers,
+                self.cfg.num_key_value_heads,
+                self.head_dim,
+            )?;
+            if cache.context_len() != position {
+                return Err(Error::InvalidInput(format!(
+                    "Granite Speech 5.0 decode position {position} does not continue its cache at {}",
+                    cache.context_len()
+                )));
+            }
+        }
+        let rope = self.rope_table.gather(positions)?;
+        let layout = MixedRowLayout::new(
+            positions
+                .iter()
+                .map(|&start_pos| MixedRowSpan {
+                    start_pos,
+                    q_len: 1,
+                })
+                .collect(),
+            rows,
+        )?;
+        let (step, logits) = {
+            let refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
+            let mut step =
+                PreparedPhysicalMixedStep::new(&refs, layout)?.with_row_invariant_decode();
+            let logits = (|| -> Result<Tensor> {
+                let embeds = self.embed_tokens.forward(&tokens.reshape((1, rows))?)?;
+                let mut x = (embeds * f64::from(self.cfg.embedding_multiplier))?;
+                for (idx, layer) in self.layers.iter().enumerate() {
+                    x = layer.forward_decode_rows(&x, &refs, &mut step, idx, &rope)?;
+                }
+                let hidden = rms_norm_forward(&self.norm, &x)?;
+                self.lm_head
+                    .forward_cast_in(&hidden, self.lm_head.compute_dtype(), RowMode::DecodeRows)?
+                    .reshape((rows, ()))
+                    .map_err(Error::from)
+            })();
+            (step, logits)
+        };
+        step.finish(caches, logits)
+    }
+
     /// Logits at transformers' scale (`logits / logits_scaling`, F32), for
     /// parity checks.
     pub(super) fn scale_logits(&self, logits: &Tensor) -> Result<Tensor> {
@@ -637,6 +834,26 @@ impl DecoderLayer {
             .map_err(Error::from)
     }
 
+    /// [`Self::forward`] for one decode step's rows (`[1, rows, hidden]`).
+    fn forward_decode_rows(
+        &self,
+        x: &Tensor,
+        caches: &[&PhysicalPagedKvCache],
+        step: &mut PreparedPhysicalMixedStep,
+        layer_idx: usize,
+        rope: &RopeSlice,
+    ) -> Result<Tensor> {
+        let normed = rms_norm_forward(&self.input_layernorm, x)?;
+        let attn = self
+            .self_attn
+            .forward_decode_rows(&normed, caches, step, layer_idx, rope)?;
+        let x = x.broadcast_add(&self.scale_residual_branch(attn)?)?;
+        let normed = rms_norm_forward(&self.post_attention_layernorm, &x)?;
+        let mlp = self.mlp.forward_in(&normed, RowMode::DecodeRows)?;
+        x.broadcast_add(&self.scale_residual_branch(mlp)?)
+            .map_err(Error::from)
+    }
+
     fn scale_residual_branch(&self, branch: Tensor) -> Result<Tensor> {
         if self.residual_branches_prescaled {
             Ok(branch)
@@ -696,11 +913,29 @@ impl QkvProjection {
 
     /// Projects in the weight's dtype and returns `output_dtype`.
     fn forward(&self, x: &Tensor, output_dtype: DType) -> Result<(Tensor, Tensor, Tensor)> {
+        self.forward_in(x, output_dtype, RowMode::Sequence)
+    }
+
+    /// [`Self::forward`] over `x` laid out as `mode` says.
+    fn forward_in(
+        &self,
+        x: &Tensor,
+        output_dtype: DType,
+        mode: RowMode,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let weight_dtype = self.weight_dtype();
         let x = if x.dtype() == weight_dtype {
             x.clone()
         } else {
             x.to_dtype(weight_dtype)?
+        };
+        let separate = |linear: &Linear| -> Result<Tensor> {
+            match mode {
+                RowMode::Sequence => linear.forward(&x).map_err(Error::from),
+                RowMode::DecodeRows => {
+                    project_decode_rows(&x, false, |x| linear.forward(x).map_err(Error::from))
+                }
+            }
         };
         let (q, k, v) = match self {
             Self::Fused {
@@ -708,7 +943,7 @@ impl QkvProjection {
                 q_out,
                 k_out,
             } => {
-                let qkv = fused.forward(&x)?;
+                let qkv = fused.forward_in(&x, mode)?;
                 let last = qkv.rank() - 1;
                 (
                     qkv.narrow(last, 0, *q_out)?,
@@ -720,11 +955,7 @@ impl QkvProjection {
                 q_proj,
                 k_proj,
                 v_proj,
-            } => (
-                q_proj.forward(&x)?,
-                k_proj.forward(&x)?,
-                v_proj.forward(&x)?,
-            ),
+            } => (separate(q_proj)?, separate(k_proj)?, separate(v_proj)?),
         };
         let cast = |t: Tensor| -> Result<Tensor> {
             if t.dtype() == output_dtype {
@@ -819,6 +1050,48 @@ impl TextAttention {
         record_decode_attention_path(DecodeAttentionPath::Paged);
         let out = out.reshape((batch, seq_len, self.num_heads * self.head_dim))?;
         self.o_proj.forward_cast(&out, x.dtype())
+    }
+
+    /// One token for each of a decode step's rows (`[1, rows, hidden]`, the
+    /// rows on the sequence axis): row `i` turns by RoPE row `i`, its own
+    /// position, and every row's K/V append and attention run in one call.
+    fn forward_decode_rows(
+        &self,
+        x: &Tensor,
+        caches: &[&PhysicalPagedKvCache],
+        step: &mut PreparedPhysicalMixedStep,
+        layer_idx: usize,
+        rope: &RopeSlice,
+    ) -> Result<Tensor> {
+        let (_, rows, _) = x.dims3()?;
+        let core_dtype = if self.f16_attention_core {
+            DType::F16
+        } else {
+            x.dtype()
+        };
+        let (q, k, v) = self
+            .qkv_proj
+            .forward_in(x, core_dtype, RowMode::DecodeRows)?;
+        let q = q.reshape((1, rows, self.num_heads, self.head_dim))?;
+        let k = k.reshape((1, rows, self.num_kv_heads, self.head_dim))?;
+        let (q, k) = apply_rope(&q, &k, rope, self.head_dim)?;
+        let out = step.write_and_attend(
+            caches,
+            layer_idx,
+            &q.reshape((rows, self.num_heads, self.head_dim))?
+                .contiguous()?,
+            &k.reshape((rows, self.num_kv_heads, self.head_dim))?
+                .contiguous()?,
+            &v.reshape((rows, self.num_kv_heads, self.head_dim))?
+                .contiguous()?,
+            self.attention_multiplier,
+            None,
+            None,
+        )?;
+        record_decode_attention_path(DecodeAttentionPath::Paged);
+        let out = out.reshape((1, rows, self.num_heads * self.head_dim))?;
+        self.o_proj
+            .forward_cast_in(&out, x.dtype(), RowMode::DecodeRows)
     }
 }
 
@@ -948,13 +1221,13 @@ impl GateUpProjection {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+    fn forward_in(&self, x: &Tensor, mode: RowMode) -> Result<(Tensor, Tensor)> {
         match self {
             Self::Fused {
                 fused,
                 intermediate_size,
             } => {
-                let gate_up = fused.forward(x)?;
+                let gate_up = fused.forward_in(x, mode)?;
                 let last = gate_up.rank() - 1;
                 Ok((
                     gate_up.narrow(last, 0, *intermediate_size)?,
@@ -962,7 +1235,15 @@ impl GateUpProjection {
                 ))
             }
             Self::Separate { gate_proj, up_proj } => {
-                Ok((gate_proj.forward(x)?, up_proj.forward(x)?))
+                let separate = |linear: &Linear| -> Result<Tensor> {
+                    match mode {
+                        RowMode::Sequence => linear.forward(x).map_err(Error::from),
+                        RowMode::DecodeRows => project_decode_rows(x, false, |x| {
+                            linear.forward(x).map_err(Error::from)
+                        }),
+                    }
+                };
+                Ok((separate(gate_proj)?, separate(up_proj)?))
             }
         }
     }
@@ -1004,18 +1285,23 @@ impl TextMlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_in(x, RowMode::Sequence)
+    }
+
+    /// [`Self::forward`] over `x` laid out as `mode` says.
+    fn forward_in(&self, x: &Tensor, mode: RowMode) -> Result<Tensor> {
         let output_dtype = x.dtype();
         let x = if self.f16 {
             x.to_dtype(DType::F16)?
         } else {
             x.clone()
         };
-        let (gate, up) = self.gate_up_proj.forward(&x)?;
+        let (gate, up) = self.gate_up_proj.forward_in(&x, mode)?;
         let hidden = match try_fused_silu_mul_with_status(&gate, &up) {
             Some(fused) => fused.tensor,
             None => gate.silu()?.broadcast_mul(&up)?,
         };
-        self.down_proj.forward_cast(&hidden, output_dtype)
+        self.down_proj.forward_cast_in(&hidden, output_dtype, mode)
     }
 }
 
@@ -1054,6 +1340,23 @@ pub(super) fn argmax_last_token(logits: &Tensor) -> Result<Tensor> {
     last.argmax(D::Minus1)?
         .to_dtype(DType::U32)?
         .reshape((1, 1))
+        .map_err(Error::from)
+}
+
+/// Each row's greedy token from a decode step's logits (`[rows, vocab]`):
+/// one argmax on the device and one readback for every row.
+pub(super) fn argmax_rows(logits: &Tensor) -> Result<Vec<u32>> {
+    let (rows, vocab) = logits.dims2()?;
+    if rows == 0 || vocab == 0 {
+        return Err(Error::InferenceError(format!(
+            "Granite Speech 5.0 decode logits have invalid shape {:?}",
+            logits.dims()
+        )));
+    }
+    logits
+        .argmax(D::Minus1)?
+        .to_dtype(DType::U32)?
+        .to_vec1::<u32>()
         .map_err(Error::from)
 }
 
@@ -1472,5 +1775,381 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(scaled_token, token);
         assert!(argmax_last_token(&Tensor::zeros((2, 3), DType::F32, &device).unwrap()).is_err());
+    }
+
+    /// The tiny model with a 512-position context (YaRN factor 4 over 128),
+    /// so a prompt can pass the CPU paged attention's 256-token slice.
+    fn long_context_language_model(device: &Device) -> GraniteLanguageModel {
+        long_context_language_model_with(device, LmExecutionPlan::BASE_DTYPE, false)
+    }
+
+    /// With `real_heads`, 128-wide heads in groups of four, as the real
+    /// decoder's, so Metal runs its GQA decode kernel rather than the
+    /// fallback it keeps for geometries the kernel does not cover.
+    fn long_context_language_model_with(
+        device: &Device,
+        plan: LmExecutionPlan,
+        real_heads: bool,
+    ) -> GraniteLanguageModel {
+        let mut config = tiny_text_config();
+        if real_heads {
+            config.hidden_size = 512;
+            config.num_attention_heads = 4;
+            config.num_key_value_heads = 1;
+        }
+        config.max_position_embeddings = 512;
+        config.rope_scaling = Some(serde_json::json!({
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 128
+        }));
+        let vb = VarBuilder::from_tensors(tiny_text_tensors(&config, device), DType::F32, device);
+        GraniteLanguageModel::load(&config, &config.rope().unwrap(), false, vb, plan).unwrap()
+    }
+
+    /// `rows` caches of `tokens_per_row` tokens each, on one shared arena
+    /// on the model's device, as the retained route's rows share one.
+    fn shared_arena_caches(
+        model: &GraniteLanguageModel,
+        rows: usize,
+        tokens_per_row: usize,
+    ) -> Vec<PhysicalPagedKvCache> {
+        use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
+        use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+        use std::sync::Arc;
+        const PAGE_TOKENS: usize = 16;
+        let pages_per_row = tokens_per_row.div_ceil(PAGE_TOKENS);
+        let bindings = (0..model.cfg.num_hidden_layers as u32)
+            .map(|layer| KvLayerBinding {
+                model_layer: layer,
+                physical_layer: layer,
+            })
+            .collect::<Vec<_>>();
+        let device = &model.device;
+        let config = KvArenaConfig {
+            id: KvArenaId {
+                model_instance: crate::engine::ModelInstanceId::new(5_005),
+                backend: crate::backends::backend_kind_for_device(device),
+                device_ordinal: (!device.is_cpu()).then_some(0),
+                generation: 1,
+            },
+            group: KvGroupId::new(0),
+            page_tokens: PAGE_TOKENS as u32,
+            capacity_pages: (rows * pages_per_row) as u32,
+            growth: None,
+            dtype: model.kv_dtype(),
+            layers: bindings
+                .iter()
+                .map(|binding| KvLayerConfig {
+                    binding: *binding,
+                    num_kv_heads: model.cfg.num_key_value_heads as u32,
+                    key_head_dim: model.head_dim as u32,
+                    value_head_dim: model.head_dim as u32,
+                })
+                .collect(),
+        };
+        let arena: Arc<dyn KvArena> = match device {
+            Device::Cpu => Arc::new(CpuKvArena::new(config).unwrap()),
+            #[cfg(any(feature = "cuda", feature = "metal"))]
+            _ => Arc::new(
+                crate::backends::kv::CandleAcceleratorKvArena::new_mutation_only(
+                    config,
+                    device.clone(),
+                )
+                .unwrap(),
+            ),
+            #[cfg(not(any(feature = "cuda", feature = "metal")))]
+            _ => unreachable!("an accelerator test needs the cuda or metal feature"),
+        };
+        (0..rows)
+            .map(|row| {
+                let blocks = (row * pages_per_row..(row + 1) * pages_per_row)
+                    .map(|index| CacheBlockRef {
+                        arena: arena.id(),
+                        group: arena.config().group,
+                        index: index as u32,
+                        slot_generation: 1,
+                    })
+                    .collect();
+                PhysicalPagedKvCache::new(arena.clone(), bindings.clone(), blocks, 0).unwrap()
+            })
+            .collect()
+    }
+
+    fn prompt_ids(len: usize, seed: u32) -> Vec<u32> {
+        (0..len as u32)
+            .map(|index| (index * 7 + seed * 5 + 3) % 24)
+            .collect()
+    }
+
+    fn values(tensor: &Tensor) -> Vec<f32> {
+        tensor
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    /// The batched step's RoPE rows are exactly the rows the table holds for
+    /// each position, and a position past the retained sequence is refused.
+    #[test]
+    fn rope_table_gather_matches_host_built_rows() {
+        let device = Device::Cpu;
+        let model = long_context_language_model(&device);
+        let table = model.rope_table();
+        assert_eq!(table.cos.dim(0).unwrap(), 512);
+        let positions = [0usize, 5, 5, 511];
+        let gathered = table.gather(&positions).unwrap();
+        for (row, position) in positions.into_iter().enumerate() {
+            let host = RopeCache::build(&model.rope, position, 1, &device, DType::F32).unwrap();
+            for (gathered, host) in [
+                (&gathered.cos, &host.cos),
+                (&gathered.sin, &host.sin),
+                (&gathered.packed, &host.packed),
+            ] {
+                assert_eq!(
+                    values(&gathered.narrow(0, row, 1).unwrap()),
+                    values(host),
+                    "position {position}"
+                );
+            }
+        }
+        assert!(table.gather(&[3, 512]).is_err());
+        // The real checkpoint's table covers the retained sequence only.
+        let mut config = tiny_text_config();
+        config.max_position_embeddings = 16_384;
+        assert_eq!(
+            retained_rope_positions(&config),
+            GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS
+        );
+    }
+
+    /// A row stepped alone through `forward_decode_rows` gets exactly the
+    /// logits `forward_token` gives it, and both track one full prefill.
+    #[test]
+    fn decode_row_alone_matches_forward_token() {
+        let device = Device::Cpu;
+        let model = long_context_language_model(&device);
+        let ids = prompt_ids(9, 1);
+        let embeds = model.embeddings(&ids).unwrap();
+        let mut atomic = tiny_cache(&device, &model, 16);
+        let mut retained = shared_arena_caches(&model, 1, 16);
+        for cache in [&mut atomic, &mut retained[0]] {
+            model
+                .forward_embeds(
+                    &embeds.narrow(1, 0, 7).unwrap(),
+                    0,
+                    cache,
+                    Some(model.rope_table()),
+                    None,
+                )
+                .unwrap();
+        }
+        for position in 7..9 {
+            let token = ids[position];
+            let alone = model
+                .forward_token(
+                    &Tensor::from_vec(vec![token], (1, 1), &device).unwrap(),
+                    position,
+                    &mut atomic,
+                    model.rope_table(),
+                )
+                .unwrap();
+            let rows = model
+                .forward_decode_rows(
+                    &Tensor::from_vec(vec![token], 1, &device).unwrap(),
+                    &[position],
+                    &mut [&mut retained[0]],
+                )
+                .unwrap();
+            assert_eq!(values(&alone), values(&rows), "position {position}");
+            assert_eq!(retained[0].context_len(), position + 1);
+        }
+        // The last step (position 8) tracks one full prefill of all 9 ids.
+        let mut full = tiny_cache(&device, &model, 16);
+        let full = model
+            .forward_embeds(&embeds, 0, &mut full, None, None)
+            .unwrap();
+        let mut check = shared_arena_caches(&model, 1, 16);
+        model
+            .forward_embeds(
+                &embeds.narrow(1, 0, 8).unwrap(),
+                0,
+                &mut check[0],
+                Some(model.rope_table()),
+                None,
+            )
+            .unwrap();
+        let last = model
+            .forward_decode_rows(
+                &Tensor::from_vec(vec![ids[8]], 1, &device).unwrap(),
+                &[8],
+                &mut [&mut check[0]],
+            )
+            .unwrap();
+        for (a, b) in values(&full).iter().zip(values(&last)) {
+            assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        }
+    }
+
+    /// Rows with prompts of 1, 37 and 300 tokens (past the CPU paged
+    /// attention's 256-token slice) decode bit-identically alone and beside
+    /// each other, in every slot order: no kernel sizes its work from the
+    /// batch.
+    fn first_argmax(values: &[f32]) -> u32 {
+        let mut best = 0;
+        for (index, value) in values.iter().enumerate() {
+            if *value > values[best] {
+                best = index;
+            }
+        }
+        best as u32
+    }
+
+    #[test]
+    fn decode_rows_are_bit_identical_alone_and_beside_others() {
+        assert_decode_rows_are_batch_invariant(
+            &Device::Cpu,
+            LmExecutionPlan::BASE_DTYPE,
+            false,
+            None,
+        );
+    }
+
+    /// On Metal (the selective F16 plan both releases run, 128-wide heads)
+    /// a row beside others is not bit-identical to the row alone on this
+    /// test's arena: its logits differ in the last F16 bits from step 0 and
+    /// drift a little as the rows' K/V differ. It must still pick the same
+    /// tokens and stay close.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_decode_rows_track_each_row_alone() {
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_decode_rows_track_each_row_alone")
+        else {
+            return;
+        };
+        assert_decode_rows_are_batch_invariant(
+            &device,
+            LmExecutionPlan::for_device(&device, DType::F32),
+            true,
+            Some(0.25),
+        );
+    }
+
+    /// Each row's logits beside the others equal (`tolerance` `None`) or,
+    /// within `tolerance`, track the row's logits alone, with the same
+    /// greedy tokens.
+    fn assert_decode_rows_are_batch_invariant(
+        device: &Device,
+        plan: LmExecutionPlan,
+        real_heads: bool,
+        tolerance: Option<f32>,
+    ) {
+        let device = device.clone();
+        let model = long_context_language_model_with(&device, plan, real_heads);
+        let prompts = [prompt_ids(1, 2), prompt_ids(37, 3), prompt_ids(300, 4)];
+        let steps = [[5u32, 9, 13], [2, 4, 6], [21, 1, 17], [8, 8, 8]];
+        let prefill = |cache: &mut PhysicalPagedKvCache, prompt: &[u32]| {
+            let embeds = model.embeddings(prompt).unwrap();
+            model
+                .forward_embeds(&embeds, 0, cache, Some(model.rope_table()), None)
+                .unwrap();
+        };
+        let alone = prompts
+            .iter()
+            .enumerate()
+            .map(|(row, prompt)| {
+                let mut caches = shared_arena_caches(&model, 1, 320);
+                prefill(&mut caches[0], prompt);
+                steps
+                    .iter()
+                    .enumerate()
+                    .map(|(step, tokens)| {
+                        let logits = model
+                            .forward_decode_rows(
+                                &Tensor::from_vec(vec![tokens[row]], 1, &device).unwrap(),
+                                &[prompt.len() + step],
+                                &mut [&mut caches[0]],
+                            )
+                            .unwrap();
+                        values(&logits)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for order in [
+            [0usize, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut caches = shared_arena_caches(&model, 3, 320);
+            for (slot, &row) in order.iter().enumerate() {
+                prefill(&mut caches[slot], &prompts[row]);
+            }
+            for (step, tokens) in steps.iter().enumerate() {
+                let input = order.iter().map(|&row| tokens[row]).collect::<Vec<_>>();
+                let positions = order
+                    .iter()
+                    .map(|&row| prompts[row].len() + step)
+                    .collect::<Vec<_>>();
+                let logits = {
+                    let mut refs = caches.iter_mut().collect::<Vec<_>>();
+                    model
+                        .forward_decode_rows(
+                            &Tensor::from_vec(input, 3, &device).unwrap(),
+                            &positions,
+                            &mut refs,
+                        )
+                        .unwrap()
+                };
+                let tokens = argmax_rows(&logits).unwrap();
+                for (slot, &row) in order.iter().enumerate() {
+                    let together = values(&logits.narrow(0, slot, 1).unwrap());
+                    match tolerance {
+                        None => {
+                            assert_eq!(together, alone[row][step], "order {order:?} step {step}")
+                        }
+                        Some(tolerance) => {
+                            for (a, b) in together.iter().zip(&alone[row][step]) {
+                                assert!(
+                                    (a - b).abs() <= tolerance,
+                                    "order {order:?} step {step}: {a} vs {b}"
+                                );
+                            }
+                        }
+                    }
+                    assert_eq!(tokens[slot], first_argmax(&alone[row][step]));
+                }
+            }
+        }
+    }
+
+    /// Rows on different arenas, or a position that does not continue its
+    /// cache, are refused before any row advances.
+    #[test]
+    fn decode_rows_reject_mixed_arenas_and_stale_positions() {
+        let device = Device::Cpu;
+        let model = long_context_language_model(&device);
+        let mut first = shared_arena_caches(&model, 1, 16);
+        let mut second = shared_arena_caches(&model, 1, 16);
+        let tokens = Tensor::from_vec(vec![1u32, 2], 2, &device).unwrap();
+        assert!(model
+            .forward_decode_rows(&tokens, &[0, 0], &mut [&mut first[0], &mut second[0]])
+            .is_err());
+        assert!(model
+            .forward_decode_rows(
+                &Tensor::from_vec(vec![1u32], 1, &device).unwrap(),
+                &[3],
+                &mut [&mut first[0]],
+            )
+            .is_err());
+        assert_eq!(first[0].context_len(), 0);
+        assert_eq!(second[0].context_len(), 0);
     }
 }

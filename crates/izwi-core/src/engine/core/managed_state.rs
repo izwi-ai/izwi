@@ -386,10 +386,64 @@ impl EngineCore {
         retained_state: &crate::kv::v2::InferenceStateContract,
         logical_context_tokens: Option<usize>,
         portable_state_copies: u32,
+        rows: (usize, usize),
+        minimum_tokens: u64,
+        reserve: StateFitReserve,
+        later_minimum_bytes: u64,
+    ) -> Result<Arc<super::super::ManagedKvModelRuntime>> {
+        self.load_retained_state_with_rows(
+            model_instance,
+            retained_state,
+            logical_context_tokens,
+            portable_state_copies,
+            rows,
+            minimum_tokens,
+            reserve,
+            later_minimum_bytes,
+            false,
+        )
+    }
+
+    /// [`Self::load_managed_model_state_with_portable_copies_and_rows`] for a
+    /// pool the caller already sized across its rows (`pool_tokens`, one
+    /// automatic sequence per row): the arena reaches `pool_tokens` as given,
+    /// neither pooled again nor refitted, and a sequence may claim all of it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_pooled_managed_model_state_with_portable_copies(
+        &mut self,
+        model_instance: super::super::ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        pool_tokens: usize,
+        portable_state_copies: u32,
+        rows: (usize, usize),
+        minimum_tokens: u64,
+        reserve: StateFitReserve,
+    ) -> Result<Arc<super::super::ManagedKvModelRuntime>> {
+        self.load_retained_state_with_rows(
+            model_instance,
+            retained_state,
+            Some(pool_tokens),
+            portable_state_copies,
+            rows,
+            minimum_tokens,
+            reserve,
+            0,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_retained_state_with_rows(
+        &mut self,
+        model_instance: super::super::ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        logical_context_tokens: Option<usize>,
+        portable_state_copies: u32,
         (retained_rows, staged_rows): (usize, usize),
         minimum_tokens: u64,
         reserve: StateFitReserve,
         later_minimum_bytes: u64,
+        pre_pooled: bool,
     ) -> Result<Arc<super::super::ManagedKvModelRuntime>> {
         // An automatic staged limit is sized for the engine rows' launch
         // width; an ASR decode fitted wider stages its own launch width,
@@ -423,7 +477,9 @@ impl EngineCore {
         // Single-user portable state keeps one context: its arena is
         // resident from load.
         let pool_context = logical_context_tokens.map(|context| {
-            if self.config.portable_context_auto && backend != BackendKind::Cuda {
+            if pre_pooled {
+                context
+            } else if self.config.portable_context_auto && backend != BackendKind::Cuda {
                 portable_pool_tokens(context, self.config.max_num_seqs)
             } else {
                 context
@@ -456,7 +512,7 @@ impl EngineCore {
                 Error::InvalidInput("managed state transaction limit exceeds u32".into())
             })?,
         };
-        if backend == BackendKind::Cuda {
+        if backend == BackendKind::Cuda && !pre_pooled {
             if let Some(per_sequence) = logical_token_reach {
                 capacity.logical_token_reach =
                     Some(self.managed_kv_cache.fit_cuda_retained_pool_tokens(
@@ -476,7 +532,7 @@ impl EngineCore {
             self.config.block_size,
             retained_state,
         )?;
-        if let Some(context) = logical_context_tokens {
+        if let Some(context) = logical_context_tokens.filter(|_| !pre_pooled) {
             // CUDA's per-sequence context was already bounded by the
             // configured maximum (`resolve_managed_token_reach`).
             let context = if backend == BackendKind::Cuda {

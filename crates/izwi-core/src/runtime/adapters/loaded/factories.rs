@@ -212,6 +212,9 @@ pub(super) struct VibeVoicePhysicalAsrAdapterFactory;
 pub(super) struct GraniteSpeechPhysicalAsrAdapterFactory;
 
 #[derive(Debug, Clone, Copy)]
+pub(super) struct GraniteSpeech5PhysicalAsrAdapterFactory;
+
+#[derive(Debug, Clone, Copy)]
 pub(super) struct Lfm25AudioPhysicalAsrAdapterFactory;
 
 #[derive(Debug, Clone, Copy)]
@@ -741,10 +744,10 @@ impl LoadedExecutionAdapterFactory for GraniteSpeechPhysicalAsrAdapterFactory {
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
+        use crate::models::architectures::granite_speech::asr::granite_speech_retained_decode_enabled;
         // Continuous decode batching lives on the retained sequence graph,
         // which the adapter offers only with resumable prefill (GRN-8).
-        if crate::models::architectures::granite_speech::asr::GraniteSpeechAsrModel::RESUMABLE_PREFILL
-        {
+        if granite_speech_retained_decode_enabled() {
             NativeBatchMode::Continuous
         } else {
             NativeBatchMode::None
@@ -760,13 +763,54 @@ impl LoadedExecutionAdapterFactory for GraniteSpeechPhysicalAsrAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(GraniteSpeechAsrExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            GraniteSpeechAsrExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
+    }
+}
+
+impl LoadedExecutionAdapterFactory for GraniteSpeech5PhysicalAsrAdapterFactory {
+    fn id(&self) -> &'static str {
+        LoadedAdapterKind::GraniteSpeech5Asr.factory_id()
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        use crate::models::architectures::granite_speech5::asr::granite_speech5_retained_decode_enabled;
+        // Continuous decode batching lives on the retained sequence graph,
+        // which the adapter offers only with its retained route (GRN-8).
+        if granite_speech5_retained_decode_enabled() {
+            NativeBatchMode::Continuous
+        } else {
+            NativeBatchMode::None
+        }
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::GraniteSpeech5Asr, metadata, backend_kind)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(
+            GraniteSpeech5AsrExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 
@@ -870,6 +914,7 @@ pub(in crate::runtime::adapters) fn built_in_loaded_adapter_factories() -> Vec<A
         Arc::new(WhisperPhysicalAsrAdapterFactory),
         Arc::new(VibeVoicePhysicalAsrAdapterFactory),
         Arc::new(GraniteSpeechPhysicalAsrAdapterFactory),
+        Arc::new(GraniteSpeech5PhysicalAsrAdapterFactory),
         Arc::new(Lfm25AudioPhysicalAsrAdapterFactory),
         Arc::new(ParakeetPhysicalAsrAdapterFactory),
         Arc::new(NemotronPhysicalAsrAdapterFactory),

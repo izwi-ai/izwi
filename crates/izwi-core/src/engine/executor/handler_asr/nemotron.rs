@@ -434,6 +434,7 @@ impl NativeExecutor {
                     artifact: active.artifact.as_ref(),
                     state: &mut active.state,
                     max_tokens,
+                    quota: scheduled[row.index].num_tokens.max(1),
                 })
             })
             .collect::<Result<Vec<_>>>()?;

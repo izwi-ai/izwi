@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use candle_core::{DType, Device, IndexOp, Tensor, D};
@@ -15,13 +16,20 @@ use serde_json::json;
 use super::config::NemotronConfigInventory;
 use super::physical::{NEMOTRON_OFFLINE_ACOUSTIC_DOMAIN, NEMOTRON_OFFLINE_PREDICTOR_DOMAIN};
 use crate::backends::state::{InvocationTensorComponentValue, InvocationTensorUpdateV2};
+use crate::backends::BackendKind;
 use crate::engine::InvocationTensorLease;
 use crate::error::{Error, Result};
+use crate::kernels::cuda::shape_graphs::{ShapeGraphLimits, ShapeGraphs};
 use crate::kernels::f16_weight_linear::{
     PointwiseConv1d, ProjectionLinear, F16_PROJECTION_MAX_RELATIVE_L2,
 };
 use crate::kernels::numeric_check::{
     run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
+};
+use crate::kernels::relpos_attention::{self, KeyBand, KeyLengths};
+use crate::kernels::transducer_greedy::{
+    self, limit_field, rnnt_step, state_field, RnntRow, RnntRules, RnntStep, SelectRules,
+    SelectTensors, LIMIT_FIELDS, STATE_FIELDS,
 };
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
@@ -256,6 +264,12 @@ pub(super) struct NemotronNetwork {
     stream_rel_pos_cache: Mutex<HashMap<StreamingRelPosCacheKey, Tensor>>,
     stream_att_mask_cache: Mutex<HashMap<StreamingMaskCacheKey, Tensor>>,
     dtype: DType,
+    /// CUDA graphs of the conformer layers over a padded offline batch, one
+    /// per `(rows, frames)` shape ([`encoder_graph_shape`]), or why there
+    /// are none.
+    encoder_graphs: std::result::Result<ShapeGraphs<(usize, usize)>, String>,
+    /// The RNNT device decode's dispatch graphs (CUDA), or why there are none.
+    decode_graphs: std::result::Result<transducer_greedy::TransducerGraphs, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -278,6 +292,8 @@ struct StreamingRelPosCacheKey {
     key_len: usize,
     query_offset: usize,
     dtype: DType,
+    /// The fused attention's table of distances, not the pairs.
+    table: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -410,6 +426,11 @@ impl NemotronNetwork {
             stream_rel_pos_cache: Mutex::new(HashMap::new()),
             stream_att_mask_cache: Mutex::new(HashMap::new()),
             dtype: vb.dtype(),
+            encoder_graphs: resolve_encoder_graphs(vb.device()),
+            decode_graphs: transducer_greedy::TransducerGraphs::resolve(
+                "Nemotron ASR decode",
+                vb.device(),
+            ),
         })
     }
 
@@ -451,8 +472,13 @@ impl NemotronNetwork {
                 x.dtype(),
                 device,
             )?;
+            let keys = AttentionKeys::solo(
+                &att_mask,
+                self.left_context_frames,
+                self.right_context_frames,
+            );
             for (index, layer) in self.layers.iter().enumerate() {
-                x = layer.forward(&x, &pos_emb, &att_mask)?;
+                x = layer.forward(&x, &pos_emb, &keys)?;
                 outputs.push((format!("layers.{index}"), x.clone()));
             }
             let prompt_id = self.prompt_dictionary.values().copied().min().unwrap_or(0);
@@ -609,7 +635,7 @@ impl NemotronNetwork {
             [] => Err(Error::InvalidInput(
                 "Nemotron encoder batch has no rows".into(),
             )),
-            [row] => {
+            [row] if !self.encoder_graphs_on() => {
                 let (encoded, len) = self.encode_features_profile(
                     row.features.clone(),
                     row.valid_frames,
@@ -618,7 +644,9 @@ impl NemotronNetwork {
                 )?;
                 Ok((encoded, vec![len]))
             }
-            rows => self.encode_padded_rows(rows),
+            rows => {
+                self.encode_padded_rows(rows, |rows, frames| self.encoder_batch_shape(rows, frames))
+            }
         }
     }
 
@@ -633,9 +661,14 @@ impl NemotronNetwork {
     /// frames. Padded frames stay finite (each padded query keeps itself as
     /// a finite key), since a non-finite value times a zero weight would
     /// still poison a sum. The prompt kernel takes each row's own prompt.
+    ///
+    /// `shape` gives the `(rows, frames)` a batch of that many rows whose
+    /// longest has that many frames runs at: an encoder graph's padded shape
+    /// ([`Self::encoder_batch_shape`]) or the batch's own.
     fn encode_padded_rows(
         &self,
         rows: &[NemotronEncoderBatchInput],
+        shape: impl Fn(usize, usize) -> (usize, usize),
     ) -> Result<(Tensor, Vec<usize>)> {
         let mut stems = Vec::with_capacity(rows.len());
         let mut lengths = Vec::with_capacity(rows.len());
@@ -654,7 +687,8 @@ impl NemotronNetwork {
             stems.push(x);
             lengths.push(len);
         }
-        let padded = lengths.iter().copied().max().unwrap_or(0);
+        let longest = lengths.iter().copied().max().unwrap_or(0);
+        let (batch_rows, padded) = shape(rows.len(), longest);
         let stems = stems
             .into_iter()
             .zip(&lengths)
@@ -666,10 +700,17 @@ impl NemotronNetwork {
                 }
             })
             .collect::<Result<Vec<_>>>()?;
-        let x = Tensor::cat(&stems, 0)?;
+        let mut x = Tensor::cat(&stems, 0)?;
         drop(stems);
         let prompt_ids = rows.iter().map(|row| row.prompt_id).collect::<Vec<_>>();
-        let encoded = self.encode_padded_stems(x, &lengths, &prompt_ids)?;
+        // A graph's spare rows are zero stems of full length: every key is
+        // real, so they stay finite, and the prompt kernel never sees them.
+        let mut batch_lengths = lengths.clone();
+        if batch_rows > rows.len() {
+            x = x.pad_with_zeros(0, 0, batch_rows - rows.len())?;
+            batch_lengths.resize(batch_rows, padded);
+        }
+        let encoded = self.encode_padded_stems(x, &batch_lengths, &prompt_ids)?;
         Ok((encoded, lengths))
     }
 
@@ -682,21 +723,101 @@ impl NemotronNetwork {
         lengths: &[usize],
         prompt_ids: &[usize],
     ) -> Result<Tensor> {
-        let padded = x.dim(1)?;
+        let (rows, padded) = (x.dim(0)?, x.dim(1)?);
         let pos_emb = self.rel_positional_embedding(padded, x.dtype(), x.device())?;
-        let att_mask = self
-            .limited_context_mask(
-                padded,
-                self.left_context_frames,
-                self.right_context_frames,
-                x.dtype(),
-                x.device(),
-            )?
-            .broadcast_add(&padded_key_mask(lengths, padded, x.dtype(), x.device())?)?;
-        for layer in &self.layers {
-            x = layer.forward(&x, &pos_emb, &att_mask)?;
+        let limited_mask = self.limited_context_mask(
+            padded,
+            self.left_context_frames,
+            self.right_context_frames,
+            x.dtype(),
+            x.device(),
+        )?;
+        let key_mask = padded_key_mask(lengths, padded, x.dtype(), x.device())?;
+        let real = lengths.iter().map(|len| *len as u32).collect::<Vec<_>>();
+        let key_lengths = Tensor::from_vec(real, rows, x.device())?;
+        x = match &self.encoder_graphs {
+            Ok(graphs) if encoder_graph_shape(rows, padded) == Some((rows, padded)) => {
+                // The graph keeps a stable copy of each input and an output
+                // the size of `x`.
+                let inputs = [x, pos_emb, limited_mask, key_mask, key_lengths];
+                let tensor_bytes = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+                let retained =
+                    inputs.iter().map(tensor_bytes).sum::<u64>() + tensor_bytes(&inputs[0]);
+                let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+                    let [x, pos_emb, limited_mask, key_mask, key_lengths] = inputs else {
+                        return Err(Error::InferenceError(format!(
+                            "Nemotron encoder graph received {} inputs, expected 5",
+                            inputs.len()
+                        )));
+                    };
+                    Ok(vec![self.layers_forward(
+                        x.clone(),
+                        pos_emb,
+                        [limited_mask, key_mask],
+                        key_lengths,
+                    )?])
+                };
+                graphs
+                    .run((rows, padded), retained, &inputs, &body)?
+                    .pop()
+                    .ok_or_else(|| {
+                        Error::InferenceError("Nemotron encoder graph returned nothing".into())
+                    })?
+            }
+            _ => self.layers_forward(x, &pos_emb, [&limited_mask, &key_mask], &key_lengths)?,
+        };
+        // A graph's spare rows end here.
+        if prompt_ids.len() < rows {
+            x = x.narrow(0, 0, prompt_ids.len())?;
         }
         self.prompt_kernel.forward_rows(&x, prompt_ids)
+    }
+
+    /// The conformer layers over stem outputs `x` under the chunked-limited
+    /// mask and each row's key mask, whose row `b` holds `key_lengths[b]`
+    /// (`[B]` U32) real frames: the eager form of the encoder graphs.
+    fn layers_forward(
+        &self,
+        mut x: Tensor,
+        pos_emb: &Tensor,
+        [limited_mask, key_mask]: [&Tensor; 2],
+        key_lengths: &Tensor,
+    ) -> Result<Tensor> {
+        let att_mask = limited_mask.broadcast_add(key_mask)?;
+        let keys = AttentionKeys {
+            mask: &att_mask,
+            band: chunked_band(self.left_context_frames, self.right_context_frames),
+            lengths: KeyLengths::PerRow(key_lengths),
+        };
+        for layer in &self.layers {
+            x = layer.forward(&x, pos_emb, &keys)?;
+        }
+        Ok(x)
+    }
+
+    /// Whether offline batches run through the CUDA encoder graphs: on CUDA
+    /// with the graphs switched on and no graph failure yet.
+    fn encoder_graphs_on(&self) -> bool {
+        self.encoder_graphs.as_ref().is_ok_and(ShapeGraphs::is_on)
+    }
+
+    /// The `(rows, frames)` a batch of `rows` rows whose longest has
+    /// `frames` encoder frames runs at: its graph's shape while the graphs
+    /// are on (at most what admission priced, [`nemotron_encoder_batch_shape`]),
+    /// else as given.
+    fn encoder_batch_shape(&self, rows: usize, frames: usize) -> (usize, usize) {
+        if self.encoder_graphs_on() {
+            encoder_graph_shape(rows, frames).unwrap_or((rows, frames))
+        } else {
+            (rows, frames)
+        }
+    }
+
+    pub(super) fn encoder_graphs_diagnostics(&self) -> serde_json::Value {
+        match &self.encoder_graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => json!({ "off": reason }),
+        }
     }
 
     fn encode_preencoded_with_prompt(
@@ -740,8 +861,9 @@ impl NemotronNetwork {
             x.device(),
         )?;
         profile.timings.att_mask += mask_start.elapsed();
+        let keys = AttentionKeys::solo(&att_mask, left_context_frames, right_context_frames);
         for layer in &self.layers {
-            x = layer.forward_profile(&x, &pos_emb, &att_mask, profile)?;
+            x = layer.forward_profile(&x, &pos_emb, &keys, profile)?;
             profile.stats.encoder_layers = profile.stats.encoder_layers.saturating_add(1);
         }
 
@@ -762,32 +884,44 @@ impl NemotronNetwork {
         let frames = x.dim(1)?;
         let cache_len = state.attention_cache_len();
         let key_len = cache_len.saturating_add(frames);
-        let pos_pair = self.streaming_rel_positional_embedding(
+        let fused = fused_attention_for(x.device(), x.dtype());
+        let positions = self.streaming_rel_positional_embedding(
             frames,
             key_len,
             cache_len,
             x.dtype(),
             x.device(),
+            fused,
         )?;
+        let positions = if fused {
+            StreamingPositions::Table(positions)
+        } else {
+            StreamingPositions::Pairs(positions)
+        };
+        let phase = state.last_chunk_start_frame % state.chunk_frames;
         let att_mask = self.streaming_limited_context_mask(
             frames,
             key_len,
             cache_len,
-            state.last_chunk_start_frame % state.chunk_frames,
+            phase,
             state.left_context_frames,
             state.right_context_frames,
             x.dtype(),
             x.device(),
         )?;
+        let keys = StreamingKeys {
+            positions: &positions,
+            mask: &att_mask,
+            band: streaming_band(
+                state.left_context_frames,
+                state.right_context_frames,
+                phase,
+                cache_len,
+            ),
+        };
 
         for (layer, layer_state) in self.layers.iter().zip(state.layer_states.iter_mut()) {
-            x = layer.forward_streaming(
-                &x,
-                layer_state,
-                &pos_pair,
-                &att_mask,
-                state.left_context_frames,
-            )?;
+            x = layer.forward_streaming(&x, layer_state, &keys, state.left_context_frames)?;
         }
 
         let encoded = self.prompt_kernel.forward(&x, prompt_id)?;
@@ -1178,27 +1312,446 @@ impl NemotronNetwork {
             } else {
                 state.stats.host_argmax_reads = state.stats.host_argmax_reads.saturating_add(1);
             }
-            let label = labels[index];
-            if label == self.blank_idx {
-                state.stats.blank_frames = state.stats.blank_frames.saturating_add(1);
-                state.advance_frame();
-                continue;
+            let mut cursor = RnntRow {
+                t: state.t,
+                symbols: state.symbols_this_frame,
+            };
+            let rules = RnntRules {
+                blank: self.blank_idx,
+                max_symbols: self.max_symbols_per_frame,
+            };
+            let step = rnnt_step(&mut cursor, labels[index], rules);
+            (state.t, state.symbols_this_frame) = (cursor.t, cursor.symbols);
+            match step {
+                RnntStep::Blank => {
+                    state.stats.blank_frames = state.stats.blank_frames.saturating_add(1);
+                }
+                RnntStep::Emit { label, frame_full } => {
+                    let (predictor, projection) = stepped.next().ok_or_else(|| {
+                        Error::InferenceError("Nemotron RNNT step lost an emitting row".into())
+                    })?;
+                    state.predictor = predictor;
+                    state.projection = projection;
+                    state.token_ids.push(label);
+                    state.stats.emitted_tokens = state.token_ids.len();
+                    if frame_full {
+                        state.stats.guard_exits = state.stats.guard_exits.saturating_add(1);
+                    }
+                    emitted[index] = Some(label);
+                }
+                RnntStep::Invalid { label } => {
+                    return Err(Error::InferenceError(format!(
+                        "Nemotron RNNT emitted invalid label {label}; blank_idx={}",
+                        self.blank_idx
+                    )));
+                }
             }
-            let (predictor, projection) = stepped.next().ok_or_else(|| {
-                Error::InferenceError("Nemotron RNNT step lost an emitting row".into())
-            })?;
-            state.predictor = predictor;
-            state.projection = projection;
-            state.token_ids.push(label);
-            state.stats.emitted_tokens = state.token_ids.len();
-            state.symbols_this_frame = state.symbols_this_frame.saturating_add(1);
-            if state.symbols_this_frame >= self.max_symbols_per_frame {
-                state.stats.guard_exits = state.stats.guard_exits.saturating_add(1);
-                state.advance_frame();
-            }
-            emitted[index] = Some(label);
         }
         Ok(emitted)
+    }
+
+    /// The dispatch graphs for the diagnostics.
+    pub(super) fn decode_graphs_diagnostics(&self) -> serde_json::Value {
+        transducer_greedy::transducer_graphs_diagnostics(&self.decode_graphs)
+    }
+
+    /// The device the network runs on.
+    pub(super) fn device(&self) -> &Device {
+        self.predictor.embed.device()
+    }
+
+    /// Whether the retained RNNT decode runs dispatches of many joint
+    /// steps: on CUDA once the transducer select kernel passed its
+    /// self-check there.
+    pub(super) fn device_decode_on(&self) -> bool {
+        let device = self.predictor.embed.device();
+        device_decode_on_the_host()
+            || (device.is_cuda()
+                && transducer_greedy::eager_reason(device).is_none()
+                && Self::dispatch_reason(device).is_none())
+    }
+
+    /// Up to `steps` RNNT joint steps for every row with one readback
+    /// (the select step on the device, `kernels::transducer_greedy`): each
+    /// step gathers every row's encoder projection from the rows' stacked
+    /// windows by a device index, runs the joint for every row, applies the
+    /// picks and the transition, and steps the predictor for every row,
+    /// keeping the state of the rows that did not emit. A row stops once it
+    /// finishes (`budgets`' token budget, its frames, `E * max_symbols`
+    /// tokens), emits its quota or leaves its window. The transitions are
+    /// [`Self::rnnt_joint_step_batch`]'s; the predictor runs in one GEMM over
+    /// every row. Whether any row emitted.
+    /// At load, on CUDA with the select kernel on: one RNNT dispatch of two
+    /// synthetic rows on the device against the same dispatch with the
+    /// select step on the host, which must agree bit for bit (tokens,
+    /// cursors, predictor state and projection); on any difference the
+    /// decode keeps one readback per joint step on this device, with the
+    /// reason in the diagnostics. Checks each device once.
+    pub(super) fn check_device_decode(&self) {
+        let device = self.device();
+        if !device.is_cuda() || transducer_greedy::eager_reason(device).is_some() {
+            return;
+        }
+        let Some((gpu_id, verdict)) = dispatch_verdict(device) else {
+            return;
+        };
+        if verdict.load(Ordering::Acquire) != DISPATCH_UNCHECKED {
+            return;
+        }
+        let reason = match self.dispatch_self_check() {
+            Ok(None) => {
+                tracing::info!(
+                    "Nemotron ASR device decode matched its host form on cuda:{gpu_id}; \
+                     {DEVICE_DECODE_STEPS} joint steps per readback"
+                );
+                None
+            }
+            Ok(Some(failure)) => Some(format!("dispatch self-check failed: {failure}")),
+            Err(error) => Some(format!("dispatch self-check could not run: {error}")),
+        };
+        if let Some(reason) = &reason {
+            tracing::warn!("Nemotron ASR device decode is off on cuda:{gpu_id}: {reason}");
+        }
+        let passed = reason.is_none();
+        DISPATCH_REASON
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[gpu_id] = reason;
+        verdict.store(
+            if passed { DISPATCH_ON } else { DISPATCH_OFF },
+            Ordering::Release,
+        );
+    }
+
+    /// Why the device decode is off on `device` past the select kernel, or
+    /// `None` when its dispatch self-check passed.
+    pub(super) fn dispatch_reason(device: &Device) -> Option<String> {
+        dispatch_verdict(device).and_then(|(gpu_id, verdict)| {
+            match verdict.load(Ordering::Acquire) {
+                DISPATCH_ON => None,
+                DISPATCH_OFF => DISPATCH_REASON
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)[gpu_id]
+                    .clone(),
+                _ => Some("dispatch self-check not run yet".to_string()),
+            }
+        })
+    }
+
+    /// One dispatch of two random rows (24 and 9 frames, a quota of four)
+    /// on the device and in its host form; `None` when they agree.
+    fn dispatch_self_check(&self) -> Result<Option<String>> {
+        let device = self.device();
+        let lens = [24usize, 9];
+        let projections = [
+            crate::kernels::numeric_check::xorshift_tensor(
+                &[24, JOINT_HIDDEN],
+                0x7D7_0011,
+                2.0,
+                device,
+            )?
+            .to_dtype(self.joint.enc.weight().dtype())?,
+            crate::kernels::numeric_check::xorshift_tensor(
+                &[9, JOINT_HIDDEN],
+                0x7D7_0012,
+                2.0,
+                device,
+            )?
+            .to_dtype(self.joint.enc.weight().dtype())?,
+        ];
+        let mut on_device = self.start_rnnt_rows(&lens)?;
+        let mut on_host = on_device.clone();
+        let budgets = [(usize::MAX, 4), (usize::MAX, 4)];
+        for (states, host) in [(&mut on_device, false), (&mut on_host, true)] {
+            let mut rows = states
+                .iter_mut()
+                .zip(&projections)
+                .zip(lens)
+                .map(|((state, projection), encoded_len)| NemotronRnntBatchRow {
+                    projection,
+                    encoded_len,
+                    state,
+                })
+                .collect::<Vec<_>>();
+            self.rnnt_dispatch_batch_with(&mut rows, &budgets, DEVICE_DECODE_STEPS, host)?;
+        }
+        let bits = |t: &Tensor| -> Result<Vec<u32>> {
+            Ok(t.to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .into_iter()
+                .map(f32::to_bits)
+                .collect())
+        };
+        for (row, (d, h)) in on_device.iter().zip(&on_host).enumerate() {
+            if d.token_ids != h.token_ids
+                || d.t != h.t
+                || d.symbols_this_frame != h.symbols_this_frame
+            {
+                return Ok(Some(format!("row {row}: tokens or cursor differ")));
+            }
+            let (dp, hp) = (d.predictor.components()?, h.predictor.components()?);
+            for (index, (a, b)) in dp.iter().zip(hp.iter()).enumerate() {
+                if bits(a)? != bits(b)? {
+                    return Ok(Some(format!("row {row}: predictor state {index} differs")));
+                }
+            }
+            if bits(&d.projection)? != bits(&h.projection)? {
+                return Ok(Some(format!("row {row}: predictor projection differs")));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(super) fn rnnt_dispatch_batch(
+        &self,
+        rows: &mut [NemotronRnntBatchRow<'_>],
+        budgets: &[(usize, usize)],
+        steps: usize,
+    ) -> Result<bool> {
+        self.rnnt_dispatch_batch_with(rows, budgets, steps, device_decode_on_the_host())
+    }
+
+    /// [`Self::rnnt_dispatch_batch`] with the select step on the host
+    /// (`on_host`) or the device.
+    fn rnnt_dispatch_batch_with(
+        &self,
+        rows: &mut [NemotronRnntBatchRow<'_>],
+        budgets: &[(usize, usize)],
+        steps: usize,
+        on_host: bool,
+    ) -> Result<bool> {
+        let batch = rows.len();
+        if batch == 0 || budgets.len() != batch {
+            return Err(Error::InvalidInput(
+                "Nemotron RNNT dispatch rows and budgets disagree".into(),
+            ));
+        }
+        let device = self.predictor.embed.device().clone();
+        let rules = SelectRules::Rnnt(RnntRules {
+            blank: self.blank_idx,
+            max_symbols: self.max_symbols_per_frame,
+        });
+        let fits = |value: usize| {
+            u32::try_from(value).map_err(|_| {
+                Error::InferenceError("Nemotron device decode sizes exceed u32".into())
+            })
+        };
+        let mut windows = Vec::with_capacity(batch);
+        let mut state = vec![0u32; batch * STATE_FIELDS];
+        let mut limits = vec![0u32; batch * LIMIT_FIELDS];
+        let mut gather = Vec::with_capacity(batch);
+        for (b, (row, (max_tokens, quota))) in rows.iter().zip(budgets).enumerate() {
+            let t = row.state.t;
+            if t >= row.encoded_len {
+                return Err(Error::InferenceError(
+                    "Nemotron retained RNNT cursor passed its last encoder frame".into(),
+                ));
+            }
+            let frames = steps.min(row.encoded_len - t);
+            windows.push(row.projection.narrow(0, t, frames)?.pad_with_zeros(
+                0,
+                0,
+                steps - frames,
+            )?);
+            let s = &mut state[b * STATE_FIELDS..(b + 1) * STATE_FIELDS];
+            s[state_field::T] = fits(t)?;
+            s[state_field::SYMBOLS] = fits(row.state.symbols_this_frame)?;
+            s[state_field::TOKENS] = fits(row.state.token_ids.len())?;
+            s[state_field::LIVE] = 1;
+            let l = &mut limits[b * LIMIT_FIELDS..(b + 1) * LIMIT_FIELDS];
+            l[limit_field::LEN] = fits(row.encoded_len)?;
+            l[limit_field::GUARD] = u32::MAX;
+            l[limit_field::BUDGET] = fits((*max_tokens).max(1).min(u32::MAX as usize))?;
+            l[limit_field::QUOTA] = fits((*quota).max(1))?;
+            l[limit_field::FIRST] = fits(t)?;
+            l[limit_field::WINDOW] = fits(steps)?;
+            gather.push(fits(b * steps)?);
+        }
+        let refs = windows.iter().collect::<Vec<_>>();
+        let frames = Tensor::cat(&refs, 0)?;
+        drop(windows);
+        let predictors = rows
+            .iter()
+            .map(|row| &row.state.predictor)
+            .collect::<Vec<_>>();
+        let cohort = PredictorState::gather_rows(&predictors)?;
+        let projections = rows
+            .iter()
+            .map(|row| &row.state.projection)
+            .collect::<Vec<_>>();
+        let projection = Tensor::cat(&projections, 0)?;
+
+        // On CUDA through the graph of the dispatch's padded width, while the
+        // graphs are on: spare rows never step.
+        let graphs = self
+            .decode_graphs
+            .as_ref()
+            .ok()
+            .filter(|graphs| !on_host && device.is_cuda() && graphs.is_on());
+        let width = match graphs.and(transducer_greedy::graph_width(batch)) {
+            Some(width) => width,
+            None => batch,
+        };
+        let graphs = graphs.filter(|_| transducer_greedy::graph_width(batch).is_some());
+        let spare = width - batch;
+        state.resize(width * STATE_FIELDS, 0);
+        limits.resize(width * LIMIT_FIELDS, 0);
+        gather.resize(width, 0);
+        let pad = |tensor: &Tensor, rows: usize| -> Result<Tensor> {
+            Ok(tensor.pad_with_zeros(0, 0, rows)?)
+        };
+        let upload = |values: &[u32]| Tensor::new(values, &device);
+        let [h0, c0, h1, c1] = cohort.components()?;
+        let inputs = [
+            pad(&frames, spare * steps)?,
+            upload(&gather)?,
+            upload(&state)?,
+            upload(&limits)?,
+            pad(h0, spare)?,
+            pad(c0, spare)?,
+            pad(h1, spare)?,
+            pad(c1, spare)?,
+            pad(&projection, spare)?,
+        ];
+        drop(frames);
+        let body = |inputs: &[Tensor]| self.dispatch_body(inputs, steps, rules, on_host);
+        let outputs = match graphs {
+            Some(graphs) => {
+                let bytes = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+                let retained = 2 * inputs.iter().map(bytes).sum::<u64>()
+                    + (width * steps * 3 * std::mem::size_of::<u32>()) as u64;
+                graphs.run((width, steps), batch, retained, &inputs, &body)?
+            }
+            None => body(&inputs)?,
+        };
+        let [state_out, emits_out, h0, c0, h1, c1, projection] = outputs.as_slice() else {
+            return Err(Error::InferenceError(
+                "Nemotron device decode dispatch returned the wrong outputs".into(),
+            ));
+        };
+        let state = state_out.to_vec1::<u32>()?;
+        let emits = emits_out.to_vec1::<u32>()?;
+        if !on_host {
+            crate::models::shared::telemetry::record_host_read(
+                DType::U32,
+                state.len() + emits.len(),
+            );
+        }
+        let cohort = PredictorState {
+            h0: Some(h0.narrow(0, 0, batch)?),
+            c0: Some(c0.narrow(0, 0, batch)?),
+            h1: Some(h1.narrow(0, 0, batch)?),
+            c1: Some(c1.narrow(0, 0, batch)?),
+        };
+        let projection = projection.narrow(0, 0, batch)?;
+        let mut any_emitted = false;
+        for (b, row) in rows.iter_mut().enumerate() {
+            let s = &state[b * STATE_FIELDS..(b + 1) * STATE_FIELDS];
+            if s[state_field::ERROR] != 0 {
+                return Err(Error::InferenceError(format!(
+                    "Nemotron RNNT emitted a label past blank_idx {}",
+                    self.blank_idx
+                )));
+            }
+            let row_state = &mut *row.state;
+            row_state.t = s[state_field::T] as usize;
+            row_state.symbols_this_frame = s[state_field::SYMBOLS] as usize;
+            let emitted = s[state_field::EMITTED] as usize;
+            for slot in 0..emitted.min(steps) {
+                row_state
+                    .token_ids
+                    .push(emits[(b * steps + slot) * 3] as usize);
+            }
+            any_emitted |= emitted > 0;
+            let stats = &mut row_state.stats;
+            let joint = s[state_field::JOINT] as usize;
+            stats.joint_steps = stats.joint_steps.saturating_add(joint);
+            stats.blank_frames = stats
+                .blank_frames
+                .saturating_add(s[state_field::BLANKS] as usize);
+            stats.guard_exits = stats
+                .guard_exits
+                .saturating_add(s[state_field::FULL] as usize);
+            // One readback per dispatch on the device; one per step on the host.
+            let reads = if on_host {
+                joint
+            } else {
+                usize::from(joint > 0)
+            };
+            stats.device_argmax_reads = stats.device_argmax_reads.saturating_add(reads);
+            stats.emitted_tokens = row_state.token_ids.len();
+            row_state.predictor = cohort.row(b)?;
+            row_state.projection = projection.narrow(0, b, 1)?.contiguous()?;
+        }
+        Ok(any_emitted)
+    }
+
+    /// An RNNT dispatch's tensor work, `steps` joint steps with no host
+    /// sync on the device (a CUDA graph's body): `inputs` are the stacked
+    /// encoder projections `[B * steps, Dj]`, the gather indices, state and
+    /// limits, the predictor's `h0, c0, h1, c1` and its joint projection
+    /// `[B, 1, Dj]`; the outputs are the state, the emissions and the
+    /// predictor's state and projection. The select step writes fresh copies
+    /// of the buffers, so the inputs stay as given.
+    fn dispatch_body(
+        &self,
+        inputs: &[Tensor],
+        steps: usize,
+        rules: SelectRules,
+        on_host: bool,
+    ) -> Result<Vec<Tensor>> {
+        let [frames, gather, state, limits, h0, c0, h1, c1, projection] = inputs else {
+            return Err(Error::InferenceError(format!(
+                "Nemotron device decode dispatch received {} inputs, expected 9",
+                inputs.len()
+            )));
+        };
+        let rows = gather.dim(0)?;
+        let device = frames.device();
+        let mut buffers = SelectTensors {
+            state: state.copy()?,
+            emits: Tensor::zeros(rows * steps * 3, DType::U32, device)?,
+            labels: Tensor::zeros(rows, DType::U32, device)?,
+            mask: Tensor::zeros(rows, DType::U32, device)?,
+            gather: gather.copy()?,
+        };
+        let mut cohort = PredictorState {
+            h0: Some(h0.clone()),
+            c0: Some(c0.clone()),
+            h1: Some(h1.clone()),
+            c1: Some(c1.clone()),
+        };
+        let mut projection = projection.clone();
+        for _ in 0..steps {
+            let encoder_rows = frames.index_select(&buffers.gather, 0)?.unsqueeze(1)?;
+            let logits = self
+                .joint
+                .joint_from_projections(&encoder_rows, &projection)?;
+            let classes = logits.dim(D::Minus1)?;
+            let logits = logits.reshape((rows, classes))?;
+            buffers = transducer_greedy::select_step_tensors(
+                &logits, limits, buffers, steps, rules, on_host,
+            )?;
+            let outputs =
+                self.predictor
+                    .step_masked(&buffers.labels, &buffers.mask, &mut cohort)?;
+            let stepped = self.joint.project_predictor(&outputs)?;
+            let predicate = buffers
+                .mask
+                .reshape((rows, 1, 1))?
+                .broadcast_as(stepped.shape())?;
+            projection = predicate.where_cond(&stepped, &projection)?;
+        }
+        let [h0, c0, h1, c1] = cohort.components()?.map(Tensor::clone);
+        Ok(vec![
+            buffers.state,
+            buffers.emits,
+            h0,
+            c0,
+            h1,
+            c1,
+            projection,
+        ])
     }
 
     pub(super) fn start_rnnt_stream(
@@ -1624,6 +2177,10 @@ impl NemotronNetwork {
         Ok(tensor)
     }
 
+    /// A streaming chunk's relative positions, cached by shape: the eager
+    /// attention's per-pair embeddings, or (`table`) the fused attention's
+    /// embeddings of the chunk's distinct distances
+    /// ([`build_streaming_rel_position_table`]).
     fn streaming_rel_positional_embedding(
         &self,
         q_len: usize,
@@ -1631,12 +2188,14 @@ impl NemotronNetwork {
         query_offset: usize,
         dtype: DType,
         device: &Device,
+        table: bool,
     ) -> Result<Tensor> {
         let key = StreamingRelPosCacheKey {
             q_len,
             key_len,
             query_offset,
             dtype,
+            table,
         };
         if let Some(cached) = self
             .stream_rel_pos_cache
@@ -1650,14 +2209,19 @@ impl NemotronNetwork {
             return Ok(cached);
         }
 
-        let tensor = build_streaming_rel_positional_embedding_for_dtype(
-            q_len,
-            key_len,
-            query_offset,
-            ENCODER_DIM,
-            device,
-            dtype,
-        )?;
+        let tensor = if table {
+            build_streaming_rel_position_table(q_len, key_len, query_offset, ENCODER_DIM, device)?
+                .to_dtype(dtype)?
+        } else {
+            build_streaming_rel_positional_embedding_for_dtype(
+                q_len,
+                key_len,
+                query_offset,
+                ENCODER_DIM,
+                device,
+                dtype,
+            )?
+        };
         let mut cache = self.stream_rel_pos_cache.lock().map_err(|_| {
             Error::InferenceError("Nemotron stream rel-pos cache lock poisoned".into())
         })?;
@@ -1877,11 +2441,6 @@ pub(super) struct NemotronRnntRow {
 }
 
 impl NemotronRnntRow {
-    fn advance_frame(&mut self) {
-        self.t = self.t.saturating_add(1);
-        self.symbols_this_frame = 0;
-    }
-
     /// The encoder frame the next joint step reads.
     pub(super) const fn cursor(&self) -> usize {
         self.t
@@ -3122,8 +3681,9 @@ pub(crate) fn nemotron_stem_bytes(feature_frames: usize) -> Result<u64> {
     .ok_or_else(|| Error::Overloaded("Nemotron stem bytes overflowed".into()))
 }
 
-/// Peak device bytes of one row's share of an offline encoder batch of
-/// `rows` rows padded to `padded` encoder frames: the stem runs row by row,
+/// Peak device bytes of one real row's share of an offline encoder batch of
+/// `batch_rows` rows padded to `padded` encoder frames, `rows` of them real
+/// (the rest pad it to a graph's width and pay nothing): the stem runs row by row,
 /// so its planes count once per batch; the attention scores and masks, the
 /// `rel_shift` buffers, the positional projection copied for every row, a
 /// layer's per-frame activations, the prompt kernel and the joint encoder
@@ -3131,8 +3691,27 @@ pub(crate) fn nemotron_stem_bytes(feature_frames: usize) -> Result<u64> {
 /// buffer up to a power of two.
 pub(crate) fn nemotron_encoder_batch_row_bytes(
     padded: usize,
+    batch_rows: usize,
+    rows: usize,
+    backend: BackendKind,
+) -> Result<u64> {
+    let rows = u64::try_from(rows.clamp(1, batch_rows.max(1)))
+        .map_err(|_| Error::Overloaded("Nemotron preparation bytes overflowed".into()))?;
+    let fused = relpos_attention::fused_priced(backend);
+    let metal = backend == BackendKind::Metal;
+    Ok(nemotron_encoder_batch_bytes(padded, batch_rows, metal, fused)?.div_ceil(rows))
+}
+
+/// Peak device bytes of an offline encoder batch of `rows` rows padded to
+/// `padded` encoder frames, as [`nemotron_encoder_batch_row_bytes`] shares
+/// them out. With the fused attention (`fused_attention`, on CUDA once its
+/// self-check passed) no score plane, `rel_shift` copy or per-row
+/// positional copy is held, only one positional projection.
+fn nemotron_encoder_batch_bytes(
+    padded: usize,
     rows: usize,
     metal: bool,
+    fused_attention: bool,
 ) -> Result<u64> {
     const F32_BYTES: u64 = 4;
     // About six [T, ff_dim] activations are live inside a layer at once:
@@ -3161,16 +3740,27 @@ pub(crate) fn nemotron_encoder_batch_row_bytes(
         as_u64(FF_DIM)?,
     );
     let stem = nemotron_stem_bytes(padded.saturating_mul(SUBSAMPLING_FACTOR))?;
+    let attention = if fused_attention {
+        // The positional projection, read in place by every row.
+        round(multiply(&[dim, 2 * t, F32_BYTES])?)?
+    } else {
+        [
+            // The scores and their softmax.
+            multiply(&[2, round(multiply(&[rows, heads, t, t, F32_BYTES])?)?])?,
+            // q_v·pᵀ, its zero pad and the reshaped copy, each [H, T, 2T].
+            multiply(&[3, round(multiply(&[rows, heads, t, 2 * t, F32_BYTES])?)?])?,
+            // The positional projection pᵀ, copied out for every row.
+            round(multiply(&[rows, dim, 2 * t, F32_BYTES])?)?,
+        ]
+        .into_iter()
+        .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(overflow)?
+    };
     let terms = [
         round(stem)?,
-        // The scores and their softmax.
-        multiply(&[2, round(multiply(&[rows, heads, t, t, F32_BYTES])?)?])?,
+        attention,
         // The chunked-limited mask with each row's key mask.
         round(multiply(&[rows, t, t, F32_BYTES])?)?,
-        // q_v·pᵀ, its zero pad and the reshaped copy, each [H, T, 2T].
-        multiply(&[3, round(multiply(&[rows, heads, t, 2 * t, F32_BYTES])?)?])?,
-        // The positional projection pᵀ, copied out for every row.
-        round(multiply(&[rows, dim, 2 * t, F32_BYTES])?)?,
         multiply(&[
             LAYER_ACTIVATIONS,
             round(multiply(&[rows, t, ff_dim, F32_BYTES])?)?,
@@ -3182,11 +3772,93 @@ pub(crate) fn nemotron_encoder_batch_row_bytes(
         ])?,
         round(multiply(&[rows, t, as_u64(JOINT_HIDDEN)?, F32_BYTES])?)?,
     ];
-    let batch = terms
+    terms
         .into_iter()
         .try_fold(0u64, |total, bytes| total.checked_add(bytes))
-        .ok_or_else(overflow)?;
-    Ok(batch.div_ceil(rows))
+        .ok_or_else(overflow)
+}
+
+/// Kill switch for the offline encoder's CUDA graphs (a boolean; on when
+/// unset). Read once: admission prices the graphed shapes from it, and the
+/// encoder captures them.
+pub(crate) const NEMOTRON_ENCODER_GRAPHS_ENV: &str = "IZWI_NEMOTRON_ASR_ENCODER_GRAPHS";
+
+fn encoder_graphs_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(NEMOTRON_ENCODER_GRAPHS_ENV, true));
+    ON.get()
+}
+
+/// Batch widths the encoder graphs are captured at, up to the CUDA encoder
+/// stage's width of 8. A graphed batch pads its rows up to the next, so a
+/// busy server's varying widths share six graphs per length bucket.
+const ENCODER_GRAPH_ROWS: [usize; 6] = [1, 2, 3, 4, 6, 8];
+
+const MIB: u64 = 1024 * 1024;
+
+/// What the encoder graphs may hold. The pool budget bounds a graph's
+/// working set, the whole batch's peak as [`nemotron_encoder_batch_bytes`]
+/// prices it at F32 (twice what a BF16 encoder holds): every width of 20 s
+/// clips (256 frames), 4 rows of 41 s and a lone 82 s clip are graphed. The
+/// retained budget holds the kept graphs' input copies and outputs: about
+/// 9 MiB for 8 rows of 256 frames in BF16.
+const ENCODER_GRAPH_LIMITS: ShapeGraphLimits = ShapeGraphLimits {
+    max_graphs: 24,
+    retained_bytes: 128 * MIB,
+    pool_bytes: 640 * MIB,
+};
+
+/// Device bytes a load on `backend` prices for the encoder graphs, which
+/// allocate lazily on their first batches: zero off CUDA or with the graphs
+/// switched off.
+pub(crate) fn nemotron_encoder_graph_device_bytes(backend: BackendKind) -> u64 {
+    if backend == BackendKind::Cuda && encoder_graphs_requested() {
+        ENCODER_GRAPH_LIMITS.device_bytes()
+    } else {
+        0
+    }
+}
+
+/// The offline encoder's CUDA graphs on `device`, or why it has none.
+fn resolve_encoder_graphs(
+    device: &Device,
+) -> std::result::Result<ShapeGraphs<(usize, usize)>, String> {
+    if encoder_graphs_requested() {
+        ShapeGraphs::resolve("Nemotron encoder", device, ENCODER_GRAPH_LIMITS)
+    } else {
+        Err(format!("{NEMOTRON_ENCODER_GRAPHS_ENV} is off"))
+    }
+}
+
+/// The `(rows, frames)` a graph runs an offline batch of `rows` rows whose
+/// longest has `frames` encoder frames at: rows up to the next graph width,
+/// frames up to a power of two, which the batcher's length bucket already
+/// is. `None` past 8 rows or past the pool budget.
+fn encoder_graph_shape(rows: usize, frames: usize) -> Option<(usize, usize)> {
+    let rows = ENCODER_GRAPH_ROWS
+        .into_iter()
+        .find(|width| *width >= rows.max(1))?;
+    let frames = frames.max(1).checked_next_power_of_two()?;
+    let fused = relpos_attention::fused_priced(BackendKind::Cuda);
+    let bytes = nemotron_encoder_batch_bytes(frames, rows, false, fused).ok()?;
+    (bytes <= ENCODER_GRAPH_LIMITS.pool_bytes).then_some((rows, frames))
+}
+
+/// The `(rows, frames)` an offline encoder batch of `rows` rows padded to
+/// `frames` frames runs at on `backend`: a graph's shape on CUDA with the
+/// encoder graphs on, else as given. Admission prices this shape; the
+/// encoder runs it, or the given one once its graphs are off.
+pub(crate) fn nemotron_encoder_batch_shape(
+    rows: usize,
+    frames: usize,
+    backend: BackendKind,
+) -> (usize, usize) {
+    if backend == BackendKind::Cuda && encoder_graphs_requested() {
+        if let Some(shape) = encoder_graph_shape(rows, frames) {
+            return shape;
+        }
+    }
+    (rows, frames)
 }
 
 /// Useful and materialized encoder-output elements of a row of
@@ -3280,16 +3952,16 @@ impl ConformerLayer {
         })
     }
 
-    fn forward(&self, x: &Tensor, pos_emb: &Tensor, att_mask: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, pos_emb: &Tensor, keys: &AttentionKeys<'_>) -> Result<Tensor> {
         let mut profile = NemotronEncodeProfile::default();
-        self.forward_profile(x, pos_emb, att_mask, &mut profile)
+        self.forward_profile(x, pos_emb, keys, &mut profile)
     }
 
     fn forward_profile(
         &self,
         x: &Tensor,
         pos_emb: &Tensor,
-        att_mask: &Tensor,
+        keys: &AttentionKeys<'_>,
         profile: &mut NemotronEncodeProfile,
     ) -> Result<Tensor> {
         let mut residual = x.clone();
@@ -3302,7 +3974,7 @@ impl ConformerLayer {
         let attn_start = Instant::now();
         let attn =
             self.self_attn
-                .forward(&self.norm_self_att.forward(&residual)?, pos_emb, att_mask)?;
+                .forward(&self.norm_self_att.forward(&residual)?, pos_emb, keys)?;
         residual = residual.broadcast_add(&attn)?;
         profile.timings.encoder_attention += attn_start.elapsed();
 
@@ -3329,8 +4001,7 @@ impl ConformerLayer {
         &self,
         x: &Tensor,
         state: &mut ConformerLayerStreamState,
-        pos_pair: &Tensor,
-        att_mask: &Tensor,
+        keys: &StreamingKeys<'_>,
         left_context_frames: usize,
     ) -> Result<Tensor> {
         let mut residual = x.clone();
@@ -3339,12 +4010,9 @@ impl ConformerLayer {
         residual = residual.broadcast_add(&ff1.affine(0.5, 0.0)?)?;
 
         let att_input = self.norm_self_att.forward(&residual)?;
-        let attn = self.self_attn.forward_streaming(
-            &att_input,
-            state.attn_cache.as_ref(),
-            pos_pair,
-            att_mask,
-        )?;
+        let attn = self
+            .self_attn
+            .forward_streaming(&att_input, state.attn_cache.as_ref(), keys)?;
         state.attn_cache =
             update_time_cache_dim1(state.attn_cache.take(), &att_input, left_context_frames)?;
         residual = residual.broadcast_add(&attn)?;
@@ -3528,6 +4196,132 @@ fn load_conv_channel_layer_norm(vb: VarBuilder) -> Result<LayerNorm> {
     Ok(LayerNorm::new(weight, bias, 1e-5))
 }
 
+/// The keys each query of an encoder layer sees: the eager additive mask
+/// and the same rule as the fused attention takes it.
+#[derive(Clone, Copy)]
+struct AttentionKeys<'a> {
+    /// `[B or 1, 1, Tq, Tk]`, 0 on visible keys.
+    mask: &'a Tensor,
+    band: KeyBand,
+    lengths: KeyLengths<'a>,
+}
+
+impl<'a> AttentionKeys<'a> {
+    /// One unpadded row under the chunked-limited `mask`.
+    fn solo(mask: &'a Tensor, left_context: usize, right_context: usize) -> Self {
+        Self {
+            mask,
+            band: chunked_band(left_context, right_context),
+            lengths: KeyLengths::All,
+        }
+    }
+}
+
+/// A streaming chunk's relative positions: the eager attention's per-pair
+/// embeddings, or the fused attention's table of distances
+/// ([`build_streaming_rel_position_table`]).
+enum StreamingPositions {
+    Pairs(Tensor),
+    Table(Tensor),
+}
+
+/// The keys a streaming chunk's queries see: the eager mask, and the
+/// band the fused attention takes for the same rule.
+struct StreamingKeys<'a> {
+    positions: &'a StreamingPositions,
+    mask: &'a Tensor,
+    band: KeyBand,
+}
+
+/// Whether encoder layers on `device` in `dtype` take the fused attention:
+/// the kernel passed its self-check there (or a test runs its host
+/// reference) and the activations are F32 or BF16.
+fn fused_attention_for(device: &Device, dtype: DType) -> bool {
+    let on = fused_attention_on_the_host()
+        || (device.is_cuda() && relpos_attention::eager_reason(device).is_none());
+    on && matches!(dtype, DType::F32 | DType::BF16)
+}
+
+/// The chunked-limited band of a streaming chunk whose first query sits
+/// `phase` frames into its chunk, after `cache_len` cached keys (the
+/// positions [`build_streaming_limited_context_mask`] uses).
+fn streaming_band(
+    left_context: usize,
+    right_context: usize,
+    phase: usize,
+    cache_len: usize,
+) -> KeyBand {
+    match chunked_band(left_context, right_context) {
+        KeyBand::Chunked {
+            chunk, left_chunks, ..
+        } => KeyBand::Chunked {
+            chunk,
+            left_chunks,
+            query_origin: phase as i64,
+            key_origin: phase as i64 - cache_len as i64,
+        },
+        band => band,
+    }
+}
+
+/// [`chunked_limited_visible`] as the fused attention's band: chunks of
+/// `right + 1` frames, each seeing `left / (right + 1)` chunks back.
+fn chunked_band(left_context: usize, right_context: usize) -> KeyBand {
+    let chunk = right_context.saturating_add(1);
+    KeyBand::Chunked {
+        chunk,
+        left_chunks: left_context / chunk,
+        query_origin: 0,
+        key_origin: 0,
+    }
+}
+
+/// Whether the conformer attention runs [`relpos_attention::reference`] on
+/// the host in place of the CUDA kernel: the in-family tests of the fused
+/// path's wiring on a machine without a GPU.
+#[cfg(test)]
+fn fused_attention_on_the_host() -> bool {
+    tests::FUSED_ATTENTION_ON_THE_HOST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn fused_attention_on_the_host() -> bool {
+    false
+}
+
+const DISPATCH_UNCHECKED: u8 = 0;
+const DISPATCH_ON: u8 = 1;
+const DISPATCH_OFF: u8 = 2;
+/// Each device's verdict of the whole RNNT dispatch against its host form
+/// (`NemotronNetwork::check_device_decode`), and why it is off.
+static DISPATCH_VERDICT: [std::sync::atomic::AtomicU8; 16] =
+    [const { std::sync::atomic::AtomicU8::new(DISPATCH_UNCHECKED) }; 16];
+static DISPATCH_REASON: Mutex<[Option<String>; 16]> = Mutex::new([const { None }; 16]);
+
+fn dispatch_verdict(device: &Device) -> Option<(usize, &'static std::sync::atomic::AtomicU8)> {
+    let candle_core::DeviceLocation::Cuda { gpu_id } = device.location() else {
+        return None;
+    };
+    DISPATCH_VERDICT
+        .get(gpu_id)
+        .map(|verdict| (gpu_id, verdict))
+}
+
+/// Joint steps per device dispatch of the retained RNNT decode.
+pub(super) const DEVICE_DECODE_STEPS: usize = transducer_greedy::DEVICE_DISPATCH_STEPS;
+
+/// Whether RNNT dispatches run the select step on the host instead of the
+/// device: the CPU tests of the dispatch's tensor work.
+#[cfg(test)]
+fn device_decode_on_the_host() -> bool {
+    tests::DEVICE_DECODE_ON_THE_HOST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn device_decode_on_the_host() -> bool {
+    false
+}
+
 struct RelPosSelfAttention {
     linear_q: ProjectionLinear,
     linear_k: ProjectionLinear,
@@ -3536,6 +4330,8 @@ struct RelPosSelfAttention {
     linear_pos: ProjectionLinear,
     pos_bias_u: Tensor,
     pos_bias_v: Tensor,
+    /// The biases' values as F32, which the fused attention reads.
+    fused_bias: [Tensor; 2],
 }
 
 impl RelPosSelfAttention {
@@ -3547,18 +4343,120 @@ impl RelPosSelfAttention {
                 f16,
             )?)
         };
+        let pos_bias_u = vb.get((ENCODER_HEADS, ENCODER_HEAD_DIM), "pos_bias_u")?;
+        let pos_bias_v = vb.get((ENCODER_HEADS, ENCODER_HEAD_DIM), "pos_bias_v")?;
+        let fused_bias = [
+            pos_bias_u.to_dtype(DType::F32)?,
+            pos_bias_v.to_dtype(DType::F32)?,
+        ];
+        // The kernel's self-check runs at load, before admission prices the
+        // encoder from its verdict.
+        relpos_attention::prepare_cuda_kernel(vb.device());
         Ok(Self {
             linear_q: projection("linear_q")?,
             linear_k: projection("linear_k")?,
             linear_v: projection("linear_v")?,
             linear_out: projection("linear_out")?,
             linear_pos: projection("linear_pos")?,
-            pos_bias_u: vb.get((ENCODER_HEADS, ENCODER_HEAD_DIM), "pos_bias_u")?,
-            pos_bias_v: vb.get((ENCODER_HEADS, ENCODER_HEAD_DIM), "pos_bias_v")?,
+            pos_bias_u,
+            pos_bias_v,
+            fused_bias,
         })
     }
 
-    fn forward(&self, x: &Tensor, pos_emb: &Tensor, att_mask: &Tensor) -> Result<Tensor> {
+    /// The attention core as one CUDA launch
+    /// ([`relpos_attention::relpos_attention`]) when its self-check passed:
+    /// each query scores its chunked-limited band's real keys only, with
+    /// eager's BF16 roundings in a BF16 encoder. `None` where the eager core
+    /// runs: off CUDA, with the kernel off, or in another dtype.
+    fn fused(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        keys: &AttentionKeys<'_>,
+    ) -> Result<Option<Tensor>> {
+        if !fused_attention_for(x.device(), x.dtype()) {
+            return Ok(None);
+        }
+        self.attend_fused(x, x, pos_emb, keys.band, keys.lengths)
+    }
+
+    /// The fused core over queries from `x` and keys and values from
+    /// `key_value` (`[B, Tk, D]`), with `positions` the `[1, Tq + Tk - 1, D]`
+    /// embeddings of the distances from `Tq - 1 + offset` down.
+    fn attend_fused(
+        &self,
+        x: &Tensor,
+        key_value: &Tensor,
+        positions: &Tensor,
+        band: KeyBand,
+        lengths: KeyLengths<'_>,
+    ) -> Result<Option<Tensor>> {
+        let on_the_host = fused_attention_on_the_host();
+        let dtype = x.dtype();
+        let b = x.dim(0)?;
+        let heads = |projection: &ProjectionLinear, x: &Tensor| -> Result<Tensor> {
+            let rows = x.dim(1)?;
+            Ok(projection
+                .forward(x)?
+                .reshape((b, rows, ENCODER_HEADS, ENCODER_HEAD_DIM))?)
+        };
+        let (q, k, v) = (
+            heads(&self.linear_q, x)?,
+            heads(&self.linear_k, key_value)?,
+            heads(&self.linear_v, key_value)?,
+        );
+        let rows = positions.dim(1)?;
+        let p =
+            self.linear_pos
+                .forward(positions)?
+                .reshape((rows, ENCODER_HEADS, ENCODER_HEAD_DIM))?;
+        // Eager adds the biases in the queries' dtype.
+        let bias = |bias: &Tensor, f32_values: &Tensor| -> Result<Tensor> {
+            if bias.dtype() == dtype {
+                Ok(f32_values.clone())
+            } else {
+                Ok(bias.to_dtype(dtype)?.to_dtype(DType::F32)?)
+            }
+        };
+        let (bias_u, bias_v) = (
+            bias(&self.pos_bias_u, &self.fused_bias[0])?,
+            bias(&self.pos_bias_v, &self.fused_bias[1])?,
+        );
+        let spec = relpos_attention::RelPosAttention {
+            q: &q,
+            k: &k,
+            v: &v,
+            pos: &p,
+            position: relpos_attention::RelPosition::TransformerXl {
+                bias_u: &bias_u,
+                bias_v: &bias_v,
+            },
+            band,
+            key_lengths: lengths,
+            scale: 1.0 / (ENCODER_HEAD_DIM as f64).sqrt(),
+            core: dtype,
+            out_dtype: dtype,
+        };
+        let out = if on_the_host {
+            Some(relpos_attention::reference(&spec)?.to_device(x.device())?)
+        } else {
+            relpos_attention::relpos_attention(&spec)?
+        };
+        let Some(out) = out else {
+            return Ok(None);
+        };
+        self.linear_out
+            .forward(&out)
+            .map(Some)
+            .map_err(|e| Error::InferenceError(e.to_string()))
+    }
+
+    fn forward(&self, x: &Tensor, pos_emb: &Tensor, keys: &AttentionKeys<'_>) -> Result<Tensor> {
+        if let Some(out) = self.fused(x, pos_emb, keys)? {
+            return Ok(out);
+        }
+        let att_mask = keys.mask;
         let (b, t, _d) = x.dims3()?;
 
         let q = self
@@ -3627,8 +4525,7 @@ impl RelPosSelfAttention {
         &self,
         x: &Tensor,
         cache: Option<&Tensor>,
-        pos_pair: &Tensor,
-        att_mask: &Tensor,
+        keys: &StreamingKeys<'_>,
     ) -> Result<Tensor> {
         let (b, q_len, _d) = x.dims3()?;
         let key_value = if let Some(cache) = cache {
@@ -3636,6 +4533,19 @@ impl RelPosSelfAttention {
         } else {
             x.clone()
         };
+        let pos_pair = match keys.positions {
+            StreamingPositions::Pairs(pairs) => pairs,
+            StreamingPositions::Table(table) => {
+                return self
+                    .attend_fused(x, &key_value, table, keys.band, KeyLengths::All)?
+                    .ok_or_else(|| {
+                        Error::InferenceError(
+                            "the fused attention refused a Nemotron streaming chunk".into(),
+                        )
+                    });
+            }
+        };
+        let att_mask = keys.mask;
         let key_len = key_value.dim(1)?;
 
         let q = self
@@ -3917,7 +4827,45 @@ impl PredictorState {
 }
 
 impl Predictor {
+    /// One step for every row of `state`: the rows whose `mask` (`[B]` U32)
+    /// is set take their `labels` (`[B]` U32, below the blank), the others
+    /// keep their state. Returns the output `[B, 1, H]`.
+    fn step_masked(
+        &self,
+        labels: &Tensor,
+        mask: &Tensor,
+        state: &mut PredictorState,
+    ) -> Result<Tensor> {
+        let [h0, c0, h1, c1] = state.components()?;
+        let x = self.embed.index_select(labels, 0)?;
+        let (h0_new, c0_new) = self.lstm_l0.step(&x, h0, c0)?;
+        let (h1_new, c1_new) = self.lstm_l1.step(&h0_new, h1, c1)?;
+        let keep = |new: &Tensor, old: &Tensor| -> Result<Tensor> {
+            let predicate = mask.reshape((mask.dim(0)?, 1))?.broadcast_as(new.shape())?;
+            Ok(predicate.where_cond(new, old)?)
+        };
+        let next = [
+            keep(&h0_new, h0)?,
+            keep(&c0_new, c0)?,
+            keep(&h1_new, h1)?,
+            keep(&c1_new, c1)?,
+        ];
+        let [h0, c0, h1, c1] = next;
+        let output = h1.unsqueeze(1)?;
+        *state = PredictorState {
+            h0: Some(h0),
+            c0: Some(c0),
+            h1: Some(h1),
+            c1: Some(c1),
+        };
+        Ok(output)
+    }
+}
+
+impl Predictor {
     fn load(vb: VarBuilder) -> Result<Self> {
+        // The device decode's select kernel checks itself at load.
+        crate::kernels::transducer_greedy::prepare_cuda_kernel(vb.device());
         let embed = vb.pp("embed").get_unchecked_dtype("weight", vb.dtype())?;
         let vocab_plus_blank = embed.dim(0)?;
         let hidden = embed.dim(1)?;
@@ -4414,6 +5362,41 @@ fn build_streaming_rel_positional_embedding(
     Tensor::from_vec(emb, (1, q_len * key_len, d_model), device).map_err(Error::from)
 }
 
+/// The embeddings of a streaming chunk's distinct relative distances, as
+/// the fused attention reads them: `[1, q_len + key_len - 1, d_model]`, row
+/// `r` holding distance `query_offset + q_len - 1 - r`, so the pair
+/// `(i, j)` of [`build_streaming_rel_positional_embedding`] is row
+/// `q_len - 1 - i + j`, with the same values.
+fn build_streaming_rel_position_table(
+    q_len: usize,
+    key_len: usize,
+    query_offset: usize,
+    d_model: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    if q_len == 0 || key_len == 0 || query_offset.saturating_add(q_len) > key_len {
+        return Err(Error::InvalidInput(format!(
+            "Invalid Nemotron streaming attention window: q_len={q_len}, key_len={key_len}, query_offset={query_offset}"
+        )));
+    }
+    let rows = q_len + key_len - 1;
+    let mut emb = vec![0f32; rows * d_model];
+    let denom = (10_000f32).ln() / d_model as f32;
+    let largest = (query_offset + q_len - 1) as isize;
+    for (row, values) in emb.chunks_exact_mut(d_model).enumerate() {
+        let distance = largest - row as isize;
+        for i in (0..d_model).step_by(2) {
+            let div = (-denom * i as f32).exp();
+            let angle = distance as f32 * div;
+            values[i] = angle.sin();
+            if i + 1 < d_model {
+                values[i + 1] = angle.cos();
+            }
+        }
+    }
+    Tensor::from_vec(emb, (1, rows, d_model), device).map_err(Error::from)
+}
+
 fn build_streaming_rel_positional_embedding_for_dtype(
     q_len: usize,
     key_len: usize,
@@ -4704,6 +5687,25 @@ fn normalize_per_feature(mel: &mut [f32], n_mels: usize, frames: usize, valid_fr
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    thread_local! {
+        /// Runs the conformer attention through the fused kernel's host
+        /// reference (see `fused_attention_on_the_host`).
+        pub(super) static FUSED_ATTENTION_ON_THE_HOST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Runs the retained RNNT dispatches with the select step on the
+        /// host (see `device_decode_on_the_host`).
+        pub(in super::super) static DEVICE_DECODE_ON_THE_HOST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// `f` with the conformer attention on the fused kernel's host reference.
+    fn with_fused_attention<T>(f: impl FnOnce() -> T) -> T {
+        FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(true));
+        let out = f();
+        FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(false));
+        out
+    }
 
     #[test]
     fn shape_tensor_cache_bounds_entries_and_retained_bytes() {
@@ -4999,6 +6001,8 @@ pub(super) mod tests {
             stream_rel_pos_cache: Mutex::new(HashMap::new()),
             stream_att_mask_cache: Mutex::new(HashMap::new()),
             dtype: DType::F32,
+            encoder_graphs: Err("test network".into()),
+            decode_graphs: Err("test network".into()),
         }
     }
 
@@ -5417,6 +6421,111 @@ pub(super) mod tests {
         tensors
     }
 
+    /// One streaming chunk's attention keys `[q_len, key_len, cache_len,
+    /// phase]` on `device`: the eager pairs or (`fused`) the distance table,
+    /// the mask, and the band.
+    fn chunk_keys(
+        [q_len, key_len, cache_len, phase]: [usize; 4],
+        left: usize,
+        right: usize,
+        fused: bool,
+        device: &Device,
+    ) -> (StreamingPositions, Tensor, KeyBand) {
+        let positions = if fused {
+            StreamingPositions::Table(
+                build_streaming_rel_position_table(q_len, key_len, cache_len, ENCODER_DIM, device)
+                    .unwrap(),
+            )
+        } else {
+            StreamingPositions::Pairs(
+                build_streaming_rel_positional_embedding(
+                    q_len,
+                    key_len,
+                    cache_len,
+                    ENCODER_DIM,
+                    device,
+                )
+                .unwrap(),
+            )
+        };
+        let mask = build_streaming_limited_context_mask(
+            q_len, key_len, cache_len, phase, left, right, device,
+        )
+        .unwrap();
+        (
+            positions,
+            mask,
+            streaming_band(left, right, phase, cache_len),
+        )
+    }
+
+    /// The fused attention over streaming chunks (cache keys before each
+    /// chunk, chunk phases, a sliding cache) matches the eager streaming
+    /// layer, chunk by chunk, through the kernel's host reference.
+    #[test]
+    fn fused_streaming_attention_matches_the_eager_chunks() {
+        let layer = hashed_conformer_layer();
+        let (left, len) = (56, 6 * 14 + 5);
+        let x = hashed_tensor(37, (1, len, ENCODER_DIM), 1.0);
+        for right in [13, 3] {
+            let mut worst = 0f32;
+            let (mut eager_state, mut fused_state) = (
+                ConformerLayerStreamState::new(),
+                ConformerLayerStreamState::new(),
+            );
+            for (start, q_len) in streaming_chunks(len, right) {
+                let chunk = x.narrow(1, start, q_len).unwrap();
+                let run = |state: &mut ConformerLayerStreamState, fused: bool| {
+                    let cache_len = state.attn_cache.as_ref().map_or(0, |c| c.dim(1).unwrap());
+                    let shape = [q_len, cache_len + q_len, cache_len, start % (right + 1)];
+                    let (positions, mask, band) =
+                        chunk_keys(shape, left, right, fused, &Device::Cpu);
+                    let keys = StreamingKeys {
+                        positions: &positions,
+                        mask: &mask,
+                        band,
+                    };
+                    FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(fused));
+                    let out = layer.forward_streaming(&chunk, state, &keys, left);
+                    FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(false));
+                    out.unwrap()
+                };
+                let eager = run(&mut eager_state, false);
+                let fused = run(&mut fused_state, true);
+                worst = worst.max(max_abs_difference(&fused, &eager) / max_abs_of(&eager).max(1.0));
+            }
+            eprintln!("Nemotron fused vs eager streaming, right {right}: {worst:e}");
+            assert!(worst <= 4e-6, "right {right}: {worst:e}");
+        }
+    }
+
+    /// The distance table holds the pair embeddings' values: pair `(i, j)`
+    /// is row `q_len - 1 - i + j`.
+    #[test]
+    fn streaming_position_table_holds_the_pair_embeddings() {
+        let (q_len, key_len, offset) = (5, 12, 7);
+        let pairs =
+            build_streaming_rel_positional_embedding(q_len, key_len, offset, 16, &Device::Cpu)
+                .unwrap()
+                .reshape((q_len, key_len, 16))
+                .unwrap();
+        let table = build_streaming_rel_position_table(q_len, key_len, offset, 16, &Device::Cpu)
+            .unwrap()
+            .squeeze(0)
+            .unwrap();
+        for i in 0..q_len {
+            for j in 0..key_len {
+                let pair = pairs.i((i, j)).unwrap().to_vec1::<f32>().unwrap();
+                let row = table
+                    .i(q_len - 1 - i + j)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                assert_eq!(pair, row, "pair ({i}, {j})");
+            }
+        }
+    }
+
     #[test]
     fn conformer_layer_streaming_matches_offline_chunked_limited() {
         let layer = hashed_conformer_layer();
@@ -5427,7 +6536,8 @@ pub(super) mod tests {
         for right in [13, 3] {
             let pos_emb = build_rel_positional_embedding(len, ENCODER_DIM, &Device::Cpu).unwrap();
             let mask = build_limited_context_mask(len, left, right, &Device::Cpu).unwrap();
-            let offline = layer.forward(&x, &pos_emb, &mask).unwrap();
+            let keys = AttentionKeys::solo(&mask, left, right);
+            let offline = layer.forward(&x, &pos_emb, &keys).unwrap();
 
             let mut state = ConformerLayerStreamState::new();
             let mut streamed = Vec::new();
@@ -5437,28 +6547,22 @@ pub(super) mod tests {
                     .as_ref()
                     .map_or(0, |cache| cache.dim(1).unwrap());
                 let key_len = cache_len + q_len;
-                let pos_pair = build_streaming_rel_positional_embedding(
-                    q_len,
-                    key_len,
-                    cache_len,
-                    ENCODER_DIM,
-                    &Device::Cpu,
-                )
-                .unwrap();
-                let mask = build_streaming_limited_context_mask(
-                    q_len,
-                    key_len,
-                    cache_len,
-                    start % (right + 1),
+                let (positions, mask, band) = chunk_keys(
+                    [q_len, key_len, cache_len, start % (right + 1)],
                     left,
                     right,
+                    false,
                     &Device::Cpu,
-                )
-                .unwrap();
+                );
+                let keys = StreamingKeys {
+                    positions: &positions,
+                    mask: &mask,
+                    band,
+                };
                 let chunk = x.narrow(1, start, q_len).unwrap();
                 streamed.push(
                     layer
-                        .forward_streaming(&chunk, &mut state, &pos_pair, &mask, left)
+                        .forward_streaming(&chunk, &mut state, &keys, left)
                         .unwrap(),
                 );
             }
@@ -5504,8 +6608,9 @@ pub(super) mod tests {
         let x = hashed_tensor(41, (1, len, ENCODER_DIM), 1.0);
         let pos_emb = build_rel_positional_embedding(len, ENCODER_DIM, &device).unwrap();
         let mask = build_limited_context_mask(len, left, right, &device).unwrap();
-        let offline = layer.forward(&x, &pos_emb, &mask).unwrap();
-        let rel = relative_l2_of(&offline, &reference.forward(&x, &pos_emb, &mask).unwrap());
+        let keys = AttentionKeys::solo(&mask, left, right);
+        let offline = layer.forward(&x, &pos_emb, &keys).unwrap();
+        let rel = relative_l2_of(&offline, &reference.forward(&x, &pos_emb, &keys).unwrap());
         assert!(rel > 0.0 && rel < 1e-2, "offline relative L2 {rel:e}");
 
         let mut state = ConformerLayerStreamState::new();
@@ -5516,28 +6621,22 @@ pub(super) mod tests {
                 .as_ref()
                 .map_or(0, |cache| cache.dim(1).unwrap());
             let key_len = cache_len + q_len;
-            let pos_pair = build_streaming_rel_positional_embedding(
-                q_len,
-                key_len,
-                cache_len,
-                ENCODER_DIM,
-                &device,
-            )
-            .unwrap();
-            let mask = build_streaming_limited_context_mask(
-                q_len,
-                key_len,
-                cache_len,
-                start % (right + 1),
+            let (positions, mask, band) = chunk_keys(
+                [q_len, key_len, cache_len, start % (right + 1)],
                 left,
                 right,
+                false,
                 &device,
-            )
-            .unwrap();
+            );
+            let keys = StreamingKeys {
+                positions: &positions,
+                mask: &mask,
+                band,
+            };
             let chunk = x.narrow(1, start, q_len).unwrap();
             streamed.push(
                 layer
-                    .forward_streaming(&chunk, &mut state, &pos_pair, &mask, left)
+                    .forward_streaming(&chunk, &mut state, &keys, left)
                     .unwrap(),
             );
         }
@@ -6426,6 +7525,246 @@ pub(super) mod tests {
             assert!(projected[row].is_contiguous());
         }
         eprintln!("Nemotron batched vs solo encode: worst relative difference {worst:e}");
+    }
+
+    /// A batch padded to an encoder graph's shape (spare rows of zero stems,
+    /// frames to a power of two) encodes each real row as the unpadded batch
+    /// does, to the batched bound; a lone row padded to its graph's shape
+    /// encodes as it does alone.
+    #[test]
+    fn graph_padded_batches_encode_their_real_rows_unchanged() {
+        let network = hashed_batch_network(&Device::Cpu, false);
+        let rows = BATCH_ROWS[..3]
+            .iter()
+            .enumerate()
+            .map(|(row, (valid, prompt))| {
+                hashed_batch_input(500 + row as u32, *valid, *prompt, &Device::Cpu)
+            })
+            .collect::<Vec<_>>();
+        let graph_shape = |rows: usize, frames: usize| encoder_graph_shape(rows, frames).unwrap();
+        assert_eq!(graph_shape(3, 28), (3, 32));
+        let (padded, padded_lengths) = network.encode_padded_rows(&rows, graph_shape).unwrap();
+        let (eager, lengths) = network
+            .encode_padded_rows(&rows, |rows, frames| (rows, frames))
+            .unwrap();
+        assert_eq!(padded_lengths, lengths);
+        assert_eq!(padded.dims(), [3, 32, ENCODER_DIM]);
+        assert_eq!(eager.dims(), [3, 28, ENCODER_DIM]);
+        for (row, len) in lengths.iter().enumerate() {
+            let alone = eager.i((row, ..*len, ..)).unwrap();
+            let difference = max_abs_difference(&padded.i((row, ..*len, ..)).unwrap(), &alone);
+            let bound = 4e-6 * max_abs_of(&alone).max(1.0);
+            assert!(
+                difference <= bound,
+                "row {row}: {difference:e} above {bound:e}"
+            );
+        }
+        let lone = std::slice::from_ref(&rows[1]);
+        let (padded, lengths) = network.encode_padded_rows(lone, graph_shape).unwrap();
+        assert_eq!(padded.dims(), [1, 16, ENCODER_DIM]);
+        let solo = network.encode_batch_with_prompts(lone).unwrap().remove(0);
+        let difference = max_abs_difference(&padded.i((0, ..lengths[0], ..)).unwrap(), &solo);
+        let bound = 4e-6 * max_abs_of(&solo).max(1.0);
+        assert!(
+            difference <= bound,
+            "lone row: {difference:e} above {bound:e}"
+        );
+    }
+
+    /// The fused attention's wiring: with the kernel's host reference in
+    /// place of the eager core (biases, position order, the chunked-limited
+    /// band and each row's key length as the CUDA kernel receives them), a
+    /// padded batch whose rows end on, past and before a chunk boundary, and
+    /// a lone utterance, encode as the eager layers do.
+    #[test]
+    fn fused_attention_matches_the_eager_encoder() {
+        let network = hashed_batch_network(&Device::Cpu, false);
+        let rows = BATCH_ROWS
+            .iter()
+            .enumerate()
+            .map(|(row, (valid, prompt))| {
+                hashed_batch_input(600 + row as u32, *valid, *prompt, &Device::Cpu)
+            })
+            .collect::<Vec<_>>();
+        let eager = network.encode_batch_with_prompts(&rows).unwrap();
+        let fused = with_fused_attention(|| network.encode_batch_with_prompts(&rows).unwrap());
+        let mut worst = 0f32;
+        for (fused, eager) in fused.iter().zip(&eager) {
+            worst = worst.max(max_abs_difference(fused, eager) / max_abs_of(eager).max(1.0));
+        }
+        let audio = hashed_values(77, 16_000, 0.25);
+        let (eager, eager_len) = network.encode_with_prompt(&audio, 3).unwrap();
+        let (fused, fused_len) =
+            with_fused_attention(|| network.encode_with_prompt(&audio, 3).unwrap());
+        assert_eq!(fused_len, eager_len);
+        worst = worst.max(max_abs_difference(&fused, &eager) / max_abs_of(&eager).max(1.0));
+        eprintln!("Nemotron fused vs eager attention on CPU: worst relative difference {worst:e}");
+        assert!(worst <= 4e-6, "{worst:e}");
+    }
+
+    #[test]
+    fn encoder_graph_shapes_pad_rows_to_a_width_and_frames_to_a_power_of_two() {
+        assert_eq!(encoder_graph_shape(1, 126), Some((1, 128)));
+        assert_eq!(encoder_graph_shape(0, 0), Some((1, 1)));
+        assert_eq!(encoder_graph_shape(5, 64), Some((6, 64)));
+        // Every width of 20 s clips, 4 rows of 41 s, a lone 82 s clip.
+        assert_eq!(encoder_graph_shape(7, 250), Some((8, 256)));
+        assert_eq!(encoder_graph_shape(4, 375), Some((4, 512)));
+        assert_eq!(encoder_graph_shape(1, 1000), Some((1, 1024)));
+        assert_eq!(encoder_graph_shape(9, 8), None, "past the stage width");
+        assert_eq!(encoder_graph_shape(5, 375), None, "6 rows of 512 frames");
+        assert_eq!(encoder_graph_shape(2, 1000), None);
+        for rows in ENCODER_GRAPH_ROWS {
+            for frames in (0..=11).map(|exp| 1usize << exp) {
+                let Some(shape) = encoder_graph_shape(rows, frames) else {
+                    continue;
+                };
+                assert_eq!(shape, (rows, frames), "a graph's shape is its own");
+                let bytes = nemotron_encoder_batch_bytes(frames, rows, false, false).unwrap();
+                assert!(bytes <= ENCODER_GRAPH_LIMITS.pool_bytes);
+            }
+        }
+        // The retained budget holds a full-width 20 s graph's copies at F32.
+        let copies =
+            (2 * 8 * 256 * ENCODER_DIM + (2 * 256 - 1) * ENCODER_DIM + 256 * 256 + 8 * 256) * 4;
+        assert!((copies as u64) * 4 <= ENCODER_GRAPH_LIMITS.retained_bytes);
+    }
+
+    /// With the fused attention on, a batch holds one positional projection
+    /// and its mask, not the scores, the three `rel_shift` planes or a
+    /// projection copy per row.
+    #[test]
+    fn fused_attention_drops_the_eager_attention_planes() {
+        for (frames, rows) in [(128usize, 1usize), (256, 8)] {
+            let eager = nemotron_encoder_batch_bytes(frames, rows, false, false).unwrap();
+            let fused = nemotron_encoder_batch_bytes(frames, rows, false, true).unwrap();
+            let (t, r) = (frames as u64, rows as u64);
+            let planes = 2 * r * 8 * t * t * 4 + 3 * r * 8 * t * 2 * t * 4 + r * 1024 * 2 * t * 4;
+            assert_eq!(eager - fused, planes - 1024 * 2 * t * 4);
+        }
+        assert_eq!(
+            nemotron_encoder_batch_row_bytes(256, 8, 8, BackendKind::Cuda).unwrap(),
+            nemotron_encoder_batch_bytes(256, 8, false, false)
+                .unwrap()
+                .div_ceil(8),
+            "without the CUDA kernel's verdict, pricing stays eager"
+        );
+    }
+
+    /// Admission prices the graphed shape on CUDA only, each real row
+    /// carrying its share of the padded batch; the graphs' own memory is a
+    /// CUDA load's.
+    #[test]
+    fn cuda_admission_prices_the_graphed_shape() {
+        // Pricing and the encoder read `IZWI_NEMOTRON_ASR_ENCODER_GRAPHS`.
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(nemotron_encoder_graph_device_bytes(BackendKind::Cpu), 0);
+        assert_eq!(nemotron_encoder_graph_device_bytes(BackendKind::Metal), 0);
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            assert_eq!(nemotron_encoder_batch_shape(5, 100, backend), (5, 100));
+        }
+        if !encoder_graphs_requested() {
+            assert_eq!(nemotron_encoder_graph_device_bytes(BackendKind::Cuda), 0);
+            assert_eq!(
+                nemotron_encoder_batch_shape(5, 100, BackendKind::Cuda),
+                (5, 100)
+            );
+            return;
+        }
+        assert_eq!(
+            nemotron_encoder_graph_device_bytes(BackendKind::Cuda),
+            768 << 20
+        );
+        assert_eq!(
+            nemotron_encoder_batch_shape(5, 100, BackendKind::Cuda),
+            (6, 128)
+        );
+        assert_eq!(
+            nemotron_encoder_batch_shape(5, 375, BackendKind::Cuda),
+            (5, 375)
+        );
+        for rows in [1usize, 3, 5, 8, 9] {
+            let (batch_rows, frames) = nemotron_encoder_batch_shape(rows, 100, BackendKind::Cuda);
+            let batch = nemotron_encoder_batch_bytes(frames, batch_rows, false, false).unwrap();
+            let row = nemotron_encoder_batch_row_bytes(frames, batch_rows, rows, BackendKind::Cpu)
+                .unwrap();
+            let eager =
+                nemotron_encoder_batch_row_bytes(100, rows, rows, BackendKind::Cpu).unwrap();
+            assert!(row * rows as u64 >= batch, "{rows} rows");
+            assert!(row >= eager, "{rows} rows");
+        }
+    }
+
+    /// On CUDA the encoder graphs return the eager padded batch bit for bit
+    /// through capture, verification and replay, over fresh inputs.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_encoder_graphs_match_the_eager_padded_batch() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let mut graphed = hashed_batch_network(&device, false);
+        graphed.encoder_graphs = ShapeGraphs::resolve("test", &device, ENCODER_GRAPH_LIMITS);
+        let eager = hashed_batch_network(&device, false);
+        let shape = |rows: usize, frames: usize| encoder_graph_shape(rows, frames).unwrap();
+        let bits = |t: &Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        for step in 0..4u32 {
+            let rows = BATCH_ROWS[..3]
+                .iter()
+                .enumerate()
+                .map(|(row, (valid, prompt))| {
+                    hashed_batch_input(600 + 10 * step + row as u32, *valid, *prompt, &device)
+                })
+                .collect::<Vec<_>>();
+            let (out, _) = graphed.encode_rows(&rows).unwrap();
+            let (expected, _) = eager.encode_padded_rows(&rows, shape).unwrap();
+            assert_eq!(bits(&out), bits(&expected), "step {step}");
+        }
+        let diagnostics = graphed.encoder_graphs_diagnostics();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        assert_eq!(diagnostics["captures"], 1, "{diagnostics}");
+        assert_eq!(diagnostics["verified"], 1, "{diagnostics}");
+        assert_eq!(diagnostics["replays"], 2, "{diagnostics}");
+    }
+
+    /// `IZWI_NEMOTRON_ASR_ENCODER_GRAPHS=0` reaches admission (no graph
+    /// memory, the eager shape) and the loader (no graphs, naming the
+    /// switch); off CUDA there are never graphs.
+    #[test]
+    fn the_kill_switch_turns_the_encoder_graphs_and_their_pricing_off() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(NEMOTRON_ENCODER_GRAPHS_ENV);
+        std::env::set_var(NEMOTRON_ENCODER_GRAPHS_ENV, "0");
+        let bytes = nemotron_encoder_graph_device_bytes(BackendKind::Cuda);
+        let shape = nemotron_encoder_batch_shape(5, 100, BackendKind::Cuda);
+        let reason = resolve_encoder_graphs(&Device::Cpu).err();
+        std::env::remove_var(NEMOTRON_ENCODER_GRAPHS_ENV);
+        let cpu = resolve_encoder_graphs(&Device::Cpu).err();
+        if let Some(previous) = previous {
+            std::env::set_var(NEMOTRON_ENCODER_GRAPHS_ENV, previous);
+        }
+        assert_eq!(bytes, 0);
+        assert_eq!(shape, (5, 100));
+        let reason = reason.expect("no graphs");
+        assert!(reason.contains(NEMOTRON_ENCODER_GRAPHS_ENV), "{reason}");
+        assert!(cpu.expect("no graphs on CPU").contains("CUDA only"));
+        let network = hashed_batch_network(&Device::Cpu, false);
+        assert!(!network.encoder_graphs_on());
+        assert_eq!(network.encoder_batch_shape(5, 100), (5, 100));
     }
 
     /// Whatever the padded stem frames hold, the real frames encode

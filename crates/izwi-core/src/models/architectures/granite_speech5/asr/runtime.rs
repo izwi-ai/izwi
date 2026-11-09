@@ -19,7 +19,9 @@ use crate::models::shared::weights::staged;
 use super::config::GraniteSpeech5Config;
 use super::encoder::ConformerEncoder;
 use super::gguf::{check_gguf_metadata, mmproj_var_builder, open_gguf};
-use super::language_model::{argmax_last_token, text_attention_geometry, GraniteLanguageModel};
+use super::language_model::{
+    argmax_last_token, argmax_rows, text_attention_geometry, GraniteLanguageModel,
+};
 use super::precision::{self, LmExecutionPlan};
 use super::preprocessor::GraniteSpeech5AudioFeatures;
 use super::projector::QFormerProjector;
@@ -319,6 +321,11 @@ impl GraniteSpeech5Runtime {
         self.dtype
     }
 
+    /// The dtype a prepared prompt's embeddings take.
+    pub(crate) fn embedding_dtype(&self) -> DType {
+        self.language_model.embedding_dtype()
+    }
+
     pub(crate) fn kv_dtype(&self) -> DType {
         self.language_model.kv_dtype()
     }
@@ -335,6 +342,7 @@ impl GraniteSpeech5Runtime {
     pub(crate) fn execution_diagnostics(&self) -> serde_json::Value {
         let plan = self.language_model.plan();
         serde_json::json!({
+            "encoder_graphs": self.encoder.graphs_diagnostics(),
             "f16_lm_head": plan.f16_lm_head,
             "f16_qkv": plan.f16_qkv,
             "f16_attention_core": plan.f16_attention_core,
@@ -392,6 +400,91 @@ impl GraniteSpeech5Runtime {
                 qformer_layers: self.projector.layer_count(),
             },
         ))
+    }
+
+    /// [`Self::audio_embeddings`] for several inputs in one encoder and one
+    /// Q-Former pass: the rows are zero-padded to the longest and masked to
+    /// their own frames (`ConformerEncoder::forward_valid_lengths`). One
+    /// input is exactly [`Self::audio_embeddings`].
+    pub fn audio_embeddings_batch(
+        &self,
+        features: &[GraniteSpeech5AudioFeatures],
+    ) -> Result<Vec<(Tensor, GraniteSpeech5AudioStats)>> {
+        // With the encoder graphs on, a lone row pads to its graph's shape too.
+        if let ([single], false) = (features, self.encoder.graphs_on()) {
+            return self.audio_embeddings(single).map(|output| vec![output]);
+        }
+        let dim = features.first().map_or(0, |row| row.encoder_dim);
+        let frames = features
+            .iter()
+            .map(|row| row.encoder_frames)
+            .max()
+            .unwrap_or(0);
+        if dim == 0
+            || frames == 0
+            || features.iter().any(|row| {
+                row.encoder_frames == 0
+                    || row.encoder_dim != dim
+                    || row.input_features.len() != row.encoder_frames
+                    || row.input_features.iter().any(|frame| frame.len() != dim)
+            })
+        {
+            return Err(Error::InvalidInput(
+                "Granite Speech 5.0 audio batch has inconsistent frame geometry".into(),
+            ));
+        }
+        let valid_lengths = features
+            .iter()
+            .map(|row| row.encoder_frames)
+            .collect::<Vec<_>>();
+        // A graph's spare rows are zero features of full length.
+        let (batch_rows, frames) = self.encoder.batch_shape(features.len(), frames);
+        let mut flat = Vec::with_capacity(batch_rows * frames * dim);
+        for row in features {
+            for frame in &row.input_features {
+                flat.extend_from_slice(frame);
+            }
+            flat.resize(flat.len() + (frames - row.encoder_frames) * dim, 0.0);
+        }
+        flat.resize(batch_rows * frames * dim, 0.0);
+        let mut batch_lengths = valid_lengths.clone();
+        batch_lengths.resize(batch_rows, frames);
+        let started = Instant::now();
+        let input = Tensor::from_vec(flat, (batch_rows, frames, dim), &self.device)?
+            .to_dtype(self.audio_dtype)?;
+        let upload = started.elapsed();
+        let started = Instant::now();
+        let mut encoded = self.encoder.forward_valid_lengths(&input, &batch_lengths)?;
+        if batch_rows > features.len() {
+            encoded = encoded.narrow(0, 0, features.len())?;
+        }
+        let encoder = started.elapsed();
+        let started = Instant::now();
+        let embeddings = self
+            .projector
+            .forward_compact_valid_lengths(&encoded, &valid_lengths)?;
+        let projector = started.elapsed();
+        Ok(embeddings
+            .into_iter()
+            .zip(&valid_lengths)
+            .map(|(embeddings, &frames)| {
+                (
+                    embeddings,
+                    GraniteSpeech5AudioStats {
+                        upload,
+                        encoder,
+                        projector,
+                        encoder_frames: frames,
+                        conformer_context_size: self.encoder.context_size(),
+                        conformer_layers: self.encoder.layer_count(),
+                        qformer_windows: self.projector.window_count(frames),
+                        qformer_window_size: self.projector.window_size(),
+                        qformer_queries_per_window: self.projector.num_queries(),
+                        qformer_layers: self.projector.layer_count(),
+                    },
+                )
+            })
+            .collect())
     }
 
     /// The prompt's token ids with the audio placeholder expanded to one id
@@ -549,6 +642,79 @@ impl GraniteSpeech5Runtime {
             },
             token_ids: generated,
         })
+    }
+
+    /// The prompt's embeddings with `audio_embeds` spliced over its expanded
+    /// audio placeholder, as `generate` prefills them: `(embeddings
+    /// [1, tokens, hidden], tokens, audio tokens)`.
+    pub(crate) fn prompt_embeddings(
+        &self,
+        prompt: &GraniteSpeech5Prompt,
+        special_tokens: &GraniteSpeech5SpecialTokens,
+        audio_embeds: &Tensor,
+    ) -> Result<(Tensor, usize, usize)> {
+        let audio_tokens = audio_embeds.dim(1)?;
+        let input_ids =
+            Self::expanded_input_ids(prompt, audio_tokens, special_tokens.audio_token_id)?;
+        let embeddings = self.language_model.prompt_embeddings_with_audio(
+            &input_ids,
+            prompt.audio_token_position,
+            audio_embeds,
+        )?;
+        Ok((embeddings, input_ids.len(), audio_tokens))
+    }
+
+    /// Prefill `[span_start, span_end)` of prepared prompt `embeddings` onto
+    /// `cache`, whose cursor must sit at `span_start`, with RoPE rows from the
+    /// load-time table. Returns the span's last logits.
+    pub(crate) fn prefill_prompt_span(
+        &self,
+        embeddings: &Tensor,
+        span_start: usize,
+        span_end: usize,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Tensor> {
+        let prompt_tokens = embeddings.dim(1)?;
+        if span_start != cache.context_len() || span_start >= span_end || span_end > prompt_tokens {
+            return Err(Error::InvalidInput(format!(
+                "Granite Speech 5.0 prefill span [{span_start},{span_end}) does not continue cache cursor {} within prompt length {prompt_tokens}",
+                cache.context_len()
+            )));
+        }
+        let span = embeddings.narrow(1, span_start, span_end - span_start)?;
+        self.language_model.forward_embeds(
+            &span,
+            span_start,
+            cache,
+            Some(self.language_model.rope_table()),
+            None,
+        )
+    }
+
+    /// The greedy next token of prefill logits, read back.
+    pub(crate) fn greedy_token(&self, logits: &Tensor) -> Result<u32> {
+        argmax_last_token(logits)?
+            .flatten_all()?
+            .to_vec1::<u32>()?
+            .first()
+            .copied()
+            .ok_or_else(|| Error::InferenceError("Granite Speech 5.0 argmax is empty".into()))
+    }
+
+    /// One decode step for several retained rows sharing one arena: row
+    /// `i` appends `tokens[i]` at `positions[i]` of `caches[i]`. Returns each
+    /// row's greedy next token, read back once for every row.
+    pub(crate) fn decode_tokens_batch(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<Vec<u32>> {
+        let input = Tensor::from_vec(tokens.to_vec(), tokens.len(), &self.device)?;
+        let logits = self
+            .language_model
+            .forward_decode_rows(&input, positions, caches)?;
+        argmax_rows(&logits)
     }
 
     #[cfg(test)]

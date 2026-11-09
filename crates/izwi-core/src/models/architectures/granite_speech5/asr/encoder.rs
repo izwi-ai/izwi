@@ -3,13 +3,15 @@
 //! (200-frame) blocks, a depthwise convolution module, and self-conditioning
 //! from a character CTC head at the midpoint layer.
 
-use candle_core::{DType, Device, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::{
     batch_norm, conv1d, conv1d_no_bias, embedding, layer_norm, linear, linear_no_bias, ops,
     Conv1dConfig, Embedding, LayerNorm, Module, VarBuilder,
 };
 
+use crate::backends::BackendKind;
 use crate::error::{Error, Result};
+use crate::kernels::cuda::shape_graphs::{ShapeGraphLimits, ShapeGraphs};
 use crate::kernels::depthwise_conv::{
     batch_norm_affine, depthwise_conv1d, fold_channel_affine, DepthwiseConv1dSpec,
 };
@@ -19,6 +21,7 @@ use crate::kernels::f16_weight_linear::{
 use crate::kernels::numeric_check::{
     run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
 };
+use crate::kernels::relpos_attention::{self, KeyBand, KeyLengths};
 
 use super::config::GraniteSpeech5EncoderConfig;
 
@@ -29,6 +32,128 @@ pub(super) struct ConformerEncoder {
     /// residual stream (self-conditioning).
     out: ProjectionLinear,
     out_mid: ProjectionLinear,
+    /// The geometry the graphs' shapes are sized from.
+    config: GraniteSpeech5EncoderConfig,
+    /// CUDA graphs of the masked encoder over a padded batch, one per
+    /// `(rows, frames)` shape ([`encoder_graph_shape`]), or why there are
+    /// none.
+    graphs: std::result::Result<ShapeGraphs<(usize, usize)>, String>,
+}
+
+/// Kill switch for Granite Speech 5.0's encoder CUDA graphs (a boolean; on
+/// when unset). Read by admission pricing and the loader.
+pub(crate) const GRANITE_SPEECH5_ENCODER_GRAPHS_ENV: &str = "IZWI_GRANITE_SPEECH5_ENCODER_GRAPHS";
+
+fn encoder_graphs_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(GRANITE_SPEECH5_ENCODER_GRAPHS_ENV, true));
+    ON.get()
+}
+
+/// Batch widths the encoder graphs are captured at, up to the CUDA encoder
+/// stage's width of 8. A graphed batch pads its rows up to the next.
+const ENCODER_GRAPH_ROWS: [usize; 6] = [1, 2, 3, 4, 6, 8];
+
+const MIB: u64 = 1024 * 1024;
+
+/// What the encoder graphs may hold: the pool bounds a graph's working set
+/// ([`encoder_batch_bytes`], priced at F32), the retained budget the kept
+/// graphs' input copies (with the eager key mask) and outputs.
+const ENCODER_GRAPH_LIMITS: ShapeGraphLimits = ShapeGraphLimits {
+    max_graphs: 24,
+    retained_bytes: 128 * MIB,
+    pool_bytes: 640 * MIB,
+};
+
+/// Device bytes a load on `backend` prices for the encoder graphs, which
+/// allocate lazily on their first batches: zero off CUDA or with the graphs
+/// switched off.
+pub(crate) fn granite_speech5_encoder_graph_device_bytes(backend: BackendKind) -> u64 {
+    if backend == BackendKind::Cuda && encoder_graphs_requested() {
+        ENCODER_GRAPH_LIMITS.device_bytes()
+    } else {
+        0
+    }
+}
+
+/// The F32 working set of the masked encoder over `rows` rows of `frames`
+/// frames: about six `[T, hidden x feed-forward]` activations, the eager
+/// attention's block scores and softmax, its key mask, and the output.
+fn encoder_batch_bytes(
+    config: &GraniteSpeech5EncoderConfig,
+    rows: usize,
+    frames: usize,
+) -> Option<u64> {
+    const F32: usize = 4;
+    let context = config.context_size.max(1);
+    let blocks = frames.div_ceil(context);
+    let ff = config.hidden_dim.checked_mul(config.feedforward_mult)?;
+    let block_pairs = rows
+        .checked_mul(blocks)?
+        .checked_mul(context)?
+        .checked_mul(context)?;
+    let terms = [
+        6usize
+            .checked_mul(rows)?
+            .checked_mul(frames)?
+            .checked_mul(ff)?,
+        2usize
+            .checked_mul(block_pairs)?
+            .checked_mul(config.num_heads)?,
+        block_pairs,
+        rows.checked_mul(frames)?.checked_mul(config.hidden_dim)?,
+    ];
+    let elements = terms
+        .into_iter()
+        .try_fold(0usize, |total, term| total.checked_add(term))?;
+    u64::try_from(elements.checked_mul(F32)?).ok()
+}
+
+/// The `(rows, frames)` a graph runs a batch of `rows` rows whose longest
+/// has `frames` frames at: rows up to the next graph width, frames up to
+/// whole attention blocks (which the attention pads to anyway). `None` past
+/// 8 rows or past the pool budget.
+pub(super) fn encoder_graph_shape(
+    config: &GraniteSpeech5EncoderConfig,
+    rows: usize,
+    frames: usize,
+) -> Option<(usize, usize)> {
+    let rows = ENCODER_GRAPH_ROWS
+        .into_iter()
+        .find(|width| *width >= rows.max(1))?;
+    let context = config.context_size.max(1);
+    let frames = frames.max(1).div_ceil(context) * context;
+    let bytes = encoder_batch_bytes(config, rows, frames)?;
+    (bytes <= ENCODER_GRAPH_LIMITS.pool_bytes).then_some((rows, frames))
+}
+
+/// The `(rows, frames)` an encoder batch of `rows` rows padded to `frames`
+/// frames runs at on `backend`: a graph's shape on CUDA with the encoder
+/// graphs on, else as given. Admission prices this shape; the encoder runs
+/// it, or the given one once its graphs are off.
+pub(super) fn encoder_batch_shape(
+    config: &GraniteSpeech5EncoderConfig,
+    rows: usize,
+    frames: usize,
+    backend: BackendKind,
+) -> (usize, usize) {
+    if backend == BackendKind::Cuda && encoder_graphs_requested() {
+        if let Some(shape) = encoder_graph_shape(config, rows, frames) {
+            return shape;
+        }
+    }
+    (rows, frames)
+}
+
+/// The encoder's CUDA graphs on `device`, or why it has none.
+fn resolve_encoder_graphs(
+    device: &Device,
+) -> std::result::Result<ShapeGraphs<(usize, usize)>, String> {
+    if encoder_graphs_requested() {
+        ShapeGraphs::resolve("Granite Speech 5.0 encoder", device, ENCODER_GRAPH_LIMITS)
+    } else {
+        Err(format!("{GRANITE_SPEECH5_ENCODER_GRAPHS_ENV} is off"))
+    }
 }
 
 /// A linear layer read from `vb`, held dense or, with `f16` set, as
@@ -86,6 +211,8 @@ impl ConformerEncoder {
                 &vb.pp("out_mid"),
                 f16,
             )?,
+            config: config.clone(),
+            graphs: resolve_encoder_graphs(vb.device()),
         })
     }
 
@@ -108,6 +235,118 @@ impl ConformerEncoder {
             if idx + 1 == midpoint {
                 let mid = ops::softmax_last_dim(&self.out.forward(&x)?)?;
                 x = x.broadcast_add(&self.out_mid.forward(&mid)?)?;
+            }
+        }
+        Ok(x)
+    }
+
+    /// [`Self::forward`] over a padded batch: row `r` holds
+    /// `valid_lengths[r]` frames, zero-padded to the batch's longest. Each
+    /// row's valid frames get its solo encoding up to the rounding of the
+    /// batch's matmul shapes: the rows share one block partition from frame
+    /// 0, padded keys are masked out of attention, padded frames are zeroed
+    /// before the depthwise convolution reads them, and every block leaves
+    /// padded frames at zero.
+    pub(super) fn forward_valid_lengths(
+        &self,
+        input: &Tensor,
+        valid_lengths: &[usize],
+    ) -> Result<Tensor> {
+        let (batch, frames, _) = input.dims3()?;
+        validate_frame_lengths(batch, frames, valid_lengths)?;
+        // The input projection keeps the activations' dtype.
+        let (device, dtype) = (input.device(), input.dtype());
+        let mask = frame_valid_mask(valid_lengths, frames, device, dtype)?;
+        let real = valid_lengths
+            .iter()
+            .map(|len| *len as u32)
+            .collect::<Vec<_>>();
+        let key_lengths = Tensor::from_vec(real, batch, device)?;
+        let key_mask = valid_key_mask(
+            valid_lengths,
+            frames.div_ceil(self.context_size().max(1)),
+            self.context_size(),
+            device,
+            dtype,
+        )?;
+        let graphs = match &self.graphs {
+            Ok(graphs)
+                if encoder_graph_shape(&self.config, batch, frames) == Some((batch, frames)) =>
+            {
+                graphs
+            }
+            _ => return self.forward_masked(input, &mask, &key_mask, &key_lengths),
+        };
+        // The graph keeps a stable copy of each input and an output of the
+        // hidden width.
+        let inputs = [input.clone(), mask, key_mask, key_lengths];
+        let tensor_bytes = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+        let retained = inputs.iter().map(tensor_bytes).sum::<u64>()
+            + (batch * frames * self.config.hidden_dim * dtype.size_in_bytes()) as u64;
+        let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+            let [input, mask, key_mask, key_lengths] = inputs else {
+                return Err(Error::InferenceError(format!(
+                    "Granite Speech 5.0 encoder graph received {} inputs, expected 4",
+                    inputs.len()
+                )));
+            };
+            Ok(vec![self.forward_masked(
+                input,
+                mask,
+                key_mask,
+                key_lengths,
+            )?])
+        };
+        graphs
+            .run((batch, frames), retained, &inputs, &body)?
+            .pop()
+            .ok_or_else(|| {
+                Error::InferenceError("Granite Speech 5.0 encoder graph returned nothing".into())
+            })
+    }
+
+    /// Whether padded batches run through the CUDA graphs: on CUDA with the
+    /// graphs switched on and no graph failure yet.
+    pub(super) fn graphs_on(&self) -> bool {
+        self.graphs.as_ref().is_ok_and(ShapeGraphs::is_on)
+    }
+
+    /// The `(rows, frames)` a batch of `rows` rows whose longest has
+    /// `frames` frames runs at: its graph's shape while the graphs are on
+    /// (at most what admission priced), else as given.
+    pub(super) fn batch_shape(&self, rows: usize, frames: usize) -> (usize, usize) {
+        if self.graphs_on() {
+            encoder_graph_shape(&self.config, rows, frames).unwrap_or((rows, frames))
+        } else {
+            (rows, frames)
+        }
+    }
+
+    pub(super) fn graphs_diagnostics(&self) -> serde_json::Value {
+        match &self.graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        }
+    }
+
+    /// [`Self::forward_valid_lengths`] under masks already built: the
+    /// eager form of the encoder graphs.
+    fn forward_masked(
+        &self,
+        input: &Tensor,
+        mask: &Tensor,
+        key_mask: &Tensor,
+        key_lengths: &Tensor,
+    ) -> Result<Tensor> {
+        let x = self.input_linear.forward(input)?;
+        let mut x = x.broadcast_mul(mask)?;
+        let midpoint = self.layers.len() / 2;
+        for (idx, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_masked(&x, mask, [key_mask, key_lengths])?;
+            if idx + 1 == midpoint {
+                let mid = ops::softmax_last_dim(&self.out.forward(&x)?)?;
+                let mid = self.out_mid.forward(&mid)?.broadcast_mul(mask)?;
+                x = x.broadcast_add(&mid)?;
             }
         }
         Ok(x)
@@ -204,6 +443,22 @@ impl ConformerBlock {
         out = out.broadcast_add(&(ff2 * 0.5)?)?;
         self.post_norm.forward(&out).map_err(Error::from)
     }
+
+    /// [`Self::forward`] over a padded batch with its `[batch, frames, 1]`
+    /// frame mask and attention keys (the key mask and each row's `[batch]`
+    /// U32 valid length); padded frames leave as zeros.
+    fn forward_masked(&self, x: &Tensor, mask: &Tensor, keys: [&Tensor; 2]) -> Result<Tensor> {
+        let ff1 = self.ff1.forward(x)?.broadcast_mul(mask)?;
+        let mut out = x.broadcast_add(&(ff1 * 0.5)?)?;
+        out = out.broadcast_add(&self.attn.forward_masked(&out, mask, keys)?)?;
+        out = out.broadcast_add(&self.conv.forward_masked(&out, mask)?)?;
+        let ff2 = self.ff2.forward(&out)?.broadcast_mul(mask)?;
+        out = out.broadcast_add(&(ff2 * 0.5)?)?;
+        self.post_norm
+            .forward(&out)?
+            .broadcast_mul(mask)
+            .map_err(Error::from)
+    }
 }
 
 struct ConformerFeedForward {
@@ -244,8 +499,22 @@ struct ConformerAttention {
     /// distance clamped to the block, offset by `max_pos_emb`.
     attention_dists: Tensor,
     context_size: usize,
+    max_pos_emb: usize,
     num_heads: usize,
     dim_head: usize,
+}
+
+/// Whether the conformer attention runs [`relpos_attention::reference`] on
+/// the host in place of the CUDA kernel: the in-family tests of the fused
+/// path's wiring on a machine without a GPU.
+#[cfg(test)]
+fn fused_attention_on_the_host() -> bool {
+    tests::FUSED_ATTENTION_ON_THE_HOST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn fused_attention_on_the_host() -> bool {
+    false
 }
 
 impl ConformerAttention {
@@ -256,6 +525,9 @@ impl ConformerAttention {
     ) -> Result<Self> {
         let inner = config.dim_head * config.num_heads;
         let hidden = config.hidden_dim;
+        // The kernel's self-check runs at load, before admission prices the
+        // encoder from its verdict.
+        relpos_attention::prepare_cuda_kernel(vb.device());
         Ok(Self {
             pre_norm: layer_norm(hidden, 1e-5, vb.pp("pre_norm"))?,
             to_q: encoder_projection(hidden, inner, false, &vb.pp("to_q"), f16)?,
@@ -268,13 +540,86 @@ impl ConformerAttention {
             )?,
             attention_dists: attention_dists(config.context_size, config.max_pos_emb, vb.device())?,
             context_size: config.context_size,
+            max_pos_emb: config.max_pos_emb,
             num_heads: config.num_heads,
             dim_head: config.dim_head,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.attend(x, None)
+    }
+
+    /// [`Self::forward`] over a padded batch: the key mask
+    /// (`[batch, blocks, 1, 1, context]`) and the `[batch]` U32 valid lengths
+    /// keep each row's queries off its padded keys, and `mask` zeroes padded
+    /// frames' output.
+    fn forward_masked(&self, x: &Tensor, mask: &Tensor, keys: [&Tensor; 2]) -> Result<Tensor> {
+        self.attend(x, Some(keys))?
+            .broadcast_mul(mask)
+            .map_err(Error::from)
+    }
+
+    /// The attention core of normed `x` (`[B, T, D]`) as one CUDA launch
+    /// ([`relpos_attention::relpos_attention`]) once its self-check passed:
+    /// each query scores the keys of its own block (cut at its row's
+    /// `key_lengths`, when given) against the position table itself, with
+    /// eager's BF16 roundings in a BF16 encoder, and no block padding.
+    /// `[B, T, H·Dh]`, or `None` where the eager core runs.
+    fn fused(&self, x: &Tensor, key_lengths: Option<&Tensor>) -> Result<Option<Tensor>> {
+        let dtype = x.dtype();
+        let on = fused_attention_on_the_host()
+            || (x.device().is_cuda() && relpos_attention::eager_reason(x.device()).is_none());
+        if !on || !matches!(dtype, DType::F32 | DType::BF16) {
+            return Ok(None);
+        }
+        let (batch, seq_len, _) = x.dims3()?;
+        let (heads, dim_head) = (self.num_heads, self.dim_head);
+        let q = self
+            .to_q
+            .forward(x)?
+            .reshape((batch, seq_len, heads, dim_head))?;
+        let kv = self
+            .to_kv
+            .forward(x)?
+            .reshape((batch, seq_len, 2, heads, dim_head))?;
+        let (k, v) = (kv.i((.., .., 0))?, kv.i((.., .., 1))?);
+        let table = self.rel_pos_emb.embeddings().to_dtype(dtype)?;
+        let spec = relpos_attention::RelPosAttention {
+            q: &q,
+            k: &k,
+            v: &v,
+            pos: &table,
+            position: relpos_attention::RelPosition::Shaw {
+                clamp: self.context_size,
+                center: self.max_pos_emb,
+            },
+            band: KeyBand::Block {
+                size: self.context_size,
+            },
+            key_lengths: key_lengths.map_or(KeyLengths::All, KeyLengths::PerRow),
+            scale: 1.0 / (dim_head as f64).sqrt(),
+            core: dtype,
+            out_dtype: dtype,
+        };
+        if fused_attention_on_the_host() {
+            return Ok(Some(
+                relpos_attention::reference(&spec)?.to_device(x.device())?,
+            ));
+        }
+        Ok(relpos_attention::relpos_attention(&spec)?)
+    }
+
+    /// Block-local attention. Without `keys` the one row's zero-padded final
+    /// block is masked as the solo route has always masked it; with them
+    /// (the key mask and each row's valid length), each row's keys past its
+    /// valid frames are.
+    fn attend(&self, x: &Tensor, keys: Option<[&Tensor; 2]>) -> Result<Tensor> {
         let x = self.pre_norm.forward(x)?;
+        if let Some(out) = self.fused(&x, keys.map(|[_, lengths]| lengths))? {
+            return self.to_out.forward(&out).map_err(Error::from);
+        }
+        let key_mask = keys.map(|[key_mask, _]| key_mask);
         let (batch, seq_len, _) = x.dims3()?;
         let blocks = seq_len.div_ceil(self.context_size);
         let padded_len = blocks * self.context_size;
@@ -308,7 +653,9 @@ impl ConformerAttention {
         let pos_bias = relative_position_bias(&q, &rel)?;
         let scale = 1.0 / (self.dim_head as f64).sqrt();
         let mut scores = (attention_scores(&q, &k)? * scale)?.broadcast_add(&pos_bias)?;
-        if pad > 0 {
+        if let Some(key_mask) = key_mask {
+            scores = scores.broadcast_add(key_mask)?;
+        } else if pad > 0 {
             let mask = padding_mask(
                 self.context_size,
                 seq_len % self.context_size,
@@ -431,6 +778,60 @@ fn padding_mask(
         .map_err(Error::from)
 }
 
+fn validate_frame_lengths(batch: usize, frames: usize, valid_lengths: &[usize]) -> Result<()> {
+    if batch == 0
+        || frames == 0
+        || valid_lengths.len() != batch
+        || valid_lengths
+            .iter()
+            .any(|length| *length == 0 || *length > frames)
+    {
+        return Err(Error::InvalidInput(format!(
+            "Granite Speech 5.0 valid frame lengths {valid_lengths:?} do not fit a batch of {batch} x {frames} frames"
+        )));
+    }
+    Ok(())
+}
+
+/// `[batch, frames, 1]`: 1 for each row's valid frames, 0 for its padding.
+fn frame_valid_mask(
+    valid_lengths: &[usize],
+    frames: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let data = valid_lengths
+        .iter()
+        .flat_map(|&length| (0..frames).map(move |frame| f32::from(u8::from(frame < length))))
+        .collect::<Vec<_>>();
+    Tensor::from_vec(data, (valid_lengths.len(), frames, 1), device)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
+}
+
+/// `[batch, blocks, 1, 1, context]`: `-1e4` on each row's keys past its
+/// valid frames, broadcast over heads and queries. A valid query's scores
+/// get exactly what the solo route adds (0 or the same `-1e4` on its final
+/// block's padding). Built as F32 on the host (Candle's Metal backend
+/// cannot cast F64).
+fn valid_key_mask(
+    valid_lengths: &[usize],
+    blocks: usize,
+    context: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let data = valid_lengths
+        .iter()
+        .flat_map(|&length| {
+            (0..blocks * context).map(move |key| if key < length { 0.0f32 } else { -1e4 })
+        })
+        .collect::<Vec<_>>();
+    Tensor::from_vec(data, (valid_lengths.len(), blocks, 1, 1, context), device)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
+}
+
 struct ConformerConv {
     norm: LayerNorm,
     up_conv: PointwiseConv1d,
@@ -510,8 +911,27 @@ impl ConformerConv {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.convolve(x, None)
+    }
+
+    /// [`Self::forward`] over a padded batch: padded frames enter the
+    /// depthwise convolution as the zeros a solo row is padded with, and
+    /// leave as zeros.
+    fn forward_masked(&self, x: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        let channel_mask = mask.transpose(1, 2)?.contiguous()?;
+        self.convolve(x, Some(&channel_mask))?
+            .broadcast_mul(mask)
+            .map_err(Error::from)
+    }
+
+    /// The module, with `channel_mask` (`[batch, 1, frames]`) applied to the
+    /// GLU output before the depthwise convolution reads it.
+    fn convolve(&self, x: &Tensor, channel_mask: Option<&Tensor>) -> Result<Tensor> {
         let x = self.norm.forward(x)?.transpose(1, 2)?.contiguous()?;
-        let x = glu_channels(&self.up_conv.forward(&x)?)?;
+        let mut x = glu_channels(&self.up_conv.forward(&x)?)?;
+        if let Some(channel_mask) = channel_mask {
+            x = x.broadcast_mul(channel_mask)?;
+        }
         let x = depthwise_conv1d(
             &x,
             &self.depth_weight,
@@ -539,6 +959,13 @@ fn glu_channels(x: &Tensor) -> Result<Tensor> {
 mod tests {
     use super::*;
     use candle_nn::{Conv1d, VarMap};
+
+    thread_local! {
+        /// Runs the conformer attention through the fused kernel's host
+        /// reference (see `fused_attention_on_the_host`).
+        pub(super) static FUSED_ATTENTION_ON_THE_HOST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
 
     fn assert_close(left: &Tensor, right: &Tensor, tolerance: f32) {
         let left = left.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -773,6 +1200,361 @@ mod tests {
             return;
         };
         assert_f16_encoder_tracks_cpu_f32(&device);
+    }
+
+    /// The 4-frame-block test encoder with seeded random weights.
+    /// The fused Shaw attention's wiring: with the kernel's host reference in
+    /// place of the eager core (the table itself, its clamp and center, the
+    /// block band, each row's valid length, no block padding), a lone input
+    /// whose last block is partial and a padded batch encode as the eager
+    /// layers do. The kernel takes head dims in multiples of 32.
+    #[test]
+    fn fused_attention_matches_the_eager_encoder() {
+        use crate::kernels::numeric_check::{host_f32, relative_l2};
+        let config = GraniteSpeech5EncoderConfig {
+            hidden_dim: 64,
+            input_dim: 12,
+            output_dim: 7,
+            dim_head: 32,
+            num_heads: 2,
+            context_size: 8,
+            max_pos_emb: 8,
+            conv_kernel_size: 5,
+            ..tiny_encoder_config()
+        };
+        let vars = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu);
+        let encoder = ConformerEncoder::load(&config, vb, None).unwrap();
+        let input = xorshift_tensor(&[2, 21, config.input_dim], 9, 1.0, &Device::Cpu).unwrap();
+        let fused = |f: &dyn Fn() -> Tensor| {
+            FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(true));
+            let out = f();
+            FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(false));
+            out
+        };
+        let rel =
+            |a: &Tensor, b: &Tensor| relative_l2(&host_f32(a).unwrap(), &host_f32(b).unwrap());
+        let lone = input.i(0..1).unwrap();
+        let eager = encoder.forward(&lone).unwrap();
+        let error = rel(&fused(&|| encoder.forward(&lone).unwrap()), &eager);
+        assert!(error < 1e-5, "lone input relative L2 {error:e}");
+        let lengths = [13, 21];
+        let eager = encoder.forward_valid_lengths(&input, &lengths).unwrap();
+        let batched = fused(&|| encoder.forward_valid_lengths(&input, &lengths).unwrap());
+        for (row, len) in lengths.iter().enumerate() {
+            let real = |t: &Tensor| t.i((row..row + 1, ..*len)).unwrap();
+            let error = rel(&real(&batched), &real(&eager));
+            eprintln!("Granite 5.0 fused vs eager attention, row {row}: relative L2 {error:e}");
+            assert!(error < 1e-5, "row {row} relative L2 {error:e}");
+        }
+    }
+
+    fn seeded_block_encoder(device: &Device) -> (GraniteSpeech5EncoderConfig, ConformerEncoder) {
+        let config = GraniteSpeech5EncoderConfig {
+            hidden_dim: 16,
+            input_dim: 12,
+            output_dim: 7,
+            dim_head: 4,
+            num_heads: 4,
+            context_size: 4,
+            max_pos_emb: 8,
+            conv_kernel_size: 5,
+            ..tiny_encoder_config()
+        };
+        let vars = VarMap::new();
+        ConformerEncoder::load(
+            &config,
+            VarBuilder::from_varmap(&vars, DType::F32, device),
+            None,
+        )
+        .unwrap();
+        let mut seed = 50;
+        let tensors = vars
+            .data()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, tensor)| {
+                seed += 1;
+                let positive = name.ends_with("running_var") || name.ends_with("norm.weight");
+                let scale = if positive { 0.1 } else { 0.3 };
+                let mut value = xorshift_tensor(tensor.dims(), seed, scale, device).unwrap();
+                if positive {
+                    value = (value.abs().unwrap() + 1.0).unwrap();
+                }
+                (name.clone(), value)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let encoder = ConformerEncoder::load(
+            &config,
+            VarBuilder::from_tensors(tensors, DType::F32, device),
+            None,
+        )
+        .unwrap();
+        (config, encoder)
+    }
+
+    /// Rows of 1 to 13 frames (inside one 4-frame block, at and across block
+    /// boundaries) encoded as one padded batch get each row's solo encoding,
+    /// up to the rounding of the batch's matmul shapes, and padded frames
+    /// leave as zeros.
+    #[test]
+    fn batched_rows_match_each_row_encoded_alone() {
+        let device = Device::Cpu;
+        let (config, encoder) = seeded_block_encoder(&device);
+        let lengths = [1usize, 3, 4, 5, 9, 13];
+        let frames = 13;
+        let rows = lengths
+            .iter()
+            .enumerate()
+            .map(|(row, &length)| {
+                xorshift_tensor(
+                    &[1, length, config.input_dim],
+                    90 + row as u64,
+                    1.0,
+                    &device,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let padded = |fill: f64| {
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    let pad = frames - row.dim(1).unwrap();
+                    let tail = (Tensor::ones((1, pad, config.input_dim), DType::F32, &device)
+                        .unwrap()
+                        * fill)
+                        .unwrap();
+                    Tensor::cat(&[row, &tail], 1).unwrap()
+                })
+                .collect::<Vec<_>>();
+            Tensor::cat(&rows, 0).unwrap()
+        };
+        let batched = encoder
+            .forward_valid_lengths(&padded(0.0), &lengths)
+            .unwrap();
+        assert_eq!(batched.dims(), &[lengths.len(), frames, config.hidden_dim]);
+        for (row, (&length, input)) in lengths.iter().zip(&rows).enumerate() {
+            let alone = encoder.forward(input).unwrap();
+            let together = batched.narrow(0, row, 1).unwrap();
+            assert_close(&together.narrow(1, 0, length).unwrap(), &alone, 1e-4);
+            let padding = together
+                .narrow(1, length, frames - length)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert!(padding.iter().all(|value| *value == 0.0), "row {row}");
+        }
+        // Whatever the padded frames hold, the valid frames are the same.
+        let poisoned = encoder
+            .forward_valid_lengths(&padded(1e3), &lengths)
+            .unwrap();
+        assert_eq!(
+            poisoned.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            batched.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        assert!(encoder
+            .forward_valid_lengths(&padded(0.0), &[1, 3, 4, 5, 9, 14])
+            .is_err());
+    }
+
+    /// A batch padded to an encoder graph's shape (spare zero rows of full
+    /// length, frames to whole attention blocks) encodes its real rows as
+    /// the unpadded batch does.
+    #[test]
+    fn graph_padded_batches_encode_their_real_rows_unchanged() {
+        let device = Device::Cpu;
+        let (config, encoder) = seeded_block_encoder(&device);
+        let lengths = [3usize, 5, 9];
+        let frames = 9;
+        let rows = lengths
+            .iter()
+            .enumerate()
+            .map(|(row, &length)| {
+                xorshift_tensor(
+                    &[1, length, config.input_dim],
+                    70 + row as u64,
+                    1.0,
+                    &device,
+                )
+                .unwrap()
+                .pad_with_zeros(1, 0, frames - length)
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input = Tensor::cat(&rows, 0).unwrap();
+        let eager = encoder.forward_valid_lengths(&input, &lengths).unwrap();
+        let (batch_rows, padded) = encoder_graph_shape(&config, 3, frames).unwrap();
+        assert_eq!(batch_rows, 3);
+        assert_eq!(padded % config.context_size, 0);
+        // Two spare rows, as a five-row step would pad to six.
+        let graphed = encoder
+            .forward_valid_lengths(
+                &input
+                    .pad_with_zeros(1, 0, padded - frames)
+                    .unwrap()
+                    .pad_with_zeros(0, 0, 3)
+                    .unwrap(),
+                &[3, 5, 9, padded, padded, padded],
+            )
+            .unwrap();
+        for (row, &length) in lengths.iter().enumerate() {
+            assert_close(
+                &graphed
+                    .narrow(0, row, 1)
+                    .unwrap()
+                    .narrow(1, 0, length)
+                    .unwrap(),
+                &eager
+                    .narrow(0, row, 1)
+                    .unwrap()
+                    .narrow(1, 0, length)
+                    .unwrap(),
+                1e-5,
+            );
+        }
+        let spare = graphed.narrow(0, 3, 3).unwrap();
+        assert!(spare
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|value| value.is_finite()));
+    }
+
+    /// The 2B encoder's shapes: rows to a graph width, frames to whole
+    /// blocks, within the pool budget; admission and the loader see the
+    /// graphs on CUDA only, and the kill switch turns both off.
+    #[test]
+    fn encoder_graph_shapes_and_pricing_follow_the_switch_on_cuda_only() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let config = GraniteSpeech5EncoderConfig {
+            cat_hidden_layers: vec![],
+            context_size: 200,
+            conv_expansion_factor: 2,
+            conv_kernel_size: 15,
+            dim_head: 128,
+            dropout: 0.0,
+            feedforward_mult: 4,
+            hidden_dim: 1024,
+            input_dim: 160,
+            max_pos_emb: 512,
+            model_type: None,
+            num_heads: 8,
+            num_layers: 16,
+            output_dim: 348,
+        };
+        assert_eq!(encoder_graph_shape(&config, 1, 500), Some((1, 600)));
+        assert_eq!(encoder_graph_shape(&config, 5, 300), Some((6, 400)));
+        assert_eq!(encoder_graph_shape(&config, 9, 100), None);
+        for rows in ENCODER_GRAPH_ROWS {
+            for blocks in 1..=16 {
+                if let Some(shape) = encoder_graph_shape(&config, rows, blocks * 200) {
+                    assert_eq!(shape, (rows, blocks * 200));
+                    assert!(
+                        encoder_batch_bytes(&config, rows, blocks * 200).unwrap()
+                            <= ENCODER_GRAPH_LIMITS.pool_bytes
+                    );
+                }
+            }
+        }
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            assert_eq!(granite_speech5_encoder_graph_device_bytes(backend), 0);
+            assert_eq!(encoder_batch_shape(&config, 5, 300, backend), (5, 300));
+        }
+        assert!(resolve_encoder_graphs(&Device::Cpu).is_err());
+        if encoder_graphs_requested() {
+            assert_eq!(
+                granite_speech5_encoder_graph_device_bytes(BackendKind::Cuda),
+                768 << 20
+            );
+            assert_eq!(
+                encoder_batch_shape(&config, 5, 300, BackendKind::Cuda),
+                (6, 400)
+            );
+        }
+        let previous = std::env::var_os(GRANITE_SPEECH5_ENCODER_GRAPHS_ENV);
+        std::env::set_var(GRANITE_SPEECH5_ENCODER_GRAPHS_ENV, "0");
+        let bytes = granite_speech5_encoder_graph_device_bytes(BackendKind::Cuda);
+        let shape = encoder_batch_shape(&config, 5, 300, BackendKind::Cuda);
+        let reason = resolve_encoder_graphs(&Device::Cpu).err();
+        std::env::remove_var(GRANITE_SPEECH5_ENCODER_GRAPHS_ENV);
+        if let Some(previous) = previous {
+            std::env::set_var(GRANITE_SPEECH5_ENCODER_GRAPHS_ENV, previous);
+        }
+        assert_eq!((bytes, shape), (0, (5, 300)));
+        assert!(reason
+            .expect("off")
+            .contains(GRANITE_SPEECH5_ENCODER_GRAPHS_ENV));
+    }
+
+    /// On CUDA the encoder graphs return the eager masked encoder bit for
+    /// bit through capture, verification and replay, over fresh inputs.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_encoder_graphs_match_the_eager_masked_encoder() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let (config, mut encoder) = seeded_block_encoder(&device);
+        encoder.graphs = ShapeGraphs::resolve("test", &device, ENCODER_GRAPH_LIMITS);
+        let (rows, frames) = encoder_graph_shape(&config, 2, 5).unwrap();
+        let lengths = [3usize, frames];
+        let bits = |t: &Tensor| {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        for step in 0..4u64 {
+            let input =
+                xorshift_tensor(&[rows, frames, config.input_dim], 200 + step, 1.0, &device)
+                    .unwrap();
+            let mask = frame_valid_mask(&lengths, frames, &device, DType::F32).unwrap();
+            let key_lengths = Tensor::new(&[3u32, frames as u32], &device).unwrap();
+            let key_mask = valid_key_mask(
+                &lengths,
+                frames.div_ceil(config.context_size),
+                config.context_size,
+                &device,
+                DType::F32,
+            )
+            .unwrap();
+            let expected = encoder
+                .forward_masked(&input, &mask, &key_mask, &key_lengths)
+                .unwrap();
+            let out = encoder.forward_valid_lengths(&input, &lengths).unwrap();
+            assert_eq!(bits(&out), bits(&expected), "step {step}");
+        }
+        let diagnostics = encoder.graphs_diagnostics();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        assert_eq!(diagnostics["captures"], 1, "{diagnostics}");
+        assert_eq!(diagnostics["replays"], 2, "{diagnostics}");
+    }
+
+    #[test]
+    fn valid_key_mask_masks_each_rows_padded_keys() {
+        let mask = valid_key_mask(&[3, 1], 2, 2, &Device::Cpu, DType::F32).unwrap();
+        assert_eq!(mask.dims(), &[2, 2, 1, 1, 2]);
+        assert_eq!(
+            mask.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![0.0, 0.0, 0.0, -1e4, 0.0, -1e4, -1e4, -1e4]
+        );
+        let frames = frame_valid_mask(&[2, 1], 3, &Device::Cpu, DType::F32).unwrap();
+        assert_eq!(frames.dims(), &[2, 3, 1]);
+        assert_eq!(
+            frames.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![1.0, 1.0, 0.0, 1.0, 0.0, 0.0]
+        );
     }
 
     fn tiny_encoder_config() -> GraniteSpeech5EncoderConfig {

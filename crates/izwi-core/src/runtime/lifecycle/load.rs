@@ -297,6 +297,35 @@ fn asr_minimum_tokens(variant: ModelVariant) -> u64 {
     super::asr_envelope::minimum_sequence_tokens(variant).unwrap_or(0)
 }
 
+/// Tokens of a retained ASR pool that every sequence claims its pages from:
+/// one `sequence_tokens` sequence per retained row, and never less than one
+/// sequence of the model's whole `context_tokens`, which still bounds each
+/// sequence on its own.
+fn asr_shared_pool_tokens(context_tokens: usize, sequence_tokens: u64, rows: usize) -> usize {
+    usize::try_from(sequence_tokens)
+        .unwrap_or(usize::MAX)
+        .min(context_tokens)
+        .saturating_mul(rows.max(1))
+        .max(context_tokens)
+}
+
+/// Refuses a Granite Speech 5.0 retained pool whose `reach` is short of one
+/// longest retained sequence (`sequence_tokens`): preparation sends a
+/// request to the retained route whenever its prompt and budget fit that
+/// sequence, and a claim the pool can never hold would wait on KV
+/// admission forever.
+fn granite_speech5_retained_reach_holds_a_sequence(
+    reach: u64,
+    sequence_tokens: usize,
+) -> Result<()> {
+    if reach < sequence_tokens as u64 {
+        return Err(Error::ModelLoadError(format!(
+            "Granite Speech 5.0 retained decoder pages reach {reach} tokens, short of one {sequence_tokens}-token retained sequence; free memory, raise the context, or set IZWI_GRANITE_SPEECH5_RETAINED_DECODE=false"
+        )));
+    }
+    Ok(())
+}
+
 /// The retained-state floor of a TTS variant, in tokens per sequence: one
 /// prompt plus the family's largest automatic output budget (per CFG domain
 /// for VibeVoice). `0` (the page minimum) for every other variant.
@@ -1061,6 +1090,22 @@ impl ModelLifecycleController {
                     )));
                 };
                 bundle_draft.seal_granite_speech_asr_preparation(model)?;
+            } else if variant.family() == crate::catalog::ModelFamily::GraniteSpeech5Asr {
+                let loaded = self
+                    .model_registry
+                    .get_loading_asr(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "instantiated Granite Speech 5.0 ASR model {variant} is missing before adapter sealing"
+                        ))
+                    })?;
+                let NativeAsrModel::GraniteSpeech5(model) = loaded.as_ref() else {
+                    return Err(Error::ModelLoadError(format!(
+                        "instantiated model {variant} does not expose Granite Speech 5.0 ASR geometry"
+                    )));
+                };
+                bundle_draft.seal_granite_speech5_asr_preparation(model)?;
             } else if variant.family() == crate::catalog::ModelFamily::Lfm25Audio {
                 let model = self
                     .model_registry

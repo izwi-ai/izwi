@@ -534,7 +534,11 @@ impl NativeExecutor {
         if family == ModelFamily::VibeVoiceAsr && request.uses_asr_retained_sequence() {
             return self.vibevoice_asr_sequence_request(request, scheduled, managed_state.take());
         }
-        if family == ModelFamily::GraniteSpeechAsr && request.uses_asr_retained_sequence() {
+        if matches!(
+            family,
+            ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr
+        ) && request.uses_asr_retained_sequence()
+        {
             return self.granite_speech_asr_sequence_request(
                 request,
                 scheduled,

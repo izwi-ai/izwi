@@ -22,6 +22,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=src/kernels/cuda/depthwise_conv.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/penalized_topk.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/counter_noise.cu");
+    println!("cargo:rerun-if-changed=src/kernels/cuda/relpos_attention.cu");
+    println!("cargo:rerun-if-changed=src/kernels/cuda/transducer_greedy.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return Ok(());
@@ -56,6 +58,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "src/kernels/cuda/depthwise_conv.cu",
             "src/kernels/cuda/penalized_topk.cu",
             "src/kernels/cuda/counter_noise.cu",
+            "src/kernels/cuda/relpos_attention.cu",
+            "src/kernels/cuda/transducer_greedy.cu",
         ])
         .arg("-std=c++17")
         .arg("-O3")

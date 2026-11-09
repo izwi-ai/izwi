@@ -245,6 +245,7 @@ impl VoxtralTokenizer {
     /// of the tokens before it, without decoding them again. `held` keeps the
     /// bytes of a character still arriving.
     pub(crate) fn decode_text_increment(&self, held: &mut Vec<u8>, token: u32) -> Result<String> {
+        let _detok = crate::engine::metrics::asr_detok_scope();
         held.extend_from_slice(&self.bytes.text_bytes(&[token])?);
         let (text, decoded) = utf8_complete_prefix_lossy(held);
         held.drain(..decoded);

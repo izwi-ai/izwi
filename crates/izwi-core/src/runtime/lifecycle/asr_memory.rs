@@ -76,11 +76,13 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::granite_speech::asr::{
     ensure_granite_speech_artifacts, granite_load_representation,
+    granite_speech_encoder_graph_device_bytes,
     granite_tensor_is_f16_encoder_projection, resolve_granite_encoder_projection_precision,
     select_granite_speech_dtype, GraniteLoadRepresentation, GraniteSpeechConfig,
 };
 use crate::models::architectures::granite_speech5::asr::{
-    ensure_granite_speech5_artifacts, granite_speech5_load_representation,
+    ensure_granite_speech5_artifacts, granite_speech5_encoder_graph_device_bytes,
+    granite_speech5_load_representation,
     granite_speech5_mmproj_safetensors_name, granite_speech5_tensor_is_f16_encoder_projection,
     resolve_granite_speech5_encoder_precision, select_granite_speech5_dtype, GraniteSpeech5Config,
     GraniteSpeech5LoadRepresentation, GraniteSpeech5Weights,
@@ -88,7 +90,8 @@ use crate::models::architectures::granite_speech5::asr::{
 use crate::models::architectures::lfm25_audio::conformer::lfm25_audio_conformer_projection;
 use crate::models::architectures::lfm25_audio::lfm25_audio_load_layout;
 use crate::models::architectures::nemotron::asr::{
-    nemotron_checkpoint_paths, nemotron_tensor_is_f16_projection, resolve_nemotron_asr_dtype,
+    nemotron_checkpoint_paths, nemotron_encoder_graph_device_bytes,
+    nemotron_tensor_is_f16_projection, resolve_nemotron_asr_dtype,
     resolve_nemotron_projection_precision, NEMOTRON_MODEL_MEMO_MAX_BYTES,
 };
 use crate::models::architectures::parakeet::asr::{
@@ -104,6 +107,9 @@ use crate::models::architectures::qwen3::core::{
     qwen3_dense_projection_fusion_enabled, qwen3_mlx_q4_1_enabled,
     qwen3_quantized_projection_grouping_for_hidden_size,
 };
+use crate::models::architectures::qwen3::decode_graph::{
+    qwen3_decode_graph_device_bytes, QWEN3_ASR_DECODE_GRAPHS_ENV, VIBEVOICE_ASR_DECODE_GRAPHS_ENV,
+};
 use crate::models::architectures::sortformer::diarization::{
     sortformer_checkpoint_paths, sortformer_extraction_is_current,
     sortformer_uses_selected_model_device,
@@ -113,10 +119,12 @@ use crate::models::architectures::vibevoice::asr::{
     vibevoice_asr_weight_dtype, vibevoice_tensor_is_f16_tokenizer_projection,
     vibevoice_tensor_is_language_model,
 };
+use crate::models::architectures::voxtral::decode_graph::voxtral_decode_graph_device_bytes;
 use crate::models::architectures::voxtral::realtime::model::{
     voxtral_realtime_weight_dtype, voxtral_realtime_weight_files,
 };
 use crate::models::architectures::whisper::asr::{whisper_weight_dtype, whisper_weight_files};
+use crate::models::architectures::whisper::whisper_decode_graph_device_bytes;
 use crate::models::shared::weights::gguf::safetensors_weight_files;
 use crate::models::shared::weights::staged::METAL_LOAD_SYNC_INTERVAL_BYTES;
 
@@ -223,36 +231,70 @@ pub(super) fn residency_plan(
 ) -> Result<Option<AsrResidencyPlan>> {
     let backend = BackendKind::from(device.kind);
     match variant {
-        ModelVariant::WhisperLargeV3Turbo => whisper_plan(model_path, device, backend),
+        ModelVariant::WhisperLargeV3Turbo => {
+            // The decoder's CUDA step graphs allocate their memory on first use.
+            let graphs = whisper_decode_graph_device_bytes(backend);
+            whisper_plan(model_path, device, backend)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
+        }
         ModelVariant::Qwen3Asr06BGguf | ModelVariant::Qwen3Asr17BGguf => {
+            // The text decoder's CUDA graphs allocate their memory on first use.
+            let graphs = qwen3_decode_graph_device_bytes(backend, QWEN3_ASR_DECODE_GRAPHS_ENV);
             qwen3_asr_plan(variant, model_path, device, backend, Precision::Selected)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
         ModelVariant::ParakeetTdt06BV3 => {
-            // The encoder's CUDA graphs allocate their memory on first use.
-            let graphs = parakeet_encoder_graph_device_bytes(backend);
+            // The encoder's and the decode dispatch's CUDA graphs allocate
+            // their memory on first use.
+            let graphs = parakeet_encoder_graph_device_bytes(backend)
+                + crate::kernels::transducer_greedy::transducer_graph_device_bytes(backend);
             parakeet_plan(variant, model_path, device, backend, Precision::Selected)
                 .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
         ModelVariant::Nemotron35AsrStreaming06B => {
+            // The offline encoder's and the decode dispatch's CUDA graphs
+            // allocate their memory on first use.
+            let graphs = nemotron_encoder_graph_device_bytes(backend)
+                + crate::kernels::transducer_greedy::transducer_graph_device_bytes(backend);
             nemotron_plan(variant, model_path, device, backend, Precision::Selected)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
         // Plus and base share the loader; the census carries their differences
         // (base: no layer-3 concatenation in the projector, an untied LM head).
-        _ if variant.family() == ModelFamily::GraniteSpeechAsr => granite_plan(
-            model_path,
-            device,
-            backend,
-            granite.speech_dtype.as_deref(),
-            Precision::Selected,
-        ),
-        _ if variant.family() == ModelFamily::GraniteSpeech5Asr => {
-            granite_speech5_plan(variant, model_path, device, backend, Precision::Selected)
+        _ if variant.family() == ModelFamily::GraniteSpeechAsr => {
+            // The encoder's CUDA graphs allocate their memory on first use.
+            let graphs = granite_speech_encoder_graph_device_bytes(backend);
+            granite_plan(
+                model_path,
+                device,
+                backend,
+                granite.speech_dtype.as_deref(),
+                Precision::Selected,
+            )
+            .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
-        ModelVariant::VibeVoiceAsr => vibevoice_plan(model_path, device, backend),
+        _ if variant.family() == ModelFamily::GraniteSpeech5Asr => {
+            // The encoder's CUDA graphs allocate their memory on first use.
+            let graphs = granite_speech5_encoder_graph_device_bytes(backend);
+            granite_speech5_plan(variant, model_path, device, backend, Precision::Selected)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
+        }
+        ModelVariant::VibeVoiceAsr => {
+            // The language model's CUDA graphs allocate their memory on first use.
+            let graphs = qwen3_decode_graph_device_bytes(backend, VIBEVOICE_ASR_DECODE_GRAPHS_ENV);
+            vibevoice_plan(model_path, device, backend)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
+        }
         _ if variant.family() == ModelFamily::NemotronTranscribeAsr => {
             nemotron_transcribe_plan(model_path, backend)
         }
-        ModelVariant::VoxtralMini4BRealtime2602 => voxtral_plan(model_path, device, backend),
+        ModelVariant::VoxtralMini4BRealtime2602 => {
+            // The language model's CUDA decode graphs allocate their memory
+            // on first use.
+            let graphs = voxtral_decode_graph_device_bytes(backend);
+            voxtral_plan(model_path, device, backend)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
+        }
         ModelVariant::Lfm25Audio15BGguf => lfm25_audio_plan(model_path, backend),
         // Priced here, but not an ASR variant: the aligner is stateless and
         // has no request floor or state fit.
@@ -4986,9 +5028,12 @@ pub(super) mod tests {
             let catalog = super::super::model_memory_estimate(ModelVariant::VibeVoiceAsr);
             assert!(retry < catalog.load_peak_bytes);
             if backend == BackendKind::Cuda {
+                // The weights, and the decode graphs' deferred memory.
+                let graphs =
+                    qwen3_decode_graph_device_bytes(backend, VIBEVOICE_ASR_DECODE_GRAPHS_ENV);
                 assert_eq!(
                     plan.resident_authorization.device_bytes,
-                    ResourceAmount::Known(bf16)
+                    ResourceAmount::Known(bf16 + graphs)
                 );
                 assert_eq!(
                     plan.load_authorization.host_bytes,

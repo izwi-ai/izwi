@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 
 use crate::kernels::FusedSiluMulResult;
 
+pub mod decode_step;
 #[cfg(feature = "cuda")]
 mod epilogues;
 pub mod fp8;
@@ -3687,6 +3688,18 @@ pub(crate) fn cuda_ptx_penalized_topk() -> &'static str {
 #[cfg(feature = "cuda")]
 pub(crate) fn cuda_ptx_counter_noise() -> &'static str {
     cuda_ptx::COUNTER_NOISE
+}
+
+/// The PTX of `kernels/cuda/relpos_attention.cu` (`kernels::relpos_attention`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_relpos_attention() -> &'static str {
+    cuda_ptx::RELPOS_ATTENTION
+}
+
+/// The PTX of `kernels/cuda/transducer_greedy.cu` (`kernels::transducer_greedy`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_transducer_greedy() -> &'static str {
+    cuda_ptx::TRANSDUCER_GREEDY
 }
 
 #[cfg(test)]

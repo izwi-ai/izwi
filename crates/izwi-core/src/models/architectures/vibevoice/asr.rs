@@ -553,6 +553,12 @@ const VIBEVOICE_TOKENIZER_PROBE_SAMPLES: usize = 4 * 3200;
 const VIBEVOICE_LM_PROBE_TOKENS: usize = 16;
 
 impl VibeVoiceAsrModel {
+    /// The language model's CUDA decode graphs: captures, replays and why
+    /// they are off.
+    pub(crate) fn decode_graph_diagnostics(&self) -> serde_json::Value {
+        self.language_model.decode_graph_diagnostics()
+    }
+
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         if variant != ModelVariant::VibeVoiceAsr {
             return Err(Error::InvalidInput(format!(
@@ -625,7 +631,7 @@ impl VibeVoiceAsrModel {
             config.decoder_config.hidden_size,
             vb.pp("model.semantic_connector"),
         )?;
-        let (language_model, lm_precision) = load_with_precision_fallback(
+        let (mut language_model, lm_precision) = load_with_precision_fallback(
             "VibeVoice-ASR LM",
             &lm_selection,
             device.kind.is_metal(),
@@ -651,6 +657,10 @@ impl VibeVoiceAsrModel {
             },
         )?;
         drop(vb);
+        language_model.enable_asr_decode_graph(
+            "VibeVoice-ASR",
+            crate::models::architectures::qwen3::decode_graph::VIBEVOICE_ASR_DECODE_GRAPHS_ENV,
+        );
         let lm_dtype = lm_precision.loaded;
         let model_identity = vibevoice_asr_model_identity(
             model_dir,
@@ -1006,6 +1016,20 @@ impl VibeVoiceAsrModel {
         language: Option<&str>,
         prompt: Option<&str>,
     ) -> Result<VibeVoiceAsrPreparedArtifact> {
+        let host = self.prepare_retained_host_audio(audio, sample_rate, language, prompt)?;
+        self.prepare_retained_artifact_from_host_audio(host, language, prompt)
+    }
+
+    /// One request's encoder audio on a host worker: resampled to the
+    /// tokenizer's rate, loudness-normalized and padded to whole acoustic
+    /// frames, with the geometry and source identity it must keep.
+    pub(crate) fn prepare_retained_host_audio(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<VibeVoiceAsrHostAudio> {
         let expected_geometry =
             match self.retained_preparation_decision(audio.len(), sample_rate, language, prompt)? {
                 VibeVoiceAsrPreparationDecision::Retained(geometry) => geometry,
@@ -1026,13 +1050,43 @@ impl VibeVoiceAsrModel {
         let encoder_samples = acoustic_frames.checked_mul(ratio).ok_or_else(|| {
             Error::Overloaded("VibeVoice ASR padded encoder length overflow".into())
         })?;
-        let mut encoder_audio = processed_audio.clone();
+        let processed_samples = processed_audio.len();
+        let mut encoder_audio = processed_audio;
         encoder_audio.resize(encoder_samples, 0.0);
+        Ok(VibeVoiceAsrHostAudio {
+            expected_geometry,
+            encoder_audio,
+            processed_samples,
+            acoustic_frames,
+            input_samples: audio.len(),
+            input_sample_rate: sample_rate,
+            source_identity: vibevoice_asr_source_identity(audio, sample_rate),
+        })
+    }
+
+    /// Builds one request's retained artifact from its host audio: the
+    /// upload, the prompt embeddings and any sampling noise.
+    pub(crate) fn prepare_retained_artifact_from_host_audio(
+        &self,
+        host: VibeVoiceAsrHostAudio,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<VibeVoiceAsrPreparedArtifact> {
+        let VibeVoiceAsrHostAudio {
+            expected_geometry,
+            encoder_audio,
+            processed_samples,
+            acoustic_frames,
+            input_samples,
+            input_sample_rate,
+            source_identity,
+        } = host;
+        let encoder_samples = encoder_audio.len();
         let encoder_audio =
             Tensor::from_vec(encoder_audio, (1, 1, encoder_samples), &self.device.device)?
                 .to_dtype(self.dtype)?;
         let audio_seconds =
-            processed_audio.len() as f64 / f64::from(self.preprocessor.target_sample_rate());
+            processed_samples as f64 / f64::from(self.preprocessor.target_sample_rate());
         let extra = prompt_instruction(language, prompt);
         let prepared_prompt =
             self.tokenizer
@@ -1087,9 +1141,9 @@ impl VibeVoiceAsrModel {
             .and_then(|tokens| tokens.checked_mul(u64::try_from(size_of::<u32>()).ok()?))
             .ok_or_else(|| Error::Overloaded("VibeVoice ASR prompt bytes overflow".into()))?;
         let geometry = VibeVoiceAsrPreparedGeometry {
-            input_samples: audio.len(),
-            input_sample_rate: sample_rate,
-            processed_samples: processed_audio.len(),
+            input_samples,
+            input_sample_rate,
+            processed_samples,
             encoder_samples,
             acoustic_frames,
             prompt_tokens: prepared_prompt.input_ids.len(),
@@ -1109,7 +1163,7 @@ impl VibeVoiceAsrModel {
         )?]);
         Ok(VibeVoiceAsrPreparedArtifact {
             model_identity: self.model_identity,
-            source_identity: vibevoice_asr_source_identity(audio, sample_rate),
+            source_identity,
             prompt_identity: vibevoice_asr_prompt_identity(language, prompt),
             prompt_ids: prepared_prompt.input_ids.into(),
             acoustic_input_range: prepared_prompt.acoustic_input_range,
@@ -2198,6 +2252,25 @@ impl VibeVoiceAsrModel {
 }
 
 impl VibeVoiceAsrDecodeState {
+    /// The diagnostics of a row that ends on the retained route.
+    pub(crate) fn retained_terminal_diagnostics(&self) -> serde_json::Value {
+        let geometry = self.prepared.as_ref().map(|artifact| artifact.geometry);
+        serde_json::json!({
+            "model_family": "vibevoice_asr",
+            "audio": {
+                "input_samples": geometry.map(|geometry| geometry.input_samples),
+                "input_sample_rate": geometry.map(|geometry| geometry.input_sample_rate),
+                "processed_samples": geometry.map(|geometry| geometry.processed_samples),
+                "acoustic_frames": geometry.map(|geometry| geometry.acoustic_frames),
+            },
+            "prompt": { "prompt_tokens": self.prompt_tokens },
+            "decode": {
+                "max_new_tokens": self.max_new_tokens,
+                "generated_tokens": self.generated.len(),
+            },
+        })
+    }
+
     pub(crate) fn prepared_artifact(&self) -> Option<Arc<VibeVoiceAsrPreparedArtifact>> {
         self.prepared.clone()
     }
@@ -2485,7 +2558,8 @@ fn forward_vibevoice_pending_decode_batch(
         })
         .collect::<Result<Vec<_>>>()?;
     let input = Tensor::from_vec(pending, (states.len(), 1), device)?;
-    let output = if states.len() == 1 {
+    // With the decode graphs on, a lone row decodes through the width-1 graph.
+    let output = if states.len() == 1 && !model.decode_graph_on() {
         model.forward_managed(&input, positions[0], &mut states[0].cache)?
     } else {
         let mut caches = states
@@ -3278,6 +3352,28 @@ fn cleanup_transcript_text(raw: &str) -> String {
 
 fn elapsed_ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
+}
+
+/// One request's encoder audio, computed on a host worker.
+pub(crate) struct VibeVoiceAsrHostAudio {
+    expected_geometry: VibeVoiceAsrPreparedGeometry,
+    encoder_audio: Vec<f32>,
+    processed_samples: usize,
+    acoustic_frames: usize,
+    input_samples: usize,
+    input_sample_rate: u32,
+    source_identity: [u8; 32],
+}
+
+impl VibeVoiceAsrHostAudio {
+    /// Host bytes the encoder audio holds until the upload drops it.
+    pub(crate) fn host_bytes(&self) -> Result<u64> {
+        self.encoder_audio
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| Error::Overloaded("VibeVoice ASR host audio bytes overflow".into()))
+    }
 }
 
 fn preprocess_asr_audio(
@@ -4594,6 +4690,33 @@ mod tests {
             padded.i(1).unwrap().to_vec2::<f32>().unwrap(),
             vec![vec![3.0, 4.0], vec![5.0, 6.0], vec![7.0, 8.0]]
         );
+    }
+
+    /// Host encoder audio is priced as the padded samples it holds until the
+    /// upload, which preparation keeps beside the request.
+    #[test]
+    fn host_audio_prices_its_padded_encoder_samples() {
+        let host = VibeVoiceAsrHostAudio {
+            expected_geometry: VibeVoiceAsrPreparedGeometry {
+                input_samples: 16_000,
+                input_sample_rate: 16_000,
+                processed_samples: 24_000,
+                encoder_samples: 25_600,
+                acoustic_frames: 8,
+                prompt_tokens: 20,
+                embedding_elements: 0,
+                preparation_workspace_bytes: 0,
+                retained_device_bytes: 0,
+                retained_host_bytes: 0,
+            },
+            encoder_audio: vec![0.0; 25_600],
+            processed_samples: 24_000,
+            acoustic_frames: 8,
+            input_samples: 16_000,
+            input_sample_rate: 16_000,
+            source_identity: vibevoice_asr_source_identity(&[0.0; 4], 16_000),
+        };
+        assert_eq!(host.host_bytes().unwrap(), 25_600 * 4);
     }
 }
 

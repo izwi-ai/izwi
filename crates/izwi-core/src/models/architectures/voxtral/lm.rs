@@ -16,11 +16,13 @@ use crate::backends::kv::{
     PagedKvDecodeArgs,
 };
 use crate::error::{Error, Result};
+use crate::kernels::cuda::decode_step::{self, DecodeStepLayout, DecodeStepRow};
+use crate::kernels::cuda::split_decode;
 use crate::kv::v2::{
     InferenceStateContract, PositionSemantics, PrefixPolicy, StateClock, StateDomainId,
     StateDomainSpec, StateGroupId, StateGroupSpec, CURRENT_INFERENCE_STATE_ABI,
 };
-use crate::kv::KvDecodeBatchMetadata;
+use crate::kv::{KvDecodeBatchMetadata, KvSlotRef};
 use crate::models::architectures::qwen3::core::{
     build_mrope_cache, build_rope_cache, build_rope_inv_freqs, qwen3_decoder_cache_domain,
     Qwen3Config, Qwen3DecoderCacheGeometry,
@@ -28,6 +30,7 @@ use crate::models::architectures::qwen3::core::{
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::telemetry::{record_decode_attention_path, DecodeAttentionPath};
 
+use super::decode_graph::{GraphKey, VoxtralDecodeGraph};
 use super::layers::{exact_gelu, linear_forward_last_dim};
 
 const EMBEDDING_WEIGHT_CANDIDATES: &[&str] = &[
@@ -61,6 +64,9 @@ pub struct VoxtralLM {
     prefix_reuse: bool,
     /// Model-lifetime RoPE cos/sin over positions, sliced per step.
     rope_positions: LmRopePositionTable,
+    /// The decode steps' CUDA graphs ([`super::decode_graph`]), or why there
+    /// are none.
+    decode_graph: std::result::Result<VoxtralDecodeGraph, String>,
 }
 
 struct VoxtralLayer {
@@ -72,9 +78,7 @@ struct VoxtralLayer {
 }
 
 struct VoxtralAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
+    qkv: VoxtralQkv,
     o_proj: Linear,
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
@@ -85,6 +89,77 @@ struct VoxtralAttention {
     mrope_section: Option<Vec<usize>>,
     rope_theta: f64,
     sliding_window: Option<usize>,
+}
+
+/// What a decode graph's attention layers read: the arena's `(keys, values)`
+/// per layer, the step's RoPE rows, and the step buffer's slots and
+/// split-decode metadata.
+struct VoxtralGraphAttention<'a> {
+    caches: &'a [(Tensor, Tensor)],
+    cos: Tensor,
+    sin: Tensor,
+    slots: Tensor,
+    metadata: Tensor,
+    page_tokens: usize,
+    max_blocks: usize,
+    max_partitions: usize,
+}
+
+/// The attention's q, k and v projections: three GEMMs, or on CUDA one GEMM
+/// over the weights stacked at load ([`VOXTRAL_FUSED_QKV_ENV`]).
+enum VoxtralQkv {
+    Separate {
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
+    },
+    Fused {
+        qkv_proj: Linear,
+        query_width: usize,
+        key_width: usize,
+        value_width: usize,
+    },
+}
+
+/// Kill switch for the language model's fused q/k/v projection on CUDA (a
+/// boolean; on when unset). Read once, at load. Off CUDA the projections
+/// always run apart.
+pub(crate) const VOXTRAL_FUSED_QKV_ENV: &str = "IZWI_VOXTRAL_FUSED_QKV";
+
+fn fused_qkv_requested(device: &Device) -> bool {
+    device.is_cuda() && crate::env::flag_or(VOXTRAL_FUSED_QKV_ENV, true)
+}
+
+impl VoxtralQkv {
+    /// `x`'s q, k and v, each `[.., width]`.
+    fn project(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        match self {
+            Self::Separate {
+                q_proj,
+                k_proj,
+                v_proj,
+            } => Ok((
+                linear_forward_last_dim(q_proj, x)?,
+                linear_forward_last_dim(k_proj, x)?,
+                linear_forward_last_dim(v_proj, x)?,
+            )),
+            Self::Fused {
+                qkv_proj,
+                query_width,
+                key_width,
+                value_width,
+            } => {
+                let qkv = linear_forward_last_dim(qkv_proj, x)?;
+                let last = qkv.rank() - 1;
+                Ok((
+                    qkv.narrow(last, 0, *query_width)?.contiguous()?,
+                    qkv.narrow(last, *query_width, *key_width)?.contiguous()?,
+                    qkv.narrow(last, query_width + key_width, *value_width)?
+                        .contiguous()?,
+                ))
+            }
+        }
+    }
 }
 
 struct VoxtralMlp {
@@ -131,7 +206,29 @@ impl VoxtralLM {
             use_mrope,
             prefix_reuse,
             rope_positions: LmRopePositionTable::default(),
+            decode_graph: if use_mrope {
+                Err("M-RoPE rotates each row on its own".into())
+            } else {
+                VoxtralDecodeGraph::resolve(vb.device())
+            },
         })
+    }
+
+    /// Whether decode steps go through the CUDA decode graphs: a lone row
+    /// then decodes as a batch of one, through its width-1 graph.
+    pub(crate) fn decode_graph_on(&self) -> bool {
+        self.decode_graph
+            .as_ref()
+            .is_ok_and(VoxtralDecodeGraph::is_on)
+    }
+
+    /// The decode graphs: captures, replays, warm checks and why they are
+    /// off.
+    pub(crate) fn decode_graph_diagnostics(&self) -> serde_json::Value {
+        match &self.decode_graph {
+            Ok(graph) => graph.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        }
     }
 
     pub fn device(&self) -> &Device {
@@ -340,7 +437,10 @@ impl VoxtralLM {
             )));
         }
         let padded_rows = padded_rows.filter(|&rows| rows >= batch_size);
-        if batch_size == 1 && padded_rows.is_none() {
+        // A lone row takes the batched route when it is padded (the same
+        // shapes as beside others) or, with the decode graphs on, for its
+        // logits through the width-1 graph.
+        if batch_size == 1 && padded_rows.is_none() && !(project_logits && self.decode_graph_on()) {
             return if project_logits {
                 self.forward_managed_with_embeds(embeds, start_positions[0], caches[0], None, ada)
             } else {
@@ -435,42 +535,43 @@ impl VoxtralLM {
             let mut completions =
                 KvWriteCompletionCollector::new(arena.config(), lowered.logical_slots())?;
             let layer_result = (|| -> Result<Tensor> {
-                let rope = LmRopeTables::with_positions(&self.rope_positions);
-                // Spare rows ride through every dense op; attention reads
-                // only the real rows.
-                let mut x = match padded_rows {
-                    Some(rows) if rows > batch_size => {
-                        embeds.pad_with_zeros(0, 0, rows - batch_size)?
-                    }
-                    _ => embeds.clone(),
-                };
-                for (layer_idx, layer) in self.layers.iter().enumerate() {
-                    let cache_refs = caches
-                        .iter()
-                        .map(|cache| &**cache)
-                        .collect::<Vec<&PhysicalPagedKvCache>>();
-                    x = layer.forward_managed_decode_batch(
-                        &x,
+                let cache_refs = caches
+                    .iter()
+                    .map(|cache| &**cache)
+                    .collect::<Vec<&PhysicalPagedKvCache>>();
+                // The decode graphs serve the unpadded logits route; a padded
+                // decode runs its fixed-shape layers below.
+                if let Some(graph) = self
+                    .decode_graph
+                    .as_ref()
+                    .ok()
+                    .filter(|graph| padded_rows.is_none() && project_logits && graph.is_on())
+                {
+                    if let Some(logits) = self.graph_step(
+                        graph,
+                        embeds,
                         start_positions,
-                        &cache_refs,
+                        &combined_slots,
                         lowered.as_ref(),
                         &metadata,
+                        &cache_refs,
                         &mut completions,
-                        layer_idx,
                         ada,
-                        &rope,
-                    )?;
+                    )? {
+                        return Ok(logits);
+                    }
                 }
-                let hidden = self.norm.forward(&x)?;
-                let output = if project_logits {
-                    self.logits_from_hidden(&hidden)?
-                } else {
-                    hidden
-                };
-                if output.dim(0)? > batch_size {
-                    return Ok(output.narrow(0, 0, batch_size)?);
-                }
-                Ok(output)
+                self.standard_decode_layers(
+                    embeds,
+                    start_positions,
+                    &cache_refs,
+                    lowered.as_ref(),
+                    &metadata,
+                    &mut completions,
+                    ada,
+                    project_logits,
+                    padded_rows,
+                )
             })();
             let logits = match layer_result {
                 Ok(logits) => logits,
@@ -566,6 +667,235 @@ impl VoxtralLM {
         }
         let hidden = self.norm.forward(&x)?;
         Ok((hidden, prepared))
+    }
+
+    /// The standard batched decode layers over `embeds`: the rows' last
+    /// hidden states or logits, their K/V writes collected in
+    /// `completions`.
+    #[allow(clippy::too_many_arguments)]
+    fn standard_decode_layers(
+        &self,
+        embeds: &Tensor,
+        start_positions: &[usize],
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        ada: Option<&VoxtralAdaScales>,
+        project_logits: bool,
+        padded_rows: Option<usize>,
+    ) -> Result<Tensor> {
+        let rope = LmRopeTables::with_positions(&self.rope_positions);
+        // Spare rows ride through every dense op; attention reads only the
+        // real rows.
+        let batch = embeds.dim(0)?;
+        let mut x = match padded_rows {
+            Some(rows) if rows > batch => embeds.pad_with_zeros(0, 0, rows - batch)?,
+            _ => embeds.clone(),
+        };
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_managed_decode_batch(
+                &x,
+                start_positions,
+                caches,
+                slots,
+                metadata,
+                completions,
+                layer_idx,
+                ada,
+                &rope,
+            )?;
+        }
+        let hidden = self.norm.forward(&x)?;
+        let output = if project_logits {
+            self.logits_from_hidden(&hidden)?
+        } else {
+            hidden
+        };
+        Ok(if output.dim(0)? > batch {
+            output.narrow(0, 0, batch)?
+        } else {
+            output
+        })
+    }
+
+    /// One decode step's logits through `graph`, its K/V write completions
+    /// collected in `completions`: `None` when the step does not fit one
+    /// (more rows than the widest, a KV arena or geometry the split decode
+    /// does not serve), so the standard decode runs it. A width's first
+    /// graphed step is checked against the standard decode; a mismatch
+    /// turns the graphs off and the step keeps the standard logits.
+    #[allow(clippy::too_many_arguments)]
+    fn graph_step(
+        &self,
+        graph: &VoxtralDecodeGraph,
+        embeds: &Tensor,
+        start_positions: &[usize],
+        slots: &[KvSlotRef],
+        slot_map: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        caches: &[&PhysicalPagedKvCache],
+        completions: &mut KvWriteCompletionCollector,
+        ada: Option<&VoxtralAdaScales>,
+    ) -> Result<Option<Tensor>> {
+        let rows = start_positions.len();
+        let (Some(width), Some(first_layer)) =
+            (decode_step::graph_width(rows), self.layers.first())
+        else {
+            return Ok(None);
+        };
+        let attention = &first_layer.self_attn;
+        let first = caches[0];
+        let arena = first.arena.clone();
+        let config = arena.config();
+        let dtype = embeds.dtype();
+        if config.dtype != dtype
+            || !split_decode::supported(
+                dtype,
+                attention.num_heads,
+                attention.num_kv_heads,
+                attention.head_dim,
+                attention.head_dim,
+            )
+        {
+            return Ok(None);
+        }
+        let positions = start_positions
+            .iter()
+            .map(|&pos| {
+                u32::try_from(pos)
+                    .map_err(|_| Error::InvalidInput("Voxtral RoPE position exceeds u32".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let needed = positions.iter().max().map_or(1, |&pos| pos as usize + 1);
+        let (cos, sin, rope_rows) = self.rope_positions.table_covering(
+            attention.head_dim,
+            attention.rope_theta,
+            needed,
+            dtype,
+            &self.device,
+        )?;
+        let page_tokens = config.page_tokens;
+        let step_rows = positions
+            .iter()
+            .zip(slots)
+            .zip(&metadata.sequences)
+            .map(|((position, slot), sequence)| {
+                DecodeStepRow::new(*position, slot, sequence, page_tokens)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let longest = step_rows
+            .iter()
+            .map(|row| row.blocks.len())
+            .max()
+            .unwrap_or(1);
+        let layout = DecodeStepLayout::for_blocks(width, longest);
+        let step = layout.upload(&step_rows, &self.device)?;
+        // Spare rows decode a zero embedding.
+        let embeds = if width > rows {
+            embeds.pad_with_zeros(0, 0, width - rows)?
+        } else {
+            embeds.clone()
+        };
+        let bindings = (0..self.layers.len())
+            .map(|layer| first.layer_binding(layer))
+            .collect::<Result<Vec<_>>>()?;
+        let page_tokens = page_tokens as usize;
+        let max_partitions = decode_step::max_partitions(
+            width,
+            attention.num_kv_heads,
+            layout.max_context(page_tokens),
+        );
+        // The graph keeps stable copies of its inputs and its logits.
+        let tensor_bytes = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+        let retained = tensor_bytes(&embeds)
+            + tensor_bytes(&step)
+            + (width * self.cfg.vocab_size * std::mem::size_of::<f32>()) as u64;
+        let inputs = [embeds, step];
+        let mut output = None;
+        let graph_completions = arena.with_graph_writes(
+            &bindings,
+            slot_map,
+            self.layers.len() as u64,
+            &mut |layers| {
+                let key = GraphKey {
+                    width,
+                    arena: arena.id(),
+                    generation: layers.generation,
+                    max_blocks: layout.max_blocks,
+                    rope_rows,
+                };
+                let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+                    let [embeds, step] = inputs else {
+                        return Err(Error::InferenceError(format!(
+                            "Voxtral decode graph received {} inputs, expected 2",
+                            inputs.len()
+                        )));
+                    };
+                    let positions = step.narrow(0, layout.positions(), width)?;
+                    let attention = VoxtralGraphAttention {
+                        caches: &layers.layers,
+                        cos: cos.index_select(&positions, 0)?,
+                        sin: sin.index_select(&positions, 0)?,
+                        slots: step.narrow(0, layout.slots(), width)?,
+                        metadata: step.narrow(0, layout.metadata(), layout.metadata_len())?,
+                        page_tokens,
+                        max_blocks: layout.max_blocks,
+                        max_partitions,
+                    };
+                    let mut x = embeds.clone();
+                    for (layer_idx, layer) in self.layers.iter().enumerate() {
+                        x = layer.forward_graph_decode(&x, &attention, layer_idx, ada)?;
+                    }
+                    let hidden = self.norm.forward(&x)?;
+                    Ok(vec![self.logits_from_hidden(&hidden)?])
+                };
+                output = graph.graphs.run(key, retained, &inputs, &body)?.pop();
+                Ok(())
+            },
+        )?;
+        for completion in graph_completions {
+            completions.collect(completion)?;
+        }
+        let logits = output
+            .ok_or_else(|| Error::InferenceError("Voxtral decode graph returned nothing".into()))?;
+        let logits = if width > rows {
+            logits.narrow(0, 0, rows)?
+        } else {
+            logits
+        };
+        graph.record_step(rows, width);
+        if !graph.needs_check(width) {
+            return Ok(Some(logits));
+        }
+        // The check: the standard decode of the same rows, its writes (the
+        // same K/V) collected and sealed apart.
+        let mut reference_completions =
+            KvWriteCompletionCollector::new(config, slot_map.logical_slots())?;
+        let reference = self.standard_decode_layers(
+            &inputs[0].narrow(0, 0, rows)?,
+            start_positions,
+            caches,
+            slot_map,
+            metadata,
+            &mut reference_completions,
+            ada,
+            true,
+            None,
+        );
+        let sealed = reference_completions.seal();
+        let reference = reference?;
+        sealed?;
+        match decode_step::logits_agree(&logits, &reference) {
+            Ok(_) => {
+                graph.mark_checked(width);
+                Ok(Some(logits))
+            }
+            Err(reason) => {
+                graph.disable(format!("a {rows}-row step (width {width}): {reason}"));
+                Ok(Some(reference))
+            }
+        }
     }
 
     pub fn logits_from_hidden(&self, hidden: &Tensor) -> Result<Tensor> {
@@ -715,6 +1045,27 @@ impl VoxtralLayer {
         })?;
         x.broadcast_add(&mlp_out).map_err(Error::from)
     }
+
+    /// [`Self::forward_managed_decode_batch`] as a decode graph runs it.
+    fn forward_graph_decode(
+        &self,
+        x: &Tensor,
+        attention: &VoxtralGraphAttention<'_>,
+        layer_idx: usize,
+        ada: Option<&VoxtralAdaScales>,
+    ) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out = self
+            .self_attn
+            .forward_graph_decode(&normed, attention, layer_idx)?;
+        let x = x.broadcast_add(&attn_out)?;
+        let mut normed = self.post_attention_layernorm.forward(&x)?;
+        if self.ada_rms_norm.is_some() {
+            normed = apply_ada_scale(&normed, ada, layer_idx)?;
+        }
+        let mlp_out = self.mlp.forward(&normed)?;
+        x.broadcast_add(&mlp_out).map_err(Error::from)
+    }
 }
 
 impl VoxtralAttention {
@@ -726,6 +1077,23 @@ impl VoxtralAttention {
         let k_proj = candle_nn::linear_no_bias(cfg.hidden_size, geometry.key_width(), vb.pp("wk"))?;
         let v_proj =
             candle_nn::linear_no_bias(cfg.hidden_size, geometry.value_width(), vb.pp("wv"))?;
+        // One GEMM over the stacked weights on CUDA; the three loaded
+        // weights are dropped once stacked.
+        let qkv = if fused_qkv_requested(vb.device()) {
+            let stacked = Tensor::cat(&[q_proj.weight(), k_proj.weight(), v_proj.weight()], 0)?;
+            VoxtralQkv::Fused {
+                qkv_proj: Linear::new(stacked, None),
+                query_width: geometry.query_width(),
+                key_width: geometry.key_width(),
+                value_width: geometry.value_width(),
+            }
+        } else {
+            VoxtralQkv::Separate {
+                q_proj,
+                k_proj,
+                v_proj,
+            }
+        };
         let o_proj =
             candle_nn::linear_no_bias(geometry.query_width(), cfg.hidden_size, vb.pp("wo"))?;
 
@@ -742,9 +1110,7 @@ impl VoxtralAttention {
             .unwrap_or((false, None));
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv,
             o_proj,
             q_norm,
             k_norm,
@@ -776,24 +1142,10 @@ impl VoxtralAttention {
             ));
         }
 
-        let mut q = linear_forward_last_dim(&self.q_proj, x)?.reshape((
-            bsz,
-            seq_len,
-            self.num_heads,
-            self.head_dim,
-        ))?;
-        let mut k = linear_forward_last_dim(&self.k_proj, x)?.reshape((
-            bsz,
-            seq_len,
-            self.num_kv_heads,
-            self.head_dim,
-        ))?;
-        let v = linear_forward_last_dim(&self.v_proj, x)?.reshape((
-            bsz,
-            seq_len,
-            self.num_kv_heads,
-            self.head_dim,
-        ))?;
+        let (q, k, v) = self.qkv.project(x)?;
+        let mut q = q.reshape((bsz, seq_len, self.num_heads, self.head_dim))?;
+        let mut k = k.reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
 
         q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, seq_len)?;
         k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, seq_len)?;
@@ -858,17 +1210,19 @@ impl VoxtralAttention {
             ));
         }
 
-        let rows = |projection: &Linear| -> Result<Tensor> {
-            let projected = linear_forward_last_dim(projection, x)?;
+        // The projections run over every row, spare ones included; only the
+        // real rows go on to attention.
+        let real = |projected: Tensor| -> Result<Tensor> {
             Ok(if padded > batch {
                 projected.narrow(0, 0, batch)?
             } else {
                 projected
             })
         };
-        let mut q = rows(&self.q_proj)?.reshape((batch, 1, self.num_heads, self.head_dim))?;
-        let mut k = rows(&self.k_proj)?.reshape((batch, 1, self.num_kv_heads, self.head_dim))?;
-        let v = rows(&self.v_proj)?.reshape((batch, 1, self.num_kv_heads, self.head_dim))?;
+        let (q, k, v) = self.qkv.project(x)?;
+        let mut q = real(q)?.reshape((batch, 1, self.num_heads, self.head_dim))?;
+        let mut k = real(k)?.reshape((batch, 1, self.num_kv_heads, self.head_dim))?;
+        let v = real(v)?.reshape((batch, 1, self.num_kv_heads, self.head_dim))?;
         q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, 1)?;
         k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, 1)?;
 
@@ -930,6 +1284,59 @@ impl VoxtralAttention {
         } else {
             out
         };
+        linear_forward_last_dim(&self.o_proj, &out)
+    }
+
+    /// The batched decode attention as a decode graph runs it: each row's
+    /// K/V written at its step-buffer slot, RoPE rows gathered by its
+    /// step-buffer position, and the split decode over its step-buffer
+    /// block table with row-invariant partitions. No host value is read or
+    /// uploaded.
+    fn forward_graph_decode(
+        &self,
+        x: &Tensor,
+        attention: &VoxtralGraphAttention<'_>,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let batch = x.dim(0)?;
+        let (q, k, v) = self.qkv.project(x)?;
+        let mut q = q.reshape((batch, 1, self.num_heads, self.head_dim))?;
+        let mut k = k.reshape((batch, 1, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((batch, 1, self.num_kv_heads, self.head_dim))?;
+        q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, 1)?;
+        k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, 1)?;
+        let q = apply_interleaved_rope_rows(&q, &attention.cos, &attention.sin)?;
+        let k = apply_interleaved_rope_rows(&k, &attention.cos, &attention.sin)?;
+        let queries = q
+            .reshape((batch, self.num_heads, self.head_dim))?
+            .contiguous()?;
+        let keys = k
+            .reshape((batch, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let values = v
+            .reshape((batch, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let (cache_keys, cache_values) = attention.caches.get(layer_idx).ok_or_else(|| {
+            Error::InferenceError(format!(
+                "Voxtral decode graph has no KV cache for layer {layer_idx}"
+            ))
+        })?;
+        decode_step::write_kv_rows(cache_keys, cache_values, &keys, &values, &attention.slots)?;
+        let out = split_decode::paged_decode_adaptive(
+            &queries,
+            cache_keys,
+            cache_values,
+            &attention.metadata,
+            batch,
+            self.num_heads,
+            self.num_kv_heads,
+            attention.page_tokens,
+            attention.max_blocks,
+            1.0f32 / (self.head_dim as f32).sqrt(),
+            None,
+            attention.max_partitions,
+        )?;
+        let out = out.reshape((batch, 1, self.num_heads * self.head_dim))?;
         linear_forward_last_dim(&self.o_proj, &out)
     }
 
@@ -1214,6 +1621,22 @@ impl LmRopePositionTable {
                 table.cos.index_select(&ids, 0)?,
                 table.sin.index_select(&ids, 0)?,
             ))
+        })
+    }
+
+    /// The whole `(cos, sin)` table for this geometry, dtype and device,
+    /// covering positions `0..end`, and its row count: a decode graph
+    /// gathers its rows on the device, bit for bit as [`Self::rows`] does.
+    fn table_covering(
+        &self,
+        head_dim: usize,
+        rope_theta: f64,
+        end: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor, usize)> {
+        self.with_table(head_dim, rope_theta, end, dtype, device, |table| {
+            Ok((table.cos.clone(), table.sin.clone(), table.cos.dim(0)?))
         })
     }
 
@@ -1600,6 +2023,118 @@ pub(crate) mod tests {
             .into_iter()
             .map(f32::to_bits)
             .collect()
+    }
+
+    /// The stacked q/k/v GEMM gives each projection's output to F32
+    /// rounding (its rows are the three weights' rows); off CUDA the
+    /// projections always run apart.
+    #[test]
+    fn fused_qkv_projects_as_the_three_projections_do() {
+        let device = Device::Cpu;
+        assert!(!fused_qkv_requested(&device));
+        let weight = |rows: usize, seed: u64| {
+            Tensor::from_vec(
+                crate::kernels::numeric_check::xorshift_values(rows * 8, seed, 1.0),
+                (rows, 8),
+                &device,
+            )
+            .unwrap()
+        };
+        let (q, k, v) = (weight(6, 1), weight(2, 2), weight(2, 3));
+        let separate = VoxtralQkv::Separate {
+            q_proj: Linear::new(q.clone(), None),
+            k_proj: Linear::new(k.clone(), None),
+            v_proj: Linear::new(v.clone(), None),
+        };
+        let fused = VoxtralQkv::Fused {
+            qkv_proj: Linear::new(Tensor::cat(&[&q, &k, &v], 0).unwrap(), None),
+            query_width: 6,
+            key_width: 2,
+            value_width: 2,
+        };
+        let x = weight(3, 4).reshape((3, 1, 8)).unwrap();
+        let (a, b) = (separate.project(&x).unwrap(), fused.project(&x).unwrap());
+        for (apart, stacked) in [(&a.0, &b.0), (&a.1, &b.1), (&a.2, &b.2)] {
+            assert_eq!(apart.dims(), stacked.dims());
+            let difference = (apart - stacked)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(difference <= 1e-5, "{difference}");
+        }
+    }
+
+    /// A decode graph gathers each row's RoPE rows from the whole position
+    /// table by its step-buffer position, bit for bit the rows the standard
+    /// decode gathers.
+    #[test]
+    fn graph_rope_gathers_match_the_standard_rows_bit_for_bit() {
+        let device = Device::Cpu;
+        let table = LmRopePositionTable::default();
+        let positions = [0usize, 7, 300, 41];
+        let (cos, sin) = table
+            .rows(128, 1e6, &positions, DType::F32, &device)
+            .unwrap();
+        let (all_cos, all_sin, rows) = table
+            .table_covering(128, 1e6, 301, DType::F32, &device)
+            .unwrap();
+        assert!(rows >= 301);
+        let ids = Tensor::new(&[0u32, 7, 300, 41], &device).unwrap();
+        let bits = |t: &Tensor| {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(&all_cos.index_select(&ids, 0).unwrap()), bits(&cos));
+        assert_eq!(bits(&all_sin.index_select(&ids, 0).unwrap()), bits(&sin));
+    }
+
+    /// Off CUDA there are no decode graphs: a lone row keeps its own route
+    /// and the diagnostics say why.
+    #[test]
+    fn decode_graphs_stay_off_off_cuda() {
+        let model = tiny_decode_model(&Device::Cpu, None);
+        assert!(!model.decode_graph_on());
+        let reason = model.decode_graph_diagnostics()["off"].to_string();
+        assert!(
+            reason.contains("CUDA only")
+                || reason.contains(super::super::decode_graph::VOXTRAL_DECODE_GRAPHS_ENV)
+                || reason.contains("cuda.decode_graphs"),
+            "{reason}"
+        );
+    }
+
+    /// On CUDA the decode graphs resolve at load (they capture on a step's
+    /// first run, which needs a CUDA KV arena: the H100 runs check it).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_decode_graphs_resolve_at_load() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !super::super::decode_graph::decode_graphs_requested() {
+            return;
+        }
+        let model = tiny_decode_model(&device, None);
+        assert!(
+            model.decode_graph_on(),
+            "{}",
+            model.decode_graph_diagnostics()
+        );
+        let diagnostics = model.decode_graph_diagnostics();
+        assert_eq!(diagnostics["graphed_steps"], 0, "{diagnostics}");
+        assert!(diagnostics["graphs"]["off"].is_null(), "{diagnostics}");
     }
 
     /// Gains precomputed once equal the per-step Ada RMSNorm computation they

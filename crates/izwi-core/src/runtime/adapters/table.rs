@@ -25,6 +25,7 @@ pub(crate) enum LoadedAdapterKind {
     WhisperAsr,
     VibeVoiceAsr,
     GraniteSpeechAsr,
+    GraniteSpeech5Asr,
     Lfm25AudioAsr,
     ParakeetAsr,
     NemotronAsr,
@@ -57,6 +58,7 @@ impl LoadedAdapterKind {
             Self::WhisperAsr => "builtin.whisper_asr.physical_sequence",
             Self::VibeVoiceAsr => "builtin.vibevoice_asr.physical_sequence",
             Self::GraniteSpeechAsr => "builtin.granite_speech_asr.physical_sequence",
+            Self::GraniteSpeech5Asr => "builtin.granite_speech5_asr.physical_sequence",
             Self::Lfm25AudioAsr => "builtin.lfm25_audio_asr.physical_sequence",
             Self::ParakeetAsr => "builtin.parakeet_asr.physical_recurrent",
             Self::NemotronAsr => "builtin.nemotron_asr.physical_recurrent",
@@ -374,9 +376,19 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         )
         .only(GRANITE_SPEAKER_ATTRIBUTED)
         .target(Target::PipelineRunner),
-        // One atomic invocation per chunk on leased decoder pages; long
-        // audio dispatches one chunk at a time.
-        row(F::GraniteSpeech5Asr, C::Asr, Loaded::Scalar, Invocation).chunked(),
+        // A single segment encodes beside other requests' audio and decodes
+        // as a retained row, one batched step per token; long audio runs one
+        // atomic invocation per chunk on leased decoder pages, one chunk a
+        // dispatch.
+        row(
+            F::GraniteSpeech5Asr,
+            C::Asr,
+            Loaded::GraniteSpeech5Asr,
+            RetainedAndInvocation,
+        )
+        .sequence()
+        .resumable()
+        .chunked(),
         // Nemotron 3.5 Transcribe runs every request (up to an hour, one
         // pass) as a retained row: resumable prefill spans that encode the
         // perception windows they need, then decode batched across rows, on

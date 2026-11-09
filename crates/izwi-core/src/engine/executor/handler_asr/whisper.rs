@@ -276,6 +276,7 @@ impl NativeExecutor {
                 stream_sequence: 0,
                 input_sample_rate: sample_rate,
                 input_sample_count: samples.len(),
+                clock: Default::default(),
             })?;
             fresh = true;
         }

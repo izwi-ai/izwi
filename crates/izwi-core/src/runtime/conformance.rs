@@ -442,14 +442,14 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            74
+            76
         );
         assert_eq!(
             manifest
                 .iter()
                 .filter(|case| case.retained_state == Stateless)
                 .count(),
-            11
+            9
         );
 
         assert_eq!(
@@ -594,15 +594,16 @@ mod tests {
             .iter()
             .any(|case| case.variant == ModelVariant::GraniteSpeech412B
                 && case.capability == CapabilityKind::SpeakerAttributedAsr));
-        // Granite Speech 5.0 runs one atomic invocation on leased pages and
-        // retains nothing between requests; it serves plain ASR only.
-        // Its GGUF release is the same model with the same state.
+        // Granite Speech 5.0 retains decoder pages for single-segment rows
+        // and leases them for long audio's atomic invocations; it serves
+        // plain ASR only. Its GGUF release is the same model with the same
+        // state.
         for variant in [
             ModelVariant::GraniteSpeech502B,
             ModelVariant::GraniteSpeech502BGguf,
         ] {
             let granite_5 = manifest_case(&manifest, variant, CapabilityKind::Asr);
-            assert_eq!(granite_5.retained_state, Stateless);
+            assert_eq!(granite_5.retained_state, Managed);
             assert_eq!(granite_5.workspace, InvocationStateRequired);
             assert_eq!(
                 manifest

@@ -49,6 +49,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Transcribes a long file's chunks as concurrent requests (up to the ASR row width at once, committed in order) on Qwen3-ASR, Whisper, Nemotron ASR and Voxtral, so one file batches with itself and others wait at most one chunk; false runs each file's chunks one after another in one request.",
     ),
     CoreEnvVar::new(
+        "IZWI_ASR_PHASE_SYNC",
+        Flag,
+        "false",
+        Once,
+        "Makes each device-thread ASR phase in izwi_asr_phase_seconds wait for its CUDA work first, so it records device time instead of launch time; costs throughput, for profiling runs only.",
+    ),
+    CoreEnvVar::new(
         "IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS",
         Duration,
         "engine per-backend default",
@@ -357,6 +364,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Chooses CUDA block-FP8 projection backend: auto, q8 or native_fp8; invalid = startup error.",
     ),
     CoreEnvVar::new(
+        "IZWI_CUDA_RELPOS_ATTENTION",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, runs the relative-position self-attention of the conformer ASR encoders (Transformer-XL in Parakeet and Nemotron ASR, Shaw block-local in Granite Speech 4.1 and 5.0) as one kernel per layer that scores only each query's visible keys, instead of the eager matmuls, rel_shift copies, masks and softmax, after a per-device self-check against the eager composition within its tolerance (off for the device, with the reason in the encoders' diagnostics, on any failure). Admission then prices the encoders without the eager score planes. Any false value keeps the eager attention.",
+    ),
+    CoreEnvVar::new(
         "IZWI_CUDA_RUNTIME_ACTIVE",
         Flag,
         "false",
@@ -383,6 +397,27 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "0.25",
         Startup,
         "Sets the share (0,1] of the post-weight CUDA budget retained recurrent state may take; the rest backs KV pages.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_CUDA_TRANSDUCER_DECODE",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, runs the greedy TDT (Parakeet) and RNNT (Nemotron ASR) decodes of the retained routes many joint steps per readback: a kernel applies each row's picks and transition on the device and the joint and predictor run for every row with the non-emitting rows' state kept, after a per-device self-check of that kernel against its host reference (bit-exact, off for the device on any difference). Any false value keeps one readback per joint step.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_CUDA_TRANSDUCER_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, replays each Parakeet and Nemotron ASR device decode dispatch (its joint, select and predictor steps) as one CUDA graph per padded width and step count, checked bit for bit against the eager dispatch on its first two runs and off for the process on any mismatch or CUDA error. Loads price 256 MiB of deferred device memory for them. Any false value (or cuda.decode_graphs=off) keeps the eager dispatch.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_CUDA_TRANSDUCER_QUANTUM",
+        Int,
+        "8",
+        Once,
+        "Tokens per row and engine step that Parakeet and Nemotron ASR ask the scheduler for while their CUDA device decode loops run (IZWI_CUDA_TRANSDUCER_DECODE): a positive integer, capped at 16, the joint steps of one dispatch. The scheduler grants fewer at a request's token budget and one while other work waits. 1 keeps one token per step. CPU and Metal always take one.",
     ),
     CoreEnvVar::new(
         "IZWI_DIARIZATION_CAPACITY_WAIT_SECS",
@@ -848,11 +883,39 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the max new tokens per Granite speaker-attributed ASR chunk (positive integer).",
     ),
     CoreEnvVar::new(
+        "IZWI_GRANITE_SPEECH5_ENCODER_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Granite Speech 5.0 runs its conformer encoder over a padded batch, a lone clip included, as a CUDA graph per shape: rows up to 1, 2, 3, 4, 6 or 8 and frames up to whole attention blocks, as many as fit 640 MiB of graph working memory, at most 24 graphs kept. The fused relative-position attention runs inside the graph when it is on. Each graph is checked bit for bit against the eager encoder on its first two batches; a mismatch or CUDA error turns the graphs off for the process. Loads price 768 MiB for them. Any false value encodes every batch eagerly at its unpadded shape; `execution.encoder_graphs` in the diagnostics reports captures, replays and why the graphs are off.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_GRANITE_SPEECH5_RETAINED_DECODE",
+        Flag,
+        "true",
+        Once,
+        "Runs single-segment Granite Speech 5.0 ASR on its retained route, where concurrent requests encode and decode together (one batched step per token); false runs every request as one atomic invocation and fits no retained decoder state.",
+    ),
+    CoreEnvVar::new(
         "IZWI_GRANITE_SPEECH_DTYPE",
         Choice,
         "auto (family/backend default)",
         Startup,
         "Forces the Granite Speech dtype (f32, f16, bf16 and aliases; --granite-speech-dtype wins); f32 also disables the Metal F16 encoder and LM paths.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_GRANITE_SPEECH_ENCODER_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Granite Speech 4.1 runs its conformer encoder over a padded batch, a lone clip included, as a CUDA graph per shape: rows up to 1, 2, 3, 4, 6 or 8 and frames up to whole 200-frame attention blocks, as many as fit 640 MiB of graph working memory (8 rows of 12 s, 2 rows of 32 s), at most 24 graphs kept, least recently used dropped. The fused relative-position attention runs inside the graph when it is on. Each graph is checked bit for bit against the eager layers on its first two batches; a mismatch or CUDA error turns the graphs off for the process. Loads price 768 MiB for them. Any false value encodes every batch eagerly at its unpadded shape; `encoder_graphs` in the load diagnostics reports captures, replays and why the graphs are off.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_GRANITE_SPEECH_RETAINED_DECODE",
+        Flag,
+        "true",
+        Once,
+        "Runs single-segment Granite Speech 4.1 ASR on its retained route, where concurrent requests decode together (one batched step per token, up to 32 rows on CUDA); false runs every request as one atomic invocation and fits no retained decoder state.",
     ),
     CoreEnvVar::new(
         "IZWI_GRANITE_TOKEN_DEBUG",
@@ -1433,6 +1496,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Encodes concurrent Nemotron 3.5 ASR clips of up to 30 s as one padded batch; false encodes every request alone.",
     ),
     CoreEnvVar::new(
+        "IZWI_NEMOTRON_ASR_ENCODER_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Nemotron 3.5 ASR runs the 24 conformer layers of an offline encode, alone or batched, as a CUDA graph per padded shape: rows up to 1, 2, 3, 4, 6 or 8 and encoder frames up to a power of two, as many as fit 640 MiB of graph working memory (every width of 20 s clips), at most 24 graphs kept, least recently used dropped. Each graph is checked bit for bit against the eager layers on its first two batches; a mismatch or CUDA error turns the graphs off for the process. Loads price 768 MiB for them. Any false value runs every encode eagerly at its unpadded shape; `encode.encoder_graphs` in the diagnostics reports captures, replays, fallbacks and why the graphs are off.",
+    ),
+    CoreEnvVar::new(
         "IZWI_NEMOTRON_METAL_DEPTHWISE_CONV1D",
         Flag,
         "true (Metal only)",
@@ -1515,6 +1585,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "unset (test fails)",
         TestHarness,
         "Checkpoint directory of NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-FP8 for the ignored real-checkpoint tests.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_NEMOTRON_TRANSCRIBE_PREFILL_PROFILE",
+        Flag,
+        "false",
+        Once,
+        "Times Nemotron 3.5 Transcribe prefill by decoder layer kind (Mamba, MoE, attention), waiting for the device around every layer; reported in the request diagnostics and izwi_asr_phase_seconds. Costs prefill throughput, for profiling runs only.",
     ),
     CoreEnvVar::new(
         "IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN",
@@ -1606,6 +1683,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "true (Metal only)",
         Once,
         "Enables the custom Metal depthwise Conv2d kernel for Parakeet ASR.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_PARAKEET_WINDOW_BATCHING",
+        Flag,
+        "true",
+        Once,
+        "Encodes a Parakeet input longer than one encoder window (82 s) on CUDA as batches of up to 4 of its windows; false (and Metal and the CPU always) encodes the windows one after another.",
     ),
     CoreEnvVar::new(
         "IZWI_PERFORMANCE_CPU_PROJECTION_BACKEND",
@@ -2385,6 +2469,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the Qwen3.8 tiled DeltaNet recurrence tile size (min 1, capped at sequence length).",
     ),
     CoreEnvVar::new(
+        "IZWI_QWEN3_ASR_DECODE_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Qwen3-ASR replays each decode step of its text decoder, from the token embeddings to the logits, as one CUDA graph per padded width (1, 2, 3, 4, 6, 8, 12, 16, 24 or 32 rows), its quantized projections on the izwi K-quant kernels and attention on the split decode with row-invariant partitions. Each graph is checked bit for bit against the eager body on its first two steps, and a width's first step against the standard decode (relative L2 within 0.05, same greedy token per row); a mismatch or CUDA error turns the graphs off for the process. Loads price 256 MiB for them. Any false value (or cuda.decode_graphs=off) keeps the standard decode; `decode_graph` in the diagnostics reports captures, replays and why the graphs are off.",
+    ),
+    CoreEnvVar::new(
         "IZWI_QWEN3_ASR_GGUF_QMATMUL_TEXT",
         Flag,
         "true",
@@ -2502,6 +2593,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "backend default",
         Load,
         "Overrides the Qwen3-TTS model dtype (e.g. f32, f16, bf16); does not inherit IZWI_QWEN_DTYPE.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_RELPOS_ATTENTION_EMULATOR_DIR",
+        Path,
+        "unset (test skipped)",
+        TestHarness,
+        "Directory the ignored kernels::relpos_attention emulator test writes every self-check call to (inputs and the host reference's output), for the C++ harness that runs kernels/cuda/relpos_attention.cu thread by thread on a machine without a GPU.",
     ),
     CoreEnvVar::new(
         "IZWI_REQUEST_PARALLELISM",
@@ -2651,6 +2749,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Request timeout in seconds (legacy alias REQUEST_TIMEOUT_SECS; invalid ignored).",
     ),
     CoreEnvVar::new(
+        "IZWI_TRANSDUCER_EMULATOR_DIR",
+        Path,
+        "unset (test skipped)",
+        TestHarness,
+        "Directory the ignored kernels::transducer_greedy emulator test writes its select-step checks to (inputs and the host reference's outputs), for the C++ harness that runs kernels/cuda/transducer_greedy.cu thread by thread on a machine without a GPU.",
+    ),
+    CoreEnvVar::new(
         "IZWI_UI_DIR",
         Path,
         "ui/dist",
@@ -2670,6 +2775,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "3600",
         Once,
         "Lowers the VibeVoice ASR max audio-seconds hint on CUDA (positive, capped at 3600); ignored off CUDA.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_VIBEVOICE_ASR_DECODE_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, VibeVoice-ASR replays each decode step of its Qwen language model as one CUDA graph per padded width (1 to 32 rows), as IZWI_QWEN3_ASR_DECODE_GRAPHS describes: checked bit for bit against the eager body and, per width, against the standard decode, and off for the process on a mismatch or CUDA error. Loads price 256 MiB for them. Any false value (or cuda.decode_graphs=off) keeps the standard decode.",
     ),
     CoreEnvVar::new(
         "IZWI_VIBEVOICE_ASR_DTYPE",
@@ -2756,11 +2868,25 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the VibeVoice TTS weight dtype (e.g. f32, f16, bf16); also used by load memory planning.",
     ),
     CoreEnvVar::new(
+        "IZWI_VOXTRAL_DECODE_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Voxtral's language model replays each decode step of its realtime rows (live streams and offline rows alike), from the frame embeddings to the logits, as one CUDA graph per padded width (1, 2, 3, 4, 6, 8, 12, 16, 24 or 32 rows), attention on the split decode with row-invariant partitions. Each graph is checked bit for bit against the eager body on its first two steps, and a width's first step against the standard decode (relative L2 within 0.05, same greedy token per row); a mismatch or CUDA error turns the graphs off for the process. Loads price 256 MiB for them. Any false value (or cuda.decode_graphs=off) keeps the standard decode; `execution.decode_graph` in the diagnostics reports captures, replays and why the graphs are off.",
+    ),
+    CoreEnvVar::new(
         "IZWI_VOXTRAL_DTYPE",
         Choice,
         "backend default",
         Load,
         "Fallback Voxtral TTS dtype override used when IZWI_VOXTRAL_TTS_DTYPE is unset.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_VOXTRAL_FUSED_QKV",
+        Flag,
+        "true (CUDA only)",
+        Once,
+        "On CUDA, Voxtral's language model stacks each layer's q, k and v weights at load and runs them as one GEMM per layer instead of three. The stacked GEMM can round differently from the three apart. Any false value keeps the three projections. CPU and Metal always run them apart.",
     ),
     CoreEnvVar::new(
         "IZWI_VOXTRAL_TTS_DTYPE",
@@ -2782,6 +2908,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "true",
         Load,
         "Sizes the Whisper decode budget from audio duration instead of a fixed cap.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_WHISPER_DECODE_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Whisper's retained decode step pads its rows to the next width of 1, 2, 3, 4, 6, 8, 12, 16, 24 or 32 and replays the step's nine pure segments (the embeddings and first self-attention projection; per layer, the self-attention output through the cross-attention query, and the cross-attention output through the MLP to the next layer's projection or the logits) as one CUDA graph per segment and width; the self- and cross-attention calls stay eager over the real rows. Each graph is checked bit for bit against its eager segment on its first two runs; a mismatch or CUDA error turns the graphs off for the process. Loads price 96 MiB for them. Any false value (or cuda.decode_graphs=off) runs the step eagerly at its own row count.",
     ),
     CoreEnvVar::new(
         "IZWI_WHISPER_DEFAULT_LANGUAGE",

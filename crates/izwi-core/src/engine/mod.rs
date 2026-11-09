@@ -3822,6 +3822,33 @@ impl Engine {
         .await
     }
 
+    /// [`Self::load_managed_model_state_with_portable_copies`] for a pool the
+    /// caller sized across its rows; see
+    /// `EngineCore::load_pooled_managed_model_state_with_portable_copies`.
+    pub(crate) async fn load_pooled_managed_model_state_with_portable_copies(
+        &self,
+        model_instance: ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        pool_tokens: usize,
+        portable_state_copies: u32,
+        rows: (usize, usize),
+        minimum_tokens: u64,
+    ) -> Result<Arc<ManagedKvModelRuntime>> {
+        self.with_core_on_device(Some(Some(model_instance)), |core| {
+            core.load_pooled_managed_model_state_with_portable_copies(
+                model_instance,
+                retained_state,
+                pool_tokens,
+                portable_state_copies,
+                rows,
+                minimum_tokens,
+                // ASR loads reconcile their observed weight growth.
+                StateFitReserve::MeasuredUntracked,
+            )
+        })
+        .await
+    }
+
     pub(crate) async fn load_composite_retained_state(
         &self,
         model_instance: ModelInstanceId,

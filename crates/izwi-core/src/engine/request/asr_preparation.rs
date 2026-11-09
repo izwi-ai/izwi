@@ -517,6 +517,7 @@ impl EngineCoreRequest {
             PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech5(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
             | PreparedAsrEncoderArtifactValue::Parakeet(_)
             | PreparedAsrEncoderArtifactValue::Nemotron(_)
@@ -577,6 +578,7 @@ impl EngineCoreRequest {
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech5(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
             | PreparedAsrEncoderArtifactValue::Parakeet(_)
             | PreparedAsrEncoderArtifactValue::Nemotron(_)
@@ -637,6 +639,7 @@ impl EngineCoreRequest {
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech5(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
             | PreparedAsrEncoderArtifactValue::Parakeet(_)
             | PreparedAsrEncoderArtifactValue::Nemotron(_)
@@ -676,6 +679,61 @@ impl EngineCoreRequest {
         Ok(())
     }
 
+    pub(crate) fn install_prepared_granite_speech5_artifact(
+        &mut self,
+        model_variant: ModelVariant,
+        artifact: Arc<GraniteSpeech5PreparedPromptArtifact>,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::GraniteSpeech5Asr
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} Granite Speech 5.0 artifact does not match its normal routed model",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
+        if self.prepared_asr_encoder_artifact.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} already owns an encoder artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+            model_variant,
+            artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::GraniteSpeech5(artifact)),
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_granite_speech5_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<GraniteSpeech5PreparedPromptArtifact>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after Granite Speech 5.0 preparation",
+                self.id
+            )));
+        }
+        match &*prepared.artifact {
+            PreparedAsrEncoderArtifactValue::GraniteSpeech5(value) => Ok(Some(value.clone())),
+            _ => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the Granite Speech 5.0 accessor"
+                    .into(),
+            )),
+        }
+    }
+
     pub(crate) fn prepared_granite_speech_artifact_for_executor(
         &self,
     ) -> Result<Option<Arc<GraniteSpeechPreparedPromptArtifact>>> {
@@ -697,6 +755,7 @@ impl EngineCoreRequest {
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech5(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
             | PreparedAsrEncoderArtifactValue::Parakeet(_)
             | PreparedAsrEncoderArtifactValue::Nemotron(_)
@@ -778,6 +837,7 @@ impl EngineCoreRequest {
             | PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech5(_)
             | PreparedAsrEncoderArtifactValue::Parakeet(_)
             | PreparedAsrEncoderArtifactValue::Nemotron(_)
             | PreparedAsrEncoderArtifactValue::Voxtral(_) => Err(Error::InvalidInput(

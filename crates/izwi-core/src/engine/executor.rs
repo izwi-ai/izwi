@@ -1624,6 +1624,26 @@ fn device_job_tag(execution: &PhysicalBatchExecution<'_>) -> (DeviceJobTag, Work
     (tag, class)
 }
 
+/// Records one ASR dispatch's prefill or decode time and the
+/// detokenisation inside it as `model`'s phases.
+fn record_asr_dispatch_phases(
+    model: &str,
+    phase: super::metrics::EngineDispatchPhase,
+    started: std::time::Instant,
+) {
+    use super::metrics::{AsrPhase, EngineDispatchPhase};
+    let phase = match phase {
+        EngineDispatchPhase::Prefill => AsrPhase::Prefill,
+        EngineDispatchPhase::Decode => AsrPhase::Decode,
+        EngineDispatchPhase::Other => return,
+    };
+    super::metrics::record_asr_device_phase(model, phase, started);
+    let detok = super::metrics::take_asr_detok();
+    if !detok.is_zero() {
+        super::metrics::record_asr_phase(model, AsrPhase::Detok, detok);
+    }
+}
+
 /// When the device last finished a model step while the engine stayed busy.
 /// The next step's start records the gap as device idle time
 /// (`izwi_engine_device_idle_seconds`); an engine going idle clears it.
@@ -3023,6 +3043,16 @@ fn mixed_force_split() -> bool {
     FORCE_SPLIT.get()
 }
 
+/// A transducer's decode quantum in the scheduling profile: above one, the
+/// rows keep it in continuous batches beyond their soft deadline.
+fn apply_transducer_decode_quantum(profile: &mut ExecutionProfile, quantum: usize) {
+    if quantum > 1 {
+        profile.preferred_decode_tokens = quantum;
+        profile.sustained_decode_quantum = true;
+        profile.speculative_decode_batch = true;
+    }
+}
+
 fn is_isolated_continuous_model_quantum(scheduled: &[ScheduledRequest]) -> bool {
     scheduled.len() == 1 && !scheduled[0].is_prefill && scheduled[0].num_tokens > 1
 }
@@ -3738,6 +3768,21 @@ impl ModelExecutor for NativeExecutor {
                 profile.sustained_decode_quantum = true;
                 profile.speculative_decode_batch = true;
             }
+        }
+        // Parakeet and Nemotron ASR decode several tokens per row and step
+        // while their device dispatches run (CUDA), rows batched, while
+        // nothing waits; the scheduler's fairness gates drop to one token
+        // as soon as a request waits.
+        if matches!(
+            variant.family(),
+            crate::catalog::ModelFamily::ParakeetAsr | crate::catalog::ModelFamily::NemotronAsr
+        ) {
+            let quantum = request
+                .prepared_asr_model_lease_for_executor()
+                .ok()
+                .flatten()
+                .map_or(1, |lease| lease.model_arc().transducer_decode_quantum());
+            apply_transducer_decode_quantum(&mut profile, quantum);
         }
         // DS1.2b: hybrid contracts that declare committed-snapshot sharing get
         // their first prefill chunk aligned to the declared interval by the
@@ -5230,9 +5275,17 @@ impl UnifiedExecutor {
         {
             return (inputs, refusal);
         }
-        let (batch_id, expected_dispatch, tag, class, shape) =
+        let (batch_id, expected_dispatch, tag, class, shape, asr_model) =
             inputs.with_execution(|execution| {
                 let (tag, class) = device_job_tag(&execution);
+                // ASR dispatches record their prefill or decode time, and
+                // the detokenisation inside it, under the model's name.
+                let asr_model = execution
+                    .requests
+                    .first()
+                    .filter(|request| request.task_type == TaskType::ASR)
+                    .and_then(|request| request.model_variant)
+                    .map(|variant| variant.dir_name());
                 let phase = super::metrics::EngineDispatchPhase::of_work(
                     execution.batch.rows.iter().map(|row| &row.work),
                 );
@@ -5242,6 +5295,7 @@ impl UnifiedExecutor {
                     tag,
                     class,
                     (execution.batch.rows.len(), phase),
+                    asr_model,
                 )
             });
         let slot = Arc::new(Mutex::new(Some(inputs)));
@@ -5261,6 +5315,11 @@ impl UnifiedExecutor {
             }
             let _device_step = idle.as_ref().map(|(clock, label)| clock.begin_step(label));
             let _physical_dispatch = begin_engine_physical_dispatch_shaped(shape.0, shape.1);
+            let asr_started = std::time::Instant::now();
+            if asr_model.is_some() {
+                // Drop detokenisation another dispatch left on this thread.
+                let _ = super::metrics::take_asr_detok();
+            }
             let inputs = job_slot.lock().unwrap_or_else(|poison| poison.into_inner());
             let result = inputs
                 .as_ref()
@@ -5271,6 +5330,9 @@ impl UnifiedExecutor {
                     }))
                 });
             drop(inputs);
+            if let Some(model) = asr_model {
+                record_asr_dispatch_phases(model, shape.1, asr_started);
+            }
             drop(admitted);
             drop(retained);
             result
@@ -5780,14 +5842,14 @@ mod tests {
             ModelFamily::Maya2Tts,
             ModelFamily::ChatterboxTts,
             ModelFamily::VoxtralTts,
+            ModelFamily::GraniteSpeechAsr,
+            ModelFamily::GraniteSpeech5Asr,
         ] {
             assert!(stage_sets_batch_rows(family), "{family:?}");
         }
         for family in [
             ModelFamily::Qwen3Chat,
             ModelFamily::Gemma3Chat,
-            ModelFamily::GraniteSpeechAsr,
-            ModelFamily::GraniteSpeech5Asr,
             ModelFamily::NemotronTranscribeAsr,
             ModelFamily::Lfm25Audio,
             ModelFamily::Lfm3Audio,
@@ -5817,6 +5879,43 @@ mod tests {
             finalizer.calls.lock().unwrap().as_slice(),
             &[(41, PendingQuantumDecision::Abort)]
         );
+    }
+
+    /// An ASR decode dispatch records its time and the detokenisation inside
+    /// it; work that is neither prefill nor decode records nothing.
+    #[test]
+    fn asr_dispatches_record_their_phase_and_detokenisation() {
+        use crate::engine::metrics::{asr_detok_scope, asr_phase_totals, AsrPhase};
+        let model = "asr-dispatch-phase-test";
+        drop(asr_detok_scope());
+        record_asr_dispatch_phases(
+            model,
+            super::super::metrics::EngineDispatchPhase::Other,
+            std::time::Instant::now(),
+        );
+        assert_eq!(asr_phase_totals(model, AsrPhase::Decode).0, 0);
+        assert_eq!(asr_phase_totals(model, AsrPhase::Prefill).0, 0);
+        {
+            let _detok = asr_detok_scope();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        record_asr_dispatch_phases(
+            model,
+            super::super::metrics::EngineDispatchPhase::Decode,
+            std::time::Instant::now(),
+        );
+        assert_eq!(asr_phase_totals(model, AsrPhase::Decode).0, 1);
+        let (detoks, detok_seconds) = asr_phase_totals(model, AsrPhase::Detok);
+        assert_eq!(detoks, 1);
+        assert!(detok_seconds >= 0.001);
+        // The clock was drained: a dispatch without detokenisation adds none.
+        record_asr_dispatch_phases(
+            model,
+            super::super::metrics::EngineDispatchPhase::Prefill,
+            std::time::Instant::now(),
+        );
+        assert_eq!(asr_phase_totals(model, AsrPhase::Prefill).0, 1);
+        assert_eq!(asr_phase_totals(model, AsrPhase::Detok).0, 1);
     }
 
     /// Publishing or discarding a pending quantum commits, restores or drops
@@ -6244,6 +6343,23 @@ mod tests {
             scheduled(1, false),
             scheduled(1, false),
         ]));
+    }
+
+    /// A transducer's decode quantum above one asks for sustained, batched
+    /// quanta; one leaves the scalar profile.
+    #[test]
+    fn transducer_quantum_profiles_batched_quanta() {
+        let mut profile = ExecutionProfile::fail_closed(
+            crate::backends::BackendKind::Cuda,
+            None,
+            ExecutionMode::Sequence,
+        );
+        apply_transducer_decode_quantum(&mut profile, 1);
+        assert_eq!(profile.preferred_decode_tokens, 1);
+        assert!(!profile.sustained_decode_quantum && !profile.speculative_decode_batch);
+        apply_transducer_decode_quantum(&mut profile, 8);
+        assert_eq!(profile.preferred_decode_tokens, 8);
+        assert!(profile.sustained_decode_quantum && profile.speculative_decode_batch);
     }
 
     fn native_route_fixture(
