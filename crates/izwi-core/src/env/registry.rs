@@ -2434,6 +2434,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Toggles the custom RoPE kernel for Qwen3 attention.",
     ),
     CoreEnvVar::new(
+        "IZWI_QWEN3_TTS_AUDIO_STAGE",
+        Flag,
+        "true",
+        Once,
+        "Kill switch: false decodes each Qwen3-TTS request's audio on its own decode step, one request at a time on the device thread, instead of in the audio stage, where a request whose audio is due (a streamed window, or a finished request's audio, 128 frames a quantum) leaves the decode batch and up to the decode rows' requests decode theirs together. On CUDA every codec call there runs four fixed vocoder windows (spare windows zero), shared across requests once the load checks that windows decode together as alone; elsewhere each window is its own call. `codec_batching` and `codec_decode.batched` in the model diagnostics report the batching and its counters.",
+    ),
+    CoreEnvVar::new(
         "IZWI_QWEN3_TTS_CODEC_BF16",
         Flag,
         "false",

@@ -2759,6 +2759,59 @@ fn prepared_continuous_cost_scales_an_isolated_multi_token_quantum() {
     assert_eq!(cost.workspace.workspace_bytes().unwrap(), 32);
 }
 
+/// A Qwen3-TTS request whose audio is due is scheduled onto the loaded
+/// audio stage and finishes on its finalization stage; each audio quantum
+/// is priced as one request of the stage, and a full batch of them with
+/// the shared codec call fits the stage's declared workspace.
+#[test]
+fn qwen_tts_audio_quanta_bind_the_audio_stage_and_fit_its_workspace() {
+    use crate::runtime::{CapabilityKind, LoadedModelBundleDraft, RuntimeAdapterRegistry};
+
+    let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+    for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+        let draft = LoadedModelBundleDraft::build(
+            &RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap(),
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            variant,
+            backend,
+        )
+        .unwrap();
+        for capability in [CapabilityKind::Tts, CapabilityKind::StreamingTts] {
+            for contract in draft.execution_contracts(capability).unwrap() {
+                let binding = contract.adapter_binding().unwrap();
+                let audio = WorkUnit::SequenceAudioDecode { max_frames: 1 };
+                let stage = binding.stage_for_work(&audio).unwrap().clone();
+                assert_eq!(
+                    stage.selector,
+                    crate::engine::StageWorkSelector::SequenceAudioDecode
+                );
+                let finalize = binding
+                    .stage_for_work(&WorkUnit::SequenceFinalize {
+                        max_output_steps: 1,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    finalize.selector,
+                    crate::engine::StageWorkSelector::SequenceFinalize
+                );
+                let mut request = EngineCoreRequest::tts("audio").with_model_variant(variant);
+                request.bind_execution_adapter(binding.clone()).unwrap();
+                let cost = EngineCore::work_cost(&request, &audio, Some(&stage), backend).unwrap();
+                assert_eq!(cost, WorkCost::new(1, 1, stage.workspace_per_row_bytes));
+                let rows = stage.max_batch_size as u64;
+                assert!(rows > 1);
+                assert_eq!(
+                    stage.workspace_base_bytes
+                        + cost.workspace.workspace_bytes().unwrap() * rows,
+                    stage.max_workspace_bytes
+                );
+                assert_eq!(cost.logical_units * rows, stage.max_work_units);
+            }
+        }
+    }
+}
+
 #[test]
 fn realtime_work_cost_accounts_for_bounded_input_and_output() {
     let request = EngineCoreRequest::asr("");

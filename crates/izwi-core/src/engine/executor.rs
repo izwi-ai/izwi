@@ -4134,6 +4134,23 @@ impl ModelExecutor for NativeExecutor {
                     ..
                 } if execution.requests.iter().all(|request| {
                     request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Qwen3Tts
+                    })
+                }) =>
+                {
+                    self.execute_static_qwen_tts_audio_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::TTS,
+                    stage: NativeAudioStage::SequenceAudioDecode,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
                         variant.family() == crate::catalog::ModelFamily::Maya1Tts
                     })
                 }) =>
@@ -6364,6 +6381,54 @@ mod tests {
                 mode: NativeBatchMode::Continuous,
                 stage_id: StageId::new(7),
             }
+        );
+    }
+
+    /// A Qwen3-TTS request whose audio is due runs on the loaded audio
+    /// stage: a static batch of audio-decode quanta resolves to the audio
+    /// route and reaches the Qwen3-TTS audio handler (which then needs the
+    /// request's loaded model), not the unregistered-stage refusal.
+    #[test]
+    fn qwen_tts_audio_quanta_reach_the_qwen_audio_handler() {
+        let (request, mut scheduled, mut batch) = native_route_fixture(
+            TaskType::TTS,
+            "tts",
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+            StageWorkSelector::SequenceAudioDecode,
+            "tts.audio_decode.qwen3.tensor_static",
+            NativeBatchMode::Static,
+            SequencePhase::Decode,
+        );
+        scheduled.work = WorkUnit::SequenceAudioDecode { max_frames: 1 };
+        batch.rows[0].work = scheduled.work.clone();
+        let requests = [&request];
+        let scheduled = [scheduled];
+        let execution = PhysicalBatchExecution {
+            batch: &batch,
+            requests: &requests,
+            scheduled: &scheduled,
+        };
+        execution.validate().unwrap();
+        assert_eq!(
+            NativeBatchRoute::resolve(&execution).unwrap(),
+            NativeBatchRoute::Audio {
+                task: TaskType::TTS,
+                stage: NativeAudioStage::SequenceAudioDecode,
+                mode: NativeBatchMode::Static,
+                stage_id: StageId::new(7),
+            }
+        );
+        let mut executor = NativeExecutor::new(WorkerConfig::default());
+        // Initialized without a model: the handler, not the route, refuses.
+        executor.initialized = true;
+        let error = executor.execute_physical_batch(execution).unwrap_err();
+        assert!(
+            error
+                .error
+                .to_string()
+                .contains("Qwen3-TTS audio lost its model"),
+            "{}",
+            error.error
         );
     }
 

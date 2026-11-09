@@ -2211,10 +2211,18 @@ fn qwen_tts_factory_binds_every_capability_to_physical_sequence_stages() {
         physical.execution_profile.decode_batch,
         NativeBatchMode::Continuous
     );
-    assert_eq!(physical.stages.len(), 2);
+    assert_eq!(physical.stages.len(), 4);
     assert_eq!(
         physical.stages[0].selector,
         StageWorkSelector::SequencePrefill
+    );
+    assert_eq!(
+        physical.stages[2].selector,
+        StageWorkSelector::SequenceAudioDecode
+    );
+    assert_eq!(
+        physical.stages[3].selector,
+        StageWorkSelector::SequenceFinalize
     );
     assert_eq!(physical.stages[0].batch_mode, NativeBatchMode::None);
     assert_eq!(physical.stages[0].max_batch_size, 1);
@@ -2306,6 +2314,85 @@ fn vibevoice_tts_preparation_uses_the_authenticated_operation_boundary() {
             .as_slice()
         )
     );
+}
+
+/// Qwen3-TTS requests decode their audio in an audio stage of the decode
+/// rows' width (a static batch from two rows, scalar at one), priced as one
+/// codec call's shared work plus each request's own, then finalize alone;
+/// IZWI_QWEN3_TTS_AUDIO_STAGE=false leaves only prefill and decode.
+#[test]
+fn qwen_tts_audio_stage_takes_the_decode_rows_and_its_kill_switch_removes_it() {
+    let metadata = LoadedModelBundleDraft::build(
+        &RuntimeAdapterRegistry::built_in(),
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(2),
+        ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+        BackendKind::Cpu,
+    )
+    .unwrap()
+    .capabilities
+    .get(&CapabilityKind::Tts)
+    .unwrap()
+    .metadata();
+    for (backend, rows) in [
+        (BackendKind::Cuda, 32),
+        (BackendKind::Metal, 2),
+        (BackendKind::Cpu, 1),
+    ] {
+        let adapter = PhysicalQwenTtsExecutionAdapter::new(
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            metadata,
+            backend,
+            1,
+        )
+        .with_decode_batch_size(rows)
+        .with_audio_stage(true);
+        let contract = adapter.contract(StreamingRequirements::NONE).unwrap();
+        let [_, decode, audio, finalize] = &contract.stages[..] else {
+            panic!("expected four stages, got {}", contract.stages.len());
+        };
+        assert_eq!(decode.max_batch_size, rows);
+        assert_eq!(audio.selector, StageWorkSelector::SequenceAudioDecode);
+        assert_eq!(audio.max_batch_size, rows);
+        assert_eq!(audio.max_work_units, rows as u64);
+        let (batch_mode, concurrency) = if rows > 1 {
+            (NativeBatchMode::Static, ConcurrencyClass::Batchable)
+        } else {
+            (NativeBatchMode::None, ConcurrencyClass::Exclusive)
+        };
+        assert_eq!(
+            (audio.batch_mode, audio.concurrency),
+            (batch_mode, concurrency)
+        );
+        assert_eq!(audio.shape_policy, StageShapePolicy::Exact);
+        let (shared, per_row) =
+            crate::models::architectures::qwen3::tts::qwen3_tts_audio_stage_workspace(backend)
+                .unwrap();
+        assert_eq!(audio.workspace_base_bytes, shared);
+        assert_eq!(audio.workspace_per_row_bytes, per_row);
+        assert_eq!(audio.max_workspace_bytes, shared + per_row * rows as u64);
+        assert_eq!(finalize.selector, StageWorkSelector::SequenceFinalize);
+        assert_eq!(finalize.max_batch_size, 1);
+        assert_eq!(finalize.max_workspace_bytes, 0);
+
+        let inline = PhysicalQwenTtsExecutionAdapter::new(
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            metadata,
+            backend,
+            1,
+        )
+        .with_decode_batch_size(rows)
+        .with_audio_stage(false)
+        .contract(StreamingRequirements::NONE)
+        .unwrap();
+        assert_eq!(inline.stages.len(), 2);
+        assert!(inline
+            .stages
+            .iter()
+            .all(|stage| stage.selector != StageWorkSelector::SequenceAudioDecode));
+    }
 }
 
 #[test]

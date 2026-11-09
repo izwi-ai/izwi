@@ -14,6 +14,9 @@ pub(super) struct PhysicalQwenTtsExecutionAdapter {
     /// Rows of the continuous decode stage: `max_batch_size`, or the wider
     /// width the family is certified for (`catalog::tts_decode_width`).
     pub(super) decode_batch_size: usize,
+    /// Whether requests decode their audio in the audio stage
+    /// (`IZWI_QWEN3_TTS_AUDIO_STAGE`) rather than on their decode steps.
+    pub(super) audio_stage: bool,
 }
 
 impl PhysicalQwenTtsExecutionAdapter {
@@ -34,6 +37,7 @@ impl PhysicalQwenTtsExecutionAdapter {
             backend_kind,
             max_batch_size: max_batch_size.max(1),
             decode_batch_size: max_batch_size.max(1),
+            audio_stage: crate::models::architectures::qwen3::tts::qwen3_tts_audio_stage_enabled(),
         }
     }
 
@@ -41,6 +45,13 @@ impl PhysicalQwenTtsExecutionAdapter {
     /// stages' rows).
     pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
         self.decode_batch_size = rows.max(self.max_batch_size);
+        self
+    }
+
+    /// With or without the audio stage, whatever the kill switch says.
+    #[cfg(test)]
+    pub(super) fn with_audio_stage(mut self, audio_stage: bool) -> Self {
+        self.audio_stage = audio_stage;
         self
     }
 }
@@ -120,6 +131,10 @@ impl LoadedExecutionAdapter for PhysicalQwenTtsExecutionAdapter {
         decode.output_visibility = prefill.output_visibility;
         prefill.validate()?;
         decode.validate()?;
+        let mut stages = vec![prefill, decode];
+        if self.audio_stage {
+            stages.extend(self.audio_stages(&execution_profile)?);
+        }
         Ok(LoadedExecutionContract {
             execution_group_id: self.execution_group_id,
             model_instance_id: self.model_instance_id,
@@ -127,8 +142,80 @@ impl LoadedExecutionAdapter for PhysicalQwenTtsExecutionAdapter {
             adapter_abi_revision: self.adapter_abi_revision(),
             metadata,
             execution_profile,
-            stages: Arc::from([prefill, decode]),
+            stages: Arc::from(stages),
         })
+    }
+}
+
+impl PhysicalQwenTtsExecutionAdapter {
+    /// The audio stage and finalization. A decode step whose request has
+    /// codec frames due (a streamed window, or a finished request's audio)
+    /// yields its row; one audio quantum then decodes the due frames of up
+    /// to the decode rows' requests together (fixed-shape codec calls on
+    /// CUDA, `qwen3::tts::speech_tokenizer::CODEC_CALL_SLOTS` windows each),
+    /// and a finished request hands its audio over in a finalization
+    /// quantum. Priced for the published codec decoder: the shared work of
+    /// a quantum (one request's frame-rate stages at a time and one vocoder
+    /// call) once, plus what each request holds through it.
+    fn audio_stages(&self, profile: &ExecutionProfile) -> Result<[StageDescriptor; 2]> {
+        let (shared, per_row) =
+            crate::models::architectures::qwen3::tts::qwen3_tts_audio_stage_workspace(
+                self.backend_kind,
+            )?;
+        let rows = self.decode_batch_size;
+        let batched = rows > 1;
+        let mut audio = StageDescriptor::from_execution_profile(
+            StageId::new(3),
+            if batched {
+                "tts.audio_decode.qwen3.tensor_static"
+            } else {
+                "tts.audio_decode.qwen3.scalar"
+            },
+            profile,
+            if batched {
+                NativeBatchMode::Static
+            } else {
+                NativeBatchMode::None
+            },
+        );
+        audio.selector = StageWorkSelector::SequenceAudioDecode;
+        audio.progress = StageProgressKind::Iterative;
+        audio.shape_policy = StageShapePolicy::Exact;
+        audio.max_padding_basis_points = 0;
+        audio.max_batch_size = rows;
+        audio.concurrency = if batched {
+            ConcurrencyClass::Batchable
+        } else {
+            ConcurrencyClass::Exclusive
+        };
+        audio.max_work_units = u64::try_from(rows).map_err(|_| {
+            Error::Overloaded("Qwen3-TTS audio stage width exceeds work accounting".into())
+        })?;
+        audio.workspace_base_bytes = shared;
+        audio.workspace_per_row_bytes = per_row;
+        audio.max_workspace_bytes = per_row
+            .checked_mul(audio.max_work_units)
+            .and_then(|rows| rows.checked_add(shared))
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS audio stage workspace overflow".into()))?;
+        audio.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        let mut finalize = StageDescriptor::from_execution_profile(
+            StageId::new(4),
+            "tts.finalize.qwen3",
+            profile,
+            NativeBatchMode::None,
+        );
+        finalize.selector = StageWorkSelector::SequenceFinalize;
+        finalize.progress = StageProgressKind::Atomic;
+        finalize.shape_policy = StageShapePolicy::Exact;
+        finalize.max_batch_size = 1;
+        finalize.concurrency = ConcurrencyClass::Exclusive;
+        finalize.max_work_units = 1;
+        finalize.max_workspace_bytes = 0;
+        finalize.output_visibility = OutputVisibility::AfterQuantumCommit;
+        audio.validate()?;
+        finalize.validate()?;
+        Ok([audio, finalize])
     }
 }
 
