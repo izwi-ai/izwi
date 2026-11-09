@@ -131,6 +131,14 @@ impl EngineCoreRequest {
             NemotronPromptOptions, NemotronTranscribeRequest,
         };
         let (samples, sample_rate) = super::super::executor::decode_request_audio_with_rate(self)?;
+        // Admission claims the row's pages for `max_tokens` in full: narrow
+        // an omitted budget to the decode this audio's duration plans, so
+        // concurrent rows share the retained pool instead of each claiming
+        // the card's 16,384 tokens.
+        self.params.max_tokens = crate::runtime::nemotron_transcribe_asr_planned_max_tokens(
+            self,
+            samples.len() as f32 / sample_rate.max(1) as f32,
+        );
         let language = self
             .asr_language_for_execution()
             .map(str::trim)

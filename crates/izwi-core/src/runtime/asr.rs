@@ -693,9 +693,9 @@ fn apply_asr_max_tokens(
     }
 }
 
-/// Nemotron 3.5 Transcribe decodes until its stop token, at most the card's
-/// 16,384 completion tokens (an hour of dense speech is 13-16k); KV for it
-/// costs 6 KiB of 16-bit storage per token, so a row books the whole budget.
+/// Nemotron 3.5 Transcribe's automatic budget is admitted at the card's
+/// 16,384 completion tokens and narrowed by preparation to the decode the
+/// audio's duration plans ([`nemotron_transcribe_asr_planned_max_tokens`]).
 fn nemotron_transcribe_auto_asr_token_ceiling(variant: ModelVariant) -> Option<usize> {
     (variant.family() == ModelFamily::NemotronTranscribeAsr)
         .then_some(crate::models::architectures::nemotron_transcribe::MAX_NEW_TOKENS)
@@ -719,6 +719,25 @@ pub(crate) fn vibevoice_asr_planned_max_tokens(
     let ceiling = request.params.max_tokens.max(1);
     if request.asr_auto_max_tokens {
         vibevoice_auto_asr_max_tokens_for_duration(audio_seconds).min(ceiling)
+    } else {
+        ceiling
+    }
+}
+
+/// Decode budget a Nemotron 3.5 Transcribe row of `audio_seconds` runs with:
+/// the planned decode (16 tokens a second and 64 more, at most the card's
+/// 16,384; a translation segment's too) under the request ceiling when the
+/// caller omitted `max_tokens`, otherwise the caller's own budget.
+/// Admission claims a row's KV for its prompt and this budget in full, so
+/// the card's budget let three 30 s rows share the 65,536-token pool.
+pub(crate) fn nemotron_transcribe_asr_planned_max_tokens(
+    request: &EngineCoreRequest,
+    audio_seconds: f32,
+) -> usize {
+    use crate::models::architectures::nemotron_transcribe::planned_decode_tokens;
+    let ceiling = request.params.max_tokens.max(1);
+    if request.asr_auto_max_tokens {
+        planned_decode_tokens(audio_seconds).min(ceiling)
     } else {
         ceiling
     }

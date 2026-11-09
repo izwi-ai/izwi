@@ -413,10 +413,14 @@ been compiled and type-checked but not yet run on a GPU.
 The Mamba state is about 47.6 MiB per row. The state is allocated through the
 managed arena at load (`allocate_nemotron_transcribe_state` in
 `runtime/lifecycle/load/state.rs`). Prompt and completion share a
-65,536-token context; the completion budget is the card's 16,384 tokens. A
-row books KV for a planned decode of `min(16384, ceil(8 × seconds) + 128)`
-tokens (`planned_decode_tokens` in `model.rs`), which covers CJK and
-tag-heavy output. Prefixes are not shared: prompts share only about 15 tokens
+65,536-token context. A request that omits `max_tokens`, and each segment
+of a long translation, decodes at most `min(16384, ceil(16 × seconds) + 64)`
+tokens (`planned_decode_tokens` in `model.rs`): several times what dense
+speech needs in any script or target language. An explicit `max_tokens` may
+reach `65,536 − prompt`. Admission claims a row's KV for its prompt and that
+budget in full, so a 30 s row claims about 975 tokens and the 65,536-token
+pool holds 32 such rows beside a 600 s one; with the card's 16,384-token
+budget it held three. Prefixes are not shared: prompts share only about 15 tokens
 before the audio, and vLLM serves this model without prefix caching too.
 
 ## Word timestamps
