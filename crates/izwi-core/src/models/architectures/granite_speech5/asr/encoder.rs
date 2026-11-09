@@ -3,7 +3,7 @@
 //! (200-frame) blocks, a depthwise convolution module, and self-conditioning
 //! from a character CTC head at the midpoint layer.
 
-use candle_core::{DType, Device, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::{
     batch_norm, conv1d, conv1d_no_bias, embedding, layer_norm, linear, linear_no_bias, ops,
     Conv1dConfig, Embedding, LayerNorm, Module, VarBuilder,
@@ -19,6 +19,7 @@ use crate::kernels::f16_weight_linear::{
 use crate::kernels::numeric_check::{
     run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
 };
+use crate::kernels::relpos_attention::{self, KeyBand, KeyLengths};
 
 use super::config::GraniteSpeech5EncoderConfig;
 
@@ -129,6 +130,11 @@ impl ConformerEncoder {
         validate_frame_lengths(batch, frames, valid_lengths)?;
         let x = self.input_linear.forward(input)?;
         let mask = frame_valid_mask(valid_lengths, frames, x.device(), x.dtype())?;
+        let real = valid_lengths
+            .iter()
+            .map(|len| *len as u32)
+            .collect::<Vec<_>>();
+        let key_lengths = Tensor::from_vec(real, batch, x.device())?;
         let key_mask = valid_key_mask(
             valid_lengths,
             frames.div_ceil(self.context_size().max(1)),
@@ -139,7 +145,7 @@ impl ConformerEncoder {
         let mut x = x.broadcast_mul(&mask)?;
         let midpoint = self.layers.len() / 2;
         for (idx, layer) in self.layers.iter().enumerate() {
-            x = layer.forward_masked(&x, &mask, &key_mask)?;
+            x = layer.forward_masked(&x, &mask, [&key_mask, &key_lengths])?;
             if idx + 1 == midpoint {
                 let mid = ops::softmax_last_dim(&self.out.forward(&x)?)?;
                 let mid = self.out_mid.forward(&mid)?.broadcast_mul(&mask)?;
@@ -242,11 +248,12 @@ impl ConformerBlock {
     }
 
     /// [`Self::forward`] over a padded batch with its `[batch, frames, 1]`
-    /// frame mask and attention key mask; padded frames leave as zeros.
-    fn forward_masked(&self, x: &Tensor, mask: &Tensor, key_mask: &Tensor) -> Result<Tensor> {
+    /// frame mask and attention keys (the key mask and each row's `[batch]`
+    /// U32 valid length); padded frames leave as zeros.
+    fn forward_masked(&self, x: &Tensor, mask: &Tensor, keys: [&Tensor; 2]) -> Result<Tensor> {
         let ff1 = self.ff1.forward(x)?.broadcast_mul(mask)?;
         let mut out = x.broadcast_add(&(ff1 * 0.5)?)?;
-        out = out.broadcast_add(&self.attn.forward_masked(&out, mask, key_mask)?)?;
+        out = out.broadcast_add(&self.attn.forward_masked(&out, mask, keys)?)?;
         out = out.broadcast_add(&self.conv.forward_masked(&out, mask)?)?;
         let ff2 = self.ff2.forward(&out)?.broadcast_mul(mask)?;
         out = out.broadcast_add(&(ff2 * 0.5)?)?;
@@ -295,8 +302,22 @@ struct ConformerAttention {
     /// distance clamped to the block, offset by `max_pos_emb`.
     attention_dists: Tensor,
     context_size: usize,
+    max_pos_emb: usize,
     num_heads: usize,
     dim_head: usize,
+}
+
+/// Whether the conformer attention runs [`relpos_attention::reference`] on
+/// the host in place of the CUDA kernel: the in-family tests of the fused
+/// path's wiring on a machine without a GPU.
+#[cfg(test)]
+fn fused_attention_on_the_host() -> bool {
+    tests::FUSED_ATTENTION_ON_THE_HOST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn fused_attention_on_the_host() -> bool {
+    false
 }
 
 impl ConformerAttention {
@@ -307,6 +328,9 @@ impl ConformerAttention {
     ) -> Result<Self> {
         let inner = config.dim_head * config.num_heads;
         let hidden = config.hidden_dim;
+        // The kernel's self-check runs at load, before admission prices the
+        // encoder from its verdict.
+        relpos_attention::prepare_cuda_kernel(vb.device());
         Ok(Self {
             pre_norm: layer_norm(hidden, 1e-5, vb.pp("pre_norm"))?,
             to_q: encoder_projection(hidden, inner, false, &vb.pp("to_q"), f16)?,
@@ -319,6 +343,7 @@ impl ConformerAttention {
             )?,
             attention_dists: attention_dists(config.context_size, config.max_pos_emb, vb.device())?,
             context_size: config.context_size,
+            max_pos_emb: config.max_pos_emb,
             num_heads: config.num_heads,
             dim_head: config.dim_head,
         })
@@ -328,20 +353,76 @@ impl ConformerAttention {
         self.attend(x, None)
     }
 
-    /// [`Self::forward`] over a padded batch: `key_mask`
-    /// (`[batch, blocks, 1, 1, context]`) keeps each row's queries off its
-    /// padded keys, and `mask` zeroes padded frames' output.
-    fn forward_masked(&self, x: &Tensor, mask: &Tensor, key_mask: &Tensor) -> Result<Tensor> {
-        self.attend(x, Some(key_mask))?
+    /// [`Self::forward`] over a padded batch: the key mask
+    /// (`[batch, blocks, 1, 1, context]`) and the `[batch]` U32 valid lengths
+    /// keep each row's queries off its padded keys, and `mask` zeroes padded
+    /// frames' output.
+    fn forward_masked(&self, x: &Tensor, mask: &Tensor, keys: [&Tensor; 2]) -> Result<Tensor> {
+        self.attend(x, Some(keys))?
             .broadcast_mul(mask)
             .map_err(Error::from)
     }
 
-    /// Block-local attention. Without `key_mask` the one row's zero-padded
-    /// final block is masked as the solo route has always masked it; with
-    /// it, each row's keys past its valid frames are.
-    fn attend(&self, x: &Tensor, key_mask: Option<&Tensor>) -> Result<Tensor> {
+    /// The attention core of normed `x` (`[B, T, D]`) as one CUDA launch
+    /// ([`relpos_attention::relpos_attention`]) once its self-check passed:
+    /// each query scores the keys of its own block (cut at its row's
+    /// `key_lengths`, when given) against the position table itself, with
+    /// eager's BF16 roundings in a BF16 encoder, and no block padding.
+    /// `[B, T, H·Dh]`, or `None` where the eager core runs.
+    fn fused(&self, x: &Tensor, key_lengths: Option<&Tensor>) -> Result<Option<Tensor>> {
+        let dtype = x.dtype();
+        let on = fused_attention_on_the_host()
+            || (x.device().is_cuda() && relpos_attention::eager_reason(x.device()).is_none());
+        if !on || !matches!(dtype, DType::F32 | DType::BF16) {
+            return Ok(None);
+        }
+        let (batch, seq_len, _) = x.dims3()?;
+        let (heads, dim_head) = (self.num_heads, self.dim_head);
+        let q = self
+            .to_q
+            .forward(x)?
+            .reshape((batch, seq_len, heads, dim_head))?;
+        let kv = self
+            .to_kv
+            .forward(x)?
+            .reshape((batch, seq_len, 2, heads, dim_head))?;
+        let (k, v) = (kv.i((.., .., 0))?, kv.i((.., .., 1))?);
+        let table = self.rel_pos_emb.embeddings().to_dtype(dtype)?;
+        let spec = relpos_attention::RelPosAttention {
+            q: &q,
+            k: &k,
+            v: &v,
+            pos: &table,
+            position: relpos_attention::RelPosition::Shaw {
+                clamp: self.context_size,
+                center: self.max_pos_emb,
+            },
+            band: KeyBand::Block {
+                size: self.context_size,
+            },
+            key_lengths: key_lengths.map_or(KeyLengths::All, KeyLengths::PerRow),
+            scale: 1.0 / (dim_head as f64).sqrt(),
+            core: dtype,
+            out_dtype: dtype,
+        };
+        if fused_attention_on_the_host() {
+            return Ok(Some(
+                relpos_attention::reference(&spec)?.to_device(x.device())?,
+            ));
+        }
+        Ok(relpos_attention::relpos_attention(&spec)?)
+    }
+
+    /// Block-local attention. Without `keys` the one row's zero-padded final
+    /// block is masked as the solo route has always masked it; with them
+    /// (the key mask and each row's valid length), each row's keys past its
+    /// valid frames are.
+    fn attend(&self, x: &Tensor, keys: Option<[&Tensor; 2]>) -> Result<Tensor> {
         let x = self.pre_norm.forward(x)?;
+        if let Some(out) = self.fused(&x, keys.map(|[_, lengths]| lengths))? {
+            return self.to_out.forward(&out).map_err(Error::from);
+        }
+        let key_mask = keys.map(|[key_mask, _]| key_mask);
         let (batch, seq_len, _) = x.dims3()?;
         let blocks = seq_len.div_ceil(self.context_size);
         let padded_len = blocks * self.context_size;
@@ -682,6 +763,13 @@ mod tests {
     use super::*;
     use candle_nn::{Conv1d, VarMap};
 
+    thread_local! {
+        /// Runs the conformer attention through the fused kernel's host
+        /// reference (see `fused_attention_on_the_host`).
+        pub(super) static FUSED_ATTENTION_ON_THE_HOST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
     fn assert_close(left: &Tensor, right: &Tensor, tolerance: f32) {
         let left = left.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let right = right.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -918,6 +1006,52 @@ mod tests {
     }
 
     /// The 4-frame-block test encoder with seeded random weights.
+    /// The fused Shaw attention's wiring: with the kernel's host reference in
+    /// place of the eager core (the table itself, its clamp and center, the
+    /// block band, each row's valid length, no block padding), a lone input
+    /// whose last block is partial and a padded batch encode as the eager
+    /// layers do. The kernel takes head dims in multiples of 32.
+    #[test]
+    fn fused_attention_matches_the_eager_encoder() {
+        use crate::kernels::numeric_check::{host_f32, relative_l2};
+        let config = GraniteSpeech5EncoderConfig {
+            hidden_dim: 64,
+            input_dim: 12,
+            output_dim: 7,
+            dim_head: 32,
+            num_heads: 2,
+            context_size: 8,
+            max_pos_emb: 8,
+            conv_kernel_size: 5,
+            ..tiny_encoder_config()
+        };
+        let vars = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu);
+        let encoder = ConformerEncoder::load(&config, vb, None).unwrap();
+        let input = xorshift_tensor(&[2, 21, config.input_dim], 9, 1.0, &Device::Cpu).unwrap();
+        let fused = |f: &dyn Fn() -> Tensor| {
+            FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(true));
+            let out = f();
+            FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(false));
+            out
+        };
+        let rel =
+            |a: &Tensor, b: &Tensor| relative_l2(&host_f32(a).unwrap(), &host_f32(b).unwrap());
+        let lone = input.i(0..1).unwrap();
+        let eager = encoder.forward(&lone).unwrap();
+        let error = rel(&fused(&|| encoder.forward(&lone).unwrap()), &eager);
+        assert!(error < 1e-5, "lone input relative L2 {error:e}");
+        let lengths = [13, 21];
+        let eager = encoder.forward_valid_lengths(&input, &lengths).unwrap();
+        let batched = fused(&|| encoder.forward_valid_lengths(&input, &lengths).unwrap());
+        for (row, len) in lengths.iter().enumerate() {
+            let real = |t: &Tensor| t.i((row..row + 1, ..*len)).unwrap();
+            let error = rel(&real(&batched), &real(&eager));
+            eprintln!("Granite 5.0 fused vs eager attention, row {row}: relative L2 {error:e}");
+            assert!(error < 1e-5, "row {row} relative L2 {error:e}");
+        }
+    }
+
     fn seeded_block_encoder(device: &Device) -> (GraniteSpeech5EncoderConfig, ConformerEncoder) {
         let config = GraniteSpeech5EncoderConfig {
             hidden_dim: 16,
