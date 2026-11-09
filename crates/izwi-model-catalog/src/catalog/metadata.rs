@@ -890,7 +890,7 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => 4.0,
             // Same architecture as plus; base's untied head adds 0.4 GB BF16.
             Self::GraniteSpeech412B => 10.0,
-            Self::GraniteSpeech412BPlus => 9.0,
+            Self::GraniteSpeech412BPlus => 9.5,
             // The same weights as 4.1 with a 16k-token decoder context.
             Self::GraniteSpeech502B => 10.0,
             Self::GraniteSpeech502BGguf => 5.0,
@@ -995,8 +995,8 @@ impl ModelVariant {
             Self::WhisperLargeV3Turbo => [4.5, 3.0, 2.0],
             Self::Qwen3Asr06BGguf => [2.5, 2.5, 1.0],
             Self::Qwen3Asr17BGguf => [4.0, 3.5, 2.5],
-            Self::GraniteSpeech412BPlus => [9.0, 5.5, 4.5],
-            Self::GraniteSpeech412B | Self::GraniteSpeech502B => [10.0, 6.0, 4.5],
+            Self::GraniteSpeech412BPlus => [9.5, 5.5, 4.5],
+            Self::GraniteSpeech412B | Self::GraniteSpeech502B => [10.0, 6.0, 5.0],
             Self::GraniteSpeech502BGguf => [5.0, 4.0, 3.0],
             Self::VibeVoiceAsr => [32.5, 17.5, 16.0],
             Self::VoxtralMini4BRealtime2602 => [18.5, 10.0, 9.0],

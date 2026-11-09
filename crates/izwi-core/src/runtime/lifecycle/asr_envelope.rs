@@ -135,6 +135,17 @@ pub(crate) struct AsrEnvelopeGeometry {
     pub(crate) conv_stem: Option<ConvStemGeometry>,
     /// The forced aligner's text side; `None` for ASR.
     pub(crate) forced_alignment: Option<ForcedAlignmentGeometry>,
+    /// The encoder's Shaw relative-position attention, when it has one.
+    pub(crate) encoder_rel_pos: Option<ShawRelPosGeometry>,
+}
+
+/// Block-local Shaw relative-position attention (the Granite Speech
+/// conformers): each `context`-frame block gathers a `[context, context,
+/// head_dim]` slice of the position table and scores every query against it
+/// in F32, beside the content scores [`layer_bytes`] prices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShawRelPosGeometry {
+    pub(crate) head_dim: u64,
 }
 
 /// A convolution stem over 1 s feature chunks that runs by slices of whole
@@ -185,6 +196,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             vocab: 51_866,
             conv_stem: None,
             forced_alignment: None,
+            encoder_rel_pos: None,
         },
         // Audio tower after its ×8 convolution stem: 13 positions per second.
         ModelVariant::Qwen3Asr06BGguf => AsrEnvelopeGeometry {
@@ -198,6 +210,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             vocab: 151_936,
             conv_stem: None,
             forced_alignment: None,
+            encoder_rel_pos: None,
         },
         ModelVariant::Qwen3Asr17BGguf => AsrEnvelopeGeometry {
             max_chunk_secs: CHUNK_SECS,
@@ -210,6 +223,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             vocab: 151_936,
             conv_stem: None,
             forced_alignment: None,
+            encoder_rel_pos: None,
         },
         // FastConformer at 12.5 positions per second; an RNN-T prediction
         // network and joint (13,088 outputs) instead of an LLM decoder.
@@ -224,6 +238,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             vocab: 13_088,
             conv_stem: None,
             forced_alignment: None,
+            encoder_rel_pos: None,
         },
         // Conformer over 50 positions per second in 4 s attention blocks;
         // the projector emits 10 audio tokens per second. Granite Speech 5.0
@@ -244,6 +259,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
                 vocab: 100_353,
                 conv_stem: None,
                 forced_alignment: None,
+                encoder_rel_pos: Some(ShawRelPosGeometry { head_dim: 128 }),
             }
         }
         // The retained route takes one 60 s tokenizer chunk (450 audio
@@ -260,6 +276,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             vocab: 152_064,
             conv_stem: None,
             forced_alignment: None,
+            encoder_rel_pos: None,
         },
         // Causal Whisper-style encoder at 50 positions per second, 12.5
         // audio tokens per second into the decoder.
@@ -274,6 +291,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             vocab: 131_072,
             conv_stem: None,
             forced_alignment: None,
+            encoder_rel_pos: None,
         },
         // FastConformer at 12.5 positions per second into the LFM2 backbone.
         ModelVariant::Lfm25Audio15BGguf => AsrEnvelopeGeometry {
@@ -287,6 +305,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             vocab: 65_536,
             conv_stem: None,
             forced_alignment: None,
+            encoder_rel_pos: None,
         },
         // The audio tower of Qwen3-ASR-1.7B (104-position ≈ 8 s attention
         // windows after the ×8 stem) under a 5,000-class timestamp head; the
@@ -314,6 +333,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
                 scored_rows_per_word: 2,
                 query_block: QWEN3_STATELESS_QUERY_BLOCK as u64,
             }),
+            encoder_rel_pos: None,
         },
         _ => return None,
     })
@@ -432,6 +452,45 @@ fn layer_bytes(geometry: StackGeometry, length: u64, context: u64) -> Result<u64
         product(&[HIDDEN_PLANES, length, geometry.hidden, F32_BYTES])?,
         product(&[FF_PLANES, length, geometry.ff, F32_BYTES])?,
         product(&[SCORE_PLANES, geometry.heads, length, context, F32_BYTES])?,
+    ])
+}
+
+/// The Shaw relative-position transients of one encoder layer over `length`
+/// positions in blocks of `context` (`relative_position_bias` in the Granite
+/// Speech encoders), beside its content scores: the gathered `[C, C, Dh]`
+/// table with its F32 copy and transposed copy, the F32 query and its
+/// transposed copy over the padded length, and the F32 position scores with
+/// their transposed and scaled copies. Priced at F32 like every activation.
+fn shaw_rel_pos_bytes(
+    geometry: StackGeometry,
+    rel_pos: ShawRelPosGeometry,
+    length: u64,
+    context: u64,
+) -> Result<u64> {
+    const TABLE_PLANES: u64 = 3;
+    const QUERY_PLANES: u64 = 2;
+    const POSITION_SCORE_PLANES: u64 = 3;
+    let context = context.max(1);
+    let padded = length
+        .div_ceil(context)
+        .checked_mul(context)
+        .ok_or_else(overflow)?;
+    sum(&[
+        product(&[TABLE_PLANES, context, context, rel_pos.head_dim, F32_BYTES])?,
+        product(&[
+            QUERY_PLANES,
+            padded,
+            geometry.heads,
+            rel_pos.head_dim,
+            F32_BYTES,
+        ])?,
+        product(&[
+            POSITION_SCORE_PLANES,
+            geometry.heads,
+            padded,
+            context,
+            F32_BYTES,
+        ])?,
     ])
 }
 
@@ -580,7 +639,13 @@ fn geometry_envelope(
             positions(geometry.encoder_positions_per_sec, window).min(encoder_length)
         })
         .max(1);
-    let encoder = layer_bytes(geometry.encoder, encoder_length, encoder_context)?;
+    let mut encoder = layer_bytes(geometry.encoder, encoder_length, encoder_context)?;
+    if let Some(rel_pos) = geometry.encoder_rel_pos {
+        encoder = sum(&[
+            encoder,
+            shaw_rel_pos_bytes(geometry.encoder, rel_pos, encoder_length, encoder_context)?,
+        ])?;
+    }
     let words = u64::try_from(words.unwrap_or(0)).map_err(|_| overflow())?;
     let text_tokens = geometry.forced_alignment.map_or(0, |alignment| {
         (alignment.tokens_per_word * words as f32).ceil() as u64
@@ -961,6 +1026,75 @@ mod tests {
         assert_eq!(metal.accelerator_bytes, 2 * cpu.accelerator_bytes);
         assert!(metal.accelerator_bytes > 170_000_000, "{metal:?}");
         assert_eq!(metal.host_bytes, cpu.host_bytes);
+    }
+
+    /// A Granite Speech encoder layer prices its Shaw relative-position
+    /// copies beside the content scores: about 105 MB over a 30 s chunk,
+    /// which is the encoder's peak on every backend.
+    #[test]
+    fn granite_envelope_prices_the_relative_position_copies() {
+        let rel_pos = 3 * 200 * 200 * 128 * 4 + 2 * 1_600 * 8 * 128 * 4 + 3 * 8 * 1_600 * 200 * 4;
+        assert_eq!(rel_pos, 105_267_200);
+        for variant in [
+            ModelVariant::GraniteSpeech412B,
+            ModelVariant::GraniteSpeech412BPlus,
+            ModelVariant::GraniteSpeech502B,
+            ModelVariant::GraniteSpeech502BGguf,
+        ] {
+            let geometry = envelope_geometry(variant).unwrap();
+            assert_eq!(
+                geometry.encoder_rel_pos,
+                Some(ShawRelPosGeometry { head_dim: 128 })
+            );
+            let rel_bytes = shaw_rel_pos_bytes(
+                geometry.encoder,
+                geometry.encoder_rel_pos.unwrap(),
+                1_500,
+                200,
+            )
+            .unwrap();
+            assert_eq!(rel_bytes, rel_pos);
+            // One block's padded length counts whole blocks.
+            let one_frame = shaw_rel_pos_bytes(
+                geometry.encoder,
+                ShawRelPosGeometry { head_dim: 128 },
+                1,
+                200,
+            )
+            .unwrap();
+            assert_eq!(
+                one_frame,
+                3 * 200 * 200 * 128 * 4 + 2 * 200 * 8 * 128 * 4 + 3 * 8 * 200 * 200 * 4
+            );
+            for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+                let priced = request_envelope(variant, 30.0, backend).unwrap().unwrap();
+                let without = geometry_envelope(
+                    AsrEnvelopeGeometry {
+                        encoder_rel_pos: None,
+                        ..geometry
+                    },
+                    30.0,
+                    None,
+                    backend,
+                )
+                .unwrap();
+                assert_eq!(
+                    priced.accelerator_bytes,
+                    without.accelerator_bytes + rel_pos,
+                    "{variant:?} {backend:?}"
+                );
+                assert_eq!(priced.host_bytes, without.host_bytes);
+            }
+        }
+        for variant in ENVELOPE_VARIANTS {
+            let granite = matches!(
+                variant.family(),
+                ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr
+            );
+            if let Some(geometry) = envelope_geometry(variant) {
+                assert_eq!(geometry.encoder_rel_pos.is_some(), granite, "{variant:?}");
+            }
+        }
     }
 
     /// One chunk per sequence: a default request's prompt and decode budget.
