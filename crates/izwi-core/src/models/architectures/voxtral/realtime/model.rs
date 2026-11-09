@@ -3962,6 +3962,15 @@ impl PublishedVoxtralRealtimePricing {
     }
 }
 
+#[cfg(test)]
+impl VoxtralRealtimeModel {
+    /// The tiny realtime model of this module's tests, for request and
+    /// executor tests elsewhere.
+    pub(crate) fn tiny_for_test() -> Self {
+        tests::tiny_realtime_model()
+    }
+}
+
 /// The worst preparation transaction a loaded model admits: one row holding
 /// the whole session ceiling, finished with its right padding.
 fn realtime_preparation_stage_seal_for(
@@ -5316,7 +5325,7 @@ mod tests {
     /// probe's tiny encoder and adapter, a one-layer Ada-norm LM over the
     /// 265-token test tokenizer, two left-pad tokens and one delay token (a
     /// four-token prompt) and a 4 s session ceiling.
-    fn tiny_realtime_model() -> super::VoxtralRealtimeModel {
+    pub(crate) fn tiny_realtime_model() -> super::VoxtralRealtimeModel {
         use super::super::audio::AudioLanguageAdapter;
         use super::super::tokenizer::tests::test_tokenizer;
         use super::{conv_stem_geometry, WhisperEncoder, NEXT_VOXTRAL_MODEL_LOAD_NONCE};

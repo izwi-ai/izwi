@@ -700,6 +700,13 @@ impl EngineCoreRequest {
             {
                 Ok(())
             }
+            (PreparedIncrementalModel::Voxtral(_), TaskType::ASR)
+                if ready.model_variant.family() == ModelFamily::Voxtral
+                    && ready.qwen_tts.is_none()
+                    && ready.voxtral_tts.is_none() =>
+            {
+                Ok(())
+            }
             (PreparedIncrementalModel::Lfm25AudioTts(_), TaskType::TTS)
                 if ready.qwen_tts.is_none() && ready.lfm25_audio_tts.is_some() =>
             {
