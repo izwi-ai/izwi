@@ -485,6 +485,8 @@ impl GraniteSpeech5AsrModel {
         execution["encoder_weight_precision"] = self.runtime.encoder_precision().diagnostics();
         execution["lm_precision"] = self.runtime.lm_precision().diagnostics();
         execution["stop_check_interval"] = json!(stats.stop_check_interval);
+        execution["cuda_relpos_attention"] =
+            crate::kernels::relpos_attention::diagnostics(&self.device.device);
         json!({
             "family": "granite_speech5_asr",
             "dtype": format!("{:?}", self.dtype),

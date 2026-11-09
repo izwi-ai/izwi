@@ -1787,7 +1787,7 @@ impl ParakeetAsrModel {
             );
         }
 
-        Ok(Self {
+        let model = Self {
             variant,
             _artifacts: artifacts,
             decoder,
@@ -1798,7 +1798,9 @@ impl ParakeetAsrModel {
             max_symbols: DEFAULT_MAX_SYMBOLS,
             encoder_windowing: EncoderWindowing::V3,
             weight_precision,
-        })
+        };
+        model.check_device_decode();
+        Ok(model)
     }
 
     pub fn transcribe(

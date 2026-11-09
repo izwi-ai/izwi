@@ -20,11 +20,15 @@
 //! ([`HostSelect`]) runs the same tensor ops with the select step on the host;
 //! the CPU tests run it.
 
-use candle_core::{DType, Device, Tensor};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Mutex, PoisonError};
+
+use candle_core::{DType, Device, DeviceLocation, Tensor};
 
 use super::{
-    ParakeetAsrModel, ParakeetPredictorBatchState, ParakeetRetainedDecodeBatchRow,
-    ParakeetRetainedDecodeStep, TdtTokenFrame,
+    EncoderWindowing, ParakeetAsrModel, ParakeetPredictorBatchState,
+    ParakeetPreparedEncoderArtifact, ParakeetRetainedDecodeBatchRow, ParakeetRetainedDecodeStep,
+    TdtTokenFrame,
 };
 use crate::error::{Error, Result};
 use crate::kernels::transducer_greedy::{
@@ -47,6 +51,43 @@ fn host_select() -> bool {
     false
 }
 
+/// Devices past this ordinal keep the readback per joint step.
+const MAX_DEVICES: usize = 16;
+const UNCHECKED: u8 = 0;
+const ON: u8 = 1;
+const OFF: u8 = 2;
+/// Each device's verdict of the whole dispatch against its host form
+/// ([`ParakeetAsrModel::check_device_decode`]), and why it is off.
+static DISPATCH_VERDICT: [AtomicU8; MAX_DEVICES] =
+    [const { AtomicU8::new(UNCHECKED) }; MAX_DEVICES];
+static DISPATCH_REASON: Mutex<[Option<String>; MAX_DEVICES]> =
+    Mutex::new([const { None }; MAX_DEVICES]);
+
+fn dispatch_verdict(device: &Device) -> Option<(usize, &'static AtomicU8)> {
+    let DeviceLocation::Cuda { gpu_id } = device.location() else {
+        return None;
+    };
+    DISPATCH_VERDICT
+        .get(gpu_id)
+        .map(|verdict| (gpu_id, verdict))
+}
+
+/// Whether two tensors hold the same values bit for bit.
+fn same_bits(a: &Tensor, b: &Tensor) -> Result<bool> {
+    if a.dims() != b.dims() || a.dtype() != b.dtype() {
+        return Ok(false);
+    }
+    let bits = |t: &Tensor| -> Result<Vec<u32>> {
+        Ok(t.to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .into_iter()
+            .map(f32::to_bits)
+            .collect())
+    };
+    Ok(bits(a)? == bits(b)?)
+}
+
 /// The select step's buffers on the host, for [`host_select`].
 struct HostSelect {
     state: Vec<u32>,
@@ -62,7 +103,117 @@ impl ParakeetAsrModel {
     /// on CUDA once the select kernel passed its self-check there.
     pub(super) fn device_decode_on(&self) -> bool {
         let device = self.network.predictor.embed.device();
-        host_select() || (device.is_cuda() && transducer_greedy::eager_reason(device).is_none())
+        host_select()
+            || (device.is_cuda()
+                && transducer_greedy::eager_reason(device).is_none()
+                && dispatch_verdict(device)
+                    .is_some_and(|(_, verdict)| verdict.load(Ordering::Acquire) == ON))
+    }
+
+    /// At load, on CUDA with the select kernel on: one dispatch of two
+    /// synthetic rows on the device against the same dispatch with the
+    /// select step on the host, which must agree bit for bit (tokens,
+    /// frames, cursors, predictor state and output); on any difference the
+    /// decode keeps one readback per joint step on this device, with the
+    /// reason in the diagnostics. Checks each device once.
+    pub(super) fn check_device_decode(&self) {
+        let device = self.network.predictor.embed.device();
+        if !device.is_cuda() || transducer_greedy::eager_reason(device).is_some() {
+            return;
+        }
+        let Some((gpu_id, verdict)) = dispatch_verdict(device) else {
+            return;
+        };
+        if verdict.load(Ordering::Acquire) != UNCHECKED {
+            return;
+        }
+        let reason = match self.dispatch_self_check() {
+            Ok(None) => {
+                tracing::info!(
+                    "Parakeet device decode matched its host form on cuda:{gpu_id}; \
+                     {DEVICE_DECODE_STEPS} joint steps per readback"
+                );
+                None
+            }
+            Ok(Some(failure)) => Some(format!("dispatch self-check failed: {failure}")),
+            Err(error) => Some(format!("dispatch self-check could not run: {error}")),
+        };
+        if let Some(reason) = &reason {
+            tracing::warn!("Parakeet device decode is off on cuda:{gpu_id}: {reason}");
+        }
+        let passed = reason.is_none();
+        DISPATCH_REASON
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[gpu_id] = reason;
+        verdict.store(if passed { ON } else { OFF }, Ordering::Release);
+    }
+
+    /// One dispatch of two random rows (24 and 9 frames, a quota of four)
+    /// on the device and in its host form; `None` when they agree.
+    fn dispatch_self_check(&self) -> Result<Option<String>> {
+        let device = self.network.predictor.embed.device();
+        let dim = self.network.encoder.geometry.dim;
+        let artifact = |len: usize, seed: u64| -> Result<ParakeetPreparedEncoderArtifact> {
+            Ok(ParakeetPreparedEncoderArtifact {
+                encoded: crate::kernels::numeric_check::xorshift_tensor(
+                    &[1, len, dim],
+                    seed,
+                    2.0,
+                    device,
+                )?,
+                encoded_len: len,
+                input_samples: len * 1280,
+                input_sample_rate: 16_000,
+                resampled_samples: len * 1280,
+                feature_frames: len * 8,
+                language: None,
+                windowing: EncoderWindowing::V3,
+                encoder_windows: 1,
+                log_mel_ms: 0.0,
+                encode_ms: 0.0,
+            })
+        };
+        let artifacts = [artifact(24, 0x7D7_0001)?, artifact(9, 0x7D7_0002)?];
+        let mut on_device = [self.start_retained_decode()?, self.start_retained_decode()?];
+        let mut on_host = on_device.clone();
+        for (states, host) in [(&mut on_device, false), (&mut on_host, true)] {
+            let mut rows = states
+                .iter_mut()
+                .zip(&artifacts)
+                .map(|(state, artifact)| ParakeetRetainedDecodeBatchRow {
+                    artifact,
+                    state,
+                    max_tokens: usize::MAX,
+                    quota: 4,
+                })
+                .collect::<Vec<_>>();
+            self.retained_decode_dispatch(&mut rows, DEVICE_DECODE_STEPS, host)?;
+        }
+        for (row, (device_state, host_state)) in on_device.iter().zip(&on_host).enumerate() {
+            if device_state.token_ids != host_state.token_ids
+                || device_state.token_frames != host_state.token_frames
+                || device_state.cursor != host_state.cursor
+            {
+                return Ok(Some(format!("row {row}: tokens or cursor differ")));
+            }
+            let (d, h) = (&device_state.predictor, &host_state.predictor);
+            for (name, a, b) in [
+                ("h0", &d.h0, &h.h0),
+                ("c0", &d.c0, &h.c0),
+                ("h1", &d.h1, &h.h1),
+                ("c1", &d.c1, &h.c1),
+                (
+                    "output",
+                    &device_state.predictor_out,
+                    &host_state.predictor_out,
+                ),
+            ] {
+                if !same_bits(a, b)? {
+                    return Ok(Some(format!("row {row}: predictor {name} differs")));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Tokens per row and engine step the retained decode asks the
@@ -83,7 +234,8 @@ impl ParakeetAsrModel {
         rows: &mut [ParakeetRetainedDecodeBatchRow<'_>],
     ) -> Result<Vec<ParakeetRetainedDecodeStep>> {
         loop {
-            let emitted = self.retained_decode_dispatch(rows, DEVICE_DECODE_STEPS)?;
+            let emitted =
+                self.retained_decode_dispatch(rows, DEVICE_DECODE_STEPS, host_select())?;
             let steps = self.retained_decode_steps(rows)?;
             if emitted || steps.iter().any(|step| step.finished) {
                 return Ok(steps);
@@ -98,6 +250,7 @@ impl ParakeetAsrModel {
         &self,
         rows: &mut [ParakeetRetainedDecodeBatchRow<'_>],
         steps: usize,
+        on_host: bool,
     ) -> Result<bool> {
         let predictor = &self.network.predictor;
         let device = predictor.embed.device().clone();
@@ -170,7 +323,6 @@ impl ParakeetAsrModel {
             .collect::<Vec<_>>();
         let mut predictor_out = Tensor::cat(&outputs, 0)?;
 
-        let on_host = host_select();
         let mut host = HostSelect {
             emits: vec![0u32; batch * steps * 3],
             labels: vec![0u32; batch],
@@ -324,12 +476,27 @@ impl ParakeetAsrModel {
     }
 }
 
-/// Whether `device` runs the device decode, for diagnostics.
+/// Whether `device` runs the device decode and why not, for diagnostics.
 pub(super) fn device_decode_diagnostics(device: &Device) -> serde_json::Value {
-    let reason = transducer_greedy::eager_reason(device);
+    let dispatch_reason = dispatch_verdict(device).and_then(|(gpu_id, verdict)| {
+        match verdict.load(Ordering::Acquire) {
+            ON => None,
+            OFF => DISPATCH_REASON
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)[gpu_id]
+                .clone(),
+            _ => Some("dispatch self-check not run yet".to_string()),
+        }
+    });
+    let reason = transducer_greedy::eager_reason(device).or(dispatch_reason);
     serde_json::json!({
         "path": if reason.is_none() { "device" } else { "readback per joint step" },
         "reason": reason,
         "steps_per_dispatch": DEVICE_DECODE_STEPS,
+        "decode_quantum": if reason.is_none() {
+            transducer_greedy::device_decode_quantum()
+        } else {
+            1
+        },
     })
 }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use candle_core::{DType, Device, IndexOp, Tensor, D};
@@ -1343,13 +1344,20 @@ impl NemotronNetwork {
         Ok(emitted)
     }
 
+    /// The device the network runs on.
+    pub(super) fn device(&self) -> &Device {
+        self.predictor.embed.device()
+    }
+
     /// Whether the retained RNNT decode runs dispatches of many joint
     /// steps: on CUDA once the transducer select kernel passed its
     /// self-check there.
     pub(super) fn device_decode_on(&self) -> bool {
         let device = self.predictor.embed.device();
         device_decode_on_the_host()
-            || (device.is_cuda() && transducer_greedy::eager_reason(device).is_none())
+            || (device.is_cuda()
+                && transducer_greedy::eager_reason(device).is_none()
+                && Self::dispatch_reason(device).is_none())
     }
 
     /// Up to `steps` RNNT joint steps for every row with one readback
@@ -1362,11 +1370,144 @@ impl NemotronNetwork {
     /// tokens), emits its quota or leaves its window. The transitions are
     /// [`Self::rnnt_joint_step_batch`]'s; the predictor runs in one GEMM over
     /// every row. Whether any row emitted.
+    /// At load, on CUDA with the select kernel on: one RNNT dispatch of two
+    /// synthetic rows on the device against the same dispatch with the
+    /// select step on the host, which must agree bit for bit (tokens,
+    /// cursors, predictor state and projection); on any difference the
+    /// decode keeps one readback per joint step on this device, with the
+    /// reason in the diagnostics. Checks each device once.
+    pub(super) fn check_device_decode(&self) {
+        let device = self.device();
+        if !device.is_cuda() || transducer_greedy::eager_reason(device).is_some() {
+            return;
+        }
+        let Some((gpu_id, verdict)) = dispatch_verdict(device) else {
+            return;
+        };
+        if verdict.load(Ordering::Acquire) != DISPATCH_UNCHECKED {
+            return;
+        }
+        let reason = match self.dispatch_self_check() {
+            Ok(None) => {
+                tracing::info!(
+                    "Nemotron ASR device decode matched its host form on cuda:{gpu_id}; \
+                     {DEVICE_DECODE_STEPS} joint steps per readback"
+                );
+                None
+            }
+            Ok(Some(failure)) => Some(format!("dispatch self-check failed: {failure}")),
+            Err(error) => Some(format!("dispatch self-check could not run: {error}")),
+        };
+        if let Some(reason) = &reason {
+            tracing::warn!("Nemotron ASR device decode is off on cuda:{gpu_id}: {reason}");
+        }
+        let passed = reason.is_none();
+        DISPATCH_REASON
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[gpu_id] = reason;
+        verdict.store(
+            if passed { DISPATCH_ON } else { DISPATCH_OFF },
+            Ordering::Release,
+        );
+    }
+
+    /// Why the device decode is off on `device` past the select kernel, or
+    /// `None` when its dispatch self-check passed.
+    pub(super) fn dispatch_reason(device: &Device) -> Option<String> {
+        dispatch_verdict(device).and_then(|(gpu_id, verdict)| {
+            match verdict.load(Ordering::Acquire) {
+                DISPATCH_ON => None,
+                DISPATCH_OFF => DISPATCH_REASON
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)[gpu_id]
+                    .clone(),
+                _ => Some("dispatch self-check not run yet".to_string()),
+            }
+        })
+    }
+
+    /// One dispatch of two random rows (24 and 9 frames, a quota of four)
+    /// on the device and in its host form; `None` when they agree.
+    fn dispatch_self_check(&self) -> Result<Option<String>> {
+        let device = self.device();
+        let lens = [24usize, 9];
+        let projections = [
+            crate::kernels::numeric_check::xorshift_tensor(
+                &[24, JOINT_HIDDEN],
+                0x7D7_0011,
+                2.0,
+                device,
+            )?
+            .to_dtype(self.joint.enc.weight().dtype())?,
+            crate::kernels::numeric_check::xorshift_tensor(
+                &[9, JOINT_HIDDEN],
+                0x7D7_0012,
+                2.0,
+                device,
+            )?
+            .to_dtype(self.joint.enc.weight().dtype())?,
+        ];
+        let mut on_device = self.start_rnnt_rows(&lens)?;
+        let mut on_host = on_device.clone();
+        let budgets = [(usize::MAX, 4), (usize::MAX, 4)];
+        for (states, host) in [(&mut on_device, false), (&mut on_host, true)] {
+            let mut rows = states
+                .iter_mut()
+                .zip(&projections)
+                .zip(lens)
+                .map(|((state, projection), encoded_len)| NemotronRnntBatchRow {
+                    projection,
+                    encoded_len,
+                    state,
+                })
+                .collect::<Vec<_>>();
+            self.rnnt_dispatch_batch_with(&mut rows, &budgets, DEVICE_DECODE_STEPS, host)?;
+        }
+        let bits = |t: &Tensor| -> Result<Vec<u32>> {
+            Ok(t.to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .into_iter()
+                .map(f32::to_bits)
+                .collect())
+        };
+        for (row, (d, h)) in on_device.iter().zip(&on_host).enumerate() {
+            if d.token_ids != h.token_ids
+                || d.t != h.t
+                || d.symbols_this_frame != h.symbols_this_frame
+            {
+                return Ok(Some(format!("row {row}: tokens or cursor differ")));
+            }
+            let (dp, hp) = (d.predictor.components()?, h.predictor.components()?);
+            for (index, (a, b)) in dp.iter().zip(hp.iter()).enumerate() {
+                if bits(a)? != bits(b)? {
+                    return Ok(Some(format!("row {row}: predictor state {index} differs")));
+                }
+            }
+            if bits(&d.projection)? != bits(&h.projection)? {
+                return Ok(Some(format!("row {row}: predictor projection differs")));
+            }
+        }
+        Ok(None)
+    }
+
     pub(super) fn rnnt_dispatch_batch(
         &self,
         rows: &mut [NemotronRnntBatchRow<'_>],
         budgets: &[(usize, usize)],
         steps: usize,
+    ) -> Result<bool> {
+        self.rnnt_dispatch_batch_with(rows, budgets, steps, device_decode_on_the_host())
+    }
+
+    /// [`Self::rnnt_dispatch_batch`] with the select step on the host
+    /// (`on_host`) or the device.
+    fn rnnt_dispatch_batch_with(
+        &self,
+        rows: &mut [NemotronRnntBatchRow<'_>],
+        budgets: &[(usize, usize)],
+        steps: usize,
+        on_host: bool,
     ) -> Result<bool> {
         let batch = rows.len();
         if batch == 0 || budgets.len() != batch {
@@ -1429,7 +1570,6 @@ impl NemotronNetwork {
             .collect::<Vec<_>>();
         let mut projection = Tensor::cat(&projections, 0)?;
 
-        let on_host = device_decode_on_the_host();
         let mut emits = vec![0u32; batch * steps * 3];
         let (mut labels, mut mask) = (vec![0u32; batch], vec![0u32; batch]);
         let upload = |values: &[u32]| Tensor::new(values, &device);
@@ -4083,6 +4223,24 @@ fn fused_attention_on_the_host() -> bool {
 #[cfg(not(test))]
 fn fused_attention_on_the_host() -> bool {
     false
+}
+
+const DISPATCH_UNCHECKED: u8 = 0;
+const DISPATCH_ON: u8 = 1;
+const DISPATCH_OFF: u8 = 2;
+/// Each device's verdict of the whole RNNT dispatch against its host form
+/// (`NemotronNetwork::check_device_decode`), and why it is off.
+static DISPATCH_VERDICT: [std::sync::atomic::AtomicU8; 16] =
+    [const { std::sync::atomic::AtomicU8::new(DISPATCH_UNCHECKED) }; 16];
+static DISPATCH_REASON: Mutex<[Option<String>; 16]> = Mutex::new([const { None }; 16]);
+
+fn dispatch_verdict(device: &Device) -> Option<(usize, &'static std::sync::atomic::AtomicU8)> {
+    let candle_core::DeviceLocation::Cuda { gpu_id } = device.location() else {
+        return None;
+    };
+    DISPATCH_VERDICT
+        .get(gpu_id)
+        .map(|verdict| (gpu_id, verdict))
 }
 
 /// Joint steps per device dispatch of the retained RNNT decode.

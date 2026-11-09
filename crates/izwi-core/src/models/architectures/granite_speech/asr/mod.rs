@@ -1799,6 +1799,8 @@ impl GraniteSpeechAsrModel {
         diagnostics["execution"]["encoder_weight_precision"] =
             self.runtime.encoder_weight_precision().diagnostics();
         diagnostics["execution"]["lm_precision"] = self.runtime.lm_precision().diagnostics();
+        diagnostics["execution"]["cuda_relpos_attention"] =
+            crate::kernels::relpos_attention::diagnostics(self.runtime.device());
         diagnostics
     }
 }

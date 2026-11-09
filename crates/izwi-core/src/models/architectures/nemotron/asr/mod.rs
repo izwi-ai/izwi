@@ -2328,6 +2328,7 @@ impl NemotronAsrModel {
             nemo::nemotron_native_artifacts_complete(model_dir, variant),
         );
 
+        network.check_device_decode();
         Ok(Self {
             variant,
             artifacts,
@@ -2596,6 +2597,19 @@ impl NemotronAsrModel {
                 "encoded_frames": artifact.encoded_len,
                 "encoder_batch_rows": artifact.batch_rows,
                 "encoder_graphs": self.network.encoder_graphs_diagnostics(),
+                "cuda_relpos_attention": crate::kernels::relpos_attention::diagnostics(
+                    self.network.device(),
+                ),
+            },
+            "cuda_transducer_decode": {
+                "path": if self.network.device_decode_on() {
+                    "device"
+                } else {
+                    "readback per joint step"
+                },
+                "reason": crate::kernels::transducer_greedy::eager_reason(self.network.device())
+                    .or_else(|| network::NemotronNetwork::dispatch_reason(self.network.device())),
+                "decode_quantum": self.decode_quantum(),
             },
             "prompt": artifact.prompt.diagnostics(),
             "prompt_id": artifact.prompt_id,
