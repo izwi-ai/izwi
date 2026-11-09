@@ -1318,7 +1318,9 @@ impl BiLstm1 {
             .contiguous()?
             .index_select(&rev_idx, 0)?
             .transpose(0, 1)?;
-        Tensor::cat(&[fwd, bwd], 2)
+        // Concatenating the transposed views lays `[B, T, 2H]` out as
+        // `[2H, T, B]`; a CUDA matmul cannot take that once B exceeds one.
+        Tensor::cat(&[fwd, bwd], 2)?.contiguous()
     }
 }
 
@@ -1625,6 +1627,58 @@ mod tests {
             assert_eq!(fused.dims(), reference.dims());
             let diff = max_abs_diff(&host_f32(&fused).unwrap(), &host_f32(&reference).unwrap());
             assert!(diff <= 1e-5, "{input}->{hidden}: max |diff| {diff}");
+        }
+    }
+
+    /// Two or more rows of BiLSTM output feed the duration projection's
+    /// matmul. Concatenating the two directions' transposed views left a
+    /// `[B, T, 2H]` tensor laid out `[2H, T, B]`, which cuBLAS cannot take
+    /// once B exceeds one (Kokoro failed every batched request from 32
+    /// streams on the H100 with "matmul is only supported for contiguous
+    /// tensors"). The CPU's general-stride GEMM accepts that layout, so the
+    /// test checks the layout itself: the output is contiguous at any width.
+    #[test]
+    fn batched_bilstm_output_feeds_a_linear_projection() {
+        use crate::kernels::numeric_check::xorshift_tensor;
+
+        let device = candle_core::Device::Cpu;
+        let (input, hidden, out) = (24usize, 8usize, 5usize);
+        let mut tensors = std::collections::HashMap::new();
+        for (n, suffix) in ["", "_reverse"].into_iter().enumerate() {
+            for (k, (name, shape)) in [
+                ("weight_ih_l0", vec![4 * hidden, input]),
+                ("weight_hh_l0", vec![4 * hidden, hidden]),
+                ("bias_ih_l0", vec![4 * hidden]),
+                ("bias_hh_l0", vec![4 * hidden]),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let seed = 40 + n as u64 * 4 + k as u64;
+                tensors.insert(
+                    format!("{name}{suffix}"),
+                    xorshift_tensor(&shape, seed, 0.3, &device).unwrap(),
+                );
+            }
+        }
+        let lstm = BiLstm1::load(
+            input,
+            hidden,
+            VarBuilder::from_tensors(tensors, DType::F32, &device),
+        )
+        .unwrap();
+        let projection = candle_nn::Linear::new(
+            xorshift_tensor(&[out, 2 * hidden], 51, 0.3, &device).unwrap(),
+            None,
+        );
+        for batch in [1usize, 2, 3] {
+            let x = xorshift_tensor(&[batch, 11, input], 60 + batch as u64, 1.0, &device).unwrap();
+            let y = lstm.forward(&x).unwrap();
+            let logits = projection
+                .forward(&y)
+                .unwrap_or_else(|error| panic!("batch {batch}: {error}"));
+            assert_eq!(logits.dims(), &[batch, 11, out]);
+            assert!(y.is_contiguous(), "batch {batch}: {:?}", y.layout());
         }
     }
 
