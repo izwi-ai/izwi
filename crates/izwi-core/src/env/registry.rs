@@ -848,6 +848,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Forces the Granite Speech dtype (f32, f16, bf16 and aliases; --granite-speech-dtype wins); f32 also disables the Metal F16 encoder and LM paths.",
     ),
     CoreEnvVar::new(
+        "IZWI_GRANITE_SPEECH_ENCODER_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Granite Speech 4.1 runs its conformer encoder over a padded batch, a lone clip included, as a CUDA graph per shape: rows up to 1, 2, 3, 4, 6 or 8 and frames up to whole 200-frame attention blocks, as many as fit 640 MiB of graph working memory (8 rows of 12 s, 2 rows of 32 s), at most 24 graphs kept, least recently used dropped. The fused relative-position attention runs inside the graph when it is on. Each graph is checked bit for bit against the eager layers on its first two batches; a mismatch or CUDA error turns the graphs off for the process. Loads price 768 MiB for them. Any false value encodes every batch eagerly at its unpadded shape; `encoder_graphs` in the load diagnostics reports captures, replays and why the graphs are off.",
+    ),
+    CoreEnvVar::new(
         "IZWI_GRANITE_SPEECH_RETAINED_DECODE",
         Flag,
         "true",

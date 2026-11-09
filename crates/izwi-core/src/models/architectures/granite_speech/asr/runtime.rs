@@ -14,8 +14,11 @@ use crate::backends::kv::{
     submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
     PagedKvDecodeArgs,
 };
-use crate::backends::{parse_dtype_name, DTypeSelection, DeviceProfile, MetalDTypeOverride};
+use crate::backends::{
+    parse_dtype_name, BackendKind, DTypeSelection, DeviceProfile, MetalDTypeOverride,
+};
 use crate::error::{Error, Result};
+use crate::kernels::cuda::shape_graphs::{ShapeGraphLimits, ShapeGraphs};
 use crate::kernels::depthwise_conv::{
     batch_norm_affine, depthwise_conv1d, fold_channel_affine, DepthwiseConv1dSpec,
 };
@@ -838,6 +841,11 @@ impl GraniteSpeechRuntime {
     }
 
     /// The encoder's projection precision, and why.
+    /// The encoder's CUDA graphs: captures, replays and why they are off.
+    pub(crate) fn encoder_graphs_diagnostics(&self) -> serde_json::Value {
+        self.encoder.graphs_diagnostics()
+    }
+
     pub(crate) fn encoder_weight_precision(&self) -> &WeightOnlyF16Load {
         &self.encoder_weight_precision
     }
@@ -909,7 +917,8 @@ impl GraniteSpeechRuntime {
                 "Granite Speech audio embedding batch is empty".into(),
             ));
         }
-        if features.len() == 1 {
+        // With the encoder graphs on, a lone row pads to its graph's shape too.
+        if features.len() == 1 && !self.encoder.graphs_on() {
             return self
                 .audio_embeddings_with_stats(&features[0])
                 .map(|output| vec![output]);
@@ -937,19 +946,27 @@ impl GraniteSpeechRuntime {
             .iter()
             .map(|row| row.encoder_frames)
             .collect::<Vec<_>>();
-        let mut flat = Vec::with_capacity(features.len() * max_frames * dim);
+        // A graph's spare rows are zero features of full length.
+        let (batch_rows, padded_frames) = self.encoder.batch_shape(features.len(), max_frames);
+        let mut flat = Vec::with_capacity(batch_rows * padded_frames * dim);
         for row in features {
             for frame in &row.input_features {
                 flat.extend_from_slice(frame);
             }
-            flat.resize(flat.len() + (max_frames - row.encoder_frames) * dim, 0.0);
+            flat.resize(flat.len() + (padded_frames - row.encoder_frames) * dim, 0.0);
         }
+        flat.resize(batch_rows * padded_frames * dim, 0.0);
+        let mut batch_lengths = valid_lengths.clone();
+        batch_lengths.resize(batch_rows, padded_frames);
         let upload_start = Instant::now();
-        let input = Tensor::from_vec(flat, (features.len(), max_frames, dim), &self.device)?
+        let input = Tensor::from_vec(flat, (batch_rows, padded_frames, dim), &self.device)?
             .to_dtype(self.audio_dtype)?;
         let upload = upload_start.elapsed();
         let encoder_start = Instant::now();
-        let encoded = self.encoder.forward_valid_lengths(&input, &valid_lengths)?;
+        let mut encoded = self.encoder.forward_valid_lengths(&input, &batch_lengths)?;
+        if batch_rows > features.len() {
+            encoded = encoded.narrow(0, 0, features.len())?;
+        }
         let encoder = encoder_start.elapsed();
         let projector_start = Instant::now();
         let embeddings = self
@@ -1493,6 +1510,133 @@ struct GraniteSpeechEncoder {
     out: ProjectionLinear,
     out_mid: ProjectionLinear,
     cat_hidden_layers: Vec<usize>,
+    /// The geometry the graphs' shapes are sized from.
+    config: GraniteSpeechEncoderConfig,
+    /// CUDA graphs of the masked layer stack over a padded batch, one per
+    /// `(rows, frames)` shape ([`granite_encoder_graph_shape`]), or why
+    /// there are none.
+    graphs: std::result::Result<ShapeGraphs<(usize, usize)>, String>,
+}
+
+/// Kill switch for Granite Speech 4.1's encoder CUDA graphs (a boolean; on
+/// when unset). Read by admission pricing and the loader.
+pub(crate) const GRANITE_SPEECH_ENCODER_GRAPHS_ENV: &str = "IZWI_GRANITE_SPEECH_ENCODER_GRAPHS";
+
+fn encoder_graphs_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(GRANITE_SPEECH_ENCODER_GRAPHS_ENV, true));
+    ON.get()
+}
+
+/// Batch widths the encoder graphs are captured at: the CUDA encoder
+/// stage's widths up to 8. A graphed batch pads its rows up to the next.
+const ENCODER_GRAPH_ROWS: [usize; 6] = [1, 2, 3, 4, 6, 8];
+
+const MIB: u64 = 1024 * 1024;
+
+/// What the encoder graphs may hold. The pool bounds a graph's working set
+/// ([`granite_encoder_batch_bytes`], priced at F32, twice a BF16 encoder's):
+/// 8 rows of three attention blocks (12 s) and 2 rows of 32 s fit. The
+/// retained budget holds the kept graphs' input copies and outputs: about
+/// 42 MiB for 8 rows of 12 s at F32.
+const ENCODER_GRAPH_LIMITS: ShapeGraphLimits = ShapeGraphLimits {
+    max_graphs: 24,
+    retained_bytes: 128 * MIB,
+    pool_bytes: 640 * MIB,
+};
+
+/// Device bytes a load on `backend` prices for the encoder graphs, which
+/// allocate lazily on their first batches: zero off CUDA or with the graphs
+/// switched off.
+pub(crate) fn granite_speech_encoder_graph_device_bytes(backend: BackendKind) -> u64 {
+    if backend == BackendKind::Cuda && encoder_graphs_requested() {
+        ENCODER_GRAPH_LIMITS.device_bytes()
+    } else {
+        0
+    }
+}
+
+/// The F32 working set of the masked layer stack over `rows` rows of
+/// `frames` frames: about six `[T, hidden x feed-forward]` activations, the
+/// eager attention's block scores and softmax, its key mask, and the
+/// concatenated output.
+fn granite_encoder_batch_bytes(
+    config: &GraniteSpeechEncoderConfig,
+    rows: usize,
+    frames: usize,
+) -> Option<u64> {
+    const F32: usize = 4;
+    let context = config.context_size.max(1);
+    let blocks = frames.div_ceil(context);
+    let ff = config.hidden_dim.checked_mul(config.feedforward_mult)?;
+    let terms = [
+        6usize
+            .checked_mul(rows)?
+            .checked_mul(frames)?
+            .checked_mul(ff)?,
+        2usize
+            .checked_mul(rows)?
+            .checked_mul(blocks)?
+            .checked_mul(config.num_heads)?
+            .checked_mul(context)?
+            .checked_mul(context)?,
+        rows.checked_mul(blocks)?
+            .checked_mul(context)?
+            .checked_mul(context)?,
+        rows.checked_mul(frames)?
+            .checked_mul(config.hidden_dim)?
+            .checked_mul(config.cat_hidden_layers.len() + 1)?,
+    ];
+    let elements = terms
+        .into_iter()
+        .try_fold(0usize, |total, term| total.checked_add(term))?;
+    u64::try_from(elements.checked_mul(F32)?).ok()
+}
+
+/// The `(rows, frames)` a graph runs a batch of `rows` rows whose longest
+/// has `frames` frames at: rows up to the next graph width, frames up to
+/// whole attention blocks (which the attention pads to anyway). `None` past
+/// 8 rows or past the pool budget.
+pub(crate) fn granite_encoder_graph_shape(
+    config: &GraniteSpeechEncoderConfig,
+    rows: usize,
+    frames: usize,
+) -> Option<(usize, usize)> {
+    let rows = ENCODER_GRAPH_ROWS
+        .into_iter()
+        .find(|width| *width >= rows.max(1))?;
+    let frames = frames.max(1).div_ceil(config.context_size.max(1)) * config.context_size.max(1);
+    let bytes = granite_encoder_batch_bytes(config, rows, frames)?;
+    (bytes <= ENCODER_GRAPH_LIMITS.pool_bytes).then_some((rows, frames))
+}
+
+/// The `(rows, frames)` an encoder batch of `rows` rows padded to `frames`
+/// frames runs at on `backend`: a graph's shape on CUDA with the encoder
+/// graphs on, else as given. Admission prices this shape; the encoder runs
+/// it, or the given one once its graphs are off.
+pub(crate) fn granite_encoder_batch_shape(
+    config: &GraniteSpeechEncoderConfig,
+    rows: usize,
+    frames: usize,
+    backend: BackendKind,
+) -> (usize, usize) {
+    if backend == BackendKind::Cuda && encoder_graphs_requested() {
+        if let Some(shape) = granite_encoder_graph_shape(config, rows, frames) {
+            return shape;
+        }
+    }
+    (rows, frames)
+}
+
+/// The encoder's CUDA graphs on `device`, or why it has none.
+fn resolve_encoder_graphs(
+    device: &Device,
+) -> std::result::Result<ShapeGraphs<(usize, usize)>, String> {
+    if encoder_graphs_requested() {
+        ShapeGraphs::resolve("Granite Speech encoder", device, ENCODER_GRAPH_LIMITS)
+    } else {
+        Err(format!("{GRANITE_SPEECH_ENCODER_GRAPHS_ENV} is off"))
+    }
 }
 
 /// A linear layer read from `vb`, held dense or, with `f16` set, as
@@ -1559,6 +1703,8 @@ impl GraniteSpeechEncoder {
             out,
             out_mid,
             cat_hidden_layers: config.cat_hidden_layers.clone(),
+            config: config.clone(),
+            graphs: resolve_encoder_graphs(vb.device()),
         })
     }
 
@@ -1605,7 +1751,69 @@ impl GraniteSpeechEncoder {
         let (batch, sequence, _) = input.dims3()?;
         validate_frame_lengths(batch, sequence, valid_lengths)?;
         let masks = self.masks(valid_lengths, sequence, input.device(), input.dtype())?;
-        self.forward_masked(input, &masks)
+        let graphs = match &self.graphs {
+            Ok(graphs)
+                if granite_encoder_graph_shape(&self.config, batch, sequence)
+                    == Some((batch, sequence)) =>
+            {
+                graphs
+            }
+            _ => return self.forward_masked(input, &masks),
+        };
+        // The graph keeps a stable copy of each input and an output of the
+        // concatenated width.
+        let mut inputs = vec![input.clone(), masks.frames];
+        inputs.extend(masks.key_lengths);
+        inputs.extend(masks.key_mask);
+        let tensor_bytes = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+        let width = self.config.hidden_dim * (self.cat_hidden_layers.len() + 1);
+        let retained = inputs.iter().map(tensor_bytes).sum::<u64>()
+            + (batch * sequence * width * input.dtype().size_in_bytes()) as u64;
+        let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+            let [input, frames, keys] = inputs else {
+                return Err(Error::InferenceError(format!(
+                    "Granite Speech encoder graph received {} inputs, expected 3",
+                    inputs.len()
+                )));
+            };
+            let fused = keys.dtype() == DType::U32;
+            let masks = GraniteEncoderMasks {
+                frames: frames.clone(),
+                key_lengths: fused.then(|| keys.clone()),
+                key_mask: (!fused).then(|| keys.clone()),
+            };
+            Ok(vec![self.forward_masked(input, &masks)?])
+        };
+        graphs
+            .run((batch, sequence), retained, &inputs, &body)?
+            .pop()
+            .ok_or_else(|| {
+                Error::InferenceError("Granite Speech encoder graph returned nothing".into())
+            })
+    }
+
+    /// Whether padded batches run through the CUDA graphs: on CUDA with the
+    /// graphs switched on and no graph failure yet.
+    fn graphs_on(&self) -> bool {
+        self.graphs.as_ref().is_ok_and(ShapeGraphs::is_on)
+    }
+
+    /// The `(rows, frames)` a batch of `rows` rows whose longest has
+    /// `frames` frames runs at: its graph's shape while the graphs are on
+    /// (at most what admission priced), else as given.
+    fn batch_shape(&self, rows: usize, frames: usize) -> (usize, usize) {
+        if self.graphs_on() {
+            granite_encoder_graph_shape(&self.config, rows, frames).unwrap_or((rows, frames))
+        } else {
+            (rows, frames)
+        }
+    }
+
+    fn graphs_diagnostics(&self) -> serde_json::Value {
+        match &self.graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        }
     }
 
     /// The masks of a padded batch whose row `b` holds `valid_lengths[b]`
@@ -4622,6 +4830,204 @@ mod tests {
             .unwrap();
         assert_tensor_close(&scalar_projected_a, &projected[0]);
         assert_tensor_close(&scalar_projected_b, &projected[1]);
+    }
+
+    /// A batch padded to an encoder graph's shape (a spare zero row of full
+    /// length, frames to whole attention blocks) encodes its real rows as
+    /// the unpadded batch does.
+    #[test]
+    fn graph_padded_encoder_batches_encode_their_real_rows_unchanged() {
+        let device = Device::Cpu;
+        let config = tiny_audio_config();
+        let vars = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vars, DType::F32, &device);
+        let encoder =
+            GraniteSpeechEncoder::load(&config.encoder_config, vb.pp("encoder"), None).unwrap();
+        let values = |seed: f32, len: usize| {
+            (0..len)
+                .map(|i| ((i as f32 + seed) * 0.37).sin())
+                .collect::<Vec<_>>()
+        };
+        let lengths = [3usize, 5];
+        let rows = lengths
+            .iter()
+            .enumerate()
+            .map(|(row, len)| {
+                Tensor::from_vec(values(row as f32, len * 2), (1, *len, 2), &device)
+                    .unwrap()
+                    .pad_with_zeros(1, 0, 5 - len)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input = Tensor::cat(&rows, 0).unwrap();
+        let eager = encoder.forward_valid_lengths(&input, &lengths).unwrap();
+        let (batch_rows, frames) =
+            granite_encoder_graph_shape(&config.encoder_config, 2, 5).unwrap();
+        assert_eq!(batch_rows, 2);
+        assert!(frames >= 5 && frames % config.encoder_config.context_size == 0);
+        // One spare row as well, as a three-row step would pad.
+        let padded = input
+            .pad_with_zeros(1, 0, frames - 5)
+            .unwrap()
+            .pad_with_zeros(0, 0, 1)
+            .unwrap();
+        let graphed = encoder
+            .forward_valid_lengths(&padded, &[3, 5, frames])
+            .unwrap();
+        for (row, len) in lengths.iter().enumerate() {
+            assert_tensor_close(
+                &eager.i(row).unwrap().narrow(0, 0, *len).unwrap(),
+                &graphed.i(row).unwrap().narrow(0, 0, *len).unwrap(),
+            );
+        }
+        assert!(graphed
+            .i(2)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|value| value.is_finite()));
+    }
+
+    /// On CUDA the encoder graphs return the eager masked stack bit for bit
+    /// through capture, verification and replay, over fresh inputs.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_encoder_graphs_match_the_eager_masked_stack() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let config = tiny_audio_config();
+        let vars = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vars, DType::F32, &device);
+        let mut encoder =
+            GraniteSpeechEncoder::load(&config.encoder_config, vb.pp("encoder"), None).unwrap();
+        encoder.graphs = ShapeGraphs::resolve("test", &device, ENCODER_GRAPH_LIMITS);
+        let (rows, frames) = granite_encoder_graph_shape(&config.encoder_config, 2, 5).unwrap();
+        let lengths = [3usize, frames];
+        let bits = |t: &Tensor| {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        for step in 0..4 {
+            let values = (0..rows * frames * 2)
+                .map(|i| ((i + 7 * step) as f32 * 0.31).sin())
+                .collect::<Vec<_>>();
+            let input = Tensor::from_vec(values, (rows, frames, 2), &device).unwrap();
+            let masks = encoder
+                .masks(&lengths, frames, &device, DType::F32)
+                .unwrap();
+            let expected = encoder.forward_masked(&input, &masks).unwrap();
+            let out = encoder.forward_valid_lengths(&input, &lengths).unwrap();
+            assert_eq!(bits(&out), bits(&expected), "step {step}");
+        }
+        let diagnostics = encoder.graphs_diagnostics();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        assert_eq!(diagnostics["captures"], 1, "{diagnostics}");
+        assert_eq!(diagnostics["replays"], 2, "{diagnostics}");
+    }
+
+    /// The 2B Plus encoder's geometry.
+    fn plus_encoder_config() -> GraniteSpeechEncoderConfig {
+        GraniteSpeechEncoderConfig {
+            cat_hidden_layers: vec![3],
+            context_size: 200,
+            conv_expansion_factor: 2,
+            conv_kernel_size: 15,
+            dim_head: 128,
+            dropout: 0.0,
+            feedforward_mult: 4,
+            hidden_dim: 1024,
+            input_dim: 160,
+            max_pos_emb: 512,
+            model_type: None,
+            num_heads: 8,
+            num_layers: 16,
+            output_dim: 348,
+        }
+    }
+
+    #[test]
+    fn encoder_graph_shapes_pad_rows_to_a_width_and_frames_to_whole_blocks() {
+        let config = plus_encoder_config();
+        assert_eq!(config.context_size, 200);
+        assert_eq!(granite_encoder_graph_shape(&config, 1, 500), Some((1, 600)));
+        assert_eq!(granite_encoder_graph_shape(&config, 5, 300), Some((6, 400)));
+        assert_eq!(granite_encoder_graph_shape(&config, 7, 600), Some((8, 600)));
+        assert_eq!(
+            granite_encoder_graph_shape(&config, 2, 1600),
+            Some((2, 1600))
+        );
+        assert_eq!(
+            granite_encoder_graph_shape(&config, 9, 100),
+            None,
+            "past 8 rows"
+        );
+        assert_eq!(
+            granite_encoder_graph_shape(&config, 8, 1600),
+            None,
+            "past the pool"
+        );
+        for rows in ENCODER_GRAPH_ROWS {
+            for blocks in 1..=16 {
+                let Some(shape) = granite_encoder_graph_shape(&config, rows, blocks * 200) else {
+                    continue;
+                };
+                assert_eq!(shape, (rows, blocks * 200), "a graph's shape is its own");
+                let bytes = granite_encoder_batch_bytes(&config, rows, blocks * 200).unwrap();
+                assert!(bytes <= ENCODER_GRAPH_LIMITS.pool_bytes);
+            }
+        }
+    }
+
+    /// Admission prices the graphed shape on CUDA only; the graphs' own
+    /// memory is a CUDA load's; the kill switch turns both off and the
+    /// loader names it.
+    #[test]
+    fn encoder_graphs_price_and_resolve_on_cuda_only() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let config = plus_encoder_config();
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            assert_eq!(granite_speech_encoder_graph_device_bytes(backend), 0);
+            assert_eq!(
+                granite_encoder_batch_shape(&config, 5, 300, backend),
+                (5, 300)
+            );
+        }
+        assert!(resolve_encoder_graphs(&Device::Cpu).is_err());
+        if encoder_graphs_requested() {
+            assert_eq!(
+                granite_speech_encoder_graph_device_bytes(BackendKind::Cuda),
+                768 << 20
+            );
+            assert_eq!(
+                granite_encoder_batch_shape(&config, 5, 300, BackendKind::Cuda),
+                (6, 400)
+            );
+        }
+        let previous = std::env::var_os(GRANITE_SPEECH_ENCODER_GRAPHS_ENV);
+        std::env::set_var(GRANITE_SPEECH_ENCODER_GRAPHS_ENV, "0");
+        let bytes = granite_speech_encoder_graph_device_bytes(BackendKind::Cuda);
+        let shape = granite_encoder_batch_shape(&config, 5, 300, BackendKind::Cuda);
+        let reason = resolve_encoder_graphs(&Device::Cpu).err();
+        std::env::remove_var(GRANITE_SPEECH_ENCODER_GRAPHS_ENV);
+        if let Some(previous) = previous {
+            std::env::set_var(GRANITE_SPEECH_ENCODER_GRAPHS_ENV, previous);
+        }
+        assert_eq!(bytes, 0);
+        assert_eq!(shape, (5, 300));
+        assert!(reason
+            .expect("off")
+            .contains(GRANITE_SPEECH_ENCODER_GRAPHS_ENV));
     }
 
     #[test]

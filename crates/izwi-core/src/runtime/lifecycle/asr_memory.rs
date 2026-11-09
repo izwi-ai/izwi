@@ -76,6 +76,7 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::granite_speech::asr::{
     ensure_granite_speech_artifacts, granite_load_representation,
+    granite_speech_encoder_graph_device_bytes,
     granite_tensor_is_f16_encoder_projection, resolve_granite_encoder_projection_precision,
     select_granite_speech_dtype, GraniteLoadRepresentation, GraniteSpeechConfig,
 };
@@ -254,13 +255,18 @@ pub(super) fn residency_plan(
         }
         // Plus and base share the loader; the census carries their differences
         // (base: no layer-3 concatenation in the projector, an untied LM head).
-        _ if variant.family() == ModelFamily::GraniteSpeechAsr => granite_plan(
-            model_path,
-            device,
-            backend,
-            granite.speech_dtype.as_deref(),
-            Precision::Selected,
-        ),
+        _ if variant.family() == ModelFamily::GraniteSpeechAsr => {
+            // The encoder's CUDA graphs allocate their memory on first use.
+            let graphs = granite_speech_encoder_graph_device_bytes(backend);
+            granite_plan(
+                model_path,
+                device,
+                backend,
+                granite.speech_dtype.as_deref(),
+                Precision::Selected,
+            )
+            .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
+        }
         _ if variant.family() == ModelFamily::GraniteSpeech5Asr => {
             granite_speech5_plan(variant, model_path, device, backend, Precision::Selected)
         }

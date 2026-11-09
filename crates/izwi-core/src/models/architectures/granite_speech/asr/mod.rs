@@ -56,13 +56,16 @@ pub use prompt::{
     GRANITE_SPEECH_SPEAKER_INSTRUCTION, GRANITE_SPEECH_SYSTEM_PROMPT,
     GRANITE_SPEECH_TIMESTAMP_INSTRUCTION,
 };
+pub(crate) use runtime::{
+    granite_load_representation, granite_speech_encoder_graph_device_bytes,
+    GraniteLoadRepresentation,
+};
 pub use runtime::{
     GraniteSpeechAttentionDecodeProfile, GraniteSpeechAudioEmbeddingStats,
     GraniteSpeechDecodeLoopProfile, GraniteSpeechDecodeProfile, GraniteSpeechForwardProfile,
     GraniteSpeechGeneration, GraniteSpeechGenerationStats, GraniteSpeechGenerationTimings,
     GraniteSpeechLayerDecodeProfile, GraniteSpeechMlpDecodeProfile, GraniteSpeechRuntime,
 };
-pub(crate) use runtime::{granite_load_representation, GraniteLoadRepresentation};
 pub use transcript::{
     parse_granite_speech_output, GraniteSpeechParsedTranscript, GraniteSpeechSegment,
     GraniteSpeechTimestampWord,
@@ -877,8 +880,14 @@ impl GraniteSpeechAsrModel {
         }
         let padded_audio_samples_per_row =
             rows.iter().map(|row| row.audio_samples).max().unwrap_or(0);
-        let padded_encoder_frames_per_row =
-            rows.iter().map(|row| row.encoder_frames).max().unwrap_or(0);
+        // On CUDA a batch runs at its encoder graph's padded shape; each real
+        // row carries its share of the spare rows.
+        let (batch_rows, padded_encoder_frames_per_row) = runtime::granite_encoder_batch_shape(
+            &self.config.encoder_config,
+            rows.len(),
+            rows.iter().map(|row| row.encoder_frames).max().unwrap_or(0),
+            crate::backends::BackendKind::from(self.device.kind),
+        );
         let encoder_dim = rows[0].encoder_dim;
         let max_prompt_tokens = rows.iter().map(|row| row.prompt_tokens).max().unwrap_or(0);
         if padded_audio_samples_per_row == 0
@@ -904,11 +913,15 @@ impl GraniteSpeechAsrModel {
             input_elements.checked_add(prompt_elements).ok_or_else(|| {
                 Error::Overloaded("Granite Speech batch materialization overflow".into())
             })?;
-        let workspace_per_row_bytes = self.preparation_workspace_bytes(
-            padded_encoder_frames_per_row,
-            encoder_dim,
-            max_prompt_tokens,
-        )?;
+        let workspace_per_row_bytes = self
+            .preparation_workspace_bytes(
+                padded_encoder_frames_per_row,
+                encoder_dim,
+                max_prompt_tokens,
+            )?
+            .checked_mul(batch_rows as u64)
+            .ok_or_else(|| Error::Overloaded("Granite Speech batch workspace overflow".into()))?
+            .div_ceil(rows.len() as u64);
         let max_workspace_bytes = workspace_per_row_bytes
             .checked_mul(
                 u64::try_from(rows.len()).map_err(|_| {
@@ -1711,6 +1724,7 @@ impl GraniteSpeechAsrModel {
             "audio_token_index": self.config.audio_token_index,
             "dtype": format!("{:?}", self.dtype),
             "device_kind": format!("{:?}", self.device.kind),
+            "encoder_graphs": self.runtime.encoder_graphs_diagnostics(),
             "sample_rate": self.processor.sample_rate(),
             "n_mels": self.processor.audio_processor.melspec_kwargs.n_mels,
             "projector_downsample_rate": self.processor.audio_processor.projector_downsample_rate,
