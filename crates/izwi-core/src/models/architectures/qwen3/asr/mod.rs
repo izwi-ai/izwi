@@ -3798,8 +3798,10 @@ fn qwen3_asr_weight_precisions(
             }
         }
         _ => DTypeSelection {
-            dtype: qwen3_asr_default_audio_dtype(is_gguf, text_dtype),
-            reason: if is_gguf {
+            dtype: qwen3_asr_default_audio_dtype(device.kind, is_gguf, text_dtype),
+            reason: if is_gguf && device.kind.is_cuda() {
+                "CUDA runs the audio tower at F32: a BF16 tower's output depended on its batch".into()
+            } else if is_gguf {
                 "the GGUF audio tower runs at the text dtype; it falls back to F32 alone if its probe fails".into()
             } else {
                 format!("{:?} default audio dtype", device.kind).into()
@@ -3880,13 +3882,16 @@ fn qwen3_asr_text_self_check(model: &Qwen3Model) -> NumericSelfCheckReport {
     })
 }
 
-/// The GGUF audio tower runs at the text activation dtype on every backend
-/// (BF16 on CUDA, where an F32 tower also left FlashAttention-2's varlen
-/// kernel unused and ran its attention windows one by one); a load-time probe
-/// on Metal and CUDA reloads it alone at F32 if it fails. Safetensors towers
-/// stay F32.
-fn qwen3_asr_default_audio_dtype(is_gguf: bool, text_dtype: DType) -> DType {
-    if is_gguf {
+/// The audio tower's default dtype on `kind`. CUDA runs it at F32: on the
+/// H100 the BF16 tower (the GGUF text dtype there) made a row's transcript
+/// depend on the clips batched with it, with word-level changes at 16 and
+/// 32 streams, and F32 was faster too (Qwen3-ASR 0.6B, 32 streams: 220
+/// against 204 audio-s/s, every point normalized-equal to solo). Elsewhere
+/// a GGUF tower runs at the text activation dtype, behind the Metal load-time
+/// probe that reloads it alone at F32 if it fails; safetensors towers stay
+/// F32.
+fn qwen3_asr_default_audio_dtype(kind: DeviceKind, is_gguf: bool, text_dtype: DType) -> DType {
+    if is_gguf && !kind.is_cuda() {
         text_dtype
     } else {
         DType::F32
@@ -6063,25 +6068,31 @@ mod tests {
         };
         let (text, audio) = precisions(true);
         assert_eq!(text.dtype, DType::BF16);
-        assert_eq!(audio.dtype, DType::BF16);
-        assert!(audio.reason.contains("probe"), "{}", audio.reason);
+        assert_eq!(audio.dtype, DType::F32);
+        assert!(audio.reason.contains("batch"), "{}", audio.reason);
         assert!(qwen3_asr_audio_probe(DeviceKind::Cuda));
         assert_eq!(
-            qwen3_asr_default_audio_dtype(false, DType::BF16),
+            qwen3_asr_default_audio_dtype(DeviceKind::Cuda, false, DType::BF16),
             DType::F32
         );
 
-        std::env::set_var("IZWI_QWEN_ASR_AUDIO_DTYPE", "f32");
+        std::env::set_var("IZWI_QWEN_ASR_AUDIO_DTYPE", "bf16");
         let (_, pinned) = precisions(true);
         std::env::remove_var("IZWI_QWEN_ASR_AUDIO_DTYPE");
-        assert_eq!(pinned.dtype, DType::F32);
+        assert_eq!(pinned.dtype, DType::BF16);
         assert!(pinned.reason.contains("override"), "{}", pinned.reason);
     }
 
     #[test]
     fn qwen_asr_non_cuda_gguf_audio_policy_is_unchanged() {
-        assert_eq!(qwen3_asr_default_audio_dtype(true, DType::F16), DType::F16);
-        assert_eq!(qwen3_asr_default_audio_dtype(true, DType::F32), DType::F32);
+        assert_eq!(
+            qwen3_asr_default_audio_dtype(DeviceKind::Metal, true, DType::F16),
+            DType::F16
+        );
+        assert_eq!(
+            qwen3_asr_default_audio_dtype(DeviceKind::Cpu, true, DType::F32),
+            DType::F32
+        );
         assert!(qwen3_asr_audio_probe(DeviceKind::Metal));
         assert!(!qwen3_asr_audio_probe(DeviceKind::Cpu));
     }
