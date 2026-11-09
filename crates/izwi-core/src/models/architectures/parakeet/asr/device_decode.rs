@@ -33,7 +33,7 @@ use crate::kernels::transducer_greedy::{
 };
 
 /// Joint steps per device dispatch.
-pub(super) const DEVICE_DECODE_STEPS: usize = 16;
+pub(super) const DEVICE_DECODE_STEPS: usize = transducer_greedy::DEVICE_DISPATCH_STEPS;
 
 /// Whether dispatches run the select step on the host instead of the
 /// device: the CPU tests of the dispatch's tensor work.
@@ -63,6 +63,17 @@ impl ParakeetAsrModel {
     pub(super) fn device_decode_on(&self) -> bool {
         let device = self.network.predictor.embed.device();
         host_select() || (device.is_cuda() && transducer_greedy::eager_reason(device).is_none())
+    }
+
+    /// Tokens per row and engine step the retained decode asks the
+    /// scheduler for: the device decode quantum while the dispatches run,
+    /// else one (the eager step emits at most one).
+    pub(crate) fn decode_quantum(&self) -> usize {
+        if self.device_decode_on() {
+            transducer_greedy::device_decode_quantum()
+        } else {
+            1
+        }
     }
 
     /// [`ParakeetAsrModel::retained_decode_step_batch`] through dispatches of

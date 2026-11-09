@@ -3151,6 +3151,17 @@ impl NativeAsrModel {
         }
     }
 
+    /// Tokens per row and engine step a transducer's retained decode asks
+    /// the scheduler for (Parakeet and Nemotron ASR on CUDA with their
+    /// device dispatches); one for every other model.
+    pub(crate) fn transducer_decode_quantum(&self) -> usize {
+        match self {
+            Self::Parakeet(model) => model.decode_quantum(),
+            Self::Nemotron(model) => model.decode_quantum(),
+            _ => 1,
+        }
+    }
+
     /// The loaded Nemotron 3.5 Transcribe model.
     pub(crate) fn nemotron_transcribe(
         &self,

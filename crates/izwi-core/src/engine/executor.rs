@@ -3039,6 +3039,16 @@ fn mixed_force_split() -> bool {
     FORCE_SPLIT.get()
 }
 
+/// A transducer's decode quantum in the scheduling profile: above one, the
+/// rows keep it in continuous batches beyond their soft deadline.
+fn apply_transducer_decode_quantum(profile: &mut ExecutionProfile, quantum: usize) {
+    if quantum > 1 {
+        profile.preferred_decode_tokens = quantum;
+        profile.sustained_decode_quantum = true;
+        profile.speculative_decode_batch = true;
+    }
+}
+
 fn is_isolated_continuous_model_quantum(scheduled: &[ScheduledRequest]) -> bool {
     scheduled.len() == 1 && !scheduled[0].is_prefill && scheduled[0].num_tokens > 1
 }
@@ -3732,6 +3742,21 @@ impl ModelExecutor for NativeExecutor {
                 profile.sustained_decode_quantum = true;
                 profile.speculative_decode_batch = true;
             }
+        }
+        // Parakeet and Nemotron ASR decode several tokens per row and step
+        // while their device dispatches run (CUDA), rows batched, while
+        // nothing waits; the scheduler's fairness gates drop to one token
+        // as soon as a request waits.
+        if matches!(
+            variant.family(),
+            crate::catalog::ModelFamily::ParakeetAsr | crate::catalog::ModelFamily::NemotronAsr
+        ) {
+            let quantum = request
+                .prepared_asr_model_lease_for_executor()
+                .ok()
+                .flatten()
+                .map_or(1, |lease| lease.model_arc().transducer_decode_quantum());
+            apply_transducer_decode_quantum(&mut profile, quantum);
         }
         // DS1.2b: hybrid contracts that declare committed-snapshot sharing get
         // their first prefill chunk aligned to the declared interval by the
@@ -6252,6 +6277,23 @@ mod tests {
             scheduled(1, false),
             scheduled(1, false),
         ]));
+    }
+
+    /// A transducer's decode quantum above one asks for sustained, batched
+    /// quanta; one leaves the scalar profile.
+    #[test]
+    fn transducer_quantum_profiles_batched_quanta() {
+        let mut profile = ExecutionProfile::fail_closed(
+            crate::backends::BackendKind::Cuda,
+            None,
+            ExecutionMode::Sequence,
+        );
+        apply_transducer_decode_quantum(&mut profile, 1);
+        assert_eq!(profile.preferred_decode_tokens, 1);
+        assert!(!profile.sustained_decode_quantum && !profile.speculative_decode_batch);
+        apply_transducer_decode_quantum(&mut profile, 8);
+        assert_eq!(profile.preferred_decode_tokens, 8);
+        assert!(profile.sustained_decode_quantum && profile.speculative_decode_batch);
     }
 
     fn native_route_fixture(

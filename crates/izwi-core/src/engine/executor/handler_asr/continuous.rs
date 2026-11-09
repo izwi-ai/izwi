@@ -4,17 +4,30 @@
 
 use super::*;
 
-pub(super) fn validate_continuous_asr_batch_shape(scheduled: &[ScheduledRequest]) -> Result<()> {
+/// A continuous ASR batch is decode rows of one token each, or for the
+/// transducer families (`quanta`: Parakeet and Nemotron ASR, whose retained
+/// steps emit up to a row's scheduled tokens) of at least one.
+pub(super) fn validate_continuous_asr_batch_shape(
+    scheduled: &[ScheduledRequest],
+    quanta: bool,
+) -> Result<()> {
     if scheduled.is_empty()
-        || scheduled
-            .iter()
-            .any(|scheduled| scheduled.is_prefill || scheduled.num_tokens != 1)
+        || scheduled.iter().any(|scheduled| {
+            scheduled.is_prefill
+                || scheduled.num_tokens == 0
+                || (!quanta && scheduled.num_tokens != 1)
+        })
     {
         return Err(Error::InvalidInput(
             "continuous ASR execution requires one decode token per row".to_string(),
         ));
     }
     Ok(())
+}
+
+/// Whether a continuous ASR batch's family takes several tokens per row.
+fn decodes_transducer_quanta(family: ModelFamily) -> bool {
+    matches!(family, ModelFamily::ParakeetAsr | ModelFamily::NemotronAsr)
 }
 
 pub(super) struct ContinuousAsrStateBatch<'a> {
@@ -112,7 +125,16 @@ impl NativeExecutor {
         scheduled: &[ScheduledRequest],
         managed_caches: Vec<Option<super::super::RetainedRowManagedState>>,
     ) -> Result<Vec<ModelSessionResult>> {
-        validate_continuous_asr_batch_shape(scheduled)?;
+        let quanta = scheduled
+            .first()
+            .and_then(|first| {
+                requests
+                    .iter()
+                    .find(|request| request.id == first.request_id)
+            })
+            .and_then(|request| Self::resolve_variant(request).ok())
+            .is_some_and(|variant| decodes_transducer_quanta(variant.family()));
+        validate_continuous_asr_batch_shape(scheduled, quanta)?;
         if managed_caches.len() != scheduled.len() {
             return Err(Error::InvalidInput(
                 "continuous ASR managed-cache rows do not match batch width".to_string(),

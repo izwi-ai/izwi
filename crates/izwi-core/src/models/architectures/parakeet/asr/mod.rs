@@ -4698,6 +4698,121 @@ mod tests {
         }
     }
 
+    /// Drives a retained cohort as the engine's handler does, at `quota`
+    /// tokens per row and step: each step's new tokens (at most the quota),
+    /// its delta appended to the row's stream (which must equal the step's
+    /// text), and, at `cancel = (row, step)`, that row restored from its
+    /// checkpoint as the handler's rollback restores a cancelled row (it must
+    /// equal the checkpoint; the row then leaves the cohort). Each row's
+    /// tokens, streamed text, final text and word timestamps.
+    fn run_like_the_handler(
+        model: &ParakeetAsrModel,
+        artifacts: &[ParakeetPreparedEncoderArtifact],
+        max_tokens: &[usize],
+        quota: usize,
+        cancel: Option<(usize, usize)>,
+    ) -> Vec<(Vec<usize>, String, String, serde_json::Value)> {
+        let mut states = artifacts
+            .iter()
+            .map(|_| model.start_retained_decode().unwrap())
+            .collect::<Vec<_>>();
+        let mut streamed = vec![String::new(); artifacts.len()];
+        let mut gone = vec![false; artifacts.len()];
+        for step in 0..10_000 {
+            let live = (0..states.len())
+                .filter(|row| !states[*row].finished && !gone[*row])
+                .collect::<Vec<_>>();
+            if live.is_empty() {
+                break;
+            }
+            let checkpoints = live
+                .iter()
+                .map(|row| states[*row].clone())
+                .collect::<Vec<_>>();
+            let before = live
+                .iter()
+                .map(|row| states[*row].token_ids.len())
+                .collect::<Vec<_>>();
+            let mut rows = states
+                .iter_mut()
+                .enumerate()
+                .filter(|(row, _)| live.contains(row))
+                .map(|(row, state)| ParakeetRetainedDecodeBatchRow {
+                    artifact: &artifacts[row],
+                    state,
+                    max_tokens: max_tokens[row],
+                    quota,
+                })
+                .collect::<Vec<_>>();
+            let steps = model.retained_decode_step_batch(&mut rows).unwrap();
+            drop(rows);
+            for (((row, step_out), before), checkpoint) in
+                live.iter().zip(steps).zip(before).zip(checkpoints)
+            {
+                if cancel == Some((*row, step)) {
+                    states[*row] = checkpoint.clone();
+                    assert_eq!(states[*row].token_ids, checkpoint.token_ids);
+                    assert_eq!(states[*row].cursor, checkpoint.cursor);
+                    gone[*row] = true;
+                    continue;
+                }
+                assert!(step_out.tokens_generated <= before + quota);
+                assert_eq!(step_out.tokens_generated, states[*row].token_ids.len());
+                streamed[*row].push_str(&step_out.delta);
+                assert_eq!(step_out.text, streamed[*row]);
+            }
+        }
+        states
+            .iter()
+            .zip(artifacts)
+            .zip(streamed)
+            .map(|((state, artifact), streamed)| {
+                let output = model.retained_decode_output(artifact, state);
+                let words = output.diagnostics.unwrap()["timestamp_words"].clone();
+                (state.token_ids.clone(), streamed, output.text, words)
+            })
+            .collect()
+    }
+
+    /// The engine contract of several tokens per row and step: a cohort at a
+    /// quota of four (the device dispatches, select step on the host)
+    /// decodes the same tokens, streamed text, final text and word
+    /// timestamps as at one token per step (the eager step); a row whose
+    /// budget ends mid-quota finishes there; and a row cancelled mid-quota
+    /// is restored to its checkpoint without changing the other rows.
+    #[test]
+    fn quanta_keep_tokens_text_and_timestamps() {
+        let device = Device::Cpu;
+        let model = random_decoder_model(&device, 0xDEC0_DE01);
+        let mut rng = XorShift(0xA77_1FAC7);
+        let artifacts = [12usize, 40, 6]
+            .map(|len| {
+                let mut artifact = zero_artifact(&device, len);
+                let values = rng.values(len * TINY.dim, 2.0, 0.0);
+                artifact.encoded = Tensor::from_vec(values, (1, len, TINY.dim), &device).unwrap();
+                artifact
+            })
+            .to_vec();
+        let max_tokens = [1_000, 5, 1_000];
+        let one = run_like_the_handler(&model, &artifacts, &max_tokens, 1, None);
+        assert_eq!(one[1].0.len(), 5, "the budget ends the second row");
+        let lengths = one.iter().map(|row| row.0.len()).collect::<Vec<_>>();
+        assert!(lengths.iter().sum::<usize>() > 8, "{lengths:?}");
+        // Cancel the first row with more than one quantum of tokens.
+        let row = (0..one.len()).find(|row| one[*row].0.len() > 4).unwrap();
+        DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(true));
+        let four = run_like_the_handler(&model, &artifacts, &max_tokens, 4, None);
+        let cancelled = run_like_the_handler(&model, &artifacts, &max_tokens, 4, Some((row, 1)));
+        DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(false));
+        assert_eq!(one, four);
+        // The cancelled row keeps its first step's tokens; the others are
+        // as before.
+        for other in (0..one.len()).filter(|other| *other != row) {
+            assert_eq!(cancelled[other], four[other], "row {other}");
+        }
+        assert!(cancelled[row].0.len() <= 4 && four[row].0.starts_with(&cancelled[row].0));
+    }
+
     #[test]
     fn parakeet_encoded_len_follows_front_end_geometry() {
         // test.wav: 3.6 s -> 360 valid feature frames -> 45 encoder frames.

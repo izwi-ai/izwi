@@ -2559,6 +2559,17 @@ impl NemotronAsrModel {
 
     /// One scheduler step of retained decodes; see
     /// [`retained_decode_step_rows`].
+    /// Tokens per row and engine step the retained decode asks the
+    /// scheduler for: the device decode quantum while its dispatches run
+    /// (CUDA), else one (the eager step emits at most one).
+    pub(crate) fn decode_quantum(&self) -> usize {
+        if self.network.device_decode_on() {
+            crate::kernels::transducer_greedy::device_decode_quantum()
+        } else {
+            1
+        }
+    }
+
     pub(crate) fn retained_decode_step_batch(
         &self,
         rows: &mut [NemotronRetainedDecodeBatchRow<'_>],

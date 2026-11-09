@@ -331,6 +331,27 @@ pub fn select_step_reference(buffers: SelectBuffers<'_>, rules: SelectRules) {
 /// read once per process.
 pub const CUDA_TRANSDUCER_DECODE_ENV: &str = "IZWI_CUDA_TRANSDUCER_DECODE";
 
+/// The decode quantum (tokens per row and engine step) of the device
+/// decode loops: any positive integer, capped at 16 (a dispatch's joint
+/// steps); 8 unset.
+pub const CUDA_TRANSDUCER_QUANTUM_ENV: &str = "IZWI_CUDA_TRANSDUCER_QUANTUM";
+
+/// Joint steps per device dispatch, and the largest decode quantum.
+pub const DEVICE_DISPATCH_STEPS: usize = 16;
+
+/// The decode quantum a device decode loop asks the scheduler for
+/// ([`CUDA_TRANSDUCER_QUANTUM_ENV`]), read once.
+pub fn device_decode_quantum() -> usize {
+    static QUANTUM: crate::env::ReadOnce<usize> = crate::env::ReadOnce::new(|| {
+        crate::env::value(CUDA_TRANSDUCER_QUANTUM_ENV)
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|quantum| *quantum > 0)
+            .unwrap_or(8)
+            .min(DEVICE_DISPATCH_STEPS)
+    });
+    QUANTUM.get()
+}
+
 /// The select step's device buffers: `state` `[B, STATE_FIELDS]`, `limits`
 /// `[B, LIMIT_FIELDS]`, `emits` `[B, max_emits, 3]`, `labels`, `mask` and
 /// `gather` `[B]`, all U32, contiguous, owned by the caller's dispatch: the

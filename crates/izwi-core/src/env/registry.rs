@@ -385,6 +385,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "On CUDA, runs the greedy TDT (Parakeet) and RNNT (Nemotron ASR) decodes of the retained routes many joint steps per readback: a kernel applies each row's picks and transition on the device and the joint and predictor run for every row with the non-emitting rows' state kept, after a per-device self-check of that kernel against its host reference (bit-exact, off for the device on any difference). Any false value keeps one readback per joint step.",
     ),
     CoreEnvVar::new(
+        "IZWI_CUDA_TRANSDUCER_QUANTUM",
+        Int,
+        "8",
+        Once,
+        "Tokens per row and engine step that Parakeet and Nemotron ASR ask the scheduler for while their CUDA device decode loops run (IZWI_CUDA_TRANSDUCER_DECODE): a positive integer, capped at 16, the joint steps of one dispatch. The scheduler grants fewer at a request's token budget and one while other work waits. 1 keeps one token per step. CPU and Metal always take one.",
+    ),
+    CoreEnvVar::new(
         "IZWI_DIARIZATION_CAPACITY_WAIT_SECS",
         Duration,
         "120",

@@ -4086,7 +4086,7 @@ fn fused_attention_on_the_host() -> bool {
 }
 
 /// Joint steps per device dispatch of the retained RNNT decode.
-pub(super) const DEVICE_DECODE_STEPS: usize = 16;
+pub(super) const DEVICE_DECODE_STEPS: usize = transducer_greedy::DEVICE_DISPATCH_STEPS;
 
 /// Whether RNNT dispatches run the select step on the host instead of the
 /// device: the CPU tests of the dispatch's tensor work.
