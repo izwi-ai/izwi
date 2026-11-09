@@ -63,6 +63,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_CUDA_RUNTIME_BINARY` | path | unset (search next to the executable and lib/izwi/runtime/cuda) | startup | Path to the private CUDA runtime binary, tried first before the built-in search locations. |
 | `IZWI_CUDA_SPLIT_DECODE` | flag | `true` | model load | Enables the CUDA grouped-query split-decode attention kernel; read once per KV arena. |
 | `IZWI_CUDA_STATE_BUDGET_FRACTION` | number | `0.25` | startup | Sets the share (0,1] of the post-weight CUDA budget retained recurrent state may take; the rest backs KV pages. |
+| `IZWI_CUDA_TRANSDUCER_DECODE` | flag | `true` | first use | On CUDA, runs the greedy TDT (Parakeet) and RNNT (Nemotron ASR) decodes of the retained routes many joint steps per readback: a kernel applies each row's picks and transition on the device and the joint and predictor run for every row with the non-emitting rows' state kept, after a per-device self-check of that kernel against its host reference (bit-exact, off for the device on any difference). Any false value keeps one readback per joint step. |
 | `IZWI_DIARIZATION_CAPACITY_WAIT_SECS` | duration | `120` | first use | Sets how long a diarization job waits for memory other admitted work holds (at admission and per stage) before failing; 0 fails at once. |
 | `IZWI_ENABLE_CHUNKED_PREFILL` | flag | `false` | startup | Enables chunked prefill in the scheduler. |
 | `IZWI_ENABLE_PREFIX_CACHING` | flag | false (catalog auto prefix reuse applies) | startup | Explicitly enables or kills prefix caching; any valid value also turns off catalog-auto prefix reuse. |
@@ -374,6 +375,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_TEST_QWEN_TTS_BASE_DIR` | path | ~/Library/Application Support/izwi/models/Qwen3-TTS-12Hz-0.6B-Base | test harness | Qwen3-TTS base checkpoint for the speaker-encoder PyTorch parity test. |
 | `IZWI_THERMAL_PRESSURE` | number | `0.0` | startup | Provides an external thermal pressure hint, clamped to [0,1], for power-adaptive scheduling. |
 | `IZWI_TIMEOUT` | duration | `300` | startup | Request timeout in seconds (legacy alias REQUEST_TIMEOUT_SECS; invalid ignored). |
+| `IZWI_TRANSDUCER_EMULATOR_DIR` | path | unset (test skipped) | test harness | Directory the ignored kernels::transducer_greedy emulator test writes its select-step checks to (inputs and the host reference's outputs), for the C++ harness that runs kernels/cuda/transducer_greedy.cu thread by thread on a machine without a GPU. |
 | `IZWI_UI_DIR` | path | `ui/dist` | startup | Directory the server serves the web UI from. |
 | `IZWI_USE_FLASH_ATTENTION` | choice | `auto` | first use | Selects flash attention: force; auto (or empty) or a true boolean = auto; a false boolean or any other word = off. |
 | `IZWI_VIBEVOICE_ASR_CUDA_MAX_AUDIO_SECS` | number | `3600` | first use | Lowers the VibeVoice ASR max audio-seconds hint on CUDA (positive, capped at 3600); ignored off CUDA. |

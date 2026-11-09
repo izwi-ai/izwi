@@ -3684,6 +3684,12 @@ pub(crate) fn cuda_ptx_relpos_attention() -> &'static str {
     cuda_ptx::RELPOS_ATTENTION
 }
 
+/// The PTX of `kernels/cuda/transducer_greedy.cu` (`kernels::transducer_greedy`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_transducer_greedy() -> &'static str {
+    cuda_ptx::TRANSDUCER_GREEDY
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

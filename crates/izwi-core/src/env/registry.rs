@@ -378,6 +378,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Sets the share (0,1] of the post-weight CUDA budget retained recurrent state may take; the rest backs KV pages.",
     ),
     CoreEnvVar::new(
+        "IZWI_CUDA_TRANSDUCER_DECODE",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, runs the greedy TDT (Parakeet) and RNNT (Nemotron ASR) decodes of the retained routes many joint steps per readback: a kernel applies each row's picks and transition on the device and the joint and predictor run for every row with the non-emitting rows' state kept, after a per-device self-check of that kernel against its host reference (bit-exact, off for the device on any difference). Any false value keeps one readback per joint step.",
+    ),
+    CoreEnvVar::new(
         "IZWI_DIARIZATION_CAPACITY_WAIT_SECS",
         Duration,
         "120",
@@ -2593,6 +2600,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "300",
         Startup,
         "Request timeout in seconds (legacy alias REQUEST_TIMEOUT_SECS; invalid ignored).",
+    ),
+    CoreEnvVar::new(
+        "IZWI_TRANSDUCER_EMULATOR_DIR",
+        Path,
+        "unset (test skipped)",
+        TestHarness,
+        "Directory the ignored kernels::transducer_greedy emulator test writes its select-step checks to (inputs and the host reference's outputs), for the C++ harness that runs kernels/cuda/transducer_greedy.cu thread by thread on a machine without a GPU.",
     ),
     CoreEnvVar::new(
         "IZWI_UI_DIR",
