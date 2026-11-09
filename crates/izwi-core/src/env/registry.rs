@@ -834,6 +834,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the max new tokens per Granite speaker-attributed ASR chunk (positive integer).",
     ),
     CoreEnvVar::new(
+        "IZWI_GRANITE_SPEECH5_ENCODER_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Granite Speech 5.0 runs its conformer encoder over a padded batch, a lone clip included, as a CUDA graph per shape: rows up to 1, 2, 3, 4, 6 or 8 and frames up to whole attention blocks, as many as fit 640 MiB of graph working memory, at most 24 graphs kept. The fused relative-position attention runs inside the graph when it is on. Each graph is checked bit for bit against the eager encoder on its first two batches; a mismatch or CUDA error turns the graphs off for the process. Loads price 768 MiB for them. Any false value encodes every batch eagerly at its unpadded shape; `execution.encoder_graphs` in the diagnostics reports captures, replays and why the graphs are off.",
+    ),
+    CoreEnvVar::new(
         "IZWI_GRANITE_SPEECH5_RETAINED_DECODE",
         Flag,
         "true",

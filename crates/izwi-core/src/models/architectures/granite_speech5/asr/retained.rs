@@ -564,8 +564,14 @@ impl GraniteSpeech5AsrModel {
         })?;
         let padded_audio_samples_per_row =
             rows.iter().map(|row| row.audio_samples).max().unwrap_or(0);
-        let padded_encoder_frames_per_row =
-            rows.iter().map(|row| row.encoder_frames).max().unwrap_or(0);
+        // On CUDA a batch runs at its encoder graph's padded shape; each real
+        // row carries its share of the spare rows.
+        let (batch_rows, padded_encoder_frames_per_row) = super::encoder::encoder_batch_shape(
+            &self.config.encoder_config,
+            rows.len(),
+            rows.iter().map(|row| row.encoder_frames).max().unwrap_or(0),
+            crate::backends::BackendKind::from(self.device.kind),
+        );
         let max_prompt_tokens = rows.iter().map(|row| row.prompt_tokens).max().unwrap_or(0);
         if padded_audio_samples_per_row == 0
             || padded_encoder_frames_per_row == 0
@@ -582,11 +588,15 @@ impl GraniteSpeech5AsrModel {
         let prompt_elements = to_u64(max_prompt_tokens, "batch prompt")?
             .checked_mul(to_u64(self.config.text_config.hidden_size, "batch prompt")?)
             .ok_or_else(|| overflow("batch prompt"))?;
-        let workspace_per_row_bytes = self.preparation_workspace_bytes(
-            padded_encoder_frames_per_row,
-            encoder_dim,
-            max_prompt_tokens,
-        )?;
+        let workspace_per_row_bytes = self
+            .preparation_workspace_bytes(
+                padded_encoder_frames_per_row,
+                encoder_dim,
+                max_prompt_tokens,
+            )?
+            .checked_mul(to_u64(batch_rows, "batch workspace")?)
+            .ok_or_else(|| overflow("batch workspace"))?
+            .div_ceil(to_u64(rows.len().max(1), "batch workspace")?);
         Ok(GraniteSpeech5PreparationBatchGeometry {
             batch_size: rows.len(),
             padded_audio_samples_per_row,

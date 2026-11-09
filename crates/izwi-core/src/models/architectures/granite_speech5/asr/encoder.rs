@@ -9,7 +9,9 @@ use candle_nn::{
     Conv1dConfig, Embedding, LayerNorm, Module, VarBuilder,
 };
 
+use crate::backends::BackendKind;
 use crate::error::{Error, Result};
+use crate::kernels::cuda::shape_graphs::{ShapeGraphLimits, ShapeGraphs};
 use crate::kernels::depthwise_conv::{
     batch_norm_affine, depthwise_conv1d, fold_channel_affine, DepthwiseConv1dSpec,
 };
@@ -30,6 +32,128 @@ pub(super) struct ConformerEncoder {
     /// residual stream (self-conditioning).
     out: ProjectionLinear,
     out_mid: ProjectionLinear,
+    /// The geometry the graphs' shapes are sized from.
+    config: GraniteSpeech5EncoderConfig,
+    /// CUDA graphs of the masked encoder over a padded batch, one per
+    /// `(rows, frames)` shape ([`encoder_graph_shape`]), or why there are
+    /// none.
+    graphs: std::result::Result<ShapeGraphs<(usize, usize)>, String>,
+}
+
+/// Kill switch for Granite Speech 5.0's encoder CUDA graphs (a boolean; on
+/// when unset). Read by admission pricing and the loader.
+pub(crate) const GRANITE_SPEECH5_ENCODER_GRAPHS_ENV: &str = "IZWI_GRANITE_SPEECH5_ENCODER_GRAPHS";
+
+fn encoder_graphs_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(GRANITE_SPEECH5_ENCODER_GRAPHS_ENV, true));
+    ON.get()
+}
+
+/// Batch widths the encoder graphs are captured at, up to the CUDA encoder
+/// stage's width of 8. A graphed batch pads its rows up to the next.
+const ENCODER_GRAPH_ROWS: [usize; 6] = [1, 2, 3, 4, 6, 8];
+
+const MIB: u64 = 1024 * 1024;
+
+/// What the encoder graphs may hold: the pool bounds a graph's working set
+/// ([`encoder_batch_bytes`], priced at F32), the retained budget the kept
+/// graphs' input copies (with the eager key mask) and outputs.
+const ENCODER_GRAPH_LIMITS: ShapeGraphLimits = ShapeGraphLimits {
+    max_graphs: 24,
+    retained_bytes: 128 * MIB,
+    pool_bytes: 640 * MIB,
+};
+
+/// Device bytes a load on `backend` prices for the encoder graphs, which
+/// allocate lazily on their first batches: zero off CUDA or with the graphs
+/// switched off.
+pub(crate) fn granite_speech5_encoder_graph_device_bytes(backend: BackendKind) -> u64 {
+    if backend == BackendKind::Cuda && encoder_graphs_requested() {
+        ENCODER_GRAPH_LIMITS.device_bytes()
+    } else {
+        0
+    }
+}
+
+/// The F32 working set of the masked encoder over `rows` rows of `frames`
+/// frames: about six `[T, hidden x feed-forward]` activations, the eager
+/// attention's block scores and softmax, its key mask, and the output.
+fn encoder_batch_bytes(
+    config: &GraniteSpeech5EncoderConfig,
+    rows: usize,
+    frames: usize,
+) -> Option<u64> {
+    const F32: usize = 4;
+    let context = config.context_size.max(1);
+    let blocks = frames.div_ceil(context);
+    let ff = config.hidden_dim.checked_mul(config.feedforward_mult)?;
+    let block_pairs = rows
+        .checked_mul(blocks)?
+        .checked_mul(context)?
+        .checked_mul(context)?;
+    let terms = [
+        6usize
+            .checked_mul(rows)?
+            .checked_mul(frames)?
+            .checked_mul(ff)?,
+        2usize
+            .checked_mul(block_pairs)?
+            .checked_mul(config.num_heads)?,
+        block_pairs,
+        rows.checked_mul(frames)?.checked_mul(config.hidden_dim)?,
+    ];
+    let elements = terms
+        .into_iter()
+        .try_fold(0usize, |total, term| total.checked_add(term))?;
+    u64::try_from(elements.checked_mul(F32)?).ok()
+}
+
+/// The `(rows, frames)` a graph runs a batch of `rows` rows whose longest
+/// has `frames` frames at: rows up to the next graph width, frames up to
+/// whole attention blocks (which the attention pads to anyway). `None` past
+/// 8 rows or past the pool budget.
+pub(super) fn encoder_graph_shape(
+    config: &GraniteSpeech5EncoderConfig,
+    rows: usize,
+    frames: usize,
+) -> Option<(usize, usize)> {
+    let rows = ENCODER_GRAPH_ROWS
+        .into_iter()
+        .find(|width| *width >= rows.max(1))?;
+    let context = config.context_size.max(1);
+    let frames = frames.max(1).div_ceil(context) * context;
+    let bytes = encoder_batch_bytes(config, rows, frames)?;
+    (bytes <= ENCODER_GRAPH_LIMITS.pool_bytes).then_some((rows, frames))
+}
+
+/// The `(rows, frames)` an encoder batch of `rows` rows padded to `frames`
+/// frames runs at on `backend`: a graph's shape on CUDA with the encoder
+/// graphs on, else as given. Admission prices this shape; the encoder runs
+/// it, or the given one once its graphs are off.
+pub(super) fn encoder_batch_shape(
+    config: &GraniteSpeech5EncoderConfig,
+    rows: usize,
+    frames: usize,
+    backend: BackendKind,
+) -> (usize, usize) {
+    if backend == BackendKind::Cuda && encoder_graphs_requested() {
+        if let Some(shape) = encoder_graph_shape(config, rows, frames) {
+            return shape;
+        }
+    }
+    (rows, frames)
+}
+
+/// The encoder's CUDA graphs on `device`, or why it has none.
+fn resolve_encoder_graphs(
+    device: &Device,
+) -> std::result::Result<ShapeGraphs<(usize, usize)>, String> {
+    if encoder_graphs_requested() {
+        ShapeGraphs::resolve("Granite Speech 5.0 encoder", device, ENCODER_GRAPH_LIMITS)
+    } else {
+        Err(format!("{GRANITE_SPEECH5_ENCODER_GRAPHS_ENV} is off"))
+    }
 }
 
 /// A linear layer read from `vb`, held dense or, with `f16` set, as
@@ -87,6 +211,8 @@ impl ConformerEncoder {
                 &vb.pp("out_mid"),
                 f16,
             )?,
+            config: config.clone(),
+            graphs: resolve_encoder_graphs(vb.device()),
         })
     }
 
@@ -128,27 +254,98 @@ impl ConformerEncoder {
     ) -> Result<Tensor> {
         let (batch, frames, _) = input.dims3()?;
         validate_frame_lengths(batch, frames, valid_lengths)?;
-        let x = self.input_linear.forward(input)?;
-        let mask = frame_valid_mask(valid_lengths, frames, x.device(), x.dtype())?;
+        // The input projection keeps the activations' dtype.
+        let (device, dtype) = (input.device(), input.dtype());
+        let mask = frame_valid_mask(valid_lengths, frames, device, dtype)?;
         let real = valid_lengths
             .iter()
             .map(|len| *len as u32)
             .collect::<Vec<_>>();
-        let key_lengths = Tensor::from_vec(real, batch, x.device())?;
+        let key_lengths = Tensor::from_vec(real, batch, device)?;
         let key_mask = valid_key_mask(
             valid_lengths,
             frames.div_ceil(self.context_size().max(1)),
             self.context_size(),
-            x.device(),
-            x.dtype(),
+            device,
+            dtype,
         )?;
-        let mut x = x.broadcast_mul(&mask)?;
+        let graphs = match &self.graphs {
+            Ok(graphs)
+                if encoder_graph_shape(&self.config, batch, frames) == Some((batch, frames)) =>
+            {
+                graphs
+            }
+            _ => return self.forward_masked(input, &mask, &key_mask, &key_lengths),
+        };
+        // The graph keeps a stable copy of each input and an output of the
+        // hidden width.
+        let inputs = [input.clone(), mask, key_mask, key_lengths];
+        let tensor_bytes = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+        let retained = inputs.iter().map(tensor_bytes).sum::<u64>()
+            + (batch * frames * self.config.hidden_dim * dtype.size_in_bytes()) as u64;
+        let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+            let [input, mask, key_mask, key_lengths] = inputs else {
+                return Err(Error::InferenceError(format!(
+                    "Granite Speech 5.0 encoder graph received {} inputs, expected 4",
+                    inputs.len()
+                )));
+            };
+            Ok(vec![self.forward_masked(
+                input,
+                mask,
+                key_mask,
+                key_lengths,
+            )?])
+        };
+        graphs
+            .run((batch, frames), retained, &inputs, &body)?
+            .pop()
+            .ok_or_else(|| {
+                Error::InferenceError("Granite Speech 5.0 encoder graph returned nothing".into())
+            })
+    }
+
+    /// Whether padded batches run through the CUDA graphs: on CUDA with the
+    /// graphs switched on and no graph failure yet.
+    pub(super) fn graphs_on(&self) -> bool {
+        self.graphs.as_ref().is_ok_and(ShapeGraphs::is_on)
+    }
+
+    /// The `(rows, frames)` a batch of `rows` rows whose longest has
+    /// `frames` frames runs at: its graph's shape while the graphs are on
+    /// (at most what admission priced), else as given.
+    pub(super) fn batch_shape(&self, rows: usize, frames: usize) -> (usize, usize) {
+        if self.graphs_on() {
+            encoder_graph_shape(&self.config, rows, frames).unwrap_or((rows, frames))
+        } else {
+            (rows, frames)
+        }
+    }
+
+    pub(super) fn graphs_diagnostics(&self) -> serde_json::Value {
+        match &self.graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        }
+    }
+
+    /// [`Self::forward_valid_lengths`] under masks already built: the
+    /// eager form of the encoder graphs.
+    fn forward_masked(
+        &self,
+        input: &Tensor,
+        mask: &Tensor,
+        key_mask: &Tensor,
+        key_lengths: &Tensor,
+    ) -> Result<Tensor> {
+        let x = self.input_linear.forward(input)?;
+        let mut x = x.broadcast_mul(mask)?;
         let midpoint = self.layers.len() / 2;
         for (idx, layer) in self.layers.iter().enumerate() {
-            x = layer.forward_masked(&x, &mask, [&key_mask, &key_lengths])?;
+            x = layer.forward_masked(&x, mask, [key_mask, key_lengths])?;
             if idx + 1 == midpoint {
                 let mid = ops::softmax_last_dim(&self.out.forward(&x)?)?;
-                let mid = self.out_mid.forward(&mid)?.broadcast_mul(&mask)?;
+                let mid = self.out_mid.forward(&mid)?.broadcast_mul(mask)?;
                 x = x.broadcast_add(&mid)?;
             }
         }
@@ -1162,6 +1359,186 @@ mod tests {
         assert!(encoder
             .forward_valid_lengths(&padded(0.0), &[1, 3, 4, 5, 9, 14])
             .is_err());
+    }
+
+    /// A batch padded to an encoder graph's shape (spare zero rows of full
+    /// length, frames to whole attention blocks) encodes its real rows as
+    /// the unpadded batch does.
+    #[test]
+    fn graph_padded_batches_encode_their_real_rows_unchanged() {
+        let device = Device::Cpu;
+        let (config, encoder) = seeded_block_encoder(&device);
+        let lengths = [3usize, 5, 9];
+        let frames = 9;
+        let rows = lengths
+            .iter()
+            .enumerate()
+            .map(|(row, &length)| {
+                xorshift_tensor(
+                    &[1, length, config.input_dim],
+                    70 + row as u64,
+                    1.0,
+                    &device,
+                )
+                .unwrap()
+                .pad_with_zeros(1, 0, frames - length)
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input = Tensor::cat(&rows, 0).unwrap();
+        let eager = encoder.forward_valid_lengths(&input, &lengths).unwrap();
+        let (batch_rows, padded) = encoder_graph_shape(&config, 3, frames).unwrap();
+        assert_eq!(batch_rows, 3);
+        assert_eq!(padded % config.context_size, 0);
+        // Two spare rows, as a five-row step would pad to six.
+        let graphed = encoder
+            .forward_valid_lengths(
+                &input
+                    .pad_with_zeros(1, 0, padded - frames)
+                    .unwrap()
+                    .pad_with_zeros(0, 0, 3)
+                    .unwrap(),
+                &[3, 5, 9, padded, padded, padded],
+            )
+            .unwrap();
+        for (row, &length) in lengths.iter().enumerate() {
+            assert_close(
+                &graphed
+                    .narrow(0, row, 1)
+                    .unwrap()
+                    .narrow(1, 0, length)
+                    .unwrap(),
+                &eager
+                    .narrow(0, row, 1)
+                    .unwrap()
+                    .narrow(1, 0, length)
+                    .unwrap(),
+                1e-5,
+            );
+        }
+        let spare = graphed.narrow(0, 3, 3).unwrap();
+        assert!(spare
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|value| value.is_finite()));
+    }
+
+    /// The 2B encoder's shapes: rows to a graph width, frames to whole
+    /// blocks, within the pool budget; admission and the loader see the
+    /// graphs on CUDA only, and the kill switch turns both off.
+    #[test]
+    fn encoder_graph_shapes_and_pricing_follow_the_switch_on_cuda_only() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let config = GraniteSpeech5EncoderConfig {
+            cat_hidden_layers: vec![],
+            context_size: 200,
+            conv_expansion_factor: 2,
+            conv_kernel_size: 15,
+            dim_head: 128,
+            dropout: 0.0,
+            feedforward_mult: 4,
+            hidden_dim: 1024,
+            input_dim: 160,
+            max_pos_emb: 512,
+            model_type: None,
+            num_heads: 8,
+            num_layers: 16,
+            output_dim: 348,
+        };
+        assert_eq!(encoder_graph_shape(&config, 1, 500), Some((1, 600)));
+        assert_eq!(encoder_graph_shape(&config, 5, 300), Some((6, 400)));
+        assert_eq!(encoder_graph_shape(&config, 9, 100), None);
+        for rows in ENCODER_GRAPH_ROWS {
+            for blocks in 1..=16 {
+                if let Some(shape) = encoder_graph_shape(&config, rows, blocks * 200) {
+                    assert_eq!(shape, (rows, blocks * 200));
+                    assert!(
+                        encoder_batch_bytes(&config, rows, blocks * 200).unwrap()
+                            <= ENCODER_GRAPH_LIMITS.pool_bytes
+                    );
+                }
+            }
+        }
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            assert_eq!(granite_speech5_encoder_graph_device_bytes(backend), 0);
+            assert_eq!(encoder_batch_shape(&config, 5, 300, backend), (5, 300));
+        }
+        assert!(resolve_encoder_graphs(&Device::Cpu).is_err());
+        if encoder_graphs_requested() {
+            assert_eq!(
+                granite_speech5_encoder_graph_device_bytes(BackendKind::Cuda),
+                768 << 20
+            );
+            assert_eq!(
+                encoder_batch_shape(&config, 5, 300, BackendKind::Cuda),
+                (6, 400)
+            );
+        }
+        let previous = std::env::var_os(GRANITE_SPEECH5_ENCODER_GRAPHS_ENV);
+        std::env::set_var(GRANITE_SPEECH5_ENCODER_GRAPHS_ENV, "0");
+        let bytes = granite_speech5_encoder_graph_device_bytes(BackendKind::Cuda);
+        let shape = encoder_batch_shape(&config, 5, 300, BackendKind::Cuda);
+        let reason = resolve_encoder_graphs(&Device::Cpu).err();
+        std::env::remove_var(GRANITE_SPEECH5_ENCODER_GRAPHS_ENV);
+        if let Some(previous) = previous {
+            std::env::set_var(GRANITE_SPEECH5_ENCODER_GRAPHS_ENV, previous);
+        }
+        assert_eq!((bytes, shape), (0, (5, 300)));
+        assert!(reason
+            .expect("off")
+            .contains(GRANITE_SPEECH5_ENCODER_GRAPHS_ENV));
+    }
+
+    /// On CUDA the encoder graphs return the eager masked encoder bit for
+    /// bit through capture, verification and replay, over fresh inputs.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_encoder_graphs_match_the_eager_masked_encoder() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let (config, mut encoder) = seeded_block_encoder(&device);
+        encoder.graphs = ShapeGraphs::resolve("test", &device, ENCODER_GRAPH_LIMITS);
+        let (rows, frames) = encoder_graph_shape(&config, 2, 5).unwrap();
+        let lengths = [3usize, frames];
+        let bits = |t: &Tensor| {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        for step in 0..4u64 {
+            let input =
+                xorshift_tensor(&[rows, frames, config.input_dim], 200 + step, 1.0, &device)
+                    .unwrap();
+            let mask = frame_valid_mask(&lengths, frames, &device, DType::F32).unwrap();
+            let key_lengths = Tensor::new(&[3u32, frames as u32], &device).unwrap();
+            let key_mask = valid_key_mask(
+                &lengths,
+                frames.div_ceil(config.context_size),
+                config.context_size,
+                &device,
+                DType::F32,
+            )
+            .unwrap();
+            let expected = encoder
+                .forward_masked(&input, &mask, &key_mask, &key_lengths)
+                .unwrap();
+            let out = encoder.forward_valid_lengths(&input, &lengths).unwrap();
+            assert_eq!(bits(&out), bits(&expected), "step {step}");
+        }
+        let diagnostics = encoder.graphs_diagnostics();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        assert_eq!(diagnostics["captures"], 1, "{diagnostics}");
+        assert_eq!(diagnostics["replays"], 2, "{diagnostics}");
     }
 
     #[test]

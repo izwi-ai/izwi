@@ -81,7 +81,8 @@ use crate::models::architectures::granite_speech::asr::{
     select_granite_speech_dtype, GraniteLoadRepresentation, GraniteSpeechConfig,
 };
 use crate::models::architectures::granite_speech5::asr::{
-    ensure_granite_speech5_artifacts, granite_speech5_load_representation,
+    ensure_granite_speech5_artifacts, granite_speech5_encoder_graph_device_bytes,
+    granite_speech5_load_representation,
     granite_speech5_mmproj_safetensors_name, granite_speech5_tensor_is_f16_encoder_projection,
     resolve_granite_speech5_encoder_precision, select_granite_speech5_dtype, GraniteSpeech5Config,
     GraniteSpeech5LoadRepresentation, GraniteSpeech5Weights,
@@ -268,7 +269,10 @@ pub(super) fn residency_plan(
             .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
         _ if variant.family() == ModelFamily::GraniteSpeech5Asr => {
+            // The encoder's CUDA graphs allocate their memory on first use.
+            let graphs = granite_speech5_encoder_graph_device_bytes(backend);
             granite_speech5_plan(variant, model_path, device, backend, Precision::Selected)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
         ModelVariant::VibeVoiceAsr => {
             // The language model's CUDA graphs allocate their memory on first use.

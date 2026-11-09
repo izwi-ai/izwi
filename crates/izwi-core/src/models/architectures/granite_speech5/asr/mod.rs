@@ -61,6 +61,7 @@ pub use config::{
     GraniteSpeech5ProcessorConfig, GraniteSpeech5ProjectorConfig, GraniteSpeech5TextConfig,
     GraniteSpeech5TokenizerConfig,
 };
+pub(crate) use encoder::granite_speech5_encoder_graph_device_bytes;
 pub(crate) use gguf::granite_speech5_mmproj_safetensors_name;
 pub(crate) use precision::{
     granite_speech5_load_representation, granite_speech5_tensor_is_f16_encoder_projection,

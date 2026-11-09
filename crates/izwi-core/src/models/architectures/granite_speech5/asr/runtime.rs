@@ -342,6 +342,7 @@ impl GraniteSpeech5Runtime {
     pub(crate) fn execution_diagnostics(&self) -> serde_json::Value {
         let plan = self.language_model.plan();
         serde_json::json!({
+            "encoder_graphs": self.encoder.graphs_diagnostics(),
             "f16_lm_head": plan.f16_lm_head,
             "f16_qkv": plan.f16_qkv,
             "f16_attention_core": plan.f16_attention_core,
@@ -409,7 +410,8 @@ impl GraniteSpeech5Runtime {
         &self,
         features: &[GraniteSpeech5AudioFeatures],
     ) -> Result<Vec<(Tensor, GraniteSpeech5AudioStats)>> {
-        if let [single] = features {
+        // With the encoder graphs on, a lone row pads to its graph's shape too.
+        if let ([single], false) = (features, self.encoder.graphs_on()) {
             return self.audio_embeddings(single).map(|output| vec![output]);
         }
         let dim = features.first().map_or(0, |row| row.encoder_dim);
@@ -435,19 +437,27 @@ impl GraniteSpeech5Runtime {
             .iter()
             .map(|row| row.encoder_frames)
             .collect::<Vec<_>>();
-        let mut flat = Vec::with_capacity(features.len() * frames * dim);
+        // A graph's spare rows are zero features of full length.
+        let (batch_rows, frames) = self.encoder.batch_shape(features.len(), frames);
+        let mut flat = Vec::with_capacity(batch_rows * frames * dim);
         for row in features {
             for frame in &row.input_features {
                 flat.extend_from_slice(frame);
             }
             flat.resize(flat.len() + (frames - row.encoder_frames) * dim, 0.0);
         }
+        flat.resize(batch_rows * frames * dim, 0.0);
+        let mut batch_lengths = valid_lengths.clone();
+        batch_lengths.resize(batch_rows, frames);
         let started = Instant::now();
-        let input = Tensor::from_vec(flat, (features.len(), frames, dim), &self.device)?
+        let input = Tensor::from_vec(flat, (batch_rows, frames, dim), &self.device)?
             .to_dtype(self.audio_dtype)?;
         let upload = started.elapsed();
         let started = Instant::now();
-        let encoded = self.encoder.forward_valid_lengths(&input, &valid_lengths)?;
+        let mut encoded = self.encoder.forward_valid_lengths(&input, &batch_lengths)?;
+        if batch_rows > features.len() {
+            encoded = encoded.narrow(0, 0, features.len())?;
+        }
         let encoder = started.elapsed();
         let started = Instant::now();
         let embeddings = self
