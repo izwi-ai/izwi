@@ -105,6 +105,9 @@ use crate::models::architectures::qwen3::core::{
     qwen3_dense_projection_fusion_enabled, qwen3_mlx_q4_1_enabled,
     qwen3_quantized_projection_grouping_for_hidden_size,
 };
+use crate::models::architectures::qwen3::decode_graph::{
+    qwen3_decode_graph_device_bytes, QWEN3_ASR_DECODE_GRAPHS_ENV, VIBEVOICE_ASR_DECODE_GRAPHS_ENV,
+};
 use crate::models::architectures::sortformer::diarization::{
     sortformer_checkpoint_paths, sortformer_extraction_is_current,
     sortformer_uses_selected_model_device,
@@ -226,7 +229,10 @@ pub(super) fn residency_plan(
     match variant {
         ModelVariant::WhisperLargeV3Turbo => whisper_plan(model_path, device, backend),
         ModelVariant::Qwen3Asr06BGguf | ModelVariant::Qwen3Asr17BGguf => {
+            // The text decoder's CUDA graphs allocate their memory on first use.
+            let graphs = qwen3_decode_graph_device_bytes(backend, QWEN3_ASR_DECODE_GRAPHS_ENV);
             qwen3_asr_plan(variant, model_path, device, backend, Precision::Selected)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
         ModelVariant::ParakeetTdt06BV3 => {
             // The encoder's CUDA graphs allocate their memory on first use.
@@ -252,7 +258,12 @@ pub(super) fn residency_plan(
         _ if variant.family() == ModelFamily::GraniteSpeech5Asr => {
             granite_speech5_plan(variant, model_path, device, backend, Precision::Selected)
         }
-        ModelVariant::VibeVoiceAsr => vibevoice_plan(model_path, device, backend),
+        ModelVariant::VibeVoiceAsr => {
+            // The language model's CUDA graphs allocate their memory on first use.
+            let graphs = qwen3_decode_graph_device_bytes(backend, VIBEVOICE_ASR_DECODE_GRAPHS_ENV);
+            vibevoice_plan(model_path, device, backend)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
+        }
         _ if variant.family() == ModelFamily::NemotronTranscribeAsr => {
             nemotron_transcribe_plan(model_path, backend)
         }
@@ -4990,9 +5001,12 @@ pub(super) mod tests {
             let catalog = super::super::model_memory_estimate(ModelVariant::VibeVoiceAsr);
             assert!(retry < catalog.load_peak_bytes);
             if backend == BackendKind::Cuda {
+                // The weights, and the decode graphs' deferred memory.
+                let graphs =
+                    qwen3_decode_graph_device_bytes(backend, VIBEVOICE_ASR_DECODE_GRAPHS_ENV);
                 assert_eq!(
                     plan.resident_authorization.device_bytes,
-                    ResourceAmount::Known(bf16)
+                    ResourceAmount::Known(bf16 + graphs)
                 );
                 assert_eq!(
                     plan.load_authorization.host_bytes,

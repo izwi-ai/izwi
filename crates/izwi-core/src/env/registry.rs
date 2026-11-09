@@ -2329,6 +2329,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the Qwen3.8 tiled DeltaNet recurrence tile size (min 1, capped at sequence length).",
     ),
     CoreEnvVar::new(
+        "IZWI_QWEN3_ASR_DECODE_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Qwen3-ASR replays each decode step of its text decoder, from the token embeddings to the logits, as one CUDA graph per padded width (1, 2, 3, 4, 6, 8, 12, 16, 24 or 32 rows), its quantized projections on the izwi K-quant kernels and attention on the split decode with row-invariant partitions. Each graph is checked bit for bit against the eager body on its first two steps, and a width's first step against the standard decode (relative L2 within 0.05, same greedy token per row); a mismatch or CUDA error turns the graphs off for the process. Loads price 256 MiB for them. Any false value (or cuda.decode_graphs=off) keeps the standard decode; `decode_graph` in the diagnostics reports captures, replays and why the graphs are off.",
+    ),
+    CoreEnvVar::new(
         "IZWI_QWEN3_ASR_GGUF_QMATMUL_TEXT",
         Flag,
         "true",
@@ -2593,6 +2600,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "3600",
         Once,
         "Lowers the VibeVoice ASR max audio-seconds hint on CUDA (positive, capped at 3600); ignored off CUDA.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_VIBEVOICE_ASR_DECODE_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, VibeVoice-ASR replays each decode step of its Qwen language model as one CUDA graph per padded width (1 to 32 rows), as IZWI_QWEN3_ASR_DECODE_GRAPHS describes: checked bit for bit against the eager body and, per width, against the standard decode, and off for the process on a mismatch or CUDA error. Loads price 256 MiB for them. Any false value (or cuda.decode_graphs=off) keeps the standard decode.",
     ),
     CoreEnvVar::new(
         "IZWI_VIBEVOICE_ASR_DTYPE",

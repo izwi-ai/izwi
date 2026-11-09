@@ -553,6 +553,12 @@ const VIBEVOICE_TOKENIZER_PROBE_SAMPLES: usize = 4 * 3200;
 const VIBEVOICE_LM_PROBE_TOKENS: usize = 16;
 
 impl VibeVoiceAsrModel {
+    /// The language model's CUDA decode graphs: captures, replays and why
+    /// they are off.
+    pub(crate) fn decode_graph_diagnostics(&self) -> serde_json::Value {
+        self.language_model.decode_graph_diagnostics()
+    }
+
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         if variant != ModelVariant::VibeVoiceAsr {
             return Err(Error::InvalidInput(format!(
@@ -625,7 +631,7 @@ impl VibeVoiceAsrModel {
             config.decoder_config.hidden_size,
             vb.pp("model.semantic_connector"),
         )?;
-        let (language_model, lm_precision) = load_with_precision_fallback(
+        let (mut language_model, lm_precision) = load_with_precision_fallback(
             "VibeVoice-ASR LM",
             &lm_selection,
             device.kind.is_metal(),
@@ -651,6 +657,10 @@ impl VibeVoiceAsrModel {
             },
         )?;
         drop(vb);
+        language_model.enable_asr_decode_graph(
+            "VibeVoice-ASR",
+            crate::models::architectures::qwen3::decode_graph::VIBEVOICE_ASR_DECODE_GRAPHS_ENV,
+        );
         let lm_dtype = lm_precision.loaded;
         let model_identity = vibevoice_asr_model_identity(
             model_dir,
@@ -2548,7 +2558,8 @@ fn forward_vibevoice_pending_decode_batch(
         })
         .collect::<Result<Vec<_>>>()?;
     let input = Tensor::from_vec(pending, (states.len(), 1), device)?;
-    let output = if states.len() == 1 {
+    // With the decode graphs on, a lone row decodes through the width-1 graph.
+    let output = if states.len() == 1 && !model.decode_graph_on() {
         model.forward_managed(&input, positions[0], &mut states[0].cache)?
     } else {
         let mut caches = states

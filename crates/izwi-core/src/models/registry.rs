@@ -1467,6 +1467,16 @@ fn granite_speech_asr_options(
 }
 
 impl NativeAsrModel {
+    /// The Qwen3 trunk's CUDA decode graphs (Qwen3-ASR and VibeVoice-ASR),
+    /// `None` for every other family.
+    pub(crate) fn decode_graph_diagnostics(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Qwen3(model) => Some(model.decode_graph_diagnostics()),
+            Self::VibeVoice(model) => Some(model.decode_graph_diagnostics()),
+            _ => None,
+        }
+    }
+
     /// Encodes Granite Speech prompt rows whose audio features a host worker
     /// computed.
     pub(crate) fn prepare_granite_speech_prompt_artifact_batch_from_features(

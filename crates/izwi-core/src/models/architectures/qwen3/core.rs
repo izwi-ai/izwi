@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use super::decode_graph::{GraphKey, Qwen3DecodeGraph};
 #[cfg(test)]
 use crate::backends::kv::KvArena;
 use crate::backends::kv::{
@@ -21,6 +22,9 @@ use crate::backends::kv::{
     PagedKvDecodeArgs,
 };
 use crate::error::{Error, Result};
+use crate::kernels::cuda::decode_step::{self, DecodeStepLayout, DecodeStepRow};
+use crate::kernels::cuda::kquant::{self, KQuantWeight};
+use crate::kernels::cuda::split_decode;
 use crate::kernels::{try_fused_qk_rms_norm, try_fused_silu_mul_with_status};
 use crate::kv::v2::{
     AttentionMask, AttentionPattern, CheckpointPolicy, InferenceStateContract, KeyEncoding,
@@ -29,6 +33,7 @@ use crate::kv::v2::{
     StateGroupId, StateGroupSpec, StateScope, CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::kv::KvDecodeBatchMetadata;
+use crate::kv::KvSlotRef;
 #[cfg(test)]
 use crate::kv::{CacheBlockRef, KvLayerBinding};
 use crate::models::shared::attention::flash::try_fused_self_attention;
@@ -495,6 +500,10 @@ struct Qwen3QuantizedProjection {
     /// activations as they are ([`qwen3_cuda_qmatmul_takes_half_activations`]),
     /// so no F32 casts wrap the call.
     cuda_half_activations: bool,
+    /// On CUDA, the same weight for the izwi-owned K-quant kernels, which
+    /// the decode graphs run instead of `QMatMul` (whose process-global
+    /// scratch a graph cannot capture); `None` for other types and devices.
+    kquant: Option<KQuantWeight>,
 }
 
 impl Qwen3QuantizedProjection {
@@ -504,10 +513,61 @@ impl Qwen3QuantizedProjection {
             QMatMul::Tensor(weight) | QMatMul::TensorF16(weight) => weight.device().is_cuda(),
         };
         let cuda_half_activations = on_cuda && qwen3_cuda_qmatmul_takes_half_activations(&qmatmul);
+        let kquant = KQuantWeight::from_qmatmul(&qmatmul);
         Self {
             qmatmul,
             cuda_half_activations,
+            kquant,
         }
+    }
+
+    /// `x · weightᵀ` through the K-quant kernels, as the decode graphs run
+    /// it: the activations cast to F32 (exact), quantized to Q8_1 once,
+    /// MMVQ up to eight rows and MMQ above, the F32 result cast back to the
+    /// activations' dtype. Bit for bit `QMatMul`'s result (`kquant`), which
+    /// for 16-bit activations rounds its F32 sums to them the same way.
+    fn kquant_forward(&self, weight: &KQuantWeight, x: &Tensor) -> candle_core::Result<Tensor> {
+        let activation_dtype = x.dtype();
+        let x = x.to_dtype(DType::F32)?.contiguous()?;
+        let rows = x.dims()[..x.rank().saturating_sub(1)]
+            .iter()
+            .product::<usize>();
+        let out = if rows <= kquant::MAX_ROWS {
+            kquant::mat_vec(weight, &kquant::quantize(&x)?)?
+        } else {
+            kquant::mat_mul(weight, &kquant::quantize_tiles(&x, weight.tile_scales())?)?
+        };
+        if out.dtype() == activation_dtype {
+            Ok(out)
+        } else {
+            out.to_dtype(activation_dtype)
+        }
+    }
+}
+
+thread_local! {
+    /// Set while a decode graph's body runs on this thread: quantized
+    /// projections then take the K-quant kernels ([`GraphProjections`]).
+    static GRAPH_PROJECTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Routes this thread's quantized projections through the K-quant kernels
+/// until dropped: the decode graphs' body, eager or captured.
+struct GraphProjections {
+    previous: bool,
+}
+
+impl GraphProjections {
+    fn enter() -> Self {
+        Self {
+            previous: GRAPH_PROJECTIONS.with(|on| on.replace(true)),
+        }
+    }
+}
+
+impl Drop for GraphProjections {
+    fn drop(&mut self) {
+        GRAPH_PROJECTIONS.with(|on| on.set(self.previous));
     }
 }
 
@@ -798,6 +858,13 @@ impl Module for Qwen3Projection {
         match self {
             Self::Dense(dense) => dense.linear.forward(x),
             Self::Quantized(projection) => {
+                if let Some(weight) = projection
+                    .kquant
+                    .as_ref()
+                    .filter(|_| GRAPH_PROJECTIONS.with(std::cell::Cell::get))
+                {
+                    return projection.kquant_forward(weight, x);
+                }
                 let activation_dtype = x.dtype();
                 let profile = qwen3_runtime_profiling_enabled();
                 let x = if let Some(dtype) = qwen3_qmatmul_input_dtype(
@@ -1372,6 +1439,57 @@ fn qk_norm_weight(q_norm: &Option<RmsNorm>, k_norm: &Option<RmsNorm>) -> Result<
     }
 }
 
+/// Whether a decode graph can capture each projection: dense weights, or
+/// quantized ones the K-quant kernels serve (never `QMatMul`).
+impl Qwen3Projection {
+    fn graph_capturable(&self) -> bool {
+        match self {
+            Self::Dense(_) => true,
+            Self::Quantized(projection) => projection.kquant.is_some(),
+        }
+    }
+}
+
+impl Qwen3QkvProjection {
+    fn graph_capturable(&self) -> bool {
+        match self {
+            Self::Fused(_) => true,
+            Self::FusedQuantized(fused) => fused.fused.graph_capturable(),
+            Self::Separate {
+                q_proj,
+                k_proj,
+                v_proj,
+            } => {
+                q_proj.graph_capturable() && k_proj.graph_capturable() && v_proj.graph_capturable()
+            }
+        }
+    }
+}
+
+impl Qwen3GateUpProjection {
+    fn graph_capturable(&self) -> bool {
+        match self {
+            Self::Fused(_) => true,
+            Self::FusedQuantized(fused) => fused.fused.graph_capturable(),
+            Self::Separate { gate_proj, up_proj } => {
+                gate_proj.graph_capturable() && up_proj.graph_capturable()
+            }
+        }
+    }
+}
+
+/// What a decode graph's attention layers read: the arena's `(keys,
+/// values)` per layer and the step buffer's slots and split-decode
+/// metadata ([`decode_step`]).
+struct Qwen3GraphAttention<'a> {
+    caches: &'a [(Tensor, Tensor)],
+    slots: Tensor,
+    metadata: Tensor,
+    page_tokens: usize,
+    max_blocks: usize,
+    max_partitions: usize,
+}
+
 struct Qwen3Attention {
     qkv_proj: Qwen3QkvProjection,
     o_proj: Qwen3Projection,
@@ -1716,6 +1834,25 @@ impl Qwen3Attention {
             })
             .collect::<Result<Vec<_>>>()?;
         let needed = positions.iter().max().map_or(1, |&pos| pos as usize + 1);
+        let (cos, sin, _) = self.decode_rope_table_rows(table, needed, device, dtype)?;
+        let rows = positions.len();
+        let positions = Tensor::from_vec(positions, rows, device)?;
+        Ok(Qwen3DecodeRopeRows {
+            cos: cos.index_select(&positions, 0)?,
+            sin: sin.index_select(&positions, 0)?,
+        })
+    }
+
+    /// The model's decode `(cos, sin)` tables, grown (rebuilt from zero by
+    /// the same builder) to hold at least `needed` positions, and their row
+    /// count.
+    fn decode_rope_table_rows(
+        &self,
+        table: &Mutex<Option<Qwen3DecodeRopeTable>>,
+        needed: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<(Tensor, Tensor, usize)> {
         let mut table = table
             .lock()
             .map_err(|_| Error::InferenceError("Qwen3 decode RoPE table lock poisoned".into()))?;
@@ -1739,12 +1876,7 @@ impl Qwen3Attention {
                 "Qwen3 decode RoPE table missing".into(),
             ));
         };
-        let rows = positions.len();
-        let positions = Tensor::from_vec(positions, rows, device)?;
-        Ok(Qwen3DecodeRopeRows {
-            cos: table.cos.index_select(&positions, 0)?,
-            sin: table.sin.index_select(&positions, 0)?,
-        })
+        Ok((table.cos.clone(), table.sin.clone(), table.rows))
     }
 
     /// The `[seq, head_dim / 2]` cos/sin tables for `q`'s positions, in its
@@ -2001,6 +2133,55 @@ impl Qwen3Attention {
         completions.collect(completion)?;
         let out = out.reshape((bsz, 1, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out).map_err(Error::from)
+    }
+
+    /// [`Self::forward_managed_decode_batch`] as a decode graph runs it:
+    /// each row's K/V rows written at its step-buffer slot, and the split
+    /// decode over its step-buffer block table with row-invariant
+    /// partitions. No host value is read or uploaded.
+    fn forward_graph_decode(
+        &self,
+        x: &Tensor,
+        rope: &Qwen3DecodeRopeRows,
+        attention: &Qwen3GraphAttention<'_>,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let bsz = x.dim(0)?;
+        let (q, k, v) = self.qkv_proj.forward(x)?;
+        let q = q.reshape((bsz, 1, self.num_heads, self.head_dim))?;
+        let k = k.reshape((bsz, 1, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((bsz, 1, self.num_kv_heads, self.head_dim))?;
+        let (q, k) = self.apply_qk_norm_pair(q, k, 1)?;
+        let (queries, keys) = self.apply_decode_rope(q, k, rope)?;
+        let values = v
+            .reshape((bsz, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let (cache_keys, cache_values) = attention.caches.get(layer_idx).ok_or_else(|| {
+            Error::InferenceError(format!(
+                "Qwen3 decode graph has no KV cache for layer {layer_idx}"
+            ))
+        })?;
+        decode_step::write_kv_rows(cache_keys, cache_values, &keys, &values, &attention.slots)?;
+        let out = split_decode::paged_decode_adaptive(
+            &queries,
+            cache_keys,
+            cache_values,
+            &attention.metadata,
+            bsz,
+            self.num_heads,
+            self.num_kv_heads,
+            attention.page_tokens,
+            attention.max_blocks,
+            1.0 / (self.head_dim as f32).sqrt(),
+            None,
+            attention.max_partitions,
+        )?;
+        let out = out.reshape((bsz, 1, self.num_heads * self.head_dim))?;
+        self.o_proj.forward(&out).map_err(Error::from)
+    }
+
+    fn graph_capturable(&self) -> bool {
+        self.qkv_proj.graph_capturable() && self.o_proj.graph_capturable()
     }
 
     /// One mixed step: `x` is `[1, tokens, hidden]` in `step`'s row layout.
@@ -2546,6 +2727,35 @@ impl Qwen3Layer {
         x.broadcast_add(&mlp_out).map_err(Error::from)
     }
 
+    /// [`Self::forward_managed_decode_batch`] as a decode graph runs it.
+    fn forward_graph_decode(
+        &self,
+        x: &Tensor,
+        rope: &Qwen3DecodeRopeRows,
+        attention: &Qwen3GraphAttention<'_>,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out = self
+            .self_attn
+            .forward_graph_decode(&normed, rope, attention, layer_idx)?;
+        let x = x.broadcast_add(&attn_out)?;
+        let normed = self.post_attention_layernorm.forward(&x)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        x.broadcast_add(&mlp_out).map_err(Error::from)
+    }
+
+    fn graph_capturable(&self) -> bool {
+        self.self_attn.graph_capturable()
+            && match &self.mlp {
+                Qwen3FeedForward::Dense(mlp) => {
+                    mlp.gate_up_proj.graph_capturable() && mlp.down_proj.graph_capturable()
+                }
+                // Expert routing reads the host.
+                Qwen3FeedForward::Sparse(_) => false,
+            }
+    }
+
     fn forward_managed_mixed(
         &self,
         x: &Tensor,
@@ -2574,6 +2784,9 @@ pub struct Qwen3Model {
     use_mrope: bool,
     /// Decode cos/sin by position, built at the first batched decode step.
     decode_rope_table: Mutex<Option<Qwen3DecodeRopeTable>>,
+    /// The ASR families' whole-step CUDA decode graphs, or why there are
+    /// none ([`Self::enable_asr_decode_graph`]).
+    decode_graph: std::result::Result<Qwen3DecodeGraph, String>,
 }
 
 /// Rows a decode RoPE table starts with. A position past its end rebuilds it
@@ -2758,6 +2971,7 @@ impl Qwen3Model {
             cfg,
             use_mrope,
             decode_rope_table: Mutex::new(None),
+            decode_graph: Err("not enabled for this model".into()),
         })
     }
 
@@ -2826,6 +3040,7 @@ impl Qwen3Model {
             cfg,
             use_mrope,
             decode_rope_table: Mutex::new(None),
+            decode_graph: Err("not enabled for this model".into()),
         })
     }
 
@@ -3083,6 +3298,57 @@ impl Qwen3Model {
         };
         let mut completions =
             KvWriteCompletionCollector::new(first.arena.config(), lowered.logical_slots())?;
+        let cache_refs = caches
+            .iter()
+            .map(|cache| &**cache)
+            .collect::<Vec<&PhysicalPagedKvCache>>();
+        let graphed = match self
+            .decode_graph
+            .as_ref()
+            .ok()
+            .filter(|graph| graph.is_on())
+        {
+            Some(graph) => self.graph_step(
+                graph,
+                input_ids,
+                start_positions,
+                &combined_slots,
+                lowered.as_ref(),
+                &metadata,
+                &cache_refs,
+                &mut completions,
+            )?,
+            None => None,
+        };
+        let logits = match graphed {
+            Some(logits) => logits,
+            None => self.standard_decode_logits(
+                input_ids,
+                start_positions,
+                &cache_refs,
+                lowered.as_ref(),
+                &metadata,
+                &mut completions,
+            )?,
+        };
+        let completion = Arc::new(completions.seal()?);
+        for (row, cache) in caches.iter_mut().enumerate() {
+            cache.commit_shared_completion(start_positions[row], 1, completion.clone())?;
+        }
+        Ok(logits)
+    }
+
+    /// The standard batched decode step: the rows' logits, their K/V
+    /// writes collected in `completions`.
+    fn standard_decode_logits(
+        &self,
+        input_ids: &Tensor,
+        start_positions: &[usize],
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+    ) -> Result<Tensor> {
         let mut x = self.embeddings(input_ids)?;
         if let Some(first_layer) = self.layers.first() {
             // Every layer shares one RoPE geometry: gather the rows' cos/sin
@@ -3093,29 +3359,246 @@ impl Qwen3Model {
                 &self.device,
                 x.dtype(),
             )?;
-            let cache_refs = caches
-                .iter()
-                .map(|cache| &**cache)
-                .collect::<Vec<&PhysicalPagedKvCache>>();
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 x = layer.forward_managed_decode_batch(
                     &x,
                     &rope,
-                    &cache_refs,
-                    lowered.as_ref(),
-                    &metadata,
-                    &mut completions,
+                    caches,
+                    slots,
+                    metadata,
+                    completions,
                     layer_idx,
                 )?;
             }
         }
         let hidden = self.norm.forward(&x)?;
-        let logits = self.logits_from_hidden(&hidden)?;
-        let completion = Arc::new(completions.seal()?);
-        for (row, cache) in caches.iter_mut().enumerate() {
-            cache.commit_shared_completion(start_positions[row], 1, completion.clone())?;
+        self.logits_from_hidden(&hidden)
+    }
+
+    /// Turns on `label`'s whole-step CUDA decode graphs behind `switch`
+    /// ([`super::decode_graph`]): CUDA only, and only for a dense
+    /// feed-forward trunk whose every projection a graph can capture.
+    pub(crate) fn enable_asr_decode_graph(&mut self, label: &'static str, switch: &'static str) {
+        self.decode_graph = if self.cfg.sliding_window().is_some() {
+            Err("sliding-window attention has no graph".into())
+        } else if !self.layers.iter().all(Qwen3Layer::graph_capturable)
+            || !self.lm_head.graph_capturable()
+        {
+            Err("a projection has no K-quant kernel or the feed-forward is sparse".into())
+        } else {
+            Qwen3DecodeGraph::resolve(label, switch, &self.device)
+        };
+    }
+
+    /// Whether decode steps go through the CUDA decode graphs: a lone row
+    /// then decodes as a batch of one, through its width-1 graph.
+    pub(crate) fn decode_graph_on(&self) -> bool {
+        self.decode_graph
+            .as_ref()
+            .is_ok_and(Qwen3DecodeGraph::is_on)
+    }
+
+    pub(crate) fn decode_graph_diagnostics(&self) -> serde_json::Value {
+        match &self.decode_graph {
+            Ok(graph) => graph.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
         }
-        Ok(logits)
+    }
+
+    /// One decode step through `graph`, its K/V write completions collected
+    /// in `completions`: `None` when the step does not fit a graph (more
+    /// rows than the widest, a KV arena or geometry the split decode does
+    /// not serve), so the standard decode runs it. A width's first graphed
+    /// step is checked against the standard decode; a mismatch turns the
+    /// graphs off and the step keeps the standard logits.
+    #[allow(clippy::too_many_arguments)]
+    fn graph_step(
+        &self,
+        graph: &Qwen3DecodeGraph,
+        input_ids: &Tensor,
+        start_positions: &[usize],
+        slots: &[KvSlotRef],
+        slot_map: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        caches: &[&PhysicalPagedKvCache],
+        completions: &mut KvWriteCompletionCollector,
+    ) -> Result<Option<Tensor>> {
+        let rows = start_positions.len();
+        let (Some(width), Some(first_layer)) =
+            (decode_step::graph_width(rows), self.layers.first())
+        else {
+            return Ok(None);
+        };
+        let attention = &first_layer.self_attn;
+        let first = caches[0];
+        let arena = first.arena.clone();
+        let config = arena.config();
+        let dtype = self.embed_tokens.dtype();
+        if caches
+            .iter()
+            .any(|cache| !Arc::ptr_eq(&cache.arena, &arena))
+            || config.dtype != dtype
+            || !split_decode::supported(
+                dtype,
+                attention.num_heads,
+                attention.num_kv_heads,
+                attention.head_dim,
+                attention.head_dim,
+            )
+        {
+            return Ok(None);
+        }
+        let page_tokens = config.page_tokens;
+        let positions = start_positions
+            .iter()
+            .map(|&pos| {
+                u32::try_from(attention.decode_rope_position(pos))
+                    .map_err(|_| Error::InvalidInput("Qwen3 RoPE position exceeds u32".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let needed = positions.iter().max().map_or(1, |&pos| pos as usize + 1);
+        let (cos, sin, rope_rows) = attention.decode_rope_table_rows(
+            &self.decode_rope_table,
+            needed,
+            &self.device,
+            dtype,
+        )?;
+        let step_rows = positions
+            .iter()
+            .zip(slots)
+            .zip(&metadata.sequences)
+            .map(|((position, slot), sequence)| {
+                DecodeStepRow::new(*position, slot, sequence, page_tokens)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let longest = step_rows
+            .iter()
+            .map(|row| row.blocks.len())
+            .max()
+            .unwrap_or(1);
+        let layout = DecodeStepLayout::for_blocks(width, longest);
+        let step = layout.upload(&step_rows, &self.device)?;
+        let ids = input_ids.reshape((rows, 1))?;
+        let ids = if width > rows {
+            ids.pad_with_zeros(0, 0, width - rows)?
+        } else {
+            ids
+        };
+        let bindings = (0..self.layers.len())
+            .map(|layer| first.layer_binding(layer))
+            .collect::<Result<Vec<_>>>()?;
+        let page_tokens = page_tokens as usize;
+        let max_partitions = decode_step::max_partitions(
+            width,
+            attention.num_kv_heads,
+            layout.max_context(page_tokens),
+        );
+        // The graph keeps stable copies of its inputs and its logits.
+        let tensor_bytes = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+        let retained = tensor_bytes(&ids)
+            + tensor_bytes(&step)
+            + (width * self.cfg.vocab_size * std::mem::size_of::<f32>()) as u64;
+        let inputs = [ids, step];
+        let mut output = None;
+        let graph_completions = arena.with_graph_writes(
+            &bindings,
+            slot_map,
+            self.layers.len() as u64,
+            &mut |layers| {
+                let key = GraphKey {
+                    width,
+                    arena: arena.id(),
+                    generation: layers.generation,
+                    max_blocks: layout.max_blocks,
+                    rope_rows,
+                };
+                let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+                    let [ids, step] = inputs else {
+                        return Err(Error::InferenceError(format!(
+                            "Qwen3 decode graph received {} inputs, expected 2",
+                            inputs.len()
+                        )));
+                    };
+                    let attention = Qwen3GraphAttention {
+                        caches: &layers.layers,
+                        slots: step.narrow(0, layout.slots(), width)?,
+                        metadata: step.narrow(0, layout.metadata(), layout.metadata_len())?,
+                        page_tokens,
+                        max_blocks: layout.max_blocks,
+                        max_partitions,
+                    };
+                    let positions = step.narrow(0, layout.positions(), width)?;
+                    Ok(vec![self.graph_decode_body(
+                        ids, &positions, &cos, &sin, &attention,
+                    )?])
+                };
+                output = graph.graphs.run(key, retained, &inputs, &body)?.pop();
+                Ok(())
+            },
+        )?;
+        for completion in graph_completions {
+            completions.collect(completion)?;
+        }
+        let logits = output
+            .ok_or_else(|| Error::InferenceError("Qwen3 decode graph returned nothing".into()))?;
+        let logits = if width > rows {
+            logits.narrow(0, 0, rows)?
+        } else {
+            logits
+        };
+        graph.record_step(rows, width);
+        if !graph.needs_check(width) {
+            return Ok(Some(logits));
+        }
+        // The check: the standard decode of the same rows, its writes (the
+        // same K/V) collected and sealed apart.
+        let mut reference_completions =
+            KvWriteCompletionCollector::new(config, slot_map.logical_slots())?;
+        let reference = self.standard_decode_logits(
+            input_ids,
+            start_positions,
+            caches,
+            slot_map,
+            metadata,
+            &mut reference_completions,
+        );
+        let sealed = reference_completions.seal();
+        let reference = reference?;
+        sealed?;
+        match decode_step::logits_agree(&logits, &reference) {
+            Ok(_) => {
+                graph.mark_checked(width);
+                Ok(Some(logits))
+            }
+            Err(reason) => {
+                graph.disable(format!("a {rows}-row step (width {width}): {reason}"));
+                Ok(Some(reference))
+            }
+        }
+    }
+
+    /// The decode graphs' body over a padded step: token embeddings, every
+    /// layer through [`Qwen3Layer::forward_graph_decode`], the final norm
+    /// and the logits, quantized projections on the K-quant kernels.
+    fn graph_decode_body(
+        &self,
+        ids: &Tensor,
+        positions: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention: &Qwen3GraphAttention<'_>,
+    ) -> Result<Tensor> {
+        let _projections = GraphProjections::enter();
+        let rope = Qwen3DecodeRopeRows {
+            cos: cos.index_select(positions, 0)?,
+            sin: sin.index_select(positions, 0)?,
+        };
+        let mut x = self.embeddings(ids)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_graph_decode(&x, &rope, attention, layer_idx)?;
+        }
+        let hidden = self.norm.forward(&x)?;
+        self.logits_from_hidden(&hidden)
     }
 
     /// One forward over a mixed step: `input_ids` holds every row's new
@@ -3983,6 +4466,7 @@ mod tests {
             cfg,
             use_mrope: false,
             decode_rope_table: Mutex::new(None),
+            decode_graph: Err("not enabled for this model".into()),
         }
     }
 
@@ -4271,6 +4755,35 @@ mod tests {
             .unwrap()
     }
 
+    /// The ASR decode graphs never resolve off CUDA, so a CPU or Metal model
+    /// keeps the standard decode and its lone-row route; a sparse
+    /// feed-forward (host expert routing) never has graphs.
+    #[test]
+    fn asr_decode_graphs_stay_off_off_cuda_and_for_sparse_trunks() {
+        use super::super::decode_graph::QWEN3_ASR_DECODE_GRAPHS_ENV;
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut dense = tiny_qwen3_model(&Device::Cpu);
+        assert!(!dense.decode_graph_on());
+        assert_eq!(
+            dense.decode_graph_diagnostics()["off"],
+            "not enabled for this model"
+        );
+        dense.enable_asr_decode_graph("test", QWEN3_ASR_DECODE_GRAPHS_ENV);
+        assert!(!dense.decode_graph_on());
+        let reason = dense.decode_graph_diagnostics()["off"].to_string();
+        assert!(
+            reason.contains("CUDA only") || reason.contains(QWEN3_ASR_DECODE_GRAPHS_ENV),
+            "{reason}"
+        );
+        let mut sparse = tiny_qwen3_moe_model(&Device::Cpu, 2);
+        sparse.enable_asr_decode_graph("test", QWEN3_ASR_DECODE_GRAPHS_ENV);
+        assert!(sparse.decode_graph_diagnostics()["off"]
+            .to_string()
+            .contains("sparse"));
+    }
+
     /// Tiny sparse-MoE twin of [`tiny_qwen3_model`]: identical embeddings,
     /// attention, norms, and head, with the FFN replaced by `num_experts`
     /// experts that all share the dense MLP's exact weights. With normalized
@@ -4368,6 +4881,7 @@ mod tests {
             cfg,
             use_mrope: false,
             decode_rope_table: Mutex::new(None),
+            decode_graph: Err("not enabled for this model".into()),
         }
     }
 

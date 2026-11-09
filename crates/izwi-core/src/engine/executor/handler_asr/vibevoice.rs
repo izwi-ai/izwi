@@ -347,9 +347,14 @@ impl NativeExecutor {
             };
             // A finishing row publishes its diagnostics once.
             let diagnostics = (finished && !cancelled).then(|| {
-                active
-                    .clock
-                    .diagnostics(active.state.retained_terminal_diagnostics())
+                let mut diagnostics = active.state.retained_terminal_diagnostics();
+                if let (Some(diagnostics), Some(graph)) = (
+                    diagnostics.as_mut(),
+                    active.model.decode_graph_diagnostics(),
+                ) {
+                    diagnostics["decode_graph"] = graph;
+                }
+                active.clock.diagnostics(diagnostics)
             });
             Ok((
                 generated,

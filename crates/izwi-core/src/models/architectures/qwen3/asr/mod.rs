@@ -251,6 +251,12 @@ fn qwen3_asr_retained_state_contract(
 }
 
 impl Qwen3AsrModel {
+    /// The text decoder's CUDA decode graphs: captures, replays and why
+    /// they are off.
+    pub(crate) fn decode_graph_diagnostics(&self) -> serde_json::Value {
+        self.text_model.decode_graph_diagnostics()
+    }
+
     pub(crate) fn audio_preparation_row_geometry(
         &self,
         input_samples: usize,
@@ -1717,7 +1723,7 @@ impl Qwen3AsrModel {
         // the lowered GGUF audio tower does.
         let (check_audio, check_text) =
             (qwen3_asr_audio_probe(device.kind), device.kind.is_metal());
-        let (audio_tower, audio_precision, text_model, text_precision) =
+        let (audio_tower, audio_precision, mut text_model, text_precision) =
             if let Some(gguf_path) = gguf_path.as_ref() {
                 let loader = gguf_loader.as_ref().ok_or_else(|| {
                     Error::ModelLoadError("Qwen ASR GGUF loader missing for GGUF path".to_string())
@@ -1796,6 +1802,10 @@ impl Qwen3AsrModel {
                 )?
             };
         let (audio_dtype, text_dtype) = (audio_precision.loaded, text_precision.loaded);
+        text_model.enable_asr_decode_graph(
+            "Qwen3-ASR",
+            super::decode_graph::QWEN3_ASR_DECODE_GRAPHS_ENV,
+        );
 
         info!(
             "Loaded Qwen speech-family model on {:?} (audio_dtype={:?}: {}; text_dtype={:?}: {})",
@@ -3270,7 +3280,8 @@ fn forward_asr_pending_decode_batch(
         ));
     }
     let input_ids = Tensor::from_vec(pending_tokens, (states.len(), 1), device)?;
-    let output = if states.len() == 1 {
+    // With the decode graphs on, a lone row decodes through the width-1 graph.
+    let output = if states.len() == 1 && !text_model.decode_graph_on() {
         let state = &mut *states[0];
         text_model.forward_managed(
             &input_ids,
