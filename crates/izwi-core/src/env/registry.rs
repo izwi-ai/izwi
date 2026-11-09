@@ -2772,9 +2772,9 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_VIBEVOICE_ASR_CUDA_MAX_AUDIO_SECS",
         Float,
-        "3600",
+        "300",
         Once,
-        "Lowers the VibeVoice ASR max audio-seconds hint on CUDA (positive, capped at 3600); ignored off CUDA.",
+        "Sets the longest VibeVoice ASR single pass on CUDA in seconds; longer input is chunked. The 300 s default exists because a 600 s single pass ran out of memory on an 80 GB H100. Positive, capped at the model's 3600 s window; ignored off CUDA.",
     ),
     CoreEnvVar::new(
         "IZWI_VIBEVOICE_ASR_DECODE_GRAPHS",

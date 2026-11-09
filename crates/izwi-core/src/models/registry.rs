@@ -5245,6 +5245,17 @@ pub struct VoxtralModelLease {
 }
 
 impl VoxtralModelLease {
+    #[cfg(test)]
+    pub(crate) fn for_test(model: VoxtralRealtimeModel) -> Self {
+        let uses = Arc::new(ModelUseState::default());
+        Self {
+            inner: TrackedModelLease {
+                model: Arc::new(model),
+                _guard: uses.acquire().expect("fresh test model lease"),
+            },
+        }
+    }
+
     pub(crate) fn model_arc(&self) -> Arc<VoxtralRealtimeModel> {
         self.inner.model.clone()
     }

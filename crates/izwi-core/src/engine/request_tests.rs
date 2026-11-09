@@ -240,6 +240,74 @@ fn prepared_qwen_asr_routes_are_mutually_exclusive() {
         .is_err());
 }
 
+/// An offline Voxtral request prepared on either route (a retained row with
+/// its encoded audio, or the long-form atomic graph) validates for its ASR
+/// task and hands the executor its model and artifact. On the H100 at
+/// 1fd25ae1f every request failed with "carries incremental preparation for
+/// a different task": the task check had no Voxtral ASR arm.
+#[test]
+fn prepared_voxtral_offline_requests_reach_the_executor_on_both_routes() {
+    use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
+    use crate::models::registry::VoxtralModelLease;
+    let variant = ModelVariant::VoxtralMini4BRealtime2602;
+    let model = VoxtralRealtimeModel::tiny_for_test();
+    let audio = (0..16_000)
+        .map(|index| (index as f32 * 0.013).sin() * 0.2)
+        .collect::<Vec<f32>>();
+    let prompt_tokens = model.offline_prompt_tokens().unwrap();
+    let artifact = Arc::new(model.prepare_offline_audio(&audio, 16_000).unwrap());
+    let lease = VoxtralModelLease::for_test(model);
+
+    let mut row = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+    row.install_prepared_asr_audio(variant, audio.clone(), 16_000)
+        .unwrap();
+    row.install_voxtral_asr_execution_model(
+        variant,
+        lease.clone(),
+        Some(artifact.clone()),
+        prompt_tokens,
+    )
+    .unwrap();
+    assert!(row.uses_asr_retained_sequence());
+    row.validate_incremental_model_execution_preparation()
+        .unwrap();
+    assert!(row
+        .prepared_voxtral_model_lease_for_executor()
+        .unwrap()
+        .is_some());
+    assert!(Arc::ptr_eq(
+        &row.prepared_voxtral_artifact_for_executor()
+            .unwrap()
+            .unwrap(),
+        &artifact
+    ));
+    assert_eq!(
+        row.params.max_tokens,
+        artifact.prepared_frames() - prompt_tokens + 1
+    );
+
+    let mut long = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+    long.install_prepared_asr_audio(variant, audio, 16_000)
+        .unwrap();
+    long.install_prepared_asr_long_form_atomic(
+        crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+    )
+    .unwrap();
+    long.install_voxtral_asr_execution_model(variant, lease, None, prompt_tokens)
+        .unwrap();
+    assert!(long.uses_asr_long_form_atomic());
+    long.validate_incremental_model_execution_preparation()
+        .unwrap();
+    assert!(long
+        .prepared_voxtral_model_lease_for_executor()
+        .unwrap()
+        .is_some());
+    assert!(long
+        .prepared_voxtral_artifact_for_executor()
+        .unwrap()
+        .is_none());
+}
+
 #[test]
 fn vibevoice_request_projects_only_acoustic_prefill_into_audio_samples() {
     let variant = ModelVariant::VibeVoiceAsr;
