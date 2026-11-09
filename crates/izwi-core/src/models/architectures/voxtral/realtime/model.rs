@@ -1934,25 +1934,12 @@ impl VoxtralRealtimeModel {
         source_samples: usize,
         sample_rate: u32,
     ) -> Result<(u64, u64)> {
-        let geometry = realtime_preparation_geometry_for(
+        offline_preparation_bytes_for(
+            &self.layout,
             source_samples,
             sample_rate,
-            &self.layout,
-            VoxtralRealtimePreparationMode::Complete,
-        )?;
-        let workspace = realtime_workspace_bytes_for(
-            &self.layout,
-            geometry.mel_frames,
-            geometry.conv2_frames,
             self.dtype.size_in_bytes(),
-        )?;
-        let embeddings = geometry
-            .embedding_elements
-            .checked_mul(self.dtype.size_in_bytes() as u64)
-            .ok_or_else(|| {
-                Error::Overloaded("Voxtral offline embedding bytes overflowed".into())
-            })?;
-        Ok((workspace, embeddings))
+        )
     }
 
     /// Prepare one offline request: its whole audio and the final padding
@@ -3878,6 +3865,101 @@ fn realtime_workspace_bytes_for(
         layout.encoder_sliding_window,
         dtype_bytes,
     )
+}
+
+/// The encoder workspace one offline row of `source_samples` at
+/// `sample_rate` takes (its whole audio and final padding, encoded once) and
+/// the bytes its prepared embeddings keep.
+fn offline_preparation_bytes_for(
+    layout: &VoxtralRealtimeLayout,
+    source_samples: usize,
+    sample_rate: u32,
+    dtype_bytes: usize,
+) -> Result<(u64, u64)> {
+    let geometry = realtime_preparation_geometry_for(
+        source_samples,
+        sample_rate,
+        layout,
+        VoxtralRealtimePreparationMode::Complete,
+    )?;
+    let workspace = realtime_workspace_bytes_for(
+        layout,
+        geometry.mel_frames,
+        geometry.conv2_frames,
+        dtype_bytes,
+    )?;
+    let embeddings = geometry
+        .embedding_elements
+        .checked_mul(dtype_bytes as u64)
+        .ok_or_else(|| Error::Overloaded("Voxtral offline embedding bytes overflowed".into()))?;
+    Ok((workspace, embeddings))
+}
+
+/// The published Voxtral Mini 4B Realtime 2602 layout (the config fixture
+/// under `tests/fixtures/voxtral_realtime_2602`), so pricing tests outside
+/// this module see the shipped geometry without weights.
+#[cfg(test)]
+pub(crate) struct PublishedVoxtralRealtimePricing {
+    layout: VoxtralRealtimeLayout,
+    ceiling: usize,
+    dtype_bytes: usize,
+}
+
+#[cfg(test)]
+impl PublishedVoxtralRealtimePricing {
+    pub(crate) fn load(dtype: DType) -> Self {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/voxtral_realtime_2602");
+        let params = std::fs::read_to_string(dir.join("params.json")).unwrap();
+        let config: VoxtralConfig = serde_json::from_str(&params).unwrap();
+        let runtime = load_voxtral_runtime_config(&dir).unwrap();
+        let geometry = realtime_audio_geometry(&config, &runtime);
+        let tekken = std::fs::read_to_string(dir.join("tekken_audio.json")).unwrap();
+        let audio = super::tokenizer::merge_tekken_audio_metadata(geometry.audio, &tekken).unwrap();
+        let layout = VoxtralRealtimeLayout::new(
+            &config,
+            &audio,
+            geometry.block_pool_size,
+            geometry.audio_length_per_tok,
+        )
+        .unwrap();
+        let ceiling = realtime_source_sample_ceiling(&config, &layout).unwrap();
+        Self {
+            layout,
+            ceiling,
+            dtype_bytes: dtype.size_in_bytes(),
+        }
+    }
+
+    /// The preparation seal a load of this layout publishes.
+    pub(crate) fn seal(&self) -> VoxtralRealtimePreparationStageSeal {
+        realtime_preparation_stage_seal_for(&self.layout, self.ceiling, self.dtype_bytes).unwrap()
+    }
+
+    /// The longest source, at the model rate, one row may hold.
+    pub(crate) fn ceiling_samples(&self) -> usize {
+        self.ceiling
+    }
+
+    /// An offline row's stable frames and encoder workspace, or `None` when
+    /// its audio passes the ceiling and the request runs the atomic graph.
+    pub(crate) fn offline_row(&self, samples: usize, sample_rate: u32) -> Option<(usize, u64)> {
+        let resampled = resampled_length(samples, sample_rate, self.layout.target_rate).ok()?;
+        if resampled > self.ceiling {
+            return None;
+        }
+        let geometry = realtime_preparation_geometry_for(
+            samples,
+            sample_rate,
+            &self.layout,
+            VoxtralRealtimePreparationMode::Complete,
+        )
+        .unwrap();
+        let (workspace, _) =
+            offline_preparation_bytes_for(&self.layout, samples, sample_rate, self.dtype_bytes)
+                .unwrap();
+        Some((geometry.stable_frames, workspace))
+    }
 }
 
 /// The worst preparation transaction a loaded model admits: one row holding

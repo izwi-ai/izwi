@@ -38,6 +38,7 @@ mod factories;
 mod realtime;
 mod sequence_asr;
 mod tts;
+pub(crate) use asr::voxtral_offline_preparation_cost;
 use asr::{
     ContinuousAsrExecutionAdapter, Lfm25AudioAsrExecutionAdapter, Lfm3AudioAsrExecutionAdapter,
     NemotronAsrExecutionAdapter, NemotronTranscribeAsrExecutionAdapter,

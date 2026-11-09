@@ -17,8 +17,9 @@ mod loaded;
 mod table;
 
 pub(crate) use loaded::{
-    contract_supports_atomic_blocking, LoadedCapabilityBinding, LoadedExecutionContract,
-    LoadedModelBundle, LoadedModelBundleDraft, LoadedStatePublication, StreamingRequirements,
+    contract_supports_atomic_blocking, voxtral_offline_preparation_cost, LoadedCapabilityBinding,
+    LoadedExecutionContract, LoadedModelBundle, LoadedModelBundleDraft, LoadedStatePublication,
+    StreamingRequirements,
 };
 pub(crate) use table::{capability_row, capability_rows, RealtimeAsrPath};
 

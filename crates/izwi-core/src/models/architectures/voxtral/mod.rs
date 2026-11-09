@@ -437,11 +437,13 @@ pub(crate) fn voxtral_offline_physical_state_spec(
         );
         let valid = stages.len() == 3
             && preparation.is_some_and(|stage| {
+                // A row prices its own encoder workspace; the stage seals
+                // only the maximum.
                 stage.id.get() == 0
                     && stage.batch_mode == NativeBatchMode::None
                     && stage.max_batch_size == 1
                     && stage.concurrency == ConcurrencyClass::Exclusive
-                    && stage.workspace_per_row_bytes > 0
+                    && stage.max_workspace_bytes > 0
             })
             && prefill.is_some_and(|stage| {
                 stage.id.get() == 1

@@ -1737,6 +1737,63 @@ fn voxtral_offline_rows_bind_a_row_graph_and_long_audio_the_atomic_graph() {
     }
 }
 
+/// Every offline Voxtral row the row graph admits fits the preparation stage
+/// it binds, at the published geometry: the request's own encoder workspace
+/// plus whatever the stage adds per row stays within the maximum the load
+/// sealed, from 5 s clips to the longest row (the realtime ceiling, at
+/// 16 kHz and after a 44.1 kHz resample). On the H100 at af9ba52b6 every
+/// request was refused ("native preparation workspace 1453588480 exceeds
+/// loaded stage maximum 1180958720"): the stage added its sealed maximum per
+/// row on top of the workspace the row already priced.
+#[test]
+fn voxtral_offline_rows_fit_their_sealed_preparation_stage() {
+    use crate::models::architectures::voxtral::realtime::PublishedVoxtralRealtimePricing;
+    use crate::runtime::adapters::voxtral_offline_preparation_cost;
+    use crate::runtime::coordinator::native_preparation_workspace;
+    let variant = ModelVariant::VoxtralMini4BRealtime2602;
+    let metadata = *RuntimeAdapterRegistry::built_in()
+        .require(CapabilityKind::Asr, variant)
+        .unwrap();
+    for (backend, dtype) in [
+        (BackendKind::Cuda, candle_core::DType::BF16),
+        (BackendKind::Metal, candle_core::DType::BF16),
+        (BackendKind::Cpu, candle_core::DType::F32),
+    ] {
+        let pricing = PublishedVoxtralRealtimePricing::load(dtype);
+        let adapter = VoxtralAsrExecutionAdapter::new(
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(9),
+            metadata,
+            backend,
+            8,
+        )
+        .with_decode_batch_size(32);
+        adapter.install_preparation_seal(pricing.seal()).unwrap();
+        let contract = adapter.contract(StreamingRequirements::NONE).unwrap();
+        let stage = &contract.stages[0];
+        assert_eq!(stage.selector, StageWorkSelector::PreSequencePreparation);
+        let ceiling = pricing.ceiling_samples();
+        let mut clips = (1..=6)
+            .map(|step| (step * 5 * 16_000, 16_000u32))
+            .collect::<Vec<_>>();
+        clips.push((ceiling, 16_000));
+        clips.push((ceiling / 16_000 * 44_100, 44_100));
+        for (samples, rate) in clips {
+            let (frames, workspace) = pricing
+                .offline_row(samples, rate)
+                .unwrap_or_else(|| panic!("{samples} samples at {rate} Hz run as a row"));
+            let cost = voxtral_offline_preparation_cost(backend, frames, workspace).unwrap();
+            assert!(cost.logical_units <= stage.max_work_units);
+            let reserved = native_preparation_workspace(stage, cost, 1).unwrap_or_else(|error| {
+                panic!("{backend:?} {samples} samples at {rate} Hz: {error}")
+            });
+            assert!(reserved.workspace_bytes().unwrap() <= stage.max_workspace_bytes);
+        }
+        // Past the ceiling the request runs the atomic graph, not this stage.
+        assert!(pricing.offline_row(ceiling + 16_000, 16_000).is_none());
+    }
+}
+
 #[test]
 fn voxtral_streaming_binds_to_its_exact_token_engine_adapter() {
     let variant = ModelVariant::VoxtralMini4BRealtime2602;

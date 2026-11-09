@@ -1708,11 +1708,8 @@ impl RuntimeService {
         };
         let units = u64::try_from(frames)
             .map_err(|_| Error::Overloaded("Voxtral preparation frames exceed u64".into()))?;
-        let cost = crate::engine::WorkCost::with_workspace(
-            units,
-            units,
-            super::tts_preparation::lfm25_audio_tts_preparation_workspace(backend, workspace),
-        );
+        let cost =
+            crate::runtime::adapters::voxtral_offline_preparation_cost(backend, frames, workspace)?;
         let features = features.ok_or_else(|| {
             Error::InferenceError("Voxtral offline row lost its host features".into())
         })?;
