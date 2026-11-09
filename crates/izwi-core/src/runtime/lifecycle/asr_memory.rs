@@ -4151,7 +4151,7 @@ pub(super) mod tests {
             (
                 "Nemotron-3.5-ASR-0.6B",
                 Box::new(nemotron),
-                [2.38, 1.24, 1.24, 1.20],
+                [2.38, 1.24, 1.24, 2.40],
             ),
             (
                 "Whisper-L-v3-Turbo",
@@ -4161,12 +4161,12 @@ pub(super) mod tests {
             (
                 "Qwen3-ASR-0.6B",
                 Box::new(|b| qwen3_asr(&qwen06, b)),
-                [1.29, 0.94, 1.05, 0.94],
+                [1.29, 0.94, 1.05, 1.29],
             ),
             (
                 "Qwen3-ASR-1.7B",
                 Box::new(|b| qwen3_asr(&qwen17, b)),
-                [2.89, 2.30, 2.30, 2.30],
+                [2.89, 2.30, 2.30, 2.89],
             ),
             (
                 "Granite-Speech-Plus",
@@ -4333,8 +4333,8 @@ pub(super) mod tests {
         // About 2.5 GB of weights become about 1.3 GB.
         assert_eq!(weights, 2_508_229_144);
         assert_eq!(weights - projections * 2, 1_291_880_984);
-        // Nemotron: F32 on CPU and Metal; BF16 on CUDA plus transposed copies
-        // of the two LSTM layers' input and hidden weights. Metal stores the
+        // Nemotron: F32 on every backend, plus transposed F32 copies of the
+        // two LSTM layers' input and hidden weights on CUDA. Metal stores the
         // encoder projections in F16, as for Parakeet (a 4352-wide
         // subsampling output projection).
         let files = census!("nemotron_3_5_asr_streaming_0_6b.json");
@@ -4347,7 +4347,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             nemotron(BackendKind::Cuda).resident_bytes,
-            weights / 2 + 4 * 2560 * 640 * 2
+            weights + 4 * 2560 * 640 * 4
         );
         for backend in BACKENDS {
             let plan = nemotron(backend);
@@ -4639,10 +4639,11 @@ pub(super) mod tests {
         );
     }
 
-    /// The Qwen3-ASR GGUF audio tower is priced at BF16 on CUDA, and a
-    /// failed load-time probe's reload prices only the probed components at
-    /// F32: the tower on CUDA and Metal, the text on Metal. CPU and an
-    /// F32 tower reload nothing.
+    /// The Qwen3-ASR GGUF audio tower is priced at F32 on CUDA by default
+    /// (a BF16 tower was batch-variant on the H100), so it reloads nothing.
+    /// A tower lowered by override, and a failed load-time probe's reload,
+    /// price only the probed components at F32: the tower on CUDA and Metal,
+    /// the text on Metal. CPU and an F32 tower reload nothing.
     #[test]
     fn qwen3_asr_precision_reload_prices_the_probed_components_at_f32() {
         let _env = env_lock();
@@ -4655,13 +4656,19 @@ pub(super) mod tests {
             Some(QWEN3_ASR_GGUF_CHECKPOINT_DTYPE),
         )
         .unwrap();
-        assert_eq!((text_dtype, audio_dtype), (DType::BF16, DType::BF16));
-        let load = Qwen3AsrLoad {
+        assert_eq!((text_dtype, audio_dtype), (DType::BF16, DType::F32));
+        let default = Qwen3AsrLoad {
             text_dtype,
             audio_dtype,
             qmatmul_text: true,
             packed_projections: false,
             tied_head: true,
+        };
+        assert!(qwen3_asr_precision_reload(BackendKind::Cuda, default).is_none());
+        // `IZWI_QWEN_ASR_AUDIO_DTYPE=bf16` lowers the tower again.
+        let load = Qwen3AsrLoad {
+            audio_dtype: DType::BF16,
+            ..default
         };
         let cuda = qwen3_asr_precision_reload(BackendKind::Cuda, load).unwrap();
         assert_eq!(

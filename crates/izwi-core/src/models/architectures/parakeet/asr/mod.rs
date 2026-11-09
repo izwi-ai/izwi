@@ -4720,6 +4720,18 @@ mod tests {
         }
     }
 
+    /// The load-time dispatch self-check runs (here with the select step on
+    /// the host) and finds the two forms agree. Its synthetic rows take an
+    /// unbounded `usize::MAX` budget, which the packed u32 limits once
+    /// refused, so on the H100 the check never ran and the device decode
+    /// stayed off for every Parakeet load.
+    #[test]
+    fn device_decode_self_check_runs_with_unbounded_budgets() {
+        let device = Device::Cpu;
+        let model = random_decoder_model(&device, 0xDEC0_DE02);
+        assert_eq!(model.dispatch_self_check().unwrap(), None);
+    }
+
     /// Drives a retained cohort as the engine's handler does, at `quota`
     /// tokens per row and step: each step's new tokens (at most the quota),
     /// its delta appended to the row's stream (which must equal the step's

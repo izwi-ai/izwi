@@ -6757,6 +6757,57 @@ async fn formation_stages_transactions_only_for_rows_the_step_launches() {
     drop(prepared);
 }
 
+/// The managed loader pools a per-sequence context across the engine's
+/// sequences, and each sequence keeps that context as its cap. An automatic
+/// ASR pool (Qwen3-ASR, VibeVoice-ASR, Granite Speech) already holds one
+/// sequence per row: passed as a context it was pooled a second time (8
+/// rows of 256 tokens became 8 x 2,048). The pooled loader takes it as given
+/// and lets a sequence claim all of it.
+#[test]
+fn a_pool_sized_by_its_rows_is_not_pooled_again() {
+    let contract = crate::kv::test_contract();
+    let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
+    let mut config = EngineCoreConfig {
+        max_retained_sequences: 8,
+        max_staged_transactions: 8,
+        max_num_seqs: Some(8),
+        max_seq_len: 1 << 20,
+        backend: BackendKind::Cpu,
+        ..Default::default()
+    };
+    config.portable_context_auto = true;
+    let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+    let rows = (8, 8);
+    let per_sequence = core
+        .load_managed_model_state_with_portable_copies_and_rows(
+            ModelInstanceId::new(61),
+            &contract,
+            Some(256),
+            2,
+            rows,
+            1,
+            crate::engine::StateFitReserve::MeasuredUntracked,
+            0,
+        )
+        .unwrap();
+    assert_eq!(per_sequence.logical_token_reach(), 8 * 256);
+    assert_eq!(per_sequence.maximum_sequence_tokens(), 256);
+
+    let pooled = core
+        .load_pooled_managed_model_state_with_portable_copies(
+            ModelInstanceId::new(62),
+            &contract,
+            8 * 256,
+            2,
+            rows,
+            1,
+            crate::engine::StateFitReserve::MeasuredUntracked,
+        )
+        .unwrap();
+    assert_eq!(pooled.logical_token_reach(), 8 * 256);
+    assert_eq!(pooled.maximum_sequence_tokens(), 8 * 256);
+}
+
 #[test]
 fn automatic_staged_rows_do_not_cap_a_model_fitted_staging_width() {
     let contract = crate::kv::test_contract();

@@ -298,13 +298,19 @@ fn asr_minimum_tokens(variant: ModelVariant) -> u64 {
 }
 
 /// Tokens of a retained ASR pool that every sequence claims its pages from:
-/// one `sequence_tokens` sequence per retained row, and never less than one
-/// sequence of the model's whole `context_tokens`, which still bounds each
-/// sequence on its own.
-fn asr_shared_pool_tokens(context_tokens: usize, sequence_tokens: u64, rows: usize) -> usize {
-    usize::try_from(sequence_tokens)
+/// one `sequence_tokens` sequence per retained row in whole `page_tokens`
+/// pages, and never less than one sequence of the model's whole
+/// `context_tokens`, which still bounds each sequence on its own.
+fn asr_shared_pool_tokens(
+    context_tokens: usize,
+    sequence_tokens: u64,
+    rows: usize,
+    page_tokens: usize,
+) -> usize {
+    let sequence = usize::try_from(sequence_tokens)
         .unwrap_or(usize::MAX)
-        .min(context_tokens)
+        .min(context_tokens);
+    crate::runtime::asr_pool_sequence_tokens(sequence, page_tokens)
         .saturating_mul(rows.max(1))
         .max(context_tokens)
 }

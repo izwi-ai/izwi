@@ -29,11 +29,6 @@ const MIN_SEGMENT_SECS: f32 = 5.0;
 /// Segments one translation keeps in flight: the CUDA decode width. More
 /// would only queue in the engine.
 const SEGMENTS_IN_FLIGHT: usize = 8;
-/// A segment's decode budget per second of audio, plus a reserve: several
-/// times what dense speech needs in any target language. A row books KV for
-/// its whole budget, so it stays near what the audio can need.
-const SEGMENT_TOKENS_PER_SECOND: f32 = 16.0;
-const SEGMENT_TOKEN_RESERVE: usize = 64;
 
 /// The segment length of `variant`'s `task`, or `None` when it runs in one
 /// pass: it is not a Nemotron 3.5 Transcribe translation, or segments are
@@ -98,10 +93,13 @@ pub(in crate::runtime) fn plan_translation_segments(
     segments
 }
 
-/// A segment's decode budget: the duration's, or the caller's when smaller.
+/// A segment's decode budget: the duration's planned decode (16 tokens a
+/// second and 64 more, as an untranslated request's), or the caller's when
+/// smaller. A row books KV for its whole budget, so it stays near what the
+/// audio can need.
 fn segment_max_tokens(seconds: f64, requested: Option<usize>) -> usize {
-    let budget = (seconds.max(0.0) as f32 * SEGMENT_TOKENS_PER_SECOND).ceil() as usize
-        + SEGMENT_TOKEN_RESERVE;
+    use crate::models::architectures::nemotron_transcribe::planned_decode_tokens;
+    let budget = planned_decode_tokens(seconds as f32);
     requested
         .map_or(budget, |requested| requested.min(budget))
         .max(1)

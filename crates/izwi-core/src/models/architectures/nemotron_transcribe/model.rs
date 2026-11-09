@@ -51,10 +51,13 @@ use crate::models::shared::detokenize::IncrementalDetokenizer;
 pub const MAX_CONTEXT_TOKENS: usize = 65_536;
 /// The card's completion budget.
 pub const MAX_NEW_TOKENS: usize = 16_384;
-/// The planned decode for KV booking: 8 tokens per second of audio covers
-/// CJK and tag-heavy output, plus a fixed margin.
-pub const PLANNED_TOKENS_PER_SECOND: f64 = 8.0;
-pub const PLANNED_DECODE_MARGIN: usize = 128;
+/// The planned decode: what a request that omits its budget decodes at most
+/// and books KV for, transcription and translation alike. 16 tokens per
+/// second of audio is several times what dense speech needs in any script
+/// or target language (the densest clip of the 2026-11-08 H100 matrix took
+/// 6.4), plus a fixed margin.
+pub const PLANNED_TOKENS_PER_SECOND: f64 = 16.0;
+pub const PLANNED_DECODE_MARGIN: usize = 64;
 /// The longest recording one request takes (the model's trained maximum and
 /// izwi's ASR cap).
 pub const MAX_AUDIO_SECONDS: f32 = 3_600.0;
@@ -149,7 +152,7 @@ pub fn prefill_workspace_bytes(config: &NemotronTranscribeConfig, spans: &[usize
     activations + spans.len() as u64 * (window + super::decoder::state::recurrent_state_bytes(d))
 }
 
-/// `min(16384, ceil(8 * seconds) + 128)`, the decode a request books.
+/// `min(16384, ceil(16 * seconds) + 64)`, the decode a request books.
 pub fn planned_decode_tokens(audio_seconds: f32) -> usize {
     ((f64::from(audio_seconds.max(0.0)) * PLANNED_TOKENS_PER_SECOND).ceil() as usize
         + PLANNED_DECODE_MARGIN)

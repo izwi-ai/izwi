@@ -152,7 +152,7 @@ impl ParakeetAsrModel {
 
     /// One dispatch of two random rows (24 and 9 frames, a quota of four)
     /// on the device and in its host form; `None` when they agree.
-    fn dispatch_self_check(&self) -> Result<Option<String>> {
+    pub(super) fn dispatch_self_check(&self) -> Result<Option<String>> {
         let device = self.network.predictor.embed.device();
         let dim = self.network.encoder.geometry.dim;
         let artifact = |len: usize, seed: u64| -> Result<ParakeetPreparedEncoderArtifact> {
@@ -304,7 +304,9 @@ impl ParakeetAsrModel {
             let l = &mut limits[b * LIMIT_FIELDS..(b + 1) * LIMIT_FIELDS];
             l[limit_field::LEN] = fits(len)?;
             l[limit_field::GUARD] = fits(guard_limit)?;
-            l[limit_field::BUDGET] = fits(row.max_tokens.max(1))?;
+            // A budget past u32 is unbounded for any row the decode can
+            // emit (the dispatch self-check's rows take `usize::MAX`).
+            l[limit_field::BUDGET] = fits(row.max_tokens.clamp(1, u32::MAX as usize))?;
             l[limit_field::QUOTA] = fits(row.quota.max(1))?;
             l[limit_field::FIRST] = fits(cursor.t)?;
             l[limit_field::WINDOW] = fits(window)?;

@@ -106,9 +106,11 @@ and realtime route families. Detailed preview behavior is documented in the
 | Metal | About 31 GiB: raw FP8 | F32 |
 | CUDA (compute capability 8.0+) | About 31 GiB: raw FP8; the routed experts stay unpadded, the other FP8 linears are padded for the FP8 kernels | BF16 |
 
-Each request adds about 48 MiB of decoder state plus its attention KV. A load
-that the backend's memory budget cannot hold is refused before any weights are
-read. `IZWI_NEMOTRON_TRANSCRIBE_FP8_MODE=vllm-fp8` rounds activations to FP8
+Each request holds about 48 MiB of decoder state plus its attention KV. On
+CUDA a load reserves that state for 8 concurrent requests and a working copy
+of each (about 0.75 GiB), beside 384 MiB of KV that every request shares;
+more concurrent requests wait for a row. A load that the backend's memory
+budget cannot hold is refused before any weights are read. `IZWI_NEMOTRON_TRANSCRIBE_FP8_MODE=vllm-fp8` rounds activations to FP8
 as vLLM's W8A8 path does; it is a parity-testing mode, not a speed-up.
 
 | Capability | Status |

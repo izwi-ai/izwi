@@ -3940,16 +3940,16 @@ mod tests {
         let cuda_f16 = test_device_profile(DeviceKind::Cuda, false, true);
         let cuda_f32 = test_device_profile(DeviceKind::Cuda, false, false);
 
-        let selection = select_nemotron_asr_dtype(&cuda_bf16, None).unwrap();
+        // CUDA keeps F32 by default (BF16 encoder batches were batch-variant
+        // on the H100); a BF16 override still applies where it is supported.
+        for profile in [&cuda_bf16, &cuda_f16, &cuda_f32] {
+            assert_eq!(
+                select_nemotron_asr_dtype(profile, None).unwrap().dtype,
+                DType::F32
+            );
+        }
+        let selection = select_nemotron_asr_dtype(&cuda_bf16, Some("bf16")).unwrap();
         assert_eq!(selection.dtype, DType::BF16);
-        assert_eq!(
-            select_nemotron_asr_dtype(&cuda_f16, None).unwrap().dtype,
-            DType::F16
-        );
-        assert_eq!(
-            select_nemotron_asr_dtype(&cuda_f32, None).unwrap().dtype,
-            DType::F32
-        );
 
         let diagnostics = nemotron_dtype_diagnostics(
             &selection,

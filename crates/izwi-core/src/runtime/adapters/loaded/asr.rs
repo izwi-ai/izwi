@@ -869,7 +869,10 @@ impl LoadedExecutionAdapter for VoxtralAsrExecutionAdapter {
 
         // The encoder runs alone: its ragged batch path attends with an
         // eager masked softmax, quadratic in the frames, and the decode
-        // dominates a request anyway.
+        // dominates a request anyway. Each row prices its own encoder
+        // workspace (`voxtral_offline_preparation_cost`), so the stage adds
+        // no fixed per-row term: the sealed maximum, the workspace of the
+        // longest row the stage admits, bounds that price alone.
         let mut preparation = StageDescriptor::from_execution_profile(
             StageId::new(0),
             crate::models::architectures::voxtral::VOXTRAL_OFFLINE_PREPARATION_STAGE,
@@ -883,7 +886,7 @@ impl LoadedExecutionAdapter for VoxtralAsrExecutionAdapter {
         preparation.concurrency = ConcurrencyClass::Exclusive;
         preparation.shape_policy = StageShapePolicy::Exact;
         preparation.max_work_units = seal.max_work_units;
-        preparation.workspace_per_row_bytes = seal.max_workspace_bytes;
+        preparation.workspace_per_row_bytes = 0;
         preparation.max_workspace_bytes = seal.max_workspace_bytes;
 
         let mut prefill = StageDescriptor::from_execution_profile(
@@ -932,6 +935,30 @@ impl LoadedExecutionAdapter for VoxtralAsrExecutionAdapter {
             stages: Arc::from([preparation, prefill, decode]),
         })
     }
+}
+
+/// The cost of one offline Voxtral preparation row: its stable audio frames
+/// as work, and its own encoder workspace (`VoxtralRealtimeModel::
+/// offline_preparation_bytes`) in the backend's memory domain. The stage adds
+/// nothing per row, so this workspace is what the stage maximum bounds.
+pub(crate) fn voxtral_offline_preparation_cost(
+    backend: BackendKind,
+    frames: usize,
+    workspace_bytes: u64,
+) -> Result<crate::engine::WorkCost> {
+    use crate::engine::{ResourceAmount, ResourceVector};
+    let units = u64::try_from(frames)
+        .map_err(|_| Error::Overloaded("Voxtral preparation frames exceed u64".into()))?;
+    let mut workspace = ResourceVector::zero();
+    let bytes = ResourceAmount::Known(workspace_bytes);
+    match backend {
+        BackendKind::Cpu => workspace.host_bytes = bytes,
+        BackendKind::Metal => workspace.unified_bytes = bytes,
+        BackendKind::Cuda => workspace.device_bytes = bytes,
+    }
+    Ok(crate::engine::WorkCost::with_workspace(
+        units, units, workspace,
+    ))
 }
 
 /// LFM3-Audio transcription. A clip of at most 30 s runs as a retained row

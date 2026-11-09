@@ -129,8 +129,11 @@ pub(crate) enum Qwen3AsrContextBound {
     /// bound and the shared fitter applies the configured value.
     Configured,
     /// The automatic ASR ceiling, with retained KV for this many concurrent
-    /// sequences.
-    Automatic { retained_rows: usize },
+    /// sequences in whole pages of `page_tokens` (the engine's page size).
+    Automatic {
+        retained_rows: usize,
+        page_tokens: usize,
+    },
 }
 
 /// Chunk planners cut audio at 95% of the solved invocation limit
@@ -641,10 +644,14 @@ impl Qwen3AsrModel {
         })?;
         let (sequence_tokens, retained_max_tokens) = match bound {
             Qwen3AsrContextBound::Configured => (native_tokens, native_tokens),
-            Qwen3AsrContextBound::Automatic { retained_rows } => qwen3_asr_automatic_context(
+            Qwen3AsrContextBound::Automatic {
+                retained_rows,
+                page_tokens,
+            } => qwen3_asr_automatic_context(
                 native_tokens,
                 self.automatic_asr_sequence_tokens(),
                 retained_rows,
+                page_tokens,
             ),
         };
         qwen3_asr_physical_state_spec(
@@ -3798,8 +3805,10 @@ fn qwen3_asr_weight_precisions(
             }
         }
         _ => DTypeSelection {
-            dtype: qwen3_asr_default_audio_dtype(is_gguf, text_dtype),
-            reason: if is_gguf {
+            dtype: qwen3_asr_default_audio_dtype(device.kind, is_gguf, text_dtype),
+            reason: if is_gguf && device.kind.is_cuda() {
+                "CUDA runs the audio tower at F32: a BF16 tower's output depended on its batch".into()
+            } else if is_gguf {
                 "the GGUF audio tower runs at the text dtype; it falls back to F32 alone if its probe fails".into()
             } else {
                 format!("{:?} default audio dtype", device.kind).into()
@@ -3880,13 +3889,16 @@ fn qwen3_asr_text_self_check(model: &Qwen3Model) -> NumericSelfCheckReport {
     })
 }
 
-/// The GGUF audio tower runs at the text activation dtype on every backend
-/// (BF16 on CUDA, where an F32 tower also left FlashAttention-2's varlen
-/// kernel unused and ran its attention windows one by one); a load-time probe
-/// on Metal and CUDA reloads it alone at F32 if it fails. Safetensors towers
-/// stay F32.
-fn qwen3_asr_default_audio_dtype(is_gguf: bool, text_dtype: DType) -> DType {
-    if is_gguf {
+/// The audio tower's default dtype on `kind`. CUDA runs it at F32: on the
+/// H100 the BF16 tower (the GGUF text dtype there) made a row's transcript
+/// depend on the clips batched with it, with word-level changes at 16 and
+/// 32 streams, and F32 was faster too (Qwen3-ASR 0.6B, 32 streams: 220
+/// against 204 audio-s/s, every point normalized-equal to solo). Elsewhere
+/// a GGUF tower runs at the text activation dtype, behind the Metal load-time
+/// probe that reloads it alone at F32 if it fails; safetensors towers stay
+/// F32.
+fn qwen3_asr_default_audio_dtype(kind: DeviceKind, is_gguf: bool, text_dtype: DType) -> DType {
+    if is_gguf && !kind.is_cuda() {
         text_dtype
     } else {
         DType::F32
@@ -5089,22 +5101,31 @@ mod tests {
         // 768-token planning decode reserve.
         let ceiling = qwen3_asr_sequence_ceiling(13.0, 30.0);
         assert_eq!(ceiling, 128 + 411 + 768);
+        // A row claims its sequence in whole pages: 21 pages of 64 tokens.
         assert_eq!(
-            qwen3_asr_automatic_context(65_536, ceiling, 8),
+            qwen3_asr_automatic_context(65_536, ceiling, 8, 64),
+            (ceiling, 8 * 1_344)
+        );
+        assert_eq!(
+            qwen3_asr_automatic_context(65_536, ceiling, 32, 64),
+            (ceiling, 32 * 1_344)
+        );
+        assert_eq!(
+            qwen3_asr_automatic_context(65_536, ceiling, 8, 1),
             (ceiling, 8 * ceiling)
         );
         // Many CUDA rows or a small native context never exceed the native bound.
         assert_eq!(
-            qwen3_asr_automatic_context(65_536, ceiling, 96),
+            qwen3_asr_automatic_context(65_536, ceiling, 96, 64),
             (ceiling, 65_536)
         );
         assert_eq!(
-            qwen3_asr_automatic_context(1_024, ceiling, 8),
+            qwen3_asr_automatic_context(1_024, ceiling, 8, 64),
             (1_024, 1_024)
         );
         assert_eq!(
-            qwen3_asr_automatic_context(65_536, ceiling, 0),
-            (ceiling, ceiling)
+            qwen3_asr_automatic_context(65_536, ceiling, 0, 64),
+            (ceiling, 1_344)
         );
     }
 
@@ -5180,7 +5201,7 @@ mod tests {
         assert_eq!(kv_bytes(ceiling), 1_344 * token_bytes);
         assert!(kv_bytes(ceiling) * 48 < kv_bytes(65_536));
         // Eight retained rows still need under a sixth of the native pool.
-        let (_, retained) = qwen3_asr_automatic_context(65_536, ceiling, 8);
+        let (_, retained) = qwen3_asr_automatic_context(65_536, ceiling, 8, 64);
         assert!(kv_bytes(retained) * 6 < kv_bytes(65_536));
 
         // Prepared-input rows: F16 embeddings plus I64 MRoPE positions, for
@@ -5219,7 +5240,7 @@ mod tests {
         let offline = [physical_spec_stage(1, StageProgressKind::Atomic)];
         let graphs = vec![offline.as_slice()];
         let ceiling = qwen3_asr_sequence_ceiling(13.0, 30.0);
-        let (sequence, retained_max) = qwen3_asr_automatic_context(65_536, ceiling, 8);
+        let (sequence, retained_max) = qwen3_asr_automatic_context(65_536, ceiling, 8, 64);
         let retained = qwen3_asr_retained_state_contract(
             crate::kv::test_contract(),
             sequence,
@@ -5231,7 +5252,7 @@ mod tests {
             .expect("physical ASR spec");
 
         assert_eq!(spec.sequence_tokens, ceiling);
-        assert_eq!(spec.retained_max_tokens, 8 * ceiling);
+        assert_eq!(spec.retained_max_tokens, 8 * 1_344);
         assert_eq!(
             spec.descriptor
                 .capacity_axis_bounds(crate::kv::v2::StateCapacityAxis::DecoderContext),
@@ -6063,25 +6084,31 @@ mod tests {
         };
         let (text, audio) = precisions(true);
         assert_eq!(text.dtype, DType::BF16);
-        assert_eq!(audio.dtype, DType::BF16);
-        assert!(audio.reason.contains("probe"), "{}", audio.reason);
+        assert_eq!(audio.dtype, DType::F32);
+        assert!(audio.reason.contains("batch"), "{}", audio.reason);
         assert!(qwen3_asr_audio_probe(DeviceKind::Cuda));
         assert_eq!(
-            qwen3_asr_default_audio_dtype(false, DType::BF16),
+            qwen3_asr_default_audio_dtype(DeviceKind::Cuda, false, DType::BF16),
             DType::F32
         );
 
-        std::env::set_var("IZWI_QWEN_ASR_AUDIO_DTYPE", "f32");
+        std::env::set_var("IZWI_QWEN_ASR_AUDIO_DTYPE", "bf16");
         let (_, pinned) = precisions(true);
         std::env::remove_var("IZWI_QWEN_ASR_AUDIO_DTYPE");
-        assert_eq!(pinned.dtype, DType::F32);
+        assert_eq!(pinned.dtype, DType::BF16);
         assert!(pinned.reason.contains("override"), "{}", pinned.reason);
     }
 
     #[test]
     fn qwen_asr_non_cuda_gguf_audio_policy_is_unchanged() {
-        assert_eq!(qwen3_asr_default_audio_dtype(true, DType::F16), DType::F16);
-        assert_eq!(qwen3_asr_default_audio_dtype(true, DType::F32), DType::F32);
+        assert_eq!(
+            qwen3_asr_default_audio_dtype(DeviceKind::Metal, true, DType::F16),
+            DType::F16
+        );
+        assert_eq!(
+            qwen3_asr_default_audio_dtype(DeviceKind::Cpu, true, DType::F32),
+            DType::F32
+        );
         assert!(qwen3_asr_audio_probe(DeviceKind::Metal));
         assert!(!qwen3_asr_audio_probe(DeviceKind::Cpu));
     }

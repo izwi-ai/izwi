@@ -625,6 +625,14 @@ impl DeviceProfile {
                 dtype: DType::F32,
                 reason: "model family policy keeps CUDA default in F32".into(),
             }),
+            // On the H100 a BF16 Nemotron encoder batch made a row's
+            // transcript depend on the clips beside it (word-level changes at
+            // 32 streams, against the exact-RNNT contract), and F32 batches
+            // were exact and faster: 91 against 56 audio-s/s at 32 streams.
+            ModelFamily::NemotronAsr => Some(DTypeSelection {
+                dtype: DType::F32,
+                reason: "Nemotron ASR CUDA policy keeps F32: BF16 encoder batches were batch-variant and slower on the H100".into(),
+            }),
             ModelFamily::VoxtralTts => {
                 if self.capabilities.supports_bf16 {
                     Some(DTypeSelection {
@@ -664,9 +672,7 @@ impl DeviceProfile {
                     })
                 }
             }
-            ModelFamily::NemotronAsr
-            | ModelFamily::GraniteSpeechAsr
-            | ModelFamily::GraniteSpeech5Asr => {
+            ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr => {
                 if self.capabilities.supports_bf16 {
                     Some(DTypeSelection {
                         dtype: DType::BF16,
@@ -2207,7 +2213,7 @@ mod tests {
         );
         assert_eq!(
             cuda_profile.select_model_dtype(ModelFamily::NemotronAsr, None),
-            DType::BF16
+            DType::F32
         );
     }
 
@@ -2539,16 +2545,24 @@ mod tests {
             memory_pool: None,
         };
 
+        // Nemotron ASR keeps F32 on CUDA whatever half precision the
+        // device offers; Granite Speech takes the half-precision ladder.
+        for profile in [&cuda_bf16_profile, &cuda_f16_profile, &cuda_f32_profile] {
+            assert_eq!(
+                profile.select_model_dtype(ModelFamily::NemotronAsr, None),
+                DType::F32
+            );
+        }
         assert_eq!(
-            cuda_bf16_profile.select_model_dtype(ModelFamily::NemotronAsr, None),
+            cuda_bf16_profile.select_model_dtype(ModelFamily::GraniteSpeechAsr, None),
             DType::BF16
         );
         assert_eq!(
-            cuda_f16_profile.select_model_dtype(ModelFamily::NemotronAsr, None),
+            cuda_f16_profile.select_model_dtype(ModelFamily::GraniteSpeechAsr, None),
             DType::F16
         );
         assert_eq!(
-            cuda_f32_profile.select_model_dtype(ModelFamily::NemotronAsr, None),
+            cuda_f32_profile.select_model_dtype(ModelFamily::GraniteSpeechAsr, None),
             DType::F32
         );
     }

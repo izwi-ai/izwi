@@ -199,6 +199,7 @@ impl ModelLifecycleController {
                     retained_max_tokens,
                     asr_minimum_tokens(variant),
                     rows.0,
+                    self.core_engine.config().block_size,
                 );
                 let retained = self
                     .core_engine
@@ -318,6 +319,7 @@ impl ModelLifecycleController {
                             sequence_tokens,
                             asr_minimum_tokens(variant),
                             rows.0,
+                            self.core_engine.config().block_size,
                         ),
                         2,
                         rows,
@@ -377,6 +379,44 @@ impl ModelLifecycleController {
 
     /// Offline ASR (every family but Granite Speech): retained and invocation
     /// state per loaded ASR capability.
+    /// Retained ASR state at `tokens`: an automatic pool already holds one
+    /// sequence per row (`asr_automatic_context`, `asr_shared_pool_tokens`)
+    /// and loads as given; a configured per-sequence context is pooled
+    /// across the rows by the loader.
+    async fn load_asr_retained_state(
+        &self,
+        model_instance_id: ModelInstanceId,
+        contract: &crate::kv::v2::InferenceStateContract,
+        tokens: usize,
+        pooled: bool,
+        rows: (usize, usize),
+        minimum_tokens: u64,
+    ) -> Result<Arc<crate::engine::ManagedKvModelRuntime>> {
+        if pooled {
+            self.core_engine
+                .load_pooled_managed_model_state_with_portable_copies(
+                    model_instance_id,
+                    contract,
+                    tokens,
+                    2,
+                    rows,
+                    minimum_tokens,
+                )
+                .await
+        } else {
+            self.core_engine
+                .load_managed_model_state_with_portable_copies(
+                    model_instance_id,
+                    contract,
+                    Some(tokens),
+                    2,
+                    rows,
+                    minimum_tokens,
+                )
+                .await
+        }
+    }
+
     pub(super) async fn allocate_asr_state(
         &self,
         variant: ModelVariant,
@@ -481,24 +521,25 @@ impl ModelLifecycleController {
                         .collect::<Vec<_>>();
                     // A configured context wins; otherwise Qwen3-ASR bounds
                     // its state by one planned chunk per sequence.
-                    let context_bound =
-                        if self.config.max_sequence_length.explicit_tokens().is_some() {
-                            Qwen3AsrContextBound::Configured
-                        } else {
-                            Qwen3AsrContextBound::Automatic {
-                                retained_rows: self.asr_state_rows(bundle_draft)?.0,
-                            }
-                        };
+                    let automatic_pool =
+                        self.config.max_sequence_length.explicit_tokens().is_none();
+                    let context_bound = if !automatic_pool {
+                        Qwen3AsrContextBound::Configured
+                    } else {
+                        Qwen3AsrContextBound::Automatic {
+                            retained_rows: self.asr_state_rows(bundle_draft)?.0,
+                            page_tokens: self.core_engine.config().block_size,
+                        }
+                    };
                     let physical_spec =
                         loaded.qwen3_physical_state_spec(&stage_graphs, context_bound)?;
                     let retained_max_tokens = physical_spec.retained_max_tokens;
                     let physical = self
-                        .core_engine
-                        .load_managed_model_state_with_portable_copies(
+                        .load_asr_retained_state(
                             model_instance_id,
                             &physical_spec.retained,
-                            Some(retained_max_tokens),
-                            2,
+                            retained_max_tokens,
+                            automatic_pool,
                             self.asr_state_rows(bundle_draft)?,
                             asr_minimum_tokens(variant),
                         )
@@ -585,24 +626,25 @@ impl ModelLifecycleController {
                     // without a configured context each retained row is
                     // bounded by one chunk's prompt and duration budget
                     // (P2.5), not the decoder's native context.
-                    let retained_max_tokens =
-                        if self.config.max_sequence_length.explicit_tokens().is_some() {
-                            native_tokens
-                        } else {
-                            crate::runtime::asr_automatic_context(
-                                native_tokens,
-                                loaded.vibevoice_retained_sequence_ceiling()?,
-                                self.asr_state_rows(bundle_draft)?.0,
-                            )
-                            .1
-                        };
+                    let automatic_pool =
+                        self.config.max_sequence_length.explicit_tokens().is_none();
+                    let retained_max_tokens = if !automatic_pool {
+                        native_tokens
+                    } else {
+                        crate::runtime::asr_automatic_context(
+                            native_tokens,
+                            loaded.vibevoice_retained_sequence_ceiling()?,
+                            self.asr_state_rows(bundle_draft)?.0,
+                            self.core_engine.config().block_size,
+                        )
+                        .1
+                    };
                     let retained = self
-                        .core_engine
-                        .load_managed_model_state_with_portable_copies(
+                        .load_asr_retained_state(
                             model_instance_id,
                             retained_contract,
-                            Some(retained_max_tokens),
-                            2,
+                            retained_max_tokens,
+                            automatic_pool,
                             self.asr_state_rows(bundle_draft)?,
                             asr_minimum_tokens(variant),
                         )
@@ -684,6 +726,7 @@ impl ModelLifecycleController {
                                 physical_spec.retained_max_tokens,
                                 asr_minimum_tokens(variant),
                                 rows.0,
+                                self.core_engine.config().block_size,
                             )),
                             rows,
                             asr_minimum_tokens(variant),
@@ -1204,6 +1247,11 @@ impl ModelLifecycleController {
     /// Nemotron 3.5 Transcribe rows: the family's state contract (paged KV
     /// of the six attention layers, the Mamba SSM and convolution states) in
     /// one managed arena, each row up to the model's 65,536-token context.
+    /// The rows are the ASR rows ([`Self::asr_state_rows`]), not the
+    /// engine's: each holds 47.6 MiB of Mamba state, and the automatic
+    /// engine rows (316 retained and 8 staged on an H100) reserved about
+    /// 15 GiB of it for a decode 8 rows wide. A request beyond the rows
+    /// waits for one.
     pub(super) async fn allocate_nemotron_transcribe_state(
         &self,
         variant: ModelVariant,
@@ -1251,13 +1299,13 @@ impl ModelLifecycleController {
             .min(nemotron.max_context_tokens());
         let retained = self
             .core_engine
-            .load_managed_model_state(
+            .load_managed_model_state_with_rows(
                 model_instance_id,
                 &contract,
                 Some(context),
+                self.asr_state_rows(bundle_draft)?,
                 asr_minimum_tokens(variant),
                 state_fit_reserve,
-                0,
             )
             .await?;
         self.model_registry.publish_effective_context(
