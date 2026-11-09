@@ -26,7 +26,10 @@ use crate::kernels::numeric_check::{
     run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
 };
 use crate::kernels::relpos_attention::{self, KeyBand, KeyLengths};
-use crate::kernels::transducer_greedy::{rnnt_step, RnntRow, RnntRules, RnntStep};
+use crate::kernels::transducer_greedy::{
+    self, limit_field, rnnt_step, select_step_reference, state_field, DeviceSelect, RnntRow,
+    RnntRules, RnntStep, SelectBuffers, SelectRules, LIMIT_FIELDS, STATE_FIELDS,
+};
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
     StateComponentId, StateUpdateKind,
@@ -1338,6 +1341,213 @@ impl NemotronNetwork {
             }
         }
         Ok(emitted)
+    }
+
+    /// Whether the retained RNNT decode runs dispatches of many joint
+    /// steps: on CUDA once the transducer select kernel passed its
+    /// self-check there.
+    pub(super) fn device_decode_on(&self) -> bool {
+        let device = self.predictor.embed.device();
+        device_decode_on_the_host()
+            || (device.is_cuda() && transducer_greedy::eager_reason(device).is_none())
+    }
+
+    /// Up to `steps` RNNT joint steps for every row with one readback
+    /// (the select step on the device, `kernels::transducer_greedy`): each
+    /// step gathers every row's encoder projection from the rows' stacked
+    /// windows by a device index, runs the joint for every row, applies the
+    /// picks and the transition, and steps the predictor for every row,
+    /// keeping the state of the rows that did not emit. A row stops once it
+    /// finishes (`budgets`' token budget, its frames, `E * max_symbols`
+    /// tokens), emits its quota or leaves its window. The transitions are
+    /// [`Self::rnnt_joint_step_batch`]'s; the predictor runs in one GEMM over
+    /// every row. Whether any row emitted.
+    pub(super) fn rnnt_dispatch_batch(
+        &self,
+        rows: &mut [NemotronRnntBatchRow<'_>],
+        budgets: &[(usize, usize)],
+        steps: usize,
+    ) -> Result<bool> {
+        let batch = rows.len();
+        if batch == 0 || budgets.len() != batch {
+            return Err(Error::InvalidInput(
+                "Nemotron RNNT dispatch rows and budgets disagree".into(),
+            ));
+        }
+        let device = self.predictor.embed.device().clone();
+        let rules = SelectRules::Rnnt(RnntRules {
+            blank: self.blank_idx,
+            max_symbols: self.max_symbols_per_frame,
+        });
+        let fits = |value: usize| {
+            u32::try_from(value).map_err(|_| {
+                Error::InferenceError("Nemotron device decode sizes exceed u32".into())
+            })
+        };
+        let mut windows = Vec::with_capacity(batch);
+        let mut state = vec![0u32; batch * STATE_FIELDS];
+        let mut limits = vec![0u32; batch * LIMIT_FIELDS];
+        let mut gather = Vec::with_capacity(batch);
+        for (b, (row, (max_tokens, quota))) in rows.iter().zip(budgets).enumerate() {
+            let t = row.state.t;
+            if t >= row.encoded_len {
+                return Err(Error::InferenceError(
+                    "Nemotron retained RNNT cursor passed its last encoder frame".into(),
+                ));
+            }
+            let frames = steps.min(row.encoded_len - t);
+            windows.push(row.projection.narrow(0, t, frames)?.pad_with_zeros(
+                0,
+                0,
+                steps - frames,
+            )?);
+            let s = &mut state[b * STATE_FIELDS..(b + 1) * STATE_FIELDS];
+            s[state_field::T] = fits(t)?;
+            s[state_field::SYMBOLS] = fits(row.state.symbols_this_frame)?;
+            s[state_field::TOKENS] = fits(row.state.token_ids.len())?;
+            s[state_field::LIVE] = 1;
+            let l = &mut limits[b * LIMIT_FIELDS..(b + 1) * LIMIT_FIELDS];
+            l[limit_field::LEN] = fits(row.encoded_len)?;
+            l[limit_field::GUARD] = u32::MAX;
+            l[limit_field::BUDGET] = fits((*max_tokens).max(1).min(u32::MAX as usize))?;
+            l[limit_field::QUOTA] = fits((*quota).max(1))?;
+            l[limit_field::FIRST] = fits(t)?;
+            l[limit_field::WINDOW] = fits(steps)?;
+            gather.push(fits(b * steps)?);
+        }
+        let refs = windows.iter().collect::<Vec<_>>();
+        let frames = Tensor::cat(&refs, 0)?;
+        drop(windows);
+        let predictors = rows
+            .iter()
+            .map(|row| &row.state.predictor)
+            .collect::<Vec<_>>();
+        let mut cohort = PredictorState::gather_rows(&predictors)?;
+        let projections = rows
+            .iter()
+            .map(|row| &row.state.projection)
+            .collect::<Vec<_>>();
+        let mut projection = Tensor::cat(&projections, 0)?;
+
+        let on_host = device_decode_on_the_host();
+        let mut emits = vec![0u32; batch * steps * 3];
+        let (mut labels, mut mask) = (vec![0u32; batch], vec![0u32; batch]);
+        let upload = |values: &[u32]| Tensor::new(values, &device);
+        let buffers = if on_host {
+            None
+        } else {
+            Some([
+                upload(&state)?,
+                upload(&limits)?,
+                upload(&emits)?,
+                upload(&labels)?,
+                upload(&mask)?,
+                upload(&gather)?,
+            ])
+        };
+        let mut gather_index = upload(&gather)?;
+        for _ in 0..steps {
+            let encoder_rows = frames.index_select(&gather_index, 0)?.unsqueeze(1)?;
+            let logits = self
+                .joint
+                .joint_from_projections(&encoder_rows, &projection)?;
+            let classes = logits.dim(D::Minus1)?;
+            let logits = logits.reshape((batch, classes))?.to_dtype(DType::F32)?;
+            let (step_labels, step_mask) = match &buffers {
+                Some([state, limits, emits, labels, mask, gather]) => {
+                    transducer_greedy::select_step(
+                        &logits,
+                        &DeviceSelect {
+                            state,
+                            limits,
+                            emits,
+                            labels,
+                            mask,
+                            gather,
+                        },
+                        steps,
+                        rules,
+                    )?;
+                    gather_index = gather.clone();
+                    (labels.clone(), mask.clone())
+                }
+                None => {
+                    let values = logits.flatten_all()?.to_vec1::<f32>()?;
+                    select_step_reference(
+                        SelectBuffers {
+                            logits: &values,
+                            width: classes,
+                            state: &mut state,
+                            limits: &limits,
+                            emits: &mut emits,
+                            max_emits: steps,
+                            labels: &mut labels,
+                            mask: &mut mask,
+                            gather: &mut gather,
+                        },
+                        rules,
+                    );
+                    gather_index = upload(&gather)?;
+                    (upload(&labels)?, upload(&mask)?)
+                }
+            };
+            let outputs = self
+                .predictor
+                .step_masked(&step_labels, &step_mask, &mut cohort)?;
+            let stepped = self.joint.project_predictor(&outputs)?;
+            let predicate = step_mask
+                .reshape((batch, 1, 1))?
+                .broadcast_as(stepped.shape())?;
+            projection = predicate.where_cond(&stepped, &projection)?;
+        }
+        if let Some([state_buffer, _, emits_buffer, ..]) = &buffers {
+            state = state_buffer.to_vec1::<u32>()?;
+            emits = emits_buffer.flatten_all()?.to_vec1::<u32>()?;
+            crate::models::shared::telemetry::record_host_read(
+                DType::U32,
+                state.len() + emits.len(),
+            );
+        }
+        let mut any_emitted = false;
+        for (b, row) in rows.iter_mut().enumerate() {
+            let s = &state[b * STATE_FIELDS..(b + 1) * STATE_FIELDS];
+            if s[state_field::ERROR] != 0 {
+                return Err(Error::InferenceError(format!(
+                    "Nemotron RNNT emitted a label past blank_idx {}",
+                    self.blank_idx
+                )));
+            }
+            let row_state = &mut *row.state;
+            row_state.t = s[state_field::T] as usize;
+            row_state.symbols_this_frame = s[state_field::SYMBOLS] as usize;
+            let emitted = s[state_field::EMITTED] as usize;
+            for slot in 0..emitted.min(steps) {
+                row_state
+                    .token_ids
+                    .push(emits[(b * steps + slot) * 3] as usize);
+            }
+            any_emitted |= emitted > 0;
+            let stats = &mut row_state.stats;
+            let joint = s[state_field::JOINT] as usize;
+            stats.joint_steps = stats.joint_steps.saturating_add(joint);
+            stats.blank_frames = stats
+                .blank_frames
+                .saturating_add(s[state_field::BLANKS] as usize);
+            stats.guard_exits = stats
+                .guard_exits
+                .saturating_add(s[state_field::FULL] as usize);
+            // One readback per dispatch on the device; one per step on the host.
+            let reads = if on_host {
+                joint
+            } else {
+                usize::from(joint > 0)
+            };
+            stats.device_argmax_reads = stats.device_argmax_reads.saturating_add(reads);
+            stats.emitted_tokens = row_state.token_ids.len();
+            row_state.predictor = cohort.row(b)?;
+            row_state.projection = projection.narrow(0, b, 1)?.contiguous()?;
+        }
+        Ok(any_emitted)
     }
 
     pub(super) fn start_rnnt_stream(
@@ -3875,6 +4085,21 @@ fn fused_attention_on_the_host() -> bool {
     false
 }
 
+/// Joint steps per device dispatch of the retained RNNT decode.
+pub(super) const DEVICE_DECODE_STEPS: usize = 16;
+
+/// Whether RNNT dispatches run the select step on the host instead of the
+/// device: the CPU tests of the dispatch's tensor work.
+#[cfg(test)]
+fn device_decode_on_the_host() -> bool {
+    tests::DEVICE_DECODE_ON_THE_HOST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn device_decode_on_the_host() -> bool {
+    false
+}
+
 struct RelPosSelfAttention {
     linear_q: ProjectionLinear,
     linear_k: ProjectionLinear,
@@ -4380,7 +4605,45 @@ impl PredictorState {
 }
 
 impl Predictor {
+    /// One step for every row of `state`: the rows whose `mask` (`[B]` U32)
+    /// is set take their `labels` (`[B]` U32, below the blank), the others
+    /// keep their state. Returns the output `[B, 1, H]`.
+    fn step_masked(
+        &self,
+        labels: &Tensor,
+        mask: &Tensor,
+        state: &mut PredictorState,
+    ) -> Result<Tensor> {
+        let [h0, c0, h1, c1] = state.components()?;
+        let x = self.embed.index_select(labels, 0)?;
+        let (h0_new, c0_new) = self.lstm_l0.step(&x, h0, c0)?;
+        let (h1_new, c1_new) = self.lstm_l1.step(&h0_new, h1, c1)?;
+        let keep = |new: &Tensor, old: &Tensor| -> Result<Tensor> {
+            let predicate = mask.reshape((mask.dim(0)?, 1))?.broadcast_as(new.shape())?;
+            Ok(predicate.where_cond(new, old)?)
+        };
+        let next = [
+            keep(&h0_new, h0)?,
+            keep(&c0_new, c0)?,
+            keep(&h1_new, h1)?,
+            keep(&c1_new, c1)?,
+        ];
+        let [h0, c0, h1, c1] = next;
+        let output = h1.unsqueeze(1)?;
+        *state = PredictorState {
+            h0: Some(h0),
+            c0: Some(c0),
+            h1: Some(h1),
+            c1: Some(c1),
+        };
+        Ok(output)
+    }
+}
+
+impl Predictor {
     fn load(vb: VarBuilder) -> Result<Self> {
+        // The device decode's select kernel checks itself at load.
+        crate::kernels::transducer_greedy::prepare_cuda_kernel(vb.device());
         let embed = vb.pp("embed").get_unchecked_dtype("weight", vb.dtype())?;
         let vocab_plus_blank = embed.dim(0)?;
         let hidden = embed.dim(1)?;
@@ -5207,6 +5470,10 @@ pub(super) mod tests {
         /// Runs the conformer attention through the fused kernel's host
         /// reference (see `fused_attention_on_the_host`).
         pub(super) static FUSED_ATTENTION_ON_THE_HOST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Runs the retained RNNT dispatches with the select step on the
+        /// host (see `device_decode_on_the_host`).
+        pub(in super::super) static DEVICE_DECODE_ON_THE_HOST: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
     }
 

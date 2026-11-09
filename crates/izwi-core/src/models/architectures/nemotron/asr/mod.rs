@@ -1806,6 +1806,9 @@ pub(crate) struct NemotronRetainedDecodeBatchRow<'a> {
     /// The request's decode budget. The scheduler stops scheduling a row at
     /// this many tokens, so the row must finish here rather than strand.
     pub(crate) max_tokens: usize,
+    /// Tokens this engine step may emit for the row (the scheduler's
+    /// quantum, at least one). The eager step emits at most one.
+    pub(crate) quota: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1856,6 +1859,11 @@ fn retained_decode_step_rows(
     }
     let max_symbols = network.realtime_state_shape().max_symbols_per_frame;
     let checkpoints = rows.iter().map(|row| row.state.clone()).collect::<Vec<_>>();
+    let device_decode = network.device_decode_on();
+    let budgets = rows
+        .iter()
+        .map(|row| (row.max_tokens, row.quota))
+        .collect::<Vec<_>>();
     let result = (|| loop {
         let mut joint_rows = rows
             .iter_mut()
@@ -1865,7 +1873,15 @@ fn retained_decode_step_rows(
                 state: &mut row.state.rnnt,
             })
             .collect::<Vec<_>>();
-        let emitted = network.rnnt_joint_step_batch(&mut joint_rows)?;
+        // Many joint steps per readback on CUDA; else one.
+        let emitted = if device_decode {
+            network.rnnt_dispatch_batch(&mut joint_rows, &budgets, network::DEVICE_DECODE_STEPS)?
+        } else {
+            network
+                .rnnt_joint_step_batch(&mut joint_rows)?
+                .iter()
+                .any(Option::is_some)
+        };
         drop(joint_rows);
         let mut steps = Vec::with_capacity(rows.len());
         for row in rows.iter_mut() {
@@ -1894,7 +1910,7 @@ fn retained_decode_step_rows(
                 finished: state.finished,
             });
         }
-        if emitted.iter().any(Option::is_some) || steps.iter().any(|step| step.finished) {
+        if emitted || steps.iter().any(|step| step.finished) {
             break Ok(steps);
         }
     })();
@@ -4836,6 +4852,16 @@ mod tests {
         artifacts: &[&NemotronPreparedEncoderArtifact],
         max_tokens: &[usize],
     ) -> (Vec<NemotronRetainedDecodeState>, Vec<String>, Vec<usize>) {
+        run_retained_at(network, artifacts, max_tokens, 1)
+    }
+
+    /// [`run_retained`] with a quota of `quota` tokens per row and step.
+    fn run_retained_at(
+        network: &NemotronNetwork,
+        artifacts: &[&NemotronPreparedEncoderArtifact],
+        max_tokens: &[usize],
+        quota: usize,
+    ) -> (Vec<NemotronRetainedDecodeState>, Vec<String>, Vec<usize>) {
         let mut states = start_retained_decode_rows(network, artifacts).unwrap();
         let mut streamed = vec![String::new(); states.len()];
         let mut steps_taken = vec![0usize; states.len()];
@@ -4858,14 +4884,15 @@ mod tests {
                     artifact: artifacts[row],
                     state,
                     max_tokens: max_tokens[row],
+                    quota,
                 })
                 .collect::<Vec<_>>();
             let steps = retained_decode_step_rows(network, &rnnt_text, &mut rows).unwrap();
             drop(rows);
             assert_eq!(steps.len(), live.len());
             for ((row, step), before) in live.iter().zip(steps).zip(before) {
-                // A step emits at most one label per row.
-                assert!(step.tokens_generated <= before + 1);
+                // A step emits at most its quota of labels per row.
+                assert!(step.tokens_generated <= before + quota);
                 assert_eq!(step.tokens_generated, states[*row].rnnt.token_ids().len());
                 assert_eq!(step.finished, states[*row].finished);
                 streamed[*row].push_str(&step.delta);
@@ -4912,6 +4939,56 @@ mod tests {
             blanks > 0 && emitted > 0 && guards > 0,
             "{blanks} {emitted} {guards}"
         );
+    }
+
+    /// The retained RNNT dispatches of many joint steps, with the select
+    /// step on the host, decode every row as the eager step does: the same
+    /// tokens, stats and text, across window boundaries (a 24-frame row;
+    /// windows hold 16), a token budget, and quotas of one and three.
+    #[test]
+    fn device_dispatches_match_the_eager_retained_decode() {
+        let network = hashed_rnnt_network(6, 2, 0.4);
+        let rows = [(31u32, 9usize), (32, 4), (33, 24), (34, 1)]
+            .into_iter()
+            .map(|(seed, len)| rnnt_artifact(&network, seed, len))
+            .collect::<Vec<_>>();
+        let artifacts = rows
+            .iter()
+            .map(|(_, artifact)| artifact)
+            .collect::<Vec<_>>();
+        let budgets = [usize::MAX, 2, usize::MAX, usize::MAX];
+        let (eager, eager_text, _) = run_retained(&network, &artifacts, &budgets);
+        assert!(
+            eager
+                .iter()
+                .map(|state| state.rnnt.token_ids().len())
+                .sum::<usize>()
+                > 10
+        );
+        for quota in [1, 3] {
+            use super::network::tests::DEVICE_DECODE_ON_THE_HOST;
+            DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(true));
+            let (dispatched, text, _) = run_retained_at(&network, &artifacts, &budgets, quota);
+            DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(false));
+            for (row, (eager, dispatched)) in eager.iter().zip(&dispatched).enumerate() {
+                assert_eq!(
+                    eager.rnnt.token_ids(),
+                    dispatched.rnnt.token_ids(),
+                    "row {row}"
+                );
+                let (mut eager_stats, mut stats) =
+                    (eager.rnnt.stats().clone(), dispatched.rnnt.stats().clone());
+                // The host form reads back once per joint step, as eager does.
+                assert_eq!(eager_stats.joint_steps, stats.joint_steps, "row {row}");
+                eager_stats.device_argmax_reads = 0;
+                eager_stats.host_argmax_reads = 0;
+                stats.device_argmax_reads = 0;
+                stats.host_argmax_reads = 0;
+                assert_eq!(eager_stats, stats, "row {row}, quota {quota}");
+                assert_eq!(eager.stop_reason, dispatched.stop_reason);
+            }
+            assert_eq!(eager_text, text);
+        }
     }
 
     /// A label every frame emits `max_symbols` labels per frame and guard
@@ -4999,6 +5076,7 @@ mod tests {
                 artifact,
                 state,
                 max_tokens: usize::MAX,
+                quota: 1,
             })
             .collect::<Vec<_>>();
         assert!(retained_decode_step_rows(&network, &rnnt_text, &mut rows).is_err());
