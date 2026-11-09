@@ -2735,6 +2735,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Fallback Voxtral TTS dtype override used when IZWI_VOXTRAL_TTS_DTYPE is unset.",
     ),
     CoreEnvVar::new(
+        "IZWI_VOXTRAL_FUSED_QKV",
+        Flag,
+        "true (CUDA only)",
+        Once,
+        "On CUDA, Voxtral's language model stacks each layer's q, k and v weights at load and runs them as one GEMM per layer instead of three. The stacked GEMM can round differently from the three apart. Any false value keeps the three projections. CPU and Metal always run them apart.",
+    ),
+    CoreEnvVar::new(
         "IZWI_VOXTRAL_TTS_DTYPE",
         Choice,
         "IZWI_VOXTRAL_DTYPE, else backend default",

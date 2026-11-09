@@ -72,9 +72,7 @@ struct VoxtralLayer {
 }
 
 struct VoxtralAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
+    qkv: VoxtralQkv,
     o_proj: Linear,
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
@@ -85,6 +83,63 @@ struct VoxtralAttention {
     mrope_section: Option<Vec<usize>>,
     rope_theta: f64,
     sliding_window: Option<usize>,
+}
+
+/// The attention's q, k and v projections: three GEMMs, or on CUDA one GEMM
+/// over the weights stacked at load ([`VOXTRAL_FUSED_QKV_ENV`]).
+enum VoxtralQkv {
+    Separate {
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
+    },
+    Fused {
+        qkv_proj: Linear,
+        query_width: usize,
+        key_width: usize,
+        value_width: usize,
+    },
+}
+
+/// Kill switch for the language model's fused q/k/v projection on CUDA (a
+/// boolean; on when unset). Read once, at load. Off CUDA the projections
+/// always run apart.
+pub(crate) const VOXTRAL_FUSED_QKV_ENV: &str = "IZWI_VOXTRAL_FUSED_QKV";
+
+fn fused_qkv_requested(device: &Device) -> bool {
+    device.is_cuda() && crate::env::flag_or(VOXTRAL_FUSED_QKV_ENV, true)
+}
+
+impl VoxtralQkv {
+    /// `x`'s q, k and v, each `[.., width]`.
+    fn project(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        match self {
+            Self::Separate {
+                q_proj,
+                k_proj,
+                v_proj,
+            } => Ok((
+                linear_forward_last_dim(q_proj, x)?,
+                linear_forward_last_dim(k_proj, x)?,
+                linear_forward_last_dim(v_proj, x)?,
+            )),
+            Self::Fused {
+                qkv_proj,
+                query_width,
+                key_width,
+                value_width,
+            } => {
+                let qkv = linear_forward_last_dim(qkv_proj, x)?;
+                let last = qkv.rank() - 1;
+                Ok((
+                    qkv.narrow(last, 0, *query_width)?.contiguous()?,
+                    qkv.narrow(last, *query_width, *key_width)?.contiguous()?,
+                    qkv.narrow(last, query_width + key_width, *value_width)?
+                        .contiguous()?,
+                ))
+            }
+        }
+    }
 }
 
 struct VoxtralMlp {
@@ -689,6 +744,23 @@ impl VoxtralAttention {
         let k_proj = candle_nn::linear_no_bias(cfg.hidden_size, geometry.key_width(), vb.pp("wk"))?;
         let v_proj =
             candle_nn::linear_no_bias(cfg.hidden_size, geometry.value_width(), vb.pp("wv"))?;
+        // One GEMM over the stacked weights on CUDA; the three loaded
+        // weights are dropped once stacked.
+        let qkv = if fused_qkv_requested(vb.device()) {
+            let stacked = Tensor::cat(&[q_proj.weight(), k_proj.weight(), v_proj.weight()], 0)?;
+            VoxtralQkv::Fused {
+                qkv_proj: Linear::new(stacked, None),
+                query_width: geometry.query_width(),
+                key_width: geometry.key_width(),
+                value_width: geometry.value_width(),
+            }
+        } else {
+            VoxtralQkv::Separate {
+                q_proj,
+                k_proj,
+                v_proj,
+            }
+        };
         let o_proj =
             candle_nn::linear_no_bias(geometry.query_width(), cfg.hidden_size, vb.pp("wo"))?;
 
@@ -705,9 +777,7 @@ impl VoxtralAttention {
             .unwrap_or((false, None));
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv,
             o_proj,
             q_norm,
             k_norm,
@@ -739,24 +809,10 @@ impl VoxtralAttention {
             ));
         }
 
-        let mut q = linear_forward_last_dim(&self.q_proj, x)?.reshape((
-            bsz,
-            seq_len,
-            self.num_heads,
-            self.head_dim,
-        ))?;
-        let mut k = linear_forward_last_dim(&self.k_proj, x)?.reshape((
-            bsz,
-            seq_len,
-            self.num_kv_heads,
-            self.head_dim,
-        ))?;
-        let v = linear_forward_last_dim(&self.v_proj, x)?.reshape((
-            bsz,
-            seq_len,
-            self.num_kv_heads,
-            self.head_dim,
-        ))?;
+        let (q, k, v) = self.qkv.project(x)?;
+        let mut q = q.reshape((bsz, seq_len, self.num_heads, self.head_dim))?;
+        let mut k = k.reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
 
         q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, seq_len)?;
         k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, seq_len)?;
@@ -817,24 +873,10 @@ impl VoxtralAttention {
             ));
         }
 
-        let mut q = linear_forward_last_dim(&self.q_proj, x)?.reshape((
-            batch,
-            1,
-            self.num_heads,
-            self.head_dim,
-        ))?;
-        let mut k = linear_forward_last_dim(&self.k_proj, x)?.reshape((
-            batch,
-            1,
-            self.num_kv_heads,
-            self.head_dim,
-        ))?;
-        let v = linear_forward_last_dim(&self.v_proj, x)?.reshape((
-            batch,
-            1,
-            self.num_kv_heads,
-            self.head_dim,
-        ))?;
+        let (q, k, v) = self.qkv.project(x)?;
+        let mut q = q.reshape((batch, 1, self.num_heads, self.head_dim))?;
+        let mut k = k.reshape((batch, 1, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((batch, 1, self.num_kv_heads, self.head_dim))?;
         q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, 1)?;
         k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, 1)?;
 
@@ -1561,6 +1603,49 @@ pub(crate) mod tests {
             .into_iter()
             .map(f32::to_bits)
             .collect()
+    }
+
+    /// The stacked q/k/v GEMM gives each projection's output to F32
+    /// rounding (its rows are the three weights' rows); off CUDA the
+    /// projections always run apart.
+    #[test]
+    fn fused_qkv_projects_as_the_three_projections_do() {
+        let device = Device::Cpu;
+        assert!(!fused_qkv_requested(&device));
+        let weight = |rows: usize, seed: u64| {
+            Tensor::from_vec(
+                crate::kernels::numeric_check::xorshift_values(rows * 8, seed, 1.0),
+                (rows, 8),
+                &device,
+            )
+            .unwrap()
+        };
+        let (q, k, v) = (weight(6, 1), weight(2, 2), weight(2, 3));
+        let separate = VoxtralQkv::Separate {
+            q_proj: Linear::new(q.clone(), None),
+            k_proj: Linear::new(k.clone(), None),
+            v_proj: Linear::new(v.clone(), None),
+        };
+        let fused = VoxtralQkv::Fused {
+            qkv_proj: Linear::new(Tensor::cat(&[&q, &k, &v], 0).unwrap(), None),
+            query_width: 6,
+            key_width: 2,
+            value_width: 2,
+        };
+        let x = weight(3, 4).reshape((3, 1, 8)).unwrap();
+        let (a, b) = (separate.project(&x).unwrap(), fused.project(&x).unwrap());
+        for (apart, stacked) in [(&a.0, &b.0), (&a.1, &b.1), (&a.2, &b.2)] {
+            assert_eq!(apart.dims(), stacked.dims());
+            let difference = (apart - stacked)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(difference <= 1e-5, "{difference}");
+        }
     }
 
     /// Gains precomputed once equal the per-step Ada RMSNorm computation they
