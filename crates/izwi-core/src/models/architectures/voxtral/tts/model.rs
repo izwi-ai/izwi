@@ -889,9 +889,9 @@ struct VoxtralTtsDecodeParts<'a> {
 
 /// Decode one frame for every row: one acoustic launch per compatible
 /// cohort (only the acoustic step needs the cohort's CFG strength, flow
-/// steps and first-frame policy), then one LM feedback launch for every row
-/// that continues, whatever its cohort. A lone row takes the same two calls
-/// at width one.
+/// steps and first-frame policy), then one LM feedback launch for every row,
+/// whatever its cohort, a row whose frame ends it included. A lone row takes
+/// the same two calls at width one.
 fn decode_acoustic_cohorts(
     parts: VoxtralTtsDecodeParts<'_>,
     states: &mut [&mut VoxtralTtsRetainedState],
@@ -920,7 +920,7 @@ fn decode_acoustic_cohorts(
             feedback[row] = embed;
         }
     }
-    // Every continuing row's LM feedback in one launch, rows in batch order.
+    // Every row's LM feedback in one launch, rows in batch order.
     let feedback_rows = (0..states.len())
         .filter(|&row| feedback[row].is_some())
         .collect::<Vec<_>>();
@@ -990,7 +990,7 @@ fn decode_acoustic_cohorts(
 }
 
 /// One compatible cohort's acoustic frames in one launch: each row's step
-/// and, for a row that continues, the embedding its LM feedback consumes.
+/// and the embedding its LM feedback consumes.
 fn decode_cohort_frames(
     parts: VoxtralTtsDecodeParts<'_>,
     states: &mut [&mut VoxtralTtsRetainedState],
@@ -1039,31 +1039,18 @@ fn decode_cohort_frames(
     let mut rows = Vec::with_capacity(states.len());
     for (row, state) in states.iter_mut().enumerate() {
         let frame = generated.frames[row].clone();
-        if frame.first().copied() == Some(AudioSpecialToken::End.id()) {
-            state.phase = VoxtralTtsRetainedPhase::Codec;
-            rows.push((
-                VoxtralTtsDecodeStep {
-                    frame: None,
-                    frames_generated: state.frames.len(),
-                    finished: true,
-                },
-                None,
-            ));
-            continue;
+        let ended = frame.first().copied() == Some(AudioSpecialToken::End.id());
+        if !ended {
+            state.frames.push(frame.clone());
         }
-        state.frames.push(frame.clone());
-        if state.frames.len() >= state.params.max_frames {
+        let finished = ended || state.frames.len() >= state.params.max_frames;
+        if finished {
             state.phase = VoxtralTtsRetainedPhase::Codec;
-            rows.push((
-                VoxtralTtsDecodeStep {
-                    frame: Some(frame),
-                    frames_generated: state.frames.len(),
-                    finished: true,
-                },
-                None,
-            ));
-            continue;
         }
+        // A frame that ends the request still feeds the LM: the scheduler
+        // reserved one KV token for this decode quantum, and the engine
+        // accepts the quantum only once that token's write completes. The
+        // last hidden state is never read.
         let embed = match generated.shifted_code_tensor.as_ref() {
             Some(codes) => parts
                 .audio_embeddings
@@ -1072,9 +1059,9 @@ fn decode_cohort_frames(
         };
         rows.push((
             VoxtralTtsDecodeStep {
-                frame: Some(frame),
+                frame: (!ended).then_some(frame),
                 frames_generated: state.frames.len(),
-                finished: false,
+                finished,
             },
             Some(embed),
         ));
@@ -2075,6 +2062,95 @@ mod tests {
             .unwrap();
             assert_eq!(joined.acoustic_launch_widths, vec![2]);
             assert_eq!(joined.steps.len(), 2);
+        }
+    }
+
+    /// The engine reserves one KV token for every retained decode quantum
+    /// and accepts the quantum only once that token's write completes. A
+    /// frame that ends its request (here at its frame cap) skipped the LM
+    /// feedback, so its row returned no write and every Voxtral request
+    /// failed on its last frame ("managed-cache row returned no backend write
+    /// completion" on the H100). Each row, alone or beside a continuing row,
+    /// padded or not, must now write its one token.
+    #[test]
+    fn a_frame_that_ends_its_request_still_writes_its_reserved_token() {
+        use crate::models::architectures::voxtral::lm::tests::{
+            deterministic_embeds, shared_decode_caches,
+        };
+        use crate::models::architectures::voxtral::tts::retained::VoxtralTtsPreparedArtifact;
+
+        let device = Device::Cpu;
+        let (lm, acoustic, embeddings, n_acoustic_codebook) = tiny_decode_parts(&device);
+        for padded_rows in [None, Some(VOXTRAL_TTS_PADDED_ROWS)] {
+            let parts = VoxtralTtsDecodeParts {
+                language_model: &lm,
+                acoustic_transformer: &acoustic,
+                audio_embeddings: &embeddings,
+                n_acoustic_codebook,
+                padded_rows,
+            };
+            let request = |prompt_len: usize, offset: usize, max_frames: usize| {
+                let prompt = deterministic_embeds(prompt_len, offset, &device);
+                VoxtralTtsRetainedState::new(
+                    Arc::new(VoxtralTtsPreparedArtifact {
+                        prompt_embeddings: prompt,
+                        prompt_tokens: prompt_len,
+                        source_text: Arc::from("hello"),
+                        voice: Arc::from("default"),
+                        retained_resident_bytes: 64,
+                    }),
+                    VoxtralTtsGenerationParams {
+                        max_frames,
+                        seed: 7,
+                        ..Default::default()
+                    },
+                    16,
+                )
+                .unwrap()
+            };
+            // Alone, then beside a row that continues.
+            let (mut ending, mut alone, mut continuing) =
+                (request(5, 3, 1), request(4, 9, 1), request(3, 17, 6));
+            let [mut ending_cache, mut alone_cache, mut continuing_cache]: [_; 3] =
+                shared_decode_caches(3, 977, 8)
+                    .1
+                    .try_into()
+                    .unwrap_or_else(|_| panic!("three caches"));
+            prefill_cohort_spans(
+                &lm,
+                &mut [&mut ending, &mut alone, &mut continuing],
+                &mut [&mut ending_cache, &mut alone_cache, &mut continuing_cache],
+                &[5, 4, 3],
+            )
+            .unwrap();
+            for cache in [&mut ending_cache, &mut alone_cache, &mut continuing_cache] {
+                cache.take_completed_writes();
+            }
+
+            let solo =
+                decode_acoustic_cohorts(parts, &mut [&mut alone], &mut [&mut alone_cache]).unwrap();
+            assert!(solo.steps[0].finished, "{padded_rows:?}");
+            assert_eq!(alone.lm_position, 5, "{padded_rows:?}");
+            assert!(
+                !alone_cache.take_completed_writes().is_empty(),
+                "a lone ending row wrote nothing ({padded_rows:?})"
+            );
+
+            let mixed = decode_acoustic_cohorts(
+                parts,
+                &mut [&mut ending, &mut continuing],
+                &mut [&mut ending_cache, &mut continuing_cache],
+            )
+            .unwrap();
+            assert!(mixed.steps[0].finished && !mixed.steps[1].finished);
+            assert_eq!(mixed.lm_launch_widths, vec![2], "{padded_rows:?}");
+            assert_eq!((ending.lm_position, continuing.lm_position), (6, 4));
+            for cache in [&mut ending_cache, &mut continuing_cache] {
+                assert!(
+                    !cache.take_completed_writes().is_empty(),
+                    "a batched row wrote nothing ({padded_rows:?})"
+                );
+            }
         }
     }
 
