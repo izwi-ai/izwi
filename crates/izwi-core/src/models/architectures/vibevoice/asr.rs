@@ -56,6 +56,11 @@ use crate::models::shared::detokenize::IncrementalDetokenizer;
 const DEFAULT_MAX_NEW_TOKENS: usize = 768;
 const DEFAULT_MAX_AUDIO_SECONDS: f32 = 60.0 * 60.0;
 const CUDA_MAX_AUDIO_SECONDS_ENV: &str = "IZWI_VIBEVOICE_ASR_CUDA_MAX_AUDIO_SECS";
+/// The longest single pass CUDA runs by default; longer input is chunked.
+/// On an 80 GB H100 a 600 s single pass ran out of device memory after
+/// admission (1fd25ae1f), while the same file in 300 s and 120 s chunks
+/// transcribed within about 42 GB.
+const CUDA_DEFAULT_MAX_AUDIO_SECONDS: f32 = 300.0;
 const TOKENIZER_STREAMING_CHUNK_SECONDS: usize = 60;
 /// Text tokens (chat template, timing header, language and caller
 /// instructions) a retained-route prompt may add to its audio placeholders.
@@ -3509,7 +3514,7 @@ fn vibevoice_asr_max_audio_seconds_hint_for(
 
     cuda_override
         .and_then(parse_positive_finite_f32)
-        .unwrap_or(DEFAULT_MAX_AUDIO_SECONDS)
+        .unwrap_or(CUDA_DEFAULT_MAX_AUDIO_SECONDS)
         .min(DEFAULT_MAX_AUDIO_SECONDS)
 }
 
@@ -4281,12 +4286,15 @@ mod tests {
         );
     }
 
+    /// CUDA chunks input past 300 s by default: a 600 s single pass ran out
+    /// of memory on an 80 GB H100.
     #[test]
-    fn max_audio_seconds_hint_uses_full_cuda_window_by_default() {
+    fn max_audio_seconds_hint_chunks_long_cuda_input_by_default() {
         assert_eq!(
             vibevoice_asr_max_audio_seconds_hint_for(DeviceKind::Cuda, None),
-            DEFAULT_MAX_AUDIO_SECONDS
+            CUDA_DEFAULT_MAX_AUDIO_SECONDS
         );
+        assert_eq!(CUDA_DEFAULT_MAX_AUDIO_SECONDS, 300.0);
     }
 
     #[test]
@@ -4302,7 +4310,7 @@ mod tests {
         for raw in ["", "0", "-1", "nan", "inf", "not-a-number"] {
             assert_eq!(
                 vibevoice_asr_max_audio_seconds_hint_for(DeviceKind::Cuda, Some(raw)),
-                DEFAULT_MAX_AUDIO_SECONDS
+                CUDA_DEFAULT_MAX_AUDIO_SECONDS
             );
         }
     }

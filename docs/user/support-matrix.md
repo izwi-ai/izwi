@@ -350,9 +350,11 @@ fit; the runtime does not overcommit VRAM.
 For audio generation, automatic output budgets remain bounded. Explicit CUDA
 requests can use the 32,768-token LFM2.5 Audio and Fish S2 contexts; Voxtral TTS
 accepts the upstream deployment ceiling of 2,048 output frames. CPU and Metal
-retain their existing limits. VibeVoice ASR uses its documented 60-minute
-single-pass window on CUDA by default; `IZWI_VIBEVOICE_ASR_CUDA_MAX_AUDIO_SECS`
-can lower that window but cannot raise it above 60 minutes. See the
+retain their existing limits. On CUDA, VibeVoice ASR runs input of up to
+5 minutes in a single pass and splits longer input into chunks, because a
+10-minute single pass ran out of memory on an 80 GB H100.
+`IZWI_VIBEVOICE_ASR_CUDA_MAX_AUDIO_SECS` sets that single-pass limit, up to
+the model's documented 60-minute window. See the
 [LFM2.5 Audio model card](https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B),
 [Fish S2 config](https://huggingface.co/fishaudio/s2-pro/blob/main/config.json),
 [Voxtral deployment](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/deploy/voxtral_tts.yaml),
