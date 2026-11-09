@@ -1604,15 +1604,62 @@ impl GraniteSpeechEncoder {
     fn forward_valid_lengths(&self, input: &Tensor, valid_lengths: &[usize]) -> Result<Tensor> {
         let (batch, sequence, _) = input.dims3()?;
         validate_frame_lengths(batch, sequence, valid_lengths)?;
-        let mask = frame_valid_mask(valid_lengths, sequence, input.device(), input.dtype())?;
-        let mut x = self.input_linear.forward(input)?.broadcast_mul(&mask)?;
+        let masks = self.masks(valid_lengths, sequence, input.device(), input.dtype())?;
+        self.forward_masked(input, &masks)
+    }
+
+    /// The masks of a padded batch whose row `b` holds `valid_lengths[b]`
+    /// of `sequence` frames, built once for every layer: the frame mask, and
+    /// each row's key length for the fused attention or the additive key
+    /// mask over the padded blocks for the eager one.
+    fn masks(
+        &self,
+        valid_lengths: &[usize],
+        sequence: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<GraniteEncoderMasks> {
+        let fused = self
+            .layers
+            .first()
+            .is_some_and(|layer| layer.attn.fused_available(device, dtype));
+        let context = self.context_size().max(1);
+        Ok(GraniteEncoderMasks {
+            frames: frame_valid_mask(valid_lengths, sequence, device, dtype)?,
+            key_lengths: fused
+                .then(|| {
+                    let real = valid_lengths
+                        .iter()
+                        .map(|len| *len as u32)
+                        .collect::<Vec<_>>();
+                    Tensor::from_vec(real, valid_lengths.len(), device)
+                })
+                .transpose()?,
+            key_mask: (!fused)
+                .then(|| {
+                    encoder_valid_key_mask(
+                        valid_lengths,
+                        sequence.div_ceil(context),
+                        context,
+                        device,
+                        dtype,
+                    )
+                })
+                .transpose()?,
+        })
+    }
+
+    /// [`Self::forward_valid_lengths`] under masks already built.
+    fn forward_masked(&self, input: &Tensor, masks: &GraniteEncoderMasks) -> Result<Tensor> {
+        let mask = &masks.frames;
+        let mut x = self.input_linear.forward(input)?.broadcast_mul(mask)?;
         let mut exported = Vec::with_capacity(self.cat_hidden_layers.len() + 1);
         if self.cat_hidden_layers.contains(&0) {
             exported.push(x.clone());
         }
         let midpoint = self.layers.len() / 2;
         for (idx, layer) in self.layers.iter().enumerate() {
-            x = layer.forward_valid_lengths(&x, valid_lengths, &mask)?;
+            x = layer.forward_valid_lengths(&x, masks)?;
             let layer_idx = idx + 1;
             if self.cat_hidden_layers.contains(&layer_idx) {
                 exported.push(x.clone());
@@ -1620,11 +1667,11 @@ impl GraniteSpeechEncoder {
             if layer_idx == midpoint {
                 let mid = self.out.forward(&x)?;
                 let mid = ops::softmax_last_dim(&mid)?;
-                let mid = self.out_mid.forward(&mid)?.broadcast_mul(&mask)?;
-                x = x.broadcast_add(&mid)?.broadcast_mul(&mask)?;
+                let mid = self.out_mid.forward(&mid)?.broadcast_mul(mask)?;
+                x = x.broadcast_add(&mid)?.broadcast_mul(mask)?;
             }
         }
-        x = x.broadcast_mul(&mask)?;
+        x = x.broadcast_mul(mask)?;
         if exported.is_empty() {
             Ok(x)
         } else {
@@ -1739,15 +1786,11 @@ impl GraniteConformerBlock {
         self.post_norm.forward(&out).map_err(Error::from)
     }
 
-    fn forward_valid_lengths(
-        &self,
-        x: &Tensor,
-        valid_lengths: &[usize],
-        mask: &Tensor,
-    ) -> Result<Tensor> {
+    fn forward_valid_lengths(&self, x: &Tensor, masks: &GraniteEncoderMasks) -> Result<Tensor> {
+        let mask = &masks.frames;
         let ff1 = self.ff1.forward(x)?.broadcast_mul(mask)?;
         let mut out = x.broadcast_add(&(ff1 * 0.5)?)?.broadcast_mul(mask)?;
-        let attn = self.attn.forward_valid_lengths(&out, valid_lengths)?;
+        let attn = self.attn.forward_valid_lengths(&out, masks)?;
         out = out.broadcast_add(&attn)?.broadcast_mul(mask)?;
         let conv = self.conv.forward_valid_lengths(&out, mask)?;
         out = out.broadcast_add(&conv)?.broadcast_mul(mask)?;
@@ -1855,11 +1898,9 @@ impl GraniteConformerAttention {
     /// `valid_lengths`, when given) against the position table itself, with
     /// eager's BF16 roundings in a BF16 encoder, and no block padding.
     /// `[B, T, H·Dh]`, or `None` where the eager core runs.
-    fn fused(&self, x: &Tensor, valid_lengths: Option<&[usize]>) -> Result<Option<Tensor>> {
+    fn fused(&self, x: &Tensor, key_lengths: Option<&Tensor>) -> Result<Option<Tensor>> {
         let dtype = x.dtype();
-        let on = fused_attention_on_the_host()
-            || (x.device().is_cuda() && relpos_attention::eager_reason(x.device()).is_none());
-        if !on || !matches!(dtype, DType::F32 | DType::BF16) {
+        if !self.fused_available(x.device(), dtype) {
             return Ok(None);
         }
         let (batch, seq_len, _) = x.dims3()?;
@@ -1874,12 +1915,6 @@ impl GraniteConformerAttention {
             .reshape((batch, seq_len, 2, heads, dim_head))?;
         let (k, v) = (kv.i((.., .., 0))?, kv.i((.., .., 1))?);
         let table = self.rel_pos_emb.embeddings().to_dtype(dtype)?;
-        let lengths = valid_lengths
-            .map(|lengths| {
-                let real = lengths.iter().map(|len| *len as u32).collect::<Vec<_>>();
-                Tensor::from_vec(real, batch, x.device())
-            })
-            .transpose()?;
         let spec = relpos_attention::RelPosAttention {
             q: &q,
             k: &k,
@@ -1892,7 +1927,7 @@ impl GraniteConformerAttention {
             band: KeyBand::Block {
                 size: self.context_size,
             },
-            key_lengths: lengths.as_ref().map_or(KeyLengths::All, KeyLengths::PerRow),
+            key_lengths: key_lengths.map_or(KeyLengths::All, KeyLengths::PerRow),
             scale: 1.0 / (dim_head as f64).sqrt(),
             core: dtype,
             out_dtype: dtype,
@@ -1903,6 +1938,13 @@ impl GraniteConformerAttention {
             ));
         }
         Ok(relpos_attention::relpos_attention(&spec)?)
+    }
+
+    /// Whether [`Self::fused`] may run on `device` for `dtype` activations.
+    fn fused_available(&self, device: &Device, dtype: DType) -> bool {
+        (fused_attention_on_the_host()
+            || (device.is_cuda() && relpos_attention::eager_reason(device).is_none()))
+            && matches!(dtype, DType::F32 | DType::BF16)
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -1976,16 +2018,21 @@ impl GraniteConformerAttention {
         self.to_out.forward(&out).map_err(Error::from)
     }
 
-    fn forward_valid_lengths(&self, x: &Tensor, valid_lengths: &[usize]) -> Result<Tensor> {
+    fn forward_valid_lengths(&self, x: &Tensor, masks: &GraniteEncoderMasks) -> Result<Tensor> {
         let (batch, seq_len, _) = x.dims3()?;
-        validate_frame_lengths(batch, seq_len, valid_lengths)?;
-        let input_mask = frame_valid_mask(valid_lengths, seq_len, x.device(), x.dtype())?;
-        let x = self.pre_norm.forward(x)?.broadcast_mul(&input_mask)?;
-        if let Some(out) = self.fused(&x, Some(valid_lengths))? {
+        let input_mask = &masks.frames;
+        let x = self.pre_norm.forward(x)?.broadcast_mul(input_mask)?;
+        if let Some(out) = masks
+            .key_lengths
+            .as_ref()
+            .map(|lengths| self.fused(&x, Some(lengths)))
+            .transpose()?
+            .flatten()
+        {
             return self
                 .to_out
-                .forward(&out.broadcast_mul(&input_mask)?)?
-                .broadcast_mul(&input_mask)
+                .forward(&out.broadcast_mul(input_mask)?)?
+                .broadcast_mul(input_mask)
                 .map_err(Error::from);
         }
         let nblocks = seq_len.div_ceil(self.context_size);
@@ -2031,13 +2078,18 @@ impl GraniteConformerAttention {
         let mut scores = (encoder_attention_scores(&q, &k)?
             * (1.0 / (self.dim_head as f64).sqrt()))?
         .broadcast_add(&pos_bias)?;
-        let key_mask = encoder_valid_key_mask(
-            valid_lengths,
-            nblocks,
-            self.context_size,
-            scores.device(),
-            scores.dtype(),
-        )?;
+        // The fused kernel declined a batch it was meant to run: the eager
+        // core builds the additive mask it did not need.
+        let key_mask = match &masks.key_mask {
+            Some(key_mask) => key_mask.clone(),
+            None => encoder_valid_key_mask(
+                &masks.valid_lengths(seq_len)?,
+                nblocks,
+                self.context_size,
+                scores.device(),
+                scores.dtype(),
+            )?,
+        };
         scores = scores.broadcast_add(&key_mask)?;
         let attention =
             ops::softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype())?;
@@ -2045,10 +2097,10 @@ impl GraniteConformerAttention {
             .transpose(2, 3)?
             .reshape((batch, padded_len, self.num_heads * self.dim_head))?
             .narrow(1, 0, seq_len)?
-            .broadcast_mul(&input_mask)?;
+            .broadcast_mul(input_mask)?;
         self.to_out
             .forward(&out)?
-            .broadcast_mul(&input_mask)
+            .broadcast_mul(input_mask)
             .map_err(Error::from)
     }
 
@@ -2096,6 +2148,34 @@ fn validate_frame_lengths(batch: usize, sequence: usize, valid_lengths: &[usize]
         ));
     }
     Ok(())
+}
+
+/// The masks of a padded encoder batch, built once for every layer
+/// ([`GraniteSpeechEncoder::masks`]).
+struct GraniteEncoderMasks {
+    /// `[B, T, 1]`: 1 on real frames, 0 on padding.
+    frames: Tensor,
+    /// `[B]` U32: each row's valid length, when the fused attention runs.
+    key_lengths: Option<Tensor>,
+    /// The eager attention's additive key mask over the padded blocks.
+    key_mask: Option<Tensor>,
+}
+
+impl GraniteEncoderMasks {
+    /// Each row's valid length, read back from the frame mask: only when
+    /// the fused attention declined a batch it was meant to run.
+    fn valid_lengths(&self, sequence: usize) -> Result<Vec<usize>> {
+        let rows = self.frames.dim(0)?;
+        let frames = self
+            .frames
+            .to_dtype(DType::F32)?
+            .reshape((rows, sequence))?
+            .to_vec2::<f32>()?;
+        Ok(frames
+            .iter()
+            .map(|row| row.iter().filter(|real| **real > 0.0).count())
+            .collect())
+    }
 }
 
 fn frame_valid_mask(
