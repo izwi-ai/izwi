@@ -2610,6 +2610,7 @@ impl NemotronAsrModel {
                 "reason": crate::kernels::transducer_greedy::eager_reason(self.network.device())
                     .or_else(|| network::NemotronNetwork::dispatch_reason(self.network.device())),
                 "decode_quantum": self.decode_quantum(),
+                "graphs": self.network.decode_graphs_diagnostics(),
             },
             "prompt": artifact.prompt.diagnostics(),
             "prompt_id": artifact.prompt_id,

@@ -1020,6 +1020,8 @@ pub struct ParakeetAsrModel {
     max_symbols: usize,
     encoder_windowing: EncoderWindowing,
     weight_precision: WeightOnlyF16Load,
+    /// The device decode's dispatch graphs (CUDA), or why there are none.
+    decode_graphs: std::result::Result<crate::kernels::transducer_greedy::TransducerGraphs, String>,
 }
 
 enum ParakeetDecoder {
@@ -1510,6 +1512,12 @@ impl ParakeetAsrModel {
             "device_argmax_scalar_reads": state.counters.device_argmax_scalar_reads,
             "weight_precision": self.weight_precision_diagnostics(),
             "encoder_graphs": self.network.encoder.graphs_diagnostics(),
+            "transducer_decode": device_decode::device_decode_diagnostics(
+                self.network.predictor.embed.device(),
+            ),
+            "transducer_graphs": crate::kernels::transducer_greedy::transducer_graphs_diagnostics(
+                &self.decode_graphs,
+            ),
         });
         if let Some(stop_reason) = state.stop_reason {
             diagnostics["stop_reason"] = stop_reason.into();
@@ -1787,6 +1795,10 @@ impl ParakeetAsrModel {
             );
         }
 
+        let decode_graphs = crate::kernels::transducer_greedy::TransducerGraphs::resolve(
+            "Parakeet decode",
+            network.predictor.embed.device(),
+        );
         let model = Self {
             variant,
             _artifacts: artifacts,
@@ -1798,6 +1810,7 @@ impl ParakeetAsrModel {
             max_symbols: DEFAULT_MAX_SYMBOLS,
             encoder_windowing: EncoderWindowing::V3,
             weight_precision,
+            decode_graphs,
         };
         model.check_device_decode();
         Ok(model)
@@ -2010,6 +2023,8 @@ impl ParakeetAsrModel {
         diagnostics["timestamp_words"] = self.decoder.timestamp_words(&token_ids, &token_frames);
         diagnostics["execution"]["weight_precision"] = self.weight_precision_diagnostics();
         diagnostics["execution"]["encoder_graphs"] = self.network.encoder.graphs_diagnostics();
+        diagnostics["execution"]["transducer_graphs"] =
+            crate::kernels::transducer_greedy::transducer_graphs_diagnostics(&self.decode_graphs);
 
         Ok(ParakeetAsrTranscriptionOutput {
             text: assembled,
@@ -4139,6 +4154,10 @@ mod tests {
         /// the host (see `device_decode::host_select`).
         pub(super) static DEVICE_DECODE_ON_THE_HOST: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        /// Pads the host dispatches to a graph width (see
+        /// `device_decode::pad_on_the_host`).
+        pub(super) static PAD_DISPATCH_ON_THE_HOST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
     }
     use crate::backends::{BackendKind, DTypeSelection};
     use crate::error::{Error, Result};
@@ -4522,6 +4541,7 @@ mod tests {
             max_symbols: DEFAULT_MAX_SYMBOLS,
             encoder_windowing: EncoderWindowing::V3,
             weight_precision: WeightOnlyF16Load::dense("test"),
+            decode_graphs: Err("test model".into()),
         }
     }
 
@@ -4813,6 +4833,32 @@ mod tests {
             assert_eq!(cancelled[other], four[other], "row {other}");
         }
         assert!(cancelled[row].0.len() <= 4 && four[row].0.starts_with(&cancelled[row].0));
+    }
+
+    /// A dispatch padded to its graph width (three rows run as four; the
+    /// spare row never steps) decodes every row as the unpadded dispatch and
+    /// the eager step do, as a graphed dispatch on CUDA pads.
+    #[test]
+    fn padded_dispatches_match_the_eager_retained_decode() {
+        let device = Device::Cpu;
+        let model = random_decoder_model(&device, 0xDEC0_DE01);
+        let mut rng = XorShift(0xA77_1FAC7);
+        let artifacts = [12usize, 40, 6]
+            .map(|len| {
+                let mut artifact = zero_artifact(&device, len);
+                let values = rng.values(len * TINY.dim, 2.0, 0.0);
+                artifact.encoded = Tensor::from_vec(values, (1, len, TINY.dim), &device).unwrap();
+                artifact
+            })
+            .to_vec();
+        let max_tokens = [1_000, 5, 1_000];
+        let eager = decode_cohort(&model, &artifacts, &max_tokens, 1);
+        DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(true));
+        PAD_DISPATCH_ON_THE_HOST.with(|flag| flag.set(true));
+        let padded = decode_cohort(&model, &artifacts, &max_tokens, 2);
+        PAD_DISPATCH_ON_THE_HOST.with(|flag| flag.set(false));
+        DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(false));
+        assert_eq!(eager, padded);
     }
 
     #[test]

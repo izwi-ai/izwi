@@ -28,8 +28,8 @@ use crate::kernels::numeric_check::{
 };
 use crate::kernels::relpos_attention::{self, KeyBand, KeyLengths};
 use crate::kernels::transducer_greedy::{
-    self, limit_field, rnnt_step, select_step_reference, state_field, DeviceSelect, RnntRow,
-    RnntRules, RnntStep, SelectBuffers, SelectRules, LIMIT_FIELDS, STATE_FIELDS,
+    self, limit_field, rnnt_step, state_field, RnntRow, RnntRules, RnntStep, SelectRules,
+    SelectTensors, LIMIT_FIELDS, STATE_FIELDS,
 };
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
@@ -268,6 +268,8 @@ pub(super) struct NemotronNetwork {
     /// per `(rows, frames)` shape ([`encoder_graph_shape`]), or why there
     /// are none.
     encoder_graphs: std::result::Result<ShapeGraphs<(usize, usize)>, String>,
+    /// The RNNT device decode's dispatch graphs (CUDA), or why there are none.
+    decode_graphs: std::result::Result<transducer_greedy::TransducerGraphs, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -425,6 +427,10 @@ impl NemotronNetwork {
             stream_att_mask_cache: Mutex::new(HashMap::new()),
             dtype: vb.dtype(),
             encoder_graphs: resolve_encoder_graphs(vb.device()),
+            decode_graphs: transducer_greedy::TransducerGraphs::resolve(
+                "Nemotron ASR decode",
+                vb.device(),
+            ),
         })
     }
 
@@ -1344,6 +1350,11 @@ impl NemotronNetwork {
         Ok(emitted)
     }
 
+    /// The dispatch graphs for the diagnostics.
+    pub(super) fn decode_graphs_diagnostics(&self) -> serde_json::Value {
+        transducer_greedy::transducer_graphs_diagnostics(&self.decode_graphs)
+    }
+
     /// The device the network runs on.
     pub(super) fn device(&self) -> &Device {
         self.predictor.embed.device()
@@ -1563,91 +1574,76 @@ impl NemotronNetwork {
             .iter()
             .map(|row| &row.state.predictor)
             .collect::<Vec<_>>();
-        let mut cohort = PredictorState::gather_rows(&predictors)?;
+        let cohort = PredictorState::gather_rows(&predictors)?;
         let projections = rows
             .iter()
             .map(|row| &row.state.projection)
             .collect::<Vec<_>>();
-        let mut projection = Tensor::cat(&projections, 0)?;
+        let projection = Tensor::cat(&projections, 0)?;
 
-        let mut emits = vec![0u32; batch * steps * 3];
-        let (mut labels, mut mask) = (vec![0u32; batch], vec![0u32; batch]);
-        let upload = |values: &[u32]| Tensor::new(values, &device);
-        let buffers = if on_host {
-            None
-        } else {
-            Some([
-                upload(&state)?,
-                upload(&limits)?,
-                upload(&emits)?,
-                upload(&labels)?,
-                upload(&mask)?,
-                upload(&gather)?,
-            ])
+        // On CUDA through the graph of the dispatch's padded width, while the
+        // graphs are on: spare rows never step.
+        let graphs = self
+            .decode_graphs
+            .as_ref()
+            .ok()
+            .filter(|graphs| !on_host && device.is_cuda() && graphs.is_on());
+        let width = match graphs.and(transducer_greedy::graph_width(batch)) {
+            Some(width) => width,
+            None => batch,
         };
-        let mut gather_index = upload(&gather)?;
-        for _ in 0..steps {
-            let encoder_rows = frames.index_select(&gather_index, 0)?.unsqueeze(1)?;
-            let logits = self
-                .joint
-                .joint_from_projections(&encoder_rows, &projection)?;
-            let classes = logits.dim(D::Minus1)?;
-            let logits = logits.reshape((batch, classes))?.to_dtype(DType::F32)?;
-            let (step_labels, step_mask) = match &buffers {
-                Some([state, limits, emits, labels, mask, gather]) => {
-                    transducer_greedy::select_step(
-                        &logits,
-                        &DeviceSelect {
-                            state,
-                            limits,
-                            emits,
-                            labels,
-                            mask,
-                            gather,
-                        },
-                        steps,
-                        rules,
-                    )?;
-                    gather_index = gather.clone();
-                    (labels.clone(), mask.clone())
-                }
-                None => {
-                    let values = logits.flatten_all()?.to_vec1::<f32>()?;
-                    select_step_reference(
-                        SelectBuffers {
-                            logits: &values,
-                            width: classes,
-                            state: &mut state,
-                            limits: &limits,
-                            emits: &mut emits,
-                            max_emits: steps,
-                            labels: &mut labels,
-                            mask: &mut mask,
-                            gather: &mut gather,
-                        },
-                        rules,
-                    );
-                    gather_index = upload(&gather)?;
-                    (upload(&labels)?, upload(&mask)?)
-                }
-            };
-            let outputs = self
-                .predictor
-                .step_masked(&step_labels, &step_mask, &mut cohort)?;
-            let stepped = self.joint.project_predictor(&outputs)?;
-            let predicate = step_mask
-                .reshape((batch, 1, 1))?
-                .broadcast_as(stepped.shape())?;
-            projection = predicate.where_cond(&stepped, &projection)?;
-        }
-        if let Some([state_buffer, _, emits_buffer, ..]) = &buffers {
-            state = state_buffer.to_vec1::<u32>()?;
-            emits = emits_buffer.flatten_all()?.to_vec1::<u32>()?;
+        let graphs = graphs.filter(|_| transducer_greedy::graph_width(batch).is_some());
+        let spare = width - batch;
+        state.resize(width * STATE_FIELDS, 0);
+        limits.resize(width * LIMIT_FIELDS, 0);
+        gather.resize(width, 0);
+        let pad = |tensor: &Tensor, rows: usize| -> Result<Tensor> {
+            Ok(tensor.pad_with_zeros(0, 0, rows)?)
+        };
+        let upload = |values: &[u32]| Tensor::new(values, &device);
+        let [h0, c0, h1, c1] = cohort.components()?;
+        let inputs = [
+            pad(&frames, spare * steps)?,
+            upload(&gather)?,
+            upload(&state)?,
+            upload(&limits)?,
+            pad(h0, spare)?,
+            pad(c0, spare)?,
+            pad(h1, spare)?,
+            pad(c1, spare)?,
+            pad(&projection, spare)?,
+        ];
+        drop(frames);
+        let body = |inputs: &[Tensor]| self.dispatch_body(inputs, steps, rules, on_host);
+        let outputs = match graphs {
+            Some(graphs) => {
+                let bytes = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+                let retained = 2 * inputs.iter().map(bytes).sum::<u64>()
+                    + (width * steps * 3 * std::mem::size_of::<u32>()) as u64;
+                graphs.run((width, steps), batch, retained, &inputs, &body)?
+            }
+            None => body(&inputs)?,
+        };
+        let [state_out, emits_out, h0, c0, h1, c1, projection] = outputs.as_slice() else {
+            return Err(Error::InferenceError(
+                "Nemotron device decode dispatch returned the wrong outputs".into(),
+            ));
+        };
+        let state = state_out.to_vec1::<u32>()?;
+        let emits = emits_out.to_vec1::<u32>()?;
+        if !on_host {
             crate::models::shared::telemetry::record_host_read(
                 DType::U32,
                 state.len() + emits.len(),
             );
         }
+        let cohort = PredictorState {
+            h0: Some(h0.narrow(0, 0, batch)?),
+            c0: Some(c0.narrow(0, 0, batch)?),
+            h1: Some(h1.narrow(0, 0, batch)?),
+            c1: Some(c1.narrow(0, 0, batch)?),
+        };
+        let projection = projection.narrow(0, 0, batch)?;
         let mut any_emitted = false;
         for (b, row) in rows.iter_mut().enumerate() {
             let s = &state[b * STATE_FIELDS..(b + 1) * STATE_FIELDS];
@@ -1688,6 +1684,74 @@ impl NemotronNetwork {
             row_state.projection = projection.narrow(0, b, 1)?.contiguous()?;
         }
         Ok(any_emitted)
+    }
+
+    /// An RNNT dispatch's tensor work, `steps` joint steps with no host
+    /// sync on the device (a CUDA graph's body): `inputs` are the stacked
+    /// encoder projections `[B * steps, Dj]`, the gather indices, state and
+    /// limits, the predictor's `h0, c0, h1, c1` and its joint projection
+    /// `[B, 1, Dj]`; the outputs are the state, the emissions and the
+    /// predictor's state and projection. The select step writes fresh copies
+    /// of the buffers, so the inputs stay as given.
+    fn dispatch_body(
+        &self,
+        inputs: &[Tensor],
+        steps: usize,
+        rules: SelectRules,
+        on_host: bool,
+    ) -> Result<Vec<Tensor>> {
+        let [frames, gather, state, limits, h0, c0, h1, c1, projection] = inputs else {
+            return Err(Error::InferenceError(format!(
+                "Nemotron device decode dispatch received {} inputs, expected 9",
+                inputs.len()
+            )));
+        };
+        let rows = gather.dim(0)?;
+        let device = frames.device();
+        let mut buffers = SelectTensors {
+            state: state.copy()?,
+            emits: Tensor::zeros(rows * steps * 3, DType::U32, device)?,
+            labels: Tensor::zeros(rows, DType::U32, device)?,
+            mask: Tensor::zeros(rows, DType::U32, device)?,
+            gather: gather.copy()?,
+        };
+        let mut cohort = PredictorState {
+            h0: Some(h0.clone()),
+            c0: Some(c0.clone()),
+            h1: Some(h1.clone()),
+            c1: Some(c1.clone()),
+        };
+        let mut projection = projection.clone();
+        for _ in 0..steps {
+            let encoder_rows = frames.index_select(&buffers.gather, 0)?.unsqueeze(1)?;
+            let logits = self
+                .joint
+                .joint_from_projections(&encoder_rows, &projection)?;
+            let classes = logits.dim(D::Minus1)?;
+            let logits = logits.reshape((rows, classes))?;
+            buffers = transducer_greedy::select_step_tensors(
+                &logits, limits, buffers, steps, rules, on_host,
+            )?;
+            let outputs =
+                self.predictor
+                    .step_masked(&buffers.labels, &buffers.mask, &mut cohort)?;
+            let stepped = self.joint.project_predictor(&outputs)?;
+            let predicate = buffers
+                .mask
+                .reshape((rows, 1, 1))?
+                .broadcast_as(stepped.shape())?;
+            projection = predicate.where_cond(&stepped, &projection)?;
+        }
+        let [h0, c0, h1, c1] = cohort.components()?.map(Tensor::clone);
+        Ok(vec![
+            buffers.state,
+            buffers.emits,
+            h0,
+            c0,
+            h1,
+            c1,
+            projection,
+        ])
     }
 
     pub(super) fn start_rnnt_stream(
@@ -5938,6 +6002,7 @@ pub(super) mod tests {
             stream_att_mask_cache: Mutex::new(HashMap::new()),
             dtype: DType::F32,
             encoder_graphs: Err("test network".into()),
+            decode_graphs: Err("test network".into()),
         }
     }
 

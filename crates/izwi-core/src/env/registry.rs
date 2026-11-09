@@ -385,6 +385,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "On CUDA, runs the greedy TDT (Parakeet) and RNNT (Nemotron ASR) decodes of the retained routes many joint steps per readback: a kernel applies each row's picks and transition on the device and the joint and predictor run for every row with the non-emitting rows' state kept, after a per-device self-check of that kernel against its host reference (bit-exact, off for the device on any difference). Any false value keeps one readback per joint step.",
     ),
     CoreEnvVar::new(
+        "IZWI_CUDA_TRANSDUCER_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, replays each Parakeet and Nemotron ASR device decode dispatch (its joint, select and predictor steps) as one CUDA graph per padded width and step count, checked bit for bit against the eager dispatch on its first two runs and off for the process on any mismatch or CUDA error. Loads price 256 MiB of deferred device memory for them. Any false value (or cuda.decode_graphs=off) keeps the eager dispatch.",
+    ),
+    CoreEnvVar::new(
         "IZWI_CUDA_TRANSDUCER_QUANTUM",
         Int,
         "8",

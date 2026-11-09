@@ -244,14 +244,18 @@ pub(super) fn residency_plan(
                 .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
         ModelVariant::ParakeetTdt06BV3 => {
-            // The encoder's CUDA graphs allocate their memory on first use.
-            let graphs = parakeet_encoder_graph_device_bytes(backend);
+            // The encoder's and the decode dispatch's CUDA graphs allocate
+            // their memory on first use.
+            let graphs = parakeet_encoder_graph_device_bytes(backend)
+                + crate::kernels::transducer_greedy::transducer_graph_device_bytes(backend);
             parakeet_plan(variant, model_path, device, backend, Precision::Selected)
                 .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
         ModelVariant::Nemotron35AsrStreaming06B => {
-            // The offline encoder's CUDA graphs allocate their memory on first use.
-            let graphs = nemotron_encoder_graph_device_bytes(backend);
+            // The offline encoder's and the decode dispatch's CUDA graphs
+            // allocate their memory on first use.
+            let graphs = nemotron_encoder_graph_device_bytes(backend)
+                + crate::kernels::transducer_greedy::transducer_graph_device_bytes(backend);
             nemotron_plan(variant, model_path, device, backend, Precision::Selected)
                 .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }

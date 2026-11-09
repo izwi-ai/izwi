@@ -415,6 +415,205 @@ pub fn select_step(
     }
 }
 
+/// A dispatch's select-step buffers as tensors: `state` `[B * STATE_FIELDS]`,
+/// `emits` `[B * max_emits * 3]`, `labels`, `mask` and `gather` `[B]`, U32.
+#[derive(Debug, Clone)]
+pub struct SelectTensors {
+    pub state: Tensor,
+    pub emits: Tensor,
+    pub labels: Tensor,
+    pub mask: Tensor,
+    pub gather: Tensor,
+}
+
+/// One select step over `logits` with `limits` (`[B * LIMIT_FIELDS]` U32):
+/// on CUDA, unless `on_host`, the kernel updates `buffers` in place (no host
+/// sync, so a CUDA graph can capture it) and returns them; otherwise the
+/// host reference reads them back and returns new tensors on their device
+/// (the dispatch's host form, and every non-CUDA device).
+pub fn select_step_tensors(
+    logits: &Tensor,
+    limits: &Tensor,
+    buffers: SelectTensors,
+    max_emits: usize,
+    rules: SelectRules,
+    on_host: bool,
+) -> Result<SelectTensors> {
+    let logits = logits.to_dtype(candle_core::DType::F32)?;
+    if logits.device().is_cuda() && !on_host {
+        select_step(
+            &logits,
+            &DeviceSelect {
+                state: &buffers.state,
+                limits,
+                emits: &buffers.emits,
+                labels: &buffers.labels,
+                mask: &buffers.mask,
+                gather: &buffers.gather,
+            },
+            max_emits,
+            rules,
+        )?;
+        return Ok(buffers);
+    }
+    let read = |t: &Tensor| t.flatten_all()?.to_vec1::<u32>();
+    let values = logits.flatten_all()?.to_vec1::<f32>()?;
+    let (rows, width) = logits.dims2()?;
+    let (mut state, mut emits, mut labels, mut mask, mut gather) = (
+        read(&buffers.state)?,
+        read(&buffers.emits)?,
+        vec![0; rows],
+        vec![0; rows],
+        read(&buffers.gather)?,
+    );
+    select_step_reference(
+        SelectBuffers {
+            logits: &values,
+            width,
+            state: &mut state,
+            limits: &read(limits)?,
+            emits: &mut emits,
+            max_emits,
+            labels: &mut labels,
+            mask: &mut mask,
+            gather: &mut gather,
+        },
+        rules,
+    );
+    let device = logits.device();
+    Ok(SelectTensors {
+        state: Tensor::new(state.as_slice(), device)?,
+        emits: Tensor::new(emits.as_slice(), device)?,
+        labels: Tensor::new(labels.as_slice(), device)?,
+        mask: Tensor::new(mask.as_slice(), device)?,
+        gather: Tensor::new(gather.as_slice(), device)?,
+    })
+}
+
+/// Kill switch for the transducer dispatches' CUDA graphs (a boolean; on
+/// when unset), also off with `cuda.decode_graphs=off`.
+pub const CUDA_TRANSDUCER_GRAPHS_ENV: &str = "IZWI_CUDA_TRANSDUCER_GRAPHS";
+
+/// Batch widths a dispatch's graph is captured at: a dispatch pads its rows
+/// up to the next with rows that never step.
+pub const GRAPH_WIDTHS: [usize; 6] = [1, 2, 4, 8, 16, 32];
+
+/// The graph width a dispatch of `rows` rows runs at, `None` past 32.
+pub fn graph_width(rows: usize) -> Option<usize> {
+    GRAPH_WIDTHS.into_iter().find(|width| *width >= rows.max(1))
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// What a model's dispatch graphs may hold: one graph per (width, steps),
+/// each retaining its stable inputs (the rows' stacked encoder windows, up
+/// to 8 MiB at 32 rows) and outputs; the pool holds a dispatch's working
+/// set (per step the joint's logits and the predictor's activations, about
+/// 1.6 MiB at 32 rows of Parakeet's 8,198 classes, 16 steps).
+pub const TRANSDUCER_GRAPH_LIMITS: crate::kernels::cuda::shape_graphs::ShapeGraphLimits =
+    crate::kernels::cuda::shape_graphs::ShapeGraphLimits {
+        max_graphs: 12,
+        retained_bytes: 64 * MIB,
+        pool_bytes: 192 * MIB,
+    };
+
+/// Whether the dispatch graphs' switches leave them on.
+pub fn transducer_graphs_requested() -> bool {
+    crate::env::flag_or(CUDA_TRANSDUCER_DECODE_ENV, true)
+        && crate::env::flag_or(CUDA_TRANSDUCER_GRAPHS_ENV, true)
+        && !crate::kernels::cuda::stretch_graphs::decode_graphs_switched_off()
+}
+
+/// Device bytes a transducer load on `backend` prices for its dispatch
+/// graphs, which allocate on first use: zero off CUDA or with a switch off.
+pub fn transducer_graph_device_bytes(backend: crate::backends::BackendKind) -> u64 {
+    if backend == crate::backends::BackendKind::Cuda && transducer_graphs_requested() {
+        TRANSDUCER_GRAPH_LIMITS.device_bytes()
+    } else {
+        0
+    }
+}
+
+/// A model's dispatch graphs, keyed by (graph width, joint steps).
+pub struct TransducerGraphs {
+    graphs: crate::kernels::cuda::shape_graphs::ShapeGraphs<(usize, usize)>,
+    dispatches: std::sync::atomic::AtomicU64,
+    spare_rows: std::sync::atomic::AtomicU64,
+}
+
+impl TransducerGraphs {
+    /// The graphs on `device`, or why there are none: CUDA only, with the
+    /// switches on.
+    pub fn resolve(label: &'static str, device: &Device) -> std::result::Result<Self, String> {
+        if !crate::env::flag_or(CUDA_TRANSDUCER_DECODE_ENV, true) {
+            return Err(format!("{CUDA_TRANSDUCER_DECODE_ENV} is off"));
+        }
+        if !crate::env::flag_or(CUDA_TRANSDUCER_GRAPHS_ENV, true) {
+            return Err(format!("{CUDA_TRANSDUCER_GRAPHS_ENV} is off"));
+        }
+        if crate::kernels::cuda::stretch_graphs::decode_graphs_switched_off() {
+            return Err("cuda.decode_graphs=off".into());
+        }
+        Ok(Self {
+            graphs: crate::kernels::cuda::shape_graphs::ShapeGraphs::resolve(
+                label,
+                device,
+                TRANSDUCER_GRAPH_LIMITS,
+            )?,
+            dispatches: std::sync::atomic::AtomicU64::new(0),
+            spare_rows: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Whether dispatches still go through the graphs (no capture or
+    /// replay check has failed).
+    pub fn is_on(&self) -> bool {
+        self.graphs.is_on()
+    }
+
+    /// `body` over `inputs` through the graph of `(width, steps)`, for a
+    /// dispatch of `rows` real rows; `retained` as [`ShapeGraphs::run`]
+    /// takes it. A capture is checked bit for bit against the eager body on
+    /// its first two dispatches; a mismatch or CUDA error turns the graphs
+    /// off for the process and runs the body eagerly.
+    ///
+    /// [`ShapeGraphs::run`]: crate::kernels::cuda::shape_graphs::ShapeGraphs::run
+    pub fn run(
+        &self,
+        (width, steps): (usize, usize),
+        rows: usize,
+        retained: u64,
+        inputs: &[Tensor],
+        body: &dyn Fn(&[Tensor]) -> crate::error::Result<Vec<Tensor>>,
+    ) -> crate::error::Result<Vec<Tensor>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.dispatches.fetch_add(1, Relaxed);
+        self.spare_rows
+            .fetch_add(width.saturating_sub(rows) as u64, Relaxed);
+        self.graphs.run((width, steps), retained, inputs, body)
+    }
+
+    pub fn diagnostics(&self) -> serde_json::Value {
+        use std::sync::atomic::Ordering::Relaxed;
+        serde_json::json!({
+            "dispatches": self.dispatches.load(Relaxed),
+            "spare_rows": self.spare_rows.load(Relaxed),
+            "graphs": self.graphs.diagnostics(),
+        })
+    }
+}
+
+/// A model's dispatch graphs for its diagnostics: their counters, or why
+/// there are none.
+pub fn transducer_graphs_diagnostics(
+    graphs: &std::result::Result<TransducerGraphs, String>,
+) -> serde_json::Value {
+    match graphs {
+        Ok(graphs) => graphs.diagnostics(),
+        Err(reason) => serde_json::json!({ "off": reason }),
+    }
+}
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -958,5 +1157,140 @@ mod tests {
             RnntStep::Invalid { label: 5 }
         );
         assert_eq!(row, RnntRow { t: 2, symbols: 0 });
+    }
+
+    /// A dispatch pads its rows to the next graph width; past 32 it runs
+    /// without a graph.
+    #[test]
+    fn graph_widths_pad_rows_up_to_32() {
+        let widths = [0, 1, 2, 3, 5, 8, 9, 17, 32].map(|rows| graph_width(rows).unwrap());
+        assert_eq!(widths, [1, 1, 2, 4, 8, 8, 16, 32, 32]);
+        assert_eq!(graph_width(33), None);
+    }
+
+    /// The graphs price their memory on CUDA loads with their switches on,
+    /// never resolve off CUDA, and say which switch turned them off.
+    #[test]
+    fn transducer_graphs_price_and_resolve_on_cuda_only() {
+        use crate::backends::BackendKind;
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(transducer_graph_device_bytes(BackendKind::Cpu), 0);
+        assert_eq!(transducer_graph_device_bytes(BackendKind::Metal), 0);
+        let reason = TransducerGraphs::resolve("test", &Device::Cpu)
+            .err()
+            .expect("no graphs on CPU");
+        if transducer_graphs_requested() {
+            assert!(reason.contains("CUDA only"), "{reason}");
+            assert_eq!(transducer_graph_device_bytes(BackendKind::Cuda), 256 << 20);
+        }
+        for (name, value, expected) in [
+            (CUDA_TRANSDUCER_GRAPHS_ENV, "0", CUDA_TRANSDUCER_GRAPHS_ENV),
+            (CUDA_TRANSDUCER_DECODE_ENV, "0", CUDA_TRANSDUCER_DECODE_ENV),
+            ("IZWI_CUDA_DECODE_GRAPHS", "off", "cuda.decode_graphs=off"),
+        ] {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            let bytes = transducer_graph_device_bytes(BackendKind::Cuda);
+            let reason = TransducerGraphs::resolve("test", &Device::Cpu).err();
+            std::env::remove_var(name);
+            if let Some(previous) = previous {
+                std::env::set_var(name, previous);
+            }
+            assert_eq!(bytes, 0, "{name}");
+            assert!(reason.expect("off").contains(expected), "{name}");
+        }
+        assert_eq!(
+            transducer_graphs_diagnostics(&Err("test".into()))["off"],
+            "test"
+        );
+    }
+
+    /// The functional select step on the host returns the reference's
+    /// buffers as new tensors.
+    #[test]
+    fn select_step_tensors_on_the_host_is_the_reference() {
+        let case = check_cases().remove(0);
+        let rows = case.limits.len() / LIMIT_FIELDS;
+        let mut want = case.expected_inputs();
+        case.reference_step(&mut want);
+        let cpu = &Device::Cpu;
+        let tensors = SelectTensors {
+            state: Tensor::new(case.state.as_slice(), cpu).unwrap(),
+            emits: Tensor::zeros(rows * case.max_emits * 3, candle_core::DType::U32, cpu).unwrap(),
+            labels: Tensor::zeros(rows, candle_core::DType::U32, cpu).unwrap(),
+            mask: Tensor::zeros(rows, candle_core::DType::U32, cpu).unwrap(),
+            gather: Tensor::new(vec![9u32; rows].as_slice(), cpu).unwrap(),
+        };
+        let logits = Tensor::from_vec(case.logits.clone(), (rows, case.width), cpu).unwrap();
+        let limits = Tensor::new(case.limits.as_slice(), cpu).unwrap();
+        let got = select_step_tensors(&logits, &limits, tensors, case.max_emits, case.rules, false)
+            .unwrap();
+        let read = |t: &Tensor| t.to_vec1::<u32>().unwrap();
+        assert_eq!(read(&got.state), want.state);
+        assert_eq!(read(&got.emits), want.emits);
+        assert_eq!(read(&got.labels), want.labels);
+        assert_eq!(read(&got.mask), want.mask);
+        assert_eq!(read(&got.gather), want.gather);
+    }
+
+    /// On a CUDA device the graphs resolve with the switches on, and a
+    /// graphed select step matches the eager one bit for bit.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_transducer_graphs_replay_the_select_step() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        if !transducer_graphs_requested() || !prepare_cuda_kernel(&device) {
+            return;
+        }
+        let graphs = TransducerGraphs::resolve("test", &device).unwrap();
+        let case = check_cases().remove(0);
+        let rows = case.limits.len() / LIMIT_FIELDS;
+        let upload = |values: &[u32]| Tensor::new(values, &device).unwrap();
+        let inputs = [
+            Tensor::from_vec(case.logits.clone(), (rows, case.width), &device).unwrap(),
+            upload(&case.state),
+            upload(&case.limits),
+        ];
+        let body = |inputs: &[Tensor]| -> crate::error::Result<Vec<Tensor>> {
+            let [logits, state, limits] = inputs else {
+                unreachable!()
+            };
+            let mut buffers = SelectTensors {
+                state: state.copy()?,
+                emits: Tensor::zeros(
+                    rows * case.max_emits * 3,
+                    candle_core::DType::U32,
+                    logits.device(),
+                )?,
+                labels: Tensor::zeros(rows, candle_core::DType::U32, logits.device())?,
+                mask: Tensor::zeros(rows, candle_core::DType::U32, logits.device())?,
+                gather: Tensor::zeros(rows, candle_core::DType::U32, logits.device())?,
+            };
+            for _ in 0..2 {
+                buffers = select_step_tensors(
+                    logits,
+                    limits,
+                    buffers,
+                    case.max_emits,
+                    case.rules,
+                    false,
+                )?;
+            }
+            Ok(vec![buffers.state, buffers.emits])
+        };
+        let eager = body(&inputs).unwrap();
+        for _ in 0..3 {
+            let graphed = graphs
+                .run((rows, 2), rows, 1 << 20, &inputs, &body)
+                .unwrap();
+            for (a, b) in graphed.iter().zip(&eager) {
+                assert_eq!(a.to_vec1::<u32>().unwrap(), b.to_vec1::<u32>().unwrap());
+            }
+        }
+        assert!(graphs.is_on());
     }
 }
