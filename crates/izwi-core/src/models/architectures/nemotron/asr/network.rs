@@ -26,6 +26,7 @@ use crate::kernels::numeric_check::{
     run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
 };
 use crate::kernels::relpos_attention::{self, KeyBand, KeyLengths};
+use crate::kernels::transducer_greedy::{rnnt_step, RnntRow, RnntRules, RnntStep};
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
     StateComponentId, StateUpdateKind,
@@ -1301,25 +1302,40 @@ impl NemotronNetwork {
             } else {
                 state.stats.host_argmax_reads = state.stats.host_argmax_reads.saturating_add(1);
             }
-            let label = labels[index];
-            if label == self.blank_idx {
-                state.stats.blank_frames = state.stats.blank_frames.saturating_add(1);
-                state.advance_frame();
-                continue;
+            let mut cursor = RnntRow {
+                t: state.t,
+                symbols: state.symbols_this_frame,
+            };
+            let rules = RnntRules {
+                blank: self.blank_idx,
+                max_symbols: self.max_symbols_per_frame,
+            };
+            let step = rnnt_step(&mut cursor, labels[index], rules);
+            (state.t, state.symbols_this_frame) = (cursor.t, cursor.symbols);
+            match step {
+                RnntStep::Blank => {
+                    state.stats.blank_frames = state.stats.blank_frames.saturating_add(1);
+                }
+                RnntStep::Emit { label, frame_full } => {
+                    let (predictor, projection) = stepped.next().ok_or_else(|| {
+                        Error::InferenceError("Nemotron RNNT step lost an emitting row".into())
+                    })?;
+                    state.predictor = predictor;
+                    state.projection = projection;
+                    state.token_ids.push(label);
+                    state.stats.emitted_tokens = state.token_ids.len();
+                    if frame_full {
+                        state.stats.guard_exits = state.stats.guard_exits.saturating_add(1);
+                    }
+                    emitted[index] = Some(label);
+                }
+                RnntStep::Invalid { label } => {
+                    return Err(Error::InferenceError(format!(
+                        "Nemotron RNNT emitted invalid label {label}; blank_idx={}",
+                        self.blank_idx
+                    )));
+                }
             }
-            let (predictor, projection) = stepped.next().ok_or_else(|| {
-                Error::InferenceError("Nemotron RNNT step lost an emitting row".into())
-            })?;
-            state.predictor = predictor;
-            state.projection = projection;
-            state.token_ids.push(label);
-            state.stats.emitted_tokens = state.token_ids.len();
-            state.symbols_this_frame = state.symbols_this_frame.saturating_add(1);
-            if state.symbols_this_frame >= self.max_symbols_per_frame {
-                state.stats.guard_exits = state.stats.guard_exits.saturating_add(1);
-                state.advance_frame();
-            }
-            emitted[index] = Some(label);
         }
         Ok(emitted)
     }
@@ -2011,11 +2027,6 @@ pub(super) struct NemotronRnntRow {
 }
 
 impl NemotronRnntRow {
-    fn advance_frame(&mut self) {
-        self.t = self.t.saturating_add(1);
-        self.symbols_this_frame = 0;
-    }
-
     /// The encoder frame the next joint step reads.
     pub(super) const fn cursor(&self) -> usize {
         self.t

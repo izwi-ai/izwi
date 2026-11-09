@@ -32,6 +32,7 @@ use crate::kernels::numeric_check::{
     run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
 };
 use crate::kernels::relpos_attention;
+use crate::kernels::transducer_greedy::{tdt_step, TdtRow, TdtRules, TdtStep};
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
     StateComponentId, StateUpdateKind,
@@ -942,10 +943,9 @@ pub(crate) fn parakeet_max_emittable_tokens(
 pub(crate) struct ParakeetRetainedDecodeState {
     predictor: ParakeetPredictorBatchState,
     predictor_out: Tensor,
-    t: usize,
-    last_emit_t: usize,
-    emit_count_at_t: usize,
-    guard_steps: usize,
+    /// The TDT cursor: the next frame, the last emission's frame and count,
+    /// and the joint steps taken.
+    cursor: TdtRow,
     token_ids: Vec<usize>,
     token_frames: Vec<TdtTokenFrame>,
     detokenizer: IncrementalDetokenizer,
@@ -1387,10 +1387,7 @@ impl ParakeetAsrModel {
                 Ok(ParakeetRetainedDecodeState {
                     predictor,
                     predictor_out: outputs.narrow(0, index, 1)?.contiguous()?,
-                    t: 0,
-                    last_emit_t: usize::MAX,
-                    emit_count_at_t: 0,
-                    guard_steps: 0,
+                    cursor: TdtRow::START,
                     token_ids: Vec::new(),
                     token_frames: Vec::new(),
                     detokenizer: IncrementalDetokenizer::new(),
@@ -1544,14 +1541,14 @@ impl ParakeetAsrModel {
                 let encoded_rows = rows
                     .iter()
                     .map(|row| {
-                        if row.state.t >= row.artifact.encoded_len {
+                        if row.state.cursor.t >= row.artifact.encoded_len {
                             return Err(Error::InferenceError(
                                 "Parakeet retained cursor exceeded encoder artifact".into(),
                             ));
                         }
                         row.artifact
                             .encoded
-                            .i((0, row.state.t, ..))?
+                            .i((0, row.state.cursor.t, ..))?
                             .unsqueeze(0)
                             .map_err(Error::from)
                     })
@@ -1575,44 +1572,35 @@ impl ParakeetAsrModel {
                 let selections =
                     tdt_batch_labels_and_durations(&logits, token_end, self.num_durations)?;
                 let mut emitted = Vec::new();
+                let rules = TdtRules {
+                    blank: self.blank_idx,
+                    num_durations: self.num_durations,
+                    max_symbols: self.max_symbols,
+                };
                 for (index, row) in rows.iter_mut().enumerate() {
                     let (label, duration) = selections[index];
-                    let duration = duration.min(self.num_durations.saturating_sub(1));
-                    let mut jump = duration;
-                    if label == self.blank_idx && jump == 0 {
-                        jump = 1;
+                    let step = tdt_step(&mut row.state.cursor, label, duration, rules);
+                    let counters = &mut row.state.counters;
+                    counters.tdt_joint_steps = counters.tdt_joint_steps.saturating_add(1);
+                    counters.device_argmax_scalar_reads =
+                        counters.device_argmax_scalar_reads.saturating_add(1);
+                    match step {
+                        TdtStep::Blank => {
+                            counters.tdt_blank_steps = counters.tdt_blank_steps.saturating_add(1);
+                        }
+                        TdtStep::Suppressed => {}
+                        TdtStep::Emit {
+                            label,
+                            frame,
+                            duration,
+                        } => {
+                            row.state.token_ids.push(label);
+                            row.state
+                                .token_frames
+                                .push(TdtTokenFrame { frame, duration });
+                            emitted.push((index, label));
+                        }
                     }
-                    let t_cur = row.state.t;
-                    row.state.t = row.state.t.saturating_add(jump);
-                    row.state.guard_steps = row.state.guard_steps.saturating_add(1);
-                    row.state.counters.tdt_joint_steps =
-                        row.state.counters.tdt_joint_steps.saturating_add(1);
-                    row.state.counters.device_argmax_scalar_reads = row
-                        .state
-                        .counters
-                        .device_argmax_scalar_reads
-                        .saturating_add(1);
-                    if label == self.blank_idx {
-                        row.state.counters.tdt_blank_steps =
-                            row.state.counters.tdt_blank_steps.saturating_add(1);
-                        continue;
-                    }
-                    if t_cur == row.state.last_emit_t {
-                        row.state.emit_count_at_t = row.state.emit_count_at_t.saturating_add(1);
-                    } else {
-                        row.state.last_emit_t = t_cur;
-                        row.state.emit_count_at_t = 1;
-                    }
-                    if row.state.emit_count_at_t > self.max_symbols {
-                        row.state.t = t_cur.saturating_add(1);
-                        continue;
-                    }
-                    row.state.token_ids.push(label);
-                    row.state.token_frames.push(TdtTokenFrame {
-                        frame: t_cur,
-                        duration,
-                    });
-                    emitted.push((index, label));
                 }
                 if !emitted.is_empty() {
                     let refs = emitted
@@ -1652,14 +1640,14 @@ impl ParakeetAsrModel {
                     let tokens = row.state.token_ids.len();
                     // Every frame emitting `max_symbols` labels exhausts the
                     // input as surely as the cursor passing its end does.
-                    let exhausted = row.state.t >= row.artifact.encoded_len
+                    let exhausted = row.state.cursor.t >= row.artifact.encoded_len
                         || tokens >= row.artifact.encoded_len.saturating_mul(self.max_symbols);
                     let budget_reached = !exhausted && tokens >= row.max_tokens.max(1);
                     if budget_reached {
                         row.state.stop_reason = Some("max_tokens");
                     }
                     row.state.finished =
-                        exhausted || budget_reached || row.state.guard_steps >= guard_limit;
+                        exhausted || budget_reached || row.state.cursor.guard_steps >= guard_limit;
                     if row.state.finished {
                         delta.push_str(
                             &row.state
