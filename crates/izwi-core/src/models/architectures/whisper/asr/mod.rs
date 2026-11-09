@@ -935,6 +935,12 @@ impl WhisperModel {
         LocalWhisper::load(vb, config).map(Self::Local)
     }
 
+    fn decode_graphs_diagnostics(&self) -> serde_json::Value {
+        match self {
+            Self::Local(model) => model.decoder.decode_graphs_diagnostics(),
+        }
+    }
+
     fn encoder_forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Local(model) => model.encoder.forward(x),
@@ -1249,6 +1255,12 @@ pub(crate) fn whisper_weight_files(model_dir: &Path) -> Result<Vec<std::path::Pa
 }
 
 impl WhisperTurboAsrModel {
+    /// The decoder's CUDA step graphs: captures, replays and why they are
+    /// off.
+    pub(crate) fn decode_graph_diagnostics(&self) -> serde_json::Value {
+        self.whisper.decode_graphs_diagnostics()
+    }
+
     pub fn load(model_dir: &Path, device: DeviceProfile) -> Result<Self> {
         let config_path = model_dir.join("config.json");
         let config_data = fs::read_to_string(config_path)?;

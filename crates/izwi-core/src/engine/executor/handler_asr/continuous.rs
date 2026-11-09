@@ -497,9 +497,13 @@ impl NativeExecutor {
                 let active_state = active_states.rows[row].2.require_state_mut()?;
                 // A finishing row publishes its diagnostics once.
                 let diagnostics = step.finished.then(|| {
-                    active_state
-                        .clock
-                        .diagnostics(active_state.state.retained_terminal_diagnostics())
+                    let mut diagnostics = active_state.state.retained_terminal_diagnostics();
+                    if let (Some(diagnostics), Some(graph)) =
+                        (diagnostics.as_mut(), model.decode_graph_diagnostics())
+                    {
+                        diagnostics["decode_graph"] = graph;
+                    }
+                    active_state.clock.diagnostics(diagnostics)
                 });
                 let step_tokens_generated = step
                     .tokens_generated
