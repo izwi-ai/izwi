@@ -3804,6 +3804,12 @@ impl NativeExecutor {
                     .expect("armed VibeVoice lease")
                     .require_state_mut()?;
                 let completions = active.state.take_managed_write_completions();
+                // Each row's tokenizer quantum completes its own selected
+                // clocked-state reservation, as a lone row's does.
+                let quantum = &quanta[row_index];
+                let clocked_state_completion = quantum
+                    .arena
+                    .seal_selected_completion(quantum.transaction)?;
                 active.state.commit_managed_quantum(checkpoint)?;
                 row.checkpoint = None;
                 let generated = step
@@ -3851,7 +3857,8 @@ impl NativeExecutor {
                         error: None,
                         logprobs: Vec::new(),
                     })
-                    .with_managed_cache_completions(completions),
+                    .with_managed_cache_completions(completions)
+                    .with_clocked_state_completion(clocked_state_completion),
                 );
             }
             batch.armed = false;
