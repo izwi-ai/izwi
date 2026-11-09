@@ -25,6 +25,7 @@ use crate::kernels::f16_weight_linear::{
 use crate::kernels::numeric_check::{
     run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
 };
+use crate::kernels::relpos_attention::{self, KeyBand, KeyLengths};
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
     StateComponentId, StateUpdateKind,
@@ -284,6 +285,8 @@ struct StreamingRelPosCacheKey {
     key_len: usize,
     query_offset: usize,
     dtype: DType,
+    /// The fused attention's table of distances, not the pairs.
+    table: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -458,8 +461,13 @@ impl NemotronNetwork {
                 x.dtype(),
                 device,
             )?;
+            let keys = AttentionKeys::solo(
+                &att_mask,
+                self.left_context_frames,
+                self.right_context_frames,
+            );
             for (index, layer) in self.layers.iter().enumerate() {
-                x = layer.forward(&x, &pos_emb, &att_mask)?;
+                x = layer.forward(&x, &pos_emb, &keys)?;
                 outputs.push((format!("layers.{index}"), x.clone()));
             }
             let prompt_id = self.prompt_dictionary.values().copied().min().unwrap_or(0);
@@ -714,26 +722,28 @@ impl NemotronNetwork {
             x.device(),
         )?;
         let key_mask = padded_key_mask(lengths, padded, x.dtype(), x.device())?;
+        let real = lengths.iter().map(|len| *len as u32).collect::<Vec<_>>();
+        let key_lengths = Tensor::from_vec(real, rows, x.device())?;
         x = match &self.encoder_graphs {
             Ok(graphs) if encoder_graph_shape(rows, padded) == Some((rows, padded)) => {
                 // The graph keeps a stable copy of each input and an output
                 // the size of `x`.
-                let inputs = [x, pos_emb, limited_mask, key_mask];
+                let inputs = [x, pos_emb, limited_mask, key_mask, key_lengths];
                 let tensor_bytes = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
                 let retained =
                     inputs.iter().map(tensor_bytes).sum::<u64>() + tensor_bytes(&inputs[0]);
                 let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
-                    let [x, pos_emb, limited_mask, key_mask] = inputs else {
+                    let [x, pos_emb, limited_mask, key_mask, key_lengths] = inputs else {
                         return Err(Error::InferenceError(format!(
-                            "Nemotron encoder graph received {} inputs, expected 4",
+                            "Nemotron encoder graph received {} inputs, expected 5",
                             inputs.len()
                         )));
                     };
                     Ok(vec![self.layers_forward(
                         x.clone(),
                         pos_emb,
-                        limited_mask,
-                        key_mask,
+                        [limited_mask, key_mask],
+                        key_lengths,
                     )?])
                 };
                 graphs
@@ -743,7 +753,7 @@ impl NemotronNetwork {
                         Error::InferenceError("Nemotron encoder graph returned nothing".into())
                     })?
             }
-            _ => self.layers_forward(x, &pos_emb, &limited_mask, &key_mask)?,
+            _ => self.layers_forward(x, &pos_emb, [&limited_mask, &key_mask], &key_lengths)?,
         };
         // A graph's spare rows end here.
         if prompt_ids.len() < rows {
@@ -753,17 +763,23 @@ impl NemotronNetwork {
     }
 
     /// The conformer layers over stem outputs `x` under the chunked-limited
-    /// mask and each row's key mask: the eager form of the encoder graphs.
+    /// mask and each row's key mask, whose row `b` holds `key_lengths[b]`
+    /// (`[B]` U32) real frames: the eager form of the encoder graphs.
     fn layers_forward(
         &self,
         mut x: Tensor,
         pos_emb: &Tensor,
-        limited_mask: &Tensor,
-        key_mask: &Tensor,
+        [limited_mask, key_mask]: [&Tensor; 2],
+        key_lengths: &Tensor,
     ) -> Result<Tensor> {
         let att_mask = limited_mask.broadcast_add(key_mask)?;
+        let keys = AttentionKeys {
+            mask: &att_mask,
+            band: chunked_band(self.left_context_frames, self.right_context_frames),
+            lengths: KeyLengths::PerRow(key_lengths),
+        };
         for layer in &self.layers {
-            x = layer.forward(&x, pos_emb, &att_mask)?;
+            x = layer.forward(&x, pos_emb, &keys)?;
         }
         Ok(x)
     }
@@ -834,8 +850,9 @@ impl NemotronNetwork {
             x.device(),
         )?;
         profile.timings.att_mask += mask_start.elapsed();
+        let keys = AttentionKeys::solo(&att_mask, left_context_frames, right_context_frames);
         for layer in &self.layers {
-            x = layer.forward_profile(&x, &pos_emb, &att_mask, profile)?;
+            x = layer.forward_profile(&x, &pos_emb, &keys, profile)?;
             profile.stats.encoder_layers = profile.stats.encoder_layers.saturating_add(1);
         }
 
@@ -856,32 +873,44 @@ impl NemotronNetwork {
         let frames = x.dim(1)?;
         let cache_len = state.attention_cache_len();
         let key_len = cache_len.saturating_add(frames);
-        let pos_pair = self.streaming_rel_positional_embedding(
+        let fused = fused_attention_for(x.device(), x.dtype());
+        let positions = self.streaming_rel_positional_embedding(
             frames,
             key_len,
             cache_len,
             x.dtype(),
             x.device(),
+            fused,
         )?;
+        let positions = if fused {
+            StreamingPositions::Table(positions)
+        } else {
+            StreamingPositions::Pairs(positions)
+        };
+        let phase = state.last_chunk_start_frame % state.chunk_frames;
         let att_mask = self.streaming_limited_context_mask(
             frames,
             key_len,
             cache_len,
-            state.last_chunk_start_frame % state.chunk_frames,
+            phase,
             state.left_context_frames,
             state.right_context_frames,
             x.dtype(),
             x.device(),
         )?;
+        let keys = StreamingKeys {
+            positions: &positions,
+            mask: &att_mask,
+            band: streaming_band(
+                state.left_context_frames,
+                state.right_context_frames,
+                phase,
+                cache_len,
+            ),
+        };
 
         for (layer, layer_state) in self.layers.iter().zip(state.layer_states.iter_mut()) {
-            x = layer.forward_streaming(
-                &x,
-                layer_state,
-                &pos_pair,
-                &att_mask,
-                state.left_context_frames,
-            )?;
+            x = layer.forward_streaming(&x, layer_state, &keys, state.left_context_frames)?;
         }
 
         let encoded = self.prompt_kernel.forward(&x, prompt_id)?;
@@ -1718,6 +1747,10 @@ impl NemotronNetwork {
         Ok(tensor)
     }
 
+    /// A streaming chunk's relative positions, cached by shape: the eager
+    /// attention's per-pair embeddings, or (`table`) the fused attention's
+    /// embeddings of the chunk's distinct distances
+    /// ([`build_streaming_rel_position_table`]).
     fn streaming_rel_positional_embedding(
         &self,
         q_len: usize,
@@ -1725,12 +1758,14 @@ impl NemotronNetwork {
         query_offset: usize,
         dtype: DType,
         device: &Device,
+        table: bool,
     ) -> Result<Tensor> {
         let key = StreamingRelPosCacheKey {
             q_len,
             key_len,
             query_offset,
             dtype,
+            table,
         };
         if let Some(cached) = self
             .stream_rel_pos_cache
@@ -1744,14 +1779,19 @@ impl NemotronNetwork {
             return Ok(cached);
         }
 
-        let tensor = build_streaming_rel_positional_embedding_for_dtype(
-            q_len,
-            key_len,
-            query_offset,
-            ENCODER_DIM,
-            device,
-            dtype,
-        )?;
+        let tensor = if table {
+            build_streaming_rel_position_table(q_len, key_len, query_offset, ENCODER_DIM, device)?
+                .to_dtype(dtype)?
+        } else {
+            build_streaming_rel_positional_embedding_for_dtype(
+                q_len,
+                key_len,
+                query_offset,
+                ENCODER_DIM,
+                device,
+                dtype,
+            )?
+        };
         let mut cache = self.stream_rel_pos_cache.lock().map_err(|_| {
             Error::InferenceError("Nemotron stream rel-pos cache lock poisoned".into())
         })?;
@@ -3228,17 +3268,26 @@ pub(crate) fn nemotron_encoder_batch_row_bytes(
     padded: usize,
     batch_rows: usize,
     rows: usize,
-    metal: bool,
+    backend: BackendKind,
 ) -> Result<u64> {
     let rows = u64::try_from(rows.clamp(1, batch_rows.max(1)))
         .map_err(|_| Error::Overloaded("Nemotron preparation bytes overflowed".into()))?;
-    Ok(nemotron_encoder_batch_bytes(padded, batch_rows, metal)?.div_ceil(rows))
+    let fused = relpos_attention::fused_priced(backend);
+    let metal = backend == BackendKind::Metal;
+    Ok(nemotron_encoder_batch_bytes(padded, batch_rows, metal, fused)?.div_ceil(rows))
 }
 
 /// Peak device bytes of an offline encoder batch of `rows` rows padded to
 /// `padded` encoder frames, as [`nemotron_encoder_batch_row_bytes`] shares
-/// them out.
-fn nemotron_encoder_batch_bytes(padded: usize, rows: usize, metal: bool) -> Result<u64> {
+/// them out. With the fused attention (`fused_attention`, on CUDA once its
+/// self-check passed) no score plane, `rel_shift` copy or per-row
+/// positional copy is held, only one positional projection.
+fn nemotron_encoder_batch_bytes(
+    padded: usize,
+    rows: usize,
+    metal: bool,
+    fused_attention: bool,
+) -> Result<u64> {
     const F32_BYTES: u64 = 4;
     // About six [T, ff_dim] activations are live inside a layer at once:
     // the feed-forward block's linear, swish and product, plus residual and
@@ -3266,16 +3315,27 @@ fn nemotron_encoder_batch_bytes(padded: usize, rows: usize, metal: bool) -> Resu
         as_u64(FF_DIM)?,
     );
     let stem = nemotron_stem_bytes(padded.saturating_mul(SUBSAMPLING_FACTOR))?;
+    let attention = if fused_attention {
+        // The positional projection, read in place by every row.
+        round(multiply(&[dim, 2 * t, F32_BYTES])?)?
+    } else {
+        [
+            // The scores and their softmax.
+            multiply(&[2, round(multiply(&[rows, heads, t, t, F32_BYTES])?)?])?,
+            // q_v·pᵀ, its zero pad and the reshaped copy, each [H, T, 2T].
+            multiply(&[3, round(multiply(&[rows, heads, t, 2 * t, F32_BYTES])?)?])?,
+            // The positional projection pᵀ, copied out for every row.
+            round(multiply(&[rows, dim, 2 * t, F32_BYTES])?)?,
+        ]
+        .into_iter()
+        .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(overflow)?
+    };
     let terms = [
         round(stem)?,
-        // The scores and their softmax.
-        multiply(&[2, round(multiply(&[rows, heads, t, t, F32_BYTES])?)?])?,
+        attention,
         // The chunked-limited mask with each row's key mask.
         round(multiply(&[rows, t, t, F32_BYTES])?)?,
-        // q_v·pᵀ, its zero pad and the reshaped copy, each [H, T, 2T].
-        multiply(&[3, round(multiply(&[rows, heads, t, 2 * t, F32_BYTES])?)?])?,
-        // The positional projection pᵀ, copied out for every row.
-        round(multiply(&[rows, dim, 2 * t, F32_BYTES])?)?,
         multiply(&[
             LAYER_ACTIVATIONS,
             round(multiply(&[rows, t, ff_dim, F32_BYTES])?)?,
@@ -3354,7 +3414,8 @@ fn encoder_graph_shape(rows: usize, frames: usize) -> Option<(usize, usize)> {
         .into_iter()
         .find(|width| *width >= rows.max(1))?;
     let frames = frames.max(1).checked_next_power_of_two()?;
-    let bytes = nemotron_encoder_batch_bytes(frames, rows, false).ok()?;
+    let fused = relpos_attention::fused_priced(BackendKind::Cuda);
+    let bytes = nemotron_encoder_batch_bytes(frames, rows, false, fused).ok()?;
     (bytes <= ENCODER_GRAPH_LIMITS.pool_bytes).then_some((rows, frames))
 }
 
@@ -3466,16 +3527,16 @@ impl ConformerLayer {
         })
     }
 
-    fn forward(&self, x: &Tensor, pos_emb: &Tensor, att_mask: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, pos_emb: &Tensor, keys: &AttentionKeys<'_>) -> Result<Tensor> {
         let mut profile = NemotronEncodeProfile::default();
-        self.forward_profile(x, pos_emb, att_mask, &mut profile)
+        self.forward_profile(x, pos_emb, keys, &mut profile)
     }
 
     fn forward_profile(
         &self,
         x: &Tensor,
         pos_emb: &Tensor,
-        att_mask: &Tensor,
+        keys: &AttentionKeys<'_>,
         profile: &mut NemotronEncodeProfile,
     ) -> Result<Tensor> {
         let mut residual = x.clone();
@@ -3488,7 +3549,7 @@ impl ConformerLayer {
         let attn_start = Instant::now();
         let attn =
             self.self_attn
-                .forward(&self.norm_self_att.forward(&residual)?, pos_emb, att_mask)?;
+                .forward(&self.norm_self_att.forward(&residual)?, pos_emb, keys)?;
         residual = residual.broadcast_add(&attn)?;
         profile.timings.encoder_attention += attn_start.elapsed();
 
@@ -3515,8 +3576,7 @@ impl ConformerLayer {
         &self,
         x: &Tensor,
         state: &mut ConformerLayerStreamState,
-        pos_pair: &Tensor,
-        att_mask: &Tensor,
+        keys: &StreamingKeys<'_>,
         left_context_frames: usize,
     ) -> Result<Tensor> {
         let mut residual = x.clone();
@@ -3525,12 +3585,9 @@ impl ConformerLayer {
         residual = residual.broadcast_add(&ff1.affine(0.5, 0.0)?)?;
 
         let att_input = self.norm_self_att.forward(&residual)?;
-        let attn = self.self_attn.forward_streaming(
-            &att_input,
-            state.attn_cache.as_ref(),
-            pos_pair,
-            att_mask,
-        )?;
+        let attn = self
+            .self_attn
+            .forward_streaming(&att_input, state.attn_cache.as_ref(), keys)?;
         state.attn_cache =
             update_time_cache_dim1(state.attn_cache.take(), &att_input, left_context_frames)?;
         residual = residual.broadcast_add(&attn)?;
@@ -3714,6 +3771,99 @@ fn load_conv_channel_layer_norm(vb: VarBuilder) -> Result<LayerNorm> {
     Ok(LayerNorm::new(weight, bias, 1e-5))
 }
 
+/// The keys each query of an encoder layer sees: the eager additive mask
+/// and the same rule as the fused attention takes it.
+#[derive(Clone, Copy)]
+struct AttentionKeys<'a> {
+    /// `[B or 1, 1, Tq, Tk]`, 0 on visible keys.
+    mask: &'a Tensor,
+    band: KeyBand,
+    lengths: KeyLengths<'a>,
+}
+
+impl<'a> AttentionKeys<'a> {
+    /// One unpadded row under the chunked-limited `mask`.
+    fn solo(mask: &'a Tensor, left_context: usize, right_context: usize) -> Self {
+        Self {
+            mask,
+            band: chunked_band(left_context, right_context),
+            lengths: KeyLengths::All,
+        }
+    }
+}
+
+/// A streaming chunk's relative positions: the eager attention's per-pair
+/// embeddings, or the fused attention's table of distances
+/// ([`build_streaming_rel_position_table`]).
+enum StreamingPositions {
+    Pairs(Tensor),
+    Table(Tensor),
+}
+
+/// The keys a streaming chunk's queries see: the eager mask, and the
+/// band the fused attention takes for the same rule.
+struct StreamingKeys<'a> {
+    positions: &'a StreamingPositions,
+    mask: &'a Tensor,
+    band: KeyBand,
+}
+
+/// Whether encoder layers on `device` in `dtype` take the fused attention:
+/// the kernel passed its self-check there (or a test runs its host
+/// reference) and the activations are F32 or BF16.
+fn fused_attention_for(device: &Device, dtype: DType) -> bool {
+    let on = fused_attention_on_the_host()
+        || (device.is_cuda() && relpos_attention::eager_reason(device).is_none());
+    on && matches!(dtype, DType::F32 | DType::BF16)
+}
+
+/// The chunked-limited band of a streaming chunk whose first query sits
+/// `phase` frames into its chunk, after `cache_len` cached keys (the
+/// positions [`build_streaming_limited_context_mask`] uses).
+fn streaming_band(
+    left_context: usize,
+    right_context: usize,
+    phase: usize,
+    cache_len: usize,
+) -> KeyBand {
+    match chunked_band(left_context, right_context) {
+        KeyBand::Chunked {
+            chunk, left_chunks, ..
+        } => KeyBand::Chunked {
+            chunk,
+            left_chunks,
+            query_origin: phase as i64,
+            key_origin: phase as i64 - cache_len as i64,
+        },
+        band => band,
+    }
+}
+
+/// [`chunked_limited_visible`] as the fused attention's band: chunks of
+/// `right + 1` frames, each seeing `left / (right + 1)` chunks back.
+fn chunked_band(left_context: usize, right_context: usize) -> KeyBand {
+    let chunk = right_context.saturating_add(1);
+    KeyBand::Chunked {
+        chunk,
+        left_chunks: left_context / chunk,
+        query_origin: 0,
+        key_origin: 0,
+    }
+}
+
+/// Whether the conformer attention runs [`relpos_attention::reference`] on
+/// the host in place of the CUDA kernel: the in-family tests of the fused
+/// path's wiring on a machine without a GPU.
+#[cfg(test)]
+fn fused_attention_on_the_host() -> bool {
+    tests::FUSED_ATTENTION_ON_THE_HOST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn fused_attention_on_the_host() -> bool {
+    false
+}
+
 struct RelPosSelfAttention {
     linear_q: ProjectionLinear,
     linear_k: ProjectionLinear,
@@ -3722,6 +3872,8 @@ struct RelPosSelfAttention {
     linear_pos: ProjectionLinear,
     pos_bias_u: Tensor,
     pos_bias_v: Tensor,
+    /// The biases' values as F32, which the fused attention reads.
+    fused_bias: [Tensor; 2],
 }
 
 impl RelPosSelfAttention {
@@ -3733,18 +3885,120 @@ impl RelPosSelfAttention {
                 f16,
             )?)
         };
+        let pos_bias_u = vb.get((ENCODER_HEADS, ENCODER_HEAD_DIM), "pos_bias_u")?;
+        let pos_bias_v = vb.get((ENCODER_HEADS, ENCODER_HEAD_DIM), "pos_bias_v")?;
+        let fused_bias = [
+            pos_bias_u.to_dtype(DType::F32)?,
+            pos_bias_v.to_dtype(DType::F32)?,
+        ];
+        // The kernel's self-check runs at load, before admission prices the
+        // encoder from its verdict.
+        relpos_attention::prepare_cuda_kernel(vb.device());
         Ok(Self {
             linear_q: projection("linear_q")?,
             linear_k: projection("linear_k")?,
             linear_v: projection("linear_v")?,
             linear_out: projection("linear_out")?,
             linear_pos: projection("linear_pos")?,
-            pos_bias_u: vb.get((ENCODER_HEADS, ENCODER_HEAD_DIM), "pos_bias_u")?,
-            pos_bias_v: vb.get((ENCODER_HEADS, ENCODER_HEAD_DIM), "pos_bias_v")?,
+            pos_bias_u,
+            pos_bias_v,
+            fused_bias,
         })
     }
 
-    fn forward(&self, x: &Tensor, pos_emb: &Tensor, att_mask: &Tensor) -> Result<Tensor> {
+    /// The attention core as one CUDA launch
+    /// ([`relpos_attention::relpos_attention`]) when its self-check passed:
+    /// each query scores its chunked-limited band's real keys only, with
+    /// eager's BF16 roundings in a BF16 encoder. `None` where the eager core
+    /// runs: off CUDA, with the kernel off, or in another dtype.
+    fn fused(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        keys: &AttentionKeys<'_>,
+    ) -> Result<Option<Tensor>> {
+        if !fused_attention_for(x.device(), x.dtype()) {
+            return Ok(None);
+        }
+        self.attend_fused(x, x, pos_emb, keys.band, keys.lengths)
+    }
+
+    /// The fused core over queries from `x` and keys and values from
+    /// `key_value` (`[B, Tk, D]`), with `positions` the `[1, Tq + Tk - 1, D]`
+    /// embeddings of the distances from `Tq - 1 + offset` down.
+    fn attend_fused(
+        &self,
+        x: &Tensor,
+        key_value: &Tensor,
+        positions: &Tensor,
+        band: KeyBand,
+        lengths: KeyLengths<'_>,
+    ) -> Result<Option<Tensor>> {
+        let on_the_host = fused_attention_on_the_host();
+        let dtype = x.dtype();
+        let b = x.dim(0)?;
+        let heads = |projection: &ProjectionLinear, x: &Tensor| -> Result<Tensor> {
+            let rows = x.dim(1)?;
+            Ok(projection
+                .forward(x)?
+                .reshape((b, rows, ENCODER_HEADS, ENCODER_HEAD_DIM))?)
+        };
+        let (q, k, v) = (
+            heads(&self.linear_q, x)?,
+            heads(&self.linear_k, key_value)?,
+            heads(&self.linear_v, key_value)?,
+        );
+        let rows = positions.dim(1)?;
+        let p =
+            self.linear_pos
+                .forward(positions)?
+                .reshape((rows, ENCODER_HEADS, ENCODER_HEAD_DIM))?;
+        // Eager adds the biases in the queries' dtype.
+        let bias = |bias: &Tensor, f32_values: &Tensor| -> Result<Tensor> {
+            if bias.dtype() == dtype {
+                Ok(f32_values.clone())
+            } else {
+                Ok(bias.to_dtype(dtype)?.to_dtype(DType::F32)?)
+            }
+        };
+        let (bias_u, bias_v) = (
+            bias(&self.pos_bias_u, &self.fused_bias[0])?,
+            bias(&self.pos_bias_v, &self.fused_bias[1])?,
+        );
+        let spec = relpos_attention::RelPosAttention {
+            q: &q,
+            k: &k,
+            v: &v,
+            pos: &p,
+            position: relpos_attention::RelPosition::TransformerXl {
+                bias_u: &bias_u,
+                bias_v: &bias_v,
+            },
+            band,
+            key_lengths: lengths,
+            scale: 1.0 / (ENCODER_HEAD_DIM as f64).sqrt(),
+            core: dtype,
+            out_dtype: dtype,
+        };
+        let out = if on_the_host {
+            Some(relpos_attention::reference(&spec)?.to_device(x.device())?)
+        } else {
+            relpos_attention::relpos_attention(&spec)?
+        };
+        let Some(out) = out else {
+            return Ok(None);
+        };
+        self.linear_out
+            .forward(&out)
+            .map(Some)
+            .map_err(|e| Error::InferenceError(e.to_string()))
+    }
+
+    fn forward(&self, x: &Tensor, pos_emb: &Tensor, keys: &AttentionKeys<'_>) -> Result<Tensor> {
+        if let Some(out) = self.fused(x, pos_emb, keys)? {
+            return Ok(out);
+        }
+        let att_mask = keys.mask;
         let (b, t, _d) = x.dims3()?;
 
         let q = self
@@ -3813,8 +4067,7 @@ impl RelPosSelfAttention {
         &self,
         x: &Tensor,
         cache: Option<&Tensor>,
-        pos_pair: &Tensor,
-        att_mask: &Tensor,
+        keys: &StreamingKeys<'_>,
     ) -> Result<Tensor> {
         let (b, q_len, _d) = x.dims3()?;
         let key_value = if let Some(cache) = cache {
@@ -3822,6 +4075,19 @@ impl RelPosSelfAttention {
         } else {
             x.clone()
         };
+        let pos_pair = match keys.positions {
+            StreamingPositions::Pairs(pairs) => pairs,
+            StreamingPositions::Table(table) => {
+                return self
+                    .attend_fused(x, &key_value, table, keys.band, KeyLengths::All)?
+                    .ok_or_else(|| {
+                        Error::InferenceError(
+                            "the fused attention refused a Nemotron streaming chunk".into(),
+                        )
+                    });
+            }
+        };
+        let att_mask = keys.mask;
         let key_len = key_value.dim(1)?;
 
         let q = self
@@ -4600,6 +4866,41 @@ fn build_streaming_rel_positional_embedding(
     Tensor::from_vec(emb, (1, q_len * key_len, d_model), device).map_err(Error::from)
 }
 
+/// The embeddings of a streaming chunk's distinct relative distances, as
+/// the fused attention reads them: `[1, q_len + key_len - 1, d_model]`, row
+/// `r` holding distance `query_offset + q_len - 1 - r`, so the pair
+/// `(i, j)` of [`build_streaming_rel_positional_embedding`] is row
+/// `q_len - 1 - i + j`, with the same values.
+fn build_streaming_rel_position_table(
+    q_len: usize,
+    key_len: usize,
+    query_offset: usize,
+    d_model: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    if q_len == 0 || key_len == 0 || query_offset.saturating_add(q_len) > key_len {
+        return Err(Error::InvalidInput(format!(
+            "Invalid Nemotron streaming attention window: q_len={q_len}, key_len={key_len}, query_offset={query_offset}"
+        )));
+    }
+    let rows = q_len + key_len - 1;
+    let mut emb = vec![0f32; rows * d_model];
+    let denom = (10_000f32).ln() / d_model as f32;
+    let largest = (query_offset + q_len - 1) as isize;
+    for (row, values) in emb.chunks_exact_mut(d_model).enumerate() {
+        let distance = largest - row as isize;
+        for i in (0..d_model).step_by(2) {
+            let div = (-denom * i as f32).exp();
+            let angle = distance as f32 * div;
+            values[i] = angle.sin();
+            if i + 1 < d_model {
+                values[i + 1] = angle.cos();
+            }
+        }
+    }
+    Tensor::from_vec(emb, (1, rows, d_model), device).map_err(Error::from)
+}
+
 fn build_streaming_rel_positional_embedding_for_dtype(
     q_len: usize,
     key_len: usize,
@@ -4890,6 +5191,21 @@ fn normalize_per_feature(mel: &mut [f32], n_mels: usize, frames: usize, valid_fr
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    thread_local! {
+        /// Runs the conformer attention through the fused kernel's host
+        /// reference (see `fused_attention_on_the_host`).
+        pub(super) static FUSED_ATTENTION_ON_THE_HOST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// `f` with the conformer attention on the fused kernel's host reference.
+    fn with_fused_attention<T>(f: impl FnOnce() -> T) -> T {
+        FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(true));
+        let out = f();
+        FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(false));
+        out
+    }
 
     #[test]
     fn shape_tensor_cache_bounds_entries_and_retained_bytes() {
@@ -5604,6 +5920,111 @@ pub(super) mod tests {
         tensors
     }
 
+    /// One streaming chunk's attention keys `[q_len, key_len, cache_len,
+    /// phase]` on `device`: the eager pairs or (`fused`) the distance table,
+    /// the mask, and the band.
+    fn chunk_keys(
+        [q_len, key_len, cache_len, phase]: [usize; 4],
+        left: usize,
+        right: usize,
+        fused: bool,
+        device: &Device,
+    ) -> (StreamingPositions, Tensor, KeyBand) {
+        let positions = if fused {
+            StreamingPositions::Table(
+                build_streaming_rel_position_table(q_len, key_len, cache_len, ENCODER_DIM, device)
+                    .unwrap(),
+            )
+        } else {
+            StreamingPositions::Pairs(
+                build_streaming_rel_positional_embedding(
+                    q_len,
+                    key_len,
+                    cache_len,
+                    ENCODER_DIM,
+                    device,
+                )
+                .unwrap(),
+            )
+        };
+        let mask = build_streaming_limited_context_mask(
+            q_len, key_len, cache_len, phase, left, right, device,
+        )
+        .unwrap();
+        (
+            positions,
+            mask,
+            streaming_band(left, right, phase, cache_len),
+        )
+    }
+
+    /// The fused attention over streaming chunks (cache keys before each
+    /// chunk, chunk phases, a sliding cache) matches the eager streaming
+    /// layer, chunk by chunk, through the kernel's host reference.
+    #[test]
+    fn fused_streaming_attention_matches_the_eager_chunks() {
+        let layer = hashed_conformer_layer();
+        let (left, len) = (56, 6 * 14 + 5);
+        let x = hashed_tensor(37, (1, len, ENCODER_DIM), 1.0);
+        for right in [13, 3] {
+            let mut worst = 0f32;
+            let (mut eager_state, mut fused_state) = (
+                ConformerLayerStreamState::new(),
+                ConformerLayerStreamState::new(),
+            );
+            for (start, q_len) in streaming_chunks(len, right) {
+                let chunk = x.narrow(1, start, q_len).unwrap();
+                let run = |state: &mut ConformerLayerStreamState, fused: bool| {
+                    let cache_len = state.attn_cache.as_ref().map_or(0, |c| c.dim(1).unwrap());
+                    let shape = [q_len, cache_len + q_len, cache_len, start % (right + 1)];
+                    let (positions, mask, band) =
+                        chunk_keys(shape, left, right, fused, &Device::Cpu);
+                    let keys = StreamingKeys {
+                        positions: &positions,
+                        mask: &mask,
+                        band,
+                    };
+                    FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(fused));
+                    let out = layer.forward_streaming(&chunk, state, &keys, left);
+                    FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(false));
+                    out.unwrap()
+                };
+                let eager = run(&mut eager_state, false);
+                let fused = run(&mut fused_state, true);
+                worst = worst.max(max_abs_difference(&fused, &eager) / max_abs_of(&eager).max(1.0));
+            }
+            eprintln!("Nemotron fused vs eager streaming, right {right}: {worst:e}");
+            assert!(worst <= 4e-6, "right {right}: {worst:e}");
+        }
+    }
+
+    /// The distance table holds the pair embeddings' values: pair `(i, j)`
+    /// is row `q_len - 1 - i + j`.
+    #[test]
+    fn streaming_position_table_holds_the_pair_embeddings() {
+        let (q_len, key_len, offset) = (5, 12, 7);
+        let pairs =
+            build_streaming_rel_positional_embedding(q_len, key_len, offset, 16, &Device::Cpu)
+                .unwrap()
+                .reshape((q_len, key_len, 16))
+                .unwrap();
+        let table = build_streaming_rel_position_table(q_len, key_len, offset, 16, &Device::Cpu)
+            .unwrap()
+            .squeeze(0)
+            .unwrap();
+        for i in 0..q_len {
+            for j in 0..key_len {
+                let pair = pairs.i((i, j)).unwrap().to_vec1::<f32>().unwrap();
+                let row = table
+                    .i(q_len - 1 - i + j)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                assert_eq!(pair, row, "pair ({i}, {j})");
+            }
+        }
+    }
+
     #[test]
     fn conformer_layer_streaming_matches_offline_chunked_limited() {
         let layer = hashed_conformer_layer();
@@ -5614,7 +6035,8 @@ pub(super) mod tests {
         for right in [13, 3] {
             let pos_emb = build_rel_positional_embedding(len, ENCODER_DIM, &Device::Cpu).unwrap();
             let mask = build_limited_context_mask(len, left, right, &Device::Cpu).unwrap();
-            let offline = layer.forward(&x, &pos_emb, &mask).unwrap();
+            let keys = AttentionKeys::solo(&mask, left, right);
+            let offline = layer.forward(&x, &pos_emb, &keys).unwrap();
 
             let mut state = ConformerLayerStreamState::new();
             let mut streamed = Vec::new();
@@ -5624,28 +6046,22 @@ pub(super) mod tests {
                     .as_ref()
                     .map_or(0, |cache| cache.dim(1).unwrap());
                 let key_len = cache_len + q_len;
-                let pos_pair = build_streaming_rel_positional_embedding(
-                    q_len,
-                    key_len,
-                    cache_len,
-                    ENCODER_DIM,
-                    &Device::Cpu,
-                )
-                .unwrap();
-                let mask = build_streaming_limited_context_mask(
-                    q_len,
-                    key_len,
-                    cache_len,
-                    start % (right + 1),
+                let (positions, mask, band) = chunk_keys(
+                    [q_len, key_len, cache_len, start % (right + 1)],
                     left,
                     right,
+                    false,
                     &Device::Cpu,
-                )
-                .unwrap();
+                );
+                let keys = StreamingKeys {
+                    positions: &positions,
+                    mask: &mask,
+                    band,
+                };
                 let chunk = x.narrow(1, start, q_len).unwrap();
                 streamed.push(
                     layer
-                        .forward_streaming(&chunk, &mut state, &pos_pair, &mask, left)
+                        .forward_streaming(&chunk, &mut state, &keys, left)
                         .unwrap(),
                 );
             }
@@ -5691,8 +6107,9 @@ pub(super) mod tests {
         let x = hashed_tensor(41, (1, len, ENCODER_DIM), 1.0);
         let pos_emb = build_rel_positional_embedding(len, ENCODER_DIM, &device).unwrap();
         let mask = build_limited_context_mask(len, left, right, &device).unwrap();
-        let offline = layer.forward(&x, &pos_emb, &mask).unwrap();
-        let rel = relative_l2_of(&offline, &reference.forward(&x, &pos_emb, &mask).unwrap());
+        let keys = AttentionKeys::solo(&mask, left, right);
+        let offline = layer.forward(&x, &pos_emb, &keys).unwrap();
+        let rel = relative_l2_of(&offline, &reference.forward(&x, &pos_emb, &keys).unwrap());
         assert!(rel > 0.0 && rel < 1e-2, "offline relative L2 {rel:e}");
 
         let mut state = ConformerLayerStreamState::new();
@@ -5703,28 +6120,22 @@ pub(super) mod tests {
                 .as_ref()
                 .map_or(0, |cache| cache.dim(1).unwrap());
             let key_len = cache_len + q_len;
-            let pos_pair = build_streaming_rel_positional_embedding(
-                q_len,
-                key_len,
-                cache_len,
-                ENCODER_DIM,
-                &device,
-            )
-            .unwrap();
-            let mask = build_streaming_limited_context_mask(
-                q_len,
-                key_len,
-                cache_len,
-                start % (right + 1),
+            let (positions, mask, band) = chunk_keys(
+                [q_len, key_len, cache_len, start % (right + 1)],
                 left,
                 right,
+                false,
                 &device,
-            )
-            .unwrap();
+            );
+            let keys = StreamingKeys {
+                positions: &positions,
+                mask: &mask,
+                band,
+            };
             let chunk = x.narrow(1, start, q_len).unwrap();
             streamed.push(
                 layer
-                    .forward_streaming(&chunk, &mut state, &pos_pair, &mask, left)
+                    .forward_streaming(&chunk, &mut state, &keys, left)
                     .unwrap(),
             );
         }
@@ -6659,6 +7070,37 @@ pub(super) mod tests {
         );
     }
 
+    /// The fused attention's wiring: with the kernel's host reference in
+    /// place of the eager core (biases, position order, the chunked-limited
+    /// band and each row's key length as the CUDA kernel receives them), a
+    /// padded batch whose rows end on, past and before a chunk boundary, and
+    /// a lone utterance, encode as the eager layers do.
+    #[test]
+    fn fused_attention_matches_the_eager_encoder() {
+        let network = hashed_batch_network(&Device::Cpu, false);
+        let rows = BATCH_ROWS
+            .iter()
+            .enumerate()
+            .map(|(row, (valid, prompt))| {
+                hashed_batch_input(600 + row as u32, *valid, *prompt, &Device::Cpu)
+            })
+            .collect::<Vec<_>>();
+        let eager = network.encode_batch_with_prompts(&rows).unwrap();
+        let fused = with_fused_attention(|| network.encode_batch_with_prompts(&rows).unwrap());
+        let mut worst = 0f32;
+        for (fused, eager) in fused.iter().zip(&eager) {
+            worst = worst.max(max_abs_difference(fused, eager) / max_abs_of(eager).max(1.0));
+        }
+        let audio = hashed_values(77, 16_000, 0.25);
+        let (eager, eager_len) = network.encode_with_prompt(&audio, 3).unwrap();
+        let (fused, fused_len) =
+            with_fused_attention(|| network.encode_with_prompt(&audio, 3).unwrap());
+        assert_eq!(fused_len, eager_len);
+        worst = worst.max(max_abs_difference(&fused, &eager) / max_abs_of(&eager).max(1.0));
+        eprintln!("Nemotron fused vs eager attention on CPU: worst relative difference {worst:e}");
+        assert!(worst <= 4e-6, "{worst:e}");
+    }
+
     #[test]
     fn encoder_graph_shapes_pad_rows_to_a_width_and_frames_to_a_power_of_two() {
         assert_eq!(encoder_graph_shape(1, 126), Some((1, 128)));
@@ -6677,7 +7119,7 @@ pub(super) mod tests {
                     continue;
                 };
                 assert_eq!(shape, (rows, frames), "a graph's shape is its own");
-                let bytes = nemotron_encoder_batch_bytes(frames, rows, false).unwrap();
+                let bytes = nemotron_encoder_batch_bytes(frames, rows, false, false).unwrap();
                 assert!(bytes <= ENCODER_GRAPH_LIMITS.pool_bytes);
             }
         }
@@ -6685,6 +7127,27 @@ pub(super) mod tests {
         let copies =
             (2 * 8 * 256 * ENCODER_DIM + (2 * 256 - 1) * ENCODER_DIM + 256 * 256 + 8 * 256) * 4;
         assert!((copies as u64) * 4 <= ENCODER_GRAPH_LIMITS.retained_bytes);
+    }
+
+    /// With the fused attention on, a batch holds one positional projection
+    /// and its mask, not the scores, the three `rel_shift` planes or a
+    /// projection copy per row.
+    #[test]
+    fn fused_attention_drops_the_eager_attention_planes() {
+        for (frames, rows) in [(128usize, 1usize), (256, 8)] {
+            let eager = nemotron_encoder_batch_bytes(frames, rows, false, false).unwrap();
+            let fused = nemotron_encoder_batch_bytes(frames, rows, false, true).unwrap();
+            let (t, r) = (frames as u64, rows as u64);
+            let planes = 2 * r * 8 * t * t * 4 + 3 * r * 8 * t * 2 * t * 4 + r * 1024 * 2 * t * 4;
+            assert_eq!(eager - fused, planes - 1024 * 2 * t * 4);
+        }
+        assert_eq!(
+            nemotron_encoder_batch_row_bytes(256, 8, 8, BackendKind::Cuda).unwrap(),
+            nemotron_encoder_batch_bytes(256, 8, false, false)
+                .unwrap()
+                .div_ceil(8),
+            "without the CUDA kernel's verdict, pricing stays eager"
+        );
     }
 
     /// Admission prices the graphed shape on CUDA only, each real row
@@ -6723,9 +7186,11 @@ pub(super) mod tests {
         );
         for rows in [1usize, 3, 5, 8, 9] {
             let (batch_rows, frames) = nemotron_encoder_batch_shape(rows, 100, BackendKind::Cuda);
-            let batch = nemotron_encoder_batch_bytes(frames, batch_rows, false).unwrap();
-            let row = nemotron_encoder_batch_row_bytes(frames, batch_rows, rows, false).unwrap();
-            let eager = nemotron_encoder_batch_row_bytes(100, rows, rows, false).unwrap();
+            let batch = nemotron_encoder_batch_bytes(frames, batch_rows, false, false).unwrap();
+            let row = nemotron_encoder_batch_row_bytes(frames, batch_rows, rows, BackendKind::Cpu)
+                .unwrap();
+            let eager =
+                nemotron_encoder_batch_row_bytes(100, rows, rows, BackendKind::Cpu).unwrap();
             assert!(row * rows as u64 >= batch, "{rows} rows");
             assert!(row >= eager, "{rows} rows");
         }
