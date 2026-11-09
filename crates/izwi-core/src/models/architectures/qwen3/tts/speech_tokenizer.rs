@@ -882,27 +882,34 @@ impl EncoderTransformer {
     }
 }
 
-/// SnakeBeta activation.
+/// SnakeBeta activation, `x + sin²(x·e^α) / (e^β + 1e-9)`.
 struct SnakeBeta {
-    alpha: Tensor,
-    beta: Tensor,
+    /// `e^α`, shaped `[1, channels, 1]`.
+    alpha_exp: Tensor,
+    /// `1 / (e^β + 1e-9)`, shaped `[1, channels, 1]`.
+    inv_beta: Tensor,
 }
 
 impl SnakeBeta {
+    /// Computes the per-channel constants once, with the ops (and so the
+    /// bits) the forward pass used to repeat on every call: five launches
+    /// and an upload fewer per activation, 29 activations a vocoder window.
     fn load(channels: usize, vb: VarBuilder) -> Result<Self> {
+        let alpha = vb.get((channels,), "alpha")?;
+        let beta = vb.get((channels,), "beta")?;
+        let alpha_exp = alpha.unsqueeze(0)?.unsqueeze(2)?.exp()?;
+        let beta = beta.unsqueeze(0)?.unsqueeze(2)?.exp()?;
+        let eps = Tensor::new(1e-9f32, beta.device())?.to_dtype(beta.dtype())?;
+        let inv_beta = beta.broadcast_add(&eps)?.recip()?;
         Ok(Self {
-            alpha: vb.get((channels,), "alpha")?,
-            beta: vb.get((channels,), "beta")?,
+            alpha_exp,
+            inv_beta,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let alpha = self.alpha.unsqueeze(0)?.unsqueeze(2)?.exp()?;
-        let beta = self.beta.unsqueeze(0)?.unsqueeze(2)?.exp()?;
-        let sin2 = x.broadcast_mul(&alpha)?.sin()?.sqr()?;
-        let eps = Tensor::new(1e-9f32, x.device())?.to_dtype(beta.dtype())?;
-        let inv_beta = beta.broadcast_add(&eps)?.recip()?;
-        x.broadcast_add(&sin2.broadcast_mul(&inv_beta)?)
+        let sin2 = x.broadcast_mul(&self.alpha_exp)?.sin()?.sqr()?;
+        x.broadcast_add(&sin2.broadcast_mul(&self.inv_beta)?)
             .map_err(Error::from)
     }
 }
@@ -983,9 +990,43 @@ impl DecoderBlock {
     }
 }
 
+/// The ConvNeXt block's causal depthwise conv (one 7-tap filter a channel).
+///
+/// Candle's grouped `conv1d` runs one single-group convolution per group
+/// (im2col, GEMM and a transposing copy) and concatenates them: about 4,100
+/// kernel launches for the 1,024 channels of the 12 Hz decoder, twice a
+/// vocoder window, against about 500 for the rest of the window. The shared
+/// depthwise op is one launch on CUDA (self-checked against its composition
+/// at load) and 2K + 2 element-wise ops elsewhere.
+struct CausalDepthwiseConv1d {
+    weight: Tensor,
+    bias: Tensor,
+    causal_padding: usize,
+}
+
+impl CausalDepthwiseConv1d {
+    fn load(channels: usize, kernel_size: usize, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            weight: vb.get((channels, 1, kernel_size), "weight")?,
+            bias: vb.get(channels, "bias")?,
+            causal_padding: kernel_size - 1,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        crate::kernels::depthwise_conv::depthwise_conv1d(
+            x,
+            &self.weight,
+            Some(&self.bias),
+            crate::kernels::depthwise_conv::DepthwiseConv1dSpec::padded(self.causal_padding, 0),
+        )
+        .map_err(Error::from)
+    }
+}
+
 /// ConvNeXt block used after upsample transposed conv.
 struct ConvNeXtBlock {
-    dwconv: CausalConv1d,
+    dwconv: CausalDepthwiseConv1d,
     norm: LayerNorm,
     pwconv1: Linear,
     pwconv2: Linear,
@@ -994,15 +1035,7 @@ struct ConvNeXtBlock {
 
 impl ConvNeXtBlock {
     fn load(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let dwconv = CausalConv1d::load(
-            dim,
-            dim,
-            CONVNEXT_KERNEL,
-            1,
-            dim,
-            true,
-            vb.pp("dwconv.conv"),
-        )?;
+        let dwconv = CausalDepthwiseConv1d::load(dim, CONVNEXT_KERNEL, vb.pp("dwconv.conv"))?;
         let norm = candle_nn::layer_norm(
             dim,
             LayerNormConfig {
@@ -1840,6 +1873,9 @@ impl SpeechTokenizerDecoder {
             )));
         }
         let vocoder_context_frames = vocoder_receptive_field_frames(&decoder_config);
+        // The depthwise op's one-launch CUDA kernel checks itself against its
+        // composition here, at load, not in the first request.
+        crate::kernels::depthwise_conv::prepare_cuda_kernel(&device);
         let vb = root_vb.pp("decoder");
 
         // Official checkpoints store RVQ embeddings at 256 dims.
@@ -2908,6 +2944,61 @@ mod tests {
         assert!(
             (window..seq).all(|t| !frame_changed(t)),
             "frames past the window attended to frame 0"
+        );
+    }
+
+    /// The ConvNeXt depthwise conv as the shared op computes what Candle's
+    /// grouped `conv1d` computed over the same weights (causal left padding,
+    /// per-channel bias), up to summation order.
+    #[test]
+    fn convnext_depthwise_conv_matches_the_grouped_conv1d() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let channels = 12;
+        let vb = xorshift_vb(&Device::Cpu);
+        let depthwise =
+            CausalDepthwiseConv1d::load(channels, CONVNEXT_KERNEL, vb.pp("dwconv.conv")).unwrap();
+        let grouped = CausalConv1d::load(
+            channels,
+            channels,
+            CONVNEXT_KERNEL,
+            1,
+            channels,
+            true,
+            vb.pp("dwconv.conv"),
+        )
+        .unwrap();
+        let x = xorshift_tensor(&[2, channels, 19], 7, 1.0, &Device::Cpu).unwrap();
+        let ours = host_f32(&depthwise.forward(&x).unwrap()).unwrap();
+        let reference = host_f32(&grouped.forward(&x).unwrap()).unwrap();
+        assert_eq!(ours.len(), 2 * channels * 19);
+        let error = max_abs_diff(&ours, &reference);
+        assert!(error < 1e-5, "depthwise conv diverges by {error}");
+    }
+
+    /// SnakeBeta's load-time constants give the bits the per-call formula
+    /// gave: the same ops on the same values.
+    #[test]
+    fn snake_constants_reproduce_the_per_call_formula() {
+        use crate::kernels::numeric_check::{host_f32, xorshift_tensor};
+
+        let channels = 6;
+        let vb = xorshift_vb(&Device::Cpu);
+        let snake = SnakeBeta::load(channels, vb.pp("snake")).unwrap();
+        let alpha = vb.pp("snake").get((channels,), "alpha").unwrap();
+        let beta = vb.pp("snake").get((channels,), "beta").unwrap();
+        let x = xorshift_tensor(&[2, channels, 11], 3, 2.0, &Device::Cpu).unwrap();
+        let per_call = || -> candle_core::Result<Tensor> {
+            let alpha = alpha.unsqueeze(0)?.unsqueeze(2)?.exp()?;
+            let beta = beta.unsqueeze(0)?.unsqueeze(2)?.exp()?;
+            let sin2 = x.broadcast_mul(&alpha)?.sin()?.sqr()?;
+            let eps = Tensor::new(1e-9f32, x.device())?;
+            let inv_beta = beta.broadcast_add(&eps)?.recip()?;
+            x.broadcast_add(&sin2.broadcast_mul(&inv_beta)?)
+        };
+        assert_eq!(
+            host_f32(&snake.forward(&x).unwrap()).unwrap(),
+            host_f32(&per_call().unwrap()).unwrap()
         );
     }
 
