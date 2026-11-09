@@ -293,17 +293,31 @@ pub(crate) fn asr_sequence_ceiling(
 
 /// `(sequence, retained)` token bounds of an automatic ASR context: one
 /// `sequence_ceiling` per sequence, and one per concurrent sequence in the
-/// shared retained pool, never above the model's native context.
+/// shared retained pool, in whole `page_tokens` pages
+/// ([`asr_pool_sequence_tokens`]), never above the model's native context.
 pub(crate) fn asr_automatic_context(
     native_tokens: usize,
     sequence_ceiling: usize,
     retained_rows: usize,
+    page_tokens: usize,
 ) -> (usize, usize) {
     let sequence = sequence_ceiling.min(native_tokens);
-    let retained = sequence
+    let retained = asr_pool_sequence_tokens(sequence, page_tokens)
         .saturating_mul(retained_rows.max(1))
         .min(native_tokens);
     (sequence, retained)
+}
+
+/// What one sequence of up to `sequence_tokens` takes from a shared retained
+/// pool of `page_tokens` pages: admission claims a sequence's prompt and
+/// budget in whole pages, so a pool sized in unrounded sequences is short a
+/// row once the rounding adds up (32 Qwen3-ASR rows of 1,307 tokens claim
+/// 672 pages of 64; 32 x 1,307 tokens are 654).
+pub(crate) fn asr_pool_sequence_tokens(sequence_tokens: usize, page_tokens: usize) -> usize {
+    let page_tokens = page_tokens.max(1);
+    sequence_tokens
+        .div_ceil(page_tokens)
+        .saturating_mul(page_tokens)
 }
 
 /// Smallest audio duration in seconds an invocation chunk planner will still

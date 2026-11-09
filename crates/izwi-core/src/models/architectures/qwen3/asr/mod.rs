@@ -129,8 +129,11 @@ pub(crate) enum Qwen3AsrContextBound {
     /// bound and the shared fitter applies the configured value.
     Configured,
     /// The automatic ASR ceiling, with retained KV for this many concurrent
-    /// sequences.
-    Automatic { retained_rows: usize },
+    /// sequences in whole pages of `page_tokens` (the engine's page size).
+    Automatic {
+        retained_rows: usize,
+        page_tokens: usize,
+    },
 }
 
 /// Chunk planners cut audio at 95% of the solved invocation limit
@@ -641,10 +644,14 @@ impl Qwen3AsrModel {
         })?;
         let (sequence_tokens, retained_max_tokens) = match bound {
             Qwen3AsrContextBound::Configured => (native_tokens, native_tokens),
-            Qwen3AsrContextBound::Automatic { retained_rows } => qwen3_asr_automatic_context(
+            Qwen3AsrContextBound::Automatic {
+                retained_rows,
+                page_tokens,
+            } => qwen3_asr_automatic_context(
                 native_tokens,
                 self.automatic_asr_sequence_tokens(),
                 retained_rows,
+                page_tokens,
             ),
         };
         qwen3_asr_physical_state_spec(
@@ -5094,22 +5101,31 @@ mod tests {
         // 768-token planning decode reserve.
         let ceiling = qwen3_asr_sequence_ceiling(13.0, 30.0);
         assert_eq!(ceiling, 128 + 411 + 768);
+        // A row claims its sequence in whole pages: 21 pages of 64 tokens.
         assert_eq!(
-            qwen3_asr_automatic_context(65_536, ceiling, 8),
+            qwen3_asr_automatic_context(65_536, ceiling, 8, 64),
+            (ceiling, 8 * 1_344)
+        );
+        assert_eq!(
+            qwen3_asr_automatic_context(65_536, ceiling, 32, 64),
+            (ceiling, 32 * 1_344)
+        );
+        assert_eq!(
+            qwen3_asr_automatic_context(65_536, ceiling, 8, 1),
             (ceiling, 8 * ceiling)
         );
         // Many CUDA rows or a small native context never exceed the native bound.
         assert_eq!(
-            qwen3_asr_automatic_context(65_536, ceiling, 96),
+            qwen3_asr_automatic_context(65_536, ceiling, 96, 64),
             (ceiling, 65_536)
         );
         assert_eq!(
-            qwen3_asr_automatic_context(1_024, ceiling, 8),
+            qwen3_asr_automatic_context(1_024, ceiling, 8, 64),
             (1_024, 1_024)
         );
         assert_eq!(
-            qwen3_asr_automatic_context(65_536, ceiling, 0),
-            (ceiling, ceiling)
+            qwen3_asr_automatic_context(65_536, ceiling, 0, 64),
+            (ceiling, 1_344)
         );
     }
 
@@ -5185,7 +5201,7 @@ mod tests {
         assert_eq!(kv_bytes(ceiling), 1_344 * token_bytes);
         assert!(kv_bytes(ceiling) * 48 < kv_bytes(65_536));
         // Eight retained rows still need under a sixth of the native pool.
-        let (_, retained) = qwen3_asr_automatic_context(65_536, ceiling, 8);
+        let (_, retained) = qwen3_asr_automatic_context(65_536, ceiling, 8, 64);
         assert!(kv_bytes(retained) * 6 < kv_bytes(65_536));
 
         // Prepared-input rows: F16 embeddings plus I64 MRoPE positions, for
@@ -5224,7 +5240,7 @@ mod tests {
         let offline = [physical_spec_stage(1, StageProgressKind::Atomic)];
         let graphs = vec![offline.as_slice()];
         let ceiling = qwen3_asr_sequence_ceiling(13.0, 30.0);
-        let (sequence, retained_max) = qwen3_asr_automatic_context(65_536, ceiling, 8);
+        let (sequence, retained_max) = qwen3_asr_automatic_context(65_536, ceiling, 8, 64);
         let retained = qwen3_asr_retained_state_contract(
             crate::kv::test_contract(),
             sequence,
@@ -5236,7 +5252,7 @@ mod tests {
             .expect("physical ASR spec");
 
         assert_eq!(spec.sequence_tokens, ceiling);
-        assert_eq!(spec.retained_max_tokens, 8 * ceiling);
+        assert_eq!(spec.retained_max_tokens, 8 * 1_344);
         assert_eq!(
             spec.descriptor
                 .capacity_axis_bounds(crate::kv::v2::StateCapacityAxis::DecoderContext),

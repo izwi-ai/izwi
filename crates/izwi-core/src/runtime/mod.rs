@@ -40,8 +40,8 @@ mod voice_metrics;
 mod voice_session;
 
 pub(crate) use asr::{
-    asr_automatic_context, asr_sequence_ceiling, compose_invocation_audio_limit,
-    ASR_TEXT_PROMPT_TOKEN_RESERVE,
+    asr_automatic_context, asr_pool_sequence_tokens, asr_sequence_ceiling,
+    compose_invocation_audio_limit, ASR_TEXT_PROMPT_TOKEN_RESERVE,
 };
 pub(crate) use asr::{
     nemotron_transcribe_asr_planned_max_tokens, vibevoice_asr_planned_max_tokens,

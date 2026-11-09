@@ -27,9 +27,17 @@ fn shared_asr_ceiling_bounds_one_chunk_per_sequence() {
         1_938
     );
     assert_eq!(asr_sequence_ceiling(128, 13.0, -1.0, 768), 896);
-    assert_eq!(asr_automatic_context(65_536, 1_938, 8), (1_938, 15_504));
-    assert_eq!(asr_automatic_context(65_536, 1_938, 0), (1_938, 1_938));
-    assert_eq!(asr_automatic_context(1_024, 1_938, 8), (1_024, 1_024));
+    assert_eq!(asr_automatic_context(65_536, 1_938, 8, 1), (1_938, 15_504));
+    assert_eq!(asr_automatic_context(65_536, 1_938, 0, 1), (1_938, 1_938));
+    assert_eq!(asr_automatic_context(1_024, 1_938, 8, 1), (1_024, 1_024));
+    // In 64-token pages a 1,938-token sequence takes 31 pages.
+    assert_eq!(
+        asr_automatic_context(65_536, 1_938, 8, 64),
+        (1_938, 8 * 1_984)
+    );
+    assert_eq!(asr_pool_sequence_tokens(1_938, 64), 1_984);
+    assert_eq!(asr_pool_sequence_tokens(448, 64), 448);
+    assert_eq!(asr_pool_sequence_tokens(448, 0), 448);
 }
 
 #[test]
@@ -1507,6 +1515,48 @@ fn nemotron_transcribe_pool_admits_32_automatic_30s_rows() {
     let (admitted, refusal) = FullClaimPool::new(MAX_CONTEXT_TOKENS, (8, 8)).admit_all(&card);
     assert_eq!(admitted, 3);
     assert!(backpressure(refusal));
+}
+
+/// Every automatic Qwen3-ASR request claims its whole sequence (the 2,048
+/// default budget clamped to the 1,307-token context): 21 pages of 64. The
+/// pool held 32 unrounded sequences, 654 pages, so 31 rows fit and the H100
+/// deferred 18-130 steps for capacity at 32 streams. It now holds 32 rows.
+#[test]
+fn qwen3_asr_pool_admits_its_certified_width_of_automatic_30s_rows() {
+    for variant in [ModelVariant::Qwen3Asr06BGguf, ModelVariant::Qwen3Asr17BGguf] {
+        let width = crate::catalog::certified_decode_width(variant.family(), BackendKind::Cuda);
+        assert_eq!(width, 32);
+        let ceiling =
+            crate::runtime::lifecycle::asr_envelope::minimum_sequence_tokens(variant).unwrap();
+        let ceiling = usize::try_from(ceiling).unwrap();
+        assert_eq!(ceiling, 1_307);
+        let (sequence, pool) = asr_automatic_context(65_536, ceiling, width, 64);
+        // A 30 s clip's prompt: 390 audio tokens and the text prompt (403
+        // tokens at 29.8 s in the H100 matrix's B shape).
+        let rows = (0..width)
+            .map(|_| {
+                let mut request = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(variant);
+                apply_asr_max_tokens(&mut request, variant, None);
+                request
+                    .install_prepared_sequence_input_tokens(405, sequence)
+                    .unwrap();
+                request
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows[0].num_prompt_tokens() + rows[0].params.max_tokens,
+            1_307
+        );
+        // The family's retained rows on the H100: 32 retained and staged.
+        let rows_32 = (32, 32);
+        assert_eq!(FullClaimPool::new(pool, rows_32).admit_all(&rows).0, width);
+        let (admitted, refusal) = FullClaimPool::new(width * ceiling, rows_32).admit_all(&rows);
+        assert_eq!(admitted, width - 1);
+        assert!(matches!(
+            refusal,
+            Some(crate::error::Error::Backpressure(_))
+        ));
+    }
 }
 
 #[test]

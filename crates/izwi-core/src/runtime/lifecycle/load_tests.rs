@@ -4432,32 +4432,45 @@ fn unevictable_residents_are_pinned_or_busy_and_never_the_request() {
 }
 
 /// A retained ASR pool every sequence claims its pages from holds one
-/// automatic sequence per retained row, so concurrent requests' claims fit
-/// side by side, and never less than one sequence of the model's context.
-/// A pool of one context admitted one Granite Speech 4.1 (4,096 tokens
-/// against a 2,048-token automatic claim) or Whisper (its whole 448-position
-/// window) request at a time, and every decode step carried one row.
+/// automatic sequence per retained row, in whole pages, so concurrent
+/// requests' claims fit side by side, and never less than one sequence of
+/// the model's context. A pool of one context admitted one Granite Speech
+/// 4.1 (4,096 tokens against a 2,048-token automatic claim) or Whisper (its
+/// whole 448-position window) request at a time, and every decode step
+/// carried one row.
 #[test]
 fn shared_asr_pools_hold_one_automatic_sequence_per_row() {
     let granite = super::asr_minimum_tokens(ModelVariant::GraniteSpeech412BPlus);
     assert!((444..1024).contains(&granite), "{granite}");
     let sequence = usize::try_from(granite).unwrap();
-    assert_eq!(super::asr_shared_pool_tokens(4096, granite, 1), 4096);
-    assert_eq!(super::asr_shared_pool_tokens(4096, granite, 8), 8 * sequence);
-    assert_eq!(super::asr_shared_pool_tokens(4096, granite, 32), 32 * sequence);
+    let pages = sequence.div_ceil(64) * 64;
+    assert_eq!(super::asr_shared_pool_tokens(4096, granite, 1, 64), 4096);
+    assert_eq!(
+        super::asr_shared_pool_tokens(4096, granite, 8, 64),
+        8 * pages
+    );
+    assert_eq!(
+        super::asr_shared_pool_tokens(4096, granite, 32, 64),
+        32 * pages
+    );
+    assert_eq!(
+        super::asr_shared_pool_tokens(4096, granite, 8, 1),
+        8 * sequence
+    );
     let whisper = super::asr_minimum_tokens(ModelVariant::WhisperLargeV3Turbo);
     assert_eq!(whisper, 448);
-    assert_eq!(super::asr_shared_pool_tokens(448, whisper, 1), 448);
-    assert_eq!(super::asr_shared_pool_tokens(448, whisper, 8), 8 * 448);
+    assert_eq!(super::asr_shared_pool_tokens(448, whisper, 1, 64), 448);
+    assert_eq!(super::asr_shared_pool_tokens(448, whisper, 8, 64), 8 * 448);
     // A sequence never counts for more than the model's context.
-    assert_eq!(super::asr_shared_pool_tokens(448, 10_000, 3), 3 * 448);
+    assert_eq!(super::asr_shared_pool_tokens(448, 10_000, 3, 64), 3 * 448);
 }
 
 /// Granite Speech 5.0's retained pool is bounded by its retained ceiling,
 /// not its 16k context (the atomic route's): one automatic sequence per
-/// retained row and never less than one longest retained sequence. 8 rows
-/// take 5,952 tokens (465 MiB of F16 K/V per portable copy) where a pool
-/// with the context floor took 16,384 (1.25 GiB). A fit short of one
+/// retained row in whole 64-token pages and never less than one longest
+/// retained sequence. 8 rows take 6,144 tokens (480 MiB of F16 K/V per
+/// portable copy) where a pool with the context floor took 16,384
+/// (1.25 GiB). A fit short of one
 /// retained sequence refuses the load, since a request routed to a row
 /// could then wait on KV admission forever.
 #[test]
@@ -4465,14 +4478,14 @@ fn granite_speech5_retained_pool_holds_one_longest_sequence_without_a_context_fl
     use crate::models::architectures::granite_speech5::asr::GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS as CEILING;
     let minimum = super::asr_minimum_tokens(ModelVariant::GraniteSpeech502BGguf);
     assert_eq!(minimum, 744);
-    let pool = |rows| super::asr_shared_pool_tokens(CEILING, minimum, rows);
+    let pool = |rows| super::asr_shared_pool_tokens(CEILING, minimum, rows, 64);
     assert_eq!(pool(1), CEILING);
     assert_eq!(pool(2), CEILING);
-    assert_eq!(pool(8), 8 * 744);
-    assert_eq!(pool(32), 32 * 744);
+    assert_eq!(pool(8), 8 * 768);
+    assert_eq!(pool(32), 32 * 768);
     assert!(pool(8) < 16_384);
     // 40 layers x 4 KV heads x (128 + 128) x 2 bytes per token.
-    assert_eq!(pool(8) as u64 * 40 * 4 * 256 * 2, 465 * 1024 * 1024);
+    assert_eq!(pool(8) as u64 * 40 * 4 * 256 * 2, 480 * 1024 * 1024);
     super::granite_speech5_retained_reach_holds_a_sequence(CEILING as u64, CEILING).unwrap();
     super::granite_speech5_retained_reach_holds_a_sequence(pool(8) as u64, CEILING).unwrap();
     let short = super::granite_speech5_retained_reach_holds_a_sequence(CEILING as u64 - 1, CEILING);

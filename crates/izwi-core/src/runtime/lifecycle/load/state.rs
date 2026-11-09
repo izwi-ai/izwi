@@ -199,6 +199,7 @@ impl ModelLifecycleController {
                     retained_max_tokens,
                     asr_minimum_tokens(variant),
                     rows.0,
+                    self.core_engine.config().block_size,
                 );
                 let retained = self
                     .core_engine
@@ -318,6 +319,7 @@ impl ModelLifecycleController {
                             sequence_tokens,
                             asr_minimum_tokens(variant),
                             rows.0,
+                            self.core_engine.config().block_size,
                         )),
                         2,
                         rows,
@@ -487,6 +489,7 @@ impl ModelLifecycleController {
                         } else {
                             Qwen3AsrContextBound::Automatic {
                                 retained_rows: self.asr_state_rows(bundle_draft)?.0,
+                                page_tokens: self.core_engine.config().block_size,
                             }
                         };
                     let physical_spec =
@@ -593,6 +596,7 @@ impl ModelLifecycleController {
                                 native_tokens,
                                 loaded.vibevoice_retained_sequence_ceiling()?,
                                 self.asr_state_rows(bundle_draft)?.0,
+                                self.core_engine.config().block_size,
                             )
                             .1
                         };
@@ -684,6 +688,7 @@ impl ModelLifecycleController {
                                 physical_spec.retained_max_tokens,
                                 asr_minimum_tokens(variant),
                                 rows.0,
+                                self.core_engine.config().block_size,
                             )),
                             rows,
                             asr_minimum_tokens(variant),
