@@ -31,6 +31,7 @@ use crate::kernels::f16_weight_linear::{
 use crate::kernels::numeric_check::{
     run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
 };
+use crate::kernels::relpos_attention;
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
     StateComponentId, StateUpdateKind,
@@ -613,11 +614,24 @@ fn encoder_window_row_bytes(
 /// The peak of an encoder batch of `rows` windows of `window` frames: the
 /// stem runs row by row, so its planes count once per batch; the attention
 /// and layer buffers hold every row. Metal rounds each whole batch buffer up
-/// to a power of two.
+/// to a power of two. Eager attention's score and `rel_shift` planes count
+/// unless the fused CUDA kernel passed its self-check
+/// ([`relpos_attention::fused_priced`]); the encoder runs that kernel then.
 fn encoder_window_batch_bytes(
     window: usize,
     rows: usize,
     backend: BackendKind,
+) -> Result<EncoderBatchBytes> {
+    let fused = relpos_attention::fused_priced(backend);
+    encoder_window_batch_bytes_with(window, rows, backend, fused)
+}
+
+/// [`encoder_window_batch_bytes`] with the fused attention on or off.
+fn encoder_window_batch_bytes_with(
+    window: usize,
+    rows: usize,
+    backend: BackendKind,
+    fused_attention: bool,
 ) -> Result<EncoderBatchBytes> {
     const F32_BYTES: u64 = 4;
     // About six [T, ff_dim] activations are live inside a layer at once: the
@@ -657,18 +671,21 @@ fn encoder_window_batch_bytes(
         SUBSAMPLING_SLICE_FRAMES + 2 * SUBSAMPLING_HALO_FRAMES,
     )?);
     let stem_plane = multiply(&[channels, 4 * stem_frames, mel_bins / 2, F32_BYTES])?;
-    let scores = multiply(&[rows, heads, window, window, F32_BYTES])?;
-    // q_v·pᵀ, its zero pad and the reshaped copy, each [H, T, 2T].
-    let rel_shift = multiply(&[rows, heads, window, 2 * window, F32_BYTES])?;
     let activation = multiply(&[rows, window, ff_dim, F32_BYTES])?;
-    let mut layers = vec![
-        round(scores)?,
-        multiply(&[3, round(rel_shift)?])?,
-        multiply(&[LAYER_ACTIVATIONS, round(activation)?])?,
-    ];
-    if rows > 1 {
-        // The positional projection pᵀ, copied out for every row.
-        layers.push(round(multiply(&[rows, dim, 2 * window, F32_BYTES])?)?);
+    let mut layers = vec![multiply(&[LAYER_ACTIVATIONS, round(activation)?])?];
+    if fused_attention {
+        // The fused kernel keeps no score plane; the positional projection
+        // p is read in place, once for every row.
+        layers.push(round(multiply(&[dim, 2 * window, F32_BYTES])?)?);
+    } else {
+        layers.push(round(multiply(&[rows, heads, window, window, F32_BYTES])?)?);
+        // q_v·pᵀ, its zero pad and the reshaped copy, each [H, T, 2T].
+        let rel_shift = multiply(&[rows, heads, window, 2 * window, F32_BYTES])?;
+        layers.push(multiply(&[3, round(rel_shift)?])?);
+        if rows > 1 {
+            // The positional projection pᵀ, copied out for every row.
+            layers.push(round(multiply(&[rows, dim, 2 * window, F32_BYTES])?)?);
+        }
     }
     let layers = layers
         .into_iter()
@@ -2076,6 +2093,7 @@ fn parakeet_diagnostics_json(
             "shared_depthwise_conv1d_calls_total": crate::kernels::depthwise_conv::depthwise_conv1d_calls(),
             "cuda_depthwise_conv1d_kernel": crate::kernels::depthwise_conv::prepare_cuda_kernel(device),
             "cuda_depthwise_conv1d_kernel_calls_total": crate::kernels::depthwise_conv::depthwise_conv1d_cuda_kernel_calls(),
+            "cuda_relpos_attention": relpos_attention::diagnostics(device),
         },
         "timings_ms": {
             "resample": timings.resample_ms,
@@ -2726,21 +2744,22 @@ impl ParakeetEncoder {
             Ok(graphs) if encoder_graph_shape(rows, padded) == Some((rows, padded)) => graphs,
             _ => return self.layers_forward(x, &pos, Some(&padding)),
         };
-        let inputs = [x, pos, padding.key_bias, padding.frames];
+        let inputs = [x, pos, padding.key_bias, padding.frames, padding.lengths];
         // The graph keeps a stable copy of each input and an output the size
         // of `x`.
         let tensor_bytes = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
         let retained = inputs.iter().map(tensor_bytes).sum::<u64>() + tensor_bytes(&inputs[0]);
         let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
-            let [x, pos, key_bias, frames] = inputs else {
+            let [x, pos, key_bias, frames, lengths] = inputs else {
                 return Err(Error::InferenceError(format!(
-                    "Parakeet encoder graph received {} inputs, expected 4",
+                    "Parakeet encoder graph received {} inputs, expected 5",
                     inputs.len()
                 )));
             };
             let padding = EncoderPadding {
                 key_bias: key_bias.clone(),
                 frames: frames.clone(),
+                lengths: lengths.clone(),
             };
             Ok(vec![self.layers_forward(x.clone(), pos, Some(&padding))?])
         };
@@ -2776,6 +2795,8 @@ struct EncoderPadding {
     key_bias: Tensor,
     /// `[B, 1, T]`: 1 on real frames, 0 on padding.
     frames: Tensor,
+    /// `[B]` U32: each row's real frames, for the fused attention.
+    lengths: Tensor,
 }
 
 impl EncoderPadding {
@@ -2795,9 +2816,11 @@ impl EncoderPadding {
             .map(|real| if *real > 0.0 { 0.0 } else { MASKED_SCORE })
             .collect::<Vec<_>>();
         let rows = lengths.len();
+        let real = lengths.iter().map(|len| *len as u32).collect::<Vec<_>>();
         Ok(Self {
             key_bias: Tensor::from_vec(key_bias, (rows, 1, 1, padded), device)?.to_dtype(dtype)?,
             frames: Tensor::from_vec(frames, (rows, 1, padded), device)?.to_dtype(dtype)?,
+            lengths: Tensor::from_vec(real, rows, device)?,
         })
     }
 }
@@ -3025,11 +3048,9 @@ impl ConformerLayer {
         let ff1 = self.ff1.forward(&self.norm_ff1.forward(&residual)?)?;
         residual = residual.broadcast_add(&ff1.affine(0.5, 0.0)?)?;
 
-        let attn = self.self_attn.forward(
-            &self.norm_self_att.forward(&residual)?,
-            pos_emb,
-            padding.map(|padding| &padding.key_bias),
-        )?;
+        let attn =
+            self.self_attn
+                .forward(&self.norm_self_att.forward(&residual)?, pos_emb, padding)?;
         residual = residual.broadcast_add(&attn)?;
 
         let conv = self.conv.forward(
@@ -3300,6 +3321,41 @@ impl QkvProjection {
         };
         Ok([q?, k?, v?])
     }
+
+    /// Q, K and V of F32 `x` (`[B, T, D]`) as `[B, T, H, Dh]` in the
+    /// projection dtype, without head-major copies: the fused GEMM's
+    /// columns are strided views of its output.
+    fn token_major(&self, x: &Tensor, heads: usize, head_dim: usize) -> Result<[Tensor; 3]> {
+        let (b, t, _) = x.dims3()?;
+        let [q, k, v] = match self {
+            Self::Split(projections) => projections.each_ref().map(|projection| {
+                projection
+                    .forward(x)?
+                    .reshape((b, t, heads, head_dim))
+                    .map_err(Error::from)
+            }),
+            Self::Fused(linear) => {
+                let qkv = linear
+                    .forward(&x.to_dtype(DType::BF16)?)?
+                    .reshape((b, t, 3, heads, head_dim))?;
+                [0, 1, 2].map(|index| qkv.i((.., .., index)).map_err(Error::from))
+            }
+        };
+        Ok([q?, k?, v?])
+    }
+}
+
+/// Whether the conformer attention runs [`relpos_attention::reference`] on
+/// the host in place of the CUDA kernel: the in-family tests of the fused
+/// path's wiring on a machine without a GPU.
+#[cfg(test)]
+fn fused_attention_on_the_host() -> bool {
+    tests::FUSED_ATTENTION_ON_THE_HOST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn fused_attention_on_the_host() -> bool {
+    false
 }
 
 struct RelPosSelfAttention {
@@ -3339,6 +3395,9 @@ impl RelPosSelfAttention {
         // In Parakeet checkpoints these are direct tensors under self_attn.*.
         let pos_bias_u = vb.get((heads, head_dim), "pos_bias_u")?;
         let pos_bias_v = vb.get((heads, head_dim), "pos_bias_v")?;
+        // The kernel's self-check runs at load, before admission prices the
+        // encoder from its verdict.
+        relpos_attention::prepare_cuda_kernel(vb.device());
 
         Ok(Self {
             heads,
@@ -3352,10 +3411,20 @@ impl RelPosSelfAttention {
         })
     }
 
-    /// Attention over F32 `x`; `key_bias` (`[B, 1, 1, T]`) is added to the
-    /// scores of a padded batch, before the softmax. `pos_emb` is in the
-    /// projection dtype ([`ParakeetEncoder::positions`]).
-    fn forward(&self, x: &Tensor, pos_emb: &Tensor, key_bias: Option<&Tensor>) -> Result<Tensor> {
+    /// Attention over F32 `x`; a padded batch's `padding` keeps every query
+    /// off its row's padded keys. `pos_emb` is in the projection dtype
+    /// ([`ParakeetEncoder::positions`]). On CUDA the fused kernel computes
+    /// the core when its self-check passed ([`Self::fused`]).
+    fn forward(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        padding: Option<&EncoderPadding>,
+    ) -> Result<Tensor> {
+        if let Some(out) = self.fused(x, pos_emb, padding)? {
+            return Ok(out);
+        }
+        let key_bias = padding.map(|padding| &padding.key_bias);
         let (b, t, d) = x.dims3()?;
         let (heads, head_dim) = (self.heads, self.head_dim);
 
@@ -3408,6 +3477,64 @@ impl RelPosSelfAttention {
         self.linear_out
             .forward(&out)
             .and_then(|out| out.to_dtype(DType::F32))
+            .map_err(|e| Error::InferenceError(e.to_string()))
+    }
+}
+
+impl RelPosSelfAttention {
+    /// The attention core as one CUDA launch
+    /// ([`relpos_attention::relpos_attention`]): the same F32 core over the
+    /// projections' own storage, skipping each row's padded keys, written
+    /// token-major in the projection dtype. `None` where the eager core
+    /// runs: off CUDA, or with the kernel off for the device.
+    fn fused(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        padding: Option<&EncoderPadding>,
+    ) -> Result<Option<Tensor>> {
+        let on_the_host = fused_attention_on_the_host();
+        if !on_the_host
+            && (!x.device().is_cuda() || relpos_attention::eager_reason(x.device()).is_some())
+        {
+            return Ok(None);
+        }
+        let (b, t, d) = x.dims3()?;
+        let (heads, head_dim) = (self.heads, self.head_dim);
+        let [q, k, v] = self.qkv.token_major(x, heads, head_dim)?;
+        let p = self
+            .linear_pos
+            .forward(&pos_emb.to_dtype(self.dtype)?)?
+            .reshape((2 * t - 1, heads, head_dim))?;
+        let spec = relpos_attention::RelPosAttention {
+            q: &q,
+            k: &k,
+            v: &v,
+            pos: &p,
+            position: relpos_attention::RelPosition::TransformerXl {
+                bias_u: &self.pos_bias_u,
+                bias_v: &self.pos_bias_v,
+            },
+            band: relpos_attention::KeyBand::Full,
+            key_lengths: padding.map_or(relpos_attention::KeyLengths::All, |padding| {
+                relpos_attention::KeyLengths::PerRow(&padding.lengths)
+            }),
+            scale: 1.0 / (head_dim as f64).sqrt(),
+            core: DType::F32,
+            out_dtype: self.dtype,
+        };
+        let out = if on_the_host {
+            Some(relpos_attention::reference(&spec)?.to_device(x.device())?)
+        } else {
+            relpos_attention::relpos_attention(&spec)?
+        };
+        let Some(out) = out else {
+            return Ok(None);
+        };
+        self.linear_out
+            .forward(&out.reshape((b, t, d))?)
+            .and_then(|out| out.to_dtype(DType::F32))
+            .map(Some)
             .map_err(|e| Error::InferenceError(e.to_string()))
     }
 }
@@ -3964,12 +4091,20 @@ mod tests {
         parakeet_encoder_graph_device_bytes, ENCODER_GRAPH_LIMITS, ENCODER_GRAPH_ROWS,
         PARAKEET_ENCODER_GRAPHS_ENV,
     };
+    use super::{encoder_window_batch_bytes_with, EncoderPadding};
     use super::{
         parakeet_cuda_projection_precision, parakeet_tensor_is_bf16_projection,
         resolve_parakeet_projection_precision, ConvPointwise, Projections, QkvProjection,
         PARAKEET_ASR_DTYPE_ENV,
     };
     use super::{tdt_batch_labels_and_durations, tdt_label_and_duration};
+
+    thread_local! {
+        /// Runs the conformer attention through the fused kernel's host
+        /// reference (see `fused_attention_on_the_host`).
+        pub(super) static FUSED_ATTENTION_ON_THE_HOST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
     use crate::backends::{BackendKind, DTypeSelection};
     use crate::error::{Error, Result};
     use crate::model::ModelVariant;
@@ -5688,6 +5823,71 @@ mod tests {
         );
     }
 
+    /// The fused attention's wiring: with the kernel's host reference in
+    /// place of the eager core (biases, position order, scale and each
+    /// row's key length as the CUDA kernel receives them), the conformer
+    /// layers match the eager layers on the real frames of a padded batch
+    /// and of a lone row. The kernel takes head dims in multiples of 32, so
+    /// this encoder is wider than `TINY`.
+    #[test]
+    fn fused_attention_matches_the_eager_layers() {
+        const WIDE: EncoderGeometry = EncoderGeometry {
+            mel_bins: 128,
+            subsampling_channels: 4,
+            layers: 2,
+            dim: 64,
+            heads: 2,
+            ff_dim: 64,
+            conv_kernel: 9,
+        };
+        let device = Device::Cpu;
+        let encoder = random_encoder(WIDE, 71, &device);
+        let lengths = [29usize, 17, 1];
+        let padded = 29;
+        let padding = EncoderPadding::new(&lengths, padded, DType::F32, &device).unwrap();
+        let mut rng = XorShift(0x5EED_F00D);
+        let shape = (lengths.len(), padded, WIDE.dim);
+        let x = Tensor::from_vec(
+            rng.values(shape.0 * shape.1 * shape.2, 1.0, 0.0),
+            shape,
+            &device,
+        )
+        .unwrap()
+        .broadcast_mul(&padding.frames.transpose(1, 2).unwrap())
+        .unwrap();
+        let pos = encoder.positions(padded, &device).unwrap();
+        let run = |fused: bool, x: &Tensor, padding: Option<&EncoderPadding>| {
+            FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(fused));
+            let out = encoder.layers_forward(x.clone(), &pos, padding);
+            FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(false));
+            out.unwrap()
+        };
+        let eager = run(false, &x, Some(&padding));
+        let fused = run(true, &x, Some(&padding));
+        let scale = eager
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let mut worst = 0f32;
+        for (row, len) in lengths.iter().enumerate() {
+            let real = |t: &Tensor| t.narrow(0, row, 1).unwrap().narrow(1, 0, *len).unwrap();
+            worst = worst.max(max_abs_diff(&real(&fused), &real(&eager)));
+        }
+        let alone = x.narrow(0, 0, 1).unwrap();
+        worst = worst.max(max_abs_diff(
+            &run(true, &alone, None),
+            &run(false, &alone, None),
+        ));
+        eprintln!("Parakeet fused vs eager attention on CPU: max |diff| {worst:e} of {scale}");
+        assert!(
+            worst <= 1e-5 * scale.max(1.0),
+            "max |diff| {worst} of {scale}"
+        );
+    }
+
     /// The padded batch on Metal: the fused depthwise kernel reads the masked
     /// frames, and each row's output is an exact-size copy.
     #[cfg(feature = "metal")]
@@ -6096,6 +6296,38 @@ mod tests {
                 assert!(bytes.layers <= ENCODER_GRAPH_LIMITS.pool_bytes);
             }
         }
+    }
+
+    /// With the fused attention on, a window prices its activations and one
+    /// positional projection, not the scores, the three `rel_shift` planes
+    /// or a projection copy per row: 224 MiB less for a lone 1,024-frame
+    /// window, and about a third of the eager working set left.
+    #[test]
+    fn fused_attention_drops_the_eager_attention_planes() {
+        for rows in [1usize, 4] {
+            let eager =
+                encoder_window_batch_bytes_with(1024, rows, BackendKind::Cuda, false).unwrap();
+            let fused =
+                encoder_window_batch_bytes_with(1024, rows, BackendKind::Cuda, true).unwrap();
+            let rows64 = rows as u64;
+            let planes = rows64 * 8 * 1024 * 1024 * 4 + 3 * rows64 * 8 * 1024 * 2048 * 4;
+            let copies = if rows > 1 {
+                rows64 * 1024 * 2048 * 4
+            } else {
+                0
+            };
+            assert_eq!(fused.stem, eager.stem);
+            assert_eq!(
+                eager.layers - fused.layers,
+                planes + copies - 1024 * 2048 * 4
+            );
+            assert!(fused.layers * 3 < eager.layers, "{fused:?} vs {eager:?}");
+        }
+        // Without the CUDA kernel's verdict, pricing stays eager.
+        assert_eq!(
+            encoder_window_batch_bytes(128, 2, BackendKind::Cuda).unwrap(),
+            encoder_window_batch_bytes_with(128, 2, BackendKind::Cuda, false).unwrap()
+        );
     }
 
     /// Admission prices the graphed shape on CUDA only, each real row
