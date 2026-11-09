@@ -121,6 +121,7 @@ use crate::models::architectures::voxtral::realtime::model::{
     voxtral_realtime_weight_dtype, voxtral_realtime_weight_files,
 };
 use crate::models::architectures::whisper::asr::{whisper_weight_dtype, whisper_weight_files};
+use crate::models::architectures::whisper::whisper_decode_graph_device_bytes;
 use crate::models::shared::weights::gguf::safetensors_weight_files;
 use crate::models::shared::weights::staged::METAL_LOAD_SYNC_INTERVAL_BYTES;
 
@@ -227,7 +228,12 @@ pub(super) fn residency_plan(
 ) -> Result<Option<AsrResidencyPlan>> {
     let backend = BackendKind::from(device.kind);
     match variant {
-        ModelVariant::WhisperLargeV3Turbo => whisper_plan(model_path, device, backend),
+        ModelVariant::WhisperLargeV3Turbo => {
+            // The decoder's CUDA step graphs allocate their memory on first use.
+            let graphs = whisper_decode_graph_device_bytes(backend);
+            whisper_plan(model_path, device, backend)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
+        }
         ModelVariant::Qwen3Asr06BGguf | ModelVariant::Qwen3Asr17BGguf => {
             // The text decoder's CUDA graphs allocate their memory on first use.
             let graphs = qwen3_decode_graph_device_bytes(backend, QWEN3_ASR_DECODE_GRAPHS_ENV);

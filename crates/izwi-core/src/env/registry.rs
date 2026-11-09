@@ -2700,6 +2700,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Sizes the Whisper decode budget from audio duration instead of a fixed cap.",
     ),
     CoreEnvVar::new(
+        "IZWI_WHISPER_DECODE_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Whisper's retained decode step pads its rows to the next width of 1, 2, 3, 4, 6, 8, 12, 16, 24 or 32 and replays the step's nine pure segments (the embeddings and first self-attention projection; per layer, the self-attention output through the cross-attention query, and the cross-attention output through the MLP to the next layer's projection or the logits) as one CUDA graph per segment and width; the self- and cross-attention calls stay eager over the real rows. Each graph is checked bit for bit against its eager segment on its first two runs; a mismatch or CUDA error turns the graphs off for the process. Loads price 96 MiB for them. Any false value (or cuda.decode_graphs=off) runs the step eagerly at its own row count.",
+    ),
+    CoreEnvVar::new(
         "IZWI_WHISPER_DEFAULT_LANGUAGE",
         Text,
         "unset (auto-detect)",

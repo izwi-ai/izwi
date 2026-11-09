@@ -6274,6 +6274,62 @@ mod tests {
         );
     }
 
+    /// A retained step through the CUDA graphs' segments (rows padded to a
+    /// graph width of 6, attention eager over the real rows; run eagerly here)
+    /// decodes each row as it decodes alone: the same steps and tokens, and
+    /// next logits within F32 rounding.
+    #[test]
+    fn graph_segmented_retained_steps_decode_each_row_as_alone() {
+        use crate::models::architectures::whisper::model::SEGMENTED_STEP_FOR_TEST;
+        let model = tiny_asr_model(&Device::Cpu);
+        let mut alone = batch_test_states(&model);
+        let mut together = batch_test_states(&model);
+        for step in 0..14 {
+            let live = (0..alone.len())
+                .filter(|row| !alone[*row].finished)
+                .collect::<Vec<_>>();
+            if live.is_empty() {
+                break;
+            }
+            let expected = live
+                .iter()
+                .map(|row| model.decode_step_retained(&mut alone[*row]).unwrap())
+                .collect::<Vec<_>>();
+            let mut refs = together
+                .iter_mut()
+                .enumerate()
+                .filter(|(row, _)| live.contains(row))
+                .map(|(_, state)| state)
+                .collect::<Vec<_>>();
+            // Six rows at least: two or more spare rows every step.
+            SEGMENTED_STEP_FOR_TEST.with(|width| width.set(6));
+            let actual = model.decode_step_retained_batch(&mut refs);
+            SEGMENTED_STEP_FOR_TEST.with(|width| width.set(0));
+            assert_eq!(actual.unwrap(), expected, "step {step}");
+            for row in &live {
+                let (a, b) = (&alone[*row], &together[*row]);
+                assert_eq!(
+                    a.generated_tokens, b.generated_tokens,
+                    "step {step} row {row}"
+                );
+                assert_eq!(a.finished, b.finished);
+                assert_eq!(a.self_kv.context_len(), b.self_kv.context_len());
+                if let (Some(a), Some(b)) = (&a.pending_logits, &b.pending_logits) {
+                    let difference = (a - b)
+                        .unwrap()
+                        .abs()
+                        .unwrap()
+                        .max_all()
+                        .unwrap()
+                        .to_scalar::<f32>()
+                        .unwrap();
+                    assert!(difference <= 1e-4, "step {step} row {row}: {difference}");
+                }
+            }
+        }
+        assert!(together.iter().all(|state| state.finished));
+    }
+
     /// A step that fails after the rows picked their tokens (here one
     /// row's cross memory was released) restores every row: tokens,
     /// counters, RNG, pending logits and KV context.
