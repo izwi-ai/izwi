@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 
 use crate::kernels::FusedSiluMulResult;
 
+pub mod decode_step;
 #[cfg(feature = "cuda")]
 mod epilogues;
 pub mod fp8;
