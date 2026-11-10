@@ -3414,6 +3414,96 @@
         ]
       }
     },
+    "/v1/batches": {
+      "get": {
+        "description": "The caller's batches, newest first; `after` and `limit` (1 to 100) page them.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "List batches",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      },
+      "post": {
+        "description": "JSON `input_file_id` (a JSONL file of purpose `batch`), `endpoint` (/v1/audio/transcriptions, /v1/audio/translations or /v1/audio/speech), `completion_window` (`24h`) and optional `metadata`. Each line is OpenAI's `{custom_id, method, url, body}`; a transcription or translation body names its audio by `file_id` or `audio_base64`. Lines run as batch work; at most IZWI_BATCH_MAX_REQUESTS (50000) per file. With `metadata.webhook_url`, a signed `batch.completed`, `batch.failed`, `batch.cancelled` or `batch.expired` event is posted there when the batch ends; refused with 400 unless the operator set IZWI_BATCH_WEBHOOK_SECRET.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Create batch",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/batches/{batch_id}": {
+      "get": {
+        "description": "The batch: status, `request_counts`, and `output_file_id` and `error_file_id` once it has ended. A speech line's response body is `{audio_file_id, format, bytes}`.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Get batch",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/batches/{batch_id}/cancel": {
+      "post": {
+        "description": "Stops a batch that is validating or in progress: `cancelling`, then `cancelled` with the results of the lines that finished. A batch that has ended is a 409.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Cancel batch",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
     "/v1/chat/completions": {
       "post": {
         "operationId": "create_chat_completion",
@@ -3462,6 +3552,185 @@
         "summary": "Create chat completion",
         "tags": [
           "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/files": {
+      "get": {
+        "description": "The caller's files, newest first; `purpose`, `limit` (1 to 10000), `after` and `order` (`asc` or `desc`) filter and page them.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "List files",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      },
+      "post": {
+        "description": "Multipart `file` and `purpose`: `batch` (a batch's JSONL input) or `user_data` (audio a batch line names by `file_id`). At most IZWI_FILES_MAX_BYTES (200 MB); larger is 413.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Create file",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/files/{file_id}": {
+      "delete": {
+        "description": "Deletes the file and its content.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Delete file",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      },
+      "get": {
+        "description": "A file's metadata. `batch_output` files carry `expires_at`, 30 days after creation.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Get file",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/files/{file_id}/content": {
+      "get": {
+        "description": "The file's bytes.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Download file content",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/jobs/{job_id}": {
+      "get": {
+        "description": "Fetch a durable runtime job trace with stages and artifacts.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "summary": "Get runtime job",
+        "tags": [
+          "Jobs"
+        ]
+      }
+    },
+    "/v1/jobs/{job_id}/artifacts": {
+      "get": {
+        "description": "List durable artifacts produced or consumed by a runtime job.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "summary": "List runtime job artifacts",
+        "tags": [
+          "Jobs"
+        ]
+      }
+    },
+    "/v1/jobs/{job_id}/cancel": {
+      "post": {
+        "description": "Cancel a queued or running durable runtime job.",
+        "responses": {
+          "200": {
+            "description": "Runtime job cancelled"
+          },
+          "400": {
+            "description": "Job is not cancellable"
+          },
+          "404": {
+            "description": "Job not found"
+          }
+        },
+        "summary": "Cancel runtime job",
+        "tags": [
+          "Jobs"
+        ]
+      }
+    },
+    "/v1/jobs/{job_id}/retry": {
+      "post": {
+        "description": "Requeue failed, cancelled, or expired runtime job stages.",
+        "responses": {
+          "200": {
+            "description": "Runtime job retried"
+          },
+          "400": {
+            "description": "Job is not retryable"
+          },
+          "404": {
+            "description": "Job not found"
+          }
+        },
+        "summary": "Rerun runtime job",
+        "tags": [
+          "Jobs"
         ]
       }
     },

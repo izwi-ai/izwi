@@ -281,7 +281,11 @@ pub struct GatewayArgs {
     /// OpenAI Realtime pass-through: izwi-server base URLs (comma-separated)
     /// that run `/v1/realtime` sessions. Set, the gateway serves
     /// `/v1/realtime`, admits each session and relays it to one of them,
-    /// round robin, capped by `--gateway-realtime-max-sessions`.
+    /// round robin, capped by `--gateway-realtime-max-sessions`. It also
+    /// relays `POST /v1/realtime/client_secrets` and
+    /// `GET /v1/realtime/capabilities`; a session opened with a client
+    /// secret goes to the upstream that minted it (remembered per gateway
+    /// process).
     #[arg(
         long,
         env = "IZWI_GATEWAY_OPENAI_REALTIME_UPSTREAMS",
@@ -316,8 +320,10 @@ pub struct GatewayArgs {
     pub gateway_audio_upstream_api_key: Option<String>,
 
     /// The audio upstreams share one records database and media store, so
-    /// voices and consents (`/v1/audio/voices`, `/v1/audio/voice_consents`)
-    /// are relayed too.
+    /// voices and consents (`/v1/audio/voices`, `/v1/audio/voice_consents`),
+    /// files (`/v1/files`), batches (`/v1/batches`) and durable jobs
+    /// (`/v1/jobs`) are relayed too. The upstreams see the gateway as one
+    /// caller, so every gateway principal shares these objects.
     #[arg(long, env = "IZWI_GATEWAY_AUDIO_SHARED_STATE", default_value_t = false)]
     pub gateway_audio_shared_state: bool,
 }

@@ -3365,6 +3365,15 @@ async fn speech_api_passes_through_to_izwi_servers() {
         .await
         .unwrap();
     assert_eq!(voices.status(), 404, "voices need shared upstream state");
+    for stored in ["/v1/files", "/v1/batches", "/v1/jobs/job_1"] {
+        let response = client
+            .get(format!("http://127.0.0.1:{port}{stored}"))
+            .bearer_auth(TEST_API_KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "{stored} needs shared state");
+    }
 
     // The served document lists the relayed routes and leaves out the ones
     // this gateway does not serve.
@@ -3386,6 +3395,9 @@ async fn speech_api_passes_through_to_izwi_servers() {
     }
     for unserved in [
         "/v1/audio/voices",
+        "/v1/files",
+        "/v1/batches/{batch_id}",
+        "/v1/jobs/{job_id}",
         "/v1/realtime",
         "/v1/realtime/media-stream",
     ] {
@@ -3411,4 +3423,142 @@ async fn speech_api_passes_through_to_izwi_servers() {
         r#"audio-for:{"type":"input.text","text":"Hello."}"#
     );
     ws.close(None).await.unwrap();
+}
+
+/// Files, batches and durable jobs pass through to izwi-servers that share
+/// one store: every method reaches the upstream with its path and query, an
+/// upload streams through whole, and the gateway's own authentication
+/// stands in front.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn files_batches_and_jobs_pass_through_with_shared_state() {
+    use crate::app::audio_proxy::AudioUpstreams;
+
+    /// What reached the upstream, as the response.
+    async fn echo(request: axum::extract::Request) -> Response {
+        let method = request.method().to_string();
+        let path = request
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_default();
+        let content_type = request
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let authorized = request
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            == Some("Bearer audio-key");
+        let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        if !authorized {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        axum::Json(json!({
+            "method": method,
+            "path": path,
+            "content_type": content_type,
+            "bytes": body.len(),
+        }))
+        .into_response()
+    }
+    let upstream_app = Router::new().fallback(echo);
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream_listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(upstream_listener, upstream_app).await });
+
+    let (state, _worker) = registry_gateway_state(ModelVariant::Qwen354BGguf).await;
+    let upstreams = AudioUpstreams::new(
+        vec![format!("http://127.0.0.1:{upstream_port}")],
+        Some("audio-key".to_string()),
+        true,
+        2,
+    )
+    .unwrap();
+    let app = create_gateway_router(
+        state.with_audio_upstreams(upstreams),
+        &GatewayServeConfig::default(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+
+    // An upload larger than any JSON body limit of the gateway arrives whole.
+    let upload = vec![b'a'; 3 * 1024 * 1024];
+    let uploaded: serde_json::Value = client
+        .post(format!("{base}/v1/files"))
+        .bearer_auth(TEST_API_KEY)
+        .header("content-type", "multipart/form-data; boundary=x")
+        .body(upload.clone())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        uploaded,
+        json!({
+            "method": "POST",
+            "path": "/v1/files",
+            "content_type": "multipart/form-data; boundary=x",
+            "bytes": upload.len(),
+        })
+    );
+
+    for (method, path) in [
+        (reqwest::Method::GET, "/v1/files?purpose=batch&limit=5"),
+        (reqwest::Method::GET, "/v1/files/file-1"),
+        (reqwest::Method::GET, "/v1/files/file-1/content"),
+        (reqwest::Method::DELETE, "/v1/files/file-1"),
+        (reqwest::Method::POST, "/v1/batches"),
+        (reqwest::Method::GET, "/v1/batches?after=batch_1"),
+        (reqwest::Method::GET, "/v1/batches/batch_1"),
+        (reqwest::Method::POST, "/v1/batches/batch_1/cancel"),
+        (reqwest::Method::GET, "/v1/jobs/job_1"),
+        (reqwest::Method::GET, "/v1/jobs/job_1/artifacts"),
+        (reqwest::Method::POST, "/v1/jobs/job_1/cancel"),
+        (reqwest::Method::POST, "/v1/jobs/job_1/retry"),
+    ] {
+        let response = client
+            .request(method.clone(), format!("{base}{path}"))
+            .bearer_auth(TEST_API_KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{method} {path}");
+        let relayed: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(relayed["method"], method.as_str(), "{path}");
+        assert_eq!(relayed["path"], path);
+    }
+
+    let unauthenticated = client.get(format!("{base}/v1/files")).send().await.unwrap();
+    assert_eq!(unauthenticated.status(), 401);
+
+    let document: serde_json::Value = client
+        .get(format!("{base}/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let paths = document["paths"].as_object().unwrap();
+    for served in [
+        "/v1/files",
+        "/v1/files/{file_id}/content",
+        "/v1/batches/{batch_id}/cancel",
+        "/v1/jobs/{job_id}",
+        "/v1/audio/voices",
+    ] {
+        assert!(paths.contains_key(served), "{served}");
+    }
 }

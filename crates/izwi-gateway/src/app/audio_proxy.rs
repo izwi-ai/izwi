@@ -13,10 +13,14 @@
 //! the gateway remembers which upstream answered each `X-Izwi-Speech-Id`, and
 //! asks every upstream in turn for an id it has not seen (a batch item's).
 //!
-//! Voices and consents (`/v1/audio/voices`, `/v1/audio/voice_consents`) are
-//! relayed only with `IZWI_GATEWAY_AUDIO_SHARED_STATE=true`, when every
-//! upstream shares one records database and media store; otherwise a voice
-//! made through one upstream would be missing on the next.
+//! Voices and consents (`/v1/audio/voices`, `/v1/audio/voice_consents`),
+//! files (`/v1/files`), batches (`/v1/batches`) and durable jobs
+//! (`/v1/jobs`) are relayed only with `IZWI_GATEWAY_AUDIO_SHARED_STATE=true`,
+//! when every upstream shares one records database and media store;
+//! otherwise a voice, file or batch made through one upstream would be
+//! missing on the next. An upstream sees the gateway as one caller (the
+//! upstream API key), so these objects are shared by every gateway
+//! principal.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -240,7 +244,7 @@ fn relay_response(response: reqwest::Response) -> Response {
 }
 
 /// `POST /v1/audio/{speech,speech/batch,transcriptions,translations}` and,
-/// with shared state, the voice and consent routes.
+/// with shared state, the voice, consent, file, batch and job routes.
 pub async fn proxy_http(
     State(state): State<GatewayState>,
     Extension(context): Extension<RequestContext>,
@@ -253,7 +257,7 @@ pub async fn proxy_http(
     if is_shared_state_route(&path_and_query) && !upstreams.shared_state {
         return json_error(
             StatusCode::NOT_FOUND,
-            "Voices and consents are served by the gateway only when its upstreams share one records database and media store (IZWI_GATEWAY_AUDIO_SHARED_STATE).",
+            "Voices, consents, files, batches and jobs are served by the gateway only when its upstreams share one records database and media store (IZWI_GATEWAY_AUDIO_SHARED_STATE).",
         );
     }
     let (parts, body) = request.into_parts();
@@ -296,10 +300,19 @@ fn original_path_and_query(request: &Request) -> String {
         .unwrap_or_default()
 }
 
+/// Whether `path` reads or writes records one upstream keeps: served only
+/// when every upstream shares them.
 pub(crate) fn is_shared_state_route(path: &str) -> bool {
-    path.starts_with("/v1/audio/voices")
-        || path.starts_with("/v1/audio/voice_consents")
-        || path.starts_with("/v1/audio/consent_phrases")
+    [
+        "/v1/audio/voices",
+        "/v1/audio/voice_consents",
+        "/v1/audio/consent_phrases",
+        "/v1/files",
+        "/v1/batches",
+        "/v1/jobs",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
 }
 
 /// `GET /v1/audio/speech/{id}`: the upstream that served the id, or each in
@@ -468,6 +481,9 @@ mod tests {
     fn voices_need_shared_state() {
         assert!(is_shared_state_route("/v1/audio/voices"));
         assert!(is_shared_state_route("/v1/audio/voice_consents/cons_1"));
+        assert!(is_shared_state_route("/v1/files/file-1/content"));
+        assert!(is_shared_state_route("/v1/batches?limit=2"));
+        assert!(is_shared_state_route("/v1/jobs/job_1/cancel"));
         assert!(!is_shared_state_route("/v1/audio/speech"));
         let mut memory = SpeechIdMemory::default();
         for index in 0..SPEECH_ID_MEMORY + 5 {

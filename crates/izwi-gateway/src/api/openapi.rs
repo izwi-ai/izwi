@@ -23,18 +23,20 @@ pub fn gateway_document() -> &'static Value {
 }
 
 /// Whether this gateway serves `path`: `/v1/realtime` and its media-stream
-/// framing need OpenAI Realtime upstreams, `/v1/audio/*` needs audio upstreams, and voices and consents
-/// also need their shared state.
+/// framing need OpenAI Realtime upstreams, `/v1/audio/*` needs audio upstreams, and voices, consents,
+/// files, batches and jobs also need their shared state.
 fn serves(state: &GatewayState, path: &str) -> bool {
+    use crate::app::audio_proxy::is_shared_state_route;
     if matches!(path, "/v1/realtime" | "/v1/realtime/media-stream") {
         return state.openai_realtime.is_some();
     }
-    if !path.starts_with("/v1/audio/") {
+    if !path.starts_with("/v1/audio/") && !is_shared_state_route(path) {
         return true;
     }
-    state.audio_upstreams.as_ref().is_some_and(|audio| {
-        audio.shared_state() || !crate::app::audio_proxy::is_shared_state_route(path)
-    })
+    state
+        .audio_upstreams
+        .as_ref()
+        .is_some_and(|audio| audio.shared_state() || !is_shared_state_route(path))
 }
 
 pub async fn gateway_openapi_json(State(state): State<GatewayState>) -> Json<Value> {

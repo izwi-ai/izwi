@@ -853,11 +853,30 @@ too, and the response header naming the tier served comes back. A speech id's lo
 that served it; the gateway asks each upstream in turn for an id it has not
 seen.
 
-Voices and consents (`/v1/audio/voices`, `/v1/audio/voice_consents`) are
-relayed only with `IZWI_GATEWAY_AUDIO_SHARED_STATE=true`. Set it when every
-upstream shares one records database (PostgreSQL) and one media store.
-Otherwise a voice made through one upstream would be missing on the next.
-Encoding always happens on the upstream.
+Voices and consents (`/v1/audio/voices`, `/v1/audio/voice_consents`), files
+(`/v1/files`), batches (`/v1/batches`) and durable jobs (`/v1/jobs/{id}` and
+its `cancel`, `retry` and `artifacts`) are relayed only with
+`IZWI_GATEWAY_AUDIO_SHARED_STATE=true`. Set it when every upstream shares one
+records database (PostgreSQL) and one media store; a single upstream shares
+them with itself. Otherwise a voice, file or batch made through one upstream
+would be missing on the next. With shared state, a batch created through one
+upstream is run by whichever upstream's executor leases it. Encoding always
+happens on the upstream.
+
+Two limits of these relayed records:
+
+- The upstreams see the gateway as one caller (the upstream API key), so
+  voices, files, batches and jobs are shared by every gateway principal: a
+  file one gateway key uploads can be listed and read with another. Do not
+  set `IZWI_GATEWAY_AUDIO_SHARED_STATE` on a gateway whose principals must
+  not see each other's audio.
+- An upload to `/v1/files` streams through the gateway unbuffered. The
+  upstream's `IZWI_FILES_MAX_BYTES` bounds it and answers `413`; the gateway
+  adds no limit of its own.
+
+The gateway relays `/v1/jobs` lookups only. The first-party routes that
+create durable jobs (`/v1/speech-to-text/jobs`, `/v1/text-to-speech`) are
+served by an izwi-server directly.
 
 The gateway's `/openapi.json` lists `/v1/realtime` and these audio routes only
 when its configuration relays them.

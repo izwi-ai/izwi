@@ -1543,6 +1543,31 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &GatewayServeCon
                     get(proxy_http).post(proxy_http).delete(proxy_http),
                 )
                 .route("/audio/consent_phrases", get(proxy_http));
+            // Files, batches and durable jobs are records of one store too.
+            // An upload streams through to the upstream, which refuses one
+            // past its `IZWI_FILES_MAX_BYTES` with 413.
+            inference_routes = inference_routes.merge(
+                Router::new()
+                    .route("/files", get(proxy_http).post(proxy_http))
+                    .route("/files/{file_id}", get(proxy_http).delete(proxy_http))
+                    .route("/files/{file_id}/content", get(proxy_http))
+                    .route("/batches", get(proxy_http).post(proxy_http))
+                    .route("/batches/{batch_id}", get(proxy_http))
+                    .route("/batches/{batch_id}/cancel", post(proxy_http))
+                    .route("/jobs/{job_id}", get(proxy_http))
+                    .route("/jobs/{job_id}/cancel", post(proxy_http))
+                    .route("/jobs/{job_id}/retry", post(proxy_http))
+                    .route("/jobs/{job_id}/artifacts", get(proxy_http))
+                    .layer(DefaultBodyLimit::disable())
+                    .layer(middleware::from_fn_with_state(
+                        state.clone(),
+                        bounded_gateway_admission,
+                    ))
+                    .layer(middleware::from_fn_with_state(
+                        state.clone(),
+                        tenant_pre_admission,
+                    )),
+            );
         }
         // Uploads stream through to the upstream, which enforces its own
         // limits; the gateway bounds them at the largest the server takes.

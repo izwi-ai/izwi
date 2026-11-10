@@ -2801,8 +2801,8 @@ mod tests {
     /// The gateway's document: this one restricted to the routes the gateway
     /// serves. `/v1/realtime`, its client secrets and its capabilities need
     /// OpenAI Realtime upstreams, the audio routes need audio upstreams (or
-    /// Realtime ones), and voices and consents also need
-    /// `--gateway-audio-shared-state`.
+    /// Realtime ones), and voices, consents, files, batches and jobs also
+    /// need `--gateway-audio-shared-state`.
     fn gateway_document() -> Value {
         let mut doc = document();
         if let Some(paths) = doc.get_mut("paths").and_then(Value::as_object_mut) {
@@ -2832,6 +2832,16 @@ mod tests {
                         | "/v1/audio/voice_consents"
                         | "/v1/audio/voice_consents/{consent_id}"
                         | "/v1/audio/consent_phrases"
+                        | "/v1/files"
+                        | "/v1/files/{file_id}"
+                        | "/v1/files/{file_id}/content"
+                        | "/v1/batches"
+                        | "/v1/batches/{batch_id}"
+                        | "/v1/batches/{batch_id}/cancel"
+                        | "/v1/jobs/{job_id}"
+                        | "/v1/jobs/{job_id}/cancel"
+                        | "/v1/jobs/{job_id}/retry"
+                        | "/v1/jobs/{job_id}/artifacts"
                 )
             });
         }

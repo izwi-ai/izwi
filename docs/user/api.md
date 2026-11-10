@@ -1229,6 +1229,14 @@ seconds is tried again after 2 and then 8 seconds, with the same
 it never changes the batch, and an event can be lost if the server stops
 between the batch ending and the delivery, so keep a poll as the fallback.
 
+**Through the gateway.** The gateway relays `/v1/files` and `/v1/batches`
+to its audio upstreams only with `IZWI_GATEWAY_AUDIO_SHARED_STATE=true`,
+which says every upstream shares one records database and media store (a
+single upstream does). The upstream then sees the gateway as one caller, so
+files and batches made through the gateway are shared by every gateway
+principal. Uploads stream through and are bounded by the upstream's
+`IZWI_FILES_MAX_BYTES`.
+
 Transcribe recordings:
 
 ```python
