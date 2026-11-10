@@ -2707,6 +2707,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Sets the engine streaming queue depth for TTS and speech-to-speech; overrides IZWI_STREAM_QUEUE_CAPACITY.",
     ),
     CoreEnvVar::new(
+        "IZWI_STREAM_LEAD_SECS",
+        Float,
+        "3",
+        Once,
+        "Seconds of audio a speech stream may run ahead of real time before the scheduler serves its request from the Batch class's share, until the lead falls below half of this. Nothing is throttled: with no competing work the stream runs at full speed. 0 disables pacing; invalid ignored.",
+    ),
+    CoreEnvVar::new(
         "IZWI_STREAM_QUEUE_CAPACITY",
         Int,
         "per task: TTS 8, S2S 64, ASR 4096, chat 64",

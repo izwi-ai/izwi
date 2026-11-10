@@ -531,6 +531,7 @@ impl RuntimeService {
             kv_blocked_requests: batch.kv_blocked_requests,
             realtime_reserve_deferrals_total: batch.realtime_reserve_deferrals_total,
             asr_encoder_live_yields_total: batch.asr_encoder_live_yields_total,
+            stream_pacing_transitions_total: batch.stream_pacing_transitions_total,
             continuous_envelope_scalar_fallbacks_total: batch
                 .continuous_envelope_scalar_fallbacks_total,
             physical_execution: batch.physical_execution,
@@ -821,6 +822,11 @@ impl RuntimeService {
             payload,
             ENGINE_ASR_ENCODER_LIVE_YIELDS_TOTAL,
             snapshot.asr_encoder_live_yields_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_SCHEDULER_STREAM_PACING_TRANSITIONS_TOTAL,
+            snapshot.stream_pacing_transitions_total,
         );
         push_engine_metric(
             payload,

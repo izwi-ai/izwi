@@ -20,7 +20,7 @@ use super::execution::{
     CacheMode, ExecutionProfile, NativeBatchMode, PrefillMode, RealtimePreparationMode,
     RealtimeStageOutcome, RealtimeSubphase, ReplayCapability,
 };
-use super::request::{EngineCoreRequest, RequestStatus, WorkloadClass};
+use super::request::{EngineCoreRequest, RequestStatus, StreamPacing, WorkloadClass};
 use super::types::{Priority, RequestId, SequenceId, TaskType};
 use super::{
     InputRange, ModelInstanceId, PlanId, RealtimeOperationId, SequencePhase, SessionKey, WorkUnit,
@@ -745,12 +745,28 @@ struct RequestMetadata {
     managed_prefix_cursor_losses: u8,
     /// The real-time reserve has held this request back at least once.
     reserve_deferred: bool,
+    /// The stream's pacing, when its caller measures its lead over real
+    /// time, and whether it was paced when this step began.
+    pacing: Option<StreamPacing>,
+    paced: bool,
 }
 
 impl RequestMetadata {
     fn prefill_tokens(&self) -> usize {
         self.replay_prompt_tokens
             .unwrap_or(self.total_prompt_tokens)
+    }
+
+    /// The class whose share of service this request draws on: Batch while
+    /// its stream is paced, else its own. Pacing changes nothing else: the
+    /// request keeps its deadlines, decode quanta, capacity rank and place
+    /// outside the real-time reserve.
+    fn service_class(&self) -> WorkloadClass {
+        if self.paced {
+            WorkloadClass::Batch
+        } else {
+            self.workload_class
+        }
     }
 }
 
@@ -969,6 +985,8 @@ impl Scheduler {
             managed_prefix_cursor: request.managed_prefix_cursor(),
             managed_prefix_cursor_losses: 0,
             reserve_deferred: false,
+            pacing: request.stream_pacing.clone(),
+            paced: false,
         };
 
         self.requests.insert(request.id.clone(), metadata);
@@ -1030,6 +1048,8 @@ impl Scheduler {
                 managed_prefix_cursor: request.managed_prefix_cursor(),
                 managed_prefix_cursor_losses: 0,
                 reserve_deferred: false,
+                pacing: None,
+                paced: false,
             },
         );
         self.running.insert(
@@ -1205,10 +1225,23 @@ impl Scheduler {
         );
     }
 
+    /// Read every stream's pacing once for this step, so the step charges
+    /// and compares a request under one class throughout. A request that
+    /// has finished is no longer here, so pacing it changes nothing.
+    fn refresh_stream_pacing(&mut self, now: Instant) {
+        for metadata in self.requests.values_mut() {
+            metadata.paced = metadata
+                .pacing
+                .as_ref()
+                .is_some_and(|pacing| pacing.is_paced(now));
+        }
+    }
+
     /// Renew the live demand of every lane that holds a Realtime or
     /// Streaming request, waiting or running, and drop the lanes whose hold
     /// has lapsed. An open real-time session with no operation queued is
-    /// not demand: its lane keeps the reserve only for the hold.
+    /// not demand: its lane keeps the reserve only for the hold. Neither is
+    /// a paced stream, whose listener already holds audio in hand.
     fn refresh_live_demand(&mut self, now: Instant) {
         self.live_demand
             .lanes()
@@ -1219,7 +1252,7 @@ impl Scheduler {
             .filter(
                 |(request_id, metadata)| match self.realtime_sessions.get(*request_id) {
                     Some(state) => state.in_flight.is_some() || !state.pending.is_empty(),
-                    None => Self::is_live_class(metadata.workload_class),
+                    None => !metadata.paced && Self::is_live_class(metadata.workload_class),
                 },
             )
             .map(|(request_id, _)| request_id.clone())
@@ -1454,9 +1487,10 @@ impl Scheduler {
     ) -> ScheduleResult {
         let mut result = ScheduleResult::empty();
         result.expired_requests = self.expire_deadlines();
+        let scheduling_now = Instant::now();
+        self.refresh_stream_pacing(scheduling_now);
         self.refresh_tenant_service();
         self.refresh_class_service();
-        let scheduling_now = Instant::now();
         self.refresh_live_demand(scheduling_now);
         let mut remaining_batch = self.config.max_batch_size;
         self.refresh_queue_age_sample();
@@ -1785,7 +1819,7 @@ impl Scheduler {
                     .requests
                     .get(&candidate.0)
                     .map_or((candidate.7, None), |metadata| {
-                        (metadata.workload_class, metadata.tenant_key)
+                        (metadata.service_class(), metadata.tenant_key)
                     });
                 let group = *group_of.entry(key).or_insert_with(|| {
                     groups.push((
@@ -3163,26 +3197,23 @@ impl Scheduler {
         if metadata.sequence_id != session.epoch {
             return false;
         }
-        let service = self
-            .class_service
-            .entry(metadata.workload_class)
-            .or_default();
+        let service_class = metadata.service_class();
+        let service = self.class_service.entry(service_class).or_default();
         *service = service.saturating_sub(scheduled_tokens.max(1) as u64);
         if let Some(tenant) = self
             .tenant_service
-            .get_mut(&(metadata.workload_class, metadata.tenant_key))
+            .get_mut(&(service_class, metadata.tenant_key))
         {
             tenant.units = tenant.units.saturating_sub(scheduled_tokens.max(1) as u64);
         }
         if let Some(floor) = self
             .tenant_service
             .iter()
-            .filter(|(key, _)| key.0 == metadata.workload_class)
+            .filter(|(key, _)| key.0 == service_class)
             .map(|(_, value)| value.units)
             .min()
         {
-            self.tenant_service_floor
-                .insert(metadata.workload_class, floor);
+            self.tenant_service_floor.insert(service_class, floor);
         }
         true
     }
@@ -3951,17 +3982,13 @@ impl Scheduler {
         let selected_class = self
             .waiting_members
             .iter()
-            .filter_map(|id| {
-                self.requests
-                    .get(id)
-                    .map(|metadata| metadata.workload_class)
-            })
+            .filter_map(|id| self.requests.get(id).map(RequestMetadata::service_class))
             .min_by(|a, b| self.compare_class_service(*a, *b))?;
 
         let candidates = self.waiting_members.iter().filter(|id| {
             self.requests
                 .get(*id)
-                .is_some_and(|metadata| metadata.workload_class == selected_class)
+                .is_some_and(|metadata| metadata.service_class() == selected_class)
         });
         match self.config.policy {
             SchedulingPolicy::WeightedFair | SchedulingPolicy::Priority => {
@@ -4052,7 +4079,7 @@ impl Scheduler {
                     .get(*request_id)
                     .is_none_or(|state| state.in_flight.is_some() || !state.pending.is_empty())
             })
-            .map(|(_, metadata)| metadata.workload_class)
+            .map(|(_, metadata)| metadata.service_class())
             .collect::<HashSet<_>>();
         for workload_class in &active {
             if !self.active_service_classes.contains(workload_class) {
@@ -4099,7 +4126,7 @@ impl Scheduler {
         let live = self
             .requests
             .values()
-            .map(|metadata| (metadata.workload_class, metadata.tenant_key))
+            .map(|metadata| (metadata.service_class(), metadata.tenant_key))
             .collect::<HashSet<_>>();
         self.tenant_service.retain(|key, _| live.contains(key));
         for key in live {
@@ -4122,8 +4149,8 @@ impl Scheduler {
         let (Some(a), Some(b)) = (self.requests.get(a), self.requests.get(b)) else {
             return Ordering::Equal;
         };
-        let key_a = (a.workload_class, a.tenant_key);
-        let key_b = (b.workload_class, b.tenant_key);
+        let key_a = (a.service_class(), a.tenant_key);
+        let key_b = (b.service_class(), b.tenant_key);
         if key_a == key_b {
             return Ordering::Equal;
         }
@@ -4160,7 +4187,7 @@ impl Scheduler {
         let Some(metadata) = self.requests.get(request_id) else {
             return;
         };
-        let key = (metadata.workload_class, metadata.tenant_key);
+        let key = (metadata.service_class(), metadata.tenant_key);
         self.record_class_service(key.0, units);
         let entry = self.tenant_service.entry(key).or_insert(TenantService {
             units: self.tenant_service_floor.get(&key.0).copied().unwrap_or(0),
@@ -4645,6 +4672,8 @@ mod tests {
             managed_prefix_cursor: None,
             managed_prefix_cursor_losses: 0,
             reserve_deferred: false,
+            pacing: None,
+            paced: false,
         }
     }
 
@@ -8343,6 +8372,21 @@ mod tests {
     fn add_classed(scheduler: &mut Scheduler, id: &str, class: WorkloadClass, width: usize) {
         let mut request = build_request(TaskType::TTS, id, Priority::Normal);
         request.workload_class = class;
+        add_with_width(scheduler, request, width);
+    }
+
+    /// Add a Streaming request as [`add_classed`] does, and return the
+    /// pacing its caller would drive.
+    fn add_paceable_stream(scheduler: &mut Scheduler, id: &str, width: usize) -> StreamPacing {
+        let mut request = build_request(TaskType::TTS, id, Priority::Normal);
+        request.workload_class = WorkloadClass::Streaming;
+        let pacing = StreamPacing::default();
+        request.stream_pacing = Some(pacing.clone());
+        add_with_width(scheduler, request, width);
+        pacing
+    }
+
+    fn add_with_width(scheduler: &mut Scheduler, mut request: EngineCoreRequest, width: usize) {
         request.model_variant = Some(ModelVariant::Kokoro82M);
         assert!(scheduler.add_request(&request));
         let epoch = scheduler
@@ -8415,6 +8459,100 @@ mod tests {
         scheduler.finish_request(&"live".to_string());
         lapse_live_demand(&mut scheduler);
         assert!(!board.batch_work_yields(None, WorkloadClass::Batch, Instant::now()));
+    }
+
+    /// P2.6: a paced stream draws on the Batch class's share of service and
+    /// keeps its own class for everything else; when its pacing ends it
+    /// draws on its own class's share again.
+    #[test]
+    fn a_paced_stream_is_served_from_the_batch_share_until_its_pacing_ends() {
+        let mut scheduler = reserve_scheduler(None, SchedulingPolicy::WeightedFair);
+        let pacing = add_paceable_stream(&mut scheduler, "stream", 4);
+        assert_eq!(admit_all(&mut scheduler), ["stream"]);
+        let service = |scheduler: &Scheduler, class: WorkloadClass| {
+            scheduler.class_service.get(&class).copied().unwrap_or(0)
+        };
+        let streaming_service = service(&scheduler, WorkloadClass::Streaming);
+        let batch_service = service(&scheduler, WorkloadClass::Batch);
+
+        pacing.pace_until(Instant::now() + Duration::from_secs(60));
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 1);
+        let metadata = &scheduler.requests["stream"];
+        assert!(metadata.paced);
+        assert_eq!(metadata.workload_class, WorkloadClass::Streaming);
+        let charged = service(&scheduler, WorkloadClass::Batch);
+        assert!(charged > batch_service);
+        assert_eq!(
+            service(&scheduler, WorkloadClass::Streaming),
+            streaming_service
+        );
+        // Unexecuted service goes back to the class that was charged.
+        let row = &scheduled.decode_requests[0];
+        assert!(scheduler.refund_unexecuted_service(&row.session_key(), row.num_tokens));
+        let refunded = service(&scheduler, WorkloadClass::Batch);
+        assert!(refunded < charged);
+
+        pacing.pace_until(Instant::now());
+        assert_eq!(scheduler.schedule().decode_requests.len(), 1);
+        assert!(!scheduler.requests["stream"].paced);
+        assert!(service(&scheduler, WorkloadClass::Streaming) > streaming_service);
+        assert_eq!(service(&scheduler, WorkloadClass::Batch), refunded);
+    }
+
+    /// P2.6: a paced stream is already running, so the real-time reserve
+    /// neither holds it nor counts it as batch work, and its deadline is
+    /// untouched. It is not live demand: the lane's hold lapses under it
+    /// and returns when its pacing ends.
+    #[test]
+    fn a_paced_stream_is_outside_the_reserve_and_is_not_live_demand() {
+        let mut scheduler = reserve_scheduler(None, SchedulingPolicy::WeightedFair);
+        let pacing = add_paceable_stream(&mut scheduler, "stream", 4);
+        let deadlines = |scheduler: &Scheduler| {
+            let metadata = &scheduler.requests["stream"];
+            (metadata.deadline_at, metadata.hard_deadline)
+        };
+        let admitted_deadlines = deadlines(&scheduler);
+        pacing.pace_until(Instant::now() + Duration::from_secs(60));
+        for index in 0..4 {
+            add_classed(
+                &mut scheduler,
+                &format!("batch-{index}"),
+                WorkloadClass::Batch,
+                4,
+            );
+        }
+        // Its arrival was live demand: four rows reserve one, and the
+        // paced stream takes none of the three that batch work may hold.
+        let started = admit_all(&mut scheduler);
+        assert!(started.contains(&"stream".to_string()));
+        assert!(scheduler.requests["stream"].paced);
+        assert_eq!(running_of(&scheduler, WorkloadClass::Batch), 3);
+        assert_eq!(deadlines(&scheduler), admitted_deadlines);
+
+        lapse_live_demand(&mut scheduler);
+        assert_eq!(admit_all(&mut scheduler), ["batch-3"]);
+        assert!(scheduler.live_demand.lanes().is_empty());
+
+        pacing.pace_until(Instant::now());
+        scheduler.schedule();
+        assert!(!scheduler.live_demand.lanes().is_empty());
+    }
+
+    /// P2.6: pacing a stream whose request has finished changes nothing.
+    #[test]
+    fn pacing_a_finished_request_changes_nothing() {
+        let mut scheduler = reserve_scheduler(None, SchedulingPolicy::WeightedFair);
+        let pacing = add_paceable_stream(&mut scheduler, "stream", 4);
+        add_classed(&mut scheduler, "other", WorkloadClass::Interactive, 4);
+        assert_eq!(admit_all(&mut scheduler).len(), 2);
+        scheduler.finish_request(&"stream".to_string());
+
+        pacing.pace_until(Instant::now() + Duration::from_secs(60));
+        assert_eq!(scheduler.schedule().decode_requests.len(), 1);
+        assert!(!scheduler.requests.contains_key("stream"));
+        assert!(scheduler.requests.values().all(|metadata| !metadata.paced));
+        assert!(!scheduler.class_service.contains_key(&WorkloadClass::Batch));
     }
 
     /// P2.5: a Realtime or Streaming stream that runs outside the scheduler

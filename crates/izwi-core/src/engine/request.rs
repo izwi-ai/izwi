@@ -1256,6 +1256,33 @@ pub struct EngineCoreRequest {
     /// Where the request's generated codes go, when its caller asked for
     /// them to carry into the next chunk.
     pub(crate) tts_generated_codes: Option<TtsGeneratedCodesSink>,
+    /// The stream's pacing, when its caller measures how far its audio
+    /// runs ahead of real time.
+    pub(crate) stream_pacing: Option<StreamPacing>,
+}
+
+/// One stream's pacing, shared by the caller that measures the stream's
+/// lead over real time and the scheduler. While the stream is paced the
+/// scheduler serves its request from the Batch class's share; nothing else
+/// about the request changes, and a request that has finished ignores it.
+/// Clones of a request share it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StreamPacing(Arc<Mutex<Option<Instant>>>);
+
+impl StreamPacing {
+    /// Pace the stream until `until`: the time its lead will have fallen
+    /// far enough if no more audio is produced. A later call moves it.
+    pub(crate) fn pace_until(&self, until: Instant) {
+        *self.0.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(until);
+    }
+
+    /// Whether the stream is paced at `now`.
+    pub(crate) fn is_paced(&self, now: Instant) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some_and(|until| until > now)
+    }
 }
 
 /// One slot for the codec codes a speech request generated: the executor

@@ -414,6 +414,21 @@ dispatches above therefore apply to a model whose only live work is a direct
 stream. Within one model, chunk jobs and engine dispatches take turns in
 arrival order.
 
+**Stream pacing.** The runtime measures how far each engine speech stream is
+ahead of real time where it hands audio to the transport: the audio handed on
+less the time since the first of it. Past `IZWI_STREAM_LEAD_SECS` (3 by
+default, 0 disables) the scheduler serves the request from the Batch class's
+share of service until the lead has fallen to half the threshold, which it
+does on the clock even if the stream produces nothing meanwhile. Only the
+share changes: the request keeps its admission, deadlines, decode quanta,
+capacity rank and device weight, the real-time reserve neither holds it nor
+counts it as batch work, and while paced it is not live demand. Nothing is
+throttled, so a paced stream on an idle device runs at full speed.
+`izwi_engine_scheduler_stream_pacing_transitions_total` counts the times a
+stream was lowered. Long-form speech synthesizes segments ahead of the one
+being sent, and each segment is paced by its own lead at its hand-off to the
+in-order relay. Kokoro's direct-route stream is not paced.
+
 **Mixed steps.** A chat family certified in `catalog/mixed_step.rs` runs
 prefill spans beside decode rows in one model call. None is certified yet; the
 measurements are in the support matrix (`IZWI_MIXED_STEP=0|1` overrides).

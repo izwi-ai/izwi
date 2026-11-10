@@ -188,7 +188,9 @@ pub use request::{
     EngineCoreRequest, EngineStreamPolicy, EngineTask, RealtimeAsrOperationAck,
     RealtimeAsrOperationKind, RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
 };
-pub(crate) use request::{KokoroPreparedText, Lfm3AudioReplySettings, TtsGeneratedCodesSink};
+pub(crate) use request::{
+    KokoroPreparedText, Lfm3AudioReplySettings, StreamPacing, TtsGeneratedCodesSink,
+};
 pub use resources::{
     BatchWorkspaceLease, CapacitySource, MetalLoadAdmission, PhysicalCapacityProvider,
     PhysicalCapacitySnapshot, ReservationClass, ReservationId, ReservationOwner, ResourceAmount, ResourceAuthority,
