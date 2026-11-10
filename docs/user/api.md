@@ -1197,6 +1197,12 @@ server runs four batches at a time and the rest wait their turn; the lines
 in flight across them are bounded by `IZWI_BATCH_WORKER_CONCURRENCY`. A
 batch, like its files, is visible only to the principal that created it.
 
+Lines do not run in input order. Transcription and translation lines are
+read up to 1,024 at a time and run longest audio first within that window,
+judged by the size of the file a line names or of the audio it carries, so
+that recordings of similar length are batched together on the model. Speech
+lines run in input order. The output file is in input order either way.
+
 **Completion webhook.** A batch created with `metadata.webhook_url` has an
 event posted to that URL when it ends (an Izwi extension; the event and its
 signature follow OpenAI's webhooks):

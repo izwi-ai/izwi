@@ -8,12 +8,19 @@
 //! row, and lines still to run are read again from the input file, so
 //! memory holds only the lines in flight.
 //!
+//! Transcription and translation lines are read a bounded window at a time
+//! and run longest audio first within it. The engine batches encoder rows
+//! of similar length together, so lines that run side by side fill one
+//! batch when their audio is alike and scatter over many when it is not.
+//! Results are keyed by line, so the output file keeps the input's order.
+//!
 //! The lease is renewed while the batch runs. An executor that dies leaves
 //! it to lapse, and the next executor to claim the batch skips the lines
 //! with a result row and runs the rest. A cancel or the end of the 24 hour
 //! window stops the lines in flight; what finished is written out.
 
-use std::collections::HashSet;
+use std::cmp::Reverse;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +50,8 @@ const MAX_VALIDATION_ERRORS: usize = 100;
 const RESULTS_PAGE: usize = 500;
 /// Lines validated between lease renewals.
 const VALIDATION_RENEW_EVERY: usize = 1000;
+/// A line longer than this carries its audio rather than naming a file.
+const FILE_ID_LINE_BYTES: usize = 4096;
 
 /// One line to run: its request, and whose batch it belongs to.
 #[derive(Debug)]
@@ -80,6 +89,11 @@ pub(crate) struct ExecutorConfig {
     pub(crate) max_line_bytes: usize,
     /// The wait before a line refused for capacity is run again.
     pub(crate) capacity_retry: Duration,
+    /// Transcription and translation lines read ahead and ordered by
+    /// their audio's size before they run: at most this many lines and
+    /// about this many bytes of them, so memory stays bounded.
+    pub(crate) reorder_lines: usize,
+    pub(crate) reorder_bytes: usize,
     /// Where and how ended batches are announced; `None` when webhooks
     /// are off.
     pub(crate) webhook: Option<WebhookPolicy>,
@@ -105,6 +119,8 @@ impl ExecutorConfig {
             // its other fields.
             max_line_bytes: audio_bytes.saturating_mul(4) / 3 + 1024 * 1024,
             capacity_retry: Duration::from_secs(2),
+            reorder_lines: 1024,
+            reorder_bytes: 16 * 1024 * 1024,
             webhook: crate::env_config::tuning().batch_webhook.clone(),
         }
     }
@@ -389,24 +405,23 @@ impl BatchExecutor {
         let wake = self.wake.notified();
         tokio::pin!(wake);
         let mut running = FuturesUnordered::new();
+        let mut window = VecDeque::new();
         let mut exhausted = false;
         loop {
             if exhausted && running.is_empty() {
                 return Ok(RunEnd::Finished);
             }
             tokio::select! {
-                // A slot is taken before the next line is read, so lines
-                // wait in the file, not in memory.
+                // A slot is taken before more lines are read, so lines wait
+                // in the file, and only a window of them in memory.
                 slot = self.line_slots.clone().acquire_owned(), if !exhausted => {
                     let slot = slot.context("The batch line limiter closed")?;
-                    let mut next = None;
-                    while let Some((index, line)) = lines.next().await? {
-                        if !finished.contains(&index) {
-                            next = Some((index, line));
-                            break;
-                        }
+                    if window.is_empty() {
+                        window = self
+                            .read_window(&mut lines, &finished, tenant, endpoint)
+                            .await?;
                     }
-                    match next {
+                    match window.pop_front() {
                         Some((index, line)) => {
                             running.push(self.run_line(tenant, endpoint, index, line, slot));
                         }
@@ -430,6 +445,73 @@ impl BatchExecutor {
                 }
                 _ = shutdown.changed() => return Ok(RunEnd::Stopped),
             }
+        }
+    }
+
+    /// The next unfinished lines, in the order they run. Speech lines run
+    /// in input order, one read at a time. Transcription and translation
+    /// lines are read a window at a time and ordered longest audio first,
+    /// lines of equal size in input order.
+    async fn read_window(
+        &self,
+        lines: &mut LineReader,
+        finished: &HashSet<i64>,
+        tenant: &ArtifactTenant,
+        endpoint: BatchEndpoint,
+    ) -> anyhow::Result<VecDeque<(i64, Option<Vec<u8>>)>> {
+        let (max_lines, max_bytes) = match endpoint {
+            BatchEndpoint::Speech => (1, 0),
+            BatchEndpoint::Transcriptions | BatchEndpoint::Translations => {
+                (self.config.reorder_lines.max(1), self.config.reorder_bytes)
+            }
+        };
+        let mut window = Vec::new();
+        let mut bytes = 0;
+        while window.len() < max_lines {
+            let Some((index, line)) = lines.next().await? else {
+                break;
+            };
+            if finished.contains(&index) {
+                continue;
+            }
+            bytes += line.as_ref().map_or(0, Vec::len);
+            // A window of one has nothing to order.
+            let audio_bytes = if max_lines > 1 {
+                self.audio_bytes(tenant, line.as_deref()).await
+            } else {
+                0
+            };
+            window.push((audio_bytes, index, line));
+            if bytes >= max_bytes {
+                break;
+            }
+        }
+        // Stable, so lines of equal size keep the input's order.
+        window.sort_by_key(|(audio_bytes, ..)| Reverse(*audio_bytes));
+        Ok(window
+            .into_iter()
+            .map(|(_, index, line)| (index, line))
+            .collect())
+    }
+
+    /// The size of a line's audio, standing in for its duration: the size
+    /// of the file the line names, or the line's own length when it
+    /// carries the audio. Zero for a line that names no file this tenant
+    /// has; the line's own run reports that.
+    async fn audio_bytes(&self, tenant: &ArtifactTenant, line: Option<&[u8]>) -> u64 {
+        let Some(line) = line else {
+            return 0;
+        };
+        let file_id = (line.len() <= FILE_ID_LINE_BYTES)
+            .then(|| serde_json::from_slice::<Value>(line).ok())
+            .flatten()
+            .and_then(|line| line["body"]["file_id"].as_str().map(str::to_string));
+        match file_id {
+            Some(file_id) => match self.files.get(tenant, &file_id).await {
+                Ok(Some(file)) => file.size_bytes,
+                _ => 0,
+            },
+            None => line.len() as u64,
         }
     }
 

@@ -32,6 +32,9 @@ fn config() -> ExecutorConfig {
         max_requests: 8,
         max_line_bytes: 64 * 1024,
         capacity_retry: Duration::from_millis(10),
+        // Input order, which the tests that stall chosen lines count on.
+        reorder_lines: 1,
+        reorder_bytes: 64 * 1024,
         webhook: None,
     }
 }
@@ -1103,4 +1106,92 @@ async fn a_batch_naming_a_webhook_is_refused_while_webhooks_are_off() {
         .as_str()
         .unwrap()
         .contains("IZWI_BATCH_WEBHOOK_SECRET"));
+}
+
+#[tokio::test]
+async fn transcription_lines_run_longest_audio_first_within_a_window() {
+    let server = TestServer::new("batches-order");
+    // Audio a line names by file, and audio a line carries.
+    let mut lines = String::new();
+    for (id, bytes) in [("f-10", 10), ("f-300", 300), ("f-40", 40), ("f-200", 200)] {
+        let file = server
+            .upload_ok("a", "user_data", "clip.wav", &vec![0u8; bytes])
+            .await;
+        lines += &(line(id, TRANSCRIPTIONS, json!({"model": "m", "file_id": file})) + "\n");
+    }
+    let carried = line(
+        "b64-6000",
+        TRANSCRIPTIONS,
+        json!({"model": "m", "audio_base64": "A".repeat(6000)}),
+    );
+    lines += &(carried + "\n");
+    lines += &(line(
+        "missing",
+        TRANSCRIPTIONS,
+        json!({"model": "m", "file_id": "file-x"}),
+    ) + "\n");
+    lines += &input(&["b64-4"]);
+
+    let started = Arc::new(Mutex::new(Vec::new()));
+    let seen = started.clone();
+    let executor = start(
+        &server,
+        runner(move |job| {
+            seen.lock().unwrap().push(job.custom_id.clone());
+            async move { ok(json!({"text": job.custom_id})) }
+        }),
+        // One line at a time, so the order lines start in is the order
+        // they were taken from the window; windows of three lines.
+        ExecutorConfig {
+            line_concurrency: 1,
+            reorder_lines: 3,
+            ..config()
+        },
+    );
+    let batch = create(&server, "a", TRANSCRIPTIONS, &lines).await;
+    let id = batch["id"].as_str().unwrap();
+    let completed = wait_for_status(&server, "a", id, "completed").await;
+
+    // Longest first within each window of three; a line whose file is
+    // unknown runs last in its window.
+    assert_eq!(
+        *started.lock().unwrap(),
+        ["f-300", "f-40", "f-10", "b64-6000", "f-200", "missing", "b64-4"]
+    );
+    // The output file keeps the input's order.
+    let output = file_lines(&server, "a", &completed["output_file_id"]).await;
+    assert_eq!(
+        custom_ids(&output),
+        ["f-10", "f-300", "f-40", "f-200", "b64-6000", "missing", "b64-4"]
+    );
+    executor.abort();
+
+    // Speech lines run in input order whatever their length.
+    let started = Arc::new(Mutex::new(Vec::new()));
+    let seen = started.clone();
+    let executor = start(
+        &server,
+        runner(move |job| {
+            seen.lock().unwrap().push(job.custom_id.clone());
+            async move { ok(json!({})) }
+        }),
+        ExecutorConfig {
+            line_concurrency: 1,
+            ..config()
+        },
+    );
+    let speech: String = [("short", 2), ("long", 200), ("middle", 20)]
+        .iter()
+        .map(|(id, chars)| {
+            line(
+                id,
+                SPEECH,
+                json!({"model": "m", "input": "a".repeat(*chars)}),
+            ) + "\n"
+        })
+        .collect();
+    let batch = create(&server, "a", SPEECH, &speech).await;
+    wait_for_status(&server, "a", batch["id"].as_str().unwrap(), "completed").await;
+    assert_eq!(*started.lock().unwrap(), ["short", "long", "middle"]);
+    executor.abort();
 }
