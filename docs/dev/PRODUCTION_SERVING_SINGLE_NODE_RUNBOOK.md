@@ -1034,6 +1034,64 @@ either holds the device for the length of one pass, and a live request of the
 same model waits for it. A deployment that needs strict live latency should
 serve these two for batch on a separate model instance or device.
 
+The settings that shape a server doing both kinds of work (the user guide
+`docs/user/realtime-and-batch.md` explains each; the env references under
+`docs/dev/env/` are generated from the code):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `IZWI_REALTIME_ROW_RESERVE` | a quarter of the model's rows, at least 1 | Rows a model keeps free of Batch and Background requests while it has live demand; `0` disables. |
+| `IZWI_STREAM_LEAD_SECS` | `3` | Lead past which a speech stream is scheduled from the Batch share; `0` disables. |
+| `IZWI_ADMISSION_QUEUE_TIMEOUT_SECS` | `30` | Wait for an admission slot before `429`; `0` waits without limit. |
+| `IZWI_MAX_BATCH_REQUESTS`, `IZWI_MAX_BACKGROUND_REQUESTS` | the global request limit minus one | Concurrent requests of the class; the other classes default to the global limit. |
+| `IZWI_MAX_REALTIME_SESSIONS` | `32` | Open realtime WebSocket sessions. |
+| `IZWI_ASR_REALTIME_MAX_SESSIONS` | `IZWI_MAX_NUM_SEQS`, else 16 on CUDA and 4 elsewhere | Concurrent native realtime ASR streams. |
+| `IZWI_MAX_QUEUED_REQUESTS` | `128` | The general runtime queue; the real-time queue is as large, or the real-time session cap if that is larger. |
+| `IZWI_FILES_MAX_BYTES` | `209715200` | Largest `/v1/files` upload. |
+| `IZWI_BATCH_MAX_REQUESTS` | `50000` | Requests per `/v1/batches` input file. |
+| `IZWI_BATCH_WORKER_CONCURRENCY` | the runtime's capacity | `/v1/batches` lines in flight and durable jobs run at once. |
+| `IZWI_BATCH_STAGE_TIMEOUT_SECS` | `21600` | Wall-clock limit of one durable stage; `0` disables. |
+| `IZWI_BATCH_WEBHOOK_SECRET`, `IZWI_BATCH_WEBHOOK_ALLOW_HTTP`, `IZWI_BATCH_WEBHOOK_ALLOW_PRIVATE` | unset, `false`, `false` | Batch completion webhooks: on with a secret; the two flags allow `http://` URLs and non-public hosts. |
+
+### Mixed-load gate
+
+Before a release that changes scheduling, admission, a speech model's
+serving path or the batch routes, run `scripts/bench/run-mixed-load.py` on
+the release build and the target device, four ways:
+
+| Run | Real-time side | Batch side |
+|---|---|---|
+| Same-model ASR | `--realtime-kind asr` on the ASR model | the same model (the default) |
+| Cross-model ASR | `--realtime-kind asr` on the ASR model | `--batch-kind tts --batch-model <TTS model>` |
+| Same-model TTS | `--realtime-kind tts` on the TTS model | the same model (the default) |
+| Cross-model TTS | `--realtime-kind tts` on the TTS model | `--batch-kind asr --batch-model <ASR model> --batch-audio <recording>` |
+
+Use the batch tier production uses (`--batch-service-tier flex`), the
+default `--batch-levels` ladder up to a level that saturates the device, and
+`--enforce-slo`, which exits 4 when a step fails a check. The commands are in
+`scripts/bench/README.md` ("Mixed real-time and batch load").
+
+A run passes when all of these hold at every batch level:
+
+- the real-time checks pass: ASR first partial p95 at most 0.5 s and final
+  p95 at most 0.8 s, or TTS first audio p95 at most 0.5 s, and none of them
+  more than 25% above the level-0 step (`slo` in each step file);
+- the real-time side has no failed requests, and no refusals (`429`, `503`,
+  close `1013`) that the level-0 step does not also have;
+- the batch side completes work at every level above 0: batch throughput
+  is not zero, and batch refusals are retried rather than failed;
+- batch throughput with no real-time load stays within 5% of the previous
+  release's figure for the same model and device. The mixed-load driver
+  always holds a live load, so measure this with
+  `scripts/bench/run-audio-load.py` (ASR) and
+  `scripts/bench/run-tts-concurrency.py` (TTS).
+
+Keep each run's `summary.json` with the release evidence. A failed check is
+a release blocker for the deployment shape it measures, or the documented
+targets change with it. No run of this gate has been recorded yet: the
+thresholds are the plan's targets, to be revised once after the first
+measured run and then held.
+
 ### Hierarchical KV offload (DS4, explicit opt-in)
 
 DS4 demotes cold committed prefix pages from the device KV arenas into a

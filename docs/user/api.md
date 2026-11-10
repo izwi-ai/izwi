@@ -387,6 +387,10 @@ header instead; when both are present the body field wins.
 The gateway's speech pass-through relays the field and the header to the
 izwi-server unchanged.
 
+[Real-time and batch workloads](/realtime-and-batch) covers which route to
+use for which workload, how the server keeps capacity for live traffic
+beside batch work, and the settings and metrics involved.
+
 Every response names the tier that served it in the `X-Izwi-Service-Tier`
 response header, binary audio, text, SRT and VTT included. When the request
 named a tier, JSON bodies and the final SSE event (`transcript.text.done`,
@@ -1126,6 +1130,8 @@ routes instead, in the same shape (an Izwi extension):
 
 Any other `endpoint` is refused with `400`. `/v1/audio/speech/batch` stays
 for small sets answered in one response.
+[Real-time and batch workloads](/realtime-and-batch) compares the bulk
+routes and explains how batch work shares a server with live traffic.
 
 | Method | Path | Notes |
 |--------|------|-------|

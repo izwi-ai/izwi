@@ -156,6 +156,7 @@
         "icon": "book-open",
         "pages": [
           "api",
+          "realtime-and-batch",
           "troubleshooting"
         ]
       }

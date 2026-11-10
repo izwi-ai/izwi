@@ -134,6 +134,7 @@ How many live calls a GPU carries, alone and beside a batch load, depends on the
 
 ## See also
 
+- [Real-time and batch workloads](/realtime-and-batch)
 - [OpenAI Realtime API](/api#openai-realtime-api)
 - [Voice Mode](/features/voice)
 - [Transcription](/features/transcription)

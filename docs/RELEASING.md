@@ -39,6 +39,12 @@ npm ci --prefix ui
 npm --prefix ui run build
 ```
 
+   For a release that changes scheduling, admission, a speech model's serving
+   path or the batch routes, also run the mixed-load gate on the target
+   device (`scripts/bench/run-mixed-load.py`, same-model and cross-model for
+   ASR and TTS). The runbook says what passing means:
+   `docs/dev/PRODUCTION_SERVING_SINGLE_NODE_RUNBOOK.md`, "Mixed-load gate".
+
 3. Commit the release prep changes:
 
 ```bash

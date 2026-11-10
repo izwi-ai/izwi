@@ -27,6 +27,11 @@ API routes without requiring cloud services or API keys.
 - Text-to-speech, long-form Studio projects, voice cloning, voice design, and
   saved voices.
 - Transcription, speaker diarization, forced alignment, and realtime speech-to-text.
+- Phone calls: live transcription and voice agents through the OpenAI Realtime
+  API or a carrier's media stream.
+- Bulk transcription and speech with OpenAI's Files and Batch APIs
+  (`/v1/files`, `/v1/batches`).
+- Live and batch work on one server: batch requests yield to calls and streams.
 - Local chat, model download/load/unload/delete, history, exports, and settings.
 - OpenAI-compatible `/v1` APIs for models, chat completions, audio speech,
   audio transcriptions, and preview Responses support.
