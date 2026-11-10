@@ -21,6 +21,8 @@ pub struct BatchRuntimeMetricsResponse {
     pub stages_by_status: Vec<RuntimeStageStatusCount>,
     pub queue_health: RuntimeQueueHealthSnapshot,
     pub worker: BatchWorkerSnapshot,
+    /// `/v1/batches` batches by status, with the lines they have finished.
+    pub api_batches: Vec<crate::batch_api_store::BatchStatusCount>,
 }
 
 pub async fn metrics_json(State(state): State<AppState>) -> Json<RuntimeTelemetrySnapshot> {
@@ -110,10 +112,46 @@ async fn collect_batch_runtime_metrics(
             .runtime_queue_health(super::probes::resolve_batch_heartbeat_stale_after_ms())
             .await?,
         worker: state.batch_worker_health.snapshot(),
+        api_batches: state.batch_api_store.status_counts().await?,
     })
 }
 
 fn append_batch_prometheus_metrics(payload: &mut String, batch: &BatchRuntimeMetricsResponse) {
+    payload.push_str("\n# HELP izwi_batch_runtime_api_batches Batch API batches by status.\n");
+    payload.push_str("# TYPE izwi_batch_runtime_api_batches gauge\n");
+    for count in &batch.api_batches {
+        payload.push_str(&format!(
+            "izwi_batch_runtime_api_batches{{status=\"{}\"}} {}\n",
+            count.status, count.batches
+        ));
+    }
+    payload.push_str(
+        "# HELP izwi_batch_runtime_api_batch_requests Batch API requests finished, by outcome.\n",
+    );
+    payload.push_str("# TYPE izwi_batch_runtime_api_batch_requests gauge\n");
+    for (outcome, total) in [
+        (
+            "completed",
+            batch
+                .api_batches
+                .iter()
+                .map(|count| count.requests_completed)
+                .sum::<u64>(),
+        ),
+        (
+            "failed",
+            batch
+                .api_batches
+                .iter()
+                .map(|count| count.requests_failed)
+                .sum::<u64>(),
+        ),
+    ] {
+        payload.push_str(&format!(
+            "izwi_batch_runtime_api_batch_requests{{outcome=\"{outcome}\"}} {total}\n"
+        ));
+    }
+
     payload.push_str(
         "\n# HELP izwi_batch_runtime_queued_stages Queued or retrying batch runtime stages.\n",
     );

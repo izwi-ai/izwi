@@ -323,6 +323,106 @@ def s13_files(client: OpenAI) -> str:
     return f"{uploaded.id} round-tripped {len(content)} bytes"
 
 
+def wait_for_batch(client: OpenAI, batch_id: str, timeout: float = 900.0):
+    """Poll a batch until it ends."""
+    deadline = time.time() + timeout
+    while True:
+        batch = client.batches.retrieve(batch_id)
+        if batch.status in ("completed", "failed", "expired", "cancelled"):
+            return batch
+        check(time.time() < deadline, f"batch {batch_id} is still {batch.status}")
+        time.sleep(1)
+
+
+def jsonl(lines: list[dict]) -> bytes:
+    return "".join(json.dumps(line) + "\n" for line in lines).encode()
+
+
+@scenario("S14 batch transcriptions: audio by file_id and inline, a refused line in the error file")
+def s14_batch_transcriptions(client: OpenAI) -> str:
+    spoken = client.audio.speech.create(model=TTS, voice="af_heart", input=TEXT, response_format="wav").content
+    audio = client.files.create(file=("spoken.wav", spoken), purpose="user_data")
+    endpoint = "/v1/audio/transcriptions"
+    requests = [
+        {"custom_id": "by-file", "method": "POST", "url": endpoint,
+         "body": {"model": "whisper-1", "file_id": audio.id}},
+        {"custom_id": "inline", "method": "POST", "url": endpoint,
+         "body": {"model": "whisper-1", "audio_base64": base64.b64encode(spoken).decode(),
+                  "response_format": "verbose_json"}},
+        {"custom_id": "refused", "method": "POST", "url": endpoint,
+         "body": {"model": "no-such-model", "file_id": audio.id}},
+    ]
+    source = client.files.create(file=("requests.jsonl", jsonl(requests)), purpose="batch")
+    batch = client.batches.create(
+        input_file_id=source.id, endpoint=endpoint, completion_window="24h", metadata={"suite": "speech-e2e"}
+    )
+    check(batch.status == "validating" and batch.id.startswith("batch_"), f"{batch}")
+    check(batch.id in [item.id for item in client.batches.list(limit=20)], "the batch is not listed")
+    batch = wait_for_batch(client, batch.id)
+    check(batch.status == "completed", f"status {batch.status}: {batch.errors}")
+    counts = batch.request_counts
+    check((counts.total, counts.completed, counts.failed) == (3, 2, 1), f"{counts}")
+    output = [json.loads(line) for line in client.files.content(batch.output_file_id).text.splitlines()]
+    check([line["custom_id"] for line in output] == ["by-file", "inline"], f"{output}")
+    for line in output:
+        check(line["response"]["status_code"] == 200 and line["error"] is None, f"{line}")
+        check("speaks" in line["response"]["body"]["text"].lower(), f"{line['response']['body']}")
+    check(output[1]["response"]["body"].get("task") == "transcribe", "verbose_json body")
+    errors = [json.loads(line) for line in client.files.content(batch.error_file_id).text.splitlines()]
+    check([line["custom_id"] for line in errors] == ["refused"], f"{errors}")
+    check(errors[0]["response"]["status_code"] == 400 and errors[0]["error"]["message"], f"{errors[0]}")
+    check(client.files.retrieve(batch.output_file_id).purpose == "batch_output", "output purpose")
+    return f"{batch.id}: 2 transcribed, 1 refused"
+
+
+@scenario("S15 batch speech: each line's audio is its own file; a bad input file fails; cancel ends cancelled")
+def s15_batch_speech(client: OpenAI) -> str:
+    endpoint = "/v1/audio/speech"
+
+    def speech_line(custom_id: str, text: str, **extra) -> dict:
+        body = {"model": TTS, "voice": "af_heart", "input": text, "response_format": "mp3", **extra}
+        return {"custom_id": custom_id, "method": "POST", "url": endpoint, "body": body}
+
+    source = client.files.create(
+        file=("speech.jsonl", jsonl([speech_line("first", "One."), speech_line("second", "Two.", speed=1.2)])),
+        purpose="batch",
+    )
+    batch = client.batches.create(input_file_id=source.id, endpoint=endpoint, completion_window="24h")
+    batch = wait_for_batch(client, batch.id)
+    check(batch.status == "completed" and batch.error_file_id is None, f"{batch}")
+    output = [json.loads(line) for line in client.files.content(batch.output_file_id).text.splitlines()]
+    for line, custom_id in zip(output, ["first", "second"], strict=True):
+        body = line["response"]["body"]
+        check(line["custom_id"] == custom_id and body["format"] == "mp3", f"{line}")
+        audio = client.files.content(body["audio_file_id"]).content
+        check(len(audio) == body["bytes"], f"{custom_id}: {len(audio)} bytes, body says {body['bytes']}")
+        info = probe(audio, ".mp3")
+        check(info["codec"] == "mp3" and not info["decode_errors"], f"{custom_id}: {info}")
+        check(client.files.retrieve(body["audio_file_id"]).filename == f"{custom_id}.mp3", "audio filename")
+
+    # A line that breaks the format fails the whole batch at validation.
+    broken = jsonl([speech_line("dup", "One."), speech_line("dup", "Two."), speech_line("live", "Three.", stream=True)])
+    source = client.files.create(file=("broken.jsonl", broken), purpose="batch")
+    failed = wait_for_batch(
+        client, client.batches.create(input_file_id=source.id, endpoint=endpoint, completion_window="24h").id
+    )
+    check(failed.status == "failed", f"status {failed.status}")
+    codes = [(error.code, error.line) for error in failed.errors.data]
+    check(codes == [("duplicate_custom_id", 2), ("streaming_not_supported", 3)], f"{codes}")
+
+    # Cancel: cancelling, then cancelled, with whatever finished kept.
+    many = jsonl([speech_line(f"line-{index}", f"Sentence number {index}.") for index in range(64)])
+    source = client.files.create(file=("many.jsonl", many), purpose="batch")
+    batch = client.batches.create(input_file_id=source.id, endpoint=endpoint, completion_window="24h")
+    cancelling = client.batches.cancel(batch.id)
+    check(cancelling.status in ("cancelling", "cancelled"), f"status {cancelling.status}")
+    cancelled = wait_for_batch(client, batch.id, timeout=120)
+    check(cancelled.status == "cancelled", f"status {cancelled.status}")
+    done = cancelled.request_counts.completed
+    check(done < 64, "every line ran before the cancel")
+    return f"2 spoken, 1 batch failed validation, 1 cancelled after {done} of 64 lines"
+
+
 async def socket_session(base_url: str, dialect: str, cancel: bool = False) -> dict:
     import websockets
 
@@ -469,6 +569,8 @@ def main() -> int:
         "10": lambda: s10_socket_dialect(args.url),
         "12": lambda: s12_sglang_voice(args.url),
         "13": lambda: s13_files(client),
+        "14": lambda: s14_batch_transcriptions(client),
+        "15": lambda: s15_batch_speech(client),
     }
     for number, run in plan.items():
         if args.only and number not in args.only:

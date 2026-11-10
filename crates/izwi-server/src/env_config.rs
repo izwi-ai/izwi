@@ -137,7 +137,7 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
     var(
         "IZWI_BATCH_WORKER_CONCURRENCY",
         "the runtime's capacity",
-        "Durable jobs the local batch worker runs at once (at most the runtime's capacity).",
+        "Durable jobs the local batch worker runs at once, and `/v1/batches` lines in flight at once (at most the runtime's capacity).",
     ),
     var(
         "IZWI_BATCH_STAGE_TIMEOUT_SECS",
@@ -413,6 +413,11 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "Largest file `/v1/files` accepts, in bytes (at most 1 GiB).",
     ),
     var(
+        "IZWI_BATCH_MAX_REQUESTS",
+        "50000",
+        "Requests one `/v1/batches` input file may hold.",
+    ),
+    var(
         "IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS",
         "5",
         "Heartbeat age after which readiness reports a batch worker stale.",
@@ -503,6 +508,7 @@ pub(crate) struct ServerTuning {
     pub(crate) voice_ws_outbound_audio_ms: u64,
     pub(crate) batch_worker_heartbeat_stale_ms: u64,
     pub(crate) files_max_bytes: u64,
+    pub(crate) batch_max_requests: usize,
     pub(crate) idempotency_limits: QuotaLimits,
     pub(crate) provider_write_limits: QuotaLimits,
     pub(crate) retention: RetentionPolicy,
@@ -746,6 +752,7 @@ impl ServerTuning {
             batch_worker_heartbeat_stale_ms: secs("IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS", 5)?
                 .saturating_mul(1_000),
             files_max_bytes: at_least(env, "IZWI_FILES_MAX_BYTES", 1, 200 * 1024 * 1024)?,
+            batch_max_requests: at_least(env, "IZWI_BATCH_MAX_REQUESTS", 1, 50_000)?,
             idempotency_limits: QuotaLimits {
                 global: at_least(env, "IZWI_IDEMPOTENCY_MAX_RECORDS", 1, 1_048_576)?,
                 per_tenant: at_least(env, "IZWI_IDEMPOTENCY_MAX_RECORDS_PER_TENANT", 1, 65_536)?,

@@ -29,6 +29,7 @@ When `izwi serve` is running:
 | `/v1/audio/speech/batch`, `/v1/audio/speech/{id}`, `/v1/audio/speech/stream` | Preview | Batch speech, outcome lookup (process-local) and the text-in speech WebSocket. |
 | `/v1/audio/transcriptions` | Stable | OpenAI-compatible transcription endpoint with local streaming support. |
 | `/v1/files*` | Stable | OpenAI-compatible Files API for batch input, audio and output. |
+| `/v1/batches*` | Stable | OpenAI-compatible Batch API over the audio transcription, translation and speech routes. |
 | `/livez`, `/readyz`, `/v1/live`, `/v1/ready`, `/v1/health` | Stable | Operational health and readiness endpoints. |
 | `/v1/responses*` | Preview | OpenAI-compatible Responses API shape with process-local response retention. |
 | First-party workflow routes | Preview | Persisted local product APIs used by the web UI and desktop app. |
@@ -147,6 +148,8 @@ Some older list routes return arrays or route-specific wrapper names. The route 
 | `IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB` | `25` strict, `64` relaxed | Upload limit for OpenAI audio routes. |
 | First-party audio upload limit | `64 MiB` | Applies to persisted transcription, diarization, TTS, voice design, voice clone, and saved voice creation routes. |
 | `IZWI_FILES_MAX_BYTES` | `209715200` (200 MB) | Largest file `/v1/files` accepts, at most 1 GiB. A larger upload is refused with `413`. |
+| `IZWI_BATCH_MAX_REQUESTS` | `50000` | Requests one `/v1/batches` input file may hold. A larger file fails its batch. |
+| `IZWI_BATCH_WORKER_CONCURRENCY` | The runtime's capacity | `/v1/batches` lines in flight at once, and durable jobs the batch worker runs at once. |
 | `IZWI_AUDIO_STREAM_EVENT_QUEUE_CAPACITY` | `32` | Buffered SSE audio events for `/v1/audio/speech`. |
 | `IZWI_MAX_RESPONSE_STORE_ENTRIES` | `512` | Process-local `/v1/responses` retention cap. |
 | `IZWI_MAX_AGENT_SESSION_STORE_ENTRIES` | `512` | Process-local agent session metadata cap. |
@@ -1101,6 +1104,154 @@ print(client.files.content(uploaded.id).text)
 client.files.delete(uploaded.id)
 ```
 
+### Batch API
+
+OpenAI's Batch API, so the stock SDK's `client.batches` calls work
+unchanged. A batch runs the requests of an uploaded JSONL file against one
+endpoint as batch work, which yields to interactive and real-time requests,
+and writes the results to an output file within 24 hours.
+
+OpenAI batches chat, embeddings and image requests. Izwi batches the audio
+routes instead, in the same shape (an Izwi extension):
+
+- `/v1/audio/transcriptions`
+- `/v1/audio/translations`
+- `/v1/audio/speech`
+
+Any other `endpoint` is refused with `400`. `/v1/audio/speech/batch` stays
+for small sets answered in one response.
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `POST` | `/v1/batches` | JSON `input_file_id` (a file of purpose `batch`), `endpoint`, `completion_window` (`"24h"` only) and optional `metadata` (up to 16 string pairs). Returns the batch, `validating`. |
+| `GET` | `/v1/batches` | `after`, `limit` (1 to 100, default 20), newest first. Returns `{"object": "list", "data", "first_id", "last_id", "has_more"}`. |
+| `GET` | `/v1/batches/{batch_id}` | The batch. |
+| `POST` | `/v1/batches/{batch_id}/cancel` | Cancels a batch that is `validating` or `in_progress`. Lines in flight stop, and the batch ends `cancelled` with the results of the lines that finished. A batch that is `finalizing` or has ended is a `409`. |
+
+The batch object is OpenAI's: `id` (`batch_…`), `object`, `endpoint`,
+`errors`, `input_file_id`, `completion_window`, `status`, `output_file_id`,
+`error_file_id`, `created_at`, `in_progress_at`, `expires_at`,
+`finalizing_at`, `completed_at`, `failed_at`, `expired_at`, `cancelling_at`,
+`cancelled_at`, `request_counts` (`total`, `completed`, `failed`) and
+`metadata`. Statuses are `validating`, `failed`, `in_progress`, `finalizing`,
+`completed`, `expired`, `cancelling` and `cancelled`.
+
+**Input.** One request per line, at most `IZWI_BATCH_MAX_REQUESTS` (50,000)
+lines in a file of at most `IZWI_FILES_MAX_BYTES` (200 MB):
+
+```json
+{"custom_id": "call-1", "method": "POST", "url": "/v1/audio/transcriptions", "body": {"model": "Parakeet-TDT-0.6B-v3", "file_id": "file-abc123"}}
+```
+
+`custom_id` is required and unique in the file, `method` is `POST`, and
+`url` is the batch's endpoint. `body` is the JSON body the synchronous route
+takes, with these differences:
+
+- A transcription or translation line names its audio by `file_id`, a file
+  uploaded with purpose `user_data`, or carries it as `audio_base64`. Use
+  `file_id` for anything but short clips: a line holds at most one upload's
+  worth of audio (`IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB`).
+- `stream` and `stream_format` are refused.
+- `service_tier` is ignored. Every line runs as batch work.
+
+A file that breaks these rules fails the batch: its status becomes `failed`
+and `errors.data` lists up to 100 entries of `{"code", "message", "param",
+"line"}` (`invalid_json_line`, `missing_custom_id`, `duplicate_custom_id`,
+`invalid_method`, `invalid_url`, `invalid_body`, `streaming_not_supported`,
+`line_too_long`, `too_many_requests`, `empty_file`,
+`input_file_not_found`). What a body asks for is checked when its line runs,
+by the route's own code, and a line the route refuses fails alone.
+
+**Output.** When the batch ends, `output_file_id` names a JSONL file with one
+line per request that was served, in input order:
+
+```json
+{"id": "batch_req_…", "custom_id": "call-1", "response": {"status_code": 200, "request_id": "batch_req_…", "body": {"text": "…"}}, "error": null}
+```
+
+- For a transcription or translation line, `response.body` is the JSON the
+  synchronous route returns for the line's `response_format` (`json` or
+  `verbose_json`). A text format (`text`, `srt`, `vtt`) is wrapped as
+  `{"text": "…"}`.
+- For a speech line, the audio is written to its own file, named
+  `<custom_id>.<format>`, and `response.body` is `{"audio_file_id":
+  "file-…", "format": "mp3", "bytes": 12345}` (an Izwi extension). Download
+  it with `GET /v1/files/{audio_file_id}/content`.
+
+`error_file_id` names a file of the same shape for the requests that failed:
+`response` carries the route's error status and error body, and `error` its
+`{"code", "message"}`. Either id is null when the file would be empty. Output,
+error and audio files have purpose `batch_output` and are deleted 30 days
+after they are written.
+
+**Lifecycle.** A batch survives a restart: lines that finished are not run
+again, and the rest resume. A line refused for capacity (`429`, `503`) is
+run again rather than failed. At `expires_at`, 24 hours after creation,
+lines still running are stopped, the results so far are written, and the
+batch becomes `expired`. Requests that were cancelled or ran out of time
+appear in neither file; `request_counts` tells how many there were. A
+server runs four batches at a time and the rest wait their turn; the lines
+in flight across them are bounded by `IZWI_BATCH_WORKER_CONCURRENCY`. A
+batch, like its files, is visible only to the principal that created it.
+
+Transcribe recordings:
+
+```python
+import json
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="not-needed")
+
+lines = []
+for name in ["call-1.wav", "call-2.wav"]:
+    audio = client.files.create(file=open(name, "rb"), purpose="user_data")
+    lines.append({
+        "custom_id": name,
+        "method": "POST",
+        "url": "/v1/audio/transcriptions",
+        "body": {"model": "Parakeet-TDT-0.6B-v3", "file_id": audio.id},
+    })
+requests = "\n".join(json.dumps(line) for line in lines).encode()
+source = client.files.create(file=("requests.jsonl", requests), purpose="batch")
+
+batch = client.batches.create(
+    input_file_id=source.id,
+    endpoint="/v1/audio/transcriptions",
+    completion_window="24h",
+)
+# Poll client.batches.retrieve(batch.id) until status is "completed".
+batch = client.batches.retrieve(batch.id)
+for line in client.files.content(batch.output_file_id).text.splitlines():
+    result = json.loads(line)
+    print(result["custom_id"], result["response"]["body"]["text"])
+```
+
+Speak a list of texts:
+
+```python
+lines = [
+    {
+        "custom_id": f"prompt-{index}",
+        "method": "POST",
+        "url": "/v1/audio/speech",
+        "body": {"model": "Kokoro-82M", "voice": "af_heart", "input": text, "response_format": "mp3"},
+    }
+    for index, text in enumerate(["Welcome back.", "Your order has shipped."])
+]
+requests = "\n".join(json.dumps(line) for line in lines).encode()
+source = client.files.create(file=("speech.jsonl", requests), purpose="batch")
+batch = client.batches.create(
+    input_file_id=source.id, endpoint="/v1/audio/speech", completion_window="24h"
+)
+# Once the batch is "completed":
+batch = client.batches.retrieve(batch.id)
+for line in client.files.content(batch.output_file_id).text.splitlines():
+    result = json.loads(line)
+    body = result["response"]["body"]
+    audio = client.files.content(body["audio_file_id"]).content
+    open(f"{result['custom_id']}.{body['format']}", "wb").write(audio)
+```
+
 ### Responses
 
 `POST /v1/responses`
@@ -1690,9 +1841,12 @@ Small first-party UI state APIs:
 | `GET` | `/internal/metrics/prometheus` | Internal alias. |
 
 Batch runtime metrics include `queued_stages`, `jobs_by_status`,
-`stages_by_status`, and a local worker snapshot. Prometheus output appends
-`izwi_batch_runtime_queued_stages`, `izwi_batch_runtime_jobs`,
-`izwi_batch_runtime_stages`, and `izwi_batch_runtime_worker_running`.
+`stages_by_status`, a local worker snapshot, and `api_batches` (the
+`/v1/batches` batches by status, with the requests they have finished).
+Prometheus output appends `izwi_batch_runtime_queued_stages`,
+`izwi_batch_runtime_jobs`, `izwi_batch_runtime_stages`,
+`izwi_batch_runtime_worker_running`, `izwi_batch_runtime_api_batches{status}`
+and `izwi_batch_runtime_api_batch_requests{outcome}` (`completed`, `failed`).
 
 Latencies are Prometheus histograms (cumulative `_bucket{le=...}`, `_sum`,
 `_count`) in seconds, so they aggregate across replicas and `histogram_quantile`

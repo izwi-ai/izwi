@@ -291,7 +291,7 @@ pub async fn transcriptions(
     req: Request,
 ) -> Result<Response<Body>, ApiError> {
     let req = parse_transcription_request(req).await?;
-    run_transcription(state, ctx, req).await
+    run_transcription(state, ctx.correlation_id, req).await
 }
 
 /// `POST /v1/audio/translations`: OpenAI's translation route (deprecated
@@ -304,7 +304,16 @@ pub async fn translations(
     Extension(ctx): Extension<RequestContext>,
     req: Request,
 ) -> Result<Response<Body>, ApiError> {
-    let mut req = parse_transcription_request(req).await?;
+    let req = parse_transcription_request(req).await?;
+    run_translation(state, ctx.correlation_id, req).await
+}
+
+/// Checks `req` as a translation and runs it.
+async fn run_translation(
+    state: AppState,
+    correlation_id: String,
+    mut req: TranscriptionRequest,
+) -> Result<Response<Body>, ApiError> {
     if req
         .timestamp_granularities
         .as_ref()
@@ -351,7 +360,7 @@ pub async fn translations(
         req.target_language = Some("en".to_string());
     }
     req.translate = true;
-    run_transcription(state, ctx, req).await
+    run_transcription(state, correlation_id, req).await
 }
 
 /// The catalog's speech translation models, for error messages.
@@ -367,18 +376,18 @@ fn translation_model_names() -> String {
 /// Transcribes `req` and names the tier that served it in the response.
 async fn run_transcription(
     state: AppState,
-    ctx: RequestContext,
+    correlation_id: String,
     req: TranscriptionRequest,
 ) -> Result<Response<Body>, ApiError> {
     let service_tier = req.service_tier;
-    let mut response = transcribe(state, ctx, req).await?;
+    let mut response = transcribe(state, correlation_id, req).await?;
     service_tier.stamp(&mut response);
     Ok(response)
 }
 
 async fn transcribe(
     state: AppState,
-    ctx: RequestContext,
+    correlation_id: String,
     mut req: TranscriptionRequest,
 ) -> Result<Response<Body>, ApiError> {
     validate_transcription_model(req.model.as_deref())?;
@@ -412,7 +421,7 @@ async fn transcribe(
     validate_transcription_response_format(&response_format)?;
 
     if req.stream {
-        return transcriptions_stream(state, req, task, audio, ctx.correlation_id).await;
+        return transcriptions_stream(state, req, task, audio, correlation_id).await;
     }
     let audio_bytes = audio.bytes;
 
@@ -439,7 +448,7 @@ async fn transcribe(
             req.prompt.as_deref(),
             task,
             req.max_tokens,
-            Some(&ctx.correlation_id),
+            Some(&correlation_id),
             permit.runtime_context(),
             timestamp_request.any(),
         )
@@ -753,8 +762,12 @@ async fn transcriptions_stream(
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct JsonRequestBody {
-    audio_base64: String,
+pub(crate) struct JsonRequestBody {
+    #[serde(default)]
+    audio_base64: Option<String>,
+    /// A Batch API line's audio: a `user_data` file (`/v1/files`).
+    #[serde(default)]
+    file_id: Option<String>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -788,6 +801,83 @@ struct JsonRequestBody {
     service_tier: Option<String>,
 }
 
+impl JsonRequestBody {
+    /// The request these fields describe, over `audio`.
+    fn into_request(self, audio: AudioPayload, service_tier: ServiceTier) -> TranscriptionRequest {
+        TranscriptionRequest {
+            audio: Some(audio),
+            model: self.model.map(|model| {
+                crate::api::openai::model_aliases::resolve_model_alias(&model).to_string()
+            }),
+            aligner_model: self.aligner_model,
+            language: self.language.or_else(|| {
+                self.languages.and_then(|languages| {
+                    languages.into_iter().find(|code| !code.trim().is_empty())
+                })
+            }),
+            response_format: self.response_format,
+            stream: self.stream.unwrap_or(false),
+            prompt: self.prompt,
+            target_language: self.target_language,
+            keywords: self
+                .keywords
+                .map(KeywordsField::into_keywords)
+                .unwrap_or_default(),
+            speaker_labels: self.speaker_labels.unwrap_or(false),
+            max_tokens: self.max_tokens,
+            _temperature: self.temperature,
+            timestamp_granularities: self.timestamp_granularities,
+            translate: false,
+            service_tier,
+        }
+    }
+
+    /// Where a Batch API line's audio is: exactly one of `file_id` and
+    /// `audio_base64`.
+    pub(crate) fn audio(&self) -> Result<BatchAudio<'_>, ApiError> {
+        match (self.file_id.as_deref(), self.audio_base64.as_deref()) {
+            (Some(file_id), None) => Ok(BatchAudio::FileId(file_id)),
+            (None, Some(encoded)) => Ok(BatchAudio::Base64(encoded)),
+            _ => Err(ApiError::invalid_param(
+                "file_id",
+                "Name the audio by exactly one of `file_id` or `audio_base64`",
+            )),
+        }
+    }
+}
+
+/// The audio of a Batch API line.
+pub(crate) enum BatchAudio<'a> {
+    FileId(&'a str),
+    Base64(&'a str),
+}
+
+/// The body of a Batch API line: the JSON body this route takes, whose
+/// audio may also be a `file_id`.
+pub(crate) fn parse_batch_body(body: &serde_json::Value) -> Result<JsonRequestBody, ApiError> {
+    <JsonRequestBody as serde::Deserialize>::deserialize(body)
+        .map_err(|err| ApiError::bad_request(format!("Invalid request body: {err}")))
+}
+
+/// Runs a Batch API line as this route (or `/v1/audio/translations`) runs a
+/// request, at `service_tier` whatever tier the body names.
+pub(crate) async fn run_batch_line(
+    state: AppState,
+    correlation_id: String,
+    body: JsonRequestBody,
+    audio: AudioPayload,
+    translate: bool,
+    service_tier: ServiceTier,
+) -> Result<Response<Body>, ApiError> {
+    inspect_audio_payload_canonical_with_diagnostics("openai.audio.transcriptions", &audio)?;
+    let req = body.into_request(audio, service_tier);
+    if translate {
+        run_translation(state, correlation_id, req).await
+    } else {
+        run_transcription(state, correlation_id, req).await
+    }
+}
+
 async fn parse_transcription_request(req: Request) -> Result<TranscriptionRequest, ApiError> {
     let tier_header = req.headers().get(SERVICE_TIER_HEADER).cloned();
     let content_type = req
@@ -804,35 +894,12 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
             .map_err(|e| ApiError::bad_request(format!("Invalid JSON payload: {e}")))?;
         let service_tier =
             ServiceTier::parse(payload.service_tier.as_deref(), tier_header.as_ref())?;
-        let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
+        let audio_base64 = payload.audio_base64.as_deref().ok_or_else(|| {
+            ApiError::bad_request("Invalid JSON payload: missing field `audio_base64`")
+        })?;
+        let audio_payload = decode_base64_audio_payload(audio_base64)?;
         inspect_audio_payload_canonical_with_diagnostics("openai.audio.transcriptions", &audio_payload)?;
-
-        return Ok(TranscriptionRequest {
-            audio: Some(audio_payload),
-            model: payload.model.map(|model| {
-                crate::api::openai::model_aliases::resolve_model_alias(&model).to_string()
-            }),
-            aligner_model: payload.aligner_model,
-            language: payload.language.or_else(|| {
-                payload.languages.and_then(|languages| {
-                    languages.into_iter().find(|code| !code.trim().is_empty())
-                })
-            }),
-            response_format: payload.response_format,
-            stream: payload.stream.unwrap_or(false),
-            prompt: payload.prompt,
-            target_language: payload.target_language,
-            keywords: payload
-                .keywords
-                .map(KeywordsField::into_keywords)
-                .unwrap_or_default(),
-            speaker_labels: payload.speaker_labels.unwrap_or(false),
-            max_tokens: payload.max_tokens,
-            _temperature: payload.temperature,
-            timestamp_granularities: payload.timestamp_granularities,
-            translate: false,
-            service_tier,
-        });
+        return Ok(payload.into_request(audio_payload, service_tier));
     }
 
     if content_type.starts_with("multipart/form-data") {

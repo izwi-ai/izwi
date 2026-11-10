@@ -1,6 +1,7 @@
 //! OpenAI-compatible API namespace.
 
 pub mod audio;
+pub mod batches;
 pub mod chat;
 pub mod compat;
 pub mod files;
@@ -20,6 +21,7 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .merge(audio::router())
+        .merge(batches::router())
         .merge(chat::router())
         .merge(files::router())
         .merge(models::router())

@@ -521,6 +521,10 @@ pub struct AppState {
     pub artifact_store: Arc<ArtifactStore>,
     /// The files of `/v1/files`, stored as artifacts of their tenant.
     pub(crate) file_store: Arc<crate::file_store::FileStore>,
+    /// The batches of `/v1/batches` and their finished lines.
+    pub(crate) batch_api_store: Arc<crate::batch_api_store::BatchApiStore>,
+    /// Wakes the batch executor when a batch is created or cancelled.
+    pub(crate) batch_api_wake: Arc<tokio::sync::Notify>,
     /// Shared strict media validation, canonicalization, storage, and asset registration service.
     pub media_ingest: Arc<MediaIngestService>,
     /// In-process batch worker health snapshot used by readiness and diagnostics.
@@ -575,6 +579,9 @@ impl AppState {
             store_database.clone(),
             artifact_store.clone(),
         ));
+        let batch_api_store = Arc::new(crate::batch_api_store::BatchApiStore::new(
+            store_database.clone(),
+        ));
         let speech_history_store = Arc::new(SpeechHistoryStore::initialize_with_storage(
             store_database,
             media_storage.clone(),
@@ -618,6 +625,8 @@ impl AppState {
             batch_runtime_store,
             artifact_store,
             file_store,
+            batch_api_store,
+            batch_api_wake: Arc::new(tokio::sync::Notify::new()),
             media_ingest,
             batch_worker_health,
             stream_shutdown: Arc::new(tokio::sync::watch::Sender::new(false)),
@@ -686,6 +695,9 @@ impl AppState {
             store_database.clone(),
             artifact_store.clone(),
         ));
+        let batch_api_store = Arc::new(crate::batch_api_store::BatchApiStore::new(
+            store_database.clone(),
+        ));
         let speech_history_store = Arc::new(
             SpeechHistoryStore::initialize_with_storage(
                 store_database.clone(),
@@ -732,6 +744,8 @@ impl AppState {
             batch_runtime_store,
             artifact_store,
             file_store,
+            batch_api_store,
+            batch_api_wake: Arc::new(tokio::sync::Notify::new()),
             media_ingest,
             batch_worker_health,
             stream_shutdown: Arc::new(tokio::sync::watch::Sender::new(false)),

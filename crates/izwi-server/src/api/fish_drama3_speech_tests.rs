@@ -47,7 +47,7 @@ const BUDGET: usize = 160;
 const TEMPERATURE: f32 = 2.0;
 
 /// The tests load the model one at a time.
-static LOADS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static LOADS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Server {
     app: Router,

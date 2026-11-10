@@ -106,7 +106,7 @@ impl SpeechBatchResult {
 /// response).
 const STREAM_FIELDS: [&str; 2] = ["stream", "stream_format"];
 
-fn reject_streaming(fields: &Map<String, Value>, at: &str) -> Result<(), ApiError> {
+pub(crate) fn reject_streaming(fields: &Map<String, Value>, at: &str) -> Result<(), ApiError> {
     for field in STREAM_FIELDS {
         match fields.get(field) {
             None | Some(Value::Null) | Some(Value::Bool(false)) => {}

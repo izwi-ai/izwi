@@ -1200,6 +1200,54 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     );
     add_speech_api_paths(paths);
     add_files_paths(paths);
+    add_batches_paths(paths);
+}
+
+/// OpenAI's Batch API over the audio routes.
+fn add_batches_paths(paths: &mut Map<String, Value>) {
+    add_operation(
+        paths,
+        "/v1/batches",
+        "post",
+        "OpenAI Compatible",
+        "Create batch",
+        "JSON `input_file_id` (a JSONL file of purpose `batch`), `endpoint` \
+         (/v1/audio/transcriptions, /v1/audio/translations or /v1/audio/speech), \
+         `completion_window` (`24h`) and optional `metadata`. Each line is OpenAI's \
+         `{custom_id, method, url, body}`; a transcription or translation body names its audio \
+         by `file_id` or `audio_base64`. Lines run as batch work; at most \
+         IZWI_BATCH_MAX_REQUESTS (50000) per file.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/batches",
+        "get",
+        "OpenAI Compatible",
+        "List batches",
+        "The caller's batches, newest first; `after` and `limit` (1 to 100) page them.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/batches/{batch_id}",
+        "get",
+        "OpenAI Compatible",
+        "Get batch",
+        "The batch: status, `request_counts`, and `output_file_id` and `error_file_id` once it \
+         has ended. A speech line's response body is `{audio_file_id, format, bytes}`.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/batches/{batch_id}/cancel",
+        "post",
+        "OpenAI Compatible",
+        "Cancel batch",
+        "Stops a batch that is validating or in progress: `cancelling`, then `cancelled` with \
+         the results of the lines that finished. A batch that has ended is a 409.",
+        preview_response(),
+    );
 }
 
 /// OpenAI's Files API, for the Batch API's input, audio and output.

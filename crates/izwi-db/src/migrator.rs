@@ -52,6 +52,7 @@ impl Schema {
                 (15, "speech take codes, voices and parent"),
                 (16, "voice consent recordings"),
                 (17, "uploaded and server-written files"),
+                (18, "batches and their finished lines"),
             ],
             Self::Fleet => &[
                 (1, "fleet coordination"),
@@ -237,6 +238,12 @@ async fn apply_migration<C: ConnectionTrait>(
         }
         (Schema::App, 17) => {
             for statement in FILES_SCHEMA {
+                db.execute_unprepared(&dialect_ddl(backend, statement))
+                    .await?;
+            }
+        }
+        (Schema::App, 18) => {
+            for statement in BATCHES_SCHEMA {
                 db.execute_unprepared(&dialect_ddl(backend, statement))
                     .await?;
             }
@@ -1263,6 +1270,53 @@ const FILES_SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_api_files_expires_at ON api_files(expires_at) WHERE expires_at IS NOT NULL;",
 ];
 
+/// Migration 18: the batches of `/v1/batches`. A batch names its input file
+/// and holds its status, counts, output files and the lease of the executor
+/// running it. `api_batch_requests` holds one row per finished line (its
+/// response) until the batch ends and the rows are written to its files.
+const BATCHES_SCHEMA: &[&str] = &[
+    r#"
+    CREATE TABLE IF NOT EXISTS api_batches (
+        id TEXT PRIMARY KEY,
+        tenant_scope TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        input_file_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        metadata_json TEXT NULL,
+        errors_json TEXT NULL,
+        output_file_id TEXT NULL,
+        error_file_id TEXT NULL,
+        request_total INTEGER NOT NULL DEFAULT 0,
+        request_completed INTEGER NOT NULL DEFAULT 0,
+        request_failed INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        in_progress_at INTEGER NULL,
+        finalizing_at INTEGER NULL,
+        completed_at INTEGER NULL,
+        failed_at INTEGER NULL,
+        expired_at INTEGER NULL,
+        cancelling_at INTEGER NULL,
+        cancelled_at INTEGER NULL,
+        lease_owner TEXT NULL,
+        lease_expires_at INTEGER NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_api_batches_tenant_created_at ON api_batches(tenant_scope, created_at DESC, id DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_api_batches_active ON api_batches(created_at) WHERE status IN ('validating', 'in_progress', 'finalizing', 'cancelling');",
+    r#"
+    CREATE TABLE IF NOT EXISTS api_batch_requests (
+        batch_id TEXT NOT NULL,
+        line_index INTEGER NOT NULL,
+        custom_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        status_code INTEGER NOT NULL,
+        body_json TEXT NOT NULL,
+        PRIMARY KEY(batch_id, line_index)
+    );
+    "#,
+];
+
 const SAVED_VOICE_CONSENT_COLUMN: CompatibilityColumn = CompatibilityColumn {
     table: "saved_voices",
     column: "consent_id",
@@ -1900,6 +1954,10 @@ pub(crate) fn postgres_schema_sql() -> String {
     push(&add_column(&SAVED_VOICE_CONSENT_COLUMN));
     // Migration 17.
     for statement in FILES_SCHEMA {
+        push(statement);
+    }
+    // Migration 18.
+    for statement in BATCHES_SCHEMA {
         push(statement);
     }
     push(SCHEMA_MIGRATIONS_DDL);

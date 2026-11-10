@@ -72,6 +72,17 @@ impl ArtifactTenant {
     }
 }
 
+impl ArtifactTenant {
+    /// The scheduling key `from_scheduling_key` made this tenant from:
+    /// `None` for the anonymous local tenant, and for any tenant not made
+    /// from a key.
+    pub(crate) fn scheduling_key(&self) -> Option<[u8; 32]> {
+        let mut key = [0u8; 32];
+        hex::decode_to_slice(&self.0, &mut key).ok()?;
+        Some(key)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ArtifactId(String);

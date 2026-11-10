@@ -26,7 +26,7 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_DESKTOP_OWNER_PIPE` | unset | `1` when the desktop app owns this process: stdin closing shuts it down. |
 | `IZWI_HTTP_SHUTDOWN_PRESTOP_SECS` | `0` | Pre-stop window at shutdown (0-60): readiness is unready while requests are still served. |
 | `IZWI_HTTP_SHUTDOWN_GRACE_SECS` | `20` | How long in-flight HTTP requests may run after the pre-stop window (1-300); open chat streams get a terminal shutting-down event shortly before it ends. |
-| `IZWI_BATCH_WORKER_CONCURRENCY` | the runtime's capacity | Durable jobs the local batch worker runs at once (at most the runtime's capacity). |
+| `IZWI_BATCH_WORKER_CONCURRENCY` | the runtime's capacity | Durable jobs the local batch worker runs at once, and `/v1/batches` lines in flight at once (at most the runtime's capacity). |
 | `IZWI_BATCH_STAGE_TIMEOUT_SECS` | 0 (none) | Wall-clock limit of one durable stage (30-86400; 0 disables). |
 | `IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS` | `20` | How long the batch worker drains at shutdown (1-300). |
 | `IZWI_MAX_REALTIME_REQUESTS` | the global request limit | Concurrent realtime-class requests. |
@@ -81,6 +81,7 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_VOICE_WS_OUTBOUND_AUDIO_BYTES` | `4194304` | Assistant audio bytes a voice websocket queues. |
 | `IZWI_VOICE_WS_OUTBOUND_AUDIO_MS` | `5000` | Assistant audio a voice websocket queues, in milliseconds. |
 | `IZWI_FILES_MAX_BYTES` | `209715200` | Largest file `/v1/files` accepts, in bytes (at most 1 GiB). |
+| `IZWI_BATCH_MAX_REQUESTS` | `50000` | Requests one `/v1/batches` input file may hold. |
 | `IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS` | `5` | Heartbeat age after which readiness reports a batch worker stale. |
 | `IZWI_IDEMPOTENCY_MAX_RECORDS` | `1048576` | Live idempotency records in total. |
 | `IZWI_IDEMPOTENCY_MAX_RECORDS_PER_TENANT` | `65536` | Live idempotency records per tenant. |

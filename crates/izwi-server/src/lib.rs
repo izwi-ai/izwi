@@ -20,6 +20,7 @@ mod api;
 mod app;
 pub use app::realtime_protocol;
 pub mod artifact_store;
+mod batch_api_store;
 pub mod batch_runtime;
 mod chat_store;
 mod cli;

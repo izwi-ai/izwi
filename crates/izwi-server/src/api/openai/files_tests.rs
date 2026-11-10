@@ -109,6 +109,20 @@ impl TestServer {
         .await
     }
 
+    /// A JSON request from `tenant`.
+    pub(crate) async fn post_json(&self, path: &str, tenant: &str, body: Value) -> Response {
+        self.send(
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header("x-test-tenant", tenant)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+    }
+
     /// `POST /v1/files` from `tenant`, as the SDK sends it.
     pub(crate) async fn upload(
         &self,
