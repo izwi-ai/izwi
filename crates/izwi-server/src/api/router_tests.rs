@@ -2016,6 +2016,96 @@ async fn over_limit_speech_input_is_payload_too_large_on_both_routes() {
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+/// `service_tier` is read on every speech route, as a body field or the
+/// `X-Izwi-Service-Tier` header: each of OpenAI's values passes on to the
+/// route's own checks and any other value is refused, before any model work.
+#[tokio::test]
+async fn audio_routes_take_service_tier_and_refuse_unknown_values() {
+    let (state, _root) = test_state("audio_service_tier", false);
+    state.lifecycle.mark_ready();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state, &config);
+    let audio = serde_json::from_str::<serde_json::Value>(&tiny_audio_json_body())
+        .expect("json")["audio_base64"]
+        .clone();
+    // Each body fails one of its route's own checks, so no model runs.
+    let routes = [
+        (
+            "/v1/audio/speech",
+            serde_json::json!({
+                "model": "Kokoro-82M",
+                "input": "Hi.",
+                "voice": "af_heart",
+                "response_format": "ogg-vorbis"
+            }),
+            "response_format",
+        ),
+        (
+            "/v1/audio/speech/batch",
+            serde_json::json!({"model": "Kokoro-82M", "items": []}),
+            "items",
+        ),
+        (
+            "/v1/audio/transcriptions",
+            serde_json::json!({
+                "audio_base64": audio,
+                "model": "Parakeet-TDT-0.6B-v3",
+                "response_format": "verbose_json",
+                "timestamp_granularities": ["paragraph"]
+            }),
+            "",
+        ),
+        (
+            "/v1/audio/translations",
+            serde_json::json!({"audio_base64": audio}),
+            "model",
+        ),
+    ];
+    let send = |path: &'static str, body: serde_json::Value, header: Option<&'static str>| {
+        let mut request = build_request(Method::POST, path, Some(&body.to_string()));
+        if let Some(header) = header {
+            request
+                .headers_mut()
+                .insert("x-izwi-service-tier", header.parse().unwrap());
+        }
+        send_request(app.clone(), request)
+    };
+    for (path, body, own_param) in routes {
+        for tier in ["auto", "default", "flex", "priority"] {
+            let mut with_field = body.clone();
+            with_field["service_tier"] = tier.into();
+            for response in [
+                send(path, with_field, None).await,
+                send(path, body.clone(), Some(tier)).await,
+            ] {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path} {tier}");
+                let error = read_json(response).await;
+                assert_eq!(
+                    error["error"]["param"].as_str().unwrap_or_default(),
+                    own_param,
+                    "{path} {tier}: {error}"
+                );
+            }
+        }
+        let mut unknown_field = body.clone();
+        unknown_field["service_tier"] = "fastest".into();
+        for response in [
+            send(path, unknown_field, None).await,
+            send(path, body.clone(), Some("fastest")).await,
+        ] {
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            let error = read_json(response).await;
+            assert_eq!(error["error"]["type"], "invalid_request_error", "{path}");
+            assert_eq!(error["error"]["param"], "service_tier", "{path}");
+            assert_eq!(error["error"]["code"], "invalid_value", "{path}");
+        }
+    }
+}
+
 /// A photo sent as a base64 data URL is larger than axum's 2 MB default;
 /// chat routes read it and fail, if at all, for another reason.
 #[tokio::test]

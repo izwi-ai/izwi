@@ -2164,6 +2164,13 @@
                   "null"
                 ]
               },
+              "service_tier": {
+                "description": "Izwi extension of OpenAI's field: `flex` runs the request as batch\nwork behind interactive and streaming requests; `default`, `auto` or\nabsent keeps the route's own class; `priority` is served as\n`default`. The `X-Izwi-Service-Tier` request header is read when the\nbody names none.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "speed": {
                 "format": "float",
                 "type": [
@@ -2484,6 +2491,13 @@
               "null"
             ]
           },
+          "service_tier": {
+            "description": "Izwi extension of OpenAI's field: `flex` runs the request as batch\nwork behind interactive and streaming requests; `default`, `auto` or\nabsent keeps the route's own class; `priority` is served as\n`default`. The `X-Izwi-Service-Tier` request header is read when the\nbody names none.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "speaker_labels": {
             "description": "Izwi extension: tag speakers in the transcript (models that do, such\nas Nemotron-3.5-Transcribe-30B-A4B-FP8; others reject it with 400).\nverbose_json then carries `speaker_turns`.",
             "type": [
@@ -2586,6 +2600,13 @@
               "null"
             ]
           },
+          "service_tier": {
+            "description": "Izwi extension of OpenAI's field: `flex` runs the request as batch\nwork behind interactive and streaming requests; `default`, `auto` or\nabsent keeps the route's own class; `priority` is served as\n`default`. The `X-Izwi-Service-Tier` request header is read when the\nbody names none.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "speaker_labels": {
             "description": "Izwi extension: tag speakers in the transcript (models that do, such\nas Nemotron-3.5-Transcribe-30B-A4B-FP8; others reject it with 400).\nverbose_json then carries `speaker_turns`.",
             "type": [
@@ -2630,6 +2651,13 @@
       },
       "TranscriptionResponse": {
         "properties": {
+          "service_tier": {
+            "description": "The tier that served the request (`flex` or `default`), when the\nrequest named one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "text": {
             "type": "string"
           }
@@ -2804,6 +2832,13 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "service_tier": {
+            "description": "The tier that served the request (`flex` or `default`), when the\nrequest named one.",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -2990,7 +3025,7 @@
         },
         "responses": {
           "200": {
-            "description": "Encoded audio (Content-Type per response_format; a chunked body for stream_format audio), or server-sent audio events for stream_format sse. X-Izwi-Speech-Id names the request for GET /v1/audio/speech/{speech_id}."
+            "description": "Encoded audio (Content-Type per response_format; a chunked body for stream_format audio), or server-sent audio events for stream_format sse. X-Izwi-Speech-Id names the request for GET /v1/audio/speech/{speech_id}; X-Izwi-Service-Tier names the tier that served it."
           },
           "400": {
             "content": {
@@ -3021,7 +3056,7 @@
     },
     "/v1/audio/speech/batch": {
       "post": {
-        "description": "Up to IZWI_TTS_BATCH_MAX_ITEMS speech requests: top-level fields are defaults each of `items` overrides. Returns `{id, object, results[], total, succeeded, failed}`; each result carries base64 `audio_data` or an OpenAI `error` object, and an `id` for `GET /v1/audio/speech/{speech_id}`.",
+        "description": "Up to IZWI_TTS_BATCH_MAX_ITEMS speech requests: top-level fields are defaults each of `items` overrides. Returns `{id, object, results[], total, succeeded, failed}`; each result carries base64 `audio_data` or an OpenAI `error` object, and an `id` for `GET /v1/audio/speech/{speech_id}`. A top-level `service_tier` (or the X-Izwi-Service-Tier header) applies to every item: `flex` runs them as batch work. The response names the tier served in X-Izwi-Service-Tier, and in `service_tier` when the request named one.",
         "responses": {
           "200": {
             "description": "OK"
@@ -3110,7 +3145,7 @@
                 }
               }
             },
-            "description": "Transcription result as JSON, verbose JSON, text, SRT, VTT, or server-sent events"
+            "description": "Transcription result as JSON, verbose JSON, text, SRT, VTT, or server-sent events. X-Izwi-Service-Tier names the tier that served it."
           },
           "400": {
             "content": {
@@ -3141,7 +3176,7 @@
     },
     "/v1/audio/translations": {
       "post": {
-        "description": "OpenAI's translation route: multipart `file`, `model` (a model that translates speech: Granite Speech 5.0, Nemotron 3.5 Transcribe), `prompt`, `response_format` (json, text, srt, verbose_json, vtt), `temperature`. The target is English unless `to_language` / `target_language` names another; `language` hints the source; `stream` gives `transcript.text.*` events.",
+        "description": "OpenAI's translation route: multipart `file`, `model` (a model that translates speech: Granite Speech 5.0, Nemotron 3.5 Transcribe), `prompt`, `response_format` (json, text, srt, verbose_json, vtt), `temperature`. The target is English unless `to_language` / `target_language` names another; `language` hints the source; `stream` gives `transcript.text.*` events. `service_tier` (or the X-Izwi-Service-Tier header) works as on transcriptions.",
         "responses": {
           "200": {
             "description": "OK"

@@ -1199,7 +1199,8 @@ fn add_speech_api_paths(paths: &mut Map<String, Value>) {
          Granite Speech 5.0, Nemotron 3.5 Transcribe), `prompt`, `response_format` (json, text, \
          srt, verbose_json, vtt), `temperature`. The target is English unless `to_language` / \
          `target_language` names another; `language` hints the source; `stream` gives \
-         `transcript.text.*` events.",
+         `transcript.text.*` events. `service_tier` (or the X-Izwi-Service-Tier header) works \
+         as on transcriptions.",
         preview_response(),
     );
     add_operation(
@@ -1211,7 +1212,10 @@ fn add_speech_api_paths(paths: &mut Map<String, Value>) {
         "Up to IZWI_TTS_BATCH_MAX_ITEMS speech requests: top-level fields are defaults each of \
          `items` overrides. Returns `{id, object, results[], total, succeeded, failed}`; each \
          result carries base64 `audio_data` or an OpenAI `error` object, and an `id` for \
-         `GET /v1/audio/speech/{speech_id}`.",
+         `GET /v1/audio/speech/{speech_id}`. A top-level `service_tier` (or the \
+         X-Izwi-Service-Tier header) applies to every item: `flex` runs them as batch work. The \
+         response names the tier served in X-Izwi-Service-Tier, and in `service_tier` when the \
+         request named one.",
         preview_response(),
     );
     add_operation(
@@ -2002,7 +2006,7 @@ fn create_chat_completion() {}
     summary = "Create speech",
     request_body = SpeechRequest,
     responses(
-        (status = 200, description = "Encoded audio (Content-Type per response_format; a chunked body for stream_format audio), or server-sent audio events for stream_format sse. X-Izwi-Speech-Id names the request for GET /v1/audio/speech/{speech_id}."),
+        (status = 200, description = "Encoded audio (Content-Type per response_format; a chunked body for stream_format audio), or server-sent audio events for stream_format sse. X-Izwi-Speech-Id names the request for GET /v1/audio/speech/{speech_id}; X-Izwi-Service-Tier names the tier that served it."),
         (status = 400, description = "Invalid request", body = ApiErrorEnvelope),
         (status = 500, description = "Server error", body = ApiErrorEnvelope)
     )
@@ -2023,7 +2027,7 @@ fn create_speech() {}
         )
     ),
     responses(
-        (status = 200, description = "Transcription result as JSON, verbose JSON, text, SRT, VTT, or server-sent events", body = TranscriptionResponse),
+        (status = 200, description = "Transcription result as JSON, verbose JSON, text, SRT, VTT, or server-sent events. X-Izwi-Service-Tier names the tier that served it.", body = TranscriptionResponse),
         (status = 400, description = "Invalid request", body = ApiErrorEnvelope),
         (status = 500, description = "Server error", body = ApiErrorEnvelope)
     )
@@ -2453,6 +2457,12 @@ pub struct SpeechRequest {
     /// joined by newlines; replaces `input` (giving both is a 400). Models
     /// with `supports_speaker_dialogue` only.
     pub script: Option<Vec<crate::api::speech_dialogue::SpeechScriptLine>>,
+    /// Izwi extension of OpenAI's field: `flex` runs the request as batch
+    /// work behind interactive and streaming requests; `default`, `auto` or
+    /// absent keeps the route's own class; `priority` is served as
+    /// `default`. The `X-Izwi-Service-Tier` request header is read when the
+    /// body names none.
+    pub service_tier: Option<String>,
     /// Model-specific sampling and controls (`top_p`, `seed`, `cfg_weight`,
     /// `exaggeration`, `min_p`, ...); a control the model does not take is
     /// refused.
@@ -2505,6 +2515,12 @@ pub struct TranscriptionMultipartRequest {
     pub max_tokens: Option<usize>,
     pub temperature: Option<f32>,
     pub timestamp_granularities: Option<Vec<String>>,
+    /// Izwi extension of OpenAI's field: `flex` runs the request as batch
+    /// work behind interactive and streaming requests; `default`, `auto` or
+    /// absent keeps the route's own class; `priority` is served as
+    /// `default`. The `X-Izwi-Service-Tier` request header is read when the
+    /// body names none.
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2533,11 +2549,20 @@ pub struct TranscriptionJsonRequest {
     pub max_tokens: Option<usize>,
     pub temperature: Option<f32>,
     pub timestamp_granularities: Option<Vec<String>>,
+    /// Izwi extension of OpenAI's field: `flex` runs the request as batch
+    /// work behind interactive and streaming requests; `default`, `auto` or
+    /// absent keeps the route's own class; `priority` is served as
+    /// `default`. The `X-Izwi-Service-Tier` request header is read when the
+    /// body names none.
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TranscriptionResponse {
     pub text: String,
+    /// The tier that served the request (`flex` or `default`), when the
+    /// request named one.
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2556,6 +2581,9 @@ pub struct VerboseTranscriptionResponse {
     /// `alignment_source` (model, heuristic or failed), `alignment_warnings`
     /// for windows timed by interval fallback, or `alignment_error`.
     pub izwi_asr_diagnostics: Option<serde_json::Value>,
+    /// The tier that served the request (`flex` or `default`), when the
+    /// request named one.
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

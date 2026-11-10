@@ -8,6 +8,7 @@ pub(crate) mod model_aliases;
 pub mod models;
 pub mod realtime;
 pub mod responses;
+pub(crate) mod service_tier;
 pub(crate) use izwi_gateway::api::openai::tool_calls;
 pub(crate) use izwi_gateway::api::openai::tool_response;
 

@@ -428,14 +428,19 @@ async fn fish_drama3_speaks_through_openai_speech() {
     let response = speech(&server, body(text, seed)).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["X-Audio-Sample-Rate"], "44100");
+    assert_eq!(response.headers()["X-Izwi-Service-Tier"], "default");
     let (rate, wav) = wav_samples(&bytes(response).await);
     assert_eq!(rate, SAMPLE_RATE);
     assert_eq!(wav.len() % STUB_SAMPLES_PER_FRAME, 0);
     assert_eq!(wav, pcm_i16(&expected));
-    // 16-bit and 32-bit PCM carry the same samples.
+    // 16-bit and 32-bit PCM carry the same samples; a flex request is the
+    // same audio, served as batch work.
     let mut pcm = body(text, seed);
     pcm["response_format"] = json!("pcm_i16");
-    let raw = bytes(speech(&server, pcm).await).await;
+    pcm["service_tier"] = json!("flex");
+    let response = speech(&server, pcm).await;
+    assert_eq!(response.headers()["X-Izwi-Service-Tier"], "flex");
+    let raw = bytes(response).await;
     assert_eq!(raw.len(), expected.len() * 2);
     let mut f32_pcm = body(text, seed);
     f32_pcm["response_format"] = json!("pcm_f32");
@@ -486,9 +491,11 @@ async fn fish_drama3_speaks_through_openai_speech() {
     let mut streamed = body(text, seed);
     streamed["stream"] = json!(true);
     streamed["response_format"] = json!("pcm_i16");
+    streamed["service_tier"] = json!("flex");
     let response = speech(&server, streamed).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["X-Izwi-Streaming-Mode"], "chunked");
+    assert_eq!(response.headers()["X-Izwi-Service-Tier"], "flex");
     let events = sse_events(&bytes(response).await);
     let mut stream_pcm = Vec::new();
     for event in events.iter().filter(|e| e["event"] == "audio.chunk") {
@@ -516,6 +523,30 @@ async fn fish_drama3_speaks_through_openai_speech() {
     assert_eq!(done["timing"]["token_unit"], "semantic_frames");
     assert_eq!(done["timing"]["planned_segment_count"], 1);
     assert_eq!(done["stop_reason"], "stop");
+    assert_eq!(done["service_tier"], "flex");
+
+    // A batch: the tier is the batch's, reported when the request names it.
+    for (tier, served) in [
+        (Some("flex"), "flex"),
+        (Some("priority"), "default"),
+        (None, "default"),
+    ] {
+        let mut batch = body(text, seed);
+        batch.as_object_mut().unwrap().remove("input");
+        batch["items"] = json!([{ "input": text }]);
+        if let Some(tier) = tier {
+            batch["service_tier"] = json!(tier);
+        }
+        let response = send(&server, Method::POST, "/v1/audio/speech/batch", Some(batch)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["X-Izwi-Service-Tier"], served);
+        let batch: Value = serde_json::from_slice(&bytes(response).await).unwrap();
+        assert_eq!(batch["succeeded"], 1, "{batch}");
+        match tier {
+            Some(_) => assert_eq!(batch["service_tier"], served),
+            None => assert!(batch.get("service_tier").is_none()),
+        }
+    }
 
     // Long text: at least three chunks of the family's chunker, each
     // carrying its history, spoken one after another with no gap.

@@ -346,6 +346,38 @@ Multimodal content parts:
 
 Image and video inputs are validated against the selected model. Text-only chat models reject media parts.
 
+### Audio Service Tier
+
+`POST /v1/audio/speech`, `/v1/audio/speech/batch`, `/v1/audio/transcriptions`
+and `/v1/audio/translations` take OpenAI's `service_tier`. OpenAI defines the
+field for Chat Completions and Responses; on the audio routes it is an Izwi
+extension with the same values:
+
+| `service_tier` | Served as | Effect |
+|----------------|-----------|--------|
+| `flex` | `flex` | The request runs as batch work: it is admitted and scheduled behind interactive and streaming requests. Use it for recordings and bulk synthesis that need not answer at once. `stream` and `stream_format` still work. |
+| `default`, `auto`, or absent | `default` | The route's own class: interactive for a whole-file answer, streaming for SSE and chunked audio. |
+| `priority` | `default` | Accepted for compatibility and served as `default`. |
+
+Any other value returns `400` with `param: "service_tier"`.
+
+Send it as the `service_tier` field of a JSON body or multipart form. A
+client that cannot add a form field sends the `X-Izwi-Service-Tier` request
+header instead; when both are present the body field wins.
+
+Every response names the tier that served it in the `X-Izwi-Service-Tier`
+response header, binary audio, text, SRT and VTT included. When the request
+named a tier, JSON bodies and the final SSE event (`transcript.text.done`,
+`audio.done`) also carry `"service_tier": "flex"` or `"default"`; a request
+that names none gets the bodies it always has.
+
+```bash
+curl -X POST http://localhost:8080/v1/audio/transcriptions \
+  -F "file=@recording.wav" \
+  -F "model=Parakeet-TDT-0.6B-v3" \
+  -F "service_tier=flex"
+```
+
 ### Audio Speech
 
 `POST /v1/audio/speech`
@@ -386,6 +418,7 @@ Request fields:
 | `saved_voice_id` | Server-side saved voice reference to reuse. |
 | `references` | Izwi extension, for models that voice several speakers (`speech_capabilities.supports_speaker_dialogue`: `FishAudio-Drama-3`). Reference voices per speaker, each `{speaker, audio, text}` or `{speaker, saved_voice_id}`; it replaces `reference_audio`, `reference_text` and `saved_voice_id`. See the Drama 3 dialogue notes below. |
 | `script` | Izwi extension, for the same models. A dialogue as `[{speaker, text}]` lines, instead of `input`. |
+| `service_tier` | Optional `flex`, `default`, `auto` or `priority`; see [Audio Service Tier](#audio-service-tier). |
 | `stream`, `stream_format` | `stream_format: "audio"` sends the encoded file as a chunked body while it is generated (OpenAI's streaming). `stream_format: "sse"` or `stream: true` sends server-sent events whose deltas are base64 slices of the same bytes. Without either, the whole file arrives after generation, with `Content-Length` and statistics headers. Text one request cannot speak streams as consecutive long-form segments, as a final-only request splits it. |
 
 `exaggeration`, `cfg_weight` and `min_p` are also accepted by the speech
@@ -657,6 +690,7 @@ Non-stream response:
 - `Content-Type` is the format's: `audio/mpeg`, `audio/ogg` (Opus), `audio/flac`, `audio/wav`, `audio/pcm` (`pcm`), `application/octet-stream` (`pcm_i16`, `pcm_f32`).
 - `X-Audio-Sample-Rate` is the rate the audio plays at; `X-Izwi-Speech-Id` names the request for `GET /v1/audio/speech/{speech_id}`.
 - `X-Requested-Response-Format` and `X-Actual-Response-Format` are exposed. Explicit fallbacks also include `X-Response-Format-Fallback` and an HTTP `Warning` header.
+- `X-Izwi-Service-Tier` is the tier that served the request (see [Audio Service Tier](#audio-service-tier)), in every delivery.
 
 `stream_format: "audio"` response: the same bytes as a chunked body. Headers
 (`Content-Type`, `X-Audio-Sample-Rate`, `X-Izwi-Speech-Id` and its alias
@@ -672,7 +706,7 @@ SSE events (each is also an OpenAI event, by its `type`):
 |-------|--------|--------|
 | `audio.started` | | `request_id`, `sample_rate` (output), `audio_format`, optional explicit fallback note in `error`. |
 | `audio.chunk` | `speech.audio.delta` | `audio` and `audio_base64` (base64 of the next encoded bytes: concatenated, the deltas are one file), `request_id`, `sequence`, `sample_count`, `is_final`, `sample_rate`. |
-| `audio.done` | `speech.audio.done` | `usage` (`input_tokens`, which Izwi reports as 0; `output_tokens`; `total_tokens`), `tokens_generated`, `generation_time_ms`, `audio_duration_secs`, `rtf`, `stop_reason`, `timing`. |
+| `audio.done` | `speech.audio.done` | `usage` (`input_tokens`, which Izwi reports as 0; `output_tokens`; `total_tokens`), `tokens_generated`, `generation_time_ms`, `audio_duration_secs`, `rtf`, `stop_reason`, `timing`, and `service_tier` when the request named one. |
 | `audio.failed` | `error` | `request_id`, `error`. |
 
 Example SSE request:
@@ -729,7 +763,10 @@ object, with `param` prefixed `items.<i>.`:
 
 Items run `IZWI_TTS_BATCH_CONCURRENCY` (8) at a time, each admitted on its
 own. An empty `items`, too many items, or `stream`/`stream_format` anywhere
-fails the whole request with `400`. Items whose audio would pass
+fails the whole request with `400`. `service_tier` (see
+[Audio Service Tier](#audio-service-tier)) is a top-level field that applies
+to every item; inside an item it returns `400`. The response carries
+`service_tier` when the request named one. Items whose audio would pass
 `IZWI_TTS_BATCH_MAX_OUTPUT_MB` (256) fail with `413`-class errors.
 
 ### Audio Speech Stream
@@ -838,6 +875,7 @@ Multipart fields:
 | `speaker_labels` | Izwi extension. `true` asks a model that tags speakers (`Nemotron-3.5-Transcribe-30B-A4B-FP8`) to label them; others return `400`. Multipart takes `true`/`false` (or `1`/`0`, `yes`/`no`, `on`/`off`), JSON a boolean. The speaker turns come back in `verbose_json` as `speaker_turns` (below); `text` stays untagged. It cannot be combined with `target_language`, and naming a language the model does not label speakers in returns `400`. |
 | `response_format` | `json`, `verbose_json`, `text`, `srt`, or `vtt`. Default `json`. |
 | `stream` | `true`, `1`, `yes`, or `on` enables SSE. |
+| `service_tier` | Optional `flex`, `default`, `auto` or `priority`; see [Audio Service Tier](#audio-service-tier). `json` and `verbose_json` answers and the `transcript.text.done` event carry the tier served when it is set. |
 | `timestamp_granularities[]` | Optional `word`, `segment`, or both. Requires `response_format=verbose_json`; model-provided timestamps are used before forced alignment fallback (Parakeet reports word times from its TDT decoder; `Granite-Speech-4.1-2B-Plus` runs its native timestamp mode; `Nemotron-3.5-Transcribe-30B-A4B-FP8` times words with its own CTC head; base Granite text is timed by the aligner). Without it, `verbose_json` returns `segments` only, as OpenAI does. |
 | `aligner_model` | Optional forced-aligner model for timestamp generation. Defaults to `Qwen3-ForcedAligner-0.6B`. |
 | `prompt` | Optional ASR prompt/context. Granite Speech uses it only when it is a Granite instruction (it starts with `<|audio|>`, `transcribe the speech`, `can you transcribe`, `translate the speech`, `Speaker attribution:` or `Timestamps:`; 5.0 also takes `The speech is in`) or `keywords: a, b` for keyword biasing; other text is ignored and reported as `prompt_ignored` in the diagnostics. LFM3 Audio ignores it. For `Nemotron-3.5-Transcribe-30B-A4B-FP8` it replaces the model's instruction entirely (tags removed, at most 4,000 characters), so combining it with `target_language`, `keywords` or `speaker_labels` returns `400`. |
@@ -918,7 +956,7 @@ SSE events:
 | Type | Fields |
 |------|--------|
 | `transcript.text.delta` | `delta` |
-| `transcript.text.done` | `text`, `language`, `audio_duration_secs` |
+| `transcript.text.done` | `text`, `language`, `audio_duration_secs`, and `service_tier` when the request named one |
 | `error` | `error.message` |
 
 Example multipart request:
@@ -948,6 +986,8 @@ Multipart (or JSON with `audio_base64`):
 - `to_language` or `target_language`: the target. English unless set; a
   model that translates out of English takes others.
 - `stream`: `transcript.text.delta` and `transcript.text.done` events.
+- `service_tier`: as on transcriptions (see
+  [Audio Service Tier](#audio-service-tier)).
 
 `verbose_json` carries `"task": "translate"`. Translations have no word
 timestamps.

@@ -11,7 +11,8 @@
 //!    "total": 2, "succeeded": 1, "failed": 1}
 //! ```
 //!
-//! Top-level speech fields are defaults each item overrides. Items run
+//! Top-level speech fields are defaults each item overrides; `service_tier`
+//! (or the `X-Izwi-Service-Tier` header) is the batch's alone. Items run
 //! concurrently up to `IZWI_TTS_BATCH_CONCURRENCY`, each with its own
 //! admission permit, so the engine batches items of one model and one batch
 //! cannot hold every slot; results keep the items' order. Every item gets a
@@ -21,6 +22,8 @@
 use axum::{
     body::to_bytes,
     extract::{Extension, State},
+    http::HeaderMap,
+    response::{IntoResponse, Response},
     Json,
 };
 use base64::Engine;
@@ -29,6 +32,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use super::speech::{prepare_speech, run_prepared_speech, SpeechRequest};
+use crate::api::openai::service_tier::{ServiceTier, SERVICE_TIER_HEADER};
 use crate::api::request_context::RequestContext;
 use crate::error::{ApiError, ApiJson};
 use crate::speech_outcomes::SpeechMode;
@@ -42,6 +46,8 @@ pub struct SpeechBatchResponse {
     total: usize,
     succeeded: usize,
     failed: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,10 +122,12 @@ fn reject_streaming(fields: &Map<String, Value>, at: &str) -> Result<(), ApiErro
 pub async fn speech_batch(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
+    headers: HeaderMap,
     ApiJson(body): ApiJson<Map<String, Value>>,
-) -> Result<Json<SpeechBatchResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let tuning = &crate::env_config::tuning().speech_api;
     let mut defaults = body;
+    let service_tier = batch_service_tier(&mut defaults, &headers)?;
     let items = match defaults.remove("items") {
         Some(Value::Array(items)) => items,
         Some(_) => return Err(ApiError::invalid_param("items", "`items` must be an array")),
@@ -150,6 +158,11 @@ pub async fn speech_batch(
             )));
         };
         reject_streaming(&item, &format!("items.{index}."))?;
+        if item.contains_key("service_tier") {
+            return Err(ApiError::bad_request(format!(
+                "`items.{index}.service_tier` is not allowed; `service_tier` applies to the whole batch"
+            )));
+        }
         let mut fields = defaults.clone();
         fields.extend(item);
         merged.push(fields);
@@ -168,6 +181,7 @@ pub async fn speech_batch(
                 format!("{}-{index}", ctx.correlation_id),
                 index,
                 fields,
+                service_tier,
             )
         })
         .collect();
@@ -199,14 +213,37 @@ pub async fn speech_batch(
         .iter()
         .filter(|result| result.status == "success")
         .count();
-    Ok(Json(SpeechBatchResponse {
+    let mut response = Json(SpeechBatchResponse {
         id: format!("speech_batch_{}", uuid::Uuid::new_v4()),
         object: "audio.speech.batch",
         total,
         succeeded,
         failed: total - succeeded,
         results: out,
-    }))
+        service_tier: service_tier.reported(),
+    })
+    .into_response();
+    service_tier.stamp(&mut response);
+    Ok(response)
+}
+
+/// The tier of a batch: its top-level `service_tier` (taken out of the
+/// item defaults) or the request header.
+fn batch_service_tier(
+    defaults: &mut Map<String, Value>,
+    headers: &HeaderMap,
+) -> Result<ServiceTier, ApiError> {
+    let field = match defaults.remove("service_tier") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(tier)) => Some(tier),
+        Some(_) => {
+            return Err(ApiError::invalid_param(
+                "service_tier",
+                "`service_tier` must be a string",
+            ))
+        }
+    };
+    ServiceTier::parse(field.as_deref(), headers.get(SERVICE_TIER_HEADER))
 }
 
 async fn run_item(
@@ -215,6 +252,7 @@ async fn run_item(
     correlation_id: String,
     index: usize,
     fields: Map<String, Value>,
+    service_tier: ServiceTier,
 ) -> SpeechBatchResult {
     let req: SpeechRequest = match serde_json::from_value(Value::Object(fields)) {
         Ok(req) => req,
@@ -232,6 +270,7 @@ async fn run_item(
         correlation_id,
         req,
         Some(SpeechMode::BatchItem),
+        service_tier,
     )
     .await
     {
@@ -310,6 +349,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.message.contains("items.2.stream_format"));
+    }
+
+    #[test]
+    fn the_batch_tier_is_its_top_level_field_or_the_header() {
+        let fields = |value: Value| match value {
+            Value::Object(map) => map,
+            _ => unreachable!(),
+        };
+        let mut headers = HeaderMap::new();
+        let mut defaults = fields(serde_json::json!({"model": "m", "service_tier": "flex"}));
+        let tier = batch_service_tier(&mut defaults, &headers).unwrap();
+        assert_eq!(tier.reported(), Some("flex"));
+        // The tier is the batch's, not an item default.
+        assert!(!defaults.contains_key("service_tier"));
+
+        headers.insert(SERVICE_TIER_HEADER, "priority".parse().unwrap());
+        let tier = batch_service_tier(&mut fields(serde_json::json!({})), &headers).unwrap();
+        assert_eq!(tier.reported(), Some("default"));
+
+        for bad in [
+            serde_json::json!({"service_tier": "fastest"}),
+            serde_json::json!({"service_tier": 1}),
+        ] {
+            let error = batch_service_tier(&mut fields(bad), &HeaderMap::new()).unwrap_err();
+            assert_eq!(
+                error.detail.and_then(|detail| detail.param),
+                Some("service_tier")
+            );
+        }
     }
 
     #[test]
