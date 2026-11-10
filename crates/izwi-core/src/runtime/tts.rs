@@ -295,6 +295,68 @@ impl DirectTtsObservationContext {
     }
 }
 
+/// One speech request's labels, clock and audio total for the speech metrics
+/// (`izwi_tts_first_audio_seconds`, `izwi_tts_output_audio_seconds_total`).
+pub(crate) struct TtsRequestMetrics<'a> {
+    runtime: &'a RuntimeService,
+    /// Model, backend and workload class.
+    labels: [&'static str; 3],
+    admission_ms: f64,
+    started: Instant,
+    audio_secs: f64,
+    first_audio_recorded: bool,
+}
+
+impl<'a> TtsRequestMetrics<'a> {
+    fn new(
+        runtime: &'a RuntimeService,
+        request: &GenerationRequest,
+        model_variant: ModelVariant,
+    ) -> Self {
+        Self {
+            runtime,
+            labels: [
+                model_variant.dir_name(),
+                runtime.backend_router.default_backend().kind().as_str(),
+                request.runtime_context.workload_class.as_str(),
+            ],
+            admission_ms: request.runtime_context.admission_ms.unwrap_or(0.0),
+            started: Instant::now(),
+            audio_secs: 0.0,
+            first_audio_recorded: false,
+        }
+    }
+
+    /// Audio about to be handed to the stream's transport. The first of it
+    /// is the request's first audio, timed from server admission.
+    pub(crate) fn streamed(&mut self, samples: usize, sample_rate: u32) {
+        if samples == 0 {
+            return;
+        }
+        if !self.first_audio_recorded {
+            self.first_audio_recorded = true;
+            self.runtime.record_tts_first_audio(
+                &self.labels,
+                self.admission_ms / 1000.0 + self.started.elapsed().as_secs_f64(),
+            );
+        }
+        self.buffered(samples, sample_rate);
+    }
+
+    /// Audio returned whole, with no first-audio time of its own.
+    fn buffered(&mut self, samples: usize, sample_rate: u32) {
+        if sample_rate > 0 {
+            self.audio_secs += samples as f64 / f64::from(sample_rate);
+        }
+    }
+
+    /// Counts the audio of a request that completed.
+    fn complete(self) {
+        self.runtime
+            .record_tts_output_audio(&self.labels, self.audio_secs);
+    }
+}
+
 /// Kokoro streams its planned chunks natively on the direct route; every
 /// other TTS request, streaming or not, runs on the engine.
 fn uses_direct_streaming_tts_runtime(variant: ModelVariant) -> bool {
@@ -577,6 +639,7 @@ impl RuntimeService {
     pub async fn generate(&self, request: GenerationRequest) -> Result<GenerationResult> {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
         let request = normalize_speech_text(request, resolved_variant);
+        let mut metrics = TtsRequestMetrics::new(self, &request, resolved_variant);
         let core_params = core_params_from_generation(&request.config);
         let core_request = TtsRuntimeRequest::from_generation(request, resolved_variant)?
             .into_engine_request(core_params);
@@ -590,6 +653,8 @@ impl RuntimeService {
         let samples = output.audio.samples;
         let sample_rate = output.audio.sample_rate;
         ensure_speech_audio(resolved_variant, &output.request_id, &samples, sample_rate)?;
+        metrics.buffered(samples.len(), sample_rate);
+        metrics.complete();
         let total_tokens = output.num_tokens;
         let total_time_ms = output.generation_time.as_secs_f32() * 1000.0;
 
@@ -626,6 +691,7 @@ impl RuntimeService {
     ) -> Result<()> {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
         let request = normalize_speech_text(request, resolved_variant);
+        let mut metrics = TtsRequestMetrics::new(self, &request, resolved_variant);
         if uses_direct_streaming_tts_runtime(resolved_variant) {
             let observation = DirectTtsObservationContext::new(&request, resolved_variant, true);
             let retained_input_bytes = direct_tts_retained_input_bytes(&request)?;
@@ -650,12 +716,15 @@ impl RuntimeService {
                 .await?;
             let result = match resolved_variant.family() {
                 ModelFamily::KokoroTts => {
-                    self.kokoro_tts_generate_streaming(&job, request, chunk_tx)
+                    self.kokoro_tts_generate_streaming(&job, request, chunk_tx, &mut metrics)
                         .await
                 }
                 _ => unreachable!("direct TTS family checked above"),
             };
             self.record_direct_tts_observation(observation, result.as_ref().map(|_| None));
+            if result.is_ok() {
+                metrics.complete();
+            }
             return result;
         }
         let core_params = core_params_from_generation(&request.config);
@@ -681,6 +750,7 @@ impl RuntimeService {
                 let sequence = next_sequence;
                 if !stream_chunk.samples.is_empty() {
                     next_sequence += 1;
+                    metrics.streamed(stream_chunk.samples.len(), stream_chunk.sample_rate);
                 }
                 async move {
                     if stream_chunk.samples.is_empty() {
@@ -701,6 +771,7 @@ impl RuntimeService {
             .await?;
 
         if let Some(samples) = unstreamed_terminal_pcm(&mut output.audio, next_sequence) {
+            metrics.streamed(samples.len(), output.audio.sample_rate);
             let chunk = AudioChunk::new(output.request_id.clone(), next_sequence, samples)
                 .with_sample_rate(output.audio.sample_rate);
             next_sequence += 1;
@@ -734,6 +805,7 @@ impl RuntimeService {
             .and_then(crate::engine::TtsGeneratedCodesSink::take)
             .map(std::sync::Arc::new);
         send_terminal_tts_chunk(&chunk_tx, terminal, terminal_deadline).await?;
+        metrics.complete();
         info!("Streaming generation complete via core engine");
         Ok(())
     }
@@ -1330,6 +1402,62 @@ mod tests {
             ),
             Err(Error::InvalidInput(message)) if message.contains("reference_text") && message.contains("32-character")
         ));
+    }
+
+    #[tokio::test]
+    async fn request_metrics_time_first_audio_once_and_count_completed_audio() {
+        use crate::runtime::types::RuntimeRequestContext;
+
+        let runtime = RuntimeService::new(crate::EngineConfig::default()).expect("runtime");
+        let variant = ModelVariant::Kokoro82M;
+        let mut request = GenerationRequest::new("speak");
+        request.runtime_context =
+            RuntimeRequestContext::new(WorkloadClass::Realtime).with_admission_ms(250.0);
+
+        // A stream: two chunks of one second, one first-audio observation.
+        let mut stream = TtsRequestMetrics::new(&runtime, &request, variant);
+        stream.streamed(0, 24_000);
+        stream.streamed(24_000, 24_000);
+        stream.streamed(24_000, 24_000);
+        stream.complete();
+        // A buffered request: counted, with no first audio of its own.
+        request.runtime_context = RuntimeRequestContext::new(WorkloadClass::Batch);
+        let mut buffered = TtsRequestMetrics::new(&runtime, &request, variant);
+        buffered.buffered(12_000, 24_000);
+        buffered.complete();
+        // A stream that never completes counts no audio.
+        let mut failed = TtsRequestMetrics::new(&runtime, &request, variant);
+        failed.streamed(24_000, 24_000);
+
+        let payload = runtime.telemetry_prometheus().await;
+        let series = |family: &str, workload_class: &str| {
+            payload
+                .lines()
+                .find(|line| {
+                    line.starts_with(&format!("{family}{{model=\"{}\"", variant.dir_name()))
+                        && line.contains(&format!("workload_class=\"{workload_class}\""))
+                        && !line.contains("le=")
+                })
+                .and_then(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
+        };
+        assert_eq!(
+            series("izwi_tts_output_audio_seconds_total", "realtime"),
+            Some(2.0)
+        );
+        assert_eq!(
+            series("izwi_tts_output_audio_seconds_total", "batch"),
+            Some(0.5)
+        );
+        assert_eq!(
+            series("izwi_tts_first_audio_seconds_count", "realtime"),
+            Some(1.0)
+        );
+        assert_eq!(
+            series("izwi_tts_first_audio_seconds_count", "batch"),
+            Some(1.0)
+        );
+        // Server admission (250 ms) precedes the runtime's own clock.
+        assert!(series("izwi_tts_first_audio_seconds_sum", "realtime").unwrap() >= 0.25);
     }
 
     #[tokio::test]

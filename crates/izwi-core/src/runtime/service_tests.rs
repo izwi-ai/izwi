@@ -1931,6 +1931,7 @@ async fn runtime_prometheus_includes_engine_metric_values() {
         "izwi_request_duration_seconds",
         "izwi_request_ttft_seconds",
         "izwi_request_queue_wait_seconds",
+        "izwi_tts_first_audio_seconds",
     ] {
         assert!(
             payload.contains(&format!("# TYPE {family} histogram")),

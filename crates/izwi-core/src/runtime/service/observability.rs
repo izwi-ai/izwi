@@ -966,6 +966,14 @@ izwi_inference_coordinator_poisoned {}\n",
         self.telemetry.record_voice_latency(latency, elapsed);
     }
 
+    pub(crate) fn record_tts_first_audio(&self, labels: &[&str; 3], seconds: f64) {
+        self.telemetry.record_tts_first_audio(labels, seconds);
+    }
+
+    pub(crate) fn record_tts_output_audio(&self, labels: &[&str; 3], seconds: f64) {
+        self.telemetry.record_tts_output_audio(labels, seconds);
+    }
+
     pub fn record_voice_egress_underrun(&self) {
         self.telemetry.record_voice_egress_underrun();
     }

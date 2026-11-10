@@ -1611,9 +1611,11 @@ tenant IDs are used.
 
 | Metric | Labels | Meaning |
 |---|---|---|
-| `izwi_request_duration_seconds` | `model`, `backend`, `task`, `outcome` | Server admission to the terminal output. |
-| `izwi_request_ttft_seconds` | `model`, `backend`, `task` | Server admission to the first user-visible output. |
-| `izwi_request_queue_wait_seconds` | `model`, `backend`, `task` | Server admission until the engine first schedules the request, including the runtime coordinator, input preparation and model residency. |
+| `izwi_request_duration_seconds` | `model`, `backend`, `task`, `workload_class`, `outcome` | Server admission to the terminal output. |
+| `izwi_request_ttft_seconds` | `model`, `backend`, `task`, `workload_class` | Server admission to the first user-visible output: the first text delta of a chat or transcription request (`task="asr"` covers streamed `/v1/audio/transcriptions` and each `/v1/realtime` transcription turn), the first generated frame or audio of a speech request. A model that returns its transcript whole reports the transcript's time. |
+| `izwi_request_queue_wait_seconds` | `model`, `backend`, `task`, `workload_class` | Server admission until the engine first schedules the request, including the runtime coordinator, input preparation and model residency. |
+| `izwi_tts_first_audio_seconds` | `model`, `backend`, `workload_class` | Server admission until a streamed speech request hands its first audio to the transport. Recorded on every streaming speech route (SSE and chunked `/v1/audio/speech`, `/v1/audio/speech/stream`, `/v1/realtime` and realtime voice), once per segment of a long text. |
+| `izwi_tts_output_audio_seconds_total` | `model`, `backend`, `workload_class` | Counter of the seconds of audio completed speech requests produced, streamed or buffered. Its rate is the audio seconds the server speaks per second. |
 | `izwi_request_prefill_seconds` | `model`, `backend`, `task` | Engine prefill time of one request. |
 | `izwi_request_decode_seconds` | `model`, `backend`, `task` | Engine decode time of one request, after its prefill. |
 | `izwi_request_input_audio_seconds` | `model`, `backend`, `task` | Input audio length of completed transcription and audio-chat requests. `rate(_sum)` is the audio seconds the server transcribes per second (its RTFx under load). |
@@ -1632,6 +1634,9 @@ tenant IDs are used.
 | `izwi_voice_turn_first_audio_seconds` | none | Realtime voice: endpoint decision to the turn's first assistant audio. |
 | `izwi_voice_endpointing_latency_seconds`, `izwi_voice_asr_first_partial_seconds`, `izwi_voice_asr_final_seconds`, `izwi_voice_llm_first_token_seconds`, `izwi_voice_tts_first_audio_seconds`, `izwi_voice_barge_in_latency_seconds`, `izwi_voice_session_duration_seconds` | none | Realtime voice stage latencies; `izwi_voice_metric_contract_info` lists each with its description. |
 | `izwi_voice_audio_egress_underruns_total`, `izwi_voice_audio_ingress_dropped_frames_total` | none | Assistant audio sent after playback had drained; input frames missing from the client's sequence. |
+
+`workload_class` is the class the request was admitted under: `realtime`,
+`interactive`, `streaming`, `online`, `batch` or `background`.
 
 The windowed `quantile="avg"|"p50"|"p95"` gauges (`izwi_latency_*`,
 `izwi_runtime_stage_duration_ms`, `izwi_runtime_workload_*`) were removed in
