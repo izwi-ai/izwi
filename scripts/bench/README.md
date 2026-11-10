@@ -587,6 +587,76 @@ session first so model loads are not measured. It is standard-library Python
 (a minimal RFC 6455 client); its tests are `test-voice-realtime-load.py`, run
 in the hygiene lane.
 
+## Mixed real-time and batch load
+
+`run-mixed-load.py` measures what a batch load does to a real-time load on
+the same server. Every step holds the same real-time load for `--step-secs`
+(default 30) while a closed-loop batch load runs beside it at one level of
+`--batch-levels`. Level 0 is the real-time-only baseline and runs first.
+
+- Real-time side, `--realtime-streams` of them (default 8):
+  - `--realtime-kind asr`: `/v1/realtime?intent=transcription` sessions. Each
+    speaks `--audio` (24 kHz PCM16) in real time, lets the server's VAD end
+    the utterance, waits for the transcript and speaks again.
+  - `--realtime-kind tts`: streamed `/v1/audio/speech` requests
+    (`--tts-stream-format audio` or `sse`), each replaced when it ends.
+- Batch side: buffered `/v1/audio/transcriptions` (`--batch-kind asr`, clips
+  cut from `--batch-audio`) or buffered `/v1/audio/speech` (`--batch-kind
+  tts`). `--batch-kind` and `--batch-model` default to the real-time side's;
+  another `--batch-model` measures cross-model interference.
+  `--batch-service-tier` is sent as the `service_tier` field and the
+  `X-Izwi-Service-Tier` header.
+
+```bash
+# Same-model ASR: 8 live transcription sessions, batch transcriptions on top.
+python3 scripts/bench/run-mixed-load.py --out target/mixed-load/parakeet \
+    --realtime-kind asr --realtime-model Parakeet-TDT-0.6B-v3 \
+    --batch-levels 0,4,16,64 --batch-audio data/diarization.wav
+
+# Same-model TTS: 8 live speech streams, buffered speech on top.
+python3 scripts/bench/run-mixed-load.py --out target/mixed-load/kokoro \
+    --realtime-kind tts --realtime-model Kokoro-82M --batch-levels 0,4,16,64
+
+# Cross-model: live transcription beside a batch TTS load on another model.
+python3 scripts/bench/run-mixed-load.py --out target/mixed-load/parakeet-kokoro \
+    --realtime-kind asr --realtime-model Parakeet-TDT-0.6B-v3 \
+    --batch-kind tts --batch-model Kokoro-82M --batch-levels 0,4,16,64
+
+python3 scripts/bench/test-mixed-load.py
+```
+
+Each step is written to `<out>/step-<NN>-batch-c<level>.json` and the run to
+`<out>/summary.json`. A step holds:
+
+- `realtime`: for ASR, the first partial (from the first audio frame, and
+  from the server's `speech_stopped`) and the final transcript (from
+  `speech_stopped`, and from the end of the spoken audio); for TTS, first
+  byte, first audio (the WAV header plus 100 ms) and the gaps between audio
+  chunks. Each is a count, mean, p50, p95 and max.
+- `batch`: audio seconds per second and request latency.
+- on both sides, completed, failed and refused counts. A refusal is HTTP 429
+  or 503, or a WebSocket close 1013; the client pauses `--retry-delay` and
+  tries again.
+- `server_metrics`: deltas of the server's Prometheus metrics over the step.
+  These are request TTFT, queue wait and duration by `workload_class`, TTS
+  output audio seconds, engine batch rows (the decode width) and executor
+  width and defer counters. Series the server does not expose are listed
+  under `missing`; a server without the endpoint is recorded as unavailable.
+- `slo`: a verdict per check.
+
+The checks are ASR first partial p95 (`--slo-asr-first-partial-s`, 0.5), ASR
+final p95 (`--slo-asr-final-s`, 0.8), TTS first audio p95
+(`--slo-tts-first-audio-s`, 0.5), and the rise of each over the level-0 step
+(`--slo-degradation`, 0.25). `--partial-reference` and `--final-reference`
+choose which of the two ASR origins a check reads. `--enforce-slo` exits 4
+when a step fails a check; otherwise the verdicts are only recorded.
+
+One discarded request per side runs first so model loads are not measured
+(`--no-warmup` skips it). TTS requests take `run-tts-concurrency.py`'s inputs
+and per-model fields; `--tts-extra` adds fields for a model it does not know.
+The bearer token is `--api-key` or `$IZWI_BENCH_API_KEY`. It is
+standard-library Python; its tests run in the hygiene lane.
+
 ## Metal load footprints
 
 `measure-metal-load-footprints.sh` loads each model on Metal in its own process
