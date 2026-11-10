@@ -1,5 +1,6 @@
 //! Authenticated speech connection quotas. Permits follow response body lifetime,
-//! including streaming disconnects; request headers never supply tenant identity.
+//! including streaming disconnects, and a WebSocket's for as long as it is open;
+//! request headers never supply tenant identity.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -71,12 +72,20 @@ pub(super) fn acquire(
 pub(super) fn is_speech_generation(method: &axum::http::Method, path: &str) -> bool {
     (method == axum::http::Method::POST
         && (path.ends_with("/audio/speech")
+            || path.ends_with("/audio/speech/batch")
             || path.contains("/text-to-speech")
             || path.contains("/voice-clone")
             || path.contains("/voice-design")))
         || (method == axum::http::Method::GET
             && path.contains("/text-to-speech/")
             && path.ends_with("/events"))
+}
+
+/// The speech WebSockets: the text-in speech socket and OpenAI Realtime. A
+/// socket outlives its upgrade response, so its handler holds the permit.
+pub(super) fn is_speech_connection(method: &axum::http::Method, path: &str) -> bool {
+    method == axum::http::Method::GET
+        && (path.ends_with("/audio/speech/stream") || path.ends_with("/v1/realtime"))
 }
 
 pub(super) fn guard_response(
@@ -120,6 +129,7 @@ mod tests {
         use axum::http::Method;
         for path in [
             "/v1/audio/speech",
+            "/v1/audio/speech/batch",
             "/v1/text-to-speech",
             "/v1/voice-clones",
             "/v1/voice-designs",
@@ -127,6 +137,26 @@ mod tests {
             assert!(is_speech_generation(&Method::POST, path), "{path}");
         }
         assert!(!is_speech_generation(&Method::GET, "/v1/voice-designs"));
+    }
+
+    /// The speech sockets count against the quota for as long as they are
+    /// open; their lookups and secrets do not.
+    #[test]
+    fn speech_sockets_share_speech_admission() {
+        use axum::http::Method;
+        for path in ["/v1/audio/speech/stream", "/v1/realtime"] {
+            assert!(is_speech_connection(&Method::GET, path), "{path}");
+            assert!(!is_speech_generation(&Method::GET, path), "{path}");
+        }
+        for (method, path) in [
+            (Method::POST, "/v1/realtime/client_secrets"),
+            (Method::POST, "/v1/realtime"),
+            (Method::GET, "/v1/audio/speech/speech_1"),
+            (Method::GET, "/v1/voice/realtime"),
+        ] {
+            assert!(!is_speech_connection(&method, path), "{path}");
+            assert!(!is_speech_generation(&method, path), "{path}");
+        }
     }
 
     #[test]

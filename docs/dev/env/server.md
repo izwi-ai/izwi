@@ -36,6 +36,7 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_MAX_BATCH_REQUESTS` | the global request limit minus one | Concurrent batch-class requests. |
 | `IZWI_MAX_BACKGROUND_REQUESTS` | the global request limit minus one | Concurrent background-class requests. |
 | `IZWI_MAX_REALTIME_SESSIONS` | `32` | Open realtime websocket sessions. |
+| `IZWI_ADMISSION_QUEUE_TIMEOUT_SECS` | `30` | How long a chat, agent or /v1/audio request waits for an admission slot before it is refused with 429 (0 waits without limit). Realtime sessions, record and durable-job routes and background work always wait. |
 | `IZWI_OPENAI_MODEL_ALIASES` | unset | OpenAI model names mapped to Izwi models for /v1/audio/*: comma-separated `name=Model`, e.g. `tts-1=Kokoro-82M,whisper-1=Parakeet-TDT-0.6B-v3`. Unmapped OpenAI names are refused. |
 | `IZWI_SPEECH_DEFAULT_FORMAT` | `wav` | The /v1/audio/speech `response_format` when a request names none (`mp3` gives OpenAI's default). |
 | `IZWI_TTS_BATCH_MAX_ITEMS` | `32` | Items one /v1/audio/speech/batch request may hold. |
@@ -55,7 +56,7 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_OPENAI_COMPAT_PROFILE` | `strict` | OpenAI compatibility profile: `strict` or `relaxed`. |
 | `IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB` | 64 (relaxed) or the strict profile's limit | Largest audio upload on the OpenAI audio and media routes, in MiB. |
 | `IZWI_MEDIA_DECODE_LANES` | `2` | Audio uploads decoded at once. |
-| `IZWI_MAX_SPEECH_REQUESTS_PER_TENANT` | the global request limit | Concurrent speech requests per tenant (at most the global limit). |
+| `IZWI_MAX_SPEECH_REQUESTS_PER_TENANT` | the global request limit | Concurrent speech requests per tenant (at most the global limit): speech and batch requests until their response ends, and open /v1/audio/speech/stream and /v1/realtime sockets. |
 | `IZWI_TTS_MAX_TEXT_BYTES` | `1048576` | Longest speech input one request may carry, in UTF-8 bytes. |
 | `IZWI_TTS_LONG_FORM_CHUNK_MAX_CHARS` | the model's segment size | Characters per long-form speech segment (clamped to 80-4000). |
 | `IZWI_FISH_LONG_FORM_ENABLED` | `true` | Allow Fish S2 requests that need more than one segment. |

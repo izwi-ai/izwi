@@ -43,6 +43,22 @@ pub struct RequestContext {
     /// This process's span of the request's W3C trace: the parent of every
     /// worker call made for it.
     pub trace: TraceContext,
+    /// The speech quota slot of a speech WebSocket request
+    /// (`/v1/audio/speech/stream`, `/v1/realtime`). The handler keeps it for
+    /// as long as the socket is open; dropping it frees the slot.
+    pub speech_connection: Option<SpeechConnection>,
+}
+
+/// A slot of the speech quota held by an open speech WebSocket.
+#[derive(Clone)]
+pub struct SpeechConnection {
+    _permit: Arc<speech_admission::Permit>,
+}
+
+impl std::fmt::Debug for SpeechConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpeechConnection")
+    }
 }
 
 impl RequestContext {
@@ -53,6 +69,7 @@ impl RequestContext {
             received_at: Instant::now(),
             stream_outcome: StreamOutcome::default(),
             trace: TraceContext::new_root(),
+            speech_connection: None,
         }
     }
 
@@ -423,7 +440,7 @@ fn gateway_rejection_response(
 /// The local role's request context: enterprise authentication, policy
 /// and audit around every request, and the speech admission quota
 /// (`speech_capacity` requests at once, at most `speech_per_tenant` of them
-/// for one tenant) on speech-generating routes.
+/// for one tenant) on speech-generating routes and the speech WebSockets.
 pub async fn attach_enterprise_request_context_with_hooks(
     hooks: &izwi_hooks::EnterpriseHooks,
     speech_capacity: Option<usize>,
@@ -483,7 +500,10 @@ pub async fn attach_enterprise_request_context_with_hooks(
         );
     }
 
-    let speech_permit = if speech_admission::is_speech_generation(req.method(), req.uri().path()) {
+    let speech_connection = speech_admission::is_speech_connection(req.method(), req.uri().path());
+    let speech_permit = if speech_connection
+        || speech_admission::is_speech_generation(req.method(), req.uri().path())
+    {
         match speech_admission::acquire(&principal, speech_capacity.unwrap_or(1), speech_per_tenant)
         {
             Ok(permit) => Some(permit),
@@ -504,7 +524,18 @@ pub async fn attach_enterprise_request_context_with_hooks(
         None
     };
 
-    let context = RequestContext::new(correlation_id.clone(), principal.clone()).with_trace(trace);
+    let mut context =
+        RequestContext::new(correlation_id.clone(), principal.clone()).with_trace(trace);
+    // A WebSocket outlives its upgrade response: its handler holds the
+    // permit, where any other response's body does.
+    let speech_permit = if speech_connection {
+        context.speech_connection = speech_permit.map(|permit| SpeechConnection {
+            _permit: Arc::new(permit),
+        });
+        None
+    } else {
+        speech_permit
+    };
     let stream_outcome = context.stream_outcome.clone();
     req.extensions_mut().insert(context);
 
@@ -876,6 +907,80 @@ mod tests {
             .await
             .expect("body should read");
         assert_eq!(body, format!("{request_id}|{request_id}").as_bytes());
+    }
+
+    /// The speech quota counts a batch for as long as its response body
+    /// lives, and a speech WebSocket (`/v1/audio/speech/stream`,
+    /// `/v1/realtime`) for as long as its handler holds the slot.
+    #[tokio::test]
+    async fn speech_sockets_and_batches_count_against_the_speech_quota() {
+        use axum::routing::post;
+        use std::sync::Mutex;
+
+        let open = Arc::new(Mutex::new(Vec::new()));
+        let socket = |open: Arc<Mutex<Vec<Option<SpeechConnection>>>>| {
+            move |Extension(context): Extension<RequestContext>| async move {
+                open.lock().unwrap().push(context.speech_connection);
+                "open"
+            }
+        };
+        let hooks = izwi_hooks::EnterpriseHooks::noop();
+        let app = Router::new()
+            .route("/v1/realtime", get(socket(open.clone())))
+            .route("/v1/audio/speech/stream", get(socket(open.clone())))
+            .route("/v1/audio/speech/batch", post(|| async { "batch" }))
+            .layer(middleware::from_fn(move |req, next| {
+                let hooks = hooks.clone();
+                async move {
+                    // One speech request or connection per tenant.
+                    attach_enterprise_request_context_with_hooks(
+                        &hooks,
+                        Some(8),
+                        Some(1),
+                        req,
+                        next,
+                    )
+                    .await
+                }
+            }));
+        let send = |method: &'static str, path: &'static str| {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .expect("request should build");
+            send_request(app.clone(), request)
+        };
+
+        for path in ["/v1/realtime", "/v1/audio/speech/stream"] {
+            assert_eq!(send("GET", path).await.status(), StatusCode::OK, "{path}");
+            assert!(open.lock().unwrap()[0].is_some(), "{path} holds a slot");
+            // While the socket is open the tenant's quota is spent.
+            for (method, other) in [
+                ("GET", "/v1/realtime"),
+                ("GET", "/v1/audio/speech/stream"),
+                ("POST", "/v1/audio/speech/batch"),
+            ] {
+                assert_eq!(
+                    send(method, other).await.status(),
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "{other} while {path} is open"
+                );
+            }
+            // Closing the socket frees its slot.
+            open.lock().unwrap().clear();
+        }
+
+        let batch = send("POST", "/v1/audio/speech/batch").await;
+        assert_eq!(batch.status(), StatusCode::OK);
+        assert_eq!(
+            send("GET", "/v1/realtime").await.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a batch holds its slot until its response ends"
+        );
+        drop(batch);
+        assert_eq!(send("GET", "/v1/realtime").await.status(), StatusCode::OK);
+        open.lock().unwrap().clear();
     }
 
     #[tokio::test]

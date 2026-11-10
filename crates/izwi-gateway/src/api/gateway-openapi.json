@@ -3037,6 +3037,16 @@
             },
             "description": "Invalid request"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            },
+            "description": "No admission slot became free within IZWI_ADMISSION_QUEUE_TIMEOUT_SECS (Retry-After says when to retry): code rate_limit_exceeded, or resource_unavailable for a flex request."
+          },
           "500": {
             "content": {
               "application/json": {
@@ -3156,6 +3166,16 @@
               }
             },
             "description": "Invalid request"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            },
+            "description": "No admission slot became free within IZWI_ADMISSION_QUEUE_TIMEOUT_SECS (Retry-After says when to retry): code rate_limit_exceeded, or resource_unavailable for a flex request."
           },
           "500": {
             "content": {

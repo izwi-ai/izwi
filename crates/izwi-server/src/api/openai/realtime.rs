@@ -147,7 +147,10 @@ async fn ws_upgrade(
         ws
     };
     let correlation_id = ctx.correlation_id;
-    let mut response = ws.on_upgrade(move |socket| {
+    // The session counts against the speech quota for as long as it is open.
+    let speech_connection = ctx.speech_connection;
+    let mut response = ws.on_upgrade(move |socket| async move {
+        let _speech_connection = speech_connection;
         handle_socket(
             socket,
             state,
@@ -157,6 +160,7 @@ async fn ws_upgrade(
             kind,
             bound,
         )
+        .await
     });
     if let Ok(value) = axum::http::HeaderValue::from_str(&profile_header) {
         response

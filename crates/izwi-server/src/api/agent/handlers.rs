@@ -165,9 +165,7 @@ pub async fn create_turn(
         updated_at: session_record.updated_at,
     };
 
-    let permit = state
-        .acquire_workload_permit(WorkloadClass::Interactive)
-        .await;
+    let permit = state.admit_request(WorkloadClass::Interactive).await?;
     let memory = ChatStoreMemory::new(state.chat_store.clone());
     let backend = IzwiRuntimeBackend {
         runtime: state.runtime.clone(),

@@ -21,6 +21,11 @@ use crate::local_security::{guard_local_request, LocalRequestGuard};
 use crate::logging::{SERVICE_NAME, SERVICE_VERSION};
 use crate::state::AppState;
 
+/// Seconds a client should wait before retrying a `429`. Admission slots
+/// and quota free up as other requests finish, which is usually within
+/// seconds.
+const TOO_MANY_REQUESTS_RETRY_AFTER_SECS: &str = "5";
+
 pub(crate) const DESKTOP_CORS_ORIGINS: &[&str] = &[
     "tauri://localhost",
     "http://tauri.localhost",
@@ -151,6 +156,15 @@ pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Rout
         .layer(SetResponseHeaderLayer::if_not_present(
             header::X_FRAME_OPTIONS,
             HeaderValue::from_static("DENY"),
+        ))
+        // A `429` (admission queue timeout, speech quota) says when to
+        // come back, as a `503` does.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::RETRY_AFTER,
+            |response: &Response| {
+                (response.status() == StatusCode::TOO_MANY_REQUESTS)
+                    .then(|| HeaderValue::from_static(TOO_MANY_REQUESTS_RETRY_AFTER_SECS))
+            },
         ));
     // CORS is the outermost layer so browser preflights are answered before
     // authentication, which would otherwise reject them for lacking a key.

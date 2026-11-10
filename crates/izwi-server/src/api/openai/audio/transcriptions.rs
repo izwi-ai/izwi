@@ -424,8 +424,8 @@ async fn transcribe(
 
     let service_tier = req.service_tier;
     let permit = state
-        .acquire_workload_permit(service_tier.workload_class(WorkloadClass::Interactive))
-        .await;
+        .admit_request(service_tier.workload_class(WorkloadClass::Interactive))
+        .await?;
     let started = Instant::now();
     // A model that emits word timestamps itself (Granite Speech Plus) runs
     // its timestamp task and returns `timestamp_words`; any other model's
@@ -697,26 +697,15 @@ async fn transcriptions_stream(
     let service_tier = req.service_tier;
     let audio_bytes = audio.bytes;
 
+    // Admitted before the stream starts, so a request the server has no
+    // room for is a plain `429`, not a stream.
+    let permit = state
+        .admit_request_owned(service_tier.workload_class(WorkloadClass::Streaming))
+        .await?;
     let (event_tx, mut event_rx) = mpsc::channel::<String>(TRANSCRIPTION_STREAM_CAPACITY);
     let engine = state.runtime.clone();
-    let admission_state = state.clone();
 
     tokio::spawn(async move {
-        let permit = match admission_state
-            .acquire_owned_workload_permit(service_tier.workload_class(WorkloadClass::Streaming))
-            .await
-        {
-            Ok(permit) => permit,
-            Err(_) => {
-                send_transcription_terminal(
-                    event_tx,
-                    vec![transcript_error_event_payload("Server is shutting down")],
-                )
-                .await;
-                return;
-            }
-        };
-
         let delta_tx = event_tx.clone();
         let pending = Arc::new(PendingTranscriptText::default());
         let delta_pending = pending.clone();

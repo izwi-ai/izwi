@@ -185,6 +185,11 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "32",
         "Open realtime websocket sessions.",
     ),
+    var(
+        "IZWI_ADMISSION_QUEUE_TIMEOUT_SECS",
+        "30",
+        "How long a chat, agent or /v1/audio request waits for an admission slot before it is refused with 429 (0 waits without limit). Realtime sessions, record and durable-job routes and background work always wait.",
+    ),
     // The speech API (api/openai/audio), captured in ServerTuning.
     var(
         "IZWI_OPENAI_MODEL_ALIASES",
@@ -285,7 +290,7 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
     var(
         "IZWI_MAX_SPEECH_REQUESTS_PER_TENANT",
         "the global request limit",
-        "Concurrent speech requests per tenant (at most the global limit).",
+        "Concurrent speech requests per tenant (at most the global limit): speech and batch requests until their response ends, and open /v1/audio/speech/stream and /v1/realtime sockets.",
     ),
     var(
         "IZWI_TTS_MAX_TEXT_BYTES",

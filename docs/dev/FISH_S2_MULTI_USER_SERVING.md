@@ -194,7 +194,10 @@ Authenticated speech admission also accepts `IZWI_MAX_SPEECH_REQUESTS_PER_TENANT
 Its default is the global HTTP speech admission capacity. The tenant key comes
 from the trusted authenticated principal namespace, not an arbitrary request
 field. A streaming request retains its permit until response EOF or disconnect;
-opening an SSE connection does not release its concurrency credit. Ratify each
+opening an SSE connection does not release its concurrency credit. A
+`/v1/audio/speech/batch` request counts as one request until its response ends,
+and an open `/v1/audio/speech/stream` or `/v1/realtime` WebSocket counts for as
+long as it is open. Ratify each
 tenant's limit together with global admission and measured GPU capacity.
 
 Durable workers use a unique UUID-based identity per process. Optional

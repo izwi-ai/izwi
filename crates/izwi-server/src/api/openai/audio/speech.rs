@@ -34,7 +34,7 @@ use crate::error::{core_api_error, ApiError, ApiJson};
 use crate::speech_outcomes::{
     new_speech_id, SpeechCompletion, SpeechMode, SpeechOutcome, SpeechOutcomeGuard, SpeechUsage,
 };
-use crate::state::AppState;
+use crate::state::{AppState, OwnedAdmissionPermit};
 use izwi_audio_codec::{AudioFormat, CodecError, EncoderOptions, Framing, StreamEncoder};
 use izwi_core::{
     parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
@@ -635,8 +635,9 @@ async fn buffered_speech(
         service_tier,
     } = job;
     let permit = state
-        .acquire_workload_permit(service_tier.workload_class(WorkloadClass::Interactive))
-        .await;
+        .admit_request(service_tier.workload_class(WorkloadClass::Interactive))
+        .await
+        .map_err(|err| failed(&state, &speech_id, err))?;
     let request_started = std::time::Instant::now();
     state
         .runtime
@@ -800,6 +801,15 @@ async fn fish_file_speech(
         request.config.options.max_tokens,
     )
     .map_err(|err| failed(&state, &speech_id, core_api_error(err)))?;
+    let workload = service_tier.workload_class(WorkloadClass::Interactive);
+    // The request is admitted here, as a stream is; each segment then
+    // takes its own permit.
+    drop(
+        state
+            .admit_request(workload)
+            .await
+            .map_err(|err| failed(&state, &speech_id, err))?,
+    );
     state
         .runtime
         .load_model(variant)
@@ -938,11 +948,7 @@ async fn fish_file_speech(
     };
     let generation = async {
         crate::api::tts_long_form::generate_speech_plan_stream(
-            &state,
-            variant,
-            request,
-            sender,
-            service_tier.workload_class(WorkloadClass::Interactive),
+            &state, variant, request, sender, workload,
         )
         .await
         .map_err(core_api_error)
@@ -1342,13 +1348,19 @@ impl SpeechPump {
         })
     }
 
-    /// Runs admission, model load and generation, encoding the audio and
-    /// handing it to `tx` until the stream ends or the reader goes away.
-    fn spawn(self, tx: mpsc::Sender<PumpEvent>) {
-        tokio::spawn(self.run(tx));
+    /// Admits the stream before its response starts, so a stream the
+    /// server has no room for is a plain `429`.
+    async fn admit(&self) -> Result<OwnedAdmissionPermit, ApiError> {
+        self.state.admit_request_owned(self.workload).await
     }
 
-    async fn run(self, tx: mpsc::Sender<PumpEvent>) {
+    /// Runs model load and generation under `permit`, encoding the audio
+    /// and handing it to `tx` until the stream ends or the reader goes away.
+    fn spawn(self, permit: OwnedAdmissionPermit, tx: mpsc::Sender<PumpEvent>) {
+        tokio::spawn(self.run(permit, tx));
+    }
+
+    async fn run(self, permit: OwnedAdmissionPermit, tx: mpsc::Sender<PumpEvent>) {
         let SpeechPump {
             state,
             variant,
@@ -1362,23 +1374,6 @@ impl SpeechPump {
         let stream_request_id = gen_request.id.clone();
         let fail = |error: ApiError| PumpEvent::Failed { error };
         let engine = state.runtime.clone();
-        let permit = match tokio::select! {
-            _ = tx.closed() => return,
-            result = state.acquire_owned_workload_permit(workload) => result,
-        } {
-            Ok(permit) => permit,
-            Err(_) => {
-                let _ = send_pump_event(
-                    &tx,
-                    fail(ApiError::of(
-                        crate::error::ErrorClass::Unavailable,
-                        "Server is shutting down",
-                    )),
-                )
-                .await;
-                return;
-            }
-        };
         let mut runtime_context = permit.runtime_context();
         runtime_context.tenant_key = tenant_key;
         gen_request = gen_request.with_runtime_context(runtime_context);
@@ -1692,8 +1687,12 @@ async fn stream_speech_sse(
     let output = job.output.clone();
     let speech_id = job.speech_id.clone();
     let service_tier = job.service_tier.reported();
+    let permit = pump
+        .admit()
+        .await
+        .map_err(|err| failed(&state, &job.speech_id, err))?;
     let (tx, mut rx) = mpsc::channel::<PumpEvent>(stream_event_queue_capacity());
-    pump.spawn(tx);
+    pump.spawn(permit, tx);
 
     let outcome_state = state.clone();
     let stream = async_stream::stream! {
@@ -1753,8 +1752,12 @@ async fn stream_speech_audio(
     let pump =
         SpeechPump::prepare(&state, &job).map_err(|err| failed(&state, &job.speech_id, err))?;
     let speech_id = job.speech_id.clone();
+    let permit = pump
+        .admit()
+        .await
+        .map_err(|err| failed(&state, &speech_id, err))?;
     let (tx, mut rx) = mpsc::channel::<PumpEvent>(stream_event_queue_capacity());
-    pump.spawn(tx);
+    pump.spawn(permit, tx);
 
     let sample_rate = match rx.recv().await {
         Some(PumpEvent::Started { sample_rate }) => sample_rate,

@@ -54,9 +54,7 @@ pub async fn generate_chat(
     let variant = request.variant;
     let messages = request.messages;
     let correlation_id = request.correlation_id;
-    let permit = state
-        .acquire_workload_permit(WorkloadClass::Interactive)
-        .await;
+    let permit = state.admit_request(WorkloadClass::Interactive).await?;
 
     state
         .runtime
@@ -125,10 +123,7 @@ where
     let shutdown = state.stream_shutdown.subscribe();
     let params = chat_generation_params(&request);
     let chat_config = request.resolved_chat_config();
-    let permit = state
-        .acquire_owned_workload_permit(WorkloadClass::Streaming)
-        .await
-        .map_err(|_| ApiError::service_unavailable("Server is shutting down"))?;
+    let permit = state.admit_request_owned(WorkloadClass::Streaming).await?;
     let admitted = runtime
         .admit_streaming_chat(
             request.variant,

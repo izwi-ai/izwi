@@ -79,7 +79,8 @@ JSON errors use OpenAI's envelope:
 | `409` | `invalid_request_error` | `conflict` | The resource is in use, for example unloading a model that is serving requests. |
 | `413` | `invalid_request_error` | `payload_too_large` | The body or an input exceeded a size limit. |
 | `415` | `invalid_request_error` | `unsupported_media_type` | The endpoint expected JSON or multipart content but received another content type (writes with `text/plain` or form-encoded bodies are always rejected). |
-| `429` | `rate_limit_error` | `rate_limit_exceeded` | A rate, quota or admission limit was reached. |
+| `429` | `rate_limit_error` | `rate_limit_exceeded` | A rate, quota or admission limit was reached, or the server stayed at capacity for the whole admission queue timeout (`IZWI_ADMISSION_QUEUE_TIMEOUT_SECS`). These responses carry a `Retry-After` header. |
+| `429` | `rate_limit_error` | `resource_unavailable` | A `flex` (batch-class) request found no free capacity within the admission queue timeout. The message starts with `Resource Unavailable`, as OpenAI's flex answer does. Retry later, or send the request at the default tier. |
 | `499` | `server_error` | `cancelled` | The request was cancelled. |
 | `500` | `server_error` | `server_error` | Runtime, model, storage or server failure. |
 | `502` | `server_error` | `bad_gateway` | Gateway only: a worker's answer could not be used. |
@@ -140,6 +141,7 @@ Some older list routes return arrays or route-specific wrapper names. The route 
 |---------|---------|-------|
 | `--max-concurrent` | `100` | Maximum concurrent runtime requests. |
 | `--timeout` | `300` seconds | Request timeout for regular HTTP routes. Long ASR streaming avoids a hard wall-clock cutoff while active. |
+| `IZWI_ADMISSION_QUEUE_TIMEOUT_SECS` | `30` seconds | How long a chat, agent or `/v1/audio/*` request waits for an admission slot when the server is at capacity, before it is refused with `429`. `0` waits without limit. Realtime sessions, the first-party record and job routes and background work always wait. |
 | `IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB` | `25` strict, `64` relaxed | Upload limit for OpenAI audio routes. |
 | First-party audio upload limit | `64 MiB` | Applies to persisted transcription, diarization, TTS, voice design, voice clone, and saved voice creation routes. |
 | `IZWI_AUDIO_STREAM_EVENT_QUEUE_CAPACITY` | `32` | Buffered SSE audio events for `/v1/audio/speech`. |
@@ -360,6 +362,14 @@ extension with the same values:
 | `priority` | `default` | Accepted for compatibility and served as `default`. |
 
 Any other value returns `400` with `param: "service_tier"`.
+
+When the server is at capacity a request waits for an admission slot for up
+to `IZWI_ADMISSION_QUEUE_TIMEOUT_SECS` (30 seconds) and is then refused with
+`429` and a `Retry-After` header, before any stream starts. A `default`
+request gets code `rate_limit_exceeded`; a `flex` request gets code
+`resource_unavailable` and a message starting `Resource Unavailable`, as
+OpenAI's flex tier does, so a client can retry later or fall back to
+`default`. In a batch each refused item carries the error in its result.
 
 Send it as the `service_tier` field of a JSON body or multipart form. A
 client that cannot add a form field sends the `X-Izwi-Service-Tier` request

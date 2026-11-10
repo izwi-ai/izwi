@@ -2009,6 +2009,7 @@ fn create_chat_completion() {}
     responses(
         (status = 200, description = "Encoded audio (Content-Type per response_format; a chunked body for stream_format audio), or server-sent audio events for stream_format sse. X-Izwi-Speech-Id names the request for GET /v1/audio/speech/{speech_id}; X-Izwi-Service-Tier names the tier that served it."),
         (status = 400, description = "Invalid request", body = ApiErrorEnvelope),
+        (status = 429, description = "No admission slot became free within IZWI_ADMISSION_QUEUE_TIMEOUT_SECS (Retry-After says when to retry): code rate_limit_exceeded, or resource_unavailable for a flex request.", body = ApiErrorEnvelope),
         (status = 500, description = "Server error", body = ApiErrorEnvelope)
     )
 )]
@@ -2030,6 +2031,7 @@ fn create_speech() {}
     responses(
         (status = 200, description = "Transcription result as JSON, verbose JSON, text, SRT, VTT, or server-sent events. X-Izwi-Service-Tier names the tier that served it.", body = TranscriptionResponse),
         (status = 400, description = "Invalid request", body = ApiErrorEnvelope),
+        (status = 429, description = "No admission slot became free within IZWI_ADMISSION_QUEUE_TIMEOUT_SECS (Retry-After says when to retry): code rate_limit_exceeded, or resource_unavailable for a flex request.", body = ApiErrorEnvelope),
         (status = 500, description = "Server error", body = ApiErrorEnvelope)
     )
 )]
