@@ -82,6 +82,9 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_VOICE_WS_OUTBOUND_AUDIO_MS` | `5000` | Assistant audio a voice websocket queues, in milliseconds. |
 | `IZWI_FILES_MAX_BYTES` | `209715200` | Largest file `/v1/files` accepts, in bytes (at most 1 GiB). |
 | `IZWI_BATCH_MAX_REQUESTS` | `50000` | Requests one `/v1/batches` input file may hold. |
+| `IZWI_BATCH_WEBHOOK_SECRET` | unset (webhooks off) | Turns on `/v1/batches` completion webhooks (`metadata.webhook_url`) and signs each delivery (Standard Webhooks, HMAC-SHA256). A `whsec_` value is base64 of the key; any other value is the key. Unset, a batch that names a webhook is refused. |
+| `IZWI_BATCH_WEBHOOK_ALLOW_HTTP` | `false` | Allows `http://` batch webhook URLs; `https://` only otherwise. |
+| `IZWI_BATCH_WEBHOOK_ALLOW_PRIVATE` | `false` | Allows batch webhook URLs whose host resolves to a loopback, private, link-local or other non-public address. |
 | `IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS` | `5` | Heartbeat age after which readiness reports a batch worker stale. |
 | `IZWI_IDEMPOTENCY_MAX_RECORDS` | `1048576` | Live idempotency records in total. |
 | `IZWI_IDEMPOTENCY_MAX_RECORDS_PER_TENANT` | `65536` | Live idempotency records per tenant. |

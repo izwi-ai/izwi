@@ -17,6 +17,7 @@ use std::time::Duration;
 use anyhow::bail;
 use izwi_serving_protocol::env::{EnvSnapshot, EnvVar};
 
+use crate::api::openai::batches::webhook::WebhookPolicy;
 use crate::api::openai::compat::OpenAiCompatibilityProfile;
 use crate::batch_runtime::store::{QuotaLimits, RetentionPolicy};
 use crate::local_security::LocalExposure;
@@ -418,6 +419,21 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "Requests one `/v1/batches` input file may hold.",
     ),
     var(
+        "IZWI_BATCH_WEBHOOK_SECRET",
+        "unset (webhooks off)",
+        "Turns on `/v1/batches` completion webhooks (`metadata.webhook_url`) and signs each delivery (Standard Webhooks, HMAC-SHA256). A `whsec_` value is base64 of the key; any other value is the key. Unset, a batch that names a webhook is refused.",
+    ),
+    var(
+        "IZWI_BATCH_WEBHOOK_ALLOW_HTTP",
+        "false",
+        "Allows `http://` batch webhook URLs; `https://` only otherwise.",
+    ),
+    var(
+        "IZWI_BATCH_WEBHOOK_ALLOW_PRIVATE",
+        "false",
+        "Allows batch webhook URLs whose host resolves to a loopback, private, link-local or other non-public address.",
+    ),
+    var(
         "IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS",
         "5",
         "Heartbeat age after which readiness reports a batch worker stale.",
@@ -509,6 +525,8 @@ pub(crate) struct ServerTuning {
     pub(crate) batch_worker_heartbeat_stale_ms: u64,
     pub(crate) files_max_bytes: u64,
     pub(crate) batch_max_requests: usize,
+    /// `None` leaves `/v1/batches` completion webhooks off.
+    pub(crate) batch_webhook: Option<WebhookPolicy>,
     pub(crate) idempotency_limits: QuotaLimits,
     pub(crate) provider_write_limits: QuotaLimits,
     pub(crate) retention: RetentionPolicy,
@@ -753,6 +771,7 @@ impl ServerTuning {
                 .saturating_mul(1_000),
             files_max_bytes: at_least(env, "IZWI_FILES_MAX_BYTES", 1, 200 * 1024 * 1024)?,
             batch_max_requests: at_least(env, "IZWI_BATCH_MAX_REQUESTS", 1, 50_000)?,
+            batch_webhook: WebhookPolicy::from_env(env)?,
             idempotency_limits: QuotaLimits {
                 global: at_least(env, "IZWI_IDEMPOTENCY_MAX_RECORDS", 1, 1_048_576)?,
                 per_tenant: at_least(env, "IZWI_IDEMPOTENCY_MAX_RECORDS_PER_TENANT", 1, 65_536)?,

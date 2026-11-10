@@ -150,6 +150,8 @@ Some older list routes return arrays or route-specific wrapper names. The route 
 | `IZWI_FILES_MAX_BYTES` | `209715200` (200 MB) | Largest file `/v1/files` accepts, at most 1 GiB. A larger upload is refused with `413`. |
 | `IZWI_BATCH_MAX_REQUESTS` | `50000` | Requests one `/v1/batches` input file may hold. A larger file fails its batch. |
 | `IZWI_BATCH_WORKER_CONCURRENCY` | The runtime's capacity | `/v1/batches` lines in flight at once, and durable jobs the batch worker runs at once. |
+| `IZWI_BATCH_WEBHOOK_SECRET` | Unset (webhooks off) | Turns on `/v1/batches` completion webhooks and signs each delivery. See [Batch API](#batch-api). |
+| `IZWI_BATCH_WEBHOOK_ALLOW_HTTP`, `IZWI_BATCH_WEBHOOK_ALLOW_PRIVATE` | `false` | Allow `http://` webhook URLs, and webhook hosts on loopback, private or link-local addresses. |
 | `IZWI_AUDIO_STREAM_EVENT_QUEUE_CAPACITY` | `32` | Buffered SSE audio events for `/v1/audio/speech`. |
 | `IZWI_MAX_RESPONSE_STORE_ENTRIES` | `512` | Process-local `/v1/responses` retention cap. |
 | `IZWI_MAX_AGENT_SESSION_STORE_ENTRIES` | `512` | Process-local agent session metadata cap. |
@@ -1193,6 +1195,38 @@ appear in neither file; `request_counts` tells how many there were. A
 server runs four batches at a time and the rest wait their turn; the lines
 in flight across them are bounded by `IZWI_BATCH_WORKER_CONCURRENCY`. A
 batch, like its files, is visible only to the principal that created it.
+
+**Completion webhook.** A batch created with `metadata.webhook_url` has an
+event posted to that URL when it ends (an Izwi extension; the event and its
+signature follow OpenAI's webhooks):
+
+```json
+{"id": "evt_…", "object": "event", "type": "batch.completed", "created_at": 1762790400, "data": {"id": "batch_…"}}
+```
+
+`type` is `batch.completed`, `batch.failed`, `batch.cancelled` or
+`batch.expired`. Fetch the batch for its counts and files. Each delivery
+carries the Standard Webhooks headers `webhook-id` (the event id),
+`webhook-timestamp` (epoch seconds) and `webhook-signature`:
+`v1,` followed by the base64 HMAC-SHA256 of `{webhook-id}.{webhook-timestamp}.{body}`
+under the server's `IZWI_BATCH_WEBHOOK_SECRET`. A secret that starts with
+`whsec_` is base64 of the key, as the OpenAI SDK's
+`client.webhooks.unwrap(body, headers, secret=…)` and the Standard Webhooks
+libraries read it; any other secret is used as the key itself.
+
+Webhooks are off until the operator sets `IZWI_BATCH_WEBHOOK_SECRET`, and a
+batch that names `webhook_url` is refused with `400` while they are off. The
+URL must be `https://` (`IZWI_BATCH_WEBHOOK_ALLOW_HTTP=1` also allows
+`http://`), carry no credentials, and its host must resolve only to public
+addresses (`IZWI_BATCH_WEBHOOK_ALLOW_PRIVATE=1` also allows loopback,
+private and link-local ones). A host given as an address is checked when
+the batch is created; a host name is resolved and checked at each delivery,
+and the connection goes to the addresses that were checked. Redirects are
+not followed and no proxy is used. A delivery that gets no `2xx` within 10
+seconds is tried again after 2 and then 8 seconds, with the same
+`webhook-id`, and dropped after the third attempt. Delivery is best effort:
+it never changes the batch, and an event can be lost if the server stops
+between the batch ending and the delivery, so keep a poll as the fallback.
 
 Transcribe recordings:
 

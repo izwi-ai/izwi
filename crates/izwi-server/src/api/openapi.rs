@@ -1216,7 +1216,10 @@ fn add_batches_paths(paths: &mut Map<String, Value>) {
          `completion_window` (`24h`) and optional `metadata`. Each line is OpenAI's \
          `{custom_id, method, url, body}`; a transcription or translation body names its audio \
          by `file_id` or `audio_base64`. Lines run as batch work; at most \
-         IZWI_BATCH_MAX_REQUESTS (50000) per file.",
+         IZWI_BATCH_MAX_REQUESTS (50000) per file. With `metadata.webhook_url`, a signed \
+         `batch.completed`, `batch.failed`, `batch.cancelled` or `batch.expired` event is \
+         posted there when the batch ends; refused with 400 unless the operator set \
+         IZWI_BATCH_WEBHOOK_SECRET.",
         preview_response(),
     );
     add_operation(

@@ -17,7 +17,9 @@ use serde_json::{json, Value};
 use super::executor::{
     BatchExecutor, ExecutorConfig, LineJob, LineOutcome, LineReader, LineRunner,
 };
+use super::webhook::tests::{assert_signed, local_policy, Listener};
 use crate::api::openai::files::tests::{bytes, json as read_json, TestServer};
+use crate::artifact_store::ArtifactTenant;
 
 const TRANSCRIPTIONS: &str = "/v1/audio/transcriptions";
 const SPEECH: &str = "/v1/audio/speech";
@@ -30,6 +32,7 @@ fn config() -> ExecutorConfig {
         max_requests: 8,
         max_line_bytes: 64 * 1024,
         capacity_retry: Duration::from_millis(10),
+        webhook: None,
     }
 }
 
@@ -981,4 +984,123 @@ async fn speech_lines_write_the_speech_routes_audio_to_files() {
         .unwrap()
         .contains("no-such-model"));
     executor.abort();
+}
+
+/// A batch of `tenant` over a new one-line input file, announced to
+/// `webhook_url`. It is written to the store as the route writes it: the
+/// route itself refuses a webhook while the test process has no secret.
+async fn create_with_webhook(server: &TestServer, tenant: &str, webhook_url: &str) -> String {
+    let template = create(server, tenant, TRANSCRIPTIONS, &input(&["one"])).await;
+    let store = &server.state.batch_api_store;
+    let template = store
+        .load(template["id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .expect("the batch");
+    let batch = store
+        .create(
+            &ArtifactTenant::parse(template.tenant_scope).unwrap(),
+            &template.endpoint,
+            &template.input_file_id,
+            Some(&json!({"webhook_url": webhook_url})),
+        )
+        .await
+        .unwrap();
+    batch.id
+}
+
+#[tokio::test]
+async fn a_batch_that_ends_posts_a_signed_event_to_its_webhook() {
+    static ACCEPTS: [StatusCode; 1] = [StatusCode::OK];
+    let server = TestServer::new("batches-webhook");
+    let listener = Listener::start(&ACCEPTS).await;
+    let id = create_with_webhook(&server, "a", &listener.url).await;
+    let executor = start(
+        &server,
+        runner(|_| async { ok(json!({"text": "hi"})) }),
+        ExecutorConfig {
+            webhook: Some(local_policy("batch-secret")),
+            ..config()
+        },
+    );
+    wait_for_status(&server, "a", &id, "completed").await;
+
+    // The delivery runs apart from the batch, so it lands a little later.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let delivery = loop {
+        if let Some(delivery) = listener.deliveries().into_iter().next() {
+            break delivery;
+        }
+        assert!(std::time::Instant::now() < deadline, "no delivery");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_signed(&delivery, b"batch-secret");
+    let event: Value = serde_json::from_str(&delivery.body).unwrap();
+    assert_eq!(event["id"], delivery.id.as_str());
+    assert!(delivery.id.starts_with("evt_"));
+    assert_eq!(event["object"], "event");
+    assert_eq!(event["type"], "batch.completed");
+    assert!(event["created_at"].is_i64());
+    assert_eq!(event["data"], json!({"id": id}));
+    // A batch without a webhook posts nothing.
+    assert_eq!(listener.deliveries().len(), 1);
+    executor.abort();
+}
+
+#[tokio::test]
+async fn a_webhook_that_keeps_failing_leaves_the_batch_as_it_ended() {
+    static REFUSES: [StatusCode; 1] = [StatusCode::INTERNAL_SERVER_ERROR];
+    let server = TestServer::new("batches-webhook-fails");
+    let listener = Listener::start(&REFUSES).await;
+    let id = create_with_webhook(&server, "a", &listener.url).await;
+    let executor = start(
+        &server,
+        runner(|_| async { ok(json!({"text": "hi"})) }),
+        ExecutorConfig {
+            webhook: Some(local_policy("batch-secret")),
+            ..config()
+        },
+    );
+    let completed = wait_for_status(&server, "a", &id, "completed").await;
+    assert_eq!(
+        completed["request_counts"],
+        json!({"total": 1, "completed": 1, "failed": 0})
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while listener.deliveries().len() < 3 {
+        assert!(std::time::Instant::now() < deadline, "three attempts");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(listener.deliveries().len(), 3, "no fourth attempt");
+    assert_eq!(get(&server, "a", &id).await["status"], "completed");
+    executor.abort();
+}
+
+#[tokio::test]
+async fn a_batch_naming_a_webhook_is_refused_while_webhooks_are_off() {
+    let server = TestServer::new("batches-webhook-off");
+    let file = server
+        .upload_ok("a", "batch", "input.jsonl", input(&["one"]).as_bytes())
+        .await;
+    let response = server
+        .post_json(
+            "/v1/batches",
+            "a",
+            json!({
+                "input_file_id": file,
+                "endpoint": TRANSCRIPTIONS,
+                "completion_window": "24h",
+                "metadata": {"webhook_url": "https://hooks.example.com/izwi"},
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = read_json(response).await;
+    assert_eq!(error["error"]["param"], "metadata.webhook_url");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("IZWI_BATCH_WEBHOOK_SECRET"));
 }

@@ -21,10 +21,12 @@
 //! `user_data` file) or carries it as `audio_base64`. A speech line's audio
 //! is written to its own `batch_output` file, and its response body is
 //! `{"audio_file_id", "format", "bytes"}`. A batch belongs to the principal
-//! that created it.
+//! that created it. One created with `metadata.webhook_url` has an event
+//! posted there when it ends (`webhook.rs`).
 
 pub(crate) mod executor;
 mod runner;
+pub(crate) mod webhook;
 
 pub use executor::spawn as spawn_executor;
 
@@ -242,6 +244,10 @@ pub async fn create_batch(
         ));
     }
     let metadata = validate_metadata(request.metadata)?;
+    webhook::validate_metadata(
+        crate::env_config::tuning().batch_webhook.as_ref(),
+        metadata.as_ref(),
+    )?;
     let tenant = tenant(&ctx);
     let input = state
         .file_store

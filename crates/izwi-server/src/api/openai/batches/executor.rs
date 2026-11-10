@@ -25,6 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::sync::{watch, Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
 
+use super::webhook::{self, WebhookPolicy};
 use super::BatchEndpoint;
 use crate::artifact_store::ArtifactTenant;
 use crate::batch_api_store::{
@@ -79,6 +80,9 @@ pub(crate) struct ExecutorConfig {
     pub(crate) max_line_bytes: usize,
     /// The wait before a line refused for capacity is run again.
     pub(crate) capacity_retry: Duration,
+    /// Where and how ended batches are announced; `None` when webhooks
+    /// are off.
+    pub(crate) webhook: Option<WebhookPolicy>,
 }
 
 impl ExecutorConfig {
@@ -101,6 +105,7 @@ impl ExecutorConfig {
             // its other fields.
             max_line_bytes: audio_bytes.saturating_mul(4) / 3 + 1024 * 1024,
             capacity_retry: Duration::from_secs(2),
+            webhook: crate::env_config::tuning().batch_webhook.clone(),
         }
     }
 }
@@ -291,15 +296,7 @@ impl BatchExecutor {
             .with_context(|| format!("Batch {} has an unknown endpoint", batch.id))?;
         let Some(mut lines) = self.open_input(batch, tenant).await? else {
             let errors = error_list(vec![input_gone(batch)]);
-            self.batches
-                .finish(
-                    &batch.id,
-                    &self.owner,
-                    BatchStatus::Validating,
-                    BatchStatus::Failed,
-                    Some(&errors),
-                )
-                .await?;
+            self.end(batch, BatchStatus::Failed, Some(&errors)).await?;
             return Ok(());
         };
         let mut errors = Vec::new();
@@ -367,14 +364,7 @@ impl BatchExecutor {
                 errors = errors.len(),
                 "A batch failed validation"
             );
-            self.batches
-                .finish(
-                    &batch.id,
-                    &self.owner,
-                    BatchStatus::Validating,
-                    BatchStatus::Failed,
-                    Some(&error_list(errors)),
-                )
+            self.end(batch, BatchStatus::Failed, Some(&error_list(errors)))
                 .await?;
         }
         Ok(())
@@ -558,16 +548,30 @@ impl BatchExecutor {
                 .set_output_file(&batch.id, kind, &file.id)
                 .await?;
         }
-        let ended = self
-            .batches
-            .finish(&batch.id, &self.owner, batch.status, status, errors)
-            .await?;
-        if ended {
+        if self.end(batch, status, errors).await? {
             info!(batch_id = %batch.id, status = status.as_str(), "A batch ended");
             // A batch slot is free.
             self.wake.notify_waiters();
         }
         Ok(())
+    }
+
+    /// End the batch as `status` and announce it to the batch's webhook.
+    /// `false` when the batch was no longer this executor's to end.
+    async fn end(
+        &self,
+        batch: &BatchRecord,
+        status: BatchStatus,
+        errors: Option<&Value>,
+    ) -> anyhow::Result<bool> {
+        let ended = self
+            .batches
+            .finish(&batch.id, &self.owner, batch.status, status, errors)
+            .await?;
+        if ended {
+            webhook::notify(self.config.webhook.as_ref(), batch, status);
+        }
+        Ok(ended)
     }
 }
 
