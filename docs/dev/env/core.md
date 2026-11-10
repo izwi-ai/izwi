@@ -194,7 +194,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_MAX_PHYSICAL_IN_FLIGHT` | integer | `1` | startup | Engine-wide ceiling on overlapping physical model launches (1 to 1024; invalid ignored). |
 | `IZWI_MAX_PREFIX_CACHE_PAGES` | integer | unset (automatic) | startup | Prefix-cache page budget; 0 or invalid ignored, leaving the automatic budget. |
 | `IZWI_MAX_PREFIX_SNAPSHOTS` | integer | `8` | startup | Caps committed hybrid recurrent-state prefix snapshots per model (0..=1024; 0 keeps hybrid state private). |
-| `IZWI_MAX_QUEUED_REQUESTS` | integer | `128` | startup | Maximum requests waiting in the engine queue (0 or invalid ignored). |
+| `IZWI_MAX_QUEUED_REQUESTS` | integer | `128` | startup | Maximum requests waiting in the engine queue (0 or invalid ignored). Real-time requests and sessions wait in a queue of their own, of the same size or the real-time session cap if that is larger, so a full queue does not refuse a call. |
 | `IZWI_MAX_RETAINED_SEQUENCES` | integer | 0 (automatic device ceiling) | startup | Maximum retained sequences; 0 or invalid ignored, leaving the automatic ceiling. |
 | `IZWI_MAX_SCHEDULER_BATCH_SIZE` | integer | 0 (automatic device ceiling) | startup | Maximum scheduler batch size; 0 or invalid ignored, leaving the automatic ceiling. |
 | `IZWI_MAX_SEQUENCE_LENGTH` | choice | `auto` | startup | Context-length cap: auto (model's context) or a positive token count; invalid ignored. |

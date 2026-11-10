@@ -362,6 +362,15 @@ realtime pushes, diarization) are weighed the same way rather than queueing
 as control jobs. Long work is chunked so it gives the device back:
 long-form ASR runs one audio window per dispatch.
 
+**Queue pools.** The coordinator admits jobs from two permit pools
+(`runtime/coordinator.rs`). Realtime-class jobs, which include each real-time
+session's lease for its whole life, take from the real-time pool; every other
+class takes from the general pool of `IZWI_MAX_QUEUED_REQUESTS`. The real-time
+pool holds the larger of that figure and the real-time ASR session cap. A full
+general queue therefore cannot refuse a call, and an open session takes
+nothing from the general queue. Memory admission and device arbitration are
+shared by both pools.
+
 **Execution lanes.** Each loaded model is one lane, and a step fences only its
 own lane. `IZWI_LANE_STEP_DRIVERS=1` runs one step driver per lane instead of
 one for the engine. It is off by default: a mixed chat, ASR, TTS and realtime

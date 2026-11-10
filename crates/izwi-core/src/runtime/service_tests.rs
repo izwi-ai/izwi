@@ -2021,6 +2021,14 @@ async fn runtime_prometheus_includes_engine_metric_values() {
     ));
     assert!(payload.contains("izwi_engine_executor_physical_batch_fill_ratio"));
     assert!(payload.contains("# TYPE izwi_inference_coordinator_active_jobs gauge"));
+    for pool in ["general", "realtime"] {
+        assert!(payload.contains(&format!(
+            "izwi_inference_coordinator_queue_capacity{{pool=\"{pool}\"}}"
+        )));
+        assert!(payload.contains(&format!(
+            "izwi_inference_coordinator_queue_depth{{pool=\"{pool}\"}} 0"
+        )));
+    }
     assert!(payload.contains("# TYPE izwi_inference_coordinator_admitted_total counter"));
     assert!(payload.contains("izwi_inference_coordinator_reserved_memory_bytes"));
     assert!(payload.contains("izwi_inference_coordinator_reserved_host_memory_bytes"));

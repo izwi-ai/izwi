@@ -895,6 +895,12 @@ impl RuntimeService {
 izwi_inference_coordinator_capacity {}\n\
 # TYPE izwi_inference_coordinator_active_jobs gauge\n\
 izwi_inference_coordinator_active_jobs {}\n\
+# TYPE izwi_inference_coordinator_queue_capacity gauge\n\
+izwi_inference_coordinator_queue_capacity{{pool=\"general\"}} {}\n\
+izwi_inference_coordinator_queue_capacity{{pool=\"realtime\"}} {}\n\
+# TYPE izwi_inference_coordinator_queue_depth gauge\n\
+izwi_inference_coordinator_queue_depth{{pool=\"general\"}} {}\n\
+izwi_inference_coordinator_queue_depth{{pool=\"realtime\"}} {}\n\
 # TYPE izwi_inference_coordinator_active_executions gauge\n\
 izwi_inference_coordinator_active_executions {}\n\
 # TYPE izwi_inference_coordinator_reserved_memory_bytes gauge\n\
@@ -923,6 +929,10 @@ izwi_inference_coordinator_draining {}\n\
 izwi_inference_coordinator_poisoned {}\n",
             snapshot.capacity,
             snapshot.active_jobs,
+            snapshot.queue_capacity,
+            snapshot.realtime_queue_capacity,
+            snapshot.queued_jobs,
+            snapshot.realtime_queued_jobs,
             snapshot.active_executions,
             snapshot.reserved_memory_bytes,
             snapshot.reserved_host_memory_bytes,

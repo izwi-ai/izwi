@@ -1304,7 +1304,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Int,
         "128",
         Startup,
-        "Maximum requests waiting in the engine queue (0 or invalid ignored).",
+        "Maximum requests waiting in the engine queue (0 or invalid ignored). Real-time requests and sessions wait in a queue of their own, of the same size or the real-time session cap if that is larger, so a full queue does not refuse a call.",
     ),
     CoreEnvVar::new(
         "IZWI_MAX_RETAINED_SEQUENCES",

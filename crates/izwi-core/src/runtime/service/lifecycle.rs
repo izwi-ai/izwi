@@ -267,12 +267,20 @@ impl RuntimeService {
                 .physical_launch_limit
                 .get(),
         );
-        let coordinator = Arc::new(InferenceCoordinator::new_with_device(
+        let asr_realtime_sessions = RealtimeAsrSessionPolicy::resolve_for_sequences(
+            config.asr_realtime,
             selected_backend_kind,
-            device.clone(),
-            execution_parallelism,
-            core_config.max_queued_requests,
-        )?);
+            max_num_seqs,
+        )?;
+        let coordinator = Arc::new(
+            InferenceCoordinator::new_with_device(
+                selected_backend_kind,
+                device.clone(),
+                execution_parallelism,
+                core_config.max_queued_requests,
+            )?
+            .with_realtime_session_capacity(asr_realtime_sessions.max_sessions()),
+        );
         let qwen_asr_encoder_batcher = Arc::new(QwenAsrEncoderBatcher::new(coordinator.clone()));
         let whisper_encoder_batcher = Arc::new(WhisperEncoderBatcher::new(coordinator.clone()));
         let vibevoice_encoder_batcher = Arc::new(VibeVoiceEncoderBatcher::new(coordinator.clone()));
@@ -282,11 +290,6 @@ impl RuntimeService {
             Arc::new(GraniteSpeech5EncoderBatcher::new(coordinator.clone()));
         let parakeet_encoder_batcher = Arc::new(ParakeetEncoderBatcher::new(coordinator.clone()));
         let nemotron_encoder_batcher = Arc::new(NemotronEncoderBatcher::new(coordinator.clone()));
-        let asr_realtime_sessions = RealtimeAsrSessionPolicy::resolve_for_sequences(
-            config.asr_realtime,
-            selected_backend_kind,
-            max_num_seqs,
-        )?;
         let realtime_asr_sequence_capacity = asr_realtime_sessions.retained_sequence_capacity()?;
         worker_config.resource_authority = Some(coordinator.resource_authority());
         worker_config.physical_execution_admission =
