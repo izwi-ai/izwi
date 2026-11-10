@@ -5205,10 +5205,15 @@ mod tests {
         }
     }
 
-    /// Random encoder and adapter weights for [`voxtral_probe_outputs`].
+    /// Encoder and adapter weights for [`voxtral_probe_outputs`]: the shapes
+    /// a load asks for, filled from fixed seeds. `VarMap` draws its random
+    /// initialisation from an unseeded generator, so every run probed other
+    /// weights, and on GitHub's paravirtual GPU one draw put the logits
+    /// 1.1e-1 from F32, past the bound, on a run that changed no Voxtral code.
     fn voxtral_probe_weights() -> std::collections::HashMap<String, Tensor> {
         use super::super::audio::AudioLanguageAdapter;
         use super::WhisperEncoder;
+        use crate::kernels::numeric_check::xorshift_tensor;
 
         let cfg = voxtral_probe_encoder_config();
         let vars = candle_nn::VarMap::new();
@@ -5216,8 +5221,36 @@ mod tests {
         WhisperEncoder::load_voxtral(&cfg, host.pp("encoder")).unwrap();
         AudioLanguageAdapter::load(4 * 32, 4, host.pp("adapter")).unwrap();
         let data = vars.data().lock().unwrap();
-        data.iter()
-            .map(|(name, var)| (name.clone(), var.as_tensor().clone()))
+        let fan_in = |dims: &[usize]| dims[1..].iter().product::<usize>().max(1) as f32;
+        let mut names = data.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let tensor = data[name].as_tensor();
+                let values = tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                // Norm gains and zero biases are constant: kept as they are.
+                if values.iter().all(|value| *value == values[0]) {
+                    return (name.clone(), tensor.clone());
+                }
+                // Candle's spreads: Kaiming-normal weights (variance 2 over
+                // the fan-in, as a uniform), and biases uniform within one
+                // over the root of their weight's fan-in.
+                let dims = tensor.dims();
+                let scale = if dims.len() >= 2 {
+                    (6.0 / fan_in(dims)).sqrt()
+                } else {
+                    let weight = name
+                        .strip_suffix("bias")
+                        .and_then(|prefix| data.get(&format!("{prefix}weight")));
+                    let fan =
+                        weight.map_or(dims[0] as f32, |weight| fan_in(weight.as_tensor().dims()));
+                    fan.sqrt().recip()
+                };
+                let seeded = xorshift_tensor(dims, index as u64 + 1, scale, &Device::Cpu).unwrap();
+                (name.clone(), seeded)
+            })
             .collect()
     }
 
