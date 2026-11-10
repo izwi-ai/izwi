@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -479,7 +480,43 @@ pub struct Scheduler {
     service_clock: u64,
     /// Lanes with live demand: a Realtime or Streaming request, or a
     /// real-time session operation, seen within `REALTIME_RESERVE_HOLD`.
-    live_demand: HashMap<ExecutionLane, LiveDemand>,
+    live_demand: Arc<LiveDemandBoard>,
+}
+
+/// The live demand of every lane. The scheduler keeps it; the runtime holds
+/// the same board to read it between the device jobs of batch work that
+/// runs outside the scheduler, and to record the streams that do.
+#[derive(Debug, Default)]
+pub(crate) struct LiveDemandBoard {
+    lanes: std::sync::Mutex<HashMap<ExecutionLane, LiveDemand>>,
+}
+
+impl LiveDemandBoard {
+    fn lanes(&self) -> std::sync::MutexGuard<'_, HashMap<ExecutionLane, LiveDemand>> {
+        self.lanes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// When the live demand of `lane` lapses, if it has any at `now`.
+    fn held_until(&self, lane: ExecutionLane, now: Instant) -> Option<Instant> {
+        self.lanes()
+            .get(&lane)
+            .map(|demand| demand.until)
+            .filter(|until| *until > now)
+    }
+
+    /// Whether work of `workload_class` on `lane` should give the device up
+    /// between its own units of work: it is Batch or Background work and
+    /// the lane has live demand at `now`.
+    pub(crate) fn batch_work_yields(
+        &self,
+        lane: ExecutionLane,
+        workload_class: WorkloadClass,
+        now: Instant,
+    ) -> bool {
+        Scheduler::is_reserve_bound_class(workload_class) && self.held_until(lane, now).is_some()
+    }
 }
 
 /// The live demand of one lane.
@@ -814,7 +851,7 @@ impl Scheduler {
             debts: StarvationDebts::default(),
             lane_debts: HashMap::new(),
             service_clock: 0,
-            live_demand: HashMap::new(),
+            live_demand: Arc::default(),
         }
     }
 
@@ -1092,6 +1129,11 @@ impl Scheduler {
         Ok(id)
     }
 
+    /// The board this scheduler keeps its lanes' live demand on.
+    pub(crate) fn live_demand_board(&self) -> Arc<LiveDemandBoard> {
+        self.live_demand.clone()
+    }
+
     /// Classes whose requests are live demand: a caller is waiting on
     /// their output as it is produced.
     fn is_live_class(workload_class: WorkloadClass) -> bool {
@@ -1116,13 +1158,14 @@ impl Scheduler {
         };
         // A request added since the last step has no profile yet; the
         // lane keeps the rows of the same model's earlier live request.
+        let mut lanes = self.live_demand.lanes();
         let decode_dispatch_rows = metadata.cache_policy.decode_dispatch_rows.or_else(|| {
-            self.live_demand
+            lanes
                 .get(&metadata.lane)
                 .filter(|demand| demand.model_variant == metadata.model_variant)
                 .and_then(|demand| demand.decode_dispatch_rows)
         });
-        self.live_demand.insert(
+        lanes.insert(
             metadata.lane,
             LiveDemand {
                 until: now + REALTIME_RESERVE_HOLD,
@@ -1137,7 +1180,9 @@ impl Scheduler {
     /// has lapsed. An open real-time session with no operation queued is
     /// not demand: its lane keeps the reserve only for the hold.
     fn refresh_live_demand(&mut self, now: Instant) {
-        self.live_demand.retain(|_, demand| demand.until > now);
+        self.live_demand
+            .lanes()
+            .retain(|_, demand| demand.until > now);
         let live = self
             .requests
             .iter()
@@ -1177,11 +1222,9 @@ impl Scheduler {
     /// whose profile is not installed has no known capacity and is never
     /// held.
     fn reserve_defers(&self, metadata: &RequestMetadata, now: Instant) -> bool {
-        if !Self::is_reserve_bound_class(metadata.workload_class)
-            || !self
-                .live_demand
-                .get(&metadata.lane)
-                .is_some_and(|demand| demand.until > now)
+        if !self
+            .live_demand
+            .batch_work_yields(metadata.lane, metadata.workload_class, now)
         {
             return false;
         }
@@ -1209,6 +1252,7 @@ impl Scheduler {
         now: Instant,
     ) -> Option<usize> {
         self.live_demand
+            .lanes()
             .values()
             .filter(|demand| demand.until > now && demand.model_variant == Some(model_variant))
             .filter_map(|demand| self.reserve_limit(demand.decode_dispatch_rows))
@@ -3621,8 +3665,7 @@ impl Scheduler {
             .iter()
             .filter_map(|request_id| self.requests.get(request_id))
             .filter(|metadata| metadata.reserve_deferred)
-            .filter_map(|metadata| self.live_demand.get(&metadata.lane))
-            .map(|demand| demand.until);
+            .filter_map(|metadata| self.live_demand.held_until(metadata.lane, now));
         rows.chain(cleanups)
             .chain(reserve_holds)
             .filter(|at| *at > now)
@@ -8316,9 +8359,32 @@ mod tests {
 
     /// End the live-demand hold of every lane, as 30 idle seconds would.
     fn lapse_live_demand(scheduler: &mut Scheduler) {
-        for demand in scheduler.live_demand.values_mut() {
+        for demand in scheduler.live_demand.lanes().values_mut() {
             demand.until = Instant::now();
         }
+    }
+
+    /// P2.2: batch work that runs outside the scheduler is told to give
+    /// the device up between its units of work only while its lane has
+    /// live demand, and only when it is Batch or Background work.
+    #[test]
+    fn batch_work_yields_only_on_a_lane_with_live_demand() {
+        let mut scheduler = reserve_scheduler(None, SchedulingPolicy::WeightedFair);
+        let board = scheduler.live_demand_board();
+        assert!(!board.batch_work_yields(None, WorkloadClass::Batch, Instant::now()));
+
+        add_classed(&mut scheduler, "live", WorkloadClass::Streaming, 4);
+        let now = Instant::now();
+        assert!(board.batch_work_yields(None, WorkloadClass::Batch, now));
+        assert!(board.batch_work_yields(None, WorkloadClass::Background, now));
+        assert!(!board.batch_work_yields(None, WorkloadClass::Interactive, now));
+        assert!(!board.batch_work_yields(None, WorkloadClass::Realtime, now));
+        let other_lane = Some(crate::engine::ModelInstanceId::new(77));
+        assert!(!board.batch_work_yields(other_lane, WorkloadClass::Batch, now));
+
+        scheduler.finish_request(&"live".to_string());
+        lapse_live_demand(&mut scheduler);
+        assert!(!board.batch_work_yields(None, WorkloadClass::Batch, Instant::now()));
     }
 
     /// P2.1: with a live request on the lane, a batch flood runs at most
@@ -8426,7 +8492,7 @@ mod tests {
         lapse_live_demand(&mut scheduler);
         assert_eq!(admit_all(&mut scheduler).len(), 3);
         assert_eq!(running_of(&scheduler, WorkloadClass::Batch), 6);
-        assert!(scheduler.live_demand.is_empty());
+        assert!(scheduler.live_demand.lanes().is_empty());
         assert_eq!(
             scheduler.reserved_admission_limit(ModelVariant::Kokoro82M, Instant::now()),
             None

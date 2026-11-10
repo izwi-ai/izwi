@@ -23,7 +23,7 @@ use crate::config::{
     ResolvedKvCachePolicy,
 };
 use crate::engine::metrics::{
-    ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_WIDTH_CALLS_TOTAL,
+    ENGINE_ASR_ENCODER_LIVE_YIELDS_TOTAL, ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_WIDTH_CALLS_TOTAL,
     ENGINE_KV_MODEL_ADMISSION_AVAILABLE_PAGES, ENGINE_KV_MODEL_ADMISSION_CLAIMED_PAGES,
     ENGINE_KV_MODEL_ALLOCATED_PAGES, ENGINE_KV_MODEL_CAPACITY_PAGES,
     ENGINE_KV_MODEL_PREFIX_RETAINED_PAGES, ENGINE_KV_PREFIX_HIT_TOKENS_TOTAL,
@@ -93,6 +93,7 @@ use crate::models::architectures::nemotron::asr::{
 };
 use crate::models::architectures::parakeet::asr::{
     ParakeetEncoderBatchRow, ParakeetHostFeatures, ParakeetPreparedEncoderArtifact,
+    ParakeetWindowedEncode,
 };
 use crate::models::architectures::qwen3::asr::{
     Qwen3AsrAudioPreparationGeometry, Qwen3AsrHostFeatures, Qwen3AsrPreparedAudio,
@@ -123,7 +124,7 @@ use crate::runtime::audio_io::decode_reference_audio_base64;
 use crate::runtime::broker::{InferenceBroker, InferenceBrokerObservation};
 use crate::runtime::coordinator::{
     CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobLease, JobResourceObservation,
-    JobSpec, PreparationArtifact, PreparationCancellation, PreparationRowOutcome,
+    JobSpec, PreparationArtifact, PreparationCancellation, PreparationRowOutcome, PreparationStep,
 };
 use crate::runtime::health::RuntimeHealth;
 use crate::runtime::lifecycle::controller::ModelLifecycleController;

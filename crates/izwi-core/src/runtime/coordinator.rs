@@ -156,6 +156,15 @@ pub(crate) struct PreparationArtifact<T> {
     pub(crate) retained: JobResourceObservation,
 }
 
+/// What one device job of a preparation batch produced.
+pub(crate) enum PreparationStep<T> {
+    /// The operation stopped at a boundary of its own so that other work
+    /// can take the device; it continues in a later device job.
+    Yielded,
+    /// The batch's artifacts, one per live row.
+    Complete(Vec<Result<PreparationArtifact<T>>>),
+}
+
 #[derive(Debug)]
 pub(crate) enum PreparationRowOutcome<T> {
     Committed {
@@ -1774,6 +1783,36 @@ impl InferenceCoordinator {
         T: Send + 'static,
         F: FnOnce(&[usize]) -> Result<Vec<Result<PreparationArtifact<T>>>> + Send + 'static,
     {
+        let mut operation = Some(operation);
+        self.run_loaded_native_preparation_batch_in_parts(rows, contract, work, move |live| {
+            let operation = operation.take().ok_or_else(|| {
+                Error::InferenceError("native preparation ran after it completed".to_string())
+            })?;
+            operation(live).map(PreparationStep::Complete)
+        })
+        .await
+    }
+
+    /// [`Self::run_loaded_native_preparation_batch`] for an operation that
+    /// may stop between its own units of work: each `Yielded` ends the
+    /// device job and releases the physical dispatch, so waiting work of
+    /// the same or another model runs before the operation is called again
+    /// in a new job. The rows' leases are held from the first job to the
+    /// last; each job reserves the batch workspace for itself, under its
+    /// dispatch, so a yielded batch holds none while other work runs. An
+    /// operation that never yields runs as the single job of
+    /// `run_loaded_native_preparation_batch`.
+    pub(crate) async fn run_loaded_native_preparation_batch_in_parts<T, F>(
+        self: &Arc<Self>,
+        rows: Vec<PreparationBatchRow>,
+        contract: LoadedExecutionContract,
+        work: WorkUnit,
+        operation: F,
+    ) -> Result<Vec<PreparationRowOutcome<T>>>
+    where
+        T: Send + 'static,
+        F: FnMut(&[usize]) -> Result<PreparationStep<T>> + Send + 'static,
+    {
         if rows.is_empty() {
             return Err(Error::InvalidInput(
                 "native preparation batch has no admitted rows".to_string(),
@@ -1943,101 +1982,116 @@ impl InferenceCoordinator {
                 .max()
                 .unwrap_or(1),
         };
-        let execution = self
-            .acquire_physical_dispatch(
-                binding.execution_group_id,
-                binding.model_instance_id,
-                stage.physical_launch_policy,
-                stage.batch_mode,
-                live.len(),
-                deadline,
-                tag.weight,
-            )
-            .await?;
-        let batch_id = BatchId::new(NEXT_DIRECT_BATCH_ID.fetch_add(1, Ordering::Relaxed));
-        let workspace =
-            self.reserve_batch_workspace(binding.execution_group_id, batch_id, workspace)?;
         let first = rows[live[0]].job.clone();
-        let physical = self
-            .run_blocking_task_with_deadline(
-                &first,
-                deadline,
-                (execution, workspace),
-                "inference",
-                Some(tag),
-                move || {
-                    let _contract = contract;
-                    let _work = work;
-                    let physical = match operation(&live) {
-                        Ok(outputs) if outputs.len() == live.len() => outputs,
-                        Ok(_) => {
-                            return Err(Error::InferenceError(
-                                "native preparation output width does not match live row width"
-                                    .to_string(),
-                            ));
-                        }
-                        Err(error) => {
-                            // Every live row fails with the operation's own
-                            // error kind: an input error stays a 400 rather
-                            // than becoming an internal error.
-                            for index in &live {
-                                outcomes[*index] =
-                                    Some(PreparationPhysicalOutcome::Failed(error.replicate()));
+        // What a device job hands back when its operation yielded: all the
+        // next job needs.
+        let mut parts = (operation, live, outcomes, rows, contract, work);
+        let physical = loop {
+            let execution = self
+                .acquire_physical_dispatch(
+                    binding.execution_group_id,
+                    binding.model_instance_id,
+                    stage.physical_launch_policy,
+                    stage.batch_mode,
+                    parts.1.len(),
+                    deadline,
+                    tag.weight,
+                )
+                .await?;
+            let batch_id = BatchId::new(NEXT_DIRECT_BATCH_ID.fetch_add(1, Ordering::Relaxed));
+            let workspace_lease =
+                self.reserve_batch_workspace(binding.execution_group_id, batch_id, workspace)?;
+            let job = self
+                .run_blocking_task_with_deadline(
+                    &first,
+                    deadline,
+                    (execution, workspace_lease),
+                    "inference",
+                    Some(tag),
+                    move || {
+                        let (mut operation, live, mut outcomes, rows, contract, work) = parts;
+                        let physical = match operation(&live) {
+                            Ok(PreparationStep::Yielded) => {
+                                return Ok(Err((operation, live, outcomes, rows, contract, work)));
                             }
-                            return Ok(outcomes
-                                .into_iter()
-                                .map(Option::unwrap)
-                                .collect::<Vec<_>>());
-                        }
-                    };
-                    let mut rows: Vec<Option<PreparationBatchRow>> =
-                        rows.into_iter().map(Some).collect();
-                    for (index, output) in live.into_iter().zip(physical) {
-                        let row = rows[index]
-                            .take()
-                            .expect("live preparation row is consumed exactly once");
-                        let outcome = match output {
-                            Err(error) => PreparationPhysicalOutcome::Failed(error),
-                            Ok(_artifact)
-                                if row
-                                    .job
-                                    .spec
-                                    .deadline
-                                    .is_some_and(|deadline| deadline <= Instant::now()) =>
+                            Ok(PreparationStep::Complete(outputs))
+                                if outputs.len() == live.len() =>
                             {
-                                PreparationPhysicalOutcome::TimedOut
+                                outputs
                             }
-                            Ok(artifact) => {
-                                if !row.cancellation.begin_commit() {
-                                    PreparationPhysicalOutcome::Cancelled
-                                } else {
-                                    let committed = row
-                                        .job
-                                        .record_materialized_usage(artifact.retained)
-                                        .map_err(|error| match error {
-                                            Error::InferenceError(message) => {
-                                                Error::InferenceError(format!(
-                                                    "{message}, stage=preparation_commit"
-                                                ))
-                                            }
-                                            error => error,
-                                        })
-                                        .map(|()| PreparationPhysicalOutcome::Committed {
-                                            artifact,
-                                            job: row.job,
-                                        })
-                                        .unwrap_or_else(PreparationPhysicalOutcome::Failed);
-                                    row.cancellation.finish_commit();
-                                    committed
+                            Ok(PreparationStep::Complete(_)) => {
+                                return Err(Error::InferenceError(
+                                    "native preparation output width does not match live row width"
+                                        .to_string(),
+                                ));
+                            }
+                            Err(error) => {
+                                // Every live row fails with the operation's own
+                                // error kind: an input error stays a 400 rather
+                                // than becoming an internal error.
+                                for index in &live {
+                                    outcomes[*index] =
+                                        Some(PreparationPhysicalOutcome::Failed(error.replicate()));
                                 }
+                                return Ok(Ok(outcomes
+                                    .into_iter()
+                                    .map(Option::unwrap)
+                                    .collect::<Vec<_>>()));
                             }
                         };
-                        outcomes[index] = Some(outcome);
-                    }
-                    Ok(outcomes.into_iter().map(Option::unwrap).collect())
-                },
-            )
-            .await?;
+                        let mut rows: Vec<Option<PreparationBatchRow>> =
+                            rows.into_iter().map(Some).collect();
+                        for (index, output) in live.into_iter().zip(physical) {
+                            let row = rows[index]
+                                .take()
+                                .expect("live preparation row is consumed exactly once");
+                            let outcome = match output {
+                                Err(error) => PreparationPhysicalOutcome::Failed(error),
+                                Ok(_artifact)
+                                    if row
+                                        .job
+                                        .spec
+                                        .deadline
+                                        .is_some_and(|deadline| deadline <= Instant::now()) =>
+                                {
+                                    PreparationPhysicalOutcome::TimedOut
+                                }
+                                Ok(artifact) => {
+                                    if !row.cancellation.begin_commit() {
+                                        PreparationPhysicalOutcome::Cancelled
+                                    } else {
+                                        let committed = row
+                                            .job
+                                            .record_materialized_usage(artifact.retained)
+                                            .map_err(|error| match error {
+                                                Error::InferenceError(message) => {
+                                                    Error::InferenceError(format!(
+                                                        "{message}, stage=preparation_commit"
+                                                    ))
+                                                }
+                                                error => error,
+                                            })
+                                            .map(|()| PreparationPhysicalOutcome::Committed {
+                                                artifact,
+                                                job: row.job,
+                                            })
+                                            .unwrap_or_else(PreparationPhysicalOutcome::Failed);
+                                        row.cancellation.finish_commit();
+                                        committed
+                                    }
+                                }
+                            };
+                            outcomes[index] = Some(outcome);
+                        }
+                        Ok(Ok(outcomes.into_iter().map(Option::unwrap).collect()))
+                    },
+                )
+                .await?;
+            match job {
+                Ok(physical) => break physical,
+                Err(yielded) => parts = yielded,
+            }
+        };
         // The blocking helper and its retained task clone are gone after the
         // await; drop our deadline-anchor clone before requiring unique row
         // ownership for the admission bridge.
@@ -5686,6 +5740,74 @@ mod tests {
             coordinator.snapshot().reserved_memory_bytes,
             2 * 64 * 1024 * 1024
         );
+        drop(output);
+        assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+    }
+
+    /// A preparation that yields runs one device job per call, giving the
+    /// physical dispatch and its workspace up between them, and keeps its
+    /// rows' admissions until the call that completes it.
+    #[tokio::test]
+    async fn native_preparation_in_parts_runs_one_dispatch_per_part() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 4, 4));
+        let job = coordinator.admit(job("native-prep-parts")).await.unwrap();
+        let contract = native_preparation_contract(&coordinator, 2, 64);
+        let row = sealed_preparation_row(
+            &coordinator,
+            &contract,
+            job,
+            WorkCost::new(1, 4, 16),
+            4,
+            PreparationCancellation::default(),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task_calls = calls.clone();
+        let task_coordinator = coordinator.clone();
+        let reserved = Arc::new(Mutex::new(Vec::new()));
+        let task_reserved = reserved.clone();
+
+        let output = coordinator
+            .run_loaded_native_preparation_batch_in_parts(
+                vec![row],
+                contract,
+                WorkUnit::PreSequencePreparation {
+                    kind: "asr.encoder.audio".to_string(),
+                },
+                move |live| {
+                    assert_eq!(live, &[0]);
+                    let snapshot = task_coordinator.snapshot();
+                    assert_eq!(snapshot.active_executions, 1);
+                    task_reserved
+                        .lock()
+                        .unwrap()
+                        .push(snapshot.reserved_memory_bytes);
+                    if task_calls.fetch_add(1, Ordering::Relaxed) < 2 {
+                        return Ok(PreparationStep::Yielded);
+                    }
+                    Ok(PreparationStep::Complete(vec![Ok(PreparationArtifact {
+                        value: 7usize,
+                        retained: JobResourceObservation::host(1),
+                    })]))
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        // Every part ran under the same reservation: the row and its own
+        // job's batch workspace.
+        let reserved = reserved.lock().unwrap().clone();
+        assert_eq!(reserved.len(), 3);
+        assert!(reserved.iter().all(|bytes| *bytes == reserved[0]));
+        assert!(matches!(
+            &output[0],
+            PreparationRowOutcome::Committed {
+                artifact: PreparationArtifact { value: 7, .. },
+                ..
+            }
+        ));
+        assert_eq!(coordinator.snapshot().active_executions, 0);
+        assert_eq!(coordinator.snapshot().active_preparation_bridges, 1);
         drop(output);
         assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
     }

@@ -370,6 +370,7 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub claim_deadlock_aborts_total: u64,
     pub kv_blocked_requests: u64,
     pub realtime_reserve_deferrals_total: u64,
+    pub asr_encoder_live_yields_total: u64,
     pub continuous_envelope_scalar_fallbacks_total: u64,
     pub physical_execution: EnginePhysicalExecutionMetricsSnapshot,
     /// Exact backend-owned managed arenas, page ownership, and counters.

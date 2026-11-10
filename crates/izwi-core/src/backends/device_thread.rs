@@ -594,6 +594,14 @@ impl<T: DeviceResident + Send + 'static> std::ops::Deref for DeviceOwned<T> {
     }
 }
 
+impl<T: DeviceResident + Send + 'static> std::ops::DerefMut for DeviceOwned<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.value
+            .as_mut()
+            .expect("a device-owned value is present until it drops")
+    }
+}
+
 impl<T: DeviceResident + Clone + Send + 'static> Clone for DeviceOwned<T> {
     fn clone(&self) -> Self {
         Self::new((**self).clone())

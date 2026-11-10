@@ -62,6 +62,7 @@ pub const ENGINE_SCHEDULER_PREEMPTIONS_TOTAL: &str = "engine.scheduler.preemptio
 pub const ENGINE_SCHEDULER_KV_BLOCKED_REQUESTS: &str = "engine.scheduler.kv_blocked_requests";
 pub const ENGINE_SCHEDULER_RESERVE_DEFERRALS_TOTAL: &str =
     "engine.scheduler.reserve_deferrals_total";
+pub const ENGINE_ASR_ENCODER_LIVE_YIELDS_TOTAL: &str = "engine.asr.encoder_live_yields_total";
 pub const ENGINE_KV_PROMOTION_LATENCY_AVG_SECONDS: &str =
     "engine.kv_cache.promotion_latency_avg_seconds";
 pub const ENGINE_STREAM_BACKPRESSURE_TOTAL: &str = "engine.stream.backpressure_total";
@@ -436,6 +437,10 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     EngineMetricDescriptor {
         name: ENGINE_SCHEDULER_RESERVE_DEFERRALS_TOTAL,
         description: "Batch and Background requests whose start waited for the real-time reserve of a model with live demand; each request counts once.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_ASR_ENCODER_LIVE_YIELDS_TOTAL,
+        description: "Times a Batch or Background long-audio encode ended its device job after a window group because its model had live demand, and continued in a new job.",
     },
     EngineMetricDescriptor {
         name: ENGINE_SCHEDULER_CAPACITY_REPLAY_TOKENS_TOTAL,
@@ -1446,6 +1451,7 @@ pub struct EngineBatchMetricsSnapshot {
     pub claim_deadlock_aborts_total: u64,
     pub kv_blocked_requests: u64,
     pub realtime_reserve_deferrals_total: u64,
+    pub asr_encoder_live_yields_total: u64,
     pub continuous_envelope_scalar_fallbacks_total: u64,
     pub physical_execution: EnginePhysicalExecutionMetricsSnapshot,
 }
@@ -1527,6 +1533,14 @@ static ENGINE_REALTIME_RESERVE_DEFERRALS: AtomicU64 = AtomicU64::new(0);
 /// lane; recorded once per request.
 pub(crate) fn record_realtime_reserve_deferral() {
     ENGINE_REALTIME_RESERVE_DEFERRALS.fetch_add(1, Ordering::Relaxed);
+}
+
+static ENGINE_ASR_ENCODER_LIVE_YIELDS: AtomicU64 = AtomicU64::new(0);
+
+/// A batch long-audio encode gave the device up between two window groups
+/// because its model had live demand.
+pub(crate) fn record_asr_encoder_live_yield() {
+    ENGINE_ASR_ENCODER_LIVE_YIELDS.fetch_add(1, Ordering::Relaxed);
 }
 
 static ENGINE_INCREMENTAL_PREFILL_QUANTA_COMMITTED: AtomicU64 = AtomicU64::new(0);
@@ -2203,6 +2217,7 @@ pub fn engine_batch_metrics_snapshot() -> EngineBatchMetricsSnapshot {
         claim_deadlock_aborts_total: ENGINE_CLAIM_DEADLOCK_ABORTS.load(Ordering::Relaxed),
         kv_blocked_requests: ENGINE_KV_BLOCKED_REQUESTS.load(Ordering::Relaxed),
         realtime_reserve_deferrals_total: ENGINE_REALTIME_RESERVE_DEFERRALS.load(Ordering::Relaxed),
+        asr_encoder_live_yields_total: ENGINE_ASR_ENCODER_LIVE_YIELDS.load(Ordering::Relaxed),
         continuous_envelope_scalar_fallbacks_total: ENGINE_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS
             .load(Ordering::Relaxed),
         physical_execution: engine_physical_execution_metrics_snapshot(),
@@ -2589,6 +2604,7 @@ mod tests {
             ENGINE_SCHEDULER_PREEMPTIONS_TOTAL,
             ENGINE_SCHEDULER_KV_BLOCKED_REQUESTS,
             ENGINE_SCHEDULER_RESERVE_DEFERRALS_TOTAL,
+            ENGINE_ASR_ENCODER_LIVE_YIELDS_TOTAL,
         ] {
             assert!(names.contains(metric), "{metric} is not catalogued");
         }

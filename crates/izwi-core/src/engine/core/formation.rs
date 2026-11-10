@@ -563,6 +563,13 @@ impl EngineCore {
         self.scheduler.lanes_with_work()
     }
 
+    /// See [`super::super::scheduler::Scheduler::live_demand_board`].
+    pub(in crate::engine) fn live_demand_board(
+        &self,
+    ) -> std::sync::Arc<super::super::scheduler::LiveDemandBoard> {
+        self.scheduler.live_demand_board()
+    }
+
     /// See [`super::super::scheduler::Scheduler::reserved_admission_limit`].
     pub(in crate::engine) fn reserved_admission_limit(
         &self,

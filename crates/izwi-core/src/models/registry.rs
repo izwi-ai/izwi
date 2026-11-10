@@ -90,6 +90,7 @@ use crate::models::architectures::nemotron::asr::{
 use crate::models::architectures::parakeet::asr::{
     ParakeetAsrModel, ParakeetAsrTranscriptionOutput, ParakeetEncoderBatchRow,
     ParakeetHostFeatures, ParakeetPhysicalStateSpec, ParakeetPreparedEncoderArtifact,
+    ParakeetWindowedEncode,
 };
 pub(crate) use crate::models::architectures::qwen3::asr::AlignmentUnit;
 use crate::models::architectures::qwen3::asr::{
@@ -1734,6 +1735,28 @@ impl NativeAsrModel {
             Self::Parakeet(model) => model.prepare_host_features(audio, sample_rate),
             _ => Err(Error::InvalidInput(
                 "Parakeet features were requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    /// Continues one long Parakeet row's encode; see
+    /// [`ParakeetAsrModel::encode_host_features_in_parts`].
+    pub(crate) fn encode_parakeet_row_in_parts(
+        &self,
+        row: &ParakeetEncoderBatchRow<'_>,
+        encode: &mut ParakeetWindowedEncode,
+        pause: &dyn Fn() -> bool,
+    ) -> Result<Option<ParakeetPreparedEncoderArtifact>> {
+        match self {
+            Self::Parakeet(model) => model.encode_host_features_in_parts(
+                row.features,
+                row.language,
+                row.checkpoint,
+                encode,
+                pause,
+            ),
+            _ => Err(Error::InvalidInput(
+                "Parakeet encoder rows were supplied to another ASR model".into(),
             )),
         }
     }

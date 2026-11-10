@@ -391,6 +391,18 @@ youngest. Long-form speech asks for the same limit before it fans out its
 segments. `izwi_engine_scheduler_reserve_deferrals_total` counts the requests
 the reserve held back.
 
+**Bounded batch dispatches.** The same live demand bounds batch work that
+runs outside the scheduler. A long Parakeet recording encodes its windows in
+one pre-sequence preparation job; while its lane has live demand, a Batch or
+Background recording ends that job after each window group and continues in a
+new one, so the lane's live work waits for one group at most. The groups and
+the stitched output are those of the single job, and with no live demand the
+encode runs as one job. `izwi_engine_asr_encoder_live_yields_total` counts
+the jobs ended this way. Chunked families (Whisper, Qwen3-ASR, Granite
+Speech, LFM audio) already run one chunk per dispatch. VibeVoice-ASR and
+Nemotron 3.5 Transcribe read the whole recording in one context and are not
+split (see the runbook).
+
 **Mixed steps.** A chat family certified in `catalog/mixed_step.rs` runs
 prefill spans beside decode rows in one model call. None is certified yet; the
 measurements are in the support matrix (`IZWI_MIXED_STEP=0|1` overrides).

@@ -985,6 +985,23 @@ silence.
 The old defaults were a 10-minute lifetime and a 30 s idle timeout. A
 deployment that relied on them must now set them explicitly.
 
+### Batch transcription beside live traffic
+
+A model that serves live and batch requests shares its device between them
+between device jobs; a running job is never interrupted. Long recordings are
+therefore transcribed in bounded jobs where the model allows it: Whisper,
+Qwen3-ASR, Granite Speech and the LFM audio models run one chunk per job, and
+a Batch or Background Parakeet recording encodes one window group per job
+(one 82 s window, four on CUDA) while its model has live demand.
+`izwi_engine_asr_encoder_live_yields_total` counts the jobs Parakeet ended
+this way.
+
+VibeVoice-ASR and Nemotron 3.5 Transcribe read the whole recording in one
+context, so splitting it would change the transcript. A batch request of
+either holds the device for the length of one pass, and a live request of the
+same model waits for it. A deployment that needs strict live latency should
+serve these two for batch on a separate model instance or device.
+
 ### Hierarchical KV offload (DS4, explicit opt-in)
 
 DS4 demotes cold committed prefix pages from the device KV arenas into a

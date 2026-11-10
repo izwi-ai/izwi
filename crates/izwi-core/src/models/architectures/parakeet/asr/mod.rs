@@ -1266,20 +1266,49 @@ impl ParakeetAsrModel {
         language: Option<&str>,
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<ParakeetPreparedEncoderArtifact> {
+        self.encode_host_features_in_parts(
+            features,
+            language,
+            checkpoint,
+            &mut ParakeetWindowedEncode::default(),
+            &|| false,
+        )?
+        .ok_or_else(|| Error::InferenceError("Parakeet encode paused unasked".into()))
+    }
+
+    /// [`Self::encode_host_features`] as one or more calls over the same
+    /// `encode`: after a window group, with windows left, `pause` may end
+    /// the call (`None`) so the caller can hand the device to other work,
+    /// and the next call continues at the following group. The groups and
+    /// their arithmetic are those of the single call, so the artifact is
+    /// the same however the calls divide them.
+    pub(crate) fn encode_host_features_in_parts(
+        &self,
+        features: &ParakeetHostFeatures,
+        language: Option<&str>,
+        checkpoint: &dyn Fn() -> Result<()>,
+        encode: &mut ParakeetWindowedEncode,
+        pause: &dyn Fn() -> bool,
+    ) -> Result<Option<ParakeetPreparedEncoderArtifact>> {
         let encode_started = Instant::now();
-        let encoded = self.encode_log_mel(
+        let encoded = self.encode_log_mel_in_parts(
             &features.log_mel,
             &mut ParakeetTimings::default(),
             checkpoint,
-        )?;
-        let encode_ms = elapsed_ms(encode_started);
-        Ok(features.artifact(
+            &mut encode.progress,
+            pause,
+        );
+        encode.encode_ms += elapsed_ms(encode_started);
+        let Some(encoded) = encoded? else {
+            return Ok(None);
+        };
+        Ok(Some(features.artifact(
             deep_copy_tensor_storage(&encoded.encoded)?,
             encoded.windows,
             language,
             self.encoder_windowing,
-            encode_ms,
-        ))
+            encode.encode_ms,
+        )))
     }
 
     /// Encodes the rows of one preparation batch. A single row runs
@@ -1355,6 +1384,26 @@ impl ParakeetAsrModel {
         timings: &mut ParakeetTimings,
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<ParakeetEncoded> {
+        self.encode_log_mel_in_parts(
+            log_mel,
+            timings,
+            checkpoint,
+            &mut WindowedEncodeProgress::default(),
+            &|| false,
+        )?
+        .ok_or_else(|| Error::InferenceError("Parakeet encode paused unasked".into()))
+    }
+
+    /// [`Self::encode_log_mel`] from `progress`, ending early (`None`) after
+    /// a window group when `pause` asks for it.
+    fn encode_log_mel_in_parts(
+        &self,
+        log_mel: &ParakeetLogMel,
+        timings: &mut ParakeetTimings,
+        checkpoint: &dyn Fn() -> Result<()>,
+        progress: &mut WindowedEncodeProgress,
+        pause: &dyn Fn() -> bool,
+    ) -> Result<Option<ParakeetEncoded>> {
         let device = self.preprocessor.device();
         self.network.encoder.encode_windows(
             log_mel.frames(),
@@ -1364,6 +1413,8 @@ impl ParakeetAsrModel {
             &mut |columns| log_mel.normalize_and_upload(columns, device),
             timings,
             checkpoint,
+            progress,
+            pause,
         )
     }
 
@@ -2510,7 +2561,10 @@ impl ParakeetEncoder {
     /// [`EncoderWindowing`]). `window_features` returns the
     /// `[1, mel_bins, columns]` features of a log-mel column range, and
     /// `checkpoint` runs before every window so a cancelled or expired
-    /// request stops within one window.
+    /// request stops within one window. The encode starts at `progress`
+    /// and, after a window group that leaves windows to encode, returns
+    /// `None` when `pause` asks for it; a later call continues from there.
+    #[allow(clippy::too_many_arguments)]
     fn encode_windows(
         &self,
         feature_frames: usize,
@@ -2520,7 +2574,9 @@ impl ParakeetEncoder {
         window_features: &mut dyn FnMut(Range<usize>) -> Result<Tensor>,
         timings: &mut ParakeetTimings,
         checkpoint: &dyn Fn() -> Result<()>,
-    ) -> Result<ParakeetEncoded> {
+        progress: &mut WindowedEncodeProgress,
+        pause: &dyn Fn() -> bool,
+    ) -> Result<Option<ParakeetEncoded>> {
         let plan = plan_encoder_windows(
             encoded_len,
             windowing.frames,
@@ -2541,11 +2597,11 @@ impl ParakeetEncoder {
                 window_features,
                 timings,
                 checkpoint,
+                progress,
+                pause,
             );
         }
-        let mut stitched: Option<Tensor> = None;
-        let mut pos_emb: Option<Tensor> = None;
-        for window in &plan {
+        for window in &plan[progress.next_window.min(plan.len())..] {
             checkpoint()?;
             let upload_started = Instant::now();
             let features = window_features(window.feature_columns(feature_frames))?;
@@ -2565,17 +2621,17 @@ impl ParakeetEncoder {
                 let x = x.pad_with_zeros(1, 0, padded - frames)?;
                 let encoded = self.encode_padded(x, &[frames])?.narrow(1, 0, frames)?;
                 timings.encoder_layers_ms += elapsed_ms(layers_started);
-                return Ok(ParakeetEncoded {
+                return Ok(Some(ParakeetEncoded {
                     encoded,
                     encoded_len,
                     windows: 1,
-                });
+                }));
             }
 
             // Relative positions depend only on i - j, so one embedding of
             // the window length serves every window.
             let pos_started = Instant::now();
-            let pos = match pos_emb.take() {
+            let pos = match progress.pos_emb.take() {
                 Some(pos) if pos.dim(1)? == 2 * frames - 1 => pos,
                 _ => self.positions(frames, x.device())?,
             };
@@ -2586,16 +2642,16 @@ impl ParakeetEncoder {
                 x = layer.forward(&x, &pos, None)?;
             }
             timings.encoder_layers_ms += elapsed_ms(layers_started);
-            pos_emb = Some(pos);
+            progress.pos_emb = Some(pos);
 
             if plan.len() == 1 {
-                return Ok(ParakeetEncoded {
+                return Ok(Some(ParakeetEncoded {
                     encoded: x,
                     encoded_len,
                     windows: 1,
-                });
+                }));
             }
-            let output = match stitched.take() {
+            let output = match progress.stitched.take() {
                 Some(output) => output,
                 None => Tensor::zeros((1, encoded_len, self.geometry.dim), x.dtype(), x.device())?,
             };
@@ -2610,15 +2666,13 @@ impl ParakeetEncoder {
             drop((kept, x));
             // Metal returns pooled buffers only at a synchronization point.
             output.device().synchronize()?;
-            stitched = Some(output);
+            progress.stitched = Some(output);
+            progress.next_window += 1;
+            if progress.next_window < plan.len() && pause() {
+                return Ok(None);
+            }
         }
-        Ok(ParakeetEncoded {
-            encoded: stitched.ok_or_else(|| {
-                Error::InferenceError("Parakeet windowed encode stitched no frames".into())
-            })?,
-            encoded_len,
-            windows: plan.len(),
-        })
+        progress.finish(encoded_len, plan.len()).map(Some)
     }
 
     /// [`Self::encode_windows`] over a long input's windows, `rows` at a time
@@ -2637,9 +2691,12 @@ impl ParakeetEncoder {
         window_features: &mut dyn FnMut(Range<usize>) -> Result<Tensor>,
         timings: &mut ParakeetTimings,
         checkpoint: &dyn Fn() -> Result<()>,
-    ) -> Result<ParakeetEncoded> {
-        let mut stitched: Option<Tensor> = None;
-        for group in plan.chunks(rows.max(1)) {
+        progress: &mut WindowedEncodeProgress,
+        pause: &dyn Fn() -> bool,
+    ) -> Result<Option<ParakeetEncoded>> {
+        // A pause falls between whole groups, so the remaining windows
+        // group exactly as the uninterrupted encode groups them.
+        for group in plan[progress.next_window.min(plan.len())..].chunks(rows.max(1)) {
             checkpoint()?;
             let upload_started = Instant::now();
             let inputs = group
@@ -2658,7 +2715,7 @@ impl ParakeetEncoder {
             drop(inputs);
             timings.encoder_layers_ms += elapsed_ms(layers_started);
 
-            let output = match stitched.take() {
+            let output = match progress.stitched.take() {
                 Some(output) => output,
                 None => {
                     let first = encoded.first().ok_or_else(|| {
@@ -2681,15 +2738,13 @@ impl ParakeetEncoder {
             }
             // Metal returns pooled buffers only at a synchronization point.
             output.device().synchronize()?;
-            stitched = Some(output);
+            progress.stitched = Some(output);
+            progress.next_window += group.len();
+            if progress.next_window < plan.len() && pause() {
+                return Ok(None);
+            }
         }
-        Ok(ParakeetEncoded {
-            encoded: stitched.ok_or_else(|| {
-                Error::InferenceError("Parakeet windowed encode stitched no frames".into())
-            })?,
-            encoded_len,
-            windows: plan.len(),
-        })
+        progress.finish(encoded_len, plan.len()).map(Some)
     }
 
     /// The stem over one window's `[1, mel_bins, columns]` features, cut to
@@ -2860,6 +2915,56 @@ struct ParakeetEncoded {
     encoded: Tensor,
     encoded_len: usize,
     windows: usize,
+}
+
+/// Where a long input's windowed encode stands: the windows already
+/// encoded and the output their kept frames were stitched into.
+#[derive(Default)]
+struct WindowedEncodeProgress {
+    next_window: usize,
+    stitched: Option<Tensor>,
+    /// The sequential loop's relative positions, reused by every window.
+    pos_emb: Option<Tensor>,
+}
+
+impl WindowedEncodeProgress {
+    /// The stitched output of all `windows` windows.
+    fn finish(&mut self, encoded_len: usize, windows: usize) -> Result<ParakeetEncoded> {
+        Ok(ParakeetEncoded {
+            encoded: self.stitched.take().ok_or_else(|| {
+                Error::InferenceError("Parakeet windowed encode stitched no frames".into())
+            })?,
+            encoded_len,
+            windows,
+        })
+    }
+}
+
+impl crate::backends::DeviceResident for WindowedEncodeProgress {
+    fn device_location(&self) -> Option<candle_core::DeviceLocation> {
+        self.stitched
+            .as_ref()
+            .map(|stitched| stitched.device().location())
+    }
+}
+
+/// One request's encode across the calls of
+/// [`ParakeetAsrModel::encode_host_features_in_parts`]. Between calls it
+/// holds device buffers, so wherever it is dropped they are freed on the
+/// device's thread.
+pub(crate) struct ParakeetWindowedEncode {
+    progress: crate::backends::DeviceOwned<WindowedEncodeProgress>,
+    /// Time spent encoding so far, without the pauses between calls.
+    encode_ms: f64,
+}
+
+impl Default for ParakeetWindowedEncode {
+    fn default() -> Self {
+        Self {
+            progress: crate::backends::DeviceOwned::new(WindowedEncodeProgress::default()),
+            encode_ms: 0.0,
+        }
+    }
 }
 
 /// Output frames the subsampling stem computes per slice (9.6 s): a slice
@@ -4128,8 +4233,9 @@ mod tests {
         EncoderWindowing, Joint, LstmCell, ParakeetAsrModel, ParakeetDecoder, ParakeetEncoded,
         ParakeetEncoder, ParakeetEncoderBatchRow, ParakeetHostFeatures, ParakeetLogMel,
         ParakeetNetwork, ParakeetPreparedEncoderArtifact, ParakeetPreprocessor,
-        ParakeetRetainedDecodeBatchRow, ParakeetRetainedDecodeStep, ParakeetTimings, Predictor,
-        TdtTokenFrame, DEFAULT_MAX_SYMBOLS, PRED_HIDDEN,
+        ParakeetRetainedDecodeBatchRow, ParakeetRetainedDecodeStep, ParakeetTimings,
+        ParakeetWindowedEncode, Predictor, TdtTokenFrame, WindowedEncodeProgress,
+        DEFAULT_MAX_SYMBOLS, PRED_HIDDEN,
     };
     use super::{
         encoder_batch_shape, encoder_graph_shape, encoder_graphs_requested,
@@ -4416,15 +4522,19 @@ mod tests {
         window_features: &mut dyn FnMut(std::ops::Range<usize>) -> Result<Tensor>,
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<ParakeetEncoded> {
-        encoder.encode_windows(
-            feature_frames,
-            encoded_len,
-            windowing,
-            window_rows,
-            window_features,
-            &mut ParakeetTimings::default(),
-            checkpoint,
-        )
+        encoder
+            .encode_windows(
+                feature_frames,
+                encoded_len,
+                windowing,
+                window_rows,
+                window_features,
+                &mut ParakeetTimings::default(),
+                checkpoint,
+                &mut WindowedEncodeProgress::default(),
+                &|| false,
+            )
+            .map(|encoded| encoded.expect("an encode that never pauses completes"))
     }
 
     /// Largest absolute difference; NaN or infinity counts as infinitely far.
@@ -5871,6 +5981,129 @@ mod tests {
                 "{rows} rows: max |diff| {diff} of {scale}"
             );
         }
+    }
+
+    /// An encode that pauses after every window group and continues in a
+    /// later call stitches the same bytes as the uninterrupted encode, for
+    /// sequential and stacked windows alike, and pauses only when asked.
+    #[test]
+    fn paused_windowed_encode_is_bit_identical_to_the_uninterrupted_one() {
+        let device = Device::Cpu;
+        let encoder = random_encoder(TINY, 11, &device);
+        let valid = 8 * 120 + 3;
+        let frames = valid + 1;
+        let encoded_len = subsampled_len_3x(valid);
+        let log_mel = random_log_mel(frames, valid, 33);
+        let windowing = EncoderWindowing {
+            frames: 32,
+            left_context: 8,
+            right_context: 8,
+        };
+        let values = |tensor: &Tensor| tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for rows in [1, 2, 3] {
+            let whole = encode_windows_stacked(
+                &encoder,
+                frames,
+                encoded_len,
+                windowing,
+                rows,
+                &mut |columns| log_mel.normalize_and_upload(columns, &device),
+                &|| Ok(()),
+            )
+            .unwrap();
+            let groups = whole.windows.div_ceil(rows);
+            assert!(groups >= 2, "{groups} groups");
+
+            let mut progress = WindowedEncodeProgress::default();
+            let pause_checks = Cell::new(0);
+            let mut calls = 0;
+            let paused = loop {
+                calls += 1;
+                let step = encoder
+                    .encode_windows(
+                        frames,
+                        encoded_len,
+                        windowing,
+                        rows,
+                        &mut |columns| log_mel.normalize_and_upload(columns, &device),
+                        &mut ParakeetTimings::default(),
+                        &|| Ok(()),
+                        &mut progress,
+                        &|| {
+                            pause_checks.set(pause_checks.get() + 1);
+                            true
+                        },
+                    )
+                    .unwrap();
+                if let Some(encoded) = step {
+                    break encoded;
+                }
+            };
+            // One call per group, and no pause is asked after the last.
+            assert_eq!(calls, groups, "{rows} rows");
+            assert_eq!(pause_checks.get(), groups - 1, "{rows} rows");
+            assert_eq!(paused.windows, whole.windows);
+            assert_eq!(paused.encoded.dims(), whole.encoded.dims());
+            assert_eq!(
+                values(&paused.encoded),
+                values(&whole.encoded),
+                "{rows} rows"
+            );
+        }
+    }
+
+    /// The model-level encode in parts returns the artifact of the single
+    /// call, and one that is never asked to pause finishes in its first call.
+    #[test]
+    fn retained_encoder_artifact_in_parts_matches_the_single_call() {
+        let device = Device::Cpu;
+        let mut model = forced_label_model(&device);
+        model.encoder_windowing = EncoderWindowing {
+            frames: 32,
+            left_context: 10,
+            right_context: 10,
+        };
+        let audio = XorShift(13).values(64_037, 0.1, 0.0);
+        let features = model.prepare_host_features(&audio, 16_000).unwrap();
+        let whole = model
+            .encode_host_features(&features, Some("en"), &|| Ok(()))
+            .unwrap();
+        assert_eq!(whole.encoder_windows, 3);
+        let values = |tensor: &Tensor| tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let mut encode = ParakeetWindowedEncode::default();
+        let mut calls = 0;
+        let parts = loop {
+            calls += 1;
+            let step = model
+                .encode_host_features_in_parts(
+                    &features,
+                    Some("en"),
+                    &|| Ok(()),
+                    &mut encode,
+                    &|| true,
+                )
+                .unwrap();
+            if let Some(artifact) = step {
+                break artifact;
+            }
+        };
+        assert_eq!(calls, 3);
+        assert_eq!(parts.encoder_windows, whole.encoder_windows);
+        assert_eq!(parts.encoded_len, whole.encoded_len);
+        assert_eq!(values(&parts.encoded), values(&whole.encoded));
+
+        let unasked = model
+            .encode_host_features_in_parts(
+                &features,
+                Some("en"),
+                &|| Ok(()),
+                &mut ParakeetWindowedEncode::default(),
+                &|| false,
+            )
+            .unwrap()
+            .expect("an encode that is never asked to pause completes");
+        assert_eq!(values(&unasked.encoded), values(&whole.encoded));
     }
 
     #[test]

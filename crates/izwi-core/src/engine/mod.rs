@@ -195,6 +195,7 @@ pub use resources::{
     ResourceAuthoritySnapshot, ResourceEstimate, ResourceLease, ResourceLedger,
     ResourceReservation, ResourceVector,
 };
+pub(crate) use scheduler::LiveDemandBoard;
 pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig, SchedulingPolicy};
 pub use types::FinishReason as OutputFinishReason;
 pub use types::{
@@ -725,6 +726,8 @@ pub struct Engine {
     /// The scheduler counts and KV snapshot telemetry last read, served while
     /// a step holds the core for writing so metrics never wait behind it.
     telemetry_cache: std::sync::Mutex<Option<EngineCoreTelemetry>>,
+    /// The scheduler's live demand per lane, readable without the core lock.
+    live_demand: Arc<scheduler::LiveDemandBoard>,
 }
 
 /// Scheduler counts and the managed-KV snapshot for telemetry.
@@ -1448,6 +1451,7 @@ impl Engine {
         let direct_request_preparation_capacity = config.max_batch_size.max(1);
 
         Ok(Self {
+            live_demand: core.live_demand_board(),
             core: Arc::new(RwLock::new(core)),
             gates: StepGates::new(config.lane_step_drivers),
             request_processor,
@@ -3151,6 +3155,13 @@ impl Engine {
         self.core.read().await.lanes_with_work()
     }
 
+    /// The scheduler's live demand per lane (a lane is a model instance):
+    /// read by batch work that runs outside the scheduler, between its
+    /// device jobs, and written by streams that run outside it.
+    pub(crate) fn live_demand(&self) -> Arc<scheduler::LiveDemandBoard> {
+        self.live_demand.clone()
+    }
+
     /// How many requests of `model_variant` a caller below the Realtime
     /// class may run at once while the model has live demand; `None` when
     /// the model has none or reserves nothing.
@@ -4816,6 +4827,7 @@ mod tests {
     pub(super) fn engine_around_core(core: EngineCore) -> Engine {
         let config = core.config().clone();
         Engine {
+            live_demand: core.live_demand_board(),
             core: Arc::new(RwLock::new(core)),
             gates: StepGates::new(config.lane_step_drivers),
             request_processor: RequestProcessor::new(config.clone()),
@@ -6203,6 +6215,7 @@ mod tests {
         )
         .unwrap();
         let engine = Arc::new(Engine {
+            live_demand: core.live_demand_board(),
             core: Arc::new(RwLock::new(core)),
             gates: StepGates::new(false),
             request_processor: RequestProcessor::new(config.clone()),

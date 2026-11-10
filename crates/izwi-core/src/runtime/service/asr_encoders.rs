@@ -127,6 +127,9 @@ pub(super) struct ParakeetEncoderQueueKey {
 pub(super) struct ParakeetEncoderBatcher {
     pub(super) coordinator: Arc<InferenceCoordinator>,
     pub(super) formation: EncoderBatchFormation<ParakeetEncoderQueueKey, ParakeetEncoderPending>,
+    /// The engine's live demand per model, which a long batch row checks
+    /// between its window groups.
+    pub(super) live_demand: Arc<crate::engine::LiveDemandBoard>,
 }
 
 /// A row waiting for an encoder batch.
@@ -443,10 +446,14 @@ fn parakeet_encoder_batching_enabled() -> bool {
 }
 
 impl ParakeetEncoderBatcher {
-    pub(super) fn new(coordinator: Arc<InferenceCoordinator>) -> Self {
+    pub(super) fn new(
+        coordinator: Arc<InferenceCoordinator>,
+        live_demand: Arc<crate::engine::LiveDemandBoard>,
+    ) -> Self {
         Self {
             coordinator,
             formation: EncoderBatchFormation::new(),
+            live_demand,
         }
     }
 
@@ -553,6 +560,22 @@ impl ParakeetEncoderBatcher {
         let work = WorkUnit::PreSequencePreparation {
             kind: "asr.encoder.parakeet".into(),
         };
+        // A long recording's windows encode as one device job, which a live
+        // request of the same model would wait out. A Batch or Background
+        // row therefore ends its job after a window group while the model
+        // has live demand, and encodes the next group in a new job. The
+        // groups and the artifact are those of the single job.
+        let yields_to_live_demand = match (&rows[..], contract.adapter_binding()) {
+            ([row], Ok(binding)) if !row.features.single_window() => {
+                let live_demand = self.live_demand.clone();
+                let lane = Some(binding.model_instance_id);
+                let workload_class = row.job.spec.workload_class;
+                Some(move || live_demand.batch_work_yields(lane, workload_class, Instant::now()))
+            }
+            _ => None,
+        };
+        let mut windowed_encode = ParakeetWindowedEncode::default();
+        let mut first_job = true;
         // The host stage recorded the request bytes plus its log-mel
         // features, which the encode consumes; each row's commit records
         // only what its artifact keeps (request bytes and the encoder
@@ -613,8 +636,13 @@ impl ParakeetEncoderBatcher {
         }
         let result = self
             .coordinator
-            .run_loaded_native_preparation_batch(sealed, contract, work, move |live| {
-                crate::engine::metrics::record_asr_preparation_batch_rows(model_label, live.len());
+            .run_loaded_native_preparation_batch_in_parts(sealed, contract, work, move |live| {
+                if std::mem::take(&mut first_job) {
+                    crate::engine::metrics::record_asr_preparation_batch_rows(
+                        model_label,
+                        live.len(),
+                    );
+                }
                 // Checked before the encode and between a long row's
                 // windows, so a disconnected or expired request fails
                 // alone and releases the device within one window.
@@ -646,18 +674,35 @@ impl ParakeetEncoderBatcher {
                     })
                     .collect::<Vec<_>>();
                 let encode_started = Instant::now();
-                let prepared = model.prepare_parakeet_encoder_batch(&rows)?;
+                let prepared = match (&yields_to_live_demand, &rows[..]) {
+                    (Some(pause), [row]) => {
+                        match model.encode_parakeet_row_in_parts(row, &mut windowed_encode, pause)
+                        {
+                            Ok(Some(artifact)) => Ok(Some(vec![Ok(artifact)])),
+                            Ok(None) => Ok(None),
+                            Err(error @ (Error::Cancelled(_) | Error::Timeout(_))) => {
+                                Ok(Some(vec![Err(error)]))
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    _ => model.prepare_parakeet_encoder_batch(&rows).map(Some),
+                }?;
                 crate::engine::metrics::record_asr_device_phase(
                     model_label,
                     crate::engine::metrics::AsrPhase::Encoder,
                     encode_started,
                 );
+                let Some(prepared) = prepared else {
+                    crate::engine::metrics::record_asr_encoder_live_yield();
+                    return Ok(PreparationStep::Yielded);
+                };
                 if prepared.len() != live.len() {
                     return Err(Error::InferenceError(
                         "Parakeet encoder batch returned the wrong row count".into(),
                     ));
                 }
-                Ok(prepared
+                let artifacts = prepared
                     .into_iter()
                     .zip(live)
                     .map(|(artifact, index)| {
@@ -677,7 +722,8 @@ impl ParakeetEncoderBatcher {
                             value: artifact,
                         })
                     })
-                    .collect::<Vec<_>>())
+                    .collect::<Vec<_>>();
+                Ok(PreparationStep::Complete(artifacts))
             })
             .await;
         match result {

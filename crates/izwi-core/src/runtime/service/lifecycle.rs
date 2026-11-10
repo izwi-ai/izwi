@@ -288,7 +288,6 @@ impl RuntimeService {
             Arc::new(GraniteSpeechEncoderBatcher::new(coordinator.clone()));
         let granite_speech5_encoder_batcher =
             Arc::new(GraniteSpeech5EncoderBatcher::new(coordinator.clone()));
-        let parakeet_encoder_batcher = Arc::new(ParakeetEncoderBatcher::new(coordinator.clone()));
         let nemotron_encoder_batcher = Arc::new(NemotronEncoderBatcher::new(coordinator.clone()));
         let realtime_asr_sequence_capacity = asr_realtime_sessions.retained_sequence_capacity()?;
         worker_config.resource_authority = Some(coordinator.resource_authority());
@@ -320,6 +319,10 @@ impl RuntimeService {
             "resolved runtime concurrency"
         );
         let core_engine = Arc::new(CoreEngine::new_with_worker(core_config, worker_config)?);
+        let parakeet_encoder_batcher = Arc::new(ParakeetEncoderBatcher::new(
+            coordinator.clone(),
+            core_engine.live_demand(),
+        ));
         let backend_router = BackendRouter::from_context(backend_context);
         let tokenizer = Arc::new(RwLock::new(None));
         let codec = Arc::new(RwLock::new(AudioCodec::new()));
