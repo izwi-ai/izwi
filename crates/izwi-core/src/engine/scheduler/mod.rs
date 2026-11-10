@@ -517,6 +517,36 @@ impl LiveDemandBoard {
     ) -> bool {
         Scheduler::is_reserve_bound_class(workload_class) && self.held_until(lane, now).is_some()
     }
+
+    /// Record the live demand of a Realtime or Streaming stream of
+    /// `model_variant` that runs on `lane` outside the scheduler (a
+    /// direct-route stream), held from `now` as a request's is.
+    pub(crate) fn note_direct_stream(
+        &self,
+        lane: ExecutionLane,
+        model_variant: ModelVariant,
+        workload_class: WorkloadClass,
+        now: Instant,
+    ) {
+        if !Scheduler::is_live_class(workload_class) {
+            return;
+        }
+        let mut lanes = self.lanes();
+        // The stream has no execution profile; the lane keeps the rows of
+        // the same model's last live engine request.
+        let decode_dispatch_rows = lanes
+            .get(&lane)
+            .filter(|demand| demand.model_variant == Some(model_variant))
+            .and_then(|demand| demand.decode_dispatch_rows);
+        lanes.insert(
+            lane,
+            LiveDemand {
+                until: now + REALTIME_RESERVE_HOLD,
+                model_variant: Some(model_variant),
+                decode_dispatch_rows,
+            },
+        );
+    }
 }
 
 /// The live demand of one lane.
@@ -8384,6 +8414,69 @@ mod tests {
 
         scheduler.finish_request(&"live".to_string());
         lapse_live_demand(&mut scheduler);
+        assert!(!board.batch_work_yields(None, WorkloadClass::Batch, Instant::now()));
+    }
+
+    /// P2.5: a Realtime or Streaming stream that runs outside the scheduler
+    /// is live demand on its lane like an engine stream: batch requests of
+    /// the lane start only below the reserve limit and batch work outside
+    /// the scheduler yields, until the hold lapses. A stream of another
+    /// class, or on another lane, records nothing.
+    #[test]
+    fn a_direct_stream_is_live_demand_on_its_lane() {
+        let mut scheduler = reserve_scheduler(None, SchedulingPolicy::WeightedFair);
+        let board = scheduler.live_demand_board();
+        let other_lane = Some(crate::engine::ModelInstanceId::new(77));
+        let now = Instant::now();
+        for class in [
+            WorkloadClass::Interactive,
+            WorkloadClass::Batch,
+            WorkloadClass::Background,
+        ] {
+            board.note_direct_stream(None, ModelVariant::Kokoro82M, class, now);
+        }
+        board.note_direct_stream(
+            other_lane,
+            ModelVariant::Kokoro82M,
+            WorkloadClass::Streaming,
+            now,
+        );
+        assert!(!board.batch_work_yields(None, WorkloadClass::Batch, now));
+        for index in 0..4 {
+            add_classed(
+                &mut scheduler,
+                &format!("batch-{index}"),
+                WorkloadClass::Batch,
+                4,
+            );
+        }
+        assert_eq!(admit_all(&mut scheduler).len(), 4);
+
+        board.note_direct_stream(
+            None,
+            ModelVariant::Kokoro82M,
+            WorkloadClass::Streaming,
+            Instant::now(),
+        );
+        assert!(board.batch_work_yields(None, WorkloadClass::Batch, Instant::now()));
+        for index in 4..8 {
+            add_classed(
+                &mut scheduler,
+                &format!("batch-{index}"),
+                WorkloadClass::Batch,
+                4,
+            );
+        }
+        // Four rows reserve one, and four batch requests already run.
+        assert!(admit_all(&mut scheduler).is_empty());
+        for index in 0..2 {
+            scheduler.finish_request(&format!("batch-{index}"));
+        }
+        assert_eq!(admit_all(&mut scheduler).len(), 1);
+        assert_eq!(running_of(&scheduler, WorkloadClass::Batch), 3);
+
+        lapse_live_demand(&mut scheduler);
+        assert!(!admit_all(&mut scheduler).is_empty());
         assert!(!board.batch_work_yields(None, WorkloadClass::Batch, Instant::now()));
     }
 

@@ -92,6 +92,22 @@ impl RuntimeService {
             .get_kokoro(variant)
             .await
             .ok_or_else(|| Error::InferenceError("Kokoro model not loaded".to_string()))?;
+        // The stream runs outside the engine scheduler: one planned chunk a
+        // device job, at the weight of the request's workload class. It is
+        // recorded as its model's live demand before each job, as the
+        // scheduler records an engine stream, so the model's batch work
+        // leaves it a sequence and yields between its own jobs.
+        let lane = Some(execution_contract.adapter_binding()?.model_instance_id);
+        let live_demand = self.core_engine.live_demand();
+        let note_live_demand = || {
+            live_demand.note_direct_stream(
+                lane,
+                variant,
+                job.spec.workload_class,
+                std::time::Instant::now(),
+            )
+        };
+        note_live_demand();
         let text = request.text;
         let text_for_limit = text.clone();
         let speaker = request
@@ -149,6 +165,7 @@ impl RuntimeService {
         )?;
 
         for (sequence, planned) in stream_chunks.into_iter().enumerate() {
+            note_live_demand();
             let model_for_task = model.clone();
             let speaker_for_task = speaker.clone();
             let language_for_task = language.clone();

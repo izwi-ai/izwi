@@ -403,6 +403,17 @@ Speech, LFM audio) already run one chunk per dispatch. VibeVoice-ASR and
 Nemotron 3.5 Transcribe read the whole recording in one context and are not
 split (see the runbook).
 
+**Direct-route streams.** Kokoro streams its planned chunks on the
+coordinator's direct route, one chunk per device job, while buffered Kokoro
+runs in the engine as one atomic dispatch that joins its chunks; the engine
+path cannot emit a chunk's audio before the dispatch commits. Each chunk job
+takes the device at the weight of the request's workload class, as an engine
+dispatch does, and a Realtime or Streaming stream is recorded as its model's
+live demand before each chunk. The real-time reserve and the bounded batch
+dispatches above therefore apply to a model whose only live work is a direct
+stream. Within one model, chunk jobs and engine dispatches take turns in
+arrival order.
+
 **Mixed steps.** A chat family certified in `catalog/mixed_step.rs` runs
 prefill spans beside decode rows in one model call. None is certified yet; the
 measurements are in the support matrix (`IZWI_MIXED_STEP=0|1` overrides).
