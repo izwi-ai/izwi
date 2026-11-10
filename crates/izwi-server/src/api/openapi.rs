@@ -1179,8 +1179,9 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "get",
         "Realtime",
         "List realtime capabilities",
-        "The realtime profiles `model` may name, the voices, audio formats and turn detection \
-         types, and the session limits.",
+        "The realtime profiles `model` may name, the transcription models and whether each \
+         transcribes a turn while it is spoken (`transcription_mode`: `live` or `turn`), the \
+         voices, audio formats and turn detection types, and the session limits.",
         preview_response(),
     );
     add_speech_api_paths(paths);

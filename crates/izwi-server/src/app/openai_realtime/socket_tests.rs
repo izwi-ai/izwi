@@ -595,3 +595,276 @@ async fn persisted_sessions_record_their_turns_in_the_voice_history() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+/// A model with a native streaming session, which transcribes turns live.
+const LIVE_ASR_MODEL: &str = "Voxtral-Mini-4B-Realtime-2602";
+
+fn live_session(turn_detection: Value) -> Value {
+    json!({"type": "session.update", "session": {"type": "realtime", "audio": {"input": {
+        "transcription": {"model": LIVE_ASR_MODEL},
+        "turn_detection": turn_detection}}}})
+}
+
+/// Wait for every scripted native session to close.
+async fn sessions_closed(script: &super::live::scripted::Script) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while script.open.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the native session is released"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn deltas(events: &[Value]) -> String {
+    events
+        .iter()
+        .filter(|event| event["type"] == "conversation.item.input_audio_transcription.delta")
+        .filter_map(|event| event["delta"].as_str())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_model_transcribes_a_turn_while_it_is_spoken() {
+    let server = serve().await;
+    let script = super::live::scripted::install(&server.state);
+    let mut client = connect(&server, "?model=izwi-voice").await;
+    handshake(&mut client).await;
+    send(
+        &mut client,
+        live_session(json!({"type": "server_vad", "threshold": 0.01, "silence_duration_ms": 300})),
+    )
+    .await;
+    assert_eq!(next(&mut client).await["type"], "session.updated");
+
+    // 300 ms of silence and 900 ms of tone: the turn is still open.
+    let mut offset = 0;
+    for chunk in 0..12 {
+        let samples = if chunk < 3 {
+            vec![0; 2_400]
+        } else {
+            tone(100, offset)
+        };
+        offset += samples.len();
+        send(&mut client, pcm_chunk(&samples)).await;
+    }
+    let mut events = until(
+        &mut client,
+        "conversation.item.input_audio_transcription.delta",
+    )
+    .await;
+    let started = events[position(&events, "input_audio_buffer.speech_started")].clone();
+    assert!(
+        !types(&events).contains(&"input_audio_buffer.speech_stopped"),
+        "the first delta arrives while the user speaks: {:?}",
+        types(&events)
+    );
+    assert_eq!(events.last().expect("delta")["item_id"], started["item_id"]);
+
+    // A second of silence ends the turn.
+    for _ in 0..10 {
+        send(&mut client, pcm_chunk(&[0; 2_400])).await;
+    }
+    events.extend(
+        until_all(
+            &mut client,
+            &[
+                "response.done",
+                "conversation.item.input_audio_transcription.completed",
+            ],
+        )
+        .await,
+    );
+    let kinds = types(&events);
+    assert!(
+        !kinds.contains(&"error")
+            && !kinds.contains(&"conversation.item.input_audio_transcription.failed"),
+        "{kinds:?}"
+    );
+    let committed = &events[position(&events, "input_audio_buffer.committed")];
+    assert_eq!(committed["item_id"], started["item_id"]);
+    assert!(
+        position(&events, "input_audio_buffer.speech_stopped")
+            < position(&events, "input_audio_buffer.committed")
+    );
+    assert!(
+        position(&events, "input_audio_buffer.committed")
+            < position(
+                &events,
+                "conversation.item.input_audio_transcription.completed"
+            )
+    );
+    let completed = &events[position(
+        &events,
+        "conversation.item.input_audio_transcription.completed",
+    )];
+    assert_eq!(completed["item_id"], started["item_id"]);
+    let transcript = completed["transcript"].as_str().expect("transcript");
+    assert!(
+        transcript.starts_with("word1") && transcript.ends_with("end."),
+        "{transcript}"
+    );
+    assert_eq!(deltas(&events), transcript, "the deltas add up to it");
+
+    // The item carries the same transcript, for the reply and for history.
+    send(
+        &mut client,
+        json!({"type": "conversation.item.retrieve", "item_id": started["item_id"]}),
+    )
+    .await;
+    let retrieved = until(&mut client, "conversation.item.retrieved").await;
+    assert_eq!(
+        retrieved.last().expect("item")["item"]["content"][0]["transcript"],
+        transcript
+    );
+    // One native session served the turn, and the commit closed it.
+    assert_eq!(script.started.load(std::sync::atomic::Ordering::SeqCst), 1);
+    sessions_closed(&script).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_turn_without_a_native_session_is_transcribed_at_its_commit() {
+    let server = serve().await;
+    let script = super::live::scripted::install(&server.state);
+    script
+        .unavailable
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut client = connect(&server, "?intent=transcription").await;
+    assert_eq!(next(&mut client).await["type"], "session.created");
+    send(&mut client, live_session(Value::Null)).await;
+    assert_eq!(next(&mut client).await["type"], "session.updated");
+
+    send(&mut client, pcm_chunk(&tone(200, 0))).await;
+    send(&mut client, json!({"type": "input_audio_buffer.commit"})).await;
+    // The turn-based pass runs instead (and fails here, without weights):
+    // no delta, and no `error` event for the missing session.
+    let events = until(
+        &mut client,
+        "conversation.item.input_audio_transcription.failed",
+    )
+    .await;
+    assert_eq!(
+        types(&events),
+        [
+            "input_audio_buffer.committed",
+            "conversation.item.input_audio_transcription.failed"
+        ]
+    );
+    assert_eq!(events[0]["item_id"], events[1]["item_id"]);
+    assert_eq!(script.started.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // A session that fails mid-turn falls back the same way, and its
+    // deltas are not sent a second time.
+    script
+        .unavailable
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    send(&mut client, pcm_chunk(&tone(200, 0))).await;
+    let delta = next(&mut client).await;
+    assert_eq!(
+        delta["type"],
+        "conversation.item.input_audio_transcription.delta"
+    );
+    script
+        .fail_pushes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    send(&mut client, pcm_chunk(&tone(200, 4_800))).await;
+    sessions_closed(&script).await;
+    send(&mut client, json!({"type": "input_audio_buffer.commit"})).await;
+    let events = until(
+        &mut client,
+        "conversation.item.input_audio_transcription.failed",
+    )
+    .await;
+    assert_eq!(
+        types(&events),
+        [
+            "input_audio_buffer.committed",
+            "conversation.item.input_audio_transcription.failed"
+        ]
+    );
+    assert_eq!(events[0]["item_id"], delta["item_id"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clearing_or_closing_a_live_turn_releases_its_native_session() {
+    let server = serve().await;
+    let script = super::live::scripted::install(&server.state);
+    let mut client = connect(&server, "?intent=transcription").await;
+    assert_eq!(next(&mut client).await["type"], "session.created");
+    send(&mut client, live_session(Value::Null)).await;
+    assert_eq!(next(&mut client).await["type"], "session.updated");
+
+    // A manual turn is transcribed from its first audio.
+    send(&mut client, pcm_chunk(&tone(200, 0))).await;
+    let cleared_turn = next(&mut client).await;
+    assert_eq!(
+        cleared_turn["type"],
+        "conversation.item.input_audio_transcription.delta"
+    );
+    assert_eq!(script.open.load(std::sync::atomic::Ordering::SeqCst), 1);
+    send(&mut client, json!({"type": "input_audio_buffer.clear"})).await;
+    assert_eq!(
+        next(&mut client).await["type"],
+        "input_audio_buffer.cleared"
+    );
+    sessions_closed(&script).await;
+
+    // The next turn has its own session and its own item.
+    send(&mut client, pcm_chunk(&tone(200, 0))).await;
+    let delta = next(&mut client).await;
+    assert_ne!(delta["item_id"], cleared_turn["item_id"]);
+    send(&mut client, json!({"type": "input_audio_buffer.commit"})).await;
+    let events = until(
+        &mut client,
+        "conversation.item.input_audio_transcription.completed",
+    )
+    .await;
+    assert_eq!(events[0]["type"], "input_audio_buffer.committed");
+    assert_eq!(events[0]["item_id"], delta["item_id"]);
+    let completed = events.last().expect("completed");
+    assert_eq!(completed["item_id"], delta["item_id"]);
+    assert_eq!(completed["transcript"], "word1 end.");
+    assert_eq!(completed["usage"]["type"], "duration");
+    sessions_closed(&script).await;
+
+    // A socket that closes mid-turn leaves no session behind.
+    send(&mut client, pcm_chunk(&tone(200, 0))).await;
+    assert_eq!(
+        next(&mut client).await["type"],
+        "conversation.item.input_audio_transcription.delta"
+    );
+    assert_eq!(script.open.load(std::sync::atomic::Ordering::SeqCst), 1);
+    client.close(None).await.expect("close");
+    sessions_closed(&script).await;
+    assert_eq!(script.started.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn capabilities_report_how_each_model_transcribes() {
+    let server = serve().await;
+    let capabilities: Value = reqwest::Client::new()
+        .get(format!("http://{}/v1/realtime/capabilities", server.addr))
+        .send()
+        .await
+        .expect("capabilities")
+        .json()
+        .await
+        .expect("json");
+    let mode = |model: &str| {
+        capabilities["transcription_models"]
+            .as_array()
+            .expect("transcription models")
+            .iter()
+            .find(|entry| entry["id"] == model)
+            .unwrap_or_else(|| panic!("no {model}"))["transcription_mode"]
+            .clone()
+    };
+    assert_eq!(mode(LIVE_ASR_MODEL), "live");
+    assert_eq!(mode("Parakeet-TDT-0.6B-v3"), "turn");
+    for profile in capabilities["profiles"].as_array().expect("profiles") {
+        // The built-in profiles transcribe with Parakeet, or reply with a
+        // unified model: both commit a turn before transcribing it.
+        assert_eq!(profile["transcription_mode"], "turn", "{profile}");
+    }
+}

@@ -278,6 +278,7 @@ const fn voice_latency_prometheus_name(latency: VoiceLatency) -> &'static str {
         VoiceLatency::Endpointing => "izwi_voice_endpointing_latency_seconds",
         VoiceLatency::AsrFirstPartial => "izwi_voice_asr_first_partial_seconds",
         VoiceLatency::AsrFinal => "izwi_voice_asr_final_seconds",
+        VoiceLatency::AsrLiveFirstPartial => "izwi_voice_asr_live_first_partial_seconds",
         VoiceLatency::LlmFirstToken => "izwi_voice_llm_first_token_seconds",
         VoiceLatency::TtsFirstAudio => "izwi_voice_tts_first_audio_seconds",
         VoiceLatency::TurnFirstAudio => "izwi_voice_turn_first_audio_seconds",

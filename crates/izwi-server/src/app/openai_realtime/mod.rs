@@ -11,6 +11,7 @@ pub(crate) mod audio;
 pub(crate) mod connection;
 pub(crate) mod events;
 pub(crate) mod items;
+pub(crate) mod live;
 pub(crate) mod persist;
 pub(crate) mod profiles;
 pub(crate) mod respond;

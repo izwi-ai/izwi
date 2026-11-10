@@ -14,17 +14,18 @@ use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
+use crate::app::native_asr_stream;
 use crate::app::realtime_protocol::{
     RealtimeAudioGapAction, RealtimeClose, RealtimeCloseCode, RealtimeCloseReason,
     RealtimeDeliveryClass, RealtimeErrorCode, RealtimeEventEnvelope, RealtimeProtocol,
     RealtimeServerEnvelope, RealtimeServerEvent, TRANSCRIPTION_REALTIME_VERSION,
 };
-#[cfg(test)]
-use crate::app::realtime_transport::MailboxOutput;
 use crate::app::realtime_transport::{
-    now_unix_millis, pcm16_bytes_to_i16, pcm16_i16_to_f32, spawn_writer, wav_bytes_from_pcm16_mono,
-    OutboundClass, OutboundEnqueueError, OutboundItem, OutboundLimits, OutboundMailbox,
+    now_unix_millis, pcm16_bytes_to_i16, spawn_writer, wav_bytes_from_pcm16_mono, OutboundClass,
+    OutboundEnqueueError, OutboundItem, OutboundLimits, OutboundMailbox,
 };
+#[cfg(test)]
+use crate::app::realtime_transport::{pcm16_i16_to_f32, MailboxOutput};
 use crate::state::AppState;
 pub(crate) use izwi_gateway::app::realtime_wire::{
     negotiate_transcription_protocol, parse_binary_message, BinaryMessageKind, ClientEvent,
@@ -1293,15 +1294,13 @@ async fn maybe_process_native_stream_frame(
 
     if !session.native_stream_checked {
         session.native_stream_checked = true;
-        let _permit = state.acquire_workload_permit(WorkloadClass::Realtime).await;
-        match state
-            .runtime
-            .try_start_asr_realtime_stream(
-                session.model_id.as_deref(),
-                session.language.as_deref(),
-                None,
-            )
-            .await
+        match native_asr_stream::start(
+            state,
+            session.model_id.as_deref(),
+            session.language.as_deref(),
+            None,
+        )
+        .await
         {
             Ok(stream) => session.native_asr_stream = stream,
             Err(error) if error.kind() == ErrorKind::CapacityExhausted => {
@@ -1316,12 +1315,8 @@ async fn maybe_process_native_stream_frame(
         return Ok(false);
     };
 
-    let samples = pcm16_i16_to_f32(frame_samples);
     let started = Instant::now();
-    let _permit = state.acquire_workload_permit(WorkloadClass::Realtime).await;
-    let events = state
-        .runtime
-        .push_asr_realtime_samples(stream, &samples, sample_rate)
+    let events = native_asr_stream::push(state, stream, frame_samples, sample_rate)
         .await
         .map_err(|err| NativeStreamFailure {
             message: err.to_string(),
@@ -1381,10 +1376,7 @@ async fn finish_native_stream_if_needed(
 
     let sample_rate = session.sample_rate.unwrap_or(16_000);
     let started = Instant::now();
-    let _permit = state.acquire_workload_permit(WorkloadClass::Realtime).await;
-    let events = state
-        .runtime
-        .finish_asr_realtime_stream(&mut stream)
+    let events = native_asr_stream::finish(state, &mut stream)
         .await
         .map_err(|err| err.to_string())?;
     let processing_time_ms = started.elapsed().as_secs_f64() * 1000.0;

@@ -24,8 +24,10 @@ use serde_json::{json, Value};
 
 use crate::api::request_context::RequestContext;
 use crate::app::openai_realtime::events::Ids;
+use crate::app::openai_realtime::live::{transcribes_live, transcription_mode};
 use crate::app::openai_realtime::profiles::{
-    configured_specs, resolve_profile, validate_spec, ProfileMode,
+    configured_specs, resolve_profile, transcribes_input, transcription_model, validate_spec,
+    ProfileMode,
 };
 use crate::app::openai_realtime::secrets;
 use crate::app::openai_realtime::session_config::SessionConfig;
@@ -287,20 +289,37 @@ async fn capabilities(State(state): State<AppState>) -> Result<Json<Value>, ApiE
                     } => json!({"asr": asr_model_id, "text": text_model_id, "tts": tts_model_id}),
                     ProfileMode::Unified { s2s_model_id, .. } => json!({"s2s": s2s_model_id}),
                 };
+                // How a conversation on this profile transcribes its turns
+                // when the client names no transcription model.
+                let live = transcription_model(&profile, None)
+                    .is_ok_and(|model| transcribes_live(&profile, true, &model));
                 json!({
                     "id": profile.id,
                     "mode": if profile.is_unified() { "unified" } else { "modular" },
                     "models": models,
                     "default_voice": profile.default_voice,
+                    "transcription_mode": transcription_mode(live),
                 })
             }
             Err(error) => json!({"id": spec.id, "error": error}),
+        })
+        .collect();
+    // Every model `audio.input.transcription.model` may name.
+    let transcription_models: Vec<Value> = izwi_core::ModelVariant::all()
+        .iter()
+        .filter(|variant| transcribes_input(**variant))
+        .map(|variant| {
+            json!({
+                "id": variant.dir_name(),
+                "transcription_mode": transcription_mode(izwi_core::asr_streams_live(*variant)),
+            })
         })
         .collect();
     Ok(Json(json!({
         "object": "realtime.capabilities",
         "default_profile": default_profile,
         "profiles": profiles,
+        "transcription_models": transcription_models,
         "model_aliases": {
             "openai": "gpt-realtime*, gpt-4o-realtime*, gpt-4o-mini-realtime* and gpt-audio* select the default profile",
             "audio_chat_model_ids": "a speech-to-speech model id selects that model",
