@@ -67,9 +67,11 @@ pub(crate) struct PhysicalPagedKvCheckpoint {
 }
 
 impl PhysicalPagedKvCache {
-    /// A private, single-page cache on `device` for a load-time numeric
-    /// probe: `layers` layers of `kv_heads` x `head_dim` K/V in `dtype`, room
-    /// for `tokens` tokens. It lives only for the probe, outside any
+    /// A private cache on `device` for a load-time numeric probe: `layers`
+    /// layers of `kv_heads` x `head_dim` K/V in `dtype`, room for `tokens`
+    /// tokens in whole pages of the engine's default size, so the probe runs
+    /// the paged kernels the model will (CUDA's paged decode takes only 16-,
+    /// 32- and 64-token pages). It lives only for the probe, outside any
     /// lifecycle-owned arena; a few hundred KB at probe sizes.
     pub(crate) fn scratch_for_probe(
         device: &candle_core::Device,
@@ -87,6 +89,8 @@ impl PhysicalPagedKvCache {
                 .map_err(|_| Error::InvalidInput(format!("probe cache {what} exceeds u32")))
         };
         let backend = backend_kind_for_device(device);
+        let page_tokens = crate::engine::DEFAULT_KV_PAGE_TOKENS;
+        let pages = u32_of(tokens.max(1).div_ceil(page_tokens), "page count")?;
         let bindings = (0..layers)
             .map(|layer| {
                 let layer = u32_of(layer, "layer")?;
@@ -114,8 +118,8 @@ impl PhysicalPagedKvCache {
                 generation: 1,
             },
             group: crate::kv::KvGroupId::new(0),
-            page_tokens: u32_of(tokens.max(1), "token count")?,
-            capacity_pages: 1,
+            page_tokens: u32_of(page_tokens, "page size")?,
+            capacity_pages: pages,
             growth: None,
             dtype,
             layers: bindings
@@ -146,13 +150,15 @@ impl PhysicalPagedKvCache {
                 ));
             }
         };
-        let block = CacheBlockRef {
-            arena: arena.id(),
-            group: arena.config().group,
-            index: 0,
-            slot_generation: 1,
-        };
-        Self::new(arena, bindings, vec![block], 0)
+        let blocks = (0..pages)
+            .map(|index| CacheBlockRef {
+                arena: arena.id(),
+                group: arena.config().group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        Self::new(arena, bindings, blocks, 0)
     }
 
     pub fn new(
@@ -1915,20 +1921,32 @@ mod tests {
     }
 
     /// A probe cache attends causally like any physical cache: the first
-    /// query sees only its own key, so its output is its own value.
+    /// query sees only its own key, so its output is its own value, and a
+    /// decode step after the prompt attends over every page. Its pages are
+    /// the engine's: a probe was one page of its own length, which CUDA's
+    /// paged decode refuses (16-, 32- and 64-token pages only), so every
+    /// load-time BF16 check that decodes on a probe failed to run and its
+    /// model fell back to F32 (Maya1, Maya 2, Chatterbox T3 on the H100).
     fn probe_cache_attends_causally(device: &candle_core::Device, dtype: candle_core::DType) {
+        use crate::engine::DEFAULT_KV_PAGE_TOKENS;
         use crate::kernels::numeric_check::{host_f32, xorshift_tensor};
 
-        let (heads, dim, tokens) = (2, 32, 5);
+        let (heads, dim, tokens) = (2, 32, DEFAULT_KV_PAGE_TOKENS + 5);
         let mut cache =
-            PhysicalPagedKvCache::scratch_for_probe(device, dtype, 2, heads, dim, tokens).unwrap();
-        let tensor = |seed| {
-            xorshift_tensor(&[tokens, heads, dim], seed, 1.0, device)
+            PhysicalPagedKvCache::scratch_for_probe(device, dtype, 2, heads, dim, tokens + 1)
+                .unwrap();
+        assert_eq!(
+            cache.arena.config().page_tokens as usize,
+            DEFAULT_KV_PAGE_TOKENS
+        );
+        assert_eq!(cache.blocks.len(), 2);
+        let tensor = |rows, seed| {
+            xorshift_tensor(&[rows, heads, dim], seed, 1.0, device)
                 .unwrap()
                 .to_dtype(dtype)
                 .unwrap()
         };
-        let (q, k, v) = (tensor(1), tensor(2), tensor(3));
+        let (q, k, v) = (tensor(tokens, 1), tensor(tokens, 2), tensor(tokens, 3));
         let mut prepared = cache.prepare_append(0, tokens).unwrap();
         for layer in 0..2 {
             let out = cache
@@ -1943,8 +1961,26 @@ mod tests {
             }
         }
         cache.commit_prepared(prepared).unwrap();
-        assert_eq!(cache.context_len(), tokens);
-        assert!(cache.prepare_append(tokens, 1).is_err(), "one page only");
+        let (q, k, v) = (tensor(1, 4), tensor(1, 5), tensor(1, 6));
+        let mut step = cache.prepare_append(tokens, 1).unwrap();
+        for layer in 0..2 {
+            let out = cache
+                .write_and_attend(layer, &mut step, &q, &k, &v, 0.125)
+                .unwrap();
+            assert_eq!(out.dims(), &[1, heads, dim]);
+            assert!(host_f32(&out)
+                .unwrap()
+                .iter()
+                .all(|value| value.is_finite()));
+        }
+        cache.commit_prepared(step).unwrap();
+        assert_eq!(cache.context_len(), tokens + 1);
+        assert!(
+            cache
+                .prepare_append(tokens + 1, 2 * DEFAULT_KV_PAGE_TOKENS - tokens)
+                .is_err(),
+            "room for whole pages only"
+        );
     }
 
     #[test]
@@ -1961,5 +1997,14 @@ mod tests {
             return;
         };
         probe_cache_attends_causally(&device, candle_core::DType::F16);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_probe_cache_attends_causally_in_bf16() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        probe_cache_attends_causally(&device, candle_core::DType::BF16);
     }
 }

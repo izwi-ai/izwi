@@ -83,6 +83,7 @@ pub(crate) use cache::retained_static_attention::{
 };
 pub use cache::telemetry::ManagedKvTelemetrySnapshot;
 pub(crate) use config::backend_step_sizes;
+pub(crate) use config::DEFAULT_KV_PAGE_TOKENS;
 pub(crate) use config::resolve_backend_model_context;
 pub(crate) use config::tts_explicit_output_limit;
 pub use config::EngineCoreConfig;
