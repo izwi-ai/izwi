@@ -45,6 +45,10 @@ const MAX_CAPACITY_REPLAYS: u8 = 3;
 /// besides the four-transaction bound. A Chatterbox acoustic unit (0.3-0.7 s
 /// on Metal) exceeds it on its own, so token decode follows each one.
 const AUDIO_ONLY_TIME_BUDGET: Duration = Duration::from_millis(250);
+/// How long a lane keeps its real-time reserve after its last live request
+/// or session operation. It covers the gap between the turns of a call, so
+/// batch work does not fill the lane while a caller is listening.
+const REALTIME_RESERVE_HOLD: Duration = Duration::from_secs(30);
 
 /// Schedule-time managed prefix probe for one exact session: the cursor its
 /// first prefill span may start at, or `None` for a zero-start prefill.
@@ -160,6 +164,13 @@ pub struct SchedulerConfig {
     /// Rows one dispatch of an unbatched decode stage holds: the physical
     /// launch limit, which is one unless launches run concurrently.
     pub unbatched_dispatch_rows: usize,
+    /// Sequences the engine retains at once; with a model's decode rows it
+    /// bounds the sequences one lane runs.
+    pub max_retained_sequences: usize,
+    /// Sequences a lane keeps free of Batch and Background requests while
+    /// it has live demand. `None` is automatic (a quarter of the lane's
+    /// capacity, at least one); zero disables the reserve.
+    pub realtime_row_reserve: Option<usize>,
 }
 
 impl Default for SchedulerConfig {
@@ -188,6 +199,8 @@ impl Default for SchedulerConfig {
             max_decode_tokens_per_request: 2,
             physical_dispatch_limit: 1,
             unbatched_dispatch_rows: 1,
+            max_retained_sequences: 8,
+            realtime_row_reserve: None,
         }
     }
 }
@@ -219,6 +232,8 @@ impl From<&EngineCoreConfig> for SchedulerConfig {
             max_decode_tokens_per_request: config.max_decode_tokens_per_request,
             physical_dispatch_limit: capacity.candidate_dispatch_limit.get(),
             unbatched_dispatch_rows: capacity.physical_launch_limit.get(),
+            max_retained_sequences: config.max_retained_sequences,
+            realtime_row_reserve: config.realtime_row_reserve,
         }
     }
 }
@@ -462,6 +477,20 @@ pub struct Scheduler {
     lane_debts: HashMap<ExecutionLane, StarvationDebts>,
     /// Committed non-realtime quanta, stamped on each row they served.
     service_clock: u64,
+    /// Lanes with live demand: a Realtime or Streaming request, or a
+    /// real-time session operation, seen within `REALTIME_RESERVE_HOLD`.
+    live_demand: HashMap<ExecutionLane, LiveDemand>,
+}
+
+/// The live demand of one lane.
+#[derive(Debug, Clone, Copy)]
+struct LiveDemand {
+    /// When the lane's reserve lapses unless another live request is seen.
+    until: Instant,
+    /// Model and decode rows of the live request last seen, for callers
+    /// that ask for the model's allowance before they submit work.
+    model_variant: Option<ModelVariant>,
+    decode_dispatch_rows: Option<usize>,
 }
 
 /// Bounded-starvation guards, counted over committed transactions.
@@ -647,6 +676,8 @@ struct RequestMetadata {
     managed_prefix_cursor: Option<u32>,
     /// Probed cursors this request lost before prepare could attach them.
     managed_prefix_cursor_losses: u8,
+    /// The real-time reserve has held this request back at least once.
+    reserve_deferred: bool,
 }
 
 impl RequestMetadata {
@@ -783,6 +814,7 @@ impl Scheduler {
             debts: StarvationDebts::default(),
             lane_debts: HashMap::new(),
             service_clock: 0,
+            live_demand: HashMap::new(),
         }
     }
 
@@ -869,9 +901,13 @@ impl Scheduler {
             managed_preamble_boundary: request.managed_preamble_boundary(),
             managed_prefix_cursor: request.managed_prefix_cursor(),
             managed_prefix_cursor_losses: 0,
+            reserve_deferred: false,
         };
 
         self.requests.insert(request.id.clone(), metadata);
+        if Self::is_live_class(request.workload_class) {
+            self.note_live_demand(&request.id, Instant::now());
+        }
 
         self.enqueue_waiting_request(request.id.clone());
 
@@ -926,6 +962,7 @@ impl Scheduler {
                 managed_preamble_boundary: request.managed_preamble_boundary(),
                 managed_prefix_cursor: request.managed_prefix_cursor(),
                 managed_prefix_cursor_losses: 0,
+                reserve_deferred: false,
             },
         );
         self.running.insert(
@@ -964,6 +1001,7 @@ impl Scheduler {
                 finish_enqueued: false,
             },
         );
+        self.note_live_demand(&request.id, Instant::now());
         true
     }
 
@@ -1012,6 +1050,7 @@ impl Scheduler {
             remaining_output_steps: max_output_steps,
             committed_cache_append: 0,
         });
+        self.note_live_demand(&session.request_id, Instant::now());
         Ok((id, input))
     }
 
@@ -1049,7 +1088,131 @@ impl Scheduler {
             remaining_output_steps: max_output_steps,
             committed_cache_append: 0,
         });
+        self.note_live_demand(&session.request_id, Instant::now());
         Ok(id)
+    }
+
+    /// Classes whose requests are live demand: a caller is waiting on
+    /// their output as it is produced.
+    fn is_live_class(workload_class: WorkloadClass) -> bool {
+        matches!(
+            workload_class,
+            WorkloadClass::Realtime | WorkloadClass::Streaming
+        )
+    }
+
+    /// Classes the real-time reserve holds back.
+    fn is_reserve_bound_class(workload_class: WorkloadClass) -> bool {
+        matches!(
+            workload_class,
+            WorkloadClass::Batch | WorkloadClass::Background
+        )
+    }
+
+    /// Record live demand on the lane of `request_id`, held from `now`.
+    fn note_live_demand(&mut self, request_id: &RequestId, now: Instant) {
+        let Some(metadata) = self.requests.get(request_id) else {
+            return;
+        };
+        // A request added since the last step has no profile yet; the
+        // lane keeps the rows of the same model's earlier live request.
+        let decode_dispatch_rows = metadata.cache_policy.decode_dispatch_rows.or_else(|| {
+            self.live_demand
+                .get(&metadata.lane)
+                .filter(|demand| demand.model_variant == metadata.model_variant)
+                .and_then(|demand| demand.decode_dispatch_rows)
+        });
+        self.live_demand.insert(
+            metadata.lane,
+            LiveDemand {
+                until: now + REALTIME_RESERVE_HOLD,
+                model_variant: metadata.model_variant,
+                decode_dispatch_rows,
+            },
+        );
+    }
+
+    /// Renew the live demand of every lane that holds a Realtime or
+    /// Streaming request, waiting or running, and drop the lanes whose hold
+    /// has lapsed. An open real-time session with no operation queued is
+    /// not demand: its lane keeps the reserve only for the hold.
+    fn refresh_live_demand(&mut self, now: Instant) {
+        self.live_demand.retain(|_, demand| demand.until > now);
+        let live = self
+            .requests
+            .iter()
+            .filter(
+                |(request_id, metadata)| match self.realtime_sessions.get(*request_id) {
+                    Some(state) => state.in_flight.is_some() || !state.pending.is_empty(),
+                    None => Self::is_live_class(metadata.workload_class),
+                },
+            )
+            .map(|(request_id, _)| request_id.clone())
+            .collect::<Vec<_>>();
+        for request_id in live {
+            self.note_live_demand(&request_id, now);
+        }
+    }
+
+    /// Batch and Background requests a lane of `decode_dispatch_rows` may
+    /// run while it has live demand, or `None` when no reserve applies. The
+    /// lane's sequence capacity is its model's decode rows, bounded by the
+    /// sequences the engine retains; a one-sequence lane has nothing to
+    /// reserve, and batch work always keeps at least one sequence.
+    fn reserve_limit(&self, decode_dispatch_rows: Option<usize>) -> Option<usize> {
+        let capacity = decode_dispatch_rows?.min(self.config.max_retained_sequences);
+        if capacity <= 1 {
+            return None;
+        }
+        let reserve = self
+            .config
+            .realtime_row_reserve
+            .unwrap_or((capacity / 4).max(1));
+        (reserve > 0).then(|| capacity.saturating_sub(reserve).max(1))
+    }
+
+    /// Whether the real-time reserve holds a waiting request back: it is
+    /// Batch or Background work, its lane has live demand, and the lane
+    /// already runs as many such requests as the reserve allows. A request
+    /// whose profile is not installed has no known capacity and is never
+    /// held.
+    fn reserve_defers(&self, metadata: &RequestMetadata, now: Instant) -> bool {
+        if !Self::is_reserve_bound_class(metadata.workload_class)
+            || !self
+                .live_demand
+                .get(&metadata.lane)
+                .is_some_and(|demand| demand.until > now)
+        {
+            return false;
+        }
+        let Some(limit) = self.reserve_limit(metadata.cache_policy.decode_dispatch_rows) else {
+            return false;
+        };
+        let running = self
+            .running
+            .keys()
+            .filter_map(|request_id| self.requests.get(request_id))
+            .filter(|other| {
+                other.lane == metadata.lane && Self::is_reserve_bound_class(other.workload_class)
+            })
+            .count();
+        running >= limit
+    }
+
+    /// How many requests of `model_variant` a caller below the Realtime
+    /// class may run at once while the model has live demand; `None` when
+    /// it has none or no reserve applies. Long-form fan-out sizes itself
+    /// from this, so one long request does not fill the model.
+    pub(crate) fn reserved_admission_limit(
+        &self,
+        model_variant: ModelVariant,
+        now: Instant,
+    ) -> Option<usize> {
+        self.live_demand
+            .values()
+            .filter(|demand| demand.until > now && demand.model_variant == Some(model_variant))
+            .filter_map(|demand| self.reserve_limit(demand.decode_dispatch_rows))
+            .min()
     }
 
     /// Install the loaded executor's cache contract for one exact scheduler
@@ -1220,6 +1383,7 @@ impl Scheduler {
         self.refresh_tenant_service();
         self.refresh_class_service();
         let scheduling_now = Instant::now();
+        self.refresh_live_demand(scheduling_now);
         let mut remaining_batch = self.config.max_batch_size;
         self.refresh_queue_age_sample();
         self.update_dynamic_budget();
@@ -1793,16 +1957,16 @@ impl Scheduler {
                     .is_none_or(|retry| retry <= scheduling_now)
         };
         let other_prompt_ready = !yielding.is_empty()
-            && (self
-                .waiting_members
-                .iter()
-                .any(|request_id| self.requests.get(request_id).is_some_and(ready))
-                || self.running.iter().any(|(request_id, running)| {
-                    !running.prefill_complete
-                        && !running.prefill_in_flight
-                        && !yielding.contains(request_id)
-                        && self.requests.get(request_id).is_some_and(ready)
-                }));
+            && (self.waiting_members.iter().any(|request_id| {
+                self.requests.get(request_id).is_some_and(|metadata| {
+                    ready(metadata) && !self.reserve_defers(metadata, scheduling_now)
+                })
+            }) || self.running.iter().any(|(request_id, running)| {
+                !running.prefill_complete
+                    && !running.prefill_in_flight
+                    && !yielding.contains(request_id)
+                    && self.requests.get(request_id).is_some_and(ready)
+            }));
         let mut incomplete_prefill_candidates: Vec<_> = self
             .running
             .iter()
@@ -1988,6 +2152,7 @@ impl Scheduler {
         }
 
         let mut deferred_waiting = Vec::new();
+        let mut reserve_deferred = Vec::new();
         let max_waiting_attempts = self.waiting_count();
         let mut waiting_attempts = 0usize;
 
@@ -2012,6 +2177,20 @@ impl Scheduler {
             }
             if !lanes.admits(metadata.lane) {
                 deferred_waiting.push(request_id);
+                continue;
+            }
+            // While its lane has live demand, batch work starts only below
+            // the reserve limit, so a sequence stays free for the next live
+            // request. Nothing running is stopped: the reserve fills as
+            // running batch requests finish.
+            if self.reserve_defers(&metadata, scheduling_now) {
+                if let Some(metadata) = self.requests.get_mut(&request_id) {
+                    if !metadata.reserve_deferred {
+                        metadata.reserve_deferred = true;
+                        crate::engine::metrics::record_realtime_reserve_deferral();
+                    }
+                }
+                reserve_deferred.push(request_id);
                 continue;
             }
 
@@ -2173,6 +2352,11 @@ impl Scheduler {
 
         for request_id in deferred_waiting {
             self.enqueue_waiting_request(request_id);
+        }
+        // Requests the reserve held back were not served: they return to
+        // the head of the queue in the order they were taken.
+        for request_id in reserve_deferred.into_iter().rev() {
+            self.requeue_waiting_front(request_id);
         }
         // The step aside ends once another prompt was scheduled, none is
         // ready, or the slot went unused (the prompts cannot run now).
@@ -3082,8 +3266,18 @@ impl Scheduler {
         true
     }
 
-    /// A single priority/age order governs both survivor and victim selection,
-    /// so a younger high-priority request cannot deadlock behind a protected owner.
+    /// The rank capacity is kept by: workload class weight, then priority.
+    /// A live request therefore outranks batch work of any age.
+    fn capacity_rank(metadata: &RequestMetadata) -> (u64, Priority) {
+        (
+            Self::workload_weight(metadata.workload_class),
+            metadata.priority,
+        )
+    }
+
+    /// A single class/priority/age order governs both survivor and victim
+    /// selection, so a younger request of a heavier class or higher priority
+    /// cannot deadlock behind a protected owner.
     pub(crate) fn capacity_survivor(
         &self,
         candidates: impl IntoIterator<Item = SessionKey>,
@@ -3097,7 +3291,7 @@ impl Scheduler {
             })
             .max_by_key(|candidate| {
                 (
-                    self.requests[&candidate.request_id].priority,
+                    Self::capacity_rank(&self.requests[&candidate.request_id]),
                     std::cmp::Reverse(candidate.epoch),
                 )
             })
@@ -3122,9 +3316,9 @@ impl Scheduler {
             })
     }
 
-    /// The lowest-priority, then youngest, candidate below the survivor in
-    /// the same priority/age order; the older equal-priority request is
-    /// protected. Victims remain suspended until that exact survivor leaves,
+    /// The candidate of the lightest workload class, then lowest priority,
+    /// then youngest, below the survivor in the same class/priority/age
+    /// order; the older request of equal class and priority is protected. Victims remain suspended until that exact survivor leaves,
     /// and a request replayed `MAX_CAPACITY_REPLAYS` times is not chosen
     /// again, avoiding repeated eviction/replay oscillation.
     pub(crate) fn published_capacity_victim(
@@ -3149,12 +3343,13 @@ impl Scheduler {
                     && !running.audio_decode_in_flight
                     && !self.capacity_waiting(meta)
                     && meta.capacity_replays < MAX_CAPACITY_REPLAYS
-                    && (meta.priority < owner.priority
-                        || meta.priority == owner.priority && meta.sequence_id > owner.sequence_id)
+                    && (Self::capacity_rank(meta) < Self::capacity_rank(owner)
+                        || Self::capacity_rank(meta) == Self::capacity_rank(owner)
+                            && meta.sequence_id > owner.sequence_id)
             })
             .max_by_key(|candidate| {
                 (
-                    std::cmp::Reverse(self.requests[&candidate.request_id].priority),
+                    std::cmp::Reverse(Self::capacity_rank(&self.requests[&candidate.request_id])),
                     candidate.epoch,
                 )
             })
@@ -3405,8 +3600,9 @@ impl Scheduler {
     }
 
     /// The earliest future instant at which work becomes due without any
-    /// other event: a deferred row's retry time, a hard deadline, or a
-    /// cleanup retry. An idle step driver sleeps no longer than this, so a
+    /// other event: a deferred row's retry time, a hard deadline, a
+    /// cleanup retry, or the end of the live-demand hold on a lane whose
+    /// reserve is holding a request back. An idle step driver sleeps no longer than this, so a
     /// deferred row runs at its retry time rather than after the idle
     /// backoff (SCH-F11).
     pub(crate) fn next_wakeup(&self, now: Instant) -> Option<Instant> {
@@ -3420,7 +3616,17 @@ impl Scheduler {
             .values()
             .filter(|pending| pending.confirmation_required && !pending.cleanup_confirmed)
             .map(|pending| pending.retry_at);
-        rows.chain(cleanups).filter(|at| *at > now).min()
+        let reserve_holds = self
+            .waiting_members
+            .iter()
+            .filter_map(|request_id| self.requests.get(request_id))
+            .filter(|metadata| metadata.reserve_deferred)
+            .filter_map(|metadata| self.live_demand.get(&metadata.lane))
+            .map(|demand| demand.until);
+        rows.chain(cleanups)
+            .chain(reserve_holds)
+            .filter(|at| *at > now)
+            .min()
     }
 
     pub(crate) fn force_release_all_after_executor_shutdown(&mut self) {
@@ -3652,6 +3858,19 @@ impl Scheduler {
                 arrival_time: metadata.arrival_time,
             }),
             SchedulingPolicy::WeightedFair => self.waiting_fcfs.push_back(request_id),
+        }
+    }
+
+    /// Return a request taken off the waiting queue to its head.
+    fn requeue_waiting_front(&mut self, request_id: RequestId) {
+        if self.config.policy == SchedulingPolicy::Priority {
+            // The heap orders by priority and arrival, not by insertion.
+            return self.enqueue_waiting_request(request_id);
+        }
+        if self.requests.contains_key(&request_id)
+            && self.waiting_members.insert(request_id.clone())
+        {
+            self.waiting_fcfs.push_front(request_id);
         }
     }
 
@@ -4078,6 +4297,7 @@ impl Scheduler {
                         && metadata.cache_policy.prefill == PrefillMode::Full
                         && !self.capacity_waiting(metadata)
                         && metadata.retry_not_before.is_none_or(|retry| retry <= now)
+                        && !self.reserve_defers(metadata, now)
                 })
             })
     }
@@ -4115,6 +4335,7 @@ impl Scheduler {
                         && metadata.cache_policy.prefill == PrefillMode::Incremental
                         && !self.capacity_waiting(metadata)
                         && metadata.retry_not_before.is_none_or(|retry| retry <= now)
+                        && !self.reserve_defers(metadata, now)
                 })
             })
     }
@@ -4350,6 +4571,7 @@ mod tests {
             managed_preamble_boundary: None,
             managed_prefix_cursor: None,
             managed_prefix_cursor_losses: 0,
+            reserve_deferred: false,
         }
     }
 
@@ -8029,5 +8251,391 @@ mod tests {
         let request = build_request(TaskType::TTS, "tts-finalize-early", Priority::Normal);
         assert!(scheduler.add_request(&request));
         assert!(scheduler.request_sequence_finalize(&request.id).is_err());
+    }
+
+    /// A scheduler whose models decode `width` rows a dispatch, with room
+    /// for every prompt of a test in one step.
+    fn reserve_scheduler(reserve: Option<usize>, policy: SchedulingPolicy) -> Scheduler {
+        Scheduler::new(SchedulerConfig {
+            max_batch_size: 16,
+            max_tokens_per_step: 1024,
+            policy,
+            realtime_row_reserve: reserve,
+            ..Default::default()
+        })
+    }
+
+    /// Add a one-token request of `class` whose loaded model decodes
+    /// `width` rows a dispatch.
+    fn add_classed(scheduler: &mut Scheduler, id: &str, class: WorkloadClass, width: usize) {
+        let mut request = build_request(TaskType::TTS, id, Priority::Normal);
+        request.workload_class = class;
+        request.model_variant = Some(ModelVariant::Kokoro82M);
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler
+            .get_sequence_id(&request.id)
+            .expect("request epoch");
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.max_batch_size = width;
+        assert!(scheduler.update_execution_profile(&SessionKey::new(request.id, epoch), &profile));
+    }
+
+    /// Schedule until no new request starts, committing every row, and
+    /// return the requests that started, in order.
+    fn admit_all(scheduler: &mut Scheduler) -> Vec<String> {
+        let mut started = Vec::new();
+        loop {
+            let scheduled = scheduler.schedule();
+            let before = started.len();
+            for row in &scheduled.prefill_requests {
+                scheduler.update_after_step(&row.request_id, row.num_tokens, 0, 1.0);
+                if !started.contains(&row.request_id) {
+                    started.push(row.request_id.clone());
+                }
+            }
+            for row in &scheduled.decode_requests {
+                scheduler.update_after_step(&row.request_id, 0, row.num_tokens, 1.0);
+            }
+            if started.len() == before {
+                return started;
+            }
+        }
+    }
+
+    fn running_of(scheduler: &Scheduler, class: WorkloadClass) -> usize {
+        scheduler
+            .running
+            .keys()
+            .filter(|request_id| scheduler.requests[*request_id].workload_class == class)
+            .count()
+    }
+
+    /// End the live-demand hold of every lane, as 30 idle seconds would.
+    fn lapse_live_demand(scheduler: &mut Scheduler) {
+        for demand in scheduler.live_demand.values_mut() {
+            demand.until = Instant::now();
+        }
+    }
+
+    /// P2.1: with a live request on the lane, a batch flood runs at most
+    /// `rows - reserve` requests; the rest start as running ones finish.
+    #[test]
+    fn realtime_reserve_holds_under_a_batch_flood() {
+        let mut scheduler = reserve_scheduler(None, SchedulingPolicy::WeightedFair);
+        add_classed(&mut scheduler, "live", WorkloadClass::Streaming, 4);
+        for index in 0..8 {
+            add_classed(
+                &mut scheduler,
+                &format!("batch-{index}"),
+                WorkloadClass::Batch,
+                4,
+            );
+        }
+
+        let started = admit_all(&mut scheduler);
+        assert!(started.contains(&"live".to_string()));
+        // Four rows reserve one: three batch requests run beside the stream.
+        assert_eq!(running_of(&scheduler, WorkloadClass::Batch), 3);
+        assert_eq!(scheduler.waiting_count(), 5);
+
+        // Batch is not starved: each one that finishes lets the next start.
+        let finished = started
+            .iter()
+            .find(|id| id.starts_with("batch"))
+            .expect("a batch request started")
+            .clone();
+        scheduler.finish_request(&finished);
+        assert_eq!(admit_all(&mut scheduler).len(), 1);
+        assert_eq!(running_of(&scheduler, WorkloadClass::Batch), 3);
+        assert_eq!(scheduler.waiting_count(), 4);
+    }
+
+    /// P2.1: batch work that filled the lane before any live demand keeps
+    /// running, a live request then starts at once, and no further batch
+    /// request starts until the lane is back under its reserve limit.
+    #[test]
+    fn a_live_request_starts_while_batch_holds_the_reserve_limit() {
+        let mut scheduler = reserve_scheduler(None, SchedulingPolicy::WeightedFair);
+        for index in 0..6 {
+            add_classed(
+                &mut scheduler,
+                &format!("batch-{index}"),
+                WorkloadClass::Batch,
+                4,
+            );
+        }
+        // No live demand: nothing is reserved.
+        assert_eq!(admit_all(&mut scheduler).len(), 6);
+
+        add_classed(&mut scheduler, "live", WorkloadClass::Realtime, 4);
+        for index in 6..9 {
+            add_classed(
+                &mut scheduler,
+                &format!("batch-{index}"),
+                WorkloadClass::Batch,
+                4,
+            );
+        }
+        assert_eq!(admit_all(&mut scheduler), vec!["live".to_string()]);
+        assert_eq!(running_of(&scheduler, WorkloadClass::Batch), 6);
+
+        // Six running against a limit of three: the fourth to finish frees
+        // the first slot below it.
+        for index in 0..3 {
+            scheduler.finish_request(&format!("batch-{index}"));
+            assert!(admit_all(&mut scheduler).is_empty());
+        }
+        scheduler.finish_request(&"batch-3".to_string());
+        assert_eq!(admit_all(&mut scheduler).len(), 1);
+        assert_eq!(running_of(&scheduler, WorkloadClass::Batch), 3);
+    }
+
+    /// P2.1: the reserve outlives the live request by the hold, then batch
+    /// work takes the whole lane again; an idle driver wakes at that time.
+    #[test]
+    fn realtime_reserve_is_released_after_the_hold() {
+        let mut scheduler = reserve_scheduler(None, SchedulingPolicy::WeightedFair);
+        add_classed(&mut scheduler, "live", WorkloadClass::Streaming, 4);
+        for index in 0..6 {
+            add_classed(
+                &mut scheduler,
+                &format!("batch-{index}"),
+                WorkloadClass::Batch,
+                4,
+            );
+        }
+        admit_all(&mut scheduler);
+        scheduler.finish_request(&"live".to_string());
+
+        // Between the turns of a call the reserve is kept.
+        assert!(admit_all(&mut scheduler).is_empty());
+        assert_eq!(running_of(&scheduler, WorkloadClass::Batch), 3);
+        let now = Instant::now();
+        let wakeup = scheduler.next_wakeup(now).expect("hold expiry");
+        assert!(wakeup > now && wakeup <= now + REALTIME_RESERVE_HOLD);
+        // Long-form fan-out on the model is told the same limit.
+        assert_eq!(
+            scheduler.reserved_admission_limit(ModelVariant::Kokoro82M, now),
+            Some(3)
+        );
+
+        lapse_live_demand(&mut scheduler);
+        assert_eq!(admit_all(&mut scheduler).len(), 3);
+        assert_eq!(running_of(&scheduler, WorkloadClass::Batch), 6);
+        assert!(scheduler.live_demand.is_empty());
+        assert_eq!(
+            scheduler.reserved_admission_limit(ModelVariant::Kokoro82M, Instant::now()),
+            None
+        );
+    }
+
+    /// P2.1: a real-time session operation is live demand; an open session
+    /// with nothing queued is not, once the hold has passed.
+    #[test]
+    fn realtime_session_operations_hold_the_reserve() {
+        let mut scheduler = reserve_scheduler(None, SchedulingPolicy::WeightedFair);
+        let mut session_request = build_request(TaskType::ASR, "session", Priority::Normal);
+        session_request
+            .enable_realtime_asr_ingress()
+            .expect("ASR realtime ingress");
+        assert!(scheduler.add_realtime_session(&session_request));
+        let session = SessionKey::new(
+            session_request.id.clone(),
+            scheduler.get_sequence_id(&session_request.id).unwrap(),
+        );
+        lapse_live_demand(&mut scheduler);
+        for index in 0..4 {
+            add_classed(
+                &mut scheduler,
+                &format!("batch-{index}"),
+                WorkloadClass::Batch,
+                4,
+            );
+        }
+        // The session is open but idle: batch work takes every row.
+        assert_eq!(admit_all(&mut scheduler).len(), 4);
+
+        scheduler
+            .enqueue_realtime_push(&session, 160, 1, 4)
+            .expect("push");
+        add_classed(&mut scheduler, "batch-late", WorkloadClass::Batch, 4);
+        assert!(admit_all(&mut scheduler).is_empty());
+        assert_eq!(
+            scheduler.get_status(&"batch-late".to_string()),
+            Some(RequestStatus::Waiting)
+        );
+    }
+
+    /// P2.1: the reserve is configurable, never takes a model's only row,
+    /// and never leaves batch work without one.
+    #[test]
+    fn realtime_reserve_limit_follows_rows_and_configuration() {
+        let automatic = reserve_scheduler(None, SchedulingPolicy::WeightedFair);
+        assert_eq!(automatic.reserve_limit(None), None);
+        assert_eq!(automatic.reserve_limit(Some(1)), None);
+        assert_eq!(automatic.reserve_limit(Some(2)), Some(1));
+        assert_eq!(automatic.reserve_limit(Some(4)), Some(3));
+        // Bounded by the sequences the engine retains (8 here).
+        assert_eq!(automatic.reserve_limit(Some(32)), Some(6));
+
+        let disabled = reserve_scheduler(Some(0), SchedulingPolicy::WeightedFair);
+        assert_eq!(disabled.reserve_limit(Some(8)), None);
+        let explicit = reserve_scheduler(Some(3), SchedulingPolicy::WeightedFair);
+        assert_eq!(explicit.reserve_limit(Some(8)), Some(5));
+        assert_eq!(explicit.reserve_limit(Some(2)), Some(1));
+
+        // With the reserve off, or on a one-row model, a live request
+        // holds no batch request back.
+        for (reserve, width) in [(Some(0), 4), (None, 1)] {
+            let mut scheduler = reserve_scheduler(reserve, SchedulingPolicy::WeightedFair);
+            add_classed(&mut scheduler, "live", WorkloadClass::Streaming, width);
+            for index in 0..6 {
+                add_classed(
+                    &mut scheduler,
+                    &format!("batch-{index}"),
+                    WorkloadClass::Batch,
+                    width,
+                );
+            }
+            admit_all(&mut scheduler);
+            assert_eq!(running_of(&scheduler, WorkloadClass::Batch), 6);
+        }
+    }
+
+    /// P2.1: a request the reserve holds back is not charged service and
+    /// keeps its place in the queue.
+    #[test]
+    fn reserve_deferral_charges_no_service_and_keeps_queue_order() {
+        // Two lanes of work that differ only in three held-back requests
+        // end with the same service charged to the batch class and tenant.
+        let batch_service = |requests: usize| {
+            let mut scheduler = reserve_scheduler(None, SchedulingPolicy::WeightedFair);
+            add_classed(&mut scheduler, "live", WorkloadClass::Streaming, 4);
+            for index in 0..requests {
+                add_classed(
+                    &mut scheduler,
+                    &format!("batch-{index}"),
+                    WorkloadClass::Batch,
+                    4,
+                );
+            }
+            admit_all(&mut scheduler);
+            for _ in 0..4 {
+                scheduler.schedule();
+            }
+            assert_eq!(scheduler.waiting_count(), requests - 3);
+            (
+                scheduler.class_service[&WorkloadClass::Batch],
+                scheduler.tenant_service[&(WorkloadClass::Batch, None)].units,
+            )
+        };
+        assert_eq!(batch_service(6), batch_service(3));
+
+        // First come, first served: held requests return to the head in
+        // arrival order, ahead of a later arrival.
+        let mut fcfs = reserve_scheduler(None, SchedulingPolicy::FCFS);
+        add_classed(&mut fcfs, "live", WorkloadClass::Streaming, 2);
+        for id in ["batch-0", "batch-1", "batch-2"] {
+            add_classed(&mut fcfs, id, WorkloadClass::Batch, 2);
+        }
+        assert_eq!(admit_all(&mut fcfs), ["live", "batch-0"]);
+        add_classed(&mut fcfs, "interactive", WorkloadClass::Interactive, 2);
+        assert_eq!(admit_all(&mut fcfs), ["interactive"]);
+        assert_eq!(fcfs.waiting_fcfs, ["batch-1", "batch-2"]);
+        fcfs.finish_request(&"batch-0".to_string());
+        assert_eq!(admit_all(&mut fcfs), ["batch-1"]);
+    }
+
+    /// P2.1: a full prefill the reserve holds back is not owed a forced
+    /// transaction, which would stop the lane's decode with nothing to run.
+    #[test]
+    fn a_reserve_held_full_prefill_does_not_stall_decode() {
+        let mut scheduler = reserve_scheduler(None, SchedulingPolicy::WeightedFair);
+        add_classed(&mut scheduler, "live", WorkloadClass::Streaming, 2);
+        add_classed(&mut scheduler, "batch-0", WorkloadClass::Batch, 2);
+        assert_eq!(admit_all(&mut scheduler).len(), 2);
+        add_classed(&mut scheduler, "batch-held", WorkloadClass::Batch, 2);
+        let epoch = scheduler
+            .get_sequence_id(&"batch-held".to_string())
+            .unwrap();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.max_batch_size = 2;
+        assert!(scheduler
+            .update_execution_profile(&SessionKey::new("batch-held".to_string(), epoch), &profile));
+
+        for _ in 0..3 * MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL {
+            let scheduled = scheduler.schedule();
+            assert!(scheduled.prefill_requests.is_empty());
+            assert_eq!(scheduled.decode_requests.len(), 2);
+            let committed = scheduled
+                .decode_requests
+                .iter()
+                .map(|row| {
+                    scheduler.update_after_step(&row.request_id, 0, row.num_tokens, 1.0);
+                    (row.request_id.clone(), SequencePhase::Decode)
+                })
+                .collect::<Vec<_>>();
+            scheduler.record_committed_batch_service(&committed);
+        }
+    }
+
+    /// P2.1: capacity goes to the heavier workload class first, so batch
+    /// work, not the newest live request, is replayed under pressure.
+    #[test]
+    fn capacity_victim_is_the_lightest_class_before_priority_and_age() {
+        let mut scheduler = reserve_scheduler(Some(0), SchedulingPolicy::WeightedFair);
+        for (id, class) in [
+            ("older-batch", WorkloadClass::Batch),
+            ("background", WorkloadClass::Background),
+            ("interactive", WorkloadClass::Interactive),
+            ("younger-batch", WorkloadClass::Batch),
+            ("live", WorkloadClass::Realtime),
+        ] {
+            add_classed(&mut scheduler, id, class, 8);
+        }
+        scheduler.requests.get_mut("older-batch").unwrap().priority = Priority::High;
+        assert_eq!(admit_all(&mut scheduler).len(), 5);
+        let session = |id: &str| {
+            SessionKey::new(
+                id.to_string(),
+                scheduler.get_sequence_id(&id.to_string()).unwrap(),
+            )
+        };
+        let all = [
+            "older-batch",
+            "background",
+            "interactive",
+            "younger-batch",
+            "live",
+        ]
+        .map(session);
+
+        // The youngest request survives: it is the live one.
+        let survivor = scheduler.capacity_survivor(all.clone()).unwrap();
+        assert_eq!(survivor, session("live"));
+        // Lightest class first, then lowest priority, then youngest.
+        let mut candidates = all.to_vec();
+        for expected in ["background", "younger-batch", "older-batch", "interactive"] {
+            let victim = scheduler
+                .published_capacity_victim(candidates.clone(), &survivor)
+                .unwrap();
+            assert_eq!(victim, session(expected));
+            candidates.retain(|candidate| *candidate != victim);
+        }
+        assert_eq!(
+            scheduler.published_capacity_victim(candidates, &survivor),
+            None
+        );
+        // A batch survivor never replays a live request.
+        assert_eq!(
+            scheduler.published_capacity_victim([session("live")], &session("older-batch")),
+            None
+        );
     }
 }

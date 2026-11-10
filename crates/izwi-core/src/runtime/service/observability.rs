@@ -529,6 +529,7 @@ impl RuntimeService {
             recompute_preemptions_total: batch.recompute_preemptions_total,
             claim_deadlock_aborts_total: batch.claim_deadlock_aborts_total,
             kv_blocked_requests: batch.kv_blocked_requests,
+            realtime_reserve_deferrals_total: batch.realtime_reserve_deferrals_total,
             continuous_envelope_scalar_fallbacks_total: batch
                 .continuous_envelope_scalar_fallbacks_total,
             physical_execution: batch.physical_execution,
@@ -809,6 +810,11 @@ impl RuntimeService {
             payload,
             ENGINE_SCHEDULER_KV_BLOCKED_REQUESTS,
             snapshot.kv_blocked_requests,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_SCHEDULER_RESERVE_DEFERRALS_TOTAL,
+            snapshot.realtime_reserve_deferrals_total,
         );
         push_engine_metric(
             payload,

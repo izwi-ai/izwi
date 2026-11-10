@@ -3151,6 +3151,19 @@ impl Engine {
         self.core.read().await.lanes_with_work()
     }
 
+    /// How many requests of `model_variant` a caller below the Realtime
+    /// class may run at once while the model has live demand; `None` when
+    /// the model has none or reserves nothing.
+    pub(crate) async fn reserved_admission_limit(
+        &self,
+        model_variant: crate::model::ModelVariant,
+    ) -> Option<usize> {
+        self.core
+            .read()
+            .await
+            .reserved_admission_limit(model_variant)
+    }
+
     async fn step_with_terminal_ack(
         &self,
         defer_unregistered_terminal_ack: bool,

@@ -432,6 +432,25 @@ impl RuntimeService {
         self.adapter_registry.max_tensor_batch_size().max(1)
     }
 
+    /// Long-form segments one request of `workload_class` may synthesize
+    /// at once on `variant`: the TTS row width, or the model's real-time
+    /// reserve limit while it has live demand, so one long request leaves
+    /// rows for live callers. Realtime-class callers keep the row width.
+    pub async fn tts_long_form_concurrency(
+        &self,
+        variant: ModelVariant,
+        workload_class: WorkloadClass,
+    ) -> usize {
+        let width = self.tts_row_width();
+        if workload_class == WorkloadClass::Realtime {
+            return width;
+        }
+        match self.core_engine.reserved_admission_limit(variant).await {
+            Some(limit) => width.min(limit),
+            None => width,
+        }
+    }
+
     /// The concurrency this runtime resolved at startup (`max_num_seqs` and
     /// every limit it sized).
     pub fn resolved_concurrency(&self) -> &ResolvedConcurrency {

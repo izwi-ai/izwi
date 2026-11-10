@@ -2595,6 +2595,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the Qwen3-TTS model dtype (e.g. f32, f16, bf16); does not inherit IZWI_QWEN_DTYPE.",
     ),
     CoreEnvVar::new(
+        "IZWI_REALTIME_ROW_RESERVE",
+        Int,
+        "a quarter of the model's rows, at least 1",
+        Startup,
+        "Sequences each model keeps free of Batch and Background requests while it has live demand (a Realtime or Streaming request or a real-time session operation in the last 30 seconds), so a live request starts without waiting for batch work to finish. 0 disables the reserve; a one-row model reserves nothing; invalid ignored.",
+    ),
+    CoreEnvVar::new(
         "IZWI_RELPOS_ATTENTION_EMULATOR_DIR",
         Path,
         "unset (test skipped)",

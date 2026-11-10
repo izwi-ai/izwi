@@ -369,6 +369,19 @@ soak on an M1 Pro gave better TTS latency and a smaller worst chat gap with it
 on, but worse chat TTFT, typical inter-token latency and realtime lag
 (`SERVING_BENCHMARK.md`).
 
+**Real-time reserve.** While a lane has live demand (a Realtime or Streaming
+request waiting or running, or a real-time session operation, in the last
+30 seconds), the scheduler starts Batch and Background requests only up to
+`rows - R`, where `rows` is the model's decode rows bounded by the retained
+sequences and `R` is `IZWI_REALTIME_ROW_RESERVE` or a quarter of the rows, at
+least one. Requests already running are not stopped; held requests keep their
+queue order and are charged no service. A one-row model reserves nothing, and
+batch work always keeps one sequence. Under KV pressure the replay victim is
+the request of the lightest workload class, then lowest priority, then
+youngest. Long-form speech asks for the same limit before it fans out its
+segments. `izwi_engine_scheduler_reserve_deferrals_total` counts the requests
+the reserve held back.
+
 **Mixed steps.** A chat family certified in `catalog/mixed_step.rs` runs
 prefill spans beside decode rows in one model call. None is certified yet; the
 measurements are in the support matrix (`IZWI_MIXED_STEP=0|1` overrides).
