@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-06",
+  "version": "2026-11-10",
   "scope": {
     "supported_endpoints": [
       "/v1/models",
@@ -17,7 +17,10 @@
       "/v1/audio/voices",
       "/v1/audio/voices/{voice_id}",
       "/v1/audio/voice_consents",
-      "/v1/audio/voice_consents/{consent_id}"
+      "/v1/audio/voice_consents/{consent_id}",
+      "/v1/files",
+      "/v1/files/{file_id}",
+      "/v1/files/{file_id}/content"
     ],
     "preview_endpoints": {
       "/v1/responses": {

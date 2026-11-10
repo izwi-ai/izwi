@@ -28,6 +28,7 @@ When `izwi serve` is running:
 | `/v1/audio/translations`, `/v1/audio/voices*`, `/v1/audio/voice_consents*` | Stable | OpenAI-compatible translation and custom-voice routes. |
 | `/v1/audio/speech/batch`, `/v1/audio/speech/{id}`, `/v1/audio/speech/stream` | Preview | Batch speech, outcome lookup (process-local) and the text-in speech WebSocket. |
 | `/v1/audio/transcriptions` | Stable | OpenAI-compatible transcription endpoint with local streaming support. |
+| `/v1/files*` | Stable | OpenAI-compatible Files API for batch input, audio and output. |
 | `/livez`, `/readyz`, `/v1/live`, `/v1/ready`, `/v1/health` | Stable | Operational health and readiness endpoints. |
 | `/v1/responses*` | Preview | OpenAI-compatible Responses API shape with process-local response retention. |
 | First-party workflow routes | Preview | Persisted local product APIs used by the web UI and desktop app. |
@@ -145,6 +146,7 @@ Some older list routes return arrays or route-specific wrapper names. The route 
 | `IZWI_ADMISSION_QUEUE_TIMEOUT_SECS` | `30` seconds | How long a chat, agent or `/v1/audio/*` request waits for an admission slot when the server is at capacity, before it is refused with `429`. `0` waits without limit. Realtime sessions, the first-party record and job routes and background work always wait. |
 | `IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB` | `25` strict, `64` relaxed | Upload limit for OpenAI audio routes. |
 | First-party audio upload limit | `64 MiB` | Applies to persisted transcription, diarization, TTS, voice design, voice clone, and saved voice creation routes. |
+| `IZWI_FILES_MAX_BYTES` | `209715200` (200 MB) | Largest file `/v1/files` accepts, at most 1 GiB. A larger upload is refused with `413`. |
 | `IZWI_AUDIO_STREAM_EVENT_QUEUE_CAPACITY` | `32` | Buffered SSE audio events for `/v1/audio/speech`. |
 | `IZWI_MAX_RESPONSE_STORE_ENTRIES` | `512` | Process-local `/v1/responses` retention cap. |
 | `IZWI_MAX_AGENT_SESSION_STORE_ENTRIES` | `512` | Process-local agent session metadata cap. |
@@ -1063,6 +1065,40 @@ curl -X POST http://localhost:8080/v1/audio/align \
   -F "text=Hello world" \
   -F "model=Qwen3-ForcedAligner-0.6B" \
   -F "response_format=verbose_json"
+```
+
+### Files
+
+OpenAI's Files API, so the stock SDK's `client.files` calls work unchanged.
+Files hold what the Batch API reads and writes.
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `POST` | `/v1/files` | Multipart `file` and `purpose`. Returns `{"id": "file-…", "object": "file", "bytes", "created_at", "filename", "purpose"}`. |
+| `GET` | `/v1/files` | `purpose`, `limit` (1 to 10000), `after` and `order` (`asc` or `desc`, default `desc`). Returns `{"object": "list", "data", "has_more", "first_id", "last_id"}`. |
+| `GET` | `/v1/files/{file_id}` | The file's metadata. |
+| `GET` | `/v1/files/{file_id}/content` | The file's bytes. |
+| `DELETE` | `/v1/files/{file_id}` | Returns `{"id", "object": "file", "deleted": true}`. |
+
+| Purpose | Written by | Holds |
+|---------|-----------|-------|
+| `batch` | Client | A batch's JSONL input. Lines are checked when the batch is created, not at upload. |
+| `user_data` | Client | Audio a batch line names by `file_id`. |
+| `batch_output` | Server | A batch's output, error and audio files. They carry `expires_at` and are deleted 30 days after creation. |
+
+Any other purpose is refused with `400`. An upload may be at most
+`IZWI_FILES_MAX_BYTES` (200 MB by default); a larger one is refused with
+`413`. Uploads are kept until deleted, and survive a restart. A file is
+visible only to the principal that created it; anyone else gets `404`.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="not-needed")
+uploaded = client.files.create(file=open("requests.jsonl", "rb"), purpose="batch")
+print(client.files.retrieve(uploaded.id).bytes)
+print(client.files.content(uploaded.id).text)
+client.files.delete(uploaded.id)
 ```
 
 ### Responses

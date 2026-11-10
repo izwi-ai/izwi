@@ -51,6 +51,7 @@ impl Schema {
                 (14, "saved voice reference language"),
                 (15, "speech take codes, voices and parent"),
                 (16, "voice consent recordings"),
+                (17, "uploaded and server-written files"),
             ],
             Self::Fleet => &[
                 (1, "fleet coordination"),
@@ -233,6 +234,12 @@ async fn apply_migration<C: ConnectionTrait>(
                     .await?;
             }
             ensure_column(db, &SAVED_VOICE_CONSENT_COLUMN).await?;
+        }
+        (Schema::App, 17) => {
+            for statement in FILES_SCHEMA {
+                db.execute_unprepared(&dialect_ddl(backend, statement))
+                    .await?;
+            }
         }
         (Schema::App, 13) => {
             if backend == DbBackend::Postgres {
@@ -1236,6 +1243,26 @@ const VOICE_CONSENT_SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_voice_consents_created_at ON voice_consents(created_at DESC, id DESC);",
 ];
 
+/// Migration 17: the files of `/v1/files`. A file's bytes are an opaque
+/// artifact of its tenant (the id is the artifact's, prefixed `file-`); this
+/// row is what the Files API lists: purpose, name, size and, for a
+/// server-written `batch_output` file, when it expires.
+const FILES_SCHEMA: &[&str] = &[
+    r#"
+    CREATE TABLE IF NOT EXISTS api_files (
+        id TEXT PRIMARY KEY,
+        tenant_scope TEXT NOT NULL,
+        purpose TEXT NOT NULL,
+        filename TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_api_files_tenant_created_at ON api_files(tenant_scope, created_at DESC, id DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_api_files_expires_at ON api_files(expires_at) WHERE expires_at IS NOT NULL;",
+];
+
 const SAVED_VOICE_CONSENT_COLUMN: CompatibilityColumn = CompatibilityColumn {
     table: "saved_voices",
     column: "consent_id",
@@ -1871,6 +1898,10 @@ pub(crate) fn postgres_schema_sql() -> String {
         push(statement);
     }
     push(&add_column(&SAVED_VOICE_CONSENT_COLUMN));
+    // Migration 17.
+    for statement in FILES_SCHEMA {
+        push(statement);
+    }
     push(SCHEMA_MIGRATIONS_DDL);
     for (version, name) in Schema::App.migrations() {
         push(&format!(

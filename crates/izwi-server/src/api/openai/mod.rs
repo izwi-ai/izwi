@@ -3,6 +3,7 @@
 pub mod audio;
 pub mod chat;
 pub mod compat;
+pub mod files;
 pub use izwi_gateway::api::openai::convert;
 pub(crate) mod model_aliases;
 pub mod models;
@@ -20,6 +21,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .merge(audio::router())
         .merge(chat::router())
+        .merge(files::router())
         .merge(models::router())
         .merge(realtime::router())
         .merge(responses::router())

@@ -519,6 +519,8 @@ pub struct AppState {
     pub batch_runtime_store: Arc<BatchRuntimeStore>,
     /// Tenant-scoped opaque artifacts plus durable physical-deletion recovery.
     pub artifact_store: Arc<ArtifactStore>,
+    /// The files of `/v1/files`, stored as artifacts of their tenant.
+    pub(crate) file_store: Arc<crate::file_store::FileStore>,
     /// Shared strict media validation, canonicalization, storage, and asset registration service.
     pub media_ingest: Arc<MediaIngestService>,
     /// In-process batch worker health snapshot used by readiness and diagnostics.
@@ -569,6 +571,10 @@ impl AppState {
             media_storage.clone(),
             ArtifactStoreLimits::default(),
         )?);
+        let file_store = Arc::new(crate::file_store::FileStore::new(
+            store_database.clone(),
+            artifact_store.clone(),
+        ));
         let speech_history_store = Arc::new(SpeechHistoryStore::initialize_with_storage(
             store_database,
             media_storage.clone(),
@@ -611,6 +617,7 @@ impl AppState {
             voice_observation_store,
             batch_runtime_store,
             artifact_store,
+            file_store,
             media_ingest,
             batch_worker_health,
             stream_shutdown: Arc::new(tokio::sync::watch::Sender::new(false)),
@@ -675,6 +682,10 @@ impl AppState {
             media_storage.clone(),
             ArtifactStoreLimits::default(),
         )?);
+        let file_store = Arc::new(crate::file_store::FileStore::new(
+            store_database.clone(),
+            artifact_store.clone(),
+        ));
         let speech_history_store = Arc::new(
             SpeechHistoryStore::initialize_with_storage(
                 store_database.clone(),
@@ -720,6 +731,7 @@ impl AppState {
             voice_observation_store,
             batch_runtime_store,
             artifact_store,
+            file_store,
             media_ingest,
             batch_worker_health,
             stream_shutdown: Arc::new(tokio::sync::watch::Sender::new(false)),

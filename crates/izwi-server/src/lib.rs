@@ -27,6 +27,7 @@ mod diarization_store;
 mod entity;
 mod env_config;
 mod error;
+mod file_store;
 mod local_security;
 mod logging;
 pub mod media_ingest;

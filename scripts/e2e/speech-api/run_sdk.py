@@ -296,6 +296,33 @@ def s8_batch(base_url: str) -> str:
     return f"{result['succeeded']} ok, 1 refused"
 
 
+@scenario("S13 files: upload, retrieve, list, content and delete with client.files")
+def s13_files(client: OpenAI) -> str:
+    content = b'{"custom_id": "probe"}\n'
+    uploaded = client.files.create(file=("probe.jsonl", content), purpose="batch")
+    check(uploaded.id.startswith("file-"), f"id {uploaded.id}")
+    check(uploaded.bytes == len(content) and uploaded.purpose == "batch", f"{uploaded}")
+    check(client.files.retrieve(uploaded.id).filename == "probe.jsonl", "retrieve")
+    listed = [item.id for item in client.files.list(purpose="batch")]
+    check(uploaded.id in listed, f"{uploaded.id} not in the list")
+    check(client.files.content(uploaded.id).content == content, "content")
+    deleted = client.files.delete(uploaded.id)
+    check(deleted.deleted and deleted.id == uploaded.id, f"{deleted}")
+    try:
+        client.files.retrieve(uploaded.id)
+    except Exception as error:  # noqa: BLE001 - the SDK's NotFoundError
+        check(getattr(error, "status_code", None) == 404, f"after delete: {error}")
+    else:
+        raise AssertionError("the deleted file is still there")
+    try:
+        client.files.create(file=("probe.jsonl", content), purpose="assistants")
+    except Exception as error:  # noqa: BLE001 - the SDK's BadRequestError
+        check(getattr(error, "status_code", None) == 400, f"purpose: {error}")
+    else:
+        raise AssertionError("purpose assistants was accepted")
+    return f"{uploaded.id} round-tripped {len(content)} bytes"
+
+
 async def socket_session(base_url: str, dialect: str, cancel: bool = False) -> dict:
     import websockets
 
@@ -441,6 +468,7 @@ def main() -> int:
         "9": lambda: s9_socket(args.url),
         "10": lambda: s10_socket_dialect(args.url),
         "12": lambda: s12_sglang_voice(args.url),
+        "13": lambda: s13_files(client),
     }
     for number, run in plan.items():
         if args.only and number not in args.only:

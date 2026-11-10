@@ -408,6 +408,11 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "Assistant audio a voice websocket queues, in milliseconds.",
     ),
     var(
+        "IZWI_FILES_MAX_BYTES",
+        "209715200",
+        "Largest file `/v1/files` accepts, in bytes (at most 1 GiB).",
+    ),
+    var(
         "IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS",
         "5",
         "Heartbeat age after which readiness reports a batch worker stale.",
@@ -497,6 +502,7 @@ pub(crate) struct ServerTuning {
     pub(crate) voice_ws_outbound_audio_bytes: usize,
     pub(crate) voice_ws_outbound_audio_ms: u64,
     pub(crate) batch_worker_heartbeat_stale_ms: u64,
+    pub(crate) files_max_bytes: u64,
     pub(crate) idempotency_limits: QuotaLimits,
     pub(crate) provider_write_limits: QuotaLimits,
     pub(crate) retention: RetentionPolicy,
@@ -739,6 +745,7 @@ impl ServerTuning {
             voice_ws_outbound_audio_ms: at_least(env, "IZWI_VOICE_WS_OUTBOUND_AUDIO_MS", 1, 5_000)?,
             batch_worker_heartbeat_stale_ms: secs("IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS", 5)?
                 .saturating_mul(1_000),
+            files_max_bytes: at_least(env, "IZWI_FILES_MAX_BYTES", 1, 200 * 1024 * 1024)?,
             idempotency_limits: QuotaLimits {
                 global: at_least(env, "IZWI_IDEMPOTENCY_MAX_RECORDS", 1, 1_048_576)?,
                 per_tenant: at_least(env, "IZWI_IDEMPOTENCY_MAX_RECORDS_PER_TENANT", 1, 65_536)?,

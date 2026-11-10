@@ -1199,6 +1199,58 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         preview_response(),
     );
     add_speech_api_paths(paths);
+    add_files_paths(paths);
+}
+
+/// OpenAI's Files API, for the Batch API's input, audio and output.
+fn add_files_paths(paths: &mut Map<String, Value>) {
+    add_operation(
+        paths,
+        "/v1/files",
+        "post",
+        "OpenAI Compatible",
+        "Create file",
+        "Multipart `file` and `purpose`: `batch` (a batch's JSONL input) or `user_data` (audio a \
+         batch line names by `file_id`). At most IZWI_FILES_MAX_BYTES (200 MB); larger is 413.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/files",
+        "get",
+        "OpenAI Compatible",
+        "List files",
+        "The caller's files, newest first; `purpose`, `limit` (1 to 10000), `after` and `order` \
+         (`asc` or `desc`) filter and page them.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/files/{file_id}",
+        "get",
+        "OpenAI Compatible",
+        "Get file",
+        "A file's metadata. `batch_output` files carry `expires_at`, 30 days after creation.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/files/{file_id}",
+        "delete",
+        "OpenAI Compatible",
+        "Delete file",
+        "Deletes the file and its content.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/files/{file_id}/content",
+        "get",
+        "OpenAI Compatible",
+        "Download file content",
+        "The file's bytes.",
+        preview_response(),
+    );
 }
 
 /// The speech API beyond `/v1/audio/speech` and `/transcriptions`:
