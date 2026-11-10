@@ -657,6 +657,52 @@ and per-model fields; `--tts-extra` adds fields for a model it does not know.
 The bearer token is `--api-key` or `$IZWI_BENCH_API_KEY`. It is
 standard-library Python; its tests run in the hygiene lane.
 
+## Telephony audio accuracy
+
+`run-telephony-accuracy.py` measures what telephone audio costs a
+transcription model. For each `--model` it transcribes every reference clip
+through `/v1/audio/transcriptions` under each condition and scores the
+transcripts against the references:
+
+- `original`: the recording as it is;
+- `ulaw`: band-limited to 3.4 kHz, resampled to 8 kHz, then G.711 μ-law
+  encoded and decoded, which is what a model hears of a phone call
+  (`audio/pcmu` on `/v1/realtime`, or a media stream);
+- `alaw`: the same through G.711 A-law (`audio/pcma`);
+- `narrowband`: band-limited and resampled only. It is not run by default;
+  add it to `--conditions` to tell the loss of bandwidth from the loss of
+  companding.
+
+References are a directory of `name.wav` files (16-bit PCM) with a `name.txt`
+or `name.md` transcript beside each (`--audio`), or a JSONL manifest of
+`{"audio": "a.wav", "text": "..."}` lines (`--manifest`; `"text_file"` names
+a transcript file instead, and paths are relative to the manifest). The
+repository's own fixtures are enough for a smoke run; a verdict needs a set
+of real speech with at least a few hundred reference words per language.
+
+```bash
+python3 scripts/bench/run-telephony-accuracy.py --audio data \
+    --model Parakeet-TDT-0.6B-v3,Whisper-Large-v3-Turbo \
+    --output target/telephony-accuracy.json
+
+python3 scripts/bench/test-telephony-accuracy.py
+```
+
+The printed table and the JSON (schema `izwi.telephony_accuracy`) hold, per
+model and condition, the word error rate and character error rate over the
+whole set (errors summed over clips, divided by the reference length; text
+normalized as `score-asr-matrix.py` does), the clips scored and failed, and
+under `degradation` how far each telephone condition falls from `original`:
+`wer_absolute` and `cer_absolute` in rate points, `wer_relative` and
+`cer_relative` as a fraction of the original's rate (null when the original
+scores 0). `--save-samples` keeps every transcript. A clip that fails to
+transcribe is counted, left out of the rates, and makes the run exit 1.
+
+The conditions are prepared offline, so the script measures the model on
+telephone audio, not the realtime transport. `noise_reduction` on
+`/v1/realtime` is accepted and ignored; this measurement is what decides
+whether it gets an implementation.
+
 ## Metal load footprints
 
 `measure-metal-load-footprints.sh` loads each model on Metal in its own process
