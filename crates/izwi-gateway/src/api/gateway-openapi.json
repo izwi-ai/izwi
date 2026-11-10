@@ -3600,6 +3600,23 @@
           "Realtime"
         ]
       }
+    },
+    "/v1/realtime/media-stream": {
+      "get": {
+        "description": "Upgrade to a phone call in the media-stream framing of call-centre platforms and carrier APIs: JSON text frames (`connected`, `start`, `media`, `mark`, `dtmf`, `stop`) with base64 8 kHz μ-law audio. The call runs as a `/v1/realtime` session. `?model=` and `?intent=transcription` select it as on `/v1/realtime`; `voice`, `instructions`, `language`, `transcription_model` and `transcripts` configure it, in the query string or the `start` frame's `customParameters`.",
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade"
+          },
+          "400": {
+            "description": "Invalid WebSocket request"
+          }
+        },
+        "summary": "Open a telephony media-stream WebSocket",
+        "tags": [
+          "Realtime"
+        ]
+      }
     }
   },
   "servers": [

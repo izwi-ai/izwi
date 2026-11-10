@@ -46,9 +46,14 @@
         "retention": "the conversation lives as long as the socket"
       },
       "/v1/realtime/client_secrets": {
-        "contract": "ephemeral ek_ keys bound to a session config, admitting /v1/realtime only",
+        "contract": "ephemeral ek_ keys bound to a session config, admitting /v1/realtime and /v1/realtime/media-stream only",
         "durability": "process_local",
         "retention": "keys live in memory for at most two hours and are lost on server restart"
+      },
+      "/v1/realtime/media-stream": {
+        "contract": "telephony media-stream WebSocket: connected, start, media, mark, dtmf, stop in; media, mark, clear and Izwi's transcript and error out; base64 8 kHz mu-law; one call per socket, run as a /v1/realtime session",
+        "durability": "process_local",
+        "retention": "the call lives as long as the socket"
       },
       "/v1/audio/speech/batch": {
         "contract": "SGLang-Omni/vLLM-Omni batch envelope {id, results[], total, succeeded, failed}; inline base64 audio; at most IZWI_TTS_BATCH_MAX_ITEMS items",

@@ -37,6 +37,7 @@ When `izwi serve` is running:
 | `/v1/admin/*` | Preview | Local model-management APIs. Bind carefully on shared hosts. |
 | WebSocket realtime routes | Preview | Browser-facing low-latency protocols that may evolve. |
 | `/v1/realtime`, `/v1/realtime/client_secrets` | Preview | OpenAI Realtime API (GA) over WebSocket, served by local models. |
+| `/v1/realtime/media-stream` | Preview | A phone call as a telephony media stream, run as a `/v1/realtime` session. |
 | `/internal/*` aliases | Internal | Compatibility aliases for tooling. Prefer `/v1/*` or root probes where available. |
 
 ## Common Conventions
@@ -2104,11 +2105,11 @@ Events are the GA protocol's: `session.update`, `input_audio_buffer.*`, `convers
 - Errors are `error` events with `type`, `code`, `message`, `param` and the client's `event_id`; the session stays open. Requests that conflict harmlessly (a different `model` in `session.update`, a voice change after the session has spoken, a truncate past the end) are accepted and ignored.
 - Sessions are not written to the voice history unless `IZWI_REALTIME_PERSIST=1`.
 - `?intent=transcription` opens a transcription session: input audio, VAD or manual commits and transcription events, no responses.
-- WebRTC (`/v1/realtime/calls`), SIP, MCP tools and image input are not served.
+- WebRTC (`/v1/realtime/calls`), SIP, MCP tools and image input are not served. [Phone calls and call centres](/features/telephony) covers how a call reaches a session.
 
 ### Browser clients and client secrets
 
-A browser cannot set `Authorization` on a WebSocket. `POST /v1/realtime/client_secrets` (authenticated with the API key) mints an `ek_` key bound to a session config, valid for `expires_after.seconds` (10 to 7200, default 600). The browser offers it as the `openai-insecure-api-key.<key>` subprotocol beside `realtime`; the key admits `/v1/realtime` only, and its session config applies to each session it opens. Browser pages on other origins still need the server's CORS and origin settings.
+A browser cannot set `Authorization` on a WebSocket. `POST /v1/realtime/client_secrets` (authenticated with the API key) mints an `ek_` key bound to a session config, valid for `expires_after.seconds` (10 to 7200, default 600). The browser offers it as the `openai-insecure-api-key.<key>` subprotocol beside `realtime`; the key admits `/v1/realtime` and `/v1/realtime/media-stream` only, and its session config applies to each session it opens. Browser pages on other origins still need the server's CORS and origin settings.
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/realtime/client_secrets \
@@ -2116,8 +2117,55 @@ curl -s http://127.0.0.1:8080/v1/realtime/client_secrets \
   -d '{"session": {"type": "realtime", "model": "izwi-voice", "instructions": "Be brief."}}'
 ```
 
+### Telephony media streams
+
+`GET /v1/realtime/media-stream` takes a phone call in the WebSocket framing call-centre platforms and carrier APIs stream call audio in, and runs it as a `/v1/realtime` session: G.711 μ-law at 8 kHz in both directions, turns cut by `server_vad`. One socket carries one call and takes one realtime session slot. [Phone calls and call centres](/features/telephony) has worked examples and the other ways to connect a call.
+
+The call is configured in the query string, or by the same names in the `start` frame's `customParameters` (which win; some platforms drop the query string):
+
+| Parameter | Meaning |
+| --- | --- |
+| `model` | The realtime profile, as on `/v1/realtime`. |
+| `intent` | `transcription` opens a transcription call: transcripts, no replies. |
+| `voice`, `instructions` | The session's `audio.output.voice` and `instructions`. |
+| `transcription_model`, `language` | The session's `audio.input.transcription` model and language. A conversation sends transcripts of the caller only when one of them is set, or when a client secret's session config sets `audio.input.transcription`. |
+| `transcripts` | `false` keeps `transcript` frames off the stream. |
+
+Authentication is the same as `/v1/realtime`: the API key as a bearer token, or a client secret as a bearer token or the `openai-insecure-api-key.<key>` subprotocol. A client secret's session config applies under the call's own parameters; its audio formats are replaced by G.711 μ-law, and a `turn_detection` of `null` by `server_vad`. A bad `model` or `intent` in the query string refuses the upgrade with `400`.
+
+Frames are JSON text, one event each. From the carrier:
+
+| `event` | Handling |
+| --- | --- |
+| `connected` | Ignored. |
+| `start` | Starts the call. `streamSid` (top level or in `start`) names the stream and is echoed on every frame Izwi sends. `start.mediaFormat`, when present, must be `audio/x-mulaw`, 8000 Hz, 1 channel. `start.customParameters` configure the call. A `start` must arrive within 10 seconds. |
+| `media` | `media.payload` is base64 μ-law, any frame length (20 ms is usual). Frames whose `media.track` is not `inbound` are ignored. |
+| `mark`, `dtmf` | Ignored. |
+| `stop` | Ends the call; Izwi closes the socket. Closing the socket ends the call too. |
+
+Any other event, and any frame that is not JSON, is ignored. From Izwi:
+
+| `event` | Meaning |
+| --- | --- |
+| `media` | Speech of a reply: `media.payload` is base64 μ-law at 8 kHz, up to 100 ms a frame, sent as it is generated. |
+| `mark` | The end of a reply's speech; `mark.name` is the reply's item id. A carrier echoes it when playback reaches it. |
+| `clear` | The caller started speaking while a reply was still playing: drop the audio not yet played. Izwi cancels the reply and keeps, as what the agent said, the share of it that had time to play. |
+| `transcript` | Izwi extension. `item_id`, `type` (`delta` or `completed`) and `text`: the caller's words. A model that transcribes live sends `delta` frames while the caller speaks; every model sends `completed` with the whole utterance. |
+| `error` | Izwi extension. `error` is the session's error object (`type`, `code`, `message`): a failed reply or transcription, or a bad frame. The call stays open. |
+
+A call that cannot start gets an `error` frame and a close: code `1008` for a `start` that is late, has no `streamSid`, names another media format or carries bad parameters, and `1013` when every realtime session slot is in use.
+
+```json
+{"event": "start", "streamSid": "MZ123", "start": {"streamSid": "MZ123", "callSid": "CA456", "tracks": ["inbound"],
+  "mediaFormat": {"encoding": "audio/x-mulaw", "sampleRate": 8000, "channels": 1},
+  "customParameters": {"model": "izwi-voice", "voice": "cedar"}}}
+{"event": "media", "streamSid": "MZ123", "media": {"track": "inbound", "chunk": "1", "timestamp": "0", "payload": "//////..."}}
+```
+
+Function tools, manual turns and the rest of the Realtime protocol are not reachable through this framing; use `/v1/realtime` for them.
+
 ### Through the gateway
 
-With `IZWI_GATEWAY_OPENAI_REALTIME_UPSTREAMS` (izwi-server base URLs) the gateway serves `/v1/realtime` too: it authenticates and admits each session, then relays it to an upstream izwi-server (round robin, `IZWI_GATEWAY_OPENAI_REALTIME_UPSTREAM_API_KEY` as the upstream's key, capped by `IZWI_GATEWAY_REALTIME_MAX_SESSIONS`). The session itself runs on the izwi-server.
+With `IZWI_GATEWAY_OPENAI_REALTIME_UPSTREAMS` (izwi-server base URLs) the gateway serves `/v1/realtime` too: it authenticates and admits each session, then relays it to an upstream izwi-server (round robin, `IZWI_GATEWAY_OPENAI_REALTIME_UPSTREAM_API_KEY` as the upstream's key, capped by `IZWI_GATEWAY_REALTIME_MAX_SESSIONS`). The session itself runs on the izwi-server. `/v1/realtime/media-stream` is relayed the same way, under the same session cap.
 
-The gateway relays `POST /v1/realtime/client_secrets` and `GET /v1/realtime/capabilities` to the same upstreams, after its own authentication, admission and tenant lease. An izwi-server keeps the `ek_` keys it mints in memory, so the gateway remembers which upstream minted each key and for which principal. A browser presents the key on the gateway's `/v1/realtime` as it would to an izwi-server (the `openai-insecure-api-key.<key>` subprotocol, no gateway API key): the gateway treats the session as the minting principal's, sends it to the upstream that minted the key, and that upstream checks the key and applies its session config. The key opens no other gateway route. The gateway's memory of keys is per process and is lost on restart, so with several gateway replicas a key works only through the replica that minted it: run one replica for this, or route a browser's requests to the replica its backend used. `capabilities` is answered by one upstream, so configure the upstreams' profiles alike.
+The gateway relays `POST /v1/realtime/client_secrets` and `GET /v1/realtime/capabilities` to the same upstreams, after its own authentication, admission and tenant lease. An izwi-server keeps the `ek_` keys it mints in memory, so the gateway remembers which upstream minted each key and for which principal. A browser presents the key on the gateway's `/v1/realtime` (or a carrier on its `/v1/realtime/media-stream`) as it would to an izwi-server (the `openai-insecure-api-key.<key>` subprotocol, no gateway API key): the gateway treats the session as the minting principal's, sends it to the upstream that minted the key, and that upstream checks the key and applies its session config. The key opens no other gateway route. The gateway's memory of keys is per process and is lost on restart, so with several gateway replicas a key works only through the replica that minted it: run one replica for this, or route a browser's requests to the replica its backend used. `capabilities` is answered by one upstream, so configure the upstreams' profiles alike.

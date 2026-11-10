@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use futures::StreamExt;
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use izwi_core::SessionModelLeases;
 use izwi_vad::{configured_snr_margin_db, sanitize_snr_margin};
 use serde_json::{json, Value};
@@ -25,7 +25,7 @@ use super::events::{parse_client_event, ClientEvent, Ids, RealtimeError};
 use super::items::{ContentPart, Item, ItemAudio, ItemKind, ItemStatus, ItemStore, Position, Role};
 use super::live::{transcribes_live, LiveTranscription, LiveTurn};
 use super::persist::History;
-use super::profiles::{speaker_for, transcription_model, RealtimeProfile};
+use super::profiles::{resolve_profile, speaker_for, transcription_model, RealtimeProfile};
 use super::respond::{
     lock_items, run_response, Outbound, PendingTranscript, PendingTranscripts, ResponseContext,
     ResponsePlan, ResponseSummary,
@@ -156,24 +156,93 @@ fn heard_share(text: &str, heard_ms: u64, audio_ms: u64) -> String {
     words[..keep.min(words.len())].join(" ")
 }
 
+/// What a session runs, resolved when its socket is opened.
+pub(crate) struct SessionSpec {
+    pub(crate) profile: RealtimeProfile,
+    pub(crate) requested_model: String,
+    pub(crate) kind: SessionKind,
+    /// A session config applied before the session starts: an ephemeral
+    /// key's, or a media-stream call's.
+    pub(crate) bound_session: Option<Value>,
+}
+
+impl SessionSpec {
+    /// The session `model` and `intent` ask for; either may come from the
+    /// session config an ephemeral key binds instead.
+    pub(crate) fn resolve(
+        model: Option<&str>,
+        intent: Option<&str>,
+        bound_session: Option<Value>,
+    ) -> Result<Self, String> {
+        let bound = |field: &str| {
+            bound_session
+                .as_ref()
+                .and_then(|session| session.get(field))
+                .and_then(Value::as_str)
+        };
+        let kind = match intent.map(str::trim).or(bound("type")) {
+            None | Some("" | "realtime" | "conversation") => SessionKind::Realtime,
+            Some("transcription") => SessionKind::Transcription,
+            Some(other) => {
+                return Err(format!(
+                    "Unsupported intent `{other}`; use `realtime` or `transcription`."
+                ))
+            }
+        };
+        let model = model.or(bound("model"));
+        let profile = resolve_profile(model)?;
+        let requested_model = model
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .unwrap_or(&profile.id)
+            .to_string();
+        Ok(Self {
+            profile,
+            requested_model,
+            kind,
+            bound_session,
+        })
+    }
+}
+
 /// Run one `/v1/realtime` socket to its end.
 pub(crate) async fn handle_socket(
-    mut socket: WebSocket,
+    socket: WebSocket,
     state: AppState,
     correlation_id: String,
-    profile: RealtimeProfile,
-    requested_model: String,
-    kind: SessionKind,
-    bound_session: Option<Value>,
+    spec: SessionSpec,
 ) {
+    let (ws_tx, ws_rx) = socket.split();
+    run_session(ws_tx, ws_rx, state, correlation_id, spec).await;
+}
+
+/// Run one session to its end over a socket's two halves. They carry
+/// `/v1/realtime` events: the socket's own, or another framing translated
+/// to them (`app::media_stream`).
+pub(crate) async fn run_session<Tx, Rx, E>(
+    mut ws_tx: Tx,
+    mut ws_rx: Rx,
+    state: AppState,
+    correlation_id: String,
+    spec: SessionSpec,
+) where
+    Tx: Sink<Message> + Unpin + Send + 'static,
+    Rx: Stream<Item = Result<Message, E>> + Unpin,
+{
+    let SessionSpec {
+        profile,
+        requested_model,
+        kind,
+        bound_session,
+    } = spec;
     let ids = Arc::new(Ids::new());
     let Some(_session_permit) = state.try_acquire_realtime_session() else {
         let error = RealtimeError::server("Realtime session capacity is exhausted; retry shortly.");
         let mut event = error.to_event(&ids);
         event["error"]["code"] = json!("session_capacity");
-        let _ = socket.send(Message::Text(event.to_string().into())).await;
+        let _ = ws_tx.send(Message::Text(event.to_string().into())).await;
         // 1013 (try again later) is a close openai-python retries.
-        let _ = socket
+        let _ = ws_tx
             .send(Message::Close(Some(CloseFrame {
                 code: 1013,
                 reason: "realtime_session_capacity".into(),
@@ -182,7 +251,6 @@ pub(crate) async fn handle_socket(
         return;
     };
 
-    let (ws_tx, mut ws_rx) = socket.split();
     let tuning = crate::env_config::tuning();
     let mailbox = Arc::new(OutboundMailbox::new(OutboundLimits {
         max_items: tuning.voice_ws_outbound_items.max(OUTBOUND_ITEMS),

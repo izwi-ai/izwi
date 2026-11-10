@@ -10,6 +10,10 @@
 //! refusal of the upgrade (an unknown `model`, its own capacity) reaches the
 //! client as the same HTTP status.
 //!
+//! `/v1/realtime/media-stream` (a phone call in a carrier's media-stream
+//! framing, which the upstream runs as a realtime session) is admitted and
+//! relayed the same way.
+//!
 //! `POST /v1/realtime/client_secrets` and `GET /v1/realtime/capabilities`
 //! are relayed to the same upstreams. An izwi-server keeps the `ek_` keys it
 //! mints in its own memory, so the gateway remembers which upstream minted
@@ -391,6 +395,39 @@ pub async fn proxy_socket(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    relay_session(state, context, "/v1/realtime", query, headers, upgrade).await
+}
+
+/// `GET /v1/realtime/media-stream`: a phone call as a telephony media
+/// stream. The upstream runs it as a realtime session, so the gateway admits
+/// and relays it as one.
+pub async fn proxy_media_stream(
+    State(state): State<GatewayState>,
+    Extension(context): Extension<RequestContext>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    relay_session(
+        state,
+        context,
+        "/v1/realtime/media-stream",
+        query,
+        headers,
+        upgrade,
+    )
+    .await
+}
+
+/// Admit one session socket and relay it to the upstream's `path`.
+async fn relay_session(
+    state: GatewayState,
+    context: RequestContext,
+    path: &str,
+    query: Option<String>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
     let Some(upstreams) = state.openai_realtime.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -413,7 +450,7 @@ pub async fn proxy_socket(
         None => upstreams.pick(),
     };
     let url = format!(
-        "{}/v1/realtime{}",
+        "{}{path}{}",
         upstreams.urls[upstream],
         query.map(|query| format!("?{query}")).unwrap_or_default()
     );

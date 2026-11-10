@@ -2899,6 +2899,7 @@ async fn openai_realtime_sessions_pass_through_to_an_izwi_server() {
     // model, and echoes every client event after `session.created`.
     async fn upstream(
         headers: axum::http::HeaderMap,
+        uri: axum::http::Uri,
         RawQuery(query): RawQuery,
         upgrade: WebSocketUpgrade,
     ) -> Response {
@@ -2920,8 +2921,8 @@ async fn openai_realtime_sessions_pass_through_to_an_izwi_server() {
         upgrade
             .protocols(["realtime"])
             .on_upgrade(move |mut socket| async move {
-                let created =
-                    json!({"type": "session.created", "event_id": "event_1", "query": query});
+                let created = json!({"type": "session.created", "event_id": "event_1",
+                    "query": query, "path": uri.path()});
                 let _ = socket
                     .send(AxumMessage::Text(created.to_string().into()))
                     .await;
@@ -2938,7 +2939,9 @@ async fn openai_realtime_sessions_pass_through_to_an_izwi_server() {
                 }
             })
     }
-    let upstream_app = Router::new().route("/v1/realtime", axum::routing::get(upstream));
+    let upstream_app = Router::new()
+        .route("/v1/realtime", axum::routing::get(upstream))
+        .route("/v1/realtime/media-stream", axum::routing::get(upstream));
     let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_port = upstream_listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(upstream_listener, upstream_app).await });
@@ -3016,6 +3019,39 @@ async fn openai_realtime_sessions_pass_through_to_an_izwi_server() {
         other => panic!("expected 401 without the gateway key, got {other:?}"),
     }
     ws.close(None).await.unwrap();
+
+    // A phone call's media stream is relayed the same way, to the
+    // upstream's media-stream route.
+    let media_stream = |authorized: bool| {
+        let url = format!("ws://127.0.0.1:{port}/v1/realtime/media-stream?intent=transcription");
+        let mut request = url.into_client_request().unwrap();
+        if authorized {
+            request.headers_mut().insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {TEST_API_KEY}")).unwrap(),
+            );
+        }
+        request
+    };
+    let (mut call, _) = tokio_tungstenite::connect_async(media_stream(true))
+        .await
+        .unwrap();
+    let opened = call.next().await.unwrap().unwrap();
+    let opened: serde_json::Value = serde_json::from_str(opened.to_text().unwrap()).unwrap();
+    assert_eq!(opened["path"], "/v1/realtime/media-stream");
+    assert_eq!(opened["query"], "intent=transcription");
+    call.send(Message::Text(r#"{"event":"connected"}"#.into()))
+        .await
+        .unwrap();
+    let echo = call.next().await.unwrap().unwrap();
+    assert_eq!(echo.to_text().unwrap(), r#"echo:{"event":"connected"}"#);
+    match tokio_tungstenite::connect_async(media_stream(false)).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), 401)
+        }
+        other => panic!("expected 401 without the gateway key, got {other:?}"),
+    }
+    call.close(None).await.unwrap();
 }
 
 /// Realtime client secrets through the gateway: an upstream mints the key,
@@ -3348,7 +3384,11 @@ async fn speech_api_passes_through_to_izwi_servers() {
     ] {
         assert!(paths.contains_key(served), "{served}");
     }
-    for unserved in ["/v1/audio/voices", "/v1/realtime"] {
+    for unserved in [
+        "/v1/audio/voices",
+        "/v1/realtime",
+        "/v1/realtime/media-stream",
+    ] {
         assert!(!paths.contains_key(unserved), "{unserved}");
     }
 

@@ -6,6 +6,8 @@
 //!   WebRTC/SIP sideband) is not served. A client offering the `realtime`
 //!   subprotocol gets it back, and a browser may authenticate with an
 //!   ephemeral key as the `openai-insecure-api-key.<key>` subprotocol.
+//! - `GET /v1/realtime/media-stream`: a phone call as a telephony media
+//!   stream (see `app::media_stream`), run as a session of the same kind.
 //! - `POST /v1/realtime/client_secrets`: mint such an ephemeral key, bound to
 //!   a session config.
 //! - `GET /v1/realtime/capabilities`: Izwi's realtime profiles, voices and
@@ -23,6 +25,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::api::request_context::RequestContext;
+use crate::app::media_stream::{self, CallParams};
 use crate::app::openai_realtime::events::Ids;
 use crate::app::openai_realtime::live::{transcribes_live, transcription_mode};
 use crate::app::openai_realtime::profiles::{
@@ -31,7 +34,7 @@ use crate::app::openai_realtime::profiles::{
 };
 use crate::app::openai_realtime::secrets;
 use crate::app::openai_realtime::session_config::SessionConfig;
-use crate::app::openai_realtime::{handle_socket, SessionKind};
+use crate::app::openai_realtime::{handle_socket, SessionSpec};
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::voice_defaults::DEFAULT_VOICE_AGENT_SYSTEM_PROMPT;
@@ -42,6 +45,7 @@ const MAX_MESSAGE_BYTES: usize = 24 * 1024 * 1024;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/realtime", get(ws_upgrade))
+        .route("/realtime/media-stream", get(media_stream_upgrade))
         .route("/realtime/client_secrets", post(create_client_secret))
         .route("/realtime/capabilities", get(capabilities))
 }
@@ -100,69 +104,26 @@ async fn ws_upgrade(
         )
         .into_response();
     }
-    let bound = bound_session(&headers);
-    let bound_type = bound
-        .as_ref()
-        .and_then(|session| session.get("type"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let kind = match query
-        .intent
-        .as_deref()
-        .map(str::trim)
-        .or(bound_type.as_deref())
-    {
-        None | Some("" | "realtime" | "conversation") => SessionKind::Realtime,
-        Some("transcription") => SessionKind::Transcription,
-        Some(other) => {
-            return ApiError::bad_request(format!(
-                "Unsupported intent `{other}`; use `realtime` or `transcription`."
-            ))
-            .into_response()
-        }
-    };
-    let model = query.model.clone().or_else(|| {
-        bound
-            .as_ref()
-            .and_then(|session| session.get("model"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    });
-    let profile = match resolve_profile(model.as_deref()) {
-        Ok(profile) => profile,
+    let spec = match SessionSpec::resolve(
+        query.model.as_deref(),
+        query.intent.as_deref(),
+        bound_session(&headers),
+    ) {
+        Ok(spec) => spec,
         Err(err) => return ApiError::bad_request(err).into_response(),
     };
-    let requested_model = model
-        .map(|model| model.trim().to_string())
-        .filter(|model| !model.is_empty())
-        .unwrap_or_else(|| profile.id.clone());
-    let profile_header = profile.summary();
-    let ws = ws
-        .max_message_size(MAX_MESSAGE_BYTES)
-        .max_frame_size(MAX_MESSAGE_BYTES);
-    let ws = if offered_protocols(&headers)
-        .iter()
-        .any(|protocol| protocol == "realtime")
-    {
-        ws.protocols(["realtime"])
-    } else {
-        ws
-    };
+    let profile_header = spec.profile.summary();
+    let ws = offer_realtime_protocol(
+        ws.max_message_size(MAX_MESSAGE_BYTES)
+            .max_frame_size(MAX_MESSAGE_BYTES),
+        &headers,
+    );
     let correlation_id = ctx.correlation_id;
     // The session counts against the speech quota for as long as it is open.
     let speech_connection = ctx.speech_connection;
     let mut response = ws.on_upgrade(move |socket| async move {
         let _speech_connection = speech_connection;
-        handle_socket(
-            socket,
-            state,
-            correlation_id,
-            profile,
-            requested_model,
-            kind,
-            bound,
-        )
-        .await
+        handle_socket(socket, state, correlation_id, spec).await
     });
     if let Ok(value) = axum::http::HeaderValue::from_str(&profile_header) {
         response
@@ -170,6 +131,46 @@ async fn ws_upgrade(
             .insert("x-izwi-realtime-profile", value);
     }
     response
+}
+
+/// Answer the `realtime` subprotocol to a client that offered it.
+fn offer_realtime_protocol(ws: WebSocketUpgrade, headers: &HeaderMap) -> WebSocketUpgrade {
+    if offered_protocols(headers)
+        .iter()
+        .any(|protocol| protocol == "realtime")
+    {
+        ws.protocols(["realtime"])
+    } else {
+        ws
+    }
+}
+
+/// `GET /v1/realtime/media-stream`.
+async fn media_stream_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
+    Query(params): Query<CallParams>,
+    headers: HeaderMap,
+) -> Response {
+    let bound = bound_session(&headers);
+    // A bad query refuses the upgrade; a call's custom parameters arrive
+    // with its `start` and are checked there.
+    if let Err(err) = params.session_spec(bound.clone()) {
+        return ApiError::bad_request(err).into_response();
+    }
+    let ws = offer_realtime_protocol(
+        ws.max_message_size(media_stream::MAX_MESSAGE_BYTES)
+            .max_frame_size(media_stream::MAX_MESSAGE_BYTES),
+        &headers,
+    );
+    let correlation_id = ctx.correlation_id;
+    // The call counts against the speech quota for as long as it is open.
+    let speech_connection = ctx.speech_connection;
+    ws.on_upgrade(move |socket| async move {
+        let _speech_connection = speech_connection;
+        media_stream::handle_socket(socket, state, correlation_id, params, bound).await
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]

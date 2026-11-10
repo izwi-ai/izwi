@@ -1164,6 +1164,20 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     );
     add_operation(
         paths,
+        "/v1/realtime/media-stream",
+        "get",
+        "Realtime",
+        "Open a telephony media-stream WebSocket",
+        "Upgrade to a phone call in the media-stream framing of call-centre platforms and \
+         carrier APIs: JSON text frames (`connected`, `start`, `media`, `mark`, `dtmf`, `stop`) \
+         with base64 8 kHz μ-law audio. The call runs as a `/v1/realtime` session. `?model=` and \
+         `?intent=transcription` select it as on `/v1/realtime`; `voice`, `instructions`, \
+         `language`, `transcription_model` and `transcripts` configure it, in the query string or \
+         the `start` frame's `customParameters`.",
+        websocket_response(),
+    );
+    add_operation(
+        paths,
         "/v1/realtime/client_secrets",
         "post",
         "Realtime",
@@ -2701,6 +2715,7 @@ mod tests {
                         | "/v1/models"
                         | "/v1/models/{model}"
                         | "/v1/realtime"
+                        | "/v1/realtime/media-stream"
                         | "/v1/realtime/client_secrets"
                         | "/v1/realtime/capabilities"
                         | "/v1/audio/speech"

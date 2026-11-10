@@ -81,11 +81,14 @@ pub(super) fn is_speech_generation(method: &axum::http::Method, path: &str) -> b
             && path.ends_with("/events"))
 }
 
-/// The speech WebSockets: the text-in speech socket and OpenAI Realtime. A
-/// socket outlives its upgrade response, so its handler holds the permit.
+/// The speech WebSockets: the text-in speech socket, OpenAI Realtime and
+/// its media-stream framing. A socket outlives its upgrade response, so its
+/// handler holds the permit.
 pub(super) fn is_speech_connection(method: &axum::http::Method, path: &str) -> bool {
     method == axum::http::Method::GET
-        && (path.ends_with("/audio/speech/stream") || path.ends_with("/v1/realtime"))
+        && (path.ends_with("/audio/speech/stream")
+            || path.ends_with("/v1/realtime")
+            || path.ends_with("/v1/realtime/media-stream"))
 }
 
 pub(super) fn guard_response(
@@ -144,7 +147,11 @@ mod tests {
     #[test]
     fn speech_sockets_share_speech_admission() {
         use axum::http::Method;
-        for path in ["/v1/audio/speech/stream", "/v1/realtime"] {
+        for path in [
+            "/v1/audio/speech/stream",
+            "/v1/realtime",
+            "/v1/realtime/media-stream",
+        ] {
             assert!(is_speech_connection(&Method::GET, path), "{path}");
             assert!(!is_speech_generation(&Method::GET, path), "{path}");
         }

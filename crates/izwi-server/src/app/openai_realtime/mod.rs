@@ -20,7 +20,7 @@ pub(crate) mod session_config;
 pub(crate) mod transcribe;
 pub(crate) mod voices;
 
-pub(crate) use connection::{handle_socket, SessionKind};
+pub(crate) use connection::{handle_socket, run_session, SessionKind, SessionSpec};
 
 #[cfg(test)]
-mod socket_tests;
+pub(crate) mod socket_tests;

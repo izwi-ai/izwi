@@ -369,10 +369,13 @@ fn valid_gateway_request_id(value: &str) -> bool {
 
 /// A browser opening `/v1/realtime` has no gateway key: it presents the
 /// client secret a principal minted for it through this gateway, and is that
-/// principal. The secret opens nothing else.
+/// principal. So does a carrier opening `/v1/realtime/media-stream`. The
+/// secret opens nothing else.
 fn realtime_client_secret_principal(state: &GatewayState, req: &Request) -> Option<Principal> {
     // This middleware runs inside the `/v1` nest, which strips the prefix.
-    if req.method() != axum::http::Method::GET || req.uri().path() != "/realtime" {
+    if req.method() != axum::http::Method::GET
+        || !matches!(req.uri().path(), "/realtime" | "/realtime/media-stream")
+    {
         return None;
     }
     state

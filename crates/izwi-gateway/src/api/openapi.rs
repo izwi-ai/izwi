@@ -22,11 +22,11 @@ pub fn gateway_document() -> &'static Value {
     })
 }
 
-/// Whether this gateway serves `path`: `/v1/realtime` needs OpenAI Realtime
-/// upstreams, `/v1/audio/*` needs audio upstreams, and voices and consents
+/// Whether this gateway serves `path`: `/v1/realtime` and its media-stream
+/// framing need OpenAI Realtime upstreams, `/v1/audio/*` needs audio upstreams, and voices and consents
 /// also need their shared state.
 fn serves(state: &GatewayState, path: &str) -> bool {
-    if path == "/v1/realtime" {
+    if matches!(path, "/v1/realtime" | "/v1/realtime/media-stream") {
         return state.openai_realtime.is_some();
     }
     if !path.starts_with("/v1/audio/") {

@@ -12,9 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use futures::stream::SplitSink;
-use futures::SinkExt;
+use axum::extract::ws::{CloseFrame, Message};
+use futures::{Sink, SinkExt};
 use izwi_core::audio::{AudioEncoder, AudioFormat};
 use tokio::sync::Notify;
 
@@ -327,11 +326,14 @@ fn subtract_audio_depth(state: &mut OutboundMailboxState, class: &OutboundClass)
 /// messages for [`WS_WRITER_SEND_TIMEOUT`], or the mailbox closes the session
 /// (sent as a close frame with `close_code`). The mailbox is closed when the
 /// writer stops, so producers waiting for audio credit give up.
-pub(crate) fn spawn_writer(
-    mut sink: SplitSink<WebSocket, Message>,
+pub(crate) fn spawn_writer<S>(
+    mut sink: S,
     mailbox: Arc<OutboundMailbox>,
     close_code: u16,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<()>
+where
+    S: Sink<Message> + Unpin + Send + 'static,
+{
     tokio::spawn(async move {
         while let Some(output) = mailbox.next().await {
             let message = match output {

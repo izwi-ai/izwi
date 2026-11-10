@@ -744,6 +744,7 @@ fn gateway_route_label(path: &str) -> &'static str {
         "/v1/chat/completions" => "/v1/chat/completions",
         "/v1/realtime/ws" => "/v1/realtime/ws",
         "/v1/realtime" => "/v1/realtime",
+        "/v1/realtime/media-stream" => "/v1/realtime/media-stream",
         "/v1/realtime/client_secrets" => "/v1/realtime/client_secrets",
         "/v1/realtime/capabilities" => "/v1/realtime/capabilities",
         "/v1/speech-to-text/realtime/ws" => "/v1/speech-to-text/realtime/ws",
@@ -1486,6 +1487,10 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &GatewayServeCon
                 .route(
                     "/realtime",
                     get(crate::app::openai_realtime_proxy::proxy_socket),
+                )
+                .route(
+                    "/realtime/media-stream",
+                    get(crate::app::openai_realtime_proxy::proxy_media_stream),
                 )
                 .layer(middleware::from_fn_with_state(
                     state.clone(),

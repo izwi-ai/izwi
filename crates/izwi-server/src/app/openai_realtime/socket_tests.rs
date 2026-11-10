@@ -15,16 +15,20 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use super::audio::{base64, pcm16_bytes};
 use crate::state::AppState;
 
-type Client =
+pub(crate) type Client =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-struct Server {
-    addr: SocketAddr,
-    state: AppState,
+pub(crate) struct Server {
+    pub(crate) addr: SocketAddr,
+    pub(crate) state: AppState,
     _dir: tempfile::TempDir,
 }
 
-async fn serve() -> Server {
+pub(crate) async fn serve() -> Server {
+    serve_with_hooks(izwi_hooks::EnterpriseHooks::noop()).await
+}
+
+pub(crate) async fn serve_with_hooks(hooks: izwi_hooks::EnterpriseHooks) -> Server {
     let dir = tempfile::tempdir().expect("temp dir");
     let models_dir = dir.path().join("models");
     std::fs::create_dir_all(&models_dir).expect("models dir");
@@ -40,7 +44,7 @@ async fn serve() -> Server {
         std::env::set_var("IZWI_MEDIA_DIR", dir.path().join("media"));
         let runtime =
             izwi_core::RuntimeService::new(serve_config.engine_config()).expect("runtime");
-        let state = AppState::new(runtime, &serve_config).expect("state");
+        let state = AppState::with_enterprise_hooks(runtime, &serve_config, hooks).expect("state");
         std::env::remove_var("IZWI_DB_PATH");
         std::env::remove_var("IZWI_MEDIA_DIR");
         state
@@ -597,7 +601,7 @@ async fn persisted_sessions_record_their_turns_in_the_voice_history() {
 }
 
 /// A model with a native streaming session, which transcribes turns live.
-const LIVE_ASR_MODEL: &str = "Voxtral-Mini-4B-Realtime-2602";
+pub(crate) const LIVE_ASR_MODEL: &str = "Voxtral-Mini-4B-Realtime-2602";
 
 fn live_session(turn_detection: Value) -> Value {
     json!({"type": "session.update", "session": {"type": "realtime", "audio": {"input": {
@@ -606,7 +610,7 @@ fn live_session(turn_detection: Value) -> Value {
 }
 
 /// Wait for every scripted native session to close.
-async fn sessions_closed(script: &super::live::scripted::Script) {
+pub(crate) async fn sessions_closed(script: &super::live::scripted::Script) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while script.open.load(std::sync::atomic::Ordering::SeqCst) > 0 {
         assert!(
