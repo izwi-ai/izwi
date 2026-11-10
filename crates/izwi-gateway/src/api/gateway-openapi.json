@@ -2449,6 +2449,19 @@
           "audio_base64": {
             "type": "string"
           },
+          "chunking_strategy": {
+            "description": "`\"auto\"`, the server's own splitting of long audio at pauses, or\nomitted. A `server_vad` object is refused with 400."
+          },
+          "include": {
+            "description": "OpenAI's `include[]`. `logprobs` is refused with 400: no model\nreturns token log-probabilities.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "keywords": {
             "description": "Izwi extension: terms to bias recognition toward, as an array (or\none comma- or newline-separated string). Models without keyword\nbiasing reject it (400).",
             "items": {
@@ -2519,6 +2532,7 @@
             ]
           },
           "temperature": {
+            "description": "0 to 1, checked and without effect: every ASR model decodes\ngreedily (Whisper with its fallback ladder from 0).",
             "format": "float",
             "type": [
               "number",
@@ -2554,9 +2568,22 @@
               "null"
             ]
           },
+          "chunking_strategy": {
+            "description": "`\"auto\"`, the server's own splitting of long audio at pauses, or\nomitted. A `server_vad` object is refused with 400."
+          },
           "file": {
             "format": "binary",
             "type": "string"
+          },
+          "include": {
+            "description": "OpenAI's `include[]`. `logprobs` is refused with 400: no model\nreturns token log-probabilities.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "keywords": {
             "description": "Izwi extension: terms to bias recognition toward. Repeat the field or\nseparate terms with commas or newlines. Models without keyword\nbiasing reject it (400).",
@@ -2628,6 +2655,7 @@
             ]
           },
           "temperature": {
+            "description": "0 to 1, checked and without effect: every ASR model decodes\ngreedily (Whisper with its fallback ladder from 0).",
             "format": "float",
             "type": [
               "number",

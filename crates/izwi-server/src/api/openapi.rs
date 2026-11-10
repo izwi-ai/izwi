@@ -2634,7 +2634,15 @@ pub struct TranscriptionMultipartRequest {
     /// verbose_json then carries `speaker_turns`.
     pub speaker_labels: Option<bool>,
     pub max_tokens: Option<usize>,
+    /// 0 to 1, checked and without effect: every ASR model decodes
+    /// greedily (Whisper with its fallback ladder from 0).
     pub temperature: Option<f32>,
+    /// `"auto"`, the server's own splitting of long audio at pauses, or
+    /// omitted. A `server_vad` object is refused with 400.
+    pub chunking_strategy: Option<serde_json::Value>,
+    /// OpenAI's `include[]`. `logprobs` is refused with 400: no model
+    /// returns token log-probabilities.
+    pub include: Option<Vec<String>>,
     pub timestamp_granularities: Option<Vec<String>>,
     /// Izwi extension of OpenAI's field: `flex` runs the request as batch
     /// work behind interactive and streaming requests; `default`, `auto` or
@@ -2668,7 +2676,15 @@ pub struct TranscriptionJsonRequest {
     /// verbose_json then carries `speaker_turns`.
     pub speaker_labels: Option<bool>,
     pub max_tokens: Option<usize>,
+    /// 0 to 1, checked and without effect: every ASR model decodes
+    /// greedily (Whisper with its fallback ladder from 0).
     pub temperature: Option<f32>,
+    /// `"auto"`, the server's own splitting of long audio at pauses, or
+    /// omitted. A `server_vad` object is refused with 400.
+    pub chunking_strategy: Option<serde_json::Value>,
+    /// OpenAI's `include[]`. `logprobs` is refused with 400: no model
+    /// returns token log-probabilities.
+    pub include: Option<Vec<String>>,
     pub timestamp_granularities: Option<Vec<String>>,
     /// Izwi extension of OpenAI's field: `flex` runs the request as batch
     /// work behind interactive and streaming requests; `default`, `auto` or

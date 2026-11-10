@@ -904,7 +904,9 @@ Multipart fields:
 | `aligner_model` | Optional forced-aligner model for timestamp generation. Defaults to `Qwen3-ForcedAligner-0.6B`. |
 | `prompt` | Optional ASR prompt/context. Granite Speech uses it only when it is a Granite instruction (it starts with `<|audio|>`, `transcribe the speech`, `can you transcribe`, `translate the speech`, `Speaker attribution:` or `Timestamps:`; 5.0 also takes `The speech is in`) or `keywords: a, b` for keyword biasing; other text is ignored and reported as `prompt_ignored` in the diagnostics. LFM3 Audio ignores it. For `Nemotron-3.5-Transcribe-30B-A4B-FP8` it replaces the model's instruction entirely (tags removed, at most 4,000 characters), so combining it with `target_language`, `keywords` or `speaker_labels` returns `400`. |
 | `max_tokens` | Optional ASR decoder token budget. |
-| `temperature` | Accepted for compatibility; currently ignored by native ASR models. |
+| `temperature` | `0` to `1`; a value outside that range returns `400`. It does not change the transcript: no ASR model samples its output. Whisper Large v3 Turbo decodes greedily and retries a window at higher temperatures only when its own quality checks fail, which is what OpenAI documents for `0`; Parakeet, Qwen3-ASR, Granite Speech, Nemotron 3.5 Transcribe, VibeVoice-ASR, Voxtral and the LFM audio models always take the most likely token. |
+| `chunking_strategy` | `"auto"` or omitted: the server splits long audio itself, at pauses near `IZWI_ASR_CHUNK_TARGET_SECS` (see the notes below for models that read a recording in one pass). The `{"type": "server_vad", …}` object returns `400` (`unsupported_parameter`): chunking is set per server, not per request. Multipart sends `auto` or the object as JSON text. |
+| `include[]` | `logprobs` returns `400` (`unsupported_parameter`): no model returns token log-probabilities. Any other value returns `400`. JSON takes `include` as an array. |
 
 `LFM3-Audio-2B-GGUF` and `LFM3-Audio-2B-Q8_0-GGUF` produce no word timestamps
 of their own, so `timestamp_granularities[]` falls back to the forced aligner.
@@ -1004,7 +1006,8 @@ Multipart (or JSON with `audio_base64`):
 
 - `file` and `model`, both required. `model` may be an
   `IZWI_OPENAI_MODEL_ALIASES` name such as `whisper-1`.
-- `prompt` and `temperature`.
+- `prompt` and `temperature` (`0` to `1`, without effect, as for
+  transcriptions).
 - `response_format`: `json`, `text`, `srt`, `verbose_json` or `vtt`.
 - `language`: a hint for the source language.
 - `to_language` or `target_language`: the target. English unless set; a

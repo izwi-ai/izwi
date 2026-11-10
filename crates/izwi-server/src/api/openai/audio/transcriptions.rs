@@ -171,7 +171,13 @@ struct TranscriptionRequest {
     /// Tag speakers in the transcript (models that do).
     speaker_labels: bool,
     max_tokens: Option<usize>,
-    _temperature: Option<f32>,
+    /// OpenAI's sampling temperature. Checked, then unused: every ASR
+    /// family decodes greedily (`validate_openai_decoding_options`).
+    temperature: Option<f32>,
+    /// OpenAI's `chunking_strategy`: `"auto"` or an object.
+    chunking_strategy: Option<serde_json::Value>,
+    /// OpenAI's `include[]`.
+    include: Vec<String>,
     timestamp_granularities: Option<Vec<String>>,
     /// Served by `/v1/audio/translations`: `verbose_json` says `translate`.
     translate: bool,
@@ -392,6 +398,7 @@ async fn transcribe(
 ) -> Result<Response<Body>, ApiError> {
     validate_transcription_model(req.model.as_deref())?;
     validate_transcription_language(req.model.as_deref(), req.language.as_deref())?;
+    validate_openai_decoding_options(&req)?;
     crate::api::transcript_alignment::reject_removed_aligner(req.aligner_model.as_deref())?;
     let timestamp_request =
         TimestampGranularityRequest::parse(req.timestamp_granularities.as_deref())?;
@@ -635,6 +642,64 @@ async fn transcribe(
 
 const SUPPORTED_TRANSCRIPTION_FORMATS: &str = "json, verbose_json, text, srt, vtt";
 
+/// OpenAI's decoding options, none of which changes how this server
+/// decodes; each is checked so a request is never served as something it
+/// did not ask for.
+///
+/// - `temperature` must be in OpenAI's range, 0 to 1, and has no effect:
+///   no ASR family samples. Whisper keeps its checkpoint's fallback ladder
+///   from 0, which is what OpenAI documents for 0; every other family
+///   takes the most likely token.
+/// - `chunking_strategy` `"auto"` is what the server does with long audio
+///   (`IZWI_ASR_CHUNK_*`). `server_vad` is refused: chunk plans are made
+///   per model family from process settings, with no per-request VAD
+///   thresholds to map it onto.
+/// - `include[]=logprobs` is refused: no decoder returns token
+///   log-probabilities to the route.
+fn validate_openai_decoding_options(req: &TranscriptionRequest) -> Result<(), ApiError> {
+    if req
+        .temperature
+        .is_some_and(|temperature| !(0.0..=1.0).contains(&temperature))
+    {
+        return Err(ApiError::invalid_param(
+            "temperature",
+            "`temperature` must be between 0 and 1",
+        ));
+    }
+    match &req.chunking_strategy {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(strategy)) if strategy == "auto" => {}
+        Some(strategy) if strategy["type"] == "server_vad" => {
+            return Err(ApiError::unsupported_param(
+                "chunking_strategy",
+                "`chunking_strategy` of type `server_vad` is not supported; omit it or send                  `\"auto\"`, and the server splits long audio at pauses itself",
+            ));
+        }
+        Some(_) => {
+            return Err(ApiError::invalid_param(
+                "chunking_strategy",
+                "`chunking_strategy` must be `\"auto\"`",
+            ));
+        }
+    }
+    if let Some(value) = req.include.first() {
+        return Err(match value.as_str() {
+            "logprobs" => ApiError::unsupported_param(
+                "include",
+                format!(
+                    "`include[]=logprobs` is not supported for {}: its decoder returns no \
+                     token log-probabilities",
+                    req.model.as_deref().unwrap_or("this model")
+                ),
+            ),
+            other => {
+                ApiError::invalid_param("include", format!("Unknown `include[]` value `{other}`"))
+            }
+        });
+    }
+    Ok(())
+}
+
 fn validate_transcription_response_format(response_format: &str) -> Result<(), ApiError> {
     match response_format {
         "json" | "verbose_json" | "text" | "srt" | "vtt" => Ok(()),
@@ -796,6 +861,10 @@ pub(crate) struct JsonRequestBody {
     #[serde(default)]
     temperature: Option<f32>,
     #[serde(default)]
+    chunking_strategy: Option<serde_json::Value>,
+    #[serde(default)]
+    include: Option<Vec<String>>,
+    #[serde(default)]
     timestamp_granularities: Option<Vec<String>>,
     #[serde(default)]
     service_tier: Option<String>,
@@ -825,7 +894,9 @@ impl JsonRequestBody {
                 .unwrap_or_default(),
             speaker_labels: self.speaker_labels.unwrap_or(false),
             max_tokens: self.max_tokens,
-            _temperature: self.temperature,
+            temperature: self.temperature,
+            chunking_strategy: self.chunking_strategy,
+            include: self.include.unwrap_or_default(),
             timestamp_granularities: self.timestamp_granularities,
             translate: false,
             service_tier,
@@ -1071,7 +1142,41 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                             "Failed reading multipart 'temperature' field: {e}"
                         ))
                     })?;
-                    out._temperature = text.trim().parse::<f32>().ok();
+                    if !text.trim().is_empty() {
+                        out.temperature = Some(text.trim().parse::<f32>().map_err(|_| {
+                            ApiError::invalid_param(
+                                "temperature",
+                                "Invalid multipart 'temperature' field: expected a number",
+                            )
+                        })?);
+                    }
+                }
+                "chunking_strategy" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'chunking_strategy' field: {e}"
+                        ))
+                    })?;
+                    // `auto`, or the strategy object as JSON.
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        out.chunking_strategy = Some(
+                            serde_json::from_str(text)
+                                .ok()
+                                .filter(serde_json::Value::is_object)
+                                .unwrap_or_else(|| text.into()),
+                        );
+                    }
+                }
+                "include[]" | "include" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'include[]' field: {e}"
+                        ))
+                    })?;
+                    if !text.trim().is_empty() {
+                        out.include.push(text.trim().to_string());
+                    }
                 }
                 "timestamp_granularities[]" => {
                     let text = field.text().await.map_err(|e| {
@@ -1803,6 +1908,183 @@ mod tests {
         }
         body.push_str("--izwi-boundary--\r\n");
         Body::from(body)
+    }
+
+    /// The request a JSON body and a form make of the same fields, checked
+    /// as the route checks it.
+    async fn check_decoding_options(
+        json: serde_json::Value,
+        form: &[(&str, &str)],
+    ) -> [Result<(), ApiError>; 2] {
+        let mut body = json;
+        body["audio_base64"] = wav_data_url().into();
+        let json = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let form = multipart_request().body(multipart_body(form)).unwrap();
+        let mut results = Vec::new();
+        for request in [json, form] {
+            results.push(match parse_transcription_request(request).await {
+                Ok(request) => validate_openai_decoding_options(&request),
+                Err(error) => Err(error),
+            });
+        }
+        results.try_into().unwrap()
+    }
+
+    fn refusal(result: Result<(), ApiError>) -> (Option<&'static str>, Option<&'static str>) {
+        let error = result.expect_err("the option is refused");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        let detail = error.detail.expect("the error names its parameter");
+        (detail.param, detail.code)
+    }
+
+    /// What `docs/openai-compatibility-contract.json` says of the route's
+    /// decoding options.
+    fn decoding_contract() -> serde_json::Value {
+        let contract: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../../docs/openai-compatibility-contract.json"
+        ))
+        .unwrap();
+        contract["formats"]["audio_transcriptions"].clone()
+    }
+
+    #[tokio::test]
+    async fn temperature_is_accepted_within_openais_range_and_refused_outside_it() {
+        let range = decoding_contract()["temperature_range"].clone();
+        assert_eq!(range, serde_json::json!([0, 1]));
+        for (json, form) in [(0.0, "0"), (0.4, "0.4"), (1.0, "1")] {
+            for result in check_decoding_options(
+                serde_json::json!({"temperature": json}),
+                &[("temperature", form)],
+            )
+            .await
+            {
+                assert!(result.is_ok(), "temperature {form}");
+            }
+        }
+        for (json, form) in [(-0.1, "-0.1"), (1.5, "1.5")] {
+            for result in check_decoding_options(
+                serde_json::json!({"temperature": json}),
+                &[("temperature", form)],
+            )
+            .await
+            {
+                assert_eq!(
+                    refusal(result),
+                    (Some("temperature"), Some("invalid_value")),
+                    "temperature {form}"
+                );
+            }
+        }
+        // A form value that is not a number is refused rather than dropped,
+        // and an empty one is absent.
+        let [_, not_a_number] =
+            check_decoding_options(serde_json::json!({}), &[("temperature", "warm")]).await;
+        assert_eq!(refusal(not_a_number).0, Some("temperature"));
+        let [absent, empty] =
+            check_decoding_options(serde_json::json!({}), &[("temperature", "")]).await;
+        assert!(absent.is_ok() && empty.is_ok());
+    }
+
+    #[tokio::test]
+    async fn chunking_strategy_auto_is_accepted_and_server_vad_is_refused() {
+        let contract = decoding_contract();
+        assert_eq!(contract["chunking_strategy"], serde_json::json!(["auto"]));
+        assert_eq!(
+            contract["refused_chunking_strategy"],
+            serde_json::json!(["server_vad"])
+        );
+        for result in check_decoding_options(
+            serde_json::json!({"chunking_strategy": "auto"}),
+            &[("chunking_strategy", "auto")],
+        )
+        .await
+        {
+            assert!(result.is_ok());
+        }
+        let server_vad = serde_json::json!({
+            "type": "server_vad",
+            "prefix_padding_ms": 300,
+            "silence_duration_ms": 200,
+            "threshold": 0.5,
+        });
+        for result in check_decoding_options(
+            serde_json::json!({"chunking_strategy": server_vad}),
+            &[("chunking_strategy", &server_vad.to_string())],
+        )
+        .await
+        {
+            let error = result.clone().expect_err("server_vad is refused");
+            assert!(error.message.contains("server_vad"), "{}", error.message);
+            assert_eq!(
+                refusal(result),
+                (Some("chunking_strategy"), Some("unsupported_parameter"))
+            );
+        }
+        for (json, form) in [
+            (serde_json::json!("vad"), "vad"),
+            (
+                serde_json::json!({"type": "semantic"}),
+                r#"{"type":"semantic"}"#,
+            ),
+        ] {
+            for result in check_decoding_options(
+                serde_json::json!({"chunking_strategy": json}),
+                &[("chunking_strategy", form)],
+            )
+            .await
+            {
+                assert_eq!(
+                    refusal(result),
+                    (Some("chunking_strategy"), Some("invalid_value")),
+                    "{form}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn include_logprobs_is_refused_by_name() {
+        assert_eq!(
+            decoding_contract()["refused_include"],
+            serde_json::json!(["logprobs"])
+        );
+        for field in ["include[]", "include"] {
+            for result in check_decoding_options(
+                serde_json::json!({"include": ["logprobs"], "model": "Parakeet-TDT-0.6B-v3"}),
+                &[(field, "logprobs"), ("model", "Parakeet-TDT-0.6B-v3")],
+            )
+            .await
+            {
+                let error = result.clone().expect_err("logprobs are refused");
+                assert!(
+                    error
+                        .message
+                        .contains("not supported for Parakeet-TDT-0.6B-v3"),
+                    "{}",
+                    error.message
+                );
+                assert_eq!(
+                    refusal(result),
+                    (Some("include"), Some("unsupported_parameter"))
+                );
+            }
+        }
+        for result in check_decoding_options(
+            serde_json::json!({"include": ["tokens"]}),
+            &[("include[]", "tokens")],
+        )
+        .await
+        {
+            assert_eq!(refusal(result), (Some("include"), Some("invalid_value")));
+        }
+        for result in
+            check_decoding_options(serde_json::json!({"include": []}), &[("include[]", "")]).await
+        {
+            assert!(result.is_ok());
+        }
     }
 
     /// `service_tier` arrives as a JSON field, a form field or the

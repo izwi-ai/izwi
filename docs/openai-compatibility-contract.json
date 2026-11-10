@@ -160,6 +160,21 @@
         "sse"
       ],
       "pcm_sample_rate": 24000
+    },
+    "audio_transcriptions": {
+      "temperature_range": [
+        0,
+        1
+      ],
+      "chunking_strategy": [
+        "auto"
+      ],
+      "refused_chunking_strategy": [
+        "server_vad"
+      ],
+      "refused_include": [
+        "logprobs"
+      ]
     }
   }
 }
