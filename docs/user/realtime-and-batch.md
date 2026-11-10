@@ -39,7 +39,7 @@ All of this is on by default.
 
 - **Classes.** Every request is admitted and scheduled under its class. Between models that share a device, device time is shared by class weight, and batch and background work have the smallest shares.
 - **Admission.** Batch and background requests can never take the server's last request slot (`IZWI_MAX_BATCH_REQUESTS` and `IZWI_MAX_BACKGROUND_REQUESTS` default to the global limit less one).
-- **The real-time reserve.** While a model has live demand (a real-time or streaming request, or a real-time session operation, in the last 30 seconds), batch and background requests of that model may start only up to the model's rows less a reserve. A live request then starts in a free row instead of waiting for batch work to finish. With no live demand there is no reserve, and batch work uses every row.
+- **The real-time reserve.** While a model has live demand (a real-time or streaming request, or a real-time session operation, in the last 30 seconds), batch and background requests of that model may start only up to the model's rows less a reserve. A live request then starts in a free row instead of waiting for batch work to finish. With no live demand batch work uses every row. A model that keeps more sequences than it decodes in one step (`IZWI_MAX_NUM_SEQS` above its rows) still leaves the reserve free among the extra sequences, which add no batch throughput, so the first live request after a quiet spell does not wait for a batch request to finish.
 - **Class-aware encoding.** When more transcription requests wait for a model's audio encoder than one batch holds, the batch takes the requests of the higher classes first, so a live request does not wait behind a backlog of batch rows.
 - **Bounded batch steps.** A long recording is transcribed in steps, and live requests are served between them. Parakeet ends its encode after each window group while its model has live demand.
 - **A separate real-time queue.** Real-time requests and open sessions wait in a runtime queue of their own, so a flood of batch requests that fills the general queue does not refuse a call.
@@ -56,7 +56,7 @@ Set these in the server's environment. The defaults suit a server that does both
 
 | Variable | Default | What it does |
 |----------|---------|--------------|
-| `IZWI_REALTIME_ROW_RESERVE` | A quarter of the model's rows, at least 1 | Rows each model keeps free of batch and background requests while it has live demand. `0` turns the reserve off. Raise it if live requests queue behind batch work; lower it if batch throughput matters more. |
+| `IZWI_REALTIME_ROW_RESERVE` | A quarter of the model's rows, at least 1 | Rows each model keeps free of batch and background requests while it has live demand, and sequences beyond its rows it keeps free of them at all times. `0` turns the reserve off. Raise it if live requests queue behind batch work; lower it if batch throughput matters more. |
 | `IZWI_STREAM_LEAD_SECS` | `3` | Seconds of audio a speech stream may run ahead of real time before it is scheduled from the batch share. `0` turns pacing off. |
 | `IZWI_ADMISSION_QUEUE_TIMEOUT_SECS` | `30` | How long a request waits for an admission slot before `429`. `0` waits without limit. Real-time sessions, the first-party job routes and background work always wait. |
 | `IZWI_MAX_REALTIME_REQUESTS`, `IZWI_MAX_STREAMING_REQUESTS`, `IZWI_MAX_INTERACTIVE_REQUESTS`, `IZWI_MAX_ONLINE_REQUESTS` | The global request limit (`--max-concurrent`, 100) | Concurrent requests of each class. |

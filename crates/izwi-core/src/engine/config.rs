@@ -278,7 +278,9 @@ pub struct EngineCoreConfig {
     /// real-time session operation, in the last 30 seconds), so a live
     /// request does not wait for batch work to finish. `None` reserves a
     /// quarter of the model's sequences, at least one; zero disables the
-    /// reserve. Set with IZWI_REALTIME_ROW_RESERVE.
+    /// reserve. A model that retains more sequences than a dispatch decodes
+    /// keeps the reserve free among the extra ones with no live demand too.
+    /// Set with IZWI_REALTIME_ROW_RESERVE.
     #[serde(default = "default_realtime_row_reserve")]
     pub realtime_row_reserve: Option<usize>,
 

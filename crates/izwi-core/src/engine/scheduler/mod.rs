@@ -169,8 +169,9 @@ pub struct SchedulerConfig {
     /// bounds the sequences one lane runs.
     pub max_retained_sequences: usize,
     /// Sequences a lane keeps free of Batch and Background requests while
-    /// it has live demand. `None` is automatic (a quarter of the lane's
-    /// capacity, at least one); zero disables the reserve.
+    /// it has live demand, and among those beyond its decode rows at all
+    /// times. `None` is automatic (a quarter of the lane's capacity, at
+    /// least one); zero disables the reserve.
     pub realtime_row_reserve: Option<usize>,
 }
 
@@ -1279,19 +1280,43 @@ impl Scheduler {
         (reserve > 0).then(|| capacity.saturating_sub(reserve).max(1))
     }
 
+    /// Batch and Background requests a lane of `decode_dispatch_rows` may
+    /// run when it has no live demand, or `None` when nothing bounds them.
+    /// A lane that retains more sequences than one dispatch decodes gains
+    /// no throughput from filling them all, and a sequence cannot be taken
+    /// back from a running request, so the first live request after a
+    /// quiet spell would wait for a batch request to finish. Batch work
+    /// therefore leaves the reserve free among the sequences beyond the
+    /// dispatch, and still fills every decode row.
+    fn idle_limit(&self, decode_dispatch_rows: Option<usize>) -> Option<usize> {
+        let rows = decode_dispatch_rows?;
+        let sequences = self.config.max_retained_sequences;
+        if sequences <= rows {
+            return None;
+        }
+        let reserve = self
+            .config
+            .realtime_row_reserve
+            .unwrap_or((sequences / 4).max(1));
+        (reserve > 0).then(|| sequences.saturating_sub(reserve).max(rows))
+    }
+
     /// Whether the real-time reserve holds a waiting request back: it is
-    /// Batch or Background work, its lane has live demand, and the lane
-    /// already runs as many such requests as the reserve allows. A request
-    /// whose profile is not installed has no known capacity and is never
-    /// held.
+    /// Batch or Background work and its lane already runs as many such
+    /// requests as the reserve allows, with live demand or without. A
+    /// request whose profile is not installed has no known capacity and is
+    /// never held.
     fn reserve_defers(&self, metadata: &RequestMetadata, now: Instant) -> bool {
-        if !self
-            .live_demand
-            .batch_work_yields(metadata.lane, metadata.workload_class, now)
-        {
+        if !Self::is_reserve_bound_class(metadata.workload_class) {
             return false;
         }
-        let Some(limit) = self.reserve_limit(metadata.cache_policy.decode_dispatch_rows) else {
+        let rows = metadata.cache_policy.decode_dispatch_rows;
+        let live_limit = self
+            .live_demand
+            .batch_work_yields(metadata.lane, metadata.workload_class, now)
+            .then(|| self.reserve_limit(rows))
+            .flatten();
+        let Some(limit) = live_limit.or_else(|| self.idle_limit(rows)) else {
             return false;
         };
         let running = self
@@ -2287,10 +2312,10 @@ impl Scheduler {
                 deferred_waiting.push(request_id);
                 continue;
             }
-            // While its lane has live demand, batch work starts only below
-            // the reserve limit, so a sequence stays free for the next live
-            // request. Nothing running is stopped: the reserve fills as
-            // running batch requests finish.
+            // Batch work starts only below the reserve limit of its lane
+            // (lower while the lane has live demand), so a sequence stays
+            // free for the next live request. Nothing running is stopped:
+            // the reserve fills as running batch requests finish.
             if self.reserve_defers(&metadata, scheduling_now) {
                 if let Some(metadata) = self.requests.get_mut(&request_id) {
                     if !metadata.reserve_deferred {
@@ -8689,6 +8714,63 @@ mod tests {
         scheduler.finish_request(&"batch-3".to_string());
         assert_eq!(admit_all(&mut scheduler).len(), 1);
         assert_eq!(running_of(&scheduler, WorkloadClass::Batch), 3);
+    }
+
+    /// A lane that retains more sequences than a dispatch decodes keeps the
+    /// reserve free of batch work even with no live demand, so live requests
+    /// that arrive after a quiet spell start at once instead of waiting for
+    /// a batch request to finish. Batch work still fills every decode row.
+    #[test]
+    fn batch_leaves_sequences_free_for_live_requests_on_a_quiet_lane() {
+        let mut scheduler = reserve_scheduler(None, SchedulingPolicy::WeightedFair);
+        for index in 0..8 {
+            add_classed(
+                &mut scheduler,
+                &format!("batch-{index}"),
+                WorkloadClass::Batch,
+                2,
+            );
+        }
+        // Eight retained sequences keep a quarter free: six requests share
+        // the two decode rows and two wait.
+        assert_eq!(admit_all(&mut scheduler).len(), 6);
+        assert_eq!(scheduler.waiting_count(), 2);
+        assert_eq!(scheduler.schedule().decode_requests.len(), 2);
+
+        for id in ["live-0", "live-1"] {
+            add_classed(&mut scheduler, id, WorkloadClass::Streaming, 2);
+        }
+        assert_eq!(admit_all(&mut scheduler), ["live-0", "live-1"]);
+        assert_eq!(scheduler.running.len(), 8);
+
+        // Batch is not starved: once the lane is quiet again, each request
+        // that finishes lets a waiting one start.
+        for id in ["live-0", "live-1", "batch-0"] {
+            scheduler.finish_request(&id.to_string());
+        }
+        lapse_live_demand(&mut scheduler);
+        assert_eq!(admit_all(&mut scheduler).len(), 1);
+        assert_eq!(running_of(&scheduler, WorkloadClass::Batch), 6);
+    }
+
+    /// The quiet-lane limit applies only to sequences beyond the dispatch:
+    /// batch work always fills the decode rows, and a lane no wider than
+    /// its dispatch, or with the reserve off, is not limited.
+    #[test]
+    fn quiet_lane_limit_follows_rows_and_configuration() {
+        let automatic = reserve_scheduler(None, SchedulingPolicy::WeightedFair);
+        assert_eq!(automatic.idle_limit(None), None);
+        assert_eq!(automatic.idle_limit(Some(1)), Some(6));
+        assert_eq!(automatic.idle_limit(Some(2)), Some(6));
+        assert_eq!(automatic.idle_limit(Some(7)), Some(7));
+        assert_eq!(automatic.idle_limit(Some(8)), None);
+        assert_eq!(automatic.idle_limit(Some(32)), None);
+
+        let disabled = reserve_scheduler(Some(0), SchedulingPolicy::WeightedFair);
+        assert_eq!(disabled.idle_limit(Some(2)), None);
+        let explicit = reserve_scheduler(Some(3), SchedulingPolicy::WeightedFair);
+        assert_eq!(explicit.idle_limit(Some(2)), Some(5));
+        assert_eq!(explicit.idle_limit(Some(6)), Some(6));
     }
 
     /// P2.1: the reserve outlives the live request by the hold, then batch

@@ -2599,7 +2599,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Int,
         "a quarter of the model's rows, at least 1",
         Startup,
-        "Sequences each model keeps free of Batch and Background requests while it has live demand (a Realtime or Streaming request or a real-time session operation in the last 30 seconds), so a live request starts without waiting for batch work to finish. 0 disables the reserve; a one-row model reserves nothing; invalid ignored.",
+        "Sequences each model keeps free of Batch and Background requests while it has live demand (a Realtime or Streaming request or a real-time session operation in the last 30 seconds), so a live request starts without waiting for batch work to finish. A model that retains more sequences than it decodes in one dispatch also keeps the reserve free among the extra sequences with no live demand. 0 disables the reserve; a one-row model reserves no row; invalid ignored.",
     ),
     CoreEnvVar::new(
         "IZWI_RELPOS_ATTENTION_EMULATOR_DIR",

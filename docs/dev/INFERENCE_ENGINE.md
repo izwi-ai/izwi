@@ -385,7 +385,12 @@ request waiting or running, or a real-time session operation, in the last
 sequences and `R` is `IZWI_REALTIME_ROW_RESERVE` or a quarter of the rows, at
 least one. Requests already running are not stopped; held requests keep their
 queue order and are charged no service. A one-row model reserves nothing, and
-batch work always keeps one sequence. Under KV pressure the replay victim is
+batch work always keeps one sequence. With no live demand batch work fills
+every decode row, but a lane that retains more sequences than a dispatch
+decodes starts Batch and Background requests only up to `sequences - R`
+(never fewer than its rows, `R` then a quarter of the sequences): a sequence
+cannot be taken back from a running request, and parked ones add no
+throughput, so they stay free for the next live request. Under KV pressure the replay victim is
 the request of the lightest workload class, then lowest priority, then
 youngest. Long-form speech asks for the same limit before it fans out its
 segments. `izwi_engine_scheduler_reserve_deferrals_total` counts the requests
