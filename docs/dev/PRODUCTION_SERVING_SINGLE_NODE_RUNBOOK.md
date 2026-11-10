@@ -821,6 +821,19 @@ voice exception is OpenAI Realtime (`/v1/realtime`): with
 session and relays it whole to an izwi-server, which keeps the session's state;
 the gateway runs no part of the voice turn.
 
+`POST /v1/realtime/client_secrets` and `GET /v1/realtime/capabilities` are
+relayed to the same upstreams. Each izwi-server keeps the `ek_` keys it mints
+in its own memory, so the gateway remembers which upstream minted each key and
+for which principal, sends a session that presents the key to that upstream
+(with the key as the session's credential there), and counts the session
+against the minting principal's tenant. A browser therefore needs no gateway
+API key, only the secret, and the secret opens `/v1/realtime` alone. This
+memory is per gateway process: a restart of the gateway or of the upstream
+forgets the keys (clients mint a new one), and with more than one gateway
+replica a key is only good at the replica that minted it. Run a single
+replica for browser clients, or pin a browser to the replica its backend
+minted through.
+
 The speech API is relayed the same way. With `IZWI_GATEWAY_AUDIO_UPSTREAMS`,
 the gateway relays these routes to izwi-servers, round robin, after its own
 authentication, admission and tenant lease:

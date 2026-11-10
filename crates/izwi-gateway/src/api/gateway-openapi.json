@@ -3554,6 +3554,52 @@
           "Realtime"
         ]
       }
+    },
+    "/v1/realtime/capabilities": {
+      "get": {
+        "description": "The realtime profiles `model` may name, the transcription models and whether each transcribes a turn while it is spoken (`transcription_mode`: `live` or `turn`), the voices, audio formats and turn detection types, and the session limits.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "List realtime capabilities",
+        "tags": [
+          "Realtime"
+        ]
+      }
+    },
+    "/v1/realtime/client_secrets": {
+      "post": {
+        "description": "Mint an ephemeral `ek_` key, bound to a session config, that admits `/v1/realtime` for 10 seconds to 2 hours (default 10 minutes). Browsers present it as the `openai-insecure-api-key.<key>` WebSocket subprotocol.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Create a realtime client secret",
+        "tags": [
+          "Realtime"
+        ]
+      }
     }
   },
   "servers": [

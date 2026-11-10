@@ -744,6 +744,8 @@ fn gateway_route_label(path: &str) -> &'static str {
         "/v1/chat/completions" => "/v1/chat/completions",
         "/v1/realtime/ws" => "/v1/realtime/ws",
         "/v1/realtime" => "/v1/realtime",
+        "/v1/realtime/client_secrets" => "/v1/realtime/client_secrets",
+        "/v1/realtime/capabilities" => "/v1/realtime/capabilities",
         "/v1/speech-to-text/realtime/ws" => "/v1/speech-to-text/realtime/ws",
         "/livez" => "/livez",
         "/readyz" => "/readyz",
@@ -1488,6 +1490,27 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &GatewayServeCon
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
                     bounded_gateway_admission,
+                )),
+        );
+        // Minting a client secret and listing capabilities are plain
+        // requests, admitted as the speech routes are.
+        inference_routes = inference_routes.merge(
+            Router::new()
+                .route(
+                    "/realtime/client_secrets",
+                    post(crate::app::openai_realtime_proxy::proxy_client_secret),
+                )
+                .route(
+                    "/realtime/capabilities",
+                    get(crate::app::openai_realtime_proxy::proxy_capabilities),
+                )
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    bounded_gateway_admission,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    tenant_pre_admission,
                 )),
         );
     }

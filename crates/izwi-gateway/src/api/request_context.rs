@@ -223,7 +223,11 @@ pub async fn attach_gateway_request_context(
     // Principal; quota and concurrency identity derive from it downstream.
     let principal = match state.perimeter.authenticate(req.headers()) {
         Some(principal) => principal,
-        None => match state.principal_keys.authenticate(req.headers()) {
+        None => match state
+            .principal_keys
+            .authenticate(req.headers())
+            .or_else(|| realtime_client_secret_principal(&state, &req))
+        {
             Some(principal) => principal,
             None => {
                 return gateway_rejection_response(
@@ -361,6 +365,20 @@ fn valid_gateway_request_id(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
         })
+}
+
+/// A browser opening `/v1/realtime` has no gateway key: it presents the
+/// client secret a principal minted for it through this gateway, and is that
+/// principal. The secret opens nothing else.
+fn realtime_client_secret_principal(state: &GatewayState, req: &Request) -> Option<Principal> {
+    // This middleware runs inside the `/v1` nest, which strips the prefix.
+    if req.method() != axum::http::Method::GET || req.uri().path() != "/realtime" {
+        return None;
+    }
+    state
+        .openai_realtime
+        .as_ref()?
+        .client_secret_principal(req.headers())
 }
 
 fn gateway_headers_are_bounded(headers: &axum::http::HeaderMap) -> bool {

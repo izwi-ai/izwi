@@ -2682,9 +2682,10 @@ mod tests {
     use std::collections::HashSet;
 
     /// The gateway's document: this one restricted to the routes the gateway
-    /// serves. `/v1/realtime` needs OpenAI Realtime upstreams, the audio
-    /// routes need audio upstreams (or Realtime ones), and voices and
-    /// consents also need `--gateway-audio-shared-state`.
+    /// serves. `/v1/realtime`, its client secrets and its capabilities need
+    /// OpenAI Realtime upstreams, the audio routes need audio upstreams (or
+    /// Realtime ones), and voices and consents also need
+    /// `--gateway-audio-shared-state`.
     fn gateway_document() -> Value {
         let mut doc = document();
         if let Some(paths) = doc.get_mut("paths").and_then(Value::as_object_mut) {
@@ -2700,6 +2701,8 @@ mod tests {
                         | "/v1/models"
                         | "/v1/models/{model}"
                         | "/v1/realtime"
+                        | "/v1/realtime/client_secrets"
+                        | "/v1/realtime/capabilities"
                         | "/v1/audio/speech"
                         | "/v1/audio/speech/batch"
                         | "/v1/audio/speech/stream"
