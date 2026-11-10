@@ -129,18 +129,49 @@ pub(super) struct ParakeetEncoderBatcher {
     pub(super) formation: EncoderBatchFormation<ParakeetEncoderQueueKey, ParakeetEncoderPending>,
 }
 
+/// A row waiting for an encoder batch.
+pub(super) trait EncoderBatchRow {
+    /// The workload class of the row's request, which orders the rows of a
+    /// queue longer than one batch.
+    fn workload_class(&self) -> WorkloadClass;
+}
+
+macro_rules! encoder_batch_row {
+    ($($pending:ty),+ $(,)?) => {$(
+        impl EncoderBatchRow for $pending {
+            fn workload_class(&self) -> WorkloadClass {
+                self.job.spec.workload_class
+            }
+        }
+    )+};
+}
+
+encoder_batch_row!(
+    QwenAsrEncoderPending,
+    WhisperEncoderPending,
+    ParakeetEncoderPending,
+    NemotronEncoderPending,
+    GraniteSpeechEncoderPending,
+    GraniteSpeech5EncoderPending,
+);
+
 /// Forms one encoder's cross-request batches with at most one batch in
 /// flight per key. Rows that arrive while their key's batch runs wait, and
 /// form the key's next batch when it completes, so requests that arrive
 /// staggered still batch under load. Every batched encoder here forms its
 /// batches this way; a queue drained one yield after its first row (the
 /// older shape) runs each row as a batch of one behind a busy device.
+///
+/// When more rows wait than one batch holds, the batch takes the rows of
+/// the heaviest workload classes, oldest first within a class, so a live
+/// request's audio is not encoded behind a backlog of batch work. Keys and
+/// widths are the same for every class, so batch shapes do not change.
 pub(super) struct EncoderBatchFormation<K, P> {
     /// A key's queue exists exactly while a runner drains it.
     queues: std::sync::Mutex<HashMap<K, VecDeque<P>>>,
 }
 
-impl<K: Eq + std::hash::Hash, P> EncoderBatchFormation<K, P> {
+impl<K: Eq + std::hash::Hash, P: EncoderBatchRow> EncoderBatchFormation<K, P> {
     pub(super) fn new() -> Self {
         Self {
             queues: std::sync::Mutex::new(HashMap::new()),
@@ -179,13 +210,13 @@ impl<K: Eq + std::hash::Hash, P> EncoderBatchFormation<K, P> {
     {
         /// A runner that unwinds drops its key's waiting rows, whose
         /// submitters then fail, and frees the key for a new runner.
-        struct Abandon<'a, K: Eq + std::hash::Hash, P> {
+        struct Abandon<'a, K: Eq + std::hash::Hash, P: EncoderBatchRow> {
             formation: &'a EncoderBatchFormation<K, P>,
             key: &'a K,
             armed: bool,
         }
 
-        impl<K: Eq + std::hash::Hash, P> Drop for Abandon<'_, K, P> {
+        impl<K: Eq + std::hash::Hash, P: EncoderBatchRow> Drop for Abandon<'_, K, P> {
             fn drop(&mut self) {
                 if self.armed {
                     let rows = self.formation.queues().remove(self.key);
@@ -215,7 +246,21 @@ impl<K: Eq + std::hash::Hash, P> EncoderBatchFormation<K, P> {
             return None;
         }
         let width = queue.len().min(max_width.max(1));
-        Some(queue.drain(..width).collect())
+        // The sort is stable, so rows of one class stay oldest first and a
+        // queue of one class yields its first `width` rows, as it always has.
+        let mut order = (0..queue.len()).collect::<Vec<_>>();
+        order.sort_by_key(|&row| std::cmp::Reverse(queue[row].workload_class().service_weight()));
+        let mut taken = order[..width].to_vec();
+        taken.sort_unstable();
+        // Removing from the back keeps the earlier indices valid; the batch
+        // holds its rows in arrival order.
+        let mut batch = taken
+            .into_iter()
+            .rev()
+            .filter_map(|row| queue.remove(row))
+            .collect::<Vec<_>>();
+        batch.reverse();
+        Some(batch)
     }
 }
 
@@ -1944,9 +1989,22 @@ mod tests {
 
     use tokio::sync::Notify;
 
-    use super::EncoderBatchFormation;
+    use super::{EncoderBatchFormation, EncoderBatchRow};
+    use crate::engine::WorkloadClass;
 
     type Batches = Arc<Mutex<Vec<Vec<usize>>>>;
+
+    /// Rows of the earlier tests share one class. A row from 1000 up is a
+    /// real-time request and one from 2000 up a streamed one.
+    impl EncoderBatchRow for usize {
+        fn workload_class(&self) -> WorkloadClass {
+            match *self {
+                0..1000 => WorkloadClass::Batch,
+                1000..2000 => WorkloadClass::Realtime,
+                _ => WorkloadClass::Streaming,
+            }
+        }
+    }
 
     /// Drains `key` with a runner whose first batch waits for `release`
     /// after signalling `started`; every batch is recorded in order.
@@ -2030,7 +2088,41 @@ mod tests {
         assert_eq!(*other.lock().unwrap(), vec![vec![100]]);
     }
 
+    /// A real-time row queued behind a backlog of batch rows is encoded in
+    /// the next batch; rows of one class keep their arrival order, and the
+    /// batch holds its rows in arrival order.
+    #[tokio::test]
+    async fn the_next_batch_takes_the_heaviest_classes_then_the_oldest_rows() {
+        let formation = Arc::new(EncoderBatchFormation::new());
+        let (started, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        assert!(formation.push(1, 0));
+        let (batches, runner) = start_runner(&formation, 1, 4, &started, &release);
+        started.notified().await;
+        for row in [1, 2, 3, 4, 5, 2000, 6, 1000, 1001] {
+            assert!(!formation.push(1, row));
+        }
+        release.notify_one();
+        runner.await.unwrap();
+        assert_eq!(
+            *batches.lock().unwrap(),
+            vec![
+                vec![0],
+                // Both real-time rows and the streamed one, then the oldest
+                // batch row.
+                vec![1, 2000, 1000, 1001],
+                vec![2, 3, 4, 5],
+                vec![6]
+            ]
+        );
+    }
+
     struct Row(Arc<AtomicUsize>);
+
+    impl EncoderBatchRow for Row {
+        fn workload_class(&self) -> WorkloadClass {
+            WorkloadClass::Online
+        }
+    }
 
     impl Drop for Row {
         fn drop(&mut self) {
