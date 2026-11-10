@@ -104,6 +104,64 @@ fn prepared_asr_audio_is_arc_retained_exactly_and_rejects_source_drift() {
         .contains("changed after decoded-audio preparation"));
 }
 
+/// A request built from decoded samples (a long file's chunk row) decodes
+/// to exactly those samples at the canonical rate without an audio codec,
+/// canonicalizes as typed audio, and pins its prepared audio to them.
+#[test]
+fn asr_requests_from_decoded_samples_skip_the_audio_codec() {
+    let limits = DirectPayloadLimits {
+        audio_source_bytes: 64,
+        reference_source_bytes: 64,
+        reference_text_chars: 64,
+        metadata_bytes: 128,
+        collection_items: 64,
+    };
+    let variant = ModelVariant::Qwen3Asr06BGguf;
+    let samples: Arc<[f32]> = vec![0.25, -0.5, 0.75, 0.0].into();
+    let mut request = EngineCoreRequest::asr_samples(samples.clone()).with_model_variant(variant);
+    request
+        .canonicalize_direct_payloads_with_limits(limits)
+        .expect("samples canonicalize as typed audio");
+    assert_eq!(request.audio_samples_for_execution(), Some(&samples[..]));
+    assert!(request.audio_bytes_for_execution().is_none());
+    assert!(request.audio_base64_for_execution().is_none());
+    let (decoded, rate) = crate::engine::decode_request_audio_with_rate(&request).unwrap();
+    assert_eq!(decoded, samples.to_vec());
+    assert_eq!(rate, 16_000);
+    request
+        .install_prepared_asr_audio(variant, decoded, rate)
+        .unwrap();
+    request.prepared_asr_audio_for_executor().unwrap().unwrap();
+    // A clone shares the samples, so its prepared audio still matches.
+    request
+        .clone()
+        .prepared_asr_audio_for_executor()
+        .unwrap()
+        .unwrap();
+    // Other samples are another source.
+    request.task = EngineTask::Asr(AsrEngineInput {
+        audio: EngineAudioInput::Samples(vec![0.25, -0.5, 0.75, 1.0].into()),
+        language: None,
+        prompt: None,
+    });
+    assert!(request
+        .prepared_asr_audio_for_executor()
+        .unwrap_err()
+        .to_string()
+        .contains("changed after decoded-audio preparation"));
+    // Samples past the source limit are refused like an oversized upload.
+    let mut oversized = EngineCoreRequest::asr_samples(vec![0.0; 17].into());
+    assert!(oversized
+        .canonicalize_direct_payloads_with_limits(limits)
+        .unwrap_err()
+        .to_string()
+        .contains("source limit"));
+    // No samples are no audio.
+    let empty = EngineCoreRequest::asr_samples(Vec::new().into());
+    assert!(empty.audio_samples_for_execution().is_none());
+    assert!(crate::engine::decode_request_audio_with_rate(&empty).is_err());
+}
+
 #[test]
 fn prepared_asr_accessors_reuse_the_preparation_digest_of_the_upload() {
     let full_hashes = || super::ASR_SOURCE_AUDIO_FULL_HASHES.with(|count| count.get());
@@ -180,6 +238,74 @@ fn prepared_qwen_asr_routes_are_mutually_exclusive() {
     assert!(long
         .install_prepared_sequence_input_tokens(32, 4096)
         .is_err());
+}
+
+/// An offline Voxtral request prepared on either route (a retained row with
+/// its encoded audio, or the long-form atomic graph) validates for its ASR
+/// task and hands the executor its model and artifact. On the H100 at
+/// 1fd25ae1f every request failed with "carries incremental preparation for
+/// a different task": the task check had no Voxtral ASR arm.
+#[test]
+fn prepared_voxtral_offline_requests_reach_the_executor_on_both_routes() {
+    use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
+    use crate::models::registry::VoxtralModelLease;
+    let variant = ModelVariant::VoxtralMini4BRealtime2602;
+    let model = VoxtralRealtimeModel::tiny_for_test();
+    let audio = (0..16_000)
+        .map(|index| (index as f32 * 0.013).sin() * 0.2)
+        .collect::<Vec<f32>>();
+    let prompt_tokens = model.offline_prompt_tokens().unwrap();
+    let artifact = Arc::new(model.prepare_offline_audio(&audio, 16_000).unwrap());
+    let lease = VoxtralModelLease::for_test(model);
+
+    let mut row = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+    row.install_prepared_asr_audio(variant, audio.clone(), 16_000)
+        .unwrap();
+    row.install_voxtral_asr_execution_model(
+        variant,
+        lease.clone(),
+        Some(artifact.clone()),
+        prompt_tokens,
+    )
+    .unwrap();
+    assert!(row.uses_asr_retained_sequence());
+    row.validate_incremental_model_execution_preparation()
+        .unwrap();
+    assert!(row
+        .prepared_voxtral_model_lease_for_executor()
+        .unwrap()
+        .is_some());
+    assert!(Arc::ptr_eq(
+        &row.prepared_voxtral_artifact_for_executor()
+            .unwrap()
+            .unwrap(),
+        &artifact
+    ));
+    assert_eq!(
+        row.params.max_tokens,
+        artifact.prepared_frames() - prompt_tokens + 1
+    );
+
+    let mut long = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+    long.install_prepared_asr_audio(variant, audio, 16_000)
+        .unwrap();
+    long.install_prepared_asr_long_form_atomic(
+        crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+    )
+    .unwrap();
+    long.install_voxtral_asr_execution_model(variant, lease, None, prompt_tokens)
+        .unwrap();
+    assert!(long.uses_asr_long_form_atomic());
+    long.validate_incremental_model_execution_preparation()
+        .unwrap();
+    assert!(long
+        .prepared_voxtral_model_lease_for_executor()
+        .unwrap()
+        .is_some());
+    assert!(long
+        .prepared_voxtral_artifact_for_executor()
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -1564,4 +1690,84 @@ fn invalid_speech_sampling_is_rejected_before_preparation() {
             Err(Error::InvalidInput(_))
         ));
     }
+}
+
+fn kokoro_artifact_on(device: &candle_core::Device) -> Arc<super::KokoroPreparedText> {
+    let chunk = crate::models::architectures::kokoro::KokoroPreparedRequest {
+        source_text: "Probe.".into(),
+        requested_speaker: None,
+        requested_language: None,
+        requested_speed: 1.0,
+        phonemes: "p".into(),
+        token_ids: vec![1; 4],
+        ref_style: candle_core::Tensor::zeros((1, 256), candle_core::DType::F32, device).unwrap(),
+        speed: 1.0,
+        rng_seed: None,
+    };
+    Arc::new(super::KokoroPreparedText {
+        source_text: "Probe.".into(),
+        requested_speaker: None,
+        requested_language: None,
+        requested_speed: 1.0,
+        chunks: vec![chunk],
+    })
+}
+
+fn retired(kokoro: Arc<super::KokoroPreparedText>) -> super::RetiredTtsArtifacts {
+    super::RetiredTtsArtifacts {
+        kokoro: Some(kokoro),
+        vibevoice: None,
+        voxtral: None,
+        chatterbox: None,
+        lfm25_audio: None,
+        lfm3_audio: None,
+    }
+}
+
+/// Off CUDA a retired request's prepared TTS artifacts report no device to
+/// move to, so they drop in place on whatever thread drops the request.
+#[test]
+fn retired_tts_artifacts_off_cuda_drop_in_place() {
+    use crate::backends::DeviceResident;
+    let artifact = kokoro_artifact_on(&candle_core::Device::Cpu);
+    let weak = Arc::downgrade(&artifact);
+    let owned = crate::backends::DeviceOwned::new(retired(artifact));
+    assert_eq!(owned.device_location(), None);
+    std::thread::spawn(move || drop(owned)).join().unwrap();
+    assert!(weak.upgrade().is_none(), "the artifact dropped with its owner");
+}
+
+/// On CUDA a Kokoro request's style rows report their device, so a request
+/// dropped on a tokio worker moves its last free to the device thread
+/// instead of freeing without the context (B2: Kokoro lost 35 of 64
+/// requests at 32 streams to the latched `CUDA_ERROR_INVALID_CONTEXT`).
+#[cfg(feature = "cuda")]
+#[test]
+fn retired_kokoro_style_rows_on_cuda_free_on_the_device_thread() {
+    use crate::backends::DeviceResident;
+    let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+        return;
+    };
+    let context = device.as_cuda_device().unwrap().cuda_stream().context().clone();
+    context.check_err().expect("no error latched before the drop");
+    let owned = crate::backends::DeviceOwned::new(retired(kokoro_artifact_on(&device)));
+    assert!(matches!(
+        owned.device_location(),
+        Some(candle_core::DeviceLocation::Cuda { .. })
+    ));
+    let before = crate::backends::device_frees_rerouted_total();
+    std::thread::spawn(move || drop(owned)).join().unwrap();
+    assert!(crate::backends::device_frees_rerouted_total() > before);
+    let thread =
+        crate::backends::DeviceThread::for_location(device.location()).expect("device thread");
+    crate::backends::recv_serving_device({
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        drop(thread.submit(move || {
+            let _ = sender.send(());
+        }));
+        receiver
+    });
+    context
+        .check_err()
+        .expect("retired Kokoro style rows dropped on a fresh thread must not latch an error");
 }

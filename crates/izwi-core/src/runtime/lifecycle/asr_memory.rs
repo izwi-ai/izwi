@@ -76,11 +76,13 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::granite_speech::asr::{
     ensure_granite_speech_artifacts, granite_load_representation,
+    granite_speech_encoder_graph_device_bytes,
     granite_tensor_is_f16_encoder_projection, resolve_granite_encoder_projection_precision,
     select_granite_speech_dtype, GraniteLoadRepresentation, GraniteSpeechConfig,
 };
 use crate::models::architectures::granite_speech5::asr::{
-    ensure_granite_speech5_artifacts, granite_speech5_load_representation,
+    ensure_granite_speech5_artifacts, granite_speech5_encoder_graph_device_bytes,
+    granite_speech5_load_representation,
     granite_speech5_mmproj_safetensors_name, granite_speech5_tensor_is_f16_encoder_projection,
     resolve_granite_speech5_encoder_precision, select_granite_speech5_dtype, GraniteSpeech5Config,
     GraniteSpeech5LoadRepresentation, GraniteSpeech5Weights,
@@ -88,11 +90,13 @@ use crate::models::architectures::granite_speech5::asr::{
 use crate::models::architectures::lfm25_audio::conformer::lfm25_audio_conformer_projection;
 use crate::models::architectures::lfm25_audio::lfm25_audio_load_layout;
 use crate::models::architectures::nemotron::asr::{
-    nemotron_checkpoint_paths, nemotron_tensor_is_f16_projection, resolve_nemotron_asr_dtype,
+    nemotron_checkpoint_paths, nemotron_encoder_graph_device_bytes,
+    nemotron_tensor_is_f16_projection, resolve_nemotron_asr_dtype,
     resolve_nemotron_projection_precision, NEMOTRON_MODEL_MEMO_MAX_BYTES,
 };
 use crate::models::architectures::parakeet::asr::{
-    parakeet_checkpoint_paths, parakeet_tensor_is_f16_projection,
+    parakeet_checkpoint_paths, parakeet_encoder_graph_device_bytes,
+    parakeet_tensor_is_bf16_projection, parakeet_tensor_is_f16_projection,
     resolve_parakeet_projection_precision, PARAKEET_WEIGHT_DTYPE,
 };
 use crate::models::architectures::qwen3::asr::{
@@ -103,6 +107,9 @@ use crate::models::architectures::qwen3::core::{
     qwen3_dense_projection_fusion_enabled, qwen3_mlx_q4_1_enabled,
     qwen3_quantized_projection_grouping_for_hidden_size,
 };
+use crate::models::architectures::qwen3::decode_graph::{
+    qwen3_decode_graph_device_bytes, QWEN3_ASR_DECODE_GRAPHS_ENV, VIBEVOICE_ASR_DECODE_GRAPHS_ENV,
+};
 use crate::models::architectures::sortformer::diarization::{
     sortformer_checkpoint_paths, sortformer_extraction_is_current,
     sortformer_uses_selected_model_device,
@@ -112,10 +119,12 @@ use crate::models::architectures::vibevoice::asr::{
     vibevoice_asr_weight_dtype, vibevoice_tensor_is_f16_tokenizer_projection,
     vibevoice_tensor_is_language_model,
 };
+use crate::models::architectures::voxtral::decode_graph::voxtral_decode_graph_device_bytes;
 use crate::models::architectures::voxtral::realtime::model::{
     voxtral_realtime_weight_dtype, voxtral_realtime_weight_files,
 };
 use crate::models::architectures::whisper::asr::{whisper_weight_dtype, whisper_weight_files};
+use crate::models::architectures::whisper::whisper_decode_graph_device_bytes;
 use crate::models::shared::weights::gguf::safetensors_weight_files;
 use crate::models::shared::weights::staged::METAL_LOAD_SYNC_INTERVAL_BYTES;
 
@@ -222,33 +231,70 @@ pub(super) fn residency_plan(
 ) -> Result<Option<AsrResidencyPlan>> {
     let backend = BackendKind::from(device.kind);
     match variant {
-        ModelVariant::WhisperLargeV3Turbo => whisper_plan(model_path, device, backend),
+        ModelVariant::WhisperLargeV3Turbo => {
+            // The decoder's CUDA step graphs allocate their memory on first use.
+            let graphs = whisper_decode_graph_device_bytes(backend);
+            whisper_plan(model_path, device, backend)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
+        }
         ModelVariant::Qwen3Asr06BGguf | ModelVariant::Qwen3Asr17BGguf => {
-            qwen3_asr_plan(variant, model_path, device, backend)
+            // The text decoder's CUDA graphs allocate their memory on first use.
+            let graphs = qwen3_decode_graph_device_bytes(backend, QWEN3_ASR_DECODE_GRAPHS_ENV);
+            qwen3_asr_plan(variant, model_path, device, backend, Precision::Selected)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
         ModelVariant::ParakeetTdt06BV3 => {
+            // The encoder's and the decode dispatch's CUDA graphs allocate
+            // their memory on first use.
+            let graphs = parakeet_encoder_graph_device_bytes(backend)
+                + crate::kernels::transducer_greedy::transducer_graph_device_bytes(backend);
             parakeet_plan(variant, model_path, device, backend, Precision::Selected)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
         ModelVariant::Nemotron35AsrStreaming06B => {
+            // The offline encoder's and the decode dispatch's CUDA graphs
+            // allocate their memory on first use.
+            let graphs = nemotron_encoder_graph_device_bytes(backend)
+                + crate::kernels::transducer_greedy::transducer_graph_device_bytes(backend);
             nemotron_plan(variant, model_path, device, backend, Precision::Selected)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
         // Plus and base share the loader; the census carries their differences
         // (base: no layer-3 concatenation in the projector, an untied LM head).
-        _ if variant.family() == ModelFamily::GraniteSpeechAsr => granite_plan(
-            model_path,
-            device,
-            backend,
-            granite.speech_dtype.as_deref(),
-            Precision::Selected,
-        ),
-        _ if variant.family() == ModelFamily::GraniteSpeech5Asr => {
-            granite_speech5_plan(variant, model_path, device, backend, Precision::Selected)
+        _ if variant.family() == ModelFamily::GraniteSpeechAsr => {
+            // The encoder's CUDA graphs allocate their memory on first use.
+            let graphs = granite_speech_encoder_graph_device_bytes(backend);
+            granite_plan(
+                model_path,
+                device,
+                backend,
+                granite.speech_dtype.as_deref(),
+                Precision::Selected,
+            )
+            .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
-        ModelVariant::VibeVoiceAsr => vibevoice_plan(model_path, device, backend),
+        _ if variant.family() == ModelFamily::GraniteSpeech5Asr => {
+            // The encoder's CUDA graphs allocate their memory on first use.
+            let graphs = granite_speech5_encoder_graph_device_bytes(backend);
+            granite_speech5_plan(variant, model_path, device, backend, Precision::Selected)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
+        }
+        ModelVariant::VibeVoiceAsr => {
+            // The language model's CUDA graphs allocate their memory on first use.
+            let graphs = qwen3_decode_graph_device_bytes(backend, VIBEVOICE_ASR_DECODE_GRAPHS_ENV);
+            vibevoice_plan(model_path, device, backend)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
+        }
         _ if variant.family() == ModelFamily::NemotronTranscribeAsr => {
             nemotron_transcribe_plan(model_path, backend)
         }
-        ModelVariant::VoxtralMini4BRealtime2602 => voxtral_plan(model_path, device, backend),
+        ModelVariant::VoxtralMini4BRealtime2602 => {
+            // The language model's CUDA decode graphs allocate their memory
+            // on first use.
+            let graphs = voxtral_decode_graph_device_bytes(backend);
+            voxtral_plan(model_path, device, backend)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
+        }
         ModelVariant::Lfm25Audio15BGguf => lfm25_audio_plan(model_path, backend),
         // Priced here, but not an ASR variant: the aligner is stateless and
         // has no request floor or state fit.
@@ -276,6 +322,9 @@ pub(super) struct AsrResidencyPlan {
     load_peak_bytes: u64,
     /// CUDA only: high-water mark of host staging.
     host_staging_bytes: u64,
+    /// Device memory the model allocates lazily after the load (Parakeet's
+    /// encoder graphs): resident, but a pending claim until it is used.
+    deferred_device_bytes: u64,
 }
 
 impl AsrResidencyPlan {
@@ -297,7 +346,14 @@ impl AsrResidencyPlan {
             memo_bytes,
             load_peak_bytes: ledger.peak,
             host_staging_bytes: ledger.host_peak,
+            deferred_device_bytes: 0,
         })
+    }
+
+    /// This plan with `bytes` of device memory the model allocates lazily.
+    pub(super) fn with_deferred_device_bytes(mut self, bytes: u64) -> Self {
+        self.deferred_device_bytes = bytes;
+        self
     }
 
     /// This plan in `backend`'s domains: weights priced on the host (a
@@ -310,8 +366,16 @@ impl AsrResidencyPlan {
 
     pub(super) fn estimate(&self) -> Result<ModelMemoryEstimate> {
         Ok(ModelMemoryEstimate {
-            resident_bytes: sum(&[self.resident_bytes, self.memo_bytes])?,
-            load_peak_bytes: sum(&[self.load_peak_bytes, self.memo_bytes])?,
+            resident_bytes: sum(&[
+                self.resident_bytes,
+                self.memo_bytes,
+                self.deferred_device_bytes,
+            ])?,
+            load_peak_bytes: sum(&[
+                self.load_peak_bytes,
+                self.memo_bytes,
+                self.deferred_device_bytes,
+            ])?,
         })
     }
 
@@ -320,6 +384,10 @@ impl AsrResidencyPlan {
         if self.backend == BackendKind::Cuda {
             // The device holds the weights; the host only stages them.
             plan.load_authorization.host_bytes = ResourceAmount::Known(self.host_staging_bytes);
+            // Allocated on first use: kept pending so state fits cannot
+            // spend it.
+            plan.deferred_resident_authorization.device_bytes =
+                ResourceAmount::Known(self.deferred_device_bytes);
         }
         Ok(plan)
     }
@@ -1540,6 +1608,7 @@ fn qwen3_asr_plan(
     model_path: &Path,
     device: &DeviceProfile,
     backend: BackendKind,
+    precision: Precision,
 ) -> Result<Option<AsrResidencyPlan>> {
     let Some(path) = resolve_qwen_asr_gguf_path(model_path, variant) else {
         return Ok(None);
@@ -1573,7 +1642,29 @@ fn qwen3_asr_plan(
         ),
         tied_head,
     };
+    let load = match precision {
+        Precision::Selected => load,
+        Precision::F32Reload => match qwen3_asr_precision_reload(backend, load) {
+            Some(reload) => reload,
+            None => return Ok(None),
+        },
+    };
     price_qwen3_asr(&files, backend, load).map(Some)
+}
+
+/// What a Qwen3-ASR GGUF load falls back to when a component loaded below
+/// F32 fails its load-time probe (`load_qwen3_asr_components`): the audio
+/// tower (probed on Metal and CUDA) and the text (probed on Metal) reload at
+/// F32, a bound for either reloading beside the other. `None` when no probed
+/// component is lowered.
+fn qwen3_asr_precision_reload(backend: BackendKind, load: Qwen3AsrLoad) -> Option<Qwen3AsrLoad> {
+    let audio = backend != BackendKind::Cpu && load.audio_dtype != DType::F32;
+    let text = backend == BackendKind::Metal && load.text_dtype != DType::F32;
+    (audio || text).then_some(Qwen3AsrLoad {
+        audio_dtype: if audio { DType::F32 } else { load.audio_dtype },
+        text_dtype: if text { DType::F32 } else { load.text_dtype },
+        ..load
+    })
 }
 
 fn qwen3_asr_prefix(tensors: &BTreeMap<&str, &CensusTensor>) -> &'static str {
@@ -1756,6 +1847,16 @@ pub(super) fn precision_reload_plan(
                 return Ok(None);
             };
             price_qwen3_aligner(&files, backend, reload)?
+        }
+        // A lowered GGUF audio tower (Metal, CUDA) or text (Metal) that
+        // fails its probe reloads at F32 (`load_qwen3_asr_components`).
+        ModelFamily::Qwen3Asr => {
+            let Some(plan) =
+                qwen3_asr_plan(variant, model_path, device, backend, Precision::F32Reload)?
+            else {
+                return Ok(None);
+            };
+            plan
         }
         // Weight-only F16 encoder projections that fail their probe reload
         // dense (`load_weight_only_f16`).
@@ -1983,10 +2084,13 @@ enum NemoFamily {
 }
 
 impl NemoFamily {
-    fn is_f16_projection(self, name: &str) -> bool {
-        match self {
-            Self::Parakeet => parakeet_tensor_is_f16_projection(name),
-            Self::Nemotron => nemotron_tensor_is_f16_projection(name),
+    /// Whether `name` is one of the encoder projections the family loads
+    /// converted to `dtype` (F16 on Metal; BF16 for Parakeet on CUDA).
+    fn is_converted_projection(self, name: &str, dtype: DType) -> bool {
+        match (self, dtype) {
+            (Self::Parakeet, DType::BF16) => parakeet_tensor_is_bf16_projection(name),
+            (Self::Parakeet, _) => parakeet_tensor_is_f16_projection(name),
+            (Self::Nemotron, _) => nemotron_tensor_is_f16_projection(name),
         }
     }
 
@@ -2006,8 +2110,7 @@ fn parakeet_plan(
     precision: Precision,
 ) -> Result<Option<AsrResidencyPlan>> {
     let paths = parakeet_checkpoint_paths(model_path, variant)?;
-    let f16_projections = precision == Precision::Selected
-        && resolve_parakeet_projection_precision(device).dtype == DType::F16;
+    let projections = parakeet_projection_dtype(device, precision);
     // The loader reads the extracted checkpoint, or its zip-repacked copy when
     // Candle cannot parse the original.
     for checkpoint in [&paths.checkpoint_path, &paths.repacked_checkpoint_path] {
@@ -2018,14 +2121,14 @@ fn parakeet_plan(
                     backend,
                     PARAKEET_WEIGHT_DTYPE,
                     NemoFamily::Parakeet,
-                    f16_projections,
+                    projections,
                 )
                 .map(Some);
             }
         }
     }
     // Without a tensor list the first load is priced at F32 throughout, an
-    // over-estimate when the projections load in F16.
+    // over-estimate when the projections load in F16 or BF16.
     if paths.checkpoint_path.is_file() {
         // An unreadable checkpoint is repacked on disk before it loads.
         let payload = std::fs::metadata(&paths.checkpoint_path)?.len();
@@ -2038,6 +2141,19 @@ fn parakeet_plan(
     // First load: the archive is streamed to disk through small buffers.
     let payload = nemo_payload_bytes(&paths.nemo_path)?;
     price_nemo_first_load(backend, payload, DType::F32, PARAKEET_WEIGHT_DTYPE, 0, 0).map(Some)
+}
+
+/// The dtype Parakeet's encoder projections load in for `precision`: F16
+/// (Metal) or BF16 (CUDA) as the loader selects, `None` when they stay F32.
+/// A failed F16 probe reloads them dense; the BF16 tier has no probe.
+fn parakeet_projection_dtype(device: &DeviceProfile, precision: Precision) -> Option<DType> {
+    match (
+        precision,
+        resolve_parakeet_projection_precision(device).dtype,
+    ) {
+        (Precision::F32Reload, _) | (_, DType::F32) => None,
+        (Precision::Selected, dtype) => Some(dtype),
+    }
 }
 
 fn nemotron_plan(
@@ -2058,7 +2174,7 @@ fn nemotron_plan(
                 backend,
                 dtype,
                 NemoFamily::Nemotron,
-                f16_projections,
+                f16_projections.then_some(DType::F16),
             )
             .map(Some);
         }
@@ -2079,14 +2195,15 @@ fn nemotron_plan(
 /// counters are never read, and the featurizer tensors go back to the host.
 /// Parakeet adds each depthwise convolution with its BatchNorm folded in;
 /// Nemotron on CUDA adds transposed copies of its LSTM weights. With
-/// `f16_projections` the family's encoder projections are read and converted
-/// to F16 on the host and uploaded once (weight-only F16 on Metal).
+/// `projections` the family's encoder projections are read and converted to
+/// that dtype on the host and uploaded once (weight-only F16 on Metal;
+/// Parakeet's BF16 tier on CUDA, whose fused q/k/v holds the same bytes).
 fn price_nemo(
     files: &[CensusFile],
     backend: BackendKind,
     dtype: DType,
     family: NemoFamily,
-    f16_projections: bool,
+    projections: Option<DType>,
 ) -> Result<AsrResidencyPlan> {
     let mut ledger = Ledger::new(backend);
     for tensor in files.iter().flat_map(|file| file.tensors.iter()) {
@@ -2094,8 +2211,10 @@ fn price_nemo(
         if name.ends_with(".num_batches_tracked") || name.starts_with("preprocessor.") {
             continue;
         }
-        if f16_projections && family.is_f16_projection(name) {
-            ledger.host_converted(tensor, DType::F16)?;
+        if let Some(converted) =
+            projections.filter(|converted| family.is_converted_projection(name, *converted))
+        {
+            ledger.host_converted(tensor, converted)?;
         } else {
             ledger.var(tensor, Source::Copied, &[dtype])?;
         }
@@ -2422,6 +2541,7 @@ fn nemotron_transcribe_plan(
         memo_bytes: 0,
         load_peak_bytes: sum(&[resident, priced.largest_tensor_bytes])?,
         host_staging_bytes: host_staging,
+        deferred_device_bytes: 0,
     }))
 }
 
@@ -3626,14 +3746,12 @@ pub(super) mod tests {
     }
 
     fn parakeet(backend: BackendKind) -> AsrResidencyPlan {
-        let f16_projections =
-            resolve_parakeet_projection_precision(&profile(backend)).dtype == DType::F16;
         price_nemo(
             &census!("parakeet_tdt_0_6b_v3.json"),
             backend,
             PARAKEET_WEIGHT_DTYPE,
             NemoFamily::Parakeet,
-            f16_projections,
+            parakeet_projection_dtype(&profile(backend), Precision::Selected),
         )
         .unwrap()
     }
@@ -3648,7 +3766,7 @@ pub(super) mod tests {
             backend,
             dtype,
             NemoFamily::Nemotron,
-            f16_projections,
+            f16_projections.then_some(DType::F16),
         )
         .unwrap()
     }
@@ -4028,12 +4146,12 @@ pub(super) mod tests {
             (
                 "Parakeet-TDT-0.6B-v3",
                 Box::new(parakeet),
-                [2.34, 1.20, 1.20, 2.34],
+                [2.34, 1.20, 1.20, 1.20],
             ),
             (
                 "Nemotron-3.5-ASR-0.6B",
                 Box::new(nemotron),
-                [2.38, 1.24, 1.24, 1.20],
+                [2.38, 1.24, 1.24, 2.40],
             ),
             (
                 "Whisper-L-v3-Turbo",
@@ -4192,25 +4310,31 @@ pub(super) mod tests {
         // plus each depthwise convolution with its BatchNorm folded in. Metal
         // stores the encoder projections in F16: the subsampling output
         // projection and, per layer, four FFN, five attention and two
-        // pointwise-conv weights.
+        // pointwise-conv weights. CUDA stores the same projections, and the
+        // subsampling output projection's bias, in BF16.
         let files = census!("parakeet_tdt_0_6b_v3.json");
         let weights = stored(&files, |t| {
             t.dtype == StoredDType::Dense(DType::F32) && !t.name.starts_with("preprocessor.")
         });
         let folds = 24 * (1024 * 9 + 1024) * 4;
-        for backend in [BackendKind::Cpu, BackendKind::Cuda] {
-            assert_eq!(parakeet(backend).logical_resident_bytes, weights + folds);
-        }
+        assert_eq!(
+            parakeet(BackendKind::Cpu).logical_resident_bytes,
+            weights + folds
+        );
         let projections = 1024 * 4096 + 24 * (4 * 4096 * 1024 + 5 * 1024 * 1024 + 3 * 1024 * 1024);
         assert_eq!(
             parakeet(BackendKind::Metal).logical_resident_bytes,
             weights + folds - projections * 2
         );
+        assert_eq!(
+            parakeet(BackendKind::Cuda).logical_resident_bytes,
+            weights + folds - (projections + 1024) * 2
+        );
         // About 2.5 GB of weights become about 1.3 GB.
         assert_eq!(weights, 2_508_229_144);
         assert_eq!(weights - projections * 2, 1_291_880_984);
-        // Nemotron: F32 on CPU and Metal; BF16 on CUDA plus transposed copies
-        // of the two LSTM layers' input and hidden weights. Metal stores the
+        // Nemotron: F32 on every backend, plus transposed F32 copies of the
+        // two LSTM layers' input and hidden weights on CUDA. Metal stores the
         // encoder projections in F16, as for Parakeet (a 4352-wide
         // subsampling output projection).
         let files = census!("nemotron_3_5_asr_streaming_0_6b.json");
@@ -4223,7 +4347,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             nemotron(BackendKind::Cuda).resident_bytes,
-            weights / 2 + 4 * 2560 * 640 * 2
+            weights + 4 * 2560 * 640 * 4
         );
         for backend in BACKENDS {
             let plan = nemotron(backend);
@@ -4507,12 +4631,81 @@ pub(super) mod tests {
             vibevoice(BackendKind::Cuda).host_staging_bytes,
             largest(&files)
         );
-        // Parakeet's 12 GiB catalog figure (device and host) was 5x its weights.
+        // Parakeet's 12 GiB catalog figure (device and host) was 10x its BF16-tier weights.
         assert_gib(
             "Parakeet CUDA",
             parakeet(BackendKind::Cuda).load_peak_bytes,
-            2.34,
+            1.20,
         );
+    }
+
+    /// The Qwen3-ASR GGUF audio tower is priced at F32 on CUDA by default
+    /// (a BF16 tower was batch-variant on the H100), so it reloads nothing.
+    /// A tower lowered by override, and a failed load-time probe's reload,
+    /// price only the probed components at F32: the tower on CUDA and Metal,
+    /// the text on Metal. CPU and an F32 tower reload nothing.
+    #[test]
+    fn qwen3_asr_precision_reload_prices_the_probed_components_at_f32() {
+        let _env = env_lock();
+        let files = census!("qwen3_asr_0_6b_q8_0.json");
+        let (text_dtype, audio_dtype) = qwen3_asr_weight_dtypes(
+            &profile(BackendKind::Cuda),
+            ModelFamily::Qwen3Asr,
+            true,
+            true,
+            Some(QWEN3_ASR_GGUF_CHECKPOINT_DTYPE),
+        )
+        .unwrap();
+        assert_eq!((text_dtype, audio_dtype), (DType::BF16, DType::F32));
+        let default = Qwen3AsrLoad {
+            text_dtype,
+            audio_dtype,
+            qmatmul_text: true,
+            packed_projections: false,
+            tied_head: true,
+        };
+        assert!(qwen3_asr_precision_reload(BackendKind::Cuda, default).is_none());
+        // `IZWI_QWEN_ASR_AUDIO_DTYPE=bf16` lowers the tower again.
+        let load = Qwen3AsrLoad {
+            audio_dtype: DType::BF16,
+            ..default
+        };
+        let cuda = qwen3_asr_precision_reload(BackendKind::Cuda, load).unwrap();
+        assert_eq!(
+            (cuda.text_dtype, cuda.audio_dtype),
+            (DType::BF16, DType::F32)
+        );
+        let lowered = Qwen3AsrLoad {
+            text_dtype: DType::F16,
+            audio_dtype: DType::F16,
+            ..load
+        };
+        let metal = qwen3_asr_precision_reload(BackendKind::Metal, lowered).unwrap();
+        assert_eq!(
+            (metal.text_dtype, metal.audio_dtype),
+            (DType::F32, DType::F32)
+        );
+        assert!(qwen3_asr_precision_reload(BackendKind::Cpu, load).is_none());
+        let f32_tower = Qwen3AsrLoad {
+            audio_dtype: DType::F32,
+            ..load
+        };
+        assert!(qwen3_asr_precision_reload(BackendKind::Cuda, f32_tower).is_none());
+
+        let audio_bytes = |load| {
+            price_qwen3_asr(&files, BackendKind::Cuda, load)
+                .unwrap()
+                .logical_resident_bytes
+        };
+        // Every tower tensor is dequantized: 2 more bytes each at F32.
+        let tower_elements = files
+            .iter()
+            .flat_map(|file| file.tensors.iter())
+            .filter(|tensor| tensor.name.contains("audio_tower."))
+            .map(CensusTensor::elements)
+            .sum::<u64>();
+        assert!(tower_elements > 100_000_000);
+        assert_eq!(audio_bytes(cuda) - audio_bytes(load), 2 * tower_elements);
     }
 
     /// A dtype policy change reprices admission: the plans take the loaders'
@@ -4842,9 +5035,12 @@ pub(super) mod tests {
             let catalog = super::super::model_memory_estimate(ModelVariant::VibeVoiceAsr);
             assert!(retry < catalog.load_peak_bytes);
             if backend == BackendKind::Cuda {
+                // The weights, and the decode graphs' deferred memory.
+                let graphs =
+                    qwen3_decode_graph_device_bytes(backend, VIBEVOICE_ASR_DECODE_GRAPHS_ENV);
                 assert_eq!(
                     plan.resident_authorization.device_bytes,
-                    ResourceAmount::Known(bf16)
+                    ResourceAmount::Known(bf16 + graphs)
                 );
                 assert_eq!(
                     plan.load_authorization.host_bytes,

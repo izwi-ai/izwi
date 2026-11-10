@@ -59,6 +59,64 @@ impl QFormerProjector {
         self.linear.forward(&output).map_err(Error::from)
     }
 
+    /// [`Self::forward`] for each row of a padded batch (`[batch, frames,
+    /// encoder]`, row `r` holding `valid_lengths[r]` frames): each row is
+    /// cut to its own frames and zero-padded to its own windows, exactly as
+    /// alone, and every row's windows run through one Q-Former call. Returns
+    /// each row's `(1, windows * queries, text hidden)`.
+    pub(super) fn forward_compact_valid_lengths(
+        &self,
+        hidden: &Tensor,
+        valid_lengths: &[usize],
+    ) -> Result<Vec<Tensor>> {
+        let (batch, frames, dim) = hidden.dims3()?;
+        if valid_lengths.len() != batch
+            || valid_lengths
+                .iter()
+                .any(|length| *length == 0 || *length > frames)
+        {
+            return Err(Error::InvalidInput(format!(
+                "Granite Speech 5.0 projector valid lengths {valid_lengths:?} do not fit {batch} x {frames} frames"
+            )));
+        }
+        let mut packed = Vec::with_capacity(batch);
+        let mut row_windows = Vec::with_capacity(batch);
+        for (row, &valid) in valid_lengths.iter().enumerate() {
+            let windows = self.window_count(valid);
+            let pad = windows * self.window_size - valid;
+            let frames = hidden.narrow(0, row, 1)?.narrow(1, 0, valid)?;
+            let frames = if pad > 0 {
+                frames.pad_with_zeros(1, 0, pad)?
+            } else {
+                frames.contiguous()?
+            };
+            packed.push(frames.reshape((windows, self.window_size, dim))?);
+            row_windows.push(windows);
+        }
+        let windowed = Tensor::cat(&packed, 0)?;
+        let total = windowed.dim(0)?;
+        let query = self
+            .query
+            .broadcast_as((total, self.num_queries, self.query.dim(2)?))?;
+        let output = self
+            .linear
+            .forward(&self.qformer.forward(&query, &windowed)?)?;
+        let width = output.dim(2)?;
+        let mut offset = 0;
+        row_windows
+            .into_iter()
+            .map(|windows| {
+                let row = output.narrow(0, offset, windows)?.reshape((
+                    1,
+                    windows * self.num_queries,
+                    width,
+                ))?;
+                offset += windows;
+                Ok(row)
+            })
+            .collect()
+    }
+
     pub(super) fn window_count(&self, frames: usize) -> usize {
         frames.div_ceil(self.window_size)
     }
@@ -249,5 +307,54 @@ mod tests {
         assert_eq!(output.dims(), &[1, 9, 4]);
         assert_eq!(projector.window_count(31), 3);
         assert_eq!(projector.window_count(30), 2);
+    }
+
+    /// A padded batch's rows each get the windows and queries they get
+    /// alone, whatever the padding holds.
+    #[test]
+    fn compact_batch_rows_match_each_row_projected_alone() {
+        let device = Device::Cpu;
+        let mut config = GraniteSpeech5Config::load(&fixture_dir()).unwrap();
+        config.projector_config.hidden_size = 8;
+        config.projector_config.intermediate_size = 16;
+        config.projector_config.num_attention_heads = 2;
+        config.projector_config.encoder_hidden_size = 6;
+        config.text_config.hidden_size = 4;
+        let vars = VarMap::new();
+        let projector =
+            QFormerProjector::load(&config, VarBuilder::from_varmap(&vars, DType::F32, &device))
+                .unwrap();
+        let lengths = [31usize, 15, 4];
+        let hidden =
+            crate::kernels::numeric_check::xorshift_tensor(&[3, 31, 6], 7, 1.0, &device).unwrap();
+        let rows = projector
+            .forward_compact_valid_lengths(&hidden, &lengths)
+            .unwrap();
+        for (row, &length) in lengths.iter().enumerate() {
+            let alone = projector
+                .forward(
+                    &hidden
+                        .narrow(0, row, 1)
+                        .unwrap()
+                        .narrow(1, 0, length)
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(rows[row].dims(), alone.dims());
+            let diff = (&rows[row] - &alone)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(diff < 1e-5, "row {row}: {diff}");
+        }
+        assert!(projector
+            .forward_compact_valid_lengths(&hidden, &[31, 0, 4])
+            .is_err());
     }
 }

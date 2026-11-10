@@ -368,7 +368,7 @@ impl ModelLifecycleController {
                 }
             };
             self.model_registry
-                .publish_effective_context(variant, retained.logical_token_reach())?;
+                .publish_effective_context(variant, retained.maximum_sequence_tokens())?;
             self.model_registry.publish_kv_storage(variant, &retained);
             crate::runtime::rollout::validate_managed_state_plan_eligibility(
                 variant,
@@ -432,10 +432,22 @@ impl ModelLifecycleController {
         later: LaterStateGroups,
     ) -> Result<()> {
         let backend = self.backend_router.context().backend_kind;
+        let axis_bounds = descriptor.capacity_axis_bounds(StateCapacityAxis::DecoderContext);
         if backend == BackendKind::Cuda {
+            // CUDA prices invocation workspace per request, so nothing is
+            // fitted here, but invocation-only routes (Whisper, Granite
+            // Speech 4.1 and 5.0) still need the context they plan against:
+            // without it every request failed with "no effective context".
+            if let Some(context) = cuda_invocation_context(
+                self.config.max_sequence_length,
+                self.model_registry.effective_context(variant),
+                axis_bounds,
+            ) {
+                self.model_registry
+                    .publish_effective_context(variant, context)?;
+            }
             return Ok(());
         }
-        let axis_bounds = descriptor.capacity_axis_bounds(StateCapacityAxis::DecoderContext);
         // ASR state leaves live room for the requests it serves (ADM-7), and
         // keeps the one reserve the retained fit keeps too (ADM-11): the
         // configured floor or the measured untracked growth, not a catalog

@@ -16,6 +16,7 @@ use crate::kv::v2::{
 use crate::models::shared::attention::paged::default_kv_page_size;
 #[cfg(test)]
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+use crate::models::shared::state::exact_stage_scratch_domain;
 
 use super::FishS2Config;
 
@@ -95,29 +96,22 @@ pub(crate) fn fish_s2_physical_state_spec(
             } else {
                 Vec::new()
             };
-            if stage.max_workspace_bytes > 0 {
-                let scratch_id = max_domain_id
-                    .checked_add(u32::try_from(index + 1).map_err(|_| {
-                        Error::ModelLoadError("Fish S2 execution stage count exceeds u32".into())
-                    })?)
-                    .ok_or_else(|| {
-                        Error::ModelLoadError("Fish S2 scratch domain id overflow".into())
-                    })?;
-                domains.push(InvocationWorkspaceDomain::Scratch {
-                    id: StateDomainId::new(scratch_id),
-                    placement: PlacementPolicy::BackendLocal,
-                    alignment_bytes: 64,
-                    zero_on_release: false,
-                    formula: WorkspaceFormula {
-                        fixed_bytes: if stage.workspace_per_row_bytes > 0 {
-                            stage.workspace_per_row_bytes
-                        } else {
-                            stage.max_workspace_bytes
-                        },
-                        dimensions: vec![],
-                        terms: vec![],
-                    },
-                });
+            let scratch_id = max_domain_id
+                .checked_add(u32::try_from(index + 1).map_err(|_| {
+                    Error::ModelLoadError("Fish S2 execution stage count exceeds u32".into())
+                })?)
+                .ok_or_else(|| {
+                    Error::ModelLoadError("Fish S2 scratch domain id overflow".into())
+                })?;
+            // Each row leases its share of the stage's ceiling. The prefill
+            // stage prices its whole batch in `max_workspace_bytes`, with no
+            // per-row figure, so the share is the ceiling over the rows.
+            if let Some(scratch) = exact_stage_scratch_domain(
+                stage,
+                StateDomainId::new(scratch_id),
+                InvocationLeaseScope::PerRow,
+            )? {
+                domains.push(scratch);
             }
             has_invocation_workspace |= !domains.is_empty();
             invocation_stages.push(InvocationStageWorkspace {

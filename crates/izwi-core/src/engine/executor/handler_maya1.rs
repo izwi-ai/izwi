@@ -415,6 +415,113 @@ impl NativeExecutor {
         Ok(ModelSessionResult::yielded(empty_output(request), reason))
     }
 
+    /// One audio window for each of several requests (the batched audio
+    /// stage on CUDA): due windows of one length share SNAC calls, and each
+    /// request continues as [`Self::maya1_tts_audio_request`] would.
+    pub(super) fn maya1_tts_audio_batch(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+    ) -> Result<Vec<ModelSessionResult>> {
+        if requests.is_empty() || requests.len() != scheduled.len() {
+            return Err(Error::InvalidInput(
+                "Maya1 audio batch rows do not match".into(),
+            ));
+        }
+        let mut outputs = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
+        let mut rows = Vec::with_capacity(requests.len());
+        for (index, (request, scheduled)) in requests.iter().zip(scheduled).enumerate() {
+            if !matches!(
+                scheduled.work,
+                crate::engine::WorkUnit::SequenceAudioDecode { max_frames: 1 }
+            ) || scheduled.is_prefill
+            {
+                return Err(Error::InvalidInput(
+                    "Maya1 audio stage requires one audio-decode unit".into(),
+                ));
+            }
+            if request.is_cancelled() {
+                outputs[index] = Some(ModelSessionResult::cancelled_before_dispatch(
+                    ExecutorOutput::cancelled(request.id.clone()),
+                ));
+                continue;
+            }
+            let (model, mut lease) = self.checkout_maya1_audio(request, scheduled)?;
+            lease.mark_dirty();
+            rows.push((index, model, lease));
+        }
+        if rows.is_empty() {
+            return collect_outputs(outputs);
+        }
+        let model = rows[0].1.clone();
+        if rows
+            .iter()
+            .any(|(_, row_model, _)| !Arc::ptr_eq(&row_model.model_arc(), &model.model_arc()))
+        {
+            return Err(Error::InvalidInput(
+                "Maya1 audio batch crossed model identity".into(),
+            ));
+        }
+        let started = std::time::Instant::now();
+        // A failed batch leaves every lease dirty, so the partial states are
+        // discarded with their requests.
+        let progress = {
+            let mut states = rows
+                .iter_mut()
+                .map(|(_, _, lease)| Ok(&mut lease.require_state_mut()?.state))
+                .collect::<Result<Vec<_>>>()?;
+            Self::run_blocking(|| model.retained_audio_batch(&mut states))?
+        };
+        tracing::debug!(
+            rows = rows.len(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "Maya1 audio windows"
+        );
+        for ((index, _, mut lease), progress) in rows.into_iter().zip(progress) {
+            let request = requests[index];
+            if request.is_cancelled() {
+                // The dirty lease discards the window's state.
+                outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+                continue;
+            }
+            let active = lease.require_state_mut()?;
+            if let Maya1AudioProgress::Window(samples) = progress {
+                if !samples.is_empty() {
+                    if let Some(tx) = Self::stream_sender(request) {
+                        Self::stream_audio_with_policy(
+                            &tx,
+                            request.stream_policy,
+                            &request.id,
+                            &mut active.stream_sequence,
+                            samples,
+                            SAMPLE_RATE,
+                            false,
+                        )?;
+                    } else {
+                        active.rendered.extend(samples);
+                    }
+                }
+            }
+            let reason = if active.state.audio.done() {
+                crate::engine::YieldReason::AwaitingFinalization
+            } else if model.retained_window_due(&active.state) {
+                crate::engine::YieldReason::AwaitingAudioDecode { max_frames: 1 }
+            } else if active.state.stopped() {
+                return Err(Error::InferenceError(
+                    "Maya1 stopped with no audio window left to run".into(),
+                ));
+            } else {
+                crate::engine::YieldReason::QuantumExhausted
+            };
+            lease.mark_clean();
+            lease.restore()?;
+            outputs[index] = Some(ModelSessionResult::yielded(empty_output(request), reason));
+        }
+        collect_outputs(outputs)
+    }
+
     /// Hand over the audio: the whole utterance in one output, or, for a
     /// stream whose windows sent it all, the end-of-stream marker.
     pub(super) fn maya1_tts_finalize_request(

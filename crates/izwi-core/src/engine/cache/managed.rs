@@ -72,8 +72,8 @@ use binding::{
 use capacity::{
     cuda_contiguous_replacement_peak_pages, cuda_contiguous_replacement_required_bytes,
     cuda_largest_contiguous_replacement_extra, cuda_resident_required_bytes,
-    fit_cuda_contiguous_token_reach, fit_cuda_resident_token_reach, fit_resident_rows_and_reach,
-    managed_paged_capacity_strategy, CudaContiguousPagedGeometry,
+    fit_cuda_contiguous_token_reach, fit_cuda_resident_token_reach, fit_pool_sequences,
+    fit_resident_rows_and_reach, managed_paged_capacity_strategy, CudaContiguousPagedGeometry,
 };
 use capacity::{
     cuda_managed_state_peak_authorization, managed_state_resources,
@@ -529,6 +529,20 @@ impl ManagedKvCacheManager {
 
     pub(crate) fn synchronize_worker(&self) -> Result<()> {
         self.worker_device.synchronize().map_err(Error::from)
+    }
+
+    /// Synchronize the worker device, so every free queued on it has run,
+    /// then hand its idle pooled memory back to the driver (CUDA only; see
+    /// [`crate::backends::device::release_idle_cuda_memory`]).
+    pub(crate) fn release_idle_worker_memory(
+        &self,
+        graph_pool: bool,
+    ) -> Result<Option<crate::backends::device::CudaMemoryRelease>> {
+        self.synchronize_worker()?;
+        Ok(crate::backends::device::release_idle_cuda_memory(
+            &self.worker_device,
+            graph_pool,
+        ))
     }
     #[cfg(test)]
     pub(crate) fn inject_composite_synchronize_failure(&mut self) {

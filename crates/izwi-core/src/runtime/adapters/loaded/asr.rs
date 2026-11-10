@@ -1,4 +1,5 @@
-//! Continuous ASR execution adapters: Qwen3-ASR, Parakeet and LFM2.5-Audio.
+//! Continuous ASR execution adapters: Qwen3-ASR, Parakeet, Nemotron,
+//! Voxtral and LFM2.5-Audio.
 
 use super::*;
 
@@ -9,7 +10,10 @@ pub(super) struct ContinuousAsrExecutionAdapter {
     pub(super) adapter_instance_id: AdapterInstanceId,
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
+    /// The audio preparation's width: the engine rows.
     pub(super) max_batch_size: usize,
+    /// The continuous decode's width, at least `max_batch_size`.
+    pub(super) decode_batch_size: usize,
     pub(super) audio_preparation:
         OnceLock<crate::models::architectures::qwen3::asr::Qwen3AsrAudioPreparationStageSeal>,
 }
@@ -31,8 +35,16 @@ impl ContinuousAsrExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
             audio_preparation: OnceLock::new(),
         }
+    }
+
+    /// Decode up to `rows` rows per step; the audio preparation keeps the
+    /// width the adapter was built with.
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
     }
 
     pub(super) fn install_audio_preparation_seal(
@@ -177,7 +189,7 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
         execution_profile.recompute_safe = true;
         execution_profile.cache_release_safe = true;
         execution_profile.prefix_reuse_safe = false;
-        execution_profile.max_batch_size = self.max_batch_size;
+        execution_profile.max_batch_size = self.decode_batch_size;
         execution_profile.resolved_from_loaded_model = true;
 
         let mut preparation = StageDescriptor::from_execution_profile(
@@ -187,6 +199,8 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
             NativeBatchMode::Static,
         );
         preparation.selector = StageWorkSelector::PreSequencePreparation;
+        // The encoder's workspace is sealed at the engine rows' width.
+        preparation.max_batch_size = self.max_batch_size;
         preparation.progress = StageProgressKind::Atomic;
         preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
         preparation.shape_policy = StageShapePolicy::Padded;
@@ -236,6 +250,13 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
     }
 }
 
+/// Input samples one Parakeet preparation row may encode: over an hour at
+/// 16 kHz, above the decoded-audio cap.
+const PARAKEET_PREPARATION_ROW_WORK_UNITS: u64 = 64 * 1024 * 1024;
+/// Workspace bound of one Parakeet preparation row: one encoder window, its
+/// feature copy and the stitched output of the longest input.
+const PARAKEET_PREPARATION_ROW_WORKSPACE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 #[derive(Debug)]
 pub(super) struct ParakeetAsrExecutionAdapter {
     pub(super) execution_group_id: ExecutionGroupId,
@@ -243,7 +264,10 @@ pub(super) struct ParakeetAsrExecutionAdapter {
     pub(super) adapter_instance_id: AdapterInstanceId,
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
+    /// The encoder preparation's and prefill's width: the engine rows.
     pub(super) max_batch_size: usize,
+    /// The continuous decode's width, at least `max_batch_size`.
+    pub(super) decode_batch_size: usize,
 }
 
 impl ParakeetAsrExecutionAdapter {
@@ -263,7 +287,15 @@ impl ParakeetAsrExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
         }
+    }
+
+    /// Decode up to `rows` rows per step; the encoder and prefill keep the
+    /// width the adapter was built with.
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
     }
 }
 
@@ -334,6 +366,11 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
         let batch_workspace = workspace_per_row
             .checked_mul(width)
             .ok_or_else(|| Error::Overloaded("Parakeet batch workspace overflowed".into()))?;
+        let decode_width = u64::try_from(self.decode_batch_size)
+            .map_err(|_| Error::Overloaded("Parakeet decode width exceeds u64".into()))?;
+        let decode_workspace = workspace_per_row
+            .checked_mul(decode_width)
+            .ok_or_else(|| Error::Overloaded("Parakeet decode workspace overflowed".into()))?;
 
         let mut profile = scalar_execution_profile(metadata, self.backend_kind);
         profile.mode = ExecutionMode::Sequence;
@@ -351,23 +388,29 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
         profile.recompute_safe = true;
         profile.cache_release_safe = true;
         profile.prefix_reuse_safe = false;
-        profile.max_batch_size = self.max_batch_size;
+        profile.max_batch_size = self.decode_batch_size;
         profile.resolved_from_loaded_model = true;
 
+        // Concurrent clips of one window encode as one padded batch of up to
+        // the engine's width (`ParakeetEncoderBatcher`); longer audio encodes
+        // alone. Each row may bring an hour of samples and its own workspace.
         let mut preparation = StageDescriptor::from_execution_profile(
             StageId::new(0),
             "asr.encoder.parakeet",
             &profile,
-            NativeBatchMode::None,
+            NativeBatchMode::Static,
         );
         preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.max_batch_size = self.max_batch_size;
         preparation.progress = StageProgressKind::Atomic;
         preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
-        preparation.max_batch_size = 1;
-        preparation.max_work_units = 64 * 1024 * 1024;
-        preparation.max_workspace_bytes = 4 * 1024 * 1024 * 1024;
-        preparation.concurrency = ConcurrencyClass::Exclusive;
-        preparation.shape_policy = StageShapePolicy::Exact;
+        preparation.max_work_units = PARAKEET_PREPARATION_ROW_WORK_UNITS
+            .checked_mul(width)
+            .ok_or_else(|| Error::Overloaded("Parakeet preparation work overflowed".into()))?;
+        preparation.max_workspace_bytes = PARAKEET_PREPARATION_ROW_WORKSPACE_BYTES
+            .checked_mul(width)
+            .ok_or_else(|| Error::Overloaded("Parakeet preparation workspace overflowed".into()))?;
+        preparation.shape_policy = StageShapePolicy::Padded;
         preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
 
         let selection = ClockedStateSelection::new(
@@ -381,6 +424,7 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
             NativeBatchMode::Static,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.max_batch_size = self.max_batch_size;
         prefill.progress = StageProgressKind::Iterative;
         prefill.membership_safe_point = MembershipSafePoint::QuantumBoundary;
         prefill.max_work_units = width;
@@ -400,9 +444,9 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
         decode.selector = StageWorkSelector::SequenceDecode;
         decode.progress = StageProgressKind::Iterative;
         decode.membership_safe_point = MembershipSafePoint::QuantumBoundary;
-        decode.max_work_units = width;
+        decode.max_work_units = decode_width;
         decode.workspace_per_row_bytes = workspace_per_row;
-        decode.max_workspace_bytes = batch_workspace;
+        decode.max_workspace_bytes = decode_workspace;
         decode.shape_policy = StageShapePolicy::Ragged;
         decode.max_padding_basis_points = 0;
         decode.retained_state_selections = Some(vec![selection]);
@@ -421,6 +465,500 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
             stages: Arc::from([preparation, prefill, decode]),
         })
     }
+}
+
+/// Input samples one Nemotron preparation row may encode: far above a 30 s
+/// clip at any input rate (decoded audio is capped below this).
+const NEMOTRON_PREPARATION_ROW_WORK_UNITS: u64 = 64 * 1024 * 1024;
+/// Workspace bound of one Nemotron preparation row: its share of a padded
+/// encoder batch of 30 s clips, its stem and its retained projection.
+const NEMOTRON_PREPARATION_ROW_WORKSPACE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Nemotron 3.5 ASR Streaming offline transcription. A clip of at most the
+/// 30 s chunk hint runs as a retained row: a static encoder preparation
+/// batched across requests, a static prefill that starts its predictor and
+/// a continuous RNNT decode batched across rows, its recurrent state held
+/// by the executor session. Longer audio and diarization run today's
+/// atomic graph, which leases the predictor and the encoder projection per
+/// invocation.
+#[derive(Debug)]
+pub(super) struct NemotronAsrExecutionAdapter {
+    pub(super) execution_group_id: ExecutionGroupId,
+    pub(super) model_instance_id: ModelInstanceId,
+    pub(super) adapter_instance_id: AdapterInstanceId,
+    pub(super) metadata: AdapterMetadata,
+    pub(super) backend_kind: BackendKind,
+    /// The encoder preparation's and prefill's width: the engine rows.
+    pub(super) max_batch_size: usize,
+    /// The continuous decode's width, at least `max_batch_size`.
+    pub(super) decode_batch_size: usize,
+}
+
+impl NemotronAsrExecutionAdapter {
+    pub(super) fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        max_batch_size: usize,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
+        }
+    }
+
+    /// Decode up to `rows` rows per step; the encoder and prefill keep the
+    /// width the adapter was built with.
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
+    }
+}
+
+impl LoadedExecutionAdapter for NemotronAsrExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        NEMOTRON_ASR_ADAPTER_ABI
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        let metadata = self.metadata();
+        if streaming.model_native {
+            return Err(Error::InvalidInput(format!(
+                "Model {} has no native streaming ASR contract",
+                metadata.model_variant
+            )));
+        }
+        // Long audio and diarization keep the one-stage atomic graph the
+        // scalar adapter authored, under this adapter's identity.
+        if streaming.asr_long_form {
+            return scalar_contract(
+                self.execution_group_id,
+                self.model_instance_id,
+                self.adapter_instance_id(),
+                self.adapter_abi_revision(),
+                metadata,
+                self.backend_kind,
+                1,
+                streaming,
+            );
+        }
+        let width = u64::try_from(self.max_batch_size)
+            .map_err(|_| Error::Overloaded("Nemotron batch width exceeds u64".into()))?;
+        let workspace_per_row =
+            crate::models::architectures::nemotron::asr::NEMOTRON_RETAINED_WORKSPACE_PER_ROW_BYTES;
+        let batch_workspace = workspace_per_row
+            .checked_mul(width)
+            .ok_or_else(|| Error::Overloaded("Nemotron batch workspace overflowed".into()))?;
+        let decode_width = u64::try_from(self.decode_batch_size)
+            .map_err(|_| Error::Overloaded("Nemotron decode width exceeds u64".into()))?;
+        let decode_workspace = workspace_per_row
+            .checked_mul(decode_width)
+            .ok_or_else(|| Error::Overloaded("Nemotron decode workspace overflowed".into()))?;
+
+        let mut profile = scalar_execution_profile(metadata, self.backend_kind);
+        profile.mode = ExecutionMode::Sequence;
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        profile.prefill_batch = NativeBatchMode::Static;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        // The rollback-safe predictor state is retained by the exact
+        // executor session; it has no attention pages or managed KV runtime.
+        profile.cache_mode = CacheMode::None;
+        profile.cache_namespace = None;
+        profile.kv_dtype = "none".into();
+        profile.cancellation = CancellationGranularity::SequenceStep;
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.recompute_safe = true;
+        profile.cache_release_safe = true;
+        profile.prefix_reuse_safe = false;
+        profile.max_batch_size = self.decode_batch_size;
+        profile.resolved_from_loaded_model = true;
+
+        // Concurrent clips encode as one padded batch of up to the engine's
+        // width (`NemotronEncoderBatcher`), each row with its own budget.
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            crate::models::architectures::nemotron::asr::NEMOTRON_ENCODER_STAGE,
+            &profile,
+            NativeBatchMode::Static,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.max_batch_size = self.max_batch_size;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
+        preparation.max_work_units = NEMOTRON_PREPARATION_ROW_WORK_UNITS
+            .checked_mul(width)
+            .ok_or_else(|| Error::Overloaded("Nemotron preparation work overflowed".into()))?;
+        preparation.max_workspace_bytes = NEMOTRON_PREPARATION_ROW_WORKSPACE_BYTES
+            .checked_mul(width)
+            .ok_or_else(|| Error::Overloaded("Nemotron preparation workspace overflowed".into()))?;
+        preparation.shape_policy = StageShapePolicy::Padded;
+        preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        let selection = ClockedStateSelection::new(
+            crate::models::architectures::nemotron::asr::NEMOTRON_OFFLINE_GROUP,
+            StateClock::DecoderTokens,
+        )?;
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            crate::models::architectures::nemotron::asr::NEMOTRON_RETAINED_PREFILL_STAGE,
+            &profile,
+            NativeBatchMode::Static,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.max_batch_size = self.max_batch_size;
+        prefill.progress = StageProgressKind::Iterative;
+        prefill.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        prefill.max_work_units = width;
+        prefill.workspace_per_row_bytes = workspace_per_row;
+        prefill.max_workspace_bytes = batch_workspace;
+        prefill.shape_policy = StageShapePolicy::Ragged;
+        prefill.max_padding_basis_points = 0;
+        prefill.retained_state_selections = Some(vec![selection.clone()]);
+        prefill.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            crate::models::architectures::nemotron::asr::NEMOTRON_RETAINED_DECODE_STAGE,
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.progress = StageProgressKind::Iterative;
+        decode.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        decode.max_work_units = decode_width;
+        decode.workspace_per_row_bytes = workspace_per_row;
+        decode.max_workspace_bytes = decode_workspace;
+        decode.shape_policy = StageShapePolicy::Ragged;
+        decode.max_padding_basis_points = 0;
+        decode.retained_state_selections = Some(vec![selection]);
+        decode.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        preparation.validate()?;
+        prefill.validate()?;
+        decode.validate()?;
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id(),
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata,
+            execution_profile: profile,
+            stages: Arc::from([preparation, prefill, decode]),
+        })
+    }
+}
+
+/// Tokens a Voxtral offline prompt prefill may hold: far above the
+/// published 39-token transcription prompt.
+const VOXTRAL_OFFLINE_PREFILL_WORK_UNITS: u64 = 1_024;
+/// Workspace of one Voxtral prompt prefill: the prompt's F32 logits over the
+/// 131,072-token vocabulary (20 MiB at 39 tokens) and its activations.
+pub(crate) const VOXTRAL_OFFLINE_PREFILL_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
+/// Workspace of one Voxtral decode row: its F32 logits row (0.5 MiB) and
+/// one token's activations through the language model.
+pub(crate) const VOXTRAL_OFFLINE_DECODE_ROW_WORKSPACE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Voxtral Mini 4B Realtime offline transcription. Audio within the realtime
+/// session ceiling runs as a closed realtime stream: its whole audio is
+/// prepared once (width 1, encoder and adapter), its prompt prefills alone
+/// and its frames decode one per step, batched across rows, on the retained
+/// pages realtime sessions use. Longer audio and pipelines
+/// (`streaming.asr_long_form`) keep the one-stage atomic graph, which leases
+/// the language model's pages per invocation.
+#[derive(Debug)]
+pub(super) struct VoxtralAsrExecutionAdapter {
+    pub(super) execution_group_id: ExecutionGroupId,
+    pub(super) model_instance_id: ModelInstanceId,
+    pub(super) adapter_instance_id: AdapterInstanceId,
+    pub(super) metadata: AdapterMetadata,
+    pub(super) backend_kind: BackendKind,
+    /// The continuous decode's width.
+    pub(super) decode_batch_size: usize,
+    pub(super) preparation: OnceLock<
+        crate::models::architectures::voxtral::realtime::VoxtralRealtimePreparationStageSeal,
+    >,
+}
+
+impl VoxtralAsrExecutionAdapter {
+    pub(super) fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        max_batch_size: usize,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            decode_batch_size: max_batch_size.max(1),
+            preparation: OnceLock::new(),
+        }
+    }
+
+    /// Decode up to `rows` rows per step, never fewer than the engine rows.
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.decode_batch_size);
+        self
+    }
+
+    pub(super) fn install_preparation_seal(
+        &self,
+        seal: crate::models::architectures::voxtral::realtime::VoxtralRealtimePreparationStageSeal,
+    ) -> Result<()> {
+        if let Some(existing) = self.preparation.get() {
+            return if existing == &seal {
+                Ok(())
+            } else {
+                Err(Error::ModelLoadError(
+                    "Voxtral offline preparation was resealed with different geometry".into(),
+                ))
+            };
+        }
+        self.preparation.set(seal).map_err(|_| {
+            Error::ModelLoadError("Voxtral offline preparation seal raced publication".into())
+        })
+    }
+}
+
+impl LoadedExecutionAdapter for VoxtralAsrExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        VOXTRAL_ASR_ADAPTER_ABI
+    }
+
+    fn seal_voxtral_realtime_preparation(
+        &self,
+        model: &crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel,
+    ) -> Result<()> {
+        self.install_preparation_seal(model.realtime_preparation_stage_seal()?)
+    }
+
+    #[cfg(test)]
+    fn install_test_preparation_seal(
+        &self,
+        _backend: BackendKind,
+        _max_batch_size: usize,
+    ) -> Result<()> {
+        self.install_preparation_seal(
+            crate::models::architectures::voxtral::realtime::VoxtralRealtimePreparationStageSeal {
+                max_source_samples: 480_000,
+                max_work_units: 480_000,
+                max_materialized_tensor_elements_per_row: 1_000_000,
+                max_workspace_bytes: 4_000_000,
+            },
+        )
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        let metadata = self.metadata();
+        if streaming.model_native && metadata.streaming_mode == StreamingMode::None {
+            return Err(Error::InvalidInput(format!(
+                "Model {} has no streaming ASR contract",
+                metadata.model_variant
+            )));
+        }
+        // Long audio and pipelines run one exclusive atomic invocation that
+        // leases the language model's pages and chunks long audio inside it.
+        if streaming.asr_long_form {
+            let mut profile = scalar_execution_profile(metadata, self.backend_kind);
+            profile.mode = ExecutionMode::Atomic;
+            profile.prefill = PrefillMode::None;
+            profile.incremental_decode = false;
+            profile.prefill_batch = NativeBatchMode::None;
+            profile.decode_batch = NativeBatchMode::None;
+            profile.cache_mode = CacheMode::None;
+            profile.cache_namespace = None;
+            profile.kv_dtype = "none".into();
+            profile.cancellation = CancellationGranularity::OperationBoundary;
+            profile.concurrency = ConcurrencyClass::Exclusive;
+            profile.recompute_safe = false;
+            profile.cache_release_safe = false;
+            profile.prefix_reuse_safe = false;
+            profile.max_batch_size = 1;
+            profile.resolved_from_loaded_model = true;
+            let mut stage = StageDescriptor::from_execution_profile(
+                StageId::new(3),
+                "asr.long_form.voxtral.atomic",
+                &profile,
+                NativeBatchMode::None,
+            );
+            stage.selector = StageWorkSelector::Atomic;
+            stage.shape_policy = StageShapePolicy::Exact;
+            stage.output_visibility = output_visibility_for(
+                streaming.transport_output,
+                profile.mode,
+                NativeBatchMode::None,
+            );
+            stage.validate()?;
+            return Ok(LoadedExecutionContract {
+                execution_group_id: self.execution_group_id,
+                model_instance_id: self.model_instance_id,
+                adapter_instance_id: self.adapter_instance_id(),
+                adapter_abi_revision: self.adapter_abi_revision(),
+                metadata,
+                execution_profile: profile,
+                stages: Arc::from([stage]),
+            });
+        }
+        let seal = self.preparation.get().ok_or_else(|| {
+            Error::ModelLoadError(
+                "Voxtral offline row graph is unavailable before preparation geometry is sealed"
+                    .into(),
+            )
+        })?;
+        if seal.max_source_samples == 0 || seal.max_work_units == 0 || seal.max_workspace_bytes == 0
+        {
+            return Err(Error::ModelLoadError(
+                "Voxtral offline preparation seal is not finite and positive".into(),
+            ));
+        }
+        let decode_width = u64::try_from(self.decode_batch_size)
+            .map_err(|_| Error::Overloaded("Voxtral decode width exceeds u64".into()))?;
+
+        let mut profile = scalar_execution_profile(metadata, self.backend_kind);
+        profile.mode = ExecutionMode::Sequence;
+        profile.prefill = PrefillMode::Full;
+        profile.incremental_decode = true;
+        profile.prefill_batch = NativeBatchMode::None;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.cache_namespace = Some(format!(
+            "{}:asr:{}:voxtral-offline-state-v2",
+            metadata.model_variant,
+            self.backend_kind.as_str()
+        ));
+        profile.kv_dtype = "state_v2_resolved".into();
+        profile.cancellation = CancellationGranularity::SequenceStep;
+        profile.concurrency = ConcurrencyClass::Batchable;
+        // A row's state is rebuilt from its prepared audio only at its
+        // prefill; it is never recomputed from a cursor.
+        profile.recompute_safe = false;
+        profile.cache_release_safe = true;
+        profile.prefix_reuse_safe = false;
+        profile.max_batch_size = self.decode_batch_size;
+        profile.resolved_from_loaded_model = true;
+
+        // The encoder runs alone: its ragged batch path attends with an
+        // eager masked softmax, quadratic in the frames, and the decode
+        // dominates a request anyway. Each row prices its own encoder
+        // workspace (`voxtral_offline_preparation_cost`), so the stage adds
+        // no fixed per-row term: the sealed maximum, the workspace of the
+        // longest row the stage admits, bounds that price alone.
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            crate::models::architectures::voxtral::VOXTRAL_OFFLINE_PREPARATION_STAGE,
+            &profile,
+            NativeBatchMode::None,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
+        preparation.max_batch_size = 1;
+        preparation.concurrency = ConcurrencyClass::Exclusive;
+        preparation.shape_policy = StageShapePolicy::Exact;
+        preparation.max_work_units = seal.max_work_units;
+        preparation.workspace_per_row_bytes = 0;
+        preparation.max_workspace_bytes = seal.max_workspace_bytes;
+
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            crate::models::architectures::voxtral::VOXTRAL_OFFLINE_PREFILL_STAGE,
+            &profile,
+            NativeBatchMode::None,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.max_batch_size = 1;
+        prefill.concurrency = ConcurrencyClass::Exclusive;
+        prefill.shape_policy = StageShapePolicy::Exact;
+        prefill.max_work_units = VOXTRAL_OFFLINE_PREFILL_WORK_UNITS;
+        prefill.workspace_per_row_bytes = VOXTRAL_OFFLINE_PREFILL_WORKSPACE_BYTES;
+        prefill.max_workspace_bytes = VOXTRAL_OFFLINE_PREFILL_WORKSPACE_BYTES;
+
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            crate::models::architectures::voxtral::VOXTRAL_OFFLINE_DECODE_STAGE,
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.progress = StageProgressKind::Iterative;
+        decode.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        decode.max_work_units = decode_width;
+        decode.workspace_per_row_bytes = VOXTRAL_OFFLINE_DECODE_ROW_WORKSPACE_BYTES;
+        decode.max_workspace_bytes = VOXTRAL_OFFLINE_DECODE_ROW_WORKSPACE_BYTES
+            .checked_mul(decode_width)
+            .ok_or_else(|| Error::Overloaded("Voxtral decode workspace overflowed".into()))?;
+        decode.shape_policy = StageShapePolicy::Ragged;
+        decode.max_padding_basis_points = 0;
+
+        // Every quantum's text and pages publish when Core commits it.
+        for stage in [&mut preparation, &mut prefill, &mut decode] {
+            stage.output_visibility = OutputVisibility::AfterQuantumCommit;
+            stage.validate()?;
+        }
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id(),
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata,
+            execution_profile: profile,
+            stages: Arc::from([preparation, prefill, decode]),
+        })
+    }
+}
+
+/// The cost of one offline Voxtral preparation row: its stable audio frames
+/// as work, and its own encoder workspace (`VoxtralRealtimeModel::
+/// offline_preparation_bytes`) in the backend's memory domain. The stage adds
+/// nothing per row, so this workspace is what the stage maximum bounds.
+pub(crate) fn voxtral_offline_preparation_cost(
+    backend: BackendKind,
+    frames: usize,
+    workspace_bytes: u64,
+) -> Result<crate::engine::WorkCost> {
+    use crate::engine::{ResourceAmount, ResourceVector};
+    let units = u64::try_from(frames)
+        .map_err(|_| Error::Overloaded("Voxtral preparation frames exceed u64".into()))?;
+    let mut workspace = ResourceVector::zero();
+    let bytes = ResourceAmount::Known(workspace_bytes);
+    match backend {
+        BackendKind::Cpu => workspace.host_bytes = bytes,
+        BackendKind::Metal => workspace.unified_bytes = bytes,
+        BackendKind::Cuda => workspace.device_bytes = bytes,
+    }
+    Ok(crate::engine::WorkCost::with_workspace(
+        units, units, workspace,
+    ))
 }
 
 /// LFM3-Audio transcription. A clip of at most 30 s runs as a retained row

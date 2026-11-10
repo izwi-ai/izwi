@@ -13,13 +13,21 @@
 //! chat, keep the portable width of two they have always been served at,
 //! except Fish Audio Drama 3, whose rows start at one on CPU and Metal.
 //!
-//! On CUDA the engine and every capability but chat run the automatic eight.
-//! Chat's automatic width there is the CUDA ceiling, clamped per family:
-//! Qwen3.5, Qwen3.6, Qwen3.8, LFM2 and LFM3 batch every row's recurrent and
-//! conv state in one launch per layer (one launch per row before), and
-//! Qwen3.6 and Qwen3.8 run their block-FP8 projections on tensor-core kernels
-//! whose cost barely grows with the rows, so their steps stay cheap past
-//! eight rows and they take the ceiling; every other family keeps eight.
+//! On CUDA the engine and every capability but chat and ASR decode run the
+//! automatic eight. Chat's automatic width there is the CUDA ceiling,
+//! clamped per family: Qwen3.5, Qwen3.6, Qwen3.8, LFM2 and LFM3 batch every
+//! row's recurrent and conv state in one launch per layer (one launch per row
+//! before), and Qwen3.6 and Qwen3.8 run their block-FP8 projections on
+//! tensor-core kernels whose cost barely grows with the rows, so their steps
+//! stay cheap past eight rows and they take the ceiling; every other family
+//! keeps eight. ASR decode takes the same ceiling for the families whose
+//! continuous decode steps every row in one launch per op (Qwen3-ASR and
+//! VibeVoice-ASR through the Qwen3 core, Parakeet's TDT and Nemotron ASR's
+//! RNNT joints, Whisper's decoder with one cross-attention call per layer,
+//! Voxtral's offline rows and Granite Speech 4.1's and 5.0's retained
+//! rows);
+//! their encoders, preparation and prefill stay at the engine rows, and each
+//! load fits the width to its memory.
 
 use super::ModelFamily;
 use crate::backends::BackendKind;
@@ -46,6 +54,11 @@ pub(crate) const CUDA_DEFAULT_WIDTH: usize = 8;
 /// | Qwen3.6, Qwen3.8 | 2 | 2 | 32 | H100 greedy parity and serving matrix (support matrix) |
 /// | Qwen3, Qwen3-MoE, Gemma3 | 2 | 2 | 8 | No checkpoint measured |
 /// | Fish Audio Drama 3 (TTS) | 1 | 1 | 8 | Defaults until its row-invariance and throughput evidence |
+/// | Qwen3-ASR, VibeVoice-ASR, Parakeet, Nemotron ASR (decode only) | 2 | 2 | 32 | Unmeasured past 8. H100 (`e8f189691`): Qwen3-ASR and VibeVoice-ASR scaled 2.4–2.9x from 1 to 8 streams, then stayed flat at the width (Qwen3-ASR ~82 audio-s/s); each decode step runs all rows per launch |
+/// | Whisper (decode only) | 2 | 2 | 32 | Unmeasured. Its ~316 MB decoder was launch-bound at one row per step; rows now share each launch, one flash-attention call per layer for cross attention, and a row decodes the same alone as beside others (CPU tiny-model parity test) |
+/// | Granite Speech 4.1 (decode only) | 2 | 2 | 32 | Unmeasured past one row. Each request held the device for its whole decode; retained rows now step together (one token upload, one RoPE gather, one paged append and attention per layer, one argmax readback for every row), and the real 2B Plus checkpoint emits the atomic route's tokens through spans, scalar steps and a two-row batch on CPU and Metal (`granite_speech_retained_decode_matches_atomic_on_*`) |
+/// | Granite Speech 5.0 (decode only) | 2 | 2 | 32 | Unmeasured past one row. Each request held the device for its whole decode on a 16k-token KV lease; retained rows now step together (one token upload, one RoPE gather, one paged append and attention per layer, one argmax readback for every row), a row decodes bit-identically alone and beside others on the CPU, and the real GGUF checkpoint emits the atomic route's tokens through spans, scalar steps and a three-row batch on Metal (`granite_speech5_retained_decode_matches_atomic_on_metal`) |
+/// | Voxtral (offline decode only) | 2 | 2 | 32 | Unmeasured past one row. H100: an offline request held the device for its whole decode (about 6.3 ms a frame), 9.6 audio-s/s flat from 1 to 32 streams; offline rows now step together (one token upload, LM forward and argmax readback for every row), and a row emits the same alone as beside others (CPU tiny-model test) |
 ///
 /// Qwen3.5 on the CPU gained nothing past two rows in a repeated run, so it
 /// stays at two. Metal's LFM2 small-batch mat-vec serves 2..=8 rows, which
@@ -61,7 +74,15 @@ pub(crate) const fn certified_decode_width(family: ModelFamily, backend: Backend
             | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
-            | ModelFamily::Lfm3Chat,
+            | ModelFamily::Lfm3Chat
+            | ModelFamily::Qwen3Asr
+            | ModelFamily::VibeVoiceAsr
+            | ModelFamily::ParakeetAsr
+            | ModelFamily::NemotronAsr
+            | ModelFamily::WhisperAsr
+            | ModelFamily::Voxtral
+            | ModelFamily::GraniteSpeechAsr
+            | ModelFamily::GraniteSpeech5Asr,
         ) => CUDA_MAX_WIDTH,
         (BackendKind::Cuda, _) => CUDA_DEFAULT_WIDTH,
         (BackendKind::Cpu | BackendKind::Metal, ModelFamily::Lfm2Chat | ModelFamily::Lfm3Chat)
@@ -99,6 +120,110 @@ pub(crate) const fn chat_engine_width(
         BackendKind::Cuda if automatic => CUDA_MAX_WIDTH,
         _ => tensor_width,
     }
+}
+
+/// The engine width ASR decode clamps to its family's certified width: on
+/// CUDA with no width fixed (`IZWI_MAX_BATCH_SIZE` or `max_num_seqs`) the
+/// CUDA ceiling, otherwise the non-chat rows.
+pub(crate) const fn asr_engine_width(
+    backend: BackendKind,
+    non_chat_width: usize,
+    automatic: bool,
+) -> usize {
+    match backend {
+        BackendKind::Cuda if automatic => CUDA_MAX_WIDTH,
+        _ => non_chat_width,
+    }
+}
+
+/// The continuous decode width an ASR model of `family` loads with before
+/// its memory fit: the ASR engine width clamped to the family's certified
+/// width, never below the non-chat rows its encoder and prefill run at (an
+/// explicit or `max_num_seqs` width therefore applies as it always has).
+pub(crate) const fn asr_decode_width(
+    family: ModelFamily,
+    backend: BackendKind,
+    non_chat_width: usize,
+    asr_engine_width: usize,
+) -> usize {
+    let certified = certified_decode_width(family, backend);
+    let widened = if asr_engine_width < certified {
+        asr_engine_width
+    } else {
+        certified
+    };
+    if widened > non_chat_width {
+        widened
+    } else {
+        non_chat_width
+    }
+}
+
+/// The continuous decode width a TTS model of `family` loads with: the TTS
+/// engine width (the CUDA ceiling when no width is fixed) for the families
+/// whose decode steps every row in one launch per op on CUDA, padded to one
+/// row-invariant shape so a request sounds the same at any width (Qwen3-TTS's
+/// talker and code predictor, Maya1's and Maya 2's backbones and Maya 2's
+/// depth groups, Chatterbox's T3, Voxtral TTS's LM feedback and acoustic
+/// flow); the non-chat rows for every other family and backend. Never below
+/// the non-chat rows.
+///
+/// H100 (`e8f189691`): every Qwen3-TTS variant stayed at ~5 audio-s/s from 8
+/// to 64 streams, the width of eight; Maya 2 at ~5.2 from 16 streams.
+pub(crate) const fn tts_decode_width(
+    family: ModelFamily,
+    backend: BackendKind,
+    non_chat_width: usize,
+    tts_engine_width: usize,
+) -> usize {
+    let certified = match (backend, family) {
+        (
+            BackendKind::Cuda,
+            ModelFamily::Qwen3Tts
+            | ModelFamily::Maya1Tts
+            | ModelFamily::Maya2Tts
+            | ModelFamily::ChatterboxTts
+            | ModelFamily::VoxtralTts,
+        ) => CUDA_MAX_WIDTH,
+        _ => non_chat_width,
+    };
+    let widened = if tts_engine_width < certified {
+        tts_engine_width
+    } else {
+        certified
+    };
+    if widened > non_chat_width {
+        widened
+    } else {
+        non_chat_width
+    }
+}
+
+/// Widths a load fits an ASR decode wider than the engine rows to, widest
+/// first.
+const ASR_FIT_WIDTHS: [usize; 3] = [CUDA_MAX_WIDTH, 16, CUDA_DEFAULT_WIDTH];
+
+/// The widest of 32, 16 and 8 rows, at most `ceiling` and above `floor`,
+/// whose rows of `per_row_bytes` take at most half of `headroom_bytes` (the
+/// planning headroom left after the model's resident weights); `floor`, the
+/// rows the model ran at before, when none does. The other half stays free
+/// for the encoder, prefill and request workspace and for other models.
+pub(crate) fn fit_asr_decode_width(
+    ceiling: usize,
+    floor: usize,
+    per_row_bytes: u64,
+    headroom_bytes: u64,
+) -> usize {
+    let budget = headroom_bytes / 2;
+    ASR_FIT_WIDTHS
+        .into_iter()
+        .filter(|width| *width <= ceiling && *width > floor)
+        .find(|width| {
+            (*width as u64)
+                .checked_mul(per_row_bytes)
+                .is_some_and(|bytes| bytes <= budget)
+        })
+        .unwrap_or(floor)
 }
 
 /// The rows every capability but chat runs at: the certified engine rows,
@@ -206,6 +331,129 @@ mod tests {
         assert_eq!(chat_engine_width(BackendKind::Cuda, 16, false), 16);
         assert_eq!(chat_engine_width(BackendKind::Metal, 8, true), 8);
         assert_eq!(chat_engine_width(BackendKind::Cpu, 8, true), 8);
+    }
+
+    /// The eight ASR families whose decode steps every row per launch take
+    /// the CUDA ceiling; every other speech family keeps the engine rows, and
+    /// none changes on CPU or Metal.
+    #[test]
+    fn batched_asr_decode_families_take_the_cuda_ceiling() {
+        const WIDE: [ModelFamily; 8] = [
+            ModelFamily::Qwen3Asr,
+            ModelFamily::VibeVoiceAsr,
+            ModelFamily::ParakeetAsr,
+            ModelFamily::NemotronAsr,
+            ModelFamily::WhisperAsr,
+            ModelFamily::Voxtral,
+            ModelFamily::GraniteSpeechAsr,
+            ModelFamily::GraniteSpeech5Asr,
+        ];
+        for family in WIDE {
+            assert_eq!(
+                certified_decode_width(family, BackendKind::Cuda),
+                CUDA_MAX_WIDTH,
+                "{family:?}"
+            );
+            for backend in [BackendKind::Cpu, BackendKind::Metal] {
+                assert_eq!(
+                    certified_decode_width(family, backend),
+                    PORTABLE_BASELINE_WIDTH,
+                    "{family:?} {backend:?}"
+                );
+            }
+        }
+        for family in [
+            ModelFamily::NemotronTranscribeAsr,
+            ModelFamily::Lfm25Audio,
+            ModelFamily::Lfm3Audio,
+            ModelFamily::Qwen3Tts,
+        ] {
+            assert_eq!(
+                certified_decode_width(family, BackendKind::Cuda),
+                CUDA_DEFAULT_WIDTH,
+                "{family:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn asr_decode_widens_only_on_automatic_cuda() {
+        let decode = |family, backend, non_chat, automatic| {
+            asr_decode_width(
+                family,
+                backend,
+                non_chat,
+                asr_engine_width(backend, non_chat, automatic),
+            )
+        };
+        // Automatic CUDA: certified families take the ceiling, the rest the
+        // engine rows.
+        assert_eq!(
+            decode(ModelFamily::Qwen3Asr, BackendKind::Cuda, 8, true),
+            CUDA_MAX_WIDTH
+        );
+        assert_eq!(
+            decode(ModelFamily::ParakeetAsr, BackendKind::Cuda, 8, true),
+            CUDA_MAX_WIDTH
+        );
+        assert_eq!(
+            decode(ModelFamily::WhisperAsr, BackendKind::Cuda, 8, true),
+            CUDA_MAX_WIDTH
+        );
+        assert_eq!(
+            decode(ModelFamily::GraniteSpeechAsr, BackendKind::Cuda, 8, true),
+            CUDA_MAX_WIDTH
+        );
+        assert_eq!(
+            decode(ModelFamily::GraniteSpeech5Asr, BackendKind::Cuda, 8, true),
+            CUDA_MAX_WIDTH
+        );
+        assert_eq!(
+            decode(
+                ModelFamily::NemotronTranscribeAsr,
+                BackendKind::Cuda,
+                8,
+                true
+            ),
+            8
+        );
+        // An explicit or `max_num_seqs` width applies as it always has, above
+        // or below a family's certified width.
+        for family in [ModelFamily::Qwen3Asr, ModelFamily::WhisperAsr] {
+            for width in [4, 16, 32] {
+                assert_eq!(decode(family, BackendKind::Cuda, width, false), width);
+            }
+        }
+        // CPU and Metal keep the portable rows (or an explicit width).
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            for family in [
+                ModelFamily::Qwen3Asr,
+                ModelFamily::NemotronAsr,
+                ModelFamily::WhisperAsr,
+            ] {
+                assert_eq!(decode(family, backend, 2, true), 2);
+                assert_eq!(decode(family, backend, 8, false), 8);
+            }
+        }
+    }
+
+    #[test]
+    fn asr_decode_fits_the_widest_width_half_the_headroom_holds() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // Qwen3-ASR 1.7B rows (about 149 MiB each).
+        let row = 149 * 1024 * 1024;
+        assert_eq!(fit_asr_decode_width(32, 8, row, 70 * GIB), 32);
+        assert_eq!(fit_asr_decode_width(32, 8, row, 6 * GIB), 16);
+        assert_eq!(fit_asr_decode_width(32, 8, row, 3 * GIB), 8);
+        // Below even the floor's rows the model keeps the rows it ran at.
+        assert_eq!(fit_asr_decode_width(32, 8, row, GIB), 8);
+        assert_eq!(fit_asr_decode_width(32, 8, row, 0), 8);
+        // The fit never exceeds the ceiling, and never drops below a floor
+        // that is not one of its widths.
+        assert_eq!(fit_asr_decode_width(16, 8, row, 70 * GIB), 16);
+        assert_eq!(fit_asr_decode_width(32, 12, row, 3 * GIB), 12);
+        assert_eq!(fit_asr_decode_width(8, 8, row, 70 * GIB), 8);
+        assert_eq!(fit_asr_decode_width(32, 8, u64::MAX, u64::MAX), 8);
     }
 
     #[test]

@@ -18,6 +18,23 @@ pub struct GraniteSpeechAudioFeatures {
     pub input_features: Vec<Vec<f32>>,
 }
 
+impl GraniteSpeechAudioFeatures {
+    /// Host bytes the features hold: the resampled samples, the log-mel and
+    /// the stacked encoder input.
+    pub fn host_bytes(&self) -> Option<u64> {
+        let rows = |rows: &[Vec<f32>]| {
+            rows.iter()
+                .try_fold(0usize, |total, row| total.checked_add(row.len()))
+        };
+        let elements = self
+            .samples
+            .len()
+            .checked_add(rows(&self.log_mel)?)?
+            .checked_add(rows(&self.input_features)?)?;
+        u64::try_from(elements.checked_mul(std::mem::size_of::<f32>())?).ok()
+    }
+}
+
 pub struct GraniteSpeechPreprocessor {
     config: GraniteSpeechProcessorConfig,
     mel: MelSpectrogram,
@@ -159,5 +176,18 @@ mod tests {
         assert_eq!(features.encoder_dim, 160);
         assert_eq!(features.encoder_frames, features.log_mel.len() / 2);
         assert_eq!(features.projected_frames_hint % 3, 0);
+    }
+
+    /// A request's features are priced as every buffer they hold, which
+    /// preparation keeps until the encoder batch reads them.
+    #[test]
+    fn features_price_the_samples_log_mel_and_stacked_input() {
+        let preprocessor = GraniteSpeechPreprocessor::new(test_processor()).unwrap();
+        let features = preprocessor.prepare(&vec![0.1f32; 8_000], 8_000).unwrap();
+        let elements = features.samples.len()
+            + features.log_mel.iter().map(Vec::len).sum::<usize>()
+            + features.input_features.iter().map(Vec::len).sum::<usize>();
+        assert_eq!(features.host_bytes(), Some((elements * 4) as u64));
+        assert!(features.host_bytes().unwrap() > 16_000 * 4);
     }
 }

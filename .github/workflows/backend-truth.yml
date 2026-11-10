@@ -88,11 +88,13 @@ jobs:
   cargo-cpu:
     name: Cargo Validation (CPU)
     runs-on: ubuntu-latest
-    # Like the other cargo lanes. The full izwi-core suite, the KV matrix
-    # and the five-minute KV soak take 18-27 minutes on a warm dependency
-    # cache and over 30 on a cold one (a new cache key). A timed-out job
-    # saves no cache, so a tighter limit leaves every later run cold too.
-    timeout-minutes: 45
+    # The full izwi-core suite, the izwi-server suite, the KV matrix and the
+    # five-minute KV soak took 30-43 minutes on main; with the CUDA ASR and
+    # TTS serving tests the core suite alone runs 21 minutes and the lane
+    # 45 (a green run at 44m53s, then a cancel at the 45-minute limit). A
+    # timed-out job saves no cache, so a tight limit leaves every later run
+    # cold too.
+    timeout-minutes: 60
 
     steps:
       - name: Checkout

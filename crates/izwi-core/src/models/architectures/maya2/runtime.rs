@@ -19,11 +19,15 @@ use super::ecapa::Maya2Ecapa;
 use super::guards::{piece_budget, suspend_windows, LoopGuard, Maya2PieceBudget, Maya2StopReason};
 use super::inputs::Maya2Inputs;
 use super::prompt::{Maya2Prompt, Maya2Reference, Maya2Tokenizer};
-use super::sampling::{depth_gumbel, sample_cb0, Cb0State, Maya2SamplingParams};
+use super::sampling::{
+    depth_gumbel, depth_noise_key, device_noise, sample_cb0, Cb0State, Maya2SamplingParams,
+};
 use super::weights::mmap_release;
+use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::codecs::mimi::{self, MimiDecoder, MimiEncoder};
+use crate::models::shared::codecs::reduced_precision::{self, CodecPrecision};
 use crate::models::shared::noise::SplitMix64;
 
 /// Independent random streams of one request.
@@ -106,6 +110,8 @@ pub struct Maya2Runtime {
     inputs: Maya2Inputs,
     depth: Maya2Depth,
     mimi: MimiDecoder,
+    /// What Mimi's SEANet decoder runs in, and why.
+    mimi_precision: CodecPrecision,
     /// Loaded on first use: only clone references need them.
     mimi_encoder: Mutex<Option<Arc<MimiEncoder>>>,
     ecapa: Mutex<Option<Arc<Maya2Ecapa>>>,
@@ -178,6 +184,7 @@ impl Maya2Runtime {
             mimi,
             mimi_encoder: Mutex::new(None),
             ecapa: Mutex::new(None),
+            mimi_precision: CodecPrecision::f32(false, "F32"),
             device: device.clone(),
         })
     }
@@ -200,6 +207,45 @@ impl Maya2Runtime {
 
     pub fn depth(&self) -> &Maya2Depth {
         &self.depth
+    }
+
+    /// Resolves the depth decoder's CUDA frame graphs for this runtime's
+    /// backbone hidden dtype and the depth policy (see
+    /// [`Maya2Depth::resolve_graphs`]).
+    pub(crate) fn resolve_depth_graphs(&mut self) {
+        let dtype = self.backbone.dtype();
+        self.depth.resolve_graphs(
+            dtype,
+            MAYA2_DEFAULTS.depth_temperature,
+            MAYA2_DEFAULTS.depth_top_k,
+        );
+    }
+
+    /// Runs Mimi's SEANet decoder in BF16 on CUDA when an operator asked
+    /// for it ([`MAYA2_MIMI_BF16_ENV`]) and its load-time check against F32
+    /// keeps it ([`MimiDecoder::try_seanet_dtype`]); otherwise F32.
+    pub(crate) fn resolve_mimi_precision(&mut self) {
+        let requested = maya2_mimi_bf16_requested();
+        self.mimi_precision = if !requested {
+            CodecPrecision::f32(false, format!("F32 ({MAYA2_MIMI_BF16_ENV} is off)"))
+        } else if !self.device.is_cuda() {
+            CodecPrecision::f32(true, "a BF16 Mimi decoder runs on CUDA only")
+        } else {
+            let precision = self
+                .mimi
+                .try_seanet_dtype(DType::BF16, reduced_precision::MAX_REL_L2);
+            if precision.dtype == DType::BF16 {
+                tracing::info!(reason = %precision.reason, "Maya2's Mimi SEANet runs in BF16");
+            } else {
+                tracing::warn!(reason = %precision.reason, "Maya2's Mimi SEANet stays F32");
+            }
+            precision
+        };
+    }
+
+    /// What Mimi's SEANet decoder runs in, and why.
+    pub(crate) fn mimi_precision(&self) -> &CodecPrecision {
+        &self.mimi_precision
     }
 
     pub fn mimi(&self) -> &MimiDecoder {
@@ -358,21 +404,29 @@ impl Maya2Runtime {
             if let Some(reason) = draw.stop {
                 break reason;
             }
-            let gumbel = depth_gumbel(
-                &mut [&mut depth_rng],
-                DEPTH_LEVELS,
-                CODEBOOK_SIZE,
-                &self.device,
-            )?;
+            // As the engine's decode steps draw it (`retained`).
             let cb0 = Tensor::new(&[draw.code], &self.device)?;
-            let frame = self.depth.generate_frame(
-                &hidden,
-                &cb0,
-                &cross,
-                &gumbel,
-                MAYA2_DEFAULTS.depth_temperature,
-                MAYA2_DEFAULTS.depth_top_k,
-            )?;
+            let (temperature, top_k) =
+                (MAYA2_DEFAULTS.depth_temperature, MAYA2_DEFAULTS.depth_top_k);
+            let frame = if device_noise(&self.device) {
+                self.depth.generate_frame_keyed(
+                    &hidden,
+                    &cb0,
+                    &cross,
+                    &[depth_noise_key(params.seed, frames)],
+                    temperature,
+                    top_k,
+                )?
+            } else {
+                let gumbel = depth_gumbel(
+                    &mut [&mut depth_rng],
+                    DEPTH_LEVELS,
+                    CODEBOOK_SIZE,
+                    &self.device,
+                )?;
+                self.depth
+                    .generate_frame(&hidden, &cb0, &cross, &gumbel, temperature, top_k)?
+            };
             codes.extend(frame.to_vec2::<u32>()?.remove(0));
             frames += 1;
             if frames >= budget.cap {
@@ -416,6 +470,27 @@ impl Maya2Runtime {
             lm_ms,
             codec_ms: codec_started.elapsed().as_secs_f32() * 1000.0,
         })
+    }
+}
+
+/// Opt-in for a BF16 Mimi SEANet decoder on CUDA (a boolean; off when
+/// unset).
+pub(crate) const MAYA2_MIMI_BF16_ENV: &str = "IZWI_MAYA2_MIMI_BF16";
+
+fn maya2_mimi_bf16_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(MAYA2_MIMI_BF16_ENV, false));
+    ON.get()
+}
+
+/// Device bytes a load on `backend` prices for the BF16 copy of Mimi's
+/// SEANet decoder (`elements` weights), built beside the F32 one for the
+/// load check: zero off CUDA or unless an operator asked for it.
+pub(crate) fn maya2_mimi_bf16_device_bytes(backend: BackendKind, elements: u64) -> u64 {
+    if backend == BackendKind::Cuda && maya2_mimi_bf16_requested() {
+        elements.saturating_mul(DType::BF16.size_in_bytes() as u64)
+    } else {
+        0
     }
 }
 
@@ -575,5 +650,29 @@ mod real_weight_tests {
              (80 ms of audio per frame)",
             per[0], per[1], per[2], per[3], per[4]
         );
+    }
+}
+
+#[cfg(test)]
+mod precision_tests {
+    use super::*;
+
+    /// Only a CUDA load that asks for a BF16 Mimi prices its copy.
+    #[test]
+    fn only_a_cuda_bf16_mimi_request_prices_the_copy() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(MAYA2_MIMI_BF16_ENV);
+        std::env::remove_var(MAYA2_MIMI_BF16_ENV);
+        let off = maya2_mimi_bf16_device_bytes(BackendKind::Cuda, 1_000);
+        std::env::set_var(MAYA2_MIMI_BF16_ENV, "true");
+        let cuda = maya2_mimi_bf16_device_bytes(BackendKind::Cuda, 1_000);
+        let cpu = maya2_mimi_bf16_device_bytes(BackendKind::Cpu, 1_000);
+        match previous {
+            Some(value) => std::env::set_var(MAYA2_MIMI_BF16_ENV, value),
+            None => std::env::remove_var(MAYA2_MIMI_BF16_ENV),
+        }
+        assert_eq!((off, cuda, cpu), (0, 2_000, 0));
     }
 }

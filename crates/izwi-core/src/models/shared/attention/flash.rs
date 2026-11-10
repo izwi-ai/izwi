@@ -461,7 +461,34 @@ pub fn try_fused_varlen_self_attention(
     head_dim: usize,
     causal: bool,
 ) -> Result<Option<Tensor>> {
-    if !q.device().is_cuda() {
+    try_fused_varlen_self_attention_with_options(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        max_seqlen,
+        head_dim,
+        causal,
+        CudaFlashAttentionOptions::default(),
+    )
+}
+
+/// [`try_fused_varlen_self_attention`] with a sliding window: every span
+/// attends within `options`' window, resolved as the dense helper resolves it
+/// (a causal span's right window is 0). ALiBi and softcap are not supported
+/// here and decline to the caller's fallback.
+#[allow(clippy::too_many_arguments)]
+pub fn try_fused_varlen_self_attention_with_options(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    cu_seqlens: &[u32],
+    max_seqlen: usize,
+    head_dim: usize,
+    causal: bool,
+    options: CudaFlashAttentionOptions<'_>,
+) -> Result<Option<Tensor>> {
+    if !q.device().is_cuda() || options.alibi_slopes.is_some() || options.softcap.is_some() {
         return Ok(None);
     }
 
@@ -499,9 +526,25 @@ pub fn try_fused_varlen_self_attention(
                     let k = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
                     let v = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
                     let seqlens = Tensor::new(cu_seqlens, device)?;
-                    candle_flash_attn::flash_attn_varlen(
-                        &q, &k, &v, &seqlens, &seqlens, max_seqlen, max_seqlen, scale, causal,
-                    )
+                    let (window_left, window_right) = cuda_flash_attention_window(causal, options);
+                    if (window_left, window_right) == (None, if causal { Some(0) } else { None }) {
+                        candle_flash_attn::flash_attn_varlen(
+                            &q, &k, &v, &seqlens, &seqlens, max_seqlen, max_seqlen, scale, causal,
+                        )
+                    } else {
+                        candle_flash_attn::flash_attn_varlen_windowed(
+                            &q,
+                            &k,
+                            &v,
+                            &seqlens,
+                            &seqlens,
+                            max_seqlen,
+                            max_seqlen,
+                            scale,
+                            window_left,
+                            window_right,
+                        )
+                    }
                 }));
                 match flash_result {
                     Ok(Ok(out)) => {
@@ -515,7 +558,7 @@ pub fn try_fused_varlen_self_attention(
                 }
             }
             #[cfg(not(feature = "flash-attn"))]
-            let _ = causal;
+            let _ = (causal, options);
         }
         CudaFlashAttentionDecision::Skip(reason) => {
             fallback_reason = reason;
@@ -884,6 +927,30 @@ mod tests {
             should_try_metal_sdpa(&q, &k, &v, None, true).unwrap(),
             MetalSdpaDecision::Try
         ));
+    }
+
+    /// The Qwen3-ASR audio tower's attention windows (head_dim 64: 896/14
+    /// and 1024/16) take FlashAttention-2 on an H100 once the GGUF tower runs
+    /// in BF16 on CUDA, and fell back to the eager per-window loop in F32.
+    #[test]
+    fn qwen3_asr_audio_windows_take_flash_attention_only_below_f32() {
+        let decide = |dtype| {
+            should_try_cuda_flash_attention(
+                true,
+                true,
+                false,
+                64,
+                dtype,
+                dtype,
+                dtype,
+                Some((9, 0)),
+            )
+        };
+        assert_eq!(decide(DType::BF16), CudaFlashAttentionDecision::Try);
+        assert_eq!(
+            decide(DType::F32),
+            CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashDTypeUnsupported)
+        );
     }
 
     #[test]

@@ -889,10 +889,12 @@ pub(crate) async fn generate_long_form_stream(
         return runtime.generate_streaming(segments.remove(0), output).await;
     }
     let runtime = runtime.clone();
+    let lookahead = long_form_segment_concurrency(&runtime);
     stream_segments(
         segments,
         &request.id,
         fallback_sample_rate,
+        lookahead,
         output,
         move |segment, sender| {
             let runtime = runtime.clone();
@@ -902,15 +904,55 @@ pub(crate) async fn generate_long_form_stream(
     .await
 }
 
+/// One streamed segment started ahead of its turn: its generation task and
+/// a relay that drains the segment's chunks into an unbounded queue, so a
+/// segment waiting for the ones before it never holds up the engine's
+/// delivery. Dropping it aborts both.
+struct StartedSegment {
+    task: tokio::task::JoinHandle<Result<(), izwi_core::Error>>,
+    chunks: tokio::sync::mpsc::UnboundedReceiver<izwi_core::AudioChunk>,
+    _abort: [AbortSpeechTask; 2],
+}
+
+fn start_segment<F, Fut>(segment: GenerationRequest, generate: &F) -> StartedSegment
+where
+    F: Fn(GenerationRequest, tokio::sync::mpsc::Sender<izwi_core::AudioChunk>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), izwi_core::Error>> + Send + 'static,
+{
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
+    let (queue, chunks) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(generate(segment, sender));
+    let relay = tokio::spawn(async move {
+        while let Some(chunk) = receiver.recv().await {
+            if queue.send(chunk).is_err() {
+                break;
+            }
+        }
+    });
+    StartedSegment {
+        _abort: [
+            AbortSpeechTask(task.abort_handle()),
+            AbortSpeechTask(relay.abort_handle()),
+        ],
+        task,
+        chunks,
+    }
+}
+
 /// Forward each segment's chunks as one utterance's: renumbered under
 /// `request_id`, a later segment opening with the long-form pause and fading
 /// in, and only the last segment's final chunk final, carrying the whole
 /// request's totals and combined stop reason (an earlier segment's totals go
 /// out as a delta).
+///
+/// Up to `lookahead` segments synthesize at once (the engine's TTS rows, as
+/// buffered long form runs them), so a streamed long input no longer runs its
+/// segments one after another; audio still goes out strictly in order.
 async fn stream_segments<F, Fut>(
     segments: Vec<GenerationRequest>,
     request_id: &str,
     fallback_sample_rate: u32,
+    lookahead: usize,
     output: tokio::sync::mpsc::Sender<izwi_core::AudioChunk>,
     generate: F,
 ) -> Result<(), izwi_core::Error>
@@ -922,11 +964,20 @@ where
     let mut sequence = 0;
     let (mut tokens, mut time_ms) = (0usize, 0f32);
     let mut stop_reasons = Vec::with_capacity(count);
-    for (index, segment) in segments.into_iter().enumerate() {
+    let mut pending = segments.into_iter();
+    let mut started = std::collections::VecDeque::new();
+    for segment in pending.by_ref().take(lookahead.max(1)) {
+        started.push_back(start_segment(segment, &generate));
+    }
+    for index in 0..count {
         let last = index + 1 == count;
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
-        let task = tokio::spawn(generate(segment, sender));
-        let _abort = AbortSpeechTask(task.abort_handle());
+        let StartedSegment {
+            task,
+            chunks: mut receiver,
+            _abort,
+        } = started.pop_front().ok_or_else(|| {
+            izwi_core::Error::InferenceError("streamed long form lost a segment".into())
+        })?;
         let mut pause_pending = index > 0;
         // Deltas this segment has sent so far.
         let (mut sent_tokens, mut sent_ms) = (0usize, 0f32);
@@ -971,6 +1022,10 @@ where
         task.await.map_err(|error| {
             izwi_core::Error::InferenceError(format!("Speech segment task failed: {error}"))
         })??;
+        // Its slot is free: the next segment starts behind those in flight.
+        if let Some(segment) = pending.next() {
+            started.push_back(start_segment(segment, &generate));
+        }
     }
     Ok(())
 }
@@ -1356,6 +1411,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
             0.0
         },
         stop_reason: TtsStopReason::combine(stop_reasons),
+        diagnostics: None,
     });
     output
         .send(terminal)
@@ -1402,28 +1458,36 @@ mod tests {
             tokens_generated: tokens,
             rtf: 0.0,
             stop_reason,
+            diagnostics: None,
         };
         let segments = vec![
             GenerationRequest::new("first"),
             GenerationRequest::new("second"),
         ];
         let (output, mut received) = tokio::sync::mpsc::channel(16);
-        stream_segments(segments, "request", 100, output, move |segment, sender| {
-            let first = segment.text == "first";
-            async move {
-                let mut interim = AudioChunk::new(segment.id.clone(), 0, vec![1.0; 4]);
-                interim.stats = Some(stats(3, 30.0, None));
-                sender.send(interim).await.unwrap();
-                let mut last = AudioChunk::final_chunk(segment.id.clone(), 1, vec![1.0; 2]);
-                last.stats = Some(if first {
-                    stats(5, 50.0, Some(TtsStopReason::OutputBudget))
-                } else {
-                    stats(4, 40.0, Some(TtsStopReason::EndOfSpeech))
-                });
-                sender.send(last).await.unwrap();
-                Ok(())
-            }
-        })
+        stream_segments(
+            segments,
+            "request",
+            100,
+            2,
+            output,
+            move |segment, sender| {
+                let first = segment.text == "first";
+                async move {
+                    let mut interim = AudioChunk::new(segment.id.clone(), 0, vec![1.0; 4]);
+                    interim.stats = Some(stats(3, 30.0, None));
+                    sender.send(interim).await.unwrap();
+                    let mut last = AudioChunk::final_chunk(segment.id.clone(), 1, vec![1.0; 2]);
+                    last.stats = Some(if first {
+                        stats(5, 50.0, Some(TtsStopReason::OutputBudget))
+                    } else {
+                        stats(4, 40.0, Some(TtsStopReason::EndOfSpeech))
+                    });
+                    sender.send(last).await.unwrap();
+                    Ok(())
+                }
+            },
+        )
         .await
         .unwrap();
 
@@ -1452,6 +1516,57 @@ mod tests {
         assert_eq!(total.tokens_generated, 9);
         assert_eq!(total.generation_time_ms, 90.0);
         assert_eq!(total.stop_reason, Some(TtsStopReason::OutputBudget));
+    }
+
+    /// A streamed long input synthesizes the next segments while the current
+    /// one streams: here the first segment cannot finish until the second has
+    /// started, which deadlocked when segments ran one after another. The
+    /// audio still arrives in segment order.
+    #[tokio::test]
+    async fn streamed_segments_synthesize_ahead_and_arrive_in_order() {
+        use izwi_core::AudioChunk;
+        let second_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let segments = vec![
+            GenerationRequest::new("first"),
+            GenerationRequest::new("second"),
+            GenerationRequest::new("third"),
+        ];
+        let (output, mut received) = tokio::sync::mpsc::channel(16);
+        let started = second_started.clone();
+        let run = stream_segments(
+            segments,
+            "request",
+            100,
+            2,
+            output,
+            move |segment, sender| {
+                let started = started.clone();
+                async move {
+                    match segment.text.as_str() {
+                        "first" => started.notified().await,
+                        "second" => started.notify_one(),
+                        _ => {}
+                    }
+                    let value = match segment.text.as_str() {
+                        "first" => 1.0,
+                        "second" => 2.0,
+                        _ => 3.0,
+                    };
+                    let chunk = AudioChunk::final_chunk(segment.id.clone(), 0, vec![value; 4]);
+                    sender.send(chunk).await.unwrap();
+                    Ok(())
+                }
+            },
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("the second segment starts while the first is in flight")
+            .unwrap();
+        let mut firsts = Vec::new();
+        while let Some(chunk) = received.recv().await {
+            firsts.push(*chunk.samples.last().unwrap());
+        }
+        assert_eq!(firsts, [1.0, 2.0, 3.0]);
     }
 
     /// SPK-F12: segments run `concurrency` at a time, and their outputs come

@@ -19,6 +19,7 @@ enum CertifiedTopology {
     RetainedPagedTensorAndInvocationPaged,
     RetainedPagedPagedTensorAndInvocationPagedPagedTensor,
     RetainedTensorAndInvocationTensor,
+    RetainedTensorAndInvocationTensorStatic,
     RetainedPagedAndInvocationPagedTensor,
     RetainedPagedAndInvocationPaged,
     RetainedPagedRingAndInvocationPagedRing,
@@ -30,7 +31,6 @@ enum CertifiedTopology {
     InvocationPaged,
     InvocationPagedRing,
     InvocationTensor,
-    InvocationTensorStatic,
 }
 
 impl CertifiedTopology {
@@ -55,13 +55,13 @@ impl CertifiedTopology {
             Self::RetainedPagedPagedTensorAndInvocationPagedPagedTensor => {
                 InferenceStateRequirement::RetainedAndInvocation
             }
-            Self::RetainedTensorAndInvocationTensor => {
+            Self::RetainedTensorAndInvocationTensor
+            | Self::RetainedTensorAndInvocationTensorStatic => {
                 InferenceStateRequirement::RetainedAndInvocation
             }
-            Self::InvocationPaged
-            | Self::InvocationPagedRing
-            | Self::InvocationTensor
-            | Self::InvocationTensorStatic => InferenceStateRequirement::Invocation,
+            Self::InvocationPaged | Self::InvocationPagedRing | Self::InvocationTensor => {
+                InferenceStateRequirement::Invocation
+            }
         }
     }
 
@@ -85,11 +85,11 @@ impl CertifiedTopology {
             | Self::RetainedPagedTensorTensorAndInvocationScratch => true,
             Self::Stateless
             | Self::RetainedTensorAndInvocationTensor
+            | Self::RetainedTensorAndInvocationTensorStatic
             | Self::RetainedAppendRingTensor
             | Self::InvocationPaged
             | Self::InvocationPagedRing
-            | Self::InvocationTensor
-            | Self::InvocationTensorStatic => false,
+            | Self::InvocationTensor => false,
         }
     }
 }
@@ -188,6 +188,7 @@ impl CertifiedTopology {
 const UNCHECKED_RETAINED_PAGE_ROUTES: &[(ModelFamily, CapabilityKind)] = &[
     (ModelFamily::WhisperAsr, CapabilityKind::Asr),
     (ModelFamily::Voxtral, CapabilityKind::RealtimeAsr),
+    (ModelFamily::Voxtral, CapabilityKind::Asr),
 ];
 
 fn certified_topology(
@@ -246,7 +247,10 @@ fn certified_topology(
         // Qwen ASR commits decoder pages and immutable prepared inputs under
         // one retained transaction; long-form leases invocation pages only.
         (Qwen3Asr, Asr) => RetainedPagedTensorAndInvocationPaged,
-        (Voxtral, Asr) => InvocationPaged,
+        // Offline Voxtral rows retain transactional pages in the arena its
+        // realtime sessions use; long audio and pipelines lease the language
+        // model's pages for one atomic invocation.
+        (Voxtral, Asr) => RetainedPagedAndInvocationPaged,
         // Realtime Voxtral retains transactional external pages while its
         // absolute-position sliding window rotates the visible cache view.
         (Voxtral, RealtimeAsr) => RetainedPagedRotatingAndInvocationScratch,
@@ -258,13 +262,17 @@ fn certified_topology(
         (ParakeetAsr, Asr) => RetainedTensorAndInvocationTensor,
         (GraniteSpeechAsr, Asr) => RetainedPagedAndInvocationPaged,
         (GraniteSpeechAsr, SpeakerAttributedAsr) => InvocationPaged,
-        // Granite Speech 5.0 runs one atomic invocation on leased pages.
-        (GraniteSpeech5Asr, Asr) => InvocationPaged,
+        // Granite Speech 5.0 retains decoder pages for single-segment rows;
+        // long audio leases them for one atomic invocation per chunk.
+        (GraniteSpeech5Asr, Asr) => RetainedPagedAndInvocationPaged,
         // Nemotron 3.5 Transcribe rows commit attention pages, the Mamba SSM
         // state and the convolution history as one transaction; each stage
         // leases its activations as per-row scratch.
         (NemotronTranscribeAsr, Asr) => RetainedPagedTensorTensorAndInvocationScratch,
-        (NemotronAsr, Asr) => InvocationTensorStatic,
+        // Short clips retain the RNNT predictor between quanta in the
+        // executor session; long audio and diarization lease the predictor
+        // and the static encoder projection per invocation.
+        (NemotronAsr, Asr) => RetainedTensorAndInvocationTensorStatic,
         // Realtime Nemotron retains append/ring/tensor streaming state and
         // uses invocation-scoped workspace for the exact graph.
         (NemotronAsr, RealtimeAsr) => RetainedAppendRingTensor,

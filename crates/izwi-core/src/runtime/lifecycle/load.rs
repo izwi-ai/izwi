@@ -165,6 +165,22 @@ fn loaded_asr_state_publication_route(variant: ModelVariant) -> LoadedAsrStatePu
 fn parakeet_retained_uses(
     contracts: &[LoadedExecutionContract],
 ) -> Result<HashMap<[u8; 32], RetainedStateUseV2>> {
+    session_retained_uses(contracts, "Parakeet")
+}
+
+/// Nemotron's offline predictor is retained the way Parakeet's is: by the
+/// exact executor session of a short clip's row; the atomic long-form graph
+/// leases invocation tensors.
+fn nemotron_offline_retained_uses(
+    contracts: &[LoadedExecutionContract],
+) -> Result<HashMap<[u8; 32], RetainedStateUseV2>> {
+    session_retained_uses(contracts, "Nemotron offline")
+}
+
+fn session_retained_uses(
+    contracts: &[LoadedExecutionContract],
+    family: &str,
+) -> Result<HashMap<[u8; 32], RetainedStateUseV2>> {
     contracts
         .iter()
         .map(|contract| {
@@ -173,9 +189,9 @@ fn parakeet_retained_uses(
                 crate::engine::ExecutionMode::Sequence | crate::engine::ExecutionMode::Atomic => {
                     Ok((graph, RetainedStateUseV2::Inactive))
                 }
-                _ => Err(Error::ModelLoadError(
-                    "Parakeet graph has an incompatible execution mode".into(),
-                )),
+                _ => Err(Error::ModelLoadError(format!(
+                    "{family} graph has an incompatible execution mode"
+                ))),
             }
         })
         .collect()
@@ -208,6 +224,27 @@ fn kokoro_effective_context_tokens(
     }
     u64::try_from(effective)
         .map_err(|_| Error::ModelLoadError("Kokoro effective context exceeds u64".into()))
+}
+
+/// The decoder context CUDA publishes for an invocation-only route. CUDA
+/// sizes invocation workspace per request, so the memory fit the portable
+/// backends run is skipped and the decoder-context axis stays unresolved; the
+/// routes still plan chunks against a published context, which is the
+/// model-authored maximum narrowed by an explicit `max_sequence_length` and by
+/// any context already published for this generation. `None` when the
+/// descriptor has no decoder-context axis (fixed-size state).
+fn cuda_invocation_context(
+    preference: ContextLengthPreference,
+    published_context: Option<usize>,
+    axis_bounds: Option<(u64, u64)>,
+) -> Option<u64> {
+    let (_, maximum) = axis_bounds?;
+    Some(
+        match portable_invocation_context_intent(preference, published_context, maximum) {
+            PortableInvocationContextIntent::Explicit { selected } => selected,
+            PortableInvocationContextIntent::Automatic { ceiling } => ceiling,
+        },
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +295,41 @@ fn state_fit_budgets(
 /// variants, and for ASR families without an LLM decoder context).
 fn asr_minimum_tokens(variant: ModelVariant) -> u64 {
     super::asr_envelope::minimum_sequence_tokens(variant).unwrap_or(0)
+}
+
+/// Tokens of a retained ASR pool that every sequence claims its pages from:
+/// one `sequence_tokens` sequence per retained row in whole `page_tokens`
+/// pages, and never less than one sequence of the model's whole
+/// `context_tokens`, which still bounds each sequence on its own.
+fn asr_shared_pool_tokens(
+    context_tokens: usize,
+    sequence_tokens: u64,
+    rows: usize,
+    page_tokens: usize,
+) -> usize {
+    let sequence = usize::try_from(sequence_tokens)
+        .unwrap_or(usize::MAX)
+        .min(context_tokens);
+    crate::runtime::asr_pool_sequence_tokens(sequence, page_tokens)
+        .saturating_mul(rows.max(1))
+        .max(context_tokens)
+}
+
+/// Refuses a Granite Speech 5.0 retained pool whose `reach` is short of one
+/// longest retained sequence (`sequence_tokens`): preparation sends a
+/// request to the retained route whenever its prompt and budget fit that
+/// sequence, and a claim the pool can never hold would wait on KV
+/// admission forever.
+fn granite_speech5_retained_reach_holds_a_sequence(
+    reach: u64,
+    sequence_tokens: usize,
+) -> Result<()> {
+    if reach < sequence_tokens as u64 {
+        return Err(Error::ModelLoadError(format!(
+            "Granite Speech 5.0 retained decoder pages reach {reach} tokens, short of one {sequence_tokens}-token retained sequence; free memory, raise the context, or set IZWI_GRANITE_SPEECH5_RETAINED_DECODE=false"
+        )));
+    }
+    Ok(())
 }
 
 /// The retained-state floor of a TTS variant, in tokens per sequence: one
@@ -498,6 +570,28 @@ fn precision_reload_gate(
         crate::backends::recv_serving_device(outcome).ok_or_else(ended)?
     });
     (gate, receiver)
+}
+
+/// The widest continuous decode stage of a loaded model's ASR graphs: the
+/// rows one ASR decode step batches (1 without one).
+fn asr_decode_stage_width(bundle_draft: &LoadedModelBundleDraft) -> Result<usize> {
+    decode_stage_width(bundle_draft, CapabilityKind::Asr)
+}
+
+/// The widest continuous decode stage of a loaded model's `capability`
+/// graphs (1 without one).
+fn decode_stage_width(
+    bundle_draft: &LoadedModelBundleDraft,
+    capability: CapabilityKind,
+) -> Result<usize> {
+    Ok(bundle_draft
+        .execution_contracts(capability)?
+        .iter()
+        .flat_map(|contract| contract.stages.iter())
+        .filter(|stage| stage.batch_mode == crate::engine::NativeBatchMode::Continuous)
+        .map(|stage| stage.max_batch_size)
+        .max()
+        .unwrap_or(1))
 }
 
 /// `(retained, staged)` rows of ASR retained state (ADM-6). Automatic engine
@@ -893,9 +987,17 @@ impl ModelLifecycleController {
             let admission_ms = admission_started.elapsed().as_secs_f64() * 1000.0;
             // Adapter factories are one-shot. Freeze their exact identities
             // and selectable stage graphs before model-derived state planning
-            // or any physical state allocation can occur.
-            let bundle_draft =
-                self.draft_loaded_model_bundle(variant, model_instance_id)?;
+            // or any physical state allocation can occur. An ASR decode that
+            // may run past the engine rows takes the width its memory fits.
+            let asr_decode_width = self.fit_asr_decode_width(variant, &resource_plan)?;
+            let bundle_draft = self.draft_loaded_model_bundle(
+                variant,
+                model_instance_id,
+                asr_decode_width,
+            )?;
+            if let Some(rows) = asr_decode_width {
+                self.model_registry.publish_asr_decode_width(variant, rows);
+            }
             // This is the first operation allowed to allocate model tensors;
             // the peak host/device authorization and authoritative Loading slot
             // are both installed above.
@@ -994,6 +1096,22 @@ impl ModelLifecycleController {
                     )));
                 };
                 bundle_draft.seal_granite_speech_asr_preparation(model)?;
+            } else if variant.family() == crate::catalog::ModelFamily::GraniteSpeech5Asr {
+                let loaded = self
+                    .model_registry
+                    .get_loading_asr(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "instantiated Granite Speech 5.0 ASR model {variant} is missing before adapter sealing"
+                        ))
+                    })?;
+                let NativeAsrModel::GraniteSpeech5(model) = loaded.as_ref() else {
+                    return Err(Error::ModelLoadError(format!(
+                        "instantiated model {variant} does not expose Granite Speech 5.0 ASR geometry"
+                    )));
+                };
+                bundle_draft.seal_granite_speech5_asr_preparation(model)?;
             } else if variant.family() == crate::catalog::ModelFamily::Lfm25Audio {
                 let model = self
                     .model_registry

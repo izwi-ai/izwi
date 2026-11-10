@@ -10,6 +10,7 @@
 
 pub mod buffer_pool;
 pub mod conv_tiling;
+pub mod counter_noise;
 pub mod cpu_q8;
 pub mod cuda;
 pub mod depthwise_conv;
@@ -32,10 +33,13 @@ pub(crate) mod metal_paged_gqa;
 pub(crate) mod metal_qwen36moe;
 pub mod moe_relu2;
 pub mod numeric_check;
+pub mod penalized_topk;
 pub mod qk_norm_rope;
+pub mod relpos_attention;
 pub mod race_sampler;
 pub mod residual_norm;
 pub mod swiglu;
+pub mod transducer_greedy;
 
 use crate::error::Error;
 use candle_core::{Device, Tensor};

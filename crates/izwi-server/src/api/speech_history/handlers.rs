@@ -3639,6 +3639,7 @@ mod tests {
             tokens_generated: 1,
             rtf: 0.2,
             stop_reason: None,
+            diagnostics: None,
         });
         statistics.observe(&first);
         let mut terminal = AudioChunk::final_chunk("request".into(), 1, Vec::new());
@@ -3647,6 +3648,7 @@ mod tests {
             tokens_generated: 2,
             rtf: 0.3,
             stop_reason: None,
+            diagnostics: None,
         });
         statistics.observe(&terminal);
         assert_eq!(statistics.tokens, 2);
@@ -3703,6 +3705,7 @@ mod tests {
             tokens_generated: 313,
             rtf: 0.3,
             stop_reason: Some(TtsStopReason::OutputBudget),
+            diagnostics: None,
         });
         statistics.observe(&terminal);
         let stop_reason =

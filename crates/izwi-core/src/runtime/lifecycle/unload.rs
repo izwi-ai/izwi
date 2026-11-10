@@ -35,13 +35,37 @@ impl ModelLifecycleController {
         // sample the next load is admitted against, until some later request
         // or load happens to synchronize (measured: Parakeet kept 1.3 GB,
         // Granite Speech 6.5 GB). Only buffers nothing holds are freed, so
-        // other residents are untouched.
-        if let Err(error) = self.core_engine.synchronize_worker_device().await {
-            tracing::warn!(
+        // other residents are untouched. On CUDA the synchronization lets the
+        // memory pool take the model's frees back, and the pool then returns
+        // its idle pages to the driver; without that it kept them for good
+        // (24 GB after one Maya1 load, 45.7 GB after 26 loads). The graph
+        // pool is trimmed only once nothing else is resident: a resident
+        // model's graphs would map their trimmed pages again, which their
+        // cache charges against the bytes priced for it.
+        let drained = self.authoritative_resident_variants().is_empty()
+            && self.model_manager.resident_variants().await.is_empty();
+        match self.core_engine.release_idle_worker_memory(drained).await {
+            Ok(Some(release)) => {
+                let [pool_before, pool_after] = release.default_pool;
+                info!(
+                    model = %variant,
+                    released_bytes = release.released_bytes(),
+                    pool_reserved_before_bytes = pool_before.reserved,
+                    pool_reserved_bytes = pool_after.reserved,
+                    pool_used_bytes = pool_after.used,
+                    graph_pool_reserved_before_bytes =
+                        release.graph_pool.map(|[before, _]| before.reserved),
+                    graph_pool_reserved_bytes = release.graph_pool.map(|[_, after]| after.reserved),
+                    graph_pool_used_bytes = release.graph_pool.map(|[_, after]| after.used),
+                    "Returned an unloaded model's idle CUDA memory to the driver"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
                 model = %variant,
                 %error,
                 "Synchronizing the device to release an unloaded model's buffers failed"
-            );
+            ),
         }
         let physical = self
             .coordinator
@@ -594,7 +618,7 @@ mod tests {
                 .expect("managed physical state");
             let draft = runtime
                 .model_lifecycle
-                .draft_loaded_model_bundle(variant, model_instance)
+                .draft_loaded_model_bundle(variant, model_instance, None)
                 .unwrap();
             draft.seal_chat_workspace(8_192).unwrap();
             let bundle = runtime

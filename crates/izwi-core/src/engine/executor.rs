@@ -51,7 +51,12 @@ pub(crate) fn decode_request_audio_with_rate(
     audio::decode_request_audio_with_rate(request)
 }
 
-pub(crate) use audio::{AsrRouteCapabilities, PlannedAsrChunks};
+#[cfg(test)]
+pub(crate) use audio::AsrChunkPlannerKind;
+pub(crate) use audio::{
+    timestamp_words_json, AsrChunkTranscription, AsrRouteCapabilities, ChunkedAsrRun,
+    ChunkedAsrTranscription, PlannedAsrChunks,
+};
 
 /// Route plan for a request's audio; see [`NativeExecutor::asr_route_plan`].
 pub(crate) fn asr_route_plan(
@@ -112,7 +117,7 @@ use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
 use state::{
     ActiveAsrDecode, ActiveChatDecode, ActiveChatterboxTtsDecode, ActiveFishDrama3TtsDecode,
     ActiveFishS2TtsDecode, ActiveLfm25AsrDecode, ActiveLfm25TtsDecode, ActiveLfm3AudioDecode,
-    ActiveLfm3AudioRealtime, ActiveMaya1TtsDecode, ActiveMaya2TtsDecode,
+    ActiveLfm3AudioRealtime, ActiveMaya1TtsDecode, ActiveMaya2TtsDecode, ActiveNemotronAsrDecode,
     ActiveNemotronTranscribeDecode, ActiveParakeetAsrDecode, ActiveQwenTtsDecode,
     ActiveVibeVoiceTtsDecode, ActiveVoxtralRealtime, ActiveVoxtralTtsDecode,
     PendingLfm3AudioRealtimeQuantum, PendingVoxtralRealtimeQuantum,
@@ -1166,13 +1171,21 @@ impl WorkerConfig {
 
 /// Families whose loaded stage sets their batch rows instead of the
 /// engine's tensor width: Fish S2 and Drama 3 fit their own rows, and the chat
-/// families certified wider on CUDA than the engine rows
-/// (`catalog::batch_width`) decode up to their stage's width. Read from the
-/// certified widths, so certifying a family wider cannot leave it capped here.
+/// and ASR families certified wider on CUDA than the engine rows
+/// (`catalog::batch_width`) decode up to their stage's width (an ASR model's
+/// encoder and prefill stages keep the engine rows). Read from the certified
+/// widths, so certifying a family wider cannot leave it capped here. Every
+/// stage of such a family is bound by its own width, which on CPU and Metal
+/// (and for a family's realtime capability) is the engine rows the formation
+/// already planned it at.
 fn stage_sets_batch_rows(family: crate::catalog::ModelFamily) -> bool {
     use crate::catalog::ModelFamily;
+    let cuda = crate::backends::BackendKind::Cuda;
     matches!(family, ModelFamily::FishS2Tts | ModelFamily::FishDrama3Tts)
-        || crate::catalog::certified_decode_width(family, crate::backends::BackendKind::Cuda)
+        || crate::catalog::certified_decode_width(family, cuda) > crate::catalog::CUDA_DEFAULT_WIDTH
+        // TTS decodes certified past the engine rows: their loaded decode
+        // stage carries the width (the engine rows off CUDA).
+        || crate::catalog::tts_decode_width(family, cuda, 1, usize::MAX)
             > crate::catalog::CUDA_DEFAULT_WIDTH
 }
 
@@ -1609,6 +1622,26 @@ fn device_job_tag(execution: &PhysicalBatchExecution<'_>) -> (DeviceJobTag, Work
         weight: class.service_weight(),
     };
     (tag, class)
+}
+
+/// Records one ASR dispatch's prefill or decode time and the
+/// detokenisation inside it as `model`'s phases.
+fn record_asr_dispatch_phases(
+    model: &str,
+    phase: super::metrics::EngineDispatchPhase,
+    started: std::time::Instant,
+) {
+    use super::metrics::{AsrPhase, EngineDispatchPhase};
+    let phase = match phase {
+        EngineDispatchPhase::Prefill => AsrPhase::Prefill,
+        EngineDispatchPhase::Decode => AsrPhase::Decode,
+        EngineDispatchPhase::Other => return,
+    };
+    super::metrics::record_asr_device_phase(model, phase, started);
+    let detok = super::metrics::take_asr_detok();
+    if !detok.is_zero() {
+        super::metrics::record_asr_phase(model, AsrPhase::Detok, detok);
+    }
 }
 
 /// When the device last finished a model step while the engine stayed busy.
@@ -2774,6 +2807,7 @@ pub struct NativeExecutor {
     suspended_chat_states: Mutex<HashMap<SessionKey, state::SuspendedChatDecode>>,
     asr_decode_states: ExecutorStateStore<ActiveAsrDecode>,
     parakeet_asr_decode_states: ExecutorStateStore<ActiveParakeetAsrDecode>,
+    nemotron_asr_decode_states: ExecutorStateStore<ActiveNemotronAsrDecode>,
     lfm25_asr_decode_states: ExecutorStateStore<ActiveLfm25AsrDecode>,
     lfm25_tts_decode_states: ExecutorStateStore<ActiveLfm25TtsDecode>,
     vibevoice_tts_decode_states: ExecutorStateStore<ActiveVibeVoiceTtsDecode>,
@@ -2885,6 +2919,7 @@ impl NativeExecutor {
             suspended_chat_states: Mutex::new(HashMap::new()),
             asr_decode_states: Mutex::new(HashMap::new()),
             parakeet_asr_decode_states: Mutex::new(HashMap::new()),
+            nemotron_asr_decode_states: Mutex::new(HashMap::new()),
             lfm25_asr_decode_states: Mutex::new(HashMap::new()),
             lfm25_tts_decode_states: Mutex::new(HashMap::new()),
             vibevoice_tts_decode_states: Mutex::new(HashMap::new()),
@@ -3008,6 +3043,16 @@ fn mixed_force_split() -> bool {
     FORCE_SPLIT.get()
 }
 
+/// A transducer's decode quantum in the scheduling profile: above one, the
+/// rows keep it in continuous batches beyond their soft deadline.
+fn apply_transducer_decode_quantum(profile: &mut ExecutionProfile, quantum: usize) {
+    if quantum > 1 {
+        profile.preferred_decode_tokens = quantum;
+        profile.sustained_decode_quantum = true;
+        profile.speculative_decode_batch = true;
+    }
+}
+
 fn is_isolated_continuous_model_quantum(scheduled: &[ScheduledRequest]) -> bool {
     scheduled.len() == 1 && !scheduled[0].is_prefill && scheduled[0].num_tokens > 1
 }
@@ -3090,6 +3135,15 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
                     .flatten()
                     .map(|_| (true, true))
             })
+            // A Voxtral row prefills its prompt alone and decodes batched.
+            .or_else(|| {
+                request
+                    .prepared_voxtral_model_lease_for_executor()
+                    .ok()
+                    .flatten()
+                    .filter(|_| request.uses_asr_retained_sequence())
+                    .map(|_| (false, true))
+            })
             .unwrap_or((false, false)),
         // Drama 3 decodes rows of many users together, but a prefill cell
         // is never batched across requests (§7.4).
@@ -3112,6 +3166,9 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
                     .is_ok_and(|model| model.is_some())
                 || request
                     .prepared_maya2_tts_model_lease_for_executor()
+                    .is_ok_and(|model| model.is_some())
+                || request
+                    .prepared_voxtral_tts_model_lease_for_executor()
                     .is_ok_and(|model| model.is_some())
                 || request
                     .prepared_lfm3_audio_model_lease_for_executor()
@@ -3369,6 +3426,9 @@ impl ModelExecutor for NativeExecutor {
                         .prepared_maya2_tts_model_lease_for_executor()
                         .is_ok_and(|model| model.is_some())
                     || request
+                        .prepared_voxtral_tts_model_lease_for_executor()
+                        .is_ok_and(|model| model.is_some())
+                    || request
                         .prepared_lfm3_audio_model_lease_for_executor()
                         .is_ok_and(|model| model.is_some())
                     || (self.config.model_registry.is_none() && self.loaded_tts_model.is_some());
@@ -3382,6 +3442,7 @@ impl ModelExecutor for NativeExecutor {
                         | crate::catalog::ModelFamily::ChatterboxTts
                         | crate::catalog::ModelFamily::Maya1Tts
                         | crate::catalog::ModelFamily::Maya2Tts
+                        | crate::catalog::ModelFamily::VoxtralTts
                         | crate::catalog::ModelFamily::Lfm3Audio
                 ))
             }
@@ -3430,6 +3491,7 @@ impl ModelExecutor for NativeExecutor {
                             | crate::catalog::ModelFamily::ChatterboxTts
                             | crate::catalog::ModelFamily::Maya1Tts
                             | crate::catalog::ModelFamily::Maya2Tts
+                            | crate::catalog::ModelFamily::VoxtralTts
                             | crate::catalog::ModelFamily::Lfm3Audio
                     )
                 }
@@ -3459,6 +3521,15 @@ impl ModelExecutor for NativeExecutor {
                         .ok()
                         .flatten()
                         .map(|_| true)
+                })
+                // A Voxtral prompt prefills whole: its realtime prefill has
+                // no resumable safe point.
+                .or_else(|| {
+                    request
+                        .prepared_voxtral_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| false)
                 }),
             super::types::TaskType::TTS => request
                 .prepared_qwen_tts_model_for_executor()
@@ -3516,6 +3587,14 @@ impl ModelExecutor for NativeExecutor {
                         .flatten()
                         .map(|_| true)
                 })
+                // A Voxtral TTS prompt prefills in spans from its own cursor.
+                .or_else(|| {
+                    request
+                        .prepared_voxtral_tts_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| true)
+                })
                 .or_else(|| {
                     request
                         .prepared_lfm3_audio_model_lease_for_executor()
@@ -3545,6 +3624,12 @@ impl ModelExecutor for NativeExecutor {
             // over exactly the next cell, never a budget's cut of it.
             if let Ok(Some(model)) = request.prepared_fish_drama3_tts_model_lease_for_executor() {
                 profile.prefill_grid_tokens = model.prefill_span_rows();
+            }
+            // A Qwen3-TTS prompt prefills on its model's grid on CUDA, so its
+            // spans never shrink to a step's leftover budget beside other
+            // requests (a request sounds the same under load).
+            if let Ok(Some(model)) = request.prepared_qwen_tts_model_for_executor() {
+                profile.prefill_grid_tokens = model.prefill_grid_tokens();
             }
             profile.incremental_decode = true;
             profile.recompute_safe = profile.resolved_from_loaded_model;
@@ -3683,6 +3768,21 @@ impl ModelExecutor for NativeExecutor {
                 profile.sustained_decode_quantum = true;
                 profile.speculative_decode_batch = true;
             }
+        }
+        // Parakeet and Nemotron ASR decode several tokens per row and step
+        // while their device dispatches run (CUDA), rows batched, while
+        // nothing waits; the scheduler's fairness gates drop to one token
+        // as soon as a request waits.
+        if matches!(
+            variant.family(),
+            crate::catalog::ModelFamily::ParakeetAsr | crate::catalog::ModelFamily::NemotronAsr
+        ) {
+            let quantum = request
+                .prepared_asr_model_lease_for_executor()
+                .ok()
+                .flatten()
+                .map_or(1, |lease| lease.model_arc().transducer_decode_quantum());
+            apply_transducer_decode_quantum(&mut profile, quantum);
         }
         // DS1.2b: hybrid contracts that declare committed-snapshot sharing get
         // their first prefill chunk aligned to the declared interval by the
@@ -3848,6 +3948,25 @@ impl ModelExecutor for NativeExecutor {
                     }) =>
                 {
                     self.execute_static_parakeet_asr_prefill_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.batch.lane.kernel_mode
+                    == crate::models::architectures::nemotron::asr::NEMOTRON_RETAINED_PREFILL_STAGE
+                    && execution.requests.iter().all(|request| {
+                        request.model_variant.is_some_and(|variant| {
+                            variant.family() == crate::catalog::ModelFamily::NemotronAsr
+                        })
+                    }) =>
+                {
+                    self.execute_static_nemotron_asr_prefill_requests_with_rows(
                         execution.requests,
                         execution.scheduled,
                         Some(&execution.batch.rows),
@@ -4048,6 +4167,40 @@ impl ModelExecutor for NativeExecutor {
                 }) =>
                 {
                     self.execute_static_fish_drama3_codec_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::TTS,
+                    stage: NativeAudioStage::SequenceAudioDecode,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Qwen3Tts
+                    })
+                }) =>
+                {
+                    self.execute_static_qwen_tts_audio_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::TTS,
+                    stage: NativeAudioStage::SequenceAudioDecode,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Maya1Tts
+                    })
+                }) =>
+                {
+                    self.execute_static_maya1_audio_requests_with_rows(
                         execution.requests,
                         execution.scheduled,
                         Some(&execution.batch.rows),
@@ -4273,6 +4426,9 @@ impl ModelExecutor for NativeExecutor {
         let mut parakeet_asr = self.parakeet_asr_decode_states.lock().map_err(|_| {
             Error::InferenceError("Parakeet ASR decode state mutex poisoned".to_string())
         })?;
+        let mut nemotron_asr = self.nemotron_asr_decode_states.lock().map_err(|_| {
+            Error::InferenceError("Nemotron ASR decode state mutex poisoned".to_string())
+        })?;
         let mut lfm25_asr = self.lfm25_asr_decode_states.lock().map_err(|_| {
             Error::InferenceError("LFM2.5 Audio ASR decode state mutex poisoned".to_string())
         })?;
@@ -4340,6 +4496,7 @@ impl ModelExecutor for NativeExecutor {
         chat.clear();
         asr.clear();
         parakeet_asr.clear();
+        nemotron_asr.clear();
         lfm25_asr.clear();
         lfm25_tts.clear();
         vibevoice_tts.clear();
@@ -4358,6 +4515,7 @@ impl ModelExecutor for NativeExecutor {
             chat,
             asr,
             parakeet_asr,
+            nemotron_asr,
             lfm25_asr,
             lfm25_tts,
             vibevoice_tts,
@@ -4410,6 +4568,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut chat),
             Ok(mut asr),
             Ok(mut parakeet_asr),
+            Ok(mut nemotron_asr),
             Ok(mut lfm25_asr),
             Ok(mut lfm25_tts),
             Ok(mut vibevoice_tts),
@@ -4428,6 +4587,7 @@ impl ModelExecutor for NativeExecutor {
             self.chat_decode_states.lock(),
             self.asr_decode_states.lock(),
             self.parakeet_asr_decode_states.lock(),
+            self.nemotron_asr_decode_states.lock(),
             self.lfm25_asr_decode_states.lock(),
             self.lfm25_tts_decode_states.lock(),
             self.vibevoice_tts_decode_states.lock(),
@@ -4450,6 +4610,7 @@ impl ModelExecutor for NativeExecutor {
         let chat = cleanup_request_states_locked(&mut chat, request_id);
         let asr = cleanup_request_states_locked(&mut asr, request_id);
         let parakeet_asr = cleanup_request_states_locked(&mut parakeet_asr, request_id);
+        let nemotron_asr = cleanup_request_states_locked(&mut nemotron_asr, request_id);
         let lfm25_asr = cleanup_request_states_locked(&mut lfm25_asr, request_id);
         let lfm25_tts = cleanup_request_states_locked(&mut lfm25_tts, request_id);
         let vibevoice_tts = cleanup_request_states_locked(&mut vibevoice_tts, request_id);
@@ -4467,6 +4628,7 @@ impl ModelExecutor for NativeExecutor {
         cleanup_report(
             chat.combine(asr)
                 .combine(parakeet_asr)
+                .combine(nemotron_asr)
                 .combine(lfm25_asr)
                 .combine(lfm25_tts)
                 .combine(vibevoice_tts)
@@ -4516,6 +4678,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut chat),
             Ok(mut asr),
             Ok(mut parakeet_asr),
+            Ok(mut nemotron_asr),
             Ok(mut lfm25_asr),
             Ok(mut lfm25_tts),
             Ok(mut vibevoice_tts),
@@ -4534,6 +4697,7 @@ impl ModelExecutor for NativeExecutor {
             self.chat_decode_states.lock(),
             self.asr_decode_states.lock(),
             self.parakeet_asr_decode_states.lock(),
+            self.nemotron_asr_decode_states.lock(),
             self.lfm25_asr_decode_states.lock(),
             self.lfm25_tts_decode_states.lock(),
             self.vibevoice_tts_decode_states.lock(),
@@ -4560,6 +4724,7 @@ impl ModelExecutor for NativeExecutor {
         let chat = cleanup_session_state_locked(&mut chat, session);
         let asr = cleanup_session_state_locked(&mut asr, session);
         let parakeet_asr = cleanup_session_state_locked(&mut parakeet_asr, session);
+        let nemotron_asr = cleanup_session_state_locked(&mut nemotron_asr, session);
         let lfm25_asr = cleanup_session_state_locked(&mut lfm25_asr, session);
         let lfm25_tts = cleanup_session_state_locked(&mut lfm25_tts, session);
         let vibevoice_tts = cleanup_session_state_locked(&mut vibevoice_tts, session);
@@ -4577,6 +4742,7 @@ impl ModelExecutor for NativeExecutor {
         cleanup_report(
             chat.combine(asr)
                 .combine(parakeet_asr)
+                .combine(nemotron_asr)
                 .combine(lfm25_asr)
                 .combine(lfm25_tts)
                 .combine(vibevoice_tts)
@@ -5109,9 +5275,17 @@ impl UnifiedExecutor {
         {
             return (inputs, refusal);
         }
-        let (batch_id, expected_dispatch, tag, class, shape) =
+        let (batch_id, expected_dispatch, tag, class, shape, asr_model) =
             inputs.with_execution(|execution| {
                 let (tag, class) = device_job_tag(&execution);
+                // ASR dispatches record their prefill or decode time, and
+                // the detokenisation inside it, under the model's name.
+                let asr_model = execution
+                    .requests
+                    .first()
+                    .filter(|request| request.task_type == TaskType::ASR)
+                    .and_then(|request| request.model_variant)
+                    .map(|variant| variant.dir_name());
                 let phase = super::metrics::EngineDispatchPhase::of_work(
                     execution.batch.rows.iter().map(|row| &row.work),
                 );
@@ -5121,6 +5295,7 @@ impl UnifiedExecutor {
                     tag,
                     class,
                     (execution.batch.rows.len(), phase),
+                    asr_model,
                 )
             });
         let slot = Arc::new(Mutex::new(Some(inputs)));
@@ -5140,6 +5315,11 @@ impl UnifiedExecutor {
             }
             let _device_step = idle.as_ref().map(|(clock, label)| clock.begin_step(label));
             let _physical_dispatch = begin_engine_physical_dispatch_shaped(shape.0, shape.1);
+            let asr_started = std::time::Instant::now();
+            if asr_model.is_some() {
+                // Drop detokenisation another dispatch left on this thread.
+                let _ = super::metrics::take_asr_detok();
+            }
             let inputs = job_slot.lock().unwrap_or_else(|poison| poison.into_inner());
             let result = inputs
                 .as_ref()
@@ -5150,6 +5330,9 @@ impl UnifiedExecutor {
                     }))
                 });
             drop(inputs);
+            if let Some(model) = asr_model {
+                record_asr_dispatch_phases(model, shape.1, asr_started);
+            }
             drop(admitted);
             drop(retained);
             result
@@ -5648,10 +5831,31 @@ mod tests {
             ModelFamily::Qwen38Chat,
             ModelFamily::Lfm2Chat,
             ModelFamily::Lfm3Chat,
+            ModelFamily::Qwen3Asr,
+            ModelFamily::VibeVoiceAsr,
+            ModelFamily::ParakeetAsr,
+            ModelFamily::NemotronAsr,
+            ModelFamily::WhisperAsr,
+            ModelFamily::Voxtral,
+            ModelFamily::Qwen3Tts,
+            ModelFamily::Maya1Tts,
+            ModelFamily::Maya2Tts,
+            ModelFamily::ChatterboxTts,
+            ModelFamily::VoxtralTts,
+            ModelFamily::GraniteSpeechAsr,
+            ModelFamily::GraniteSpeech5Asr,
         ] {
             assert!(stage_sets_batch_rows(family), "{family:?}");
         }
-        for family in [ModelFamily::Qwen3Chat, ModelFamily::Gemma3Chat] {
+        for family in [
+            ModelFamily::Qwen3Chat,
+            ModelFamily::Gemma3Chat,
+            ModelFamily::NemotronTranscribeAsr,
+            ModelFamily::Lfm25Audio,
+            ModelFamily::Lfm3Audio,
+            ModelFamily::KokoroTts,
+            ModelFamily::VibeVoiceTts,
+        ] {
             assert!(!stage_sets_batch_rows(family), "{family:?}");
         }
     }
@@ -5675,6 +5879,43 @@ mod tests {
             finalizer.calls.lock().unwrap().as_slice(),
             &[(41, PendingQuantumDecision::Abort)]
         );
+    }
+
+    /// An ASR decode dispatch records its time and the detokenisation inside
+    /// it; work that is neither prefill nor decode records nothing.
+    #[test]
+    fn asr_dispatches_record_their_phase_and_detokenisation() {
+        use crate::engine::metrics::{asr_detok_scope, asr_phase_totals, AsrPhase};
+        let model = "asr-dispatch-phase-test";
+        drop(asr_detok_scope());
+        record_asr_dispatch_phases(
+            model,
+            super::super::metrics::EngineDispatchPhase::Other,
+            std::time::Instant::now(),
+        );
+        assert_eq!(asr_phase_totals(model, AsrPhase::Decode).0, 0);
+        assert_eq!(asr_phase_totals(model, AsrPhase::Prefill).0, 0);
+        {
+            let _detok = asr_detok_scope();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        record_asr_dispatch_phases(
+            model,
+            super::super::metrics::EngineDispatchPhase::Decode,
+            std::time::Instant::now(),
+        );
+        assert_eq!(asr_phase_totals(model, AsrPhase::Decode).0, 1);
+        let (detoks, detok_seconds) = asr_phase_totals(model, AsrPhase::Detok);
+        assert_eq!(detoks, 1);
+        assert!(detok_seconds >= 0.001);
+        // The clock was drained: a dispatch without detokenisation adds none.
+        record_asr_dispatch_phases(
+            model,
+            super::super::metrics::EngineDispatchPhase::Prefill,
+            std::time::Instant::now(),
+        );
+        assert_eq!(asr_phase_totals(model, AsrPhase::Prefill).0, 1);
+        assert_eq!(asr_phase_totals(model, AsrPhase::Detok).0, 1);
     }
 
     /// Publishing or discarding a pending quantum commits, restores or drops
@@ -6104,6 +6345,23 @@ mod tests {
         ]));
     }
 
+    /// A transducer's decode quantum above one asks for sustained, batched
+    /// quanta; one leaves the scalar profile.
+    #[test]
+    fn transducer_quantum_profiles_batched_quanta() {
+        let mut profile = ExecutionProfile::fail_closed(
+            crate::backends::BackendKind::Cuda,
+            None,
+            ExecutionMode::Sequence,
+        );
+        apply_transducer_decode_quantum(&mut profile, 1);
+        assert_eq!(profile.preferred_decode_tokens, 1);
+        assert!(!profile.sustained_decode_quantum && !profile.speculative_decode_batch);
+        apply_transducer_decode_quantum(&mut profile, 8);
+        assert_eq!(profile.preferred_decode_tokens, 8);
+        assert!(profile.sustained_decode_quantum && profile.speculative_decode_batch);
+    }
+
     fn native_route_fixture(
         task: TaskType,
         capability: &str,
@@ -6239,6 +6497,54 @@ mod tests {
                 mode: NativeBatchMode::Continuous,
                 stage_id: StageId::new(7),
             }
+        );
+    }
+
+    /// A Qwen3-TTS request whose audio is due runs on the loaded audio
+    /// stage: a static batch of audio-decode quanta resolves to the audio
+    /// route and reaches the Qwen3-TTS audio handler (which then needs the
+    /// request's loaded model), not the unregistered-stage refusal.
+    #[test]
+    fn qwen_tts_audio_quanta_reach_the_qwen_audio_handler() {
+        let (request, mut scheduled, mut batch) = native_route_fixture(
+            TaskType::TTS,
+            "tts",
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+            StageWorkSelector::SequenceAudioDecode,
+            "tts.audio_decode.qwen3.tensor_static",
+            NativeBatchMode::Static,
+            SequencePhase::Decode,
+        );
+        scheduled.work = WorkUnit::SequenceAudioDecode { max_frames: 1 };
+        batch.rows[0].work = scheduled.work.clone();
+        let requests = [&request];
+        let scheduled = [scheduled];
+        let execution = PhysicalBatchExecution {
+            batch: &batch,
+            requests: &requests,
+            scheduled: &scheduled,
+        };
+        execution.validate().unwrap();
+        assert_eq!(
+            NativeBatchRoute::resolve(&execution).unwrap(),
+            NativeBatchRoute::Audio {
+                task: TaskType::TTS,
+                stage: NativeAudioStage::SequenceAudioDecode,
+                mode: NativeBatchMode::Static,
+                stage_id: StageId::new(7),
+            }
+        );
+        let mut executor = NativeExecutor::new(WorkerConfig::default());
+        // Initialized without a model: the handler, not the route, refuses.
+        executor.initialized = true;
+        let error = executor.execute_physical_batch(execution).unwrap_err();
+        assert!(
+            error
+                .error
+                .to_string()
+                .contains("Qwen3-TTS audio lost its model"),
+            "{}",
+            error.error
         );
     }
 
@@ -7694,6 +8000,27 @@ mod tests {
         assert_eq!(profile.prefill, PrefillMode::Full);
         assert!(profile.prefill_spans_required);
         assert_eq!(profile.prefill_grid_tokens, 0);
+    }
+
+    /// Voxtral TTS publishes only sequence stages (preparation, prefill,
+    /// decode, codec): an atomic profile matched none of them, so the engine
+    /// forced every request scalar.
+    #[test]
+    fn voxtral_tts_raw_profile_uses_the_sequence_execution_route() {
+        let executor = NativeExecutor::new(WorkerConfig {
+            backend: BackendKind::Cpu,
+            request_parallelism: 4,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        });
+        let mut request = EngineCoreRequest::tts("The quick brown fox jumps over the lazy dog");
+        request.model_variant = Some(ModelVariant::Voxtral4BTts2603);
+
+        let profile = executor.execution_profile(&request).unwrap();
+
+        assert_eq!(profile.mode, ExecutionMode::Sequence);
+        assert!(profile.incremental_decode);
+        assert_eq!(profile.prefill, PrefillMode::Full);
     }
 
     #[test]

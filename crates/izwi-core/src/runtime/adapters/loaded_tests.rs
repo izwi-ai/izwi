@@ -956,6 +956,15 @@ fn loaded_models_clamp_to_their_family_certified_width() {
         assert_eq!(widest(ModelVariant::Lfm2512BInstructGguf, backend), 8);
         assert_eq!(widest(ModelVariant::Qwen306B, backend), 2);
         assert_eq!(widest(ModelVariant::WhisperLargeV3Turbo, backend), 2);
+        // ASR families certified wider on CUDA keep the portable rows.
+        for variant in [
+            ModelVariant::Qwen3Asr17BGguf,
+            ModelVariant::VibeVoiceAsr,
+            ModelVariant::ParakeetTdt06BV3,
+            ModelVariant::Nemotron35AsrStreaming06B,
+        ] {
+            assert_eq!(widest(variant, backend), 2, "{variant} {backend:?}");
+        }
     }
     assert_eq!(widest(ModelVariant::Qwen3508BGguf, BackendKind::Metal), 8);
     assert_eq!(widest(ModelVariant::Qwen3508BGguf, BackendKind::Cpu), 2);
@@ -966,8 +975,139 @@ fn loaded_models_clamp_to_their_family_certified_width() {
     );
 }
 
+/// On CUDA with an automatic width (the registry's ASR engine width at the
+/// CUDA ceiling), Qwen3-ASR, VibeVoice-ASR, Parakeet, Nemotron ASR, Whisper
+/// and Granite Speech 4.1 (on its retained route) decode up to 32 rows per
+/// step while their encoder preparation and prefill stay
+/// at the engine's eight, so neither workspace scales with the decode; a
+/// load's fitted width narrows only the decode. Every other ASR family keeps
+/// the engine rows.
 #[test]
-fn missing_concurrency_evidence_keeps_whisper_decoder_scalar_while_encoder_is_static() {
+fn batched_asr_families_decode_at_the_asr_width_and_prepare_at_the_engine_rows() {
+    let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1)
+        .unwrap()
+        .with_asr_tensor_batch_size(crate::catalog::asr_engine_width(BackendKind::Cuda, 8, true));
+    let sequence_graph = |variant: ModelVariant, fitted: Option<usize>| {
+        let draft = LoadedModelBundleDraft::build_with_asr_decode_width(
+            &registry,
+            ExecutionGroupId::new(47),
+            ModelInstanceId::new(1),
+            variant,
+            BackendKind::Cuda,
+            fitted,
+        )
+        .unwrap();
+        install_test_preparation_seals(&draft, BackendKind::Cuda, 8);
+        draft
+            .execution_contracts(CapabilityKind::Asr)
+            .unwrap()
+            .into_iter()
+            .find(|contract| contract.execution_profile.mode == ExecutionMode::Sequence)
+            .unwrap_or_else(|| panic!("{variant} has a retained sequence graph"))
+    };
+    let stage = |contract: &LoadedExecutionContract, selector| {
+        contract
+            .stages
+            .iter()
+            .find(|stage| stage.selector == selector)
+            .unwrap_or_else(|| panic!("{selector:?} stage"))
+            .clone()
+    };
+    // (variant, preparation rows, prefill rows)
+    let granite_retained =
+        crate::models::architectures::granite_speech::asr::granite_speech_retained_decode_enabled();
+    for (variant, preparation_rows, prefill_rows) in [
+        (ModelVariant::Qwen3Asr06BGguf, 8, 1),
+        (ModelVariant::Qwen3Asr17BGguf, 8, 1),
+        (ModelVariant::VibeVoiceAsr, 1, 8),
+        (ModelVariant::ParakeetTdt06BV3, 8, 8),
+        (ModelVariant::Nemotron35AsrStreaming06B, 8, 8),
+        (ModelVariant::WhisperLargeV3Turbo, 8, 1),
+        (ModelVariant::GraniteSpeech412BPlus, 8, 1),
+    ]
+    .into_iter()
+    .filter(|(variant, _, _)| granite_retained || *variant != ModelVariant::GraniteSpeech412BPlus)
+    {
+        for (fitted, decode_rows) in [(None, 32), (Some(32), 32), (Some(16), 16), (Some(8), 8)] {
+            let contract = sequence_graph(variant, fitted);
+            let decode = stage(&contract, StageWorkSelector::SequenceDecode);
+            assert_eq!(decode.batch_mode, NativeBatchMode::Continuous, "{variant}");
+            assert_eq!(decode.max_batch_size, decode_rows, "{variant} {fitted:?}");
+            assert_eq!(decode.max_work_units, decode_rows as u64, "{variant}");
+            if decode.workspace_per_row_bytes > 0 {
+                assert_eq!(
+                    decode.max_workspace_bytes,
+                    decode.workspace_per_row_bytes * decode_rows as u64,
+                    "{variant}"
+                );
+            }
+            assert_eq!(contract.execution_profile.max_batch_size, decode_rows);
+            assert_eq!(
+                stage(&contract, StageWorkSelector::PreSequencePreparation).max_batch_size,
+                preparation_rows,
+                "{variant} {fitted:?}"
+            );
+            assert_eq!(
+                stage(&contract, StageWorkSelector::SequencePrefill).max_batch_size,
+                prefill_rows,
+                "{variant} {fitted:?}"
+            );
+        }
+    }
+    // The encoder batchers form at most the preparation width, with the
+    // per-row budget a batch of eight had.
+    let parakeet = sequence_graph(ModelVariant::ParakeetTdt06BV3, None);
+    let preparation = stage(&parakeet, StageWorkSelector::PreSequencePreparation);
+    assert_eq!(preparation.max_work_units, 8 * 64 * 1024 * 1024);
+    assert_eq!(preparation.max_workspace_bytes, 8 * 4 * 1024 * 1024 * 1024);
+    let prefill = stage(&parakeet, StageWorkSelector::SequencePrefill);
+    assert_eq!(prefill.max_work_units, 8);
+    assert_eq!(prefill.max_workspace_bytes, 8 * 16 * 1024 * 1024);
+    // LFM2.5 Audio keeps the engine rows on CUDA.
+    let variant = ModelVariant::Lfm25Audio15BGguf;
+    assert_eq!(
+        registry.asr_decode_width(variant.family(), BackendKind::Cuda),
+        8,
+        "{variant}"
+    );
+    let draft = LoadedModelBundleDraft::build(
+        &registry,
+        ExecutionGroupId::new(48),
+        ModelInstanceId::new(1),
+        variant,
+        BackendKind::Cuda,
+    )
+    .unwrap();
+    install_test_preparation_seals(&draft, BackendKind::Cuda, 8);
+    let widest = draft
+        .execution_contracts(CapabilityKind::Asr)
+        .unwrap()
+        .iter()
+        .flat_map(|contract| contract.stages.to_vec())
+        .map(|stage| stage.max_batch_size)
+        .max()
+        .unwrap();
+    assert!(widest <= 8, "{variant}: {widest}");
+    // Nemotron's realtime sessions keep the engine rows beside its wide
+    // offline decode.
+    let nemotron = LoadedModelBundleDraft::build(
+        &registry,
+        ExecutionGroupId::new(49),
+        ModelInstanceId::new(1),
+        ModelVariant::Nemotron35AsrStreaming06B,
+        BackendKind::Cuda,
+    )
+    .unwrap();
+    assert!(nemotron
+        .execution_contracts(CapabilityKind::RealtimeAsr)
+        .unwrap()
+        .iter()
+        .flat_map(|contract| contract.stages.iter())
+        .all(|stage| stage.max_batch_size <= 8));
+}
+
+#[test]
+fn whisper_batches_its_encoder_and_decode_while_its_prompt_prefill_stays_scalar() {
     let request_parallelism = 4;
     let registry =
         RuntimeAdapterRegistry::built_in_with_execution_limits(2, request_parallelism).unwrap();
@@ -984,25 +1124,36 @@ fn missing_concurrency_evidence_keeps_whisper_decoder_scalar_while_encoder_is_st
         .execution_contracts(CapabilityKind::Asr)
         .unwrap()
         .remove(0);
+    assert_eq!(whisper.adapter_abi_revision, WHISPER_ASR_ADAPTER_ABI);
     assert_eq!(whisper.execution_profile.max_batch_size, 2);
     assert_eq!(
         whisper.execution_profile.concurrency,
-        ConcurrencyClass::Exclusive
+        ConcurrencyClass::Batchable
     );
     assert_eq!(
-        whisper.execution_profile.physical_launch_policy,
-        PhysicalLaunchPolicy::ExecutionGroupExclusive
+        whisper.execution_profile.decode_batch,
+        NativeBatchMode::Continuous
     );
     assert_eq!(whisper.stages[0].batch_mode, NativeBatchMode::Static);
     assert_eq!(whisper.stages[0].max_batch_size, 2);
     assert_eq!(whisper.stages[0].concurrency, ConcurrencyClass::Batchable);
-    assert!(whisper.stages[1..].iter().all(|stage| {
-        stage.batch_mode == NativeBatchMode::None
-            && stage.max_batch_size == 1
-            && stage.concurrency == ConcurrencyClass::Exclusive
-            && stage.shape_policy == StageShapePolicy::Exact
-            && stage.physical_launch_policy == PhysicalLaunchPolicy::ExecutionGroupExclusive
-    }));
+    let prefill = &whisper.stages[1];
+    assert_eq!(prefill.selector, StageWorkSelector::SequencePrefill);
+    assert_eq!(prefill.batch_mode, NativeBatchMode::None);
+    assert_eq!(prefill.max_batch_size, 1);
+    assert_eq!(prefill.concurrency, ConcurrencyClass::Exclusive);
+    assert_eq!(prefill.shape_policy, StageShapePolicy::Exact);
+    let decode = &whisper.stages[2];
+    assert_eq!(decode.selector, StageWorkSelector::SequenceDecode);
+    assert_eq!(decode.name, "asr.decode.whisper.tensor_continuous");
+    assert_eq!(decode.batch_mode, NativeBatchMode::Continuous);
+    assert_eq!(decode.max_batch_size, 2);
+    assert_eq!(decode.concurrency, ConcurrencyClass::Batchable);
+    assert!(decode.workspace_per_row_bytes > 0);
+    assert_eq!(
+        decode.max_workspace_bytes,
+        2 * decode.workspace_per_row_bytes
+    );
 
     for (index, variant) in [ModelVariant::Kokoro82M].into_iter().enumerate() {
         let tts = LoadedModelBundleDraft::build(
@@ -1108,7 +1259,11 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                     let vibevoice_asr = execution.metadata().capability == CapabilityKind::Asr
                         && variant.family() == crate::catalog::ModelFamily::VibeVoiceAsr;
                     let granite_asr = execution.metadata().capability == CapabilityKind::Asr
-                        && variant.family() == crate::catalog::ModelFamily::GraniteSpeechAsr;
+                        && matches!(
+                            variant.family(),
+                            crate::catalog::ModelFamily::GraniteSpeechAsr
+                                | crate::catalog::ModelFamily::GraniteSpeech5Asr
+                        );
                     let whisper_asr = execution.metadata().capability == CapabilityKind::Asr
                         && variant.family() == crate::catalog::ModelFamily::WhisperAsr;
                     let lfm_audio_asr = execution.metadata().capability
@@ -1142,6 +1297,10 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                         );
                     let parakeet_asr = execution.metadata().capability == CapabilityKind::Asr
                         && variant.family() == crate::catalog::ModelFamily::ParakeetAsr;
+                    let nemotron_asr = execution.metadata().capability == CapabilityKind::Asr
+                        && variant.family() == crate::catalog::ModelFamily::NemotronAsr;
+                    let voxtral_asr = execution.metadata().capability == CapabilityKind::Asr
+                        && variant.family() == crate::catalog::ModelFamily::Voxtral;
                     let nemotron_transcribe_asr = execution.metadata().capability
                         == CapabilityKind::Asr
                         && variant.family() == crate::catalog::ModelFamily::NemotronTranscribeAsr;
@@ -1158,10 +1317,13 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                     if (qwen3_asr
                         || vibevoice_asr
                         || granite_asr
+                        || whisper_asr
                         || lfm_audio_asr
                         || qwen3_tts
                         || retained_tts
                         || parakeet_asr
+                        || nemotron_asr
+                        || voxtral_asr
                         || nemotron_transcribe_asr
                         || engine_realtime
                         || nemotron_realtime)
@@ -1181,15 +1343,6 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                         assert_eq!(contract.execution_profile.max_batch_size, 8);
                         assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::None);
                         assert_eq!(contract.stages[2].batch_mode, NativeBatchMode::Continuous);
-                    } else if whisper_asr
-                        && contract.execution_profile.mode == ExecutionMode::Sequence
-                    {
-                        assert_eq!(contract.execution_profile.max_batch_size, 8);
-                        assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
-                        assert_eq!(contract.stages[0].max_batch_size, 8);
-                        assert!(contract.stages[1..]
-                            .iter()
-                            .all(|stage| stage.batch_mode == NativeBatchMode::None));
                     } else if kokoro_tts
                         && contract
                             .stages
@@ -1316,6 +1469,7 @@ fn whisper_metadata_and_adapter_abi_cannot_manufacture_concurrent_decode_policy(
                 dtype: "f32".into(),
                 max_batch_size: 3,
                 max_workspace_bytes: 1024,
+                decode_workspace_per_row_bytes: 512,
             },
         )
         .unwrap();
@@ -1444,6 +1598,202 @@ fn scalar_adapters_remain_exact_width_one_without_concurrency_evidence() {
     assert_eq!(contract.stages[1].max_batch_size, 1);
 }
 
+/// Voxtral offline ASR binds a row graph (width-1 preparation, scalar
+/// prompt prefill, continuous decode at its decode width) for audio within
+/// the realtime ceiling, and the one-stage atomic graph for long audio and
+/// pipelines under the same adapter identity; the offline state accepts
+/// both, on the realtime sessions' retained contract.
+#[test]
+fn voxtral_offline_rows_bind_a_row_graph_and_long_audio_the_atomic_graph() {
+    use crate::models::architectures::voxtral::{
+        voxtral_offline_physical_state_spec, voxtral_retained_contract,
+        VOXTRAL_OFFLINE_DECODE_STAGE, VOXTRAL_OFFLINE_PREFILL_STAGE,
+        VOXTRAL_OFFLINE_PREPARATION_STAGE,
+    };
+    let variant = ModelVariant::VoxtralMini4BRealtime2602;
+    let metadata = *RuntimeAdapterRegistry::built_in()
+        .require(CapabilityKind::Asr, variant)
+        .unwrap();
+    assert_eq!(
+        metadata.state_requirement,
+        InferenceStateRequirement::RetainedAndInvocation
+    );
+    for (backend, engine_rows, decode_rows) in [
+        (BackendKind::Cpu, 2, 2),
+        (BackendKind::Metal, 2, 2),
+        (BackendKind::Cuda, 8, 32),
+    ] {
+        let adapter = VoxtralAsrExecutionAdapter::new(
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(9),
+            metadata,
+            backend,
+            engine_rows,
+        )
+        .with_decode_batch_size(decode_rows);
+        // Long audio needs no preparation geometry; rows do.
+        let long = adapter
+            .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+            .unwrap();
+        assert!(adapter.contract(StreamingRequirements::NONE).is_err());
+        adapter
+            .install_test_preparation_seal(backend, engine_rows)
+            .unwrap();
+        assert_eq!(long.adapter_abi_revision, VOXTRAL_ASR_ADAPTER_ABI);
+        assert_eq!(long.stages.len(), 1);
+        assert_eq!(long.stages[0].selector, StageWorkSelector::Atomic);
+        assert_eq!(long.execution_profile.max_batch_size, 1);
+
+        for streaming in [
+            StreamingRequirements::NONE,
+            StreamingRequirements::transport_only(),
+        ] {
+            let row = adapter.contract(streaming).unwrap();
+            assert_eq!(row.adapter_abi_revision, VOXTRAL_ASR_ADAPTER_ABI);
+            assert_eq!(row.execution_profile.mode, ExecutionMode::Sequence);
+            assert_eq!(row.execution_profile.cache_mode, CacheMode::ExternalPaged);
+            assert_eq!(row.execution_profile.max_batch_size, decode_rows);
+            let shape = row
+                .stages
+                .iter()
+                .map(|stage| {
+                    (
+                        stage.name.as_str(),
+                        stage.selector,
+                        stage.batch_mode,
+                        stage.max_batch_size,
+                        stage.concurrency,
+                        stage.output_visibility,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                shape,
+                [
+                    (
+                        VOXTRAL_OFFLINE_PREPARATION_STAGE,
+                        StageWorkSelector::PreSequencePreparation,
+                        NativeBatchMode::None,
+                        1,
+                        ConcurrencyClass::Exclusive,
+                        OutputVisibility::AfterQuantumCommit,
+                    ),
+                    (
+                        VOXTRAL_OFFLINE_PREFILL_STAGE,
+                        StageWorkSelector::SequencePrefill,
+                        NativeBatchMode::None,
+                        1,
+                        ConcurrencyClass::Exclusive,
+                        OutputVisibility::AfterQuantumCommit,
+                    ),
+                    (
+                        VOXTRAL_OFFLINE_DECODE_STAGE,
+                        StageWorkSelector::SequenceDecode,
+                        NativeBatchMode::Continuous,
+                        decode_rows,
+                        ConcurrencyClass::Batchable,
+                        OutputVisibility::AfterQuantumCommit,
+                    ),
+                ]
+            );
+            assert_eq!(row.stages[0].max_workspace_bytes, 4_000_000);
+            assert_eq!(
+                row.stages[2].max_workspace_bytes,
+                asr::VOXTRAL_OFFLINE_DECODE_ROW_WORKSPACE_BYTES * decode_rows as u64
+            );
+
+            let mut invocation = crate::kv::v2::test_contract();
+            for domain in &mut invocation.domains {
+                if let crate::kv::v2::StateDomainSpec::PagedAttention(domain) = domain {
+                    domain.header.scope = crate::kv::v2::StateScope::Invocation;
+                    domain.header.prefix = crate::kv::v2::PrefixPolicy::Disabled;
+                    domain.header.checkpoint = crate::kv::v2::CheckpointPolicy::None;
+                }
+            }
+            for group in &mut invocation.groups {
+                group.prefix_shareable = false;
+            }
+            let retained = voxtral_retained_contract(invocation.clone()).unwrap();
+            let spec = voxtral_offline_physical_state_spec(
+                &[&row.stages, &long.stages],
+                invocation,
+                retained.clone(),
+                1_024,
+            )
+            .unwrap();
+            assert_eq!(
+                spec.descriptor.retained,
+                RetainedStateCapability::Managed { contract: retained }
+            );
+            // The realtime graph is not an offline graph.
+            assert!(voxtral_offline_physical_state_spec(
+                &[&row.stages[1..]],
+                spec.invocation.clone(),
+                spec.retained.clone(),
+                1_024,
+            )
+            .is_err());
+        }
+    }
+}
+
+/// Every offline Voxtral row the row graph admits fits the preparation stage
+/// it binds, at the published geometry: the request's own encoder workspace
+/// plus whatever the stage adds per row stays within the maximum the load
+/// sealed, from 5 s clips to the longest row (the realtime ceiling, at
+/// 16 kHz and after a 44.1 kHz resample). On the H100 at af9ba52b6 every
+/// request was refused ("native preparation workspace 1453588480 exceeds
+/// loaded stage maximum 1180958720"): the stage added its sealed maximum per
+/// row on top of the workspace the row already priced.
+#[test]
+fn voxtral_offline_rows_fit_their_sealed_preparation_stage() {
+    use crate::models::architectures::voxtral::realtime::PublishedVoxtralRealtimePricing;
+    use crate::runtime::adapters::voxtral_offline_preparation_cost;
+    use crate::runtime::coordinator::native_preparation_workspace;
+    let variant = ModelVariant::VoxtralMini4BRealtime2602;
+    let metadata = *RuntimeAdapterRegistry::built_in()
+        .require(CapabilityKind::Asr, variant)
+        .unwrap();
+    for (backend, dtype) in [
+        (BackendKind::Cuda, candle_core::DType::BF16),
+        (BackendKind::Metal, candle_core::DType::BF16),
+        (BackendKind::Cpu, candle_core::DType::F32),
+    ] {
+        let pricing = PublishedVoxtralRealtimePricing::load(dtype);
+        let adapter = VoxtralAsrExecutionAdapter::new(
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(9),
+            metadata,
+            backend,
+            8,
+        )
+        .with_decode_batch_size(32);
+        adapter.install_preparation_seal(pricing.seal()).unwrap();
+        let contract = adapter.contract(StreamingRequirements::NONE).unwrap();
+        let stage = &contract.stages[0];
+        assert_eq!(stage.selector, StageWorkSelector::PreSequencePreparation);
+        let ceiling = pricing.ceiling_samples();
+        let mut clips = (1..=6)
+            .map(|step| (step * 5 * 16_000, 16_000u32))
+            .collect::<Vec<_>>();
+        clips.push((ceiling, 16_000));
+        clips.push((ceiling / 16_000 * 44_100, 44_100));
+        for (samples, rate) in clips {
+            let (frames, workspace) = pricing
+                .offline_row(samples, rate)
+                .unwrap_or_else(|| panic!("{samples} samples at {rate} Hz run as a row"));
+            let cost = voxtral_offline_preparation_cost(backend, frames, workspace).unwrap();
+            assert!(cost.logical_units <= stage.max_work_units);
+            let reserved = native_preparation_workspace(stage, cost, 1).unwrap_or_else(|error| {
+                panic!("{backend:?} {samples} samples at {rate} Hz: {error}")
+            });
+            assert!(reserved.workspace_bytes().unwrap() <= stage.max_workspace_bytes);
+        }
+        // Past the ceiling the request runs the atomic graph, not this stage.
+        assert!(pricing.offline_row(ceiling + 16_000, 16_000).is_none());
+    }
+}
+
 #[test]
 fn voxtral_streaming_binds_to_its_exact_token_engine_adapter() {
     let variant = ModelVariant::VoxtralMini4BRealtime2602;
@@ -1504,7 +1854,7 @@ fn offline_asr_transport_progress_does_not_require_native_streaming() {
     assert_eq!(transport.execution_profile.mode, ExecutionMode::Sequence);
     assert_eq!(transport.execution_profile.cache_mode, CacheMode::None);
     assert_eq!(transport.stages.len(), 3);
-    assert_eq!(transport.stages[0].batch_mode, NativeBatchMode::None);
+    assert_eq!(transport.stages[0].batch_mode, NativeBatchMode::Static);
     assert_eq!(transport.stages[1].batch_mode, NativeBatchMode::Static);
     assert_eq!(transport.stages[2].batch_mode, NativeBatchMode::Continuous);
     assert_eq!(
@@ -1926,10 +2276,18 @@ fn qwen_tts_factory_binds_every_capability_to_physical_sequence_stages() {
         physical.execution_profile.decode_batch,
         NativeBatchMode::Continuous
     );
-    assert_eq!(physical.stages.len(), 2);
+    assert_eq!(physical.stages.len(), 4);
     assert_eq!(
         physical.stages[0].selector,
         StageWorkSelector::SequencePrefill
+    );
+    assert_eq!(
+        physical.stages[2].selector,
+        StageWorkSelector::SequenceAudioDecode
+    );
+    assert_eq!(
+        physical.stages[3].selector,
+        StageWorkSelector::SequenceFinalize
     );
     assert_eq!(physical.stages[0].batch_mode, NativeBatchMode::None);
     assert_eq!(physical.stages[0].max_batch_size, 1);
@@ -2021,6 +2379,85 @@ fn vibevoice_tts_preparation_uses_the_authenticated_operation_boundary() {
             .as_slice()
         )
     );
+}
+
+/// Qwen3-TTS requests decode their audio in an audio stage of the decode
+/// rows' width (a static batch from two rows, scalar at one), priced as one
+/// codec call's shared work plus each request's own, then finalize alone;
+/// IZWI_QWEN3_TTS_AUDIO_STAGE=false leaves only prefill and decode.
+#[test]
+fn qwen_tts_audio_stage_takes_the_decode_rows_and_its_kill_switch_removes_it() {
+    let metadata = LoadedModelBundleDraft::build(
+        &RuntimeAdapterRegistry::built_in(),
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(2),
+        ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+        BackendKind::Cpu,
+    )
+    .unwrap()
+    .capabilities
+    .get(&CapabilityKind::Tts)
+    .unwrap()
+    .metadata();
+    for (backend, rows) in [
+        (BackendKind::Cuda, 32),
+        (BackendKind::Metal, 2),
+        (BackendKind::Cpu, 1),
+    ] {
+        let adapter = PhysicalQwenTtsExecutionAdapter::new(
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            metadata,
+            backend,
+            1,
+        )
+        .with_decode_batch_size(rows)
+        .with_audio_stage(true);
+        let contract = adapter.contract(StreamingRequirements::NONE).unwrap();
+        let [_, decode, audio, finalize] = &contract.stages[..] else {
+            panic!("expected four stages, got {}", contract.stages.len());
+        };
+        assert_eq!(decode.max_batch_size, rows);
+        assert_eq!(audio.selector, StageWorkSelector::SequenceAudioDecode);
+        assert_eq!(audio.max_batch_size, rows);
+        assert_eq!(audio.max_work_units, rows as u64);
+        let (batch_mode, concurrency) = if rows > 1 {
+            (NativeBatchMode::Static, ConcurrencyClass::Batchable)
+        } else {
+            (NativeBatchMode::None, ConcurrencyClass::Exclusive)
+        };
+        assert_eq!(
+            (audio.batch_mode, audio.concurrency),
+            (batch_mode, concurrency)
+        );
+        assert_eq!(audio.shape_policy, StageShapePolicy::Exact);
+        let (shared, per_row) =
+            crate::models::architectures::qwen3::tts::qwen3_tts_audio_stage_workspace(backend)
+                .unwrap();
+        assert_eq!(audio.workspace_base_bytes, shared);
+        assert_eq!(audio.workspace_per_row_bytes, per_row);
+        assert_eq!(audio.max_workspace_bytes, shared + per_row * rows as u64);
+        assert_eq!(finalize.selector, StageWorkSelector::SequenceFinalize);
+        assert_eq!(finalize.max_batch_size, 1);
+        assert_eq!(finalize.max_workspace_bytes, 0);
+
+        let inline = PhysicalQwenTtsExecutionAdapter::new(
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            metadata,
+            backend,
+            1,
+        )
+        .with_decode_batch_size(rows)
+        .with_audio_stage(false)
+        .contract(StreamingRequirements::NONE)
+        .unwrap();
+        assert_eq!(inline.stages.len(), 2);
+        assert!(inline
+            .stages
+            .iter()
+            .all(|stage| stage.selector != StageWorkSelector::SequenceAudioDecode));
+    }
 }
 
 #[test]
@@ -2295,6 +2732,54 @@ fn fish_capacity_seals_both_routes_and_rejects_rebinding() {
     }
     capacity.ar_rows = 6;
     assert!(draft.seal_fish_capacity(capacity).is_err());
+}
+
+/// A natively batched Fish load publishes an invocation workspace whose
+/// per-row scratch, times each stage's rows, is that stage's ceiling. The
+/// prefill stage prices its whole batch in `max_workspace_bytes` with no
+/// per-row figure; reading that ceiling as one row's scratch made every load
+/// with more than one prefill row fail its workspace check (HTTP 400 on the
+/// H100 once Fish batched by default on CUDA).
+#[test]
+fn batched_fish_workspace_matches_every_loaded_stage() {
+    let registry = RuntimeAdapterRegistry::built_in();
+    let draft = LoadedModelBundleDraft::build(
+        &registry,
+        ExecutionGroupId::new(17),
+        ModelInstanceId::new(19),
+        ModelVariant::FishAudioS2Pro,
+        BackendKind::Cuda,
+    )
+    .unwrap();
+    let mut capacity =
+        crate::runtime::fish_capacity::ResolvedFishServingCapacity::scalar().unwrap();
+    capacity.ar_rows = 4;
+    capacity.prefill_tokens = 312;
+    capacity.codec_rows = 4;
+    capacity.active_rows = 4;
+    capacity.staged_rows = 4;
+    capacity.native_batching = true;
+    draft.seal_fish_capacity(capacity).unwrap();
+    let config = crate::models::architectures::fish_s2::config::current_config();
+    for capability in [CapabilityKind::Tts, CapabilityKind::StreamingTts] {
+        for contract in draft.execution_contracts(capability).unwrap() {
+            let prefill = contract
+                .stages
+                .iter()
+                .find(|stage| stage.selector == StageWorkSelector::SequencePrefill)
+                .unwrap();
+            assert_eq!(prefill.max_batch_size, 4);
+            let spec = crate::models::architectures::fish_s2::fish_s2_physical_state_spec(
+                &config,
+                candle_core::DType::BF16,
+                &[&contract.stages],
+            )
+            .unwrap();
+            spec.descriptor
+                .validate_against_stages(&contract.stages)
+                .unwrap();
+        }
+    }
 }
 
 #[test]
@@ -2591,13 +3076,18 @@ fn lfm25_audio_asr_factory_publishes_sealed_retained_graph_and_atomic_long_form(
     }
 }
 
-/// Granite Speech 5.0 runs on the scalar adapter, whose ASR graph is the
-/// chunked atomic stage for every request: a long file dispatches one chunk
-/// at a time (it used to hold the device for the whole file), and the normal
-/// and long-form requirements seal the same graph, so the load keeps one
-/// invocation pool. Nemotron's scalar ASR keeps its single-dispatch stage.
+/// Granite Speech 5.0's normal requirement (with or without native
+/// streaming) binds its retained sequence graph: scalar encoder
+/// preparation, scalar exact prefill, and continuous decode priced per row.
+/// A long-form requirement binds the chunked atomic stage, which dispatches
+/// one chunk at a time; with the retained route switched off it is the only
+/// graph (GRN-8). Nemotron's long-form ASR keeps its single-dispatch stage.
 #[test]
-fn granite_speech5_scalar_asr_dispatches_one_chunk_at_a_time() {
+fn granite_speech5_asr_offers_its_retained_graph_and_chunked_atomic_graph() {
+    use crate::models::architectures::granite_speech5::asr::{
+        granite_speech5_retained_decode_enabled, granite_speech5_test_physical_state_spec,
+    };
+    let retained_route = granite_speech5_retained_decode_enabled();
     let registry = RuntimeAdapterRegistry::built_in();
     for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
         let draft = LoadedModelBundleDraft::build(
@@ -2608,27 +3098,102 @@ fn granite_speech5_scalar_asr_dispatches_one_chunk_at_a_time() {
             backend,
         )
         .unwrap();
+        install_test_preparation_seals(&draft, backend, 1);
         let adapter = draft.capabilities.get(&CapabilityKind::Asr).unwrap();
-        let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
         let long = adapter
             .contract(StreamingRequirements::NONE.with_asr_long_form(true))
             .unwrap();
-        for contract in [&normal, &long] {
-            assert_eq!(contract.execution_profile.mode, ExecutionMode::Atomic);
-            assert_eq!(contract.stages.len(), 1);
-            let stage = &contract.stages[0];
-            assert_eq!(stage.name, "asr.long_form.chunked", "{backend:?}");
-            assert_eq!(stage.selector, StageWorkSelector::Atomic);
-            assert_eq!(stage.progress, StageProgressKind::Iterative);
-            assert_eq!(
-                stage.membership_safe_point,
-                MembershipSafePoint::QuantumBoundary
-            );
-        }
+        assert_eq!(long.execution_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(long.stages.len(), 1);
+        let stage = &long.stages[0];
+        assert_eq!(stage.name, "asr.granite_speech5.long_form.chunked");
+        assert_eq!(stage.selector, StageWorkSelector::Atomic);
+        assert_eq!(stage.progress, StageProgressKind::Iterative);
         assert_eq!(
-            crate::kv::v2::stage_graph_fingerprint(&normal.stages).unwrap(),
-            crate::kv::v2::stage_graph_fingerprint(&long.stages).unwrap(),
+            stage.membership_safe_point,
+            MembershipSafePoint::QuantumBoundary
         );
+        for streaming in [
+            StreamingRequirements::NONE,
+            StreamingRequirements::transport_only(),
+            StreamingRequirements::native(true),
+        ] {
+            let normal = adapter.contract(streaming).unwrap();
+            if !retained_route {
+                assert_eq!(
+                    crate::kv::v2::stage_graph_fingerprint(&normal.stages).unwrap(),
+                    crate::kv::v2::stage_graph_fingerprint(&long.stages).unwrap(),
+                );
+                continue;
+            }
+            assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
+            let names = normal
+                .stages
+                .iter()
+                .map(|stage| (stage.name.as_str(), stage.selector))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                vec![
+                    (
+                        "asr.encoder.granite_speech5",
+                        StageWorkSelector::PreSequencePreparation
+                    ),
+                    (
+                        "asr.granite_speech5.prefill.scalar",
+                        StageWorkSelector::SequencePrefill
+                    ),
+                    (
+                        "asr.granite_speech5.decode.tensor_continuous",
+                        StageWorkSelector::SequenceDecode
+                    ),
+                ]
+            );
+            let decode = &normal.stages[2];
+            assert_eq!(decode.batch_mode, NativeBatchMode::Continuous);
+            assert!(decode.workspace_per_row_bytes > 0);
+            assert_eq!(
+                decode.max_workspace_bytes,
+                decode.workspace_per_row_bytes * decode.max_batch_size as u64
+            );
+            assert_eq!(normal.stages[0].max_batch_size, 1);
+            assert_eq!(normal.stages[1].max_batch_size, 1);
+        }
+    }
+    // At four engine rows the encoder batches four requests' audio, padded,
+    // its ceilings four times one request's.
+    if retained_route {
+        let draft = LoadedModelBundleDraft::build(
+            &RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap(),
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(3),
+            ModelVariant::GraniteSpeech502BGguf,
+            BackendKind::Cuda,
+        )
+        .unwrap();
+        install_test_preparation_seals(&draft, BackendKind::Cuda, 4);
+        let normal = draft
+            .capabilities
+            .get(&CapabilityKind::Asr)
+            .unwrap()
+            .contract(StreamingRequirements::NONE)
+            .unwrap();
+        let preparation = &normal.stages[0];
+        assert_eq!(preparation.batch_mode, NativeBatchMode::Static);
+        assert_eq!(preparation.shape_policy, StageShapePolicy::Padded);
+        assert_eq!(preparation.concurrency, ConcurrencyClass::Batchable);
+        assert_eq!(preparation.max_batch_size, 4);
+        assert_eq!(preparation.max_workspace_bytes, 4 * 1024 * 1024 * 1024);
+        assert_eq!(preparation.max_work_units, 4 * 10_000);
+        assert_eq!(normal.stages[1].max_batch_size, 1);
+        let long = draft
+            .capabilities
+            .get(&CapabilityKind::Asr)
+            .unwrap()
+            .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+            .unwrap();
+        granite_speech5_test_physical_state_spec(&[normal.stages.as_ref(), long.stages.as_ref()])
+            .unwrap();
     }
     let nemotron = LoadedModelBundleDraft::build(
         &registry,
@@ -2642,7 +3207,7 @@ fn granite_speech5_scalar_asr_dispatches_one_chunk_at_a_time() {
         .capabilities
         .get(&CapabilityKind::Asr)
         .unwrap()
-        .contract(StreamingRequirements::NONE)
+        .contract(StreamingRequirements::NONE.with_asr_long_form(true))
         .unwrap();
     assert_eq!(scalar.stages[0].name, "asr.scalar");
     assert_eq!(scalar.stages[0].progress, StageProgressKind::Atomic);
@@ -2669,21 +3234,35 @@ fn whisper_normal_and_long_form_graphs_are_distinct_and_scalar() {
                 dtype: "f32".into(),
                 max_batch_size: 4,
                 max_workspace_bytes: 1024,
+                decode_workspace_per_row_bytes: 512,
             },
         )
         .unwrap();
     let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
     assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
     assert_eq!(normal.execution_profile.max_batch_size, 4);
-    assert_eq!(normal.execution_profile.decode_batch, NativeBatchMode::None);
+    assert_eq!(
+        normal.execution_profile.decode_batch,
+        NativeBatchMode::Continuous
+    );
     assert_eq!(normal.stages[0].name, "asr.encoder.whisper");
     assert_eq!(normal.stages[0].batch_mode, NativeBatchMode::Static);
     assert_eq!(
         normal.stages[1].selector,
         StageWorkSelector::SequencePrefill
     );
+    assert_eq!(normal.stages[1].batch_mode, NativeBatchMode::None);
+    assert_eq!(normal.stages[1].max_batch_size, 1);
     assert_eq!(normal.stages[2].selector, StageWorkSelector::SequenceDecode);
-    assert_eq!(normal.stages[2].batch_mode, NativeBatchMode::None);
+    assert_eq!(normal.stages[2].batch_mode, NativeBatchMode::Continuous);
+    assert_eq!(normal.stages[2].concurrency, ConcurrencyClass::Batchable);
+    assert_eq!(normal.stages[2].max_batch_size, 4);
+    assert_eq!(normal.stages[2].max_work_units, 4);
+    assert!(normal.stages[2].workspace_per_row_bytes > 512);
+    assert_eq!(
+        normal.stages[2].max_workspace_bytes,
+        4 * normal.stages[2].workspace_per_row_bytes
+    );
 
     let long = adapter
         .contract(StreamingRequirements::NONE.with_asr_long_form(true))
@@ -2743,6 +3322,32 @@ fn parakeet_long_form_graph_is_one_atomic_stage_beside_the_sequence_graph() {
         .stages
         .iter()
         .all(|stage| stage.selector != StageWorkSelector::Atomic));
+    // Concurrent short clips encode as one padded batch of the engine's
+    // width, each row with the budget a lone row had.
+    let preparation = &normal.stages[0];
+    assert_eq!(
+        preparation.selector,
+        StageWorkSelector::PreSequencePreparation
+    );
+    assert_eq!(preparation.batch_mode, NativeBatchMode::Static);
+    assert_eq!(preparation.concurrency, ConcurrencyClass::Batchable);
+    assert_eq!(preparation.shape_policy, StageShapePolicy::Padded);
+    assert_eq!(preparation.max_padding_basis_points, 10_000);
+    assert_eq!(preparation.max_batch_size, 4);
+    assert_eq!(preparation.max_work_units, 4 * 64 * 1024 * 1024);
+    assert_eq!(preparation.max_workspace_bytes, 4 * 4 * 1024 * 1024 * 1024);
+    assert_eq!(normal.adapter_abi_revision, AdapterAbiRevision::new(29));
+    let solo = ParakeetAsrExecutionAdapter::new(
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(2),
+        metadata,
+        BackendKind::Cpu,
+        1,
+    )
+    .contract(StreamingRequirements::NONE)
+    .unwrap();
+    assert_eq!(solo.stages[0].max_batch_size, 1);
+    assert_eq!(solo.stages[0].max_workspace_bytes, 4 * 1024 * 1024 * 1024);
 
     let long = adapter
         .contract(StreamingRequirements::NONE.with_asr_long_form(true))
@@ -2762,13 +3367,141 @@ fn parakeet_long_form_graph_is_one_atomic_stage_beside_the_sequence_graph() {
         .is_ok());
 }
 
-/// A Granite Speech ASR adapter with its retained sequence route on. The
-/// route is dormant until Granite resumes prefill (GRN-8); these tests keep
-/// its graph honest for that day.
-fn granite_retained_route_adapter(
+/// Nemotron 3.5 ASR Streaming's offline graph decodes short clips as
+/// retained rows (a static encoder preparation batched across requests, a
+/// static predictor prefill and a continuous RNNT decode), while long audio
+/// and diarization keep the one-stage atomic graph the scalar adapter
+/// sealed, bit for bit, under the new adapter's identity.
+#[test]
+fn nemotron_offline_graph_is_retained_rows_beside_the_scalar_atomic_graph() {
+    let registry = RuntimeAdapterRegistry::built_in();
+    let metadata = *registry
+        .require(CapabilityKind::Asr, ModelVariant::Nemotron35AsrStreaming06B)
+        .unwrap();
+    assert_eq!(
+        metadata.state_requirement,
+        InferenceStateRequirement::RetainedAndInvocation
+    );
+    let adapter = NemotronAsrExecutionAdapter::new(
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(2),
+        metadata,
+        BackendKind::Cpu,
+        4,
+    );
+    let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
+    assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
+    assert_eq!(normal.execution_profile.cache_mode, CacheMode::None);
+    assert_eq!(normal.adapter_abi_revision, AdapterAbiRevision::new(1));
+    assert_eq!(
+        normal
+            .stages
+            .iter()
+            .map(|stage| (stage.name.as_str(), stage.selector, stage.batch_mode))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "asr.encoder.nemotron",
+                StageWorkSelector::PreSequencePreparation,
+                NativeBatchMode::Static
+            ),
+            (
+                "asr.prefill.nemotron.predictor",
+                StageWorkSelector::SequencePrefill,
+                NativeBatchMode::Static
+            ),
+            (
+                "asr.decode.nemotron.joint",
+                StageWorkSelector::SequenceDecode,
+                NativeBatchMode::Continuous
+            ),
+        ]
+    );
+    // Concurrent clips encode as one padded batch of the engine's width,
+    // each row with the budget a lone row had.
+    let preparation = &normal.stages[0];
+    assert_eq!(preparation.concurrency, ConcurrencyClass::Batchable);
+    assert_eq!(preparation.shape_policy, StageShapePolicy::Padded);
+    assert_eq!(preparation.progress, StageProgressKind::Atomic);
+    assert_eq!(preparation.max_batch_size, 4);
+    assert_eq!(preparation.max_work_units, 4 * 64 * 1024 * 1024);
+    assert_eq!(preparation.max_workspace_bytes, 4 * 1024 * 1024 * 1024);
+    for stage in &normal.stages[1..] {
+        assert_eq!(stage.max_batch_size, 4);
+        assert_eq!(stage.concurrency, ConcurrencyClass::Batchable);
+        assert_eq!(stage.shape_policy, StageShapePolicy::Ragged);
+        assert_eq!(stage.workspace_per_row_bytes, 16 * 1024 * 1024);
+        assert_eq!(stage.max_workspace_bytes, 4 * 16 * 1024 * 1024);
+        assert_eq!(
+            stage.retained_state_selections,
+            Some(vec![ClockedStateSelection::new(
+                crate::models::architectures::nemotron::asr::NEMOTRON_OFFLINE_GROUP,
+                StateClock::DecoderTokens,
+            )
+            .unwrap()])
+        );
+    }
+    let solo = NemotronAsrExecutionAdapter::new(
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(2),
+        metadata,
+        BackendKind::Cpu,
+        1,
+    )
+    .contract(StreamingRequirements::NONE)
+    .unwrap();
+    assert_eq!(solo.stages[0].max_batch_size, 1);
+    assert_eq!(solo.stages[0].max_workspace_bytes, 1024 * 1024 * 1024);
+
+    for streaming in [
+        StreamingRequirements::NONE,
+        StreamingRequirements::transport_only(),
+    ] {
+        let long = adapter
+            .contract(streaming.with_asr_long_form(true))
+            .unwrap();
+        let scalar = scalar_contract(
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            adapter.adapter_instance_id(),
+            adapter.adapter_abi_revision(),
+            metadata,
+            BackendKind::Cpu,
+            1,
+            streaming,
+        )
+        .unwrap();
+        assert_eq!(long.execution_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(long.adapter_abi_revision, AdapterAbiRevision::new(1));
+        assert_eq!(long.stages.len(), 1);
+        assert_eq!(long.stages[0].name, "asr.scalar");
+        assert_eq!(long.stages[0].batch_mode, NativeBatchMode::None);
+        assert_eq!(long.stages[0].max_batch_size, 1);
+        assert_eq!(
+            crate::kv::v2::stage_graph_fingerprint(&long.stages).unwrap(),
+            crate::kv::v2::stage_graph_fingerprint(&scalar.stages).unwrap(),
+        );
+        assert!(long
+            .adapter_binding()
+            .unwrap()
+            .stage_for_work(&crate::engine::WorkUnit::AtomicJob {
+                kind: "diarization.transcribe".into(),
+            })
+            .is_ok());
+    }
+    assert!(adapter
+        .contract(StreamingRequirements::native(true))
+        .is_err());
+}
+
+/// A Granite Speech ASR adapter with its retained sequence route on or off
+/// (`IZWI_GRANITE_SPEECH_RETAINED_DECODE`, on by default), whatever this
+/// process's switch reads.
+fn granite_adapter(
     metadata: AdapterMetadata,
     backend: BackendKind,
     max_batch_size: usize,
+    retained_route: bool,
 ) -> GraniteSpeechAsrExecutionAdapter {
     let mut adapter = GraniteSpeechAsrExecutionAdapter::new(
         ExecutionGroupId::new(1),
@@ -2777,12 +3510,24 @@ fn granite_retained_route_adapter(
         backend,
         max_batch_size,
     );
-    adapter.retained_route = true;
+    adapter.retained_route = retained_route;
     adapter
 }
 
+fn granite_retained_route_adapter(
+    metadata: AdapterMetadata,
+    backend: BackendKind,
+    max_batch_size: usize,
+) -> GraniteSpeechAsrExecutionAdapter {
+    granite_adapter(metadata, backend, max_batch_size, true)
+}
+
+/// The built-in Granite Speech ASR adapter follows the process switch, and
+/// its factory's batch mode with it.
 #[test]
-fn granite_speech_without_resumable_prefill_offers_only_its_atomic_graph() {
+fn granite_speech_adapter_follows_the_retained_decode_switch() {
+    let enabled =
+        crate::models::architectures::granite_speech::asr::granite_speech_retained_decode_enabled();
     let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
     let draft = LoadedModelBundleDraft::build(
         &registry,
@@ -2792,10 +3537,38 @@ fn granite_speech_without_resumable_prefill_offers_only_its_atomic_graph() {
         BackendKind::Metal,
     )
     .unwrap();
+    install_test_preparation_seals(&draft, BackendKind::Metal, 8);
+    let normal = draft.capabilities[&CapabilityKind::Asr]
+        .contract(StreamingRequirements::NONE)
+        .unwrap();
+    assert_eq!(
+        normal.execution_profile.mode,
+        if enabled {
+            ExecutionMode::Sequence
+        } else {
+            ExecutionMode::Atomic
+        }
+    );
+    assert_eq!(
+        GraniteSpeechPhysicalAsrAdapterFactory.batch_mode(),
+        if enabled {
+            NativeBatchMode::Continuous
+        } else {
+            NativeBatchMode::None
+        }
+    );
+}
+
+#[test]
+fn granite_speech_without_resumable_prefill_offers_only_its_atomic_graph() {
+    let metadata = *RuntimeAdapterRegistry::built_in()
+        .require(CapabilityKind::Asr, ModelVariant::GraniteSpeech412BPlus)
+        .unwrap();
+    let adapter = granite_adapter(metadata, BackendKind::Metal, 8, false);
     // Every selectable graph is known when the bundle is drafted, before the
     // weights load: none waits on the preparation seal.
-    let contracts = draft.execution_contracts(CapabilityKind::Asr).unwrap();
-    let atomic = draft.capabilities[&CapabilityKind::Asr]
+    let contracts = loaded_execution_contracts(&adapter).unwrap();
+    let atomic = adapter
         .contract(StreamingRequirements::NONE.with_asr_long_form(true))
         .unwrap();
     for contract in &contracts {
@@ -2811,25 +3584,22 @@ fn granite_speech_without_resumable_prefill_offers_only_its_atomic_graph() {
         )));
     }
     // An ordinary requirement re-seals the long-form graph exactly.
-    let normal = draft.capabilities[&CapabilityKind::Asr]
-        .contract(StreamingRequirements::NONE)
-        .unwrap();
+    let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
     assert_eq!(
         stage_graph_fingerprint(&normal.stages).unwrap(),
         stage_graph_fingerprint(&atomic.stages).unwrap()
     );
     // The model's preparation seal still installs, and changes no graph.
-    install_test_preparation_seals(&draft, BackendKind::Metal, 8);
+    adapter
+        .install_test_preparation_seal(BackendKind::Metal, 8)
+        .unwrap();
     assert_eq!(
-        draft
-            .execution_contracts(CapabilityKind::Asr)
-            .unwrap()
-            .len(),
+        loaded_execution_contracts(&adapter).unwrap().len(),
         contracts.len()
     );
     assert_eq!(
         stage_graph_fingerprint(
-            &draft.capabilities[&CapabilityKind::Asr]
+            &adapter
                 .contract(StreamingRequirements::NONE)
                 .unwrap()
                 .stages
@@ -3041,6 +3811,7 @@ fn vibevoice_normal_graph_has_scalar_preparation_and_ragged_decode() {
             prefill_max_batch_work_units: 4 * 1_500,
             prefill_max_batch_workspace_bytes: 4 * 64 * 1024 * 1024,
             decode_workspace_per_row_bytes: 8_192,
+            legacy_workspace_bytes: 96 * 1024 * 1024,
         })
         .unwrap();
 
@@ -3100,6 +3871,23 @@ fn vibevoice_normal_graph_has_scalar_preparation_and_ragged_decode() {
     assert_eq!(legacy.stages.len(), 1);
     assert_eq!(legacy.stages[0].name, "asr.scalar");
     assert_eq!(legacy.stages[0].selector, StageWorkSelector::Atomic);
+    // The one exclusive pass over a long file reserves its sealed workspace
+    // as each dispatch's row cost.
+    assert_eq!(legacy.stages[0].max_batch_size, 1);
+    assert_eq!(legacy.stages[0].workspace_per_row_bytes, 96 * 1024 * 1024);
+    assert_eq!(legacy.stages[0].max_workspace_bytes, 96 * 1024 * 1024);
+
+    // The weight-free route probe reads the long-form graph before any seal.
+    let probe = VibeVoiceAsrExecutionAdapter::new(
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(3),
+        metadata,
+        BackendKind::Cpu,
+        4,
+    )
+    .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+    .unwrap();
+    assert!(contract_supports_atomic_blocking(&probe));
 }
 
 #[test]
@@ -3263,5 +4051,137 @@ fn voxtral_tts_factory_publishes_retained_batched_graph_on_all_backends() {
             .stages
             .iter()
             .all(|stage| { stage.output_visibility == OutputVisibility::AfterQuantumCommit }));
+    }
+}
+
+/// On CUDA with an automatic width, Qwen3-TTS, Maya1, Maya 2 and Chatterbox
+/// decode up to 32 rows per step (their decode steps every row in one launch
+/// per op, padded to one row-invariant shape) while preparation and prefill
+/// stay at the engine's eight; other TTS families keep the engine rows, and
+/// on Metal every family does.
+#[test]
+fn batched_tts_families_decode_at_the_tts_width_and_prefill_at_the_engine_rows() {
+    let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1)
+        .unwrap()
+        .with_tts_tensor_batch_size(crate::catalog::asr_engine_width(BackendKind::Cuda, 8, true));
+    let sequence_graph = |variant: ModelVariant, backend: BackendKind| {
+        LoadedModelBundleDraft::build(
+            &registry,
+            ExecutionGroupId::new(57),
+            ModelInstanceId::new(1),
+            variant,
+            backend,
+        )
+        .unwrap()
+        .execution_contracts(CapabilityKind::Tts)
+        .unwrap()
+        .into_iter()
+        .find(|contract| contract.execution_profile.mode == ExecutionMode::Sequence)
+        .unwrap_or_else(|| panic!("{variant} has a sequence graph"))
+    };
+    let stage = |contract: &LoadedExecutionContract, selector| {
+        contract
+            .stages
+            .iter()
+            .find(|stage| stage.selector == selector)
+            .unwrap_or_else(|| panic!("{selector:?} stage"))
+            .clone()
+    };
+    // (variant, prefill rows)
+    for (variant, prefill_rows) in [
+        (ModelVariant::Qwen3Tts12Hz06BCustomVoice, 1),
+        (ModelVariant::Qwen3Tts12Hz17BBase, 1),
+        (ModelVariant::Maya13B, 8),
+        (ModelVariant::Maya2Native25B, 8),
+        (ModelVariant::Chatterbox500M, 8),
+        (ModelVariant::Voxtral4BTts2603, 8),
+    ] {
+        assert_eq!(
+            registry.tts_decode_width(variant.family(), BackendKind::Cuda),
+            32
+        );
+        let contract = sequence_graph(variant, BackendKind::Cuda);
+        let decode = stage(&contract, StageWorkSelector::SequenceDecode);
+        assert_eq!(decode.batch_mode, NativeBatchMode::Continuous, "{variant}");
+        assert_eq!(decode.max_batch_size, 32, "{variant}");
+        assert_eq!(contract.execution_profile.max_batch_size, 32, "{variant}");
+        assert_eq!(
+            stage(&contract, StageWorkSelector::SequencePrefill).max_batch_size,
+            prefill_rows,
+            "{variant}"
+        );
+        let portable = sequence_graph(variant, BackendKind::Metal);
+        assert_eq!(
+            stage(&portable, StageWorkSelector::SequenceDecode).max_batch_size,
+            8,
+            "{variant} on Metal"
+        );
+    }
+    for variant in [
+        ModelVariant::Kokoro82M,
+        ModelVariant::FishAudioS2Pro,
+        ModelVariant::VibeVoice15BTts,
+    ] {
+        assert_eq!(
+            registry.tts_decode_width(variant.family(), BackendKind::Cuda),
+            8,
+            "{variant}"
+        );
+    }
+}
+
+/// Maya1's audio windows decode for up to the engine rows per quantum on
+/// CUDA (SNAC calls of fixed rows keep each request's samples its own); on
+/// Metal and the CPU one request's window a quantum, as before.
+#[test]
+fn maya1_audio_windows_batch_across_requests_on_cuda_only() {
+    let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
+    for variant in [ModelVariant::Maya13B, ModelVariant::Maya13BGguf] {
+        for (backend, rows, mode, concurrency) in [
+            (
+                BackendKind::Cuda,
+                8,
+                NativeBatchMode::Static,
+                ConcurrencyClass::Batchable,
+            ),
+            (
+                BackendKind::Metal,
+                1,
+                NativeBatchMode::None,
+                ConcurrencyClass::Exclusive,
+            ),
+            (
+                BackendKind::Cpu,
+                1,
+                NativeBatchMode::None,
+                ConcurrencyClass::Exclusive,
+            ),
+        ] {
+            let contract = LoadedModelBundleDraft::build(
+                &registry,
+                ExecutionGroupId::new(58),
+                ModelInstanceId::new(1),
+                variant,
+                backend,
+            )
+            .unwrap()
+            .execution_contracts(CapabilityKind::Tts)
+            .unwrap()
+            .into_iter()
+            .find(|contract| contract.execution_profile.mode == ExecutionMode::Sequence)
+            .unwrap();
+            let audio = contract
+                .stages
+                .iter()
+                .find(|stage| stage.selector == StageWorkSelector::SequenceAudioDecode)
+                .unwrap();
+            assert_eq!(
+                (audio.batch_mode, audio.max_batch_size, audio.concurrency),
+                (mode, rows, concurrency),
+                "{variant} on {backend:?}"
+            );
+            assert_eq!(audio.max_work_units, rows as u64);
+            assert_eq!(audio.max_workspace_bytes, 256 * 1024 * 1024 * rows as u64);
+        }
     }
 }

@@ -11,9 +11,10 @@ use candle_nn::{ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use super::decode_graph::{GraphKey, Qwen3DecodeGraph};
 #[cfg(test)]
 use crate::backends::kv::KvArena;
 use crate::backends::kv::{
@@ -21,6 +22,9 @@ use crate::backends::kv::{
     PagedKvDecodeArgs,
 };
 use crate::error::{Error, Result};
+use crate::kernels::cuda::decode_step::{self, DecodeStepLayout, DecodeStepRow};
+use crate::kernels::cuda::kquant::{self, KQuantWeight};
+use crate::kernels::cuda::split_decode;
 use crate::kernels::{try_fused_qk_rms_norm, try_fused_silu_mul_with_status};
 use crate::kv::v2::{
     AttentionMask, AttentionPattern, CheckpointPolicy, InferenceStateContract, KeyEncoding,
@@ -29,6 +33,7 @@ use crate::kv::v2::{
     StateGroupId, StateGroupSpec, StateScope, CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::kv::KvDecodeBatchMetadata;
+use crate::kv::KvSlotRef;
 #[cfg(test)]
 use crate::kv::{CacheBlockRef, KvLayerBinding};
 use crate::models::shared::attention::flash::try_fused_self_attention;
@@ -484,7 +489,86 @@ fn record_qwen3_silu_mul_profile(fused: bool) {
 
 enum Qwen3Projection {
     Dense(Qwen3DenseProjection),
-    Quantized(QMatMul),
+    Quantized(Qwen3QuantizedProjection),
+}
+
+/// A quantized projection, with how its activations reach the kernel
+/// decided once at load.
+struct Qwen3QuantizedProjection {
+    qmatmul: QMatMul,
+    /// On CUDA, Candle's GGUF kernels take this weight's BF16/F16
+    /// activations as they are ([`qwen3_cuda_qmatmul_takes_half_activations`]),
+    /// so no F32 casts wrap the call.
+    cuda_half_activations: bool,
+    /// On CUDA, the same weight for the izwi-owned K-quant kernels, which
+    /// the decode graphs run instead of `QMatMul` (whose process-global
+    /// scratch a graph cannot capture); `None` for other types and devices.
+    kquant: Option<KQuantWeight>,
+}
+
+impl Qwen3QuantizedProjection {
+    fn new(qmatmul: QMatMul) -> Self {
+        let on_cuda = match &qmatmul {
+            QMatMul::QTensor(weight) => weight.device().is_cuda(),
+            QMatMul::Tensor(weight) | QMatMul::TensorF16(weight) => weight.device().is_cuda(),
+        };
+        let cuda_half_activations = on_cuda && qwen3_cuda_qmatmul_takes_half_activations(&qmatmul);
+        let kquant = KQuantWeight::from_qmatmul(&qmatmul);
+        Self {
+            qmatmul,
+            cuda_half_activations,
+            kquant,
+        }
+    }
+
+    /// `x · weightᵀ` through the K-quant kernels, as the decode graphs run
+    /// it: the activations cast to F32 (exact), quantized to Q8_1 once,
+    /// MMVQ up to eight rows and MMQ above, the F32 result cast back to the
+    /// activations' dtype. Bit for bit `QMatMul`'s result (`kquant`), which
+    /// for 16-bit activations rounds its F32 sums to them the same way.
+    fn kquant_forward(&self, weight: &KQuantWeight, x: &Tensor) -> candle_core::Result<Tensor> {
+        let activation_dtype = x.dtype();
+        let x = x.to_dtype(DType::F32)?.contiguous()?;
+        let rows = x.dims()[..x.rank().saturating_sub(1)]
+            .iter()
+            .product::<usize>();
+        let out = if rows <= kquant::MAX_ROWS {
+            kquant::mat_vec(weight, &kquant::quantize(&x)?)?
+        } else {
+            kquant::mat_mul(weight, &kquant::quantize_tiles(&x, weight.tile_scales())?)?
+        };
+        if out.dtype() == activation_dtype {
+            Ok(out)
+        } else {
+            out.to_dtype(activation_dtype)
+        }
+    }
+}
+
+thread_local! {
+    /// Set while a decode graph's body runs on this thread: quantized
+    /// projections then take the K-quant kernels ([`GraphProjections`]).
+    static GRAPH_PROJECTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Routes this thread's quantized projections through the K-quant kernels
+/// until dropped: the decode graphs' body, eager or captured.
+struct GraphProjections {
+    previous: bool,
+}
+
+impl GraphProjections {
+    fn enter() -> Self {
+        Self {
+            previous: GRAPH_PROJECTIONS.with(|on| on.replace(true)),
+        }
+    }
+}
+
+impl Drop for GraphProjections {
+    fn drop(&mut self) {
+        GRAPH_PROJECTIONS.with(|on| on.set(self.previous));
+    }
 }
 
 /// The text model's token embedding: a dense table (safetensors and MLX
@@ -529,7 +613,7 @@ impl Qwen3TokenEmbedding {
             Self::Dense(embedding) => {
                 Ok(Qwen3Projection::tied_dense(embedding.embeddings().clone()))
             }
-            Self::Quantized { table, .. } => Ok(Qwen3Projection::Quantized(table.tied_head()?)),
+            Self::Quantized { table, .. } => Ok(Qwen3Projection::from_qmatmul(table.tied_head()?)),
         }
     }
 
@@ -629,14 +713,18 @@ impl Qwen3Projection {
         let resolved = qwen3_gguf_tensor_name(loader, name).unwrap_or_else(|| name.to_string());
         let weights = Arc::new(loader.load_qtensor(&resolved, device)?);
         QMatMul::from_arc(weights)
-            .map(Self::Quantized)
+            .map(Self::from_qmatmul)
             .map_err(Error::from)
     }
 
     fn from_qtensor(qtensor: QTensor) -> Result<Self> {
         QMatMul::from_qtensor(qtensor)
-            .map(Self::Quantized)
+            .map(Self::from_qmatmul)
             .map_err(Error::from)
+    }
+
+    fn from_qmatmul(qmatmul: QMatMul) -> Self {
+        Self::Quantized(Qwen3QuantizedProjection::new(qmatmul))
     }
 
     fn packed_quantized(loader: &GgufLoader, device: &Device, names: &[&str]) -> Result<Self> {
@@ -645,7 +733,7 @@ impl Qwen3Projection {
             .map(|name| qwen3_gguf_tensor_name(loader, name).unwrap_or_else(|| (*name).to_string()))
             .collect::<Vec<_>>();
         let resolved = resolved.iter().map(String::as_str).collect::<Vec<_>>();
-        packed_quantized_qmatmul(loader, device, &resolved).map(Self::Quantized)
+        packed_quantized_qmatmul(loader, device, &resolved).map(Self::from_qmatmul)
     }
 
     fn tied_dense(weight: Tensor) -> Self {
@@ -697,34 +785,93 @@ fn qwen3_metal_qmatmul_f32_input_policy(is_metal: bool, override_enabled: Option
     is_metal && override_enabled.unwrap_or(true)
 }
 
-fn qwen3_qmatmul_input_dtype(device: &Device, activation_dtype: DType) -> Option<DType> {
+fn qwen3_qmatmul_input_dtype(
+    device: &Device,
+    cuda_half_activations: bool,
+    activation_dtype: DType,
+) -> Option<DType> {
     qwen3_qmatmul_input_dtype_policy(
         device.is_cuda(),
+        cuda_half_activations,
         qwen3_metal_qmatmul_f32_input_enabled(device),
         activation_dtype,
     )
 }
 
+/// The dtype a quantized projection's activations are cast to before the
+/// call (and its output cast back from), or `None` to pass them as they are.
 fn qwen3_qmatmul_input_dtype_policy(
     is_cuda: bool,
+    cuda_half_activations: bool,
     metal_f32_input_enabled: bool,
     activation_dtype: DType,
 ) -> Option<DType> {
     if activation_dtype == DType::F32 {
         return None;
     }
-    (is_cuda || metal_f32_input_enabled).then_some(DType::F32)
+    if is_cuda {
+        let native = cuda_half_activations && matches!(activation_dtype, DType::BF16 | DType::F16);
+        return (!native).then_some(DType::F32);
+    }
+    metal_f32_input_enabled.then_some(DType::F32)
+}
+
+/// Whether Candle 0.11.1's CUDA `QMatMul` takes BF16/F16 activations for
+/// `qmatmul` and gives bit-for-bit what casting them to F32, running the F32
+/// kernel and casting the result back gives:
+/// - a `QTensor` of a type its fast GGUF kernels cover (Q4_0, Q4_1, Q5_0,
+///   Q5_1, Q8_0, Q2_K to Q6_K), whose rows are whole blocks. Up to 8 rows
+///   MMVQ quantizes the activations to Q8_1 from their exact F32 values,
+///   sums in F32 and rounds each sum to the output dtype to nearest even,
+///   as the cast kernel does; more rows run MMQ, which makes those casts
+///   itself.
+/// - not a dequantized `Tensor` (an F16/BF16/F32 GGUF weight, an F32
+///   matmul), `TensorF16`, or another quantized type: their fallback kernels
+///   read F32 only.
+fn qwen3_cuda_qmatmul_takes_half_activations(qmatmul: &QMatMul) -> bool {
+    let QMatMul::QTensor(weight) = qmatmul else {
+        return false;
+    };
+    let dtype = weight.dtype();
+    let fast_kernels = matches!(
+        dtype,
+        GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K
+    );
+    fast_kernels
+        && weight
+            .shape()
+            .dims2()
+            .is_ok_and(|(_, cols)| cols.is_multiple_of(dtype.block_size()))
 }
 
 impl Module for Qwen3Projection {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         match self {
             Self::Dense(dense) => dense.linear.forward(x),
-            Self::Quantized(qmatmul) => {
+            Self::Quantized(projection) => {
+                if let Some(weight) = projection
+                    .kquant
+                    .as_ref()
+                    .filter(|_| GRAPH_PROJECTIONS.with(std::cell::Cell::get))
+                {
+                    return projection.kquant_forward(weight, x);
+                }
                 let activation_dtype = x.dtype();
                 let profile = qwen3_runtime_profiling_enabled();
-                let x = if let Some(dtype) = qwen3_qmatmul_input_dtype(x.device(), activation_dtype)
-                {
+                let x = if let Some(dtype) = qwen3_qmatmul_input_dtype(
+                    x.device(),
+                    projection.cuda_half_activations,
+                    activation_dtype,
+                ) {
                     let started = profile.then(Instant::now);
                     let casted = x.to_dtype(dtype)?;
                     if let Some(started) = started {
@@ -733,11 +880,15 @@ impl Module for Qwen3Projection {
                             .fetch_add(elapsed_ns(started), Ordering::Relaxed);
                     }
                     casted
+                } else if projection.cuda_half_activations {
+                    // The fast kernels read contiguous rows; the cast this
+                    // replaces always produced them.
+                    x.contiguous()?
                 } else {
                     x.clone()
                 };
                 let qmatmul_started = profile.then(Instant::now);
-                let out = qmatmul.forward(&x)?;
+                let out = projection.qmatmul.forward(&x)?;
                 if let Some(started) = qmatmul_started {
                     QWEN3_PROFILE_QMATMUL_CALLS.fetch_add(1, Ordering::Relaxed);
                     QWEN3_PROFILE_QMATMUL_NS.fetch_add(elapsed_ns(started), Ordering::Relaxed);
@@ -1288,6 +1439,57 @@ fn qk_norm_weight(q_norm: &Option<RmsNorm>, k_norm: &Option<RmsNorm>) -> Result<
     }
 }
 
+/// Whether a decode graph can capture each projection: dense weights, or
+/// quantized ones the K-quant kernels serve (never `QMatMul`).
+impl Qwen3Projection {
+    fn graph_capturable(&self) -> bool {
+        match self {
+            Self::Dense(_) => true,
+            Self::Quantized(projection) => projection.kquant.is_some(),
+        }
+    }
+}
+
+impl Qwen3QkvProjection {
+    fn graph_capturable(&self) -> bool {
+        match self {
+            Self::Fused(_) => true,
+            Self::FusedQuantized(fused) => fused.fused.graph_capturable(),
+            Self::Separate {
+                q_proj,
+                k_proj,
+                v_proj,
+            } => {
+                q_proj.graph_capturable() && k_proj.graph_capturable() && v_proj.graph_capturable()
+            }
+        }
+    }
+}
+
+impl Qwen3GateUpProjection {
+    fn graph_capturable(&self) -> bool {
+        match self {
+            Self::Fused(_) => true,
+            Self::FusedQuantized(fused) => fused.fused.graph_capturable(),
+            Self::Separate { gate_proj, up_proj } => {
+                gate_proj.graph_capturable() && up_proj.graph_capturable()
+            }
+        }
+    }
+}
+
+/// What a decode graph's attention layers read: the arena's `(keys,
+/// values)` per layer and the step buffer's slots and split-decode
+/// metadata ([`decode_step`]).
+struct Qwen3GraphAttention<'a> {
+    caches: &'a [(Tensor, Tensor)],
+    slots: Tensor,
+    metadata: Tensor,
+    page_tokens: usize,
+    max_blocks: usize,
+    max_partitions: usize,
+}
+
 struct Qwen3Attention {
     qkv_proj: Qwen3QkvProjection,
     o_proj: Qwen3Projection,
@@ -1519,11 +1721,24 @@ impl Qwen3Attention {
         let Some((cos_half, sin_half)) = tables.as_ref() else {
             return Err(Error::InferenceError("Qwen3 RoPE tables missing".into()));
         };
+        self.apply_rope_pair_with_tables(&q, &k, cos_half, sin_half)
+    }
 
+    /// Rotates contiguous `[batch, seq, heads, head_dim]` `q` and `k` by the
+    /// `[seq, head_dim / 2]` `cos_half`/`sin_half` rows: the fused kernel
+    /// where enabled, else the composed ops. Each output element reads only
+    /// its own row's cos/sin, so the rows may come from any positions.
+    fn apply_rope_pair_with_tables(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        cos_half: &Tensor,
+        sin_half: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
         if self.should_try_rope_kernel(q.dtype()) {
             let cos = cos_half.unsqueeze(0)?.contiguous()?;
             let sin = sin_half.unsqueeze(0)?.contiguous()?;
-            if let Some((q_out, k_out)) = try_apply_rope_pair_thd(&q, &k, &cos, &sin)? {
+            if let Some((q_out, k_out)) = try_apply_rope_pair_thd(q, k, &cos, &sin)? {
                 record_rope_kernel();
                 record_rope_kernel();
                 return Ok((q_out, k_out));
@@ -1533,9 +1748,135 @@ impl Qwen3Attention {
         record_rope_manual();
 
         Ok((
-            apply_rotary_emb(&q, cos_half, sin_half)?,
-            apply_rotary_emb(&k, cos_half, sin_half)?,
+            apply_rotary_emb(q, cos_half, sin_half)?,
+            apply_rotary_emb(k, cos_half, sin_half)?,
         ))
+    }
+
+    /// RoPE over a whole decode batch in one call per tensor: `[rows, 1,
+    /// heads, head_dim]` `q`/`k` rotate as one `[1, rows, heads, head_dim]`
+    /// sequence whose token `i` takes `rope`'s row `i`. Each element sees
+    /// exactly the cos/sin and ops a one-row call at that row's position
+    /// does. Returns the `[rows, heads, head_dim]` queries and keys.
+    fn apply_decode_rope(
+        &self,
+        q: Tensor,
+        k: Tensor,
+        rope: &Qwen3DecodeRopeRows,
+    ) -> Result<(Tensor, Tensor)> {
+        let rows = q.dim(0)?;
+        if rope.cos.dtype() != q.dtype() {
+            return Err(Error::InferenceError(format!(
+                "Qwen3 decode RoPE rows are {:?} but the queries are {:?}",
+                rope.cos.dtype(),
+                q.dtype()
+            )));
+        }
+        let q = q
+            .reshape((1, rows, self.num_heads, self.head_dim))?
+            .contiguous()?;
+        let k = k
+            .reshape((1, rows, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let (q, k) = self.apply_rope_pair_with_tables(&q, &k, &rope.cos, &rope.sin)?;
+        Ok((
+            q.reshape((rows, self.num_heads, self.head_dim))?
+                .contiguous()?,
+            k.reshape((rows, self.num_kv_heads, self.head_dim))?
+                .contiguous()?,
+        ))
+    }
+
+    /// The position whose angles a one-token decode row at `start_pos`
+    /// rotates by in [`Self::rope_tables`]: MRoPE with fewer than three
+    /// sections builds its table from position zero.
+    fn decode_rope_position(&self, start_pos: usize) -> usize {
+        if self.use_mrope && !self.sequential_mrope_uses_host_tables() {
+            0
+        } else {
+            start_pos
+        }
+    }
+
+    /// cos/sin rows for positions `0..rows`, built by the builder
+    /// [`Self::rope_tables`] runs for one decode token. Every element is
+    /// computed on its own (`pos as f32 * inv`, then cos/sin elementwise),
+    /// so row `p` is bit-identical to the table that path builds at `p`.
+    fn decode_rope_table(
+        &self,
+        rows: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        if self.sequential_mrope_uses_host_tables() {
+            build_sequential_rope_host_tables(rows, 0, device, dtype, &self.rope_inv_freqs)
+        } else {
+            build_rope_cache_with_inv_freqs(rows, 0, device, dtype, &self.rope_inv_freqs)
+        }
+    }
+
+    /// Each decode row's `[rows, head_dim / 2]` cos/sin: one upload of the
+    /// rows' positions and one gather per table from the model's decode
+    /// table, which grows (rebuilt from zero by the same builder) when a
+    /// position passes its end.
+    fn decode_rope_rows(
+        &self,
+        table: &Mutex<Option<Qwen3DecodeRopeTable>>,
+        start_positions: &[usize],
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Qwen3DecodeRopeRows> {
+        let positions = start_positions
+            .iter()
+            .map(|&pos| {
+                u32::try_from(self.decode_rope_position(pos))
+                    .map_err(|_| Error::InvalidInput("Qwen3 RoPE position exceeds u32".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let needed = positions.iter().max().map_or(1, |&pos| pos as usize + 1);
+        let (cos, sin, _) = self.decode_rope_table_rows(table, needed, device, dtype)?;
+        let rows = positions.len();
+        let positions = Tensor::from_vec(positions, rows, device)?;
+        Ok(Qwen3DecodeRopeRows {
+            cos: cos.index_select(&positions, 0)?,
+            sin: sin.index_select(&positions, 0)?,
+        })
+    }
+
+    /// The model's decode `(cos, sin)` tables, grown (rebuilt from zero by
+    /// the same builder) to hold at least `needed` positions, and their row
+    /// count.
+    fn decode_rope_table_rows(
+        &self,
+        table: &Mutex<Option<Qwen3DecodeRopeTable>>,
+        needed: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<(Tensor, Tensor, usize)> {
+        let mut table = table
+            .lock()
+            .map_err(|_| Error::InferenceError("Qwen3 decode RoPE table lock poisoned".into()))?;
+        let stale = !table
+            .as_ref()
+            .is_some_and(|table| table.dtype == dtype && table.rows >= needed);
+        if stale {
+            let rows = needed
+                .next_power_of_two()
+                .max(QWEN3_DECODE_ROPE_TABLE_MIN_ROWS);
+            let (cos, sin) = self.decode_rope_table(rows, device, dtype)?;
+            *table = Some(Qwen3DecodeRopeTable {
+                dtype,
+                rows,
+                cos,
+                sin,
+            });
+        }
+        let Some(table) = table.as_ref() else {
+            return Err(Error::InferenceError(
+                "Qwen3 decode RoPE table missing".into(),
+            ));
+        };
+        Ok((table.cos.clone(), table.sin.clone(), table.rows))
     }
 
     /// The `[seq, head_dim / 2]` cos/sin tables for `q`'s positions, in its
@@ -1732,7 +2073,7 @@ impl Qwen3Attention {
     fn forward_managed_decode_batch(
         &self,
         x: &Tensor,
-        start_positions: &[usize],
+        rope: &Qwen3DecodeRopeRows,
         caches: &[&PhysicalPagedKvCache],
         slots: &dyn KvSlotMap,
         metadata: &KvDecodeBatchMetadata,
@@ -1740,7 +2081,7 @@ impl Qwen3Attention {
         layer_idx: usize,
     ) -> Result<Tensor> {
         let bsz = x.dim(0)?;
-        if x.dim(1)? != 1 || bsz == 0 || start_positions.len() != bsz || caches.len() != bsz {
+        if x.dim(1)? != 1 || bsz == 0 || rope.cos.dim(0)? != bsz || caches.len() != bsz {
             return Err(Error::InvalidInput(
                 "Qwen3 managed decode batch dimensions do not match".to_string(),
             ));
@@ -1760,25 +2101,10 @@ impl Qwen3Attention {
         let k = k.reshape((bsz, 1, self.num_kv_heads, self.head_dim))?;
         let v = v.reshape((bsz, 1, self.num_kv_heads, self.head_dim))?;
         let (q, k) = self.apply_qk_norm_pair(q, k, 1)?;
-
-        let mut query_rows = Vec::with_capacity(bsz);
-        let mut key_rows = Vec::with_capacity(bsz);
-        let mut value_rows = Vec::with_capacity(bsz);
-        for row in 0..bsz {
-            let q_row = q.i(row)?.unsqueeze(0)?;
-            let k_row = k.i(row)?.unsqueeze(0)?;
-            let (q_row, k_row) = self.apply_rope_pair(q_row, k_row, start_positions[row], None)?;
-            query_rows.push(q_row.reshape((self.num_heads, self.head_dim))?);
-            key_rows.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
-            value_rows.push(v.i(row)?.reshape((self.num_kv_heads, self.head_dim))?);
-        }
-
-        let query_rows = query_rows.iter().collect::<Vec<_>>();
-        let key_rows = key_rows.iter().collect::<Vec<_>>();
-        let value_rows = value_rows.iter().collect::<Vec<_>>();
-        let queries = Tensor::stack(&query_rows, 0)?.contiguous()?;
-        let keys = Tensor::stack(&key_rows, 0)?.contiguous()?;
-        let values = Tensor::stack(&value_rows, 0)?.contiguous()?;
+        let (queries, keys) = self.apply_decode_rope(q, k, rope)?;
+        let values = v
+            .reshape((bsz, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
         if slots.arena_id() != first.arena.id() || slots.len() != bsz {
             return Err(Error::InvalidInput(
                 "Qwen3 managed decode received an incompatible prepared slot map".into(),
@@ -1807,6 +2133,55 @@ impl Qwen3Attention {
         completions.collect(completion)?;
         let out = out.reshape((bsz, 1, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out).map_err(Error::from)
+    }
+
+    /// [`Self::forward_managed_decode_batch`] as a decode graph runs it:
+    /// each row's K/V rows written at its step-buffer slot, and the split
+    /// decode over its step-buffer block table with row-invariant
+    /// partitions. No host value is read or uploaded.
+    fn forward_graph_decode(
+        &self,
+        x: &Tensor,
+        rope: &Qwen3DecodeRopeRows,
+        attention: &Qwen3GraphAttention<'_>,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let bsz = x.dim(0)?;
+        let (q, k, v) = self.qkv_proj.forward(x)?;
+        let q = q.reshape((bsz, 1, self.num_heads, self.head_dim))?;
+        let k = k.reshape((bsz, 1, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((bsz, 1, self.num_kv_heads, self.head_dim))?;
+        let (q, k) = self.apply_qk_norm_pair(q, k, 1)?;
+        let (queries, keys) = self.apply_decode_rope(q, k, rope)?;
+        let values = v
+            .reshape((bsz, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let (cache_keys, cache_values) = attention.caches.get(layer_idx).ok_or_else(|| {
+            Error::InferenceError(format!(
+                "Qwen3 decode graph has no KV cache for layer {layer_idx}"
+            ))
+        })?;
+        decode_step::write_kv_rows(cache_keys, cache_values, &keys, &values, &attention.slots)?;
+        let out = split_decode::paged_decode_adaptive(
+            &queries,
+            cache_keys,
+            cache_values,
+            &attention.metadata,
+            bsz,
+            self.num_heads,
+            self.num_kv_heads,
+            attention.page_tokens,
+            attention.max_blocks,
+            1.0 / (self.head_dim as f32).sqrt(),
+            None,
+            attention.max_partitions,
+        )?;
+        let out = out.reshape((bsz, 1, self.num_heads * self.head_dim))?;
+        self.o_proj.forward(&out).map_err(Error::from)
+    }
+
+    fn graph_capturable(&self) -> bool {
+        self.qkv_proj.graph_capturable() && self.o_proj.graph_capturable()
     }
 
     /// One mixed step: `x` is `[1, tokens, hidden]` in `step`'s row layout.
@@ -2329,7 +2704,7 @@ impl Qwen3Layer {
     fn forward_managed_decode_batch(
         &self,
         x: &Tensor,
-        start_positions: &[usize],
+        rope: &Qwen3DecodeRopeRows,
         caches: &[&PhysicalPagedKvCache],
         slots: &dyn KvSlotMap,
         metadata: &KvDecodeBatchMetadata,
@@ -2339,7 +2714,7 @@ impl Qwen3Layer {
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = self.self_attn.forward_managed_decode_batch(
             &normed,
-            start_positions,
+            rope,
             caches,
             slots,
             metadata,
@@ -2350,6 +2725,35 @@ impl Qwen3Layer {
         let normed = self.post_attention_layernorm.forward(&x)?;
         let mlp_out = self.mlp.forward(&normed)?;
         x.broadcast_add(&mlp_out).map_err(Error::from)
+    }
+
+    /// [`Self::forward_managed_decode_batch`] as a decode graph runs it.
+    fn forward_graph_decode(
+        &self,
+        x: &Tensor,
+        rope: &Qwen3DecodeRopeRows,
+        attention: &Qwen3GraphAttention<'_>,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out = self
+            .self_attn
+            .forward_graph_decode(&normed, rope, attention, layer_idx)?;
+        let x = x.broadcast_add(&attn_out)?;
+        let normed = self.post_attention_layernorm.forward(&x)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        x.broadcast_add(&mlp_out).map_err(Error::from)
+    }
+
+    fn graph_capturable(&self) -> bool {
+        self.self_attn.graph_capturable()
+            && match &self.mlp {
+                Qwen3FeedForward::Dense(mlp) => {
+                    mlp.gate_up_proj.graph_capturable() && mlp.down_proj.graph_capturable()
+                }
+                // Expert routing reads the host.
+                Qwen3FeedForward::Sparse(_) => false,
+            }
     }
 
     fn forward_managed_mixed(
@@ -2378,6 +2782,32 @@ pub struct Qwen3Model {
     device: Device,
     cfg: Qwen3Config,
     use_mrope: bool,
+    /// Decode cos/sin by position, built at the first batched decode step.
+    decode_rope_table: Mutex<Option<Qwen3DecodeRopeTable>>,
+    /// The ASR families' whole-step CUDA decode graphs, or why there are
+    /// none ([`Self::enable_asr_decode_graph`]).
+    decode_graph: std::result::Result<Qwen3DecodeGraph, String>,
+}
+
+/// Rows a decode RoPE table starts with. A position past its end rebuilds it
+/// at the next power of two (same builder from zero, so the old rows are
+/// unchanged).
+const QWEN3_DECODE_ROPE_TABLE_MIN_ROWS: usize = 4096;
+
+/// A model's decode cos/sin, `[rows, head_dim / 2]` each, for positions
+/// `0..rows` in one dtype.
+struct Qwen3DecodeRopeTable {
+    dtype: DType,
+    rows: usize,
+    cos: Tensor,
+    sin: Tensor,
+}
+
+/// One decode step's `[rows, head_dim / 2]` cos/sin, row `i` for decode row
+/// `i`'s position; every layer reads the same rows.
+struct Qwen3DecodeRopeRows {
+    cos: Tensor,
+    sin: Tensor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2470,12 +2900,13 @@ impl Qwen3Model {
         // exactly the dense table's rows.
         let embed_tokens =
             match qwen3_mlx_q4_1_projection(&embed_vb, &[("", cfg.vocab_size)], cfg.hidden_size)? {
-                Some(Qwen3Projection::Quantized(QMatMul::QTensor(table))) => {
-                    Qwen3TokenEmbedding::Quantized {
-                        table: QuantizedTokenTable::from_arc(table)?,
-                        dtype: vb.dtype(),
-                    }
-                }
+                Some(Qwen3Projection::Quantized(Qwen3QuantizedProjection {
+                    qmatmul: QMatMul::QTensor(table),
+                    ..
+                })) => Qwen3TokenEmbedding::Quantized {
+                    table: QuantizedTokenTable::from_arc(table)?,
+                    dtype: vb.dtype(),
+                },
                 _ => Qwen3TokenEmbedding::Dense(mlx::load_embedding(
                     cfg.vocab_size,
                     cfg.hidden_size,
@@ -2539,6 +2970,8 @@ impl Qwen3Model {
             device: vb.device().clone(),
             cfg,
             use_mrope,
+            decode_rope_table: Mutex::new(None),
+            decode_graph: Err("not enabled for this model".into()),
         })
     }
 
@@ -2575,7 +3008,7 @@ impl Qwen3Model {
             }
             // A tied head (a stored copy of the table, as Qwen3-ASR
             // checkpoints carry, is not read) shares the token table.
-            Qwen3Projection::Quantized(table.tied_head()?)
+            Qwen3Projection::from_qmatmul(table.tied_head()?)
         };
         let embed_tokens = Qwen3TokenEmbedding::Quantized { table, dtype };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -2606,6 +3039,8 @@ impl Qwen3Model {
             device: device.clone(),
             cfg,
             use_mrope,
+            decode_rope_table: Mutex::new(None),
+            decode_graph: Err("not enabled for this model".into()),
         })
     }
 
@@ -2863,29 +3298,307 @@ impl Qwen3Model {
         };
         let mut completions =
             KvWriteCompletionCollector::new(first.arena.config(), lowered.logical_slots())?;
-        let mut x = self.embeddings(input_ids)?;
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let cache_refs = caches
-                .iter()
-                .map(|cache| &**cache)
-                .collect::<Vec<&PhysicalPagedKvCache>>();
-            x = layer.forward_managed_decode_batch(
-                &x,
+        let cache_refs = caches
+            .iter()
+            .map(|cache| &**cache)
+            .collect::<Vec<&PhysicalPagedKvCache>>();
+        let graphed = match self
+            .decode_graph
+            .as_ref()
+            .ok()
+            .filter(|graph| graph.is_on())
+        {
+            Some(graph) => self.graph_step(
+                graph,
+                input_ids,
+                start_positions,
+                &combined_slots,
+                lowered.as_ref(),
+                &metadata,
+                &cache_refs,
+                &mut completions,
+            )?,
+            None => None,
+        };
+        let logits = match graphed {
+            Some(logits) => logits,
+            None => self.standard_decode_logits(
+                input_ids,
                 start_positions,
                 &cache_refs,
                 lowered.as_ref(),
                 &metadata,
                 &mut completions,
-                layer_idx,
-            )?;
-        }
-        let hidden = self.norm.forward(&x)?;
-        let logits = self.logits_from_hidden(&hidden)?;
+            )?,
+        };
         let completion = Arc::new(completions.seal()?);
         for (row, cache) in caches.iter_mut().enumerate() {
             cache.commit_shared_completion(start_positions[row], 1, completion.clone())?;
         }
         Ok(logits)
+    }
+
+    /// The standard batched decode step: the rows' logits, their K/V
+    /// writes collected in `completions`.
+    fn standard_decode_logits(
+        &self,
+        input_ids: &Tensor,
+        start_positions: &[usize],
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+    ) -> Result<Tensor> {
+        let mut x = self.embeddings(input_ids)?;
+        if let Some(first_layer) = self.layers.first() {
+            // Every layer shares one RoPE geometry: gather the rows' cos/sin
+            // once for the whole step.
+            let rope = first_layer.self_attn.decode_rope_rows(
+                &self.decode_rope_table,
+                start_positions,
+                &self.device,
+                x.dtype(),
+            )?;
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                x = layer.forward_managed_decode_batch(
+                    &x,
+                    &rope,
+                    caches,
+                    slots,
+                    metadata,
+                    completions,
+                    layer_idx,
+                )?;
+            }
+        }
+        let hidden = self.norm.forward(&x)?;
+        self.logits_from_hidden(&hidden)
+    }
+
+    /// Turns on `label`'s whole-step CUDA decode graphs behind `switch`
+    /// ([`super::decode_graph`]): CUDA only, and only for a dense
+    /// feed-forward trunk whose every projection a graph can capture.
+    pub(crate) fn enable_asr_decode_graph(&mut self, label: &'static str, switch: &'static str) {
+        self.decode_graph = if self.cfg.sliding_window().is_some() {
+            Err("sliding-window attention has no graph".into())
+        } else if !self.layers.iter().all(Qwen3Layer::graph_capturable)
+            || !self.lm_head.graph_capturable()
+        {
+            Err("a projection has no K-quant kernel or the feed-forward is sparse".into())
+        } else {
+            Qwen3DecodeGraph::resolve(label, switch, &self.device)
+        };
+    }
+
+    /// Whether decode steps go through the CUDA decode graphs: a lone row
+    /// then decodes as a batch of one, through its width-1 graph.
+    pub(crate) fn decode_graph_on(&self) -> bool {
+        self.decode_graph
+            .as_ref()
+            .is_ok_and(Qwen3DecodeGraph::is_on)
+    }
+
+    pub(crate) fn decode_graph_diagnostics(&self) -> serde_json::Value {
+        match &self.decode_graph {
+            Ok(graph) => graph.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        }
+    }
+
+    /// One decode step through `graph`, its K/V write completions collected
+    /// in `completions`: `None` when the step does not fit a graph (more
+    /// rows than the widest, a KV arena or geometry the split decode does
+    /// not serve), so the standard decode runs it. A width's first graphed
+    /// step is checked against the standard decode; a mismatch turns the
+    /// graphs off and the step keeps the standard logits.
+    #[allow(clippy::too_many_arguments)]
+    fn graph_step(
+        &self,
+        graph: &Qwen3DecodeGraph,
+        input_ids: &Tensor,
+        start_positions: &[usize],
+        slots: &[KvSlotRef],
+        slot_map: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        caches: &[&PhysicalPagedKvCache],
+        completions: &mut KvWriteCompletionCollector,
+    ) -> Result<Option<Tensor>> {
+        let rows = start_positions.len();
+        let (Some(width), Some(first_layer)) =
+            (decode_step::graph_width(rows), self.layers.first())
+        else {
+            return Ok(None);
+        };
+        let attention = &first_layer.self_attn;
+        let first = caches[0];
+        let arena = first.arena.clone();
+        let config = arena.config();
+        let dtype = self.embed_tokens.dtype();
+        if caches
+            .iter()
+            .any(|cache| !Arc::ptr_eq(&cache.arena, &arena))
+            || config.dtype != dtype
+            || !split_decode::supported(
+                dtype,
+                attention.num_heads,
+                attention.num_kv_heads,
+                attention.head_dim,
+                attention.head_dim,
+            )
+        {
+            return Ok(None);
+        }
+        let page_tokens = config.page_tokens;
+        let positions = start_positions
+            .iter()
+            .map(|&pos| {
+                u32::try_from(attention.decode_rope_position(pos))
+                    .map_err(|_| Error::InvalidInput("Qwen3 RoPE position exceeds u32".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let needed = positions.iter().max().map_or(1, |&pos| pos as usize + 1);
+        let (cos, sin, rope_rows) = attention.decode_rope_table_rows(
+            &self.decode_rope_table,
+            needed,
+            &self.device,
+            dtype,
+        )?;
+        let step_rows = positions
+            .iter()
+            .zip(slots)
+            .zip(&metadata.sequences)
+            .map(|((position, slot), sequence)| {
+                DecodeStepRow::new(*position, slot, sequence, page_tokens)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let longest = step_rows
+            .iter()
+            .map(|row| row.blocks.len())
+            .max()
+            .unwrap_or(1);
+        let layout = DecodeStepLayout::for_blocks(width, longest);
+        let step = layout.upload(&step_rows, &self.device)?;
+        let ids = input_ids.reshape((rows, 1))?;
+        let ids = if width > rows {
+            ids.pad_with_zeros(0, 0, width - rows)?
+        } else {
+            ids
+        };
+        let bindings = (0..self.layers.len())
+            .map(|layer| first.layer_binding(layer))
+            .collect::<Result<Vec<_>>>()?;
+        let page_tokens = page_tokens as usize;
+        let max_partitions = decode_step::max_partitions(
+            width,
+            attention.num_kv_heads,
+            layout.max_context(page_tokens),
+        );
+        // The graph keeps stable copies of its inputs and its logits.
+        let tensor_bytes = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+        let retained = tensor_bytes(&ids)
+            + tensor_bytes(&step)
+            + (width * self.cfg.vocab_size * std::mem::size_of::<f32>()) as u64;
+        let inputs = [ids, step];
+        let mut output = None;
+        let graph_completions = arena.with_graph_writes(
+            &bindings,
+            slot_map,
+            self.layers.len() as u64,
+            &mut |layers| {
+                let key = GraphKey {
+                    width,
+                    arena: arena.id(),
+                    generation: layers.generation,
+                    max_blocks: layout.max_blocks,
+                    rope_rows,
+                };
+                let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+                    let [ids, step] = inputs else {
+                        return Err(Error::InferenceError(format!(
+                            "Qwen3 decode graph received {} inputs, expected 2",
+                            inputs.len()
+                        )));
+                    };
+                    let attention = Qwen3GraphAttention {
+                        caches: &layers.layers,
+                        slots: step.narrow(0, layout.slots(), width)?,
+                        metadata: step.narrow(0, layout.metadata(), layout.metadata_len())?,
+                        page_tokens,
+                        max_blocks: layout.max_blocks,
+                        max_partitions,
+                    };
+                    let positions = step.narrow(0, layout.positions(), width)?;
+                    Ok(vec![self.graph_decode_body(
+                        ids, &positions, &cos, &sin, &attention,
+                    )?])
+                };
+                output = graph.graphs.run(key, retained, &inputs, &body)?.pop();
+                Ok(())
+            },
+        )?;
+        for completion in graph_completions {
+            completions.collect(completion)?;
+        }
+        let logits = output
+            .ok_or_else(|| Error::InferenceError("Qwen3 decode graph returned nothing".into()))?;
+        let logits = if width > rows {
+            logits.narrow(0, 0, rows)?
+        } else {
+            logits
+        };
+        graph.record_step(rows, width);
+        if !graph.needs_check(width) {
+            return Ok(Some(logits));
+        }
+        // The check: the standard decode of the same rows, its writes (the
+        // same K/V) collected and sealed apart.
+        let mut reference_completions =
+            KvWriteCompletionCollector::new(config, slot_map.logical_slots())?;
+        let reference = self.standard_decode_logits(
+            input_ids,
+            start_positions,
+            caches,
+            slot_map,
+            metadata,
+            &mut reference_completions,
+        );
+        let sealed = reference_completions.seal();
+        let reference = reference?;
+        sealed?;
+        match decode_step::logits_agree(&logits, &reference) {
+            Ok(_) => {
+                graph.mark_checked(width);
+                Ok(Some(logits))
+            }
+            Err(reason) => {
+                graph.disable(format!("a {rows}-row step (width {width}): {reason}"));
+                Ok(Some(reference))
+            }
+        }
+    }
+
+    /// The decode graphs' body over a padded step: token embeddings, every
+    /// layer through [`Qwen3Layer::forward_graph_decode`], the final norm
+    /// and the logits, quantized projections on the K-quant kernels.
+    fn graph_decode_body(
+        &self,
+        ids: &Tensor,
+        positions: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention: &Qwen3GraphAttention<'_>,
+    ) -> Result<Tensor> {
+        let _projections = GraphProjections::enter();
+        let rope = Qwen3DecodeRopeRows {
+            cos: cos.index_select(positions, 0)?,
+            sin: sin.index_select(positions, 0)?,
+        };
+        let mut x = self.embeddings(ids)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_graph_decode(&x, &rope, attention, layer_idx)?;
+        }
+        let hidden = self.norm.forward(&x)?;
+        self.logits_from_hidden(&hidden)
     }
 
     /// One forward over a mixed step: `input_ids` holds every row's new
@@ -3090,6 +3803,109 @@ impl Qwen3Model {
         token_ids: &[u32],
     ) -> Result<Vec<(u32, f32)>> {
         self.lm_head.logits_for_tokens(hidden, token_ids)
+    }
+
+    /// [`Self::logits_from_hidden_for_tokens`] for every row of `hidden`
+    /// (`[rows, hidden]` or `[rows, 1, hidden]`): `[rows, token_ids.len()]`
+    /// logits left on the device, so one readback scores every row.
+    pub(crate) fn logits_rows_for_tokens(
+        &self,
+        hidden: &Tensor,
+        token_ids: &[u32],
+    ) -> Result<Tensor> {
+        let hidden = hidden.flatten_to(hidden.rank().saturating_sub(2))?;
+        match &self.lm_head {
+            Qwen3Projection::Dense(dense) => dense_logits_for_tokens(dense, &hidden, token_ids),
+            Qwen3Projection::Quantized(_) => self
+                .lm_head
+                .forward(&hidden)?
+                .index_select(&token_index_tensor(token_ids, hidden.device())?, 1)
+                .map_err(Error::from),
+        }
+    }
+
+    /// [`Self::forward_managed_decode_batch`] for caller-provided embeddings
+    /// (`[batch, 1, hidden]`), returning the normalized hidden states
+    /// (`[batch, 1, hidden]`) without `lm_head`: diffusion-conditioned
+    /// decode rows (VibeVoice TTS) step every row in one launch per op. The
+    /// rows share one physical arena; every cache advances only when the
+    /// whole forward succeeds.
+    pub(crate) fn forward_managed_decode_batch_hidden_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_positions: &[usize],
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<Tensor> {
+        let (batch_size, sequence_len, hidden_size) = embeds.dims3()?;
+        if sequence_len != 1
+            || batch_size == 0
+            || hidden_size != self.cfg.hidden_size
+            || start_positions.len() != batch_size
+            || caches.len() != batch_size
+        {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 managed embedding decode expects matching [batch,1,{}] rows, got {:?}",
+                self.cfg.hidden_size,
+                embeds.dims()
+            )));
+        }
+        if self.cfg.sliding_window().is_some() {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed execution does not yet support sliding-window block tables"
+                    .to_string(),
+            ));
+        }
+        let key_head_dim = self.cfg.attention_geometry()?.key_head_dim();
+        let mut combined_slots = Vec::with_capacity(batch_size);
+        for (cache, &start) in caches.iter().zip(start_positions) {
+            cache.validate_model(
+                self.cfg.num_hidden_layers,
+                self.cfg.num_key_value_heads,
+                key_head_dim,
+            )?;
+            combined_slots.push(cache.slots_for_append(start, 1)?[0]);
+        }
+        let first = &*caches[0];
+        let lowered = first.arena.lower_slots(&combined_slots)?;
+        let metadata = KvDecodeBatchMetadata {
+            sequences: caches
+                .iter()
+                .zip(start_positions)
+                .map(|(cache, &start)| cache.sequence_table(start + 1))
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let mut completions =
+            KvWriteCompletionCollector::new(first.arena.config(), lowered.logical_slots())?;
+        let mut x = embeds.clone();
+        if let Some(first_layer) = self.layers.first() {
+            let rope = first_layer.self_attn.decode_rope_rows(
+                &self.decode_rope_table,
+                start_positions,
+                &self.device,
+                x.dtype(),
+            )?;
+            let cache_refs = caches
+                .iter()
+                .map(|cache| &**cache)
+                .collect::<Vec<&PhysicalPagedKvCache>>();
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                x = layer.forward_managed_decode_batch(
+                    &x,
+                    &rope,
+                    &cache_refs,
+                    lowered.as_ref(),
+                    &metadata,
+                    &mut completions,
+                    layer_idx,
+                )?;
+            }
+        }
+        let hidden = self.norm.forward(&x)?;
+        let completion = Arc::new(completions.seal()?);
+        for (cache, &start) in caches.iter_mut().zip(start_positions) {
+            cache.commit_shared_completion(start, 1, completion.clone())?;
+        }
+        Ok(hidden)
     }
 
     pub fn uses_mrope(&self) -> bool {
@@ -3752,6 +4568,8 @@ mod tests {
             device: device.clone(),
             cfg,
             use_mrope: false,
+            decode_rope_table: Mutex::new(None),
+            decode_graph: Err("not enabled for this model".into()),
         }
     }
 
@@ -4040,6 +4858,35 @@ mod tests {
             .unwrap()
     }
 
+    /// The ASR decode graphs never resolve off CUDA, so a CPU or Metal model
+    /// keeps the standard decode and its lone-row route; a sparse
+    /// feed-forward (host expert routing) never has graphs.
+    #[test]
+    fn asr_decode_graphs_stay_off_off_cuda_and_for_sparse_trunks() {
+        use super::super::decode_graph::QWEN3_ASR_DECODE_GRAPHS_ENV;
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut dense = tiny_qwen3_model(&Device::Cpu);
+        assert!(!dense.decode_graph_on());
+        assert_eq!(
+            dense.decode_graph_diagnostics()["off"],
+            "not enabled for this model"
+        );
+        dense.enable_asr_decode_graph("test", QWEN3_ASR_DECODE_GRAPHS_ENV);
+        assert!(!dense.decode_graph_on());
+        let reason = dense.decode_graph_diagnostics()["off"].to_string();
+        assert!(
+            reason.contains("CUDA only") || reason.contains(QWEN3_ASR_DECODE_GRAPHS_ENV),
+            "{reason}"
+        );
+        let mut sparse = tiny_qwen3_moe_model(&Device::Cpu, 2);
+        sparse.enable_asr_decode_graph("test", QWEN3_ASR_DECODE_GRAPHS_ENV);
+        assert!(sparse.decode_graph_diagnostics()["off"]
+            .to_string()
+            .contains("sparse"));
+    }
+
     /// Tiny sparse-MoE twin of [`tiny_qwen3_model`]: identical embeddings,
     /// attention, norms, and head, with the FFN replaced by `num_experts`
     /// experts that all share the dense MLP's exact weights. With normalized
@@ -4136,6 +4983,8 @@ mod tests {
             device: device.clone(),
             cfg,
             use_mrope: false,
+            decode_rope_table: Mutex::new(None),
+            decode_graph: Err("not enabled for this model".into()),
         }
     }
 
@@ -4502,6 +5351,208 @@ mod tests {
         assert_eq!(arena.operation_stats().slot_write_dispatches, 3);
         assert_eq!(arena.operation_stats().paged_prefill_dispatches, 2);
         assert_eq!(arena.operation_stats().paged_decode_dispatches, 1);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RopeTestMode {
+        Plain,
+        /// Qwen3-ASR: three MRoPE sections, sequential positions on host tables.
+        Mrope,
+        /// MRoPE with fewer than three sections: tables from position zero.
+        ShortMrope,
+    }
+
+    /// The tiny model's attention with 3 query heads, 2 KV heads and a
+    /// head_dim of 8 (four frequencies), for RoPE-only tests.
+    fn rope_test_attention(mode: RopeTestMode, kernel: bool) -> Qwen3Attention {
+        let mut attention = tiny_qwen3_model(&Device::Cpu).layers.remove(0).self_attn;
+        attention.num_heads = 3;
+        attention.num_kv_heads = 2;
+        attention.head_dim = 8;
+        attention.rope_inv_freqs = build_rope_inv_freqs(8, 1_000_000.0);
+        attention.rope_kernel_enabled = kernel;
+        (attention.use_mrope, attention.mrope_section) = match mode {
+            RopeTestMode::Plain => (false, None),
+            RopeTestMode::Mrope => (true, Some(vec![24, 20, 20])),
+            RopeTestMode::ShortMrope => (true, Some(vec![2])),
+        };
+        attention
+    }
+
+    fn f32_bits(tensor: &Tensor) -> Vec<u32> {
+        bitwise(&tensor.to_dtype(DType::F32).unwrap())
+    }
+
+    fn decode_rope_table_rows(table: &Mutex<Option<Qwen3DecodeRopeTable>>) -> usize {
+        table.lock().unwrap().as_ref().map_or(0, |table| table.rows)
+    }
+
+    /// Row `p` of the decode table is exactly the table the one-token path
+    /// builds at position `p`, in every RoPE mode and dtype.
+    #[test]
+    fn decode_rope_table_rows_match_per_token_tables_bit_for_bit() {
+        let device = Device::Cpu;
+        for mode in [
+            RopeTestMode::Plain,
+            RopeTestMode::Mrope,
+            RopeTestMode::ShortMrope,
+        ] {
+            let attention = rope_test_attention(mode, false);
+            for dtype in [DType::F32, DType::BF16] {
+                let probe = Tensor::zeros((1, 1, 3, 8), dtype, &device).unwrap();
+                let (cos, sin) = attention.decode_rope_table(300, &device, dtype).unwrap();
+                for pos in [0, 1, 2, 17, 255, 299] {
+                    let (expected_cos, expected_sin) =
+                        attention.rope_tables(1, pos, None, &probe).unwrap();
+                    let row = attention.decode_rope_position(pos);
+                    assert_eq!(
+                        f32_bits(&cos.narrow(0, row, 1).unwrap()),
+                        f32_bits(&expected_cos),
+                        "{mode:?} {dtype:?} cos at {pos}"
+                    );
+                    assert_eq!(
+                        f32_bits(&sin.narrow(0, row, 1).unwrap()),
+                        f32_bits(&expected_sin),
+                        "{mode:?} {dtype:?} sin at {pos}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// One RoPE call over a ragged decode batch equals rotating each row on
+    /// its own (the pre-batching loop: `apply_rope_pair` per row, then a
+    /// stack), bit for bit, through the fused kernel (Metal and CUDA) and
+    /// the composed ops (CPU), including a step that grows the table.
+    ///
+    /// The composed ops run only at F32, the CPU activation dtype: Candle's
+    /// CPU BF16 binary ops round a NEON vector body and a scalar tail
+    /// differently, so their bits depend on the tensor's length.
+    #[test]
+    fn batched_decode_rope_matches_per_row_rope_bit_for_bit() {
+        let device = Device::Cpu;
+        let positions = [0usize, 9, 3, 4_100, 9];
+        let rows = positions.len();
+        for mode in [
+            RopeTestMode::Plain,
+            RopeTestMode::Mrope,
+            RopeTestMode::ShortMrope,
+        ] {
+            for (kernel, dtype) in [
+                (false, DType::F32),
+                (true, DType::F32),
+                (true, DType::BF16),
+                (true, DType::F16),
+            ] {
+                let attention = rope_test_attention(mode, kernel);
+                let values =
+                    |count, seed| crate::kernels::numeric_check::xorshift_values(count, seed, 1.0);
+                let q = Tensor::from_vec(values(rows * 3 * 8, 11), (rows, 1, 3, 8), &device)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                let k = Tensor::from_vec(values(rows * 2 * 8, 12), (rows, 1, 2, 8), &device)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                let mut expected_q = Vec::new();
+                let mut expected_k = Vec::new();
+                for (row, &pos) in positions.iter().enumerate() {
+                    let (q_row, k_row) = attention
+                        .apply_rope_pair(
+                            q.i(row).unwrap().unsqueeze(0).unwrap(),
+                            k.i(row).unwrap().unsqueeze(0).unwrap(),
+                            pos,
+                            None,
+                        )
+                        .unwrap();
+                    expected_q.push(q_row.reshape((3, 8)).unwrap());
+                    expected_k.push(k_row.reshape((2, 8)).unwrap());
+                }
+                let expected_q = Tensor::stack(&expected_q, 0).unwrap();
+                let expected_k = Tensor::stack(&expected_k, 0).unwrap();
+
+                let table = Mutex::new(None);
+                attention
+                    .decode_rope_rows(&table, &[1], &device, dtype)
+                    .unwrap();
+                assert_eq!(decode_rope_table_rows(&table), 4_096);
+                let rope = attention
+                    .decode_rope_rows(&table, &positions, &device, dtype)
+                    .unwrap();
+                let grown = match mode {
+                    RopeTestMode::ShortMrope => 4_096,
+                    RopeTestMode::Plain | RopeTestMode::Mrope => 8_192,
+                };
+                assert_eq!(decode_rope_table_rows(&table), grown);
+                let (actual_q, actual_k) = attention
+                    .apply_decode_rope(q.clone(), k.clone(), &rope)
+                    .unwrap();
+                let label = format!("{mode:?} kernel={kernel} {dtype:?}");
+                assert_eq!(f32_bits(&expected_q), f32_bits(&actual_q), "q {label}");
+                assert_eq!(f32_bits(&expected_k), f32_bits(&actual_k), "k {label}");
+            }
+        }
+    }
+
+    /// A batched decode step gathers its RoPE rows from the model's table
+    /// (no per-row table builds; the table is built once and reused), and
+    /// each row matches that row decoded alone, with plain RoPE and with
+    /// Qwen3-ASR's MRoPE. Within a tolerance: Candle's CPU GEMM rounds a
+    /// one-row product differently from a two-row one.
+    #[test]
+    fn managed_decode_batch_gathers_rope_once_and_matches_single_rows() {
+        let device = Device::Cpu;
+        for mrope in [false, true] {
+            let mut model = tiny_qwen3_model(&device);
+            if mrope {
+                model.use_mrope = true;
+                for layer in &mut model.layers {
+                    layer.self_attn.use_mrope = true;
+                    layer.self_attn.mrope_section = Some(vec![1, 1, 1]);
+                }
+            }
+            let prefilled = || {
+                let (arena, bindings) = test_managed_arena();
+                let mut a = test_managed_cache(arena.clone(), bindings.clone(), 0);
+                let mut b = test_managed_cache(arena, bindings, 4);
+                for (cache, prompt) in [(&mut a, vec![0u32, 1]), (&mut b, vec![2u32, 3, 4])] {
+                    let len = prompt.len();
+                    let prompt = Tensor::from_vec(prompt, (1, len), &device).unwrap();
+                    model.forward_managed(&prompt, 0, cache).unwrap();
+                }
+                (a, b)
+            };
+            let (mut solo_a, mut solo_b) = prefilled();
+            let (mut batch_a, mut batch_b) = prefilled();
+            let mut solo = Vec::new();
+            for (cache, token, pos) in [(&mut solo_a, 5u32, 2usize), (&mut solo_b, 6, 3)] {
+                let token = Tensor::from_vec(vec![token], (1, 1), &device).unwrap();
+                solo.push(
+                    model
+                        .forward_managed_decode_batch(&token, &[pos], &mut [cache])
+                        .unwrap(),
+                );
+            }
+            let table_id = |model: &Qwen3Model| {
+                let table = model.decode_rope_table.lock().unwrap();
+                table.as_ref().unwrap().cos.id()
+            };
+            let table = table_id(&model);
+            let builds = thread_rope_table_builds();
+            let batched = model
+                .forward_managed_decode_batch(
+                    &Tensor::from_vec(vec![5u32, 6], (2, 1), &device).unwrap(),
+                    &[2, 3],
+                    &mut [&mut batch_a, &mut batch_b],
+                )
+                .unwrap();
+            assert_eq!(thread_rope_table_builds(), builds, "mrope={mrope}");
+            assert_eq!(table_id(&model), table, "mrope={mrope}");
+            for (row, solo) in solo.iter().enumerate() {
+                assert_tensor_close(solo, &batched.narrow(0, row, 1).unwrap());
+            }
+        }
     }
 
     #[test]
@@ -4899,26 +5950,107 @@ mod tests {
 
     #[test]
     fn qwen3_qmatmul_uses_f32_input_for_accelerated_lower_precision_activations() {
+        // CUDA weights without half-activation kernels, and Metal: cast.
         assert_eq!(
-            qwen3_qmatmul_input_dtype_policy(true, false, DType::BF16),
+            qwen3_qmatmul_input_dtype_policy(true, false, false, DType::BF16),
             Some(DType::F32)
         );
         assert_eq!(
-            qwen3_qmatmul_input_dtype_policy(true, false, DType::F16),
+            qwen3_qmatmul_input_dtype_policy(true, false, false, DType::F16),
             Some(DType::F32)
         );
         assert_eq!(
-            qwen3_qmatmul_input_dtype_policy(true, false, DType::F32),
+            qwen3_qmatmul_input_dtype_policy(true, false, false, DType::F32),
             None
         );
         assert_eq!(
-            qwen3_qmatmul_input_dtype_policy(false, true, DType::F16),
+            qwen3_qmatmul_input_dtype_policy(false, false, true, DType::F16),
             Some(DType::F32)
         );
         assert_eq!(
-            qwen3_qmatmul_input_dtype_policy(false, false, DType::BF16),
+            qwen3_qmatmul_input_dtype_policy(false, false, false, DType::BF16),
             None
         );
+    }
+
+    #[test]
+    fn qwen3_cuda_qmatmul_passes_half_activations_only_to_weights_that_take_them() {
+        for dtype in [DType::BF16, DType::F16] {
+            assert_eq!(
+                qwen3_qmatmul_input_dtype_policy(true, true, false, dtype),
+                None
+            );
+        }
+        assert_eq!(
+            qwen3_qmatmul_input_dtype_policy(true, true, false, DType::F32),
+            None
+        );
+        // Any other activation dtype still reaches the F32 kernels.
+        assert_eq!(
+            qwen3_qmatmul_input_dtype_policy(true, true, false, DType::F64),
+            Some(DType::F32)
+        );
+        // The flag means nothing off CUDA: Metal keeps its own policy.
+        assert_eq!(
+            qwen3_qmatmul_input_dtype_policy(false, true, true, DType::BF16),
+            Some(DType::F32)
+        );
+        assert_eq!(
+            qwen3_qmatmul_input_dtype_policy(false, true, false, DType::BF16),
+            None
+        );
+    }
+
+    #[test]
+    fn qwen3_cuda_half_activation_weights_are_fast_kernel_qtensors() {
+        let device = Device::Cpu;
+        let weight = Tensor::from_vec(
+            crate::kernels::numeric_check::xorshift_values(4 * 256, 9, 1.0),
+            (4, 256),
+            &device,
+        )
+        .unwrap();
+        let qmatmul =
+            |dtype| QMatMul::QTensor(Arc::new(QTensor::quantize(&weight, dtype).unwrap()));
+        for dtype in [
+            GgmlDType::Q4_0,
+            GgmlDType::Q4_1,
+            GgmlDType::Q5_0,
+            GgmlDType::Q5_1,
+            GgmlDType::Q8_0,
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+        ] {
+            assert!(
+                qwen3_cuda_qmatmul_takes_half_activations(&qmatmul(dtype)),
+                "{dtype:?}"
+            );
+        }
+        // Types with no fast kernel fall back to F32-only kernels.
+        for dtype in [GgmlDType::Q8_1, GgmlDType::Q8K] {
+            assert!(
+                !qwen3_cuda_qmatmul_takes_half_activations(&qmatmul(dtype)),
+                "{dtype:?}"
+            );
+        }
+        // A dense (dequantized F16/BF16/F32 GGUF) weight is an F32 matmul.
+        let dense =
+            QMatMul::from_qtensor(QTensor::quantize(&weight, GgmlDType::F16).unwrap()).unwrap();
+        assert!(matches!(dense, QMatMul::Tensor(_)));
+        assert!(!qwen3_cuda_qmatmul_takes_half_activations(&dense));
+        assert!(!qwen3_cuda_qmatmul_takes_half_activations(
+            &QMatMul::TensorF16(weight.to_dtype(DType::F16).unwrap())
+        ));
+        // Decided at load, and only for a CUDA weight.
+        let Qwen3Projection::Quantized(projection) =
+            Qwen3Projection::from_qmatmul(qmatmul(GgmlDType::Q8_0))
+        else {
+            panic!("a QMatMul loads as a quantized projection");
+        };
+        assert!(!projection.cuda_half_activations);
     }
 
     #[test]

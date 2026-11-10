@@ -386,16 +386,18 @@ impl ModelLifecycleController {
         model_instance_id: ModelInstanceId,
         state_publications: HashMap<CapabilityKind, LoadedStatePublication>,
     ) -> Result<Arc<LoadedModelBundle>> {
-        let draft = self.draft_loaded_model_bundle(variant, model_instance_id)?;
+        let draft = self.draft_loaded_model_bundle(variant, model_instance_id, None)?;
         self.bind_loaded_model_bundle_draft(draft, variant, model_instance_id, state_publications)
     }
 
     /// Freeze the exact adapter instances and every selectable stage graph
-    /// before model-derived physical state is planned or allocated.
+    /// before model-derived physical state is planned or allocated, the ASR
+    /// decode at `asr_decode_width` (`None`: the registry's width).
     pub(super) fn draft_loaded_model_bundle(
         &self,
         variant: ModelVariant,
         model_instance_id: ModelInstanceId,
+        asr_decode_width: Option<usize>,
     ) -> Result<LoadedModelBundleDraft> {
         let state = self.state();
         let slot = state.residents.get(&variant).ok_or_else(|| {
@@ -414,12 +416,13 @@ impl ModelLifecycleController {
             )));
         }
         drop(state);
-        LoadedModelBundleDraft::build(
+        LoadedModelBundleDraft::build_with_asr_decode_width(
             &self.adapter_registry,
             self.coordinator.execution_group_id(),
             model_instance_id,
             variant,
             self.backend_router.context().backend_kind,
+            asr_decode_width,
         )
     }
 

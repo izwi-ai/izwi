@@ -554,6 +554,24 @@ fn normalize_speech_text(
     request
 }
 
+/// A request's engine diagnostics, buffered or streamed: its latency
+/// breakdown and the units it is counted in.
+fn tts_request_diagnostics(
+    variant: ModelVariant,
+    latency_breakdown: &impl serde::Serialize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "latency_breakdown": latency_breakdown,
+        "timing_basis": "engine_execution",
+        "token_unit": if variant.uses_fish_dac_codec() {
+            "semantic_frames"
+        } else {
+            "model_tokens"
+        },
+        "split_request_count": 1,
+    })
+}
+
 impl RuntimeService {
     /// Generate audio from text using the unified core engine.
     pub async fn generate(&self, request: GenerationRequest) -> Result<GenerationResult> {
@@ -565,16 +583,10 @@ impl RuntimeService {
         let budget_frames = core_request.params.max_tokens;
 
         let output = self.run_request(core_request).await?;
-        let diagnostics = Some(serde_json::json!({
-            "latency_breakdown": output.latency_breakdown,
-            "timing_basis": "engine_execution",
-            "token_unit": if resolved_variant.uses_fish_dac_codec() {
-                "semantic_frames"
-            } else {
-                "model_tokens"
-            },
-            "split_request_count": 1,
-        }));
+        let diagnostics = Some(tts_request_diagnostics(
+            resolved_variant,
+            &output.latency_breakdown,
+        ));
         let samples = output.audio.samples;
         let sample_rate = output.audio.sample_rate;
         ensure_speech_audio(resolved_variant, &output.request_id, &samples, sample_rate)?;
@@ -712,6 +724,10 @@ impl RuntimeService {
                 &output.latency_breakdown,
                 output.num_tokens,
             ),
+            diagnostics: Some(tts_request_diagnostics(
+                resolved_variant,
+                &output.latency_breakdown,
+            )),
         });
         terminal.generated_codes = generated_codes
             .as_ref()

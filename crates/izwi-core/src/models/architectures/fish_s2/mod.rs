@@ -43,6 +43,7 @@ pub use contracts::{
     semantic_token_id, FishS2DacContract, FishS2PromptTensorShape,
 };
 pub use dac::{FishS2DacConfig, FishS2DacDecoder};
+pub(crate) use fast::fish_s2_fast_graph_device_bytes;
 pub use fast::{FishS2FastConfig, FishS2FastDecoder, FishS2GeneratedFrame, FishS2Sampler};
 #[cfg(test)]
 pub(crate) use physical::fish_s2_physical_state_spec;
@@ -85,6 +86,8 @@ struct FishS2NativeRuntime {
     fast: FishS2FastDecoder,
     dac: FishS2DacDecoder,
     semantic_allowed_mask: Vec<bool>,
+    /// The semantic masks on the device, built at the first batched draw.
+    semantic_masks: std::sync::OnceLock<FishS2SemanticMasks>,
     dtype: DType,
     /// The transformers' dtype after the load-time check, and why.
     precision: PrecisionLoad,
@@ -134,6 +137,10 @@ pub struct FishS2TtsDiagnostics {
     /// The slow/fast transformers' load precision and self-check (FSH-11);
     /// `None` without the native runtime.
     pub precision: Option<serde_json::Value>,
+    /// The fast AR's CUDA frame graphs: why they are off, or their captures,
+    /// replays, fallbacks and graphed and eager frames; `None` without the
+    /// native runtime.
+    pub fast_graphs: Option<serde_json::Value>,
 }
 
 /// Model-authored terminal reason. Exhausting a budget is incomplete speech.
@@ -284,6 +291,10 @@ impl FishS2TtsModel {
                 .runtime
                 .as_ref()
                 .map(|runtime| runtime.precision.diagnostics()),
+            fast_graphs: self
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.fast.graphs_diagnostics()),
         }
     }
 
@@ -448,7 +459,7 @@ impl FishS2NativeRuntime {
         // On Metal a dtype below F32 must keep the trunk's activations finite
         // and in range (FSH-11: norm gains reach 48), or the slow and fast
         // transformers reload in F32.
-        let ((slow, fast, device), precision) = load_with_precision_fallback(
+        let ((slow, mut fast, device), precision) = load_with_precision_fallback(
             "Fish S2",
             &selection,
             device.kind.is_metal(),
@@ -473,6 +484,8 @@ impl FishS2NativeRuntime {
             precision.loaded,
             precision.reason
         );
+        // A fast frame's input is the slow transformer's hidden state.
+        fast.resolve_graphs(precision.loaded);
         let codec_weights = codec.load_weights(&device, DType::F32)?;
         let dac = FishS2DacDecoder::load(FishS2DacConfig::current(), codec_weights.var_builder())?;
         let semantic_allowed_mask = slow.semantic_allowed_mask(eos)?;
@@ -483,6 +496,7 @@ impl FishS2NativeRuntime {
             fast,
             dac,
             semantic_allowed_mask,
+            semantic_masks: std::sync::OnceLock::new(),
             dtype: precision.loaded,
             precision,
         })
@@ -714,6 +728,206 @@ impl FishS2SemanticSampler {
     }
 }
 
+impl FishS2SemanticSampler {
+    /// The candidates' top-p a distribution must cover: the request's, or
+    /// the repetition-aware retry's when it is higher.
+    fn required_top_p(&self) -> f32 {
+        if self.repetition_aware && self.sampler.temperature > 0.0 {
+            self.sampler.top_p.max(RAS_HIGH_TOP_P)
+        } else {
+            self.sampler.top_p
+        }
+    }
+
+    /// One semantic token from `distribution`, with the repetition-aware
+    /// retry over the last [`RAS_WIN_SIZE`] tokens of `previous`.
+    fn draw(
+        &mut self,
+        distribution: &FishS2SamplingDistribution,
+        im_end_token_id: u32,
+        previous: &[u32],
+    ) -> Result<u32> {
+        let normal = self.sampler.sample(distribution)?;
+        if self.repetition_aware && self.sampler.temperature > 0.0 {
+            // Upstream draws both policies each frame, then chooses the retry
+            // only when a semantic token repeats in the last ten frames. RNG
+            // algorithms differ from Torch; this records and replays the
+            // native Rust policy.
+            let high =
+                self.sampler
+                    .sample_with_policy(distribution, RAS_HIGH_TEMP, RAS_HIGH_TOP_P)?;
+            let recent = &previous[previous.len().saturating_sub(RAS_WIN_SIZE)..];
+            if normal != im_end_token_id && recent.contains(&normal) {
+                return Ok(high);
+            }
+        }
+        Ok(normal)
+    }
+}
+
+/// The semantic masks as one `[2, vocab]` U8 device tensor (row 0 the
+/// semantic mask, row 1 the first frame's, without `<|im_end|>`), uploaded
+/// once per model, with the first frame's host mask and both masks' allowed
+/// counts.
+struct FishS2SemanticMasks {
+    device: Tensor,
+    first_frame: Vec<bool>,
+    allowed: [usize; 2],
+}
+
+impl FishS2NativeRuntime {
+    fn semantic_masks(
+        &self,
+        device: &candle_core::Device,
+        im_end_token_id: u32,
+    ) -> Result<&FishS2SemanticMasks> {
+        if let Some(masks) = self.semantic_masks.get() {
+            return Ok(masks);
+        }
+        let mut first_frame = self.semantic_allowed_mask.clone();
+        if let Some(allowed) = first_frame.get_mut(im_end_token_id as usize) {
+            *allowed = false;
+        }
+        let values = self
+            .semantic_allowed_mask
+            .iter()
+            .chain(&first_frame)
+            .map(|allowed| u8::from(*allowed))
+            .collect::<Vec<_>>();
+        let count = |mask: &[bool]| mask.iter().filter(|allowed| **allowed).count();
+        let masks = FishS2SemanticMasks {
+            device: Tensor::from_vec(values, (2, first_frame.len()), device)?,
+            allowed: [count(&self.semantic_allowed_mask), count(&first_frame)],
+            first_frame,
+        };
+        let _ = self.semantic_masks.set(masks);
+        self.semantic_masks
+            .get()
+            .ok_or_else(|| Error::InferenceError("Fish S2 semantic masks were not kept".into()))
+    }
+}
+
+/// One row of a step's semantic draw.
+struct FishS2SemanticRow<'a> {
+    logits: &'a Tensor,
+    allow_im_end: bool,
+    previous: &'a [u32],
+    sampler: &'a mut FishS2SemanticSampler,
+}
+
+/// `IZWI_FISH_S2_BATCHED_SAMPLING` (default on): draw a step's semantic and
+/// fast codes for every row from one device pass and one readback each.
+fn fish_s2_batched_sampling_enabled() -> bool {
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_FISH_S2_BATCHED_SAMPLING", true));
+    ENABLED.get()
+}
+
+/// Whether semantic rows draw from batched device candidates: CUDA and
+/// Metal, where the per-row path planned device candidates too.
+fn semantic_rows_on_device(logits: &Tensor) -> bool {
+    (logits.device().is_cuda() || logits.device().is_metal()) && fish_s2_batched_sampling_enabled()
+}
+
+/// Every row's semantic token, as [`sample_semantic_token`] draws it. With
+/// `device_candidates`, the rows' bounded candidates (and each raw row's
+/// finiteness count) come from one device pass and one readback, under
+/// masks uploaded once per model; the per-row path read back twice per row
+/// and copied the vocabulary-sized mask for a first frame. Each row's
+/// candidates are bit-identical to the per-row path's, and its own sampler
+/// draws from them with the same host code, so every row's token and RNG
+/// stream are what it gets alone.
+fn sample_semantic_rows(
+    runtime: &FishS2NativeRuntime,
+    rows: &mut [FishS2SemanticRow<'_>],
+    device_candidates: bool,
+) -> Result<Vec<u32>> {
+    let im_end = runtime
+        .slow
+        .eos_logit_index(runtime.tokenizer.specials().eos);
+    if !device_candidates || rows.is_empty() {
+        return rows
+            .iter_mut()
+            .map(|row| {
+                sample_semantic_token(
+                    row.logits,
+                    &runtime.semantic_allowed_mask,
+                    im_end,
+                    row.allow_im_end,
+                    row.previous,
+                    row.sampler,
+                )
+            })
+            .collect();
+    }
+    let vocab = runtime.semantic_allowed_mask.len();
+    let mut logit_rows = Vec::with_capacity(rows.len());
+    for row in rows.iter() {
+        sampling::validate_policy(row.sampler.sampler.temperature, row.sampler.sampler.top_p)?;
+        let logits = last_logits_row(row.logits)?;
+        if logits.dim(0)? != vocab {
+            return Err(Error::InferenceError(format!(
+                "Fish S2 semantic mask length {vocab} does not match logits length {}",
+                logits.dim(0)?,
+            )));
+        }
+        logit_rows.push(logits);
+    }
+    let stacked = Tensor::stack(&logit_rows, 0)?.to_dtype(DType::F32)?;
+    let finite = stacked
+        .eq(&stacked)?
+        .broadcast_mul(&stacked.abs()?.le(f32::MAX as f64)?)?
+        .to_dtype(DType::U32)?
+        .sum(1)?
+        .to_dtype(DType::F32)?;
+    let masks = runtime.semantic_masks(stacked.device(), im_end)?;
+    let selector = rows
+        .iter()
+        .map(|row| u32::from(!row.allow_im_end))
+        .collect::<Vec<_>>();
+    let row_masks = masks.device.index_select(
+        &Tensor::from_vec(selector.clone(), rows.len(), stacked.device())?,
+        0,
+    )?;
+    let (finite, candidates) = crate::models::shared::sampling::masked_nucleus_candidate_rows(
+        &stacked,
+        &row_masks,
+        vec![finite],
+    )?;
+    let mut tokens = Vec::with_capacity(rows.len());
+    for (index, (row, candidates)) in rows.iter_mut().zip(candidates).enumerate() {
+        if finite[index] as usize != vocab {
+            return Err(FishS2SamplingDistribution::non_finite_row_error(
+                &logit_rows[index],
+                "semantic",
+            )?);
+        }
+        let first_frame = selector[index] as usize;
+        let mask = if first_frame == 1 {
+            &masks.first_frame
+        } else {
+            &runtime.semantic_allowed_mask
+        };
+        let distribution = match candidates.and_then(|candidates| {
+            FishS2SamplingDistribution::from_device_candidates(
+                candidates,
+                masks.allowed[first_frame],
+                row.sampler.sampler.top_k,
+                row.sampler.required_top_p(),
+            )
+        }) {
+            Some(distribution) => distribution,
+            None => FishS2SamplingDistribution::from_host_row(
+                &logit_rows[index],
+                Some(mask),
+                "semantic",
+            )?,
+        };
+        tokens.push(row.sampler.draw(&distribution, im_end, row.previous)?);
+    }
+    Ok(tokens)
+}
+
 fn sample_semantic_token(
     logits: &Tensor,
     allowed_mask: &[bool],
@@ -741,35 +955,14 @@ fn sample_semantic_token(
         }
         &first_frame_mask
     };
-    let use_ras = sampler.repetition_aware && sampler.sampler.temperature > 0.0;
-    let required_top_p = if use_ras {
-        sampler.sampler.top_p.max(RAS_HIGH_TOP_P)
-    } else {
-        sampler.sampler.top_p
-    };
     let distribution = FishS2SamplingDistribution::from_logits(
         &row,
         Some(sampling_mask),
         sampler.sampler.top_k,
-        required_top_p,
+        sampler.required_top_p(),
         "semantic",
     )?;
-    let normal = sampler.sampler.sample(&distribution)?;
-    if use_ras {
-        // Upstream draws both policies each frame, then chooses the retry only
-        // when a semantic token repeats in the last ten frames. RNG algorithms
-        // differ from Torch; this records and replays the native Rust policy.
-        let high =
-            sampler
-                .sampler
-                .sample_with_policy(&distribution, RAS_HIGH_TEMP, RAS_HIGH_TOP_P)?;
-        let recent = &previous_semantic_tokens
-            [previous_semantic_tokens.len().saturating_sub(RAS_WIN_SIZE)..];
-        if normal != im_end_token_id && recent.contains(&normal) {
-            return Ok(high);
-        }
-    }
-    Ok(normal)
+    sampler.draw(&distribution, im_end_token_id, previous_semantic_tokens)
 }
 
 fn last_logits_row(logits: &Tensor) -> Result<Tensor> {

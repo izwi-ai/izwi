@@ -30,6 +30,7 @@ use crate::models::architectures::fish_drama3::{
 };
 use crate::models::architectures::fish_s2::{FishS2GenerationParams, FishS2PreparedArtifact};
 use crate::models::architectures::granite_speech::asr::GraniteSpeechPreparedPromptArtifact;
+use crate::models::architectures::granite_speech5::asr::GraniteSpeech5PreparedPromptArtifact;
 use crate::models::architectures::kokoro::KokoroPreparedRequest;
 use crate::models::architectures::lfm25_audio::{
     lfm25_audio_tts_system_prompt, model::Lfm25AudioPreparedAsrArtifact,
@@ -40,6 +41,7 @@ use crate::models::architectures::maya1::retained::Maya1PreparedArtifact;
 use crate::models::architectures::maya1::Maya1GenerationParams;
 use crate::models::architectures::maya2::retained::Maya2PreparedArtifact;
 use crate::models::architectures::maya2::Maya2GenerationParams;
+use crate::models::architectures::nemotron::asr::NemotronPreparedEncoderArtifact;
 use crate::models::architectures::parakeet::asr::ParakeetPreparedEncoderArtifact;
 use crate::models::architectures::qwen3::asr::Qwen3AsrPreparedAudio;
 use crate::models::architectures::qwen3::tts::{
@@ -56,7 +58,7 @@ use crate::models::registry::{
     AsrModelLease, ChatModelLease, ChatterboxTtsModelLease, FishDrama3TtsModelLease,
     FishS2TtsModelLease, KokoroTtsModelLease, Lfm25AudioModelLease, Maya1TtsModelLease,
     Maya2TtsModelLease, NativeAsrModel, NativeChatModel, NativeChatPreparedPrompt,
-    QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralTtsModelLease,
+    QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralModelLease, VoxtralTtsModelLease,
 };
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig, ChatRole};
 use crate::runtime::audio_io::{
@@ -194,6 +196,10 @@ impl WorkloadClass {
 pub enum EngineAudioInput {
     Base64(String),
     Bytes(Vec<u8>),
+    /// Canonical 16 kHz mono samples the runtime already decoded (one chunk
+    /// of a long file it transcribes as chunk rows), so the request neither
+    /// encodes nor decodes its audio.
+    Samples(Arc<[f32]>),
 }
 
 #[derive(Debug, Clone)]
@@ -450,6 +456,8 @@ enum PreparedIncrementalModel {
     /// LFM3-Audio speech as a retained row (the audio-chat model's lease).
     Lfm3Audio(Lfm25AudioModelLease),
     KokoroTts(KokoroTtsModelLease),
+    /// Voxtral offline transcription as a retained row, or its atomic route.
+    Voxtral(VoxtralModelLease),
 }
 
 impl fmt::Debug for PreparedIncrementalModel {
@@ -468,6 +476,7 @@ impl fmt::Debug for PreparedIncrementalModel {
             Self::Maya2Tts(model) => write!(formatter, "Maya2Tts({:p})", &**model),
             Self::Lfm3Audio(model) => write!(formatter, "Lfm3Audio({:p})", &**model),
             Self::KokoroTts(model) => write!(formatter, "KokoroTts({:p})", &**model),
+            Self::Voxtral(model) => write!(formatter, "Voxtral({:p})", &**model),
         }
     }
 }
@@ -498,6 +507,67 @@ pub(super) struct IncrementalModelExecutionReady {
     nemotron_transcribe:
         Option<Arc<crate::models::architectures::nemotron_transcribe::NemotronPreparedArtifact>>,
     kokoro_tts: Option<Arc<KokoroPreparedText>>,
+}
+
+/// A request is usually the last owner of its prepared TTS artifacts and is
+/// dropped on a tokio worker. Those that keep tensors on the device (Kokoro's
+/// style rows, VibeVoice, Chatterbox, Voxtral and LFM2.5/LFM3-Audio prompt
+/// embeddings) would then free CUDA memory without the context, and the
+/// latched `CUDA_ERROR_INVALID_CONTEXT` fails the next device call: Kokoro
+/// lost 35 of 64 requests at 32 streams on the H100 this way. Hand them to
+/// [`DeviceOwned`](crate::backends::DeviceOwned) so the last free runs on the
+/// device thread, as the ASR encoder artifacts do.
+impl Drop for IncrementalModelExecutionReady {
+    fn drop(&mut self) {
+        drop(crate::backends::DeviceOwned::new(RetiredTtsArtifacts {
+            kokoro: self.kokoro_tts.take(),
+            vibevoice: self.vibevoice_tts.take(),
+            voxtral: self.voxtral_tts.take(),
+            chatterbox: self.chatterbox_tts.take(),
+            lfm25_audio: self.lfm25_audio_tts.take(),
+            lfm3_audio: self.lfm3_audio.take(),
+        }));
+    }
+}
+
+/// The device-resident prepared TTS artifacts of one dropped request.
+struct RetiredTtsArtifacts {
+    kokoro: Option<Arc<KokoroPreparedText>>,
+    vibevoice: Option<Arc<VibeVoiceTtsPreparedArtifact>>,
+    voxtral: Option<Arc<VoxtralTtsPreparedArtifact>>,
+    chatterbox: Option<Arc<ChatterboxPreparedArtifact>>,
+    lfm25_audio: Option<Arc<Lfm25AudioPreparedTtsArtifact>>,
+    lfm3_audio: Option<Arc<Lfm3AudioPreparedArtifact>>,
+}
+
+impl crate::backends::DeviceResident for RetiredTtsArtifacts {
+    fn device_location(&self) -> Option<candle_core::DeviceLocation> {
+        let kokoro = self
+            .kokoro
+            .as_ref()
+            .and_then(|artifact| artifact.chunks.first())
+            .map(|chunk| &chunk.ref_style);
+        [
+            kokoro,
+            self.vibevoice
+                .as_ref()
+                .map(|artifact| artifact.input_embeds()),
+            self.voxtral
+                .as_ref()
+                .map(|artifact| &artifact.prompt_embeddings),
+            self.chatterbox
+                .as_ref()
+                .map(|artifact| &artifact.conditional),
+            self.lfm25_audio
+                .as_ref()
+                .map(|artifact| &artifact.prompt_embeddings),
+            self.lfm3_audio.as_ref().map(|artifact| &artifact.embeds),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|tensor| tensor.device().location())
+        .find(|location| matches!(location, candle_core::DeviceLocation::Cuda { .. }))
+    }
 }
 
 /// Speech-rate range every TTS request is clamped to. Clients may send
@@ -780,6 +850,7 @@ impl DirectPayloadLimits {
 enum BorrowedEngineAudioInput<'a> {
     Base64(&'a String),
     Bytes(&'a Vec<u8>),
+    Samples(&'a Arc<[f32]>),
 }
 
 /// Which upload field a digest was computed from, and that buffer's address
@@ -787,7 +858,8 @@ enum BorrowedEngineAudioInput<'a> {
 /// the accessors then hash the new bytes in full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct AsrSourceAudioIdentity {
-    base64: bool,
+    /// 0 base64, 1 bytes, 2 samples.
+    representation: u8,
     address: usize,
     len: usize,
 }
@@ -796,12 +868,17 @@ impl AsrSourceAudioIdentity {
     fn of(audio: BorrowedEngineAudioInput<'_>) -> Self {
         match audio {
             BorrowedEngineAudioInput::Base64(value) => Self {
-                base64: true,
+                representation: 0,
                 address: value.as_ptr() as usize,
                 len: value.len(),
             },
             BorrowedEngineAudioInput::Bytes(value) => Self {
-                base64: false,
+                representation: 1,
+                address: value.as_ptr() as usize,
+                len: value.len(),
+            },
+            BorrowedEngineAudioInput::Samples(value) => Self {
+                representation: 2,
                 address: value.as_ptr() as usize,
                 len: value.len(),
             },
@@ -829,6 +906,13 @@ fn asr_source_audio_digest(audio: BorrowedEngineAudioInput<'_>) -> u64 {
             1_u8.hash(&mut hasher);
             value.as_slice().hash(&mut hasher);
         }
+        BorrowedEngineAudioInput::Samples(value) => {
+            2_u8.hash(&mut hasher);
+            value.len().hash(&mut hasher);
+            for sample in value.iter() {
+                hasher.write_u32(sample.to_bits());
+            }
+        }
     }
     hasher.finish()
 }
@@ -844,6 +928,7 @@ impl EngineAudioInput {
         match self {
             Self::Base64(value) => value.is_empty(),
             Self::Bytes(value) => value.is_empty(),
+            Self::Samples(value) => value.is_empty(),
         }
     }
 }
@@ -893,7 +978,10 @@ pub(super) struct PreparedAsrAudio {
 #[derive(Clone)]
 pub(super) struct PreparedAsrEncoderArtifact {
     model_variant: ModelVariant,
-    artifact: PreparedAsrEncoderArtifactValue,
+    /// Held as [`DeviceOwned`]: the request is usually the artifact's last
+    /// owner and is dropped on a tokio worker, where a CUDA free fails and
+    /// latches `CUDA_ERROR_INVALID_CONTEXT` for the next device call.
+    artifact: crate::backends::DeviceOwned<PreparedAsrEncoderArtifactValue>,
     source_fingerprint: u64,
 }
 
@@ -903,8 +991,11 @@ enum PreparedAsrEncoderArtifactValue {
     Whisper(Arc<WhisperPreparedWindow>),
     VibeVoice(Arc<VibeVoiceAsrPreparedArtifact>),
     GraniteSpeech(Arc<GraniteSpeechPreparedPromptArtifact>),
+    GraniteSpeech5(Arc<GraniteSpeech5PreparedPromptArtifact>),
     Lfm25Audio(Arc<Lfm25AudioPreparedAsrArtifact>),
     Parakeet(Arc<ParakeetPreparedEncoderArtifact>),
+    Nemotron(Arc<NemotronPreparedEncoderArtifact>),
+    Voxtral(Arc<crate::models::architectures::voxtral::realtime::VoxtralOfflinePreparedAudio>),
 }
 
 impl fmt::Debug for PreparedAsrEncoderArtifact {
@@ -918,6 +1009,22 @@ impl fmt::Debug for PreparedAsrEncoderArtifact {
     }
 }
 
+impl crate::backends::DeviceResident for PreparedAsrEncoderArtifactValue {
+    fn device_location(&self) -> Option<candle_core::DeviceLocation> {
+        match self {
+            Self::Qwen3(value) => Some(value.device_location()),
+            Self::Whisper(value) => value.device_location(),
+            Self::VibeVoice(value) => Some(value.device_location()),
+            Self::GraniteSpeech(value) => Some(value.device_location()),
+            Self::GraniteSpeech5(value) => Some(value.device_location()),
+            Self::Lfm25Audio(value) => Some(value.device_location()),
+            Self::Parakeet(value) => Some(value.device_location()),
+            Self::Nemotron(value) => Some(value.device_location()),
+            Self::Voxtral(value) => Some(value.device_location()),
+        }
+    }
+}
+
 impl PreparedAsrEncoderArtifactValue {
     const fn family_name(&self) -> &'static str {
         match self {
@@ -925,8 +1032,11 @@ impl PreparedAsrEncoderArtifactValue {
             Self::Whisper(_) => "whisper",
             Self::VibeVoice(_) => "vibevoice",
             Self::GraniteSpeech(_) => "granite_speech",
+            Self::GraniteSpeech5(_) => "granite_speech5",
             Self::Lfm25Audio(_) => "lfm25_audio",
             Self::Parakeet(_) => "parakeet",
+            Self::Nemotron(_) => "nemotron",
+            Self::Voxtral(_) => "voxtral",
         }
     }
 
@@ -940,10 +1050,15 @@ impl PreparedAsrEncoderArtifactValue {
             Self::GraniteSpeech(value) => {
                 Ok((value.resident_host_bytes(), value.resident_tensor_bytes()?))
             }
+            Self::GraniteSpeech5(value) => {
+                Ok((value.resident_host_bytes(), value.resident_tensor_bytes()?))
+            }
             Self::Lfm25Audio(value) => {
                 Ok((value.retained_host_bytes, value.retained_resident_bytes))
             }
             Self::Parakeet(value) => Ok((0, value.resident_tensor_bytes()?)),
+            Self::Nemotron(value) => Ok((0, value.resident_tensor_bytes()?)),
+            Self::Voxtral(value) => Ok((0, value.tensor_bytes()?)),
         }
     }
 
@@ -953,8 +1068,11 @@ impl PreparedAsrEncoderArtifactValue {
             Self::Qwen3(_)
             | Self::Whisper(_)
             | Self::GraniteSpeech(_)
+            | Self::GraniteSpeech5(_)
             | Self::Lfm25Audio(_)
-            | Self::Parakeet(_) => &[],
+            | Self::Parakeet(_)
+            | Self::Nemotron(_)
+            | Self::Voxtral(_) => &[],
         }
     }
 }
@@ -1074,6 +1192,11 @@ pub struct EngineCoreRequest {
     pub asr_native_word_timestamps: bool,
     /// Translation target and keyword list, for families that support them.
     pub asr_task: AsrTaskOptions,
+    /// One chunk of a long file the runtime transcribes as concurrent chunk
+    /// rows: it runs in one pass (it never chunks again), skips the
+    /// whole-input no-speech gate as a chunk of the sequential route does,
+    /// and counts in no request metric (its parent request counts once).
+    pub(crate) asr_chunk_row: bool,
     /// Reference audio for voice cloning (base64 encoded). Processing may move
     /// this buffer into [`Self::task`] and clear this field.
     pub reference_audio: Option<String>,
@@ -1278,14 +1401,17 @@ impl RequestProcessor {
 
         request.stream_policy.validate()?;
 
-        // Parakeet preparation already bounded max_tokens by the input's
-        // emittable labels (E × max_symbols). Long audio exceeds the token
-        // context, which limits nothing in Parakeet's decode, so only an
-        // unprepared Parakeet request keeps the context clamp.
+        // Parakeet and Nemotron preparation already bounded max_tokens by
+        // the input's emittable labels (E × max_symbols). Long audio exceeds
+        // the token context, which limits nothing in their recurrent decode,
+        // so only an unprepared request keeps the context clamp.
         let output_bound_prepared = request.task_type == TaskType::ASR
-            && request
-                .model_variant
-                .is_some_and(|variant| variant.family() == ModelFamily::ParakeetAsr)
+            && request.model_variant.is_some_and(|variant| {
+                matches!(
+                    variant.family(),
+                    ModelFamily::ParakeetAsr | ModelFamily::NemotronAsr
+                )
+            })
             && request.prepared_sequence_input_tokens.is_some();
 
         // Validate and clamp parameters

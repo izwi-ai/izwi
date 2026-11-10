@@ -442,14 +442,14 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            72
+            76
         );
         assert_eq!(
             manifest
                 .iter()
                 .filter(|case| case.retained_state == Stateless)
                 .count(),
-            13
+            9
         );
 
         assert_eq!(
@@ -484,15 +484,6 @@ mod tests {
             )
             .retained_state,
             Managed
-        );
-        assert_eq!(
-            manifest_case(
-                &manifest,
-                ModelVariant::Nemotron35AsrStreaming06B,
-                CapabilityKind::Asr,
-            )
-            .retained_state,
-            Stateless
         );
         // Nemotron 3.5 Transcribe keeps its decoder's pages and Mamba state
         // in the managed arena between quanta.
@@ -558,6 +549,8 @@ mod tests {
             (ModelVariant::WhisperLargeV3Turbo, CapabilityKind::Asr),
             (ModelVariant::VibeVoiceAsr, CapabilityKind::Asr),
             (ModelVariant::ParakeetTdt06BV3, CapabilityKind::Asr),
+            (ModelVariant::Nemotron35AsrStreaming06B, CapabilityKind::Asr),
+            (ModelVariant::VoxtralMini4BRealtime2602, CapabilityKind::Asr),
             (ModelVariant::GraniteSpeech412B, CapabilityKind::Asr),
             (ModelVariant::Lfm25Audio15BGguf, CapabilityKind::Asr),
             (ModelVariant::Lfm25Audio15BGguf, CapabilityKind::Tts),
@@ -580,17 +573,6 @@ mod tests {
             assert_eq!(case.retained_state, Managed, "{variant} {capability:?}");
             assert_eq!(case.workspace, InvocationStateRequired);
         }
-        // Voxtral's offline ASR keeps only invocation state; its retained
-        // state belongs to the realtime capability.
-        assert_eq!(
-            manifest_case(
-                &manifest,
-                ModelVariant::VoxtralMini4BRealtime2602,
-                CapabilityKind::Asr,
-            )
-            .retained_state,
-            Stateless
-        );
         for capability in [CapabilityKind::Asr, CapabilityKind::SpeakerAttributedAsr] {
             assert_eq!(
                 manifest_case(&manifest, ModelVariant::GraniteSpeech412BPlus, capability,)
@@ -612,15 +594,16 @@ mod tests {
             .iter()
             .any(|case| case.variant == ModelVariant::GraniteSpeech412B
                 && case.capability == CapabilityKind::SpeakerAttributedAsr));
-        // Granite Speech 5.0 runs one atomic invocation on leased pages and
-        // retains nothing between requests; it serves plain ASR only.
-        // Its GGUF release is the same model with the same state.
+        // Granite Speech 5.0 retains decoder pages for single-segment rows
+        // and leases them for long audio's atomic invocations; it serves
+        // plain ASR only. Its GGUF release is the same model with the same
+        // state.
         for variant in [
             ModelVariant::GraniteSpeech502B,
             ModelVariant::GraniteSpeech502BGguf,
         ] {
             let granite_5 = manifest_case(&manifest, variant, CapabilityKind::Asr);
-            assert_eq!(granite_5.retained_state, Stateless);
+            assert_eq!(granite_5.retained_state, Managed);
             assert_eq!(granite_5.workspace, InvocationStateRequired);
             assert_eq!(
                 manifest

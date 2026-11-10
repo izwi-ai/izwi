@@ -55,7 +55,7 @@ impl RuntimeService {
         let kv_reach = state_binding
             .state
             .managed_kv_runtime()
-            .map(|runtime| runtime.logical_token_reach())
+            .map(|runtime| runtime.maximum_sequence_tokens())
             .filter(|tokens| *tokens > 0)
             .and_then(|tokens| usize::try_from(tokens).ok())
             .ok_or_else(|| {

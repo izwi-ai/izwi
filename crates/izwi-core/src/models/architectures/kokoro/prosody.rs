@@ -247,9 +247,7 @@ impl KokoroProsodyPredictor {
             )));
         }
 
-        let style = ref_style
-            .i((.., self.style_dim..(self.style_dim * 2)))
-            .map_err(Error::from)?; // predictor uses second half (128 dims)
+        let style = predictor_style(ref_style, self.style_dim)?;
 
         let d = self.duration_encoder.forward(d_en, &style)?; // [B, T, hidden+style]
         let x = self.duration_lstm.forward(&d)?; // [B, T, hidden]
@@ -286,7 +284,6 @@ impl KokoroProsodyPredictor {
             expanded_frames.push(frames);
         }
         let d_t = d.transpose(1, 2).map_err(Error::from)?; // [B, hidden+style, T]
-        let max_frames = expanded_frames.iter().copied().max().unwrap_or(1);
         let mut f0_rows = vec![None; b];
         let mut n_rows = vec![None; b];
         let mut duration_buckets = BTreeMap::<usize, Vec<usize>>::new();
@@ -297,7 +294,7 @@ impl KokoroProsodyPredictor {
         // frames: padding would alter the backward recurrence of valid frames.
         // Bucket after the one native duration pass and pad only completed
         // outputs for transport to the duration-aware decoder scheduler.
-        for (frames, rows) in duration_buckets {
+        for rows in duration_buckets.into_values() {
             let durations = rows
                 .iter()
                 .map(|&row| duration_frames[row].clone())
@@ -308,18 +305,8 @@ impl KokoroProsodyPredictor {
             let en = d_rows.matmul(&pred_aln).map_err(Error::from)?;
             let (f0, n) = self.f0n_train(&en, &style_rows)?;
             for (bucket_row, &original_row) in rows.iter().enumerate() {
-                f0_rows[original_row] = Some(
-                    f0.narrow(0, bucket_row, 1)
-                        .map_err(Error::from)?
-                        .pad_with_zeros(1, 0, max_frames - frames)
-                        .map_err(Error::from)?,
-                );
-                n_rows[original_row] = Some(
-                    n.narrow(0, bucket_row, 1)
-                        .map_err(Error::from)?
-                        .pad_with_zeros(1, 0, max_frames - frames)
-                        .map_err(Error::from)?,
-                );
+                f0_rows[original_row] = Some(f0.narrow(0, bucket_row, 1).map_err(Error::from)?);
+                n_rows[original_row] = Some(n.narrow(0, bucket_row, 1).map_err(Error::from)?);
             }
         }
         let f0_rows = f0_rows
@@ -330,8 +317,8 @@ impl KokoroProsodyPredictor {
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| Error::InferenceError("Kokoro omitted a noise batch row".to_string()))?;
-        let f0 = Tensor::cat(&f0_rows.iter().collect::<Vec<_>>(), 0).map_err(Error::from)?;
-        let n = Tensor::cat(&n_rows.iter().collect::<Vec<_>>(), 0).map_err(Error::from)?;
+        let f0 = pad_rows_to_longest(&f0_rows)?;
+        let n = pad_rows_to_longest(&n_rows)?;
 
         Ok(KokoroProsodyBatchOutput {
             duration_frames,
@@ -376,12 +363,36 @@ impl KokoroProsodyPredictor {
     }
 }
 
+/// Rows of different lengths, zero-padded on the right to the longest and
+/// stacked. F0 and N run at twice the frame rate, so a row's padding is its
+/// own length's shortfall, never a frame count; the decoder trims each row
+/// back to its own conditioning length.
+fn pad_rows_to_longest(rows: &[Tensor]) -> Result<Tensor> {
+    let longest = rows
+        .iter()
+        .map(|row| row.dim(1))
+        .collect::<CandleResult<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let padded = rows
+        .iter()
+        .map(|row| row.pad_with_zeros(1, 0, longest - row.dim(1)?))
+        .collect::<CandleResult<Vec<_>>>()?;
+    Tensor::cat(&padded.iter().collect::<Vec<_>>(), 0).map_err(Error::from)
+}
+
+/// `rows` of a batch, contiguous: they feed a matmul, and a lone row of a
+/// transposed batch (which `cat` hands back as the same strided view) is a
+/// layout no CUDA or Metal matmul takes.
 fn select_batch_rows(tensor: &Tensor, rows: &[usize]) -> Result<Tensor> {
     let selected = rows
         .iter()
         .map(|&row| tensor.narrow(0, row, 1).map_err(Error::from))
         .collect::<Result<Vec<_>>>()?;
-    Tensor::cat(&selected.iter().collect::<Vec<_>>(), 0).map_err(Error::from)
+    Tensor::cat(&selected.iter().collect::<Vec<_>>(), 0)
+        .and_then(|rows| rows.contiguous())
+        .map_err(Error::from)
 }
 
 pub(super) fn bounded_duration_frames(
@@ -1320,7 +1331,9 @@ impl BiLstm1 {
             .contiguous()?
             .index_select(&rev_idx, 0)?
             .transpose(0, 1)?;
-        Tensor::cat(&[fwd, bwd], 2)
+        // Concatenating the transposed views lays `[B, T, 2H]` out as
+        // `[2H, T, B]`; a CUDA matmul cannot take that once B exceeds one.
+        Tensor::cat(&[fwd, bwd], 2)?.contiguous()
     }
 }
 
@@ -1480,9 +1493,34 @@ pub(crate) fn fuse_weight_norm_dim0(weight_v: &Tensor, weight_g: &Tensor) -> Res
     weight_v.broadcast_mul(&scale).map_err(Error::from)
 }
 
+/// The predictor's half of a `[B, 2 * style_dim]` reference style: its
+/// second `style_dim` columns, made contiguous. With two or more rows the
+/// column slice is a strided view (row stride `2 * style_dim`), which CUDA's
+/// matmul refuses ("matmul is only supported for contiguous tensors"): every
+/// batched Kokoro prefill on CUDA failed that way from two rows up.
+fn predictor_style(ref_style: &Tensor, style_dim: usize) -> Result<Tensor> {
+    ref_style
+        .i((.., style_dim..(style_dim * 2)))
+        .and_then(|style| style.contiguous())
+        .map_err(Error::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batched_predictor_style_is_the_contiguous_second_half() {
+        let device = candle_core::Device::Cpu;
+        let values: Vec<f32> = (0..2 * 8).map(|value| value as f32).collect();
+        let ref_style = Tensor::from_vec(values, (2, 8), &device).unwrap();
+        let style = predictor_style(&ref_style, 4).unwrap();
+        assert!(style.is_contiguous(), "{:?}", style.layout());
+        assert_eq!(
+            style.to_vec2::<f32>().unwrap(),
+            vec![vec![4.0, 5.0, 6.0, 7.0], vec![12.0, 13.0, 14.0, 15.0]]
+        );
+    }
 
     /// The previous BiLstm1: two Candle `LSTM`s stepped one direction at a
     /// time, the backward one over an index-selected reversed copy.
@@ -1602,6 +1640,114 @@ mod tests {
             assert_eq!(fused.dims(), reference.dims());
             let diff = max_abs_diff(&host_f32(&fused).unwrap(), &host_f32(&reference).unwrap());
             assert!(diff <= 1e-5, "{input}->{hidden}: max |diff| {diff}");
+        }
+    }
+
+    /// Rows of one batch expand to different frame counts, and their F0/N
+    /// curves run at twice the frame rate. Padding each by its frame shortfall
+    /// left rows of 396 and 367 samples (198 and 169 frames) that could not
+    /// be stacked: every Kokoro batch spanning two duration buckets failed
+    /// ("shape mismatch in cat", one text at two speeds on Metal). Rows now
+    /// pad to the longest curve and keep their values.
+    #[test]
+    fn rows_pad_to_the_longest_curve_and_keep_their_values() {
+        let device = candle_core::Device::Cpu;
+        let long = Tensor::arange(0f32, 396., &device)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        let short = Tensor::arange(0f32, 338., &device)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        let stacked = pad_rows_to_longest(&[short.clone(), long.clone()]).unwrap();
+        assert_eq!(stacked.dims(), &[2, 396]);
+        let rows = stacked.to_vec2::<f32>().unwrap();
+        assert_eq!(rows[0][..338], short.to_vec2::<f32>().unwrap()[0][..]);
+        assert!(rows[0][338..].iter().all(|&v| v == 0.0));
+        assert_eq!(rows[1], long.to_vec2::<f32>().unwrap()[0]);
+    }
+
+    /// A batch whose rows expand to different frame counts runs each row's
+    /// F0/N alignment matmul on that row alone, sliced from the transposed
+    /// `[B, hidden+style, T]` duration features. A lone row came back as the
+    /// strided view (leading dimension 2T), which CUDA and Metal matmuls
+    /// refuse: Kokoro failed from 32 streams on the H100, and on Metal with
+    /// one text at two speeds. Every bucket's rows are now contiguous and in
+    /// bucket order.
+    #[test]
+    fn selected_batch_rows_are_contiguous_for_any_bucket() {
+        let device = candle_core::Device::Cpu;
+        let features = Tensor::arange(0f32, 24., &device)
+            .unwrap()
+            .reshape((2, 3, 4))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap();
+        for rows in [&[1usize][..], &[0], &[0, 1], &[1, 0]] {
+            let selected = select_batch_rows(&features, rows).unwrap();
+            assert!(selected.is_contiguous(), "rows {rows:?}");
+            let expected = rows
+                .iter()
+                .map(|&row| features.get(row).unwrap().to_vec2::<f32>().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                selected.to_vec3::<f32>().unwrap(),
+                expected,
+                "rows {rows:?}"
+            );
+        }
+    }
+
+    /// Two or more rows of BiLSTM output feed the duration projection's
+    /// matmul. Concatenating the two directions' transposed views left a
+    /// `[B, T, 2H]` tensor laid out `[2H, T, B]`, which cuBLAS cannot take
+    /// once B exceeds one (Kokoro failed every batched request from 32
+    /// streams on the H100 with "matmul is only supported for contiguous
+    /// tensors"). The CPU's general-stride GEMM accepts that layout, so the
+    /// test checks the layout itself: the output is contiguous at any width.
+    #[test]
+    fn batched_bilstm_output_feeds_a_linear_projection() {
+        use crate::kernels::numeric_check::xorshift_tensor;
+
+        let device = candle_core::Device::Cpu;
+        let (input, hidden, out) = (24usize, 8usize, 5usize);
+        let mut tensors = std::collections::HashMap::new();
+        for (n, suffix) in ["", "_reverse"].into_iter().enumerate() {
+            for (k, (name, shape)) in [
+                ("weight_ih_l0", vec![4 * hidden, input]),
+                ("weight_hh_l0", vec![4 * hidden, hidden]),
+                ("bias_ih_l0", vec![4 * hidden]),
+                ("bias_hh_l0", vec![4 * hidden]),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let seed = 40 + n as u64 * 4 + k as u64;
+                tensors.insert(
+                    format!("{name}{suffix}"),
+                    xorshift_tensor(&shape, seed, 0.3, &device).unwrap(),
+                );
+            }
+        }
+        let lstm = BiLstm1::load(
+            input,
+            hidden,
+            VarBuilder::from_tensors(tensors, DType::F32, &device),
+        )
+        .unwrap();
+        let projection = candle_nn::Linear::new(
+            xorshift_tensor(&[out, 2 * hidden], 51, 0.3, &device).unwrap(),
+            None,
+        );
+        for batch in [1usize, 2, 3] {
+            let x = xorshift_tensor(&[batch, 11, input], 60 + batch as u64, 1.0, &device).unwrap();
+            let y = lstm.forward(&x).unwrap();
+            let logits = projection
+                .forward(&y)
+                .unwrap_or_else(|error| panic!("batch {batch}: {error}"));
+            assert_eq!(logits.dims(), &[batch, 11, out]);
+            assert!(y.is_contiguous(), "batch {batch}: {:?}", y.layout());
         }
     }
 

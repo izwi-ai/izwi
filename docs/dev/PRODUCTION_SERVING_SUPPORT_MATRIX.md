@@ -99,16 +99,46 @@ The tests below are ignored and need the checkpoint.
 | Qwen3.5 | 2 | 8 | 32 (unmeasured) | `qwen35_decode_width_parity_and_throughput_{cpu,metal}` (0.8B; 2B on Metal): every decisive step agrees with width 1 and the top-16 logits move by under 1e-4. Metal (2026-10-24, with the shared small-batch k-quant mat-vec on every Q4_K/Q5_K/Q6_K/Q8_0 projection and the tied head) 0.8B gives 105/180/251/285 tok/s at widths 1/2/4/8 (Candle per-row: 105/122/133/140); 2B gives 68/99/137/147 (60/69/73/77). On the CPU, 0.8B gives 21/22/25/26, then 11/16/15/15 on a repeat under load. That is no repeatable gain past two, so the CPU stays at 2 |
 | Qwen3.6, Qwen3.8 | 2 | 2 | 32 | CPU and Metal: no checkpoint on the measuring machine. CUDA: every row's DeltaNet state and q/k RoPE run in one launch per layer, and the block-FP8 projections run tensor-core kernels whose cost barely grows from 2 to 16 rows (about 0.013 ms per 5120x5120 projection on an H100). H100 (2026-11-05, 789bf38e4). Parity: greedy decode through the server (32 prompts x 96 tokens, top-2 logprobs) at 8, 16 and 32 concurrent users against one never left the width-1 token where its top-two logit margin was 1.0 or more. The logits are BF16, and every divergence came at a margin of 0.75 or less; the worst chosen-token logprob delta on matching steps was 0.12 (Qwen3.8) and 0.28 (Qwen3.6). Throughput, as server busy tokens/s (greedy, 256 in / 256 out, width 8 in brackets): Qwen3.8 at 16 and 32 users 433 and 418 (282, 292); Qwen3.6 349 and 364 (318, 321) |
 | Qwen3, Qwen3-MoE, Gemma3 | 2 | 2 | 8 | No checkpoint on the measuring machine; the historical portable width |
+| Qwen3-ASR, VibeVoice-ASR, Parakeet, Nemotron ASR (continuous decode only) | 2 | 2 | 32 (unmeasured past 8) | H100 (`e8f189691`): Qwen3-ASR 0.6B/1.7B and VibeVoice-ASR scaled 2.4–2.9x from 1 to 8 streams, then stayed flat at the width (Qwen3-ASR ~82 audio-s/s). Their decode steps every row per launch: the Qwen3 core rotates a whole batch with one RoPE call per layer, Parakeet's TDT and Nemotron's RNNT joints step all rows with one readback |
 
 CUDA keeps its automatic width of eight for the engine rows and every family
-not certified wider, and a ceiling of 32 for chat. The 32 is a policy
-constant (`catalog/batch_width.rs`), not a kernel or metadata limit. A
-family certified past eight decodes at its stage's width
-(`engine/executor.rs`, read from the same table), and its pre-load CUDA
-state floor prices staged rows at that width. On a smaller GPU an operator
-can keep the old width with `IZWI_MAX_BATCH_SIZE=8`. An explicit
+not certified wider, and a ceiling of 32 for chat and for the ASR decode of
+the families above. The 32 is a policy constant (`catalog/batch_width.rs`),
+not a kernel or metadata limit. A family certified past eight decodes at its
+stage's width (`engine/executor.rs`, read from the same table), and its
+pre-load CUDA state floor prices staged rows at that width. On a smaller GPU
+an operator can keep the old width with `IZWI_MAX_BATCH_SIZE=8`. An explicit
 `IZWI_MAX_BATCH_SIZE` above a certified width is honoured up to 32 with a
 startup warning.
+
+ASR widens only its continuous decode stage. The encoder, preparation and
+prefill stages (and the Parakeet and Nemotron encoder batchers, which form
+at most the preparation stage's width) stay at the engine rows, so their
+workspace does not grow. Each load fits the decode width to memory: the
+widest of 32, 16 and 8 rows whose per-row bytes take at most half the
+planning headroom left after the model's resident weights. A row is its
+retained sequence state, one prepared-input row and its decode workspace
+(`asr_envelope::cuda_decode_row_bytes`):
+
+| Model | Per decode row | 32 rows |
+|---|---|---|
+| Qwen3-ASR 1.7B | ~149 MiB (1,307 tokens of BF16 KV at 112 KiB, embeddings, logits) | ~4.6 GiB |
+| Qwen3-ASR 0.6B | ~146 MiB | ~4.6 GiB |
+| VibeVoice-ASR | ~136 MiB (1,938 tokens at 56 KiB, embeddings, tokenizer caches) | ~4.2 GiB |
+| Parakeet-TDT-0.6B-v3 | ~21 MiB (16 MiB decode workspace, one window's encoder output) | ~0.7 GiB |
+| Nemotron 3.5 ASR Streaming | ~17.5 MiB | ~0.55 GiB |
+
+A load that cannot price its headroom keeps eight. The ASR state of a
+widened model stages one step at its decode width, past the engine's
+automatic staged rows, and retains as many sequences (Parakeet and Nemotron
+keep at least their realtime session count). The startup log and
+`runtime.concurrency.asr_row_width` in `/v1/health` report the ceiling (32
+on CUDA with an automatic width, the non-chat rows otherwise); each load
+logs its fitted width, which `runtime.loaded_models[].asr_decode_width`
+reports. With an explicit `IZWI_MAX_BATCH_SIZE` or `IZWI_MAX_NUM_SEQS` every
+ASR stage runs that width as before. Above eight rows candle switches its
+quantized mat-vec kernels (MMVQ) to MMQ, so a transcript can differ by
+width.
 
 Live check (Metal, LFM2.5-1.2B, release build). The sweep used 32 prompts of
 256 words and 128 output tokens at rates 1, 2, 4 and inf, alternating runs on

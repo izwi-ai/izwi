@@ -265,6 +265,37 @@ impl T3Model {
             .add(&self.speech_pos.forward(&self.positions(position, 1)?)?)?)
     }
 
+    /// [`Self::speech_step_embed`] of each `tokens[i]` at `positions[i]`,
+    /// `[rows, hidden]`: the ids and positions go up in one upload and each
+    /// table is gathered once (each row's values are its single-row ones).
+    pub fn speech_step_embeds(&self, tokens: &[u32], positions: &[usize]) -> Result<Tensor> {
+        let rows = tokens.len();
+        if rows == 0 || positions.len() != rows {
+            return Err(Error::InvalidInput(
+                "Chatterbox speech embeddings need one position per token".into(),
+            ));
+        }
+        if let Some(&position) = positions
+            .iter()
+            .find(|&&position| position >= self.cfg.speech_positions)
+        {
+            return Err(Error::InvalidInput(format!(
+                "Chatterbox speech position {position} exceeds the {}-row table",
+                self.cfg.speech_positions
+            )));
+        }
+        let ids = tokens
+            .iter()
+            .copied()
+            .chain(positions.iter().map(|&position| position as u32))
+            .collect::<Vec<_>>();
+        let ids = Tensor::from_vec(ids, 2 * rows, &self.device)?;
+        Ok(self
+            .speech_emb
+            .forward(&ids.narrow(0, 0, rows)?)?
+            .add(&self.speech_pos.forward(&ids.narrow(0, rows, rows)?)?)?)
+    }
+
     /// Run `rows` through the backbone and return each row's speech logits
     /// at its last position, `[rows, speech_vocab]` in row order (F32).
     pub fn forward(&self, rows: &mut [T3ForwardRow<'_>]) -> Result<Tensor> {

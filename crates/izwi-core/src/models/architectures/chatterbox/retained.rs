@@ -22,6 +22,7 @@ use super::{
     ChatterboxGenerationParams, ChatterboxPreparedVoice, ChatterboxRuntime, ChatterboxStopReason,
 };
 use crate::error::{Error, Result};
+use crate::kernels::penalized_topk;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PhysicalPagedKvCheckpoint};
 
 /// One request, prepared before it reaches the engine: both prefill rows and
@@ -94,11 +95,146 @@ struct HostCheckpoint {
     stop_reason: Option<ChatterboxStopReason>,
 }
 
-/// Logits of the last forward, one row per branch.
+/// What the next draw reads from the last forward.
 #[derive(Clone)]
-struct PendingLogits {
-    conditional: Vec<f32>,
-    unconditional: Option<Vec<f32>>,
+enum PendingLogits {
+    /// The logits, one row per branch.
+    Rows {
+        conditional: Vec<f32>,
+        unconditional: Option<Vec<f32>>,
+    },
+    /// On CUDA, the tokens the draw can pick with their processed logits,
+    /// from the row's device candidates ([`sampling::candidate_survivors`]).
+    Survivors(Vec<(u32, f32)>),
+}
+
+/// One request's share of a T3 forward's logits, for [`read_pending`].
+struct PendingRequest<'a> {
+    guided: bool,
+    /// Whether the request draws from this forward.
+    wanted: bool,
+    params: &'a sampling::T3SamplingParams,
+    history: &'a [u32],
+}
+
+/// Whether draws read device candidates: on CUDA, unless
+/// `IZWI_CHATTERBOX_DEVICE_SAMPLING=false` or the kernel's one-time check
+/// failed.
+fn device_sampling(model: &T3Model) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    model.device().is_cuda()
+        && *ENABLED.get_or_init(|| crate::env::flag_or("IZWI_CHATTERBOX_DEVICE_SAMPLING", true))
+        && penalized_topk::device_path::ready(model.device())
+}
+
+/// What each request's next draw reads from a forward's `[pushed rows,
+/// vocab]` F32 logits (each request's conditional row, then its
+/// unconditional row when guided, in `requests` order); `None` where not
+/// `wanted`. With `device_candidates`, the requests read back their
+/// candidates together in one transfer; a request they cannot serve (min-p
+/// off, non-finite logits, an undecidable min-p cut), or every request
+/// without, reads its rows whole.
+fn read_pending(
+    logits: &Tensor,
+    requests: &[PendingRequest<'_>],
+    device_candidates: bool,
+) -> Result<Vec<Option<PendingLogits>>> {
+    let vocab = logits.dim(1)?;
+    let mut conditional_rows = Vec::with_capacity(requests.len());
+    let mut next = 0usize;
+    for request in requests {
+        conditional_rows.push(next);
+        next += if request.guided { 2 } else { 1 };
+    }
+    let mut pending = vec![None; requests.len()];
+    if device_candidates {
+        let histories = requests
+            .iter()
+            .map(|request| {
+                let mut tokens = request
+                    .history
+                    .iter()
+                    .copied()
+                    .filter(|&token| (token as usize) < vocab)
+                    .collect::<Vec<_>>();
+                tokens.sort_unstable();
+                tokens.dedup();
+                tokens
+            })
+            .collect::<Vec<_>>();
+        let mut selected = Vec::new();
+        let mut candidate_rows = Vec::new();
+        for (index, request) in requests.iter().enumerate() {
+            let row = conditional_rows[index];
+            let candidates = request
+                .wanted
+                .then(|| {
+                    sampling::device_candidates(
+                        request.params,
+                        (row, request.guided.then_some(row + 1)),
+                        &histories[index],
+                    )
+                })
+                .flatten();
+            if let Some(candidates) = candidates {
+                selected.push(index);
+                candidate_rows.push(candidates);
+            }
+        }
+        if !selected.is_empty() {
+            let count = sampling::DEVICE_CANDIDATES;
+            let packed = penalized_topk::candidates_packed(logits, vocab, &candidate_rows, count)?
+                .flatten_all()?
+                .to_vec1::<u32>()?;
+            for (&index, candidates) in selected.iter().zip(penalized_topk::unpack(&packed, count))
+            {
+                if candidates.non_finite == 0 {
+                    pending[index] = sampling::candidate_survivors(
+                        &candidates.values,
+                        &candidates.indices,
+                        requests[index].params,
+                        vocab,
+                    )
+                    .map(PendingLogits::Survivors);
+                }
+            }
+        }
+    }
+    let whole = (0..requests.len())
+        .filter(|&index| requests[index].wanted && pending[index].is_none())
+        .collect::<Vec<_>>();
+    if device_candidates {
+        let wanted = requests.iter().filter(|request| request.wanted).count();
+        penalized_topk::device_path::record(wanted, whole.len());
+    }
+    if whole.is_empty() {
+        return Ok(pending);
+    }
+    // Every row as before, or only the rows of the requests that need them.
+    let (host, row_of) = if !device_candidates {
+        (logits.to_vec2::<f32>()?, conditional_rows.clone())
+    } else {
+        let mut ids = Vec::new();
+        let mut row_of = vec![0; requests.len()];
+        for &index in &whole {
+            row_of[index] = ids.len();
+            ids.push(conditional_rows[index] as u32);
+            if requests[index].guided {
+                ids.push(conditional_rows[index] as u32 + 1);
+            }
+        }
+        let count = ids.len();
+        let ids = Tensor::from_vec(ids, count, logits.device())?;
+        (logits.index_select(&ids, 0)?.to_vec2::<f32>()?, row_of)
+    };
+    for &index in &whole {
+        let row = row_of[index];
+        pending[index] = Some(PendingLogits::Rows {
+            conditional: host[row].clone(),
+            unconditional: requests[index].guided.then(|| host[row + 1].clone()),
+        });
+    }
+    Ok(pending)
 }
 
 pub(crate) struct ChatterboxQuantumCheckpoint {
@@ -405,44 +541,28 @@ pub(crate) fn chatterbox_prefill_batch(
     }
     let logits = model.forward(&mut forward)?;
     drop(forward);
-    distribute_logits(rows, &logits, |row, index| {
-        let step = steps[index];
+    let pending = {
+        let requests = rows
+            .iter()
+            .zip(&steps)
+            .map(|(row, step)| PendingRequest {
+                guided: row.state.guided(),
+                // The prompt's end: the first draw reads its logits.
+                wanted: step.complete,
+                params: &row.state.params.sampling,
+                history: &row.state.history,
+            })
+            .collect::<Vec<_>>();
+        read_pending(&logits, &requests, device_sampling(model))?
+    };
+    for ((row, step), pending) in rows.iter_mut().zip(&steps).zip(pending) {
         row.state.prefill_cursor += step.consumed_tokens;
         if step.complete {
             row.state.phase = ChatterboxPhase::Decode;
-        }
-        Ok(step.complete)
-    })?;
-    Ok(steps)
-}
-
-/// Copy each row's logits out of a forward's `[rows, vocab]` output, in the
-/// order the rows were pushed (conditional, then unconditional when
-/// guided), keeping them only where `keep` says the row is now decoding.
-fn distribute_logits(
-    rows: &mut [ChatterboxStepRow<'_>],
-    logits: &Tensor,
-    mut keep: impl FnMut(&mut ChatterboxStepRow<'_>, usize) -> Result<bool>,
-) -> Result<()> {
-    let all = logits.to_vec2::<f32>()?;
-    let mut next = 0usize;
-    for (index, row) in rows.iter_mut().enumerate() {
-        let conditional = all[next].clone();
-        next += 1;
-        let unconditional = if row.state.guided() {
-            next += 1;
-            Some(all[next - 1].clone())
-        } else {
-            None
-        };
-        if keep(row, index)? {
-            row.state.pending = Some(PendingLogits {
-                conditional,
-                unconditional,
-            });
+            row.state.pending = pending;
         }
     }
-    Ok(())
+    Ok(steps)
 }
 
 /// One decode step for each row: sample a token from its pending logits,
@@ -468,13 +588,21 @@ pub(crate) fn chatterbox_decode_batch(
         let pending = state.pending.take().ok_or_else(|| {
             Error::InferenceError("Chatterbox decode step has no pending logits".into())
         })?;
-        let token = sampling::sample_next(
-            &pending.conditional,
-            pending.unconditional.as_deref(),
-            &state.history,
-            &state.params.sampling,
-            &mut state.rng,
-        )?;
+        let token = match pending {
+            PendingLogits::Rows {
+                conditional,
+                unconditional,
+            } => sampling::sample_next(
+                &conditional,
+                unconditional.as_deref(),
+                &state.history,
+                &state.params.sampling,
+                &mut state.rng,
+            )?,
+            PendingLogits::Survivors(survivors) => {
+                sampling::sample_survivors(&survivors, &mut state.rng)?
+            }
+        };
         state.history.push(token);
         let stopped = if token == cfg.stop_speech_token {
             Some(ChatterboxStopReason::EndOfSpeech)
@@ -497,20 +625,20 @@ pub(crate) fn chatterbox_decode_batch(
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     if !continuing.is_empty() {
-        let embeds = continuing
+        // Every continuing row's token at its speech position, gathered in
+        // one upload and one lookup per table.
+        let (tokens, positions): (Vec<u32>, Vec<usize>) = continuing
             .iter()
-            .map(|&index| {
-                let position = rows[index].state.tokens_generated();
-                model.speech_step_embed(sampled[index], position)
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .map(|&index| (sampled[index], rows[index].state.tokens_generated()))
+            .unzip();
+        let embeds = model.speech_step_embeds(&tokens, &positions)?;
         let mut forward = Vec::with_capacity(continuing.len() * 2);
         let mut cursor = 0usize;
         for (index, row) in rows.iter_mut().enumerate() {
             if continuing.get(cursor) != Some(&index) {
                 continue;
             }
-            let embed = embeds[cursor].clone();
+            let embed = embeds.narrow(0, cursor, 1)?;
             cursor += 1;
             forward.push(T3ForwardRow {
                 embeds: embed.clone(),
@@ -530,22 +658,23 @@ pub(crate) fn chatterbox_decode_batch(
         }
         let logits = model.forward(&mut forward)?;
         drop(forward);
-        let all = logits.to_vec2::<f32>()?;
-        let mut next = 0usize;
-        for &index in &continuing {
-            let state = &mut *rows[index].state;
-            let conditional = all[next].clone();
-            next += 1;
-            let unconditional = if state.guided() {
-                next += 1;
-                Some(all[next - 1].clone())
-            } else {
-                None
-            };
-            state.pending = Some(PendingLogits {
-                conditional,
-                unconditional,
-            });
+        let pending = {
+            let requests = continuing
+                .iter()
+                .map(|&index| {
+                    let state = &*rows[index].state;
+                    PendingRequest {
+                        guided: state.guided(),
+                        wanted: true,
+                        params: &state.params.sampling,
+                        history: &state.history,
+                    }
+                })
+                .collect::<Vec<_>>();
+            read_pending(&logits, &requests, device_sampling(model))?
+        };
+        for (&index, pending) in continuing.iter().zip(pending) {
+            rows[index].state.pending = pending;
         }
     }
     Ok(rows
@@ -555,4 +684,102 @@ pub(crate) fn chatterbox_decode_batch(
             finished: row.state.phase == ChatterboxPhase::Acoustic,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use candle_core::Device;
+
+    use super::*;
+
+    /// A forward's logits reach each request's draw the same through device
+    /// candidates as whole: guided and unguided requests side by side, one
+    /// not drawing, one with min-p off (whole rows on either path).
+    #[test]
+    fn pending_draws_match_with_and_without_device_candidates() {
+        const VOCAB: usize = 8_194;
+        let mut source = SplitMix64::new(41);
+        let base = sampling::T3SamplingParams {
+            temperature: 0.8,
+            repetition_penalty: 1.2,
+            min_p: 0.05,
+            top_p: 1.0,
+            cfg_weight: 0.5,
+        };
+        let unguided = sampling::T3SamplingParams {
+            cfg_weight: 0.0,
+            top_p: 0.9,
+            ..base
+        };
+        let min_p_off = sampling::T3SamplingParams {
+            min_p: 0.0,
+            ..unguided
+        };
+        let params = [base, unguided, base, min_p_off];
+        let wanted = [true, true, false, true];
+        let histories = (0..4)
+            .map(|row| {
+                (0..40 + row * 30)
+                    .map(|_| (source.next_u64() % VOCAB as u64) as u32)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let requests = (0..4)
+            .map(|index| PendingRequest {
+                guided: params[index].guided(),
+                wanted: wanted[index],
+                params: &params[index],
+                history: &histories[index],
+            })
+            .collect::<Vec<_>>();
+        let rows = requests
+            .iter()
+            .map(|request| if request.guided { 2 } else { 1 })
+            .sum::<usize>();
+        let logits = Tensor::from_vec(
+            source
+                .standard_normals(rows * VOCAB)
+                .into_iter()
+                .map(|v| v * 3.0)
+                .collect::<Vec<_>>(),
+            (rows, VOCAB),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let draw = |pending: &PendingLogits, index: usize| {
+            let mut rng = SplitMix64::new(7 + index as u64);
+            let token = match pending {
+                PendingLogits::Rows {
+                    conditional,
+                    unconditional,
+                } => sampling::sample_next(
+                    conditional,
+                    unconditional.as_deref(),
+                    &histories[index],
+                    &params[index],
+                    &mut rng,
+                )
+                .unwrap(),
+                PendingLogits::Survivors(survivors) => {
+                    sampling::sample_survivors(survivors, &mut rng).unwrap()
+                }
+            };
+            (token, rng.next_u64())
+        };
+        let host = read_pending(&logits, &requests, false).unwrap();
+        let device = read_pending(&logits, &requests, true).unwrap();
+        for index in 0..4 {
+            assert_eq!(host[index].is_some(), wanted[index]);
+            assert_eq!(device[index].is_some(), wanted[index]);
+            if let (Some(host), Some(device)) = (&host[index], &device[index]) {
+                assert!(matches!(host, PendingLogits::Rows { .. }));
+                assert_eq!(
+                    matches!(device, PendingLogits::Survivors(_)),
+                    index != 3,
+                    "request {index}"
+                );
+                assert_eq!(draw(host, index), draw(device, index), "request {index}");
+            }
+        }
+    }
 }

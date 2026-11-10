@@ -115,6 +115,10 @@ pub(super) fn engine_output_observation(
         prompt_tokens: Some(output.token_stats.prompt_tokens as u64),
         generated_tokens: Some(output.token_stats.generated_tokens as u64),
         audio_samples: Some(output.audio.samples.len() as u64),
+        input_audio_ms: output
+            .input_audio_duration_secs
+            .filter(|secs| secs.is_finite() && *secs > 0.0)
+            .map(|secs| (f64::from(secs) * 1000.0).round() as u64),
         transcript_chars: output.text.as_ref().map(|text| text.chars().count() as u64),
         stop_reason: output.finish_reason.map(|reason| format!("{reason:?}")),
         ..RuntimeStageOutputCounters::default()
@@ -136,9 +140,94 @@ pub(super) fn engine_error_observation(
     observation
 }
 
+/// The request metrics of a request the runtime serves as several internal
+/// requests (a long file's chunk rows, which count in none): it is routed,
+/// queued and finished once, like the one request it replaces. Dropped
+/// unfinished, it counts as cancelled.
+pub(crate) struct CompositeRequestMetrics {
+    telemetry: Arc<RuntimeTelemetryCollector>,
+    context: RuntimeObservationContext,
+    admission_ms: Option<f64>,
+    request_id: String,
+    open: bool,
+}
+
+impl CompositeRequestMetrics {
+    /// Records the request's terminal `output`, whose latency breakdown and
+    /// token counts cover all of its parts.
+    pub(crate) async fn complete(mut self, output: &EngineOutput) {
+        self.open = false;
+        self.telemetry
+            .record_stage_observation(engine_output_observation(
+                self.context.clone(),
+                self.admission_ms,
+                output,
+            ));
+        self.telemetry.record_request_finished(output).await;
+    }
+
+    /// Records the request's failure: a timeout or cancellation counts as
+    /// cancelled, as it does for one request, anything else as failed.
+    pub(crate) async fn fail(mut self, error: &Error) {
+        self.open = false;
+        self.telemetry
+            .record_stage_observation(engine_error_observation(
+                self.context.clone(),
+                self.admission_ms,
+                error.to_string(),
+            ));
+        match error {
+            Error::Cancelled(_) | Error::Timeout(_) => {
+                self.telemetry
+                    .record_request_cancelled(&self.request_id)
+                    .await
+            }
+            _ => {
+                self.telemetry
+                    .record_forced_failures([self.request_id.as_str()])
+                    .await
+            }
+        }
+    }
+}
+
+impl Drop for CompositeRequestMetrics {
+    fn drop(&mut self) {
+        if !self.open {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let telemetry = self.telemetry.clone();
+        let request_id = std::mem::take(&mut self.request_id);
+        runtime.spawn(async move { telemetry.record_request_cancelled(&request_id).await });
+    }
+}
+
 impl RuntimeService {
     pub fn record_stage_observation(&self, observation: RuntimeStageObservation) {
         self.telemetry.record_stage_observation(observation);
+    }
+
+    /// Routes and queues `request` (it never reaches the engine itself) as
+    /// one request whose parts run as internal requests.
+    pub(crate) async fn begin_composite_request_metrics(
+        &self,
+        request: &EngineCoreRequest,
+        streaming: bool,
+    ) -> Result<CompositeRequestMetrics> {
+        // Its parts run without a native stream; the parent streams their
+        // committed text over the transport.
+        self.observe_broker_request_with_transport_streaming(request)?;
+        self.telemetry.record_request_queued(&request.id).await;
+        Ok(CompositeRequestMetrics {
+            telemetry: self.telemetry.clone(),
+            context: self.engine_observation_context(request, streaming),
+            admission_ms: request.admission_ms,
+            request_id: request.id.clone(),
+            open: true,
+        })
     }
 
     pub(super) fn observe_broker_request(&self, request: &EngineCoreRequest) -> Result<()> {
@@ -150,6 +239,10 @@ impl RuntimeService {
         request: &EngineCoreRequest,
         streaming_required: bool,
     ) -> Result<()> {
+        // A long-form chunk row was routed with its parent request.
+        if request.asr_chunk_row {
+            return Ok(());
+        }
         let Some(observation) = self
             .inference_broker
             .observe_engine_request_with_streaming_required(
@@ -297,12 +390,17 @@ impl RuntimeService {
         }
     }
 
+    /// Records a whole request's outcome in the request metrics. A long-form
+    /// chunk row is part of its parent request, which records itself once.
     pub(super) fn record_engine_output_observation(
         &self,
         request: &EngineCoreRequest,
         output: &EngineOutput,
         streaming: bool,
     ) {
+        if request.asr_chunk_row {
+            return;
+        }
         self.telemetry
             .record_stage_observation(engine_output_observation(
                 self.engine_observation_context(request, streaming),
@@ -317,6 +415,9 @@ impl RuntimeService {
         streaming: bool,
         error_kind: impl Into<String>,
     ) {
+        if request.asr_chunk_row {
+            return;
+        }
         self.telemetry
             .record_stage_observation(engine_error_observation(
                 self.engine_observation_context(request, streaming),

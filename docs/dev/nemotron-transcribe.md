@@ -276,12 +276,13 @@ Every request is a retained engine row. The pieces:
   the windows and the decode budget, and installs the row. No device work
   happens here: the perception windows encode inside the prefill spans.
 - **Rows handler**: `crates/izwi-core/src/engine/executor/handler_nemotron_transcribe_rows.rs`.
-  Each quantum either prefills one span of a row's prompt (encoding the
-  perception windows its audio positions need) or steps every decoding row
-  one token, with the decoder batched across rows. A quantum opens a
-  checkpoint; the Mamba state is staged into the tensor-state arena and
-  committed with the KV pages, so a failed or cancelled quantum rolls the row
-  back to where it started. Text streams as it decodes. A finished row
+  Each quantum either prefills one span of each of its rows' prompts
+  (encoding the perception windows its audio positions need), the rows'
+  spans packed into one decoder forward (see [Packed prefill](#packed-prefill)),
+  or steps every decoding row one token, with the decoder batched across
+  rows. A quantum opens a checkpoint; the Mamba state is staged into the
+  tensor-state arena and committed with the KV pages, so a failed or
+  cancelled quantum rolls the row back to where it started. Text streams as it decodes. A finished row
   reports `finish_reason`, `raw_text`, `speaker_turns`, token counts and the
   number of perception windows in its ASR diagnostics, and `timing`: host
   milliseconds of preparation, prefill (with the perception windows it
@@ -299,7 +300,8 @@ Every request is a retained engine row. The pieces:
   tokens on CUDA or 192 on CPU and Metal, whether the row prefills alone or
   beside other rows, and never a step budget's leftover. How a prompt splits
   changes the span's rounding and so, at a near tie, a greedy token; a fixed
-  grid keeps a request's transcript independent of server load. A one-hour
+  grid keeps a request's spans independent of server load (packed prefill
+  can still round them differently in the last bits). A one-hour
   prompt (about 45,000 audio tokens) is 88 spans on CUDA or 234 on CPU and
   Metal, each a bounded dispatch between other rows' decode steps.
 
@@ -312,6 +314,48 @@ width. While no request waits or prefills, a decode quantum runs several steps
 scheduler drops back to one step a quantum as soon as a request waits or a
 running row is between prefill spans. Greedy decoding makes the transcript
 the same at any quantum.
+
+### Packed prefill
+
+The rows of a prefill quantum run their spans as one decoder forward
+(`retained_prefill_batch` in `model.rs`, `forward_spans` in
+`decoder/mod.rs`): each row's span embeddings first, encoding the
+perception windows it needs, then the decoder over every row's tokens at
+once.
+
+- The norms, the projections and the experts run once over every row's
+  tokens, so the weights are read once per quantum instead of once per row.
+- The Mamba convolution and scan run per row, from its own history and
+  state. When every row's span has the same length, they run as one call
+  over the stacked rows. No varlen scan kernel was added: the scan is a
+  small part of a span's time.
+- Attention runs per row over its own paged KV.
+- The LM head runs only for the rows whose prompt ends in this span, and
+  their picks are read back once.
+- The rows' KV and Mamba states commit together after the picks. If
+  anything fails before that, no row's state moves.
+
+Each row's tokens take the kernels its span takes alone:
+
+- The CPU's Q8_0 projections run spans shorter than five tokens through the
+  row-wise kernel and longer ones through the tile kernel, per row.
+- The MoE runs a row's tokens on the warp kernels or the GEMMs as
+  `uses_gemm` picks for that row's own span.
+
+What changes is only the shape of the GEMMs the rows share, so a row can
+differ from its span alone in the last bits. On the synthetic CPU checkpoint
+the worst relative L2 was 3e-8, and the logits were identical. A GPU's GEMMs
+round differently at another row count, so a near-tied greedy token can
+depend on what prefills beside the row. A quantum of one row runs exactly as
+before, and `IZWI_NEMOTRON_TRANSCRIBE_BATCHED_PREFILL=0` runs every row
+alone. `batched_prefill` in the diagnostics counts packed quanta and rows.
+
+The adapter's prefill stage already leases each row a whole span's
+activations plus a perception window and a Mamba state copy, which covers a
+packed quantum (`prefill_workspace_bytes` in `model.rs` prices it). The
+scheduler admits rows until the step's token budget runs out (2,048 tokens
+on CUDA: about eleven 10-second prompts, or four 512-token spans). Each
+physical batch holds at most the tensor width of rows.
 
 ### Decode step
 
@@ -368,12 +412,22 @@ been compiled and type-checked but not yet run on a GPU.
 
 The Mamba state is about 47.6 MiB per row. The state is allocated through the
 managed arena at load (`allocate_nemotron_transcribe_state` in
-`runtime/lifecycle/load/state.rs`). Prompt and completion share a
-65,536-token context; the completion budget is the card's 16,384 tokens. A
-row books KV for a planned decode of `min(16384, ceil(8 × seconds) + 128)`
-tokens (`planned_decode_tokens` in `model.rs`), which covers CJK and
-tag-heavy output. Prefixes are not shared: prompts share only about 15 tokens
-before the audio, and vLLM serves this model without prefix caching too.
+`runtime/lifecycle/load/state.rs`) for the ASR rows (`asr_state_rows`), not
+the engine's: on CUDA with automatic rows, 8 retained rows (the decode
+width) and 8 staged ones, 762 MiB. The engine rows reserved about 15 GiB on
+an H100 (316 retained and 8 staged). A request beyond the rows waits for
+one.
+
+Prompt and completion share a 65,536-token context. A request that omits
+`max_tokens`, and each segment of a long translation, decodes at most
+`min(16384, ceil(16 × seconds) + 64)` tokens (`planned_decode_tokens` in
+`model.rs`): several times what dense speech needs in any script or target
+language. An explicit `max_tokens` may reach `65,536 − prompt`. Admission
+claims a row's KV for its prompt and that budget in full, so a 30 s row
+claims about 975 tokens and the 65,536-token pool holds 32 such rows beside
+a 600 s one; with the card's 16,384-token budget it held three. Prefixes
+are not shared: prompts share only about 15 tokens before the audio, and
+vLLM serves this model without prefix caching too.
 
 ## Word timestamps
 
@@ -602,6 +656,10 @@ The family's knobs, in [`env/core.md`](env/core.md):
 - `IZWI_NEMOTRON_TRANSCRIBE_FUSED_DECODE` (read at load): any false value
   runs decode steps through the eager composition instead of the fused
   kernels (see [Decode step](#decode-step)).
+- `IZWI_NEMOTRON_TRANSCRIBE_BATCHED_PREFILL` (read at load, on by
+  default): any false value prefills a quantum's rows one after another,
+  each exactly as alone, instead of as one packed forward (see
+  [Packed prefill](#packed-prefill)).
 
 `IZWI_NEMOTRON_TRANSCRIBE_MODEL_DIR`, `_AUDIO_DIR`, `_BACKEND` and
 `_REFERENCE` are read only by the tests.

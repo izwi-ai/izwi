@@ -1546,6 +1546,236 @@ pub(crate) fn read_planned_rows(
     Ok(values)
 }
 
+/// One row of [`read_masked_planned_rows`]: its plan over the first `vocab`
+/// columns of its logits, of which it may pick only the `allowed` ones
+/// (every one when `None`).
+pub(crate) struct MaskedReadback<'a> {
+    pub(crate) vocab: usize,
+    pub(crate) allowed: Option<&'a [bool]>,
+    pub(crate) plan: PlannedReadback<'a>,
+}
+
+/// [`read_planned_rows`] for rows that each read their own vocabulary
+/// prefix under their own allowed mask, all in one device-to-host transfer.
+/// A disallowed column reads as `-inf`: a greedy row's index is the argmax
+/// of its masked prefix, and a candidate row's candidates are bit for bit
+/// what [`bounded_device_sampling_candidates`] plans for it alone with that
+/// `allowed_mask` (masking before the `-inf` sanitizing or after it gives
+/// the same values). Rows with the same prefix and mask are planned
+/// together. A row with an empty or too wide prefix reads nothing (`None`).
+pub(crate) fn read_masked_planned_rows(
+    logits: &Tensor,
+    rows: Vec<MaskedReadback<'_>>,
+) -> Result<Vec<PlannedValues>> {
+    let (row_count, width) = logits.dims2()?;
+    if row_count != rows.len() {
+        return Err(Error::InvalidInput(format!(
+            "masked readback planned {} rows for {row_count} logits rows",
+            rows.len()
+        )));
+    }
+    // Rows sharing a prefix and mask, in first-seen order.
+    let mut groups: Vec<(usize, Option<&[bool]>, Vec<usize>)> = Vec::new();
+    for (row, request) in rows.iter().enumerate() {
+        let vocab = request.vocab.min(width);
+        if matches!(request.plan, PlannedReadback::None)
+            || vocab == 0
+            || vocab > MAX_EXACT_F32_INTEGER
+        {
+            continue;
+        }
+        let allowed = match request.allowed {
+            Some(mask) if mask.len() < vocab => {
+                return Err(Error::InvalidInput(
+                    "sampling mask is shorter than the selected vocabulary".into(),
+                ))
+            }
+            // Allowing every column changes no value.
+            Some(mask) if mask[..vocab].iter().all(|allowed| *allowed) => None,
+            Some(mask) => Some(&mask[..vocab]),
+            None => None,
+        };
+        match groups
+            .iter_mut()
+            .find(|(group_vocab, group_mask, _)| *group_vocab == vocab && *group_mask == allowed)
+        {
+            Some((_, _, members)) => members.push(row),
+            None => groups.push((vocab, allowed, vec![row])),
+        }
+    }
+    let device = logits.device();
+    let mut readback = ReadbackParts::default();
+    let mut greedy_at = vec![None; row_count];
+    let mut pending = (0..row_count).map(|_| None).collect::<Vec<_>>();
+    for (vocab, allowed, members) in &groups {
+        let block = if members.iter().copied().eq(0..row_count) {
+            logits.clone()
+        } else {
+            let ids = members.iter().map(|&row| row as u32).collect::<Vec<_>>();
+            let ids = Tensor::from_vec(ids, members.len(), device)?;
+            logits.contiguous()?.index_select(&ids, 0)?
+        };
+        let mut block = block.narrow(1, 0, *vocab)?.to_dtype(DType::F32)?;
+        if let Some(allowed) = allowed {
+            let mask = cached_sampling_tensor(
+                device,
+                SamplingTensorCacheInput::Mask(allowed.iter().map(|a| u8::from(*a)).collect()),
+            )?;
+            let negative = negative_infinity(device)?.broadcast_as(block.shape())?;
+            block = mask
+                .broadcast_as(block.shape())?
+                .where_cond(&block, &negative)?;
+        }
+        let greedy = |row: &usize| matches!(rows[*row].plan, PlannedReadback::Greedy);
+        if members.iter().any(greedy) {
+            let block = block.contiguous()?;
+            let ids = block.argmax_keepdim(D::Minus1)?;
+            let picked = block.gather(&ids, D::Minus1)?;
+            let ids_at = readback.push(ids.to_dtype(DType::F32)?.flatten_all()?);
+            let picked_at = readback.push(picked.flatten_all()?);
+            for (slot, row) in members.iter().enumerate().filter(|(_, row)| greedy(row)) {
+                greedy_at[*row] = Some((ids_at + slot, picked_at + slot));
+            }
+        }
+        let plans = members
+            .iter()
+            .map(|&row| match &rows[row].plan {
+                PlannedReadback::Candidates(request) => PlannedReadback::Candidates(*request),
+                _ => PlannedReadback::None,
+            })
+            .collect::<Vec<_>>();
+        if plans
+            .iter()
+            .any(|plan| matches!(plan, PlannedReadback::Candidates(_)))
+        {
+            for (&row, planned) in members
+                .iter()
+                .zip(plan_step_candidates(&block, *vocab, &plans)?)
+            {
+                pending[row] = planned.map(|planned| {
+                    let start = readback.push_candidates(&planned);
+                    (planned, start)
+                });
+            }
+        }
+    }
+    let packed = readback.read()?;
+    rows.iter()
+        .zip(greedy_at.into_iter().zip(pending))
+        .map(|(request, (greedy, pending))| {
+            Ok(match (&request.plan, greedy, pending) {
+                (PlannedReadback::Greedy, Some((index, logit)), _) => PlannedValues::Greedy {
+                    index: packed[index] as u32,
+                    logit: packed[logit],
+                },
+                (PlannedReadback::Candidates(_), _, Some((pending, start))) => {
+                    let values = readback_slice(&packed, start, pending.len())?;
+                    PlannedValues::Candidates(pending.unpack(values)?)
+                }
+                _ => PlannedValues::None,
+            })
+        })
+        .collect()
+}
+
+/// [`bounded_device_sampling_candidates`] on any device, the CPU included,
+/// so a family's batched sampler can be checked against the single-row
+/// accelerator path on the CPU.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bounded_sampling_candidates_on_any_device(
+    logits: &Tensor,
+    vocab_limit: usize,
+    top_k: usize,
+    temperature: f32,
+    history: &[u32],
+    repetition_penalty: f32,
+    presence_penalty: f32,
+    allowed_mask: Option<&[bool]>,
+) -> Result<Option<DeviceSamplingCandidates>> {
+    if temperature <= 1e-5 {
+        return Ok(None);
+    }
+    bounded_sampling_candidates(
+        logits,
+        vocab_limit,
+        top_k,
+        temperature,
+        PenaltyHistory::uniform(history),
+        repetition_penalty,
+        presence_penalty,
+        allowed_mask,
+    )
+}
+
+/// Every row's [`bounded_device_sampling_candidates`] at top-k 0 (the nucleus
+/// bound and the row's log-sum-exp), temperature 1 and no penalties, under
+/// its own row of `masks` (`[rows, vocab]` U8, 0 excludes the token), read
+/// back in one transfer after `extra` (rank-1 F32 tensors on the logits'
+/// device, whose values come back first). The rows are planned in one pass
+/// when batched planning is admitted on this device
+/// (`IZWI_BATCHED_DEVICE_SAMPLING` and its self-check), else one at a time.
+/// Either way each row's candidates are bit-identical to what the single-row
+/// path plans for it: the same sanitize and mask, a no-op temperature of 1,
+/// and the row-wise [`bounded_topk_rows`] and log-sum-exp. A row is `None`
+/// where a candidate came back non-finite (the caller's host fallback).
+pub(crate) fn masked_nucleus_candidate_rows(
+    logits: &Tensor,
+    masks: &Tensor,
+    extra: Vec<Tensor>,
+) -> Result<(Vec<f32>, Vec<Option<DeviceSamplingCandidates>>)> {
+    let (rows, vocab) = logits.dims2()?;
+    if rows == 0 || masks.dims() != [rows, vocab] || !plans_bounded_candidates(vocab, 0, 1.0) {
+        return Err(Error::InvalidInput(format!(
+            "masked candidate rows need [rows, vocab] logits and masks, got {:?} and {:?}",
+            logits.dims(),
+            masks.dims()
+        )));
+    }
+    let count = candidate_count(0, vocab);
+    let plan = |logits: &Tensor, masks: &Tensor| -> Result<Tensor> {
+        let rows = logits.dim(0)?;
+        let adjusted = sanitize_finite(&logits.to_dtype(DType::F32)?)?;
+        let negative = negative_infinity(adjusted.device())?.broadcast_as(adjusted.shape())?;
+        let adjusted = masks.where_cond(&adjusted, &negative)?;
+        let (values, indices) = bounded_topk_rows(&adjusted, count)?;
+        let logsumexp = adjusted.log_sum_exp(D::Minus1)?.reshape((rows, 1))?;
+        Tensor::cat(&[values, indices.to_dtype(DType::F32)?, logsumexp], 1)?
+            .flatten_all()
+            .map_err(Error::from)
+    };
+    let mut readback = ReadbackParts::default();
+    let extra_len = extra.iter().map(Tensor::elem_count).sum::<usize>();
+    for part in extra {
+        readback.push(part);
+    }
+    if rows > 1 && batched_device_sampling::admit(logits.device(), rows) {
+        readback.push(plan(logits, masks)?);
+    } else {
+        for row in 0..rows {
+            readback.push(plan(&logits.narrow(0, row, 1)?, &masks.narrow(0, row, 1)?)?);
+        }
+    }
+    let packed = readback.read()?;
+    let stride = count * 2 + 1;
+    let candidates = (0..rows)
+        .map(|row| {
+            let start = extra_len + row * stride;
+            let (values, indices, logsumexp) =
+                unpack_sampling_readback(readback_slice(&packed, start, stride)?, count, true)?;
+            Ok(values
+                .iter()
+                .all(|value| value.is_finite())
+                .then_some(DeviceSamplingCandidates {
+                    values,
+                    indices,
+                    logsumexp,
+                }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((packed[..extra_len].to_vec(), candidates))
+}
+
 /// One row's bounded candidates, still on the device as one packed F32
 /// tensor (values, indices, then the normalizer when present), so a caller
 /// can read many rows back in a single transfer.
@@ -2031,6 +2261,96 @@ pub fn resident_top_k_sample(
     gumbel_top_k_token(&adjusted, k, &gumbel).map(Some)
 }
 
+/// [`resident_top_k_sample`] for every row of `logits` (`[rows, vocab]`) in
+/// one pass, all rows sharing `top_k` and `temperature`: the same
+/// sanitizing and scaling, row-wise top-k ([`bounded_topk_rows`] equals
+/// [`bounded_topk`] row by row), each row's Gumbel noise from its own
+/// `draws` closure in the same order, and one argmax per row. Each row's code
+/// is the one [`resident_top_k_sample`] picks for that row alone, and the
+/// noise for all rows goes up in one upload instead of one per row. Returns
+/// a `[rows]` U32 tensor, or `None` where the single-row sampler would (and
+/// the caller falls back to it row by row).
+pub fn resident_top_k_sample_rows<'d>(
+    logits: &Tensor,
+    top_k: usize,
+    temperature: f32,
+    draws: &mut [&mut (dyn FnMut() -> f32 + 'd)],
+) -> Result<Option<Tensor>> {
+    if temperature <= 1e-5 || top_k == 0 || top_k > DEVICE_TOP_K_LIMIT {
+        return Ok(None);
+    }
+    let (rows, vocab) = logits.dims2()?;
+    if rows == 0 || vocab == 0 || draws.len() != rows {
+        return Ok(None);
+    }
+    let adjusted = sanitize_finite(&logits.to_dtype(DType::F32)?)?;
+    let adjusted = (adjusted / temperature as f64)?;
+    let k = top_k.min(vocab);
+    let (values, indices) = bounded_topk_rows(&adjusted, k)?;
+    let keep = values.dim(1)?;
+    let mut noise = Vec::with_capacity(rows * keep);
+    for draw in draws.iter_mut() {
+        noise.extend_from_slice(&gumbel_noise(k, &mut **draw)[..keep]);
+    }
+    let noise = Tensor::from_vec(noise, (rows, keep), logits.device())?;
+    let picks = values
+        .broadcast_add(&noise)?
+        .argmax(D::Minus1)?
+        .to_dtype(DType::U32)?
+        .reshape((rows, 1))?;
+    Ok(Some(
+        indices
+            .to_dtype(DType::U32)?
+            .contiguous()?
+            .gather(&picks, 1)?
+            .reshape(rows)?,
+    ))
+}
+
+/// [`resident_top_k_sample_rows`] with every row's Gumbel noise already on
+/// the logits' device, `[rows, top_k.min(vocab)]` (each row's
+/// [`gumbel_noise`] of that many draws, as that function draws it), and the
+/// column ids `0..vocab` (U32) passed in: the same arithmetic with nothing
+/// uploaded or cached, so a CUDA graph can capture it and take the noise and
+/// ids as inputs. `None` where that function returns `None`.
+pub fn resident_top_k_rows_with_noise(
+    logits: &Tensor,
+    top_k: usize,
+    temperature: f32,
+    noise: &Tensor,
+    column_ids: &Tensor,
+) -> Result<Option<Tensor>> {
+    if temperature <= 1e-5 || top_k == 0 || top_k > DEVICE_TOP_K_LIMIT {
+        return Ok(None);
+    }
+    let (rows, vocab) = logits.dims2()?;
+    if rows == 0 || vocab == 0 {
+        return Ok(None);
+    }
+    let adjusted = sanitize_finite(&logits.to_dtype(DType::F32)?)?;
+    let adjusted = (adjusted / temperature as f64)?;
+    let (values, indices) = bounded_topk_rows_from(&adjusted, top_k.min(vocab), Some(column_ids))?;
+    if noise.dims() != values.dims() {
+        return Err(Error::InvalidInput(format!(
+            "top-k noise {:?} does not match the candidates {:?}",
+            noise.dims(),
+            values.dims()
+        )));
+    }
+    let picks = values
+        .broadcast_add(noise)?
+        .argmax(D::Minus1)?
+        .to_dtype(DType::U32)?
+        .reshape((rows, 1))?;
+    Ok(Some(
+        indices
+            .to_dtype(DType::U32)?
+            .contiguous()?
+            .gather(&picks, 1)?
+            .reshape(rows)?,
+    ))
+}
+
 /// `-ln(-ln(u))` for `count` uniforms, the Gumbel(0, 1) noise of the
 /// Gumbel-max trick.
 pub(crate) fn gumbel_noise(count: usize, draw: &mut dyn FnMut() -> f32) -> Vec<f32> {
@@ -2067,6 +2387,29 @@ pub(crate) fn device_top_k(values: &Tensor, k: usize) -> Result<Option<(Tensor, 
         return Ok(None);
     }
     bounded_topk(values, k).map(Some)
+}
+
+/// [`device_top_k`] of every row of `values` (`[rows, length]`), equal row
+/// by row to [`device_top_k`] of that row alone (ties included). `None` when
+/// `k` is 0 or above the device sort bound.
+pub(crate) fn device_top_k_rows(values: &Tensor, k: usize) -> Result<Option<(Tensor, Tensor)>> {
+    if k == 0 || k > DEVICE_TOP_K_LIMIT {
+        return Ok(None);
+    }
+    bounded_topk_rows(values, k).map(Some)
+}
+
+/// [`device_top_k_rows`] with the column ids `0..length` (U32) passed in, not
+/// read from the per-thread cache, so a CUDA graph can take them as an input.
+pub(crate) fn device_top_k_rows_with_ids(
+    values: &Tensor,
+    k: usize,
+    column_ids: &Tensor,
+) -> Result<Option<(Tensor, Tensor)>> {
+    if k == 0 || k > DEVICE_TOP_K_LIMIT {
+        return Ok(None);
+    }
+    bounded_topk_rows_from(values, k, Some(column_ids)).map(Some)
 }
 
 fn bounded_topk(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
@@ -2129,6 +2472,18 @@ fn bounded_topk(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
 /// and gathers work row by row, so each row's result equals `bounded_topk`
 /// of that row alone, ties included.
 fn bounded_topk_rows(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
+    bounded_topk_rows_from(values, k, None)
+}
+
+/// [`bounded_topk_rows`] whose column ids come from `indices` (`0..length`
+/// as U32) when given, not from the per-thread tensor cache: a CUDA graph
+/// takes them as an input, since a cached tensor evicted after the capture
+/// would free memory the graph still reads.
+fn bounded_topk_rows_from(
+    values: &Tensor,
+    k: usize,
+    indices: Option<&Tensor>,
+) -> Result<(Tensor, Tensor)> {
     let (rows, length) = values.dims2()?;
     if rows == 0 || length == 0 || length > u32::MAX as usize || k == 0 || k > DEVICE_TOP_K_LIMIT {
         return Err(Error::InvalidInput(format!(
@@ -2137,11 +2492,23 @@ fn bounded_topk_rows(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
     }
     let device = values.device();
     let mut candidate_values = values.contiguous()?;
-    let mut candidate_indices =
-        cached_sampling_tensor(device, SamplingTensorCacheInput::Arange(length as u32))?
-            .unsqueeze(0)?
-            .broadcast_as((rows, length))?
-            .contiguous()?;
+    let indices = match indices {
+        Some(indices) if indices.dims() == [length] && indices.dtype() == DType::U32 => {
+            indices.clone()
+        }
+        Some(indices) => {
+            return Err(Error::InvalidInput(format!(
+                "bounded top-k column ids {:?} {:?} do not cover {length} columns",
+                indices.dims(),
+                indices.dtype()
+            )))
+        }
+        None => cached_sampling_tensor(device, SamplingTensorCacheInput::Arange(length as u32))?,
+    };
+    let mut candidate_indices = indices
+        .unsqueeze(0)?
+        .broadcast_as((rows, length))?
+        .contiguous()?;
     loop {
         let length = candidate_values.dim(1)?;
         if length <= DEVICE_SORT_CHUNK {
@@ -2315,6 +2682,168 @@ pub(crate) mod batched_device_sampling {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn xorshift(seed: u64) -> impl FnMut() -> f32 {
+        let mut state = seed | 1;
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 24) as f32
+        }
+    }
+
+    /// Each row of the batched sampler picks the code the single-row sampler
+    /// picks for that row with the same noise stream, at widths that take one
+    /// sort chunk and several (the predictor's 2,048-code heads), with ties.
+    #[test]
+    fn resident_top_k_rows_match_each_row_alone() {
+        let device = Device::Cpu;
+        for (rows, vocab, top_k) in [(1, 64, 8), (5, 2048, 50), (8, 3000, 1), (3, 700, 512)] {
+            let mut values = xorshift(vocab as u64 * 31 + rows as u64);
+            let mut logits: Vec<f32> = (0..rows * vocab).map(|_| values() * 8.0 - 4.0).collect();
+            // A tie inside the candidates of row 0.
+            logits[3] = logits[5];
+            let logits = Tensor::from_vec(logits, (rows, vocab), &device).unwrap();
+            let mut batched_draws = (0..rows).map(|row| xorshift(row as u64 + 7)).collect::<Vec<_>>();
+            let mut draws = batched_draws
+                .iter_mut()
+                .map(|draw| draw as &mut dyn FnMut() -> f32)
+                .collect::<Vec<_>>();
+            let batched = resident_top_k_sample_rows(&logits, top_k, 0.9, &mut draws)
+                .unwrap()
+                .expect("sampled on the device")
+                .to_vec1::<u32>()
+                .unwrap();
+            for (row, &code) in batched.iter().enumerate() {
+                let mut draw = xorshift(row as u64 + 7);
+                let alone = resident_top_k_sample(&logits.i(row).unwrap(), vocab, top_k, 0.9, &mut draw)
+                    .unwrap()
+                    .expect("sampled on the device")
+                    .to_vec1::<u32>()
+                    .unwrap();
+                assert_eq!(code, alone[0], "rows={rows} vocab={vocab} top_k={top_k} row={row}");
+            }
+        }
+    }
+
+    /// Noise drawn up front and passed in picks what the drawing sampler
+    /// picks for every row, at one and several sort chunks.
+    #[test]
+    fn resident_top_k_rows_with_noise_match_the_drawing_sampler() {
+        let device = Device::Cpu;
+        for (rows, vocab, top_k) in [(4, 64, 8), (6, 2048, 50), (3, 700, 512), (2, 30, 50)] {
+            let mut values = xorshift(vocab as u64 * 17 + rows as u64);
+            let logits: Vec<f32> = (0..rows * vocab).map(|_| values() * 8.0 - 4.0).collect();
+            let logits = Tensor::from_vec(logits, (rows, vocab), &device).unwrap();
+            let mut streams = (0..rows)
+                .map(|row| xorshift(row as u64 + 11))
+                .collect::<Vec<_>>();
+            let mut draws = streams
+                .iter_mut()
+                .map(|draw| draw as &mut dyn FnMut() -> f32)
+                .collect::<Vec<_>>();
+            let drawn = resident_top_k_sample_rows(&logits, top_k, 1.1, &mut draws)
+                .unwrap()
+                .unwrap()
+                .to_vec1::<u32>()
+                .unwrap();
+            let keep = top_k.min(vocab);
+            let noise = (0..rows)
+                .flat_map(|row| gumbel_noise(keep, &mut xorshift(row as u64 + 11)))
+                .collect::<Vec<_>>();
+            let noise = Tensor::from_vec(noise, (rows, keep), &device).unwrap();
+            let ids = Tensor::arange(0u32, vocab as u32, &device).unwrap();
+            let passed = resident_top_k_rows_with_noise(&logits, top_k, 1.1, &noise, &ids)
+                .unwrap()
+                .unwrap()
+                .to_vec1::<u32>()
+                .unwrap();
+            assert_eq!(passed, drawn, "rows={rows} vocab={vocab} top_k={top_k}");
+        }
+    }
+
+    /// Masked nucleus candidates of many rows, planned together and read
+    /// back once with an extra part, are bit for bit what the single-row
+    /// planner gives each row under its mask, with NaN, +/-inf and ties in
+    /// the logits and rows under different masks.
+    #[test]
+    fn masked_candidate_rows_match_each_row_planned_alone() {
+        let device = Device::Cpu;
+        let (rows, vocab) = (4usize, 3_000usize);
+        let mut state = 0xF15Eu64;
+        let mut logits = xorshift_logits(&mut state, rows * vocab);
+        logits[vocab + 7] = f32::NAN;
+        logits[2 * vocab + 11] = f32::INFINITY;
+        logits[3 * vocab + 13] = f32::NEG_INFINITY;
+        logits[5] = logits[9];
+        let logits = Tensor::from_vec(logits, (rows, vocab), &device).unwrap();
+        let masks = (0..rows)
+            .map(|row| {
+                (0..vocab)
+                    .map(|token| token % (row + 2) != 1 || token == 9)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mask_tensor = Tensor::from_vec(
+            masks
+                .iter()
+                .flatten()
+                .map(|allowed| u8::from(*allowed))
+                .collect::<Vec<_>>(),
+            (rows, vocab),
+            &device,
+        )
+        .unwrap();
+        let extra = Tensor::new(&[3.5f32, -1.0], &device).unwrap();
+        for batched in [true, false] {
+            let (extra_values, candidates) = if batched {
+                masked_nucleus_candidate_rows(&logits, &mask_tensor, vec![extra.clone()]).unwrap()
+            } else {
+                let mut values = Vec::new();
+                let mut candidates = Vec::new();
+                for row in 0..rows {
+                    let (extra, mut row_candidates) = masked_nucleus_candidate_rows(
+                        &logits.narrow(0, row, 1).unwrap(),
+                        &mask_tensor.narrow(0, row, 1).unwrap(),
+                        vec![extra.clone()],
+                    )
+                    .unwrap();
+                    values = extra;
+                    candidates.push(row_candidates.remove(0));
+                }
+                (values, candidates)
+            };
+            assert_eq!(extra_values, vec![3.5, -1.0]);
+            for (row, candidates) in candidates.into_iter().enumerate() {
+                let candidates = candidates.expect("finite candidates");
+                let alone = pending_sampling_candidates(
+                    &logits.i(row).unwrap(),
+                    vocab,
+                    0,
+                    1.0,
+                    PenaltyHistory::uniform(&[]),
+                    1.0,
+                    0.0,
+                    Some(&masks[row]),
+                )
+                .unwrap()
+                .unwrap();
+                let alone = alone
+                    .unpack(&alone.packed.to_vec1::<f32>().unwrap())
+                    .unwrap()
+                    .unwrap();
+                let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&candidates.values), bits(&alone.values), "row {row}");
+                assert_eq!(candidates.indices, alone.indices, "row {row}");
+                assert_eq!(
+                    candidates.logsumexp.map(f32::to_bits),
+                    alone.logsumexp.map(f32::to_bits),
+                    "row {row}"
+                );
+            }
+        }
+    }
 
     /// Unstructured logits: xorshift values in [-4, 4).
     fn xorshift_logits(state: &mut u64, len: usize) -> Vec<f32> {
@@ -2766,6 +3295,123 @@ mod tests {
         })
         .unwrap();
         expect_per_row(&one_row, planned);
+    }
+
+    fn candidate_bits(candidates: &Option<DeviceSamplingCandidates>) -> Option<Vec<u32>> {
+        candidates.as_ref().map(|candidates| {
+            let mut bits = candidates
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>();
+            bits.extend(&candidates.indices);
+            bits.extend(candidates.logsumexp.map(f32::to_bits));
+            bits
+        })
+    }
+
+    /// Rows with their own vocabulary prefixes and masks, greedy and
+    /// candidate rows mixed, in one transfer: each greedy row reads the
+    /// argmax of its masked prefix and its logit, and each candidate row
+    /// exactly the candidates the single-row accelerator planner gives it
+    /// with that mask (one row nearly all `-inf`, so it falls back).
+    fn assert_masked_rows_match_single_rows(device: &Device) {
+        let (rows, width) = (8, 2_100);
+        let logits = Tensor::from_vec(planning_logits(rows, width), (rows, width), device).unwrap();
+        let history = [5u32, 6, 7, 8, 9, 17, 1_027, 2_000, 2_049];
+        let masked = (0..2_050)
+            .map(|token| token < 2_000 || token == 2_049)
+            .collect::<Vec<_>>();
+        let open = vec![true; 2_000];
+        let (eos, all) = (Some(masked.as_slice()), Some(open.as_slice()));
+        let uniform = PenaltyHistory::uniform(&history);
+        let plan = |row: usize| -> (usize, Option<&[bool]>, PlannedReadback<'_>) {
+            match row {
+                0 => (2_050, eos, PlannedReadback::Greedy),
+                1 => (2_050, eos, candidates(50, 0.9, uniform, 1.05, 0.0)),
+                2 => (2_000, all, candidates(50, 0.9, uniform, 1.05, 0.0)),
+                3 => (2_000, None, PlannedReadback::Greedy),
+                4 => (2_050, eos, candidates(0, 1.2, uniform, 1.3, 0.0)),
+                5 => (2_050, eos, PlannedReadback::None),
+                6 => (2_000, None, candidates(1, 0.7, uniform, 1.0, 0.0)),
+                _ => (2_050, eos, candidates(20, 0.8, uniform, 1.2, 0.0)),
+            }
+        };
+        let read = read_masked_planned_rows(
+            &logits,
+            (0..rows)
+                .map(|row| {
+                    let (vocab, allowed, plan) = plan(row);
+                    MaskedReadback {
+                        vocab,
+                        allowed,
+                        plan,
+                    }
+                })
+                .collect(),
+        )
+        .unwrap();
+        for (row, value) in read.into_iter().enumerate() {
+            let (vocab, allowed, plan) = plan(row);
+            let row_logits = logits.i(row).unwrap();
+            match (plan, value) {
+                (PlannedReadback::Greedy, PlannedValues::Greedy { index, logit }) => {
+                    let mut alone = row_logits.narrow(0, 0, vocab).unwrap();
+                    if let Some(allowed) = allowed.filter(|mask| mask.iter().any(|a| !a)) {
+                        let mask = allowed.iter().map(|a| u8::from(*a)).collect::<Vec<_>>();
+                        let mask = Tensor::from_vec(mask, vocab, device).unwrap();
+                        let blocked = Tensor::full(f32::NEG_INFINITY, vocab, device).unwrap();
+                        alone = mask.where_cond(&alone, &blocked).unwrap();
+                    }
+                    let expected = alone.argmax(0).unwrap().to_scalar::<u32>().unwrap();
+                    let values = alone.to_vec1::<f32>().unwrap();
+                    assert_eq!(index, expected, "row {row}");
+                    assert_eq!(
+                        logit.to_bits(),
+                        values[expected as usize].to_bits(),
+                        "row {row}"
+                    );
+                }
+                (PlannedReadback::Candidates(request), PlannedValues::Candidates(candidates)) => {
+                    let alone = bounded_sampling_candidates(
+                        &row_logits,
+                        vocab,
+                        request.top_k,
+                        request.temperature,
+                        request.history,
+                        request.repetition_penalty,
+                        request.presence_penalty,
+                        allowed,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        candidate_bits(&candidates),
+                        candidate_bits(&alone),
+                        "row {row} on {:?}",
+                        device.location()
+                    );
+                    assert_eq!(candidates.is_none(), row == rows - 1, "row {row}");
+                }
+                (PlannedReadback::None, PlannedValues::None) => {}
+                _ => panic!("row {row} read the wrong kind of values"),
+            }
+        }
+    }
+
+    #[test]
+    fn masked_rows_read_what_each_row_reads_alone_on_cpu() {
+        assert_masked_rows_match_single_rows(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn masked_rows_read_what_each_row_reads_alone_on_metal() {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "masked_rows_read_what_each_row_reads_alone_on_metal",
+        ) else {
+            return;
+        };
+        assert_masked_rows_match_single_rows(&device);
     }
 
     #[test]

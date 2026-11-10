@@ -14,13 +14,15 @@ pub(crate) mod model;
 pub(crate) mod streaming;
 mod tokenizer;
 
+#[cfg(test)]
+pub(crate) use model::PublishedVoxtralRealtimePricing;
 pub use model::VoxtralRealtimeModel;
 pub(crate) use model::VOXTRAL_REALTIME_OFFLINE_AUDIO_SECONDS_HINT;
 pub(crate) use model::{
-    VoxtralRealtimeCheckpoint, VoxtralRealtimeDecodeBatchRow,
-    VoxtralRealtimePreparationBatchGeometry, VoxtralRealtimePreparationBatchRow,
-    VoxtralRealtimePreparationGeometry, VoxtralRealtimePreparationMode,
-    VoxtralRealtimePreparationStageSeal, VoxtralRealtimePreparedAudio,
-    VoxtralRealtimePreparedResourceUsage, VoxtralRealtimeStep,
+    VoxtralOfflineFeatures, VoxtralOfflinePreparedAudio, VoxtralRealtimeCheckpoint,
+    VoxtralRealtimeDecodeBatchRow, VoxtralRealtimePreparationBatchGeometry,
+    VoxtralRealtimePreparationBatchRow, VoxtralRealtimePreparationGeometry,
+    VoxtralRealtimePreparationMode, VoxtralRealtimePreparationStageSeal,
+    VoxtralRealtimePreparedAudio, VoxtralRealtimePreparedResourceUsage, VoxtralRealtimeStep,
 };
 pub(crate) use streaming::{VoxtralRealtimeResourceUsage, VoxtralRealtimeState};

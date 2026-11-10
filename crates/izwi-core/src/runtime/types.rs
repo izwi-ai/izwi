@@ -569,6 +569,11 @@ pub struct ChunkStats {
     /// On a final chunk: why generation ended, when a frame budget applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<TtsStopReason>,
+    /// On a final chunk: the request's engine diagnostics (latency
+    /// breakdown), as a buffered response's `X-Izwi-Tts-Diagnostics`
+    /// carries them. Not part of the streamed events.
+    #[serde(skip)]
+    pub diagnostics: Option<serde_json::Value>,
 }
 
 /// Complete generation result

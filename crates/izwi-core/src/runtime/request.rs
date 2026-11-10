@@ -252,10 +252,18 @@ fn validate_speaker_references(request: &GenerationRequest, variant: ModelVarian
     Ok(())
 }
 
+/// An ASR request's audio: an encoded upload, or samples already decoded.
+#[derive(Debug, Clone)]
+enum AsrRuntimeAudio {
+    Encoded(RuntimeAudioInput),
+    /// Canonical 16 kHz mono samples (a long file's chunk row).
+    Samples(std::sync::Arc<[f32]>),
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AsrRuntimeRequest {
     envelope: RequestEnvelope,
-    audio: RuntimeAudioInput,
+    audio: AsrRuntimeAudio,
     language: Option<String>,
     prompt: Option<String>,
     task: AsrTaskOptions,
@@ -272,16 +280,13 @@ impl AsrRuntimeRequest {
     ) -> Result<Self> {
         let audio = RuntimeAudioInput::Base64(audio_base64.into());
         audio.validate("ASR")?;
-        Ok(Self {
-            envelope: RequestEnvelope::new(model_variant)
-                .with_correlation_id(correlation_id)
-                .with_runtime_context(runtime_context),
-            audio,
+        Ok(Self::with_audio(
+            AsrRuntimeAudio::Encoded(audio),
+            model_variant,
             language,
-            prompt: None,
-            task: AsrTaskOptions::default(),
-            native_word_timestamps: false,
-        })
+            correlation_id,
+            runtime_context,
+        ))
     }
 
     pub(crate) fn from_bytes(
@@ -293,7 +298,45 @@ impl AsrRuntimeRequest {
     ) -> Result<Self> {
         let audio = RuntimeAudioInput::Bytes(audio_bytes.into());
         audio.validate("ASR")?;
-        Ok(Self {
+        Ok(Self::with_audio(
+            AsrRuntimeAudio::Encoded(audio),
+            model_variant,
+            language,
+            correlation_id,
+            runtime_context,
+        ))
+    }
+
+    /// A request for canonical 16 kHz mono `samples` already decoded.
+    pub(crate) fn from_samples(
+        samples: std::sync::Arc<[f32]>,
+        model_variant: ModelVariant,
+        language: Option<String>,
+        correlation_id: Option<String>,
+        runtime_context: RuntimeRequestContext,
+    ) -> Result<Self> {
+        if samples.is_empty() {
+            return Err(Error::InvalidInput(
+                "ASR request missing audio samples".to_string(),
+            ));
+        }
+        Ok(Self::with_audio(
+            AsrRuntimeAudio::Samples(samples),
+            model_variant,
+            language,
+            correlation_id,
+            runtime_context,
+        ))
+    }
+
+    fn with_audio(
+        audio: AsrRuntimeAudio,
+        model_variant: ModelVariant,
+        language: Option<String>,
+        correlation_id: Option<String>,
+        runtime_context: RuntimeRequestContext,
+    ) -> Self {
+        Self {
             envelope: RequestEnvelope::new(model_variant)
                 .with_correlation_id(correlation_id)
                 .with_runtime_context(runtime_context),
@@ -302,7 +345,7 @@ impl AsrRuntimeRequest {
             prompt: None,
             task: AsrTaskOptions::default(),
             native_word_timestamps: false,
-        })
+        }
     }
 
     pub(crate) fn with_prompt(mut self, prompt: Option<String>) -> Self {
@@ -329,8 +372,13 @@ impl AsrRuntimeRequest {
 
     pub(crate) fn into_engine_request(self) -> EngineCoreRequest {
         let mut request = match self.audio {
-            RuntimeAudioInput::Base64(audio_base64) => EngineCoreRequest::asr(audio_base64),
-            RuntimeAudioInput::Bytes(audio_bytes) => EngineCoreRequest::asr_bytes(audio_bytes),
+            AsrRuntimeAudio::Encoded(RuntimeAudioInput::Base64(audio_base64)) => {
+                EngineCoreRequest::asr(audio_base64)
+            }
+            AsrRuntimeAudio::Encoded(RuntimeAudioInput::Bytes(audio_bytes)) => {
+                EngineCoreRequest::asr_bytes(audio_bytes)
+            }
+            AsrRuntimeAudio::Samples(samples) => EngineCoreRequest::asr_samples(samples),
         };
         self.envelope.apply_to(&mut request);
         if let Some(language) = self.language {

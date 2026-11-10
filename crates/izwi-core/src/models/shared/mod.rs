@@ -7,6 +7,7 @@ pub mod attention;
 pub mod chat;
 pub mod codecs;
 pub mod config;
+pub(crate) mod decoder_precision;
 pub(crate) mod detokenize;
 pub mod grammar;
 pub mod memory;

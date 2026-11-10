@@ -502,6 +502,47 @@ every WAV is transcribed by a separately started ASR server (Nemotron on CPU
 by default) and scored by WER. The deterministic checks live in
 `test-score-tts-matrix.py`.
 
+## TTS serving concurrency
+
+`run-tts-concurrency.py` measures how a running server serves many speech
+requests at once. It loads one TTS model at a time through the admin API and
+releases closed-loop request levels:
+
+- **S:** buffered WAV, c = 1, 2, 4, 8, 16, 32, 64 with n = max(4, 2c).
+- **T:** streamed WAV, c = 1, 8, 32 with n = max(4, c). It records the time to
+  the first 100 ms of audio.
+
+Every input is 20 to 40 words (about 8–14 s of audio).
+
+Request i always carries seed i + 1 and the same text, so every level's PCM is
+compared with the c = 1 output by md5. A seeded request that sounds the same
+alone and under load is exact at every level. `--greedy-every N` sends every
+Nth request at temperature 0, so one decode step mixes sampling settings.
+
+The climb for a shape stops when a level fails half its requests or runs past
+`--level-budget-s`. Clone models use `data/fox.wav` as the reference.
+
+```bash
+python3 scripts/bench/run-tts-concurrency.py run --base http://127.0.0.1:8080 \
+    --out target/tts-concurrency --models Kokoro-82M,Qwen3-TTS-12Hz-0.6B-CustomVoice
+python3 scripts/bench/run-tts-concurrency.py report target/tts-concurrency --require-parity
+python3 scripts/bench/test-tts-concurrency.py
+```
+
+Each point is written to `<out>/<model>/<shape>-c<N>.json`. A point holds:
+
+- the request records, with every `X-*` header;
+- a summary, including the median of each `*_ms` field in
+  `X-Izwi-Tts-Diagnostics`;
+- `nvidia-smi` samples, when the tool exists;
+- filtered Prometheus metrics and `/v1/health`, before and after.
+
+`report` prints a Markdown table of throughput (audio seconds per wall second
+and the gain over c = 1), latency, first audio, GPU utilisation, parity, and
+the median codec and decode milliseconds. `--require-parity` exits 1 when any
+level's output differs from c = 1. `--no-load` drives models that are already
+loaded and leaves them loaded.
+
 ## Realtime voice and transcription load
 
 `run-voice-realtime-load.py` opens N concurrent realtime sessions against a

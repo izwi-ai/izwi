@@ -38,9 +38,11 @@ mod factories;
 mod realtime;
 mod sequence_asr;
 mod tts;
+pub(crate) use asr::voxtral_offline_preparation_cost;
 use asr::{
     ContinuousAsrExecutionAdapter, Lfm25AudioAsrExecutionAdapter, Lfm3AudioAsrExecutionAdapter,
-    NemotronTranscribeAsrExecutionAdapter, ParakeetAsrExecutionAdapter,
+    NemotronAsrExecutionAdapter, NemotronTranscribeAsrExecutionAdapter,
+    ParakeetAsrExecutionAdapter, VoxtralAsrExecutionAdapter,
 };
 use chat::ContinuousChatExecutionAdapter;
 use descriptor::loaded_execution_contracts;
@@ -48,15 +50,16 @@ pub(super) use factories::built_in_loaded_adapter_factories;
 #[cfg(test)]
 use factories::{
     ContinuousPhysicalChatAdapterFactory, FishS2PhysicalTtsAdapterFactory,
-    Lfm25AudioPhysicalAsrAdapterFactory, Lfm25AudioPhysicalTtsAdapterFactory,
-    ScalarExecutionAdapterFactory,
+    GraniteSpeechPhysicalAsrAdapterFactory, Lfm25AudioPhysicalAsrAdapterFactory,
+    Lfm25AudioPhysicalTtsAdapterFactory, ScalarExecutionAdapterFactory,
 };
 use realtime::{
     Lfm3AudioRealtimeExecutionAdapter, NemotronRealtimeExecutionAdapter,
     VoxtralRealtimeExecutionAdapter,
 };
 use sequence_asr::{
-    GraniteSpeechAsrExecutionAdapter, VibeVoiceAsrExecutionAdapter, WhisperAsrExecutionAdapter,
+    GraniteSpeech5AsrExecutionAdapter, GraniteSpeechAsrExecutionAdapter,
+    VibeVoiceAsrExecutionAdapter, WhisperAsrExecutionAdapter,
 };
 use tts::{
     ChatterboxTtsExecutionAdapter, FishDrama3TtsExecutionAdapter, FishS2TtsExecutionAdapter,
@@ -71,9 +74,10 @@ const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::ne
 const NEMOTRON_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(25);
 const CONTINUOUS_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(15);
 const CONTINUOUS_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(16);
-const WHISPER_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(17);
+const WHISPER_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(18);
 const VIBEVOICE_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(19);
 const GRANITE_SPEECH_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(22);
+const GRANITE_SPEECH5_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const LFM25_AUDIO_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(23);
 const LFM25_AUDIO_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(24);
 const VIBEVOICE_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(26);
@@ -87,7 +91,9 @@ const LFM3_AUDIO_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1
 const LFM3_AUDIO_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const LFM3_AUDIO_CHAT_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const NEMOTRON_TRANSCRIBE_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
-const PARAKEET_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(28);
+const PARAKEET_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(29);
+const NEMOTRON_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
+pub(crate) const VOXTRAL_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const LFM3_AUDIO_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(
     crate::models::architectures::lfm3_audio::LFM3_AUDIO_REALTIME_EXECUTION_ABI,
 );
@@ -376,6 +382,15 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
         ))
     }
 
+    fn seal_granite_speech5_asr_preparation(
+        &self,
+        _model: &crate::models::architectures::granite_speech5::asr::GraniteSpeech5AsrModel,
+    ) -> Result<()> {
+        Err(Error::ModelLoadError(
+            "loaded adapter does not own Granite Speech 5.0 ASR preparation".into(),
+        ))
+    }
+
     fn seal_lfm25_audio_asr_preparation(
         &self,
         _model: &crate::models::registry::NativeAudioChatModel,
@@ -505,6 +520,11 @@ pub(super) struct LoadedAdapterFactoryContext {
     model_instance_id: ModelInstanceId,
     backend_kind: BackendKind,
     max_tensor_batch_size: usize,
+    /// The width of a continuous decode stage: `max_tensor_batch_size`, or
+    /// for ASR its fitted decode width (`RuntimeAdapterRegistry::
+    /// asr_decode_width`), which only the ASR adapters that batch their
+    /// decode read.
+    max_decode_batch_size: usize,
     request_parallelism: usize,
 }
 
@@ -667,6 +687,9 @@ struct VibeVoiceAsrExecutionSeal {
     prefill_max_batch_work_units: u64,
     prefill_max_batch_workspace_bytes: u64,
     decode_workspace_per_row_bytes: u64,
+    /// The long-form (legacy) invocation's workspace: one exclusive pass over
+    /// the whole file.
+    legacy_workspace_bytes: u64,
 }
 
 /// One-shot execution identity built before physical state allocation.

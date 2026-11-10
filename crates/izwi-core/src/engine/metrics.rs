@@ -1550,6 +1550,138 @@ static ENGINE_BATCH_TOKENS: HistogramFamily = HistogramFamily::new(
     &[],
     buckets::BATCH_TOKENS,
 );
+static ASR_PREPARATION_BATCH_ROWS: HistogramFamily = HistogramFamily::new(
+    "izwi_asr_preparation_batch_rows",
+    "Requests one cross-request ASR encoder batch ran in one device call.",
+    &["model"],
+    buckets::BATCH_ROWS,
+);
+
+/// Record the requests one ASR encoder preparation batch of `model` ran.
+pub(crate) fn record_asr_preparation_batch_rows(model: &str, rows: usize) {
+    ASR_PREPARATION_BATCH_ROWS.observe(&[model], rows as f64);
+}
+
+/// Observations and total rows of `model`'s preparation batch histogram.
+#[cfg(test)]
+pub(crate) fn asr_preparation_batch_rows_totals(model: &str) -> (u64, f64) {
+    let snapshot = ASR_PREPARATION_BATCH_ROWS.series(&[model]).snapshot();
+    (snapshot.count, snapshot.sum)
+}
+
+static ASR_PHASE_SECONDS: HistogramFamily = HistogramFamily::new(
+    "izwi_asr_phase_seconds",
+    "Seconds an ASR model spent in one phase: per request for host work (decode_audio, features), per physical call for device-thread work (encoder, prefill, decode, detok). Device phases are device-thread time; IZWI_ASR_PHASE_SYNC=1 makes CUDA phases wait for the device first.",
+    &["model", "phase"],
+    buckets::STEP_SECONDS,
+);
+
+/// One phase of an ASR request, the `phase` label of `izwi_asr_phase_seconds`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AsrPhase {
+    /// Decoding the uploaded file into samples, on a host worker.
+    DecodeAudio,
+    /// Resampling and log-mel features computed on a host worker.
+    Features,
+    /// One encoder (preparation) batch on the device thread.
+    Encoder,
+    /// One engine dispatch whose rows prefill.
+    Prefill,
+    /// One engine dispatch of decode steps.
+    Decode,
+    /// Detokenisation inside one engine dispatch.
+    Detok,
+    /// Nemotron Transcribe prefill by decoder layer kind, under
+    /// `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_PROFILE` only.
+    PrefillMamba,
+    PrefillMoe,
+    PrefillAttention,
+}
+
+impl AsrPhase {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::DecodeAudio => "decode_audio",
+            Self::Features => "features",
+            Self::Encoder => "encoder",
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+            Self::Detok => "detok",
+            Self::PrefillMamba => "prefill_mamba",
+            Self::PrefillMoe => "prefill_moe",
+            Self::PrefillAttention => "prefill_attention",
+        }
+    }
+}
+
+/// Record `elapsed` seconds of `model`'s `phase`.
+pub(crate) fn record_asr_phase(model: &str, phase: AsrPhase, elapsed: Duration) {
+    ASR_PHASE_SECONDS.observe_duration(&[model, phase.as_str()], elapsed);
+}
+
+/// Record a device-thread phase that started at `started`. With
+/// `IZWI_ASR_PHASE_SYNC=1` a CUDA phase first waits for the work it queued,
+/// so the time is device time rather than launch time.
+pub(crate) fn record_asr_device_phase(model: &str, phase: AsrPhase, started: Instant) {
+    asr_phase_sync();
+    record_asr_phase(model, phase, started.elapsed());
+}
+
+/// Whether device-thread ASR phases synchronize the device before they are
+/// recorded (`IZWI_ASR_PHASE_SYNC`, off by default: it costs throughput).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn asr_phase_sync_enabled() -> bool {
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_ASR_PHASE_SYNC", false));
+    ENABLED.get()
+}
+
+/// Waits for the calling thread's current CUDA context when phase sync is on.
+/// A no-op on other backends and off a device thread.
+pub(crate) fn asr_phase_sync() {
+    #[cfg(feature = "cuda")]
+    if asr_phase_sync_enabled() {
+        if let Err(error) = cudarc::driver::result::ctx::synchronize() {
+            tracing::debug!("ASR phase sync skipped: {error}");
+        }
+    }
+}
+
+thread_local! {
+    /// Detokenisation time on this thread since the last
+    /// [`take_asr_detok`], in nanoseconds.
+    static ASR_DETOK_NANOS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Adds its lifetime to this thread's detokenisation clock when dropped.
+pub(crate) struct AsrDetokScope(Instant);
+
+impl Drop for AsrDetokScope {
+    fn drop(&mut self) {
+        let nanos = u64::try_from(self.0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        ASR_DETOK_NANOS.with(|clock| clock.set(clock.get().saturating_add(nanos)));
+    }
+}
+
+/// Times one detokenisation call on this thread's clock.
+pub(crate) fn asr_detok_scope() -> AsrDetokScope {
+    AsrDetokScope(Instant::now())
+}
+
+/// The detokenisation time this thread accumulated since the last call.
+pub(crate) fn take_asr_detok() -> Duration {
+    Duration::from_nanos(ASR_DETOK_NANOS.with(|clock| clock.replace(0)))
+}
+
+/// Observations and total seconds of `model`'s `phase`.
+#[cfg(test)]
+pub(crate) fn asr_phase_totals(model: &str, phase: AsrPhase) -> (u64, f64) {
+    let snapshot = ASR_PHASE_SECONDS
+        .series(&[model, phase.as_str()])
+        .snapshot();
+    (snapshot.count, snapshot.sum)
+}
+
 static ENGINE_MODEL_CALLS_PER_STEP: HistogramFamily = HistogramFamily::new(
     "izwi_engine_model_calls_per_step",
     "Model calls one engine step dispatched: one per tensor batch or serial row, one per row of a request-parallel batch.",
@@ -1672,6 +1804,8 @@ pub fn push_engine_histograms(payload: &mut String) {
     ENGINE_BATCH_ROWS.render(payload);
     ENGINE_BATCH_TOKENS.render(payload);
     ENGINE_MODEL_CALLS_PER_STEP.render(payload);
+    ASR_PREPARATION_BATCH_ROWS.render(payload);
+    ASR_PHASE_SECONDS.render(payload);
     ENGINE_MIXED_ROWS.render(payload);
     ENGINE_MIXED_TOKENS.render(payload);
     ENGINE_DEVICE_IDLE_SECONDS.render(payload);
@@ -1683,6 +1817,14 @@ pub fn push_engine_histograms(payload: &mut String) {
     payload.push_str(&format!(
         "izwi_engine_device_ops_off_thread_total {}\n",
         crate::backends::device_ops_off_thread_total()
+    ));
+    payload.push_str(
+        "# HELP izwi_engine_device_frees_rerouted_total Device buffers whose last drop began off their CUDA device thread and was moved onto it (request-owned ASR encoder artifacts).\n\
+         # TYPE izwi_engine_device_frees_rerouted_total counter\n",
+    );
+    payload.push_str(&format!(
+        "izwi_engine_device_frees_rerouted_total {}\n",
+        crate::backends::device_frees_rerouted_total()
     ));
 }
 
@@ -2364,6 +2506,39 @@ mod tests {
         let snapshot = collector.snapshot().await;
         assert_eq!(snapshot.total_requests, 2);
         assert_eq!(snapshot.total_tokens, 150);
+    }
+
+    #[test]
+    fn asr_preparation_batch_rows_are_exported_per_model() {
+        let model = "asr-preparation-batch-rows-test";
+        record_asr_preparation_batch_rows(model, 1);
+        record_asr_preparation_batch_rows(model, 7);
+        assert_eq!(asr_preparation_batch_rows_totals(model), (2, 8.0));
+        let mut payload = String::new();
+        push_engine_histograms(&mut payload);
+        assert!(payload.contains(&format!(
+            "izwi_asr_preparation_batch_rows_count{{model=\"{model}\"}} 2"
+        )));
+    }
+
+    #[test]
+    fn asr_phase_seconds_are_exported_per_model_and_phase() {
+        let model = "asr-phase-seconds-test";
+        record_asr_phase(model, AsrPhase::Features, Duration::from_millis(3));
+        record_asr_device_phase(model, AsrPhase::Encoder, Instant::now());
+        record_asr_device_phase(model, AsrPhase::Encoder, Instant::now());
+        assert_eq!(asr_phase_totals(model, AsrPhase::Features), (1, 0.003));
+        assert_eq!(asr_phase_totals(model, AsrPhase::Encoder).0, 2);
+        assert_eq!(asr_phase_totals(model, AsrPhase::Decode).0, 0);
+        let mut payload = String::new();
+        push_engine_histograms(&mut payload);
+        assert!(payload.contains("# TYPE izwi_asr_phase_seconds histogram"));
+        assert!(payload.contains(&format!(
+            "izwi_asr_phase_seconds_count{{model=\"{model}\",phase=\"encoder\"}} 2"
+        )));
+        assert!(payload.contains(&format!(
+            "izwi_asr_phase_seconds_sum{{model=\"{model}\",phase=\"features\"}}"
+        )));
     }
 
     #[test]

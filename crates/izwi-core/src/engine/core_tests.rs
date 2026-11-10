@@ -2759,6 +2759,59 @@ fn prepared_continuous_cost_scales_an_isolated_multi_token_quantum() {
     assert_eq!(cost.workspace.workspace_bytes().unwrap(), 32);
 }
 
+/// A Qwen3-TTS request whose audio is due is scheduled onto the loaded
+/// audio stage and finishes on its finalization stage; each audio quantum
+/// is priced as one request of the stage, and a full batch of them with
+/// the shared codec call fits the stage's declared workspace.
+#[test]
+fn qwen_tts_audio_quanta_bind_the_audio_stage_and_fit_its_workspace() {
+    use crate::runtime::{CapabilityKind, LoadedModelBundleDraft, RuntimeAdapterRegistry};
+
+    let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+    for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+        let draft = LoadedModelBundleDraft::build(
+            &RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap(),
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            variant,
+            backend,
+        )
+        .unwrap();
+        for capability in [CapabilityKind::Tts, CapabilityKind::StreamingTts] {
+            for contract in draft.execution_contracts(capability).unwrap() {
+                let binding = contract.adapter_binding().unwrap();
+                let audio = WorkUnit::SequenceAudioDecode { max_frames: 1 };
+                let stage = binding.stage_for_work(&audio).unwrap().clone();
+                assert_eq!(
+                    stage.selector,
+                    crate::engine::StageWorkSelector::SequenceAudioDecode
+                );
+                let finalize = binding
+                    .stage_for_work(&WorkUnit::SequenceFinalize {
+                        max_output_steps: 1,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    finalize.selector,
+                    crate::engine::StageWorkSelector::SequenceFinalize
+                );
+                let mut request = EngineCoreRequest::tts("audio").with_model_variant(variant);
+                request.bind_execution_adapter(binding.clone()).unwrap();
+                let cost = EngineCore::work_cost(&request, &audio, Some(&stage), backend).unwrap();
+                assert_eq!(cost, WorkCost::new(1, 1, stage.workspace_per_row_bytes));
+                let rows = stage.max_batch_size as u64;
+                assert!(rows > 1);
+                assert_eq!(
+                    stage.workspace_base_bytes
+                        + cost.workspace.workspace_bytes().unwrap() * rows,
+                    stage.max_workspace_bytes
+                );
+                assert_eq!(cost.logical_units * rows, stage.max_work_units);
+            }
+        }
+    }
+}
+
 #[test]
 fn realtime_work_cost_accounts_for_bounded_input_and_output() {
     let request = EngineCoreRequest::asr("");
@@ -6704,6 +6757,57 @@ async fn formation_stages_transactions_only_for_rows_the_step_launches() {
     drop(prepared);
 }
 
+/// The managed loader pools a per-sequence context across the engine's
+/// sequences, and each sequence keeps that context as its cap. An automatic
+/// ASR pool (Qwen3-ASR, VibeVoice-ASR, Granite Speech) already holds one
+/// sequence per row: passed as a context it was pooled a second time (8
+/// rows of 256 tokens became 8 x 2,048). The pooled loader takes it as given
+/// and lets a sequence claim all of it.
+#[test]
+fn a_pool_sized_by_its_rows_is_not_pooled_again() {
+    let contract = crate::kv::test_contract();
+    let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
+    let mut config = EngineCoreConfig {
+        max_retained_sequences: 8,
+        max_staged_transactions: 8,
+        max_num_seqs: Some(8),
+        max_seq_len: 1 << 20,
+        backend: BackendKind::Cpu,
+        ..Default::default()
+    };
+    config.portable_context_auto = true;
+    let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+    let rows = (8, 8);
+    let per_sequence = core
+        .load_managed_model_state_with_portable_copies_and_rows(
+            ModelInstanceId::new(61),
+            &contract,
+            Some(256),
+            2,
+            rows,
+            1,
+            crate::engine::StateFitReserve::MeasuredUntracked,
+            0,
+        )
+        .unwrap();
+    assert_eq!(per_sequence.logical_token_reach(), 8 * 256);
+    assert_eq!(per_sequence.maximum_sequence_tokens(), 256);
+
+    let pooled = core
+        .load_pooled_managed_model_state_with_portable_copies(
+            ModelInstanceId::new(62),
+            &contract,
+            8 * 256,
+            2,
+            rows,
+            1,
+            crate::engine::StateFitReserve::MeasuredUntracked,
+        )
+        .unwrap();
+    assert_eq!(pooled.logical_token_reach(), 8 * 256);
+    assert_eq!(pooled.maximum_sequence_tokens(), 8 * 256);
+}
+
 #[test]
 fn automatic_staged_rows_do_not_cap_a_model_fitted_staging_width() {
     let contract = crate::kv::test_contract();
@@ -6734,6 +6838,188 @@ fn automatic_staged_rows_do_not_cap_a_model_fitted_staging_width() {
     load(&mut automatic, 47, 8, 6)
         .expect("an automatic staged limit must not cap a model-fitted width");
     assert!(load(&mut automatic, 48, 9, 6).is_err());
+
+    // ASR state (retained rows with portable copies) stages an ASR decode
+    // fitted past the engine rows the same way.
+    let load_asr = |core: &mut EngineCore, model, retained, staged| {
+        core.load_managed_model_state_with_portable_copies_and_rows(
+            ModelInstanceId::new(model),
+            &contract,
+            None,
+            2,
+            (retained, staged),
+            1,
+            crate::engine::StateFitReserve::MeasuredUntracked,
+            0,
+        )
+    };
+    assert!(load_asr(&mut core_with(false), 49, 8, 6).is_err());
+    let mut automatic = core_with(true);
+    load_asr(&mut automatic, 50, 8, 8)
+        .expect("an automatic staged limit must not cap a fitted ASR decode width");
+    assert!(load_asr(&mut automatic, 51, 8, 9).is_err());
+    assert!(load_asr(&mut automatic, 52, 9, 2).is_err());
+}
+
+/// The graph a batched ASR decode runs (Qwen3-ASR's: a scalar prefill, then
+/// a continuous decode at the width its load fitted, here 32) on retained
+/// state staged at that width, past the engine's automatic staged rows (two
+/// on the CPU): once every row has prefilled, all 20 rows decode in one
+/// batch, and no batch exceeds the decode stage's width.
+#[tokio::test]
+async fn a_fitted_continuous_decode_steps_every_admitted_row_in_one_batch() {
+    const ROWS: usize = 20;
+    const DECODE_WIDTH: usize = 32;
+    let model = ModelInstanceId::new(101);
+    let batches = Arc::new(Mutex::new(Vec::new()));
+    let executor = UnifiedExecutor::new_for_test(Box::new(ManagedDecodeExecutor {
+        mixed_width: Some(DECODE_WIDTH),
+        batches: batches.clone(),
+        ..Default::default()
+    }));
+    let mut config = EngineCoreConfig {
+        enable_chunked_prefill: false,
+        block_size: 16,
+        max_blocks: 256,
+        max_batch_size: 64,
+        max_retained_sequences: 64,
+        max_staged_transactions: 2,
+        backend: BackendKind::Cpu,
+        ..Default::default()
+    };
+    config.automatic_row_limits.staged_transactions = true;
+    let mut core = EngineCore::new_with_unified_executor(config, executor).expect("core");
+    let contract = crate::kv::test_contract();
+    let physical = core
+        .load_managed_model_state_with_portable_copies_and_rows(
+            model,
+            &contract,
+            None,
+            2,
+            (DECODE_WIDTH, DECODE_WIDTH),
+            1,
+            crate::engine::StateFitReserve::MeasuredUntracked,
+            0,
+        )
+        .expect("retained rows staged at the decode width");
+
+    let mut ids = HashSet::new();
+    for index in 0..ROWS {
+        let id = format!("asr-row-{index}");
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: id.clone(),
+        }])
+        .with_model_variant(ModelVariant::Qwen306B);
+        request.id = id.clone();
+        request.params.max_tokens = 24;
+        request
+            .install_chat_execution_preparation(
+                ModelVariant::Qwen306B,
+                vec![1, 2, 3, 4],
+                None,
+                4096,
+            )
+            .expect("prepare prompt");
+        request.bind_model_instance(model).expect("model instance");
+        let mut profile = ExecutionProfile::fail_closed(
+            BackendKind::Cpu,
+            Some(ModelVariant::Qwen306B),
+            ExecutionMode::Sequence,
+        );
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.cache_namespace = Some("core-test-state-v2".to_string());
+        profile.kv_dtype = "state_v2_resolved".to_string();
+        profile.resolved_from_loaded_model = true;
+        profile.max_batch_size = DECODE_WIDTH;
+        let mut prefill = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(1),
+            "asr.prefill.scalar",
+            &profile,
+            NativeBatchMode::None,
+        );
+        prefill.selector = super::super::StageWorkSelector::SequencePrefill;
+        prefill.max_batch_size = 1;
+        prefill.concurrency = ConcurrencyClass::Exclusive;
+        let mut decode = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(2),
+            "asr.decode.tensor_continuous",
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = super::super::StageWorkSelector::SequenceDecode;
+        decode.max_work_units = DECODE_WIDTH as u64;
+        let execution = super::super::ExecutionAdapterBinding {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: model,
+            adapter_instance_id: super::super::AdapterInstanceId::new(model.get()),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            model_variant: ModelVariant::Qwen306B,
+            capability_id: "asr".to_string(),
+            stages: Arc::from([prefill, decode]),
+        };
+        let descriptor = crate::kv::v2::CapabilityStateDescriptorV2::managed_for_stages_test(
+            contract.clone(),
+            &execution.stages,
+        );
+        let runtime = Arc::new(crate::kv::v2::CapabilityStateRuntimeV2::managed(
+            crate::kv::v2::ManagedCapabilityRuntimeV2::seal(
+                BackendKind::Cpu,
+                &execution,
+                descriptor,
+                physical.clone(),
+                crate::kv::v2::RetainedStateUseV2::ExternalPaged,
+            )
+            .expect("seal managed runtime"),
+        ));
+        request
+            .bind_execution_adapter(execution)
+            .expect("bind execution");
+        request
+            .bind_v2_state_runtime(runtime.clone(), runtime.state_fingerprint, BackendKind::Cpu)
+            .expect("bind managed state");
+        core.add_request(request).expect("add");
+        ids.insert(id);
+    }
+
+    let mut finished = HashSet::new();
+    for _ in 0..2_000 {
+        for output in core.step().await.expect("step") {
+            if output.is_finished {
+                assert!(
+                    output.error.is_none(),
+                    "{}: {:?}",
+                    output.request_id,
+                    output.error
+                );
+                finished.insert(output.request_id);
+            }
+        }
+        if finished == ids {
+            break;
+        }
+    }
+    assert_eq!(finished, ids);
+    let batches = std::mem::take(&mut *batches.lock().unwrap());
+    let widest_decode = batches
+        .iter()
+        .filter(|rows| rows.iter().all(|(_, prefill)| !*prefill))
+        .map(Vec::len)
+        .max()
+        .unwrap();
+    assert_eq!(widest_decode, ROWS, "{batches:?}");
+    assert!(batches.iter().all(|rows| rows.len() <= DECODE_WIDTH));
+    // Every prefill ran alone, as the scalar prefill stage declares.
+    assert!(batches
+        .iter()
+        .filter(|rows| rows.iter().any(|(_, prefill)| *prefill))
+        .all(|rows| rows.len() == 1));
+    let snapshot = core.managed_kv_cache.runtime_snapshot();
+    assert_eq!(snapshot.totals.coordinator.active_transactions, 0);
 }
 
 #[tokio::test]
@@ -7001,6 +7287,7 @@ fn load_owned_composite_survives_weak_request_upgrade_until_ordered_unload() {
             &crate::engine::cache::composite::tests::contract(),
             crate::kv::v2::StateDomainId::new(2),
             Some(32),
+            (2, 2),
             0,
         )
         .unwrap();

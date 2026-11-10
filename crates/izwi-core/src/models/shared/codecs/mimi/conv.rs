@@ -8,7 +8,7 @@
 //! next chunk's own output already carries). With zero initial state the
 //! concatenated chunks equal the whole-sequence output up to summation order.
 
-use candle_core::{Module, Tensor};
+use candle_core::{DType, Module, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, VarBuilder};
 
 use crate::error::{Error, Result};
@@ -64,6 +64,22 @@ impl CausalConv1d {
             padding_total: effective_kernel - stride,
             pad_mode,
             in_channels,
+        })
+    }
+
+    /// This convolution with its weight and bias in `dtype`.
+    pub(crate) fn with_dtype(&self, dtype: DType) -> Result<Self> {
+        Ok(Self {
+            conv: Conv1d::new(
+                self.conv.weight().to_dtype(dtype)?,
+                self.conv.bias().map(|b| b.to_dtype(dtype)).transpose()?,
+                *self.conv.config(),
+            ),
+            stride: self.stride,
+            effective_kernel: self.effective_kernel,
+            padding_total: self.padding_total,
+            pad_mode: self.pad_mode,
+            in_channels: self.in_channels,
         })
     }
 
@@ -176,6 +192,28 @@ impl CausalConvTranspose1d {
         })
     }
 
+    /// This convolution with its weight and bias in `dtype`.
+    pub(crate) fn with_dtype(&self, dtype: DType) -> Result<Self> {
+        let kind = match &self.kind {
+            TransposeKind::Dense { conv } => TransposeKind::Dense {
+                conv: ConvTranspose1d::new(
+                    conv.weight().to_dtype(dtype)?,
+                    conv.bias().map(|b| b.to_dtype(dtype)).transpose()?,
+                    *conv.config(),
+                ),
+            },
+            TransposeKind::Depthwise { weight } => TransposeKind::Depthwise {
+                weight: weight.to_dtype(dtype)?,
+            },
+        };
+        Ok(Self {
+            kind,
+            stride: self.stride,
+            kernel: self.kernel,
+            out_channels: self.out_channels,
+        })
+    }
+
     /// Output samples a chunk spills past its end.
     pub(crate) fn overlap(&self) -> usize {
         self.kernel - self.stride
@@ -274,6 +312,14 @@ impl ResnetBlock {
                 PadMode::Constant,
                 vb.pp("block.3.conv"),
             )?,
+        })
+    }
+
+    /// This block with its convolutions in `dtype`.
+    pub(crate) fn with_dtype(&self, dtype: DType) -> Result<Self> {
+        Ok(Self {
+            conv1: self.conv1.with_dtype(dtype)?,
+            conv2: self.conv2.with_dtype(dtype)?,
         })
     }
 

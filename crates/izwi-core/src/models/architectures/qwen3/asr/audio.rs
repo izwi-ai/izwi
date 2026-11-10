@@ -801,7 +801,7 @@ impl AudioTower {
             packed_chunks.push(chunk);
         }
         let packed_refs: Vec<&Tensor> = packed_chunks.iter().collect();
-        let mut x = Tensor::cat(&packed_refs, 0)?.unsqueeze(0)?; // [1, total_frames_after_cnn, d_model]
+        let x = Tensor::cat(&packed_refs, 0)?.unsqueeze(0)?; // [1, total_frames_after_cnn, d_model]
         let packed_len = x.dim(1)?;
 
         // Build chunked self-attention windows in the CNN-downsampled domain.
@@ -835,15 +835,20 @@ impl AudioTower {
             cu_seqlens = vec![0, packed_len_i64];
         }
 
-        for layer in &self.layers {
-            x = layer.forward(&x, &cu_seqlens)?;
-        }
+        self.encode_windows(x, &cu_seqlens)
+    }
 
+    /// The transformer layers and output projection over a packed
+    /// `[1, tokens, d_model]` sequence whose attention windows `cu_seqlens`
+    /// bounds.
+    fn encode_windows(&self, mut x: Tensor, cu_seqlens: &[i64]) -> Result<Tensor> {
+        for layer in &self.layers {
+            x = layer.forward(&x, cu_seqlens)?;
+        }
         let x = self.ln_post.forward(&x)?;
         let x = self.proj1.forward(&x)?;
         let x = gelu(&x)?;
-        let x = self.proj2.forward(&x)?;
-        Ok(x)
+        self.proj2.forward(&x).map_err(Error::from)
     }
 
     fn forward_ragged_feature_batch(
@@ -932,7 +937,7 @@ impl AudioTower {
             }
         }
         let packed_refs: Vec<&Tensor> = packed_chunks.iter().collect();
-        let mut x = Tensor::cat(&packed_refs, 0)?.unsqueeze(0)?;
+        let x = Tensor::cat(&packed_refs, 0)?.unsqueeze(0)?;
 
         let mut row_output_lengths = Vec::with_capacity(feature_lens.len());
         let mut chunk_cursor = 0usize;
@@ -976,13 +981,7 @@ impl AudioTower {
             }
         }
 
-        for layer in &self.layers {
-            x = layer.forward(&x, &cu_seqlens)?;
-        }
-        let x = self.ln_post.forward(&x)?;
-        let x = self.proj1.forward(&x)?;
-        let x = gelu(&x)?;
-        let x = self.proj2.forward(&x)?;
+        let x = self.encode_windows(x, &cu_seqlens)?;
 
         let max_output_len = row_output_lengths.iter().copied().max().unwrap_or(0);
         let hidden = x.dim(2)?;
@@ -1022,6 +1021,16 @@ pub(crate) fn tiny_audio_tower_for_test(device: &candle_core::Device) -> AudioTo
     tests::tiny_audio_tower(device)
 }
 
+/// [`tiny_audio_tower_for_test`] with every weight in `dtype`, as a GGUF
+/// tower loads at its selected dtype.
+#[cfg(test)]
+pub(crate) fn tiny_audio_tower_at_for_test(
+    device: &candle_core::Device,
+    dtype: candle_core::DType,
+) -> AudioTower {
+    tests::tiny_audio_tower_at(device, dtype)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1054,26 +1063,44 @@ mod tests {
         Tensor::from_vec(values, shape, device).expect("deterministic tensor")
     }
 
-    fn tiny_linear(out_dim: usize, in_dim: usize, device: &Device, seed: usize) -> Linear {
+    fn tiny_linear(
+        out_dim: usize,
+        in_dim: usize,
+        device: &Device,
+        seed: usize,
+        dtype: DType,
+    ) -> Linear {
+        let cast = |tensor: Tensor| tensor.to_dtype(dtype).expect("linear dtype");
         Linear::new(
-            deterministic_tensor(out_dim * in_dim, (out_dim, in_dim), device, seed),
-            Some(
+            cast(deterministic_tensor(
+                out_dim * in_dim,
+                (out_dim, in_dim),
+                device,
+                seed,
+            )),
+            Some(cast(
                 deterministic_tensor(out_dim, out_dim, device, seed + 1)
                     .reshape(out_dim)
                     .expect("linear bias"),
-            ),
+            )),
         )
     }
 
-    fn tiny_layer_norm(dim: usize, device: &Device) -> LayerNorm {
+    fn tiny_layer_norm(dim: usize, device: &Device, dtype: DType) -> LayerNorm {
         LayerNorm::new(
-            Tensor::ones(dim, DType::F32, device).expect("norm weight"),
-            Tensor::zeros(dim, DType::F32, device).expect("norm bias"),
+            Tensor::ones(dim, dtype, device).expect("norm weight"),
+            Tensor::zeros(dim, dtype, device).expect("norm bias"),
             1e-5,
         )
     }
 
     pub(super) fn tiny_audio_tower(device: &Device) -> AudioTower {
+        tiny_audio_tower_at(device, DType::F32)
+    }
+
+    /// The tiny tower with every weight in `dtype`.
+    pub(super) fn tiny_audio_tower_at(device: &Device, dtype: DType) -> AudioTower {
+        let cast = |tensor: Tensor| tensor.to_dtype(dtype).expect("tower dtype");
         let cfg = AudioConfig {
             d_model: 4,
             encoder_attention_heads: 1,
@@ -1093,45 +1120,45 @@ mod tests {
         };
         let conv = |out_channels: usize, in_channels: usize, seed: usize| {
             Conv2d::new(
-                deterministic_tensor(
+                cast(deterministic_tensor(
                     out_channels * in_channels * 3 * 3,
                     (out_channels, in_channels, 3, 3),
                     device,
                     seed,
-                ),
-                Some(deterministic_tensor(
+                )),
+                Some(cast(deterministic_tensor(
                     out_channels,
                     out_channels,
                     device,
                     seed + 1,
-                )),
+                ))),
                 conv_cfg,
             )
         };
         let attention = AudioAttention {
-            q_proj: tiny_linear(4, 4, device, 10),
-            k_proj: tiny_linear(4, 4, device, 12),
-            v_proj: tiny_linear(4, 4, device, 14),
-            out_proj: tiny_linear(4, 4, device, 16),
+            q_proj: tiny_linear(4, 4, device, 10, dtype),
+            k_proj: tiny_linear(4, 4, device, 12, dtype),
+            v_proj: tiny_linear(4, 4, device, 14, dtype),
+            out_proj: tiny_linear(4, 4, device, 16, dtype),
             num_heads: 1,
             head_dim: 4,
         };
         let layer = AudioEncoderLayer {
-            self_attn_layer_norm: tiny_layer_norm(4, device),
+            self_attn_layer_norm: tiny_layer_norm(4, device, dtype),
             self_attn: attention,
-            final_layer_norm: tiny_layer_norm(4, device),
-            fc1: tiny_linear(8, 4, device, 18),
-            fc2: tiny_linear(4, 8, device, 20),
+            final_layer_norm: tiny_layer_norm(4, device, dtype),
+            fc1: tiny_linear(8, 4, device, 18, dtype),
+            fc2: tiny_linear(4, 8, device, 20, dtype),
         };
         AudioTower {
             conv2d1: conv(2, 1, 1),
             conv2d2: conv(2, 2, 3),
             conv2d3: conv(2, 2, 5),
-            conv_out: Linear::new(deterministic_tensor(8, (4, 2), device, 7), None),
+            conv_out: Linear::new(cast(deterministic_tensor(8, (4, 2), device, 7)), None),
             layers: vec![layer],
-            ln_post: tiny_layer_norm(4, device),
-            proj1: tiny_linear(4, 4, device, 22),
-            proj2: tiny_linear(4, 4, device, 24),
+            ln_post: tiny_layer_norm(4, device, dtype),
+            proj1: tiny_linear(4, 4, device, 22, dtype),
+            proj2: tiny_linear(4, 4, device, 24, dtype),
             pos_embed: SinusoidalPositionEmbedding::new(1500, 4, device)
                 .expect("position embedding"),
             cfg,
@@ -1412,5 +1439,82 @@ mod tests {
         for (lhs, rhs) in masked_vals.iter().zip(chunked_vals.iter()) {
             assert!((lhs - rhs).abs() < 1e-5);
         }
+    }
+
+    /// The BF16 tower (a GGUF load's default on CUDA) over packed attention
+    /// windows of several rows stays within BF16 rounding of the F32 tower,
+    /// picks the same largest output feature for every token whose F32 lead
+    /// exceeds twice the largest change BF16 makes, and encodes each window
+    /// as that window alone does. The windows start after the convolution
+    /// stem: Candle 0.11's CPU conv2d has no BF16 kernel (CUDA has
+    /// `im2col_bf16` and cuDNN), and the stem's per-chunk geometry is
+    /// dtype-independent (`ragged_audio_batch_matches_scalar_across_chunk_boundaries`).
+    #[test]
+    fn bf16_audio_windows_match_f32_and_their_own_solo_encodes() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, relative_l2};
+
+        let device = Device::Cpu;
+        let f32_tower = tiny_audio_tower(&device);
+        let bf16_tower = tiny_audio_tower_at(&device, DType::BF16);
+        // Three rows' windows packed as the ragged batch packs them.
+        let cu_seqlens = [0i64, 13, 26, 30, 47, 52];
+        let tokens = 52;
+        let values = (0..tokens * 4)
+            .map(|index| ((index * 37 + 11) % 53) as f32 * 0.06 - 1.5)
+            .collect::<Vec<_>>();
+        let x = Tensor::from_vec(values, (1, tokens, 4), &device).expect("packed input");
+        let bf16_x = x.to_dtype(DType::BF16).expect("BF16 input");
+        let expected = host_f32(
+            &f32_tower
+                .encode_windows(x, &cu_seqlens)
+                .expect("F32 windows"),
+        )
+        .expect("F32 values");
+        let packed = bf16_tower
+            .encode_windows(bf16_x.clone(), &cu_seqlens)
+            .expect("BF16 windows");
+        assert_eq!(packed.dtype(), DType::BF16);
+        let actual = host_f32(&packed).expect("BF16 values");
+        let rel = relative_l2(&actual, &expected);
+        let band = 2.0 * max_abs_diff(&actual, &expected);
+        let mut decisive = 0;
+        for (f32_token, bf16_token) in expected.chunks(4).zip(actual.chunks(4)) {
+            let argmax = |values: &[f32]| {
+                (0..values.len())
+                    .max_by(|a, b| values[*a].total_cmp(&values[*b]))
+                    .expect("features")
+            };
+            let mut sorted = f32_token.to_vec();
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            if sorted[0] - sorted[1] > band {
+                decisive += 1;
+                assert_eq!(argmax(bf16_token), argmax(f32_token));
+            }
+        }
+        let mut worst_solo = 0f32;
+        for span in cu_seqlens.windows(2) {
+            let (start, len) = (span[0] as usize, (span[1] - span[0]) as usize);
+            let solo = bf16_tower
+                .encode_windows(
+                    bf16_x.narrow(1, start, len).expect("window"),
+                    &[0, len as i64],
+                )
+                .expect("BF16 solo window");
+            let solo = host_f32(&solo).expect("solo values");
+            worst_solo = worst_solo.max(max_abs_diff(&actual[start * 4..(start + len) * 4], &solo));
+        }
+        eprintln!(
+            "Qwen3 audio windows BF16 vs F32 (tiny, CPU): relative L2 {rel:.3e}; {decisive} of {tokens} token argmaxes decisive and identical; BF16 packed vs solo max |diff| {worst_solo:.3e}"
+        );
+        assert!(rel > 0.0 && rel < 2e-2, "relative L2 {rel:e}");
+        assert!(decisive * 2 > tokens, "{decisive} of {tokens} decisive");
+        // The packed product regroups its F32 sums before narrowing to BF16,
+        // so a value may round one BF16 step apart: at most 2^-7 of the
+        // output's scale.
+        let scale = actual.iter().fold(0f32, |max, value| max.max(value.abs()));
+        assert!(
+            worst_solo <= scale / 128.0,
+            "packed vs solo {worst_solo} of {scale}"
+        );
     }
 }

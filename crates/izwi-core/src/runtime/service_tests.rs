@@ -2253,6 +2253,70 @@ fn parakeet_decode_budget_tracks_emittable_labels() {
     assert_eq!(request(50_000, false), max_emittable);
 }
 
+#[test]
+fn nemotron_decode_budget_tracks_emittable_labels() {
+    let variant = ModelVariant::Nemotron35AsrStreaming06B;
+    // 30 s at 16 kHz: 376 encoder frames × 10 labels.
+    let max_emittable =
+        crate::models::architectures::nemotron::asr::nemotron_max_emittable_tokens(376, 10)
+            .unwrap();
+    assert_eq!(max_emittable, 3_760);
+    let request = |max_tokens: usize, auto: bool| {
+        let mut request = EngineCoreRequest::asr("audio").with_model_variant(variant);
+        request.params.max_tokens = max_tokens;
+        request.asr_auto_max_tokens = auto;
+        install_nemotron_decode_budget(&mut request, max_emittable).unwrap();
+        assert!(request.uses_asr_retained_sequence());
+        request.params.max_tokens
+    };
+
+    assert_eq!(request(2048, true), max_emittable);
+    assert_eq!(request(5, false), 5);
+    assert_eq!(request(50_000, false), max_emittable);
+}
+
+/// Nemotron clips one pass covers decode as retained rows, streamed or
+/// not; longer audio and speaker attribution keep the atomic graph.
+/// A Granite Speech 5.0 row's KV claim (prompt and planned budget) never
+/// exceeds one retained sequence, which the retained pool always holds: a
+/// request at the 2,528-token ceiling decodes as a row, one token over it
+/// (a long prompt, or a caller's large `max_tokens`) runs atomically.
+#[test]
+fn granite_speech5_rows_never_claim_more_than_one_retained_sequence() {
+    use crate::models::architectures::granite_speech5::asr::GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS as CEILING;
+    let context = 16_384;
+    assert!(granite_speech5_decodes_as_row(1_328, 1_200, context));
+    assert!(granite_speech5_decodes_as_row(400, CEILING - 400, context));
+    assert!(!granite_speech5_decodes_as_row(400, CEILING - 399, context));
+    assert!(!granite_speech5_decodes_as_row(1_329, 1_200, context));
+    assert!(!granite_speech5_decodes_as_row(100, 8_000, context));
+    // A prompt that leaves the context no room never becomes a row.
+    assert!(!granite_speech5_decodes_as_row(300, 200, 300));
+}
+
+#[test]
+fn nemotron_short_clips_decode_as_rows_and_long_audio_stays_atomic() {
+    let variant = ModelVariant::Nemotron35AsrStreaming06B;
+    let capabilities =
+        crate::engine::AsrRouteCapabilities::for_family(ModelFamily::NemotronAsr, Some(30.0));
+    let decodes_as_row = |secs: usize, streaming: bool, speaker_attribution: bool| {
+        let samples = vec![0.0f32; 16_000 * secs];
+        let mut request = EngineCoreRequest::asr("audio").with_model_variant(variant);
+        request.streaming = streaming;
+        request.asr_task.speaker_attribution = speaker_attribution;
+        let plan = crate::engine::asr_route_plan(&samples, 16_000, &capabilities, streaming);
+        nemotron_decodes_as_row(&plan, &request)
+    };
+    for streaming in [false, true] {
+        assert!(decodes_as_row(1, streaming, false));
+        assert!(decodes_as_row(10, streaming, false));
+        assert!(decodes_as_row(20, streaming, false));
+        assert!(!decodes_as_row(60, streaming, false));
+        assert!(!decodes_as_row(600, streaming, false));
+        assert!(!decodes_as_row(10, streaming, true));
+    }
+}
+
 async fn admitted_asr_job(runtime: &RuntimeService, request: &EngineCoreRequest) -> JobLease {
     let (spec, observation) = runtime
         .coordinator_job_for_request(request)
@@ -2825,6 +2889,10 @@ fn max_num_seqs_sizes_every_automatic_limit() {
     assert_eq!(concurrency.max_num_seqs, None);
     assert_eq!(concurrency.scheduler_rows, 8);
     assert_eq!(concurrency.realtime_asr_sessions, 4);
+    // ASR decode widens only on CUDA; the CPU keeps the portable rows.
+    assert_eq!(concurrency.non_chat_row_width, 2);
+    assert_eq!(concurrency.asr_row_width, 2);
+    assert_eq!(single.adapter_registry.max_asr_tensor_batch_size(), 2);
 
     let multi = RuntimeService::new(EngineConfig {
         backend: crate::backends::BackendPreference::Cpu,
@@ -2873,6 +2941,20 @@ fn max_num_seqs_sizes_every_automatic_limit() {
     assert_eq!(concurrency.tensor_width, 12);
     assert_eq!(concurrency.non_chat_row_width, 12);
     assert_eq!(wide.tts_row_width(), 12);
+    // ASR decode runs the explicit width as asked, like every other stage.
+    assert_eq!(concurrency.asr_row_width, 12);
+    assert_eq!(multi.resolved_concurrency().asr_row_width, 2);
+    for registry in [&wide.adapter_registry, &multi.adapter_registry] {
+        for variant in [
+            ModelVariant::Qwen3Asr17BGguf,
+            ModelVariant::WhisperLargeV3Turbo,
+        ] {
+            assert_eq!(
+                registry.asr_decode_width(variant.family(), BackendKind::Cpu),
+                registry.max_tensor_batch_size()
+            );
+        }
+    }
 }
 
 #[test]
@@ -3398,4 +3480,112 @@ fn qwen_tts_coordinator_reserves_request_max_output_exactly() {
     let expected = plain_spec.resources.checked_add(output).unwrap();
     let (spec, _) = runtime.coordinator_job_for_request(&request).unwrap();
     assert_eq!(spec.resources, expected);
+}
+
+/// The total of a Prometheus series over all its label sets.
+fn prometheus_total(payload: &str, series: &str) -> f64 {
+    payload
+        .lines()
+        .filter(|line| line.starts_with(&format!("{series}{{")))
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
+        .sum()
+}
+
+fn asr_request_output(request_id: &str, input_audio_secs: f32) -> EngineOutput {
+    let mut output = OutputProcessor::new(16_000).process(
+        ExecutorOutput {
+            text: Some("words".to_string()),
+            ..ExecutorOutput::terminal(request_id.to_string())
+        },
+        0,
+        Duration::from_millis(50),
+    );
+    output.input_audio_duration_secs = Some(input_audio_secs);
+    output
+}
+
+/// A long file's chunk rows count in no request metric; their parent counts
+/// once, with the whole file's audio.
+#[tokio::test]
+async fn chunk_rows_count_once_in_the_request_metrics() {
+    let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+    let mut parent = EngineCoreRequest::asr_bytes(Vec::new());
+    parent.model_variant = Some(ModelVariant::Qwen3Asr06BGguf);
+    let metrics = runtime
+        .begin_composite_request_metrics(&parent, false)
+        .await
+        .expect("parent metrics");
+    for _ in 0..3 {
+        let mut row = parent.clone();
+        row.id = uuid::Uuid::new_v4().to_string();
+        row.asr_chunk_row = true;
+        runtime.observe_broker_request(&row).unwrap();
+        runtime.record_engine_output_observation(&row, &asr_request_output(&row.id, 30.0), false);
+        runtime.record_engine_error_observation(&row, false, "row failed");
+    }
+    metrics
+        .complete(&asr_request_output(&parent.id, 600.0))
+        .await;
+    let snapshot = runtime.telemetry_snapshot().await;
+    assert_eq!(snapshot.requests_queued, 1);
+    assert_eq!(snapshot.requests_completed, 1);
+    assert_eq!(snapshot.requests_failed, 0);
+    assert_eq!(snapshot.requests_active, 0);
+    let payload = runtime.telemetry_prometheus().await;
+    assert_eq!(
+        prometheus_total(&payload, "izwi_request_input_audio_seconds_count"),
+        1.0
+    );
+    assert_eq!(
+        prometheus_total(&payload, "izwi_request_input_audio_seconds_sum"),
+        600.0
+    );
+    assert_eq!(
+        prometheus_total(&payload, "izwi_request_duration_seconds_count"),
+        1.0
+    );
+}
+
+/// A parent that fails counts as failed, one that times out or is dropped
+/// unfinished as cancelled.
+#[tokio::test]
+async fn a_chunk_row_parent_counts_its_failure_once() {
+    let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+    let parent = || {
+        let mut parent = EngineCoreRequest::asr_bytes(Vec::new());
+        parent.model_variant = Some(ModelVariant::Qwen3Asr06BGguf);
+        parent
+    };
+    runtime
+        .begin_composite_request_metrics(&parent(), true)
+        .await
+        .unwrap()
+        .fail(&Error::InferenceError("row failed".into()))
+        .await;
+    let timed_out = parent();
+    runtime
+        .begin_composite_request_metrics(&timed_out, true)
+        .await
+        .unwrap()
+        .fail(&Error::Timeout(timed_out.id.clone()))
+        .await;
+    drop(
+        runtime
+            .begin_composite_request_metrics(&parent(), false)
+            .await
+            .unwrap(),
+    );
+    // The drop records its cancellation on a task of its own.
+    for _ in 0..100 {
+        if runtime.telemetry_snapshot().await.requests_active == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let snapshot = runtime.telemetry_snapshot().await;
+    assert_eq!(snapshot.requests_queued, 3);
+    assert_eq!(snapshot.requests_completed, 3);
+    assert_eq!(snapshot.requests_failed, 1);
+    assert_eq!(snapshot.requests_cancelled, 2);
+    assert_eq!(snapshot.requests_active, 0);
 }

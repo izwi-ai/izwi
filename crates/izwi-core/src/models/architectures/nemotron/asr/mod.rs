@@ -41,12 +41,17 @@ pub use nemo::{ensure_nemotron_artifacts, NemotronArtifacts, NEMOTRON_NEMO_FILEN
 pub(crate) use nemo::{nemotron_checkpoint_paths, nemotron_native_artifacts_complete};
 use network::{
     causal_subsampled_len, default_realtime_state_shape, resample_linear,
-    resample_linear_output_len, NemotronEncodeProfile, NemotronNetwork, NemotronRealtimeStateShape,
+    resample_linear_output_len, NemotronEncodeProfile, NemotronEncoderBatchInput, NemotronHostMel,
+    NemotronNetwork, NemotronRealtimeStateShape, NemotronRnntBatchRow, NemotronRnntRow,
     NemotronRnntStreamState, NemotronStreamingEncoderState, NemotronStreamingFeatureState,
     NemotronStreamingPreEncodeState,
 };
-pub(crate) use network::{nemotron_stem_bytes, NEMOTRON_MODEL_MEMO_MAX_BYTES};
-pub(crate) use physical::NemotronOfflinePhysicalStateSpec;
+pub(crate) use network::{
+    nemotron_encoder_batch_row_bytes, nemotron_encoder_batch_shape,
+    nemotron_encoder_graph_device_bytes, nemotron_encoder_projection_bytes,
+    nemotron_encoder_row_elements, nemotron_stem_bytes, NEMOTRON_MODEL_MEMO_MAX_BYTES,
+};
+pub(crate) use physical::{NemotronOfflinePhysicalStateSpec, NEMOTRON_OFFLINE_GROUP};
 
 const SAMPLE_RATE: u32 = 16_000;
 const DEFAULT_STRIP_LANG_TAGS: bool = true;
@@ -69,6 +74,15 @@ const CONSERVATIVE_NEMOTRON_DECODER_TOKEN_BYTES: usize = 256;
 const REALTIME_HOST_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024;
 const REALTIME_PEAK_TEXT_COPIES: u64 = 4;
 pub(crate) const NEMOTRON_REALTIME_STAGE_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
+/// The offline encoder preparation of a short clip decoded as a row.
+pub(crate) const NEMOTRON_ENCODER_STAGE: &str = "asr.encoder.nemotron";
+/// Starts the predictors of short clips decoded as rows.
+pub(crate) const NEMOTRON_RETAINED_PREFILL_STAGE: &str = "asr.prefill.nemotron.predictor";
+/// One RNNT step of short clips decoded as rows.
+pub(crate) const NEMOTRON_RETAINED_DECODE_STAGE: &str = "asr.decode.nemotron.joint";
+/// One row's decode workspace: a joint step's logits and the predictor's
+/// activations, far under this bound.
+pub(crate) const NEMOTRON_RETAINED_WORKSPACE_PER_ROW_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const NEMOTRON_REALTIME_ENCODER_STAGE: &str = "asr.realtime.encoder";
 pub(crate) const NEMOTRON_REALTIME_RNNT_STAGE: &str = "asr.realtime.rnnt";
 pub(crate) const NEMOTRON_REALTIME_FALLBACK_STAGE: &str = "asr.realtime.scalar_fallback";
@@ -1648,6 +1662,283 @@ impl NemotronPromptCondition {
     }
 }
 
+/// One request's encoder input, computed on a host worker: the 16 kHz
+/// log-mel of its audio and the prompt it encodes with, so its device job
+/// runs only the encoder.
+pub(crate) struct NemotronHostFeatures {
+    mel: NemotronHostMel,
+    prompt: NemotronPromptCondition,
+    prompt_id: usize,
+    input_samples: usize,
+    input_sample_rate: u32,
+    resampled_samples: usize,
+    feature_ms: f64,
+}
+
+impl NemotronHostFeatures {
+    /// Silent 16 kHz features of `valid_frames` feature frames, for tests of
+    /// the preparation route that need only their geometry.
+    #[cfg(test)]
+    pub(crate) fn silent_for_test(valid_frames: usize) -> Self {
+        Self {
+            mel: NemotronHostMel::silent(valid_frames),
+            prompt: NemotronPromptCondition::resolve(None, None)
+                .expect("the automatic language resolves"),
+            prompt_id: 0,
+            input_samples: valid_frames * 160,
+            input_sample_rate: SAMPLE_RATE,
+            resampled_samples: valid_frames * 160,
+            feature_ms: 0.0,
+        }
+    }
+
+    /// Encoder frames (E) these features encode to.
+    pub(crate) fn encoded_len(&self) -> usize {
+        self.mel.encoded_len()
+    }
+
+    /// The input sample count, at the request's own rate.
+    pub(crate) const fn input_samples(&self) -> usize {
+        self.input_samples
+    }
+
+    /// Log-mel columns, including the STFT padding column.
+    pub(crate) const fn feature_frames(&self) -> usize {
+        self.mel.frames()
+    }
+
+    /// Host bytes the features hold until the encode drops them.
+    pub(crate) fn host_bytes(&self) -> Result<u64> {
+        self.mel
+            .host_bytes()
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| Error::Overloaded("Nemotron log-mel bytes overflowed".into()))
+    }
+
+    fn artifact(
+        &self,
+        projection: Tensor,
+        encode_ms: f64,
+        batch_rows: usize,
+    ) -> Result<NemotronPreparedEncoderArtifact> {
+        let encoded_len = self.encoded_len();
+        if projection.dims() != [encoded_len, network::JOINT_HIDDEN] {
+            return Err(Error::InferenceError(format!(
+                "Nemotron encoder produced a {:?} projection for {encoded_len} frames",
+                projection.dims()
+            )));
+        }
+        Ok(NemotronPreparedEncoderArtifact {
+            projection,
+            encoded_len,
+            input_samples: self.input_samples,
+            input_sample_rate: self.input_sample_rate,
+            resampled_samples: self.resampled_samples,
+            feature_frames: self.mel.valid_frames(),
+            prompt: self.prompt.clone(),
+            prompt_id: self.prompt_id,
+            feature_ms: self.feature_ms,
+            encode_ms,
+            batch_rows,
+        })
+    }
+}
+
+/// One request's encoded audio as the retained RNNT decode reads it: the
+/// joint network's encoder projection `[E, JOINT_HIDDEN]`, in its own
+/// storage.
+#[derive(Clone)]
+pub(crate) struct NemotronPreparedEncoderArtifact {
+    projection: Tensor,
+    encoded_len: usize,
+    input_samples: usize,
+    input_sample_rate: u32,
+    resampled_samples: usize,
+    feature_frames: usize,
+    prompt: NemotronPromptCondition,
+    prompt_id: usize,
+    feature_ms: f64,
+    encode_ms: f64,
+    /// Requests the encoder batch that produced this artifact held.
+    batch_rows: usize,
+}
+
+impl NemotronPreparedEncoderArtifact {
+    /// The device holding the encoder projection.
+    pub(crate) fn device_location(&self) -> candle_core::DeviceLocation {
+        self.projection.device().location()
+    }
+
+    pub(crate) fn resident_tensor_bytes(&self) -> Result<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        accounting.add_tensor(&self.projection).ok_or_else(|| {
+            Error::Overloaded("Nemotron encoder artifact storage accounting overflowed".into())
+        })?;
+        Ok(accounting.bytes())
+    }
+
+    /// Encoder frames (E) the decode walks.
+    pub(crate) const fn encoded_len(&self) -> usize {
+        self.encoded_len
+    }
+}
+
+/// One request of a Nemotron encoder batch.
+pub(crate) struct NemotronEncoderBatchRow<'a> {
+    pub(crate) features: &'a NemotronHostFeatures,
+    /// Fails when the request is cancelled or past its deadline.
+    pub(crate) checkpoint: &'a dyn Fn() -> Result<()>,
+}
+
+/// One request's retained offline RNNT decode between scheduler steps.
+#[derive(Clone)]
+pub(crate) struct NemotronRetainedDecodeState {
+    rnnt: NemotronRnntRow,
+    detokenizer: IncrementalDetokenizer,
+    assembled: String,
+    finished: bool,
+    stop_reason: Option<&'static str>,
+}
+
+pub(crate) struct NemotronRetainedDecodeBatchRow<'a> {
+    pub(crate) artifact: &'a NemotronPreparedEncoderArtifact,
+    pub(crate) state: &'a mut NemotronRetainedDecodeState,
+    /// The request's decode budget. The scheduler stops scheduling a row at
+    /// this many tokens, so the row must finish here rather than strand.
+    pub(crate) max_tokens: usize,
+    /// Tokens this engine step may emit for the row (the scheduler's
+    /// quantum, at least one). The eager step emits at most one.
+    pub(crate) quota: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NemotronRetainedDecodeStep {
+    pub(crate) delta: String,
+    pub(crate) text: String,
+    pub(crate) tokens_generated: usize,
+    pub(crate) finished: bool,
+}
+
+/// Retained decodes of `artifacts`, each predictor after the blank start
+/// symbol, started with one predictor call.
+fn start_retained_decode_rows(
+    network: &NemotronNetwork,
+    artifacts: &[&NemotronPreparedEncoderArtifact],
+) -> Result<Vec<NemotronRetainedDecodeState>> {
+    let encoded_lens = artifacts
+        .iter()
+        .map(|artifact| artifact.encoded_len)
+        .collect::<Vec<_>>();
+    Ok(network
+        .start_rnnt_rows(&encoded_lens)?
+        .into_iter()
+        .map(|rnnt| NemotronRetainedDecodeState {
+            rnnt,
+            detokenizer: IncrementalDetokenizer::new(),
+            assembled: String::new(),
+            finished: false,
+            stop_reason: None,
+        })
+        .collect())
+}
+
+/// One scheduler step of retained RNNT greedy decodes: joint steps run for
+/// every row together until a row emits a label or finishes, so each row
+/// emits at most one label per step and blank frames cost no scheduler
+/// round. A row finishes when its cursor passes its last frame, or at its
+/// decode budget (`stop_reason` "max_tokens"). An error restores every row.
+fn retained_decode_step_rows(
+    network: &NemotronNetwork,
+    decode_text: &dyn Fn(&[usize]) -> String,
+    rows: &mut [NemotronRetainedDecodeBatchRow<'_>],
+) -> Result<Vec<NemotronRetainedDecodeStep>> {
+    if rows.is_empty() || rows.iter().any(|row| row.state.finished) {
+        return Err(Error::InvalidInput(
+            "Nemotron retained cohort requires live rows".into(),
+        ));
+    }
+    let max_symbols = network.realtime_state_shape().max_symbols_per_frame;
+    let checkpoints = rows.iter().map(|row| row.state.clone()).collect::<Vec<_>>();
+    let device_decode = network.device_decode_on();
+    let budgets = rows
+        .iter()
+        .map(|row| (row.max_tokens, row.quota))
+        .collect::<Vec<_>>();
+    let result = (|| loop {
+        let mut joint_rows = rows
+            .iter_mut()
+            .map(|row| NemotronRnntBatchRow {
+                projection: &row.artifact.projection,
+                encoded_len: row.artifact.encoded_len,
+                state: &mut row.state.rnnt,
+            })
+            .collect::<Vec<_>>();
+        // Many joint steps per readback on CUDA; else one.
+        let emitted = if device_decode {
+            network.rnnt_dispatch_batch(&mut joint_rows, &budgets, network::DEVICE_DECODE_STEPS)?
+        } else {
+            network
+                .rnnt_joint_step_batch(&mut joint_rows)?
+                .iter()
+                .any(Option::is_some)
+        };
+        drop(joint_rows);
+        let mut steps = Vec::with_capacity(rows.len());
+        for row in rows.iter_mut() {
+            let state = &mut *row.state;
+            let decode = |ids: &[usize]| Ok(decode_text(ids));
+            let mut delta = state.detokenizer.step(state.rnnt.token_ids(), decode)?;
+            let tokens = state.rnnt.token_ids().len();
+            let encoded_len = row.artifact.encoded_len;
+            // Every frame emitting `max_symbols` labels exhausts the input as
+            // surely as the cursor passing its end does.
+            let exhausted = state.rnnt.cursor() >= encoded_len
+                || tokens >= encoded_len.saturating_mul(max_symbols);
+            let budget_reached = !exhausted && tokens >= row.max_tokens.max(1);
+            if budget_reached {
+                state.stop_reason = Some("max_tokens");
+            }
+            state.finished = exhausted || budget_reached;
+            if state.finished {
+                delta.push_str(&state.detokenizer.finish(state.rnnt.token_ids(), decode)?);
+            }
+            state.assembled.push_str(&delta);
+            steps.push(NemotronRetainedDecodeStep {
+                delta,
+                text: state.assembled.clone(),
+                tokens_generated: tokens,
+                finished: state.finished,
+            });
+        }
+        if emitted || steps.iter().any(|step| step.finished) {
+            break Ok(steps);
+        }
+    })();
+    if result.is_err() {
+        for (row, checkpoint) in rows.iter_mut().zip(checkpoints) {
+            *row.state = checkpoint;
+        }
+    }
+    result
+}
+
+/// Upper bound on the labels RNNT greedy decoding can emit: at most
+/// `max_symbols` per encoder frame, so `E × max_symbols` bounds every
+/// transcript of this input.
+pub(crate) fn nemotron_max_emittable_tokens(
+    encoded_len: usize,
+    max_symbols: usize,
+) -> Result<usize> {
+    if encoded_len == 0 {
+        return Err(Error::InvalidInput(
+            "Nemotron audio encodes to no encoder frame".into(),
+        ));
+    }
+    encoded_len
+        .checked_mul(max_symbols.max(1))
+        .ok_or_else(|| Error::Overloaded("Nemotron decode budget overflowed".into()))
+}
+
 #[derive(Debug, Clone)]
 struct NemotronDecodeRequest {
     samples: usize,
@@ -2037,6 +2328,7 @@ impl NemotronAsrModel {
             nemo::nemotron_native_artifacts_complete(model_dir, variant),
         );
 
+        network.check_device_decode();
         Ok(Self {
             variant,
             artifacts,
@@ -2145,6 +2437,215 @@ impl NemotronAsrModel {
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
         Some(DEFAULT_MAX_AUDIO_SECONDS_HINT)
+    }
+
+    /// Labels RNNT greedy decoding may emit per encoder frame.
+    pub(crate) fn max_symbols_per_frame(&self) -> usize {
+        self.network.realtime_state_shape().max_symbols_per_frame
+    }
+
+    /// Resolves the prompt, resamples the audio to 16 kHz and computes its
+    /// log-mel on the host, so a request's device job runs only the encoder.
+    pub(crate) fn prepare_host_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<NemotronHostFeatures> {
+        let request = self.prepare_decode_request(audio, sample_rate, language, prompt)?;
+        let prompt_id = self.network.prompt_id(&request.prompt.target_lang)?;
+        let started = Instant::now();
+        let audio_16khz = if request.input_sample_rate == request.target_sample_rate {
+            audio.to_vec()
+        } else {
+            resample_linear(audio, request.input_sample_rate, request.target_sample_rate)
+        };
+        let resampled_samples = audio_16khz.len();
+        let mel = self.network.compute_host_mel(&audio_16khz)?;
+        drop(audio_16khz);
+        Ok(NemotronHostFeatures {
+            mel,
+            prompt: request.prompt,
+            prompt_id,
+            input_samples: audio.len(),
+            input_sample_rate: sample_rate,
+            resampled_samples,
+            feature_ms: duration_ms(started.elapsed()),
+        })
+    }
+
+    /// Encodes one request's host features alone, as the offline decode
+    /// encodes its audio. `checkpoint` runs before the encode.
+    pub(crate) fn encode_host_features(
+        &self,
+        features: &NemotronHostFeatures,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<NemotronPreparedEncoderArtifact> {
+        checkpoint()?;
+        let started = Instant::now();
+        let input = self.encoder_batch_input(features)?;
+        let projection = self
+            .network
+            .encode_projection_batch(std::slice::from_ref(&input))?
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Nemotron encode returned no row".into()))?;
+        features.artifact(projection, duration_ms(started.elapsed()), 1)
+    }
+
+    /// Encodes the rows of one preparation batch. A single row runs
+    /// [`Self::encode_host_features`]; wider batches encode as one padded
+    /// batch. A row whose checkpoint fails before the encode fails alone;
+    /// an encoder error fails the batch.
+    pub(crate) fn prepare_retained_encoder_batch(
+        &self,
+        rows: &[NemotronEncoderBatchRow<'_>],
+    ) -> Result<Vec<Result<NemotronPreparedEncoderArtifact>>> {
+        if let [row] = rows {
+            return match self.encode_host_features(row.features, row.checkpoint) {
+                Ok(artifact) => Ok(vec![Ok(artifact)]),
+                Err(error @ (Error::Cancelled(_) | Error::Timeout(_))) => Ok(vec![Err(error)]),
+                Err(error) => Err(error),
+            };
+        }
+        let mut outcomes = rows
+            .iter()
+            .map(|row| (row.checkpoint)().err().map(Err))
+            .collect::<Vec<Option<Result<NemotronPreparedEncoderArtifact>>>>();
+        let live = (0..rows.len())
+            .filter(|index| outcomes[*index].is_none())
+            .collect::<Vec<_>>();
+        if let [index] = live[..] {
+            let row = &rows[index];
+            outcomes[index] = Some(self.encode_host_features(row.features, row.checkpoint));
+        } else if !live.is_empty() {
+            let started = Instant::now();
+            let inputs = live
+                .iter()
+                .map(|index| self.encoder_batch_input(rows[*index].features))
+                .collect::<Result<Vec<_>>>()?;
+            let projections = self.network.encode_projection_batch(&inputs)?;
+            drop(inputs);
+            let encode_ms = duration_ms(started.elapsed());
+            if projections.len() != live.len() {
+                return Err(Error::InferenceError(
+                    "Nemotron encoder batch returned the wrong row count".into(),
+                ));
+            }
+            for (index, projection) in live.iter().zip(projections) {
+                outcomes[*index] = Some(rows[*index].features.artifact(
+                    projection,
+                    encode_ms,
+                    live.len(),
+                ));
+            }
+        }
+        Ok(outcomes
+            .into_iter()
+            .map(|outcome| outcome.expect("every Nemotron batch row has an outcome"))
+            .collect())
+    }
+
+    /// Starts the retained decodes of `artifacts` with one predictor call.
+    pub(crate) fn start_retained_decode_batch(
+        &self,
+        artifacts: &[&NemotronPreparedEncoderArtifact],
+    ) -> Result<Vec<NemotronRetainedDecodeState>> {
+        start_retained_decode_rows(&self.network, artifacts)
+    }
+
+    pub(crate) const fn retained_decode_finished(state: &NemotronRetainedDecodeState) -> bool {
+        state.finished
+    }
+
+    /// One scheduler step of retained decodes; see
+    /// [`retained_decode_step_rows`].
+    /// Tokens per row and engine step the retained decode asks the
+    /// scheduler for: the device decode quantum while its dispatches run
+    /// (CUDA), else one (the eager step emits at most one).
+    pub(crate) fn decode_quantum(&self) -> usize {
+        if self.network.device_decode_on() {
+            crate::kernels::transducer_greedy::device_decode_quantum()
+        } else {
+            1
+        }
+    }
+
+    pub(crate) fn retained_decode_step_batch(
+        &self,
+        rows: &mut [NemotronRetainedDecodeBatchRow<'_>],
+    ) -> Result<Vec<NemotronRetainedDecodeStep>> {
+        retained_decode_step_rows(&self.network, &|ids| self.decoder.decode(ids), rows)
+    }
+
+    /// The transcription of a finished retained decode.
+    pub(crate) fn retained_decode_output(
+        &self,
+        artifact: &NemotronPreparedEncoderArtifact,
+        state: &NemotronRetainedDecodeState,
+    ) -> NemotronAsrTranscriptionOutput {
+        let mut diagnostics = json!({
+            "audio": {
+                "input_sample_rate": artifact.input_sample_rate,
+                "target_sample_rate": self.runtime_plan.sample_rate,
+                "input_samples": artifact.input_samples,
+                "resampled_samples": artifact.resampled_samples,
+                "acoustic_frames": artifact.feature_frames,
+            },
+            "encode": {
+                "feature_frames": artifact.feature_frames,
+                "encoded_frames": artifact.encoded_len,
+                "encoder_batch_rows": artifact.batch_rows,
+                "encoder_graphs": self.network.encoder_graphs_diagnostics(),
+                "cuda_relpos_attention": crate::kernels::relpos_attention::diagnostics(
+                    self.network.device(),
+                ),
+            },
+            "cuda_transducer_decode": {
+                "path": if self.network.device_decode_on() {
+                    "device"
+                } else {
+                    "readback per joint step"
+                },
+                "reason": crate::kernels::transducer_greedy::eager_reason(self.network.device())
+                    .or_else(|| network::NemotronNetwork::dispatch_reason(self.network.device())),
+                "decode_quantum": self.decode_quantum(),
+                "graphs": self.network.decode_graphs_diagnostics(),
+            },
+            "prompt": artifact.prompt.diagnostics(),
+            "prompt_id": artifact.prompt_id,
+            "blank_id": self.network.blank_idx(),
+            "dtype_plan": nemotron_dtype_diagnostics(&self.dtype_selection, &self.device_profile, self.network.dtype(), &self.weight_precision),
+            "native_forward_status": "enabled_offline_fastconformer_rnnt",
+            "decode_mode": "retained_continuous",
+            "decode": state.rnnt.stats().diagnostics(),
+            "timings_ms": {
+                "mel_prepare": artifact.feature_ms,
+                "audio_encode": artifact.encode_ms,
+                "encode_ms": artifact.encode_ms,
+                "detokenized_tokens": state.detokenizer.decoded_tokens(),
+            },
+            "supports_realtime_cache_decode": true,
+        });
+        if let Some(stop_reason) = state.stop_reason {
+            diagnostics["stop_reason"] = stop_reason.into();
+        }
+        NemotronAsrTranscriptionOutput {
+            text: state.assembled.clone(),
+            language: Some(artifact.prompt.target_lang.clone()),
+            diagnostics: Some(diagnostics),
+        }
+    }
+
+    fn encoder_batch_input(
+        &self,
+        features: &NemotronHostFeatures,
+    ) -> Result<NemotronEncoderBatchInput> {
+        Ok(NemotronEncoderBatchInput {
+            features: self.network.upload_host_mel(&features.mel)?,
+            valid_frames: features.mel.valid_frames(),
+            prompt_id: features.prompt_id,
+        })
     }
 
     /// Stateless streaming encoder — no decoder prompt to budget.
@@ -3439,16 +3940,16 @@ mod tests {
         let cuda_f16 = test_device_profile(DeviceKind::Cuda, false, true);
         let cuda_f32 = test_device_profile(DeviceKind::Cuda, false, false);
 
-        let selection = select_nemotron_asr_dtype(&cuda_bf16, None).unwrap();
+        // CUDA keeps F32 by default (BF16 encoder batches were batch-variant
+        // on the H100); a BF16 override still applies where it is supported.
+        for profile in [&cuda_bf16, &cuda_f16, &cuda_f32] {
+            assert_eq!(
+                select_nemotron_asr_dtype(profile, None).unwrap().dtype,
+                DType::F32
+            );
+        }
+        let selection = select_nemotron_asr_dtype(&cuda_bf16, Some("bf16")).unwrap();
         assert_eq!(selection.dtype, DType::BF16);
-        assert_eq!(
-            select_nemotron_asr_dtype(&cuda_f16, None).unwrap().dtype,
-            DType::F16
-        );
-        assert_eq!(
-            select_nemotron_asr_dtype(&cuda_f32, None).unwrap().dtype,
-            DType::F32
-        );
 
         let diagnostics = nemotron_dtype_diagnostics(
             &selection,
@@ -4335,5 +4836,286 @@ mod tests {
             .all(|events| events.iter().any(|event| !event.text.is_empty())));
         assert_eq!(together[0], solo[0], "test.wav pushed with fox.wav");
         assert_eq!(together[1], solo[1], "fox.wav pushed with test.wav");
+    }
+
+    use super::network::tests::{
+        hashed_rnnt_network, hashed_tensor, joint_encoder_projection, rnnt_test_network,
+    };
+
+    fn rnnt_text(ids: &[usize]) -> String {
+        ids.iter().map(|id| format!("<{id}>")).collect()
+    }
+
+    /// The artifact of hashed encoder frames `[1, len, D]` (seed `seed`).
+    fn rnnt_artifact(
+        network: &NemotronNetwork,
+        seed: u32,
+        len: usize,
+    ) -> (Tensor, NemotronPreparedEncoderArtifact) {
+        let encoded = hashed_tensor(seed, (1, len, 1024), 1.0);
+        let projection = joint_encoder_projection(network, &encoded);
+        let artifact = NemotronPreparedEncoderArtifact {
+            projection,
+            encoded_len: len,
+            input_samples: len * 1280,
+            input_sample_rate: SAMPLE_RATE,
+            resampled_samples: len * 1280,
+            feature_frames: len * 8,
+            prompt: NemotronPromptCondition::resolve(None, None).unwrap(),
+            prompt_id: 0,
+            feature_ms: 0.0,
+            encode_ms: 0.0,
+            batch_rows: 1,
+        };
+        (encoded, artifact)
+    }
+
+    /// Runs retained decodes to the end, stepping only unfinished rows as
+    /// the scheduler does, and returns each row's state, streamed text and
+    /// the steps it took.
+    fn run_retained(
+        network: &NemotronNetwork,
+        artifacts: &[&NemotronPreparedEncoderArtifact],
+        max_tokens: &[usize],
+    ) -> (Vec<NemotronRetainedDecodeState>, Vec<String>, Vec<usize>) {
+        run_retained_at(network, artifacts, max_tokens, 1)
+    }
+
+    /// [`run_retained`] with a quota of `quota` tokens per row and step.
+    fn run_retained_at(
+        network: &NemotronNetwork,
+        artifacts: &[&NemotronPreparedEncoderArtifact],
+        max_tokens: &[usize],
+        quota: usize,
+    ) -> (Vec<NemotronRetainedDecodeState>, Vec<String>, Vec<usize>) {
+        let mut states = start_retained_decode_rows(network, artifacts).unwrap();
+        let mut streamed = vec![String::new(); states.len()];
+        let mut steps_taken = vec![0usize; states.len()];
+        loop {
+            let live = (0..states.len())
+                .filter(|row| !states[*row].finished)
+                .collect::<Vec<_>>();
+            if live.is_empty() {
+                break;
+            }
+            let before = live
+                .iter()
+                .map(|row| states[*row].rnnt.token_ids().len())
+                .collect::<Vec<_>>();
+            let mut rows = states
+                .iter_mut()
+                .enumerate()
+                .filter(|(_, state)| !state.finished)
+                .map(|(row, state)| NemotronRetainedDecodeBatchRow {
+                    artifact: artifacts[row],
+                    state,
+                    max_tokens: max_tokens[row],
+                    quota,
+                })
+                .collect::<Vec<_>>();
+            let steps = retained_decode_step_rows(network, &rnnt_text, &mut rows).unwrap();
+            drop(rows);
+            assert_eq!(steps.len(), live.len());
+            for ((row, step), before) in live.iter().zip(steps).zip(before) {
+                // A step emits at most its quota of labels per row.
+                assert!(step.tokens_generated <= before + quota);
+                assert_eq!(step.tokens_generated, states[*row].rnnt.token_ids().len());
+                assert_eq!(step.finished, states[*row].finished);
+                streamed[*row].push_str(&step.delta);
+                assert_eq!(step.text, streamed[*row]);
+                steps_taken[*row] += 1;
+            }
+        }
+        (states, streamed, steps_taken)
+    }
+
+    /// Retained rows of different lengths, stepped together, decode every
+    /// row's tokens and stats exactly as the greedy decode of that row
+    /// alone: blanks, emissions and guard exits at `max_symbols`.
+    #[test]
+    fn retained_decode_rows_match_the_greedy_decode_of_each_row() {
+        let network = hashed_rnnt_network(6, 2, 0.4);
+        let rows = [(11u32, 9usize), (12, 4), (13, 17), (14, 1)]
+            .into_iter()
+            .map(|(seed, len)| rnnt_artifact(&network, seed, len))
+            .collect::<Vec<_>>();
+        let artifacts = rows
+            .iter()
+            .map(|(_, artifact)| artifact)
+            .collect::<Vec<_>>();
+        let (states, streamed, _) = run_retained(&network, &artifacts, &[usize::MAX; 4]);
+        let (mut blanks, mut emitted, mut guards) = (0, 0, 0);
+        for ((encoded, artifact), (state, streamed)) in
+            rows.iter().zip(states.iter().zip(&streamed))
+        {
+            let solo = network
+                .decode_rnnt_greedy(encoded, artifact.encoded_len, &mut |_| {})
+                .unwrap();
+            assert_eq!(state.rnnt.token_ids(), solo.token_ids.as_slice());
+            assert_eq!(state.rnnt.stats(), &solo.stats);
+            assert_eq!(streamed, &rnnt_text(&solo.token_ids));
+            assert_eq!(state.assembled, *streamed);
+            assert_eq!(state.stop_reason, None);
+            blanks += solo.stats.blank_frames;
+            emitted += solo.stats.emitted_tokens;
+            guards += solo.stats.guard_exits;
+        }
+        // The fixture exercises every RNNT transition.
+        assert!(
+            blanks > 0 && emitted > 0 && guards > 0,
+            "{blanks} {emitted} {guards}"
+        );
+    }
+
+    /// The retained RNNT dispatches of many joint steps, with the select
+    /// step on the host, decode every row as the eager step does: the same
+    /// tokens, stats and text, across window boundaries (a 24-frame row;
+    /// windows hold 16), a token budget, and quotas of one and three.
+    #[test]
+    fn device_dispatches_match_the_eager_retained_decode() {
+        let network = hashed_rnnt_network(6, 2, 0.4);
+        let rows = [(31u32, 9usize), (32, 4), (33, 24), (34, 1)]
+            .into_iter()
+            .map(|(seed, len)| rnnt_artifact(&network, seed, len))
+            .collect::<Vec<_>>();
+        let artifacts = rows
+            .iter()
+            .map(|(_, artifact)| artifact)
+            .collect::<Vec<_>>();
+        let budgets = [usize::MAX, 2, usize::MAX, usize::MAX];
+        let (eager, eager_text, _) = run_retained(&network, &artifacts, &budgets);
+        assert!(
+            eager
+                .iter()
+                .map(|state| state.rnnt.token_ids().len())
+                .sum::<usize>()
+                > 10
+        );
+        for quota in [1, 3] {
+            use super::network::tests::DEVICE_DECODE_ON_THE_HOST;
+            DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(true));
+            let (dispatched, text, _) = run_retained_at(&network, &artifacts, &budgets, quota);
+            DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(false));
+            for (row, (eager, dispatched)) in eager.iter().zip(&dispatched).enumerate() {
+                assert_eq!(
+                    eager.rnnt.token_ids(),
+                    dispatched.rnnt.token_ids(),
+                    "row {row}"
+                );
+                let (mut eager_stats, mut stats) =
+                    (eager.rnnt.stats().clone(), dispatched.rnnt.stats().clone());
+                // The host form reads back once per joint step, as eager does.
+                assert_eq!(eager_stats.joint_steps, stats.joint_steps, "row {row}");
+                eager_stats.device_argmax_reads = 0;
+                eager_stats.host_argmax_reads = 0;
+                stats.device_argmax_reads = 0;
+                stats.host_argmax_reads = 0;
+                assert_eq!(eager_stats, stats, "row {row}, quota {quota}");
+                assert_eq!(eager.stop_reason, dispatched.stop_reason);
+            }
+            assert_eq!(eager_text, text);
+        }
+    }
+
+    /// A label every frame emits `max_symbols` labels per frame and guard
+    /// exits each frame; all-blank decodes take no step per frame.
+    #[test]
+    fn retained_decode_forced_emissions_and_blanks_match_the_greedy_decode() {
+        for (bias, max_symbols) in [
+            (vec![0.0, 2.0, 1.0, -1.0], 3usize),
+            (vec![0.0, 1.0, 0.5, 4.0], 2),
+        ] {
+            let network = rnnt_test_network(bias, max_symbols);
+            let rows = [(21u32, 5usize), (22, 2)]
+                .into_iter()
+                .map(|(seed, len)| rnnt_artifact(&network, seed, len))
+                .collect::<Vec<_>>();
+            let artifacts = rows
+                .iter()
+                .map(|(_, artifact)| artifact)
+                .collect::<Vec<_>>();
+            let (states, _, steps) = run_retained(&network, &artifacts, &[usize::MAX; 2]);
+            for ((encoded, artifact), state) in rows.iter().zip(&states) {
+                let solo = network
+                    .decode_rnnt_greedy(encoded, artifact.encoded_len, &mut |_| {})
+                    .unwrap();
+                assert_eq!(state.rnnt.token_ids(), solo.token_ids.as_slice());
+                assert_eq!(state.rnnt.stats(), &solo.stats);
+            }
+            if states[0].rnnt.token_ids().is_empty() {
+                // Blank frames cost no step: the first step ends when the
+                // short row finishes, the second finishes the long one.
+                assert_eq!(steps, [2, 1]);
+            } else {
+                assert_eq!(states[0].rnnt.stats().guard_exits, 5);
+                assert_eq!(states[0].rnnt.token_ids(), vec![1; 5 * max_symbols]);
+            }
+        }
+    }
+
+    /// A row stops at its decode budget with the greedy decode's first
+    /// tokens and "max_tokens", while its peers decode to the end.
+    #[test]
+    fn retained_decode_stops_at_max_tokens() {
+        let network = hashed_rnnt_network(6, 2, 0.4);
+        let rows = [(13u32, 17usize), (11, 9)]
+            .into_iter()
+            .map(|(seed, len)| rnnt_artifact(&network, seed, len))
+            .collect::<Vec<_>>();
+        let artifacts = rows
+            .iter()
+            .map(|(_, artifact)| artifact)
+            .collect::<Vec<_>>();
+        let solo = rows
+            .iter()
+            .map(|(encoded, artifact)| {
+                network
+                    .decode_rnnt_greedy(encoded, artifact.encoded_len, &mut |_| {})
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(solo[0].token_ids.len() > 3);
+        let (states, streamed, _) = run_retained(&network, &artifacts, &[3, usize::MAX]);
+        assert_eq!(states[0].rnnt.token_ids(), &solo[0].token_ids[..3]);
+        assert_eq!(states[0].stop_reason, Some("max_tokens"));
+        assert_eq!(streamed[0], rnnt_text(&solo[0].token_ids[..3]));
+        assert_eq!(states[1].rnnt.token_ids(), solo[1].token_ids.as_slice());
+        assert_eq!(states[1].stop_reason, None);
+    }
+
+    /// An error part-way through a step restores every row of the step, so
+    /// blank frames the step had already consumed are decoded again.
+    #[test]
+    fn retained_decode_error_rolls_every_row_back() {
+        let network = rnnt_test_network(vec![0.0, 1.0, 0.5, 4.0], 2);
+        let (_, healthy) = rnnt_artifact(&network, 31, 5);
+        let (_, mut truncated) = rnnt_artifact(&network, 32, 3);
+        // Claims more frames than it holds: the fourth joint step fails.
+        truncated.encoded_len = 6;
+        let artifacts = [&healthy, &truncated];
+        let mut states = start_retained_decode_rows(&network, &artifacts).unwrap();
+        let before = states.clone();
+        let mut rows = states
+            .iter_mut()
+            .zip(artifacts)
+            .map(|(state, artifact)| NemotronRetainedDecodeBatchRow {
+                artifact,
+                state,
+                max_tokens: usize::MAX,
+                quota: 1,
+            })
+            .collect::<Vec<_>>();
+        assert!(retained_decode_step_rows(&network, &rnnt_text, &mut rows).is_err());
+        drop(rows);
+        for (after, before) in states.iter().zip(&before) {
+            assert_eq!(after.rnnt.cursor(), 0);
+            assert_eq!(after.rnnt.cursor(), before.rnnt.cursor());
+            assert_eq!(after.rnnt.stats(), before.rnnt.stats());
+            assert_eq!(after.rnnt.token_ids(), before.rnnt.token_ids());
+            assert!(!after.finished);
+        }
+        // The healthy row alone decodes as before.
+        let (states, _, _) = run_retained(&network, &[&healthy], &[usize::MAX]);
+        assert_eq!(states[0].rnnt.stats().blank_frames, 5);
     }
 }

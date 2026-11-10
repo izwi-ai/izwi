@@ -122,14 +122,30 @@ impl AttentionMixer {
 
     /// Projects `h` `[n, hidden]` to `(q [n, heads, d], k, v [n, kv, d])`.
     pub fn project(&self, h: &Tensor, pass: Pass) -> Result<(Tensor, Tensor, Tensor)> {
+        self.project_with(h, |linear, h| linear.forward(h, pass))
+    }
+
+    /// [`Self::project`] of several rows' spans packed into `h` (row `r`'s
+    /// `lengths[r]` tokens in turn), each row through the kernels its span
+    /// alone takes.
+    pub fn project_packed(
+        &self,
+        h: &Tensor,
+        lengths: &[usize],
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        self.project_with(h, |linear, h| linear.forward_rows(h, lengths, false))
+    }
+
+    fn project_with(
+        &self,
+        h: &Tensor,
+        forward: impl Fn(&NtLinear, &Tensor) -> Result<Tensor>,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let a = self.config;
         let n = h.dim(0)?;
-        let q = self
-            .q_proj
-            .forward(h, pass)?
-            .reshape((n, a.heads, a.head_dim))?;
-        let mut k = self.k_proj.forward(h, pass)?;
-        let mut v = self.v_proj.forward(h, pass)?;
+        let q = forward(&self.q_proj, h)?.reshape((n, a.heads, a.head_dim))?;
+        let mut k = forward(&self.k_proj, h)?;
+        let mut v = forward(&self.v_proj, h)?;
         if let Some((k_scale, v_scale)) = self.kv_scales {
             // vllm-fp8: K and V round-trip through the FP8 KV cache.
             let round_trip = |t: &Tensor, scale: f32| -> Result<Tensor> {
@@ -178,5 +194,10 @@ impl AttentionMixer {
 
     pub fn output(&self, attended: &Tensor, pass: Pass) -> Result<Tensor> {
         self.o_proj.forward(attended, pass)
+    }
+
+    /// [`Self::output`] of packed spans, as [`Self::project_packed`].
+    pub fn output_packed(&self, attended: &Tensor, lengths: &[usize]) -> Result<Tensor> {
+        self.o_proj.forward_rows(attended, lengths, false)
     }
 }

@@ -5,8 +5,8 @@ use crate::catalog::ModelFamily;
 use crate::engine::InvocationPagedKvLease;
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::{
-    PhysicalTtsManagedQuantumCheckpoint, PhysicalTtsPrefillManagedCheckpoint, TalkerPhysicalCache,
-    TtsGenerationParams, TtsStreamingConfig,
+    PhysicalTtsManagedQuantumCheckpoint, PhysicalTtsPrefillManagedCheckpoint, Qwen3TtsModel,
+    TalkerPhysicalCache, TtsGenerationParams, TtsStreamingConfig,
 };
 
 use super::super::request::EngineCoreRequest;
@@ -290,6 +290,37 @@ fn validate_qwen_tts_physical_bindings(
     Ok(())
 }
 
+/// Whether a Qwen3-TTS request decodes its audio in the audio stage: its
+/// loaded contract has one (`IZWI_QWEN3_TTS_AUDIO_STAGE` on).
+fn qwen_tts_codec_deferred(request: &EngineCoreRequest) -> bool {
+    request.execution_adapter_binding().is_some_and(|binding| {
+        binding
+            .stages
+            .iter()
+            .any(|stage| stage.selector == crate::engine::StageWorkSelector::SequenceAudioDecode)
+    })
+}
+
+/// A Qwen3-TTS decode quantum's result: the row continues decoding, or,
+/// with `audio_due`, yields to the audio stage. A row that ended on a
+/// terminal frame (EOS, no talker token) commits none of the token its
+/// quantum reserved.
+fn qwen_tts_decode_result(output: ExecutorOutput, audio_due: bool) -> ModelSessionResult {
+    if !audio_due {
+        return ModelSessionResult::sequence(output);
+    }
+    let appended = output.tokens_processed;
+    let result = ModelSessionResult::yielded(
+        output,
+        crate::engine::YieldReason::AwaitingAudioDecode { max_frames: 1 },
+    );
+    if appended == 0 {
+        result.with_managed_cache_append(0)
+    } else {
+        result
+    }
+}
+
 fn qwen_tts_decode_iterations(scheduled: &ScheduledRequest) -> usize {
     if scheduled.is_prefill {
         0
@@ -345,6 +376,18 @@ fn late_cancelled_tts_rows(cancelled: &[bool], checkpoint_armed: &[bool]) -> Vec
         .enumerate()
         .filter_map(|(row, (cancelled, armed))| (*cancelled && *armed).then_some(row))
         .collect()
+}
+
+/// The phase times one continuous TTS step adds to its request: the step's
+/// sampling and codec milliseconds, which the engine sums into the
+/// request's latency breakdown (`X-Izwi-Tts-Diagnostics`). Nothing else:
+/// the engine times the decode step itself, and prefill reported its own.
+fn continuous_tts_step_timing(sampling_ms: f64, codec_ms: f64) -> ExecutorPhaseTiming {
+    ExecutorPhaseTiming {
+        sampling_ms: Some(sampling_ms),
+        codec_ms: Some(codec_ms),
+        ..ExecutorPhaseTiming::default()
+    }
 }
 
 fn continuous_tts_model_call(
@@ -2704,6 +2747,8 @@ impl NativeExecutor {
             }
 
             state_lease.mark_dirty();
+            // A decode quantum that left audio for the audio stage.
+            let mut yields_audio = false;
             let execution = (|| -> Result<(
                 usize,
                 usize,
@@ -2760,9 +2805,11 @@ impl NativeExecutor {
                             QwenTtsPhysicalState::Prefill(state) => state,
                             _ => unreachable!("validated prefill transition"),
                         };
-                        active_state.state = QwenTtsPhysicalState::Decode(
-                            active_state.model.finish_physical_prefill(prefill)?,
-                        );
+                        let mut decode = active_state.model.finish_physical_prefill(prefill)?;
+                        if qwen_tts_codec_deferred(request) {
+                            decode.defer_codec_to_audio_stage()?;
+                        }
+                        active_state.state = QwenTtsPhysicalState::Decode(decode);
                     }
                     let timing = Some(ExecutorPhaseTiming {
                         normalization_ms: Some(active_state.normalization_ms),
@@ -2790,6 +2837,7 @@ impl NativeExecutor {
                     }
                 };
                 let mut finished = false;
+                let mut audio_due = false;
                 let mut stream_events = Vec::new();
                 for _ in 0..decode_iterations {
                     if request.is_cancelled() {
@@ -2824,6 +2872,15 @@ impl NativeExecutor {
                             .extend_from_slice(&step.samples);
                         stream_events.push((step.samples, false));
                     }
+                    // Audio for the audio stage ends the quantum; a finished
+                    // request then finalizes after it.
+                    audio_due = matches!(
+                        &active_state.state,
+                        QwenTtsPhysicalState::Decode(state) if state.audio_due()
+                    );
+                    if audio_due {
+                        break;
+                    }
                     if step.finished {
                         stream_events.push((Vec::new(), true));
                         finished = true;
@@ -2842,6 +2899,7 @@ impl NativeExecutor {
                 };
                 let accepted =
                     accepted_tts_talker_tokens(start_cursor, end_cursor, scheduled.num_tokens)?;
+                yields_audio = audio_due;
                 if let Some(tx) = stream_tx.as_ref() {
                     for (samples, is_final) in stream_events {
                         Self::stream_audio_with_policy(
@@ -2952,7 +3010,7 @@ impl NativeExecutor {
                 return Err(error);
             }
 
-            Ok(ModelSessionResult::sequence(ExecutorOutput {
+            let output = ExecutorOutput {
                 request_id: request.id.clone(),
                 audio: Some(AudioOutput::new(finished_samples, 24_000)),
                 text: None,
@@ -2964,8 +3022,9 @@ impl NativeExecutor {
                 asr_diagnostics: None,
                 error: None,
                 logprobs: Vec::new(),
-            })
-            .with_managed_cache_completions(managed_cache_completions))
+            };
+            Ok(qwen_tts_decode_result(output, yields_audio)
+                .with_managed_cache_completions(managed_cache_completions))
         }
     }
 
@@ -3792,6 +3851,12 @@ impl NativeExecutor {
                     .expect("armed VibeVoice lease")
                     .require_state_mut()?;
                 let completions = active.state.take_managed_write_completions();
+                // Each row's tokenizer quantum completes its own selected
+                // clocked-state reservation, as a lone row's does.
+                let quantum = &quanta[row_index];
+                let clocked_state_completion = quantum
+                    .arena
+                    .seal_selected_completion(quantum.transaction)?;
                 active.state.commit_managed_quantum(checkpoint)?;
                 row.checkpoint = None;
                 let generated = step
@@ -3839,7 +3904,8 @@ impl NativeExecutor {
                         error: None,
                         logprobs: Vec::new(),
                     })
-                    .with_managed_cache_completions(completions),
+                    .with_managed_cache_completions(completions)
+                    .with_clocked_state_completion(clocked_state_completion),
                 );
             }
             batch.armed = false;
@@ -4162,11 +4228,15 @@ impl NativeExecutor {
                 )));
                 continue;
             }
-            let row_result = (|| -> Result<ModelSessionResult> {
+            let row_result = (|| -> Result<(ModelSessionResult, bool)> {
                 let active_state = active.rows[row].2.require_state_mut()?;
                 let QwenTtsPhysicalState::Decode(state) = &mut active_state.state else {
                     unreachable!("validated continuous Qwen3-TTS decode state")
                 };
+                // Audio for the audio stage: the row yields, and a finished
+                // request hands its audio over after the stage decodes it.
+                let audio_due = state.audio_due();
+                let done = step.finished && !audio_due;
                 if let Some(arena) = request
                     .managed_cache_runtime()
                     .and_then(|runtime| runtime.tensor_state())
@@ -4200,7 +4270,7 @@ impl NativeExecutor {
                         )?;
                     }
                 }
-                if step.finished {
+                if done {
                     if let Some(tx) = Self::stream_sender(request) {
                         Self::stream_final_marker_with_policy(
                             &tx,
@@ -4214,29 +4284,36 @@ impl NativeExecutor {
                     return Err(Error::Cancelled(request.id.clone()));
                 }
                 let completions = state.take_managed_write_completions();
-                let audio = if step.finished {
+                let audio = if done {
                     active_state.audio_samples_accum.clone()
                 } else {
                     Vec::new()
                 };
-                Ok(ModelSessionResult::sequence(ExecutorOutput {
+                let output = ExecutorOutput {
                     request_id: request.id.clone(),
                     audio: Some(AudioOutput::new(audio, 24_000)),
                     text: None,
                     input_transcription: None,
                     tokens_processed: accepted,
                     tokens_generated: accepted,
-                    finished: step.finished,
-                    phase_timing_override: None,
+                    finished: done,
+                    phase_timing_override: Some(continuous_tts_step_timing(
+                        step.sampling_ms,
+                        step.codec_ms,
+                    )),
                     asr_diagnostics: None,
                     error: None,
                     logprobs: Vec::new(),
-                })
-                .with_managed_cache_completions(completions))
+                };
+                Ok((
+                    qwen_tts_decode_result(output, audio_due)
+                        .with_managed_cache_completions(completions),
+                    done,
+                ))
             })();
             match row_result {
-                Ok(result) => {
-                    continuing[index] = !step.finished;
+                Ok((result, done)) => {
+                    continuing[index] = !done;
                     outputs[index] = Some(result);
                 }
                 Err(error) => {
@@ -4298,6 +4375,262 @@ impl NativeExecutor {
             })
             .collect()
     }
+
+    pub(super) fn qwen_tts_audio_request(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+    ) -> Result<ModelSessionResult> {
+        self.qwen_tts_audio_batch(&[request], std::slice::from_ref(scheduled))?
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Qwen3-TTS audio row lost its output".into()))
+    }
+
+    /// One audio quantum for each of several Qwen3-TTS requests: their due
+    /// codec frames decoded together, each request's samples streamed or
+    /// kept, and each request back to decoding, to another audio quantum
+    /// (a long finished request's audio takes several), or to finalization.
+    pub(super) fn qwen_tts_audio_batch(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+    ) -> Result<Vec<ModelSessionResult>> {
+        if requests.is_empty() || requests.len() != scheduled.len() {
+            return Err(Error::InvalidInput(
+                "Qwen3-TTS audio batch rows do not match".into(),
+            ));
+        }
+        let mut outputs = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
+        let mut rows = Vec::with_capacity(requests.len());
+        let mut model: Option<Arc<Qwen3TtsModel>> = None;
+        for (index, (request, scheduled)) in requests.iter().zip(scheduled).enumerate() {
+            if !matches!(
+                scheduled.work,
+                crate::engine::WorkUnit::SequenceAudioDecode { max_frames: 1 }
+            ) || scheduled.is_prefill
+                || scheduled.request_id != request.id
+            {
+                return Err(Error::InvalidInput(
+                    "Qwen3-TTS audio stage requires one audio-decode unit per request".into(),
+                ));
+            }
+            if request.is_cancelled() {
+                outputs[index] = Some(ModelSessionResult::cancelled_before_dispatch(
+                    ExecutorOutput::cancelled(request.id.clone()),
+                ));
+                continue;
+            }
+            let (row_model, lease) = self.checkout_qwen_tts_audio(request, scheduled)?;
+            match &model {
+                Some(model) if !Arc::ptr_eq(model, &row_model) => {
+                    return Err(Error::InvalidInput(
+                        "Qwen3-TTS audio batch crossed model identity".into(),
+                    ));
+                }
+                Some(_) => {}
+                None => model = Some(row_model),
+            }
+            rows.push((index, lease));
+        }
+        let Some(model) = model else {
+            return collect_qwen_tts_outputs(outputs);
+        };
+        let started = Instant::now();
+        // A failed quantum leaves every lease dirty: the requests' states
+        // are discarded with them.
+        for (_, lease) in &mut rows {
+            lease.mark_dirty();
+        }
+        let steps = {
+            let mut states = rows
+                .iter_mut()
+                .map(|(_, lease)| match &mut lease.require_state_mut()?.state {
+                    QwenTtsPhysicalState::Decode(state) => Ok(state),
+                    _ => Err(Error::InferenceError(
+                        "Qwen3-TTS audio quantum reached an unfinished prefill".into(),
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Self::run_blocking(|| model.tts_audio_decode_batch(&mut states))?
+        };
+        tracing::debug!(
+            rows = rows.len(),
+            frames = steps.iter().map(|step| step.frames).sum::<usize>(),
+            windows = steps.iter().map(|step| step.windows).sum::<usize>(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "Qwen3-TTS audio quantum"
+        );
+        for ((index, mut lease), step) in rows.into_iter().zip(steps) {
+            let request = requests[index];
+            if request.is_cancelled() {
+                // The dirty lease discards the decoded state.
+                outputs[index] = Some(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+                continue;
+            }
+            let active = lease.require_state_mut()?;
+            active.codec_ms += step.codec_ms;
+            if !step.samples.is_empty() {
+                if active.first_output_ms_since_start.is_none() {
+                    active.first_output_ms_since_start =
+                        Some(active.execution_started.elapsed().as_secs_f64() * 1000.0);
+                }
+                active.audio_samples_accum.extend_from_slice(&step.samples);
+                if let Some(tx) = Self::stream_sender(request) {
+                    Self::stream_audio_with_policy(
+                        &tx,
+                        request.stream_policy,
+                        &request.id,
+                        &mut active.stream_sequence,
+                        step.samples,
+                        24_000,
+                        false,
+                    )?;
+                }
+            }
+            let QwenTtsPhysicalState::Decode(state) = &active.state else {
+                unreachable!("validated Qwen3-TTS audio state")
+            };
+            let reason = if state.audio_due() {
+                crate::engine::YieldReason::AwaitingAudioDecode { max_frames: 1 }
+            } else if state.is_finished() {
+                crate::engine::YieldReason::AwaitingFinalization
+            } else {
+                crate::engine::YieldReason::QuantumExhausted
+            };
+            let timing = ExecutorPhaseTiming {
+                codec_ms: Some(step.codec_ms),
+                ..ExecutorPhaseTiming::default()
+            };
+            lease.mark_clean();
+            lease.restore()?;
+            outputs[index] = Some(ModelSessionResult::yielded(
+                ExecutorOutput {
+                    request_id: request.id.clone(),
+                    audio: Some(AudioOutput::empty(24_000)),
+                    text: None,
+                    input_transcription: None,
+                    tokens_processed: 0,
+                    tokens_generated: 0,
+                    finished: false,
+                    phase_timing_override: Some(timing),
+                    asr_diagnostics: None,
+                    error: None,
+                    logprobs: Vec::new(),
+                },
+                reason,
+            ));
+        }
+        collect_qwen_tts_outputs(outputs)
+    }
+
+    /// Hand a finished Qwen3-TTS request's audio over once the audio stage
+    /// has decoded all of it: the whole utterance, and for a stream its
+    /// end-of-stream marker.
+    pub(super) fn qwen_tts_finalize_request(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+    ) -> Result<ModelSessionResult> {
+        if !matches!(
+            scheduled.work,
+            crate::engine::WorkUnit::SequenceFinalize {
+                max_output_steps: 1
+            }
+        ) || scheduled.is_prefill
+        {
+            return Err(Error::InvalidInput(
+                "Qwen3-TTS finalization requires an exact sequence-finalize quantum".into(),
+            ));
+        }
+        if request.is_cancelled() {
+            return Err(Error::Cancelled(request.id.clone()));
+        }
+        let (_, mut lease) = self.checkout_qwen_tts_audio(request, scheduled)?;
+        let active = lease.require_state_mut()?;
+        let QwenTtsPhysicalState::Decode(state) = &active.state else {
+            return Err(Error::InferenceError(
+                "Qwen3-TTS finalization reached an unfinished prefill".into(),
+            ));
+        };
+        if !state.is_finished() || state.audio_due() || !state.audio_complete() {
+            return Err(Error::InferenceError(
+                "Qwen3-TTS finalization reached a request with audio left to decode".into(),
+            ));
+        }
+        if let Some(tx) = Self::stream_sender(request) {
+            Self::stream_final_marker_with_policy(
+                &tx,
+                request.stream_policy,
+                &request.id,
+                &mut active.stream_sequence,
+            )?;
+        }
+        let audio = std::mem::take(&mut active.audio_samples_accum);
+        lease.release()?;
+        Ok(ModelSessionResult::sequence(ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: Some(AudioOutput::new(audio, 24_000)),
+            text: None,
+            input_transcription: None,
+            tokens_processed: 0,
+            tokens_generated: 0,
+            finished: true,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+            logprobs: Vec::new(),
+        }))
+    }
+
+    /// The model and the request's decode state for an audio or
+    /// finalization quantum, fenced to the model that generated its frames.
+    fn checkout_qwen_tts_audio<'a>(
+        &'a self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+    ) -> Result<(
+        Arc<Qwen3TtsModel>,
+        ExecutorStateLease<'a, ActiveQwenTtsDecode>,
+    )> {
+        let variant = request.model_variant.ok_or_else(|| {
+            Error::InvalidInput("Qwen3-TTS audio request is missing its model variant".into())
+        })?;
+        if variant.family() != ModelFamily::Qwen3Tts {
+            return Err(Error::InvalidInput(
+                "foreign Qwen3-TTS audio request".into(),
+            ));
+        }
+        let model = request
+            .prepared_qwen_tts_model_for_executor()?
+            .ok_or_else(|| Error::InferenceError("Qwen3-TTS audio lost its model".into()))?;
+        let mut lease = ExecutorStateLease::checkout(
+            &self.qwen_tts_decode_states,
+            scheduled.session_key(),
+            variant,
+            "Qwen3-TTS audio",
+        )?;
+        let active = lease.require_state_mut()?;
+        if active.variant != Some(variant) || !Arc::ptr_eq(&active.model, &model) {
+            return Err(Error::InferenceError(
+                "Qwen3-TTS audio state crossed its model fence".into(),
+            ));
+        }
+        Ok((model, lease))
+    }
+}
+
+fn collect_qwen_tts_outputs(
+    outputs: Vec<Option<ModelSessionResult>>,
+) -> Result<Vec<ModelSessionResult>> {
+    outputs
+        .into_iter()
+        .map(|output| {
+            output
+                .ok_or_else(|| Error::InferenceError("Qwen3-TTS audio row lost its output".into()))
+        })
+        .collect()
 }
 
 /// Terminal conditions belong to one row, even when its device work shared a
@@ -4685,6 +5018,22 @@ mod tests {
         assert_eq!(accepted_tts_talker_tokens(17, 18, 1).unwrap(), 1);
         assert!(accepted_tts_talker_tokens(18, 17, 1).is_err());
         assert!(accepted_tts_talker_tokens(17, 19, 1).is_err());
+    }
+
+    /// A continuous TTS step reports its own sampling and codec time, which
+    /// the engine adds up per request (they were missing from every
+    /// continuously decoded Qwen3-TTS request's diagnostics), and leaves the
+    /// decode and prefill time the engine measures itself alone.
+    #[test]
+    fn continuous_tts_steps_report_their_sampling_and_codec_time() {
+        let timing = continuous_tts_step_timing(1.5, 42.0);
+        assert_eq!(timing.sampling_ms, Some(1.5));
+        assert_eq!(timing.codec_ms, Some(42.0));
+        assert_eq!(timing.decode_ms, None);
+        assert_eq!(timing.prefill_ms, None);
+        assert_eq!(timing.decode_steps, None);
+        assert_eq!(timing.prefill_steps, None);
+        assert_eq!(timing.first_output_ms_since_start, None);
     }
 
     #[test]

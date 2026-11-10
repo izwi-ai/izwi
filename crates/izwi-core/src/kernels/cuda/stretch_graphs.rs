@@ -29,6 +29,17 @@ use super::segment_graph::{SegmentGraph, SegmentInput};
 /// The global switch for every family's decode graphs (`cuda.decode_graphs`).
 const DECODE_GRAPHS_ENV: &str = "IZWI_CUDA_DECODE_GRAPHS";
 
+/// Whether `cuda.decode_graphs=off` (`IZWI_CUDA_DECODE_GRAPHS`) turns every
+/// family's decode graphs off.
+pub fn decode_graphs_switched_off() -> bool {
+    crate::env::value(DECODE_GRAPHS_ENV).is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false"
+        )
+    })
+}
+
 /// Widest step whose stretches are captured: both families' default CUDA
 /// width, which a busy server runs at. Each row count keeps its own graphs,
 /// with stable copies of its rows' recurrent states (about 46 MB a row for
@@ -96,12 +107,7 @@ impl StretchGraphs {
         if !crate::env::flag_or(switch, true) {
             return Err(format!("{switch} is off"));
         }
-        if crate::env::value(DECODE_GRAPHS_ENV).is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "off" | "0" | "false"
-            )
-        }) {
+        if decode_graphs_switched_off() {
             return Err("cuda.decode_graphs=off".into());
         }
         Ok(Self {
@@ -275,7 +281,7 @@ fn failed(
 }
 
 /// Whether `a` and `b` hold the same tensors bit for bit.
-fn bitwise(a: &[Tensor], b: &[Tensor]) -> std::result::Result<(), String> {
+pub(super) fn bitwise(a: &[Tensor], b: &[Tensor]) -> std::result::Result<(), String> {
     if a.len() != b.len() {
         return Err(format!("{} outputs against {}", b.len(), a.len()));
     }

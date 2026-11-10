@@ -163,12 +163,14 @@ latency and rejections. These are tooling tests, not model performance results.
 
 ## Runtime rollout controls
 
-`IZWI_FISH_NATIVE_BATCHING=true` opts a deployment into the native Fish batch
-path. It defaults to scalar execution until the exact GPU/provider profile is
-qualified. `false` selects the scalar path for newly loaded models. Changing the
-variable cannot resize a loaded adapter; drain and reload to change the profile.
-Unknown physical planning headroom also keeps the scalar path. Enabling this flag
-is an experimental rollout decision, not a hardware qualification result.
+`IZWI_FISH_NATIVE_BATCHING` selects the native Fish batch path. It is on by
+default on CUDA: one row at a time held an H100 at 2.4 audio-s/s from 1 to 64
+concurrent streams, every request queued behind the others, while batched rows
+keep each request's output identical to its solo output. CPU and Metal default to
+scalar execution. `false` selects the scalar path for newly loaded models and
+`true` opts other backends in. Changing the variable cannot resize a loaded
+adapter; drain and reload to change the profile. Unknown physical planning
+headroom also keeps the scalar path.
 
 At load, Fish derives a conservative row ceiling from authoritative free planning
 headroom after weight reconciliation, requested-context KV geometry (native for

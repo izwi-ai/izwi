@@ -27,9 +27,17 @@ fn shared_asr_ceiling_bounds_one_chunk_per_sequence() {
         1_938
     );
     assert_eq!(asr_sequence_ceiling(128, 13.0, -1.0, 768), 896);
-    assert_eq!(asr_automatic_context(65_536, 1_938, 8), (1_938, 15_504));
-    assert_eq!(asr_automatic_context(65_536, 1_938, 0), (1_938, 1_938));
-    assert_eq!(asr_automatic_context(1_024, 1_938, 8), (1_024, 1_024));
+    assert_eq!(asr_automatic_context(65_536, 1_938, 8, 1), (1_938, 15_504));
+    assert_eq!(asr_automatic_context(65_536, 1_938, 0, 1), (1_938, 1_938));
+    assert_eq!(asr_automatic_context(1_024, 1_938, 8, 1), (1_024, 1_024));
+    // In 64-token pages a 1,938-token sequence takes 31 pages.
+    assert_eq!(
+        asr_automatic_context(65_536, 1_938, 8, 64),
+        (1_938, 8 * 1_984)
+    );
+    assert_eq!(asr_pool_sequence_tokens(1_938, 64), 1_984);
+    assert_eq!(asr_pool_sequence_tokens(448, 64), 448);
+    assert_eq!(asr_pool_sequence_tokens(448, 0), 448);
 }
 
 #[test]
@@ -1265,6 +1273,310 @@ fn vibevoice_omitted_budget_is_admitted_at_the_ceiling_and_planned_by_duration()
     // The duration budget never exceeds what admission priced.
     auto.params.max_tokens = 700;
     assert_eq!(vibevoice_asr_planned_max_tokens(&auto, 60.0), 700);
+}
+
+#[test]
+fn nemotron_transcribe_omitted_budget_is_admitted_at_the_card_and_planned_by_duration() {
+    let transcribe = ModelVariant::Nemotron35Transcribe30BA4BFp8;
+    let mut auto = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(transcribe);
+    apply_asr_max_tokens(&mut auto, transcribe, None);
+    assert!(auto.asr_auto_max_tokens);
+    assert_eq!(auto.params.max_tokens, 16_384);
+    // 16 tokens a second and 64 more, at most the card's 16,384.
+    assert_eq!(nemotron_transcribe_asr_planned_max_tokens(&auto, 10.0), 224);
+    assert_eq!(nemotron_transcribe_asr_planned_max_tokens(&auto, 30.0), 544);
+    assert_eq!(
+        nemotron_transcribe_asr_planned_max_tokens(&auto, 600.0),
+        9_664
+    );
+    assert_eq!(
+        nemotron_transcribe_asr_planned_max_tokens(&auto, 3_600.0),
+        16_384
+    );
+    // A translation's budget is the same.
+    auto.asr_task.translate_to = Some("de".into());
+    assert_eq!(nemotron_transcribe_asr_planned_max_tokens(&auto, 30.0), 544);
+
+    let mut explicit = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(transcribe);
+    apply_asr_max_tokens(&mut explicit, transcribe, Some(16_384));
+    assert!(!explicit.asr_auto_max_tokens);
+    assert_eq!(
+        nemotron_transcribe_asr_planned_max_tokens(&explicit, 30.0),
+        16_384
+    );
+}
+
+/// The engine's full-request admission of retained ASR rows into one shared
+/// CPU pool of `pool_tokens` in the CUDA default's 64-token pages, with
+/// `(retained, staged)` tensor-state rows. A row claims its prompt and
+/// `max_tokens` in whole pages at its first prefill and holds one retained
+/// tensor row (as Transcribe's Mamba state and Qwen3-ASR's prepared input
+/// do) until its release. A one-head contract with a four-float tensor
+/// keeps the arena small: claims count pages and rows, not bytes.
+struct FullClaimPool {
+    manager: crate::engine::ManagedKvCacheManager,
+    runtime: std::sync::Arc<crate::engine::ManagedKvModelRuntime>,
+    plans: u64,
+}
+
+impl FullClaimPool {
+    fn new(pool_tokens: usize, (retained, staged): (u32, u32)) -> Self {
+        use crate::kv::v2::{
+            BoundedShape, CheckpointPolicy, KeyEncoding, PlacementPolicy, PrefixPolicy, ShapeAxis,
+            ShapeDimension, ShapeExtent, StateClock, StateComponentId, StateDType,
+            StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId, StateGroupSpec,
+            StateScope, TensorComponentSpec, TensorRole, TensorStateDomainSpec,
+        };
+        let mut contract = crate::kv::test_contract();
+        let StateDomainSpec::PagedAttention(domain) = &mut contract.domains[0] else {
+            panic!("the test contract is paged attention");
+        };
+        for layer in &mut domain.layers {
+            layer.query_heads = 1;
+            layer.kv_heads = 1;
+            layer.key_head_dim = 8;
+            layer.value_head_dim = 8;
+            layer.key_encoding = KeyEncoding::Rotary { rotary_dim: 8 };
+        }
+        contract
+            .domains
+            .push(StateDomainSpec::Tensor(TensorStateDomainSpec {
+                header: StateDomainHeader {
+                    id: StateDomainId::new(2),
+                    scope: StateScope::Retained,
+                    clock: StateClock::DecoderTokens,
+                    placement: PlacementPolicy::BackendLocalWithHostOffload,
+                    prefix: PrefixPolicy::Disabled,
+                    checkpoint: CheckpointPolicy::Transactional,
+                },
+                components: vec![TensorComponentSpec {
+                    id: StateComponentId::new(1),
+                    role: TensorRole::RecurrentHidden,
+                    shape: BoundedShape {
+                        dimensions: vec![ShapeDimension {
+                            axis: ShapeAxis::Hidden,
+                            extent: ShapeExtent::Fixed { value: 4 },
+                        }],
+                    },
+                    accepted_dtypes: vec![StateDType::F32],
+                }],
+            }));
+        contract.groups = vec![StateGroupSpec {
+            id: StateGroupId::new(1),
+            domains: vec![StateDomainId::new(1), StateDomainId::new(2)],
+            prefix_shareable: false,
+        }];
+        contract.validate().unwrap();
+        let mut manager = crate::engine::ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_model_state_with_capacity(
+                ModelInstanceId::new(7),
+                BackendKind::Cpu,
+                crate::engine::ManagedStateCapacityRequest {
+                    total_paged_pages: 1 << 20,
+                    logical_token_reach: Some(pool_tokens as u64),
+                    retained_sequence_rows: retained,
+                    staged_transaction_rows: staged,
+                },
+                64,
+                &contract,
+            )
+            .unwrap();
+        assert_eq!(runtime.plan().groups[0].page_tokens, 64);
+        Self {
+            manager,
+            runtime,
+            plans: 0,
+        }
+    }
+
+    fn session(row: usize) -> crate::engine::SessionKey {
+        crate::engine::SessionKey::new(format!("row-{row}"), 1)
+    }
+
+    /// Prefills `request`'s prompt as `row` and commits it; the row keeps
+    /// its claim and tensor row until [`Self::release`].
+    fn admit(&mut self, row: usize, request: &EngineCoreRequest) -> crate::error::Result<()> {
+        use crate::backends::state::{PhysicalStateTransactionId, StateComponentValue};
+        use crate::engine::{InputRange, SequencePhase, WorkUnit};
+        self.plans += 1;
+        let prompt = request.num_prompt_tokens();
+        let work = WorkUnit::SequenceStep {
+            phase: SequencePhase::Prefill,
+            input: InputRange {
+                start: 0,
+                end: prompt,
+            },
+            max_output_steps: prompt,
+            auxiliary_state: None,
+        };
+        let reservation = self
+            .manager
+            .prepare(
+                &self.runtime,
+                self.plans,
+                &Self::session(row),
+                &work,
+                Some(request),
+            )?
+            .expect("a managed reservation");
+        self.runtime.tensor_state().unwrap().stage_replace(
+            PhysicalStateTransactionId::new(self.plans)?,
+            crate::kv::v2::StateDomainId::new(2),
+            0,
+            prompt as u64,
+            vec![StateComponentValue {
+                component: crate::kv::v2::StateComponentId::new(1),
+                tensor: Some(candle_core::Tensor::zeros(
+                    4,
+                    candle_core::DType::F32,
+                    &candle_core::Device::Cpu,
+                )?),
+            }],
+        )?;
+        self.manager.finalize(
+            &reservation,
+            Some(&reservation.completed_write_receipt_for_test()),
+            true,
+        )
+    }
+
+    fn release(&mut self, row: usize) {
+        self.manager.release_session(&Self::session(row)).unwrap();
+    }
+
+    /// How many of `requests` are admitted in order before the first
+    /// refusal, and that refusal.
+    fn admit_all(
+        &mut self,
+        requests: &[EngineCoreRequest],
+    ) -> (usize, Option<crate::error::Error>) {
+        for (row, request) in requests.iter().enumerate() {
+            if let Err(error) = self.admit(row, request) {
+                return (row, Some(error));
+            }
+        }
+        (requests.len(), None)
+    }
+}
+
+/// An automatic Nemotron 3.5 Transcribe row of `prompt` tokens over
+/// `seconds` of audio, prepared as preparation prepares it (the card's
+/// budget when `plan` is false, as before).
+fn transcribe_row(prompt: usize, seconds: f32, plan: bool) -> EngineCoreRequest {
+    use crate::models::architectures::nemotron_transcribe::MAX_CONTEXT_TOKENS;
+    let transcribe = ModelVariant::Nemotron35Transcribe30BA4BFp8;
+    let mut request = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(transcribe);
+    apply_asr_max_tokens(&mut request, transcribe, None);
+    if plan {
+        request.params.max_tokens = nemotron_transcribe_asr_planned_max_tokens(&request, seconds);
+    }
+    request
+        .install_prepared_sequence_input_tokens(prompt, MAX_CONTEXT_TOKENS)
+        .unwrap();
+    request
+}
+
+/// Nemotron 3.5 Transcribe rows share one 65,536-token pool and claim their
+/// prompt and budget in full. The card's 16,384-token budget let three 30 s
+/// rows in (decode widths of about 3 at 8 and 32 streams on the H100); the
+/// planned budget admits 32, and 31 beside a 600 s row. A row that does not
+/// fit beside the others waits for one to finish; it never fails.
+#[test]
+fn nemotron_transcribe_pool_admits_32_automatic_30s_rows() {
+    use crate::models::architectures::nemotron_transcribe::MAX_CONTEXT_TOKENS;
+    let backpressure = |error: Option<crate::error::Error>| {
+        matches!(error, Some(crate::error::Error::Backpressure(_)))
+    };
+    // Prompts of the H100 matrix's 30 s (426-431 tokens) and 600 s (7,556)
+    // clips.
+    let short = || transcribe_row(431, 30.0, true);
+    let long = || transcribe_row(7_556, 600.0, true);
+    let row = short();
+    assert_eq!(row.num_prompt_tokens() + row.params.max_tokens, 975);
+
+    let rows = (0..32).map(|_| short()).collect::<Vec<_>>();
+    let mut pool = FullClaimPool::new(MAX_CONTEXT_TOKENS, (64, 64));
+    assert_eq!(pool.admit_all(&rows).0, 32);
+
+    // A 600 s row (17,220 tokens) and 31 short ones take 766 of 1,024
+    // pages; a second 600 s row waits until the first finishes.
+    let mut mixed = vec![long()];
+    mixed.extend((0..31).map(|_| short()));
+    let mut pool = FullClaimPool::new(MAX_CONTEXT_TOKENS, (64, 64));
+    assert_eq!(pool.admit_all(&mixed).0, 32);
+    assert!(backpressure(pool.admit(32, &long()).err()));
+    pool.release(0);
+    pool.admit(32, &long()).unwrap();
+
+    let card = (0..8)
+        .map(|_| transcribe_row(431, 30.0, false))
+        .collect::<Vec<_>>();
+    let (admitted, refusal) = FullClaimPool::new(MAX_CONTEXT_TOKENS, (8, 8)).admit_all(&card);
+    assert_eq!(admitted, 3);
+    assert!(backpressure(refusal));
+}
+
+/// A Nemotron 3.5 Transcribe load holds 8 retained rows on CUDA (its decode
+/// width; 8 more stage): a ninth concurrent request waits for a row instead
+/// of failing, and binds once a row is released.
+#[test]
+fn nemotron_transcribe_requests_beyond_the_rows_wait_for_one() {
+    use crate::models::architectures::nemotron_transcribe::MAX_CONTEXT_TOKENS;
+    let rows = (0..9)
+        .map(|_| transcribe_row(431, 30.0, true))
+        .collect::<Vec<_>>();
+    let mut pool = FullClaimPool::new(MAX_CONTEXT_TOKENS, (8, 8));
+    let (admitted, refusal) = pool.admit_all(&rows);
+    assert_eq!(admitted, 8);
+    assert!(
+        matches!(&refusal, Some(crate::error::Error::Backpressure(reason)) if reason.contains("sequence capacity")),
+        "{refusal:?}"
+    );
+    pool.release(3);
+    pool.admit(8, &rows[8]).unwrap();
+}
+
+/// Every automatic Qwen3-ASR request claims its whole sequence (the 2,048
+/// default budget clamped to the 1,307-token context): 21 pages of 64. The
+/// pool held 32 unrounded sequences, 654 pages, so 31 rows fit and the H100
+/// deferred 18-130 steps for capacity at 32 streams. It now holds 32 rows.
+#[test]
+fn qwen3_asr_pool_admits_its_certified_width_of_automatic_30s_rows() {
+    for variant in [ModelVariant::Qwen3Asr06BGguf, ModelVariant::Qwen3Asr17BGguf] {
+        let width = crate::catalog::certified_decode_width(variant.family(), BackendKind::Cuda);
+        assert_eq!(width, 32);
+        let ceiling =
+            crate::runtime::lifecycle::asr_envelope::minimum_sequence_tokens(variant).unwrap();
+        let ceiling = usize::try_from(ceiling).unwrap();
+        assert_eq!(ceiling, 1_307);
+        let (sequence, pool) = asr_automatic_context(65_536, ceiling, width, 64);
+        // A 30 s clip's prompt: 390 audio tokens and the text prompt (403
+        // tokens at 29.8 s in the H100 matrix's B shape).
+        let rows = (0..width)
+            .map(|_| {
+                let mut request = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(variant);
+                apply_asr_max_tokens(&mut request, variant, None);
+                request
+                    .install_prepared_sequence_input_tokens(405, sequence)
+                    .unwrap();
+                request
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows[0].num_prompt_tokens() + rows[0].params.max_tokens,
+            1_307
+        );
+        // The family's retained rows on the H100: 32 retained and staged.
+        let rows_32 = (32, 32);
+        assert_eq!(FullClaimPool::new(pool, rows_32).admit_all(&rows).0, width);
+        let (admitted, refusal) = FullClaimPool::new(width * ceiling, rows_32).admit_all(&rows);
+        assert_eq!(admitted, width - 1);
+        assert!(matches!(
+            refusal,
+            Some(crate::error::Error::Backpressure(_))
+        ));
+    }
 }
 
 #[test]

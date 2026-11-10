@@ -340,7 +340,12 @@ certified width, `catalog/batch_width.rs`), retained sessions, the realtime
 ASR session cap and the worker's in-flight invocations follow it, chunked
 prefill turns on unless set explicitly, and the portable chat KV pool plans a
 context per sequence (`max(context, seqs × min(context, 8,192))` tokens).
-`runtime.concurrency` in `/v1/health` reports the resolved values.
+`runtime.concurrency` in `/v1/health` reports the resolved values. On CUDA
+with no width fixed, the ASR families with a batched decode (Qwen3-ASR,
+VibeVoice-ASR, Parakeet, Nemotron ASR) decode up to 32 rows while their
+encoders and prefill keep the engine's eight; `asr_row_width` reports that
+ceiling and each loaded model's `asr_decode_width` the width its memory fit
+chose.
 
 **Device thread.** One OS thread per device runs every device operation
 (`backends/device_thread.rs`). Control jobs (KV page operations, loads, frees)

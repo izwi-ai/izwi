@@ -2,6 +2,9 @@
 //! artifacts, and stage costs.
 
 use super::*;
+use crate::backends::DeviceOwned;
+use crate::models::architectures::voxtral::realtime::VoxtralOfflinePreparedAudio;
+use crate::models::registry::VoxtralModelLease;
 
 impl EngineCoreRequest {
     pub(crate) fn install_asr_execution_model(
@@ -128,6 +131,14 @@ impl EngineCoreRequest {
             NemotronPromptOptions, NemotronTranscribeRequest,
         };
         let (samples, sample_rate) = super::super::executor::decode_request_audio_with_rate(self)?;
+        // Admission claims the row's pages for `max_tokens` in full: narrow
+        // an omitted budget to the decode this audio's duration plans, so
+        // concurrent rows share the retained pool instead of each claiming
+        // the card's 16,384 tokens.
+        self.params.max_tokens = crate::runtime::nemotron_transcribe_asr_planned_max_tokens(
+            self,
+            samples.len() as f32 / sample_rate.max(1) as f32,
+        );
         let language = self
             .asr_language_for_execution()
             .map(str::trim)
@@ -259,6 +270,24 @@ impl EngineCoreRequest {
             {
                 return Err(Error::Overloaded(
                     "Parakeet retained decode workspace exceeds its loaded adapter budget"
+                        .to_string(),
+                ));
+            }
+            return Ok(Some((stage.id, cost)));
+        }
+        if matches!(model, NativeAsrModel::Nemotron(_)) {
+            let cost = WorkCost::new(
+                1,
+                1,
+                crate::models::architectures::nemotron::asr::NEMOTRON_RETAINED_WORKSPACE_PER_ROW_BYTES,
+            );
+            if !cost
+                .workspace
+                .workspace_bytes()
+                .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
+            {
+                return Err(Error::Overloaded(
+                    "Nemotron retained decode workspace exceeds its loaded adapter budget"
                         .to_string(),
                 ));
             }
@@ -458,7 +487,7 @@ impl EngineCoreRequest {
         if let Some(current) = self.prepared_asr_encoder_artifact.as_ref() {
             if current.model_variant == model_variant
                 && current.source_fingerprint == source_fingerprint
-                && matches!(&current.artifact, PreparedAsrEncoderArtifactValue::Qwen3(value) if Arc::ptr_eq(value, &artifact))
+                && matches!(&*current.artifact, PreparedAsrEncoderArtifactValue::Qwen3(value) if Arc::ptr_eq(value, &artifact))
             {
                 return Ok(());
             }
@@ -469,7 +498,7 @@ impl EngineCoreRequest {
         }
         self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
             model_variant,
-            artifact: PreparedAsrEncoderArtifactValue::Qwen3(artifact),
+            artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::Qwen3(artifact)),
             source_fingerprint,
         });
         Ok(())
@@ -491,13 +520,16 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        match &prepared.artifact {
+        match &*prepared.artifact {
             PreparedAsrEncoderArtifactValue::Qwen3(value) => Ok(Some(value.clone())),
             PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech5(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
-            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Parakeet(_)
+            | PreparedAsrEncoderArtifactValue::Nemotron(_)
+            | PreparedAsrEncoderArtifactValue::Voxtral(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Qwen3 accessor".into(),
             )),
         }
@@ -527,7 +559,7 @@ impl EngineCoreRequest {
         }
         self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
             model_variant,
-            artifact: PreparedAsrEncoderArtifactValue::Whisper(artifact),
+            artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::Whisper(artifact)),
             source_fingerprint,
         });
         Ok(())
@@ -549,13 +581,16 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        match &prepared.artifact {
+        match &*prepared.artifact {
             PreparedAsrEncoderArtifactValue::Whisper(value) => Ok(Some(value.clone())),
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech5(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
-            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Parakeet(_)
+            | PreparedAsrEncoderArtifactValue::Nemotron(_)
+            | PreparedAsrEncoderArtifactValue::Voxtral(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Whisper accessor".into(),
             )),
         }
@@ -585,7 +620,7 @@ impl EngineCoreRequest {
         }
         self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
             model_variant,
-            artifact: PreparedAsrEncoderArtifactValue::VibeVoice(artifact),
+            artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::VibeVoice(artifact)),
             source_fingerprint,
         });
         Ok(())
@@ -607,13 +642,16 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        match &prepared.artifact {
+        match &*prepared.artifact {
             PreparedAsrEncoderArtifactValue::VibeVoice(value) => Ok(Some(value.clone())),
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech5(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
-            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Parakeet(_)
+            | PreparedAsrEncoderArtifactValue::Nemotron(_)
+            | PreparedAsrEncoderArtifactValue::Voxtral(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the VibeVoice accessor".into(),
             )),
         }
@@ -643,10 +681,65 @@ impl EngineCoreRequest {
         }
         self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
             model_variant,
-            artifact: PreparedAsrEncoderArtifactValue::GraniteSpeech(artifact),
+            artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::GraniteSpeech(artifact)),
             source_fingerprint,
         });
         Ok(())
+    }
+
+    pub(crate) fn install_prepared_granite_speech5_artifact(
+        &mut self,
+        model_variant: ModelVariant,
+        artifact: Arc<GraniteSpeech5PreparedPromptArtifact>,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::GraniteSpeech5Asr
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} Granite Speech 5.0 artifact does not match its normal routed model",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
+        if self.prepared_asr_encoder_artifact.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} already owns an encoder artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+            model_variant,
+            artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::GraniteSpeech5(artifact)),
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_granite_speech5_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<GraniteSpeech5PreparedPromptArtifact>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after Granite Speech 5.0 preparation",
+                self.id
+            )));
+        }
+        match &*prepared.artifact {
+            PreparedAsrEncoderArtifactValue::GraniteSpeech5(value) => Ok(Some(value.clone())),
+            _ => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the Granite Speech 5.0 accessor"
+                    .into(),
+            )),
+        }
     }
 
     pub(crate) fn prepared_granite_speech_artifact_for_executor(
@@ -665,13 +758,16 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        match &prepared.artifact {
+        match &*prepared.artifact {
             PreparedAsrEncoderArtifactValue::GraniteSpeech(value) => Ok(Some(value.clone())),
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech5(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
-            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::Parakeet(_)
+            | PreparedAsrEncoderArtifactValue::Nemotron(_)
+            | PreparedAsrEncoderArtifactValue::Voxtral(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Granite Speech accessor".into(),
             )),
         }
@@ -718,7 +814,7 @@ impl EngineCoreRequest {
             .unwrap_or_default();
         self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
             model_variant,
-            artifact: PreparedAsrEncoderArtifactValue::Lfm25Audio(artifact),
+            artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::Lfm25Audio(artifact)),
             source_fingerprint,
         });
         for (stage_id, cost) in prepared_costs {
@@ -743,13 +839,16 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        match &prepared.artifact {
+        match &*prepared.artifact {
             PreparedAsrEncoderArtifactValue::Lfm25Audio(value) => Ok(Some(value.clone())),
             PreparedAsrEncoderArtifactValue::Qwen3(_)
             | PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
-            | PreparedAsrEncoderArtifactValue::Parakeet(_) => Err(Error::InvalidInput(
+            | PreparedAsrEncoderArtifactValue::GraniteSpeech5(_)
+            | PreparedAsrEncoderArtifactValue::Parakeet(_)
+            | PreparedAsrEncoderArtifactValue::Nemotron(_)
+            | PreparedAsrEncoderArtifactValue::Voxtral(_) => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the LFM2.5 Audio accessor".into(),
             )),
         }
@@ -779,7 +878,7 @@ impl EngineCoreRequest {
         }
         self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
             model_variant,
-            artifact: PreparedAsrEncoderArtifactValue::Parakeet(artifact),
+            artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::Parakeet(artifact)),
             source_fingerprint,
         });
         Ok(())
@@ -801,10 +900,190 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        match &prepared.artifact {
+        match &*prepared.artifact {
             PreparedAsrEncoderArtifactValue::Parakeet(value) => Ok(Some(value.clone())),
             _ => Err(Error::InvalidInput(
                 "foreign encoder artifact was requested through the Parakeet accessor".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn install_prepared_nemotron_artifact(
+        &mut self,
+        model_variant: ModelVariant,
+        artifact: Arc<NemotronPreparedEncoderArtifact>,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::NemotronAsr
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} Nemotron artifact does not match its normal routed model",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
+        if self.prepared_asr_encoder_artifact.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} already owns an encoder artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+            model_variant,
+            artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::Nemotron(artifact)),
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_nemotron_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<NemotronPreparedEncoderArtifact>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after Nemotron preparation",
+                self.id
+            )));
+        }
+        match &*prepared.artifact {
+            PreparedAsrEncoderArtifactValue::Nemotron(value) => Ok(Some(value.clone())),
+            _ => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the Nemotron accessor".into(),
+            )),
+        }
+    }
+
+    /// A Voxtral offline request's execution model. Audio the realtime
+    /// ceiling covers becomes a retained row over its prepared audio (a
+    /// prompt prefill, then one decode step per remaining audio frame, the
+    /// last one finishing the row); other audio runs the atomic route
+    /// (`artifact` `None`, after `install_prepared_asr_long_form_atomic`).
+    pub(crate) fn install_voxtral_asr_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: VoxtralModelLease,
+        artifact: Option<Arc<VoxtralOfflinePreparedAudio>>,
+        prompt_tokens: usize,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::Voxtral
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} Voxtral preparation does not match its routed model",
+                self.id
+            )));
+        }
+        match artifact {
+            Some(artifact) => {
+                let frames = artifact.prepared_frames();
+                if self.uses_asr_long_form_atomic()
+                    || prompt_tokens == 0
+                    || frames < prompt_tokens
+                    || self.prepared_asr_encoder_artifact.is_some()
+                    || self
+                        .prepared_sequence_input_tokens
+                        .is_some_and(|tokens| tokens != prompt_tokens)
+                {
+                    return Err(Error::InvalidInput(format!(
+                        "ASR request {} Voxtral row does not match its prepared audio",
+                        self.id
+                    )));
+                }
+                let source_fingerprint =
+                    self.refresh_asr_execution_source_fingerprint(model_variant)?;
+                self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+                    model_variant,
+                    artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::Voxtral(artifact)),
+                    source_fingerprint,
+                });
+                // The prefill predicts one token and every remaining audio
+                // frame one more; the decode stops when the audio runs out,
+                // as the atomic route's does, never at a caller's budget.
+                self.params.max_tokens = frames - prompt_tokens + 1;
+                self.prepared_sequence_input_tokens = Some(prompt_tokens);
+                self.prepared_asr_execution_shape =
+                    Some(PreparedAsrExecutionShape::RetainedSequence {
+                        input_tokens: prompt_tokens,
+                    });
+            }
+            None if self.uses_asr_long_form_atomic() => {}
+            None => {
+                return Err(Error::InvalidInput(format!(
+                    "ASR request {} Voxtral atomic route has no prepared long-form shape",
+                    self.id
+                )));
+            }
+        }
+        self.prepared_stage_costs.clear();
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::Voxtral(model),
+            qwen_tts: None,
+            lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
+            fish_s2_tts: None,
+            fish_s2_tts_params: None,
+            fish_drama3_tts: None,
+            fish_drama3_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
+            chatterbox_tts: None,
+            chatterbox_tts_params: None,
+            maya1_tts: None,
+            maya1_tts_params: None,
+            maya2_tts: None,
+            maya2_tts_params: None,
+            lfm3_audio: None,
+            nemotron_transcribe: None,
+            kokoro_tts: None,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_voxtral_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<VoxtralModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::Voxtral(model) => Some(model.clone()),
+                _ => None,
+            }))
+    }
+
+    pub(crate) fn prepared_voxtral_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<VoxtralOfflinePreparedAudio>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after Voxtral preparation",
+                self.id
+            )));
+        }
+        match &*prepared.artifact {
+            PreparedAsrEncoderArtifactValue::Voxtral(value) => Ok(Some(value.clone())),
+            _ => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the Voxtral accessor".into(),
             )),
         }
     }
@@ -895,7 +1174,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::Lfm3Audio(_)
-                | PreparedIncrementalModel::KokoroTts(_) => None,
+                | PreparedIncrementalModel::KokoroTts(_)
+                | PreparedIncrementalModel::Voxtral(_) => None,
             }))
     }
 
@@ -917,7 +1197,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::Lfm3Audio(_)
-                | PreparedIncrementalModel::KokoroTts(_) => None,
+                | PreparedIncrementalModel::KokoroTts(_)
+                | PreparedIncrementalModel::Voxtral(_) => None,
             }))
     }
 
@@ -955,7 +1236,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::Lfm3Audio(_)
-                | PreparedIncrementalModel::KokoroTts(_) => None,
+                | PreparedIncrementalModel::KokoroTts(_)
+                | PreparedIncrementalModel::Voxtral(_) => None,
             }))
     }
 }

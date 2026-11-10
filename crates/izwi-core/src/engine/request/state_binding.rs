@@ -344,6 +344,7 @@ impl EngineCoreRequest {
                     | ModelFamily::VibeVoiceAsr
                     | ModelFamily::GraniteSpeechAsr
                     | ModelFamily::ParakeetAsr
+                    | ModelFamily::NemotronAsr
             )
         {
             if self.prepared_asr_audio_for_executor()?.is_none() {
@@ -368,8 +369,14 @@ impl EngineCoreRequest {
                             ModelFamily::GraniteSpeechAsr => self
                                 .prepared_granite_speech_artifact_for_executor()?
                                 .is_some(),
+                            ModelFamily::GraniteSpeech5Asr => self
+                                .prepared_granite_speech5_artifact_for_executor()?
+                                .is_some(),
                             ModelFamily::ParakeetAsr => {
                                 self.prepared_parakeet_artifact_for_executor()?.is_some()
+                            }
+                            ModelFamily::NemotronAsr => {
+                                self.prepared_nemotron_artifact_for_executor()?.is_some()
                             }
                             _ => false,
                         } => {}
@@ -379,6 +386,30 @@ impl EngineCoreRequest {
                 _ => {
                     return Err(Error::InvalidInput(format!(
                         "ASR request {} is missing a consistent exact media execution shape",
+                        self.id
+                    )));
+                }
+            }
+        }
+        if matches!(&ready.model, PreparedIncrementalModel::Voxtral(_)) {
+            if ready.model_variant.family() != ModelFamily::Voxtral
+                || self.prepared_asr_audio_for_executor()?.is_none()
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Voxtral ASR request {} is missing its exact decoded-audio artifact",
+                    self.id
+                )));
+            }
+            match self.prepared_asr_execution_shape {
+                Some(PreparedAsrExecutionShape::RetainedSequence { input_tokens })
+                    if self.prepared_sequence_input_tokens == Some(input_tokens)
+                        && self.prepared_voxtral_artifact_for_executor()?.is_some() => {}
+                Some(PreparedAsrExecutionShape::LongFormAtomic)
+                    if self.prepared_sequence_input_tokens.is_none()
+                        && self.prepared_asr_encoder_artifact.is_none() => {}
+                _ => {
+                    return Err(Error::InvalidInput(format!(
+                        "Voxtral ASR request {} is missing a consistent exact media execution shape",
                         self.id
                     )));
                 }
@@ -669,6 +700,13 @@ impl EngineCoreRequest {
             {
                 Ok(())
             }
+            (PreparedIncrementalModel::Voxtral(_), TaskType::ASR)
+                if ready.model_variant.family() == ModelFamily::Voxtral
+                    && ready.qwen_tts.is_none()
+                    && ready.voxtral_tts.is_none() =>
+            {
+                Ok(())
+            }
             (PreparedIncrementalModel::Lfm25AudioTts(_), TaskType::TTS)
                 if ready.qwen_tts.is_none() && ready.lfm25_audio_tts.is_some() =>
             {
@@ -819,7 +857,8 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::Lfm3Audio(_)
-                | PreparedIncrementalModel::KokoroTts(_) => None,
+                | PreparedIncrementalModel::KokoroTts(_)
+                | PreparedIncrementalModel::Voxtral(_) => None,
             })
             .filter(|_| self.uses_asr_retained_sequence())
             .map(|model| Self::continuous_asr_stage_cost(Some(&binding), model))
@@ -833,7 +872,7 @@ impl EngineCoreRequest {
                 _ => None,
             })
             .zip(self.prepared_asr_encoder_artifact.as_ref())
-            .and_then(|(model, prepared)| match &prepared.artifact {
+            .and_then(|(model, prepared)| match &*prepared.artifact {
                 PreparedAsrEncoderArtifactValue::Lfm25Audio(artifact) => {
                     Some((model, artifact.prompt_tokens))
                 }

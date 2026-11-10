@@ -64,6 +64,7 @@ use crate::kernels::numeric_check::{
     run_numeric_self_check, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+use crate::models::shared::decoder_precision::{opt_in_bf16, DecoderPrecision};
 use hift::HiftVocoder;
 use noise::{NoiseStream, SplitMix64};
 use perth::PerthWatermarker;
@@ -101,8 +102,52 @@ pub struct ChatterboxRuntime {
     default_voice: ChatterboxPreparedVoice,
     device: Device,
     /// T3's weights, activations and retained K/V; every other network
-    /// runs in F32.
+    /// runs in F32, but S3Gen's flow and HiFT may run in BF16 on CUDA
+    /// ([`CHATTERBOX_ACOUSTIC_BF16_ENV`], `acoustic_precision`).
     t3_dtype: DType,
+    /// Which copy of S3Gen's flow and HiFT serves, and why.
+    acoustic_precision: DecoderPrecision,
+}
+
+/// Opt-in BF16 copies of S3Gen's flow and HiFT on CUDA (a boolean; off when
+/// unset). Read at each load.
+pub(crate) const CHATTERBOX_ACOUSTIC_BF16_ENV: &str = "IZWI_CHATTERBOX_ACOUSTIC_BF16";
+
+/// The relative L2 against F32 each output of the acoustic probe (mel, F0,
+/// waveform) of the BF16 copies must stay within.
+const CHATTERBOX_ACOUSTIC_BF16_TOLERANCE: f64 = 0.05;
+
+/// Speech tokens the acoustic probe renders after the default voice.
+const ACOUSTIC_PROBE_TOKENS: usize = 25;
+
+/// The acoustic probe of one copy of S3Gen's flow and HiFT: the default
+/// voice and xorshift speech tokens through the flow (fixed noise), the mel's
+/// F0, and HiFT's waveform from that mel and one fixed source (a 200 Hz
+/// fundamental), so the F0 a copy predicts cannot move the waveform's
+/// harmonic phases.
+fn acoustic_probe(
+    flow: &S3GenFlow,
+    vocoder: &HiftVocoder,
+    voice: &S3GenVoiceReference,
+) -> Result<Vec<(String, Vec<f32>)>> {
+    use crate::kernels::numeric_check::{host_f32, xorshift_values};
+    let prepared = flow.prepare_voice(voice)?;
+    let vocab = flow.config().vocab_size;
+    let tokens = xorshift_values(ACOUSTIC_PROBE_TOKENS, 0xAC05, 1.0)
+        .into_iter()
+        .map(|value| ((value.abs() * vocab as f32) as usize).min(vocab - 1) as u32)
+        .collect::<Vec<_>>();
+    let frames = S3GenFlow::total_frames(prepared.prompt_tokens(), tokens.len());
+    let noise = xorshift_values(flow.config().mel_bins * frames, 0xAC06, 1.0);
+    let mel = flow.generate_mel(&prepared, &tokens, &noise)?;
+    let f0 = vocoder.predict_f0(&mel)?;
+    let source = vocoder.harmonic_source(&vec![200.0; mel.dim(1)?], 0xAC07);
+    let waveform = vocoder.decode(&mel, &source)?;
+    Ok(vec![
+        ("mel".into(), host_f32(&mel)?),
+        ("f0".into(), f0),
+        ("waveform".into(), waveform),
+    ])
 }
 
 /// A voice embedded for both networks, shared by every request using it.
@@ -239,13 +284,26 @@ impl ChatterboxRuntime {
             device,
         )?;
         let t3 = T3Model::load(t3_cfg, t3_vb)?;
-        let s3gen_vb = weights::mmap_safetensors(
-            &model_dir.join(config::S3GEN_WEIGHTS_FILE),
-            DType::F32,
-            device,
-        )?;
+        let s3gen_path = model_dir.join(config::S3GEN_WEIGHTS_FILE);
+        let s3gen_vb = weights::mmap_safetensors(&s3gen_path, DType::F32, device)?;
         let flow = S3GenFlow::load(S3GenConfig::current(), s3gen_vb.clone())?;
         let vocoder = HiftVocoder::load(HiftConfig::current(), s3gen_vb.pp("mel2wav"))?;
+        let default = ChatterboxVoice::load_default(&model_dir.join(config::DEFAULT_VOICE_FILE))?;
+        let ((flow, vocoder), acoustic_precision) = opt_in_bf16(
+            "Chatterbox S3Gen flow and HiFT",
+            CHATTERBOX_ACOUSTIC_BF16_ENV,
+            device,
+            CHATTERBOX_ACOUSTIC_BF16_TOLERANCE,
+            (flow, vocoder),
+            || {
+                let vb = weights::mmap_safetensors(&s3gen_path, DType::BF16, device)?;
+                Ok((
+                    S3GenFlow::load(S3GenConfig::current(), vb.clone())?,
+                    HiftVocoder::load(HiftConfig::current(), vb.pp("mel2wav"))?,
+                ))
+            },
+            |(flow, vocoder)| acoustic_probe(flow, vocoder, &default.s3gen),
+        );
         let ve_vb = weights::mmap_safetensors(
             &model_dir.join(config::VOICE_ENCODER_WEIGHTS_FILE),
             DType::F32,
@@ -265,7 +323,6 @@ impl ChatterboxRuntime {
         } else {
             None
         };
-        let default = ChatterboxVoice::load_default(&model_dir.join(config::DEFAULT_VOICE_FILE))?;
         let default_voice = ChatterboxPreparedVoice {
             t3: t3.prepare_voice(&default.t3)?,
             s3gen: flow.prepare_voice(&default.s3gen)?,
@@ -282,7 +339,13 @@ impl ChatterboxRuntime {
             default_voice,
             device: device.clone(),
             t3_dtype,
+            acoustic_precision,
         })
+    }
+
+    /// Which copy of S3Gen's flow and HiFT serves, and why.
+    pub(crate) fn acoustic_precision(&self) -> &DecoderPrecision {
+        &self.acoustic_precision
     }
 
     /// The load-time check of a T3 below F32: the default voice at the
@@ -572,8 +635,27 @@ impl ChatterboxRuntime {
             tokens,
             stopped,
         )?;
-        self.device.synchronize()?;
+        self.end_acoustic_quantum()?;
         Ok(unit)
+    }
+
+    /// Wait for the device at the end of an acoustic quantum, so its cost
+    /// lands in its own quantum: on CPU and Metal (where it also commits
+    /// Metal's command buffer). On CUDA every unit runs on the device
+    /// thread's one stream, so the next unit, any other request's quantum
+    /// and every free are ordered after it already, and a vocoder unit has
+    /// read its samples back; waiting would only keep the host from queueing
+    /// the next quantum's launches behind it (`IZWI_CHATTERBOX_ACOUSTIC_SYNC`
+    /// restores the wait).
+    fn end_acoustic_quantum(&self) -> Result<()> {
+        static SYNC_ON_CUDA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if self.device.is_cuda()
+            && !*SYNC_ON_CUDA
+                .get_or_init(|| crate::env::flag_or("IZWI_CHATTERBOX_ACOUSTIC_SYNC", false))
+        {
+            return Ok(());
+        }
+        Ok(self.device.synchronize()?)
     }
 
     /// Acoustic units one utterance takes: the encoder, each Euler step and
@@ -641,7 +723,7 @@ impl ChatterboxRuntime {
         if let Some(next) = next {
             *progress = next;
         }
-        self.device.synchronize()?;
+        self.end_acoustic_quantum()?;
         Ok(matches!(progress, ChatterboxAcoustic::Rendered(_)))
     }
 }

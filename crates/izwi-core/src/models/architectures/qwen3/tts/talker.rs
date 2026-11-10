@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 use crate::kernels::f16_weight_linear::{projection_var_builder, ProjectionLinear};
 use crate::kv::KvDecodeBatchMetadata;
 use crate::models::architectures::qwen3::tts::config::TalkerConfig;
+use crate::models::architectures::qwen3::tts::decode_rows::{self, forward_rows};
 use crate::models::architectures::qwen3::tts::rope::{
     build_rope_inv_freq, build_rope_window, duplicate_rope_window, qwen_rotate_half,
 };
@@ -254,7 +255,9 @@ impl Attention {
 
     /// Execute one native ragged decode step for rows sharing one physical
     /// arena. Dense projections keep the real batch dimension while the paged
-    /// backend consumes each row's independent block table.
+    /// backend consumes each row's independent block table. `padded`
+    /// (row-invariant decode, [`decode_rows`]) runs the projections at
+    /// [`decode_rows::DECODE_ROWS`] rows and the arena's row-invariant decode.
     #[allow(clippy::too_many_arguments)]
     fn forward_physical_decode_batch(
         &self,
@@ -266,6 +269,7 @@ impl Attention {
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
         layer_idx: usize,
+        padded: bool,
     ) -> Result<Tensor> {
         let (batch_size, sequence_len, _) = x.dims3()?;
         if batch_size == 0
@@ -289,18 +293,24 @@ impl Attention {
             ));
         }
 
-        let mut q =
-            self.q_proj
-                .forward(x)?
-                .reshape((batch_size, 1, self.num_heads, self.head_dim))?;
-        let mut k =
-            self.k_proj
-                .forward(x)?
-                .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
-        let v =
-            self.v_proj
-                .forward(x)?
-                .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
+        let mut q = forward_rows(&self.q_proj, x, padded)?.reshape((
+            batch_size,
+            1,
+            self.num_heads,
+            self.head_dim,
+        ))?;
+        let mut k = forward_rows(&self.k_proj, x, padded)?.reshape((
+            batch_size,
+            1,
+            self.num_kv_heads,
+            self.head_dim,
+        ))?;
+        let v = forward_rows(&self.v_proj, x, padded)?.reshape((
+            batch_size,
+            1,
+            self.num_kv_heads,
+            self.head_dim,
+        ))?;
         q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, 1)?;
         k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, 1)?;
 
@@ -336,24 +346,25 @@ impl Attention {
             },
         )?;
         let (out, completion) = submit_ordered_after_write(completion, || {
-            first.arena().paged_decode(
-                binding,
-                PagedKvDecodeArgs {
-                    queries: &queries,
-                    batch: metadata,
-                    softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
-                    softcap: None,
-                },
-            )
+            let args = PagedKvDecodeArgs {
+                queries: &queries,
+                batch: metadata,
+                softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
+                softcap: None,
+            };
+            if padded {
+                first.arena().paged_decode_row_invariant(binding, args)
+            } else {
+                first.arena().paged_decode(binding, args)
+            }
         })?;
         completions.collect(completion)?;
-        self.o_proj
-            .forward(&out.to_dtype(compute_dtype)?.reshape((
-                batch_size,
-                1,
-                self.num_heads * self.head_dim,
-            ))?)
-            .map_err(Error::from)
+        let out = out.to_dtype(compute_dtype)?.reshape((
+            batch_size,
+            1,
+            self.num_heads * self.head_dim,
+        ))?;
+        forward_rows(&self.o_proj, &out, padded).map_err(Error::from)
     }
 }
 
@@ -388,11 +399,17 @@ impl Mlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
+        self.forward_rows(x, false)
+    }
+
+    /// [`Self::forward`] with each projection's rows padded when `padded`
+    /// ([`forward_rows`]).
+    fn forward_rows(&self, x: &Tensor, padded: bool) -> Result<Tensor> {
+        let gate = forward_rows(&self.gate_proj, x, padded)?;
+        let up = forward_rows(&self.up_proj, x, padded)?;
         let act = ops::silu(&gate)?;
         let hidden = act.broadcast_mul(&up)?;
-        self.down_proj.forward(&hidden).map_err(Error::from)
+        forward_rows(&self.down_proj, &hidden, padded).map_err(Error::from)
     }
 }
 
@@ -454,6 +471,7 @@ impl Layer {
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
         layer_idx: usize,
+        padded: bool,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = self.self_attn.forward_physical_decode_batch(
@@ -465,10 +483,11 @@ impl Layer {
             metadata,
             completions,
             layer_idx,
+            padded,
         )?;
         let x = x.broadcast_add(&attn_out)?;
         let normed = self.post_attention_layernorm.forward(&x)?;
-        let mlp_out = self.mlp.forward(&normed)?;
+        let mlp_out = self.mlp.forward_rows(&normed, padded)?;
         x.broadcast_add(&mlp_out).map_err(Error::from)
     }
 }
@@ -987,9 +1006,12 @@ impl TalkerModel {
 
     /// Append one generation embedding for a ragged set of retained sessions.
     ///
-    /// A single row intentionally uses the scalar implementation. Wider calls
-    /// batch projections/MLPs and issue one paged decode operation per layer.
-    /// Every row must share the same arena and layer geometry, but may have a
+    /// Off CUDA a single row uses the scalar implementation. Wider calls, and
+    /// every call on CUDA, batch projections/MLPs and issue one paged decode
+    /// operation per layer. On CUDA the step is row-invariant
+    /// ([`decode_rows`]): its dense ops run at 32 rows and its attention is
+    /// the arena's row-invariant decode, so a row's hidden state and logits
+    /// are the same alone and beside other rows. Every row must share the same arena and layer geometry, but may have a
     /// different retained context length. Logical cursor commits are all-or-none.
     pub fn generate_physical_step_batch_with_embeds(
         &self,
@@ -1009,7 +1031,8 @@ impl TalkerModel {
                 caches.len()
             )));
         }
-        if batch_size == 1 {
+        let padded = decode_rows::row_invariant(&self.device);
+        if batch_size == 1 && !padded {
             let (hidden_states, logits) =
                 self.generate_physical_step_with_embed(input_embeds, caches[0])?;
             return Ok(TalkerPhysicalBatchOutput {
@@ -1079,10 +1102,11 @@ impl TalkerModel {
                     &metadata,
                     &mut completions,
                     layer_idx,
+                    padded,
                 )?;
             }
             let hidden = self.norm.forward(&hidden)?;
-            let logits = self.lm_head.forward(&hidden)?;
+            let logits = forward_rows(&self.lm_head, &hidden, padded)?;
             Ok((hidden, logits))
         })();
         let (hidden_states, logits) = match execution {
@@ -1151,6 +1175,18 @@ impl TalkerModel {
         let token_tensor = Tensor::from_vec(vec![token_id], (1,), &self.device)?;
         let embed = self.codec_embedding.forward(&token_tensor)?;
         embed.unsqueeze(0).map_err(Error::from)
+    }
+
+    /// The codec embedding of one token per batch row, `[rows, 1, hidden]`:
+    /// one id upload and one lookup for the whole step, each row bit for bit
+    /// [`Self::get_codec_embedding`] of its token.
+    pub fn get_codec_embedding_rows(&self, token_ids: &[u32]) -> Result<Tensor> {
+        let rows = token_ids.len();
+        let ids = Tensor::from_vec(token_ids.to_vec(), rows, &self.device)?;
+        let embed = self.codec_embedding.forward(&ids)?;
+        embed
+            .reshape((rows, 1, self.cfg.hidden_size))
+            .map_err(Error::from)
     }
 
     /// Get codec embeddings for a sequence of codec token IDs.
@@ -1697,6 +1733,251 @@ pub(crate) mod tests {
         assert!(Arc::ptr_eq(&completion_a[0], &completion_b[0]));
     }
 
+    /// A talker of xorshift weights wide enough that the CPU's matmul
+    /// rounds a row differently at different row counts: 2 layers, hidden
+    /// 64, 4 query heads on 2 key heads of 16 dims, MLP 96, 40 codes,
+    /// interleaved MRoPE.
+    pub(crate) fn random_talker(device: &Device) -> TalkerModel {
+        use crate::kernels::numeric_check::xorshift_tensor;
+        let (hidden, heads, kv_heads, head_dim, intermediate, vocab) = (64, 4, 2, 16, 96, 40);
+        let mut seed = 0x7A1C_u64;
+        let mut tensor = |shape: &[usize], scale: f32| {
+            seed += 1;
+            xorshift_tensor(shape, seed, scale, device).unwrap()
+        };
+        let mut model = tiny_talker_with_mrope(device, true);
+        let mut layers = Vec::new();
+        for _ in 0..2 {
+            let mut linear = |output: usize, input: usize| -> ProjectionLinear {
+                Linear::new(tensor(&[output, input], 0.25), None).into()
+            };
+            let attention = Attention {
+                q_proj: linear(heads * head_dim, hidden),
+                k_proj: linear(kv_heads * head_dim, hidden),
+                v_proj: linear(kv_heads * head_dim, hidden),
+                o_proj: linear(hidden, heads * head_dim),
+                q_norm: Some(RmsNorm::new(
+                    Tensor::ones(head_dim, DType::F32, device).unwrap(),
+                    1e-6,
+                )),
+                k_norm: Some(RmsNorm::new(
+                    Tensor::ones(head_dim, DType::F32, device).unwrap(),
+                    1e-6,
+                )),
+                num_heads: heads,
+                num_kv_heads: kv_heads,
+                head_dim,
+                rope_inv_freq: build_rope_inv_freq(head_dim, 10_000.0),
+                use_mrope: true,
+                mrope_section: vec![3, 3, 2],
+            };
+            let mlp = Mlp {
+                gate_proj: linear(intermediate, hidden),
+                up_proj: linear(intermediate, hidden),
+                down_proj: linear(hidden, intermediate),
+            };
+            layers.push(Layer {
+                input_layernorm: RmsNorm::new(
+                    Tensor::ones(hidden, DType::F32, device).unwrap(),
+                    1e-6,
+                ),
+                self_attn: attention,
+                post_attention_layernorm: RmsNorm::new(
+                    Tensor::ones(hidden, DType::F32, device).unwrap(),
+                    1e-6,
+                ),
+                mlp,
+            });
+        }
+        model.layers = layers;
+        model.norm = RmsNorm::new(Tensor::ones(hidden, DType::F32, device).unwrap(), 1e-6);
+        model.lm_head = Linear::new(tensor(&[vocab, hidden], 0.25), None);
+        model.codec_embedding = Embedding::new(tensor(&[vocab, hidden], 0.5), hidden);
+        model.cfg.hidden_size = hidden;
+        model.cfg.num_hidden_layers = 2;
+        model.cfg.num_attention_heads = heads;
+        model.cfg.num_key_value_heads = kv_heads;
+        model.cfg.head_dim = head_dim;
+        model.cfg.intermediate_size = intermediate;
+        model.cfg.vocab_size = vocab;
+        model
+    }
+
+    /// A CPU arena for [`random_talker`]: 2 layers of 2 key heads of 16
+    /// dims, 4-token pages, `pages` of them.
+    pub(crate) fn random_talker_arena(
+        instance: u64,
+        pages: usize,
+    ) -> (Arc<dyn KvArena>, Vec<KvLayerBinding>) {
+        let bindings = (0..2)
+            .map(|layer| KvLayerBinding {
+                model_layer: layer,
+                physical_layer: layer,
+            })
+            .collect::<Vec<_>>();
+        let arena = CpuKvArena::new(KvArenaConfig {
+            id: KvArenaId {
+                model_instance: ModelInstanceId::new(instance),
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                generation: 1,
+            },
+            group: KvGroupId::new(0),
+            page_tokens: 4,
+            capacity_pages: pages as u32,
+            growth: None,
+            dtype: DType::F32,
+            layers: bindings
+                .iter()
+                .map(|&binding| KvLayerConfig {
+                    binding,
+                    num_kv_heads: 2,
+                    key_head_dim: 16,
+                    value_head_dim: 16,
+                })
+                .collect(),
+        })
+        .unwrap();
+        (Arc::new(arena), bindings)
+    }
+
+    /// A cache of `pages` pages from `first_page` on `arena`.
+    pub(crate) fn cache_at(
+        arena: &Arc<dyn KvArena>,
+        bindings: &[KvLayerBinding],
+        first_page: u32,
+        pages: u32,
+    ) -> TalkerPhysicalCache {
+        let blocks = (first_page..first_page + pages)
+            .map(|index| CacheBlockRef {
+                arena: arena.id(),
+                group: arena.config().group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        TalkerPhysicalCache::new(arena.clone(), bindings.to_vec(), blocks, 0).unwrap()
+    }
+
+    /// Each request's per-step hidden states and logits (bits) when the
+    /// requests `order` decode `steps` steps side by side, after their own
+    /// prefills (request `r` prefills `1 + r % 5` positions).
+    fn talker_step_bits(
+        model: &TalkerModel,
+        order: &[usize],
+        steps: usize,
+        instance: u64,
+    ) -> Vec<Vec<(Vec<u32>, Vec<u32>)>> {
+        use crate::kernels::numeric_check::xorshift_tensor;
+        let device = Device::Cpu;
+        let pages_per_row = 4u32;
+        let (arena, bindings) = random_talker_arena(instance, order.len() * pages_per_row as usize);
+        let mut caches = order
+            .iter()
+            .enumerate()
+            .map(|(slot, _)| {
+                cache_at(
+                    &arena,
+                    &bindings,
+                    slot as u32 * pages_per_row,
+                    pages_per_row,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (cache, &request) in caches.iter_mut().zip(order) {
+            let prompt = xorshift_tensor(
+                &[1, 1 + request % 5, 64],
+                100 + request as u64,
+                1.0,
+                &device,
+            )
+            .unwrap();
+            model
+                .prefill_physical_with_embeds(&prompt, cache, None)
+                .unwrap();
+            cache.take_completed_writes();
+        }
+        let bits = |tensor: &Tensor| {
+            tensor
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        let mut out = vec![Vec::new(); order.len()];
+        for step in 0..steps {
+            let inputs = order
+                .iter()
+                .map(|&request| {
+                    xorshift_tensor(
+                        &[1, 1, 64],
+                        1_000 * (step as u64 + 1) + request as u64,
+                        1.0,
+                        &device,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let inputs = Tensor::cat(&inputs, 0).unwrap();
+            let mut refs = caches.iter_mut().collect::<Vec<_>>();
+            let output = model
+                .generate_physical_step_batch_with_embeds(&inputs, &mut refs)
+                .unwrap();
+            for cache in caches.iter_mut() {
+                cache.take_completed_writes();
+            }
+            for (slot, row) in out.iter_mut().enumerate() {
+                row.push((
+                    bits(&output.hidden_states.i(slot).unwrap()),
+                    bits(&output.logits.i(slot).unwrap()),
+                ));
+            }
+        }
+        // Back in request order.
+        let mut by_request = vec![Vec::new(); order.iter().max().map_or(0, |max| max + 1)];
+        for (slot, &request) in order.iter().enumerate() {
+            by_request[request] = std::mem::take(&mut out[slot]);
+        }
+        by_request
+    }
+
+    /// D3: on CUDA's path (forced here) a request's talker steps, hidden
+    /// states and logits, are bit for bit the same alone and beside 1 to 31
+    /// other requests of other context lengths, wherever it sits in the
+    /// batch; a lone request runs the batch path.
+    #[test]
+    fn padded_talker_steps_are_the_same_alone_and_in_any_batch() {
+        let _force = decode_rows::ForceRowInvariant::new(true);
+        let device = Device::Cpu;
+        let model = random_talker(&device);
+        let steps = 3;
+        let requests = 32;
+        let alone = (0..requests)
+            .map(|request| {
+                talker_step_bits(&model, &[request], steps, 800 + request as u64)
+                    .swap_remove(request)
+            })
+            .collect::<Vec<_>>();
+        let batches: [Vec<usize>; 3] = [
+            vec![3, 0],
+            vec![7, 1, 30, 12, 5],
+            (0..requests).rev().collect(),
+        ];
+        for (index, order) in batches.iter().enumerate() {
+            let batched = talker_step_bits(&model, order, steps, 900 + index as u64);
+            for &request in order {
+                assert!(
+                    batched[request] == alone[request],
+                    "request {request} differs in the batch of {}",
+                    order.len()
+                );
+            }
+        }
+    }
+
     #[test]
     fn incompatible_talker_batch_leaves_every_row_cursor_unchanged() {
         let device = Device::Cpu;
@@ -1734,6 +2015,25 @@ pub(crate) mod tests {
     /// allocating only the F16 table, and checked on sampled rows against
     /// the stored values (an F16 overflow on a sampled row is infinite).
     /// Other forms are left to the builder; a wrong shape is an error.
+    /// A step's semantic embeddings, looked up for all rows at once, are
+    /// each row's own lookup.
+    #[test]
+    fn codec_embedding_rows_are_each_tokens_own_embedding() {
+        let device = Device::Cpu;
+        let talker = tiny_talker(&device);
+        let tokens = [3u32, 0, 7, 3, 5];
+        let rows = talker.get_codec_embedding_rows(&tokens).unwrap();
+        assert_eq!(rows.dims(), &[tokens.len(), 1, 4]);
+        let values = |tensor: Tensor| tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (row, &token) in tokens.iter().enumerate() {
+            assert_eq!(
+                values(rows.i(row).unwrap()),
+                values(talker.get_codec_embedding(token).unwrap()),
+                "row {row}"
+            );
+        }
+    }
+
     #[test]
     fn f16_embedding_reads_each_float_form_in_place() {
         use crate::kernels::numeric_check::xorshift_tensor;

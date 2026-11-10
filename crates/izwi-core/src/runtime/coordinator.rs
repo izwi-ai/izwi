@@ -703,6 +703,44 @@ impl std::fmt::Debug for StageDeviceFence {
 /// share the device capacity of one, so one request's audio decode queued
 /// every other request's tokenization. Each preparation still reserves its
 /// own memory.
+/// The workspace one native preparation batch of `rows` rows reserves: the
+/// rows' own priced workspace (`aggregate`) plus the stage's fixed per-row,
+/// per-work-unit and base terms, refused when it exceeds the stage maximum
+/// sealed at load.
+pub(crate) fn native_preparation_workspace(
+    stage: &crate::engine::StageDescriptor,
+    aggregate: WorkCost,
+    rows: usize,
+) -> Result<ResourceVector> {
+    let rows = u64::try_from(rows).map_err(|_| {
+        Error::Overloaded("native preparation width exceeds work accounting".to_string())
+    })?;
+    let fixed_workspace = stage
+        .workspace_per_row_bytes
+        .checked_mul(rows)
+        .and_then(|bytes| {
+            stage
+                .workspace_per_work_unit_bytes
+                .checked_mul(aggregate.logical_units)
+                .and_then(|units| bytes.checked_add(units))
+        })
+        .and_then(|bytes| bytes.checked_add(stage.workspace_base_bytes))
+        .ok_or_else(|| {
+            Error::Overloaded("native preparation workspace accounting overflow".to_string())
+        })?;
+    let workspace = aggregate
+        .workspace
+        .checked_add(ResourceVector::temporary_workspace(fixed_workspace))?;
+    let workspace_bytes = workspace.workspace_bytes()?;
+    if workspace_bytes > stage.max_workspace_bytes {
+        return Err(Error::Overloaded(format!(
+            "native preparation workspace {workspace_bytes} exceeds loaded stage maximum {}",
+            stage.max_workspace_bytes
+        )));
+    }
+    Ok(workspace)
+}
+
 fn host_preparation_capacity(device_capacity: usize) -> usize {
     let cores = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
@@ -1831,32 +1869,7 @@ impl InferenceCoordinator {
                 }
             }
         }
-        let rows_u64 = u64::try_from(live.len()).map_err(|_| {
-            Error::Overloaded("native preparation width exceeds work accounting".to_string())
-        })?;
-        let fixed_workspace = stage
-            .workspace_per_row_bytes
-            .checked_mul(rows_u64)
-            .and_then(|bytes| {
-                stage
-                    .workspace_per_work_unit_bytes
-                    .checked_mul(aggregate.logical_units)
-                    .and_then(|units| bytes.checked_add(units))
-            })
-            .and_then(|bytes| bytes.checked_add(stage.workspace_base_bytes))
-            .ok_or_else(|| {
-                Error::Overloaded("native preparation workspace accounting overflow".to_string())
-            })?;
-        let workspace = aggregate
-            .workspace
-            .checked_add(ResourceVector::temporary_workspace(fixed_workspace))?;
-        let workspace_bytes = workspace.workspace_bytes()?;
-        if workspace_bytes > stage.max_workspace_bytes {
-            return Err(Error::Overloaded(format!(
-                "native preparation workspace {workspace_bytes} exceeds loaded stage maximum {}",
-                stage.max_workspace_bytes
-            )));
-        }
+        let workspace = native_preparation_workspace(stage, aggregate, live.len())?;
         let deadline = live
             .iter()
             .all(|index| rows[*index].job.spec.deadline.is_some())
@@ -6985,3 +6998,7 @@ mod tests {
 #[cfg(test)]
 #[path = "fish_s2_preparation_tests.rs"]
 mod fish_s2_preparation_tests;
+
+#[cfg(test)]
+#[path = "tts_prepared_artifact_admission_tests.rs"]
+mod tts_prepared_artifact_admission_tests;

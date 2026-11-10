@@ -37,8 +37,11 @@ mod executor;
 pub(crate) use executor::CUDA_DISPATCH_SCRATCH_BYTES_PER_ROW;
 #[cfg(test)]
 pub(crate) use executor::qwen3_asr_requires_long_form;
+#[cfg(test)]
+pub(crate) use executor::AsrChunkPlannerKind;
 pub(crate) use executor::{
-    asr_route_plan, decode_request_audio_with_rate, AsrRouteCapabilities, PlannedAsrChunks,
+    asr_route_plan, decode_request_audio_with_rate, timestamp_words_json, AsrChunkTranscription,
+    AsrRouteCapabilities, ChunkedAsrRun, ChunkedAsrTranscription, NativeExecutor, PlannedAsrChunks,
 };
 pub mod metrics;
 mod output;
@@ -72,11 +75,15 @@ pub use cache::managed::{
 #[cfg(test)]
 pub(crate) use cache::physical::PhysicalStateManager;
 pub(crate) use cache::physical::{RetainedTensorStateRuntimeIdV2, RetainedTensorStateRuntimeV2};
+#[cfg(test)]
+pub(crate) use cache::retained_static_attention::test_retained_static_runtime;
 pub(crate) use cache::retained_static_attention::{
-    RetainedStaticAttentionRuntimeV2, RetainedStaticAttentionSequenceId,
+    RetainedStaticAttentionBatch, RetainedStaticAttentionRuntimeV2,
+    RetainedStaticAttentionSequenceId,
 };
 pub use cache::telemetry::ManagedKvTelemetrySnapshot;
 pub(crate) use config::backend_step_sizes;
+pub(crate) use config::DEFAULT_KV_PAGE_TOKENS;
 pub(crate) use config::resolve_backend_model_context;
 pub(crate) use config::tts_explicit_output_limit;
 pub use config::EngineCoreConfig;
@@ -3620,6 +3627,16 @@ impl Engine {
             .await
     }
 
+    /// Synchronize the worker device on its thread, then hand its idle pooled
+    /// memory back to the driver (CUDA only).
+    pub(crate) async fn release_idle_worker_memory(
+        &self,
+        graph_pool: bool,
+    ) -> Result<Option<crate::backends::device::CudaMemoryRelease>> {
+        self.with_core_on_device(None, |core| core.release_idle_worker_memory(graph_pool))
+            .await
+    }
+
     /// Admit and allocate managed physical state before the model generation
     /// becomes Ready.
     #[cfg(test)]
@@ -3721,6 +3738,32 @@ impl Engine {
     /// [`Self::load_managed_model_state`] on the model's own sealed
     /// `(retained, staged)` rows instead of the engine's: the same live fit
     /// above `minimum_tokens` per row, keeping `reserve`.
+    /// See `EngineCore::load_managed_model_state_with_staged_rows`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn load_managed_model_state_with_staged_rows(
+        &self,
+        model_instance: ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        logical_context_tokens: Option<usize>,
+        staged_rows: usize,
+        minimum_tokens: u64,
+        reserve: StateFitReserve,
+        later_minimum_bytes: u64,
+    ) -> Result<Arc<ManagedKvModelRuntime>> {
+        self.with_core_on_device(Some(Some(model_instance)), |core| {
+            core.load_managed_model_state_with_staged_rows(
+                model_instance,
+                retained_state,
+                logical_context_tokens,
+                staged_rows,
+                minimum_tokens,
+                reserve,
+                later_minimum_bytes,
+            )
+        })
+        .await
+    }
+
     pub(crate) async fn load_managed_model_state_with_rows(
         &self,
         model_instance: ModelInstanceId,
@@ -3740,6 +3783,32 @@ impl Engine {
                 minimum_tokens,
                 reserve,
                 0,
+            )
+        })
+        .await
+    }
+
+    /// [`Self::load_managed_model_state_with_rows`] for a pool the model
+    /// sized for its rows; see
+    /// `EngineCore::load_pooled_managed_model_state_with_portable_copies`.
+    pub(crate) async fn load_pooled_managed_model_state_with_rows(
+        &self,
+        model_instance: ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        pool_tokens: usize,
+        rows: (usize, usize),
+        minimum_tokens: u64,
+        reserve: StateFitReserve,
+    ) -> Result<Arc<ManagedKvModelRuntime>> {
+        self.with_core_on_device(Some(Some(model_instance)), |core| {
+            core.load_pooled_managed_model_state_with_portable_copies(
+                model_instance,
+                retained_state,
+                pool_tokens,
+                1,
+                rows,
+                minimum_tokens,
+                reserve,
             )
         })
         .await
@@ -3790,12 +3859,40 @@ impl Engine {
         .await
     }
 
+    /// [`Self::load_managed_model_state_with_portable_copies`] for a pool the
+    /// caller sized across its rows; see
+    /// `EngineCore::load_pooled_managed_model_state_with_portable_copies`.
+    pub(crate) async fn load_pooled_managed_model_state_with_portable_copies(
+        &self,
+        model_instance: ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        pool_tokens: usize,
+        portable_state_copies: u32,
+        rows: (usize, usize),
+        minimum_tokens: u64,
+    ) -> Result<Arc<ManagedKvModelRuntime>> {
+        self.with_core_on_device(Some(Some(model_instance)), |core| {
+            core.load_pooled_managed_model_state_with_portable_copies(
+                model_instance,
+                retained_state,
+                pool_tokens,
+                portable_state_copies,
+                rows,
+                minimum_tokens,
+                // ASR loads reconcile their observed weight growth.
+                StateFitReserve::MeasuredUntracked,
+            )
+        })
+        .await
+    }
+
     pub(crate) async fn load_composite_retained_state(
         &self,
         model_instance: ModelInstanceId,
         contract: &crate::kv::v2::InferenceStateContract,
         static_domain: crate::kv::v2::StateDomainId,
         logical_context_tokens: Option<usize>,
+        rows: (usize, usize),
         minimum_tokens: u64,
     ) -> Result<Arc<CompositeRetainedStateRuntimeV2>> {
         self.with_core_on_device(Some(Some(model_instance)), |core| {
@@ -3804,6 +3901,7 @@ impl Engine {
                 contract,
                 static_domain,
                 logical_context_tokens,
+                rows,
                 minimum_tokens,
             )
         })

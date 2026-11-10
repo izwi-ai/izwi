@@ -1,4 +1,5 @@
 mod decode;
+mod device_decode;
 pub(crate) mod metal_kernels;
 mod nemo;
 mod physical;
@@ -22,14 +23,17 @@ use crate::backends::state::{
 use crate::backends::{BackendKind, DTypeSelection, DeviceProfile};
 use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
+use crate::kernels::cuda::shape_graphs::{ShapeGraphLimits, ShapeGraphs};
 use crate::kernels::depthwise_conv::{depthwise_conv1d, DepthwiseConv1dSpec};
 use crate::kernels::f16_weight_linear::{
-    load_weight_only_f16, PointwiseConv1d, ProjectionLinear, WeightOnlyF16Load,
+    load_weight_only_f16, F16WeightLinear, PointwiseConv1d, ProjectionLinear, WeightOnlyF16Load,
     F16_PROJECTION_MAX_RELATIVE_L2,
 };
 use crate::kernels::numeric_check::{
     run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
 };
+use crate::kernels::relpos_attention;
+use crate::kernels::transducer_greedy::{tdt_step, TdtRow, TdtRules, TdtStep};
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
     StateComponentId, StateUpdateKind,
@@ -51,32 +55,83 @@ pub(crate) use physical::{parakeet_physical_state_spec, PARAKEET_PREDICTOR_STATE
 pub(crate) use physical::{ParakeetPhysicalStateSpec, PARAKEET_PREDICTOR_STATE_GROUP};
 use preprocessor::{ParakeetLogMel, ParakeetPreprocessor};
 
-/// The dtype the Parakeet loader reads every weight in, and the activation
-/// dtype on every backend. On Metal the encoder's projection weights are then
-/// stored in F16 (see [`resolve_parakeet_projection_precision`]). Load
-/// admission prices the checkpoint from both
-/// (`runtime/lifecycle/asr_memory.rs`).
+/// The dtype the Parakeet loader reads every weight in, and the dtype of the
+/// encoder's residual stream on every backend. The encoder's projection
+/// weights are then stored in F16 on Metal or BF16 on CUDA (see
+/// [`resolve_parakeet_projection_precision`]). Load admission prices the
+/// checkpoint from both (`runtime/lifecycle/asr_memory.rs`).
 pub(crate) const PARAKEET_WEIGHT_DTYPE: DType = DType::F32;
 
 /// Parakeet's dtype override. On Metal, `f32` keeps every weight in F32 and
-/// `f16` stores the encoder projections in F16; see
+/// `f16` stores the encoder projections in F16; on CUDA, `f32` keeps every
+/// weight in F32 and `bf16` (the default) runs the projections in BF16; see
 /// [`resolve_parakeet_projection_precision`].
 pub(crate) const PARAKEET_ASR_DTYPE_ENV: &str = "IZWI_PARAKEET_ASR_DTYPE";
 
-/// Whether the encoder's projection weights (FFN, attention q/k/v/out/pos,
-/// pointwise convs and the subsampling output projection) load in F16 on
-/// `device`: F16 when they do, F32 when every weight stays F32. The rest
-/// stays F32 as in whisper.cpp's Parakeet converter: subsampling convs,
-/// depthwise conv and BatchNorm, LayerNorms, biases, positional biases, and
-/// the TDT predictor and joint. Activations are F32 throughout. A failed
-/// load-time self-check still falls back to F32 ([`load_weight_only_f16`]).
+/// The precision of the encoder's projections (FFN, attention q/k/v/out/pos,
+/// pointwise convs and the subsampling output projection) on `device`:
+/// - F16 on Metal: weight-only F16 with F32 activations, as in whisper.cpp's
+///   Parakeet converter. A failed load-time self-check still falls back to
+///   F32 ([`load_weight_only_f16`]).
+/// - BF16 on CUDA ([`parakeet_cuda_projection_precision`]): BF16 weights and
+///   GEMMs, each encoder block casting its input to BF16 once and its output
+///   back to the F32 residual stream.
+/// - F32 otherwise: every weight stays F32.
+///
+/// Subsampling convs, depthwise conv and BatchNorm, LayerNorms, positional
+/// biases, the relative-position attention core, and the TDT predictor and
+/// joint stay F32 in every tier.
 pub(crate) fn resolve_parakeet_projection_precision(device: &DeviceProfile) -> DTypeSelection {
     let family = std::env::var(PARAKEET_ASR_DTYPE_ENV).ok();
+    if device.kind.is_cuda() {
+        return parakeet_cuda_projection_precision(
+            device.capabilities.supports_bf16,
+            family.as_deref(),
+        );
+    }
     device.resolve_metal_weight_only_f16(
         family
             .as_deref()
             .map(|value| (PARAKEET_ASR_DTYPE_ENV, value)),
     )
+}
+
+/// The CUDA projection tier: BF16 on a device that supports it, unless the
+/// family override `raw` names F32. The F32 encoder is launch-bound on an
+/// H100 (122 ms per 10 s clip); BF16 keeps F32's range, so it needs no
+/// load-time range probe.
+fn parakeet_cuda_projection_precision(supports_bf16: bool, raw: Option<&str>) -> DTypeSelection {
+    let raw = raw.map(str::trim).filter(|raw| !raw.is_empty());
+    let note = match raw {
+        Some(raw) => match crate::backends::parse_dtype_name(raw) {
+            Some(DType::F32) => {
+                return DTypeSelection {
+                    dtype: DType::F32,
+                    reason: format!("{PARAKEET_ASR_DTYPE_ENV}={raw} keeps every weight in F32")
+                        .into(),
+                };
+            }
+            Some(DType::BF16) => format!("; {PARAKEET_ASR_DTYPE_ENV}={raw}"),
+            _ => format!(
+                "; {PARAKEET_ASR_DTYPE_ENV}={raw} is not a CUDA Parakeet precision and is ignored"
+            ),
+        },
+        None => String::new(),
+    };
+    if !supports_bf16 {
+        return DTypeSelection {
+            dtype: DType::F32,
+            reason: format!("the CUDA device reports no BF16 support; weights stay F32{note}")
+                .into(),
+        };
+    }
+    DTypeSelection {
+        dtype: DType::BF16,
+        reason: format!(
+            "CUDA default: BF16 encoder projections and GEMMs with an F32 residual stream{note}"
+        )
+        .into(),
+    }
 }
 
 /// Whether checkpoint tensor `name` is one of the encoder projections that
@@ -112,12 +167,99 @@ pub(crate) fn parakeet_tensor_is_f16_projection(name: &str) -> bool {
         )
 }
 
-/// The host-side builder for weights that load in F16: they are read on the
-/// CPU and converted there, so their F32 form never reaches the GPU.
-fn projection_vb<'a>(vb: &VarBuilder<'a>, f16: Option<&Device>) -> VarBuilder<'a> {
-    match f16 {
-        Some(_) => vb.clone().set_device(Device::Cpu),
-        None => vb.clone(),
+/// Whether checkpoint tensor `name` loads in BF16 when
+/// [`resolve_parakeet_projection_precision`] selects BF16: the F16 set plus
+/// the subsampling output projection's bias, which its BF16 GEMM adds.
+/// Admission prices these at BF16.
+pub(crate) fn parakeet_tensor_is_bf16_projection(name: &str) -> bool {
+    name == "encoder.pre_encode.out.bias" || parakeet_tensor_is_f16_projection(name)
+}
+
+/// How the encoder's projections load: the tier
+/// [`resolve_parakeet_projection_precision`] selects, on its device.
+#[derive(Debug, Clone, Copy)]
+enum Projections<'a> {
+    /// Every weight dense F32 on the checkpoint's device.
+    F32,
+    /// Weight-only F16 on the device: F32 activations.
+    F16(&'a Device),
+    /// BF16 weights and GEMMs on the device: each block casts its input to
+    /// BF16 once and its output back to F32.
+    Bf16(&'a Device),
+}
+
+impl<'a> Projections<'a> {
+    /// The builder projections read from: the host for a converted tier, so
+    /// the weight is converted there and its F32 form never reaches the GPU.
+    fn vb<'v>(self, vb: &VarBuilder<'v>) -> VarBuilder<'v> {
+        match self {
+            Self::F32 => vb.clone(),
+            Self::F16(_) | Self::Bf16(_) => vb.clone().set_device(Device::Cpu),
+        }
+    }
+
+    fn f16_device(self) -> Option<&'a Device> {
+        match self {
+            Self::F16(device) => Some(device),
+            Self::F32 | Self::Bf16(_) => None,
+        }
+    }
+
+    /// The dtype the projection GEMMs run in.
+    fn dtype(self) -> DType {
+        match self {
+            Self::Bf16(_) => DType::BF16,
+            Self::F32 | Self::F16(_) => DType::F32,
+        }
+    }
+
+    /// `linear`, read through [`Self::vb`], in this tier.
+    fn linear(self, linear: Linear) -> Result<ProjectionLinear> {
+        match self {
+            Self::Bf16(device) => Ok(ProjectionLinear::Dense(bf16_linear(
+                linear.weight(),
+                linear.bias(),
+                device,
+            )?)),
+            Self::F32 | Self::F16(_) => {
+                ProjectionLinear::new(linear, self.f16_device()).map_err(Error::from)
+            }
+        }
+    }
+
+    /// The pointwise conv `conv`, read through [`Self::vb`], in this tier.
+    fn pointwise(self, conv: Conv1d) -> Result<ConvPointwise> {
+        match self {
+            Self::Bf16(device) => {
+                let (out_channels, in_channels, _) = conv.weight().dims3()?;
+                Ok(ConvPointwise::Bf16(bf16_linear(
+                    &conv.weight().reshape((out_channels, in_channels))?,
+                    conv.bias(),
+                    device,
+                )?))
+            }
+            Self::F32 | Self::F16(_) => Ok(ConvPointwise::Conv(PointwiseConv1d::new(
+                conv,
+                self.f16_device(),
+            )?)),
+        }
+    }
+}
+
+/// A BF16 copy of a host weight (and bias) on `device`, converted on the host
+/// and uploaded once at its exact size.
+fn bf16_linear(weight: &Tensor, bias: Option<&Tensor>, device: &Device) -> Result<Linear> {
+    let upload = |tensor: &Tensor| tensor.to_dtype(DType::BF16)?.to_device(device);
+    Ok(Linear::new(upload(weight)?, bias.map(upload).transpose()?))
+}
+
+/// `x` as a contiguous tensor of `dtype`. A cast writes contiguous output, so
+/// a strided view costs one kernel either way.
+fn contiguous_as(x: &Tensor, dtype: DType) -> candle_core::Result<Tensor> {
+    if x.dtype() == dtype {
+        x.contiguous()
+    } else {
+        x.to_dtype(dtype)
     }
 }
 
@@ -204,6 +346,17 @@ struct EncoderWindow {
 }
 
 impl EncoderWindow {
+    /// The one window of an input of at most one window: every frame is
+    /// encoded and kept.
+    const fn whole(encoded_len: usize) -> Self {
+        Self {
+            start: 0,
+            end: encoded_len,
+            keep_start: 0,
+            keep_end: encoded_len,
+        }
+    }
+
     /// The log-mel columns that produce this window's frames: whole groups
     /// of the ×8 subsampling, clipped to the spectrogram. Stopping at
     /// `8 · end` also drops the STFT padding column when the valid frames are
@@ -226,12 +379,7 @@ fn plan_encoder_windows(
 ) -> Result<Vec<EncoderWindow>> {
     if encoded_len <= window {
         return Ok((encoded_len > 0)
-            .then_some(EncoderWindow {
-                start: 0,
-                end: encoded_len,
-                keep_start: 0,
-                keep_end: encoded_len,
-            })
+            .then_some(EncoderWindow::whole(encoded_len))
             .into_iter()
             .collect());
     }
@@ -265,11 +413,62 @@ fn plan_encoder_windows(
     }
 }
 
+/// Windows [`plan_encoder_windows`] plans over `encoded_len` frames.
+fn encoder_window_count(encoded_len: usize, windowing: EncoderWindowing) -> Result<usize> {
+    Ok(plan_encoder_windows(
+        encoded_len,
+        windowing.frames,
+        windowing.left_context,
+        windowing.right_context,
+    )?
+    .len()
+    .max(1))
+}
+
+/// Kill switch for stacking a long input's encoder windows as batch rows (a
+/// boolean; on when unset). Off, the windows encode one after another.
+/// Read once: admission prices the stacked rows from it, and the encoder
+/// runs them.
+pub(crate) const PARAKEET_WINDOW_BATCHING_ENV: &str = "IZWI_PARAKEET_WINDOW_BATCHING";
+
+fn window_batching_enabled() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(PARAKEET_WINDOW_BATCHING_ENV, true));
+    ON.get()
+}
+
+/// The most windows of one long input the encoder runs as the rows of one
+/// batch on `backend`. Every window of a long input has the same frames, so
+/// the rows need no padding and a batch costs about one window's launches,
+/// which is what a launch-bound GPU pays for. A full 1,024-frame window's
+/// layer buffers are about 416 MiB, so CUDA stacks four (about 1.4 GiB).
+/// Metal and the CPU are compute-bound at this length and run the windows
+/// one after another, as before: on an M-series Mac two stacked windows
+/// encoded a 600 s file in 17.3 s against 14.7 s one at a time.
+fn window_batch_rows(backend: BackendKind) -> usize {
+    match backend {
+        BackendKind::Cuda if window_batching_enabled() => 4,
+        _ => 1,
+    }
+}
+
+/// The `(rows, frames)` one batch of a long input's `windows` windows of
+/// `frames` frames runs at on `backend`.
+fn window_batch_shape(windows: usize, frames: usize, backend: BackendKind) -> (usize, usize) {
+    encoder_batch_shape(
+        windows.clamp(1, window_batch_rows(backend)),
+        frames,
+        backend,
+    )
+}
+
 /// Peak preparation memory beyond the weights and the retained artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ParakeetPreparationBytes {
-    /// Host log-mel pipeline: mono copy, pre-emphasis and padded copies,
-    /// power spectrum and log-mel.
+    /// Host bytes: the log-mel pipeline of a whole request (mono copy,
+    /// pre-emphasis and padded copies, power spectrum and log-mel) in
+    /// [`parakeet_preparation_bytes`]; one window's normalized feature copy
+    /// in a device job's [`parakeet_encode_row_bytes`].
     pub(crate) host_bytes: u64,
     /// One encoder window's peak: the first subsampling convolution and its
     /// ReLU copy over one stem slice, the attention scores and `rel_shift`
@@ -295,8 +494,148 @@ pub(crate) fn parakeet_preparation_bytes(
     samples: usize,
     backend: BackendKind,
 ) -> Result<ParakeetPreparationBytes> {
-    const F32_BYTES: u64 = 4;
     const HOST_BYTES_PER_SAMPLE: u64 = 22;
+    let valid_frames = preprocessor::valid_feature_frames(samples);
+    // The STFT emits one padding frame past the valid ones.
+    let window = subsampled_len_3x(valid_frames + 1).min(EncoderWindowing::V3.frames);
+    let host_bytes = u64::try_from(samples)
+        .ok()
+        .and_then(|samples| samples.checked_mul(HOST_BYTES_PER_SAMPLE))
+        .ok_or_else(|| Error::Overloaded("Parakeet preparation bytes overflowed".into()))?;
+    // A lone window of one 82 s window or less runs at its graph's shape; a
+    // longer input stacks its windows as the rows of one batch.
+    let windows = encoder_window_count(subsampled_len_3x(valid_frames), EncoderWindowing::V3)?;
+    let (batch_rows, window) = window_batch_shape(windows, window, backend);
+    Ok(ParakeetPreparationBytes {
+        host_bytes,
+        window_bytes: encoder_window_row_bytes(window, batch_rows, 1, backend)?,
+        output_bytes: encoder_output_bytes(subsampled_len_3x(valid_frames), backend)?,
+    })
+}
+
+/// The `(rows, frames)` the encoder runs a batch of `rows` rows padded to
+/// `padded_frames` at: single-window rows at their graph's shape where
+/// [`encoder_batch_shape`] gives one; a longer row (always alone) stacks
+/// its windows as the rows of one batch ([`window_batch_shape`]).
+fn encode_row_shape(
+    features: &ParakeetHostFeatures,
+    padded_frames: usize,
+    rows: usize,
+    backend: BackendKind,
+) -> (usize, usize) {
+    if features.single_window() {
+        encoder_batch_shape(rows, padded_frames, backend)
+    } else {
+        window_batch_shape(features.encoder_windows(), padded_frames, backend)
+    }
+}
+
+/// Prices one row's device job in an encoder batch of `rows` rows whose
+/// windows are padded to `padded_frames` encoder frames (on CUDA, to the
+/// graph shape [`encoder_batch_shape`] gives): its share of the
+/// batch's window peak, its own retained output, and on the host the
+/// normalized feature copy each window uploads. The log-mel pipeline itself
+/// ran on a host worker before the row was admitted.
+pub(crate) fn parakeet_encode_row_bytes(
+    features: &ParakeetHostFeatures,
+    padded_frames: usize,
+    rows: usize,
+    backend: BackendKind,
+) -> Result<ParakeetPreparationBytes> {
+    const F32_BYTES: usize = 4;
+    let columns = features
+        .feature_frames()
+        .min(features.window_frames().saturating_mul(SUBSAMPLING_FACTOR));
+    // A long row uploads the features of every window it stacks.
+    let uploads = if features.single_window() {
+        1
+    } else {
+        features
+            .encoder_windows()
+            .clamp(1, window_batch_rows(backend))
+    };
+    let host_bytes = EncoderGeometry::V3
+        .mel_bins
+        .checked_mul(columns)
+        .and_then(|elements| elements.checked_mul(uploads))
+        .and_then(|elements| elements.checked_mul(F32_BYTES))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| Error::Overloaded("Parakeet preparation bytes overflowed".into()))?;
+    let (batch_rows, frames) = encode_row_shape(features, padded_frames, rows, backend);
+    Ok(ParakeetPreparationBytes {
+        host_bytes,
+        window_bytes: encoder_window_row_bytes(frames, batch_rows, rows, backend)?,
+        output_bytes: encoder_output_bytes(features.encoded_len(), backend)?,
+    })
+}
+
+/// Useful and materialized encoder-output elements of one row in a batch
+/// of `rows` rows padded to `padded_frames`: a single-window row is padded
+/// up to the batch's longest row (on CUDA, to its graph's frames), a longer
+/// row (always alone) never.
+pub(crate) fn parakeet_encode_row_elements(
+    features: &ParakeetHostFeatures,
+    padded_frames: usize,
+    rows: usize,
+    backend: BackendKind,
+) -> Result<(u64, u64)> {
+    let (_, padded_frames) = encode_row_shape(features, padded_frames, rows, backend);
+    let padding = padded_frames.saturating_sub(features.window_frames());
+    let elements = |frames: usize| {
+        frames
+            .checked_mul(EncoderGeometry::V3.dim)
+            .and_then(|elements| u64::try_from(elements).ok())
+            .ok_or_else(|| Error::Overloaded("Parakeet preparation geometry overflowed".into()))
+    };
+    let encoded_len = features.encoded_len();
+    Ok((
+        elements(encoded_len)?,
+        elements(encoded_len.saturating_add(padding))?,
+    ))
+}
+
+/// One row's share of the peak of an encoder batch of `batch_rows` windows
+/// of `window` frames that holds `rows` real rows (the rest pad it to a
+/// graph's width).
+fn encoder_window_row_bytes(
+    window: usize,
+    batch_rows: usize,
+    rows: usize,
+    backend: BackendKind,
+) -> Result<u64> {
+    let bytes = encoder_window_batch_bytes(window, batch_rows, backend)?;
+    let rows = u64::try_from(rows.max(1))
+        .map_err(|_| Error::Overloaded("Parakeet preparation bytes overflowed".into()))?;
+    Ok(bytes
+        .stem
+        .checked_add(bytes.layers)
+        .ok_or_else(|| Error::Overloaded("Parakeet preparation bytes overflowed".into()))?
+        .div_ceil(rows))
+}
+
+/// The peak of an encoder batch of `rows` windows of `window` frames: the
+/// stem runs row by row, so its planes count once per batch; the attention
+/// and layer buffers hold every row. Metal rounds each whole batch buffer up
+/// to a power of two. Eager attention's score and `rel_shift` planes count
+/// unless the fused CUDA kernel passed its self-check
+/// ([`relpos_attention::fused_priced`]); the encoder runs that kernel then.
+fn encoder_window_batch_bytes(
+    window: usize,
+    rows: usize,
+    backend: BackendKind,
+) -> Result<EncoderBatchBytes> {
+    let fused = relpos_attention::fused_priced(backend);
+    encoder_window_batch_bytes_with(window, rows, backend, fused)
+}
+
+/// [`encoder_window_batch_bytes`] with the fused attention on or off.
+fn encoder_window_batch_bytes_with(
+    window: usize,
+    rows: usize,
+    backend: BackendKind,
+    fused_attention: bool,
+) -> Result<EncoderBatchBytes> {
+    const F32_BYTES: u64 = 4;
     // About six [T, ff_dim] activations are live inside a layer at once: the
     // feed-forward block's linear, sigmoid and product, plus residual and
     // convolution-module buffers (report 11 sizes them as 98,304·T bytes).
@@ -311,10 +650,7 @@ pub(crate) fn parakeet_preparation_bytes(
         }
     };
     let as_u64 = |value: usize| u64::try_from(value).map_err(|_| overflow());
-    let valid_frames = preprocessor::valid_feature_frames(samples);
-    let encoded_len = as_u64(subsampled_len_3x(valid_frames))?;
-    // The STFT emits one padding frame past the valid ones.
-    let window = as_u64(subsampled_len_3x(valid_frames + 1).min(EncoderWindowing::V3.frames))?;
+    let (window, rows) = (as_u64(window)?, as_u64(rows.max(1))?);
     let (channels, mel_bins) = (
         as_u64(geometry.subsampling_channels)?,
         as_u64(geometry.mel_bins)?,
@@ -337,24 +673,123 @@ pub(crate) fn parakeet_preparation_bytes(
         SUBSAMPLING_SLICE_FRAMES + 2 * SUBSAMPLING_HALO_FRAMES,
     )?);
     let stem_plane = multiply(&[channels, 4 * stem_frames, mel_bins / 2, F32_BYTES])?;
-    let scores = multiply(&[heads, window, window, F32_BYTES])?;
-    // q_v·pᵀ, its zero pad and the reshaped copy, each [H, T, 2T].
-    let rel_shift = multiply(&[heads, window, 2 * window, F32_BYTES])?;
-    let activation = multiply(&[window, ff_dim, F32_BYTES])?;
-    let window_bytes = [
-        multiply(&[3, round(stem_plane)?])?,
-        round(scores)?,
-        multiply(&[3, round(rel_shift)?])?,
-        multiply(&[LAYER_ACTIVATIONS, round(activation)?])?,
-    ]
-    .into_iter()
-    .try_fold(0u64, |total, bytes| total.checked_add(bytes))
-    .ok_or_else(overflow)?;
-    Ok(ParakeetPreparationBytes {
-        host_bytes: multiply(&[as_u64(samples)?, HOST_BYTES_PER_SAMPLE])?,
-        window_bytes,
-        output_bytes: round(multiply(&[encoded_len, dim, F32_BYTES])?)?,
+    let activation = multiply(&[rows, window, ff_dim, F32_BYTES])?;
+    let mut layers = vec![multiply(&[LAYER_ACTIVATIONS, round(activation)?])?];
+    if fused_attention {
+        // The fused kernel keeps no score plane; the positional projection
+        // p is read in place, once for every row.
+        layers.push(round(multiply(&[dim, 2 * window, F32_BYTES])?)?);
+    } else {
+        layers.push(round(multiply(&[rows, heads, window, window, F32_BYTES])?)?);
+        // q_v·pᵀ, its zero pad and the reshaped copy, each [H, T, 2T].
+        let rel_shift = multiply(&[rows, heads, window, 2 * window, F32_BYTES])?;
+        layers.push(multiply(&[3, round(rel_shift)?])?);
+        if rows > 1 {
+            // The positional projection pᵀ, copied out for every row.
+            layers.push(round(multiply(&[rows, dim, 2 * window, F32_BYTES])?)?);
+        }
+    }
+    let layers = layers
+        .into_iter()
+        .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(overflow)?;
+    Ok(EncoderBatchBytes {
+        stem: multiply(&[3, round(stem_plane)?])?,
+        layers,
     })
+}
+
+/// The peak of an encoder batch, in its two parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EncoderBatchBytes {
+    /// The stem's planes over one slice of one row.
+    stem: u64,
+    /// The conformer layers' attention and activation buffers over every
+    /// row: a graphed batch's working set.
+    layers: u64,
+}
+
+/// Kill switch for the Parakeet encoder's CUDA graphs (a boolean; on when
+/// unset). Read once: admission prices the graphed shapes from it, and the
+/// encoder captures them.
+pub(crate) const PARAKEET_ENCODER_GRAPHS_ENV: &str = "IZWI_PARAKEET_ENCODER_GRAPHS";
+
+fn encoder_graphs_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(PARAKEET_ENCODER_GRAPHS_ENV, true));
+    ON.get()
+}
+
+/// Batch widths the encoder graphs are captured at. A graphed batch pads
+/// its rows up to the next, so a busy server's varying widths share ten
+/// graphs per length bucket rather than one graph per width.
+const ENCODER_GRAPH_ROWS: [usize; 10] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32];
+
+const MIB: u64 = 1024 * 1024;
+
+/// What the encoder graphs may hold. The pool budget bounds a graph's
+/// working set ([`EncoderBatchBytes::layers`]): 32 rows of 128 frames
+/// (10 s clips) need 528 MiB, so every width of 10 s clips, 12 rows of
+/// 20 s clips and a lone 82 s window are graphed. The retained budget holds
+/// the kept graphs' input copies and outputs: 33 MiB for 32 rows of 128
+/// frames.
+const ENCODER_GRAPH_LIMITS: ShapeGraphLimits = ShapeGraphLimits {
+    max_graphs: 24,
+    retained_bytes: 192 * MIB,
+    pool_bytes: 576 * MIB,
+};
+
+/// Device bytes a load on `backend` prices for the encoder graphs, which
+/// allocate lazily on their first batches: zero off CUDA or with the graphs
+/// switched off.
+pub(crate) fn parakeet_encoder_graph_device_bytes(backend: BackendKind) -> u64 {
+    if backend == BackendKind::Cuda && encoder_graphs_requested() {
+        ENCODER_GRAPH_LIMITS.device_bytes()
+    } else {
+        0
+    }
+}
+
+/// The `(rows, frames)` a graph runs a batch of `rows` single-window rows
+/// whose longest has `frames` frames at: rows up to the next graph width,
+/// frames up to a power of two. `None` past 32 rows, past one window, or
+/// past the pool budget.
+fn encoder_graph_shape(rows: usize, frames: usize) -> Option<(usize, usize)> {
+    let rows = ENCODER_GRAPH_ROWS
+        .into_iter()
+        .find(|width| *width >= rows.max(1))?;
+    let frames = frames.max(1).checked_next_power_of_two()?;
+    if frames > EncoderWindowing::V3.frames {
+        return None;
+    }
+    let bytes = encoder_window_batch_bytes(frames, rows, BackendKind::Cuda).ok()?;
+    (bytes.layers <= ENCODER_GRAPH_LIMITS.pool_bytes).then_some((rows, frames))
+}
+
+/// The `(rows, frames)` an encoder batch of `rows` single-window rows
+/// padded to `frames` frames runs at on `backend`: a graph's shape on CUDA
+/// with the encoder graphs on, else as given. Admission prices this shape;
+/// the encoder runs it, or the given one once its graphs are off.
+fn encoder_batch_shape(rows: usize, frames: usize, backend: BackendKind) -> (usize, usize) {
+    if backend == BackendKind::Cuda && encoder_graphs_requested() {
+        if let Some(shape) = encoder_graph_shape(rows, frames) {
+            return shape;
+        }
+    }
+    (rows, frames)
+}
+
+/// The retained `[1, E, D]` encoder output.
+fn encoder_output_bytes(encoded_len: usize, backend: BackendKind) -> Result<u64> {
+    let bytes = encoded_len
+        .checked_mul(EncoderGeometry::V3.dim)
+        .and_then(|elements| elements.checked_mul(4))
+        .and_then(|bytes| u64::try_from(bytes).ok());
+    match (bytes, backend) {
+        (Some(bytes), BackendKind::Metal) => bytes.checked_next_power_of_two(),
+        (bytes, _) => bytes,
+    }
+    .ok_or_else(|| Error::Overloaded("Parakeet preparation bytes overflowed".into()))
 }
 
 pub struct ParakeetAsrTranscriptionOutput {
@@ -379,12 +814,96 @@ pub(crate) struct ParakeetPreparedEncoderArtifact {
 }
 
 impl ParakeetPreparedEncoderArtifact {
+    /// The device holding the encoder output.
+    pub(crate) fn device_location(&self) -> candle_core::DeviceLocation {
+        self.encoded.device().location()
+    }
+
     pub(crate) fn resident_tensor_bytes(&self) -> Result<u64> {
         let mut accounting = TensorStorageAccounting::default();
         accounting.add_tensor(&self.encoded).ok_or_else(|| {
             Error::Overloaded("Parakeet encoder artifact storage accounting overflowed".into())
         })?;
         Ok(accounting.bytes())
+    }
+}
+
+/// One request's encoder input, computed on a host worker: the 16 kHz
+/// log-mel of its audio, before per-window normalization.
+pub(crate) struct ParakeetHostFeatures {
+    log_mel: ParakeetLogMel,
+    input_samples: usize,
+    input_sample_rate: u32,
+    resampled_samples: usize,
+    log_mel_ms: f64,
+    /// Frames of one encoder window.
+    window_frames: usize,
+    /// Encoder windows the input spans (one when it fits a window).
+    windows: usize,
+}
+
+impl ParakeetHostFeatures {
+    /// Encoder frames (E) these features encode to.
+    pub(crate) fn encoded_len(&self) -> usize {
+        subsampled_len_3x(self.log_mel.valid_frames())
+    }
+
+    /// Whether the audio fits one encoder window, the only rows a batch of
+    /// more than one request holds.
+    pub(crate) fn single_window(&self) -> bool {
+        self.encoded_len() <= self.window_frames
+    }
+
+    /// Encoder frames attention spans at once: the whole input when it fits
+    /// one window, else one window.
+    pub(crate) fn window_frames(&self) -> usize {
+        self.encoded_len().min(self.window_frames)
+    }
+
+    /// Encoder windows the input spans: one when it fits a window.
+    pub(crate) const fn encoder_windows(&self) -> usize {
+        self.windows
+    }
+
+    /// The input sample count, at the request's own rate.
+    pub(crate) const fn input_samples(&self) -> usize {
+        self.input_samples
+    }
+
+    /// Log-mel columns, including the STFT padding column.
+    pub(crate) const fn feature_frames(&self) -> usize {
+        self.log_mel.frames()
+    }
+
+    /// Host bytes the features hold until the encode drops them.
+    pub(crate) fn host_bytes(&self) -> Result<u64> {
+        self.log_mel
+            .resident_bytes()
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| Error::Overloaded("Parakeet log-mel bytes overflowed".into()))
+    }
+
+    fn artifact(
+        &self,
+        encoded: Tensor,
+        encoder_windows: usize,
+        language: Option<&str>,
+        windowing: EncoderWindowing,
+        encode_ms: f64,
+    ) -> ParakeetPreparedEncoderArtifact {
+        ParakeetPreparedEncoderArtifact {
+            encoded,
+            encoded_len: self.encoded_len(),
+            input_samples: self.input_samples,
+            input_sample_rate: self.input_sample_rate,
+            resampled_samples: self.resampled_samples,
+            feature_frames: self.log_mel.valid_frames(),
+            language: language.map(ToOwned::to_owned),
+            windowing,
+            encoder_windows,
+            log_mel_ms: self.log_mel_ms,
+            encode_ms,
+        }
     }
 }
 
@@ -425,10 +944,9 @@ pub(crate) fn parakeet_max_emittable_tokens(
 pub(crate) struct ParakeetRetainedDecodeState {
     predictor: ParakeetPredictorBatchState,
     predictor_out: Tensor,
-    t: usize,
-    last_emit_t: usize,
-    emit_count_at_t: usize,
-    guard_steps: usize,
+    /// The TDT cursor: the next frame, the last emission's frame and count,
+    /// and the joint steps taken.
+    cursor: TdtRow,
     token_ids: Vec<usize>,
     token_frames: Vec<TdtTokenFrame>,
     detokenizer: IncrementalDetokenizer,
@@ -444,6 +962,9 @@ pub(crate) struct ParakeetRetainedDecodeBatchRow<'a> {
     /// The request's decode budget. The scheduler stops scheduling a row at
     /// this many tokens, so the row must finish here rather than strand.
     pub(crate) max_tokens: usize,
+    /// Tokens this engine step may emit for the row (the scheduler's
+    /// quantum, at least one). The eager step emits at most one.
+    pub(crate) quota: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -499,6 +1020,8 @@ pub struct ParakeetAsrModel {
     max_symbols: usize,
     encoder_windowing: EncoderWindowing,
     weight_precision: WeightOnlyF16Load,
+    /// The device decode's dispatch graphs (CUDA), or why there are none.
+    decode_graphs: std::result::Result<crate::kernels::transducer_greedy::TransducerGraphs, String>,
 }
 
 enum ParakeetDecoder {
@@ -615,6 +1138,14 @@ fn tdt_word_timestamps(
     words
 }
 
+/// One request of a Parakeet encoder batch.
+pub(crate) struct ParakeetEncoderBatchRow<'a> {
+    pub(crate) features: &'a ParakeetHostFeatures,
+    pub(crate) language: Option<&'a str>,
+    /// Fails when the request is cancelled or past its deadline.
+    pub(crate) checkpoint: &'a dyn Fn() -> Result<()>,
+}
+
 impl ParakeetAsrModel {
     pub(crate) fn new_predictor_batch_state(
         &self,
@@ -670,6 +1201,7 @@ impl ParakeetAsrModel {
 
     /// Encodes the audio into the artifact the retained decode reads.
     /// `checkpoint` runs between encoder windows; its error aborts the encode.
+    #[cfg(test)]
     pub(crate) fn prepare_retained_encoder(
         &self,
         audio: &[f32],
@@ -677,6 +1209,17 @@ impl ParakeetAsrModel {
         language: Option<&str>,
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<ParakeetPreparedEncoderArtifact> {
+        let features = self.prepare_host_features(audio, sample_rate)?;
+        self.encode_host_features(&features, language, checkpoint)
+    }
+
+    /// Resamples the audio to 16 kHz and computes its log-mel on the host,
+    /// so a request's device job runs only the encoder.
+    pub(crate) fn prepare_host_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<ParakeetHostFeatures> {
         if audio.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".into()));
         }
@@ -695,30 +1238,113 @@ impl ParakeetAsrModel {
         let log_mel = self.preprocessor.compute_log_mel(&mono)?;
         drop(mono);
         let log_mel_ms = elapsed_ms(log_mel_started);
-        let encode_started = Instant::now();
-        let encoded = self.encode_log_mel(&log_mel, &mut ParakeetTimings::default(), checkpoint)?;
-        let encode_ms = elapsed_ms(encode_started);
+        let encoded_len = subsampled_len_3x(log_mel.valid_frames());
         // Preparation sized the decode budget from the sample count alone.
         let budgeted_len = parakeet_encoded_len_for_samples(audio.len(), sample_rate);
-        if encoded.encoded_len != budgeted_len {
+        if encoded_len != budgeted_len {
             return Err(Error::InferenceError(format!(
-                "Parakeet encoder produced {} frames but its decode budget assumed {budgeted_len}",
-                encoded.encoded_len
+                "Parakeet encoder produced {encoded_len} frames but its decode budget assumed {budgeted_len}"
             )));
         }
-        Ok(ParakeetPreparedEncoderArtifact {
-            encoded: deep_copy_tensor_storage(&encoded.encoded)?,
-            encoded_len: encoded.encoded_len,
+        Ok(ParakeetHostFeatures {
+            log_mel,
             input_samples: audio.len(),
             input_sample_rate: sample_rate,
             resampled_samples,
-            feature_frames: log_mel.valid_frames(),
-            language: language.map(ToOwned::to_owned),
-            windowing: self.encoder_windowing,
-            encoder_windows: encoded.windows,
             log_mel_ms,
-            encode_ms,
+            window_frames: self.encoder_windowing.frames,
+            windows: encoder_window_count(encoded_len, self.encoder_windowing)?,
         })
+    }
+
+    /// Encodes one request's host features into the artifact the retained
+    /// decode reads, window by window. `checkpoint` runs before every
+    /// window; its error aborts the encode.
+    pub(crate) fn encode_host_features(
+        &self,
+        features: &ParakeetHostFeatures,
+        language: Option<&str>,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<ParakeetPreparedEncoderArtifact> {
+        let encode_started = Instant::now();
+        let encoded = self.encode_log_mel(
+            &features.log_mel,
+            &mut ParakeetTimings::default(),
+            checkpoint,
+        )?;
+        let encode_ms = elapsed_ms(encode_started);
+        Ok(features.artifact(
+            deep_copy_tensor_storage(&encoded.encoded)?,
+            encoded.windows,
+            language,
+            self.encoder_windowing,
+            encode_ms,
+        ))
+    }
+
+    /// Encodes the rows of one preparation batch. A single row runs
+    /// [`Self::encode_host_features`]; wider batches hold only single-window
+    /// rows, which encode as one padded batch. A row whose checkpoint fails
+    /// before the encode fails alone; an encoder error fails the batch.
+    pub(crate) fn prepare_retained_encoder_batch(
+        &self,
+        rows: &[ParakeetEncoderBatchRow<'_>],
+    ) -> Result<Vec<Result<ParakeetPreparedEncoderArtifact>>> {
+        if let [row] = rows {
+            return match self.encode_host_features(row.features, row.language, row.checkpoint) {
+                Ok(artifact) => Ok(vec![Ok(artifact)]),
+                Err(error @ (Error::Cancelled(_) | Error::Timeout(_))) => Ok(vec![Err(error)]),
+                Err(error) => Err(error),
+            };
+        }
+        if rows.iter().any(|row| !row.features.single_window()) {
+            return Err(Error::InvalidInput(
+                "Parakeet encoder batches hold only single-window rows".into(),
+            ));
+        }
+        let mut outcomes = rows
+            .iter()
+            .map(|row| (row.checkpoint)().err().map(Err))
+            .collect::<Vec<Option<Result<ParakeetPreparedEncoderArtifact>>>>();
+        let live = (0..rows.len())
+            .filter(|index| outcomes[*index].is_none())
+            .collect::<Vec<_>>();
+        if let [index] = live[..] {
+            let row = &rows[index];
+            outcomes[index] =
+                Some(self.encode_host_features(row.features, row.language, row.checkpoint));
+        } else if !live.is_empty() {
+            let device = self.preprocessor.device();
+            let encode_started = Instant::now();
+            let inputs = live
+                .iter()
+                .map(|index| {
+                    let features = rows[*index].features;
+                    let encoded_len = features.encoded_len();
+                    let columns = EncoderWindow::whole(encoded_len)
+                        .feature_columns(features.feature_frames());
+                    let window = features.log_mel.normalize_and_upload(columns, device)?;
+                    Ok((window, encoded_len))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let encoded = self.network.encoder.encode_single_window_batch(&inputs)?;
+            drop(inputs);
+            let encode_ms = elapsed_ms(encode_started);
+            for (index, encoded) in live.into_iter().zip(encoded) {
+                let row = &rows[index];
+                outcomes[index] = Some(Ok(row.features.artifact(
+                    encoded,
+                    1,
+                    row.language,
+                    self.encoder_windowing,
+                    encode_ms,
+                )));
+            }
+        }
+        Ok(outcomes
+            .into_iter()
+            .map(|outcome| outcome.expect("every Parakeet batch row has an outcome"))
+            .collect())
     }
 
     /// Runs the windowed encoder over a host log-mel, normalizing each
@@ -734,6 +1360,7 @@ impl ParakeetAsrModel {
             log_mel.frames(),
             subsampled_len_3x(log_mel.valid_frames()),
             self.encoder_windowing,
+            window_batch_rows(crate::backends::backend_kind_for_device(device)),
             &mut |columns| log_mel.normalize_and_upload(columns, device),
             timings,
             checkpoint,
@@ -766,10 +1393,7 @@ impl ParakeetAsrModel {
                 Ok(ParakeetRetainedDecodeState {
                     predictor,
                     predictor_out: outputs.narrow(0, index, 1)?.contiguous()?,
-                    t: 0,
-                    last_emit_t: usize::MAX,
-                    emit_count_at_t: 0,
-                    guard_steps: 0,
+                    cursor: TdtRow::START,
                     token_ids: Vec::new(),
                     token_frames: Vec::new(),
                     detokenizer: IncrementalDetokenizer::new(),
@@ -886,7 +1510,14 @@ impl ParakeetAsrModel {
             "tdt_blank_steps": state.counters.tdt_blank_steps,
             "host_argmax_reads": state.counters.host_argmax_reads,
             "device_argmax_scalar_reads": state.counters.device_argmax_scalar_reads,
-            "weight_precision": self.weight_precision.diagnostics(),
+            "weight_precision": self.weight_precision_diagnostics(),
+            "encoder_graphs": self.network.encoder.graphs_diagnostics(),
+            "transducer_decode": device_decode::device_decode_diagnostics(
+                self.network.predictor.embed.device(),
+            ),
+            "transducer_graphs": crate::kernels::transducer_greedy::transducer_graphs_diagnostics(
+                &self.decode_graphs,
+            ),
         });
         if let Some(stop_reason) = state.stop_reason {
             diagnostics["stop_reason"] = stop_reason.into();
@@ -917,19 +1548,28 @@ impl ParakeetAsrModel {
             ));
         }
         let checkpoints = rows.iter().map(|row| row.state.clone()).collect::<Vec<_>>();
+        if self.device_decode_on() {
+            let result = self.retained_decode_step_batch_device(rows);
+            if result.is_err() {
+                for (row, checkpoint) in rows.iter_mut().zip(checkpoints) {
+                    *row.state = checkpoint;
+                }
+            }
+            return result;
+        }
         let result = (|| {
             loop {
                 let encoded_rows = rows
                     .iter()
                     .map(|row| {
-                        if row.state.t >= row.artifact.encoded_len {
+                        if row.state.cursor.t >= row.artifact.encoded_len {
                             return Err(Error::InferenceError(
                                 "Parakeet retained cursor exceeded encoder artifact".into(),
                             ));
                         }
                         row.artifact
                             .encoded
-                            .i((0, row.state.t, ..))?
+                            .i((0, row.state.cursor.t, ..))?
                             .unsqueeze(0)
                             .map_err(Error::from)
                     })
@@ -953,44 +1593,35 @@ impl ParakeetAsrModel {
                 let selections =
                     tdt_batch_labels_and_durations(&logits, token_end, self.num_durations)?;
                 let mut emitted = Vec::new();
+                let rules = TdtRules {
+                    blank: self.blank_idx,
+                    num_durations: self.num_durations,
+                    max_symbols: self.max_symbols,
+                };
                 for (index, row) in rows.iter_mut().enumerate() {
                     let (label, duration) = selections[index];
-                    let duration = duration.min(self.num_durations.saturating_sub(1));
-                    let mut jump = duration;
-                    if label == self.blank_idx && jump == 0 {
-                        jump = 1;
+                    let step = tdt_step(&mut row.state.cursor, label, duration, rules);
+                    let counters = &mut row.state.counters;
+                    counters.tdt_joint_steps = counters.tdt_joint_steps.saturating_add(1);
+                    counters.device_argmax_scalar_reads =
+                        counters.device_argmax_scalar_reads.saturating_add(1);
+                    match step {
+                        TdtStep::Blank => {
+                            counters.tdt_blank_steps = counters.tdt_blank_steps.saturating_add(1);
+                        }
+                        TdtStep::Suppressed => {}
+                        TdtStep::Emit {
+                            label,
+                            frame,
+                            duration,
+                        } => {
+                            row.state.token_ids.push(label);
+                            row.state
+                                .token_frames
+                                .push(TdtTokenFrame { frame, duration });
+                            emitted.push((index, label));
+                        }
                     }
-                    let t_cur = row.state.t;
-                    row.state.t = row.state.t.saturating_add(jump);
-                    row.state.guard_steps = row.state.guard_steps.saturating_add(1);
-                    row.state.counters.tdt_joint_steps =
-                        row.state.counters.tdt_joint_steps.saturating_add(1);
-                    row.state.counters.device_argmax_scalar_reads = row
-                        .state
-                        .counters
-                        .device_argmax_scalar_reads
-                        .saturating_add(1);
-                    if label == self.blank_idx {
-                        row.state.counters.tdt_blank_steps =
-                            row.state.counters.tdt_blank_steps.saturating_add(1);
-                        continue;
-                    }
-                    if t_cur == row.state.last_emit_t {
-                        row.state.emit_count_at_t = row.state.emit_count_at_t.saturating_add(1);
-                    } else {
-                        row.state.last_emit_t = t_cur;
-                        row.state.emit_count_at_t = 1;
-                    }
-                    if row.state.emit_count_at_t > self.max_symbols {
-                        row.state.t = t_cur.saturating_add(1);
-                        continue;
-                    }
-                    row.state.token_ids.push(label);
-                    row.state.token_frames.push(TdtTokenFrame {
-                        frame: t_cur,
-                        duration,
-                    });
-                    emitted.push((index, label));
                 }
                 if !emitted.is_empty() {
                     let refs = emitted
@@ -1015,46 +1646,7 @@ impl ParakeetAsrModel {
                             outputs.narrow(0, cohort_index, 1)?.contiguous()?;
                     }
                 }
-                let mut steps = Vec::with_capacity(rows.len());
-                for row in rows.iter_mut() {
-                    let mut delta = row
-                        .state
-                        .detokenizer
-                        .step(&row.state.token_ids, |ids| Ok(self.decoder.decode(ids)))?;
-                    let guard_limit = row
-                        .artifact
-                        .encoded_len
-                        .saturating_mul(self.max_symbols)
-                        .saturating_mul(8)
-                        .max(512);
-                    let tokens = row.state.token_ids.len();
-                    // Every frame emitting `max_symbols` labels exhausts the
-                    // input as surely as the cursor passing its end does.
-                    let exhausted = row.state.t >= row.artifact.encoded_len
-                        || tokens >= row.artifact.encoded_len.saturating_mul(self.max_symbols);
-                    let budget_reached = !exhausted && tokens >= row.max_tokens.max(1);
-                    if budget_reached {
-                        row.state.stop_reason = Some("max_tokens");
-                    }
-                    row.state.finished =
-                        exhausted || budget_reached || row.state.guard_steps >= guard_limit;
-                    if row.state.finished {
-                        delta.push_str(
-                            &row.state
-                                .detokenizer
-                                .finish(&row.state.token_ids, |ids| Ok(self.decoder.decode(ids)))?,
-                        );
-                    }
-                    row.state.assembled.push_str(&delta);
-                    row.state.counters.detokenized_tokens = row.state.detokenizer.decoded_tokens();
-                    row.state.counters.tdt_emitted_tokens = tokens;
-                    steps.push(ParakeetRetainedDecodeStep {
-                        delta,
-                        text: row.state.assembled.clone(),
-                        tokens_generated: row.state.token_ids.len(),
-                        finished: row.state.finished,
-                    });
-                }
+                let steps = self.retained_decode_steps(rows)?;
                 // A scheduler quantum produces at most one token per row, but
                 // blank-only joint evaluations are consumed inside that
                 // quantum. This matches the original greedy decoder and
@@ -1070,6 +1662,69 @@ impl ParakeetAsrModel {
             }
         }
         result
+    }
+
+    /// Each row's step after its joint steps: the detokenized delta and
+    /// text, and whether it finished (its cursor past its frames, every frame
+    /// at `max_symbols` labels, its token budget, or the joint-step limit).
+    fn retained_decode_steps(
+        &self,
+        rows: &mut [ParakeetRetainedDecodeBatchRow<'_>],
+    ) -> Result<Vec<ParakeetRetainedDecodeStep>> {
+        let mut steps = Vec::with_capacity(rows.len());
+        for row in rows.iter_mut() {
+            let mut delta = row
+                .state
+                .detokenizer
+                .step(&row.state.token_ids, |ids| Ok(self.decoder.decode(ids)))?;
+            let guard_limit = row
+                .artifact
+                .encoded_len
+                .saturating_mul(self.max_symbols)
+                .saturating_mul(8)
+                .max(512);
+            let tokens = row.state.token_ids.len();
+            // Every frame emitting `max_symbols` labels exhausts the
+            // input as surely as the cursor passing its end does.
+            let exhausted = row.state.cursor.t >= row.artifact.encoded_len
+                || tokens >= row.artifact.encoded_len.saturating_mul(self.max_symbols);
+            let budget_reached = !exhausted && tokens >= row.max_tokens.max(1);
+            if budget_reached {
+                row.state.stop_reason = Some("max_tokens");
+            }
+            row.state.finished =
+                exhausted || budget_reached || row.state.cursor.guard_steps >= guard_limit;
+            if row.state.finished {
+                delta.push_str(
+                    &row.state
+                        .detokenizer
+                        .finish(&row.state.token_ids, |ids| Ok(self.decoder.decode(ids)))?,
+                );
+            }
+            row.state.assembled.push_str(&delta);
+            row.state.counters.detokenized_tokens = row.state.detokenizer.decoded_tokens();
+            row.state.counters.tdt_emitted_tokens = tokens;
+            steps.push(ParakeetRetainedDecodeStep {
+                delta,
+                text: row.state.assembled.clone(),
+                tokens_generated: row.state.token_ids.len(),
+                finished: row.state.finished,
+            });
+        }
+        Ok(steps)
+    }
+
+    /// The encoder's projection precision for diagnostics: weight-only F16
+    /// or F32 as loaded, or the BF16 tier's mixed precision.
+    fn weight_precision_diagnostics(&self) -> serde_json::Value {
+        let mut diagnostics = self.weight_precision.diagnostics();
+        if self.network.encoder.projection_dtype == DType::BF16 {
+            diagnostics["projection_weights"] = "BF16".into();
+            diagnostics["activations"] =
+                "BF16 projection GEMMs; F32 residual stream, norms, depthwise conv and attention core"
+                    .into();
+        }
+        diagnostics
     }
 
     pub fn load(
@@ -1125,11 +1780,7 @@ impl ParakeetAsrModel {
         let (network, weight_precision) = ParakeetNetwork::load(&vb, projection_precision)?;
         tracing::info!(
             "Parakeet encoder projections load in {}: {}",
-            if weight_precision.projections_f16 {
-                "F16"
-            } else {
-                "F32"
-            },
+            network.encoder.projection_weights(),
             weight_precision.reason
         );
 
@@ -1144,7 +1795,11 @@ impl ParakeetAsrModel {
             );
         }
 
-        Ok(Self {
+        let decode_graphs = crate::kernels::transducer_greedy::TransducerGraphs::resolve(
+            "Parakeet decode",
+            network.predictor.embed.device(),
+        );
+        let model = Self {
             variant,
             _artifacts: artifacts,
             decoder,
@@ -1155,7 +1810,10 @@ impl ParakeetAsrModel {
             max_symbols: DEFAULT_MAX_SYMBOLS,
             encoder_windowing: EncoderWindowing::V3,
             weight_precision,
-        })
+            decode_graphs,
+        };
+        model.check_device_decode();
+        Ok(model)
     }
 
     pub fn transcribe(
@@ -1363,7 +2021,10 @@ impl ParakeetAsrModel {
             self.max_symbols,
         );
         diagnostics["timestamp_words"] = self.decoder.timestamp_words(&token_ids, &token_frames);
-        diagnostics["execution"]["weight_precision"] = self.weight_precision.diagnostics();
+        diagnostics["execution"]["weight_precision"] = self.weight_precision_diagnostics();
+        diagnostics["execution"]["encoder_graphs"] = self.network.encoder.graphs_diagnostics();
+        diagnostics["execution"]["transducer_graphs"] =
+            crate::kernels::transducer_greedy::transducer_graphs_diagnostics(&self.decode_graphs);
 
         Ok(ParakeetAsrTranscriptionOutput {
             text: assembled,
@@ -1459,6 +2120,10 @@ fn parakeet_diagnostics_json(
             "metal_depthwise_conv2d": metal_kernels::depthwise_conv2d_enabled_for_device(device),
             "conformer_conv_fused": metal_kernels::depthwise_conv1d_bias_swish_enabled_for_device(device),
             "shared_depthwise_conv1d_calls_total": crate::kernels::depthwise_conv::depthwise_conv1d_calls(),
+            "cuda_depthwise_conv1d_kernel": crate::kernels::depthwise_conv::prepare_cuda_kernel(device),
+            "cuda_depthwise_conv1d_kernel_calls_total": crate::kernels::depthwise_conv::depthwise_conv1d_cuda_kernel_calls(),
+            "cuda_relpos_attention": relpos_attention::diagnostics(device),
+            "cuda_transducer_decode": device_decode::device_decode_diagnostics(device),
         },
         "timings_ms": {
             "resample": timings.resample_ms,
@@ -1702,36 +2367,104 @@ struct ParakeetEncoder {
     geometry: EncoderGeometry,
     pre_encode: ConvSubsamplingDw,
     layers: Vec<ConformerLayer>,
+    /// The dtype the projection GEMMs run in: BF16 in the CUDA tier, else
+    /// F32 (weight-only F16 projections take and return F32).
+    projection_dtype: DType,
+    /// CUDA graphs of the conformer layers over a padded single-window
+    /// batch, one per `(rows, frames)` shape ([`encoder_graph_shape`]), or
+    /// why there are none.
+    graphs: std::result::Result<ShapeGraphs<(usize, usize)>, String>,
 }
 
 impl ParakeetEncoder {
-    /// Loads the encoder with its projections in F16 on `f16` when given.
-    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
-        let pre_encode = ConvSubsamplingDw::load(vb.pp("pre_encode"), geometry, f16)?;
+    /// Loads the encoder with its projections in `projections`' tier.
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, projections: Projections) -> Result<Self> {
+        let pre_encode = ConvSubsamplingDw::load(vb.pp("pre_encode"), geometry, projections)?;
         let layers = (0..geometry.layers)
-            .map(|idx| ConformerLayer::load(vb.pp(format!("layers.{idx}")), geometry, f16))
+            .map(|idx| ConformerLayer::load(vb.pp(format!("layers.{idx}")), geometry, projections))
             .collect::<Result<Vec<_>>>()?;
+        let graphs = if encoder_graphs_requested() {
+            ShapeGraphs::resolve("Parakeet encoder", vb.device(), ENCODER_GRAPH_LIMITS)
+        } else {
+            Err(format!("{PARAKEET_ENCODER_GRAPHS_ENV} is off"))
+        };
         Ok(Self {
             geometry,
             pre_encode,
             layers,
+            projection_dtype: projections.dtype(),
+            graphs,
         })
     }
 
-    /// Loads the encoder at `precision` (F16 = weight-only F16 projections),
-    /// keeping F16 only if [`Self::weight_only_f16_self_check`] passes.
+    /// Whether single-window batches run through the CUDA graphs: on CUDA
+    /// with the graphs switched on and no graph failure yet.
+    fn graphs_on(&self) -> bool {
+        self.graphs.as_ref().is_ok_and(ShapeGraphs::is_on)
+    }
+
+    /// The `(rows, frames)` a batch of `rows` single-window rows whose
+    /// longest has `frames` frames runs at: its graph's shape while the
+    /// graphs are on (at most what admission priced, [`encoder_batch_shape`]),
+    /// else as given.
+    fn batch_shape(&self, rows: usize, frames: usize) -> (usize, usize) {
+        if self.graphs_on() {
+            encoder_graph_shape(rows, frames).unwrap_or((rows, frames))
+        } else {
+            (rows, frames)
+        }
+    }
+
+    fn graphs_diagnostics(&self) -> serde_json::Value {
+        match &self.graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        }
+    }
+
+    /// Loads the encoder at `precision`: BF16 projections and GEMMs, or
+    /// weight-only F16 projections kept only if
+    /// [`Self::weight_only_f16_self_check`] passes, or F32.
     fn load_with_precision(
         vb: VarBuilder,
         geometry: EncoderGeometry,
         precision: DTypeSelection,
     ) -> Result<(Self, WeightOnlyF16Load)> {
+        let device = vb.device().clone();
+        if precision.dtype == DType::BF16 {
+            let encoder = Self::load(vb, geometry, Projections::Bf16(&device))?;
+            return Ok((encoder, WeightOnlyF16Load::dense(precision.reason)));
+        }
         load_weight_only_f16(
             "Parakeet",
             &precision,
-            &vb.device().clone(),
-            |f16| Self::load(vb.clone(), geometry, f16),
+            &device,
+            |f16| {
+                let projections = f16.map_or(Projections::F32, Projections::F16);
+                Self::load(vb.clone(), geometry, projections)
+            },
             |encoder| encoder.weight_only_f16_self_check(&vb),
         )
+    }
+
+    /// The projection weights' dtype, as diagnostics report it.
+    fn projection_weights(&self) -> &'static str {
+        if self.pre_encode.out.as_f16().is_some() {
+            "F16"
+        } else if self.projection_dtype == DType::BF16 {
+            "BF16"
+        } else {
+            "F32"
+        }
+    }
+
+    /// The relative positional embedding of a `frames`-frame input, in the
+    /// projection dtype: `linear_pos` reads it in every layer, so it is cast
+    /// once per encode, not once per layer.
+    fn positions(&self, frames: usize, device: &Device) -> Result<Tensor> {
+        build_rel_positional_embedding(frames, self.geometry.dim, device)?
+            .to_dtype(self.projection_dtype)
+            .map_err(Error::from)
     }
 
     /// Checks the F16 conversion against the original F32 weight of the first
@@ -1749,7 +2482,9 @@ impl ParakeetEncoder {
                 let original = mlx::load_linear_no_bias(
                     geometry.dim,
                     geometry.ff_dim,
-                    projection_vb(vb, Some(&Device::Cpu)).pp("layers.0.feed_forward1.linear1"),
+                    Projections::F16(&Device::Cpu)
+                        .vb(vb)
+                        .pp("layers.0.feed_forward1.linear1"),
                 )?;
                 let relative = converted.check_against(original.weight(), None, 8)?;
                 if !relative.is_finite() || relative > F16_PROJECTION_MAX_RELATIVE_L2 {
@@ -1762,9 +2497,9 @@ impl ParakeetEncoder {
             let features = xorshift_tensor(&[1, geometry.mel_bins, 64], 0xA5A5, 2.0, device)?;
             let mut x = self.pre_encode.forward(&features)?;
             let mut outputs = vec![("pre_encode".to_string(), x.clone())];
-            let pos = build_rel_positional_embedding(x.dim(1)?, geometry.dim, device)?;
+            let pos = self.positions(x.dim(1)?, device)?;
             for (index, layer) in self.layers.iter().enumerate() {
-                x = layer.forward(&x, &pos)?;
+                x = layer.forward(&x, &pos, None)?;
                 outputs.push((format!("layers.{index}"), x.clone()));
             }
             Ok::<_, Error>(outputs)
@@ -1781,6 +2516,7 @@ impl ParakeetEncoder {
         feature_frames: usize,
         encoded_len: usize,
         windowing: EncoderWindowing,
+        window_rows: usize,
         window_features: &mut dyn FnMut(Range<usize>) -> Result<Tensor>,
         timings: &mut ParakeetTimings,
         checkpoint: &dyn Fn() -> Result<()>,
@@ -1796,6 +2532,17 @@ impl ParakeetEncoder {
                 "Parakeet encoder produced no decodable frames".into(),
             ));
         }
+        if plan.len() > 1 && window_rows > 1 {
+            return self.encode_stacked_windows(
+                &plan,
+                feature_frames,
+                encoded_len,
+                window_rows,
+                window_features,
+                timings,
+                checkpoint,
+            );
+        }
         let mut stitched: Option<Tensor> = None;
         let mut pos_emb: Option<Tensor> = None;
         for window in &plan {
@@ -1806,31 +2553,37 @@ impl ParakeetEncoder {
 
             let frames = window.end - window.start;
             let pre_encode_started = Instant::now();
-            let x = self.pre_encode.forward(&features)?;
+            let mut x = self.stem_window(&features, frames)?;
             drop(features);
-            if x.dim(1)? < frames {
-                return Err(Error::InferenceError(format!(
-                    "Parakeet window produced {} encoder frames, expected {frames}",
-                    x.dim(1)?
-                )));
-            }
-            // Attention must see only this window's frames, never one made
-            // purely of STFT padding.
-            let mut x = x.narrow(1, 0, frames)?;
             timings.pre_encode_ms += elapsed_ms(pre_encode_started);
+
+            if plan.len() == 1 && self.graphs_on() {
+                // A lone window runs as a padded batch of one, through its
+                // graph; its real frames come back as a view.
+                let layers_started = Instant::now();
+                let (_, padded) = self.batch_shape(1, frames);
+                let x = x.pad_with_zeros(1, 0, padded - frames)?;
+                let encoded = self.encode_padded(x, &[frames])?.narrow(1, 0, frames)?;
+                timings.encoder_layers_ms += elapsed_ms(layers_started);
+                return Ok(ParakeetEncoded {
+                    encoded,
+                    encoded_len,
+                    windows: 1,
+                });
+            }
 
             // Relative positions depend only on i - j, so one embedding of
             // the window length serves every window.
             let pos_started = Instant::now();
             let pos = match pos_emb.take() {
                 Some(pos) if pos.dim(1)? == 2 * frames - 1 => pos,
-                _ => build_rel_positional_embedding(frames, self.geometry.dim, x.device())?,
+                _ => self.positions(frames, x.device())?,
             };
             timings.pos_emb_ms += elapsed_ms(pos_started);
 
             let layers_started = Instant::now();
             for layer in &self.layers {
-                x = layer.forward(&x, &pos)?;
+                x = layer.forward(&x, &pos, None)?;
             }
             timings.encoder_layers_ms += elapsed_ms(layers_started);
             pos_emb = Some(pos);
@@ -1867,6 +2620,239 @@ impl ParakeetEncoder {
             windows: plan.len(),
         })
     }
+
+    /// [`Self::encode_windows`] over a long input's windows, `rows` at a time
+    /// as the rows of one batch ([`Self::encode_single_window_batch`]): every
+    /// window has the same frames, so no row is padded, and each window's
+    /// kept frames are stitched as the sequential loop stitches them. The
+    /// stems run inside the batch, so their time counts as layer time.
+    /// `checkpoint` runs before every batch.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_stacked_windows(
+        &self,
+        plan: &[EncoderWindow],
+        feature_frames: usize,
+        encoded_len: usize,
+        rows: usize,
+        window_features: &mut dyn FnMut(Range<usize>) -> Result<Tensor>,
+        timings: &mut ParakeetTimings,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<ParakeetEncoded> {
+        let mut stitched: Option<Tensor> = None;
+        for group in plan.chunks(rows.max(1)) {
+            checkpoint()?;
+            let upload_started = Instant::now();
+            let inputs = group
+                .iter()
+                .map(|window| {
+                    Ok((
+                        window_features(window.feature_columns(feature_frames))?,
+                        window.end - window.start,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            timings.feature_upload_ms += elapsed_ms(upload_started);
+
+            let layers_started = Instant::now();
+            let encoded = self.encode_single_window_batch(&inputs)?;
+            drop(inputs);
+            timings.encoder_layers_ms += elapsed_ms(layers_started);
+
+            let output = match stitched.take() {
+                Some(output) => output,
+                None => {
+                    let first = encoded.first().ok_or_else(|| {
+                        Error::InferenceError("Parakeet window batch encoded no rows".into())
+                    })?;
+                    Tensor::zeros(
+                        (1, encoded_len, self.geometry.dim),
+                        first.dtype(),
+                        first.device(),
+                    )?
+                }
+            };
+            for (window, x) in group.iter().zip(encoded) {
+                let kept = x.narrow(
+                    1,
+                    window.keep_start - window.start,
+                    window.keep_end - window.keep_start,
+                )?;
+                output.slice_set(&kept, 1, window.keep_start)?;
+            }
+            // Metal returns pooled buffers only at a synchronization point.
+            output.device().synchronize()?;
+            stitched = Some(output);
+        }
+        Ok(ParakeetEncoded {
+            encoded: stitched.ok_or_else(|| {
+                Error::InferenceError("Parakeet windowed encode stitched no frames".into())
+            })?,
+            encoded_len,
+            windows: plan.len(),
+        })
+    }
+
+    /// The stem over one window's `[1, mel_bins, columns]` features, cut to
+    /// the window's `frames` encoder frames.
+    fn stem_window(&self, features: &Tensor, frames: usize) -> Result<Tensor> {
+        let x = self.pre_encode.forward(features)?;
+        if x.dim(1)? < frames {
+            return Err(Error::InferenceError(format!(
+                "Parakeet window produced {} encoder frames, expected {frames}",
+                x.dim(1)?
+            )));
+        }
+        // Attention must see only this window's frames, never one made
+        // purely of STFT padding.
+        x.narrow(1, 0, frames).map_err(Error::from)
+    }
+
+    /// Encodes single-window rows, each `(features, frames)` as
+    /// [`Self::encode_windows`] takes its one window, in one batch. Each row
+    /// runs the stem alone (about 1.5% of the work): padded log-mel columns
+    /// would leave its first convolution as ReLU(bias), not zero, and the
+    /// next convolution would read them into real frames. The stem outputs
+    /// are zero-padded to the longest row and the layers run once over
+    /// `[B, T, D]` with the padding masked (see [`EncoderPadding`]). While
+    /// the CUDA graphs are on, the batch pads further, to its graph's shape
+    /// ([`Self::batch_shape`]): frames to a power of two and zero rows up to
+    /// the next graph width, all of whose frames count as real. Each real
+    /// row's frames are copied out, so no output keeps the batch buffer
+    /// alive.
+    fn encode_single_window_batch(&self, rows: &[(Tensor, usize)]) -> Result<Vec<Tensor>> {
+        let longest = rows.iter().map(|(_, frames)| *frames).max().unwrap_or(0);
+        self.encode_single_window_batch_at(rows, self.batch_shape(rows.len(), longest))
+    }
+
+    /// [`Self::encode_single_window_batch`] padded to `(batch_rows, padded)`.
+    fn encode_single_window_batch_at(
+        &self,
+        rows: &[(Tensor, usize)],
+        (batch_rows, padded): (usize, usize),
+    ) -> Result<Vec<Tensor>> {
+        let mut lengths = rows.iter().map(|(_, frames)| *frames).collect::<Vec<_>>();
+        if batch_rows < rows.len() || lengths.iter().any(|frames| *frames > padded) {
+            return Err(Error::InvalidInput(format!(
+                "Parakeet batch rows {lengths:?} do not fit {batch_rows} rows of {padded} frames"
+            )));
+        }
+        let stems = rows
+            .iter()
+            .map(|(features, frames)| {
+                self.stem_window(features, *frames)?
+                    .pad_with_zeros(1, 0, padded - frames)
+                    .map_err(Error::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut x = Tensor::cat(&stems, 0)?;
+        drop(stems);
+        if batch_rows > rows.len() {
+            x = x.pad_with_zeros(0, 0, batch_rows - rows.len())?;
+            lengths.resize(batch_rows, padded);
+        }
+        let encoded = self.encode_padded(x, &lengths)?;
+        lengths
+            .iter()
+            .take(rows.len())
+            .enumerate()
+            .map(|(row, frames)| {
+                let frames = encoded.narrow(0, row, 1)?.narrow(1, 0, *frames)?;
+                deep_copy_tensor_storage(&frames).map_err(Error::from)
+            })
+            .collect()
+    }
+
+    /// The conformer layers over a zero-padded `[B, T, D]` batch whose row
+    /// `b` holds `lengths[b]` real frames: through the CUDA graph of a
+    /// graph's shape, eagerly otherwise. The stem, the positional embedding
+    /// and the masks (host uploads) stay outside the graph, as its inputs.
+    fn encode_padded(&self, x: Tensor, lengths: &[usize]) -> Result<Tensor> {
+        let (rows, padded) = (x.dim(0)?, x.dim(1)?);
+        let padding = EncoderPadding::new(lengths, padded, x.dtype(), x.device())?;
+        let pos = self.positions(padded, x.device())?;
+        let graphs = match &self.graphs {
+            Ok(graphs) if encoder_graph_shape(rows, padded) == Some((rows, padded)) => graphs,
+            _ => return self.layers_forward(x, &pos, Some(&padding)),
+        };
+        let inputs = [x, pos, padding.key_bias, padding.frames, padding.lengths];
+        // The graph keeps a stable copy of each input and an output the size
+        // of `x`.
+        let tensor_bytes = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+        let retained = inputs.iter().map(tensor_bytes).sum::<u64>() + tensor_bytes(&inputs[0]);
+        let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+            let [x, pos, key_bias, frames, lengths] = inputs else {
+                return Err(Error::InferenceError(format!(
+                    "Parakeet encoder graph received {} inputs, expected 5",
+                    inputs.len()
+                )));
+            };
+            let padding = EncoderPadding {
+                key_bias: key_bias.clone(),
+                frames: frames.clone(),
+                lengths: lengths.clone(),
+            };
+            Ok(vec![self.layers_forward(x.clone(), pos, Some(&padding))?])
+        };
+        graphs
+            .run((rows, padded), retained, &inputs, &body)?
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Parakeet encoder graph returned nothing".into()))
+    }
+
+    /// The conformer layers over `x`; `padding` masks a padded batch.
+    fn layers_forward(
+        &self,
+        mut x: Tensor,
+        pos: &Tensor,
+        padding: Option<&EncoderPadding>,
+    ) -> Result<Tensor> {
+        for layer in &self.layers {
+            x = layer.forward(&x, pos, padding)?;
+        }
+        Ok(x)
+    }
+}
+
+/// The padding of a batch of encoder rows zero-padded to one length. A
+/// padded frame must reach no real frame: attention adds `key_bias` to its
+/// scores, so a padded key's weight is exactly zero, and the convolution
+/// module zeroes padded frames before its depthwise convolution, whose
+/// kernel would otherwise read them from the last real frames. Padded
+/// frames stay finite (every query has a real key), since a non-finite
+/// value times a zero weight would still poison a sum.
+struct EncoderPadding {
+    /// `[B, 1, 1, T]`: 0 on real keys, -1e9 on padding.
+    key_bias: Tensor,
+    /// `[B, 1, T]`: 1 on real frames, 0 on padding.
+    frames: Tensor,
+    /// `[B]` U32: each row's real frames, for the fused attention.
+    lengths: Tensor,
+}
+
+impl EncoderPadding {
+    fn new(lengths: &[usize], padded: usize, dtype: DType, device: &Device) -> Result<Self> {
+        const MASKED_SCORE: f32 = -1e9;
+        if lengths.is_empty() || lengths.iter().any(|len| *len == 0 || *len > padded) {
+            return Err(Error::InvalidInput(format!(
+                "Parakeet batch rows {lengths:?} do not fit {padded} padded frames"
+            )));
+        }
+        let frames = lengths
+            .iter()
+            .flat_map(|len| (0..padded).map(move |frame| f32::from(u8::from(frame < *len))))
+            .collect::<Vec<_>>();
+        let key_bias = frames
+            .iter()
+            .map(|real| if *real > 0.0 { 0.0 } else { MASKED_SCORE })
+            .collect::<Vec<_>>();
+        let rows = lengths.len();
+        let real = lengths.iter().map(|len| *len as u32).collect::<Vec<_>>();
+        Ok(Self {
+            key_bias: Tensor::from_vec(key_bias, (rows, 1, 1, padded), device)?.to_dtype(dtype)?,
+            frames: Tensor::from_vec(frames, (rows, 1, padded), device)?.to_dtype(dtype)?,
+            lengths: Tensor::from_vec(real, rows, device)?,
+        })
+    }
 }
 
 /// The stitched `[1, E, D]` encoder output.
@@ -1893,10 +2879,12 @@ struct ConvSubsamplingDw {
     conv5: Conv2d,
     conv6: Conv2d,
     out: ProjectionLinear,
+    /// The dtype `out` runs in; the convolutions and the output stay F32.
+    dtype: DType,
 }
 
 impl ConvSubsamplingDw {
-    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, projections: Projections) -> Result<Self> {
         let channels = geometry.subsampling_channels;
         let stride_cfg = Conv2dConfig {
             stride: 2,
@@ -1920,14 +2908,11 @@ impl ConvSubsamplingDw {
         let conv5 = mlx::load_conv2d(1, channels, 3, dw_stride_cfg, vb.pp("conv.5"))?;
         let conv6 = mlx::load_conv2d(channels, channels, 1, point_cfg, vb.pp("conv.6"))?;
 
-        let out = ProjectionLinear::new(
-            mlx::load_linear(
-                channels * geometry.subsampled_mel_bins(),
-                geometry.dim,
-                projection_vb(&vb, f16).pp("out"),
-            )?,
-            f16,
-        )?;
+        let out = projections.linear(mlx::load_linear(
+            channels * geometry.subsampled_mel_bins(),
+            geometry.dim,
+            projections.vb(&vb).pp("out"),
+        )?)?;
 
         Ok(Self {
             conv0,
@@ -1936,6 +2921,7 @@ impl ConvSubsamplingDw {
             conv5,
             conv6,
             out,
+            dtype: projections.dtype(),
         })
     }
 
@@ -2000,10 +2986,13 @@ impl ConvSubsamplingDw {
         x = self.conv6.forward(&x)?;
         x = x.relu()?;
 
+        // The layout copy before `out` is also its cast to the projection
+        // dtype; the stem output joins the F32 residual stream.
         let (b, c, t, f) = x.dims4()?;
-        x.transpose(1, 2)?
+        contiguous_as(&x.transpose(1, 2)?, self.dtype)?
             .reshape((b, t, c * f))?
-            .apply(&self.out)
+            .apply(&self.out)?
+            .to_dtype(DType::F32)
             .map_err(Error::from)
     }
 }
@@ -2047,19 +3036,19 @@ struct ConformerLayer {
 }
 
 impl ConformerLayer {
-    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, projections: Projections) -> Result<Self> {
         let dim = geometry.dim;
         let norm_ff1 = layer_norm(dim, 1e-5, vb.pp("norm_feed_forward1"))?;
-        let ff1 = FeedForward::load(vb.pp("feed_forward1"), geometry, f16)?;
+        let ff1 = FeedForward::load(vb.pp("feed_forward1"), geometry, projections)?;
 
         let norm_self_att = layer_norm(dim, 1e-5, vb.pp("norm_self_att"))?;
-        let self_attn = RelPosSelfAttention::load(vb.pp("self_attn"), geometry, f16)?;
+        let self_attn = RelPosSelfAttention::load(vb.pp("self_attn"), geometry, projections)?;
 
         let norm_conv = layer_norm(dim, 1e-5, vb.pp("norm_conv"))?;
-        let conv = ConformerConv::load(vb.pp("conv"), geometry, f16)?;
+        let conv = ConformerConv::load(vb.pp("conv"), geometry, projections)?;
 
         let norm_ff2 = layer_norm(dim, 1e-5, vb.pp("norm_feed_forward2"))?;
-        let ff2 = FeedForward::load(vb.pp("feed_forward2"), geometry, f16)?;
+        let ff2 = FeedForward::load(vb.pp("feed_forward2"), geometry, projections)?;
 
         let norm_out = layer_norm(dim, 1e-5, vb.pp("norm_out"))?;
 
@@ -2076,18 +3065,28 @@ impl ConformerLayer {
         })
     }
 
-    fn forward(&self, x: &Tensor, pos_emb: &Tensor) -> Result<Tensor> {
+    /// One layer over `x`; `padding` masks the padded frames of a batch,
+    /// and `None` runs an unpadded input.
+    fn forward(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        padding: Option<&EncoderPadding>,
+    ) -> Result<Tensor> {
         let mut residual = x.clone();
 
         let ff1 = self.ff1.forward(&self.norm_ff1.forward(&residual)?)?;
         residual = residual.broadcast_add(&ff1.affine(0.5, 0.0)?)?;
 
-        let attn = self
-            .self_attn
-            .forward(&self.norm_self_att.forward(&residual)?, pos_emb)?;
+        let attn =
+            self.self_attn
+                .forward(&self.norm_self_att.forward(&residual)?, pos_emb, padding)?;
         residual = residual.broadcast_add(&attn)?;
 
-        let conv = self.conv.forward(&self.norm_conv.forward(&residual)?)?;
+        let conv = self.conv.forward(
+            &self.norm_conv.forward(&residual)?,
+            padding.map(|padding| &padding.frames),
+        )?;
         residual = residual.broadcast_add(&conv)?;
 
         let ff2 = self.ff2.forward(&self.norm_ff2.forward(&residual)?)?;
@@ -2102,55 +3101,107 @@ impl ConformerLayer {
 struct FeedForward {
     linear1: ProjectionLinear,
     linear2: ProjectionLinear,
+    /// The dtype both linears and the swish between them run in.
+    dtype: DType,
 }
 
 impl FeedForward {
-    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
-        let vb = projection_vb(&vb, f16);
-        let linear1 = ProjectionLinear::new(
-            mlx::load_linear_no_bias(geometry.dim, geometry.ff_dim, vb.pp("linear1"))?,
-            f16,
-        )?;
-        let linear2 = ProjectionLinear::new(
-            mlx::load_linear_no_bias(geometry.ff_dim, geometry.dim, vb.pp("linear2"))?,
-            f16,
-        )?;
-        Ok(Self { linear1, linear2 })
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, projections: Projections) -> Result<Self> {
+        let vb = projections.vb(&vb);
+        let linear1 = projections.linear(mlx::load_linear_no_bias(
+            geometry.dim,
+            geometry.ff_dim,
+            vb.pp("linear1"),
+        )?)?;
+        let linear2 = projections.linear(mlx::load_linear_no_bias(
+            geometry.ff_dim,
+            geometry.dim,
+            vb.pp("linear2"),
+        )?)?;
+        Ok(Self {
+            linear1,
+            linear2,
+            dtype: projections.dtype(),
+        })
     }
 
+    /// The block over F32 `x`, cast to the block's dtype once on the way in
+    /// and back to F32 once on the way out.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.linear1.forward(x)?;
+        let x = self.linear1.forward(&x.to_dtype(self.dtype)?)?;
         let x = swish(&x)?;
         self.linear2
             .forward(&x)
+            .and_then(|x| x.to_dtype(DType::F32))
             .map_err(|e| Error::InferenceError(e.to_string()))
+    }
+}
+
+/// A pointwise convolution of [`ConformerConv`]: dense F32 or weight-only F16
+/// over `[B, C, T]`, or the BF16 tier's `[out, in]` linear over the channels
+/// of `[B, T, C]`.
+enum ConvPointwise {
+    Conv(PointwiseConv1d),
+    Bf16(Linear),
+}
+
+impl ConvPointwise {
+    fn as_f16(&self) -> Option<&F16WeightLinear> {
+        match self {
+            Self::Conv(conv) => conv.as_f16(),
+            Self::Bf16(_) => None,
+        }
+    }
+
+    /// F32 `[B, T, C_in]` to F32 `[B, C_out, T]` (a strided view in the F32
+    /// and F16 tiers). The BF16 tier casts in, runs one GEMM, and writes the
+    /// channels-first F32 copy in the cast back.
+    fn channels_first(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Conv(conv) => conv.forward(&x.transpose(1, 2)?).map_err(Error::from),
+            Self::Bf16(linear) => linear
+                .forward(&x.to_dtype(DType::BF16)?)?
+                .transpose(1, 2)?
+                .to_dtype(DType::F32)
+                .map_err(Error::from),
+        }
+    }
+
+    /// F32 `[B, C_in, T]` to F32 `[B, T, C_out]` (a strided view in the F32
+    /// and F16 tiers). The BF16 tier writes the channels-last BF16 copy in
+    /// its cast in, runs one GEMM and casts back.
+    fn channels_last(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Conv(conv) => conv.forward(x)?.transpose(1, 2).map_err(Error::from),
+            Self::Bf16(linear) => linear
+                .forward(&contiguous_as(&x.transpose(1, 2)?, DType::BF16)?)?
+                .to_dtype(DType::F32)
+                .map_err(Error::from),
+        }
     }
 }
 
 struct ConformerConv {
     dim: usize,
-    pointwise_conv1: PointwiseConv1d,
+    pointwise_conv1: ConvPointwise,
     depthwise_conv: Conv1d,
     folded_depthwise_weight: Tensor,
     folded_depthwise_bias: Tensor,
     batch_norm: candle_nn::BatchNorm,
-    pointwise_conv2: PointwiseConv1d,
+    pointwise_conv2: ConvPointwise,
 }
 
 impl ConformerConv {
-    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, projections: Projections) -> Result<Self> {
         let dim = geometry.dim;
-        let pointwise_vb = projection_vb(&vb, f16);
-        let pointwise_conv1 = PointwiseConv1d::new(
-            mlx::load_conv1d_no_bias(
-                dim,
-                dim * 2,
-                1,
-                Conv1dConfig::default(),
-                pointwise_vb.pp("pointwise_conv1"),
-            )?,
-            f16,
-        )?;
+        let pointwise_vb = projections.vb(&vb);
+        let pointwise_conv1 = projections.pointwise(mlx::load_conv1d_no_bias(
+            dim,
+            dim * 2,
+            1,
+            Conv1dConfig::default(),
+            pointwise_vb.pp("pointwise_conv1"),
+        )?)?;
 
         let depthwise_conv = mlx::load_conv1d_no_bias(
             dim,
@@ -2167,17 +3218,16 @@ impl ConformerConv {
         let batch_norm = batch_norm(dim, 1e-5, vb.pp("batch_norm"))?;
         let (folded_depthwise_weight, folded_depthwise_bias) =
             fold_depthwise_conv1d_batch_norm(&depthwise_conv, &batch_norm)?;
+        // The CUDA depthwise kernel's per-device self-check, once, at load.
+        crate::kernels::depthwise_conv::prepare_cuda_kernel(vb.device());
 
-        let pointwise_conv2 = PointwiseConv1d::new(
-            mlx::load_conv1d_no_bias(
-                dim,
-                dim,
-                1,
-                Conv1dConfig::default(),
-                pointwise_vb.pp("pointwise_conv2"),
-            )?,
-            f16,
-        )?;
+        let pointwise_conv2 = projections.pointwise(mlx::load_conv1d_no_bias(
+            dim,
+            dim,
+            1,
+            Conv1dConfig::default(),
+            pointwise_vb.pp("pointwise_conv2"),
+        )?)?;
 
         Ok(Self {
             dim,
@@ -2190,14 +3240,19 @@ impl ConformerConv {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // [B, T, C] -> [B, C, T]
-        let mut x = x.transpose(1, 2)?;
-
-        x = self.pointwise_conv1.forward(&x)?;
+    /// The convolution module over F32 `[B, T, C]`; `frame_mask`
+    /// (`[B, 1, T]`) zeroes a padded batch's padded frames before the
+    /// depthwise conv. The GLU, the depthwise conv with its folded BatchNorm
+    /// and the swish run in F32 in every tier.
+    fn forward(&self, x: &Tensor, frame_mask: Option<&Tensor>) -> Result<Tensor> {
+        // [B, T, C] -> [B, 2C, T]
+        let mut x = self.pointwise_conv1.channels_first(x)?;
         let x_a = x.i((.., ..self.dim, ..))?;
         let x_b = x.i((.., self.dim.., ..))?;
         x = x_a.broadcast_mul(&ops::sigmoid(&x_b)?)?;
+        if let Some(frame_mask) = frame_mask {
+            x = x.broadcast_mul(frame_mask)?;
+        }
 
         if let Some(fused) = metal_kernels::try_depthwise_conv1d_bias_swish(
             &x,
@@ -2230,9 +3285,8 @@ impl ConformerConv {
             }
             x = swish(&x)?;
         }
-        x = self.pointwise_conv2.forward(&x)?;
-
-        x.transpose(1, 2).map_err(Error::from)
+        // [B, C, T] -> [B, T, C]
+        self.pointwise_conv2.channels_last(&x)
     }
 }
 
@@ -2262,79 +3316,153 @@ fn fold_depthwise_conv1d_batch_norm(
     Ok((folded_weight, folded_bias))
 }
 
+/// The query, key and value projections of [`RelPosSelfAttention`]: one
+/// each (F32 or weight-only F16), or the BF16 tier's single `[3D, D]` GEMM.
+enum QkvProjection {
+    Split([ProjectionLinear; 3]),
+    Fused(Linear),
+}
+
+impl QkvProjection {
+    /// The projections, when they are separate.
+    fn split(&self) -> Option<&[ProjectionLinear; 3]> {
+        match self {
+            Self::Split(projections) => Some(projections),
+            Self::Fused(_) => None,
+        }
+    }
+
+    /// Q, K and V of F32 `x` (`[B, T, D]`), each a contiguous F32
+    /// `[B, H, T, Dh]`. The fused GEMM's head-major F32 copies are its casts
+    /// back.
+    fn heads(&self, x: &Tensor, heads: usize, head_dim: usize) -> Result<[Tensor; 3]> {
+        let (b, t, _) = x.dims3()?;
+        let head_major = |x: &Tensor| contiguous_as(&x.transpose(1, 2)?, DType::F32);
+        let [q, k, v] = match self {
+            Self::Split(projections) => projections.each_ref().map(|projection| {
+                head_major(&projection.forward(x)?.reshape((b, t, heads, head_dim))?)
+            }),
+            Self::Fused(linear) => {
+                let qkv = linear
+                    .forward(&x.to_dtype(DType::BF16)?)?
+                    .reshape((b, t, 3, heads, head_dim))?;
+                [0, 1, 2].map(|index| head_major(&qkv.i((.., .., index))?))
+            }
+        };
+        Ok([q?, k?, v?])
+    }
+
+    /// Q, K and V of F32 `x` (`[B, T, D]`) as `[B, T, H, Dh]` in the
+    /// projection dtype, without head-major copies: the fused GEMM's
+    /// columns are strided views of its output.
+    fn token_major(&self, x: &Tensor, heads: usize, head_dim: usize) -> Result<[Tensor; 3]> {
+        let (b, t, _) = x.dims3()?;
+        let [q, k, v] = match self {
+            Self::Split(projections) => projections.each_ref().map(|projection| {
+                projection
+                    .forward(x)?
+                    .reshape((b, t, heads, head_dim))
+                    .map_err(Error::from)
+            }),
+            Self::Fused(linear) => {
+                let qkv = linear
+                    .forward(&x.to_dtype(DType::BF16)?)?
+                    .reshape((b, t, 3, heads, head_dim))?;
+                [0, 1, 2].map(|index| qkv.i((.., .., index)).map_err(Error::from))
+            }
+        };
+        Ok([q?, k?, v?])
+    }
+}
+
+/// Whether the conformer attention runs [`relpos_attention::reference`] on
+/// the host in place of the CUDA kernel: the in-family tests of the fused
+/// path's wiring on a machine without a GPU.
+#[cfg(test)]
+fn fused_attention_on_the_host() -> bool {
+    tests::FUSED_ATTENTION_ON_THE_HOST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn fused_attention_on_the_host() -> bool {
+    false
+}
+
 struct RelPosSelfAttention {
     heads: usize,
     head_dim: usize,
-    linear_q: ProjectionLinear,
-    linear_k: ProjectionLinear,
-    linear_v: ProjectionLinear,
+    qkv: QkvProjection,
     linear_out: ProjectionLinear,
     linear_pos: ProjectionLinear,
     pos_bias_u: Tensor,
     pos_bias_v: Tensor,
+    /// The dtype the projections run in. The attention core (`ac + bd`,
+    /// `rel_shift`, softmax and the value product) runs in F32.
+    dtype: DType,
 }
 
 impl RelPosSelfAttention {
-    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, projections: Projections) -> Result<Self> {
         let dim = geometry.dim;
         let (heads, head_dim) = (geometry.heads, geometry.head_dim());
-        let projection_vb = projection_vb(&vb, f16);
-        let projection = |name: &str| {
-            ProjectionLinear::new(
-                mlx::load_linear_no_bias(dim, dim, projection_vb.pp(name))?,
-                f16,
-            )
-            .map_err(Error::from)
+        let projection_vb = projections.vb(&vb);
+        let read = |name: &str| mlx::load_linear_no_bias(dim, dim, projection_vb.pp(name));
+        let (q, k, v) = (read("linear_q")?, read("linear_k")?, read("linear_v")?);
+        let qkv = match projections {
+            Projections::Bf16(device) => {
+                let weight = Tensor::cat(&[q.weight(), k.weight(), v.weight()], 0)?;
+                QkvProjection::Fused(bf16_linear(&weight, None, device)?)
+            }
+            Projections::F32 | Projections::F16(_) => QkvProjection::Split([
+                projections.linear(q)?,
+                projections.linear(k)?,
+                projections.linear(v)?,
+            ]),
         };
-        let linear_q = projection("linear_q")?;
-        let linear_k = projection("linear_k")?;
-        let linear_v = projection("linear_v")?;
-        let linear_out = projection("linear_out")?;
-        let linear_pos = projection("linear_pos")?;
+        let linear_out = projections.linear(read("linear_out")?)?;
+        let linear_pos = projections.linear(read("linear_pos")?)?;
 
         // In Parakeet checkpoints these are direct tensors under self_attn.*.
         let pos_bias_u = vb.get((heads, head_dim), "pos_bias_u")?;
         let pos_bias_v = vb.get((heads, head_dim), "pos_bias_v")?;
+        // The kernel's self-check runs at load, before admission prices the
+        // encoder from its verdict.
+        relpos_attention::prepare_cuda_kernel(vb.device());
 
         Ok(Self {
             heads,
             head_dim,
-            linear_q,
-            linear_k,
-            linear_v,
+            qkv,
             linear_out,
             linear_pos,
             pos_bias_u,
             pos_bias_v,
+            dtype: projections.dtype(),
         })
     }
 
-    fn forward(&self, x: &Tensor, pos_emb: &Tensor) -> Result<Tensor> {
+    /// Attention over F32 `x`; a padded batch's `padding` keeps every query
+    /// off its row's padded keys. `pos_emb` is in the projection dtype
+    /// ([`ParakeetEncoder::positions`]). On CUDA the fused kernel computes
+    /// the core when its self-check passed ([`Self::fused`]).
+    fn forward(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        padding: Option<&EncoderPadding>,
+    ) -> Result<Tensor> {
+        if let Some(out) = self.fused(x, pos_emb, padding)? {
+            return Ok(out);
+        }
+        let key_bias = padding.map(|padding| &padding.key_bias);
         let (b, t, d) = x.dims3()?;
         let (heads, head_dim) = (self.heads, self.head_dim);
 
-        let q = self
-            .linear_q
-            .forward(x)?
-            .reshape((b, t, heads, head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?; // [B, H, T, Dh]
-        let k = self
-            .linear_k
-            .forward(x)?
-            .reshape((b, t, heads, head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let v = self
-            .linear_v
-            .forward(x)?
-            .reshape((b, t, heads, head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
+        let [q, k, v] = self.qkv.heads(x, heads, head_dim)?; // [B, H, T, Dh]
 
         let p = self
             .linear_pos
-            .forward(pos_emb)?
+            .forward(&pos_emb.to_dtype(self.dtype)?)?
             .reshape((1, 2 * t - 1, heads, head_dim))?
             .transpose(1, 2)?; // [1, H, 2T-1, Dh]
 
@@ -2345,7 +3473,15 @@ impl RelPosSelfAttention {
         let q_v = q.broadcast_add(&pos_bias_v)?;
 
         let k_t = k.transpose(2, 3)?.contiguous()?;
-        let p_t = p.transpose(2, 3)?.contiguous()?;
+        // Every row of a batch reads the same projection; the matmul takes
+        // equal batch dimensions. One copy writes the F32 layout.
+        let p_t = p.transpose(2, 3)?;
+        let p_t = if b > 1 {
+            p_t.broadcast_as((b, heads, head_dim, 2 * t - 1))?
+        } else {
+            p_t
+        };
+        let p_t = contiguous_as(&p_t, DType::F32)?;
         let matrix_ac = q_u.matmul(&k_t)?;
         let matrix_bd = rel_shift(&q_v.matmul(&p_t)?)?;
         let matrix_bd = matrix_bd.narrow(3, 0, t)?;
@@ -2353,6 +3489,10 @@ impl RelPosSelfAttention {
         let scores = matrix_ac
             .broadcast_add(&matrix_bd)?
             .affine(1.0 / (head_dim as f64).sqrt(), 0.0)?;
+        let scores = match key_bias {
+            Some(key_bias) => scores.broadcast_add(key_bias)?,
+            None => scores,
+        };
         let scores = if scores.is_contiguous() {
             scores
         } else {
@@ -2360,11 +3500,71 @@ impl RelPosSelfAttention {
         };
         let attn = ops::softmax_last_dim(&scores)?;
 
+        // The token-major copy before `linear_out` is also its cast in.
         let out = attn.matmul(&v)?;
-        let out = out.transpose(1, 2)?.reshape((b, t, d))?;
+        let out = contiguous_as(&out.transpose(1, 2)?, self.dtype)?.reshape((b, t, d))?;
 
         self.linear_out
             .forward(&out)
+            .and_then(|out| out.to_dtype(DType::F32))
+            .map_err(|e| Error::InferenceError(e.to_string()))
+    }
+}
+
+impl RelPosSelfAttention {
+    /// The attention core as one CUDA launch
+    /// ([`relpos_attention::relpos_attention`]): the same F32 core over the
+    /// projections' own storage, skipping each row's padded keys, written
+    /// token-major in the projection dtype. `None` where the eager core
+    /// runs: off CUDA, or with the kernel off for the device.
+    fn fused(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        padding: Option<&EncoderPadding>,
+    ) -> Result<Option<Tensor>> {
+        let on_the_host = fused_attention_on_the_host();
+        if !on_the_host
+            && (!x.device().is_cuda() || relpos_attention::eager_reason(x.device()).is_some())
+        {
+            return Ok(None);
+        }
+        let (b, t, d) = x.dims3()?;
+        let (heads, head_dim) = (self.heads, self.head_dim);
+        let [q, k, v] = self.qkv.token_major(x, heads, head_dim)?;
+        let p = self
+            .linear_pos
+            .forward(&pos_emb.to_dtype(self.dtype)?)?
+            .reshape((2 * t - 1, heads, head_dim))?;
+        let spec = relpos_attention::RelPosAttention {
+            q: &q,
+            k: &k,
+            v: &v,
+            pos: &p,
+            position: relpos_attention::RelPosition::TransformerXl {
+                bias_u: &self.pos_bias_u,
+                bias_v: &self.pos_bias_v,
+            },
+            band: relpos_attention::KeyBand::Full,
+            key_lengths: padding.map_or(relpos_attention::KeyLengths::All, |padding| {
+                relpos_attention::KeyLengths::PerRow(&padding.lengths)
+            }),
+            scale: 1.0 / (head_dim as f64).sqrt(),
+            core: DType::F32,
+            out_dtype: self.dtype,
+        };
+        let out = if on_the_host {
+            Some(relpos_attention::reference(&spec)?.to_device(x.device())?)
+        } else {
+            relpos_attention::relpos_attention(&spec)?
+        };
+        let Some(out) = out else {
+            return Ok(None);
+        };
+        self.linear_out
+            .forward(&out.reshape((b, t, d))?)
+            .and_then(|out| out.to_dtype(DType::F32))
+            .map(Some)
             .map_err(|e| Error::InferenceError(e.to_string()))
     }
 }
@@ -2450,6 +3650,8 @@ impl Predictor {
         let lstm_l0 = LstmCell::load(vb.pp("dec_rnn.lstm"), 0)?;
         let lstm_l1 = LstmCell::load(vb.pp("dec_rnn.lstm"), 1)?;
 
+        // The device decode's select kernel checks itself at load.
+        crate::kernels::transducer_greedy::prepare_cuda_kernel(vb.device());
         Ok(Self {
             embed,
             lstm_l0,
@@ -2858,6 +4060,20 @@ fn tdt_batch_labels_and_durations(
             "Parakeet TDT joint output of width {width} cannot hold {token_end} token and {num_durations} duration logits"
         )));
     }
+    if logits.device().is_cuda() {
+        // Ties to the lowest id and NaN never picked, as the device decode's
+        // select step and the CPU's argmax pick (Candle's CUDA argmax breaks
+        // ties by its strided reduction).
+        use crate::kernels::greedy::greedy_packed;
+        let labels = greedy_packed(&logits.narrow(1, 0, token_end)?.contiguous()?)?;
+        let durations = greedy_packed(&logits.narrow(1, token_end, num_durations)?.contiguous()?)?;
+        crate::models::shared::telemetry::record_host_read(DType::U32, 4 * rows);
+        let picks = Tensor::cat(&[labels, durations], 1)?.to_vec2::<u32>()?;
+        return Ok(picks
+            .iter()
+            .map(|pick| (pick[0] as usize, pick[2] as usize))
+            .collect());
+    }
     let labels = logits.narrow(1, 0, token_end)?.argmax(D::Minus1)?;
     let durations = logits
         .narrow(1, token_end, num_durations)?
@@ -2905,23 +4121,51 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        build_rel_positional_embedding, parakeet_encoded_len_for_samples,
-        parakeet_max_emittable_tokens, parakeet_preparation_bytes,
-        parakeet_tensor_is_f16_projection, plan_encoder_windows, subsampled_len_3x,
-        tdt_word_timestamps, EncoderGeometry, EncoderWindow, EncoderWindowing, Joint, LstmCell,
-        ParakeetAsrModel, ParakeetDecoder, ParakeetEncoded, ParakeetEncoder, ParakeetLogMel,
+        build_rel_positional_embedding, encoder_window_row_bytes, parakeet_encode_row_bytes,
+        parakeet_encoded_len_for_samples, parakeet_max_emittable_tokens,
+        parakeet_preparation_bytes, parakeet_tensor_is_f16_projection, plan_encoder_windows,
+        subsampled_len_3x, tdt_word_timestamps, window_batch_rows, EncoderGeometry, EncoderWindow,
+        EncoderWindowing, Joint, LstmCell, ParakeetAsrModel, ParakeetDecoder, ParakeetEncoded,
+        ParakeetEncoder, ParakeetEncoderBatchRow, ParakeetHostFeatures, ParakeetLogMel,
         ParakeetNetwork, ParakeetPreparedEncoderArtifact, ParakeetPreprocessor,
         ParakeetRetainedDecodeBatchRow, ParakeetRetainedDecodeStep, ParakeetTimings, Predictor,
         TdtTokenFrame, DEFAULT_MAX_SYMBOLS, PRED_HIDDEN,
     };
+    use super::{
+        encoder_batch_shape, encoder_graph_shape, encoder_graphs_requested,
+        encoder_window_batch_bytes, parakeet_encode_row_elements,
+        parakeet_encoder_graph_device_bytes, ENCODER_GRAPH_LIMITS, ENCODER_GRAPH_ROWS,
+        PARAKEET_ENCODER_GRAPHS_ENV,
+    };
+    use super::{encoder_window_batch_bytes_with, EncoderPadding};
+    use super::{
+        parakeet_cuda_projection_precision, parakeet_tensor_is_bf16_projection,
+        resolve_parakeet_projection_precision, ConvPointwise, Projections, QkvProjection,
+        PARAKEET_ASR_DTYPE_ENV,
+    };
     use super::{tdt_batch_labels_and_durations, tdt_label_and_duration};
+
+    thread_local! {
+        /// Runs the conformer attention through the fused kernel's host
+        /// reference (see `fused_attention_on_the_host`).
+        pub(super) static FUSED_ATTENTION_ON_THE_HOST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Runs the retained decode's dispatches with the select step on
+        /// the host (see `device_decode::host_select`).
+        pub(super) static DEVICE_DECODE_ON_THE_HOST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Pads the host dispatches to a graph width (see
+        /// `device_decode::pad_on_the_host`).
+        pub(super) static PAD_DISPATCH_ON_THE_HOST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
     use crate::backends::{BackendKind, DTypeSelection};
     use crate::error::{Error, Result};
     use crate::model::ModelVariant;
     use candle_core::{DType, Device, Tensor};
     use candle_nn::{Linear, VarBuilder};
 
-    use crate::kernels::f16_weight_linear::WeightOnlyF16Load;
+    use crate::kernels::f16_weight_linear::{ProjectionLinear, WeightOnlyF16Load};
     use crate::kernels::numeric_check::{host_f32, relative_l2};
 
     /// Small enough to run on CPU in milliseconds; two layers keep conv edge
@@ -2984,7 +4228,7 @@ mod tests {
         let stem = super::ConvSubsamplingDw::load(
             random_encoder_vb(TINY, 0x5EED, &device).pp("pre_encode"),
             TINY,
-            None,
+            Projections::F32,
         )
         .unwrap();
         for frames in [8 * super::SUBSAMPLING_SLICE_FRAMES * 2 + 3, 5_001] {
@@ -3022,7 +4266,12 @@ mod tests {
     /// A NeMo-layout encoder checkpoint with random weights, loaded through
     /// the production loaders.
     fn random_encoder(geometry: EncoderGeometry, seed: u64, device: &Device) -> ParakeetEncoder {
-        ParakeetEncoder::load(random_encoder_vb(geometry, seed, device), geometry, None).unwrap()
+        ParakeetEncoder::load(
+            random_encoder_vb(geometry, seed, device),
+            geometry,
+            Projections::F32,
+        )
+        .unwrap()
     }
 
     /// The random encoder checkpoint of [`random_encoder`] as a VarBuilder.
@@ -3133,7 +4382,7 @@ mod tests {
             build_rel_positional_embedding(x.dim(1).unwrap(), encoder.geometry.dim, x.device())
                 .unwrap();
         for layer in &encoder.layers {
-            x = layer.forward(&x, &pos).unwrap();
+            x = layer.forward(&x, &pos, None).unwrap();
         }
         x.narrow(1, 0, encoded_len).unwrap()
     }
@@ -3146,10 +4395,32 @@ mod tests {
         window_features: &mut dyn FnMut(std::ops::Range<usize>) -> Result<Tensor>,
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<ParakeetEncoded> {
+        encode_windows_stacked(
+            encoder,
+            feature_frames,
+            encoded_len,
+            windowing,
+            1,
+            window_features,
+            checkpoint,
+        )
+    }
+
+    /// [`encode_windows`] with up to `window_rows` windows per batch.
+    fn encode_windows_stacked(
+        encoder: &ParakeetEncoder,
+        feature_frames: usize,
+        encoded_len: usize,
+        windowing: EncoderWindowing,
+        window_rows: usize,
+        window_features: &mut dyn FnMut(std::ops::Range<usize>) -> Result<Tensor>,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<ParakeetEncoded> {
         encoder.encode_windows(
             feature_frames,
             encoded_len,
             windowing,
+            window_rows,
             window_features,
             &mut ParakeetTimings::default(),
             checkpoint,
@@ -3157,6 +4428,11 @@ mod tests {
     }
 
     /// Largest absolute difference; NaN or infinity counts as infinitely far.
+    /// Batched vs solo encodes on CPU F32, as a fraction of the row's scale.
+    const BATCHED_ENCODE_TOLERANCE: f32 = 4e-6;
+    /// BF16-tier encodes on CPU, as relative L2 against the reference.
+    const BF16_ENCODE_RELATIVE_L2: f64 = 2e-2;
+
     fn max_abs_diff(left: &Tensor, right: &Tensor) -> f32 {
         assert_eq!(left.dims(), right.dims());
         let values = |tensor: &Tensor| tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -3188,13 +4464,10 @@ mod tests {
         for layer in &encoder.layers {
             let conv = &layer.conv;
             let calls = crate::kernels::depthwise_conv::depthwise_conv1d_calls();
-            let actual = conv.forward(&x).unwrap();
+            let actual = conv.forward(&x, None).unwrap();
             assert!(crate::kernels::depthwise_conv::depthwise_conv1d_calls() > calls);
 
-            let h = conv
-                .pointwise_conv1
-                .forward(&x.transpose(1, 2).unwrap())
-                .unwrap();
+            let h = conv.pointwise_conv1.channels_first(&x).unwrap();
             let gate = h.narrow(1, 0, TINY.dim).unwrap();
             let value = h.narrow(1, TINY.dim, TINY.dim).unwrap();
             let h = gate
@@ -3203,12 +4476,7 @@ mod tests {
             let h = conv.depthwise_conv.forward(&h).unwrap();
             let h = conv.batch_norm.forward_t(&h, false).unwrap();
             let h = super::swish(&h).unwrap();
-            let expected = conv
-                .pointwise_conv2
-                .forward(&h)
-                .unwrap()
-                .transpose(1, 2)
-                .unwrap();
+            let expected = conv.pointwise_conv2.channels_last(&h).unwrap();
             let diff = max_abs_diff(&expected, &actual);
             assert!(diff <= 1e-5, "max |diff| {diff}");
         }
@@ -3273,6 +4541,7 @@ mod tests {
             max_symbols: DEFAULT_MAX_SYMBOLS,
             encoder_windowing: EncoderWindowing::V3,
             weight_precision: WeightOnlyF16Load::dense("test"),
+            decode_graphs: Err("test model".into()),
         }
     }
 
@@ -3308,6 +4577,7 @@ mod tests {
                 artifact,
                 state: &mut state,
                 max_tokens,
+                quota: 1,
             }];
             steps.extend(model.retained_decode_step_batch(&mut rows).unwrap());
         }
@@ -3316,6 +4586,291 @@ mod tests {
             .diagnostics
             .unwrap();
         (steps, diagnostics)
+    }
+
+    /// A TDT model whose picks depend on the encoder frames and the
+    /// predictor state: random predictor, joint and embeddings, labels
+    /// `[0, 4)`, blank 4 and durations `0..5`.
+    fn random_decoder_model(device: &Device, seed: u64) -> ParakeetAsrModel {
+        let mut rng = XorShift(seed);
+        let mut tensor = |shape: &[usize], scale: f32| {
+            let len = shape.iter().product();
+            Tensor::from_vec(rng.values(len, scale, 0.0), shape, device).unwrap()
+        };
+        let mut lstm = || LstmCell {
+            w_ih: tensor(&[PRED_HIDDEN * 4, PRED_HIDDEN], 0.05),
+            w_hh: tensor(&[PRED_HIDDEN * 4, PRED_HIDDEN], 0.05),
+            b_ih: tensor(&[PRED_HIDDEN * 4], 0.1),
+            b_hh: tensor(&[PRED_HIDDEN * 4], 0.1),
+        };
+        let (lstm_l0, lstm_l1) = (lstm(), lstm());
+        let predictor = Predictor {
+            embed: tensor(&[5, PRED_HIDDEN], 1.0),
+            lstm_l0,
+            lstm_l1,
+            blank_idx: 4,
+        };
+        let joint = Joint {
+            pred: Linear::new(tensor(&[PRED_HIDDEN, PRED_HIDDEN], 0.05), None),
+            enc: Linear::new(tensor(&[PRED_HIDDEN, TINY.dim], 0.3), None),
+            out: Linear::new(tensor(&[10, PRED_HIDDEN], 0.1), Some(tensor(&[10], 0.5))),
+            num_classes_with_blank: 5,
+            num_durations: 5,
+        };
+        let mut model = forced_label_model(device);
+        model.network.predictor = predictor;
+        model.network.joint = joint;
+        model.network.blank_idx = 4;
+        model.network.num_durations = 5;
+        model.blank_idx = 4;
+        model.num_durations = 5;
+        model.decoder = ParakeetDecoder::Vocab(
+            ["\u{2581}a", "\u{2581}b", "c", "\u{2581}d"]
+                .map(String::from)
+                .to_vec(),
+        );
+        model
+    }
+
+    /// Decodes `artifacts` as one retained cohort (finished rows leave it)
+    /// until every row finishes: each row's tokens, frames, text and joint
+    /// and blank steps.
+    fn decode_cohort(
+        model: &ParakeetAsrModel,
+        artifacts: &[ParakeetPreparedEncoderArtifact],
+        max_tokens: &[usize],
+        quota: usize,
+    ) -> Vec<(Vec<usize>, Vec<TdtTokenFrame>, String, usize, usize)> {
+        let mut states = artifacts
+            .iter()
+            .map(|_| model.start_retained_decode().unwrap())
+            .collect::<Vec<_>>();
+        for _ in 0..10_000 {
+            let mut rows = states
+                .iter_mut()
+                .zip(artifacts)
+                .zip(max_tokens)
+                .filter(|((state, _), _)| !state.finished)
+                .map(
+                    |((state, artifact), max_tokens)| ParakeetRetainedDecodeBatchRow {
+                        artifact,
+                        state,
+                        max_tokens: *max_tokens,
+                        quota,
+                    },
+                )
+                .collect::<Vec<_>>();
+            if rows.is_empty() {
+                break;
+            }
+            let steps = model.retained_decode_step_batch(&mut rows).unwrap();
+            for step in &steps {
+                assert!(step.tokens_generated <= 10_000);
+            }
+        }
+        states
+            .into_iter()
+            .map(|state| {
+                assert!(state.finished, "a row never finished");
+                (
+                    state.token_ids,
+                    state.token_frames,
+                    state.assembled,
+                    state.counters.tdt_joint_steps,
+                    state.counters.tdt_blank_steps,
+                )
+            })
+            .collect()
+    }
+
+    /// The dispatches of many joint steps decode every row of a cohort as
+    /// the eager step does, with the select step on the host: the same
+    /// tokens, frames, text and joint and blank steps, across window
+    /// boundaries (a 70-frame row; windows hold 64), a token budget, rows finishing at
+    /// different steps, and a quota of several tokens per engine step.
+    #[test]
+    fn device_decode_dispatches_match_the_eager_retained_decode() {
+        let device = Device::Cpu;
+        let model = random_decoder_model(&device, 0xDEC0_DE01);
+        let mut rng = XorShift(0xA77_1FAC7);
+        let artifacts = [12usize, 70, 5, 20]
+            .map(|len| {
+                let mut artifact = zero_artifact(&device, len);
+                artifact.encoded = Tensor::from_vec(
+                    rng.values(len * TINY.dim, 2.0, 0.0),
+                    (1, len, TINY.dim),
+                    &device,
+                )
+                .unwrap();
+                artifact
+            })
+            .to_vec();
+        let max_tokens = [1_000, 1_000, 1_000, 3];
+        let eager = decode_cohort(&model, &artifacts, &max_tokens, 1);
+        assert!(eager.iter().map(|row| row.0.len()).sum::<usize>() > 10);
+        assert!(eager.iter().any(|row| row.4 > 0), "no blanks");
+        assert_eq!(eager[3].0.len(), 3, "the budget stops the last row");
+        for quota in [1, 3] {
+            DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(true));
+            let dispatched = decode_cohort(&model, &artifacts, &max_tokens, quota);
+            DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(false));
+            for (row, (eager, dispatched)) in eager.iter().zip(&dispatched).enumerate() {
+                assert_eq!(eager, dispatched, "row {row}, quota {quota}");
+            }
+        }
+    }
+
+    /// The load-time dispatch self-check runs (here with the select step on
+    /// the host) and finds the two forms agree. Its synthetic rows take an
+    /// unbounded `usize::MAX` budget, which the packed u32 limits once
+    /// refused, so on the H100 the check never ran and the device decode
+    /// stayed off for every Parakeet load.
+    #[test]
+    fn device_decode_self_check_runs_with_unbounded_budgets() {
+        let device = Device::Cpu;
+        let model = random_decoder_model(&device, 0xDEC0_DE02);
+        assert_eq!(model.dispatch_self_check().unwrap(), None);
+    }
+
+    /// Drives a retained cohort as the engine's handler does, at `quota`
+    /// tokens per row and step: each step's new tokens (at most the quota),
+    /// its delta appended to the row's stream (which must equal the step's
+    /// text), and, at `cancel = (row, step)`, that row restored from its
+    /// checkpoint as the handler's rollback restores a cancelled row (it must
+    /// equal the checkpoint; the row then leaves the cohort). Each row's
+    /// tokens, streamed text, final text and word timestamps.
+    fn run_like_the_handler(
+        model: &ParakeetAsrModel,
+        artifacts: &[ParakeetPreparedEncoderArtifact],
+        max_tokens: &[usize],
+        quota: usize,
+        cancel: Option<(usize, usize)>,
+    ) -> Vec<(Vec<usize>, String, String, serde_json::Value)> {
+        let mut states = artifacts
+            .iter()
+            .map(|_| model.start_retained_decode().unwrap())
+            .collect::<Vec<_>>();
+        let mut streamed = vec![String::new(); artifacts.len()];
+        let mut gone = vec![false; artifacts.len()];
+        for step in 0..10_000 {
+            let live = (0..states.len())
+                .filter(|row| !states[*row].finished && !gone[*row])
+                .collect::<Vec<_>>();
+            if live.is_empty() {
+                break;
+            }
+            let checkpoints = live
+                .iter()
+                .map(|row| states[*row].clone())
+                .collect::<Vec<_>>();
+            let before = live
+                .iter()
+                .map(|row| states[*row].token_ids.len())
+                .collect::<Vec<_>>();
+            let mut rows = states
+                .iter_mut()
+                .enumerate()
+                .filter(|(row, _)| live.contains(row))
+                .map(|(row, state)| ParakeetRetainedDecodeBatchRow {
+                    artifact: &artifacts[row],
+                    state,
+                    max_tokens: max_tokens[row],
+                    quota,
+                })
+                .collect::<Vec<_>>();
+            let steps = model.retained_decode_step_batch(&mut rows).unwrap();
+            drop(rows);
+            for (((row, step_out), before), checkpoint) in
+                live.iter().zip(steps).zip(before).zip(checkpoints)
+            {
+                if cancel == Some((*row, step)) {
+                    states[*row] = checkpoint.clone();
+                    assert_eq!(states[*row].token_ids, checkpoint.token_ids);
+                    assert_eq!(states[*row].cursor, checkpoint.cursor);
+                    gone[*row] = true;
+                    continue;
+                }
+                assert!(step_out.tokens_generated <= before + quota);
+                assert_eq!(step_out.tokens_generated, states[*row].token_ids.len());
+                streamed[*row].push_str(&step_out.delta);
+                assert_eq!(step_out.text, streamed[*row]);
+            }
+        }
+        states
+            .iter()
+            .zip(artifacts)
+            .zip(streamed)
+            .map(|((state, artifact), streamed)| {
+                let output = model.retained_decode_output(artifact, state);
+                let words = output.diagnostics.unwrap()["timestamp_words"].clone();
+                (state.token_ids.clone(), streamed, output.text, words)
+            })
+            .collect()
+    }
+
+    /// The engine contract of several tokens per row and step: a cohort at a
+    /// quota of four (the device dispatches, select step on the host)
+    /// decodes the same tokens, streamed text, final text and word
+    /// timestamps as at one token per step (the eager step); a row whose
+    /// budget ends mid-quota finishes there; and a row cancelled mid-quota
+    /// is restored to its checkpoint without changing the other rows.
+    #[test]
+    fn quanta_keep_tokens_text_and_timestamps() {
+        let device = Device::Cpu;
+        let model = random_decoder_model(&device, 0xDEC0_DE01);
+        let mut rng = XorShift(0xA77_1FAC7);
+        let artifacts = [12usize, 40, 6]
+            .map(|len| {
+                let mut artifact = zero_artifact(&device, len);
+                let values = rng.values(len * TINY.dim, 2.0, 0.0);
+                artifact.encoded = Tensor::from_vec(values, (1, len, TINY.dim), &device).unwrap();
+                artifact
+            })
+            .to_vec();
+        let max_tokens = [1_000, 5, 1_000];
+        let one = run_like_the_handler(&model, &artifacts, &max_tokens, 1, None);
+        assert_eq!(one[1].0.len(), 5, "the budget ends the second row");
+        let lengths = one.iter().map(|row| row.0.len()).collect::<Vec<_>>();
+        assert!(lengths.iter().sum::<usize>() > 8, "{lengths:?}");
+        // Cancel the first row with more than one quantum of tokens.
+        let row = (0..one.len()).find(|row| one[*row].0.len() > 4).unwrap();
+        DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(true));
+        let four = run_like_the_handler(&model, &artifacts, &max_tokens, 4, None);
+        let cancelled = run_like_the_handler(&model, &artifacts, &max_tokens, 4, Some((row, 1)));
+        DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(false));
+        assert_eq!(one, four);
+        // The cancelled row keeps its first step's tokens; the others are
+        // as before.
+        for other in (0..one.len()).filter(|other| *other != row) {
+            assert_eq!(cancelled[other], four[other], "row {other}");
+        }
+        assert!(cancelled[row].0.len() <= 4 && four[row].0.starts_with(&cancelled[row].0));
+    }
+
+    /// A dispatch padded to its graph width (three rows run as four; the
+    /// spare row never steps) decodes every row as the unpadded dispatch and
+    /// the eager step do, as a graphed dispatch on CUDA pads.
+    #[test]
+    fn padded_dispatches_match_the_eager_retained_decode() {
+        let device = Device::Cpu;
+        let model = random_decoder_model(&device, 0xDEC0_DE01);
+        let mut rng = XorShift(0xA77_1FAC7);
+        let artifacts = [12usize, 40, 6]
+            .map(|len| {
+                let mut artifact = zero_artifact(&device, len);
+                let values = rng.values(len * TINY.dim, 2.0, 0.0);
+                artifact.encoded = Tensor::from_vec(values, (1, len, TINY.dim), &device).unwrap();
+                artifact
+            })
+            .to_vec();
+        let max_tokens = [1_000, 5, 1_000];
+        let eager = decode_cohort(&model, &artifacts, &max_tokens, 1);
+        DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(true));
+        PAD_DISPATCH_ON_THE_HOST.with(|flag| flag.set(true));
+        let padded = decode_cohort(&model, &artifacts, &max_tokens, 2);
+        PAD_DISPATCH_ON_THE_HOST.with(|flag| flag.set(false));
+        DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(false));
+        assert_eq!(eager, padded);
     }
 
     #[test]
@@ -3452,21 +5007,28 @@ mod tests {
         }
     }
 
+    /// A layer's linear projections in the F32 and F16 tiers (q, k and v
+    /// separate).
+    fn split_projections(layer: &super::ConformerLayer) -> Vec<&ProjectionLinear> {
+        let [q, k, v] = layer.self_attn.qkv.split().expect("separate q, k and v");
+        vec![
+            &layer.ff1.linear1,
+            &layer.ff1.linear2,
+            &layer.ff2.linear1,
+            &layer.ff2.linear2,
+            q,
+            k,
+            v,
+            &layer.self_attn.linear_out,
+            &layer.self_attn.linear_pos,
+        ]
+    }
+
     /// Every projection the recipe lists is F16 and nothing else is.
     fn assert_projection_split(encoder: &ParakeetEncoder, f16: bool) {
         assert_eq!(encoder.pre_encode.out.as_f16().is_some(), f16);
         for layer in &encoder.layers {
-            for projection in [
-                &layer.ff1.linear1,
-                &layer.ff1.linear2,
-                &layer.ff2.linear1,
-                &layer.ff2.linear2,
-                &layer.self_attn.linear_q,
-                &layer.self_attn.linear_k,
-                &layer.self_attn.linear_v,
-                &layer.self_attn.linear_out,
-                &layer.self_attn.linear_pos,
-            ] {
+            for projection in split_projections(layer) {
                 assert_eq!(projection.as_f16().is_some(), f16);
             }
             assert_eq!(layer.conv.pointwise_conv1.as_f16().is_some(), f16);
@@ -3523,23 +5085,13 @@ mod tests {
         .unwrap();
         let f16_weights = std::iter::once(encoder.pre_encode.out.as_f16().unwrap())
             .chain(encoder.layers.iter().flat_map(|layer| {
-                [
-                    &layer.ff1.linear1,
-                    &layer.ff1.linear2,
-                    &layer.ff2.linear1,
-                    &layer.ff2.linear2,
-                    &layer.self_attn.linear_q,
-                    &layer.self_attn.linear_k,
-                    &layer.self_attn.linear_v,
-                    &layer.self_attn.linear_out,
-                    &layer.self_attn.linear_pos,
-                ]
-                .into_iter()
-                .map(|projection| projection.as_f16().unwrap())
-                .chain([
-                    layer.conv.pointwise_conv1.as_f16().unwrap(),
-                    layer.conv.pointwise_conv2.as_f16().unwrap(),
-                ])
+                split_projections(layer)
+                    .into_iter()
+                    .map(|projection| projection.as_f16().unwrap())
+                    .chain([
+                        layer.conv.pointwise_conv1.as_f16().unwrap(),
+                        layer.conv.pointwise_conv2.as_f16().unwrap(),
+                    ])
             }))
             .map(|linear| linear.out_features() * linear.in_features())
             .sum::<usize>();
@@ -3583,6 +5135,425 @@ mod tests {
         assert!(!precision.projections_f16);
         assert!(precision.self_check.is_none());
         assert_projection_split(&encoder, false);
+    }
+
+    fn bf16_precision() -> DTypeSelection {
+        DTypeSelection {
+            dtype: DType::BF16,
+            reason: "test: BF16 projections".into(),
+        }
+    }
+
+    fn bf16_encoder(seed: u64, device: &Device) -> ParakeetEncoder {
+        let (encoder, precision) = ParakeetEncoder::load_with_precision(
+            random_encoder_vb(TINY, seed, device),
+            TINY,
+            bf16_precision(),
+        )
+        .unwrap();
+        assert!(!precision.projections_f16);
+        assert!(precision.self_check.is_none());
+        assert_eq!(encoder.projection_dtype, DType::BF16);
+        encoder
+    }
+
+    /// The BF16 tensors of a BF16-tier encoder, by role. Everything else it
+    /// holds stays F32.
+    fn bf16_tensors(encoder: &ParakeetEncoder) -> Vec<Tensor> {
+        fn dense(projection: &ProjectionLinear) -> &Linear {
+            match projection {
+                ProjectionLinear::Dense(linear) => linear,
+                ProjectionLinear::F16(_) => panic!("weight-only F16 projection in the BF16 tier"),
+            }
+        }
+        let linear_tensors = |linear: &Linear| {
+            std::iter::once(linear.weight().clone()).chain(linear.bias().cloned())
+        };
+        let mut tensors = linear_tensors(dense(&encoder.pre_encode.out)).collect::<Vec<_>>();
+        for layer in &encoder.layers {
+            let QkvProjection::Fused(qkv) = &layer.self_attn.qkv else {
+                panic!("separate q, k and v in the BF16 tier");
+            };
+            assert_eq!(qkv.weight().dims(), [3 * TINY.dim, TINY.dim]);
+            for linear in [
+                dense(&layer.ff1.linear1),
+                dense(&layer.ff1.linear2),
+                dense(&layer.ff2.linear1),
+                dense(&layer.ff2.linear2),
+                qkv,
+                dense(&layer.self_attn.linear_out),
+                dense(&layer.self_attn.linear_pos),
+            ] {
+                tensors.extend(linear_tensors(linear));
+            }
+            for pointwise in [&layer.conv.pointwise_conv1, &layer.conv.pointwise_conv2] {
+                let ConvPointwise::Bf16(linear) = pointwise else {
+                    panic!("pointwise conv outside the BF16 tier");
+                };
+                tensors.extend(linear_tensors(linear));
+            }
+        }
+        tensors
+    }
+
+    /// The BF16 tier converts exactly the tensors admission prices at BF16
+    /// (`parakeet_tensor_is_bf16_projection`), and keeps the recipe's F32
+    /// tensors F32.
+    #[test]
+    fn bf16_projection_names_match_the_loader() {
+        let device = Device::Cpu;
+        let tensors = random_encoder_tensors(TINY, 38, &device);
+        let encoder = bf16_encoder(38, &device);
+        let converted = bf16_tensors(&encoder);
+        assert!(converted.iter().all(|tensor| tensor.dtype() == DType::BF16));
+        let named = |filter: fn(&str) -> bool| {
+            tensors
+                .iter()
+                .filter(|(name, _)| filter(&format!("encoder.{name}")))
+                .map(|(_, tensor)| tensor.elem_count())
+                .sum::<usize>()
+        };
+        assert_eq!(
+            converted.iter().map(Tensor::elem_count).sum::<usize>(),
+            named(parakeet_tensor_is_bf16_projection)
+        );
+        assert_eq!(
+            named(parakeet_tensor_is_bf16_projection) - named(parakeet_tensor_is_f16_projection),
+            TINY.dim
+        );
+        assert!(parakeet_tensor_is_bf16_projection(
+            "encoder.pre_encode.out.bias"
+        ));
+        for name in [
+            "encoder.pre_encode.conv.3.weight",
+            "encoder.layers.0.conv.depthwise_conv.weight",
+            "encoder.layers.0.self_attn.pos_bias_u",
+            "encoder.layers.0.norm_out.weight",
+            "joint.enc.weight",
+            "decoder.prediction.dec_rnn.lstm.weight_ih_l0",
+        ] {
+            assert!(!parakeet_tensor_is_bf16_projection(name), "{name}");
+        }
+        assert!(encoder.pre_encode.out.as_f16().is_none());
+        assert_eq!(encoder.pre_encode.conv0.weight().dtype(), DType::F32);
+        assert_eq!(encoder.pre_encode.conv6.weight().dtype(), DType::F32);
+        for layer in &encoder.layers {
+            assert_eq!(layer.conv.depthwise_conv.weight().dtype(), DType::F32);
+            assert_eq!(layer.conv.folded_depthwise_weight.dtype(), DType::F32);
+            assert_eq!(layer.conv.folded_depthwise_bias.dtype(), DType::F32);
+            assert_eq!(layer.self_attn.pos_bias_u.dtype(), DType::F32);
+            assert_eq!(layer.self_attn.pos_bias_v.dtype(), DType::F32);
+            assert_eq!(layer.norm_ff1.weight().dtype(), DType::F32);
+            assert_eq!(layer.norm_out.weight().dtype(), DType::F32);
+        }
+    }
+
+    /// A model over `encoder` whose joint reads the encoder output through
+    /// random weights (the zero predictor adds nothing), so its TDT decode
+    /// decisions follow the encoder.
+    fn encoder_driven_model(device: &Device, encoder: ParakeetEncoder) -> ParakeetAsrModel {
+        let mut rng = XorShift(0x7D7_0001);
+        let mut random = |shape: &[usize], scale: f32| {
+            let values = rng.values(shape.iter().product(), scale, 0.0);
+            Tensor::from_vec(values, shape, device).unwrap()
+        };
+        let enc = random(&[PRED_HIDDEN, TINY.dim], 2.0 / (TINY.dim as f32).sqrt());
+        let out = random(&[5, PRED_HIDDEN], 4.0 / (PRED_HIDDEN as f32).sqrt());
+        let bias = random(&[5], 0.5);
+        let mut model = forced_label_model(device);
+        model.network.encoder = encoder;
+        model.network.joint.enc = Linear::new(enc, None);
+        model.network.joint.out = Linear::new(out, Some(bias));
+        model
+    }
+
+    /// The joint's `[T, labels + durations]` logits over `encoded` with a
+    /// zero predictor output.
+    fn joint_logits(model: &ParakeetAsrModel, encoded: &Tensor) -> Tensor {
+        let predictor = Tensor::zeros((1, 1, PRED_HIDDEN), DType::F32, encoded.device()).unwrap();
+        model
+            .network
+            .joint
+            .joint_after_projection(encoded, &predictor)
+            .unwrap()
+            .squeeze(2)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+    }
+
+    /// Sets the joint output bias of `models` to minus the mean logit of the
+    /// first over the frames of `encoded`, so a frame's decisions turn on
+    /// what sets it apart from the others (frames of one input share most of
+    /// their encoding).
+    fn center_joint(models: [&mut ParakeetAsrModel; 2], encoded: &Tensor) {
+        let without_bias = {
+            let out = &models[0].network.joint.out;
+            let bias = out.bias().unwrap();
+            joint_logits(models[0], encoded)
+                .broadcast_sub(bias)
+                .unwrap()
+        };
+        let bias = without_bias.mean(0).unwrap().neg().unwrap();
+        for model in models {
+            let weight = model.network.joint.out.weight().clone();
+            model.network.joint.out = Linear::new(weight, Some(bias.clone()));
+        }
+    }
+
+    /// Each frame's TDT decisions (label, duration) by the joint over
+    /// `encoded` with a zero predictor output, with the gap between each
+    /// winning logit and its runner-up.
+    fn frame_decisions(
+        model: &ParakeetAsrModel,
+        encoded: &Tensor,
+    ) -> Vec<((usize, usize), [f32; 2])> {
+        let classes = model.network.joint.num_classes_with_blank;
+        let margin = |values: &[f32]| {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            sorted[0] - sorted[1]
+        };
+        joint_logits(model, encoded)
+            .to_vec2::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                let frame = Tensor::new(row.as_slice(), encoded.device()).unwrap();
+                (
+                    tdt_label_and_duration(&frame, classes).unwrap(),
+                    [margin(&row[..classes]), margin(&row[classes..])],
+                )
+            })
+            .collect()
+    }
+
+    /// The BF16 tier (BF16 projections and GEMMs, F32 residual stream,
+    /// norms, depthwise conv and attention core) stays within BF16 rounding
+    /// of the F32 encoder and keeps the TDT decisions of a tiny decode: a
+    /// confident joint decodes identically, and a joint centred on the
+    /// input changes no decision whose F32 margin exceeds twice the largest
+    /// logit change BF16 makes (a decision inside that band is a tie to
+    /// within BF16 rounding).
+    #[test]
+    fn bf16_encoder_matches_f32_and_keeps_decode_decisions() {
+        let device = Device::Cpu;
+        let f32_encoder = random_encoder(TINY, 31, &device);
+        let bf16 = bf16_encoder(31, &device);
+        let reference = encode_probe(&f32_encoder, &device);
+        let actual = encode_probe(&bf16, &device);
+        let rel = relative_l2(&actual, &reference);
+        let max_abs = actual
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let scale = reference
+            .iter()
+            .fold(0f32, |max, value| max.max(value.abs()));
+        eprintln!(
+            "Parakeet BF16 vs F32 encoder (TINY, CPU): relative L2 {rel:.3e}, max |diff| {max_abs:.3e} of max |x| {scale:.3}"
+        );
+        assert!(
+            rel > 0.0 && rel < BF16_ENCODE_RELATIVE_L2,
+            "relative L2 {rel:e}"
+        );
+
+        let mut f32_model = encoder_driven_model(&device, f32_encoder);
+        let mut bf16_model = encoder_driven_model(&device, bf16);
+        // 4 s of audio, 50 encoder frames: a tone that changes pitch and
+        // level every quarter second over faint noise.
+        let noise = XorShift(13).values(64_037, 0.01, 0.0);
+        let audio = noise
+            .iter()
+            .enumerate()
+            .map(|(n, noise)| {
+                let segment = n / 4_000;
+                let pitch = 200.0 + 600.0 * (segment % 7) as f32;
+                let level = 0.05 + 0.1 * (segment % 3) as f32;
+                let phase = 2.0 * std::f32::consts::PI * pitch * n as f32 / 16_000.0;
+                level * phase.sin() + noise
+            })
+            .collect::<Vec<_>>();
+        let artifacts = [&f32_model, &bf16_model].map(|model| {
+            model
+                .prepare_retained_encoder(&audio, 16_000, Some("en"), &ready)
+                .unwrap()
+        });
+        assert_eq!(artifacts[1].encoded.dtype(), DType::F32);
+        let compare = |f32_model: &ParakeetAsrModel, bf16_model: &ParakeetAsrModel| {
+            let perturbation = max_abs_diff(
+                &joint_logits(f32_model, &artifacts[0].encoded),
+                &joint_logits(bf16_model, &artifacts[1].encoded),
+            );
+            let f32_decisions = frame_decisions(f32_model, &artifacts[0].encoded);
+            let bf16_decisions = frame_decisions(bf16_model, &artifacts[1].encoded);
+            assert_eq!(f32_decisions.len(), 50);
+            (f32_decisions, bf16_decisions, perturbation)
+        };
+
+        // A confident joint: every decision clears the band, so the whole
+        // retained decode (labels, durations, timestamps) is identical.
+        let (f32_decisions, bf16_decisions, perturbation) = compare(&f32_model, &bf16_model);
+        let smallest = f32_decisions
+            .iter()
+            .flat_map(|(_, margins)| *margins)
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            smallest > 2.0 * perturbation,
+            "margin {smallest} vs logit change {perturbation}"
+        );
+        assert_eq!(
+            bf16_decisions.iter().map(|d| d.0).collect::<Vec<_>>(),
+            f32_decisions.iter().map(|d| d.0).collect::<Vec<_>>()
+        );
+        let (f32_steps, f32_diagnostics) = decode_until_finished(&f32_model, &artifacts[0], 500);
+        let (bf16_steps, bf16_diagnostics) = decode_until_finished(&bf16_model, &artifacts[1], 500);
+        assert_eq!(
+            bf16_steps.last().unwrap().text,
+            f32_steps.last().unwrap().text
+        );
+        for key in [
+            "tdt_joint_steps",
+            "tdt_emitted_tokens",
+            "tdt_blank_steps",
+            "timestamp_words",
+        ] {
+            assert_eq!(bf16_diagnostics[key], f32_diagnostics[key], "{key}");
+        }
+        eprintln!(
+            "Parakeet BF16 vs F32 confident decode: identical over {} joint steps ({} tokens), smallest margin {smallest:.3e}, largest logit change {perturbation:.3e}",
+            f32_diagnostics["tdt_joint_steps"], f32_diagnostics["tdt_emitted_tokens"]
+        );
+
+        // A centred joint: decisions vary frame to frame.
+        center_joint([&mut f32_model, &mut bf16_model], &artifacts[0].encoded);
+        let (f32_decisions, bf16_decisions, perturbation) = compare(&f32_model, &bf16_model);
+        let band = 2.0 * perturbation;
+        let (mut decisive, mut ties, mut flipped) = (0, 0, 0);
+        for (frame, ((f32_decision, margins), (bf16_decision, _))) in
+            f32_decisions.iter().zip(&bf16_decisions).enumerate()
+        {
+            let heads = [
+                (f32_decision.0, bf16_decision.0),
+                (f32_decision.1, bf16_decision.1),
+            ];
+            for ((f32_choice, bf16_choice), margin) in heads.into_iter().zip(margins) {
+                if *margin > band {
+                    decisive += 1;
+                    assert_eq!(bf16_choice, f32_choice, "frame {frame}: margin {margin}");
+                } else {
+                    ties += 1;
+                    flipped += usize::from(bf16_choice != f32_choice);
+                }
+            }
+        }
+        eprintln!(
+            "Parakeet BF16 vs F32 centred joint: {decisive} decisive decisions identical; {flipped} of {ties} within {band:.3e} of a tie flipped"
+        );
+        let labels = f32_decisions.iter().map(|d| d.0 .0).collect::<Vec<_>>();
+        let durations = f32_decisions.iter().map(|d| d.0 .1).collect::<Vec<_>>();
+        assert!(labels.iter().any(|label| *label != labels[0]));
+        assert!(durations.iter().any(|duration| *duration != durations[0]));
+        // Centring leaves small logits: 69 of 100 decisions clear the band
+        // here, and none of those changes.
+        assert!(decisive >= 60, "{decisive} of 100 decisions decisive");
+        assert_eq!(
+            bf16_model.weight_precision_diagnostics()["projection_weights"],
+            serde_json::json!("BF16")
+        );
+    }
+
+    /// A padded BF16 batch encodes each row as the row alone does in BF16,
+    /// within BF16 rounding: the CPU product regroups its F32 sums by batch
+    /// shape before narrowing to BF16, so one rounding step can differ.
+    #[test]
+    fn bf16_batched_encode_matches_solo_bf16_encode() {
+        let device = Device::Cpu;
+        let mut model = forced_label_model(&device);
+        model.network.encoder = bf16_encoder(1, &device);
+        let lengths = [1usize, 3, 37, 64, 125];
+        let features = lengths
+            .iter()
+            .zip(31..)
+            .map(|(len, seed)| features_of_frames(&model, *len, seed))
+            .collect::<Vec<_>>();
+        let solo = features
+            .iter()
+            .map(|features| model.encode_host_features(features, None, &ready).unwrap())
+            .collect::<Vec<_>>();
+        let rows = features
+            .iter()
+            .map(|features| batch_row(features, &ready))
+            .collect::<Vec<_>>();
+        let batched = model.prepare_retained_encoder_batch(&rows).unwrap();
+        let mut worst = 0f64;
+        for ((artifact, solo), len) in batched.into_iter().zip(&solo).zip(lengths) {
+            let artifact = artifact.unwrap();
+            assert_eq!(artifact.encoded.dtype(), DType::F32);
+            assert_eq!(artifact.encoded.dims(), solo.encoded.dims());
+            assert_eq!(
+                artifact.resident_tensor_bytes().unwrap(),
+                (len * TINY.dim * 4) as u64
+            );
+            let rel = relative_l2(
+                &host_f32(&artifact.encoded).unwrap(),
+                &host_f32(&solo.encoded).unwrap(),
+            );
+            worst = worst.max(rel);
+        }
+        eprintln!("Parakeet BF16 batched vs solo encode on CPU: worst relative L2 {worst:.3e}");
+        assert!(worst < BF16_ENCODE_RELATIVE_L2, "relative L2 {worst:e}");
+    }
+
+    /// `IZWI_PARAKEET_ASR_DTYPE` on CUDA: BF16 by default and for `bf16`,
+    /// F32 for `f32` (today's path), anything else ignored visibly; a device
+    /// without BF16 stays F32. CPU stays F32 and Metal keeps weight-only F16.
+    #[test]
+    fn cuda_projection_precision_defaults_to_bf16_with_an_f32_kill_switch() {
+        let select = parakeet_cuda_projection_precision;
+        assert_eq!(select(true, None).dtype, DType::BF16);
+        assert_eq!(select(true, Some("  ")).dtype, DType::BF16);
+        assert_eq!(select(true, Some("bf16")).dtype, DType::BF16);
+        let pinned = select(true, Some("f32"));
+        assert_eq!(pinned.dtype, DType::F32);
+        assert!(
+            pinned.reason.contains("IZWI_PARAKEET_ASR_DTYPE=f32"),
+            "{}",
+            pinned.reason
+        );
+        let ignored = select(true, Some("f16"));
+        assert_eq!(ignored.dtype, DType::BF16);
+        assert!(ignored.reason.contains("ignored"), "{}", ignored.reason);
+        assert_eq!(select(false, None).dtype, DType::F32);
+
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let profile = |kind| crate::backends::DeviceProfile {
+            device: Device::Cpu,
+            kind,
+            capabilities: crate::backends::DeviceCapabilities {
+                supports_bf16: kind == crate::backends::DeviceKind::Cuda,
+                supports_f16: kind != crate::backends::DeviceKind::Cpu,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+        use crate::backends::DeviceKind::{Cpu, Cuda, Metal};
+        let resolve = |kind| resolve_parakeet_projection_precision(&profile(kind)).dtype;
+        std::env::remove_var(PARAKEET_ASR_DTYPE_ENV);
+        assert_eq!(
+            [resolve(Cuda), resolve(Metal), resolve(Cpu)],
+            [DType::BF16, DType::F16, DType::F32]
+        );
+        std::env::set_var(PARAKEET_ASR_DTYPE_ENV, "f32");
+        let pinned = [resolve(Cuda), resolve(Metal), resolve(Cpu)];
+        std::env::set_var(PARAKEET_ASR_DTYPE_ENV, "bf16");
+        let bf16 = [resolve(Cuda), resolve(Cpu)];
+        std::env::remove_var(PARAKEET_ASR_DTYPE_ENV);
+        assert_eq!(pinned, [DType::F32; 3]);
+        assert_eq!(bf16, [DType::BF16, DType::F32]);
     }
 
     /// A weight F16 cannot represent turns the F16 encoder non-finite; the
@@ -3631,9 +5602,12 @@ mod tests {
             f16_precision(),
         )
         .unwrap();
-        let other =
-            ParakeetEncoder::load(random_encoder_vb(TINY, 35, &device), TINY, Some(&device))
-                .unwrap();
+        let other = ParakeetEncoder::load(
+            random_encoder_vb(TINY, 35, &device),
+            TINY,
+            Projections::F16(&device),
+        )
+        .unwrap();
         encoder.layers[0].ff1.linear1 = other.layers[0].ff1.linear1.clone();
         let report = encoder.weight_only_f16_self_check(&random_encoder_vb(TINY, 34, &device));
         assert!(!report.passed);
@@ -3840,6 +5814,65 @@ mod tests {
         assert!(max_abs_diff(&windowed(2).encoded, &reference) > 1e-3);
     }
 
+    /// A long input's windows stacked as the rows of one batch encode as the
+    /// sequential windows do (within the batched-encode bound), and the
+    /// stacked encode checks for cancellation before every batch.
+    #[test]
+    fn stacked_windows_match_sequential_windows() {
+        let device = Device::Cpu;
+        let encoder = random_encoder(TINY, 11, &device);
+        let valid = 8 * 120 + 3;
+        let frames = valid + 1;
+        let encoded_len = subsampled_len_3x(valid);
+        let log_mel = random_log_mel(frames, valid, 33);
+        let windowing = EncoderWindowing {
+            frames: 32,
+            left_context: 8,
+            right_context: 8,
+        };
+        let run = |rows: usize, checks: &Cell<usize>| {
+            encode_windows_stacked(
+                &encoder,
+                frames,
+                encoded_len,
+                windowing,
+                rows,
+                &mut |columns| log_mel.normalize_and_upload(columns, &device),
+                &|| {
+                    checks.set(checks.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap()
+        };
+        let sequential_checks = Cell::new(0);
+        let sequential = run(1, &sequential_checks);
+        assert!(sequential.windows >= 5, "{} windows", sequential.windows);
+        assert_eq!(sequential_checks.get(), sequential.windows);
+        let scale = sequential
+            .encoded
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        for rows in [2, 3, sequential.windows + 4] {
+            let checks = Cell::new(0);
+            let stacked = run(rows, &checks);
+            assert_eq!(stacked.windows, sequential.windows);
+            assert_eq!(stacked.encoded.dims(), sequential.encoded.dims());
+            assert_eq!(checks.get(), sequential.windows.div_ceil(rows), "{rows} rows");
+            let diff = max_abs_diff(&stacked.encoded, &sequential.encoded);
+            assert!(
+                diff <= BATCHED_ENCODE_TOLERANCE * scale.max(1.0),
+                "{rows} rows: max |diff| {diff} of {scale}"
+            );
+        }
+    }
+
     #[test]
     fn windowed_encode_stops_at_a_cancelled_checkpoint() {
         let device = Device::Cpu;
@@ -3921,6 +5954,10 @@ mod tests {
 
     #[test]
     fn preparation_pricing_is_bounded_by_the_window() {
+        // Pricing and the encoder read `IZWI_PARAKEET_ENCODER_GRAPHS`.
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         const GIB: u64 = 1 << 30;
         let minute = 60 * 16_000;
         let total = |samples: usize, backend: BackendKind| {
@@ -3942,7 +5979,9 @@ mod tests {
                 assert!(bytes >= previous, "{backend:?} pricing fell at {samples}");
                 previous = bytes;
             }
-            assert!(total(60 * minute, backend) <= 5 * GIB / 2, "{backend:?}");
+            // CUDA stacks four windows of a long input (about 1.4 GiB).
+            let bound = if backend == BackendKind::Cuda { 3 * GIB } else { 5 * GIB / 2 };
+            assert!(total(60 * minute, backend) <= bound, "{backend:?}");
         }
 
         // E = 1024 frames: the window term is final from here on. It was
@@ -3956,15 +5995,444 @@ mod tests {
         };
         assert_eq!(full_window(BackendKind::Cpu), (832 - 512 + 96) << 20);
         assert_eq!(full_window(BackendKind::Metal), (832 - 512 + 96) << 20);
+        // A longer input stacks its windows as the rows of one batch on
+        // CUDA: two windows at 2 minutes, then four; the CPU and Metal run
+        // them one at a time, at the one-window price.
+        assert_eq!(backends.map(window_batch_rows), [1, 1, 4]);
         for minutes in [2, 10, 30, 60] {
             for backend in backends {
                 let bytes = parakeet_preparation_bytes(minutes * minute, backend).unwrap();
-                assert_eq!(bytes.window_bytes, full_window(backend));
+                let rows = if minutes == 2 { 2 } else { 4 }.min(window_batch_rows(backend));
+                assert_eq!(
+                    bytes.window_bytes,
+                    encoder_window_row_bytes(1024, rows, 1, backend).unwrap(),
+                    "{backend:?} at {minutes} minutes"
+                );
             }
+            assert_eq!(
+                parakeet_preparation_bytes(minutes * minute, BackendKind::Cpu)
+                    .unwrap()
+                    .window_bytes,
+                full_window(BackendKind::Cpu)
+            );
         }
         for samples in [16_000, 7 * minute + 4_321, 60 * minute] {
             assert!(total(samples, BackendKind::Metal) >= total(samples, BackendKind::Cpu));
         }
+    }
+
+    /// The host worker computes the log-mel; the device job then holds one
+    /// window's normalized copy instead of the whole log-mel pipeline.
+    #[test]
+    fn host_features_price_the_log_mel_and_one_window_upload() {
+        // Pricing and the encoder read `IZWI_PARAKEET_ENCODER_GRAPHS`.
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let device = Device::Cpu;
+        let model = forced_label_model(&device);
+        // 3 s at 8 kHz: 300 valid feature frames, 38 encoder frames.
+        let audio = XorShift(17).values(24_000, 0.1, 0.0);
+        let features = model.prepare_host_features(&audio, 8_000).unwrap();
+        assert_eq!(features.encoded_len(), 38);
+        assert_eq!(features.feature_frames(), 301);
+        assert_eq!(features.input_samples(), 24_000);
+        assert!(features.single_window());
+        assert_eq!(features.window_frames(), 38);
+        assert!(features.host_bytes().unwrap() >= 128 * 301 * 4);
+
+        let artifact = model
+            .encode_host_features(&features, Some("en"), &|| Ok(()))
+            .unwrap();
+        let reference = model
+            .prepare_retained_encoder(&audio, 8_000, Some("en"), &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            artifact.encoded.to_vec3::<f32>().unwrap(),
+            reference.encoded.to_vec3::<f32>().unwrap()
+        );
+        assert_eq!(artifact.feature_frames, 300);
+        assert_eq!(artifact.resampled_samples, 48_000);
+
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let solo = parakeet_preparation_bytes(48_000, backend).unwrap();
+            let device_job = parakeet_encode_row_bytes(&features, 38, 1, backend).unwrap();
+            assert_eq!(device_job.host_bytes, 128 * 301 * 4);
+            assert!(device_job.window_bytes <= solo.window_bytes);
+            assert_eq!(device_job.output_bytes, solo.output_bytes);
+        }
+        // An empty or rate-less input never reaches the device.
+        assert!(model.prepare_host_features(&[], 16_000).is_err());
+        assert!(model.prepare_host_features(&audio, 0).is_err());
+    }
+
+    /// Host features of a 16 kHz input that encodes to `encoded_len` frames;
+    /// its STFT padding column shares the last encoder frame.
+    fn features_of_frames(
+        model: &ParakeetAsrModel,
+        encoded_len: usize,
+        seed: u64,
+    ) -> ParakeetHostFeatures {
+        let samples = (8 * encoded_len - 3) * 160 + 77;
+        let audio = XorShift(seed).values(samples, 0.1, 0.0);
+        let features = model.prepare_host_features(&audio, 16_000).unwrap();
+        assert_eq!(features.encoded_len(), encoded_len);
+        features
+    }
+
+    fn batch_row<'a>(
+        features: &'a ParakeetHostFeatures,
+        checkpoint: &'a dyn Fn() -> Result<()>,
+    ) -> ParakeetEncoderBatchRow<'a> {
+        ParakeetEncoderBatchRow {
+            features,
+            language: Some("en"),
+            checkpoint,
+        }
+    }
+
+    fn ready() -> Result<()> {
+        Ok(())
+    }
+
+    /// A padded batch encodes each single-window row as the row alone does,
+    /// whatever lengths share it. Rows of one length batch bit for bit on
+    /// the dev Mac; padding regroups the CPU softmax's vectorized sum (its
+    /// tail joins the SIMD lanes), so padded rows agree within a few F32
+    /// ulps of the output's scale.
+    #[test]
+    fn batched_encode_matches_solo_encode_for_mixed_lengths() {
+        let device = Device::Cpu;
+        let model = forced_label_model(&device);
+        let lengths = [1usize, 3, 37, 64, 125];
+        let features = lengths
+            .iter()
+            .zip(31..)
+            .map(|(len, seed)| features_of_frames(&model, *len, seed))
+            .collect::<Vec<_>>();
+        let solo = features
+            .iter()
+            .map(|features| model.encode_host_features(features, None, &ready).unwrap())
+            .collect::<Vec<_>>();
+        let scale = solo
+            .iter()
+            .map(|artifact| {
+                let values = artifact.encoded.flatten_all().unwrap().to_vec1::<f32>();
+                values
+                    .unwrap()
+                    .into_iter()
+                    .fold(0f32, |max, value| max.max(value.abs()))
+            })
+            .fold(0f32, f32::max);
+        let mut worst = 0f32;
+        for batch in [&[0usize, 1, 2, 3, 4][..], &[2, 3], &[4, 0, 1]] {
+            let rows = batch
+                .iter()
+                .map(|index| batch_row(&features[*index], &ready))
+                .collect::<Vec<_>>();
+            let batched = model.prepare_retained_encoder_batch(&rows).unwrap();
+            assert_eq!(batched.len(), batch.len());
+            for (index, artifact) in batch.iter().zip(batched) {
+                let artifact = artifact.unwrap();
+                assert_eq!(artifact.encoded.dims(), solo[*index].encoded.dims());
+                assert_eq!(artifact.encoded_len, lengths[*index]);
+                assert_eq!(artifact.encoder_windows, 1);
+                assert_eq!(artifact.language.as_deref(), Some("en"));
+                assert_eq!(artifact.feature_frames, solo[*index].feature_frames);
+                // Its own exact storage, not a view pinning the batch buffer.
+                assert_eq!(
+                    artifact.resident_tensor_bytes().unwrap(),
+                    (lengths[*index] * TINY.dim * 4) as u64
+                );
+                worst = worst.max(max_abs_diff(&artifact.encoded, &solo[*index].encoded));
+            }
+        }
+        eprintln!(
+            "Parakeet batched vs solo encode on CPU: max |diff| {worst:e} over max |x| {scale} ({})",
+            if worst == 0.0 {
+                "bit-exact"
+            } else {
+                "not bit-exact"
+            }
+        );
+        // A padded row's softmax sums over the padded length, which the SIMD
+        // reduction regroups: 7e-7 of scale here, and another CPU (x86 CI)
+        // can regroup differently, so the bound leaves room.
+        assert!(
+            worst <= BATCHED_ENCODE_TOLERANCE * scale.max(1.0),
+            "max |diff| {worst} of {scale}"
+        );
+    }
+
+    /// The fused attention's wiring: with the kernel's host reference in
+    /// place of the eager core (biases, position order, scale and each
+    /// row's key length as the CUDA kernel receives them), the conformer
+    /// layers match the eager layers on the real frames of a padded batch
+    /// and of a lone row. The kernel takes head dims in multiples of 32, so
+    /// this encoder is wider than `TINY`.
+    #[test]
+    fn fused_attention_matches_the_eager_layers() {
+        const WIDE: EncoderGeometry = EncoderGeometry {
+            mel_bins: 128,
+            subsampling_channels: 4,
+            layers: 2,
+            dim: 64,
+            heads: 2,
+            ff_dim: 64,
+            conv_kernel: 9,
+        };
+        let device = Device::Cpu;
+        let encoder = random_encoder(WIDE, 71, &device);
+        let lengths = [29usize, 17, 1];
+        let padded = 29;
+        let padding = EncoderPadding::new(&lengths, padded, DType::F32, &device).unwrap();
+        let mut rng = XorShift(0x5EED_F00D);
+        let shape = (lengths.len(), padded, WIDE.dim);
+        let x = Tensor::from_vec(
+            rng.values(shape.0 * shape.1 * shape.2, 1.0, 0.0),
+            shape,
+            &device,
+        )
+        .unwrap()
+        .broadcast_mul(&padding.frames.transpose(1, 2).unwrap())
+        .unwrap();
+        let pos = encoder.positions(padded, &device).unwrap();
+        let run = |fused: bool, x: &Tensor, padding: Option<&EncoderPadding>| {
+            FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(fused));
+            let out = encoder.layers_forward(x.clone(), &pos, padding);
+            FUSED_ATTENTION_ON_THE_HOST.with(|flag| flag.set(false));
+            out.unwrap()
+        };
+        let eager = run(false, &x, Some(&padding));
+        let fused = run(true, &x, Some(&padding));
+        let scale = eager
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let mut worst = 0f32;
+        for (row, len) in lengths.iter().enumerate() {
+            let real = |t: &Tensor| t.narrow(0, row, 1).unwrap().narrow(1, 0, *len).unwrap();
+            worst = worst.max(max_abs_diff(&real(&fused), &real(&eager)));
+        }
+        let alone = x.narrow(0, 0, 1).unwrap();
+        worst = worst.max(max_abs_diff(
+            &run(true, &alone, None),
+            &run(false, &alone, None),
+        ));
+        eprintln!("Parakeet fused vs eager attention on CPU: max |diff| {worst:e} of {scale}");
+        assert!(
+            worst <= 1e-5 * scale.max(1.0),
+            "max |diff| {worst} of {scale}"
+        );
+    }
+
+    /// The padded batch on Metal: the fused depthwise kernel reads the masked
+    /// frames, and each row's output is an exact-size copy.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_batched_encode_matches_solo_encode() {
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_batched_encode_matches_solo_encode")
+        else {
+            return;
+        };
+        let model = forced_label_model(&device);
+        let lengths = [3usize, 37, 64];
+        let features = lengths
+            .iter()
+            .zip(51..)
+            .map(|(len, seed)| features_of_frames(&model, *len, seed))
+            .collect::<Vec<_>>();
+        let rows = features
+            .iter()
+            .map(|features| batch_row(features, &ready))
+            .collect::<Vec<_>>();
+        let batched = model.prepare_retained_encoder_batch(&rows).unwrap();
+        for ((features, len), artifact) in features.iter().zip(lengths).zip(batched) {
+            let artifact = artifact.unwrap();
+            let solo = model.encode_host_features(features, None, &ready).unwrap();
+            let scale = host_f32(&solo.encoded)
+                .unwrap()
+                .into_iter()
+                .fold(0f32, |max, value| max.max(value.abs()));
+            let diff = max_abs_diff(&artifact.encoded, &solo.encoded);
+            assert!(diff <= 1e-5 * scale.max(1.0), "{len}: {diff:e} of {scale}");
+            assert_eq!(
+                artifact.resident_tensor_bytes().unwrap(),
+                (len * TINY.dim * 4) as u64
+            );
+        }
+    }
+
+    /// Padded frames reach no real frame: poisoning them with ±1e3 after the
+    /// stem leaves every real frame's output bit for bit, and every padded
+    /// frame stays finite. The same layers without the masks let it in.
+    #[test]
+    fn padded_frames_never_reach_real_frames() {
+        let device = Device::Cpu;
+        let encoder = random_encoder(TINY, 0xBAD5, &device);
+        let lengths = [37usize, 64, 5];
+        let padded = 64;
+        let stems = lengths
+            .iter()
+            .zip(7..)
+            .map(|(len, seed)| {
+                let values = XorShift(seed).values(len * TINY.dim, 1.0, 0.0);
+                Tensor::from_vec(values, (1, *len, TINY.dim), &device).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let batch = |poison: f32| {
+            let rows = stems
+                .iter()
+                .zip(lengths)
+                .map(|(stem, len)| {
+                    if len == padded {
+                        return stem.clone();
+                    }
+                    let fill = (0..(padded - len) * TINY.dim)
+                        .map(|index| if index % 2 == 0 { poison } else { -poison })
+                        .collect::<Vec<_>>();
+                    let fill = Tensor::from_vec(fill, (1, padded - len, TINY.dim), &device);
+                    Tensor::cat(&[stem, &fill.unwrap()], 1).unwrap()
+                })
+                .collect::<Vec<_>>();
+            Tensor::cat(&rows, 0).unwrap()
+        };
+        let clean = encoder.encode_padded(batch(0.0), &lengths).unwrap();
+        let poisoned = encoder.encode_padded(batch(1e3), &lengths).unwrap();
+        let real = |x: &Tensor, row: usize| {
+            x.narrow(0, row, 1)
+                .unwrap()
+                .narrow(1, 0, lengths[row])
+                .unwrap()
+        };
+        for row in 0..lengths.len() {
+            assert_eq!(
+                real(&clean, row).to_vec3::<f32>().unwrap(),
+                real(&poisoned, row).to_vec3::<f32>().unwrap(),
+                "row {row}"
+            );
+        }
+        for x in [&clean, &poisoned] {
+            let values = x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert!(values.iter().all(|value| value.is_finite()));
+        }
+
+        let pos = build_rel_positional_embedding(padded, TINY.dim, &device).unwrap();
+        let mut unmasked = batch(1e3);
+        for layer in &encoder.layers {
+            unmasked = layer.forward(&unmasked, &pos, None).unwrap();
+        }
+        assert!(max_abs_diff(&real(&unmasked, 0), &real(&clean, 0)) > 1e-3);
+    }
+
+    /// A batch of one request runs today's windowed encode, bit for bit,
+    /// whether its input fits one window or not; a multi-window input never
+    /// joins a wider batch.
+    #[test]
+    fn width_one_batch_is_the_solo_encode() {
+        let device = Device::Cpu;
+        let mut model = forced_label_model(&device);
+        // 4 s: 50 encoder frames.
+        let audio = XorShift(13).values(64_037, 0.1, 0.0);
+        let windowed = EncoderWindowing {
+            frames: 32,
+            left_context: 10,
+            right_context: 10,
+        };
+        for (windowing, windows) in [(EncoderWindowing::V3, 1), (windowed, 3)] {
+            model.encoder_windowing = windowing;
+            let features = model.prepare_host_features(&audio, 16_000).unwrap();
+            assert_eq!(features.single_window(), windows == 1);
+            let batched = model
+                .prepare_retained_encoder_batch(&[batch_row(&features, &ready)])
+                .unwrap()
+                .pop()
+                .unwrap()
+                .unwrap();
+            let solo = model
+                .prepare_retained_encoder(&audio, 16_000, Some("en"), &ready)
+                .unwrap();
+            assert_eq!(batched.encoder_windows, windows);
+            assert_eq!(
+                batched.encoded.to_vec3::<f32>().unwrap(),
+                solo.encoded.to_vec3::<f32>().unwrap()
+            );
+        }
+        let multi_window = model.prepare_host_features(&audio, 16_000).unwrap();
+        let single_window = features_of_frames(&model, 20, 3);
+        let mixed = [
+            batch_row(&single_window, &ready),
+            batch_row(&multi_window, &ready),
+        ];
+        assert!(model.prepare_retained_encoder_batch(&mixed).is_err());
+    }
+
+    /// A row cancelled before the encode fails alone: the others encode as
+    /// they would have without it, and a lone survivor runs the solo encode.
+    #[test]
+    fn a_cancelled_batch_row_fails_alone() {
+        let model = forced_label_model(&Device::Cpu);
+        let features = [5usize, 7, 6]
+            .into_iter()
+            .zip(41..)
+            .map(|(len, seed)| features_of_frames(&model, len, seed))
+            .collect::<Vec<_>>();
+        let cancelled = || -> Result<()> { Err(Error::Cancelled("parakeet-row".into())) };
+        let solo = |index: usize| {
+            model
+                .encode_host_features(&features[index], None, &ready)
+                .unwrap()
+        };
+
+        let rows = [
+            batch_row(&features[0], &ready),
+            batch_row(&features[1], &cancelled),
+            batch_row(&features[2], &ready),
+        ];
+        let outcomes = model.prepare_retained_encoder_batch(&rows).unwrap();
+        assert!(matches!(outcomes[1], Err(Error::Cancelled(_))));
+        for index in [0, 2] {
+            let artifact = outcomes[index].as_ref().unwrap();
+            let alone = solo(index).encoded;
+            let scale = alone
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                max_abs_diff(&artifact.encoded, &alone)
+                    <= BATCHED_ENCODE_TOLERANCE * scale.max(1.0)
+            );
+        }
+
+        let rows = [
+            batch_row(&features[0], &cancelled),
+            batch_row(&features[1], &ready),
+            batch_row(&features[2], &cancelled),
+        ];
+        let outcomes = model.prepare_retained_encoder_batch(&rows).unwrap();
+        assert!(matches!(outcomes[0], Err(Error::Cancelled(_))));
+        assert!(matches!(outcomes[2], Err(Error::Cancelled(_))));
+        assert_eq!(
+            outcomes[1]
+                .as_ref()
+                .unwrap()
+                .encoded
+                .to_vec3::<f32>()
+                .unwrap(),
+            solo(1).encoded.to_vec3::<f32>().unwrap()
+        );
+
+        let outcomes = model
+            .prepare_retained_encoder_batch(&[batch_row(&features[0], &cancelled)])
+            .unwrap();
+        assert!(matches!(outcomes[..], [Err(Error::Cancelled(_))]));
     }
 
     /// The pre-change per-head argmax: one scalar readback per head.
@@ -4141,5 +6609,224 @@ mod tests {
             batch.to_vec2::<f32>().unwrap(),
             expected.to_vec2::<f32>().unwrap()
         );
+    }
+
+    /// A graph's shape: rows up to the next graph width, frames up to a
+    /// power of two, and nothing past 32 rows, one window or the pool.
+    #[test]
+    fn encoder_graph_shapes_pad_rows_to_a_width_and_frames_to_a_power_of_two() {
+        assert_eq!(encoder_graph_shape(1, 125), Some((1, 128)));
+        assert_eq!(encoder_graph_shape(0, 0), Some((1, 1)));
+        assert_eq!(encoder_graph_shape(5, 64), Some((6, 64)));
+        assert_eq!(encoder_graph_shape(17, 100), Some((24, 128)));
+        // Every width of 10 s clips, 12 rows of 20 s, a lone 82 s window.
+        assert_eq!(encoder_graph_shape(32, 125), Some((32, 128)));
+        assert_eq!(encoder_graph_shape(12, 250), Some((12, 256)));
+        assert_eq!(encoder_graph_shape(1, 1000), Some((1, 1024)));
+        assert_eq!(encoder_graph_shape(33, 8), None);
+        assert_eq!(encoder_graph_shape(13, 250), None, "16 rows of 256 frames");
+        assert_eq!(encoder_graph_shape(2, 1000), None);
+        assert_eq!(encoder_graph_shape(1, 1025), None, "past one window");
+        for rows in ENCODER_GRAPH_ROWS {
+            for frames in (0..=10).map(|exp| 1usize << exp) {
+                let Some(shape) = encoder_graph_shape(rows, frames) else {
+                    continue;
+                };
+                assert_eq!(shape, (rows, frames), "a graph's shape is its own");
+                let bytes = encoder_window_batch_bytes(frames, rows, BackendKind::Cuda).unwrap();
+                assert!(bytes.layers <= ENCODER_GRAPH_LIMITS.pool_bytes);
+            }
+        }
+    }
+
+    /// With the fused attention on, a window prices its activations and one
+    /// positional projection, not the scores, the three `rel_shift` planes
+    /// or a projection copy per row: 224 MiB less for a lone 1,024-frame
+    /// window, and about a third of the eager working set left.
+    #[test]
+    fn fused_attention_drops_the_eager_attention_planes() {
+        for rows in [1usize, 4] {
+            let eager =
+                encoder_window_batch_bytes_with(1024, rows, BackendKind::Cuda, false).unwrap();
+            let fused =
+                encoder_window_batch_bytes_with(1024, rows, BackendKind::Cuda, true).unwrap();
+            let rows64 = rows as u64;
+            let planes = rows64 * 8 * 1024 * 1024 * 4 + 3 * rows64 * 8 * 1024 * 2048 * 4;
+            let copies = if rows > 1 {
+                rows64 * 1024 * 2048 * 4
+            } else {
+                0
+            };
+            assert_eq!(fused.stem, eager.stem);
+            assert_eq!(
+                eager.layers - fused.layers,
+                planes + copies - 1024 * 2048 * 4
+            );
+            assert!(fused.layers * 3 < eager.layers, "{fused:?} vs {eager:?}");
+        }
+        // Without the CUDA kernel's verdict, pricing stays eager.
+        assert_eq!(
+            encoder_window_batch_bytes(128, 2, BackendKind::Cuda).unwrap(),
+            encoder_window_batch_bytes_with(128, 2, BackendKind::Cuda, false).unwrap()
+        );
+    }
+
+    /// Admission prices the graphed shape on CUDA only, each real row
+    /// carrying its share of the padded batch; the graphs' own memory is a
+    /// CUDA load's.
+    #[test]
+    fn cuda_admission_prices_the_graphed_shape() {
+        // Pricing and the encoder read `IZWI_PARAKEET_ENCODER_GRAPHS`.
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(parakeet_encoder_graph_device_bytes(BackendKind::Cpu), 0);
+        assert_eq!(parakeet_encoder_graph_device_bytes(BackendKind::Metal), 0);
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            assert_eq!(encoder_batch_shape(5, 100, backend), (5, 100));
+        }
+        if !encoder_graphs_requested() {
+            assert_eq!(parakeet_encoder_graph_device_bytes(BackendKind::Cuda), 0);
+            assert_eq!(encoder_batch_shape(5, 100, BackendKind::Cuda), (5, 100));
+            return;
+        }
+        assert_eq!(
+            parakeet_encoder_graph_device_bytes(BackendKind::Cuda),
+            768 << 20
+        );
+        assert_eq!(encoder_batch_shape(5, 100, BackendKind::Cuda), (6, 128));
+        assert_eq!(encoder_batch_shape(13, 250, BackendKind::Cuda), (13, 250));
+
+        let model = forced_label_model(&Device::Cpu);
+        let features = features_of_frames(&model, 38, 5);
+        for rows in [1usize, 3, 5, 17, 32, 40] {
+            let (batch_rows, frames) = encoder_batch_shape(rows, 38, BackendKind::Cuda);
+            let batch = encoder_window_batch_bytes(frames, batch_rows, BackendKind::Cuda).unwrap();
+            let row = parakeet_encode_row_bytes(&features, 38, rows, BackendKind::Cuda).unwrap();
+            let eager = parakeet_encode_row_bytes(&features, 38, rows, BackendKind::Cpu).unwrap();
+            assert!(row.window_bytes * rows as u64 >= batch.stem + batch.layers);
+            assert!(row.window_bytes >= eager.window_bytes, "{rows} rows");
+            let (useful, materialized) =
+                parakeet_encode_row_elements(&features, 38, rows, BackendKind::Cuda).unwrap();
+            assert_eq!(useful, (38 * EncoderGeometry::V3.dim) as u64);
+            assert_eq!(materialized, (frames * EncoderGeometry::V3.dim) as u64);
+        }
+    }
+
+    /// `IZWI_PARAKEET_ENCODER_GRAPHS=0` reaches admission (no graph memory,
+    /// the eager shape) and the loader (no graphs, naming the switch).
+    #[test]
+    fn the_kill_switch_turns_the_graphs_and_their_pricing_off() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(PARAKEET_ENCODER_GRAPHS_ENV);
+        std::env::set_var(PARAKEET_ENCODER_GRAPHS_ENV, "0");
+        let bytes = parakeet_encoder_graph_device_bytes(BackendKind::Cuda);
+        let shape = encoder_batch_shape(5, 100, BackendKind::Cuda);
+        let reason = random_encoder(TINY, 1, &Device::Cpu).graphs.err();
+        std::env::remove_var(PARAKEET_ENCODER_GRAPHS_ENV);
+        let on = (
+            parakeet_encoder_graph_device_bytes(BackendKind::Cuda),
+            encoder_batch_shape(5, 100, BackendKind::Cuda),
+        );
+        if let Some(previous) = previous {
+            std::env::set_var(PARAKEET_ENCODER_GRAPHS_ENV, previous);
+        }
+        assert_eq!(bytes, 0);
+        assert_eq!(shape, (5, 100));
+        let reason = reason.expect("no graphs");
+        assert!(reason.contains(PARAKEET_ENCODER_GRAPHS_ENV), "{reason}");
+        assert_eq!(on, (768 << 20, (6, 128)), "on when unset");
+    }
+
+    /// Off CUDA the encoder has no graphs, and says why.
+    #[test]
+    fn cpu_encoder_runs_without_graphs() {
+        let encoder = random_encoder(TINY, 1, &Device::Cpu);
+        assert!(!encoder.graphs_on());
+        assert_eq!(encoder.batch_shape(5, 100), (5, 100));
+        let off = encoder.graphs_diagnostics()["off"].clone();
+        assert!(
+            off.as_str().is_some_and(|reason| !reason.is_empty()),
+            "{off}"
+        );
+    }
+
+    /// On CUDA, a padded batch (spare rows included) and a lone window run
+    /// through their graphs: capture, verify, then two replays, each bit for
+    /// bit the eager layers at the same padded shape, over fresh inputs.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_encoder_graphs_replay_the_eager_layers_bit_for_bit() {
+        // Pricing and the encoder read `IZWI_PARAKEET_ENCODER_GRAPHS`.
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        if !encoder_graphs_requested() {
+            return;
+        }
+        let mut model = forced_label_model(&device);
+        model.network.encoder = bf16_encoder(1, &device);
+        assert!(
+            model.network.encoder.graphs_on(),
+            "{}",
+            model.network.encoder.graphs_diagnostics()
+        );
+        let mut eager = bf16_encoder(1, &device);
+        eager.graphs = Err("eager reference".into());
+        let bits = |t: &Tensor| -> Vec<u32> {
+            host_f32(t).unwrap().into_iter().map(f32::to_bits).collect()
+        };
+        let upload = |features: &ParakeetHostFeatures| {
+            let len = features.encoded_len();
+            let columns = EncoderWindow::whole(len).feature_columns(features.feature_frames());
+            let window = features
+                .log_mel
+                .normalize_and_upload(columns, &device)
+                .unwrap();
+            (window, len)
+        };
+        for step in 0..4u64 {
+            // Five rows pad to the six-row graph of 64 frames.
+            let lengths = [37usize, 64, 50, 12, 61];
+            let features = lengths
+                .iter()
+                .zip(0..)
+                .map(|(len, index)| features_of_frames(&model, *len, 100 * step + index + 1))
+                .collect::<Vec<_>>();
+            let rows = features
+                .iter()
+                .map(|features| batch_row(features, &ready))
+                .collect::<Vec<_>>();
+            let graphed = model.prepare_retained_encoder_batch(&rows).unwrap();
+            let uploaded = features.iter().map(upload).collect::<Vec<_>>();
+            assert_eq!(model.network.encoder.batch_shape(5, 64), (6, 64));
+            let want = eager
+                .encode_single_window_batch_at(&uploaded, (6, 64))
+                .unwrap();
+            for (index, (got, want)) in graphed.into_iter().zip(&want).enumerate() {
+                let got = got.unwrap();
+                assert_eq!(got.encoded.dims(), want.dims());
+                assert_eq!(bits(&got.encoded), bits(want), "step {step} row {index}");
+            }
+
+            // A lone 125-frame window runs the one-row graph of 128 frames.
+            let solo = features_of_frames(&model, 125, 7 + step);
+            let got = model.encode_host_features(&solo, None, &ready).unwrap();
+            let want = eager
+                .encode_single_window_batch_at(&[upload(&solo)], (1, 128))
+                .unwrap();
+            assert_eq!(bits(&got.encoded), bits(&want[0]), "step {step} solo");
+        }
+        let diagnostics = model.network.encoder.graphs_diagnostics();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        assert_eq!(diagnostics["captures"], 2, "{diagnostics}");
+        assert_eq!(diagnostics["verified"], 2, "{diagnostics}");
+        assert_eq!(diagnostics["replays"], 4, "{diagnostics}");
+        assert_eq!(diagnostics["fallbacks"], 0, "{diagnostics}");
     }
 }

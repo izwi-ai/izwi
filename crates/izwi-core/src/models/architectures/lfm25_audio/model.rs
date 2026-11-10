@@ -93,6 +93,11 @@ pub(crate) struct Lfm25AudioPreparedAsrArtifact {
 }
 
 impl Lfm25AudioPreparedAsrArtifact {
+    /// The device holding the prepared prompt embeddings.
+    pub(crate) fn device_location(&self) -> candle_core::DeviceLocation {
+        self.prompt_embeddings.device().location()
+    }
+
     pub(crate) const fn model_load_nonce(&self) -> u64 {
         self.model_load_nonce
     }

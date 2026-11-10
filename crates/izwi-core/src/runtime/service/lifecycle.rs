@@ -234,7 +234,14 @@ impl RuntimeService {
         // width; every other capability runs at the engine rows' width. On
         // CUDA an automatic chat width is the CUDA ceiling, so the families
         // certified for wide batches decode more rows per forward than the
-        // engine rows. An operator's explicit width applies as asked.
+        // engine rows. ASR decode does the same (its encoders and prefill
+        // keep the engine rows), and each ASR load fits its decode width to
+        // its memory. An operator's explicit width applies as asked.
+        let asr_row_width = crate::catalog::asr_engine_width(
+            selected_backend_kind,
+            non_chat_row_width,
+            automatic_tensor_width,
+        );
         let adapter_registry = Arc::new(
             RuntimeAdapterRegistry::built_in_with_execution_limits(
                 non_chat_row_width,
@@ -245,6 +252,9 @@ impl RuntimeService {
                 worker_config.max_tensor_batch_size,
                 automatic_tensor_width,
             ))
+            .with_asr_tensor_batch_size(asr_row_width)
+            // TTS decode widens on the same terms as ASR decode.
+            .with_tts_tensor_batch_size(asr_row_width)
             .with_explicit_tensor_width(explicit_tensor_width),
         );
         worker_config.static_tensor_batch_variants =
@@ -268,6 +278,10 @@ impl RuntimeService {
         let vibevoice_encoder_batcher = Arc::new(VibeVoiceEncoderBatcher::new(coordinator.clone()));
         let granite_speech_encoder_batcher =
             Arc::new(GraniteSpeechEncoderBatcher::new(coordinator.clone()));
+        let granite_speech5_encoder_batcher =
+            Arc::new(GraniteSpeech5EncoderBatcher::new(coordinator.clone()));
+        let parakeet_encoder_batcher = Arc::new(ParakeetEncoderBatcher::new(coordinator.clone()));
+        let nemotron_encoder_batcher = Arc::new(NemotronEncoderBatcher::new(coordinator.clone()));
         let asr_realtime_sessions = RealtimeAsrSessionPolicy::resolve_for_sequences(
             config.asr_realtime,
             selected_backend_kind,
@@ -285,6 +299,7 @@ impl RuntimeService {
             staged_transactions: core_config.max_staged_transactions,
             tensor_width: worker_config.max_tensor_batch_size,
             non_chat_row_width,
+            asr_row_width,
             realtime_asr_sessions: asr_realtime_sessions.max_sessions(),
             chunked_prefill: core_config.effective_chunked_prefill(),
         };
@@ -296,6 +311,7 @@ impl RuntimeService {
             staged_transactions = concurrency.staged_transactions,
             tensor_width = concurrency.tensor_width,
             non_chat_row_width = concurrency.non_chat_row_width,
+            asr_row_width = concurrency.asr_row_width,
             realtime_asr_sessions = concurrency.realtime_asr_sessions,
             chunked_prefill = concurrency.chunked_prefill,
             "resolved runtime concurrency"
@@ -323,6 +339,10 @@ impl RuntimeService {
             .max_loaded_models
             .or_else(|| positive_usize_env("IZWI_MAX_LOADED_MODELS"));
 
+        let asr_chunk_row_permits = Arc::new(Semaphore::new(chunk_row_permit_count(
+            non_chat_row_width,
+            config.max_queued_requests,
+        )));
         Ok(Self {
             config,
             cache_policy,
@@ -338,6 +358,10 @@ impl RuntimeService {
             whisper_encoder_batcher,
             vibevoice_encoder_batcher,
             granite_speech_encoder_batcher,
+            granite_speech5_encoder_batcher,
+            parakeet_encoder_batcher,
+            nemotron_encoder_batcher,
+            asr_chunk_row_permits,
             asr_realtime_sessions,
             telemetry: Arc::new(RuntimeTelemetryCollector::new(2048)),
             completion_waiters: Arc::new(Mutex::new(HashMap::new())),

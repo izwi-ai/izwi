@@ -204,11 +204,13 @@ impl RuntimeService {
         );
         if request.task_type == TaskType::ASR {
             if let Some(variant) = request.model_variant {
-                if let Some(resources) = asr_transient_resources(
+                if let Some(resources) = asr_transient_resources_for_route(
                     self.backend_router.context().backend_kind,
                     variant,
                     input_bytes,
                     request.prepared_asr_input_duration_secs(),
+                    variant.family() == ModelFamily::Voxtral
+                        && request.uses_asr_retained_sequence(),
                 )? {
                     spec.resources = resources;
                 }
@@ -249,6 +251,7 @@ impl RuntimeService {
                             | ModelFamily::VibeVoiceAsr
                             | ModelFamily::GraniteSpeechAsr
                             | ModelFamily::Lfm25Audio
+                            | ModelFamily::Voxtral
                     )
                 })
                 && request.prepared_asr_audio_for_executor()?.is_some());
@@ -627,7 +630,11 @@ impl RuntimeService {
         self.bind_waiter(&request_id, waiter_registration_id, guard.session.epoch)
             .await?;
         waiter_guard.disarm();
-        self.telemetry.record_request_queued(&request_id).await;
+        // A long-form chunk row counts in its parent request instead; one
+        // never queued is never counted finished or cancelled either.
+        if !observation_request.asr_chunk_row {
+            self.telemetry.record_request_queued(&request_id).await;
+        }
         self.step_driver_wakeup.notify_one();
         let completion = self
             .await_completion(&request_id, completion_rx, observation_request.deadline)
@@ -927,7 +934,9 @@ impl RuntimeService {
         )
         .await?;
         waiter_guard.disarm();
-        self.telemetry.record_request_queued(&request_id).await;
+        if !observation_request.asr_chunk_row {
+            self.telemetry.record_request_queued(&request_id).await;
+        }
         self.step_driver_wakeup.notify_one();
         let mut completion_result: Option<EngineOutput> = None;
         let deadline = observation_request.deadline;

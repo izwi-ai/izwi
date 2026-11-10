@@ -822,13 +822,145 @@ impl ModelLifecycleController {
             .map_err(|_| Error::InvalidInput("managed state transaction limit exceeds u32".into()))
     }
 
-    pub(super) fn asr_state_rows(&self) -> (usize, usize) {
+    /// `(retained, staged)` rows of a loaded model's ASR state. With
+    /// automatic staged rows, one step's launch at its widest continuous ASR
+    /// decode stage, which may exceed the engine rows' width (a decode the
+    /// load fitted past the engine rows, `catalog::batch_width`); never
+    /// fewer than the engine's staged rows. Retained rows follow
+    /// ([`asr_state_rows`]).
+    pub(super) fn asr_state_rows(
+        &self,
+        bundle_draft: &LoadedModelBundleDraft,
+    ) -> Result<(usize, usize)> {
         let engine = self.core_engine.config();
-        asr_state_rows(
+        let staged = if engine.automatic_row_limits.staged_transactions {
+            engine.max_staged_transactions.max(
+                crate::runtime::service::automatic_staged_transaction_rows(
+                    asr_decode_stage_width(bundle_draft)?,
+                    engine
+                        .resolved_physical_execution_capacity()
+                        .candidate_dispatch_limit
+                        .get(),
+                    engine.max_retained_sequences,
+                ),
+            )
+        } else {
+            engine.max_staged_transactions
+        };
+        Ok(asr_state_rows(
             engine.automatic_row_limits.retained_sequences,
             engine.max_retained_sequences,
-            engine.max_staged_transactions,
-        )
+            staged,
+        ))
+    }
+
+    /// Staged rows of a loaded model's TTS state. With automatic staged
+    /// rows, one step's launch at its widest continuous TTS decode stage,
+    /// which may exceed the engine rows' width (`catalog::tts_decode_width`);
+    /// never fewer than the engine's staged rows. Operator-set rows are kept.
+    pub(super) fn tts_staged_rows(&self, bundle_draft: &LoadedModelBundleDraft) -> Result<usize> {
+        let engine = self.core_engine.config();
+        if !engine.automatic_row_limits.staged_transactions {
+            return Ok(engine.max_staged_transactions);
+        }
+        Ok(engine.max_staged_transactions.max(
+            crate::runtime::service::automatic_staged_transaction_rows(
+                super::decode_stage_width(bundle_draft, CapabilityKind::Tts)?,
+                engine
+                    .resolved_physical_execution_capacity()
+                    .candidate_dispatch_limit
+                    .get(),
+                engine.max_retained_sequences,
+            ),
+        ))
+    }
+
+    /// The ASR decode width a load of `variant` drafts its adapters with,
+    /// or `None` for a model without an ASR capability. Where the registry
+    /// lets the decode run past the engine rows (CUDA with an automatic
+    /// width, the families certified wider), the widest of 32, 16 and 8
+    /// rows whose decode rows (`asr_envelope::cuda_decode_row_bytes`) take
+    /// at most half the planning headroom left after the model's resident
+    /// authorization; the engine rows when that cannot be priced. Otherwise
+    /// the registry's width, as before. Logged for every ASR load.
+    pub(super) fn fit_asr_decode_width(
+        &self,
+        variant: ModelVariant,
+        plan: &ModelResourcePlan,
+    ) -> Result<Option<usize>> {
+        if self
+            .adapter_registry
+            .require(CapabilityKind::Asr, variant)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let backend = self.backend_router.context().backend_kind;
+        let ceiling = self
+            .adapter_registry
+            .asr_decode_width(variant.family(), backend);
+        let floor = self.adapter_registry.max_tensor_batch_size();
+        if ceiling <= floor {
+            tracing::info!(
+                model = %variant,
+                asr_decode_width = ceiling,
+                "ASR decode runs at the engine rows"
+            );
+            return Ok(Some(ceiling));
+        }
+        let per_row_bytes = super::super::asr_envelope::cuda_decode_row_bytes(variant)?;
+        let planning_headroom = self
+            .coordinator
+            .resource_authority()
+            .planning_headroom_bytes(backend)?;
+        let (Some(per_row_bytes), ResourceAmount::Known(planning_headroom)) =
+            (per_row_bytes, planning_headroom)
+        else {
+            tracing::info!(
+                model = %variant,
+                asr_decode_width = floor,
+                ceiling,
+                "ASR decode keeps the engine rows: its rows or the headroom are unpriced"
+            );
+            return Ok(Some(floor));
+        };
+        // The load's lease holds its peak; what it holds above the resident
+        // weights frees when the load publishes, before any row decodes.
+        let released = match (
+            plan.load_authorization.device_bytes,
+            plan.resident_authorization.device_bytes,
+        ) {
+            (ResourceAmount::Known(load), ResourceAmount::Known(resident)) => {
+                load.saturating_sub(resident)
+            }
+            _ => 0,
+        };
+        let headroom = planning_headroom.saturating_add(released);
+        let width = crate::catalog::fit_asr_decode_width(ceiling, floor, per_row_bytes, headroom);
+        tracing::info!(
+            model = %variant,
+            asr_decode_width = width,
+            ceiling,
+            floor,
+            per_row_bytes,
+            headroom_after_resident_bytes = headroom,
+            "Fitted the ASR decode width to memory"
+        );
+        Ok(Some(width))
+    }
+
+    /// Sequences a transducer's retained predictor state holds (Parakeet,
+    /// Nemotron ASR): the realtime session capacity it has always had, and
+    /// at least its continuous decode width, so a decode fitted past the
+    /// engine rows can run every row it batches.
+    pub(super) fn transducer_retained_sequences(
+        &self,
+        bundle_draft: &LoadedModelBundleDraft,
+    ) -> Result<u32> {
+        let width = u32::try_from(asr_decode_stage_width(bundle_draft)?).map_err(|_| {
+            Error::ModelLoadError("ASR decode width exceeds the sequence capacity".into())
+        })?;
+        Ok(self.realtime_asr_sequence_capacity.max(width))
     }
 
     /// Reserve one request envelope per execution slot for the state fits

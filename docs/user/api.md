@@ -1615,15 +1615,19 @@ tenant IDs are used.
 | `izwi_request_ttft_seconds` | `model`, `backend`, `task` | Server admission to the first user-visible output. |
 | `izwi_request_queue_wait_seconds` | `model`, `backend`, `task` | Server admission until the engine first schedules the request, including the runtime coordinator, input preparation and model residency. |
 | `izwi_request_prefill_seconds` | `model`, `backend`, `task` | Engine prefill time of one request. |
+| `izwi_request_decode_seconds` | `model`, `backend`, `task` | Engine decode time of one request, after its prefill. |
+| `izwi_request_input_audio_seconds` | `model`, `backend`, `task` | Input audio length of completed transcription and audio-chat requests. `rate(_sum)` is the audio seconds the server transcribes per second (its RTFx under load). |
 | `izwi_request_prompt_tokens_total`, `izwi_request_generation_tokens_total` | `model`, `task` | Counters for completed requests (generation counts audio frames for speech models). |
 | `izwi_engine_inter_token_latency_seconds` | `model`, `task` | Gap between successive committed tokens of one request; a commit of k tokens after a gap g counts k gaps of g/k. |
 | `izwi_engine_step_host_seconds` | `phase` (`prepare`, `commit`, `deliver`) | Host time of engine step phases under the step gate. |
 | `izwi_engine_batch_rows`, `izwi_engine_batch_tokens` | none | Rows and work units (tokens, or frames for speech) per dispatched physical batch. |
 | `izwi_engine_model_calls_per_step` | none | Model calls one engine step dispatched: one per tensor batch or serial row, one per row of a request-parallel batch. |
+| `izwi_asr_preparation_batch_rows` | `model` | Requests one cross-request ASR encoder batch ran in one device call (Parakeet, Nemotron 3.5 ASR Streaming). Concurrent Parakeet clips of up to 82 s and Nemotron clips of up to 30 s batch together; longer files encode alone. |
 | `izwi_engine_mixed_rows`, `izwi_engine_mixed_tokens` | `phase` (`decode`, `prefill`) on rows | Rows of each phase and tokens per committed mixed prefill+decode batch (models certified for mixed steps). |
 | `izwi_engine_device_idle_seconds` | `device` (`cpu`, `metal`, `cuda:0`) | Time the device waited between the end of one model step and the start of the next while the engine had work: the host gap (commit, delivery, prepare, dispatch) between steps. |
 | `izwi_engine_device_queue_wait_seconds` | `device`, `class` (workload class) | Time a model dispatch waited on its device's queue before it started. Control work (KV page operations, loads, frees) runs first; dispatches of different models share the device by workload-class weight, between jobs. |
 | `izwi_engine_device_ops_off_thread_total` | none | Counter of device operations (model calls, KV page operations, state allocation and frees) that ran off their device's thread. Zero in a healthy process. |
+| `izwi_engine_device_frees_rerouted_total` | none | Counter of device buffers whose last drop began off their CUDA device's thread (request-owned ASR encoder outputs) and was moved onto it. |
 | `izwi_runtime_stage_duration_seconds` | `stage`, `workload_class` | Duration of runtime pipeline stages. |
 | `izwi_voice_turn_first_audio_seconds` | none | Realtime voice: endpoint decision to the turn's first assistant audio. |
 | `izwi_voice_endpointing_latency_seconds`, `izwi_voice_asr_first_partial_seconds`, `izwi_voice_asr_final_seconds`, `izwi_voice_llm_first_token_seconds`, `izwi_voice_tts_first_audio_seconds`, `izwi_voice_barge_in_latency_seconds`, `izwi_voice_session_duration_seconds` | none | Realtime voice stage latencies; `izwi_voice_metric_contract_info` lists each with its description. |

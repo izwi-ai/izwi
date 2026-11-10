@@ -129,8 +129,11 @@ pub(crate) enum Qwen3AsrContextBound {
     /// bound and the shared fitter applies the configured value.
     Configured,
     /// The automatic ASR ceiling, with retained KV for this many concurrent
-    /// sequences.
-    Automatic { retained_rows: usize },
+    /// sequences in whole pages of `page_tokens` (the engine's page size).
+    Automatic {
+        retained_rows: usize,
+        page_tokens: usize,
+    },
 }
 
 /// Chunk planners cut audio at 95% of the solved invocation limit
@@ -251,6 +254,12 @@ fn qwen3_asr_retained_state_contract(
 }
 
 impl Qwen3AsrModel {
+    /// The text decoder's CUDA decode graphs: captures, replays and why
+    /// they are off.
+    pub(crate) fn decode_graph_diagnostics(&self) -> serde_json::Value {
+        self.text_model.decode_graph_diagnostics()
+    }
+
     pub(crate) fn audio_preparation_row_geometry(
         &self,
         input_samples: usize,
@@ -394,18 +403,9 @@ impl Qwen3AsrModel {
             .map_err(|_| Error::Overloaded("Qwen3 ASR audio dtype width exceeds u64".into()))?;
         let text_dtype_bytes = u64::try_from(self.text_dtype.size_in_bytes())
             .map_err(|_| Error::Overloaded("Qwen3 ASR text dtype width exceeds u64".into()))?;
-        let host_elements = rows.iter().try_fold(padded_mel_elements, |total, row| {
-            let row_elements =
-                checked_product_u64(&[row.resampled_samples], "Qwen3 ASR resample geometry")?
-                    .checked_add(checked_product_u64(
-                        &[row.mel_frames, n_mels],
-                        "Qwen3 ASR host mel geometry",
-                    )?)
-                    .ok_or_else(|| Error::Overloaded("Qwen3 ASR host frontend overflow".into()))?;
-            total
-                .checked_add(row_elements)
-                .ok_or_else(|| Error::Overloaded("Qwen3 ASR host workspace overflow".into()))
-        })?;
+        // Each row's resample and log-mel ran on a host worker, priced with
+        // its request; the batch builds only the padded upload copy.
+        let host_elements = padded_mel_elements;
         let device_audio_elements = padded_mel_elements
             .checked_add(conv_elements)
             .and_then(|value| value.checked_add(packed_elements))
@@ -644,10 +644,14 @@ impl Qwen3AsrModel {
         })?;
         let (sequence_tokens, retained_max_tokens) = match bound {
             Qwen3AsrContextBound::Configured => (native_tokens, native_tokens),
-            Qwen3AsrContextBound::Automatic { retained_rows } => qwen3_asr_automatic_context(
+            Qwen3AsrContextBound::Automatic {
+                retained_rows,
+                page_tokens,
+            } => qwen3_asr_automatic_context(
                 native_tokens,
                 self.automatic_asr_sequence_tokens(),
                 retained_rows,
+                page_tokens,
             ),
         };
         qwen3_asr_physical_state_spec(
@@ -901,6 +905,16 @@ pub(crate) struct AsrDecodeCheckpoint {
 }
 
 impl AsrDecodeState {
+    /// The diagnostics of a row that ends on the retained route: its front
+    /// end, prompt and prefill as prepared, and the tokens it generated.
+    pub(crate) fn retained_terminal_diagnostics(&self) -> serde_json::Value {
+        let mut diagnostics = self.diagnostics.clone();
+        diagnostics.generated_tokens = self.generated_ids.len();
+        diagnostics.to_json()
+    }
+}
+
+impl AsrDecodeState {
     pub(crate) fn prefill_progress(&self) -> usize {
         self.prefill_progress
     }
@@ -1107,6 +1121,29 @@ pub(crate) struct Qwen3AsrAudioBatchRow<'a> {
     pub(crate) sample_rate: u32,
 }
 
+/// One request's audio front end, computed on a host worker: its 16 kHz
+/// log-mel, frame-major and truncated to the tower's input frames.
+pub(crate) struct Qwen3AsrHostFeatures {
+    flat: Vec<f32>,
+    frontend: Qwen3AsrPreparedFrontend,
+}
+
+impl Qwen3AsrHostFeatures {
+    /// Mel frames the audio tower reads.
+    pub(crate) fn mel_frames(&self) -> usize {
+        self.frontend.mel_frames
+    }
+
+    /// Host bytes the features hold until the encode drops them.
+    pub(crate) fn host_bytes(&self) -> Result<u64> {
+        self.flat
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| Error::Overloaded("Qwen3 ASR host feature bytes overflow".into()))
+    }
+}
+
 /// Immutable, exact-row output of the Qwen3 ASR audio tower.
 ///
 /// It contains no decoder KV and may therefore be retained or discarded
@@ -1120,6 +1157,11 @@ pub(crate) struct Qwen3AsrPreparedAudio {
 }
 
 impl Qwen3AsrPreparedAudio {
+    /// The device holding the prepared audio embeddings.
+    pub(crate) fn device_location(&self) -> candle_core::DeviceLocation {
+        self.audio_embeddings.device().location()
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(tokens: usize, width: usize) -> Result<Self> {
         if tokens == 0 || width == 0 {
@@ -1659,8 +1701,8 @@ impl Qwen3AsrModel {
         let mel = MelSpectrogram::new(mel_cfg)?;
 
         // Quantized text checkpoints are trained/evaluated in bf16 and can
-        // degrade when forced through fp32 dequant paths. CUDA audio kernels are
-        // stricter around f32 boundaries, so select audio/text dtypes separately.
+        // degrade when forced through fp32 dequant paths. The audio and text
+        // dtypes are selected (and probed) separately.
         let is_gguf = gguf_loader.is_some();
         let checkpoint_format = if is_gguf { "gguf" } else { "safetensors" };
         let is_quantized = is_gguf || config.is_mlx_quantized();
@@ -1684,9 +1726,11 @@ impl Qwen3AsrModel {
         let text_context_tokens = text_cfg.context_length();
         let gguf_qmatmul_text_enabled = is_gguf && qwen3_asr_use_gguf_qmatmul_text(&device.device);
         // On Metal a lowered audio or text dtype must pass its own load-time
-        // probe, or that component alone reloads in F32 (report 13).
-        let check = device.kind.is_metal();
-        let (audio_tower, audio_precision, text_model, text_precision) =
+        // probe, or that component alone reloads in F32 (report 13); on CUDA
+        // the lowered GGUF audio tower does.
+        let (check_audio, check_text) =
+            (qwen3_asr_audio_probe(device.kind), device.kind.is_metal());
+        let (audio_tower, audio_precision, mut text_model, text_precision) =
             if let Some(gguf_path) = gguf_path.as_ref() {
                 let loader = gguf_loader.as_ref().ok_or_else(|| {
                     Error::ModelLoadError("Qwen ASR GGUF loader missing for GGUF path".to_string())
@@ -1695,7 +1739,7 @@ impl Qwen3AsrModel {
                 load_qwen3_asr_components(
                     &audio_selection,
                     &text_selection,
-                    check,
+                    (check_audio, check_text),
                     &device.device,
                     |audio_dtype| {
                         let vb_audio = var_builder_from_gguf_filtered(
@@ -1753,7 +1797,7 @@ impl Qwen3AsrModel {
                 load_qwen3_asr_components(
                     &audio_selection,
                     &text_selection,
-                    check,
+                    (check_audio, check_text),
                     &device.device,
                     |audio_dtype| {
                         AudioTower::load(
@@ -1765,6 +1809,10 @@ impl Qwen3AsrModel {
                 )?
             };
         let (audio_dtype, text_dtype) = (audio_precision.loaded, text_precision.loaded);
+        text_model.enable_asr_decode_graph(
+            "Qwen3-ASR",
+            super::decode_graph::QWEN3_ASR_DECODE_GRAPHS_ENV,
+        );
 
         info!(
             "Loaded Qwen speech-family model on {:?} (audio_dtype={:?}: {}; text_dtype={:?}: {})",
@@ -2187,15 +2235,105 @@ impl Qwen3AsrModel {
         Ok(state)
     }
 
-    /// Run the independently schedulable audio front end for a ragged group.
-    ///
-    /// Resampling and mel extraction remain host-side per row. Their exact
-    /// frame-major outputs are padded once for a single device upload, then the
-    /// audio tower packs all logical rows into one convolution/encoder pass.
-    /// No decoder KV is allocated or mutated by this operation.
+    /// Resamples one request's audio to 16 kHz and computes its log-mel on
+    /// the host, so a device job runs only the upload and the audio tower.
+    pub(crate) fn prepare_host_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<Qwen3AsrHostFeatures> {
+        if self.is_forced_aligner {
+            return Err(Error::InvalidInput(
+                "Qwen3-ForcedAligner models do not support transcription audio preparation."
+                    .to_string(),
+            ));
+        }
+        let mel_config = self.mel.config();
+        let n_mels = mel_config.n_mels;
+        let geometry = qwen3_asr_frontend_geometry(
+            audio.len(),
+            sample_rate,
+            QWEN3_ASR_SAMPLE_RATE,
+            mel_config.n_fft,
+            mel_config.hop_length,
+            self.device.device.is_cuda(),
+            self.preprocessor.nb_max_frames,
+        )?;
+        if geometry.mel_frames == 0 {
+            return Err(Error::InvalidInput("Empty audio input".to_string()));
+        }
+
+        let resample_started = Instant::now();
+        let resampled = if sample_rate != QWEN3_ASR_SAMPLE_RATE {
+            resample(audio, sample_rate, QWEN3_ASR_SAMPLE_RATE)?
+        } else {
+            audio.to_vec()
+        };
+        let resample_ms = elapsed_ms(resample_started);
+        if resampled.len() != geometry.resampled_samples {
+            return Err(Error::InferenceError(format!(
+                "Qwen3 ASR resample geometry drifted: predicted={}, actual={}",
+                geometry.resampled_samples,
+                resampled.len()
+            )));
+        }
+
+        let mel_started = Instant::now();
+        let (mut flat, actual_frames) = qwen3_log_mel(&self.mel, &resampled)?;
+        if actual_frames != geometry.mel_frames_before_truncate {
+            return Err(Error::InferenceError(format!(
+                "Qwen3 ASR mel geometry drifted: predicted={}, actual={actual_frames}",
+                geometry.mel_frames_before_truncate
+            )));
+        }
+        flat.truncate(
+            geometry
+                .mel_frames
+                .checked_mul(n_mels)
+                .ok_or_else(|| Error::Overloaded("Qwen3 ASR mel size overflow".to_string()))?,
+        );
+        let mel_ms = elapsed_ms(mel_started);
+        Ok(Qwen3AsrHostFeatures {
+            flat,
+            frontend: Qwen3AsrPreparedFrontend {
+                input_sample_rate: sample_rate,
+                input_samples: audio.len(),
+                resampled_sample_rate: QWEN3_ASR_SAMPLE_RATE,
+                resampled_samples: geometry.resampled_samples,
+                mel_frames: geometry.mel_frames,
+                mel_frames_before_drop: geometry.mel_frames_before_drop,
+                mel_frames_before_truncate: geometry.mel_frames_before_truncate,
+                mel_last_frame_dropped: geometry.mel_last_frame_dropped,
+                mel_frames_truncated: geometry.mel_frames_before_truncate > geometry.mel_frames,
+                resample_ms,
+                mel_ms,
+                ..Default::default()
+            },
+        })
+    }
+
+    /// Run the independently schedulable audio front end for a ragged group:
+    /// each row's host features, then one tower pass over all of them.
     pub(crate) fn prepare_audio_tower_batch(
         &self,
         rows: &[Qwen3AsrAudioBatchRow<'_>],
+    ) -> Result<Vec<Qwen3AsrPreparedAudio>> {
+        let features = rows
+            .iter()
+            .map(|row| self.prepare_host_features(row.audio, row.sample_rate))
+            .collect::<Result<Vec<_>>>()?;
+        self.prepare_audio_tower_from_features(&features.iter().collect::<Vec<_>>())
+    }
+
+    /// Run the audio tower over rows whose features a host worker computed.
+    ///
+    /// The frame-major features are padded once for a single device upload,
+    /// then the audio tower packs all logical rows into one
+    /// convolution/encoder pass. No decoder KV is allocated or mutated by
+    /// this operation.
+    pub(crate) fn prepare_audio_tower_from_features(
+        &self,
+        rows: &[&Qwen3AsrHostFeatures],
     ) -> Result<Vec<Qwen3AsrPreparedAudio>> {
         if self.is_forced_aligner {
             return Err(Error::InvalidInput(
@@ -2209,78 +2347,8 @@ impl Qwen3AsrModel {
             ));
         }
         let batch_started = Instant::now();
-
-        struct HostFrontendRow {
-            flat: Vec<f32>,
-            frontend: Qwen3AsrPreparedFrontend,
-        }
-
-        let mel_config = self.mel.config();
-        let n_mels = mel_config.n_mels;
-        let mut host_rows = Vec::with_capacity(rows.len());
-        for row in rows {
-            let geometry = qwen3_asr_frontend_geometry(
-                row.audio.len(),
-                row.sample_rate,
-                QWEN3_ASR_SAMPLE_RATE,
-                mel_config.n_fft,
-                mel_config.hop_length,
-                self.device.device.is_cuda(),
-                self.preprocessor.nb_max_frames,
-            )?;
-            if geometry.mel_frames == 0 {
-                return Err(Error::InvalidInput("Empty audio input".to_string()));
-            }
-
-            let resample_started = Instant::now();
-            let resampled = if row.sample_rate != QWEN3_ASR_SAMPLE_RATE {
-                resample(row.audio, row.sample_rate, QWEN3_ASR_SAMPLE_RATE)?
-            } else {
-                row.audio.to_vec()
-            };
-            let resample_ms = elapsed_ms(resample_started);
-            if resampled.len() != geometry.resampled_samples {
-                return Err(Error::InferenceError(format!(
-                    "Qwen3 ASR resample geometry drifted: predicted={}, actual={}",
-                    geometry.resampled_samples,
-                    resampled.len()
-                )));
-            }
-
-            let mel_started = Instant::now();
-            let (mut flat, actual_frames) = qwen3_log_mel(&self.mel, &resampled)?;
-            if actual_frames != geometry.mel_frames_before_truncate {
-                return Err(Error::InferenceError(format!(
-                    "Qwen3 ASR mel geometry drifted: predicted={}, actual={actual_frames}",
-                    geometry.mel_frames_before_truncate
-                )));
-            }
-            flat.truncate(
-                geometry
-                    .mel_frames
-                    .checked_mul(n_mels)
-                    .ok_or_else(|| Error::Overloaded("Qwen3 ASR mel size overflow".to_string()))?,
-            );
-            let mel_ms = elapsed_ms(mel_started);
-            host_rows.push(HostFrontendRow {
-                flat,
-                frontend: Qwen3AsrPreparedFrontend {
-                    input_sample_rate: row.sample_rate,
-                    input_samples: row.audio.len(),
-                    resampled_sample_rate: QWEN3_ASR_SAMPLE_RATE,
-                    resampled_samples: geometry.resampled_samples,
-                    mel_frames: geometry.mel_frames,
-                    mel_frames_before_drop: geometry.mel_frames_before_drop,
-                    mel_frames_before_truncate: geometry.mel_frames_before_truncate,
-                    mel_last_frame_dropped: geometry.mel_last_frame_dropped,
-                    mel_frames_truncated: geometry.mel_frames_before_truncate > geometry.mel_frames,
-                    resample_ms,
-                    mel_ms,
-                    ..Default::default()
-                },
-            });
-        }
-
+        let n_mels = self.mel.config().n_mels;
+        let host_rows = rows;
         let max_frames = host_rows
             .iter()
             .map(|row| row.frontend.mel_frames)
@@ -2347,16 +2415,17 @@ impl Qwen3AsrModel {
         let frontend_total_ms = elapsed_ms(batch_started);
 
         Ok(host_rows
-            .into_iter()
+            .iter()
             .zip(exact_rows)
-            .map(|(mut row, audio_embeddings)| {
-                row.frontend.mel_flatten_upload_ms = upload_ms;
-                row.frontend.audio_encode_ms = encode_ms;
-                row.frontend.frontend_total_ms = frontend_total_ms;
+            .map(|(row, audio_embeddings)| {
+                let mut frontend = row.frontend.clone();
+                frontend.mel_flatten_upload_ms = upload_ms;
+                frontend.audio_encode_ms = encode_ms;
+                frontend.frontend_total_ms = frontend_total_ms;
                 Qwen3AsrPreparedAudio {
                     preparation_id: self.audio_preparation_id,
                     audio_embeddings,
-                    frontend: row.frontend,
+                    frontend,
                 }
             })
             .collect())
@@ -2558,6 +2627,7 @@ impl Qwen3AsrModel {
     }
 
     fn decode_incremental_delta(&self, state: &mut AsrDecodeState) -> Result<String> {
+        let _detok = crate::engine::metrics::asr_detok_scope();
         if state.visible_generated_ids.len() <= state.decoded_visible_tokens {
             return Ok(String::new());
         }
@@ -3217,7 +3287,8 @@ fn forward_asr_pending_decode_batch(
         ));
     }
     let input_ids = Tensor::from_vec(pending_tokens, (states.len(), 1), device)?;
-    let output = if states.len() == 1 {
+    // With the decode graphs on, a lone row decodes through the width-1 graph.
+    let output = if states.len() == 1 && !text_model.decode_graph_on() {
         let state = &mut *states[0];
         text_model.forward_managed(
             &input_ids,
@@ -3507,17 +3578,18 @@ fn infer_downsample_hidden_size(loader: &GgufLoader) -> Result<usize> {
 }
 
 /// The audio tower and the text model, each read at its selected dtype by
-/// `load_audio` / `load_text`. With `check` (Metal), a dtype below F32 must
-/// pass that component's load-time probe, or the component alone reloads in
-/// F32 (report 13), for GGUF and safetensors checkpoints alike. Admission
-/// prices the selected dtypes, so a reload asks the load's
+/// `load_audio` / `load_text`. With a component's check set (the audio tower
+/// on Metal and CUDA, the text on Metal), a dtype below F32 must pass that
+/// component's load-time probe, or the component alone reloads in F32
+/// (report 13), for GGUF and safetensors checkpoints alike. Admission prices
+/// the selected dtypes, so a reload asks the load's
 /// [`admit_precision_reload`] gate for its memory
 /// (`load_with_precision_fallback` does), which first synchronizes the device
 /// so Candle frees the dropped component's buffers.
 fn load_qwen3_asr_components(
     audio_selection: &DTypeSelection,
     text_selection: &DTypeSelection,
-    check: bool,
+    (check_audio, check_text): (bool, bool),
     device: &candle_core::Device,
     mut load_audio: impl FnMut(DType) -> Result<AudioTower>,
     mut load_text: impl FnMut(DType) -> Result<Qwen3Model>,
@@ -3525,7 +3597,7 @@ fn load_qwen3_asr_components(
     let (audio_tower, audio_precision) = load_with_precision_fallback(
         "Qwen3-ASR audio tower",
         audio_selection,
-        check,
+        check_audio,
         DType::F32,
         &mut load_audio,
         |tower| qwen3_asr_audio_self_check(tower, audio_selection.dtype, device),
@@ -3533,7 +3605,7 @@ fn load_qwen3_asr_components(
     let (text_model, text_precision) = load_with_precision_fallback(
         "Qwen3-ASR text",
         text_selection,
-        check,
+        check_text,
         DType::F32,
         &mut load_text,
         qwen3_asr_text_self_check,
@@ -3734,7 +3806,9 @@ fn qwen3_asr_weight_precisions(
         }
         _ => DTypeSelection {
             dtype: qwen3_asr_default_audio_dtype(device.kind, is_gguf, text_dtype),
-            reason: if is_gguf && !device.kind.is_cuda() {
+            reason: if is_gguf && device.kind.is_cuda() {
+                "CUDA runs the audio tower at F32: a BF16 tower's output depended on its batch".into()
+            } else if is_gguf {
                 "the GGUF audio tower runs at the text dtype; it falls back to F32 alone if its probe fails".into()
             } else {
                 format!("{:?} default audio dtype", device.kind).into()
@@ -3815,18 +3889,26 @@ fn qwen3_asr_text_self_check(model: &Qwen3Model) -> NumericSelfCheckReport {
     })
 }
 
-fn qwen3_asr_default_audio_dtype(
-    device_kind: DeviceKind,
-    is_gguf: bool,
-    text_dtype: DType,
-) -> DType {
-    if is_gguf && device_kind.is_cuda() {
-        return DType::F32;
+/// The audio tower's default dtype on `kind`. CUDA runs it at F32: on the
+/// H100 the BF16 tower (the GGUF text dtype there) made a row's transcript
+/// depend on the clips batched with it, with word-level changes at 16 and
+/// 32 streams, and F32 was faster too (Qwen3-ASR 0.6B, 32 streams: 220
+/// against 204 audio-s/s, every point normalized-equal to solo). Elsewhere
+/// a GGUF tower runs at the text activation dtype, behind the Metal load-time
+/// probe that reloads it alone at F32 if it fails; safetensors towers stay
+/// F32.
+fn qwen3_asr_default_audio_dtype(kind: DeviceKind, is_gguf: bool, text_dtype: DType) -> DType {
+    if is_gguf && !kind.is_cuda() {
+        text_dtype
+    } else {
+        DType::F32
     }
-    if is_gguf {
-        return text_dtype;
-    }
-    DType::F32
+}
+
+/// Whether a lowered audio tower runs its load-time probe on `kind`: on
+/// Metal and CUDA, the backends that lower it.
+fn qwen3_asr_audio_probe(kind: DeviceKind) -> bool {
+    kind.is_metal() || kind.is_cuda()
 }
 
 fn infer_lm_head_size_from_gguf(
@@ -5019,22 +5101,31 @@ mod tests {
         // 768-token planning decode reserve.
         let ceiling = qwen3_asr_sequence_ceiling(13.0, 30.0);
         assert_eq!(ceiling, 128 + 411 + 768);
+        // A row claims its sequence in whole pages: 21 pages of 64 tokens.
         assert_eq!(
-            qwen3_asr_automatic_context(65_536, ceiling, 8),
+            qwen3_asr_automatic_context(65_536, ceiling, 8, 64),
+            (ceiling, 8 * 1_344)
+        );
+        assert_eq!(
+            qwen3_asr_automatic_context(65_536, ceiling, 32, 64),
+            (ceiling, 32 * 1_344)
+        );
+        assert_eq!(
+            qwen3_asr_automatic_context(65_536, ceiling, 8, 1),
             (ceiling, 8 * ceiling)
         );
         // Many CUDA rows or a small native context never exceed the native bound.
         assert_eq!(
-            qwen3_asr_automatic_context(65_536, ceiling, 96),
+            qwen3_asr_automatic_context(65_536, ceiling, 96, 64),
             (ceiling, 65_536)
         );
         assert_eq!(
-            qwen3_asr_automatic_context(1_024, ceiling, 8),
+            qwen3_asr_automatic_context(1_024, ceiling, 8, 64),
             (1_024, 1_024)
         );
         assert_eq!(
-            qwen3_asr_automatic_context(65_536, ceiling, 0),
-            (ceiling, ceiling)
+            qwen3_asr_automatic_context(65_536, ceiling, 0, 64),
+            (ceiling, 1_344)
         );
     }
 
@@ -5110,7 +5201,7 @@ mod tests {
         assert_eq!(kv_bytes(ceiling), 1_344 * token_bytes);
         assert!(kv_bytes(ceiling) * 48 < kv_bytes(65_536));
         // Eight retained rows still need under a sixth of the native pool.
-        let (_, retained) = qwen3_asr_automatic_context(65_536, ceiling, 8);
+        let (_, retained) = qwen3_asr_automatic_context(65_536, ceiling, 8, 64);
         assert!(kv_bytes(retained) * 6 < kv_bytes(65_536));
 
         // Prepared-input rows: F16 embeddings plus I64 MRoPE positions, for
@@ -5149,7 +5240,7 @@ mod tests {
         let offline = [physical_spec_stage(1, StageProgressKind::Atomic)];
         let graphs = vec![offline.as_slice()];
         let ceiling = qwen3_asr_sequence_ceiling(13.0, 30.0);
-        let (sequence, retained_max) = qwen3_asr_automatic_context(65_536, ceiling, 8);
+        let (sequence, retained_max) = qwen3_asr_automatic_context(65_536, ceiling, 8, 64);
         let retained = qwen3_asr_retained_state_contract(
             crate::kv::test_contract(),
             sequence,
@@ -5161,7 +5252,7 @@ mod tests {
             .expect("physical ASR spec");
 
         assert_eq!(spec.sequence_tokens, ceiling);
-        assert_eq!(spec.retained_max_tokens, 8 * ceiling);
+        assert_eq!(spec.retained_max_tokens, 8 * 1_344);
         assert_eq!(
             spec.descriptor
                 .capacity_axis_bounds(crate::kv::v2::StateCapacityAxis::DecoderContext),
@@ -5969,20 +6060,43 @@ mod tests {
         assert_eq!(parse_asr_dtype(Some("unknown")), None);
     }
 
+    /// The GGUF audio tower runs at the text dtype on CUDA (BF16), behind
+    /// its load-time probe; `IZWI_QWEN_ASR_AUDIO_DTYPE=f32` restores the F32
+    /// tower, and safetensors towers stay F32.
     #[test]
-    fn qwen_asr_cuda_gguf_audio_defaults_to_f32() {
-        assert_eq!(
-            qwen3_asr_default_audio_dtype(DeviceKind::Cuda, true, DType::BF16),
-            DType::F32
-        );
-        assert_eq!(
-            qwen3_asr_default_audio_dtype(DeviceKind::Cuda, true, DType::F16),
-            DType::F32
-        );
+    fn qwen_asr_cuda_gguf_audio_follows_the_text_dtype_unless_f32_is_pinned() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var("IZWI_QWEN_ASR_AUDIO_DTYPE");
+        let cuda = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cuda,
+            capabilities: crate::backends::DeviceCapabilities {
+                supports_bf16: true,
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+        let precisions = |is_gguf: bool| {
+            qwen3_asr_weight_precisions(&cuda, ModelFamily::Qwen3Asr, is_gguf, true, None).unwrap()
+        };
+        let (text, audio) = precisions(true);
+        assert_eq!(text.dtype, DType::BF16);
+        assert_eq!(audio.dtype, DType::F32);
+        assert!(audio.reason.contains("batch"), "{}", audio.reason);
+        assert!(qwen3_asr_audio_probe(DeviceKind::Cuda));
         assert_eq!(
             qwen3_asr_default_audio_dtype(DeviceKind::Cuda, false, DType::BF16),
             DType::F32
         );
+
+        std::env::set_var("IZWI_QWEN_ASR_AUDIO_DTYPE", "bf16");
+        let (_, pinned) = precisions(true);
+        std::env::remove_var("IZWI_QWEN_ASR_AUDIO_DTYPE");
+        assert_eq!(pinned.dtype, DType::BF16);
+        assert!(pinned.reason.contains("override"), "{}", pinned.reason);
     }
 
     #[test]
@@ -5995,6 +6109,8 @@ mod tests {
             qwen3_asr_default_audio_dtype(DeviceKind::Cpu, true, DType::F32),
             DType::F32
         );
+        assert!(qwen3_asr_audio_probe(DeviceKind::Metal));
+        assert!(!qwen3_asr_audio_probe(DeviceKind::Cpu));
     }
 
     fn qwen3_test_mel(n_mels: usize) -> MelSpectrogram {
@@ -6748,39 +6864,107 @@ mod precision_tests {
         }
     }
 
+    /// The host-worker features fed to the tower give bit-identical
+    /// embeddings to the in-job front end, at 16 kHz and after a resample,
+    /// and are priced as the host copy they hold.
+    #[test]
+    fn host_features_encode_exactly_like_the_in_job_front_end() {
+        let model = tiny_model(false);
+        let tone = |rate: u32, seconds: f32| {
+            (0..(rate as f32 * seconds) as usize)
+                .map(|index| (index as f32 * 0.013).sin() * 0.2)
+                .collect::<Vec<f32>>()
+        };
+        let (a, b) = (tone(16_000, 1.3), tone(8_000, 0.7));
+        let reference = model
+            .prepare_audio_tower_batch(&[
+                super::Qwen3AsrAudioBatchRow {
+                    audio: &a,
+                    sample_rate: 16_000,
+                },
+                super::Qwen3AsrAudioBatchRow {
+                    audio: &b,
+                    sample_rate: 8_000,
+                },
+            ])
+            .unwrap();
+        let features = [
+            model.prepare_host_features(&a, 16_000).unwrap(),
+            model.prepare_host_features(&b, 8_000).unwrap(),
+        ];
+        let rows = model
+            .prepare_audio_tower_from_features(&[&features[0], &features[1]])
+            .unwrap();
+        for (row, expected) in rows.iter().zip(&reference) {
+            assert_eq!(
+                row.audio_embeddings
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                expected
+                    .audio_embeddings
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            );
+        }
+        for feature in &features {
+            assert_eq!(
+                feature.host_bytes().unwrap(),
+                (feature.mel_frames() * 8 * 4) as u64
+            );
+        }
+        assert!(model.prepare_host_features(&[], 16_000).is_err());
+        assert!(model.prepare_audio_tower_from_features(&[]).is_err());
+    }
+
     /// QFA-7 / ADM-11: both checkpoint formats load through one helper, so
     /// a safetensors checkpoint's lowered tier (the 4-bit aligner's F16 text
     /// on Metal) runs its load-time probe, as the GGUF one always did. F32
-    /// is the reference and is never probed; off Metal nothing is.
+    /// is the reference and is never probed. Metal probes both components,
+    /// CUDA the audio tower (its GGUF BF16 tower), CPU neither. The lowered
+    /// tower here is F16: Candle's CPU conv2d has no BF16 kernel.
     #[test]
     fn lowered_tiers_run_their_load_time_probe_on_metal() {
         let device = Device::Cpu;
-        for check in [true, false] {
-            let mut audio_loads = Vec::new();
-            let mut text_loads = Vec::new();
-            let (_, audio, _, text) = load_qwen3_asr_components(
-                &selection(DType::F32),
-                &selection(DType::F16),
-                check,
-                &device,
-                |dtype| {
-                    audio_loads.push(dtype);
-                    Ok(super::audio::tiny_audio_tower_for_test(&device))
-                },
-                |dtype| {
-                    text_loads.push(dtype);
-                    Ok(tiny_qwen3_model_for_test(&device))
-                },
-            )
-            .unwrap();
-            assert_eq!(audio_loads, [DType::F32]);
-            // A passing probe keeps the tier: one load, no F32 reload.
-            assert_eq!(text_loads, [DType::F16]);
-            assert!(audio.self_check.is_none());
-            assert_eq!(text.loaded, DType::F16);
-            match text.self_check {
-                Some(report) => assert!(check && report.passed, "{}", report.reason),
-                None => assert!(!check),
+        for (check_audio, check_text) in [(true, true), (true, false), (false, false)] {
+            for audio_dtype in [DType::F32, DType::F16] {
+                let mut audio_loads = Vec::new();
+                let mut text_loads = Vec::new();
+                let (_, audio, _, text) = load_qwen3_asr_components(
+                    &selection(audio_dtype),
+                    &selection(DType::F16),
+                    (check_audio, check_text),
+                    &device,
+                    |dtype| {
+                        audio_loads.push(dtype);
+                        Ok(super::audio::tiny_audio_tower_at_for_test(&device, dtype))
+                    },
+                    |dtype| {
+                        text_loads.push(dtype);
+                        Ok(tiny_qwen3_model_for_test(&device))
+                    },
+                )
+                .unwrap();
+                // A passing probe keeps the tier: one load, no F32 reload.
+                assert_eq!(audio_loads, [audio_dtype]);
+                assert_eq!(text_loads, [DType::F16]);
+                assert_eq!(audio.loaded, audio_dtype);
+                assert_eq!(text.loaded, DType::F16);
+                match audio.self_check {
+                    Some(report) => assert!(
+                        check_audio && audio_dtype == DType::F16 && report.passed,
+                        "{}",
+                        report.reason
+                    ),
+                    None => assert!(!check_audio || audio_dtype == DType::F32),
+                }
+                match text.self_check {
+                    Some(report) => assert!(check_text && report.passed, "{}", report.reason),
+                    None => assert!(!check_text),
+                }
             }
         }
     }
@@ -6813,7 +6997,7 @@ mod precision_tests {
                 load_qwen3_asr_components(
                     &selection(DType::F32),
                     &selection(DType::F16),
-                    true,
+                    (true, true),
                     &device,
                     |_| Ok(super::audio::tiny_audio_tower_for_test(&device)),
                     |dtype| {

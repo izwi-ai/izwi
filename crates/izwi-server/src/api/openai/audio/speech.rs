@@ -952,6 +952,9 @@ async fn fish_file_speech(
                 .header("X-Stop-Reason", stop_reason.as_str())
                 .header("X-Output-Truncated", stop_reason.truncated().to_string());
         }
+        if let Some(diagnostics) = stats.diagnostics.as_ref() {
+            builder = builder.header("X-Izwi-Tts-Diagnostics", diagnostics.to_string());
+        }
     }
     if let Some(fallback) = output.format.fallback.as_deref() {
         builder = builder.header("X-Response-Format-Fallback", fallback);
@@ -2689,6 +2692,7 @@ mod tests {
             tokens_generated: 1,
             rtf: 0.2,
             stop_reason: None,
+            diagnostics: None,
         });
         accumulate_stream_statistics(&mut statistics, &first);
         let mut terminal = AudioChunk::final_chunk("fish".into(), 1, Vec::new());
@@ -2697,11 +2701,17 @@ mod tests {
             tokens_generated: 2,
             rtf: 0.3,
             stop_reason: None,
+            diagnostics: Some(serde_json::json!({"latency_breakdown": {"decode_ms": 20.0}})),
         });
         accumulate_stream_statistics(&mut statistics, &terminal);
         let statistics = statistics.unwrap();
         assert_eq!(statistics.tokens_generated, 2);
         assert_eq!(statistics.generation_time_ms, 25.0);
+        // A Fish file response reports the terminal chunk's diagnostics.
+        assert_eq!(
+            statistics.diagnostics.unwrap()["latency_breakdown"]["decode_ms"],
+            20.0
+        );
     }
 
     /// D7: a streamed WAV is one RIFF header (sizes "unknown") followed by

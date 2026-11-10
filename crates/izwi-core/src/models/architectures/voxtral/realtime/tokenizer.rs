@@ -239,6 +239,26 @@ impl VoxtralTokenizer {
     pub fn decode_text_final(&self, tokens: &[u32]) -> Result<String> {
         Ok(String::from_utf8_lossy(&self.bytes.text_bytes(tokens)?).into_owned())
     }
+
+    /// The text `token` completes after the earlier tokens whose undecoded
+    /// tail is `held`: `decode_text_prefix` of every token so far, minus that
+    /// of the tokens before it, without decoding them again. `held` keeps the
+    /// bytes of a character still arriving.
+    pub(crate) fn decode_text_increment(&self, held: &mut Vec<u8>, token: u32) -> Result<String> {
+        let _detok = crate::engine::metrics::asr_detok_scope();
+        held.extend_from_slice(&self.bytes.text_bytes(&[token])?);
+        let (text, decoded) = utf8_complete_prefix_lossy(held);
+        held.drain(..decoded);
+        Ok(text)
+    }
+
+    /// The text the held tail of a finished decode adds:
+    /// `decode_text_final` of every token, minus `decode_text_prefix`.
+    pub(crate) fn decode_text_flush(held: &mut Vec<u8>) -> String {
+        let text = String::from_utf8_lossy(held).into_owned();
+        held.clear();
+        text
+    }
 }
 
 /// Decode `bytes` up to the last complete character. An incomplete trailing
@@ -246,20 +266,28 @@ impl VoxtralTokenizer {
 /// U+FFFD, the same substitution `String::from_utf8_lossy` makes, so the
 /// result is always a prefix of the lossy decode of the same bytes.
 fn utf8_prefix_lossy(bytes: &[u8]) -> String {
+    utf8_complete_prefix_lossy(bytes).0
+}
+
+/// [`utf8_prefix_lossy`] and the bytes it decoded: everything but an
+/// incomplete trailing sequence. Every decision before that tail depends only
+/// on the bytes before it, so decoding the tail with later bytes appended
+/// continues this decode exactly.
+fn utf8_complete_prefix_lossy(bytes: &[u8]) -> (String, usize) {
     let mut text = String::with_capacity(bytes.len());
     let mut rest = bytes;
     loop {
         match std::str::from_utf8(rest) {
             Ok(valid) => {
                 text.push_str(valid);
-                return text;
+                return (text, bytes.len());
             }
             Err(error) => {
                 let (valid, after) = rest.split_at(error.valid_up_to());
                 text.push_str(std::str::from_utf8(valid).unwrap_or_default());
                 let Some(invalid) = error.error_len() else {
                     // Unexpected end of input: wait for the next token.
-                    return text;
+                    return (text, bytes.len() - after.len());
                 };
                 text.push(char::REPLACEMENT_CHARACTER);
                 rest = &after[invalid..];
@@ -497,7 +525,7 @@ pub(super) fn published_byte_ids(bytes: &[u8]) -> Vec<u32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
     use tekken::config::{TokenInfo, TokenizerVersion};
@@ -540,7 +568,11 @@ mod tests {
             .collect()
     }
 
-    fn test_tokenizer(audio_config: AudioConfig) -> VoxtralTokenizer {
+    /// A 265-token tokenizer (256 bytes, two words and the seven named
+    /// specials) over `audio_config`.
+    pub(in crate::models::architectures::voxtral::realtime) fn test_tokenizer(
+        audio_config: AudioConfig,
+    ) -> VoxtralTokenizer {
         let mut vocab = (0..=255).map(byte_token).collect::<Vec<_>>();
         vocab.push(token(256, "hello"));
         vocab.push(token(257, " world"));
@@ -769,5 +801,64 @@ mod tests {
         assert!(final_text.starts_with(last.as_str()));
         assert_eq!(final_text, "the 你好\u{FFFD}é😀 end\u{FFFD}");
         assert_eq!(*last, "the 你好\u{FFFD}é😀 end");
+    }
+
+    /// Decoding one token at a time from the held tail gives exactly the
+    /// prefix decode of every token so far, and the flush the final decode,
+    /// over split characters, invalid bytes, truncated sequences and special
+    /// ids.
+    #[test]
+    fn incremental_decode_matches_whole_prefix_decode() {
+        let tokenizer = published_tokenizer();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut sequences = vec![{
+            let mut ids = vec![1];
+            for piece in [
+                "the ".as_bytes(),
+                "你好".as_bytes(),
+                b"\xFF",
+                "é😀".as_bytes(),
+                b" end\xF0\x9F",
+            ] {
+                ids.extend(published_byte_ids(piece));
+                ids.push(33);
+            }
+            ids
+        }];
+        for _ in 0..64 {
+            let len = (next() % 40) as usize;
+            sequences.push(
+                (0..len)
+                    .map(|_| match next() % 8 {
+                        // A special id, skipped by the decode.
+                        0 => 33,
+                        // A lead or continuation byte of a multibyte char.
+                        1..=3 => 1000 + 0x80 + (next() % 0x78) as u32,
+                        _ => 1000 + (next() % 256) as u32,
+                    })
+                    .collect(),
+            );
+        }
+        for ids in sequences {
+            let mut held = Vec::new();
+            let mut text = String::new();
+            for len in 1..=ids.len() {
+                text.push_str(
+                    &tokenizer
+                        .decode_text_increment(&mut held, ids[len - 1])
+                        .unwrap(),
+                );
+                assert_eq!(text, tokenizer.decode_text_prefix(&ids[..len]).unwrap());
+            }
+            text.push_str(&VoxtralTokenizer::decode_text_flush(&mut held));
+            assert_eq!(text, tokenizer.decode_text_final(&ids).unwrap());
+            assert!(held.is_empty());
+        }
     }
 }

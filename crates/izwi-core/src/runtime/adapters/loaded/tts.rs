@@ -11,6 +11,12 @@ pub(super) struct PhysicalQwenTtsExecutionAdapter {
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
     pub(super) max_batch_size: usize,
+    /// Rows of the continuous decode stage: `max_batch_size`, or the wider
+    /// width the family is certified for (`catalog::tts_decode_width`).
+    pub(super) decode_batch_size: usize,
+    /// Whether requests decode their audio in the audio stage
+    /// (`IZWI_QWEN3_TTS_AUDIO_STAGE`) rather than on their decode steps.
+    pub(super) audio_stage: bool,
 }
 
 impl PhysicalQwenTtsExecutionAdapter {
@@ -30,7 +36,23 @@ impl PhysicalQwenTtsExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
+            audio_stage: crate::models::architectures::qwen3::tts::qwen3_tts_audio_stage_enabled(),
         }
+    }
+
+    /// Decode `rows` per continuous step (never fewer than the other
+    /// stages' rows).
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
+    }
+
+    /// With or without the audio stage, whatever the kill switch says.
+    #[cfg(test)]
+    pub(super) fn with_audio_stage(mut self, audio_stage: bool) -> Self {
+        self.audio_stage = audio_stage;
+        self
     }
 }
 
@@ -74,7 +96,7 @@ impl LoadedExecutionAdapter for PhysicalQwenTtsExecutionAdapter {
         execution_profile.recompute_safe = true;
         execution_profile.cache_release_safe = true;
         execution_profile.prefix_reuse_safe = false;
-        execution_profile.max_batch_size = self.max_batch_size;
+        execution_profile.max_batch_size = self.decode_batch_size;
         execution_profile.resolved_from_loaded_model = true;
 
         let mut prefill = StageDescriptor::from_execution_profile(
@@ -109,6 +131,10 @@ impl LoadedExecutionAdapter for PhysicalQwenTtsExecutionAdapter {
         decode.output_visibility = prefill.output_visibility;
         prefill.validate()?;
         decode.validate()?;
+        let mut stages = vec![prefill, decode];
+        if self.audio_stage {
+            stages.extend(self.audio_stages(&execution_profile)?);
+        }
         Ok(LoadedExecutionContract {
             execution_group_id: self.execution_group_id,
             model_instance_id: self.model_instance_id,
@@ -116,8 +142,80 @@ impl LoadedExecutionAdapter for PhysicalQwenTtsExecutionAdapter {
             adapter_abi_revision: self.adapter_abi_revision(),
             metadata,
             execution_profile,
-            stages: Arc::from([prefill, decode]),
+            stages: Arc::from(stages),
         })
+    }
+}
+
+impl PhysicalQwenTtsExecutionAdapter {
+    /// The audio stage and finalization. A decode step whose request has
+    /// codec frames due (a streamed window, or a finished request's audio)
+    /// yields its row; one audio quantum then decodes the due frames of up
+    /// to the decode rows' requests together (fixed-shape codec calls on
+    /// CUDA, `qwen3::tts::speech_tokenizer::CODEC_CALL_SLOTS` windows each),
+    /// and a finished request hands its audio over in a finalization
+    /// quantum. Priced for the published codec decoder: the shared work of
+    /// a quantum (one request's frame-rate stages at a time and one vocoder
+    /// call) once, plus what each request holds through it.
+    fn audio_stages(&self, profile: &ExecutionProfile) -> Result<[StageDescriptor; 2]> {
+        let (shared, per_row) =
+            crate::models::architectures::qwen3::tts::qwen3_tts_audio_stage_workspace(
+                self.backend_kind,
+            )?;
+        let rows = self.decode_batch_size;
+        let batched = rows > 1;
+        let mut audio = StageDescriptor::from_execution_profile(
+            StageId::new(3),
+            if batched {
+                "tts.audio_decode.qwen3.tensor_static"
+            } else {
+                "tts.audio_decode.qwen3.scalar"
+            },
+            profile,
+            if batched {
+                NativeBatchMode::Static
+            } else {
+                NativeBatchMode::None
+            },
+        );
+        audio.selector = StageWorkSelector::SequenceAudioDecode;
+        audio.progress = StageProgressKind::Iterative;
+        audio.shape_policy = StageShapePolicy::Exact;
+        audio.max_padding_basis_points = 0;
+        audio.max_batch_size = rows;
+        audio.concurrency = if batched {
+            ConcurrencyClass::Batchable
+        } else {
+            ConcurrencyClass::Exclusive
+        };
+        audio.max_work_units = u64::try_from(rows).map_err(|_| {
+            Error::Overloaded("Qwen3-TTS audio stage width exceeds work accounting".into())
+        })?;
+        audio.workspace_base_bytes = shared;
+        audio.workspace_per_row_bytes = per_row;
+        audio.max_workspace_bytes = per_row
+            .checked_mul(audio.max_work_units)
+            .and_then(|rows| rows.checked_add(shared))
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS audio stage workspace overflow".into()))?;
+        audio.output_visibility = OutputVisibility::AfterQuantumCommit;
+
+        let mut finalize = StageDescriptor::from_execution_profile(
+            StageId::new(4),
+            "tts.finalize.qwen3",
+            profile,
+            NativeBatchMode::None,
+        );
+        finalize.selector = StageWorkSelector::SequenceFinalize;
+        finalize.progress = StageProgressKind::Atomic;
+        finalize.shape_policy = StageShapePolicy::Exact;
+        finalize.max_batch_size = 1;
+        finalize.concurrency = ConcurrencyClass::Exclusive;
+        finalize.max_work_units = 1;
+        finalize.max_workspace_bytes = 0;
+        finalize.output_visibility = OutputVisibility::AfterQuantumCommit;
+        audio.validate()?;
+        finalize.validate()?;
+        Ok([audio, finalize])
     }
 }
 
@@ -298,6 +396,9 @@ pub(super) struct VoxtralTtsExecutionAdapter {
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
     pub(super) max_batch_size: usize,
+    /// Rows of the continuous decode stage: `max_batch_size`, or the wider
+    /// width the family is certified for (`catalog::tts_decode_width`).
+    pub(super) decode_batch_size: usize,
 }
 
 impl VoxtralTtsExecutionAdapter {
@@ -317,7 +418,15 @@ impl VoxtralTtsExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
         }
+    }
+
+    /// Decode `rows` per continuous step (never fewer than the other
+    /// stages' rows).
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
     }
 }
 
@@ -350,7 +459,7 @@ impl LoadedExecutionAdapter for VoxtralTtsExecutionAdapter {
         profile.concurrency = ConcurrencyClass::Batchable;
         profile.recompute_safe = true;
         profile.cache_release_safe = true;
-        profile.max_batch_size = self.max_batch_size;
+        profile.max_batch_size = self.decode_batch_size;
         profile.resolved_from_loaded_model = true;
 
         let mut preparation = StageDescriptor::from_execution_profile(
@@ -374,6 +483,8 @@ impl LoadedExecutionAdapter for VoxtralTtsExecutionAdapter {
             NativeBatchMode::Static,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
+        // Prefill stays at the engine rows; only decode widens.
+        prefill.max_batch_size = self.max_batch_size;
         prefill.progress = StageProgressKind::Iterative;
         prefill.shape_policy = StageShapePolicy::Ragged;
         prefill.max_padding_basis_points = 0;
@@ -391,10 +502,10 @@ impl LoadedExecutionAdapter for VoxtralTtsExecutionAdapter {
         decode.selector = StageWorkSelector::SequenceDecode;
         decode.progress = StageProgressKind::Iterative;
         decode.shape_policy = StageShapePolicy::Ragged;
-        decode.max_work_units = 64_u64.saturating_mul(self.max_batch_size as u64);
+        decode.max_work_units = 64_u64.saturating_mul(self.decode_batch_size as u64);
         decode.max_workspace_bytes = 512_u64
             .saturating_mul(1024 * 1024)
-            .saturating_mul(self.max_batch_size as u64);
+            .saturating_mul(self.decode_batch_size as u64);
         let mut finalize = StageDescriptor::from_execution_profile(
             StageId::new(3),
             "tts.codec.voxtral.scalar",
@@ -432,6 +543,9 @@ pub(super) struct ChatterboxTtsExecutionAdapter {
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
     pub(super) max_batch_size: usize,
+    /// Rows of the continuous decode stage: `max_batch_size`, or the wider
+    /// width the family is certified for (`catalog::tts_decode_width`).
+    pub(super) decode_batch_size: usize,
 }
 
 impl ChatterboxTtsExecutionAdapter {
@@ -451,7 +565,15 @@ impl ChatterboxTtsExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
         }
+    }
+
+    /// Decode `rows` per continuous step (never fewer than the other
+    /// stages' rows).
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
     }
 }
 
@@ -492,7 +614,7 @@ impl LoadedExecutionAdapter for ChatterboxTtsExecutionAdapter {
         profile.concurrency = ConcurrencyClass::Batchable;
         profile.recompute_safe = true;
         profile.cache_release_safe = true;
-        profile.max_batch_size = self.max_batch_size;
+        profile.max_batch_size = self.decode_batch_size;
         profile.resolved_from_loaded_model = true;
 
         let mut preparation = StageDescriptor::from_execution_profile(
@@ -516,6 +638,8 @@ impl LoadedExecutionAdapter for ChatterboxTtsExecutionAdapter {
             NativeBatchMode::Static,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
+        // Prefill stays at the engine rows; only decode widens.
+        prefill.max_batch_size = self.max_batch_size;
         prefill.progress = StageProgressKind::Iterative;
         prefill.shape_policy = StageShapePolicy::Ragged;
         prefill.max_padding_basis_points = 0;
@@ -533,10 +657,10 @@ impl LoadedExecutionAdapter for ChatterboxTtsExecutionAdapter {
         decode.selector = StageWorkSelector::SequenceDecode;
         decode.progress = StageProgressKind::Iterative;
         decode.shape_policy = StageShapePolicy::Ragged;
-        decode.max_work_units = 64_u64.saturating_mul(self.max_batch_size as u64);
+        decode.max_work_units = 64_u64.saturating_mul(self.decode_batch_size as u64);
         decode.max_workspace_bytes = 512_u64
             .saturating_mul(1024 * 1024)
-            .saturating_mul(self.max_batch_size as u64);
+            .saturating_mul(self.decode_batch_size as u64);
         // Hands over the rendered waveform.
         let mut finalize = StageDescriptor::from_execution_profile(
             StageId::new(3),
@@ -599,6 +723,9 @@ pub(super) struct Maya1TtsExecutionAdapter {
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
     pub(super) max_batch_size: usize,
+    /// Rows of the continuous decode stage: `max_batch_size`, or the wider
+    /// width the family is certified for (`catalog::tts_decode_width`).
+    pub(super) decode_batch_size: usize,
 }
 
 impl Maya1TtsExecutionAdapter {
@@ -618,7 +745,15 @@ impl Maya1TtsExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
         }
+    }
+
+    /// Decode `rows` per continuous step (never fewer than the other
+    /// stages' rows).
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
     }
 }
 
@@ -659,7 +794,7 @@ impl LoadedExecutionAdapter for Maya1TtsExecutionAdapter {
         profile.concurrency = ConcurrencyClass::Batchable;
         profile.recompute_safe = true;
         profile.cache_release_safe = true;
-        profile.max_batch_size = self.max_batch_size;
+        profile.max_batch_size = self.decode_batch_size;
         profile.resolved_from_loaded_model = true;
 
         let mut preparation = StageDescriptor::from_execution_profile(
@@ -684,6 +819,8 @@ impl LoadedExecutionAdapter for Maya1TtsExecutionAdapter {
             NativeBatchMode::Static,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
+        // Prefill stays at the engine rows; only decode widens.
+        prefill.max_batch_size = self.max_batch_size;
         prefill.progress = StageProgressKind::Iterative;
         prefill.shape_policy = StageShapePolicy::Ragged;
         prefill.max_padding_basis_points = 0;
@@ -701,10 +838,10 @@ impl LoadedExecutionAdapter for Maya1TtsExecutionAdapter {
         decode.selector = StageWorkSelector::SequenceDecode;
         decode.progress = StageProgressKind::Iterative;
         decode.shape_policy = StageShapePolicy::Ragged;
-        decode.max_work_units = 64_u64.saturating_mul(self.max_batch_size as u64);
+        decode.max_work_units = 64_u64.saturating_mul(self.decode_batch_size as u64);
         decode.max_workspace_bytes = 512_u64
             .saturating_mul(1024 * 1024)
-            .saturating_mul(self.max_batch_size as u64);
+            .saturating_mul(self.decode_batch_size as u64);
         // Hands over the audio (a stream's end-of-stream marker).
         let mut finalize = StageDescriptor::from_execution_profile(
             StageId::new(3),
@@ -719,23 +856,46 @@ impl LoadedExecutionAdapter for Maya1TtsExecutionAdapter {
         finalize.concurrency = ConcurrencyClass::Exclusive;
         finalize.max_work_units = 1;
         finalize.max_workspace_bytes = 0;
-        // One SNAC window per quantum, so other requests' quanta run between
-        // them.
+        // One SNAC window per request and quantum, so other requests' quanta
+        // run between them. On CUDA the due windows of up to the engine rows
+        // decode in one quantum, sharing fixed-row SNAC calls
+        // (`maya1::snac::SNAC_CUDA_CALL_ROWS`).
+        let batched_audio = self.backend_kind == BackendKind::Cuda
+            && self.max_batch_size > 1
+            && crate::models::architectures::maya1::snac::snac_batching_enabled();
         let mut acoustic = StageDescriptor::from_execution_profile(
             StageId::new(4),
-            "tts.audio.maya1.scalar",
+            if batched_audio {
+                "tts.audio.maya1.tensor_static"
+            } else {
+                "tts.audio.maya1.scalar"
+            },
             &profile,
-            NativeBatchMode::None,
+            if batched_audio {
+                NativeBatchMode::Static
+            } else {
+                NativeBatchMode::None
+            },
         );
         acoustic.selector = StageWorkSelector::SequenceAudioDecode;
         acoustic.progress = StageProgressKind::Iterative;
         acoustic.shape_policy = StageShapePolicy::Exact;
-        acoustic.max_batch_size = 1;
-        acoustic.concurrency = ConcurrencyClass::Exclusive;
-        acoustic.max_work_units = 1;
+        acoustic.max_padding_basis_points = 0;
+        let rows = if batched_audio {
+            self.max_batch_size
+        } else {
+            1
+        };
+        acoustic.max_batch_size = rows;
+        acoustic.concurrency = if batched_audio {
+            ConcurrencyClass::Batchable
+        } else {
+            ConcurrencyClass::Exclusive
+        };
+        acoustic.max_work_units = rows as u64;
         // SNAC's activations over a window of up to 22 frames (45,056
-        // samples), the widest 12 MB a tensor.
-        acoustic.max_workspace_bytes = 256 * 1024 * 1024;
+        // samples), the widest 12 MB a tensor, a window a row.
+        acoustic.max_workspace_bytes = (256 * 1024 * 1024_u64).saturating_mul(rows as u64);
         for stage in [
             &mut preparation,
             &mut prefill,
@@ -766,6 +926,9 @@ pub(super) struct Maya2TtsExecutionAdapter {
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
     pub(super) max_batch_size: usize,
+    /// Rows of the continuous decode stage: `max_batch_size`, or the wider
+    /// width the family is certified for (`catalog::tts_decode_width`).
+    pub(super) decode_batch_size: usize,
 }
 
 impl Maya2TtsExecutionAdapter {
@@ -785,7 +948,15 @@ impl Maya2TtsExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
         }
+    }
+
+    /// Decode `rows` per continuous step (never fewer than the other
+    /// stages' rows).
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
     }
 }
 
@@ -826,7 +997,7 @@ impl LoadedExecutionAdapter for Maya2TtsExecutionAdapter {
         profile.concurrency = ConcurrencyClass::Batchable;
         profile.recompute_safe = true;
         profile.cache_release_safe = true;
-        profile.max_batch_size = self.max_batch_size;
+        profile.max_batch_size = self.decode_batch_size;
         profile.resolved_from_loaded_model = true;
 
         let mut preparation = StageDescriptor::from_execution_profile(
@@ -852,6 +1023,8 @@ impl LoadedExecutionAdapter for Maya2TtsExecutionAdapter {
             NativeBatchMode::Static,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
+        // Prefill stays at the engine rows; only decode widens.
+        prefill.max_batch_size = self.max_batch_size;
         prefill.progress = StageProgressKind::Iterative;
         prefill.shape_policy = StageShapePolicy::Ragged;
         prefill.max_padding_basis_points = 0;
@@ -869,10 +1042,10 @@ impl LoadedExecutionAdapter for Maya2TtsExecutionAdapter {
         decode.selector = StageWorkSelector::SequenceDecode;
         decode.progress = StageProgressKind::Iterative;
         decode.shape_policy = StageShapePolicy::Ragged;
-        decode.max_work_units = 64_u64.saturating_mul(self.max_batch_size as u64);
+        decode.max_work_units = 64_u64.saturating_mul(self.decode_batch_size as u64);
         decode.max_workspace_bytes = 512_u64
             .saturating_mul(1024 * 1024)
-            .saturating_mul(self.max_batch_size as u64);
+            .saturating_mul(self.decode_batch_size as u64);
         // Hands over the audio (a stream's end-of-stream marker).
         let mut finalize = StageDescriptor::from_execution_profile(
             StageId::new(3),

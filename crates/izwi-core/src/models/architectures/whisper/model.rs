@@ -2,19 +2,28 @@
 //! positional tensors follow the active Izwi model dtype and decoder attention
 //! consumes lifecycle-owned physical state.
 
+use std::sync::Arc;
+
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{embedding, Conv1d, Conv1dConfig, Embedding, LayerNorm, Module, VarBuilder};
 use candle_transformers::models::whisper::Config;
 use candle_transformers::models::with_tracing::{linear, linear_no_bias, Linear};
 
 use crate::backends::state::{StaticAttentionLayerValue, StaticAttentionRaggedRow};
+use crate::backends::BackendKind;
 use crate::engine::{
-    InvocationStaticAttentionLease, RetainedStaticAttentionRuntimeV2,
+    InvocationStaticAttentionLease, RetainedStaticAttentionBatch, RetainedStaticAttentionRuntimeV2,
     RetainedStaticAttentionSequenceId,
 };
 use crate::error::{Error, Result};
+use crate::kernels::cuda::decode_step::graph_width;
+use crate::kernels::cuda::shape_graphs::{ShapeGraphLimits, ShapeGraphs};
+use crate::kernels::cuda::stretch_graphs::decode_graphs_switched_off;
 use crate::kv::v2::{DomainStepIntent, StateUpdateKind};
 use crate::models::shared::attention::flash::try_fused_self_attention;
+use crate::models::shared::attention::mixed::{
+    MixedRowLayout, MixedRowSpan, PreparedPhysicalMixedStep,
+};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::memory::accounting::deep_copy_tensor_storage;
 use crate::models::shared::memory::exact::exact_zeros;
@@ -411,6 +420,65 @@ impl ResidualAttentionBlock {
         })
     }
 
+    /// One decoder block over token-major rows `x` (`[1, tokens, d]`):
+    /// `self_attend(q, k, v, scale)` runs causal self attention on the rows'
+    /// paged state and `cross_attend(layer, q, scale)` attends their audio
+    /// memories; both take and return `[tokens, heads, head_dim]`.
+    fn forward_decoder_step(
+        &self,
+        model_layer: usize,
+        x: &Tensor,
+        self_attend: impl FnOnce(&Tensor, &Tensor, &Tensor, f32) -> Result<Tensor>,
+        cross_attend: impl FnOnce(u32, &Tensor, f32) -> Result<Tensor>,
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let (q, k, v) = self.decoder_self_qkv(x)?;
+        let scale = decoder_attention_scale(&q)?;
+        let attended = self_attend(&q, &k, &v, scale)?;
+        let (x, cross_query) = self.decoder_after_self_attention(x, &attended)?;
+        let model_layer = u32::try_from(model_layer)
+            .map_err(|_| Error::InvalidInput("Whisper layer index exceeds u32".into()))?;
+        let cross_attended = cross_attend(model_layer, &cross_query, scale)?;
+        self.decoder_after_cross_attention(&x, &cross_attended)
+    }
+
+    /// A decoder step's self-attention input: `x`'s token-major q, k, v.
+    fn decoder_self_qkv(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let self_input = self.attn_ln.forward(x)?;
+        self.attn
+            .project_self_attention_qkv_token_major(&self_input)
+    }
+
+    /// The residual after self-attention's `attended` rows, and its
+    /// cross-attention query.
+    fn decoder_after_self_attention(
+        &self,
+        x: &Tensor,
+        attended: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let x = (x + self.attn.project_output_token_major(attended)?)?;
+        let (cross_attn, cross_ln) = self.decoder_cross_attention()?;
+        let cross_query = cross_attn.project_cross_attention_query(&cross_ln.forward(&x)?)?;
+        Ok((x, cross_query))
+    }
+
+    /// The layer's output after cross-attention's `cross_attended` rows.
+    fn decoder_after_cross_attention(&self, x: &Tensor, cross_attended: &Tensor) -> Result<Tensor> {
+        let (cross_attn, _) = self.decoder_cross_attention()?;
+        let x = (x + cross_attn.project_output_token_major(cross_attended)?)?;
+
+        let mlp = self.mlp_linear2.forward(&gelu(
+            &self.mlp_linear1.forward(&self.mlp_ln.forward(&x)?)?,
+        )?)?;
+        Ok((x + mlp)?)
+    }
+
+    fn decoder_cross_attention(&self) -> Result<&(MultiHeadAttention, LayerNorm)> {
+        self.cross_attn.as_ref().ok_or_else(|| {
+            Error::InvalidInput("Whisper decoder layer has no cross attention".into())
+        })
+    }
+
     fn forward_decoder_physical(
         &self,
         model_layer: usize,
@@ -419,41 +487,17 @@ impl ResidualAttentionBlock {
         prepared: &mut PreparedPhysicalPagedStep,
         cross_kv: &InvocationStaticAttentionLease,
     ) -> Result<Tensor> {
-        let _enter = self.span.enter();
-        let self_input = self.attn_ln.forward(x)?;
-        let (q, k, v) = self
-            .attn
-            .project_self_attention_qkv_token_major(&self_input)?;
-        let head_dim = q.dim(2)?;
-        let scale = 1.0_f32 / (head_dim as f32).sqrt();
-        let attended = self_kv.write_and_attend(model_layer, prepared, &q, &k, &v, scale)?;
-        let mut x = (x + self.attn.project_output_token_major(&attended)?)?;
-
-        let (cross_attn, cross_ln) = self.cross_attn.as_ref().ok_or_else(|| {
-            Error::InvalidInput("Whisper decoder layer has no cross attention".into())
-        })?;
-        let cross_query = cross_attn.project_cross_attention_query(&cross_ln.forward(&x)?)?;
-        let query_len = u32::try_from(cross_query.dim(0)?)
-            .map_err(|_| Error::InvalidInput("Whisper query length exceeds u32".into()))?;
-        let model_layer = u32::try_from(model_layer)
-            .map_err(|_| Error::InvalidInput("Whisper layer index exceeds u32".into()))?;
-        let cross_attended = cross_kv.attend(
+        self.forward_decoder_step(
             model_layer,
-            &cross_query,
-            &[StaticAttentionRaggedRow {
-                query_start: 0,
-                query_len,
-            }],
-            scale,
-        )?;
-        x = (&x + cross_attn.project_output_token_major(&cross_attended)?)?;
-
-        let mlp = self.mlp_linear2.forward(&gelu(
-            &self.mlp_linear1.forward(&self.mlp_ln.forward(&x)?)?,
-        )?)?;
-        Ok((x + mlp)?)
+            x,
+            |q, k, v, scale| self_kv.write_and_attend(model_layer, prepared, q, k, v, scale),
+            |layer, query, scale| cross_kv.attend(layer, query, &[one_query_row(query)?], scale),
+        )
     }
 
+    /// One block of a retained sequence. Decode tokens attend
+    /// batch-invariantly, as a row of [`Self::forward_decoder_retained_batch`]
+    /// does.
     fn forward_decoder_retained(
         &self,
         model_layer: usize,
@@ -463,40 +507,160 @@ impl ResidualAttentionBlock {
         cross_runtime: &RetainedStaticAttentionRuntimeV2,
         cross_sequence: RetainedStaticAttentionSequenceId,
     ) -> Result<Tensor> {
-        let _enter = self.span.enter();
-        let self_input = self.attn_ln.forward(x)?;
-        let (q, k, v) = self
-            .attn
-            .project_self_attention_qkv_token_major(&self_input)?;
-        let head_dim = q.dim(2)?;
-        let scale = 1.0_f32 / (head_dim as f32).sqrt();
-        let attended = self_kv.write_and_attend(model_layer, prepared, &q, &k, &v, scale)?;
-        let mut x = (x + self.attn.project_output_token_major(&attended)?)?;
-
-        let (cross_attn, cross_ln) = self.cross_attn.as_ref().ok_or_else(|| {
-            Error::InvalidInput("Whisper decoder layer has no cross attention".into())
-        })?;
-        let cross_query = cross_attn.project_cross_attention_query(&cross_ln.forward(&x)?)?;
-        let query_len = u32::try_from(cross_query.dim(0)?)
-            .map_err(|_| Error::InvalidInput("Whisper query length exceeds u32".into()))?;
-        let model_layer = u32::try_from(model_layer)
-            .map_err(|_| Error::InvalidInput("Whisper layer index exceeds u32".into()))?;
-        let cross_attended = cross_runtime.attend(
-            cross_sequence,
+        self.forward_decoder_step(
             model_layer,
-            &cross_query,
-            &[StaticAttentionRaggedRow {
-                query_start: 0,
-                query_len,
-            }],
-            scale,
-        )?;
-        x = (&x + cross_attn.project_output_token_major(&cross_attended)?)?;
+            x,
+            |q, k, v, scale| {
+                self_kv.write_and_attend_row_invariant(model_layer, prepared, q, k, v, scale)
+            },
+            |layer, query, scale| {
+                cross_runtime.attend(
+                    cross_sequence,
+                    layer,
+                    query,
+                    &[one_query_row(query)?],
+                    scale,
+                )
+            },
+        )
+    }
 
-        let mlp = self.mlp_linear2.forward(&gelu(
-            &self.mlp_linear1.forward(&self.mlp_ln.forward(&x)?)?,
-        )?)?;
-        Ok((x + mlp)?)
+    /// One block of a decode step whose row `i` is one token of the
+    /// retained sequence `caches[i]` / `cross`'s row `i`.
+    fn forward_decoder_retained_batch(
+        &self,
+        model_layer: usize,
+        x: &Tensor,
+        caches: &[&PhysicalPagedKvCache],
+        step: &mut PreparedPhysicalMixedStep,
+        cross: &RetainedStaticAttentionBatch<'_>,
+    ) -> Result<Tensor> {
+        self.forward_decoder_step(
+            model_layer,
+            x,
+            |q, k, v, scale| step.write_and_attend(caches, model_layer, q, k, v, scale, None, None),
+            |layer, query, scale| cross.attend(layer, query, scale),
+        )
+    }
+}
+
+/// The one ragged row covering every query of `queries` (`[tokens, heads,
+/// head_dim]`): one sequence's span.
+fn one_query_row(queries: &Tensor) -> Result<StaticAttentionRaggedRow> {
+    Ok(StaticAttentionRaggedRow {
+        query_start: 0,
+        query_len: u32::try_from(queries.dim(0)?)
+            .map_err(|_| Error::InvalidInput("Whisper query length exceeds u32".into()))?,
+    })
+}
+
+/// The decoder's attention scale for token-major `q` (`[tokens, heads,
+/// head_dim]`).
+fn decoder_attention_scale(q: &Tensor) -> Result<f32> {
+    let head_dim = q.dim(2)?;
+    Ok(1.0_f32 / (head_dim as f32).sqrt())
+}
+
+/// Kill switch for the Whisper decoder's step graphs (a boolean; on when
+/// unset). Read by admission pricing and the loader.
+pub(crate) const WHISPER_DECODE_GRAPHS_ENV: &str = "IZWI_WHISPER_DECODE_GRAPHS";
+
+fn decode_graphs_requested() -> bool {
+    crate::env::flag_or(WHISPER_DECODE_GRAPHS_ENV, true) && !decode_graphs_switched_off()
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// What the decoder's step graphs may hold: nine segments a step (the
+/// embeddings, then two per layer between its eager self- and
+/// cross-attention calls) at up to ten widths. Each graph retains its input
+/// copies and outputs: a few `[width, 1280]` rows, or the last segment's
+/// F32 logits (`32 x 51,866 x 4` = 6.6 MB at 32 rows; 22 MB over all
+/// widths). The pool holds the widest step's MLP and logits working set.
+const DECODE_GRAPH_LIMITS: ShapeGraphLimits = ShapeGraphLimits {
+    max_graphs: 96,
+    retained_bytes: 64 * MIB,
+    pool_bytes: 32 * MIB,
+};
+
+/// Device bytes a load on `backend` prices for the decoder's step graphs,
+/// which allocate lazily on their first steps: zero off CUDA or with the
+/// graphs switched off.
+pub(crate) fn whisper_decode_graph_device_bytes(backend: BackendKind) -> u64 {
+    if backend == BackendKind::Cuda && decode_graphs_requested() {
+        DECODE_GRAPH_LIMITS.device_bytes()
+    } else {
+        0
+    }
+}
+
+/// The decoder's step graphs (CUDA), shared by clones of the decoder, or
+/// why there are none: one graph per `(segment, width)` of a retained
+/// decode step ([`TextDecoder::graphed_retained_decode`]).
+#[derive(Clone)]
+struct DecoderStepGraphs(Arc<std::result::Result<ShapeGraphs<(usize, usize)>, String>>);
+
+impl std::fmt::Debug for DecoderStepGraphs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DecoderStepGraphs")
+    }
+}
+
+impl DecoderStepGraphs {
+    fn resolve(device: &Device) -> Self {
+        Self(Arc::new(
+            if !crate::env::flag_or(WHISPER_DECODE_GRAPHS_ENV, true) {
+                Err(format!("{WHISPER_DECODE_GRAPHS_ENV} is off"))
+            } else if decode_graphs_switched_off() {
+                Err("cuda.decode_graphs=off".into())
+            } else {
+                ShapeGraphs::resolve("Whisper decoder", device, DECODE_GRAPH_LIMITS)
+            },
+        ))
+    }
+
+    /// The graphs while they are on.
+    fn on(&self) -> Option<&ShapeGraphs<(usize, usize)>> {
+        self.0
+            .as_ref()
+            .as_ref()
+            .ok()
+            .filter(|graphs| graphs.is_on())
+    }
+
+    fn diagnostics(&self) -> serde_json::Value {
+        match self.0.as_ref() {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        }
+    }
+}
+
+/// Runs one segment of a graphed decode step: its index, retained bytes,
+/// inputs and eager body.
+type SegmentRun<'a> = &'a dyn Fn(
+    usize,
+    u64,
+    &[Tensor],
+    &dyn Fn(&[Tensor]) -> Result<Vec<Tensor>>,
+) -> Result<Vec<Tensor>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests run a retained decode step's segments eagerly, padded to a
+    /// graph width of at least this many rows (0: off), as the CUDA graphs
+    /// run them (there are none off CUDA).
+    pub(crate) static SEGMENTED_STEP_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// `t` (`[rows, ..]`) zero-padded to `width` rows.
+fn pad_rows(t: &Tensor, width: usize) -> Result<Tensor> {
+    let rows = t.dim(0)?;
+    if rows >= width {
+        Ok(t.clone())
+    } else {
+        Ok(t.pad_with_zeros(0, 0, width - rows)?)
     }
 }
 
@@ -630,6 +794,8 @@ pub struct TextDecoder {
     n_head: usize,
     span: tracing::Span,
     span_final: tracing::Span,
+    /// CUDA graphs of a retained decode step's pure segments.
+    decode_graphs: DecoderStepGraphs,
 }
 
 impl TextDecoder {
@@ -647,6 +813,7 @@ impl TextDecoder {
             })
             .collect::<Result<Vec<_>>>()?;
         let ln = layer_norm(n_state, vb.pp("layer_norm"))?;
+        let decode_graphs = DecoderStepGraphs::resolve(vb.device());
         Ok(Self {
             token_embedding,
             positional_embedding,
@@ -655,6 +822,7 @@ impl TextDecoder {
             n_head,
             span,
             span_final,
+            decode_graphs,
         })
     }
 
@@ -832,6 +1000,268 @@ impl TextDecoder {
         let x = self.ln.forward(&x)?;
         self_kv.commit_prepared(prepared)?;
         Ok(x)
+    }
+
+    /// One decode step of `tokens.len()` retained sequences together: row
+    /// `i` appends `tokens[i]` at `positions[i]` (its cache's context) to
+    /// `caches[i]` and attends `cross`'s row `i`. Each layer writes every
+    /// row's K/V and attends all rows in one paged call (batch-invariant
+    /// decode, as a lone row's) and one cross-attention batch. Returns the
+    /// F32 logits `[rows, vocab]`. The caches advance only when the whole
+    /// step succeeds.
+    pub(crate) fn forward_retained_decode_batch(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        cross: &RetainedStaticAttentionBatch<'_>,
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let rows = tokens.len();
+        if rows == 0 || positions.len() != rows || caches.len() != rows || cross.len() != rows {
+            return Err(Error::InvalidInput(format!(
+                "Whisper decode batch needs one position, cache and memory per token, got {rows} tokens, {} positions, {} caches and {} memories",
+                positions.len(),
+                caches.len(),
+                cross.len()
+            )));
+        }
+        let hidden_size = self.token_embedding.embeddings().dim(1)?;
+        if self.n_head == 0 || hidden_size % self.n_head != 0 {
+            return Err(Error::InvalidInput(
+                "Whisper decoder hidden size is not divisible by its head count".into(),
+            ));
+        }
+        let capacity = self.positional_embedding.dim(0)?;
+        for (cache, position) in caches.iter().zip(positions) {
+            if *position != cache.context_len() {
+                return Err(Error::InvalidInput(format!(
+                    "Whisper decoder position {position} does not match physical cache cursor {}",
+                    cache.context_len()
+                )));
+            }
+            if *position >= capacity {
+                return Err(Error::InvalidInput(format!(
+                    "Whisper decoder position {} exceeds its positional capacity",
+                    position + 1
+                )));
+            }
+            cache.validate_model(self.blocks.len(), self.n_head, hidden_size / self.n_head)?;
+        }
+        let device = self.positional_embedding.device();
+        let token_ids = Tensor::from_slice(tokens, rows, device)?;
+        let position_ids = positions
+            .iter()
+            .map(|position| {
+                u32::try_from(*position)
+                    .map_err(|_| Error::InvalidInput("Whisper decoder position exceeds u32".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let graphed = self
+            .decode_graphs
+            .on()
+            .zip(graph_width(rows))
+            .map(|(graphs, width)| (graphs, width, position_ids.clone()));
+        let position_ids = Tensor::from_vec(position_ids, rows, device)?;
+        let layout = MixedRowLayout::new(
+            positions
+                .iter()
+                .map(|start_pos| MixedRowSpan {
+                    start_pos: *start_pos,
+                    q_len: 1,
+                })
+                .collect(),
+            rows,
+        )?;
+        let (step, logits) = {
+            let refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
+            let mut step =
+                PreparedPhysicalMixedStep::new(&refs, layout)?.with_row_invariant_decode();
+            let logits =
+                (|| -> Result<Tensor> {
+                    if let Some((graphs, width, positions)) = graphed {
+                        let run = |segment: usize,
+                               retained: u64,
+                               inputs: &[Tensor],
+                               body: &dyn Fn(&[Tensor]) -> Result<Vec<Tensor>>| {
+                        graphs.run((segment, width), retained, inputs, body)
+                    };
+                        return self.graphed_retained_decode(
+                            &run, width, tokens, &positions, &refs, &mut step, cross,
+                        );
+                    }
+                    #[cfg(test)]
+                    if let Some(width) = Some(SEGMENTED_STEP_FOR_TEST.with(std::cell::Cell::get))
+                        .filter(|min| *min > 0)
+                        .and_then(|min| graph_width(rows.max(min)))
+                    {
+                        let run = |_: usize,
+                               _: u64,
+                               inputs: &[Tensor],
+                               body: &dyn Fn(&[Tensor]) -> Result<Vec<Tensor>>| {
+                        body(inputs)
+                    };
+                        let positions = positions
+                            .iter()
+                            .map(|position| *position as u32)
+                            .collect::<Vec<_>>();
+                        return self.graphed_retained_decode(
+                            &run, width, tokens, &positions, &refs, &mut step, cross,
+                        );
+                    }
+                    let mut x = self.embed_step(&token_ids, &position_ids)?;
+                    for (model_layer, block) in self.blocks.iter().enumerate() {
+                        x = block.forward_decoder_retained_batch(
+                            model_layer,
+                            &x,
+                            &refs,
+                            &mut step,
+                            cross,
+                        )?;
+                    }
+                    Ok(self.final_linear(&self.ln.forward(&x)?)?.squeeze(0)?)
+                })();
+            (step, logits)
+        };
+        step.finish(caches, logits)
+    }
+
+    /// The decoder input of a step: each row's token and positional
+    /// embedding, `[1, rows, d_model]`.
+    fn embed_step(&self, token_ids: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
+        let token_embedding = self.token_embedding.forward(token_ids)?;
+        let positional_embedding = to_add_dtype(
+            self.positional_embedding.index_select(position_ids, 0)?,
+            token_embedding.dtype(),
+        )?;
+        Ok((token_embedding + positional_embedding)?.unsqueeze(0)?)
+    }
+
+    /// [`Self::forward_retained_decode_batch`]'s layers through the step
+    /// graphs: the rows pad to `width` and the step's pure segments (the
+    /// embeddings and first self-attention projection; per layer, the
+    /// self-attention output to the cross-attention query, and the
+    /// cross-attention output through the MLP to the next layer's
+    /// projection or the logits) replay one CUDA graph per `(segment,
+    /// width)`, each checked bit for bit against its eager segment on its
+    /// first two runs. The self- and cross-attention calls stay eager over
+    /// the real rows, as their per-step metadata and caches require.
+    ///
+    /// `run` runs one segment (its index, retained bytes, inputs and eager
+    /// body): through the graphs, or eagerly in tests.
+    #[allow(clippy::too_many_arguments)]
+    fn graphed_retained_decode(
+        &self,
+        run: SegmentRun<'_>,
+        width: usize,
+        tokens: &[u32],
+        positions: &[u32],
+        caches: &[&PhysicalPagedKvCache],
+        step: &mut PreparedPhysicalMixedStep,
+        cross: &RetainedStaticAttentionBatch<'_>,
+    ) -> Result<Tensor> {
+        let rows = tokens.len();
+        let device = self.positional_embedding.device();
+        let padded = |values: &[u32]| -> Result<Tensor> {
+            let mut values = values.to_vec();
+            values.resize(width, 0);
+            Ok(Tensor::from_vec(values, width, device)?)
+        };
+        let hidden = self.token_embedding.embeddings().dim(1)?;
+        let vocab = self.token_embedding.embeddings().dim(0)?;
+        let bytes = |t: &[Tensor]| {
+            t.iter()
+                .map(|t| (t.elem_count() * t.dtype().size_in_bytes()) as u64)
+                .sum::<u64>()
+        };
+        // A segment keeps stable copies of its inputs and at most four
+        // `[width, d_model]` F32 outputs, or the F32 logits.
+        let rows_bytes = (4 * width * hidden * 4) as u64;
+        let logits_bytes = (width * vocab * 4) as u64;
+        let wrong_inputs = |count: usize| {
+            Error::InferenceError(format!(
+                "Whisper decoder step graph received {count} inputs"
+            ))
+        };
+        let first = self
+            .blocks
+            .first()
+            .ok_or_else(|| Error::InvalidInput("Whisper decoder has no layers".into()))?;
+        let inputs = [padded(tokens)?, padded(positions)?];
+        let mut state = run(0, bytes(&inputs) + rows_bytes, &inputs, &|inputs| {
+            let [ids, positions] = inputs else {
+                return Err(wrong_inputs(inputs.len()));
+            };
+            let x = self.embed_step(ids, positions)?;
+            let (q, k, v) = first.decoder_self_qkv(&x)?;
+            Ok(vec![x, q, k, v])
+        })?;
+        for (model_layer, block) in self.blocks.iter().enumerate() {
+            let [x, q, k, v] =
+                <[Tensor; 4]>::try_from(state).map_err(|outputs| wrong_inputs(outputs.len()))?;
+            let scale = decoder_attention_scale(&q)?;
+            let real = |t: &Tensor| t.narrow(0, 0, rows);
+            let attended = step.write_and_attend(
+                caches,
+                model_layer,
+                &real(&q)?,
+                &real(&k)?,
+                &real(&v)?,
+                scale,
+                None,
+                None,
+            )?;
+            let inputs = [x, pad_rows(&attended, width)?];
+            let after_self = run(
+                1 + 2 * model_layer,
+                bytes(&inputs) + rows_bytes,
+                &inputs,
+                &|inputs| {
+                    let [x, attended] = inputs else {
+                        return Err(wrong_inputs(inputs.len()));
+                    };
+                    let (x, cross_query) = block.decoder_after_self_attention(x, attended)?;
+                    Ok(vec![x, cross_query])
+                },
+            )?;
+            let [x, cross_query] = <[Tensor; 2]>::try_from(after_self)
+                .map_err(|outputs| wrong_inputs(outputs.len()))?;
+            let layer = u32::try_from(model_layer)
+                .map_err(|_| Error::InvalidInput("Whisper layer index exceeds u32".into()))?;
+            let cross_attended = cross.attend(layer, &cross_query.narrow(0, 0, rows)?, scale)?;
+            let inputs = [x, pad_rows(&cross_attended, width)?];
+            let next = self.blocks.get(model_layer + 1);
+            let retained = bytes(&inputs)
+                + if next.is_some() {
+                    rows_bytes
+                } else {
+                    logits_bytes
+                };
+            state = run(2 + 2 * model_layer, retained, &inputs, &|inputs| {
+                let [x, cross_attended] = inputs else {
+                    return Err(wrong_inputs(inputs.len()));
+                };
+                let x = block.decoder_after_cross_attention(x, cross_attended)?;
+                match next {
+                    Some(next) => {
+                        let (q, k, v) = next.decoder_self_qkv(&x)?;
+                        Ok(vec![x, q, k, v])
+                    }
+                    None => Ok(vec![self
+                        .final_linear(&self.ln.forward(&x)?)?
+                        .squeeze(0)?]),
+                }
+            })?;
+        }
+        let logits = state.pop().ok_or_else(|| {
+            Error::InferenceError("Whisper decoder graphs returned no logits".into())
+        })?;
+        Ok(logits.narrow(0, 0, rows)?)
+    }
+
+    /// The decoder's step graphs: captures, replays and why they are off.
+    pub(crate) fn decode_graphs_diagnostics(&self) -> serde_json::Value {
+        self.decode_graphs.diagnostics()
     }
 
     /// One decoder step for `token` at position 0 over `audio_features`
@@ -1033,8 +1463,9 @@ pub(crate) mod test_fixture {
 #[cfg(test)]
 mod tests {
     use super::{
-        flatten_token_major, gelu, reshape_head_major, reshape_token_major, sinusoids,
-        whisper_metal_sdpa_enabled,
+        decode_graphs_requested, flatten_token_major, gelu, pad_rows, reshape_head_major,
+        reshape_token_major, sinusoids, whisper_decode_graph_device_bytes,
+        whisper_metal_sdpa_enabled, BackendKind, DecoderStepGraphs, WHISPER_DECODE_GRAPHS_ENV,
     };
     use candle_core::{DType, Device, Tensor};
 
@@ -1277,6 +1708,201 @@ mod tests {
         );
     }
 
+    fn argmax_rows(logits: &Tensor) -> Vec<u32> {
+        logits
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap()
+            .iter()
+            .map(|row| argmax(row) as u32)
+            .collect()
+    }
+
+    /// Rows of the tiny Whisper with different audio memories, prompt
+    /// lengths and join steps, decoded greedily one row at a time
+    /// (`forward_retained_at`) and together (`forward_retained_decode_batch`,
+    /// whose batch changes as rows join): every step picks the same tokens,
+    /// with logits within `tolerance` of the lone rows'. Returns the largest
+    /// logit difference seen.
+    fn retained_decode_rows_match_alone(device: &Device, dtype: DType, tolerance: f32) -> f32 {
+        use super::test_fixture::{tiny_config, tiny_tensors};
+        use crate::engine::test_retained_static_runtime;
+        use crate::kernels::numeric_check::xorshift_tensor;
+        use crate::kv::v2::StateDType;
+        use crate::models::shared::attention::physical::test_physical_caches_with_dtype_on;
+
+        let mut config = tiny_config();
+        config.max_target_positions = 32;
+        let vb = candle_nn::VarBuilder::from_tensors(tiny_tensors(&config, 0.2), dtype, device);
+        let whisper = super::Whisper::load(&vb, config.clone()).expect("tiny whisper");
+        let decoder = &whisper.decoder;
+        let heads = config.decoder_attention_heads;
+        let head_dim = config.d_model / heads;
+        // (prompt tokens, step the row joins the batch at)
+        let rows = [
+            (vec![3u32], 0usize),
+            (vec![5, 2, 7], 0),
+            (vec![9, 4, 11, 6, 2], 2),
+        ];
+        let steps = 6;
+        let mut caches = test_physical_caches_with_dtype_on(
+            device,
+            dtype,
+            config.decoder_layers,
+            heads,
+            head_dim,
+            config.max_target_positions,
+            2 * rows.len(),
+        );
+        let state_dtype = if dtype == DType::F32 {
+            StateDType::F32
+        } else {
+            StateDType::F16
+        };
+        let runtime = test_retained_static_runtime(
+            device,
+            state_dtype,
+            &(0..config.decoder_layers as u32).collect::<Vec<_>>(),
+            heads as u32,
+            head_dim as u32,
+            config.max_source_positions as u64,
+            2 * rows.len() as u32,
+        );
+        // Sequence `2i` decodes row `i` alone; `2i + 1` decodes it batched.
+        let mut sequences = Vec::new();
+        let mut alone_logits = Vec::new();
+        for (row, (prompt, _)) in rows.iter().enumerate() {
+            let features = xorshift_tensor(
+                &[1, config.max_source_positions, config.d_model],
+                40 + row as u64,
+                1.0,
+                device,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let memory = decoder.prepare_cross_attention_memory(&features).unwrap();
+            let mut prompt_logits = None;
+            for copy in 0..2 {
+                let sequence = runtime.register_sequence().unwrap();
+                runtime
+                    .install(sequence, [row as u8 + 1; 32], memory.clone())
+                    .unwrap();
+                let tokens = Tensor::new(prompt.as_slice(), device)
+                    .unwrap()
+                    .unsqueeze(0)
+                    .unwrap();
+                let hidden = decoder
+                    .forward_retained_at(
+                        &tokens,
+                        0,
+                        &mut caches[2 * row + copy],
+                        &runtime,
+                        sequence,
+                    )
+                    .unwrap();
+                let last = hidden.narrow(1, prompt.len() - 1, 1).unwrap();
+                prompt_logits = Some(decoder.final_linear(&last).unwrap().flatten_all().unwrap());
+                sequences.push(sequence);
+            }
+            alone_logits.push(prompt_logits.unwrap());
+        }
+        let mut batched_logits = alone_logits.clone();
+        let mut largest = 0.0f32;
+        for step in 0..steps {
+            let live = (0..rows.len())
+                .filter(|row| rows[*row].1 <= step)
+                .collect::<Vec<_>>();
+            let mut tokens = Vec::new();
+            let mut positions = Vec::new();
+            for row in &live {
+                let alone = argmax_rows(&alone_logits[*row].unsqueeze(0).unwrap())[0];
+                let together = argmax_rows(&batched_logits[*row].unsqueeze(0).unwrap())[0];
+                assert_eq!(alone, together, "step {step} row {row}");
+                let position = caches[2 * row].context_len();
+                assert_eq!(caches[2 * row + 1].context_len(), position);
+                let token = Tensor::new(&[[alone]], device).unwrap();
+                let hidden = decoder
+                    .forward_retained_at(
+                        &token,
+                        position,
+                        &mut caches[2 * row],
+                        &runtime,
+                        sequences[2 * row],
+                    )
+                    .unwrap();
+                alone_logits[*row] = decoder
+                    .final_linear(&hidden)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap();
+                tokens.push(together);
+                positions.push(position);
+            }
+            let batch_sequences = live
+                .iter()
+                .map(|row| sequences[2 * row + 1])
+                .collect::<Vec<_>>();
+            let cross = runtime.prepare_batch(&batch_sequences).unwrap();
+            let mut batch_caches = caches
+                .iter_mut()
+                .enumerate()
+                .filter(|(index, _)| index % 2 == 1 && live.contains(&(index / 2)))
+                .map(|(_, cache)| cache)
+                .collect::<Vec<_>>();
+            let logits = decoder
+                .forward_retained_decode_batch(&tokens, &positions, &mut batch_caches, &cross)
+                .unwrap();
+            drop(cross);
+            assert_eq!(logits.dims(), &[live.len(), config.vocab_size]);
+            assert_eq!(logits.dtype(), DType::F32);
+            for (index, row) in live.iter().enumerate() {
+                batched_logits[*row] = logits.get(index).unwrap();
+                let difference = (&batched_logits[*row] - &alone_logits[*row])
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap();
+                assert!(
+                    difference <= tolerance,
+                    "step {step} row {row}: {difference}"
+                );
+                largest = largest.max(difference);
+            }
+        }
+        for row in 0..rows.len() {
+            assert_eq!(
+                caches[2 * row].context_len(),
+                caches[2 * row + 1].context_len()
+            );
+        }
+        largest
+    }
+
+    #[test]
+    fn batched_retained_decode_matches_rows_alone_on_cpu() {
+        let largest = retained_decode_rows_match_alone(&Device::Cpu, DType::F32, 1e-4);
+        eprintln!("CPU F32 batched vs alone: largest logit difference {largest:e}");
+    }
+
+    /// The batched decoder step on Metal in F16 (Whisper's Metal dtype):
+    /// the same tokens as each row alone, logits within F16 rounding.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_f16_batched_retained_decode_matches_rows_alone() {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_f16_batched_retained_decode_matches_rows_alone",
+        ) else {
+            return;
+        };
+        let largest = retained_decode_rows_match_alone(&device, DType::F16, 2e-2);
+        eprintln!("Metal F16 batched vs alone: largest logit difference {largest:e}");
+    }
+
     /// The tiny model in F16 on the GPU: finite throughout, and within F16
     /// rounding of the CPU F32 reference with the same top-1 logit.
     #[cfg(feature = "metal")]
@@ -1292,5 +1918,46 @@ mod tests {
             assert!(values.iter().all(|value| value.is_finite()), "{name}");
         }
         assert_f16_tracks_f32(&f16, &probe_at(DType::F32, &Device::Cpu));
+    }
+
+    /// The decoder's step graphs price their memory on CUDA loads with
+    /// their switch on, and never resolve off CUDA or with a switch off.
+    #[test]
+    fn decoder_step_graphs_price_and_resolve_on_cuda_only() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(whisper_decode_graph_device_bytes(BackendKind::Cpu), 0);
+        assert_eq!(whisper_decode_graph_device_bytes(BackendKind::Metal), 0);
+        let cpu = DecoderStepGraphs::resolve(&Device::Cpu);
+        assert!(cpu.on().is_none());
+        if decode_graphs_requested() {
+            assert_eq!(
+                whisper_decode_graph_device_bytes(BackendKind::Cuda),
+                96 << 20
+            );
+            assert!(cpu.diagnostics()["off"].to_string().contains("CUDA only"));
+        }
+        let previous = std::env::var_os(WHISPER_DECODE_GRAPHS_ENV);
+        std::env::set_var(WHISPER_DECODE_GRAPHS_ENV, "0");
+        let bytes = whisper_decode_graph_device_bytes(BackendKind::Cuda);
+        let off = DecoderStepGraphs::resolve(&Device::Cpu).diagnostics();
+        std::env::remove_var(WHISPER_DECODE_GRAPHS_ENV);
+        if let Some(previous) = previous {
+            std::env::set_var(WHISPER_DECODE_GRAPHS_ENV, previous);
+        }
+        assert_eq!(bytes, 0);
+        assert!(off["off"].to_string().contains(WHISPER_DECODE_GRAPHS_ENV));
+    }
+
+    #[test]
+    fn rows_pad_to_their_graph_width() {
+        let rows = Tensor::new(&[[1f32, 2.], [3., 4.]], &Device::Cpu).unwrap();
+        let padded = pad_rows(&rows, 3).unwrap();
+        assert_eq!(
+            padded.to_vec2::<f32>().unwrap(),
+            [[1., 2.], [3., 4.], [0., 0.]]
+        );
+        assert_eq!(pad_rows(&rows, 2).unwrap().dims(), [2, 2]);
     }
 }

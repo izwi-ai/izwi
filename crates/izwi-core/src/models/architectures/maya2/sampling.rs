@@ -22,8 +22,11 @@ use super::config::{
     PRESENCE_PENALTY_RANGE, STOP_HAZARD, STOP_TAU, TEMPERATURE_RANGE,
 };
 use super::guards::Maya2StopReason;
+use super::runtime::Maya2Stream;
 use crate::error::{Error, Result};
-use crate::models::shared::noise::SplitMix64;
+use crate::kernels::counter_noise;
+use crate::kernels::penalized_topk::{CandidatePenalty, CandidateRow, MAX_CANDIDATES};
+use crate::models::shared::noise::{mix, stream_seed, SplitMix64};
 
 /// A request's cb0 sampler settings.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -180,19 +183,7 @@ pub fn sample_cb0(
             }
         })
         .0;
-    let mut stop = None;
-    if frames >= minimum {
-        state.hazard = 1.0 - (1.0 - state.hazard) * (1.0 - p_aeos);
-        stop = if argmax == AEOS_CLASS {
-            Some(Maya2StopReason::AeosArgmax)
-        } else if p_aeos >= STOP_TAU {
-            Some(Maya2StopReason::AeosTau)
-        } else if state.hazard >= STOP_HAZARD {
-            Some(Maya2StopReason::AeosHazard)
-        } else {
-            None
-        };
-    }
+    let stop = controlled_stop(state, p_aeos, argmax == AEOS_CLASS, frames, minimum);
     // Draw from the distribution without end of audio. When end of audio
     // held all the mass, take the best other class.
     let mass = probs[..AEOS_CLASS].iter().sum::<f32>();
@@ -224,11 +215,228 @@ pub fn sample_cb0(
             })
             .0
     } as u32;
-    if state.recent.len() == MAYA2_DEFAULTS.presence_window {
-        state.recent.remove(0);
-    }
-    state.recent.push(code);
+    state.remember(code);
     Ok(Cb0Draw { code, stop, p_aeos })
+}
+
+/// The controlled stop after `frames` frames (allowed from `minimum`),
+/// accumulating the hazard.
+fn controlled_stop(
+    state: &mut Cb0State,
+    p_aeos: f32,
+    aeos_argmax: bool,
+    frames: usize,
+    minimum: usize,
+) -> Option<Maya2StopReason> {
+    if frames < minimum {
+        return None;
+    }
+    state.hazard = 1.0 - (1.0 - state.hazard) * (1.0 - p_aeos);
+    if aeos_argmax {
+        Some(Maya2StopReason::AeosArgmax)
+    } else if p_aeos >= STOP_TAU {
+        Some(Maya2StopReason::AeosTau)
+    } else if state.hazard >= STOP_HAZARD {
+        Some(Maya2StopReason::AeosHazard)
+    } else {
+        None
+    }
+}
+
+impl Cb0State {
+    fn remember(&mut self, code: u32) {
+        if self.recent.len() == MAYA2_DEFAULTS.presence_window {
+            self.recent.remove(0);
+        }
+        self.recent.push(code);
+    }
+
+    /// The distinct codes the presence penalty reads, ascending.
+    pub fn recent_codes(&self) -> Vec<u32> {
+        let mut codes = self.recent.clone();
+        codes.sort_unstable();
+        codes.dedup();
+        codes
+    }
+}
+
+/// The device's share of a cb0 draw: the logits scaled by `1 / T`, the
+/// end-of-audio bias and the presence penalty over `recent` (the state's
+/// [`Cb0State::recent_codes`]), exactly as [`sample_cb0`] writes them before
+/// top-k, and how many of the largest to return. `None` when top-k is wider
+/// than the candidates a row returns: that row reads its whole logits.
+pub(crate) fn cb0_device_candidates<'a>(
+    params: &Maya2SamplingParams,
+    aeos_bias: f32,
+    recent: &'a [u32],
+) -> Option<(CandidateRow<'a>, usize)> {
+    let count = (params.top_k + 1).next_power_of_two().max(64);
+    if params.top_k == 0 || count > MAX_CANDIDATES || count >= CB0_CLASSES {
+        return None;
+    }
+    let penalty = if params.presence_penalty > 0.0 {
+        CandidatePenalty::Presence(params.presence_penalty)
+    } else {
+        CandidatePenalty::None
+    };
+    Some((
+        CandidateRow {
+            scale: 1.0 / params.temperature,
+            bias: Some((AEOS_CLASS, aeos_bias)),
+            penalty,
+            penalized: recent,
+            ..CandidateRow::plain(0)
+        },
+        count,
+    ))
+}
+
+/// [`sample_cb0`] from a row's device candidates (`values` its scaled,
+/// biased and penalised logits, largest first, at classes `indices`): the
+/// same draw, stop and stream use, over the kept classes only. `None`, with
+/// nothing consumed, when the candidates cannot show that no class past
+/// them survives top-k (the last ties the k-th), or when end of audio holds
+/// all the mass (the fallback then reads every other class).
+pub fn sample_cb0_candidates(
+    values: &[f32],
+    indices: &[u32],
+    params: &Maya2SamplingParams,
+    frames: usize,
+    minimum: usize,
+    state: &mut Cb0State,
+    rng: &mut SplitMix64,
+) -> Option<Cb0Draw> {
+    let k = params.top_k.min(CB0_CLASSES);
+    if k == 0 || k >= values.len() || values.len() != indices.len() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    let (_, kth, _) = sorted.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+    let kth = *kth;
+    if !values.last()?.lt(&kth) {
+        return None;
+    }
+    // The kept classes in class order: every other class is -inf.
+    let mut kept = indices
+        .iter()
+        .zip(values)
+        .filter(|&(_, &l)| l >= kth)
+        .map(|(&class, &l)| (class as usize, l))
+        .collect::<Vec<_>>();
+    kept.sort_by_key(|&(class, _)| class);
+    let sparse_softmax = |kept: &[(usize, f32)]| {
+        let max = kept
+            .iter()
+            .map(|&(_, l)| l)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let exp = kept
+            .iter()
+            .map(|&(_, l)| if l.is_finite() { (l - max).exp() } else { 0.0 })
+            .collect::<Vec<_>>();
+        let sum = exp.iter().sum::<f32>();
+        exp.into_iter().map(|e| e / sum).collect::<Vec<_>>()
+    };
+    let mut probs = sparse_softmax(&kept);
+    if params.top_p < 1.0 {
+        let mut order = (0..kept.len()).collect::<Vec<_>>();
+        order.sort_by(|&a, &b| probs[b].total_cmp(&probs[a]));
+        let mut before = 0.0f32;
+        for &slot in &order {
+            if before > params.top_p {
+                kept[slot].1 = f32::NEG_INFINITY;
+            }
+            before += probs[slot];
+        }
+        probs = sparse_softmax(&kept);
+    }
+    let p_aeos = kept
+        .iter()
+        .position(|&(class, _)| class == AEOS_CLASS)
+        .map_or(0.0, |slot| probs[slot]);
+    let argmax = kept
+        .iter()
+        .zip(&probs)
+        .fold((0, f32::NEG_INFINITY), |best, (&(class, _), &p)| {
+            if p > best.1 {
+                (class, p)
+            } else {
+                best
+            }
+        })
+        .0;
+    let codes = kept
+        .iter()
+        .zip(&probs)
+        .filter(|(&(class, _), _)| class < AEOS_CLASS)
+        .map(|(&(class, _), &p)| (class, p))
+        .collect::<Vec<_>>();
+    let mass = codes.iter().map(|&(_, p)| p).sum::<f32>();
+    if !mass.gt(&0.0) {
+        return None;
+    }
+    let stop = controlled_stop(state, p_aeos, argmax == AEOS_CLASS, frames, minimum);
+    let target = rng.next_open01() as f32 * mass;
+    let mut cumulative = 0.0f32;
+    let mut pick = None;
+    for &(class, p) in &codes {
+        if p <= 0.0 {
+            continue;
+        }
+        cumulative += p;
+        pick = Some(class);
+        if cumulative >= target {
+            break;
+        }
+    }
+    let code = pick.unwrap_or(0) as u32;
+    state.remember(code);
+    Some(Cb0Draw { code, stop, p_aeos })
+}
+
+/// Whether the depth decoder's noise is generated on `device` from each
+/// row's seed and frame ([`depth_counter_gumbel`]): on CUDA, unless
+/// `IZWI_MAYA2_DEVICE_NOISE=false`. Elsewhere each row's host stream draws it
+/// and it is uploaded ([`depth_gumbel`]).
+pub(crate) fn device_noise(device: &Device) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    device.is_cuda()
+        && *ENABLED.get_or_init(|| crate::env::flag_or("IZWI_MAYA2_DEVICE_NOISE", true))
+}
+
+/// Whether cb0 draws read device candidates ([`sample_cb0_candidates`]): on
+/// CUDA, unless `IZWI_MAYA2_DEVICE_SAMPLING=false` or the candidate kernel's
+/// one-time check failed.
+pub(crate) fn device_cb0_sampling(device: &Device) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    device.is_cuda()
+        && *ENABLED.get_or_init(|| crate::env::flag_or("IZWI_MAYA2_DEVICE_SAMPLING", true))
+        && crate::kernels::penalized_topk::device_path::ready(device)
+}
+
+/// The depth noise key of a request's frame `frame`: its depth stream mixed
+/// with the frame index, so a frame's noise is the same however it is
+/// batched or retried.
+pub fn depth_noise_key(seed: u64, frame: usize) -> u64 {
+    mix(stream_seed(seed, Maya2Stream::Depth.into()) ^ mix(frame as u64 + 1))
+}
+
+/// [`depth_gumbel`]'s `[rows, levels, codes]` from counter noise generated
+/// on `device` (`kernels::counter_noise`), row `r` keyed `keys[r]`
+/// ([`depth_noise_key`]): one 8-byte key a row goes up instead of the
+/// noise.
+pub fn depth_counter_gumbel(
+    keys: &[u64],
+    levels: usize,
+    codes: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    Ok(
+        counter_noise::gumbel(keys, levels * codes, device)?.reshape((
+            keys.len(),
+            levels,
+            codes,
+        ))?,
+    )
 }
 
 fn softmax(logits: &[f32]) -> Vec<f32> {
@@ -472,6 +680,105 @@ mod tests {
         .to_vec1::<u32>()
         .unwrap();
         assert_eq!(solo[0], codes[0]);
+    }
+
+    /// A cb0 draw from device candidates (packed by the kernel's host
+    /// reference) is the host sampler's: code, stop, p(AEOS), hazard,
+    /// presence history and stream, over random logits, temperatures,
+    /// top-k/top-p, presence penalties, histories and loop biases.
+    #[test]
+    fn cb0_candidates_draw_the_host_samplers_code() {
+        use crate::kernels::penalized_topk::{candidates_packed, unpack};
+        let mut source = SplitMix64::new(17);
+        let (mut drawn, mut whole) = (0, 0);
+        for case in 0..400usize {
+            let scale = [1.0f32, 3.0, 8.0][case % 3];
+            let mut logits = source
+                .standard_normals(CB0_CLASSES)
+                .into_iter()
+                .map(|v| v * scale)
+                .collect::<Vec<_>>();
+            if case % 4 == 0 {
+                for value in &mut logits {
+                    *value = (*value * 2.0).round() / 2.0;
+                }
+            }
+            logits[AEOS_CLASS] = [-4.0, 0.0, 3.0, 9.0][(case / 3) % 4];
+            let params = Maya2SamplingParams {
+                temperature: [0.5, 1.0, 1.3][(case / 2) % 3],
+                top_k: [64, 1, 20, 100, 127][(case / 5) % 5],
+                top_p: [1.0, 0.9, 0.5, 0.05][(case / 7) % 4],
+                presence_penalty: [0.0, 0.7, PRESENCE_PENALTY_RANGE.1][case % 3],
+            };
+            let mut state = Cb0State::default();
+            for _ in 0..(case % 13) {
+                state.remember((source.next_u64() % 64) as u32);
+            }
+            state.hazard = [0.0, 0.3, 0.55][case % 3];
+            let bias = [0.0, 2.5][case % 2];
+            let frames = [0, 10][(case / 11) % 2];
+            let seed = 1 + case as u64;
+
+            let mut host_state = state.clone();
+            let mut host_rng = SplitMix64::new(seed);
+            let expected = sample_cb0(
+                &logits,
+                &params,
+                bias,
+                frames,
+                4,
+                &mut host_state,
+                &mut host_rng,
+            )
+            .unwrap();
+
+            let recent = state.recent_codes();
+            let (row, count) = cb0_device_candidates(&params, bias, &recent).unwrap();
+            let tensor = Tensor::from_vec(logits.clone(), (1, CB0_CLASSES), &Device::Cpu).unwrap();
+            let packed = candidates_packed(&tensor, CB0_CLASSES, &[row], count)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<u32>()
+                .unwrap();
+            let candidates = unpack(&packed, count).remove(0);
+            let mut rng = SplitMix64::new(seed);
+            let before = (state.clone(), rng.clone());
+            match sample_cb0_candidates(
+                &candidates.values,
+                &candidates.indices,
+                &params,
+                frames,
+                4,
+                &mut state,
+                &mut rng,
+            ) {
+                Some(draw) => {
+                    assert_eq!(draw, expected, "case {case}: {params:?}");
+                    assert_eq!(state, host_state, "case {case}");
+                    assert_eq!(rng.next_u64(), host_rng.next_u64(), "case {case}");
+                    drawn += 1;
+                }
+                None => {
+                    // Nothing consumed: the whole row samples as before.
+                    assert_eq!(
+                        (state, rng.next_u64()),
+                        (before.0, before.1.clone().next_u64())
+                    );
+                    whole += 1;
+                }
+            }
+        }
+        assert!(drawn >= 330, "{drawn} from candidates, {whole} whole");
+    }
+
+    #[test]
+    fn depth_noise_keys_follow_the_seed_and_frame() {
+        assert_eq!(depth_noise_key(5, 3), depth_noise_key(5, 3));
+        assert_ne!(depth_noise_key(5, 3), depth_noise_key(5, 4));
+        assert_ne!(depth_noise_key(5, 3), depth_noise_key(6, 3));
+        let noise = depth_counter_gumbel(&[depth_noise_key(5, 3)], 2, 8, &Device::Cpu).unwrap();
+        assert_eq!(noise.dims(), [1, 2, 8]);
     }
 
     #[test]

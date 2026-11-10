@@ -30,8 +30,9 @@ impl RuntimeService {
                     "ASR request missing audio bytes".to_string(),
                 ));
             }
-            AsrAudioInput::Base64(audio) => audio.len(),
-            AsrAudioInput::Bytes(audio) => audio.len(),
+            AsrAudioInput::Base64(_) | AsrAudioInput::Bytes(_) | AsrAudioInput::Samples(_) => {
+                audio_input.input_bytes()
+            }
         };
         audio_input.validate_retained_size()?;
         let input_bytes = audio_bytes
@@ -89,6 +90,13 @@ impl RuntimeService {
                     )?,
                     OwnedAsrAudioInput::Bytes(audio_bytes) => AsrRuntimeRequest::from_bytes(
                         audio_bytes,
+                        variant,
+                        language,
+                        correlation_id,
+                        runtime_context,
+                    )?,
+                    OwnedAsrAudioInput::Samples(samples) => AsrRuntimeRequest::from_samples(
+                        samples,
                         variant,
                         language,
                         correlation_id,
@@ -309,6 +317,25 @@ impl RuntimeService {
         runtime_context: RuntimeRequestContext,
         native_word_timestamps: bool,
     ) -> Result<AsrTranscription> {
+        if let Some(transcription) = self
+            .transcribe_in_chunk_rows(
+                variant,
+                audio_bytes,
+                language,
+                prompt,
+                &task,
+                max_tokens,
+                correlation_id,
+                runtime_context,
+                false,
+                native_word_timestamps,
+                &mut |_: String| {},
+                &mut |_: AsrProgress| {},
+            )
+            .await?
+        {
+            return Ok(transcription);
+        }
         if let Some(translation) = self
             .translate_in_segments(
                 variant,
@@ -463,6 +490,25 @@ impl RuntimeService {
         F: FnMut(String) + Send + 'static,
         P: FnMut(AsrProgress) + Send + 'static,
     {
+        if let Some(transcription) = self
+            .transcribe_in_chunk_rows(
+                variant,
+                audio_bytes,
+                language,
+                prompt,
+                &task,
+                max_tokens,
+                correlation_id,
+                runtime_context,
+                true,
+                native_word_timestamps,
+                &mut on_delta,
+                &mut on_progress,
+            )
+            .await?
+        {
+            return Ok(transcription);
+        }
         if let Some(translation) = self
             .translate_in_segments(
                 variant,

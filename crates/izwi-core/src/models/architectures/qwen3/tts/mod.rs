@@ -5,6 +5,7 @@
 
 mod budget;
 mod config;
+mod decode_rows;
 mod predictor;
 mod reference_cache;
 mod rope;
@@ -12,6 +13,7 @@ mod speaker_encoder;
 pub(crate) mod speech_tokenizer;
 
 use speaker_encoder::SpeakerEncoder;
+use speech_tokenizer::{CodecCallPolicy, DecoderConfig, StreamDecodeJob, CODEC_CALL_SLOTS};
 mod talker;
 mod tokenizer;
 
@@ -21,9 +23,11 @@ pub use budget::{
 };
 pub(crate) use budget::{qwen3_tts_retained_memory_tokens, qwen3_tts_state_floor_tokens};
 pub use config::Qwen3TtsConfig;
+pub(crate) use predictor::qwen3_tts_predictor_graph_device_bytes;
 pub use predictor::{
-    code_predictor_physical_context_tokens, CodePredictor, CodePredictorPhysicalCache,
-    CodeSelection, SubtalkerSampling, CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS,
+    code_predictor_physical_context_tokens, AcousticCodeRows, CodePredictor,
+    CodePredictorPhysicalCache, CodeSelection, SubtalkerSampling,
+    CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS,
 };
 pub use speech_tokenizer::{
     SpeechTokenizerDecodeStats, SpeechTokenizerDecoder, SpeechTokenizerStream,
@@ -46,7 +50,7 @@ use tracing::{debug, info};
 use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, TensorStateArena,
 };
-use crate::backends::{DTypeSelection, DeviceProfile};
+use crate::backends::{BackendKind, DTypeSelection, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::engine::{StageDescriptor, StageWorkSelector};
 use crate::error::{Error, Result};
@@ -70,7 +74,9 @@ use crate::models::architectures::qwen3::core::{
     qwen3_decoder_cache_domain, Qwen3DecoderCacheGeometry,
 };
 use crate::models::shared::sampling::{
-    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+    bounded_device_sampling_candidates, device_candidates_cover_top_p, read_masked_planned_rows,
+    sample_device_candidates, CandidateRequest, DeviceSamplingCandidates, MaskedReadback,
+    PenaltyHistory, PlannedReadback, PlannedValues,
 };
 use crate::models::shared::state::exact_stage_scratch_domain;
 use crate::models::shared::weights::staged::metal_staged_safetensors;
@@ -103,6 +109,28 @@ pub fn qwen3_tts_host_readbacks() -> u64 {
 #[cfg(test)]
 pub(crate) fn thread_qwen3_tts_host_readbacks() -> u64 {
     QWEN3_TTS_HOST_READBACKS_THREAD.with(std::cell::Cell::get)
+}
+
+/// The prompt tokens of one Qwen3-TTS prefill span on CUDA: the CUDA
+/// engine's prefill chunk, so a prompt of up to 512 tokens (most) still
+/// prefills in one span.
+pub(crate) const QWEN3_TTS_CUDA_PREFILL_SPAN: usize = 512;
+
+/// The cell of the scheduler's prefill grid for Qwen3-TTS prompts: with a
+/// row-invariant decode (CUDA), [`QWEN3_TTS_CUDA_PREFILL_SPAN`], so every
+/// span but a prompt's last is exactly that long whatever else the step
+/// runs. A span's length is its projections' row count and where the
+/// paged prefill resumes, so a span cut to a step's leftover token budget
+/// or to the adaptive chunk changed the prompt's bits under load. Prefill
+/// is never batched across requests (one exclusive row per prefill
+/// stage), so the grid is all a request's prefill needs to be the same
+/// alone and beside others. 0 (no grid) on the CPU and Metal.
+pub(crate) const fn qwen3_tts_prefill_grid_tokens(row_invariant: bool) -> usize {
+    if row_invariant {
+        QWEN3_TTS_CUDA_PREFILL_SPAN
+    } else {
+        0
+    }
 }
 
 const NEWLINE_TOKEN_ID: u32 = 198;
@@ -303,6 +331,9 @@ pub struct TtsStreamingConfig {
     pub min_frames_before_stream: usize,
     /// Minimum newly generated codec frames before decoding again.
     pub decode_interval_frames: usize,
+    /// Largest interval the emission cadence grows to (see
+    /// [`Self::emission_interval`]).
+    pub max_decode_interval_frames: usize,
     /// Keep a small decode lookahead to reduce boundary artifacts.
     pub decode_lookahead_frames: usize,
 }
@@ -312,6 +343,7 @@ impl Default for TtsStreamingConfig {
         Self {
             min_frames_before_stream: 6,
             decode_interval_frames: 4,
+            max_decode_interval_frames: 32,
             decode_lookahead_frames: 2,
         }
     }
@@ -326,8 +358,26 @@ impl TtsStreamingConfig {
         Self {
             min_frames_before_stream: usize::MAX,
             decode_interval_frames: usize::MAX,
+            max_decode_interval_frames: usize::MAX,
             decode_lookahead_frames: 0,
         }
+    }
+
+    /// New frames to wait for before the next streamed decode, once
+    /// `emitted` frames have been sent.
+    ///
+    /// Every streamed decode re-runs the vocoder over its receptive-field
+    /// context and synchronizes the device, so 4-frame windows cost several
+    /// times their own frames: on the H100 a streamed request took 2.4× as
+    /// long as the same request buffered. The interval grows with the audio
+    /// already sent (6, 12, 24, then 32 frames by default), so a listener
+    /// always holds at least as much audio as the next window takes to
+    /// generate while the first chunk still arrives after
+    /// `min_frames_before_stream` frames.
+    pub fn emission_interval(&self, emitted: usize) -> usize {
+        self.decode_interval_frames
+            .max(emitted)
+            .min(self.max_decode_interval_frames.max(self.decode_interval_frames))
     }
 }
 
@@ -565,6 +615,13 @@ pub struct PhysicalTtsDecodeState {
     /// The incremental codec decode once streaming has emitted audio.
     codec_stream: Option<SpeechTokenizerStream>,
     finished: bool,
+    /// The audio stage decodes this request's audio
+    /// ([`PhysicalTtsDecodeState::defer_codec_to_audio_stage`]): a decode
+    /// step marks audio due instead of running the codec.
+    codec_deferred: bool,
+    /// Codec frames are due for the audio stage
+    /// ([`Qwen3TtsModel::tts_audio_decode_batch`]).
+    audio_due: bool,
 }
 
 /// Row-local continuation snapshot used to make the multi-row convenience API
@@ -589,6 +646,7 @@ struct PhysicalTtsDecodeBatchCheckpoint {
     /// The incremental codec decode once streaming has emitted audio.
     codec_stream: Option<SpeechTokenizerStream>,
     finished: bool,
+    audio_due: bool,
 }
 
 pub(crate) struct PhysicalTtsManagedQuantumCheckpoint {
@@ -626,6 +684,7 @@ impl PhysicalTtsDecodeState {
             decode_raw_token_scratch: self.decode_raw_token_scratch.clone(),
             codec_stream: self.codec_stream.clone(),
             finished: self.finished,
+            audio_due: self.audio_due,
         }
     }
 
@@ -652,6 +711,7 @@ impl PhysicalTtsDecodeState {
         self.decode_raw_token_scratch = checkpoint.decode_raw_token_scratch;
         self.codec_stream = checkpoint.codec_stream;
         self.finished = checkpoint.finished;
+        self.audio_due = checkpoint.audio_due;
     }
 
     pub fn talker_context_len(&self) -> usize {
@@ -664,6 +724,37 @@ impl PhysicalTtsDecodeState {
 
     pub fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    /// Hand this request's codec work to the audio stage: from now on a
+    /// decode step that would decode audio marks it due
+    /// ([`Self::audio_due`]) and the request decodes it in an audio quantum
+    /// ([`Qwen3TtsModel::tts_audio_decode_batch`]). Only before any audio
+    /// has been decoded.
+    pub fn defer_codec_to_audio_stage(&mut self) -> Result<()> {
+        if self.emitted_frames != 0 && !self.codec_deferred {
+            return Err(Error::InvalidInput(
+                "Qwen3-TTS codec work can move to the audio stage only before any audio".into(),
+            ));
+        }
+        self.codec_deferred = true;
+        Ok(())
+    }
+
+    /// Whether the audio stage decodes this request's audio.
+    pub fn codec_deferred(&self) -> bool {
+        self.codec_deferred
+    }
+
+    /// Whether codec frames wait for the audio stage: a streamed window
+    /// fell due, or the request finished with frames not yet decoded.
+    pub fn audio_due(&self) -> bool {
+        self.audio_due
+    }
+
+    /// Whether every generated frame has been decoded to audio.
+    pub fn audio_complete(&self) -> bool {
+        self.emitted_frames >= self.frames_generated()
     }
 
     pub(crate) fn take_managed_write_completions(
@@ -959,7 +1050,6 @@ pub struct TtsDecodeStep {
 /// schedulable predictor stage. Construction never mutates decode state.
 pub struct PreparedTtsPredictorStage {
     semantic_token: u32,
-    semantic_embed: Tensor,
     talker_hidden: Tensor,
     source_logits: Tensor,
     text_addition: Tensor,
@@ -1097,6 +1187,10 @@ pub struct Qwen3TtsModel {
     /// Whether the talker and predictor projections loaded as weight-only
     /// F16, why, and the self-check that decided.
     weight_precision: WeightOnlyF16Load,
+    /// The codec decoder's precision and the BF16 self-check, if one ran.
+    codec_precision: Qwen3TtsCodecPrecision,
+    /// How the audio stage batches codec calls.
+    codec_batching: Qwen3TtsCodecBatching,
     /// Prepared voice-clone references, by reference audio.
     reference_cache: reference_cache::ReferenceCache,
 }
@@ -1121,115 +1215,164 @@ impl Qwen3TtsModel {
         &self,
         stage_graphs: &[&[StageDescriptor]],
     ) -> Result<Qwen3TtsPhysicalStateSpec> {
-        if stage_graphs.is_empty() {
-            return Err(Error::ModelLoadError(
-                "Qwen3 TTS physical state has no execution graph".to_string(),
-            ));
-        }
-        let full = self.managed_inference_state_contract()?;
-        let retained = qwen3_tts_retained_talker_contract(&full, &self.config, self.dtype)?;
-
-        let mut predictor_contract = InferenceStateContract {
-            abi: full.abi,
-            domains: vec![full.domains[1].clone()],
-            groups: vec![full.groups[1].clone()],
-        };
-        let StateDomainSpec::PagedAttention(predictor) = &mut predictor_contract.domains[0] else {
-            unreachable!("Qwen3 TTS predictor is paged attention")
-        };
-        predictor.header.scope = StateScope::Invocation;
-        predictor.header.prefix = PrefixPolicy::Disabled;
-        predictor.header.checkpoint = CheckpointPolicy::None;
-        predictor_contract.groups[0].prefix_shareable = false;
-        predictor_contract.validate()?;
-        let predictor_domain = predictor_contract.domains[0].clone();
-        let predictor_group = predictor_contract.groups[0].clone();
-        let max_invocation_domain_id = predictor_domain.id().get();
-        let predictor_workspace_tokens = u64::try_from(self.physical_predictor_workspace_tokens())
-            .map_err(|_| {
-                Error::ModelLoadError("Qwen3-TTS predictor workspace exceeds u64".into())
-            })?;
-        let predictor_capacity = InvocationStateCapacity::PagedTokens {
-            max_tokens: predictor_workspace_tokens,
-        };
-        let predictor_physical_bytes =
-            minimum_physical_bytes_for_capacity(&predictor_domain, predictor_capacity)?;
-
-        let mut profiles = Vec::with_capacity(stage_graphs.len());
-        for stages in stage_graphs {
-            let mut invocation_stages = stages
-                .iter()
-                .enumerate()
-                .map(|(index, stage)| {
-                    let decode = stage.selector == StageWorkSelector::SequenceDecode;
-                    let lease_scope = if decode || stage.max_batch_size == 1 {
-                        InvocationLeaseScope::PerRow
-                    } else {
-                        InvocationLeaseScope::PerStageBatch
-                    };
-                    let mut domains = decode
-                        .then(|| InvocationWorkspaceDomain::State {
-                            state: predictor_domain.clone(),
-                            capacity: predictor_capacity,
-                            placement: predictor_domain.header().placement,
-                            formula: WorkspaceFormula {
-                                fixed_bytes: predictor_physical_bytes,
-                                dimensions: vec![],
-                                terms: vec![],
-                            },
-                        })
-                        .into_iter()
-                        .collect::<Vec<_>>();
-                    let scratch_id = max_invocation_domain_id
-                        .checked_add(u32::try_from(index + 1).map_err(|_| {
-                            Error::ModelLoadError("Qwen3 TTS stage count exceeds u32".into())
-                        })?)
-                        .ok_or_else(|| {
-                            Error::ModelLoadError("Qwen3 TTS scratch domain id overflow".into())
-                        })?;
-                    if let Some(scratch) = exact_stage_scratch_domain(
-                        stage,
-                        StateDomainId::new(scratch_id),
-                        lease_scope,
-                    )? {
-                        domains.push(scratch);
-                    }
-                    Ok(InvocationStageWorkspace {
-                        stage: stage.id,
-                        lease_scope,
-                        groups: decode
-                            .then(|| predictor_group.clone())
-                            .into_iter()
-                            .collect(),
-                        domains,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            invocation_stages.sort_unstable_by_key(|stage| stage.stage);
-            profiles.push(InvocationWorkspaceProfile {
-                stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
-                stages: invocation_stages,
-            });
-        }
-        profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
-        profiles.dedup();
-        let descriptor = CapabilityStateDescriptorV2 {
-            abi: CURRENT_INFERENCE_STATE_ABI,
-            retained: RetainedStateCapability::Managed {
-                contract: retained.clone(),
+        qwen3_tts_physical_state_spec(
+            &Qwen3TtsStateGeometry {
+                config: &self.config,
+                dtype: self.dtype,
+                talker_state_dtype: self.talker_state_dtype,
+                predictor_state_dtype: self.predictor_state_dtype,
+                kv_page_size: self.kv_page_size,
+                predictor_workspace_tokens: self.physical_predictor_workspace_tokens(),
+                audio_stage_workspace: self.audio_stage_workspace_bytes()?,
             },
-            invocation: InvocationWorkspaceSet::Bounded { profiles },
-        };
-        for stages in stage_graphs {
-            descriptor.validate_against_stages(stages)?;
-        }
-        Ok(Qwen3TtsPhysicalStateSpec {
-            retained,
-            retained_max_tokens: self.config.talker_config.max_position_embeddings,
-            descriptor,
-            predictor_contract,
-        })
+            stage_graphs,
+        )
     }
+}
+
+/// What a loaded model's physical state spec is built from
+/// ([`qwen3_tts_physical_state_spec`]).
+pub(crate) struct Qwen3TtsStateGeometry<'a> {
+    pub(crate) config: &'a Qwen3TtsConfig,
+    pub(crate) dtype: DType,
+    pub(crate) talker_state_dtype: DType,
+    pub(crate) predictor_state_dtype: DType,
+    pub(crate) kv_page_size: usize,
+    pub(crate) predictor_workspace_tokens: usize,
+    /// The audio stage's `(shared, per request)` bytes for this codec.
+    pub(crate) audio_stage_workspace: (u64, u64),
+}
+
+/// [`Qwen3TtsModel::physical_state_spec`] over `geometry`.
+pub(crate) fn qwen3_tts_physical_state_spec(
+    geometry: &Qwen3TtsStateGeometry<'_>,
+    stage_graphs: &[&[StageDescriptor]],
+) -> Result<Qwen3TtsPhysicalStateSpec> {
+    if stage_graphs.is_empty() {
+        return Err(Error::ModelLoadError(
+            "Qwen3 TTS physical state has no execution graph".to_string(),
+        ));
+    }
+    let full = qwen3_tts_inference_state_contract(
+        geometry.config,
+        geometry.talker_state_dtype,
+        geometry.predictor_state_dtype,
+        geometry.kv_page_size,
+    )?;
+    let retained = qwen3_tts_retained_talker_contract(&full, geometry.config, geometry.dtype)?;
+
+    let mut predictor_contract = InferenceStateContract {
+        abi: full.abi,
+        domains: vec![full.domains[1].clone()],
+        groups: vec![full.groups[1].clone()],
+    };
+    let StateDomainSpec::PagedAttention(predictor) = &mut predictor_contract.domains[0] else {
+        unreachable!("Qwen3 TTS predictor is paged attention")
+    };
+    predictor.header.scope = StateScope::Invocation;
+    predictor.header.prefix = PrefixPolicy::Disabled;
+    predictor.header.checkpoint = CheckpointPolicy::None;
+    predictor_contract.groups[0].prefix_shareable = false;
+    predictor_contract.validate()?;
+    let predictor_domain = predictor_contract.domains[0].clone();
+    let predictor_group = predictor_contract.groups[0].clone();
+    let max_invocation_domain_id = predictor_domain.id().get();
+    let predictor_workspace_tokens = u64::try_from(geometry.predictor_workspace_tokens)
+        .map_err(|_| Error::ModelLoadError("Qwen3-TTS predictor workspace exceeds u64".into()))?;
+    let predictor_capacity = InvocationStateCapacity::PagedTokens {
+        max_tokens: predictor_workspace_tokens,
+    };
+    let predictor_physical_bytes =
+        minimum_physical_bytes_for_capacity(&predictor_domain, predictor_capacity)?;
+
+    // The adapter prices the audio stage for the published decoder; this
+    // checkpoint's decoder must fit that price.
+    let (audio_shared, audio_row) = geometry.audio_stage_workspace;
+    for stage in stage_graphs
+        .iter()
+        .flat_map(|stages| stages.iter())
+        .filter(|stage| stage.selector == StageWorkSelector::SequenceAudioDecode)
+    {
+        if stage.workspace_base_bytes < audio_shared || stage.workspace_per_row_bytes < audio_row {
+            return Err(Error::ModelLoadError(format!(
+                "Qwen3-TTS audio stage prices {} + {} bytes a row, but this codec needs \
+                 {audio_shared} + {audio_row}",
+                stage.workspace_base_bytes, stage.workspace_per_row_bytes
+            )));
+        }
+    }
+    let mut profiles = Vec::with_capacity(stage_graphs.len());
+    for stages in stage_graphs {
+        let mut invocation_stages = stages
+            .iter()
+            .enumerate()
+            .map(|(index, stage)| {
+                let decode = stage.selector == StageWorkSelector::SequenceDecode;
+                let lease_scope = if decode || stage.max_batch_size == 1 {
+                    InvocationLeaseScope::PerRow
+                } else {
+                    InvocationLeaseScope::PerStageBatch
+                };
+                let mut domains = decode
+                    .then(|| InvocationWorkspaceDomain::State {
+                        state: predictor_domain.clone(),
+                        capacity: predictor_capacity,
+                        placement: predictor_domain.header().placement,
+                        formula: WorkspaceFormula {
+                            fixed_bytes: predictor_physical_bytes,
+                            dimensions: vec![],
+                            terms: vec![],
+                        },
+                    })
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let scratch_id = max_invocation_domain_id
+                    .checked_add(u32::try_from(index + 1).map_err(|_| {
+                        Error::ModelLoadError("Qwen3 TTS stage count exceeds u32".into())
+                    })?)
+                    .ok_or_else(|| {
+                        Error::ModelLoadError("Qwen3 TTS scratch domain id overflow".into())
+                    })?;
+                if let Some(scratch) =
+                    exact_stage_scratch_domain(stage, StateDomainId::new(scratch_id), lease_scope)?
+                {
+                    domains.push(scratch);
+                }
+                Ok(InvocationStageWorkspace {
+                    stage: stage.id,
+                    lease_scope,
+                    groups: decode
+                        .then(|| predictor_group.clone())
+                        .into_iter()
+                        .collect(),
+                    domains,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        invocation_stages.sort_unstable_by_key(|stage| stage.stage);
+        profiles.push(InvocationWorkspaceProfile {
+            stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
+            stages: invocation_stages,
+        });
+    }
+    profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
+    profiles.dedup();
+    let descriptor = CapabilityStateDescriptorV2 {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        retained: RetainedStateCapability::Managed {
+            contract: retained.clone(),
+        },
+        invocation: InvocationWorkspaceSet::Bounded { profiles },
+    };
+    for stages in stage_graphs {
+        descriptor.validate_against_stages(stages)?;
+    }
+    Ok(Qwen3TtsPhysicalStateSpec {
+        retained,
+        retained_max_tokens: geometry.config.talker_config.max_position_embeddings,
+        descriptor,
+        predictor_contract,
+    })
 }
 
 /// The retained talker state a loaded model publishes: the talker's pages
@@ -1443,6 +1586,278 @@ pub struct Qwen3TtsDiagnostics {
     pub host_readbacks_total: u64,
     /// Voice-clone references prepared from the cache vs encoded.
     pub reference_cache: reference_cache::ReferenceCacheStats,
+    /// The code predictor's CUDA frame graphs: why they are off, or their
+    /// captures, replays and graphed and eager frames.
+    pub predictor_graphs: serde_json::Value,
+    /// The codec decoder's compute precision, and the BF16 self-check.
+    pub codec_precision: Qwen3TtsCodecPrecision,
+    /// How the audio stage batches codec calls (its counters are under
+    /// `codec_decode.batched`).
+    pub codec_batching: Qwen3TtsCodecBatching,
+}
+
+/// Opt-in BF16 codec (speech-tokenizer) decoder on CUDA: a boolean, off
+/// when unset, read at load. The decoder runs at F32 otherwise; BF16 needs
+/// H100 parity, ASR round-trip and listening evidence before it can be the
+/// default.
+pub(crate) const QWEN3_TTS_CODEC_BF16_ENV: &str = "IZWI_QWEN3_TTS_CODEC_BF16";
+
+/// The largest relative L2 the BF16 decoder's waveform may differ from the
+/// F32 decoder's on the load self-check's codes. BF16 rounding through the
+/// decoder's transformer and vocoder lands well inside it; a broken
+/// conversion lands near or above 1.
+pub(crate) const QWEN3_TTS_CODEC_BF16_MAX_RELATIVE_L2: f64 = 0.05;
+
+/// Codec frames the BF16 self-check decodes: two vocoder windows.
+const QWEN3_TTS_CODEC_CHECK_FRAMES: usize = 40;
+
+/// Kill switch for the audio stage (a boolean, on when unset, read once):
+/// false runs each request's codec on its decode step, one request at a
+/// time, as before the stage.
+pub(crate) const QWEN3_TTS_AUDIO_STAGE_ENV: &str = "IZWI_QWEN3_TTS_AUDIO_STAGE";
+
+/// Whether Qwen3-TTS requests decode their audio in the audio stage
+/// ([`QWEN3_TTS_AUDIO_STAGE_ENV`], default on).
+pub(crate) fn qwen3_tts_audio_stage_enabled() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(QWEN3_TTS_AUDIO_STAGE_ENV, true));
+    ON.get()
+}
+
+/// Most codec frames one audio quantum decodes for a request: a streamed
+/// window always fits (they grow to 32 frames), and a finished request's
+/// audio takes as many quanta as it needs, other requests' decode steps
+/// running between them.
+pub const QWEN3_TTS_AUDIO_QUANTUM_FRAMES: usize = 128;
+
+/// Bytes the audio stage's quanta take on `backend`, as `(shared, per
+/// request)`, for the published 12 Hz codec decoder at F32 (the BF16 codec
+/// takes less): shared, one request's frame-rate stages at a time and one
+/// vocoder call ([`CODEC_CALL_SLOTS`] windows on CUDA, one elsewhere); per
+/// request, what it holds through the quantum.
+pub(crate) fn qwen3_tts_audio_stage_workspace(backend: BackendKind) -> Result<(u64, u64)> {
+    qwen3_tts_audio_stage_workspace_for(&DecoderConfig::published_12hz(), backend)
+}
+
+fn qwen3_tts_audio_stage_workspace_for(
+    config: &DecoderConfig,
+    backend: BackendKind,
+) -> Result<(u64, u64)> {
+    let slots = if backend == BackendKind::Cuda {
+        CODEC_CALL_SLOTS
+    } else {
+        1
+    };
+    let element_bytes = DType::F32.size_in_bytes();
+    Ok((
+        speech_tokenizer::stream_batch_shared_upper_bound_bytes(
+            config,
+            QWEN3_TTS_AUDIO_QUANTUM_FRAMES,
+            slots,
+            element_bytes,
+        )?,
+        speech_tokenizer::stream_batch_job_upper_bound_bytes(
+            config,
+            QWEN3_TTS_AUDIO_QUANTUM_FRAMES,
+            element_bytes,
+        )?,
+    ))
+}
+
+/// How the loaded model batches its audio stage's codec calls, for the
+/// diagnostics.
+#[derive(Debug, Clone, Serialize)]
+pub struct Qwen3TtsCodecBatching {
+    /// Whether requests decode their audio in the audio stage
+    /// ([`QWEN3_TTS_AUDIO_STAGE_ENV`]); off, the decode step runs the codec.
+    pub audio_stage: bool,
+    /// Windows every vocoder call runs, spare windows zero (CUDA), or none
+    /// (one window a call at its own length).
+    pub call_slots: Option<usize>,
+    /// Whether windows of different requests share calls.
+    pub shared_calls: bool,
+    /// Why.
+    pub reason: String,
+}
+
+impl Qwen3TtsCodecBatching {
+    /// The batching a load runs: on CUDA, calls shared across requests once
+    /// the decoder shows rows of a call come out as each does alone
+    /// ([`SpeechTokenizerDecoder::check_shared_calls`]).
+    fn resolve(decoder: &SpeechTokenizerDecoder, device: &DeviceProfile) -> Self {
+        let audio_stage = qwen3_tts_audio_stage_enabled();
+        if !audio_stage {
+            return Self {
+                audio_stage,
+                call_slots: None,
+                shared_calls: false,
+                reason: format!("{QWEN3_TTS_AUDIO_STAGE_ENV} is off"),
+            };
+        }
+        if !device.kind.is_cuda() {
+            return Self {
+                audio_stage,
+                call_slots: None,
+                shared_calls: false,
+                reason: "one window a call off CUDA".into(),
+            };
+        }
+        let (shared_calls, reason) = match decoder.check_shared_calls(CODEC_CALL_SLOTS) {
+            Ok(true) => (
+                true,
+                "windows decode together as alone: calls are shared across requests".to_string(),
+            ),
+            Ok(false) => (
+                false,
+                "windows decode together differently from alone: each request's windows \
+                 keep calls of their own"
+                    .to_string(),
+            ),
+            Err(error) => (
+                false,
+                format!("shared-call check failed ({error}): each request's windows keep calls of their own"),
+            ),
+        };
+        if shared_calls {
+            info!(
+                slots = CODEC_CALL_SLOTS,
+                "Qwen3-TTS codec calls are shared across requests"
+            );
+        } else {
+            tracing::warn!(%reason, "Qwen3-TTS codec calls stay per request");
+        }
+        Self {
+            audio_stage,
+            call_slots: Some(CODEC_CALL_SLOTS),
+            shared_calls,
+            reason,
+        }
+    }
+}
+
+/// The codec decoder's precision as loaded, for the diagnostics.
+#[derive(Debug, Clone, Serialize)]
+pub struct Qwen3TtsCodecPrecision {
+    /// The decoder's compute dtype (the reference encoder stays at the
+    /// speech tokenizer's dtype).
+    pub dtype: String,
+    /// Whether [`QWEN3_TTS_CODEC_BF16_ENV`] asked for BF16.
+    pub bf16_requested: bool,
+    /// Why the decoder runs at `dtype`.
+    pub reason: String,
+    /// The self-check's relative L2 of the BF16 waveform against F32.
+    pub relative_l2: Option<f64>,
+    pub max_relative_l2: f64,
+    /// Frames of xorshift codes the self-check decodes.
+    pub check_frames: usize,
+}
+
+/// Whether a load may try the BF16 codec decoder, or why not: asked for,
+/// on CUDA with BF16, over an F32 decoder.
+fn qwen3_tts_codec_bf16_allowed(
+    requested: bool,
+    device: &DeviceProfile,
+    decoder_dtype: DType,
+) -> std::result::Result<(), String> {
+    if !requested {
+        return Err(format!("{QWEN3_TTS_CODEC_BF16_ENV} is off"));
+    }
+    if !device.kind.is_cuda() {
+        return Err("the BF16 codec decoder runs on CUDA only".into());
+    }
+    if !device.capabilities.supports_bf16 {
+        return Err("the device has no BF16".into());
+    }
+    if decoder_dtype != DType::F32 {
+        return Err(format!(
+            "the codec already decodes at {decoder_dtype:?} ({QWEN3_TTS_DTYPE_ENV})"
+        ));
+    }
+    Ok(())
+}
+
+/// The BF16 self-check over two decodes of the same codes: the relative L2
+/// of `candidate` (BF16) against `reference` (F32), and whether it passes
+/// (finite, the same length, within
+/// [`QWEN3_TTS_CODEC_BF16_MAX_RELATIVE_L2`]).
+fn qwen3_tts_codec_bf16_check(candidate: &[f32], reference: &[f32]) -> (f64, bool) {
+    let relative = crate::kernels::numeric_check::relative_l2(candidate, reference);
+    let passed = !reference.is_empty()
+        && candidate.len() == reference.len()
+        && relative.is_finite()
+        && relative <= QWEN3_TTS_CODEC_BF16_MAX_RELATIVE_L2;
+    (relative, passed)
+}
+
+/// The codec decoder a load runs: `decoder` (as loaded at `dtype`), or with
+/// [`QWEN3_TTS_CODEC_BF16_ENV`] on CUDA a BF16 decoder read from `path`
+/// once its waveform on xorshift codes is within tolerance of `decoder`'s.
+/// The F32 decoder's reference waveform is read back and the decoder
+/// dropped before the BF16 one loads, so the load never holds more than
+/// the F32 decoder it prices; a failed check reads the F32 decoder back.
+/// The reference encoder moves to whichever decoder runs.
+fn resolve_qwen3_tts_codec_precision(
+    decoder: SpeechTokenizerDecoder,
+    path: &Path,
+    device: &DeviceProfile,
+    dtype: DType,
+) -> Result<(SpeechTokenizerDecoder, Qwen3TtsCodecPrecision)> {
+    let requested = crate::env::flag_or(QWEN3_TTS_CODEC_BF16_ENV, false);
+    let mut precision = Qwen3TtsCodecPrecision {
+        dtype: format!("{dtype:?}"),
+        bf16_requested: requested,
+        reason: String::new(),
+        relative_l2: None,
+        max_relative_l2: QWEN3_TTS_CODEC_BF16_MAX_RELATIVE_L2,
+        check_frames: QWEN3_TTS_CODEC_CHECK_FRAMES,
+    };
+    if let Err(reason) = qwen3_tts_codec_bf16_allowed(requested, device, dtype) {
+        precision.reason = reason;
+        return Ok((decoder, precision));
+    }
+    let codes = decoder.self_check_codes(QWEN3_TTS_CODEC_CHECK_FRAMES);
+    let reference = decoder.decode(&codes)?;
+    let mut decoder = decoder;
+    let encoder = decoder.take_encoder();
+    drop(decoder);
+    let checked = SpeechTokenizerDecoder::load(path, device.device.clone(), DType::BF16, false)
+        .and_then(|bf16| {
+            let samples = bf16.decode(&codes)?;
+            Ok((bf16, qwen3_tts_codec_bf16_check(&samples, &reference)))
+        });
+    match checked {
+        Ok((mut bf16, (relative, true))) => {
+            bf16.set_encoder(encoder);
+            info!(
+                relative_l2 = relative,
+                tolerance = QWEN3_TTS_CODEC_BF16_MAX_RELATIVE_L2,
+                "Qwen3-TTS codec decoder runs at BF16 ({QWEN3_TTS_CODEC_BF16_ENV})"
+            );
+            precision.dtype = format!("{:?}", DType::BF16);
+            precision.reason = "BF16 self-check passed".into();
+            precision.relative_l2 = Some(relative);
+            Ok((bf16, precision))
+        }
+        failed => {
+            precision.reason = match failed {
+                Ok((_, (relative, _))) => {
+                    precision.relative_l2 = Some(relative);
+                    format!(
+                        "BF16 self-check failed: relative L2 {relative} against F32, tolerance {QWEN3_TTS_CODEC_BF16_MAX_RELATIVE_L2}"
+                    )
+                }
+                Err(error) => format!("BF16 self-check failed: {error}"),
+            };
+            tracing::warn!(
+                reason = %precision.reason,
+                "Qwen3-TTS codec decoder stays at F32"
+            );
+            let mut decoder =
+                SpeechTokenizerDecoder::load(path, device.device.clone(), dtype, false)?;
+            decoder.set_encoder(encoder);
+            Ok((decoder, precision))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2040,7 +2455,7 @@ impl Qwen3TtsModel {
             code_predictor_config.text_hidden_size = Some(config.talker_config.text_hidden_size);
         }
         let weight_only = qwen3_tts_weight_only_f16(&device, dtype_plan);
-        let ((talker, code_predictor), weight_precision) = load_weight_only_f16(
+        let ((talker, mut code_predictor), weight_precision) = load_weight_only_f16(
             "Qwen3-TTS",
             &weight_only,
             &device.device,
@@ -2074,6 +2489,8 @@ impl Qwen3TtsModel {
             },
             weight_precision.reason
         );
+        // A frame's inputs are the talker's hidden state and codec embedding.
+        code_predictor.resolve_graphs(dtype_plan.talker);
 
         // Load speech tokenizer decoder
         info!("Loading speech tokenizer decoder...");
@@ -2084,6 +2501,13 @@ impl Qwen3TtsModel {
             dtype_plan.speech_tokenizer,
             layout.tokenizer_encoder,
         )?;
+        let (speech_tokenizer, codec_precision) = resolve_qwen3_tts_codec_precision(
+            speech_tokenizer,
+            &speech_tokenizer_path,
+            &device,
+            dtype_plan.speech_tokenizer,
+        )?;
+        let codec_batching = Qwen3TtsCodecBatching::resolve(&speech_tokenizer, &device);
 
         info!(
             "Qwen3-TTS model loaded successfully on {:?} (talker {:?}, predictor {:?}, speech tokenizer {:?}, talker state {:?}, predictor state {:?})",
@@ -2115,6 +2539,8 @@ impl Qwen3TtsModel {
             speaker_encoder,
             config,
             weight_precision,
+            codec_precision,
+            codec_batching,
             kv_page_size: kv_page_size.max(1),
             reference_cache: reference_cache::ReferenceCache::default(),
         })
@@ -2176,6 +2602,12 @@ impl Qwen3TtsModel {
 
     pub fn supports_resumable_prefill(&self) -> bool {
         true
+    }
+
+    /// The cell of the scheduler's prefill grid for this model's prompts
+    /// ([`qwen3_tts_prefill_grid_tokens`]).
+    pub fn prefill_grid_tokens(&self) -> usize {
+        qwen3_tts_prefill_grid_tokens(decode_rows::row_invariant(self.talker.device()))
     }
 
     pub fn supports_continuous_decode_batch(&self) -> bool {
@@ -2438,6 +2870,9 @@ impl Qwen3TtsModel {
             codec_decode: self.speech_tokenizer.decode_stats(),
             host_readbacks_total: qwen3_tts_host_readbacks(),
             reference_cache: self.reference_cache.stats(),
+            predictor_graphs: self.code_predictor.graphs_diagnostics(),
+            codec_precision: self.codec_precision.clone(),
+            codec_batching: self.codec_batching.clone(),
         }
     }
 
@@ -2780,59 +3215,119 @@ impl Qwen3TtsModel {
         )
     }
 
-    /// Prepare one row-local semantic decision without mutating retained state.
+    /// Prepare every row's semantic decision for one decode step without
+    /// mutating retained state, drawing all live rows' semantic tokens with
+    /// one device readback ([`sample_semantic_rows`]): each row's stage is
+    /// the one it would get alone, and every row reports the step's sampling
+    /// time.
     ///
     /// Terminal rows carry their row-local RNG transition and bypass
     /// predictor/talker work; codec finalization remains outside that transaction.
-    pub fn prepare_tts_predictor_stage(
+    pub fn prepare_tts_frame_stages(
+        &self,
+        states: &[&mut PhysicalTtsDecodeState],
+    ) -> Result<Vec<PreparedTtsFrameStage>> {
+        let sampling_started = Instant::now();
+        let mut stages = Vec::with_capacity(states.len());
+        let mut live = Vec::new();
+        for (row, state) in states.iter().enumerate() {
+            let terminal = Self::terminal_stage_before_sampling(state)?;
+            if terminal.is_none() {
+                live.push(row);
+            }
+            stages.push(terminal.map(PreparedTtsFrameStage::Terminal));
+        }
+        if !live.is_empty() {
+            let logits = live
+                .iter()
+                .map(|&row| {
+                    let logits = states[row].last_logits.as_ref().ok_or_else(|| {
+                        Error::InferenceError("Qwen3-TTS last logits are not hydrated".into())
+                    })?;
+                    logits.i((0, 0..1))?.contiguous().map_err(Error::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let logits = Tensor::cat(&logits, 0)?;
+            let mut next_rngs = live.iter().map(|&row| states[row].rng).collect::<Vec<_>>();
+            let tokens = {
+                let mut rows = live
+                    .iter()
+                    .zip(next_rngs.iter_mut())
+                    .map(|(&row, rng)| {
+                        let state = &*states[row];
+                        SemanticRowSampling {
+                            semantic_vocab_size: state.semantic_vocab_size,
+                            allow_eos: qwen_tts_allows_eos(state.frames_generated()),
+                            params: &state.params,
+                            history: &state.semantic_history,
+                            rng,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                sample_semantic_rows(
+                    &logits,
+                    self.specials.codec_eos_token_id,
+                    &mut rows,
+                    qwen_tts_uses_device_sampling(&self.device),
+                )?
+            };
+            let sampling_ms = sampling_started.elapsed().as_secs_f64() * 1000.0;
+            for ((row, token), next_rng) in live.into_iter().zip(tokens).zip(next_rngs) {
+                stages[row] =
+                    Some(self.stage_after_semantic(&*states[row], token, next_rng, sampling_ms)?);
+            }
+        }
+        stages
+            .into_iter()
+            .map(|stage| {
+                stage.ok_or_else(|| {
+                    Error::InferenceError("Qwen3-TTS frame preparation lost a row".into())
+                })
+            })
+            .collect()
+    }
+
+    /// The terminal stage of a row that draws no semantic token (already
+    /// finished, or at its frame limit); `None` for a row that draws one.
+    fn terminal_stage_before_sampling(
+        state: &PhysicalTtsDecodeState,
+    ) -> Result<Option<PreparedTtsTerminalStage>> {
+        let reason = if state.finished {
+            TtsTerminalReason::AlreadyFinished
+        } else if state.frame_idx >= state.max_frames {
+            TtsTerminalReason::FrameLimit
+        } else {
+            if state.offset != state.talker_cache.context_len() {
+                return Err(Error::InferenceError(format!(
+                    "Qwen3-TTS physical state offset {} diverged from retained talker cursor {}",
+                    state.offset,
+                    state.talker_cache.context_len()
+                )));
+            }
+            return Ok(None);
+        };
+        Ok(Some(PreparedTtsTerminalStage {
+            reason,
+            expected_talker_context: state.talker_cache.context_len(),
+            expected_frame_idx: state.frame_idx,
+            expected_rng: state.rng,
+            expected_semantic_history: state.semantic_history.clone(),
+            next_rng: state.rng,
+            sampling_ms: 0.0,
+        }))
+    }
+
+    /// A live row's stage once its semantic token is drawn (`next_rng` is
+    /// its generator after the draw): semantic EOS ends it, any other token
+    /// feeds the predictor.
+    fn stage_after_semantic(
         &self,
         state: &PhysicalTtsDecodeState,
+        semantic_token: u32,
+        next_rng: SimpleRng,
+        sampling_ms: f64,
     ) -> Result<PreparedTtsFrameStage> {
-        if state.finished {
-            return Ok(PreparedTtsFrameStage::Terminal(PreparedTtsTerminalStage {
-                reason: TtsTerminalReason::AlreadyFinished,
-                expected_talker_context: state.talker_cache.context_len(),
-                expected_frame_idx: state.frame_idx,
-                expected_rng: state.rng,
-                expected_semantic_history: state.semantic_history.clone(),
-                next_rng: state.rng,
-                sampling_ms: 0.0,
-            }));
-        }
-        if state.frame_idx >= state.max_frames {
-            return Ok(PreparedTtsFrameStage::Terminal(PreparedTtsTerminalStage {
-                reason: TtsTerminalReason::FrameLimit,
-                expected_talker_context: state.talker_cache.context_len(),
-                expected_frame_idx: state.frame_idx,
-                expected_rng: state.rng,
-                expected_semantic_history: state.semantic_history.clone(),
-                next_rng: state.rng,
-                sampling_ms: 0.0,
-            }));
-        }
-        if state.offset != state.talker_cache.context_len() {
-            return Err(Error::InferenceError(format!(
-                "Qwen3-TTS physical state offset {} diverged from retained talker cursor {}",
-                state.offset,
-                state.talker_cache.context_len()
-            )));
-        }
-        let sampling_started = Instant::now();
         let allow_eos = qwen_tts_allows_eos(state.frames_generated());
-        let mut next_rng = state.rng;
-        let last_logits = state.last_logits.as_ref().ok_or_else(|| {
-            Error::InferenceError("Qwen3-TTS last logits are not hydrated".into())
-        })?;
-        let semantic_token = sample_semantic(
-            &last_logits.i((0, 0))?,
-            state.semantic_vocab_size,
-            self.specials.codec_eos_token_id,
-            allow_eos,
-            &state.params,
-            &state.semantic_history,
-            &mut next_rng,
-            qwen_tts_uses_device_sampling(&self.device),
-        )?;
         if allow_eos && semantic_token == self.specials.codec_eos_token_id {
             return Ok(PreparedTtsFrameStage::Terminal(PreparedTtsTerminalStage {
                 reason: TtsTerminalReason::SemanticEos,
@@ -2841,12 +3336,14 @@ impl Qwen3TtsModel {
                 expected_rng: state.rng,
                 expected_semantic_history: state.semantic_history.clone(),
                 next_rng,
-                sampling_ms: sampling_started.elapsed().as_secs_f64() * 1000.0,
+                sampling_ms,
             }));
         }
+        let last_logits = state.last_logits.as_ref().ok_or_else(|| {
+            Error::InferenceError("Qwen3-TTS last logits are not hydrated".into())
+        })?;
         let next_semantic_history =
             record_semantic_history(&state.semantic_history, semantic_token);
-        let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
         let talker_hidden = state.last_hidden.as_ref().ok_or_else(|| {
             Error::InferenceError("Qwen3-TTS last hidden state is not hydrated".into())
         })?;
@@ -2866,7 +3363,6 @@ impl Qwen3TtsModel {
         Ok(PreparedTtsFrameStage::Predictor(
             PreparedTtsPredictorStage {
                 semantic_token,
-                semantic_embed,
                 talker_hidden: talker_hidden.clone(),
                 source_logits: last_logits.clone(),
                 text_addition,
@@ -2878,7 +3374,7 @@ impl Qwen3TtsModel {
                 next_rng,
                 next_semantic_history,
                 subtalker: state.params.subtalker,
-                sampling_ms: sampling_started.elapsed().as_secs_f64() * 1000.0,
+                sampling_ms,
             },
         ))
     }
@@ -2903,12 +3399,13 @@ impl Qwen3TtsModel {
             .iter()
             .map(|row| &row.talker_hidden)
             .collect::<Vec<_>>();
-        let semantic_refs = rows
-            .iter()
-            .map(|row| &row.semantic_embed)
-            .collect::<Vec<_>>();
         let talker_hidden = Tensor::cat(&talker_refs, 0)?;
-        let semantic_embeds = Tensor::cat(&semantic_refs, 0)?;
+        // Every row's semantic embedding in one upload and one lookup.
+        let semantic_tokens = rows
+            .iter()
+            .map(|row| row.semantic_token)
+            .collect::<Vec<_>>();
+        let semantic_embeds = self.talker.get_codec_embedding_rows(&semantic_tokens)?;
         let checkpoints = caches
             .iter()
             .map(|cache| cache.logical_checkpoint())
@@ -2934,21 +3431,20 @@ impl Qwen3TtsModel {
                     draw,
                 })
                 .collect::<Vec<_>>();
-            self.code_predictor.generate_acoustic_codes_physical_batch(
-                &talker_hidden,
-                &semantic_embeds,
-                caches,
-                &mut selections,
-            )?
+            self.code_predictor
+                .generate_acoustic_code_rows_physical_batch(
+                    &talker_hidden,
+                    &semantic_embeds,
+                    caches,
+                    &mut selections,
+                )?
         };
         for (row, rng) in rows.iter_mut().zip(rngs) {
             row.next_rng = rng;
         }
         let predictor_ms = predictor_started.elapsed().as_secs_f64() * 1000.0;
-        let result = rows
-            .into_iter()
-            .zip(acoustic)
-            .map(|(predictor, acoustic_codes)| {
+        let result = (|| {
+            for acoustic_codes in &acoustic.rows {
                 if acoustic_codes.len() != self.code_predictor.num_acoustic_groups() {
                     return Err(Error::InferenceError(format!(
                         "Qwen3-TTS predictor row returned {} acoustic groups, expected {}",
@@ -2956,21 +3452,36 @@ impl Qwen3TtsModel {
                         self.code_predictor.num_acoustic_groups()
                     )));
                 }
-                let acoustic_embed_sum = self
-                    .code_predictor
-                    .get_acoustic_embeddings_sum(&acoustic_codes)?;
-                let step_input = predictor
-                    .semantic_embed
-                    .broadcast_add(&acoustic_embed_sum)?
-                    .broadcast_add(&predictor.text_addition)?;
-                Ok(PreparedTtsTalkerStage {
-                    predictor,
-                    acoustic_codes,
-                    step_input,
-                    predictor_ms,
+            }
+            // Every row's step input in one pass: the codes stay on the
+            // device for the gather, and each sum is elementwise in the
+            // per-row order.
+            let acoustic_embed_sums = self
+                .code_predictor
+                .acoustic_embeddings_sum_rows(&acoustic.by_group)?;
+            let text_additions = rows
+                .iter()
+                .map(|row| &row.text_addition)
+                .collect::<Vec<_>>();
+            let step_inputs = semantic_embeds
+                .broadcast_add(&acoustic_embed_sums)?
+                .broadcast_add(&Tensor::cat(&text_additions, 0)?)?;
+            Ok((step_inputs, acoustic.rows))
+        })()
+        .and_then(|(step_inputs, acoustic_rows)| {
+            rows.into_iter()
+                .zip(acoustic_rows)
+                .enumerate()
+                .map(|(row, (predictor, acoustic_codes))| {
+                    Ok(PreparedTtsTalkerStage {
+                        predictor,
+                        acoustic_codes,
+                        step_input: step_inputs.narrow(0, row, 1)?,
+                        predictor_ms,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>();
+                .collect::<Result<Vec<_>>>()
+        });
         if let Err(error) = result {
             let mut rollback_error = None;
             for (row, cache) in caches.iter_mut().enumerate() {
@@ -3209,7 +3720,10 @@ impl Qwen3TtsModel {
 
     /// Execute a changing set of TTS rows while preserving input/output order.
     /// Terminal/EOS rows are finalized independently, live rows form one native
-    /// predictor/talker batch, and a single live row uses scalar model kernels.
+    /// predictor/talker batch, and off CUDA a single request uses scalar model
+    /// kernels. On CUDA a single request runs this batch path too, so its
+    /// semantic draw, predictor frame and talker step are the ones it gets
+    /// beside other requests ([`decode_rows`]).
     pub fn tts_decode_step_batch_physical(
         &self,
         states: &mut [&mut PhysicalTtsDecodeState],
@@ -3221,16 +3735,14 @@ impl Qwen3TtsModel {
                     .into(),
             ));
         }
-        if states.len() == 1 {
+        refuse_due_audio(states.iter().map(|state| &**state))?;
+        if states.len() == 1 && !decode_rows::row_invariant(self.talker.device()) {
             return self
-                .tts_decode_step_physical(states[0], predictor_caches[0])
+                .tts_decode_step_physical_scalar(states[0], predictor_caches[0])
                 .map(|step| vec![step]);
         }
         run_tts_decode_batch_transaction(states, predictor_caches, |states, predictor_caches| {
-            let prepared = states
-                .iter()
-                .map(|state| self.prepare_tts_predictor_stage(state))
-                .collect::<Result<Vec<_>>>()?;
+            let prepared = self.prepare_tts_frame_stages(states)?;
             let row_count = states.len();
             let mut live_mask = vec![false; row_count];
             let mut live_indices = Vec::new();
@@ -3305,7 +3817,27 @@ impl Qwen3TtsModel {
     /// cursor-zero invocation cache reserved for this frame. Predictor pages
     /// are never stored in the returned state and may be released immediately
     /// after this call, including terminal EOS calls where they remain unused.
+    /// On CUDA the quantum runs the batch path as a batch of one
+    /// ([`Self::tts_decode_step_batch_physical`]).
     pub fn tts_decode_step_physical(
+        &self,
+        state: &mut PhysicalTtsDecodeState,
+        predictor_cache: &mut CodePredictorPhysicalCache,
+    ) -> Result<TtsDecodeStep> {
+        refuse_due_audio([&*state])?;
+        if decode_rows::row_invariant(self.talker.device()) {
+            return self
+                .tts_decode_step_batch_physical(&mut [state], &mut [predictor_cache])?
+                .pop()
+                .ok_or_else(|| {
+                    Error::InferenceError("Qwen3-TTS decode batch returned no row".into())
+                });
+        }
+        self.tts_decode_step_physical_scalar(state, predictor_cache)
+    }
+
+    /// The single-row quantum of the CPU and Metal.
+    fn tts_decode_step_physical_scalar(
         &self,
         state: &mut PhysicalTtsDecodeState,
         predictor_cache: &mut CodePredictorPhysicalCache,
@@ -3389,7 +3921,6 @@ impl Qwen3TtsModel {
         let next_semantic_history =
             record_semantic_history(&state.semantic_history, semantic_token);
 
-        let predictor_start = Instant::now();
         let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
         let last_hidden = state.last_hidden.as_ref().ok_or_else(|| {
             Error::InferenceError("Qwen3-TTS last hidden state is not hydrated".into())
@@ -3409,7 +3940,6 @@ impl Qwen3TtsModel {
         let acoustic_embed_sum = self
             .code_predictor
             .get_acoustic_embeddings_sum(&acoustic_codes)?;
-        let predictor_ms = predictor_start.elapsed().as_secs_f64() * 1000.0;
 
         let text_addition = if state.frame_idx < state.trailing_text_len {
             state
@@ -3428,11 +3958,9 @@ impl Qwen3TtsModel {
             .broadcast_add(&acoustic_embed_sum)?
             .broadcast_add(&text_addition)?;
 
-        let talker_start = Instant::now();
         let (new_hidden, new_logits) = self
             .talker
             .generate_physical_step_with_embed(&step_input, &mut state.talker_cache)?;
-        let talker_ms = talker_start.elapsed().as_secs_f64() * 1000.0;
 
         state.rng = next_rng;
         state.semantic_history = next_semantic_history;
@@ -3460,19 +3988,6 @@ impl Qwen3TtsModel {
         }
         let audio_ms = audio_start.elapsed().as_secs_f64() * 1000.0;
 
-        if self.device.kind.is_cuda() {
-            debug!(
-                frame_idx = state.frame_idx,
-                semantic_ms,
-                predictor_ms,
-                talker_ms,
-                audio_ms,
-                total_ms = step_start.elapsed().as_secs_f64() * 1000.0,
-                emitted_samples = samples.len(),
-                "Qwen3-TTS physical CUDA decode step timings"
-            );
-        }
-
         let total_ms = step_start.elapsed().as_secs_f64() * 1000.0;
         Ok(TtsDecodeStep {
             samples,
@@ -3483,6 +3998,102 @@ impl Qwen3TtsModel {
             codec_ms: audio_ms,
             executed_model_row: true,
         })
+    }
+
+    /// One audio-stage quantum: each request's due codec frames (a streamed
+    /// window, or up to [`QWEN3_TTS_AUDIO_QUANTUM_FRAMES`] of a finished
+    /// request's frames) decoded together
+    /// ([`SpeechTokenizerDecoder::decode_stream_batch`]), its stream moved
+    /// past them and its audio no longer due unless frames remain. On CUDA
+    /// every vocoder call runs [`CODEC_CALL_SLOTS`] fixed windows, so a
+    /// request's samples are the same alone as beside others; elsewhere each
+    /// window is its own call. The quantum is all or nothing: a failure
+    /// leaves every state as it was.
+    pub fn tts_audio_decode_batch(
+        &self,
+        states: &mut [&mut PhysicalTtsDecodeState],
+    ) -> Result<Vec<TtsAudioStep>> {
+        let mut streams = Vec::with_capacity(states.len());
+        let mut tokens = Vec::with_capacity(states.len());
+        let mut ends = Vec::with_capacity(states.len());
+        for state in states.iter() {
+            if !state.codec_deferred || !state.audio_due {
+                return Err(Error::InvalidInput(
+                    "Qwen3-TTS audio quantum reached a request with no audio due".into(),
+                ));
+            }
+            if state.emitted_frames != 0 && state.codec_stream.is_none() {
+                return Err(Error::InferenceError(
+                    "Qwen3-TTS codec stream state is missing after emitted audio".into(),
+                ));
+            }
+            let start = state.emitted_frames;
+            let end = state
+                .frames_generated()
+                .min(start.saturating_add(QWEN3_TTS_AUDIO_QUANTUM_FRAMES));
+            let mut raw = Vec::new();
+            self.fill_raw_codec_scratch_range(&state.all_code_groups, start, end, &mut raw)?;
+            tokens.push(raw);
+            streams.push(
+                state
+                    .codec_stream
+                    .clone()
+                    .unwrap_or_else(|| self.speech_tokenizer.start_stream()),
+            );
+            ends.push(end);
+        }
+        let outputs = {
+            let mut jobs = streams
+                .iter_mut()
+                .zip(&tokens)
+                .map(|(stream, tokens)| StreamDecodeJob { stream, tokens })
+                .collect::<Vec<_>>();
+            self.speech_tokenizer
+                .decode_stream_batch(&mut jobs, self.codec_call_policy())?
+        };
+        let mut steps = Vec::with_capacity(states.len());
+        for (((state, stream), output), end) in
+            states.iter_mut().zip(streams).zip(outputs).zip(ends)
+        {
+            let mut samples = output.samples;
+            finish_decoded_audio(&mut samples);
+            let frames = end - state.emitted_frames;
+            record_qwen3_tts_codec_stream_frames(frames);
+            state.codec_stream = Some(stream);
+            state.emitted_frames = end;
+            state.emitted_samples += samples.len();
+            state.audio_due = state.finished && !state.audio_complete();
+            steps.push(TtsAudioStep {
+                samples,
+                codec_ms: output.codec_ms,
+                frames,
+                windows: output.windows,
+            });
+        }
+        Ok(steps)
+    }
+
+    /// How [`Self::tts_audio_decode_batch`] groups vocoder windows into
+    /// calls on this model's device.
+    fn codec_call_policy(&self) -> CodecCallPolicy {
+        if decode_rows::row_invariant(self.talker.device()) {
+            CodecCallPolicy::Fixed {
+                slots: CODEC_CALL_SLOTS,
+                shared: self.codec_batching.shared_calls,
+            }
+        } else {
+            CodecCallPolicy::PerWindow
+        }
+    }
+
+    /// Bytes the audio stage's quanta take for this model's codec on its
+    /// device, as `(shared, per request)`:
+    /// [`qwen3_tts_audio_stage_workspace`] over the loaded decoder.
+    pub fn audio_stage_workspace_bytes(&self) -> Result<(u64, u64)> {
+        qwen3_tts_audio_stage_workspace_for(
+            self.speech_tokenizer.decoder_config(),
+            BackendKind::from(self.device.kind),
+        )
     }
 
     fn resolve_language_id(&self, language: Option<&str>) -> Option<u32> {
@@ -3809,6 +4420,8 @@ impl Qwen3TtsModel {
             decode_raw_token_scratch: Vec::new(),
             codec_stream: None,
             finished: false,
+            codec_deferred: false,
+            audio_due: false,
         })
     }
 
@@ -3817,6 +4430,18 @@ impl Qwen3TtsModel {
         state: &mut PhysicalTtsDecodeState,
         force: bool,
     ) -> Result<Vec<f32>> {
+        if state.codec_deferred {
+            // The audio stage decodes it; the step only marks it due.
+            if incremental_audio_due(
+                &state.all_code_groups,
+                state.stream_config,
+                state.emitted_frames,
+                force,
+            ) {
+                state.audio_due = true;
+            }
+            return Ok(Vec::new());
+        }
         self.collect_incremental_audio_parts(
             &state.all_code_groups,
             state.stream_config,
@@ -3848,7 +4473,7 @@ impl Qwen3TtsModel {
                 return Ok(Vec::new());
             }
             let newly_generated = total_frames.saturating_sub(*emitted_frames);
-            if newly_generated < stream_config.decode_interval_frames {
+            if newly_generated < stream_config.emission_interval(*emitted_frames) {
                 return Ok(Vec::new());
             }
         }
@@ -4281,6 +4906,7 @@ fn argmax_semantic_values(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_semantic(
     logits: &Tensor,
     semantic_vocab_size: u32,
@@ -4290,6 +4916,47 @@ fn sample_semantic(
     history: &[u32],
     rng: &mut SimpleRng,
     prefer_device_sampling: bool,
+) -> Result<u32> {
+    sample_semantic_planned(
+        logits,
+        semantic_vocab_size,
+        eos_token_id,
+        allow_eos,
+        params,
+        history,
+        rng,
+        prefer_device_sampling,
+        bounded_device_sampling_candidates,
+    )
+}
+
+/// How [`sample_semantic`] plans a sampled row's device candidates:
+/// [`bounded_device_sampling_candidates`]'s signature.
+type SemanticCandidatePlanner = fn(
+    &Tensor,
+    usize,
+    usize,
+    f32,
+    &[u32],
+    f32,
+    f32,
+    Option<&[bool]>,
+) -> Result<Option<DeviceSamplingCandidates>>;
+
+/// [`sample_semantic`] with its candidate planner passed in, so a test can
+/// run the accelerator path (which plans candidates only on CUDA and Metal)
+/// on the CPU.
+#[allow(clippy::too_many_arguments)]
+fn sample_semantic_planned(
+    logits: &Tensor,
+    semantic_vocab_size: u32,
+    eos_token_id: u32,
+    allow_eos: bool,
+    params: &TtsGenerationParams,
+    history: &[u32],
+    rng: &mut SimpleRng,
+    prefer_device_sampling: bool,
+    plan_candidates: SemanticCandidatePlanner,
 ) -> Result<u32> {
     if !prefer_device_sampling {
         return sample_semantic_reference(
@@ -4331,7 +4998,7 @@ fn sample_semantic(
     let semantic_len = (semantic_vocab_size as usize).min(vocab_len);
     let (sampling_vocab, allowed_mask) =
         semantic_sampling_vocab_and_mask(vocab_len, semantic_len, eos_token_id, allow_eos);
-    if let Some(candidates) = bounded_device_sampling_candidates(
+    let candidates = plan_candidates(
         &logits,
         sampling_vocab,
         params.top_k,
@@ -4340,8 +5007,172 @@ fn sample_semantic(
         params.repetition_penalty,
         0.0,
         Some(&allowed_mask),
-    )? {
+    )?;
+    if candidates.is_some() {
         record_qwen3_tts_host_readback();
+    }
+    finish_sampled_semantic(
+        &logits,
+        candidates,
+        semantic_vocab_size,
+        eos_token_id,
+        allow_eos,
+        params,
+        history,
+        rng,
+    )
+}
+
+/// One row of [`sample_semantic_rows`]: what [`sample_semantic`] takes for
+/// it besides its logits.
+struct SemanticRowSampling<'a> {
+    semantic_vocab_size: u32,
+    allow_eos: bool,
+    params: &'a TtsGenerationParams,
+    history: &'a [u32],
+    rng: &'a mut SimpleRng,
+}
+
+/// [`sample_semantic`] for every row of one decode step's `[rows, vocab]`
+/// logits with one device-to-host readback instead of one per row: greedy
+/// rows read the argmax of their allowed codes and sampled rows their
+/// bounded device candidates, planned together ([`read_masked_planned_rows`]),
+/// and each row then finishes on the host as `sample_semantic` does (the
+/// top-p cover check, the same draws from its own generator, the same host
+/// fallback). Each row's token, and where its generator ends, is what
+/// `sample_semantic` gives that row alone. Off the accelerators every row
+/// samples on its own.
+fn sample_semantic_rows(
+    logits: &Tensor,
+    eos_token_id: u32,
+    rows: &mut [SemanticRowSampling<'_>],
+    prefer_device_sampling: bool,
+) -> Result<Vec<u32>> {
+    let device = logits.device();
+    sample_semantic_rows_planned(
+        logits,
+        eos_token_id,
+        rows,
+        prefer_device_sampling,
+        device.is_cuda() || device.is_metal(),
+    )
+}
+
+/// [`sample_semantic_rows`] planning device candidates iff
+/// `plan_candidates` (as [`bounded_device_sampling_candidates`] does on CUDA
+/// and Metal only), so a test can run the accelerator path on the CPU.
+fn sample_semantic_rows_planned(
+    logits: &Tensor,
+    eos_token_id: u32,
+    rows: &mut [SemanticRowSampling<'_>],
+    prefer_device_sampling: bool,
+    plan_candidates: bool,
+) -> Result<Vec<u32>> {
+    let (row_count, vocab_len) = logits.dims2()?;
+    if row_count != rows.len() {
+        return Err(Error::InvalidInput(format!(
+            "Qwen3-TTS semantic sampling received {row_count} logits rows for {} rows",
+            rows.len()
+        )));
+    }
+    if !prefer_device_sampling {
+        return rows
+            .iter_mut()
+            .enumerate()
+            .map(|(index, row)| {
+                sample_semantic(
+                    &logits.i(index)?,
+                    row.semantic_vocab_size,
+                    eos_token_id,
+                    row.allow_eos,
+                    row.params,
+                    row.history,
+                    row.rng,
+                    false,
+                )
+            })
+            .collect();
+    }
+    let masks = rows
+        .iter()
+        .map(|row| {
+            let semantic_len = (row.semantic_vocab_size as usize).min(vocab_len);
+            semantic_sampling_vocab_and_mask(vocab_len, semantic_len, eos_token_id, row.allow_eos)
+        })
+        .collect::<Vec<_>>();
+    let plans = rows
+        .iter()
+        .zip(&masks)
+        .map(|(row, (vocab, allowed))| MaskedReadback {
+            vocab: *vocab,
+            allowed: Some(allowed),
+            plan: if row.params.temperature <= 1e-5 {
+                PlannedReadback::Greedy
+            } else if plan_candidates {
+                PlannedReadback::Candidates(CandidateRequest {
+                    top_k: row.params.top_k,
+                    temperature: row.params.temperature,
+                    history: PenaltyHistory::uniform(row.history),
+                    repetition_penalty: row.params.repetition_penalty,
+                    presence_penalty: 0.0,
+                })
+            } else {
+                PlannedReadback::None
+            },
+        })
+        .collect();
+    let values = read_masked_planned_rows(logits, plans)?;
+    if values
+        .iter()
+        .any(|value| !matches!(value, PlannedValues::None))
+    {
+        record_qwen3_tts_host_readback();
+    }
+    rows.iter_mut()
+        .zip(values)
+        .enumerate()
+        .map(|(position, (row, value))| match value {
+            PlannedValues::Greedy { index, .. } => Ok(index),
+            // A greedy row that read nothing (an empty or too wide
+            // vocabulary) takes the single-row argmax.
+            _ if row.params.temperature <= 1e-5 => argmax_semantic(
+                &logits.i(position)?,
+                row.semantic_vocab_size,
+                eos_token_id,
+                row.allow_eos,
+            ),
+            value => finish_sampled_semantic(
+                &logits.i(position)?.to_dtype(DType::F32)?,
+                match value {
+                    PlannedValues::Candidates(candidates) => candidates,
+                    _ => None,
+                },
+                row.semantic_vocab_size,
+                eos_token_id,
+                row.allow_eos,
+                row.params,
+                row.history,
+                row.rng,
+            ),
+        })
+        .collect()
+}
+
+/// The host half of a sampled (non-greedy) semantic draw from a row's F32
+/// `logits` (`[vocab]`): a draw from its device `candidates` when they cover
+/// the top-p nucleus, else the exact host sampler over the row.
+#[allow(clippy::too_many_arguments)]
+fn finish_sampled_semantic(
+    logits: &Tensor,
+    candidates: Option<DeviceSamplingCandidates>,
+    semantic_vocab_size: u32,
+    eos_token_id: u32,
+    allow_eos: bool,
+    params: &TtsGenerationParams,
+    history: &[u32],
+    rng: &mut SimpleRng,
+) -> Result<u32> {
+    if let Some(candidates) = candidates {
         if device_candidates_cover_top_p(&candidates, params.top_p) {
             if let Some(token) = sample_device_candidates(&candidates, params.top_p, rng.next_f32())
             {
@@ -4349,11 +5180,13 @@ fn sample_semantic(
             }
         }
     }
-    let mut values = collect_semantic_sampling_values(&logits, semantic_len, params, history)?;
+    let vocab_len = logits.dim(0)?;
+    let semantic_len = (semantic_vocab_size as usize).min(vocab_len);
+    let mut values = collect_semantic_sampling_values(logits, semantic_len, params, history)?;
 
     let eos_idx = eos_token_id as usize;
     if allow_eos && eos_idx < vocab_len && eos_idx >= semantic_len {
-        values.push((eos_token_id, logit_scalar_f32(&logits, eos_token_id)?));
+        values.push((eos_token_id, logit_scalar_f32(logits, eos_token_id)?));
     }
 
     // Repetition penalty over recent semantic history.
@@ -4406,7 +5239,7 @@ fn sample_semantic(
 
     let mut sum: f32 = probs.iter().map(|(_, p)| *p).sum();
     if !sum.is_finite() || sum <= 0.0 {
-        return argmax_semantic(&logits, semantic_vocab_size, eos_token_id, allow_eos);
+        return argmax_semantic(logits, semantic_vocab_size, eos_token_id, allow_eos);
     }
     for (_, p) in probs.iter_mut() {
         *p /= sum;
@@ -4714,6 +5547,55 @@ impl SimpleRng {
     }
 }
 
+/// Whether codec frames are ready to decode: every generated frame not yet
+/// decoded when `force` (the request finished), else a streamed window
+/// once the stream config's cadence says so. The decision
+/// [`Qwen3TtsModel::collect_incremental_audio_parts`] makes before it
+/// decodes.
+fn incremental_audio_due(
+    codec_groups: &[Vec<u32>],
+    stream_config: TtsStreamingConfig,
+    emitted_frames: usize,
+    force: bool,
+) -> bool {
+    let total_frames = codec_groups.first().map(Vec::len).unwrap_or(0);
+    if total_frames <= emitted_frames || codec_groups.iter().any(|g| g.len() < total_frames) {
+        return false;
+    }
+    force
+        || (total_frames >= stream_config.min_frames_before_stream
+            && total_frames - emitted_frames >= stream_config.emission_interval(emitted_frames))
+}
+
+/// A decode step never runs on a request whose audio waits for the audio
+/// stage: its frames would land behind audio it has not decoded.
+fn refuse_due_audio<'a>(
+    states: impl IntoIterator<Item = &'a PhysicalTtsDecodeState>,
+) -> Result<()> {
+    if states.into_iter().any(|state| state.audio_due) {
+        return Err(Error::InvalidInput(
+            "a Qwen3-TTS decode step reached a request whose audio waits for the audio stage"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The audio one audio-stage quantum decoded for a request
+/// ([`Qwen3TtsModel::tts_audio_decode_batch`]).
+#[derive(Debug, Clone)]
+pub struct TtsAudioStep {
+    /// The frames' samples, finished as the inline decode finishes them.
+    pub samples: Vec<f32>,
+    /// The request's share of the quantum's codec time: its frame-rate
+    /// stages and, per vocoder window, its share of the call it rode in.
+    pub codec_ms: f64,
+    /// Codec frames decoded.
+    pub frames: usize,
+    /// Vocoder windows they took.
+    pub windows: usize,
+}
+
 /// The treatment every decoded sample gets, streamed or not: the codec has
 /// already clamped it to [-1, 1], and a non-finite sample is silenced. No
 /// whole-utterance gain is applied to either path (a stream cannot know the
@@ -4739,7 +5621,149 @@ pub(crate) mod tests {
     use super::config::{CodePredictorConfig, TalkerConfig};
     use super::*;
 
-    fn dtype_test_profile(
+    /// Streamed emissions: the first after 6 frames, then windows that grow
+    /// with the audio already sent up to 32 frames; buffered decoding never
+    /// emits early.
+    #[test]
+    fn streamed_emission_windows_grow_with_sent_audio() {
+        let config = TtsStreamingConfig::default();
+        let mut emitted = 0;
+        let mut windows = Vec::new();
+        for total in 1..=200 {
+            if total < config.min_frames_before_stream {
+                continue;
+            }
+            if total - emitted >= config.emission_interval(emitted) {
+                windows.push(total - emitted);
+                emitted = total;
+            }
+        }
+        assert_eq!(&windows[..6], &[6, 6, 12, 24, 32, 32]);
+        assert!(windows.iter().all(|&window| window <= 32));
+        let buffered = TtsStreamingConfig::final_only();
+        assert_eq!(buffered.emission_interval(0), usize::MAX);
+        assert_eq!(buffered.emission_interval(500), usize::MAX);
+    }
+
+    /// The audio stage's due decision is the inline decode's: a streamed
+    /// window once the cadence says so, a finished request's undecoded
+    /// frames, never frames already decoded or a frame whose groups are
+    /// incomplete, and a buffered request only when it finishes.
+    #[test]
+    fn audio_falls_due_exactly_when_the_inline_decode_would_run() {
+        let groups = |frames: usize| vec![vec![1u32; frames]; 4];
+        let streamed = TtsStreamingConfig::default();
+        assert!(!incremental_audio_due(&groups(5), streamed, 0, false));
+        assert!(incremental_audio_due(&groups(6), streamed, 0, false));
+        assert!(!incremental_audio_due(&groups(11), streamed, 6, false));
+        assert!(incremental_audio_due(&groups(12), streamed, 6, false));
+        assert!(!incremental_audio_due(&groups(12), streamed, 12, true));
+        assert!(incremental_audio_due(&groups(13), streamed, 12, true));
+        let mut ragged = groups(13);
+        ragged[3].pop();
+        assert!(!incremental_audio_due(&ragged, streamed, 6, true));
+        let buffered = TtsStreamingConfig::final_only();
+        assert!(!incremental_audio_due(&groups(500), buffered, 0, false));
+        assert!(incremental_audio_due(&groups(500), buffered, 0, true));
+        assert!(!incremental_audio_due(&groups(0), buffered, 0, true));
+    }
+
+    /// A request's codec work moves to the audio stage only before it has
+    /// audio; due audio fences off decode steps; and a rolled-back quantum
+    /// restores whether audio was due.
+    #[test]
+    fn deferred_codec_fences_decode_steps_and_rolls_back_with_its_quantum() {
+        let (arena, bindings) = talker::tests::test_arena(772);
+        let mut state =
+            transactional_decode_state(talker::tests::test_cache(arena.clone(), &bindings, 0), 9);
+        state.defer_codec_to_audio_stage().unwrap();
+        assert!(state.codec_deferred() && !state.audio_due());
+        assert!(refuse_due_audio([&state]).is_ok());
+        let checkpoint = state.batch_checkpoint();
+        state.audio_due = true;
+        assert!(refuse_due_audio([&state]).is_err());
+        state.restore_batch_checkpoint(checkpoint);
+        assert!(!state.audio_due());
+
+        let mut inline =
+            transactional_decode_state(talker::tests::test_cache(arena, &bindings, 6), 10);
+        inline.emitted_frames = 6;
+        assert!(inline.defer_codec_to_audio_stage().is_err());
+    }
+
+    /// The audio stage's contract prices the published codec decoder: a
+    /// CUDA quantum's shared work is four F32 vocoder windows of the
+    /// receptive field plus 32 frames (over 1.6 GB), elsewhere one; and a
+    /// request holds a few MB through a quantum of 128 frames.
+    #[test]
+    fn audio_stage_workspace_prices_the_published_codec_calls() {
+        let config = DecoderConfig::published_12hz();
+        let (cuda_shared, cuda_row) = qwen3_tts_audio_stage_workspace(BackendKind::Cuda).unwrap();
+        let (metal_shared, metal_row) =
+            qwen3_tts_audio_stage_workspace(BackendKind::Metal).unwrap();
+        assert_eq!(cuda_row, metal_row);
+        assert!(cuda_shared > 1_600_000_000, "{cuda_shared}");
+        assert!(metal_shared > 400_000_000 && metal_shared < cuda_shared / 3);
+        assert!(cuda_row > 1_000_000 && cuda_row < 16_000_000, "{cuda_row}");
+        assert_eq!(
+            qwen3_tts_audio_stage_workspace_for(&config, BackendKind::Cpu).unwrap(),
+            (metal_shared, metal_row)
+        );
+    }
+
+    /// Every loaded Qwen3-TTS contract with the audio stage builds a
+    /// physical state spec that validates against its stages on each
+    /// backend, and a codec needing more than the stage prices refuses the
+    /// load.
+    #[test]
+    fn audio_stage_contracts_validate_against_the_physical_state_spec() {
+        use crate::runtime::{CapabilityKind, LoadedModelBundleDraft, RuntimeAdapterRegistry};
+
+        let config = cache_test_config();
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let draft = LoadedModelBundleDraft::build(
+                &RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap(),
+                crate::engine::ExecutionGroupId::new(1),
+                ModelInstanceId::new(2),
+                crate::catalog::ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+                backend,
+            )
+            .unwrap();
+            let workspace = qwen3_tts_audio_stage_workspace(backend).unwrap();
+            let geometry = Qwen3TtsStateGeometry {
+                config: &config,
+                dtype: DType::F32,
+                talker_state_dtype: DType::F32,
+                predictor_state_dtype: DType::F32,
+                kv_page_size: 16,
+                predictor_workspace_tokens: code_predictor_physical_context_tokens(
+                    config.talker_config.num_code_groups - 1,
+                ),
+                audio_stage_workspace: workspace,
+            };
+            for capability in [CapabilityKind::Tts, CapabilityKind::StreamingTts] {
+                let contracts = draft.execution_contracts(capability).unwrap();
+                let graphs = contracts
+                    .iter()
+                    .map(|contract| contract.stages.as_ref())
+                    .collect::<Vec<_>>();
+                assert!(graphs.iter().all(|stages| stages
+                    .iter()
+                    .any(|stage| stage.selector == StageWorkSelector::SequenceAudioDecode)));
+                let spec = qwen3_tts_physical_state_spec(&geometry, &graphs).unwrap();
+                for stages in &graphs {
+                    spec.descriptor.validate_against_stages(stages).unwrap();
+                }
+                let hungrier = Qwen3TtsStateGeometry {
+                    audio_stage_workspace: (workspace.0, workspace.1 + 1),
+                    ..geometry
+                };
+                assert!(qwen3_tts_physical_state_spec(&hungrier, &graphs).is_err());
+            }
+        }
+    }
+
+    pub(crate) fn dtype_test_profile(
         kind: DeviceKind,
         supports_bf16: bool,
         supports_f16: bool,
@@ -5226,6 +6250,8 @@ pub(crate) mod tests {
             decode_raw_token_scratch: Vec::new(),
             codec_stream: None,
             finished: false,
+            codec_deferred: false,
+            audio_due: false,
         }
     }
 
@@ -5272,7 +6298,6 @@ pub(crate) mod tests {
         PreparedTtsTalkerStage {
             predictor: PreparedTtsPredictorStage {
                 semantic_token,
-                semantic_embed: Tensor::zeros((1, 1, 4), DType::F32, &device).unwrap(),
                 talker_hidden: state.last_hidden.as_ref().unwrap().clone(),
                 source_logits: state.last_logits.as_ref().unwrap().clone(),
                 text_addition: Tensor::zeros((1, 1, 4), DType::F32, &device).unwrap(),
@@ -5508,6 +6533,15 @@ pub(crate) mod tests {
             (predictor_a.context_len(), predictor_b.context_len()),
             (1, 1)
         );
+    }
+
+    /// D3: on CUDA (a row-invariant decode) a prompt prefills on a fixed
+    /// 512-token grid, so its spans never depend on the step's other work;
+    /// the CPU and Metal keep the engine's chunking.
+    #[test]
+    fn row_invariant_prompts_prefill_on_a_fixed_grid() {
+        assert_eq!(qwen3_tts_prefill_grid_tokens(true), 512);
+        assert_eq!(qwen3_tts_prefill_grid_tokens(false), 0);
     }
 
     #[test]
@@ -6257,6 +7291,111 @@ pub(crate) mod tests {
                 "temperature {temperature}, device {prefer_device}"
             );
         }
+    }
+
+    /// One decode step's semantic draws for all rows at once give every row
+    /// the token `sample_semantic` gives it alone on an accelerator (bounded
+    /// device candidates; the CPU plans them here too) and leave its
+    /// generator where that leaves it: xorshift logits with ties, NaN and
+    /// infinities, random histories and settings (greedy, top-k on and off,
+    /// above the device bound, top-p below 1), EOS allowed or not, at a toy
+    /// and the real vocabulary geometry. Greedy rows and sampled rows whose
+    /// candidates cover the nucleus read back once for the whole step.
+    #[test]
+    fn batched_semantic_sampling_matches_each_row_alone() {
+        use crate::models::shared::sampling::bounded_sampling_candidates_on_any_device;
+
+        let device = candle_core::Device::Cpu;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut sampled_rows = 0;
+        for (trial, (vocab, semantic, eos)) in [(300usize, 256u32, 290u32), (3_072, 2_048, 2_150)]
+            .into_iter()
+            .cycle()
+            .take(40)
+            .enumerate()
+        {
+            let rows = 1 + trial % 9;
+            let logits = (0..rows * vocab)
+                .map(|index| match next() % 97 {
+                    0 if index % 5 == 0 => f32::NAN,
+                    1 if index % 7 == 0 => f32::INFINITY,
+                    2 => f32::NEG_INFINITY,
+                    // Coarse values: ties everywhere.
+                    3..=40 => (next() % 25) as f32 * 0.5 - 6.0,
+                    _ => (next() % 1_000_000) as f32 / 1_000_000.0 * 12.0 - 6.0,
+                })
+                .collect::<Vec<_>>();
+            let logits = Tensor::from_vec(logits, (rows, vocab), &device).unwrap();
+            let settings = (0..rows)
+                .map(|_| {
+                    let params = TtsGenerationParams {
+                        temperature: [0.0, 0.5, 0.9, 1.3][(next() % 4) as usize],
+                        top_k: [0, 1, 7, 50, 700][(next() % 5) as usize],
+                        top_p: [1.0, 0.9, 0.3][(next() % 3) as usize],
+                        repetition_penalty: [1.0, 1.05, 1.5][(next() % 3) as usize],
+                        ..Default::default()
+                    };
+                    let history = (0..next() % 40)
+                        .map(|_| (next() % (vocab as u64 + 3)) as u32)
+                        .fold(Vec::new(), |history, token| {
+                            record_semantic_history(&history, token)
+                        });
+                    let allow_eos = next() % 3 != 0;
+                    let rng = SimpleRng { state: next() | 1 };
+                    (params, history, allow_eos, rng)
+                })
+                .collect::<Vec<_>>();
+            let mut rngs = settings.iter().map(|setting| setting.3).collect::<Vec<_>>();
+            let before = thread_qwen3_tts_host_readbacks();
+            let batched = {
+                let mut rows = settings
+                    .iter()
+                    .zip(rngs.iter_mut())
+                    .map(|(setting, rng)| SemanticRowSampling {
+                        semantic_vocab_size: semantic,
+                        allow_eos: setting.2,
+                        params: &setting.0,
+                        history: &setting.1,
+                        rng,
+                    })
+                    .collect::<Vec<_>>();
+                sample_semantic_rows_planned(&logits, eos, &mut rows, true, true).unwrap()
+            };
+            let readbacks = thread_qwen3_tts_host_readbacks() - before;
+            for (row, (params, history, allow_eos, rng)) in settings.iter().enumerate() {
+                let mut alone_rng = *rng;
+                let alone = sample_semantic_planned(
+                    &logits.i(row).unwrap(),
+                    semantic,
+                    eos,
+                    *allow_eos,
+                    params,
+                    history,
+                    &mut alone_rng,
+                    true,
+                    bounded_sampling_candidates_on_any_device,
+                )
+                .unwrap();
+                assert_eq!(batched[row], alone, "trial {trial} row {row} {params:?}");
+                assert_eq!(rngs[row].state, alone_rng.state, "trial {trial} row {row}");
+                sampled_rows += usize::from(params.temperature > 0.0);
+            }
+            // Top-k off or past the device bound, or a top-p below 1, can
+            // fall back to the host; nothing else does.
+            if settings.iter().all(|(params, ..)| {
+                params.temperature == 0.0
+                    || (params.top_p >= 1.0 && (1..=512).contains(&params.top_k))
+            }) {
+                assert_eq!(readbacks, 1, "trial {trial}");
+            }
+        }
+        assert!(sampled_rows > 100, "{sampled_rows} sampled rows");
     }
 
     /// The semantic repetition penalty covers every code generated so far,

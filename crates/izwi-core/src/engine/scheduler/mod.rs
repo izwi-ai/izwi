@@ -1823,22 +1823,36 @@ impl Scheduler {
                 {
                     return None;
                 }
+                // Least progress first lets a short chat prompt reach its
+                // first token sooner. A transcription's progress says nothing
+                // about its wait, so ASR rows rank by arrival alone.
+                let progress_rank = if metadata.task_type == TaskType::ASR {
+                    0
+                } else {
+                    r.num_tokens_processed
+                };
                 Some((
                     id.clone(),
                     r.priority,
                     r.sequence_id,
                     r.num_tokens_processed,
+                    progress_rank,
                 ))
             })
             .collect();
         while !incomplete_prefill_candidates.is_empty() {
+            // A total order: rows that tie on every key go oldest first, not in
+            // the running map's hash order. Deferred full prefills (Voxtral,
+            // Nemotron offline ASR: progress 0) all tied, so a row could wait
+            // behind every later arrival (p95 near the whole run on the H100).
             incomplete_prefill_candidates.sort_by(|a, b| {
                 self.compare_tenant_service_with(&self.tenant_service, &a.0, &b.0)
                     .then_with(|| b.1.cmp(&a.1))
-                    .then_with(|| a.3.cmp(&b.3))
+                    .then_with(|| a.4.cmp(&b.4))
+                    .then_with(|| a.2.cmp(&b.2))
             });
 
-            let (request_id, _priority, sequence_id, mut num_computed) =
+            let (request_id, _priority, sequence_id, mut num_computed, _progress_rank) =
                 incomplete_prefill_candidates.remove(0);
             if remaining_batch == 0 || remaining_prefill_budget == 0 {
                 break;
@@ -4515,6 +4529,75 @@ mod tests {
         profile.cache_mode = CacheMode::ExternalPaged;
         assert!(scheduler
             .update_execution_profile(&SessionKey::new(request_id.to_string(), epoch), &profile));
+    }
+
+    #[test]
+    fn deferred_asr_prefills_are_served_oldest_first() {
+        // B5: formation launches one width-1 ASR prefill (Voxtral, offline
+        // Nemotron) and returns the rest to the running pool. Those rows tie
+        // on tenant, priority and progress, and were served in the pool's
+        // hash order, so a request could wait behind every later arrival.
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 8,
+            max_tokens_per_step: 4096,
+            policy: SchedulingPolicy::WeightedFair,
+            ..Default::default()
+        });
+        let ids: Vec<String> = (0..32).map(|index| format!("r{index:02}")).collect();
+        for id in &ids {
+            let mut request = build_request(TaskType::ASR, id, Priority::Normal);
+            request.prompt_tokens = vec![1; 8];
+            assert!(scheduler.add_request(&request));
+        }
+        let mut served = Vec::new();
+        for _ in 0..ids.len() {
+            let mut result = scheduler.schedule();
+            assert!(
+                !result.prefill_requests.is_empty(),
+                "a waiting request is scheduled"
+            );
+            let head = result.prefill_requests.remove(0);
+            for row in result.prefill_requests.iter().chain(&result.decode_requests) {
+                assert!(scheduler.release_unexecuted_quantum(row));
+                scheduler.refund_unexecuted_service(
+                    &row.session_key(),
+                    Scheduler::service_units_for_work(row.num_tokens, &row.work),
+                );
+            }
+            served.push(head.request_id.clone());
+            scheduler.finish_request(&head.request_id);
+        }
+        assert_eq!(served, ids);
+    }
+
+    #[test]
+    fn a_resumed_asr_prefill_keeps_its_cursor() {
+        // ASR rows rank by arrival, not progress, but the row they are
+        // scheduled from must still carry the tokens already computed: a
+        // resumed span started from zero diverged from the model's cursor.
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 8,
+            max_tokens_per_step: 4,
+            min_tokens_per_step: 1,
+            enable_chunked_prefill: true,
+            policy: SchedulingPolicy::WeightedFair,
+            ..Default::default()
+        });
+        let mut request = build_request(TaskType::ASR, "asr", Priority::Normal);
+        request.prompt_tokens = vec![1; 10];
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler.get_sequence_id(&request.id).expect("epoch");
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.prefill = PrefillMode::Incremental;
+        assert!(scheduler
+            .update_execution_profile(&SessionKey::new(request.id.clone(), epoch), &profile));
+        let first = scheduler.schedule().prefill_requests.remove(0);
+        assert_eq!(first.num_computed_tokens, 0);
+        assert!(first.num_tokens < 10, "the prompt spans several steps");
+        scheduler.update_after_step(&request.id, first.num_tokens, 0, 1.0);
+        let second = scheduler.schedule().prefill_requests.remove(0);
+        assert_eq!(second.num_computed_tokens, first.num_tokens);
     }
 
     #[test]

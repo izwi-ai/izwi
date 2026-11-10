@@ -224,10 +224,27 @@ impl ResolvedFishServingCapacity {
     }
 }
 
+/// Whether Fish S2 decodes concurrent requests as rows of one batch when
+/// `IZWI_FISH_NATIVE_BATCHING` is unset. On by default on CUDA: one row at a
+/// time held an H100 at 2.4 audio-s/s from 1 to 64 streams (every request
+/// queued behind the others), while the batched path keeps each request's
+/// output identical to its solo output. Portable backends stay scalar.
+pub(crate) fn fish_native_batching_default(backend: crate::backends::BackendKind) -> bool {
+    backend == crate::backends::BackendKind::Cuda
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::architectures::fish_s2::FishS2TtsModel;
+
+    #[test]
+    fn native_batching_defaults_on_for_cuda_only() {
+        use crate::backends::BackendKind;
+        assert!(fish_native_batching_default(BackendKind::Cuda));
+        assert!(!fish_native_batching_default(BackendKind::Metal));
+        assert!(!fish_native_batching_default(BackendKind::Cpu));
+    }
 
     #[test]
     fn unknown_or_unqualified_capacity_stays_scalar() {

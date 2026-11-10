@@ -26,7 +26,10 @@ use super::ctc::{
     SpeakerActivity,
 };
 use super::ctc_head::NemotronCtcHead;
-use super::decoder::{DecodeRow, DecoderTrace, NemotronDecoder, NemotronMambaState, TraceRequest};
+use super::decoder::{
+    take_prefill_layer_times, DecodeRow, DecoderTrace, NemotronDecoder, NemotronMambaState,
+    PrefillLayerTimes, SpanRow, TraceRequest,
+};
 use super::frontend::NemotronMelFrontend;
 use super::linear::Residency;
 use super::perception::{NemotronPerception, PerceptionStream};
@@ -48,10 +51,13 @@ use crate::models::shared::detokenize::IncrementalDetokenizer;
 pub const MAX_CONTEXT_TOKENS: usize = 65_536;
 /// The card's completion budget.
 pub const MAX_NEW_TOKENS: usize = 16_384;
-/// The planned decode for KV booking: 8 tokens per second of audio covers
-/// CJK and tag-heavy output, plus a fixed margin.
-pub const PLANNED_TOKENS_PER_SECOND: f64 = 8.0;
-pub const PLANNED_DECODE_MARGIN: usize = 128;
+/// The planned decode: what a request that omits its budget decodes at most
+/// and books KV for, transcription and translation alike. 16 tokens per
+/// second of audio is several times what dense speech needs in any script
+/// or target language (the densest clip of the 2026-11-08 H100 matrix took
+/// 6.4), plus a fixed margin.
+pub const PLANNED_TOKENS_PER_SECOND: f64 = 16.0;
+pub const PLANNED_DECODE_MARGIN: usize = 64;
 /// The longest recording one request takes (the model's trained maximum and
 /// izwi's ASR cap).
 pub const MAX_AUDIO_SECONDS: f32 = 3_600.0;
@@ -71,8 +77,9 @@ pub const PREFILL_SPAN_ENV: &str = "IZWI_NEMOTRON_TRANSCRIBE_PREFILL_SPAN";
 /// grid: 512 tokens on CUDA, 192 on CPU and Metal (the engine's prefill
 /// chunk; an hour's 45,000-token prompt is 88 or 234 spans), or the
 /// environment's. Every span but a prompt's last is exactly this long,
-/// alone or beside other rows, so a request's transcript never depends on
-/// what else the server is running.
+/// alone or beside other rows, so a row's spans never depend on what else
+/// the server is running; with [`BATCHED_PREFILL_ENV`] off, neither does its
+/// transcript.
 pub fn prefill_span(backend: crate::backends::BackendKind) -> usize {
     std::env::var(PREFILL_SPAN_ENV)
         .ok()
@@ -83,6 +90,18 @@ pub fn prefill_span(backend: crate::backends::BackendKind) -> usize {
             crate::backends::BackendKind::Cpu | crate::backends::BackendKind::Metal => 192,
         })
 }
+
+/// Kill switch for packed prefill (`0`, `off`, `false`; read at load): the
+/// rows of a prefill quantum then run their spans one after another, each
+/// exactly as it runs alone.
+///
+/// Packed, a quantum's rows run their spans as one forward, so the
+/// projections and experts multiply every row's tokens at once. A row's span
+/// still starts and ends on the grid above and takes the kernels it takes
+/// alone, but the GEMMs it shares may round its values differently in the
+/// last bits, so a near-tied greedy token can depend on what else prefills
+/// beside it. A quantum of one row always runs alone.
+pub const BATCHED_PREFILL_ENV: &str = "IZWI_NEMOTRON_TRANSCRIBE_BATCHED_PREFILL";
 
 /// `IZWI_NEMOTRON_TRANSCRIBE_DECODE_QUANTUM`: the most decode steps a row
 /// runs in one engine quantum (1 to 64).
@@ -113,7 +132,27 @@ fn backend_of(device: &Device) -> crate::backends::BackendKind {
     }
 }
 
-/// `min(16384, ceil(8 * seconds) + 128)`, the decode a request books.
+/// Device workspace a prefill quantum of `spans` (each row's tokens) holds
+/// when its rows run as one packed forward: the activations of every row's
+/// tokens through the widest projection, and per row one perception window
+/// and a copy of its Mamba state. A row's share is what its span holds
+/// alone, so the adapter's per-row lease of a whole span covers a packed
+/// quantum of rows.
+pub fn prefill_workspace_bytes(config: &NemotronTranscribeConfig, spans: &[usize]) -> u64 {
+    let d = &config.decoder;
+    let widest = d
+        .mamba
+        .in_proj_rows()
+        .max(d.moe.shared_intermediate)
+        .max(d.attention.heads * d.attention.head_dim);
+    let tokens = spans.iter().sum::<usize>() as u64;
+    let activations = tokens * (widest as u64 + 8 * d.hidden as u64) * 4;
+    let window = 600 * config.asr_encoder.ff_dim as u64 * 4 * 4
+        + (config.asr_encoder.heads * 600 * 600 * 4) as u64;
+    activations + spans.len() as u64 * (window + super::decoder::state::recurrent_state_bytes(d))
+}
+
+/// `min(16384, ceil(16 * seconds) + 64)`, the decode a request books.
 pub fn planned_decode_tokens(audio_seconds: f32) -> usize {
     ((f64::from(audio_seconds.max(0.0)) * PLANNED_TOKENS_PER_SECOND).ceil() as usize
         + PLANNED_DECODE_MARGIN)
@@ -152,6 +191,11 @@ pub struct NemotronPreparedArtifact {
 pub struct NemotronRowTiming {
     pub preparation_ms: f64,
     pub prefill_ms: f64,
+    /// Prefill device time by decoder layer kind, measured only under
+    /// `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_PROFILE`.
+    pub prefill_mamba_ms: f64,
+    pub prefill_moe_ms: f64,
+    pub prefill_attention_ms: f64,
     pub perception_ms: f64,
     pub prefill_spans: u64,
     pub decode_ms: f64,
@@ -160,8 +204,18 @@ pub struct NemotronRowTiming {
 }
 
 impl NemotronRowTiming {
+    /// Adds one profiled span's layer-kind times.
+    pub(crate) fn add_prefill_layers(&mut self, layers: PrefillLayerTimes) {
+        let ms = |duration: std::time::Duration| duration.as_secs_f64() * 1e3;
+        self.prefill_mamba_ms += ms(layers.mamba);
+        self.prefill_moe_ms += ms(layers.moe);
+        self.prefill_attention_ms += ms(layers.attention);
+    }
+
     pub fn to_json(&self) -> serde_json::Value {
-        json!({
+        let profiled =
+            self.prefill_mamba_ms + self.prefill_moe_ms + self.prefill_attention_ms > 0.0;
+        let mut timing = json!({
             "preparation_ms": self.preparation_ms,
             "prefill_ms": self.prefill_ms,
             "perception_ms": self.perception_ms,
@@ -171,7 +225,15 @@ impl NemotronRowTiming {
             "ms_per_decode_step": (self.decode_steps > 0)
                 .then(|| self.decode_ms / self.decode_steps as f64),
             "ctc_ms": self.ctc_ms,
-        })
+        });
+        if profiled {
+            timing["prefill_by_layer_ms"] = json!({
+                "mamba": self.prefill_mamba_ms,
+                "moe": self.prefill_moe_ms,
+                "attention": self.prefill_attention_ms,
+            });
+        }
+        timing
     }
 }
 
@@ -379,6 +441,13 @@ pub struct NemotronStepRow<'a> {
     pub cache: &'a mut PhysicalPagedKvCache,
 }
 
+/// A row in a prefill quantum: its next `span` prompt tokens.
+pub struct NemotronPrefillRow<'a> {
+    pub state: &'a mut NemotronRetainedState,
+    pub cache: &'a mut PhysicalPagedKvCache,
+    pub span: usize,
+}
+
 /// A finished transcription.
 #[derive(Debug, Clone)]
 pub struct NemotronTranscription {
@@ -489,6 +558,9 @@ struct NemotronDiagnostics {
     /// Host microseconds of every prefill span and decode step.
     prefill_us: AtomicU64,
     decode_us: AtomicU64,
+    /// Prefill quanta whose rows ran as one packed forward, and their rows.
+    packed_prefills: AtomicU64,
+    packed_prefill_rows: AtomicU64,
 }
 
 pub struct NemotronTranscribeModel {
@@ -515,6 +587,9 @@ pub struct NemotronTranscribeModel {
     /// at load.
     prefill_span: usize,
     decode_quantum: usize,
+    /// Whether a prefill quantum's rows run as one packed forward
+    /// ([`BATCHED_PREFILL_ENV`], read at load).
+    batched_prefill: bool,
 }
 
 impl std::fmt::Debug for NemotronTranscribeModel {
@@ -681,10 +756,38 @@ impl NemotronTranscribeModel {
             config,
             prefill_span: prefill_span(backend_of(device)),
             decode_quantum: decode_quantum(backend_of(device)),
+            batched_prefill: crate::env::flag_or(BATCHED_PREFILL_ENV, true),
         })
     }
 
+    /// Whether a prefill quantum's rows run as one packed forward (read at
+    /// load).
+    pub fn batched_prefill(&self) -> bool {
+        self.batched_prefill
+    }
+
+    /// Switches packed prefill, for tests that compare the two.
+    #[cfg(test)]
+    pub(crate) fn set_batched_prefill(&mut self, on: bool) {
+        self.batched_prefill = on;
+    }
+
     /// The prefill span a row takes while it prefills alone (read at load).
+    /// Records one prefill call's profiled layer-kind times as the model's
+    /// `prefill_<kind>` phases; nothing when profiling is off.
+    fn record_prefill_layers(&self, layers: PrefillLayerTimes) {
+        use crate::engine::metrics::{record_asr_phase, AsrPhase};
+        let Some(model) = self.variant.as_ref().map(ModelVariant::dir_name) else {
+            return;
+        };
+        if layers == PrefillLayerTimes::default() {
+            return;
+        }
+        record_asr_phase(model, AsrPhase::PrefillMamba, layers.mamba);
+        record_asr_phase(model, AsrPhase::PrefillMoe, layers.moe);
+        record_asr_phase(model, AsrPhase::PrefillAttention, layers.attention);
+    }
+
     pub fn prefill_span(&self) -> usize {
         self.prefill_span
     }
@@ -788,6 +891,11 @@ impl NemotronTranscribeModel {
             "loop_stops": d.loop_stops.load(Ordering::Relaxed),
             "prefill_ms": d.prefill_us.load(Ordering::Relaxed) as f64 / 1e3,
             "decode_ms": d.decode_us.load(Ordering::Relaxed) as f64 / 1e3,
+            "batched_prefill": {
+                "on": self.batched_prefill,
+                "packed_quanta": d.packed_prefills.load(Ordering::Relaxed),
+                "packed_rows": d.packed_prefill_rows.load(Ordering::Relaxed),
+            },
             "host_readbacks": super::speech_transformer::host_readbacks(),
             "fp8_decode_kernel": self.fp8_decode_kernel(),
             "decode_graphs": self.decoder.graph_diagnostics(),
@@ -830,20 +938,9 @@ impl NemotronTranscribeModel {
             + (d.vocab * 4 + d.mamba.in_proj_rows() * 8 + d.hidden * 64) as u64
     }
 
-    /// Device workspace one prefill span of `tokens` holds: its activations
-    /// through the widest projection, one perception window, and a copy of
-    /// the row's Mamba state.
-    pub fn prefill_workspace_bytes(&self, tokens: usize) -> u64 {
-        let d = self.decoder.config();
-        let widest = d
-            .mamba
-            .in_proj_rows()
-            .max(d.moe.shared_intermediate)
-            .max(d.attention.heads * d.attention.head_dim);
-        let activations = tokens as u64 * (widest as u64 + 8 * d.hidden as u64) * 4;
-        let window = 600 * self.config.asr_encoder.ff_dim as u64 * 4 * 4
-            + (self.config.asr_encoder.heads * 600 * 600 * 4) as u64;
-        activations + window + super::decoder::state::recurrent_state_bytes(d)
+    /// [`prefill_workspace_bytes`] in this model's geometry.
+    pub fn prefill_workspace_bytes(&self, spans: &[usize]) -> u64 {
+        prefill_workspace_bytes(&self.config, spans)
     }
 
     /// [`Self::prepare`] for audio at any sample rate (resampled to 16 kHz).
@@ -1030,6 +1127,7 @@ impl NemotronTranscribeModel {
         }
         let embeds = self.span_embeddings(state, start, span)?;
         let mut trace = trace;
+        let _ = take_prefill_layer_times();
         let hidden = self.decoder.forward_span(
             &embeds,
             &mut state.mamba,
@@ -1049,27 +1147,110 @@ impl NemotronTranscribeModel {
             .prefill_spans
             .fetch_add(1, Ordering::Relaxed);
         if state.prefill_cursor == prompt {
-            let budget = state
-                .artifact
-                .max_new_tokens
-                .min(state.context.saturating_sub(prompt));
-            let mut decode = NemotronDecodeLoop {
-                generated: Vec::new(),
-                finished: None,
-                max_new_tokens: budget,
-                detokenizer: IncrementalDetokenizer::new(),
-                pending_text: String::new(),
-                near_ties: 0,
-            };
             let (token, margin) = self.decoder.greedy(&hidden)?[0];
-            self.accept(&mut decode, token, margin)?;
-            state.decode = Some(decode);
+            self.start_decode(state, token, margin)?;
         }
         let elapsed = started.elapsed();
         state.timing.prefill_ms += elapsed.as_secs_f64() * 1e3;
         state.timing.prefill_spans += 1;
+        let layers = take_prefill_layer_times();
+        state.timing.add_prefill_layers(layers);
+        self.record_prefill_layers(layers);
         self.diagnostics
             .prefill_us
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Starts a row's decode loop from the token its prompt's last span
+    /// picked.
+    fn start_decode(
+        &self,
+        state: &mut NemotronRetainedState,
+        token: u32,
+        margin: f32,
+    ) -> Result<()> {
+        let budget = state
+            .artifact
+            .max_new_tokens
+            .min(state.context.saturating_sub(state.prompt_tokens()));
+        let mut decode = NemotronDecodeLoop {
+            generated: Vec::new(),
+            finished: None,
+            max_new_tokens: budget,
+            detokenizer: IncrementalDetokenizer::new(),
+            pending_text: String::new(),
+            near_ties: 0,
+        };
+        self.accept(&mut decode, token, margin)?;
+        state.decode = Some(decode);
+        Ok(())
+    }
+
+    /// Prefills each row's next `span` prompt tokens; a row's last span
+    /// starts its decode loop. With [`BATCHED_PREFILL_ENV`] on, two or more
+    /// rows run as one packed forward ([`NemotronDecoder::forward_spans`]):
+    /// each row's span embeddings (and the perception windows they need),
+    /// then the decoder over every row's tokens at once and one greedy
+    /// readback for the rows whose prompt ends. An error before the commit
+    /// leaves every row's decoder state, KV and cursor where they were. One
+    /// row, or the switch off, runs each span as [`Self::retained_prefill`].
+    pub fn retained_prefill_batch(&self, rows: &mut [NemotronPrefillRow<'_>]) -> Result<()> {
+        if rows.len() < 2 || !self.batched_prefill {
+            for row in rows.iter_mut() {
+                self.retained_prefill(row.state, row.cache, row.span)?;
+            }
+            return Ok(());
+        }
+        let started = Instant::now();
+        for row in rows.iter() {
+            let (start, prompt) = (row.state.prefill_cursor, row.state.prompt_tokens());
+            if row.state.decode.is_some() || row.span == 0 || start + row.span > prompt {
+                return Err(Error::InvalidInput(format!(
+                    "Nemotron 3.5 Transcribe prefill span {start}+{} does not fit its {prompt}-token prompt",
+                    row.span
+                )));
+            }
+        }
+        let mut embeds = Vec::with_capacity(rows.len());
+        for row in rows.iter_mut() {
+            let start = row.state.prefill_cursor;
+            embeds.push(self.span_embeddings(row.state, start, row.span)?);
+        }
+        let mut spans = rows
+            .iter_mut()
+            .zip(embeds)
+            .map(|(row, embeds)| SpanRow {
+                pick: row.state.prefill_cursor + row.span == row.state.prompt_tokens(),
+                embeds,
+                state: &mut row.state.mamba,
+                cache: &mut *row.cache,
+            })
+            .collect::<Vec<_>>();
+        let _ = take_prefill_layer_times();
+        let packed = self.decoder.forward_spans(&mut spans)?;
+        drop(spans);
+        for (row, pick) in rows.iter_mut().zip(packed.picks) {
+            row.state.prefill_cursor += row.span;
+            if let Some((token, margin)) = pick {
+                self.start_decode(row.state, token, margin)?;
+            }
+        }
+        let elapsed = started.elapsed();
+        let layers = take_prefill_layer_times();
+        for row in rows.iter_mut() {
+            row.state.timing.prefill_ms += elapsed.as_secs_f64() * 1e3;
+            row.state.timing.prefill_spans += 1;
+            row.state.timing.add_prefill_layers(layers);
+        }
+        self.record_prefill_layers(layers);
+        let d = &self.diagnostics;
+        d.prefill_spans
+            .fetch_add(rows.len() as u64, Ordering::Relaxed);
+        d.packed_prefills.fetch_add(1, Ordering::Relaxed);
+        d.packed_prefill_rows
+            .fetch_add(rows.len() as u64, Ordering::Relaxed);
+        d.prefill_us
             .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
         Ok(())
     }

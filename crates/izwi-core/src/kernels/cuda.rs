@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 
 use crate::kernels::FusedSiluMulResult;
 
+pub mod decode_step;
 #[cfg(feature = "cuda")]
 mod epilogues;
 pub mod fp8;
@@ -28,6 +29,7 @@ pub mod rope;
 pub mod row_gemv;
 pub mod sampling;
 pub mod segment_graph;
+pub mod shape_graphs;
 pub mod split_decode;
 pub mod stretch_graphs;
 pub mod timing;
@@ -3668,6 +3670,36 @@ pub(crate) fn cuda_ptx_race_sampler() -> &'static str {
 #[cfg(feature = "cuda")]
 pub(crate) fn cuda_ptx_swiglu() -> &'static str {
     cuda_ptx::SWIGLU
+}
+
+/// The PTX of `kernels/cuda/depthwise_conv.cu` (`kernels::depthwise_conv`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_depthwise_conv() -> &'static str {
+    cuda_ptx::DEPTHWISE_CONV
+}
+
+/// The PTX of `kernels/cuda/penalized_topk.cu` (`kernels::penalized_topk`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_penalized_topk() -> &'static str {
+    cuda_ptx::PENALIZED_TOPK
+}
+
+/// The PTX of `kernels/cuda/counter_noise.cu` (`kernels::counter_noise`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_counter_noise() -> &'static str {
+    cuda_ptx::COUNTER_NOISE
+}
+
+/// The PTX of `kernels/cuda/relpos_attention.cu` (`kernels::relpos_attention`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_relpos_attention() -> &'static str {
+    cuda_ptx::RELPOS_ATTENTION
+}
+
+/// The PTX of `kernels/cuda/transducer_greedy.cu` (`kernels::transducer_greedy`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_transducer_greedy() -> &'static str {
+    cuda_ptx::TRANSDUCER_GREEDY
 }
 
 #[cfg(test)]

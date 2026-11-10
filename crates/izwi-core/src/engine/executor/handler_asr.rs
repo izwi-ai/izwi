@@ -7,6 +7,9 @@ use crate::models::architectures::granite_speech::asr::{
 use crate::models::architectures::lfm25_audio::asr_retained::{
     Lfm25AudioAsrDecodeStep, Lfm25AudioAsrQuantumCheckpoint, Lfm25AudioAsrStopReason,
 };
+use crate::models::architectures::nemotron::asr::{
+    NemotronPreparedEncoderArtifact, NemotronRetainedDecodeBatchRow, NemotronRetainedDecodeState,
+};
 use crate::models::architectures::parakeet::asr::{
     ParakeetRetainedDecodeBatchRow, ParakeetRetainedDecodeState,
 };
@@ -43,7 +46,8 @@ use super::audio::{
 };
 use super::long_form::LongFormAsrState;
 use super::state::{
-    ActiveAsrDecode, ActiveLfm25AsrDecode, ActiveParakeetAsrDecode, ActiveVoxtralRealtime,
+    ActiveAsrDecode, ActiveLfm25AsrDecode, ActiveNemotronAsrDecode, ActiveParakeetAsrDecode,
+    ActiveVoxtralRealtime,
 };
 use super::{
     ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
@@ -65,6 +69,8 @@ mod lfm25_audio;
 mod lfm3_audio;
 #[path = "handler_asr/lfm3_live.rs"]
 mod lfm3_live;
+#[path = "handler_asr/nemotron.rs"]
+mod nemotron;
 #[path = "handler_asr/parakeet.rs"]
 mod parakeet;
 #[path = "handler_asr/qwen3.rs"]
@@ -73,6 +79,8 @@ mod qwen3;
 mod vibevoice;
 #[path = "handler_asr/voxtral.rs"]
 mod voxtral;
+#[path = "handler_asr/voxtral_offline.rs"]
+mod voxtral_offline;
 #[path = "handler_asr/whisper.rs"]
 mod whisper;
 #[cfg(test)]
@@ -92,7 +100,8 @@ use whisper::with_whisper_invocation_state;
 #[cfg(test)]
 use whisper::{
     apply_whisper_terminal_transition, begins_whisper_managed_generation,
-    resolve_whisper_terminal_action, whisper_prefill_boundary_step, WhisperTerminalAction,
+    resolve_whisper_terminal_action, settle_whisper_step, whisper_prefill_boundary_step,
+    WhisperStepSettlement, WhisperTerminalAction,
 };
 
 const MAX_ASR_NEW_TOKENS: usize = 512;
@@ -155,6 +164,8 @@ fn resolve_asr_execution_audio(
             | ModelFamily::GraniteSpeech5Asr
             | ModelFamily::Lfm25Audio
             | ModelFamily::Lfm3Audio
+            | ModelFamily::NemotronAsr
+            | ModelFamily::Voxtral
     ) {
         if let Some((samples, sample_rate)) = request.prepared_asr_audio_for_executor()? {
             return Ok((AsrExecutionAudio::Prepared(samples), sample_rate, 0.0));
@@ -309,7 +320,7 @@ fn asr_execution_route_plan(
     Ok(Arc::new(NativeExecutor::asr_route_plan(
         samples,
         sample_rate,
-        &capabilities()?,
+        &capabilities()?.for_request(request),
         request.streaming,
     )))
 }
@@ -523,7 +534,11 @@ impl NativeExecutor {
         if family == ModelFamily::VibeVoiceAsr && request.uses_asr_retained_sequence() {
             return self.vibevoice_asr_sequence_request(request, scheduled, managed_state.take());
         }
-        if family == ModelFamily::GraniteSpeechAsr && request.uses_asr_retained_sequence() {
+        if matches!(
+            family,
+            ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr
+        ) && request.uses_asr_retained_sequence()
+        {
             return self.granite_speech_asr_sequence_request(
                 request,
                 scheduled,
@@ -539,6 +554,21 @@ impl NativeExecutor {
                 scheduled,
                 managed_state.take(),
             );
+        }
+        if family == ModelFamily::Voxtral && request.uses_asr_retained_sequence() {
+            if scheduled.is_prefill {
+                return self.voxtral_asr_prefill_row(request, scheduled, managed_state.take());
+            }
+            return self
+                .voxtral_asr_decode_batch_with_managed(
+                    &[request],
+                    std::slice::from_ref(scheduled),
+                    vec![managed_state.take()],
+                )?
+                .pop()
+                .ok_or_else(|| {
+                    Error::InferenceError("Voxtral offline row lost its output".into())
+                });
         }
         if family == ModelFamily::NemotronTranscribeAsr {
             return self.nemotron_transcribe_request_with_managed_cache(
@@ -563,6 +593,24 @@ impl NativeExecutor {
             };
             return outputs.pop().ok_or_else(|| {
                 Error::InferenceError("Parakeet B1 fallback returned no output".into())
+            });
+        }
+        if family == ModelFamily::NemotronAsr && request.uses_asr_retained_sequence() {
+            let mut outputs = if scheduled.is_prefill {
+                self.nemotron_asr_prefill_batch_with_managed(
+                    &[request],
+                    std::slice::from_ref(scheduled),
+                    vec![managed_state.take()],
+                )?
+            } else {
+                self.nemotron_asr_decode_batch_with_managed(
+                    &[request],
+                    std::slice::from_ref(scheduled),
+                    vec![managed_state.take()],
+                )?
+            };
+            return outputs.pop().ok_or_else(|| {
+                Error::InferenceError("Nemotron B1 fallback returned no output".into())
             });
         }
         if managed_state.is_some() {

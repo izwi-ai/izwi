@@ -6,12 +6,96 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 pub use super::sampling::FishS2Sampler;
-use super::sampling::{sample_resident, FishS2ResidentDraws, FishS2SamplingDistribution};
+use super::sampling::{
+    resident_rows_codes, sample_resident, sample_resident_rows, FishS2FastPolicy,
+    FishS2ResidentDraws, FishS2ResidentRowDraws, FishS2SamplingDistribution,
+};
+use crate::backends::BackendKind;
 use crate::error::{Error, Result};
+use crate::kernels::cuda::shape_graphs::{ShapeGraphLimits, ShapeGraphs};
 use crate::models::architectures::fish_s2::config::FishS2Config;
 use crate::models::architectures::fish_s2::rotary::FishS2RotaryCache;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
+use crate::models::shared::sampling::gumbel_noise;
 use crate::models::shared::telemetry;
+
+/// Kill switch for the fast AR's CUDA frame graphs (a boolean; on when
+/// unset). Load pricing and the decoder read it.
+pub(crate) const FISH_S2_FAST_GRAPHS_ENV: &str = "IZWI_FISH_S2_FAST_GRAPHS";
+
+fn fast_graphs_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(FISH_S2_FAST_GRAPHS_ENV, true));
+    ON.get()
+}
+
+/// The rows every graphed frame runs. Spare rows are zero rows, so every
+/// kernel of a frame runs one shape however many requests share the step (a
+/// row's codes never depend on the rows beside it), and one graph per
+/// sampling policy serves every width.
+pub(crate) const FAST_GRAPH_ROWS: usize = 32;
+
+const MIB: u64 = 1024 * 1024;
+
+/// What the fast-AR graphs may hold: one graph per input dtype and sampling
+/// policy. A 32-row frame's working set is a few MiB (nine depths of
+/// `[32, 4096]` F32 logits and their chunked sorts, `[32, 9728]` MLP
+/// activations, ten positions of dense KV per layer); the retained buffers
+/// are its inputs (`[32, 1, 2560]` hiddens, the noise, the top-p matrix,
+/// the column ids) and its codes.
+const FAST_GRAPH_LIMITS: ShapeGraphLimits = ShapeGraphLimits {
+    max_graphs: 4,
+    retained_bytes: 16 * MIB,
+    pool_bytes: 112 * MIB,
+};
+
+/// Device bytes a load on `backend` prices for the fast-AR graphs, which the
+/// load's self-check allocates: zero off CUDA or with the graphs switched
+/// off.
+pub(crate) fn fish_s2_fast_graph_device_bytes(backend: BackendKind) -> u64 {
+    if backend == BackendKind::Cuda && fast_graphs_requested() {
+        FAST_GRAPH_LIMITS.device_bytes()
+    } else {
+        0
+    }
+}
+
+/// A frame graph's key: its rows' sampling policy and its inputs' dtype.
+type FastGraphKey = (FishS2FastPolicy, DType);
+
+/// The fast AR's frame graphs ([`FishS2FastDecoder::resolve_graphs`]), or
+/// why there are none, and how many frames ran through them.
+struct FastGraphs {
+    graphs: std::result::Result<ShapeGraphs<FastGraphKey>, String>,
+    graphed_frames: AtomicU64,
+    /// Frames the graphs could not take: a row whose policy only the host
+    /// serves.
+    eager_frames: AtomicU64,
+    /// The codebook's column ids `0..codebook_size` (U32), read by the top-k
+    /// from the graph's own copy, never from a cache that could free them
+    /// under a captured graph.
+    column_ids: std::sync::OnceLock<Tensor>,
+}
+
+impl FastGraphs {
+    fn off(reason: &str) -> Self {
+        Self {
+            graphs: Err(reason.into()),
+            graphed_frames: AtomicU64::new(0),
+            eager_frames: AtomicU64::new(0),
+            column_ids: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// `0..vocab` as U32 on `device`, uploaded once.
+    fn column_ids(&self, vocab: usize, device: &Device) -> Result<Tensor> {
+        if let Some(ids) = self.column_ids.get() {
+            return Ok(ids.clone());
+        }
+        let ids = Tensor::arange(0u32, vocab as u32, device)?;
+        Ok(self.column_ids.get_or_init(|| ids).clone())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FishS2FastConfig {
@@ -43,6 +127,7 @@ pub struct FishS2FastDecoder {
     layers: Vec<FishS2FastLayer>,
     norm: RmsNorm,
     output: Linear,
+    graphs: FastGraphs,
 }
 
 enum FishS2FastProjectIn {
@@ -160,6 +245,7 @@ impl FishS2FastDecoder {
             layers,
             norm,
             output,
+            graphs: FastGraphs::off("not resolved"),
         })
     }
 
@@ -352,6 +438,23 @@ impl FishS2FastDecoder {
                     "Fish Fast AR batch cache has insufficient capacity".into(),
                 ));
             }
+        }
+        if resident {
+            let run = |key: FastGraphKey, inputs: &[Tensor]| self.run_frame_graph(key, inputs);
+            if let Some(frames) = self.graphed_frames(
+                semantic_tokens,
+                &semantic_codes,
+                slow_hidden,
+                samplers,
+                &run,
+            )? {
+                for cache in caches.iter_mut() {
+                    cache.reset_invocation()?;
+                }
+                return Ok(frames);
+            }
+        }
+        for cache in caches.iter_mut() {
             cache.reset_invocation()?;
         }
         let hidden = self.project_slow_hidden(slow_hidden)?;
@@ -366,11 +469,18 @@ impl FishS2FastDecoder {
             .collect::<Vec<_>>();
         let ids = Tensor::from_slice(&semantic_codes, (rows, 1), slow_hidden.device())?;
         let mut current = self.embeddings.forward(&ids)?;
-        let draws = self.resident_draws(samplers, slow_hidden.device(), resident)?;
+        let row_draws = self.resident_row_draws(samplers, slow_hidden.device(), resident)?;
+        let draws = match row_draws {
+            Some(_) => None,
+            None => self.resident_draws(samplers, slow_hidden.device(), resident)?,
+        };
         let mut resident = ResidentCodes::default();
         for depth in 1..self.cfg.num_codebooks {
             let logits = self.forward_step_batch(&current, depth, caches, true)?;
-            let next_ids = if let Some(draws) = &draws {
+            let next_ids = if let Some(row_draws) = &row_draws {
+                // Every row's code at this depth from one pass.
+                resident.sample_rows(&logits.i((.., 0))?, row_draws, depth - 1)?
+            } else if let Some(draws) = &draws {
                 let mut codes = Vec::with_capacity(rows);
                 for (row, (sampler, draws)) in samplers.iter().zip(draws).enumerate() {
                     codes.push(resident.sample(&logits.i((row, 0))?, sampler, draws, depth - 1)?);
@@ -390,7 +500,7 @@ impl FishS2FastDecoder {
                 current = self.embeddings.forward(&next_ids.reshape((rows, 1))?)?;
             }
         }
-        if draws.is_some() {
+        if row_draws.is_some() || draws.is_some() {
             // Codes were drawn depth by depth, rows within a depth.
             let codes = resident.read_back()?;
             for (index, code) in codes.into_iter().enumerate() {
@@ -446,6 +556,21 @@ impl FishS2FastDecoder {
         Ok(Some(draws))
     }
 
+    /// One frame's draws for every row at once, or `None` for the per-row
+    /// draws (host path, differing policies, or
+    /// `IZWI_FISH_S2_BATCHED_SAMPLING=false`).
+    fn resident_row_draws(
+        &self,
+        samplers: &mut [&mut FishS2Sampler],
+        device: &Device,
+        resident: bool,
+    ) -> Result<Option<FishS2ResidentRowDraws>> {
+        if !resident || !super::fish_s2_batched_sampling_enabled() {
+            return Ok(None);
+        }
+        FishS2ResidentRowDraws::new(samplers, self.cfg.num_codebooks.saturating_sub(1), device)
+    }
+
     pub fn generate_frame(
         &self,
         semantic_token_id: u32,
@@ -467,6 +592,22 @@ impl FishS2FastDecoder {
     ) -> Result<FishS2GeneratedFrame> {
         let semantic_code =
             semantic_code_from_token_id_from_fast_config(&self.cfg, semantic_token_id)?;
+        if resident {
+            // A row alone takes the same 32-row graph as beside others.
+            let run = |key: FastGraphKey, inputs: &[Tensor]| self.run_frame_graph(key, inputs);
+            if let Some(mut frames) = self.graphed_frames(
+                &[semantic_token_id],
+                &[semantic_code],
+                slow_hidden,
+                &mut [&mut *sampler],
+                &run,
+            )? {
+                cache.reset_invocation()?;
+                return frames.pop().ok_or_else(|| {
+                    Error::InferenceError("Fish S2 fast graph returned no frame".into())
+                });
+            }
+        }
         cache.reset_invocation()?;
         let hidden = self.project_slow_hidden(slow_hidden)?;
         let _ = self.forward_step_inner(&hidden, 0, cache, false)?;
@@ -474,7 +615,11 @@ impl FishS2FastDecoder {
         let mut codebooks = vec![semantic_code];
         let mut current = self.codebook_embedding(semantic_code)?;
         let tokens = self.cfg.num_codebooks.saturating_sub(1);
-        let draws = if resident {
+        // A row alone draws with the batched sampler at width one, so it
+        // samples as it does beside others.
+        let row_draws =
+            self.resident_row_draws(&mut [&mut *sampler], slow_hidden.device(), resident)?;
+        let draws = if resident && row_draws.is_none() {
             sampler.resident_draws(tokens, slow_hidden.device())?
         } else {
             None
@@ -483,9 +628,12 @@ impl FishS2FastDecoder {
         for codebook_idx in 1..self.cfg.num_codebooks {
             let logits = self.forward_step(&current, codebook_idx, cache)?;
             let row = logits.i((0, 0))?;
-            let next = match &draws {
-                Some(draws) => resident.sample(&row, sampler, draws, codebook_idx - 1)?,
-                None => {
+            let next = match (&row_draws, &draws) {
+                (Some(row_draws), _) => {
+                    resident.sample_rows(&row.unsqueeze(0)?, row_draws, codebook_idx - 1)?
+                }
+                (None, Some(draws)) => resident.sample(&row, sampler, draws, codebook_idx - 1)?,
+                (None, None) => {
                     let code = sample_logits(&row, sampler)?;
                     codebooks.push(code);
                     Tensor::from_vec(vec![code], 1, row.device())?
@@ -495,13 +643,369 @@ impl FishS2FastDecoder {
                 current = self.embeddings.forward(&next.reshape((1, 1))?)?;
             }
         }
-        if draws.is_some() {
+        if row_draws.is_some() || draws.is_some() {
             codebooks.extend(resident.read_back()?);
         }
         Ok(FishS2GeneratedFrame {
             semantic_token_id,
             codebooks,
         })
+    }
+}
+
+/// The graph inputs of one chunk of rows that share a policy, and the rows'
+/// places in the frame.
+struct GraphChunk {
+    rows: Vec<usize>,
+    policy: FishS2FastPolicy,
+}
+
+impl FishS2FastDecoder {
+    /// Turns the frame graphs on (CUDA only, unless
+    /// [`FISH_S2_FAST_GRAPHS_ENV`] is off) once a self-check passes: for
+    /// greedy frames and for the default draw (temperature 0.7, top-p 0.7,
+    /// top-k 30), two frames of xorshift inputs at `input_dtype` (the slow
+    /// transformer's hidden dtype, which every frame's input has), each
+    /// captured or replayed and compared with the eager dense frame bit for
+    /// bit ([`ShapeGraphs::run`]). A mismatch or a CUDA error leaves every
+    /// frame on the eager paged path, with the reason in the diagnostics.
+    pub(crate) fn resolve_graphs(&mut self, input_dtype: DType) {
+        let device = self.embeddings.embeddings().device().clone();
+        let resolved = if fast_graphs_requested() {
+            ShapeGraphs::resolve("Fish S2 fast AR", &device, FAST_GRAPH_LIMITS)
+        } else {
+            Err(format!("{FISH_S2_FAST_GRAPHS_ENV} is off"))
+        };
+        let resolved = resolved.and_then(|graphs| {
+            match self.self_check_graphs(&graphs, input_dtype, &device) {
+                Ok(()) if graphs.is_on() => Ok(graphs),
+                Ok(()) => Err(format!(
+                    "self-check failed: {}",
+                    graphs.diagnostics()["off"]
+                )),
+                Err(error) => Err(format!("self-check failed: {error}")),
+            }
+        });
+        match &resolved {
+            Ok(_) => tracing::info!(
+                rows = FAST_GRAPH_ROWS,
+                "Fish S2 fast AR frames run as CUDA graphs"
+            ),
+            Err(reason) if device.is_cuda() => {
+                tracing::warn!(%reason, "Fish S2 fast AR frames run eagerly")
+            }
+            Err(_) => {}
+        }
+        self.graphs.graphs = resolved;
+    }
+
+    /// Two frames per policy through `graphs` (see [`Self::resolve_graphs`]):
+    /// the first captures the graph and checks a replay against the eager
+    /// frame, the second checks a replay over new inputs, so a value baked
+    /// into the graph shows.
+    fn self_check_graphs(
+        &self,
+        graphs: &ShapeGraphs<FastGraphKey>,
+        input_dtype: DType,
+        device: &Device,
+    ) -> Result<()> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut uniform = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let tokens = self.cfg.num_codebooks.saturating_sub(1);
+        let policies = [0.0, 0.7].map(|temperature| FishS2FastPolicy {
+            temperature,
+            top_p: 0.7,
+            top_k: 30,
+        });
+        for policy in policies {
+            for _ in 0..2 {
+                let width = self.cfg.input_hidden_size;
+                let hidden = (0..FAST_GRAPH_ROWS * width)
+                    .map(|_| uniform() * 2.0 - 1.0)
+                    .collect::<Vec<_>>();
+                let hidden = Tensor::from_vec(hidden, (FAST_GRAPH_ROWS, 1, width), device)?
+                    .to_dtype(input_dtype)?;
+                let codes = (0..FAST_GRAPH_ROWS)
+                    .map(|_| (uniform() * self.cfg.codebook_size as f32) as u32)
+                    .map(|code| code.min(self.cfg.codebook_size as u32 - 1))
+                    .collect::<Vec<_>>();
+                let codes = Tensor::from_vec(codes, FAST_GRAPH_ROWS, device)?;
+                let noise = if policy.samples() {
+                    let count = FAST_GRAPH_ROWS * tokens * policy.top_k;
+                    Tensor::from_vec(
+                        gumbel_noise(count, &mut uniform),
+                        (FAST_GRAPH_ROWS, tokens, policy.top_k),
+                        device,
+                    )?
+                } else {
+                    Tensor::zeros(1, DType::F32, device)?
+                };
+                let inputs = [
+                    hidden,
+                    codes,
+                    noise,
+                    Tensor::triu2(policy.top_k, DType::F32, device)?,
+                    self.graphs.column_ids(self.cfg.codebook_size, device)?,
+                ];
+                self.graph_run(graphs, (policy, input_dtype), &inputs)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The frame graphs' state and counters, for the model diagnostics.
+    pub(crate) fn graphs_diagnostics(&self) -> serde_json::Value {
+        let mut diagnostics = match &self.graphs.graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        };
+        diagnostics["rows"] = FAST_GRAPH_ROWS.into();
+        diagnostics["graphed_frames"] = self.graphs.graphed_frames.load(Ordering::Relaxed).into();
+        diagnostics["eager_frames"] = self.graphs.eager_frames.load(Ordering::Relaxed).into();
+        diagnostics
+    }
+
+    /// [`Self::dense_frame`] over `inputs` through the graph of `key`.
+    fn run_frame_graph(&self, key: FastGraphKey, inputs: &[Tensor]) -> Result<Tensor> {
+        let Ok(graphs) = &self.graphs.graphs else {
+            return Err(Error::InferenceError("Fish S2 fast graphs are off".into()));
+        };
+        self.graph_run(graphs, key, inputs)
+    }
+
+    /// [`Self::dense_frame`] over `inputs` through `graphs` under `key`,
+    /// pricing what the graph keeps: its stable copy of each input and its
+    /// packed codes.
+    fn graph_run(
+        &self,
+        graphs: &ShapeGraphs<FastGraphKey>,
+        key: FastGraphKey,
+        inputs: &[Tensor],
+    ) -> Result<Tensor> {
+        let bytes = |tensor: &Tensor| (tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64;
+        let depths = self.cfg.num_codebooks.saturating_sub(1);
+        let codes = (2 * depths * FAST_GRAPH_ROWS * DType::U32.size_in_bytes()) as u64;
+        let retained = inputs.iter().map(bytes).sum::<u64>() + codes;
+        let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+            Ok(vec![self.dense_frame(key.0, inputs)?])
+        };
+        graphs
+            .run(key, retained, inputs, &body)?
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Fish S2 fast graph returned nothing".into()))
+    }
+
+    /// One frame's fast codes for `semantic_codes` rows through the graphs,
+    /// when they are on and every row's policy is one the device serves:
+    /// rows grouped by policy in frame order, each group in chunks of
+    /// [`FAST_GRAPH_ROWS`] padded with zero rows, every sampling row's noise
+    /// for the frame drawn from its own sampler up front exactly as the
+    /// eager frame draws it, and each chunk's codes read back once. `run`
+    /// replays a chunk (the graph cache in production). `None` runs the
+    /// eager paged frame.
+    fn graphed_frames(
+        &self,
+        semantic_tokens: &[u32],
+        semantic_codes: &[u32],
+        slow_hidden: &Tensor,
+        samplers: &mut [&mut FishS2Sampler],
+        run: &dyn Fn(FastGraphKey, &[Tensor]) -> Result<Tensor>,
+    ) -> Result<Option<Vec<FishS2GeneratedFrame>>> {
+        match &self.graphs.graphs {
+            Ok(graphs) if graphs.is_on() => {}
+            _ => return Ok(None),
+        }
+        self.graph_frames_with(semantic_tokens, semantic_codes, slow_hidden, samplers, run)
+    }
+
+    /// [`Self::graphed_frames`] without the graphs' state check: what a
+    /// replay computes, with `run` standing in for it.
+    fn graph_frames_with(
+        &self,
+        semantic_tokens: &[u32],
+        semantic_codes: &[u32],
+        slow_hidden: &Tensor,
+        samplers: &mut [&mut FishS2Sampler],
+        run: &dyn Fn(FastGraphKey, &[Tensor]) -> Result<Tensor>,
+    ) -> Result<Option<Vec<FishS2GeneratedFrame>>> {
+        let rows = semantic_codes.len();
+        let width = self.cfg.input_hidden_size;
+        if rows == 0
+            || rows != samplers.len()
+            || rows != semantic_tokens.len()
+            || slow_hidden.dims() != [rows, 1, width]
+            || self.cfg.num_codebooks < 2
+        {
+            self.graphs.eager_frames.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+        let mut chunks: Vec<GraphChunk> = Vec::new();
+        for (row, sampler) in samplers.iter().enumerate() {
+            let Some(policy) = sampler.fast_policy()? else {
+                self.graphs.eager_frames.fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            };
+            match chunks
+                .iter_mut()
+                .find(|chunk| chunk.policy == policy && chunk.rows.len() < FAST_GRAPH_ROWS)
+            {
+                Some(chunk) => chunk.rows.push(row),
+                None => chunks.push(GraphChunk {
+                    rows: vec![row],
+                    policy,
+                }),
+            }
+        }
+        let device = slow_hidden.device();
+        let tokens = self.cfg.num_codebooks - 1;
+        let mut codebooks = vec![Vec::new(); rows];
+        for chunk in &chunks {
+            let count = chunk.rows.len();
+            let spare = FAST_GRAPH_ROWS - count;
+            let contiguous = chunk.rows.windows(2).all(|pair| pair[1] == pair[0] + 1);
+            let hidden = if contiguous {
+                slow_hidden.narrow(0, chunk.rows[0], count)?
+            } else {
+                let index = chunk.rows.iter().map(|&row| row as u32).collect::<Vec<_>>();
+                slow_hidden.index_select(&Tensor::from_vec(index, count, device)?, 0)?
+            };
+            let mut codes = vec![0u32; FAST_GRAPH_ROWS];
+            for (slot, &row) in chunk.rows.iter().enumerate() {
+                codes[slot] = semantic_codes[row];
+            }
+            let noise = if chunk.policy.samples() {
+                let per_row = tokens * chunk.policy.top_k;
+                let mut noise = vec![0f32; FAST_GRAPH_ROWS * per_row];
+                for (slot, &row) in chunk.rows.iter().enumerate() {
+                    samplers[row].draw_fast_noise(&mut noise[slot * per_row..][..per_row]);
+                }
+                Tensor::from_vec(noise, (FAST_GRAPH_ROWS, tokens, chunk.policy.top_k), device)?
+            } else {
+                Tensor::zeros(1, DType::F32, device)?
+            };
+            let inputs = [
+                hidden.pad_with_zeros(0, 0, spare)?,
+                Tensor::from_vec(codes, FAST_GRAPH_ROWS, device)?,
+                noise,
+                Tensor::triu2(chunk.policy.top_k, DType::F32, device)?,
+                self.graphs.column_ids(self.cfg.codebook_size, device)?,
+            ];
+            let packed = run((chunk.policy, slow_hidden.dtype()), &inputs)?;
+            // [2, tokens, rows]: the codes, then each depth's non-finite
+            // logit counts, read back once.
+            let packed = packed.narrow(2, 0, count)?.contiguous()?;
+            telemetry::record_host_read(DType::U32, packed.elem_count());
+            let host = packed.to_vec3::<u32>()?;
+            let non_finite = host[1].iter().flatten().map(|&v| u64::from(v)).sum::<u64>();
+            if non_finite > 0 {
+                return Err(Error::InferenceError(format!(
+                    "Fish S2 fast logits contain {non_finite} non-finite values"
+                )));
+            }
+            for (slot, &row) in chunk.rows.iter().enumerate() {
+                codebooks[row] = std::iter::once(semantic_codes[row])
+                    .chain(host[0].iter().map(|depth| depth[slot]))
+                    .collect();
+            }
+        }
+        self.graphs.graphed_frames.fetch_add(1, Ordering::Relaxed);
+        FISH_S2_RESIDENT_FAST_FRAMES.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(
+            semantic_tokens
+                .iter()
+                .zip(codebooks)
+                .map(|(&semantic_token_id, codebooks)| FishS2GeneratedFrame {
+                    semantic_token_id,
+                    codebooks,
+                })
+                .collect(),
+        ))
+    }
+
+    /// One frame's fast codes for every row, entirely on the device, from
+    /// `inputs`: slow hiddens `[rows, 1, input_hidden]`, semantic codes
+    /// `[rows]` (U32), the frame's Gumbel noise `[rows, depths, top_k]` (any
+    /// tensor when greedy), the top-p matrix and the column ids. The eager
+    /// batch frame with each row's KV in a dense per-row cache instead of
+    /// paged invocation pages ([`FishS2FastAttention::forward_dense`]), and
+    /// each depth drawn as [`sample_resident_rows`] draws it. Returns
+    /// `[2, depths, rows]` U32: the codes, then each depth's non-finite logit
+    /// counts. A pure function of its inputs and the weights, so a CUDA graph
+    /// can capture it.
+    fn dense_frame(&self, policy: FishS2FastPolicy, inputs: &[Tensor]) -> Result<Tensor> {
+        let [slow_hidden, semantic, noise, upper, column_ids] = inputs else {
+            return Err(Error::InferenceError(format!(
+                "Fish S2 fast frame received {} inputs, expected 5",
+                inputs.len()
+            )));
+        };
+        let rows = slow_hidden.dim(0)?;
+        let mut kv = (0..self.layers.len()).map(|_| None).collect::<Vec<_>>();
+        let hidden = self.project_slow_hidden(slow_hidden)?;
+        self.dense_step(&hidden, 0, &mut kv, false)?;
+        let mut current = self.embeddings.forward(&semantic.reshape((rows, 1))?)?;
+        let mut codes = Vec::with_capacity(self.cfg.num_codebooks);
+        let mut non_finite = Vec::with_capacity(self.cfg.num_codebooks);
+        for depth in 1..self.cfg.num_codebooks {
+            let logits = self.dense_step(&current, depth, &mut kv, true)?;
+            let depth_noise = if policy.samples() {
+                Some(noise.i((.., depth - 1))?)
+            } else {
+                None
+            };
+            let (next, counts) = resident_rows_codes(
+                &logits.i((.., 0))?,
+                policy,
+                upper,
+                depth_noise.as_ref(),
+                Some(column_ids),
+            )?;
+            if depth + 1 < self.cfg.num_codebooks {
+                current = self.embeddings.forward(&next.reshape((rows, 1))?)?;
+            }
+            codes.push(next);
+            non_finite.push(counts);
+        }
+        Ok(Tensor::stack(
+            &[Tensor::stack(&codes, 0)?, Tensor::stack(&non_finite, 0)?],
+            0,
+        )?)
+    }
+
+    /// One position of every row through the layers (as
+    /// `forward_step_batch`), each layer attending over its dense cache in
+    /// `kv` (grown here); the logits when `project_logits`, else the hidden
+    /// state.
+    fn dense_step(
+        &self,
+        x: &Tensor,
+        position: usize,
+        kv: &mut [Option<(Tensor, Tensor)>],
+        project_logits: bool,
+    ) -> Result<Tensor> {
+        let mut hidden = x.clone();
+        for (layer, cache) in self.layers.iter().zip(kv.iter_mut()) {
+            let norm = layer.input_layernorm.forward(&hidden)?;
+            let attn = layer.self_attn.forward_dense(&norm, position, cache)?;
+            hidden = hidden.broadcast_add(&attn)?;
+            hidden = hidden.broadcast_add(
+                &layer
+                    .mlp
+                    .forward(&layer.post_attention_layernorm.forward(&hidden)?)?,
+            )?;
+        }
+        if project_logits {
+            self.output
+                .forward(&self.norm.forward(&hidden)?)
+                .map_err(Error::from)
+        } else {
+            Ok(hidden)
+        }
     }
 }
 
@@ -635,6 +1139,70 @@ impl FishS2FastAttention {
             .map_err(Error::from)
     }
 
+    /// [`Self::forward_batch`] over a dense per-row cache instead of paged
+    /// KV: `x` is `[rows, 1, hidden]` at `position`, and `kv` holds the rows'
+    /// earlier keys and values (F32 `[rows, kv_heads, positions, head_dim]`)
+    /// and gains this call's. Query head `h` reads key head `h / group`, as
+    /// the paged kernels do; scores and the softmax run in F32, as the paged
+    /// kernels run them.
+    fn forward_dense(
+        &self,
+        x: &Tensor,
+        position: usize,
+        kv: &mut Option<(Tensor, Tensor)>,
+    ) -> Result<Tensor> {
+        let rows = x.dim(0)?;
+        let (heads, kv_heads, head_dim) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        if kv_heads == 0 || heads % kv_heads != 0 {
+            return Err(Error::InvalidInput(format!(
+                "Fish S2 fast attention has {heads} query heads for {kv_heads} key heads"
+            )));
+        }
+        let qsize = heads * head_dim;
+        let kvsize = kv_heads * head_dim;
+        let qkv = self.qkv_proj.forward(x)?;
+        let q = self.rotary.apply(
+            &qkv.narrow(2, 0, qsize)?
+                .reshape((rows, 1, heads, head_dim))?,
+            position,
+        )?;
+        let k = self.rotary.apply(
+            &qkv.narrow(2, qsize, kvsize)?
+                .reshape((rows, 1, kv_heads, head_dim))?,
+            position,
+        )?;
+        let v = qkv
+            .narrow(2, qsize + kvsize, kvsize)?
+            .reshape((rows, 1, kv_heads, head_dim))?;
+        let k = k.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
+        let v = v.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
+        let (keys, values) = match kv.take() {
+            Some((keys, values)) => (
+                Tensor::cat(&[&keys, &k], 2)?,
+                Tensor::cat(&[&values, &v], 2)?,
+            ),
+            None => (k, v),
+        };
+        if keys.dim(2)? != position + 1 {
+            return Err(Error::InvalidInput(format!(
+                "Fish S2 dense fast cache holds {} positions at {position}",
+                keys.dim(2)?
+            )));
+        }
+        // [rows, kv_heads, group, head_dim]: query head h = kv * group + g.
+        let queries = q
+            .reshape((rows, kv_heads, heads / kv_heads, head_dim))?
+            .to_dtype(DType::F32)?;
+        let scale = f64::from(1.0f32 / (head_dim as f32).sqrt());
+        let scores = (queries.matmul(&keys.t()?)? * scale)?;
+        let out = ops::softmax_last_dim(&scores)?
+            .matmul(&values)?
+            .to_dtype(x.dtype())?
+            .reshape((rows, 1, qsize))?;
+        *kv = Some((keys, values));
+        self.o_proj.forward(&out).map_err(Error::from)
+    }
+
     fn forward(
         &self,
         x: &Tensor,
@@ -757,10 +1325,24 @@ impl ResidentCodes {
         Ok(code)
     }
 
+    /// Draw every row's code at one depth (left on the device as a `[rows]`
+    /// U32 tensor).
+    fn sample_rows(
+        &mut self,
+        logits: &Tensor,
+        draws: &FishS2ResidentRowDraws,
+        token: usize,
+    ) -> Result<Tensor> {
+        let (codes, non_finite) = sample_resident_rows(logits, draws, token)?;
+        self.codes.push(codes.clone());
+        self.non_finite.push(non_finite);
+        Ok(codes)
+    }
+
     /// The codes in draw order, from one readback; an error if any sampled
     /// row held a non-finite logit.
     fn read_back(self) -> Result<Vec<u32>> {
-        let count = self.codes.len();
+        let count = self.codes.iter().map(Tensor::elem_count).sum::<usize>();
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -1097,6 +1679,497 @@ mod tests {
             batch_caches.reverse();
             scalar_caches.reverse();
         }
+    }
+
+    /// The batched resident sampler: a batch of frames equals each row's
+    /// frame drawn alone with the resident sampler (which takes the same
+    /// sampler at width one), rows reordered between frames.
+    #[test]
+    fn resident_fast_batch_matches_rows_drawn_alone() {
+        let decoder = tiny_decoder(&Device::Cpu);
+        let cfg = decoder.config();
+        let cache = || {
+            super::super::physical::test_physical_caches(
+                904,
+                cfg.num_hidden_layers,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                cfg.num_codebooks,
+                5,
+            )
+        };
+        let mut batch_caches = cache();
+        let mut scalar_caches = cache();
+        let mut samplers = (0..5)
+            .map(|row| FishS2Sampler::new(0.8, 0.85, row + 3))
+            .collect::<Vec<_>>();
+        let mut scalar_samplers = samplers.clone();
+        for iteration in 0..3 {
+            let ids = (0..5)
+                .map(|row| 20 + (row * 3 + iteration) % 8)
+                .collect::<Vec<_>>();
+            let hidden = Tensor::from_vec(
+                (0..15)
+                    .map(|i| ((i + iteration) as f32 * 0.47).cos())
+                    .collect::<Vec<_>>(),
+                (5, 1, 3),
+                &Device::Cpu,
+            )
+            .unwrap();
+            let expected = (0..5)
+                .map(|row| {
+                    decoder
+                        .generate_frame_with(
+                            ids[row],
+                            &hidden.narrow(0, row, 1).unwrap(),
+                            &mut scalar_samplers[row],
+                            &mut scalar_caches[row],
+                            true,
+                        )
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let actual = decoder
+                .generate_frames_batch_with(
+                    &ids,
+                    &hidden,
+                    &mut samplers.iter_mut().collect::<Vec<_>>(),
+                    &mut batch_caches.iter_mut().collect::<Vec<_>>(),
+                    true,
+                )
+                .unwrap();
+            assert_eq!(actual, expected);
+            samplers.rotate_left(2);
+            scalar_samplers.rotate_left(2);
+            batch_caches.rotate_left(2);
+            scalar_caches.rotate_left(2);
+        }
+    }
+
+    /// Unstructured values in `[-scale, scale)`.
+    fn xorshift(seed: u64, count: usize, scale: f32) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..count)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * scale
+            })
+            .collect()
+    }
+
+    /// Two layers, grouped query heads, an input projection and a codebook
+    /// of `codebook_size` codes.
+    fn xorshift_cfg(codebook_size: usize) -> FishS2FastConfig {
+        FishS2FastConfig {
+            input_hidden_size: 6,
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 4,
+            codebook_size,
+            num_codebooks: 5,
+            semantic_start_token_id: 100,
+            semantic_end_token_id: 100 + codebook_size as u32 - 1,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+        }
+    }
+
+    /// Every weight of `cfg` from xorshift, norms near one.
+    fn xorshift_decoder(cfg: FishS2FastConfig, seed: u64) -> FishS2FastDecoder {
+        let device = Device::Cpu;
+        let mut salt = seed;
+        let mut tensor = |shape: &[usize], offset: f32| {
+            salt += 1;
+            let count = shape.iter().product();
+            let values = xorshift(salt * 7919, count, 0.6)
+                .into_iter()
+                .map(|value| value + offset)
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, shape, &device).unwrap()
+        };
+        let (hidden, input) = (cfg.hidden_size, cfg.input_hidden_size);
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "fast_project_in.weight".into(),
+            tensor(&[hidden, input], 0.0),
+        );
+        tensors.insert("fast_project_in.bias".into(), tensor(&[hidden], 0.0));
+        tensors.insert(
+            "fast_embeddings.weight".into(),
+            tensor(&[cfg.codebook_size, hidden], 0.0),
+        );
+        tensors.insert("fast_norm.weight".into(), tensor(&[hidden], 1.0));
+        tensors.insert(
+            "fast_output.weight".into(),
+            tensor(&[cfg.codebook_size, hidden], 0.0),
+        );
+        for layer in 0..cfg.num_hidden_layers {
+            let name = |suffix: &str| format!("fast_layers.{layer}.{suffix}");
+            tensors.insert(name("input_layernorm.weight"), tensor(&[hidden], 1.0));
+            tensors.insert(
+                name("post_attention_layernorm.weight"),
+                tensor(&[hidden], 1.0),
+            );
+            tensors.insert(
+                name("self_attn.qkv_proj.weight"),
+                tensor(&[cfg.q_size() + 2 * cfg.kv_size(), hidden], 0.0),
+            );
+            tensors.insert(
+                name("self_attn.o_proj.weight"),
+                tensor(&[hidden, cfg.q_size()], 0.0),
+            );
+            for projection in ["gate_proj", "up_proj"] {
+                tensors.insert(
+                    name(&format!("mlp.{projection}.weight")),
+                    tensor(&[cfg.intermediate_size, hidden], 0.0),
+                );
+            }
+            tensors.insert(
+                name("mlp.down_proj.weight"),
+                tensor(&[hidden, cfg.intermediate_size], 0.0),
+            );
+        }
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+        FishS2FastDecoder::load(cfg, vb).unwrap()
+    }
+
+    /// What a graph replay computes: the dense frame itself.
+    fn dense_run(
+        decoder: &FishS2FastDecoder,
+    ) -> impl Fn(FastGraphKey, &[Tensor]) -> Result<Tensor> + '_ {
+        move |key, inputs| decoder.dense_frame(key.0, inputs)
+    }
+
+    /// Each sampler's next draws, to show where its stream stands.
+    fn next_draws(samplers: &mut [FishS2Sampler]) -> Vec<Vec<u32>> {
+        samplers
+            .iter_mut()
+            .map(|sampler| {
+                let mut values = [0f32; 6];
+                let mut stochastic = sampler.clone();
+                stochastic.temperature = 1.0;
+                stochastic.draw_fast_noise(&mut values);
+                values.iter().map(|value| value.to_bits()).collect()
+            })
+            .collect()
+    }
+
+    /// The dense layers give the paged layers' logits at every depth within
+    /// F32 rounding, rows batched.
+    #[test]
+    fn dense_steps_match_the_paged_steps() {
+        let cfg = xorshift_cfg(40);
+        let decoder = xorshift_decoder(cfg.clone(), 3);
+        let rows = 3;
+        let hidden = Tensor::from_vec(
+            xorshift(41, rows * cfg.input_hidden_size, 1.0),
+            (rows, 1, cfg.input_hidden_size),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let mut caches = super::super::physical::test_physical_caches(
+            905,
+            cfg.num_hidden_layers,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.num_codebooks,
+            rows,
+        );
+        let mut caches = caches.iter_mut().collect::<Vec<_>>();
+        let projected = decoder.project_slow_hidden(&hidden).unwrap();
+        let mut kv = vec![None; cfg.num_hidden_layers];
+        let paged = decoder
+            .forward_step_batch(&projected, 0, &mut caches, false)
+            .unwrap();
+        let dense = decoder.dense_step(&projected, 0, &mut kv, false).unwrap();
+        let mut pairs = vec![(paged, dense)];
+        for depth in 1..cfg.num_codebooks {
+            let codes = (0..rows)
+                .map(|row| ((row * 7 + depth * 3) % cfg.codebook_size) as u32)
+                .collect::<Vec<_>>();
+            let ids = Tensor::from_vec(codes, (rows, 1), &Device::Cpu).unwrap();
+            let x = decoder.embeddings.forward(&ids).unwrap();
+            let paged = decoder
+                .forward_step_batch(&x, depth, &mut caches, true)
+                .unwrap();
+            let dense = decoder.dense_step(&x, depth, &mut kv, true).unwrap();
+            pairs.push((paged, dense));
+        }
+        for (depth, (paged, dense)) in pairs.iter().enumerate() {
+            assert_eq!(paged.dims(), dense.dims());
+            let diff = (paged - dense)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(diff < 1e-5, "depth {depth} differs by {diff}");
+        }
+    }
+
+    /// The frame batches the graph tests run: (codebook size, rows, the
+    /// rows' policies in turn) for greedy, sampled, three mixed policies,
+    /// 34 rows in two chunks, and a codebook below top-k.
+    #[allow(clippy::type_complexity)]
+    const GRAPH_CASES: [(usize, usize, &[(f32, f32, usize)]); 6] = [
+        (1500, 1, &[(0.0, 0.7, 30)]),
+        (1500, 1, &[(0.7, 0.7, 30)]),
+        (1500, 3, &[(0.7, 0.7, 30)]),
+        (1500, 5, &[(0.7, 0.7, 30), (1.1, 0.95, 12), (0.0, 0.7, 30)]),
+        (60, 34, &[(0.7, 0.7, 30)]),
+        (20, 3, &[(1.1, 0.95, 12), (0.7, 0.7, 30)]),
+    ];
+
+    /// One graph case's decoder, slow hiddens, semantic tokens and codes,
+    /// and samplers.
+    #[allow(clippy::type_complexity)]
+    fn graph_case(
+        case: usize,
+    ) -> (
+        FishS2FastDecoder,
+        Tensor,
+        Vec<u32>,
+        Vec<u32>,
+        Vec<FishS2Sampler>,
+    ) {
+        let (codebook_size, rows, policies) = GRAPH_CASES[case];
+        let cfg = xorshift_cfg(codebook_size);
+        let decoder = xorshift_decoder(cfg.clone(), case as u64 + 5);
+        let hidden = Tensor::from_vec(
+            xorshift(case as u64 + 77, rows * cfg.input_hidden_size, 1.5),
+            (rows, 1, cfg.input_hidden_size),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let tokens = (0..rows)
+            .map(|row| cfg.semantic_start_token_id + ((row * 13 + case) % codebook_size) as u32)
+            .collect::<Vec<_>>();
+        let codes = tokens
+            .iter()
+            .map(|&token| token - cfg.semantic_start_token_id)
+            .collect::<Vec<_>>();
+        let samplers = (0..rows)
+            .map(|row| {
+                let (temperature, top_p, top_k) = policies[row % policies.len()];
+                FishS2Sampler::with_top_k(temperature, top_p, top_k, row as u64 + 31)
+            })
+            .collect::<Vec<_>>();
+        (decoder, hidden, tokens, codes, samplers)
+    }
+
+    /// A row's frame alone, as a lone request runs it: the dense frame in
+    /// slot 0 of 32 rows, the rest zero, its noise drawn from `sampler`.
+    fn dense_alone(
+        decoder: &FishS2FastDecoder,
+        hidden: &Tensor,
+        code: u32,
+        sampler: &mut FishS2Sampler,
+    ) -> Vec<u32> {
+        let device = Device::Cpu;
+        let rows = FAST_GRAPH_ROWS;
+        let policy = sampler.fast_policy().unwrap().unwrap();
+        let depths = decoder.cfg.num_codebooks - 1;
+        let noise = if policy.samples() {
+            let mut noise = vec![0f32; rows * depths * policy.top_k];
+            sampler.draw_fast_noise(&mut noise[..depths * policy.top_k]);
+            Tensor::from_vec(noise, (rows, depths, policy.top_k), &device).unwrap()
+        } else {
+            Tensor::zeros(1, DType::F32, &device).unwrap()
+        };
+        let mut codes = vec![0u32; rows];
+        codes[0] = code;
+        let inputs = [
+            hidden.pad_with_zeros(0, 0, rows - 1).unwrap(),
+            Tensor::from_vec(codes, rows, &device).unwrap(),
+            noise,
+            Tensor::triu2(policy.top_k, DType::F32, &device).unwrap(),
+            Tensor::arange(0u32, decoder.cfg.codebook_size as u32, &device).unwrap(),
+        ];
+        let packed = decoder
+            .dense_frame(policy, &inputs)
+            .unwrap()
+            .to_vec3::<u32>()
+            .unwrap();
+        assert!(packed[1].iter().flatten().all(|&count| count == 0));
+        std::iter::once(code)
+            .chain(packed[0].iter().map(|depth| depth[0]))
+            .collect()
+    }
+
+    /// A graphed frame (rows grouped by policy, chunks of 32 padded with
+    /// zero rows, the noise drawn up front) gives every row the bits it gets
+    /// alone (in slot 0 of 32 rows, as a lone request runs), one readback
+    /// per chunk, two frames running: a row's codes do not depend on the
+    /// rows beside it, its slot or its chunk.
+    #[test]
+    fn graphed_frames_give_each_row_its_frame_alone() {
+        for case in 0..GRAPH_CASES.len() {
+            let (decoder, hidden, tokens, codes, mut samplers) = graph_case(case);
+            let mut alone_samplers = samplers.clone();
+            let policies = GRAPH_CASES[case].2.len().min(tokens.len());
+            for frame in 0..2 {
+                let before = telemetry::thread_host_reads();
+                let graphed = decoder
+                    .graph_frames_with(
+                        &tokens,
+                        &codes,
+                        &hidden,
+                        &mut samplers.iter_mut().collect::<Vec<_>>(),
+                        &dense_run(&decoder),
+                    )
+                    .unwrap()
+                    .expect("every policy is graphed");
+                let chunks = tokens.len().div_ceil(FAST_GRAPH_ROWS) + policies - 1;
+                assert_eq!(
+                    telemetry::thread_host_reads() - before,
+                    chunks as u64,
+                    "case {case}: one readback per chunk"
+                );
+                for (row, sampler) in alone_samplers.iter_mut().enumerate() {
+                    let alone = dense_alone(
+                        &decoder,
+                        &hidden.narrow(0, row, 1).unwrap(),
+                        codes[row],
+                        sampler,
+                    );
+                    assert_eq!(graphed[row].semantic_token_id, tokens[row]);
+                    assert_eq!(
+                        graphed[row].codebooks, alone,
+                        "case {case} frame {frame} row {row}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Graphed frames pick the eager paged frame's codes (the dense and
+    /// paged attention agree to F32 rounding, so a near tie may rarely
+    /// flip one code: at most 1% of them) and leave every sampler's stream
+    /// where the eager frame does.
+    #[test]
+    fn graphed_frames_pick_the_eager_frames_codes() {
+        let (mut compared, mut differing) = (0usize, 0usize);
+        for case in 0..GRAPH_CASES.len() {
+            let (decoder, hidden, tokens, codes, mut samplers) = graph_case(case);
+            let cfg = decoder.config().clone();
+            let mut eager_samplers = samplers.clone();
+            let mut caches = super::super::physical::test_physical_caches(
+                906 + case as u64,
+                cfg.num_hidden_layers,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                cfg.num_codebooks,
+                tokens.len(),
+            );
+            for frame in 0..2 {
+                let eager = decoder
+                    .generate_frames_batch_with(
+                        &tokens,
+                        &hidden,
+                        &mut eager_samplers.iter_mut().collect::<Vec<_>>(),
+                        &mut caches.iter_mut().collect::<Vec<_>>(),
+                        true,
+                    )
+                    .unwrap();
+                let graphed = decoder
+                    .graph_frames_with(
+                        &tokens,
+                        &codes,
+                        &hidden,
+                        &mut samplers.iter_mut().collect::<Vec<_>>(),
+                        &dense_run(&decoder),
+                    )
+                    .unwrap()
+                    .expect("every policy is graphed");
+                for (graphed, eager) in graphed.iter().zip(&eager) {
+                    assert_eq!(graphed.codebooks.len(), eager.codebooks.len());
+                    compared += eager.codebooks.len() - 1;
+                    differing += graphed
+                        .codebooks
+                        .iter()
+                        .zip(&eager.codebooks)
+                        .filter(|(a, b)| a != b)
+                        .count();
+                }
+                assert_eq!(
+                    next_draws(&mut samplers),
+                    next_draws(&mut eager_samplers),
+                    "case {case} frame {frame}: streams"
+                );
+            }
+        }
+        assert!(
+            differing * 100 <= compared,
+            "{differing} of {compared} codes differ from the eager frame's"
+        );
+    }
+
+    /// A row whose policy only the host serves keeps the frame eager.
+    #[test]
+    fn a_host_only_policy_keeps_the_frame_eager() {
+        let cfg = xorshift_cfg(40);
+        let decoder = xorshift_decoder(cfg.clone(), 9);
+        let hidden =
+            Tensor::zeros((2, 1, cfg.input_hidden_size), DType::F32, &Device::Cpu).unwrap();
+        let mut samplers = [
+            FishS2Sampler::with_top_k(0.7, 0.7, 30, 1),
+            FishS2Sampler::with_top_k(0.7, 0.7, 0, 2),
+        ];
+        let frames = decoder
+            .graph_frames_with(
+                &[100, 101],
+                &[0, 1],
+                &hidden,
+                &mut samplers.iter_mut().collect::<Vec<_>>(),
+                &dense_run(&decoder),
+            )
+            .unwrap();
+        assert!(frames.is_none());
+        assert_eq!(decoder.graphs_diagnostics()["eager_frames"], 1);
+    }
+
+    /// Off CUDA the graphs never resolve and price nothing; the kill switch
+    /// turns their pricing off on CUDA and names itself.
+    #[test]
+    fn fast_graphs_run_on_cuda_only_and_obey_the_kill_switch() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(FISH_S2_FAST_GRAPHS_ENV);
+        std::env::remove_var(FISH_S2_FAST_GRAPHS_ENV);
+        assert_eq!(fish_s2_fast_graph_device_bytes(BackendKind::Cpu), 0);
+        assert_eq!(fish_s2_fast_graph_device_bytes(BackendKind::Metal), 0);
+        assert_eq!(
+            fish_s2_fast_graph_device_bytes(BackendKind::Cuda),
+            128 * MIB
+        );
+        let mut decoder = xorshift_decoder(xorshift_cfg(40), 1);
+        decoder.resolve_graphs(DType::F32);
+        assert_eq!(
+            decoder.graphs_diagnostics()["off"],
+            "shape graphs run on CUDA only"
+        );
+        std::env::set_var(FISH_S2_FAST_GRAPHS_ENV, "0");
+        assert_eq!(fish_s2_fast_graph_device_bytes(BackendKind::Cuda), 0);
+        decoder.resolve_graphs(DType::F32);
+        let off = decoder.graphs_diagnostics()["off"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        match previous {
+            Some(value) => std::env::set_var(FISH_S2_FAST_GRAPHS_ENV, value),
+            None => std::env::remove_var(FISH_S2_FAST_GRAPHS_ENV),
+        }
+        assert!(off.contains(FISH_S2_FAST_GRAPHS_ENV), "{off}");
     }
 
     #[test]

@@ -22,13 +22,17 @@ use std::sync::Arc;
 use candle_core::{Device, Tensor};
 
 use super::backbone::{Maya2Backbone, Maya2BackboneRow};
-use super::config::{CODEBOOKS, CODEBOOK_SIZE, DEPTH_LEVELS, MAYA2_DEFAULTS};
+use super::config::{CB0_CLASSES, CODEBOOKS, CODEBOOK_SIZE, DEPTH_LEVELS, MAYA2_DEFAULTS};
 use super::depth::Maya2Depth;
 use super::guards::{LoopGuard, Maya2PieceBudget, Maya2StopReason};
 use super::inputs::Maya2Inputs;
 use super::runtime::{cap_reason, Maya2GenerationParams, Maya2Stream, Maya2Voice};
-use super::sampling::{depth_gumbel, sample_cb0, Cb0State};
+use super::sampling::{
+    cb0_device_candidates, depth_gumbel, depth_noise_key, device_cb0_sampling, device_noise,
+    sample_cb0, sample_cb0_candidates, Cb0Draw, Cb0State,
+};
 use crate::error::{Error, Result};
+use crate::kernels::penalized_topk::{self, CandidateRow};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PhysicalPagedKvCheckpoint};
 use crate::models::shared::codecs::mimi::{MimiDecoder, MimiDecoderState};
 use crate::models::shared::noise::SplitMix64;
@@ -423,6 +427,94 @@ pub(crate) fn maya2_prefill_batch(
     Ok(steps)
 }
 
+/// Each row's cb0 draw from the step's `[rows, 2049]` F32 logits. With
+/// `device_candidates`, rows read back their top candidates together in one
+/// transfer and draw from them ([`sample_cb0_candidates`]); a row they
+/// cannot serve, or every row without, reads its whole logits.
+fn draw_cb0_rows(
+    logits: &Tensor,
+    rows: &mut [Maya2StepRow<'_>],
+    device_candidates: bool,
+) -> Result<Vec<Cb0Draw>> {
+    let mut draws = vec![None; rows.len()];
+    if device_candidates {
+        let recent = rows
+            .iter()
+            .map(|row| row.state.cb0_state.recent_codes())
+            .collect::<Vec<_>>();
+        let mut selected = Vec::new();
+        let mut candidate_rows = Vec::new();
+        let mut count = 0;
+        for (index, row) in rows.iter().enumerate() {
+            if let Some((candidates, wanted)) = cb0_device_candidates(
+                &row.state.params.sampling,
+                row.state.guard.aeos_bias(),
+                &recent[index],
+            ) {
+                selected.push(index);
+                candidate_rows.push(CandidateRow {
+                    logits_row: index,
+                    ..candidates
+                });
+                count = wanted.max(count);
+            }
+        }
+        if !selected.is_empty() {
+            let packed =
+                penalized_topk::candidates_packed(logits, CB0_CLASSES, &candidate_rows, count)?
+                    .flatten_all()?
+                    .to_vec1::<u32>()?;
+            for (&index, candidates) in selected.iter().zip(penalized_topk::unpack(&packed, count))
+            {
+                if candidates.non_finite != 0 {
+                    continue;
+                }
+                let state = &mut *rows[index].state;
+                draws[index] = sample_cb0_candidates(
+                    &candidates.values,
+                    &candidates.indices,
+                    &state.params.sampling,
+                    state.frames(),
+                    state.artifact.budget.minimum,
+                    &mut state.cb0_state,
+                    &mut state.cb0_rng,
+                );
+            }
+        }
+    }
+    let whole = (0..rows.len())
+        .filter(|&index| draws[index].is_none())
+        .collect::<Vec<_>>();
+    if device_candidates {
+        penalized_topk::device_path::record(rows.len(), whole.len());
+    }
+    if !whole.is_empty() {
+        let host = if whole.len() == rows.len() {
+            logits.to_vec2::<f32>()?
+        } else {
+            let ids = whole.iter().map(|&index| index as u32).collect::<Vec<_>>();
+            let ids = Tensor::from_vec(ids, whole.len(), logits.device())?;
+            logits.index_select(&ids, 0)?.to_vec2::<f32>()?
+        };
+        for (&index, logits) in whole.iter().zip(&host) {
+            let state = &mut *rows[index].state;
+            draws[index] = Some(sample_cb0(
+                logits,
+                &state.params.sampling,
+                state.guard.aeos_bias(),
+                state.frames(),
+                state.artifact.budget.minimum,
+                &mut state.cb0_state,
+                &mut state.cb0_rng,
+            )?);
+        }
+    }
+    draws
+        .into_iter()
+        .map(|draw| draw.ok_or_else(|| Error::InferenceError("Maya2 row lost its cb0 draw".into())))
+        .collect()
+}
+
 /// One frame for each row: the cb0 draws (and controlled stops), the depth
 /// decoder for the rows that go on, then one backbone step over the frames
 /// of the rows still decoding.
@@ -446,22 +538,14 @@ pub(crate) fn maya2_decode_batch(
         })?);
     }
     let hidden = Tensor::cat(&hidden, 0)?;
-    let logits = networks.inputs.cb0_logits(&hidden)?.to_vec2::<f32>()?;
+    let logits = networks.inputs.cb0_logits(&hidden)?;
+    let draws = draw_cb0_rows(&logits, rows, device_cb0_sampling(device))?;
 
-    // Host draws; rows that stop on the draw emit nothing.
+    // Rows that stop on the draw emit nothing.
     let mut going = Vec::with_capacity(rows.len());
     let mut cb0 = Vec::with_capacity(rows.len());
-    for (index, (row, logits)) in rows.iter_mut().zip(&logits).enumerate() {
+    for (index, (row, draw)) in rows.iter_mut().zip(draws).enumerate() {
         let state = &mut *row.state;
-        let draw = sample_cb0(
-            logits,
-            &state.params.sampling,
-            state.guard.aeos_bias(),
-            state.frames(),
-            state.artifact.budget.minimum,
-            &mut state.cb0_state,
-            &mut state.cb0_rng,
-        )?;
         match draw.stop {
             Some(reason) => {
                 state.pending = None;
@@ -500,7 +584,21 @@ pub(crate) fn maya2_decode_batch(
             })
             .collect::<Result<Vec<_>>>()?;
         let cross = Tensor::stack(&cross, 0)?;
-        let gumbel = {
+        let cb0 = Tensor::from_vec(cb0, going.len(), device)?;
+        let (temperature, top_k) = (MAYA2_DEFAULTS.depth_temperature, MAYA2_DEFAULTS.depth_top_k);
+        let frames = if device_noise(device) {
+            let keys = going
+                .iter()
+                .map(|&index| {
+                    let state = &rows[index].state;
+                    depth_noise_key(state.params.seed, state.frames())
+                })
+                .collect::<Vec<_>>();
+            // Through the depth frame graph on CUDA when it is on.
+            networks
+                .depth
+                .generate_frame_keyed(&h, &cb0, &cross, &keys, temperature, top_k)?
+        } else {
             let mut rngs = Vec::with_capacity(going.len());
             let mut cursor = 0;
             for (index, row) in rows.iter_mut().enumerate() {
@@ -509,17 +607,11 @@ pub(crate) fn maya2_decode_batch(
                     cursor += 1;
                 }
             }
-            depth_gumbel(&mut rngs, DEPTH_LEVELS, CODEBOOK_SIZE, device)?
+            let gumbel = depth_gumbel(&mut rngs, DEPTH_LEVELS, CODEBOOK_SIZE, device)?;
+            networks
+                .depth
+                .generate_frame(&h, &cb0, &cross, &gumbel, temperature, top_k)?
         };
-        let cb0 = Tensor::from_vec(cb0, going.len(), device)?;
-        let frames = networks.depth.generate_frame(
-            &h,
-            &cb0,
-            &cross,
-            &gumbel,
-            MAYA2_DEFAULTS.depth_temperature,
-            MAYA2_DEFAULTS.depth_top_k,
-        )?;
         let host = frames.to_vec2::<u32>()?;
 
         let mut feed = Vec::with_capacity(going.len());

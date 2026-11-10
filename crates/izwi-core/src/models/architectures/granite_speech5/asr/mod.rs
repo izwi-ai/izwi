@@ -6,9 +6,13 @@
 //! has its own prompt contract. It is a separate family: nothing here calls
 //! the 4.1 module, which stays as it shipped.
 //!
-//! A request runs as one atomic invocation on a lifecycle-owned paged KV
-//! lease; long audio is cut into chunks by the generic ASR route. The 4.1
-//! retained-decode route is uncertified (GRN-8) and is not carried over.
+//! A single-segment request runs on the retained route (`retained.rs`): its
+//! audio is encoded beside other requests', its prompt prefilled onto
+//! retained decoder pages, and it decodes beside the other rows, one batched
+//! step per token. Long audio is cut into chunks by the generic ASR route,
+//! each chunk one atomic invocation on a lifecycle-owned paged KV lease, as
+//! is every request with the retained route switched off
+//! (`IZWI_GRANITE_SPEECH5_RETAINED_DECODE`).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,6 +49,9 @@ mod projector;
 mod prompt;
 #[cfg(test)]
 mod reference_tests;
+mod retained;
+#[cfg(test)]
+mod retained_tests;
 mod runtime;
 mod transcript;
 
@@ -54,6 +61,7 @@ pub use config::{
     GraniteSpeech5ProcessorConfig, GraniteSpeech5ProjectorConfig, GraniteSpeech5TextConfig,
     GraniteSpeech5TokenizerConfig,
 };
+pub(crate) use encoder::granite_speech5_encoder_graph_device_bytes;
 pub(crate) use gguf::granite_speech5_mmproj_safetensors_name;
 pub(crate) use precision::{
     granite_speech5_load_representation, granite_speech5_tensor_is_f16_encoder_projection,
@@ -71,6 +79,12 @@ pub use prompt::{
     GRANITE_SPEECH5_MAX_KEYWORD_CHARS, GRANITE_SPEECH5_PUNCTUATED_ASR_INSTRUCTION,
     GRANITE_SPEECH5_RAW_ASR_INSTRUCTION, GRANITE_SPEECH5_SOURCE_LANGUAGES,
     GRANITE_SPEECH5_TRANSLATION_TARGETS,
+};
+pub(crate) use retained::{
+    GraniteSpeech5AsrPreparationStageSeal, GraniteSpeech5DecodeCheckpoint,
+    GraniteSpeech5DecodeState, GraniteSpeech5DecodeStep, GraniteSpeech5FeatureRow,
+    GraniteSpeech5PreparationBatchGeometry, GraniteSpeech5PreparationBatchRow,
+    GraniteSpeech5PreparedGeometry, GraniteSpeech5PreparedPromptArtifact,
 };
 pub use runtime::{
     GraniteSpeech5AudioStats, GraniteSpeech5Generation, GraniteSpeech5GenerationStats,
@@ -131,9 +145,30 @@ const AUTO_TOKENS_PER_WINDOW: f64 = 300.0;
 const AUTO_WINDOW_SECONDS: f64 = 30.0;
 /// The admitted ceiling of the automatic budget.
 pub const GRANITE_SPEECH5_AUTO_MAX_TOKENS: usize = 2048;
+/// The longest sequence the retained route decodes: the 128-token prompt
+/// reserve, 120 s of audio tokens and that audio's automatic budget
+/// (128 + 1,200 + 1,200). A request whose prompt and budget need more runs
+/// as one atomic invocation.
+pub(crate) const GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS: usize = 2_528;
 const DEFAULT_MAX_NEW_TOKENS: usize = 768;
 
 static NEXT_MODEL_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+/// The retained route's switch for Granite Speech 5.0 (on by default).
+pub(crate) const GRANITE_SPEECH5_RETAINED_DECODE_ENV: &str = "IZWI_GRANITE_SPEECH5_RETAINED_DECODE";
+
+/// Whether a Granite Speech 5.0 load offers the retained sequence route: a
+/// single-segment request resumes prefill on retained decoder pages and
+/// decodes beside the other rows, one batched step per token. Off, every
+/// request runs as one atomic invocation and the load fits no retained
+/// decoder state (GRN-8). Read once per process: the loaded adapter and the
+/// model it seals both take it, so their routes agree.
+pub(crate) fn granite_speech5_retained_decode_enabled() -> bool {
+    static ENABLED: crate::env::ReadOnce<bool> = crate::env::ReadOnce::new(|| {
+        crate::env::flag_or(GRANITE_SPEECH5_RETAINED_DECODE_ENV, true)
+    });
+    ENABLED.get()
+}
 
 /// The automatic decode budget for `audio_seconds` of audio,
 /// `ceil(300 * max(1, secs / 30))`. Callers bound it by the request ceiling
@@ -222,10 +257,16 @@ pub struct GraniteSpeech5Transcription {
     pub diagnostics: Option<serde_json::Value>,
 }
 
-/// The invocation state a load publishes for its atomic ASR graphs.
+/// The state a load publishes for its ASR graphs: retained decoder pages
+/// for the retained sequence graph (when it is offered), and invocation
+/// pages for the atomic graph.
 #[derive(Debug, Clone)]
 pub(crate) struct GraniteSpeech5PhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
+    pub(crate) retained: Option<InferenceStateContract>,
+    /// The longest retained sequence: the retained ceiling, within the
+    /// context.
+    pub(crate) retained_max_tokens: Option<usize>,
     pub(crate) invocation: InferenceStateContract,
 }
 
@@ -240,6 +281,7 @@ pub struct GraniteSpeech5AsrModel {
     prompt_tokenizer: GraniteSpeech5PromptTokenizer,
     preprocessor: GraniteSpeech5Preprocessor,
     runtime: GraniteSpeech5Runtime,
+    retained_decode: bool,
 }
 
 impl GraniteSpeech5AsrModel {
@@ -289,6 +331,7 @@ impl GraniteSpeech5AsrModel {
             prompt_tokenizer,
             preprocessor,
             runtime,
+            retained_decode: granite_speech5_retained_decode_enabled(),
         })
     }
 
@@ -333,9 +376,9 @@ impl GraniteSpeech5AsrModel {
         self.prompt_tokenizer.build_prompt(options)
     }
 
-    /// The invocation state for the loaded ASR capability's stage graphs:
-    /// each must be the single invocation stage, which leases one paged
-    /// decoder cache of the model's full context per chunk.
+    /// The state for the loaded ASR capability's stage graphs: retained
+    /// decoder pages for a retained sequence graph, and for the atomic graph
+    /// one paged decoder cache of the model's full context per invocation.
     pub(crate) fn physical_state_spec(
         &self,
         stage_graphs: &[&[StageDescriptor]],
@@ -345,8 +388,10 @@ impl GraniteSpeech5AsrModel {
             self.runtime.kv_dtype(),
             default_kv_page_size(),
         )?;
+        let retained = granite_speech5_retained_contract(invocation.clone())?;
         granite_speech5_physical_state_spec(
             stage_graphs,
+            retained,
             invocation,
             self.config.text_config.max_position_embeddings,
         )
@@ -441,6 +486,8 @@ impl GraniteSpeech5AsrModel {
         execution["encoder_weight_precision"] = self.runtime.encoder_precision().diagnostics();
         execution["lm_precision"] = self.runtime.lm_precision().diagnostics();
         execution["stop_check_interval"] = json!(stats.stop_check_interval);
+        execution["cuda_relpos_attention"] =
+            crate::kernels::relpos_attention::diagnostics(&self.device.device);
         json!({
             "family": "granite_speech5_asr",
             "dtype": format!("{:?}", self.dtype),
@@ -575,33 +622,127 @@ fn granite_speech5_invocation_contract(
     Ok(contract)
 }
 
+/// The retained route's decoder pages: the invocation contract's layout,
+/// retained across scheduler quanta with transactional checkpoints.
+fn granite_speech5_retained_contract(
+    mut contract: InferenceStateContract,
+) -> Result<InferenceStateContract> {
+    for domain in &mut contract.domains {
+        let StateDomainSpec::PagedAttention(domain) = domain else {
+            return Err(Error::ModelLoadError(
+                "Granite Speech 5.0 retained state must be paged attention".into(),
+            ));
+        };
+        domain.header.scope = StateScope::Retained;
+        domain.header.prefix = PrefixPolicy::Disabled;
+        domain.header.checkpoint = CheckpointPolicy::Transactional;
+    }
+    contract.validate()?;
+    Ok(contract)
+}
+
+/// One unbatched invocation stage: the atomic graph (the chunked stage
+/// every long file and, with the retained route off, every request runs).
+fn granite_speech5_atomic_graph(stages: &[StageDescriptor]) -> bool {
+    stages.len() == 1
+        && stages[0].batch_mode == crate::engine::NativeBatchMode::None
+        && !matches!(
+            stages[0].selector,
+            crate::engine::StageWorkSelector::SequencePrefill
+                | crate::engine::StageWorkSelector::SequenceDecode
+                | crate::engine::StageWorkSelector::PreSequencePreparation
+        )
+}
+
+/// The retained sequence graph a load may seal: encoder preparation (scalar,
+/// or static and padded across requests), scalar exact prefill, and
+/// continuous ragged decode priced per row.
+fn granite_speech5_retained_graph(stages: &[StageDescriptor]) -> bool {
+    use crate::engine::{ConcurrencyClass, NativeBatchMode, StageShapePolicy, StageWorkSelector};
+    let scalar_prefill = stages.iter().any(|stage| {
+        stage.selector == StageWorkSelector::SequencePrefill
+            && stage.batch_mode == NativeBatchMode::None
+            && stage.shape_policy == StageShapePolicy::Exact
+            && stage.concurrency == ConcurrencyClass::Exclusive
+            && stage.max_batch_size == 1
+    });
+    let preparation = stages.iter().any(|stage| {
+        if stage.selector != StageWorkSelector::PreSequencePreparation {
+            return false;
+        }
+        if stage.max_batch_size == 1 {
+            return stage.batch_mode == NativeBatchMode::None
+                && stage.shape_policy == StageShapePolicy::Exact
+                && stage.concurrency == ConcurrencyClass::Exclusive;
+        }
+        stage.batch_mode == NativeBatchMode::Static
+            && stage.shape_policy == StageShapePolicy::Padded
+            && stage.concurrency == ConcurrencyClass::Batchable
+            && stage.workspace_base_bytes == 0
+            && stage.workspace_per_row_bytes == 0
+            && stage.workspace_per_work_unit_bytes == 0
+            && stage.max_workspace_bytes > 0
+    });
+    let decode = stages.iter().any(|stage| {
+        let batch_workspace = u64::try_from(stage.max_batch_size)
+            .ok()
+            .and_then(|width| stage.workspace_per_row_bytes.checked_mul(width));
+        stage.selector == StageWorkSelector::SequenceDecode
+            && stage.batch_mode == NativeBatchMode::Continuous
+            && stage.shape_policy == StageShapePolicy::Ragged
+            && stage.concurrency == ConcurrencyClass::Batchable
+            && stage.max_batch_size > 0
+            && stage.workspace_base_bytes == 0
+            && stage.workspace_per_row_bytes > 0
+            && stage.workspace_per_work_unit_bytes == 0
+            && batch_workspace.is_some_and(|bytes| stage.max_workspace_bytes >= bytes)
+    });
+    stages.len() == 3 && preparation && scalar_prefill && decode
+}
+
 fn granite_speech5_physical_state_spec(
     stage_graphs: &[&[StageDescriptor]],
+    retained: InferenceStateContract,
     invocation: InferenceStateContract,
     max_context_tokens: usize,
 ) -> Result<GraniteSpeech5PhysicalStateSpec> {
     if stage_graphs.is_empty() || max_context_tokens == 0 {
         return Err(Error::ModelLoadError(
-            "Granite Speech 5.0 invocation state requires stages and a non-zero text context"
-                .into(),
+            "Granite Speech 5.0 state requires stages and a non-zero text context".into(),
         ));
     }
-    // One unbatched stage per graph: the chunked atomic ASR stage, one
-    // invocation per chunk of long audio. Sequence stages would need
-    // retained decoder state this family does not author.
-    let invocation_only = |stages: &[StageDescriptor]| {
-        stages.len() == 1
-            && stages[0].batch_mode == crate::engine::NativeBatchMode::None
-            && !matches!(
-                stages[0].selector,
-                crate::engine::StageWorkSelector::SequencePrefill
-                    | crate::engine::StageWorkSelector::SequenceDecode
-                    | crate::engine::StageWorkSelector::PreSequencePreparation
-            )
+    let atomic_graphs = stage_graphs
+        .iter()
+        .filter(|stages| granite_speech5_atomic_graph(stages))
+        .count();
+    let retained_graphs = stage_graphs
+        .iter()
+        .filter(|stages| {
+            stages.iter().any(|stage| {
+                matches!(
+                    stage.selector,
+                    crate::engine::StageWorkSelector::SequencePrefill
+                        | crate::engine::StageWorkSelector::SequenceDecode
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    // A retained graph needs the atomic graph beside it (long audio); with
+    // the retained route off, every graph is atomic and no retained state is
+    // authored (GRN-8).
+    let valid = if retained_graphs.is_empty() {
+        atomic_graphs == stage_graphs.len()
+    } else {
+        retained_graphs
+            .iter()
+            .all(|stages| granite_speech5_retained_graph(stages))
+            && atomic_graphs > 0
+            && retained_graphs.len() + atomic_graphs == stage_graphs.len()
     };
-    if !stage_graphs.iter().all(|stages| invocation_only(stages)) {
+    if !valid {
         return Err(Error::ModelLoadError(
-            "Granite Speech 5.0 ASR runs one unbatched invocation stage per graph".into(),
+            "Granite Speech 5.0 ASR runs its atomic graph, beside at most a retained graph of preparation, scalar exact prefill and continuous ragged decode"
+                .into(),
         ));
     }
     let max_tokens = u64::try_from(max_context_tokens)
@@ -616,54 +757,96 @@ fn granite_speech5_physical_state_spec(
         })?;
     let mut profiles = Vec::with_capacity(stage_graphs.len());
     for stages in stage_graphs {
-        let stage = &stages[0];
-        let mut domains = invocation
-            .domains
-            .iter()
-            .cloned()
-            .map(|state| {
-                Ok(InvocationWorkspaceDomain::State {
-                    placement: state.header().placement,
+        let atomic = granite_speech5_atomic_graph(stages);
+        let mut ordered = stages.iter().collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|stage| stage.id);
+        let mut invocation_stages = Vec::with_capacity(ordered.len());
+        for (index, stage) in ordered.into_iter().enumerate() {
+            // Only the atomic graph leases invocation pages; the retained
+            // graph's stages lease scratch beside the retained pages.
+            let mut domains = if atomic {
+                invocation
+                    .domains
+                    .iter()
+                    .cloned()
+                    .map(|state| {
+                        Ok(InvocationWorkspaceDomain::State {
+                            placement: state.header().placement,
+                            formula: WorkspaceFormula {
+                                fixed_bytes: paged_invocation_bytes(&state, max_tokens)?,
+                                dimensions: vec![],
+                                terms: vec![],
+                            },
+                            state,
+                            capacity: InvocationStateCapacity::decoder_context(max_tokens)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
+            if stage.max_workspace_bytes > 0 {
+                let scratch_bytes = if stage.workspace_per_row_bytes > 0 {
+                    stage.workspace_per_row_bytes
+                } else {
+                    stage.max_workspace_bytes
+                };
+                let scratch_id = u32::try_from(index + 1)
+                    .ok()
+                    .and_then(|offset| max_domain_id.checked_add(offset))
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(
+                            "Granite Speech 5.0 scratch domain id overflow".into(),
+                        )
+                    })?;
+                domains.push(InvocationWorkspaceDomain::Scratch {
+                    id: StateDomainId::new(scratch_id),
+                    placement: PlacementPolicy::BackendLocal,
+                    alignment_bytes: 64,
+                    zero_on_release: false,
                     formula: WorkspaceFormula {
-                        fixed_bytes: paged_invocation_bytes(&state, max_tokens)?,
+                        fixed_bytes: scratch_bytes,
                         dimensions: vec![],
                         terms: vec![],
                     },
-                    state,
-                    capacity: InvocationStateCapacity::decoder_context(max_tokens)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if stage.max_workspace_bytes > 0 {
-            domains.push(InvocationWorkspaceDomain::Scratch {
-                id: StateDomainId::new(max_domain_id.checked_add(1).ok_or_else(|| {
-                    Error::ModelLoadError("Granite Speech 5.0 scratch domain id overflow".into())
-                })?),
-                placement: PlacementPolicy::BackendLocal,
-                alignment_bytes: 64,
-                zero_on_release: false,
-                formula: WorkspaceFormula {
-                    fixed_bytes: stage.max_workspace_bytes,
-                    dimensions: vec![],
-                    terms: vec![],
+                });
+            }
+            invocation_stages.push(InvocationStageWorkspace {
+                stage: stage.id,
+                lease_scope: if stage.selector
+                    == crate::engine::StageWorkSelector::PreSequencePreparation
+                    && stage.batch_mode == crate::engine::NativeBatchMode::Static
+                    && stage.workspace_per_row_bytes == 0
+                {
+                    InvocationLeaseScope::PerStageBatch
+                } else {
+                    InvocationLeaseScope::PerRow
                 },
+                groups: if atomic {
+                    invocation.groups.clone()
+                } else {
+                    Vec::new()
+                },
+                domains,
             });
         }
         profiles.push(InvocationWorkspaceProfile {
             stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
-            stages: vec![InvocationStageWorkspace {
-                stage: stage.id,
-                lease_scope: InvocationLeaseScope::PerRow,
-                groups: invocation.groups.clone(),
-                domains,
-            }],
+            stages: invocation_stages,
         });
     }
     profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
     profiles.dedup();
+    let uses_retained = !retained_graphs.is_empty();
     let descriptor = CapabilityStateDescriptorV2 {
         abi: CURRENT_INFERENCE_STATE_ABI,
-        retained: RetainedStateCapability::Stateless,
+        retained: if uses_retained {
+            RetainedStateCapability::Managed {
+                contract: retained.clone(),
+            }
+        } else {
+            RetainedStateCapability::Stateless
+        },
         invocation: InvocationWorkspaceSet::Bounded { profiles },
     };
     for stages in stage_graphs {
@@ -671,8 +854,25 @@ fn granite_speech5_physical_state_spec(
     }
     Ok(GraniteSpeech5PhysicalStateSpec {
         descriptor,
+        retained: uses_retained.then_some(retained),
+        // A retained sequence never outgrows the retained ceiling:
+        // preparation sends longer requests to the atomic graph.
+        retained_max_tokens: uses_retained
+            .then_some(max_context_tokens.min(GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS)),
         invocation,
     })
+}
+
+/// The physical state a Granite Speech 5.0 load authors for `stage_graphs`,
+/// on the test decoder geometry instead of a checkpoint's, so a bundle test
+/// can publish and seal exactly what a load would.
+#[cfg(test)]
+pub(crate) fn granite_speech5_test_physical_state_spec(
+    stage_graphs: &[&[StageDescriptor]],
+) -> Result<GraniteSpeech5PhysicalStateSpec> {
+    let invocation = tests::test_invocation_contract();
+    let retained = granite_speech5_retained_contract(invocation.clone())?;
+    granite_speech5_physical_state_spec(stage_graphs, retained, invocation, 128)
 }
 
 fn paged_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> Result<u64> {
@@ -782,6 +982,19 @@ mod tests {
     }
 
     #[test]
+    fn retained_sequences_hold_the_longest_automatic_segment() {
+        assert_eq!(
+            GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS,
+            crate::runtime::asr_sequence_ceiling(
+                crate::runtime::ASR_TEXT_PROMPT_TOKEN_RESERVE,
+                GRANITE_SPEECH5_AUDIO_TOKENS_PER_SECOND,
+                GRANITE_SPEECH5_MAX_AUDIO_SECONDS,
+                granite_speech5_auto_max_tokens_for_duration(GRANITE_SPEECH5_MAX_AUDIO_SECONDS),
+            )
+        );
+    }
+
+    #[test]
     fn invocation_state_leases_the_full_16k_context_of_paged_kv() {
         let config = published_config();
         let invocation =
@@ -802,13 +1015,16 @@ mod tests {
         );
 
         let stage = atomic_stage(0);
+        let retained = granite_speech5_retained_contract(invocation.clone()).unwrap();
         let spec = granite_speech5_physical_state_spec(
             &[std::slice::from_ref(&stage)],
+            retained,
             invocation,
             config.text_config.max_position_embeddings,
         )
         .unwrap();
         assert_eq!(spec.descriptor.retained, RetainedStateCapability::Stateless);
+        assert!(spec.retained.is_none() && spec.retained_max_tokens.is_none());
     }
 
     #[test]
@@ -817,24 +1033,204 @@ mod tests {
         let invocation =
             granite_speech5_invocation_contract(&config, DType::F32, default_kv_page_size())
                 .unwrap();
+        let retained = granite_speech5_retained_contract(invocation.clone()).unwrap();
         let mut sequence = atomic_stage(0);
         sequence.selector = StageWorkSelector::SequenceDecode;
         assert!(granite_speech5_physical_state_spec(
             &[std::slice::from_ref(&sequence)],
+            retained.clone(),
             invocation.clone(),
             16_384
         )
         .is_err());
-        assert!(granite_speech5_physical_state_spec(&[], invocation.clone(), 16_384).is_err());
+        assert!(granite_speech5_physical_state_spec(
+            &[],
+            retained.clone(),
+            invocation.clone(),
+            16_384
+        )
+        .is_err());
         // The scalar adapter's stage selects any work.
         let mut scalar = atomic_stage(0);
         scalar.selector = StageWorkSelector::Any;
         assert!(granite_speech5_physical_state_spec(
             &[std::slice::from_ref(&scalar)],
+            retained,
             invocation,
             16_384
         )
         .is_ok());
+    }
+
+    pub(super) fn test_invocation_contract() -> InferenceStateContract {
+        let mut contract = crate::kv::v2::test_contract();
+        for domain in &mut contract.domains {
+            let StateDomainSpec::PagedAttention(domain) = domain else {
+                panic!("test contract must be paged attention")
+            };
+            domain.header.scope = StateScope::Invocation;
+            domain.header.checkpoint = CheckpointPolicy::None;
+            domain.header.prefix = PrefixPolicy::Disabled;
+        }
+        for group in &mut contract.groups {
+            group.prefix_shareable = false;
+        }
+        contract.validate().unwrap();
+        contract
+    }
+
+    fn sequence_stage(id: u32, selector: StageWorkSelector) -> StageDescriptor {
+        let mut profile = ExecutionProfile::fail_closed(
+            crate::backends::BackendKind::Cpu,
+            None,
+            ExecutionMode::Sequence,
+        );
+        let batch_mode = match selector {
+            StageWorkSelector::SequenceDecode => {
+                profile.max_batch_size = 4;
+                crate::engine::NativeBatchMode::Continuous
+            }
+            _ => {
+                profile.max_batch_size = 1;
+                crate::engine::NativeBatchMode::None
+            }
+        };
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(id),
+            format!("granite_speech5.test.{id}"),
+            &profile,
+            batch_mode,
+        );
+        stage.selector = selector;
+        if selector == StageWorkSelector::SequenceDecode {
+            stage.workspace_per_row_bytes = 16;
+            stage.max_workspace_bytes = 64;
+        }
+        stage
+    }
+
+    fn static_preparation_stage(id: u32) -> StageDescriptor {
+        let mut profile = ExecutionProfile::fail_closed(
+            crate::backends::BackendKind::Cpu,
+            None,
+            ExecutionMode::Sequence,
+        );
+        profile.max_batch_size = 4;
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(id),
+            format!("granite_speech5.test.{id}"),
+            &profile,
+            crate::engine::NativeBatchMode::Static,
+        );
+        stage.selector = StageWorkSelector::PreSequencePreparation;
+        stage.max_workspace_bytes = 128;
+        stage
+    }
+
+    /// The retained graph authors managed decoder pages and leases no
+    /// invocation pages; the atomic graph beside it leases them as before.
+    #[test]
+    fn physical_state_separates_the_retained_and_atomic_graphs() {
+        let normal = vec![
+            sequence_stage(0, StageWorkSelector::PreSequencePreparation),
+            sequence_stage(1, StageWorkSelector::SequencePrefill),
+            sequence_stage(2, StageWorkSelector::SequenceDecode),
+        ];
+        let batched = vec![
+            static_preparation_stage(0),
+            sequence_stage(1, StageWorkSelector::SequencePrefill),
+            sequence_stage(2, StageWorkSelector::SequenceDecode),
+        ];
+        let atomic = vec![atomic_stage(0)];
+        let spec = granite_speech5_test_physical_state_spec(&[
+            normal.as_slice(),
+            batched.as_slice(),
+            atomic.as_slice(),
+            atomic.as_slice(),
+        ])
+        .unwrap();
+        assert!(spec.retained.is_some());
+        assert_eq!(spec.retained_max_tokens, Some(128));
+        assert!(matches!(
+            spec.descriptor.retained,
+            RetainedStateCapability::Managed { .. }
+        ));
+        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
+            panic!("bounded invocation profiles")
+        };
+        for (graph, leases_invocation_pages) in
+            [(&normal, false), (&batched, false), (&atomic, true)]
+        {
+            let fingerprint = stage_graph_fingerprint(graph).unwrap();
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.stage_graph_fingerprint == fingerprint)
+                .unwrap();
+            assert!(profile
+                .stages
+                .iter()
+                .all(|stage| stage.groups.is_empty() != leases_invocation_pages));
+        }
+        let batched_preparation = profiles
+            .iter()
+            .find(|profile| {
+                profile.stage_graph_fingerprint == stage_graph_fingerprint(&batched).unwrap()
+            })
+            .unwrap();
+        assert_eq!(
+            batched_preparation.stages[0].lease_scope,
+            InvocationLeaseScope::PerStageBatch
+        );
+    }
+
+    /// The published checkpoint's retained sequences are bounded by the
+    /// retained ceiling, not its 16k context, which stays the atomic
+    /// graph's invocation bound.
+    #[test]
+    fn retained_sequences_are_bounded_by_the_retained_ceiling() {
+        let config = published_config();
+        let invocation =
+            granite_speech5_invocation_contract(&config, DType::F16, default_kv_page_size())
+                .unwrap();
+        let retained = granite_speech5_retained_contract(invocation.clone()).unwrap();
+        let normal = vec![
+            sequence_stage(0, StageWorkSelector::PreSequencePreparation),
+            sequence_stage(1, StageWorkSelector::SequencePrefill),
+            sequence_stage(2, StageWorkSelector::SequenceDecode),
+        ];
+        let atomic = vec![atomic_stage(0)];
+        let spec = granite_speech5_physical_state_spec(
+            &[normal.as_slice(), atomic.as_slice()],
+            retained,
+            invocation,
+            config.text_config.max_position_embeddings,
+        )
+        .unwrap();
+        assert_eq!(
+            spec.retained_max_tokens,
+            Some(GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS)
+        );
+    }
+
+    /// With the retained route off the capability offers only its atomic
+    /// graph and authors no retained state (GRN-8); a retained graph needs
+    /// its atomic graph beside it and all three stages.
+    #[test]
+    fn atomic_only_graphs_author_no_retained_state_and_incomplete_graphs_fail() {
+        let atomic = vec![atomic_stage(0)];
+        let spec = granite_speech5_test_physical_state_spec(&[atomic.as_slice()]).unwrap();
+        assert!(spec.retained.is_none());
+        assert_eq!(spec.descriptor.retained, RetainedStateCapability::Stateless);
+        let normal = vec![
+            sequence_stage(0, StageWorkSelector::PreSequencePreparation),
+            sequence_stage(1, StageWorkSelector::SequencePrefill),
+            sequence_stage(2, StageWorkSelector::SequenceDecode),
+        ];
+        assert!(granite_speech5_test_physical_state_spec(&[normal.as_slice()]).is_err());
+        let incomplete = &normal[..2];
+        assert!(
+            granite_speech5_test_physical_state_spec(&[incomplete, atomic.as_slice()]).is_err()
+        );
     }
 
     #[test]

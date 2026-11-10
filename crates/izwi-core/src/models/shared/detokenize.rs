@@ -52,6 +52,7 @@ impl IncrementalDetokenizer {
         tokens: &[T],
         mut decode: impl FnMut(&[T]) -> Result<String>,
     ) -> Result<String> {
+        let _detok = crate::engine::metrics::asr_detok_scope();
         self.check_len(tokens)?;
         if tokens.len() == self.read_offset {
             return Ok(String::new());
@@ -79,6 +80,7 @@ impl IncrementalDetokenizer {
         tokens: &[T],
         mut decode: impl FnMut(&[T]) -> Result<String>,
     ) -> Result<String> {
+        let _detok = crate::engine::metrics::asr_detok_scope();
         self.check_len(tokens)?;
         if tokens.len() == self.read_offset {
             return Ok(String::new());

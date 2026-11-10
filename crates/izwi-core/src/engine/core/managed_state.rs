@@ -290,6 +290,33 @@ impl EngineCore {
         )
     }
 
+    /// [`Self::load_managed_model_state`] staging `staged_rows` transactions
+    /// instead of the engine's: a TTS decode certified wider than the engine
+    /// rows (`catalog::tts_decode_width`) stages one launch at its own width.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_managed_model_state_with_staged_rows(
+        &mut self,
+        model_instance: super::super::ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        logical_context_tokens: Option<usize>,
+        staged_rows: usize,
+        minimum_tokens: u64,
+        reserve: StateFitReserve,
+        later_minimum_bytes: u64,
+    ) -> Result<Arc<super::super::ManagedKvModelRuntime>> {
+        let retained_rows = self.config.max_retained_sequences;
+        self.load_managed_model_state_with_portable_copies_and_rows(
+            model_instance,
+            retained_state,
+            logical_context_tokens,
+            1,
+            (retained_rows, staged_rows.clamp(1, retained_rows.max(1))),
+            minimum_tokens,
+            reserve,
+            later_minimum_bytes,
+        )
+    }
+
     /// What `retained_state` takes at `minimum_tokens` per sequence on the
     /// engine's own rows, priced as the live retained fit of
     /// [`Self::load_managed_model_state`] prices it, so pre-load admission
@@ -359,15 +386,77 @@ impl EngineCore {
         retained_state: &crate::kv::v2::InferenceStateContract,
         logical_context_tokens: Option<usize>,
         portable_state_copies: u32,
-        (retained_rows, staged_rows): (usize, usize),
+        rows: (usize, usize),
         minimum_tokens: u64,
         reserve: StateFitReserve,
         later_minimum_bytes: u64,
     ) -> Result<Arc<super::super::ManagedKvModelRuntime>> {
+        self.load_retained_state_with_rows(
+            model_instance,
+            retained_state,
+            logical_context_tokens,
+            portable_state_copies,
+            rows,
+            minimum_tokens,
+            reserve,
+            later_minimum_bytes,
+            false,
+        )
+    }
+
+    /// [`Self::load_managed_model_state_with_portable_copies_and_rows`] for a
+    /// pool the caller already sized across its rows (`pool_tokens`, one
+    /// automatic sequence per row): the arena reaches `pool_tokens` as given,
+    /// neither pooled again nor refitted, and a sequence may claim all of it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_pooled_managed_model_state_with_portable_copies(
+        &mut self,
+        model_instance: super::super::ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        pool_tokens: usize,
+        portable_state_copies: u32,
+        rows: (usize, usize),
+        minimum_tokens: u64,
+        reserve: StateFitReserve,
+    ) -> Result<Arc<super::super::ManagedKvModelRuntime>> {
+        self.load_retained_state_with_rows(
+            model_instance,
+            retained_state,
+            Some(pool_tokens),
+            portable_state_copies,
+            rows,
+            minimum_tokens,
+            reserve,
+            0,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_retained_state_with_rows(
+        &mut self,
+        model_instance: super::super::ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        logical_context_tokens: Option<usize>,
+        portable_state_copies: u32,
+        (retained_rows, staged_rows): (usize, usize),
+        minimum_tokens: u64,
+        reserve: StateFitReserve,
+        later_minimum_bytes: u64,
+        pre_pooled: bool,
+    ) -> Result<Arc<super::super::ManagedKvModelRuntime>> {
+        // An automatic staged limit is sized for the engine rows' launch
+        // width; an ASR decode fitted wider stages its own launch width,
+        // bounded by its retained rows instead.
+        let staged_ceiling = if self.config.automatic_row_limits.staged_transactions {
+            self.config.max_retained_sequences
+        } else {
+            self.config.max_staged_transactions
+        };
         if retained_rows == 0
             || staged_rows == 0
             || retained_rows > self.config.max_retained_sequences
-            || staged_rows > self.config.max_staged_transactions
+            || staged_rows > staged_ceiling
         {
             return Err(Error::ModelLoadError(
                 "retained state row limits exceed configured capacity".into(),
@@ -380,6 +469,22 @@ impl EngineCore {
         {
             return Ok(runtime);
         }
+        // The arena's pages are its logical reach divided by the page size,
+        // shared by every row, so a one-context reach ran a model one request
+        // at a time once a request's prompt-plus-output claim took most of it
+        // (Maya1). As for chat, the arena pools a context per sequence the
+        // memory holds, and each request is held to one context (below).
+        // Single-user portable state keeps one context: its arena is
+        // resident from load.
+        let pool_context = logical_context_tokens.map(|context| {
+            if pre_pooled {
+                context
+            } else if self.config.portable_context_auto && backend != BackendKind::Cuda {
+                portable_pool_tokens(context, self.config.max_num_seqs)
+            } else {
+                context
+            }
+        });
         // ASR and TTS retained state fit within live memory so the requests
         // they serve can run beside them; the floor is admitted against
         // planning headroom.
@@ -387,7 +492,7 @@ impl EngineCore {
             backend,
             model_instance,
             retained_state,
-            logical_context_tokens,
+            pool_context,
             portable_state_copies,
             (retained_rows, staged_rows),
             PortableFitHeadroom::Live {
@@ -396,24 +501,48 @@ impl EngineCore {
                 later_minimum_bytes,
             },
         )?;
+        let mut capacity = ManagedStateCapacityRequest {
+            total_paged_pages: u32::try_from(self.config.max_blocks)
+                .map_err(|_| Error::InvalidInput("managed KV page budget exceeds u32".into()))?,
+            logical_token_reach,
+            retained_sequence_rows: u32::try_from(retained_rows).map_err(|_| {
+                Error::InvalidInput("managed state sequence limit exceeds u32".into())
+            })?,
+            staged_transaction_rows: u32::try_from(staged_rows).map_err(|_| {
+                Error::InvalidInput("managed state transaction limit exceeds u32".into())
+            })?,
+        };
+        if backend == BackendKind::Cuda && !pre_pooled {
+            if let Some(per_sequence) = logical_token_reach {
+                capacity.logical_token_reach =
+                    Some(self.managed_kv_cache.fit_cuda_retained_pool_tokens(
+                        model_instance,
+                        retained_state,
+                        per_sequence,
+                        capacity,
+                        self.config.block_size,
+                        self.config.cuda_state_budget_fraction,
+                    )?);
+            }
+        }
         let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
             model_instance,
             backend,
-            ManagedStateCapacityRequest {
-                total_paged_pages: u32::try_from(self.config.max_blocks).map_err(|_| {
-                    Error::InvalidInput("managed KV page budget exceeds u32".into())
-                })?,
-                logical_token_reach,
-                retained_sequence_rows: u32::try_from(retained_rows).map_err(|_| {
-                    Error::InvalidInput("managed state sequence limit exceeds u32".into())
-                })?,
-                staged_transaction_rows: u32::try_from(staged_rows).map_err(|_| {
-                    Error::InvalidInput("managed state transaction limit exceeds u32".into())
-                })?,
-            },
+            capacity,
             self.config.block_size,
             retained_state,
         )?;
+        if let Some(context) = logical_context_tokens.filter(|_| !pre_pooled) {
+            // CUDA's per-sequence context was already bounded by the
+            // configured maximum (`resolve_managed_token_reach`).
+            let context = if backend == BackendKind::Cuda {
+                context.min(self.config.max_seq_len)
+            } else {
+                context
+            };
+            runtime
+                .set_maximum_sequence_tokens((context as u64).min(runtime.logical_token_reach()));
+        }
         runtime.synchronize_backing()?;
         Ok(runtime)
     }
@@ -489,6 +618,7 @@ impl EngineCore {
         full_contract: &crate::kv::v2::InferenceStateContract,
         static_domain: crate::kv::v2::StateDomainId,
         logical_context_tokens: Option<usize>,
+        (retained_rows, staged_rows): (usize, usize),
         minimum_tokens: u64,
     ) -> Result<Arc<CompositeRetainedStateRuntimeV2>> {
         if self.composite_retained_state.contains_key(&model_instance) {
@@ -496,13 +626,31 @@ impl EngineCore {
                 "composite retained state already owns this model generation".into(),
             ));
         }
+        // An automatic staged limit is sized for the engine rows' launch
+        // width; a decode fitted wider stages its own launch width, bounded
+        // by its retained rows instead.
+        let staged_ceiling = if self.config.automatic_row_limits.staged_transactions {
+            self.config.max_retained_sequences
+        } else {
+            self.config.max_staged_transactions
+        };
+        if retained_rows == 0
+            || staged_rows == 0
+            || retained_rows > self.config.max_retained_sequences
+            || staged_rows > staged_ceiling
+        {
+            return Err(Error::ModelLoadError(
+                "composite retained state row limits exceed configured capacity".into(),
+            ));
+        }
         let backend = self.managed_kv_cache.worker_backend();
-        let logical_token_reach = self.resolve_managed_token_reach_for_contract(
+        let logical_token_reach = self.resolve_managed_token_reach_for_contract_with_rows(
             backend,
             model_instance,
             &project_composite_paged_contract(full_contract, static_domain)?,
             logical_context_tokens,
             1,
+            (retained_rows, staged_rows),
             // Whisper's decoder state: ASR, fitted within live memory. Its
             // load reconciles observed weight growth.
             PortableFitHeadroom::Live {
@@ -511,7 +659,7 @@ impl EngineCore {
                 later_minimum_bytes: 0,
             },
         )?;
-        let sequence_capacity = u32::try_from(self.config.max_retained_sequences)
+        let sequence_capacity = u32::try_from(retained_rows)
             .map_err(|_| Error::InvalidInput("managed state sequence limit exceeds u32".into()))?;
         let runtime = allocate_composite_retained_state(
             &mut self.managed_kv_cache,
@@ -524,10 +672,9 @@ impl EngineCore {
                 })?,
                 logical_token_reach,
                 retained_sequence_rows: sequence_capacity,
-                staged_transaction_rows: u32::try_from(self.config.max_staged_transactions)
-                    .map_err(|_| {
-                        Error::InvalidInput("managed state transaction limit exceeds u32".into())
-                    })?,
+                staged_transaction_rows: u32::try_from(staged_rows).map_err(|_| {
+                    Error::InvalidInput("managed state transaction limit exceeds u32".into())
+                })?,
             },
             self.config.block_size,
             full_contract,

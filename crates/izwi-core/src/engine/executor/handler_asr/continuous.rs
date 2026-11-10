@@ -1,19 +1,33 @@
 //! Continuous ASR decode: one batched decode step over retained rows,
-//! dispatching LFM2.5-Audio and Parakeet rows to their own batches.
+//! dispatching LFM2.5-Audio, Parakeet, Nemotron, Whisper and Voxtral rows to
+//! their own batches.
 
 use super::*;
 
-pub(super) fn validate_continuous_asr_batch_shape(scheduled: &[ScheduledRequest]) -> Result<()> {
+/// A continuous ASR batch is decode rows of one token each, or for the
+/// transducer families (`quanta`: Parakeet and Nemotron ASR, whose retained
+/// steps emit up to a row's scheduled tokens) of at least one.
+pub(super) fn validate_continuous_asr_batch_shape(
+    scheduled: &[ScheduledRequest],
+    quanta: bool,
+) -> Result<()> {
     if scheduled.is_empty()
-        || scheduled
-            .iter()
-            .any(|scheduled| scheduled.is_prefill || scheduled.num_tokens != 1)
+        || scheduled.iter().any(|scheduled| {
+            scheduled.is_prefill
+                || scheduled.num_tokens == 0
+                || (!quanta && scheduled.num_tokens != 1)
+        })
     {
         return Err(Error::InvalidInput(
             "continuous ASR execution requires one decode token per row".to_string(),
         ));
     }
     Ok(())
+}
+
+/// Whether a continuous ASR batch's family takes several tokens per row.
+fn decodes_transducer_quanta(family: ModelFamily) -> bool {
+    matches!(family, ModelFamily::ParakeetAsr | ModelFamily::NemotronAsr)
 }
 
 pub(super) struct ContinuousAsrStateBatch<'a> {
@@ -111,7 +125,16 @@ impl NativeExecutor {
         scheduled: &[ScheduledRequest],
         managed_caches: Vec<Option<super::super::RetainedRowManagedState>>,
     ) -> Result<Vec<ModelSessionResult>> {
-        validate_continuous_asr_batch_shape(scheduled)?;
+        let quanta = scheduled
+            .first()
+            .and_then(|first| {
+                requests
+                    .iter()
+                    .find(|request| request.id == first.request_id)
+            })
+            .and_then(|request| Self::resolve_variant(request).ok())
+            .is_some_and(|variant| decodes_transducer_quanta(variant.family()));
+        validate_continuous_asr_batch_shape(scheduled, quanta)?;
         if managed_caches.len() != scheduled.len() {
             return Err(Error::InvalidInput(
                 "continuous ASR managed-cache rows do not match batch width".to_string(),
@@ -194,6 +217,33 @@ impl NativeExecutor {
                 managed_caches,
             );
         }
+        if Self::resolve_variant(ordered_requests[live_indices[0]])?.family()
+            == ModelFamily::WhisperAsr
+        {
+            return self.whisper_asr_decode_batch_with_managed(
+                &ordered_requests,
+                scheduled,
+                managed_caches,
+            );
+        }
+        if Self::resolve_variant(ordered_requests[live_indices[0]])?.family()
+            == ModelFamily::Voxtral
+        {
+            return self.voxtral_asr_decode_batch_with_managed(
+                &ordered_requests,
+                scheduled,
+                managed_caches,
+            );
+        }
+        if Self::resolve_variant(ordered_requests[live_indices[0]])?.family()
+            == ModelFamily::NemotronAsr
+        {
+            return self.nemotron_asr_decode_batch_with_managed(
+                &ordered_requests,
+                scheduled,
+                managed_caches,
+            );
+        }
 
         let model = ordered_requests[live_indices[0]]
             .prepared_asr_model_for_executor()?
@@ -205,7 +255,10 @@ impl NativeExecutor {
         let batch_family = Self::resolve_variant(ordered_requests[live_indices[0]])?.family();
         if !matches!(
             batch_family,
-            ModelFamily::Qwen3Asr | ModelFamily::VibeVoiceAsr | ModelFamily::GraniteSpeechAsr
+            ModelFamily::Qwen3Asr
+                | ModelFamily::VibeVoiceAsr
+                | ModelFamily::GraniteSpeechAsr
+                | ModelFamily::GraniteSpeech5Asr
         ) {
             return Err(Error::InvalidInput(
                 "continuous ASR batch contains a model without retained tensor decode".into(),
@@ -335,6 +388,7 @@ impl NativeExecutor {
             .map(|(_, _, lease, _)| lease.require_state_mut().map(|state| &mut state.state))
             .collect::<Result<Vec<_>>>()?;
         let live_width = state_refs.len();
+        let decode_started = std::time::Instant::now();
         let steps = if state_refs.is_empty() {
             Vec::new()
         } else if state_refs.len() == 1 {
@@ -343,6 +397,14 @@ impl NativeExecutor {
             Self::run_blocking(|| model.decode_step_batch(&mut state_refs))?
         };
         drop(state_refs);
+        let decode_elapsed = decode_started.elapsed();
+        for row in &call_rows {
+            active_states.rows[*row]
+                .2
+                .require_state_mut()?
+                .clock
+                .record_decode(decode_elapsed);
+        }
         // One native batch call may outlive cancellation of any subset of its
         // rows. Observe every row before staging tensor state, emitting text,
         // or detaching write completions while all checkpoints remain armed.
@@ -425,8 +487,24 @@ impl NativeExecutor {
                 continue;
             }
 
-            let (step_tokens_generated, input_sample_rate, input_sample_count, stream_result) = {
+            let (
+                step_tokens_generated,
+                input_sample_rate,
+                input_sample_count,
+                stream_result,
+                diagnostics,
+            ) = {
                 let active_state = active_states.rows[row].2.require_state_mut()?;
+                // A finishing row publishes its diagnostics once.
+                let diagnostics = step.finished.then(|| {
+                    let mut diagnostics = active_state.state.retained_terminal_diagnostics();
+                    if let (Some(diagnostics), Some(graph)) =
+                        (diagnostics.as_mut(), model.decode_graph_diagnostics())
+                    {
+                        diagnostics["decode_graph"] = graph;
+                    }
+                    active_state.clock.diagnostics(diagnostics)
+                });
                 let step_tokens_generated = step
                     .tokens_generated
                     .saturating_sub(active_state.last_tokens_generated);
@@ -459,6 +537,7 @@ impl NativeExecutor {
                     active_state.input_sample_rate,
                     active_state.input_sample_count,
                     stream_result,
+                    diagnostics,
                 )
             };
             if let Err(error) = stream_result {
@@ -511,7 +590,7 @@ impl NativeExecutor {
                     tokens_generated: step_tokens_generated,
                     finished: step.finished,
                     phase_timing_override: None,
-                    asr_diagnostics: None,
+                    asr_diagnostics: diagnostics,
                     error: None,
                     logprobs: Vec::new(),
                 })

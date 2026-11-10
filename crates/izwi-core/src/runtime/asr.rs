@@ -73,6 +73,7 @@ use crate::serve_runtime::{
 };
 use izwi_asr_toolkit::{clean_transcript_text, plan_audio_chunks, AsrLongFormConfig, AudioChunk};
 
+mod chunk_rows;
 mod realtime;
 mod realtime_push;
 mod realtime_session;
@@ -80,6 +81,7 @@ mod saa_seam;
 mod speaker_attribution;
 mod transcribe;
 mod translation_segments;
+pub(crate) use chunk_rows::chunk_row_permit_count;
 #[cfg(test)]
 pub(in crate::runtime) use translation_segments::{append_segment, plan_translation_segments, segment_wav};
 use realtime_push::{RealtimePush, RealtimePushBatcher, RealtimePushHolds, RealtimePushRow};
@@ -117,11 +119,15 @@ use speaker_attribution::{
 pub(super) enum AsrAudioInput<'a> {
     Base64(&'a str),
     Bytes(&'a [u8]),
+    /// Canonical 16 kHz mono samples already decoded (a long file's chunk
+    /// row), which the request neither encodes nor decodes.
+    Samples(&'a Arc<[f32]>),
 }
 
 enum OwnedAsrAudioInput {
     Base64(String),
     Bytes(Vec<u8>),
+    Samples(Arc<[f32]>),
 }
 
 impl AsrAudioInput<'_> {
@@ -129,6 +135,7 @@ impl AsrAudioInput<'_> {
         match self {
             Self::Base64(audio) => audio.len(),
             Self::Bytes(audio) => audio.len(),
+            Self::Samples(samples) => std::mem::size_of_val::<[f32]>(samples),
         }
     }
 
@@ -147,6 +154,16 @@ impl AsrAudioInput<'_> {
                 )))
             }
             Self::Bytes(_) => Ok(()),
+            Self::Samples(samples) if samples.is_empty() => Err(Error::InvalidInput(
+                "ASR request missing audio samples".to_string(),
+            )),
+            Self::Samples(samples) if self.input_bytes() > MAX_AUDIO_SOURCE_BYTES => {
+                Err(Error::InvalidInput(format!(
+                    "ASR audio is {} samples, exceeding the {MAX_AUDIO_SOURCE_BYTES}-byte source limit",
+                    samples.len()
+                )))
+            }
+            Self::Samples(_) => Ok(()),
         }
     }
 
@@ -158,6 +175,8 @@ impl AsrAudioInput<'_> {
             Self::Bytes(audio) => Ok(OwnedAsrAudioInput::Bytes(
                 copy_preparation_bytes(job, audio, "ASR encoded audio").await?,
             )),
+            // Shared, not copied: the caller hands over its own buffer.
+            Self::Samples(samples) => Ok(OwnedAsrAudioInput::Samples(samples.clone())),
         }
     }
 }
@@ -167,6 +186,7 @@ impl OwnedAsrAudioInput {
         match self {
             Self::Base64(audio) => audio.capacity(),
             Self::Bytes(audio) => audio.capacity(),
+            Self::Samples(samples) => std::mem::size_of_val::<[f32]>(samples),
         }
     }
 
@@ -177,6 +197,10 @@ impl OwnedAsrAudioInput {
                 decode_audio_bytes_canonical(&audio)
             }
             Self::Bytes(audio) => decode_audio_bytes_canonical(audio),
+            Self::Samples(samples) => Ok((
+                samples.to_vec(),
+                crate::runtime::audio_io::CANONICAL_SPEECH_SAMPLE_RATE,
+            )),
         }
     }
 
@@ -191,7 +215,7 @@ impl OwnedAsrAudioInput {
                     audio.len()
                 )))
             }
-            Self::Bytes(_) => Ok(()),
+            Self::Bytes(_) | Self::Samples(_) => Ok(()),
         }
     }
 }
@@ -269,17 +293,31 @@ pub(crate) fn asr_sequence_ceiling(
 
 /// `(sequence, retained)` token bounds of an automatic ASR context: one
 /// `sequence_ceiling` per sequence, and one per concurrent sequence in the
-/// shared retained pool, never above the model's native context.
+/// shared retained pool, in whole `page_tokens` pages
+/// ([`asr_pool_sequence_tokens`]), never above the model's native context.
 pub(crate) fn asr_automatic_context(
     native_tokens: usize,
     sequence_ceiling: usize,
     retained_rows: usize,
+    page_tokens: usize,
 ) -> (usize, usize) {
     let sequence = sequence_ceiling.min(native_tokens);
-    let retained = sequence
+    let retained = asr_pool_sequence_tokens(sequence, page_tokens)
         .saturating_mul(retained_rows.max(1))
         .min(native_tokens);
     (sequence, retained)
+}
+
+/// What one sequence of up to `sequence_tokens` takes from a shared retained
+/// pool of `page_tokens` pages: admission claims a sequence's prompt and
+/// budget in whole pages, so a pool sized in unrounded sequences is short a
+/// row once the rounding adds up (32 Qwen3-ASR rows of 1,307 tokens claim
+/// 672 pages of 64; 32 x 1,307 tokens are 654).
+pub(crate) fn asr_pool_sequence_tokens(sequence_tokens: usize, page_tokens: usize) -> usize {
+    let page_tokens = page_tokens.max(1);
+    sequence_tokens
+        .div_ceil(page_tokens)
+        .saturating_mul(page_tokens)
 }
 
 /// Smallest audio duration in seconds an invocation chunk planner will still
@@ -669,9 +707,9 @@ fn apply_asr_max_tokens(
     }
 }
 
-/// Nemotron 3.5 Transcribe decodes until its stop token, at most the card's
-/// 16,384 completion tokens (an hour of dense speech is 13-16k); KV for it
-/// costs 6 KiB of 16-bit storage per token, so a row books the whole budget.
+/// Nemotron 3.5 Transcribe's automatic budget is admitted at the card's
+/// 16,384 completion tokens and narrowed by preparation to the decode the
+/// audio's duration plans ([`nemotron_transcribe_asr_planned_max_tokens`]).
 fn nemotron_transcribe_auto_asr_token_ceiling(variant: ModelVariant) -> Option<usize> {
     (variant.family() == ModelFamily::NemotronTranscribeAsr)
         .then_some(crate::models::architectures::nemotron_transcribe::MAX_NEW_TOKENS)
@@ -695,6 +733,25 @@ pub(crate) fn vibevoice_asr_planned_max_tokens(
     let ceiling = request.params.max_tokens.max(1);
     if request.asr_auto_max_tokens {
         vibevoice_auto_asr_max_tokens_for_duration(audio_seconds).min(ceiling)
+    } else {
+        ceiling
+    }
+}
+
+/// Decode budget a Nemotron 3.5 Transcribe row of `audio_seconds` runs with:
+/// the planned decode (16 tokens a second and 64 more, at most the card's
+/// 16,384; a translation segment's too) under the request ceiling when the
+/// caller omitted `max_tokens`, otherwise the caller's own budget.
+/// Admission claims a row's KV for its prompt and this budget in full, so
+/// the card's budget let three 30 s rows share the 65,536-token pool.
+pub(crate) fn nemotron_transcribe_asr_planned_max_tokens(
+    request: &EngineCoreRequest,
+    audio_seconds: f32,
+) -> usize {
+    use crate::models::architectures::nemotron_transcribe::planned_decode_tokens;
+    let ceiling = request.params.max_tokens.max(1);
+    if request.asr_auto_max_tokens {
+        planned_decode_tokens(audio_seconds).min(ceiling)
     } else {
         ceiling
     }

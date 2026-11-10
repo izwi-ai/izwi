@@ -553,6 +553,82 @@ pub fn recv_serving_device<T>(mut reply: oneshot::Receiver<T>) -> Option<T> {
     }
 }
 
+/// A value whose device buffers it reports through [`DeviceResident`].
+pub trait DeviceResident {
+    /// The device holding the value's buffers, if any.
+    fn device_location(&self) -> Option<DeviceLocation>;
+}
+
+impl<T: DeviceResident + ?Sized> DeviceResident for Arc<T> {
+    fn device_location(&self) -> Option<DeviceLocation> {
+        (**self).device_location()
+    }
+}
+
+/// A shared value (typically an `Arc` of tensors) whose last free must run on
+/// its CUDA device's thread. Request-owned ASR encoder artifacts outlive the
+/// executor's copy and are dropped with their request on a tokio worker; there
+/// cudarc frees without binding the context, the free fails, and the latched
+/// `CUDA_ERROR_INVALID_CONTEXT` fails the next device call (a whole decode
+/// batch). Dropping one off a device thread queues the drop on the device's
+/// thread instead, as `RetiredTensorState` does: queued, not awaited, and
+/// moved there whole, so the thread drops the last reference this owner held.
+/// On any other device, or already on a device thread, it drops in place.
+pub struct DeviceOwned<T: DeviceResident + Send + 'static> {
+    value: Option<T>,
+}
+
+impl<T: DeviceResident + Send + 'static> DeviceOwned<T> {
+    pub fn new(value: T) -> Self {
+        Self { value: Some(value) }
+    }
+}
+
+impl<T: DeviceResident + Send + 'static> std::ops::Deref for DeviceOwned<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.value
+            .as_ref()
+            .expect("a device-owned value is present until it drops")
+    }
+}
+
+impl<T: DeviceResident + Clone + Send + 'static> Clone for DeviceOwned<T> {
+    fn clone(&self) -> Self {
+        Self::new((**self).clone())
+    }
+}
+
+impl<T: DeviceResident + Send + 'static> Drop for DeviceOwned<T> {
+    fn drop(&mut self) {
+        let Some(value) = self.value.take() else {
+            return;
+        };
+        if CURRENT_DEVICE_THREAD.with(Cell::get).is_some() {
+            return;
+        }
+        let Some(location @ DeviceLocation::Cuda { .. }) = value.device_location() else {
+            return;
+        };
+        DEVICE_FREES_REROUTED.fetch_add(1, Ordering::Relaxed);
+        // `submit` enqueues before it returns; a job its thread cannot take is
+        // dropped (with the value) here, which is no worse than before.
+        if let Ok(thread) = DeviceThread::for_location(location) {
+            drop(thread.submit(move || drop(value)));
+        }
+    }
+}
+
+static DEVICE_FREES_REROUTED: AtomicU64 = AtomicU64::new(0);
+
+/// Device-owned values whose drop was moved to their device thread because
+/// it began elsewhere (each one would otherwise have freed CUDA memory on a
+/// thread without the context).
+pub fn device_frees_rerouted_total() -> u64 {
+    DEVICE_FREES_REROUTED.load(Ordering::Relaxed)
+}
+
 /// Device operations that ran off a device thread since process start.
 pub fn device_ops_off_thread_total() -> u64 {
     DEVICE_OPS_OFF_THREAD.load(Ordering::Relaxed)
@@ -568,6 +644,32 @@ pub(crate) fn watch_off_thread_ops(watch: Option<Arc<AtomicU64>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_owned_values_off_cuda_drop_in_place() {
+        struct Probe(Arc<AtomicU64>);
+        impl DeviceResident for Probe {
+            fn device_location(&self) -> Option<DeviceLocation> {
+                Some(DeviceLocation::Cpu)
+            }
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let drops = Arc::new(AtomicU64::new(0));
+        let owned = DeviceOwned::new(Arc::new(Probe(drops.clone())));
+        let copy = owned.clone();
+        drop(owned);
+        assert_eq!(drops.load(Ordering::Relaxed), 0, "a clone still holds the value");
+        std::thread::spawn(move || drop(copy)).join().unwrap();
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            1,
+            "a value off CUDA drops where its last owner drops it"
+        );
+    }
 
     fn test_thread() -> Arc<DeviceThread> {
         // A private thread: the shared CPU thread may be serving other tests.

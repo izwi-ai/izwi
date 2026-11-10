@@ -3,10 +3,12 @@
 //! `norm_f` and the untied language-model head. No embedding scaling. The
 //! residual stream is F32.
 //!
-//! A prefill span runs one row's tokens; a decode step runs one token of
-//! every row in one forward: projections and experts batched over rows,
-//! the SSM and convolution over the rows' stacked states, attention per row
-//! over its own paged KV.
+//! A prefill span runs one row's tokens, and packed spans run several rows'
+//! spans in one forward: projections and experts over every row's tokens,
+//! the convolution and scan per row, attention per row over its own paged
+//! KV. A decode step runs one token of every row in one forward:
+//! projections and experts batched over rows, the SSM and convolution over
+//! the rows' stacked states, attention per row over its own paged KV.
 
 pub mod attention;
 mod graphs;
@@ -30,6 +32,72 @@ use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedP
 use attention::AttentionMixer;
 use mamba::MambaMixer;
 use moe::{MoeMixer, Routing};
+
+/// Prefill time by decoder layer kind, measured only when
+/// `IZWI_NEMOTRON_TRANSCRIBE_PREFILL_PROFILE` is on: each layer then waits
+/// for the device before and after it, so the split is device time.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct PrefillLayerTimes {
+    pub(crate) mamba: std::time::Duration,
+    pub(crate) moe: std::time::Duration,
+    pub(crate) attention: std::time::Duration,
+}
+
+thread_local! {
+    static PREFILL_LAYER_TIMES: std::cell::Cell<PrefillLayerTimes> =
+        const { std::cell::Cell::new(PrefillLayerTimes {
+            mamba: std::time::Duration::ZERO,
+            moe: std::time::Duration::ZERO,
+            attention: std::time::Duration::ZERO,
+        }) };
+}
+
+/// Whether prefill spans time each layer kind
+/// (`IZWI_NEMOTRON_TRANSCRIBE_PREFILL_PROFILE`, off by default).
+pub(crate) fn prefill_profile_enabled() -> bool {
+    static ENABLED: crate::env::ReadOnce<bool> = crate::env::ReadOnce::new(|| {
+        crate::env::flag_or("IZWI_NEMOTRON_TRANSCRIBE_PREFILL_PROFILE", false)
+    });
+    ENABLED.get()
+}
+
+/// The layer-kind prefill time this thread measured since the last call.
+pub(crate) fn take_prefill_layer_times() -> PrefillLayerTimes {
+    PREFILL_LAYER_TIMES.with(|times| times.replace(PrefillLayerTimes::default()))
+}
+
+/// Starts timing one prefill layer when profiling: waits for the device so
+/// earlier layers' work is not counted.
+fn begin_profiled_layer(x: &Tensor) -> Result<Option<std::time::Instant>> {
+    if !prefill_profile_enabled() {
+        return Ok(None);
+    }
+    x.device().synchronize()?;
+    Ok(Some(std::time::Instant::now()))
+}
+
+/// Ends timing one prefill layer of `mixer`'s kind.
+fn end_profiled_layer(
+    started: Option<std::time::Instant>,
+    mixer: &Mixer,
+    out: &Tensor,
+) -> Result<()> {
+    let Some(started) = started else {
+        return Ok(());
+    };
+    out.device().synchronize()?;
+    let elapsed = started.elapsed();
+    PREFILL_LAYER_TIMES.with(|times| {
+        let mut total = times.get();
+        match mixer {
+            Mixer::Mamba { .. } => total.mamba += elapsed,
+            Mixer::Moe(_) => total.moe += elapsed,
+            Mixer::Attention { .. } => total.attention += elapsed,
+        }
+        times.set(total);
+    });
+    Ok(())
+}
 pub use state::NemotronMambaState;
 
 enum Mixer {
@@ -147,6 +215,26 @@ pub struct DecodeRow<'a> {
     pub token: u32,
 }
 
+/// One row of a packed prefill: its span's embeddings `[tokens, hidden]` at
+/// its cache's cursor, its state and cache, and whether to pick its next
+/// token (the span ends the row's prompt).
+pub struct SpanRow<'a> {
+    pub embeds: Tensor,
+    pub state: &'a mut NemotronMambaState,
+    pub cache: &'a mut PhysicalPagedKvCache,
+    pub pick: bool,
+}
+
+/// What a packed prefill returns.
+#[derive(Debug)]
+pub struct PackedSpans {
+    /// Each row's final normalized hidden state of its last token
+    /// `[rows, hidden]`.
+    pub hidden: Tensor,
+    /// The greedy `(token, margin)` of each row that asked for a pick.
+    pub picks: Vec<Option<(u32, f32)>>,
+}
+
 /// Kill switch for the fused decode step (`0`, `off`, `false`): the step
 /// then runs the eager composition. Read at load.
 pub const FUSED_DECODE_ENV: &str = "IZWI_NEMOTRON_TRANSCRIBE_FUSED_DECODE";
@@ -175,6 +263,9 @@ pub struct NemotronDecoder {
     graphs: std::result::Result<crate::kernels::cuda::stretch_graphs::StretchGraphs, String>,
     /// Why a requested FP8 head stayed 16-bit.
     lm_head_fallback: Option<String>,
+    /// A packed prefill fails after this layer (tests of its rollback).
+    #[cfg(test)]
+    fail_packed_after_layer: std::sync::atomic::AtomicUsize,
 }
 
 impl NemotronDecoder {
@@ -304,7 +395,18 @@ impl NemotronDecoder {
             config: d.clone(),
             device: device.clone(),
             lm_head_fallback,
+            #[cfg(test)]
+            fail_packed_after_layer: std::sync::atomic::AtomicUsize::new(usize::MAX),
         })
+    }
+
+    /// Makes every packed prefill fail after `layer` (`None` clears it).
+    #[cfg(test)]
+    pub(crate) fn fail_packed_prefill_after(&self, layer: Option<usize>) {
+        self.fail_packed_after_layer.store(
+            layer.unwrap_or(usize::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// The LM head's resident form, and why a requested FP8 head stayed
@@ -470,6 +572,7 @@ impl NemotronDecoder {
                     Some(h) => h,
                     None => candle_nn::ops::rms_norm(&x, &layer.norm, eps)?,
                 };
+                let profiled = begin_profiled_layer(&h)?;
                 let out = match &layer.mixer {
                     Mixer::Mamba { index, mixer } => {
                         let (out, conv, ssm) = mixer.forward(
@@ -501,6 +604,7 @@ impl NemotronDecoder {
                         mixer.output(&attended, Pass::Span)?
                     }
                 };
+                end_profiled_layer(profiled, &layer.mixer, &out)?;
                 if self.fused() {
                     // The next layer's norm (or the final one) with the add.
                     let gain = self.layers.get(index + 1).map_or(&self.norm_f, |l| &l.norm);
@@ -533,6 +637,177 @@ impl NemotronDecoder {
             }
             Err(error) => {
                 let _ = cache.abort_prepared(prepared);
+                Err(error)
+            }
+        }
+    }
+
+    /// Prefills several rows' spans as one forward, each at its own cache's
+    /// cursor: the norms, the projections and the experts once over every
+    /// row's tokens, the Mamba convolution and scan and the attention per
+    /// row over its own state and paged KV, and the LM head only over the
+    /// rows that `pick`, read back once. The rows' KV and Mamba states commit
+    /// after the picks; on an error before that, no row's does.
+    ///
+    /// Each row's tokens take the kernels its span takes alone (the CPU's
+    /// Q8_0 kernel by row count, the MoE's warp kernels or GEMMs by span), but
+    /// the GEMMs they share multiply more rows than one span does, so a row's
+    /// values may differ from [`Self::forward_span`]'s in the last bits.
+    pub fn forward_spans(&self, rows: &mut [SpanRow<'_>]) -> Result<PackedSpans> {
+        if rows.is_empty() {
+            return Err(Error::InvalidInput("a packed prefill needs a row".into()));
+        }
+        let mut lengths = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
+            self.validate_cache(row.cache)?;
+            if row.state.cursor != row.cache.context_len() as u64 {
+                return Err(Error::InferenceError(
+                    "Nemotron 3.5 Transcribe Mamba and KV clocks diverged".into(),
+                ));
+            }
+            lengths.push(row.embeds.dim(0)?);
+        }
+        let mut prepared = Vec::with_capacity(rows.len());
+        let mut failure = None;
+        for (row, &tokens) in rows.iter().zip(&lengths) {
+            match row.cache.prepare_append(row.cache.context_len(), tokens) {
+                Ok(step) => prepared.push(step),
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = failure {
+            for (row, step) in rows.iter_mut().zip(prepared) {
+                let _ = row.cache.abort_prepared(step);
+            }
+            return Err(error);
+        }
+        let mut next = rows.iter().map(|row| row.state.clone()).collect::<Vec<_>>();
+        let result = (|| -> Result<PackedSpans> {
+            let eps = self.config.norm_eps as f32;
+            let mut x = Tensor::cat(&rows.iter().map(|row| &row.embeds).collect::<Vec<_>>(), 0)?
+                .to_dtype(DType::F32)?;
+            let mut normed = self
+                .fused()
+                .then(|| residual_norm::rms_norm(&x, &self.layers[0].norm, eps, DType::F32))
+                .transpose()?;
+            for (index, layer) in self.layers.iter().enumerate() {
+                let h = match normed.take() {
+                    Some(h) => h,
+                    None => candle_nn::ops::rms_norm(&x, &layer.norm, eps)?,
+                };
+                let profiled = begin_profiled_layer(&h)?;
+                let out = match &layer.mixer {
+                    Mixer::Mamba { index, mixer } => {
+                        let conv = next.iter().map(|s| &s.conv[*index]).collect::<Vec<_>>();
+                        let ssm = next.iter().map(|s| &s.ssm[*index]).collect::<Vec<_>>();
+                        let (out, conv, ssm) = mixer.forward_packed(&h, &lengths, &conv, &ssm)?;
+                        for ((state, conv), ssm) in next.iter_mut().zip(conv).zip(ssm) {
+                            state.conv[*index] = conv;
+                            state.ssm[*index] = ssm;
+                        }
+                        out
+                    }
+                    Mixer::Moe(mixer) => mixer.forward_packed(&h, &lengths)?,
+                    Mixer::Attention { index, mixer } => {
+                        let (q, k, v) = mixer.project_packed(&h, &lengths)?;
+                        let mut attended = Vec::with_capacity(rows.len());
+                        let mut offset = 0;
+                        for ((row, step), &tokens) in
+                            rows.iter().zip(prepared.iter_mut()).zip(&lengths)
+                        {
+                            attended.push(mixer.attend(
+                                row.cache,
+                                step,
+                                *index,
+                                &q.narrow(0, offset, tokens)?,
+                                &k.narrow(0, offset, tokens)?,
+                                &v.narrow(0, offset, tokens)?,
+                                Self::kv_dtype(row.cache),
+                            )?);
+                            offset += tokens;
+                        }
+                        mixer.output_packed(&Tensor::cat(&attended, 0)?, &lengths)?
+                    }
+                };
+                end_profiled_layer(profiled, &layer.mixer, &out)?;
+                if self.fused() {
+                    let gain = self.layers.get(index + 1).map_or(&self.norm_f, |l| &l.norm);
+                    let (sum, h) = residual_norm::add_rms_norm(&x, &out, gain, eps, DType::F32)?;
+                    x = sum;
+                    normed = Some(h);
+                } else {
+                    x = (x + out)?;
+                }
+                #[cfg(test)]
+                if index
+                    == self
+                        .fail_packed_after_layer
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    return Err(Error::InferenceError(format!(
+                        "a test failed the packed prefill after layer {index}"
+                    )));
+                }
+            }
+            // Each row's last token.
+            let mut end = 0;
+            let last = lengths
+                .iter()
+                .map(|&tokens| {
+                    end += tokens;
+                    (end - 1) as u32
+                })
+                .collect::<Vec<_>>();
+            let last = Tensor::from_vec(last, lengths.len(), &self.device)?;
+            let hidden = match normed {
+                Some(h) => h.index_select(&last, 0)?,
+                None => candle_nn::ops::rms_norm(&x.index_select(&last, 0)?, &self.norm_f, eps)?,
+            };
+            let picked = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.pick)
+                .map(|(r, _)| r as u32)
+                .collect::<Vec<_>>();
+            let mut picks = vec![None; rows.len()];
+            if !picked.is_empty() {
+                let ids = Tensor::from_vec(picked.clone(), picked.len(), &self.device)?;
+                let greedy = self.greedy(&hidden.index_select(&ids, 0)?)?;
+                for (&r, pick) in picked.iter().zip(greedy) {
+                    picks[r as usize] = Some(pick);
+                }
+            }
+            Ok(PackedSpans { hidden, picks })
+        })();
+        match result {
+            Ok(packed) => {
+                let mut failure = None;
+                for ((row, step), (mut state, &tokens)) in rows
+                    .iter_mut()
+                    .zip(prepared)
+                    .zip(next.into_iter().zip(&lengths))
+                {
+                    if failure.is_some() {
+                        let _ = row.cache.abort_prepared(step);
+                        continue;
+                    }
+                    match row.cache.commit_prepared(step) {
+                        Ok(()) => {
+                            state.cursor += tokens as u64;
+                            *row.state = state;
+                        }
+                        Err(error) => failure = Some(error),
+                    }
+                }
+                failure.map_or(Ok(packed), Err)
+            }
+            Err(error) => {
+                for (row, step) in rows.iter_mut().zip(prepared) {
+                    let _ = row.cache.abort_prepared(step);
+                }
                 Err(error)
             }
         }

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify, RwLock, Semaphore};
 use tokio::task::yield_now;
 use tracing::{debug, error, info_span, warn};
 
@@ -70,8 +70,13 @@ use crate::model::ModelResidencyLease;
 use crate::models::architectures::chatterbox::{ChatterboxGenerationParams, T3SamplingParams};
 use crate::models::architectures::fish_s2::{FishS2GenerationParams, FishS2Reference};
 use crate::models::architectures::granite_speech::asr::{
-    GraniteSpeechPreparationBatchRow, GraniteSpeechPreparedGeometry,
+    GraniteSpeechAudioFeatures, GraniteSpeechFeatureRow, GraniteSpeechPreparedGeometry,
     GraniteSpeechPreparedPromptArtifact,
+};
+use crate::models::architectures::granite_speech5::asr::{
+    GraniteSpeech5AsrModel, GraniteSpeech5AudioFeatures, GraniteSpeech5FeatureRow,
+    GraniteSpeech5PreparedGeometry, GraniteSpeech5PreparedPromptArtifact,
+    GraniteSpeech5RequestOptions,
 };
 use crate::models::architectures::kokoro::kokoro_output_budget;
 use crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload;
@@ -82,19 +87,28 @@ use crate::models::architectures::maya1::{
 use crate::models::architectures::maya2::{
     resolve_language, Maya2GenerationParams, Maya2SamplingParams, Maya2Voice,
 };
+use crate::models::architectures::nemotron::asr::{
+    NemotronEncoderBatchRow, NemotronHostFeatures, NemotronPreparedEncoderArtifact,
+    NEMOTRON_ENCODER_STAGE,
+};
+use crate::models::architectures::parakeet::asr::{
+    ParakeetEncoderBatchRow, ParakeetHostFeatures, ParakeetPreparedEncoderArtifact,
+};
 use crate::models::architectures::qwen3::asr::{
-    Qwen3AsrAudioBatchRow, Qwen3AsrAudioPreparationGeometry, Qwen3AsrPreparedAudio,
+    Qwen3AsrAudioPreparationGeometry, Qwen3AsrHostFeatures, Qwen3AsrPreparedAudio,
 };
 use crate::models::architectures::vibevoice::asr::{
-    VibeVoiceAsrPreparationDecision, VibeVoiceAsrPreparedArtifact, VibeVoiceAsrPreparedGeometry,
+    VibeVoiceAsrHostAudio, VibeVoiceAsrPreparationDecision, VibeVoiceAsrPreparedArtifact,
+    VibeVoiceAsrPreparedGeometry,
 };
 use crate::models::architectures::vibevoice::tts::{
     vibevoice_tts_auto_max_frames_for_text, VibeVoiceSpeakerReference,
     VibeVoiceTtsGenerationParams, VIBEVOICE_TTS_DEFAULT_CFG_SCALE,
 };
+use crate::models::architectures::voxtral::realtime::VoxtralOfflineFeatures;
 use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
 use crate::models::architectures::whisper::asr::{
-    WhisperAudioBatchRow, WhisperPreparedWindow, WhisperWindowPreparationGeometry,
+    WhisperHostFeatures, WhisperPreparedWindow, WhisperWindowPreparationGeometry,
 };
 use crate::models::registry::AsrModelLease;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
@@ -103,7 +117,7 @@ use crate::runtime::adapters::{
     LoadedCapabilityBinding, LoadedExecutionContract, LoadedModelBundle, RuntimeAdapterRegistry,
     StreamingRequirements,
 };
-use crate::runtime::asr::RealtimeAsrSessionPolicy;
+use crate::runtime::asr::{chunk_row_permit_count, RealtimeAsrSessionPolicy};
 use crate::runtime::asr_no_speech::{asr_no_speech_gate_applies, AsrNoSpeechGate};
 use crate::runtime::audio_io::decode_reference_audio_base64;
 use crate::runtime::broker::{InferenceBroker, InferenceBrokerObservation};
@@ -142,13 +156,19 @@ mod tts_preparation;
 #[cfg(test)]
 use asr_encoders::granite_speech_deadline_budget_bucket;
 use asr_encoders::{
-    GraniteSpeechEncoderBatcher, GraniteSpeechEncoderPending, QwenAsrEncoderBatcher,
+    GraniteSpeech5EncoderBatcher, GraniteSpeech5EncoderPending, GraniteSpeechEncoderBatcher,
+    GraniteSpeechEncoderPending, NemotronEncoderBatcher,
+    NemotronEncoderPending, ParakeetEncoderBatcher, ParakeetEncoderPending, QwenAsrEncoderBatcher,
     QwenAsrEncoderPending, VibeVoiceEncoderBatcher, VibeVoiceEncoderPending, WhisperEncoderBatcher,
     WhisperEncoderPending,
 };
 use asr_preparation::asr_encoder_retained_resources;
 #[cfg(test)]
 use asr_preparation::install_parakeet_decode_budget;
+#[cfg(test)]
+use asr_preparation::{
+    granite_speech5_decodes_as_row, install_nemotron_decode_budget, nemotron_decodes_as_row,
+};
 #[cfg(test)]
 use chat_invocation::RuntimeChatInvocationDriver;
 pub use chat_invocation::{
@@ -269,6 +289,20 @@ fn asr_transient_resources(
     input_bytes: usize,
     audio_secs: Option<f32>,
 ) -> Result<Option<ResourceVector>> {
+    asr_transient_resources_for_route(backend, variant, input_bytes, audio_secs, false)
+}
+
+/// [`asr_transient_resources`] for a request whose encoder already ran in a
+/// preparation stage that priced it (`encoder_prepared`): a Voxtral row
+/// keeps only its prepared embeddings, which the request prices as its
+/// artifact.
+fn asr_transient_resources_for_route(
+    backend: BackendKind,
+    variant: ModelVariant,
+    input_bytes: usize,
+    audio_secs: Option<f32>,
+    encoder_prepared: bool,
+) -> Result<Option<ResourceVector>> {
     use super::lifecycle::asr_envelope;
     let Some(secs) = audio_secs.or_else(|| asr_envelope::max_chunk_secs(variant)) else {
         return Ok(None);
@@ -276,10 +310,11 @@ fn asr_transient_resources(
     let Some(envelope) = asr_envelope::request_envelope(variant, secs, backend)? else {
         return Ok(None);
     };
-    let unpriced_encoder = matches!(
-        variant.family(),
-        ModelFamily::NemotronAsr | ModelFamily::Voxtral
-    );
+    let unpriced_encoder = match variant.family() {
+        ModelFamily::NemotronAsr => true,
+        ModelFamily::Voxtral => !encoder_prepared,
+        _ => false,
+    };
     let accelerator_bytes = if unpriced_encoder {
         envelope.accelerator_bytes
     } else {
@@ -525,6 +560,9 @@ fn add_audio_input_allocation(
         EngineAudioInput::Bytes(value) => {
             add_retained_allocation(total, value.capacity(), std::mem::size_of::<u8>(), label)
         }
+        EngineAudioInput::Samples(value) => {
+            add_retained_allocation(total, value.len(), std::mem::size_of::<f32>(), label)
+        }
     }
 }
 
@@ -757,6 +795,29 @@ pub(super) fn add_fish_s2_artifact_to_admission(
     Ok(())
 }
 
+/// Price a prepared TTS artifact into its execution admission.
+///
+/// Preparation records the artifact's conditioning (voice and reference
+/// tensors, resident on the device on CUDA) as materialized usage, and the
+/// coordinator refuses to resize a reservation below what is materialized.
+/// The generic request estimate prices only the request input, so without
+/// this every Chatterbox, VibeVoice, Voxtral and LFM2.5-Audio request was
+/// refused on CUDA. `host_bytes` is the artifact's host share beyond the
+/// request input; `accelerator_bytes` its resident tensors.
+pub(super) fn add_prepared_tts_artifact_to_admission(
+    backend: BackendKind,
+    spec: &mut JobSpec,
+    host_bytes: u64,
+    accelerator_bytes: u64,
+) -> Result<()> {
+    spec.resources = spec.resources.checked_add(retained_artifact_resources(
+        backend,
+        host_bytes,
+        accelerator_bytes,
+    )?)?;
+    Ok(())
+}
+
 fn ensure_preparation_copy_deadline(job: &JobLease) -> Result<()> {
     if job
         .spec
@@ -959,6 +1020,12 @@ pub struct RuntimeService {
     whisper_encoder_batcher: Arc<WhisperEncoderBatcher>,
     vibevoice_encoder_batcher: Arc<VibeVoiceEncoderBatcher>,
     granite_speech_encoder_batcher: Arc<GraniteSpeechEncoderBatcher>,
+    granite_speech5_encoder_batcher: Arc<GraniteSpeech5EncoderBatcher>,
+    parakeet_encoder_batcher: Arc<ParakeetEncoderBatcher>,
+    nemotron_encoder_batcher: Arc<NemotronEncoderBatcher>,
+    /// Long-form chunk rows in flight across every file (see
+    /// `asr::chunk_row_permit_count`).
+    pub(crate) asr_chunk_row_permits: Arc<Semaphore>,
     pub(super) asr_realtime_sessions: RealtimeAsrSessionPolicy,
     telemetry: Arc<RuntimeTelemetryCollector>,
     completion_waiters: Arc<RuntimeCompletionWaiters>,
@@ -979,6 +1046,15 @@ pub(crate) struct AdmittedEngineRequest {
     request: EngineCoreRequest,
     job: JobLease,
     residency_lease: ModelResidencyLease,
+}
+
+impl AdmittedEngineRequest {
+    /// This request as one chunk of a long file its caller transcribes as
+    /// chunk rows (see `EngineCoreRequest::asr_chunk_row`).
+    pub(crate) fn into_asr_chunk_row(mut self) -> Self {
+        self.request.asr_chunk_row = true;
+        self
+    }
 }
 
 fn bind_request_to_residency(
@@ -1019,6 +1095,7 @@ fn bind_request_to_residency(
                 | ModelFamily::GraniteSpeech5Asr
                 | ModelFamily::Lfm25Audio
                 | ModelFamily::Lfm3Audio
+                | ModelFamily::Voxtral
         ) && request.prepared_asr_execution_shape().is_some()
     }) && request.prepared_asr_audio_for_executor()?.is_none()
     {
@@ -1046,6 +1123,18 @@ fn bind_request_to_residency(
     {
         return Err(Error::InvalidInput(
             "Granite Speech normal execution shape has no matching prepared artifact".into(),
+        ));
+    }
+    if request.model_variant.is_some_and(|variant| {
+        variant.family() == ModelFamily::GraniteSpeech5Asr
+            && request.prepared_asr_execution_shape().is_some()
+            && !request.uses_asr_long_form_atomic()
+    }) && request
+        .prepared_granite_speech5_artifact_for_executor()?
+        .is_none()
+    {
+        return Err(Error::InvalidInput(
+            "Granite Speech 5.0 normal execution shape has no matching prepared artifact".into(),
         ));
     }
     if request.model_variant.is_some_and(|variant| {
@@ -1080,6 +1169,16 @@ fn bind_request_to_residency(
     {
         return Err(Error::InvalidInput(
             "LFM3-Audio normal execution shape has no matching prepared artifact".into(),
+        ));
+    }
+    if request.model_variant.is_some_and(|variant| {
+        variant.family() == ModelFamily::Voxtral
+            && request.prepared_asr_execution_shape().is_some()
+            && !request.uses_asr_long_form_atomic()
+    }) && request.prepared_voxtral_artifact_for_executor()?.is_none()
+    {
+        return Err(Error::InvalidInput(
+            "Voxtral normal execution shape has no matching prepared audio".into(),
         ));
     }
     let streaming = if request.streaming && !model_streaming_required {

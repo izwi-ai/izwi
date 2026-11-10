@@ -23,13 +23,16 @@ impl LoadedExecutionAdapterFactory for PhysicalQwenTtsAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(PhysicalQwenTtsExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            PhysicalQwenTtsExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 
@@ -183,13 +186,16 @@ impl LoadedExecutionAdapterFactory for ContinuousPhysicalAsrAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(ContinuousAsrExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            ContinuousAsrExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 
@@ -206,10 +212,50 @@ pub(super) struct VibeVoicePhysicalAsrAdapterFactory;
 pub(super) struct GraniteSpeechPhysicalAsrAdapterFactory;
 
 #[derive(Debug, Clone, Copy)]
+pub(super) struct GraniteSpeech5PhysicalAsrAdapterFactory;
+
+#[derive(Debug, Clone, Copy)]
 pub(super) struct Lfm25AudioPhysicalAsrAdapterFactory;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ParakeetPhysicalAsrAdapterFactory;
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct NemotronPhysicalAsrAdapterFactory;
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct VoxtralPhysicalAsrAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for VoxtralPhysicalAsrAdapterFactory {
+    fn id(&self) -> &'static str {
+        LoadedAdapterKind::VoxtralAsr.factory_id()
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Continuous
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::VoxtralAsr, metadata, backend_kind)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(
+            VoxtralAsrExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Lfm25AudioPhysicalTtsAdapterFactory;
@@ -244,13 +290,16 @@ impl LoadedExecutionAdapterFactory for ChatterboxPhysicalTtsAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(ChatterboxTtsExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            ChatterboxTtsExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 
@@ -272,13 +321,16 @@ impl LoadedExecutionAdapterFactory for Maya1PhysicalTtsAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(Maya1TtsExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            Maya1TtsExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 
@@ -300,13 +352,16 @@ impl LoadedExecutionAdapterFactory for Maya2PhysicalTtsAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(Maya2TtsExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            Maya2TtsExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 
@@ -473,13 +528,16 @@ impl LoadedExecutionAdapterFactory for VoxtralPhysicalTtsAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(VoxtralTtsExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            VoxtralTtsExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 
@@ -636,13 +694,47 @@ impl LoadedExecutionAdapterFactory for ParakeetPhysicalAsrAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(ParakeetAsrExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            ParakeetAsrExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
+    }
+}
+
+impl LoadedExecutionAdapterFactory for NemotronPhysicalAsrAdapterFactory {
+    fn id(&self) -> &'static str {
+        LoadedAdapterKind::NemotronAsr.factory_id()
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Continuous
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::NemotronAsr, metadata, backend_kind)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(
+            NemotronAsrExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 
@@ -652,10 +744,10 @@ impl LoadedExecutionAdapterFactory for GraniteSpeechPhysicalAsrAdapterFactory {
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
+        use crate::models::architectures::granite_speech::asr::granite_speech_retained_decode_enabled;
         // Continuous decode batching lives on the retained sequence graph,
         // which the adapter offers only with resumable prefill (GRN-8).
-        if crate::models::architectures::granite_speech::asr::GraniteSpeechAsrModel::RESUMABLE_PREFILL
-        {
+        if granite_speech_retained_decode_enabled() {
             NativeBatchMode::Continuous
         } else {
             NativeBatchMode::None
@@ -671,13 +763,54 @@ impl LoadedExecutionAdapterFactory for GraniteSpeechPhysicalAsrAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(GraniteSpeechAsrExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            GraniteSpeechAsrExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
+    }
+}
+
+impl LoadedExecutionAdapterFactory for GraniteSpeech5PhysicalAsrAdapterFactory {
+    fn id(&self) -> &'static str {
+        LoadedAdapterKind::GraniteSpeech5Asr.factory_id()
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        use crate::models::architectures::granite_speech5::asr::granite_speech5_retained_decode_enabled;
+        // Continuous decode batching lives on the retained sequence graph,
+        // which the adapter offers only with its retained route (GRN-8).
+        if granite_speech5_retained_decode_enabled() {
+            NativeBatchMode::Continuous
+        } else {
+            NativeBatchMode::None
+        }
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::GraniteSpeech5Asr, metadata, backend_kind)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(
+            GraniteSpeech5AsrExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 
@@ -699,13 +832,16 @@ impl LoadedExecutionAdapterFactory for VibeVoicePhysicalAsrAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(VibeVoiceAsrExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            VibeVoiceAsrExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 
@@ -715,7 +851,7 @@ impl LoadedExecutionAdapterFactory for WhisperPhysicalAsrAdapterFactory {
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
-        NativeBatchMode::Static
+        NativeBatchMode::Continuous
     }
 
     fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
@@ -727,13 +863,16 @@ impl LoadedExecutionAdapterFactory for WhisperPhysicalAsrAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(WhisperAsrExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            WhisperAsrExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 
@@ -775,8 +914,11 @@ pub(in crate::runtime::adapters) fn built_in_loaded_adapter_factories() -> Vec<A
         Arc::new(WhisperPhysicalAsrAdapterFactory),
         Arc::new(VibeVoicePhysicalAsrAdapterFactory),
         Arc::new(GraniteSpeechPhysicalAsrAdapterFactory),
+        Arc::new(GraniteSpeech5PhysicalAsrAdapterFactory),
         Arc::new(Lfm25AudioPhysicalAsrAdapterFactory),
         Arc::new(ParakeetPhysicalAsrAdapterFactory),
+        Arc::new(NemotronPhysicalAsrAdapterFactory),
+        Arc::new(VoxtralPhysicalAsrAdapterFactory),
         Arc::new(Lfm25AudioPhysicalTtsAdapterFactory),
         Arc::new(VibeVoicePhysicalTtsAdapterFactory),
         Arc::new(FishS2PhysicalTtsAdapterFactory),

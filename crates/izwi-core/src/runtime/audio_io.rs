@@ -521,7 +521,8 @@ fn validate_riff_wave_structure(wav_bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+/// A WAV upload's duration from its header, without decoding it; `None`
+/// for anything but a RIFF WAVE with a format and a data chunk.
 pub(crate) fn wav_duration_seconds_fast(wav_bytes: &[u8]) -> Option<f32> {
     if !is_riff_wave(wav_bytes) {
         return None;

@@ -207,6 +207,7 @@ impl NativeExecutor {
                 stream_sequence: 0,
                 input_sample_rate: sample_rate,
                 input_sample_count: samples.len(),
+                clock: Default::default(),
             })?;
             fresh_state = true;
         }
@@ -242,6 +243,7 @@ impl NativeExecutor {
                     cancelled = true;
                     break;
                 }
+                let call_started = std::time::Instant::now();
                 let step = if let Some((start, end)) = resumable_span {
                     let Some(complete) = run_asr_model_call(request, || {
                         Self::run_blocking(|| {
@@ -285,6 +287,11 @@ impl NativeExecutor {
                     };
                     step
                 };
+                if resumable_span.is_some() {
+                    active.clock.record_prefill(call_started.elapsed());
+                } else {
+                    active.clock.record_decode(call_started.elapsed());
+                }
                 if request.is_cancelled() {
                     cancelled = true;
                     break;
@@ -338,6 +345,17 @@ impl NativeExecutor {
             } else {
                 active.state.take_managed_write_completions()
             };
+            // A finishing row publishes its diagnostics once.
+            let diagnostics = (finished && !cancelled).then(|| {
+                let mut diagnostics = active.state.retained_terminal_diagnostics();
+                if let (Some(diagnostics), Some(graph)) = (
+                    diagnostics.as_mut(),
+                    active.model.decode_graph_diagnostics(),
+                ) {
+                    diagnostics["decode_graph"] = graph;
+                }
+                active.clock.diagnostics(diagnostics)
+            });
             Ok((
                 generated,
                 text,
@@ -346,22 +364,31 @@ impl NativeExecutor {
                 active.input_sample_rate,
                 active.input_sample_count,
                 completions,
+                diagnostics,
             ))
         })();
-        let (generated, text, finished, cancelled, sample_rate, sample_count, completions) =
-            match execution {
-                Ok(value) => value,
-                Err(error) => {
-                    let _ = request.take_staged_stream_outputs()?;
-                    rollback_scalar_asr_quantum(
-                        &mut state_lease,
-                        &mut checkpoint,
-                        outer_checkpoint,
-                        fresh_state,
-                    )?;
-                    return Err(error);
-                }
-            };
+        let (
+            generated,
+            text,
+            finished,
+            cancelled,
+            sample_rate,
+            sample_count,
+            completions,
+            diagnostics,
+        ) = match execution {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = request.take_staged_stream_outputs()?;
+                rollback_scalar_asr_quantum(
+                    &mut state_lease,
+                    &mut checkpoint,
+                    outer_checkpoint,
+                    fresh_state,
+                )?;
+                return Err(error);
+            }
+        };
         if cancelled {
             rollback_scalar_asr_quantum(
                 &mut state_lease,
@@ -468,7 +495,7 @@ impl NativeExecutor {
             tokens_generated: generated,
             finished,
             phase_timing_override: None,
-            asr_diagnostics: None,
+            asr_diagnostics: diagnostics,
             error: None,
             logprobs: Vec::new(),
         })

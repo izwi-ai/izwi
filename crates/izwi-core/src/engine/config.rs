@@ -407,8 +407,12 @@ pub(crate) const fn backend_step_sizes(backend: BackendKind) -> BackendStepSizes
         },
     }
 }
+/// The KV page size, in tokens, a default engine runs, and the page size of
+/// load-time probe caches, so a probe runs the paged kernels a model will.
+pub(crate) const DEFAULT_KV_PAGE_TOKENS: usize = 64;
+
 fn default_block_size() -> usize {
-    64
+    DEFAULT_KV_PAGE_TOKENS
 }
 fn default_kv_cache_dtype() -> String {
     "float16".to_string()

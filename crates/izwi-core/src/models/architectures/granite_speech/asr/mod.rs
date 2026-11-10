@@ -35,6 +35,8 @@ use crate::tokenizer::IncrementalDecoder;
 mod config;
 mod preprocessor;
 mod prompt;
+#[cfg(test)]
+mod retained_tests;
 mod runtime;
 mod transcript;
 
@@ -54,13 +56,16 @@ pub use prompt::{
     GRANITE_SPEECH_SPEAKER_INSTRUCTION, GRANITE_SPEECH_SYSTEM_PROMPT,
     GRANITE_SPEECH_TIMESTAMP_INSTRUCTION,
 };
+pub(crate) use runtime::{
+    granite_load_representation, granite_speech_encoder_graph_device_bytes,
+    GraniteLoadRepresentation,
+};
 pub use runtime::{
     GraniteSpeechAttentionDecodeProfile, GraniteSpeechAudioEmbeddingStats,
     GraniteSpeechDecodeLoopProfile, GraniteSpeechDecodeProfile, GraniteSpeechForwardProfile,
     GraniteSpeechGeneration, GraniteSpeechGenerationStats, GraniteSpeechGenerationTimings,
     GraniteSpeechLayerDecodeProfile, GraniteSpeechMlpDecodeProfile, GraniteSpeechRuntime,
 };
-pub(crate) use runtime::{granite_load_representation, GraniteLoadRepresentation};
 pub use transcript::{
     parse_granite_speech_output, GraniteSpeechParsedTranscript, GraniteSpeechSegment,
     GraniteSpeechTimestampWord,
@@ -91,6 +96,21 @@ const TIMESTAMP_MAX_AUDIO_SECONDS: f32 = 3.5 * 60.0;
 /// 4096-token decoder context.
 const TIMESTAMP_MAX_CHUNK_SECONDS: f32 = 60.0;
 static NEXT_GRANITE_SPEECH_MODEL_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The retained route's switch for Granite Speech 4.1 (on by default).
+pub(crate) const GRANITE_SPEECH_RETAINED_DECODE_ENV: &str = "IZWI_GRANITE_SPEECH_RETAINED_DECODE";
+
+/// Whether a Granite Speech 4.1 load offers the retained sequence route:
+/// a single-segment ASR request resumes prefill on retained decoder pages
+/// and decodes beside the other rows, one batched step per token. Off, every
+/// request runs as one atomic invocation and the load fits no retained
+/// decoder state (GRN-8). Read once per process: the loaded adapter and the
+/// model it seals both take it, so their routes agree.
+pub(crate) fn granite_speech_retained_decode_enabled() -> bool {
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(GRANITE_SPEECH_RETAINED_DECODE_ENV, true));
+    ENABLED.get()
+}
 
 /// Reject a request language the variant's checkpoint was not trained on
 /// (IBM's alias table; plus drops Japanese) before the request is admitted.
@@ -185,6 +205,7 @@ pub struct GraniteSpeechAsrModel {
     prompt_tokenizer: GraniteSpeechPromptTokenizer,
     preprocessor: GraniteSpeechPreprocessor,
     runtime: GraniteSpeechRuntime,
+    retained_decode: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +241,13 @@ pub(crate) struct GraniteSpeechPreparedGeometry {
 pub(crate) struct GraniteSpeechPreparationBatchRow<'a> {
     pub(crate) audio: &'a [f32],
     pub(crate) sample_rate: u32,
+    pub(crate) language: Option<&'a str>,
+    pub(crate) prompt: Option<&'a str>,
+}
+
+/// One prompt row whose audio features a host worker computed.
+pub(crate) struct GraniteSpeechFeatureRow<'a> {
+    pub(crate) features: GraniteSpeechAudioFeatures,
     pub(crate) language: Option<&'a str>,
     pub(crate) prompt: Option<&'a str>,
 }
@@ -462,6 +490,11 @@ impl GraniteSpeechPreparedAudio {
 }
 
 impl GraniteSpeechPreparedPromptArtifact {
+    /// The device holding the prepared prompt embeddings.
+    pub(crate) fn device_location(&self) -> candle_core::DeviceLocation {
+        self.embeddings.device().location()
+    }
+
     pub(crate) fn prompt_tokens(&self) -> usize {
         self.prompt_tokens
     }
@@ -486,6 +519,18 @@ impl GraniteSpeechPreparedPromptArtifact {
             .as_ref()
             .map_or(0, |language| language.len() as u64)
     }
+}
+
+fn granite_decode_workspace_per_row_bytes(text: &GraniteTextConfig, dtype: DType) -> Result<u64> {
+    let bytes = |elements: usize, element_bytes: usize| {
+        u64::try_from(elements)
+            .ok()
+            .and_then(|elements| elements.checked_mul(u64::try_from(element_bytes).ok()?))
+    };
+    bytes(text.hidden_size, dtype.size_in_bytes())
+        .zip(bytes(text.vocab_size, std::mem::size_of::<f32>()))
+        .and_then(|(hidden, logits)| hidden.checked_add(logits))
+        .ok_or_else(|| Error::Overloaded("Granite Speech decode workspace overflow".into()))
 }
 
 fn granite_decode_step(state: &GraniteSpeechDecodeState, delta: String) -> GraniteSpeechDecodeStep {
@@ -640,6 +685,7 @@ impl GraniteSpeechAsrModel {
             prompt_tokenizer,
             preprocessor,
             runtime,
+            retained_decode: granite_speech_retained_decode_enabled(),
         })
     }
 
@@ -651,19 +697,16 @@ impl GraniteSpeechAsrModel {
         self.checkpoint_kind
     }
 
-    /// Granite's retained decoder is not quality-certified, so no Granite
-    /// checkpoint resumes prefill: request preparation routes every ASR
-    /// request to the atomic graph, and the loaded ASR adapter offers no
-    /// retained sequence graph whose decoder state would be fitted,
-    /// allocated and held for nothing (GRN-8).
-    pub(crate) const RESUMABLE_PREFILL: bool = false;
-
+    /// Whether a single-segment ASR request resumes prefill on the retained
+    /// route ([`granite_speech_retained_decode_enabled`], read at load).
     pub(crate) const fn supports_resumable_prefill(&self) -> bool {
-        Self::RESUMABLE_PREFILL
+        self.retained_decode
     }
 
+    /// The retained route's decode steps; the same switch as
+    /// [`Self::supports_resumable_prefill`], so the two never disagree.
     pub(crate) const fn supports_incremental_decode(&self) -> bool {
-        false
+        self.retained_decode
     }
 
     pub(crate) fn physical_state_spec(
@@ -729,6 +772,13 @@ impl GraniteSpeechAsrModel {
         sample_rate: u32,
     ) -> Result<Arc<GraniteSpeechPreparedAudio>> {
         let features = self.prepare_audio_features(audio, sample_rate)?;
+        self.prepared_audio_from_features(features)
+    }
+
+    fn prepared_audio_from_features(
+        &self,
+        features: GraniteSpeechAudioFeatures,
+    ) -> Result<Arc<GraniteSpeechPreparedAudio>> {
         validate_granite_audio_duration(features.audio_seconds)?;
         let (embeddings, stats) = self.runtime.audio_embeddings_with_stats(&features)?;
         Ok(Arc::new(GraniteSpeechPreparedAudio {
@@ -747,6 +797,18 @@ impl GraniteSpeechAsrModel {
         prompt: Option<&str>,
     ) -> Result<GraniteSpeechPreparedGeometry> {
         let features = self.prepare_audio_features(audio, sample_rate)?;
+        self.retained_preparation_geometry_for_features(&features, audio.len(), language, prompt)
+    }
+
+    /// The retained geometry of a request of `audio_samples` input samples
+    /// whose audio features a host worker already computed.
+    pub(crate) fn retained_preparation_geometry_for_features(
+        &self,
+        features: &GraniteSpeechAudioFeatures,
+        audio_samples: usize,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<GraniteSpeechPreparedGeometry> {
         validate_granite_audio_duration(features.audio_seconds)?;
         let windows = features
             .encoder_frames
@@ -796,7 +858,7 @@ impl GraniteSpeechAsrModel {
             prompt_tokens,
         )?;
         Ok(GraniteSpeechPreparedGeometry {
-            audio_samples: audio.len(),
+            audio_samples,
             encoder_frames: features.encoder_frames,
             encoder_dim: features.encoder_dim,
             prompt_tokens,
@@ -818,8 +880,14 @@ impl GraniteSpeechAsrModel {
         }
         let padded_audio_samples_per_row =
             rows.iter().map(|row| row.audio_samples).max().unwrap_or(0);
-        let padded_encoder_frames_per_row =
-            rows.iter().map(|row| row.encoder_frames).max().unwrap_or(0);
+        // On CUDA a batch runs at its encoder graph's padded shape; each real
+        // row carries its share of the spare rows.
+        let (batch_rows, padded_encoder_frames_per_row) = runtime::granite_encoder_batch_shape(
+            &self.config.encoder_config,
+            rows.len(),
+            rows.iter().map(|row| row.encoder_frames).max().unwrap_or(0),
+            crate::backends::BackendKind::from(self.device.kind),
+        );
         let encoder_dim = rows[0].encoder_dim;
         let max_prompt_tokens = rows.iter().map(|row| row.prompt_tokens).max().unwrap_or(0);
         if padded_audio_samples_per_row == 0
@@ -845,11 +913,15 @@ impl GraniteSpeechAsrModel {
             input_elements.checked_add(prompt_elements).ok_or_else(|| {
                 Error::Overloaded("Granite Speech batch materialization overflow".into())
             })?;
-        let workspace_per_row_bytes = self.preparation_workspace_bytes(
-            padded_encoder_frames_per_row,
-            encoder_dim,
-            max_prompt_tokens,
-        )?;
+        let workspace_per_row_bytes = self
+            .preparation_workspace_bytes(
+                padded_encoder_frames_per_row,
+                encoder_dim,
+                max_prompt_tokens,
+            )?
+            .checked_mul(batch_rows as u64)
+            .ok_or_else(|| Error::Overloaded("Granite Speech batch workspace overflow".into()))?
+            .div_ceil(rows.len() as u64);
         let max_workspace_bytes = workspace_per_row_bytes
             .checked_mul(
                 u64::try_from(rows.len()).map_err(|_| {
@@ -1106,14 +1178,33 @@ impl GraniteSpeechAsrModel {
         &self,
         rows: &[GraniteSpeechPreparationBatchRow<'_>],
     ) -> Result<Vec<Arc<GraniteSpeechPreparedPromptArtifact>>> {
+        let rows = rows
+            .iter()
+            .map(|row| {
+                Ok(GraniteSpeechFeatureRow {
+                    features: self.prepare_audio_features(row.audio, row.sample_rate)?,
+                    language: row.language,
+                    prompt: row.prompt,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.prepare_prompt_artifact_batch_from_features(rows)
+    }
+
+    /// Encodes prompt rows whose audio features a host worker computed: one
+    /// row alone, more as one batched encoder pass.
+    pub(crate) fn prepare_prompt_artifact_batch_from_features(
+        &self,
+        mut rows: Vec<GraniteSpeechFeatureRow<'_>>,
+    ) -> Result<Vec<Arc<GraniteSpeechPreparedPromptArtifact>>> {
         if rows.is_empty() {
             return Err(Error::InvalidInput(
                 "Granite Speech prompt preparation batch is empty".into(),
             ));
         }
         if rows.len() == 1 {
-            let row = rows[0];
-            let audio = self.prepare_audio_retained(row.audio, row.sample_rate)?;
+            let row = rows.pop().expect("one prompt row");
+            let audio = self.prepared_audio_from_features(row.features)?;
             return self
                 .prepare_prompt_artifact(
                     &audio,
@@ -1126,9 +1217,9 @@ impl GraniteSpeechAsrModel {
         }
         let mut features = Vec::with_capacity(rows.len());
         let mut prompts = Vec::with_capacity(rows.len());
+        let mut languages = Vec::with_capacity(rows.len());
         for row in rows {
-            let row_features = self.prepare_audio_features(row.audio, row.sample_rate)?;
-            validate_granite_audio_duration(row_features.audio_seconds)?;
+            validate_granite_audio_duration(row.features.audio_seconds)?;
             let prompt = self.build_prompt(&GraniteSpeechPromptOptions {
                 task: GraniteSpeechTask::Asr,
                 language: row.language.map(str::to_string),
@@ -1140,15 +1231,16 @@ impl GraniteSpeechAsrModel {
                     "Granite Speech prompt must contain exactly one audio placeholder".into(),
                 ));
             }
-            features.push(row_features);
+            features.push(row.features);
             prompts.push(prompt);
+            languages.push(row.language);
         }
         let audio = self.runtime.audio_embeddings_batch_with_stats(&features)?;
         prompts
             .iter()
             .zip(audio)
-            .zip(rows)
-            .map(|((prompt, (audio_embeddings, _stats)), row)| {
+            .zip(languages)
+            .map(|((prompt, (audio_embeddings, _stats)), language)| {
                 let (embeddings, prompt_tokens, audio_tokens) =
                     self.runtime.prepare_prompt_embeddings(
                         prompt,
@@ -1160,7 +1252,7 @@ impl GraniteSpeechAsrModel {
                     embeddings,
                     prompt_tokens,
                     audio_tokens,
-                    language: row.language.map(str::to_string),
+                    language: language.map(str::to_string),
                 }))
             })
             .collect()
@@ -1400,11 +1492,11 @@ impl GraniteSpeechAsrModel {
         true
     }
 
+    /// Bytes one row of a continuous decode step uses beside its retained
+    /// state: its hidden row in the model dtype and its logits row over the
+    /// 100k vocabulary, priced at F32.
     pub(crate) fn continuous_decode_workspace_per_row_bytes(&self) -> Result<u64> {
-        u64::try_from(self.config.text_config.hidden_size)
-            .ok()
-            .and_then(|hidden| hidden.checked_mul(u64::try_from(self.dtype.size_in_bytes()).ok()?))
-            .ok_or_else(|| Error::Overloaded("Granite Speech decode workspace overflow".into()))
+        granite_decode_workspace_per_row_bytes(&self.config.text_config, self.dtype)
     }
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
@@ -1632,6 +1724,7 @@ impl GraniteSpeechAsrModel {
             "audio_token_index": self.config.audio_token_index,
             "dtype": format!("{:?}", self.dtype),
             "device_kind": format!("{:?}", self.device.kind),
+            "encoder_graphs": self.runtime.encoder_graphs_diagnostics(),
             "sample_rate": self.processor.sample_rate(),
             "n_mels": self.processor.audio_processor.melspec_kwargs.n_mels,
             "projector_downsample_rate": self.processor.audio_processor.projector_downsample_rate,
@@ -1720,6 +1813,8 @@ impl GraniteSpeechAsrModel {
         diagnostics["execution"]["encoder_weight_precision"] =
             self.runtime.encoder_weight_precision().diagnostics();
         diagnostics["execution"]["lm_precision"] = self.runtime.lm_precision().diagnostics();
+        diagnostics["execution"]["cuda_relpos_attention"] =
+            crate::kernels::relpos_attention::diagnostics(self.runtime.device());
         diagnostics
     }
 }
@@ -2790,9 +2885,10 @@ mod tests {
             .all(|stage| !stage.groups.is_empty()));
     }
 
-    /// Without resumable prefill the ASR capability offers only its atomic
-    /// graph, so the load authors no retained state at all (GRN-8). A
-    /// stateless descriptor beside a retained graph cannot be published.
+    /// With the retained route switched off the ASR capability offers only
+    /// its atomic graph, so the load authors no retained state at all
+    /// (GRN-8). A stateless descriptor beside a retained graph cannot be
+    /// published.
     #[test]
     fn atomic_only_asr_graphs_author_no_retained_state() {
         let invocation = granite_test_invocation_contract();

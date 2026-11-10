@@ -48,9 +48,53 @@ pub(crate) struct StaticAttentionMetadata {
 #[derive(Debug)]
 struct StaticAttentionLayerBacking {
     semantic: StaticAttentionLayerSpec,
+    /// `[slots · max_memory_tokens, kv_heads, key_head_dim]`: slot `s` owns
+    /// the block of rows starting at `s · max_memory_tokens`.
     keys: Var,
+    /// `[slots · max_memory_tokens, kv_heads, value_head_dim]`.
     values: Var,
 }
+
+/// Every layer's K/V for `slots` installed memories. A pool of retained
+/// arenas shares one backing, each arena owning one slot, so a batch of
+/// their memories is one paged tensor per layer whose block `s` is slot `s`.
+#[derive(Debug)]
+struct StaticAttentionBacking {
+    layers: Vec<StaticAttentionLayerBacking>,
+    slots: usize,
+}
+
+/// The CUDA flash-attention row metadata for `rows` over installed
+/// memories: cumulative query and key lengths and a one-block table that
+/// names each row's slot.
+#[cfg(feature = "flash-attn")]
+#[derive(Debug)]
+struct StaticAttentionCudaRows {
+    rows: Vec<StaticAttentionRaggedRow>,
+    seqlens_q: Tensor,
+    seqlens_k: Tensor,
+    block_table: Tensor,
+    max_query_len: usize,
+    max_memory_tokens: usize,
+}
+
+/// One decode query per installed memory of arenas that share a backing,
+/// lowered once for every layer of a step (CUDA: one upload of the rows'
+/// lengths and slots).
+#[derive(Debug)]
+pub(crate) struct StaticAttentionDecodeRows {
+    rows: usize,
+    #[cfg(feature = "flash-attn")]
+    cuda: Option<StaticAttentionCudaRows>,
+}
+
+/// The one-query row of a decode step, whose CUDA metadata an installed
+/// memory builds once for every layer and token.
+#[cfg(feature = "flash-attn")]
+const STATIC_ATTENTION_DECODE_ROW: StaticAttentionRaggedRow = StaticAttentionRaggedRow {
+    query_start: 0,
+    query_len: 1,
+};
 
 #[derive(Debug)]
 struct PendingStaticAttentionInstall {
@@ -65,6 +109,7 @@ struct PendingStaticAttentionInstall {
 ///
 /// Pool ownership and lease generations live above this type. Mutation takes
 /// `&mut self`, so an installed memory cannot race attention within one lease.
+/// An arena reads and writes only its own slot of its backing.
 #[derive(Debug)]
 pub(crate) struct InvocationStaticAttentionArena {
     plan: Arc<ResolvedStatePlan>,
@@ -73,7 +118,8 @@ pub(crate) struct InvocationStaticAttentionArena {
     group: StateGroupId,
     backend: BackendKind,
     device: Device,
-    layers: Vec<StaticAttentionLayerBacking>,
+    backing: Arc<StaticAttentionBacking>,
+    slot: usize,
     max_memory_tokens: usize,
     maximum_bytes: u64,
     source_identity: Option<[u8; 32]>,
@@ -81,6 +127,10 @@ pub(crate) struct InvocationStaticAttentionArena {
     initialized: bool,
     dirty: bool,
     pending_install: Option<PendingStaticAttentionInstall>,
+    /// CUDA: the decode row's metadata over the installed memory, built at
+    /// commit (three small uploads otherwise repeated per layer per token).
+    #[cfg(feature = "flash-attn")]
+    cuda_decode_rows: Option<StaticAttentionCudaRows>,
 }
 
 impl InvocationStaticAttentionArena {
@@ -109,6 +159,20 @@ impl InvocationStaticAttentionArena {
         domain: StateDomainId,
         device: Device,
     ) -> Result<Self> {
+        Self::new_retained_pool(contract, plan, domain, device, 1)?
+            .pop()
+            .ok_or_else(|| invalid("retained static-attention pool built no arena"))
+    }
+
+    /// `slots` retained arenas over one shared backing: arena `s` owns slot
+    /// `s` of every layer, so their memories batch as one paged tensor.
+    pub(crate) fn new_retained_pool(
+        contract: &InferenceStateContract,
+        plan: Arc<ResolvedStatePlan>,
+        domain: StateDomainId,
+        device: Device,
+        slots: usize,
+    ) -> Result<Vec<Self>> {
         let state = contract
             .domains
             .iter()
@@ -133,13 +197,14 @@ impl InvocationStaticAttentionArena {
         let backend = backend_kind_for_device(&device);
         let ordinal = device_ordinal(&device)?;
         let registry = StateBackendRegistry::new(backend, ordinal)?;
-        Self::new_with_operation_registry(
+        Self::pool_with_operation_registry(
             contract,
             plan,
             workspace_domain,
             device,
             StateScope::Retained,
             &registry,
+            slots,
         )
     }
 
@@ -151,6 +216,31 @@ impl InvocationStaticAttentionArena {
         expected_scope: StateScope,
         registry: &StateBackendRegistry,
     ) -> Result<Self> {
+        Self::pool_with_operation_registry(
+            contract,
+            plan,
+            workspace_domain,
+            device,
+            expected_scope,
+            registry,
+            1,
+        )?
+        .pop()
+        .ok_or_else(|| invalid("static-attention pool built no arena"))
+    }
+
+    fn pool_with_operation_registry(
+        contract: &InferenceStateContract,
+        plan: Arc<ResolvedStatePlan>,
+        workspace_domain: InvocationWorkspaceDomain,
+        device: Device,
+        expected_scope: StateScope,
+        registry: &StateBackendRegistry,
+        slots: usize,
+    ) -> Result<Vec<Self>> {
+        if slots == 0 {
+            return Err(invalid("static-attention pool requires at least one slot"));
+        }
         let backend = backend_kind_for_device(&device);
         let ordinal = device_ordinal(&device)?;
         if plan.backend != backend || plan.device_ordinal != ordinal {
@@ -218,6 +308,9 @@ impl InvocationStaticAttentionArena {
         let dtype = candle_dtype(resolved.storage)?;
         let max_memory_tokens = usize::try_from(semantic.max_memory_tokens)
             .map_err(|_| invalid("static-attention memory capacity exceeds usize"))?;
+        let pool_tokens = max_memory_tokens
+            .checked_mul(slots)
+            .ok_or_else(|| invalid("static-attention pool token count overflow"))?;
         let mut layers = Vec::with_capacity(resolved.layers.len());
         let mut allocated_bytes = 0_u64;
         for (physical_index, binding) in resolved.layers.iter().enumerate() {
@@ -238,13 +331,8 @@ impl InvocationStaticAttentionArena {
                 .map_err(|_| invalid("static-attention key head dimension exceeds usize"))?;
             let value_head_dim = usize::try_from(layer.value_head_dim)
                 .map_err(|_| invalid("static-attention value head dimension exceeds usize"))?;
-            let keys =
-                exact_zeros_var((max_memory_tokens, kv_heads, key_head_dim), dtype, &device)?;
-            let values = exact_zeros_var(
-                (max_memory_tokens, kv_heads, value_head_dim),
-                dtype,
-                &device,
-            )?;
+            let keys = exact_zeros_var((pool_tokens, kv_heads, key_head_dim), dtype, &device)?;
+            let values = exact_zeros_var((pool_tokens, kv_heads, value_head_dim), dtype, &device)?;
             let layer_bytes = tensor_bytes(keys.as_tensor())?
                 .checked_add(tensor_bytes(values.as_tensor())?)
                 .ok_or_else(|| invalid("static-attention layer byte count overflow"))?;
@@ -257,29 +345,42 @@ impl InvocationStaticAttentionArena {
                 values,
             });
         }
-        if allocated_bytes != resolved_maximum_bytes {
+        let slots_u64 =
+            u64::try_from(slots).map_err(|_| invalid("static-attention slot count exceeds u64"))?;
+        if resolved_maximum_bytes.checked_mul(slots_u64) != Some(allocated_bytes) {
             return Err(invalid(
                 "static-attention allocation does not equal its resolved byte bound",
             ));
         }
         device.synchronize()?;
 
-        Ok(Self {
-            plan,
-            workspace_domain,
-            domain,
-            group,
-            backend,
-            device,
-            layers,
-            max_memory_tokens,
-            maximum_bytes: allocated_bytes,
-            source_identity: None,
-            absolute_cursor: 0,
-            initialized: false,
-            dirty: false,
-            pending_install: None,
-        })
+        let backing = Arc::new(StaticAttentionBacking { layers, slots });
+        Ok((0..slots)
+            .map(|slot| Self {
+                plan: plan.clone(),
+                workspace_domain: workspace_domain.clone(),
+                domain,
+                group,
+                backend,
+                device: device.clone(),
+                backing: backing.clone(),
+                slot,
+                max_memory_tokens,
+                maximum_bytes: resolved_maximum_bytes,
+                source_identity: None,
+                absolute_cursor: 0,
+                initialized: false,
+                dirty: false,
+                pending_install: None,
+                #[cfg(feature = "flash-attn")]
+                cuda_decode_rows: None,
+            })
+            .collect())
+    }
+
+    /// The first row of this arena's slot in every layer's backing.
+    fn slot_start(&self) -> usize {
+        self.slot * self.max_memory_tokens
     }
 
     pub(crate) fn plan(&self) -> &ResolvedStatePlan {
@@ -382,6 +483,7 @@ impl InvocationStaticAttentionArena {
                 ));
             }
             let index = self
+                .backing
                 .layers
                 .binary_search_by_key(&value.model_layer, |layer| layer.semantic.model_layer)
                 .map_err(|_| {
@@ -392,7 +494,7 @@ impl InvocationStaticAttentionArena {
                     "static-attention pending install repeats one model layer",
                 ));
             }
-            let backing = &self.layers[index];
+            let backing = &self.backing.layers[index];
             let key_tokens = validate_install_tensor(
                 &value.keys,
                 &self.device,
@@ -414,7 +516,7 @@ impl InvocationStaticAttentionArena {
                     "static-attention layer write does not match the authenticated memory length",
                 ));
             }
-            if self.layers.iter().any(|candidate| {
+            if self.backing.layers.iter().any(|candidate| {
                 shares_storage(&value.keys, candidate.keys.as_tensor())
                     || shares_storage(&value.keys, candidate.values.as_tensor())
                     || shares_storage(&value.values, candidate.keys.as_tensor())
@@ -433,18 +535,24 @@ impl InvocationStaticAttentionArena {
                 return Err(error);
             }
         };
+        // The slot is all zeros since its allocation or last reset (a failed
+        // install leaves it dirty until a reset zeroes it), so the copy
+        // writes the memory and re-zeroes only the slot's unused tail.
         let copy = (|| -> Result<()> {
-            let backing = &mut self.layers[index];
-            backing.keys.zero_set().map_err(Error::from)?;
-            backing.values.zero_set().map_err(Error::from)?;
-            backing
-                .keys
-                .slice_set(&value.keys, 0, 0)
-                .map_err(Error::from)?;
-            backing
-                .values
-                .slice_set(&value.values, 0, 0)
-                .map_err(Error::from)?;
+            let backing = &self.backing.layers[index];
+            let start = self.slot_start();
+            let memory_tokens = value.keys.dim(0)?;
+            for (var, source) in [
+                (&backing.keys, &value.keys),
+                (&backing.values, &value.values),
+            ] {
+                var.slice_set(source, 0, start).map_err(Error::from)?;
+                zero_rows(
+                    var,
+                    start + memory_tokens,
+                    self.max_memory_tokens - memory_tokens,
+                )?;
+            }
             Ok(())
         })();
         if let Err(error) = copy {
@@ -475,6 +583,19 @@ impl InvocationStaticAttentionArena {
             self.mark_pending_failed();
             return Err(error.into());
         }
+        #[cfg(feature = "flash-attn")]
+        let cuda_decode_rows = match self.backend {
+            BackendKind::Cuda => {
+                match self.cuda_rows(&[STATIC_ATTENTION_DECODE_ROW], pending.target_cursor) {
+                    Ok(rows) => Some(rows),
+                    Err(error) => {
+                        self.mark_pending_failed();
+                        return Err(error);
+                    }
+                }
+            }
+            BackendKind::Cpu | BackendKind::Metal => None,
+        };
         let pending = self
             .pending_install
             .take()
@@ -483,6 +604,10 @@ impl InvocationStaticAttentionArena {
         self.absolute_cursor = pending.target_cursor;
         self.initialized = true;
         self.dirty = false;
+        #[cfg(feature = "flash-attn")]
+        {
+            self.cuda_decode_rows = cuda_decode_rows;
+        }
         Ok(())
     }
 
@@ -500,12 +625,7 @@ impl InvocationStaticAttentionArena {
         if !self.initialized {
             return Err(invalid("static-attention memory is not initialized"));
         }
-        let layer = self
-            .layers
-            .binary_search_by_key(&model_layer, |layer| layer.semantic.model_layer)
-            .ok()
-            .map(|index| &self.layers[index])
-            .ok_or_else(|| invalid("static-attention request references an unknown model layer"))?;
+        let layer = self.layer(model_layer)?;
         validate_queries(
             queries,
             rows,
@@ -521,20 +641,143 @@ impl InvocationStaticAttentionArena {
         }
     }
 
+    /// Lower one decode query per arena of `arenas` (row `i` attends
+    /// `arenas[i]`'s memory) once for every layer of a step. The arenas must
+    /// be clean, initialized, distinct slots of one backing.
+    pub(crate) fn decode_rows(arenas: &[&Self]) -> Result<StaticAttentionDecodeRows> {
+        let first = *arenas
+            .first()
+            .ok_or_else(|| invalid("static-attention decode rows need at least one arena"))?;
+        let mut slots = Vec::with_capacity(arenas.len());
+        for arena in arenas {
+            arena.require_clean()?;
+            if !arena.initialized {
+                return Err(invalid("static-attention memory is not initialized"));
+            }
+            if !Arc::ptr_eq(&arena.backing, &first.backing) {
+                return Err(invalid(
+                    "static-attention decode rows span arenas of different backings",
+                ));
+            }
+            slots.push(arena.slot);
+        }
+        slots.sort_unstable();
+        if slots.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(invalid("static-attention decode rows name one slot twice"));
+        }
+        #[cfg(feature = "flash-attn")]
+        let cuda = match first.backend {
+            BackendKind::Cuda if arenas.len() > 1 => {
+                let rows = (0..arenas.len())
+                    .map(|row| {
+                        Ok(StaticAttentionRaggedRow {
+                            query_start: u32::try_from(row)
+                                .map_err(|_| invalid("static-attention batch exceeds u32"))?,
+                            query_len: 1,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let memories = arenas
+                    .iter()
+                    .map(|arena| {
+                        Ok((
+                            u32::try_from(arena.absolute_cursor)
+                                .map_err(|_| invalid("static-attention CUDA cursor exceeds u32"))?,
+                            u32::try_from(arena.slot)
+                                .map_err(|_| invalid("static-attention CUDA slot exceeds u32"))?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Some(cuda_rows_over(&first.device, &rows, &memories)?)
+            }
+            _ => None,
+        };
+        Ok(StaticAttentionDecodeRows {
+            rows: arenas.len(),
+            #[cfg(feature = "flash-attn")]
+            cuda,
+        })
+    }
+
+    /// Attend `queries` (`[rows, query_heads, key_dim]`, row `i` one decode
+    /// query of `arenas[i]`) over each row's own memory at `model_layer`.
+    /// One row is exactly [`Self::attend`]; CUDA runs every row in one
+    /// flash-attention call over the shared backing; CPU and Metal attend
+    /// row by row, so each row's output is the same as alone.
+    pub(crate) fn attend_decode_rows(
+        arenas: &[&Self],
+        rows: &StaticAttentionDecodeRows,
+        model_layer: u32,
+        queries: &Tensor,
+        softmax_scale: f32,
+    ) -> Result<Tensor> {
+        if arenas.len() != rows.rows || queries.rank() != 3 || queries.dim(0)? != rows.rows {
+            return Err(invalid(
+                "static-attention decode queries do not match their lowered rows",
+            ));
+        }
+        let decode_row = [StaticAttentionRaggedRow {
+            query_start: 0,
+            query_len: 1,
+        }];
+        if let [arena] = arenas {
+            return arena.attend(model_layer, queries, &decode_row, softmax_scale);
+        }
+        #[cfg(feature = "flash-attn")]
+        if let Some(metadata) = &rows.cuda {
+            let first = arenas[0];
+            let layer = first.layer(model_layer)?;
+            validate_queries(
+                queries,
+                &metadata.rows,
+                layer,
+                &first.device,
+                u64::try_from(metadata.max_memory_tokens)
+                    .map_err(|_| invalid("static-attention memory length exceeds u64"))?,
+                softmax_scale,
+            )?;
+            for arena in arenas {
+                arena.require_clean()?;
+            }
+            return first.flash_attend(layer, queries, metadata, softmax_scale);
+        }
+        let outputs = arenas
+            .iter()
+            .enumerate()
+            .map(|(row, arena)| {
+                arena.attend(
+                    model_layer,
+                    &queries.narrow(0, row, 1)?,
+                    &decode_row,
+                    softmax_scale,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Tensor::cat(&outputs, 0).map_err(Error::from)
+    }
+
+    fn layer(&self, model_layer: u32) -> Result<&StaticAttentionLayerBacking> {
+        self.backing
+            .layers
+            .binary_search_by_key(&model_layer, |layer| layer.semantic.model_layer)
+            .ok()
+            .map(|index| &self.backing.layers[index])
+            .ok_or_else(|| invalid("static-attention request references an unknown model layer"))
+    }
+
     pub(crate) fn reset_for_reuse(&mut self) -> Result<()> {
         #[cfg(test)]
         if FAIL_NEXT_RESET.with(|fail| fail.replace(false)) {
             self.dirty = true;
             return Err(invalid("injected static-attention reset failure"));
         }
-        for layer in &mut self.layers {
-            if let Err(error) = layer.keys.zero_set() {
-                self.dirty = true;
-                return Err(error.into());
-            }
-            if let Err(error) = layer.values.zero_set() {
-                self.dirty = true;
-                return Err(error.into());
+        let start = self.slot_start();
+        for layer in &self.backing.layers {
+            for var in [&layer.keys, &layer.values] {
+                if let Err(error) = zero_rows(var, start, self.max_memory_tokens) {
+                    self.dirty = true;
+                    return Err(error);
+                }
             }
         }
         if let Err(error) = self.device.synchronize() {
@@ -546,6 +789,10 @@ impl InvocationStaticAttentionArena {
         self.initialized = false;
         self.pending_install = None;
         self.dirty = false;
+        #[cfg(feature = "flash-attn")]
+        {
+            self.cuda_decode_rows = None;
+        }
         Ok(())
     }
 
@@ -648,7 +895,7 @@ impl InvocationStaticAttentionArena {
             source_identity: *source_identity,
             target_cursor: intent.target_cursor,
             memory_tokens,
-            written_layers: vec![false; self.layers.len()],
+            written_layers: vec![false; self.backing.layers.len()],
             failed: false,
         })
     }
@@ -661,13 +908,13 @@ impl InvocationStaticAttentionArena {
     }
 
     fn validate_install_values(&self, values: &[StaticAttentionLayerValue]) -> Result<usize> {
-        if values.len() != self.layers.len() {
+        if values.len() != self.backing.layers.len() {
             return Err(invalid(
                 "static-attention installation must cover every layer",
             ));
         }
         let mut common_memory_tokens = None;
-        for (backing, value) in self.layers.iter().zip(values) {
+        for (backing, value) in self.backing.layers.iter().zip(values) {
             if value.model_layer != backing.semantic.model_layer {
                 return Err(invalid(
                     "static-attention layers are not in canonical model-layer order",
@@ -701,7 +948,7 @@ impl InvocationStaticAttentionArena {
                     "static-attention memory length is zero or exceeds capacity",
                 ));
             }
-            if self.layers.iter().any(|candidate| {
+            if self.backing.layers.iter().any(|candidate| {
                 shares_storage(&value.keys, candidate.keys.as_tensor())
                     || shares_storage(&value.keys, candidate.values.as_tensor())
                     || shares_storage(&value.values, candidate.keys.as_tensor())
@@ -735,8 +982,11 @@ impl InvocationStaticAttentionArena {
         let (key_storage, key_layout) = layer.keys.as_tensor().storage_and_layout();
         let (value_storage, value_layout) = layer.values.as_tensor().storage_and_layout();
         let (query_storage, query_layout) = queries.storage_and_layout();
-        let key_start = contiguous_range(key_layout, "static-attention CPU keys")?.0;
-        let value_start = contiguous_range(value_layout, "static-attention CPU values")?.0;
+        let slot_start = self.slot_start();
+        let key_start = contiguous_range(key_layout, "static-attention CPU keys")?.0
+            + slot_start * kv_heads * key_dim;
+        let value_start = contiguous_range(value_layout, "static-attention CPU values")?.0
+            + slot_start * kv_heads * value_dim;
         let query_start = contiguous_range(query_layout, "static-attention CPU queries")?.0;
 
         macro_rules! attend_typed {
@@ -803,10 +1053,12 @@ impl InvocationStaticAttentionArena {
         let mut metadata = Vec::with_capacity(batch_size * 3);
         metadata.extend(std::iter::repeat_n(memory_tokens, batch_size));
         metadata.extend(std::iter::repeat_n(0_u32, batch_size));
-        metadata.extend(std::iter::repeat_n(0_u32, batch_size));
+        let slot = u32::try_from(self.slot)
+            .map_err(|_| invalid("static-attention Metal slot exceeds u32"))?;
+        metadata.extend(std::iter::repeat_n(slot, batch_size));
         let device_metadata = Tensor::from_vec(metadata.clone(), metadata.len(), queries.device())?;
         let keys = layer.keys.as_tensor().reshape((
-            1,
+            self.backing.slots,
             page_tokens,
             usize::try_from(layer.semantic.kv_heads)
                 .map_err(|_| invalid("static-attention KV heads exceed usize"))?,
@@ -814,7 +1066,7 @@ impl InvocationStaticAttentionArena {
                 .map_err(|_| invalid("static-attention key dimension exceeds usize"))?,
         ))?;
         let values = layer.values.as_tensor().reshape((
-            1,
+            self.backing.slots,
             page_tokens,
             usize::try_from(layer.semantic.kv_heads)
                 .map_err(|_| invalid("static-attention KV heads exceed usize"))?,
@@ -854,6 +1106,21 @@ impl InvocationStaticAttentionArena {
         Err(invalid("static-attention Metal operation is not compiled"))
     }
 
+    /// The flash-attention metadata of `rows` over this arena's installed
+    /// memory of `memory_tokens` tokens.
+    #[cfg(feature = "flash-attn")]
+    fn cuda_rows(
+        &self,
+        rows: &[StaticAttentionRaggedRow],
+        memory_tokens: u64,
+    ) -> Result<StaticAttentionCudaRows> {
+        let memory_tokens = u32::try_from(memory_tokens)
+            .map_err(|_| invalid("static-attention CUDA cursor exceeds u32"))?;
+        let slot = u32::try_from(self.slot)
+            .map_err(|_| invalid("static-attention CUDA slot exceeds u32"))?;
+        cuda_rows_over(&self.device, rows, &vec![(memory_tokens, slot); rows.len()])
+    }
+
     #[cfg(feature = "flash-attn")]
     fn attend_cuda(
         &self,
@@ -862,58 +1129,52 @@ impl InvocationStaticAttentionArena {
         rows: &[StaticAttentionRaggedRow],
         softmax_scale: f32,
     ) -> Result<Tensor> {
-        let batch_size = rows.len();
-        let mut seqlens_q = Vec::with_capacity(batch_size + 1);
-        let mut seqlens_k = Vec::with_capacity(batch_size + 1);
-        seqlens_q.push(0_u32);
-        seqlens_k.push(0_u32);
-        let memory_tokens = u32::try_from(self.absolute_cursor)
-            .map_err(|_| invalid("static-attention CUDA cursor exceeds u32"))?;
-        let mut cumulative_q = 0_u32;
-        let mut cumulative_k = 0_u32;
-        let mut max_query_len = 0_usize;
-        for row in rows {
-            cumulative_q = cumulative_q
-                .checked_add(row.query_len)
-                .ok_or_else(|| invalid("static-attention CUDA query cursor overflow"))?;
-            cumulative_k = cumulative_k
-                .checked_add(memory_tokens)
-                .ok_or_else(|| invalid("static-attention CUDA memory cursor overflow"))?;
-            seqlens_q.push(cumulative_q);
-            seqlens_k.push(cumulative_k);
-            max_query_len = max_query_len.max(
-                usize::try_from(row.query_len)
-                    .map_err(|_| invalid("static-attention query length exceeds usize"))?,
-            );
-        }
-        let seqlens_q = Tensor::from_vec(seqlens_q, batch_size + 1, &self.device)?;
-        let seqlens_k = Tensor::from_vec(seqlens_k, batch_size + 1, &self.device)?;
-        let block_table = Tensor::zeros((batch_size, 1), DType::U32, &self.device)?;
+        let built;
+        let metadata = match &self.cuda_decode_rows {
+            Some(decode) if decode.rows == rows => decode,
+            _ => {
+                built = self.cuda_rows(rows, self.absolute_cursor)?;
+                &built
+            }
+        };
+        let memory_tokens = usize::try_from(self.absolute_cursor)
+            .map_err(|_| invalid("static-attention CUDA memory length exceeds usize"))?;
+        debug_assert_eq!(metadata.max_memory_tokens, memory_tokens);
+        self.flash_attend(layer, queries, metadata, softmax_scale)
+    }
+
+    /// One flash-attention call of `metadata`'s rows over the backing's
+    /// slots, whose block `s` is slot `s`.
+    #[cfg(feature = "flash-attn")]
+    fn flash_attend(
+        &self,
+        layer: &StaticAttentionLayerBacking,
+        queries: &Tensor,
+        metadata: &StaticAttentionCudaRows,
+        softmax_scale: f32,
+    ) -> Result<Tensor> {
         let kv_heads = usize::try_from(layer.semantic.kv_heads)
             .map_err(|_| invalid("static-attention KV heads exceed usize"))?;
         let head_dim = usize::try_from(layer.semantic.key_head_dim)
             .map_err(|_| invalid("static-attention head dimension exceeds usize"))?;
-        let keys =
-            layer
-                .keys
-                .as_tensor()
-                .reshape((1, self.max_memory_tokens, kv_heads, head_dim))?;
-        let values =
-            layer
-                .values
-                .as_tensor()
-                .reshape((1, self.max_memory_tokens, kv_heads, head_dim))?;
+        let paged = (
+            self.backing.slots,
+            self.max_memory_tokens,
+            kv_heads,
+            head_dim,
+        );
+        let keys = layer.keys.as_tensor().reshape(paged)?;
+        let values = layer.values.as_tensor().reshape(paged)?;
         candle_flash_attn::flash_attn_varlen_paged_windowed(
             queries,
             &keys,
             &values,
-            &seqlens_q,
-            &seqlens_k,
-            &block_table,
+            &metadata.seqlens_q,
+            &metadata.seqlens_k,
+            &metadata.block_table,
             None,
-            max_query_len,
-            usize::try_from(memory_tokens)
-                .map_err(|_| invalid("static-attention CUDA memory length exceeds usize"))?,
+            metadata.max_query_len,
+            metadata.max_memory_tokens,
             softmax_scale,
             None,
             None,
@@ -942,6 +1203,7 @@ impl InvocationStaticAttentionArena {
         model_layer: u32,
     ) -> Result<(candle_core::TensorId, candle_core::TensorId)> {
         let layer = self
+            .backing
             .layers
             .iter()
             .find(|layer| layer.semantic.model_layer == model_layer)
@@ -953,19 +1215,25 @@ impl InvocationStaticAttentionArena {
     fn layer_backing_values(&self, model_layer: u32) -> Result<(Vec<f32>, Vec<f32>)> {
         self.require_clean()?;
         let layer = self
+            .backing
             .layers
             .iter()
             .find(|layer| layer.semantic.model_layer == model_layer)
             .ok_or_else(|| invalid("static-attention test requested an unknown layer"))?;
-        Ok((
-            layer.keys.as_tensor().flatten_all()?.to_vec1::<f32>()?,
-            layer.values.as_tensor().flatten_all()?.to_vec1::<f32>()?,
-        ))
+        let slot = |var: &Var| -> Result<Vec<f32>> {
+            Ok(var
+                .as_tensor()
+                .narrow(0, self.slot_start(), self.max_memory_tokens)?
+                .flatten_all()?
+                .to_vec1::<f32>()?)
+        };
+        Ok((slot(&layer.keys)?, slot(&layer.values)?))
     }
 
     #[cfg(test)]
     fn layer_key_backing(&self, model_layer: u32) -> Result<Tensor> {
         Ok(self
+            .backing
             .layers
             .iter()
             .find(|layer| layer.semantic.model_layer == model_layer)
@@ -1030,6 +1298,62 @@ pub(super) fn static_plan_is_supported(
                 })
         }
     }
+}
+
+/// Flash-attention metadata of `rows` whose row `i` attends `memories[i]`:
+/// `(installed tokens, slot)`. The query and key lengths and the block table
+/// travel in one upload and are views of it.
+#[cfg(feature = "flash-attn")]
+fn cuda_rows_over(
+    device: &Device,
+    rows: &[StaticAttentionRaggedRow],
+    memories: &[(u32, u32)],
+) -> Result<StaticAttentionCudaRows> {
+    let batch_size = rows.len();
+    if batch_size == 0 || memories.len() != batch_size {
+        return Err(invalid(
+            "static-attention CUDA rows need one memory per non-empty row",
+        ));
+    }
+    let mut packed = Vec::with_capacity(3 * batch_size + 2);
+    packed.push(0_u32);
+    let mut cumulative_q = 0_u32;
+    let mut max_query_len = 0_usize;
+    for row in rows {
+        cumulative_q = cumulative_q
+            .checked_add(row.query_len)
+            .ok_or_else(|| invalid("static-attention CUDA query cursor overflow"))?;
+        packed.push(cumulative_q);
+        max_query_len = max_query_len.max(
+            usize::try_from(row.query_len)
+                .map_err(|_| invalid("static-attention query length exceeds usize"))?,
+        );
+    }
+    packed.push(0_u32);
+    let mut cumulative_k = 0_u32;
+    let mut max_memory_tokens = 0_usize;
+    for (memory_tokens, _) in memories {
+        cumulative_k = cumulative_k
+            .checked_add(*memory_tokens)
+            .ok_or_else(|| invalid("static-attention CUDA memory cursor overflow"))?;
+        packed.push(cumulative_k);
+        max_memory_tokens = max_memory_tokens.max(
+            usize::try_from(*memory_tokens)
+                .map_err(|_| invalid("static-attention memory length exceeds usize"))?,
+        );
+    }
+    packed.extend(memories.iter().map(|(_, slot)| *slot));
+    let packed = Tensor::from_vec(packed, 3 * batch_size + 2, device)?;
+    Ok(StaticAttentionCudaRows {
+        rows: rows.to_vec(),
+        seqlens_q: packed.narrow(0, 0, batch_size + 1)?,
+        seqlens_k: packed.narrow(0, batch_size + 1, batch_size + 1)?,
+        block_table: packed
+            .narrow(0, 2 * batch_size + 2, batch_size)?
+            .reshape((batch_size, 1))?,
+        max_query_len,
+        max_memory_tokens,
+    })
 }
 
 fn validate_direct_plan(
@@ -1196,6 +1520,22 @@ where
     Ok(output)
 }
 
+/// Zero `rows` rows of `var` from `start` along its first axis: the whole
+/// tensor in place when that is all of it, otherwise by copying zeros in.
+fn zero_rows(var: &Var, start: usize, rows: usize) -> Result<()> {
+    if rows == 0 {
+        return Ok(());
+    }
+    let dims = var.dims();
+    if start == 0 && rows == dims[0] {
+        return var.zero_set().map_err(Error::from);
+    }
+    let mut shape = dims.to_vec();
+    shape[0] = rows;
+    let zeros = Tensor::zeros(shape, var.dtype(), var.device())?;
+    var.slice_set(&zeros, 0, start).map_err(Error::from)
+}
+
 fn tensor_bytes(tensor: &Tensor) -> Result<u64> {
     let bytes = tensor
         .elem_count()
@@ -1216,7 +1556,7 @@ fn candle_dtype(storage: StateStorageFormat) -> Result<DType> {
     }
 }
 
-fn device_ordinal(device: &Device) -> Result<Option<u32>> {
+pub(crate) fn device_ordinal(device: &Device) -> Result<Option<u32>> {
     match device.location() {
         DeviceLocation::Cpu => Ok(None),
         DeviceLocation::Cuda { gpu_id } => u32::try_from(gpu_id)
@@ -1750,6 +2090,178 @@ mod tests {
         let (keys, values) = arena.layer_backing_values(0).unwrap();
         assert_eq!(keys, vec![0.0; 8]);
         assert_eq!(values, vec![0.0; 8]);
+    }
+
+    /// `slots` retained arenas of one layer (4 query heads over 2 KV heads)
+    /// sharing one backing.
+    fn retained_pool(slots: usize, max_memory_tokens: u64) -> Vec<InvocationStaticAttentionArena> {
+        let semantic_layers = vec![layer(0, 4, 2)];
+        let mut header = header();
+        header.scope = StateScope::Retained;
+        let domain = StateDomainSpec::StaticAttention(StaticAttentionDomainSpec {
+            header,
+            layers: semantic_layers.clone(),
+            max_memory_tokens,
+            accepted_dtypes: vec![StateDType::F32],
+        });
+        let contract = InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: vec![domain.clone()],
+            groups: vec![crate::kv::v2::StateGroupSpec {
+                id: StateGroupId::new(1),
+                domains: vec![domain.id()],
+                prefix_shareable: false,
+            }],
+        };
+        let plan = Arc::new(
+            crate::backends::state::negotiate_state_plan(
+                &contract,
+                &crate::backends::state::StateBackendPlanRequest {
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    page_tokens_hint: None,
+                    storage_dtype_hint: Some(StateDType::F32),
+                },
+            )
+            .unwrap(),
+        );
+        InvocationStaticAttentionArena::new_retained_pool(
+            &contract,
+            plan,
+            domain.id(),
+            Device::Cpu,
+            slots,
+        )
+        .unwrap()
+    }
+
+    fn pool_memory(memory_tokens: usize, seed: f32) -> (Vec<f32>, Vec<f32>) {
+        let elements = memory_tokens * 2 * 2;
+        let wave = |offset: f32| {
+            (0..elements)
+                .map(|index| ((index as f32 + seed) * 0.37 + offset).sin())
+                .collect::<Vec<_>>()
+        };
+        (wave(0.0), wave(1.3))
+    }
+
+    /// A pool's arenas share one backing but each reads and writes only
+    /// its own slot: installs and resets leave the other slots intact, and
+    /// each slot attends exactly as a lone arena does.
+    #[test]
+    fn pooled_arenas_own_disjoint_slots_of_one_backing() {
+        let mut pool = retained_pool(3, 4);
+        assert!(pool.iter().all(|arena| arena.maximum_bytes() == 128));
+        assert_eq!(
+            pool[0].layer_backing_ids(0).unwrap(),
+            pool[2].layer_backing_ids(0).unwrap()
+        );
+        let memories = [(3, 0.0), (4, 5.0), (2, 9.0)];
+        for (arena, (tokens, seed)) in pool.iter_mut().zip(memories) {
+            let (keys, memory_values) = pool_memory(tokens, seed);
+            arena
+                .install(
+                    [seed as u8 + 1; 32],
+                    vec![values(0, &keys, &memory_values, tokens, 2)],
+                )
+                .unwrap();
+        }
+        let queries = [1.0, 0.0, 0.5, 0.5, 0.0, 1.0, -0.5, 0.5];
+        let query_tensor = Tensor::from_slice(&queries, (1, 4, 2), &Device::Cpu).unwrap();
+        let row = [StaticAttentionRaggedRow {
+            query_start: 0,
+            query_len: 1,
+        }];
+        for (arena, (tokens, seed)) in pool.iter().zip(memories) {
+            let (keys, memory_values) = pool_memory(tokens, seed);
+            let (slot_keys, _) = arena.layer_backing_values(0).unwrap();
+            assert_eq!(&slot_keys[..keys.len()], keys.as_slice());
+            assert!(slot_keys[keys.len()..].iter().all(|value| *value == 0.0));
+            let output = arena
+                .attend(0, &query_tensor, &row, 0.5)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let expected = dense_reference(&queries, &keys, &memory_values, 1, 4, 2, tokens, 0.5);
+            assert_close(&output, &expected);
+        }
+        pool[1].reset_for_reuse().unwrap();
+        assert_eq!(pool[1].layer_backing_values(0).unwrap().0, vec![0.0; 16]);
+        let (keys, _) = pool_memory(3, 0.0);
+        assert_eq!(
+            &pool[0].layer_backing_values(0).unwrap().0[..12],
+            keys.as_slice()
+        );
+        let (keys, _) = pool_memory(2, 9.0);
+        assert_eq!(
+            &pool[2].layer_backing_values(0).unwrap().0[..8],
+            keys.as_slice()
+        );
+    }
+
+    /// One decode query per arena, lowered once, attends each row's own
+    /// memory exactly as that arena alone does, in any row order; one row
+    /// is the single-arena call.
+    #[test]
+    fn decode_rows_attend_each_row_as_its_arena_alone() {
+        let mut pool = retained_pool(3, 4);
+        for (arena, (tokens, seed)) in pool.iter_mut().zip([(3, 1.0), (4, 2.0), (1, 3.0)]) {
+            let (keys, memory_values) = pool_memory(tokens, seed);
+            arena
+                .install([7; 32], vec![values(0, &keys, &memory_values, tokens, 2)])
+                .unwrap();
+        }
+        let row = [StaticAttentionRaggedRow {
+            query_start: 0,
+            query_len: 1,
+        }];
+        let order = [&pool[2], &pool[0], &pool[1]];
+        let queries = (0..3 * 4 * 2)
+            .map(|index| (index as f32 * 0.61).cos())
+            .collect::<Vec<_>>();
+        let query_tensor = Tensor::from_slice(&queries, (3, 4, 2), &Device::Cpu).unwrap();
+        let rows = InvocationStaticAttentionArena::decode_rows(&order).unwrap();
+        let batched = InvocationStaticAttentionArena::attend_decode_rows(
+            &order,
+            &rows,
+            0,
+            &query_tensor,
+            0.75,
+        )
+        .unwrap();
+        assert_eq!(batched.dims(), &[3, 4, 2]);
+        for (index, arena) in order.iter().enumerate() {
+            let alone = arena
+                .attend(0, &query_tensor.narrow(0, index, 1).unwrap(), &row, 0.75)
+                .unwrap();
+            assert_eq!(
+                batched
+                    .narrow(0, index, 1)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                alone.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            );
+        }
+        // Repeated slots, wrong query counts and uninstalled memories fail.
+        assert!(InvocationStaticAttentionArena::decode_rows(&[&pool[0], &pool[0]]).is_err());
+        assert!(InvocationStaticAttentionArena::attend_decode_rows(
+            &order,
+            &rows,
+            0,
+            &query_tensor.narrow(0, 0, 2).unwrap(),
+            0.75,
+        )
+        .is_err());
+        pool[1].reset_for_reuse().unwrap();
+        assert!(InvocationStaticAttentionArena::decode_rows(&[&pool[0], &pool[1]]).is_err());
+        // Arenas of different backings cannot share a lowered batch.
+        let other = retained_pool(1, 4);
+        assert!(InvocationStaticAttentionArena::decode_rows(&[&pool[0], &other[0]]).is_err());
     }
 
     #[test]

@@ -41,10 +41,10 @@ mod reference_tests;
 pub(crate) mod synthetic;
 
 pub use model::{
-    decode_quantum, planned_decode_tokens, prefill_span, NemotronPreparedArtifact,
-    NemotronRetainedCheckpoint, NemotronRetainedState, NemotronStepRow, NemotronTranscribeModel,
-    NemotronTranscribeRequest, NemotronTranscription, DECODE_QUANTUM_ENV, MAX_AUDIO_SECONDS,
-    MAX_CONTEXT_TOKENS, MAX_NEW_TOKENS, PREFILL_SPAN_ENV,
+    decode_quantum, planned_decode_tokens, prefill_span, NemotronPrefillRow,
+    NemotronPreparedArtifact, NemotronRetainedCheckpoint, NemotronRetainedState, NemotronStepRow,
+    NemotronTranscribeModel, NemotronTranscribeRequest, NemotronTranscription, BATCHED_PREFILL_ENV,
+    DECODE_QUANTUM_ENV, MAX_AUDIO_SECONDS, MAX_CONTEXT_TOKENS, MAX_NEW_TOKENS, PREFILL_SPAN_ENV,
 };
 pub use prompt::{NemotronPromptOptions, LANGUAGES as NEMOTRON_TRANSCRIBE_LANGUAGES};
 pub use transcript::NemotronFinishReason;

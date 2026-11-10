@@ -133,6 +133,102 @@ impl MambaMixer {
         Ok((out, next_conv, next_ssm))
     }
 
+    /// Several rows' prefill spans packed into `h` `[sum(lengths), hidden]`
+    /// (row `r`'s `lengths[r]` tokens contiguous, rows in order), each row
+    /// with its own convolution history `[1, K - 1, C]` and SSM state
+    /// `[1, heads, head_dim, state]`. The projections (each row through the
+    /// kernel its span alone takes) and the gated norm run once over every
+    /// token; the convolution and the scan run per row over that row's
+    /// tokens (one call over the stacked rows when every row has the same
+    /// length), so each row's recurrence is its own whatever shares the
+    /// call. Returns the output and each row's next history and state.
+    pub fn forward_packed(
+        &self,
+        h: &Tensor,
+        lengths: &[usize],
+        conv: &[&Tensor],
+        ssm: &[&Tensor],
+    ) -> Result<(Tensor, Vec<Tensor>, Vec<Tensor>)> {
+        let m = self.config;
+        let rows = lengths.len();
+        if rows == 0 || conv.len() != rows || ssm.len() != rows || lengths.contains(&0) {
+            return Err(crate::error::Error::InferenceError(
+                "a packed Mamba2 call needs one non-empty span and one state per row".into(),
+            ));
+        }
+        let projected = self.in_proj.forward_rows(h, lengths, false)?;
+        let z = projected.narrow(1, 0, m.inner())?;
+        let xbc = projected.narrow(1, m.inner(), m.conv_channels())?;
+        let dt = projected.narrow(1, m.inner() + m.conv_channels(), m.heads)?;
+        let (y, next_conv, next_ssm) = if lengths.iter().all(|&len| len == lengths[0]) {
+            let tokens = lengths[0];
+            let xbc = xbc
+                .contiguous()?
+                .reshape((rows, tokens, m.conv_channels()))?;
+            let dt = dt.contiguous()?.reshape((rows, tokens, m.heads))?;
+            let (u, next_conv) = mamba2::causal_conv_silu(
+                &xbc,
+                &Tensor::cat(conv, 0)?,
+                &self.conv_weight,
+                &self.conv_bias,
+            )?;
+            let (y, next_ssm) = mamba2::selective_scan(
+                m.geometry(),
+                &u.contiguous()?,
+                &dt,
+                &self.params,
+                &Tensor::cat(ssm, 0)?,
+            )?;
+            let split = |t: &Tensor| -> Result<Vec<Tensor>> {
+                (0..rows).map(|r| Ok(t.narrow(0, r, 1)?)).collect()
+            };
+            (
+                y.reshape((rows * tokens, m.inner()))?,
+                split(&next_conv)?,
+                split(&next_ssm)?,
+            )
+        } else {
+            let mut ys = Vec::with_capacity(rows);
+            let mut next_conv = Vec::with_capacity(rows);
+            let mut next_ssm = Vec::with_capacity(rows);
+            let mut offset = 0;
+            for (r, &tokens) in lengths.iter().enumerate() {
+                let xbc = xbc.narrow(0, offset, tokens)?.contiguous()?.reshape((
+                    1,
+                    tokens,
+                    m.conv_channels(),
+                ))?;
+                let dt = dt
+                    .narrow(0, offset, tokens)?
+                    .contiguous()?
+                    .reshape((1, tokens, m.heads))?;
+                let (u, conv) =
+                    mamba2::causal_conv_silu(&xbc, conv[r], &self.conv_weight, &self.conv_bias)?;
+                let (y, ssm) = mamba2::selective_scan(
+                    m.geometry(),
+                    &u.contiguous()?,
+                    &dt,
+                    &self.params,
+                    ssm[r],
+                )?;
+                ys.push(y.reshape((tokens, m.inner()))?);
+                next_conv.push(conv);
+                next_ssm.push(ssm);
+                offset += tokens;
+            }
+            (Tensor::cat(&ys, 0)?, next_conv, next_ssm)
+        };
+        let gated = mamba2::gated_group_rms_norm(
+            &y,
+            &z.contiguous()?,
+            &self.norm,
+            m.norm_group(),
+            self.eps,
+        )?;
+        let out = self.out_proj.forward_rows(&gated, lengths, false)?;
+        Ok((out, next_conv, next_ssm))
+    }
+
     /// Where a step's operands sit in the in_proj row `[z | xBC | dt]`.
     fn step_layout(&self) -> mamba2::Mamba2StepLayout {
         let m = self.config;

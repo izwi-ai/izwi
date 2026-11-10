@@ -56,6 +56,11 @@ use crate::models::shared::detokenize::IncrementalDetokenizer;
 const DEFAULT_MAX_NEW_TOKENS: usize = 768;
 const DEFAULT_MAX_AUDIO_SECONDS: f32 = 60.0 * 60.0;
 const CUDA_MAX_AUDIO_SECONDS_ENV: &str = "IZWI_VIBEVOICE_ASR_CUDA_MAX_AUDIO_SECS";
+/// The longest single pass CUDA runs by default; longer input is chunked.
+/// On an 80 GB H100 a 600 s single pass ran out of device memory after
+/// admission (1fd25ae1f), while the same file in 300 s and 120 s chunks
+/// transcribed within about 42 GB.
+const CUDA_DEFAULT_MAX_AUDIO_SECONDS: f32 = 300.0;
 const TOKENIZER_STREAMING_CHUNK_SECONDS: usize = 60;
 /// Text tokens (chat template, timing header, language and caller
 /// instructions) a retained-route prompt may add to its audio placeholders.
@@ -289,6 +294,11 @@ impl VibeVoiceAsrRetainedTokenizerQuantum {
 }
 
 impl VibeVoiceAsrPreparedArtifact {
+    /// The device holding the prepared prompt embeddings.
+    pub(crate) fn device_location(&self) -> candle_core::DeviceLocation {
+        self.prompt_embeddings.device().location()
+    }
+
     pub(crate) const fn geometry(&self) -> VibeVoiceAsrPreparedGeometry {
         self.geometry
     }
@@ -548,6 +558,12 @@ const VIBEVOICE_TOKENIZER_PROBE_SAMPLES: usize = 4 * 3200;
 const VIBEVOICE_LM_PROBE_TOKENS: usize = 16;
 
 impl VibeVoiceAsrModel {
+    /// The language model's CUDA decode graphs: captures, replays and why
+    /// they are off.
+    pub(crate) fn decode_graph_diagnostics(&self) -> serde_json::Value {
+        self.language_model.decode_graph_diagnostics()
+    }
+
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         if variant != ModelVariant::VibeVoiceAsr {
             return Err(Error::InvalidInput(format!(
@@ -620,7 +636,7 @@ impl VibeVoiceAsrModel {
             config.decoder_config.hidden_size,
             vb.pp("model.semantic_connector"),
         )?;
-        let (language_model, lm_precision) = load_with_precision_fallback(
+        let (mut language_model, lm_precision) = load_with_precision_fallback(
             "VibeVoice-ASR LM",
             &lm_selection,
             device.kind.is_metal(),
@@ -646,6 +662,10 @@ impl VibeVoiceAsrModel {
             },
         )?;
         drop(vb);
+        language_model.enable_asr_decode_graph(
+            "VibeVoice-ASR",
+            crate::models::architectures::qwen3::decode_graph::VIBEVOICE_ASR_DECODE_GRAPHS_ENV,
+        );
         let lm_dtype = lm_precision.loaded;
         let model_identity = vibevoice_asr_model_identity(
             model_dir,
@@ -926,6 +946,19 @@ impl VibeVoiceAsrModel {
         })
     }
 
+    /// Bytes the legacy invocation (`asr.scalar`) reserves when it dispatches,
+    /// beside its typed decoder and tokenizer state, for the longest audio
+    /// this device takes in one pass ([`vibevoice_legacy_workspace_bytes`]).
+    pub(crate) fn legacy_invocation_workspace_bytes(&self) -> Result<u64> {
+        vibevoice_legacy_workspace_bytes(
+            &self.config,
+            &self.preprocessor,
+            self.dtype,
+            self.lm_dtype,
+            vibevoice_asr_max_audio_seconds_hint(self.device.kind),
+        )
+    }
+
     /// Tokens one retained-route sequence needs (P2.5): its text prompt, one
     /// tokenizer chunk of audio placeholders and that chunk's duration
     /// budget, within the decoder context. The retained route takes no more
@@ -967,6 +1000,13 @@ impl VibeVoiceAsrModel {
         ))
     }
 
+    /// Tokens the legacy route prefills per decoder call: the retained
+    /// route's largest prompt, so a long file's prefill activations are those
+    /// of one retained prompt, not of the whole file.
+    fn legacy_prefill_span_tokens(&self) -> Result<usize> {
+        self.retained_prompt_token_bound()
+    }
+
     pub(crate) fn continuous_decode_workspace_per_row_bytes(&self) -> Result<u64> {
         u64::try_from(self.language_model.hidden_size())
             .ok()
@@ -981,6 +1021,20 @@ impl VibeVoiceAsrModel {
         language: Option<&str>,
         prompt: Option<&str>,
     ) -> Result<VibeVoiceAsrPreparedArtifact> {
+        let host = self.prepare_retained_host_audio(audio, sample_rate, language, prompt)?;
+        self.prepare_retained_artifact_from_host_audio(host, language, prompt)
+    }
+
+    /// One request's encoder audio on a host worker: resampled to the
+    /// tokenizer's rate, loudness-normalized and padded to whole acoustic
+    /// frames, with the geometry and source identity it must keep.
+    pub(crate) fn prepare_retained_host_audio(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<VibeVoiceAsrHostAudio> {
         let expected_geometry =
             match self.retained_preparation_decision(audio.len(), sample_rate, language, prompt)? {
                 VibeVoiceAsrPreparationDecision::Retained(geometry) => geometry,
@@ -1001,13 +1055,43 @@ impl VibeVoiceAsrModel {
         let encoder_samples = acoustic_frames.checked_mul(ratio).ok_or_else(|| {
             Error::Overloaded("VibeVoice ASR padded encoder length overflow".into())
         })?;
-        let mut encoder_audio = processed_audio.clone();
+        let processed_samples = processed_audio.len();
+        let mut encoder_audio = processed_audio;
         encoder_audio.resize(encoder_samples, 0.0);
+        Ok(VibeVoiceAsrHostAudio {
+            expected_geometry,
+            encoder_audio,
+            processed_samples,
+            acoustic_frames,
+            input_samples: audio.len(),
+            input_sample_rate: sample_rate,
+            source_identity: vibevoice_asr_source_identity(audio, sample_rate),
+        })
+    }
+
+    /// Builds one request's retained artifact from its host audio: the
+    /// upload, the prompt embeddings and any sampling noise.
+    pub(crate) fn prepare_retained_artifact_from_host_audio(
+        &self,
+        host: VibeVoiceAsrHostAudio,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<VibeVoiceAsrPreparedArtifact> {
+        let VibeVoiceAsrHostAudio {
+            expected_geometry,
+            encoder_audio,
+            processed_samples,
+            acoustic_frames,
+            input_samples,
+            input_sample_rate,
+            source_identity,
+        } = host;
+        let encoder_samples = encoder_audio.len();
         let encoder_audio =
             Tensor::from_vec(encoder_audio, (1, 1, encoder_samples), &self.device.device)?
                 .to_dtype(self.dtype)?;
         let audio_seconds =
-            processed_audio.len() as f64 / f64::from(self.preprocessor.target_sample_rate());
+            processed_samples as f64 / f64::from(self.preprocessor.target_sample_rate());
         let extra = prompt_instruction(language, prompt);
         let prepared_prompt =
             self.tokenizer
@@ -1062,9 +1146,9 @@ impl VibeVoiceAsrModel {
             .and_then(|tokens| tokens.checked_mul(u64::try_from(size_of::<u32>()).ok()?))
             .ok_or_else(|| Error::Overloaded("VibeVoice ASR prompt bytes overflow".into()))?;
         let geometry = VibeVoiceAsrPreparedGeometry {
-            input_samples: audio.len(),
-            input_sample_rate: sample_rate,
-            processed_samples: processed_audio.len(),
+            input_samples,
+            input_sample_rate,
+            processed_samples,
             encoder_samples,
             acoustic_frames,
             prompt_tokens: prepared_prompt.input_ids.len(),
@@ -1084,7 +1168,7 @@ impl VibeVoiceAsrModel {
         )?]);
         Ok(VibeVoiceAsrPreparedArtifact {
             model_identity: self.model_identity,
-            source_identity: vibevoice_asr_source_identity(audio, sample_rate),
+            source_identity,
             prompt_identity: vibevoice_asr_prompt_identity(language, prompt),
             prompt_ids: prepared_prompt.input_ids.into(),
             acoustic_input_range: prepared_prompt.acoustic_input_range,
@@ -1880,6 +1964,7 @@ impl VibeVoiceAsrModel {
                 semantic.typed_mut::<InvocationTensorLease>()?,
             )?
         };
+        drop(speech);
         let physical_cache = leases
             .lease_mut(crate::models::architectures::vibevoice::VIBEVOICE_ASR_DECODER_DOMAIN)?
             .paged_cache_mut()?;
@@ -1907,6 +1992,7 @@ impl VibeVoiceAsrModel {
             prompt.acoustic_input_range.clone(),
             &speech_features.to_dtype(input_embeds.dtype())?,
         )?;
+        drop(speech_features);
 
         if physical_cache.context_len() != 0 {
             return Err(Error::InvalidInput(
@@ -1916,9 +2002,13 @@ impl VibeVoiceAsrModel {
         let decode_cache_dense_max_tokens = 0;
         let cuda_device_argmax = self.device.kind.is_cuda();
         let prefill_started = Instant::now();
-        let logits = self
-            .language_model
-            .forward_managed_last_logits_with_embeds(&input_embeds, 0, physical_cache, None)?;
+        let prefill_span = self.legacy_prefill_span_tokens()?;
+        let logits = prefill_managed_in_spans(
+            &self.language_model,
+            &input_embeds,
+            physical_cache,
+            prefill_span,
+        )?;
         let prefill_ms = elapsed_ms(prefill_started);
         let mut next = argmax_last_logits(&logits, cuda_device_argmax)?;
         let mut generated = Vec::new();
@@ -2041,6 +2131,7 @@ impl VibeVoiceAsrModel {
                     "cuda_dense_decode_cache": decode_cache_dense_max_tokens > 0,
                     "dense_decode_max_tokens": decode_cache_dense_max_tokens,
                     "cuda_device_argmax": cuda_device_argmax,
+                    "prefill_span_tokens": prefill_span,
                 },
                 "timings_ms": {
                     "preprocess": preprocess_ms,
@@ -2166,6 +2257,25 @@ impl VibeVoiceAsrModel {
 }
 
 impl VibeVoiceAsrDecodeState {
+    /// The diagnostics of a row that ends on the retained route.
+    pub(crate) fn retained_terminal_diagnostics(&self) -> serde_json::Value {
+        let geometry = self.prepared.as_ref().map(|artifact| artifact.geometry);
+        serde_json::json!({
+            "model_family": "vibevoice_asr",
+            "audio": {
+                "input_samples": geometry.map(|geometry| geometry.input_samples),
+                "input_sample_rate": geometry.map(|geometry| geometry.input_sample_rate),
+                "processed_samples": geometry.map(|geometry| geometry.processed_samples),
+                "acoustic_frames": geometry.map(|geometry| geometry.acoustic_frames),
+            },
+            "prompt": { "prompt_tokens": self.prompt_tokens },
+            "decode": {
+                "max_new_tokens": self.max_new_tokens,
+                "generated_tokens": self.generated.len(),
+            },
+        })
+    }
+
     pub(crate) fn prepared_artifact(&self) -> Option<Arc<VibeVoiceAsrPreparedArtifact>> {
         self.prepared.clone()
     }
@@ -2390,6 +2500,40 @@ fn take_vibevoice_quantum_argmax(output: &mut Option<Tensor>, on_device: bool) -
     argmax_last_logits(&output, on_device)
 }
 
+/// Prefill `embeds` (`[1, tokens, hidden]`) into the empty `cache` in
+/// decoder calls of at most `span` tokens and return the last position's
+/// logits, as one call over every token would. Each call's activations cover
+/// its span alone; the spans before it are only committed K/V.
+fn prefill_managed_in_spans(
+    model: &Qwen3Model,
+    embeds: &Tensor,
+    cache: &mut PhysicalPagedKvCache,
+    span: usize,
+) -> Result<Tensor> {
+    let tokens = embeds.dim(1)?;
+    if tokens == 0 || span == 0 || cache.context_len() != 0 {
+        return Err(Error::InvalidInput(format!(
+            "VibeVoice ASR span prefill of {tokens} tokens in spans of {span} needs an empty cache"
+        )));
+    }
+    let mut start = 0;
+    while tokens - start > span {
+        model.forward_managed_prefill_only_with_embeds(
+            &embeds.narrow(1, start, span)?,
+            start,
+            cache,
+            None,
+        )?;
+        start += span;
+    }
+    model.forward_managed_last_logits_with_embeds(
+        &embeds.narrow(1, start, tokens - start)?,
+        start,
+        cache,
+        None,
+    )
+}
+
 fn forward_vibevoice_pending_decode_batch(
     model: &Qwen3Model,
     device: &candle_core::Device,
@@ -2419,7 +2563,8 @@ fn forward_vibevoice_pending_decode_batch(
         })
         .collect::<Result<Vec<_>>>()?;
     let input = Tensor::from_vec(pending, (states.len(), 1), device)?;
-    let output = if states.len() == 1 {
+    // With the decode graphs on, a lone row decodes through the width-1 graph.
+    let output = if states.len() == 1 && !model.decode_graph_on() {
         model.forward_managed(&input, positions[0], &mut states[0].cache)?
     } else {
         let mut caches = states
@@ -2523,6 +2668,88 @@ fn checked_tensor_elements(frames: usize, channels: usize, live_factor: u64) -> 
         .and_then(|frames| frames.checked_mul(u64::try_from(channels).ok()?))
         .and_then(|elements| elements.checked_mul(live_factor))
         .ok_or_else(|| Error::Overloaded("VibeVoice tokenizer workspace elements overflow".into()))
+}
+
+/// Bytes one legacy invocation holds beside its typed decoder and tokenizer
+/// state, for the longest audio it takes in one pass (`max_audio_secs`,
+/// within the decoder context). The padded input and the tokenizer means
+/// stay resident, beside the largest of:
+/// - one tokenizer chunk, in F32: the norms accumulate half-precision
+///   activations in F32;
+/// - both connectors over every audio token;
+/// - the prompt assembly: the embeddings, their feature-spliced copy and the
+///   features;
+/// - the prompt embeddings, one prefill span's activations (eight hidden and
+///   three feed-forward planes, in F32 at most) and the last logits row.
+fn vibevoice_legacy_workspace_bytes(
+    config: &VibeVoiceConfig,
+    preprocessor: &VibeVoicePreprocessorConfig,
+    audio_dtype: DType,
+    lm_dtype: DType,
+    max_audio_secs: f32,
+) -> Result<u64> {
+    let overflow = || Error::Overloaded("VibeVoice ASR legacy workspace overflow".into());
+    let to_u64 = |value: usize| u64::try_from(value).map_err(|_| overflow());
+    let product = |values: &[u64]| {
+        values
+            .iter()
+            .try_fold(1u64, |total, value| total.checked_mul(*value))
+            .ok_or_else(overflow)
+    };
+    let sum = |values: &[u64]| {
+        values
+            .iter()
+            .try_fold(0u64, |total, value| total.checked_add(*value))
+            .ok_or_else(overflow)
+    };
+    if !max_audio_secs.is_finite() || max_audio_secs <= 0.0 {
+        return Err(Error::ModelLoadError(format!(
+            "VibeVoice ASR legacy audio bound {max_audio_secs} s is not positive"
+        )));
+    }
+    let decoder = &config.decoder_config;
+    let context = decoder.max_position_embeddings.ok_or_else(|| {
+        Error::ModelLoadError("VibeVoice ASR decoder context is unbounded".into())
+    })?;
+    let sample_rate = preprocessor.target_sample_rate();
+    let ratio = preprocessor.speech_tok_compress_ratio.max(1);
+    let samples = (f64::from(max_audio_secs) * f64::from(sample_rate)).ceil() as usize;
+    let audio_tokens = asr_placeholder_count(samples, ratio).min(context);
+    let prompt_tokens = audio_tokens
+        .saturating_add(RETAINED_PROMPT_TEXT_TOKENS)
+        .min(context);
+    let span = vibevoice_retained_prompt_token_bound(sample_rate, ratio, context);
+    let chunk = tokenizer_streaming_chunk_samples(sample_rate, ratio);
+    let tokenizer_elements =
+        tokenizer_encoder_workspace_elements(&config.acoustic_tokenizer_config, chunk)?.max(
+            tokenizer_encoder_workspace_elements(&config.semantic_tokenizer_config, chunk)?,
+        );
+    let [audio_bytes, lm_bytes, f32_bytes] =
+        [audio_dtype, lm_dtype, DType::F32].map(|dtype| dtype.size_in_bytes() as u64);
+    let (audio_tokens, prompt_tokens, span) =
+        (to_u64(audio_tokens)?, to_u64(prompt_tokens)?, to_u64(span)?);
+    let hidden = to_u64(decoder.hidden_size)?;
+    let feed_forward = to_u64(decoder.intermediate_size)?;
+    let vocab = to_u64(decoder.lm_head_size.unwrap_or(decoder.vocab_size))?;
+    let latents = to_u64(config.acoustic_vae_dim() + config.semantic_vae_dim())?;
+
+    let resident = sum(&[
+        product(&[audio_tokens, to_u64(ratio)?, audio_bytes])?,
+        product(&[audio_tokens, latents, audio_bytes])?,
+    ])?;
+    let tokenizer = product(&[tokenizer_elements, f32_bytes])?;
+    let connectors = product(&[audio_tokens, hidden, 8, audio_bytes])?;
+    let prompt = sum(&[
+        product(&[prompt_tokens, hidden, 3, lm_bytes])?,
+        product(&[audio_tokens, hidden, audio_bytes])?,
+    ])?;
+    let span_planes = sum(&[product(&[8, hidden])?, product(&[3, feed_forward])?])?;
+    let prefill = sum(&[
+        product(&[prompt_tokens, hidden, lm_bytes])?,
+        product(&[span, span_planes, f32_bytes])?,
+        product(&[vocab, f32_bytes])?,
+    ])?;
+    sum(&[resident, tokenizer.max(connectors).max(prompt).max(prefill)])
 }
 
 fn validate_vibevoice_artifact_storage(artifact: &VibeVoiceAsrPreparedArtifact) -> Result<()> {
@@ -3132,6 +3359,28 @@ fn elapsed_ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
 }
 
+/// One request's encoder audio, computed on a host worker.
+pub(crate) struct VibeVoiceAsrHostAudio {
+    expected_geometry: VibeVoiceAsrPreparedGeometry,
+    encoder_audio: Vec<f32>,
+    processed_samples: usize,
+    acoustic_frames: usize,
+    input_samples: usize,
+    input_sample_rate: u32,
+    source_identity: [u8; 32],
+}
+
+impl VibeVoiceAsrHostAudio {
+    /// Host bytes the encoder audio holds until the upload drops it.
+    pub(crate) fn host_bytes(&self) -> Result<u64> {
+        self.encoder_audio
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| Error::Overloaded("VibeVoice ASR host audio bytes overflow".into()))
+    }
+}
+
 fn preprocess_asr_audio(
     audio: &[f32],
     sample_rate: u32,
@@ -3265,7 +3514,7 @@ fn vibevoice_asr_max_audio_seconds_hint_for(
 
     cuda_override
         .and_then(parse_positive_finite_f32)
-        .unwrap_or(DEFAULT_MAX_AUDIO_SECONDS)
+        .unwrap_or(CUDA_DEFAULT_MAX_AUDIO_SECONDS)
         .min(DEFAULT_MAX_AUDIO_SECONDS)
 }
 
@@ -3542,6 +3791,68 @@ mod tests {
         );
     }
 
+    /// The published VibeVoice-ASR geometry: a Qwen2.5-7B decoder and the
+    /// default σ-VAE tokenizers (32 filters, ratios 8·5·5·4·2·2).
+    fn published_asr_config() -> VibeVoiceConfig {
+        serde_json::from_value(json!({
+            "decoder_config": {
+                "hidden_size": 3584,
+                "intermediate_size": 18944,
+                "num_attention_heads": 28,
+                "num_hidden_layers": 28,
+                "num_key_value_heads": 4,
+                "max_position_embeddings": 131072,
+                "rms_norm_eps": 0.000001,
+                "rope_theta": 1000000.0,
+                "vocab_size": 152064
+            },
+            "acoustic_tokenizer_config": {"vae_dim": 64, "fix_std": 0.5},
+            "semantic_tokenizer_config": {"vae_dim": 128, "std_dist_type": "none"}
+        }))
+        .unwrap()
+    }
+
+    /// The legacy route's sealed workspace covers one 60 s tokenizer chunk
+    /// in F32 and both connectors over the longest single pass (3,600 s:
+    /// 27,000 audio tokens), stops growing at the decoder context, and stays
+    /// a few GiB.
+    #[test]
+    fn legacy_workspace_covers_a_tokenizer_chunk_and_the_longest_pass() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let config = published_asr_config();
+        let preprocessor = reference_rate_preprocessor();
+        let bytes = |audio: DType, lm: DType, secs: f32| {
+            vibevoice_legacy_workspace_bytes(&config, &preprocessor, audio, lm, secs)
+        };
+        let chunk = tokenizer_streaming_chunk_samples(24_000, 3_200);
+        assert_eq!(chunk, 1_440_000);
+        let tokenizer_elements = [
+            &config.acoustic_tokenizer_config,
+            &config.semantic_tokenizer_config,
+        ]
+        .map(|tokenizer| tokenizer_encoder_workspace_elements(tokenizer, chunk).unwrap());
+        let tokenizer_f32 = 4 * tokenizer_elements[0].max(tokenizer_elements[1]);
+        let connectors = |dtype_bytes: u64| 27_000 * 3_584 * 8 * dtype_bytes;
+
+        let cuda = bytes(DType::BF16, DType::BF16, 3_600.0).unwrap();
+        assert!(cuda >= tokenizer_f32, "{cuda} < {tokenizer_f32}");
+        assert!(cuda >= connectors(2), "{cuda}");
+        assert!(cuda < 3 * GIB, "{cuda}");
+        let portable = bytes(DType::F32, DType::F16, 3_600.0).unwrap();
+        assert!(portable >= connectors(4) && portable >= cuda, "{portable}");
+        assert!(portable < 4 * GIB, "{portable}");
+
+        let ten_minutes = bytes(DType::BF16, DType::BF16, 600.0).unwrap();
+        assert!(ten_minutes >= tokenizer_f32 && ten_minutes <= cuda);
+        // 131,072 tokens of context hold 17,476 s of audio tokens.
+        assert_eq!(
+            bytes(DType::BF16, DType::BF16, 20_000.0).unwrap(),
+            bytes(DType::BF16, DType::BF16, 1.0e9).unwrap()
+        );
+        assert!(bytes(DType::BF16, DType::BF16, 0.0).is_err());
+        assert!(bytes(DType::BF16, DType::BF16, f32::NAN).is_err());
+    }
+
     #[test]
     fn split_embedding_prefill_matches_one_shot_qwen_logits() {
         let device = Device::Cpu;
@@ -3573,6 +3884,40 @@ mod tests {
             &full_logits.i((.., 4..5, ..)).unwrap(),
             &split_logits.i((.., 2..3, ..)).unwrap(),
         );
+    }
+
+    /// The legacy route's span prefill samples the same next token and
+    /// commits the same K/V as one call over the whole prompt, whether the
+    /// spans divide the prompt, leave a ragged last span or cover it whole.
+    #[test]
+    fn span_prefill_matches_one_shot_prefill_and_the_next_decode() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model_for_test(&device);
+        let ids = Tensor::from_vec(vec![0u32, 1, 2, 3, 4, 5, 6], (1, 7), &device).unwrap();
+        let embeddings = model.embeddings(&ids).unwrap();
+        let next = Tensor::from_vec(vec![7u32], (1, 1), &device).unwrap();
+        let (arena, bindings) = test_managed_arena();
+        let mut one_shot = test_managed_cache(arena, bindings, 0, 0);
+        let expected = model
+            .forward_managed_last_logits_with_embeds(&embeddings, 0, &mut one_shot, None)
+            .unwrap();
+        let expected_decode = model.forward_managed(&next, 7, &mut one_shot).unwrap();
+
+        for span in [1, 2, 3, 7, 64] {
+            let (arena, bindings) = test_managed_arena();
+            let mut cache = test_managed_cache(arena, bindings, 0, 0);
+            let logits = prefill_managed_in_spans(&model, &embeddings, &mut cache, span).unwrap();
+            assert_eq!(cache.context_len(), 7, "span {span}");
+            assert_eq!(logits.dims(), expected.dims(), "span {span}");
+            assert_tensor_close(&logits, &expected);
+            let decode = model.forward_managed(&next, 7, &mut cache).unwrap();
+            assert_tensor_close(&decode, &expected_decode);
+        }
+
+        let (arena, bindings) = test_managed_arena();
+        let mut cache = test_managed_cache(arena, bindings, 0, 0);
+        assert!(prefill_managed_in_spans(&model, &embeddings, &mut cache, 0).is_err());
+        assert_eq!(cache.context_len(), 0);
     }
 
     #[test]
@@ -3941,12 +4286,15 @@ mod tests {
         );
     }
 
+    /// CUDA chunks input past 300 s by default: a 600 s single pass ran out
+    /// of memory on an 80 GB H100.
     #[test]
-    fn max_audio_seconds_hint_uses_full_cuda_window_by_default() {
+    fn max_audio_seconds_hint_chunks_long_cuda_input_by_default() {
         assert_eq!(
             vibevoice_asr_max_audio_seconds_hint_for(DeviceKind::Cuda, None),
-            DEFAULT_MAX_AUDIO_SECONDS
+            CUDA_DEFAULT_MAX_AUDIO_SECONDS
         );
+        assert_eq!(CUDA_DEFAULT_MAX_AUDIO_SECONDS, 300.0);
     }
 
     #[test]
@@ -3962,7 +4310,7 @@ mod tests {
         for raw in ["", "0", "-1", "nan", "inf", "not-a-number"] {
             assert_eq!(
                 vibevoice_asr_max_audio_seconds_hint_for(DeviceKind::Cuda, Some(raw)),
-                DEFAULT_MAX_AUDIO_SECONDS
+                CUDA_DEFAULT_MAX_AUDIO_SECONDS
             );
         }
     }
@@ -4350,6 +4698,33 @@ mod tests {
             padded.i(1).unwrap().to_vec2::<f32>().unwrap(),
             vec![vec![3.0, 4.0], vec![5.0, 6.0], vec![7.0, 8.0]]
         );
+    }
+
+    /// Host encoder audio is priced as the padded samples it holds until the
+    /// upload, which preparation keeps beside the request.
+    #[test]
+    fn host_audio_prices_its_padded_encoder_samples() {
+        let host = VibeVoiceAsrHostAudio {
+            expected_geometry: VibeVoiceAsrPreparedGeometry {
+                input_samples: 16_000,
+                input_sample_rate: 16_000,
+                processed_samples: 24_000,
+                encoder_samples: 25_600,
+                acoustic_frames: 8,
+                prompt_tokens: 20,
+                embedding_elements: 0,
+                preparation_workspace_bytes: 0,
+                retained_device_bytes: 0,
+                retained_host_bytes: 0,
+            },
+            encoder_audio: vec![0.0; 25_600],
+            processed_samples: 24_000,
+            acoustic_frames: 8,
+            input_samples: 16_000,
+            input_sample_rate: 16_000,
+            source_identity: vibevoice_asr_source_identity(&[0.0; 4], 16_000),
+        };
+        assert_eq!(host.host_bytes().unwrap(), 25_600 * 4);
     }
 }
 

@@ -10,7 +10,8 @@ use rand::{RngExt, SeedableRng};
 
 use crate::error::{Error, Result};
 use crate::models::shared::sampling::{
-    bounded_device_sampling_candidates, device_top_k, gumbel_noise, DEVICE_TOP_K_LIMIT,
+    bounded_device_sampling_candidates, device_top_k, device_top_k_rows,
+    device_top_k_rows_with_ids, gumbel_noise, DeviceSamplingCandidates, DEVICE_TOP_K_LIMIT,
 };
 use crate::models::shared::telemetry;
 
@@ -189,6 +190,205 @@ pub(crate) fn sample_resident(
     Ok(Some((token, non_finite)))
 }
 
+/// One frame's device-resident draws for every row of a fast batch that
+/// shares one policy: each row's Gumbel noise drawn from its own sampler's
+/// RNG exactly as [`FishS2Sampler::resident_draws`] draws it, uploaded once
+/// as `[rows, tokens, top_k]` instead of once per row.
+pub(crate) struct FishS2ResidentRowDraws {
+    noise: Option<Tensor>,
+    upper: Tensor,
+    top_k: usize,
+    temperature: f32,
+    top_p: f32,
+}
+
+impl FishS2ResidentRowDraws {
+    /// `None` when the rows' policies differ or one needs the host path
+    /// (callers then draw row by row, as before).
+    pub(crate) fn new(
+        samplers: &mut [&mut FishS2Sampler],
+        tokens: usize,
+        device: &candle_core::Device,
+    ) -> Result<Option<Self>> {
+        let Some(first) = samplers.first() else {
+            return Ok(None);
+        };
+        let (temperature, top_p, top_k) = (first.temperature, first.top_p, first.top_k);
+        validate_policy(temperature, top_p)?;
+        if top_k == 0
+            || top_k > DEVICE_TOP_K_LIMIT
+            || samplers.iter().any(|sampler| {
+                sampler.temperature.to_bits() != temperature.to_bits()
+                    || sampler.top_p.to_bits() != top_p.to_bits()
+                    || sampler.top_k != top_k
+            })
+        {
+            return Ok(None);
+        }
+        let noise = if temperature > 0.0 {
+            let mut values = Vec::with_capacity(samplers.len() * tokens * top_k);
+            for sampler in samplers.iter_mut() {
+                let rng = &mut sampler.rng;
+                let mut draw = || rng.random::<f32>();
+                values.extend(gumbel_noise(tokens * top_k, &mut draw));
+            }
+            Some(Tensor::from_vec(
+                values,
+                (samplers.len(), tokens, top_k),
+                device,
+            )?)
+        } else {
+            None
+        };
+        Ok(Some(Self {
+            noise,
+            upper: Tensor::triu2(top_k, DType::F32, device)?,
+            top_k,
+            temperature,
+            top_p,
+        }))
+    }
+}
+
+/// [`sample_resident`] for every row of `logits` (`[rows, vocab]`) in one
+/// pass: the rows' codes as a `[rows]` U32 tensor and their non-finite logit
+/// counts as `[rows]` U32, both left on the device. Every op is elementwise
+/// or row-wise with the single-row path's arithmetic (the top-p prefix sum
+/// is a batched one-row matmul per row), so each row's code is the one
+/// [`sample_resident`] draws for it alone with the same noise.
+pub(crate) fn sample_resident_rows(
+    logits: &Tensor,
+    draws: &FishS2ResidentRowDraws,
+    token: usize,
+) -> Result<(Tensor, Tensor)> {
+    let noise = match &draws.noise {
+        Some(noise) => Some(noise.i((.., token))?),
+        None => None,
+    };
+    let policy = FishS2FastPolicy {
+        temperature: draws.temperature,
+        top_p: draws.top_p,
+        top_k: draws.top_k,
+    };
+    resident_rows_codes(logits, policy, &draws.upper, noise.as_ref(), None)
+}
+
+/// One fast-AR sampling policy the device serves (top-k within the device
+/// sort bound), shared by every row it draws: a graph key.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FishS2FastPolicy {
+    pub(crate) temperature: f32,
+    pub(crate) top_p: f32,
+    pub(crate) top_k: usize,
+}
+
+impl PartialEq for FishS2FastPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        self.temperature.to_bits() == other.temperature.to_bits()
+            && self.top_p.to_bits() == other.top_p.to_bits()
+            && self.top_k == other.top_k
+    }
+}
+
+impl FishS2FastPolicy {
+    /// Whether a frame draws noise (a positive temperature) or is greedy.
+    pub(crate) fn samples(self) -> bool {
+        self.temperature > 0.0
+    }
+}
+
+impl FishS2Sampler {
+    /// This sampler's fast policy, or `None` when only the host path serves
+    /// it (top-k 0 or above the device sort bound), as
+    /// [`Self::resident_draws`] decides.
+    pub(crate) fn fast_policy(&self) -> Result<Option<FishS2FastPolicy>> {
+        validate_policy(self.temperature, self.top_p)?;
+        if self.top_k == 0 || self.top_k > DEVICE_TOP_K_LIMIT {
+            return Ok(None);
+        }
+        Ok(Some(FishS2FastPolicy {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+        }))
+    }
+
+    /// One frame's Gumbel noise for `out.len() / top_k` tokens, drawn from
+    /// this sampler's stream exactly as [`Self::resident_draws`] draws it
+    /// (nothing when greedy).
+    pub(crate) fn draw_fast_noise(&mut self, out: &mut [f32]) {
+        if self.temperature > 0.0 {
+            let rng = &mut self.rng;
+            let mut draw = || rng.random::<f32>();
+            out.copy_from_slice(&gumbel_noise(out.len(), &mut draw));
+        }
+    }
+}
+
+/// [`sample_resident_rows`] for one depth from its parts: `noise` is that
+/// depth's `[rows, top_k]` Gumbel noise (`None` when greedy) and
+/// `column_ids`, when given, the logits' column ids `0..vocab` (U32), so
+/// nothing is read from a per-thread cache and a CUDA graph can capture it.
+pub(crate) fn resident_rows_codes(
+    logits: &Tensor,
+    policy: FishS2FastPolicy,
+    upper: &Tensor,
+    noise: Option<&Tensor>,
+    column_ids: Option<&Tensor>,
+) -> Result<(Tensor, Tensor)> {
+    let (rows, vocab) = logits.dims2()?;
+    if vocab == 0 {
+        return Err(Error::InferenceError(
+            "Fish S2 fast sampler received empty logits".into(),
+        ));
+    }
+    let logits = logits.to_dtype(DType::F32)?;
+    let non_finite = logits
+        .ne(&logits)?
+        .maximum(&logits.abs()?.gt(f32::MAX as f64)?)?
+        .to_dtype(DType::U32)?
+        .sum_keepdim(1)?
+        .reshape(rows)?;
+    let top_k = match column_ids {
+        Some(ids) => device_top_k_rows_with_ids(&logits, policy.top_k, ids)?,
+        None => device_top_k_rows(&logits, policy.top_k)?,
+    };
+    let (values, indices) = top_k.ok_or_else(|| {
+        Error::InferenceError("Fish S2 batched fast sampler lost its policy".into())
+    })?;
+    let k = values.dim(1)?;
+    let max = values.narrow(1, 0, 1)?;
+    let log_sum_exp = logits
+        .broadcast_sub(&max)?
+        .exp()?
+        .sum_keepdim(1)?
+        .log()?
+        .broadcast_add(&max)?;
+    let raw = values.broadcast_sub(&log_sum_exp)?.exp()?;
+    let cumulative = raw
+        .unsqueeze(1)?
+        .broadcast_matmul(&upper.narrow(0, 0, k)?.narrow(1, 0, k)?)?
+        .squeeze(1)?;
+    let keep = cumulative
+        .le(policy.top_p as f64)?
+        .maximum(&(&cumulative - &raw)?.le(0.0)?)?
+        .to_dtype(DType::F32)?;
+    let tempered = (values.broadcast_sub(&max)? / f64::from(policy.temperature.max(1e-5)))?;
+    let masked = (tempered + keep.affine(1e30, -1e30)?)?;
+    let indices = indices.to_dtype(DType::U32)?.contiguous()?;
+    let codes = match noise {
+        None => indices.narrow(1, 0, 1)?.reshape(rows)?,
+        Some(noise) => {
+            let pick = masked
+                .broadcast_add(&noise.narrow(1, 0, k)?)?
+                .argmax_keepdim(1)?
+                .to_dtype(DType::U32)?;
+            indices.gather(&pick, 1)?.reshape(rows)?
+        }
+    };
+    Ok((codes, non_finite))
+}
+
 pub(crate) fn validate_policy(temperature: f32, top_p: f32) -> Result<()> {
     if !temperature.is_finite() || temperature < 0.0 {
         return Err(Error::InvalidInput(
@@ -262,7 +462,7 @@ impl FishS2SamplingDistribution {
             // top_k=0 requests the existing Candle selection plus the full-row
             // log-sum-exp. Applying top-k inside that helper would normalize
             // over a truncated row and change Fish's top-p support.
-            if let Some(candidates) = bounded_device_sampling_candidates(
+            if let Some(distribution) = bounded_device_sampling_candidates(
                 &row_f32,
                 vocab,
                 0,
@@ -271,40 +471,69 @@ impl FishS2SamplingDistribution {
                 1.0,
                 0.0,
                 allowed_mask,
-            )? {
-                if let Some(logsumexp) = candidates.logsumexp {
-                    let raw_probabilities = candidates
-                        .values
-                        .iter()
-                        .map(|value| (*value - logsumexp).exp())
-                        .collect::<Vec<_>>();
-                    let cumulative = raw_probabilities.iter().sum::<f32>();
-                    let covers_top_k = top_k > 0 && candidates.values.len() >= top_k;
-                    let covers_all = candidates.values.len() >= allowed_count;
-                    // A strict excess is needed: a token at exactly top-p is
-                    // retained, so equality alone cannot prove completeness.
-                    let covers_top_p = cumulative > required_top_p;
-                    if (covers_top_k || covers_all || covers_top_p)
-                        && raw_probabilities.iter().all(|value| value.is_finite())
-                    {
-                        return Ok(Self {
-                            values: candidates
-                                .indices
-                                .into_iter()
-                                .zip(candidates.values)
-                                .collect(),
-                            raw_probabilities,
-                        });
-                    }
-                }
+            )?
+            .and_then(|candidates| {
+                Self::from_device_candidates(candidates, allowed_count, top_k, required_top_p)
+            }) {
+                return Ok(distribution);
             }
         }
+        Self::from_host_row(row, allowed_mask, label)
+    }
 
-        let values = read_row(&row_f32)?;
+    /// The distribution of a row's bounded device candidates (top-k 0 with
+    /// the row's log-sum-exp, under its mask), or `None` when they cannot
+    /// prove they hold the whole policy support (the caller then reads the
+    /// row, [`Self::from_host_row`]).
+    pub(crate) fn from_device_candidates(
+        candidates: DeviceSamplingCandidates,
+        allowed_count: usize,
+        top_k: usize,
+        required_top_p: f32,
+    ) -> Option<Self> {
+        let logsumexp = candidates.logsumexp?;
+        let raw_probabilities = candidates
+            .values
+            .iter()
+            .map(|value| (*value - logsumexp).exp())
+            .collect::<Vec<_>>();
+        let cumulative = raw_probabilities.iter().sum::<f32>();
+        let covers_top_k = top_k > 0 && candidates.values.len() >= top_k;
+        let covers_all = candidates.values.len() >= allowed_count;
+        // A strict excess is needed: a token at exactly top-p is retained,
+        // so equality alone cannot prove completeness.
+        let covers_top_p = cumulative > required_top_p;
+        ((covers_top_k || covers_all || covers_top_p)
+            && raw_probabilities.iter().all(|value| value.is_finite()))
+        .then(|| Self {
+            values: candidates
+                .indices
+                .into_iter()
+                .zip(candidates.values)
+                .collect(),
+            raw_probabilities,
+        })
+    }
+
+    /// The exact host distribution of a whole row read back, failing on a
+    /// non-finite raw logit.
+    pub(crate) fn from_host_row(
+        row: &Tensor,
+        allowed_mask: Option<&[bool]>,
+        label: &str,
+    ) -> Result<Self> {
+        let values = read_row(&row.to_dtype(DType::F32)?)?;
         if values.iter().any(|value| !value.is_finite()) {
             return Err(non_finite_error(&values, row, label));
         }
         Self::from_values(&values, allowed_mask)
+    }
+
+    /// The error a row with non-finite raw logits fails with (the row is read
+    /// back for its counts).
+    pub(crate) fn non_finite_row_error(row: &Tensor, label: &str) -> Result<Error> {
+        let values = read_row(&row.to_dtype(DType::F32)?)?;
+        Ok(non_finite_error(&values, row, label))
     }
 
     fn from_values(values: &[f32], allowed_mask: Option<&[bool]>) -> Result<Self> {
@@ -399,6 +628,79 @@ fn non_finite_error(values: &[f32], row: &Tensor, label: &str) -> Error {
 mod tests {
     use super::*;
     use candle_core::Device;
+
+    /// Every row's code from the batched fast sampler is the code the
+    /// per-row resident sampler draws for that row with the same RNG, at
+    /// every depth, with ties, a vocabulary narrower than top-k, greedy and
+    /// stochastic policies, and each row's RNG ends where it does alone.
+    #[test]
+    fn resident_rows_draw_each_rows_own_code() {
+        use crate::kernels::numeric_check::xorshift_values;
+
+        let device = Device::Cpu;
+        let tokens = 4;
+        for (rows, vocab, temperature, top_p, top_k) in [
+            (5usize, 64usize, 0.7f32, 0.9f32, 30usize),
+            (3, 2_100, 1.1, 0.6, 30),
+            (4, 12, 0.8, 1.0, 30),
+            (2, 64, 0.0, 0.9, 30),
+        ] {
+            let mut samplers = (0..rows)
+                .map(|row| FishS2Sampler::with_top_k(temperature, top_p, top_k, 41 + row as u64))
+                .collect::<Vec<_>>();
+            let mut alone = samplers.clone();
+            let draws = FishS2ResidentRowDraws::new(
+                &mut samplers.iter_mut().collect::<Vec<_>>(),
+                tokens,
+                &device,
+            )
+            .unwrap()
+            .expect("one shared policy");
+            let row_draws = alone
+                .iter_mut()
+                .map(|sampler| sampler.resident_draws(tokens, &device).unwrap().unwrap())
+                .collect::<Vec<_>>();
+            for token in 0..tokens {
+                let mut values = xorshift_values(rows * vocab, (vocab * 7 + token) as u64, 3.0);
+                values[2] = values[4];
+                let logits = Tensor::from_vec(values, (rows, vocab), &device).unwrap();
+                let (codes, non_finite) = sample_resident_rows(&logits, &draws, token).unwrap();
+                let codes = codes.to_vec1::<u32>().unwrap();
+                assert_eq!(non_finite.to_vec1::<u32>().unwrap(), vec![0; rows]);
+                for row in 0..rows {
+                    let (code, _) = sample_resident(
+                        &logits.i(row).unwrap(),
+                        temperature,
+                        top_p,
+                        &row_draws[row],
+                        token,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(
+                        codes[row],
+                        code.to_vec1::<u32>().unwrap()[0],
+                        "rows={rows} vocab={vocab} row={row} token={token}"
+                    );
+                }
+            }
+            for (batched, alone) in samplers.iter_mut().zip(&mut alone) {
+                assert_eq!(batched.rng.random::<u64>(), alone.rng.random::<u64>());
+            }
+        }
+        // Rows with different policies keep the per-row draws.
+        let mut mixed = [
+            FishS2Sampler::new(0.7, 0.9, 1),
+            FishS2Sampler::new(0.8, 0.9, 2),
+        ];
+        assert!(FishS2ResidentRowDraws::new(
+            &mut mixed.iter_mut().collect::<Vec<_>>(),
+            tokens,
+            &device
+        )
+        .unwrap()
+        .is_none());
+    }
 
     /// FSH-4: the device filter keeps exactly the host policy's support
     /// (top-p over the whole row's raw softmax, rank 0 always, then top-k)

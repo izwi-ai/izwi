@@ -41,6 +41,7 @@ impl EngineCoreRequest {
         (!audio.is_empty()).then_some(match audio {
             EngineAudioInput::Base64(value) => BorrowedEngineAudioInput::Base64(value),
             EngineAudioInput::Bytes(value) => BorrowedEngineAudioInput::Bytes(value),
+            EngineAudioInput::Samples(value) => BorrowedEngineAudioInput::Samples(value),
         })
     }
 
@@ -111,14 +112,23 @@ impl EngineCoreRequest {
     pub(crate) fn audio_bytes_for_execution(&self) -> Option<&[u8]> {
         match self.selected_audio_input()? {
             BorrowedEngineAudioInput::Bytes(value) => Some(value.as_slice()),
-            BorrowedEngineAudioInput::Base64(_) => None,
+            BorrowedEngineAudioInput::Base64(_) | BorrowedEngineAudioInput::Samples(_) => None,
         }
     }
 
     pub(crate) fn audio_base64_for_execution(&self) -> Option<&str> {
         match self.selected_audio_input()? {
             BorrowedEngineAudioInput::Base64(value) => Some(value.as_str()),
-            BorrowedEngineAudioInput::Bytes(_) => None,
+            BorrowedEngineAudioInput::Bytes(_) | BorrowedEngineAudioInput::Samples(_) => None,
+        }
+    }
+
+    /// Canonical 16 kHz mono samples the runtime decoded before building
+    /// the request ([`EngineAudioInput::Samples`]).
+    pub(crate) fn audio_samples_for_execution(&self) -> Option<&[f32]> {
+        match self.selected_audio_input()? {
+            BorrowedEngineAudioInput::Samples(value) => Some(value),
+            BorrowedEngineAudioInput::Base64(_) | BorrowedEngineAudioInput::Bytes(_) => None,
         }
     }
 
@@ -540,6 +550,20 @@ impl EngineCoreRequest {
                 }
                 Ok(())
             }
+            BorrowedEngineAudioInput::Samples(value) => {
+                if value.is_empty() {
+                    return Err(Error::InvalidInput(format!(
+                        "Direct Engine {label} cannot be empty"
+                    )));
+                }
+                let bytes = std::mem::size_of_val::<[f32]>(value);
+                if bytes > max_source_bytes {
+                    return Err(Error::InvalidInput(format!(
+                        "Direct Engine {label} holds {bytes} bytes of samples, exceeding the {max_source_bytes}-byte source limit"
+                    )));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -576,6 +600,9 @@ impl EngineCoreRequest {
         Some(match audio {
             EngineAudioInput::Base64(value) => EngineAudioInput::Base64(std::mem::take(value)),
             EngineAudioInput::Bytes(value) => EngineAudioInput::Bytes(std::mem::take(value)),
+            EngineAudioInput::Samples(value) => {
+                EngineAudioInput::Samples(std::mem::replace(value, Arc::from(Vec::new())))
+            }
         })
     }
 

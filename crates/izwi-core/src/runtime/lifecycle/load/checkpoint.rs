@@ -79,7 +79,11 @@ pub(super) fn checkpoint_resource_plan(
         let memory = crate::models::architectures::fish_s2::weights::fish_s2_model_memory(
             model_path, device,
         )?;
-        return fish_s2_resource_plan(BackendKind::from(device.kind), memory).map(Some);
+        let backend = BackendKind::from(device.kind);
+        // The fast AR's CUDA graphs allocate at the load's self-check.
+        let graphs =
+            crate::models::architectures::fish_s2::fish_s2_fast_graph_device_bytes(backend);
+        return fish_s2_resource_plan(backend, memory, graphs).map(Some);
     }
     if variant.family() == crate::catalog::ModelFamily::FishDrama3Tts {
         // Priced from the pinned census, before a weight is read.
@@ -487,9 +491,12 @@ pub(super) fn qwen38_synthetic_fixture_estimate(model_path: &Path) -> Result<Mod
     })
 }
 
+/// `graph_device_bytes`: the fast AR's CUDA graphs, priced resident but kept
+/// pending until they allocate.
 pub(super) fn fish_s2_resource_plan(
     backend: BackendKind,
     memory: crate::models::architectures::fish_s2::weights::FishS2ModelMemory,
+    graph_device_bytes: u64,
 ) -> Result<ModelResourcePlan> {
     // On Metal the GPU allocates only the final tensors (staged transformer
     // uploads, codec uploaded from the host); the rest of the load peak is
@@ -530,5 +537,15 @@ pub(super) fn fish_s2_resource_plan(
     // state fitting cannot consume this headroom before the first reference is
     // encoded. As with lazy graph caches, this remains conservative once filled.
     plan.deferred_resident_authorization = reference_cache;
+    if graph_device_bytes > 0 {
+        let graphs = ResourceVector {
+            device_bytes: ResourceAmount::Known(graph_device_bytes),
+            ..ResourceVector::zero()
+        };
+        plan.load_authorization = plan.load_authorization.checked_add(graphs)?;
+        plan.resident_authorization = plan.resident_authorization.checked_add(graphs)?;
+        plan.deferred_resident_authorization =
+            plan.deferred_resident_authorization.checked_add(graphs)?;
+    }
     Ok(plan)
 }

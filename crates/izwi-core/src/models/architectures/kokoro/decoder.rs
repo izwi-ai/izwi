@@ -129,6 +129,14 @@ fn kokoro_cpu_stage_branches_parallel_enabled() -> bool {
     ENABLED.get()
 }
 
+/// `IZWI_KOKORO_DEVICE_ISTFT` (default on CUDA only): run the generator's
+/// inverse STFT on the logits' device and read back only the waveform.
+fn kokoro_device_istft_enabled(device: &candle_core::Device) -> bool {
+    static OVERRIDE: crate::env::ReadOnce<Option<bool>> =
+        crate::env::ReadOnce::new(|| crate::env::flag("IZWI_KOKORO_DEVICE_ISTFT"));
+    OVERRIDE.get().unwrap_or_else(|| device.is_cuda())
+}
+
 fn kokoro_metal_harmonic_overlap_enabled() -> bool {
     static ENABLED: crate::env::ReadOnce<bool> = crate::env::ReadOnce::new(|| {
         crate::env::flag_or("IZWI_KOKORO_METAL_HARMONIC_OVERLAP", true)
@@ -669,7 +677,12 @@ impl KokoroIstftGenerator {
             log_kokoro_profile("generator.conv_post_spec_phase", t2.elapsed());
         }
         let t3 = Instant::now();
-        self.stft.inverse(&spec, &phase).inspect(|_| {
+        let audio = if kokoro_device_istft_enabled(spec.device()) {
+            self.stft.inverse_on_device(&spec, &phase)
+        } else {
+            self.stft.inverse(&spec, &phase)
+        };
+        audio.inspect(|_| {
             if profile {
                 log_kokoro_profile("generator.istft_inverse", t3.elapsed());
             }
@@ -1307,6 +1320,9 @@ struct KokoroStft {
     window: Vec<f32>,
     fft_fwd: Arc<dyn Fft<f32>>,
     fft_inv: Arc<dyn Fft<f32>>,
+    /// The device iSTFT's synthesis and squared-window kernels, built on
+    /// first use on the logits' device.
+    device_kernels: Arc<std::sync::OnceLock<(Tensor, Tensor)>>,
 }
 
 impl fmt::Debug for KokoroStft {
@@ -1327,6 +1343,7 @@ impl Clone for KokoroStft {
             window: self.window.clone(),
             fft_fwd: self.fft_fwd.clone(),
             fft_inv: self.fft_inv.clone(),
+            device_kernels: self.device_kernels.clone(),
         }
     }
 }
@@ -1340,7 +1357,100 @@ impl KokoroStft {
             window: hann_window_periodic(n_fft),
             fft_fwd: planner.plan_fft_forward(n_fft.max(1)),
             fft_inv: planner.plan_fft_inverse(n_fft.max(1)),
+            device_kernels: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// `[2 * bins, 1, n_fft]` synthesis kernel (the real inverse DFT of each
+    /// bin's real and imaginary part, windowed: DC and Nyquist once, the
+    /// other bins twice, over `n_fft`) and the `[1, 1, n_fft]` squared
+    /// window, on `device`.
+    fn device_kernels(&self, device: &candle_core::Device) -> Result<&(Tensor, Tensor)> {
+        if let Some(kernels) = self.device_kernels.get() {
+            return Ok(kernels);
+        }
+        let n = self.n_fft;
+        let bins = n / 2 + 1;
+        let mut synthesis = vec![0f32; 2 * bins * n];
+        for k in 0..bins {
+            let weight = if k == 0 || 2 * k == n { 1.0 } else { 2.0 } / n as f64;
+            for i in 0..n {
+                let angle = 2.0 * std::f64::consts::PI * ((k * i) % n) as f64 / n as f64;
+                let window = f64::from(self.window[i]);
+                synthesis[k * n + i] = (weight * angle.cos() * window) as f32;
+                // The DC and Nyquist bins' imaginary parts never reach the
+                // real output.
+                if k != 0 && 2 * k != n {
+                    synthesis[(bins + k) * n + i] = (-weight * angle.sin() * window) as f32;
+                }
+            }
+        }
+        let window_sq = self.window.iter().map(|w| w * w).collect::<Vec<_>>();
+        let kernels = (
+            Tensor::from_vec(synthesis, (2 * bins, 1, n), device)?,
+            Tensor::from_vec(window_sq, (1, 1, n), device)?,
+        );
+        let _ = self.device_kernels.set(kernels);
+        self.device_kernels
+            .get()
+            .ok_or_else(|| Error::InferenceError("Kokoro iSTFT kernels were not kept".into()))
+    }
+
+    /// [`Self::inverse`] on the tensors' device: the spectrum's overlap-add
+    /// is one transposed convolution with the synthesis kernel, normalised by
+    /// the squared-window envelope (the same transposed convolution of ones),
+    /// with the same zero-envelope, non-finite, centre-trim and clamp rules;
+    /// only the waveforms come back, in one copy (the host path reads back
+    /// the magnitude and phase, twice as many values, and runs a small FFT
+    /// per frame). Rows are independent, so a row's audio does not depend on
+    /// the batch.
+    fn inverse_on_device(&self, magnitude: &Tensor, phase: &Tensor) -> Result<Vec<Vec<f32>>> {
+        let (b, n_bins, frames) = magnitude.dims3().map_err(Error::from)?;
+        if b == 0 || phase.dims() != magnitude.dims() || n_bins != self.n_fft / 2 + 1 {
+            return Err(Error::InferenceError(format!(
+                "Kokoro iSTFT expects matching non-empty [B,{},frames] tensors, got mag={:?}, phase={:?}",
+                self.n_fft / 2 + 1,
+                magnitude.shape().dims(),
+                phase.shape().dims(),
+            )));
+        }
+        if frames == 0 {
+            return Ok(vec![Vec::new(); b]);
+        }
+        let device = magnitude.device();
+        let (synthesis, window_sq) = self.device_kernels(device)?;
+        let magnitude = magnitude.to_dtype(DType::F32)?.relu()?;
+        let phase = phase.to_dtype(DType::F32)?;
+        let spectrum = Tensor::cat(
+            &[(&magnitude * phase.cos()?)?, (&magnitude * phase.sin()?)?],
+            1,
+        )?;
+        // The centre padding is trimmed by the transposed convolutions'
+        // padding, as the host drops it after the overlap-add.
+        let length = (frames - 1) * self.hop + self.n_fft;
+        let pad = if length > self.n_fft / 2 * 2 {
+            self.n_fft / 2
+        } else {
+            0
+        };
+        let output = spectrum.conv_transpose1d(synthesis, pad, 0, self.hop, 1, 1)?;
+        let envelope = Tensor::ones((1, 1, frames), DType::F32, device)?
+            .conv_transpose1d(window_sq, pad, 0, self.hop, 1, 1)?;
+        // Where the envelope vanishes the host leaves the sample as it is:
+        // dividing it by one does the same.
+        let envelope = envelope
+            .gt(1e-8)?
+            .where_cond(&envelope, &envelope.ones_like()?)?;
+        let output = output.broadcast_div(&envelope)?;
+        let finite = output
+            .eq(&output)?
+            .broadcast_mul(&output.abs()?.le(f32::MAX as f64)?)?;
+        finite
+            .where_cond(&output, &output.zeros_like()?)?
+            .clamp(-1f32, 1f32)?
+            .squeeze(1)?
+            .to_vec2::<f32>()
+            .map_err(Error::from)
     }
 
     fn transform(&self, input: &[f32]) -> Result<(Vec<f32>, Vec<f32>)> {
@@ -1856,6 +1966,41 @@ mod tests {
         assert_eq!(y.len(), 1);
         assert!(!y[0].is_empty());
         assert!(y.iter().flatten().all(|v| v.is_finite()));
+    }
+
+    /// The device iSTFT is the host iSTFT's math (to f32 rounding: a direct
+    /// overlap-add sum against an FFT), on random spectra wide enough to hit
+    /// the clamp, and a row's audio is the same alone as in a batch.
+    #[test]
+    fn kokoro_device_istft_matches_the_host_inverse() {
+        use crate::kernels::numeric_check::{max_abs_diff, xorshift_tensor};
+
+        let stft = KokoroStft::new(20, 5);
+        let device = candle_core::Device::Cpu;
+        let (rows, frames) = (3, 57);
+        let magnitude = xorshift_tensor(&[rows, 11, frames], 5, 3.0, &device)
+            .unwrap()
+            .exp()
+            .unwrap();
+        let phase = xorshift_tensor(&[rows, 11, frames], 9, 3.0, &device)
+            .unwrap()
+            .sin()
+            .unwrap();
+        let host = stft.inverse(&magnitude, &phase).unwrap();
+        let on_device = stft.inverse_on_device(&magnitude, &phase).unwrap();
+        assert_eq!(on_device.len(), rows);
+        assert!(host.iter().flatten().any(|sample| sample.abs() == 1.0));
+        for (row, (device_row, host_row)) in on_device.iter().zip(&host).enumerate() {
+            let diff = max_abs_diff(device_row, host_row);
+            assert!(diff <= 2e-5, "row {row}: |diff| {diff}");
+            let alone = stft
+                .inverse_on_device(
+                    &magnitude.narrow(0, row, 1).unwrap(),
+                    &phase.narrow(0, row, 1).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(&alone[0], device_row, "row {row} alone");
+        }
     }
 
     #[test]

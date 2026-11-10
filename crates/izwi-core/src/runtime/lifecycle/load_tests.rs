@@ -1,5 +1,5 @@
 use super::{
-    admit_asr_request_floor, asr_state_rows, automatic_state_group_budget,
+    admit_asr_request_floor, asr_state_rows, automatic_state_group_budget, cuda_invocation_context,
     estimate_from_tensor_inventory, fish_s2_resource_plan, is_metal_command_buffer_oom,
     kokoro_effective_context_tokens, loaded_asr_state_publication_route,
     managed_chat_capacity_policy, materialization_tolerance_bytes, model_memory_estimate,
@@ -166,20 +166,24 @@ async fn fish_s2_load_publishes_and_seals_both_tts_capabilities() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
-/// A Granite Speech load without resumable prefill publishes invocation
-/// state only, and the bundle seals it: its ASR capability offers no
-/// retained graph (GRN-8), so no graph declares retained cache state beside
-/// the stateless publication, and speaker attribution publishes as before.
+/// A Granite Speech load publishes retained decoder state for its ASR
+/// capability beside invocation-only speaker attribution, and the bundle
+/// seals it: an ordinary requirement binds the retained sequence graph on
+/// the managed decoder pages, a long-form one the atomic graph and its
+/// invocation state. With the retained route switched off
+/// (`IZWI_GRANITE_SPEECH_RETAINED_DECODE`) the ASR capability publishes
+/// invocation state only and every requirement binds the atomic graph
+/// (GRN-8).
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn granite_speech_load_without_resumable_prefill_seals_invocation_only_state() {
+async fn granite_speech_load_publishes_retained_asr_state_beside_attribution() {
     use crate::models::architectures::granite_speech::asr::{
-        granite_speech_test_physical_state_spec, GraniteSpeechAsrModel,
+        granite_speech_retained_decode_enabled, granite_speech_test_physical_state_spec,
     };
     use crate::runtime::adapters::{
         LoadedModelBundleDraft, LoadedStatePublication, StreamingRequirements,
     };
-    const { assert!(!GraniteSpeechAsrModel::RESUMABLE_PREFILL) };
+    let retained_route = granite_speech_retained_decode_enabled();
     // Serialize against OOM-ladder poison windows and load-transaction
     // reservations on the process-global resource authority.
     let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
@@ -191,7 +195,9 @@ async fn granite_speech_load_without_resumable_prefill_seals_invocation_only_sta
     let runtime = RuntimeService::new(EngineConfig {
         models_dir: directory.clone(),
         backend: BackendPreference::Cpu,
-        max_sequence_length: ContextLengthPreference::explicit(32).unwrap(),
+        max_sequence_length: ContextLengthPreference::explicit(1024).unwrap(),
+        max_retained_sequences: 2,
+        max_staged_transactions: 2,
         ..Default::default()
     })
     .unwrap();
@@ -208,13 +214,16 @@ async fn granite_speech_load_without_resumable_prefill_seals_invocation_only_sta
         .install_loading_slot(variant, lease)
         .unwrap();
     let draft = LoadedModelBundleDraft::build(
-        &RuntimeAdapterRegistry::built_in(),
+        &RuntimeAdapterRegistry::built_in_with_execution_limits(2, 1).unwrap(),
         ExecutionGroupId::new(992),
         instance,
         variant,
         BackendKind::Cpu,
     )
     .unwrap();
+    draft
+        .install_test_preparation_seals(BackendKind::Cpu, 2)
+        .unwrap();
     let publications = runtime
         .model_lifecycle
         .load_granite_speech_state_publications(
@@ -236,19 +245,21 @@ async fn granite_speech_load_without_resumable_prefill_seals_invocation_only_sta
         else {
             panic!("Granite Speech {capability:?} must publish physical state");
         };
-        assert!(retained.is_none(), "{capability:?}");
-        assert!(retained_uses.is_empty(), "{capability:?}");
-        assert!(
-            matches!(descriptor.retained, RetainedStateCapability::Stateless),
+        let holds_retained = retained_route && capability == CapabilityKind::Asr;
+        assert_eq!(retained.is_some(), holds_retained, "{capability:?}");
+        assert_eq!(!retained_uses.is_empty(), holds_retained, "{capability:?}");
+        assert_eq!(
+            !matches!(descriptor.retained, RetainedStateCapability::Stateless),
+            holds_retained,
             "{capability:?}"
         );
     }
     let bundle = draft
         .seal(publications)
-        .expect("a Granite Speech load without resumable prefill must seal");
+        .expect("a Granite Speech load must seal");
 
-    // Every ASR requirement, ordinary or long-form, with or without
-    // transport output, binds the atomic graph and its invocation state.
+    // An ordinary requirement binds the retained graph (with or without
+    // transport output); a long-form one the atomic graph.
     for streaming in [
         StreamingRequirements::NONE,
         StreamingRequirements::transport_only(),
@@ -258,7 +269,15 @@ async fn granite_speech_load_without_resumable_prefill_seals_invocation_only_sta
         let contract = bundle
             .contract_for_streaming(CapabilityKind::Asr, streaming)
             .unwrap();
-        assert_eq!(contract.execution_profile.mode, ExecutionMode::Atomic);
+        let sequence = retained_route && !streaming.asr_long_form;
+        assert_eq!(
+            contract.execution_profile.mode,
+            if sequence {
+                ExecutionMode::Sequence
+            } else {
+                ExecutionMode::Atomic
+            }
+        );
         let binding = bundle
             .capability_binding_for_streaming(CapabilityKind::Asr, streaming)
             .unwrap();
@@ -267,7 +286,7 @@ async fn granite_speech_load_without_resumable_prefill_seals_invocation_only_sta
             .state
             .validate_against(BackendKind::Cpu, &binding.execution)
             .unwrap();
-        assert!(binding.state.managed_kv_runtime().is_none());
+        assert_eq!(binding.state.managed_kv_runtime().is_some(), sequence);
     }
     let attributed = bundle
         .capability_binding_for_streaming(
@@ -284,6 +303,127 @@ async fn granite_speech_load_without_resumable_prefill_seals_invocation_only_sta
         StageWorkSelector::Pipeline { ordinal: None }
     );
     drop(attributed);
+    drop(bundle);
+    drop(runtime);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+/// A Granite Speech 5.0 load publishes retained decoder pages for its
+/// retained graph beside the atomic graph's invocation pages, and the
+/// bundle seals them: an ordinary or streaming requirement binds the
+/// retained sequence graph on the managed pages, a long-form one the atomic
+/// graph and its invocation state. With the retained route switched off
+/// (`IZWI_GRANITE_SPEECH5_RETAINED_DECODE`) it publishes invocation state
+/// only and every requirement binds the atomic graph (GRN-8).
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn granite_speech5_load_publishes_retained_asr_state() {
+    use crate::models::architectures::granite_speech5::asr::{
+        granite_speech5_retained_decode_enabled, granite_speech5_test_physical_state_spec,
+    };
+    use crate::runtime::adapters::{
+        LoadedModelBundleDraft, LoadedStatePublication, StreamingRequirements,
+    };
+    let retained_route = granite_speech5_retained_decode_enabled();
+    // Serialize against OOM-ladder poison windows and load-transaction
+    // reservations on the process-global resource authority.
+    let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let directory = std::env::temp_dir().join(format!(
+        "izwi-granite5-state-publication-{}",
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let runtime = RuntimeService::new(EngineConfig {
+        models_dir: directory.clone(),
+        backend: BackendPreference::Cpu,
+        max_sequence_length: ContextLengthPreference::explicit(1024).unwrap(),
+        max_retained_sequences: 2,
+        max_staged_transactions: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    let variant = ModelVariant::GraniteSpeech502BGguf;
+    let authority = vector_authority(all_memory_capacity(1024));
+    let lease = authority
+        .reserve(
+            ReservationOwner::new(ReservationClass::Model, "granite5-load-publication"),
+            ResourceVector::zero(),
+        )
+        .unwrap();
+    let instance = runtime
+        .model_lifecycle
+        .install_loading_slot(variant, lease)
+        .unwrap();
+    let draft = LoadedModelBundleDraft::build(
+        &RuntimeAdapterRegistry::built_in_with_execution_limits(2, 1).unwrap(),
+        ExecutionGroupId::new(993),
+        instance,
+        variant,
+        BackendKind::Cpu,
+    )
+    .unwrap();
+    draft
+        .install_test_preparation_seals(BackendKind::Cpu, 2)
+        .unwrap();
+    let publication = runtime
+        .model_lifecycle
+        .load_granite_speech5_state_publication(
+            variant,
+            instance,
+            &draft,
+            granite_speech5_test_physical_state_spec,
+        )
+        .await
+        .unwrap();
+    let LoadedStatePublication::PhysicalV2 {
+        descriptor,
+        retained,
+        retained_uses,
+        ..
+    } = &publication
+    else {
+        panic!("Granite Speech 5.0 ASR must publish physical state");
+    };
+    assert_eq!(retained.is_some(), retained_route);
+    assert_eq!(!retained_uses.is_empty(), retained_route);
+    assert_eq!(
+        !matches!(descriptor.retained, RetainedStateCapability::Stateless),
+        retained_route
+    );
+    let bundle = draft
+        .seal(HashMap::from([(CapabilityKind::Asr, publication)]))
+        .expect("a Granite Speech 5.0 load must seal");
+    for streaming in [
+        StreamingRequirements::NONE,
+        StreamingRequirements::transport_only(),
+        StreamingRequirements::native(true),
+        StreamingRequirements::NONE.with_asr_long_form(true),
+        StreamingRequirements::transport_only().with_asr_long_form(true),
+    ] {
+        let contract = bundle
+            .contract_for_streaming(CapabilityKind::Asr, streaming)
+            .unwrap();
+        let sequence = retained_route && !streaming.asr_long_form;
+        assert_eq!(
+            contract.execution_profile.mode,
+            if sequence {
+                ExecutionMode::Sequence
+            } else {
+                ExecutionMode::Atomic
+            }
+        );
+        let binding = bundle
+            .capability_binding_for_streaming(CapabilityKind::Asr, streaming)
+            .unwrap();
+        assert_eq!(binding.execution, contract.adapter_binding().unwrap());
+        binding
+            .state
+            .validate_against(BackendKind::Cpu, &binding.execution)
+            .unwrap();
+        assert_eq!(binding.state.managed_kv_runtime().is_some(), sequence);
+    }
     drop(bundle);
     drop(runtime);
     std::fs::remove_dir_all(directory).unwrap();
@@ -1550,7 +1690,7 @@ fn fish_s2_cuda_weight_lease_leaves_room_for_separately_charged_state() {
         metal_device_load_peak_bytes: 10_712_372_164,
         cuda_host_load_peak_bytes: 9_944_351_744,
     };
-    let plan = fish_s2_resource_plan(BackendKind::Cuda, memory).unwrap();
+    let plan = fish_s2_resource_plan(BackendKind::Cuda, memory, 0).unwrap();
     assert_eq!(
         plan.resident_authorization,
         ResourceVector {
@@ -1599,6 +1739,43 @@ fn fish_s2_cuda_weight_lease_leaves_room_for_separately_charged_state() {
     drop(state);
 }
 
+/// The fast AR's CUDA graphs are device memory in the load and resident
+/// authorizations, and stay pending until they allocate; with no graphs the
+/// plan is unchanged.
+#[test]
+fn fish_s2_cuda_plan_prices_the_fast_graphs_as_pending_device_memory() {
+    let memory = FishS2ModelMemory {
+        resident_bytes: 10_000,
+        load_peak_bytes: 12_000,
+        metal_device_load_peak_bytes: 10_000,
+        cuda_host_load_peak_bytes: 9_000,
+    };
+    let graphs = 128 * 1024 * 1024;
+    let without = fish_s2_resource_plan(BackendKind::Cuda, memory, 0).unwrap();
+    let with = fish_s2_resource_plan(BackendKind::Cuda, memory, graphs).unwrap();
+    let device = |vector: &ResourceVector| match vector.device_bytes {
+        ResourceAmount::Known(bytes) => bytes,
+        other => panic!("device bytes {other:?}"),
+    };
+    assert_eq!(
+        device(&with.load_authorization),
+        device(&without.load_authorization) + graphs
+    );
+    assert_eq!(
+        device(&with.resident_authorization),
+        device(&without.resident_authorization) + graphs
+    );
+    assert_eq!(device(&with.deferred_resident_authorization), graphs);
+    assert_eq!(
+        with.deferred_resident_authorization.host_bytes,
+        without.deferred_resident_authorization.host_bytes
+    );
+    assert_eq!(
+        crate::models::architectures::fish_s2::fish_s2_fast_graph_device_bytes(BackendKind::Cpu),
+        0
+    );
+}
+
 #[test]
 fn fish_s2_lazy_reference_cache_keeps_headroom_reserved_after_weight_load() {
     let cache = crate::models::architectures::fish_s2::FISH_S2_REFERENCE_CACHE_BYTES;
@@ -1614,6 +1791,7 @@ fn fish_s2_lazy_reference_cache_keeps_headroom_reserved_after_weight_load() {
             metal_device_load_peak_bytes: 100,
             cuda_host_load_peak_bytes: 0,
         },
+        0,
     )
     .unwrap();
     assert_eq!(plan.deferred_resident_authorization, host(cache));
@@ -1663,7 +1841,7 @@ fn fish_s2_portable_weight_plan_charges_the_expanded_representation() {
         metal_device_load_peak_bytes: 19_836_076_996,
         cuda_host_load_peak_bytes: 9_944_351_744,
     };
-    let cpu = fish_s2_resource_plan(BackendKind::Cpu, cpu_memory).unwrap();
+    let cpu = fish_s2_resource_plan(BackendKind::Cpu, cpu_memory, 0).unwrap();
     assert_eq!(
         cpu.resident_authorization.host_bytes,
         ResourceAmount::Known(
@@ -1690,7 +1868,7 @@ fn fish_s2_portable_weight_plan_charges_the_expanded_representation() {
     };
     // On Metal the unified authorization books what the GPU allocates; the
     // host staging (1.6 GB) is checked against host memory instead.
-    let metal = fish_s2_resource_plan(BackendKind::Metal, half_memory).unwrap();
+    let metal = fish_s2_resource_plan(BackendKind::Metal, half_memory, 0).unwrap();
     assert_eq!(
         metal.load_authorization.unified_bytes,
         ResourceAmount::Known(half_memory.metal_device_load_peak_bytes)
@@ -1755,6 +1933,45 @@ fn automatic_invocation_context_treats_published_reach_as_a_ceiling() {
             65_536
         ),
         PortableInvocationContextIntent::Automatic { ceiling: 65_536 }
+    );
+}
+
+#[test]
+fn cuda_invocation_context_publishes_the_ceiling_without_a_memory_fit() {
+    // Automatic: the model-authored maximum, narrowed by a published reach.
+    assert_eq!(
+        cuda_invocation_context(ContextLengthPreference::Auto, None, Some((448, 448))),
+        Some(448)
+    );
+    assert_eq!(
+        cuda_invocation_context(
+            ContextLengthPreference::Auto,
+            Some(4_096),
+            Some((64, 8_192))
+        ),
+        Some(4_096)
+    );
+    // Explicit: the configured length, capped at the maximum.
+    assert_eq!(
+        cuda_invocation_context(
+            ContextLengthPreference::explicit(2_048).unwrap(),
+            None,
+            Some((64, 8_192))
+        ),
+        Some(2_048)
+    );
+    assert_eq!(
+        cuda_invocation_context(
+            ContextLengthPreference::explicit(16_384).unwrap(),
+            None,
+            Some((64, 8_192))
+        ),
+        Some(8_192)
+    );
+    // Fixed-size state has no decoder-context axis to publish.
+    assert_eq!(
+        cuda_invocation_context(ContextLengthPreference::Auto, None, None),
+        None
     );
 }
 
@@ -1965,6 +2182,110 @@ fn cuda_wide_chat_families_stage_at_the_width_the_state_floor_prices() {
             "{variant:?}"
         );
     }
+}
+
+/// An ASR decode fitted past the engine rows (CUDA, EXE-F7) stages and
+/// retains one launch at its width, so all its rows can be admitted and
+/// stepped together; a decode at the engine rows keeps today's rows. Engine
+/// rows here are an H100's: hundreds of automatic retained rows and staged
+/// rows at the engine width.
+#[test]
+fn asr_state_rows_cover_the_asr_decode_width() {
+    use crate::runtime::adapters::LoadedModelBundleDraft;
+    let draft = |asr_width: usize, variant: ModelVariant, backend: BackendKind| {
+        LoadedModelBundleDraft::build(
+            &RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1)
+                .unwrap()
+                .with_asr_tensor_batch_size(asr_width),
+            ExecutionGroupId::new(994),
+            ModelInstanceId::new(1),
+            variant,
+            backend,
+        )
+        .unwrap()
+    };
+    let wide = RuntimeService::new(EngineConfig {
+        backend: BackendPreference::Cpu,
+        max_num_seqs: Some(320),
+        ..Default::default()
+    })
+    .unwrap();
+    let engine = wide.core_engine.config();
+    assert!(engine.automatic_row_limits.retained_sequences);
+    assert!(engine.automatic_row_limits.staged_transactions);
+    assert_eq!(engine.max_retained_sequences, 320);
+    let lifecycle = &wide.model_lifecycle;
+    for variant in [
+        ModelVariant::ParakeetTdt06BV3,
+        ModelVariant::Nemotron35AsrStreaming06B,
+    ] {
+        let fitted = draft(32, variant, BackendKind::Cuda);
+        assert_eq!(lifecycle.asr_state_rows(&fitted).unwrap(), (32, 32));
+        assert_eq!(
+            lifecycle
+                .asr_state_rows(&draft(16, variant, BackendKind::Cuda))
+                .unwrap(),
+            (16, 16)
+        );
+        assert_eq!(
+            lifecycle
+                .asr_state_rows(&draft(8, variant, BackendKind::Cuda))
+                .unwrap(),
+            (8, 8)
+        );
+    }
+
+    // A transducer's predictor rows: its realtime sessions (4 on the CPU),
+    // and at least its decode width.
+    let portable = RuntimeService::new(EngineConfig {
+        backend: BackendPreference::Cpu,
+        ..Default::default()
+    })
+    .unwrap();
+    let lifecycle = &portable.model_lifecycle;
+    for variant in [
+        ModelVariant::ParakeetTdt06BV3,
+        ModelVariant::Nemotron35AsrStreaming06B,
+    ] {
+        assert_eq!(
+            lifecycle
+                .transducer_retained_sequences(&draft(32, variant, BackendKind::Cuda))
+                .unwrap(),
+            32
+        );
+        let cpu = LoadedModelBundleDraft::build(
+            &portable.adapter_registry,
+            ExecutionGroupId::new(995),
+            ModelInstanceId::new(1),
+            variant,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        assert_eq!(lifecycle.transducer_retained_sequences(&cpu).unwrap(), 4);
+        // The CPU's ASR rows are today's: the engine's staged rows.
+        assert_eq!(lifecycle.asr_state_rows(&cpu).unwrap(), (8, 2));
+    }
+    // Without a CUDA width to fit, a load keeps the registry's ASR width
+    // and a model without ASR has none.
+    let plan = model_resource_plan(
+        BackendKind::Cpu,
+        ModelMemoryEstimate {
+            load_peak_bytes: 1_000,
+            resident_bytes: 800,
+        },
+    );
+    assert_eq!(
+        lifecycle
+            .fit_asr_decode_width(ModelVariant::Qwen3Asr17BGguf, &plan)
+            .unwrap(),
+        Some(2)
+    );
+    assert_eq!(
+        lifecycle
+            .fit_asr_decode_width(ModelVariant::Qwen306B, &plan)
+            .unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -4145,5 +4466,201 @@ fn unevictable_residents_are_pinned_or_busy_and_never_the_request() {
             &pinned,
         ),
         vec![ModelVariant::Kokoro82M, ModelVariant::WhisperLargeV3Turbo]
+    );
+}
+
+/// With automatic staged rows a TTS load stages one launch at its widest
+/// continuous decode stage, so a decode certified past the engine rows
+/// (`catalog::tts_decode_width`) is not held to the engine's staged width;
+/// a family at the engine rows keeps the engine's staged rows.
+#[test]
+fn tts_staged_rows_cover_the_tts_decode_width() {
+    use crate::runtime::adapters::LoadedModelBundleDraft;
+    let draft = |tts_width: usize, variant: ModelVariant| {
+        LoadedModelBundleDraft::build(
+            &RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1)
+                .unwrap()
+                .with_tts_tensor_batch_size(tts_width),
+            ExecutionGroupId::new(995),
+            ModelInstanceId::new(1),
+            variant,
+            BackendKind::Cuda,
+        )
+        .unwrap()
+    };
+    let wide = RuntimeService::new(EngineConfig {
+        backend: BackendPreference::Cpu,
+        max_num_seqs: Some(320),
+        ..Default::default()
+    })
+    .unwrap();
+    let engine_staged = wide.core_engine.config().max_staged_transactions;
+    assert!(
+        wide.core_engine
+            .config()
+            .automatic_row_limits
+            .staged_transactions
+    );
+    let lifecycle = &wide.model_lifecycle;
+    for variant in [
+        ModelVariant::Maya13B,
+        ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+        ModelVariant::Voxtral4BTts2603,
+    ] {
+        assert_eq!(
+            lifecycle.tts_staged_rows(&draft(32, variant)).unwrap(),
+            32.max(engine_staged),
+            "{variant}"
+        );
+        assert_eq!(
+            lifecycle.tts_staged_rows(&draft(8, variant)).unwrap(),
+            engine_staged.max(8),
+            "{variant}"
+        );
+    }
+    assert_eq!(
+        lifecycle
+            .tts_staged_rows(&draft(32, ModelVariant::Kokoro82M))
+            .unwrap(),
+        engine_staged
+    );
+}
+
+/// A retained ASR pool every sequence claims its pages from holds one
+/// automatic sequence per retained row, in whole pages, so concurrent
+/// requests' claims fit side by side, and never less than one sequence of
+/// the model's context. A pool of one context admitted one Granite Speech
+/// 4.1 (4,096 tokens against a 2,048-token automatic claim) or Whisper (its
+/// whole 448-position window) request at a time, and every decode step
+/// carried one row.
+#[test]
+fn shared_asr_pools_hold_one_automatic_sequence_per_row() {
+    let granite = super::asr_minimum_tokens(ModelVariant::GraniteSpeech412BPlus);
+    assert!((444..1024).contains(&granite), "{granite}");
+    let sequence = usize::try_from(granite).unwrap();
+    let pages = sequence.div_ceil(64) * 64;
+    assert_eq!(super::asr_shared_pool_tokens(4096, granite, 1, 64), 4096);
+    assert_eq!(
+        super::asr_shared_pool_tokens(4096, granite, 8, 64),
+        8 * pages
+    );
+    assert_eq!(
+        super::asr_shared_pool_tokens(4096, granite, 32, 64),
+        32 * pages
+    );
+    assert_eq!(
+        super::asr_shared_pool_tokens(4096, granite, 8, 1),
+        8 * sequence
+    );
+    let whisper = super::asr_minimum_tokens(ModelVariant::WhisperLargeV3Turbo);
+    assert_eq!(whisper, 448);
+    assert_eq!(super::asr_shared_pool_tokens(448, whisper, 1, 64), 448);
+    assert_eq!(super::asr_shared_pool_tokens(448, whisper, 8, 64), 8 * 448);
+    // A sequence never counts for more than the model's context.
+    assert_eq!(super::asr_shared_pool_tokens(448, 10_000, 3, 64), 3 * 448);
+}
+
+/// Granite Speech 5.0's retained pool is bounded by its retained ceiling,
+/// not its 16k context (the atomic route's): one automatic sequence per
+/// retained row in whole 64-token pages and never less than one longest
+/// retained sequence. 8 rows take 6,144 tokens (480 MiB of F16 K/V per
+/// portable copy) where a pool with the context floor took 16,384
+/// (1.25 GiB). A fit short of one
+/// retained sequence refuses the load, since a request routed to a row
+/// could then wait on KV admission forever.
+#[test]
+fn granite_speech5_retained_pool_holds_one_longest_sequence_without_a_context_floor() {
+    use crate::models::architectures::granite_speech5::asr::GRANITE_SPEECH5_RETAINED_SEQUENCE_TOKENS as CEILING;
+    let minimum = super::asr_minimum_tokens(ModelVariant::GraniteSpeech502BGguf);
+    assert_eq!(minimum, 744);
+    let pool = |rows| super::asr_shared_pool_tokens(CEILING, minimum, rows, 64);
+    assert_eq!(pool(1), CEILING);
+    assert_eq!(pool(2), CEILING);
+    assert_eq!(pool(8), 8 * 768);
+    assert_eq!(pool(32), 32 * 768);
+    assert!(pool(8) < 16_384);
+    // 40 layers x 4 KV heads x (128 + 128) x 2 bytes per token.
+    assert_eq!(pool(8) as u64 * 40 * 4 * 256 * 2, 480 * 1024 * 1024);
+    super::granite_speech5_retained_reach_holds_a_sequence(CEILING as u64, CEILING).unwrap();
+    super::granite_speech5_retained_reach_holds_a_sequence(pool(8) as u64, CEILING).unwrap();
+    let short = super::granite_speech5_retained_reach_holds_a_sequence(CEILING as u64 - 1, CEILING);
+    assert!(short
+        .unwrap_err()
+        .to_string()
+        .contains("IZWI_GRANITE_SPEECH5_RETAINED_DECODE"));
+}
+
+/// Nemotron 3.5 Transcribe's Mamba state takes the ASR rows, not the
+/// engine's. Beside an H100's automatic engine rows (320 here; 316 retained
+/// and 8 staged in the 2026-11-08 matrix), its 8-row decode takes 8
+/// retained and 8 staged rows: 16 x 47.6 MiB = 762 MiB of recurrent and
+/// convolution state beside its 384 MiB K/V pool, where the engine rows
+/// reserved 324 x 47.6 MiB = 15.1 GiB.
+#[test]
+fn nemotron_transcribe_state_takes_the_asr_rows_not_the_engine_rows() {
+    use crate::models::architectures::nemotron_transcribe::config::tests::published;
+    use crate::models::architectures::nemotron_transcribe::decoder::state::{
+        decoder_state_contract, kv_bytes_per_token, recurrent_state_bytes,
+    };
+    use crate::runtime::adapters::LoadedModelBundleDraft;
+    const MIB: u64 = 1024 * 1024;
+    let variant = ModelVariant::Nemotron35Transcribe30BA4BFp8;
+    let width = crate::catalog::certified_decode_width(variant.family(), BackendKind::Cuda);
+    assert_eq!(width, 8);
+    let wide = RuntimeService::new(EngineConfig {
+        backend: BackendPreference::Cpu,
+        max_num_seqs: Some(320),
+        ..Default::default()
+    })
+    .unwrap();
+    let draft = LoadedModelBundleDraft::build(
+        &RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1)
+            .unwrap()
+            .with_asr_tensor_batch_size(width),
+        ExecutionGroupId::new(996),
+        ModelInstanceId::new(1),
+        variant,
+        BackendKind::Cuda,
+    )
+    .unwrap();
+    let rows = wide.model_lifecycle.asr_state_rows(&draft).unwrap();
+    assert_eq!(rows, (8, 8));
+
+    let config = published();
+    let row_bytes = recurrent_state_bytes(&config.decoder);
+    assert_eq!(row_bytes, 49_930_240);
+    let contract = decoder_state_contract(&config.decoder, StateDType::F16, 64).unwrap();
+    let plan = crate::backends::state::negotiate_state_plan(
+        &contract,
+        &crate::backends::state::StateBackendPlanRequest {
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            page_tokens_hint: Some(64),
+            storage_dtype_hint: None,
+        },
+    )
+    .unwrap();
+    let state_bytes = |(retained, staged): (usize, usize)| {
+        let (_, tensor) = crate::engine::plan_managed_state_capacity(
+            &plan,
+            ModelInstanceId::new(35),
+            crate::engine::ManagedStateCapacityRequest {
+                total_paged_pages: 1 << 20,
+                logical_token_reach: Some(65_536),
+                retained_sequence_rows: u32::try_from(retained).unwrap(),
+                staged_transaction_rows: u32::try_from(staged).unwrap(),
+            },
+        )
+        .unwrap();
+        tensor.unwrap().authorized_bytes()
+    };
+    assert_eq!(state_bytes(rows), 16 * row_bytes);
+    assert_eq!(state_bytes(rows) / MIB, 761);
+    assert_eq!(state_bytes((316, 8)), 324 * row_bytes);
+    assert_eq!(state_bytes((316, 8)) / MIB, 15_427);
+    // The 65,536-token K/V pool: 6 KiB of BF16 K/V a token.
+    assert_eq!(
+        65_536 * kv_bytes_per_token(&config.decoder, candle_core::DType::BF16),
+        384 * MIB
     );
 }

@@ -129,6 +129,26 @@ pub(crate) struct WhisperAudioBatchRow<'a> {
     pub(crate) sample_rate: u32,
 }
 
+/// One request's encoder input, computed on a host worker: the 30 s window's
+/// log-mel of its trimmed 16 kHz audio, mel-major as the encoder reads it.
+pub(crate) struct WhisperHostFeatures {
+    mel: Vec<f32>,
+    source_identity: [u8; 32],
+    input_samples: usize,
+    input_sample_rate: u32,
+}
+
+impl WhisperHostFeatures {
+    /// Host bytes the features hold until the encode drops them.
+    pub(crate) fn host_bytes(&self) -> Result<u64> {
+        self.mel
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| Error::Overloaded("Whisper host feature bytes overflow".into()))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WhisperWindowPreparationGeometry {
     pub(crate) input_samples: usize,
@@ -155,6 +175,9 @@ pub(crate) struct WhisperAudioPreparationStageSeal {
     pub(crate) dtype: String,
     pub(crate) max_batch_size: usize,
     pub(crate) max_workspace_bytes: u64,
+    /// One continuous decode row's workspace
+    /// ([`WhisperTurboAsrModel::continuous_decode_workspace_per_row_bytes`]).
+    pub(crate) decode_workspace_per_row_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -168,6 +191,12 @@ pub(crate) struct WhisperPreparedWindow {
 }
 
 impl WhisperPreparedWindow {
+    /// The device holding the prepared cross-attention memory, if any layer
+    /// has one.
+    pub(crate) fn device_location(&self) -> Option<candle_core::DeviceLocation> {
+        self.layers.first().map(|layer| layer.keys.device().location())
+    }
+
     pub(crate) const fn cross_memory_tokens(&self) -> usize {
         self.memory_tokens
     }
@@ -906,6 +935,12 @@ impl WhisperModel {
         LocalWhisper::load(vb, config).map(Self::Local)
     }
 
+    fn decode_graphs_diagnostics(&self) -> serde_json::Value {
+        match self {
+            Self::Local(model) => model.decoder.decode_graphs_diagnostics(),
+        }
+    }
+
     fn encoder_forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Local(model) => model.encoder.forward(x),
@@ -974,6 +1009,20 @@ impl WhisperModel {
                 cross_runtime,
                 cross_sequence,
             ),
+        }
+    }
+
+    fn decoder_forward_retained_decode_batch(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        cross: &crate::engine::RetainedStaticAttentionBatch<'_>,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Local(model) => model
+                .decoder
+                .forward_retained_decode_batch(tokens, positions, caches, cross),
         }
     }
 
@@ -1075,6 +1124,9 @@ pub struct WhisperTurboAsrModel {
     numeral_symbol_tokens: Vec<u32>,
     decode_mask: Tensor,
     decode_begin_mask: Tensor,
+    /// `[2, vocab]`: row 0 the decode mask, row 1 it plus the begin mask, so
+    /// a batch masks every row with one gather by whether it is at begin.
+    decode_mask_table: Tensor,
     language_token_ids: Vec<u32>,
     language_token_range: Option<(usize, usize)>,
     token_id_to_language_code: HashMap<u32, String>,
@@ -1203,6 +1255,12 @@ pub(crate) fn whisper_weight_files(model_dir: &Path) -> Result<Vec<std::path::Pa
 }
 
 impl WhisperTurboAsrModel {
+    /// The decoder's CUDA step graphs: captures, replays and why they are
+    /// off.
+    pub(crate) fn decode_graph_diagnostics(&self) -> serde_json::Value {
+        self.whisper.decode_graphs_diagnostics()
+    }
+
     pub fn load(model_dir: &Path, device: DeviceProfile) -> Result<Self> {
         let config_path = model_dir.join("config.json");
         let config_data = fs::read_to_string(config_path)?;
@@ -1255,6 +1313,7 @@ impl WhisperTurboAsrModel {
             &device.device,
         )?;
 
+        let decode_mask_table = whisper_decode_mask_table(&decode_mask, &decode_begin_mask)?;
         let mel = MelSpectrogram::new(whisper_mel_config(config.num_mel_bins))?;
 
         info!(
@@ -1276,6 +1335,7 @@ impl WhisperTurboAsrModel {
             numeral_symbol_tokens,
             decode_mask,
             decode_begin_mask,
+            decode_mask_table,
             language_token_ids,
             language_token_range,
             token_id_to_language_code,
@@ -1490,14 +1550,11 @@ impl WhisperTurboAsrModel {
             .ok_or_else(|| {
                 Error::Overloaded("Whisper device workspace geometry overflow".into())
             })?;
+        // Each row's resample and log-mel ran on a host worker, priced with
+        // its request; the batch holds only each window's upload copy.
         let host_elements = rows.iter().try_fold(0_u64, |total, row| {
             total
-                .checked_add(
-                    u64::try_from(row.resampled_samples).map_err(|_| {
-                        Error::Overloaded("Whisper resampled row exceeds u64".into())
-                    })?,
-                )
-                .and_then(|value| value.checked_add(row.materialized_mel_elements))
+                .checked_add(row.materialized_mel_elements)
                 .ok_or_else(|| Error::Overloaded("Whisper host workspace geometry overflow".into()))
         })?;
         let workspace_bytes = device_elements
@@ -1581,6 +1638,28 @@ impl WhisperTurboAsrModel {
             dtype: format!("{:?}", self.model_dtype).to_ascii_lowercase(),
             max_batch_size: width,
             max_workspace_bytes: self.window_max_batch_workspace_bytes(width)?,
+            decode_workspace_per_row_bytes: self.continuous_decode_workspace_per_row_bytes()?,
+        })
+    }
+
+    /// Trims, resamples and turns one request's audio into its window's
+    /// log-mel on the host, so a device job runs only the upload and encoder.
+    pub(crate) fn prepare_host_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<WhisperHostFeatures> {
+        if audio.is_empty() || sample_rate == 0 {
+            return Err(Error::InvalidInput(
+                "Whisper window preparation received an empty row".into(),
+            ));
+        }
+        let trimmed = self.trimmed_audio_slice(audio, sample_rate);
+        Ok(WhisperHostFeatures {
+            mel: self.log_mel_host(trimmed, sample_rate)?,
+            source_identity: whisper_cross_source_identity(trimmed, sample_rate),
+            input_samples: audio.len(),
+            input_sample_rate: sample_rate,
         })
     }
 
@@ -1588,27 +1667,37 @@ impl WhisperTurboAsrModel {
         &self,
         rows: &[WhisperAudioBatchRow<'_>],
     ) -> Result<Vec<WhisperPreparedWindow>> {
+        let features = rows
+            .iter()
+            .map(|row| self.prepare_host_features(row.audio, row.sample_rate))
+            .collect::<Result<Vec<_>>>()?;
+        self.prepare_window_batch_from_features(&features.iter().collect::<Vec<_>>())
+    }
+
+    /// Encodes windows whose log-mel a host worker computed, as one batch.
+    pub(crate) fn prepare_window_batch_from_features(
+        &self,
+        rows: &[&WhisperHostFeatures],
+    ) -> Result<Vec<WhisperPreparedWindow>> {
         if rows.is_empty() {
             return Err(Error::InvalidInput(
                 "Whisper window preparation requires at least one row".into(),
             ));
         }
-        let mut mels = Vec::with_capacity(rows.len());
-        let mut identities = Vec::with_capacity(rows.len());
-        for row in rows {
-            if row.audio.is_empty() || row.sample_rate == 0 {
-                return Err(Error::InvalidInput(
-                    "Whisper window preparation received an empty row".into(),
-                ));
-            }
-            let trimmed = self.trimmed_audio_slice(row.audio, row.sample_rate);
-            mels.push(self.prepare_mel(trimmed, row.sample_rate)?);
-            identities.push((
-                whisper_cross_source_identity(trimmed, row.sample_rate),
-                row.audio.len(),
-                row.sample_rate,
-            ));
-        }
+        let mels = rows
+            .iter()
+            .map(|row| self.upload_mel(&row.mel))
+            .collect::<Result<Vec<_>>>()?;
+        let identities = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.source_identity,
+                    row.input_samples,
+                    row.input_sample_rate,
+                )
+            })
+            .collect::<Vec<_>>();
         let mel_refs = mels.iter().collect::<Vec<_>>();
         let mel_batch = Tensor::cat(&mel_refs, 0)?;
         let encoded = self.whisper.encoder_forward_batch(&mel_batch)?;
@@ -1938,6 +2027,39 @@ impl WhisperTurboAsrModel {
             &mut log_probs,
             &mut profile,
         )?;
+        if let Some(position) = self.record_selected_token(state, next, next_logprob)? {
+            let sequence = state.cross_sequence.ok_or_else(|| {
+                Error::InferenceError("Whisper retained cross sequence was released".into())
+            })?;
+            let token = Tensor::new(&[[next]], &self.device.device)?;
+            let output = self.whisper.decoder_forward_retained_at(
+                &token,
+                position,
+                &mut state.self_kv,
+                state.cross_runtime.as_ref(),
+                sequence,
+            )?;
+            state.managed_completions_drained = false;
+            let next_logits = self
+                .whisper
+                .decoder_final_linear(&output.i((..1, 0..1))?)
+                .and_then(|logits| logits.i(0).map_err(Error::from))
+                .and_then(|logits| logits.i(0).map_err(Error::from))?;
+            state.pending_logits = Some(next_logits);
+        }
+        self.retained_step_outcome(state)
+    }
+
+    /// Count the selected `next` into the attempt, in decode order: EOT ends
+    /// it; any other token joins `generated_tokens`, and the step budget or a
+    /// repeated suffix may end it. Returns the position `next` decodes at
+    /// when the attempt goes on.
+    fn record_selected_token(
+        &self,
+        state: &mut WhisperDecodeState,
+        next: u32,
+        next_logprob: f32,
+    ) -> Result<Option<usize>> {
         state.decode_steps = state
             .decode_steps
             .checked_add(1)
@@ -1950,52 +2072,47 @@ impl WhisperTurboAsrModel {
         if next == self.special.eot {
             state.ended_with_eot = true;
             state.finished = true;
-        } else {
-            let generated_after_step =
-                state.generated_tokens.len().checked_add(1).ok_or_else(|| {
-                    Error::InvalidInput("Whisper generated token count overflow".into())
-                })?;
-            let reaches_limit = generated_after_step >= state.max_steps;
-            if !reaches_limit {
-                let sequence = state.cross_sequence.ok_or_else(|| {
-                    Error::InferenceError("Whisper retained cross sequence was released".into())
-                })?;
-                let position = state
-                    .prompt
-                    .len()
-                    .checked_add(state.generated_tokens.len())
-                    .ok_or_else(|| {
-                        Error::InvalidInput("Whisper decode position overflow".into())
-                    })?;
-                let token = Tensor::new(&[[next]], &self.device.device)?;
-                let output = self.whisper.decoder_forward_retained_at(
-                    &token,
-                    position,
-                    &mut state.self_kv,
-                    state.cross_runtime.as_ref(),
-                    sequence,
-                )?;
-                state.managed_completions_drained = false;
-                let next_logits = self
-                    .whisper
-                    .decoder_final_linear(&output.i((..1, 0..1))?)
-                    .and_then(|logits| logits.i(0).map_err(Error::from))
-                    .and_then(|logits| logits.i(0).map_err(Error::from))?;
-                state.pending_logits = Some(next_logits);
-            } else {
-                state.finished = true;
+            return Ok(None);
+        }
+        let generated_after_step =
+            state.generated_tokens.len().checked_add(1).ok_or_else(|| {
+                Error::InvalidInput("Whisper generated token count overflow".into())
+            })?;
+        let position = state
+            .prompt
+            .len()
+            .checked_add(state.generated_tokens.len())
+            .ok_or_else(|| Error::InvalidInput("Whisper decode position overflow".into()))?;
+        if generated_after_step >= state.max_steps {
+            state.finished = true;
+        }
+        state.generated_tokens.push(next);
+        if let Some((span, repeats)) = find_suffix_token_repetition(&state.generated_tokens) {
+            let trim = span.saturating_mul(repeats.saturating_sub(1));
+            if trim > 0 && trim <= state.generated_tokens.len() {
+                state
+                    .generated_tokens
+                    .truncate(state.generated_tokens.len() - trim);
             }
-            state.generated_tokens.push(next);
-            if let Some((span, repeats)) = find_suffix_token_repetition(&state.generated_tokens) {
-                let trim = span.saturating_mul(repeats.saturating_sub(1));
-                if trim > 0 && trim <= state.generated_tokens.len() {
-                    state
-                        .generated_tokens
-                        .truncate(state.generated_tokens.len() - trim);
-                }
-                state.repetition_loop = true;
-                state.finished = true;
-            }
+            state.repetition_loop = true;
+            state.finished = true;
+        }
+        Ok((!state.finished).then_some(position))
+    }
+
+    /// The step a decode ends with. Text is decoded only when the attempt
+    /// finishes: the terminal policy reads `assembled` then, and the
+    /// executor publishes no provisional text (the fallback policy can still
+    /// reject the attempt at EOS). Decoding the whole sequence on every step
+    /// cost one full detokenization per token.
+    fn retained_step_outcome(&self, state: &mut WhisperDecodeState) -> Result<WhisperDecodeStep> {
+        if !state.finished {
+            return Ok(WhisperDecodeStep {
+                delta: String::new(),
+                text: String::new(),
+                tokens_generated: state.generated_tokens.len(),
+                finished: false,
+            });
         }
         let decoded = self.decode_generated_text(&state.generated_tokens)?;
         let text = decoded.trim().to_string();
@@ -2005,16 +2122,243 @@ impl WhisperTurboAsrModel {
             delta: delta.to_string(),
             text,
             tokens_generated: state.generated_tokens.len(),
-            finished: state.finished,
+            finished: true,
         })
+    }
+
+    /// One decode step of several retained sequences together, each row as
+    /// [`Self::decode_step_retained`] steps it alone: rows already at their
+    /// end finish without a forward; greedy rows pick their tokens from one
+    /// masked `[rows, vocab]` batch with one readback (on an accelerator;
+    /// sampled rows and the CPU read their own logits row); each row counts
+    /// its token in today's order; and only the rows that go on run one
+    /// batched decoder forward. A failure restores every row.
+    pub(crate) fn decode_step_retained_batch(
+        &self,
+        states: &mut [&mut WhisperDecodeState],
+    ) -> Result<Vec<WhisperDecodeStep>> {
+        if states.iter().any(|state| {
+            state.prefill_progress != state.prompt.len() || state.pending_logits.is_none()
+        }) {
+            return Err(Error::InvalidInput(
+                "Whisper decode requires completed prefill and pending logits".into(),
+            ));
+        }
+        let mut steps = Vec::with_capacity(states.len());
+        let mut active = Vec::with_capacity(states.len());
+        for (row, state) in states.iter_mut().enumerate() {
+            if state.finished || state.generated_tokens.len() >= state.max_steps {
+                state.finished = true;
+                steps.push(Some(WhisperDecodeStep {
+                    delta: String::new(),
+                    text: state.assembled.trim().to_string(),
+                    tokens_generated: state.generated_tokens.len(),
+                    finished: true,
+                }));
+            } else {
+                steps.push(None);
+                active.push(row);
+            }
+        }
+        if !active.is_empty() {
+            let snapshots = active
+                .iter()
+                .map(|row| {
+                    (
+                        states[*row].self_kv.logical_checkpoint(),
+                        WhisperDecodeStepSnapshot::capture(states[*row]),
+                    )
+                })
+                .collect::<Vec<_>>();
+            match self.decode_step_retained_batch_transaction(states, &active) {
+                Ok(active_steps) => {
+                    for (row, step) in active.iter().zip(active_steps) {
+                        steps[*row] = Some(step);
+                    }
+                }
+                Err(error) => {
+                    let mut rollback_errors = Vec::new();
+                    for (row, (checkpoint, snapshot)) in active.iter().zip(snapshots) {
+                        let state = &mut *states[*row];
+                        if let Err(rollback) = state.self_kv.restore_logical_checkpoint(checkpoint)
+                        {
+                            rollback_errors.push(rollback.to_string());
+                        }
+                        snapshot.restore(state);
+                    }
+                    return Err(if rollback_errors.is_empty() {
+                        error
+                    } else {
+                        Error::InferenceError(format!(
+                            "Whisper batched decode step failed ({error}); state rollback also failed: {}",
+                            rollback_errors.join("; ")
+                        ))
+                    });
+                }
+            }
+        }
+        Ok(steps.into_iter().flatten().collect())
+    }
+
+    fn decode_step_retained_batch_transaction(
+        &self,
+        states: &mut [&mut WhisperDecodeState],
+        active: &[usize],
+    ) -> Result<Vec<WhisperDecodeStep>> {
+        let logits = active
+            .iter()
+            .map(|row| {
+                states[*row]
+                    .pending_logits
+                    .take()
+                    .expect("validated pending logits")
+            })
+            .collect::<Vec<_>>();
+        let mut selections = vec![None; active.len()];
+        if self.runtime_tuning.device_greedy_decode && !self.device.device.is_cpu() {
+            let greedy = (0..active.len())
+                .filter(|index| states[active[*index]].temperature <= 0.0)
+                .collect::<Vec<_>>();
+            if !greedy.is_empty() {
+                let rows = greedy
+                    .iter()
+                    .map(|index| {
+                        (
+                            &logits[*index],
+                            states[active[*index]].generated_tokens.is_empty(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                match self.greedy_decode_rows_on_device(&rows) {
+                    Ok(picked) => {
+                        for (index, selection) in greedy.into_iter().zip(picked) {
+                            selections[index] = Some(selection);
+                        }
+                    }
+                    Err(err) => {
+                        debug!(
+                            "Whisper batched device greedy decode fell back to host logits: {err}"
+                        );
+                    }
+                }
+            }
+        }
+        let mut forward = Vec::new();
+        for (index, row) in active.iter().enumerate() {
+            let state = &mut *states[*row];
+            let (next, next_logprob) = match selections[index] {
+                Some(selection) => selection,
+                None => {
+                    let mut log_probs = Vec::new();
+                    let mut profile = WhisperDecodeProfile::new(false);
+                    self.select_next_token(
+                        &logits[index],
+                        state.generated_tokens.is_empty(),
+                        state.temperature <= 0.0,
+                        state.temperature,
+                        &mut state.rng,
+                        &mut log_probs,
+                        &mut profile,
+                    )?
+                }
+            };
+            if let Some(position) = self.record_selected_token(state, next, next_logprob)? {
+                forward.push((*row, next, position));
+            }
+        }
+        if !forward.is_empty() {
+            let runtime = states[forward[0].0].cross_runtime.clone();
+            let sequences = forward
+                .iter()
+                .map(|(row, _, _)| {
+                    if !Arc::ptr_eq(&states[*row].cross_runtime, &runtime) {
+                        return Err(Error::InvalidInput(
+                            "Whisper decode batch spans different cross-attention runtimes".into(),
+                        ));
+                    }
+                    states[*row].cross_sequence.ok_or_else(|| {
+                        Error::InferenceError("Whisper retained cross sequence was released".into())
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let tokens = forward
+                .iter()
+                .map(|(_, token, _)| *token)
+                .collect::<Vec<_>>();
+            let positions = forward
+                .iter()
+                .map(|(_, _, position)| *position)
+                .collect::<Vec<_>>();
+            let logits = {
+                let cross = runtime.prepare_batch(&sequences)?;
+                let mut forward_rows = forward.iter().map(|(row, _, _)| *row).peekable();
+                let mut caches = Vec::with_capacity(forward.len());
+                for (row, state) in states.iter_mut().enumerate() {
+                    if forward_rows.next_if_eq(&row).is_some() {
+                        caches.push(&mut state.self_kv);
+                    }
+                }
+                self.whisper.decoder_forward_retained_decode_batch(
+                    &tokens,
+                    &positions,
+                    &mut caches,
+                    &cross,
+                )?
+            };
+            for (index, (row, _, _)) in forward.iter().enumerate() {
+                let state = &mut *states[*row];
+                state.pending_logits = Some(logits.i(index)?);
+                state.managed_completions_drained = false;
+            }
+        }
+        active
+            .iter()
+            .map(|row| self.retained_step_outcome(states[*row]))
+            .collect()
+    }
+
+    /// Greedy picks of `rows` (`(logits, at_begin)`) from one masked batch:
+    /// every row is masked with one gather of [`Self::decode_mask_table`]
+    /// and the picks come back in one readback.
+    fn greedy_decode_rows_on_device(&self, rows: &[(&Tensor, bool)]) -> Result<Vec<(u32, f32)>> {
+        let logits = Tensor::stack(
+            &rows.iter().map(|(logits, _)| *logits).collect::<Vec<_>>(),
+            0,
+        )?;
+        let begin = Tensor::from_vec(
+            rows.iter()
+                .map(|(_, at_begin)| u32::from(*at_begin))
+                .collect::<Vec<_>>(),
+            rows.len(),
+            logits.device(),
+        )?;
+        let mask =
+            self.mask_for_logits(&self.decode_mask_table.index_select(&begin, 0)?, &logits)?;
+        greedy_decode_rows_from_masked_logits(&(logits + mask)?, self.special.eot)
+    }
+
+    pub(crate) fn supports_continuous_decode_batch(&self) -> bool {
+        true
+    }
+
+    /// Bytes one row of a continuous decode step uses beside its retained
+    /// state: its hidden row in the model dtype and its F32 logits row.
+    pub(crate) fn continuous_decode_workspace_per_row_bytes(&self) -> Result<u64> {
+        let hidden = checked_product_u64(
+            &[self.config.d_model, self.model_dtype.size_in_bytes()],
+            "Whisper decode hidden row",
+        )?;
+        let logits = checked_product_u64(
+            &[self.config.vocab_size, std::mem::size_of::<f32>()],
+            "Whisper decode logits row",
+        )?;
+        hidden
+            .checked_add(logits)
+            .ok_or_else(|| Error::Overloaded("Whisper decode workspace overflow".into()))
     }
 
     pub(crate) const fn supports_resumable_prefill(&self) -> bool {
         true
-    }
-
-    pub(crate) const fn supports_continuous_decode_batch(&self) -> bool {
-        false
     }
 
     fn validate_prepared_window(&self, prepared: &WhisperPreparedWindow) -> Result<()> {
@@ -2522,6 +2866,11 @@ impl WhisperTurboAsrModel {
     }
 
     fn prepare_mel(&self, audio: &[f32], sample_rate: u32) -> Result<Tensor> {
+        self.upload_mel(&self.log_mel_host(audio, sample_rate)?)
+    }
+
+    /// The window's log-mel of `audio`, resampled to 16 kHz, mel-major.
+    fn log_mel_host(&self, audio: &[f32], sample_rate: u32) -> Result<Vec<f32>> {
         let mono_16khz = if sample_rate == SAMPLE_RATE {
             audio.to_vec()
         } else {
@@ -2543,7 +2892,14 @@ impl WhisperTurboAsrModel {
             }
         }
 
-        let mel = Tensor::from_vec(flat, (1, n_mels, frames), &self.device.device)?;
+        Ok(flat)
+    }
+
+    /// Uploads one window's mel-major log-mel as the encoder's input.
+    fn upload_mel(&self, mel: &[f32]) -> Result<Tensor> {
+        let frames = self.config.max_source_positions.saturating_mul(2).max(1);
+        let n_mels = self.config.num_mel_bins;
+        let mel = Tensor::from_slice(mel, (1, n_mels, frames), &self.device.device)?;
         if mel.dtype() != self.model_dtype {
             return Ok(mel.to_dtype(self.model_dtype)?);
         }
@@ -2763,6 +3119,7 @@ impl WhisperTurboAsrModel {
     }
 
     fn decode_generated_text(&self, token_ids: &[u32]) -> Result<String> {
+        let _detok = crate::engine::metrics::asr_detok_scope();
         self.tokenizer.decode(token_ids)
     }
 
@@ -3573,14 +3930,21 @@ fn tensor_to_f32_vec1(tensor: &Tensor) -> Result<Vec<f32>> {
 }
 
 /// Device greedy step over decode-filtered logits. The log-probability is
-/// taken at temperature 1, as on the host.
+/// taken at temperature 1, as on the host. The token, its logit, the
+/// maximum and the log-sum-exp come back in one transfer: the token index
+/// travels as an F32, exact for any vocabulary below 2^24.
 fn greedy_decode_step_from_masked_logits(masked: &Tensor, eot: u32) -> Result<(u32, f32)> {
+    if masked.dim(0)? > 1 << f32::MANTISSA_DIGITS {
+        return Err(Error::InvalidInput(
+            "Whisper vocabulary exceeds the exact F32 token range".into(),
+        ));
+    }
     let masked_f32 = if masked.dtype() == DType::F32 {
         masked.clone()
     } else {
         masked.to_dtype(DType::F32)?
     };
-    let next = masked.argmax(0)?.to_scalar::<u32>()?;
+    let next = masked.argmax(0)?;
     let max_logit = masked_f32.max(0)?;
     let logsumexp = masked_f32
         .broadcast_sub(&max_logit)?
@@ -3588,18 +3952,86 @@ fn greedy_decode_step_from_masked_logits(masked: &Tensor, eot: u32) -> Result<(u
         .sum_all()?
         .log()?
         .broadcast_add(&max_logit)?;
-    let next_logit = masked_f32.i(next as usize)?;
-    let stats = Tensor::stack(&[&max_logit, &logsumexp, &next_logit], 0)?.to_vec1::<f32>()?;
+    let next_logit = masked_f32.index_select(&next.reshape(1)?, 0)?.squeeze(0)?;
+    let stats = Tensor::stack(
+        &[
+            &max_logit,
+            &logsumexp,
+            &next_logit,
+            &next.to_dtype(DType::F32)?,
+        ],
+        0,
+    )?
+    .to_vec1::<f32>()?;
     if !stats[0].is_finite() {
         return Ok((eot, f32::NEG_INFINITY));
     }
-    let (logsumexp, next_logit) = (stats[1], stats[2]);
+    let (logsumexp, next_logit, next) = (stats[1], stats[2], stats[3] as u32);
     let next_logprob = if next_logit.is_finite() && logsumexp.is_finite() {
         next_logit - logsumexp
     } else {
         f32::NEG_INFINITY
     };
     Ok((next, next_logprob))
+}
+
+/// The decode mask table `[2, vocab]` of [`WhisperTurboAsrModel`]: row 0
+/// is `base`, row 1 `base + begin`. Both hold only 0 and -inf, so a row's
+/// one gather-and-add masks it with exactly the values `base` and then
+/// `begin` would.
+fn whisper_decode_mask_table(base: &Tensor, begin: &Tensor) -> Result<Tensor> {
+    Ok(Tensor::stack(&[base, &(base + begin)?], 0)?)
+}
+
+/// [`greedy_decode_step_from_masked_logits`] for every row of `masked`
+/// (`[rows, vocab]`): each row's token, logit, maximum and log-sum-exp come
+/// back in one transfer for the whole batch.
+fn greedy_decode_rows_from_masked_logits(masked: &Tensor, eot: u32) -> Result<Vec<(u32, f32)>> {
+    let (_, vocab) = masked.dims2()?;
+    if vocab > 1 << f32::MANTISSA_DIGITS {
+        return Err(Error::InvalidInput(
+            "Whisper vocabulary exceeds the exact F32 token range".into(),
+        ));
+    }
+    let masked_f32 = if masked.dtype() == DType::F32 {
+        masked.clone()
+    } else {
+        masked.to_dtype(DType::F32)?
+    };
+    let next = masked.argmax_keepdim(1)?;
+    let max_logit = masked_f32.max_keepdim(1)?;
+    let logsumexp = masked_f32
+        .broadcast_sub(&max_logit)?
+        .exp()?
+        .sum_keepdim(1)?
+        .log()?
+        .add(&max_logit)?;
+    let next_logit = masked_f32.gather(&next, 1)?;
+    let stats = Tensor::cat(
+        &[
+            &max_logit,
+            &logsumexp,
+            &next_logit,
+            &next.to_dtype(DType::F32)?,
+        ],
+        1,
+    )?
+    .to_vec2::<f32>()?;
+    Ok(stats
+        .into_iter()
+        .map(|row| {
+            if !row[0].is_finite() {
+                return (eot, f32::NEG_INFINITY);
+            }
+            let (logsumexp, next_logit, next) = (row[1], row[2], row[3] as u32);
+            let logprob = if next_logit.is_finite() && logsumexp.is_finite() {
+                next_logit - logsumexp
+            } else {
+                f32::NEG_INFINITY
+            };
+            (next, logprob)
+        })
+        .collect())
 }
 
 /// Host token selection over decode-filtered logits. Sampling draws from the
@@ -4690,6 +5122,113 @@ mod tests {
         f64::from(logits[token as usize]) - (max + sum.ln())
     }
 
+    /// The greedy step as it was before its readbacks merged: the token read
+    /// back first, then its logit, the maximum and the log-sum-exp.
+    fn two_readback_greedy_step(masked: &Tensor, eot: u32) -> (u32, f32) {
+        use candle_core::IndexOp;
+        let masked_f32 = masked.to_dtype(DType::F32).unwrap();
+        let next = masked.argmax(0).unwrap().to_scalar::<u32>().unwrap();
+        let max_logit = masked_f32.max(0).unwrap();
+        let logsumexp = masked_f32
+            .broadcast_sub(&max_logit)
+            .unwrap()
+            .exp()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .log()
+            .unwrap()
+            .broadcast_add(&max_logit)
+            .unwrap();
+        let next_logit = masked_f32.i(next as usize).unwrap();
+        let stats = Tensor::stack(&[&max_logit, &logsumexp, &next_logit], 0)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        if !stats[0].is_finite() {
+            return (eot, f32::NEG_INFINITY);
+        }
+        let logprob = if stats[2].is_finite() && stats[1].is_finite() {
+            stats[2] - stats[1]
+        } else {
+            f32::NEG_INFINITY
+        };
+        (next, logprob)
+    }
+
+    /// One readback per greedy step picks the same token with the same
+    /// log-probability bits as the two-readback step, on the tiny Whisper's
+    /// logits (F32 and F16, constrained as decode constrains them) and on
+    /// ties, masked rows and non-finite logits.
+    #[test]
+    fn single_readback_greedy_step_matches_two_readback_step_bit_for_bit() {
+        use crate::kernels::numeric_check::xorshift_tensor;
+        use crate::models::architectures::whisper::model::test_fixture::{
+            tiny_config, tiny_tensors,
+        };
+
+        let device = Device::Cpu;
+        let special = decode_test_special_tokens();
+        let config = tiny_config();
+        let vb =
+            candle_nn::VarBuilder::from_tensors(tiny_tensors(&config, 0.2), DType::F32, &device);
+        let whisper = super::LocalWhisper::load(&vb, config.clone()).expect("tiny whisper");
+        let mut cases = Vec::new();
+        for seed in 0..4 {
+            let frames = config.max_source_positions * 2;
+            let mel =
+                xorshift_tensor(&[1, config.num_mel_bins, frames], seed, 1.5, &device).unwrap();
+            for token in [0u32, 3, 7] {
+                let (_, logits) = whisper
+                    .numeric_probe(&mel, token)
+                    .expect("probe")
+                    .pop()
+                    .expect("logits");
+                let mut logits = logits.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                apply_whisper_decode_constraints(
+                    &mut logits,
+                    token == 0,
+                    &[],
+                    &[],
+                    &[],
+                    &special,
+                    true,
+                    &[],
+                );
+                cases.push(logits);
+            }
+        }
+        let vocab = config.vocab_size;
+        let mut tied = vec![f32::NEG_INFINITY; vocab];
+        tied[2] = 1.5;
+        tied[5] = 1.5;
+        cases.push(tied);
+        cases.push(vec![f32::NEG_INFINITY; vocab]);
+        let mut leading_nan = vec![0.25; vocab];
+        leading_nan[0] = f32::NAN;
+        cases.push(leading_nan);
+        let mut inner_nan = vec![0.25; vocab];
+        inner_nan[3] = f32::NAN;
+        inner_nan[4] = 2.0;
+        cases.push(inner_nan);
+        for (index, logits) in cases.iter().enumerate() {
+            for dtype in [DType::F32, DType::F16] {
+                let masked = Tensor::from_vec(logits.clone(), vocab, &device)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                let expected = two_readback_greedy_step(&masked, special.eot);
+                let actual = greedy_decode_step_from_masked_logits(&masked, special.eot).unwrap();
+                assert_eq!(actual.0, expected.0, "case {index} {dtype:?}");
+                assert_eq!(
+                    actual.1.to_bits(),
+                    expected.1.to_bits(),
+                    "case {index} {dtype:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn device_greedy_decode_matches_host_greedy_selection() {
         let special = decode_test_special_tokens();
@@ -5435,6 +5974,456 @@ mod tests {
                 .expect("foreign model must reject Whisper prefill");
         assert!(error.to_string().contains("another ASR model"));
         assert_cross_sequence_released_for_reuse(runtime.as_ref());
+    }
+
+    /// Special tokens of the tiny batch-decode model: control tokens at the
+    /// top of its 96-token vocabulary, timestamps from 91.
+    fn batch_test_special_tokens() -> WhisperSpecialTokens {
+        WhisperSpecialTokens {
+            sot: 80,
+            sot_prev: Some(81),
+            transcribe: 82,
+            eot: 83,
+            blank: Some(84),
+            no_timestamps: Some(90),
+            no_speech: Some(85),
+        }
+    }
+
+    /// The tiny random Whisper as a loaded ASR model on `device`, with a
+    /// word-level tokenizer over its vocabulary.
+    fn tiny_asr_model(device: &Device) -> super::WhisperTurboAsrModel {
+        use crate::models::architectures::whisper::model::test_fixture::{
+            tiny_config, tiny_tensors,
+        };
+        let mut config = tiny_config();
+        config.max_target_positions = 48;
+        let vb =
+            candle_nn::VarBuilder::from_tensors(tiny_tensors(&config, 0.2), DType::F32, device);
+        let whisper = super::WhisperModel::load(&vb, config.clone()).expect("tiny whisper");
+        let special = batch_test_special_tokens();
+        let words = (0..config.vocab_size)
+            .map(|token| format!("\"t{token} \":{token}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let tokenizer = crate::tokenizer::Tokenizer::from_hf_json_bytes(
+            format!(
+                r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+                "normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,
+                "model":{{"type":"WordLevel","vocab":{{{words}}},"unk_token":"t0 "}}}}"#
+            )
+            .as_bytes(),
+        )
+        .expect("tiny tokenizer");
+        let (decode_mask, decode_begin_mask) = build_whisper_decode_mask_tensors(
+            config.vocab_size,
+            &[],
+            &[],
+            &[],
+            &special,
+            true,
+            &[],
+            DType::F32,
+            device,
+        )
+        .expect("decode masks");
+        let decode_mask_table =
+            super::whisper_decode_mask_table(&decode_mask, &decode_begin_mask).expect("mask table");
+        let mut runtime_tuning = super::WhisperRuntimeTuning::from_env();
+        runtime_tuning.device_greedy_decode = true;
+        super::WhisperTurboAsrModel {
+            preparation_id: 1,
+            device: crate::backends::DeviceProfile::cpu(),
+            model_dtype: DType::F32,
+            whisper,
+            config: config.clone(),
+            generation: Default::default(),
+            tokenizer,
+            special,
+            mel: MelSpectrogram::new(whisper_mel_config(config.num_mel_bins)).expect("mel"),
+            suppress_tokens: Vec::new(),
+            numeral_symbol_tokens: Vec::new(),
+            decode_mask,
+            decode_begin_mask,
+            decode_mask_table,
+            language_token_ids: Vec::new(),
+            language_token_range: None,
+            token_id_to_language_code: std::collections::HashMap::new(),
+            runtime_tuning,
+            cuda_dtype_shim: false,
+            precision: crate::kernels::numeric_check::PrecisionLoad::unchecked(
+                &crate::backends::DTypeSelection {
+                    dtype: DType::F32,
+                    reason: "test".into(),
+                },
+            ),
+        }
+    }
+
+    /// The host-worker log-mel uploads to exactly the tensor the in-job
+    /// front end builds, at 16 kHz and after a resample, and is priced as the
+    /// mel-major window it holds.
+    #[test]
+    fn host_features_upload_exactly_like_the_in_job_front_end() {
+        let model = tiny_asr_model(&Device::Cpu);
+        let frames = model.config.max_source_positions.saturating_mul(2).max(1);
+        let window = frames * model.config.num_mel_bins;
+        for rate in [16_000_u32, 8_000] {
+            let audio = (0..rate as usize)
+                .map(|index| (index as f32 * 0.011).sin() * 0.3)
+                .collect::<Vec<f32>>();
+            let features = model.prepare_host_features(&audio, rate).unwrap();
+            assert_eq!(features.host_bytes().unwrap(), (window * 4) as u64);
+            assert_eq!(features.input_samples, audio.len());
+            let trimmed = model.trimmed_audio_slice(&audio, rate);
+            let reference = model.prepare_mel(trimmed, rate).unwrap();
+            let uploaded = model.upload_mel(&features.mel).unwrap();
+            assert_eq!(
+                uploaded.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                reference.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            );
+            assert_eq!(
+                features.source_identity,
+                super::whisper_cross_source_identity(trimmed, rate)
+            );
+        }
+        assert!(model.prepare_host_features(&[], 16_000).is_err());
+        assert!(model.prepare_window_batch_from_features(&[]).is_err());
+    }
+
+    /// A retained row of the tiny model over its own audio memory and
+    /// `prompt`, prefilled and ready to decode.
+    fn tiny_prefilled_state(
+        model: &super::WhisperTurboAsrModel,
+        runtime: &Arc<RetainedStaticAttentionRuntimeV2>,
+        self_kv: PhysicalPagedKvCache,
+        memory_seed: u64,
+        prompt: Vec<u32>,
+        max_steps: usize,
+        temperature: f32,
+    ) -> WhisperDecodeState {
+        let features = crate::kernels::numeric_check::xorshift_tensor(
+            &[1, model.config.max_source_positions, model.config.d_model],
+            memory_seed,
+            1.0,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let sequence = runtime.register_sequence().unwrap();
+        runtime
+            .install(
+                sequence,
+                [memory_seed as u8 + 1; 32],
+                model
+                    .whisper
+                    .prepare_cross_attention_memory(&features)
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut state = WhisperDecodeState {
+            state_id: super::next_whisper_decode_state_id().unwrap(),
+            next_quantum_nonce: 1,
+            active_quantum: None,
+            current_managed_generation: 1,
+            managed_completions_drained: true,
+            self_kv,
+            cross_runtime: runtime.clone(),
+            cross_sequence: Some(sequence),
+            prompt,
+            prefill_progress: 0,
+            pending_logits: None,
+            generated_tokens: Vec::new(),
+            assembled: String::new(),
+            sum_logprobs: 0.0,
+            sampled_token_count: 0,
+            no_speech_prob: None,
+            ended_with_eot: false,
+            repetition_loop: false,
+            decode_steps: 0,
+            best_attempt: None,
+            pending_retry: None,
+            temperature,
+            attempt_generation: 1,
+            max_steps,
+            finished: false,
+            rng: ChaCha12Rng::seed_from_u64(memory_seed),
+            language: super::WhisperLanguageResolution {
+                resolved: None,
+                hint_used: false,
+                detect_ms: 0.0,
+                strategy: "hint",
+            },
+            attempts: Vec::new(),
+            published_attempt: None,
+        };
+        let prompt_len = state.prompt.len();
+        assert!(model
+            .continue_resumable_prefill(&mut state, 0, prompt_len)
+            .unwrap());
+        state
+    }
+
+    /// Rows: (memory seed, prompt, max steps, temperature). Greedy rows of
+    /// different memories and prompt lengths, one that runs out of budget
+    /// early, and a sampled row (a fallback attempt at temperature 0.4).
+    fn batch_test_rows() -> Vec<(u64, Vec<u32>, usize, f32)> {
+        vec![
+            (11, vec![80, 82, 90], 12, 0.0),
+            (12, vec![81, 7, 9, 80, 82, 90], 12, 0.0),
+            (13, vec![80, 90], 3, 0.0),
+            (14, vec![80, 82, 90], 12, 0.4),
+        ]
+    }
+
+    fn batch_test_states(model: &super::WhisperTurboAsrModel) -> Vec<WhisperDecodeState> {
+        let rows = batch_test_rows();
+        let heads = model.config.decoder_attention_heads;
+        let runtime = Arc::new(crate::engine::test_retained_static_runtime(
+            &Device::Cpu,
+            StateDType::F32,
+            &[0, 1],
+            heads as u32,
+            (model.config.d_model / heads) as u32,
+            model.config.max_source_positions as u64,
+            rows.len() as u32,
+        ));
+        let caches = crate::models::shared::attention::physical::test_physical_caches_on(
+            &Device::Cpu,
+            model.config.decoder_layers,
+            heads,
+            model.config.d_model / heads,
+            model.config.max_target_positions,
+            rows.len(),
+        );
+        rows.into_iter()
+            .zip(caches)
+            .map(|((seed, prompt, max_steps, temperature), cache)| {
+                tiny_prefilled_state(model, &runtime, cache, seed, prompt, max_steps, temperature)
+            })
+            .collect()
+    }
+
+    /// Rows decoded together step exactly as each decodes alone: the same
+    /// steps (tokens, finishes, text), the same sampled tokens for the
+    /// fallback row, log-probabilities and next logits within F32 rounding
+    /// of the lone rows', and finished rows stop without a forward.
+    #[test]
+    fn batched_retained_decode_steps_each_row_as_alone() {
+        let model = tiny_asr_model(&Device::Cpu);
+        let mut alone = batch_test_states(&model);
+        let mut together = batch_test_states(&model);
+        let mut finished_steps = 0;
+        for step in 0..14 {
+            let live = (0..alone.len())
+                .filter(|row| !alone[*row].finished)
+                .collect::<Vec<_>>();
+            if live.is_empty() {
+                break;
+            }
+            let contexts = live
+                .iter()
+                .map(|row| together[*row].self_kv.context_len())
+                .collect::<Vec<_>>();
+            let expected = live
+                .iter()
+                .map(|row| model.decode_step_retained(&mut alone[*row]).unwrap())
+                .collect::<Vec<_>>();
+            let mut refs = together
+                .iter_mut()
+                .enumerate()
+                .filter(|(row, _)| live.contains(row))
+                .map(|(_, state)| state)
+                .collect::<Vec<_>>();
+            let actual = model.decode_step_retained_batch(&mut refs).unwrap();
+            assert_eq!(actual, expected, "step {step}");
+            // A row that goes on writes one token's K/V; a finishing step
+            // (EOT, budget or repetition) writes none.
+            for ((row, context), step) in live.iter().zip(contexts).zip(&actual) {
+                assert_eq!(
+                    together[*row].self_kv.context_len(),
+                    context + usize::from(!step.finished)
+                );
+            }
+            for row in &live {
+                let (a, b) = (&alone[*row], &together[*row]);
+                assert_eq!(
+                    a.generated_tokens, b.generated_tokens,
+                    "step {step} row {row}"
+                );
+                assert_eq!(a.finished, b.finished);
+                assert_eq!(a.ended_with_eot, b.ended_with_eot);
+                assert_eq!(a.decode_steps, b.decode_steps);
+                assert_eq!(a.self_kv.context_len(), b.self_kv.context_len());
+                assert!((a.sum_logprobs - b.sum_logprobs).abs() <= 1e-4, "row {row}");
+                match (&a.pending_logits, &b.pending_logits) {
+                    (Some(a), Some(b)) => {
+                        let difference = (a - b)
+                            .unwrap()
+                            .abs()
+                            .unwrap()
+                            .max_all()
+                            .unwrap()
+                            .to_scalar::<f32>()
+                            .unwrap();
+                        assert!(difference <= 1e-4, "step {step} row {row}: {difference}");
+                    }
+                    (None, None) => assert!(a.finished),
+                    _ => panic!("step {step} row {row}: pending logits diverged"),
+                }
+            }
+            finished_steps += actual.iter().filter(|step| step.finished).count();
+        }
+        assert_eq!(
+            finished_steps,
+            batch_test_rows().len(),
+            "every row finished"
+        );
+        assert!(together.iter().all(|state| state.finished));
+        assert_eq!(
+            together[2].generated_tokens.len(),
+            3,
+            "the short budget ends row 2"
+        );
+    }
+
+    /// A retained step through the CUDA graphs' segments (rows padded to a
+    /// graph width of 6, attention eager over the real rows; run eagerly here)
+    /// decodes each row as it decodes alone: the same steps and tokens, and
+    /// next logits within F32 rounding.
+    #[test]
+    fn graph_segmented_retained_steps_decode_each_row_as_alone() {
+        use crate::models::architectures::whisper::model::SEGMENTED_STEP_FOR_TEST;
+        let model = tiny_asr_model(&Device::Cpu);
+        let mut alone = batch_test_states(&model);
+        let mut together = batch_test_states(&model);
+        for step in 0..14 {
+            let live = (0..alone.len())
+                .filter(|row| !alone[*row].finished)
+                .collect::<Vec<_>>();
+            if live.is_empty() {
+                break;
+            }
+            let expected = live
+                .iter()
+                .map(|row| model.decode_step_retained(&mut alone[*row]).unwrap())
+                .collect::<Vec<_>>();
+            let mut refs = together
+                .iter_mut()
+                .enumerate()
+                .filter(|(row, _)| live.contains(row))
+                .map(|(_, state)| state)
+                .collect::<Vec<_>>();
+            // Six rows at least: two or more spare rows every step.
+            SEGMENTED_STEP_FOR_TEST.with(|width| width.set(6));
+            let actual = model.decode_step_retained_batch(&mut refs);
+            SEGMENTED_STEP_FOR_TEST.with(|width| width.set(0));
+            assert_eq!(actual.unwrap(), expected, "step {step}");
+            for row in &live {
+                let (a, b) = (&alone[*row], &together[*row]);
+                assert_eq!(
+                    a.generated_tokens, b.generated_tokens,
+                    "step {step} row {row}"
+                );
+                assert_eq!(a.finished, b.finished);
+                assert_eq!(a.self_kv.context_len(), b.self_kv.context_len());
+                if let (Some(a), Some(b)) = (&a.pending_logits, &b.pending_logits) {
+                    let difference = (a - b)
+                        .unwrap()
+                        .abs()
+                        .unwrap()
+                        .max_all()
+                        .unwrap()
+                        .to_scalar::<f32>()
+                        .unwrap();
+                    assert!(difference <= 1e-4, "step {step} row {row}: {difference}");
+                }
+            }
+        }
+        assert!(together.iter().all(|state| state.finished));
+    }
+
+    /// A step that fails after the rows picked their tokens (here one
+    /// row's cross memory was released) restores every row: tokens,
+    /// counters, RNG, pending logits and KV context.
+    #[test]
+    fn failed_batched_retained_decode_restores_every_row() {
+        let model = tiny_asr_model(&Device::Cpu);
+        let mut states = batch_test_states(&model);
+        let before = states
+            .iter()
+            .map(|state| {
+                (
+                    state.generated_tokens.clone(),
+                    state.decode_steps,
+                    state.sum_logprobs,
+                    state.self_kv.context_len(),
+                    state.rng.clone().random::<u64>(),
+                    state
+                        .pending_logits
+                        .as_ref()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let released = states[1].cross_sequence.take().unwrap();
+        states[1].cross_runtime.release_sequence(released).unwrap();
+        let mut refs = states.iter_mut().collect::<Vec<_>>();
+        assert!(model.decode_step_retained_batch(&mut refs).is_err());
+        for (state, before) in states.iter().zip(before) {
+            assert_eq!(state.generated_tokens, before.0);
+            assert_eq!(state.decode_steps, before.1);
+            assert_eq!(state.sum_logprobs, before.2);
+            assert_eq!(state.self_kv.context_len(), before.3);
+            assert_eq!(state.rng.clone().random::<u64>(), before.4);
+            assert_eq!(
+                state
+                    .pending_logits
+                    .as_ref()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                before.5
+            );
+            assert!(!state.finished);
+        }
+    }
+
+    /// Greedy picks of a masked batch, read back once, equal each row's
+    /// own one-readback greedy step bit for bit, with every row masked by
+    /// one gather of the begin/decode mask table exactly as alone.
+    #[test]
+    fn batched_greedy_picks_match_each_row_bit_for_bit() {
+        let model = tiny_asr_model(&Device::Cpu);
+        let states = batch_test_states(&model);
+        let mut rows = states
+            .iter()
+            .map(|state| (state.pending_logits.clone().unwrap(), true))
+            .collect::<Vec<_>>();
+        rows[1].1 = false;
+        rows[3].1 = false;
+        let vocab = model.config.vocab_size;
+        let mut tied = vec![f32::NEG_INFINITY; vocab];
+        tied[2] = 1.5;
+        tied[5] = 1.5;
+        rows.push((Tensor::from_vec(tied, vocab, &Device::Cpu).unwrap(), false));
+        rows.push((
+            Tensor::from_vec(vec![f32::NEG_INFINITY; vocab], vocab, &Device::Cpu).unwrap(),
+            true,
+        ));
+        let refs = rows
+            .iter()
+            .map(|(logits, at_begin)| (logits, *at_begin))
+            .collect::<Vec<_>>();
+        let batched = model.greedy_decode_rows_on_device(&refs).unwrap();
+        for ((logits, at_begin), (token, logprob)) in rows.iter().zip(batched) {
+            let alone = model
+                .greedy_decode_step_on_device(logits, *at_begin)
+                .unwrap();
+            assert_eq!(token, alone.0);
+            assert_eq!(logprob.to_bits(), alone.1.to_bits());
+        }
     }
 
     fn transactional_test_state() -> WhisperDecodeState {

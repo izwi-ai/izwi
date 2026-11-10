@@ -188,19 +188,37 @@ impl ModelLifecycleController {
                         "Granite Speech retained decoder has no context bound".into(),
                     )
                 })?;
+                // Every sequence claims its pages from one shared pool, so
+                // the pool holds one automatic sequence (its prompt, one
+                // planned chunk's audio and its budget) per retained row, as
+                // Qwen3-ASR's does, and never less than one sequence of the
+                // decoder's whole context. A pool of one context admitted
+                // one request at a time.
+                let rows = self.asr_state_rows(bundle_draft)?;
+                let pool_tokens = asr_shared_pool_tokens(
+                    retained_max_tokens,
+                    asr_minimum_tokens(variant),
+                    rows.0,
+                    self.core_engine.config().block_size,
+                );
                 let retained = self
                     .core_engine
-                    .load_managed_model_state_with_portable_copies(
+                    .load_pooled_managed_model_state_with_portable_copies(
                         model_instance_id,
                         retained_contract,
-                        Some(retained_max_tokens),
+                        pool_tokens,
                         2,
-                        self.asr_state_rows(),
+                        rows,
                         asr_minimum_tokens(variant),
                     )
                     .await?;
-                self.model_registry
-                    .publish_effective_context(variant, retained.logical_token_reach())?;
+                // One sequence never reaches past the decoder's context.
+                self.model_registry.publish_effective_context(
+                    variant,
+                    retained
+                        .logical_token_reach()
+                        .min(retained_max_tokens as u64),
+                )?;
                 self.model_registry.publish_kv_storage(variant, &retained);
                 crate::runtime::rollout::validate_managed_state_plan_eligibility(
                     variant,
@@ -258,8 +276,147 @@ impl ModelLifecycleController {
         Ok(publications)
     }
 
+    /// Publish the state Granite Speech 5.0's ASR graphs need, as
+    /// `physical_state_spec` authors it for them: retained decoder pages
+    /// for its retained sequence graph (none when the route is off, GRN-8)
+    /// beside the atomic graph's invocation pages.
+    pub(super) async fn load_granite_speech5_state_publication(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        bundle_draft: &LoadedModelBundleDraft,
+        physical_state_spec: impl Fn(
+            &[&[StageDescriptor]],
+        ) -> Result<
+            crate::models::architectures::granite_speech5::asr::GraniteSpeech5PhysicalStateSpec,
+        >,
+    ) -> Result<LoadedStatePublication> {
+        let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
+        let stage_graphs = contracts
+            .iter()
+            .map(|contract| contract.stages.as_ref())
+            .collect::<Vec<_>>();
+        let physical_spec = physical_state_spec(&stage_graphs)?;
+        let (retained, retained_uses) = match (
+            physical_spec.retained.as_ref(),
+            physical_spec.retained_max_tokens,
+        ) {
+            (Some(retained_contract), Some(sequence_tokens)) => {
+                // Every row claims its pages from one shared pool. A row is
+                // at most one retained sequence (2,528 tokens): preparation
+                // runs a longer request atomically. So the pool holds one
+                // automatic sequence (a 30 s chunk's prompt, audio and
+                // budget) per retained row and never less than one longest
+                // retained sequence, with no floor of the 16k context, which
+                // stays the atomic route's (its invocation fit publishes it).
+                let rows = self.asr_state_rows(bundle_draft)?;
+                let retained = self
+                    .core_engine
+                    .load_pooled_managed_model_state_with_portable_copies(
+                        model_instance_id,
+                        retained_contract,
+                        asr_shared_pool_tokens(
+                            sequence_tokens,
+                            asr_minimum_tokens(variant),
+                            rows.0,
+                            self.core_engine.config().block_size,
+                        ),
+                        2,
+                        rows,
+                        sequence_tokens as u64,
+                    )
+                    .await?;
+                granite_speech5_retained_reach_holds_a_sequence(
+                    retained.logical_token_reach(),
+                    sequence_tokens,
+                )?;
+                self.model_registry.publish_kv_storage(variant, &retained);
+                crate::runtime::rollout::validate_managed_state_plan_eligibility(
+                    variant,
+                    CapabilityKind::Asr,
+                    retained.state_plan_v2(),
+                )?;
+                let uses = contracts
+                    .iter()
+                    .map(|contract| {
+                        let graph = stage_graph_fingerprint(&contract.stages)?;
+                        let use_kind = match contract.execution_profile.mode {
+                            crate::engine::ExecutionMode::Sequence => {
+                                RetainedStateUseV2::ExternalPaged
+                            }
+                            crate::engine::ExecutionMode::Atomic => {
+                                RetainedStateUseV2::Inactive
+                            }
+                            _ => {
+                                return Err(Error::ModelLoadError(
+                                    "Granite Speech 5.0 ASR graph has an incompatible retained-state profile"
+                                        .into(),
+                                ));
+                            }
+                        };
+                        Ok((graph, use_kind))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
+                (Some(retained.into()), uses)
+            }
+            (None, None) => (None, HashMap::new()),
+            _ => {
+                return Err(Error::ModelLoadError(
+                    "Granite Speech 5.0 retained state has no context bound".into(),
+                ));
+            }
+        };
+        self.load_invocation_workspace_publication(
+            model_instance_id,
+            &contracts,
+            physical_spec.descriptor,
+            &physical_spec.invocation,
+            retained,
+            retained_uses,
+        )
+        .await
+    }
+
     /// Offline ASR (every family but Granite Speech): retained and invocation
     /// state per loaded ASR capability.
+    /// Retained ASR state at `tokens`: an automatic pool already holds one
+    /// sequence per row (`asr_automatic_context`, `asr_shared_pool_tokens`)
+    /// and loads as given; a configured per-sequence context is pooled
+    /// across the rows by the loader.
+    async fn load_asr_retained_state(
+        &self,
+        model_instance_id: ModelInstanceId,
+        contract: &crate::kv::v2::InferenceStateContract,
+        tokens: usize,
+        pooled: bool,
+        rows: (usize, usize),
+        minimum_tokens: u64,
+    ) -> Result<Arc<crate::engine::ManagedKvModelRuntime>> {
+        if pooled {
+            self.core_engine
+                .load_pooled_managed_model_state_with_portable_copies(
+                    model_instance_id,
+                    contract,
+                    tokens,
+                    2,
+                    rows,
+                    minimum_tokens,
+                )
+                .await
+        } else {
+            self.core_engine
+                .load_managed_model_state_with_portable_copies(
+                    model_instance_id,
+                    contract,
+                    Some(tokens),
+                    2,
+                    rows,
+                    minimum_tokens,
+                )
+                .await
+        }
+    }
+
     pub(super) async fn allocate_asr_state(
         &self,
         variant: ModelVariant,
@@ -294,15 +451,54 @@ impl ModelLifecycleController {
                     .iter()
                     .map(|contract| contract.stages.as_ref())
                     .collect::<Vec<_>>();
-                let physical_spec = loaded.physical_state_spec(&stage_graphs)?;
+                let physical_spec = loaded.offline_physical_state_spec(&stage_graphs)?;
+                // Offline rows and realtime sessions share one arena (the
+                // same retained contract binds the same runtime): it keeps
+                // the engine's retained rows realtime has always had, and
+                // stages one step of the offline decode width.
+                let engine = self.core_engine.config();
+                let rows = (
+                    engine.max_retained_sequences,
+                    self.asr_state_rows(bundle_draft)?.1,
+                );
+                let retained = self
+                    .core_engine
+                    .load_managed_model_state_with_portable_copies(
+                        model_instance_id,
+                        &physical_spec.retained,
+                        Some(physical_spec.retained_max_tokens),
+                        1,
+                        rows,
+                        asr_minimum_tokens(variant),
+                    )
+                    .await?;
+                let retained_uses = contracts
+                    .iter()
+                    .map(|contract| {
+                        let graph = stage_graph_fingerprint(&contract.stages)?;
+                        let use_kind = match contract.execution_profile.mode {
+                            crate::engine::ExecutionMode::Sequence => {
+                                RetainedStateUseV2::ExternalPaged
+                            }
+                            crate::engine::ExecutionMode::Atomic => RetainedStateUseV2::Inactive,
+                            _ => {
+                                return Err(Error::ModelLoadError(
+                                    "Voxtral ASR graph has an incompatible retained-state profile"
+                                        .into(),
+                                ));
+                            }
+                        };
+                        Ok((graph, use_kind))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
                 let publication = self
                     .load_invocation_workspace_publication(
                         model_instance_id,
                         &contracts,
                         physical_spec.descriptor,
                         &physical_spec.invocation,
-                        None,
-                        HashMap::new(),
+                        Some(retained.into()),
+                        retained_uses,
                     )
                     .await?;
                 state_publications.insert(CapabilityKind::Asr, publication);
@@ -325,25 +521,26 @@ impl ModelLifecycleController {
                         .collect::<Vec<_>>();
                     // A configured context wins; otherwise Qwen3-ASR bounds
                     // its state by one planned chunk per sequence.
-                    let context_bound =
-                        if self.config.max_sequence_length.explicit_tokens().is_some() {
-                            Qwen3AsrContextBound::Configured
-                        } else {
-                            Qwen3AsrContextBound::Automatic {
-                                retained_rows: self.asr_state_rows().0,
-                            }
-                        };
+                    let automatic_pool =
+                        self.config.max_sequence_length.explicit_tokens().is_none();
+                    let context_bound = if !automatic_pool {
+                        Qwen3AsrContextBound::Configured
+                    } else {
+                        Qwen3AsrContextBound::Automatic {
+                            retained_rows: self.asr_state_rows(bundle_draft)?.0,
+                            page_tokens: self.core_engine.config().block_size,
+                        }
+                    };
                     let physical_spec =
                         loaded.qwen3_physical_state_spec(&stage_graphs, context_bound)?;
                     let retained_max_tokens = physical_spec.retained_max_tokens;
                     let physical = self
-                        .core_engine
-                        .load_managed_model_state_with_portable_copies(
+                        .load_asr_retained_state(
                             model_instance_id,
                             &physical_spec.retained,
-                            Some(retained_max_tokens),
-                            2,
-                            self.asr_state_rows(),
+                            retained_max_tokens,
+                            automatic_pool,
+                            self.asr_state_rows(bundle_draft)?,
                             asr_minimum_tokens(variant),
                         )
                         .await?;
@@ -352,7 +549,7 @@ impl ModelLifecycleController {
                     self.model_registry.publish_effective_context(
                         variant,
                         physical
-                            .logical_token_reach()
+                            .maximum_sequence_tokens()
                             .min(physical_spec.sequence_tokens as u64),
                     )?;
                     self.model_registry.publish_kv_storage(variant, &physical);
@@ -429,25 +626,26 @@ impl ModelLifecycleController {
                     // without a configured context each retained row is
                     // bounded by one chunk's prompt and duration budget
                     // (P2.5), not the decoder's native context.
-                    let retained_max_tokens =
-                        if self.config.max_sequence_length.explicit_tokens().is_some() {
-                            native_tokens
-                        } else {
-                            crate::runtime::asr_automatic_context(
-                                native_tokens,
-                                loaded.vibevoice_retained_sequence_ceiling()?,
-                                self.asr_state_rows().0,
-                            )
-                            .1
-                        };
+                    let automatic_pool =
+                        self.config.max_sequence_length.explicit_tokens().is_none();
+                    let retained_max_tokens = if !automatic_pool {
+                        native_tokens
+                    } else {
+                        crate::runtime::asr_automatic_context(
+                            native_tokens,
+                            loaded.vibevoice_retained_sequence_ceiling()?,
+                            self.asr_state_rows(bundle_draft)?.0,
+                            self.core_engine.config().block_size,
+                        )
+                        .1
+                    };
                     let retained = self
-                        .core_engine
-                        .load_managed_model_state_with_portable_copies(
+                        .load_asr_retained_state(
                             model_instance_id,
                             retained_contract,
-                            Some(retained_max_tokens),
-                            2,
-                            self.asr_state_rows(),
+                            retained_max_tokens,
+                            automatic_pool,
+                            self.asr_state_rows(bundle_draft)?,
                             asr_minimum_tokens(variant),
                         )
                         .await?;
@@ -459,7 +657,7 @@ impl ModelLifecycleController {
                     ) as u64;
                     self.model_registry.publish_effective_context(
                         variant,
-                        retained.logical_token_reach().max(invocation_ceiling),
+                        retained.maximum_sequence_tokens().max(invocation_ceiling),
                     )?;
                     self.model_registry.publish_kv_storage(variant, &retained);
                     crate::runtime::rollout::validate_managed_state_plan_eligibility(
@@ -511,13 +709,26 @@ impl ModelLifecycleController {
                         .map(|contract| contract.stages.as_ref())
                         .collect::<Vec<_>>();
                     let physical_spec = loaded.whisper_physical_state_spec(&stage_graphs)?;
+                    // As many sequences (cross-attention pool slots and
+                    // decoder rows) as the other ASR families, never fewer
+                    // than one decode batch. Each decoder row claims its
+                    // whole 448-position window from the shared self-attention
+                    // pool, so the pool holds one window per row; one window
+                    // admitted one request at a time.
+                    let rows = self.asr_state_rows(bundle_draft)?;
                     let retained = self
                         .core_engine
                         .load_composite_retained_state(
                             model_instance_id,
                             &physical_spec.retained,
                             physical_spec.retained_static_domain,
-                            Some(physical_spec.retained_max_tokens),
+                            Some(asr_shared_pool_tokens(
+                                physical_spec.retained_max_tokens,
+                                asr_minimum_tokens(variant),
+                                rows.0,
+                                self.core_engine.config().block_size,
+                            )),
+                            rows,
                             asr_minimum_tokens(variant),
                         )
                         .await?;
@@ -571,7 +782,7 @@ impl ModelLifecycleController {
                         .load_retained_tensor_state(
                             model_instance_id,
                             retained_contract,
-                            self.realtime_asr_sequence_capacity,
+                            self.transducer_retained_sequences(bundle_draft)?,
                         )
                         .await?;
                     let effective_context = self.config.portable_context_ceiling();
@@ -611,40 +822,59 @@ impl ModelLifecycleController {
                         .collect::<Vec<_>>();
                     let physical_spec =
                         loaded.nemotron_offline_physical_state_spec(&stage_graphs)?;
+                    // Short clips decode as rows whose predictor the executor
+                    // session retains, as Parakeet's does; their decode
+                    // budget is the clip's emittable labels, not a context.
+                    let retained_contract = physical_spec.retained.as_ref().ok_or_else(|| {
+                        Error::ModelLoadError(
+                            "Nemotron sequence graph did not author retained predictor state"
+                                .into(),
+                        )
+                    })?;
+                    let retained = self
+                        .core_engine
+                        .load_retained_tensor_state(
+                            model_instance_id,
+                            retained_contract,
+                            self.transducer_retained_sequences(bundle_draft)?,
+                        )
+                        .await?;
+                    let effective_context = self.config.portable_context_ceiling();
+                    self.model_registry.publish_effective_context(
+                        variant,
+                        u64::try_from(effective_context).map_err(|_| {
+                            Error::ModelLoadError("Nemotron effective context exceeds u64".into())
+                        })?,
+                    )?;
                     let publication = self
                         .load_invocation_workspace_publication(
                             model_instance_id,
                             &contracts,
                             physical_spec.descriptor,
                             &physical_spec.invocation,
-                            None,
-                            HashMap::new(),
+                            Some(retained.into()),
+                            nemotron_offline_retained_uses(&contracts)?,
                         )
                         .await?;
                     state_publications.insert(CapabilityKind::Asr, publication);
                 } else if publication_route == LoadedAsrStatePublicationRoute::GraniteSpeech5 {
-                    // One atomic invocation per request on leased decoder
-                    // pages of the model's full context.
+                    // Single segments decode as retained rows on managed
+                    // decoder pages; long audio runs one atomic invocation
+                    // per chunk on leased decoder pages of the model's full
+                    // context. With the retained route off the capability
+                    // offers only the atomic graph and no retained state is
+                    // fitted (GRN-8).
                     if !managed_kv_backend_compiled(backend) {
                         return Err(Error::ModelLoadError(format!(
                             "loaded model {variant} requires physical ASR invocation state, but the {backend:?} build has no direct paged-attention runtime"
                         )));
                     }
-                    let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
-                    let stage_graphs = contracts
-                        .iter()
-                        .map(|contract| contract.stages.as_ref())
-                        .collect::<Vec<_>>();
-                    let physical_spec =
-                        loaded.granite_speech5_physical_state_spec(&stage_graphs)?;
                     let publication = self
-                        .load_invocation_workspace_publication(
+                        .load_granite_speech5_state_publication(
+                            variant,
                             model_instance_id,
-                            &contracts,
-                            physical_spec.descriptor,
-                            &physical_spec.invocation,
-                            None,
-                            HashMap::new(),
+                            bundle_draft,
+                            |graphs| loaded.granite_speech5_physical_state_spec(graphs),
                         )
                         .await?;
                     state_publications.insert(CapabilityKind::Asr, publication);
@@ -868,13 +1098,13 @@ impl ModelLifecycleController {
                             &physical_spec.retained,
                             Some(retained_max_tokens),
                             2,
-                            self.asr_state_rows(),
+                            self.asr_state_rows(bundle_draft)?,
                             asr_minimum_tokens(variant),
                         )
                         .await?;
                     self.model_registry.publish_effective_context(
                         variant,
-                        retained.logical_token_reach(),
+                        retained.maximum_sequence_tokens(),
                     )?;
                     self.model_registry.publish_kv_storage(variant, &retained);
                     crate::runtime::rollout::validate_managed_state_plan_eligibility(
@@ -947,7 +1177,7 @@ impl ModelLifecycleController {
                         .await?;
                     self.model_registry.publish_effective_context(
                         variant,
-                        retained.logical_token_reach(),
+                        retained.maximum_sequence_tokens(),
                     )?;
                     self.model_registry.publish_kv_storage(variant, &retained);
                     crate::runtime::rollout::validate_managed_state_plan_eligibility(
@@ -1017,6 +1247,11 @@ impl ModelLifecycleController {
     /// Nemotron 3.5 Transcribe rows: the family's state contract (paged KV
     /// of the six attention layers, the Mamba SSM and convolution states) in
     /// one managed arena, each row up to the model's 65,536-token context.
+    /// The rows are the ASR rows ([`Self::asr_state_rows`]), not the
+    /// engine's: each holds 47.6 MiB of Mamba state, and the automatic
+    /// engine rows (316 retained and 8 staged on an H100) reserved about
+    /// 15 GiB of it for a decode 8 rows wide. A request beyond the rows
+    /// waits for one.
     pub(super) async fn allocate_nemotron_transcribe_state(
         &self,
         variant: ModelVariant,
@@ -1062,20 +1297,23 @@ impl ModelLifecycleController {
             .explicit_tokens()
             .unwrap_or(nemotron.max_context_tokens())
             .min(nemotron.max_context_tokens());
+        // The one context is the pool every row's automatic 30 s request
+        // claims from (32 of them fit), so it loads as given rather than
+        // pooled again per row.
         let retained = self
             .core_engine
-            .load_managed_model_state(
+            .load_pooled_managed_model_state_with_rows(
                 model_instance_id,
                 &contract,
-                Some(context),
+                context,
+                self.asr_state_rows(bundle_draft)?,
                 asr_minimum_tokens(variant),
                 state_fit_reserve,
-                0,
             )
             .await?;
         self.model_registry.publish_effective_context(
             variant,
-            retained.logical_token_reach().min(context as u64),
+            retained.maximum_sequence_tokens().min(context as u64),
         )?;
         self.model_registry.publish_kv_storage(variant, &retained);
         crate::runtime::rollout::validate_managed_state_plan_eligibility(
@@ -1163,10 +1401,11 @@ impl ModelLifecycleController {
         for (capability, contracts, spec) in plans {
             let retained = self
                 .core_engine
-                .load_managed_model_state(
+                .load_managed_model_state_with_staged_rows(
                     model_instance_id,
                     &spec.retained,
                     logical_context,
+                    self.tts_staged_rows(bundle_draft)?,
                     tts_state_minimum_tokens(variant),
                     state_fit_reserve,
                     0,
@@ -1298,10 +1537,11 @@ impl ModelLifecycleController {
                 // gets the bound runtime back.
                 let retained = self
                     .core_engine
-                    .load_managed_model_state(
+                    .load_managed_model_state_with_staged_rows(
                         model_instance_id,
                         &physical_spec.retained,
                         Some(retained_max_tokens),
+                        self.tts_staged_rows(bundle_draft)?,
                         tts_state_minimum_tokens(variant),
                         state_fit_reserve,
                         later_predictor_bytes,
@@ -1317,7 +1557,7 @@ impl ModelLifecycleController {
                     .await?;
                 self.model_registry.publish_effective_context(
                     variant,
-                    retained.logical_token_reach(),
+                    retained.maximum_sequence_tokens(),
                 )?;
                 self.model_registry.publish_kv_storage(variant, &retained);
                 crate::runtime::rollout::validate_managed_state_plan_eligibility(
@@ -1412,10 +1652,11 @@ impl ModelLifecycleController {
             let retained_max_tokens = physical_spec.retained_max_tokens;
             let retained = self
                 .core_engine
-                .load_managed_model_state(
+                .load_managed_model_state_with_staged_rows(
                     model_instance_id,
                     retained_contract,
                     retained_max_tokens,
+                    self.tts_staged_rows(bundle_draft)?,
                     tts_state_minimum_tokens(variant),
                     state_fit_reserve,
                     0,
@@ -1423,7 +1664,7 @@ impl ModelLifecycleController {
                 .await?;
             self.model_registry.publish_effective_context(
                 variant,
-                retained.logical_token_reach(),
+                retained.maximum_sequence_tokens(),
             )?;
             self.model_registry.publish_kv_storage(variant, &retained);
             crate::runtime::rollout::validate_managed_state_plan_eligibility(
@@ -1488,7 +1729,7 @@ impl ModelLifecycleController {
             let native_batching = match crate::env::value("IZWI_FISH_NATIVE_BATCHING") {
                 Some(value) => izwi_env::parse_bool("IZWI_FISH_NATIVE_BATCHING", &value)
                     .map_err(|error| Error::ConfigError(error.to_string()))?,
-                None => false,
+                None => crate::runtime::fish_capacity::fish_native_batching_default(backend),
             };
             // Automatic staged rows are sized for tensor-width launches. Fish
             // fits its own autoregressive width (no tensor arena backs its
@@ -1685,7 +1926,7 @@ impl ModelLifecycleController {
             .await?;
         self.model_registry.publish_effective_context(
             variant,
-            retained.logical_token_reach().min(positions as u64),
+            retained.maximum_sequence_tokens().min(positions as u64),
         )?;
         self.model_registry.publish_kv_storage(variant, &retained);
         crate::runtime::rollout::validate_managed_state_plan_eligibility(
@@ -1731,10 +1972,11 @@ impl ModelLifecycleController {
             // context per request, shared by prefill and decode).
             let retained = self
                 .core_engine
-                .load_managed_model_state(
+                .load_managed_model_state_with_staged_rows(
                     model_instance_id,
                     &physical_spec.retained,
                     Some(physical_spec.retained_max_tokens),
+                    self.tts_staged_rows(bundle_draft)?,
                     tts_state_minimum_tokens(variant),
                     state_fit_reserve,
                     0,
@@ -1742,7 +1984,7 @@ impl ModelLifecycleController {
                 .await?;
             self.model_registry.publish_effective_context(
                 variant,
-                retained.logical_token_reach(),
+                retained.maximum_sequence_tokens(),
             )?;
             self.model_registry.publish_kv_storage(variant, &retained);
             crate::runtime::rollout::validate_managed_state_plan_eligibility(
@@ -1807,17 +2049,18 @@ impl ModelLifecycleController {
         let physical_spec = model.physical_state_spec(&stage_graphs)?;
         let retained = self
             .core_engine
-            .load_managed_model_state(
+            .load_managed_model_state_with_staged_rows(
                 model_instance_id,
                 &physical_spec.retained,
                 Some(physical_spec.retained_max_tokens),
+                self.tts_staged_rows(bundle_draft)?,
                 tts_state_minimum_tokens(variant),
                 state_fit_reserve,
                 0,
             )
             .await?;
         self.model_registry
-            .publish_effective_context(variant, retained.logical_token_reach())?;
+            .publish_effective_context(variant, retained.maximum_sequence_tokens())?;
         self.model_registry.publish_kv_storage(variant, &retained);
         crate::runtime::rollout::validate_managed_state_plan_eligibility(
             variant,
@@ -1879,17 +2122,18 @@ impl ModelLifecycleController {
         let physical_spec = model.physical_state_spec(&stage_graphs)?;
         let retained = self
             .core_engine
-            .load_managed_model_state(
+            .load_managed_model_state_with_staged_rows(
                 model_instance_id,
                 &physical_spec.retained,
                 Some(physical_spec.retained_max_tokens),
+                self.tts_staged_rows(bundle_draft)?,
                 tts_state_minimum_tokens(variant),
                 state_fit_reserve,
                 0,
             )
             .await?;
         self.model_registry
-            .publish_effective_context(variant, retained.logical_token_reach())?;
+            .publish_effective_context(variant, retained.maximum_sequence_tokens())?;
         self.model_registry.publish_kv_storage(variant, &retained);
         crate::runtime::rollout::validate_managed_state_plan_eligibility(
             variant,
@@ -1951,17 +2195,18 @@ impl ModelLifecycleController {
         let physical_spec = model.physical_state_spec(&stage_graphs)?;
         let retained = self
             .core_engine
-            .load_managed_model_state(
+            .load_managed_model_state_with_staged_rows(
                 model_instance_id,
                 &physical_spec.retained,
                 Some(physical_spec.retained_max_tokens),
+                self.tts_staged_rows(bundle_draft)?,
                 tts_state_minimum_tokens(variant),
                 state_fit_reserve,
                 0,
             )
             .await?;
         self.model_registry
-            .publish_effective_context(variant, retained.logical_token_reach())?;
+            .publish_effective_context(variant, retained.maximum_sequence_tokens())?;
         self.model_registry.publish_kv_storage(variant, &retained);
         crate::runtime::rollout::validate_managed_state_plan_eligibility(
             variant,

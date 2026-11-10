@@ -103,6 +103,8 @@ pub(crate) struct PreparedPhysicalMixedStep {
     slots: Arc<dyn KvSlotMap>,
     views: Vec<MixedWindowViews>,
     completions: KvWriteCompletionCollector,
+    /// Decode rows attend through `KvArena::paged_decode_row_invariant`.
+    row_invariant_decode: bool,
 }
 
 impl PreparedPhysicalMixedStep {
@@ -144,7 +146,17 @@ impl PreparedPhysicalMixedStep {
             slots,
             views,
             completions,
+            row_invariant_decode: false,
         })
+    }
+
+    /// Attend decode rows batch-invariantly
+    /// (`KvArena::paged_decode_row_invariant`): each row's output depends on
+    /// its own context only, so a row decodes the same alone as beside any
+    /// others. Prefill spans are unaffected.
+    pub(crate) fn with_row_invariant_decode(mut self) -> Self {
+        self.row_invariant_decode = true;
+        self
     }
 
     pub(crate) fn layout(&self) -> &MixedRowLayout {
@@ -262,20 +274,23 @@ impl PreparedPhysicalMixedStep {
             ));
         }
         let views = &self.views[views];
+        let row_invariant_decode = self.row_invariant_decode;
         let decode_tokens = self.layout.decode_tokens();
         let (output, completion) = submit_ordered_after_write(completion, || {
             let decode = (decode_tokens > 0)
                 .then(|| {
                     let queries = queries.narrow(0, 0, decode_tokens)?.contiguous()?;
-                    cache.arena().paged_decode(
-                        binding,
-                        PagedKvDecodeArgs {
-                            queries: &queries,
-                            batch: &views.decode,
-                            softmax_scale,
-                            softcap,
-                        },
-                    )
+                    let args = PagedKvDecodeArgs {
+                        queries: &queries,
+                        batch: &views.decode,
+                        softmax_scale,
+                        softcap,
+                    };
+                    if row_invariant_decode {
+                        cache.arena().paged_decode_row_invariant(binding, args)
+                    } else {
+                        cache.arena().paged_decode(binding, args)
+                    }
                 })
                 .transpose()?;
             let prefill = (decode_tokens < tokens)

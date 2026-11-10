@@ -57,15 +57,50 @@ pub const GEMM_MIN_PAIRS_PER_EXPERT: usize = 16;
 /// they win from 64 tokens (6 pairs per expert over 64 experts; 19 against
 /// 24 ms) and lose at 32 (3 pairs; 18 against 13 ms).
 pub const TILED_GEMM_MIN_PAIRS_PER_EXPERT: usize = 5;
+/// The same for CUDA, measured on an H100 (2026-11-07, Nemotron 3.5
+/// Transcribe, 128 experts, top 6). One-span prefills of 119 and 243 tokens
+/// took 406 and 761 ms on the warp kernels (about 3 ms a token), while spans
+/// of 426-431 tokens took 278-312 ms as GEMMs, whose cost is mostly a fixed
+/// dequantization per touched expert. At 3 pairs per expert the GEMMs start
+/// at the 64-token floor, so every prompt span but the shortest takes them
+/// and decode steps never do.
+pub const CUDA_GEMM_MIN_PAIRS_PER_EXPERT: usize = 3;
+
+/// The devices [`uses_gemm`] distinguishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GemmDevice {
+    Cpu,
+    Metal,
+    Cuda,
+}
+
+impl GemmDevice {
+    fn of(device: &Device) -> Self {
+        if device.is_metal() {
+            Self::Metal
+        } else if device.is_cuda() {
+            Self::Cuda
+        } else {
+            Self::Cpu
+        }
+    }
+
+    const fn min_pairs_per_expert(self) -> usize {
+        match self {
+            Self::Metal => TILED_GEMM_MIN_PAIRS_PER_EXPERT,
+            Self::Cuda => CUDA_GEMM_MIN_PAIRS_PER_EXPERT,
+            Self::Cpu => GEMM_MIN_PAIRS_PER_EXPERT,
+        }
+    }
+}
 
 /// Whether [`experts`] runs a call of `tokens` tokens on `device` as GEMMs.
 pub fn uses_gemm(device: &Device, tokens: usize, top_k: usize, experts: usize) -> bool {
-    let per_expert = if device.is_metal() {
-        TILED_GEMM_MIN_PAIRS_PER_EXPERT
-    } else {
-        GEMM_MIN_PAIRS_PER_EXPERT
-    };
-    tokens >= GEMM_MIN_TOKENS && tokens * top_k >= per_expert * experts
+    uses_gemm_on(GemmDevice::of(device), tokens, top_k, experts)
+}
+
+fn uses_gemm_on(device: GemmDevice, tokens: usize, top_k: usize, experts: usize) -> bool {
+    tokens >= GEMM_MIN_TOKENS && tokens * top_k >= device.min_pairs_per_expert() * experts
 }
 /// Values one warp covers per sweep: 16 bytes per lane, 32 lanes.
 const SWEEP: usize = 512;
@@ -260,6 +295,25 @@ pub fn experts(
     top_k: usize,
     weights: &StackedExperts,
 ) -> Result<Tensor> {
+    let gemm = x
+        .dims2()
+        .is_ok_and(|(tokens, _)| uses_gemm(x.device(), tokens, top_k, weights.experts));
+    experts_on_path(x, routing, top_k, weights, gemm)
+}
+
+/// [`experts`] on the path the caller picks rather than the one the call's
+/// token count picks: `gemm` runs the GEMMs on Metal and CUDA, otherwise the
+/// warp kernels at any token count (the CPU always runs the reference).
+/// Several rows' spans packed into one call keep each row on the path its
+/// span alone takes, so a row's warp-kernel tokens stay bit for bit what
+/// they are alone.
+pub fn experts_on_path(
+    x: &Tensor,
+    routing: &Tensor,
+    top_k: usize,
+    weights: &StackedExperts,
+    gemm: bool,
+) -> Result<Tensor> {
     let (tokens, hidden) = x.dims2()?;
     if hidden != weights.hidden
         || x.dtype() != DType::F32
@@ -277,7 +331,7 @@ pub fn experts(
         )
     }
     let (x, routing) = (x.contiguous()?, routing.contiguous()?);
-    if !x.device().is_cpu() && uses_gemm(x.device(), tokens, top_k, weights.experts) {
+    if gemm && !x.device().is_cpu() {
         return experts_by_gemm(&x, &routing, top_k, weights);
     }
     let grouped = tokens * top_k >= GROUPED_MIN_PAIRS;
@@ -1864,6 +1918,21 @@ mod tests {
         assert!(uses_gemm(&cpu, 2048, 6, 128));
         // Few experts: still never below the decode floor.
         assert!(!uses_gemm(&cpu, GEMM_MIN_TOKENS - 1, 6, 1));
+    }
+
+    #[test]
+    fn cuda_prompt_spans_take_gemms_from_the_decode_floor() {
+        // H100: a 119-token span on the warp kernels cost 406 ms against
+        // about 300 ms for a 426-token span as GEMMs.
+        for tokens in [64, 119, 243, 426, 2048] {
+            assert!(uses_gemm_on(GemmDevice::Cuda, tokens, 6, 128), "{tokens}");
+        }
+        for tokens in [1, 8, 32, GEMM_MIN_TOKENS - 1] {
+            assert!(!uses_gemm_on(GemmDevice::Cuda, tokens, 6, 128), "{tokens}");
+        }
+        // Metal keeps its measured crossover.
+        assert!(!uses_gemm_on(GemmDevice::Metal, 64, 6, 128));
+        assert!(uses_gemm_on(GemmDevice::Metal, 128, 6, 128));
     }
 
     /// Times the warp kernels against the dequantized-GEMM form across span

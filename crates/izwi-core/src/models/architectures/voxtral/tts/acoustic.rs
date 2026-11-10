@@ -3,10 +3,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use candle_core::{DType, IndexOp, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::{ops, Linear, Module, RmsNorm, VarBuilder};
 
+use crate::backends::BackendKind;
 use crate::error::{Error, Result};
+use crate::kernels::cuda::shape_graphs::{ShapeGraphLimits, ShapeGraphs};
 use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::gqa::compact_gqa_sdpa_bhsd;
 
@@ -15,6 +17,7 @@ use super::config::{
     VoxtralTtsAcousticTransformerArgs, VoxtralTtsConfig, DEFAULT_CFG_ALPHA,
     DEFAULT_N_DECODING_STEPS,
 };
+use super::model::VOXTRAL_TTS_PADDED_ROWS;
 
 pub const AUDIO_SPECIAL_TOKEN_COUNT: u32 = 2;
 pub const ACOUSTIC_CODEBOOK_OFFSET: usize = 1;
@@ -88,8 +91,10 @@ pub struct FlowMatchingAudioTransformer {
     args: VoxtralTtsAcousticTransformerArgs,
     generation: AcousticGenerationConfig,
     /// `time_projection(time_embedding(step / n_steps))` for every step of
-    /// an `n_steps` schedule, per (n_steps, dtype, device).
+    /// an `n_steps` schedule, per (n_steps, dtype, device). Never evicted: a
+    /// flow graph reads its table in place.
     time_tables: Mutex<Vec<AcousticTimeTable>>,
+    flow_graphs: FlowGraphs,
 }
 
 struct AcousticTimeTable {
@@ -98,6 +103,61 @@ struct AcousticTimeTable {
     device: candle_core::DeviceLocation,
     /// `[n_steps, dim]`.
     projected: Tensor,
+}
+
+/// Kill switch for the acoustic flow's CUDA graphs (a boolean; on when
+/// unset). Read once: load pricing and the transformer read it.
+pub(crate) const VOXTRAL_TTS_FLOW_GRAPHS_ENV: &str = "IZWI_VOXTRAL_TTS_FLOW_GRAPHS";
+
+fn flow_graphs_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(VOXTRAL_TTS_FLOW_GRAPHS_ENV, true));
+    ON.get()
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// What the flow graphs may hold: one graph per step count, CFG strength
+/// and dtype in use. A 32-row frame's working set is a few MiB (the CFG's
+/// 64 rows of three `dim`-wide tokens through the layers, the widest
+/// `[192, hidden_dim]`); a graph retains its two inputs (`[32, input_dim]`
+/// and `[32, n_acoustic_codebooks]`) and its state, under 0.25 MiB.
+const FLOW_GRAPH_LIMITS: ShapeGraphLimits = ShapeGraphLimits {
+    max_graphs: 4,
+    retained_bytes: 4 * MIB,
+    pool_bytes: 60 * MIB,
+};
+
+/// Device bytes a load on `backend` prices for the flow graphs, which the
+/// load's self-check allocates: zero off CUDA or with the graphs off.
+pub(crate) fn voxtral_tts_flow_graph_device_bytes(backend: BackendKind) -> u64 {
+    if backend == BackendKind::Cuda && flow_graphs_requested() {
+        FLOW_GRAPH_LIMITS.device_bytes()
+    } else {
+        0
+    }
+}
+
+/// A flow graph's key: its Euler steps, CFG strength (bits) and dtype.
+type FlowGraphKey = (usize, u32, DType);
+
+/// The flow's graphs ([`FlowMatchingAudioTransformer::resolve_flow_graphs`]),
+/// or why there are none, and how many frames ran through them.
+struct FlowGraphs {
+    graphs: std::result::Result<ShapeGraphs<FlowGraphKey>, String>,
+    graphed_frames: AtomicU64,
+    /// Frames the graphs could not take: not at the padded rows.
+    eager_frames: AtomicU64,
+}
+
+impl FlowGraphs {
+    fn off(reason: &str) -> Self {
+        Self {
+            graphs: Err(reason.into()),
+            graphed_frames: AtomicU64::new(0),
+            eager_frames: AtomicU64::new(0),
+        }
+    }
 }
 
 static VOXTRAL_ACOUSTIC_FRAME_READBACKS: AtomicU64 = AtomicU64::new(0);
@@ -270,7 +330,163 @@ impl FlowMatchingAudioTransformer {
             args,
             generation,
             time_tables: Mutex::new(Vec::new()),
+            flow_graphs: FlowGraphs::off("not resolved"),
         })
+    }
+
+    /// Turns the flow graphs on (CUDA only, unless
+    /// [`VOXTRAL_TTS_FLOW_GRAPHS_ENV`] is off) once a self-check passes: two
+    /// padded frames of xorshift inputs at `dtype` (the LM hidden dtype every
+    /// frame's inputs have), at a request's default steps and CFG strength,
+    /// each captured or replayed and compared with the eager flow bit for
+    /// bit ([`ShapeGraphs::run`]). A mismatch or a CUDA error leaves every
+    /// frame eager, with the reason in the diagnostics.
+    pub(crate) fn resolve_flow_graphs(&mut self, dtype: DType, device: &Device) {
+        let resolved = if flow_graphs_requested() {
+            ShapeGraphs::resolve("Voxtral TTS acoustic flow", device, FLOW_GRAPH_LIMITS)
+        } else {
+            Err(format!("{VOXTRAL_TTS_FLOW_GRAPHS_ENV} is off"))
+        };
+        let resolved =
+            resolved.and_then(
+                |graphs| match self.self_check_flow_graphs(&graphs, dtype, device) {
+                    Ok(()) if graphs.is_on() => Ok(graphs),
+                    Ok(()) => Err(format!(
+                        "self-check failed: {}",
+                        graphs.diagnostics()["off"]
+                    )),
+                    Err(error) => Err(format!("self-check failed: {error}")),
+                },
+            );
+        match &resolved {
+            Ok(_) => tracing::info!(
+                rows = VOXTRAL_TTS_PADDED_ROWS,
+                "Voxtral TTS acoustic flow frames run as CUDA graphs"
+            ),
+            Err(reason) if device.is_cuda() => tracing::warn!(
+                %reason,
+                "Voxtral TTS acoustic flow frames run eagerly"
+            ),
+            Err(_) => {}
+        }
+        self.flow_graphs.graphs = resolved;
+    }
+
+    /// Two frames through `graphs` (see [`Self::resolve_flow_graphs`]): the
+    /// first captures the graph and checks a replay against the eager flow,
+    /// the second checks a replay over new inputs, so a value baked into the
+    /// graph shows.
+    fn self_check_flow_graphs(
+        &self,
+        graphs: &ShapeGraphs<FlowGraphKey>,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<()> {
+        use crate::kernels::numeric_check::xorshift_tensor;
+        let rows = VOXTRAL_TTS_PADDED_ROWS;
+        for seed in [0x7A11_F10Au64, 0x7A11_F10B] {
+            let hidden = xorshift_tensor(&[rows, self.args.input_dim], seed, 1.0, device)?
+                .to_dtype(dtype)?;
+            let state = xorshift_tensor(
+                &[rows, self.generation.n_acoustic_codebooks],
+                seed ^ 0x5EED,
+                1.0,
+                device,
+            )?
+            .to_dtype(dtype)?;
+            self.run_flow_graph(
+                graphs,
+                DEFAULT_CFG_ALPHA,
+                DEFAULT_N_DECODING_STEPS.max(1),
+                &[hidden, state],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The flow graphs' state and counters, for the model diagnostics.
+    pub(crate) fn flow_graphs_diagnostics(&self) -> serde_json::Value {
+        let mut diagnostics = match &self.flow_graphs.graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        };
+        diagnostics["rows"] = VOXTRAL_TTS_PADDED_ROWS.into();
+        diagnostics["graphed_frames"] = self
+            .flow_graphs
+            .graphed_frames
+            .load(Ordering::Relaxed)
+            .into();
+        diagnostics["eager_frames"] = self.flow_graphs.eager_frames.load(Ordering::Relaxed).into();
+        diagnostics
+    }
+
+    /// The integrated flow through its graph, when the graphs are on and the
+    /// frame runs at the padded rows ([`VOXTRAL_TTS_PADDED_ROWS`], one graph
+    /// for every width); `None` runs it eagerly.
+    fn graphed_flow(
+        &self,
+        llm_hidden: &Tensor,
+        state: &Tensor,
+        cfg_alpha: f32,
+        n_decoding_steps: usize,
+    ) -> Result<Option<Tensor>> {
+        let Ok(graphs) = &self.flow_graphs.graphs else {
+            return Ok(None);
+        };
+        if !graphs.is_on() {
+            return Ok(None);
+        }
+        if llm_hidden.dim(0)? != VOXTRAL_TTS_PADDED_ROWS || state.dtype() != llm_hidden.dtype() {
+            self.flow_graphs
+                .eager_frames
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+        let sampled = self.run_flow_graph(
+            graphs,
+            cfg_alpha,
+            n_decoding_steps.max(1),
+            &[llm_hidden.contiguous()?, state.contiguous()?],
+        )?;
+        self.flow_graphs
+            .graphed_frames
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(Some(sampled))
+    }
+
+    /// [`Self::integrate_flow`] over `inputs` (the padded LM hidden states
+    /// and the starting state, in one dtype) through the graph of its key.
+    /// The noise is the starting state, an input the graph copies in before
+    /// each replay; the step times are the cached table, read in place.
+    fn run_flow_graph(
+        &self,
+        graphs: &ShapeGraphs<FlowGraphKey>,
+        cfg_alpha: f32,
+        n_steps: usize,
+        inputs: &[Tensor],
+    ) -> Result<Tensor> {
+        let bytes = |tensor: &Tensor| (tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64;
+        // A graph keeps a stable copy of each input, and its state.
+        let retained = inputs.iter().map(bytes).sum::<u64>() + inputs.get(1).map_or(0, bytes);
+        let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+            let [hidden, state] = inputs else {
+                return Err(Error::InferenceError(format!(
+                    "Voxtral TTS flow graph received {} inputs, expected 2",
+                    inputs.len()
+                )));
+            };
+            Ok(vec![self.integrate_flow(
+                state.clone(),
+                hidden,
+                cfg_alpha,
+                n_steps,
+            )?])
+        };
+        let key = (n_steps, cfg_alpha.to_bits(), inputs[0].dtype());
+        graphs
+            .run(key, retained, inputs, &body)?
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Voxtral TTS flow graph returned nothing".into()))
     }
 
     pub fn forward_audio_codes(
@@ -323,6 +539,31 @@ impl FlowMatchingAudioTransformer {
         allow_end_audio: bool,
         initial_noise: Option<&Tensor>,
     ) -> Result<VoxtralGeneratedAudioCodes> {
+        self.forward_audio_codes_padded(
+            llm_hidden,
+            cfg_alpha,
+            n_decoding_steps,
+            allow_end_audio,
+            initial_noise,
+            None,
+        )
+    }
+
+    /// [`Self::forward_audio_codes_with_feedback_tensor`] with the frame's
+    /// dense ops (the semantic head and the whole flow) over `padded_rows`
+    /// rows when given, the spare rows zero (zero noise too): every matmul
+    /// sees one shape however many rows share the frame, so a row's codes
+    /// never depend on the rows beside it. The codes are picked for the real
+    /// rows only. More rows than `padded_rows` run unpadded.
+    pub(crate) fn forward_audio_codes_padded(
+        &self,
+        llm_hidden: &Tensor,
+        cfg_alpha: f32,
+        n_decoding_steps: usize,
+        allow_end_audio: bool,
+        initial_noise: Option<&Tensor>,
+        padded_rows: Option<usize>,
+    ) -> Result<VoxtralGeneratedAudioCodes> {
         let llm_hidden = match llm_hidden.rank() {
             1 => llm_hidden.unsqueeze(0)?,
             2 => llm_hidden.clone(),
@@ -340,8 +581,22 @@ impl FlowMatchingAudioTransformer {
             )));
         }
 
+        let rows = llm_hidden.dim(0)?;
+        let spare = padded_rows
+            .filter(|&padded| padded >= rows)
+            .map_or(0, |padded| padded - rows);
+        let llm_hidden = if spare > 0 {
+            llm_hidden.pad_with_zeros(0, 0, spare)?
+        } else {
+            llm_hidden
+        };
         let semantic_logits = linear_forward_last_dim(&self.semantic_codebook_output, &llm_hidden)
             .map_err(|err| Error::InferenceError(format!("semantic projection failed: {err}")))?;
+        let semantic_logits = if spare > 0 {
+            semantic_logits.narrow(0, 0, rows)?
+        } else {
+            semantic_logits
+        };
         if llm_hidden.device().is_cuda() {
             return self
                 .packed_frame(
@@ -396,6 +651,8 @@ impl FlowMatchingAudioTransformer {
         })
     }
 
+    /// The acoustic codes of `semantic_codes`' rows, the first rows of
+    /// `llm_hidden` (see [`Self::flow_state_rows`]).
     fn decode_one_frame(
         &self,
         semantic_codes: &[u32],
@@ -404,13 +661,49 @@ impl FlowMatchingAudioTransformer {
         n_decoding_steps: usize,
         initial_noise: Option<&Tensor>,
     ) -> Result<DecodedAcousticCodes> {
-        let sampled = self.initial_flow_state(semantic_codes.len(), llm_hidden, initial_noise)?;
-        let sampled = self.integrate_flow(sampled, llm_hidden, cfg_alpha, n_decoding_steps)?;
+        let sampled = self.flow_state_rows(
+            llm_hidden,
+            semantic_codes.len(),
+            cfg_alpha,
+            n_decoding_steps,
+            initial_noise,
+        )?;
         shifted_acoustic_codes_from_sampled_tensor(
             &sampled,
             semantic_codes,
             self.generation.acoustic_codebook_size,
         )
+    }
+
+    /// The integrated flow state of the first `rows` rows of `llm_hidden`,
+    /// the flow run over every row of it: `initial_noise` (`[rows,
+    /// n_acoustic_codebooks]`) gets zero rows for the spare ones, and with no
+    /// noise every row draws device `randn`.
+    fn flow_state_rows(
+        &self,
+        llm_hidden: &Tensor,
+        rows: usize,
+        cfg_alpha: f32,
+        n_decoding_steps: usize,
+        initial_noise: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let dense = llm_hidden.dim(0)?;
+        let noise = match initial_noise {
+            Some(noise) if dense > rows && noise.dim(0)? == rows => {
+                Some(noise.pad_with_zeros(0, 0, dense - rows)?)
+            }
+            noise => noise.cloned(),
+        };
+        // The noise (or device `randn`) is drawn here, before any graph.
+        let sampled = self.initial_flow_state(dense, llm_hidden, noise.as_ref())?;
+        let sampled = match self.graphed_flow(llm_hidden, &sampled, cfg_alpha, n_decoding_steps)? {
+            Some(sampled) => sampled,
+            None => self.integrate_flow(sampled, llm_hidden, cfg_alpha, n_decoding_steps)?,
+        };
+        if dense > rows {
+            return Ok(sampled.narrow(0, 0, rows)?);
+        }
+        Ok(sampled)
     }
 
     /// The flow's starting state for `batch` rows: `initial_noise` when given
@@ -452,12 +745,18 @@ impl FlowMatchingAudioTransformer {
         allow_end_audio: bool,
         initial_noise: Option<&Tensor>,
     ) -> Result<VoxtralGeneratedAudioCodes> {
-        let batch = llm_hidden.dim(0)?;
+        // `llm_hidden` may carry spare rows past the logits' rows.
+        let batch = semantic_logits.dim(0)?;
         let allowed = (self.generation.semantic_codebook_size + AUDIO_SPECIAL_TOKEN_COUNT as usize)
             .min(semantic_logits.dim(1)?);
         let (indices, scores) = semantic_argmax_tensors(semantic_logits, allowed, allow_end_audio)?;
-        let sampled = self.initial_flow_state(batch, llm_hidden, initial_noise)?;
-        let sampled = self.integrate_flow(sampled, llm_hidden, cfg_alpha, n_decoding_steps)?;
+        let sampled = self.flow_state_rows(
+            llm_hidden,
+            batch,
+            cfg_alpha,
+            n_decoding_steps,
+            initial_noise,
+        )?;
         let acoustic =
             shifted_acoustic_code_tensor(&sampled, self.generation.acoustic_codebook_size)?;
         let packed = Tensor::cat(
@@ -1608,6 +1907,148 @@ pub(crate) mod tests {
         assert!((inv_freq[1] - 0.01).abs() < 1e-7, "{inv_freq:?}");
     }
 
+    /// A transformer of width `dim` (its LLM input too) and `layers` layers,
+    /// with xorshift weights: wide enough that a matmul's row count changes
+    /// how the CPU rounds a row.
+    pub(crate) fn sized_acoustic_transformer(
+        dim: usize,
+        layers: usize,
+        device: &Device,
+    ) -> FlowMatchingAudioTransformer {
+        use crate::kernels::numeric_check::xorshift_tensor;
+
+        let mut config = tiny_acoustic_config();
+        let args = &mut config.multimodal.audio_model_args.acoustic_transformer_args;
+        (args.dim, args.input_dim, args.hidden_dim) = (dim, dim, 2 * dim);
+        (args.n_heads, args.n_kv_heads, args.head_dim) = (4, 2, dim / 4);
+        args.n_layers = layers;
+        let (heads, kv) = (4 * (dim / 4), 2 * (dim / 4));
+        let codebooks = config.n_acoustic_codebooks();
+        let mut shapes = [
+            ("input_projection", vec![dim, codebooks]),
+            ("time_projection", vec![dim, dim]),
+            ("llm_projection", vec![dim, dim]),
+            ("semantic_codebook_output", vec![128, dim]),
+            ("acoustic_codebook_output", vec![codebooks, dim]),
+            ("norm", vec![dim]),
+        ]
+        .map(|(name, shape)| (name.to_string(), shape))
+        .to_vec();
+        for layer in 0..layers {
+            shapes.extend(
+                [
+                    ("attention.wq", vec![heads, dim]),
+                    ("attention.wk", vec![kv, dim]),
+                    ("attention.wv", vec![kv, dim]),
+                    ("attention.wo", vec![dim, heads]),
+                    ("feed_forward.w1", vec![2 * dim, dim]),
+                    ("feed_forward.w2", vec![dim, 2 * dim]),
+                    ("feed_forward.w3", vec![2 * dim, dim]),
+                    ("attention_norm", vec![dim]),
+                    ("ffn_norm", vec![dim]),
+                ]
+                .map(|(part, shape)| (format!("layers.{layer}.{part}"), shape)),
+            );
+        }
+        let tensors = shapes
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, shape))| {
+                let tensor = if name.ends_with("norm") {
+                    Tensor::ones(shape, DType::F32, device).unwrap()
+                } else {
+                    xorshift_tensor(&shape, 0xACE5 + index as u64, 0.3, device).unwrap()
+                };
+                (format!("{name}.weight"), tensor)
+            })
+            .collect::<HashMap<_, _>>();
+        FlowMatchingAudioTransformer::load(
+            &config,
+            VarBuilder::from_tensors(tensors, DType::F32, device),
+        )
+        .unwrap()
+    }
+
+    /// Off CUDA the flow graphs never resolve and price nothing; the kill
+    /// switch turns their pricing off on CUDA and names itself.
+    #[test]
+    fn flow_graphs_run_on_cuda_only_and_obey_the_kill_switch() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(VOXTRAL_TTS_FLOW_GRAPHS_ENV);
+        let device = Device::Cpu;
+        std::env::remove_var(VOXTRAL_TTS_FLOW_GRAPHS_ENV);
+        assert_eq!(voxtral_tts_flow_graph_device_bytes(BackendKind::Cpu), 0);
+        assert_eq!(voxtral_tts_flow_graph_device_bytes(BackendKind::Metal), 0);
+        assert_eq!(
+            voxtral_tts_flow_graph_device_bytes(BackendKind::Cuda),
+            64 * MIB
+        );
+        let mut transformer = sized_acoustic_transformer(8, 1, &device);
+        assert_eq!(transformer.flow_graphs_diagnostics()["off"], "not resolved");
+        transformer.resolve_flow_graphs(DType::F32, &device);
+        assert_eq!(
+            transformer.flow_graphs_diagnostics()["off"],
+            "shape graphs run on CUDA only"
+        );
+        std::env::set_var(VOXTRAL_TTS_FLOW_GRAPHS_ENV, "0");
+        let priced = voxtral_tts_flow_graph_device_bytes(BackendKind::Cuda);
+        transformer.resolve_flow_graphs(DType::F32, &device);
+        let off = transformer.flow_graphs_diagnostics()["off"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        match previous {
+            Some(value) => std::env::set_var(VOXTRAL_TTS_FLOW_GRAPHS_ENV, value),
+            None => std::env::remove_var(VOXTRAL_TTS_FLOW_GRAPHS_ENV),
+        }
+        assert_eq!(priced, 0);
+        assert!(off.contains(VOXTRAL_TTS_FLOW_GRAPHS_ENV), "{off}");
+    }
+
+    /// D3: with the frame's dense ops padded to 32 rows, a row's flow state
+    /// and codes are bit-identical alone and at any position of a batch.
+    #[test]
+    fn padded_frames_are_bit_identical_alone_and_in_a_batch() {
+        use crate::kernels::numeric_check::xorshift_tensor;
+
+        let device = Device::Cpu;
+        let padded_rows = Some(32);
+        let transformer = sized_acoustic_transformer(64, 2, &device);
+        let hidden = xorshift_tensor(&[3, 64], 0xD3, 1.0, &device).unwrap();
+        let noise = xorshift_tensor(&[3, 2], 0xD4, 1.0, &device).unwrap();
+        let frame = |rows: &[u32]| {
+            let ids = Tensor::from_vec(rows.to_vec(), rows.len(), &device).unwrap();
+            let hidden = hidden.index_select(&ids, 0).unwrap();
+            let noise = noise.index_select(&ids, 0).unwrap();
+            let dense = match padded_rows {
+                Some(padded) => hidden.pad_with_zeros(0, 0, padded - rows.len()).unwrap(),
+                None => hidden.clone(),
+            };
+            let state = transformer
+                .flow_state_rows(&dense, rows.len(), 1.2, 7, Some(&noise))
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(|row| row.into_iter().map(f32::to_bits).collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            let codes = transformer
+                .forward_audio_codes_padded(&hidden, 1.2, 7, true, Some(&noise), padded_rows)
+                .unwrap()
+                .frames;
+            (state, codes)
+        };
+        let order = [2u32, 0, 1];
+        let (states, codes) = frame(&order);
+        for (position, &row) in order.iter().enumerate() {
+            let (alone_state, alone_codes) = frame(&[row]);
+            assert_eq!(alone_state[0], states[position], "row {row} state");
+            assert_eq!(alone_codes[0], codes[position], "row {row} codes");
+        }
+    }
+
     pub(crate) fn tiny_acoustic_config() -> VoxtralTtsConfig {
         let mut value: serde_json::Value = serde_json::from_str(fixture_json()).unwrap();
         value["dim"] = json!(4);
@@ -1692,5 +2133,78 @@ pub(crate) mod tests {
                 Tensor::ones((4,), DType::F32, device).unwrap(),
             ),
         ])
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_tests {
+    use super::tests::sized_acoustic_transformer;
+    use super::*;
+    use crate::kernels::numeric_check::xorshift_tensor;
+
+    fn bits(tensor: &Tensor) -> Vec<u32> {
+        tensor
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The self-check turns the graphs on, and every padded frame after it
+    /// (capture, verify, replay) returns the eager flow's state bit for bit
+    /// over fresh inputs, at the request defaults and another CFG strength.
+    #[test]
+    fn cuda_flow_graphs_return_the_eager_state() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let mut transformer = sized_acoustic_transformer(64, 2, &device);
+        transformer.resolve_flow_graphs(DType::F32, &device);
+        let diagnostics = transformer.flow_graphs_diagnostics();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        for (frame, cfg_alpha) in [DEFAULT_CFG_ALPHA, DEFAULT_CFG_ALPHA, 1.5, 1.5, 1.5]
+            .into_iter()
+            .enumerate()
+        {
+            let rows = 1 + frame % 3;
+            let hidden = xorshift_tensor(&[rows, 64], 0xC0 + frame as u64, 1.0, &device).unwrap();
+            let noise = xorshift_tensor(&[rows, 2], 0xD0 + frame as u64, 1.0, &device).unwrap();
+            let dense = hidden
+                .pad_with_zeros(0, 0, VOXTRAL_TTS_PADDED_ROWS - rows)
+                .unwrap();
+            let state = transformer
+                .flow_state_rows(
+                    &dense,
+                    rows,
+                    cfg_alpha,
+                    DEFAULT_N_DECODING_STEPS,
+                    Some(&noise),
+                )
+                .unwrap();
+            let expected = transformer
+                .integrate_flow(
+                    noise
+                        .pad_with_zeros(0, 0, VOXTRAL_TTS_PADDED_ROWS - rows)
+                        .unwrap(),
+                    &dense,
+                    cfg_alpha,
+                    DEFAULT_N_DECODING_STEPS,
+                )
+                .unwrap()
+                .narrow(0, 0, rows)
+                .unwrap();
+            assert_eq!(bits(&state), bits(&expected), "frame {frame}");
+        }
+        let diagnostics = transformer.flow_graphs_diagnostics();
+        assert_eq!(diagnostics["graphed_frames"], 5, "{diagnostics}");
+        assert!(
+            diagnostics["replays"].as_u64().unwrap() >= 3,
+            "{diagnostics}"
+        );
     }
 }

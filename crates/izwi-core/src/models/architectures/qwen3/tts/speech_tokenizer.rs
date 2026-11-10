@@ -6,8 +6,7 @@
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{
-    ops, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, LayerNorm, LayerNormConfig,
-    Linear, Module, RmsNorm, VarBuilder,
+    ops, Conv1d, Conv1dConfig, LayerNorm, LayerNormConfig, Linear, Module, RmsNorm, VarBuilder,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -146,6 +145,36 @@ fn default_decoder_sliding_window() -> usize {
     72
 }
 
+impl DecoderConfig {
+    /// The decoder of the published 12 Hz speech tokenizer, which every
+    /// Qwen3-TTS-12Hz checkpoint ships (its `speech_tokenizer/config.json`):
+    /// what a contract prices before a checkpoint is read.
+    pub(crate) fn published_12hz() -> Self {
+        Self {
+            latent_dim: 1024,
+            codebook_dim: 512,
+            codebook_size: 2048,
+            decoder_dim: 1536,
+            hidden_size: 512,
+            intermediate_size: 1024,
+            hidden_act: "silu".into(),
+            num_hidden_layers: 8,
+            num_attention_heads: 16,
+            num_key_value_heads: 16,
+            head_dim: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            num_quantizers: 16,
+            num_semantic_quantizers: 1,
+            semantic_codebook_size: 4096,
+            upsample_rates: vec![8, 5, 4, 3],
+            upsampling_ratios: vec![2, 2],
+            vector_quantization_hidden_dimension: 512,
+            sliding_window: 72,
+        }
+    }
+}
+
 /// Codec frames per upsampler/vocoder window in [`SpeechTokenizerDecoder::decode`].
 /// The vocoder's activations run at up to 24 kHz (about 8 MiB of live F32
 /// tensors per frame at the last stage), so the window, not the utterance,
@@ -204,10 +233,23 @@ impl CausalConv1d {
     }
 }
 
-/// Causal transposed conv that trims the right side to preserve exact stride upsampling.
+/// Causal transposed conv (kernel `stride` or `2 * stride`) trimmed on the
+/// right to exact stride upsampling: `L` frames in, `L * stride` out.
+///
+/// Every frame's taps are one plain GEMM over all rows and frames,
+/// `[B * L, C_in] x [C_in, C_out * K]`, then placed: a frame's first
+/// `stride` taps are its own samples, the other `stride` (kernel
+/// `2 * stride`) add into the next frame's. Candle's transposed conv runs
+/// a GEMM per row of the batch, whose rounding can depend on the row's
+/// place in the batch, so a window's samples could change with the windows
+/// beside it in a batched codec call; one GEMM over every row cannot.
 struct CausalTransConv1d {
-    conv: ConvTranspose1d,
-    right_trim: usize,
+    /// `[C_in, C_out * K]`, tap-minor.
+    weight: Tensor,
+    bias: Tensor,
+    out_channels: usize,
+    kernel_size: usize,
+    stride: usize,
 }
 
 impl CausalTransConv1d {
@@ -218,28 +260,50 @@ impl CausalTransConv1d {
         stride: usize,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let config = ConvTranspose1dConfig {
-            padding: 0,
-            output_padding: 0,
-            stride,
-            dilation: 1,
-            groups: 1,
-        };
-        let conv = candle_nn::conv_transpose1d(in_channels, out_channels, kernel_size, config, vb)?;
+        if stride == 0 || (kernel_size != stride && kernel_size != 2 * stride) {
+            return Err(Error::ModelError(format!(
+                "speech-tokenizer transposed conv needs a kernel of one or two strides, \
+                 got kernel {kernel_size} at stride {stride}"
+            )));
+        }
+        let weight = vb
+            .get((in_channels, out_channels, kernel_size), "weight")?
+            .reshape((in_channels, out_channels * kernel_size))?;
         Ok(Self {
-            conv,
-            right_trim: kernel_size.saturating_sub(stride),
+            weight,
+            bias: vb.get(out_channels, "bias")?,
+            out_channels,
+            kernel_size,
+            stride,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let out = self.conv.forward(x)?;
-        if self.right_trim == 0 {
-            return Ok(out);
+        let (batch, in_channels, frames) = x.dims3()?;
+        let (stride, channels) = (self.stride, self.out_channels);
+        let taps = x
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((batch * frames, in_channels))?
+            .matmul(&self.weight)?
+            .reshape((batch, frames, channels, self.kernel_size))?;
+        // `[B, L, C, stride]` taps from `first` laid out as `[B, C, L * stride]`.
+        let place = |first: usize| -> candle_core::Result<Tensor> {
+            taps.narrow(3, first, stride)?
+                .permute((0, 2, 1, 3))?
+                .contiguous()?
+                .reshape((batch, channels, frames * stride))
+        };
+        let mut out = place(0)?;
+        if self.kernel_size == 2 * stride && frames > 1 {
+            // The last frame's spill falls in the trimmed tail.
+            let spill = place(stride)?
+                .narrow(2, 0, (frames - 1) * stride)?
+                .pad_with_zeros(2, stride, 0)?;
+            out = (out + spill)?;
         }
-        let out_len = out.dim(2)?;
-        let keep = out_len.saturating_sub(self.right_trim);
-        out.narrow(2, 0, keep).map_err(Error::from)
+        out.broadcast_add(&self.bias.reshape((1, channels, 1))?)
+            .map_err(Error::from)
     }
 }
 
@@ -882,27 +946,34 @@ impl EncoderTransformer {
     }
 }
 
-/// SnakeBeta activation.
+/// SnakeBeta activation, `x + sin²(x·e^α) / (e^β + 1e-9)`.
 struct SnakeBeta {
-    alpha: Tensor,
-    beta: Tensor,
+    /// `e^α`, shaped `[1, channels, 1]`.
+    alpha_exp: Tensor,
+    /// `1 / (e^β + 1e-9)`, shaped `[1, channels, 1]`.
+    inv_beta: Tensor,
 }
 
 impl SnakeBeta {
+    /// Computes the per-channel constants once, with the ops (and so the
+    /// bits) the forward pass used to repeat on every call: five launches
+    /// and an upload fewer per activation, 29 activations a vocoder window.
     fn load(channels: usize, vb: VarBuilder) -> Result<Self> {
+        let alpha = vb.get((channels,), "alpha")?;
+        let beta = vb.get((channels,), "beta")?;
+        let alpha_exp = alpha.unsqueeze(0)?.unsqueeze(2)?.exp()?;
+        let beta = beta.unsqueeze(0)?.unsqueeze(2)?.exp()?;
+        let eps = Tensor::new(1e-9f32, beta.device())?.to_dtype(beta.dtype())?;
+        let inv_beta = beta.broadcast_add(&eps)?.recip()?;
         Ok(Self {
-            alpha: vb.get((channels,), "alpha")?,
-            beta: vb.get((channels,), "beta")?,
+            alpha_exp,
+            inv_beta,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let alpha = self.alpha.unsqueeze(0)?.unsqueeze(2)?.exp()?;
-        let beta = self.beta.unsqueeze(0)?.unsqueeze(2)?.exp()?;
-        let sin2 = x.broadcast_mul(&alpha)?.sin()?.sqr()?;
-        let eps = Tensor::new(1e-9f32, x.device())?.to_dtype(beta.dtype())?;
-        let inv_beta = beta.broadcast_add(&eps)?.recip()?;
-        x.broadcast_add(&sin2.broadcast_mul(&inv_beta)?)
+        let sin2 = x.broadcast_mul(&self.alpha_exp)?.sin()?.sqr()?;
+        x.broadcast_add(&sin2.broadcast_mul(&self.inv_beta)?)
             .map_err(Error::from)
     }
 }
@@ -983,9 +1054,43 @@ impl DecoderBlock {
     }
 }
 
+/// The ConvNeXt block's causal depthwise conv (one 7-tap filter a channel).
+///
+/// Candle's grouped `conv1d` runs one single-group convolution per group
+/// (im2col, GEMM and a transposing copy) and concatenates them: about 4,100
+/// kernel launches for the 1,024 channels of the 12 Hz decoder, twice a
+/// vocoder window, against about 500 for the rest of the window. The shared
+/// depthwise op is one launch on CUDA (self-checked against its composition
+/// at load) and 2K + 2 element-wise ops elsewhere.
+struct CausalDepthwiseConv1d {
+    weight: Tensor,
+    bias: Tensor,
+    causal_padding: usize,
+}
+
+impl CausalDepthwiseConv1d {
+    fn load(channels: usize, kernel_size: usize, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            weight: vb.get((channels, 1, kernel_size), "weight")?,
+            bias: vb.get(channels, "bias")?,
+            causal_padding: kernel_size - 1,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        crate::kernels::depthwise_conv::depthwise_conv1d(
+            x,
+            &self.weight,
+            Some(&self.bias),
+            crate::kernels::depthwise_conv::DepthwiseConv1dSpec::padded(self.causal_padding, 0),
+        )
+        .map_err(Error::from)
+    }
+}
+
 /// ConvNeXt block used after upsample transposed conv.
 struct ConvNeXtBlock {
-    dwconv: CausalConv1d,
+    dwconv: CausalDepthwiseConv1d,
     norm: LayerNorm,
     pwconv1: Linear,
     pwconv2: Linear,
@@ -994,15 +1099,7 @@ struct ConvNeXtBlock {
 
 impl ConvNeXtBlock {
     fn load(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let dwconv = CausalConv1d::load(
-            dim,
-            dim,
-            CONVNEXT_KERNEL,
-            1,
-            dim,
-            true,
-            vb.pp("dwconv.conv"),
-        )?;
+        let dwconv = CausalDepthwiseConv1d::load(dim, CONVNEXT_KERNEL, vb.pp("dwconv.conv"))?;
         let norm = candle_nn::layer_norm(
             dim,
             LayerNormConfig {
@@ -1026,7 +1123,10 @@ impl ConvNeXtBlock {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let residual = x.clone();
         let hidden = self.dwconv.forward(x)?;
-        let hidden = hidden.transpose(1, 2)?;
+        // Channels-last and contiguous: the norm runs fused, and each
+        // pointwise layer is one GEMM over every row and frame, not a GEMM
+        // per row (whose rounding can follow the row's place in a batch).
+        let hidden = hidden.transpose(1, 2)?.contiguous()?;
         let hidden = self.norm.forward(&hidden)?;
         let hidden = self.pwconv1.forward(&hidden)?;
         let hidden = hidden.gelu_erf()?;
@@ -1495,7 +1595,7 @@ impl EncoderSplitResidualVectorQuantizer {
     }
 }
 
-struct SpeechTokenizerEncoder {
+pub(crate) struct SpeechTokenizerEncoder {
     encoder_net: SpeechTokenizerEncoderNet,
     encoder_transformer: EncoderTransformer,
     downsample: Option<MimiConv1d>,
@@ -1759,7 +1859,121 @@ pub struct SpeechTokenizerDecoder {
     vocoder_windows: AtomicU64,
     /// Largest window, context included, the vocoder has run on (diagnostics).
     vocoder_peak_window_frames: AtomicUsize,
+    /// Batched stream decodes ([`SpeechTokenizerDecoder::decode_stream_batch`]).
+    batch: StreamBatchCounters,
 }
+
+/// Counters of [`SpeechTokenizerDecoder::decode_stream_batch`] since load.
+#[derive(Debug, Default)]
+struct StreamBatchCounters {
+    /// Batched decodes (one per audio quantum).
+    batches: AtomicU64,
+    /// Jobs (requests) across them.
+    jobs: AtomicU64,
+    /// Vocoder calls they ran.
+    calls: AtomicU64,
+    /// Windows those calls decoded.
+    windows: AtomicU64,
+    /// Window slots they ran, spare zero windows included.
+    slots: AtomicU64,
+    /// Calls that held windows of more than one job.
+    shared_calls: AtomicU64,
+    /// Jobs per call, summed over calls.
+    call_jobs: AtomicU64,
+}
+
+/// What [`SpeechTokenizerDecoder::decode_stream_batch`] has run since load.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct SpeechTokenizerBatchStats {
+    pub batches: u64,
+    pub jobs: u64,
+    pub calls: u64,
+    pub windows: u64,
+    pub slots: u64,
+    pub shared_calls: u64,
+    pub call_jobs: u64,
+}
+
+/// How [`SpeechTokenizerDecoder::decode_stream_batch`] groups vocoder
+/// windows into calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodecCallPolicy {
+    /// One window a call at its own length, no padding (CPU and Metal):
+    /// the peak a call holds stays one window's, as in the inline decode.
+    PerWindow,
+    /// Every call runs `slots` windows of
+    /// [`SpeechTokenizerDecoder::fixed_window_frames`] frames, short windows
+    /// right-padded and spare windows zero, so a call's shapes never depend
+    /// on load (CUDA). With `shared`, windows of different jobs share calls;
+    /// without, each job's windows fill calls of their own.
+    Fixed { slots: usize, shared: bool },
+}
+
+/// One request's next codec frames for
+/// [`SpeechTokenizerDecoder::decode_stream_batch`]: its stream, advanced in
+/// place, and the frames' raw codes, `tokens[group][frame]`.
+pub(crate) struct StreamDecodeJob<'a> {
+    pub(crate) stream: &'a mut SpeechTokenizerStream,
+    pub(crate) tokens: &'a [Vec<u32>],
+}
+
+/// A job's decoded frames: its samples (clamped, not yet finished), its
+/// share of the batch's codec time, and the vocoder windows they took.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StreamDecodeOutput {
+    pub(crate) samples: Vec<f32>,
+    pub(crate) codec_ms: f64,
+    pub(crate) windows: usize,
+}
+
+/// One vocoder window over a job's latent run (its new frames behind up
+/// to the vocoder's receptive field of earlier latents): latents
+/// `start..start + span` (clipped at the run's end), of which frames
+/// `emit_from..emit_from + emit_frames` are the window's output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowPlan {
+    start: usize,
+    emit_from: usize,
+    emit_frames: usize,
+}
+
+/// The windows over a latent run of `context` frames of left context then
+/// `frames` new frames, each `context_frames + window` frames long. A
+/// window starts `context_frames` before its first output frame, so it
+/// carries the vocoder's whole receptive field, or at the run's start: a
+/// run holds less than `context_frames` of context only when it starts at
+/// the stream's first frame, where every causal layer's zero padding is
+/// the stream's own start. A window there outputs up to `context_frames +
+/// window` frames. Which windows a job gets depends only on its own run.
+fn fixed_window_plan(
+    context_frames: usize,
+    window: usize,
+    context: usize,
+    frames: usize,
+) -> Vec<WindowPlan> {
+    let total = context + frames;
+    let span = context_frames + window.max(1);
+    let mut plans = Vec::new();
+    let mut first = context;
+    while first < total {
+        let start = first.saturating_sub(context_frames);
+        let end = total.min(start + span);
+        plans.push(WindowPlan {
+            start,
+            emit_from: first - start,
+            emit_frames: end - first,
+        });
+        first = end;
+    }
+    plans
+}
+
+/// Vocoder windows each CUDA codec call runs. Every call, one request's
+/// windows or several requests', runs this many windows of
+/// [`SpeechTokenizerDecoder::fixed_window_frames`], spare windows zero:
+/// cuBLAS picks a GEMM kernel by shape, and kernels round differently, so a
+/// call whose shape followed the load would change a request's audio.
+pub(crate) const CODEC_CALL_SLOTS: usize = 4;
 
 /// Incremental decode state of [`SpeechTokenizerDecoder::decode_stream_step`]:
 /// the frames consumed and the bounded causal contexts. Tensors are
@@ -1786,6 +2000,8 @@ pub struct SpeechTokenizerDecodeStats {
     pub context_frames: usize,
     pub windows: u64,
     pub peak_window_frames: usize,
+    /// Batched stream decodes (the audio stage's).
+    pub batched: SpeechTokenizerBatchStats,
 }
 
 impl SpeechTokenizerDecoder {
@@ -1840,6 +2056,9 @@ impl SpeechTokenizerDecoder {
             )));
         }
         let vocoder_context_frames = vocoder_receptive_field_frames(&decoder_config);
+        // The depthwise op's one-launch CUDA kernel checks itself against its
+        // composition here, at load, not in the first request.
+        crate::kernels::depthwise_conv::prepare_cuda_kernel(&device);
         let vb = root_vb.pp("decoder");
 
         // Official checkpoints store RVQ embeddings at 256 dims.
@@ -1970,7 +2189,41 @@ impl SpeechTokenizerDecoder {
             vocoder_context_frames,
             vocoder_windows: AtomicU64::new(0),
             vocoder_peak_window_frames: AtomicUsize::new(0),
+            batch: StreamBatchCounters::default(),
         })
+    }
+
+    /// `frames` frames of xorshift codes for every quantizer, each within
+    /// its codebook: unstructured input for a decoder self-check.
+    pub(crate) fn self_check_codes(&self, frames: usize) -> Vec<Vec<u32>> {
+        let size = self.config.codebook_size.max(1) as u64;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        (0..self.config.num_quantizers)
+            .map(|_| {
+                (0..frames)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        (state % size) as u32
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Moves the reference encoder (voice cloning's) out, so another
+    /// decoder of these weights can take it ([`Self::set_encoder`]).
+    pub(crate) fn take_encoder(&mut self) -> Option<SpeechTokenizerEncoder> {
+        self.encoder.take()
+    }
+
+    pub(crate) fn set_encoder(&mut self, encoder: Option<SpeechTokenizerEncoder>) {
+        self.encoder = encoder;
+    }
+
+    pub(crate) fn decoder_config(&self) -> &DecoderConfig {
+        &self.config
     }
 
     pub fn decode_stats(&self) -> SpeechTokenizerDecodeStats {
@@ -1979,6 +2232,15 @@ impl SpeechTokenizerDecoder {
             context_frames: self.vocoder_context_frames,
             windows: self.vocoder_windows.load(Ordering::Relaxed),
             peak_window_frames: self.vocoder_peak_window_frames.load(Ordering::Relaxed),
+            batched: SpeechTokenizerBatchStats {
+                batches: self.batch.batches.load(Ordering::Relaxed),
+                jobs: self.batch.jobs.load(Ordering::Relaxed),
+                calls: self.batch.calls.load(Ordering::Relaxed),
+                windows: self.batch.windows.load(Ordering::Relaxed),
+                slots: self.batch.slots.load(Ordering::Relaxed),
+                shared_calls: self.batch.shared_calls.load(Ordering::Relaxed),
+                call_jobs: self.batch.call_jobs.load(Ordering::Relaxed),
+            },
         }
     }
 
@@ -2178,19 +2440,254 @@ impl SpeechTokenizerDecoder {
         if frames == 0 {
             return Ok(Vec::new());
         }
+        let (latents, context) = self.stream_window_latents(stream, new_tokens)?;
+        self.vocode_range(&latents, context, context + frames, VOCODER_WINDOW_FRAMES)
+    }
+
+    /// The next frames' latents behind the vocoder's left context: the
+    /// stream's latent tail (`min(vocoder context, frames before)` frames)
+    /// then the new frames, as `([1, latent_dim, context + frames],
+    /// context)`. The tail moves past the new frames.
+    fn stream_window_latents(
+        &self,
+        stream: &mut SpeechTokenizerStream,
+        new_tokens: &[Vec<u32>],
+    ) -> Result<(Tensor, usize)> {
         let latents = self.stream_latents(stream, new_tokens)?;
         let (latents, context) = match &stream.latent_tail {
             Some(tail) => (Tensor::cat(&[tail, &latents], 2)?, tail.dim(2)?),
             None => (latents, 0),
         };
-        let samples =
-            self.vocode_range(&latents, context, context + frames, VOCODER_WINDOW_FRAMES)?;
         let latent_len = latents.dim(2)?;
         let kept = self.vocoder_context_frames.min(latent_len);
         stream.latent_tail = (kept > 0)
             .then(|| latents.narrow(2, latent_len - kept, kept))
             .transpose()?;
-        Ok(samples)
+        Ok((latents, context))
+    }
+
+    /// Frames of every [`CodecCallPolicy::Fixed`] vocoder window: the
+    /// vocoder's receptive field plus [`VOCODER_WINDOW_FRAMES`].
+    pub(crate) fn fixed_window_frames(&self) -> usize {
+        self.vocoder_context_frames + VOCODER_WINDOW_FRAMES
+    }
+
+    /// Decode each job's next frames, the jobs' vocoder windows grouped into
+    /// calls by `policy`, and advance each job's stream past them. A job's
+    /// samples equal what [`Self::decode_stream_step`] returns for the same
+    /// frames up to rounding: every window carries the vocoder's receptive
+    /// field, and the decoder is causal, so right padding and spare windows
+    /// change no output frame.
+    ///
+    /// Under [`CodecCallPolicy::Fixed`] a job's samples are bit for bit the
+    /// same alone as beside other jobs, provided rows of one call do not
+    /// interact ([`Self::check_shared_calls`]): its frame-rate stages run
+    /// alone on its own frames, which windows it gets depends only on its
+    /// own run, and every call runs the same shape. A job's codec time is
+    /// its frame-rate stages plus its share of each call it rode in, by
+    /// window. On error no stream is advanced past what it had committed:
+    /// callers pass candidate streams.
+    pub(crate) fn decode_stream_batch(
+        &self,
+        jobs: &mut [StreamDecodeJob<'_>],
+        policy: CodecCallPolicy,
+    ) -> Result<Vec<StreamDecodeOutput>> {
+        struct Window {
+            job: usize,
+            latents: Tensor,
+            emit_from: usize,
+            emit_frames: usize,
+        }
+        let fixed_frames = self.fixed_window_frames();
+        let upsample = self.decode_upsample_rate;
+        let mut outputs = vec![StreamDecodeOutput::default(); jobs.len()];
+        let mut windows = Vec::new();
+        for (index, job) in jobs.iter_mut().enumerate() {
+            let frames = job.tokens.first().map_or(0, Vec::len);
+            if frames == 0 {
+                continue;
+            }
+            let started = std::time::Instant::now();
+            let (latents, context) = self.stream_window_latents(job.stream, job.tokens)?;
+            let run = latents.dim(2)?;
+            for plan in fixed_window_plan(
+                self.vocoder_context_frames,
+                VOCODER_WINDOW_FRAMES,
+                context,
+                frames,
+            ) {
+                let take = (run - plan.start).min(fixed_frames);
+                let mut window = latents.narrow(2, plan.start, take)?;
+                if matches!(policy, CodecCallPolicy::Fixed { .. }) && take < fixed_frames {
+                    window = window.pad_with_zeros(2, 0, fixed_frames - take)?;
+                }
+                windows.push(Window {
+                    job: index,
+                    latents: window,
+                    emit_from: plan.emit_from,
+                    emit_frames: plan.emit_frames,
+                });
+            }
+            outputs[index].codec_ms += started.elapsed().as_secs_f64() * 1000.0;
+        }
+
+        let calls: Vec<Vec<usize>> = match policy {
+            CodecCallPolicy::PerWindow => (0..windows.len()).map(|window| vec![window]).collect(),
+            CodecCallPolicy::Fixed { slots, shared } => {
+                let slots = slots.max(1);
+                let order = (0..windows.len()).collect::<Vec<_>>();
+                if shared {
+                    order.chunks(slots).map(<[usize]>::to_vec).collect()
+                } else {
+                    order
+                        .chunk_by(|left, right| windows[*left].job == windows[*right].job)
+                        .flat_map(|job| job.chunks(slots).map(<[usize]>::to_vec))
+                        .collect()
+                }
+            }
+        };
+        let slots = match policy {
+            CodecCallPolicy::PerWindow => None,
+            CodecCallPolicy::Fixed { slots, .. } => Some(slots.max(1)),
+        };
+        let mut segments = vec![Vec::new(); windows.len()];
+        for call in &calls {
+            let started = std::time::Instant::now();
+            let inputs = call
+                .iter()
+                .map(|&window| &windows[window].latents)
+                .collect::<Vec<_>>();
+            let decoded = self.vocode_call(&inputs, slots)?;
+            let share = started.elapsed().as_secs_f64() * 1000.0 / call.len() as f64;
+            for (&index, samples) in call.iter().zip(decoded) {
+                let window = &windows[index];
+                let from = window.emit_from * upsample;
+                let to = from + window.emit_frames * upsample;
+                segments[index] = samples.get(from..to).map(<[f32]>::to_vec).ok_or_else(|| {
+                    Error::InferenceError(format!(
+                        "speech-tokenizer window produced {} samples, its output ends at {to}",
+                        samples.len()
+                    ))
+                })?;
+                outputs[window.job].codec_ms += share;
+                outputs[window.job].windows += 1;
+            }
+            let mut jobs_in_call = call
+                .iter()
+                .map(|&window| windows[window].job)
+                .collect::<Vec<_>>();
+            jobs_in_call.dedup();
+            let counters = &self.batch;
+            counters.calls.fetch_add(1, Ordering::Relaxed);
+            counters
+                .windows
+                .fetch_add(call.len() as u64, Ordering::Relaxed);
+            counters
+                .slots
+                .fetch_add(slots.unwrap_or(call.len()) as u64, Ordering::Relaxed);
+            counters
+                .call_jobs
+                .fetch_add(jobs_in_call.len() as u64, Ordering::Relaxed);
+            if jobs_in_call.len() > 1 {
+                counters.shared_calls.fetch_add(1, Ordering::Relaxed);
+            }
+            self.vocoder_windows
+                .fetch_add(call.len() as u64, Ordering::Relaxed);
+            for &window in call {
+                self.vocoder_peak_window_frames
+                    .fetch_max(windows[window].latents.dim(2)?, Ordering::Relaxed);
+            }
+        }
+        for (window, segment) in windows.iter().zip(segments) {
+            outputs[window.job].samples.extend(segment);
+        }
+        self.batch.batches.fetch_add(1, Ordering::Relaxed);
+        self.batch
+            .jobs
+            .fetch_add(jobs.len() as u64, Ordering::Relaxed);
+        Ok(outputs)
+    }
+
+    /// One vocoder call over `windows` (`[1, latent_dim, frames]` each, all
+    /// one length), padded with zero windows to `slots` when given: each
+    /// window's clamped samples, on the host. The device is synchronized
+    /// after the call so its pooled buffers are released before the next.
+    fn vocode_call(&self, windows: &[&Tensor], slots: Option<usize>) -> Result<Vec<Vec<f32>>> {
+        let Some(first) = windows.first() else {
+            return Ok(Vec::new());
+        };
+        let (_, channels, frames) = first.dims3()?;
+        if windows.iter().any(|window| window.dims() != first.dims())
+            || slots.is_some_and(|slots| windows.len() > slots)
+        {
+            return Err(Error::InvalidInput(
+                "speech-tokenizer vocoder call windows differ in shape or exceed its slots".into(),
+            ));
+        }
+        let mut parts = windows
+            .iter()
+            .map(|window| (*window).clone())
+            .collect::<Vec<_>>();
+        if let Some(spare) = slots
+            .map(|slots| slots - windows.len())
+            .filter(|&spare| spare > 0)
+        {
+            parts.push(Tensor::zeros(
+                (spare, channels, frames),
+                first.dtype(),
+                first.device(),
+            )?);
+        }
+        let batch = if parts.len() == 1 {
+            parts.pop().expect("one window")
+        } else {
+            Tensor::cat(&parts, 0)?
+        };
+        let samples_per_window = frames * self.decode_upsample_rate;
+        let wav = self.vocode(&batch)?;
+        if wav.dims() != [batch.dim(0)?, 1, samples_per_window] {
+            return Err(Error::InferenceError(format!(
+                "speech-tokenizer vocoder produced {:?} for {frames}-frame windows",
+                wav.dims()
+            )));
+        }
+        let host = wav
+            .clamp(-1.0f32, 1.0f32)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        drop(batch);
+        self.device.synchronize()?;
+        Ok(host
+            .chunks(samples_per_window)
+            .take(windows.len())
+            .map(<[f32]>::to_vec)
+            .collect())
+    }
+
+    /// Whether windows decoded together in one [`CodecCallPolicy::Fixed`]
+    /// call of `slots` come out bit for bit as each does alone in such a
+    /// call (spare windows zero), on this decoder's device: `slots`
+    /// different windows of latents from xorshift codes, decoded together
+    /// and then one at a time. A load runs it once on CUDA; a `false`
+    /// keeps each request's windows in calls of their own.
+    pub(crate) fn check_shared_calls(&self, slots: usize) -> Result<bool> {
+        let slots = slots.max(1);
+        let frames = self.fixed_window_frames();
+        let codes = self.self_check_codes(frames * slots);
+        let latents = self.decode_latents(&codes)?;
+        let windows = (0..slots)
+            .map(|slot| latents.narrow(2, slot * frames, frames))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        let bits = |samples: &[f32]| samples.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let together = self.vocode_call(&windows.iter().collect::<Vec<_>>(), Some(slots))?;
+        for (window, shared) in windows.iter().zip(&together) {
+            let alone = self.vocode_call(&[window], Some(slots))?;
+            if alone.first().map(|alone| bits(alone)) != Some(bits(shared)) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Like [`Self::decode_stream_step`]: the next frames' latents
@@ -2356,13 +2853,27 @@ fn decode_workspace_upper_bound_bytes(
     element_bytes: usize,
 ) -> Result<u64> {
     let overflow = || Error::Overloaded("speech-tokenizer workspace overflow".into());
+    let window = codec_frames.min(VOCODER_WINDOW_FRAMES.saturating_add(context_frames));
+    frame_rate_workspace_upper_bound_elements(cfg, codec_frames)?
+        .checked_add(vocoder_window_workspace_upper_bound_elements(cfg, window)?)
+        .and_then(|elements| elements.checked_mul(u64::try_from(element_bytes).ok()?))
+        .ok_or_else(overflow)
+}
+
+/// Backend temporaries, in elements, of the frame-rate stages (RVQ,
+/// pre-conv, the sliding-window transformer) over `codec_frames` frames:
+/// one query block of sliding-window scores, the transformer's linear
+/// activations, and the pre-conv/latent tensors that stay live while the
+/// vocoder windows run.
+fn frame_rate_workspace_upper_bound_elements(
+    cfg: &DecoderConfig,
+    codec_frames: usize,
+) -> Result<u64> {
+    let overflow = || Error::Overloaded("speech-tokenizer workspace overflow".into());
     let to_u64 = |value: usize| u64::try_from(value).map_err(|_| overflow());
     let mul = |left: u64, right: u64| left.checked_mul(right).ok_or_else(overflow);
     let add = |left: u64, right: u64| left.checked_add(right).ok_or_else(overflow);
 
-    // Frame-rate stages over every frame: one query block of sliding-window
-    // scores, the transformer's linear activations, and the pre-conv/latent
-    // tensors that stay live while the vocoder windows run.
     let frames = to_u64(codec_frames)?;
     let block = codec_frames.min(BANDED_QUERY_BLOCK);
     let keys = codec_frames.min(block + cfg.sliding_window.max(1) - 1);
@@ -2373,9 +2884,19 @@ fn decode_workspace_upper_bound_bytes(
     let transformer_linear = mul(mul(to_u64(cfg.hidden_size)?, frames)?, 12)?;
     let frame_rate_width = cfg.latent_dim.max(cfg.hidden_size.saturating_mul(3));
     let frame_rate = mul(mul(to_u64(frame_rate_width)?, frames)?, 2)?;
+    add(add(attention, transformer_linear)?, frame_rate)
+}
 
-    // Upsampler and vocoder over one window, context included.
-    let window = codec_frames.min(VOCODER_WINDOW_FRAMES.saturating_add(context_frames));
+/// Backend temporaries, in elements, of the upsampler and vocoder over one
+/// window of `window` frames, context included.
+fn vocoder_window_workspace_upper_bound_elements(
+    cfg: &DecoderConfig,
+    window: usize,
+) -> Result<u64> {
+    let overflow = || Error::Overloaded("speech-tokenizer workspace overflow".into());
+    let to_u64 = |value: usize| u64::try_from(value).map_err(|_| overflow());
+    let mul = |left: u64, right: u64| left.checked_mul(right).ok_or_else(overflow);
+
     let mut time = to_u64(window)?;
     let latent = to_u64(cfg.latent_dim)?;
     let mut peak_activation = mul(latent, time)?;
@@ -2393,12 +2914,78 @@ fn decode_workspace_upper_bound_bytes(
     // The widest stage's 7-tap convs hold an im2col copy (7 widths) next to
     // the input, its padded copy, the output, the residual and two SnakeBeta
     // temporaries: 13 activation widths.
-    let vocoder = mul(peak_activation, 13)?;
-    let elements = add(
-        add(attention, transformer_linear)?,
-        add(frame_rate, vocoder)?,
-    )?;
-    mul(elements, to_u64(element_bytes)?)
+    mul(peak_activation, 13)
+}
+
+/// Backend temporaries of one batched audio quantum's shared work
+/// ([`SpeechTokenizerDecoder::decode_stream_batch`]) over jobs of up to
+/// `frames` new frames: one job's frame-rate stages at a time (its frames
+/// behind each layer's sliding-window tail) and one vocoder call of
+/// `slots` windows of the vocoder's receptive field plus
+/// [`VOCODER_WINDOW_FRAMES`] frames.
+pub(crate) fn stream_batch_shared_upper_bound_bytes(
+    cfg: &DecoderConfig,
+    frames: usize,
+    slots: usize,
+    element_bytes: usize,
+) -> Result<u64> {
+    let overflow = || Error::Overloaded("speech-tokenizer batch workspace overflow".into());
+    let window = vocoder_receptive_field_frames(cfg) + VOCODER_WINDOW_FRAMES;
+    let frame_rate =
+        frame_rate_workspace_upper_bound_elements(cfg, frames.saturating_add(cfg.sliding_window))?;
+    vocoder_window_workspace_upper_bound_elements(cfg, window)?
+        .checked_mul(u64::try_from(slots.max(1)).map_err(|_| overflow())?)
+        .and_then(|call| call.checked_add(frame_rate))
+        .and_then(|elements| elements.checked_mul(u64::try_from(element_bytes).ok()?))
+        .ok_or_else(overflow)
+}
+
+/// What one job holds through a batched audio quantum of up to `frames`
+/// new frames, in bytes: on the device its latent run and window copies
+/// and its stream's new tails (each transformer layer's and the pre-conv's
+/// keep the buffer they were cut from), on the host its samples twice
+/// (window segments and the job's output).
+pub(crate) fn stream_batch_job_upper_bound_bytes(
+    cfg: &DecoderConfig,
+    frames: usize,
+    element_bytes: usize,
+) -> Result<u64> {
+    let overflow = || Error::Overloaded("speech-tokenizer batch job workspace overflow".into());
+    let context = vocoder_receptive_field_frames(cfg);
+    let window = context + VOCODER_WINDOW_FRAMES;
+    let windows = frames.div_ceil(VOCODER_WINDOW_FRAMES) + 1;
+    let latent_frames = context
+        .checked_add(frames)
+        .and_then(|run| run.checked_add(windows.checked_mul(window)?))
+        .ok_or_else(overflow)?;
+    let tail_elements = cfg
+        .num_hidden_layers
+        .checked_mul(
+            cfg.sliding_window
+                .checked_add(frames)
+                .ok_or_else(overflow)?,
+        )
+        .and_then(|frames| frames.checked_mul(cfg.hidden_size))
+        .and_then(|layers| {
+            frames
+                .checked_add(3)?
+                .checked_mul(cfg.hidden_size)
+                .and_then(|pre_conv| layers.checked_add(pre_conv))
+        })
+        .ok_or_else(overflow)?;
+    let device = latent_frames
+        .checked_mul(cfg.latent_dim)
+        .and_then(|latents| latents.checked_add(tail_elements))
+        .and_then(|elements| elements.checked_mul(element_bytes))
+        .ok_or_else(overflow)?;
+    let host = frames
+        .checked_mul(vocoder_upsample_factor(cfg))
+        .and_then(|samples| samples.checked_mul(2 * std::mem::size_of::<f32>()))
+        .ok_or_else(overflow)?;
+    device
+        .checked_add(host)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(overflow)
 }
 
 /// Build standard RoPE cos/sin cache.
@@ -2882,6 +3469,103 @@ mod tests {
         );
     }
 
+    /// The ConvNeXt depthwise conv as the shared op computes what Candle's
+    /// grouped `conv1d` computed over the same weights (causal left padding,
+    /// per-channel bias), up to summation order.
+    #[test]
+    fn convnext_depthwise_conv_matches_the_grouped_conv1d() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let channels = 12;
+        let vb = xorshift_vb(&Device::Cpu);
+        let depthwise =
+            CausalDepthwiseConv1d::load(channels, CONVNEXT_KERNEL, vb.pp("dwconv.conv")).unwrap();
+        let grouped = CausalConv1d::load(
+            channels,
+            channels,
+            CONVNEXT_KERNEL,
+            1,
+            channels,
+            true,
+            vb.pp("dwconv.conv"),
+        )
+        .unwrap();
+        let x = xorshift_tensor(&[2, channels, 19], 7, 1.0, &Device::Cpu).unwrap();
+        let ours = host_f32(&depthwise.forward(&x).unwrap()).unwrap();
+        let reference = host_f32(&grouped.forward(&x).unwrap()).unwrap();
+        assert_eq!(ours.len(), 2 * channels * 19);
+        let error = max_abs_diff(&ours, &reference);
+        assert!(error < 1e-5, "depthwise conv diverges by {error}");
+    }
+
+    /// The one-GEMM transposed conv computes what Candle's transposed conv,
+    /// trimmed to `L * stride`, computed over the same weights, for kernels
+    /// of one and two strides, one frame and many, one row and several.
+    #[test]
+    fn transposed_conv_matches_candles_trimmed_conv_transpose1d() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let vb = xorshift_vb(&Device::Cpu);
+        for (stride, kernel) in [(2, 2), (3, 6), (5, 10)] {
+            let name = format!("up{stride}x{kernel}");
+            let ours = CausalTransConv1d::load(6, 4, kernel, stride, vb.pp(&name)).unwrap();
+            let config = candle_nn::ConvTranspose1dConfig {
+                padding: 0,
+                output_padding: 0,
+                stride,
+                dilation: 1,
+                groups: 1,
+            };
+            let reference =
+                candle_nn::conv_transpose1d(6, 4, kernel, config, vb.pp(&name)).unwrap();
+            for (batch, frames) in [(1, 1), (1, 9), (3, 9)] {
+                let x = xorshift_tensor(&[batch, 6, frames], 11, 1.0, &Device::Cpu).unwrap();
+                // Row by row: Candle's CPU transposed conv returns other
+                // values for every row past the first of a batch.
+                let rows = (0..batch)
+                    .map(|row| {
+                        reference
+                            .forward(&x.narrow(0, row, 1).unwrap())
+                            .unwrap()
+                            .narrow(2, 0, frames * stride)
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let expected = Tensor::cat(&rows, 0).unwrap();
+                let got = ours.forward(&x).unwrap();
+                assert_eq!(got.dims(), expected.dims());
+                let error = max_abs_diff(&host_f32(&got).unwrap(), &host_f32(&expected).unwrap());
+                assert!(error < 1e-5, "{name} x{batch}x{frames} diverges by {error}");
+            }
+        }
+    }
+
+    /// SnakeBeta's load-time constants give the bits the per-call formula
+    /// gave: the same ops on the same values.
+    #[test]
+    fn snake_constants_reproduce_the_per_call_formula() {
+        use crate::kernels::numeric_check::{host_f32, xorshift_tensor};
+
+        let channels = 6;
+        let vb = xorshift_vb(&Device::Cpu);
+        let snake = SnakeBeta::load(channels, vb.pp("snake")).unwrap();
+        let alpha = vb.pp("snake").get((channels,), "alpha").unwrap();
+        let beta = vb.pp("snake").get((channels,), "beta").unwrap();
+        let x = xorshift_tensor(&[2, channels, 11], 3, 2.0, &Device::Cpu).unwrap();
+        let per_call = || -> candle_core::Result<Tensor> {
+            let alpha = alpha.unsqueeze(0)?.unsqueeze(2)?.exp()?;
+            let beta = beta.unsqueeze(0)?.unsqueeze(2)?.exp()?;
+            let sin2 = x.broadcast_mul(&alpha)?.sin()?.sqr()?;
+            let eps = Tensor::new(1e-9f32, x.device())?;
+            let inv_beta = beta.broadcast_add(&eps)?.recip()?;
+            x.broadcast_add(&sin2.broadcast_mul(&inv_beta)?)
+        };
+        assert_eq!(
+            host_f32(&snake.forward(&x).unwrap()).unwrap(),
+            host_f32(&per_call().unwrap()).unwrap()
+        );
+    }
+
     fn tiny_decoder() -> SpeechTokenizerDecoder {
         SpeechTokenizerDecoder::from_config(
             tiny_speech_tokenizer_config(),
@@ -2942,6 +3626,127 @@ mod tests {
         );
     }
 
+    /// The BF16 codec self-check (D4): the tiny decoder at BF16 decodes its
+    /// xorshift check codes within the tolerance of its F32 decode, while
+    /// the F32 waveform of other codes, or a cut one, fails it.
+    #[test]
+    fn bf16_codec_check_admits_bf16_rounding_and_rejects_other_audio() {
+        use super::super::{qwen3_tts_codec_bf16_check, QWEN3_TTS_CODEC_BF16_MAX_RELATIVE_L2};
+
+        let f32_decoder = tiny_decoder();
+        let bf16_decoder = SpeechTokenizerDecoder::from_config(
+            tiny_speech_tokenizer_config(),
+            VarBuilder::from_backend(Box::new(XorshiftWeights), DType::BF16, Device::Cpu),
+            Device::Cpu,
+        )
+        .unwrap();
+        let codes = f32_decoder.self_check_codes(40);
+        assert_eq!(codes.len(), 4);
+        assert!(codes
+            .iter()
+            .all(|group| group.len() == 40 && group.iter().all(|code| *code < 32)));
+        let reference = f32_decoder.decode(&codes).unwrap();
+        assert!(
+            reference.iter().filter(|v| v.abs() < 0.99).count() > reference.len() / 2,
+            "decoder output is saturated; the comparison would be vacuous"
+        );
+        let (relative, passed) =
+            qwen3_tts_codec_bf16_check(&bf16_decoder.decode(&codes).unwrap(), &reference);
+        assert!(
+            passed && relative > 0.0,
+            "BF16 relative L2 {relative}, tolerance {QWEN3_TTS_CODEC_BF16_MAX_RELATIVE_L2}"
+        );
+        // A decoder whose weights are wrong (every tensor's values drawn
+        // apart) decodes the same codes far outside the tolerance.
+        let wrong = SpeechTokenizerDecoder::from_config(
+            tiny_speech_tokenizer_config(),
+            VarBuilder::from_backend(Box::new(SaltedXorshiftWeights), DType::F32, Device::Cpu),
+            Device::Cpu,
+        )
+        .unwrap();
+        let (relative, passed) =
+            qwen3_tts_codec_bf16_check(&wrong.decode(&codes).unwrap(), &reference);
+        assert!(
+            !passed && relative > 0.3,
+            "a wrong decoder passed at {relative}"
+        );
+        assert!(!qwen3_tts_codec_bf16_check(&reference[1..], &reference).1);
+        assert!(!qwen3_tts_codec_bf16_check(&[], &[]).1);
+    }
+
+    /// [`XorshiftWeights`] with every tensor's seed salted: a decoder of
+    /// the same geometry whose weights are all wrong.
+    struct SaltedXorshiftWeights;
+
+    impl candle_nn::var_builder::SimpleBackend for SaltedXorshiftWeights {
+        fn get(
+            &self,
+            shape: candle_core::Shape,
+            name: &str,
+            init: candle_nn::Init,
+            dtype: DType,
+            device: &Device,
+        ) -> candle_core::Result<Tensor> {
+            XorshiftWeights.get(shape, &format!("salted.{name}"), init, dtype, device)
+        }
+
+        fn get_unchecked(&self, name: &str, _: DType, _: &Device) -> candle_core::Result<Tensor> {
+            candle_core::bail!("unexpected unchecked tensor request {name}")
+        }
+
+        fn contains_tensor(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    /// Without the switch, or off CUDA, a load keeps the F32 decoder it
+    /// read and says why; neither reads the checkpoint again.
+    #[test]
+    fn bf16_codec_decoder_stays_off_unless_asked_on_cuda() {
+        use super::super::{
+            qwen3_tts_codec_bf16_allowed, resolve_qwen3_tts_codec_precision,
+            tests::dtype_test_profile, QWEN3_TTS_CODEC_BF16_ENV,
+        };
+        use crate::backends::DeviceKind;
+
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(QWEN3_TTS_CODEC_BF16_ENV);
+        let missing = std::path::Path::new("/nonexistent/speech_tokenizer");
+        let cpu = dtype_test_profile(DeviceKind::Cpu, true, true);
+        std::env::remove_var(QWEN3_TTS_CODEC_BF16_ENV);
+        let (_, precision) =
+            resolve_qwen3_tts_codec_precision(tiny_decoder(), missing, &cpu, DType::F32).unwrap();
+        assert_eq!(precision.dtype, "F32");
+        assert!(!precision.bf16_requested);
+        assert!(precision.reason.contains(QWEN3_TTS_CODEC_BF16_ENV));
+        assert_eq!(precision.relative_l2, None);
+        std::env::set_var(QWEN3_TTS_CODEC_BF16_ENV, "1");
+        let (_, precision) =
+            resolve_qwen3_tts_codec_precision(tiny_decoder(), missing, &cpu, DType::F32).unwrap();
+        assert_eq!(precision.dtype, "F32");
+        assert!(precision.bf16_requested);
+        assert!(
+            precision.reason.contains("CUDA only"),
+            "{}",
+            precision.reason
+        );
+        match previous {
+            Some(value) => std::env::set_var(QWEN3_TTS_CODEC_BF16_ENV, value),
+            None => std::env::remove_var(QWEN3_TTS_CODEC_BF16_ENV),
+        }
+
+        let cuda = dtype_test_profile(DeviceKind::Cuda, true, true);
+        assert!(qwen3_tts_codec_bf16_allowed(true, &cuda, DType::F32).is_ok());
+        assert!(qwen3_tts_codec_bf16_allowed(false, &cuda, DType::F32).is_err());
+        assert!(qwen3_tts_codec_bf16_allowed(true, &cuda, DType::F16).is_err());
+        let no_bf16 = dtype_test_profile(DeviceKind::Cuda, false, true);
+        assert!(qwen3_tts_codec_bf16_allowed(true, &no_bf16, DType::F32).is_err());
+        let metal = dtype_test_profile(DeviceKind::Metal, true, true);
+        assert!(qwen3_tts_codec_bf16_allowed(true, &metal, DType::F32).is_err());
+    }
+
     /// QTTS-5: decoding a stream in uneven steps (single frames, steps
     /// shorter and longer than the sliding window and the vocoder window)
     /// reproduces the whole-utterance decode sample for sample, so a
@@ -2976,6 +3781,212 @@ mod tests {
         assert_eq!(streamed.len(), whole.len());
         let error = max_abs_diff(&streamed, &whole);
         assert!(error < 1e-5, "streamed decode diverges by {error}");
+    }
+
+    /// The codes of frames `from..to` of `codes`.
+    fn code_range(codes: &[Vec<u32>], from: usize, to: usize) -> Vec<Vec<u32>> {
+        codes.iter().map(|group| group[from..to].to_vec()).collect()
+    }
+
+    /// Fixed windows cover every new frame of a run once, in order, and
+    /// each starts the vocoder's receptive field before its first output
+    /// frame unless it starts at the stream's first frame; none is longer
+    /// than the field plus one window.
+    #[test]
+    fn fixed_window_plan_carries_the_receptive_field_and_covers_each_frame_once() {
+        let (context_frames, window) = (11, 32);
+        for (context, frames) in [
+            (0, 1),
+            (0, 6),
+            (6, 6),
+            (0, 43),
+            (0, 44),
+            (11, 1),
+            (11, 128),
+            (3, 200),
+        ] {
+            let plans = fixed_window_plan(context_frames, window, context, frames);
+            let mut next = context;
+            for plan in &plans {
+                assert_eq!(plan.start + plan.emit_from, next, "{context}+{frames}");
+                assert!(plan.emit_frames > 0);
+                assert!(plan.emit_from + plan.emit_frames <= context_frames + window);
+                assert!(
+                    plan.emit_from == context_frames || plan.start == 0,
+                    "a window lost its context: {plan:?} in {context}+{frames}"
+                );
+                next += plan.emit_frames;
+            }
+            assert_eq!(next, context + frames);
+        }
+        // A stream's first window outputs the field plus one window.
+        assert_eq!(
+            fixed_window_plan(11, 32, 0, 100)[0],
+            WindowPlan {
+                start: 0,
+                emit_from: 0,
+                emit_frames: 43
+            }
+        );
+    }
+
+    /// Every batching policy decodes a stream's runs, from its first frame
+    /// on, as the stream step does: right-padded windows, spare windows and
+    /// the window split change no output frame beyond rounding.
+    #[test]
+    fn batched_stream_decode_matches_the_stream_step() {
+        use crate::kernels::numeric_check::max_abs_diff;
+
+        let decoder = tiny_decoder();
+        let codes = xorshift_codes(4, 61, 32);
+        let mut stepped = decoder.start_stream();
+        let mut reference = Vec::new();
+        let runs = [6usize, 6, 12, 1, 23, 13];
+        let mut frames = 0;
+        for run in runs {
+            let next = code_range(&codes, frames, frames + run);
+            reference.extend(decoder.decode_stream_step(&mut stepped, &next).unwrap());
+            frames += run;
+        }
+        for policy in [
+            CodecCallPolicy::PerWindow,
+            CodecCallPolicy::Fixed {
+                slots: 4,
+                shared: true,
+            },
+            CodecCallPolicy::Fixed {
+                slots: 2,
+                shared: false,
+            },
+        ] {
+            let mut stream = decoder.start_stream();
+            let mut decoded = Vec::new();
+            let mut frames = 0;
+            for run in runs {
+                let next = code_range(&codes, frames, frames + run);
+                let mut jobs = [StreamDecodeJob {
+                    stream: &mut stream,
+                    tokens: &next,
+                }];
+                let mut out = decoder.decode_stream_batch(&mut jobs, policy).unwrap();
+                assert_eq!(out[0].samples.len(), run * 24, "{policy:?}");
+                decoded.append(&mut out[0].samples);
+                frames += run;
+            }
+            assert_eq!(stream.frames(), 61);
+            let error = max_abs_diff(&decoded, &reference);
+            assert!(error < 1e-5, "{policy:?} diverges by {error}");
+        }
+    }
+
+    /// D3 on the fixed-shape path: each job's samples, and where its stream
+    /// is left, are bit for bit the same decoded alone as decoded beside
+    /// other jobs (fresh and advanced streams, runs shorter and longer
+    /// than a window, an empty run), whether or not jobs share calls; and
+    /// every call runs its fixed slots.
+    #[test]
+    fn fixed_calls_decode_each_job_alone_as_beside_others() {
+        let decoder = tiny_decoder();
+        let codes = xorshift_codes(4, 80, 32);
+        let bits = |samples: &[f32]| samples.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        // (frames already decoded, new frames) per job.
+        let shapes = [
+            (0usize, 30usize),
+            (13, 9),
+            (0, 5),
+            (40, 31),
+            (7, 0),
+            (2, 47),
+        ];
+        let advanced = |decoder: &SpeechTokenizerDecoder, done: usize| {
+            let mut stream = decoder.start_stream();
+            if done > 0 {
+                decoder
+                    .decode_stream_step(&mut stream, &code_range(&codes, 0, done))
+                    .unwrap();
+            }
+            stream
+        };
+        for shared in [true, false] {
+            let policy = CodecCallPolicy::Fixed { slots: 4, shared };
+            let tokens = shapes
+                .iter()
+                .map(|&(done, new)| code_range(&codes, done, done + new))
+                .collect::<Vec<_>>();
+            let mut alone_streams = shapes
+                .iter()
+                .map(|&(done, _)| advanced(&decoder, done))
+                .collect::<Vec<_>>();
+            let alone = alone_streams
+                .iter_mut()
+                .zip(&tokens)
+                .map(|(stream, tokens)| {
+                    let mut jobs = [StreamDecodeJob { stream, tokens }];
+                    decoder
+                        .decode_stream_batch(&mut jobs, policy)
+                        .unwrap()
+                        .remove(0)
+                })
+                .collect::<Vec<_>>();
+            let before = decoder.decode_stats().batched;
+            let mut together_streams = shapes
+                .iter()
+                .map(|&(done, _)| advanced(&decoder, done))
+                .collect::<Vec<_>>();
+            let mut jobs = together_streams
+                .iter_mut()
+                .zip(&tokens)
+                .map(|(stream, tokens)| StreamDecodeJob { stream, tokens })
+                .collect::<Vec<_>>();
+            let together = decoder.decode_stream_batch(&mut jobs, policy).unwrap();
+            let after = decoder.decode_stats().batched;
+            for (job, ((alone, together), &(_, new))) in
+                alone.iter().zip(&together).zip(&shapes).enumerate()
+            {
+                assert_eq!(together.samples.len(), new * 24, "job {job}");
+                assert_eq!(
+                    bits(&alone.samples),
+                    bits(&together.samples),
+                    "job {job} decoded differently beside others (shared: {shared})"
+                );
+                assert_eq!(alone.windows, together.windows);
+            }
+            let calls = after.calls - before.calls;
+            assert_eq!(after.slots - before.slots, calls * 4);
+            assert_eq!(after.shared_calls - before.shared_calls > 0, shared);
+            // Each stream continues the same from where the batch left it.
+            for (job, (alone, together)) in alone_streams
+                .iter_mut()
+                .zip(together_streams.iter_mut())
+                .enumerate()
+            {
+                assert_eq!(alone.frames(), together.frames());
+                let done = alone.frames();
+                let next = code_range(&codes, done, done + 7);
+                let mut first = [StreamDecodeJob {
+                    stream: alone,
+                    tokens: &next,
+                }];
+                let first = decoder.decode_stream_batch(&mut first, policy).unwrap();
+                let mut second = [StreamDecodeJob {
+                    stream: together,
+                    tokens: &next,
+                }];
+                let second = decoder.decode_stream_batch(&mut second, policy).unwrap();
+                assert_eq!(
+                    bits(&first[0].samples),
+                    bits(&second[0].samples),
+                    "job {job}"
+                );
+            }
+        }
+    }
+
+    /// The load-time check for shared calls passes where rows of a call do
+    /// not interact (the CPU here).
+    #[test]
+    fn shared_call_check_passes_where_rows_do_not_interact() {
+        assert!(tiny_decoder().check_shared_calls(CODEC_CALL_SLOTS).unwrap());
     }
 
     /// QTTS-5: the streamed pre-transformer latents equal the whole

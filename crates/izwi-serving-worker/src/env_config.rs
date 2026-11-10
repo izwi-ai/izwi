@@ -354,7 +354,7 @@ pub(crate) static WORKER_ENV: &[EnvVar] = &[
     var(
         ENV_ASR_REALTIME_MAX_SESSIONS,
         "IZWI_MAX_NUM_SEQS, else 16 on CUDA and 4 on CPU and Metal",
-        "Concurrent realtime ASR sessions (also the state arena rows a load reserves).",
+        "Concurrent realtime ASR sessions (also the state arena rows a load reserves; Parakeet and Nemotron ASR reserve at least their offline decode width, up to 32 on CUDA).",
     ),
     var(
         ENV_ASR_REALTIME_MAX_LIFETIME_SECS,

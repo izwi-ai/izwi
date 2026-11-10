@@ -74,6 +74,54 @@ impl Residency {
     }
 }
 
+/// Runs an op over packed rows (row `r`'s `lengths[r]` tokens in turn)
+/// split by each row's `class` of its token count: `run(ids, class)` takes
+/// the token indices of one class (`None` when every row is of that class)
+/// and returns their outputs in that order. Returns every token's output in
+/// token order.
+pub(crate) fn by_row_class(
+    lengths: &[usize],
+    device: &Device,
+    class: impl Fn(usize) -> bool,
+    mut run: impl FnMut(Option<&Tensor>, bool) -> Result<Tensor>,
+) -> Result<Tensor> {
+    let classes = lengths
+        .iter()
+        .map(|&tokens| class(tokens))
+        .collect::<Vec<_>>();
+    match classes.first() {
+        None => {
+            return Err(Error::InferenceError(
+                "a packed call needs at least one row".into(),
+            ))
+        }
+        Some(&first) if classes.iter().all(|&c| c == first) => return run(None, first),
+        Some(_) => {}
+    }
+    let mut ids = [Vec::new(), Vec::new()];
+    let mut start = 0u32;
+    for (&tokens, &c) in lengths.iter().zip(&classes) {
+        let end = start
+            + u32::try_from(tokens)
+                .map_err(|_| Error::InferenceError("a packed row has too many tokens".into()))?;
+        ids[usize::from(c)].extend(start..end);
+        start = end;
+    }
+    let mut parts = Vec::with_capacity(2);
+    let mut position = vec![0u32; start as usize];
+    let mut at = 0u32;
+    for (c, ids) in [false, true].into_iter().zip(&ids) {
+        for &token in ids {
+            position[token as usize] = at;
+            at += 1;
+        }
+        let tensor = Tensor::from_vec(ids.clone(), ids.len(), device)?;
+        parts.push(run(Some(&tensor), c)?);
+    }
+    let position = Tensor::from_vec(position, start as usize, device)?;
+    Ok(Tensor::cat(&parts, 0)?.index_select(&position, 0)?)
+}
+
 enum Weight {
     Q8(QMatMul),
     Fp8 { bytes: Tensor, scales: Tensor },
@@ -513,6 +561,40 @@ impl NtLinear {
         }
     }
 
+    /// [`Self::forward`] (or, with `relu2`, [`Self::forward_relu2`]) of
+    /// several rows' spans packed into `x`, row `r`'s `lengths[r]` tokens in
+    /// turn, each row through the kernel its span takes alone. Only the
+    /// CPU's Q8_0 weights pick their kernel by row count (the tile kernel
+    /// from `CPU_TILE_MIN_ROWS` rows, the row-wise one below): there the
+    /// shorter spans run the row-wise kernel together and the others the tile
+    /// kernel, so a row differs from its span alone only in the tile GEMM's
+    /// rounding. Every other weight takes its span kernel in one call.
+    pub fn forward_rows(&self, x: &Tensor, lengths: &[usize], relu2: bool) -> Result<Tensor> {
+        let run = |x: &Tensor, pass: Pass| {
+            if relu2 {
+                self.forward_relu2(x, pass)
+            } else {
+                self.forward(x, pass)
+            }
+        };
+        if !matches!(&self.weight, Weight::Q8(QMatMul::QTensor(_))) {
+            return run(x, Pass::Span);
+        }
+        by_row_class(
+            lengths,
+            x.device(),
+            |tokens| tokens >= CPU_TILE_MIN_ROWS,
+            |ids, tiled| {
+                // A step always takes the row-wise kernel.
+                let pass = if tiled { Pass::Span } else { Pass::Step };
+                match ids {
+                    Some(ids) => run(&x.index_select(ids, 0)?, pass),
+                    None => run(x, pass),
+                }
+            },
+        )
+    }
+
     /// `relu(forward_padded(x))^2`: a relu² MLP's up projection. A CUDA step
     /// applies the relu² in the GEMV's epilogue (one launch).
     pub fn forward_relu2(&self, x: &Tensor, pass: Pass) -> Result<Tensor> {
@@ -599,6 +681,62 @@ mod tests {
         let span = host_f32(&layer.forward(&x, Pass::Span).unwrap()).unwrap();
         let step = host_f32(&layer.forward(&x, Pass::Step).unwrap()).unwrap();
         assert!(relative_l2(&span, &step) < 1e-2);
+    }
+
+    /// Packed spans of short (row-wise Q8_0) and long (tile) rows on the
+    /// CPU: every row's output is its span's alone, the short rows bit for
+    /// bit, the long ones within the tile GEMM's rounding at another row
+    /// count, and each lands back at its own tokens.
+    #[test]
+    fn packed_rows_take_their_spans_own_q8_kernels() {
+        let (rows, cols) = (48, 64);
+        let layer =
+            NtLinear::q8_from_values(&xorshift_values(rows * cols, 3, 0.5), rows, cols).unwrap();
+        let lengths = [1usize, 7, 4, 5, 2];
+        let total = lengths.iter().sum::<usize>();
+        let x = Tensor::from_vec(
+            xorshift_values(total * cols, 5, 1.0),
+            (total, cols),
+            &Device::Cpu,
+        )
+        .unwrap();
+        for relu2 in [false, true] {
+            let packed = layer.forward_rows(&x, &lengths, relu2).unwrap();
+            let mut offset = 0;
+            for &tokens in &lengths {
+                let span = x.narrow(0, offset, tokens).unwrap();
+                let alone = if relu2 {
+                    layer.forward_relu2(&span, Pass::Span)
+                } else {
+                    layer.forward(&span, Pass::Span)
+                }
+                .unwrap();
+                let alone = host_f32(&alone).unwrap();
+                let got = host_f32(&packed.narrow(0, offset, tokens).unwrap()).unwrap();
+                if tokens < CPU_TILE_MIN_ROWS {
+                    assert_eq!(got, alone, "{tokens}-token row");
+                } else {
+                    let error = relative_l2(&got, &alone);
+                    assert!(error < 1e-6, "{tokens}-token row: {error}");
+                }
+                offset += tokens;
+            }
+        }
+        // The kernels differ: a short row through the tile kernel is not its
+        // span alone.
+        let short = x.narrow(0, 0, 1).unwrap();
+        let tiled = host_f32(
+            &layer
+                .forward(&Tensor::cat(&[&short; 5], 0).unwrap(), Pass::Span)
+                .unwrap()
+                .narrow(0, 0, 1)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(
+            tiled,
+            host_f32(&layer.forward(&short, Pass::Span).unwrap()).unwrap()
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use candle_core::DType;
 use candle_transformers::models::whisper::Config;
 
 use crate::backends::BackendKind;
-use crate::engine::{NativeBatchMode, StageDescriptor, StageWorkSelector};
+use crate::engine::{ConcurrencyClass, NativeBatchMode, StageDescriptor, StageWorkSelector};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, AttentionMask, AttentionPattern, CapabilityStateDescriptorV2,
@@ -111,13 +111,35 @@ pub(crate) fn whisper_physical_state_spec(
                         ));
                     }
                 }
-                StageWorkSelector::SequencePrefill | StageWorkSelector::SequenceDecode => {
+                StageWorkSelector::SequencePrefill => {
                     if stage.batch_mode != NativeBatchMode::None {
                         return Err(model_load(
-                            "Whisper scalar sequence stages cannot advertise native decoder batching",
+                            "Whisper prompt prefill is scalar and cannot advertise native batching",
                         ));
                     }
                 }
+                StageWorkSelector::SequenceDecode => match stage.batch_mode {
+                    NativeBatchMode::None => {}
+                    // Rows decode together, each leasing its own workspace.
+                    NativeBatchMode::Continuous => {
+                        let batch_workspace = u64::try_from(stage.max_batch_size)
+                            .ok()
+                            .and_then(|rows| stage.workspace_per_row_bytes.checked_mul(rows));
+                        if stage.concurrency != ConcurrencyClass::Batchable
+                            || stage.workspace_base_bytes != 0
+                            || stage.workspace_per_work_unit_bytes != 0
+                            || !batch_workspace
+                                .is_some_and(|bytes| stage.max_workspace_bytes >= bytes)
+                        {
+                            return Err(model_load(
+                                "Whisper continuous decode requires batchable rows with per-row workspace",
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(model_load("Whisper decode batches only continuously"));
+                    }
+                },
                 _ => {
                     return Err(model_load(
                         "Whisper execution graph contains an unsupported stage selector",
@@ -152,6 +174,12 @@ pub(crate) fn whisper_physical_state_spec(
                 ]);
             }
             if stage.max_workspace_bytes > 0 {
+                // A per-row lease holds one row's workspace.
+                let scratch_bytes = if stage.workspace_per_row_bytes > 0 {
+                    stage.workspace_per_row_bytes
+                } else {
+                    stage.max_workspace_bytes
+                };
                 let ordinal = u32::try_from(index + 1)
                     .map_err(|_| model_load("Whisper execution stage count exceeds u32"))?;
                 let scratch_id = max_domain_id
@@ -162,7 +190,7 @@ pub(crate) fn whisper_physical_state_spec(
                     placement: PlacementPolicy::BackendLocal,
                     alignment_bytes: 64,
                     zero_on_release: false,
-                    formula: fixed_formula(stage.max_workspace_bytes),
+                    formula: fixed_formula(scratch_bytes),
                 });
             }
             invocation_stages.push(InvocationStageWorkspace {

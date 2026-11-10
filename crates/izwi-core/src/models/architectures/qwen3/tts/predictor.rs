@@ -4,6 +4,7 @@
 //! has produced the first (semantic) codebook. It uses a smaller transformer
 //! for efficient multi-token prediction.
 
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Tensor, D};
@@ -13,18 +14,22 @@ use crate::backends::kv::{
     submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
     PagedKvDecodeArgs, PagedKvPrefillArgs, PagedKvPrefillRow,
 };
+use crate::backends::BackendKind;
 use crate::error::{Error, Result};
+use crate::kernels::cuda::shape_graphs::{ShapeGraphLimits, ShapeGraphs};
 use crate::kernels::f16_weight_linear::{projection_var_builder, ProjectionLinear};
 use crate::kv::KvDecodeBatchMetadata;
 use crate::models::architectures::qwen3::tts::config::CodePredictorConfig;
+use crate::models::architectures::qwen3::tts::decode_rows::{self, DECODE_ROWS};
 use crate::models::architectures::qwen3::tts::rope::{
     build_rope_inv_freq, build_rope_window_full, qwen_rotate_half,
 };
 pub use crate::models::shared::attention::physical::PhysicalPagedKvCache as CodePredictorPhysicalCache;
 use crate::models::shared::attention::physical::PreparedPhysicalPagedStep;
 use crate::models::shared::sampling::{
-    bounded_device_sampling_candidates, device_candidates_cover_top_p, resident_top_k_sample,
-    sample_device_candidates,
+    bounded_device_sampling_candidates, device_candidates_cover_top_p, gumbel_noise,
+    resident_top_k_rows_with_noise, resident_top_k_sample, resident_top_k_sample_rows,
+    sample_device_candidates, DEVICE_TOP_K_LIMIT,
 };
 use crate::models::shared::weights::mlx;
 
@@ -119,6 +124,215 @@ impl CodeSelection<'_> {
     }
 }
 
+/// Kill switch for the code predictor's CUDA graphs (a boolean; on when
+/// unset). Read once: load pricing and the predictor read it.
+pub(crate) const QWEN3_TTS_PREDICTOR_GRAPHS_ENV: &str = "IZWI_QWEN3_TTS_PREDICTOR_GRAPHS";
+
+fn predictor_graphs_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(QWEN3_TTS_PREDICTOR_GRAPHS_ENV, true));
+    ON.get()
+}
+
+/// The rows every graphed frame runs. Spare rows are zero rows, so every
+/// kernel of a frame runs one shape however many requests share the step
+/// (a row's codes never depend on the rows beside it), and one graph per
+/// sampling setting serves every width. A CUDA frame the graphs do not
+/// take runs the same rows eagerly.
+pub(crate) const PREDICTOR_GRAPH_ROWS: usize = DECODE_ROWS;
+
+const MIB: u64 = 1024 * 1024;
+
+/// What the predictor graphs may hold: one graph per input dtype and
+/// sampling setting (greedy, and each sub-talker top-k and temperature in
+/// use). A 32-row frame's working set is a few MiB (15 codebooks of
+/// `[32, 2048]` logits and their sorts, 17 positions of dense KV); the
+/// retained buffers are its inputs (two `[32, 1, 2048]` hiddens and the
+/// noise) and its codes.
+const PREDICTOR_GRAPH_LIMITS: ShapeGraphLimits = ShapeGraphLimits {
+    max_graphs: 4,
+    retained_bytes: 16 * MIB,
+    pool_bytes: 112 * MIB,
+};
+
+/// Device bytes a load on `backend` prices for the predictor graphs, which
+/// the load's self-check allocates: zero off CUDA or with the graphs
+/// switched off.
+pub(crate) fn qwen3_tts_predictor_graph_device_bytes(backend: BackendKind) -> u64 {
+    if backend == BackendKind::Cuda && predictor_graphs_requested() {
+        PREDICTOR_GRAPH_LIMITS.device_bytes()
+    } else {
+        0
+    }
+}
+
+/// How every row of a graphed frame picks its codes, as the eager frame
+/// picks them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FrameSelection {
+    /// Every row greedy: one argmax per codebook.
+    Greedy,
+    /// Every row draws with the same sub-talker top-k and temperature at
+    /// top-p 1 ([`resident_top_k_sample_rows`]), its Gumbel noise drawn
+    /// before the frame.
+    TopK { top_k: usize, temperature: f32 },
+}
+
+impl FrameSelection {
+    /// The selection every row shares, or `None` when rows pick apart (or
+    /// draw on the host).
+    fn of(selections: &[CodeSelection<'_>]) -> Option<Self> {
+        let first = Self::of_row(selections.first()?)?;
+        selections
+            .iter()
+            .all(|selection| Self::of_row(selection).is_some_and(|row| row.same(first)))
+            .then_some(first)
+    }
+
+    /// How one row picks its codes on the device: greedy, or a top-k draw
+    /// at top-p 1 within the device sort bound; `None` for a host draw.
+    fn of_row(selection: &CodeSelection<'_>) -> Option<Self> {
+        if selection.is_greedy() {
+            return Some(Self::Greedy);
+        }
+        match selection {
+            CodeSelection::Sample { params, .. }
+                if params.top_p >= 1.0 && (1..=DEVICE_TOP_K_LIMIT).contains(&params.top_k) =>
+            {
+                Some(Self::TopK {
+                    top_k: params.top_k,
+                    temperature: params.temperature,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The same selection, temperatures compared bit for bit.
+    fn same(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Greedy, Self::Greedy) => true,
+            (
+                Self::TopK { top_k, temperature },
+                Self::TopK {
+                    top_k: other_k,
+                    temperature: other_temperature,
+                },
+            ) => top_k == other_k && temperature.to_bits() == other_temperature.to_bits(),
+            _ => false,
+        }
+    }
+}
+
+/// The most ways a graphed frame's rows may pick their codes: one graph
+/// replay per way, and every way's graph kept
+/// ([`PREDICTOR_GRAPH_LIMITS`]`.max_graphs`, with greedy and the default
+/// draw among them).
+const MAX_FRAME_GROUPS: usize = PREDICTOR_GRAPH_LIMITS.max_graphs;
+
+/// A frame graph's key: its selection and its inputs' dtype.
+type PredictorGraphKey = (FrameSelection, DType);
+
+/// The code predictor's frame graphs ([`CodePredictor::resolve_graphs`]),
+/// or why there are none, and how many frames ran through them.
+struct PredictorGraphs {
+    graphs: std::result::Result<ShapeGraphs<PredictorGraphKey>, String>,
+    graphed_frames: AtomicU64,
+    /// Graphed frames whose rows picked their codes more than one way, and
+    /// their graph replays (one per way).
+    mixed_frames: AtomicU64,
+    mixed_replays: AtomicU64,
+    /// Frames the graphs could not take: a row that draws on the host, rows
+    /// that pick more than [`MAX_FRAME_GROUPS`] ways, or more rows than
+    /// [`PREDICTOR_GRAPH_ROWS`].
+    eager_frames: AtomicU64,
+    /// The heads' column ids `0..vocab` (U32), every frame's last input:
+    /// the top-k reads them from the graph's own copy, never from a cache
+    /// that could free them under a captured graph.
+    column_ids: std::sync::OnceLock<Tensor>,
+}
+
+impl PredictorGraphs {
+    fn off(reason: &str) -> Self {
+        Self {
+            graphs: Err(reason.into()),
+            graphed_frames: AtomicU64::new(0),
+            mixed_frames: AtomicU64::new(0),
+            mixed_replays: AtomicU64::new(0),
+            eager_frames: AtomicU64::new(0),
+            column_ids: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// `0..vocab` as U32 on `device`, uploaded once.
+    fn column_ids(&self, vocab: usize, device: &Device) -> Result<Tensor> {
+        if let Some(ids) = self.column_ids.get() {
+            return Ok(ids.clone());
+        }
+        let ids = Tensor::arange(0u32, vocab as u32, device)?;
+        Ok(self.column_ids.get_or_init(|| ids).clone())
+    }
+}
+
+/// The Gumbel noise for all `groups` codebooks of a frame of the sampling
+/// rows `members` of `selections`, `[groups, PREDICTOR_GRAPH_ROWS, keep]`
+/// (row `slot` of the frame is `members[slot]`): drawn from each row's own
+/// source codebook after codebook, `keep` draws each, as the eager frame
+/// draws it ([`resident_top_k_sample`]); spare rows get zeros.
+fn frame_noise(
+    selections: &mut [CodeSelection<'_>],
+    members: &[usize],
+    groups: usize,
+    keep: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut noise = vec![0f32; groups * PREDICTOR_GRAPH_ROWS * keep];
+    for (slot, &member) in members.iter().enumerate() {
+        let Some(CodeSelection::Sample { draw, .. }) = selections.get_mut(member) else {
+            return Err(Error::InferenceError(
+                "a sampled Qwen3-TTS predictor frame has a greedy row".into(),
+            ));
+        };
+        for group in 0..groups {
+            let start = (group * PREDICTOR_GRAPH_ROWS + slot) * keep;
+            noise[start..start + keep].copy_from_slice(&gumbel_noise(keep, &mut **draw));
+        }
+    }
+    Tensor::from_vec(noise, (groups, PREDICTOR_GRAPH_ROWS, keep), device).map_err(Error::from)
+}
+
+/// One codebook's codes of a dense frame (`logits` `[rows, vocab]`) as a
+/// `[rows]` U32 tensor, picked as the eager frame picks them, with the
+/// codebook's pre-drawn noise and the heads' column ids.
+fn dense_select(
+    logits: &Tensor,
+    selection: FrameSelection,
+    noise: &Tensor,
+    column_ids: &Tensor,
+    group: usize,
+) -> Result<Tensor> {
+    match selection {
+        FrameSelection::Greedy => argmax_device(logits),
+        FrameSelection::TopK { top_k, temperature } => resident_top_k_rows_with_noise(
+            logits,
+            top_k,
+            temperature,
+            &noise.i(group)?,
+            column_ids,
+        )?
+        .ok_or_else(|| {
+            Error::InferenceError("Qwen3-TTS predictor top-k frame drew nothing".into())
+        }),
+    }
+}
+
+/// One frame's acoustic codes for a batch of rows: on the device, one row
+/// of codes per codebook (`[groups, rows]` U32), and read back per row.
+pub struct AcousticCodeRows {
+    pub by_group: Tensor,
+    pub rows: Vec<Vec<u32>>,
+}
+
 /// Code Predictor model
 pub struct CodePredictor {
     codec_embeddings: Vec<CodecEmbedding>,
@@ -129,6 +343,7 @@ pub struct CodePredictor {
     device: Device,
     cfg: CodePredictorConfig,
     num_code_groups: usize,
+    graphs: PredictorGraphs,
 }
 
 /// One codebook's embedding table: dense, or (weight-only F16) stored in F16
@@ -241,6 +456,7 @@ impl CodePredictor {
             device: vb.device().clone(),
             cfg,
             num_code_groups,
+            graphs: PredictorGraphs::off("not resolved"),
         })
     }
 
@@ -378,6 +594,22 @@ impl CodePredictor {
         selection: &mut CodeSelection<'_>,
     ) -> Result<Vec<u32>> {
         self.validate_physical_workspace(cache)?;
+        if decode_rows::row_invariant(&self.device) {
+            // CUDA: a lone row takes the batch frame, padded as every frame.
+            return self
+                .generate_acoustic_code_rows_physical_batch(
+                    talker_hidden,
+                    semantic_embed,
+                    &mut [cache],
+                    std::slice::from_mut(selection),
+                )?
+                .rows
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    Error::InferenceError("Qwen3-TTS predictor frame returned no row".into())
+                });
+        }
         let initial_cursor = cache.context_len();
         let checkpoint = cache.logical_checkpoint();
         let result = self.generate_acoustic_codes_physical_inner(
@@ -481,8 +713,10 @@ impl CodePredictor {
     /// The predictor is an independently schedulable stage: every row begins at
     /// invocation cursor zero, executes the same two-token prefill, then advances
     /// through identical codebook positions. Rows with different cursor/shape or
-    /// codebook geometry are rejected and must be split by the scheduler. One
-    /// row deliberately falls back to the scalar implementation.
+    /// codebook geometry are rejected and must be split by the scheduler. Off
+    /// CUDA one row falls back to the scalar implementation; on CUDA every
+    /// frame runs the dense frame at 32 rows, graphed or eagerly
+    /// ([`Self::eager_dense_frame`]), and touches no invocation page.
     pub fn generate_acoustic_codes_physical_batch(
         &self,
         talker_hidden: &Tensor,
@@ -490,6 +724,25 @@ impl CodePredictor {
         caches: &mut [&mut CodePredictorPhysicalCache],
         selections: &mut [CodeSelection<'_>],
     ) -> Result<Vec<Vec<u32>>> {
+        self.generate_acoustic_code_rows_physical_batch(
+            talker_hidden,
+            semantic_embeds,
+            caches,
+            selections,
+        )
+        .map(|codes| codes.rows)
+    }
+
+    /// [`Self::generate_acoustic_codes_physical_batch`] that also keeps the
+    /// frame's codes on the device, `[groups, rows]`, for
+    /// [`Self::acoustic_embeddings_sum_rows`].
+    pub fn generate_acoustic_code_rows_physical_batch(
+        &self,
+        talker_hidden: &Tensor,
+        semantic_embeds: &Tensor,
+        caches: &mut [&mut CodePredictorPhysicalCache],
+        selections: &mut [CodeSelection<'_>],
+    ) -> Result<AcousticCodeRows> {
         // Inputs arrive at the talker's width; `small_to_mtp_projection`
         // narrows them to the predictor's `hidden_size` below.
         let input_hidden_size = self.cfg.input_hidden_size();
@@ -511,18 +764,28 @@ impl CodePredictor {
                 caches.len()
             )));
         }
-        if batch_size == 1 {
-            return self
-                .generate_acoustic_codes_physical(
-                    talker_hidden,
-                    semantic_embeds,
-                    caches[0],
-                    &mut selections[0],
-                )
-                .map(|codes| vec![codes]);
+        let row_invariant = decode_rows::row_invariant(&self.device);
+        if batch_size == 1 && !row_invariant {
+            let codes = self.generate_acoustic_codes_physical(
+                talker_hidden,
+                semantic_embeds,
+                caches[0],
+                &mut selections[0],
+            )?;
+            let by_group = Tensor::from_vec(codes.clone(), (codes.len(), 1), &self.device)?;
+            return Ok(AcousticCodeRows {
+                by_group,
+                rows: vec![codes],
+            });
         }
         for cache in caches.iter() {
             self.validate_physical_workspace(cache)?;
+        }
+        if let Some(codes) = self.graphed_frame(talker_hidden, semantic_embeds, selections)? {
+            return Ok(codes);
+        }
+        if row_invariant && batch_size <= DECODE_ROWS {
+            return self.eager_dense_frame(talker_hidden, semantic_embeds, selections);
         }
         let first = &*caches[0];
         if caches
@@ -561,7 +824,10 @@ impl CodePredictor {
                 .contiguous()?;
             let num_acoustic = self.lm_heads.len();
             if num_acoustic == 0 {
-                return Ok(vec![Vec::new(); batch_size]);
+                return Ok(AcousticCodeRows {
+                    by_group: Tensor::zeros((0, batch_size), DType::U32, &self.device)?,
+                    rows: vec![Vec::new(); batch_size],
+                });
             }
 
             let first_logits = self.lm_heads[0].forward(&last_hidden)?;
@@ -601,9 +867,12 @@ impl CodePredictor {
                 )));
             }
             super::record_qwen3_tts_host_readback();
-            Tensor::stack(&steps, 1)?
-                .to_vec2::<u32>()
-                .map_err(Error::from)
+            let by_group = Tensor::stack(&steps, 0)?;
+            let codes = by_group.to_vec2::<u32>()?;
+            let rows = (0..batch_size)
+                .map(|row| codes.iter().map(|group| group[row]).collect())
+                .collect();
+            Ok(AcousticCodeRows { by_group, rows })
         })();
         if let Err(error) = result {
             let mut rollback_error = None;
@@ -625,6 +894,513 @@ impl CodePredictor {
             };
         }
         result
+    }
+
+    /// Turns the frame graphs on (CUDA only, unless
+    /// [`QWEN3_TTS_PREDICTOR_GRAPHS_ENV`] is off) once a self-check passes:
+    /// for greedy frames and for the sub-talker default draw, two frames of
+    /// xorshift inputs at `input_dtype` (the talker's hidden dtype, which
+    /// every frame's inputs have), each captured or replayed and compared
+    /// with the eager dense frame bit for bit ([`ShapeGraphs::run`]). A
+    /// mismatch or a CUDA error leaves every frame on the eager paged path,
+    /// with the reason in the diagnostics.
+    pub(crate) fn resolve_graphs(&mut self, input_dtype: DType) {
+        let resolved = if predictor_graphs_requested() {
+            ShapeGraphs::resolve(
+                "Qwen3-TTS code predictor",
+                &self.device,
+                PREDICTOR_GRAPH_LIMITS,
+            )
+        } else {
+            Err(format!("{QWEN3_TTS_PREDICTOR_GRAPHS_ENV} is off"))
+        };
+        let resolved =
+            resolved.and_then(
+                |graphs| match self.self_check_graphs(&graphs, input_dtype) {
+                    Ok(()) if graphs.is_on() => Ok(graphs),
+                    Ok(()) => Err(format!(
+                        "self-check failed: {}",
+                        graphs.diagnostics()["off"]
+                    )),
+                    Err(error) => Err(format!("self-check failed: {error}")),
+                },
+            );
+        match &resolved {
+            Ok(_) => tracing::info!(
+                rows = PREDICTOR_GRAPH_ROWS,
+                "Qwen3-TTS code predictor frames run as CUDA graphs"
+            ),
+            Err(reason) if self.device.is_cuda() => tracing::warn!(
+                %reason,
+                "Qwen3-TTS code predictor frames run eagerly"
+            ),
+            Err(_) => {}
+        }
+        self.graphs.graphs = resolved;
+    }
+
+    /// Two frames per default selection through `graphs` (see
+    /// [`Self::resolve_graphs`]): the first captures the graph and checks a
+    /// replay against the eager frame, the second checks a replay over new
+    /// inputs, so a value baked into the graph shows. Then a frame whose
+    /// rows sample apart ([`Self::self_check_mixed_frame`]).
+    fn self_check_graphs(
+        &self,
+        graphs: &ShapeGraphs<PredictorGraphKey>,
+        input_dtype: DType,
+    ) -> Result<()> {
+        let width = self.cfg.input_hidden_size();
+        let groups = self.lm_heads.len();
+        let default = SubtalkerSampling::default();
+        let keep = default.top_k.min(self.cfg.vocab_size);
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut uniform = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let selections = [
+            FrameSelection::Greedy,
+            FrameSelection::TopK {
+                top_k: default.top_k,
+                temperature: default.temperature,
+            },
+        ];
+        for selection in selections {
+            for _ in 0..2 {
+                let mut hidden = || -> Result<Tensor> {
+                    let values = (0..PREDICTOR_GRAPH_ROWS * width)
+                        .map(|_| uniform() * 2.0 - 1.0)
+                        .collect::<Vec<_>>();
+                    Tensor::from_vec(values, (PREDICTOR_GRAPH_ROWS, 1, width), &self.device)?
+                        .to_dtype(input_dtype)
+                        .map_err(Error::from)
+                };
+                let talker_hidden = hidden()?;
+                let semantic = hidden()?;
+                let noise = match selection {
+                    FrameSelection::Greedy => Tensor::zeros(1, DType::F32, &self.device)?,
+                    FrameSelection::TopK { .. } => Tensor::from_vec(
+                        gumbel_noise(groups * PREDICTOR_GRAPH_ROWS * keep, &mut uniform),
+                        (groups, PREDICTOR_GRAPH_ROWS, keep),
+                        &self.device,
+                    )?,
+                };
+                let column_ids = self.graphs.column_ids(self.cfg.vocab_size, &self.device)?;
+                self.run_frame_graph(
+                    graphs,
+                    selection,
+                    &[talker_hidden, semantic, noise, column_ids],
+                )?;
+            }
+        }
+        self.self_check_mixed_frame(graphs, input_dtype, &mut uniform)
+    }
+
+    /// A frame of 6 rows that pick apart (greedy and the default draw,
+    /// interleaved) through `graphs` by group ([`Self::grouped_frame`],
+    /// both graphs captured by now) must pick the eager frame's codes and
+    /// leave every row's draw source where the eager frame leaves it.
+    fn self_check_mixed_frame(
+        &self,
+        graphs: &ShapeGraphs<PredictorGraphKey>,
+        input_dtype: DType,
+        uniform: &mut dyn FnMut() -> f32,
+    ) -> Result<()> {
+        const ROWS: usize = 6;
+        let width = self.cfg.input_hidden_size();
+        let mut hidden = || -> Result<Tensor> {
+            let values = (0..ROWS * width)
+                .map(|_| uniform() * 2.0 - 1.0)
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, (ROWS, 1, width), &self.device)?
+                .to_dtype(input_dtype)
+                .map_err(Error::from)
+        };
+        let talker_hidden = hidden()?;
+        let semantic = hidden()?;
+        let seeds = (0..ROWS as u64)
+            .map(|row| 0xD1B5_4A32_D192_ED03u64 ^ (row + 1))
+            .collect::<Vec<_>>();
+        let run = |graphed: bool| -> Result<(Vec<Vec<u32>>, Vec<u64>)> {
+            let mut states = seeds.clone();
+            let mut draws = states
+                .iter_mut()
+                .map(|state| {
+                    move || {
+                        *state ^= *state << 13;
+                        *state ^= *state >> 7;
+                        *state ^= *state << 17;
+                        (*state >> 40) as f32 / (1u64 << 24) as f32
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut selections = draws
+                .iter_mut()
+                .enumerate()
+                .map(|(row, draw)| {
+                    if row % 2 == 0 {
+                        CodeSelection::Greedy
+                    } else {
+                        CodeSelection::Sample {
+                            params: SubtalkerSampling::default(),
+                            draw,
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+            let codes = if graphed {
+                self.grouped_frame(
+                    &talker_hidden,
+                    &semantic,
+                    &mut selections,
+                    &mut |selection, inputs| self.run_frame_graph(graphs, selection, inputs),
+                )?
+                .ok_or_else(|| {
+                    Error::InferenceError("the mixed frame did not run as groups".into())
+                })?
+            } else {
+                self.eager_dense_frame(&talker_hidden, &semantic, &mut selections)?
+            };
+            drop(selections);
+            drop(draws);
+            Ok((codes.rows, states))
+        };
+        let graphed = run(true)?;
+        if graphed != run(false)? {
+            return Err(Error::InferenceError(
+                "a frame of rows that sample apart picked other codes through the graphs than eagerly"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The frame graphs' state and counters, for the model diagnostics.
+    pub fn graphs_diagnostics(&self) -> serde_json::Value {
+        let mut diagnostics = match &self.graphs.graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        };
+        diagnostics["rows"] = PREDICTOR_GRAPH_ROWS.into();
+        diagnostics["graphed_frames"] = self.graphs.graphed_frames.load(Relaxed).into();
+        diagnostics["mixed_frames"] = self.graphs.mixed_frames.load(Relaxed).into();
+        diagnostics["mixed_replays"] = self.graphs.mixed_replays.load(Relaxed).into();
+        diagnostics["eager_frames"] = self.graphs.eager_frames.load(Relaxed).into();
+        diagnostics
+    }
+
+    /// One frame through the graphs, when they are on and every row picks
+    /// its codes on the device ([`Self::grouped_frame`]): one graph replay
+    /// per way the rows pick them. The invocation caches are not touched (a
+    /// frame's KV is dense, inside the graph). `None` runs the eager frame.
+    fn graphed_frame(
+        &self,
+        talker_hidden: &Tensor,
+        semantic_embeds: &Tensor,
+        selections: &mut [CodeSelection<'_>],
+    ) -> Result<Option<AcousticCodeRows>> {
+        let Ok(graphs) = &self.graphs.graphs else {
+            return Ok(None);
+        };
+        if !graphs.is_on() {
+            return Ok(None);
+        }
+        let rows = talker_hidden.dim(0)?;
+        let fits = rows == selections.len()
+            && rows <= PREDICTOR_GRAPH_ROWS
+            && !self.lm_heads.is_empty()
+            && semantic_embeds.dims() == talker_hidden.dims();
+        let mut replays = 0u64;
+        let codes = if fits {
+            self.grouped_frame(
+                talker_hidden,
+                semantic_embeds,
+                selections,
+                &mut |selection, inputs| {
+                    replays += 1;
+                    self.run_frame_graph(graphs, selection, inputs)
+                },
+            )?
+        } else {
+            None
+        };
+        match &codes {
+            Some(_) => {
+                self.graphs.graphed_frames.fetch_add(1, Relaxed);
+                if replays > 1 {
+                    self.graphs.mixed_frames.fetch_add(1, Relaxed);
+                    self.graphs.mixed_replays.fetch_add(replays, Relaxed);
+                }
+            }
+            None => {
+                self.graphs.eager_frames.fetch_add(1, Relaxed);
+            }
+        }
+        Ok(codes)
+    }
+
+    /// One frame of rows that all pick their codes on the device, grouped
+    /// by how they pick them (greedy, or each top-k and temperature, first
+    /// seen first). Each group's rows, padded with zero rows to
+    /// [`PREDICTOR_GRAPH_ROWS`], run `run` with the group's selection and
+    /// frame inputs (talker hidden, semantic embeddings, the group's noise
+    /// drawn as the eager frame draws it, column ids), which returns its
+    /// `[codebooks, PREDICTOR_GRAPH_ROWS]` codes; every row's codes come
+    /// back in row order, read back once. A row's codes are its group's
+    /// frame's, which a padded frame makes those of the row alone, so rows
+    /// that sample apart stay on the graphs. `None` when a row draws on the
+    /// host or the rows pick more than [`MAX_FRAME_GROUPS`] ways.
+    fn grouped_frame(
+        &self,
+        talker_hidden: &Tensor,
+        semantic_embeds: &Tensor,
+        selections: &mut [CodeSelection<'_>],
+        run: &mut dyn FnMut(FrameSelection, &[Tensor]) -> Result<Tensor>,
+    ) -> Result<Option<AcousticCodeRows>> {
+        let rows = talker_hidden.dim(0)?;
+        let mut groups: Vec<(FrameSelection, Vec<usize>)> = Vec::new();
+        for (row, selection) in selections.iter().enumerate() {
+            let Some(selection) = FrameSelection::of_row(selection) else {
+                return Ok(None);
+            };
+            match groups.iter_mut().find(|(group, _)| group.same(selection)) {
+                Some((_, members)) => members.push(row),
+                None => groups.push((selection, vec![row])),
+            }
+        }
+        if groups.is_empty() || groups.len() > MAX_FRAME_GROUPS {
+            return Ok(None);
+        }
+        let codebooks = self.lm_heads.len();
+        let column_ids = self.graphs.column_ids(self.cfg.vocab_size, &self.device)?;
+        let single = groups.len() == 1;
+        let mut parts = Vec::with_capacity(groups.len());
+        let mut grouped_order = Vec::with_capacity(rows);
+        for (selection, members) in &groups {
+            let (talker, semantic) = if single {
+                (talker_hidden.clone(), semantic_embeds.clone())
+            } else {
+                let ids = members.iter().map(|&row| row as u32).collect::<Vec<_>>();
+                let ids = Tensor::from_vec(ids, members.len(), &self.device)?;
+                (
+                    talker_hidden.index_select(&ids, 0)?,
+                    semantic_embeds.index_select(&ids, 0)?,
+                )
+            };
+            let spare = PREDICTOR_GRAPH_ROWS - members.len();
+            let noise = match *selection {
+                FrameSelection::Greedy => Tensor::zeros(1, DType::F32, &self.device)?,
+                FrameSelection::TopK { top_k, .. } => frame_noise(
+                    selections,
+                    members,
+                    codebooks,
+                    top_k.min(self.cfg.vocab_size),
+                    &self.device,
+                )?,
+            };
+            let inputs = [
+                talker.pad_with_zeros(0, 0, spare)?,
+                semantic.pad_with_zeros(0, 0, spare)?,
+                noise,
+                column_ids.clone(),
+            ];
+            parts.push(run(*selection, &inputs)?.narrow(1, 0, members.len())?);
+            grouped_order.extend_from_slice(members);
+        }
+        let by_group = if single {
+            parts.remove(0).contiguous()?
+        } else {
+            // Grouped columns back in row order.
+            let mut position = vec![0u32; rows];
+            for (column, &row) in grouped_order.iter().enumerate() {
+                position[row] = column as u32;
+            }
+            Tensor::cat(&parts, 1)?
+                .index_select(&Tensor::from_vec(position, rows, &self.device)?, 1)?
+                .contiguous()?
+        };
+        super::record_qwen3_tts_host_readback();
+        let host = by_group.to_vec2::<u32>()?;
+        Ok(Some(AcousticCodeRows {
+            rows: (0..rows)
+                .map(|row| host.iter().map(|group| group[row]).collect())
+                .collect(),
+            by_group,
+        }))
+    }
+
+    /// [`Self::dense_frame_codes`] over `inputs` (talker hidden, semantic
+    /// embeddings, noise, column ids) through the graph of its key.
+    fn run_frame_graph(
+        &self,
+        graphs: &ShapeGraphs<PredictorGraphKey>,
+        selection: FrameSelection,
+        inputs: &[Tensor],
+    ) -> Result<Tensor> {
+        let bytes = |tensor: &Tensor| (tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64;
+        // A graph keeps a stable copy of each input, and its codes.
+        let codes =
+            (self.lm_heads.len() * PREDICTOR_GRAPH_ROWS * DType::U32.size_in_bytes()) as u64;
+        let retained = inputs.iter().map(bytes).sum::<u64>() + codes;
+        let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+            let [talker_hidden, semantic, noise, column_ids] = inputs else {
+                return Err(Error::InferenceError(format!(
+                    "Qwen3-TTS predictor graph received {} inputs, expected 4",
+                    inputs.len()
+                )));
+            };
+            Ok(vec![self.dense_frame_codes(
+                talker_hidden,
+                semantic,
+                selection,
+                noise,
+                column_ids,
+            )?])
+        };
+        let key = (selection, inputs[0].dtype());
+        graphs
+            .run(key, retained, inputs, &body)?
+            .pop()
+            .ok_or_else(|| {
+                Error::InferenceError("Qwen3-TTS predictor graph returned nothing".into())
+            })
+    }
+
+    /// One frame's codes, `[groups, rows]` U32, from `[rows, 1, input]`
+    /// talker hidden states and semantic embeddings, entirely on the device:
+    /// the eager batch frame with each row's KV in a dense per-row cache
+    /// instead of paged invocation pages ([`Attention::forward_dense`]) and
+    /// each codebook's noise read from `noise` (`[groups, rows, keep]`; any
+    /// tensor when greedy) and the heads' column ids from `column_ids`
+    /// (`0..vocab`). A pure function of its inputs and the weights, so a
+    /// CUDA graph can capture it.
+    fn dense_frame_codes(
+        &self,
+        talker_hidden: &Tensor,
+        semantic: &Tensor,
+        selection: FrameSelection,
+        noise: &Tensor,
+        column_ids: &Tensor,
+    ) -> Result<Tensor> {
+        self.dense_frame(talker_hidden, semantic, &mut |logits, group| {
+            dense_select(logits, selection, noise, column_ids, group)
+        })
+    }
+
+    /// A frame that the graphs do not take, on CUDA: the graphs' dense frame
+    /// run eagerly at [`DECODE_ROWS`] rows ([`Self::padded_dense_frame`]),
+    /// each row picking its codes through its own selection, as the eager
+    /// paged frame picks them. A row's logits are those of a graphed frame,
+    /// at any width, so its codes do not depend on the rows beside it or on
+    /// whether the graphs took the frame.
+    fn eager_dense_frame(
+        &self,
+        talker_hidden: &Tensor,
+        semantic_embeds: &Tensor,
+        selections: &mut [CodeSelection<'_>],
+    ) -> Result<AcousticCodeRows> {
+        let rows = talker_hidden.dim(0)?;
+        let by_group =
+            self.padded_dense_frame(talker_hidden, semantic_embeds, &mut |logits, _| {
+                select_codes(logits, rows, selections)
+            })?;
+        super::record_qwen3_tts_host_readback();
+        let host = by_group.to_vec2::<u32>()?;
+        Ok(AcousticCodeRows {
+            rows: (0..rows)
+                .map(|row| host.iter().map(|group| group[row]).collect())
+                .collect(),
+            by_group,
+        })
+    }
+
+    /// [`Self::dense_frame`] over `[rows, 1, input]` inputs padded with zero
+    /// rows to [`DECODE_ROWS`], so every kernel runs one shape at any width;
+    /// `select` sees the real rows' `[rows, vocab]` logits and returns their
+    /// `[rows]` codes (the spare rows take code 0). Returns the real rows'
+    /// codes, `[groups, rows]`.
+    fn padded_dense_frame(
+        &self,
+        talker_hidden: &Tensor,
+        semantic_embeds: &Tensor,
+        select: &mut dyn FnMut(&Tensor, usize) -> Result<Tensor>,
+    ) -> Result<Tensor> {
+        let rows = talker_hidden.dim(0)?;
+        if rows == 0 || rows > DECODE_ROWS || semantic_embeds.dims() != talker_hidden.dims() {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS padded predictor frame takes 1 to {DECODE_ROWS} matching rows, got {:?} and {:?}",
+                talker_hidden.dims(),
+                semantic_embeds.dims()
+            )));
+        }
+        let spare = DECODE_ROWS - rows;
+        let codes = self.dense_frame(
+            &talker_hidden.pad_with_zeros(0, 0, spare)?,
+            &semantic_embeds.pad_with_zeros(0, 0, spare)?,
+            &mut |logits, group| {
+                select(&logits.narrow(0, 0, rows)?, group)?
+                    .pad_with_zeros(0, 0, spare)
+                    .map_err(Error::from)
+            },
+        )?;
+        codes.narrow(1, 0, rows)?.contiguous().map_err(Error::from)
+    }
+
+    /// The dense frame's body: [`Self::dense_frame_codes`] with each
+    /// codebook's `[rows]` U32 codes picked by `select` from its
+    /// `[rows, vocab]` logits and the codebook's index.
+    fn dense_frame(
+        &self,
+        talker_hidden: &Tensor,
+        semantic: &Tensor,
+        select: &mut dyn FnMut(&Tensor, usize) -> Result<Tensor>,
+    ) -> Result<Tensor> {
+        let rows = talker_hidden.dim(0)?;
+        let input = Tensor::cat(&[talker_hidden, semantic], 1)?;
+        let hidden = match &self.small_to_mtp_projection {
+            Some(proj) => proj.forward(&input)?,
+            None => input,
+        };
+        let mut kv = (0..self.layers.len()).map(|_| None).collect::<Vec<_>>();
+        let hidden = self.dense_forward(&hidden, 0, &mut kv)?;
+        let last = hidden
+            .i((.., CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS - 1, ..))?
+            .contiguous()?;
+        let Some(first_head) = self.lm_heads.first() else {
+            return Tensor::zeros((0, rows), DType::U32, &self.device).map_err(Error::from);
+        };
+        let mut previous = select(&first_head.forward(&last)?, 0)?;
+        let mut codes = vec![previous.clone()];
+        for group_idx in 1..self.lm_heads.len() {
+            let ids = previous.reshape((rows, 1))?;
+            let mut step = self.codec_embeddings[group_idx - 1].forward(&ids)?;
+            if let Some(proj) = &self.small_to_mtp_projection {
+                step = proj.forward(&step)?;
+            }
+            let step = self.dense_forward(&step, group_idx + 1, &mut kv)?;
+            let logits = self.lm_heads[group_idx].forward(&step)?;
+            previous = select(&logits.i((.., 0, ..))?, group_idx)?;
+            codes.push(previous.clone());
+        }
+        Tensor::stack(&codes, 0).map_err(Error::from)
+    }
+
+    /// The layers and final norm over `x` (`[rows, seq, hidden]`) at
+    /// positions `start_pos..`, each layer attending over its dense cache in
+    /// `kv` (grown here).
+    fn dense_forward(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        kv: &mut [Option<(Tensor, Tensor)>],
+    ) -> Result<Tensor> {
+        let mut hidden = x.clone();
+        for (layer, cache) in self.layers.iter().zip(kv.iter_mut()) {
+            hidden = layer.forward_dense(&hidden, start_pos, cache)?;
+        }
+        self.norm.forward(&hidden).map_err(Error::from)
     }
 
     fn forward_physical_hidden_uncommitted(
@@ -841,6 +1617,27 @@ impl CodePredictor {
         Ok(sum)
     }
 
+    /// [`Self::get_acoustic_embeddings_sum`] of every row at once, from
+    /// `codes_by_group` (`[groups, rows]` U32 on the device): one gather per
+    /// codebook for all rows, added in the per-row order, so each row of the
+    /// `[rows, 1, codec_embed_dim]` result is bit for bit its per-row sum. A
+    /// step runs 15 gathers and 14 adds instead of that many per row.
+    pub fn acoustic_embeddings_sum_rows(&self, codes_by_group: &Tensor) -> Result<Tensor> {
+        let (groups, _rows) = codes_by_group.dims2()?;
+        if groups == 0 || groups != self.codec_embeddings.len() {
+            return Err(Error::InvalidInput(format!(
+                "Expected {} acoustic code groups, got {groups}",
+                self.codec_embeddings.len()
+            )));
+        }
+        let codes = codes_by_group.contiguous()?;
+        let mut sum = self.codec_embeddings[0].forward(&codes.i(0)?)?;
+        for (group_idx, embedding) in self.codec_embeddings.iter().enumerate().skip(1) {
+            sum = sum.broadcast_add(&embedding.forward(&codes.i(group_idx)?)?)?;
+        }
+        sum.unsqueeze(1).map_err(Error::from)
+    }
+
     fn codec_embedding_row(&self, group_idx: usize, code: u32) -> Result<Tensor> {
         if self.device.is_cuda() {
             self.codec_embeddings[group_idx]
@@ -931,6 +1728,20 @@ impl Layer {
         let mlp_out = self.mlp.forward(&normed)?;
         x.broadcast_add(&mlp_out).map_err(Error::from)
     }
+
+    fn forward_dense(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        kv: &mut Option<(Tensor, Tensor)>,
+    ) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out = self.self_attn.forward_dense(&normed, start_pos, kv)?;
+        let x = x.broadcast_add(&attn_out)?;
+        let normed = self.post_attention_layernorm.forward(&x)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        x.broadcast_add(&mlp_out).map_err(Error::from)
+    }
 }
 
 /// Multi-head attention for code predictor
@@ -944,7 +1755,81 @@ struct Attention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    rope_inv_freq: Vec<f32>,
+    rope: PredictorRope,
+}
+
+/// Positions whose RoPE tables [`PredictorRope`] keeps: a frame runs
+/// positions 0 to 16 (the two-token prefill, then one per codebook).
+const ROPE_CACHED_POSITIONS: usize = 32;
+
+/// The predictor's RoPE tables. Every frame runs the same few positions, so
+/// the cos/sin rows of the first [`ROPE_CACHED_POSITIONS`] positions are
+/// built once per dtype and device by [`build_rope_window_full`] (host
+/// angles, device cos/sin) and each call takes a view of its rows: each
+/// position's row depends on that position alone, so the values are the
+/// ones a per-call build gives, without its upload and six kernels for q
+/// and for k in every layer at every codebook.
+struct PredictorRope {
+    inv_freq: Vec<f32>,
+    tables: std::sync::Mutex<Vec<RopeTable>>,
+}
+
+struct RopeTable {
+    dtype: DType,
+    device: candle_core::DeviceLocation,
+    cos: Tensor,
+    sin: Tensor,
+}
+
+impl PredictorRope {
+    fn new(inv_freq: Vec<f32>) -> Self {
+        Self {
+            inv_freq,
+            tables: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// cos/sin `[seq_len, head_dim]` for positions `start_pos..`.
+    fn window(
+        &self,
+        seq_len: usize,
+        start_pos: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        if start_pos + seq_len > ROPE_CACHED_POSITIONS {
+            return build_rope_window_full(seq_len, start_pos, &self.inv_freq, device, dtype);
+        }
+        let mut tables = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+        let location = device.location();
+        let index = match tables
+            .iter()
+            .position(|table| table.dtype == dtype && table.device == location)
+        {
+            Some(index) => index,
+            None => {
+                let (cos, sin) = build_rope_window_full(
+                    ROPE_CACHED_POSITIONS,
+                    0,
+                    &self.inv_freq,
+                    device,
+                    dtype,
+                )?;
+                tables.push(RopeTable {
+                    dtype,
+                    device: location,
+                    cos,
+                    sin,
+                });
+                tables.len() - 1
+            }
+        };
+        let table = &tables[index];
+        Ok((
+            table.cos.narrow(0, start_pos, seq_len)?,
+            table.sin.narrow(0, start_pos, seq_len)?,
+        ))
+    }
 }
 
 impl Attention {
@@ -997,7 +1882,7 @@ impl Attention {
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim,
-            rope_inv_freq: build_rope_inv_freq(head_dim, cfg.rope_theta),
+            rope: PredictorRope::new(build_rope_inv_freq(head_dim, cfg.rope_theta)),
         })
     }
 
@@ -1020,13 +1905,9 @@ impl Attention {
         let seq_len = x.dim(1)?;
         let half_dim = self.head_dim / 2;
 
-        let (cos, sin) = build_rope_window_full(
-            seq_len,
-            start_pos,
-            &self.rope_inv_freq,
-            x.device(),
-            x.dtype(),
-        )?;
+        let (cos, sin) = self
+            .rope
+            .window(seq_len, start_pos, x.device(), x.dtype())?;
 
         let cos = cos.unsqueeze(0)?.unsqueeze(2)?;
         let sin = sin.unsqueeze(0)?.unsqueeze(2)?;
@@ -1098,6 +1979,94 @@ impl Attention {
         let out =
             out.to_dtype(compute_dtype)?
                 .reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
+        self.o_proj.forward(&out).map_err(Error::from)
+    }
+
+    /// [`Self::forward_physical_batch`] over a dense per-row cache instead
+    /// of paged KV: `x` is `[rows, seq, hidden]` at positions
+    /// `start_pos..`, and `kv` holds the rows' earlier keys and values (F32
+    /// `[rows, kv_heads, positions, head_dim]`) and gains this call's. Query
+    /// head `h` reads key head `h / group`, as the paged kernels and the
+    /// reference's `repeat_kv` do; scores, the causal mask of a multi-token
+    /// call and the softmax run in F32, as the paged kernels run them.
+    fn forward_dense(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        kv: &mut Option<(Tensor, Tensor)>,
+    ) -> Result<Tensor> {
+        let (rows, seq, _) = x.dims3()?;
+        let (heads, kv_heads, head_dim) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        if kv_heads == 0 || heads % kv_heads != 0 {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS predictor has {heads} query heads for {kv_heads} key heads"
+            )));
+        }
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((rows, seq, heads, head_dim))?;
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape((rows, seq, kv_heads, head_dim))?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape((rows, seq, kv_heads, head_dim))?;
+        let q = self.apply_qk_norm(q, heads, seq, &self.q_norm)?;
+        let k = self.apply_qk_norm(k, kv_heads, seq, &self.k_norm)?;
+        let q = self.apply_rope(q, start_pos)?;
+        let k = self.apply_rope(k, start_pos)?;
+        let k = k.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
+        let v = v.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
+        let (keys, values) = match kv.take() {
+            Some((keys, values)) => (
+                Tensor::cat(&[&keys, &k], 2)?,
+                Tensor::cat(&[&values, &v], 2)?,
+            ),
+            None => (k, v),
+        };
+        let context = keys.dim(2)?;
+        if context != start_pos + seq {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS dense predictor cache holds {context} positions at {start_pos}+{seq}"
+            )));
+        }
+        // [rows, kv_heads, group * seq, head_dim]: query head h = kv * group
+        // + g, row g * seq + s of its key head's block.
+        let group = heads / kv_heads;
+        let queries = q
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((rows, kv_heads, group * seq, head_dim))?
+            .to_dtype(DType::F32)?;
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let mut scores = (queries.matmul(&keys.t()?)? * scale)?;
+        if seq > 1 {
+            let mask = (0..group * seq)
+                .flat_map(|row| {
+                    let position = start_pos + row % seq;
+                    (0..context).map(move |key| {
+                        if key > position {
+                            f32::NEG_INFINITY
+                        } else {
+                            0.0
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mask = Tensor::from_vec(mask, (group * seq, context), x.device())?;
+            scores = scores.broadcast_add(&mask)?;
+        }
+        let out = ops::softmax_last_dim(&scores)?
+            .matmul(&values)?
+            .to_dtype(x.dtype())?
+            .reshape((rows, heads, seq, head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((rows, seq, heads * head_dim))?;
+        *kv = Some((keys, values));
         self.o_proj.forward(&out).map_err(Error::from)
     }
 
@@ -1294,12 +2263,47 @@ fn select_codes(
     if selections.iter().all(CodeSelection::is_greedy) {
         return argmax_device(&logits);
     }
+    if let Some(codes) = select_resident_top_k_rows(&logits, selections)? {
+        return Ok(codes);
+    }
     let codes = selections
         .iter_mut()
         .enumerate()
         .map(|(row, selection)| selection.select(&logits.i(row)?))
         .collect::<Result<Vec<_>>>()?;
     Tensor::cat(&codes, 0).map_err(Error::from)
+}
+
+/// Every row's code in one device pass when all rows sample the sub-talker
+/// way (top-k with top-p 1) with the same `top_k` and temperature, which
+/// every request with default sub-talker settings does: each row's code is
+/// the one [`CodeSelection::select`] picks for it alone, but the 15
+/// codebooks of a frame no longer run a sampling chain and a noise upload per
+/// row. `None` sends the rows through [`CodeSelection::select`] one by one.
+fn select_resident_top_k_rows(
+    logits: &Tensor,
+    selections: &mut [CodeSelection<'_>],
+) -> Result<Option<Tensor>> {
+    let shared = |selection: &CodeSelection<'_>| match selection {
+        CodeSelection::Sample { params, .. } if !params.is_greedy() && params.top_p >= 1.0 => {
+            Some((params.top_k, params.temperature.to_bits()))
+        }
+        _ => None,
+    };
+    let Some(first) = selections.first().and_then(shared) else {
+        return Ok(None);
+    };
+    if selections.len() < 2 || selections.iter().any(|selection| shared(selection) != Some(first)) {
+        return Ok(None);
+    }
+    let mut draws = selections
+        .iter_mut()
+        .map(|selection| match selection {
+            CodeSelection::Sample { draw, .. } => &mut **draw,
+            CodeSelection::Greedy => unreachable!("every row samples"),
+        })
+        .collect::<Vec<&mut (dyn FnMut() -> f32 + '_)>>();
+    resident_top_k_sample_rows(logits, first.0, f32::from_bits(first.1), &mut draws)
 }
 
 /// Argmax over the last axis as U32 on the logits' device: `[1]` for one row,
@@ -1478,7 +2482,7 @@ mod tests {
             num_heads: 2,
             num_kv_heads: 1,
             head_dim: 2,
-            rope_inv_freq: build_rope_inv_freq(2, cfg.rope_theta),
+            rope: PredictorRope::new(build_rope_inv_freq(2, cfg.rope_theta)),
         };
         let layer = Layer {
             input_layernorm: RmsNorm::new(Tensor::ones(4, DType::F32, device).unwrap(), 1e-5),
@@ -1519,6 +2523,7 @@ mod tests {
             device: device.clone(),
             cfg,
             num_code_groups: 3,
+            graphs: PredictorGraphs::off("test predictor"),
         }
     }
 
@@ -1672,7 +2677,7 @@ mod tests {
         let semantic = Tensor::cat(&[&semantic_a, &semantic_b], 0).unwrap();
         let mut caches = [&mut batch_a, &mut batch_b];
         let batch_codes = model
-            .generate_acoustic_codes_physical_batch(
+            .generate_acoustic_code_rows_physical_batch(
                 &talker,
                 &semantic,
                 &mut caches,
@@ -1680,7 +2685,12 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(batch_codes, vec![scalar_codes_a, scalar_codes_b]);
+        assert_eq!(batch_codes.rows, vec![scalar_codes_a, scalar_codes_b]);
+        // The device codes are the same codes, one row per codebook.
+        assert_eq!(
+            batch_codes.by_group.t().unwrap().to_vec2::<u32>().unwrap(),
+            batch_codes.rows
+        );
         assert_eq!((batch_a.context_len(), batch_b.context_len()), (4, 4));
         let completions_a = batch_a.take_completed_writes();
         let completions_b = batch_b.take_completed_writes();
@@ -1798,6 +2808,782 @@ mod tests {
 
         assert_eq!(actual, vec![expected]);
         assert_eq!(fallback.context_len(), scalar.context_len());
+    }
+
+    /// Unstructured weights: xorshift values in [-0.5, 0.5).
+    fn xorshift_values(state: &mut u64, len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|_| {
+                *state ^= *state << 13;
+                *state ^= *state >> 7;
+                *state ^= *state << 17;
+                (*state >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+            })
+            .collect()
+    }
+
+    fn random_tensor(state: &mut u64, shape: &[usize], device: &Device) -> Tensor {
+        let len = shape.iter().product();
+        Tensor::from_vec(xorshift_values(state, len), shape, device).unwrap()
+    }
+
+    /// A predictor of xorshift weights with grouped query heads (4 query
+    /// heads on 2 key heads of 4 dims), two layers, 4 codebooks of 16 codes
+    /// and an `input_width` input (projected to the hidden 8 when wider).
+    fn random_predictor(input_width: usize, device: &Device) -> CodePredictor {
+        random_predictor_sized(input_width, (8, 4, 2, 4, 16, 4, 16), device)
+    }
+
+    /// [`random_predictor`] of other sizes: `(hidden, query heads, key
+    /// heads, head dim, codes, codebooks, MLP width)`.
+    fn random_predictor_sized(
+        input_width: usize,
+        (hidden, heads, kv_heads, head_dim, vocab, groups, mlp): (
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        ),
+        device: &Device,
+    ) -> CodePredictor {
+        let mut state = 0x2545_F491_4F6C_DD1Du64 ^ input_width as u64;
+        let mut linear = |output: usize, input: usize| -> ProjectionLinear {
+            Linear::new(random_tensor(&mut state, &[output, input], device), None).into()
+        };
+        let mut layers = Vec::new();
+        for _ in 0..2 {
+            layers.push(Layer {
+                input_layernorm: RmsNorm::new(
+                    Tensor::ones(hidden, DType::F32, device).unwrap(),
+                    1e-5,
+                ),
+                self_attn: Attention {
+                    q_proj: linear(heads * head_dim, hidden),
+                    k_proj: linear(kv_heads * head_dim, hidden),
+                    v_proj: linear(kv_heads * head_dim, hidden),
+                    o_proj: linear(hidden, heads * head_dim),
+                    q_norm: RmsNorm::new(Tensor::ones(head_dim, DType::F32, device).unwrap(), 1e-5),
+                    k_norm: RmsNorm::new(Tensor::ones(head_dim, DType::F32, device).unwrap(), 1e-5),
+                    num_heads: heads,
+                    num_kv_heads: kv_heads,
+                    head_dim,
+                    rope: PredictorRope::new(build_rope_inv_freq(head_dim, 10_000.0)),
+                },
+                post_attention_layernorm: RmsNorm::new(
+                    Tensor::ones(hidden, DType::F32, device).unwrap(),
+                    1e-5,
+                ),
+                mlp: Mlp {
+                    gate_proj: linear(mlp, hidden),
+                    up_proj: linear(mlp, hidden),
+                    down_proj: linear(hidden, mlp),
+                },
+            });
+        }
+        let lm_heads = (0..groups).map(|_| linear(vocab, hidden)).collect();
+        let small_to_mtp_projection = (input_width != hidden).then(|| {
+            Linear::new(
+                random_tensor(&mut state, &[hidden, input_width], device),
+                None,
+            )
+        });
+        let codec_embeddings = (0..groups)
+            .map(|_| {
+                CodecEmbedding::Dense(Embedding::new(
+                    random_tensor(&mut state, &[vocab, input_width], device),
+                    input_width,
+                ))
+            })
+            .collect();
+        let mut model = tiny_predictor_with_input_width(input_width, device);
+        model.cfg.hidden_size = hidden;
+        model.cfg.num_attention_heads = heads;
+        model.cfg.num_key_value_heads = kv_heads;
+        model.cfg.head_dim = head_dim;
+        model.cfg.num_hidden_layers = 2;
+        model.cfg.vocab_size = vocab;
+        model.cfg.num_code_groups = groups;
+        model.codec_embeddings = codec_embeddings;
+        model.small_to_mtp_projection = small_to_mtp_projection;
+        model.layers = layers;
+        model.norm = RmsNorm::new(Tensor::ones(hidden, DType::F32, device).unwrap(), 1e-5);
+        model.lm_heads = lm_heads;
+        model.num_code_groups = groups;
+        model
+    }
+
+    /// A CPU arena for [`random_predictor`]: two layers of 2 key heads of 4
+    /// dims, pages of 2 tokens.
+    fn random_arena(instance: u64) -> (Arc<dyn KvArena>, Vec<KvLayerBinding>) {
+        random_arena_sized(instance, 4, 64)
+    }
+
+    /// [`random_arena`] with key heads of `head_dim` dims and `pages` pages.
+    fn random_arena_sized(
+        instance: u64,
+        head_dim: usize,
+        pages: usize,
+    ) -> (Arc<dyn KvArena>, Vec<KvLayerBinding>) {
+        let bindings = (0..2)
+            .map(|layer| KvLayerBinding {
+                model_layer: layer,
+                physical_layer: layer,
+            })
+            .collect::<Vec<_>>();
+        let arena = CpuKvArena::new(KvArenaConfig {
+            id: KvArenaId {
+                model_instance: ModelInstanceId::new(instance),
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                generation: 1,
+            },
+            group: KvGroupId::new(0),
+            page_tokens: 2,
+            capacity_pages: pages as u32,
+            growth: None,
+            dtype: DType::F32,
+            layers: bindings
+                .iter()
+                .map(|&binding| KvLayerConfig {
+                    binding,
+                    num_kv_heads: 2,
+                    key_head_dim: head_dim as u32,
+                    value_head_dim: head_dim as u32,
+                })
+                .collect(),
+        })
+        .unwrap();
+        (Arc::new(arena), bindings)
+    }
+
+    /// A predictor wide enough that the CPU's matmul rounds a row
+    /// differently at different row counts (hidden 64, MLP 96, 4 query
+    /// heads on 2 key heads of 16 dims, 4 codebooks of 48 codes), and its
+    /// arena (`rows` invocation workspaces).
+    fn wide_predictor(
+        rows: usize,
+        instance: u64,
+        device: &Device,
+    ) -> (CodePredictor, Arc<dyn KvArena>, Vec<KvLayerBinding>) {
+        let model = random_predictor_sized(64, (64, 4, 2, 16, 48, 4, 96), device);
+        let (arena, bindings) = random_arena_sized(instance, 16, rows * 8);
+        (model, arena, bindings)
+    }
+
+    /// D3: on CUDA's path (forced here) a frame the graphs do not take runs
+    /// the graphs' dense frame eagerly at 32 rows: a request's logits at
+    /// every codebook are bit for bit the same alone and beside 1 to 31
+    /// other requests, wherever it sits, and a lone request takes the same
+    /// frame through the single-row entry.
+    #[test]
+    fn padded_eager_frame_logits_are_the_same_alone_and_in_any_batch() {
+        let _force = decode_rows::ForceRowInvariant::new(true);
+        let device = Device::Cpu;
+        let (model, _, _) = wide_predictor(1, 0, &device);
+        let requests = 32;
+        let inputs = (0..requests)
+            .map(|request| {
+                let mut state = 0xA11CE_u64 + request as u64;
+                (
+                    random_tensor(&mut state, &[1, 1, 64], &device),
+                    random_tensor(&mut state, &[1, 1, 64], &device),
+                )
+            })
+            .collect::<Vec<_>>();
+        // Each request's logits bits per codebook, in `order`'s frame.
+        let frame = |order: &[usize]| {
+            let talker =
+                Tensor::cat(&order.iter().map(|&r| &inputs[r].0).collect::<Vec<_>>(), 0).unwrap();
+            let semantic =
+                Tensor::cat(&order.iter().map(|&r| &inputs[r].1).collect::<Vec<_>>(), 0).unwrap();
+            let mut seen = vec![Vec::new(); order.len()];
+            model
+                .padded_dense_frame(&talker, &semantic, &mut |logits, _| {
+                    for (row, values) in logits.to_vec2::<f32>().unwrap().into_iter().enumerate() {
+                        seen[row].push(values.into_iter().map(f32::to_bits).collect::<Vec<_>>());
+                    }
+                    argmax_device(logits)
+                })
+                .unwrap();
+            let mut by_request = vec![Vec::new(); requests];
+            for (slot, &request) in order.iter().enumerate() {
+                by_request[request] = std::mem::take(&mut seen[slot]);
+            }
+            by_request
+        };
+        let alone = (0..requests)
+            .map(|request| frame(&[request]).swap_remove(request))
+            .collect::<Vec<_>>();
+        for order in [
+            vec![3, 0],
+            vec![7, 1, 30, 12, 5],
+            (0..requests).rev().collect::<Vec<_>>(),
+        ] {
+            let batched = frame(&order);
+            for &request in &order {
+                assert!(
+                    batched[request] == alone[request],
+                    "request {request} differs in a frame of {}",
+                    order.len()
+                );
+            }
+        }
+    }
+
+    /// D3: on CUDA's path (forced here) a request's codes, and where its
+    /// draw source ends, are the same alone and beside requests that pick
+    /// their codes otherwise (greedy, the sub-talker draw, another top-k
+    /// and temperature, a top-p draw on the host), through the eager frame
+    /// the graphs leave such mixed frames to.
+    #[test]
+    fn padded_eager_frame_codes_are_the_same_beside_other_selections() {
+        let _force = decode_rows::ForceRowInvariant::new(true);
+        let device = Device::Cpu;
+        let settings = [
+            None,
+            Some(SubtalkerSampling::default()),
+            Some(SubtalkerSampling {
+                do_sample: true,
+                temperature: 0.7,
+                top_k: 7,
+                top_p: 1.0,
+            }),
+            Some(SubtalkerSampling {
+                do_sample: true,
+                temperature: 1.1,
+                top_k: 20,
+                top_p: 0.8,
+            }),
+        ];
+        let requests = 8;
+        let inputs = (0..requests)
+            .map(|request| {
+                let mut state = 0xF00D_u64 + request as u64;
+                (
+                    random_tensor(&mut state, &[1, 1, 64], &device),
+                    random_tensor(&mut state, &[1, 1, 64], &device),
+                )
+            })
+            .collect::<Vec<_>>();
+        let run = |order: &[usize], instance: u64| {
+            let (model, arena, bindings) = wide_predictor(order.len(), instance, &device);
+            let mut caches = (0..order.len())
+                .map(|slot| test_cache(arena.clone(), &bindings, slot as u32 * 8, 0))
+                .collect::<Vec<_>>();
+            let mut rngs = order
+                .iter()
+                .map(|&request| super::super::SimpleRng::seeded(request as u64 + 5))
+                .collect::<Vec<_>>();
+            let mut draws = rngs
+                .iter_mut()
+                .map(|rng| move || rng.next_f32())
+                .collect::<Vec<_>>();
+            let mut selections = order
+                .iter()
+                .zip(draws.iter_mut())
+                .map(
+                    |(&request, draw)| match settings[request % settings.len()] {
+                        Some(params) => CodeSelection::Sample { params, draw },
+                        None => CodeSelection::Greedy,
+                    },
+                )
+                .collect::<Vec<_>>();
+            let talker =
+                Tensor::cat(&order.iter().map(|&r| &inputs[r].0).collect::<Vec<_>>(), 0).unwrap();
+            let semantic =
+                Tensor::cat(&order.iter().map(|&r| &inputs[r].1).collect::<Vec<_>>(), 0).unwrap();
+            let mut refs = caches.iter_mut().collect::<Vec<_>>();
+            let codes = if order.len() == 1 {
+                vec![model
+                    .generate_acoustic_codes_physical(
+                        &talker,
+                        &semantic,
+                        refs[0],
+                        &mut selections[0],
+                    )
+                    .unwrap()]
+            } else {
+                model
+                    .generate_acoustic_code_rows_physical_batch(
+                        &talker,
+                        &semantic,
+                        &mut refs,
+                        &mut selections,
+                    )
+                    .unwrap()
+                    .rows
+            };
+            drop(selections);
+            drop(draws);
+            let mut by_request = vec![(Vec::new(), 0u64); requests];
+            for ((&request, codes), rng) in order.iter().zip(codes).zip(&rngs) {
+                by_request[request] = (codes, rng.state);
+            }
+            by_request
+        };
+        let alone = (0..requests)
+            .map(|request| run(&[request], 60 + request as u64).swap_remove(request))
+            .collect::<Vec<_>>();
+        for (index, order) in [vec![1, 0, 3], (0..requests).rev().collect::<Vec<_>>()]
+            .into_iter()
+            .enumerate()
+        {
+            let batched = run(&order, 70 + index as u64);
+            for &request in &order {
+                assert_eq!(batched[request], alone[request], "request {request}");
+            }
+        }
+    }
+
+    /// Rows that pick their codes apart (greedy, the sub-talker draw, two
+    /// other top-k and temperatures) run one padded frame per way through
+    /// the graphs (here the dense frame they capture, run directly): every
+    /// row's codes and draw source are those of the eager frame over the
+    /// same rows and of its own frame alone, wherever it sits. A host draw,
+    /// or more ways than the graphs keep, leaves the frame to the eager
+    /// path.
+    #[test]
+    fn grouped_frames_pick_each_rows_own_codes() {
+        let device = Device::Cpu;
+        let (model, _, _) = wide_predictor(1, 0, &device);
+        let sample = |top_k: usize, temperature: f32, top_p: f32| {
+            Some(SubtalkerSampling {
+                do_sample: true,
+                temperature,
+                top_k,
+                top_p,
+            })
+        };
+        let ways = [
+            None,
+            Some(SubtalkerSampling::default()),
+            sample(7, 0.7, 1.0),
+            sample(20, 1.1, 1.0),
+        ];
+        let requests = 8;
+        let inputs = (0..requests)
+            .map(|request| {
+                let mut state = 0x6E0F_u64 + request as u64;
+                (
+                    random_tensor(&mut state, &[1, 1, 64], &device),
+                    random_tensor(&mut state, &[1, 1, 64], &device),
+                )
+            })
+            .collect::<Vec<_>>();
+        // Each request's codes and draw-source state, or `None` when the
+        // grouped frame turns the frame down.
+        let run = |order: &[usize], settings: &[Option<SubtalkerSampling>], grouped: bool| {
+            let mut rngs = order
+                .iter()
+                .map(|&request| super::super::SimpleRng::seeded(request as u64 + 9))
+                .collect::<Vec<_>>();
+            let mut draws = rngs
+                .iter_mut()
+                .map(|rng| move || rng.next_f32())
+                .collect::<Vec<_>>();
+            let mut selections = order
+                .iter()
+                .zip(draws.iter_mut())
+                .map(
+                    |(&request, draw)| match settings[request % settings.len()] {
+                        Some(params) => CodeSelection::Sample { params, draw },
+                        None => CodeSelection::Greedy,
+                    },
+                )
+                .collect::<Vec<_>>();
+            let talker =
+                Tensor::cat(&order.iter().map(|&r| &inputs[r].0).collect::<Vec<_>>(), 0).unwrap();
+            let semantic =
+                Tensor::cat(&order.iter().map(|&r| &inputs[r].1).collect::<Vec<_>>(), 0).unwrap();
+            let codes = if grouped {
+                model
+                    .grouped_frame(
+                        &talker,
+                        &semantic,
+                        &mut selections,
+                        &mut |selection, inputs| {
+                            let [talker, semantic, noise, ids] = inputs else {
+                                panic!("four frame inputs");
+                            };
+                            model.dense_frame_codes(talker, semantic, selection, noise, ids)
+                        },
+                    )
+                    .unwrap()
+            } else {
+                Some(
+                    model
+                        .eager_dense_frame(&talker, &semantic, &mut selections)
+                        .unwrap(),
+                )
+            };
+            drop(selections);
+            drop(draws);
+            codes.map(|codes| {
+                let mut by_request = vec![(Vec::new(), 0u64); requests];
+                for ((&request, codes), rng) in order.iter().zip(codes.rows).zip(&rngs) {
+                    by_request[request] = (codes, rng.state);
+                }
+                by_request
+            })
+        };
+        let alone = (0..requests)
+            .map(|request| run(&[request], &ways, true).unwrap().swap_remove(request))
+            .collect::<Vec<_>>();
+        for order in [vec![1, 0, 2], vec![5, 2, 7, 0, 3, 6, 1, 4]] {
+            let grouped = run(&order, &ways, true).unwrap();
+            let eager = run(&order, &ways, false).unwrap();
+            for &request in &order {
+                assert_eq!(
+                    grouped[request], alone[request],
+                    "request {request} grouped"
+                );
+                assert_eq!(eager[request], alone[request], "request {request} eagerly");
+            }
+        }
+        let host = [None, sample(50, 0.9, 0.8)];
+        assert!(run(&[0, 1], &host, true).is_none());
+        let five = [
+            None,
+            Some(SubtalkerSampling::default()),
+            sample(7, 0.7, 1.0),
+            sample(20, 1.1, 1.0),
+            sample(3, 0.5, 1.0),
+        ];
+        assert!(run(&[0, 1, 2, 3, 4], &five, true).is_none());
+        assert!(run(&[0, 1, 2, 3], &five, true).is_some());
+    }
+
+    /// The dense layers (the graphs' body) give the paged layers' hidden
+    /// states, every position of the two-token prefill (so the causal mask)
+    /// and the next codebook positions, within F32 rounding.
+    #[test]
+    fn dense_layers_match_the_paged_layers() {
+        let device = Device::Cpu;
+        let model = random_predictor(8, &device);
+        let (arena, bindings) = random_arena(741);
+        let mut cache = test_cache(arena, &bindings, 0, 0);
+        let mut state = 0x51ED_2701u64;
+        let mut kv = vec![None, None];
+        for (start_pos, seq) in [(0, 2), (2, 1), (3, 1)] {
+            let x = random_tensor(&mut state, &[1, seq, 8], &device);
+            let (paged, prepared) = model
+                .forward_physical_hidden_uncommitted(&x, start_pos, &mut cache)
+                .unwrap();
+            cache.commit_prepared(prepared).unwrap();
+            let dense = model.dense_forward(&x, start_pos, &mut kv).unwrap();
+            let paged = paged.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let dense = dense.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            for (index, (paged, dense)) in paged.iter().zip(&dense).enumerate() {
+                let error = (paged - dense).abs();
+                assert!(
+                    error <= 1e-5 * paged.abs().max(1.0),
+                    "position {start_pos}+{seq} element {index}: paged {paged} dense {dense}"
+                );
+            }
+        }
+    }
+
+    /// The dense frame picks the eager paged frame's codes, greedy and with
+    /// a sub-talker draw whose noise is drawn before the frame, with spare
+    /// zero rows up to the graph rows, and leaves every row's draw source
+    /// where the eager frame leaves it: three rows, xorshift weights and
+    /// inputs, with and without the input projection.
+    #[test]
+    fn dense_frame_picks_the_eager_frames_codes() {
+        let device = Device::Cpu;
+        let rows = 3;
+        for input_width in [8, 12] {
+            let model = random_predictor(input_width, &device);
+            let mut state = 0x9E37_79B9u64 ^ input_width as u64;
+            let talker = random_tensor(&mut state, &[rows, 1, input_width], &device);
+            let semantic = random_tensor(&mut state, &[rows, 1, input_width], &device);
+            let pad = |tensor: &Tensor| {
+                tensor
+                    .pad_with_zeros(0, 0, PREDICTOR_GRAPH_ROWS - rows)
+                    .unwrap()
+            };
+            let params = SubtalkerSampling {
+                do_sample: true,
+                temperature: 0.9,
+                top_k: 5,
+                top_p: 1.0,
+            };
+            for sampled in [false, true] {
+                let (arena, bindings) = random_arena(742 + input_width as u64);
+                let mut caches = (0..rows)
+                    .map(|row| test_cache(arena.clone(), &bindings, row as u32 * 8, 0))
+                    .collect::<Vec<_>>();
+                let mut eager_draws = (0..rows)
+                    .map(|row| super::super::SimpleRng::seeded(row as u64 + 17))
+                    .collect::<Vec<_>>();
+                let eager = {
+                    let mut draws = eager_draws
+                        .iter_mut()
+                        .map(|rng| move || rng.next_f32())
+                        .collect::<Vec<_>>();
+                    let mut selections = draws
+                        .iter_mut()
+                        .map(|draw| {
+                            if sampled {
+                                CodeSelection::Sample { params, draw }
+                            } else {
+                                CodeSelection::Greedy
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let mut refs = caches.iter_mut().collect::<Vec<_>>();
+                    model
+                        .generate_acoustic_codes_physical_batch(
+                            &talker,
+                            &semantic,
+                            &mut refs,
+                            &mut selections,
+                        )
+                        .unwrap()
+                };
+                let mut dense_draws = (0..rows)
+                    .map(|row| super::super::SimpleRng::seeded(row as u64 + 17))
+                    .collect::<Vec<_>>();
+                let (selection, noise) = {
+                    let mut draws = dense_draws
+                        .iter_mut()
+                        .map(|rng| move || rng.next_f32())
+                        .collect::<Vec<_>>();
+                    let mut selections = draws
+                        .iter_mut()
+                        .map(|draw| {
+                            if sampled {
+                                CodeSelection::Sample { params, draw }
+                            } else {
+                                CodeSelection::Greedy
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let selection = FrameSelection::of(&selections).unwrap();
+                    let noise = if sampled {
+                        frame_noise(&mut selections, &[0, 1, 2], 4, 5, &device).unwrap()
+                    } else {
+                        Tensor::zeros(1, DType::F32, &device).unwrap()
+                    };
+                    (selection, noise)
+                };
+                let ids = Tensor::arange(0u32, 16, &device).unwrap();
+                let codes = model
+                    .dense_frame_codes(&pad(&talker), &pad(&semantic), selection, &noise, &ids)
+                    .unwrap();
+                let dense = codes
+                    .narrow(1, 0, rows)
+                    .unwrap()
+                    .t()
+                    .unwrap()
+                    .to_vec2::<u32>()
+                    .unwrap();
+                assert_eq!(dense, eager, "width {input_width}, sampled {sampled}");
+                for (eager, dense) in eager_draws.iter().zip(&dense_draws) {
+                    assert_eq!(eager.state, dense.state, "width {input_width}");
+                }
+                if !sampled {
+                    // Unpadded, the dense frame picks the same codes.
+                    let unpadded = model
+                        .dense_frame_codes(&talker, &semantic, selection, &noise, &ids)
+                        .unwrap()
+                        .t()
+                        .unwrap()
+                        .to_vec2::<u32>()
+                        .unwrap();
+                    assert_eq!(unpadded, eager, "width {input_width}");
+                }
+            }
+        }
+    }
+
+    /// A graphed frame needs every row to pick its codes the same resident
+    /// way: all greedy, or one sub-talker top-k and temperature at top-p 1.
+    #[test]
+    fn graphed_frames_need_one_resident_selection() {
+        let sample = |top_k: usize, temperature: f32, top_p: f32| SubtalkerSampling {
+            do_sample: true,
+            temperature,
+            top_k,
+            top_p,
+        };
+        let of = |params: &[Option<SubtalkerSampling>]| {
+            let mut draws = params.iter().map(|_| || 0.5f32).collect::<Vec<_>>();
+            let selections = params
+                .iter()
+                .zip(draws.iter_mut())
+                .map(|(params, draw)| match params {
+                    Some(params) => CodeSelection::Sample {
+                        params: *params,
+                        draw,
+                    },
+                    None => CodeSelection::Greedy,
+                })
+                .collect::<Vec<_>>();
+            FrameSelection::of(&selections)
+        };
+        assert_eq!(of(&[]), None);
+        assert_eq!(of(&[None, None]), Some(FrameSelection::Greedy));
+        assert_eq!(
+            of(&[None, Some(SubtalkerSampling::greedy())]),
+            Some(FrameSelection::Greedy)
+        );
+        assert_eq!(
+            of(&[Some(sample(50, 0.9, 1.0))]),
+            Some(FrameSelection::TopK {
+                top_k: 50,
+                temperature: 0.9
+            })
+        );
+        for apart in [
+            vec![None, Some(sample(50, 0.9, 1.0))],
+            vec![Some(sample(50, 0.9, 1.0)), Some(sample(40, 0.9, 1.0))],
+            vec![Some(sample(50, 0.9, 1.0)), Some(sample(50, 0.8, 1.0))],
+            vec![Some(sample(50, 0.9, 0.95))],
+            vec![Some(sample(0, 0.9, 1.0))],
+            vec![Some(sample(DEVICE_TOP_K_LIMIT + 1, 0.9, 1.0))],
+        ] {
+            assert_eq!(of(&apart), None, "{apart:?}");
+        }
+    }
+
+    /// Off CUDA the graphs never resolve and price nothing; the kill switch
+    /// turns their pricing off on CUDA and names itself.
+    #[test]
+    fn predictor_graphs_run_on_cuda_only_and_obey_the_kill_switch() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(QWEN3_TTS_PREDICTOR_GRAPHS_ENV);
+        let device = Device::Cpu;
+        std::env::remove_var(QWEN3_TTS_PREDICTOR_GRAPHS_ENV);
+        assert_eq!(qwen3_tts_predictor_graph_device_bytes(BackendKind::Cpu), 0);
+        assert_eq!(
+            qwen3_tts_predictor_graph_device_bytes(BackendKind::Metal),
+            0
+        );
+        assert_eq!(
+            qwen3_tts_predictor_graph_device_bytes(BackendKind::Cuda),
+            128 * MIB
+        );
+        let mut model = tiny_predictor(&device);
+        model.resolve_graphs(DType::F32);
+        assert_eq!(
+            model.graphs_diagnostics()["off"],
+            "shape graphs run on CUDA only"
+        );
+        std::env::set_var(QWEN3_TTS_PREDICTOR_GRAPHS_ENV, "0");
+        assert_eq!(qwen3_tts_predictor_graph_device_bytes(BackendKind::Cuda), 0);
+        model.resolve_graphs(DType::F32);
+        let off = model.graphs_diagnostics()["off"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        match previous {
+            Some(value) => std::env::set_var(QWEN3_TTS_PREDICTOR_GRAPHS_ENV, value),
+            None => std::env::remove_var(QWEN3_TTS_PREDICTOR_GRAPHS_ENV),
+        }
+        assert!(off.contains(QWEN3_TTS_PREDICTOR_GRAPHS_ENV), "{off}");
+    }
+
+    /// The cached RoPE rows are the per-call tables bit for bit, for every
+    /// window a frame runs and beyond the cache, in each compute dtype.
+    #[test]
+    fn cached_rope_windows_equal_per_call_tables() {
+        let device = Device::Cpu;
+        let inv_freq = build_rope_inv_freq(128, 1_000_000.0);
+        let rope = PredictorRope::new(inv_freq.clone());
+        let bits = |tensor: &Tensor| {
+            tensor
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            for (seq_len, start_pos) in [(2, 0), (1, 2), (1, 9), (1, 16), (3, 29), (2, 31)] {
+                let (cos, sin) = rope.window(seq_len, start_pos, &device, dtype).unwrap();
+                let (expected_cos, expected_sin) =
+                    build_rope_window_full(seq_len, start_pos, &inv_freq, &device, dtype).unwrap();
+                let window = format!("{dtype:?} {start_pos}+{seq_len}");
+                assert_eq!(cos.dtype(), dtype);
+                assert_eq!(cos.dims(), expected_cos.dims());
+                assert_eq!(bits(&cos), bits(&expected_cos), "{window}");
+                assert_eq!(bits(&sin), bits(&expected_sin), "{window}");
+            }
+        }
+        assert_eq!(rope.tables.lock().unwrap().len(), 3);
+    }
+
+    /// A step's acoustic embedding sums gathered for all rows at once equal
+    /// each row's own sum bit for bit (the same codebook order), over 15
+    /// xorshift tables of mixed magnitudes, dense F32 and widened F16, so a
+    /// different order would round differently.
+    #[test]
+    fn batched_acoustic_embedding_sums_equal_each_rows_own() {
+        let device = Device::Cpu;
+        let mut state = 0x51ED_2701_9E37_79B9u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let (groups, vocab, width, rows) = (15, 8, 4, 5);
+        for f16 in [false, true] {
+            let mut model = tiny_predictor(&device);
+            model.codec_embeddings = (0..groups)
+                .map(|_| {
+                    let values = (0..vocab * width)
+                        .map(|_| {
+                            let unit = (next() >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0;
+                            unit * 2f32.powi((next() % 12) as i32 - 6)
+                        })
+                        .collect::<Vec<_>>();
+                    let table = Tensor::from_vec(values, (vocab, width), &device).unwrap();
+                    CodecEmbedding::new(Embedding::new(table, width), f16.then_some(&device))
+                        .unwrap()
+                })
+                .collect();
+            let codes = (0..rows)
+                .map(|_| {
+                    (0..groups)
+                        .map(|_| (next() % vocab as u64) as u32)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let by_group = (0..groups)
+                .flat_map(|group| codes.iter().map(move |row| row[group]))
+                .collect::<Vec<_>>();
+            let by_group = Tensor::from_vec(by_group, (groups, rows), &device).unwrap();
+            let batched = model.acoustic_embeddings_sum_rows(&by_group).unwrap();
+            assert_eq!(batched.dims(), &[rows, 1, width]);
+            for (row, row_codes) in codes.iter().enumerate() {
+                let bits = |tensor: Tensor| {
+                    tensor
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                        .into_iter()
+                        .map(f32::to_bits)
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    bits(batched.i(row).unwrap()),
+                    bits(model.get_acoustic_embeddings_sum(row_codes).unwrap()),
+                    "row {row}, f16 tables {f16}"
+                );
+            }
+        }
     }
 
     /// QTTS-4: one predictor frame reads its codes back once (it read one

@@ -28,6 +28,71 @@ pub(super) fn install_parakeet_decode_budget(
     request.install_prepared_sequence_input_tokens(1, sequence_tokens)
 }
 
+/// Nemotron's decode budget is a short clip's emittable-label bound
+/// (`E × max_symbols`), not the portable token context: its recurrent
+/// predictor keeps no per-token state. A caller's `max_tokens` is kept below
+/// the bound by the sequence clamp.
+pub(super) fn install_nemotron_decode_budget(
+    request: &mut EngineCoreRequest,
+    max_emittable_tokens: usize,
+) -> Result<()> {
+    if request.asr_auto_max_tokens {
+        request.params.max_tokens = max_emittable_tokens;
+    }
+    let sequence_tokens = max_emittable_tokens
+        .checked_add(1)
+        .ok_or_else(|| Error::Overloaded("Nemotron decode budget overflowed".into()))?;
+    request.install_prepared_sequence_input_tokens(1, sequence_tokens)
+}
+
+/// Whether a Nemotron request decodes as a retained row: audio one pass
+/// covers (at most the 30 s chunk hint) without speaker attribution. Longer
+/// audio, chunked streams and speaker attribution keep the atomic graph.
+pub(super) fn nemotron_decodes_as_row(
+    plan: &crate::engine::PlannedAsrChunks,
+    request: &EngineCoreRequest,
+) -> bool {
+    !plan.requires_chunk_path() && !request.asr_task.speaker_attribution
+}
+
+/// Whether a Granite Speech 5.0 request of `prompt_tokens` and a
+/// `planned_budget` runs as a retained row: its KV claim (prompt and budget)
+/// must fit one retained sequence, which the retained pool always holds, so
+/// no row can wait on KV admission for good. Its prompt must also leave room
+/// in the context. Otherwise it runs as one atomic invocation.
+pub(super) fn granite_speech5_decodes_as_row(
+    prompt_tokens: usize,
+    planned_budget: usize,
+    context_limit: usize,
+) -> bool {
+    GraniteSpeech5AsrModel::retained_sequence_fits(prompt_tokens, planned_budget)
+        && prompt_tokens < context_limit
+}
+
+/// Decodes a request's audio on the host worker, recording the time as its
+/// model's `decode_audio` phase.
+fn decode_asr_request_audio(request: &EngineCoreRequest) -> Result<(Vec<f32>, u32)> {
+    let started = Instant::now();
+    let decoded = crate::engine::decode_request_audio_with_rate(request)?;
+    if let Some(variant) = request.model_variant {
+        crate::engine::metrics::record_asr_phase(
+            variant.dir_name(),
+            crate::engine::metrics::AsrPhase::DecodeAudio,
+            started.elapsed(),
+        );
+    }
+    Ok(decoded)
+}
+
+/// Records `started`'s elapsed time as `variant`'s host `features` phase.
+fn record_host_features(variant: ModelVariant, started: Instant) {
+    crate::engine::metrics::record_asr_phase(
+        variant.dir_name(),
+        crate::engine::metrics::AsrPhase::Features,
+        started.elapsed(),
+    );
+}
+
 impl RuntimeService {
     pub(super) async fn prepare_qwen3_asr_shape_for_binding(
         &self,
@@ -76,12 +141,11 @@ impl RuntimeService {
                 ))
             })?;
         let model_for_shape = model.clone();
-        let (prepared, geometry) = self
+        let (prepared, geometry, features) = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
                     &model_for_shape,
                     variant,
@@ -98,6 +162,17 @@ impl RuntimeService {
                 let geometry = (!long_form)
                     .then(|| {
                         model_for_shape.audio_preparation_row_geometry(samples.len(), sample_rate)
+                    })
+                    .transpose()?;
+                // The resample and log-mel run here, on a host worker, so the
+                // device job runs only the upload and the audio tower.
+                let features = (!long_form)
+                    .then(|| {
+                        let started = Instant::now();
+                        let features =
+                            model_for_shape.prepare_qwen3_host_features(&samples, sample_rate);
+                        record_host_features(variant, started);
+                        features
                     })
                     .transpose()?;
                 let input_tokens = (!long_form)
@@ -119,12 +194,21 @@ impl RuntimeService {
                         context_limit,
                     )?;
                 }
-                Ok((request, geometry))
+                Ok((request, geometry, features))
             })
             .await?;
         let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
             .map_err(|_| Error::Overloaded("Qwen3 ASR retained host input exceeds u64".into()))?;
-        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        // The features are held beside the request until the encode drops
+        // them.
+        let prepared_host_bytes = features
+            .as_ref()
+            .map(Qwen3AsrHostFeatures::host_bytes)
+            .transpose()?
+            .unwrap_or(0)
+            .checked_add(retained_host_bytes)
+            .ok_or_else(|| Error::Overloaded("Qwen3 ASR prepared host bytes overflow".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
         let initial_bridge = self.coordinator.bridge_preparation_admission(job)?;
 
         if prepared.uses_asr_long_form_atomic() {
@@ -150,7 +234,7 @@ impl RuntimeService {
         })?;
         let encoder_resources = asr_encoder_retained_resources(
             self.backend_router.context().backend_kind,
-            retained_host_bytes,
+            prepared_host_bytes,
             geometry.retained_artifact_bytes,
         )?;
         let encoder_spec = JobSpec {
@@ -166,7 +250,7 @@ impl RuntimeService {
             .admit_observed_from_preparation(
                 initial_bridge,
                 encoder_spec,
-                JobResourceObservation::host(retained_host_bytes),
+                JobResourceObservation::host(prepared_host_bytes),
             )
             .await
         {
@@ -178,17 +262,17 @@ impl RuntimeService {
                 return Err(error);
             }
         };
-        let (samples, sample_rate) = prepared
-            .prepared_asr_audio_for_executor()?
-            .ok_or_else(|| Error::InferenceError("Qwen3 ASR decoded audio was lost".into()))?;
+        let features = features.ok_or_else(|| {
+            Error::InferenceError("normal Qwen3 ASR route lost its host features".to_string())
+        })?;
         let outcome = self
             .qwen_asr_encoder_batcher
             .submit(QwenAsrEncoderPending {
                 job: encoder_job,
                 contract: encoder_contract,
                 model,
-                samples,
-                sample_rate,
+                model_label: variant.dir_name(),
+                features,
                 geometry,
                 retained_host_bytes,
                 cancellation: PreparationCancellation::default(),
@@ -307,12 +391,11 @@ impl RuntimeService {
                 Error::ModelLoadError(format!("Whisper model {variant} has no effective context"))
             })?;
         let model_for_shape = model.clone();
-        let (prepared, geometry) = self
+        let (prepared, geometry, features) = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
                     &model_for_shape,
                     variant,
@@ -331,16 +414,36 @@ impl RuntimeService {
                         model_for_shape.whisper_window_preparation_geometry(&samples, sample_rate)
                     })
                     .transpose()?;
+                // The resample and log-mel run here, on a host worker, so the
+                // device job runs only the upload and the encoder.
+                let features = (!long_form)
+                    .then(|| {
+                        let started = Instant::now();
+                        let features =
+                            model_for_shape.prepare_whisper_host_features(&samples, sample_rate);
+                        record_host_features(variant, started);
+                        features
+                    })
+                    .transpose()?;
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
                 if long_form {
                     request.install_prepared_asr_long_form_atomic(plan)?;
                 }
-                Ok((request, geometry))
+                Ok((request, geometry, features))
             })
             .await?;
         let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
             .map_err(|_| Error::Overloaded("Whisper retained input exceeds u64".into()))?;
-        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        // The features are held beside the request until the encode drops
+        // them.
+        let prepared_host_bytes = features
+            .as_ref()
+            .map(WhisperHostFeatures::host_bytes)
+            .transpose()?
+            .unwrap_or(0)
+            .checked_add(retained_host_bytes)
+            .ok_or_else(|| Error::Overloaded("Whisper prepared host bytes overflow".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
         if prepared.uses_asr_long_form_atomic() {
             let (spec, observation) = match self.coordinator_job_for_request(&prepared) {
@@ -375,7 +478,7 @@ impl RuntimeService {
         };
         let resources = match asr_encoder_retained_resources(
             self.backend_router.context().backend_kind,
-            retained_host_bytes,
+            prepared_host_bytes,
             geometry.retained_artifact_bytes,
         ) {
             Ok(resources) => resources,
@@ -398,7 +501,7 @@ impl RuntimeService {
             .admit_observed_from_preparation(
                 bridge,
                 prep_spec,
-                JobResourceObservation::host(retained_host_bytes),
+                JobResourceObservation::host(prepared_host_bytes),
             )
             .await
         {
@@ -410,17 +513,17 @@ impl RuntimeService {
                 return Err(error);
             }
         };
-        let (samples, sample_rate) = prepared
-            .prepared_asr_audio_for_executor()?
-            .ok_or_else(|| Error::InferenceError("Whisper decoded audio was lost".into()))?;
+        let features = features.ok_or_else(|| {
+            Error::InferenceError("Whisper normal route lost its host features".into())
+        })?;
         let outcome = self
             .whisper_encoder_batcher
             .submit(WhisperEncoderPending {
                 job: prep_job,
                 contract: encoder_contract,
                 model: model.clone(),
-                samples,
-                sample_rate,
+                model_label: variant.dir_name(),
+                features,
                 geometry,
                 retained_host_bytes,
                 cancellation: PreparationCancellation::default(),
@@ -551,18 +654,32 @@ impl RuntimeService {
                 ))
             })?;
         let model_for_shape = model.clone();
-        let (prepared, geometry) = self
+        let (prepared, geometry, host_audio) = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let decision = model_for_shape.vibevoice_retained_preparation_decision(
                     samples.len(),
                     sample_rate,
                     request.asr_language_for_execution(),
                     request.asr_prompt_for_execution(),
                 )?;
+                // The resample, normalization and padding run here, on a host
+                // worker, so the device job runs only the upload.
+                let host_audio = matches!(decision, VibeVoiceAsrPreparationDecision::Retained(_))
+                    .then(|| {
+                        let started = Instant::now();
+                        let host_audio = model_for_shape.prepare_vibevoice_retained_host_audio(
+                            &samples,
+                            sample_rate,
+                            request.asr_language_for_execution(),
+                            request.asr_prompt_for_execution(),
+                        );
+                        record_host_features(variant, started);
+                        host_audio
+                    })
+                    .transpose()?;
                 let audio_seconds = samples.len() as f32 / sample_rate.max(1) as f32;
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
                 match decision {
@@ -578,7 +695,7 @@ impl RuntimeService {
                             geometry.prompt_tokens,
                             context_limit,
                         )?;
-                        Ok((request, Some(geometry)))
+                        Ok((request, Some(geometry), host_audio))
                     }
                     VibeVoiceAsrPreparationDecision::LegacyInvocation => {
                         let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
@@ -600,7 +717,7 @@ impl RuntimeService {
                             request.streaming,
                         );
                         request.install_prepared_asr_long_form_atomic(plan)?;
-                        Ok((request, None))
+                        Ok((request, None, None))
                     }
                 }
             })
@@ -609,7 +726,17 @@ impl RuntimeService {
             u64::try_from(retained_engine_request_input_bytes(&prepared)?).map_err(|_| {
                 Error::Overloaded("VibeVoice ASR retained input exceeds u64".into())
             })?;
-        job.record_materialized_usage(JobResourceObservation::host(retained_request_host_bytes))?;
+        // The host audio is held beside the request until the upload drops
+        // it.
+        let host_audio_bytes = host_audio
+            .as_ref()
+            .map(VibeVoiceAsrHostAudio::host_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        let prepared_host_bytes = retained_request_host_bytes
+            .checked_add(host_audio_bytes)
+            .ok_or_else(|| Error::Overloaded("VibeVoice prepared host bytes overflow".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
         if prepared.uses_asr_long_form_atomic() {
             let (spec, observation) = match self.coordinator_job_for_request(&prepared) {
@@ -642,7 +769,11 @@ impl RuntimeService {
             .ok_or_else(|| Error::Overloaded("VibeVoice retained host bytes overflow".into()))?;
         let resources = asr_encoder_retained_resources(
             self.backend_router.context().backend_kind,
-            retained_host_bytes,
+            retained_host_bytes
+                .checked_add(host_audio_bytes)
+                .ok_or_else(|| {
+                    Error::Overloaded("VibeVoice prepared host bytes overflow".into())
+                })?,
             geometry.retained_device_bytes,
         )?;
         let preparation_spec = JobSpec {
@@ -658,7 +789,7 @@ impl RuntimeService {
             .admit_observed_from_preparation(
                 bridge,
                 preparation_spec,
-                JobResourceObservation::host(retained_request_host_bytes),
+                JobResourceObservation::host(prepared_host_bytes),
             )
             .await
         {
@@ -670,17 +801,17 @@ impl RuntimeService {
                 return Err(error);
             }
         };
-        let (samples, sample_rate) = prepared
-            .prepared_asr_audio_for_executor()?
-            .ok_or_else(|| Error::InferenceError("VibeVoice decoded audio was lost".into()))?;
+        let host_audio = host_audio.ok_or_else(|| {
+            Error::InferenceError("VibeVoice normal route lost its host audio".into())
+        })?;
         let outcome = self
             .vibevoice_encoder_batcher
             .submit(VibeVoiceEncoderPending {
                 job: preparation_job,
                 contract: preparation_contract,
                 model: model.clone(),
-                samples,
-                sample_rate,
+                model_label: variant.dir_name(),
+                host_audio,
                 language: prepared.asr_language_for_execution().map(str::to_owned),
                 prompt: prepared.asr_prompt_for_execution().map(str::to_owned),
                 geometry,
@@ -787,12 +918,11 @@ impl RuntimeService {
                 ))
             })?;
         let model_for_shape = model.clone();
-        let (prepared, geometry) = self
+        let (prepared, shaped) = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
                     &model_for_shape,
                     variant,
@@ -806,34 +936,50 @@ impl RuntimeService {
                     request.streaming,
                 );
                 let long_form = plan.requires_chunk_path();
-                // Granite's retained decoder is not quality-certified: the
-                // real model can collapse to tokenizer id 0 for every output
-                // step while its invocation-scoped physical route produces
-                // the expected transcript. Keep retained preparation behind
-                // the model's truthful capability declaration so production
-                // requests use the correctness-proven atomic route.
-                // A native-timestamp request needs the atomic route, which
-                // selects the timestamp task; retained preparation is ASR-only.
+                // A single-segment request runs on the retained route when
+                // the loaded model offers it (`IZWI_GRANITE_SPEECH_RETAINED_DECODE`):
+                // the route emits the atomic route's tokens on the real
+                // checkpoint, and neither route recovers a single segment
+                // from a loop or truncation, which only the chunk route
+                // (always atomic) does. A native-timestamp request needs the
+                // atomic route, which selects the timestamp task; retained
+                // preparation is ASR-only.
                 let retained = !long_form
                     && !request.asr_native_word_timestamps
                     && model_for_shape.supports_resumable_prefill();
-                let geometry = retained
+                // The log-mel runs here, on a host worker, and travels with
+                // the request, so the device job runs only the encoder.
+                let shaped = retained
                     .then(|| {
-                        model_for_shape.granite_speech_retained_preparation_geometry(
+                        let started = Instant::now();
+                        let shaped = model_for_shape.granite_speech_retained_preparation_features(
                             &samples,
                             sample_rate,
                             request.asr_language_for_execution(),
                             request.asr_prompt_for_execution(),
-                        )
+                        );
+                        record_host_features(variant, started);
+                        shaped
                     })
                     .transpose()?;
+                let audio_seconds = samples.len() as f32 / sample_rate.max(1) as f32;
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
-                if let Some(geometry) = geometry {
+                if let Some((features, geometry)) = shaped {
+                    // Admission claims the sequence's pages for `max_tokens`
+                    // in full: narrow an omitted budget to the one the
+                    // decode uses for this audio's duration, so concurrent
+                    // rows share the retained pool instead of one row
+                    // claiming the automatic 2,048 tokens.
+                    request.params.max_tokens =
+                        crate::runtime::asr::granite_asr_planned_max_tokens(
+                            &request,
+                            audio_seconds,
+                        );
                     request.install_prepared_sequence_input_tokens(
                         geometry.prompt_tokens,
                         context_limit,
                     )?;
-                    Ok((request, Some(geometry)))
+                    Ok((request, Some((features, geometry))))
                 } else {
                     request.install_prepared_asr_long_form_atomic(plan)?;
                     Ok((request, None))
@@ -842,7 +988,20 @@ impl RuntimeService {
             .await?;
         let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
             .map_err(|_| Error::Overloaded("Granite Speech retained input exceeds u64".into()))?;
-        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        // The features are held beside the request until the encode drops
+        // them.
+        let features_host_bytes = match &shaped {
+            Some((features, _)) => features
+                .host_bytes()
+                .ok_or_else(|| Error::Overloaded("Granite Speech feature bytes overflow".into()))?,
+            None => 0,
+        };
+        let prepared_host_bytes = retained_host_bytes
+            .checked_add(features_host_bytes)
+            .ok_or_else(|| {
+                Error::Overloaded("Granite Speech prepared host bytes overflow".into())
+            })?;
+        job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
         if prepared.uses_asr_long_form_atomic() {
             let (spec, observation) = self.coordinator_job_for_request(&prepared)?;
@@ -860,7 +1019,7 @@ impl RuntimeService {
                 }
             };
         }
-        let geometry = geometry.ok_or_else(|| {
+        let (features, geometry) = shaped.ok_or_else(|| {
             Error::InferenceError("Granite Speech normal route lost preparation geometry".into())
         })?;
         let artifact_host_bytes = u64::try_from(
@@ -874,7 +1033,11 @@ impl RuntimeService {
             })?;
         let resources = asr_encoder_retained_resources(
             self.backend_router.context().backend_kind,
-            total_retained_host_bytes,
+            total_retained_host_bytes
+                .checked_add(features_host_bytes)
+                .ok_or_else(|| {
+                    Error::Overloaded("Granite Speech prepared host bytes overflow".into())
+                })?,
             geometry.retained_device_bytes,
         )?;
         let prep_spec = JobSpec {
@@ -890,7 +1053,7 @@ impl RuntimeService {
             .admit_observed_from_preparation(
                 bridge,
                 prep_spec,
-                JobResourceObservation::host(retained_host_bytes),
+                JobResourceObservation::host(prepared_host_bytes),
             )
             .await
         {
@@ -902,17 +1065,14 @@ impl RuntimeService {
                 return Err(error);
             }
         };
-        let (samples, sample_rate) = prepared
-            .prepared_asr_audio_for_executor()?
-            .ok_or_else(|| Error::InferenceError("Granite Speech decoded audio was lost".into()))?;
         let outcome = self
             .granite_speech_encoder_batcher
             .submit(GraniteSpeechEncoderPending {
                 job: prep_job,
                 contract: preparation_contract,
                 model: model.clone(),
-                samples,
-                sample_rate,
+                model_label: variant.dir_name(),
+                features,
                 language: prepared.asr_language_for_execution().map(str::to_owned),
                 prompt: prepared.asr_prompt_for_execution().map(str::to_owned),
                 geometry,
@@ -1018,8 +1178,7 @@ impl RuntimeService {
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let plan = crate::engine::asr_route_plan(
                     &samples,
                     sample_rate,
@@ -1277,8 +1436,7 @@ impl RuntimeService {
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let plan = crate::engine::asr_route_plan(
                     &samples,
                     sample_rate,
@@ -1405,6 +1563,230 @@ impl RuntimeService {
             .map_err(|failure| failure.error)
     }
 
+    /// Voxtral Mini 4B Realtime offline transcription. Audio within the
+    /// realtime session ceiling runs as a closed realtime stream: it is
+    /// decoded on a host worker and encoded once, alone (the ragged encoder
+    /// batch attends with an eager quadratic softmax, and the decode
+    /// dominates anyway); its prompt then prefills alone and its frames
+    /// decode batched across rows. Longer audio and speaker attribution keep
+    /// the atomic route, which chunks long audio inside its dispatch.
+    pub(super) async fn prepare_voxtral_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::Voxtral)
+            || request.prepared_asr_execution_shape().is_some()
+            || request.is_realtime_asr_session()
+        {
+            return Ok((request, job));
+        }
+        let variant = request.model_variant.expect("validated Voxtral variant");
+        let model = self
+            .model_registry
+            .get_voxtral_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("Voxtral model {variant} is not loaded"))
+            })?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Voxtral ASR preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let prompt_tokens = model.offline_prompt_tokens()?;
+        let model_for_plan = model.clone();
+        let (prepared, row_frames, features) = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
+                let plan = crate::engine::asr_route_plan(
+                    &samples,
+                    sample_rate,
+                    &model_for_plan
+                        .asr_route_capabilities()
+                        .for_request(&request),
+                    request.streaming,
+                );
+                let row_frames =
+                    if plan.requires_chunk_path() || request.asr_task.speaker_attribution {
+                        None
+                    } else {
+                        model_for_plan.offline_row_frames(samples.len(), sample_rate)?
+                    };
+                // The resample and log-mel run here, on a host worker, so the
+                // device job runs only the encoder.
+                let features = row_frames
+                    .is_some()
+                    .then(|| {
+                        let started = Instant::now();
+                        let features =
+                            model_for_plan.prepare_offline_features(&samples, sample_rate);
+                        record_host_features(variant, started);
+                        features
+                    })
+                    .transpose()?;
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                if row_frames.is_none() {
+                    request.install_prepared_asr_long_form_atomic(plan)?;
+                }
+                Ok((request, row_frames, features))
+            })
+            .await?;
+        let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
+            .map_err(|_| Error::Overloaded("Voxtral ASR retained input exceeds u64".into()))?;
+        // The decoded audio joins the request, and the features are held
+        // beside it until the encode drops them: usage only rises here.
+        let features_host_bytes = features
+            .as_ref()
+            .map(VoxtralOfflineFeatures::host_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        let prepared_host_bytes = retained_request_bytes
+            .checked_add(features_host_bytes)
+            .ok_or_else(|| Error::Overloaded("Voxtral ASR prepared host bytes overflow".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let Some(frames) = row_frames else {
+            let mut prepared = prepared;
+            prepared.install_voxtral_asr_execution_model(variant, model, None, prompt_tokens)?;
+            let (spec, observation) = self.coordinator_job_for_request(&prepared)?;
+            return self
+                .coordinator
+                .admit_observed_from_preparation(bridge, spec, observation)
+                .await
+                .map(|job| (prepared, job))
+                .map_err(|failure| failure.error);
+        };
+        let (samples, sample_rate) = prepared
+            .prepared_asr_audio_for_executor()?
+            .ok_or_else(|| Error::InferenceError("Voxtral decoded audio was lost".into()))?;
+        let (workspace, embedding_bytes) =
+            model.offline_preparation_bytes(samples.len(), sample_rate)?;
+        let backend = self.backend_router.context().backend_kind;
+        // The preparation job holds the request and, once the encode
+        // commits, the prepared embeddings; the encoder's working set is the
+        // stage row's own workspace.
+        let preparation_job = self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                JobSpec {
+                    request_id: prepared.id.clone(),
+                    lane: CoordinatorLane::Atomic,
+                    priority: prepared.priority,
+                    workload_class: prepared.workload_class,
+                    deadline: prepared.deadline,
+                    resources: asr_encoder_retained_resources(
+                        backend,
+                        prepared_host_bytes,
+                        embedding_bytes,
+                    )?,
+                },
+                JobResourceObservation::host(prepared_host_bytes),
+            )
+            .await
+            .map_err(|failure| failure.error)?;
+        let work = WorkUnit::PreSequencePreparation {
+            kind: crate::models::architectures::voxtral::VOXTRAL_OFFLINE_PREPARATION_STAGE.into(),
+        };
+        let units = u64::try_from(frames)
+            .map_err(|_| Error::Overloaded("Voxtral preparation frames exceed u64".into()))?;
+        let cost =
+            crate::runtime::adapters::voxtral_offline_preparation_cost(backend, frames, workspace)?;
+        let features = features.ok_or_else(|| {
+            Error::InferenceError("Voxtral offline row lost its host features".into())
+        })?;
+        // The encode consumes the features and the row commits only the
+        // request and its embeddings. Restore the features' claim to pending
+        // first: usage may only rise through an observation, and the
+        // reservation still covers the features until the encode ends.
+        preparation_job
+            .prepare_materialized_release(JobResourceObservation::host(retained_request_bytes))?;
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &contract,
+            &work,
+            cost,
+            units,
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let model_label = variant.dir_name();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "Voxtral ASR preparation must remain scalar".into(),
+                    ));
+                }
+                let encode_started = Instant::now();
+                let artifact =
+                    model_for_preparation.prepare_offline_audio_from_features(features)?;
+                crate::engine::metrics::record_asr_device_phase(
+                    model_label,
+                    crate::engine::metrics::AsrPhase::Encoder,
+                    encode_started,
+                );
+                // What the row keeps: the request and its prepared
+                // embeddings, a rise over the request alone.
+                let retained = JobResourceObservation {
+                    host_bytes: retained_request_bytes,
+                    accelerator_bytes: artifact.tensor_bytes()?,
+                };
+                Ok(vec![Ok(PreparationArtifact {
+                    retained,
+                    value: Arc::new(artifact),
+                })])
+            })
+            .await?;
+        cancellation_guard.armed = false;
+        let (artifact, bridge) = match outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("Voxtral ASR preparation returned no outcome".into())
+        })? {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let retained = artifact.retained;
+        let mut prepared = prepared;
+        prepared.install_voxtral_asr_execution_model(
+            variant,
+            model,
+            Some(artifact.value),
+            prompt_tokens,
+        )?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        self.coordinator
+            .admit_observed_from_preparation(bridge, execution, retained)
+            .await
+            .map(|job| (prepared, job))
+            .map_err(|failure| failure.error)
+    }
+
     pub(super) async fn prepare_parakeet_asr_shape_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -1448,26 +1830,37 @@ impl RuntimeService {
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
         )?;
-        let prepared = self
+        let model_for_features = model.clone();
+        let (prepared, features) = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let max_emittable_tokens =
                     crate::models::architectures::parakeet::asr::parakeet_max_emittable_tokens(
                         samples.len(),
                         sample_rate,
                         max_symbols,
                     )?;
+                // The resample and log-mel run here, on a host worker, so the
+                // device job runs only the encoder.
+                let features_started = Instant::now();
+                let features =
+                    model_for_features.prepare_parakeet_host_features(&samples, sample_rate)?;
+                record_host_features(variant, features_started);
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
                 install_parakeet_decode_budget(&mut request, max_emittable_tokens)?;
-                Ok(request)
+                Ok((request, features))
             })
             .await?;
         let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
             .map_err(|_| Error::Overloaded("Parakeet retained input exceeds u64".into()))?;
-        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        // The log-mel features are held beside the request until the encode
+        // drops them.
+        let prepared_host_bytes = retained_host_bytes
+            .checked_add(features.host_bytes()?)
+            .ok_or_else(|| Error::Overloaded("Parakeet prepared host bytes overflowed".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
         let (samples, sample_rate) = prepared
             .prepared_asr_audio_for_executor()?
             .ok_or_else(|| Error::InferenceError("Parakeet decoded audio was lost".into()))?;
@@ -1490,17 +1883,6 @@ impl RuntimeService {
             .ok_or_else(|| {
                 Error::Overloaded("Parakeet retained tensor estimate overflowed".into())
             })?;
-        let materialized_elements = u64::try_from(feature_frames)
-            .ok()
-            .and_then(|frames| frames.checked_mul(1024 * 16))
-            .ok_or_else(|| Error::Overloaded("Parakeet preparation geometry overflowed".into()))?;
-        // Windowed encoding caps the quadratic attention terms at one window;
-        // only the host features and the stitched output grow with length.
-        let preparation_bytes =
-            crate::models::architectures::parakeet::asr::parakeet_preparation_bytes(
-                resampled,
-                self.backend_router.context().backend_kind,
-            )?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
         let prep_spec = JobSpec {
             request_id: prepared.id.clone(),
@@ -1510,7 +1892,7 @@ impl RuntimeService {
             deadline: prepared.deadline,
             resources: asr_encoder_retained_resources(
                 self.backend_router.context().backend_kind,
-                retained_host_bytes,
+                prepared_host_bytes,
                 retained_device_ceiling,
             )?,
         };
@@ -1519,103 +1901,30 @@ impl RuntimeService {
             .admit_observed_from_preparation(
                 bridge,
                 prep_spec,
-                JobResourceObservation::host(retained_host_bytes),
+                JobResourceObservation::host(prepared_host_bytes),
             )
             .await
         {
             Ok(job) => job,
             Err(failure) => return Err(failure.error),
         };
-        let work = WorkUnit::PreSequencePreparation {
-            kind: "asr.encoder.parakeet".into(),
-        };
-        let cost = crate::engine::WorkCost::with_workspace(
-            u64::try_from(samples.len())
-                .map_err(|_| Error::Overloaded("Parakeet sample work exceeds u64".into()))?,
-            materialized_elements,
-            retained_artifact_resources(
-                self.backend_router.context().backend_kind,
-                preparation_bytes.host_bytes,
-                preparation_bytes.device_bytes()?,
-            )?,
-        );
-        let cancellation = PreparationCancellation::default();
-        let row = self.coordinator.seal_preparation_row(
-            prep_job,
-            &contract,
-            &work,
-            cost,
-            materialized_elements,
-            cancellation.clone(),
-        )?;
-        let language = prepared.asr_language_for_execution().map(str::to_owned);
-        let model_for_preparation = model.clone();
-        let encoder_cancellation = cancellation.clone();
-        let encoder_request_id = prepared.id.clone();
-        let encoder_deadline = prepared.deadline;
-        let mut guard = PreparationCancellationGuard {
-            cancellation,
-            armed: true,
-        };
-        let mut outcomes = self
-            .coordinator
-            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
-                if live != [0] {
-                    return Err(Error::InferenceError(
-                        "Parakeet encoder preparation must remain scalar".into(),
-                    ));
-                }
-                let model_arc = model_for_preparation.model_arc();
-                let crate::models::registry::NativeAsrModel::Parakeet(model) = model_arc.as_ref()
-                else {
-                    return Err(Error::InferenceError(
-                        "Parakeet preparation crossed model family".into(),
-                    ));
-                };
-                // Checked between encoder windows, so a disconnected or
-                // expired request releases the device within one window.
-                let checkpoint = || {
-                    if encoder_cancellation.is_cancelled() {
-                        return Err(Error::Cancelled(encoder_request_id.clone()));
-                    }
-                    if encoder_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        return Err(Error::Timeout(encoder_request_id.clone()));
-                    }
-                    Ok(())
-                };
-                let artifact = match model.prepare_retained_encoder(
-                    samples.as_ref(),
-                    sample_rate,
-                    language.as_deref(),
-                    &checkpoint,
-                ) {
-                    Ok(artifact) => Arc::new(artifact),
-                    // A row error keeps its kind; a batch error is reported
-                    // as an inference failure.
-                    Err(error @ (Error::Cancelled(_) | Error::Timeout(_))) => {
-                        return Ok(vec![Err(error)]);
-                    }
-                    Err(error) => return Err(error),
-                };
-                let accelerator_bytes = artifact.resident_tensor_bytes()?;
-                if accelerator_bytes > retained_device_ceiling {
-                    return Err(Error::InferenceError(format!(
-                        "Parakeet encoder artifact exceeded its admitted ceiling: {accelerator_bytes} > {retained_device_ceiling}"
-                    )));
-                }
-                Ok(vec![Ok(PreparationArtifact {
-                    retained: JobResourceObservation {
-                        host_bytes: retained_host_bytes,
-                        accelerator_bytes,
-                    },
-                    value: artifact,
-                })])
+        // Concurrent clips of one window encode as one padded batch.
+        let outcome = self
+            .parakeet_encoder_batcher
+            .submit(ParakeetEncoderPending {
+                job: prep_job,
+                contract,
+                model: model.clone(),
+                model_label: variant.dir_name(),
+                backend: self.backend_router.context().backend_kind,
+                features,
+                language: prepared.asr_language_for_execution().map(str::to_owned),
+                retained_host_bytes,
+                retained_device_ceiling,
+                cancellation: PreparationCancellation::default(),
+                response: None,
             })
             .await?;
-        guard.armed = false;
-        let outcome = outcomes.pop().ok_or_else(|| {
-            Error::InferenceError("Parakeet preparation returned no outcome".into())
-        })?;
         let (artifact, bridge) = match outcome {
             PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
             PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
@@ -1635,14 +1944,194 @@ impl RuntimeService {
         }
     }
 
-    /// Granite Speech 5.0: decode the audio and plan its chunks on a host
-    /// worker, then dispatch the chunked atomic stage one chunk at a time, so
-    /// a long file no longer holds the device for its whole length and the
-    /// upload is never decoded on the device thread.
+    /// Nemotron 3.5 ASR Streaming, offline: a clip one pass covers decodes
+    /// as a retained row. Its audio is decoded, resampled and turned into
+    /// its log-mel on a host worker, concurrent clips encode as one padded
+    /// batch, and the decode batches across rows. Longer audio and speaker
+    /// attribution keep the atomic graph, whose single dispatch encodes and
+    /// decodes the whole file in 30 s chunks.
+    pub(super) async fn prepare_nemotron_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::NemotronAsr)
+            || request.prepared_asr_execution_shape().is_some()
+            || request.is_realtime_asr_session()
+        {
+            return Ok((request, job));
+        }
+        let variant = request.model_variant.expect("validated Nemotron variant");
+        let model = self
+            .model_registry
+            .get_asr_lease(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not loaded")))?;
+        let max_symbols = match model.model_arc().as_ref() {
+            crate::models::registry::NativeAsrModel::Nemotron(nemotron) => {
+                nemotron.max_symbols_per_frame()
+            }
+            _ => {
+                return Err(Error::ModelLoadError(
+                    "Nemotron registry lease crossed model family".into(),
+                ))
+            }
+        };
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Nemotron preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let effective_context = self.model_registry.effective_context(variant);
+        let model_for_features = model.clone();
+        let (prepared, features) = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
+                let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
+                    &model_for_features,
+                    variant,
+                    &request,
+                    effective_context,
+                )?;
+                let plan = crate::engine::asr_route_plan(
+                    &samples,
+                    sample_rate,
+                    &capabilities,
+                    request.streaming,
+                );
+                if !nemotron_decodes_as_row(&plan, &request) {
+                    request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                    request.install_prepared_asr_long_form_atomic(plan)?;
+                    return Ok((request, None));
+                }
+                // The resample and log-mel run here, on a host worker, so the
+                // device job runs only the encoder.
+                let features_started = Instant::now();
+                let features = model_for_features.prepare_nemotron_host_features(
+                    &samples,
+                    sample_rate,
+                    request.asr_language_for_execution(),
+                    request.asr_prompt_for_execution(),
+                )?;
+                record_host_features(variant, features_started);
+                let max_emittable_tokens =
+                    crate::models::architectures::nemotron::asr::nemotron_max_emittable_tokens(
+                        features.encoded_len(),
+                        max_symbols,
+                    )?;
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                install_nemotron_decode_budget(&mut request, max_emittable_tokens)?;
+                Ok((request, Some(features)))
+            })
+            .await?;
+        let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
+            .map_err(|_| Error::Overloaded("Nemotron retained input exceeds u64".into()))?;
+        let Some(features) = features else {
+            job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+            let bridge = self.coordinator.bridge_preparation_admission(job)?;
+            let (spec, observation) = self.coordinator_job_for_request(&prepared)?;
+            return self
+                .coordinator
+                .admit_observed_from_preparation(bridge, spec, observation)
+                .await
+                .map(|job| (prepared, job))
+                .map_err(|failure| failure.error);
+        };
+        // The log-mel features are held beside the request until the encode
+        // drops them.
+        let prepared_host_bytes = retained_host_bytes
+            .checked_add(features.host_bytes()?)
+            .ok_or_else(|| Error::Overloaded("Nemotron prepared host bytes overflowed".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
+        let backend = self.backend_router.context().backend_kind;
+        let retained_device_ceiling =
+            crate::models::architectures::nemotron::asr::nemotron_encoder_projection_bytes(
+                features.encoded_len(),
+                backend == BackendKind::Metal,
+            )?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let prep_spec = JobSpec {
+            request_id: prepared.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: prepared.priority,
+            workload_class: prepared.workload_class,
+            deadline: prepared.deadline,
+            resources: asr_encoder_retained_resources(
+                backend,
+                prepared_host_bytes,
+                retained_device_ceiling,
+            )?,
+        };
+        let prep_job = self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                prep_spec,
+                JobResourceObservation::host(prepared_host_bytes),
+            )
+            .await
+            .map_err(|failure| failure.error)?;
+        // Concurrent clips encode as one padded batch.
+        let outcome = self
+            .nemotron_encoder_batcher
+            .submit(NemotronEncoderPending {
+                job: prep_job,
+                contract,
+                model: model.clone(),
+                model_label: variant.dir_name(),
+                backend,
+                features,
+                retained_host_bytes,
+                retained_device_ceiling,
+                cancellation: PreparationCancellation::default(),
+                response: None,
+            })
+            .await?;
+        let (artifact, bridge) = match outcome {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let mut prepared = prepared;
+        prepared.install_prepared_nemotron_artifact(variant, artifact.value)?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        self.coordinator
+            .admit_observed_from_preparation(bridge, execution, artifact.retained)
+            .await
+            .map(|job| (prepared, job))
+            .map_err(|failure| failure.error)
+    }
+
+    /// Granite Speech 5.0: decode the audio and plan its route on a host
+    /// worker. A single segment whose prompt and budget fit one retained
+    /// sequence is encoded (beside other requests' audio, through
+    /// `GraniteSpeech5EncoderBatcher`) into a prompt artifact and runs as a
+    /// retained row; longer audio dispatches the chunked atomic stage one
+    /// chunk at a time, so a long file no longer holds the device for its
+    /// whole length and the upload is never decoded on the device thread.
     pub(super) async fn prepare_granite_speech5_asr_shape_for_binding(
         &self,
         request: EngineCoreRequest,
         job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
     ) -> Result<(EngineCoreRequest, JobLease)> {
         if request.task_type != TaskType::ASR
             || request
@@ -1668,14 +2157,14 @@ impl RuntimeService {
                     "Granite Speech 5.0 model {variant} has no effective context"
                 ))
             })?;
-        let prepared = self
+        let model_for_shape = model.clone();
+        let (prepared, row) = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
-                let (samples, sample_rate) =
-                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
                 let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
-                    &model,
+                    &model_for_shape,
                     variant,
                     &request,
                     Some(context_limit),
@@ -1686,21 +2175,198 @@ impl RuntimeService {
                     &capabilities,
                     request.streaming,
                 );
+                let options = GraniteSpeech5RequestOptions {
+                    language: request.asr_language_for_execution().map(str::to_string),
+                    prompt: request.asr_prompt_for_execution().map(str::to_string),
+                    translate_to: request.asr_task.translate_to.clone(),
+                    keywords: request.asr_task.keywords.clone(),
+                };
+                // A single segment runs on the retained route when the loaded
+                // model offers it (`IZWI_GRANITE_SPEECH5_RETAINED_DECODE`) and
+                // its prompt and decode budget fit one retained sequence;
+                // neither route recovers a single segment from a loop or
+                // truncation, which only the chunk route (always atomic)
+                // does.
+                let audio_seconds = samples.len() as f32 / sample_rate.max(1) as f32;
+                let budget =
+                    crate::runtime::granite_speech5_asr_planned_max_tokens(&request, audio_seconds);
+                // The log-mel runs here, on a host worker, and travels with
+                // the request, so the device job runs only the encoder.
+                let shaped = (!plan.requires_chunk_path()
+                    && model_for_shape.supports_resumable_prefill())
+                .then(|| {
+                    let started = Instant::now();
+                    let shaped = model_for_shape.granite_speech5_retained_preparation_features(
+                        &samples,
+                        sample_rate,
+                        &options,
+                    );
+                    record_host_features(variant, started);
+                    shaped
+                })
+                .transpose()?
+                .filter(|(_, geometry)| {
+                    granite_speech5_decodes_as_row(geometry.prompt_tokens, budget, context_limit)
+                });
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
-                request.install_prepared_asr_long_form_atomic(plan)?;
-                Ok(request)
+                match shaped {
+                    Some((features, geometry)) => {
+                        // Admission claims the sequence's pages for
+                        // `max_tokens` in full: narrow an omitted budget to
+                        // the one the decode uses for this audio's duration,
+                        // so concurrent rows share the retained pool.
+                        request.params.max_tokens = budget;
+                        request.install_prepared_sequence_input_tokens(
+                            geometry.prompt_tokens,
+                            context_limit,
+                        )?;
+                        Ok((request, Some((geometry, options, features))))
+                    }
+                    None => {
+                        request.install_prepared_asr_long_form_atomic(plan)?;
+                        Ok((request, None))
+                    }
+                }
             })
             .await?;
         let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
             .map_err(|_| {
                 Error::Overloaded("Granite Speech 5.0 retained input exceeds u64".into())
             })?;
-        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        // The features are held beside the request until the encode drops
+        // them.
+        let features_host_bytes = match &row {
+            Some((_, _, features)) => features.host_bytes().ok_or_else(|| {
+                Error::Overloaded("Granite Speech 5.0 feature bytes overflow".into())
+            })?,
+            None => 0,
+        };
+        let prepared_host_bytes = retained_host_bytes
+            .checked_add(features_host_bytes)
+            .ok_or_else(|| {
+                Error::Overloaded("Granite Speech 5.0 prepared host bytes overflow".into())
+            })?;
+        job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
-        let (spec, observation) = self.coordinator_job_for_request(&prepared)?;
+        let Some((geometry, options, features)) = row else {
+            let (spec, observation) = self.coordinator_job_for_request(&prepared)?;
+            return match self
+                .coordinator
+                .admit_observed_from_preparation(bridge, spec, observation)
+                .await
+            {
+                Ok(job) => Ok((prepared, job)),
+                Err(failure) => {
+                    drop(prepared);
+                    let error = failure.error;
+                    drop(failure.bridge);
+                    Err(error)
+                }
+            };
+        };
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Granite Speech 5.0 preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let preparation_contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let artifact_host_bytes = geometry.language_bytes;
+        let total_retained_host_bytes = retained_host_bytes
+            .checked_add(artifact_host_bytes)
+            .ok_or_else(|| {
+                Error::Overloaded("Granite Speech 5.0 retained host bytes overflow".into())
+            })?;
+        let resources = asr_encoder_retained_resources(
+            self.backend_router.context().backend_kind,
+            total_retained_host_bytes
+                .checked_add(features_host_bytes)
+                .ok_or_else(|| {
+                    Error::Overloaded("Granite Speech 5.0 prepared host bytes overflow".into())
+                })?,
+            geometry.retained_device_bytes,
+        )?;
+        let prep_spec = JobSpec {
+            request_id: prepared.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: prepared.priority,
+            workload_class: prepared.workload_class,
+            deadline: prepared.deadline,
+            resources,
+        };
+        let prep_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                prep_spec,
+                JobResourceObservation::host(prepared_host_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                return Err(error);
+            }
+        };
+        let outcome = self
+            .granite_speech5_encoder_batcher
+            .submit(GraniteSpeech5EncoderPending {
+                job: prep_job,
+                contract: preparation_contract,
+                model: model.clone(),
+                model_label: variant.dir_name(),
+                features,
+                request: options,
+                geometry,
+                retained_host_bytes: total_retained_host_bytes,
+                artifact_host_bytes,
+                cancellation: PreparationCancellation::default(),
+                response: None,
+            })
+            .await?;
+        let (artifact, bridge) = match outcome {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact.value, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        if artifact.prompt_tokens() != geometry.prompt_tokens
+            || artifact.audio_tokens() != geometry.audio_tokens
+            || artifact.resident_host_bytes() != artifact_host_bytes
+            || artifact.resident_tensor_bytes()? != geometry.retained_device_bytes
+        {
+            drop(artifact);
+            drop(prepared);
+            drop(bridge);
+            return Err(Error::InferenceError(
+                "Granite Speech 5.0 artifact drifted from admitted geometry".into(),
+            ));
+        }
+        let mut prepared = prepared;
+        prepared.install_prepared_granite_speech5_artifact(variant, artifact)?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
         match self
             .coordinator
-            .admit_observed_from_preparation(bridge, spec, observation)
+            .admit_observed_from_preparation(
+                bridge,
+                execution,
+                JobResourceObservation {
+                    host_bytes: total_retained_host_bytes,
+                    accelerator_bytes: geometry.retained_device_bytes,
+                },
+            )
             .await
         {
             Ok(job) => Ok((prepared, job)),
@@ -1732,16 +2398,22 @@ impl RuntimeService {
             .prepare_granite_speech_asr_shape_for_binding(request, job, residency_lease)
             .await?;
         let (request, job) = self
-            .prepare_granite_speech5_asr_shape_for_binding(request, job)
+            .prepare_granite_speech5_asr_shape_for_binding(request, job, residency_lease)
             .await?;
         let (request, job) = self
             .prepare_parakeet_asr_shape_for_binding(request, job, residency_lease)
+            .await?;
+        let (request, job) = self
+            .prepare_nemotron_asr_shape_for_binding(request, job, residency_lease)
             .await?;
         let (request, job) = self
             .prepare_lfm25_audio_asr_shape_for_binding(request, job, residency_lease)
             .await?;
         let (request, job) = self
             .prepare_lfm3_audio_asr_shape_for_binding(request, job, residency_lease)
+            .await?;
+        let (request, job) = self
+            .prepare_voxtral_asr_shape_for_binding(request, job, residency_lease)
             .await?;
         self.prepare_nemotron_transcribe_asr_shape_for_binding(request, job)
             .await
@@ -1780,7 +2452,9 @@ impl RuntimeService {
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
+                let features_started = Instant::now();
                 request.prepare_nemotron_transcribe_row(variant, model, context_limit)?;
+                record_host_features(variant, features_started);
                 Ok(request)
             })
             .await?;

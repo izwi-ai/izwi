@@ -31,6 +31,7 @@
 use crate::backends::BackendKind;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
+use crate::kernels::relpos_attention;
 use crate::model::ModelVariant;
 use crate::models::architectures::nemotron::asr::nemotron_stem_bytes;
 use crate::models::architectures::parakeet::asr::parakeet_preparation_bytes;
@@ -135,6 +136,17 @@ pub(crate) struct AsrEnvelopeGeometry {
     pub(crate) conv_stem: Option<ConvStemGeometry>,
     /// The forced aligner's text side; `None` for ASR.
     pub(crate) forced_alignment: Option<ForcedAlignmentGeometry>,
+    /// The encoder's Shaw relative-position attention, when it has one.
+    pub(crate) encoder_rel_pos: Option<ShawRelPosGeometry>,
+}
+
+/// Block-local Shaw relative-position attention (the Granite Speech
+/// conformers): each `context`-frame block gathers a `[context, context,
+/// head_dim]` slice of the position table and scores every query against it
+/// in F32, beside the content scores [`layer_bytes`] prices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShawRelPosGeometry {
+    pub(crate) head_dim: u64,
 }
 
 /// A convolution stem over 1 s feature chunks that runs by slices of whole
@@ -185,6 +197,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             vocab: 51_866,
             conv_stem: None,
             forced_alignment: None,
+            encoder_rel_pos: None,
         },
         // Audio tower after its ×8 convolution stem: 13 positions per second.
         ModelVariant::Qwen3Asr06BGguf => AsrEnvelopeGeometry {
@@ -198,6 +211,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             vocab: 151_936,
             conv_stem: None,
             forced_alignment: None,
+            encoder_rel_pos: None,
         },
         ModelVariant::Qwen3Asr17BGguf => AsrEnvelopeGeometry {
             max_chunk_secs: CHUNK_SECS,
@@ -210,6 +224,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             vocab: 151_936,
             conv_stem: None,
             forced_alignment: None,
+            encoder_rel_pos: None,
         },
         // FastConformer at 12.5 positions per second; an RNN-T prediction
         // network and joint (13,088 outputs) instead of an LLM decoder.
@@ -224,6 +239,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             vocab: 13_088,
             conv_stem: None,
             forced_alignment: None,
+            encoder_rel_pos: None,
         },
         // Conformer over 50 positions per second in 4 s attention blocks;
         // the projector emits 10 audio tokens per second. Granite Speech 5.0
@@ -244,6 +260,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
                 vocab: 100_353,
                 conv_stem: None,
                 forced_alignment: None,
+                encoder_rel_pos: Some(ShawRelPosGeometry { head_dim: 128 }),
             }
         }
         // The retained route takes one 60 s tokenizer chunk (450 audio
@@ -260,6 +277,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             vocab: 152_064,
             conv_stem: None,
             forced_alignment: None,
+            encoder_rel_pos: None,
         },
         // Causal Whisper-style encoder at 50 positions per second, 12.5
         // audio tokens per second into the decoder.
@@ -274,6 +292,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             vocab: 131_072,
             conv_stem: None,
             forced_alignment: None,
+            encoder_rel_pos: None,
         },
         // FastConformer at 12.5 positions per second into the LFM2 backbone.
         ModelVariant::Lfm25Audio15BGguf => AsrEnvelopeGeometry {
@@ -287,6 +306,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             vocab: 65_536,
             conv_stem: None,
             forced_alignment: None,
+            encoder_rel_pos: None,
         },
         // The audio tower of Qwen3-ASR-1.7B (104-position ≈ 8 s attention
         // windows after the ×8 stem) under a 5,000-class timestamp head; the
@@ -314,6 +334,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
                 scored_rows_per_word: 2,
                 query_block: QWEN3_STATELESS_QUERY_BLOCK as u64,
             }),
+            encoder_rel_pos: None,
         },
         _ => return None,
     })
@@ -433,6 +454,72 @@ fn layer_bytes(geometry: StackGeometry, length: u64, context: u64) -> Result<u64
         product(&[FF_PLANES, length, geometry.ff, F32_BYTES])?,
         product(&[SCORE_PLANES, geometry.heads, length, context, F32_BYTES])?,
     ])
+}
+
+/// The Shaw relative-position transients of one encoder layer over `length`
+/// positions in blocks of `context` (`relative_position_bias` in the Granite
+/// Speech encoders), beside its content scores: the gathered `[C, C, Dh]`
+/// table with its F32 copy and transposed copy, the F32 query and its
+/// transposed copy over the padded length, and the F32 position scores with
+/// their transposed and scaled copies. Priced at F32 like every activation.
+fn shaw_rel_pos_bytes(
+    geometry: StackGeometry,
+    rel_pos: ShawRelPosGeometry,
+    length: u64,
+    context: u64,
+) -> Result<u64> {
+    const TABLE_PLANES: u64 = 3;
+    const QUERY_PLANES: u64 = 2;
+    const POSITION_SCORE_PLANES: u64 = 3;
+    let context = context.max(1);
+    let padded = length
+        .div_ceil(context)
+        .checked_mul(context)
+        .ok_or_else(overflow)?;
+    sum(&[
+        product(&[TABLE_PLANES, context, context, rel_pos.head_dim, F32_BYTES])?,
+        product(&[
+            QUERY_PLANES,
+            padded,
+            geometry.heads,
+            rel_pos.head_dim,
+            F32_BYTES,
+        ])?,
+        product(&[
+            POSITION_SCORE_PLANES,
+            geometry.heads,
+            padded,
+            context,
+            F32_BYTES,
+        ])?,
+    ])
+}
+
+/// One encoder layer's live bytes: [`layer_bytes`], plus a Shaw encoder's
+/// position copies ([`shaw_rel_pos_bytes`]). With the fused attention
+/// kernel (`fused_attention`: on CUDA once its self-check passed) the layer
+/// holds neither the score planes nor those copies.
+fn encoder_layer_bytes(
+    geometry: AsrEnvelopeGeometry,
+    length: u64,
+    context: u64,
+    fused_attention: bool,
+) -> Result<u64> {
+    let encoder = geometry.encoder;
+    if fused_attention {
+        return sum(&[
+            product(&[HIDDEN_PLANES, length, encoder.hidden, F32_BYTES])?,
+            product(&[FF_PLANES, length, encoder.ff, F32_BYTES])?,
+        ]);
+    }
+    let layer = layer_bytes(encoder, length, context)?;
+    match geometry.encoder_rel_pos {
+        Some(rel_pos) => sum(&[
+            layer,
+            shaw_rel_pos_bytes(encoder, rel_pos, length, context)?,
+        ]),
+        None => Ok(layer),
+    }
 }
 
 /// One causal prefill layer over `length` positions whose attention runs
@@ -580,7 +667,8 @@ fn geometry_envelope(
             positions(geometry.encoder_positions_per_sec, window).min(encoder_length)
         })
         .max(1);
-    let encoder = layer_bytes(geometry.encoder, encoder_length, encoder_context)?;
+    let fused = geometry.encoder_rel_pos.is_some() && relpos_attention::fused_priced(backend);
+    let encoder = encoder_layer_bytes(geometry, encoder_length, encoder_context, fused)?;
     let words = u64::try_from(words.unwrap_or(0)).map_err(|_| overflow())?;
     let text_tokens = geometry.forced_alignment.map_or(0, |alignment| {
         (alignment.tokens_per_word * words as f32).ceil() as u64
@@ -635,6 +723,161 @@ pub(crate) fn deferred_request_envelope(
     };
     let slots = u64::try_from(request_slots.max(1)).map_err(|_| overflow())?;
     envelope.scaled_by(slots).map(Some)
+}
+
+/// BF16: the KV and prepared-input dtype of the CUDA ASR decoders.
+const BF16_BYTES: u64 = 2;
+/// Parakeet-TDT-0.6B-v3's encoder: 1,024 wide at 12.5 positions per second.
+const PARAKEET_ENCODER_HIDDEN: u64 = 1024;
+const PARAKEET_ENCODER_POSITIONS_PER_SEC: f32 = 12.5;
+/// Whisper Large v3 Turbo's decoder layers (each with self and cross
+/// attention over 1,280-wide K and V).
+const WHISPER_DECODER_LAYERS: u64 = 4;
+/// Whisper's CUDA cross-attention memory: 1,500 encoder positions padded
+/// to the 32-token flash-attention block.
+const WHISPER_CUDA_CROSS_TOKENS: u64 = 1_504;
+/// Allowance for one VibeVoice-ASR row's acoustic and semantic tokenizer
+/// streaming caches (convolution histories of a few MiB).
+const VIBEVOICE_TOKENIZER_STATE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A language-model decoder's KV width: its layers and the K (or V) width of
+/// one layer (`num_key_value_heads × head_dim`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecoderKvGeometry {
+    layers: u64,
+    kv_width: u64,
+}
+
+/// The pinned decoder KV geometry of the ASR variants whose decode runs
+/// wider than the engine rows on CUDA (checked against the checkpoint
+/// census in the tests).
+fn decoder_kv_geometry(variant: ModelVariant) -> Option<DecoderKvGeometry> {
+    Some(match variant {
+        // Qwen3-0.6B and Qwen3-1.7B: 28 layers, 8 KV heads of 128.
+        ModelVariant::Qwen3Asr06BGguf | ModelVariant::Qwen3Asr17BGguf => DecoderKvGeometry {
+            layers: 28,
+            kv_width: 1024,
+        },
+        // Qwen2.5-7B: 28 layers, 4 KV heads of 128.
+        ModelVariant::VibeVoiceAsr => DecoderKvGeometry {
+            layers: 28,
+            kv_width: 512,
+        },
+        // Voxtral's Ministral decoder: 26 layers, 8 KV heads of 128.
+        ModelVariant::VoxtralMini4BRealtime2602 => DecoderKvGeometry {
+            layers: 26,
+            kv_width: 1024,
+        },
+        // Granite Speech 4.1's Granite 4.0 decoder: 40 layers, 4 KV heads
+        // of 128.
+        ModelVariant::GraniteSpeech412B | ModelVariant::GraniteSpeech412BPlus => {
+            DecoderKvGeometry {
+                layers: 40,
+                kv_width: 512,
+            }
+        }
+        // Granite Speech 5.0's YaRN-extended granite-4.0-1b: 40 layers, 4
+        // KV heads of 128, in both releases.
+        ModelVariant::GraniteSpeech502B | ModelVariant::GraniteSpeech502BGguf => {
+            DecoderKvGeometry {
+                layers: 40,
+                kv_width: 512,
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// What one continuous decode row of `variant` holds on CUDA, for the
+/// load's decode-width fit (`catalog::fit_asr_decode_width`): its retained
+/// sequence state, one prepared-input row and its decode workspace. A
+/// language-model decoder holds BF16 K and V over one planned chunk
+/// ([`minimum_sequence_tokens`]), that chunk's BF16 prepared embeddings and
+/// an F32 logits row (VibeVoice also its tokenizer caches). A transducer
+/// holds one pass's F32 encoder output (Parakeet one encoder window,
+/// Nemotron one 30 s chunk) and its sealed per-row decode workspace; its
+/// predictor state is a few KiB. Whisper holds F16 K and V of its whole
+/// target window in self attention, its slot of the retained
+/// cross-attention pool, its prepared cross-attention memory (the encoder
+/// output projected per layer) until the request ends, and an F32 logits
+/// row. `None` for a variant whose decode does not run wider than the
+/// engine rows.
+pub(crate) fn cuda_decode_row_bytes(variant: ModelVariant) -> Result<Option<u64>> {
+    use crate::models::architectures::nemotron::asr::NEMOTRON_RETAINED_WORKSPACE_PER_ROW_BYTES;
+    use crate::models::architectures::parakeet::asr::PARAKEET_RETAINED_WORKSPACE_PER_ROW_BYTES;
+    let transducer = |positions_per_sec: f32, secs: f32, hidden: u64, workspace: u64| {
+        sum(&[
+            product(&[positions(positions_per_sec, secs), hidden, F32_BYTES])?,
+            workspace,
+        ])
+    };
+    let bytes = match variant {
+        ModelVariant::ParakeetTdt06BV3 => transducer(
+            PARAKEET_ENCODER_POSITIONS_PER_SEC,
+            PARAKEET_WINDOW_SECS,
+            PARAKEET_ENCODER_HIDDEN,
+            PARAKEET_RETAINED_WORKSPACE_PER_ROW_BYTES,
+        )?,
+        ModelVariant::Nemotron35AsrStreaming06B => {
+            let Some(geometry) = envelope_geometry(variant) else {
+                return Ok(None);
+            };
+            transducer(
+                geometry.encoder_positions_per_sec,
+                geometry.max_chunk_secs,
+                geometry.encoder.hidden,
+                NEMOTRON_RETAINED_WORKSPACE_PER_ROW_BYTES,
+            )?
+        }
+        ModelVariant::WhisperLargeV3Turbo => {
+            let Some(geometry) = envelope_geometry(variant) else {
+                return Ok(None);
+            };
+            let per_token = product(&[
+                2,
+                WHISPER_DECODER_LAYERS,
+                geometry.decoder.hidden,
+                BF16_BYTES,
+            ])?;
+            let memory_tokens =
+                positions(geometry.encoder_positions_per_sec, geometry.max_chunk_secs);
+            sum(&[
+                product(&[
+                    sum(&[
+                        geometry.prompt_tokens,
+                        WHISPER_CUDA_CROSS_TOKENS,
+                        memory_tokens,
+                    ])?,
+                    per_token,
+                ])?,
+                product(&[geometry.vocab, F32_BYTES])?,
+            ])?
+        }
+        _ => {
+            let (Some(kv), Some(geometry), Some(tokens)) = (
+                decoder_kv_geometry(variant),
+                envelope_geometry(variant),
+                minimum_sequence_tokens(variant),
+            ) else {
+                return Ok(None);
+            };
+            let per_token = sum(&[
+                product(&[2, kv.layers, kv.kv_width, BF16_BYTES])?,
+                product(&[geometry.decoder.hidden, BF16_BYTES])?,
+            ])?;
+            let tokenizer = if variant == ModelVariant::VibeVoiceAsr {
+                VIBEVOICE_TOKENIZER_STATE_BYTES
+            } else {
+                0
+            };
+            sum(&[
+                product(&[tokens, per_token])?,
+                product(&[geometry.vocab, F32_BYTES])?,
+                tokenizer,
+            ])?
+        }
+    };
+    Ok(Some(bytes))
 }
 
 #[cfg(test)]
@@ -808,6 +1051,82 @@ mod tests {
         assert_eq!(metal.host_bytes, cpu.host_bytes);
     }
 
+    /// A Granite Speech encoder layer prices its Shaw relative-position
+    /// copies beside the content scores: about 105 MB over a 30 s chunk,
+    /// which is the encoder's peak on every backend.
+    #[test]
+    fn granite_envelope_prices_the_relative_position_copies() {
+        let rel_pos = 3 * 200 * 200 * 128 * 4 + 2 * 1_600 * 8 * 128 * 4 + 3 * 8 * 1_600 * 200 * 4;
+        assert_eq!(rel_pos, 105_267_200);
+        for variant in [
+            ModelVariant::GraniteSpeech412B,
+            ModelVariant::GraniteSpeech412BPlus,
+            ModelVariant::GraniteSpeech502B,
+            ModelVariant::GraniteSpeech502BGguf,
+        ] {
+            let geometry = envelope_geometry(variant).unwrap();
+            assert_eq!(
+                geometry.encoder_rel_pos,
+                Some(ShawRelPosGeometry { head_dim: 128 })
+            );
+            let rel_bytes = shaw_rel_pos_bytes(
+                geometry.encoder,
+                geometry.encoder_rel_pos.unwrap(),
+                1_500,
+                200,
+            )
+            .unwrap();
+            assert_eq!(rel_bytes, rel_pos);
+            // One block's padded length counts whole blocks.
+            let one_frame = shaw_rel_pos_bytes(
+                geometry.encoder,
+                ShawRelPosGeometry { head_dim: 128 },
+                1,
+                200,
+            )
+            .unwrap();
+            assert_eq!(
+                one_frame,
+                3 * 200 * 200 * 128 * 4 + 2 * 200 * 8 * 128 * 4 + 3 * 8 * 200 * 200 * 4
+            );
+            for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+                let priced = request_envelope(variant, 30.0, backend).unwrap().unwrap();
+                let without = geometry_envelope(
+                    AsrEnvelopeGeometry {
+                        encoder_rel_pos: None,
+                        ..geometry
+                    },
+                    30.0,
+                    None,
+                    backend,
+                )
+                .unwrap();
+                assert_eq!(
+                    priced.accelerator_bytes,
+                    without.accelerator_bytes + rel_pos,
+                    "{variant:?} {backend:?}"
+                );
+                assert_eq!(priced.host_bytes, without.host_bytes);
+            }
+            // With the fused kernel, neither the score planes nor the copies.
+            let fused = encoder_layer_bytes(geometry, 1_500, 200, true).unwrap();
+            let scores = 2 * 8 * 1_500 * 200 * 4;
+            assert_eq!(
+                fused + scores + rel_pos,
+                encoder_layer_bytes(geometry, 1_500, 200, false).unwrap()
+            );
+        }
+        for variant in ENVELOPE_VARIANTS {
+            let granite = matches!(
+                variant.family(),
+                ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr
+            );
+            if let Some(geometry) = envelope_geometry(variant) {
+                assert_eq!(geometry.encoder_rel_pos.is_some(), granite, "{variant:?}");
+            }
+        }
+    }
+
     /// One chunk per sequence: a default request's prompt and decode budget.
     #[test]
     fn minimum_sequence_tokens_hold_one_chunk() {
@@ -833,6 +1152,226 @@ mod tests {
             minimum_sequence_tokens(ModelVariant::Nemotron35AsrStreaming06B),
             None
         );
+    }
+
+    /// Every variant of the families certified wider on CUDA has a decode
+    /// row estimate; no other speech variant does. A Qwen3-ASR row is
+    /// dominated by its one-chunk KV (1,307 tokens at 112 KiB), so 32 rows
+    /// take about 4.6 GiB; a transducer row is its workspace and one pass's
+    /// encoder output. A Whisper row is its F16 self-attention window (448
+    /// tokens), its cross-attention pool slot (1,504) and its prepared
+    /// memory (1,500) at 20 KiB a token over 4 layers, about 68 MiB, so 32
+    /// rows take about 2.1 GiB.
+    #[test]
+    fn cuda_decode_rows_price_their_state_input_and_workspace() {
+        const MIB: u64 = 1024 * 1024;
+        let row = |variant| cuda_decode_row_bytes(variant).unwrap();
+        for variant in crate::model::ModelVariant::all().iter().copied() {
+            let wide = crate::catalog::certified_decode_width(variant.family(), BackendKind::Cuda)
+                > crate::catalog::CUDA_DEFAULT_WIDTH
+                && matches!(
+                    variant.family(),
+                    ModelFamily::Qwen3Asr
+                        | ModelFamily::VibeVoiceAsr
+                        | ModelFamily::ParakeetAsr
+                        | ModelFamily::NemotronAsr
+                        | ModelFamily::WhisperAsr
+                        | ModelFamily::Voxtral
+                        | ModelFamily::GraniteSpeechAsr
+                        | ModelFamily::GraniteSpeech5Asr
+                );
+            assert_eq!(row(variant).is_some(), wide, "{variant}");
+        }
+        let qwen_17b = row(ModelVariant::Qwen3Asr17BGguf).unwrap();
+        assert_eq!(
+            qwen_17b,
+            1_307 * (2 * 28 * 1024 * 2 + 2048 * 2) + 151_936 * 4
+        );
+        assert_eq!(qwen_17b / MIB, 148);
+        assert_eq!(row(ModelVariant::Qwen3Asr06BGguf).unwrap() / MIB, 146);
+        // VibeVoice: 1,938 tokens of 56 KiB KV and 7 KiB of embeddings.
+        assert_eq!(row(ModelVariant::VibeVoiceAsr).unwrap() / MIB, 135);
+        assert_eq!(row(ModelVariant::ParakeetTdt06BV3).unwrap() / MIB, 21);
+        assert_eq!(
+            row(ModelVariant::Nemotron35AsrStreaming06B).unwrap() / MIB,
+            17
+        );
+        let whisper = row(ModelVariant::WhisperLargeV3Turbo).unwrap();
+        assert_eq!(
+            whisper,
+            (448 + 1_504 + 1_500) * (2 * 4 * 1_280 * 2) + 51_866 * 4
+        );
+        assert_eq!(whisper / MIB, 67);
+        const GIB: u64 = 1024 * MIB;
+        // H100 80 GB and L4 24 GB take the full 32 rows after the ~1.6 GB
+        // of weights; it takes a device with under ~4.5 GiB of headroom to
+        // narrow the decode.
+        assert_eq!(
+            crate::catalog::fit_asr_decode_width(32, 8, whisper, 75 * GIB),
+            32
+        );
+        assert_eq!(
+            crate::catalog::fit_asr_decode_width(32, 8, whisper, 20 * GIB),
+            32
+        );
+        assert_eq!(
+            crate::catalog::fit_asr_decode_width(32, 8, whisper, 3 * GIB),
+            16
+        );
+        assert_eq!(crate::catalog::fit_asr_decode_width(32, 8, whisper, GIB), 8);
+        // A Voxtral row holds BF16 K and V of its 26 layers and its BF16
+        // prepared audio embedding (3,072 wide) over one 30 s chunk's 918
+        // tokens, and an F32 logits row: about 99 MiB, so 32 rows take about
+        // 3.1 GiB. Beside ~8.9 GB of BF16 weights an H100 80 GB (about 70
+        // GiB of headroom) and an L4 24 GB (about 13 GiB) both take 32 rows;
+        // under ~6.2 GiB of headroom the decode narrows.
+        let voxtral = row(ModelVariant::VoxtralMini4BRealtime2602).unwrap();
+        assert_eq!(voxtral, 918 * (2 * 26 * 1024 * 2 + 3072 * 2) + 131_072 * 4);
+        assert_eq!(voxtral / MIB, 99);
+        assert_eq!(
+            crate::catalog::fit_asr_decode_width(32, 8, voxtral, 70 * GIB),
+            32
+        );
+        assert_eq!(
+            crate::catalog::fit_asr_decode_width(32, 8, voxtral, 13 * GIB),
+            32
+        );
+        assert_eq!(
+            crate::catalog::fit_asr_decode_width(32, 8, voxtral, 6 * GIB),
+            16
+        );
+        assert_eq!(
+            crate::catalog::fit_asr_decode_width(32, 8, voxtral, 3 * GIB),
+            8
+        );
+        // A Granite Speech 4.1 row holds BF16 K and V of its 40 layers and
+        // its BF16 prepared prompt embedding (2,048 wide) over one 30 s
+        // chunk's 644 tokens (the 128-token prompt reserve, 316 audio
+        // tokens and the 200-token budget), and an F32 logits row over the
+        // 100k vocabulary: about 53 MiB, so 32 rows take about 1.7 GiB.
+        // Beside ~5.3 GB of BF16 weights an H100 and an L4 both take 32
+        // rows; under ~3.4 GiB of headroom the decode narrows.
+        for variant in [
+            ModelVariant::GraniteSpeech412B,
+            ModelVariant::GraniteSpeech412BPlus,
+        ] {
+            let granite = row(variant).unwrap();
+            assert_eq!(
+                granite,
+                644 * (2 * 40 * 512 * 2 + 2048 * 2) + 100_353 * 4,
+                "{variant}"
+            );
+            assert_eq!(granite / MIB, 53);
+            assert_eq!(
+                crate::catalog::fit_asr_decode_width(32, 8, granite, 70 * GIB),
+                32
+            );
+            assert_eq!(
+                crate::catalog::fit_asr_decode_width(32, 8, granite, 13 * GIB),
+                32
+            );
+            assert_eq!(
+                crate::catalog::fit_asr_decode_width(32, 8, granite, 3 * GIB),
+                16
+            );
+            assert_eq!(crate::catalog::fit_asr_decode_width(32, 8, granite, GIB), 8);
+        }
+        // A Granite Speech 5.0 row holds the same 40 layers' BF16 K and V
+        // and BF16 prompt embedding over one 30 s chunk's 744 tokens (the
+        // 128-token prompt reserve, 316 audio tokens and its 300-token
+        // automatic budget) and an F32 logits row: about 61 MiB, so 32 rows
+        // take about 1.9 GiB, against the 1.25 GiB 16k lease one request
+        // held on the atomic route.
+        for variant in [
+            ModelVariant::GraniteSpeech502B,
+            ModelVariant::GraniteSpeech502BGguf,
+        ] {
+            let granite = row(variant).unwrap();
+            assert_eq!(
+                granite,
+                744 * (2 * 40 * 512 * 2 + 2048 * 2) + 100_353 * 4,
+                "{variant}"
+            );
+            assert_eq!(granite / MIB, 61);
+            for (headroom, width) in [(70 * GIB, 32), (13 * GIB, 32), (3 * GIB, 16), (GIB, 8)] {
+                assert_eq!(
+                    crate::catalog::fit_asr_decode_width(32, 8, granite, headroom),
+                    width,
+                    "{variant} {headroom}"
+                );
+            }
+        }
+    }
+
+    /// The pinned decoder KV widths match the checkpoints' K projections.
+    #[test]
+    fn decoder_kv_geometry_matches_the_checkpoint_census() {
+        fn k_projection(fixture: &str, name: &str) -> (u64, u64) {
+            let value: serde_json::Value = serde_json::from_str(fixture).unwrap();
+            let entries = value["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|file| file["tensors"].as_array().unwrap())
+                .filter(|tensor| tensor[0] == name)
+                .collect::<Vec<_>>();
+            assert!(!entries.is_empty(), "{name} missing");
+            let layers = entries
+                .iter()
+                .map(|tensor| tensor[4].as_u64().unwrap())
+                .sum();
+            (layers, entries[0][2][0].as_u64().unwrap())
+        }
+        for (variant, fixture, name) in [
+            (
+                ModelVariant::Qwen3Asr06BGguf,
+                include_str!("../../../tests/fixtures/asr_residency/qwen3_asr_0_6b_q8_0.json"),
+                "thinker.model.layers.{i}.self_attn.k_proj.weight",
+            ),
+            (
+                ModelVariant::Qwen3Asr17BGguf,
+                include_str!("../../../tests/fixtures/asr_residency/qwen3_asr_1_7b_q8_0.json"),
+                "thinker.model.layers.{i}.self_attn.k_proj.weight",
+            ),
+            (
+                ModelVariant::VibeVoiceAsr,
+                include_str!("../../../tests/fixtures/asr_residency/vibevoice_asr.json"),
+                "model.language_model.layers.{i}.self_attn.k_proj.weight",
+            ),
+            (
+                ModelVariant::VoxtralMini4BRealtime2602,
+                include_str!(
+                    "../../../tests/fixtures/asr_residency/voxtral_mini_4b_realtime_2602.json"
+                ),
+                "layers.{i}.attention.wk.weight",
+            ),
+            (
+                ModelVariant::GraniteSpeech412BPlus,
+                include_str!(
+                    "../../../tests/fixtures/asr_residency/granite_speech_4_1_2b_plus.json"
+                ),
+                "language_model.model.layers.{i}.self_attn.k_proj.weight",
+            ),
+            (
+                ModelVariant::GraniteSpeech502B,
+                include_str!("../../../tests/fixtures/asr_residency/granite_speech_5_0_2b.json"),
+                "language_model.model.layers.{i}.self_attn.k_proj.weight",
+            ),
+            (
+                ModelVariant::GraniteSpeech502BGguf,
+                include_str!(
+                    "../../../tests/fixtures/asr_residency/granite_speech_5_0_2b_gguf_q8_0.json"
+                ),
+                "blk.{i}.attn_k.weight",
+            ),
+        ] {
+            let geometry = decoder_kv_geometry(variant).unwrap();
+            assert_eq!(
+                k_projection(fixture, name),
+                (geometry.layers, geometry.kv_width),
+                "{variant}"
+            );
+        }
     }
 
     /// The pinned dimensions match the published checkpoints' tensor shapes.

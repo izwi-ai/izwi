@@ -9,10 +9,11 @@ use crate::error::{Error, Result};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
 use super::{
-    append_generated_frame, elapsed_ms, generated_frame_prompt, sample_semantic_token,
-    FishS2ConditioningPrompt, FishS2GenerationOutput, FishS2GenerationParams, FishS2Reference,
-    FishS2Sampler, FishS2SemanticSampler, FishS2SlowOutput, FishS2StopReason,
-    FishS2TtsGenerationDiagnostics, FishS2TtsModel, FishS2VqCodes, RAS_WIN_SIZE,
+    append_generated_frame, elapsed_ms, generated_frame_prompt, sample_semantic_rows,
+    semantic_rows_on_device, FishS2ConditioningPrompt, FishS2GenerationOutput,
+    FishS2GenerationParams, FishS2Reference, FishS2Sampler, FishS2SemanticRow,
+    FishS2SemanticSampler, FishS2SlowOutput, FishS2StopReason, FishS2TtsGenerationDiagnostics,
+    FishS2TtsModel, FishS2VqCodes, RAS_WIN_SIZE,
 };
 
 static NEXT_FISH_S2_STATE_ID: AtomicU64 = AtomicU64::new(1);
@@ -414,16 +415,20 @@ impl FishS2TtsModel {
             Error::InferenceError("Fish S2 retained state has no slow output".into())
         })?;
         let sampling_started = Instant::now();
-        let semantic_index = sample_semantic_token(
-            &slow.logits,
-            &runtime.semantic_allowed_mask,
-            runtime
-                .slow
-                .eos_logit_index(runtime.tokenizer.specials().eos),
-            state.frames_generated() > 0,
-            &state.recent_semantic_tokens,
-            &mut state.semantic_sampler,
-        )?;
+        let device_candidates = semantic_rows_on_device(&slow.logits);
+        let allow_im_end = state.frames_generated() > 0;
+        // The batched path at width one: a row draws alone as it does beside
+        // others.
+        let semantic_index = sample_semantic_rows(
+            runtime,
+            &mut [FishS2SemanticRow {
+                logits: &slow.logits,
+                allow_im_end,
+                previous: &state.recent_semantic_tokens,
+                sampler: &mut state.semantic_sampler,
+            }],
+            device_candidates,
+        )?[0];
         state.sampling_ms += sampling_started.elapsed().as_secs_f64() * 1000.0;
         let semantic = runtime.slow.token_id_from_logit(semantic_index)?;
         if semantic == runtime.tokenizer.specials().eos {
@@ -513,26 +518,39 @@ impl FishS2TtsModel {
         }
         let started = Instant::now();
         let runtime = self.native_runtime()?;
-        let mut semantic_indices = Vec::with_capacity(states.len());
-        let mut semantics = Vec::with_capacity(states.len());
-        for state in states.iter_mut() {
-            let sampling_started = Instant::now();
-            let index = sample_semantic_token(
-                &state
+        // Every row's semantic token from one device pass and one readback.
+        let sampling_started = Instant::now();
+        let semantic_indices = {
+            let device_candidates = semantic_rows_on_device(
+                &states[0]
                     .slow_output
                     .as_ref()
                     .expect("validated slow output")
                     .logits,
-                &runtime.semantic_allowed_mask,
-                runtime
-                    .slow
-                    .eos_logit_index(runtime.tokenizer.specials().eos),
-                state.frames_generated() > 0,
-                &state.recent_semantic_tokens,
-                &mut state.semantic_sampler,
-            )?;
-            state.sampling_ms += sampling_started.elapsed().as_secs_f64() * 1000.0;
-            semantic_indices.push(index);
+            );
+            let mut rows = states
+                .iter_mut()
+                .map(|state| {
+                    let state = &mut **state;
+                    let allow_im_end = state.frames_generated() > 0;
+                    FishS2SemanticRow {
+                        allow_im_end,
+                        logits: &state
+                            .slow_output
+                            .as_ref()
+                            .expect("validated slow output")
+                            .logits,
+                        previous: &state.recent_semantic_tokens,
+                        sampler: &mut state.semantic_sampler,
+                    }
+                })
+                .collect::<Vec<_>>();
+            sample_semantic_rows(runtime, &mut rows, device_candidates)?
+        };
+        let sampling_ms = sampling_started.elapsed().as_secs_f64() * 1000.0;
+        let mut semantics = Vec::with_capacity(states.len());
+        for (state, &index) in states.iter_mut().zip(&semantic_indices) {
+            state.sampling_ms += sampling_ms;
             semantics.push(runtime.slow.token_id_from_logit(index)?);
         }
         let eos = runtime.tokenizer.specials().eos;
@@ -1270,6 +1288,7 @@ mod tests {
             fast: super::super::fast::tiny_for_batch_tests(),
             dac: super::super::dac::tiny_for_batch_tests(),
             semantic_allowed_mask: mask,
+            semantic_masks: std::sync::OnceLock::new(),
             dtype: candle_core::DType::F32,
             precision: crate::kernels::numeric_check::PrecisionLoad::unchecked(
                 &crate::backends::DTypeSelection {
@@ -1290,6 +1309,62 @@ mod tests {
         )
         .unwrap();
         state.begin_managed_quantum(view).unwrap()
+    }
+
+    /// A step's semantic rows drawn together from batched device candidates
+    /// give each row the token it gets drawn alone, step after step (so each
+    /// row's RNG stays in step), first frames (no `<|im_end|>`) beside later
+    /// ones.
+    #[test]
+    fn batched_semantic_rows_draw_each_rows_own_token() {
+        use crate::kernels::numeric_check::xorshift_tensor;
+
+        let model = tiny_native_model();
+        let runtime = model.runtime.as_ref().unwrap();
+        let vocab = runtime.semantic_allowed_mask.len();
+        let device = candle_core::Device::Cpu;
+        let mut samplers = (0..5)
+            .map(|row| FishS2SemanticSampler::new(0.9, 0.8, 70 + row))
+            .collect::<Vec<_>>();
+        let mut alone = samplers.clone();
+        let mut previous = vec![Vec::new(); 5];
+        for step in 0..6u64 {
+            let logits = (0..5u64)
+                .map(|row| xorshift_tensor(&[1, 1, vocab], step * 10 + row, 2.0, &device).unwrap())
+                .collect::<Vec<_>>();
+            let allow = (0..5)
+                .map(|row| step > 0 || row % 2 == 1)
+                .collect::<Vec<_>>();
+            let batched = {
+                let mut rows = samplers
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(row, sampler)| FishS2SemanticRow {
+                        logits: &logits[row],
+                        allow_im_end: allow[row],
+                        previous: &previous[row],
+                        sampler,
+                    })
+                    .collect::<Vec<_>>();
+                sample_semantic_rows(runtime, &mut rows, true).unwrap()
+            };
+            for row in 0..5 {
+                let token = sample_semantic_rows(
+                    runtime,
+                    &mut [FishS2SemanticRow {
+                        logits: &logits[row],
+                        allow_im_end: allow[row],
+                        previous: &previous[row],
+                        sampler: &mut alone[row],
+                    }],
+                    true,
+                )
+                .unwrap()[0];
+                assert_eq!(batched[row], token, "step {step} row {row}");
+                previous[row].push(token);
+            }
+        }
+        // Six steps of equal tokens: the rows' RNG streams stayed in step.
     }
 
     #[test]
