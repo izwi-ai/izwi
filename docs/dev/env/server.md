@@ -27,7 +27,7 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_HTTP_SHUTDOWN_PRESTOP_SECS` | `0` | Pre-stop window at shutdown (0-60): readiness is unready while requests are still served. |
 | `IZWI_HTTP_SHUTDOWN_GRACE_SECS` | `20` | How long in-flight HTTP requests may run after the pre-stop window (1-300); open chat streams get a terminal shutting-down event shortly before it ends. |
 | `IZWI_BATCH_WORKER_CONCURRENCY` | the runtime's capacity | Durable jobs the local batch worker runs at once, and `/v1/batches` lines in flight at once (at most the runtime's capacity). |
-| `IZWI_BATCH_STAGE_TIMEOUT_SECS` | 0 (none) | Wall-clock limit of one durable stage (30-86400; 0 disables). |
+| `IZWI_BATCH_STAGE_TIMEOUT_SECS` | `21600` | Wall-clock limit of one durable stage, in seconds from its start (30-86400; 0 disables). A stage is one whole job: raise it for recordings or scripts that take longer than six hours on this device. |
 | `IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS` | `20` | How long the batch worker drains at shutdown (1-300). |
 | `IZWI_MAX_REALTIME_REQUESTS` | the global request limit | Concurrent realtime-class requests. |
 | `IZWI_MAX_INTERACTIVE_REQUESTS` | the global request limit | Concurrent interactive-class requests. |

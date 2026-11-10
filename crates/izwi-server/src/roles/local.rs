@@ -451,8 +451,13 @@ pub(crate) fn batch_worker_concurrency(runtime_capacity: usize, configured: Opti
     }
 }
 
+/// The wall-clock limit of one durable stage (`IZWI_BATCH_STAGE_TIMEOUT_SECS`,
+/// 30-86400, 0 for none). A stage is one whole transcription or synthesis
+/// job and reports no progress the worker could time instead, so the
+/// default is six hours: far beyond a long recording or script, and short
+/// enough that a stage that hangs gives its slot back the same day.
 pub(crate) fn batch_stage_execution_timeout() -> Option<Duration> {
-    duration_secs_from_env("IZWI_BATCH_STAGE_TIMEOUT_SECS", 0, 30, 86_400)
+    duration_secs_from_env("IZWI_BATCH_STAGE_TIMEOUT_SECS", 21_600, 30, 86_400)
 }
 
 pub(crate) fn batch_worker_drain_timeout() -> Duration {

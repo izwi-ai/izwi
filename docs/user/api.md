@@ -150,6 +150,7 @@ Some older list routes return arrays or route-specific wrapper names. The route 
 | `IZWI_FILES_MAX_BYTES` | `209715200` (200 MB) | Largest file `/v1/files` accepts, at most 1 GiB. A larger upload is refused with `413`. |
 | `IZWI_BATCH_MAX_REQUESTS` | `50000` | Requests one `/v1/batches` input file may hold. A larger file fails its batch. |
 | `IZWI_BATCH_WORKER_CONCURRENCY` | The runtime's capacity | `/v1/batches` lines in flight at once, and durable jobs the batch worker runs at once. |
+| `IZWI_BATCH_STAGE_TIMEOUT_SECS` | `21600` (six hours) | Wall-clock limit of one durable job stage, from its start (30 to 86400). `0` disables it. |
 | `IZWI_BATCH_WEBHOOK_SECRET` | Unset (webhooks off) | Turns on `/v1/batches` completion webhooks and signs each delivery. See [Batch API](#batch-api). |
 | `IZWI_BATCH_WEBHOOK_ALLOW_HTTP`, `IZWI_BATCH_WEBHOOK_ALLOW_PRIVATE` | `false` | Allow `http://` webhook URLs, and webhook hosts on loopback, private or link-local addresses. |
 | `IZWI_AUDIO_STREAM_EVENT_QUEUE_CAPACITY` | `32` | Buffered SSE audio events for `/v1/audio/speech`. |
@@ -1621,6 +1622,12 @@ stage still has attempts left; a stage that used all of its attempts is not
 revived, so submit a new job instead. Stages and artifacts include IDs,
 capability/model metadata, attempt counts, timing/error fields, media/text
 asset references, and storage keys when available.
+
+A stage is one whole transcription or synthesis job. One that runs longer
+than `IZWI_BATCH_STAGE_TIMEOUT_SECS` (six hours by default, counted from the
+stage's start; `0` disables the limit) is cancelled and retried or failed
+like any other stage failure. Raise it for recordings or scripts that take
+longer than that on your device.
 
 ### Saved Voices
 

@@ -142,8 +142,8 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
     ),
     var(
         "IZWI_BATCH_STAGE_TIMEOUT_SECS",
-        "0 (none)",
-        "Wall-clock limit of one durable stage (30-86400; 0 disables).",
+        "21600",
+        "Wall-clock limit of one durable stage, in seconds from its start (30-86400; 0 disables). A stage is one whole job: raise it for recordings or scripts that take longer than six hours on this device.",
     ),
     var(
         "IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS",
