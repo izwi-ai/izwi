@@ -525,11 +525,12 @@ async fn fish_drama3_speaks_through_openai_speech() {
     assert_eq!(done["stop_reason"], "stop");
     assert_eq!(done["service_tier"], "flex");
 
-    // A batch: the tier is the batch's, reported when the request names it.
+    // A batch is batch work unless it names another tier; the tier is
+    // reported in the body when the request names it.
     for (tier, served) in [
         (Some("flex"), "flex"),
         (Some("priority"), "default"),
-        (None, "default"),
+        (None, "flex"),
     ] {
         let mut batch = body(text, seed);
         batch.as_object_mut().unwrap().remove("input");

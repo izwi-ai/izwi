@@ -1213,7 +1213,8 @@ fn add_speech_api_paths(paths: &mut Map<String, Value>) {
          `items` overrides. Returns `{id, object, results[], total, succeeded, failed}`; each \
          result carries base64 `audio_data` or an OpenAI `error` object, and an `id` for \
          `GET /v1/audio/speech/{speech_id}`. A top-level `service_tier` (or the \
-         X-Izwi-Service-Tier header) applies to every item: `flex` runs them as batch work. The \
+         X-Izwi-Service-Tier header) applies to every item: they run as batch work (`flex`) \
+         unless it is `default`, `auto` or `priority`. The \
          response names the tier served in X-Izwi-Service-Tier, and in `service_tier` when the \
          request named one.",
         preview_response(),

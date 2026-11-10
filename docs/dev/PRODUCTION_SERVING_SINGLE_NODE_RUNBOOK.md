@@ -834,7 +834,9 @@ authentication, admission and tenant lease:
 Without `IZWI_GATEWAY_AUDIO_UPSTREAMS`, the Realtime upstreams serve these
 routes when those are set.
 
-Bodies stream through unbuffered. A speech id's lookup goes to the upstream
+Bodies stream through unbuffered, so a request's `service_tier` field reaches
+the izwi-server as sent; the `X-Izwi-Service-Tier` request header is relayed
+too, and the response header naming the tier served comes back. A speech id's lookup goes to the upstream
 that served it; the gateway asks each upstream in turn for an id it has not
 seen.
 

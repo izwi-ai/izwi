@@ -3036,10 +3036,17 @@ async fn speech_api_passes_through_to_izwi_servers() {
         if !authorized {
             return StatusCode::UNAUTHORIZED.into_response();
         }
+        // The tier the upstream was asked for, as the server reports it.
+        let tier = headers
+            .get("x-izwi-service-tier")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("default")
+            .to_string();
         (
             [
-                ("content-type", "audio/mpeg"),
-                ("x-izwi-speech-id", "speech_up1"),
+                ("content-type", "audio/mpeg".to_string()),
+                ("x-izwi-speech-id", "speech_up1".to_string()),
+                ("x-izwi-service-tier", tier),
             ],
             format!("MP3:{body}"),
         )
@@ -3100,9 +3107,28 @@ async fn speech_api_passes_through_to_izwi_servers() {
     assert_eq!(response.status(), 200);
     assert_eq!(response.headers()["content-type"], "audio/mpeg");
     assert_eq!(response.headers()["x-izwi-speech-id"], "speech_up1");
+    assert_eq!(response.headers()["x-izwi-service-tier"], "default");
     assert_eq!(
         response.text().await.unwrap(),
         r#"MP3:{"model":"Kokoro-82M","input":"hi"}"#
+    );
+
+    // The service tier reaches the upstream unchanged, as a body field and
+    // as the header, and the tier the upstream served comes back.
+    let flex = client
+        .post(format!("http://127.0.0.1:{port}/v1/audio/speech"))
+        .bearer_auth(TEST_API_KEY)
+        .header("content-type", "application/json")
+        .header("x-izwi-service-tier", "flex")
+        .body(r#"{"model":"Kokoro-82M","input":"hi","service_tier":"flex"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(flex.status(), 200);
+    assert_eq!(flex.headers()["x-izwi-service-tier"], "flex");
+    assert_eq!(
+        flex.text().await.unwrap(),
+        r#"MP3:{"model":"Kokoro-82M","input":"hi","service_tier":"flex"}"#
     );
 
     let lookup = client

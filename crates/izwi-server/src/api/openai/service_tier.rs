@@ -4,7 +4,8 @@
 //! takes the same field and values on `/v1/audio/*`. `flex` marks a request
 //! as batch work, which yields to interactive and streaming requests;
 //! `auto` and `default` keep the route's own class; `priority` is accepted
-//! and served as `default`. A multipart client that cannot add a form field
+//! and served as `default`. `/v1/audio/speech/batch` is batch work unless
+//! the request names another tier. A multipart client that cannot add a form field
 //! sends the `X-Izwi-Service-Tier` header instead; the body field wins when
 //! both are present.
 //!
@@ -21,6 +22,9 @@ use crate::error::ApiError;
 
 /// The request and response header carrying a service tier.
 pub(crate) const SERVICE_TIER_HEADER: HeaderName = HeaderName::from_static("x-izwi-service-tier");
+
+/// The values `service_tier` takes, for error messages.
+const SUPPORTED_TIERS: &str = "auto, default, flex, priority";
 
 /// The tier a request is served at, and whether the request named one.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -49,17 +53,25 @@ impl ServiceTier {
         let flex = match value.trim().to_ascii_lowercase().as_str() {
             "flex" => true,
             "auto" | "default" | "priority" => false,
-            other => return Err(ApiError::invalid_param(
-                "service_tier",
-                format!(
-                    "Unsupported service_tier: {other}. Supported: auto, default, flex, priority"
-                ),
-            )),
+            other => {
+                return Err(ApiError::invalid_param(
+                    "service_tier",
+                    format!("Unsupported service_tier: {other}. Supported: {SUPPORTED_TIERS}"),
+                ))
+            }
         };
         Ok(Self {
             flex,
             requested: true,
         })
+    }
+
+    /// The tier of a batch surface: `flex` unless the request named one.
+    pub(crate) fn or_flex(self) -> Self {
+        Self {
+            flex: self.flex || !self.requested,
+            ..self
+        }
     }
 
     /// The class a request of this tier runs as on a route whose own class
@@ -135,6 +147,31 @@ mod tests {
             assert_eq!(
                 tier.workload_class(WorkloadClass::Interactive),
                 WorkloadClass::Interactive
+            );
+        }
+    }
+
+    #[test]
+    fn a_batch_surface_is_flex_until_the_request_names_a_tier() {
+        let unnamed = ServiceTier::default().or_flex();
+        assert_eq!(unnamed.as_str(), "flex");
+        assert_eq!(unnamed.reported(), None);
+        assert_eq!(
+            unnamed.workload_class(WorkloadClass::Interactive),
+            WorkloadClass::Batch
+        );
+        for (value, served, class) in [
+            ("flex", "flex", WorkloadClass::Batch),
+            ("default", "default", WorkloadClass::Interactive),
+            ("auto", "default", WorkloadClass::Interactive),
+            ("priority", "default", WorkloadClass::Interactive),
+        ] {
+            let tier = ServiceTier::parse(Some(value), None).unwrap().or_flex();
+            assert_eq!(tier.reported(), Some(served), "{value}");
+            assert_eq!(
+                tier.workload_class(WorkloadClass::Interactive),
+                class,
+                "{value}"
             );
         }
     }

@@ -12,7 +12,8 @@
 //! ```
 //!
 //! Top-level speech fields are defaults each item overrides; `service_tier`
-//! (or the `X-Izwi-Service-Tier` header) is the batch's alone. Items run
+//! (or the `X-Izwi-Service-Tier` header) is the batch's alone. A batch is
+//! batch work (`flex`) unless it names another tier. Items run
 //! concurrently up to `IZWI_TTS_BATCH_CONCURRENCY`, each with its own
 //! admission permit, so the engine batches items of one model and one batch
 //! cannot hold every slot; results keep the items' order. Every item gets a
@@ -228,7 +229,7 @@ pub async fn speech_batch(
 }
 
 /// The tier of a batch: its top-level `service_tier` (taken out of the
-/// item defaults) or the request header.
+/// item defaults) or the request header, and `flex` when neither names one.
 fn batch_service_tier(
     defaults: &mut Map<String, Value>,
     headers: &HeaderMap,
@@ -243,7 +244,7 @@ fn batch_service_tier(
             ))
         }
     };
-    ServiceTier::parse(field.as_deref(), headers.get(SERVICE_TIER_HEADER))
+    ServiceTier::parse(field.as_deref(), headers.get(SERVICE_TIER_HEADER)).map(ServiceTier::or_flex)
 }
 
 async fn run_item(
@@ -367,6 +368,12 @@ mod tests {
         headers.insert(SERVICE_TIER_HEADER, "priority".parse().unwrap());
         let tier = batch_service_tier(&mut fields(serde_json::json!({})), &headers).unwrap();
         assert_eq!(tier.reported(), Some("default"));
+
+        // A batch that names no tier is batch work, and does not report one.
+        let tier =
+            batch_service_tier(&mut fields(serde_json::json!({})), &HeaderMap::new()).unwrap();
+        assert_eq!(tier.as_str(), "flex");
+        assert_eq!(tier.reported(), None);
 
         for bad in [
             serde_json::json!({"service_tier": "fastest"}),

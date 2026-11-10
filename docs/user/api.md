@@ -356,7 +356,7 @@ extension with the same values:
 | `service_tier` | Served as | Effect |
 |----------------|-----------|--------|
 | `flex` | `flex` | The request runs as batch work: it is admitted and scheduled behind interactive and streaming requests. Use it for recordings and bulk synthesis that need not answer at once. `stream` and `stream_format` still work. |
-| `default`, `auto`, or absent | `default` | The route's own class: interactive for a whole-file answer, streaming for SSE and chunked audio. |
+| `default`, `auto`, or absent | `default` | The route's own class: interactive for a whole-file answer, streaming for SSE and chunked audio. On `/v1/audio/speech/batch` an absent tier is `flex`. |
 | `priority` | `default` | Accepted for compatibility and served as `default`. |
 
 Any other value returns `400` with `param: "service_tier"`.
@@ -364,6 +364,9 @@ Any other value returns `400` with `param: "service_tier"`.
 Send it as the `service_tier` field of a JSON body or multipart form. A
 client that cannot add a form field sends the `X-Izwi-Service-Tier` request
 header instead; when both are present the body field wins.
+
+The gateway's speech pass-through relays the field and the header to the
+izwi-server unchanged.
 
 Every response names the tier that served it in the `X-Izwi-Service-Tier`
 response header, binary audio, text, SRT and VTT included. When the request
@@ -765,8 +768,10 @@ Items run `IZWI_TTS_BATCH_CONCURRENCY` (8) at a time, each admitted on its
 own. An empty `items`, too many items, or `stream`/`stream_format` anywhere
 fails the whole request with `400`. `service_tier` (see
 [Audio Service Tier](#audio-service-tier)) is a top-level field that applies
-to every item; inside an item it returns `400`. The response carries
-`service_tier` when the request named one. Items whose audio would pass
+to every item; inside an item it returns `400`. A batch runs as batch work
+(`flex`) unless it says otherwise: send `"service_tier": "default"` to run
+its items in the interactive class, as before the tier existed. The response
+carries `service_tier` when the request named one. Items whose audio would pass
 `IZWI_TTS_BATCH_MAX_OUTPUT_MB` (256) fail with `413`-class errors.
 
 ### Audio Speech Stream

@@ -48,6 +48,7 @@ const FORWARDED_REQUEST_HEADERS: &[&str] = &[
     "accept-encoding",
     "x-request-id",
     "idempotency-key",
+    "x-izwi-service-tier",
 ];
 /// Response headers that describe the hop, not the content.
 const HOP_HEADERS: &[&str] = &[
