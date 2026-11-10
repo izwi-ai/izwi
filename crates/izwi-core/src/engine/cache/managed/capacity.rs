@@ -1088,7 +1088,18 @@ impl ManagedKvCacheManager {
                 )),
             }
         };
-        Ok(per_sequence_tokens * fit_pool_sequences(rows, budget_bytes, peak_bytes)?)
+        let sequences = fit_pool_sequences(rows, budget_bytes, peak_bytes)?;
+        tracing::info!(
+            ?model_instance,
+            rows,
+            sequences,
+            per_sequence_tokens,
+            headroom_bytes,
+            budget_bytes,
+            peak_bytes = peak_bytes(sequences)?,
+            "Fitted the CUDA retained pool to memory"
+        );
+        Ok(per_sequence_tokens * sequences)
     }
 }
 

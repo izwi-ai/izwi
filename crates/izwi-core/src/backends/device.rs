@@ -1523,17 +1523,48 @@ fn retain_cuda_pool_memory(device: &Device) {
 #[cfg(not(feature = "cuda"))]
 fn retain_cuda_pool_memory(_device: &Device) {}
 
-/// Bytes the device's default memory pool holds but no allocation uses: free
-/// for izwi's own allocations, though `cuMemGetInfo` counts them as used.
-/// `None` when the pool cannot be read.
+/// A CUDA memory pool's mapped bytes, and the bytes its live allocations use.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CudaPoolBytes {
+    pub reserved: u64,
+    pub used: u64,
+}
+
+impl CudaPoolBytes {
+    /// Mapped bytes no allocation uses.
+    pub(crate) fn idle(self) -> u64 {
+        self.reserved.saturating_sub(self.used)
+    }
+}
+
+/// The device's two memory pools before and after
+/// [`release_idle_cuda_memory`] trimmed them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CudaMemoryRelease {
+    pub default_pool: [CudaPoolBytes; 2],
+    /// `None` when the graph pool was left alone or could not be read.
+    pub graph_pool: Option<[CudaPoolBytes; 2]>,
+}
+
+impl CudaMemoryRelease {
+    /// Bytes the trims handed back to the driver.
+    pub(crate) fn released_bytes(&self) -> u64 {
+        let released =
+            |[before, after]: [CudaPoolBytes; 2]| before.reserved.saturating_sub(after.reserved);
+        released(self.default_pool) + self.graph_pool.map_or(0, released)
+    }
+}
+
+/// The device's default memory pool, which cudarc allocates every tensor
+/// from. `None` when the pool cannot be read.
 #[cfg(feature = "cuda")]
-pub(crate) fn cuda_pool_idle_bytes(
+fn cuda_default_pool_bytes(
     device: candle_core::cuda_backend::cudarc::driver::sys::CUdevice,
-) -> Option<u64> {
+) -> Option<CudaPoolBytes> {
     use candle_core::cuda_backend::cudarc::driver::sys;
 
     let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
-    let (mut reserved, mut used) = (0u64, 0u64);
+    let mut bytes = CudaPoolBytes::default();
     // SAFETY: the driver writes the pool handle and two u64 attributes into
     // the locals; the calls read no other memory.
     unsafe {
@@ -1543,11 +1574,11 @@ pub(crate) fn cuda_pool_idle_bytes(
         for (attribute, value) in [
             (
                 sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
-                &mut reserved,
+                &mut bytes.reserved,
             ),
             (
                 sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
-                &mut used,
+                &mut bytes.used,
             ),
         ] {
             if sys::cuMemPoolGetAttribute(pool, attribute, (value as *mut u64).cast())
@@ -1557,7 +1588,113 @@ pub(crate) fn cuda_pool_idle_bytes(
             }
         }
     }
-    Some(reserved.saturating_sub(used))
+    Some(bytes)
+}
+
+/// Bytes the device's default memory pool holds but no allocation uses: free
+/// for izwi's own allocations, though `cuMemGetInfo` counts them as used.
+/// `None` when the pool cannot be read.
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_pool_idle_bytes(
+    device: candle_core::cuda_backend::cudarc::driver::sys::CUdevice,
+) -> Option<u64> {
+    cuda_default_pool_bytes(device).map(CudaPoolBytes::idle)
+}
+
+/// The device's CUDA graph memory pool, which backs the allocations captured
+/// graphs make. Its idle pages are free only for graphs, so the VRAM probe
+/// counts them as used. The caller's thread must have the context current.
+#[cfg(feature = "cuda")]
+fn cuda_graph_pool_bytes(
+    device: candle_core::cuda_backend::cudarc::driver::sys::CUdevice,
+) -> Option<CudaPoolBytes> {
+    use candle_core::cuda_backend::cudarc::driver::sys::{self, CUgraphMem_attribute::*};
+
+    let mut bytes = CudaPoolBytes::default();
+    for (attribute, value) in [
+        (CU_GRAPH_MEM_ATTR_RESERVED_MEM_CURRENT, &mut bytes.reserved),
+        (CU_GRAPH_MEM_ATTR_USED_MEM_CURRENT, &mut bytes.used),
+    ] {
+        // SAFETY: the driver writes one u64 (a cuuint64_t) for every graph
+        // memory attribute.
+        let status = unsafe {
+            sys::cuDeviceGetGraphMemAttribute(device, attribute, (value as *mut u64).cast())
+        };
+        if status != sys::CUresult::CUDA_SUCCESS {
+            return None;
+        }
+    }
+    Some(bytes)
+}
+
+/// Hands the device's idle pooled memory back to the driver, and reports
+/// both pools before and after.
+///
+/// [`retain_cuda_pool_memory`] keeps freed memory in the default pool, so
+/// without this an unloaded model's weights and state stay mapped to the
+/// process for good: other processes cannot have them, and the next model
+/// can reuse them only through the default pool. Trimming frees only pages
+/// no live allocation uses, so call it after synchronizing the stream the
+/// frees were queued on; the models still resident map what they need again
+/// on their next step.
+///
+/// With `graph_pool` it also trims the graph memory pool, whose idle pages
+/// no other allocation can use. That unmaps the pages of every graph not
+/// running, and a graph cache charges the pages its next replay maps again
+/// against the bytes priced for it, so pass it only when no other model is
+/// resident.
+#[cfg(feature = "cuda")]
+pub(crate) fn release_idle_cuda_memory(
+    device: &Device,
+    graph_pool: bool,
+) -> Option<CudaMemoryRelease> {
+    use candle_core::cuda_backend::cudarc::driver::{result, sys};
+
+    let context = device
+        .as_cuda_device()
+        .ok()?
+        .cuda_stream()
+        .context()
+        .clone();
+    let cu_device = context.cu_device();
+    // SAFETY: `context` keeps the context alive; making it current only
+    // changes this thread's binding (the device thread already holds it).
+    unsafe { result::ctx::set_current(context.cu_ctx()) }.ok()?;
+    let default_before = cuda_default_pool_bytes(cu_device)?;
+    let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+    // SAFETY: the driver writes the pool handle; trimming releases only pages
+    // that back no outstanding allocation.
+    let trimmed = unsafe {
+        sys::cuDeviceGetDefaultMemPool(&mut pool, cu_device) == sys::CUresult::CUDA_SUCCESS
+            && sys::cuMemPoolTrimTo(pool, 0) == sys::CUresult::CUDA_SUCCESS
+    };
+    if !trimmed {
+        warn!("could not trim the CUDA memory pool");
+    }
+    let graph_pool = graph_pool
+        .then(|| {
+            let before = cuda_graph_pool_bytes(cu_device);
+            // SAFETY: the context is current; the driver frees only graph
+            // pages no running or scheduled graph uses.
+            let status = unsafe { sys::cuDeviceGraphMemTrim(cu_device) };
+            if status != sys::CUresult::CUDA_SUCCESS {
+                warn!(?status, "could not trim the CUDA graph memory pool");
+            }
+            Some([before?, cuda_graph_pool_bytes(cu_device)?])
+        })
+        .flatten();
+    Some(CudaMemoryRelease {
+        default_pool: [default_before, cuda_default_pool_bytes(cu_device)?],
+        graph_pool,
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn release_idle_cuda_memory(
+    _device: &Device,
+    _graph_pool: bool,
+) -> Option<CudaMemoryRelease> {
+    None
 }
 
 #[cfg(test)]
@@ -1595,6 +1732,34 @@ mod tests {
         context
             .check_err()
             .expect("dropping a tensor on a fresh thread must not latch a CUDA error");
+    }
+
+    /// The pool keeps a dropped tensor's pages mapped across synchronizations
+    /// (`retain_cuda_pool_memory`), so an unloaded model's memory left the
+    /// process only when the release trimmed it. The graph pool is left alone:
+    /// trimming it would remap the pages of graph tests running beside this.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn releasing_idle_cuda_memory_returns_freed_pages_to_the_driver() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        const BYTES: u64 = 256 << 20;
+        let tensor = candle_core::Tensor::zeros(BYTES as usize / 4, DType::F32, &device).unwrap();
+        device.synchronize().unwrap();
+        drop(tensor);
+        device.synchronize().unwrap();
+        let release = release_idle_cuda_memory(&device, false).expect("the CUDA pool is readable");
+        let [before, _] = release.default_pool;
+        assert!(
+            before.idle() >= BYTES,
+            "the pool kept the dropped tensor's pages: {before:?}"
+        );
+        assert!(
+            release.released_bytes() >= BYTES,
+            "the trim returned the dropped tensor's pages: {release:?}"
+        );
+        assert_eq!(release.graph_pool, None);
     }
 
     /// A request-owned ASR encoder artifact is dropped with its request on a

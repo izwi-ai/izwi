@@ -530,6 +530,20 @@ impl ManagedKvCacheManager {
     pub(crate) fn synchronize_worker(&self) -> Result<()> {
         self.worker_device.synchronize().map_err(Error::from)
     }
+
+    /// Synchronize the worker device, so every free queued on it has run,
+    /// then hand its idle pooled memory back to the driver (CUDA only; see
+    /// [`crate::backends::device::release_idle_cuda_memory`]).
+    pub(crate) fn release_idle_worker_memory(
+        &self,
+        graph_pool: bool,
+    ) -> Result<Option<crate::backends::device::CudaMemoryRelease>> {
+        self.synchronize_worker()?;
+        Ok(crate::backends::device::release_idle_cuda_memory(
+            &self.worker_device,
+            graph_pool,
+        ))
+    }
     #[cfg(test)]
     pub(crate) fn inject_composite_synchronize_failure(&mut self) {
         self.fail_next_composite_synchronize = true;

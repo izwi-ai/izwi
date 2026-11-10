@@ -3626,6 +3626,16 @@ impl Engine {
             .await
     }
 
+    /// Synchronize the worker device on its thread, then hand its idle pooled
+    /// memory back to the driver (CUDA only).
+    pub(crate) async fn release_idle_worker_memory(
+        &self,
+        graph_pool: bool,
+    ) -> Result<Option<crate::backends::device::CudaMemoryRelease>> {
+        self.with_core_on_device(None, |core| core.release_idle_worker_memory(graph_pool))
+            .await
+    }
+
     /// Admit and allocate managed physical state before the model generation
     /// becomes Ready.
     #[cfg(test)]
