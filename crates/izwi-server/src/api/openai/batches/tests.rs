@@ -343,6 +343,60 @@ async fn batches_are_created_read_listed_and_cancelled() {
 }
 
 #[tokio::test]
+async fn a_trusted_gateway_tenant_header_keeps_each_tenants_batches_apart() {
+    let server = TestServer::behind_gateway("batches-gateway-tenants", true);
+    let batch = create(&server, "tenant-a", TRANSCRIPTIONS, &input(&["one"])).await;
+    let id = batch["id"].as_str().unwrap();
+
+    // Another gateway tenant, and a caller that names none, see none of it
+    // and cannot use the input file.
+    for other in ["tenant-b", ""] {
+        for (method, path) in [
+            (Method::GET, format!("/v1/batches/{id}")),
+            (Method::POST, format!("/v1/batches/{id}/cancel")),
+        ] {
+            let response = server.call(method, &path, other).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{other:?} {path}");
+        }
+        let list = read_json(server.call(Method::GET, "/v1/batches", other).await).await;
+        assert_eq!(list["data"], json!([]), "{other:?}");
+        let stolen = server
+            .post_json(
+                "/v1/batches",
+                other,
+                json!({
+                    "input_file_id": batch["input_file_id"],
+                    "endpoint": TRANSCRIPTIONS,
+                    "completion_window": "24h",
+                }),
+            )
+            .await;
+        assert_eq!(stolen.status(), StatusCode::BAD_REQUEST, "{other:?}");
+    }
+    assert_eq!(get(&server, "tenant-a", id).await["status"], "validating");
+
+    // The batch runs as its tenant: its output file is that tenant's.
+    let executor = start(
+        &server,
+        runner(|job| async move { ok(json!({"text": job.custom_id.clone()})) }),
+        config(),
+    );
+    let done = wait_for_status(&server, "tenant-a", id, "completed").await;
+    let output = done["output_file_id"].as_str().unwrap();
+    assert_eq!(
+        custom_ids(&file_lines(&server, "tenant-a", &done["output_file_id"]).await),
+        ["one"]
+    );
+    for other in ["tenant-b", ""] {
+        let response = server
+            .call(Method::GET, &format!("/v1/files/{output}/content"), other)
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{other:?}");
+    }
+    executor.abort();
+}
+
+#[tokio::test]
 async fn an_input_file_that_breaks_the_line_format_fails_the_batch() {
     let server = TestServer::new("batches-validation");
     let body = json!({"model": "m", "audio_base64": "AAAA"});

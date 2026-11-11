@@ -26,6 +26,9 @@ pub type HookMetadata = BTreeMap<String, String>;
 pub enum HookError {
     #[error("enterprise hook denied request: {0}")]
     Denied(String),
+    /// The request itself is malformed (HTTP 400), not merely unauthorized.
+    #[error("enterprise hook rejected a malformed request: {0}")]
+    Invalid(String),
     #[error("enterprise hook did not find resource: {0}")]
     NotFound(String),
     #[error("enterprise hook failed: {0}")]

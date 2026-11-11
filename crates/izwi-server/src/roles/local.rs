@@ -75,7 +75,18 @@ pub(crate) async fn run_local(
              load and delete models and read or delete history. Set IZWI_API_KEY instead."
         );
     }
-    let enterprise_hooks = local_security::with_api_key(enterprise_hooks, api_key);
+    if tuning.trust_gateway_tenant_header {
+        info!(
+            "IZWI_TRUST_GATEWAY_TENANT_HEADER: files, batches and jobs are kept per gateway \
+             tenant (X-Izwi-Gateway-Tenant). Anyone who can reach this server with its API key \
+             can name any tenant, so only the gateway should reach it."
+        );
+    }
+    let enterprise_hooks = local_security::with_api_key(
+        enterprise_hooks,
+        api_key,
+        tuning.trust_gateway_tenant_header,
+    );
 
     let effective_runtime_config = serde_json::to_string(&serve_config)
         .context("failed to serialize effective server runtime configuration")?;

@@ -3425,6 +3425,185 @@ async fn speech_api_passes_through_to_izwi_servers() {
     ws.close(None).await.unwrap();
 }
 
+/// An upstream sees one caller, the gateway, so every relay names the
+/// caller's tenant: the same for the keys of one tenant, another for the
+/// next tenant, the minting principal's for a client-secret session, and
+/// never what the client sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relays_name_the_callers_tenant_to_the_upstream() {
+    use crate::api::request_context::GATEWAY_TENANT_HEADER;
+    use crate::app::audio_proxy::AudioUpstreams;
+    use crate::app::openai_realtime_proxy::OpenAiRealtimeUpstreams;
+    use axum::extract::ws::{Message as AxumMessage, WebSocketUpgrade};
+    use axum::http::HeaderMap;
+    use sha2::{Digest, Sha256};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue};
+
+    const SAME_TENANT_KEY: &str = "scoped-same-tenant-key-135791";
+
+    /// The tenant header values that reached the upstream.
+    fn tenants(headers: &HeaderMap) -> Vec<String> {
+        headers
+            .get_all(GATEWAY_TENANT_HEADER)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect()
+    }
+    // A stand-in izwi-server that answers with the tenant it was told.
+    let socket = |headers: HeaderMap, upgrade: WebSocketUpgrade| async move {
+        upgrade
+            .protocols(["realtime"])
+            .on_upgrade(move |mut socket| async move {
+                let created = json!({"type": "session.created", "tenants": tenants(&headers)});
+                let _ = socket
+                    .send(AxumMessage::Text(created.to_string().into()))
+                    .await;
+            })
+    };
+    let mint = |headers: HeaderMap| async move {
+        axum::Json(json!({
+            "value": "ek_minted",
+            "expires_at": 4_102_444_800u64,
+            "tenants": tenants(&headers),
+        }))
+    };
+    let upstream_app = Router::new()
+        .route("/v1/realtime", axum::routing::get(socket))
+        .route("/v1/audio/speech/stream", axum::routing::get(socket))
+        .route("/v1/realtime/client_secrets", axum::routing::post(mint))
+        .fallback(
+            |headers: HeaderMap| async move { axum::Json(json!({"tenants": tenants(&headers)})) },
+        );
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!(
+        "http://127.0.0.1:{}",
+        upstream_listener.local_addr().unwrap().port()
+    );
+    tokio::spawn(async move { axum::serve(upstream_listener, upstream_app).await });
+
+    let directory = {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var("IZWI_TEST_GW_SCOPED_A", TEST_SCOPED_INFERENCE_KEY);
+        std::env::set_var("IZWI_TEST_GW_SCOPED_B", TEST_SCOPED_OTHER_TENANT_KEY);
+        std::env::set_var("IZWI_TEST_GW_SCOPED_C", SAME_TENANT_KEY);
+        let directory = scoped_key_directory(
+            r#"{"version":1,"principals":[
+                {"principal_id":"svc-alpha","roles":["inference"],"tenant_id":"tenant-alpha","key_ref":"env:IZWI_TEST_GW_SCOPED_A"},
+                {"principal_id":"svc-beta","roles":["inference"],"tenant_id":"tenant-beta","key_ref":"env:IZWI_TEST_GW_SCOPED_B"},
+                {"principal_id":"svc-alpha-2","roles":["inference"],"tenant_id":"tenant-alpha","key_ref":"env:IZWI_TEST_GW_SCOPED_C"}]}"#,
+        )
+        .await;
+        for name in ["A", "B", "C"] {
+            std::env::remove_var(format!("IZWI_TEST_GW_SCOPED_{name}"));
+        }
+        directory
+    };
+    let (state, _worker) = registry_gateway_state(ModelVariant::Qwen354BGguf).await;
+    let app = create_gateway_router(
+        state
+            .with_principal_keys(directory)
+            .with_audio_upstreams(
+                AudioUpstreams::new(vec![upstream.clone()], None, true, 2).unwrap(),
+            )
+            .with_openai_realtime(OpenAiRealtimeUpstreams::new(vec![upstream], None, 8).unwrap()),
+        &GatewayServeConfig::default(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let tenant = |namespace: &str| json!([hex::encode(Sha256::digest(namespace.as_bytes()))]);
+    let alpha = tenant("tenant:tenant-alpha");
+    let beta = tenant("tenant:tenant-beta");
+    assert_ne!(alpha, beta);
+
+    // Every HTTP relay, whatever the client claims.
+    for (method, path) in [
+        (reqwest::Method::GET, "/v1/files"),
+        (reqwest::Method::POST, "/v1/batches"),
+        (reqwest::Method::GET, "/v1/jobs/job_1"),
+        (reqwest::Method::POST, "/v1/audio/speech"),
+        (reqwest::Method::GET, "/v1/audio/speech/speech_1"),
+        (reqwest::Method::GET, "/v1/realtime/capabilities"),
+    ] {
+        for (key, expected) in [
+            (TEST_SCOPED_INFERENCE_KEY, &alpha),
+            (SAME_TENANT_KEY, &alpha),
+            (TEST_SCOPED_OTHER_TENANT_KEY, &beta),
+        ] {
+            let response = client
+                .request(method.clone(), format!("{base}{path}"))
+                .bearer_auth(key)
+                .header(GATEWAY_TENANT_HEADER, "forged")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200, "{method} {path}");
+            let relayed: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(&relayed["tenants"], expected, "{method} {path}");
+        }
+    }
+    // The bootstrap key is a caller of its own.
+    let root: serde_json::Value = client
+        .get(format!("{base}/v1/files"))
+        .bearer_auth(TEST_API_KEY)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(root["tenants"].as_array().unwrap().len(), 1);
+    assert!(root["tenants"] != alpha && root["tenants"] != beta);
+
+    // The sockets: a key, and a browser with the client secret tenant alpha
+    // minted and no gateway key.
+    let minted: serde_json::Value = client
+        .post(format!("{base}/v1/realtime/client_secrets"))
+        .bearer_auth(TEST_SCOPED_INFERENCE_KEY)
+        .json(&json!({"session": {"type": "realtime"}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(minted["tenants"], alpha);
+    let secret_protocol = "realtime, openai-insecure-api-key.ek_minted";
+    let beta_key = format!("Bearer {TEST_SCOPED_OTHER_TENANT_KEY}");
+    for (path, credential, expected) in [
+        (
+            "/v1/realtime?model=izwi-voice",
+            ("authorization", beta_key.as_str()),
+            &beta,
+        ),
+        (
+            "/v1/audio/speech/stream",
+            ("authorization", beta_key.as_str()),
+            &beta,
+        ),
+        (
+            "/v1/realtime?model=izwi-voice",
+            ("sec-websocket-protocol", secret_protocol),
+            &alpha,
+        ),
+    ] {
+        let mut request = format!("ws://127.0.0.1:{port}{path}")
+            .into_client_request()
+            .unwrap();
+        let headers = request.headers_mut();
+        headers.insert(credential.0, HeaderValue::from_str(credential.1).unwrap());
+        headers.insert(GATEWAY_TENANT_HEADER, HeaderValue::from_static("forged"));
+        let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let created = ws.next().await.unwrap().unwrap();
+        let created: serde_json::Value = serde_json::from_str(created.to_text().unwrap()).unwrap();
+        assert_eq!(&created["tenants"], expected, "{path}");
+    }
+}
+
 /// Files, batches and durable jobs pass through to izwi-servers that share
 /// one store: every method reaches the upstream with its path and query, an
 /// upload streams through whole, and the gateway's own authentication

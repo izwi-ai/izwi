@@ -18,9 +18,14 @@
 //! (`/v1/jobs`) are relayed only with `IZWI_GATEWAY_AUDIO_SHARED_STATE=true`,
 //! when every upstream shares one records database and media store;
 //! otherwise a voice, file or batch made through one upstream would be
-//! missing on the next. An upstream sees the gateway as one caller (the
-//! upstream API key), so these objects are shared by every gateway
-//! principal.
+//! missing on the next.
+//!
+//! An upstream sees the gateway as one caller (the upstream API key), so
+//! every relayed request names the caller's tenant in
+//! `X-Izwi-Gateway-Tenant`. An upstream started with
+//! `IZWI_TRUST_GATEWAY_TENANT_HEADER=true` keeps each tenant's files,
+//! batches, jobs and speech lookups apart; one without it shares them among
+//! every gateway principal. Voices and consents are shared either way.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -37,7 +42,7 @@ use futures::TryStreamExt;
 use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, protocol::WebSocketConfig};
 use tracing::warn;
 
-use crate::api::request_context::RequestContext;
+use crate::api::request_context::{RequestContext, GATEWAY_TENANT_HEADER};
 use crate::app::openai_realtime_proxy::{json_error, relay, websocket_base, MAX_MESSAGE_BYTES};
 use crate::gateway::GatewayState;
 
@@ -193,18 +198,24 @@ async fn forward(
     method: Method,
     path_and_query: &str,
     headers: &HeaderMap,
-    correlation_id: &str,
+    context: &RequestContext,
     body: reqwest::Body,
 ) -> reqwest::Result<reqwest::Response> {
     let url = format!("{}{}", upstreams.bases[upstream], path_and_query);
-    let mut request = upstreams.client.request(method, url).body(body);
+    // The client's headers are relayed by name, so only this copy of the
+    // tenant header reaches the upstream.
+    let mut request = upstreams
+        .client
+        .request(method, url)
+        .header(GATEWAY_TENANT_HEADER, context.gateway_tenant())
+        .body(body);
     for name in FORWARDED_REQUEST_HEADERS {
         if let Some(value) = headers.get(*name) {
             request = request.header(*name, value.clone());
         }
     }
     if !headers.contains_key("x-request-id") {
-        request = request.header("x-request-id", correlation_id);
+        request = request.header("x-request-id", &context.correlation_id);
     }
     if let Some(key) = upstreams.api_key.as_deref() {
         request = request.bearer_auth(key);
@@ -269,7 +280,7 @@ pub async fn proxy_http(
         parts.method,
         &path_and_query,
         &parts.headers,
-        &context.correlation_id,
+        &context,
         body,
     )
     .await
@@ -340,7 +351,7 @@ pub async fn proxy_speech_lookup(
             Method::GET,
             &path,
             request.headers(),
-            &context.correlation_id,
+            &context,
             reqwest::Body::from(Vec::new()),
         )
         .await
@@ -405,6 +416,11 @@ pub async fn proxy_speech_stream(
     }
     if let Ok(value) = HeaderValue::from_str(&context.correlation_id) {
         upstream_request.headers_mut().insert("x-request-id", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&context.gateway_tenant()) {
+        upstream_request
+            .headers_mut()
+            .insert(GATEWAY_TENANT_HEADER, value);
     }
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE_BYTES))

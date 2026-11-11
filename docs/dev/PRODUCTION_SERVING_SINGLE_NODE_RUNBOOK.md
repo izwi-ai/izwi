@@ -863,13 +863,30 @@ would be missing on the next. With shared state, a batch created through one
 upstream is run by whichever upstream's executor leases it. Encoding always
 happens on the upstream.
 
-Two limits of these relayed records:
+Three limits of these relayed records:
 
-- The upstreams see the gateway as one caller (the upstream API key), so
-  voices, files, batches and jobs are shared by every gateway principal: a
-  file one gateway key uploads can be listed and read with another. Do not
-  set `IZWI_GATEWAY_AUDIO_SHARED_STATE` on a gateway whose principals must
-  not see each other's audio.
+- The upstreams see the gateway as one caller (the upstream API key). The
+  gateway therefore names the caller's tenant on every request it relays, in
+  `X-Izwi-Gateway-Tenant`: a digest of the principal key's `tenant_id`, or
+  of its `principal_id` when it has none, so the keys of one tenant share
+  their records. The gateway sets the header itself and never relays a
+  client's copy. An upstream acts on it only when started with
+  `IZWI_TRUST_GATEWAY_TENANT_HEADER=true`. Then files, batches (with their
+  output, error and speech audio files), `/v1/jobs/{id}` lookups, speech
+  lookups (`GET /v1/audio/speech/{id}`), idempotency keys and the upstream's
+  per-tenant limits (`IZWI_MAX_SPEECH_REQUESTS_PER_TENANT` and the like) are
+  kept per gateway tenant: another tenant's id answers `404`, like one that does not exist.
+  Records made by a client that reaches the upstream directly, and those
+  made before the setting was turned on, stay with direct callers.
+- Set `IZWI_TRUST_GATEWAY_TENANT_HEADER` on every upstream, and only on
+  upstreams that nothing but the gateway can reach: whoever can reach one
+  with its API key (anyone at all, on an upstream without a key) can name
+  any tenant. The gateway cannot tell whether an upstream has it. Without
+  it the header is ignored and files, batches and jobs are shared by every
+  gateway principal: a file one gateway key uploads can be listed and read
+  with another. Voices and consents are shared by every gateway principal
+  either way. Do not set `IZWI_GATEWAY_AUDIO_SHARED_STATE` on a gateway
+  whose principals must not use each other's voices.
 - An upload to `/v1/files` streams through the gateway unbuffered. The
   upstream's `IZWI_FILES_MAX_BYTES` bounds it and answers `413`; the gateway
   adds no limit of its own.

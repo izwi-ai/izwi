@@ -91,6 +91,11 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "The port is published on the host's loopback only (a container's `-p 127.0.0.1:…`): treat the bind as loopback, so no key is required and only loopback or IZWI_ALLOWED_HOSTS Host names are served.",
     ),
     var(
+        "IZWI_TRUST_GATEWAY_TENANT_HEADER",
+        "false",
+        "Keep files, batches, jobs and speech lookups apart per gateway tenant: a request that carries the API key (any request when no key is set) acts for the tenant its `X-Izwi-Gateway-Tenant` header names, which an Izwi gateway sets for every caller. Anyone who can reach the server with the key can name any tenant, so enable it only where the gateway is the server's sole client. Off, the header is ignored.",
+    ),
+    var(
         "IZWI_ALLOWED_HOSTS",
         "",
         "Comma-separated extra Host names to accept (port optional). On a non-loopback bind, setting it turns the Host check on.",
@@ -486,6 +491,8 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
 pub(crate) struct ServerTuning {
     pub(crate) allow_unauthenticated_network: bool,
     pub(crate) local_exposure: LocalExposure,
+    /// Requests act for the tenant `X-Izwi-Gateway-Tenant` names.
+    pub(crate) trust_gateway_tenant_header: bool,
     /// Unauthenticated probes carry uptime, capacity, queues and startup
     /// warnings only while no API key protects the server (loopback, the
     /// desktop app, development); a keyed server keeps them on its keyed
@@ -669,6 +676,7 @@ impl ServerTuning {
                 loopback_published: env.flag_or("IZWI_LOOPBACK_PUBLISHED", false)?,
                 allowed_hosts: allowed_hosts(env.get("IZWI_ALLOWED_HOSTS")?.unwrap_or(""))?,
             },
+            trust_gateway_tenant_header: env.flag_or("IZWI_TRUST_GATEWAY_TENANT_HEADER", false)?,
             public_probe_details: ["IZWI_API_KEY", "IZWI_API_KEY_FILE"]
                 .iter()
                 .all(|name| env.get_os(name).is_none_or(|value| value.is_empty())),

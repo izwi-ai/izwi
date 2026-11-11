@@ -1247,10 +1247,15 @@ between the batch ending and the delivery, so keep a poll as the fallback.
 **Through the gateway.** The gateway relays `/v1/files` and `/v1/batches`
 to its audio upstreams only with `IZWI_GATEWAY_AUDIO_SHARED_STATE=true`,
 which says every upstream shares one records database and media store (a
-single upstream does). The upstream then sees the gateway as one caller, so
-files and batches made through the gateway are shared by every gateway
-principal. Uploads stream through and are bounded by the upstream's
-`IZWI_FILES_MAX_BYTES`.
+single upstream does). The upstream sees the gateway as one caller, so the
+gateway tells it which tenant each request is for (the key's `tenant_id`,
+or the key itself when it has none). Start every upstream with
+`IZWI_TRUST_GATEWAY_TENANT_HEADER=true` and each tenant sees only its own
+files and batches: another tenant's id answers `404`. Only the gateway may
+reach such an upstream, because anyone holding the upstream's API key could
+name any tenant. Without the setting, files and batches made through the
+gateway are shared by every gateway principal. Uploads stream through and
+are bounded by the upstream's `IZWI_FILES_MAX_BYTES`.
 
 Transcribe recordings:
 

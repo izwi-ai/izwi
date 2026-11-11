@@ -323,7 +323,11 @@ pub struct GatewayArgs {
     /// voices and consents (`/v1/audio/voices`, `/v1/audio/voice_consents`),
     /// files (`/v1/files`), batches (`/v1/batches`) and durable jobs
     /// (`/v1/jobs`) are relayed too. The upstreams see the gateway as one
-    /// caller, so every gateway principal shares these objects.
+    /// caller, so every relayed request names the caller's tenant in
+    /// `X-Izwi-Gateway-Tenant`: upstreams started with
+    /// `IZWI_TRUST_GATEWAY_TENANT_HEADER=true` keep each tenant's files,
+    /// batches and jobs apart, and without it every gateway principal shares
+    /// them. Voices and consents are shared either way.
     #[arg(long, env = "IZWI_GATEWAY_AUDIO_SHARED_STATE", default_value_t = false)]
     pub gateway_audio_shared_state: bool,
 }

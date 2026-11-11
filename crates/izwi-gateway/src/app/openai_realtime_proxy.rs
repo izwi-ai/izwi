@@ -48,7 +48,7 @@ use tokio_tungstenite::tungstenite::{
 };
 use tracing::warn;
 
-use crate::api::request_context::RequestContext;
+use crate::api::request_context::{RequestContext, GATEWAY_TENANT_HEADER};
 use crate::gateway::GatewayState;
 
 /// The largest message either side may send: a 15 MiB audio append in base64.
@@ -215,7 +215,7 @@ impl OpenAiRealtimeUpstreams {
         method: Method,
         path: &str,
         headers: &HeaderMap,
-        correlation_id: &str,
+        context: &RequestContext,
         body: Bytes,
     ) -> reqwest::Result<UpstreamAnswer> {
         let base = &self.urls[upstream];
@@ -224,7 +224,8 @@ impl OpenAiRealtimeUpstreams {
         let mut request = self
             .client
             .request(method, url)
-            .header("x-request-id", correlation_id)
+            .header("x-request-id", &context.correlation_id)
+            .header(GATEWAY_TENANT_HEADER, context.gateway_tenant())
             .body(body);
         if let Some(content_type) = headers.get(header::CONTENT_TYPE) {
             request = request.header(header::CONTENT_TYPE, content_type.clone());
@@ -291,7 +292,7 @@ pub async fn proxy_client_secret(
             Method::POST,
             "/v1/realtime/client_secrets",
             &headers,
-            &context.correlation_id,
+            &context,
             body,
         )
         .await
@@ -337,7 +338,7 @@ pub async fn proxy_capabilities(
             Method::GET,
             "/v1/realtime/capabilities",
             &headers,
-            &context.correlation_id,
+            &context,
             Bytes::new(),
         )
         .await
@@ -488,6 +489,9 @@ async fn relay_session(
     }
     if let Ok(value) = HeaderValue::from_str(&context.correlation_id) {
         request.headers_mut().insert("x-request-id", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&context.gateway_tenant()) {
+        request.headers_mut().insert(GATEWAY_TENANT_HEADER, value);
     }
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE_BYTES))

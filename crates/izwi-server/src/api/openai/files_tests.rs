@@ -34,12 +34,19 @@ impl AuthProvider for HeaderTenantAuth {
     }
 }
 
+/// The API key of a [`TestServer::behind_gateway`].
+const GATEWAY_UPSTREAM_KEY: &str = "files-test-upstream-key-123456";
+
 /// A server on a temporary database and media directory whose requests
 /// belong to the tenant `x-test-tenant` names.
 pub(crate) struct TestServer {
     pub(crate) app: Router,
     pub(crate) state: AppState,
     pub(crate) root: std::path::PathBuf,
+    /// The header that carries a request's `tenant`.
+    tenant_header: &'static str,
+    /// Sent with every request that brings no credential of its own.
+    api_key: Option<&'static str>,
 }
 
 impl Drop for TestServer {
@@ -60,14 +67,46 @@ impl TestServer {
         root: std::path::PathBuf,
         models_dir: std::path::PathBuf,
     ) -> Self {
+        let mut hooks = EnterpriseHooks::noop();
+        hooks.auth = Arc::new(HeaderTenantAuth);
+        Self::with_hooks(root, models_dir, hooks, "x-test-tenant", None)
+    }
+
+    /// A server as a gateway's upstream: every request carries the server's
+    /// API key, and `tenant` is the gateway's `X-Izwi-Gateway-Tenant` (none
+    /// for an empty `tenant`, a caller that reaches the server directly),
+    /// which the server trusts when `trusts_tenant_header`.
+    pub(crate) fn behind_gateway(tag: &str, trusts_tenant_header: bool) -> Self {
+        let root = std::env::temp_dir().join(format!("izwi-{tag}-{}", uuid::Uuid::new_v4()));
+        let models_dir = root.join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        let hooks = crate::local_security::with_api_key(
+            EnterpriseHooks::noop(),
+            Some(crate::local_security::LocalApiKey::new(GATEWAY_UPSTREAM_KEY).expect("key")),
+            trusts_tenant_header,
+        );
+        Self::with_hooks(
+            root,
+            models_dir,
+            hooks,
+            crate::api::request_context::GATEWAY_TENANT_HEADER,
+            Some(GATEWAY_UPSTREAM_KEY),
+        )
+    }
+
+    fn with_hooks(
+        root: std::path::PathBuf,
+        models_dir: std::path::PathBuf,
+        hooks: EnterpriseHooks,
+        tenant_header: &'static str,
+        api_key: Option<&'static str>,
+    ) -> Self {
         let serve_config = ServeRuntimeConfig {
             backend: izwi_core::backends::BackendPreference::Cpu,
             ui_enabled: false,
             models_dir,
             ..ServeRuntimeConfig::default()
         };
-        let mut hooks = EnterpriseHooks::noop();
-        hooks.auth = Arc::new(HeaderTenantAuth);
         let state = {
             let _guard = env_lock();
             std::env::set_var("IZWI_DB_PATH", root.join("izwi.sqlite3"));
@@ -84,10 +123,18 @@ impl TestServer {
             app: crate::api::create_router(state.clone(), &serve_config),
             state,
             root,
+            tenant_header,
+            api_key,
         }
     }
 
-    pub(crate) async fn send(&self, request: Request<Body>) -> Response {
+    pub(crate) async fn send(&self, mut request: Request<Body>) -> Response {
+        if let Some(key) = self.api_key {
+            request
+                .headers_mut()
+                .entry(header::AUTHORIZATION)
+                .or_insert_with(|| format!("Bearer {key}").parse().expect("a header value"));
+        }
         self.app
             .clone()
             .as_service::<Body>()
@@ -96,13 +143,21 @@ impl TestServer {
             .expect("a response")
     }
 
+    /// A request builder for `tenant`.
+    fn request(&self, tenant: &str) -> axum::http::request::Builder {
+        let builder = Request::builder();
+        if tenant.is_empty() {
+            return builder;
+        }
+        builder.header(self.tenant_header, tenant)
+    }
+
     /// A request without a body from `tenant`.
     pub(crate) async fn call(&self, method: Method, path: &str, tenant: &str) -> Response {
         self.send(
-            Request::builder()
+            self.request(tenant)
                 .method(method)
                 .uri(path)
-                .header("x-test-tenant", tenant)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -112,10 +167,9 @@ impl TestServer {
     /// A JSON request from `tenant`.
     pub(crate) async fn post_json(&self, path: &str, tenant: &str, body: Value) -> Response {
         self.send(
-            Request::builder()
+            self.request(tenant)
                 .method(Method::POST)
                 .uri(path)
-                .header("x-test-tenant", tenant)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap(),
@@ -150,10 +204,9 @@ impl TestServer {
         body.extend_from_slice(content);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         self.send(
-            Request::builder()
+            self.request(tenant)
                 .method(Method::POST)
                 .uri("/v1/files")
-                .header("x-test-tenant", tenant)
                 .header(
                     header::CONTENT_TYPE,
                     format!("multipart/form-data; boundary={boundary}"),
@@ -387,6 +440,79 @@ async fn a_file_is_visible_to_its_tenant_only() {
     assert_eq!(other["first_id"], Value::Null);
     // The other tenant's delete removed nothing.
     assert_eq!(server.content("a", &id).await, b"secret");
+}
+
+/// The ids `tenant` lists.
+async fn listed_ids(server: &TestServer, tenant: &str) -> Vec<String> {
+    json(server.call(Method::GET, "/v1/files", tenant).await).await["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_trusted_gateway_tenant_header_keeps_each_tenants_files_apart() {
+    let server = TestServer::behind_gateway("files-gateway-tenants", true);
+    // A caller that reaches the server directly names no tenant.
+    let direct = server.upload_ok("", "batch", "f.jsonl", b"direct").await;
+    let of_a = server.upload_ok("tenant-a", "batch", "f.jsonl", b"a").await;
+    let of_b = server.upload_ok("tenant-b", "batch", "f.jsonl", b"b").await;
+
+    for (tenant, own) in [("", &direct), ("tenant-a", &of_a), ("tenant-b", &of_b)] {
+        assert_eq!(listed_ids(&server, tenant).await, std::slice::from_ref(own));
+    }
+    for (tenant, id) in [("tenant-b", &of_a), ("", &of_a), ("tenant-a", &direct)] {
+        for (method, path) in [
+            (Method::GET, format!("/v1/files/{id}")),
+            (Method::GET, format!("/v1/files/{id}/content")),
+            (Method::DELETE, format!("/v1/files/{id}")),
+        ] {
+            let response = server.call(method.clone(), &path, tenant).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{tenant:?} {method} {path}"
+            );
+        }
+    }
+    assert_eq!(server.content("tenant-a", &of_a).await, b"a");
+    assert_eq!(server.content("", &direct).await, b"direct");
+
+    // A tenant the gateway would never send is refused, not guessed at.
+    let too_long = "t".repeat(129);
+    for tenant in ["tenant a", "tenant/a", "tenant,b", too_long.as_str()] {
+        let response = server.call(Method::GET, "/v1/files", tenant).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{tenant:?}");
+    }
+
+    // The header counts only with the server's API key.
+    let keyless = server
+        .send(
+            server
+                .request("tenant-a")
+                .uri("/v1/files")
+                .header(header::AUTHORIZATION, "Bearer not-the-upstream-key-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(keyless.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn an_untrusted_gateway_tenant_header_is_ignored() {
+    let server = TestServer::behind_gateway("files-gateway-untrusted", false);
+    let id = server.upload_ok("tenant-a", "batch", "f.jsonl", b"a").await;
+    for tenant in ["tenant-b", "", "not a tenant"] {
+        assert_eq!(
+            listed_ids(&server, tenant).await,
+            std::slice::from_ref(&id),
+            "{tenant:?}"
+        );
+        assert_eq!(server.content(tenant, &id).await, b"a");
+    }
 }
 
 #[tokio::test]

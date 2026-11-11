@@ -4424,6 +4424,7 @@ async fn local_api_key_guards_api_routes_but_not_probes() {
     let hooks = crate::local_security::with_api_key(
         EnterpriseHooks::noop(),
         Some(crate::local_security::LocalApiKey::new(KEY).unwrap()),
+        false,
     );
     let (state, temp_dir) = test_state_with_hooks("local_api_key_guard", false, hooks);
     state.lifecycle.mark_ready();

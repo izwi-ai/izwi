@@ -12,6 +12,13 @@
 //! whatever provider the build supplies, so the principal (and therefore the
 //! tenant) still comes from that provider.
 //!
+//! A gateway relays every caller's requests with that one key, so it names
+//! the caller's tenant in `X-Izwi-Gateway-Tenant`. With
+//! `IZWI_TRUST_GATEWAY_TENANT_HEADER` the same wrapper makes that tenant part
+//! of the principal, which keeps each gateway tenant's files, batches, jobs
+//! and speech lookups apart. Any holder of the key can send the header, so
+//! the setting is for servers only the gateway reaches.
+//!
 //! Independently of the key, [`guard_local_request`] protects browsers'
 //! access to the server: a loopback-only server only answers loopback `Host`
 //! names and `IZWI_ALLOWED_HOSTS` (DNS rebinding), and writes and WebSocket
@@ -35,6 +42,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::api::request_context::{principal_namespace, GATEWAY_TENANT_HEADER};
 use crate::api::DESKTOP_CORS_ORIGINS;
 use crate::error::ApiError;
 use crate::gateway_security::{constant_time_eq, is_loopback_host, validate_secret};
@@ -45,6 +53,7 @@ pub(crate) const API_KEY_FILE_ENV: &str = "IZWI_API_KEY_FILE";
 /// The key's 4096-byte maximum plus a trailing CRLF.
 const MAX_API_KEY_FILE_BYTES: u64 = 4098;
 const API_KEY_HEADER: &str = "x-api-key";
+const MAX_GATEWAY_TENANT_BYTES: usize = 128;
 /// Same-site cookie the web UI sets after asking for the key, so browser
 /// requests that cannot carry headers (EventSource, WebSocket, media URLs)
 /// authenticate too.
@@ -197,14 +206,18 @@ fn allows_any_origin(serve_config: &ServeRuntimeConfig) -> bool {
                 .any(|origin| origin.trim() == "*"))
 }
 
-/// Install the API key check in front of the build's auth provider.
+/// Install the API key check in front of the build's auth provider, and
+/// with `trust_gateway_tenant` (`IZWI_TRUST_GATEWAY_TENANT_HEADER`) the
+/// gateway's tenant header.
 pub(crate) fn with_api_key(
     mut hooks: EnterpriseHooks,
     api_key: Option<LocalApiKey>,
+    trust_gateway_tenant: bool,
 ) -> EnterpriseHooks {
-    if let Some(key) = api_key {
+    if api_key.is_some() || trust_gateway_tenant {
         hooks.auth = Arc::new(LocalApiKeyAuth {
-            key,
+            key: api_key,
+            trust_gateway_tenant,
             inner: hooks.auth.clone(),
         });
     }
@@ -212,15 +225,20 @@ pub(crate) fn with_api_key(
 }
 
 struct LocalApiKeyAuth {
-    key: LocalApiKey,
+    key: Option<LocalApiKey>,
+    trust_gateway_tenant: bool,
     inner: Arc<dyn AuthProvider>,
 }
 
 #[async_trait]
 impl AuthProvider for LocalApiKeyAuth {
     async fn authenticate(&self, request: &RequestEnvelope) -> HookResult<Principal> {
-        if !is_public_request(&request.method, &request.path)
-            && !presented_api_keys(request).any(|candidate| self.key.matches(&candidate))
+        let keyed = self
+            .key
+            .as_ref()
+            .is_none_or(|key| presented_api_keys(request).any(|candidate| key.matches(&candidate)));
+        if !keyed
+            && !is_public_request(&request.method, &request.path)
             && !crate::app::openai_realtime::secrets::admits(
                 &request.method,
                 &request.path,
@@ -235,8 +253,50 @@ impl AuthProvider for LocalApiKeyAuth {
                     .to_string(),
             ));
         }
-        self.inner.authenticate(request).await
+        let principal = self.inner.authenticate(request).await?;
+        // A realtime client secret or a public path is not the gateway.
+        if self.trust_gateway_tenant && keyed {
+            if let Some(tenant) = gateway_tenant(request)? {
+                return Ok(for_gateway_tenant(principal, tenant));
+            }
+        }
+        Ok(principal)
     }
+}
+
+/// The tenant the gateway names for its caller, if the request carries one.
+fn gateway_tenant(request: &RequestEnvelope) -> HookResult<Option<&str>> {
+    let mut values = request
+        .headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case(GATEWAY_TENANT_HEADER))
+        .map(|header| header.value.as_str());
+    let Some(tenant) = values.next() else {
+        return Ok(None);
+    };
+    let valid = (1..=MAX_GATEWAY_TENANT_BYTES).contains(&tenant.len())
+        && tenant
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte));
+    if !valid || values.next().is_some() {
+        return Err(HookError::Invalid(format!(
+            "{GATEWAY_TENANT_HEADER} must be one value of 1-{MAX_GATEWAY_TENANT_BYTES} \
+             letters, digits, '-', '_', '.' or ':'"
+        )));
+    }
+    Ok(Some(tenant))
+}
+
+/// `principal` acting for one gateway tenant: a tenant of its own, so what
+/// it stores is kept from the gateway's other tenants and from callers that
+/// reach this server directly. `/` is in no gateway tenant, which keeps the
+/// two halves apart.
+fn for_gateway_tenant(mut principal: Principal, tenant: &str) -> Principal {
+    principal.tenant_id = Some(format!(
+        "{}/gateway:{tenant}",
+        principal_namespace(&principal)
+    ));
+    principal
 }
 
 /// Probes, and GET/HEAD requests outside the API (the web UI's static files
@@ -476,6 +536,7 @@ mod tests {
         with_api_key(
             EnterpriseHooks::noop(),
             Some(LocalApiKey::new(KEY).unwrap()),
+            false,
         )
         .auth
     }
@@ -659,6 +720,89 @@ mod tests {
             .await,
             Err(HookError::Denied(_))
         ));
+    }
+
+    /// With `IZWI_TRUST_GATEWAY_TENANT_HEADER`, a request with the API key
+    /// acts for the tenant the gateway names; a direct caller stays who it
+    /// was.
+    #[tokio::test]
+    async fn a_trusted_gateway_tenant_header_names_the_principals_tenant() {
+        let bearer = format!("Bearer {KEY}");
+        let request = |tenants: &[&str]| {
+            let mut headers = vec![("authorization", bearer.as_str())];
+            headers.extend(
+                tenants
+                    .iter()
+                    .map(|tenant| ("x-izwi-gateway-tenant", *tenant)),
+            );
+            envelope("GET", "/v1/files", &headers)
+        };
+        let key = || Some(LocalApiKey::new(KEY).unwrap());
+        let trusting = with_api_key(EnterpriseHooks::noop(), key(), true).auth;
+
+        let direct = trusting.authenticate(&request(&[])).await.unwrap();
+        assert_eq!(direct, Principal::local_anonymous());
+        let a = trusting
+            .authenticate(&request(&["tenant-a"]))
+            .await
+            .unwrap();
+        let b = trusting
+            .authenticate(&request(&["tenant-b"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            a.tenant_id.as_deref(),
+            Some("principal:local-anonymous/gateway:tenant-a")
+        );
+        assert_ne!(a.tenant_id, b.tenant_id);
+
+        let too_long = "t".repeat(MAX_GATEWAY_TENANT_BYTES + 1);
+        for invalid in [
+            &[""][..],
+            &["tenant a"],
+            &["a/b"],
+            &[&too_long],
+            &["a", "b"],
+        ] {
+            assert!(
+                matches!(
+                    trusting.authenticate(&request(invalid)).await,
+                    Err(HookError::Invalid(_))
+                ),
+                "{invalid:?}"
+            );
+        }
+
+        // A realtime client secret is not the gateway's credential.
+        let (secret, _) =
+            crate::app::openai_realtime::secrets::mint(serde_json::json!({"type": "realtime"}), 60)
+                .expect("mint");
+        let secret = format!("Bearer {secret}");
+        let session = envelope(
+            "GET",
+            "/v1/realtime",
+            &[
+                ("authorization", secret.as_str()),
+                ("x-izwi-gateway-tenant", "tenant-a"),
+            ],
+        );
+        assert_eq!(
+            trusting.authenticate(&session).await.unwrap(),
+            Principal::local_anonymous()
+        );
+
+        // Without the setting the header means nothing, valid or not.
+        for tenant in ["tenant-a", "not a tenant"] {
+            assert_eq!(
+                auth().authenticate(&request(&[tenant])).await.unwrap(),
+                Principal::local_anonymous()
+            );
+        }
+
+        // A server without a key trusts whoever reaches it.
+        let keyless = with_api_key(EnterpriseHooks::noop(), None, true).auth;
+        let unkeyed = envelope("GET", "/v1/files", &[("x-izwi-gateway-tenant", "tenant-a")]);
+        assert_eq!(keyless.authenticate(&unkeyed).await.unwrap(), a);
     }
 
     #[tokio::test]

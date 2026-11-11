@@ -278,6 +278,7 @@ async fn a_call_needs_the_api_key_or_a_client_secret() {
     let server = serve_with_hooks(crate::local_security::with_api_key(
         izwi_hooks::EnterpriseHooks::noop(),
         Some(crate::local_security::LocalApiKey::new(KEY).expect("key")),
+        false,
     ))
     .await;
     let url = format!("ws://{}/v1/realtime/media-stream", server.addr);

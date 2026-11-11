@@ -94,7 +94,7 @@ Scrape `GET /v1/metrics/prometheus`. The [metrics reference](/api#metrics) descr
 - **Kokoro streams are not paced.** A streamed Kokoro request runs outside the scheduler that paces other speech streams. It still counts as its model's live demand, so the reserve applies to batch Kokoro work beside it.
 - **First-party durable jobs take no tier.** They always run as batch work.
 - **Running work is not preempted.** A live request can wait for the batch job in front of it on the device to finish; bounded batch steps keep that wait short for the models that support them.
-- **One server holds a batch.** Files and batches live in the server's own store. Behind the gateway they are served only when its upstreams share that store ([Batch API](/api#batch-api)).
+- **One server holds a batch.** Files and batches live in the server's own store. Behind the gateway they are served only when its upstreams share that store, and each gateway tenant sees only its own once the upstreams run with `IZWI_TRUST_GATEWAY_TENANT_HEADER=true` ([Batch API](/api#batch-api)).
 
 ---
 

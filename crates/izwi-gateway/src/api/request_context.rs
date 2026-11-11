@@ -26,6 +26,12 @@ use crate::gateway::GatewayState;
 use crate::gateway_security::MAX_GATEWAY_REQUEST_ID_BYTES;
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
+/// Names the gateway caller's tenant on every request the gateway relays to
+/// an izwi-server, which sees the gateway as one caller (the upstream API
+/// key). A server that trusts it (`IZWI_TRUST_GATEWAY_TENANT_HEADER`) keeps
+/// each tenant's files, batches and jobs apart. The gateway never relays a
+/// client's copy.
+pub const GATEWAY_TENANT_HEADER: &str = "x-izwi-gateway-tenant";
 const MAX_GATEWAY_HEADER_COUNT: usize = 128;
 const MAX_GATEWAY_HEADER_BYTES: usize = 32 * 1024;
 const MAX_GATEWAY_HEADER_VALUE_BYTES: usize = 8 * 1024;
@@ -86,6 +92,17 @@ impl RequestContext {
         }
         use sha2::{Digest, Sha256};
         Some(Sha256::digest(principal_namespace(&self.principal).as_bytes()).into())
+    }
+
+    /// The caller's tenant as the gateway names it to an izwi-server
+    /// ([`GATEWAY_TENANT_HEADER`]): the digest of the namespace its quotas
+    /// and leases use, so the keys of one tenant share their files and
+    /// batches, and no tenant or principal name leaves the gateway.
+    pub fn gateway_tenant(&self) -> String {
+        use sha2::{Digest, Sha256};
+        ::hex::encode(Sha256::digest(
+            principal_namespace(&self.principal).as_bytes(),
+        ))
     }
 
     /// Stable durable-store namespace derived only from authenticated identity.
@@ -285,6 +302,8 @@ pub async fn attach_gateway_request_context(
         );
     }
 
+    // Only the gateway names a caller's tenant to its upstreams.
+    req.headers_mut().remove(GATEWAY_TENANT_HEADER);
     let trace = RequestTrace::resolve(&mut req).context;
     let context = RequestContext::new(correlation_id.clone(), principal.clone()).with_trace(trace);
     let stream_outcome = context.stream_outcome.clone();
@@ -819,6 +838,7 @@ async fn record_request_outcome(
 fn auth_failure_status(err: &HookError) -> StatusCode {
     match err {
         HookError::Denied(_) => StatusCode::UNAUTHORIZED,
+        HookError::Invalid(_) => StatusCode::BAD_REQUEST,
         HookError::NotFound(_) => StatusCode::INTERNAL_SERVER_ERROR,
         HookError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -827,6 +847,7 @@ fn auth_failure_status(err: &HookError) -> StatusCode {
 fn policy_failure_status(err: &HookError) -> StatusCode {
     match err {
         HookError::Denied(_) => StatusCode::FORBIDDEN,
+        HookError::Invalid(_) => StatusCode::BAD_REQUEST,
         HookError::NotFound(_) => StatusCode::INTERNAL_SERVER_ERROR,
         HookError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
