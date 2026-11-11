@@ -31,6 +31,8 @@ use crate::models::shared::config::checkpoint_dtype_from_config_json;
 use crate::models::shared::sampling::{sample_chat_rows, ChatSampler};
 use crate::models::shared::weights::gguf::GgufLoader;
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
+use izwi_model_catalog::chat::tools::hermes_tools_prompt;
+use izwi_model_catalog::chat::ChatRequestConfig;
 
 #[derive(Debug, Clone)]
 pub struct ChatGenerationOutput {
@@ -1013,57 +1015,149 @@ impl Qwen3ChatModel {
     }
 
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
-        self.build_prompt(messages)
+        self.prompt_token_ids_for_request(messages, &ChatRequestConfig::default())
     }
 
-    fn build_prompt(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
-        if messages.is_empty() {
-            return Err(Error::InvalidInput(
-                "Chat request must include at least one message".to_string(),
-            ));
-        }
-
-        let mut prompt_messages = messages.to_vec();
-        if !matches!(
-            prompt_messages.first().map(|m| &m.role),
-            Some(ChatRole::System)
-        ) {
-            prompt_messages.insert(
-                0,
-                ChatMessage {
-                    role: ChatRole::System,
-                    content: "You are a helpful assistant.".to_string(),
-                },
-            );
-        }
-
+    /// The prompt for `messages` with the request's tools and thinking
+    /// switch, as the Qwen3 chat template writes it.
+    pub fn prompt_token_ids_for_request(
+        &self,
+        messages: &[ChatMessage],
+        request: &ChatRequestConfig,
+    ) -> Result<Vec<u32>> {
+        let (turns, opening) = prompt_turns(messages, request)?;
         let mut ids = Vec::new();
-        for message in &prompt_messages {
-            let content = if matches!(message.role, ChatRole::Assistant) {
-                strip_think_blocks(message.content.trim())
-            } else {
-                message.content.trim().to_string()
-            };
-
-            if content.is_empty() {
-                continue;
-            }
-
+        for (role, content) in &turns {
             ids.push(self.tokenizer.specials.im_start);
-            ids.extend(
-                self.tokenizer
-                    .encode_text(&format!("{}\n", message.role.as_prompt_role()))?,
-            );
-            ids.extend(self.tokenizer.encode_text(&content)?);
+            ids.extend(self.tokenizer.encode_text(&format!("{role}\n"))?);
+            ids.extend(self.tokenizer.encode_text(content)?);
             ids.push(self.tokenizer.specials.im_end);
             ids.extend(self.tokenizer.encode_text("\n")?);
         }
-
         ids.push(self.tokenizer.specials.im_start);
-        ids.extend(self.tokenizer.encode_text("assistant\n")?);
-
+        ids.extend(
+            self.tokenizer
+                .encode_text(&format!("assistant\n{opening}"))?,
+        );
         Ok(ids)
     }
+}
+
+/// The turns of a Qwen3 prompt as `(role, content)`, and what the prompt
+/// writes after the final `assistant\n` header.
+///
+/// This follows the Qwen3 chat template (`Qwen/Qwen3-4B`): tools are listed
+/// in the system turn after the system text, in the Hermes format; tool
+/// results are `<tool_response>` blocks in a user turn, consecutive ones in
+/// the same turn; reasoning is kept only on assistant turns after the last
+/// user query. Unlike the template, a conversation without a system message
+/// gets a default one, and message text is trimmed.
+fn prompt_turns(
+    messages: &[ChatMessage],
+    request: &ChatRequestConfig,
+) -> Result<(Vec<(&'static str, String)>, String)> {
+    if messages.is_empty() {
+        return Err(Error::InvalidInput(
+            "Chat request must include at least one message".to_string(),
+        ));
+    }
+
+    let mut messages = messages.to_vec();
+    if !matches!(messages.first().map(|m| &m.role), Some(ChatRole::System)) {
+        messages.insert(
+            0,
+            ChatMessage {
+                role: ChatRole::System,
+                content: "You are a helpful assistant.".to_string(),
+            },
+        );
+    }
+    // The last user message that asks something; tool results after it
+    // belong to the answer in progress.
+    let last_query_index = messages
+        .iter()
+        .rposition(|message| message.role == ChatRole::User && !is_tool_response(&message.content))
+        .unwrap_or(messages.len());
+
+    let mut turns: Vec<(&'static str, String)> = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        let content = match message.role {
+            ChatRole::System if index == 0 && !request.tools.is_empty() => {
+                let system = message.content.trim();
+                let tools = hermes_tools_prompt(&request.tools);
+                if system.is_empty() {
+                    tools
+                } else {
+                    format!("{system}\n\n{tools}")
+                }
+            }
+            ChatRole::Assistant => {
+                let (reasoning, answer) = split_assistant_reasoning(message.content.trim());
+                let is_last = index + 1 == messages.len();
+                if index > last_query_index && (is_last || !reasoning.is_empty()) {
+                    format!(
+                        "<think>\n{reasoning}\n</think>\n\n{}",
+                        answer.trim_start_matches('\n')
+                    )
+                } else {
+                    strip_think_blocks(message.content.trim())
+                }
+            }
+            ChatRole::Tool => {
+                let block = format!(
+                    "<tool_response>\n{}\n</tool_response>",
+                    message.content.trim()
+                );
+                // Consecutive results share one user turn.
+                if index > 0 && messages[index - 1].role == ChatRole::Tool {
+                    if let Some((_, turn)) = turns.last_mut() {
+                        turn.push('\n');
+                        turn.push_str(&block);
+                        continue;
+                    }
+                }
+                block
+            }
+            _ => message.content.trim().to_string(),
+        };
+        if content.is_empty() {
+            continue;
+        }
+        let role = match message.role {
+            ChatRole::System => "system",
+            ChatRole::User | ChatRole::Tool => "user",
+            ChatRole::Assistant => "assistant",
+        };
+        turns.push((role, content));
+    }
+
+    let opening = if request.enable_thinking == Some(false) {
+        "<think>\n\n</think>\n\n"
+    } else {
+        ""
+    };
+    Ok((turns, opening.to_string()))
+}
+
+fn is_tool_response(content: &str) -> bool {
+    let content = content.trim();
+    content.starts_with("<tool_response>") && content.ends_with("</tool_response>")
+}
+
+/// An assistant message's `(reasoning, answer)` when it carries a closed
+/// `<think>` block, as the template splits it.
+fn split_assistant_reasoning(content: &str) -> (&str, &str) {
+    let Some(end) = content.find("</think>") else {
+        return ("", content);
+    };
+    let before = &content[..end];
+    let reasoning = before
+        .rsplit_once("<think>")
+        .map_or(before, |(_, reasoning)| reasoning);
+    (
+        reasoning.trim_matches('\n'),
+        content[end + "</think>".len()..].trim_start_matches('\n'),
+    )
 }
 
 fn strip_think_blocks(input: &str) -> String {
@@ -1120,7 +1214,11 @@ fn parse_qwen3_gguf_config(loader: &GgufLoader) -> Result<Qwen3Config> {
     // parser serves the family.
     let arch = ["qwen3moe", "qwen3"]
         .into_iter()
-        .find(|arch| loader.get_metadata_u64(&format!("{arch}.block_count")).is_some())
+        .find(|arch| {
+            loader
+                .get_metadata_u64(&format!("{arch}.block_count"))
+                .is_some()
+        })
         .ok_or_else(|| {
             Error::ModelLoadError("Missing or invalid GGUF metadata: qwen3.block_count".to_string())
         })?;
@@ -1394,7 +1492,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            model.continuous_decode_batch_workspace_per_row_bytes().unwrap(),
+            model
+                .continuous_decode_batch_workspace_per_row_bytes()
+                .unwrap(),
             hidden_only + 4 * model.text_model.lm_head_size() as u64
         );
     }
@@ -1897,7 +1997,10 @@ mod stream_tests {
                     sample.join().expect("sampler stream"),
                 )
             });
-            assert_eq!(decoded, expected_decode, "iteration {iteration}: decode stream");
+            assert_eq!(
+                decoded, expected_decode,
+                "iteration {iteration}: decode stream"
+            );
             assert_eq!(sampled, greedy, "iteration {iteration}: sampler stream");
         }
     }
@@ -2030,6 +2133,33 @@ mod stream_tests {
             );
             assert_eq!(summary(&split), summary(&mixed));
             assert_eq!(split.pending_logprobs, mixed.pending_logprobs);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tool_prompt_reference_tests {
+    use super::*;
+    use crate::models::shared::tool_prompt_reference::{reference_cases, ReferenceCase};
+    use izwi_model_catalog::chat::tools::ToolDialect;
+
+    fn render(case: &ReferenceCase) -> String {
+        let (turns, opening) = prompt_turns(&case.messages, &case.request).unwrap();
+        let mut prompt = String::new();
+        for (role, content) in turns {
+            prompt.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
+        }
+        prompt.push_str("<|im_start|>assistant\n");
+        prompt.push_str(&opening);
+        prompt
+    }
+
+    /// The Qwen3 prompt builder writes tool conversations exactly as the
+    /// published chat template does.
+    #[test]
+    fn tool_prompts_match_the_qwen3_chat_template() {
+        for case in reference_cases("qwen3", ToolDialect::HermesJson) {
+            assert_eq!(render(&case), case.prompt, "case {}", case.name);
         }
     }
 }

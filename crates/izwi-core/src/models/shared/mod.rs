@@ -20,4 +20,6 @@ pub(crate) mod speech_duration;
 pub(crate) mod state;
 pub mod telemetry;
 pub(crate) mod text_normalize;
+#[cfg(test)]
+pub(crate) mod tool_prompt_reference;
 pub mod weights;
