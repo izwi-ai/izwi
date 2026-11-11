@@ -745,7 +745,8 @@ impl NativeExecutor {
                 .any(|scheduled| scheduled.is_prefill || scheduled.num_tokens < 1)
         {
             return Err(Error::InvalidInput(
-                "continuous chat execution requires a positive decode token count per row".to_string(),
+                "continuous chat execution requires a positive decode token count per row"
+                    .to_string(),
             ));
         }
         // DS9.4: a speculative envelope is homogeneous — every row carries the
@@ -927,9 +928,7 @@ impl NativeExecutor {
                         "speculative envelopes require an MTP speculative model".to_string(),
                     ));
                 }
-                Self::run_blocking(|| {
-                    model.decode_speculative_batch(&mut state_refs, budget)
-                })?
+                Self::run_blocking(|| model.decode_speculative_batch(&mut state_refs, budget))?
             }
             None => Self::run_blocking(|| model.decode_step_batch(&mut state_refs))?,
         };
@@ -1568,7 +1567,7 @@ mod tests {
             config.seed,
             NativeExecutor::chat_request_seed("req-sampling")
         );
-        assert_eq!(config.request, request.chat_config);
+        assert_eq!(config.request, *request.chat_config);
     }
 
     /// EXE-F9: a caller's seed, not the request id, seeds sampling, so the

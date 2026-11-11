@@ -424,11 +424,32 @@ async fn synthetic_speaker_attribution_and_one_model_diarization() {
 /// in-order join of each segment translated alone, its stream's deltas and
 /// progress follow the segments in order, and a transcription of the same
 /// audio stays one pass.
+///
+/// The segmented path nests the whole ASR request future; an unoptimized
+/// test build polls it within a few percent of the default 2 MiB stack, so
+/// any growth of a request type overflowed it. The test runs on a thread,
+/// and a runtime, with room to spare.
+#[test]
+fn synthetic_long_translations_run_in_segments() {
+    const STACK_BYTES: usize = 32 << 20;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(STACK_BYTES)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    std::thread::Builder::new()
+        .stack_size(STACK_BYTES)
+        .spawn(move || runtime.block_on(long_translations_run_in_segments()))
+        .expect("a test thread")
+        .join()
+        .expect("the test body");
+}
+
 // The env lock is held across awaits on purpose: it keeps the span
 // variable fixed for the whole test.
 #[allow(clippy::await_holding_lock)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn synthetic_long_translations_run_in_segments() {
+async fn long_translations_run_in_segments() {
     use super::asr::{append_segment, plan_translation_segments, segment_wav};
     use crate::engine::{AsrProgress, AsrProgressPhase, AsrTaskOptions};
     use crate::models::architectures::nemotron_transcribe::PREFILL_SPAN_ENV;
