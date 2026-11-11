@@ -16,6 +16,7 @@ Per case it records:
   stream_equal  the streamed answer, reassembled, makes the same calls as the
                 non-streamed one (run with a fixed seed)
   finish        `finish_reason` is `tool_calls` exactly when calls came back
+                (`length` when the output budget cut the answer off)
 
 Usage (standard library only):
 
@@ -25,7 +26,8 @@ Usage (standard library only):
 
 `--thinking off|on|default` sets `enable_thinking`; `--only` filters cases by
 substring; `--skip-forced` leaves out the `tool_choice` required / named /
-`parallel_tool_calls` cases for servers that refuse them.
+`parallel_tool_calls` cases for servers that refuse them; `--strict` marks
+every tool `strict: true`, so the server must hold calls to the schemas.
 """
 import argparse
 import json
@@ -340,7 +342,11 @@ def score(case, result, stream_result):
                 row["problems"].append(f"missing call {want}")
             else:
                 remaining.remove(match)
-    row["finish_ok"] = (result["finish"] == "tool_calls") == bool(calls)
+    # An answer the output budget cut off reports `length`, with or without
+    # calls.
+    row["finish_ok"] = result["finish"] == "length" or (
+        (result["finish"] == "tool_calls") == bool(calls)
+    )
     if stream_result is not None:
         row["stream_equal"] = parsed_calls(stream_result) == calls and normalized(
             stream_result["content"]
@@ -358,6 +364,7 @@ def main():
     parser.add_argument("--only", default="")
     parser.add_argument("--thinking", choices=["on", "off", "default"], default="off")
     parser.add_argument("--skip-forced", action="store_true")
+    parser.add_argument("--strict", action="store_true", help="mark every tool `strict: true`")
     parser.add_argument("--no-stream", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--timeout", type=float, default=600)
@@ -368,6 +375,11 @@ def main():
         name, messages, tools, _expected, extras = case
         if args.only not in name or (args.skip_forced and extras.get("forced")):
             continue
+        if args.strict:
+            tools = [
+                {"type": "function", "function": dict(tool["function"], strict=True)}
+                for tool in tools
+            ]
         payload = {
             "model": args.model,
             "messages": messages,
@@ -399,7 +411,13 @@ def main():
         print(f"{'ERR   ' if 'error' in row else flags}  {name:36s} {row['seconds']:7.2f}s  {row.get('error') or '; '.join(row['problems'])}")
 
     scored = [row for row in rows if "error" not in row]
-    summary = {"model": args.model, "thinking": args.thinking, "cases": len(rows), "errors": len(rows) - len(scored)}
+    summary = {
+        "model": args.model,
+        "thinking": args.thinking,
+        "strict": args.strict,
+        "cases": len(rows),
+        "errors": len(rows) - len(scored),
+    }
     for key in ("called", "valid_name", "valid_schema", "exact", "finish_ok", "stream_equal"):
         values = [row[key] for row in scored if key in row]
         summary[key] = f"{sum(values)}/{len(values)}"

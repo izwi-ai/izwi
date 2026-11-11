@@ -52,16 +52,23 @@ impl ToolSchemas {
     /// The value of an argument written as bare text (the XML formats'
     /// `<parameter=k>` body), read by the parameter's declared type: a
     /// `string` parameter keeps its text even when the text is `123`, `true`
-    /// or `null`; any other declared type is read as JSON. Only an undeclared
-    /// or untyped parameter is guessed (JSON when it parses, else text).
+    /// or `null`; any other declared type is read as JSON (a boolean or null
+    /// also in Python's spelling). Only an undeclared or untyped parameter is
+    /// guessed (JSON when it parses, else text).
     pub fn text_argument(&self, tool: &str, parameter: &str, raw: &str) -> Value {
         let parsed = || serde_json::from_str::<Value>(raw).ok();
         let text = || Value::String(raw.to_string());
         let Some(kinds) = self.property(tool, parameter).and_then(declared_types) else {
             return parsed().unwrap_or_else(text);
         };
-        if kinds.iter().any(|kind| kind == "null") && raw == "null" {
-            return Value::Null;
+        let declares = |kind: &str| kinds.iter().any(|declared| declared == kind);
+        // Python literals: Qwen3.5's own template writes booleans and null
+        // this way in history, so the model writes them too.
+        match raw {
+            "null" | "None" if declares("null") => return Value::Null,
+            "True" if declares("boolean") => return Value::Bool(true),
+            "False" if declares("boolean") => return Value::Bool(false),
+            _ => {}
         }
         // The JSON reading wins when it has one of the declared non-string
         // types; otherwise the text is the value when a string is allowed.
@@ -160,6 +167,11 @@ mod tests {
         let schemas = schemas();
         assert_eq!(schemas.text_argument("f", "count", "5"), json!(5));
         assert_eq!(schemas.text_argument("f", "on", "true"), json!(true));
+        assert_eq!(schemas.text_argument("f", "on", "True"), json!(true));
+        assert_eq!(schemas.text_argument("f", "on", "False"), json!(false));
+        assert_eq!(schemas.text_argument("f", "due", "None"), Value::Null);
+        // A string parameter keeps the word.
+        assert_eq!(schemas.text_argument("f", "id", "True"), json!("True"));
         assert_eq!(schemas.text_argument("f", "tags", "[\"a\"]"), json!(["a"]));
         // Text that is not the declared type stays text for the client to see.
         assert_eq!(schemas.text_argument("f", "count", "five"), json!("five"));

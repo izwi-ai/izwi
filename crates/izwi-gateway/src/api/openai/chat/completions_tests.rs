@@ -615,7 +615,8 @@ async fn a_forced_tool_call_is_opened_in_the_prompt_and_parsed_from_it() {
         request.chat_config.response_prefix,
         "<tool_call>\n<function=get_weather>\n"
     );
-    assert_eq!(request.stop, ["END"]);
+    // A named function is one call: generation ends at its close tag.
+    assert_eq!(request.stop, ["END", "</tool_call>"]);
     assert!(!format.reasoning_opened_in_prompt);
     let response = render_completion_response(
         request.variant,

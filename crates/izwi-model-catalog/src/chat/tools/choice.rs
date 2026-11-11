@@ -126,16 +126,17 @@ impl ToolPlan {
         })
     }
 
-    /// The most calls the answer may make.
+    /// The most calls the answer may make: one when parallel calls are off,
+    /// and one when a function is named (the answer is that call).
     pub fn max_calls(&self) -> Option<usize> {
-        (!self.parallel).then_some(1)
+        (!self.parallel || matches!(self.choice, ToolChoice::Named(_))).then_some(1)
     }
 
     /// A stop sequence that ends generation when the only call the answer
     /// may make closes, so no tokens are spent on calls that would be
     /// dropped.
     pub fn stop_sequence(&self) -> Option<&'static str> {
-        (!self.parallel).then(|| self.dialect.call_closer())
+        self.max_calls().map(|_| self.dialect.call_closer())
     }
 
     /// The parser for this request's answer.
