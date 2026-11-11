@@ -1,6 +1,6 @@
 //! Text-to-speech runtime methods.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tracing::info;
@@ -9,6 +9,7 @@ use crate::backends::BackendKind;
 use crate::catalog::ModelFamily;
 use crate::engine::{
     tts_explicit_output_limit, GenerationParams as CoreGenParams, ResourceAmount, ResourceVector,
+    StreamPacing,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -295,6 +296,148 @@ impl DirectTtsObservationContext {
     }
 }
 
+/// Seconds of audio a stream may run ahead of real time before its request
+/// is paced (`IZWI_STREAM_LEAD_SECS`, 3 by default; 0 disables pacing).
+fn stream_lead_threshold_secs() -> f64 {
+    static SECS: crate::env::ReadOnce<f64> = crate::env::ReadOnce::new(|| {
+        crate::env::value("IZWI_STREAM_LEAD_SECS")
+            .and_then(|raw| raw.parse::<f64>().ok())
+            .filter(|secs| secs.is_finite() && *secs >= 0.0)
+            .unwrap_or(3.0)
+    });
+    SECS.get()
+}
+
+/// How far a stream is ahead of real time: the audio it has handed on less
+/// the time since it handed on the first of it. A listener who plays the
+/// stream as it arrives holds this much audio unplayed.
+fn stream_lead_secs(audio_secs: f64, since_first_audio: Duration) -> f64 {
+    audio_secs - since_first_audio.as_secs_f64()
+}
+
+/// Paces one stream by its lead over real time. Once the lead passes the
+/// threshold the request is scheduled from the Batch class's share, so
+/// audio nobody is waiting for does not take device time from live
+/// requests; it returns to its own class when the lead has fallen to half
+/// the threshold. Nothing is throttled: with no competing work a paced
+/// stream runs at full speed.
+struct StreamPacer {
+    threshold_secs: f64,
+    pacing: StreamPacing,
+    first_audio: Option<Instant>,
+    audio_secs: f64,
+}
+
+impl StreamPacer {
+    /// A pacer for one stream, or `None` when `threshold_secs` disables
+    /// pacing.
+    fn new(threshold_secs: f64) -> Option<Self> {
+        (threshold_secs > 0.0).then(|| Self {
+            threshold_secs,
+            pacing: StreamPacing::default(),
+            first_audio: None,
+            audio_secs: 0.0,
+        })
+    }
+
+    /// Count `audio_secs` more audio handed on at `now`.
+    fn observe(&mut self, audio_secs: f64, now: Instant) {
+        let first_audio = *self.first_audio.get_or_insert(now);
+        self.audio_secs += audio_secs;
+        let lead = stream_lead_secs(self.audio_secs, now.duration_since(first_audio));
+        let paced = self.pacing.is_paced(now);
+        if lead <= self.threshold_secs && !paced {
+            return;
+        }
+        if !paced {
+            crate::engine::metrics::record_stream_pacing_transition();
+        }
+        // With no more audio the lead falls to half the threshold at this
+        // time, so the request returns to its class then even if the
+        // stream produces nothing in between. Audio handed on while paced
+        // moves the time out.
+        let resume_after = (lead - self.threshold_secs / 2.0).max(0.0);
+        self.pacing
+            .pace_until(now + Duration::from_secs_f64(resume_after));
+    }
+}
+
+/// One speech request's labels, clock and audio total for the speech metrics
+/// (`izwi_tts_first_audio_seconds`, `izwi_tts_output_audio_seconds_total`).
+pub(crate) struct TtsRequestMetrics<'a> {
+    runtime: &'a RuntimeService,
+    /// Model, backend and workload class.
+    labels: [&'static str; 3],
+    admission_ms: f64,
+    started: Instant,
+    audio_secs: f64,
+    first_audio_recorded: bool,
+    /// Paces the request while its audio streams from the engine.
+    pacer: Option<StreamPacer>,
+}
+
+impl<'a> TtsRequestMetrics<'a> {
+    fn new(
+        runtime: &'a RuntimeService,
+        request: &GenerationRequest,
+        model_variant: ModelVariant,
+    ) -> Self {
+        Self {
+            runtime,
+            labels: [
+                model_variant.dir_name(),
+                runtime.backend_router.default_backend().kind().as_str(),
+                request.runtime_context.workload_class.as_str(),
+            ],
+            admission_ms: request.runtime_context.admission_ms.unwrap_or(0.0),
+            started: Instant::now(),
+            audio_secs: 0.0,
+            first_audio_recorded: false,
+            pacer: None,
+        }
+    }
+
+    /// Start pacing the request's stream by the audio [`Self::streamed`]
+    /// sees, and return the handle its engine request carries; `None` when
+    /// pacing is disabled.
+    fn start_pacing(&mut self) -> Option<StreamPacing> {
+        self.pacer = StreamPacer::new(stream_lead_threshold_secs());
+        self.pacer.as_ref().map(|pacer| pacer.pacing.clone())
+    }
+
+    /// Audio about to be handed to the stream's transport. The first of it
+    /// is the request's first audio, timed from server admission.
+    pub(crate) fn streamed(&mut self, samples: usize, sample_rate: u32) {
+        if samples == 0 {
+            return;
+        }
+        if let Some(pacer) = self.pacer.as_mut().filter(|_| sample_rate > 0) {
+            pacer.observe(samples as f64 / f64::from(sample_rate), Instant::now());
+        }
+        if !self.first_audio_recorded {
+            self.first_audio_recorded = true;
+            self.runtime.record_tts_first_audio(
+                &self.labels,
+                self.admission_ms / 1000.0 + self.started.elapsed().as_secs_f64(),
+            );
+        }
+        self.buffered(samples, sample_rate);
+    }
+
+    /// Audio returned whole, with no first-audio time of its own.
+    fn buffered(&mut self, samples: usize, sample_rate: u32) {
+        if sample_rate > 0 {
+            self.audio_secs += samples as f64 / f64::from(sample_rate);
+        }
+    }
+
+    /// Counts the audio of a request that completed.
+    fn complete(self) {
+        self.runtime
+            .record_tts_output_audio(&self.labels, self.audio_secs);
+    }
+}
+
 /// Kokoro streams its planned chunks natively on the direct route; every
 /// other TTS request, streaming or not, runs on the engine.
 fn uses_direct_streaming_tts_runtime(variant: ModelVariant) -> bool {
@@ -577,6 +720,7 @@ impl RuntimeService {
     pub async fn generate(&self, request: GenerationRequest) -> Result<GenerationResult> {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
         let request = normalize_speech_text(request, resolved_variant);
+        let mut metrics = TtsRequestMetrics::new(self, &request, resolved_variant);
         let core_params = core_params_from_generation(&request.config);
         let core_request = TtsRuntimeRequest::from_generation(request, resolved_variant)?
             .into_engine_request(core_params);
@@ -590,6 +734,8 @@ impl RuntimeService {
         let samples = output.audio.samples;
         let sample_rate = output.audio.sample_rate;
         ensure_speech_audio(resolved_variant, &output.request_id, &samples, sample_rate)?;
+        metrics.buffered(samples.len(), sample_rate);
+        metrics.complete();
         let total_tokens = output.num_tokens;
         let total_time_ms = output.generation_time.as_secs_f32() * 1000.0;
 
@@ -626,6 +772,7 @@ impl RuntimeService {
     ) -> Result<()> {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
         let request = normalize_speech_text(request, resolved_variant);
+        let mut metrics = TtsRequestMetrics::new(self, &request, resolved_variant);
         if uses_direct_streaming_tts_runtime(resolved_variant) {
             let observation = DirectTtsObservationContext::new(&request, resolved_variant, true);
             let retained_input_bytes = direct_tts_retained_input_bytes(&request)?;
@@ -650,12 +797,15 @@ impl RuntimeService {
                 .await?;
             let result = match resolved_variant.family() {
                 ModelFamily::KokoroTts => {
-                    self.kokoro_tts_generate_streaming(&job, request, chunk_tx)
+                    self.kokoro_tts_generate_streaming(&job, request, chunk_tx, &mut metrics)
                         .await
                 }
                 _ => unreachable!("direct TTS family checked above"),
             };
             self.record_direct_tts_observation(observation, result.as_ref().map(|_| None));
+            if result.is_ok() {
+                metrics.complete();
+            }
             return result;
         }
         let core_params = core_params_from_generation(&request.config);
@@ -671,6 +821,7 @@ impl RuntimeService {
             .continues_speech_across_chunks()
             .then(crate::engine::TtsGeneratedCodesSink::default);
         core_request.tts_generated_codes = generated_codes.clone();
+        core_request.stream_pacing = metrics.start_pacing();
 
         let terminal_deadline = core_request.deadline;
         let budget_frames = core_request.params.max_tokens;
@@ -681,6 +832,7 @@ impl RuntimeService {
                 let sequence = next_sequence;
                 if !stream_chunk.samples.is_empty() {
                     next_sequence += 1;
+                    metrics.streamed(stream_chunk.samples.len(), stream_chunk.sample_rate);
                 }
                 async move {
                     if stream_chunk.samples.is_empty() {
@@ -700,7 +852,11 @@ impl RuntimeService {
             })
             .await?;
 
+        // The request has ended: whatever audio is still to hand on, there
+        // is nothing left to pace.
+        metrics.pacer = None;
         if let Some(samples) = unstreamed_terminal_pcm(&mut output.audio, next_sequence) {
+            metrics.streamed(samples.len(), output.audio.sample_rate);
             let chunk = AudioChunk::new(output.request_id.clone(), next_sequence, samples)
                 .with_sample_rate(output.audio.sample_rate);
             next_sequence += 1;
@@ -734,6 +890,7 @@ impl RuntimeService {
             .and_then(crate::engine::TtsGeneratedCodesSink::take)
             .map(std::sync::Arc::new);
         send_terminal_tts_chunk(&chunk_tx, terminal, terminal_deadline).await?;
+        metrics.complete();
         info!("Streaming generation complete via core engine");
         Ok(())
     }
@@ -1330,6 +1487,130 @@ mod tests {
             ),
             Err(Error::InvalidInput(message)) if message.contains("reference_text") && message.contains("32-character")
         ));
+    }
+
+    #[test]
+    fn stream_lead_is_the_audio_handed_on_less_the_time_since_the_first_of_it() {
+        assert_eq!(stream_lead_secs(5.0, Duration::from_secs(2)), 3.0);
+        assert_eq!(stream_lead_secs(1.0, Duration::from_secs(4)), -3.0);
+        assert_eq!(stream_lead_secs(0.5, Duration::ZERO), 0.5);
+    }
+
+    #[test]
+    fn a_stream_is_paced_above_the_threshold_and_restored_below_half_of_it() {
+        let mut pacer = StreamPacer::new(3.0).expect("pacing is on");
+        let pacing = pacer.pacing.clone();
+        let start = Instant::now();
+        let at = |secs: f64| start + Duration::from_secs_f64(secs);
+
+        // Two seconds of audio at once: a lead of 2 s, under the threshold.
+        pacer.observe(2.0, at(0.0));
+        assert!(!pacing.is_paced(at(0.0)));
+        // Three more a second later: a lead of 4 s. With no more audio it
+        // falls to 1.5 s at 3.5 s.
+        pacer.observe(3.0, at(1.0));
+        assert!(pacing.is_paced(at(1.0)));
+        assert!(pacing.is_paced(at(3.4)));
+        assert!(!pacing.is_paced(at(3.6)));
+        // Audio handed on while paced, with the lead between half the
+        // threshold and the threshold, keeps the stream paced for longer.
+        pacer.observe(0.4, at(3.0));
+        assert!(pacing.is_paced(at(3.8)));
+        assert!(!pacing.is_paced(at(4.0)));
+        // Once restored, the same lead does not pace it again.
+        pacer.observe(1.0, at(4.5));
+        assert!(!pacing.is_paced(at(4.5)));
+        // A stream that falls behind real time is never paced.
+        pacer.observe(0.1, at(30.0));
+        assert!(!pacing.is_paced(at(30.0)));
+    }
+
+    #[tokio::test]
+    async fn stream_pacing_follows_the_environment_and_is_off_at_zero() {
+        const LEAD: &str = "IZWI_STREAM_LEAD_SECS";
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = std::env::var_os(LEAD);
+        let runtime = RuntimeService::new(crate::EngineConfig::default()).expect("runtime");
+        let request = GenerationRequest::new("speak");
+        let mut metrics = TtsRequestMetrics::new(&runtime, &request, ModelVariant::Kokoro82M);
+
+        std::env::remove_var(LEAD);
+        assert_eq!(stream_lead_threshold_secs(), 3.0);
+        let pacing = metrics.start_pacing().expect("pacing is on by default");
+        // Four seconds of audio at once is more than three ahead.
+        metrics.streamed(96_000, 24_000);
+        assert!(pacing.is_paced(Instant::now()));
+
+        std::env::set_var(LEAD, "0");
+        assert_eq!(stream_lead_threshold_secs(), 0.0);
+        assert!(StreamPacer::new(0.0).is_none());
+        assert!(metrics.start_pacing().is_none());
+        metrics.streamed(96_000, 24_000);
+
+        std::env::set_var(LEAD, "-1");
+        assert_eq!(stream_lead_threshold_secs(), 3.0);
+        match saved {
+            Some(value) => std::env::set_var(LEAD, value),
+            None => std::env::remove_var(LEAD),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_metrics_time_first_audio_once_and_count_completed_audio() {
+        use crate::runtime::types::RuntimeRequestContext;
+
+        let runtime = RuntimeService::new(crate::EngineConfig::default()).expect("runtime");
+        let variant = ModelVariant::Kokoro82M;
+        let mut request = GenerationRequest::new("speak");
+        request.runtime_context =
+            RuntimeRequestContext::new(WorkloadClass::Realtime).with_admission_ms(250.0);
+
+        // A stream: two chunks of one second, one first-audio observation.
+        let mut stream = TtsRequestMetrics::new(&runtime, &request, variant);
+        stream.streamed(0, 24_000);
+        stream.streamed(24_000, 24_000);
+        stream.streamed(24_000, 24_000);
+        stream.complete();
+        // A buffered request: counted, with no first audio of its own.
+        request.runtime_context = RuntimeRequestContext::new(WorkloadClass::Batch);
+        let mut buffered = TtsRequestMetrics::new(&runtime, &request, variant);
+        buffered.buffered(12_000, 24_000);
+        buffered.complete();
+        // A stream that never completes counts no audio.
+        let mut failed = TtsRequestMetrics::new(&runtime, &request, variant);
+        failed.streamed(24_000, 24_000);
+
+        let payload = runtime.telemetry_prometheus().await;
+        let series = |family: &str, workload_class: &str| {
+            payload
+                .lines()
+                .find(|line| {
+                    line.starts_with(&format!("{family}{{model=\"{}\"", variant.dir_name()))
+                        && line.contains(&format!("workload_class=\"{workload_class}\""))
+                        && !line.contains("le=")
+                })
+                .and_then(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
+        };
+        assert_eq!(
+            series("izwi_tts_output_audio_seconds_total", "realtime"),
+            Some(2.0)
+        );
+        assert_eq!(
+            series("izwi_tts_output_audio_seconds_total", "batch"),
+            Some(0.5)
+        );
+        assert_eq!(
+            series("izwi_tts_first_audio_seconds_count", "realtime"),
+            Some(1.0)
+        );
+        assert_eq!(
+            series("izwi_tts_first_audio_seconds_count", "batch"),
+            Some(1.0)
+        );
+        // Server admission (250 ms) precedes the runtime's own clock.
+        assert!(series("izwi_tts_first_audio_seconds_sum", "realtime").unwrap() >= 0.25);
     }
 
     #[tokio::test]

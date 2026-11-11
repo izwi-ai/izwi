@@ -1304,7 +1304,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Int,
         "128",
         Startup,
-        "Maximum requests waiting in the engine queue (0 or invalid ignored).",
+        "Maximum requests waiting in the engine queue (0 or invalid ignored). Real-time requests and sessions wait in a queue of their own, of the same size or the real-time session cap if that is larger, so a full queue does not refuse a call.",
     ),
     CoreEnvVar::new(
         "IZWI_MAX_RETAINED_SEQUENCES",
@@ -2595,6 +2595,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the Qwen3-TTS model dtype (e.g. f32, f16, bf16); does not inherit IZWI_QWEN_DTYPE.",
     ),
     CoreEnvVar::new(
+        "IZWI_REALTIME_ROW_RESERVE",
+        Int,
+        "a quarter of the model's rows, at least 1",
+        Startup,
+        "Sequences each model keeps free of Batch and Background requests while it has live demand (a Realtime or Streaming request or a real-time session operation in the last 30 seconds), so a live request starts without waiting for batch work to finish. A model that retains more sequences than it decodes in one dispatch also keeps the reserve free among the extra sequences with no live demand. 0 disables the reserve; a one-row model reserves no row; invalid ignored.",
+    ),
+    CoreEnvVar::new(
         "IZWI_RELPOS_ATTENTION_EMULATOR_DIR",
         Path,
         "unset (test skipped)",
@@ -2698,6 +2705,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "8 (TTS) / 64 (speech-to-speech)",
         Once,
         "Sets the engine streaming queue depth for TTS and speech-to-speech; overrides IZWI_STREAM_QUEUE_CAPACITY.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_STREAM_LEAD_SECS",
+        Float,
+        "3",
+        Once,
+        "Seconds of audio a speech stream may run ahead of real time before the scheduler serves its request from the Batch class's share, until the lead falls below half of this. Nothing is throttled: with no competing work the stream runs at full speed. 0 disables pacing; invalid ignored.",
     ),
     CoreEnvVar::new(
         "IZWI_STREAM_QUEUE_CAPACITY",

@@ -2,7 +2,8 @@
 //! `ek_…` keys a server mints with its real API key and hands to a browser,
 //! which cannot set an `Authorization` header on a WebSocket. The browser
 //! presents the key as the `openai-insecure-api-key.<key>` subprotocol (or a
-//! bearer token); the key admits `/v1/realtime` only, until it expires, and
+//! bearer token); the key admits `/v1/realtime` and its media-stream framing
+//! only, until it expires, and
 //! the session config minted with it applies to every session it opens.
 //!
 //! Keys live in memory, hashed, for at most two hours; a restart forgets them.
@@ -115,14 +116,14 @@ pub(crate) fn presented_key<'a>(
 }
 
 /// Whether a request to `path` presents a live ephemeral key, which admits
-/// the realtime socket only.
+/// the realtime socket and its media-stream framing only.
 pub(crate) fn admits<'a>(
     method: &str,
     path: &str,
     headers: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> bool {
     method == "GET"
-        && path == "/v1/realtime"
+        && matches!(path, "/v1/realtime" | "/v1/realtime/media-stream")
         && presented_key(headers).is_some_and(|key| lookup(&key).is_some())
 }
 
@@ -141,6 +142,11 @@ mod tests {
         let protocol = format!("realtime, {SUBPROTOCOL_KEY_PREFIX}{key}");
         let headers = [("sec-websocket-protocol", protocol.as_str())];
         assert!(admits("GET", "/v1/realtime", headers.iter().copied()));
+        assert!(admits(
+            "GET",
+            "/v1/realtime/media-stream",
+            headers.iter().copied()
+        ));
         assert!(!admits("GET", "/v1/models", headers.iter().copied()));
         assert!(!admits("POST", "/v1/realtime", headers.iter().copied()));
         let bearer = format!("Bearer {key}");

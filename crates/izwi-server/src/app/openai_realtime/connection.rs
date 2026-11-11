@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use futures::StreamExt;
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use izwi_core::SessionModelLeases;
 use izwi_vad::{configured_snr_margin_db, sanitize_snr_margin};
 use serde_json::{json, Value};
@@ -23,8 +23,9 @@ use tracing::{debug, warn};
 use super::audio::{base64, decode_input, pcm16_bytes, wav};
 use super::events::{parse_client_event, ClientEvent, Ids, RealtimeError};
 use super::items::{ContentPart, Item, ItemAudio, ItemKind, ItemStatus, ItemStore, Position, Role};
+use super::live::{transcribes_live, LiveTranscription, LiveTurn};
 use super::persist::History;
-use super::profiles::{speaker_for, transcription_model, RealtimeProfile};
+use super::profiles::{resolve_profile, speaker_for, transcription_model, RealtimeProfile};
 use super::respond::{
     lock_items, run_response, Outbound, PendingTranscript, PendingTranscripts, ResponseContext,
     ResponsePlan, ResponseSummary,
@@ -99,6 +100,8 @@ struct Session {
     /// `audio_start_ms`/`audio_end_ms` clock.
     input_ms: f64,
     speech: Option<Speech>,
+    /// The turn in progress, when its model transcribes it as it is spoken.
+    live: Option<LiveTurn>,
     responses: Vec<ActiveResponse>,
     next_generation: u64,
     /// A VAD turn ended while a response was still running; answer it next.
@@ -153,24 +156,93 @@ fn heard_share(text: &str, heard_ms: u64, audio_ms: u64) -> String {
     words[..keep.min(words.len())].join(" ")
 }
 
+/// What a session runs, resolved when its socket is opened.
+pub(crate) struct SessionSpec {
+    pub(crate) profile: RealtimeProfile,
+    pub(crate) requested_model: String,
+    pub(crate) kind: SessionKind,
+    /// A session config applied before the session starts: an ephemeral
+    /// key's, or a media-stream call's.
+    pub(crate) bound_session: Option<Value>,
+}
+
+impl SessionSpec {
+    /// The session `model` and `intent` ask for; either may come from the
+    /// session config an ephemeral key binds instead.
+    pub(crate) fn resolve(
+        model: Option<&str>,
+        intent: Option<&str>,
+        bound_session: Option<Value>,
+    ) -> Result<Self, String> {
+        let bound = |field: &str| {
+            bound_session
+                .as_ref()
+                .and_then(|session| session.get(field))
+                .and_then(Value::as_str)
+        };
+        let kind = match intent.map(str::trim).or(bound("type")) {
+            None | Some("" | "realtime" | "conversation") => SessionKind::Realtime,
+            Some("transcription") => SessionKind::Transcription,
+            Some(other) => {
+                return Err(format!(
+                    "Unsupported intent `{other}`; use `realtime` or `transcription`."
+                ))
+            }
+        };
+        let model = model.or(bound("model"));
+        let profile = resolve_profile(model)?;
+        let requested_model = model
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .unwrap_or(&profile.id)
+            .to_string();
+        Ok(Self {
+            profile,
+            requested_model,
+            kind,
+            bound_session,
+        })
+    }
+}
+
 /// Run one `/v1/realtime` socket to its end.
 pub(crate) async fn handle_socket(
-    mut socket: WebSocket,
+    socket: WebSocket,
     state: AppState,
     correlation_id: String,
-    profile: RealtimeProfile,
-    requested_model: String,
-    kind: SessionKind,
-    bound_session: Option<Value>,
+    spec: SessionSpec,
 ) {
+    let (ws_tx, ws_rx) = socket.split();
+    run_session(ws_tx, ws_rx, state, correlation_id, spec).await;
+}
+
+/// Run one session to its end over a socket's two halves. They carry
+/// `/v1/realtime` events: the socket's own, or another framing translated
+/// to them (`app::media_stream`).
+pub(crate) async fn run_session<Tx, Rx, E>(
+    mut ws_tx: Tx,
+    mut ws_rx: Rx,
+    state: AppState,
+    correlation_id: String,
+    spec: SessionSpec,
+) where
+    Tx: Sink<Message> + Unpin + Send + 'static,
+    Rx: Stream<Item = Result<Message, E>> + Unpin,
+{
+    let SessionSpec {
+        profile,
+        requested_model,
+        kind,
+        bound_session,
+    } = spec;
     let ids = Arc::new(Ids::new());
     let Some(_session_permit) = state.try_acquire_realtime_session() else {
         let error = RealtimeError::server("Realtime session capacity is exhausted; retry shortly.");
         let mut event = error.to_event(&ids);
         event["error"]["code"] = json!("session_capacity");
-        let _ = socket.send(Message::Text(event.to_string().into())).await;
+        let _ = ws_tx.send(Message::Text(event.to_string().into())).await;
         // 1013 (try again later) is a close openai-python retries.
-        let _ = socket
+        let _ = ws_tx
             .send(Message::Close(Some(CloseFrame {
                 code: 1013,
                 reason: "realtime_session_capacity".into(),
@@ -179,7 +251,6 @@ pub(crate) async fn handle_socket(
         return;
     };
 
-    let (ws_tx, mut ws_rx) = socket.split();
     let tuning = crate::env_config::tuning();
     let mailbox = Arc::new(OutboundMailbox::new(OutboundLimits {
         max_items: tuning.voice_ws_outbound_items.max(OUTBOUND_ITEMS),
@@ -214,6 +285,7 @@ pub(crate) async fn handle_socket(
         frame_seq: 0,
         input_ms: 0.0,
         speech: None,
+        live: None,
         responses: Vec::new(),
         next_generation: 0,
         pending_auto_response: false,
@@ -403,6 +475,7 @@ impl Session {
                     Input::Vad(input) => input.clear(),
                 }
                 self.speech = None;
+                self.live = None;
                 self.out.event("input_audio_buffer.cleared", json!({}));
                 Ok(())
             }
@@ -469,6 +542,7 @@ impl Session {
         if outcome.input_changed {
             self.input = input_for(&self.config);
             self.speech = None;
+            self.live = None;
         }
         self.custom_voice = match &self.config.voice {
             Voice::Custom(id) => Some(
@@ -502,7 +576,17 @@ impl Session {
                         "The input audio buffer is full; commit or clear it.",
                     ));
                 }
+                let first = buffer.is_empty();
                 buffer.extend_from_slice(&samples);
+                // A manual turn runs from its first audio to the commit.
+                if !first {
+                    if let Some(live) = self.live.as_ref() {
+                        live.push(samples);
+                    }
+                } else if let Some(model_id) = self.live_transcription_model() {
+                    let item_id = self.out.ids.next("item");
+                    self.start_live(model_id, item_id, samples);
+                }
                 Ok(())
             }
             Input::Vad(input) => {
@@ -510,6 +594,13 @@ impl Session {
                 let result = input
                     .handle_pcm16_frame(self.frame_seq, rate, &pcm16_bytes(&samples))
                     .map_err(RealtimeError::server)?;
+                // A live transcript starts once speech is confirmed, from
+                // the utterance so far, so its deltas follow `speech_started`
+                // and noise that never becomes a turn is not transcribed.
+                let heard = match (result.barge_in, input.active.as_ref()) {
+                    (true, Some(active)) => Some(active.samples_i16.clone()),
+                    _ => None,
+                };
                 if let Some(start) = result.speech_start {
                     let pre_roll_ms = start.pre_roll_samples as f64 * 1_000.0 / f64::from(rate);
                     self.speech = Some(Speech {
@@ -520,6 +611,16 @@ impl Session {
                 }
                 if result.barge_in {
                     self.announce_speech();
+                }
+                if let Some(heard) = heard {
+                    let speech = self.speech.as_ref().map(|speech| speech.item_id.clone());
+                    if let (Some(item_id), Some(model_id)) =
+                        (speech, self.live_transcription_model())
+                    {
+                        self.start_live(model_id, item_id, heard);
+                    }
+                } else if let Some(live) = self.live.as_ref() {
+                    live.push(samples);
                 }
                 if let Some(outcome) = result.utterance_end {
                     self.on_utterance_end(outcome, true);
@@ -597,6 +698,7 @@ impl Session {
                 }
             }
             UtteranceOutcome::Rejected(_) => {
+                self.live = None;
                 self.state.runtime.record_voice_speech_rejected();
                 if let Some(speech) = self.speech.take().filter(|speech| speech.announced) {
                     self.out.event(
@@ -673,7 +775,42 @@ impl Session {
                 );
             return;
         }
-        self.transcribe(item_id, wav_bytes, ready_tx);
+        // A turn transcribed as it was spoken ends its live transcript;
+        // any other is transcribed now.
+        let live = self.live.take().filter(|live| live.item_id == item_id);
+        let transcription = self.transcription(item_id, wav_bytes, ready_tx);
+        match live {
+            Some(live) => live.finish(transcription),
+            None => transcription.spawn(),
+        }
+    }
+
+    /// The model that transcribes this session's turns as they are spoken,
+    /// when it is one that can.
+    fn live_transcription_model(&self) -> Option<String> {
+        let model_id = self.transcription_model().ok()?;
+        transcribes_live(&self.profile, self.kind == SessionKind::Realtime, &model_id)
+            .then_some(model_id)
+    }
+
+    /// Transcribe the turn that becomes `item_id` as it is spoken, from the
+    /// audio `heard` so far.
+    fn start_live(&mut self, model_id: String, item_id: String, heard: Vec<i16>) {
+        let transcription = self.config.transcription.as_ref();
+        self.live = Some(
+            LiveTranscription {
+                state: self.state.clone(),
+                item_id,
+                model_id,
+                language: transcription.and_then(|config| config.language.clone()),
+                prompt: transcription.and_then(|config| config.prompt.clone()),
+                emit: transcription.is_some(),
+                out: self.out.clone(),
+                model_leases: self.model_leases.clone(),
+                sample_rate: self.config.input_format.sample_rate(),
+            }
+            .spawn(heard),
+        );
     }
 
     /// Whether replies transcribe the turn they hear (LFM3-Audio), so a
@@ -707,6 +844,16 @@ impl Session {
     }
 
     fn transcribe(&self, item_id: String, wav_bytes: Vec<u8>, ready: watch::Sender<bool>) {
+        self.transcription(item_id, wav_bytes, ready).spawn();
+    }
+
+    /// The turn-based transcription of a committed item.
+    fn transcription(
+        &self,
+        item_id: String,
+        wav_bytes: Vec<u8>,
+        ready: watch::Sender<bool>,
+    ) -> Transcription {
         let model_id = self.transcription_model().unwrap_or_else(|err| {
             warn!("realtime transcription model not used: {err}");
             transcription_model(&self.profile, None).unwrap_or_default()
@@ -728,10 +875,10 @@ impl Session {
                 .as_ref()
                 .and_then(|config| config.prompt.clone()),
             emit: transcription.is_some(),
+            emit_deltas: true,
             ready,
             lane: self.profile.is_unified().then(|| self.lane.clone()),
         }
-        .spawn();
     }
 
     fn on_commit(&mut self) -> Result<(), RealtimeError> {
@@ -752,7 +899,11 @@ impl Session {
                     return Err(empty(ms));
                 }
                 let samples = std::mem::take(buffer);
-                let item_id = self.out.ids.next("item");
+                // Live deltas already name the item this turn becomes.
+                let item_id = match self.live.as_ref() {
+                    Some(live) => live.item_id.clone(),
+                    None => self.out.ids.next("item"),
+                };
                 self.commit_audio(item_id, samples, rate, false);
                 self.last_activity = Instant::now();
                 Ok(())

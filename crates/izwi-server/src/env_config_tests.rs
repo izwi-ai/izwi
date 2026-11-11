@@ -143,6 +143,7 @@ fn unset_variables_keep_the_previous_defaults() {
     let tuning = tuning_with(&[]).unwrap();
     assert!(!tuning.allow_unauthenticated_network);
     assert_eq!(tuning.local_exposure, LocalExposure::default());
+    assert!(!tuning.trust_gateway_tenant_header);
     assert!(tuning.public_probe_details);
     assert_eq!(
         tuning.openai_compat_profile,

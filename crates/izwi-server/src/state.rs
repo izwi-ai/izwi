@@ -5,6 +5,7 @@ use crate::batch_runtime::{store::BatchRuntimeStore, worker::BatchWorkerHealth};
 use crate::chat_store::ChatStore;
 use crate::db::StoreDatabase;
 use crate::diarization_store::DiarizationStore;
+use crate::error::{ApiError, ApiErrorDetail};
 use crate::media_ingest::MediaIngestService;
 use crate::node_identity::NodeIdentity;
 use crate::onboarding_store::OnboardingStore;
@@ -24,12 +25,13 @@ use izwi_hooks::{EnterpriseHooks, MediaStorageProvider};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, SemaphorePermit};
 
 const DEFAULT_RESPONSE_STORE_LIMIT: usize = 512;
 const DEFAULT_AGENT_SESSION_STORE_LIMIT: usize = 512;
 const DEFAULT_MAX_REALTIME_SESSIONS: usize = 32;
+const DEFAULT_ADMISSION_QUEUE_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RequestAdmissionClassSnapshot {
@@ -90,6 +92,9 @@ impl RequestAdmissionLimits {
 #[derive(Clone)]
 pub struct RequestAdmissionLimiter {
     limits: RequestAdmissionLimits,
+    /// How long an HTTP request waits for admission before it is refused;
+    /// `None` waits without limit.
+    queue_timeout: Option<Duration>,
     non_realtime_limit: usize,
     non_realtime: Arc<Semaphore>,
     realtime: Arc<Semaphore>,
@@ -135,6 +140,12 @@ impl OwnedAdmissionPermit {
 impl RequestAdmissionLimiter {
     fn new(global_capacity: usize) -> Self {
         Self::from_limits(RequestAdmissionLimits::from_env(global_capacity))
+            .with_queue_timeout(admission_queue_timeout_from_env())
+    }
+
+    fn with_queue_timeout(mut self, queue_timeout: Option<Duration>) -> Self {
+        self.queue_timeout = queue_timeout;
+        self
     }
 
     fn from_limits(limits: RequestAdmissionLimits) -> Self {
@@ -145,6 +156,7 @@ impl RequestAdmissionLimiter {
         };
         Self {
             limits,
+            queue_timeout: None,
             non_realtime_limit: non_realtime_capacity,
             non_realtime: Arc::new(Semaphore::new(non_realtime_capacity)),
             realtime: Arc::new(Semaphore::new(limits.realtime)),
@@ -210,6 +222,44 @@ impl RequestAdmissionLimiter {
             class,
             wait_ms: started.elapsed().as_secs_f64() * 1000.0,
         })
+    }
+
+    /// How long a request of `class` may wait for admission. Realtime work
+    /// has its own reserved slot and session limit, and is never timed out.
+    fn queue_timeout_for(&self, class: WorkloadClass) -> Option<Duration> {
+        self.queue_timeout
+            .filter(|_| class != WorkloadClass::Realtime)
+    }
+
+    /// [`Self::acquire`] for an HTTP request: a request not admitted within
+    /// the queue timeout is refused with `429`.
+    async fn admit<'a>(
+        &'a self,
+        class: WorkloadClass,
+        global: &'a Semaphore,
+    ) -> Result<AdmissionPermit<'a>, ApiError> {
+        match self.queue_timeout_for(class) {
+            Some(limit) => tokio::time::timeout(limit, self.acquire(class, global))
+                .await
+                .map_err(|_| admission_timeout_error(class, limit)),
+            None => Ok(self.acquire(class, global).await),
+        }
+    }
+
+    /// [`Self::acquire_owned`] for an HTTP request, bounded as [`Self::admit`].
+    async fn admit_owned(
+        &self,
+        class: WorkloadClass,
+        global: Arc<Semaphore>,
+    ) -> Result<OwnedAdmissionPermit, ApiError> {
+        let acquire = self.acquire_owned(class, global);
+        let acquired = match self.queue_timeout_for(class) {
+            Some(limit) => tokio::time::timeout(limit, acquire)
+                .await
+                .map_err(|_| admission_timeout_error(class, limit))?,
+            None => acquire.await,
+        };
+        acquired.map_err(|_| ApiError::service_unavailable("Server is shutting down"))
     }
 
     fn snapshot(&self, global: &Semaphore, global_capacity: usize) -> RequestAdmissionSnapshot {
@@ -469,6 +519,12 @@ pub struct AppState {
     pub batch_runtime_store: Arc<BatchRuntimeStore>,
     /// Tenant-scoped opaque artifacts plus durable physical-deletion recovery.
     pub artifact_store: Arc<ArtifactStore>,
+    /// The files of `/v1/files`, stored as artifacts of their tenant.
+    pub(crate) file_store: Arc<crate::file_store::FileStore>,
+    /// The batches of `/v1/batches` and their finished lines.
+    pub(crate) batch_api_store: Arc<crate::batch_api_store::BatchApiStore>,
+    /// Wakes the batch executor when a batch is created or cancelled.
+    pub(crate) batch_api_wake: Arc<tokio::sync::Notify>,
     /// Shared strict media validation, canonicalization, storage, and asset registration service.
     pub media_ingest: Arc<MediaIngestService>,
     /// In-process batch worker health snapshot used by readiness and diagnostics.
@@ -519,6 +575,13 @@ impl AppState {
             media_storage.clone(),
             ArtifactStoreLimits::default(),
         )?);
+        let file_store = Arc::new(crate::file_store::FileStore::new(
+            store_database.clone(),
+            artifact_store.clone(),
+        ));
+        let batch_api_store = Arc::new(crate::batch_api_store::BatchApiStore::new(
+            store_database.clone(),
+        ));
         let speech_history_store = Arc::new(SpeechHistoryStore::initialize_with_storage(
             store_database,
             media_storage.clone(),
@@ -561,6 +624,9 @@ impl AppState {
             voice_observation_store,
             batch_runtime_store,
             artifact_store,
+            file_store,
+            batch_api_store,
+            batch_api_wake: Arc::new(tokio::sync::Notify::new()),
             media_ingest,
             batch_worker_health,
             stream_shutdown: Arc::new(tokio::sync::watch::Sender::new(false)),
@@ -625,6 +691,13 @@ impl AppState {
             media_storage.clone(),
             ArtifactStoreLimits::default(),
         )?);
+        let file_store = Arc::new(crate::file_store::FileStore::new(
+            store_database.clone(),
+            artifact_store.clone(),
+        ));
+        let batch_api_store = Arc::new(crate::batch_api_store::BatchApiStore::new(
+            store_database.clone(),
+        ));
         let speech_history_store = Arc::new(
             SpeechHistoryStore::initialize_with_storage(
                 store_database.clone(),
@@ -670,20 +743,57 @@ impl AppState {
             voice_observation_store,
             batch_runtime_store,
             artifact_store,
+            file_store,
+            batch_api_store,
+            batch_api_wake: Arc::new(tokio::sync::Notify::new()),
             media_ingest,
             batch_worker_health,
             stream_shutdown: Arc::new(tokio::sync::watch::Sender::new(false)),
         })
     }
 
-    /// Acquire a permit for a specific workload class.
+    /// Admit a synchronous HTTP request (chat, agent turns, `/v1/audio/*`)
+    /// of `class`, waiting at most
+    /// `IZWI_ADMISSION_QUEUE_TIMEOUT_SECS` for a slot (realtime requests wait
+    /// without limit). A request that is not admitted in time is refused
+    /// with `429`: `rate_limit_exceeded`, or OpenAI's flex answer
+    /// `resource_unavailable` for batch-class work.
+    pub async fn admit_request(
+        &self,
+        class: WorkloadClass,
+    ) -> Result<AdmissionPermit<'_>, ApiError> {
+        self.request_admission
+            .admit(class, &self.request_semaphore)
+            .await
+    }
+
+    /// [`Self::admit_request`] with an owned permit, for spawned tasks.
+    pub async fn admit_request_owned(
+        &self,
+        class: WorkloadClass,
+    ) -> Result<OwnedAdmissionPermit, ApiError> {
+        self.request_admission
+            .admit_owned(class, self.request_semaphore.clone())
+            .await
+    }
+
+    /// The admission queue timeout, for tests of a full server.
+    #[cfg(test)]
+    pub(crate) fn with_admission_queue_timeout(mut self, queue_timeout: Option<Duration>) -> Self {
+        self.request_admission = self.request_admission.with_queue_timeout(queue_timeout);
+        self
+    }
+
+    /// Acquire a permit for a specific workload class, waiting as long as
+    /// it takes: background work, durable jobs and work already under way.
     pub async fn acquire_workload_permit(&self, class: WorkloadClass) -> AdmissionPermit<'_> {
         self.request_admission
             .acquire(class, &self.request_semaphore)
             .await
     }
 
-    /// Acquire an owned permit for spawned tasks.
+    /// [`Self::acquire_workload_permit`] with an owned permit, for spawned
+    /// tasks.
     pub async fn acquire_owned_workload_permit(
         &self,
         class: WorkloadClass,
@@ -768,6 +878,45 @@ fn class_limit_from_env(key: &str, default: usize) -> usize {
         .unwrap_or(default.max(1))
 }
 
+/// `IZWI_ADMISSION_QUEUE_TIMEOUT_SECS`: how long an HTTP request waits for
+/// admission; 0 waits without limit.
+fn admission_queue_timeout_from_env() -> Option<Duration> {
+    let secs = std::env::var("IZWI_ADMISSION_QUEUE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ADMISSION_QUEUE_TIMEOUT_SECS);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// The `429` for a request of `class` that waited `waited` for admission.
+/// Batch-class work is a flex request, which OpenAI answers with "Resource
+/// Unavailable" when no capacity is free.
+fn admission_timeout_error(class: WorkloadClass, waited: Duration) -> ApiError {
+    let secs = waited.as_secs();
+    let (code, message) = match class {
+        WorkloadClass::Batch => (
+            "resource_unavailable",
+            format!(
+                "Resource Unavailable: no capacity for flex requests became free within {secs} seconds. Retry later, or send the request at the default service tier."
+            ),
+        ),
+        _ => (
+            "rate_limit_exceeded",
+            format!(
+                "The server is at capacity: the request waited {secs} seconds for admission. Retry shortly."
+            ),
+        ),
+    };
+    ApiError {
+        status: axum::http::StatusCode::TOO_MANY_REQUESTS,
+        message,
+        detail: Some(ApiErrorDetail {
+            param: None,
+            code: Some(code),
+        }),
+    }
+}
+
 fn realtime_session_limit_from_env() -> usize {
     std::env::var("IZWI_MAX_REALTIME_SESSIONS")
         .ok()
@@ -811,6 +960,7 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::Semaphore;
 
     /// PIPE-7: a registered job can be cancelled by its record id, and it
@@ -1009,6 +1159,124 @@ mod tests {
         let context = realtime.runtime_context();
         assert_eq!(context.workload_class, WorkloadClass::Realtime);
         assert!(context.admission_ms.is_some_and(|wait_ms| wait_ms >= 0.0));
+    }
+
+    fn full_limiter(queue_timeout: Option<Duration>) -> (RequestAdmissionLimiter, Arc<Semaphore>) {
+        let limits = RequestAdmissionLimits {
+            global: 2,
+            realtime: 1,
+            interactive: 1,
+            streaming: 1,
+            online: 1,
+            batch: 1,
+            background: 1,
+        };
+        let limiter =
+            RequestAdmissionLimiter::from_limits(limits).with_queue_timeout(queue_timeout);
+        // Nothing is free: the realtime slot and the non-realtime slot are taken.
+        (limiter, Arc::new(Semaphore::new(0)))
+    }
+
+    /// A request that is not admitted within the queue timeout is refused
+    /// with 429: `rate_limit_exceeded` for interactive, streaming and online
+    /// work, OpenAI's flex answer for batch work.
+    #[tokio::test]
+    async fn admission_times_out_with_a_429_in_the_shape_of_its_class() {
+        let (limiter, global) = full_limiter(Some(Duration::from_millis(20)));
+        for (class, code) in [
+            (WorkloadClass::Interactive, "rate_limit_exceeded"),
+            (WorkloadClass::Streaming, "rate_limit_exceeded"),
+            (WorkloadClass::Online, "rate_limit_exceeded"),
+            (WorkloadClass::Batch, "resource_unavailable"),
+        ] {
+            let borrowed = limiter.admit(class, &global).await.err();
+            let owned = limiter.admit_owned(class, global.clone()).await.err();
+            for error in [borrowed, owned] {
+                let error = error.unwrap_or_else(|| panic!("{class:?} should time out"));
+                assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(error.detail.and_then(|detail| detail.code), Some(code));
+                assert_eq!(
+                    error.message.contains("Resource Unavailable"),
+                    class == WorkloadClass::Batch,
+                    "{class:?}: {}",
+                    error.message
+                );
+                let body = error.openai_body();
+                assert_eq!(body["error"]["type"], "rate_limit_error");
+                assert_eq!(body["error"]["code"], code);
+            }
+        }
+        // A timed-out wait holds nothing.
+        let snapshot = limiter.snapshot(&global, 2);
+        assert_eq!(snapshot.interactive.available, 1);
+        assert_eq!(snapshot.batch.available, 1);
+        assert_eq!(snapshot.non_realtime.available, 1);
+    }
+
+    /// A timeout of 0 keeps the unbounded wait, and realtime work waits
+    /// without limit whatever the timeout.
+    #[tokio::test]
+    async fn admission_waits_without_limit_for_realtime_and_when_unbounded() {
+        for (queue_timeout, class) in [
+            (None, WorkloadClass::Interactive),
+            (None, WorkloadClass::Batch),
+            (Some(Duration::from_millis(20)), WorkloadClass::Realtime),
+        ] {
+            let (limiter, global) = full_limiter(queue_timeout);
+            let waiting = {
+                let limiter = limiter.clone();
+                let global = global.clone();
+                tokio::spawn(async move { limiter.admit_owned(class, global).await })
+            };
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            assert!(!waiting.is_finished(), "{class:?} should still be waiting");
+            global.add_permits(1);
+            let permit = tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .expect("the wait ends once a slot is free")
+                .expect("task")
+                .unwrap_or_else(|error| panic!("{class:?}: {}", error.message));
+            assert_eq!(permit.runtime_context().workload_class, class);
+        }
+    }
+
+    /// Internal callers (durable workers, background work) keep the
+    /// unbounded wait even when HTTP admission is bounded.
+    #[tokio::test]
+    async fn internal_acquisition_is_not_bounded_by_the_queue_timeout() {
+        let (limiter, global) = full_limiter(Some(Duration::from_millis(20)));
+        let waiting = {
+            let limiter = limiter.clone();
+            let global = global.clone();
+            tokio::spawn(async move { limiter.acquire_owned(WorkloadClass::Batch, global).await })
+        };
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(!waiting.is_finished());
+        global.add_permits(1);
+        assert!(tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the wait ends once a slot is free")
+            .expect("task")
+            .is_ok());
+    }
+
+    #[test]
+    fn admission_queue_timeout_defaults_to_30_seconds_and_0_is_unbounded() {
+        let _guard = env_lock();
+        let key = "IZWI_ADMISSION_QUEUE_TIMEOUT_SECS";
+        std::env::remove_var(key);
+        assert_eq!(
+            super::admission_queue_timeout_from_env(),
+            Some(Duration::from_secs(30))
+        );
+        std::env::set_var(key, "5");
+        assert_eq!(
+            super::admission_queue_timeout_from_env(),
+            Some(Duration::from_secs(5))
+        );
+        std::env::set_var(key, "0");
+        assert_eq!(super::admission_queue_timeout_from_env(), None);
+        std::env::remove_var(key);
     }
 
     #[test]

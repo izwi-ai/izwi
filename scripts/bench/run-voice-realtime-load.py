@@ -105,9 +105,10 @@ class WebSocket:
     def __init__(self, reader, writer):
         self.reader = reader
         self.writer = writer
+        self.close_code = None  # The server's close status, once it closes.
 
     @classmethod
-    async def connect(cls, url, timeout=30.0):
+    async def connect(cls, url, timeout=30.0, headers=None):
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme != "ws":
             raise ValueError(f"only ws:// URLs are supported, got {url}")
@@ -119,10 +120,12 @@ class WebSocket:
         writer.write((
             f"GET {path} HTTP/1.1\r\nHost: {parsed.hostname}:{port}\r\n"
             "Upgrade: websocket\r\nConnection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+            + "".join(f"{name}: {value}\r\n" for name, value in (headers or {}).items())
+            + f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
         await writer.drain()
         status = await asyncio.wait_for(reader.readline(), timeout)
         if b" 101 " not in status:
+            writer.close()
             raise ConnectionError(f"websocket upgrade refused: {status.decode(errors='replace').strip()}")
         while (await reader.readline()) not in (b"\r\n", b""):
             pass
@@ -154,6 +157,8 @@ class WebSocket:
             if opcode == OP_PONG:
                 continue
             if opcode == OP_CLOSE:
+                if len(payload) >= 2:
+                    (self.close_code,) = struct.unpack("!H", payload[:2])
                 return None
             if opcode != OP_CONT:
                 message_opcode = opcode

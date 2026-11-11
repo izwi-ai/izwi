@@ -9,20 +9,38 @@
 //! and relays frames both ways until either side closes. The upstream's
 //! refusal of the upgrade (an unknown `model`, its own capacity) reaches the
 //! client as the same HTTP status.
+//!
+//! `/v1/realtime/media-stream` (a phone call in a carrier's media-stream
+//! framing, which the upstream runs as a realtime session) is admitted and
+//! relayed the same way.
+//!
+//! `POST /v1/realtime/client_secrets` and `GET /v1/realtime/capabilities`
+//! are relayed to the same upstreams. An izwi-server keeps the `ek_` keys it
+//! mints in its own memory, so the gateway remembers which upstream minted
+//! each key, and for whom. A browser has no gateway API key: the `ek_` key it
+//! presents on `/v1/realtime` authenticates it as the principal that minted
+//! the key, and its session goes to the upstream that knows the key, which
+//! checks it again and applies the session config bound to it. The memory is
+//! this process's own, so behind several gateway replicas a key works only
+//! through the replica that minted it.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
+    body::Bytes,
     extract::{
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
         Extension, RawQuery, State,
     },
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
 use futures::{SinkExt, StreamExt};
+use izwi_hooks::Principal;
+use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::{
     self, client::IntoClientRequest, http::HeaderValue, protocol::WebSocketConfig,
@@ -30,14 +48,20 @@ use tokio_tungstenite::tungstenite::{
 };
 use tracing::warn;
 
-use crate::api::request_context::RequestContext;
+use crate::api::request_context::{RequestContext, GATEWAY_TENANT_HEADER};
 use crate::gateway::GatewayState;
 
 /// The largest message either side may send: a 15 MiB audio append in base64.
 pub const MAX_MESSAGE_BYTES: usize = 24 * 1024 * 1024;
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The whole of a relayed HTTP request: both routes answer from memory.
+const UPSTREAM_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// The realtime subprotocol a browser-style client offers.
 const REALTIME_SUBPROTOCOL: &str = "realtime";
+/// The subprotocol prefix a browser presents an ephemeral key with.
+const SUBPROTOCOL_KEY_PREFIX: &str = "openai-insecure-api-key.";
+/// Client secrets remembered: an izwi-server keeps as many live keys.
+const CLIENT_SECRET_MEMORY: usize = 10_000;
 
 /// The izwi-servers OpenAI Realtime sessions go to.
 #[derive(Debug)]
@@ -47,6 +71,73 @@ pub struct OpenAiRealtimeUpstreams {
     sessions: Arc<Semaphore>,
     max_sessions: usize,
     next: AtomicUsize,
+    client: reqwest::Client,
+    client_secrets: Mutex<ClientSecretMemory>,
+}
+
+/// A client secret an upstream minted through this gateway.
+#[derive(Debug, Clone)]
+struct ClientSecret {
+    upstream: usize,
+    /// Who minted the key: its sessions are theirs.
+    principal: Principal,
+    expires_at: u64,
+}
+
+/// The live client secrets, by the SHA-256 of the key.
+#[derive(Debug, Default)]
+struct ClientSecretMemory {
+    order: VecDeque<[u8; 32]>,
+    secrets: HashMap<[u8; 32], ClientSecret>,
+}
+
+impl ClientSecretMemory {
+    fn remember(&mut self, key: &str, secret: ClientSecret, now: u64) {
+        self.order.retain(|digest| {
+            let live = self
+                .secrets
+                .get(digest)
+                .is_some_and(|secret| secret.expires_at > now);
+            if !live {
+                self.secrets.remove(digest);
+            }
+            live
+        });
+        let digest = digest(key);
+        if self.secrets.insert(digest, secret).is_none() {
+            self.order.push_back(digest);
+        }
+        while self.order.len() > CLIENT_SECRET_MEMORY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.secrets.remove(&oldest);
+            }
+        }
+    }
+}
+
+fn digest(key: &str) -> [u8; 32] {
+    Sha256::digest(key.as_bytes()).into()
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// The ephemeral key a request presents: an `openai-insecure-api-key.ek_…`
+/// subprotocol, or an `ek_…` bearer token, as izwi-server reads it.
+fn presented_client_secret(headers: &HeaderMap) -> Option<&str> {
+    let offered = headers
+        .get_all(header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .find_map(|protocol| protocol.trim().strip_prefix(SUBPROTOCOL_KEY_PREFIX));
+    offered
+        .or_else(|| crate::gateway_security::bearer_token(headers))
+        .filter(|key| key.starts_with("ek_"))
 }
 
 impl OpenAiRealtimeUpstreams {
@@ -67,12 +158,22 @@ impl OpenAiRealtimeUpstreams {
         if max_sessions == 0 {
             return Err("the OpenAI Realtime session cap must be positive".to_string());
         }
+        // reqwest's rustls has no built-in crypto provider in this workspace.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::builder()
+            .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+            .timeout(UPSTREAM_HTTP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|err| format!("OpenAI Realtime upstream client: {err}"))?;
         Ok(Self {
             urls,
             api_key: api_key.filter(|key| !key.trim().is_empty()),
             sessions: Arc::new(Semaphore::new(max_sessions)),
             max_sessions,
             next: AtomicUsize::new(0),
+            client,
+            client_secrets: Mutex::default(),
         })
     }
 
@@ -81,9 +182,169 @@ impl OpenAiRealtimeUpstreams {
     }
 
     /// The next upstream, round robin.
-    fn pick(&self) -> &str {
-        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.urls.len();
-        &self.urls[index]
+    fn pick(&self) -> usize {
+        self.next.fetch_add(1, Ordering::Relaxed) % self.urls.len()
+    }
+
+    /// The live client secret `headers` present, when this gateway relayed
+    /// its minting.
+    fn client_secret<'a>(&self, headers: &'a HeaderMap) -> Option<(&'a str, ClientSecret)> {
+        let key = presented_client_secret(headers)?;
+        let secret = self
+            .client_secrets
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .secrets
+            .get(&digest(key))
+            .filter(|secret| secret.expires_at > unix_now())
+            .cloned()?;
+        Some((key, secret))
+    }
+
+    /// Who a request without a gateway key is, when it opens `/v1/realtime`
+    /// with a client secret minted through this gateway.
+    pub fn client_secret_principal(&self, headers: &HeaderMap) -> Option<Principal> {
+        self.client_secret(headers)
+            .map(|(_, secret)| secret.principal)
+    }
+
+    /// Relay one small HTTP request to `upstream` and read its answer whole.
+    async fn forward(
+        &self,
+        upstream: usize,
+        method: Method,
+        path: &str,
+        headers: &HeaderMap,
+        context: &RequestContext,
+        body: Bytes,
+    ) -> reqwest::Result<UpstreamAnswer> {
+        let base = &self.urls[upstream];
+        // Upstreams are kept as WebSocket bases: ws(s) maps onto http(s).
+        let url = format!("http{}{path}", base.trim_start_matches("ws"));
+        let mut request = self
+            .client
+            .request(method, url)
+            .header("x-request-id", &context.correlation_id)
+            .header(GATEWAY_TENANT_HEADER, context.gateway_tenant())
+            .body(body);
+        if let Some(content_type) = headers.get(header::CONTENT_TYPE) {
+            request = request.header(header::CONTENT_TYPE, content_type.clone());
+        }
+        if let Some(key) = self.api_key.as_deref() {
+            request = request.bearer_auth(key);
+        }
+        let response = request.send().await?;
+        Ok(UpstreamAnswer {
+            status: StatusCode::from_u16(response.status().as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY),
+            content_type: response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| axum::http::HeaderValue::from_bytes(value.as_bytes()).ok()),
+            body: response.bytes().await?,
+        })
+    }
+}
+
+/// An upstream's answer to a relayed HTTP request.
+struct UpstreamAnswer {
+    status: StatusCode,
+    content_type: Option<axum::http::HeaderValue>,
+    body: Bytes,
+}
+
+impl IntoResponse for UpstreamAnswer {
+    fn into_response(self) -> Response {
+        let mut response = (self.status, self.body).into_response();
+        if let Some(content_type) = self.content_type {
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, content_type);
+        }
+        response
+    }
+}
+
+/// The 502 for an upstream that could not be reached.
+fn upstream_unavailable(error: reqwest::Error) -> Response {
+    warn!("realtime upstream request failed: {error}");
+    json_error(
+        StatusCode::BAD_GATEWAY,
+        "The realtime upstream is unavailable.",
+    )
+}
+
+/// `POST /v1/realtime/client_secrets`: an upstream mints the key, and the
+/// gateway remembers which, so the key's sessions reach it.
+pub async fn proxy_client_secret(
+    State(state): State<GatewayState>,
+    Extension(context): Extension<RequestContext>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(upstreams) = state.openai_realtime.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let upstream = upstreams.pick();
+    let answer = match upstreams
+        .forward(
+            upstream,
+            Method::POST,
+            "/v1/realtime/client_secrets",
+            &headers,
+            &context,
+            body,
+        )
+        .await
+    {
+        Ok(answer) => answer,
+        Err(error) => return upstream_unavailable(error),
+    };
+    if answer.status.is_success() {
+        let minted = serde_json::from_slice::<serde_json::Value>(&answer.body).unwrap_or_default();
+        if let (Some(key), Some(expires_at)) =
+            (minted["value"].as_str(), minted["expires_at"].as_u64())
+        {
+            upstreams
+                .client_secrets
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remember(
+                    key,
+                    ClientSecret {
+                        upstream,
+                        principal: context.principal.clone(),
+                        expires_at,
+                    },
+                    unix_now(),
+                );
+        }
+    }
+    answer.into_response()
+}
+
+/// `GET /v1/realtime/capabilities`, as an upstream answers it.
+pub async fn proxy_capabilities(
+    State(state): State<GatewayState>,
+    Extension(context): Extension<RequestContext>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(upstreams) = state.openai_realtime.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match upstreams
+        .forward(
+            upstreams.pick(),
+            Method::GET,
+            "/v1/realtime/capabilities",
+            &headers,
+            &context,
+            Bytes::new(),
+        )
+        .await
+    {
+        Ok(answer) => answer.into_response(),
+        Err(error) => upstream_unavailable(error),
     }
 }
 
@@ -135,6 +396,39 @@ pub async fn proxy_socket(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    relay_session(state, context, "/v1/realtime", query, headers, upgrade).await
+}
+
+/// `GET /v1/realtime/media-stream`: a phone call as a telephony media
+/// stream. The upstream runs it as a realtime session, so the gateway admits
+/// and relays it as one.
+pub async fn proxy_media_stream(
+    State(state): State<GatewayState>,
+    Extension(context): Extension<RequestContext>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    relay_session(
+        state,
+        context,
+        "/v1/realtime/media-stream",
+        query,
+        headers,
+        upgrade,
+    )
+    .await
+}
+
+/// Admit one session socket and relay it to the upstream's `path`.
+async fn relay_session(
+    state: GatewayState,
+    context: RequestContext,
+    path: &str,
+    query: Option<String>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
     let Some(upstreams) = state.openai_realtime.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -149,9 +443,16 @@ pub async fn proxy_socket(
         Err(error) => return error.into_response(),
     };
     let offered = offers_realtime(&headers);
+    // A session opened with a client secret goes to the upstream that minted
+    // it, with the secret as its credential there.
+    let client_secret = upstreams.client_secret(&headers);
+    let upstream = match &client_secret {
+        Some((_, secret)) => secret.upstream,
+        None => upstreams.pick(),
+    };
     let url = format!(
-        "{}/v1/realtime{}",
-        upstreams.pick(),
+        "{}{path}{}",
+        upstreams.urls[upstream],
         query.map(|query| format!("?{query}")).unwrap_or_default()
     );
     let mut request = match url.into_client_request() {
@@ -163,7 +464,11 @@ pub async fn proxy_socket(
             )
         }
     };
-    if let Some(key) = upstreams.api_key.as_deref() {
+    let upstream_key = client_secret
+        .as_ref()
+        .map(|(key, _)| *key)
+        .or(upstreams.api_key.as_deref());
+    if let Some(key) = upstream_key {
         match HeaderValue::from_str(&format!("Bearer {key}")) {
             Ok(value) => {
                 request.headers_mut().insert("authorization", value);
@@ -184,6 +489,9 @@ pub async fn proxy_socket(
     }
     if let Ok(value) = HeaderValue::from_str(&context.correlation_id) {
         request.headers_mut().insert("x-request-id", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&context.gateway_tenant()) {
+        request.headers_mut().insert(GATEWAY_TENANT_HEADER, value);
     }
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE_BYTES))
@@ -330,7 +638,56 @@ mod tests {
         assert_eq!(upstreams.api_key, None, "a blank key is no key");
         assert_eq!(
             [upstreams.pick(), upstreams.pick(), upstreams.pick()],
-            ["ws://a:1", "ws://b:2", "ws://a:1"]
+            [0, 1, 0]
         );
+    }
+
+    #[test]
+    fn a_client_secret_is_remembered_until_it_expires() {
+        let upstreams =
+            OpenAiRealtimeUpstreams::new(vec!["http://a:1".into(), "http://b:2".into()], None, 4)
+                .unwrap();
+        let secret = |upstream, expires_at| ClientSecret {
+            upstream,
+            principal: Principal::local_anonymous(),
+            expires_at,
+        };
+        let now = unix_now();
+        {
+            let mut memory = upstreams.client_secrets.lock().unwrap();
+            memory.remember("ek_live", secret(1, now + 600), now);
+            memory.remember("ek_expired", secret(0, now), now);
+        }
+        let presenting = |name: &'static str, value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, value.parse().unwrap());
+            headers
+        };
+        // A browser offers the key as a subprotocol; a server-side client
+        // may send it as a bearer token.
+        for headers in [
+            presenting(
+                "sec-websocket-protocol",
+                "realtime, openai-insecure-api-key.ek_live",
+            ),
+            presenting("authorization", "Bearer ek_live"),
+        ] {
+            let (key, secret) = upstreams.client_secret(&headers).expect("a live secret");
+            assert_eq!((key, secret.upstream), ("ek_live", 1));
+            assert!(upstreams.client_secret_principal(&headers).is_some());
+        }
+        for headers in [
+            presenting("authorization", "Bearer ek_expired"),
+            presenting("authorization", "Bearer ek_unknown"),
+            presenting("authorization", "Bearer not-an-ephemeral-key"),
+            presenting("sec-websocket-protocol", "realtime"),
+        ] {
+            assert!(upstreams.client_secret(&headers).is_none());
+        }
+        // The next key minted drops the expired one from the memory.
+        let mut memory = upstreams.client_secrets.lock().unwrap();
+        memory.remember("ek_next", secret(0, now + 600), now);
+        assert_eq!(memory.secrets.len(), 2);
+        assert_eq!(memory.order.len(), 2);
     }
 }

@@ -24,6 +24,7 @@ use crate::api::audio_payload::{
     decode_base64_audio_payload, inspect_audio_payload_canonical_with_diagnostics,
     read_multipart_audio_base64_payload, read_multipart_audio_file_payload, AudioPayload,
 };
+use crate::api::openai::service_tier::{ServiceTier, SERVICE_TIER_HEADER};
 use crate::api::request_context::RequestContext;
 use crate::api::speech_text_upload::multipart_upload_api_error;
 use crate::api::transcript_alignment::align_transcript;
@@ -107,6 +108,7 @@ impl PendingTranscriptText {
 async fn drive_transcription_stream<F>(
     event_tx: &mpsc::Sender<String>,
     pending: &PendingTranscriptText,
+    service_tier: Option<&'static str>,
     generation: F,
 ) -> Option<Vec<String>>
 where
@@ -131,9 +133,12 @@ where
         .into_iter()
         .collect::<Vec<_>>();
     terminal.push(match result {
-        Ok(output) => {
-            transcript_done_event_payload(output.text, output.language, output.duration_secs)
-        }
+        Ok(output) => transcript_done_event_payload(
+            output.text,
+            output.language,
+            output.duration_secs,
+            service_tier,
+        ),
         Err(err) => transcript_error_event_payload(&err.to_string()),
     });
     Some(terminal)
@@ -166,10 +171,18 @@ struct TranscriptionRequest {
     /// Tag speakers in the transcript (models that do).
     speaker_labels: bool,
     max_tokens: Option<usize>,
-    _temperature: Option<f32>,
+    /// OpenAI's sampling temperature. Checked, then unused: every ASR
+    /// family decodes greedily (`validate_openai_decoding_options`).
+    temperature: Option<f32>,
+    /// OpenAI's `chunking_strategy`: `"auto"` or an object.
+    chunking_strategy: Option<serde_json::Value>,
+    /// OpenAI's `include[]`.
+    include: Vec<String>,
     timestamp_granularities: Option<Vec<String>>,
     /// Served by `/v1/audio/translations`: `verbose_json` says `translate`.
     translate: bool,
+    /// The tier the request named (`service_tier` or its header).
+    service_tier: ServiceTier,
 }
 
 impl TranscriptionRequest {
@@ -202,6 +215,8 @@ fn extract_speaker_turns(
 #[derive(Debug, serde::Serialize)]
 struct JsonTranscriptionResponse {
     text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<&'static str>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -221,6 +236,8 @@ struct VerboseJsonTranscriptionResponse {
     rtf: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     izwi_asr_diagnostics: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -280,7 +297,7 @@ pub async fn transcriptions(
     req: Request,
 ) -> Result<Response<Body>, ApiError> {
     let req = parse_transcription_request(req).await?;
-    run_transcription(state, ctx, req).await
+    run_transcription(state, ctx.correlation_id, req).await
 }
 
 /// `POST /v1/audio/translations`: OpenAI's translation route (deprecated
@@ -293,7 +310,16 @@ pub async fn translations(
     Extension(ctx): Extension<RequestContext>,
     req: Request,
 ) -> Result<Response<Body>, ApiError> {
-    let mut req = parse_transcription_request(req).await?;
+    let req = parse_transcription_request(req).await?;
+    run_translation(state, ctx.correlation_id, req).await
+}
+
+/// Checks `req` as a translation and runs it.
+async fn run_translation(
+    state: AppState,
+    correlation_id: String,
+    mut req: TranscriptionRequest,
+) -> Result<Response<Body>, ApiError> {
     if req
         .timestamp_granularities
         .as_ref()
@@ -340,7 +366,7 @@ pub async fn translations(
         req.target_language = Some("en".to_string());
     }
     req.translate = true;
-    run_transcription(state, ctx, req).await
+    run_transcription(state, correlation_id, req).await
 }
 
 /// The catalog's speech translation models, for error messages.
@@ -353,13 +379,26 @@ fn translation_model_names() -> String {
         .join(", ")
 }
 
+/// Transcribes `req` and names the tier that served it in the response.
 async fn run_transcription(
     state: AppState,
-    ctx: RequestContext,
+    correlation_id: String,
+    req: TranscriptionRequest,
+) -> Result<Response<Body>, ApiError> {
+    let service_tier = req.service_tier;
+    let mut response = transcribe(state, correlation_id, req).await?;
+    service_tier.stamp(&mut response);
+    Ok(response)
+}
+
+async fn transcribe(
+    state: AppState,
+    correlation_id: String,
     mut req: TranscriptionRequest,
 ) -> Result<Response<Body>, ApiError> {
     validate_transcription_model(req.model.as_deref())?;
     validate_transcription_language(req.model.as_deref(), req.language.as_deref())?;
+    validate_openai_decoding_options(&req)?;
     crate::api::transcript_alignment::reject_removed_aligner(req.aligner_model.as_deref())?;
     let timestamp_request =
         TimestampGranularityRequest::parse(req.timestamp_granularities.as_deref())?;
@@ -389,7 +428,7 @@ async fn run_transcription(
     validate_transcription_response_format(&response_format)?;
 
     if req.stream {
-        return transcriptions_stream(state, req, task, audio, ctx.correlation_id).await;
+        return transcriptions_stream(state, req, task, audio, correlation_id).await;
     }
     let audio_bytes = audio.bytes;
 
@@ -399,9 +438,10 @@ async fn run_transcription(
         ));
     }
 
+    let service_tier = req.service_tier;
     let permit = state
-        .acquire_workload_permit(WorkloadClass::Interactive)
-        .await;
+        .admit_request(service_tier.workload_class(WorkloadClass::Interactive))
+        .await?;
     let started = Instant::now();
     // A model that emits word timestamps itself (Granite Speech Plus) runs
     // its timestamp task and returns `timestamp_words`; any other model's
@@ -415,7 +455,7 @@ async fn run_transcription(
             req.prompt.as_deref(),
             task,
             req.max_tokens,
-            Some(&ctx.correlation_id),
+            Some(&correlation_id),
             permit.runtime_context(),
             timestamp_request.any(),
         )
@@ -545,7 +585,11 @@ async fn run_transcription(
         "json" => Ok(Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
-                serde_json::to_string(&JsonTranscriptionResponse { text: output.text }).unwrap(),
+                serde_json::to_string(&JsonTranscriptionResponse {
+                    text: output.text,
+                    service_tier: service_tier.reported(),
+                })
+                .unwrap(),
             ))
             .unwrap()),
         "verbose_json" => Ok(Response::builder()
@@ -567,6 +611,7 @@ async fn run_transcription(
                     processing_time_ms: elapsed_ms,
                     rtf,
                     izwi_asr_diagnostics: asr_diagnostics,
+                    service_tier: service_tier.reported(),
                 })
                 .unwrap(),
             ))
@@ -596,6 +641,64 @@ async fn run_transcription(
 }
 
 const SUPPORTED_TRANSCRIPTION_FORMATS: &str = "json, verbose_json, text, srt, vtt";
+
+/// OpenAI's decoding options, none of which changes how this server
+/// decodes; each is checked so a request is never served as something it
+/// did not ask for.
+///
+/// - `temperature` must be in OpenAI's range, 0 to 1, and has no effect:
+///   no ASR family samples. Whisper keeps its checkpoint's fallback ladder
+///   from 0, which is what OpenAI documents for 0; every other family
+///   takes the most likely token.
+/// - `chunking_strategy` `"auto"` is what the server does with long audio
+///   (`IZWI_ASR_CHUNK_*`). `server_vad` is refused: chunk plans are made
+///   per model family from process settings, with no per-request VAD
+///   thresholds to map it onto.
+/// - `include[]=logprobs` is refused: no decoder returns token
+///   log-probabilities to the route.
+fn validate_openai_decoding_options(req: &TranscriptionRequest) -> Result<(), ApiError> {
+    if req
+        .temperature
+        .is_some_and(|temperature| !(0.0..=1.0).contains(&temperature))
+    {
+        return Err(ApiError::invalid_param(
+            "temperature",
+            "`temperature` must be between 0 and 1",
+        ));
+    }
+    match &req.chunking_strategy {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(strategy)) if strategy == "auto" => {}
+        Some(strategy) if strategy["type"] == "server_vad" => {
+            return Err(ApiError::unsupported_param(
+                "chunking_strategy",
+                "`chunking_strategy` of type `server_vad` is not supported; omit it or send                  `\"auto\"`, and the server splits long audio at pauses itself",
+            ));
+        }
+        Some(_) => {
+            return Err(ApiError::invalid_param(
+                "chunking_strategy",
+                "`chunking_strategy` must be `\"auto\"`",
+            ));
+        }
+    }
+    if let Some(value) = req.include.first() {
+        return Err(match value.as_str() {
+            "logprobs" => ApiError::unsupported_param(
+                "include",
+                format!(
+                    "`include[]=logprobs` is not supported for {}: its decoder returns no \
+                     token log-probabilities",
+                    req.model.as_deref().unwrap_or("this model")
+                ),
+            ),
+            other => {
+                ApiError::invalid_param("include", format!("Unknown `include[]` value `{other}`"))
+            }
+        });
+    }
+    Ok(())
+}
 
 fn validate_transcription_response_format(response_format: &str) -> Result<(), ApiError> {
     match response_format {
@@ -665,28 +768,18 @@ async fn transcriptions_stream(
     let language = req.language;
     let prompt = req.prompt;
     let max_tokens = req.max_tokens;
+    let service_tier = req.service_tier;
     let audio_bytes = audio.bytes;
 
+    // Admitted before the stream starts, so a request the server has no
+    // room for is a plain `429`, not a stream.
+    let permit = state
+        .admit_request_owned(service_tier.workload_class(WorkloadClass::Streaming))
+        .await?;
     let (event_tx, mut event_rx) = mpsc::channel::<String>(TRANSCRIPTION_STREAM_CAPACITY);
     let engine = state.runtime.clone();
-    let admission_state = state.clone();
 
     tokio::spawn(async move {
-        let permit = match admission_state
-            .acquire_owned_workload_permit(WorkloadClass::Streaming)
-            .await
-        {
-            Ok(permit) => permit,
-            Err(_) => {
-                send_transcription_terminal(
-                    event_tx,
-                    vec![transcript_error_event_payload("Server is shutting down")],
-                )
-                .await;
-                return;
-            }
-        };
-
         let delta_tx = event_tx.clone();
         let pending = Arc::new(PendingTranscriptText::default());
         let delta_pending = pending.clone();
@@ -701,7 +794,9 @@ async fn transcriptions_stream(
             permit.runtime_context(),
             move |delta| delta_pending.push(&delta_tx, delta),
         );
-        let terminal = drive_transcription_stream(&event_tx, &pending, generation).await;
+        let terminal =
+            drive_transcription_stream(&event_tx, &pending, service_tier.reported(), generation)
+                .await;
         drop(permit);
         if let Some(terminal) = terminal {
             send_transcription_terminal(event_tx, terminal).await;
@@ -732,8 +827,12 @@ async fn transcriptions_stream(
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct JsonRequestBody {
-    audio_base64: String,
+pub(crate) struct JsonRequestBody {
+    #[serde(default)]
+    audio_base64: Option<String>,
+    /// A Batch API line's audio: a `user_data` file (`/v1/files`).
+    #[serde(default)]
+    file_id: Option<String>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -762,10 +861,96 @@ struct JsonRequestBody {
     #[serde(default)]
     temperature: Option<f32>,
     #[serde(default)]
+    chunking_strategy: Option<serde_json::Value>,
+    #[serde(default)]
+    include: Option<Vec<String>>,
+    #[serde(default)]
     timestamp_granularities: Option<Vec<String>>,
+    #[serde(default)]
+    service_tier: Option<String>,
+}
+
+impl JsonRequestBody {
+    /// The request these fields describe, over `audio`.
+    fn into_request(self, audio: AudioPayload, service_tier: ServiceTier) -> TranscriptionRequest {
+        TranscriptionRequest {
+            audio: Some(audio),
+            model: self.model.map(|model| {
+                crate::api::openai::model_aliases::resolve_model_alias(&model).to_string()
+            }),
+            aligner_model: self.aligner_model,
+            language: self.language.or_else(|| {
+                self.languages.and_then(|languages| {
+                    languages.into_iter().find(|code| !code.trim().is_empty())
+                })
+            }),
+            response_format: self.response_format,
+            stream: self.stream.unwrap_or(false),
+            prompt: self.prompt,
+            target_language: self.target_language,
+            keywords: self
+                .keywords
+                .map(KeywordsField::into_keywords)
+                .unwrap_or_default(),
+            speaker_labels: self.speaker_labels.unwrap_or(false),
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+            chunking_strategy: self.chunking_strategy,
+            include: self.include.unwrap_or_default(),
+            timestamp_granularities: self.timestamp_granularities,
+            translate: false,
+            service_tier,
+        }
+    }
+
+    /// Where a Batch API line's audio is: exactly one of `file_id` and
+    /// `audio_base64`.
+    pub(crate) fn audio(&self) -> Result<BatchAudio<'_>, ApiError> {
+        match (self.file_id.as_deref(), self.audio_base64.as_deref()) {
+            (Some(file_id), None) => Ok(BatchAudio::FileId(file_id)),
+            (None, Some(encoded)) => Ok(BatchAudio::Base64(encoded)),
+            _ => Err(ApiError::invalid_param(
+                "file_id",
+                "Name the audio by exactly one of `file_id` or `audio_base64`",
+            )),
+        }
+    }
+}
+
+/// The audio of a Batch API line.
+pub(crate) enum BatchAudio<'a> {
+    FileId(&'a str),
+    Base64(&'a str),
+}
+
+/// The body of a Batch API line: the JSON body this route takes, whose
+/// audio may also be a `file_id`.
+pub(crate) fn parse_batch_body(body: &serde_json::Value) -> Result<JsonRequestBody, ApiError> {
+    <JsonRequestBody as serde::Deserialize>::deserialize(body)
+        .map_err(|err| ApiError::bad_request(format!("Invalid request body: {err}")))
+}
+
+/// Runs a Batch API line as this route (or `/v1/audio/translations`) runs a
+/// request, at `service_tier` whatever tier the body names.
+pub(crate) async fn run_batch_line(
+    state: AppState,
+    correlation_id: String,
+    body: JsonRequestBody,
+    audio: AudioPayload,
+    translate: bool,
+    service_tier: ServiceTier,
+) -> Result<Response<Body>, ApiError> {
+    inspect_audio_payload_canonical_with_diagnostics("openai.audio.transcriptions", &audio)?;
+    let req = body.into_request(audio, service_tier);
+    if translate {
+        run_translation(state, correlation_id, req).await
+    } else {
+        run_transcription(state, correlation_id, req).await
+    }
 }
 
 async fn parse_transcription_request(req: Request) -> Result<TranscriptionRequest, ApiError> {
+    let tier_header = req.headers().get(SERVICE_TIER_HEADER).cloned();
     let content_type = req
         .headers()
         .get(header::CONTENT_TYPE)
@@ -778,34 +963,14 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
             .extract::<Json<JsonRequestBody>, _>()
             .await
             .map_err(|e| ApiError::bad_request(format!("Invalid JSON payload: {e}")))?;
-        let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
+        let service_tier =
+            ServiceTier::parse(payload.service_tier.as_deref(), tier_header.as_ref())?;
+        let audio_base64 = payload.audio_base64.as_deref().ok_or_else(|| {
+            ApiError::bad_request("Invalid JSON payload: missing field `audio_base64`")
+        })?;
+        let audio_payload = decode_base64_audio_payload(audio_base64)?;
         inspect_audio_payload_canonical_with_diagnostics("openai.audio.transcriptions", &audio_payload)?;
-
-        return Ok(TranscriptionRequest {
-            audio: Some(audio_payload),
-            model: payload.model.map(|model| {
-                crate::api::openai::model_aliases::resolve_model_alias(&model).to_string()
-            }),
-            aligner_model: payload.aligner_model,
-            language: payload.language.or_else(|| {
-                payload.languages.and_then(|languages| {
-                    languages.into_iter().find(|code| !code.trim().is_empty())
-                })
-            }),
-            response_format: payload.response_format,
-            stream: payload.stream.unwrap_or(false),
-            prompt: payload.prompt,
-            target_language: payload.target_language,
-            keywords: payload
-                .keywords
-                .map(KeywordsField::into_keywords)
-                .unwrap_or_default(),
-            speaker_labels: payload.speaker_labels.unwrap_or(false),
-            max_tokens: payload.max_tokens,
-            _temperature: payload.temperature,
-            timestamp_granularities: payload.timestamp_granularities,
-            translate: false,
-        });
+        return Ok(payload.into_request(audio_payload, service_tier));
     }
 
     if content_type.starts_with("multipart/form-data") {
@@ -816,6 +981,7 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
 
         let mut out = TranscriptionRequest::default();
         let mut languages_hint = None;
+        let mut service_tier = None;
 
         while let Some(field) = multipart
             .next_field()
@@ -976,7 +1142,41 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                             "Failed reading multipart 'temperature' field: {e}"
                         ))
                     })?;
-                    out._temperature = text.trim().parse::<f32>().ok();
+                    if !text.trim().is_empty() {
+                        out.temperature = Some(text.trim().parse::<f32>().map_err(|_| {
+                            ApiError::invalid_param(
+                                "temperature",
+                                "Invalid multipart 'temperature' field: expected a number",
+                            )
+                        })?);
+                    }
+                }
+                "chunking_strategy" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'chunking_strategy' field: {e}"
+                        ))
+                    })?;
+                    // `auto`, or the strategy object as JSON.
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        out.chunking_strategy = Some(
+                            serde_json::from_str(text)
+                                .ok()
+                                .filter(serde_json::Value::is_object)
+                                .unwrap_or_else(|| text.into()),
+                        );
+                    }
+                }
+                "include[]" | "include" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'include[]' field: {e}"
+                        ))
+                    })?;
+                    if !text.trim().is_empty() {
+                        out.include.push(text.trim().to_string());
+                    }
                 }
                 "timestamp_granularities[]" => {
                     let text = field.text().await.map_err(|e| {
@@ -1001,6 +1201,13 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                         "1" | "true" | "yes" | "on"
                     );
                 }
+                "service_tier" => {
+                    service_tier = Some(field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'service_tier' field: {e}"
+                        ))
+                    })?);
+                }
                 _ => {}
             }
         }
@@ -1008,6 +1215,7 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
         if out.language.is_none() {
             out.language = languages_hint;
         }
+        out.service_tier = ServiceTier::parse(service_tier.as_deref(), tier_header.as_ref())?;
         return Ok(out);
     }
 
@@ -1488,14 +1696,18 @@ fn transcript_done_event_payload(
     text: String,
     language: Option<String>,
     duration_secs: f32,
+    service_tier: Option<&'static str>,
 ) -> String {
-    serde_json::json!({
+    let mut done = serde_json::json!({
         "type": "transcript.text.done",
         "text": text,
         "language": language,
         "audio_duration_secs": duration_secs,
-    })
-    .to_string()
+    });
+    if let Some(service_tier) = service_tier {
+        done["service_tier"] = service_tier.into();
+    }
+    done.to_string()
 }
 
 fn transcript_error_event_payload(message: &str) -> String {
@@ -1680,6 +1892,319 @@ mod tests {
         );
     }
 
+    fn multipart_request() -> axum::http::request::Builder {
+        Request::builder().header(
+            header::CONTENT_TYPE,
+            "multipart/form-data; boundary=izwi-boundary",
+        )
+    }
+
+    fn multipart_body(fields: &[(&str, &str)]) -> Body {
+        let mut body = String::new();
+        for (name, value) in fields {
+            body.push_str(&format!(
+                "--izwi-boundary\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            ));
+        }
+        body.push_str("--izwi-boundary--\r\n");
+        Body::from(body)
+    }
+
+    /// The request a JSON body and a form make of the same fields, checked
+    /// as the route checks it.
+    async fn check_decoding_options(
+        json: serde_json::Value,
+        form: &[(&str, &str)],
+    ) -> [Result<(), ApiError>; 2] {
+        let mut body = json;
+        body["audio_base64"] = wav_data_url().into();
+        let json = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let form = multipart_request().body(multipart_body(form)).unwrap();
+        let mut results = Vec::new();
+        for request in [json, form] {
+            results.push(match parse_transcription_request(request).await {
+                Ok(request) => validate_openai_decoding_options(&request),
+                Err(error) => Err(error),
+            });
+        }
+        results.try_into().unwrap()
+    }
+
+    fn refusal(result: Result<(), ApiError>) -> (Option<&'static str>, Option<&'static str>) {
+        let error = result.expect_err("the option is refused");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        let detail = error.detail.expect("the error names its parameter");
+        (detail.param, detail.code)
+    }
+
+    /// What `docs/openai-compatibility-contract.json` says of the route's
+    /// decoding options.
+    fn decoding_contract() -> serde_json::Value {
+        let contract: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../../docs/openai-compatibility-contract.json"
+        ))
+        .unwrap();
+        contract["formats"]["audio_transcriptions"].clone()
+    }
+
+    #[tokio::test]
+    async fn temperature_is_accepted_within_openais_range_and_refused_outside_it() {
+        let range = decoding_contract()["temperature_range"].clone();
+        assert_eq!(range, serde_json::json!([0, 1]));
+        for (json, form) in [(0.0, "0"), (0.4, "0.4"), (1.0, "1")] {
+            for result in check_decoding_options(
+                serde_json::json!({"temperature": json}),
+                &[("temperature", form)],
+            )
+            .await
+            {
+                assert!(result.is_ok(), "temperature {form}");
+            }
+        }
+        for (json, form) in [(-0.1, "-0.1"), (1.5, "1.5")] {
+            for result in check_decoding_options(
+                serde_json::json!({"temperature": json}),
+                &[("temperature", form)],
+            )
+            .await
+            {
+                assert_eq!(
+                    refusal(result),
+                    (Some("temperature"), Some("invalid_value")),
+                    "temperature {form}"
+                );
+            }
+        }
+        // A form value that is not a number is refused rather than dropped,
+        // and an empty one is absent.
+        let [_, not_a_number] =
+            check_decoding_options(serde_json::json!({}), &[("temperature", "warm")]).await;
+        assert_eq!(refusal(not_a_number).0, Some("temperature"));
+        let [absent, empty] =
+            check_decoding_options(serde_json::json!({}), &[("temperature", "")]).await;
+        assert!(absent.is_ok() && empty.is_ok());
+    }
+
+    #[tokio::test]
+    async fn chunking_strategy_auto_is_accepted_and_server_vad_is_refused() {
+        let contract = decoding_contract();
+        assert_eq!(contract["chunking_strategy"], serde_json::json!(["auto"]));
+        assert_eq!(
+            contract["refused_chunking_strategy"],
+            serde_json::json!(["server_vad"])
+        );
+        for result in check_decoding_options(
+            serde_json::json!({"chunking_strategy": "auto"}),
+            &[("chunking_strategy", "auto")],
+        )
+        .await
+        {
+            assert!(result.is_ok());
+        }
+        let server_vad = serde_json::json!({
+            "type": "server_vad",
+            "prefix_padding_ms": 300,
+            "silence_duration_ms": 200,
+            "threshold": 0.5,
+        });
+        for result in check_decoding_options(
+            serde_json::json!({"chunking_strategy": server_vad}),
+            &[("chunking_strategy", &server_vad.to_string())],
+        )
+        .await
+        {
+            let error = result.clone().expect_err("server_vad is refused");
+            assert!(error.message.contains("server_vad"), "{}", error.message);
+            assert_eq!(
+                refusal(result),
+                (Some("chunking_strategy"), Some("unsupported_parameter"))
+            );
+        }
+        for (json, form) in [
+            (serde_json::json!("vad"), "vad"),
+            (
+                serde_json::json!({"type": "semantic"}),
+                r#"{"type":"semantic"}"#,
+            ),
+        ] {
+            for result in check_decoding_options(
+                serde_json::json!({"chunking_strategy": json}),
+                &[("chunking_strategy", form)],
+            )
+            .await
+            {
+                assert_eq!(
+                    refusal(result),
+                    (Some("chunking_strategy"), Some("invalid_value")),
+                    "{form}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn include_logprobs_is_refused_by_name() {
+        assert_eq!(
+            decoding_contract()["refused_include"],
+            serde_json::json!(["logprobs"])
+        );
+        for field in ["include[]", "include"] {
+            for result in check_decoding_options(
+                serde_json::json!({"include": ["logprobs"], "model": "Parakeet-TDT-0.6B-v3"}),
+                &[(field, "logprobs"), ("model", "Parakeet-TDT-0.6B-v3")],
+            )
+            .await
+            {
+                let error = result.clone().expect_err("logprobs are refused");
+                assert!(
+                    error
+                        .message
+                        .contains("not supported for Parakeet-TDT-0.6B-v3"),
+                    "{}",
+                    error.message
+                );
+                assert_eq!(
+                    refusal(result),
+                    (Some("include"), Some("unsupported_parameter"))
+                );
+            }
+        }
+        for result in check_decoding_options(
+            serde_json::json!({"include": ["tokens"]}),
+            &[("include[]", "tokens")],
+        )
+        .await
+        {
+            assert_eq!(refusal(result), (Some("include"), Some("invalid_value")));
+        }
+        for result in
+            check_decoding_options(serde_json::json!({"include": []}), &[("include[]", "")]).await
+        {
+            assert!(result.is_ok());
+        }
+    }
+
+    /// `service_tier` arrives as a JSON field, a form field or the
+    /// `X-Izwi-Service-Tier` header; the body wins, and every value maps to
+    /// the tier served.
+    #[tokio::test]
+    async fn parse_request_reads_the_service_tier_from_the_body_or_the_header() {
+        for (value, served) in [
+            ("auto", "default"),
+            ("default", "default"),
+            ("flex", "flex"),
+            ("priority", "default"),
+        ] {
+            let json = Request::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"audio_base64": wav_data_url(), "service_tier": value})
+                        .to_string(),
+                ))
+                .unwrap();
+            let form = multipart_request()
+                .body(multipart_body(&[("service_tier", value)]))
+                .unwrap();
+            let header_only = multipart_request()
+                .header(SERVICE_TIER_HEADER, value)
+                .body(multipart_body(&[("model", "Parakeet-TDT-0.6B-v3")]))
+                .unwrap();
+            for request in [json, form, header_only] {
+                let tier = parse_transcription_request(request)
+                    .await
+                    .expect("request should parse")
+                    .service_tier;
+                assert_eq!(tier.reported(), Some(served), "{value}");
+            }
+        }
+
+        let body_wins = multipart_request()
+            .header(SERVICE_TIER_HEADER, "default")
+            .body(multipart_body(&[("service_tier", "flex")]))
+            .unwrap();
+        let tier = parse_transcription_request(body_wins)
+            .await
+            .unwrap()
+            .service_tier;
+        assert_eq!(
+            tier.workload_class(WorkloadClass::Interactive),
+            WorkloadClass::Batch
+        );
+
+        let unnamed = multipart_request()
+            .body(multipart_body(&[("model", "Parakeet-TDT-0.6B-v3")]))
+            .unwrap();
+        let tier = parse_transcription_request(unnamed)
+            .await
+            .unwrap()
+            .service_tier;
+        assert_eq!(tier, ServiceTier::default());
+    }
+
+    #[tokio::test]
+    async fn parse_request_rejects_an_unknown_service_tier() {
+        let json = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"audio_base64": wav_data_url(), "service_tier": "fastest"})
+                    .to_string(),
+            ))
+            .unwrap();
+        let form = multipart_request()
+            .body(multipart_body(&[("service_tier", "fastest")]))
+            .unwrap();
+        let header_only = multipart_request()
+            .header(SERVICE_TIER_HEADER, "fastest")
+            .body(multipart_body(&[]))
+            .unwrap();
+        for request in [json, form, header_only] {
+            let error = parse_transcription_request(request)
+                .await
+                .expect_err("an unknown tier is refused");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                error.detail.and_then(|detail| detail.param),
+                Some("service_tier")
+            );
+        }
+    }
+
+    /// Bodies name the tier served only when the request named one.
+    #[test]
+    fn transcription_bodies_report_a_named_service_tier() {
+        let flex = ServiceTier::parse(Some("flex"), None).unwrap();
+        let body = |service_tier| {
+            serde_json::to_value(JsonTranscriptionResponse {
+                text: "hello".to_string(),
+                service_tier,
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            body(flex.reported()),
+            serde_json::json!({"text": "hello", "service_tier": "flex"})
+        );
+        assert_eq!(
+            body(ServiceTier::default().reported()),
+            serde_json::json!({"text": "hello"})
+        );
+
+        let done = |service_tier| {
+            serde_json::from_str::<serde_json::Value>(&transcript_done_event_payload(
+                "hello".to_string(),
+                None,
+                1.0,
+                service_tier,
+            ))
+            .unwrap()
+        };
+        assert_eq!(done(flex.reported())["service_tier"], "flex");
+        assert!(done(None).get("service_tier").is_none());
+    }
+
     #[tokio::test]
     async fn parse_json_request_rejects_undecodable_audio() {
         let request = Request::builder()
@@ -1760,7 +2285,7 @@ mod tests {
             }
             Ok(transcription(text))
         };
-        let terminal = drive_transcription_stream(&event_tx, &pending, generation)
+        let terminal = drive_transcription_stream(&event_tx, &pending, None, generation)
             .await
             .expect("the client is still connected");
         drop(delta_tx);
@@ -1811,7 +2336,7 @@ mod tests {
             pending.push(&event_tx, "b".to_string());
             Err(izwi_core::Error::InferenceError("boom".to_string()))
         };
-        let terminal = drive_transcription_stream(&event_tx, &pending, generation)
+        let terminal = drive_transcription_stream(&event_tx, &pending, None, generation)
             .await
             .expect("the client is still connected");
         let reader = tokio::spawn(async move {
@@ -1835,7 +2360,7 @@ mod tests {
         drop(event_rx);
         let pending = PendingTranscriptText::default();
         let terminal =
-            drive_transcription_stream(&event_tx, &pending, std::future::pending()).await;
+            drive_transcription_stream(&event_tx, &pending, None, std::future::pending()).await;
         assert!(terminal.is_none());
     }
 
@@ -1852,7 +2377,7 @@ mod tests {
                 pending.push(&event_tx, "unsent".to_string());
                 Ok(transcription("done".to_string()))
             };
-            let terminal = drive_transcription_stream(&event_tx, &pending, generation).await;
+            let terminal = drive_transcription_stream(&event_tx, &pending, None, generation).await;
             drop(permit);
             if let Some(terminal) = terminal {
                 send_transcription_terminal(event_tx, terminal).await;

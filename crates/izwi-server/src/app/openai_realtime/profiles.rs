@@ -202,7 +202,7 @@ pub(crate) fn validate_spec(spec: &ProfileSpec) -> Result<RealtimeProfile, Strin
     let tts_model_id = spec.tts_model_id.as_deref().unwrap_or(DEFAULT_TTS_MODEL);
     let asr = parse_model_variant(asr_model_id)
         .map_err(|err| format!("Profile `{}`: unsupported ASR model: {err}", spec.id))?;
-    if !asr.serves_live_asr() {
+    if !transcribes_input(asr) {
         return Err(format!(
             "Profile `{}`: `{asr_model_id}` is not a live ASR model",
             spec.id
@@ -364,6 +364,13 @@ pub(crate) fn is_openai_transcription_model(model: &str) -> bool {
         || model.starts_with("gpt-realtime-whisper")
 }
 
+/// Whether `variant` may transcribe a session's input: a live ASR model, or
+/// a model with a streaming session of its own (Voxtral Realtime,
+/// LFM3-Audio).
+pub(crate) fn transcribes_input(variant: ModelVariant) -> bool {
+    variant.serves_live_asr() || izwi_core::asr_streams_live(variant)
+}
+
 /// The ASR model that transcribes a session's input: the transcription
 /// model the client named when it is an Izwi live ASR model (after the
 /// operator's `IZWI_OPENAI_MODEL_ALIASES`, so `gpt-4o-transcribe=…` picks
@@ -394,7 +401,7 @@ fn transcription_model_with(
     {
         let variant = parse_model_variant(requested)
             .map_err(|_| format!("Unknown transcription model `{requested}`"))?;
-        if !(variant.serves_live_asr() || variant.family() == izwi_core::ModelFamily::Lfm3Audio) {
+        if !transcribes_input(variant) {
             return Err(format!(
                 "`{requested}` cannot transcribe live speech; name an ASR model"
             ));

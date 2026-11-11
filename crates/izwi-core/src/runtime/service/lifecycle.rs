@@ -267,12 +267,20 @@ impl RuntimeService {
                 .physical_launch_limit
                 .get(),
         );
-        let coordinator = Arc::new(InferenceCoordinator::new_with_device(
+        let asr_realtime_sessions = RealtimeAsrSessionPolicy::resolve_for_sequences(
+            config.asr_realtime,
             selected_backend_kind,
-            device.clone(),
-            execution_parallelism,
-            core_config.max_queued_requests,
-        )?);
+            max_num_seqs,
+        )?;
+        let coordinator = Arc::new(
+            InferenceCoordinator::new_with_device(
+                selected_backend_kind,
+                device.clone(),
+                execution_parallelism,
+                core_config.max_queued_requests,
+            )?
+            .with_realtime_session_capacity(asr_realtime_sessions.max_sessions()),
+        );
         let qwen_asr_encoder_batcher = Arc::new(QwenAsrEncoderBatcher::new(coordinator.clone()));
         let whisper_encoder_batcher = Arc::new(WhisperEncoderBatcher::new(coordinator.clone()));
         let vibevoice_encoder_batcher = Arc::new(VibeVoiceEncoderBatcher::new(coordinator.clone()));
@@ -280,13 +288,7 @@ impl RuntimeService {
             Arc::new(GraniteSpeechEncoderBatcher::new(coordinator.clone()));
         let granite_speech5_encoder_batcher =
             Arc::new(GraniteSpeech5EncoderBatcher::new(coordinator.clone()));
-        let parakeet_encoder_batcher = Arc::new(ParakeetEncoderBatcher::new(coordinator.clone()));
         let nemotron_encoder_batcher = Arc::new(NemotronEncoderBatcher::new(coordinator.clone()));
-        let asr_realtime_sessions = RealtimeAsrSessionPolicy::resolve_for_sequences(
-            config.asr_realtime,
-            selected_backend_kind,
-            max_num_seqs,
-        )?;
         let realtime_asr_sequence_capacity = asr_realtime_sessions.retained_sequence_capacity()?;
         worker_config.resource_authority = Some(coordinator.resource_authority());
         worker_config.physical_execution_admission =
@@ -317,6 +319,10 @@ impl RuntimeService {
             "resolved runtime concurrency"
         );
         let core_engine = Arc::new(CoreEngine::new_with_worker(core_config, worker_config)?);
+        let parakeet_encoder_batcher = Arc::new(ParakeetEncoderBatcher::new(
+            coordinator.clone(),
+            core_engine.live_demand(),
+        ));
         let backend_router = BackendRouter::from_context(backend_context);
         let tokenizer = Arc::new(RwLock::new(None));
         let codec = Arc::new(RwLock::new(AudioCodec::new()));
@@ -430,6 +436,25 @@ impl RuntimeService {
     /// out TTS work size their concurrency from it; more would only queue.
     pub fn tts_row_width(&self) -> usize {
         self.adapter_registry.max_tensor_batch_size().max(1)
+    }
+
+    /// Long-form segments one request of `workload_class` may synthesize
+    /// at once on `variant`: the TTS row width, or the model's real-time
+    /// reserve limit while it has live demand, so one long request leaves
+    /// rows for live callers. Realtime-class callers keep the row width.
+    pub async fn tts_long_form_concurrency(
+        &self,
+        variant: ModelVariant,
+        workload_class: WorkloadClass,
+    ) -> usize {
+        let width = self.tts_row_width();
+        if workload_class == WorkloadClass::Realtime {
+            return width;
+        }
+        match self.core_engine.reserved_admission_limit(variant).await {
+            Some(limit) => width.min(limit),
+            None => width,
+        }
     }
 
     /// The concurrency this runtime resolved at startup (`max_num_seqs` and

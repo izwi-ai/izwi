@@ -821,6 +821,19 @@ voice exception is OpenAI Realtime (`/v1/realtime`): with
 session and relays it whole to an izwi-server, which keeps the session's state;
 the gateway runs no part of the voice turn.
 
+`POST /v1/realtime/client_secrets` and `GET /v1/realtime/capabilities` are
+relayed to the same upstreams. Each izwi-server keeps the `ek_` keys it mints
+in its own memory, so the gateway remembers which upstream minted each key and
+for which principal, sends a session that presents the key to that upstream
+(with the key as the session's credential there), and counts the session
+against the minting principal's tenant. A browser therefore needs no gateway
+API key, only the secret, and the secret opens `/v1/realtime` alone. This
+memory is per gateway process: a restart of the gateway or of the upstream
+forgets the keys (clients mint a new one), and with more than one gateway
+replica a key is only good at the replica that minted it. Run a single
+replica for browser clients, or pin a browser to the replica its backend
+minted through.
+
 The speech API is relayed the same way. With `IZWI_GATEWAY_AUDIO_UPSTREAMS`,
 the gateway relays these routes to izwi-servers, round robin, after its own
 authentication, admission and tenant lease:
@@ -834,15 +847,53 @@ authentication, admission and tenant lease:
 Without `IZWI_GATEWAY_AUDIO_UPSTREAMS`, the Realtime upstreams serve these
 routes when those are set.
 
-Bodies stream through unbuffered. A speech id's lookup goes to the upstream
+Bodies stream through unbuffered, so a request's `service_tier` field reaches
+the izwi-server as sent; the `X-Izwi-Service-Tier` request header is relayed
+too, and the response header naming the tier served comes back. A speech id's lookup goes to the upstream
 that served it; the gateway asks each upstream in turn for an id it has not
 seen.
 
-Voices and consents (`/v1/audio/voices`, `/v1/audio/voice_consents`) are
-relayed only with `IZWI_GATEWAY_AUDIO_SHARED_STATE=true`. Set it when every
-upstream shares one records database (PostgreSQL) and one media store.
-Otherwise a voice made through one upstream would be missing on the next.
-Encoding always happens on the upstream.
+Voices and consents (`/v1/audio/voices`, `/v1/audio/voice_consents`), files
+(`/v1/files`), batches (`/v1/batches`) and durable jobs (`/v1/jobs/{id}` and
+its `cancel`, `retry` and `artifacts`) are relayed only with
+`IZWI_GATEWAY_AUDIO_SHARED_STATE=true`. Set it when every upstream shares one
+records database (PostgreSQL) and one media store; a single upstream shares
+them with itself. Otherwise a voice, file or batch made through one upstream
+would be missing on the next. With shared state, a batch created through one
+upstream is run by whichever upstream's executor leases it. Encoding always
+happens on the upstream.
+
+Three limits of these relayed records:
+
+- The upstreams see the gateway as one caller (the upstream API key). The
+  gateway therefore names the caller's tenant on every request it relays, in
+  `X-Izwi-Gateway-Tenant`: a digest of the principal key's `tenant_id`, or
+  of its `principal_id` when it has none, so the keys of one tenant share
+  their records. The gateway sets the header itself and never relays a
+  client's copy. An upstream acts on it only when started with
+  `IZWI_TRUST_GATEWAY_TENANT_HEADER=true`. Then files, batches (with their
+  output, error and speech audio files), `/v1/jobs/{id}` lookups, speech
+  lookups (`GET /v1/audio/speech/{id}`), idempotency keys and the upstream's
+  per-tenant limits (`IZWI_MAX_SPEECH_REQUESTS_PER_TENANT` and the like) are
+  kept per gateway tenant: another tenant's id answers `404`, like one that does not exist.
+  Records made by a client that reaches the upstream directly, and those
+  made before the setting was turned on, stay with direct callers.
+- Set `IZWI_TRUST_GATEWAY_TENANT_HEADER` on every upstream, and only on
+  upstreams that nothing but the gateway can reach: whoever can reach one
+  with its API key (anyone at all, on an upstream without a key) can name
+  any tenant. The gateway cannot tell whether an upstream has it. Without
+  it the header is ignored and files, batches and jobs are shared by every
+  gateway principal: a file one gateway key uploads can be listed and read
+  with another. Voices and consents are shared by every gateway principal
+  either way. Do not set `IZWI_GATEWAY_AUDIO_SHARED_STATE` on a gateway
+  whose principals must not use each other's voices.
+- An upload to `/v1/files` streams through the gateway unbuffered. The
+  upstream's `IZWI_FILES_MAX_BYTES` bounds it and answers `413`; the gateway
+  adds no limit of its own.
+
+The gateway relays `/v1/jobs` lookups only. The first-party routes that
+create durable jobs (`/v1/speech-to-text/jobs`, `/v1/text-to-speech`) are
+served by an izwi-server directly.
 
 The gateway's `/openapi.json` lists `/v1/realtime` and these audio routes only
 when its configuration relays them.
@@ -982,6 +1033,81 @@ silence.
 
 The old defaults were a 10-minute lifetime and a 30 s idle timeout. A
 deployment that relied on them must now set them explicitly.
+
+### Batch transcription beside live traffic
+
+A model that serves live and batch requests shares its device between them
+between device jobs; a running job is never interrupted. Long recordings are
+therefore transcribed in bounded jobs where the model allows it: Whisper,
+Qwen3-ASR, Granite Speech and the LFM audio models run one chunk per job, and
+a Batch or Background Parakeet recording encodes one window group per job
+(one 82 s window, four on CUDA) while its model has live demand.
+`izwi_engine_asr_encoder_live_yields_total` counts the jobs Parakeet ended
+this way.
+
+VibeVoice-ASR and Nemotron 3.5 Transcribe read the whole recording in one
+context, so splitting it would change the transcript. A batch request of
+either holds the device for the length of one pass, and a live request of the
+same model waits for it. A deployment that needs strict live latency should
+serve these two for batch on a separate model instance or device.
+
+The settings that shape a server doing both kinds of work (the user guide
+`docs/user/realtime-and-batch.md` explains each; the env references under
+`docs/dev/env/` are generated from the code):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `IZWI_REALTIME_ROW_RESERVE` | a quarter of the model's rows, at least 1 | Rows a model keeps free of Batch and Background requests while it has live demand; `0` disables. |
+| `IZWI_STREAM_LEAD_SECS` | `3` | Lead past which a speech stream is scheduled from the Batch share; `0` disables. |
+| `IZWI_ADMISSION_QUEUE_TIMEOUT_SECS` | `30` | Wait for an admission slot before `429`; `0` waits without limit. |
+| `IZWI_MAX_BATCH_REQUESTS`, `IZWI_MAX_BACKGROUND_REQUESTS` | the global request limit minus one | Concurrent requests of the class; the other classes default to the global limit. |
+| `IZWI_MAX_REALTIME_SESSIONS` | `32` | Open realtime WebSocket sessions. |
+| `IZWI_ASR_REALTIME_MAX_SESSIONS` | `IZWI_MAX_NUM_SEQS`, else 16 on CUDA and 4 elsewhere | Concurrent native realtime ASR streams. |
+| `IZWI_MAX_QUEUED_REQUESTS` | `128` | The general runtime queue; the real-time queue is as large, or the real-time session cap if that is larger. |
+| `IZWI_FILES_MAX_BYTES` | `209715200` | Largest `/v1/files` upload. |
+| `IZWI_BATCH_MAX_REQUESTS` | `50000` | Requests per `/v1/batches` input file. |
+| `IZWI_BATCH_WORKER_CONCURRENCY` | the runtime's capacity | `/v1/batches` lines in flight and durable jobs run at once. |
+| `IZWI_BATCH_STAGE_TIMEOUT_SECS` | `21600` | Wall-clock limit of one durable stage; `0` disables. |
+| `IZWI_BATCH_WEBHOOK_SECRET`, `IZWI_BATCH_WEBHOOK_ALLOW_HTTP`, `IZWI_BATCH_WEBHOOK_ALLOW_PRIVATE` | unset, `false`, `false` | Batch completion webhooks: on with a secret; the two flags allow `http://` URLs and non-public hosts. |
+
+### Mixed-load gate
+
+Before a release that changes scheduling, admission, a speech model's
+serving path or the batch routes, run `scripts/bench/run-mixed-load.py` on
+the release build and the target device, four ways:
+
+| Run | Real-time side | Batch side |
+|---|---|---|
+| Same-model ASR | `--realtime-kind asr` on the ASR model | the same model (the default) |
+| Cross-model ASR | `--realtime-kind asr` on the ASR model | `--batch-kind tts --batch-model <TTS model>` |
+| Same-model TTS | `--realtime-kind tts` on the TTS model | the same model (the default) |
+| Cross-model TTS | `--realtime-kind tts` on the TTS model | `--batch-kind asr --batch-model <ASR model> --batch-audio <recording>` |
+
+Use the batch tier production uses (`--batch-service-tier flex`), the
+default `--batch-levels` ladder up to a level that saturates the device, and
+`--enforce-slo`, which exits 4 when a step fails a check. The commands are in
+`scripts/bench/README.md` ("Mixed real-time and batch load").
+
+A run passes when all of these hold at every batch level:
+
+- the real-time checks pass: ASR first partial p95 at most 0.5 s and final
+  p95 at most 0.8 s, or TTS first audio p95 at most 0.5 s, and none of them
+  more than 25% above the level-0 step (`slo` in each step file);
+- the real-time side has no failed requests, and no refusals (`429`, `503`,
+  close `1013`) that the level-0 step does not also have;
+- the batch side completes work at every level above 0: batch throughput
+  is not zero, and batch refusals are retried rather than failed;
+- batch throughput with no real-time load stays within 5% of the previous
+  release's figure for the same model and device. The mixed-load driver
+  always holds a live load, so measure this with
+  `scripts/bench/run-audio-load.py` (ASR) and
+  `scripts/bench/run-tts-concurrency.py` (TTS).
+
+Keep each run's `summary.json` with the release evidence. A failed check is
+a release blocker for the deployment shape it measures, or the documented
+targets change with it. No run of this gate has been recorded yet: the
+thresholds are the plan's targets, to be revised once after the first
+measured run and then held.
 
 ### Hierarchical KV offload (DS4, explicit opt-in)
 

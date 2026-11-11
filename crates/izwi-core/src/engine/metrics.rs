@@ -60,6 +60,11 @@ pub const ENGINE_KV_MODEL_ADMISSION_AVAILABLE_PAGES: &str =
     "engine.kv_cache.model_admission_available_pages";
 pub const ENGINE_SCHEDULER_PREEMPTIONS_TOTAL: &str = "engine.scheduler.preemptions_total";
 pub const ENGINE_SCHEDULER_KV_BLOCKED_REQUESTS: &str = "engine.scheduler.kv_blocked_requests";
+pub const ENGINE_SCHEDULER_RESERVE_DEFERRALS_TOTAL: &str =
+    "engine.scheduler.reserve_deferrals_total";
+pub const ENGINE_ASR_ENCODER_LIVE_YIELDS_TOTAL: &str = "engine.asr.encoder_live_yields_total";
+pub const ENGINE_SCHEDULER_STREAM_PACING_TRANSITIONS_TOTAL: &str =
+    "engine.scheduler.stream_pacing_transitions_total";
 pub const ENGINE_KV_PROMOTION_LATENCY_AVG_SECONDS: &str =
     "engine.kv_cache.promotion_latency_avg_seconds";
 pub const ENGINE_STREAM_BACKPRESSURE_TOTAL: &str = "engine.stream.backpressure_total";
@@ -430,6 +435,18 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     EngineMetricDescriptor {
         name: ENGINE_SCHEDULER_KV_BLOCKED_REQUESTS,
         description: "Scheduled requests the last engine step deferred for managed KV capacity.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_SCHEDULER_RESERVE_DEFERRALS_TOTAL,
+        description: "Batch and Background requests whose start waited for the real-time reserve of a model with live demand; each request counts once.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_SCHEDULER_STREAM_PACING_TRANSITIONS_TOTAL,
+        description: "Times a speech stream that ran ahead of real time by more than IZWI_STREAM_LEAD_SECS was lowered to the Batch class's share of service; the return to its own class is not counted.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_ASR_ENCODER_LIVE_YIELDS_TOTAL,
+        description: "Times a Batch or Background long-audio encode ended its device job after a window group because its model had live demand, and continued in a new job.",
     },
     EngineMetricDescriptor {
         name: ENGINE_SCHEDULER_CAPACITY_REPLAY_TOKENS_TOTAL,
@@ -1439,6 +1456,9 @@ pub struct EngineBatchMetricsSnapshot {
     pub recompute_preemptions_total: u64,
     pub claim_deadlock_aborts_total: u64,
     pub kv_blocked_requests: u64,
+    pub realtime_reserve_deferrals_total: u64,
+    pub asr_encoder_live_yields_total: u64,
+    pub stream_pacing_transitions_total: u64,
     pub continuous_envelope_scalar_fallbacks_total: u64,
     pub physical_execution: EnginePhysicalExecutionMetricsSnapshot,
 }
@@ -1512,6 +1532,30 @@ pub(crate) fn record_claim_deadlock_abort() {
 
 pub(crate) fn record_kv_blocked_requests(requests: usize) {
     ENGINE_KV_BLOCKED_REQUESTS.store(requests as u64, Ordering::Relaxed);
+}
+
+static ENGINE_REALTIME_RESERVE_DEFERRALS: AtomicU64 = AtomicU64::new(0);
+
+/// A Batch or Background request waited for the real-time reserve of its
+/// lane; recorded once per request.
+pub(crate) fn record_realtime_reserve_deferral() {
+    ENGINE_REALTIME_RESERVE_DEFERRALS.fetch_add(1, Ordering::Relaxed);
+}
+
+static ENGINE_ASR_ENCODER_LIVE_YIELDS: AtomicU64 = AtomicU64::new(0);
+
+/// A batch long-audio encode gave the device up between two window groups
+/// because its model had live demand.
+pub(crate) fn record_asr_encoder_live_yield() {
+    ENGINE_ASR_ENCODER_LIVE_YIELDS.fetch_add(1, Ordering::Relaxed);
+}
+
+static ENGINE_STREAM_PACING_TRANSITIONS: AtomicU64 = AtomicU64::new(0);
+
+/// A speech stream ran far enough ahead of real time to be scheduled from
+/// the Batch class's share.
+pub(crate) fn record_stream_pacing_transition() {
+    ENGINE_STREAM_PACING_TRANSITIONS.fetch_add(1, Ordering::Relaxed);
 }
 
 static ENGINE_INCREMENTAL_PREFILL_QUANTA_COMMITTED: AtomicU64 = AtomicU64::new(0);
@@ -2187,6 +2231,9 @@ pub fn engine_batch_metrics_snapshot() -> EngineBatchMetricsSnapshot {
         recompute_preemptions_total: ENGINE_RECOMPUTE_PREEMPTIONS.load(Ordering::Relaxed),
         claim_deadlock_aborts_total: ENGINE_CLAIM_DEADLOCK_ABORTS.load(Ordering::Relaxed),
         kv_blocked_requests: ENGINE_KV_BLOCKED_REQUESTS.load(Ordering::Relaxed),
+        realtime_reserve_deferrals_total: ENGINE_REALTIME_RESERVE_DEFERRALS.load(Ordering::Relaxed),
+        asr_encoder_live_yields_total: ENGINE_ASR_ENCODER_LIVE_YIELDS.load(Ordering::Relaxed),
+        stream_pacing_transitions_total: ENGINE_STREAM_PACING_TRANSITIONS.load(Ordering::Relaxed),
         continuous_envelope_scalar_fallbacks_total: ENGINE_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS
             .load(Ordering::Relaxed),
         physical_execution: engine_physical_execution_metrics_snapshot(),
@@ -2572,6 +2619,9 @@ mod tests {
             ENGINE_KV_MODEL_ADMISSION_AVAILABLE_PAGES,
             ENGINE_SCHEDULER_PREEMPTIONS_TOTAL,
             ENGINE_SCHEDULER_KV_BLOCKED_REQUESTS,
+            ENGINE_SCHEDULER_RESERVE_DEFERRALS_TOTAL,
+            ENGINE_ASR_ENCODER_LIVE_YIELDS_TOTAL,
+            ENGINE_SCHEDULER_STREAM_PACING_TRANSITIONS_TOTAL,
         ] {
             assert!(names.contains(metric), "{metric} is not catalogued");
         }

@@ -17,7 +17,7 @@ use crate::models::architectures::kokoro::{
 use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind};
 use crate::runtime::coordinator::{JobLease, JobResourceObservation};
 use crate::runtime::service::RuntimeService;
-use crate::runtime::tts::direct_tts_retained_input_bytes;
+use crate::runtime::tts::{direct_tts_retained_input_bytes, TtsRequestMetrics};
 use crate::runtime::types::{AudioChunk, GenerationRequest};
 
 pub(crate) const KOKORO_STREAM_TARGET_CHARS: usize = 180;
@@ -69,6 +69,7 @@ impl RuntimeService {
         job: &JobLease,
         request: GenerationRequest,
         chunk_tx: mpsc::Sender<AudioChunk>,
+        metrics: &mut TtsRequestMetrics<'_>,
     ) -> Result<()> {
         let retained_input_bytes = u64::try_from(direct_tts_retained_input_bytes(&request)?)
             .map_err(|_| Error::InvalidInput("Kokoro retained input exceeds u64".to_string()))?;
@@ -91,6 +92,22 @@ impl RuntimeService {
             .get_kokoro(variant)
             .await
             .ok_or_else(|| Error::InferenceError("Kokoro model not loaded".to_string()))?;
+        // The stream runs outside the engine scheduler: one planned chunk a
+        // device job, at the weight of the request's workload class. It is
+        // recorded as its model's live demand before each job, as the
+        // scheduler records an engine stream, so the model's batch work
+        // leaves it a sequence and yields between its own jobs.
+        let lane = Some(execution_contract.adapter_binding()?.model_instance_id);
+        let live_demand = self.core_engine.live_demand();
+        let note_live_demand = || {
+            live_demand.note_direct_stream(
+                lane,
+                variant,
+                job.spec.workload_class,
+                std::time::Instant::now(),
+            )
+        };
+        note_live_demand();
         let text = request.text;
         let text_for_limit = text.clone();
         let speaker = request
@@ -148,6 +165,7 @@ impl RuntimeService {
         )?;
 
         for (sequence, planned) in stream_chunks.into_iter().enumerate() {
+            note_live_demand();
             let model_for_task = model.clone();
             let speaker_for_task = speaker.clone();
             let language_for_task = language.clone();
@@ -199,6 +217,7 @@ impl RuntimeService {
                 chunk_sample_limit,
             )?;
 
+            metrics.streamed(synthesis.samples.len(), current_sample_rate);
             let mut chunk = AudioChunk::new(request_id.clone(), sequence, synthesis.samples)
                 .with_sample_rate(current_sample_rate);
             chunk.is_final = sequence + 1 == total_chunks;

@@ -120,10 +120,13 @@ pub async fn speech_stream(
     };
     let tenant_key = ctx.tenant_key();
     let correlation_id = ctx.correlation_id;
+    // The socket counts against the speech quota for as long as it is open.
+    let speech_connection = ctx.speech_connection;
     ws.max_message_size(MAX_MESSAGE_BYTES)
         .max_frame_size(MAX_MESSAGE_BYTES)
         .on_upgrade(move |socket| async move {
             let _slot = slot;
+            let _speech_connection = speech_connection;
             let session = Session::new(state, socket, dialect, tenant_key, correlation_id);
             session.run().await;
         })

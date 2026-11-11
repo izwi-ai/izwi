@@ -804,7 +804,7 @@ pub async fn generate_long_form_tts(
     let split_request_count = planned_requests.len();
     let outputs = generate_segments(
         planned_requests,
-        long_form_segment_concurrency(runtime),
+        long_form_segment_concurrency(runtime, variant, &request).await,
         retry_runaways,
         &request.id,
         |segment| runtime.generate(segment),
@@ -889,7 +889,7 @@ pub(crate) async fn generate_long_form_stream(
         return runtime.generate_streaming(segments.remove(0), output).await;
     }
     let runtime = runtime.clone();
-    let lookahead = long_form_segment_concurrency(&runtime);
+    let lookahead = long_form_segment_concurrency(&runtime, variant, &request).await;
     stream_segments(
         segments,
         &request.id,
@@ -1032,9 +1032,18 @@ where
 
 /// Long-form segments in flight at once: the rows the engine batches TTS at
 /// (`RuntimeService::tts_row_width`), so segments synthesize side by side
-/// instead of one after another (SPK-F12). More would only queue.
-fn long_form_segment_concurrency(runtime: &RuntimeService) -> usize {
-    runtime.tts_row_width()
+/// instead of one after another (SPK-F12). More would only queue. While the
+/// model has live demand a request below the Realtime class runs fewer, so
+/// one long request leaves rows for live callers
+/// (`RuntimeService::tts_long_form_concurrency`).
+async fn long_form_segment_concurrency(
+    runtime: &RuntimeService,
+    variant: ModelVariant,
+    request: &GenerationRequest,
+) -> usize {
+    runtime
+        .tts_long_form_concurrency(variant, request.runtime_context.workload_class)
+        .await
 }
 
 /// Generate the segments with up to `concurrency` in flight, returning each

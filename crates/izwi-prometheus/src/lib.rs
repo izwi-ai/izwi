@@ -305,6 +305,70 @@ impl CounterFamily {
     }
 }
 
+/// A monotonic counter of a continuous quantity such as seconds, with zero
+/// or more labels. Negative and non-finite amounts are dropped, so the total
+/// never decreases.
+#[derive(Debug)]
+pub struct FloatCounterFamily {
+    name: &'static str,
+    help: &'static str,
+    labels: &'static [&'static str],
+    max_series: usize,
+    series: Mutex<BTreeMap<Vec<String>, f64>>,
+}
+
+impl FloatCounterFamily {
+    pub const fn new(
+        name: &'static str,
+        help: &'static str,
+        labels: &'static [&'static str],
+    ) -> Self {
+        Self {
+            name,
+            help,
+            labels,
+            max_series: DEFAULT_MAX_SERIES,
+            series: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn add(&self, values: &[&str], amount: f64) {
+        debug_assert_eq!(values.len(), self.labels.len(), "{}", self.name);
+        if !amount.is_finite() || amount < 0.0 {
+            return;
+        }
+        let mut series = self
+            .series
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let key = series_key(&series, values, self.max_series);
+        *series.entry(key).or_insert(0.0) += amount;
+    }
+
+    pub fn render(&self, out: &mut String) {
+        let series = self
+            .series
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let _ = writeln!(out, "# HELP {} {}", self.name, self.help);
+        let _ = writeln!(out, "# TYPE {} counter", self.name);
+        if series.is_empty() && self.labels.is_empty() {
+            let _ = writeln!(out, "{} 0", self.name);
+        }
+        for (values, total) in series {
+            let labels = render_labels(self.labels, &values);
+            let _ = writeln!(
+                out,
+                "{}{} {}",
+                self.name,
+                braced(&labels),
+                format_float(total)
+            );
+        }
+    }
+}
+
 fn series_key<V>(series: &BTreeMap<Vec<String>, V>, values: &[&str], max: usize) -> Vec<String> {
     let key = values
         .iter()
@@ -591,6 +655,19 @@ mod tests {
         assert!(text.contains("# TYPE izwi_tokens_total counter"));
         assert!(text.contains("izwi_tokens_total{model=\"m\"} 7"));
         assert_eq!(family.get(&["m"]), 7);
+        parse_exposition(&text).unwrap();
+    }
+
+    #[test]
+    fn float_counters_sum_fractions_and_never_decrease() {
+        let family = FloatCounterFamily::new("izwi_audio_seconds_total", "Audio.", &["model"]);
+        for amount in [1.25, 2.5, -4.0, f64::NAN, f64::INFINITY] {
+            family.add(&["m"], amount);
+        }
+        let mut text = String::new();
+        family.render(&mut text);
+        assert!(text.contains("# TYPE izwi_audio_seconds_total counter"));
+        assert!(text.contains("izwi_audio_seconds_total{model=\"m\"} 3.75"));
         parse_exposition(&text).unwrap();
     }
 

@@ -156,6 +156,15 @@ pub(crate) struct PreparationArtifact<T> {
     pub(crate) retained: JobResourceObservation,
 }
 
+/// What one device job of a preparation batch produced.
+pub(crate) enum PreparationStep<T> {
+    /// The operation stopped at a boundary of its own so that other work
+    /// can take the device; it continues in a later device job.
+    Yielded,
+    /// The batch's artifacts, one per live row.
+    Complete(Vec<Result<PreparationArtifact<T>>>),
+}
+
 #[derive(Debug)]
 pub(crate) enum PreparationRowOutcome<T> {
     Committed {
@@ -204,6 +213,13 @@ impl JobResourceObservation {
 pub struct CoordinatorSnapshot {
     pub capacity: usize,
     pub active_jobs: usize,
+    /// Jobs the general queue admits at once, and how many it holds.
+    pub queue_capacity: usize,
+    pub queued_jobs: usize,
+    /// The same for the real-time queue, which Realtime-class jobs and
+    /// real-time sessions draw from.
+    pub realtime_queue_capacity: usize,
+    pub realtime_queued_jobs: usize,
     pub active_preparation_bridges: usize,
     pub active_model_loads: usize,
     pub active_executions: usize,
@@ -753,7 +769,15 @@ pub struct InferenceCoordinator {
     execution_group_id: ExecutionGroupId,
     capacity: usize,
     backend: BackendKind,
+    /// Queue permits of every class but Realtime.
     jobs: Arc<Semaphore>,
+    queue_capacity: usize,
+    /// Queue permits of Realtime-class jobs, which include each real-time
+    /// session's lease for its whole life. Kept apart so a full general
+    /// queue cannot refuse a call, and an open session takes nothing from
+    /// the general queue.
+    realtime_jobs: Arc<Semaphore>,
+    realtime_queue_capacity: usize,
     host_work: Arc<Semaphore>,
     /// One stage at a time of a model whose weights and compute live in host
     /// memory while this coordinator owns an accelerator. Separate from
@@ -835,11 +859,15 @@ impl InferenceCoordinator {
         let execution_group_id =
             ExecutionGroupId::new(NEXT_EXECUTION_GROUP_ID.fetch_add(1, Ordering::Relaxed));
         let idle = Arc::new(Notify::new());
+        let queue_capacity = max_queued_jobs.max(capacity).max(1);
         Self {
             execution_group_id,
             capacity,
             backend,
-            jobs: Arc::new(Semaphore::new(max_queued_jobs.max(capacity).max(1))),
+            jobs: Arc::new(Semaphore::new(queue_capacity)),
+            queue_capacity,
+            realtime_jobs: Arc::new(Semaphore::new(queue_capacity)),
+            realtime_queue_capacity: queue_capacity,
             host_work: Arc::new(Semaphore::new(host_preparation_capacity(capacity))),
             host_models: Arc::new(Semaphore::new(1)),
             host_model_stages_total: AtomicU64::new(0),
@@ -861,6 +889,43 @@ impl InferenceCoordinator {
             draining: AtomicBool::new(false),
             failed_stage_fence: None,
         }
+    }
+
+    /// Size the real-time queue for `sessions` concurrent real-time
+    /// sessions. It is never smaller than the general queue, so real-time
+    /// work keeps at least the queue depth it had when the classes shared
+    /// one queue.
+    pub(crate) fn with_realtime_session_capacity(mut self, sessions: usize) -> Self {
+        self.realtime_queue_capacity = sessions
+            .max(self.queue_capacity)
+            .min(Semaphore::MAX_PERMITS);
+        self.realtime_jobs = Arc::new(Semaphore::new(self.realtime_queue_capacity));
+        self
+    }
+
+    /// The queue a job of `workload_class` takes its permit from.
+    fn job_queue(&self, workload_class: WorkloadClass) -> &Arc<Semaphore> {
+        if workload_class == WorkloadClass::Realtime {
+            &self.realtime_jobs
+        } else {
+            &self.jobs
+        }
+    }
+
+    /// Take a queue permit for a job of `workload_class`, or refuse it
+    /// because its queue is full.
+    fn try_queue_permit(&self, workload_class: WorkloadClass) -> Result<OwnedSemaphorePermit> {
+        self.job_queue(workload_class)
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                self.rejected_total.fetch_add(1, Ordering::Relaxed);
+                Error::Overloaded(if workload_class == WorkloadClass::Realtime {
+                    "real-time inference queue is full".to_string()
+                } else {
+                    "global inference queue is full".to_string()
+                })
+            })
     }
 
     #[cfg(test)]
@@ -923,6 +988,14 @@ impl InferenceCoordinator {
         CoordinatorSnapshot {
             capacity: self.capacity,
             active_jobs: self.active_jobs.load(Ordering::Relaxed),
+            queue_capacity: self.queue_capacity,
+            queued_jobs: self
+                .queue_capacity
+                .saturating_sub(self.jobs.available_permits()),
+            realtime_queue_capacity: self.realtime_queue_capacity,
+            realtime_queued_jobs: self
+                .realtime_queue_capacity
+                .saturating_sub(self.realtime_jobs.available_permits()),
             active_preparation_bridges: self.active_preparation_bridges.load(Ordering::Relaxed),
             active_model_loads: self.active_model_loads.load(Ordering::Relaxed),
             active_executions: self.execution.active(),
@@ -1143,14 +1216,9 @@ impl InferenceCoordinator {
             self.expired_total.fetch_add(1, Ordering::Relaxed);
             fail!(Error::Timeout(execution.request_id));
         }
-        let permit = match self.jobs.clone().try_acquire_owned() {
+        let permit = match self.try_queue_permit(execution.workload_class) {
             Ok(permit) => permit,
-            Err(_) => {
-                self.rejected_total.fetch_add(1, Ordering::Relaxed);
-                fail!(Error::Overloaded(
-                    "global inference queue is full".to_string()
-                ));
-            }
+            Err(error) => fail!(error),
         };
         let resources = match effective_resources(execution.resources, self.backend) {
             Ok(resources) => resources,
@@ -1243,10 +1311,7 @@ impl InferenceCoordinator {
             self.expired_total.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Timeout(spec.request_id));
         }
-        let permit = self.jobs.clone().try_acquire_owned().map_err(|_| {
-            self.rejected_total.fetch_add(1, Ordering::Relaxed);
-            Error::Overloaded("global inference queue is full".to_string())
-        })?;
+        let permit = self.try_queue_permit(spec.workload_class)?;
         let effective_resources = effective_resources(spec.resources, self.backend)?;
         let owner = ReservationOwner::new(ReservationClass::Request, spec.request_id.clone());
         let reservation = observation
@@ -1718,6 +1783,36 @@ impl InferenceCoordinator {
         T: Send + 'static,
         F: FnOnce(&[usize]) -> Result<Vec<Result<PreparationArtifact<T>>>> + Send + 'static,
     {
+        let mut operation = Some(operation);
+        self.run_loaded_native_preparation_batch_in_parts(rows, contract, work, move |live| {
+            let operation = operation.take().ok_or_else(|| {
+                Error::InferenceError("native preparation ran after it completed".to_string())
+            })?;
+            operation(live).map(PreparationStep::Complete)
+        })
+        .await
+    }
+
+    /// [`Self::run_loaded_native_preparation_batch`] for an operation that
+    /// may stop between its own units of work: each `Yielded` ends the
+    /// device job and releases the physical dispatch, so waiting work of
+    /// the same or another model runs before the operation is called again
+    /// in a new job. The rows' leases are held from the first job to the
+    /// last; each job reserves the batch workspace for itself, under its
+    /// dispatch, so a yielded batch holds none while other work runs. An
+    /// operation that never yields runs as the single job of
+    /// `run_loaded_native_preparation_batch`.
+    pub(crate) async fn run_loaded_native_preparation_batch_in_parts<T, F>(
+        self: &Arc<Self>,
+        rows: Vec<PreparationBatchRow>,
+        contract: LoadedExecutionContract,
+        work: WorkUnit,
+        operation: F,
+    ) -> Result<Vec<PreparationRowOutcome<T>>>
+    where
+        T: Send + 'static,
+        F: FnMut(&[usize]) -> Result<PreparationStep<T>> + Send + 'static,
+    {
         if rows.is_empty() {
             return Err(Error::InvalidInput(
                 "native preparation batch has no admitted rows".to_string(),
@@ -1887,101 +1982,116 @@ impl InferenceCoordinator {
                 .max()
                 .unwrap_or(1),
         };
-        let execution = self
-            .acquire_physical_dispatch(
-                binding.execution_group_id,
-                binding.model_instance_id,
-                stage.physical_launch_policy,
-                stage.batch_mode,
-                live.len(),
-                deadline,
-                tag.weight,
-            )
-            .await?;
-        let batch_id = BatchId::new(NEXT_DIRECT_BATCH_ID.fetch_add(1, Ordering::Relaxed));
-        let workspace =
-            self.reserve_batch_workspace(binding.execution_group_id, batch_id, workspace)?;
         let first = rows[live[0]].job.clone();
-        let physical = self
-            .run_blocking_task_with_deadline(
-                &first,
-                deadline,
-                (execution, workspace),
-                "inference",
-                Some(tag),
-                move || {
-                    let _contract = contract;
-                    let _work = work;
-                    let physical = match operation(&live) {
-                        Ok(outputs) if outputs.len() == live.len() => outputs,
-                        Ok(_) => {
-                            return Err(Error::InferenceError(
-                                "native preparation output width does not match live row width"
-                                    .to_string(),
-                            ));
-                        }
-                        Err(error) => {
-                            // Every live row fails with the operation's own
-                            // error kind: an input error stays a 400 rather
-                            // than becoming an internal error.
-                            for index in &live {
-                                outcomes[*index] =
-                                    Some(PreparationPhysicalOutcome::Failed(error.replicate()));
+        // What a device job hands back when its operation yielded: all the
+        // next job needs.
+        let mut parts = (operation, live, outcomes, rows, contract, work);
+        let physical = loop {
+            let execution = self
+                .acquire_physical_dispatch(
+                    binding.execution_group_id,
+                    binding.model_instance_id,
+                    stage.physical_launch_policy,
+                    stage.batch_mode,
+                    parts.1.len(),
+                    deadline,
+                    tag.weight,
+                )
+                .await?;
+            let batch_id = BatchId::new(NEXT_DIRECT_BATCH_ID.fetch_add(1, Ordering::Relaxed));
+            let workspace_lease =
+                self.reserve_batch_workspace(binding.execution_group_id, batch_id, workspace)?;
+            let job = self
+                .run_blocking_task_with_deadline(
+                    &first,
+                    deadline,
+                    (execution, workspace_lease),
+                    "inference",
+                    Some(tag),
+                    move || {
+                        let (mut operation, live, mut outcomes, rows, contract, work) = parts;
+                        let physical = match operation(&live) {
+                            Ok(PreparationStep::Yielded) => {
+                                return Ok(Err((operation, live, outcomes, rows, contract, work)));
                             }
-                            return Ok(outcomes
-                                .into_iter()
-                                .map(Option::unwrap)
-                                .collect::<Vec<_>>());
-                        }
-                    };
-                    let mut rows: Vec<Option<PreparationBatchRow>> =
-                        rows.into_iter().map(Some).collect();
-                    for (index, output) in live.into_iter().zip(physical) {
-                        let row = rows[index]
-                            .take()
-                            .expect("live preparation row is consumed exactly once");
-                        let outcome = match output {
-                            Err(error) => PreparationPhysicalOutcome::Failed(error),
-                            Ok(_artifact)
-                                if row
-                                    .job
-                                    .spec
-                                    .deadline
-                                    .is_some_and(|deadline| deadline <= Instant::now()) =>
+                            Ok(PreparationStep::Complete(outputs))
+                                if outputs.len() == live.len() =>
                             {
-                                PreparationPhysicalOutcome::TimedOut
+                                outputs
                             }
-                            Ok(artifact) => {
-                                if !row.cancellation.begin_commit() {
-                                    PreparationPhysicalOutcome::Cancelled
-                                } else {
-                                    let committed = row
-                                        .job
-                                        .record_materialized_usage(artifact.retained)
-                                        .map_err(|error| match error {
-                                            Error::InferenceError(message) => {
-                                                Error::InferenceError(format!(
-                                                    "{message}, stage=preparation_commit"
-                                                ))
-                                            }
-                                            error => error,
-                                        })
-                                        .map(|()| PreparationPhysicalOutcome::Committed {
-                                            artifact,
-                                            job: row.job,
-                                        })
-                                        .unwrap_or_else(PreparationPhysicalOutcome::Failed);
-                                    row.cancellation.finish_commit();
-                                    committed
+                            Ok(PreparationStep::Complete(_)) => {
+                                return Err(Error::InferenceError(
+                                    "native preparation output width does not match live row width"
+                                        .to_string(),
+                                ));
+                            }
+                            Err(error) => {
+                                // Every live row fails with the operation's own
+                                // error kind: an input error stays a 400 rather
+                                // than becoming an internal error.
+                                for index in &live {
+                                    outcomes[*index] =
+                                        Some(PreparationPhysicalOutcome::Failed(error.replicate()));
                                 }
+                                return Ok(Ok(outcomes
+                                    .into_iter()
+                                    .map(Option::unwrap)
+                                    .collect::<Vec<_>>()));
                             }
                         };
-                        outcomes[index] = Some(outcome);
-                    }
-                    Ok(outcomes.into_iter().map(Option::unwrap).collect())
-                },
-            )
-            .await?;
+                        let mut rows: Vec<Option<PreparationBatchRow>> =
+                            rows.into_iter().map(Some).collect();
+                        for (index, output) in live.into_iter().zip(physical) {
+                            let row = rows[index]
+                                .take()
+                                .expect("live preparation row is consumed exactly once");
+                            let outcome = match output {
+                                Err(error) => PreparationPhysicalOutcome::Failed(error),
+                                Ok(_artifact)
+                                    if row
+                                        .job
+                                        .spec
+                                        .deadline
+                                        .is_some_and(|deadline| deadline <= Instant::now()) =>
+                                {
+                                    PreparationPhysicalOutcome::TimedOut
+                                }
+                                Ok(artifact) => {
+                                    if !row.cancellation.begin_commit() {
+                                        PreparationPhysicalOutcome::Cancelled
+                                    } else {
+                                        let committed = row
+                                            .job
+                                            .record_materialized_usage(artifact.retained)
+                                            .map_err(|error| match error {
+                                                Error::InferenceError(message) => {
+                                                    Error::InferenceError(format!(
+                                                        "{message}, stage=preparation_commit"
+                                                    ))
+                                                }
+                                                error => error,
+                                            })
+                                            .map(|()| PreparationPhysicalOutcome::Committed {
+                                                artifact,
+                                                job: row.job,
+                                            })
+                                            .unwrap_or_else(PreparationPhysicalOutcome::Failed);
+                                        row.cancellation.finish_commit();
+                                        committed
+                                    }
+                                }
+                            };
+                            outcomes[index] = Some(outcome);
+                        }
+                        Ok(Ok(outcomes.into_iter().map(Option::unwrap).collect()))
+                    },
+                )
+                .await?;
+            match job {
+                Ok(physical) => break physical,
+                Err(yielded) => parts = yielded,
+            }
+        };
         // The blocking helper and its retained task clone are gone after the
         // await; drop our deadline-anchor clone before requiring unique row
         // ownership for the admission bridge.
@@ -4782,6 +4892,107 @@ mod tests {
         assert_eq!(parallel.snapshot().active_jobs, 0);
     }
 
+    fn realtime_job(id: &str) -> JobSpec {
+        JobSpec {
+            lane: CoordinatorLane::Realtime,
+            workload_class: WorkloadClass::Realtime,
+            ..job(id)
+        }
+    }
+
+    /// P2.4: a full general queue refuses more general work but still
+    /// admits a real-time job, which draws from its own queue.
+    #[tokio::test]
+    async fn a_full_general_queue_still_admits_real_time_jobs() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 2));
+        let general = [
+            coordinator.admit(job("batch-0")).await.unwrap(),
+            coordinator.admit(job("batch-1")).await.unwrap(),
+        ];
+        assert!(matches!(
+            coordinator.admit(job("batch-2")).await,
+            Err(Error::Overloaded(message)) if message == "global inference queue is full"
+        ));
+        let call = coordinator.admit(realtime_job("call")).await.unwrap();
+        let snapshot = coordinator.snapshot();
+        assert_eq!((snapshot.queue_capacity, snapshot.queued_jobs), (2, 2));
+        assert_eq!(snapshot.realtime_queued_jobs, 1);
+        assert_eq!(snapshot.active_jobs, 3);
+        drop((general, call));
+        let snapshot = coordinator.snapshot();
+        assert_eq!(
+            (snapshot.queued_jobs, snapshot.realtime_queued_jobs),
+            (0, 0)
+        );
+    }
+
+    /// P2.4: the real-time queue is bounded by the session cap, and filling
+    /// it takes nothing from the general queue.
+    #[tokio::test]
+    async fn a_full_real_time_queue_refuses_only_real_time_jobs() {
+        let coordinator = Arc::new(
+            InferenceCoordinator::new(BackendKind::Cpu, 1, 2).with_realtime_session_capacity(3),
+        );
+        assert_eq!(coordinator.snapshot().realtime_queue_capacity, 3);
+        let calls = [
+            coordinator.admit(realtime_job("call-0")).await.unwrap(),
+            coordinator.admit(realtime_job("call-1")).await.unwrap(),
+            coordinator.admit(realtime_job("call-2")).await.unwrap(),
+        ];
+        assert!(matches!(
+            coordinator.admit(realtime_job("call-3")).await,
+            Err(Error::Overloaded(message)) if message == "real-time inference queue is full"
+        ));
+        assert_eq!(coordinator.snapshot().rejected_total, 1);
+        let general = [
+            coordinator.admit(job("batch-0")).await.unwrap(),
+            coordinator.admit(job("batch-1")).await.unwrap(),
+        ];
+        assert_eq!(coordinator.snapshot().queued_jobs, 2);
+        drop((calls, general));
+        assert_eq!(coordinator.snapshot().active_jobs, 0);
+
+        // The real-time queue is never smaller than the general one.
+        let small = InferenceCoordinator::new(BackendKind::Cpu, 1, 8)
+            .with_realtime_session_capacity(4)
+            .snapshot();
+        assert_eq!(small.realtime_queue_capacity, 8);
+    }
+
+    /// P2.4: a real-time session's lease, held for the session's life,
+    /// leaves the general queue its whole capacity; the preparation handoff
+    /// of a real-time job stays in the real-time queue too.
+    #[tokio::test]
+    async fn a_real_time_session_holds_no_general_queue_permit() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 1));
+        let session = coordinator.admit(realtime_job("session")).await.unwrap();
+        // Operations of the session share its one lease.
+        let operation = session.clone();
+        assert_eq!(coordinator.snapshot().realtime_queued_jobs, 1);
+        let general = coordinator.admit(job("batch")).await.unwrap();
+        assert_eq!(coordinator.snapshot().queued_jobs, 1);
+        drop((session, operation));
+        assert_eq!(coordinator.snapshot().realtime_queued_jobs, 0);
+
+        let preparation = coordinator.admit(realtime_job("turn")).await.unwrap();
+        let bridge = coordinator
+            .bridge_preparation_admission(preparation)
+            .expect("unique preparation bridge");
+        assert_eq!(coordinator.snapshot().realtime_queued_jobs, 0);
+        // The general queue is full, and the real-time turn is still admitted.
+        let turn = coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                realtime_job("turn"),
+                JobResourceObservation::host(1),
+            )
+            .await
+            .expect("real-time execution admission");
+        assert_eq!(coordinator.snapshot().realtime_queued_jobs, 1);
+        drop((turn, general));
+        assert_eq!(coordinator.snapshot().active_jobs, 0);
+    }
+
     #[tokio::test]
     async fn rejected_admission_never_starts_expensive_preparation() {
         let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 1));
@@ -5529,6 +5740,74 @@ mod tests {
             coordinator.snapshot().reserved_memory_bytes,
             2 * 64 * 1024 * 1024
         );
+        drop(output);
+        assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+    }
+
+    /// A preparation that yields runs one device job per call, giving the
+    /// physical dispatch and its workspace up between them, and keeps its
+    /// rows' admissions until the call that completes it.
+    #[tokio::test]
+    async fn native_preparation_in_parts_runs_one_dispatch_per_part() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 4, 4));
+        let job = coordinator.admit(job("native-prep-parts")).await.unwrap();
+        let contract = native_preparation_contract(&coordinator, 2, 64);
+        let row = sealed_preparation_row(
+            &coordinator,
+            &contract,
+            job,
+            WorkCost::new(1, 4, 16),
+            4,
+            PreparationCancellation::default(),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task_calls = calls.clone();
+        let task_coordinator = coordinator.clone();
+        let reserved = Arc::new(Mutex::new(Vec::new()));
+        let task_reserved = reserved.clone();
+
+        let output = coordinator
+            .run_loaded_native_preparation_batch_in_parts(
+                vec![row],
+                contract,
+                WorkUnit::PreSequencePreparation {
+                    kind: "asr.encoder.audio".to_string(),
+                },
+                move |live| {
+                    assert_eq!(live, &[0]);
+                    let snapshot = task_coordinator.snapshot();
+                    assert_eq!(snapshot.active_executions, 1);
+                    task_reserved
+                        .lock()
+                        .unwrap()
+                        .push(snapshot.reserved_memory_bytes);
+                    if task_calls.fetch_add(1, Ordering::Relaxed) < 2 {
+                        return Ok(PreparationStep::Yielded);
+                    }
+                    Ok(PreparationStep::Complete(vec![Ok(PreparationArtifact {
+                        value: 7usize,
+                        retained: JobResourceObservation::host(1),
+                    })]))
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        // Every part ran under the same reservation: the row and its own
+        // job's batch workspace.
+        let reserved = reserved.lock().unwrap().clone();
+        assert_eq!(reserved.len(), 3);
+        assert!(reserved.iter().all(|bytes| *bytes == reserved[0]));
+        assert!(matches!(
+            &output[0],
+            PreparationRowOutcome::Committed {
+                artifact: PreparationArtifact { value: 7, .. },
+                ..
+            }
+        ));
+        assert_eq!(coordinator.snapshot().active_executions, 0);
+        assert_eq!(coordinator.snapshot().active_preparation_bridges, 1);
         drop(output);
         assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
     }

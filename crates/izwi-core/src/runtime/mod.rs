@@ -49,12 +49,13 @@ pub(crate) use asr::{
 
 pub(crate) use adapters::capability_rows;
 pub use adapters::CapabilityKind;
+pub use asr::{
+    asr_streams_live, validate_asr_language, validate_asr_task, RuntimeAsrRealtimeEvent,
+    RuntimeAsrRealtimeStream,
+};
 pub(crate) use asr::{
     granite_asr_planned_max_tokens, granite_auto_asr_max_tokens_for_duration,
     granite_speech5_asr_planned_max_tokens, invocation_decode_room,
-};
-pub use asr::{
-    validate_asr_language, validate_asr_task, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream,
 };
 pub use chat::AdmittedChatStream;
 pub use chat_request::{
@@ -103,12 +104,13 @@ pub use types::{
 pub use voice_metrics::{
     prometheus_voice_metric_name, prometheus_voice_metric_type, voice_metric_catalog,
     voice_metric_prometheus_contract, VoiceLatency, VoiceMetricDescriptor, VOICE_ASR_FINAL_SECONDS,
-    VOICE_ASR_FIRST_PARTIAL_SECONDS, VOICE_AUDIO_EGRESS_UNDERRUNS_TOTAL,
-    VOICE_AUDIO_INGRESS_DROPPED_FRAMES_TOTAL, VOICE_BARGE_IN_LATENCY_SECONDS, VOICE_BARGE_IN_TOTAL,
-    VOICE_ENDPOINTING_LATENCY_SECONDS, VOICE_LLM_FIRST_TOKEN_SECONDS, VOICE_METRIC_CATALOG,
-    VOICE_SESSION_CLOSED_TOTAL, VOICE_SESSION_DURATION_SECONDS, VOICE_SESSION_INTERRUPTED_TOTAL,
-    VOICE_SESSION_STARTED_TOTAL, VOICE_SPEECH_REJECTED_TOTAL, VOICE_STREAM_BACKPRESSURE_TOTAL,
-    VOICE_TTS_FIRST_AUDIO_SECONDS, VOICE_TURN_FIRST_AUDIO_SECONDS,
+    VOICE_ASR_FIRST_PARTIAL_SECONDS, VOICE_ASR_LIVE_FIRST_PARTIAL_SECONDS,
+    VOICE_AUDIO_EGRESS_UNDERRUNS_TOTAL, VOICE_AUDIO_INGRESS_DROPPED_FRAMES_TOTAL,
+    VOICE_BARGE_IN_LATENCY_SECONDS, VOICE_BARGE_IN_TOTAL, VOICE_ENDPOINTING_LATENCY_SECONDS,
+    VOICE_LLM_FIRST_TOKEN_SECONDS, VOICE_METRIC_CATALOG, VOICE_SESSION_CLOSED_TOTAL,
+    VOICE_SESSION_DURATION_SECONDS, VOICE_SESSION_INTERRUPTED_TOTAL, VOICE_SESSION_STARTED_TOTAL,
+    VOICE_SPEECH_REJECTED_TOTAL, VOICE_STREAM_BACKPRESSURE_TOTAL, VOICE_TTS_FIRST_AUDIO_SECONDS,
+    VOICE_TURN_FIRST_AUDIO_SECONDS,
 };
 pub use voice_session::{VoiceSession, VoiceSessionPhase};
 

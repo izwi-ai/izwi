@@ -15,7 +15,7 @@
 use axum::{
     body::Body,
     extract::{Extension, Path, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::Response,
     Json,
 };
@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::info;
 
+use crate::api::openai::service_tier::{ServiceTier, SERVICE_TIER_HEADER};
 use crate::api::request_context::RequestContext;
 use crate::api::saved_voices::resolve_saved_voice_reference;
 use crate::api::tts_policy::resolve_tts_output_frames;
@@ -33,14 +34,14 @@ use crate::error::{core_api_error, ApiError, ApiJson};
 use crate::speech_outcomes::{
     new_speech_id, SpeechCompletion, SpeechMode, SpeechOutcome, SpeechOutcomeGuard, SpeechUsage,
 };
-use crate::state::AppState;
+use crate::state::{AppState, OwnedAdmissionPermit};
 use izwi_audio_codec::{AudioFormat, CodecError, EncoderOptions, Framing, StreamEncoder};
 use izwi_core::{
     parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
     TtsStopReason, WorkloadClass,
 };
 
-const SPEECH_RESPONSE_EXPOSED_HEADERS: &str = "X-Generation-Time-Ms, X-Audio-Duration-Secs, X-RTF, X-RTF-Basis, X-Wall-Time-Ms, X-Wall-RTF, X-Tokens-Generated, X-Audio-Sample-Rate, X-Audio-Channels, X-Stop-Reason, X-Output-Truncated, X-Izwi-Tts-Diagnostics, X-Requested-Response-Format, X-Actual-Response-Format, X-Response-Format-Fallback, X-Izwi-Speech-Id, X-SGLang-Omni-Speech-Id, X-Izwi-Streaming-Mode";
+const SPEECH_RESPONSE_EXPOSED_HEADERS: &str = "X-Generation-Time-Ms, X-Audio-Duration-Secs, X-RTF, X-RTF-Basis, X-Wall-Time-Ms, X-Wall-RTF, X-Tokens-Generated, X-Audio-Sample-Rate, X-Audio-Channels, X-Stop-Reason, X-Output-Truncated, X-Izwi-Tts-Diagnostics, X-Requested-Response-Format, X-Actual-Response-Format, X-Response-Format-Fallback, X-Izwi-Speech-Id, X-SGLang-Omni-Speech-Id, X-Izwi-Streaming-Mode, X-Izwi-Service-Tier";
 
 /// OpenAI's `instructions` and `input` cap, in characters.
 const OPENAI_TEXT_CAP_CHARS: usize = 4096;
@@ -158,6 +159,10 @@ pub struct SpeechRequest {
     /// `<|speaker:N|> text` lines; replaces `input`.
     #[serde(default)]
     pub script: Option<Vec<crate::api::speech_dialogue::SpeechScriptLine>>,
+    /// izwi extension of OpenAI's field: `flex` runs the request as batch
+    /// work; `auto`, `default` and `priority` keep the delivery's class.
+    #[serde(default)]
+    pub service_tier: Option<String>,
     /// izwi extensions: speech sampling (`top_p`, `seed`, `subtalker_*`,
     /// `cfg_scale`, `diffusion_steps`, `repetition_penalty`).
     #[serde(flatten)]
@@ -197,6 +202,9 @@ struct SpeechStreamEvent {
     /// the output budget cut it.
     #[serde(skip_serializing_if = "Option::is_none")]
     stop_reason: Option<&'static str>,
+    /// On `audio.done`: the tier that served a request that named one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<&'static str>,
 }
 
 impl SpeechStreamEvent {
@@ -217,6 +225,7 @@ impl SpeechStreamEvent {
             rtf: None,
             error: None,
             stop_reason: None,
+            service_tier: None,
         }
     }
 }
@@ -413,9 +422,22 @@ impl SpeechDelivery {
 pub async fn speech(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
+    headers: HeaderMap,
     ApiJson(req): ApiJson<SpeechRequest>,
 ) -> Result<Response<Body>, ApiError> {
-    let prepared = prepare_speech(&state, ctx.tenant_key(), ctx.correlation_id, req, None).await?;
+    let service_tier = ServiceTier::parse(
+        req.service_tier.as_deref(),
+        headers.get(SERVICE_TIER_HEADER),
+    )?;
+    let prepared = prepare_speech(
+        &state,
+        ctx.tenant_key(),
+        ctx.correlation_id,
+        req,
+        None,
+        service_tier,
+    )
+    .await?;
     run_prepared_speech(state, prepared).await
 }
 
@@ -449,13 +471,15 @@ pub(crate) struct ValidatedSpeech {
 }
 
 /// Validates `req` (everything that needs no model work) and records it in
-/// the outcome store; `mode` overrides the delivery's (batch items).
+/// the outcome store; `mode` overrides the delivery's (batch items). The
+/// request runs at `service_tier`, whatever its own `service_tier` says.
 pub(crate) async fn prepare_speech(
     state: &AppState,
     tenant_key: Option<[u8; 32]>,
     correlation_id: String,
     req: SpeechRequest,
     mode: Option<SpeechMode>,
+    service_tier: ServiceTier,
 ) -> Result<PreparedSpeech, ApiError> {
     let ValidatedSpeech {
         req,
@@ -480,6 +504,7 @@ pub(crate) async fn prepare_speech(
             correlation_id,
             tenant_key,
             speech_id,
+            service_tier,
         },
         delivery,
         guard,
@@ -544,7 +569,8 @@ pub(crate) async fn validate_speech(
     })
 }
 
-/// Runs a prepared request in its delivery mode.
+/// Runs a prepared request in its delivery mode, and names the tier that
+/// served it in the response.
 pub(crate) async fn run_prepared_speech(
     state: AppState,
     prepared: PreparedSpeech,
@@ -555,14 +581,17 @@ pub(crate) async fn run_prepared_speech(
         guard,
     } = prepared;
     let variant = request.variant;
-    match delivery {
+    let service_tier = request.service_tier;
+    let mut response = match delivery {
         SpeechDelivery::Sse => stream_speech_sse(state, request, guard).await,
         SpeechDelivery::AudioStream => stream_speech_audio(state, request, guard).await,
         SpeechDelivery::Buffered if variant.plans_own_speech_segments() => {
             fish_file_speech(state, request, guard).await
         }
         SpeechDelivery::Buffered => buffered_speech(state, request, guard).await,
-    }
+    }?;
+    service_tier.stamp(&mut response);
+    Ok(response)
 }
 
 /// One admitted speech request.
@@ -573,6 +602,7 @@ struct SpeechJob {
     correlation_id: String,
     tenant_key: Option<[u8; 32]>,
     speech_id: String,
+    service_tier: ServiceTier,
 }
 
 /// Records `error` as the request's outcome, and returns it.
@@ -602,10 +632,12 @@ async fn buffered_speech(
         correlation_id,
         tenant_key,
         speech_id,
+        service_tier,
     } = job;
     let permit = state
-        .acquire_workload_permit(WorkloadClass::Interactive)
-        .await;
+        .admit_request(service_tier.workload_class(WorkloadClass::Interactive))
+        .await
+        .map_err(|err| failed(&state, &speech_id, err))?;
     let request_started = std::time::Instant::now();
     state
         .runtime
@@ -758,6 +790,7 @@ async fn fish_file_speech(
         correlation_id,
         tenant_key,
         speech_id,
+        service_tier,
     } = job;
     let mut request = build_generation_request(&req, correlation_id, true, variant);
     request.runtime_context.tenant_key = tenant_key;
@@ -768,6 +801,15 @@ async fn fish_file_speech(
         request.config.options.max_tokens,
     )
     .map_err(|err| failed(&state, &speech_id, core_api_error(err)))?;
+    let workload = service_tier.workload_class(WorkloadClass::Interactive);
+    // The request is admitted here, as a stream is; each segment then
+    // takes its own permit.
+    drop(
+        state
+            .admit_request(workload)
+            .await
+            .map_err(|err| failed(&state, &speech_id, err))?,
+    );
     state
         .runtime
         .load_model(variant)
@@ -906,11 +948,7 @@ async fn fish_file_speech(
     };
     let generation = async {
         crate::api::tts_long_form::generate_speech_plan_stream(
-            &state,
-            variant,
-            request,
-            sender,
-            WorkloadClass::Interactive,
+            &state, variant, request, sender, workload,
         )
         .await
         .map_err(core_api_error)
@@ -1263,6 +1301,8 @@ struct SpeechPump {
     gen_request: GenerationRequest,
     planned_segment_count: usize,
     tenant_key: Option<[u8; 32]>,
+    /// The class the stream is admitted and generated as.
+    workload: WorkloadClass,
     started: Instant,
 }
 
@@ -1303,17 +1343,24 @@ impl SpeechPump {
             gen_request,
             planned_segment_count,
             tenant_key: job.tenant_key,
+            workload: job.service_tier.workload_class(WorkloadClass::Streaming),
             started,
         })
     }
 
-    /// Runs admission, model load and generation, encoding the audio and
-    /// handing it to `tx` until the stream ends or the reader goes away.
-    fn spawn(self, tx: mpsc::Sender<PumpEvent>) {
-        tokio::spawn(self.run(tx));
+    /// Admits the stream before its response starts, so a stream the
+    /// server has no room for is a plain `429`.
+    async fn admit(&self) -> Result<OwnedAdmissionPermit, ApiError> {
+        self.state.admit_request_owned(self.workload).await
     }
 
-    async fn run(self, tx: mpsc::Sender<PumpEvent>) {
+    /// Runs model load and generation under `permit`, encoding the audio
+    /// and handing it to `tx` until the stream ends or the reader goes away.
+    fn spawn(self, permit: OwnedAdmissionPermit, tx: mpsc::Sender<PumpEvent>) {
+        tokio::spawn(self.run(permit, tx));
+    }
+
+    async fn run(self, permit: OwnedAdmissionPermit, tx: mpsc::Sender<PumpEvent>) {
         let SpeechPump {
             state,
             variant,
@@ -1321,28 +1368,12 @@ impl SpeechPump {
             mut gen_request,
             planned_segment_count,
             tenant_key,
+            workload,
             started,
         } = self;
         let stream_request_id = gen_request.id.clone();
         let fail = |error: ApiError| PumpEvent::Failed { error };
         let engine = state.runtime.clone();
-        let permit = match tokio::select! {
-            _ = tx.closed() => return,
-            result = state.acquire_owned_workload_permit(WorkloadClass::Streaming) => result,
-        } {
-            Ok(permit) => permit,
-            Err(_) => {
-                let _ = send_pump_event(
-                    &tx,
-                    fail(ApiError::of(
-                        crate::error::ErrorClass::Unavailable,
-                        "Server is shutting down",
-                    )),
-                )
-                .await;
-                return;
-            }
-        };
         let mut runtime_context = permit.runtime_context();
         runtime_context.tenant_key = tenant_key;
         gen_request = gen_request.with_runtime_context(runtime_context);
@@ -1373,7 +1404,7 @@ impl SpeechPump {
                     variant,
                     gen_request,
                     chunk_tx,
-                    WorkloadClass::Streaming,
+                    workload,
                 )
                 .await
             } else {
@@ -1582,11 +1613,12 @@ async fn next_stream_chunk<T>(
     }
 }
 
-/// The SSE events for one pump event.
+/// The SSE events for one pump event; `audio.done` carries `service_tier`.
 fn sse_events(
     event: PumpEvent,
     request_id: &str,
     output: &SpeechOutput,
+    service_tier: Option<&'static str>,
 ) -> (
     Option<SpeechStreamEvent>,
     Option<Result<SpeechCompletion, ApiError>>,
@@ -1632,6 +1664,7 @@ fn sse_events(
             done.audio_duration_secs = Some(summary.audio_duration_secs);
             done.rtf = Some(summary.rtf);
             done.stop_reason = summary.stop_reason.map(TtsStopReason::as_str);
+            done.service_tier = service_tier;
             (Some(done), Some(Ok(summary.completion())))
         }
         PumpEvent::Failed { error } => {
@@ -1653,8 +1686,13 @@ async fn stream_speech_sse(
     let request_id = pump.gen_request.id.clone();
     let output = job.output.clone();
     let speech_id = job.speech_id.clone();
+    let service_tier = job.service_tier.reported();
+    let permit = pump
+        .admit()
+        .await
+        .map_err(|err| failed(&state, &job.speech_id, err))?;
     let (tx, mut rx) = mpsc::channel::<PumpEvent>(stream_event_queue_capacity());
-    pump.spawn(tx);
+    pump.spawn(permit, tx);
 
     let outcome_state = state.clone();
     let stream = async_stream::stream! {
@@ -1662,7 +1700,7 @@ async fn stream_speech_sse(
         loop {
             match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
                 Ok(Some(event)) => {
-                    let (sse, ended) = sse_events(event, &request_id, &output);
+                    let (sse, ended) = sse_events(event, &request_id, &output, service_tier);
                     if let Some(sse) = sse {
                         yield Ok::<_, Infallible>(format!("data: {}\n\n", openai_stream_payload(&sse)));
                     }
@@ -1714,8 +1752,12 @@ async fn stream_speech_audio(
     let pump =
         SpeechPump::prepare(&state, &job).map_err(|err| failed(&state, &job.speech_id, err))?;
     let speech_id = job.speech_id.clone();
+    let permit = pump
+        .admit()
+        .await
+        .map_err(|err| failed(&state, &speech_id, err))?;
     let (tx, mut rx) = mpsc::channel::<PumpEvent>(stream_event_queue_capacity());
-    pump.spawn(tx);
+    pump.spawn(permit, tx);
 
     let sample_rate = match rx.recv().await {
         Some(PumpEvent::Started { sample_rate }) => sample_rate,
@@ -2072,6 +2114,7 @@ mod tests {
             saved_voice_id: None,
             references: Vec::new(),
             script: None,
+            service_tier: None,
             sampling: Default::default(),
         };
 
@@ -2113,6 +2156,7 @@ mod tests {
             saved_voice_id: None,
             references: Vec::new(),
             script: None,
+            service_tier: None,
             sampling: Default::default(),
         };
 
@@ -2154,6 +2198,7 @@ mod tests {
             saved_voice_id: None,
             references: Vec::new(),
             script: None,
+            service_tier: None,
             sampling: Default::default(),
         };
 
@@ -2194,6 +2239,7 @@ mod tests {
             saved_voice_id: None,
             references: Vec::new(),
             script: None,
+            service_tier: None,
             sampling: Default::default(),
         };
 
@@ -2235,6 +2281,7 @@ mod tests {
             saved_voice_id: None,
             references: Vec::new(),
             script: None,
+            service_tier: None,
             sampling: Default::default(),
         };
 
@@ -2268,6 +2315,7 @@ mod tests {
             saved_voice_id: None,
             references: Vec::new(),
             script: None,
+            service_tier: None,
             sampling: Default::default(),
         };
 
@@ -2305,6 +2353,7 @@ mod tests {
             saved_voice_id: None,
             references: Vec::new(),
             script: None,
+            service_tier: None,
             sampling: Default::default(),
         };
         let drama3 = ModelVariant::FishAudioDrama3;
@@ -2378,6 +2427,7 @@ mod tests {
             saved_voice_id: None,
             references: Vec::new(),
             script: None,
+            service_tier: None,
             sampling: Default::default(),
         };
         assert!(validate_speech_voice_contract(
@@ -2426,6 +2476,7 @@ mod tests {
             rtf: None,
             error: None,
             stop_reason: None,
+            service_tier: None,
         };
         let delta: serde_json::Value =
             serde_json::from_str(&openai_stream_payload(&event("audio.chunk"))).unwrap();
@@ -2469,6 +2520,7 @@ mod tests {
             saved_voice_id: None,
             references: Vec::new(),
             script: None,
+            service_tier: None,
             sampling: Default::default(),
         };
 
@@ -2502,6 +2554,7 @@ mod tests {
             saved_voice_id: None,
             references: Vec::new(),
             script: None,
+            service_tier: None,
             sampling: Default::default(),
         };
 
@@ -2654,6 +2707,7 @@ mod tests {
             },
             "req",
             &output,
+            None,
         );
         let event = event.unwrap();
         assert!(ended.is_none());
@@ -2677,8 +2731,69 @@ mod tests {
             },
             "req",
             &output,
+            None,
         );
         assert!(empty.is_none());
+    }
+
+    /// `audio.done` names the tier served when the request named one, and
+    /// is unchanged otherwise.
+    #[test]
+    fn sse_done_reports_the_service_tier_a_request_named() {
+        let output = SpeechOutput::resolve(Some("wav"), false, None, None).unwrap();
+        let done = |service_tier| {
+            let summary = StreamSummary {
+                generation_time_ms: 10.0,
+                tokens_generated: Some(4),
+                execution_time_ms: None,
+                audio_duration_secs: 1.0,
+                rtf: 0.01,
+                first_pcm_ms: None,
+                last_pcm_ms: None,
+                total_samples: 24_000,
+                sample_rate: 24_000,
+                stop_reason: None,
+                planned_segment_count: 1,
+                token_unit: "model_tokens",
+            };
+            let (event, ended) = sse_events(
+                PumpEvent::Done(Box::new(summary)),
+                "req",
+                &output,
+                service_tier,
+            );
+            assert!(matches!(ended, Some(Ok(_))));
+            serde_json::from_str::<serde_json::Value>(&openai_stream_payload(&event.unwrap()))
+                .unwrap()
+        };
+        let flex = ServiceTier::parse(Some("flex"), None).unwrap();
+        assert_eq!(done(flex.reported())["service_tier"], "flex");
+        let priority = ServiceTier::parse(Some("priority"), None).unwrap();
+        assert_eq!(done(priority.reported())["service_tier"], "default");
+        let unnamed = done(ServiceTier::default().reported());
+        assert_eq!(unnamed["type"], "speech.audio.done");
+        assert!(unnamed.get("service_tier").is_none());
+    }
+
+    /// The request field reaches the handler's parser; a stream's class
+    /// follows the tier.
+    #[test]
+    fn speech_requests_carry_service_tier() {
+        let req: SpeechRequest = serde_json::from_value(serde_json::json!({
+            "model": "Kokoro-82M",
+            "input": "hello",
+            "service_tier": "flex"
+        }))
+        .unwrap();
+        let tier = ServiceTier::parse(req.service_tier.as_deref(), None).unwrap();
+        assert_eq!(
+            tier.workload_class(WorkloadClass::Streaming),
+            WorkloadClass::Batch
+        );
+        let req: SpeechRequest =
+            serde_json::from_value(serde_json::json!({"model": "Kokoro-82M", "input": "hello"}))
+                .unwrap();
+        assert_eq!(req.service_tier, None);
     }
 
     #[test]
@@ -2769,6 +2884,7 @@ mod tests {
             rtf: None,
             error: None,
             stop_reason: None,
+            service_tier: None,
         };
 
         let value = serde_json::to_value(event).expect("serialize event");

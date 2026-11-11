@@ -8,6 +8,7 @@ icon: "sparkles"
 | Feature | Description | Guide |
 |---------|-------------|-------|
 | **Voice** | Real-time voice conversations with AI | [Voice Guide](/features/voice) |
+| **Phone calls** | Live transcription and voice agents on phone calls | [Phone calls and call centres](/features/telephony) |
 | **Chat** | Text-based AI conversations | [Chat Guide](/features/chat) |
 | **Transcription** | Convert audio to text | [Transcription Guide](/features/transcription) |
 | **Speaker Attributed ASR** | Generate speaker-turn transcripts | [SAA Guide](/features/speaker-attributed-asr) |
@@ -86,6 +87,7 @@ Different features require different models:
 Choose a feature to learn more:
 
 - [Voice Mode](/features/voice) — Real-time conversations
+- [Phone calls and call centres](/features/telephony) — Connect calls for live transcription and voice agents
 - [Voices](/features/voices) — Manage and create reusable voices
 - [Text-to-Speech](/features/text-to-speech) — Generate speech
 - [Studio](/features/studio) — Build long-form TTS projects

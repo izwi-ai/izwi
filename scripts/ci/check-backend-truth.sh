@@ -652,9 +652,11 @@ run_hygiene() {
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-fish-long-form-qualification.py
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-fish-serving-capacity.py
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-gateway-chat-benchmark.py
+    PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-mixed-load.py
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-score-asr-matrix.py
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-score-tts-matrix.py
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-serving-benchmark.py
+    PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-telephony-accuracy.py
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-tts-concurrency.py
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-voice-realtime-load.py
 }

@@ -42,7 +42,9 @@ use crate::models::shared::telemetry::{
     prometheus as kernel_path_prometheus, snapshot as kernel_path_telemetry_snapshot,
 };
 use crate::runtime::pipeline::{PipelineExecutionSummary, PipelineKind};
-use crate::runtime::telemetry::histogram::{buckets, CounterFamily, HistogramFamily};
+use crate::runtime::telemetry::histogram::{
+    buckets, CounterFamily, FloatCounterFamily, HistogramFamily,
+};
 use crate::runtime::voice_metrics::{
     prometheus_voice_metric_name, voice_metric_catalog, voice_metric_prometheus_contract,
     VoiceLatency, VoiceMetricDescriptor, VOICE_AUDIO_EGRESS_UNDERRUNS_TOTAL,
@@ -75,13 +77,17 @@ fn is_request_stage(stage: &str) -> bool {
 }
 
 const REQUEST_LABELS: &[&str] = &["model", "backend", "task"];
-const REQUEST_OUTCOME_LABELS: &[&str] = &["model", "backend", "task", "outcome"];
+const REQUEST_CLASS_LABELS: &[&str] = &["model", "backend", "task", "workload_class"];
+const REQUEST_OUTCOME_LABELS: &[&str] = &["model", "backend", "task", "workload_class", "outcome"];
 const TOKEN_LABELS: &[&str] = &["model", "task"];
+const TTS_LABELS: &[&str] = &["model", "backend", "workload_class"];
 
 /// Aggregatable request histograms for the Prometheus exposition. Times run
 /// from server admission (the workload permit wait) through runtime
 /// admission, so queue wait and TTFT include coordinator and model-residency
-/// time, not only the engine scheduler's queue.
+/// time, not only the engine scheduler's queue. Duration, TTFT and queue wait
+/// carry the request's workload class, so a real-time and a batch load on one
+/// model read apart.
 #[derive(Debug)]
 struct RequestHistograms {
     duration: HistogramFamily,
@@ -93,6 +99,8 @@ struct RequestHistograms {
     generation_tokens: CounterFamily,
     input_audio: HistogramFamily,
     stage_duration: HistogramFamily,
+    tts_first_audio: HistogramFamily,
+    tts_output_audio: FloatCounterFamily,
 }
 
 impl RequestHistograms {
@@ -106,14 +114,14 @@ impl RequestHistograms {
             ),
             ttft: HistogramFamily::new(
                 "izwi_request_ttft_seconds",
-                "Time from server admission to the first user-visible output.",
-                REQUEST_LABELS,
+                "Time from server admission to the first user-visible output: the first text delta of a chat or transcription request, the first generated frame or audio of a speech request (izwi_tts_first_audio_seconds times the audio itself).",
+                REQUEST_CLASS_LABELS,
                 buckets::FIRST_OUTPUT_SECONDS,
             ),
             queue_wait: HistogramFamily::new(
                 "izwi_request_queue_wait_seconds",
                 "Time from server admission until the engine first schedules the request, including the coordinator, input preparation and model residency.",
-                REQUEST_LABELS,
+                REQUEST_CLASS_LABELS,
                 buckets::QUEUE_SECONDS,
             ),
             prefill: HistogramFamily::new(
@@ -150,6 +158,17 @@ impl RequestHistograms {
                 &["stage", "workload_class"],
                 buckets::REQUEST_SECONDS,
             ),
+            tts_first_audio: HistogramFamily::new(
+                "izwi_tts_first_audio_seconds",
+                "Time from server admission until a streamed speech request hands its first audio to the transport, on every streaming route (one observation per segment of a long text).",
+                TTS_LABELS,
+                buckets::FIRST_OUTPUT_SECONDS,
+            ),
+            tts_output_audio: FloatCounterFamily::new(
+                "izwi_tts_output_audio_seconds_total",
+                "Seconds of audio produced by completed speech requests, streamed or buffered. Its rate is the server's speech throughput in audio seconds per second.",
+                TTS_LABELS,
+            ),
         }
     }
 
@@ -168,7 +187,9 @@ impl RequestHistograms {
         let model = context.model_variant.as_deref().unwrap_or("unknown");
         let backend = context.backend_kind.as_deref().unwrap_or("unknown");
         let task = context.capability.as_deref().unwrap_or("unknown");
+        let workload_class = context.workload_class.as_deref().unwrap_or("unknown");
         let labels = [model, backend, task];
+        let class_labels = [model, backend, task, workload_class];
         // Server admission precedes every runtime-relative timing.
         let admission_ms = timing.admission_ms.unwrap_or(0.0);
         let seconds = |ms: f64| (admission_ms + ms) / 1000.0;
@@ -178,14 +199,17 @@ impl RequestHistograms {
                 RuntimeStageOutcome::Cancelled => "cancelled",
                 _ => "completed",
             };
-            self.duration
-                .observe(&[model, backend, task, outcome], seconds(total_ms));
+            self.duration.observe(
+                &[model, backend, task, workload_class, outcome],
+                seconds(total_ms),
+            );
         }
         if let Some(ttft_ms) = timing.ttft_ms {
-            self.ttft.observe(&labels, seconds(ttft_ms));
+            self.ttft.observe(&class_labels, seconds(ttft_ms));
         }
         if let Some(queue_wait_ms) = timing.queue_wait_ms {
-            self.queue_wait.observe(&labels, seconds(queue_wait_ms));
+            self.queue_wait
+                .observe(&class_labels, seconds(queue_wait_ms));
         }
         if let Some(prefill_ms) = timing.prefill_ms {
             self.prefill.observe(&labels, prefill_ms / 1000.0);
@@ -217,6 +241,8 @@ impl RequestHistograms {
         self.generation_tokens.render(payload);
         self.input_audio.render(payload);
         self.stage_duration.render(payload);
+        self.tts_first_audio.render(payload);
+        self.tts_output_audio.render(payload);
     }
 }
 
@@ -252,6 +278,7 @@ const fn voice_latency_prometheus_name(latency: VoiceLatency) -> &'static str {
         VoiceLatency::Endpointing => "izwi_voice_endpointing_latency_seconds",
         VoiceLatency::AsrFirstPartial => "izwi_voice_asr_first_partial_seconds",
         VoiceLatency::AsrFinal => "izwi_voice_asr_final_seconds",
+        VoiceLatency::AsrLiveFirstPartial => "izwi_voice_asr_live_first_partial_seconds",
         VoiceLatency::LlmFirstToken => "izwi_voice_llm_first_token_seconds",
         VoiceLatency::TtsFirstAudio => "izwi_voice_tts_first_audio_seconds",
         VoiceLatency::TurnFirstAudio => "izwi_voice_turn_first_audio_seconds",
@@ -343,6 +370,9 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub recompute_preemptions_total: u64,
     pub claim_deadlock_aborts_total: u64,
     pub kv_blocked_requests: u64,
+    pub realtime_reserve_deferrals_total: u64,
+    pub asr_encoder_live_yields_total: u64,
+    pub stream_pacing_transitions_total: u64,
     pub continuous_envelope_scalar_fallbacks_total: u64,
     pub physical_execution: EnginePhysicalExecutionMetricsSnapshot,
     /// Exact backend-owned managed arenas, page ownership, and counters.
@@ -807,6 +837,21 @@ impl RuntimeTelemetryCollector {
         self.voice_latencies
             .family(latency)
             .observe_duration(&[], elapsed);
+    }
+
+    /// First audio of a streamed speech request, `labels` being its model,
+    /// backend and workload class.
+    pub(crate) fn record_tts_first_audio(&self, labels: &[&str; 3], seconds: f64) {
+        self.request_histograms
+            .tts_first_audio
+            .observe(labels, seconds);
+    }
+
+    /// Audio a completed speech request produced.
+    pub(crate) fn record_tts_output_audio(&self, labels: &[&str; 3], seconds: f64) {
+        self.request_histograms
+            .tts_output_audio
+            .add(labels, seconds);
     }
 
     pub(crate) fn record_voice_egress_underrun(&self) {
@@ -2074,16 +2119,20 @@ mod tests {
         assert!(!payload.contains("izwi_latency_"));
         let counts = check_histograms(&payload).expect("valid histogram exposition");
         let labels = "backend=\"cpu\",model=\"Qwen3-0.6B\",task=\"chat\"";
+        let class_labels = format!("{labels},workload_class=\"interactive\"");
         let duration = |outcome: &str| {
             format!(
-                "izwi_request_duration_seconds{{backend=\"cpu\",model=\"Qwen3-0.6B\",outcome=\"{outcome}\",task=\"chat\"}}"
+                "izwi_request_duration_seconds{{backend=\"cpu\",model=\"Qwen3-0.6B\",outcome=\"{outcome}\",task=\"chat\",workload_class=\"interactive\"}}"
             )
         };
         assert_eq!(counts[&duration("completed")], 5);
         assert_eq!(counts[&duration("failed")], 1);
-        assert_eq!(counts[&format!("izwi_request_ttft_seconds{{{labels}}}")], 5);
         assert_eq!(
-            counts[&format!("izwi_request_queue_wait_seconds{{{labels}}}")],
+            counts[&format!("izwi_request_ttft_seconds{{{class_labels}}}")],
+            5
+        );
+        assert_eq!(
+            counts[&format!("izwi_request_queue_wait_seconds{{{class_labels}}}")],
             5
         );
         assert_eq!(
@@ -2092,7 +2141,7 @@ mod tests {
         );
         // Admission (20 ms) precedes the runtime timings: 25 ms <= 50 ms bucket.
         assert!(payload.contains(
-            "izwi_request_duration_seconds_bucket{model=\"Qwen3-0.6B\",backend=\"cpu\",task=\"chat\",outcome=\"completed\",le=\"0.05\"} 1"
+            "izwi_request_duration_seconds_bucket{model=\"Qwen3-0.6B\",backend=\"cpu\",task=\"chat\",workload_class=\"interactive\",outcome=\"completed\",le=\"0.05\"} 1"
         ));
         // Failed requests count toward duration but not toward token totals.
         assert!(payload
@@ -2101,6 +2150,79 @@ mod tests {
             "izwi_request_generation_tokens_total{model=\"Qwen3-0.6B\",task=\"chat\"} 20"
         ));
         assert!(!payload.contains("req-Qwen3"));
+    }
+
+    #[tokio::test]
+    async fn request_latency_histograms_split_by_workload_class() {
+        let telemetry = RuntimeTelemetryCollector::new(64);
+        for (workload_class, requests) in [(Some("realtime"), 2), (Some("batch"), 3), (None, 1)] {
+            for _ in 0..requests {
+                let mut observation = engine_request_observation(
+                    "m",
+                    RuntimeStageOutcome::Completed,
+                    RuntimeStageTiming {
+                        queue_wait_ms: Some(3.0),
+                        prefill_ms: Some(30.0),
+                        ttft_ms: Some(40.0),
+                        total_ms: Some(80.0),
+                        ..RuntimeStageTiming::default()
+                    },
+                );
+                observation.context.workload_class = workload_class.map(str::to_string);
+                telemetry.record_stage_observation(observation);
+            }
+        }
+
+        let payload = telemetry.prometheus().await;
+        let counts = check_histograms(&payload).expect("valid histogram exposition");
+        for (workload_class, requests) in [("realtime", 2), ("batch", 3), ("unknown", 1)] {
+            let labels = format!(
+                "backend=\"cpu\",model=\"m\",task=\"chat\",workload_class=\"{workload_class}\""
+            );
+            for family in [
+                "izwi_request_ttft_seconds",
+                "izwi_request_queue_wait_seconds",
+            ] {
+                assert_eq!(counts[&format!("{family}{{{labels}}}")], requests);
+            }
+            assert_eq!(
+                counts[&format!(
+                    "izwi_request_duration_seconds{{backend=\"cpu\",model=\"m\",outcome=\"completed\",task=\"chat\",workload_class=\"{workload_class}\"}}"
+                )],
+                requests
+            );
+        }
+        // Engine phase times are not split by class.
+        assert_eq!(
+            counts["izwi_request_prefill_seconds{backend=\"cpu\",model=\"m\",task=\"chat\"}"],
+            6
+        );
+    }
+
+    #[tokio::test]
+    async fn tts_first_audio_and_output_audio_export_by_workload_class() {
+        let telemetry = RuntimeTelemetryCollector::new(64);
+        let realtime = ["Kokoro-82M", "metal", "realtime"];
+        let batch = ["Kokoro-82M", "metal", "batch"];
+        telemetry.record_tts_first_audio(&realtime, 0.12);
+        telemetry.record_tts_first_audio(&realtime, 0.4);
+        telemetry.record_tts_output_audio(&realtime, 2.5);
+        telemetry.record_tts_output_audio(&realtime, 1.25);
+        telemetry.record_tts_output_audio(&batch, 600.0);
+
+        let payload = telemetry.prometheus().await;
+        let counts = check_histograms(&payload).expect("valid histogram exposition");
+        assert_eq!(
+            counts["izwi_tts_first_audio_seconds{backend=\"metal\",model=\"Kokoro-82M\",workload_class=\"realtime\"}"],
+            2
+        );
+        assert!(payload.contains("# TYPE izwi_tts_output_audio_seconds_total counter"));
+        assert!(payload.contains(
+            "izwi_tts_output_audio_seconds_total{model=\"Kokoro-82M\",backend=\"metal\",workload_class=\"realtime\"} 3.75"
+        ));
+        assert!(payload.contains(
+            "izwi_tts_output_audio_seconds_total{model=\"Kokoro-82M\",backend=\"metal\",workload_class=\"batch\"} 600.0"
+        ));
     }
 
     #[tokio::test]

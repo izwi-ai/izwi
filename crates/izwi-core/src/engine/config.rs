@@ -273,6 +273,17 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_capacity_replay")]
     pub enable_capacity_replay: bool,
 
+    /// Sequences each model keeps free of Batch and Background requests
+    /// while it has live demand (a Realtime or Streaming request, or a
+    /// real-time session operation, in the last 30 seconds), so a live
+    /// request does not wait for batch work to finish. `None` reserves a
+    /// quarter of the model's sequences, at least one; zero disables the
+    /// reserve. A model that retains more sequences than a dispatch decodes
+    /// keeps the reserve free among the extra ones with no live demand too.
+    /// Set with IZWI_REALTIME_ROW_RESERVE.
+    #[serde(default = "default_realtime_row_reserve")]
+    pub realtime_row_reserve: Option<usize>,
+
     /// Output tokens a chat request claims in managed KV beyond its prompt and
     /// current step. Claims grow by this quantum as generation proceeds
     /// instead of reserving the whole output budget up front, so concurrent
@@ -426,6 +437,10 @@ fn default_lane_step_drivers() -> bool {
 
 fn default_capacity_replay() -> bool {
     crate::env::flag_or("IZWI_CAPACITY_REPLAY", true)
+}
+
+fn default_realtime_row_reserve() -> Option<usize> {
+    crate::env::value("IZWI_REALTIME_ROW_RESERVE")?.parse().ok()
 }
 
 fn default_cuda_incremental_chat() -> bool {
@@ -694,6 +709,7 @@ impl Default for EngineCoreConfig {
             num_threads: default_num_threads(),
             enable_preemption: default_enable_preemption(),
             enable_capacity_replay: default_capacity_replay(),
+            realtime_row_reserve: default_realtime_row_reserve(),
             managed_chat_claim_quantum_tokens: default_managed_chat_claim_quantum_tokens(),
             portable_auto_context_cap_tokens: default_portable_auto_context_cap_tokens(),
             max_num_seqs: None,

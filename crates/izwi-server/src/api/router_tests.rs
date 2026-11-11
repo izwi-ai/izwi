@@ -2016,6 +2016,204 @@ async fn over_limit_speech_input_is_payload_too_large_on_both_routes() {
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+/// `service_tier` is read on every speech route, as a body field or the
+/// `X-Izwi-Service-Tier` header: each of OpenAI's values passes on to the
+/// route's own checks and any other value is refused, before any model work.
+#[tokio::test]
+async fn audio_routes_take_service_tier_and_refuse_unknown_values() {
+    let (state, _root) = test_state("audio_service_tier", false);
+    state.lifecycle.mark_ready();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state, &config);
+    let audio: serde_json::Value = serde_json::from_str(&tiny_audio_json_body()).expect("json");
+    let audio = audio["audio_base64"].clone();
+    // Each body fails one of its route's own checks, so no model runs.
+    let routes = [
+        (
+            "/v1/audio/speech",
+            serde_json::json!({
+                "model": "Kokoro-82M",
+                "input": "Hi.",
+                "voice": "af_heart",
+                "response_format": "ogg-vorbis"
+            }),
+            "response_format",
+        ),
+        (
+            "/v1/audio/speech/batch",
+            serde_json::json!({"model": "Kokoro-82M", "items": []}),
+            "items",
+        ),
+        (
+            "/v1/audio/transcriptions",
+            serde_json::json!({
+                "audio_base64": audio,
+                "model": "Parakeet-TDT-0.6B-v3",
+                "response_format": "verbose_json",
+                "timestamp_granularities": ["paragraph"]
+            }),
+            "",
+        ),
+        (
+            "/v1/audio/translations",
+            serde_json::json!({"audio_base64": audio}),
+            "model",
+        ),
+    ];
+    let send = |path: &'static str, body: serde_json::Value, header: Option<&'static str>| {
+        let mut request = build_request(Method::POST, path, Some(&body.to_string()));
+        if let Some(header) = header {
+            request
+                .headers_mut()
+                .insert("x-izwi-service-tier", header.parse().unwrap());
+        }
+        send_request(app.clone(), request)
+    };
+    for (path, body, own_param) in routes {
+        for tier in ["auto", "default", "flex", "priority"] {
+            let mut with_field = body.clone();
+            with_field["service_tier"] = tier.into();
+            for response in [
+                send(path, with_field, None).await,
+                send(path, body.clone(), Some(tier)).await,
+            ] {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path} {tier}");
+                let error = read_json(response).await;
+                assert_eq!(
+                    error["error"]["param"].as_str().unwrap_or_default(),
+                    own_param,
+                    "{path} {tier}: {error}"
+                );
+            }
+        }
+        let mut unknown_field = body.clone();
+        unknown_field["service_tier"] = "fastest".into();
+        for response in [
+            send(path, unknown_field, None).await,
+            send(path, body.clone(), Some("fastest")).await,
+        ] {
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            let error = read_json(response).await;
+            assert_eq!(error["error"]["type"], "invalid_request_error", "{path}");
+            assert_eq!(error["error"]["param"], "service_tier", "{path}");
+            assert_eq!(error["error"]["code"], "invalid_value", "{path}");
+        }
+    }
+}
+
+/// P1.3: a speech request the server has no room for within the admission
+/// queue timeout is refused with 429 and `Retry-After`, in every delivery:
+/// `rate_limit_exceeded` at the default tier, OpenAI's flex answer
+/// (`resource_unavailable`, "Resource Unavailable") for batch work. A
+/// stream is refused before it starts.
+#[tokio::test]
+async fn full_admission_refuses_speech_requests_with_429_and_retry_after() {
+    let (state, _root) = test_state("admission_queue_timeout", false);
+    state.lifecycle.mark_ready();
+    let state = state.with_admission_queue_timeout(Some(Duration::from_millis(20)));
+    // Every slot is taken.
+    let _busy = state
+        .request_semaphore
+        .clone()
+        .acquire_many_owned(state.request_global_capacity as u32)
+        .await
+        .expect("slots");
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state, &config);
+    let audio: serde_json::Value = serde_json::from_str(&tiny_audio_json_body()).expect("json");
+    let audio = audio["audio_base64"].clone();
+    let speech = serde_json::json!({"model": "Kokoro-82M", "input": "Hi.", "voice": "af_heart"});
+    let transcription = serde_json::json!({"audio_base64": audio, "model": "Parakeet-TDT-0.6B-v3"});
+    let with = |body: &serde_json::Value, fields: serde_json::Value| {
+        let mut body = body.clone();
+        for (name, value) in fields.as_object().expect("fields") {
+            body[name] = value.clone();
+        }
+        body
+    };
+    let requests = [
+        ("/v1/audio/speech", speech.clone()),
+        (
+            "/v1/audio/speech",
+            with(&speech, serde_json::json!({"stream": true})),
+        ),
+        (
+            "/v1/audio/speech",
+            with(&speech, serde_json::json!({"stream_format": "audio"})),
+        ),
+        ("/v1/audio/transcriptions", transcription.clone()),
+        (
+            "/v1/audio/transcriptions",
+            with(&transcription, serde_json::json!({"stream": true})),
+        ),
+    ];
+    for (path, body) in requests {
+        for (tier, code, flex) in [
+            (None, "rate_limit_exceeded", false),
+            (Some("priority"), "rate_limit_exceeded", false),
+            (Some("flex"), "resource_unavailable", true),
+        ] {
+            let body = match tier {
+                Some(tier) => with(&body, serde_json::json!({"service_tier": tier})),
+                None => body.clone(),
+            };
+            let response = send_request(
+                app.clone(),
+                build_request(Method::POST, path, Some(&body.to_string())),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "{path} {body}"
+            );
+            assert_eq!(response.headers()[header::RETRY_AFTER], "5", "{path}");
+            let error = read_json(response).await;
+            assert_eq!(error["error"]["type"], "rate_limit_error", "{path}");
+            assert_eq!(error["error"]["code"], code, "{path} {tier:?}");
+            assert_eq!(
+                error["error"]["message"]
+                    .as_str()
+                    .expect("message")
+                    .contains("Resource Unavailable"),
+                flex,
+                "{path} {tier:?}: {error}"
+            );
+        }
+    }
+
+    // A batch is batch work: each item is refused in its result.
+    let batch = serde_json::json!({
+        "model": "Kokoro-82M",
+        "voice": "af_heart",
+        "items": [{"input": "One."}]
+    });
+    let response = send_request(
+        app.clone(),
+        build_request(
+            Method::POST,
+            "/v1/audio/speech/batch",
+            Some(&batch.to_string()),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let batch = read_json(response).await;
+    assert_eq!(batch["failed"], 1, "{batch}");
+    assert_eq!(
+        batch["results"][0]["error"]["code"], "resource_unavailable",
+        "{batch}"
+    );
+}
+
 /// A photo sent as a base64 data URL is larger than axum's 2 MB default;
 /// chat routes read it and fail, if at all, for another reason.
 #[tokio::test]
@@ -4226,6 +4424,7 @@ async fn local_api_key_guards_api_routes_but_not_probes() {
     let hooks = crate::local_security::with_api_key(
         EnterpriseHooks::noop(),
         Some(crate::local_security::LocalApiKey::new(KEY).unwrap()),
+        false,
     );
     let (state, temp_dir) = test_state_with_hooks("local_api_key_guard", false, hooks);
     state.lifecycle.mark_ready();

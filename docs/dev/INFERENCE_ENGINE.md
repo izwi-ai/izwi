@@ -362,12 +362,77 @@ realtime pushes, diarization) are weighed the same way rather than queueing
 as control jobs. Long work is chunked so it gives the device back:
 long-form ASR runs one audio window per dispatch.
 
+**Queue pools.** The coordinator admits jobs from two permit pools
+(`runtime/coordinator.rs`). Realtime-class jobs, which include each real-time
+session's lease for its whole life, take from the real-time pool; every other
+class takes from the general pool of `IZWI_MAX_QUEUED_REQUESTS`. The real-time
+pool holds the larger of that figure and the real-time ASR session cap. A full
+general queue therefore cannot refuse a call, and an open session takes
+nothing from the general queue. Memory admission and device arbitration are
+shared by both pools.
+
 **Execution lanes.** Each loaded model is one lane, and a step fences only its
 own lane. `IZWI_LANE_STEP_DRIVERS=1` runs one step driver per lane instead of
 one for the engine. It is off by default: a mixed chat, ASR, TTS and realtime
 soak on an M1 Pro gave better TTS latency and a smaller worst chat gap with it
 on, but worse chat TTFT, typical inter-token latency and realtime lag
 (`SERVING_BENCHMARK.md`).
+
+**Real-time reserve.** While a lane has live demand (a Realtime or Streaming
+request waiting or running, or a real-time session operation, in the last
+30 seconds), the scheduler starts Batch and Background requests only up to
+`rows - R`, where `rows` is the model's decode rows bounded by the retained
+sequences and `R` is `IZWI_REALTIME_ROW_RESERVE` or a quarter of the rows, at
+least one. Requests already running are not stopped; held requests keep their
+queue order and are charged no service. A one-row model reserves nothing, and
+batch work always keeps one sequence. With no live demand batch work fills
+every decode row, but a lane that retains more sequences than a dispatch
+decodes starts Batch and Background requests only up to `sequences - R`
+(never fewer than its rows, `R` then a quarter of the sequences): a sequence
+cannot be taken back from a running request, and parked ones add no
+throughput, so they stay free for the next live request. Under KV pressure the replay victim is
+the request of the lightest workload class, then lowest priority, then
+youngest. Long-form speech asks for the same limit before it fans out its
+segments. `izwi_engine_scheduler_reserve_deferrals_total` counts the requests
+the reserve held back.
+
+**Bounded batch dispatches.** The same live demand bounds batch work that
+runs outside the scheduler. A long Parakeet recording encodes its windows in
+one pre-sequence preparation job; while its lane has live demand, a Batch or
+Background recording ends that job after each window group and continues in a
+new one, so the lane's live work waits for one group at most. The groups and
+the stitched output are those of the single job, and with no live demand the
+encode runs as one job. `izwi_engine_asr_encoder_live_yields_total` counts
+the jobs ended this way. Chunked families (Whisper, Qwen3-ASR, Granite
+Speech, LFM audio) already run one chunk per dispatch. VibeVoice-ASR and
+Nemotron 3.5 Transcribe read the whole recording in one context and are not
+split (see the runbook).
+
+**Direct-route streams.** Kokoro streams its planned chunks on the
+coordinator's direct route, one chunk per device job, while buffered Kokoro
+runs in the engine as one atomic dispatch that joins its chunks; the engine
+path cannot emit a chunk's audio before the dispatch commits. Each chunk job
+takes the device at the weight of the request's workload class, as an engine
+dispatch does, and a Realtime or Streaming stream is recorded as its model's
+live demand before each chunk. The real-time reserve and the bounded batch
+dispatches above therefore apply to a model whose only live work is a direct
+stream. Within one model, chunk jobs and engine dispatches take turns in
+arrival order.
+
+**Stream pacing.** The runtime measures how far each engine speech stream is
+ahead of real time where it hands audio to the transport: the audio handed on
+less the time since the first of it. Past `IZWI_STREAM_LEAD_SECS` (3 by
+default, 0 disables) the scheduler serves the request from the Batch class's
+share of service until the lead has fallen to half the threshold, which it
+does on the clock even if the stream produces nothing meanwhile. Only the
+share changes: the request keeps its admission, deadlines, decode quanta,
+capacity rank and device weight, the real-time reserve neither holds it nor
+counts it as batch work, and while paced it is not live demand. Nothing is
+throttled, so a paced stream on an idle device runs at full speed.
+`izwi_engine_scheduler_stream_pacing_transitions_total` counts the times a
+stream was lowered. Long-form speech synthesizes segments ahead of the one
+being sent, and each segment is paced by its own lead at its hand-off to the
+in-order relay. Kokoro's direct-route stream is not paced.
 
 **Mixed steps.** A chat family certified in `catalog/mixed_step.rs` runs
 prefill spans beside decode rows in one model call. None is certified yet; the

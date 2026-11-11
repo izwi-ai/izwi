@@ -37,6 +37,27 @@ uv venv /tmp/rt-pipecat && uv pip install --python /tmp/rt-pipecat/bin/python "p
 /tmp/rt-pipecat/bin/python scripts/e2e/openai-realtime/run_pipecat.py --model gpt-realtime
 ```
 
+## Telephony media stream
+
+`run_media_stream.py` is the carrier side of `/v1/realtime/media-stream`: it
+plays a WAV as a phone call (`connected`, `start`, 20 ms frames of base64
+8 kHz μ-law in real time, `stop`), prints the `transcript` frames and saves the
+speech the call returns. It needs only `websockets`, which `openai[realtime]`
+installs.
+
+```bash
+# A call that is only transcribed, with a model that transcribes live.
+/tmp/rt-sdk/bin/python scripts/e2e/openai-realtime/run_media_stream.py \
+    --intent transcription --transcription-model Voxtral-Mini-4B-Realtime-2602
+# A call a voice agent answers; its speech is saved as media-stream-reply.wav.
+/tmp/rt-sdk/bin/python scripts/e2e/openai-realtime/run_media_stream.py --model izwi-voice --voice cedar
+```
+
+`--custom-parameters` sends the call's parameters in the `start` frame instead
+of the query string, and `--api-key` (or `IZWI_API_KEY`) authenticates. The
+run passes when a transcription call returns a completed transcript, or a
+conversation call returns speech, and no `error` frame arrives.
+
 `--url` points at another server (`http://host:port` for the SDK and LiveKit,
 `ws://host:port` for Pipecat). The scripts use `data/fox.wav` (24 kHz) as the
 user's speech. Models load on first use, so a cold server's first scenario is

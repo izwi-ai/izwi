@@ -256,6 +256,11 @@ fn local_batch_worker_timeouts_are_configurable_and_bounded() {
     std::env::remove_var("IZWI_GATEWAY_WORKER_TLS_CA_REFS");
     std::env::remove_var("IZWI_GATEWAY_WORKER_TLS_CLIENT_CERT_REF");
     std::env::remove_var("IZWI_GATEWAY_WORKER_TLS_CLIENT_KEY_REF");
+    assert_eq!(
+        batch_stage_execution_timeout(),
+        Some(Duration::from_secs(21_600))
+    );
+    std::env::set_var("IZWI_BATCH_STAGE_TIMEOUT_SECS", "0");
     assert_eq!(batch_stage_execution_timeout(), None);
     assert_eq!(batch_worker_drain_timeout(), Duration::from_secs(20));
     assert_eq!(http_shutdown_grace_timeout(), Duration::from_secs(20));

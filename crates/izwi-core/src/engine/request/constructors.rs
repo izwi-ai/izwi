@@ -74,6 +74,7 @@ impl EngineCoreRequest {
             tts_speaker_references: Vec::new(),
             tts_chunk_history: Vec::new(),
             tts_generated_codes: None,
+            stream_pacing: None,
         }
     }
 
@@ -147,6 +148,7 @@ impl EngineCoreRequest {
             tts_speaker_references: Vec::new(),
             tts_chunk_history: Vec::new(),
             tts_generated_codes: None,
+            stream_pacing: None,
         }
     }
 
@@ -220,6 +222,7 @@ impl EngineCoreRequest {
             tts_speaker_references: Vec::new(),
             tts_chunk_history: Vec::new(),
             tts_generated_codes: None,
+            stream_pacing: None,
         }
     }
 
@@ -303,6 +306,7 @@ impl EngineCoreRequest {
             tts_speaker_references: Vec::new(),
             tts_chunk_history: Vec::new(),
             tts_generated_codes: None,
+            stream_pacing: None,
         }
     }
 
@@ -374,6 +378,7 @@ impl EngineCoreRequest {
             tts_speaker_references: Vec::new(),
             tts_chunk_history: Vec::new(),
             tts_generated_codes: None,
+            stream_pacing: None,
         }
     }
 
@@ -445,6 +450,7 @@ impl EngineCoreRequest {
             tts_speaker_references: Vec::new(),
             tts_chunk_history: Vec::new(),
             tts_generated_codes: None,
+            stream_pacing: None,
         }
     }
 

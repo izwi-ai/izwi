@@ -114,9 +114,7 @@ pub async fn align(
         )));
     }
 
-    let _permit = state
-        .acquire_workload_permit(WorkloadClass::Interactive)
-        .await;
+    let _permit = state.admit_request(WorkloadClass::Interactive).await?;
     let started = Instant::now();
     // Audio longer than the aligner's window is aligned in sub-windows,
     // never as one forward.

@@ -17,6 +17,7 @@ use std::time::Duration;
 use anyhow::bail;
 use izwi_serving_protocol::env::{EnvSnapshot, EnvVar};
 
+use crate::api::openai::batches::webhook::WebhookPolicy;
 use crate::api::openai::compat::OpenAiCompatibilityProfile;
 use crate::batch_runtime::store::{QuotaLimits, RetentionPolicy};
 use crate::local_security::LocalExposure;
@@ -90,6 +91,11 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "The port is published on the host's loopback only (a container's `-p 127.0.0.1:…`): treat the bind as loopback, so no key is required and only loopback or IZWI_ALLOWED_HOSTS Host names are served.",
     ),
     var(
+        "IZWI_TRUST_GATEWAY_TENANT_HEADER",
+        "false",
+        "Keep files, batches, jobs and speech lookups apart per gateway tenant: a request that carries the API key (any request when no key is set) acts for the tenant its `X-Izwi-Gateway-Tenant` header names, which an Izwi gateway sets for every caller. Anyone who can reach the server with the key can name any tenant, so enable it only where the gateway is the server's sole client. Off, the header is ignored.",
+    ),
+    var(
         "IZWI_ALLOWED_HOSTS",
         "",
         "Comma-separated extra Host names to accept (port optional). On a non-loopback bind, setting it turns the Host check on.",
@@ -137,12 +143,12 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
     var(
         "IZWI_BATCH_WORKER_CONCURRENCY",
         "the runtime's capacity",
-        "Durable jobs the local batch worker runs at once (at most the runtime's capacity).",
+        "Durable jobs the local batch worker runs at once, and `/v1/batches` lines in flight at once (at most the runtime's capacity).",
     ),
     var(
         "IZWI_BATCH_STAGE_TIMEOUT_SECS",
-        "0 (none)",
-        "Wall-clock limit of one durable stage (30-86400; 0 disables).",
+        "21600",
+        "Wall-clock limit of one durable stage, in seconds from its start (30-86400; 0 disables). A stage is one whole job: raise it for recordings or scripts that take longer than six hours on this device.",
     ),
     var(
         "IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS",
@@ -184,6 +190,11 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "IZWI_MAX_REALTIME_SESSIONS",
         "32",
         "Open realtime websocket sessions.",
+    ),
+    var(
+        "IZWI_ADMISSION_QUEUE_TIMEOUT_SECS",
+        "30",
+        "How long a chat, agent or /v1/audio request waits for an admission slot before it is refused with 429 (0 waits without limit). Realtime sessions, record and durable-job routes and background work always wait.",
     ),
     // The speech API (api/openai/audio), captured in ServerTuning.
     var(
@@ -285,7 +296,7 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
     var(
         "IZWI_MAX_SPEECH_REQUESTS_PER_TENANT",
         "the global request limit",
-        "Concurrent speech requests per tenant (at most the global limit).",
+        "Concurrent speech requests per tenant (at most the global limit): speech and batch requests until their response ends, and open /v1/audio/speech/stream and /v1/realtime sockets.",
     ),
     var(
         "IZWI_TTS_MAX_TEXT_BYTES",
@@ -403,6 +414,31 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "Assistant audio a voice websocket queues, in milliseconds.",
     ),
     var(
+        "IZWI_FILES_MAX_BYTES",
+        "209715200",
+        "Largest file `/v1/files` accepts, in bytes (at most 1 GiB).",
+    ),
+    var(
+        "IZWI_BATCH_MAX_REQUESTS",
+        "50000",
+        "Requests one `/v1/batches` input file may hold.",
+    ),
+    var(
+        "IZWI_BATCH_WEBHOOK_SECRET",
+        "unset (webhooks off)",
+        "Turns on `/v1/batches` completion webhooks (`metadata.webhook_url`) and signs each delivery (Standard Webhooks, HMAC-SHA256). A `whsec_` value is base64 of the key; any other value is the key. Unset, a batch that names a webhook is refused.",
+    ),
+    var(
+        "IZWI_BATCH_WEBHOOK_ALLOW_HTTP",
+        "false",
+        "Allows `http://` batch webhook URLs; `https://` only otherwise.",
+    ),
+    var(
+        "IZWI_BATCH_WEBHOOK_ALLOW_PRIVATE",
+        "false",
+        "Allows batch webhook URLs whose host resolves to a loopback, private, link-local or other non-public address.",
+    ),
+    var(
         "IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS",
         "5",
         "Heartbeat age after which readiness reports a batch worker stale.",
@@ -455,6 +491,8 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
 pub(crate) struct ServerTuning {
     pub(crate) allow_unauthenticated_network: bool,
     pub(crate) local_exposure: LocalExposure,
+    /// Requests act for the tenant `X-Izwi-Gateway-Tenant` names.
+    pub(crate) trust_gateway_tenant_header: bool,
     /// Unauthenticated probes carry uptime, capacity, queues and startup
     /// warnings only while no API key protects the server (loopback, the
     /// desktop app, development); a keyed server keeps them on its keyed
@@ -492,6 +530,10 @@ pub(crate) struct ServerTuning {
     pub(crate) voice_ws_outbound_audio_bytes: usize,
     pub(crate) voice_ws_outbound_audio_ms: u64,
     pub(crate) batch_worker_heartbeat_stale_ms: u64,
+    pub(crate) files_max_bytes: u64,
+    pub(crate) batch_max_requests: usize,
+    /// `None` leaves `/v1/batches` completion webhooks off.
+    pub(crate) batch_webhook: Option<WebhookPolicy>,
     pub(crate) idempotency_limits: QuotaLimits,
     pub(crate) provider_write_limits: QuotaLimits,
     pub(crate) retention: RetentionPolicy,
@@ -634,6 +676,7 @@ impl ServerTuning {
                 loopback_published: env.flag_or("IZWI_LOOPBACK_PUBLISHED", false)?,
                 allowed_hosts: allowed_hosts(env.get("IZWI_ALLOWED_HOSTS")?.unwrap_or(""))?,
             },
+            trust_gateway_tenant_header: env.flag_or("IZWI_TRUST_GATEWAY_TENANT_HEADER", false)?,
             public_probe_details: ["IZWI_API_KEY", "IZWI_API_KEY_FILE"]
                 .iter()
                 .all(|name| env.get_os(name).is_none_or(|value| value.is_empty())),
@@ -734,6 +777,9 @@ impl ServerTuning {
             voice_ws_outbound_audio_ms: at_least(env, "IZWI_VOICE_WS_OUTBOUND_AUDIO_MS", 1, 5_000)?,
             batch_worker_heartbeat_stale_ms: secs("IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS", 5)?
                 .saturating_mul(1_000),
+            files_max_bytes: at_least(env, "IZWI_FILES_MAX_BYTES", 1, 200 * 1024 * 1024)?,
+            batch_max_requests: at_least(env, "IZWI_BATCH_MAX_REQUESTS", 1, 50_000)?,
+            batch_webhook: WebhookPolicy::from_env(env)?,
             idempotency_limits: QuotaLimits {
                 global: at_least(env, "IZWI_IDEMPOTENCY_MAX_RECORDS", 1, 1_048_576)?,
                 per_tenant: at_least(env, "IZWI_IDEMPOTENCY_MAX_RECORDS_PER_TENANT", 1, 65_536)?,

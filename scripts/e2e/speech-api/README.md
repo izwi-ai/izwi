@@ -3,7 +3,8 @@
 Stock OpenAI SDK clients, and SGLang-Omni/vLLM-Omni style socket clients, against a
 running izwi-server. These checks cover `/v1/audio/speech` (every format, plus chunked
 `audio` and SSE streams), model aliases, the outcome lookup, `/v1/audio/translations`,
-voices and consents, batch, and the `/v1/audio/speech/stream` socket.
+voices and consents, batch, the `/v1/audio/speech/stream` socket, and the Files and
+Batch APIs (`client.files`, `client.batches`).
 
 ## Run a server
 
@@ -55,6 +56,9 @@ There, `whisper-1` would load Granite Speech beside the voice stack.
 | 10 | Socket (sglang-omni dialect) closes after `session.done`; `input.cancel` ends the utterance (vllm-omni dialect) |
 | 11 | openai-node: `speech.create` returns MP3 bytes and `translations.create` returns an object (JSON Content-Type) |
 | 12 | SGLang-Omni's voice upload as its docs send it (`audio_sample`, free-text `consent`), `names_only`, speech by the uploaded name, delete by name |
+| 13 | `files.create/retrieve/list/content/delete` round-trip a `batch` file; a deleted file is a 404 and purpose `assistants` a 400 |
+| 14 | `batches.create(endpoint="/v1/audio/transcriptions")`: one line names its audio by `file_id`, one carries `audio_base64` with `verbose_json`, one names an unknown model; the batch is `completed` with counts 3/2/1, the output file in input order and the refused line in the error file |
+| 15 | `batches.create(endpoint="/v1/audio/speech")`: each line's `audio_file_id` is a decodable MP3 named `<custom_id>.mp3`; a duplicate `custom_id` and `stream: true` fail a batch with line errors; `batches.cancel` ends `cancelled` |
 
 ## openai-node
 

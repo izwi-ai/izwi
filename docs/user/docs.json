@@ -86,6 +86,7 @@
         "root": "features/index",
         "pages": [
           "features/voice",
+          "features/telephony",
           "features/chat",
           "features/transcription",
           "features/speaker-attributed-asr",
@@ -155,6 +156,7 @@
         "icon": "book-open",
         "pages": [
           "api",
+          "realtime-and-batch",
           "troubleshooting"
         ]
       }

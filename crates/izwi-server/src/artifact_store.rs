@@ -72,6 +72,17 @@ impl ArtifactTenant {
     }
 }
 
+impl ArtifactTenant {
+    /// The scheduling key `from_scheduling_key` made this tenant from:
+    /// `None` for the anonymous local tenant, and for any tenant not made
+    /// from a key.
+    pub(crate) fn scheduling_key(&self) -> Option<[u8; 32]> {
+        let mut key = [0u8; 32];
+        hex::decode_to_slice(&self.0, &mut key).ok()?;
+        Some(key)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ArtifactId(String);
@@ -405,6 +416,26 @@ impl ArtifactStore {
         write: ArtifactWrite,
     ) -> Result<ArtifactDescriptor, ArtifactStoreError> {
         let stored = self.store_reserved_write(tenant, write).await?;
+        self.publish_opaque(tenant, stored).await
+    }
+
+    /// `put` for an object already on disk: the provider copies the file, so
+    /// its bytes never sit in memory. The Files API stores uploads and batch
+    /// output this way.
+    pub(crate) async fn put_file(
+        &self,
+        tenant: &ArtifactTenant,
+        write: ArtifactFileWrite,
+    ) -> Result<ArtifactDescriptor, ArtifactStoreError> {
+        let stored = self.store_reserved_file(tenant, write).await?;
+        self.publish_opaque(tenant, stored).await
+    }
+
+    async fn publish_opaque(
+        &self,
+        tenant: &ArtifactTenant,
+        stored: StoredReservedArtifact,
+    ) -> Result<ArtifactDescriptor, ArtifactStoreError> {
         let asset = match self
             .metadata
             .publish_reserved_opaque_artifact(

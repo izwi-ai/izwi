@@ -529,6 +529,9 @@ impl RuntimeService {
             recompute_preemptions_total: batch.recompute_preemptions_total,
             claim_deadlock_aborts_total: batch.claim_deadlock_aborts_total,
             kv_blocked_requests: batch.kv_blocked_requests,
+            realtime_reserve_deferrals_total: batch.realtime_reserve_deferrals_total,
+            asr_encoder_live_yields_total: batch.asr_encoder_live_yields_total,
+            stream_pacing_transitions_total: batch.stream_pacing_transitions_total,
             continuous_envelope_scalar_fallbacks_total: batch
                 .continuous_envelope_scalar_fallbacks_total,
             physical_execution: batch.physical_execution,
@@ -812,6 +815,21 @@ impl RuntimeService {
         );
         push_engine_metric(
             payload,
+            ENGINE_SCHEDULER_RESERVE_DEFERRALS_TOTAL,
+            snapshot.realtime_reserve_deferrals_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_ASR_ENCODER_LIVE_YIELDS_TOTAL,
+            snapshot.asr_encoder_live_yields_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_SCHEDULER_STREAM_PACING_TRANSITIONS_TOTAL,
+            snapshot.stream_pacing_transitions_total,
+        );
+        push_engine_metric(
+            payload,
             ENGINE_EXECUTOR_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS_TOTAL,
             snapshot.continuous_envelope_scalar_fallbacks_total,
         );
@@ -889,6 +907,12 @@ impl RuntimeService {
 izwi_inference_coordinator_capacity {}\n\
 # TYPE izwi_inference_coordinator_active_jobs gauge\n\
 izwi_inference_coordinator_active_jobs {}\n\
+# TYPE izwi_inference_coordinator_queue_capacity gauge\n\
+izwi_inference_coordinator_queue_capacity{{pool=\"general\"}} {}\n\
+izwi_inference_coordinator_queue_capacity{{pool=\"realtime\"}} {}\n\
+# TYPE izwi_inference_coordinator_queue_depth gauge\n\
+izwi_inference_coordinator_queue_depth{{pool=\"general\"}} {}\n\
+izwi_inference_coordinator_queue_depth{{pool=\"realtime\"}} {}\n\
 # TYPE izwi_inference_coordinator_active_executions gauge\n\
 izwi_inference_coordinator_active_executions {}\n\
 # TYPE izwi_inference_coordinator_reserved_memory_bytes gauge\n\
@@ -917,6 +941,10 @@ izwi_inference_coordinator_draining {}\n\
 izwi_inference_coordinator_poisoned {}\n",
             snapshot.capacity,
             snapshot.active_jobs,
+            snapshot.queue_capacity,
+            snapshot.realtime_queue_capacity,
+            snapshot.queued_jobs,
+            snapshot.realtime_queued_jobs,
             snapshot.active_executions,
             snapshot.reserved_memory_bytes,
             snapshot.reserved_host_memory_bytes,
@@ -964,6 +992,14 @@ izwi_inference_coordinator_poisoned {}\n",
         elapsed: std::time::Duration,
     ) {
         self.telemetry.record_voice_latency(latency, elapsed);
+    }
+
+    pub(crate) fn record_tts_first_audio(&self, labels: &[&str; 3], seconds: f64) {
+        self.telemetry.record_tts_first_audio(labels, seconds);
+    }
+
+    pub(crate) fn record_tts_output_audio(&self, labels: &[&str; 3], seconds: f64) {
+        self.telemetry.record_tts_output_audio(labels, seconds);
     }
 
     pub fn record_voice_egress_underrun(&self) {

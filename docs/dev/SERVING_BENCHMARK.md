@@ -120,7 +120,8 @@ point and stores the deltas under `server_metrics[<url>]`:
 - `histograms`: every histogram series that moved, with count, mean and
   p50/p90/p99 from the bucket deltas (Prometheus `histogram_quantile`
   semantics, in the metric's own unit). This includes
-  `izwi_request_ttft_seconds`, `izwi_request_queue_wait_seconds`,
+  `izwi_request_ttft_seconds`, `izwi_request_queue_wait_seconds` (one series
+  per `workload_class`), `izwi_tts_first_audio_seconds`,
   `izwi_engine_inter_token_latency_seconds`, and the gateway's
   `izwi_gateway_chat_*` families.
 - `counters`: every `_total` counter that moved.

@@ -563,6 +563,22 @@ impl EngineCore {
         self.scheduler.lanes_with_work()
     }
 
+    /// See [`super::super::scheduler::Scheduler::live_demand_board`].
+    pub(in crate::engine) fn live_demand_board(
+        &self,
+    ) -> std::sync::Arc<super::super::scheduler::LiveDemandBoard> {
+        self.scheduler.live_demand_board()
+    }
+
+    /// See [`super::super::scheduler::Scheduler::reserved_admission_limit`].
+    pub(in crate::engine) fn reserved_admission_limit(
+        &self,
+        model_variant: crate::model::ModelVariant,
+    ) -> Option<usize> {
+        self.scheduler
+            .reserved_admission_limit(model_variant, std::time::Instant::now())
+    }
+
     /// The execution lane of a tracked request.
     pub(super) fn request_lane(&self, request_id: &RequestId) -> ExecutionLane {
         self.requests

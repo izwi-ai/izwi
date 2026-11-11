@@ -446,6 +446,12 @@ fn realtime_noise_gate(variant: ModelVariant) -> Option<izwi_vad::NoiseGate> {
     })
 }
 
+/// Whether `variant` transcribes audio as it arrives, through a realtime
+/// stream, rather than a recording at a time.
+pub fn asr_streams_live(variant: ModelVariant) -> bool {
+    capability_row(CapabilityKind::RealtimeAsr, variant).is_some()
+}
+
 fn resolve_asr_realtime_stream_variant(model_id: Option<&str>) -> Option<ModelVariant> {
     let variant = resolve_asr_model_variant(model_id);
     capability_row(CapabilityKind::RealtimeAsr, variant).map(|_| variant)

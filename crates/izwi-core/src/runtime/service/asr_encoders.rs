@@ -127,7 +127,36 @@ pub(super) struct ParakeetEncoderQueueKey {
 pub(super) struct ParakeetEncoderBatcher {
     pub(super) coordinator: Arc<InferenceCoordinator>,
     pub(super) formation: EncoderBatchFormation<ParakeetEncoderQueueKey, ParakeetEncoderPending>,
+    /// The engine's live demand per model, which a long batch row checks
+    /// between its window groups.
+    pub(super) live_demand: Arc<crate::engine::LiveDemandBoard>,
 }
+
+/// A row waiting for an encoder batch.
+pub(super) trait EncoderBatchRow {
+    /// The workload class of the row's request, which orders the rows of a
+    /// queue longer than one batch.
+    fn workload_class(&self) -> WorkloadClass;
+}
+
+macro_rules! encoder_batch_row {
+    ($($pending:ty),+ $(,)?) => {$(
+        impl EncoderBatchRow for $pending {
+            fn workload_class(&self) -> WorkloadClass {
+                self.job.spec.workload_class
+            }
+        }
+    )+};
+}
+
+encoder_batch_row!(
+    QwenAsrEncoderPending,
+    WhisperEncoderPending,
+    ParakeetEncoderPending,
+    NemotronEncoderPending,
+    GraniteSpeechEncoderPending,
+    GraniteSpeech5EncoderPending,
+);
 
 /// Forms one encoder's cross-request batches with at most one batch in
 /// flight per key. Rows that arrive while their key's batch runs wait, and
@@ -135,12 +164,17 @@ pub(super) struct ParakeetEncoderBatcher {
 /// staggered still batch under load. Every batched encoder here forms its
 /// batches this way; a queue drained one yield after its first row (the
 /// older shape) runs each row as a batch of one behind a busy device.
+///
+/// When more rows wait than one batch holds, the batch takes the rows of
+/// the heaviest workload classes, oldest first within a class, so a live
+/// request's audio is not encoded behind a backlog of batch work. Keys and
+/// widths are the same for every class, so batch shapes do not change.
 pub(super) struct EncoderBatchFormation<K, P> {
     /// A key's queue exists exactly while a runner drains it.
     queues: std::sync::Mutex<HashMap<K, VecDeque<P>>>,
 }
 
-impl<K: Eq + std::hash::Hash, P> EncoderBatchFormation<K, P> {
+impl<K: Eq + std::hash::Hash, P: EncoderBatchRow> EncoderBatchFormation<K, P> {
     pub(super) fn new() -> Self {
         Self {
             queues: std::sync::Mutex::new(HashMap::new()),
@@ -179,13 +213,13 @@ impl<K: Eq + std::hash::Hash, P> EncoderBatchFormation<K, P> {
     {
         /// A runner that unwinds drops its key's waiting rows, whose
         /// submitters then fail, and frees the key for a new runner.
-        struct Abandon<'a, K: Eq + std::hash::Hash, P> {
+        struct Abandon<'a, K: Eq + std::hash::Hash, P: EncoderBatchRow> {
             formation: &'a EncoderBatchFormation<K, P>,
             key: &'a K,
             armed: bool,
         }
 
-        impl<K: Eq + std::hash::Hash, P> Drop for Abandon<'_, K, P> {
+        impl<K: Eq + std::hash::Hash, P: EncoderBatchRow> Drop for Abandon<'_, K, P> {
             fn drop(&mut self) {
                 if self.armed {
                     let rows = self.formation.queues().remove(self.key);
@@ -215,7 +249,21 @@ impl<K: Eq + std::hash::Hash, P> EncoderBatchFormation<K, P> {
             return None;
         }
         let width = queue.len().min(max_width.max(1));
-        Some(queue.drain(..width).collect())
+        // The sort is stable, so rows of one class stay oldest first and a
+        // queue of one class yields its first `width` rows, as it always has.
+        let mut order = (0..queue.len()).collect::<Vec<_>>();
+        order.sort_by_key(|&row| std::cmp::Reverse(queue[row].workload_class().service_weight()));
+        let mut taken = order[..width].to_vec();
+        taken.sort_unstable();
+        // Removing from the back keeps the earlier indices valid; the batch
+        // holds its rows in arrival order.
+        let mut batch = taken
+            .into_iter()
+            .rev()
+            .filter_map(|row| queue.remove(row))
+            .collect::<Vec<_>>();
+        batch.reverse();
+        Some(batch)
     }
 }
 
@@ -398,10 +446,14 @@ fn parakeet_encoder_batching_enabled() -> bool {
 }
 
 impl ParakeetEncoderBatcher {
-    pub(super) fn new(coordinator: Arc<InferenceCoordinator>) -> Self {
+    pub(super) fn new(
+        coordinator: Arc<InferenceCoordinator>,
+        live_demand: Arc<crate::engine::LiveDemandBoard>,
+    ) -> Self {
         Self {
             coordinator,
             formation: EncoderBatchFormation::new(),
+            live_demand,
         }
     }
 
@@ -508,6 +560,22 @@ impl ParakeetEncoderBatcher {
         let work = WorkUnit::PreSequencePreparation {
             kind: "asr.encoder.parakeet".into(),
         };
+        // A long recording's windows encode as one device job, which a live
+        // request of the same model would wait out. A Batch or Background
+        // row therefore ends its job after a window group while the model
+        // has live demand, and encodes the next group in a new job. The
+        // groups and the artifact are those of the single job.
+        let yields_to_live_demand = match (&rows[..], contract.adapter_binding()) {
+            ([row], Ok(binding)) if !row.features.single_window() => {
+                let live_demand = self.live_demand.clone();
+                let lane = Some(binding.model_instance_id);
+                let workload_class = row.job.spec.workload_class;
+                Some(move || live_demand.batch_work_yields(lane, workload_class, Instant::now()))
+            }
+            _ => None,
+        };
+        let mut windowed_encode = ParakeetWindowedEncode::default();
+        let mut first_job = true;
         // The host stage recorded the request bytes plus its log-mel
         // features, which the encode consumes; each row's commit records
         // only what its artifact keeps (request bytes and the encoder
@@ -568,8 +636,13 @@ impl ParakeetEncoderBatcher {
         }
         let result = self
             .coordinator
-            .run_loaded_native_preparation_batch(sealed, contract, work, move |live| {
-                crate::engine::metrics::record_asr_preparation_batch_rows(model_label, live.len());
+            .run_loaded_native_preparation_batch_in_parts(sealed, contract, work, move |live| {
+                if std::mem::take(&mut first_job) {
+                    crate::engine::metrics::record_asr_preparation_batch_rows(
+                        model_label,
+                        live.len(),
+                    );
+                }
                 // Checked before the encode and between a long row's
                 // windows, so a disconnected or expired request fails
                 // alone and releases the device within one window.
@@ -601,18 +674,35 @@ impl ParakeetEncoderBatcher {
                     })
                     .collect::<Vec<_>>();
                 let encode_started = Instant::now();
-                let prepared = model.prepare_parakeet_encoder_batch(&rows)?;
+                let prepared = match (&yields_to_live_demand, &rows[..]) {
+                    (Some(pause), [row]) => {
+                        match model.encode_parakeet_row_in_parts(row, &mut windowed_encode, pause)
+                        {
+                            Ok(Some(artifact)) => Ok(Some(vec![Ok(artifact)])),
+                            Ok(None) => Ok(None),
+                            Err(error @ (Error::Cancelled(_) | Error::Timeout(_))) => {
+                                Ok(Some(vec![Err(error)]))
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    _ => model.prepare_parakeet_encoder_batch(&rows).map(Some),
+                }?;
                 crate::engine::metrics::record_asr_device_phase(
                     model_label,
                     crate::engine::metrics::AsrPhase::Encoder,
                     encode_started,
                 );
+                let Some(prepared) = prepared else {
+                    crate::engine::metrics::record_asr_encoder_live_yield();
+                    return Ok(PreparationStep::Yielded);
+                };
                 if prepared.len() != live.len() {
                     return Err(Error::InferenceError(
                         "Parakeet encoder batch returned the wrong row count".into(),
                     ));
                 }
-                Ok(prepared
+                let artifacts = prepared
                     .into_iter()
                     .zip(live)
                     .map(|(artifact, index)| {
@@ -632,7 +722,8 @@ impl ParakeetEncoderBatcher {
                             value: artifact,
                         })
                     })
-                    .collect::<Vec<_>>())
+                    .collect::<Vec<_>>();
+                Ok(PreparationStep::Complete(artifacts))
             })
             .await;
         match result {
@@ -1944,9 +2035,22 @@ mod tests {
 
     use tokio::sync::Notify;
 
-    use super::EncoderBatchFormation;
+    use super::{EncoderBatchFormation, EncoderBatchRow};
+    use crate::engine::WorkloadClass;
 
     type Batches = Arc<Mutex<Vec<Vec<usize>>>>;
+
+    /// Rows of the earlier tests share one class. A row from 1000 up is a
+    /// real-time request and one from 2000 up a streamed one.
+    impl EncoderBatchRow for usize {
+        fn workload_class(&self) -> WorkloadClass {
+            match *self {
+                0..1000 => WorkloadClass::Batch,
+                1000..2000 => WorkloadClass::Realtime,
+                _ => WorkloadClass::Streaming,
+            }
+        }
+    }
 
     /// Drains `key` with a runner whose first batch waits for `release`
     /// after signalling `started`; every batch is recorded in order.
@@ -2030,7 +2134,41 @@ mod tests {
         assert_eq!(*other.lock().unwrap(), vec![vec![100]]);
     }
 
+    /// A real-time row queued behind a backlog of batch rows is encoded in
+    /// the next batch; rows of one class keep their arrival order, and the
+    /// batch holds its rows in arrival order.
+    #[tokio::test]
+    async fn the_next_batch_takes_the_heaviest_classes_then_the_oldest_rows() {
+        let formation = Arc::new(EncoderBatchFormation::new());
+        let (started, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        assert!(formation.push(1, 0));
+        let (batches, runner) = start_runner(&formation, 1, 4, &started, &release);
+        started.notified().await;
+        for row in [1, 2, 3, 4, 5, 2000, 6, 1000, 1001] {
+            assert!(!formation.push(1, row));
+        }
+        release.notify_one();
+        runner.await.unwrap();
+        assert_eq!(
+            *batches.lock().unwrap(),
+            vec![
+                vec![0],
+                // Both real-time rows and the streamed one, then the oldest
+                // batch row.
+                vec![1, 2000, 1000, 1001],
+                vec![2, 3, 4, 5],
+                vec![6]
+            ]
+        );
+    }
+
     struct Row(Arc<AtomicUsize>);
+
+    impl EncoderBatchRow for Row {
+        fn workload_class(&self) -> WorkloadClass {
+            WorkloadClass::Online
+        }
+    }
 
     impl Drop for Row {
         fn drop(&mut self) {

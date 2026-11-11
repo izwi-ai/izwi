@@ -17,6 +17,7 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_API_KEY_FILE` | unset | Absolute path of a file holding the API key instead (a Docker or systemd secret; one trailing newline is ignored). Setting both is an error. |
 | `IZWI_ALLOW_UNAUTHENTICATED_NETWORK` | `false` | Serve a non-loopback bind without IZWI_API_KEY (same as --allow-unauthenticated-network). |
 | `IZWI_LOOPBACK_PUBLISHED` | `false` | The port is published on the host's loopback only (a container's `-p 127.0.0.1:…`): treat the bind as loopback, so no key is required and only loopback or IZWI_ALLOWED_HOSTS Host names are served. |
+| `IZWI_TRUST_GATEWAY_TENANT_HEADER` | `false` | Keep files, batches, jobs and speech lookups apart per gateway tenant: a request that carries the API key (any request when no key is set) acts for the tenant its `X-Izwi-Gateway-Tenant` header names, which an Izwi gateway sets for every caller. Anyone who can reach the server with the key can name any tenant, so enable it only where the gateway is the server's sole client. Off, the header is ignored. |
 | `IZWI_ALLOWED_HOSTS` | unset | Comma-separated extra Host names to accept (port optional). On a non-loopback bind, setting it turns the Host check on. |
 | `IZWI_PRELOAD_MODELS` | unset | Comma-separated model ids loaded at start-up; readiness waits for them. |
 | `IZWI_WARMUP_PRELOADED_MODELS` | `true` | Run a warm-up request on each preloaded model. |
@@ -26,8 +27,8 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_DESKTOP_OWNER_PIPE` | unset | `1` when the desktop app owns this process: stdin closing shuts it down. |
 | `IZWI_HTTP_SHUTDOWN_PRESTOP_SECS` | `0` | Pre-stop window at shutdown (0-60): readiness is unready while requests are still served. |
 | `IZWI_HTTP_SHUTDOWN_GRACE_SECS` | `20` | How long in-flight HTTP requests may run after the pre-stop window (1-300); open chat streams get a terminal shutting-down event shortly before it ends. |
-| `IZWI_BATCH_WORKER_CONCURRENCY` | the runtime's capacity | Durable jobs the local batch worker runs at once (at most the runtime's capacity). |
-| `IZWI_BATCH_STAGE_TIMEOUT_SECS` | 0 (none) | Wall-clock limit of one durable stage (30-86400; 0 disables). |
+| `IZWI_BATCH_WORKER_CONCURRENCY` | the runtime's capacity | Durable jobs the local batch worker runs at once, and `/v1/batches` lines in flight at once (at most the runtime's capacity). |
+| `IZWI_BATCH_STAGE_TIMEOUT_SECS` | `21600` | Wall-clock limit of one durable stage, in seconds from its start (30-86400; 0 disables). A stage is one whole job: raise it for recordings or scripts that take longer than six hours on this device. |
 | `IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS` | `20` | How long the batch worker drains at shutdown (1-300). |
 | `IZWI_MAX_REALTIME_REQUESTS` | the global request limit | Concurrent realtime-class requests. |
 | `IZWI_MAX_INTERACTIVE_REQUESTS` | the global request limit | Concurrent interactive-class requests. |
@@ -36,6 +37,7 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_MAX_BATCH_REQUESTS` | the global request limit minus one | Concurrent batch-class requests. |
 | `IZWI_MAX_BACKGROUND_REQUESTS` | the global request limit minus one | Concurrent background-class requests. |
 | `IZWI_MAX_REALTIME_SESSIONS` | `32` | Open realtime websocket sessions. |
+| `IZWI_ADMISSION_QUEUE_TIMEOUT_SECS` | `30` | How long a chat, agent or /v1/audio request waits for an admission slot before it is refused with 429 (0 waits without limit). Realtime sessions, record and durable-job routes and background work always wait. |
 | `IZWI_OPENAI_MODEL_ALIASES` | unset | OpenAI model names mapped to Izwi models for /v1/audio/*: comma-separated `name=Model`, e.g. `tts-1=Kokoro-82M,whisper-1=Parakeet-TDT-0.6B-v3`. Unmapped OpenAI names are refused. |
 | `IZWI_SPEECH_DEFAULT_FORMAT` | `wav` | The /v1/audio/speech `response_format` when a request names none (`mp3` gives OpenAI's default). |
 | `IZWI_TTS_BATCH_MAX_ITEMS` | `32` | Items one /v1/audio/speech/batch request may hold. |
@@ -55,7 +57,7 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_OPENAI_COMPAT_PROFILE` | `strict` | OpenAI compatibility profile: `strict` or `relaxed`. |
 | `IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB` | 64 (relaxed) or the strict profile's limit | Largest audio upload on the OpenAI audio and media routes, in MiB. |
 | `IZWI_MEDIA_DECODE_LANES` | `2` | Audio uploads decoded at once. |
-| `IZWI_MAX_SPEECH_REQUESTS_PER_TENANT` | the global request limit | Concurrent speech requests per tenant (at most the global limit). |
+| `IZWI_MAX_SPEECH_REQUESTS_PER_TENANT` | the global request limit | Concurrent speech requests per tenant (at most the global limit): speech and batch requests until their response ends, and open /v1/audio/speech/stream and /v1/realtime sockets. |
 | `IZWI_TTS_MAX_TEXT_BYTES` | `1048576` | Longest speech input one request may carry, in UTF-8 bytes. |
 | `IZWI_TTS_LONG_FORM_CHUNK_MAX_CHARS` | the model's segment size | Characters per long-form speech segment (clamped to 80-4000). |
 | `IZWI_FISH_LONG_FORM_ENABLED` | `true` | Allow Fish S2 requests that need more than one segment. |
@@ -79,6 +81,11 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_VOICE_WS_OUTBOUND_ITEMS` | `256` | Messages a voice websocket queues for its client. |
 | `IZWI_VOICE_WS_OUTBOUND_AUDIO_BYTES` | `4194304` | Assistant audio bytes a voice websocket queues. |
 | `IZWI_VOICE_WS_OUTBOUND_AUDIO_MS` | `5000` | Assistant audio a voice websocket queues, in milliseconds. |
+| `IZWI_FILES_MAX_BYTES` | `209715200` | Largest file `/v1/files` accepts, in bytes (at most 1 GiB). |
+| `IZWI_BATCH_MAX_REQUESTS` | `50000` | Requests one `/v1/batches` input file may hold. |
+| `IZWI_BATCH_WEBHOOK_SECRET` | unset (webhooks off) | Turns on `/v1/batches` completion webhooks (`metadata.webhook_url`) and signs each delivery (Standard Webhooks, HMAC-SHA256). A `whsec_` value is base64 of the key; any other value is the key. Unset, a batch that names a webhook is refused. |
+| `IZWI_BATCH_WEBHOOK_ALLOW_HTTP` | `false` | Allows `http://` batch webhook URLs; `https://` only otherwise. |
+| `IZWI_BATCH_WEBHOOK_ALLOW_PRIVATE` | `false` | Allows batch webhook URLs whose host resolves to a loopback, private, link-local or other non-public address. |
 | `IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS` | `5` | Heartbeat age after which readiness reports a batch worker stale. |
 | `IZWI_IDEMPOTENCY_MAX_RECORDS` | `1048576` | Live idempotency records in total. |
 | `IZWI_IDEMPOTENCY_MAX_RECORDS_PER_TENANT` | `65536` | Live idempotency records per tenant. |

@@ -744,6 +744,9 @@ fn gateway_route_label(path: &str) -> &'static str {
         "/v1/chat/completions" => "/v1/chat/completions",
         "/v1/realtime/ws" => "/v1/realtime/ws",
         "/v1/realtime" => "/v1/realtime",
+        "/v1/realtime/media-stream" => "/v1/realtime/media-stream",
+        "/v1/realtime/client_secrets" => "/v1/realtime/client_secrets",
+        "/v1/realtime/capabilities" => "/v1/realtime/capabilities",
         "/v1/speech-to-text/realtime/ws" => "/v1/speech-to-text/realtime/ws",
         "/livez" => "/livez",
         "/readyz" => "/readyz",
@@ -1485,9 +1488,34 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &GatewayServeCon
                     "/realtime",
                     get(crate::app::openai_realtime_proxy::proxy_socket),
                 )
+                .route(
+                    "/realtime/media-stream",
+                    get(crate::app::openai_realtime_proxy::proxy_media_stream),
+                )
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
                     bounded_gateway_admission,
+                )),
+        );
+        // Minting a client secret and listing capabilities are plain
+        // requests, admitted as the speech routes are.
+        inference_routes = inference_routes.merge(
+            Router::new()
+                .route(
+                    "/realtime/client_secrets",
+                    post(crate::app::openai_realtime_proxy::proxy_client_secret),
+                )
+                .route(
+                    "/realtime/capabilities",
+                    get(crate::app::openai_realtime_proxy::proxy_capabilities),
+                )
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    bounded_gateway_admission,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    tenant_pre_admission,
                 )),
         );
     }
@@ -1515,6 +1543,31 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &GatewayServeCon
                     get(proxy_http).post(proxy_http).delete(proxy_http),
                 )
                 .route("/audio/consent_phrases", get(proxy_http));
+            // Files, batches and durable jobs are records of one store too.
+            // An upload streams through to the upstream, which refuses one
+            // past its `IZWI_FILES_MAX_BYTES` with 413.
+            inference_routes = inference_routes.merge(
+                Router::new()
+                    .route("/files", get(proxy_http).post(proxy_http))
+                    .route("/files/{file_id}", get(proxy_http).delete(proxy_http))
+                    .route("/files/{file_id}/content", get(proxy_http))
+                    .route("/batches", get(proxy_http).post(proxy_http))
+                    .route("/batches/{batch_id}", get(proxy_http))
+                    .route("/batches/{batch_id}/cancel", post(proxy_http))
+                    .route("/jobs/{job_id}", get(proxy_http))
+                    .route("/jobs/{job_id}/cancel", post(proxy_http))
+                    .route("/jobs/{job_id}/retry", post(proxy_http))
+                    .route("/jobs/{job_id}/artifacts", get(proxy_http))
+                    .layer(DefaultBodyLimit::disable())
+                    .layer(middleware::from_fn_with_state(
+                        state.clone(),
+                        bounded_gateway_admission,
+                    ))
+                    .layer(middleware::from_fn_with_state(
+                        state.clone(),
+                        tenant_pre_admission,
+                    )),
+            );
         }
         // Uploads stream through to the upstream, which enforces its own
         // limits; the gateway bounds them at the largest the server takes.

@@ -28,6 +28,8 @@ When `izwi serve` is running:
 | `/v1/audio/translations`, `/v1/audio/voices*`, `/v1/audio/voice_consents*` | Stable | OpenAI-compatible translation and custom-voice routes. |
 | `/v1/audio/speech/batch`, `/v1/audio/speech/{id}`, `/v1/audio/speech/stream` | Preview | Batch speech, outcome lookup (process-local) and the text-in speech WebSocket. |
 | `/v1/audio/transcriptions` | Stable | OpenAI-compatible transcription endpoint with local streaming support. |
+| `/v1/files*` | Stable | OpenAI-compatible Files API for batch input, audio and output. |
+| `/v1/batches*` | Stable | OpenAI-compatible Batch API over the audio transcription, translation and speech routes. |
 | `/livez`, `/readyz`, `/v1/live`, `/v1/ready`, `/v1/health` | Stable | Operational health and readiness endpoints. |
 | `/v1/responses*` | Preview | OpenAI-compatible Responses API shape with process-local response retention. |
 | First-party workflow routes | Preview | Persisted local product APIs used by the web UI and desktop app. |
@@ -37,6 +39,7 @@ When `izwi serve` is running:
 | `/v1/admin/*` | Preview | Local model-management APIs. Bind carefully on shared hosts. |
 | WebSocket realtime routes | Preview | Browser-facing low-latency protocols that may evolve. |
 | `/v1/realtime`, `/v1/realtime/client_secrets` | Preview | OpenAI Realtime API (GA) over WebSocket, served by local models. |
+| `/v1/realtime/media-stream` | Preview | A phone call as a telephony media stream, run as a `/v1/realtime` session. |
 | `/internal/*` aliases | Internal | Compatibility aliases for tooling. Prefer `/v1/*` or root probes where available. |
 
 ## Common Conventions
@@ -79,7 +82,8 @@ JSON errors use OpenAI's envelope:
 | `409` | `invalid_request_error` | `conflict` | The resource is in use, for example unloading a model that is serving requests. |
 | `413` | `invalid_request_error` | `payload_too_large` | The body or an input exceeded a size limit. |
 | `415` | `invalid_request_error` | `unsupported_media_type` | The endpoint expected JSON or multipart content but received another content type (writes with `text/plain` or form-encoded bodies are always rejected). |
-| `429` | `rate_limit_error` | `rate_limit_exceeded` | A rate, quota or admission limit was reached. |
+| `429` | `rate_limit_error` | `rate_limit_exceeded` | A rate, quota or admission limit was reached, or the server stayed at capacity for the whole admission queue timeout (`IZWI_ADMISSION_QUEUE_TIMEOUT_SECS`). These responses carry a `Retry-After` header. |
+| `429` | `rate_limit_error` | `resource_unavailable` | A `flex` (batch-class) request found no free capacity within the admission queue timeout. The message starts with `Resource Unavailable`, as OpenAI's flex answer does. Retry later, or send the request at the default tier. |
 | `499` | `server_error` | `cancelled` | The request was cancelled. |
 | `500` | `server_error` | `server_error` | Runtime, model, storage or server failure. |
 | `502` | `server_error` | `bad_gateway` | Gateway only: a worker's answer could not be used. |
@@ -140,8 +144,15 @@ Some older list routes return arrays or route-specific wrapper names. The route 
 |---------|---------|-------|
 | `--max-concurrent` | `100` | Maximum concurrent runtime requests. |
 | `--timeout` | `300` seconds | Request timeout for regular HTTP routes. Long ASR streaming avoids a hard wall-clock cutoff while active. |
+| `IZWI_ADMISSION_QUEUE_TIMEOUT_SECS` | `30` seconds | How long a chat, agent or `/v1/audio/*` request waits for an admission slot when the server is at capacity, before it is refused with `429`. `0` waits without limit. Realtime sessions, the first-party record and job routes and background work always wait. |
 | `IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB` | `25` strict, `64` relaxed | Upload limit for OpenAI audio routes. |
 | First-party audio upload limit | `64 MiB` | Applies to persisted transcription, diarization, TTS, voice design, voice clone, and saved voice creation routes. |
+| `IZWI_FILES_MAX_BYTES` | `209715200` (200 MB) | Largest file `/v1/files` accepts, at most 1 GiB. A larger upload is refused with `413`. |
+| `IZWI_BATCH_MAX_REQUESTS` | `50000` | Requests one `/v1/batches` input file may hold. A larger file fails its batch. |
+| `IZWI_BATCH_WORKER_CONCURRENCY` | The runtime's capacity | `/v1/batches` lines in flight at once, and durable jobs the batch worker runs at once. |
+| `IZWI_BATCH_STAGE_TIMEOUT_SECS` | `21600` (six hours) | Wall-clock limit of one durable job stage, from its start (30 to 86400). `0` disables it. |
+| `IZWI_BATCH_WEBHOOK_SECRET` | Unset (webhooks off) | Turns on `/v1/batches` completion webhooks and signs each delivery. See [Batch API](#batch-api). |
+| `IZWI_BATCH_WEBHOOK_ALLOW_HTTP`, `IZWI_BATCH_WEBHOOK_ALLOW_PRIVATE` | `false` | Allow `http://` webhook URLs, and webhook hosts on loopback, private or link-local addresses. |
 | `IZWI_AUDIO_STREAM_EVENT_QUEUE_CAPACITY` | `32` | Buffered SSE audio events for `/v1/audio/speech`. |
 | `IZWI_MAX_RESPONSE_STORE_ENTRIES` | `512` | Process-local `/v1/responses` retention cap. |
 | `IZWI_MAX_AGENT_SESSION_STORE_ENTRIES` | `512` | Process-local agent session metadata cap. |
@@ -346,6 +357,53 @@ Multimodal content parts:
 
 Image and video inputs are validated against the selected model. Text-only chat models reject media parts.
 
+### Audio Service Tier
+
+`POST /v1/audio/speech`, `/v1/audio/speech/batch`, `/v1/audio/transcriptions`
+and `/v1/audio/translations` take OpenAI's `service_tier`. OpenAI defines the
+field for Chat Completions and Responses; on the audio routes it is an Izwi
+extension with the same values:
+
+| `service_tier` | Served as | Effect |
+|----------------|-----------|--------|
+| `flex` | `flex` | The request runs as batch work: it is admitted and scheduled behind interactive and streaming requests. Use it for recordings and bulk synthesis that need not answer at once. `stream` and `stream_format` still work. |
+| `default`, `auto`, or absent | `default` | The route's own class: interactive for a whole-file answer, streaming for SSE and chunked audio. On `/v1/audio/speech/batch` an absent tier is `flex`. |
+| `priority` | `default` | Accepted for compatibility and served as `default`. |
+
+Any other value returns `400` with `param: "service_tier"`.
+
+When the server is at capacity a request waits for an admission slot for up
+to `IZWI_ADMISSION_QUEUE_TIMEOUT_SECS` (30 seconds) and is then refused with
+`429` and a `Retry-After` header, before any stream starts. A `default`
+request gets code `rate_limit_exceeded`; a `flex` request gets code
+`resource_unavailable` and a message starting `Resource Unavailable`, as
+OpenAI's flex tier does, so a client can retry later or fall back to
+`default`. In a batch each refused item carries the error in its result.
+
+Send it as the `service_tier` field of a JSON body or multipart form. A
+client that cannot add a form field sends the `X-Izwi-Service-Tier` request
+header instead; when both are present the body field wins.
+
+The gateway's speech pass-through relays the field and the header to the
+izwi-server unchanged.
+
+[Real-time and batch workloads](/realtime-and-batch) covers which route to
+use for which workload, how the server keeps capacity for live traffic
+beside batch work, and the settings and metrics involved.
+
+Every response names the tier that served it in the `X-Izwi-Service-Tier`
+response header, binary audio, text, SRT and VTT included. When the request
+named a tier, JSON bodies and the final SSE event (`transcript.text.done`,
+`audio.done`) also carry `"service_tier": "flex"` or `"default"`; a request
+that names none gets the bodies it always has.
+
+```bash
+curl -X POST http://localhost:8080/v1/audio/transcriptions \
+  -F "file=@recording.wav" \
+  -F "model=Parakeet-TDT-0.6B-v3" \
+  -F "service_tier=flex"
+```
+
 ### Audio Speech
 
 `POST /v1/audio/speech`
@@ -386,6 +444,7 @@ Request fields:
 | `saved_voice_id` | Server-side saved voice reference to reuse. |
 | `references` | Izwi extension, for models that voice several speakers (`speech_capabilities.supports_speaker_dialogue`: `FishAudio-Drama-3`). Reference voices per speaker, each `{speaker, audio, text}` or `{speaker, saved_voice_id}`; it replaces `reference_audio`, `reference_text` and `saved_voice_id`. See the Drama 3 dialogue notes below. |
 | `script` | Izwi extension, for the same models. A dialogue as `[{speaker, text}]` lines, instead of `input`. |
+| `service_tier` | Optional `flex`, `default`, `auto` or `priority`; see [Audio Service Tier](#audio-service-tier). |
 | `stream`, `stream_format` | `stream_format: "audio"` sends the encoded file as a chunked body while it is generated (OpenAI's streaming). `stream_format: "sse"` or `stream: true` sends server-sent events whose deltas are base64 slices of the same bytes. Without either, the whole file arrives after generation, with `Content-Length` and statistics headers. Text one request cannot speak streams as consecutive long-form segments, as a final-only request splits it. |
 
 `exaggeration`, `cfg_weight` and `min_p` are also accepted by the speech
@@ -657,6 +716,7 @@ Non-stream response:
 - `Content-Type` is the format's: `audio/mpeg`, `audio/ogg` (Opus), `audio/flac`, `audio/wav`, `audio/pcm` (`pcm`), `application/octet-stream` (`pcm_i16`, `pcm_f32`).
 - `X-Audio-Sample-Rate` is the rate the audio plays at; `X-Izwi-Speech-Id` names the request for `GET /v1/audio/speech/{speech_id}`.
 - `X-Requested-Response-Format` and `X-Actual-Response-Format` are exposed. Explicit fallbacks also include `X-Response-Format-Fallback` and an HTTP `Warning` header.
+- `X-Izwi-Service-Tier` is the tier that served the request (see [Audio Service Tier](#audio-service-tier)), in every delivery.
 
 `stream_format: "audio"` response: the same bytes as a chunked body. Headers
 (`Content-Type`, `X-Audio-Sample-Rate`, `X-Izwi-Speech-Id` and its alias
@@ -672,7 +732,7 @@ SSE events (each is also an OpenAI event, by its `type`):
 |-------|--------|--------|
 | `audio.started` | | `request_id`, `sample_rate` (output), `audio_format`, optional explicit fallback note in `error`. |
 | `audio.chunk` | `speech.audio.delta` | `audio` and `audio_base64` (base64 of the next encoded bytes: concatenated, the deltas are one file), `request_id`, `sequence`, `sample_count`, `is_final`, `sample_rate`. |
-| `audio.done` | `speech.audio.done` | `usage` (`input_tokens`, which Izwi reports as 0; `output_tokens`; `total_tokens`), `tokens_generated`, `generation_time_ms`, `audio_duration_secs`, `rtf`, `stop_reason`, `timing`. |
+| `audio.done` | `speech.audio.done` | `usage` (`input_tokens`, which Izwi reports as 0; `output_tokens`; `total_tokens`), `tokens_generated`, `generation_time_ms`, `audio_duration_secs`, `rtf`, `stop_reason`, `timing`, and `service_tier` when the request named one. |
 | `audio.failed` | `error` | `request_id`, `error`. |
 
 Example SSE request:
@@ -729,7 +789,12 @@ object, with `param` prefixed `items.<i>.`:
 
 Items run `IZWI_TTS_BATCH_CONCURRENCY` (8) at a time, each admitted on its
 own. An empty `items`, too many items, or `stream`/`stream_format` anywhere
-fails the whole request with `400`. Items whose audio would pass
+fails the whole request with `400`. `service_tier` (see
+[Audio Service Tier](#audio-service-tier)) is a top-level field that applies
+to every item; inside an item it returns `400`. A batch runs as batch work
+(`flex`) unless it says otherwise: send `"service_tier": "default"` to run
+its items in the interactive class, as before the tier existed. The response
+carries `service_tier` when the request named one. Items whose audio would pass
 `IZWI_TTS_BATCH_MAX_OUTPUT_MB` (256) fail with `413`-class errors.
 
 ### Audio Speech Stream
@@ -838,11 +903,14 @@ Multipart fields:
 | `speaker_labels` | Izwi extension. `true` asks a model that tags speakers (`Nemotron-3.5-Transcribe-30B-A4B-FP8`) to label them; others return `400`. Multipart takes `true`/`false` (or `1`/`0`, `yes`/`no`, `on`/`off`), JSON a boolean. The speaker turns come back in `verbose_json` as `speaker_turns` (below); `text` stays untagged. It cannot be combined with `target_language`, and naming a language the model does not label speakers in returns `400`. |
 | `response_format` | `json`, `verbose_json`, `text`, `srt`, or `vtt`. Default `json`. |
 | `stream` | `true`, `1`, `yes`, or `on` enables SSE. |
+| `service_tier` | Optional `flex`, `default`, `auto` or `priority`; see [Audio Service Tier](#audio-service-tier). `json` and `verbose_json` answers and the `transcript.text.done` event carry the tier served when it is set. |
 | `timestamp_granularities[]` | Optional `word`, `segment`, or both. Requires `response_format=verbose_json`; model-provided timestamps are used before forced alignment fallback (Parakeet reports word times from its TDT decoder; `Granite-Speech-4.1-2B-Plus` runs its native timestamp mode; `Nemotron-3.5-Transcribe-30B-A4B-FP8` times words with its own CTC head; base Granite text is timed by the aligner). Without it, `verbose_json` returns `segments` only, as OpenAI does. |
 | `aligner_model` | Optional forced-aligner model for timestamp generation. Defaults to `Qwen3-ForcedAligner-0.6B`. |
 | `prompt` | Optional ASR prompt/context. Granite Speech uses it only when it is a Granite instruction (it starts with `<|audio|>`, `transcribe the speech`, `can you transcribe`, `translate the speech`, `Speaker attribution:` or `Timestamps:`; 5.0 also takes `The speech is in`) or `keywords: a, b` for keyword biasing; other text is ignored and reported as `prompt_ignored` in the diagnostics. LFM3 Audio ignores it. For `Nemotron-3.5-Transcribe-30B-A4B-FP8` it replaces the model's instruction entirely (tags removed, at most 4,000 characters), so combining it with `target_language`, `keywords` or `speaker_labels` returns `400`. |
 | `max_tokens` | Optional ASR decoder token budget. |
-| `temperature` | Accepted for compatibility; currently ignored by native ASR models. |
+| `temperature` | `0` to `1`; a value outside that range returns `400`. It does not change the transcript: no ASR model samples its output. Whisper Large v3 Turbo decodes greedily and retries a window at higher temperatures only when its own quality checks fail, which is what OpenAI documents for `0`; Parakeet, Qwen3-ASR, Granite Speech, Nemotron 3.5 Transcribe, VibeVoice-ASR, Voxtral and the LFM audio models always take the most likely token. |
+| `chunking_strategy` | `"auto"` or omitted: the server splits long audio itself, at pauses near `IZWI_ASR_CHUNK_TARGET_SECS` (see the notes below for models that read a recording in one pass). The `{"type": "server_vad", …}` object returns `400` (`unsupported_parameter`): chunking is set per server, not per request. Multipart sends `auto` or the object as JSON text. |
+| `include[]` | `logprobs` returns `400` (`unsupported_parameter`): no model returns token log-probabilities. Any other value returns `400`. JSON takes `include` as an array. |
 
 `LFM3-Audio-2B-GGUF` and `LFM3-Audio-2B-Q8_0-GGUF` produce no word timestamps
 of their own, so `timestamp_granularities[]` falls back to the forced aligner.
@@ -918,7 +986,7 @@ SSE events:
 | Type | Fields |
 |------|--------|
 | `transcript.text.delta` | `delta` |
-| `transcript.text.done` | `text`, `language`, `audio_duration_secs` |
+| `transcript.text.done` | `text`, `language`, `audio_duration_secs`, and `service_tier` when the request named one |
 | `error` | `error.message` |
 
 Example multipart request:
@@ -942,12 +1010,15 @@ Multipart (or JSON with `audio_base64`):
 
 - `file` and `model`, both required. `model` may be an
   `IZWI_OPENAI_MODEL_ALIASES` name such as `whisper-1`.
-- `prompt` and `temperature`.
+- `prompt` and `temperature` (`0` to `1`, without effect, as for
+  transcriptions).
 - `response_format`: `json`, `text`, `srt`, `verbose_json` or `vtt`.
 - `language`: a hint for the source language.
 - `to_language` or `target_language`: the target. English unless set; a
   model that translates out of English takes others.
 - `stream`: `transcript.text.delta` and `transcript.text.done` events.
+- `service_tier`: as on transcriptions (see
+  [Audio Service Tier](#audio-service-tier)).
 
 `verbose_json` carries `"task": "translate"`. Translations have no word
 timestamps.
@@ -1007,6 +1078,241 @@ curl -X POST http://localhost:8080/v1/audio/align \
   -F "text=Hello world" \
   -F "model=Qwen3-ForcedAligner-0.6B" \
   -F "response_format=verbose_json"
+```
+
+### Files
+
+OpenAI's Files API, so the stock SDK's `client.files` calls work unchanged.
+Files hold what the Batch API reads and writes.
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `POST` | `/v1/files` | Multipart `file` and `purpose`. Returns `{"id": "file-…", "object": "file", "bytes", "created_at", "filename", "purpose"}`. |
+| `GET` | `/v1/files` | `purpose`, `limit` (1 to 10000), `after` and `order` (`asc` or `desc`, default `desc`). Returns `{"object": "list", "data", "has_more", "first_id", "last_id"}`. |
+| `GET` | `/v1/files/{file_id}` | The file's metadata. |
+| `GET` | `/v1/files/{file_id}/content` | The file's bytes. |
+| `DELETE` | `/v1/files/{file_id}` | Returns `{"id", "object": "file", "deleted": true}`. |
+
+| Purpose | Written by | Holds |
+|---------|-----------|-------|
+| `batch` | Client | A batch's JSONL input. Lines are checked when the batch is created, not at upload. |
+| `user_data` | Client | Audio a batch line names by `file_id`. |
+| `batch_output` | Server | A batch's output, error and audio files. They carry `expires_at` and are deleted 30 days after creation. |
+
+Any other purpose is refused with `400`. An upload may be at most
+`IZWI_FILES_MAX_BYTES` (200 MB by default); a larger one is refused with
+`413`. Uploads are kept until deleted, and survive a restart. A file is
+visible only to the principal that created it; anyone else gets `404`.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="not-needed")
+uploaded = client.files.create(file=open("requests.jsonl", "rb"), purpose="batch")
+print(client.files.retrieve(uploaded.id).bytes)
+print(client.files.content(uploaded.id).text)
+client.files.delete(uploaded.id)
+```
+
+### Batch API
+
+OpenAI's Batch API, so the stock SDK's `client.batches` calls work
+unchanged. A batch runs the requests of an uploaded JSONL file against one
+endpoint as batch work, which yields to interactive and real-time requests,
+and writes the results to an output file within 24 hours.
+
+OpenAI batches chat, embeddings and image requests. Izwi batches the audio
+routes instead, in the same shape (an Izwi extension):
+
+- `/v1/audio/transcriptions`
+- `/v1/audio/translations`
+- `/v1/audio/speech`
+
+Any other `endpoint` is refused with `400`. `/v1/audio/speech/batch` stays
+for small sets answered in one response.
+[Real-time and batch workloads](/realtime-and-batch) compares the bulk
+routes and explains how batch work shares a server with live traffic.
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `POST` | `/v1/batches` | JSON `input_file_id` (a file of purpose `batch`), `endpoint`, `completion_window` (`"24h"` only) and optional `metadata` (up to 16 string pairs). Returns the batch, `validating`. |
+| `GET` | `/v1/batches` | `after`, `limit` (1 to 100, default 20), newest first. Returns `{"object": "list", "data", "first_id", "last_id", "has_more"}`. |
+| `GET` | `/v1/batches/{batch_id}` | The batch. |
+| `POST` | `/v1/batches/{batch_id}/cancel` | Cancels a batch that is `validating` or `in_progress`. Lines in flight stop, and the batch ends `cancelled` with the results of the lines that finished. A batch that is `finalizing` or has ended is a `409`. |
+
+The batch object is OpenAI's: `id` (`batch_…`), `object`, `endpoint`,
+`errors`, `input_file_id`, `completion_window`, `status`, `output_file_id`,
+`error_file_id`, `created_at`, `in_progress_at`, `expires_at`,
+`finalizing_at`, `completed_at`, `failed_at`, `expired_at`, `cancelling_at`,
+`cancelled_at`, `request_counts` (`total`, `completed`, `failed`) and
+`metadata`. Statuses are `validating`, `failed`, `in_progress`, `finalizing`,
+`completed`, `expired`, `cancelling` and `cancelled`.
+
+**Input.** One request per line, at most `IZWI_BATCH_MAX_REQUESTS` (50,000)
+lines in a file of at most `IZWI_FILES_MAX_BYTES` (200 MB):
+
+```json
+{"custom_id": "call-1", "method": "POST", "url": "/v1/audio/transcriptions", "body": {"model": "Parakeet-TDT-0.6B-v3", "file_id": "file-abc123"}}
+```
+
+`custom_id` is required and unique in the file, `method` is `POST`, and
+`url` is the batch's endpoint. `body` is the JSON body the synchronous route
+takes, with these differences:
+
+- A transcription or translation line names its audio by `file_id`, a file
+  uploaded with purpose `user_data`, or carries it as `audio_base64`. Use
+  `file_id` for anything but short clips: a line holds at most one upload's
+  worth of audio (`IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB`).
+- `stream` and `stream_format` are refused.
+- `service_tier` is ignored. Every line runs as batch work.
+
+A file that breaks these rules fails the batch: its status becomes `failed`
+and `errors.data` lists up to 100 entries of `{"code", "message", "param",
+"line"}` (`invalid_json_line`, `missing_custom_id`, `duplicate_custom_id`,
+`invalid_method`, `invalid_url`, `invalid_body`, `streaming_not_supported`,
+`line_too_long`, `too_many_requests`, `empty_file`,
+`input_file_not_found`). What a body asks for is checked when its line runs,
+by the route's own code, and a line the route refuses fails alone.
+
+**Output.** When the batch ends, `output_file_id` names a JSONL file with one
+line per request that was served, in input order:
+
+```json
+{"id": "batch_req_…", "custom_id": "call-1", "response": {"status_code": 200, "request_id": "batch_req_…", "body": {"text": "…"}}, "error": null}
+```
+
+- For a transcription or translation line, `response.body` is the JSON the
+  synchronous route returns for the line's `response_format` (`json` or
+  `verbose_json`). A text format (`text`, `srt`, `vtt`) is wrapped as
+  `{"text": "…"}`.
+- For a speech line, the audio is written to its own file, named
+  `<custom_id>.<format>`, and `response.body` is `{"audio_file_id":
+  "file-…", "format": "mp3", "bytes": 12345}` (an Izwi extension). Download
+  it with `GET /v1/files/{audio_file_id}/content`.
+
+`error_file_id` names a file of the same shape for the requests that failed:
+`response` carries the route's error status and error body, and `error` its
+`{"code", "message"}`. Either id is null when the file would be empty. Output,
+error and audio files have purpose `batch_output` and are deleted 30 days
+after they are written.
+
+**Lifecycle.** A batch survives a restart: lines that finished are not run
+again, and the rest resume. A line refused for capacity (`429`, `503`) is
+run again rather than failed. At `expires_at`, 24 hours after creation,
+lines still running are stopped, the results so far are written, and the
+batch becomes `expired`. Requests that were cancelled or ran out of time
+appear in neither file; `request_counts` tells how many there were. A
+server runs four batches at a time and the rest wait their turn; the lines
+in flight across them are bounded by `IZWI_BATCH_WORKER_CONCURRENCY`. A
+batch, like its files, is visible only to the principal that created it.
+
+Lines do not run in input order. Transcription and translation lines are
+read up to 1,024 at a time and run longest audio first within that window,
+judged by the size of the file a line names or of the audio it carries, so
+that recordings of similar length are batched together on the model. Speech
+lines run in input order. The output file is in input order either way.
+
+**Completion webhook.** A batch created with `metadata.webhook_url` has an
+event posted to that URL when it ends (an Izwi extension; the event and its
+signature follow OpenAI's webhooks):
+
+```json
+{"id": "evt_…", "object": "event", "type": "batch.completed", "created_at": 1762790400, "data": {"id": "batch_…"}}
+```
+
+`type` is `batch.completed`, `batch.failed`, `batch.cancelled` or
+`batch.expired`. Fetch the batch for its counts and files. Each delivery
+carries the Standard Webhooks headers `webhook-id` (the event id),
+`webhook-timestamp` (epoch seconds) and `webhook-signature`:
+`v1,` followed by the base64 HMAC-SHA256 of `{webhook-id}.{webhook-timestamp}.{body}`
+under the server's `IZWI_BATCH_WEBHOOK_SECRET`. A secret that starts with
+`whsec_` is base64 of the key, as the OpenAI SDK's
+`client.webhooks.unwrap(body, headers, secret=…)` and the Standard Webhooks
+libraries read it; any other secret is used as the key itself.
+
+Webhooks are off until the operator sets `IZWI_BATCH_WEBHOOK_SECRET`, and a
+batch that names `webhook_url` is refused with `400` while they are off. The
+URL must be `https://` (`IZWI_BATCH_WEBHOOK_ALLOW_HTTP=1` also allows
+`http://`), carry no credentials, and its host must resolve only to public
+addresses (`IZWI_BATCH_WEBHOOK_ALLOW_PRIVATE=1` also allows loopback,
+private and link-local ones). A host given as an address is checked when
+the batch is created; a host name is resolved and checked at each delivery,
+and the connection goes to the addresses that were checked. Redirects are
+not followed and no proxy is used. A delivery that gets no `2xx` within 10
+seconds is tried again after 2 and then 8 seconds, with the same
+`webhook-id`, and dropped after the third attempt. Delivery is best effort:
+it never changes the batch, and an event can be lost if the server stops
+between the batch ending and the delivery, so keep a poll as the fallback.
+
+**Through the gateway.** The gateway relays `/v1/files` and `/v1/batches`
+to its audio upstreams only with `IZWI_GATEWAY_AUDIO_SHARED_STATE=true`,
+which says every upstream shares one records database and media store (a
+single upstream does). The upstream sees the gateway as one caller, so the
+gateway tells it which tenant each request is for (the key's `tenant_id`,
+or the key itself when it has none). Start every upstream with
+`IZWI_TRUST_GATEWAY_TENANT_HEADER=true` and each tenant sees only its own
+files and batches: another tenant's id answers `404`. Only the gateway may
+reach such an upstream, because anyone holding the upstream's API key could
+name any tenant. Without the setting, files and batches made through the
+gateway are shared by every gateway principal. Uploads stream through and
+are bounded by the upstream's `IZWI_FILES_MAX_BYTES`.
+
+Transcribe recordings:
+
+```python
+import json
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="not-needed")
+
+lines = []
+for name in ["call-1.wav", "call-2.wav"]:
+    audio = client.files.create(file=open(name, "rb"), purpose="user_data")
+    lines.append({
+        "custom_id": name,
+        "method": "POST",
+        "url": "/v1/audio/transcriptions",
+        "body": {"model": "Parakeet-TDT-0.6B-v3", "file_id": audio.id},
+    })
+requests = "\n".join(json.dumps(line) for line in lines).encode()
+source = client.files.create(file=("requests.jsonl", requests), purpose="batch")
+
+batch = client.batches.create(
+    input_file_id=source.id,
+    endpoint="/v1/audio/transcriptions",
+    completion_window="24h",
+)
+# Poll client.batches.retrieve(batch.id) until status is "completed".
+batch = client.batches.retrieve(batch.id)
+for line in client.files.content(batch.output_file_id).text.splitlines():
+    result = json.loads(line)
+    print(result["custom_id"], result["response"]["body"]["text"])
+```
+
+Speak a list of texts:
+
+```python
+lines = [
+    {
+        "custom_id": f"prompt-{index}",
+        "method": "POST",
+        "url": "/v1/audio/speech",
+        "body": {"model": "Kokoro-82M", "voice": "af_heart", "input": text, "response_format": "mp3"},
+    }
+    for index, text in enumerate(["Welcome back.", "Your order has shipped."])
+]
+requests = "\n".join(json.dumps(line) for line in lines).encode()
+source = client.files.create(file=("speech.jsonl", requests), purpose="batch")
+batch = client.batches.create(
+    input_file_id=source.id, endpoint="/v1/audio/speech", completion_window="24h"
+)
+# Once the batch is "completed":
+batch = client.batches.retrieve(batch.id)
+for line in client.files.content(batch.output_file_id).text.splitlines():
+    result = json.loads(line)
+    body = result["response"]["body"]
+    audio = client.files.content(body["audio_file_id"]).content
+    open(f"{result['custom_id']}.{body['format']}", "wb").write(audio)
 ```
 
 ### Responses
@@ -1345,6 +1651,12 @@ revived, so submit a new job instead. Stages and artifacts include IDs,
 capability/model metadata, attempt counts, timing/error fields, media/text
 asset references, and storage keys when available.
 
+A stage is one whole transcription or synthesis job. One that runs longer
+than `IZWI_BATCH_STAGE_TIMEOUT_SECS` (six hours by default, counted from the
+stage's start; `0` disables the limit) is cancelled and retried or failed
+like any other stage failure. Raise it for recordings or scripts that take
+longer than that on your device.
+
 ### Saved Voices
 
 Reusable voice clone references:
@@ -1598,9 +1910,12 @@ Small first-party UI state APIs:
 | `GET` | `/internal/metrics/prometheus` | Internal alias. |
 
 Batch runtime metrics include `queued_stages`, `jobs_by_status`,
-`stages_by_status`, and a local worker snapshot. Prometheus output appends
-`izwi_batch_runtime_queued_stages`, `izwi_batch_runtime_jobs`,
-`izwi_batch_runtime_stages`, and `izwi_batch_runtime_worker_running`.
+`stages_by_status`, a local worker snapshot, and `api_batches` (the
+`/v1/batches` batches by status, with the requests they have finished).
+Prometheus output appends `izwi_batch_runtime_queued_stages`,
+`izwi_batch_runtime_jobs`, `izwi_batch_runtime_stages`,
+`izwi_batch_runtime_worker_running`, `izwi_batch_runtime_api_batches{status}`
+and `izwi_batch_runtime_api_batch_requests{outcome}` (`completed`, `failed`).
 
 Latencies are Prometheus histograms (cumulative `_bucket{le=...}`, `_sum`,
 `_count`) in seconds, so they aggregate across replicas and `histogram_quantile`
@@ -1611,9 +1926,11 @@ tenant IDs are used.
 
 | Metric | Labels | Meaning |
 |---|---|---|
-| `izwi_request_duration_seconds` | `model`, `backend`, `task`, `outcome` | Server admission to the terminal output. |
-| `izwi_request_ttft_seconds` | `model`, `backend`, `task` | Server admission to the first user-visible output. |
-| `izwi_request_queue_wait_seconds` | `model`, `backend`, `task` | Server admission until the engine first schedules the request, including the runtime coordinator, input preparation and model residency. |
+| `izwi_request_duration_seconds` | `model`, `backend`, `task`, `workload_class`, `outcome` | Server admission to the terminal output. |
+| `izwi_request_ttft_seconds` | `model`, `backend`, `task`, `workload_class` | Server admission to the first user-visible output: the first text delta of a chat or transcription request (`task="asr"` covers streamed `/v1/audio/transcriptions` and each `/v1/realtime` transcription turn), the first generated frame or audio of a speech request. A model that returns its transcript whole reports the transcript's time. |
+| `izwi_request_queue_wait_seconds` | `model`, `backend`, `task`, `workload_class` | Server admission until the engine first schedules the request, including the runtime coordinator, input preparation and model residency. |
+| `izwi_tts_first_audio_seconds` | `model`, `backend`, `workload_class` | Server admission until a streamed speech request hands its first audio to the transport. Recorded on every streaming speech route (SSE and chunked `/v1/audio/speech`, `/v1/audio/speech/stream`, `/v1/realtime` and realtime voice), once per segment of a long text. |
+| `izwi_tts_output_audio_seconds_total` | `model`, `backend`, `workload_class` | Counter of the seconds of audio completed speech requests produced, streamed or buffered. Its rate is the audio seconds the server speaks per second. |
 | `izwi_request_prefill_seconds` | `model`, `backend`, `task` | Engine prefill time of one request. |
 | `izwi_request_decode_seconds` | `model`, `backend`, `task` | Engine decode time of one request, after its prefill. |
 | `izwi_request_input_audio_seconds` | `model`, `backend`, `task` | Input audio length of completed transcription and audio-chat requests. `rate(_sum)` is the audio seconds the server transcribes per second (its RTFx under load). |
@@ -1626,12 +1943,19 @@ tenant IDs are used.
 | `izwi_engine_mixed_rows`, `izwi_engine_mixed_tokens` | `phase` (`decode`, `prefill`) on rows | Rows of each phase and tokens per committed mixed prefill+decode batch (models certified for mixed steps). |
 | `izwi_engine_device_idle_seconds` | `device` (`cpu`, `metal`, `cuda:0`) | Time the device waited between the end of one model step and the start of the next while the engine had work: the host gap (commit, delivery, prepare, dispatch) between steps. |
 | `izwi_engine_device_queue_wait_seconds` | `device`, `class` (workload class) | Time a model dispatch waited on its device's queue before it started. Control work (KV page operations, loads, frees) runs first; dispatches of different models share the device by workload-class weight, between jobs. |
+| `izwi_engine_scheduler_reserve_deferrals_total` | none | Counter of Batch and Background requests whose start waited for the real-time reserve: while a model has a real-time or streaming request (or had one in the last 30 seconds), batch work starts only up to the model's rows less `IZWI_REALTIME_ROW_RESERVE`. A model that retains more sequences than its rows keeps the reserve free among the extra sequences at all times, and requests held for that count too. Each request counts once. |
+| `izwi_engine_asr_encoder_live_yields_total` | none | Counter of device jobs a Batch or Background Parakeet long-audio encode ended after a window group because its model had a real-time or streaming request (or had one in the last 30 seconds); the encode continues in a new job, so the live request waits for one window group at most. |
+| `izwi_engine_scheduler_stream_pacing_transitions_total` | none | Counter of the times a speech stream ran more than `IZWI_STREAM_LEAD_SECS` (default 3) seconds of audio ahead of real time and was scheduled from the batch class's share of service until its lead fell to half of that. Nothing is throttled: with no competing work the stream still runs at full speed. The return to its own class is not counted. |
+| `izwi_inference_coordinator_queue_depth`, `izwi_inference_coordinator_queue_capacity` | `pool` (`general`, `realtime`) | Gauges of the requests the runtime queue holds and can hold. Real-time requests and open real-time sessions use the `realtime` pool, every other class the `general` pool (`IZWI_MAX_QUEUED_REQUESTS`); a request that finds its pool full is refused with 503. |
 | `izwi_engine_device_ops_off_thread_total` | none | Counter of device operations (model calls, KV page operations, state allocation and frees) that ran off their device's thread. Zero in a healthy process. |
 | `izwi_engine_device_frees_rerouted_total` | none | Counter of device buffers whose last drop began off their CUDA device's thread (request-owned ASR encoder outputs) and was moved onto it. |
 | `izwi_runtime_stage_duration_seconds` | `stage`, `workload_class` | Duration of runtime pipeline stages. |
 | `izwi_voice_turn_first_audio_seconds` | none | Realtime voice: endpoint decision to the turn's first assistant audio. |
-| `izwi_voice_endpointing_latency_seconds`, `izwi_voice_asr_first_partial_seconds`, `izwi_voice_asr_final_seconds`, `izwi_voice_llm_first_token_seconds`, `izwi_voice_tts_first_audio_seconds`, `izwi_voice_barge_in_latency_seconds`, `izwi_voice_session_duration_seconds` | none | Realtime voice stage latencies; `izwi_voice_metric_contract_info` lists each with its description. |
+| `izwi_voice_endpointing_latency_seconds`, `izwi_voice_asr_first_partial_seconds`, `izwi_voice_asr_final_seconds`, `izwi_voice_asr_live_first_partial_seconds`, `izwi_voice_llm_first_token_seconds`, `izwi_voice_tts_first_audio_seconds`, `izwi_voice_barge_in_latency_seconds`, `izwi_voice_session_duration_seconds` | none | Realtime voice stage latencies; `izwi_voice_metric_contract_info` lists each with its description. |
 | `izwi_voice_audio_egress_underruns_total`, `izwi_voice_audio_ingress_dropped_frames_total` | none | Assistant audio sent after playback had drained; input frames missing from the client's sequence. |
+
+`workload_class` is the class the request was admitted under: `realtime`,
+`interactive`, `streaming`, `online`, `batch` or `background`.
 
 The windowed `quantile="avg"|"p50"|"p95"` gauges (`izwi_latency_*`,
 `izwi_runtime_stage_duration_ms`, `izwi_runtime_workload_*`) were removed in
@@ -2017,14 +2341,16 @@ Events are the GA protocol's: `session.update`, `input_audio_buffer.*`, `convers
 | a chat model id (`Qwen3.5-9B`) | Modular, with that chat model and the default ASR and TTS |
 | an OpenAI model name (`gpt-realtime`, `gpt-realtime-2.1`, `gpt-4o-realtime-preview`), or none | The default profile (`IZWI_REALTIME_DEFAULT_PROFILE`) |
 
-`IZWI_REALTIME_PROFILES` adds profiles (a JSON array of `{id, asr_model_id, text_model_id, tts_model_id}` or `{id, s2s_model_id}`). An unknown `model` refuses the upgrade with `400`. The resolved models are in the upgrade response's `x-izwi-realtime-profile` header, and `GET /v1/realtime/capabilities` lists the profiles, voices, audio formats and limits.
+`IZWI_REALTIME_PROFILES` adds profiles (a JSON array of `{id, asr_model_id, text_model_id, tts_model_id}` or `{id, s2s_model_id}`). An unknown `model` refuses the upgrade with `400`. The resolved models are in the upgrade response's `x-izwi-realtime-profile` header, and `GET /v1/realtime/capabilities` lists the profiles, the transcription models and how each transcribes, voices, audio formats and limits.
 
 ### Audio, voices and turns
 
 - Audio is base64 in JSON: `audio/pcm` at 24 kHz (16-bit mono), or G.711 `audio/pcmu` / `audio/pcma` at 8 kHz, in both directions. Speech from a model at another rate is resampled to 24 kHz; output deltas carry at most 100 ms each.
 - `audio.output.voice` takes OpenAI's names (`alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`, `marin`, `cedar`), mapped onto each TTS model's own voices; any other name is the model's own voice (`af_heart` for Kokoro). `{"id": "<saved voice id>"}` speaks in a saved voice when the profile's TTS model clones voices. The voice is fixed once the session has spoken. `speed` is accepted and ignored.
 - `turn_detection` is `server_vad` (the default; threshold, `prefix_padding_ms`, `silence_duration_ms`, `idle_timeout_ms`, `create_response`, `interrupt_response`), `semantic_vad` (its `eagerness` picks the trailing-silence window: `high` 350 ms, `medium`/`auto` 800 ms, `low` 1500 ms), or `null` for manual turns (`input_audio_buffer.commit`, then `response.create`). Voice activity is Izwi's VAD; `input_audio_buffer.speech_started` is sent once speech is confirmed (about 300 ms of voiced speech) and dated back to where it began, and with `interrupt_response` it cancels the response in progress.
-- `audio.input.transcription` turns on `conversation.item.input_audio_transcription.*` events. OpenAI transcription model names (`whisper-1`, `gpt-4o-mini-transcribe`, …) run on the profile's ASR; an Izwi ASR model id picks that model.
+- `audio.input.noise_reduction` is accepted and ignored: the session echoes the value and applies no noise reduction.
+- `audio.input.transcription` turns on `conversation.item.input_audio_transcription.*` events. OpenAI transcription model names (`whisper-1`, `gpt-4o-mini-transcribe`, …) run on the profile's ASR; an Izwi ASR model id picks that model (any live ASR model, Voxtral Realtime or LFM3-Audio).
+- A model with a native streaming session (Nemotron streaming ASR, Voxtral Realtime, LFM3-Audio LiveASR) transcribes a turn live: `conversation.item.input_audio_transcription.delta` events start while the user is still speaking, once `speech_started` has been sent (or, with manual turns, from the first audio appended), and carry the id of the item the turn becomes. `...completed` follows the commit with the full transcript, which is the streaming session's final text; the reply reads the same text. Every other model transcribes the turn after it is committed, as do conversations on a speech-to-speech profile. A live turn that cannot get a streaming session (`IZWI_ASR_REALTIME_MAX_SESSIONS` are all in use, or the session fails) is transcribed after its commit instead, with no `error` event. `GET /v1/realtime/capabilities` reports the mode as `transcription_mode` (`"live"` or `"turn"`): for each model `audio.input.transcription.model` may name under `transcription_models`, and for each profile's default.
 
 ### Responses, tools and history
 
@@ -2039,11 +2365,11 @@ Events are the GA protocol's: `session.update`, `input_audio_buffer.*`, `convers
 - Errors are `error` events with `type`, `code`, `message`, `param` and the client's `event_id`; the session stays open. Requests that conflict harmlessly (a different `model` in `session.update`, a voice change after the session has spoken, a truncate past the end) are accepted and ignored.
 - Sessions are not written to the voice history unless `IZWI_REALTIME_PERSIST=1`.
 - `?intent=transcription` opens a transcription session: input audio, VAD or manual commits and transcription events, no responses.
-- WebRTC (`/v1/realtime/calls`), SIP, MCP tools and image input are not served.
+- WebRTC (`/v1/realtime/calls`), SIP, MCP tools and image input are not served. [Phone calls and call centres](/features/telephony) covers how a call reaches a session.
 
 ### Browser clients and client secrets
 
-A browser cannot set `Authorization` on a WebSocket. `POST /v1/realtime/client_secrets` (authenticated with the API key) mints an `ek_` key bound to a session config, valid for `expires_after.seconds` (10 to 7200, default 600). The browser offers it as the `openai-insecure-api-key.<key>` subprotocol beside `realtime`; the key admits `/v1/realtime` only, and its session config applies to each session it opens. Browser pages on other origins still need the server's CORS and origin settings.
+A browser cannot set `Authorization` on a WebSocket. `POST /v1/realtime/client_secrets` (authenticated with the API key) mints an `ek_` key bound to a session config, valid for `expires_after.seconds` (10 to 7200, default 600). The browser offers it as the `openai-insecure-api-key.<key>` subprotocol beside `realtime`; the key admits `/v1/realtime` and `/v1/realtime/media-stream` only, and its session config applies to each session it opens. Browser pages on other origins still need the server's CORS and origin settings.
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/realtime/client_secrets \
@@ -2051,6 +2377,55 @@ curl -s http://127.0.0.1:8080/v1/realtime/client_secrets \
   -d '{"session": {"type": "realtime", "model": "izwi-voice", "instructions": "Be brief."}}'
 ```
 
+### Telephony media streams
+
+`GET /v1/realtime/media-stream` takes a phone call in the WebSocket framing call-centre platforms and carrier APIs stream call audio in, and runs it as a `/v1/realtime` session: G.711 μ-law at 8 kHz in both directions, turns cut by `server_vad`. One socket carries one call and takes one realtime session slot. [Phone calls and call centres](/features/telephony) has worked examples and the other ways to connect a call.
+
+The call is configured in the query string, or by the same names in the `start` frame's `customParameters` (which win; some platforms drop the query string):
+
+| Parameter | Meaning |
+| --- | --- |
+| `model` | The realtime profile, as on `/v1/realtime`. |
+| `intent` | `transcription` opens a transcription call: transcripts, no replies. |
+| `voice`, `instructions` | The session's `audio.output.voice` and `instructions`. |
+| `transcription_model`, `language` | The session's `audio.input.transcription` model and language. A conversation sends transcripts of the caller only when one of them is set, or when a client secret's session config sets `audio.input.transcription`. |
+| `transcripts` | `false` keeps `transcript` frames off the stream. |
+
+Authentication is the same as `/v1/realtime`: the API key as a bearer token, or a client secret as a bearer token or the `openai-insecure-api-key.<key>` subprotocol. A client secret's session config applies under the call's own parameters; its audio formats are replaced by G.711 μ-law, and a `turn_detection` of `null` by `server_vad`. A bad `model` or `intent` in the query string refuses the upgrade with `400`.
+
+Frames are JSON text, one event each. From the carrier:
+
+| `event` | Handling |
+| --- | --- |
+| `connected` | Ignored. |
+| `start` | Starts the call. `streamSid` (top level or in `start`) names the stream and is echoed on every frame Izwi sends. `start.mediaFormat`, when present, must be `audio/x-mulaw`, 8000 Hz, 1 channel. `start.customParameters` configure the call. A `start` must arrive within 10 seconds. |
+| `media` | `media.payload` is base64 μ-law, any frame length (20 ms is usual). Frames whose `media.track` is not `inbound` are ignored. |
+| `mark`, `dtmf` | Ignored. |
+| `stop` | Ends the call; Izwi closes the socket. Closing the socket ends the call too. |
+
+Any other event, and any frame that is not JSON, is ignored. From Izwi:
+
+| `event` | Meaning |
+| --- | --- |
+| `media` | Speech of a reply: `media.payload` is base64 μ-law at 8 kHz, up to 100 ms a frame, sent as it is generated. |
+| `mark` | The end of a reply's speech; `mark.name` is the reply's item id. A carrier echoes it when playback reaches it. |
+| `clear` | The caller started speaking while a reply was still playing: drop the audio not yet played. Izwi cancels the reply and keeps, as what the agent said, the share of it that had time to play. |
+| `transcript` | Izwi extension. `item_id`, `type` (`delta` or `completed`) and `text`: the caller's words. A model that transcribes live sends `delta` frames while the caller speaks; every model sends `completed` with the whole utterance. |
+| `error` | Izwi extension. `error` is the session's error object (`type`, `code`, `message`): a failed reply or transcription, or a bad frame. The call stays open. |
+
+A call that cannot start gets an `error` frame and a close: code `1008` for a `start` that is late, has no `streamSid`, names another media format or carries bad parameters, and `1013` when every realtime session slot is in use.
+
+```json
+{"event": "start", "streamSid": "MZ123", "start": {"streamSid": "MZ123", "callSid": "CA456", "tracks": ["inbound"],
+  "mediaFormat": {"encoding": "audio/x-mulaw", "sampleRate": 8000, "channels": 1},
+  "customParameters": {"model": "izwi-voice", "voice": "cedar"}}}
+{"event": "media", "streamSid": "MZ123", "media": {"track": "inbound", "chunk": "1", "timestamp": "0", "payload": "//////..."}}
+```
+
+Function tools, manual turns and the rest of the Realtime protocol are not reachable through this framing; use `/v1/realtime` for them.
+
 ### Through the gateway
 
-With `IZWI_GATEWAY_OPENAI_REALTIME_UPSTREAMS` (izwi-server base URLs) the gateway serves `/v1/realtime` too: it authenticates and admits each session, then relays it to an upstream izwi-server (round robin, `IZWI_GATEWAY_OPENAI_REALTIME_UPSTREAM_API_KEY` as the upstream's key, capped by `IZWI_GATEWAY_REALTIME_MAX_SESSIONS`). The session itself runs on the izwi-server.
+With `IZWI_GATEWAY_OPENAI_REALTIME_UPSTREAMS` (izwi-server base URLs) the gateway serves `/v1/realtime` too: it authenticates and admits each session, then relays it to an upstream izwi-server (round robin, `IZWI_GATEWAY_OPENAI_REALTIME_UPSTREAM_API_KEY` as the upstream's key, capped by `IZWI_GATEWAY_REALTIME_MAX_SESSIONS`). The session itself runs on the izwi-server. `/v1/realtime/media-stream` is relayed the same way, under the same session cap.
+
+The gateway relays `POST /v1/realtime/client_secrets` and `GET /v1/realtime/capabilities` to the same upstreams, after its own authentication, admission and tenant lease. An izwi-server keeps the `ek_` keys it mints in memory, so the gateway remembers which upstream minted each key and for which principal. A browser presents the key on the gateway's `/v1/realtime` (or a carrier on its `/v1/realtime/media-stream`) as it would to an izwi-server (the `openai-insecure-api-key.<key>` subprotocol, no gateway API key): the gateway treats the session as the minting principal's, sends it to the upstream that minted the key, and that upstream checks the key and applies its session config. The key opens no other gateway route. The gateway's memory of keys is per process and is lost on restart, so with several gateway replicas a key works only through the replica that minted it: run one replica for this, or route a browser's requests to the replica its backend used. `capabilities` is answered by one upstream, so configure the upstreams' profiles alike.

@@ -11,6 +11,7 @@ pub(crate) mod audio;
 pub(crate) mod connection;
 pub(crate) mod events;
 pub(crate) mod items;
+pub(crate) mod live;
 pub(crate) mod persist;
 pub(crate) mod profiles;
 pub(crate) mod respond;
@@ -19,7 +20,7 @@ pub(crate) mod session_config;
 pub(crate) mod transcribe;
 pub(crate) mod voices;
 
-pub(crate) use connection::{handle_socket, SessionKind};
+pub(crate) use connection::{handle_socket, run_session, SessionKind, SessionSpec};
 
 #[cfg(test)]
-mod socket_tests;
+pub(crate) mod socket_tests;

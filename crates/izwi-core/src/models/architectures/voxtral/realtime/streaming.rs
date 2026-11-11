@@ -15,10 +15,38 @@ static NEXT_VOXTRAL_REALTIME_STATE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Host-owned continuation state for one Voxtral realtime stream.
 ///
-/// Audio preparation deliberately retains the original source samples.  Until
-/// the encoder exposes a checkpointed convolution/attention continuation, a
-/// push can recompute the causal encoder prefix and replace `audio_embeds`
-/// without changing the already-consumed LM/KV cursor.
+/// Audio preparation deliberately retains the original source samples: each
+/// push recomputes the causal encoder prefix over all of them and replaces
+/// `audio_embeds`, without changing the already-consumed LM/KV cursor.
+///
+/// Carrying encoder state across pushes instead was looked at and left out,
+/// because it cannot be shown to give the same embeddings:
+///
+/// - The encoder's input is not append-only. The log-mel is taken over the
+///   whole padded prefix, so the frames whose windows reach the end of the
+///   audio so far change when more arrives, and closing the input adds the
+///   right padding. That is why only `stable_frames` of a preparation are
+///   kept. A continuation would hold a settled cursor at every stage (mel,
+///   both stem convolutions, each layer, the pooling) and redo the unsettled
+///   tail on each push, not append to it.
+/// - The attention layers are causal over a sliding window with RoPE, so
+///   the state to carry is each layer's keys and values for that window, on
+///   the device. It would have to join the stream's reservation and
+///   `resource_usage`, and the host checkpoint, so a cancelled install rolls
+///   it back with the rest.
+/// - The recompute runs each layer as one attention over all the frames,
+///   batched across streams with masked lengths (flash attention on CUDA).
+///   A continuation runs new frames against cached keys. The CPU, Metal and
+///   CUDA kernels do not promise the same rounding for differently shaped
+///   products, the decode is greedy over these embeddings, and offline
+///   transcription runs as a closed realtime stream, so its text would
+///   depend on how the audio was pushed. The tree has only tiny
+///   random-weight models to test with, which cannot prove parity on the
+///   real weights or on each backend.
+///
+/// The cost of the recompute is bounded: a stream prepares at most the
+/// session's sample ceiling, and a longer one rolls over to a new segment
+/// (`runtime/asr/realtime_session.rs`).
 #[derive(Debug)]
 pub(crate) struct VoxtralRealtimeState {
     pub(super) state_id: u64,

@@ -194,7 +194,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_MAX_PHYSICAL_IN_FLIGHT` | integer | `1` | startup | Engine-wide ceiling on overlapping physical model launches (1 to 1024; invalid ignored). |
 | `IZWI_MAX_PREFIX_CACHE_PAGES` | integer | unset (automatic) | startup | Prefix-cache page budget; 0 or invalid ignored, leaving the automatic budget. |
 | `IZWI_MAX_PREFIX_SNAPSHOTS` | integer | `8` | startup | Caps committed hybrid recurrent-state prefix snapshots per model (0..=1024; 0 keeps hybrid state private). |
-| `IZWI_MAX_QUEUED_REQUESTS` | integer | `128` | startup | Maximum requests waiting in the engine queue (0 or invalid ignored). |
+| `IZWI_MAX_QUEUED_REQUESTS` | integer | `128` | startup | Maximum requests waiting in the engine queue (0 or invalid ignored). Real-time requests and sessions wait in a queue of their own, of the same size or the real-time session cap if that is larger, so a full queue does not refuse a call. |
 | `IZWI_MAX_RETAINED_SEQUENCES` | integer | 0 (automatic device ceiling) | startup | Maximum retained sequences; 0 or invalid ignored, leaving the automatic ceiling. |
 | `IZWI_MAX_SCHEDULER_BATCH_SIZE` | integer | 0 (automatic device ceiling) | startup | Maximum scheduler batch size; 0 or invalid ignored, leaving the automatic ceiling. |
 | `IZWI_MAX_SEQUENCE_LENGTH` | choice | `auto` | startup | Context-length cap: auto (model's context) or a positive token count; invalid ignored. |
@@ -374,6 +374,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_QWEN_ASR_TEXT_DTYPE` | choice | IZWI_QWEN_DTYPE, else backend default | model load | Overrides the Qwen3-ASR text decoder dtype (e.g. f32, f16, bf16); falls back to IZWI_QWEN_DTYPE. |
 | `IZWI_QWEN_DTYPE` | choice | backend/checkpoint default | model load | Shared dtype fallback for Qwen3 chat and Qwen3-ASR text when their specific overrides are unset; Qwen3-TTS ignores it. |
 | `IZWI_QWEN_TTS_DTYPE` | choice | backend default | model load | Overrides the Qwen3-TTS model dtype (e.g. f32, f16, bf16); does not inherit IZWI_QWEN_DTYPE. |
+| `IZWI_REALTIME_ROW_RESERVE` | integer | a quarter of the model's rows, at least 1 | startup | Sequences each model keeps free of Batch and Background requests while it has live demand (a Realtime or Streaming request or a real-time session operation in the last 30 seconds), so a live request starts without waiting for batch work to finish. A model that retains more sequences than it decodes in one dispatch also keeps the reserve free among the extra sequences with no live demand. 0 disables the reserve; a one-row model reserves no row; invalid ignored. |
 | `IZWI_RELPOS_ATTENTION_EMULATOR_DIR` | path | unset (test skipped) | test harness | Directory the ignored kernels::relpos_attention emulator test writes every self-check call to (inputs and the host reference's output), for the C++ harness that runs kernels/cuda/relpos_attention.cu thread by thread on a machine without a GPU. |
 | `IZWI_REQUEST_PARALLELISM` | integer | derived from backend, CPU capacity and tensor batch cap | startup | Overrides how many requests the executor runs in parallel (positive integer). |
 | `IZWI_REQUIRE_CUDA_TEST_DEVICE` | flag | `false` | test harness | Makes CUDA-feature tests fail instead of skipping when no usable CUDA device exists. |
@@ -389,6 +390,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_SORTFORMER_STREAMING_PROFILE` | choice | `model` | model load | Selects the Sortformer streaming chunk profile: model, low_latency (low), high_latency (high); unknown values ignored. |
 | `IZWI_SORTFORMER_VAD_GATE` | flag | `false` | first use | Gates Sortformer diarization output by a VAD speech mask when the request does not set vad_gate. |
 | `IZWI_STREAM_AUDIO_QUEUE_CAPACITY` | integer | 8 (TTS) / 64 (speech-to-speech) | first use | Sets the engine streaming queue depth for TTS and speech-to-speech; overrides IZWI_STREAM_QUEUE_CAPACITY. |
+| `IZWI_STREAM_LEAD_SECS` | number | `3` | first use | Seconds of audio a speech stream may run ahead of real time before the scheduler serves its request from the Batch class's share, until the lead falls below half of this. Nothing is throttled: with no competing work the stream runs at full speed. 0 disables pacing; invalid ignored. |
 | `IZWI_STREAM_QUEUE_CAPACITY` | integer | per task: TTS 8, S2S 64, ASR 4096, chat 64 | first use | Sets the fallback engine streaming queue depth for every task without a task-specific override (positive integer). |
 | `IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS` | duration | 30000 (30 s) | first use | Sets how long streamed text output may wait on a stalled consumer before the invocation fails, in milliseconds. |
 | `IZWI_STREAM_TEXT_QUEUE_CAPACITY` | integer | 4096 (ASR) / 64 (chat) | first use | Sets the engine streaming queue depth for ASR and chat text; overrides IZWI_STREAM_QUEUE_CAPACITY. |

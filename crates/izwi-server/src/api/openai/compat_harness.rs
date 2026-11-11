@@ -203,6 +203,12 @@ fn contract_supported_scope_matches_expected_endpoints() {
         "/v1/audio/voice_consents/{consent_id}",
         "/v1/realtime",
         "/v1/realtime/client_secrets",
+        "/v1/files",
+        "/v1/files/{file_id}",
+        "/v1/files/{file_id}/content",
+        "/v1/batches",
+        "/v1/batches/{batch_id}",
+        "/v1/batches/{batch_id}/cancel",
     ]
     .into_iter()
     .collect();

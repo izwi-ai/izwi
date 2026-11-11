@@ -2164,6 +2164,13 @@
                   "null"
                 ]
               },
+              "service_tier": {
+                "description": "Izwi extension of OpenAI's field: `flex` runs the request as batch\nwork behind interactive and streaming requests; `default`, `auto` or\nabsent keeps the route's own class; `priority` is served as\n`default`. The `X-Izwi-Service-Tier` request header is read when the\nbody names none.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "speed": {
                 "format": "float",
                 "type": [
@@ -2442,6 +2449,19 @@
           "audio_base64": {
             "type": "string"
           },
+          "chunking_strategy": {
+            "description": "`\"auto\"`, the server's own splitting of long audio at pauses, or\nomitted. A `server_vad` object is refused with 400."
+          },
+          "include": {
+            "description": "OpenAI's `include[]`. `logprobs` is refused with 400: no model\nreturns token log-probabilities.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "keywords": {
             "description": "Izwi extension: terms to bias recognition toward, as an array (or\none comma- or newline-separated string). Models without keyword\nbiasing reject it (400).",
             "items": {
@@ -2484,6 +2504,13 @@
               "null"
             ]
           },
+          "service_tier": {
+            "description": "Izwi extension of OpenAI's field: `flex` runs the request as batch\nwork behind interactive and streaming requests; `default`, `auto` or\nabsent keeps the route's own class; `priority` is served as\n`default`. The `X-Izwi-Service-Tier` request header is read when the\nbody names none.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "speaker_labels": {
             "description": "Izwi extension: tag speakers in the transcript (models that do, such\nas Nemotron-3.5-Transcribe-30B-A4B-FP8; others reject it with 400).\nverbose_json then carries `speaker_turns`.",
             "type": [
@@ -2505,6 +2532,7 @@
             ]
           },
           "temperature": {
+            "description": "0 to 1, checked and without effect: every ASR model decodes\ngreedily (Whisper with its fallback ladder from 0).",
             "format": "float",
             "type": [
               "number",
@@ -2540,9 +2568,22 @@
               "null"
             ]
           },
+          "chunking_strategy": {
+            "description": "`\"auto\"`, the server's own splitting of long audio at pauses, or\nomitted. A `server_vad` object is refused with 400."
+          },
           "file": {
             "format": "binary",
             "type": "string"
+          },
+          "include": {
+            "description": "OpenAI's `include[]`. `logprobs` is refused with 400: no model\nreturns token log-probabilities.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "keywords": {
             "description": "Izwi extension: terms to bias recognition toward. Repeat the field or\nseparate terms with commas or newlines. Models without keyword\nbiasing reject it (400).",
@@ -2586,6 +2627,13 @@
               "null"
             ]
           },
+          "service_tier": {
+            "description": "Izwi extension of OpenAI's field: `flex` runs the request as batch\nwork behind interactive and streaming requests; `default`, `auto` or\nabsent keeps the route's own class; `priority` is served as\n`default`. The `X-Izwi-Service-Tier` request header is read when the\nbody names none.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "speaker_labels": {
             "description": "Izwi extension: tag speakers in the transcript (models that do, such\nas Nemotron-3.5-Transcribe-30B-A4B-FP8; others reject it with 400).\nverbose_json then carries `speaker_turns`.",
             "type": [
@@ -2607,6 +2655,7 @@
             ]
           },
           "temperature": {
+            "description": "0 to 1, checked and without effect: every ASR model decodes\ngreedily (Whisper with its fallback ladder from 0).",
             "format": "float",
             "type": [
               "number",
@@ -2630,6 +2679,13 @@
       },
       "TranscriptionResponse": {
         "properties": {
+          "service_tier": {
+            "description": "The tier that served the request (`flex` or `default`), when the\nrequest named one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "text": {
             "type": "string"
           }
@@ -2804,6 +2860,13 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "service_tier": {
+            "description": "The tier that served the request (`flex` or `default`), when the\nrequest named one.",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -2990,7 +3053,7 @@
         },
         "responses": {
           "200": {
-            "description": "Encoded audio (Content-Type per response_format; a chunked body for stream_format audio), or server-sent audio events for stream_format sse. X-Izwi-Speech-Id names the request for GET /v1/audio/speech/{speech_id}."
+            "description": "Encoded audio (Content-Type per response_format; a chunked body for stream_format audio), or server-sent audio events for stream_format sse. X-Izwi-Speech-Id names the request for GET /v1/audio/speech/{speech_id}; X-Izwi-Service-Tier names the tier that served it."
           },
           "400": {
             "content": {
@@ -3001,6 +3064,16 @@
               }
             },
             "description": "Invalid request"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            },
+            "description": "No admission slot became free within IZWI_ADMISSION_QUEUE_TIMEOUT_SECS (Retry-After says when to retry): code rate_limit_exceeded, or resource_unavailable for a flex request."
           },
           "500": {
             "content": {
@@ -3021,7 +3094,7 @@
     },
     "/v1/audio/speech/batch": {
       "post": {
-        "description": "Up to IZWI_TTS_BATCH_MAX_ITEMS speech requests: top-level fields are defaults each of `items` overrides. Returns `{id, object, results[], total, succeeded, failed}`; each result carries base64 `audio_data` or an OpenAI `error` object, and an `id` for `GET /v1/audio/speech/{speech_id}`.",
+        "description": "Up to IZWI_TTS_BATCH_MAX_ITEMS speech requests: top-level fields are defaults each of `items` overrides. Returns `{id, object, results[], total, succeeded, failed}`; each result carries base64 `audio_data` or an OpenAI `error` object, and an `id` for `GET /v1/audio/speech/{speech_id}`. A top-level `service_tier` (or the X-Izwi-Service-Tier header) applies to every item: they run as batch work (`flex`) unless it is `default`, `auto` or `priority`. The response names the tier served in X-Izwi-Service-Tier, and in `service_tier` when the request named one.",
         "responses": {
           "200": {
             "description": "OK"
@@ -3110,7 +3183,7 @@
                 }
               }
             },
-            "description": "Transcription result as JSON, verbose JSON, text, SRT, VTT, or server-sent events"
+            "description": "Transcription result as JSON, verbose JSON, text, SRT, VTT, or server-sent events. X-Izwi-Service-Tier names the tier that served it."
           },
           "400": {
             "content": {
@@ -3121,6 +3194,16 @@
               }
             },
             "description": "Invalid request"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            },
+            "description": "No admission slot became free within IZWI_ADMISSION_QUEUE_TIMEOUT_SECS (Retry-After says when to retry): code rate_limit_exceeded, or resource_unavailable for a flex request."
           },
           "500": {
             "content": {
@@ -3141,7 +3224,7 @@
     },
     "/v1/audio/translations": {
       "post": {
-        "description": "OpenAI's translation route: multipart `file`, `model` (a model that translates speech: Granite Speech 5.0, Nemotron 3.5 Transcribe), `prompt`, `response_format` (json, text, srt, verbose_json, vtt), `temperature`. The target is English unless `to_language` / `target_language` names another; `language` hints the source; `stream` gives `transcript.text.*` events.",
+        "description": "OpenAI's translation route: multipart `file`, `model` (a model that translates speech: Granite Speech 5.0, Nemotron 3.5 Transcribe), `prompt`, `response_format` (json, text, srt, verbose_json, vtt), `temperature`. The target is English unless `to_language` / `target_language` names another; `language` hints the source; `stream` gives `transcript.text.*` events. `service_tier` (or the X-Izwi-Service-Tier header) works as on transcriptions.",
         "responses": {
           "200": {
             "description": "OK"
@@ -3359,6 +3442,96 @@
         ]
       }
     },
+    "/v1/batches": {
+      "get": {
+        "description": "The caller's batches, newest first; `after` and `limit` (1 to 100) page them.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "List batches",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      },
+      "post": {
+        "description": "JSON `input_file_id` (a JSONL file of purpose `batch`), `endpoint` (/v1/audio/transcriptions, /v1/audio/translations or /v1/audio/speech), `completion_window` (`24h`) and optional `metadata`. Each line is OpenAI's `{custom_id, method, url, body}`; a transcription or translation body names its audio by `file_id` or `audio_base64`. Lines run as batch work; at most IZWI_BATCH_MAX_REQUESTS (50000) per file. With `metadata.webhook_url`, a signed `batch.completed`, `batch.failed`, `batch.cancelled` or `batch.expired` event is posted there when the batch ends; refused with 400 unless the operator set IZWI_BATCH_WEBHOOK_SECRET.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Create batch",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/batches/{batch_id}": {
+      "get": {
+        "description": "The batch: status, `request_counts`, and `output_file_id` and `error_file_id` once it has ended. A speech line's response body is `{audio_file_id, format, bytes}`.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Get batch",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/batches/{batch_id}/cancel": {
+      "post": {
+        "description": "Stops a batch that is validating or in progress: `cancelling`, then `cancelled` with the results of the lines that finished. A batch that has ended is a 409.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Cancel batch",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
     "/v1/chat/completions": {
       "post": {
         "operationId": "create_chat_completion",
@@ -3407,6 +3580,185 @@
         "summary": "Create chat completion",
         "tags": [
           "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/files": {
+      "get": {
+        "description": "The caller's files, newest first; `purpose`, `limit` (1 to 10000), `after` and `order` (`asc` or `desc`) filter and page them.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "List files",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      },
+      "post": {
+        "description": "Multipart `file` and `purpose`: `batch` (a batch's JSONL input) or `user_data` (audio a batch line names by `file_id`). At most IZWI_FILES_MAX_BYTES (200 MB); larger is 413.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Create file",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/files/{file_id}": {
+      "delete": {
+        "description": "Deletes the file and its content.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Delete file",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      },
+      "get": {
+        "description": "A file's metadata. `batch_output` files carry `expires_at`, 30 days after creation.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Get file",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/files/{file_id}/content": {
+      "get": {
+        "description": "The file's bytes.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Download file content",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/jobs/{job_id}": {
+      "get": {
+        "description": "Fetch a durable runtime job trace with stages and artifacts.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "summary": "Get runtime job",
+        "tags": [
+          "Jobs"
+        ]
+      }
+    },
+    "/v1/jobs/{job_id}/artifacts": {
+      "get": {
+        "description": "List durable artifacts produced or consumed by a runtime job.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "summary": "List runtime job artifacts",
+        "tags": [
+          "Jobs"
+        ]
+      }
+    },
+    "/v1/jobs/{job_id}/cancel": {
+      "post": {
+        "description": "Cancel a queued or running durable runtime job.",
+        "responses": {
+          "200": {
+            "description": "Runtime job cancelled"
+          },
+          "400": {
+            "description": "Job is not cancellable"
+          },
+          "404": {
+            "description": "Job not found"
+          }
+        },
+        "summary": "Cancel runtime job",
+        "tags": [
+          "Jobs"
+        ]
+      }
+    },
+    "/v1/jobs/{job_id}/retry": {
+      "post": {
+        "description": "Requeue failed, cancelled, or expired runtime job stages.",
+        "responses": {
+          "200": {
+            "description": "Runtime job retried"
+          },
+          "400": {
+            "description": "Job is not retryable"
+          },
+          "404": {
+            "description": "Job not found"
+          }
+        },
+        "summary": "Rerun runtime job",
+        "tags": [
+          "Jobs"
         ]
       }
     },
@@ -3495,6 +3847,69 @@
           }
         },
         "summary": "Open OpenAI Realtime WebSocket",
+        "tags": [
+          "Realtime"
+        ]
+      }
+    },
+    "/v1/realtime/capabilities": {
+      "get": {
+        "description": "The realtime profiles `model` may name, the transcription models and whether each transcribes a turn while it is spoken (`transcription_mode`: `live` or `turn`), the voices, audio formats and turn detection types, and the session limits.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "List realtime capabilities",
+        "tags": [
+          "Realtime"
+        ]
+      }
+    },
+    "/v1/realtime/client_secrets": {
+      "post": {
+        "description": "Mint an ephemeral `ek_` key, bound to a session config, that admits `/v1/realtime` for 10 seconds to 2 hours (default 10 minutes). Browsers present it as the `openai-insecure-api-key.<key>` WebSocket subprotocol.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "summary": "Create a realtime client secret",
+        "tags": [
+          "Realtime"
+        ]
+      }
+    },
+    "/v1/realtime/media-stream": {
+      "get": {
+        "description": "Upgrade to a phone call in the media-stream framing of call-centre platforms and carrier APIs: JSON text frames (`connected`, `start`, `media`, `mark`, `dtmf`, `stop`) with base64 8 kHz μ-law audio. The call runs as a `/v1/realtime` session. `?model=` and `?intent=transcription` select it as on `/v1/realtime`; `voice`, `instructions`, `language`, `transcription_model` and `transcripts` configure it, in the query string or the `start` frame's `customParameters`.",
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade"
+          },
+          "400": {
+            "description": "Invalid WebSocket request"
+          }
+        },
+        "summary": "Open a telephony media-stream WebSocket",
         "tags": [
           "Realtime"
         ]

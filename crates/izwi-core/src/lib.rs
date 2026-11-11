@@ -110,6 +110,7 @@ pub use runtime::{
     required_conformance_capabilities, voice_metric_catalog, voice_metric_prometheus_contract,
     CapabilityConformanceCase, CapabilityKind, ConformanceExecutionClass, VoiceLatency,
     VoiceMetricDescriptor, VOICE_ASR_FINAL_SECONDS, VOICE_ASR_FIRST_PARTIAL_SECONDS,
+    VOICE_ASR_LIVE_FIRST_PARTIAL_SECONDS,
     VOICE_AUDIO_EGRESS_UNDERRUNS_TOTAL, VOICE_AUDIO_INGRESS_DROPPED_FRAMES_TOTAL,
     VOICE_BARGE_IN_LATENCY_SECONDS, VOICE_BARGE_IN_TOTAL, VOICE_ENDPOINTING_LATENCY_SECONDS,
     VOICE_LLM_FIRST_TOKEN_SECONDS, VOICE_METRIC_CATALOG, VOICE_SESSION_CLOSED_TOTAL,
@@ -117,8 +118,9 @@ pub use runtime::{
     VOICE_SPEECH_REJECTED_TOTAL, VOICE_STREAM_BACKPRESSURE_TOTAL, VOICE_TTS_FIRST_AUDIO_SECONDS, VOICE_TURN_FIRST_AUDIO_SECONDS,
 };
 pub use runtime::{
-    chat_supports_json_object, chat_supports_tools, resolve_chat_max_tokens, resolve_chat_sampling,
-    validate_asr_language, validate_asr_task, AlignedWindow, AlignmentSource, AlignmentWindow,
+    asr_streams_live, chat_supports_json_object, chat_supports_tools, resolve_chat_max_tokens,
+    resolve_chat_sampling, validate_asr_language, validate_asr_task, AlignedWindow,
+    AlignmentSource, AlignmentWindow,
     AsrTranscription, ChatFinishReason, ChatGeneration, ChatGenerationControls,
     ChatSamplingRequest, ChunkStats, DiarizationConfig, DiarizationPipelineOptions,
     DiarizationResult, DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance,

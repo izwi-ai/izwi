@@ -17,6 +17,7 @@ pub const VOICE_AUDIO_EGRESS_UNDERRUNS_TOTAL: &str = "voice.audio.egress.underru
 pub const VOICE_ENDPOINTING_LATENCY_SECONDS: &str = "voice.endpointing.latency_seconds";
 pub const VOICE_ASR_FIRST_PARTIAL_SECONDS: &str = "voice.asr.first_partial_seconds";
 pub const VOICE_ASR_FINAL_SECONDS: &str = "voice.asr.final_seconds";
+pub const VOICE_ASR_LIVE_FIRST_PARTIAL_SECONDS: &str = "voice.asr.live_first_partial_seconds";
 pub const VOICE_LLM_FIRST_TOKEN_SECONDS: &str = "voice.llm.first_token_seconds";
 pub const VOICE_TTS_FIRST_AUDIO_SECONDS: &str = "voice.tts.first_audio_seconds";
 pub const VOICE_TURN_FIRST_AUDIO_SECONDS: &str = "voice.turn.first_audio_seconds";
@@ -38,6 +39,9 @@ pub enum VoiceLatency {
     AsrFirstPartial,
     /// Endpoint decision to the final transcript.
     AsrFinal,
+    /// Start of the user's speech to the first transcript partial of a turn
+    /// transcribed while it is spoken.
+    AsrLiveFirstPartial,
     /// Final transcript to the first assistant text the voice pipeline can
     /// speak (the whole reply when the text model runs non-streaming).
     LlmFirstToken,
@@ -51,11 +55,12 @@ pub enum VoiceLatency {
 }
 
 impl VoiceLatency {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::SessionDuration,
         Self::Endpointing,
         Self::AsrFirstPartial,
         Self::AsrFinal,
+        Self::AsrLiveFirstPartial,
         Self::LlmFirstToken,
         Self::TtsFirstAudio,
         Self::TurnFirstAudio,
@@ -68,6 +73,7 @@ impl VoiceLatency {
             Self::Endpointing => VOICE_ENDPOINTING_LATENCY_SECONDS,
             Self::AsrFirstPartial => VOICE_ASR_FIRST_PARTIAL_SECONDS,
             Self::AsrFinal => VOICE_ASR_FINAL_SECONDS,
+            Self::AsrLiveFirstPartial => VOICE_ASR_LIVE_FIRST_PARTIAL_SECONDS,
             Self::LlmFirstToken => VOICE_LLM_FIRST_TOKEN_SECONDS,
             Self::TtsFirstAudio => VOICE_TTS_FIRST_AUDIO_SECONDS,
             Self::TurnFirstAudio => VOICE_TURN_FIRST_AUDIO_SECONDS,
@@ -108,6 +114,10 @@ pub const VOICE_METRIC_CATALOG: &[VoiceMetricDescriptor] = &[
     VoiceMetricDescriptor {
         name: VOICE_ASR_FINAL_SECONDS,
         description: "Latency from the endpoint decision to the final transcript.",
+    },
+    VoiceMetricDescriptor {
+        name: VOICE_ASR_LIVE_FIRST_PARTIAL_SECONDS,
+        description: "Latency from the user's speech start to the first transcript partial of a turn transcribed while it is spoken.",
     },
     VoiceMetricDescriptor {
         name: VOICE_LLM_FIRST_TOKEN_SECONDS,

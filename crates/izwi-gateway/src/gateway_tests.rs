@@ -2899,6 +2899,7 @@ async fn openai_realtime_sessions_pass_through_to_an_izwi_server() {
     // model, and echoes every client event after `session.created`.
     async fn upstream(
         headers: axum::http::HeaderMap,
+        uri: axum::http::Uri,
         RawQuery(query): RawQuery,
         upgrade: WebSocketUpgrade,
     ) -> Response {
@@ -2920,8 +2921,8 @@ async fn openai_realtime_sessions_pass_through_to_an_izwi_server() {
         upgrade
             .protocols(["realtime"])
             .on_upgrade(move |mut socket| async move {
-                let created =
-                    json!({"type": "session.created", "event_id": "event_1", "query": query});
+                let created = json!({"type": "session.created", "event_id": "event_1",
+                    "query": query, "path": uri.path()});
                 let _ = socket
                     .send(AxumMessage::Text(created.to_string().into()))
                     .await;
@@ -2938,7 +2939,9 @@ async fn openai_realtime_sessions_pass_through_to_an_izwi_server() {
                 }
             })
     }
-    let upstream_app = Router::new().route("/v1/realtime", axum::routing::get(upstream));
+    let upstream_app = Router::new()
+        .route("/v1/realtime", axum::routing::get(upstream))
+        .route("/v1/realtime/media-stream", axum::routing::get(upstream));
     let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_port = upstream_listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(upstream_listener, upstream_app).await });
@@ -3016,6 +3019,203 @@ async fn openai_realtime_sessions_pass_through_to_an_izwi_server() {
         other => panic!("expected 401 without the gateway key, got {other:?}"),
     }
     ws.close(None).await.unwrap();
+
+    // A phone call's media stream is relayed the same way, to the
+    // upstream's media-stream route.
+    let media_stream = |authorized: bool| {
+        let url = format!("ws://127.0.0.1:{port}/v1/realtime/media-stream?intent=transcription");
+        let mut request = url.into_client_request().unwrap();
+        if authorized {
+            request.headers_mut().insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {TEST_API_KEY}")).unwrap(),
+            );
+        }
+        request
+    };
+    let (mut call, _) = tokio_tungstenite::connect_async(media_stream(true))
+        .await
+        .unwrap();
+    let opened = call.next().await.unwrap().unwrap();
+    let opened: serde_json::Value = serde_json::from_str(opened.to_text().unwrap()).unwrap();
+    assert_eq!(opened["path"], "/v1/realtime/media-stream");
+    assert_eq!(opened["query"], "intent=transcription");
+    call.send(Message::Text(r#"{"event":"connected"}"#.into()))
+        .await
+        .unwrap();
+    let echo = call.next().await.unwrap().unwrap();
+    assert_eq!(echo.to_text().unwrap(), r#"echo:{"event":"connected"}"#);
+    match tokio_tungstenite::connect_async(media_stream(false)).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), 401)
+        }
+        other => panic!("expected 401 without the gateway key, got {other:?}"),
+    }
+    call.close(None).await.unwrap();
+}
+
+/// Realtime client secrets through the gateway: an upstream mints the key,
+/// and a browser presenting it, with no gateway key, reaches the upstream
+/// that minted it, which is given the key as the session's credential. The
+/// key opens nothing but `/v1/realtime`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn realtime_client_secrets_reach_the_upstream_that_minted_them() {
+    use crate::app::openai_realtime_proxy::OpenAiRealtimeUpstreams;
+    use axum::extract::ws::{Message as AxumMessage, WebSocketUpgrade};
+    use axum::http::HeaderMap;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue};
+
+    // A stand-in izwi-server that mints one key and knows only its own.
+    async fn serve_upstream(name: &'static str) -> u16 {
+        fn bearer(headers: &HeaderMap) -> Option<&str> {
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+        }
+        let mint = move |headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| async move {
+            if bearer(&headers) != Some("upstream-key-123") {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            axum::Json(json!({
+                "value": format!("ek_{name}"),
+                "expires_at": 4_102_444_800u64,
+                "session": body["session"],
+            }))
+            .into_response()
+        };
+        let capabilities = move |headers: HeaderMap| async move {
+            if bearer(&headers) != Some("upstream-key-123") {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            axum::Json(json!({"object": "realtime.capabilities"})).into_response()
+        };
+        let socket = move |headers: HeaderMap, upgrade: WebSocketUpgrade| async move {
+            let own_secret = format!("ek_{name}");
+            let credential = match bearer(&headers) {
+                Some(key) if key == own_secret => "client_secret",
+                Some("upstream-key-123") => "api_key",
+                _ => return StatusCode::UNAUTHORIZED.into_response(),
+            };
+            upgrade
+                .protocols(["realtime"])
+                .on_upgrade(move |mut socket| async move {
+                    let created = json!({"type": "session.created", "upstream": name,
+                                         "credential": credential});
+                    let _ = socket
+                        .send(AxumMessage::Text(created.to_string().into()))
+                        .await;
+                })
+        };
+        let app = Router::new()
+            .route("/v1/realtime/client_secrets", axum::routing::post(mint))
+            .route(
+                "/v1/realtime/capabilities",
+                axum::routing::get(capabilities),
+            )
+            .route("/v1/realtime", axum::routing::get(socket));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        port
+    }
+    let (port_a, port_b) = (serve_upstream("a").await, serve_upstream("b").await);
+
+    let (state, _worker) = registry_gateway_state(ModelVariant::Qwen354BGguf).await;
+    let upstreams = OpenAiRealtimeUpstreams::new(
+        vec![
+            format!("http://127.0.0.1:{port_a}"),
+            format!("http://127.0.0.1:{port_b}"),
+        ],
+        Some("upstream-key-123".to_string()),
+        8,
+    )
+    .unwrap();
+    let app = create_gateway_router(
+        state.with_openai_realtime(upstreams),
+        &GatewayServeConfig::default(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    // Minting and the capabilities listing need the gateway key.
+    let mint = || {
+        client
+            .post(format!("{base}/v1/realtime/client_secrets"))
+            .json(&json!({"session": {"type": "realtime", "instructions": "Be brief."}}))
+    };
+    assert_eq!(mint().send().await.unwrap().status(), 401);
+    let mut secrets = Vec::new();
+    for _ in 0..2 {
+        let response = mint().bearer_auth(TEST_API_KEY).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let minted: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(minted["session"]["instructions"], "Be brief.");
+        secrets.push(minted["value"].as_str().unwrap().to_string());
+    }
+    secrets.sort();
+    assert_eq!(secrets, ["ek_a", "ek_b"], "one key from each upstream");
+    let capabilities = client
+        .get(format!("{base}/v1/realtime/capabilities"))
+        .bearer_auth(TEST_API_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(capabilities.status(), 200);
+    let capabilities: serde_json::Value = capabilities.json().await.unwrap();
+    assert_eq!(capabilities["object"], "realtime.capabilities");
+
+    // A browser: the secret as a subprotocol, and no Authorization header.
+    let browser = |secret: &str| {
+        let mut request = format!("ws://127.0.0.1:{port}/v1/realtime?model=izwi-voice")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_str(&format!("realtime, openai-insecure-api-key.{secret}")).unwrap(),
+        );
+        request
+    };
+    // Round robin would send every other session to the wrong upstream.
+    for _ in 0..3 {
+        for (secret, upstream) in [("ek_a", "a"), ("ek_b", "b")] {
+            let (mut ws, response) = tokio_tungstenite::connect_async(browser(secret))
+                .await
+                .unwrap();
+            assert_eq!(
+                response
+                    .headers()
+                    .get("sec-websocket-protocol")
+                    .and_then(|value| value.to_str().ok()),
+                Some("realtime")
+            );
+            let created = ws.next().await.unwrap().unwrap();
+            let created: serde_json::Value =
+                serde_json::from_str(created.to_text().unwrap()).unwrap();
+            assert_eq!(created["upstream"], upstream);
+            assert_eq!(created["credential"], "client_secret");
+        }
+    }
+
+    // A key the gateway did not relay is no credential, and a relayed one
+    // opens only the socket.
+    match tokio_tungstenite::connect_async(browser("ek_unknown")).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), 401)
+        }
+        other => panic!("expected 401 for an unknown secret, got {other:?}"),
+    }
+    for request in [
+        client.get(format!("{base}/v1/realtime/capabilities")),
+        mint(),
+        client.get(format!("{base}/v1/models")),
+    ] {
+        let response = request.bearer_auth("ek_a").send().await.unwrap();
+        assert_eq!(response.status(), 401);
+    }
 }
 
 /// The speech API pass-through: speech bodies stream back from an izwi-server
@@ -3036,10 +3236,17 @@ async fn speech_api_passes_through_to_izwi_servers() {
         if !authorized {
             return StatusCode::UNAUTHORIZED.into_response();
         }
+        // The tier the upstream was asked for, as the server reports it.
+        let tier = headers
+            .get("x-izwi-service-tier")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("default")
+            .to_string();
         (
             [
-                ("content-type", "audio/mpeg"),
-                ("x-izwi-speech-id", "speech_up1"),
+                ("content-type", "audio/mpeg".to_string()),
+                ("x-izwi-speech-id", "speech_up1".to_string()),
+                ("x-izwi-service-tier", tier),
             ],
             format!("MP3:{body}"),
         )
@@ -3100,9 +3307,28 @@ async fn speech_api_passes_through_to_izwi_servers() {
     assert_eq!(response.status(), 200);
     assert_eq!(response.headers()["content-type"], "audio/mpeg");
     assert_eq!(response.headers()["x-izwi-speech-id"], "speech_up1");
+    assert_eq!(response.headers()["x-izwi-service-tier"], "default");
     assert_eq!(
         response.text().await.unwrap(),
         r#"MP3:{"model":"Kokoro-82M","input":"hi"}"#
+    );
+
+    // The service tier reaches the upstream unchanged, as a body field and
+    // as the header, and the tier the upstream served comes back.
+    let flex = client
+        .post(format!("http://127.0.0.1:{port}/v1/audio/speech"))
+        .bearer_auth(TEST_API_KEY)
+        .header("content-type", "application/json")
+        .header("x-izwi-service-tier", "flex")
+        .body(r#"{"model":"Kokoro-82M","input":"hi","service_tier":"flex"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(flex.status(), 200);
+    assert_eq!(flex.headers()["x-izwi-service-tier"], "flex");
+    assert_eq!(
+        flex.text().await.unwrap(),
+        r#"MP3:{"model":"Kokoro-82M","input":"hi","service_tier":"flex"}"#
     );
 
     let lookup = client
@@ -3139,6 +3365,15 @@ async fn speech_api_passes_through_to_izwi_servers() {
         .await
         .unwrap();
     assert_eq!(voices.status(), 404, "voices need shared upstream state");
+    for stored in ["/v1/files", "/v1/batches", "/v1/jobs/job_1"] {
+        let response = client
+            .get(format!("http://127.0.0.1:{port}{stored}"))
+            .bearer_auth(TEST_API_KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "{stored} needs shared state");
+    }
 
     // The served document lists the relayed routes and leaves out the ones
     // this gateway does not serve.
@@ -3158,7 +3393,14 @@ async fn speech_api_passes_through_to_izwi_servers() {
     ] {
         assert!(paths.contains_key(served), "{served}");
     }
-    for unserved in ["/v1/audio/voices", "/v1/realtime"] {
+    for unserved in [
+        "/v1/audio/voices",
+        "/v1/files",
+        "/v1/batches/{batch_id}",
+        "/v1/jobs/{job_id}",
+        "/v1/realtime",
+        "/v1/realtime/media-stream",
+    ] {
         assert!(!paths.contains_key(unserved), "{unserved}");
     }
 
@@ -3181,4 +3423,321 @@ async fn speech_api_passes_through_to_izwi_servers() {
         r#"audio-for:{"type":"input.text","text":"Hello."}"#
     );
     ws.close(None).await.unwrap();
+}
+
+/// An upstream sees one caller, the gateway, so every relay names the
+/// caller's tenant: the same for the keys of one tenant, another for the
+/// next tenant, the minting principal's for a client-secret session, and
+/// never what the client sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relays_name_the_callers_tenant_to_the_upstream() {
+    use crate::api::request_context::GATEWAY_TENANT_HEADER;
+    use crate::app::audio_proxy::AudioUpstreams;
+    use crate::app::openai_realtime_proxy::OpenAiRealtimeUpstreams;
+    use axum::extract::ws::{Message as AxumMessage, WebSocketUpgrade};
+    use axum::http::HeaderMap;
+    use sha2::{Digest, Sha256};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue};
+
+    const SAME_TENANT_KEY: &str = "scoped-same-tenant-key-135791";
+
+    /// The tenant header values that reached the upstream.
+    fn tenants(headers: &HeaderMap) -> Vec<String> {
+        headers
+            .get_all(GATEWAY_TENANT_HEADER)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect()
+    }
+    // A stand-in izwi-server that answers with the tenant it was told.
+    let socket = |headers: HeaderMap, upgrade: WebSocketUpgrade| async move {
+        upgrade
+            .protocols(["realtime"])
+            .on_upgrade(move |mut socket| async move {
+                let created = json!({"type": "session.created", "tenants": tenants(&headers)});
+                let _ = socket
+                    .send(AxumMessage::Text(created.to_string().into()))
+                    .await;
+            })
+    };
+    let mint = |headers: HeaderMap| async move {
+        axum::Json(json!({
+            "value": "ek_minted",
+            "expires_at": 4_102_444_800u64,
+            "tenants": tenants(&headers),
+        }))
+    };
+    let upstream_app = Router::new()
+        .route("/v1/realtime", axum::routing::get(socket))
+        .route("/v1/audio/speech/stream", axum::routing::get(socket))
+        .route("/v1/realtime/client_secrets", axum::routing::post(mint))
+        .fallback(
+            |headers: HeaderMap| async move { axum::Json(json!({"tenants": tenants(&headers)})) },
+        );
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!(
+        "http://127.0.0.1:{}",
+        upstream_listener.local_addr().unwrap().port()
+    );
+    tokio::spawn(async move { axum::serve(upstream_listener, upstream_app).await });
+
+    let directory = {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var("IZWI_TEST_GW_SCOPED_A", TEST_SCOPED_INFERENCE_KEY);
+        std::env::set_var("IZWI_TEST_GW_SCOPED_B", TEST_SCOPED_OTHER_TENANT_KEY);
+        std::env::set_var("IZWI_TEST_GW_SCOPED_C", SAME_TENANT_KEY);
+        let directory = scoped_key_directory(
+            r#"{"version":1,"principals":[
+                {"principal_id":"svc-alpha","roles":["inference"],"tenant_id":"tenant-alpha","key_ref":"env:IZWI_TEST_GW_SCOPED_A"},
+                {"principal_id":"svc-beta","roles":["inference"],"tenant_id":"tenant-beta","key_ref":"env:IZWI_TEST_GW_SCOPED_B"},
+                {"principal_id":"svc-alpha-2","roles":["inference"],"tenant_id":"tenant-alpha","key_ref":"env:IZWI_TEST_GW_SCOPED_C"}]}"#,
+        )
+        .await;
+        for name in ["A", "B", "C"] {
+            std::env::remove_var(format!("IZWI_TEST_GW_SCOPED_{name}"));
+        }
+        directory
+    };
+    let (state, _worker) = registry_gateway_state(ModelVariant::Qwen354BGguf).await;
+    let app = create_gateway_router(
+        state
+            .with_principal_keys(directory)
+            .with_audio_upstreams(
+                AudioUpstreams::new(vec![upstream.clone()], None, true, 2).unwrap(),
+            )
+            .with_openai_realtime(OpenAiRealtimeUpstreams::new(vec![upstream], None, 8).unwrap()),
+        &GatewayServeConfig::default(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let tenant = |namespace: &str| json!([hex::encode(Sha256::digest(namespace.as_bytes()))]);
+    let alpha = tenant("tenant:tenant-alpha");
+    let beta = tenant("tenant:tenant-beta");
+    assert_ne!(alpha, beta);
+
+    // Every HTTP relay, whatever the client claims.
+    for (method, path) in [
+        (reqwest::Method::GET, "/v1/files"),
+        (reqwest::Method::POST, "/v1/batches"),
+        (reqwest::Method::GET, "/v1/jobs/job_1"),
+        (reqwest::Method::POST, "/v1/audio/speech"),
+        (reqwest::Method::GET, "/v1/audio/speech/speech_1"),
+        (reqwest::Method::GET, "/v1/realtime/capabilities"),
+    ] {
+        for (key, expected) in [
+            (TEST_SCOPED_INFERENCE_KEY, &alpha),
+            (SAME_TENANT_KEY, &alpha),
+            (TEST_SCOPED_OTHER_TENANT_KEY, &beta),
+        ] {
+            let response = client
+                .request(method.clone(), format!("{base}{path}"))
+                .bearer_auth(key)
+                .header(GATEWAY_TENANT_HEADER, "forged")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200, "{method} {path}");
+            let relayed: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(&relayed["tenants"], expected, "{method} {path}");
+        }
+    }
+    // The bootstrap key is a caller of its own.
+    let root: serde_json::Value = client
+        .get(format!("{base}/v1/files"))
+        .bearer_auth(TEST_API_KEY)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(root["tenants"].as_array().unwrap().len(), 1);
+    assert!(root["tenants"] != alpha && root["tenants"] != beta);
+
+    // The sockets: a key, and a browser with the client secret tenant alpha
+    // minted and no gateway key.
+    let minted: serde_json::Value = client
+        .post(format!("{base}/v1/realtime/client_secrets"))
+        .bearer_auth(TEST_SCOPED_INFERENCE_KEY)
+        .json(&json!({"session": {"type": "realtime"}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(minted["tenants"], alpha);
+    let secret_protocol = "realtime, openai-insecure-api-key.ek_minted";
+    let beta_key = format!("Bearer {TEST_SCOPED_OTHER_TENANT_KEY}");
+    for (path, credential, expected) in [
+        (
+            "/v1/realtime?model=izwi-voice",
+            ("authorization", beta_key.as_str()),
+            &beta,
+        ),
+        (
+            "/v1/audio/speech/stream",
+            ("authorization", beta_key.as_str()),
+            &beta,
+        ),
+        (
+            "/v1/realtime?model=izwi-voice",
+            ("sec-websocket-protocol", secret_protocol),
+            &alpha,
+        ),
+    ] {
+        let mut request = format!("ws://127.0.0.1:{port}{path}")
+            .into_client_request()
+            .unwrap();
+        let headers = request.headers_mut();
+        headers.insert(credential.0, HeaderValue::from_str(credential.1).unwrap());
+        headers.insert(GATEWAY_TENANT_HEADER, HeaderValue::from_static("forged"));
+        let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let created = ws.next().await.unwrap().unwrap();
+        let created: serde_json::Value = serde_json::from_str(created.to_text().unwrap()).unwrap();
+        assert_eq!(&created["tenants"], expected, "{path}");
+    }
+}
+
+/// Files, batches and durable jobs pass through to izwi-servers that share
+/// one store: every method reaches the upstream with its path and query, an
+/// upload streams through whole, and the gateway's own authentication
+/// stands in front.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn files_batches_and_jobs_pass_through_with_shared_state() {
+    use crate::app::audio_proxy::AudioUpstreams;
+
+    /// What reached the upstream, as the response.
+    async fn echo(request: axum::extract::Request) -> Response {
+        let method = request.method().to_string();
+        let path = request
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_default();
+        let content_type = request
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let authorized = request
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            == Some("Bearer audio-key");
+        let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        if !authorized {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        axum::Json(json!({
+            "method": method,
+            "path": path,
+            "content_type": content_type,
+            "bytes": body.len(),
+        }))
+        .into_response()
+    }
+    let upstream_app = Router::new().fallback(echo);
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream_listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(upstream_listener, upstream_app).await });
+
+    let (state, _worker) = registry_gateway_state(ModelVariant::Qwen354BGguf).await;
+    let upstreams = AudioUpstreams::new(
+        vec![format!("http://127.0.0.1:{upstream_port}")],
+        Some("audio-key".to_string()),
+        true,
+        2,
+    )
+    .unwrap();
+    let app = create_gateway_router(
+        state.with_audio_upstreams(upstreams),
+        &GatewayServeConfig::default(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+
+    // An upload larger than any JSON body limit of the gateway arrives whole.
+    let upload = vec![b'a'; 3 * 1024 * 1024];
+    let uploaded: serde_json::Value = client
+        .post(format!("{base}/v1/files"))
+        .bearer_auth(TEST_API_KEY)
+        .header("content-type", "multipart/form-data; boundary=x")
+        .body(upload.clone())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        uploaded,
+        json!({
+            "method": "POST",
+            "path": "/v1/files",
+            "content_type": "multipart/form-data; boundary=x",
+            "bytes": upload.len(),
+        })
+    );
+
+    for (method, path) in [
+        (reqwest::Method::GET, "/v1/files?purpose=batch&limit=5"),
+        (reqwest::Method::GET, "/v1/files/file-1"),
+        (reqwest::Method::GET, "/v1/files/file-1/content"),
+        (reqwest::Method::DELETE, "/v1/files/file-1"),
+        (reqwest::Method::POST, "/v1/batches"),
+        (reqwest::Method::GET, "/v1/batches?after=batch_1"),
+        (reqwest::Method::GET, "/v1/batches/batch_1"),
+        (reqwest::Method::POST, "/v1/batches/batch_1/cancel"),
+        (reqwest::Method::GET, "/v1/jobs/job_1"),
+        (reqwest::Method::GET, "/v1/jobs/job_1/artifacts"),
+        (reqwest::Method::POST, "/v1/jobs/job_1/cancel"),
+        (reqwest::Method::POST, "/v1/jobs/job_1/retry"),
+    ] {
+        let response = client
+            .request(method.clone(), format!("{base}{path}"))
+            .bearer_auth(TEST_API_KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{method} {path}");
+        let relayed: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(relayed["method"], method.as_str(), "{path}");
+        assert_eq!(relayed["path"], path);
+    }
+
+    let unauthenticated = client.get(format!("{base}/v1/files")).send().await.unwrap();
+    assert_eq!(unauthenticated.status(), 401);
+
+    let document: serde_json::Value = client
+        .get(format!("{base}/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let paths = document["paths"].as_object().unwrap();
+    for served in [
+        "/v1/files",
+        "/v1/files/{file_id}/content",
+        "/v1/batches/{batch_id}/cancel",
+        "/v1/jobs/{job_id}",
+        "/v1/audio/voices",
+    ] {
+        assert!(paths.contains_key(served), "{served}");
+    }
 }

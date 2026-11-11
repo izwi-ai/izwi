@@ -1164,6 +1164,20 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     );
     add_operation(
         paths,
+        "/v1/realtime/media-stream",
+        "get",
+        "Realtime",
+        "Open a telephony media-stream WebSocket",
+        "Upgrade to a phone call in the media-stream framing of call-centre platforms and \
+         carrier APIs: JSON text frames (`connected`, `start`, `media`, `mark`, `dtmf`, `stop`) \
+         with base64 8 kHz μ-law audio. The call runs as a `/v1/realtime` session. `?model=` and \
+         `?intent=transcription` select it as on `/v1/realtime`; `voice`, `instructions`, \
+         `language`, `transcription_model` and `transcripts` configure it, in the query string or \
+         the `start` frame's `customParameters`.",
+        websocket_response(),
+    );
+    add_operation(
+        paths,
         "/v1/realtime/client_secrets",
         "post",
         "Realtime",
@@ -1179,11 +1193,115 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "get",
         "Realtime",
         "List realtime capabilities",
-        "The realtime profiles `model` may name, the voices, audio formats and turn detection \
-         types, and the session limits.",
+        "The realtime profiles `model` may name, the transcription models and whether each \
+         transcribes a turn while it is spoken (`transcription_mode`: `live` or `turn`), the \
+         voices, audio formats and turn detection types, and the session limits.",
         preview_response(),
     );
     add_speech_api_paths(paths);
+    add_files_paths(paths);
+    add_batches_paths(paths);
+}
+
+/// OpenAI's Batch API over the audio routes.
+fn add_batches_paths(paths: &mut Map<String, Value>) {
+    add_operation(
+        paths,
+        "/v1/batches",
+        "post",
+        "OpenAI Compatible",
+        "Create batch",
+        "JSON `input_file_id` (a JSONL file of purpose `batch`), `endpoint` \
+         (/v1/audio/transcriptions, /v1/audio/translations or /v1/audio/speech), \
+         `completion_window` (`24h`) and optional `metadata`. Each line is OpenAI's \
+         `{custom_id, method, url, body}`; a transcription or translation body names its audio \
+         by `file_id` or `audio_base64`. Lines run as batch work; at most \
+         IZWI_BATCH_MAX_REQUESTS (50000) per file. With `metadata.webhook_url`, a signed \
+         `batch.completed`, `batch.failed`, `batch.cancelled` or `batch.expired` event is \
+         posted there when the batch ends; refused with 400 unless the operator set \
+         IZWI_BATCH_WEBHOOK_SECRET.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/batches",
+        "get",
+        "OpenAI Compatible",
+        "List batches",
+        "The caller's batches, newest first; `after` and `limit` (1 to 100) page them.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/batches/{batch_id}",
+        "get",
+        "OpenAI Compatible",
+        "Get batch",
+        "The batch: status, `request_counts`, and `output_file_id` and `error_file_id` once it \
+         has ended. A speech line's response body is `{audio_file_id, format, bytes}`.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/batches/{batch_id}/cancel",
+        "post",
+        "OpenAI Compatible",
+        "Cancel batch",
+        "Stops a batch that is validating or in progress: `cancelling`, then `cancelled` with \
+         the results of the lines that finished. A batch that has ended is a 409.",
+        preview_response(),
+    );
+}
+
+/// OpenAI's Files API, for the Batch API's input, audio and output.
+fn add_files_paths(paths: &mut Map<String, Value>) {
+    add_operation(
+        paths,
+        "/v1/files",
+        "post",
+        "OpenAI Compatible",
+        "Create file",
+        "Multipart `file` and `purpose`: `batch` (a batch's JSONL input) or `user_data` (audio a \
+         batch line names by `file_id`). At most IZWI_FILES_MAX_BYTES (200 MB); larger is 413.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/files",
+        "get",
+        "OpenAI Compatible",
+        "List files",
+        "The caller's files, newest first; `purpose`, `limit` (1 to 10000), `after` and `order` \
+         (`asc` or `desc`) filter and page them.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/files/{file_id}",
+        "get",
+        "OpenAI Compatible",
+        "Get file",
+        "A file's metadata. `batch_output` files carry `expires_at`, 30 days after creation.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/files/{file_id}",
+        "delete",
+        "OpenAI Compatible",
+        "Delete file",
+        "Deletes the file and its content.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/files/{file_id}/content",
+        "get",
+        "OpenAI Compatible",
+        "Download file content",
+        "The file's bytes.",
+        preview_response(),
+    );
 }
 
 /// The speech API beyond `/v1/audio/speech` and `/transcriptions`:
@@ -1199,7 +1317,8 @@ fn add_speech_api_paths(paths: &mut Map<String, Value>) {
          Granite Speech 5.0, Nemotron 3.5 Transcribe), `prompt`, `response_format` (json, text, \
          srt, verbose_json, vtt), `temperature`. The target is English unless `to_language` / \
          `target_language` names another; `language` hints the source; `stream` gives \
-         `transcript.text.*` events.",
+         `transcript.text.*` events. `service_tier` (or the X-Izwi-Service-Tier header) works \
+         as on transcriptions.",
         preview_response(),
     );
     add_operation(
@@ -1211,7 +1330,11 @@ fn add_speech_api_paths(paths: &mut Map<String, Value>) {
         "Up to IZWI_TTS_BATCH_MAX_ITEMS speech requests: top-level fields are defaults each of \
          `items` overrides. Returns `{id, object, results[], total, succeeded, failed}`; each \
          result carries base64 `audio_data` or an OpenAI `error` object, and an `id` for \
-         `GET /v1/audio/speech/{speech_id}`.",
+         `GET /v1/audio/speech/{speech_id}`. A top-level `service_tier` (or the \
+         X-Izwi-Service-Tier header) applies to every item: they run as batch work (`flex`) \
+         unless it is `default`, `auto` or `priority`. The \
+         response names the tier served in X-Izwi-Service-Tier, and in `service_tier` when the \
+         request named one.",
         preview_response(),
     );
     add_operation(
@@ -2002,8 +2125,9 @@ fn create_chat_completion() {}
     summary = "Create speech",
     request_body = SpeechRequest,
     responses(
-        (status = 200, description = "Encoded audio (Content-Type per response_format; a chunked body for stream_format audio), or server-sent audio events for stream_format sse. X-Izwi-Speech-Id names the request for GET /v1/audio/speech/{speech_id}."),
+        (status = 200, description = "Encoded audio (Content-Type per response_format; a chunked body for stream_format audio), or server-sent audio events for stream_format sse. X-Izwi-Speech-Id names the request for GET /v1/audio/speech/{speech_id}; X-Izwi-Service-Tier names the tier that served it."),
         (status = 400, description = "Invalid request", body = ApiErrorEnvelope),
+        (status = 429, description = "No admission slot became free within IZWI_ADMISSION_QUEUE_TIMEOUT_SECS (Retry-After says when to retry): code rate_limit_exceeded, or resource_unavailable for a flex request.", body = ApiErrorEnvelope),
         (status = 500, description = "Server error", body = ApiErrorEnvelope)
     )
 )]
@@ -2023,8 +2147,9 @@ fn create_speech() {}
         )
     ),
     responses(
-        (status = 200, description = "Transcription result as JSON, verbose JSON, text, SRT, VTT, or server-sent events", body = TranscriptionResponse),
+        (status = 200, description = "Transcription result as JSON, verbose JSON, text, SRT, VTT, or server-sent events. X-Izwi-Service-Tier names the tier that served it.", body = TranscriptionResponse),
         (status = 400, description = "Invalid request", body = ApiErrorEnvelope),
+        (status = 429, description = "No admission slot became free within IZWI_ADMISSION_QUEUE_TIMEOUT_SECS (Retry-After says when to retry): code rate_limit_exceeded, or resource_unavailable for a flex request.", body = ApiErrorEnvelope),
         (status = 500, description = "Server error", body = ApiErrorEnvelope)
     )
 )]
@@ -2453,6 +2578,12 @@ pub struct SpeechRequest {
     /// joined by newlines; replaces `input` (giving both is a 400). Models
     /// with `supports_speaker_dialogue` only.
     pub script: Option<Vec<crate::api::speech_dialogue::SpeechScriptLine>>,
+    /// Izwi extension of OpenAI's field: `flex` runs the request as batch
+    /// work behind interactive and streaming requests; `default`, `auto` or
+    /// absent keeps the route's own class; `priority` is served as
+    /// `default`. The `X-Izwi-Service-Tier` request header is read when the
+    /// body names none.
+    pub service_tier: Option<String>,
     /// Model-specific sampling and controls (`top_p`, `seed`, `cfg_weight`,
     /// `exaggeration`, `min_p`, ...); a control the model does not take is
     /// refused.
@@ -2503,8 +2634,22 @@ pub struct TranscriptionMultipartRequest {
     /// verbose_json then carries `speaker_turns`.
     pub speaker_labels: Option<bool>,
     pub max_tokens: Option<usize>,
+    /// 0 to 1, checked and without effect: every ASR model decodes
+    /// greedily (Whisper with its fallback ladder from 0).
     pub temperature: Option<f32>,
+    /// `"auto"`, the server's own splitting of long audio at pauses, or
+    /// omitted. A `server_vad` object is refused with 400.
+    pub chunking_strategy: Option<serde_json::Value>,
+    /// OpenAI's `include[]`. `logprobs` is refused with 400: no model
+    /// returns token log-probabilities.
+    pub include: Option<Vec<String>>,
     pub timestamp_granularities: Option<Vec<String>>,
+    /// Izwi extension of OpenAI's field: `flex` runs the request as batch
+    /// work behind interactive and streaming requests; `default`, `auto` or
+    /// absent keeps the route's own class; `priority` is served as
+    /// `default`. The `X-Izwi-Service-Tier` request header is read when the
+    /// body names none.
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2531,13 +2676,30 @@ pub struct TranscriptionJsonRequest {
     /// verbose_json then carries `speaker_turns`.
     pub speaker_labels: Option<bool>,
     pub max_tokens: Option<usize>,
+    /// 0 to 1, checked and without effect: every ASR model decodes
+    /// greedily (Whisper with its fallback ladder from 0).
     pub temperature: Option<f32>,
+    /// `"auto"`, the server's own splitting of long audio at pauses, or
+    /// omitted. A `server_vad` object is refused with 400.
+    pub chunking_strategy: Option<serde_json::Value>,
+    /// OpenAI's `include[]`. `logprobs` is refused with 400: no model
+    /// returns token log-probabilities.
+    pub include: Option<Vec<String>>,
     pub timestamp_granularities: Option<Vec<String>>,
+    /// Izwi extension of OpenAI's field: `flex` runs the request as batch
+    /// work behind interactive and streaming requests; `default`, `auto` or
+    /// absent keeps the route's own class; `priority` is served as
+    /// `default`. The `X-Izwi-Service-Tier` request header is read when the
+    /// body names none.
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TranscriptionResponse {
     pub text: String,
+    /// The tier that served the request (`flex` or `default`), when the
+    /// request named one.
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2556,6 +2718,9 @@ pub struct VerboseTranscriptionResponse {
     /// `alignment_source` (model, heuristic or failed), `alignment_warnings`
     /// for windows timed by interval fallback, or `alignment_error`.
     pub izwi_asr_diagnostics: Option<serde_json::Value>,
+    /// The tier that served the request (`flex` or `default`), when the
+    /// request named one.
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2650,9 +2815,10 @@ mod tests {
     use std::collections::HashSet;
 
     /// The gateway's document: this one restricted to the routes the gateway
-    /// serves. `/v1/realtime` needs OpenAI Realtime upstreams, the audio
-    /// routes need audio upstreams (or Realtime ones), and voices and
-    /// consents also need `--gateway-audio-shared-state`.
+    /// serves. `/v1/realtime`, its client secrets and its capabilities need
+    /// OpenAI Realtime upstreams, the audio routes need audio upstreams (or
+    /// Realtime ones), and voices, consents, files, batches and jobs also
+    /// need `--gateway-audio-shared-state`.
     fn gateway_document() -> Value {
         let mut doc = document();
         if let Some(paths) = doc.get_mut("paths").and_then(Value::as_object_mut) {
@@ -2668,6 +2834,9 @@ mod tests {
                         | "/v1/models"
                         | "/v1/models/{model}"
                         | "/v1/realtime"
+                        | "/v1/realtime/media-stream"
+                        | "/v1/realtime/client_secrets"
+                        | "/v1/realtime/capabilities"
                         | "/v1/audio/speech"
                         | "/v1/audio/speech/batch"
                         | "/v1/audio/speech/stream"
@@ -2679,6 +2848,16 @@ mod tests {
                         | "/v1/audio/voice_consents"
                         | "/v1/audio/voice_consents/{consent_id}"
                         | "/v1/audio/consent_phrases"
+                        | "/v1/files"
+                        | "/v1/files/{file_id}"
+                        | "/v1/files/{file_id}/content"
+                        | "/v1/batches"
+                        | "/v1/batches/{batch_id}"
+                        | "/v1/batches/{batch_id}/cancel"
+                        | "/v1/jobs/{job_id}"
+                        | "/v1/jobs/{job_id}/cancel"
+                        | "/v1/jobs/{job_id}/retry"
+                        | "/v1/jobs/{job_id}/artifacts"
                 )
             });
         }
