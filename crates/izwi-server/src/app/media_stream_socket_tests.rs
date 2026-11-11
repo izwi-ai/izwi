@@ -97,6 +97,17 @@ async fn next(client: &mut Client) -> Result<Value, Option<u16>> {
     }
 }
 
+/// Waits until no call holds a session slot. The carrier sees its socket
+/// close before the server task that held the slot has finished, so the
+/// count is read until it settles, not once.
+async fn session_slots_free(state: &crate::state::AppState) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while state.realtime_session_admission_snapshot().active > 0 {
+        assert!(std::time::Instant::now() < deadline, "the session ends");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// A client secret whose session cuts turns the way the `/v1/realtime`
 /// socket tests do: a tone is no voice, so the VAD takes anything.
 fn secret(session_type: &str, input: Value) -> Vec<(&'static str, String)> {
@@ -170,7 +181,7 @@ async fn a_transcription_call_streams_transcript_frames() {
     .await;
     assert_eq!(next(&mut client).await, Err(Some(1000)));
     sessions_closed(&script).await;
-    assert_eq!(server.state.realtime_session_admission_snapshot().active, 0);
+    session_slots_free(&server.state).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -200,11 +211,7 @@ async fn a_conversation_call_answers_a_turn_and_keeps_session_events_off_the_str
 
     // The carrier hanging up ends the session.
     drop(client);
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while server.state.realtime_session_admission_snapshot().active > 0 {
-        assert!(std::time::Instant::now() < deadline, "the session ends");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    session_slots_free(&server.state).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -242,7 +249,7 @@ async fn calls_that_cannot_run_are_refused() {
         panic!("expected an error frame, got {message:?}");
     };
     assert!(text.as_str().contains("Unsupported media format"), "{text}");
-    assert_eq!(server.state.realtime_session_admission_snapshot().active, 0);
+    session_slots_free(&server.state).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
