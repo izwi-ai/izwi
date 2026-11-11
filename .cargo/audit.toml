@@ -4,4 +4,13 @@
 # entry the reason it does not apply, and recheck it when the crate that
 # pulls it in ships a release.
 [advisories]
-ignore = []
+ignore = [
+    # Bundled SQLite before 3.54.0 can return uninitialized page-cache memory
+    # when it opens a database beside a crafted -wal file of another page
+    # size. The fix is libsqlite3-sys 0.39, and sqlx-sqlite 0.9.0 (the latest,
+    # through sea-orm) requires < 0.38. Izwi opens only its own store, at
+    # IZWI_DB_PATH or IZWI_DATABASE_URL in the operator's data directory; it
+    # never opens a SQLite file a client supplied, and whoever can write that
+    # directory can already read the store.
+    "RUSTSEC-2026-0459",
+]
