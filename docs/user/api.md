@@ -339,8 +339,10 @@ Tool behavior:
   carries its `index`, `id`, `type` and `function.name`, and the
   `function.arguments` fragments concatenate to the JSON arguments. A Qwen
   XML call is sent as soon as its name is known and its arguments one
-  parameter at a time; a Qwen3 JSON call and an LFM2.5 call list are sent
-  when they close. Text that might open a call is held back until the next
+  parameter at a time; a parameter declared as a `string` is sent as its
+  text arrives, so a long value (a file body) streams instead of arriving
+  at once. A Qwen3 JSON call and an LFM2.5 call list are sent when they
+  close. Text that might open a call is held back until the next
   delta settles it, and a block that does not parse is sent as text.
 - Qwen3 uses the Hermes format its template defines: tools are listed in the
   system turn, the model writes

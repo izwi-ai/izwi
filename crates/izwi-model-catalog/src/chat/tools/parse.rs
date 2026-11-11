@@ -138,6 +138,13 @@ enum State {
     Params {
         params: usize,
     },
+    /// Inside the value of a `string` parameter, sent on as it arrives;
+    /// `params` arguments came before it, and `started` once any of its
+    /// text was seen.
+    TextParam {
+        params: usize,
+        started: bool,
+    },
     /// After `</function>`, before `</tool_call>`.
     BlockEnd,
     /// Any other `<tool_call>` body (a Hermes JSON call), held whole until
@@ -259,6 +266,14 @@ impl ToolCallParser {
                 self.truncated = true;
                 out.push_arguments(self.calls - 1, close_arguments(params).to_string())
             }
+            State::TextParam { params, .. } => {
+                self.truncated = true;
+                let tail = pending.strip_suffix('\n').unwrap_or(&pending);
+                out.push_arguments(
+                    self.calls - 1,
+                    format!("{}\"{}", json_fragment(tail), close_arguments(params + 1)),
+                )
+            }
             State::BlockEnd | State::Done => {}
         }
         self.state = State::Text;
@@ -339,6 +354,7 @@ impl ToolCallParser {
                 true
             }
             State::Params { params } => self.step_params(params, out),
+            State::TextParam { params, started } => self.step_text_param(params, started, out),
             State::BlockEnd => {
                 let body = self.pending.trim_start();
                 if let Some(rest) = body.strip_prefix(CALL_CLOSE) {
@@ -423,6 +439,22 @@ impl ToolCallParser {
             let Some(key_end) = rest.find('>') else {
                 return false;
             };
+            if self
+                .schemas
+                .is_plain_string(&self.current, rest[..key_end].trim())
+            {
+                // A string's text is its value: open it now and pass the
+                // text on as it arrives.
+                let separator = if params == 0 { "{" } else { "," };
+                let key = Value::String(rest[..key_end].trim().to_string());
+                out.push_arguments(index, format!("{separator}{key}:\""));
+                self.pending = rest[key_end + 1..].to_string();
+                self.state = State::TextParam {
+                    params,
+                    started: false,
+                };
+                return true;
+            }
             let Some(value_end) = rest[key_end + 1..]
                 .find(PARAMETER_CLOSE)
                 .map(|at| key_end + 1 + at)
@@ -469,6 +501,44 @@ impl ToolCallParser {
         true
     }
 
+    /// Inside a `string` parameter's value: everything that cannot be part
+    /// of its closing tag is sent as a JSON string fragment. The newline the
+    /// templates put after the opening tag and before the closing tag is
+    /// not part of the value.
+    fn step_text_param(&mut self, params: usize, started: bool, out: &mut ParsedOutput) -> bool {
+        const END: &str = "\n</parameter>";
+        let index = self.calls - 1;
+        if !started {
+            if self.pending.is_empty() {
+                return false;
+            }
+            if let Some(rest) = self.pending.strip_prefix('\n') {
+                self.pending = rest.to_string();
+            }
+            self.state = State::TextParam {
+                params,
+                started: true,
+            };
+            return true;
+        }
+        if let Some(at) = self.pending.find(PARAMETER_CLOSE) {
+            let value = &self.pending[..at];
+            let value = value.strip_suffix('\n').unwrap_or(value);
+            out.push_arguments(index, format!("{}\"", json_fragment(value)));
+            self.pending = self.pending[at + PARAMETER_CLOSE.len()..].to_string();
+            self.state = State::Params { params: params + 1 };
+            return true;
+        }
+        let keep = partial_tag_suffix(&self.pending, END)
+            .max(partial_tag_suffix(&self.pending, PARAMETER_CLOSE));
+        let emit = self.pending.len() - keep;
+        if emit > 0 {
+            let text: String = self.pending.drain(..emit).collect();
+            out.push_arguments(index, json_fragment(&text));
+        }
+        false
+    }
+
     /// A Hermes-style `{"name": ..., "arguments": {...}}` call body naming a
     /// declared tool.
     fn json_call(&self, body: &str) -> Option<(String, String)> {
@@ -488,6 +558,12 @@ impl ToolCallParser {
         };
         Some((name, arguments))
     }
+}
+
+/// `text` escaped as the inside of a JSON string.
+fn json_fragment(text: &str) -> String {
+    let quoted = Value::String(text.to_string()).to_string();
+    quoted[1..quoted.len() - 1].to_string()
 }
 
 /// Whether `body` could still become one JSON value with more text: it

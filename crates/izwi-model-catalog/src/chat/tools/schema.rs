@@ -49,6 +49,14 @@ impl ToolSchemas {
             .and_then(|(_, properties)| properties.get(parameter))
     }
 
+    /// Whether a parameter is declared as a plain `string`, so its bare text
+    /// is its value whatever it holds and can be passed on as it arrives.
+    pub fn is_plain_string(&self, tool: &str, parameter: &str) -> bool {
+        self.property(tool, parameter)
+            .and_then(declared_types)
+            .is_some_and(|kinds| kinds == ["string"])
+    }
+
     /// The value of an argument written as bare text (the XML formats'
     /// `<parameter=k>` body), read by the parameter's declared type: a
     /// `string` parameter keeps its text even when the text is `123`, `true`

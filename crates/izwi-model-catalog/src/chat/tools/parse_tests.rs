@@ -270,6 +270,41 @@ fn bare_text_arguments_are_read_by_their_declared_type() {
 }
 
 #[test]
+fn a_string_argument_streams_as_it_is_written() {
+    let tools = vec![
+        json!({"type": "function", "function": {"name": "write_file", "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}, "mode": {"type": "integer"}}
+        }}}),
+    ];
+    let body = "fn main() {\n    println!(\"a < b </param — \\ ✓\");\n}\n";
+    let text = format!(
+        "<tool_call>\n<function=write_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n<parameter=content>\n{body}\n</parameter>\n<parameter=mode>\n420\n</parameter>\n</function>\n</tool_call>"
+    );
+    let parser = || ToolCallParser::new(ToolDialect::QwenXml).with_tools(&tools);
+    let want = json!({"path": "src/main.rs", "content": body, "mode": 420});
+    for chunk in 1..=text.chars().count() {
+        let (content, calls, _) = stream_with(parser(), &text, chunk);
+        assert_eq!(content, "", "chunk {chunk}");
+        assert_eq!(arguments(&calls[0]), want, "chunk {chunk}");
+    }
+    // Token by token the long value arrives in many fragments, not one.
+    let (_, _, fragments) = stream_with(parser(), &text, 1);
+    assert!(fragments > 40, "{fragments} fragments");
+    // Cut off inside the value, the call keeps the text written so far.
+    let cut = &text[..text.find("println").unwrap()];
+    let mut parser = parser();
+    let mut parsed = parser.push(cut);
+    parsed.extend(parser.finish());
+    assert!(parser.truncated());
+    let (_, calls) = parsed.into_calls();
+    assert_eq!(
+        arguments(&calls[0]),
+        json!({"path": "src/main.rs", "content": "fn main() {\n    "})
+    );
+}
+
+#[test]
 fn calls_to_undeclared_tools_stay_text() {
     let parser = || ToolCallParser::new(ToolDialect::QwenXml).with_tools(&typed_tools());
     let xml = "<tool_call>\n<function=delete_everything>\n</function>\n</tool_call>";
