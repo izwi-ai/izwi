@@ -65,20 +65,20 @@ impl ToolPlan {
             (ToolChoice::Named(_), Some(index)) => Some(grammar(
                 self.dialect,
                 &tools,
-                Start::AfterName(index),
+                After::Name(index),
                 self.parallel,
             )),
             (ToolChoice::Required, _) => Some(grammar(
                 self.dialect,
                 &tools,
-                Start::AfterCallOpening,
+                After::CallOpening,
                 self.parallel,
             )),
             _ => None,
         };
         Some(ToolConstraint {
             opener: self.dialect.call_opener().to_string(),
-            call: grammar(self.dialect, &tools, Start::AfterOpener, self.parallel),
+            call: grammar(self.dialect, &tools, After::Opener, self.parallel),
             forced,
             max_calls: self.max_calls().map(|max| max as u32),
             strict,
@@ -137,17 +137,17 @@ fn is_plain_name(name: &str) -> bool {
 
 /// Where in a call a grammar starts.
 #[derive(Clone, Copy)]
-enum Start {
+enum After {
     /// Right after the opening marker (`<tool_call>`, `<|tool_call_start|>`).
-    AfterOpener,
+    Opener,
     /// After the prefix of a required call, up to where the name goes.
-    AfterCallOpening,
+    CallOpening,
     /// After the prefix of a call to the tool at this index, up to where its
     /// arguments go.
-    AfterName(usize),
+    Name(usize),
 }
 
-fn grammar(dialect: ToolDialect, tools: &[Tool<'_>], start: Start, parallel: bool) -> String {
+fn grammar(dialect: ToolDialect, tools: &[Tool<'_>], start: After, parallel: bool) -> String {
     let mut rules = Rules::default();
     let start_rule = match dialect {
         ToolDialect::QwenXml | ToolDialect::Lfm3Xml => xml_start(&mut rules, tools, start),
@@ -231,14 +231,14 @@ fn value_kind(schema: &Value) -> ValueKind<'_> {
 const XML_TEXT_VALUE: &str = "xml_text[lazy]: /(.|\\n)*\\n<\\/parameter>\\n/";
 const XML_ANY_PARAMETERS: &str = "xml_any: (\"<parameter=\" /[^>\\n]+/ \">\\n\" xml_text)*";
 
-fn xml_start(rules: &mut Rules, tools: &[Tool<'_>], start: Start) -> String {
+fn xml_start(rules: &mut Rules, tools: &[Tool<'_>], start: After) -> String {
     const END: &str = "\"</function>\\n</tool_call>\"";
     let bodies: Vec<String> = tools
         .iter()
         .enumerate()
         .map(|(index, tool)| xml_body(rules, index, tool))
         .collect();
-    if let Start::AfterName(index) = start {
+    if let After::Name(index) = start {
         return format!("{} {END}", bodies[index]);
     }
     let alternatives: Vec<String> = tools
@@ -248,7 +248,7 @@ fn xml_start(rules: &mut Rules, tools: &[Tool<'_>], start: Start) -> String {
         .collect();
     rules.push("xml_function", &alternatives.join(" | "));
     match start {
-        Start::AfterOpener => format!("\"\\n<function=\" xml_function {END}"),
+        After::Opener => format!("\"\\n<function=\" xml_function {END}"),
         _ => format!("xml_function {END}"),
     }
 }
@@ -293,7 +293,7 @@ fn xml_body(rules: &mut Rules, index: usize, tool: &Tool<'_>) -> String {
 
 // --- Qwen3: {"name": NAME, "arguments": {...}} ---
 
-fn hermes_start(rules: &mut Rules, tools: &[Tool<'_>], start: Start) -> String {
+fn hermes_start(rules: &mut Rules, tools: &[Tool<'_>], start: After) -> String {
     const END: &str = "\"}\" /\\n?/ \"</tool_call>\"";
     let arguments: Vec<String> = tools
         .iter()
@@ -305,7 +305,7 @@ fn hermes_start(rules: &mut Rules, tools: &[Tool<'_>], start: Start) -> String {
             rules.json(&schema)
         })
         .collect();
-    if let Start::AfterName(index) = start {
+    if let After::Name(index) = start {
         return format!("{} {END}", arguments[index]);
     }
     let alternatives: Vec<String> = tools
@@ -320,7 +320,7 @@ fn hermes_start(rules: &mut Rules, tools: &[Tool<'_>], start: Start) -> String {
         .collect();
     rules.push("hermes_call", &alternatives.join(" | "));
     match start {
-        Start::AfterOpener => format!("/\\n?/ \"{{\\\"name\\\": \\\"\" hermes_call {END}"),
+        After::Opener => format!("/\\n?/ \"{{\\\"name\\\": \\\"\" hermes_call {END}"),
         _ => format!("hermes_call {END}"),
     }
 }
@@ -330,7 +330,7 @@ fn hermes_start(rules: &mut Rules, tools: &[Tool<'_>], start: Start) -> String {
 const PY_STRING: &str = "PY_STRING: /'([^'\\\\\\n]|\\\\.)*'/ | /\"([^\"\\\\\\n]|\\\\.)*\"/";
 const PY_ANY_ARGUMENTS: &str = "PY_ANY: /[^()\\n]*/";
 
-fn pythonic_start(rules: &mut Rules, tools: &[Tool<'_>], start: Start, parallel: bool) -> String {
+fn pythonic_start(rules: &mut Rules, tools: &[Tool<'_>], start: After, parallel: bool) -> String {
     const END: &str = "\"]<|tool_call_end|>\"";
     let arguments: Vec<String> = tools
         .iter()
@@ -347,9 +347,9 @@ fn pythonic_start(rules: &mut Rules, tools: &[Tool<'_>], start: Start, parallel:
     rules.push("py_call", &alternatives.join(" | "));
     let more = if parallel { " (\", \" py_call)*" } else { "" };
     match start {
-        Start::AfterOpener => format!("\"[\" py_call{more} {END}"),
-        Start::AfterCallOpening => format!("py_call{more} {END}"),
-        Start::AfterName(index) => format!("{} \")\"{more} {END}", arguments[index]),
+        After::Opener => format!("\"[\" py_call{more} {END}"),
+        After::CallOpening => format!("py_call{more} {END}"),
+        After::Name(index) => format!("{} \")\"{more} {END}", arguments[index]),
     }
 }
 
