@@ -33,6 +33,9 @@ pub struct ResponsesCreateRequest {
     pub tools: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// `false` keeps the answer to one function call.
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
     #[serde(default)]
     pub enable_thinking: Option<bool>,
     #[serde(default)]

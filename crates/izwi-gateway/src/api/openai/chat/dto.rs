@@ -52,6 +52,9 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// `false` keeps the answer to one tool call.
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
     #[serde(default)]
     pub enable_thinking: Option<bool>,
     #[serde(default)]
@@ -104,6 +107,10 @@ pub struct OpenAiInboundMessage {
     pub content: Option<InboundContent>,
     #[serde(default)]
     pub tool_calls: Option<Vec<serde_json::Value>>,
+    /// On an `assistant` message: the reasoning this server returned as
+    /// `reasoning_content`, sent back so the model keeps it.
+    #[serde(default, alias = "reasoning")]
+    pub reasoning_content: Option<String>,
     /// On a `tool` message: the id of the call it answers.
     #[serde(default)]
     pub tool_call_id: Option<String>,

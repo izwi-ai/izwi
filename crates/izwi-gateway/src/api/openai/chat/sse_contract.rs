@@ -8,6 +8,7 @@
 //! (ids and timestamps replaced) must match `testdata/sse/<case>.sse`;
 //! `IZWI_UPDATE_SSE_GOLDENS=1` rewrites the files.
 
+use crate::api::openai::tool_calls::ToolCallFormat;
 use serde_json::{json, Map, Value};
 
 use super::tests::{deltas, generation, sse_payloads, tool_format};

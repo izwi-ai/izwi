@@ -170,6 +170,7 @@ pub use runtime_models::shared::chat::{
 
 /// How `<think>` reasoning splits from a chat answer, shared with the gateway.
 pub use izwi_model_catalog::chat::reasoning as chat_reasoning;
+pub use izwi_model_catalog::chat::tools as chat_tools;
 
 // Canonical native registry/device exports.
 pub use backends::{DeviceProfile, DeviceSelector};

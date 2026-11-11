@@ -46,6 +46,7 @@ use crate::app::voice_realtime::{
     SegmentSynthesis, TtsVoice, TurnControl,
 };
 use crate::state::AppState;
+use izwi_core::chat_tools::render_tool_calls;
 
 /// A reply's token budget when the client leaves it at `"inf"`.
 const DEFAULT_MODULAR_MAX_TOKENS: usize = 1_024;
@@ -931,7 +932,7 @@ async fn run_modular(
     let parser = Arc::new(Mutex::new(
         format
             .filter(|_| !tools.is_empty())
-            .map(ToolCallParser::new),
+            .map(|format| ToolCallParser::new(format).with_tools(&tools)),
     ));
     let reasoning = Arc::new(Mutex::new(ReasoningFilter::default()));
     let (deltas, delta_rx) = mpsc::unbounded_channel::<String>();
@@ -1049,7 +1050,8 @@ async fn run_modular(
         usage.output_text_tokens += generation.tokens_generated as u64;
     });
     if let Some(format) = format.filter(|_| !tools.is_empty()) {
-        let (_, calls) = parse_answer(format, &generation.text);
+        let parser = ToolCallParser::new(format).with_tools(&tools);
+        let (_, calls) = parse_answer(parser, &generation.text);
         emitter.function_calls(&calls);
     }
     Ok(
@@ -1062,19 +1064,9 @@ async fn run_modular(
 }
 
 /// A function call as LFM3-Audio's template writes one.
-fn qwen_xml_call(name: &str, arguments: &str) -> String {
-    let mut call = format!("<tool_call>\n<function={name}>\n");
-    if let Ok(Value::Object(arguments)) = serde_json::from_str::<Value>(arguments) {
-        for (key, value) in arguments {
-            let value = match value {
-                Value::String(text) => text,
-                other => other.to_string(),
-            };
-            call.push_str(&format!("<parameter={key}>\n{value}\n</parameter>\n"));
-        }
-    }
-    call.push_str("</function>\n</tool_call>");
-    call
+fn lfm3_call(name: &str, arguments: &str) -> String {
+    let call = serde_json::json!({"function": {"name": name, "arguments": arguments}});
+    render_tool_calls(ToolCallFormat::Lfm3Xml, &[call]).unwrap_or_default()
 }
 
 /// A unified response: one LFM-Audio round hears the latest user speech in
@@ -1135,7 +1127,7 @@ async fn run_unified(
                 name, arguments, ..
             } => Some(ChatMessage {
                 role: ChatRole::Assistant,
-                content: qwen_xml_call(name, arguments),
+                content: lfm3_call(name, arguments),
             }),
             ItemKind::FunctionCallOutput { output, .. } => Some(ChatMessage {
                 role: ChatRole::Tool,
@@ -1161,9 +1153,10 @@ async fn run_unified(
         .hold(&ctx.state.runtime, variant)
         .await
         .map_err(|err| model_load_error("unified audio", err))?;
-    let parser = Arc::new(Mutex::new(
-        (!tools.is_empty()).then(|| ToolCallParser::new(ToolCallFormat::QwenXml)),
-    ));
+    let parser =
+        Arc::new(Mutex::new((!tools.is_empty()).then(|| {
+            ToolCallParser::new(ToolCallFormat::Lfm3Xml).with_tools(&tools)
+        })));
     let encoder: Arc<Mutex<Option<OutputEncoder>>> = Arc::default();
     let audio_out = plan.modality == Modality::Audio;
     let output_format = plan.output_format;
@@ -1312,7 +1305,8 @@ async fn run_unified(
         emitter.audio_delta(delta, ms, true).await?;
     }
     if !tools.is_empty() {
-        let (_, calls) = parse_answer(ToolCallFormat::QwenXml, &generation.text);
+        let parser = ToolCallParser::new(ToolCallFormat::Lfm3Xml).with_tools(&tools);
+        let (_, calls) = parse_answer(parser, &generation.text);
         emitter.function_calls(&calls);
     }
     Ok(Outcome::Completed)
@@ -1343,7 +1337,7 @@ mod tests {
     #[test]
     fn lfm3_tool_calls_render_in_its_xml() {
         assert_eq!(
-            qwen_xml_call("get_weather", r#"{"city":"Harare","days":2}"#),
+            lfm3_call("get_weather", r#"{"city":"Harare","days":2}"#),
             "<tool_call>\n<function=get_weather>\n<parameter=city>\nHarare\n</parameter>\n\
              <parameter=days>\n2\n</parameter>\n</function>\n</tool_call>"
         );

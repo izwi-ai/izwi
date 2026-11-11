@@ -1,3 +1,3 @@
-text {"text":"Sure, let me check.<tool_call>\n<function=time>\n</function>\n</tool_call>","type":"assistant_text_snapshot","utterance_id":"utt-1","utterance_seq":1}
+text {"type":"assistant_text_snapshot","utterance_id":"utt-1","utterance_seq":1,"text":"Sure, let me check.<tool_call>\n<function=time>\n</function>\n</tool_call>"}
 bin len=984 head=4956575301020000010000000000000002000000c05d0000 payload=f347d63d5c5fbb65
 bin len=504 head=4956575301020100010000000000000004000000c05d0000 payload=7abf9efa652dcee5
