@@ -37,7 +37,9 @@ use super::session_config::{chat_tool, AudioFormat, Modality};
 use crate::api::openai::convert::InboundContent;
 use crate::api::openai::responses::dto::{ResponseInput, ResponseInputItem};
 use crate::api::openai::responses::handlers::build_input_messages;
-use crate::api::openai::tool_calls::{parse_answer, ToolCall, ToolCallFormat, ToolCallParser};
+use crate::api::openai::tool_calls::{
+    parse_answer, ToolCall, ToolCallFormat, ToolCallParser, ToolChoice, ToolPlan,
+};
 use crate::app::realtime_transport::{
     OutboundClass, OutboundEnqueueError, OutboundItem, OutboundMailbox,
 };
@@ -759,9 +761,9 @@ fn prompt_items(ctx: &ResponseContext, plan: &ResponsePlan) -> Vec<Item> {
 
 /// The system prompt: the instructions, then the conversation's system
 /// messages (chat templates take one system turn, at the start), then a
-/// hint for a required or named tool, which local models cannot be forced
-/// to call (D16).
-fn system_prompt(plan: &ResponsePlan, items: &[Item], tools_offered: bool) -> String {
+/// hint for a required or named tool when `hint_tool_choice` (the unified
+/// audio model's reply cannot be opened with a call, so it is asked).
+fn system_prompt(plan: &ResponsePlan, items: &[Item], hint_tool_choice: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !plan.instructions.trim().is_empty() {
         parts.push(plan.instructions.trim().to_string());
@@ -772,7 +774,7 @@ fn system_prompt(plan: &ResponsePlan, items: &[Item], tools_offered: bool) -> St
             .filter(|item| item.role() == Some(Role::System))
             .filter_map(Item::text),
     );
-    if tools_offered {
+    if hint_tool_choice {
         match &plan.tool_choice {
             Value::String(choice) if choice == "required" => {
                 parts.push("Answer by calling one of the available functions.".to_string())
@@ -915,25 +917,27 @@ async fn run_modular(
     };
     let (text, tts) = (*text, *tts);
     let items = with_transcripts(ctx, prompt_items(ctx, plan), None).await;
-    let format = ToolCallFormat::of(text);
-    let tools = if format.is_some() {
-        tools_for(plan)
+    // Tools for a model without a tool template are refused, as on the chat
+    // routes, rather than dropped. A required or named tool opens the reply.
+    let tools = tools_for(plan);
+    let tool_plan = if tools.is_empty() {
+        None
     } else {
-        Vec::new()
+        let dialect = ToolCallFormat::of(text).ok_or_else(|| {
+            format!(
+                "Model {} has no tool-calling chat template; remove `tools` or send `tool_choice: \"none\"`",
+                text.dir_name()
+            )
+        })?;
+        let choice = ToolChoice::parse(Some(&plan.tool_choice)).map_err(str::to_string)?;
+        Some(ToolPlan::new(dialect, tools.clone(), choice, true)?)
     };
-    if format.is_none() && !plan.tools.is_empty() {
-        warn!(model = %text.dir_name(), "realtime tools ignored: the chat model cannot call tools");
-    }
-    let system = system_prompt(plan, &items, !tools.is_empty());
+    let system = system_prompt(plan, &items, false);
     let messages = chat_messages(text, &system, &items, &tools)?;
     emitter.add_usage(|usage| usage.input_audio_ms += user_audio_ms(&items));
 
     let audio_out = plan.modality == Modality::Audio;
-    let parser = Arc::new(Mutex::new(
-        format
-            .filter(|_| !tools.is_empty())
-            .map(|format| ToolCallParser::new(format).with_tools(&tools)),
-    ));
+    let parser = Arc::new(Mutex::new(tool_plan.as_ref().map(ToolPlan::parser)));
     let reasoning = Arc::new(Mutex::new(ReasoningFilter::default()));
     let (deltas, delta_rx) = mpsc::unbounded_channel::<String>();
     let state = &ctx.state;
@@ -964,6 +968,10 @@ async fn run_modular(
                     ChatRequestConfig {
                         enable_thinking: Some(false),
                         tools: tools.clone(),
+                        response_prefix: tool_plan
+                            .as_ref()
+                            .and_then(ToolPlan::response_prefix)
+                            .unwrap_or_default(),
                         truncation: ChatTruncation::Auto,
                         ..ChatRequestConfig::default()
                     },
@@ -1049,9 +1057,8 @@ async fn run_modular(
         usage.cached_tokens += generation.cached_prompt_tokens.unwrap_or(0);
         usage.output_text_tokens += generation.tokens_generated as u64;
     });
-    if let Some(format) = format.filter(|_| !tools.is_empty()) {
-        let parser = ToolCallParser::new(format).with_tools(&tools);
-        let (_, calls) = parse_answer(parser, &generation.text);
+    if let Some(tool_plan) = &tool_plan {
+        let (_, calls) = parse_answer(tool_plan.parser(), &generation.text);
         emitter.function_calls(&calls);
     }
     Ok(

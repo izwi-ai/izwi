@@ -313,6 +313,7 @@ async fn run(env: EnvSnapshot, process: WorkerProcessConfig) -> anyhow::Result<(
         }
         if izwi_core::chat_supports_tools(process.variant) {
             features.insert(WorkerFeature::ChatTools);
+            features.insert(WorkerFeature::ChatResponsePrefix);
         }
     }
     let descriptor = WorkerDescriptor {
@@ -1060,12 +1061,13 @@ impl WorkerTlsConfig {
                     bail!("server certificate file contains no certificate PEM blocks");
                 }
                 // The first PKCS#8, PKCS#1 or SEC1 key block.
-                let key = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|error| match error {
-                    pem::Error::NoItemsFound => {
-                        anyhow::anyhow!("server private key file contains no key PEM blocks")
-                    }
-                    _ => anyhow::anyhow!("server private key PEM is invalid"),
-                })?;
+                let key =
+                    PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|error| match error {
+                        pem::Error::NoItemsFound => {
+                            anyhow::anyhow!("server private key file contains no key PEM blocks")
+                        }
+                        _ => anyhow::anyhow!("server private key PEM is invalid"),
+                    })?;
 
                 let mut config = if let Some(ca_ref) = client_ca_ref {
                     let ca_bytes = load_pem_file(ca_ref, "client CA")?.bytes;
@@ -2183,11 +2185,23 @@ n4hqQcj6Ww1lUPQR8+rJ24RBjCuhRANCAARrApXyDvzciYQCSB4ddOaW3lsBSwJN
     #[test]
     fn lfm_models_take_their_worker_lanes() {
         for (task, model, profile) in [
-            ("chat", "LFM2.5-1.2B-Instruct-GGUF", ("gguf-q4_k_m", "native-lfm2")),
-            ("chat", "LFM2.5-1.2B-Thinking-GGUF", ("gguf-q4_k_m", "native-lfm2")),
+            (
+                "chat",
+                "LFM2.5-1.2B-Instruct-GGUF",
+                ("gguf-q4_k_m", "native-lfm2"),
+            ),
+            (
+                "chat",
+                "LFM2.5-1.2B-Thinking-GGUF",
+                ("gguf-q4_k_m", "native-lfm2"),
+            ),
             ("chat", "LFM3-1.7B-GGUF", ("gguf-q4_0", "native-lfm3")),
             ("chat", "LFM3-1.7B-Q8_0-GGUF", ("gguf-q8_0", "native-lfm3")),
-            ("text_to_speech", "LFM3-Audio-2B-GGUF", ("fp32", "native-tts-realtime")),
+            (
+                "text_to_speech",
+                "LFM3-Audio-2B-GGUF",
+                ("fp32", "native-tts-realtime"),
+            ),
         ] {
             let process = WorkerProcessConfig::from_env(&env_config::snapshot([
                 (WORKER_TASK_ENV, task),

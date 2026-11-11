@@ -13,6 +13,7 @@ pub use izwi_model_catalog::chat::tools::{
     ToolCallParser, ToolChoice, ToolDialect, ToolPlan,
 };
 
+use crate::app::chat::ChatExecutionRequest;
 use crate::error::ApiError;
 
 /// How a model family writes tool calls.
@@ -28,10 +29,38 @@ pub struct ToolPolicy {
     pub plan: Option<Arc<ToolPlan>>,
 }
 
+impl ToolPolicy {
+    /// Apply the policy to the engine request: a forced call's opening goes
+    /// into the prompt, and an answer limited to one call stops when that
+    /// call closes.
+    pub fn apply(&self, request: &mut ChatExecutionRequest) {
+        let Some(plan) = &self.plan else {
+            return;
+        };
+        if let Some(prefix) = plan.response_prefix() {
+            request.chat_config.response_prefix = prefix;
+        }
+        if let Some(stop) = plan.stop_sequence() {
+            if !request.stop.iter().any(|existing| existing == stop) {
+                request.stop.push(stop.to_string());
+            }
+        }
+    }
+
+    /// Whether the answer must make a call, which turns thinking off for
+    /// the turn.
+    pub fn is_forced(&self) -> bool {
+        self.plan
+            .as_ref()
+            .is_some_and(|plan| plan.choice.is_forced())
+    }
+}
+
 /// Resolve OpenAI `tools`, `tool_choice` and `parallel_tool_calls` for
 /// `variant`. `"auto"` (the default) offers the tools and parses calls;
-/// `"none"` does neither. Forcing a call (`"required"` or a named function)
-/// is refused.
+/// `"none"` does neither; `"required"` and a named function make the answer
+/// open with a call. Tools for a model without a tool template are refused
+/// rather than ignored.
 pub fn resolve_tool_policy(
     variant: ModelVariant,
     tools: Option<&[Value]>,
@@ -41,19 +70,22 @@ pub fn resolve_tool_policy(
     let tools = tools.unwrap_or_default();
     let choice = ToolChoice::parse(tool_choice)
         .map_err(|message| ApiError::invalid_param("tool_choice", message))?;
-    if choice.is_forced() {
-        return Err(ApiError::unsupported_param(
-            "tool_choice",
-            "`tool_choice` \"required\" and named functions are not supported; use \"auto\" or \"none\"",
-        ));
-    }
     if let Some(index) = tools.iter().position(|tool| !is_function_tool(tool)) {
         return Err(ApiError::invalid_param(
             "tools",
             format!("`tools[{index}]` must be {{\"type\": \"function\", \"function\": {{\"name\": ...}}}}"),
         ));
     }
-    if tools.is_empty() || choice == ToolChoice::None {
+    if choice == ToolChoice::None {
+        return Ok(ToolPolicy::default());
+    }
+    if tools.is_empty() {
+        if choice.is_forced() {
+            return Err(ApiError::invalid_param(
+                "tool_choice",
+                "`tool_choice` requires a tool call, but the request has no `tools`",
+            ));
+        }
         return Ok(ToolPolicy::default());
     }
     let dialect = ToolDialect::of(variant)
@@ -64,17 +96,29 @@ pub fn resolve_tool_policy(
                 format!("Model {variant} has no tool-calling chat template"),
             )
         })?;
+    // The model reads the definitions without OpenAI's `strict` flag, which
+    // is an instruction to the server.
+    let tools: Vec<Value> = tools.iter().map(without_strict).collect();
     let plan = ToolPlan::new(
         dialect,
-        tools.to_vec(),
+        tools.clone(),
         choice,
         parallel_tool_calls.unwrap_or(true),
     )
     .map_err(|message| ApiError::invalid_param("tool_choice", message))?;
     Ok(ToolPolicy {
-        tools: tools.to_vec(),
+        tools,
         plan: Some(Arc::new(plan)),
     })
+}
+
+/// `tool` without the `strict` key of its function.
+fn without_strict(tool: &Value) -> Value {
+    let mut tool = tool.clone();
+    if let Some(function) = tool.get_mut("function").and_then(Value::as_object_mut) {
+        function.shift_remove("strict");
+    }
+    tool
 }
 
 fn is_function_tool(tool: &Value) -> bool {
@@ -119,14 +163,25 @@ mod tests {
             assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
             error.detail.unwrap()
         };
-        for forced in [
-            json!("required"),
-            json!({"type": "function", "function": {"name": "now"}}),
-        ] {
-            let detail = refused(qwen, &tools, Some(forced));
-            assert_eq!(detail.param, Some("tool_choice"));
-            assert_eq!(detail.code, Some("unsupported_parameter"));
+        // A forced call opens the answer; one tool makes "required" that tool.
+        let named = json!({"type": "function", "function": {"name": "now"}});
+        for forced in [json!("required"), named] {
+            let policy = policy(qwen, &tools, Some(forced)).unwrap();
+            assert!(policy.is_forced());
+            assert_eq!(
+                policy.plan.unwrap().response_prefix().as_deref(),
+                Some("<tool_call>\n<function=now>\n")
+            );
         }
+        let missing = json!({"type": "function", "function": {"name": "later"}});
+        assert_eq!(
+            refused(qwen, &tools, Some(missing)).param,
+            Some("tool_choice")
+        );
+        assert_eq!(
+            refused(qwen, &[], Some(json!("required"))).param,
+            Some("tool_choice")
+        );
         assert_eq!(
             refused(qwen, &tools, Some(json!("sometimes"))).code,
             Some("invalid_value")
@@ -144,6 +199,19 @@ mod tests {
         assert_eq!(
             policy(ModelVariant::Gemma34BIt, &tools, Some(json!("none"))).unwrap(),
             ToolPolicy::default()
+        );
+    }
+
+    #[test]
+    fn strict_is_kept_out_of_the_prompt() {
+        let tools = [
+            json!({"type": "function", "function": {"name": "now", "strict": true, "parameters": {}}}),
+        ];
+        let policy =
+            resolve_tool_policy(ModelVariant::Qwen359BGguf, Some(&tools), None, None).unwrap();
+        assert_eq!(
+            policy.tools,
+            [json!({"type": "function", "function": {"name": "now", "parameters": {}}})]
         );
     }
 

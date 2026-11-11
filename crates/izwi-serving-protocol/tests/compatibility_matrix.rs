@@ -46,6 +46,7 @@ fn minor4_chat_descriptor() -> WorkerDescriptor {
         WorkerFeature::ChatContextPolicy,
         WorkerFeature::ChatTools,
         WorkerFeature::ChatSkipSpecialTokens,
+        WorkerFeature::ChatResponsePrefix,
     ]);
     descriptor
 }
@@ -176,6 +177,7 @@ fn requests_without_minor4_knobs_encode_exactly_as_minor3() {
         }),
         tools: vec![json!({"type": "function", "function": {"name": "now"}})],
         skip_special_tokens: Some(false),
+        response_prefix: Some("<tool_call>\n<function=now>\n".into()),
     };
     request.validate().unwrap();
     let encoded = serde_json::to_value(&request).unwrap();
@@ -193,7 +195,8 @@ fn requests_without_minor4_knobs_encode_exactly_as_minor3() {
             "response_format": "json_object",
             "context": {"max_tokens": 16, "truncation": "disabled"},
             "tools": [{"type": "function", "function": {"name": "now"}}],
-            "skip_special_tokens": false
+            "skip_special_tokens": false,
+            "response_prefix": "<tool_call>\n<function=now>\n"
         })
     );
     assert_eq!(
@@ -375,6 +378,28 @@ fn minor4_parameters_are_range_checked() {
     assert_eq!(
         request.validate(),
         Err(ContractValidationError::InvalidTools)
+    );
+    let InvocationInput::Chat { parameters, .. } = &mut request.input;
+    parameters.tools = Vec::new();
+    for prefix in [String::new(), "x".repeat(MAX_RESPONSE_PREFIX_BYTES + 1)] {
+        let InvocationInput::Chat { parameters, .. } = &mut request.input;
+        parameters.response_prefix = Some(prefix);
+        assert_eq!(
+            request.validate(),
+            Err(ContractValidationError::InvalidResponsePrefix)
+        );
+    }
+    let InvocationInput::Chat { parameters, .. } = &mut request.input;
+    parameters.response_prefix = Some("<tool_call>\n<function=now>\n".to_string());
+    assert_eq!(request.validate(), Ok(()));
+    // A forced tool call needs a worker that writes the prefix.
+    let forced = ChatParameters {
+        response_prefix: Some("<tool_call>\n<function=now>\n".to_string()),
+        ..ChatParameters::default()
+    };
+    assert_eq!(
+        forced.first_unsupported(&BTreeSet::new()),
+        Some("tool_choice")
     );
 }
 

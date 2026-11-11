@@ -2813,15 +2813,20 @@ fn render_prompt(
     }
 
     prompt.push_str("<|im_start|>assistant\n");
-    if config
-        .request
-        .enable_thinking
-        .unwrap_or(default_enable_thinking)
+    // A forced tool call starts the turn itself, so the model does not
+    // think first.
+    let forced = !config.request.response_prefix.is_empty();
+    if !forced
+        && config
+            .request
+            .enable_thinking
+            .unwrap_or(default_enable_thinking)
     {
         prompt.push_str("<think>\n");
     } else {
         prompt.push_str("<think>\n\n</think>\n\n");
     }
+    prompt.push_str(&config.request.response_prefix);
     Ok(prompt)
 }
 
@@ -4109,6 +4114,24 @@ mod tool_prompt_reference_tests {
     use super::*;
     use crate::models::shared::tool_prompt_reference::reference_cases;
     use izwi_model_catalog::chat::tools::ToolDialect;
+
+    /// A forced tool call opens the assistant turn with thinking off, so
+    /// the model continues the call.
+    #[test]
+    fn a_forced_tool_call_opens_the_assistant_turn() {
+        let mut case = reference_cases("qwen36", ToolDialect::QwenXml).remove(0);
+        case.request.response_prefix = "<tool_call>\n<function=get_time>\n".to_string();
+        let config = ChatGenerationConfig {
+            request: case.request,
+            ..ChatGenerationConfig::default()
+        };
+        let prompt = render_prompt(&case.messages, &config, true).unwrap();
+        assert!(prompt.ends_with(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_time>\n"
+        ));
+        // Thinking is off for the turn, so no reasoning-effort sentence.
+        assert!(!prompt.contains("Reasoning effort is set"));
+    }
 
     /// The Qwen3.6 prompt builder writes tool conversations exactly as the
     /// published chat template does.

@@ -111,6 +111,8 @@ impl ChatExecutionRequest {
                 .response_format_json_object
                 .then_some(ChatResponseFormat::JsonObject),
             tools: self.chat_config.tools.clone(),
+            response_prefix: Some(self.chat_config.response_prefix.clone())
+                .filter(|prefix| !prefix.is_empty()),
             // Skipping is every worker's default; only keeping them is sent.
             skip_special_tokens: self.skip_special_tokens.filter(|skip| !skip),
             context: features
@@ -248,6 +250,8 @@ pub fn resolve_chat_request_config(
             template.preserve_thinking,
         )?,
         tools,
+        // Set by the request's tool policy when the answer must call a tool.
+        response_prefix: String::new(),
         media_inputs,
         truncation: truncation.unwrap_or_default(),
     })

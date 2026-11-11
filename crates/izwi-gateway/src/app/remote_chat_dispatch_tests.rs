@@ -662,6 +662,7 @@ async fn worker_receives_every_control_it_advertises() {
             }),
             tools: vec![serde_json::json!({"type": "function", "function": {"name": "now"}})],
             skip_special_tokens: Some(false),
+            response_prefix: Some("<tool_call>\n<function=now>\n".into()),
         }
     );
 }
@@ -677,6 +678,7 @@ fn every_control() -> ChatExecutionRequest {
     request.top_logprobs = Some(2);
     request.response_format_json_object = true;
     request.skip_special_tokens = Some(false);
+    request.chat_config.response_prefix = "<tool_call>\n<function=now>\n".into();
     request.chat_config.tools =
         vec![serde_json::json!({"type": "function", "function": {"name": "now"}})];
     request

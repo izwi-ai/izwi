@@ -117,25 +117,27 @@ pub async fn create_response(
         tool_choice.as_ref(),
         req.parallel_tool_calls,
     )?;
-    let tool_format = tool_policy.plan;
+    let tool_format = tool_policy.plan.clone();
     let chat_config = resolve_chat_request_config(
         req.enable_thinking,
         req.reasoning_effort,
         req.preserve_thinking,
         req.chat_template_kwargs.as_ref(),
-        tool_policy.tools,
+        tool_policy.tools.clone(),
         media_inputs,
         req.truncation,
     )?;
-    // Unsplit output gets back the `<think>` the prompt opened.
-    let opened_in_prompt = reasoning_opened_in_prompt(model_variant, chat_config.enable_thinking);
+    // Unsplit output gets back the `<think>` the prompt opened; a forced
+    // tool call starts the turn, so the prompt opens none.
+    let opened_in_prompt = !tool_policy.is_forced()
+        && reasoning_opened_in_prompt(model_variant, chat_config.enable_thinking);
     if req.max_output_tokens == Some(0) {
         return Err(ApiError::invalid_param(
             "max_output_tokens",
             "`max_output_tokens` must be at least 1",
         ));
     }
-    let execution_request = ChatExecutionRequest {
+    let mut execution_request = ChatExecutionRequest {
         variant: model_variant,
         messages,
         max_completion_tokens: req.max_output_tokens,
@@ -154,6 +156,7 @@ pub async fn create_response(
         chat_config,
         correlation_id: Some(ctx.correlation_id.clone()),
     };
+    tool_policy.apply(&mut execution_request);
     validate_chat_request_ranges(&execution_request)?;
 
     if req.stream.unwrap_or(false) {
@@ -1919,16 +1922,19 @@ mod tests {
             Some(ToolDialect::QwenXml)
         );
         let named = chat_completions_function(&json!({"type": "function", "name": "get_weather"}));
+        // A named function in the Responses form opens the answer with
+        // that call.
+        let forced = resolve_tool_policy(
+            ModelVariant::Qwen359BGguf,
+            Some(&[nested]),
+            Some(&named),
+            None,
+        )
+        .unwrap();
+        assert!(forced.is_forced());
         assert_eq!(
-            resolve_tool_policy(
-                ModelVariant::Qwen359BGguf,
-                Some(&[nested]),
-                Some(&named),
-                None
-            )
-            .unwrap_err()
-            .status,
-            StatusCode::BAD_REQUEST
+            forced.plan.unwrap().response_prefix().as_deref(),
+            Some("<tool_call>\n<function=get_weather>\n")
         );
     }
 

@@ -1131,12 +1131,14 @@ fn prompt_turns(
         turns.push((role, content));
     }
 
-    let opening = if request.enable_thinking == Some(false) {
-        "<think>\n\n</think>\n\n"
-    } else {
-        ""
-    };
-    Ok((turns, opening.to_string()))
+    // A forced tool call starts the turn itself, after an empty think block.
+    let forced = !request.response_prefix.is_empty();
+    let mut opening = String::new();
+    if forced || request.enable_thinking == Some(false) {
+        opening.push_str("<think>\n\n</think>\n\n");
+    }
+    opening.push_str(&request.response_prefix);
+    Ok((turns, opening))
 }
 
 fn is_tool_response(content: &str) -> bool {
@@ -2152,6 +2154,16 @@ mod tool_prompt_reference_tests {
         prompt.push_str("<|im_start|>assistant\n");
         prompt.push_str(&opening);
         prompt
+    }
+
+    /// A forced tool call opens the assistant turn after an empty think
+    /// block, so the model continues the call.
+    #[test]
+    fn a_forced_tool_call_opens_the_assistant_turn() {
+        let mut case = reference_cases("qwen3", ToolDialect::HermesJson).remove(0);
+        case.request.response_prefix = "<tool_call>\n{\"name\": \"".to_string();
+        assert!(render(&case)
+            .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n{\"name\": \""));
     }
 
     /// The Qwen3 prompt builder writes tool conversations exactly as the

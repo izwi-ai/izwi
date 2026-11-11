@@ -458,11 +458,11 @@ pub fn prepare_execution_request(
         req.reasoning_effort,
         req.preserve_thinking,
         req.chat_template_kwargs.as_ref(),
-        tool_policy.tools,
+        tool_policy.tools.clone(),
         media_inputs,
         req.truncation,
     )?;
-    let execution = ChatExecutionRequest {
+    let mut execution = ChatExecutionRequest {
         variant,
         messages,
         max_completion_tokens: req.max_completion_tokens,
@@ -485,14 +485,18 @@ pub fn prepare_execution_request(
         chat_config,
         correlation_id: Some(ctx.correlation_id.clone()),
     };
+    tool_policy.apply(&mut execution);
     validate_chat_request_ranges(&execution)?;
     let format = AnswerFormat {
         compat_profile: profile,
         parse_reasoning: parse_reasoning(req)?,
-        reasoning_opened_in_prompt: super::reasoning::reasoning_opened_in_prompt(
-            execution.variant,
-            execution.chat_config.enable_thinking,
-        ),
+        // A forced tool call starts the turn, so the prompt opens no think
+        // block.
+        reasoning_opened_in_prompt: !tool_policy.is_forced()
+            && super::reasoning::reasoning_opened_in_prompt(
+                execution.variant,
+                execution.chat_config.enable_thinking,
+            ),
         tool_calls: tool_policy.plan,
     };
     Ok((execution, format))

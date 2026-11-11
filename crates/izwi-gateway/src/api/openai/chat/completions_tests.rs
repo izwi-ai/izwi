@@ -595,6 +595,57 @@ fn chat_request(
     prepare_execution_request(&req, &ctx, OpenAiCompatibilityProfile::Strict)
 }
 
+/// A forced tool call: the prompt opens the call, thinking is off for the
+/// turn, and the answer the model continues parses as that call.
+#[tokio::test]
+async fn a_forced_tool_call_is_opened_in_the_prompt_and_parsed_from_it() {
+    let tools = json!([
+        {"type": "function", "function": {"name": "get_weather", "strict": false,
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}},
+        {"type": "function", "function": {"name": "get_time"}}
+    ]);
+    let body = |choice: serde_json::Value, parallel: bool| {
+        json!({"messages": [{"role": "user", "content": "Harare"}], "tools": tools,
+               "tool_choice": choice, "parallel_tool_calls": parallel,
+               "reasoning_format": "parsed", "stop": ["END"]})
+    };
+    let named = json!({"type": "function", "function": {"name": "get_weather"}});
+    let (request, format) = chat_request(body(named, true)).unwrap();
+    assert_eq!(
+        request.chat_config.response_prefix,
+        "<tool_call>\n<function=get_weather>\n"
+    );
+    assert_eq!(request.stop, ["END"]);
+    assert!(!format.reasoning_opened_in_prompt);
+    let response = render_completion_response(
+        request.variant,
+        generation("<parameter=city>\n4521\n</parameter>\n</function>\n</tool_call>"),
+        format,
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let call = &parsed["choices"][0]["message"]["tool_calls"][0]["function"];
+    assert_eq!(call["name"], "get_weather");
+    // The string parameter keeps its digits as text.
+    assert_eq!(call["arguments"], "{\"city\":\"4521\"}");
+    assert_eq!(parsed["choices"][0]["finish_reason"], "tool_calls");
+
+    // "required" opens a call and leaves the name to the model; one call at
+    // most ends generation at the call's close tag.
+    let (request, _) = chat_request(body(json!("required"), false)).unwrap();
+    assert_eq!(
+        request.chat_config.response_prefix,
+        "<tool_call>\n<function="
+    );
+    assert_eq!(request.stop, ["END", "</tool_call>"]);
+    // Unforced, the prompt is the model's own.
+    let (request, format) = chat_request(body(json!("auto"), true)).unwrap();
+    assert!(request.chat_config.response_prefix.is_empty());
+    assert!(format.reasoning_opened_in_prompt);
+}
+
 fn clip(format: &str) -> serde_json::Value {
     json!({"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": format}})
 }
