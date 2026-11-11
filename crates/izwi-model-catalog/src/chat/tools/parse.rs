@@ -354,22 +354,30 @@ impl ToolCallParser {
                 true
             }
             State::Held => {
-                let Some(at) = self.pending.find(CALL_CLOSE) else {
-                    return false;
-                };
-                let body: String = self.pending.drain(..at + CALL_CLOSE.len()).collect();
-                let body = &body[..at];
-                match self.json_call(body) {
-                    Some((name, arguments)) => {
+                // The block ends at the first close tag that completes its
+                // JSON: a close tag inside a JSON string is part of the
+                // value.
+                let mut from = 0;
+                loop {
+                    let Some(at) = self.pending[from..].find(CALL_CLOSE).map(|at| from + at) else {
+                        return false;
+                    };
+                    let body = &self.pending[..at];
+                    if let Some((name, arguments)) = self.json_call(body) {
+                        self.pending.drain(..at + CALL_CLOSE.len());
                         self.start_call(name, arguments, out);
                         self.state = self.after_call();
+                        return true;
                     }
-                    None => {
-                        self.emit_text(&format!("{CALL_OPEN}{body}{CALL_CLOSE}"), out);
+                    if !is_json_prefix(body) {
+                        // Not a call: the block is text.
+                        let block: String = self.pending.drain(..at + CALL_CLOSE.len()).collect();
+                        self.emit_text(&format!("{CALL_OPEN}{block}"), out);
                         self.state = State::Text;
+                        return true;
                     }
+                    from = at + CALL_CLOSE.len();
                 }
-                true
             }
             State::LfmBlock => {
                 let end_marker = lfm::TOOL_CALL_END;
@@ -480,6 +488,13 @@ impl ToolCallParser {
         };
         Some((name, arguments))
     }
+}
+
+/// Whether `body` could still become one JSON value with more text: it
+/// parses up to its end and stops there unfinished.
+fn is_json_prefix(body: &str) -> bool {
+    let body = body.trim();
+    !body.is_empty() && serde_json::from_str::<Value>(body).is_err_and(|error| error.is_eof())
 }
 
 /// A parameter's value between its tags: the templates put one newline after

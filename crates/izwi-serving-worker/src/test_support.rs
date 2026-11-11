@@ -133,6 +133,7 @@ pub fn minor4_chat_features() -> BTreeSet<WorkerFeature> {
         WorkerFeature::ChatTools,
         WorkerFeature::ChatSkipSpecialTokens,
         WorkerFeature::ChatResponsePrefix,
+        WorkerFeature::ChatToolConstraint,
     ])
 }
 

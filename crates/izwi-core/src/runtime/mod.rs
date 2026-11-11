@@ -59,8 +59,9 @@ pub(crate) use asr::{
 };
 pub use chat::AdmittedChatStream;
 pub use chat_request::{
-    chat_supports_json_object, chat_supports_tools, resolve_chat_max_tokens, resolve_chat_sampling,
-    ChatGenerationControls, ChatSamplingRequest, ResolvedChatSampling, CHAT_MAX_TOKENS_UNSET,
+    chat_supports_json_object, chat_supports_tool_constraint, chat_supports_tools,
+    resolve_chat_max_tokens, resolve_chat_sampling, ChatGenerationControls, ChatSamplingRequest,
+    ResolvedChatSampling, CHAT_MAX_TOKENS_UNSET,
 };
 pub use conformance::{
     capability_conformance_cases, required_conformance_capabilities, CapabilityConformanceCase,

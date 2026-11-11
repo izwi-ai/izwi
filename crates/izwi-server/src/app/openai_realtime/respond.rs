@@ -972,6 +972,13 @@ async fn run_modular(
                             .as_ref()
                             .and_then(ToolPlan::response_prefix)
                             .unwrap_or_default(),
+                        // A required or named tool is held to the declared
+                        // names and schemas where the sampler can.
+                        tool_constraint: tool_plan
+                            .as_ref()
+                            .filter(|_| izwi_core::chat_supports_tool_constraint(text))
+                            .and_then(|plan| plan.constraint(false))
+                            .map(Box::new),
                         truncation: ChatTruncation::Auto,
                         ..ChatRequestConfig::default()
                     },

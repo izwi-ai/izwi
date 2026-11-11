@@ -1000,17 +1000,17 @@ impl Qwen35ChatExec {
         Ok(complete)
     }
 
-    /// DS9.2 grammar runtime for this request, or `None` when the request
-    /// did not ask for constrained decoding. Always-sampleable ids mirror
+    /// The grammar runtime for this request (DS9.2 JSON output, or
+    /// constrained tool calls), or `None` when the request asked for neither. Always-sampleable ids mirror
     /// `is_stop_token` so the decode loop can still finish inside the mask.
     fn grammar_runtime(
         &self,
         config: &ChatGenerationConfig,
     ) -> Option<crate::models::shared::sampling::GrammarRuntime> {
-        if !config.constrain_json_object {
+        if !crate::models::shared::sampling::GrammarRuntime::requested(config) {
             return None;
         }
-        Some(crate::models::shared::sampling::GrammarRuntime::new(
+        crate::models::shared::sampling::GrammarRuntime::for_request(
             std::sync::Arc::new(self.tokenizer.inner.clone()),
             [
                 Some(self.tokenizer.specials.im_end),
@@ -1020,7 +1020,8 @@ impl Qwen35ChatExec {
             .into_iter()
             .flatten()
             .collect(),
-        ))
+            config,
+        )
     }
 
     pub(crate) fn continue_resumable_prefill_physical(

@@ -106,27 +106,27 @@ pub use performance::{
     OptimizationMode, PerformanceConfig, PerformanceConfigOverrides,
 };
 pub use runtime::{
+    asr_streams_live, chat_supports_json_object, chat_supports_tool_constraint,
+    chat_supports_tools, resolve_chat_max_tokens, resolve_chat_sampling, validate_asr_language,
+    validate_asr_task, AlignedWindow, AlignmentSource, AlignmentWindow, AsrTranscription,
+    ChatFinishReason, ChatGeneration, ChatGenerationControls, ChatSamplingRequest, ChunkStats,
+    DiarizationConfig, DiarizationPipelineOptions, DiarizationResult, DiarizationSegment,
+    DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord, GenerationRequest,
+    GenerationResult, JobCancellation, ResolvedChatSampling, SpeechChunkTurn, SpeechFrameCodes,
+    SpeechSpeakerReference, TtsStopReason, TtsStreamingMode, WindowedAlignment,
+    CHAT_MAX_TOKENS_UNSET,
+};
+pub use runtime::{
     capability_conformance_cases, prometheus_voice_metric_name, prometheus_voice_metric_type,
     required_conformance_capabilities, voice_metric_catalog, voice_metric_prometheus_contract,
     CapabilityConformanceCase, CapabilityKind, ConformanceExecutionClass, VoiceLatency,
     VoiceMetricDescriptor, VOICE_ASR_FINAL_SECONDS, VOICE_ASR_FIRST_PARTIAL_SECONDS,
-    VOICE_ASR_LIVE_FIRST_PARTIAL_SECONDS,
-    VOICE_AUDIO_EGRESS_UNDERRUNS_TOTAL, VOICE_AUDIO_INGRESS_DROPPED_FRAMES_TOTAL,
-    VOICE_BARGE_IN_LATENCY_SECONDS, VOICE_BARGE_IN_TOTAL, VOICE_ENDPOINTING_LATENCY_SECONDS,
-    VOICE_LLM_FIRST_TOKEN_SECONDS, VOICE_METRIC_CATALOG, VOICE_SESSION_CLOSED_TOTAL,
-    VOICE_SESSION_DURATION_SECONDS, VOICE_SESSION_INTERRUPTED_TOTAL, VOICE_SESSION_STARTED_TOTAL,
-    VOICE_SPEECH_REJECTED_TOTAL, VOICE_STREAM_BACKPRESSURE_TOTAL, VOICE_TTS_FIRST_AUDIO_SECONDS, VOICE_TURN_FIRST_AUDIO_SECONDS,
-};
-pub use runtime::{
-    asr_streams_live, chat_supports_json_object, chat_supports_tools, resolve_chat_max_tokens,
-    resolve_chat_sampling, validate_asr_language, validate_asr_task, AlignedWindow,
-    AlignmentSource, AlignmentWindow,
-    AsrTranscription, ChatFinishReason, ChatGeneration, ChatGenerationControls,
-    ChatSamplingRequest, ChunkStats, DiarizationConfig, DiarizationPipelineOptions,
-    DiarizationResult, DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance,
-    DiarizationWord, GenerationRequest, GenerationResult, JobCancellation, ResolvedChatSampling,
-    SpeechChunkTurn, SpeechFrameCodes, SpeechSpeakerReference, TtsStopReason, TtsStreamingMode,
-    WindowedAlignment, CHAT_MAX_TOKENS_UNSET,
+    VOICE_ASR_LIVE_FIRST_PARTIAL_SECONDS, VOICE_AUDIO_EGRESS_UNDERRUNS_TOTAL,
+    VOICE_AUDIO_INGRESS_DROPPED_FRAMES_TOTAL, VOICE_BARGE_IN_LATENCY_SECONDS, VOICE_BARGE_IN_TOTAL,
+    VOICE_ENDPOINTING_LATENCY_SECONDS, VOICE_LLM_FIRST_TOKEN_SECONDS, VOICE_METRIC_CATALOG,
+    VOICE_SESSION_CLOSED_TOTAL, VOICE_SESSION_DURATION_SECONDS, VOICE_SESSION_INTERRUPTED_TOTAL,
+    VOICE_SESSION_STARTED_TOTAL, VOICE_SPEECH_REJECTED_TOTAL, VOICE_STREAM_BACKPRESSURE_TOTAL,
+    VOICE_TTS_FIRST_AUDIO_SECONDS, VOICE_TURN_FIRST_AUDIO_SECONDS,
 };
 pub use runtime::{
     runtime_trace_contracts, sanitized_replay_record, stream_slow_consumer_timeout,
@@ -154,7 +154,8 @@ pub use artifacts::{
     ModelResidencyState, ModelWeights,
 };
 pub use catalog::{
-    normalize_stored_model_id, parse_chat_model_variant, parse_model_variant, parse_tts_model_variant, removed_model_variant, resolve_asr_model_variant,
+    normalize_stored_model_id, parse_chat_model_variant, parse_model_variant,
+    parse_tts_model_variant, removed_model_variant, resolve_asr_model_variant,
     resolve_diarization_asr_model_variant, resolve_diarization_llm_variant,
     resolve_diarization_model_variant, resolve_diarization_model_variant_strict,
     validate_diarization_speaker_limits, ChatModelCapabilities, CudaEvidenceLevel,

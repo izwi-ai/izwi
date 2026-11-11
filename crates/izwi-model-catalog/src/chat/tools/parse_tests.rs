@@ -127,6 +127,20 @@ fn hermes_calls_stream_without_markup_at_every_split() {
 }
 
 #[test]
+fn a_close_tag_inside_a_json_string_is_part_of_the_argument() {
+    let text = "<tool_call>\n{\"name\": \"note\", \"arguments\": {\"body\": \"write </tool_call> twice: </tool_call>\"}}\n</tool_call> done";
+    for chunk in 1..=text.len() {
+        let (content, calls, _) = stream(ToolDialect::HermesJson, text, chunk);
+        assert_eq!(content, " done", "chunk {chunk}");
+        assert_eq!(calls.len(), 1, "chunk {chunk}");
+        assert_eq!(
+            arguments(&calls[0]),
+            json!({"body": "write </tool_call> twice: </tool_call>"})
+        );
+    }
+}
+
+#[test]
 fn text_that_only_looks_like_a_call_is_released_unchanged() {
     for text in [
         "a < b and <tool_ is not a tag",

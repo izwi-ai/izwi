@@ -6,11 +6,12 @@ use izwi_serving_client::{InvocationStream, TraceContext, WorkerClient, WorkerCl
 use izwi_serving_protocol::{
     AttemptId, AttemptIdentity, CallerId, ChatContextPolicy, ChatInput,
     ChatMessage as WorkerChatMessage, ChatParameters as WorkerChatParameters, ChatResponseFormat,
-    ChatRole as WorkerChatRole, ChatTruncation as WorkerChatTruncation, DeploymentId,
-    FinishReason as WorkerFinishReason, GatewayAttestedCallerContext, IncarnationId,
-    InvocationErrorCode, InvocationEventKind, InvocationInput, InvocationRequest, ModelGeneration,
-    OutputFormat, OutputLimits, PermittedAction, PolicyRevision, RequestDigest, RequestId,
-    SchemaVersion, ServiceClass, TaskKind, TenantId, Usage, WorkerFeature,
+    ChatRole as WorkerChatRole, ChatToolConstraint as WorkerChatToolConstraint,
+    ChatTruncation as WorkerChatTruncation, DeploymentId, FinishReason as WorkerFinishReason,
+    GatewayAttestedCallerContext, IncarnationId, InvocationErrorCode, InvocationEventKind,
+    InvocationInput, InvocationRequest, ModelGeneration, OutputFormat, OutputLimits,
+    PermittedAction, PolicyRevision, RequestDigest, RequestId, SchemaVersion, ServiceClass,
+    TaskKind, TenantId, Usage, WorkerFeature,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -113,6 +114,22 @@ impl ChatExecutionRequest {
             tools: self.chat_config.tools.clone(),
             response_prefix: Some(self.chat_config.response_prefix.clone())
                 .filter(|prefix| !prefix.is_empty()),
+            // A constraint that only strengthens a forced call is left out
+            // for a worker that cannot apply it; a `strict` one is sent, so
+            // such a worker is refused.
+            tool_constraint: self
+                .chat_config
+                .tool_constraint
+                .as_ref()
+                .filter(|constraint| {
+                    constraint.strict || features.contains(&WorkerFeature::ChatToolConstraint)
+                })
+                .map(|constraint| WorkerChatToolConstraint {
+                    opener: constraint.opener.clone(),
+                    call: constraint.call.clone(),
+                    forced: constraint.forced.clone(),
+                    max_calls: constraint.max_calls,
+                }),
             // Skipping is every worker's default; only keeping them is sent.
             skip_special_tokens: self.skip_special_tokens.filter(|skip| !skip),
             context: features
@@ -252,6 +269,7 @@ pub fn resolve_chat_request_config(
         tools,
         // Set by the request's tool policy when the answer must call a tool.
         response_prefix: String::new(),
+        tool_constraint: None,
         media_inputs,
         truncation: truncation.unwrap_or_default(),
     })

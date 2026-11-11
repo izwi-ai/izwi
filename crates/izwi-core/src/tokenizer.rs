@@ -40,6 +40,9 @@ pub struct Tokenizer {
     /// Special tokens an incremental decode that skips special tokens
     /// leaves out of the text (see [`Self::skips_special_token`]).
     skipped_special_ids: Arc<HashSet<u32>>,
+    /// The token trie and grammar compiler for constrained tool calls, built
+    /// on first use and shared by this tokenizer's clones.
+    constraint_vocabulary: crate::models::shared::tool_constraint::ConstraintVocabularyCell,
 }
 
 /// Markup the serving stack parses out of generated text: tool calls
@@ -488,6 +491,7 @@ impl Tokenizer {
             inner,
             special_tokens,
             skipped_special_ids,
+            constraint_vocabulary: Default::default(),
         })
     }
 
@@ -623,10 +627,105 @@ impl Tokenizer {
         &self.special_tokens
     }
 
+    pub(crate) fn constraint_vocabulary(
+        &self,
+    ) -> &crate::models::shared::tool_constraint::ConstraintVocabularyCell {
+        &self.constraint_vocabulary
+    }
+
+    /// The bytes each token id adds to generated text, for grammar-constrained
+    /// decoding: `None` for a control token a decode leaves out (end of turn,
+    /// padding), which no grammar text can match. Markup tokens the serving
+    /// stack parses (`<tool_call>`, `<think>`) and other added tokens carry
+    /// their text.
+    pub fn token_bytes(&self) -> Vec<Option<Vec<u8>>> {
+        let (byte_level, byte_fallback) = decoder_kind(self.inner.get_decoder());
+        let added = self.inner.get_added_tokens_decoder();
+        let byte_of_char = byte_level.then(byte_level_char_map);
+        (0..self.vocab_size() as u32)
+            .map(|id| {
+                if self.skips_special_token(id) {
+                    return None;
+                }
+                if let Some(token) = added.get(&id) {
+                    return Some(token.content.as_bytes().to_vec());
+                }
+                let piece = self.inner.id_to_token(id)?;
+                if byte_fallback {
+                    if let Some(byte) = byte_fallback_piece(&piece) {
+                        return Some(vec![byte]);
+                    }
+                }
+                if let Some(byte_of_char) = &byte_of_char {
+                    // A byte-level piece spells its bytes one char each; a
+                    // piece outside that alphabet falls back to a decode.
+                    let bytes: Option<Vec<u8>> = piece
+                        .chars()
+                        .map(|c| byte_of_char.get(&c).copied())
+                        .collect();
+                    if let Some(bytes) = bytes {
+                        return Some(bytes);
+                    }
+                }
+                self.inner
+                    .decode(&[id], false)
+                    .ok()
+                    .map(String::into_bytes)
+                    .filter(|bytes| !bytes.is_empty())
+            })
+            .collect()
+    }
+
     pub fn format_tts_prompt(&self, text: &str, speaker: Option<&str>) -> String {
         let speaker_tag = speaker.unwrap_or("default");
         format!("[speaker:{}] {}", speaker_tag, text)
     }
+}
+
+/// Whether a decoder (or a sequence of them) maps byte-level pieces back to
+/// bytes, and whether it reads `<0xNN>` byte-fallback pieces.
+fn decoder_kind(decoder: Option<&DecoderWrapper>) -> (bool, bool) {
+    match decoder {
+        Some(DecoderWrapper::ByteLevel(_)) => (true, false),
+        Some(DecoderWrapper::ByteFallback(_)) => (false, true),
+        Some(DecoderWrapper::Sequence(sequence)) => sequence
+            .get_decoders()
+            .iter()
+            .map(|decoder| decoder_kind(Some(decoder)))
+            .fold((false, false), |(level, fallback), (l, f)| {
+                (level || l, fallback || f)
+            }),
+        _ => (false, false),
+    }
+}
+
+/// The byte a `<0xNN>` byte-fallback piece stands for.
+fn byte_fallback_piece(piece: &str) -> Option<u8> {
+    let hex = piece.strip_prefix("<0x")?.strip_suffix('>')?;
+    (hex.len() == 2)
+        .then(|| u8::from_str_radix(hex, 16).ok())
+        .flatten()
+}
+
+/// The byte-level BPE alphabet (GPT-2's `bytes_to_unicode`), inverted: each
+/// byte is one char, itself when printable, else the next free code point
+/// from U+0100.
+fn byte_level_char_map() -> HashMap<char, u8> {
+    let mut map = HashMap::with_capacity(256);
+    let mut next = 0x100u32;
+    for byte in 0..=255u8 {
+        let own = byte as char;
+        if matches!(own, '!'..='~' | '\u{00A1}'..='\u{00AC}' | '\u{00AE}'..='\u{00FF}') {
+            map.insert(own, byte);
+        } else {
+            map.insert(
+                char::from_u32(next).expect("a code point below U+0200"),
+                byte,
+            );
+            next += 1;
+        }
+    }
+    map
 }
 
 /// The vocabulary's special tokens plus `extra`, less parsed markup.

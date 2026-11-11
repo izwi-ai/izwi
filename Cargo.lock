@@ -1619,6 +1619,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "derivre"
+version = "0.3.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a4fbc4bbc70b71fbf8f4d9270006e8b238b91c6179f8aad06b6d25589494347"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "bytemuck_derive",
+ "hashbrown 0.17.1",
+ "regex-syntax",
+ "strum",
+]
+
+[[package]]
 name = "dialoguer"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3368,6 +3382,7 @@ dependencies = [
  "izwi-model-catalog",
  "izwi-prometheus",
  "izwi-vad",
+ "llguidance",
  "memmap2",
  "objc2",
  "objc2-metal",
@@ -3475,6 +3490,7 @@ dependencies = [
  "izwi-serving-protocol",
  "izwi-serving-worker",
  "izwi-test-process",
+ "llguidance",
  "rand 0.10.3",
  "reqwest",
  "rustls",
@@ -4001,6 +4017,21 @@ name = "litrs"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
+
+[[package]]
+name = "llguidance"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04ede1356c8ee73a0d29ef573dbeb2123a1667cfc3ebfc7e2c41346a6e92c3c8"
+dependencies = [
+ "anyhow",
+ "derivre",
+ "indexmap 2.14.2",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "toktrie",
+]
 
 [[package]]
 name = "lock_api"
@@ -6738,6 +6769,21 @@ name = "strum"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
+dependencies = [
+ "strum_macros",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab85eea0270ee17587ed4156089e10b9e6880ee688791d45a905f5b1ca36f664"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "subtle"
@@ -7801,6 +7847,19 @@ dependencies = [
  "libc",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "toktrie"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1bd80f04d68b86f1a4bf03bd4bed87b31341e74c48035697cded09d797cb1c05"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "bytemuck_derive",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

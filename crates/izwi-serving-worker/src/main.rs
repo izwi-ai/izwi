@@ -315,6 +315,9 @@ async fn run(env: EnvSnapshot, process: WorkerProcessConfig) -> anyhow::Result<(
             features.insert(WorkerFeature::ChatTools);
             features.insert(WorkerFeature::ChatResponsePrefix);
         }
+        if izwi_core::chat_supports_tool_constraint(process.variant) {
+            features.insert(WorkerFeature::ChatToolConstraint);
+        }
     }
     let descriptor = WorkerDescriptor {
         schema_version: PROTOCOL_V1,

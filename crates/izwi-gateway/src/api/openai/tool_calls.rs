@@ -5,7 +5,8 @@
 
 use std::sync::Arc;
 
-use izwi_model_catalog::{chat_supports_tools, ModelVariant};
+use izwi_model_catalog::chat::tools::ToolConstraint;
+use izwi_model_catalog::{chat_supports_tool_constraint, chat_supports_tools, ModelVariant};
 use serde_json::Value;
 
 pub use izwi_model_catalog::chat::tools::{
@@ -27,6 +28,9 @@ pub struct ToolPolicy {
     /// How the answer's calls are made and parsed; `None` leaves the answer
     /// text.
     pub plan: Option<Arc<ToolPlan>>,
+    /// What the sampler holds the calls to: set when a tool is `strict` or
+    /// the answer must make a call, on a model whose sampler can.
+    pub constraint: Option<ToolConstraint>,
 }
 
 impl ToolPolicy {
@@ -40,6 +44,7 @@ impl ToolPolicy {
         if let Some(prefix) = plan.response_prefix() {
             request.chat_config.response_prefix = prefix;
         }
+        request.chat_config.tool_constraint = self.constraint.clone().map(Box::new);
         if let Some(stop) = plan.stop_sequence() {
             if !request.stop.iter().any(|existing| existing == stop) {
                 request.stop.push(stop.to_string());
@@ -98,6 +103,7 @@ pub fn resolve_tool_policy(
         })?;
     // The model reads the definitions without OpenAI's `strict` flag, which
     // is an instruction to the server.
+    let strict = tools.iter().any(is_strict);
     let tools: Vec<Value> = tools.iter().map(without_strict).collect();
     let plan = ToolPlan::new(
         dialect,
@@ -106,10 +112,89 @@ pub fn resolve_tool_policy(
         parallel_tool_calls.unwrap_or(true),
     )
     .map_err(|message| ApiError::invalid_param("tool_choice", message))?;
+    let constraint = tool_constraint(variant, &plan, strict)?;
     Ok(ToolPolicy {
         tools,
         plan: Some(Arc::new(plan)),
+        constraint,
     })
+}
+
+/// The sampler constraint for `plan`. A `strict` tool needs one: a model
+/// whose sampler has none, or a schema the grammar cannot express, is
+/// refused. A forced call without `strict` gets one where it can, and is
+/// otherwise opened by the prompt alone.
+fn tool_constraint(
+    variant: ModelVariant,
+    plan: &ToolPlan,
+    strict: bool,
+) -> Result<Option<ToolConstraint>, ApiError> {
+    if !chat_supports_tool_constraint(variant) {
+        if strict {
+            return Err(ApiError::unsupported_param(
+                "tools",
+                format!("Model {variant} cannot enforce `strict` tool arguments; remove `strict`"),
+            ));
+        }
+        return Ok(None);
+    }
+    let Some(constraint) = plan.constraint(strict) else {
+        return Ok(None);
+    };
+    match check_grammars(&constraint) {
+        Ok(()) => Ok(Some(constraint)),
+        Err(reason) if strict => Err(ApiError::invalid_param(
+            "tools",
+            format!("A `strict` tool's parameter schema cannot be enforced: {reason}"),
+        )),
+        Err(reason) => {
+            tracing::warn!(%reason, "forced tool call runs without a constraint");
+            Ok(None)
+        }
+    }
+}
+
+/// Compile a constraint's grammars, so a schema the grammar compiler does
+/// not support is found before the request runs. The check is independent
+/// of the model's tokenizer.
+fn check_grammars(constraint: &ToolConstraint) -> Result<(), String> {
+    use llguidance::api::TopLevelGrammar;
+    use llguidance::toktrie::ApproximateTokEnv;
+    use llguidance::ParserFactory;
+    use std::sync::OnceLock;
+
+    static FACTORY: OnceLock<Result<ParserFactory, String>> = OnceLock::new();
+    let factory = FACTORY
+        .get_or_init(|| {
+            let mut factory = ParserFactory::new_simple(&ApproximateTokEnv::single_byte_env())
+                .map_err(|err| err.to_string())?;
+            factory.quiet();
+            Ok(factory)
+        })
+        .as_ref()
+        .map_err(Clone::clone)?;
+    for grammar in [Some(&constraint.call), constraint.forced.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        factory
+            .create_parser(TopLevelGrammar::from_lark(grammar.clone()))
+            .map_err(|err| first_line(&err.to_string()))?;
+    }
+    Ok(())
+}
+
+fn first_line(message: &str) -> String {
+    message.lines().next().unwrap_or(message).to_string()
+}
+
+/// Whether a tool asks for `strict` arguments (on its function, as chat
+/// completions sends it, or on the tool).
+fn is_strict(tool: &Value) -> bool {
+    [tool.pointer("/function/strict"), tool.get("strict")]
+        .into_iter()
+        .flatten()
+        .any(|strict| strict.as_bool() == Some(true))
 }
 
 /// `tool` without the `strict` key of its function.
@@ -117,6 +202,9 @@ fn without_strict(tool: &Value) -> Value {
     let mut tool = tool.clone();
     if let Some(function) = tool.get_mut("function").and_then(Value::as_object_mut) {
         function.shift_remove("strict");
+    }
+    if let Some(tool) = tool.as_object_mut() {
+        tool.shift_remove("strict");
     }
     tool
 }
@@ -213,6 +301,42 @@ mod tests {
             policy.tools,
             [json!({"type": "function", "function": {"name": "now", "parameters": {}}})]
         );
+    }
+
+    #[test]
+    fn strict_tools_and_forced_calls_are_constrained_where_the_model_can() {
+        let strict = [
+            json!({"type": "function", "function": {"name": "now", "strict": true,
+            "parameters": {"type": "object", "properties": {"zone": {"type": "string"}}}}}),
+        ];
+        let plain = [json!({"type": "function", "function": {"name": "now"}})];
+        let policy = |variant, tools: &[Value], choice: Option<Value>| {
+            resolve_tool_policy(variant, Some(tools), choice.as_ref(), None)
+        };
+        let qwen = ModelVariant::Qwen359BGguf;
+        // Unforced and not strict: the model is free.
+        assert_eq!(policy(qwen, &plain, None).unwrap().constraint, None);
+        let constraint = policy(qwen, &strict, None).unwrap().constraint.unwrap();
+        assert!(constraint.strict && constraint.forced.is_none());
+        let forced = policy(qwen, &plain, Some(json!("required"))).unwrap();
+        let constraint = forced.constraint.unwrap();
+        assert!(!constraint.strict && constraint.forced.is_some());
+
+        // Qwen3.8's sampler has no grammar hook: a forced call is opened by
+        // the prompt alone, and `strict` is refused.
+        let qwen38 = ModelVariant::Qwen3827BFp8;
+        let forced = policy(qwen38, &plain, Some(json!("required"))).unwrap();
+        assert!(forced.is_forced() && forced.constraint.is_none());
+        let error = policy(qwen38, &strict, None).expect_err("refused");
+        assert_eq!(error.detail.unwrap().code, Some("unsupported_parameter"));
+
+        // A schema the grammar cannot express is refused for a strict tool.
+        let broken = [
+            json!({"type": "function", "function": {"name": "now", "strict": true,
+            "parameters": {"type": "object", "properties": {"n": {"type": "integer", "if": {}}}}}}),
+        ];
+        let error = policy(qwen, &broken, None).expect_err("refused");
+        assert_eq!(error.detail.unwrap().param, Some("tools"));
     }
 
     #[test]

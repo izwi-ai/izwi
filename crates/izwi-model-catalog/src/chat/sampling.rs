@@ -94,6 +94,15 @@ pub fn chat_supports_tools(variant: ModelVariant) -> bool {
     variant.is_chat() && super::tools::ToolDialect::of(variant).is_some()
 }
 
+/// Whether a chat model's sampler can hold tool calls to the request's tool
+/// definitions (a `strict` tool, or the names and arguments of a forced
+/// call). Qwen3.8 samples through its own speculative path, which has no
+/// grammar hook yet: its forced calls are opened by the prompt alone, and
+/// `strict` tools are refused.
+pub fn chat_supports_tool_constraint(variant: ModelVariant) -> bool {
+    chat_supports_tools(variant) && variant.family() != ModelFamily::Qwen38Chat
+}
+
 /// Resolve a chat request's sampling. Each value comes from the request when
 /// it set one, else from the model family's published profile, else from the
 /// engine default. `enable_thinking` selects the profile's mode and falls back

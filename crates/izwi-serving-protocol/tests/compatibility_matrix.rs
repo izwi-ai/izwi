@@ -47,6 +47,7 @@ fn minor4_chat_descriptor() -> WorkerDescriptor {
         WorkerFeature::ChatTools,
         WorkerFeature::ChatSkipSpecialTokens,
         WorkerFeature::ChatResponsePrefix,
+        WorkerFeature::ChatToolConstraint,
     ]);
     descriptor
 }
@@ -178,6 +179,12 @@ fn requests_without_minor4_knobs_encode_exactly_as_minor3() {
         tools: vec![json!({"type": "function", "function": {"name": "now"}})],
         skip_special_tokens: Some(false),
         response_prefix: Some("<tool_call>\n<function=now>\n".into()),
+        tool_constraint: Some(ChatToolConstraint {
+            opener: "<tool_call>".into(),
+            call: "start: \"x\"".into(),
+            forced: None,
+            max_calls: Some(1),
+        }),
     };
     request.validate().unwrap();
     let encoded = serde_json::to_value(&request).unwrap();
@@ -196,7 +203,8 @@ fn requests_without_minor4_knobs_encode_exactly_as_minor3() {
             "context": {"max_tokens": 16, "truncation": "disabled"},
             "tools": [{"type": "function", "function": {"name": "now"}}],
             "skip_special_tokens": false,
-            "response_prefix": "<tool_call>\n<function=now>\n"
+            "response_prefix": "<tool_call>\n<function=now>\n",
+            "tool_constraint": {"opener": "<tool_call>", "call": "start: \"x\"", "max_calls": 1}
         })
     );
     assert_eq!(
@@ -392,6 +400,19 @@ fn minor4_parameters_are_range_checked() {
     let InvocationInput::Chat { parameters, .. } = &mut request.input;
     parameters.response_prefix = Some("<tool_call>\n<function=now>\n".to_string());
     assert_eq!(request.validate(), Ok(()));
+    for (opener, call) in [("", "start: \"x\""), ("<tool_call>", "")] {
+        let InvocationInput::Chat { parameters, .. } = &mut request.input;
+        parameters.tool_constraint = Some(ChatToolConstraint {
+            opener: opener.into(),
+            call: call.into(),
+            forced: None,
+            max_calls: None,
+        });
+        assert_eq!(
+            request.validate(),
+            Err(ContractValidationError::InvalidToolConstraint)
+        );
+    }
     // A forced tool call needs a worker that writes the prefix.
     let forced = ChatParameters {
         response_prefix: Some("<tool_call>\n<function=now>\n".to_string()),
