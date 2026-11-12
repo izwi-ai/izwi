@@ -76,7 +76,7 @@ On Windows only text is saved and restored around a paste: a copied image or fil
 | Setting | What it does |
 |---------|--------------|
 | **Speech model** | Any installed speech-to-text model. Parakeet is the fastest; pick another for languages it does not cover |
-| **Language** | Leave on automatic unless the model picks the wrong language |
+| **Language** | Leave on automatic unless the model picks the wrong language. Short phrases are the usual case: set your language and Parakeet keeps to its alphabet instead of, say, writing English in Cyrillic |
 | **Microphone** | The system default, or a specific device |
 | **Keep microphone ready** | Keeps the microphone open so the first word is never clipped. Your system shows its microphone indicator all the time, and a Bluetooth headset stays in call mode |
 

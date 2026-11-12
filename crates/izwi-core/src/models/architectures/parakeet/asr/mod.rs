@@ -4,6 +4,7 @@ pub(crate) mod metal_kernels;
 mod nemo;
 mod physical;
 mod preprocessor;
+mod script;
 
 use std::ops::Range;
 use std::path::Path;
@@ -1022,6 +1023,8 @@ pub struct ParakeetAsrModel {
     weight_precision: WeightOnlyF16Load,
     /// The device decode's dispatch graphs (CUDA), or why there are none.
     decode_graphs: std::result::Result<crate::kernels::transducer_greedy::TransducerGraphs, String>,
+    /// Keeps a request that names its language in that language's alphabet.
+    scripts: script::ScriptPenalties,
 }
 
 enum ParakeetDecoder {
@@ -1030,6 +1033,19 @@ enum ParakeetDecoder {
 }
 
 impl ParakeetDecoder {
+    /// The text of tokens `0..count`, empty where the vocabulary has none.
+    fn pieces(&self, count: usize) -> Vec<String> {
+        (0..count)
+            .map(|id| match self {
+                Self::Vocab(vocab) => vocab.get(id).cloned().unwrap_or_default(),
+                Self::HfTokenizer(tokenizer) => u32::try_from(id)
+                    .ok()
+                    .and_then(|id| tokenizer.id_to_token(id))
+                    .unwrap_or_default(),
+            })
+            .collect()
+    }
+
     fn decode(&self, ids: &[usize]) -> String {
         match self {
             Self::Vocab(vocab) => decode_tokens(ids, vocab),
@@ -1608,6 +1624,9 @@ impl ParakeetAsrModel {
             }
             return result;
         }
+        let penalties = self
+            .scripts
+            .for_rows(rows.iter().map(|row| row.artifact.language.as_deref()))?;
         let result = (|| {
             loop {
                 let encoded_rows = rows
@@ -1633,6 +1652,10 @@ impl ParakeetAsrModel {
                     .collect::<Vec<_>>();
                 let predictor = Tensor::cat(&predictor_rows, 0)?;
                 let logits = self.joint_batch_rows(&encoded, &predictor)?;
+                let logits = match &penalties {
+                    Some(penalties) => (logits + penalties)?,
+                    None => logits,
+                };
                 let (_, output_width) = logits.dims2()?;
                 let token_end = self.blank_idx + 1;
                 if output_width < token_end + self.num_durations {
@@ -1850,6 +1873,12 @@ impl ParakeetAsrModel {
             "Parakeet decode",
             network.predictor.embed.device(),
         );
+        let scripts = script::ScriptPenalties::build(
+            &decoder.pieces(blank_idx),
+            blank_idx + 1 + num_durations,
+            network.joint.out.weight().dtype(),
+            network.predictor.embed.device(),
+        )?;
         let model = Self {
             variant,
             _artifacts: artifacts,
@@ -1862,6 +1891,7 @@ impl ParakeetAsrModel {
             encoder_windowing: EncoderWindowing::V3,
             weight_precision,
             decode_graphs,
+            scripts,
         };
         model.check_device_decode();
         Ok(model)
@@ -2021,6 +2051,12 @@ impl ParakeetAsrModel {
             }
         };
 
+        // `[width]`, as the loop's joint output is.
+        let penalty = self
+            .scripts
+            .for_language(language)
+            .map(|penalty| penalty.squeeze(0))
+            .transpose()?;
         let decode_started = Instant::now();
         match predictor_state {
             Some(state) => self.network.decode_tdt_greedy_physical(
@@ -2031,6 +2067,7 @@ impl ParakeetAsrModel {
                 self.max_symbols,
                 &mut decode_counters,
                 state,
+                penalty.as_ref(),
                 &mut on_token,
             )?,
             None => self.network.decode_tdt_greedy(
@@ -2040,6 +2077,7 @@ impl ParakeetAsrModel {
                 self.num_durations,
                 self.max_symbols,
                 &mut decode_counters,
+                penalty.as_ref(),
                 &mut on_token,
             )?,
         }
@@ -2255,6 +2293,7 @@ impl ParakeetNetwork {
         num_durations: usize,
         max_symbols: usize,
         counters: &mut ParakeetDecodeCounters,
+        penalty: Option<&Tensor>,
         on_token: &mut dyn FnMut(usize, TdtTokenFrame),
     ) -> Result<()> {
         let encoded = encoded.i((0, ..encoded_len, ..))?; // [T, D]
@@ -2270,6 +2309,7 @@ impl ParakeetNetwork {
             num_durations,
             max_symbols,
             counters,
+            penalty,
             predictor_out,
             |label| {
                 self.predictor
@@ -2289,6 +2329,7 @@ impl ParakeetNetwork {
         max_symbols: usize,
         counters: &mut ParakeetDecodeCounters,
         predictor_state: &mut InvocationTensorLease,
+        penalty: Option<&Tensor>,
         on_token: &mut dyn FnMut(usize, TdtTokenFrame),
     ) -> Result<()> {
         let encoded = encoded.i((0, ..encoded_len, ..))?;
@@ -2302,6 +2343,7 @@ impl ParakeetNetwork {
             num_durations,
             max_symbols,
             counters,
+            penalty,
             predictor_out,
             |label| {
                 self.predictor
@@ -2320,6 +2362,8 @@ impl ParakeetNetwork {
         num_durations: usize,
         max_symbols: usize,
         counters: &mut ParakeetDecodeCounters,
+        // Added to each joint output `[width]`: see `script`.
+        penalty: Option<&Tensor>,
         mut predictor_out: Tensor,
         mut predictor_step: impl FnMut(usize) -> Result<Tensor>,
         on_token: &mut dyn FnMut(usize, TdtTokenFrame),
@@ -2346,6 +2390,10 @@ impl ParakeetNetwork {
                 .squeeze(0)?
                 .squeeze(0)?
                 .squeeze(0)?; // [V + 1 + num_durations]
+            let logits = match penalty {
+                Some(penalty) => (logits + penalty)?,
+                None => logits,
+            };
 
             counters.tdt_joint_steps = counters.tdt_joint_steps.saturating_add(1);
             counters.device_argmax_scalar_reads =
@@ -2369,6 +2417,10 @@ impl ParakeetNetwork {
                     .squeeze(0)?
                     .squeeze(0)?
                     .squeeze(0)?;
+                let logits = match penalty {
+                    Some(penalty) => (logits + penalty)?,
+                    None => logits,
+                };
 
                 counters.tdt_joint_steps = counters.tdt_joint_steps.saturating_add(1);
                 counters.device_argmax_scalar_reads =
@@ -4652,6 +4704,7 @@ mod tests {
             encoder_windowing: EncoderWindowing::V3,
             weight_precision: WeightOnlyF16Load::dense("test"),
             decode_graphs: Err("test model".into()),
+            scripts: super::script::ScriptPenalties::none(),
         }
     }
 
@@ -4820,6 +4873,59 @@ mod tests {
         assert!(eager.iter().map(|row| row.0.len()).sum::<usize>() > 10);
         assert!(eager.iter().any(|row| row.4 > 0), "no blanks");
         assert_eq!(eager[3].0.len(), 3, "the budget stops the last row");
+        for quota in [1, 3] {
+            DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(true));
+            let dispatched = decode_cohort(&model, &artifacts, &max_tokens, quota);
+            DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(false));
+            for (row, (eager, dispatched)) in eager.iter().zip(&dispatched).enumerate() {
+                assert_eq!(eager, dispatched, "row {row}, quota {quota}");
+            }
+        }
+    }
+
+    /// A row that names its language never emits a token of another
+    /// alphabet, in the eager step and in the dispatches alike, and the rows
+    /// beside it decode as if it were not there.
+    #[test]
+    fn rows_keep_to_the_alphabet_of_their_language() {
+        let device = Device::Cpu;
+        let mut model = random_decoder_model(&device, 0xDEC0_DE01);
+        // Token 1 is Cyrillic.
+        let pieces = ["\u{2581}a", "\u{2581}б", "c", "\u{2581}d"].map(String::from);
+        model.decoder = ParakeetDecoder::Vocab(pieces.to_vec());
+        let mut rng = XorShift(0xA77_1FAC7);
+        let mut artifacts = [12usize, 70, 40, 20]
+            .map(|len| {
+                let mut artifact = zero_artifact(&device, len);
+                artifact.encoded = Tensor::from_vec(
+                    rng.values(len * TINY.dim, 2.0, 0.0),
+                    (1, len, TINY.dim),
+                    &device,
+                )
+                .unwrap();
+                artifact
+            })
+            .to_vec();
+        let max_tokens = [1_000; 4];
+        let free = decode_cohort(&model, &artifacts, &max_tokens, 1);
+        assert!(
+            free[1].0.contains(&1) && free[2].0.contains(&1),
+            "the unrestricted rows never pick the Cyrillic token"
+        );
+
+        model.scripts =
+            super::script::ScriptPenalties::build(&pieces, 10, DType::F32, &device).unwrap();
+        artifacts[1].language = Some("English".into());
+        artifacts[2].language = Some("en".into());
+        artifacts[3].language = Some("ru".into());
+        let eager = decode_cohort(&model, &artifacts, &max_tokens, 1);
+        for row in [1, 2] {
+            assert!(!eager[row].0.contains(&1), "row {row} left its alphabet");
+            assert!(!eager[row].0.is_empty(), "row {row} emitted nothing");
+        }
+        // No language, and a language whose alphabet bans nothing here.
+        assert_eq!(eager[0], free[0]);
+        assert_eq!(eager[3], free[3]);
         for quota in [1, 3] {
             DEVICE_DECODE_ON_THE_HOST.with(|flag| flag.set(true));
             let dispatched = decode_cohort(&model, &artifacts, &max_tokens, quota);
@@ -5974,7 +6080,11 @@ mod tests {
             let stacked = run(rows, &checks);
             assert_eq!(stacked.windows, sequential.windows);
             assert_eq!(stacked.encoded.dims(), sequential.encoded.dims());
-            assert_eq!(checks.get(), sequential.windows.div_ceil(rows), "{rows} rows");
+            assert_eq!(
+                checks.get(),
+                sequential.windows.div_ceil(rows),
+                "{rows} rows"
+            );
             let diff = max_abs_diff(&stacked.encoded, &sequential.encoded);
             assert!(
                 diff <= BATCHED_ENCODE_TOLERANCE * scale.max(1.0),
@@ -6213,7 +6323,11 @@ mod tests {
                 previous = bytes;
             }
             // CUDA stacks four windows of a long input (about 1.4 GiB).
-            let bound = if backend == BackendKind::Cuda { 3 * GIB } else { 5 * GIB / 2 };
+            let bound = if backend == BackendKind::Cuda {
+                3 * GIB
+            } else {
+                5 * GIB / 2
+            };
             assert!(total(60 * minute, backend) <= bound, "{backend:?}");
         }
 

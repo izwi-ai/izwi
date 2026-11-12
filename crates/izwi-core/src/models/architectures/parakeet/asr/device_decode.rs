@@ -339,7 +339,13 @@ impl ParakeetAsrModel {
             None if pad_on_the_host() => transducer_greedy::graph_width(batch).unwrap_or(batch),
             None => batch,
         };
-        let graphs = graphs.filter(|_| transducer_greedy::graph_width(batch).is_some());
+        // A row kept to its language's alphabet (see `script`) brings one
+        // more input, which the captured graphs do not take.
+        let penalties = self
+            .scripts
+            .for_rows(rows.iter().map(|row| row.artifact.language.as_deref()))?;
+        let graphs = graphs
+            .filter(|_| penalties.is_none() && transducer_greedy::graph_width(batch).is_some());
         let spare = width - batch;
         state.resize(width * STATE_FIELDS, 0);
         limits.resize(width * LIMIT_FIELDS, 0);
@@ -348,7 +354,7 @@ impl ParakeetAsrModel {
             Ok(tensor.pad_with_zeros(0, 0, rows)?)
         };
         let upload = |values: &[u32]| Tensor::new(values, &device);
-        let inputs = [
+        let mut inputs = vec![
             pad(&frames, spare * window)?,
             upload(&gather)?,
             upload(&state)?,
@@ -359,6 +365,9 @@ impl ParakeetAsrModel {
             pad(&cohort.c1, spare)?,
             pad(&predictor_out, spare)?,
         ];
+        if let Some(penalties) = &penalties {
+            inputs.push(pad(penalties, spare)?);
+        }
         drop(frames);
         let body = |inputs: &[Tensor]| self.dispatch_body(inputs, steps, rules, on_host);
         let outputs = match graphs {
@@ -455,12 +464,15 @@ impl ParakeetAsrModel {
         rules: SelectRules,
         on_host: bool,
     ) -> Result<Vec<Tensor>> {
-        let [frames, gather, state, limits, h0, c0, h1, c1, predictor_out] = inputs else {
+        let [frames, gather, state, limits, h0, c0, h1, c1, predictor_out, penalties @ ..] = inputs
+        else {
             return Err(Error::InferenceError(format!(
-                "Parakeet device decode dispatch received {} inputs, expected 9",
+                "Parakeet device decode dispatch received {} inputs, expected 9 or 10",
                 inputs.len()
             )));
         };
+        // `[B, width]`, added to every step's joint output.
+        let penalties = penalties.first();
         let rows = gather.dim(0)?;
         let device = frames.device();
         let mut buffers = SelectTensors {
@@ -480,6 +492,10 @@ impl ParakeetAsrModel {
         for _ in 0..steps {
             let encoded = frames.index_select(&buffers.gather, 0)?;
             let logits = self.joint_batch_rows(&encoded, &predictor_out)?;
+            let logits = match penalties {
+                Some(penalties) => (logits + penalties)?,
+                None => logits,
+            };
             buffers = transducer_greedy::select_step_tensors(
                 &logits, limits, buffers, steps, rules, on_host,
             )?;
