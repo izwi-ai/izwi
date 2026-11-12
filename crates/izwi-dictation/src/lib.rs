@@ -9,12 +9,15 @@
 pub mod audio;
 #[cfg(feature = "capture")]
 pub mod capture;
+pub mod controller;
+pub mod hotkey;
 pub mod insert;
 pub mod session;
 pub mod settings;
 pub mod shortcut;
 pub mod text;
 
+pub use controller::{Controller, Discarded, Engine, Host, Status, Timings};
 pub use session::{Action, DiscardReason, Input, Mode, Session, SessionConfig};
 pub use settings::{CleanupSettings, DictationSettings, InsertMethod};
 pub use shortcut::{Shortcut, ShortcutError};

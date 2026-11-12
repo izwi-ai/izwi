@@ -50,6 +50,10 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+# Modifier-only and Fn hotkeys, which the OS hotkey registration cannot do.
+handy-keys = "0.3.4"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 x11rb = { version = "0.14", features = ["xtest"] }
