@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use izwi_dictation::capture::{microphones, CaptureConfig, CaptureEvent, Recorder};
-use izwi_dictation::insert::{self, FocusedApp, InsertOutcome};
+use izwi_dictation::insert::{self, ClipboardReason, FocusedApp, InsertOutcome};
 use izwi_dictation::sound::{self, Tone};
 use izwi_dictation::system_audio::{self, Muted};
 use izwi_dictation::{audio, Controller, DictationSettings, Host, Input, Shortcut, Status};
@@ -125,6 +125,8 @@ struct Shared {
     live: Mutex<Option<live::LiveSession>>,
     /// The last transcript came from the live session (for the log).
     used_live: AtomicBool,
+    /// The OS has been asked for keyboard control during this run.
+    asked_for_keyboard: AtomicBool,
 }
 
 /// Managed app state.
@@ -178,6 +180,7 @@ pub fn init(app: &AppHandle, server_url: &Url) {
         cleanup_model: Mutex::new(None),
         live: Mutex::new(None),
         used_live: AtomicBool::new(false),
+        asked_for_keyboard: AtomicBool::new(false),
     });
 
     let sink_shared = Arc::clone(&shared);
@@ -489,6 +492,21 @@ fn outcome_name(outcome: &InsertOutcome) -> &'static str {
     }
 }
 
+/// The outcome for the log, with why the text was only copied.
+fn outcome_log(outcome: &InsertOutcome) -> String {
+    match outcome {
+        InsertOutcome::Clipboard { reason, detail } => format!(
+            "clipboard ({reason:?}{})",
+            detail
+                .as_deref()
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default()
+        ),
+        InsertOutcome::Failed { message } => format!("failed ({message})"),
+        other => outcome_name(other).to_string(),
+    }
+}
+
 /// The app side of the dictation loop. Runs on the dictation thread.
 struct DesktopHost {
     shared: Arc<Shared>,
@@ -684,8 +702,23 @@ impl Host for DesktopHost {
                     },
                     timings.cleanup_ms,
                     timings.insert_ms,
-                    outcome_name(outcome)
+                    outcome_log(outcome)
                 ));
+                if matches!(
+                    outcome,
+                    InsertOutcome::Clipboard {
+                        reason: ClipboardReason::NotPermitted,
+                        ..
+                    }
+                ) {
+                    // The page may still show the permission as granted: a
+                    // grant is lost when the app is replaced by a new build.
+                    emit_snapshot(shared);
+                    // Once per run, have the OS show its prompt.
+                    if !shared.asked_for_keyboard.swap(true, Ordering::AcqRel) {
+                        std::thread::spawn(insert::request_keyboard_control);
+                    }
+                }
                 if settings.keep_history {
                     let at_ms = now_ms();
                     let entry = HistoryEntry {

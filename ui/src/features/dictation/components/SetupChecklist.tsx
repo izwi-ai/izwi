@@ -267,7 +267,7 @@ export function SetupChecklist({
           detail={
             snapshot.permissions.keyboard
               ? undefined
-              : "macOS needs Accessibility permission so Izwi can paste for you. Without it, your words are copied and you paste them yourself."
+              : "macOS needs Accessibility permission so Izwi can paste for you. Without it, your words are copied and you paste them yourself. If Izwi is already switched on in the list, macOS is holding a permission for an older copy of the app: remove Izwi from the list with the minus button, then allow it again."
           }
         />
       ) : null}

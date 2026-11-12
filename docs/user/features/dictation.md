@@ -139,6 +139,7 @@ Without `wtype`, `ydotool` or `dotool`, and without the desktop's permission, Iz
 | Nothing happens when you press the shortcut | Dictation is on; Izwi is running; no other app uses the same shortcut (the page shows an error if registration failed) |
 | "Didn't catch that" | The right microphone is selected and not muted; on macOS, Izwi is allowed under **Privacy & Security › Microphone** |
 | The text is only copied, not inserted | See [How the text is inserted](#how-the-text-is-inserted) |
+| macOS: the text is only copied although Izwi is switched on under **Accessibility** | The permission belongs to an older copy of the app. Remove Izwi from the list with the minus button, then allow it again from the Dictation page |
 | The first words are missing | Turn on **Keep microphone ready** |
 | Names come out wrong | Add them to **Vocabulary**, or add a **Replacement** |
 | It pastes in a terminal as `^V` | Use **Insert text by › Typing** for that terminal |
