@@ -15,6 +15,9 @@ pub mod insert;
 pub mod session;
 pub mod settings;
 pub mod shortcut;
+#[cfg(feature = "capture")]
+pub mod sound;
+pub mod system_audio;
 pub mod text;
 
 pub use controller::{Controller, Discarded, Engine, Host, Status, Timings};
