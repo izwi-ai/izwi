@@ -108,6 +108,16 @@ pub struct ChatRequestConfig {
     pub preserve_thinking: Option<bool>,
     #[serde(default)]
     pub tools: Vec<Value>,
+    /// Text the prompt writes for the model at the start of its turn: the
+    /// opening of a tool call the answer must make (`tool_choice` required
+    /// or a named function). The model continues from it, the reply text
+    /// does not repeat it, and thinking is off for that turn.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub response_prefix: String,
+    /// Hold the answer's tool calls to the request's tool definitions:
+    /// declared names only, and arguments that fit each tool's schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_constraint: Option<Box<super::tools::ToolConstraint>>,
     #[serde(default)]
     pub media_inputs: Vec<ChatMediaInput>,
     #[serde(default)]

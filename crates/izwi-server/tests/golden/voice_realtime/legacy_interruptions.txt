@@ -1,3 +1,3 @@
-text {"reason":"barge_in","type":"turn_interrupted","utterance_id":"utt-1","utterance_seq":1}
-text {"reason":"barge_in","status":"interrupted","type":"turn_done","utterance_id":"utt-1","utterance_seq":1}
-text {"reason":"client_interrupt","type":"turn_interrupted","utterance_id":"utt-2","utterance_seq":2}
+text {"type":"turn_interrupted","utterance_id":"utt-1","utterance_seq":1,"reason":"barge_in"}
+text {"type":"turn_done","utterance_id":"utt-1","utterance_seq":1,"status":"interrupted","reason":"barge_in"}
+text {"type":"turn_interrupted","utterance_id":"utt-2","utterance_seq":2,"reason":"client_interrupt"}

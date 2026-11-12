@@ -66,16 +66,17 @@ struct AnswerStream {
 }
 
 impl AnswerStream {
-    fn new(format: AnswerFormat) -> Self {
+    fn new(format: &AnswerFormat) -> Self {
         let opened_in_prompt = format.reasoning_opened_in_prompt;
         Self {
-            splitter: format
-                .parse_reasoning
-                .then(|| super::reasoning::ReasoningSplitter::new(opened_in_prompt)),
+            splitter: format.parse_reasoning.then(|| {
+                super::reasoning::ReasoningSplitter::new(opened_in_prompt)
+                    .with_call_opener(format.call_opener())
+            }),
             opener: super::reasoning::PromptOpener::new(
                 opened_in_prompt && !format.parse_reasoning,
             ),
-            tool_calls: format.tool_calls.map(ToolCallParser::new),
+            tool_calls: format.tool_calls.as_ref().map(|plan| plan.parser()),
         }
     }
 
@@ -170,7 +171,7 @@ pub fn render_chat_stream(
     let errors = ErrorScope::current();
     let stream = async_stream::stream! {
         let mut observer = observer;
-        let mut answer = AnswerStream::new(format);
+        let mut answer = AnswerStream::new(&format);
         let mut saw_terminal = false;
         while let Some(event) = event_rx.recv().await {
             let (payloads, terminal) = match event {

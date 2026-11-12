@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -16,7 +17,7 @@ use crate::api::openai::convert::{
     append_assistant_tool_calls, flatten_content, inbound_content_value, tool_result_message,
 };
 use crate::api::openai::tool_calls::{
-    parse_answer, resolve_tool_policy, ParsedOutput, ToolCall, ToolCallFormat, ToolCallParser,
+    parse_answer, resolve_tool_policy, ParsedOutput, ToolCall, ToolCallParser, ToolPlan,
 };
 use crate::api::openai::tool_response::{
     reject_deferred_tool_results, ToolResponseDialect, ToolResponses, ToolResult,
@@ -110,26 +111,33 @@ pub async fn create_response(
     }
 
     let tool_choice = req.tool_choice.as_ref().map(chat_completions_function);
-    let tool_policy = resolve_tool_policy(model_variant, tools.as_deref(), tool_choice.as_ref())?;
-    let tool_format = tool_policy.format;
+    let tool_policy = resolve_tool_policy(
+        model_variant,
+        tools.as_deref(),
+        tool_choice.as_ref(),
+        req.parallel_tool_calls,
+    )?;
+    let tool_format = tool_policy.plan.clone();
     let chat_config = resolve_chat_request_config(
         req.enable_thinking,
         req.reasoning_effort,
         req.preserve_thinking,
         req.chat_template_kwargs.as_ref(),
-        tool_policy.tools,
+        tool_policy.tools.clone(),
         media_inputs,
         req.truncation,
     )?;
-    // Unsplit output gets back the `<think>` the prompt opened.
-    let opened_in_prompt = reasoning_opened_in_prompt(model_variant, chat_config.enable_thinking);
+    // Unsplit output gets back the `<think>` the prompt opened; a forced
+    // tool call starts the turn, so the prompt opens none.
+    let opened_in_prompt = !tool_policy.is_forced()
+        && reasoning_opened_in_prompt(model_variant, chat_config.enable_thinking);
     if req.max_output_tokens == Some(0) {
         return Err(ApiError::invalid_param(
             "max_output_tokens",
             "`max_output_tokens` must be at least 1",
         ));
     }
-    let execution_request = ChatExecutionRequest {
+    let mut execution_request = ChatExecutionRequest {
         variant: model_variant,
         messages,
         max_completion_tokens: req.max_output_tokens,
@@ -148,6 +156,7 @@ pub async fn create_response(
         chat_config,
         correlation_id: Some(ctx.correlation_id.clone()),
     };
+    tool_policy.apply(&mut execution_request);
     validate_chat_request_ranges(&execution_request)?;
 
     if req.stream.unwrap_or(false) {
@@ -242,12 +251,12 @@ pub async fn create_response(
 /// A whole answer's message text and tool calls: parsed in `tool_format`,
 /// or all text without one.
 fn answer_output(
-    tool_format: Option<ToolCallFormat>,
+    tool_format: Option<Arc<ToolPlan>>,
     text: String,
 ) -> (Option<String>, Vec<StoredFunctionCall>) {
     match tool_format {
         Some(format) => {
-            let (text, calls) = parse_answer(format, &text);
+            let (text, calls) = parse_answer(format.parser(), &text);
             (text, calls.into_iter().map(stored_function_call).collect())
         }
         None => (Some(text), Vec::new()),
@@ -409,7 +418,7 @@ struct ResponseStreamRequest {
     tenant_scope: String,
     input_items: Vec<StoredResponseInputItem>,
     /// The tool-call format to parse the answer in; `None` keeps it text.
-    tool_format: Option<ToolCallFormat>,
+    tool_format: Option<Arc<ToolPlan>>,
     /// The prompt opened the `<think>` block (Qwen3.5/3.6/3.8 with thinking on).
     opened_in_prompt: bool,
 }
@@ -439,13 +448,13 @@ struct ResponseOutputStream {
 impl ResponseOutputStream {
     fn new(
         response_id: String,
-        tool_format: Option<ToolCallFormat>,
+        tool_format: Option<Arc<ToolPlan>>,
         opened_in_prompt: bool,
     ) -> Self {
         Self {
             response_id,
             message_id: new_prefixed_id("msg_"),
-            parser: tool_format.map(ToolCallParser::new),
+            parser: tool_format.map(|plan| plan.parser()),
             opened_in_prompt,
             opener: PromptOpener::new(opened_in_prompt),
             next_output_index: 0,
@@ -1293,6 +1302,7 @@ mod tests {
     use super::super::dto::ResponseInputItem;
     use super::*;
     use crate::api::openai::convert::{InboundContent, InboundContentPart};
+    use crate::api::openai::tool_calls::ToolDialect;
     use crate::test_support::env_lock;
     use izwi_core::{backends::BackendPreference, RuntimeService, ServeRuntimeConfig};
     use serde_json::json;
@@ -1603,7 +1613,7 @@ mod tests {
     /// The `data:` payloads of the stream `events` render to.
     async fn stream_payloads(
         state: &AppState,
-        tool_format: Option<ToolCallFormat>,
+        tool_format: Option<Arc<ToolPlan>>,
         events: Vec<ChatStreamEvent>,
     ) -> Vec<serde_json::Value> {
         use futures::StreamExt;
@@ -1651,7 +1661,7 @@ mod tests {
         let answer = format!("Let me check. {QWEN_CALL}");
         let payloads = stream_payloads(
             &state,
-            Some(ToolCallFormat::QwenXml),
+            Some(Arc::new(ToolPlan::from(ToolDialect::QwenXml))),
             vec![
                 ChatStreamEvent::Started,
                 ChatStreamEvent::Delta {
@@ -1778,7 +1788,10 @@ mod tests {
 
     #[test]
     fn whole_answers_split_into_text_and_function_calls() {
-        let (text, calls) = answer_output(Some(ToolCallFormat::QwenXml), QWEN_CALL.to_string());
+        let (text, calls) = answer_output(
+            Some(Arc::new(ToolPlan::from(ToolDialect::QwenXml))),
+            QWEN_CALL.to_string(),
+        );
         assert_eq!(text, None);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "get_weather");
@@ -1820,8 +1833,10 @@ mod tests {
             2
         );
         assert!(messages[1].content.contains("Rome"));
-        assert_eq!(messages[2].role, ChatRole::User);
-        assert!(messages[2].content.contains("<tool_response>\n21C"));
+        // The prompt builder wraps and merges the results.
+        assert_eq!(messages[2].role, ChatRole::Tool);
+        assert_eq!(messages[2].content, "21C");
+        assert_eq!(messages[3].role, ChatRole::Tool);
         assert!(messages[3].content.contains("25C"));
         assert_eq!(stored.len(), 6);
         assert_eq!(stored[2].item.as_ref().unwrap()["type"], "function_call");
@@ -1899,15 +1914,27 @@ mod tests {
             ModelVariant::Qwen359BGguf,
             Some(&[chat_completions_function(&flat)]),
             None,
+            None,
         )
         .unwrap();
-        assert_eq!(policy.format, Some(ToolCallFormat::QwenXml));
-        let named = chat_completions_function(&json!({"type": "function", "name": "get_weather"}));
         assert_eq!(
-            resolve_tool_policy(ModelVariant::Qwen359BGguf, Some(&[nested]), Some(&named))
-                .unwrap_err()
-                .status,
-            StatusCode::BAD_REQUEST
+            policy.plan.map(|plan| plan.dialect),
+            Some(ToolDialect::QwenXml)
+        );
+        let named = chat_completions_function(&json!({"type": "function", "name": "get_weather"}));
+        // A named function in the Responses form opens the answer with
+        // that call.
+        let forced = resolve_tool_policy(
+            ModelVariant::Qwen359BGguf,
+            Some(&[nested]),
+            Some(&named),
+            None,
+        )
+        .unwrap();
+        assert!(forced.is_forced());
+        assert_eq!(
+            forced.plan.unwrap().response_prefix().as_deref(),
+            Some("<tool_call>\n<function=get_weather>\n")
         );
     }
 

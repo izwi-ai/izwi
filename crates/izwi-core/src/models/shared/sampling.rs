@@ -65,8 +65,19 @@ pub struct GrammarRuntime {
     /// (the family's end-of-sequence tokens and configured stops).
     always_allowed: Vec<u32>,
     surfaces: std::sync::Arc<std::sync::OnceLock<Vec<String>>>,
-    masks: super::grammar::JsonGrammarMasks,
-    machine: super::grammar::JsonGrammarMachine,
+    constraint: OutputConstraint,
+}
+
+/// What a request's output is held to.
+#[derive(Clone)]
+enum OutputConstraint {
+    /// One JSON value (`response_format: json_object`).
+    Json {
+        masks: super::grammar::JsonGrammarMasks,
+        machine: super::grammar::JsonGrammarMachine,
+    },
+    /// Tool calls that name declared tools and fit their schemas.
+    Tools(super::tool_constraint::ToolConstraintRuntime),
 }
 
 impl Clone for GrammarRuntime {
@@ -75,8 +86,7 @@ impl Clone for GrammarRuntime {
             tokenizer: self.tokenizer.clone(),
             always_allowed: self.always_allowed.clone(),
             surfaces: self.surfaces.clone(),
-            masks: self.masks.clone(),
-            machine: self.machine.clone(),
+            constraint: self.constraint.clone(),
         }
     }
 }
@@ -90,26 +100,60 @@ impl GrammarRuntime {
             tokenizer,
             always_allowed,
             surfaces: std::sync::Arc::new(std::sync::OnceLock::new()),
-            masks: super::grammar::JsonGrammarMasks::new(),
-            machine: super::grammar::JsonGrammarMachine::new(),
+            constraint: OutputConstraint::Json {
+                masks: super::grammar::JsonGrammarMasks::new(),
+                machine: super::grammar::JsonGrammarMachine::new(),
+            },
         }
     }
 
-    fn surfaces(&self, vocab_size: usize) -> Result<&[String]> {
-        if let Some(surfaces) = self.surfaces.get() {
-            if surfaces.len() >= vocab_size {
-                return Ok(&surfaces[..vocab_size]);
-            }
+    /// Whether `config` asks for any constraint, before a caller builds
+    /// what [`Self::for_request`] needs.
+    pub(crate) fn requested(config: &ChatGenerationConfig) -> bool {
+        config.constrain_json_object || config.request.tool_constraint.is_some()
+    }
+
+    /// The constraint a request asked for, if any: one JSON value
+    /// (`response_format: json_object`), or tool calls held to the request's
+    /// tool definitions. `always_allowed` lists the family's end-of-turn
+    /// tokens, the turn's own end first. `None` when the request asked for
+    /// none, or when its tool constraint cannot be enforced on this
+    /// tokenizer (the request then runs unconstrained).
+    pub(crate) fn for_request(
+        tokenizer: std::sync::Arc<crate::tokenizer::Tokenizer>,
+        always_allowed: Vec<u32>,
+        config: &ChatGenerationConfig,
+    ) -> Option<Self> {
+        if config.constrain_json_object {
+            return Some(Self::new(tokenizer, always_allowed));
         }
-        let surfaces = (0..vocab_size)
-            .map(|id| self.tokenizer.decode(&[id as u32]).unwrap_or_default())
-            .collect::<Vec<_>>();
-        let _ = self.surfaces.set(surfaces);
-        Ok(self
-            .surfaces
-            .get()
-            .expect("surfaces just inserted")
-            .as_slice())
+        let constraint = config.request.tool_constraint.as_ref()?;
+        let end_of_turn = *always_allowed.first()?;
+        let runtime = super::tool_constraint::ToolConstraintRuntime::new(
+            &tokenizer,
+            end_of_turn,
+            constraint,
+        )?;
+        Some(Self {
+            tokenizer,
+            always_allowed,
+            surfaces: std::sync::Arc::new(std::sync::OnceLock::new()),
+            constraint: OutputConstraint::Tools(runtime),
+        })
+    }
+
+    /// Each token id's decoded text, computed once per runtime family.
+    fn surfaces_of<'a>(
+        surfaces: &'a std::sync::OnceLock<Vec<String>>,
+        tokenizer: &crate::tokenizer::Tokenizer,
+        vocab_size: usize,
+    ) -> &'a [String] {
+        let all = surfaces.get_or_init(|| {
+            (0..vocab_size)
+                .map(|id| tokenizer.decode(&[id as u32]).unwrap_or_default())
+                .collect()
+        });
+        &all[..vocab_size.min(all.len())]
     }
 
     /// Sample one token under the grammar's current mask, then advance the
@@ -154,8 +198,6 @@ impl GrammarRuntime {
         history: PenaltyHistory<'_>,
         rng: &mut R,
     ) -> Result<(u32, Option<RawTokenLogprobs>)> {
-        let surfaces = self.surfaces(vocab_size)?;
-        let mask = self.masks.mask_for(&self.machine, surfaces);
         values.truncate(vocab_size.min(values.len()));
         if values.is_empty() {
             return Err(Error::InvalidInput(
@@ -169,26 +211,60 @@ impl GrammarRuntime {
         } else {
             None
         };
-        for (index, value) in values.iter_mut().enumerate() {
-            let allowed = mask.get(index).copied().unwrap_or(false)
-                || self.always_allowed.iter().any(|id| *id as usize == index);
-            if !allowed {
-                *value = f32::NEG_INFINITY;
+        let always_allowed =
+            |index: usize| self.always_allowed.iter().any(|id| *id as usize == index);
+        match &mut self.constraint {
+            OutputConstraint::Json { masks, machine } => {
+                let surfaces = Self::surfaces_of(&self.surfaces, &self.tokenizer, vocab_size);
+                let mask = masks.mask_for(machine, surfaces);
+                for (index, value) in values.iter_mut().enumerate() {
+                    if !(mask.get(index).copied().unwrap_or(false) || always_allowed(index)) {
+                        *value = f32::NEG_INFINITY;
+                    }
+                }
+            }
+            OutputConstraint::Tools(tools) => {
+                use super::tool_constraint::Allowed;
+                match tools.allowed() {
+                    Allowed::Any => {}
+                    // Inside a call the turn cannot end: the grammar alone
+                    // decides, so the call is whole.
+                    Allowed::Mask(mask) => {
+                        for (index, value) in values.iter_mut().enumerate() {
+                            if !mask.is_allowed(index as u32) {
+                                *value = f32::NEG_INFINITY;
+                            }
+                        }
+                    }
+                    Allowed::EndOfTurn => {
+                        for (index, value) in values.iter_mut().enumerate() {
+                            if !always_allowed(index) {
+                                *value = f32::NEG_INFINITY;
+                            }
+                        }
+                    }
+                }
             }
         }
         let token = sample_from_host_values(values, config, history, rng)?;
-        if config.stop_token_ids.contains(&token) || self.always_allowed.contains(&token) {
+        let ends_turn =
+            config.stop_token_ids.contains(&token) || self.always_allowed.contains(&token);
+        match &mut self.constraint {
             // A stop token ends generation; the machine state stays put.
-        } else {
-            let surface = surfaces
-                .get(token as usize)
-                .ok_or_else(|| {
-                    Error::InferenceError("sampled token outside the grammar vocab".into())
-                })?
-                .clone();
-            self.machine.feed(&surface).map_err(|_| {
-                Error::InferenceError("grammar machine rejected a masked-in token".into())
-            })?;
+            _ if ends_turn => {}
+            OutputConstraint::Json { machine, .. } => {
+                let surfaces = Self::surfaces_of(&self.surfaces, &self.tokenizer, vocab_size);
+                let surface = surfaces
+                    .get(token as usize)
+                    .ok_or_else(|| {
+                        Error::InferenceError("sampled token outside the grammar vocab".into())
+                    })?
+                    .clone();
+                machine.feed(&surface).map_err(|_| {
+                    Error::InferenceError("grammar machine rejected a masked-in token".into())
+                })?;
+            }
+            OutputConstraint::Tools(tools) => tools.commit(token),
         }
         let logprobs = match raw_logprobs {
             Some((logsumexp, top, raw)) => {
@@ -238,17 +314,17 @@ impl ChatSampler {
         }
     }
 
-    /// DS9.2: constrain this request to emit one valid JSON value
-    /// (`response_format: json_object`). `always_allowed` lists token ids
-    /// (typically end-of-sequence) that must stay sampleable in every state.
+    /// Apply the constraint this request asked for: one valid JSON value
+    /// (DS9.2, `response_format: json_object`), or tool calls held to the
+    /// request's tool definitions. `always_allowed` lists the family's
+    /// end-of-turn token ids, the turn's own end first; they stay sampleable
+    /// wherever the turn may end.
     pub fn with_json_object_constraint(
         mut self,
         tokenizer: std::sync::Arc<crate::tokenizer::Tokenizer>,
         always_allowed: Vec<u32>,
     ) -> Self {
-        if self.config.constrain_json_object {
-            self.grammar = Some(GrammarRuntime::new(tokenizer, always_allowed));
-        }
+        self.grammar = GrammarRuntime::for_request(tokenizer, always_allowed, &self.config);
         self
     }
 
@@ -2705,7 +2781,9 @@ mod tests {
             // A tie inside the candidates of row 0.
             logits[3] = logits[5];
             let logits = Tensor::from_vec(logits, (rows, vocab), &device).unwrap();
-            let mut batched_draws = (0..rows).map(|row| xorshift(row as u64 + 7)).collect::<Vec<_>>();
+            let mut batched_draws = (0..rows)
+                .map(|row| xorshift(row as u64 + 7))
+                .collect::<Vec<_>>();
             let mut draws = batched_draws
                 .iter_mut()
                 .map(|draw| draw as &mut dyn FnMut() -> f32)
@@ -2717,12 +2795,16 @@ mod tests {
                 .unwrap();
             for (row, &code) in batched.iter().enumerate() {
                 let mut draw = xorshift(row as u64 + 7);
-                let alone = resident_top_k_sample(&logits.i(row).unwrap(), vocab, top_k, 0.9, &mut draw)
-                    .unwrap()
-                    .expect("sampled on the device")
-                    .to_vec1::<u32>()
-                    .unwrap();
-                assert_eq!(code, alone[0], "rows={rows} vocab={vocab} top_k={top_k} row={row}");
+                let alone =
+                    resident_top_k_sample(&logits.i(row).unwrap(), vocab, top_k, 0.9, &mut draw)
+                        .unwrap()
+                        .expect("sampled on the device")
+                        .to_vec1::<u32>()
+                        .unwrap();
+                assert_eq!(
+                    code, alone[0],
+                    "rows={rows} vocab={vocab} top_k={top_k} row={row}"
+                );
             }
         }
     }

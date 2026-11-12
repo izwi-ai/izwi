@@ -2313,8 +2313,8 @@ async fn stream_unified_s2s_to_socket(
         {
             let mut stream = lock_reply_stream(&stream);
             stream.chunk_offset = stream.next_chunk;
-            stream.parser =
-                (!definitions.is_empty()).then(|| ToolCallParser::new(ToolCallFormat::QwenXml));
+            stream.parser = (!definitions.is_empty())
+                .then(|| ToolCallParser::new(ToolCallFormat::Lfm3Xml).with_tools(&definitions));
         }
         let params = GenerationParams {
             max_tokens: max_output_tokens.clamp(1, 4096),
@@ -2394,7 +2394,8 @@ async fn stream_unified_s2s_to_socket(
         let Some(tools) = tools.as_ref() else {
             break;
         };
-        let (_, calls) = parse_answer(ToolCallFormat::QwenXml, &generation.text);
+        let parser = ToolCallParser::new(ToolCallFormat::Lfm3Xml).with_tools(&definitions);
+        let (_, calls) = parse_answer(parser, &generation.text);
         if calls.is_empty() {
             break;
         }

@@ -1,0 +1,2508 @@
+{
+ "families": {
+  "qwen3": {
+   "repo": "Qwen/Qwen3-4B",
+   "template_md5": "ae518d20e400c6e67716982491e5c37d",
+   "cases": [
+    {
+     "name": "tools_with_system",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "description": "Current time in a timezone.",
+        "parameters": {
+         "type": "object",
+         "properties": {}
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\nYou are a concise assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Current time in a timezone.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+     "name": "tools_thinking_off",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": false,
+     "prompt": "<|im_start|>system\nYou are a concise assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+     "name": "call_round_trip",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "{\"temperature\": 24, \"sky\": \"clear\"}"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\nYou are a concise assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"unit\": \"celsius\", \"city\": \"Harare\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temperature\": 24, \"sky\": \"clear\"}\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+     "name": "text_before_call",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      },
+      {
+       "role": "assistant",
+       "content": "Let me check that.",
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "24 C, clear"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\nYou are a concise assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\nLet me check that.\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"unit\": \"celsius\", \"city\": \"Harare\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n24 C, clear\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+     "name": "parallel_calls",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "Weather in Harare, and the time?"
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        },
+        {
+         "id": "call_2",
+         "type": "function",
+         "function": {
+          "name": "get_time",
+          "arguments": "{}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "24 C, clear"
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_2",
+       "content": "14:05"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "description": "Current time in a timezone.",
+        "parameters": {
+         "type": "object",
+         "properties": {}
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\nYou are a concise assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Current time in a timezone.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWeather in Harare, and the time?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"unit\": \"celsius\", \"city\": \"Harare\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"get_time\", \"arguments\": {}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n24 C, clear\n</tool_response>\n<tool_response>\n14:05\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+     "name": "nested_arguments",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "Save a note about the launch."
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "save_note",
+          "arguments": "{\"title\": \"Launch\", \"body\": \"Line one\\nLine two — done\", \"tags\": [\"izwi\", \"launch\"], \"meta\": {\"owner\": \"ops\", \"attempt\": 2}, \"priority\": 3}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "saved"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "save_note",
+        "description": "Save a note — with tags.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "title": {
+           "type": "string"
+          },
+          "body": {
+           "type": "string"
+          },
+          "tags": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           }
+          },
+          "meta": {
+           "type": "object"
+          },
+          "priority": {
+           "type": "integer"
+          },
+          "pinned": {
+           "type": "boolean"
+          },
+          "due": {
+           "type": [
+            "string",
+            "null"
+           ]
+          }
+         },
+         "required": [
+          "title",
+          "body"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\nYou are a concise assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"save_note\", \"description\": \"Save a note — with tags.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"title\": {\"type\": \"string\"}, \"body\": {\"type\": \"string\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"meta\": {\"type\": \"object\"}, \"priority\": {\"type\": \"integer\"}, \"pinned\": {\"type\": \"boolean\"}, \"due\": {\"type\": [\"string\", \"null\"]}}, \"required\": [\"title\", \"body\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nSave a note about the launch.<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"save_note\", \"arguments\": {\"title\": \"Launch\", \"body\": \"Line one\\nLine two — done\", \"tags\": [\"izwi\", \"launch\"], \"meta\": {\"owner\": \"ops\", \"attempt\": 2}, \"priority\": 3}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsaved\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+     "name": "literal_arguments",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "Pin a note with no due date."
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "save_note",
+          "arguments": "{\"title\": \"Pin\", \"body\": \"x\", \"pinned\": true, \"due\": null}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "saved"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "save_note",
+        "description": "Save a note — with tags.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "title": {
+           "type": "string"
+          },
+          "body": {
+           "type": "string"
+          },
+          "tags": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           }
+          },
+          "meta": {
+           "type": "object"
+          },
+          "priority": {
+           "type": "integer"
+          },
+          "pinned": {
+           "type": "boolean"
+          },
+          "due": {
+           "type": [
+            "string",
+            "null"
+           ]
+          }
+         },
+         "required": [
+          "title",
+          "body"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\nYou are a concise assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"save_note\", \"description\": \"Save a note — with tags.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"title\": {\"type\": \"string\"}, \"body\": {\"type\": \"string\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"meta\": {\"type\": \"object\"}, \"priority\": {\"type\": \"integer\"}, \"pinned\": {\"type\": \"boolean\"}, \"due\": {\"type\": [\"string\", \"null\"]}}, \"required\": [\"title\", \"body\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nPin a note with no due date.<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"save_note\", \"arguments\": {\"title\": \"Pin\", \"body\": \"x\", \"pinned\": true, \"due\": null}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsaved\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+     "name": "reasoning_before_call",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "reasoning_content": "The user wants the weather, so I call get_weather.",
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "24 C, clear"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\nYou are a concise assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\nThe user wants the weather, so I call get_weather.\n</think>\n\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"unit\": \"celsius\", \"city\": \"Harare\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n24 C, clear\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+     "name": "second_query_after_tool_round",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "reasoning_content": "Call the weather tool.",
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "24 C, clear"
+      },
+      {
+       "role": "assistant",
+       "content": "It is 24 C and clear in Harare.",
+       "reasoning_content": "Report the result."
+      },
+      {
+       "role": "user",
+       "content": "And the time there?"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "description": "Current time in a timezone.",
+        "parameters": {
+         "type": "object",
+         "properties": {}
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\nYou are a concise assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Current time in a timezone.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"unit\": \"celsius\", \"city\": \"Harare\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n24 C, clear\n</tool_response><|im_end|>\n<|im_start|>assistant\nIt is 24 C and clear in Harare.<|im_end|>\n<|im_start|>user\nAnd the time there?<|im_end|>\n<|im_start|>assistant\n"
+    }
+   ]
+  },
+  "qwen35": {
+   "repo": "Qwen/Qwen3.5-9B",
+   "template_md5": "94f89e03284d911fc65d06422439fd79",
+   "cases": [
+    {
+     "name": "tools_with_system",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "description": "Current time in a timezone.",
+        "parameters": {
+         "type": "object",
+         "properties": {}
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Current time in a timezone.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "tools_thinking_off",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": false,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+     "name": "call_round_trip",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "{\"temperature\": 24, \"sky\": \"clear\"}"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=city>\nHarare\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temperature\": 24, \"sky\": \"clear\"}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "text_before_call",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      },
+      {
+       "role": "assistant",
+       "content": "Let me check that.",
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "24 C, clear"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nLet me check that.\n\n<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=city>\nHarare\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n24 C, clear\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "parallel_calls",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "Weather in Harare, and the time?"
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        },
+        {
+         "id": "call_2",
+         "type": "function",
+         "function": {
+          "name": "get_time",
+          "arguments": "{}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "24 C, clear"
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_2",
+       "content": "14:05"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "description": "Current time in a timezone.",
+        "parameters": {
+         "type": "object",
+         "properties": {}
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Current time in a timezone.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWeather in Harare, and the time?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=city>\nHarare\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_time>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n24 C, clear\n</tool_response>\n<tool_response>\n14:05\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "nested_arguments",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "Save a note about the launch."
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "save_note",
+          "arguments": "{\"title\": \"Launch\", \"body\": \"Line one\\nLine two — done\", \"tags\": [\"izwi\", \"launch\"], \"meta\": {\"owner\": \"ops\", \"attempt\": 2}, \"priority\": 3}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "saved"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "save_note",
+        "description": "Save a note — with tags.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "title": {
+           "type": "string"
+          },
+          "body": {
+           "type": "string"
+          },
+          "tags": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           }
+          },
+          "meta": {
+           "type": "object"
+          },
+          "priority": {
+           "type": "integer"
+          },
+          "pinned": {
+           "type": "boolean"
+          },
+          "due": {
+           "type": [
+            "string",
+            "null"
+           ]
+          }
+         },
+         "required": [
+          "title",
+          "body"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"save_note\", \"description\": \"Save a note — with tags.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"title\": {\"type\": \"string\"}, \"body\": {\"type\": \"string\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"meta\": {\"type\": \"object\"}, \"priority\": {\"type\": \"integer\"}, \"pinned\": {\"type\": \"boolean\"}, \"due\": {\"type\": [\"string\", \"null\"]}}, \"required\": [\"title\", \"body\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nSave a note about the launch.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=save_note>\n<parameter=title>\nLaunch\n</parameter>\n<parameter=body>\nLine one\nLine two — done\n</parameter>\n<parameter=tags>\n[\"izwi\", \"launch\"]\n</parameter>\n<parameter=meta>\n{\"owner\": \"ops\", \"attempt\": 2}\n</parameter>\n<parameter=priority>\n3\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsaved\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "literal_arguments",
+     "asserted": false,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "Pin a note with no due date."
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "save_note",
+          "arguments": "{\"title\": \"Pin\", \"body\": \"x\", \"pinned\": true, \"due\": null}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "saved"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "save_note",
+        "description": "Save a note — with tags.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "title": {
+           "type": "string"
+          },
+          "body": {
+           "type": "string"
+          },
+          "tags": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           }
+          },
+          "meta": {
+           "type": "object"
+          },
+          "priority": {
+           "type": "integer"
+          },
+          "pinned": {
+           "type": "boolean"
+          },
+          "due": {
+           "type": [
+            "string",
+            "null"
+           ]
+          }
+         },
+         "required": [
+          "title",
+          "body"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"save_note\", \"description\": \"Save a note — with tags.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"title\": {\"type\": \"string\"}, \"body\": {\"type\": \"string\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"meta\": {\"type\": \"object\"}, \"priority\": {\"type\": \"integer\"}, \"pinned\": {\"type\": \"boolean\"}, \"due\": {\"type\": [\"string\", \"null\"]}}, \"required\": [\"title\", \"body\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nPin a note with no due date.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=save_note>\n<parameter=title>\nPin\n</parameter>\n<parameter=body>\nx\n</parameter>\n<parameter=pinned>\nTrue\n</parameter>\n<parameter=due>\nNone\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsaved\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "reasoning_before_call",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "reasoning_content": "The user wants the weather, so I call get_weather.",
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "24 C, clear"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\nThe user wants the weather, so I call get_weather.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=city>\nHarare\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n24 C, clear\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "second_query_after_tool_round",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "reasoning_content": "Call the weather tool.",
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "24 C, clear"
+      },
+      {
+       "role": "assistant",
+       "content": "It is 24 C and clear in Harare.",
+       "reasoning_content": "Report the result."
+      },
+      {
+       "role": "user",
+       "content": "And the time there?"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "description": "Current time in a timezone.",
+        "parameters": {
+         "type": "object",
+         "properties": {}
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Current time in a timezone.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=city>\nHarare\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n24 C, clear\n</tool_response><|im_end|>\n<|im_start|>assistant\nIt is 24 C and clear in Harare.<|im_end|>\n<|im_start|>user\nAnd the time there?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    }
+   ]
+  },
+  "qwen36": {
+   "repo": "Qwen/Qwen3.6-35B-A3B",
+   "template_md5": "cbb67ca62b2c86c5ad72d45794c5cfa3",
+   "cases": [
+    {
+     "name": "tools_with_system",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "description": "Current time in a timezone.",
+        "parameters": {
+         "type": "object",
+         "properties": {}
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Current time in a timezone.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "tools_thinking_off",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": false,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+     "name": "call_round_trip",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "{\"temperature\": 24, \"sky\": \"clear\"}"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=city>\nHarare\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temperature\": 24, \"sky\": \"clear\"}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "text_before_call",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      },
+      {
+       "role": "assistant",
+       "content": "Let me check that.",
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "24 C, clear"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nLet me check that.\n\n<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=city>\nHarare\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n24 C, clear\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "parallel_calls",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "Weather in Harare, and the time?"
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        },
+        {
+         "id": "call_2",
+         "type": "function",
+         "function": {
+          "name": "get_time",
+          "arguments": "{}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "24 C, clear"
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_2",
+       "content": "14:05"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "description": "Current time in a timezone.",
+        "parameters": {
+         "type": "object",
+         "properties": {}
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Current time in a timezone.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWeather in Harare, and the time?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=city>\nHarare\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_time>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n24 C, clear\n</tool_response>\n<tool_response>\n14:05\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "nested_arguments",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "Save a note about the launch."
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "save_note",
+          "arguments": "{\"title\": \"Launch\", \"body\": \"Line one\\nLine two — done\", \"tags\": [\"izwi\", \"launch\"], \"meta\": {\"owner\": \"ops\", \"attempt\": 2}, \"priority\": 3}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "saved"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "save_note",
+        "description": "Save a note — with tags.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "title": {
+           "type": "string"
+          },
+          "body": {
+           "type": "string"
+          },
+          "tags": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           }
+          },
+          "meta": {
+           "type": "object"
+          },
+          "priority": {
+           "type": "integer"
+          },
+          "pinned": {
+           "type": "boolean"
+          },
+          "due": {
+           "type": [
+            "string",
+            "null"
+           ]
+          }
+         },
+         "required": [
+          "title",
+          "body"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"save_note\", \"description\": \"Save a note — with tags.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"title\": {\"type\": \"string\"}, \"body\": {\"type\": \"string\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"meta\": {\"type\": \"object\"}, \"priority\": {\"type\": \"integer\"}, \"pinned\": {\"type\": \"boolean\"}, \"due\": {\"type\": [\"string\", \"null\"]}}, \"required\": [\"title\", \"body\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nSave a note about the launch.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=save_note>\n<parameter=title>\nLaunch\n</parameter>\n<parameter=body>\nLine one\nLine two — done\n</parameter>\n<parameter=tags>\n[\"izwi\", \"launch\"]\n</parameter>\n<parameter=meta>\n{\"owner\": \"ops\", \"attempt\": 2}\n</parameter>\n<parameter=priority>\n3\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsaved\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "literal_arguments",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "Pin a note with no due date."
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "save_note",
+          "arguments": "{\"title\": \"Pin\", \"body\": \"x\", \"pinned\": true, \"due\": null}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "saved"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "save_note",
+        "description": "Save a note — with tags.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "title": {
+           "type": "string"
+          },
+          "body": {
+           "type": "string"
+          },
+          "tags": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           }
+          },
+          "meta": {
+           "type": "object"
+          },
+          "priority": {
+           "type": "integer"
+          },
+          "pinned": {
+           "type": "boolean"
+          },
+          "due": {
+           "type": [
+            "string",
+            "null"
+           ]
+          }
+         },
+         "required": [
+          "title",
+          "body"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"save_note\", \"description\": \"Save a note — with tags.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"title\": {\"type\": \"string\"}, \"body\": {\"type\": \"string\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"meta\": {\"type\": \"object\"}, \"priority\": {\"type\": \"integer\"}, \"pinned\": {\"type\": \"boolean\"}, \"due\": {\"type\": [\"string\", \"null\"]}}, \"required\": [\"title\", \"body\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nPin a note with no due date.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=save_note>\n<parameter=title>\nPin\n</parameter>\n<parameter=body>\nx\n</parameter>\n<parameter=pinned>\ntrue\n</parameter>\n<parameter=due>\nnull\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsaved\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "reasoning_before_call",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "reasoning_content": "The user wants the weather, so I call get_weather.",
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "24 C, clear"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\nThe user wants the weather, so I call get_weather.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=city>\nHarare\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n24 C, clear\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "second_query_after_tool_round",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "reasoning_content": "Call the weather tool.",
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "24 C, clear"
+      },
+      {
+       "role": "assistant",
+       "content": "It is 24 C and clear in Harare.",
+       "reasoning_content": "Report the result."
+      },
+      {
+       "role": "user",
+       "content": "And the time there?"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "description": "Current time in a timezone.",
+        "parameters": {
+         "type": "object",
+         "properties": {}
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Current time in a timezone.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=city>\nHarare\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n24 C, clear\n</tool_response><|im_end|>\n<|im_start|>assistant\nIt is 24 C and clear in Harare.<|im_end|>\n<|im_start|>user\nAnd the time there?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    }
+   ]
+  },
+  "qwen38": {
+   "repo": "Qwen/Qwen3.8-27B",
+   "template_md5": "fce7ef69dfbda713a4aac215f48cbf7e",
+   "cases": [
+    {
+     "name": "tools_with_system",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "description": "Current time in a timezone.",
+        "parameters": {
+         "type": "object",
+         "properties": {}
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Current time in a timezone.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "tools_thinking_off",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": false,
+     "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+     "name": "call_round_trip",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "{\"temperature\": 24, \"sky\": \"clear\"}"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=city>\nHarare\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temperature\": 24, \"sky\": \"clear\"}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "text_before_call",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      },
+      {
+       "role": "assistant",
+       "content": "Let me check that.",
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "24 C, clear"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nLet me check that.\n\n<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=city>\nHarare\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n24 C, clear\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "parallel_calls",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "Weather in Harare, and the time?"
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        },
+        {
+         "id": "call_2",
+         "type": "function",
+         "function": {
+          "name": "get_time",
+          "arguments": "{}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "24 C, clear"
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_2",
+       "content": "14:05"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "description": "Current time in a timezone.",
+        "parameters": {
+         "type": "object",
+         "properties": {}
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Current time in a timezone.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWeather in Harare, and the time?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=city>\nHarare\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_time>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n24 C, clear\n</tool_response>\n<tool_response>\n14:05\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "nested_arguments",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "Save a note about the launch."
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "save_note",
+          "arguments": "{\"title\": \"Launch\", \"body\": \"Line one\\nLine two — done\", \"tags\": [\"izwi\", \"launch\"], \"meta\": {\"owner\": \"ops\", \"attempt\": 2}, \"priority\": 3}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "saved"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "save_note",
+        "description": "Save a note — with tags.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "title": {
+           "type": "string"
+          },
+          "body": {
+           "type": "string"
+          },
+          "tags": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           }
+          },
+          "meta": {
+           "type": "object"
+          },
+          "priority": {
+           "type": "integer"
+          },
+          "pinned": {
+           "type": "boolean"
+          },
+          "due": {
+           "type": [
+            "string",
+            "null"
+           ]
+          }
+         },
+         "required": [
+          "title",
+          "body"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"save_note\", \"description\": \"Save a note — with tags.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"title\": {\"type\": \"string\"}, \"body\": {\"type\": \"string\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"meta\": {\"type\": \"object\"}, \"priority\": {\"type\": \"integer\"}, \"pinned\": {\"type\": \"boolean\"}, \"due\": {\"type\": [\"string\", \"null\"]}}, \"required\": [\"title\", \"body\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nSave a note about the launch.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=save_note>\n<parameter=title>\nLaunch\n</parameter>\n<parameter=body>\nLine one\nLine two — done\n</parameter>\n<parameter=tags>\n[\"izwi\", \"launch\"]\n</parameter>\n<parameter=meta>\n{\"owner\": \"ops\", \"attempt\": 2}\n</parameter>\n<parameter=priority>\n3\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsaved\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "literal_arguments",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "Pin a note with no due date."
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "save_note",
+          "arguments": "{\"title\": \"Pin\", \"body\": \"x\", \"pinned\": true, \"due\": null}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "saved"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "save_note",
+        "description": "Save a note — with tags.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "title": {
+           "type": "string"
+          },
+          "body": {
+           "type": "string"
+          },
+          "tags": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           }
+          },
+          "meta": {
+           "type": "object"
+          },
+          "priority": {
+           "type": "integer"
+          },
+          "pinned": {
+           "type": "boolean"
+          },
+          "due": {
+           "type": [
+            "string",
+            "null"
+           ]
+          }
+         },
+         "required": [
+          "title",
+          "body"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"save_note\", \"description\": \"Save a note — with tags.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"title\": {\"type\": \"string\"}, \"body\": {\"type\": \"string\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"meta\": {\"type\": \"object\"}, \"priority\": {\"type\": \"integer\"}, \"pinned\": {\"type\": \"boolean\"}, \"due\": {\"type\": [\"string\", \"null\"]}}, \"required\": [\"title\", \"body\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nPin a note with no due date.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=save_note>\n<parameter=title>\nPin\n</parameter>\n<parameter=body>\nx\n</parameter>\n<parameter=pinned>\ntrue\n</parameter>\n<parameter=due>\nnull\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsaved\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "reasoning_before_call",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "reasoning_content": "The user wants the weather, so I call get_weather.",
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "24 C, clear"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\nThe user wants the weather, so I call get_weather.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=city>\nHarare\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n24 C, clear\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+     "name": "second_query_after_tool_round",
+     "asserted": true,
+     "messages": [
+      {
+       "role": "system",
+       "content": "You are a concise assistant."
+      },
+      {
+       "role": "user",
+       "content": "What is the weather in Harare?"
+      },
+      {
+       "role": "assistant",
+       "content": null,
+       "reasoning_content": "Call the weather tool.",
+       "tool_calls": [
+        {
+         "id": "call_1",
+         "type": "function",
+         "function": {
+          "name": "get_weather",
+          "arguments": "{\"unit\": \"celsius\", \"city\": \"Harare\"}"
+         }
+        }
+       ]
+      },
+      {
+       "role": "tool",
+       "tool_call_id": "call_1",
+       "content": "24 C, clear"
+      },
+      {
+       "role": "assistant",
+       "content": "It is 24 C and clear in Harare.",
+       "reasoning_content": "Report the result."
+      },
+      {
+       "role": "user",
+       "content": "And the time there?"
+      }
+     ],
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "city": {
+           "type": "string",
+           "description": "City name, e.g. Harare."
+          },
+          "unit": {
+           "type": "string",
+           "enum": [
+            "celsius",
+            "fahrenheit"
+           ]
+          }
+         },
+         "required": [
+          "city"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "description": "Current time in a timezone.",
+        "parameters": {
+         "type": "object",
+         "properties": {}
+        }
+       }
+      }
+     ],
+     "enable_thinking": true,
+     "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Harare.\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"description\": \"Current time in a timezone.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Harare?<|im_end|>\n<|im_start|>assistant\n<think>\nCall the weather tool.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=city>\nHarare\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n24 C, clear\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nReport the result.\n</think>\n\nIt is 24 C and clear in Harare.<|im_end|>\n<|im_start|>user\nAnd the time there?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    }
+   ]
+  }
+ }
+}

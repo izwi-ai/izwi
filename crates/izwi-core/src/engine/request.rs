@@ -1169,8 +1169,10 @@ pub struct EngineCoreRequest {
     pub text: Option<String>,
     /// Chat input messages.
     pub chat_messages: Option<Vec<ChatMessage>>,
-    /// Chat-specific prompt/runtime controls.
-    pub chat_config: ChatRequestConfig,
+    /// Chat-specific prompt/runtime controls. Boxed: every request carries
+    /// this field, most never use it, and requests are moved through deep
+    /// future chains whose stack frames grow with it.
+    pub chat_config: Box<ChatRequestConfig>,
     /// Optional language hint for multilingual generation.
     pub language: Option<String>,
     /// Request correlation ID propagated from API/runtime boundaries.

@@ -7,7 +7,7 @@ impl EngineCoreRequest {
         if self.task_type == TaskType::Chat {
             self.task = EngineTask::Chat(ChatEngineInput {
                 messages: self.chat_messages.clone().unwrap_or_default(),
-                chat_config: self.chat_config.clone(),
+                chat_config: (*self.chat_config).clone(),
                 prompt_tokens: self.prompt_tokens.clone(),
             });
         }
@@ -170,7 +170,10 @@ impl EngineCoreRequest {
     /// the expensive part, so accessors reuse the digest that preparation
     /// computed while the same upload buffer is in place, and hash in full
     /// only when the buffer was replaced (or on a clone of the request).
-    pub(super) fn asr_execution_source_fingerprint(&self, model_variant: ModelVariant) -> Result<u64> {
+    pub(super) fn asr_execution_source_fingerprint(
+        &self,
+        model_variant: ModelVariant,
+    ) -> Result<u64> {
         let audio = self.asr_execution_source_audio(model_variant)?;
         let identity = AsrSourceAudioIdentity::of(audio);
         let digest = match self.asr_source_audio_digest {
@@ -420,7 +423,10 @@ impl EngineCoreRequest {
         Ok(())
     }
 
-    pub(super) fn validate_direct_dynamic_allocations(&self, limits: DirectPayloadLimits) -> Result<usize> {
+    pub(super) fn validate_direct_dynamic_allocations(
+        &self,
+        limits: DirectPayloadLimits,
+    ) -> Result<usize> {
         for (label, count) in [
             ("stop sequences", self.params.stop_sequences.len()),
             ("stop token IDs", self.params.stop_token_ids.len()),
@@ -567,7 +573,11 @@ impl EngineCoreRequest {
         }
     }
 
-    pub(super) fn validate_direct_base64(value: &str, max_source_bytes: usize, label: &str) -> Result<()> {
+    pub(super) fn validate_direct_base64(
+        value: &str,
+        max_source_bytes: usize,
+        label: &str,
+    ) -> Result<()> {
         if value.is_empty() {
             return Err(Error::InvalidInput(format!(
                 "Direct Engine {label} cannot be empty"

@@ -2,11 +2,11 @@
 //! routes: message content, and past tool calls and tool results in the
 //! prompt format of the model family that reads them.
 
-use izwi_model_catalog::{ChatMessage, ChatRole, ModelFamily, ModelVariant};
+use izwi_model_catalog::chat::tools::{self, ToolDialect};
+use izwi_model_catalog::{ChatMessage, ChatRole, ModelVariant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::lfm_tools;
 use crate::app::chat_content::{flatten_content_parts, FlattenedMultimodalContent};
 use crate::error::ApiError;
 
@@ -80,42 +80,29 @@ pub fn flatten_content(
 }
 
 /// Append an assistant turn's past `tool_calls` to its text, in the format
-/// the model family writes them.
+/// the model family writes them (the Qwen XML format for a family without a
+/// tool template).
 pub fn append_assistant_tool_calls(
     variant: ModelVariant,
     content: &mut String,
     tool_calls: &[Value],
 ) -> Result<(), ApiError> {
-    if tool_calls.is_empty() {
-        return Ok(());
-    }
-    if variant.family() == ModelFamily::Lfm2Chat {
-        // The upstream template writes the calls right after the text.
-        content.push_str(&lfm_tools::render_tool_calls(tool_calls)?);
-        return Ok(());
-    }
-    if variant.family() == ModelFamily::Lfm3Chat {
-        // LFM3's template writes its XML calls right after the text too, one
-        // blank line apart.
-        content.push_str(&render_lfm3_tool_calls(tool_calls)?);
-        return Ok(());
-    }
-    let rendered = render_qwen_tool_calls(tool_calls)?;
-    if !content.trim().is_empty() {
-        content.push_str("\n\n");
-    }
-    content.push_str(&rendered);
-    Ok(())
+    let dialect = ToolDialect::of(variant).unwrap_or(ToolDialect::QwenXml);
+    tools::append_assistant_tool_calls(dialect, content, tool_calls).map_err(ApiError::bad_request)
 }
 
-/// A tool result turn. LFM2.5 and LFM3 have a native `tool` role (LFM3's
-/// template wraps it in `<tool_response>` itself); the Qwen templates read
-/// results as a user turn wrapped in `<tool_response>`.
+/// An assistant turn's text with the `reasoning_content` a client sent back
+/// beside it, where the prompt builders read reasoning.
+pub fn assistant_content_with_reasoning(reasoning: Option<&str>, content: &str) -> String {
+    tools::assistant_content_with_reasoning(reasoning, content)
+}
+
+/// A tool result turn. Families with a tool template get a `tool` message,
+/// which their prompt builder writes as the template does (a native tool
+/// turn, or merged `<tool_response>` blocks in a user turn). Any other
+/// family reads it as a user turn wrapped in `<tool_response>`.
 pub fn tool_result_message(variant: ModelVariant, content: String) -> ChatMessage {
-    if matches!(
-        variant.family(),
-        ModelFamily::Lfm2Chat | ModelFamily::Lfm3Chat
-    ) {
+    if ToolDialect::of(variant).is_some() {
         ChatMessage {
             role: ChatRole::Tool,
             content,
@@ -125,92 +112,6 @@ pub fn tool_result_message(variant: ModelVariant, content: String) -> ChatMessag
             role: ChatRole::User,
             content: format!("<tool_response>\n{}\n</tool_response>", content.trim()),
         }
-    }
-}
-
-/// Render OpenAI `tool_calls` as Qwen `<tool_call>` blocks.
-fn render_qwen_tool_calls(tool_calls: &[Value]) -> Result<String, ApiError> {
-    let mut rendered = Vec::with_capacity(tool_calls.len());
-    for tool_call in tool_calls {
-        let function = tool_call.get("function").unwrap_or(tool_call);
-        let name = function
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ApiError::bad_request("Each assistant tool call must include `function.name`")
-            })?;
-
-        let args = normalize_tool_call_arguments(function.get("arguments"));
-        let mut block = String::new();
-        block.push_str("<tool_call>\n");
-        block.push_str(&format!("<function={name}>\n"));
-        let mut keys: Vec<&String> = args.keys().collect();
-        keys.sort();
-        for key in keys {
-            block.push_str(&format!("<parameter={key}>\n"));
-            block.push_str(&tool_parameter_text(&args[key]));
-            block.push_str("\n</parameter>\n");
-        }
-        block.push_str("</function>\n</tool_call>");
-        rendered.push(block);
-    }
-    Ok(rendered.join("\n"))
-}
-
-/// Render OpenAI `tool_calls` the way LFM3's chat template does:
-/// `<tool_call>\n<function=NAME>\n<parameter=K>\nV\n</parameter>\n...
-/// </function>\n</tool_call>` per call, calls one blank line apart. A value
-/// is written raw when it is a string, `true`/`false`/`null` for JSON
-/// literals, and as Python `json.dumps` otherwise. Argument keys follow
-/// `serde_json`'s (sorted) map order.
-fn render_lfm3_tool_calls(tool_calls: &[Value]) -> Result<String, ApiError> {
-    let mut rendered = Vec::with_capacity(tool_calls.len());
-    for tool_call in tool_calls {
-        let function = tool_call.get("function").unwrap_or(tool_call);
-        let name = function
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ApiError::bad_request("Each assistant tool call must include `function.name`")
-            })?;
-        let mut block = format!("<tool_call>\n<function={name}>\n");
-        for (key, value) in normalize_tool_call_arguments(function.get("arguments")) {
-            block.push_str(&format!("<parameter={key}>\n"));
-            match value {
-                Value::String(text) => block.push_str(&text),
-                Value::Array(_) | Value::Object(_) => {
-                    lfm_tools::write_python_json(&value, &mut block)
-                }
-                scalar => block.push_str(&scalar.to_string()),
-            }
-            block.push_str("\n</parameter>\n");
-        }
-        block.push_str("</function>\n</tool_call>");
-        rendered.push(block);
-    }
-    Ok(rendered.join("\n\n"))
-}
-
-/// OpenAI sends `arguments` as a JSON-encoded object; anything else is kept
-/// under an `arguments` key.
-fn normalize_tool_call_arguments(raw: Option<&Value>) -> Map<String, Value> {
-    let wrap = |value: Value| Map::from_iter([("arguments".to_string(), value)]);
-    match raw {
-        None | Some(Value::Null) => Map::new(),
-        Some(Value::Object(map)) => map.clone(),
-        Some(Value::String(raw)) => match serde_json::from_str::<Value>(raw) {
-            Ok(Value::Object(map)) => map,
-            Ok(value) => wrap(value),
-            Err(_) => wrap(Value::String(raw.clone())),
-        },
-        Some(value) => wrap(value.clone()),
-    }
-}
-
-fn tool_parameter_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        _ => value.to_string(),
     }
 }
 
@@ -284,74 +185,44 @@ mod tests {
     }
 
     #[test]
-    fn renders_assistant_tool_calls_to_qwen_xml() {
-        let mut content = String::new();
-        append_assistant_tool_calls(
+    fn tool_turns_follow_the_model_family() {
+        let call = json!({"function": {"name": "get_weather", "arguments": "{\"unit\":\"c\",\"city\":\"Paris\"}"}});
+        let rendered = |variant, text: &str| {
+            let mut content = text.to_string();
+            append_assistant_tool_calls(variant, &mut content, std::slice::from_ref(&call))
+                .unwrap();
+            content
+        };
+        assert_eq!(
+            rendered(ModelVariant::Qwen359BGguf, "Checking."),
+            "Checking.\n\n<tool_call>\n<function=get_weather>\n<parameter=unit>\nc\n</parameter>\n\
+             <parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+        );
+        assert_eq!(
+            rendered(ModelVariant::Qwen314BGguf, ""),
+            "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"unit\": \"c\", \"city\": \"Paris\"}}\n</tool_call>"
+        );
+        assert_eq!(
+            rendered(ModelVariant::Lfm2512BInstructGguf, ""),
+            "<|tool_call_start|>[get_weather(unit='c', city='Paris')]<|tool_call_end|>"
+        );
+        assert!(rendered(ModelVariant::Lfm317BGguf, "Checking.")
+            .starts_with("Checking.<tool_call>\n<function=get_weather>"));
+
+        // Families with a tool template get the result as a tool message.
+        for variant in [
             ModelVariant::Qwen359BGguf,
-            &mut content,
-            &[json!({
-                "id": "call_1",
-                "type": "function",
-                "function": {
-                    "name": "get_weather",
-                    "arguments": "{\"city\":\"Harare\",\"unit\":\"celsius\"}"
-                }
-            })],
-        )
-        .expect("tool call xml should render");
-
-        assert!(content.starts_with("<tool_call>"));
-        assert!(content.contains("<function=get_weather>"));
-        assert!(content.contains("<parameter=city>\nHarare\n</parameter>"));
-        assert!(content.contains("<parameter=unit>\ncelsius\n</parameter>"));
-    }
-
-    #[test]
-    fn lfm25_tool_turns_use_the_lfm_wire_format() {
-        let call =
-            json!({"function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}});
-        let mut lfm = String::new();
-        append_assistant_tool_calls(
+            ModelVariant::Qwen314BGguf,
+            ModelVariant::Lfm317BGguf,
             ModelVariant::Lfm2512BInstructGguf,
-            &mut lfm,
-            std::slice::from_ref(&call),
-        )
-        .unwrap();
-        assert_eq!(
-            lfm,
-            "<|tool_call_start|>[get_weather(city='Paris')]<|tool_call_end|>"
-        );
-        let result = tool_result_message(ModelVariant::Lfm2512BInstructGguf, "21".into());
-        assert_eq!(
-            (result.role, result.content.as_str()),
-            (ChatRole::Tool, "21")
-        );
-
-        // LFM3 writes XML calls right after the text and keeps a tool role.
-        let calls = [
-            call.clone(),
-            json!({"function": {"name": "set", "arguments": {"on": true, "level": 2.5, "tags": ["a", "b"]}}}),
-        ];
-        let mut lfm3 = String::from("Checking.");
-        append_assistant_tool_calls(ModelVariant::Lfm317BGguf, &mut lfm3, &calls).unwrap();
-        assert_eq!(
-            lfm3,
-            "Checking.<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n\
-             </function>\n</tool_call>\n\n<tool_call>\n<function=set>\n<parameter=level>\n2.5\n\
-             </parameter>\n<parameter=on>\ntrue\n</parameter>\n<parameter=tags>\n[\"a\", \"b\"]\n\
-             </parameter>\n</function>\n</tool_call>"
-        );
-        let result = tool_result_message(ModelVariant::Lfm317BGguf, "21".into());
-        assert_eq!(
-            (result.role, result.content.as_str()),
-            (ChatRole::Tool, "21")
-        );
-
-        // Other families keep the Qwen tool format.
-        let mut qwen = String::from("Checking.");
-        append_assistant_tool_calls(ModelVariant::Qwen314BGguf, &mut qwen, &[call]).unwrap();
-        assert!(qwen.starts_with("Checking.\n\n<tool_call>"));
-        let result = tool_result_message(ModelVariant::Qwen314BGguf, " 21 ".into());
+        ] {
+            let result = tool_result_message(variant, " 21 ".into());
+            assert_eq!(
+                (result.role, result.content.as_str()),
+                (ChatRole::Tool, " 21 ")
+            );
+        }
+        let result = tool_result_message(ModelVariant::Gemma34BIt, " 21 ".into());
         assert_eq!(result.role, ChatRole::User);
         assert_eq!(result.content, "<tool_response>\n21\n</tool_response>");
     }

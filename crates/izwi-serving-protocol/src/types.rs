@@ -9,6 +9,11 @@ use std::collections::BTreeSet;
 pub const MAX_CHAT_MESSAGES: usize = 256;
 pub const MAX_CHAT_MESSAGE_BYTES: usize = 256 * 1024;
 pub const MAX_STOP_SEQUENCES: usize = 16;
+/// The longest `ChatParameters::response_prefix`: a tool call's opening
+/// markup and a function name.
+pub const MAX_RESPONSE_PREFIX_BYTES: usize = 512;
+/// The longest grammar of a `ChatToolConstraint`.
+pub const MAX_TOOL_GRAMMAR_BYTES: usize = 1 << 20;
 pub const MAX_STOP_SEQUENCE_BYTES: usize = 1024;
 /// The most function tools one chat request may declare.
 pub const MAX_CHAT_TOOLS: usize = 128;
@@ -275,6 +280,12 @@ pub enum WorkerFeature {
     ChatTools,
     /// Minor 4 (additive): honours `ChatParameters::skip_special_tokens`.
     ChatSkipSpecialTokens,
+    /// Minor 4 (additive): starts the reply with
+    /// `ChatParameters::response_prefix` (a forced tool call's opening).
+    ChatResponsePrefix,
+    /// Minor 4 (additive): holds tool calls to
+    /// `ChatParameters::tool_constraint` while sampling.
+    ChatToolConstraint,
     /// Minor 4 (additive): a TTS realtime session honours the text-stream
     /// admission's `speaker`, `language` and `incremental` fields.
     RealtimeTtsTextStream,
@@ -300,6 +311,8 @@ impl WorkerFeature {
             | Self::ChatContextPolicy
             | Self::ChatTools
             | Self::ChatSkipSpecialTokens
+            | Self::ChatResponsePrefix
+            | Self::ChatToolConstraint
             | Self::RealtimeTtsTextStream => 4,
             Self::Unknown => u16::MAX,
         }
@@ -472,6 +485,35 @@ pub struct ChatParameters {
     /// only `Some(false)` requires the feature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_special_tokens: Option<bool>,
+    /// Minor 4, `WorkerFeature::ChatResponsePrefix`: text the prompt writes
+    /// for the model at the start of its turn (the opening of a tool call
+    /// the reply must make, at most [`MAX_RESPONSE_PREFIX_BYTES`]). The
+    /// model continues from it; the reply text does not repeat it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_prefix: Option<String>,
+    /// Minor 4, `WorkerFeature::ChatToolConstraint`: grammars the sampler
+    /// holds the reply's tool calls to (declared names, arguments that fit
+    /// each tool's schema).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_constraint: Option<ChatToolConstraint>,
+}
+
+/// Minor 4: how a worker constrains a reply's tool calls. The grammars are
+/// text in llguidance's Lark dialect, each at most
+/// [`MAX_TOOL_GRAMMAR_BYTES`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatToolConstraint {
+    /// The marker that opens a call; one token of the model's vocabulary.
+    pub opener: String,
+    /// Grammar of a call's text after `opener`.
+    pub call: String,
+    /// Grammar of the reply's first call after `response_prefix`, when the
+    /// reply must make a call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced: Option<String>,
+    /// The most calls the reply may make.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_calls: Option<u32>,
 }
 
 impl ChatParameters {
@@ -492,7 +534,7 @@ impl ChatParameters {
             .map(|(_, name, _)| name)
     }
 
-    fn knobs(&self) -> [(bool, &'static str, WorkerFeature); 10] {
+    fn knobs(&self) -> [(bool, &'static str, WorkerFeature); 12] {
         [
             (self.seed.is_some(), "seed", WorkerFeature::ChatSeed),
             (
@@ -531,6 +573,16 @@ impl ChatParameters {
                 self.skip_special_tokens == Some(false),
                 "skip_special_tokens",
                 WorkerFeature::ChatSkipSpecialTokens,
+            ),
+            (
+                self.response_prefix.is_some(),
+                "tool_choice",
+                WorkerFeature::ChatResponsePrefix,
+            ),
+            (
+                self.tool_constraint.is_some(),
+                "tools",
+                WorkerFeature::ChatToolConstraint,
             ),
         ]
     }
@@ -645,6 +697,10 @@ pub enum ContractValidationError {
         "chat parameters declare more than {MAX_CHAT_TOOLS} tools or a tool that is not an object"
     )]
     InvalidTools,
+    #[error("chat response prefix is empty or longer than {MAX_RESPONSE_PREFIX_BYTES} bytes")]
+    InvalidResponsePrefix,
+    #[error("chat tool constraint has an empty or oversized marker or grammar")]
+    InvalidToolConstraint,
     #[error("output limits must be non-zero")]
     InvalidOutputLimits,
     #[error("remaining execution budget must be non-zero")]
@@ -722,6 +778,27 @@ impl InvocationRequest {
                     || parameters.tools.iter().any(|tool| !tool.is_object())
                 {
                     return Err(ContractValidationError::InvalidTools);
+                }
+                if parameters.response_prefix.as_ref().is_some_and(|prefix| {
+                    prefix.is_empty() || prefix.len() > MAX_RESPONSE_PREFIX_BYTES
+                }) {
+                    return Err(ContractValidationError::InvalidResponsePrefix);
+                }
+                if parameters
+                    .tool_constraint
+                    .as_ref()
+                    .is_some_and(|constraint| {
+                        constraint.opener.is_empty()
+                            || constraint.opener.len() > MAX_RESPONSE_PREFIX_BYTES
+                            || [Some(&constraint.call), constraint.forced.as_ref()]
+                                .into_iter()
+                                .flatten()
+                                .any(|grammar| {
+                                    grammar.is_empty() || grammar.len() > MAX_TOOL_GRAMMAR_BYTES
+                                })
+                    })
+                {
+                    return Err(ContractValidationError::InvalidToolConstraint);
                 }
             }
         }

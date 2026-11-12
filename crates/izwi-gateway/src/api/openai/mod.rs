@@ -3,7 +3,6 @@
 pub mod chat;
 pub mod compat;
 pub mod convert;
-mod lfm_tools;
 pub mod models;
 pub mod tool_calls;
 pub mod tool_response;

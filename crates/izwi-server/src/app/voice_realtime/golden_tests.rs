@@ -382,7 +382,7 @@ async fn unified_sink(typed: bool, tools: bool) -> Vec<String> {
     }
     let control = TurnControl::new(Instant::now());
     let stream = Arc::new(Mutex::new(UnifiedReplyStream {
-        parser: tools.then(|| ToolCallParser::new(ToolCallFormat::QwenXml)),
+        parser: tools.then(|| ToolCallParser::new(ToolCallFormat::Lfm3Xml)),
         ..UnifiedReplyStream::default()
     }));
     let delivery_error = Arc::new(Mutex::new(None));

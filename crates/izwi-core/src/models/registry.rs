@@ -6284,7 +6284,9 @@ impl NativeChatModel {
         config: &ChatGenerationConfig,
     ) -> Result<Vec<u32>> {
         match self {
-            Self::Qwen3(model) => model.prompt_token_ids(messages),
+            Self::Qwen3(model) => {
+                model.prompt_token_ids_for_request(messages, &config.request)
+            }
             Self::Qwen35(model) => model.prompt_token_ids_with_config(messages, config),
             Self::Qwen36Moe(model) => model.prompt_token_ids_with_config(messages, config),
             Self::Qwen38(model) => model.prompt_token_ids_with_config(messages, config),

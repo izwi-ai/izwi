@@ -51,6 +51,8 @@ sea-orm = { workspace = true, features = [
 ] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Checks that a request's tool grammars compile before the request runs.
+llguidance = { version = "1.9", default-features = false, features = ["lark"] }
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }

@@ -1,12 +1,12 @@
-data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk"}
+data: {"id":"chatcmpl-ID","object":"chat.completion.chunk","created":0,"model":"fixture","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
 
-data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null,"index":0,"logprobs":{"content":[{"bytes":[72,105],"logprob":-0.25,"token":"Hi","top_logprobs":[{"bytes":[72,105],"logprob":-0.25,"token":"Hi"},{"bytes":[72,101,121],"logprob":-1.5,"token":"Hey"}]}]}}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk"}
+data: {"id":"chatcmpl-ID","object":"chat.completion.chunk","created":0,"model":"fixture","choices":[{"index":0,"delta":{"content":"Hi"},"logprobs":{"content":[{"token":"Hi","logprob":-0.25,"bytes":[72,105],"top_logprobs":[{"token":"Hi","logprob":-0.25,"bytes":[72,105]},{"token":"Hey","logprob":-1.5,"bytes":[72,101,121]}]}]},"finish_reason":null}]}
 
-data: {"choices":[{"delta":{"content":"!"},"finish_reason":null,"index":0,"logprobs":{"content":[{"bytes":[33],"logprob":-0.5,"token":"!","top_logprobs":[{"bytes":[33],"logprob":-0.5,"token":"!"},{"bytes":[46],"logprob":-2.0,"token":"."}]}]}}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk"}
+data: {"id":"chatcmpl-ID","object":"chat.completion.chunk","created":0,"model":"fixture","choices":[{"index":0,"delta":{"content":"!"},"logprobs":{"content":[{"token":"!","logprob":-0.5,"bytes":[33],"top_logprobs":[{"token":"!","logprob":-0.5,"bytes":[33]},{"token":".","logprob":-2.0,"bytes":[46]}]}]},"finish_reason":null}]}
 
-data: {"choices":[{"delta":{},"finish_reason":null,"index":0,"logprobs":{"content":[{"bytes":[69,78,68],"logprob":-0.75,"token":"END","top_logprobs":[{"bytes":[69,78,68],"logprob":-0.75,"token":"END"},{"bytes":[32],"logprob":-3.0,"token":" "}]}]}}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk"}
+data: {"id":"chatcmpl-ID","object":"chat.completion.chunk","created":0,"model":"fixture","choices":[{"index":0,"delta":{},"logprobs":{"content":[{"token":"END","logprob":-0.75,"bytes":[69,78,68],"top_logprobs":[{"token":"END","logprob":-0.75,"bytes":[69,78,68]},{"token":" ","logprob":-3.0,"bytes":[32]}]}]},"finish_reason":null}]}
 
-data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk"}
+data: {"id":"chatcmpl-ID","object":"chat.completion.chunk","created":0,"model":"fixture","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
 data: [DONE]
 
