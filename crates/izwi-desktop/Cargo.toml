@@ -47,3 +47,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 izwi-env = { path = "../izwi-env" }
 izwi-dictation = { path = "../izwi-dictation" }
+# Live dictation: audio goes to the server's /v1/realtime while it is spoken,
+# as 24 kHz PCM in base64.
+izwi-audio-codec = { path = "../izwi-audio-codec", default-features = false }
+tokio-tungstenite = "0.30"
+futures = { workspace = true }
+base64 = "0.22"

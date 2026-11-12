@@ -256,6 +256,10 @@ impl Worker {
         });
         if warm {
             self.mark_listening();
+            // Live transcription hears the pre-roll too.
+            if let Some(take) = &self.take {
+                (self.sink)(CaptureEvent::Audio(take.samples.clone()));
+            }
         }
         Ok(())
     }

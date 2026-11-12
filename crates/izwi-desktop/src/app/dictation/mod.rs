@@ -23,6 +23,7 @@ pub mod api;
 pub mod history;
 mod hotkeys;
 mod indicator;
+mod live;
 
 use api::{model_id, ModelStatus, ServerApi};
 use history::HistoryEntry;
@@ -32,6 +33,10 @@ const SETTINGS_KEY: &str = "dictation";
 const STATUS_EVENT: &str = "dictation://status";
 const LEVEL_EVENT: &str = "dictation://level";
 const SNAPSHOT_EVENT: &str = "dictation://snapshot";
+const PARTIAL_EVENT: &str = "dictation://partial";
+/// How long the end of a recording waits for the live transcript before the
+/// recording is transcribed the ordinary way.
+const LIVE_FINISH_WAIT: Duration = Duration::from_millis(1_500);
 /// How long a notice (copied to the clipboard, a failure) stays on screen.
 const NOTICE_TIME: Duration = Duration::from_millis(2_600);
 /// The start tone plays before the output is muted.
@@ -45,6 +50,9 @@ struct ModelView {
     message: Option<String>,
     #[serde(skip)]
     keyword_biasing: bool,
+    /// The model transcribes while the audio arrives.
+    #[serde(skip)]
+    live: bool,
 }
 
 impl ModelView {
@@ -54,6 +62,7 @@ impl ModelView {
             state: "unknown",
             message: None,
             keyword_biasing: false,
+            live: false,
         }
     }
 }
@@ -112,6 +121,10 @@ struct Shared {
     microphones: Mutex<Vec<MicrophoneView>>,
     /// The chat model clean-up uses when the settings name none.
     cleanup_model: Mutex<Option<String>>,
+    /// The live session of the recording in progress, when the model streams.
+    live: Mutex<Option<live::LiveSession>>,
+    /// The last transcript came from the live session (for the log).
+    used_live: AtomicBool,
 }
 
 /// Managed app state.
@@ -163,6 +176,8 @@ pub fn init(app: &AppHandle, server_url: &Url) {
         target_app: Mutex::new(None),
         microphones: Mutex::new(Vec::new()),
         cleanup_model: Mutex::new(None),
+        live: Mutex::new(None),
+        used_live: AtomicBool::new(false),
     });
 
     let sink_shared = Arc::clone(&shared);
@@ -177,7 +192,16 @@ pub fn init(app: &AppHandle, server_url: &Url) {
             CaptureEvent::Level(level) => {
                 let _ = sink_shared.app.emit(LEVEL_EVENT, level);
             }
-            CaptureEvent::Audio(_) => {}
+            CaptureEvent::Audio(samples) => {
+                // The test file stands in for the microphone (see below).
+                #[cfg(debug_assertions)]
+                if std::env::var_os("IZWI_DICTATION_TEST_AUDIO").is_some() {
+                    return;
+                }
+                if let Some(session) = lock(&sink_shared.live).as_ref() {
+                    session.push(samples);
+                }
+            }
         }),
     );
     let _ = shared.recorder.set(recorder);
@@ -285,12 +309,14 @@ fn check_model(shared: &Arc<Shared>) {
     let shared = Arc::clone(shared);
     std::thread::spawn(move || {
         let id = model_id(&settings).to_string();
+        let live = shared.api.transcribes_live(&id);
         let view =
             |state: &'static str, message: Option<String>, keyword_biasing: bool| ModelView {
                 id: id.clone(),
                 state,
                 message,
                 keyword_biasing,
+                live,
             };
         let result = match shared.api.model_info(&id) {
             Err(message) => view("error", Some(message), false),
@@ -403,6 +429,32 @@ fn paste_last_text(shared: &Arc<Shared>) {
     });
 }
 
+/// Open a live session for this recording when the speech model streams
+/// and the user wants to see the words as they speak.
+fn start_live(shared: &Arc<Shared>, settings: &DictationSettings) -> Option<live::LiveSession> {
+    let model = lock(&shared.model).clone();
+    if !settings.live_preview || !model.live || model.state != "ready" {
+        return None;
+    }
+    let language = settings
+        .language
+        .as_deref()
+        .map(str::trim)
+        .filter(|language| !language.is_empty() && !language.eq_ignore_ascii_case("auto"));
+    let terms = settings.vocabulary_terms();
+    let prompt = (!terms.is_empty()).then(|| terms.join(", "));
+    let app = shared.app.clone();
+    live::LiveSession::start(
+        shared.api.base(),
+        &model.id,
+        language,
+        prompt,
+        Arc::new(move |partial| {
+            let _ = app.emit(PARTIAL_EVENT, partial);
+        }),
+    )
+}
+
 fn unmute(shared: &Shared) {
     lock(&shared.muted).take();
 }
@@ -444,7 +496,18 @@ impl Host for DesktopHost {
             .recorder
             .get()
             .ok_or("The microphone is not set up.")?;
-        recorder.start().map_err(|error| error.to_string())?;
+        // Before the microphone opens, so the session misses no audio.
+        *lock(&shared.live) = start_live(shared, settings);
+        #[cfg(debug_assertions)]
+        if let (Some(session), Some(samples)) = (lock(&shared.live).as_ref(), test_audio()) {
+            for chunk in samples.chunks(audio::SAMPLE_RATE as usize / 10) {
+                session.push(chunk.to_vec());
+            }
+        }
+        if let Err(error) = recorder.start() {
+            lock(&shared.live).take();
+            return Err(error.to_string());
+        }
         shared.recording.store(true, Ordering::Release);
         warm_model(shared);
         if settings.sounds {
@@ -490,10 +553,24 @@ impl Host for DesktopHost {
         if let Some(recorder) = shared.recorder.get() {
             recorder.discard();
         }
+        lock(&shared.live).take();
         unmute(shared);
     }
 
     fn transcribe(&mut self, clip: &[f32], settings: &DictationSettings) -> Result<String, String> {
+        // A live session has heard the whole recording already.
+        let live = lock(&self.shared.live).take();
+        if let Some(session) = live {
+            match session.finish(LIVE_FINISH_WAIT) {
+                Some(text) => {
+                    self.shared.used_live.store(true, Ordering::Release);
+                    return Ok(text);
+                }
+                None => desktop_log::info(
+                    "dictation: no live transcript in time; transcribing the recording",
+                ),
+            }
+        }
         let keyword_biasing = lock(&self.shared.model).keyword_biasing;
         self.shared
             .api
@@ -581,11 +658,16 @@ impl Host for DesktopHost {
                     + timings.cleanup_ms
                     + timings.insert_ms;
                 desktop_log::info(format!(
-                    "dictation: {} ms of speech, {} ms to text ({} capture, {} transcribe, {} clean-up, {} insert), {}",
+                    "dictation: {} ms of speech, {} ms to text ({} capture, {} transcribe{}, {} clean-up, {} insert), {}",
                     timings.audio_ms,
                     total_ms,
                     timings.capture_ms,
                     timings.transcribe_ms,
+                    if shared.used_live.swap(false, Ordering::AcqRel) {
+                        " live"
+                    } else {
+                        ""
+                    },
                     timings.cleanup_ms,
                     timings.insert_ms,
                     outcome_name(outcome)
@@ -633,8 +715,11 @@ impl Host for DesktopHost {
                 indicator::hide_after(&shared.app, NOTICE_TIME);
                 check_model(shared);
             }
-            // The result before it set the indicator's hide time.
-            Status::Idle => {}
+            // The result before it set the indicator's hide time. A live
+            // session of a recording that had no speech ends here.
+            Status::Idle => {
+                lock(&shared.live).take();
+            }
         }
 
         *lock(&shared.status) = status.clone();

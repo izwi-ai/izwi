@@ -110,6 +110,24 @@ impl ServerApi {
         parse_model_info(&body)
     }
 
+    pub fn base(&self) -> &Url {
+        &self.base
+    }
+
+    /// Whether `model` transcribes while the audio arrives (the server's
+    /// Realtime capabilities list says so per model).
+    pub fn transcribes_live(&self, model: &str) -> bool {
+        let Ok(client) = Self::client(QUICK_TIMEOUT) else {
+            return false;
+        };
+        client
+            .get(self.url("/v1/realtime/capabilities"))
+            .send()
+            .ok()
+            .and_then(|response| read(response).ok())
+            .is_some_and(|body| live_model_listed(&body, model))
+    }
+
     /// Load `model` and keep it loaded: idle unloading and other loads leave
     /// a pinned model alone.
     pub fn load_pinned(&self, model: &str) -> Result<(), String> {
@@ -311,6 +329,17 @@ fn error_message(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn live_model_listed(capabilities: &str, model: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(capabilities)
+        .ok()
+        .and_then(|value| value.get("transcription_models")?.as_array().cloned())
+        .is_some_and(|models| {
+            models
+                .iter()
+                .any(|listed| listed["id"] == model && listed["transcription_mode"] == "live")
+        })
+}
+
 fn parse_model_info(body: &str) -> Result<ModelInfo, String> {
     let raw: RawModelInfo = serde_json::from_str(body)
         .map_err(|error| format!("The server's answer could not be read: {error}"))?;
@@ -370,6 +399,17 @@ mod tests {
         assert_eq!(model_id(&settings), DEFAULT_MODEL);
         settings.model = Some("Whisper-Large-v3-Turbo".to_string());
         assert_eq!(model_id(&settings), "Whisper-Large-v3-Turbo");
+    }
+
+    #[test]
+    fn live_models_are_read_from_the_capabilities() {
+        let body = r#"{"transcription_models":[
+            {"id":"Nemotron-3.5-ASR-Streaming-0.6B","transcription_mode":"live"},
+            {"id":"Parakeet-TDT-0.6B-v3","transcription_mode":"turn"}]}"#;
+        assert!(live_model_listed(body, "Nemotron-3.5-ASR-Streaming-0.6B"));
+        assert!(!live_model_listed(body, "Parakeet-TDT-0.6B-v3"));
+        assert!(!live_model_listed(body, "Unknown"));
+        assert!(!live_model_listed("{}", "Parakeet-TDT-0.6B-v3"));
     }
 
     #[test]
