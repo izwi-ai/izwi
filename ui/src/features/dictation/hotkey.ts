@@ -76,13 +76,21 @@ export function isModifierOnlyHotkey(hotkey: string): boolean {
 export interface HotkeyRecorderState {
   /** Modifiers down right now. */
   held: HotkeyModifier[];
-  /** Every modifier pressed since the keyboard was last fully released. */
+  /**
+   * The combination so far: the modifiers down, or the ones just let go
+   * while the recording waits to see whether more keys follow.
+   */
   pressed: HotkeyModifier[];
 }
 
 export type HotkeyRecorderOutcome =
   | { kind: "captured"; hotkey: string }
   | { kind: "cancelled" }
+  /**
+   * Every key is up and only modifiers were pressed. The recording waits a
+   * moment for more keys, then `settleHotkeyRecording` decides.
+   */
+  | { kind: "waiting" }
   /** The keys so far cannot be a shortcut; recording goes on. */
   | { kind: "rejected"; reason: "needs_modifier" | "needs_key" };
 
@@ -96,18 +104,20 @@ export const EMPTY_RECORDER_STATE: HotkeyRecorderState = {
   pressed: [],
 };
 
+/** How long a recording waits for more keys once every key is up. */
+export const HOTKEY_SETTLE_MS = 1000;
+
 const FUNCTION_KEY = /^F\d{1,2}$/;
 
 /**
- * Feeds one key event to a recording. A key pressed with modifiers (or a
- * function key alone) is captured at once; modifiers released with no key
- * are captured as a modifier-only shortcut where the platform allows it.
- * Escape cancels.
+ * Feeds one key event to a recording. The keys can be held together or
+ * pressed one after another: modifiers add up until a key completes the
+ * shortcut (a function key needs no modifier). Modifiers let go with no key
+ * leave the recording waiting. Escape cancels.
  */
 export function recordHotkeyEvent(
   state: HotkeyRecorderState,
   event: { type: "keydown" | "keyup"; code: string },
-  options: { modifierOnly: boolean },
 ): HotkeyRecorderStep {
   const modifier = MODIFIER_CODES[event.code];
 
@@ -131,24 +141,48 @@ export function recordHotkeyEvent(
     if (!event.code) {
       return { state, outcome: null };
     }
-    if (state.held.length === 0 && !FUNCTION_KEY.test(event.code)) {
+    if (state.pressed.length === 0 && !FUNCTION_KEY.test(event.code)) {
       return { state, outcome: { kind: "rejected", reason: "needs_modifier" } };
     }
     return {
       state: EMPTY_RECORDER_STATE,
-      outcome: { kind: "captured", hotkey: buildHotkey(state.held, event.code) },
+      outcome: {
+        kind: "captured",
+        hotkey: buildHotkey(state.pressed, event.code),
+      },
     };
   }
 
-  if (!modifier) {
+  if (!modifier || !state.held.includes(modifier)) {
     return { state, outcome: null };
   }
   const held = state.held.filter((entry) => entry !== modifier);
   if (held.length > 0) {
-    return { state: { held, pressed: state.pressed }, outcome: null };
+    // Let go while others are still down: taken back out of the shortcut.
+    return {
+      state: {
+        held,
+        pressed: state.pressed.filter((entry) => entry !== modifier),
+      },
+      outcome: null,
+    };
   }
-  if (state.pressed.length === 0) {
-    return { state: EMPTY_RECORDER_STATE, outcome: null };
+  return {
+    state: { held, pressed: state.pressed },
+    outcome: { kind: "waiting" },
+  };
+}
+
+/**
+ * Ends the wait that follows modifiers let go alone: they are the shortcut
+ * where the platform allows that, and otherwise the recording starts over.
+ */
+export function settleHotkeyRecording(
+  state: HotkeyRecorderState,
+  options: { modifierOnly: boolean },
+): HotkeyRecorderStep {
+  if (state.held.length > 0 || state.pressed.length === 0) {
+    return { state, outcome: null };
   }
   return {
     state: EMPTY_RECORDER_STATE,

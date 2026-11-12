@@ -4,9 +4,12 @@ import { X } from "lucide-react";
 import { dictationApi, dictationAvailable } from "@/features/dictation/api";
 import {
   EMPTY_RECORDER_STATE,
+  HOTKEY_SETTLE_MS,
   hotkeyParts,
   recordHotkeyEvent,
+  settleHotkeyRecording,
   type HotkeyRecorderState,
+  type HotkeyRecorderStep,
 } from "@/features/dictation/hotkey";
 import type { DictationOs } from "@/features/dictation/types";
 import { cn } from "@/lib/utils";
@@ -37,7 +40,7 @@ export function HotkeyKeys({
 
 const REJECTION_HINTS = {
   needs_modifier: "Add Ctrl, Alt, Shift or another modifier key.",
-  needs_key: "Hold the modifier keys and press one more key.",
+  needs_key: "Add one more key, such as Space.",
 } as const;
 
 interface HotkeyRecorderProps {
@@ -54,8 +57,9 @@ interface HotkeyRecorderProps {
 }
 
 /**
- * Click, then press the keys: records a shortcut from the keyboard. Escape
- * or clicking away cancels and keeps the current shortcut.
+ * Click, then press the keys, together or one after another: records a
+ * shortcut from the keyboard. Escape or clicking away cancels and keeps the
+ * current shortcut.
  */
 export function HotkeyRecorder({
   label,
@@ -93,44 +97,71 @@ export function HotkeyRecorder({
     }
     stateRef.current = EMPTY_RECORDER_STATE;
 
+    let settleTimer: number | null = null;
+    const clearSettleTimer = () => {
+      if (settleTimer !== null) {
+        window.clearTimeout(settleTimer);
+        settleTimer = null;
+      }
+    };
+
     const stop = () => {
+      clearSettleTimer();
       stateRef.current = EMPTY_RECORDER_STATE;
       setRecording(false);
       setHeld("");
+    };
+
+    const apply = (step: HotkeyRecorderStep) => {
+      stateRef.current = step.state;
+      setHeld(step.state.pressed.join("+"));
+      const outcome = step.outcome;
+      if (!outcome) {
+        return;
+      }
+      if (outcome.kind === "waiting") {
+        // More keys may follow; if none do, the modifiers are the shortcut.
+        settleTimer = window.setTimeout(() => {
+          settleTimer = null;
+          apply(settleHotkeyRecording(stateRef.current, { modifierOnly }));
+        }, HOTKEY_SETTLE_MS);
+        return;
+      }
+      if (outcome.kind === "rejected") {
+        setHint(REJECTION_HINTS[outcome.reason]);
+        return;
+      }
+      setHint(null);
+      stop();
+      if (outcome.kind === "captured") {
+        onChangeRef.current(outcome.hotkey);
+      }
     };
 
     const handleKey = (event: KeyboardEvent) => {
       // The keys belong to the recording: no app shortcut may act on them.
       event.preventDefault();
       event.stopPropagation();
-      const step = recordHotkeyEvent(
-        stateRef.current,
-        {
+      if (event.type === "keydown") {
+        if (event.repeat) {
+          return;
+        }
+        clearSettleTimer();
+        setHint(null);
+      }
+      apply(
+        recordHotkeyEvent(stateRef.current, {
           type: event.type === "keyup" ? "keyup" : "keydown",
           code: event.code,
-        },
-        { modifierOnly },
+        }),
       );
-      stateRef.current = step.state;
-      setHeld(step.state.held.join("+"));
-      if (!step.outcome) {
-        return;
-      }
-      if (step.outcome.kind === "rejected") {
-        setHint(REJECTION_HINTS[step.outcome.reason]);
-        return;
-      }
-      setHint(null);
-      stop();
-      if (step.outcome.kind === "captured") {
-        onChangeRef.current(step.outcome.hotkey);
-      }
     };
 
     window.addEventListener("keydown", handleKey, true);
     window.addEventListener("keyup", handleKey, true);
     window.addEventListener("blur", stop);
     return () => {
+      clearSettleTimer();
       window.removeEventListener("keydown", handleKey, true);
       window.removeEventListener("keyup", handleKey, true);
       window.removeEventListener("blur", stop);
@@ -190,8 +221,8 @@ export function HotkeyRecorder({
         <p className="text-[12.5px] text-(--text-subtle)" aria-live="polite">
           {hint ??
             (modifierOnly
-              ? "Press a key combination, or press and release modifier keys alone. Esc cancels."
-              : "Press a key combination. Esc cancels.")}
+              ? "Press the keys together or one after another. To use modifier keys alone, press them and wait. Esc cancels."
+              : "Press the keys together or one after another. Esc cancels.")}
         </p>
       ) : null}
     </div>

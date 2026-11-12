@@ -44,7 +44,7 @@ A small indicator near the bottom of the screen shows when Izwi is listening and
 
 ### Choosing a shortcut
 
-A shortcut is one key with modifiers, such as `Ctrl+Shift+Space`, or a function key alone, such as `F9`.
+A shortcut is one key with modifiers, such as `Ctrl+Shift+Space`, or a function key alone, such as `F9`. Click the shortcut box and press the keys, together or one after another. To use modifier keys alone, press them and wait a second.
 
 On macOS and Windows it can also be modifier keys alone: hold `⌥`, `Ctrl+Shift`, or `Fn` (macOS). If you press another key while holding them, Izwi treats it as a normal keyboard shortcut and discards the recording. Modifier-only shortcuts need the Accessibility permission on macOS and stop working while a password field has focus; shortcuts with a key do not have that limit.
 

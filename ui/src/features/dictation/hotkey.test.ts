@@ -9,11 +9,13 @@ import {
   keyLabel,
   parseHotkey,
   recordHotkeyEvent,
+  settleHotkeyRecording,
   type HotkeyRecorderOutcome,
 } from "@/features/dictation/hotkey";
 
-/** Feeds "down:Code" / "up:Code" events and returns the first outcome that
- * ends the recording (or the last rejection). */
+/** Feeds "down:Code" / "up:Code" events, and "wait" for the pause after the
+ * keys are let go. Returns the outcome that ends the recording, or the last
+ * one before it. */
 function record(
   events: string[],
   modifierOnly = true,
@@ -22,15 +24,17 @@ function record(
   let last: HotkeyRecorderOutcome | null = null;
   for (const entry of events) {
     const [direction, code] = entry.split(":");
-    const step = recordHotkeyEvent(
-      state,
-      { type: direction === "down" ? "keydown" : "keyup", code },
-      { modifierOnly },
-    );
+    const step =
+      entry === "wait"
+        ? settleHotkeyRecording(state, { modifierOnly })
+        : recordHotkeyEvent(state, {
+            type: direction === "down" ? "keydown" : "keyup",
+            code,
+          });
     state = step.state;
     if (step.outcome) {
       last = step.outcome;
-      if (step.outcome.kind !== "rejected") {
+      if (last.kind === "captured" || last.kind === "cancelled") {
         return last;
       }
     }
@@ -69,29 +73,47 @@ describe("recording a hotkey", () => {
     ).toEqual({ kind: "captured", hotkey: "Ctrl+Shift+KeyD" });
   });
 
-  it("captures modifiers released alone where that is allowed", () => {
-    expect(record(["down:AltRight", "up:AltRight"])).toEqual({
-      kind: "captured",
-      hotkey: "Alt",
-    });
-    // Both count, even though one was released first.
+  it("captures keys pressed one after another", () => {
+    expect(
+      record(["down:AltLeft", "up:AltLeft", "down:Space", "up:Space"]),
+    ).toEqual({ kind: "captured", hotkey: "Alt+Space" });
     expect(
       record([
         "down:ControlLeft",
-        "down:ShiftLeft",
         "up:ControlLeft",
+        "down:ShiftLeft",
         "up:ShiftLeft",
+        "down:KeyD",
       ]),
-    ).toEqual({ kind: "captured", hotkey: "Ctrl+Shift" });
+    ).toEqual({ kind: "captured", hotkey: "Ctrl+Shift+KeyD" });
   });
 
-  it("asks for a key where modifiers alone are not allowed, then goes on", () => {
-    expect(record(["down:AltLeft", "up:AltLeft"], false)).toEqual({
+  it("waits after modifiers are let go, then takes them alone where allowed", () => {
+    expect(record(["down:AltRight", "up:AltRight"])).toEqual({
+      kind: "waiting",
+    });
+    expect(record(["down:AltRight", "up:AltRight", "wait"])).toEqual({
+      kind: "captured",
+      hotkey: "Alt",
+    });
+    expect(
+      record(["down:ControlLeft", "up:ControlLeft", "down:ShiftLeft", "up:ShiftLeft", "wait"]),
+    ).toEqual({ kind: "captured", hotkey: "Ctrl+Shift" });
+    // Nothing to settle while a key is down or before any was pressed.
+    expect(record(["wait"])).toBeNull();
+    expect(record(["down:AltLeft", "wait"])).toBeNull();
+  });
+
+  it("asks for a key where modifiers alone are not allowed, then starts over", () => {
+    expect(record(["down:AltLeft", "up:AltLeft", "wait"], false)).toEqual({
       kind: "rejected",
       reason: "needs_key",
     });
     expect(
-      record(["down:AltLeft", "up:AltLeft", "down:MetaLeft", "down:KeyK"], false),
+      record(
+        ["down:AltLeft", "up:AltLeft", "wait", "down:MetaLeft", "down:KeyK"],
+        false,
+      ),
     ).toEqual({ kind: "captured", hotkey: "Meta+KeyK" });
   });
 
