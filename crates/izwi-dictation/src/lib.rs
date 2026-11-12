@@ -9,6 +9,7 @@
 pub mod audio;
 #[cfg(feature = "capture")]
 pub mod capture;
+pub mod insert;
 pub mod session;
 pub mod settings;
 pub mod shortcut;
