@@ -689,8 +689,15 @@ impl Host for DesktopHost {
                     + timings.transcribe_ms
                     + timings.cleanup_ms
                     + timings.insert_ms;
+                // The app, not the text: enough to tell where a paste that
+                // did not land was sent.
+                let target = lock(&shared.target_app)
+                    .as_ref()
+                    .map(|app| app.name.clone())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| "unknown app".to_string());
                 desktop_log::info(format!(
-                    "dictation: {} ms of speech, {} ms to text ({} capture, {} transcribe{}, {} clean-up, {} insert), {}",
+                    "dictation: {} ms of speech, {} ms to text ({} capture, {} transcribe{}, {} clean-up, {} insert), {} in {target}",
                     timings.audio_ms,
                     total_ms,
                     timings.capture_ms,
