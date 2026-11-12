@@ -1,0 +1,26 @@
+[package]
+name = "izwi-dictation"
+description = "System-wide dictation for Izwi desktop: hotkey sessions, microphone capture, text rules and insertion at the cursor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["capture"]
+# Microphone capture through cpal. Off for builds that only need the session
+# logic, text rules and insertion (cpal needs ALSA headers on Linux).
+capture = ["dep:cpal"]
+
+[dependencies]
+izwi-vad = { path = "../izwi-vad" }
+izwi-audio-codec = { path = "../izwi-audio-codec", default-features = false }
+serde = { workspace = true }
+thiserror = { workspace = true }
+cpal = { version = "0.18.2", optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+izwi-vad = { path = "../izwi-vad", features = ["test-signals"] }

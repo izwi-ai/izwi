@@ -15,6 +15,7 @@ members = [
     "crates/izwi-gateway",
     "crates/izwi-cli",
     "crates/izwi-desktop",
+    "crates/izwi-dictation",
     "crates/izwi-serving-protocol",
     "crates/izwi-serving-client",
     "crates/izwi-serving-fence",
