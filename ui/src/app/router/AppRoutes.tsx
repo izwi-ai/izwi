@@ -32,6 +32,7 @@ const ROUTE_MODULES = {
   SpeechTextPage: () => import("@/features/speech-text/route"),
   ChatPage: () => import("@/features/chat/route"),
   VoicePage: () => import("@/features/voice/route"),
+  DictationPage: () => import("@/features/dictation/route"),
   MyModelsPage: () => import("@/features/models/route"),
   SettingsPage: () => import("@/features/settings/route"),
 };
@@ -64,6 +65,10 @@ const ChatPage = lazy(async () => ({
 
 const VoicePage = lazy(async () => ({
   default: (await ROUTE_MODULES.VoicePage()).VoicePage,
+}));
+
+const DictationPage = lazy(async () => ({
+  default: (await ROUTE_MODULES.DictationPage()).DictationPage,
 }));
 
 const MyModelsPage = lazy(async () => ({
@@ -258,6 +263,17 @@ export function AppRoutes() {
           <Route
             path="/voice"
             element={withSuspense(<VoicePage {...voicePageProps} />)}
+          />
+          <Route
+            path="/dictation"
+            element={withSuspense(
+              <DictationPage
+                models={models}
+                downloadProgress={downloadProgress}
+                onDownload={downloadModel}
+                onCancelDownload={cancelModelDownload}
+              />,
+            )}
           />
           <Route
             path="/models"

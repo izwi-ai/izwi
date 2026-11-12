@@ -101,6 +101,12 @@ export default defineConfig({
   build: {
     outDir: "dist",
     rolldownOptions: {
+      // The dictation indicator is its own small page, shown by the desktop
+      // app in a separate always-on-top window.
+      input: {
+        main: fileURLToPath(new URL("./index.html", import.meta.url)),
+        indicator: fileURLToPath(new URL("./indicator.html", import.meta.url)),
+      },
       output: {
         codeSplitting: { groups: vendorChunkGroups },
       },
