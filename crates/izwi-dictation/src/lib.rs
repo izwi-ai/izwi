@@ -12,6 +12,8 @@ pub mod capture;
 pub mod controller;
 pub mod hotkey;
 pub mod insert;
+#[cfg(target_os = "linux")]
+pub mod portal;
 pub mod session;
 pub mod settings;
 pub mod shortcut;

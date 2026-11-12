@@ -13,6 +13,8 @@ enum Registration {
     System(String),
     /// Listening until dropped.
     Listener(#[allow(dead_code)] ModifierListener),
+    /// Bound through the Wayland desktop's shortcuts portal.
+    Desktop,
 }
 
 #[derive(Default)]
@@ -39,23 +41,53 @@ fn registration_error(accelerator: &str, error: impl std::fmt::Display) -> Strin
 impl Hotkeys {
     pub fn clear<R: Runtime>(&mut self, app: &AppHandle<R>) {
         self.release_cancel(app);
-        if let Some(Registration::System(accelerator)) = self.dictate.take() {
-            let _ = app.global_shortcut().unregister(accelerator.as_str());
-        }
+        self.release_dictate(app);
         if let Some(accelerator) = self.paste_last.take() {
             let _ = app.global_shortcut().unregister(accelerator.as_str());
         }
     }
 
+    fn release_dictate<R: Runtime>(&mut self, app: &AppHandle<R>) {
+        match self.dictate.take() {
+            Some(Registration::System(accelerator)) => {
+                let _ = app.global_shortcut().unregister(accelerator.as_str());
+            }
+            Some(Registration::Desktop) => hotkey::unbind_desktop_shortcut(),
+            Some(Registration::Listener(_)) | None => {}
+        }
+    }
+
     /// Register the dictation hotkey, replacing the previous one.
+    ///
+    /// On Wayland the desktop owns shortcuts. When it refuses (no portal on
+    /// this desktop), dictation still works from the command line, so that
+    /// is a warning (`Ok(Some(..))`), not a failure.
     pub fn set_dictate<R: Runtime>(
         &mut self,
         app: &AppHandle<R>,
         shortcut: &Shortcut,
         controller: Controller,
-    ) -> Result<(), String> {
-        if let Some(Registration::System(accelerator)) = self.dictate.take() {
-            let _ = app.global_shortcut().unregister(accelerator.as_str());
+    ) -> Result<Option<String>, String> {
+        self.release_dictate(app);
+        let portal_controller = controller.clone();
+        let bound = hotkey::bind_desktop_shortcut(shortcut, move |edge| {
+            portal_controller.send(match edge {
+                KeyEdge::Pressed => Input::Press,
+                KeyEdge::Released => Input::Release,
+                KeyEdge::Chord => Input::Cancel,
+            });
+        });
+        match bound {
+            Some(Ok(())) => {
+                self.dictate = Some(Registration::Desktop);
+                return Ok(None);
+            }
+            Some(Err(error)) => {
+                return Ok(Some(format!(
+                    "{error}. Bind a key to `izwi-desktop --dictation toggle` in your desktop's keyboard settings instead."
+                )));
+            }
+            None => {}
         }
         let registration = match shortcut.accelerator() {
             Some(accelerator) => {
@@ -78,7 +110,7 @@ impl Hotkeys {
             })?),
         };
         self.dictate = Some(registration);
-        Ok(())
+        Ok(None)
     }
 
     /// Register the "paste last transcript" hotkey, or remove it.

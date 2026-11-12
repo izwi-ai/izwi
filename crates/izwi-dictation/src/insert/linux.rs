@@ -1,7 +1,8 @@
 //! Linux. On X11 the paste shortcut is sent with the XTest extension. A
-//! Wayland session has no one way to send keys, so the tools a desktop may
-//! offer are tried in turn (`wtype`, `ydotool`, `dotool`); when none works
-//! the text stays on the clipboard.
+//! Wayland session has no one way to send keys, so the ways a desktop may
+//! offer are tried in turn: the tools `wtype`, `ydotool` and `dotool`, then
+//! the RemoteDesktop portal. When none works the text stays on the
+//! clipboard.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -192,12 +193,16 @@ fn wayland_paste() -> Result<(), InjectError> {
             Err(error) => failures.push(error),
         }
     }
-    if failures.is_empty() {
-        Err(InjectError::Unsupported(
-            "Pasting on Wayland needs wtype, ydotool or dotool.".to_string(),
-        ))
-    } else {
-        Err(InjectError::Failed(failures.join("; ")))
+    // GNOME and KDE: the RemoteDesktop portal, after the user agrees once.
+    match crate::portal::send_paste(false) {
+        Ok(()) => Ok(()),
+        Err(error) if failures.is_empty() => Err(InjectError::Unsupported(format!(
+            "Pasting on Wayland needs the desktop's permission or one of wtype, ydotool and dotool ({error})."
+        ))),
+        Err(error) => {
+            failures.push(error);
+            Err(InjectError::Failed(failures.join("; ")))
+        }
     }
 }
 

@@ -59,6 +59,15 @@ handy-keys = "0.3.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
+# Wayland: the GlobalShortcuts and RemoteDesktop portals.
+ashpd = { version = "0.14", default-features = false, features = [
+    "tokio",
+    "global_shortcuts",
+    "remote_desktop",
+    "screencast",
+] }
+futures-util = "0.3"
+tokio = { workspace = true }
 x11rb = { version = "0.14", features = ["xtest"] }
 
 [dev-dependencies]

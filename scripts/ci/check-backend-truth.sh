@@ -511,6 +511,9 @@ run_cargo_serving() {
         -p izwi-serving-fence \
         -p izwi-serving-supervisor \
         -p izwi-serving-worker
+    # Without microphone capture, which needs ALSA headers this lane does
+    # not install; the session, text, insertion and portal code all build.
+    cargo test --locked -p izwi-dictation --no-default-features
     cargo test --locked --no-fail-fast -p izwi-gateway \
         --lib --bins \
         --test gateway_only_process \

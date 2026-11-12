@@ -214,6 +214,10 @@ pub fn init(app: &AppHandle, server_url: &Url) {
     let _ = shared.controller.set(controller);
     app.manage(Dictation(Arc::clone(&shared)));
 
+    if let Ok(state_dir) = app.path().app_data_dir() {
+        izwi_dictation::hotkey::init_desktop_portal(state_dir, &app.config().identifier);
+    }
+
     // Off the main thread: registering hotkeys waits on it.
     std::thread::spawn(move || {
         if let Err(error) = register_hotkeys(&shared, &settings) {
@@ -239,13 +243,15 @@ fn register_hotkeys(shared: &Arc<Shared>, settings: &DictationSettings) -> Resul
     let mut hotkeys = lock(&shared.hotkeys);
     hotkeys.clear(&shared.app);
     *lock(&shared.paste_last_error) = None;
+    *lock(&shared.hotkey_error) = None;
     if !settings.enabled {
         // Dropping the listener of a modifier-only hotkey stops it.
         *hotkeys = Hotkeys::default();
         return Ok(());
     }
     let dictate = hotkeys::validate(&settings.hotkey)?;
-    hotkeys.set_dictate(&shared.app, &dictate, controller)?;
+    let warning = hotkeys.set_dictate(&shared.app, &dictate, controller)?;
+    *lock(&shared.hotkey_error) = warning;
 
     let paste_last = settings
         .paste_last_hotkey
@@ -820,7 +826,6 @@ pub fn dictation_update_settings(
             let _ = register_hotkeys(shared, &previous);
             return Err(error);
         }
-        *lock(&shared.hotkey_error) = None;
     }
 
     *lock(&shared.settings) = settings.clone();
@@ -870,8 +875,9 @@ pub fn dictation_pause_hotkeys(state: State<'_, Dictation>, paused: bool) {
         return;
     }
     let settings = lock(&shared.settings).clone();
-    let error = register_hotkeys(shared, &settings).err();
-    *lock(&shared.hotkey_error) = error;
+    if let Err(error) = register_hotkeys(shared, &settings) {
+        *lock(&shared.hotkey_error) = Some(error);
+    }
     emit_snapshot(shared);
 }
 

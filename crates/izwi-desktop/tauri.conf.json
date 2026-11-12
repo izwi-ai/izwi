@@ -50,6 +50,9 @@
     ],
     "linux": {
       "deb": {
+        "depends": [
+          "libasound2"
+        ],
         "files": {
           "/usr/bin/izwi": "../../target/release/izwi",
           "/usr/bin/izwi-server": "../../target/release/izwi-server"

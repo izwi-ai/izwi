@@ -137,6 +137,50 @@ impl ModifierListener {
     }
 }
 
+/// True in a Wayland session, where hotkeys go through the desktop's
+/// GlobalShortcuts portal instead of an OS registration.
+pub fn uses_desktop_portal() -> bool {
+    cfg!(target_os = "linux")
+        && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty())
+}
+
+/// Register `shortcut` with the Wayland desktop. `None` outside Wayland,
+/// where the caller registers it with the OS.
+pub fn bind_desktop_shortcut(
+    shortcut: &Shortcut,
+    on_edge: impl Fn(KeyEdge) + Send + Sync + 'static,
+) -> Option<Result<(), String>> {
+    if !uses_desktop_portal() {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    return Some(crate::portal::bind_shortcut(shortcut, on_edge));
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (shortcut, on_edge);
+        None
+    }
+}
+
+pub fn unbind_desktop_shortcut() {
+    #[cfg(target_os = "linux")]
+    if uses_desktop_portal() {
+        crate::portal::unbind_shortcut();
+    }
+}
+
+/// One-time setup for the desktop portals: where their state is kept and
+/// which app this is. Does nothing outside a Wayland session.
+pub fn init_desktop_portal(state_dir: std::path::PathBuf, app_id: &str) {
+    #[cfg(target_os = "linux")]
+    if uses_desktop_portal() {
+        crate::portal::set_state_dir(state_dir);
+        crate::portal::register_app(app_id);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (state_dir, app_id);
+}
+
 /// Why `shortcut` cannot be used on this OS, if it cannot.
 pub fn unsupported_reason(shortcut: &Shortcut) -> Option<String> {
     if shortcut.function && !cfg!(target_os = "macos") {
