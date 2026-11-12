@@ -356,6 +356,14 @@ fn check_model(shared: &Arc<Shared>) {
             warm_model(&shared);
         }
         shared.model_check_running.store(false, Ordering::Release);
+        // The settings may have changed while this ran, and the check that
+        // change asked for was skipped because this one was running.
+        let current = lock(&shared.settings).clone();
+        if !current.enabled {
+            set_model(&shared, ModelView::unknown(model_id(&current)));
+        } else if model_id(&current) != id {
+            check_model(&shared);
+        }
     });
 }
 

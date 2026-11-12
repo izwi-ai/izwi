@@ -70,6 +70,35 @@ describe("DictationPage", () => {
     ).toBeInTheDocument();
   });
 
+  it("says dictation is off and turns it on from setup", async () => {
+    serve(
+      dictationSnapshot({
+        settings: dictationSettings({ enabled: false }),
+        model: { id: "Parakeet-TDT-0.6B-v3", state: "unknown", message: null },
+      }),
+    );
+    renderPage();
+
+    expect(
+      await screen.findByText(
+        "Dictation is off. Turn it on to use your shortcut.",
+      ),
+    ).toBeInTheDocument();
+    // Nothing is being checked while dictation is off.
+    expect(screen.queryByText("Checking")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Turn on" }));
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("dictation_update_settings", {
+        settings: dictationSettings({ enabled: true }),
+      }),
+    );
+    expect(
+      screen.queryByRole("button", { name: "Turn on" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("offers the model download and the keyboard permission during setup", async () => {
     serve(
       dictationSnapshot({
@@ -106,6 +135,28 @@ describe("DictationPage", () => {
     await waitFor(() =>
       expect(tauri.invoke).toHaveBeenCalledWith("dictation_update_settings", {
         settings: dictationSettings({ hotkey: "Ctrl+KeyD" }),
+      }),
+    );
+  });
+
+  it("records a shortcut from keys pressed one after another", async () => {
+    serve(dictationSnapshot());
+    renderPage();
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: /^Dictation shortcut:/ }),
+    );
+    fireEvent.keyDown(window, { code: "ControlLeft" });
+    fireEvent.keyUp(window, { code: "ControlLeft" });
+    expect(tauri.invoke).not.toHaveBeenCalledWith(
+      "dictation_update_settings",
+      expect.anything(),
+    );
+    fireEvent.keyDown(window, { code: "Space" });
+
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("dictation_update_settings", {
+        settings: dictationSettings({ hotkey: "Ctrl+Space" }),
       }),
     );
   });

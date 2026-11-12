@@ -19,7 +19,9 @@ type ModelStep =
   | "loading"
   | "not_downloaded"
   | "error"
-  | "checking";
+  | "checking"
+  | "installed"
+  | "off";
 
 /**
  * Where the speech model stands. The snapshot says whether dictation can use
@@ -31,6 +33,17 @@ export function speechModelStep(
   catalogModel: ModelInfo | undefined,
 ): ModelStep {
   const { state } = snapshot.model;
+  if (!snapshot.settings.enabled) {
+    // While dictation is off the app leaves the model alone, so the catalog
+    // is what there is to go on.
+    if (catalogModel?.status === "downloading") {
+      return "downloading";
+    }
+    if (state === "not_downloaded" || catalogModel?.status === "not_downloaded") {
+      return "not_downloaded";
+    }
+    return catalogModel ? "installed" : "off";
+  }
   if (state === "ready") {
     return "ready";
   }
@@ -73,6 +86,8 @@ const MODEL_STATUS: Record<ModelStep, { label: string; tone: SetupRowTone }> = {
   not_downloaded: { label: "Not downloaded", tone: "muted" },
   error: { label: "Needs attention", tone: "error" },
   checking: { label: "Checking", tone: "muted" },
+  installed: { label: "Downloaded", tone: "done" },
+  off: { label: "Loads when dictation is on", tone: "muted" },
 };
 
 function tryButtonLabel(status: DictationStatus): string {
@@ -96,9 +111,11 @@ interface SetupChecklistProps {
   onDownload: (variant: string) => void;
   onCancelDownload?: (variant: string) => void;
   onRefresh: () => Promise<void>;
+  /** Turns dictation on. */
+  onEnable: () => void;
 }
 
-/** The steps before dictation works: model, permission, a first try. */
+/** The steps before dictation works: on, model, permission, a first try. */
 export function SetupChecklist({
   snapshot,
   partial,
@@ -107,6 +124,7 @@ export function SetupChecklist({
   onDownload,
   onCancelDownload,
   onRefresh,
+  onEnable,
 }: SetupChecklistProps) {
   const modelId = snapshot.model.id;
   const catalogModel = models.find((model) => model.variant === modelId);
@@ -146,6 +164,19 @@ export function SetupChecklist({
 
   return (
     <ul className="[&>li:last-child]:border-b-0">
+      {snapshot.settings.enabled ? null : (
+        <SetupRow
+          title="Dictation"
+          model="Listens for your shortcut and keeps the speech model loaded"
+          status="Off"
+          tone="muted"
+          action={
+            <Button type="button" size="sm" onClick={onEnable}>
+              Turn on
+            </Button>
+          }
+        />
+      )}
       <SetupRow
         title="Speech model"
         model={getModelDisplayName(modelId, catalogModel?.display_name)}
@@ -248,7 +279,9 @@ export function SetupChecklist({
               Try it
             </span>
             <span className="text-[13px] text-(--text-muted)">
-              Click in the box, then use your shortcut or the button.
+              {snapshot.settings.enabled
+                ? "Click in the box, then use your shortcut or the button."
+                : "Turn dictation on first."}
             </span>
           </div>
           <span className="flex items-center gap-2">

@@ -190,7 +190,11 @@ function statusLine(
 ): { text: string; tone: "neutral" | "danger"; busy: boolean } {
   const { settings, status, platform } = snapshot;
   if (!settings.enabled) {
-    return { text: "Off", tone: "neutral", busy: false };
+    return {
+      text: "Dictation is off. Turn it on to use your shortcut.",
+      tone: "neutral",
+      busy: false,
+    };
   }
   const activity = activityText(status);
   if (activity) {
@@ -456,6 +460,7 @@ function DictationSettingsView({
                 onDownload={onDownload}
                 onCancelDownload={onCancelDownload}
                 onRefresh={dictation.refresh}
+                onEnable={() => void update({ enabled: true })}
               />
             ) : (
               <SettingsRow description="The speech model is ready and Izwi can write into other apps." />
