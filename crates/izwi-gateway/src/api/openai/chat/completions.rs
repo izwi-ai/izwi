@@ -16,9 +16,10 @@ use super::dto::{
 use super::stream::{render_chat_stream, AuditedStream};
 use crate::api::openai::compat::{strict_guardrail_message, OpenAiCompatibilityProfile};
 use crate::api::openai::convert::{
-    append_assistant_tool_calls, flatten_content, inbound_content_value, tool_result_message,
+    append_assistant_tool_calls, assistant_content_with_reasoning, flatten_content,
+    inbound_content_value, tool_result_message,
 };
-use crate::api::openai::tool_calls::{parse_answer, resolve_tool_policy, ToolCallFormat};
+use crate::api::openai::tool_calls::{parse_answer, resolve_tool_policy, ToolPlan};
 use crate::api::openai::tool_response::{
     reject_deferred_tool_results, ToolResponseDialect, ToolResponses, ToolResult,
 };
@@ -77,6 +78,8 @@ fn to_core_messages_with_media(
         if role == InboundMessageRole::Assistant {
             let tool_calls = message.tool_calls.as_deref().unwrap_or(&[]);
             append_assistant_tool_calls(variant, &mut content, tool_calls)?;
+            content =
+                assistant_content_with_reasoning(message.reasoning_content.as_deref(), &content);
             call_ids = tool_calls
                 .iter()
                 .filter_map(|call| call.get("id").and_then(serde_json::Value::as_str))
@@ -327,7 +330,7 @@ pub async fn gateway_completions(
 
 /// How a request's answer is rendered: extensions, reasoning split and tool
 /// calls.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct AnswerFormat {
     pub compat_profile: OpenAiCompatibilityProfile,
     /// `reasoning_format: "parsed"`: reasoning moves to `reasoning_content`.
@@ -336,8 +339,18 @@ pub struct AnswerFormat {
     /// on), so the model's text starts inside it; LFM2.5 Thinking writes its
     /// own opener.
     pub reasoning_opened_in_prompt: bool,
-    /// The tool-call format to parse; `None` leaves the answer text.
-    pub tool_calls: Option<ToolCallFormat>,
+    /// How the answer's tool calls are parsed; `None` leaves the answer
+    /// text.
+    pub tool_calls: Option<std::sync::Arc<ToolPlan>>,
+}
+
+impl AnswerFormat {
+    /// The tool-call marker that also ends an unclosed reasoning block.
+    pub fn call_opener(&self) -> Option<&'static str> {
+        self.tool_calls
+            .as_ref()
+            .map(|plan| plan.dialect.call_opener())
+    }
 }
 
 /// Runs a validated chat request on `backend` and renders the OpenAI answer:
@@ -423,7 +436,12 @@ pub fn prepare_execution_request(
     if let Some(response_format) = &req.response_format {
         ensure_response_format_supported(variant, response_format)?;
     }
-    let tool_policy = resolve_tool_policy(variant, req.tools.as_deref(), req.tool_choice.as_ref())?;
+    let tool_policy = resolve_tool_policy(
+        variant,
+        req.tools.as_deref(),
+        req.tool_choice.as_ref(),
+        req.parallel_tool_calls,
+    )?;
     let (messages, media_inputs) = to_core_messages_with_media(
         variant,
         req.messages.clone(),
@@ -440,11 +458,11 @@ pub fn prepare_execution_request(
         req.reasoning_effort,
         req.preserve_thinking,
         req.chat_template_kwargs.as_ref(),
-        tool_policy.tools,
+        tool_policy.tools.clone(),
         media_inputs,
         req.truncation,
     )?;
-    let execution = ChatExecutionRequest {
+    let mut execution = ChatExecutionRequest {
         variant,
         messages,
         max_completion_tokens: req.max_completion_tokens,
@@ -467,15 +485,19 @@ pub fn prepare_execution_request(
         chat_config,
         correlation_id: Some(ctx.correlation_id.clone()),
     };
+    tool_policy.apply(&mut execution);
     validate_chat_request_ranges(&execution)?;
     let format = AnswerFormat {
         compat_profile: profile,
         parse_reasoning: parse_reasoning(req)?,
-        reasoning_opened_in_prompt: super::reasoning::reasoning_opened_in_prompt(
-            execution.variant,
-            execution.chat_config.enable_thinking,
-        ),
-        tool_calls: tool_policy.format,
+        // A forced tool call starts the turn, so the prompt opens no think
+        // block.
+        reasoning_opened_in_prompt: !tool_policy.is_forced()
+            && super::reasoning::reasoning_opened_in_prompt(
+                execution.variant,
+                execution.chat_config.enable_thinking,
+            ),
+        tool_calls: tool_policy.plan,
     };
     Ok((execution, format))
 }
@@ -499,13 +521,17 @@ fn render_completion_response(
     let completion_tokens = generation.tokens_generated;
     let prompt_tokens = generation.prompt_tokens;
     let (reasoning_content, text) = if format.parse_reasoning {
-        super::reasoning::split_reasoning(&generation.text, format.reasoning_opened_in_prompt)
+        super::reasoning::split_reasoning_before_calls(
+            &generation.text,
+            format.reasoning_opened_in_prompt,
+            format.call_opener(),
+        )
     } else {
         let mut opener = super::reasoning::PromptOpener::new(format.reasoning_opened_in_prompt);
         (None, opener.push(&generation.text))
     };
-    let (content, tool_calls) = match format.tool_calls {
-        Some(tool_format) => parse_answer(tool_format, &text),
+    let (content, tool_calls) = match &format.tool_calls {
+        Some(plan) => parse_answer(plan.parser(), &text),
         None => (Some(text), Vec::new()),
     };
     let compat_profile = format.compat_profile;
@@ -550,16 +576,17 @@ fn render_completion_response(
 #[path = "completions_tests.rs"]
 mod tests;
 
-/// Tool calls keep their OpenAI termination contract; other answers report
-/// the engine's budget termination rather than every run as `stop`.
+/// OpenAI `finish_reason`: `length` when the output budget ended the answer
+/// (a tool call cut off there lacks arguments, and the client must be able
+/// to tell), else `tool_calls` when the answer made calls, else `stop`.
 pub fn finish_reason(
     tool_calls: bool,
     reason: Option<izwi_model_catalog::FinishReason>,
 ) -> &'static str {
-    if tool_calls {
-        "tool_calls"
-    } else if reason == Some(izwi_model_catalog::FinishReason::MaxTokens) {
+    if reason == Some(izwi_model_catalog::FinishReason::MaxTokens) {
         "length"
+    } else if tool_calls {
+        "tool_calls"
     } else {
         "stop"
     }

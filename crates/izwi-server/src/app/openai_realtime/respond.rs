@@ -37,7 +37,9 @@ use super::session_config::{chat_tool, AudioFormat, Modality};
 use crate::api::openai::convert::InboundContent;
 use crate::api::openai::responses::dto::{ResponseInput, ResponseInputItem};
 use crate::api::openai::responses::handlers::build_input_messages;
-use crate::api::openai::tool_calls::{parse_answer, ToolCall, ToolCallFormat, ToolCallParser};
+use crate::api::openai::tool_calls::{
+    parse_answer, ToolCall, ToolCallFormat, ToolCallParser, ToolChoice, ToolPlan,
+};
 use crate::app::realtime_transport::{
     OutboundClass, OutboundEnqueueError, OutboundItem, OutboundMailbox,
 };
@@ -46,6 +48,7 @@ use crate::app::voice_realtime::{
     SegmentSynthesis, TtsVoice, TurnControl,
 };
 use crate::state::AppState;
+use izwi_core::chat_tools::render_tool_calls;
 
 /// A reply's token budget when the client leaves it at `"inf"`.
 const DEFAULT_MODULAR_MAX_TOKENS: usize = 1_024;
@@ -758,9 +761,9 @@ fn prompt_items(ctx: &ResponseContext, plan: &ResponsePlan) -> Vec<Item> {
 
 /// The system prompt: the instructions, then the conversation's system
 /// messages (chat templates take one system turn, at the start), then a
-/// hint for a required or named tool, which local models cannot be forced
-/// to call (D16).
-fn system_prompt(plan: &ResponsePlan, items: &[Item], tools_offered: bool) -> String {
+/// hint for a required or named tool when `hint_tool_choice` (the unified
+/// audio model's reply cannot be opened with a call, so it is asked).
+fn system_prompt(plan: &ResponsePlan, items: &[Item], hint_tool_choice: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !plan.instructions.trim().is_empty() {
         parts.push(plan.instructions.trim().to_string());
@@ -771,7 +774,7 @@ fn system_prompt(plan: &ResponsePlan, items: &[Item], tools_offered: bool) -> St
             .filter(|item| item.role() == Some(Role::System))
             .filter_map(Item::text),
     );
-    if tools_offered {
+    if hint_tool_choice {
         match &plan.tool_choice {
             Value::String(choice) if choice == "required" => {
                 parts.push("Answer by calling one of the available functions.".to_string())
@@ -914,25 +917,27 @@ async fn run_modular(
     };
     let (text, tts) = (*text, *tts);
     let items = with_transcripts(ctx, prompt_items(ctx, plan), None).await;
-    let format = ToolCallFormat::of(text);
-    let tools = if format.is_some() {
-        tools_for(plan)
+    // Tools for a model without a tool template are refused, as on the chat
+    // routes, rather than dropped. A required or named tool opens the reply.
+    let tools = tools_for(plan);
+    let tool_plan = if tools.is_empty() {
+        None
     } else {
-        Vec::new()
+        let dialect = ToolCallFormat::of(text).ok_or_else(|| {
+            format!(
+                "Model {} has no tool-calling chat template; remove `tools` or send `tool_choice: \"none\"`",
+                text.dir_name()
+            )
+        })?;
+        let choice = ToolChoice::parse(Some(&plan.tool_choice)).map_err(str::to_string)?;
+        Some(ToolPlan::new(dialect, tools.clone(), choice, true)?)
     };
-    if format.is_none() && !plan.tools.is_empty() {
-        warn!(model = %text.dir_name(), "realtime tools ignored: the chat model cannot call tools");
-    }
-    let system = system_prompt(plan, &items, !tools.is_empty());
+    let system = system_prompt(plan, &items, false);
     let messages = chat_messages(text, &system, &items, &tools)?;
     emitter.add_usage(|usage| usage.input_audio_ms += user_audio_ms(&items));
 
     let audio_out = plan.modality == Modality::Audio;
-    let parser = Arc::new(Mutex::new(
-        format
-            .filter(|_| !tools.is_empty())
-            .map(ToolCallParser::new),
-    ));
+    let parser = Arc::new(Mutex::new(tool_plan.as_ref().map(ToolPlan::parser)));
     let reasoning = Arc::new(Mutex::new(ReasoningFilter::default()));
     let (deltas, delta_rx) = mpsc::unbounded_channel::<String>();
     let state = &ctx.state;
@@ -963,6 +968,17 @@ async fn run_modular(
                     ChatRequestConfig {
                         enable_thinking: Some(false),
                         tools: tools.clone(),
+                        response_prefix: tool_plan
+                            .as_ref()
+                            .and_then(ToolPlan::response_prefix)
+                            .unwrap_or_default(),
+                        // A required or named tool is held to the declared
+                        // names and schemas where the sampler can.
+                        tool_constraint: tool_plan
+                            .as_ref()
+                            .filter(|_| izwi_core::chat_supports_tool_constraint(text))
+                            .and_then(|plan| plan.constraint(false))
+                            .map(Box::new),
                         truncation: ChatTruncation::Auto,
                         ..ChatRequestConfig::default()
                     },
@@ -1048,8 +1064,8 @@ async fn run_modular(
         usage.cached_tokens += generation.cached_prompt_tokens.unwrap_or(0);
         usage.output_text_tokens += generation.tokens_generated as u64;
     });
-    if let Some(format) = format.filter(|_| !tools.is_empty()) {
-        let (_, calls) = parse_answer(format, &generation.text);
+    if let Some(tool_plan) = &tool_plan {
+        let (_, calls) = parse_answer(tool_plan.parser(), &generation.text);
         emitter.function_calls(&calls);
     }
     Ok(
@@ -1062,19 +1078,9 @@ async fn run_modular(
 }
 
 /// A function call as LFM3-Audio's template writes one.
-fn qwen_xml_call(name: &str, arguments: &str) -> String {
-    let mut call = format!("<tool_call>\n<function={name}>\n");
-    if let Ok(Value::Object(arguments)) = serde_json::from_str::<Value>(arguments) {
-        for (key, value) in arguments {
-            let value = match value {
-                Value::String(text) => text,
-                other => other.to_string(),
-            };
-            call.push_str(&format!("<parameter={key}>\n{value}\n</parameter>\n"));
-        }
-    }
-    call.push_str("</function>\n</tool_call>");
-    call
+fn lfm3_call(name: &str, arguments: &str) -> String {
+    let call = serde_json::json!({"function": {"name": name, "arguments": arguments}});
+    render_tool_calls(ToolCallFormat::Lfm3Xml, &[call]).unwrap_or_default()
 }
 
 /// A unified response: one LFM-Audio round hears the latest user speech in
@@ -1135,7 +1141,7 @@ async fn run_unified(
                 name, arguments, ..
             } => Some(ChatMessage {
                 role: ChatRole::Assistant,
-                content: qwen_xml_call(name, arguments),
+                content: lfm3_call(name, arguments),
             }),
             ItemKind::FunctionCallOutput { output, .. } => Some(ChatMessage {
                 role: ChatRole::Tool,
@@ -1161,9 +1167,10 @@ async fn run_unified(
         .hold(&ctx.state.runtime, variant)
         .await
         .map_err(|err| model_load_error("unified audio", err))?;
-    let parser = Arc::new(Mutex::new(
-        (!tools.is_empty()).then(|| ToolCallParser::new(ToolCallFormat::QwenXml)),
-    ));
+    let parser =
+        Arc::new(Mutex::new((!tools.is_empty()).then(|| {
+            ToolCallParser::new(ToolCallFormat::Lfm3Xml).with_tools(&tools)
+        })));
     let encoder: Arc<Mutex<Option<OutputEncoder>>> = Arc::default();
     let audio_out = plan.modality == Modality::Audio;
     let output_format = plan.output_format;
@@ -1312,7 +1319,8 @@ async fn run_unified(
         emitter.audio_delta(delta, ms, true).await?;
     }
     if !tools.is_empty() {
-        let (_, calls) = parse_answer(ToolCallFormat::QwenXml, &generation.text);
+        let parser = ToolCallParser::new(ToolCallFormat::Lfm3Xml).with_tools(&tools);
+        let (_, calls) = parse_answer(parser, &generation.text);
         emitter.function_calls(&calls);
     }
     Ok(Outcome::Completed)
@@ -1343,7 +1351,7 @@ mod tests {
     #[test]
     fn lfm3_tool_calls_render_in_its_xml() {
         assert_eq!(
-            qwen_xml_call("get_weather", r#"{"city":"Harare","days":2}"#),
+            lfm3_call("get_weather", r#"{"city":"Harare","days":2}"#),
             "<tool_call>\n<function=get_weather>\n<parameter=city>\nHarare\n</parameter>\n\
              <parameter=days>\n2\n</parameter>\n</function>\n</tool_call>"
         );

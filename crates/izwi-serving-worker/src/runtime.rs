@@ -271,6 +271,17 @@ fn chat_request(
     let chat_config = ChatRequestConfig {
         truncation,
         tools: parameters.tools.clone(),
+        response_prefix: parameters.response_prefix.clone().unwrap_or_default(),
+        tool_constraint: parameters.tool_constraint.as_ref().map(|constraint| {
+            Box::new(izwi_core::chat_tools::ToolConstraint {
+                opener: constraint.opener.clone(),
+                call: constraint.call.clone(),
+                forced: constraint.forced.clone(),
+                max_calls: constraint.max_calls,
+                // The gateway decided where the request may run.
+                strict: false,
+            })
+        }),
         ..ChatRequestConfig::default()
     };
     (params, chat_config, max_tokens_ceiling)
@@ -850,6 +861,13 @@ mod tests {
             }),
             tools: vec![serde_json::json!({"type": "function", "function": {"name": "now"}})],
             skip_special_tokens: Some(false),
+            response_prefix: Some("<tool_call>\n<function=now>\n".into()),
+            tool_constraint: Some(izwi_serving_protocol::ChatToolConstraint {
+                opener: "<tool_call>".into(),
+                call: "start: \"x\"".into(),
+                forced: None,
+                max_calls: Some(1),
+            }),
         };
         let (params, chat_config, ceiling) = chat_request(VARIANT, &parameters, 64);
         assert_eq!(
@@ -869,6 +887,12 @@ mod tests {
         assert_eq!(params.max_tokens, 16);
         assert_eq!(chat_config.truncation, ChatTruncation::Disabled);
         assert_eq!(chat_config.tools, parameters.tools);
+        assert_eq!(chat_config.response_prefix, "<tool_call>\n<function=now>\n");
+        let constraint = chat_config.tool_constraint.as_ref().expect("constraint");
+        assert_eq!(
+            (constraint.opener.as_str(), constraint.max_calls),
+            ("<tool_call>", Some(1))
+        );
         assert_eq!(ceiling, Some(64));
 
         let expected = GenerationParams::for_chat(

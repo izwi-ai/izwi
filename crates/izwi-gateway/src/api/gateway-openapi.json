@@ -1,7 +1,1037 @@
 {
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Izwi API",
+    "description": "Local HTTP API for the Izwi runtime, OpenAI-compatible endpoints, and first-party workflow surfaces.",
+    "license": {
+      "name": "Apache-2.0",
+      "identifier": "Apache-2.0"
+    },
+    "version": "0.1.2"
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "Local Izwi server"
+    }
+  ],
+  "paths": {
+    "/livez": {
+      "get": {
+        "tags": [
+          "Runtime"
+        ],
+        "summary": "Check liveness",
+        "operationId": "livez",
+        "responses": {
+          "200": {
+            "description": "Server process is alive",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LiveResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Inference runtime failed permanently; restart the process",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LiveResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "tags": [
+          "Runtime"
+        ],
+        "summary": "Check readiness",
+        "operationId": "readyz",
+        "responses": {
+          "200": {
+            "description": "Server is ready to serve requests",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Server is alive but not ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "List models",
+        "operationId": "list_models",
+        "responses": {
+          "200": {
+            "description": "List locally available OpenAI-compatible models",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiModelsResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models/{model}": {
+      "get": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Get model",
+        "operationId": "get_model",
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "description": "Model identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Retrieve a locally available OpenAI-compatible model",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiModel"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or unavailable model (`model_not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Create chat completion",
+        "operationId": "create_chat_completion",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatCompletionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Chat completion JSON when stream is false; server-sent events when stream is true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatCompletionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/audio/speech": {
+      "post": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Create speech",
+        "operationId": "create_speech",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpeechRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Encoded audio (Content-Type per response_format; a chunked body for stream_format audio), or server-sent audio events for stream_format sse. X-Izwi-Speech-Id names the request for GET /v1/audio/speech/{speech_id}; X-Izwi-Service-Tier names the tier that served it."
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "No admission slot became free within IZWI_ADMISSION_QUEUE_TIMEOUT_SECS (Retry-After says when to retry): code rate_limit_exceeded, or resource_unavailable for a flex request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/audio/transcriptions": {
+      "post": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Create transcription",
+        "operationId": "create_transcription",
+        "requestBody": {
+          "description": "Transcription input. Send application/json with audio_base64, or multipart/form-data with an audio file or audio_base64 field.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TranscriptionJsonRequest"
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/TranscriptionMultipartRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Transcription result as JSON, verbose JSON, text, SRT, VTT, or server-sent events. X-Izwi-Service-Tier names the tier that served it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscriptionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "No admission slot became free within IZWI_ADMISSION_QUEUE_TIMEOUT_SECS (Retry-After says when to retry): code rate_limit_exceeded, or resource_unavailable for a flex request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/docs": {
+      "get": {
+        "tags": [
+          "Reference"
+        ],
+        "summary": "Get API reference",
+        "description": "Open the local Scalar API reference UI.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/docs/scalar.js": {
+      "get": {
+        "tags": [
+          "Reference"
+        ],
+        "summary": "Get Scalar JavaScript",
+        "description": "Fetch the bundled Scalar API reference JavaScript asset.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "tags": [
+          "Reference"
+        ],
+        "summary": "Get OpenAPI document",
+        "description": "Fetch the generated OpenAPI document for the local server.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}": {
+      "get": {
+        "tags": [
+          "Jobs"
+        ],
+        "summary": "Get runtime job",
+        "description": "Fetch a durable runtime job trace with stages and artifacts.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}/cancel": {
+      "post": {
+        "tags": [
+          "Jobs"
+        ],
+        "summary": "Cancel runtime job",
+        "description": "Cancel a queued or running durable runtime job.",
+        "responses": {
+          "200": {
+            "description": "Runtime job cancelled"
+          },
+          "400": {
+            "description": "Job is not cancellable"
+          },
+          "404": {
+            "description": "Job not found"
+          }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}/retry": {
+      "post": {
+        "tags": [
+          "Jobs"
+        ],
+        "summary": "Rerun runtime job",
+        "description": "Requeue failed, cancelled, or expired runtime job stages.",
+        "responses": {
+          "200": {
+            "description": "Runtime job retried"
+          },
+          "400": {
+            "description": "Job is not retryable"
+          },
+          "404": {
+            "description": "Job not found"
+          }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}/artifacts": {
+      "get": {
+        "tags": [
+          "Jobs"
+        ],
+        "summary": "List runtime job artifacts",
+        "description": "List durable artifacts produced or consumed by a runtime job.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/v1/realtime": {
+      "get": {
+        "tags": [
+          "Realtime"
+        ],
+        "summary": "Open OpenAI Realtime WebSocket",
+        "description": "Upgrade to an OpenAI Realtime (GA) session: JSON events with base64 24 kHz PCM16 or G.711 audio. `?model=` selects a realtime profile (a modular ASR, chat and TTS stack, or a speech-to-speech model); OpenAI model names select the default profile. `?intent=transcription` opens a transcription session.",
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade"
+          },
+          "400": {
+            "description": "Invalid WebSocket request"
+          }
+        }
+      }
+    },
+    "/v1/realtime/media-stream": {
+      "get": {
+        "tags": [
+          "Realtime"
+        ],
+        "summary": "Open a telephony media-stream WebSocket",
+        "description": "Upgrade to a phone call in the media-stream framing of call-centre platforms and carrier APIs: JSON text frames (`connected`, `start`, `media`, `mark`, `dtmf`, `stop`) with base64 8 kHz μ-law audio. The call runs as a `/v1/realtime` session. `?model=` and `?intent=transcription` select it as on `/v1/realtime`; `voice`, `instructions`, `language`, `transcription_model` and `transcripts` configure it, in the query string or the `start` frame's `customParameters`.",
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade"
+          },
+          "400": {
+            "description": "Invalid WebSocket request"
+          }
+        }
+      }
+    },
+    "/v1/realtime/client_secrets": {
+      "post": {
+        "tags": [
+          "Realtime"
+        ],
+        "summary": "Create a realtime client secret",
+        "description": "Mint an ephemeral `ek_` key, bound to a session config, that admits `/v1/realtime` for 10 seconds to 2 hours (default 10 minutes). Browsers present it as the `openai-insecure-api-key.<key>` WebSocket subprotocol.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/v1/realtime/capabilities": {
+      "get": {
+        "tags": [
+          "Realtime"
+        ],
+        "summary": "List realtime capabilities",
+        "description": "The realtime profiles `model` may name, the transcription models and whether each transcribes a turn while it is spoken (`transcription_mode`: `live` or `turn`), the voices, audio formats and turn detection types, and the session limits.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/v1/audio/translations": {
+      "post": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Create translation",
+        "description": "OpenAI's translation route: multipart `file`, `model` (a model that translates speech: Granite Speech 5.0, Nemotron 3.5 Transcribe), `prompt`, `response_format` (json, text, srt, verbose_json, vtt), `temperature`. The target is English unless `to_language` / `target_language` names another; `language` hints the source; `stream` gives `transcript.text.*` events. `service_tier` (or the X-Izwi-Service-Tier header) works as on transcriptions.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/v1/audio/speech/batch": {
+      "post": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Create speech in a batch",
+        "description": "Up to IZWI_TTS_BATCH_MAX_ITEMS speech requests: top-level fields are defaults each of `items` overrides. Returns `{id, object, results[], total, succeeded, failed}`; each result carries base64 `audio_data` or an OpenAI `error` object, and an `id` for `GET /v1/audio/speech/{speech_id}`. A top-level `service_tier` (or the X-Izwi-Service-Tier header) applies to every item: they run as batch work (`flex`) unless it is `default`, `auto` or `priority`. The response names the tier served in X-Izwi-Service-Tier, and in `service_tier` when the request named one.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/v1/audio/speech/{speech_id}": {
+      "get": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Get a speech request's outcome",
+        "description": "Status, finish reason, usage, audio duration and timings of a /v1/audio/speech request (any delivery), by its `X-Izwi-Speech-Id`. Process-local and bounded (IZWI_SPEECH_OUTCOME_CAPACITY, IZWI_SPEECH_OUTCOME_TTL_SECS); no audio is kept.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/v1/audio/speech/stream": {
+      "get": {
+        "tags": [
+          "Realtime"
+        ],
+        "summary": "Open the text-in speech WebSocket",
+        "description": "Text in, audio out: `session.config`, then `input.text` as text arrives, `input.commit` to speak what is buffered, `input.done` to end the utterance, `input.cancel`, `session.close`. Audio arrives per segment between `audio.start` and `audio.done`. `?dialect=sglang-omni|vllm-omni` serves those stacks' clients.",
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade"
+          },
+          "400": {
+            "description": "Invalid WebSocket request"
+          }
+        }
+      }
+    },
+    "/v1/audio/voices": {
+      "get": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "List voices",
+        "description": "Every saved voice, as OpenAI `audio.voice` objects in `data` and SGLang-Omni's `voices`/`uploaded_voices`.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Create a voice",
+        "description": "Multipart `name`, `audio_sample` (at most 10 MiB) and `consent` (a consent id from /v1/audio/voice_consents, or an attestation, per IZWI_VOICE_CONSENT_MODE); optional `ref_text`, `reference_language`. Speak it with `voice: {\"id\": ...}`.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/v1/audio/voices/{voice_id}": {
+      "get": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Get a voice",
+        "description": "A voice by id or by name.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Delete a voice",
+        "description": "Deletes a voice by id (OpenAI) or by name (SGLang-Omni, vLLM-Omni).",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/v1/audio/voice_consents": {
+      "get": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "List voice consents",
+        "description": "Consent recordings, newest first; `after` and `limit` (1 to 100) page them.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Create a voice consent",
+        "description": "Multipart `name`, `recording` (at most 10 MiB) and `language` (BCP 47). Under IZWI_VOICE_CONSENT_MODE=verified the recording must say a consent phrase (GET /v1/audio/consent_phrases).",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/v1/audio/voice_consents/{consent_id}": {
+      "get": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Get a voice consent",
+        "description": "A consent recording's metadata and verification.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Update a voice consent",
+        "description": "JSON `{\"name\"}`.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Delete a voice consent",
+        "description": "Deletes the recording and revokes every voice made with it.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/v1/audio/consent_phrases": {
+      "get": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "List consent phrases",
+        "description": "What a verified consent recording says, per language.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/v1/files": {
+      "post": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Create file",
+        "description": "Multipart `file` and `purpose`: `batch` (a batch's JSONL input) or `user_data` (audio a batch line names by `file_id`). At most IZWI_FILES_MAX_BYTES (200 MB); larger is 413.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "List files",
+        "description": "The caller's files, newest first; `purpose`, `limit` (1 to 10000), `after` and `order` (`asc` or `desc`) filter and page them.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/v1/files/{file_id}": {
+      "get": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Get file",
+        "description": "A file's metadata. `batch_output` files carry `expires_at`, 30 days after creation.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Delete file",
+        "description": "Deletes the file and its content.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/v1/files/{file_id}/content": {
+      "get": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Download file content",
+        "description": "The file's bytes.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/v1/batches": {
+      "post": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Create batch",
+        "description": "JSON `input_file_id` (a JSONL file of purpose `batch`), `endpoint` (/v1/audio/transcriptions, /v1/audio/translations or /v1/audio/speech), `completion_window` (`24h`) and optional `metadata`. Each line is OpenAI's `{custom_id, method, url, body}`; a transcription or translation body names its audio by `file_id` or `audio_base64`. Lines run as batch work; at most IZWI_BATCH_MAX_REQUESTS (50000) per file. With `metadata.webhook_url`, a signed `batch.completed`, `batch.failed`, `batch.cancelled` or `batch.expired` event is posted there when the batch ends; refused with 400 unless the operator set IZWI_BATCH_WEBHOOK_SECRET.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "List batches",
+        "description": "The caller's batches, newest first; `after` and `limit` (1 to 100) page them.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/v1/batches/{batch_id}": {
+      "get": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Get batch",
+        "description": "The batch: status, `request_counts`, and `output_file_id` and `error_file_id` once it has ended. A speech line's response body is `{audio_file_id, format, bytes}`.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/v1/batches/{batch_id}/cancel": {
+      "post": {
+        "tags": [
+          "OpenAI Compatible"
+        ],
+        "summary": "Cancel batch",
+        "description": "Stops a batch that is validating or in progress: `cancelling`, then `cancelled` with the results of the lines that finished. A batch that has ended is a 409.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    }
+  },
   "components": {
     "schemas": {
       "AdminChatModelCapabilities": {
+        "type": "object",
+        "required": [
+          "supports_thinking",
+          "thinking_toggleable",
+          "default_thinking_enabled",
+          "reasoning_efforts",
+          "supports_preserve_thinking"
+        ],
         "properties": {
           "default_reasoning_effort": {
             "type": [
@@ -13,10 +1043,10 @@
             "type": "boolean"
           },
           "reasoning_efforts": {
+            "type": "array",
             "items": {
               "type": "string"
-            },
-            "type": "array"
+            }
           },
           "supports_preserve_thinking": {
             "type": "boolean"
@@ -25,20 +1055,17 @@
             "type": "boolean"
           },
           "thinking_toggleable": {
-            "description": "False when the model always reasons: a thinking switch would do nothing.",
-            "type": "boolean"
+            "type": "boolean",
+            "description": "False when the model always reasons: a thinking switch would do nothing."
           }
-        },
-        "required": [
-          "supports_thinking",
-          "thinking_toggleable",
-          "default_thinking_enabled",
-          "reasoning_efforts",
-          "supports_preserve_thinking"
-        ],
-        "type": "object"
+        }
       },
       "AdminModelActionResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "message"
+        ],
         "properties": {
           "message": {
             "type": "string"
@@ -47,20 +1074,25 @@
             "type": "string"
           },
           "warning": {
-            "description": "Why the action may be slow, when the runtime noted something (a Metal\nload larger than the host memory macOS reports available).",
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Why the action may be slow, when the runtime noted something (a Metal\nload larger than the host memory macOS reports available)."
           }
-        },
-        "required": [
-          "status",
-          "message"
-        ],
-        "type": "object"
+        }
       },
       "AdminModelBatchCapabilities": {
+        "type": "object",
+        "required": [
+          "batch_asr",
+          "batch_tts",
+          "durable_jobs",
+          "artifacts",
+          "cancellation",
+          "retry",
+          "requires_voice_permission"
+        ],
         "properties": {
           "artifacts": {
             "type": "boolean"
@@ -83,69 +1115,10 @@
           "retry": {
             "type": "boolean"
           }
-        },
-        "required": [
-          "batch_asr",
-          "batch_tts",
-          "durable_jobs",
-          "artifacts",
-          "cancellation",
-          "retry",
-          "requires_voice_permission"
-        ],
-        "type": "object"
+        }
       },
       "AdminModelDownloadProgressEvent": {
-        "properties": {
-          "current_file": {
-            "type": "string"
-          },
-          "current_file_downloaded": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "current_file_total": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "downloaded_bytes": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "error": {
-            "description": "Why the download failed, on an `error` event.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "files_completed": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "files_total": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "percent": {
-            "format": "float",
-            "type": "number"
-          },
-          "status": {
-            "type": "string"
-          },
-          "total_bytes": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "variant": {
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "variant",
           "downloaded_bytes",
@@ -158,9 +1131,78 @@
           "percent",
           "status"
         ],
-        "type": "object"
+        "properties": {
+          "current_file": {
+            "type": "string"
+          },
+          "current_file_downloaded": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "current_file_total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "downloaded_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the download failed, on an `error` event."
+          },
+          "files_completed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "files_total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "percent": {
+            "type": "number",
+            "format": "float"
+          },
+          "status": {
+            "type": "string"
+          },
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "variant": {
+            "type": "string"
+          }
+        }
       },
       "AdminModelInfo": {
+        "type": "object",
+        "required": [
+          "variant",
+          "display_name",
+          "task",
+          "estimated_size_bytes",
+          "memory_required_gb",
+          "estimated_memory_bytes",
+          "device_fit",
+          "disk_required_bytes",
+          "enabled",
+          "status",
+          "deployment_state",
+          "modalities",
+          "route_capabilities",
+          "batch_capabilities",
+          "cuda_support",
+          "cuda_quantization",
+          "cuda_operators"
+        ],
         "properties": {
           "batch_capabilities": {
             "$ref": "#/components/schemas/AdminModelBatchCapabilities"
@@ -182,25 +1224,25 @@
             "type": "string"
           },
           "device_fit": {
-            "description": "Whether the model can load on this device at all: `fits`,\n`too_large` (it needs more memory than loads here are planned\nagainst) or `unknown`. Other loaded models may still have to make\nroom for one that fits.",
-            "type": "string"
+            "type": "string",
+            "description": "Whether the model can load on this device at all: `fits`,\n`too_large` (it needs more memory than loads here are planned\nagainst) or `unknown`. Other loaded models may still have to make\nroom for one that fits."
           },
           "disk_required_bytes": {
-            "description": "Free disk a download of the model needs: its files, plus the\ncheckpoint a `.nemo` archive unpacks on first load. 0 once\ndownloaded.",
+            "type": "integer",
             "format": "int64",
-            "minimum": 0,
-            "type": "integer"
+            "description": "Free disk a download of the model needs: its files, plus the\ncheckpoint a `.nemo` archive unpacks on first load. 0 once\ndownloaded.",
+            "minimum": 0
           },
           "display_name": {
-            "description": "Human-readable model name from the catalog.",
-            "type": "string"
+            "type": "string",
+            "description": "Human-readable model name from the catalog."
           },
           "download_progress": {
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float"
           },
           "enabled": {
             "type": "boolean"
@@ -212,16 +1254,16 @@
             ]
           },
           "estimated_memory_bytes": {
-            "description": "Memory the model needs to load, in bytes: the catalog's estimate,\nwhich is all there is before the model is downloaded.",
+            "type": "integer",
             "format": "int64",
-            "minimum": 0,
-            "type": "integer"
+            "description": "Memory the model needs to load, in bytes: the catalog's estimate,\nwhich is all there is before the model is downloaded.",
+            "minimum": 0
           },
           "estimated_size_bytes": {
-            "description": "Expected download size from the catalog, for models not yet on disk.",
+            "type": "integer",
             "format": "int64",
-            "minimum": 0,
-            "type": "integer"
+            "description": "Expected download size from the catalog, for models not yet on disk.",
+            "minimum": 0
           },
           "license": {
             "type": [
@@ -230,11 +1272,11 @@
             ]
           },
           "license_notice": {
-            "description": "What the weights' licence permits, when the label alone does not\nsay it (Fish Audio Drama 3: free for research and non-commercial\nuse, commercial use only below USD 500k annual revenue, and a hosted\nservice needs a licence from Fish Audio). Informational: nothing is\nrefused on it.",
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "What the weights' licence permits, when the label alone does not\nsay it (Fish Audio Drama 3: free for research and non-commercial\nuse, commercial use only below USD 500k annual revenue, and a hosted\nservice needs a licence from Fish Audio). Informational: nothing is\nrefused on it."
           },
           "local_path": {
             "type": [
@@ -243,31 +1285,31 @@
             ]
           },
           "memory_required_gb": {
-            "description": "Catalog estimate of memory needed to run the model, in GB.",
+            "type": "number",
             "format": "float",
-            "type": "number"
+            "description": "Catalog estimate of memory needed to run the model, in GB."
           },
           "modalities": {
+            "type": "array",
             "items": {
               "type": "string"
-            },
-            "type": "array"
+            }
           },
           "pinned": {
-            "description": "Explicitly loaded in this session: survives budget and memory-pressure\neviction until explicitly unloaded.",
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Explicitly loaded in this session: survives budget and memory-pressure\neviction until explicitly unloaded."
           },
           "route_capabilities": {
             "$ref": "#/components/schemas/AdminModelRouteCapabilities"
           },
           "runtime_diagnostics": {},
           "size_bytes": {
-            "format": "int64",
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "format": "int64",
+            "minimum": 0
           },
           "speech_capabilities": {
             "oneOf": [
@@ -283,39 +1325,46 @@
             "type": "string"
           },
           "task": {
-            "description": "Primary task: tts, asr, diarization, chat, forced_align, audio_chat\nor tokenizer.",
-            "type": "string"
+            "type": "string",
+            "description": "Primary task: tts, asr, diarization, chat, forced_align, audio_chat\nor tokenizer."
           },
           "variant": {
             "type": "string"
           }
-        },
-        "required": [
-          "variant",
-          "display_name",
-          "task",
-          "estimated_size_bytes",
-          "memory_required_gb",
-          "estimated_memory_bytes",
-          "device_fit",
-          "disk_required_bytes",
-          "enabled",
-          "status",
-          "deployment_state",
-          "modalities",
-          "route_capabilities",
-          "batch_capabilities",
-          "cuda_support",
-          "cuda_quantization",
-          "cuda_operators"
-        ],
-        "type": "object"
+        }
       },
       "AdminModelRouteCapabilities": {
+        "type": "object",
+        "required": [
+          "openai_chat_completions",
+          "openai_responses",
+          "openai_audio_speech",
+          "openai_audio_transcriptions",
+          "speech_to_text_jobs",
+          "diarization_pipeline_asr",
+          "speech_to_text_realtime",
+          "speech_translation",
+          "keyword_biasing",
+          "speaker_attributed_asr",
+          "native_word_timestamps",
+          "diarization_records",
+          "one_model_diarization",
+          "text_to_speech_records",
+          "voice_design_records",
+          "voice_clone_records",
+          "saved_voice_reuse",
+          "studio_projects",
+          "voice_realtime_text_model",
+          "voice_realtime_modular_asr",
+          "voice_realtime_modular_tts",
+          "voice_realtime_unified",
+          "forced_alignment",
+          "tokenizer"
+        ],
         "properties": {
           "diarization_pipeline_asr": {
-            "description": "The diarization pipeline may use the model as its ASR stage.",
-            "type": "boolean"
+            "type": "boolean",
+            "description": "The diarization pipeline may use the model as its ASR stage."
           },
           "diarization_records": {
             "type": "boolean"
@@ -324,16 +1373,16 @@
             "type": "boolean"
           },
           "keyword_biasing": {
-            "description": "Transcription requests may bias recognition with `keywords`.",
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Transcription requests may bias recognition with `keywords`."
           },
           "native_word_timestamps": {
-            "description": "Word timestamps come from the model itself (no forced aligner).",
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Word timestamps come from the model itself (no forced aligner)."
           },
           "one_model_diarization": {
-            "description": "Diarization jobs may name the model alone: it transcribes, tags\nspeakers and times words itself, with no pipeline ASR or aligner.",
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Diarization jobs may name the model alone: it transcribes, tags\nspeakers and times words itself, with no pipeline ASR or aligner."
           },
           "openai_audio_speech": {
             "type": "boolean"
@@ -351,8 +1400,8 @@
             "type": "boolean"
           },
           "speaker_attributed_asr": {
-            "description": "Speaker-attributed ASR jobs: the model writes speaker turns itself.",
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Speaker-attributed ASR jobs: the model writes speaker turns itself."
           },
           "speech_to_text_jobs": {
             "type": "boolean"
@@ -361,8 +1410,8 @@
             "type": "boolean"
           },
           "speech_translation": {
-            "description": "Transcription requests may ask for a translation (`target_language`).",
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Transcription requests may ask for a translation (`target_language`)."
           },
           "studio_projects": {
             "type": "boolean"
@@ -391,63 +1440,46 @@
           "voice_realtime_unified": {
             "type": "boolean"
           }
-        },
-        "required": [
-          "openai_chat_completions",
-          "openai_responses",
-          "openai_audio_speech",
-          "openai_audio_transcriptions",
-          "speech_to_text_jobs",
-          "diarization_pipeline_asr",
-          "speech_to_text_realtime",
-          "speech_translation",
-          "keyword_biasing",
-          "speaker_attributed_asr",
-          "native_word_timestamps",
-          "diarization_records",
-          "one_model_diarization",
-          "text_to_speech_records",
-          "voice_design_records",
-          "voice_clone_records",
-          "saved_voice_reuse",
-          "studio_projects",
-          "voice_realtime_text_model",
-          "voice_realtime_modular_asr",
-          "voice_realtime_modular_tts",
-          "voice_realtime_unified",
-          "forced_alignment",
-          "tokenizer"
-        ],
-        "type": "object"
+        }
       },
       "AdminModelsResponse": {
+        "type": "object",
         "description": "Response for model list",
+        "required": [
+          "models"
+        ],
         "properties": {
           "models": {
+            "type": "array",
             "items": {
               "$ref": "#/components/schemas/AdminModelInfo"
-            },
-            "type": "array"
+            }
           },
           "removed_models": {
-            "description": "Downloads of variants whose support was removed, still on disk. They\nare never deleted automatically; `DELETE /v1/admin/models/{variant}`\nwith the listed `variant` reclaims the space.",
+            "type": "array",
             "items": {
               "$ref": "#/components/schemas/AdminRemovedModelInfo"
             },
-            "type": "array"
+            "description": "Downloads of variants whose support was removed, still on disk. They\nare never deleted automatically; `DELETE /v1/admin/models/{variant}`\nwith the listed `variant` reclaims the space."
           },
           "residency": {
             "$ref": "#/components/schemas/AdminResidencySummary",
             "description": "Residency snapshot for the `ollama ps`-style observability surface."
           }
-        },
-        "required": [
-          "models"
-        ],
-        "type": "object"
+        }
       },
       "AdminRemovedModelInfo": {
+        "type": "object",
         "description": "A leftover download of a removed variant.",
+        "required": [
+          "variant",
+          "display_name",
+          "status",
+          "local_path",
+          "size_bytes",
+          "replacement",
+          "reason"
+        ],
         "properties": {
           "display_name": {
             "type": "string"
@@ -459,88 +1491,83 @@
             "type": "string"
           },
           "replacement": {
-            "description": "The supported variant to use instead.",
-            "type": "string"
+            "type": "string",
+            "description": "The supported variant to use instead."
           },
           "size_bytes": {
+            "type": "integer",
             "format": "int64",
-            "minimum": 0,
-            "type": "integer"
+            "minimum": 0
           },
           "status": {
-            "description": "Always `removed`.",
-            "type": "string"
+            "type": "string",
+            "description": "Always `removed`."
           },
           "variant": {
             "type": "string"
           }
-        },
-        "required": [
-          "variant",
-          "display_name",
-          "status",
-          "local_path",
-          "size_bytes",
-          "replacement",
-          "reason"
-        ],
-        "type": "object"
+        }
       },
       "AdminResidencySummary": {
-        "properties": {
-          "max_loaded_models": {
-            "description": "Residency budget (`None` = unbounded).",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "model_keep_alive_secs": {
-            "description": "Idle keep-alive for transient residents in seconds (0 = reaper off).",
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "resident_count": {
-            "description": "Models currently tracked as resident (loading or ready).",
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
+        "type": "object",
         "required": [
           "resident_count",
           "model_keep_alive_secs"
         ],
-        "type": "object"
+        "properties": {
+          "max_loaded_models": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Residency budget (`None` = unbounded).",
+            "minimum": 0
+          },
+          "model_keep_alive_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Idle keep-alive for transient residents in seconds (0 = reaper off).",
+            "minimum": 0
+          },
+          "resident_count": {
+            "type": "integer",
+            "description": "Models currently tracked as resident (loading or ready).",
+            "minimum": 0
+          }
+        }
       },
       "AdminSpeechControlRange": {
-        "properties": {
-          "control": {
-            "type": "string"
-          },
-          "default": {
-            "format": "float",
-            "type": "number"
-          },
-          "max": {
-            "format": "float",
-            "type": "number"
-          },
-          "min": {
-            "format": "float",
-            "type": "number"
-          }
-        },
+        "type": "object",
         "required": [
           "control",
           "min",
           "max",
           "default"
         ],
-        "type": "object"
+        "properties": {
+          "control": {
+            "type": "string"
+          },
+          "default": {
+            "type": "number",
+            "format": "float"
+          },
+          "max": {
+            "type": "number",
+            "format": "float"
+          },
+          "min": {
+            "type": "number",
+            "format": "float"
+          }
+        }
       },
       "AdminSpeechLanguage": {
+        "type": "object",
+        "required": [
+          "code",
+          "name"
+        ],
         "properties": {
           "code": {
             "type": "string"
@@ -548,88 +1575,93 @@
           "name": {
             "type": "string"
           }
-        },
-        "required": [
-          "code",
-          "name"
-        ],
-        "type": "object"
+        }
       },
       "AdminSpeechModelCapabilities": {
+        "type": "object",
+        "required": [
+          "supports_builtin_voices",
+          "supports_reference_voice",
+          "reference_transcript_required",
+          "supports_voice_description",
+          "supports_streaming",
+          "supports_speed_control",
+          "supports_auto_long_form"
+        ],
         "properties": {
           "built_in_voice_count": {
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "minimum": 0
           },
           "controls": {
-            "description": "Model-specific controls a speech request may set, each with its\nrange and the model's default (Chatterbox: `exaggeration`,\n`cfg_weight`, `min_p`).",
+            "type": "array",
             "items": {
               "$ref": "#/components/schemas/AdminSpeechControlRange"
             },
-            "type": "array"
+            "description": "Model-specific controls a speech request may set, each with its\nrange and the model's default (Chatterbox: `exaggeration`,\n`cfg_weight`, `min_p`)."
           },
           "cross_lingual_reference": {
-            "description": "Whether a reference voice may name the language it is spoken in\n(`reference_language`), as the model clones a voice into another\nlanguage (Maya 2 Native).",
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Whether a reference voice may name the language it is spoken in\n(`reference_language`), as the model clones a voice into another\nlanguage (Maya 2 Native)."
           },
           "default_language": {
-            "description": "The `languages` entry a request without `language` speaks (LFM3\nAudio: `en-US`); absent, pickers default to English.",
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "The `languages` entry a request without `language` speaks (LFM3\nAudio: `en-US`); absent, pickers default to English."
           },
           "inline_tags": {
-            "description": "Inline tags the text to speak may carry, as written, each a vocal\nevent or delivery the model performs where it stands (Maya1:\n`<laugh>`, `<sigh>`, …; Maya 2 Native: `[laughs]`, `[sighs]`, …).",
+            "type": "array",
             "items": {
               "type": "string"
             },
-            "type": "array"
+            "description": "Inline tags the text to speak may carry, as written, each a vocal\nevent or delivery the model performs where it stands (Maya1:\n`<laugh>`, `<sigh>`, …; Maya 2 Native: `[laughs]`, `[sighs]`, …)."
           },
           "inline_tags_strict": {
-            "description": "Whether a tag `inline_tags` lacks is refused (Maya1); otherwise the\nlist is a suggestion and other tags pass through.",
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Whether a tag `inline_tags` lacks is refused (Maya1); otherwise the\nlist is a suggestion and other tags pass through."
           },
           "language_auto_detect": {
-            "description": "Whether `language` may be left out (or `auto`) and is then read from\nthe text's script (Maya 2 Native); the picker offers \"auto-detect\".",
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Whether `language` may be left out (or `auto`) and is then read from\nthe text's script (Maya 2 Native); the picker offers \"auto-detect\"."
           },
           "languages": {
-            "description": "The only languages a speech request may name in `language`, for a\nmodel that refuses others (Chatterbox, Maya 2 Native); absent,\n`language` is a hint.",
+            "type": "array",
             "items": {
               "$ref": "#/components/schemas/AdminSpeechLanguage"
             },
-            "type": "array"
+            "description": "The only languages a speech request may name in `language`, for a\nmodel that refuses others (Chatterbox, Maya 2 Native); absent,\n`language` is a hint."
           },
           "max_references": {
-            "description": "The reference clips a dialogue request may carry; present only with\n`supports_speaker_dialogue`.",
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "description": "The reference clips a dialogue request may carry; present only with\n`supports_speaker_dialogue`.",
+            "minimum": 0
           },
           "max_speakers": {
-            "description": "The speakers a dialogue may voice, numbered from 0; present only\nwith `supports_speaker_dialogue`.",
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "description": "The speakers a dialogue may voice, numbered from 0; present only\nwith `supports_speaker_dialogue`.",
+            "minimum": 0
           },
           "reference_transcript_required": {
-            "description": "Whether a reference voice needs its transcript. Every reference\nfamily but Chatterbox conditions on the reference's words; Chatterbox\ntakes the audio alone.",
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Whether a reference voice needs its transcript. Every reference\nfamily but Chatterbox conditions on the reference's words; Chatterbox\ntakes the audio alone."
           },
           "streaming_mode": {
-            "description": "What a streaming request delivers on this server (TPIPE-3):\n`chunked` (audio as the model commits it) or `unsupported`.",
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "What a streaming request delivers on this server (TPIPE-3):\n`chunked` (audio as the model commits it) or `unsupported`."
           },
           "supports_auto_long_form": {
             "type": "boolean"
@@ -638,19 +1670,19 @@
             "type": "boolean"
           },
           "supports_in_progress_replay": {
-            "description": "Whether an unfinished text-to-speech record of this model can be\nplayed from its start (`GET /v1/text-to-speech/{record_id}/events`):\nthe server plans the model's speech segments and journals each\nsegment's audio as it is generated.",
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Whether an unfinished text-to-speech record of this model can be\nplayed from its start (`GET /v1/text-to-speech/{record_id}/events`):\nthe server plans the model's speech segments and journals each\nsegment's audio as it is generated."
           },
           "supports_reference_voice": {
             "type": "boolean"
           },
           "supports_seeded_voice": {
-            "description": "Whether the model speaks without any voice input: with no reference,\nthe sampling seed sets its voice, so a reference is optional (Fish\nAudio Drama 3).",
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Whether the model speaks without any voice input: with no reference,\nthe sampling seed sets its voice, so a reference is optional (Fish\nAudio Drama 3)."
           },
           "supports_speaker_dialogue": {
-            "description": "Whether one request may voice several speakers: `<|speaker:N|>`\ntags or a `script`, with `references` per speaker (Fish Audio\nDrama 3).",
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Whether one request may voice several speakers: `<|speaker:N|>`\ntags or a `script`, with `references` per speaker (Fish Audio\nDrama 3)."
           },
           "supports_speed_control": {
             "type": "boolean"
@@ -661,55 +1693,50 @@
           "supports_voice_description": {
             "type": "boolean"
           }
-        },
-        "required": [
-          "supports_builtin_voices",
-          "supports_reference_voice",
-          "reference_transcript_required",
-          "supports_voice_description",
-          "supports_streaming",
-          "supports_speed_control",
-          "supports_auto_long_form"
-        ],
-        "type": "object"
+        }
       },
       "AdminStorageResponse": {
+        "type": "object",
         "description": "Where models are stored and how much room is left there.",
+        "required": [
+          "models_dir",
+          "models_bytes"
+        ],
         "properties": {
           "free_bytes": {
-            "description": "Free bytes on the volume holding the models; `None` when it cannot\nbe read.",
-            "format": "int64",
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "format": "int64",
+            "description": "Free bytes on the volume holding the models; `None` when it cannot\nbe read.",
+            "minimum": 0
           },
           "models_bytes": {
-            "description": "Disk the downloaded models use.",
+            "type": "integer",
             "format": "int64",
-            "minimum": 0,
-            "type": "integer"
+            "description": "Disk the downloaded models use.",
+            "minimum": 0
           },
           "models_dir": {
             "type": "string"
           },
           "total_bytes": {
-            "format": "int64",
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "format": "int64",
+            "minimum": 0
           }
-        },
-        "required": [
-          "models_dir",
-          "models_bytes"
-        ],
-        "type": "object"
+        }
       },
       "AlignmentJsonRequest": {
+        "type": "object",
+        "required": [
+          "audio_base64",
+          "text"
+        ],
         "properties": {
           "audio_base64": {
             "type": "string"
@@ -735,14 +1762,14 @@
           "text": {
             "type": "string"
           }
-        },
-        "required": [
-          "audio_base64",
-          "text"
-        ],
-        "type": "object"
+        }
       },
       "AlignmentMultipartRequest": {
+        "type": "object",
+        "required": [
+          "file",
+          "text"
+        ],
         "properties": {
           "audio_base64": {
             "type": [
@@ -751,8 +1778,8 @@
             ]
           },
           "file": {
-            "format": "binary",
-            "type": "string"
+            "type": "string",
+            "format": "binary"
           },
           "language": {
             "type": [
@@ -775,69 +1802,70 @@
           "text": {
             "type": "string"
           }
-        },
-        "required": [
-          "file",
-          "text"
-        ],
-        "type": "object"
+        }
       },
       "AlignmentResponse": {
-        "properties": {
-          "alignment_source": {
-            "description": "`model` when every word was timed by the aligner; `heuristic` when\nsome windows fell back to evenly spaced timings (see `warnings`).",
-            "example": "model",
-            "type": "string"
-          },
-          "alignments": {
-            "items": {
-              "$ref": "#/components/schemas/AlignmentWord"
-            },
-            "type": "array"
-          },
-          "duration": {
-            "description": "Duration of the aligned audio in seconds.",
-            "format": "float",
-            "type": "number"
-          },
-          "warnings": {
-            "description": "One entry per alignment window whose timings are not the model's.",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
+        "type": "object",
         "required": [
           "alignments",
           "duration",
           "alignment_source",
           "warnings"
         ],
-        "type": "object"
+        "properties": {
+          "alignment_source": {
+            "type": "string",
+            "description": "`model` when every word was timed by the aligner; `heuristic` when\nsome windows fell back to evenly spaced timings (see `warnings`).",
+            "example": "model"
+          },
+          "alignments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AlignmentWord"
+            }
+          },
+          "duration": {
+            "type": "number",
+            "format": "float",
+            "description": "Duration of the aligned audio in seconds."
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "One entry per alignment window whose timings are not the model's."
+          }
+        }
       },
       "AlignmentWord": {
-        "properties": {
-          "end": {
-            "format": "float",
-            "type": "number"
-          },
-          "start": {
-            "format": "float",
-            "type": "number"
-          },
-          "word": {
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "word",
           "start",
           "end"
         ],
-        "type": "object"
+        "properties": {
+          "end": {
+            "type": "number",
+            "format": "float"
+          },
+          "start": {
+            "type": "number",
+            "format": "float"
+          },
+          "word": {
+            "type": "string"
+          }
+        }
       },
       "ApiErrorBody": {
+        "type": "object",
+        "required": [
+          "message",
+          "type",
+          "code"
+        ],
         "properties": {
           "code": {
             "type": "string"
@@ -854,57 +1882,59 @@
           "type": {
             "type": "string"
           }
-        },
-        "required": [
-          "message",
-          "type",
-          "code"
-        ],
-        "type": "object"
+        }
       },
       "ApiErrorEnvelope": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
         "properties": {
           "error": {
             "$ref": "#/components/schemas/ApiErrorBody"
           }
-        },
-        "required": [
-          "error"
-        ],
-        "type": "object"
+        }
       },
       "ChatCompletionChoice": {
-        "properties": {
-          "finish_reason": {
-            "type": "string"
-          },
-          "index": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "message": {
-            "$ref": "#/components/schemas/ChatCompletionMessage"
-          }
-        },
+        "type": "object",
         "required": [
           "index",
           "message",
           "finish_reason"
         ],
-        "type": "object"
+        "properties": {
+          "finish_reason": {
+            "type": "string"
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "message": {
+            "$ref": "#/components/schemas/ChatCompletionMessage"
+          }
+        }
       },
       "ChatCompletionChunk": {
+        "type": "object",
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices"
+        ],
         "properties": {
           "choices": {
+            "type": "array",
             "items": {
               "$ref": "#/components/schemas/ChatCompletionDelta"
-            },
-            "type": "array"
+            }
           },
           "created": {
+            "type": "integer",
             "format": "int64",
-            "minimum": 0,
-            "type": "integer"
+            "minimum": 0
           },
           "id": {
             "type": "string"
@@ -925,17 +1955,14 @@
               }
             ]
           }
-        },
-        "required": [
-          "id",
-          "object",
-          "created",
-          "model",
-          "choices"
-        ],
-        "type": "object"
+        }
       },
       "ChatCompletionDelta": {
+        "type": "object",
+        "required": [
+          "index",
+          "delta"
+        ],
         "properties": {
           "delta": {
             "$ref": "#/components/schemas/ChatCompletionMessage"
@@ -947,38 +1974,53 @@
             ]
           },
           "index": {
-            "minimum": 0,
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           }
-        },
-        "required": [
-          "index",
-          "delta"
-        ],
-        "type": "object"
+        }
       },
       "ChatCompletionMessage": {
+        "type": "object",
+        "required": [
+          "role"
+        ],
         "properties": {
           "content": {
             "description": "Text, or content parts: `text`, and images for Qwen3.5."
           },
+          "reasoning_content": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "On an assistant message: the reasoning a previous answer returned."
+          },
           "role": {
             "type": "string"
           },
+          "tool_call_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "On a tool message: the id of the call it answers."
+          },
           "tool_calls": {
-            "items": {},
             "type": [
               "array",
               "null"
-            ]
+            ],
+            "items": {},
+            "description": "On an assistant message: the calls it made."
           }
-        },
-        "required": [
-          "role"
-        ],
-        "type": "object"
+        }
       },
       "ChatCompletionRequest": {
+        "type": "object",
+        "required": [
+          "model",
+          "messages"
+        ],
         "properties": {
           "audio": {
             "description": "Spoken replies are not offered here (the voice realtime API speaks);\nany value is a `400`."
@@ -1000,44 +2042,51 @@
             ]
           },
           "max_completion_tokens": {
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "minimum": 0
           },
           "max_tokens": {
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "minimum": 0
           },
           "messages": {
+            "type": "array",
             "items": {
               "$ref": "#/components/schemas/ChatCompletionMessage"
-            },
-            "type": "array"
+            }
           },
           "modalities": {
-            "description": "Replies are text: only `[\"text\"]` is accepted.",
-            "items": {
-              "type": "string"
-            },
             "type": [
               "array",
               "null"
-            ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Replies are text: only `[\"text\"]` is accepted."
           },
           "model": {
             "type": "string"
           },
+          "parallel_tool_calls": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`false` keeps the answer to one tool call."
+          },
           "presence_penalty": {
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float"
           },
           "preserve_thinking": {
             "type": [
@@ -1056,25 +2105,25 @@
             ]
           },
           "repetition_penalty": {
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float"
           },
           "seed": {
-            "format": "int64",
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "format": "int64"
           },
           "skip_special_tokens": {
-            "description": "vLLM extension: `false` keeps special tokens in the reply text.",
             "type": [
               "boolean",
               "null"
-            ]
+            ],
+            "description": "vLLM extension: `false` keeps special tokens in the reply text."
           },
           "stop": {},
           "stream": {
@@ -1094,70 +2143,77 @@
             ]
           },
           "temperature": {
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float"
           },
-          "tool_choice": {},
+          "tool_choice": {
+            "description": "`\"auto\"` (default), `\"none\"`, `\"required\"`, or a named function."
+          },
           "tools": {
-            "items": {},
             "type": [
               "array",
               "null"
-            ]
+            ],
+            "items": {},
+            "description": "OpenAI function tools. `strict: true` on a function holds its calls\nto the declared names and parameter schema."
           },
           "top_k": {
-            "format": "int64",
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "format": "int64"
           },
           "top_p": {
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float"
           },
           "truncation": {
-            "description": "`\"disabled\"` (default) or `\"auto\"`.",
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "`\"disabled\"` (default) or `\"auto\"`."
           }
-        },
-        "required": [
-          "model",
-          "messages"
-        ],
-        "type": "object"
+        }
       },
       "ChatCompletionResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices",
+          "usage"
+        ],
         "properties": {
           "choices": {
+            "type": "array",
             "items": {
               "$ref": "#/components/schemas/ChatCompletionChoice"
-            },
-            "type": "array"
+            }
           },
           "created": {
+            "type": "integer",
             "format": "int64",
-            "minimum": 0,
-            "type": "integer"
+            "minimum": 0
           },
           "id": {
             "type": "string"
           },
           "izwi_generation_time_ms": {
-            "format": "double",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "double"
           },
           "izwi_timing": {
             "oneOf": [
@@ -1179,18 +2235,10 @@
           "usage": {
             "$ref": "#/components/schemas/Usage"
           }
-        },
-        "required": [
-          "id",
-          "object",
-          "created",
-          "model",
-          "choices",
-          "usage"
-        ],
-        "type": "object"
+        }
       },
       "ChatCompletionStreamOptions": {
+        "type": "object",
         "properties": {
           "include_usage": {
             "type": [
@@ -1198,18 +2246,18 @@
               "null"
             ]
           }
-        },
-        "type": "object"
+        }
       },
       "ChatReasoningEffort": {
+        "type": "string",
         "enum": [
           "xhigh",
           "medium",
           "low"
-        ],
-        "type": "string"
+        ]
       },
       "ChatTemplateKwargs": {
+        "type": "object",
         "properties": {
           "enable_thinking": {
             "type": [
@@ -1233,103 +2281,10 @@
               }
             ]
           }
-        },
-        "type": "object"
+        }
       },
       "ChatTiming": {
-        "properties": {
-          "codec_ms": {
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "decode_ms": {
-            "description": "Sum of physical batch service time, not wall time.",
-            "format": "double",
-            "type": "number"
-          },
-          "decode_steps": {
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "decode_tokens": {
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "decode_wall_ms": {
-            "description": "First entered decode dispatch registration to last durable token commit.",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "media_decode_ms": {
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "normalization_ms": {
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "post_first_token_ms": {
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "postprocess_ms": {
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "prefill_ms": {
-            "format": "double",
-            "type": "number"
-          },
-          "prefill_steps": {
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "queue_wait_ms": {
-            "format": "double",
-            "type": "number"
-          },
-          "sampling_ms": {
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "total_ms": {
-            "format": "double",
-            "type": "number"
-          },
-          "ttft_ms": {
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          }
-        },
+        "type": "object",
         "required": [
           "queue_wait_ms",
           "prefill_ms",
@@ -1338,16 +2293,113 @@
           "prefill_steps",
           "decode_steps"
         ],
-        "type": "object"
+        "properties": {
+          "codec_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "decode_ms": {
+            "type": "number",
+            "format": "double",
+            "description": "Sum of physical batch service time, not wall time."
+          },
+          "decode_steps": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "decode_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "decode_wall_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "First entered decode dispatch registration to last durable token commit."
+          },
+          "media_decode_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "normalization_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "post_first_token_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "postprocess_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "prefill_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "prefill_steps": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "queue_wait_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "sampling_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "total_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "ttft_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          }
+        }
       },
       "CursorPagination": {
+        "type": "object",
+        "required": [
+          "has_more",
+          "limit"
+        ],
         "properties": {
           "has_more": {
             "type": "boolean"
           },
           "limit": {
-            "minimum": 0,
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "next_cursor": {
             "type": [
@@ -1355,14 +2407,10 @@
               "null"
             ]
           }
-        },
-        "required": [
-          "has_more",
-          "limit"
-        ],
-        "type": "object"
+        }
       },
       "CursorPaginationQuery": {
+        "type": "object",
         "properties": {
           "cursor": {
             "type": [
@@ -1371,29 +2419,34 @@
             ]
           },
           "limit": {
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "minimum": 0
           }
-        },
-        "type": "object"
+        }
       },
       "InputTokensDetails": {
-        "properties": {
-          "cached_tokens": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
+        "type": "object",
         "required": [
           "cached_tokens"
         ],
-        "type": "object"
+        "properties": {
+          "cached_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
       },
       "LiveResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "version",
+          "uptime_secs"
+        ],
         "properties": {
           "runtime_failure": {
             "type": [
@@ -1408,54 +2461,55 @@
             "type": "string"
           },
           "uptime_secs": {
+            "type": "integer",
             "format": "int64",
-            "minimum": 0,
-            "type": "integer"
+            "minimum": 0
           },
           "version": {
             "type": "string"
           }
-        },
-        "required": [
-          "status",
-          "version",
-          "uptime_secs"
-        ],
-        "type": "object"
+        }
       },
       "MediaIngestLaneSnapshot": {
-        "properties": {
-          "active": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "available": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "capacity": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "queued": {
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
+        "type": "object",
         "required": [
           "capacity",
           "active",
           "available",
           "queued"
         ],
-        "type": "object"
+        "properties": {
+          "active": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "available": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "capacity": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "queued": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
       },
       "OpenAiModel": {
+        "type": "object",
+        "required": [
+          "id",
+          "object",
+          "created",
+          "owned_by"
+        ],
         "properties": {
           "created": {
+            "type": "integer",
             "format": "int64",
-            "minimum": 0,
-            "type": "integer"
+            "minimum": 0
           },
           "id": {
             "type": "string"
@@ -1466,34 +2520,32 @@
           "owned_by": {
             "type": "string"
           }
-        },
-        "required": [
-          "id",
-          "object",
-          "created",
-          "owned_by"
-        ],
-        "type": "object"
+        }
       },
       "OpenAiModelsResponse": {
-        "properties": {
-          "data": {
-            "items": {
-              "$ref": "#/components/schemas/OpenAiModel"
-            },
-            "type": "array"
-          },
-          "object": {
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "object",
           "data"
         ],
-        "type": "object"
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OpenAiModel"
+            }
+          },
+          "object": {
+            "type": "string"
+          }
+        }
       },
       "ProbeCheck": {
+        "type": "object",
+        "required": [
+          "name",
+          "ok"
+        ],
         "properties": {
           "message": {
             "type": [
@@ -1507,27 +2559,36 @@
           "ok": {
             "type": "boolean"
           }
-        },
-        "required": [
-          "name",
-          "ok"
-        ],
-        "type": "object"
+        }
       },
       "PromptTokensDetails": {
-        "properties": {
-          "cached_tokens": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
+        "type": "object",
         "required": [
           "cached_tokens"
         ],
-        "type": "object"
+        "properties": {
+          "cached_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
       },
       "ReadyResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "version",
+          "ready",
+          "phase",
+          "draining",
+          "uptime_secs",
+          "request_admission",
+          "realtime_session_admission",
+          "media_ingest",
+          "checks",
+          "startup_warnings"
+        ],
         "properties": {
           "batch_runtime": {
             "oneOf": [
@@ -1540,10 +2601,10 @@
             ]
           },
           "checks": {
+            "type": "array",
             "items": {
               "$ref": "#/components/schemas/ProbeCheck"
-            },
-            "type": "array"
+            }
           },
           "draining": {
             "type": "boolean"
@@ -1564,78 +2625,74 @@
             "$ref": "#/components/schemas/RequestAdmissionSnapshot"
           },
           "startup_warnings": {
+            "type": "array",
             "items": {
               "type": "string"
-            },
-            "type": "array"
+            }
           },
           "status": {
             "type": "string"
           },
           "uptime_secs": {
+            "type": "integer",
             "format": "int64",
-            "minimum": 0,
-            "type": "integer"
+            "minimum": 0
           },
           "version": {
             "type": "string"
           }
-        },
-        "required": [
-          "status",
-          "version",
-          "ready",
-          "phase",
-          "draining",
-          "uptime_secs",
-          "request_admission",
-          "realtime_session_admission",
-          "media_ingest",
-          "checks",
-          "startup_warnings"
-        ],
-        "type": "object"
+        }
       },
       "RealtimeSessionAdmissionSnapshot": {
-        "properties": {
-          "active": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "available": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "capacity": {
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
+        "type": "object",
         "required": [
           "capacity",
           "active",
           "available"
         ],
-        "type": "object"
-      },
-      "RequestAdmissionClassSnapshot": {
         "properties": {
+          "active": {
+            "type": "integer",
+            "minimum": 0
+          },
           "available": {
-            "minimum": 0,
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "capacity": {
-            "minimum": 0,
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           }
-        },
+        }
+      },
+      "RequestAdmissionClassSnapshot": {
+        "type": "object",
         "required": [
           "capacity",
           "available"
         ],
-        "type": "object"
+        "properties": {
+          "available": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "capacity": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
       },
       "RequestAdmissionSnapshot": {
+        "type": "object",
+        "required": [
+          "global",
+          "realtime",
+          "interactive",
+          "streaming",
+          "online",
+          "batch",
+          "background"
+        ],
         "properties": {
           "background": {
             "$ref": "#/components/schemas/RequestAdmissionClassSnapshot"
@@ -1658,19 +2715,15 @@
           "streaming": {
             "$ref": "#/components/schemas/RequestAdmissionClassSnapshot"
           }
-        },
-        "required": [
-          "global",
-          "realtime",
-          "interactive",
-          "streaming",
-          "online",
-          "batch",
-          "background"
-        ],
-        "type": "object"
+        }
       },
       "ResponseDeletedObject": {
+        "type": "object",
+        "required": [
+          "id",
+          "object",
+          "deleted"
+        ],
         "properties": {
           "deleted": {
             "type": "boolean"
@@ -1681,36 +2734,40 @@
           "object": {
             "type": "string"
           }
-        },
-        "required": [
-          "id",
-          "object",
-          "deleted"
-        ],
-        "type": "object"
+        }
       },
       "ResponseInputItemsList": {
-        "properties": {
-          "data": {
-            "items": {},
-            "type": "array"
-          },
-          "object": {
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "object",
           "data"
         ],
-        "type": "object"
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {}
+          },
+          "object": {
+            "type": "string"
+          }
+        }
       },
       "ResponseObject": {
+        "type": "object",
+        "required": [
+          "id",
+          "object",
+          "created_at",
+          "status",
+          "model",
+          "output",
+          "usage"
+        ],
         "properties": {
           "created_at": {
+            "type": "integer",
             "format": "int64",
-            "minimum": 0,
-            "type": "integer"
+            "minimum": 0
           },
           "error": {
             "oneOf": [
@@ -1733,8 +2790,8 @@
             "type": "string"
           },
           "output": {
-            "items": {},
-            "type": "array"
+            "type": "array",
+            "items": {}
           },
           "status": {
             "type": "string"
@@ -1742,45 +2799,39 @@
           "usage": {
             "$ref": "#/components/schemas/ResponseUsage"
           }
-        },
-        "required": [
-          "id",
-          "object",
-          "created_at",
-          "status",
-          "model",
-          "output",
-          "usage"
-        ],
-        "type": "object"
+        }
       },
       "ResponseUsage": {
-        "properties": {
-          "input_tokens": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "input_tokens_details": {
-            "$ref": "#/components/schemas/InputTokensDetails"
-          },
-          "output_tokens": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "total_tokens": {
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
+        "type": "object",
         "required": [
           "input_tokens",
           "output_tokens",
           "total_tokens",
           "input_tokens_details"
         ],
-        "type": "object"
+        "properties": {
+          "input_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "input_tokens_details": {
+            "$ref": "#/components/schemas/InputTokensDetails"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "total_tokens": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
       },
       "ResponsesCreateRequest": {
+        "type": "object",
+        "required": [
+          "model"
+        ],
         "properties": {
           "chat_template_kwargs": {
             "oneOf": [
@@ -1806,22 +2857,29 @@
             ]
           },
           "max_output_tokens": {
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "minimum": 0
           },
           "metadata": {},
           "model": {
             "type": "string"
           },
+          "parallel_tool_calls": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`false` keeps the answer to one function call."
+          },
           "presence_penalty": {
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float"
           },
           "preserve_thinking": {
             "type": [
@@ -1840,18 +2898,18 @@
             ]
           },
           "repetition_penalty": {
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float"
           },
           "skip_special_tokens": {
-            "description": "vLLM extension: `false` keeps special tokens in the reply text.",
             "type": [
               "boolean",
               "null"
-            ]
+            ],
+            "description": "vLLM extension: `false` keeps special tokens in the reply text."
           },
           "store": {
             "type": [
@@ -1866,33 +2924,33 @@
             ]
           },
           "temperature": {
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float"
           },
           "tool_choice": {},
           "tools": {
-            "items": {},
             "type": [
               "array",
               "null"
-            ]
+            ],
+            "items": {}
           },
           "top_k": {
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "minimum": 0
           },
           "top_p": {
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float"
           },
           "user": {
             "type": [
@@ -1900,13 +2958,10 @@
               "null"
             ]
           }
-        },
-        "required": [
-          "model"
-        ],
-        "type": "object"
+        }
       },
       "RuntimeQueueClass": {
+        "type": "string",
         "enum": [
           "interactive_asr",
           "batch_asr",
@@ -1917,67 +2972,33 @@
           "export",
           "evaluation",
           "batch"
-        ],
-        "type": "string"
+        ]
       },
       "RuntimeQueueDepth": {
-        "properties": {
-          "count": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "oldest_age_ms": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "queue_class": {
-            "$ref": "#/components/schemas/RuntimeQueueClass"
-          }
-        },
+        "type": "object",
         "required": [
           "queue_class",
           "count",
           "oldest_age_ms"
         ],
-        "type": "object"
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "oldest_age_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "queue_class": {
+            "$ref": "#/components/schemas/RuntimeQueueClass"
+          }
+        }
       },
       "RuntimeQueueHealthSnapshot": {
-        "properties": {
-          "active_workers": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "healthy_workers": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "heartbeat_stale_after_ms": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "queues": {
-            "items": {
-              "$ref": "#/components/schemas/RuntimeQueueDepth"
-            },
-            "type": "array"
-          },
-          "stale_workers": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "uncovered_queue_classes": {
-            "items": {
-              "$ref": "#/components/schemas/RuntimeQueueClass"
-            },
-            "type": "array"
-          }
-        },
+        "type": "object",
         "required": [
           "heartbeat_stale_after_ms",
           "active_workers",
@@ -1986,9 +3007,46 @@
           "queues",
           "uncovered_queue_classes"
         ],
-        "type": "object"
+        "properties": {
+          "active_workers": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "healthy_workers": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "heartbeat_stale_after_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "queues": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RuntimeQueueDepth"
+            }
+          },
+          "stale_workers": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "uncovered_queue_classes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RuntimeQueueClass"
+            }
+          }
+        }
       },
       "ServerSentEvent": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
         "properties": {
           "data": {},
           "event": {
@@ -1997,46 +3055,42 @@
               "null"
             ]
           }
-        },
-        "required": [
-          "data"
-        ],
-        "type": "object"
+        }
       },
       "SpeechDialogueReference": {
+        "type": "object",
         "description": "One reference voice of a dialogue request: a clip (`audio`, base64, with\nits transcript `text`) or a saved voice, and the speaker it voices.",
         "properties": {
           "audio": {
-            "description": "The clip, base64 audio (at most 60 s for Fish Audio Drama 3).",
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "The clip, base64 audio (at most 60 s for Fish Audio Drama 3)."
           },
           "saved_voice_id": {
-            "description": "A saved voice instead of `audio` and `text`: its clip and\ntranscript (it must have one).",
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "A saved voice instead of `audio` and `text`: its clip and\ntranscript (it must have one)."
           },
           "speaker": {
-            "description": "The speaker this reference voices, 0 to the model's\n`max_speakers - 1`; unset, the speaker of a `<|speaker:N|>` tag that\nleads `text`, else 0. A leading tag must name this speaker.",
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "description": "The speaker this reference voices, 0 to the model's\n`max_speakers - 1`; unset, the speaker of a `<|speaker:N|>` tag that\nleads `text`, else 0. A leading tag must name this speaker.",
+            "minimum": 0
           },
           "text": {
-            "description": "What the clip says; required with `audio`.",
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "What the clip says; required with `audio`."
           }
-        },
-        "type": "object"
+        }
       },
       "SpeechRequest": {
         "allOf": [
@@ -2045,108 +3099,112 @@
             "description": "Model-specific sampling and controls (`top_p`, `seed`, `cfg_weight`,\n`exaggeration`, `min_p`, ...); a control the model does not take is\nrefused."
           },
           {
+            "type": "object",
+            "required": [
+              "model"
+            ],
             "properties": {
               "allow_format_fallback": {
-                "description": "Return WAV for a recognized format this build cannot encode (`aac`).",
                 "type": [
                   "boolean",
                   "null"
-                ]
+                ],
+                "description": "Return WAV for a recognized format this build cannot encode (`aac`)."
               },
               "bitrate": {
-                "description": "Target bitrate in bit/s for mp3 and opus.",
-                "format": "int32",
-                "minimum": 0,
                 "type": [
                   "integer",
                   "null"
-                ]
+                ],
+                "format": "int32",
+                "description": "Target bitrate in bit/s for mp3 and opus.",
+                "minimum": 0
               },
               "input": {
-                "description": "The text to speak. Fish S2 and Fish Audio Drama 3 refuse text holding\ntheir prompt's control tokens (`<|im_start|>`, `<|im_end|>`,\n`<|voice|>`, `<|text|>`, `<|interleave|>`, `<|semantic:N|>`);\nperformance tags such as `[sighs]` and `<whisper>…</whisper>` pass\nthrough. Long text is split into chunks the model speaks one after\nanother. Fish Audio Drama 3 voices `<|speaker:0|>` to\n`<|speaker:15|>` tags in it as a dialogue. Required unless a\n`script` gives the text.",
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "description": "The text to speak. Fish S2 and Fish Audio Drama 3 refuse text holding\ntheir prompt's control tokens (`<|im_start|>`, `<|im_end|>`,\n`<|voice|>`, `<|text|>`, `<|interleave|>`, `<|semantic:N|>`);\nperformance tags such as `[sighs]` and `<whisper>…</whisper>` pass\nthrough. Long text is split into chunks the model speaks one after\nanother. Fish Audio Drama 3 voices `<|speaker:0|>` to\n`<|speaker:15|>` tags in it as a dialogue. Required unless a\n`script` gives the text."
               },
               "instructions": {
-                "description": "At most 4096 characters.",
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "description": "At most 4096 characters."
               },
               "language": {
-                "description": "A language hint. Fish Audio Drama 3 reads the language from the text\nand is not given this; a `[language: xx]` tag in the text steers it.",
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "description": "A language hint. Fish Audio Drama 3 reads the language from the text\nand is not given this; a `[language: xx]` tag in the text steers it."
               },
               "max_output_tokens": {
-                "minimum": 0,
                 "type": [
                   "integer",
                   "null"
-                ]
+                ],
+                "minimum": 0
               },
               "max_tokens": {
-                "description": "The output budget in model frames. Fish S2 bounds the whole request\nwith it; Fish Audio Drama 3 bounds each chunk (1 to 4,096; unset, a\nchunk gets about 2.5 times its speaking estimate, at most 1,024).",
-                "minimum": 0,
                 "type": [
                   "integer",
                   "null"
-                ]
+                ],
+                "description": "The output budget in model frames. Fish S2 bounds the whole request\nwith it; Fish Audio Drama 3 bounds each chunk (1 to 4,096; unset, a\nchunk gets about 2.5 times its speaking estimate, at most 1,024).",
+                "minimum": 0
               },
               "model": {
                 "type": "string"
               },
               "reference_audio": {
-                "description": "A reference clip to clone: base64 audio, a data URL, or an http(s)\nURL on IZWI_ALLOWED_MEDIA_DOMAINS (`ref_audio` elsewhere). Fish Audio Drama 3 takes one\nup to 60 s (saved voices hold 30 s) and speaks in a voice its `seed`\nsets when given none.",
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "description": "A reference clip to clone: base64 audio, a data URL, or an http(s)\nURL on IZWI_ALLOWED_MEDIA_DOMAINS (`ref_audio` elsewhere). Fish Audio Drama 3 takes one\nup to 60 s (saved voices hold 30 s) and speaks in a voice its `seed`\nsets when given none."
               },
               "reference_language": {
-                "description": "The language the reference audio is spoken in (Maya 2 Native, which\nclones across languages); absent, read from the transcript's script.",
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "description": "The language the reference audio is spoken in (Maya 2 Native, which\nclones across languages); absent, read from the transcript's script."
               },
               "reference_text": {
-                "description": "The reference clip's transcript, required with `reference_audio` by\nevery model that conditions on its words (all but Chatterbox).",
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "description": "The reference clip's transcript, required with `reference_audio` by\nevery model that conditions on its words (all but Chatterbox)."
               },
               "references": {
-                "description": "Reference voices per speaker, for a model that voices several\n(`supports_speaker_dialogue`: Fish Audio Drama 3, at most 8, speakers\n0 to 15; several may voice one speaker). Each is a clip (`audio` and\nits `text`) or a `saved_voice_id`. Replaces `reference_audio`,\n`reference_text` and `saved_voice_id` (giving both is a 400); a\nspeaker without a reference speaks in a voice its `seed` sets. Inline\nclips total at most 16 MiB; use saved voices beyond that.",
-                "items": {
-                  "$ref": "#/components/schemas/SpeechDialogueReference"
-                },
                 "type": [
                   "array",
                   "null"
-                ]
+                ],
+                "items": {
+                  "$ref": "#/components/schemas/SpeechDialogueReference"
+                },
+                "description": "Reference voices per speaker, for a model that voices several\n(`supports_speaker_dialogue`: Fish Audio Drama 3, at most 8, speakers\n0 to 15; several may voice one speaker). Each is a clip (`audio` and\nits `text`) or a `saved_voice_id`. Replaces `reference_audio`,\n`reference_text` and `saved_voice_id` (giving both is a 400); a\nspeaker without a reference speaks in a voice its `seed` sets. Inline\nclips total at most 16 MiB; use saved voices beyond that."
               },
               "response_format": {
-                "description": "`mp3`, `opus` (Ogg), `flac`, `wav`, `pcm` (OpenAI's: 24 kHz PCM16),\n`pcm_i16` / `pcm_f32` (the model's rate), `g711_ulaw`, `g711_alaw`.\n`aac` is refused: AAC encoders need a patent licence. The default is\nIZWI_SPEECH_DEFAULT_FORMAT (`wav`).",
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "description": "`mp3`, `opus` (Ogg), `flac`, `wav`, `pcm` (OpenAI's: 24 kHz PCM16),\n`pcm_i16` / `pcm_f32` (the model's rate), `g711_ulaw`, `g711_alaw`.\n`aac` is refused: AAC encoders need a patent licence. The default is\nIZWI_SPEECH_DEFAULT_FORMAT (`wav`)."
               },
               "sample_rate": {
-                "description": "The rate to encode at (resampled when the model's differs); opus\ntakes 8000/12000/16000/24000/48000, mp3 its MPEG rates.",
-                "format": "int32",
-                "minimum": 0,
                 "type": [
                   "integer",
                   "null"
-                ]
+                ],
+                "format": "int32",
+                "description": "The rate to encode at (resampled when the model's differs); opus\ntakes 8000/12000/16000/24000/48000, mp3 its MPEG rates.",
+                "minimum": 0
               },
               "saved_voice_id": {
                 "type": [
@@ -2155,199 +3213,199 @@
                 ]
               },
               "script": {
-                "description": "A dialogue as lines, each spoken as `<|speaker:N|> text`, the lines\njoined by newlines; replaces `input` (giving both is a 400). Models\nwith `supports_speaker_dialogue` only.",
-                "items": {
-                  "$ref": "#/components/schemas/SpeechScriptLine"
-                },
                 "type": [
                   "array",
                   "null"
-                ]
+                ],
+                "items": {
+                  "$ref": "#/components/schemas/SpeechScriptLine"
+                },
+                "description": "A dialogue as lines, each spoken as `<|speaker:N|> text`, the lines\njoined by newlines; replaces `input` (giving both is a 400). Models\nwith `supports_speaker_dialogue` only."
               },
               "service_tier": {
-                "description": "Izwi extension of OpenAI's field: `flex` runs the request as batch\nwork behind interactive and streaming requests; `default`, `auto` or\nabsent keeps the route's own class; `priority` is served as\n`default`. The `X-Izwi-Service-Tier` request header is read when the\nbody names none.",
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "description": "Izwi extension of OpenAI's field: `flex` runs the request as batch\nwork behind interactive and streaming requests; `default`, `auto` or\nabsent keeps the route's own class; `priority` is served as\n`default`. The `X-Izwi-Service-Tier` request header is read when the\nbody names none."
               },
               "speed": {
-                "format": "float",
                 "type": [
                   "number",
                   "null"
-                ]
+                ],
+                "format": "float"
               },
               "stream": {
-                "description": "`true` streams server-sent events (as `stream_format: \"sse\"`).",
                 "type": [
                   "boolean",
                   "null"
-                ]
+                ],
+                "description": "`true` streams server-sent events (as `stream_format: \"sse\"`)."
               },
               "stream_format": {
-                "description": "`audio`: the encoded file as a chunked body while it is generated;\n`sse`: base64 deltas of the same bytes (`speech.audio.delta`).",
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "description": "`audio`: the encoded file as a chunked body while it is generated;\n`sse`: base64 deltas of the same bytes (`speech.audio.delta`)."
               },
               "temperature": {
-                "format": "float",
                 "type": [
                   "number",
                   "null"
-                ]
+                ],
+                "format": "float"
               },
               "top_k": {
-                "description": "Top-k sampling. Fish Audio Drama 3 reads 0 as no cap.",
-                "minimum": 0,
                 "type": [
                   "integer",
                   "null"
-                ]
+                ],
+                "description": "Top-k sampling. Fish Audio Drama 3 reads 0 as no cap.",
+                "minimum": 0
               },
               "voice": {
-                "description": "A voice name, or OpenAI's custom-voice object `{\"id\": \"...\"}` naming\na saved voice (`/v1/audio/voices`). A model that clones and has no\nbuilt-in voices reads a name as an uploaded voice's.",
                 "type": [
                   "object",
                   "null"
-                ]
+                ],
+                "description": "A voice name, or OpenAI's custom-voice object `{\"id\": \"...\"}` naming\na saved voice (`/v1/audio/voices`). A model that clones and has no\nbuilt-in voices reads a name as an uploaded voice's."
               }
-            },
-            "required": [
-              "model"
-            ],
-            "type": "object"
+            }
           }
         ]
       },
       "SpeechSamplingRequest": {
+        "type": "object",
         "description": "Optional speech-sampling fields a request may set beside `temperature`\nand `top_k`. Anything left unset keeps the model family's reference\ndefault (TPIPE-24): Qwen3-TTS generation_config, LFM 0.8 / top-k 64,\nVibeVoice CFG 1.3 with 10 steps, fish-speech 0.7 / 0.7, Voxtral greedy.",
         "properties": {
           "cfg_scale": {
-            "description": "VibeVoice classifier-free guidance scale.",
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float",
+            "description": "VibeVoice classifier-free guidance scale."
           },
           "cfg_weight": {
-            "description": "Classifier-free guidance weight, in [0, 1]; 0 turns guidance off\n(Chatterbox; its default is 0.5).",
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float",
+            "description": "Classifier-free guidance weight, in [0, 1]; 0 turns guidance off\n(Chatterbox; its default is 0.5)."
           },
           "diffusion_steps": {
-            "description": "VibeVoice diffusion steps per frame.",
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "description": "VibeVoice diffusion steps per frame.",
+            "minimum": 0
           },
           "exaggeration": {
-            "description": "Emotion intensity, in [0, 2] (Chatterbox; its default is 0.5).",
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float",
+            "description": "Emotion intensity, in [0, 2] (Chatterbox; its default is 0.5)."
           },
           "min_p": {
-            "description": "Min-p sampling threshold, in [0, 1] (Chatterbox).",
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float",
+            "description": "Min-p sampling threshold, in [0, 1] (Chatterbox)."
           },
           "normalize_text": {
-            "description": "Speak numbers, currency, dates, times and units as words. Unset keeps\nthe model's default: on for Kokoro (English) and Maya 2 Native (in the\nrequest's language), off for models that read them themselves.",
             "type": [
               "boolean",
               "null"
-            ]
+            ],
+            "description": "Speak numbers, currency, dates, times and units as words. Unset keeps\nthe model's default: on for Kokoro (English) and Maya 2 Native (in the\nrequest's language), off for models that read them themselves."
           },
           "repetition_penalty": {
-            "description": "Repetition penalty (Qwen3-TTS), >= 1.",
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float",
+            "description": "Repetition penalty (Qwen3-TTS), >= 1."
           },
           "seed": {
-            "description": "Sampling seed (Qwen3-TTS, LFM2.5-Audio, Fish S2, Fish Audio Drama 3,\nVoxtral noise, Kokoro noise). Fish Audio Drama 3's voice without a\nreference comes from it, and chunk i of long text samples from\nseed + i.",
-            "format": "int64",
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "format": "int64",
+            "description": "Sampling seed (Qwen3-TTS, LFM2.5-Audio, Fish S2, Fish Audio Drama 3,\nVoxtral noise, Kokoro noise). Fish Audio Drama 3's voice without a\nreference comes from it, and chunk i of long text samples from\nseed + i.",
+            "minimum": 0
           },
           "subtalker_do_sample": {
-            "description": "Qwen3-TTS residual-codebook sampling.",
             "type": [
               "boolean",
               "null"
-            ]
+            ],
+            "description": "Qwen3-TTS residual-codebook sampling."
           },
           "subtalker_temperature": {
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float"
           },
           "subtalker_top_k": {
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "minimum": 0
           },
           "subtalker_top_p": {
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float"
           },
           "top_p": {
-            "description": "Nucleus sampling threshold, in (0, 1].",
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float",
+            "description": "Nucleus sampling threshold, in (0, 1]."
           }
-        },
-        "type": "object"
+        }
       },
       "SpeechScriptLine": {
+        "type": "object",
         "description": "One line of a dialogue script: a speaker and what they say.",
-        "properties": {
-          "speaker": {
-            "description": "The speaker, 0 to the model's `max_speakers - 1`.",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "text": {
-            "description": "The line, without a speaker tag; performance tags such as `[sighs]`\npass through.",
-            "type": "string"
-          }
-        },
         "required": [
           "speaker",
           "text"
         ],
-        "type": "object"
+        "properties": {
+          "speaker": {
+            "type": "integer",
+            "description": "The speaker, 0 to the model's `max_speakers - 1`.",
+            "minimum": 0
+          },
+          "text": {
+            "type": "string",
+            "description": "The line, without a speaker tag; performance tags such as `[sighs]`\npass through."
+          }
+        }
       },
       "SpeechStreamEvent": {
+        "type": "object",
+        "required": [
+          "event"
+        ],
         "properties": {
           "audio_base64": {
             "type": [
@@ -2356,11 +3414,11 @@
             ]
           },
           "audio_duration_secs": {
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float"
           },
           "audio_format": {
             "type": [
@@ -2378,11 +3436,11 @@
             "type": "string"
           },
           "generation_time_ms": {
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float"
           },
           "is_final": {
             "type": [
@@ -2397,48 +3455,48 @@
             ]
           },
           "rtf": {
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float"
           },
           "sample_count": {
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "minimum": 0
           },
           "sample_rate": {
-            "format": "int32",
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "format": "int32",
+            "minimum": 0
           },
           "sequence": {
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "minimum": 0
           },
           "tokens_generated": {
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "minimum": 0
           }
-        },
-        "required": [
-          "event"
-        ],
-        "type": "object"
+        }
       },
       "TranscriptionJsonRequest": {
+        "type": "object",
+        "required": [
+          "audio_base64"
+        ],
         "properties": {
           "aligner_model": {
             "type": [
@@ -2453,24 +3511,24 @@
             "description": "`\"auto\"`, the server's own splitting of long audio at pauses, or\nomitted. A `server_vad` object is refused with 400."
           },
           "include": {
-            "description": "OpenAI's `include[]`. `logprobs` is refused with 400: no model\nreturns token log-probabilities.",
-            "items": {
-              "type": "string"
-            },
             "type": [
               "array",
               "null"
-            ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "OpenAI's `include[]`. `logprobs` is refused with 400: no model\nreturns token log-probabilities."
           },
           "keywords": {
-            "description": "Izwi extension: terms to bias recognition toward, as an array (or\none comma- or newline-separated string). Models without keyword\nbiasing reject it (400).",
-            "items": {
-              "type": "string"
-            },
             "type": [
               "array",
               "null"
-            ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Izwi extension: terms to bias recognition toward, as an array (or\none comma- or newline-separated string). Models without keyword\nbiasing reject it (400)."
           },
           "language": {
             "type": [
@@ -2479,11 +3537,11 @@
             ]
           },
           "max_tokens": {
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "minimum": 0
           },
           "model": {
             "type": [
@@ -2498,25 +3556,25 @@
             ]
           },
           "response_format": {
-            "description": "One of json, verbose_json, text, srt, vtt; anything else (including\ndiarized_json) is rejected with 400 before transcription runs.",
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "One of json, verbose_json, text, srt, vtt; anything else (including\ndiarized_json) is rejected with 400 before transcription runs."
           },
           "service_tier": {
-            "description": "Izwi extension of OpenAI's field: `flex` runs the request as batch\nwork behind interactive and streaming requests; `default`, `auto` or\nabsent keeps the route's own class; `priority` is served as\n`default`. The `X-Izwi-Service-Tier` request header is read when the\nbody names none.",
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Izwi extension of OpenAI's field: `flex` runs the request as batch\nwork behind interactive and streaming requests; `default`, `auto` or\nabsent keeps the route's own class; `priority` is served as\n`default`. The `X-Izwi-Service-Tier` request header is read when the\nbody names none."
           },
           "speaker_labels": {
-            "description": "Izwi extension: tag speakers in the transcript (models that do, such\nas Nemotron-3.5-Transcribe-30B-A4B-FP8; others reject it with 400).\nverbose_json then carries `speaker_turns`.",
             "type": [
               "boolean",
               "null"
-            ]
+            ],
+            "description": "Izwi extension: tag speakers in the transcript (models that do, such\nas Nemotron-3.5-Transcribe-30B-A4B-FP8; others reject it with 400).\nverbose_json then carries `speaker_turns`."
           },
           "stream": {
             "type": [
@@ -2525,36 +3583,36 @@
             ]
           },
           "target_language": {
-            "description": "Izwi extension: translate the speech into this language instead of\ntranscribing it. Models without speech translation reject it (400);\nword timestamps are not available for a translation.",
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Izwi extension: translate the speech into this language instead of\ntranscribing it. Models without speech translation reject it (400);\nword timestamps are not available for a translation."
           },
           "temperature": {
-            "description": "0 to 1, checked and without effect: every ASR model decodes\ngreedily (Whisper with its fallback ladder from 0).",
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float",
+            "description": "0 to 1, checked and without effect: every ASR model decodes\ngreedily (Whisper with its fallback ladder from 0)."
           },
           "timestamp_granularities": {
-            "items": {
-              "type": "string"
-            },
             "type": [
               "array",
               "null"
-            ]
+            ],
+            "items": {
+              "type": "string"
+            }
           }
-        },
-        "required": [
-          "audio_base64"
-        ],
-        "type": "object"
+        }
       },
       "TranscriptionMultipartRequest": {
+        "type": "object",
+        "required": [
+          "file"
+        ],
         "properties": {
           "aligner_model": {
             "type": [
@@ -2572,28 +3630,28 @@
             "description": "`\"auto\"`, the server's own splitting of long audio at pauses, or\nomitted. A `server_vad` object is refused with 400."
           },
           "file": {
-            "format": "binary",
-            "type": "string"
+            "type": "string",
+            "format": "binary"
           },
           "include": {
-            "description": "OpenAI's `include[]`. `logprobs` is refused with 400: no model\nreturns token log-probabilities.",
-            "items": {
-              "type": "string"
-            },
             "type": [
               "array",
               "null"
-            ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "OpenAI's `include[]`. `logprobs` is refused with 400: no model\nreturns token log-probabilities."
           },
           "keywords": {
-            "description": "Izwi extension: terms to bias recognition toward. Repeat the field or\nseparate terms with commas or newlines. Models without keyword\nbiasing reject it (400).",
-            "items": {
-              "type": "string"
-            },
             "type": [
               "array",
               "null"
-            ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Izwi extension: terms to bias recognition toward. Repeat the field or\nseparate terms with commas or newlines. Models without keyword\nbiasing reject it (400)."
           },
           "language": {
             "type": [
@@ -2602,11 +3660,11 @@
             ]
           },
           "max_tokens": {
-            "minimum": 0,
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "minimum": 0
           },
           "model": {
             "type": [
@@ -2621,25 +3679,25 @@
             ]
           },
           "response_format": {
-            "description": "One of json, verbose_json, text, srt, vtt; anything else (including\ndiarized_json) is rejected with 400 before transcription runs.",
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "One of json, verbose_json, text, srt, vtt; anything else (including\ndiarized_json) is rejected with 400 before transcription runs."
           },
           "service_tier": {
-            "description": "Izwi extension of OpenAI's field: `flex` runs the request as batch\nwork behind interactive and streaming requests; `default`, `auto` or\nabsent keeps the route's own class; `priority` is served as\n`default`. The `X-Izwi-Service-Tier` request header is read when the\nbody names none.",
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Izwi extension of OpenAI's field: `flex` runs the request as batch\nwork behind interactive and streaming requests; `default`, `auto` or\nabsent keeps the route's own class; `priority` is served as\n`default`. The `X-Izwi-Service-Tier` request header is read when the\nbody names none."
           },
           "speaker_labels": {
-            "description": "Izwi extension: tag speakers in the transcript (models that do, such\nas Nemotron-3.5-Transcribe-30B-A4B-FP8; others reject it with 400).\nverbose_json then carries `speaker_turns`.",
             "type": [
               "boolean",
               "null"
-            ]
+            ],
+            "description": "Izwi extension: tag speakers in the transcript (models that do, such\nas Nemotron-3.5-Transcribe-30B-A4B-FP8; others reject it with 400).\nverbose_json then carries `speaker_turns`."
           },
           "stream": {
             "type": [
@@ -2648,147 +3706,153 @@
             ]
           },
           "target_language": {
-            "description": "Izwi extension: translate the speech into this language instead of\ntranscribing it. Models without speech translation reject it (400);\nword timestamps are not available for a translation.",
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Izwi extension: translate the speech into this language instead of\ntranscribing it. Models without speech translation reject it (400);\nword timestamps are not available for a translation."
           },
           "temperature": {
-            "description": "0 to 1, checked and without effect: every ASR model decodes\ngreedily (Whisper with its fallback ladder from 0).",
-            "format": "float",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "float",
+            "description": "0 to 1, checked and without effect: every ASR model decodes\ngreedily (Whisper with its fallback ladder from 0)."
           },
           "timestamp_granularities": {
-            "items": {
-              "type": "string"
-            },
             "type": [
               "array",
               "null"
-            ]
+            ],
+            "items": {
+              "type": "string"
+            }
           }
-        },
-        "required": [
-          "file"
-        ],
-        "type": "object"
+        }
       },
       "TranscriptionResponse": {
-        "properties": {
-          "service_tier": {
-            "description": "The tier that served the request (`flex` or `default`), when the\nrequest named one.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "text": {
-            "type": "string"
-          }
-        },
+        "type": "object",
         "required": [
           "text"
         ],
-        "type": "object"
-      },
-      "TranscriptionTimestampSegment": {
         "properties": {
-          "end": {
-            "format": "float",
-            "type": "number"
-          },
-          "id": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "start": {
-            "format": "float",
-            "type": "number"
+          "service_tier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The tier that served the request (`flex` or `default`), when the\nrequest named one."
           },
           "text": {
             "type": "string"
           }
-        },
+        }
+      },
+      "TranscriptionTimestampSegment": {
+        "type": "object",
         "required": [
           "id",
           "start",
           "end",
           "text"
         ],
-        "type": "object"
-      },
-      "TranscriptionTimestampWord": {
         "properties": {
           "end": {
-            "format": "float",
-            "type": "number"
+            "type": "number",
+            "format": "float"
+          },
+          "id": {
+            "type": "integer",
+            "minimum": 0
           },
           "start": {
-            "format": "float",
-            "type": "number"
+            "type": "number",
+            "format": "float"
           },
-          "word": {
+          "text": {
             "type": "string"
           }
-        },
+        }
+      },
+      "TranscriptionTimestampWord": {
+        "type": "object",
         "required": [
           "word",
           "start",
           "end"
         ],
-        "type": "object"
+        "properties": {
+          "end": {
+            "type": "number",
+            "format": "float"
+          },
+          "start": {
+            "type": "number",
+            "format": "float"
+          },
+          "word": {
+            "type": "string"
+          }
+        }
       },
       "Usage": {
-        "properties": {
-          "completion_tokens": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "prompt_tokens": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "prompt_tokens_details": {
-            "$ref": "#/components/schemas/PromptTokensDetails"
-          },
-          "total_tokens": {
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
+        "type": "object",
         "required": [
           "prompt_tokens",
           "completion_tokens",
           "total_tokens",
           "prompt_tokens_details"
         ],
-        "type": "object"
+        "properties": {
+          "completion_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "prompt_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "prompt_tokens_details": {
+            "$ref": "#/components/schemas/PromptTokensDetails"
+          },
+          "total_tokens": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
       },
       "VerboseAlignmentResponse": {
+        "type": "object",
+        "required": [
+          "alignments",
+          "duration",
+          "word_count",
+          "processing_time_ms",
+          "alignment_source",
+          "warnings",
+          "alignment_windows"
+        ],
         "properties": {
           "alignment_source": {
-            "example": "model",
-            "type": "string"
+            "type": "string",
+            "example": "model"
           },
           "alignment_windows": {
+            "type": "integer",
             "description": "Aligner windows the audio was split into (each at most the aligner's\naudio limit).",
-            "minimum": 0,
-            "type": "integer"
+            "minimum": 0
           },
           "alignments": {
+            "type": "array",
             "items": {
               "$ref": "#/components/schemas/AlignmentWord"
-            },
-            "type": "array"
+            }
           },
           "duration": {
-            "description": "Duration of the aligned audio in seconds.",
+            "type": "number",
             "format": "float",
-            "type": "number"
+            "description": "Duration of the aligned audio in seconds."
           },
           "language": {
             "type": [
@@ -2803,36 +3867,32 @@
             ]
           },
           "processing_time_ms": {
-            "format": "double",
-            "type": "number"
+            "type": "number",
+            "format": "double"
           },
           "warnings": {
+            "type": "array",
             "items": {
               "type": "string"
-            },
-            "type": "array"
+            }
           },
           "word_count": {
-            "minimum": 0,
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           }
-        },
-        "required": [
-          "alignments",
-          "duration",
-          "word_count",
-          "processing_time_ms",
-          "alignment_source",
-          "warnings",
-          "alignment_windows"
-        ],
-        "type": "object"
+        }
       },
       "VerboseTranscriptionResponse": {
+        "type": "object",
+        "required": [
+          "text",
+          "duration",
+          "processing_time_ms"
+        ],
         "properties": {
           "duration": {
-            "format": "float",
-            "type": "number"
+            "type": "number",
+            "format": "float"
           },
           "izwi_asr_diagnostics": {
             "description": "ASR diagnostics. With word or segment timestamps it also carries\n`alignment_source` (model, heuristic or failed), `alignment_warnings`\nfor windows timed by interval fallback, or `alignment_error`."
@@ -2844,1140 +3904,112 @@
             ]
           },
           "processing_time_ms": {
-            "format": "double",
-            "type": "number"
+            "type": "number",
+            "format": "double"
           },
           "rtf": {
-            "format": "double",
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "format": "double"
           },
           "segments": {
-            "items": {
-              "$ref": "#/components/schemas/TranscriptionTimestampSegment"
-            },
             "type": [
               "array",
               "null"
-            ]
+            ],
+            "items": {
+              "$ref": "#/components/schemas/TranscriptionTimestampSegment"
+            }
           },
           "service_tier": {
-            "description": "The tier that served the request (`flex` or `default`), when the\nrequest named one.",
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "The tier that served the request (`flex` or `default`), when the\nrequest named one."
           },
           "speaker_turns": {
-            "description": "With `speaker_labels`: the model's speaker turns (`speaker` is its\ntag, null before the first; `start` and `end` when it timed them).",
-            "items": {},
             "type": [
               "array",
               "null"
-            ]
+            ],
+            "items": {},
+            "description": "With `speaker_labels`: the model's speaker turns (`speaker` is its\ntag, null before the first; `start` and `end` when it timed them)."
           },
           "text": {
             "type": "string"
           },
           "words": {
-            "items": {
-              "$ref": "#/components/schemas/TranscriptionTimestampWord"
-            },
             "type": [
               "array",
               "null"
-            ]
+            ],
+            "items": {
+              "$ref": "#/components/schemas/TranscriptionTimestampWord"
+            }
           }
-        },
-        "required": [
-          "text",
-          "duration",
-          "processing_time_ms"
-        ],
-        "type": "object"
+        }
       }
     }
   },
-  "info": {
-    "description": "Local HTTP API for the Izwi runtime, OpenAI-compatible endpoints, and first-party workflow surfaces.",
-    "license": {
-      "identifier": "Apache-2.0",
-      "name": "Apache-2.0"
-    },
-    "title": "Izwi API",
-    "version": "0.1.2"
-  },
-  "openapi": "3.1.0",
-  "paths": {
-    "/docs": {
-      "get": {
-        "description": "Open the local Scalar API reference UI.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          }
-        },
-        "summary": "Get API reference",
-        "tags": [
-          "Reference"
-        ]
-      }
-    },
-    "/docs/scalar.js": {
-      "get": {
-        "description": "Fetch the bundled Scalar API reference JavaScript asset.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          }
-        },
-        "summary": "Get Scalar JavaScript",
-        "tags": [
-          "Reference"
-        ]
-      }
-    },
-    "/livez": {
-      "get": {
-        "operationId": "livez",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LiveResponse"
-                }
-              }
-            },
-            "description": "Server process is alive"
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LiveResponse"
-                }
-              }
-            },
-            "description": "Inference runtime failed permanently; restart the process"
-          }
-        },
-        "summary": "Check liveness",
-        "tags": [
-          "Runtime"
-        ]
-      }
-    },
-    "/openapi.json": {
-      "get": {
-        "description": "Fetch the generated OpenAPI document for the local server.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          }
-        },
-        "summary": "Get OpenAPI document",
-        "tags": [
-          "Reference"
-        ]
-      }
-    },
-    "/readyz": {
-      "get": {
-        "operationId": "readyz",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ReadyResponse"
-                }
-              }
-            },
-            "description": "Server is ready to serve requests"
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ReadyResponse"
-                }
-              }
-            },
-            "description": "Server is alive but not ready"
-          }
-        },
-        "summary": "Check readiness",
-        "tags": [
-          "Runtime"
-        ]
-      }
-    },
-    "/v1/audio/consent_phrases": {
-      "get": {
-        "description": "What a verified consent recording says, per language.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "List consent phrases",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/audio/speech": {
-      "post": {
-        "operationId": "create_speech",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SpeechRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Encoded audio (Content-Type per response_format; a chunked body for stream_format audio), or server-sent audio events for stream_format sse. X-Izwi-Speech-Id names the request for GET /v1/audio/speech/{speech_id}; X-Izwi-Service-Tier names the tier that served it."
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorEnvelope"
-                }
-              }
-            },
-            "description": "Invalid request"
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorEnvelope"
-                }
-              }
-            },
-            "description": "No admission slot became free within IZWI_ADMISSION_QUEUE_TIMEOUT_SECS (Retry-After says when to retry): code rate_limit_exceeded, or resource_unavailable for a flex request."
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorEnvelope"
-                }
-              }
-            },
-            "description": "Server error"
-          }
-        },
-        "summary": "Create speech",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/audio/speech/batch": {
-      "post": {
-        "description": "Up to IZWI_TTS_BATCH_MAX_ITEMS speech requests: top-level fields are defaults each of `items` overrides. Returns `{id, object, results[], total, succeeded, failed}`; each result carries base64 `audio_data` or an OpenAI `error` object, and an `id` for `GET /v1/audio/speech/{speech_id}`. A top-level `service_tier` (or the X-Izwi-Service-Tier header) applies to every item: they run as batch work (`flex`) unless it is `default`, `auto` or `priority`. The response names the tier served in X-Izwi-Service-Tier, and in `service_tier` when the request named one.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Create speech in a batch",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/audio/speech/stream": {
-      "get": {
-        "description": "Text in, audio out: `session.config`, then `input.text` as text arrives, `input.commit` to speak what is buffered, `input.done` to end the utterance, `input.cancel`, `session.close`. Audio arrives per segment between `audio.start` and `audio.done`. `?dialect=sglang-omni|vllm-omni` serves those stacks' clients.",
-        "responses": {
-          "101": {
-            "description": "WebSocket upgrade"
-          },
-          "400": {
-            "description": "Invalid WebSocket request"
-          }
-        },
-        "summary": "Open the text-in speech WebSocket",
-        "tags": [
-          "Realtime"
-        ]
-      }
-    },
-    "/v1/audio/speech/{speech_id}": {
-      "get": {
-        "description": "Status, finish reason, usage, audio duration and timings of a /v1/audio/speech request (any delivery), by its `X-Izwi-Speech-Id`. Process-local and bounded (IZWI_SPEECH_OUTCOME_CAPACITY, IZWI_SPEECH_OUTCOME_TTL_SECS); no audio is kept.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Get a speech request's outcome",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/audio/transcriptions": {
-      "post": {
-        "operationId": "create_transcription",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TranscriptionJsonRequest"
-              }
-            },
-            "multipart/form-data": {
-              "schema": {
-                "$ref": "#/components/schemas/TranscriptionMultipartRequest"
-              }
-            }
-          },
-          "description": "Transcription input. Send application/json with audio_base64, or multipart/form-data with an audio file or audio_base64 field.",
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TranscriptionResponse"
-                }
-              }
-            },
-            "description": "Transcription result as JSON, verbose JSON, text, SRT, VTT, or server-sent events. X-Izwi-Service-Tier names the tier that served it."
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorEnvelope"
-                }
-              }
-            },
-            "description": "Invalid request"
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorEnvelope"
-                }
-              }
-            },
-            "description": "No admission slot became free within IZWI_ADMISSION_QUEUE_TIMEOUT_SECS (Retry-After says when to retry): code rate_limit_exceeded, or resource_unavailable for a flex request."
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorEnvelope"
-                }
-              }
-            },
-            "description": "Server error"
-          }
-        },
-        "summary": "Create transcription",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/audio/translations": {
-      "post": {
-        "description": "OpenAI's translation route: multipart `file`, `model` (a model that translates speech: Granite Speech 5.0, Nemotron 3.5 Transcribe), `prompt`, `response_format` (json, text, srt, verbose_json, vtt), `temperature`. The target is English unless `to_language` / `target_language` names another; `language` hints the source; `stream` gives `transcript.text.*` events. `service_tier` (or the X-Izwi-Service-Tier header) works as on transcriptions.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Create translation",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/audio/voice_consents": {
-      "get": {
-        "description": "Consent recordings, newest first; `after` and `limit` (1 to 100) page them.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "List voice consents",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      },
-      "post": {
-        "description": "Multipart `name`, `recording` (at most 10 MiB) and `language` (BCP 47). Under IZWI_VOICE_CONSENT_MODE=verified the recording must say a consent phrase (GET /v1/audio/consent_phrases).",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Create a voice consent",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/audio/voice_consents/{consent_id}": {
-      "delete": {
-        "description": "Deletes the recording and revokes every voice made with it.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Delete a voice consent",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      },
-      "get": {
-        "description": "A consent recording's metadata and verification.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Get a voice consent",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      },
-      "post": {
-        "description": "JSON `{\"name\"}`.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Update a voice consent",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/audio/voices": {
-      "get": {
-        "description": "Every saved voice, as OpenAI `audio.voice` objects in `data` and SGLang-Omni's `voices`/`uploaded_voices`.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "List voices",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      },
-      "post": {
-        "description": "Multipart `name`, `audio_sample` (at most 10 MiB) and `consent` (a consent id from /v1/audio/voice_consents, or an attestation, per IZWI_VOICE_CONSENT_MODE); optional `ref_text`, `reference_language`. Speak it with `voice: {\"id\": ...}`.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Create a voice",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/audio/voices/{voice_id}": {
-      "delete": {
-        "description": "Deletes a voice by id (OpenAI) or by name (SGLang-Omni, vLLM-Omni).",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Delete a voice",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      },
-      "get": {
-        "description": "A voice by id or by name.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Get a voice",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/batches": {
-      "get": {
-        "description": "The caller's batches, newest first; `after` and `limit` (1 to 100) page them.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "List batches",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      },
-      "post": {
-        "description": "JSON `input_file_id` (a JSONL file of purpose `batch`), `endpoint` (/v1/audio/transcriptions, /v1/audio/translations or /v1/audio/speech), `completion_window` (`24h`) and optional `metadata`. Each line is OpenAI's `{custom_id, method, url, body}`; a transcription or translation body names its audio by `file_id` or `audio_base64`. Lines run as batch work; at most IZWI_BATCH_MAX_REQUESTS (50000) per file. With `metadata.webhook_url`, a signed `batch.completed`, `batch.failed`, `batch.cancelled` or `batch.expired` event is posted there when the batch ends; refused with 400 unless the operator set IZWI_BATCH_WEBHOOK_SECRET.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Create batch",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/batches/{batch_id}": {
-      "get": {
-        "description": "The batch: status, `request_counts`, and `output_file_id` and `error_file_id` once it has ended. A speech line's response body is `{audio_file_id, format, bytes}`.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Get batch",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/batches/{batch_id}/cancel": {
-      "post": {
-        "description": "Stops a batch that is validating or in progress: `cancelling`, then `cancelled` with the results of the lines that finished. A batch that has ended is a 409.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Cancel batch",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/chat/completions": {
-      "post": {
-        "operationId": "create_chat_completion",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ChatCompletionRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ChatCompletionResponse"
-                }
-              }
-            },
-            "description": "Chat completion JSON when stream is false; server-sent events when stream is true"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorEnvelope"
-                }
-              }
-            },
-            "description": "Invalid request"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorEnvelope"
-                }
-              }
-            },
-            "description": "Server error"
-          }
-        },
-        "summary": "Create chat completion",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/files": {
-      "get": {
-        "description": "The caller's files, newest first; `purpose`, `limit` (1 to 10000), `after` and `order` (`asc` or `desc`) filter and page them.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "List files",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      },
-      "post": {
-        "description": "Multipart `file` and `purpose`: `batch` (a batch's JSONL input) or `user_data` (audio a batch line names by `file_id`). At most IZWI_FILES_MAX_BYTES (200 MB); larger is 413.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Create file",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/files/{file_id}": {
-      "delete": {
-        "description": "Deletes the file and its content.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Delete file",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      },
-      "get": {
-        "description": "A file's metadata. `batch_output` files carry `expires_at`, 30 days after creation.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Get file",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/files/{file_id}/content": {
-      "get": {
-        "description": "The file's bytes.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Download file content",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/jobs/{job_id}": {
-      "get": {
-        "description": "Fetch a durable runtime job trace with stages and artifacts.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          }
-        },
-        "summary": "Get runtime job",
-        "tags": [
-          "Jobs"
-        ]
-      }
-    },
-    "/v1/jobs/{job_id}/artifacts": {
-      "get": {
-        "description": "List durable artifacts produced or consumed by a runtime job.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          }
-        },
-        "summary": "List runtime job artifacts",
-        "tags": [
-          "Jobs"
-        ]
-      }
-    },
-    "/v1/jobs/{job_id}/cancel": {
-      "post": {
-        "description": "Cancel a queued or running durable runtime job.",
-        "responses": {
-          "200": {
-            "description": "Runtime job cancelled"
-          },
-          "400": {
-            "description": "Job is not cancellable"
-          },
-          "404": {
-            "description": "Job not found"
-          }
-        },
-        "summary": "Cancel runtime job",
-        "tags": [
-          "Jobs"
-        ]
-      }
-    },
-    "/v1/jobs/{job_id}/retry": {
-      "post": {
-        "description": "Requeue failed, cancelled, or expired runtime job stages.",
-        "responses": {
-          "200": {
-            "description": "Runtime job retried"
-          },
-          "400": {
-            "description": "Job is not retryable"
-          },
-          "404": {
-            "description": "Job not found"
-          }
-        },
-        "summary": "Rerun runtime job",
-        "tags": [
-          "Jobs"
-        ]
-      }
-    },
-    "/v1/models": {
-      "get": {
-        "operationId": "list_models",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/OpenAiModelsResponse"
-                }
-              }
-            },
-            "description": "List locally available OpenAI-compatible models"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorEnvelope"
-                }
-              }
-            },
-            "description": "Server error"
-          }
-        },
-        "summary": "List models",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/models/{model}": {
-      "get": {
-        "operationId": "get_model",
-        "parameters": [
-          {
-            "description": "Model identifier",
-            "in": "path",
-            "name": "model",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/OpenAiModel"
-                }
-              }
-            },
-            "description": "Retrieve a locally available OpenAI-compatible model"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorEnvelope"
-                }
-              }
-            },
-            "description": "Unknown or unavailable model (`model_not_found`)"
-          }
-        },
-        "summary": "Get model",
-        "tags": [
-          "OpenAI Compatible"
-        ]
-      }
-    },
-    "/v1/realtime": {
-      "get": {
-        "description": "Upgrade to an OpenAI Realtime (GA) session: JSON events with base64 24 kHz PCM16 or G.711 audio. `?model=` selects a realtime profile (a modular ASR, chat and TTS stack, or a speech-to-speech model); OpenAI model names select the default profile. `?intent=transcription` opens a transcription session.",
-        "responses": {
-          "101": {
-            "description": "WebSocket upgrade"
-          },
-          "400": {
-            "description": "Invalid WebSocket request"
-          }
-        },
-        "summary": "Open OpenAI Realtime WebSocket",
-        "tags": [
-          "Realtime"
-        ]
-      }
-    },
-    "/v1/realtime/capabilities": {
-      "get": {
-        "description": "The realtime profiles `model` may name, the transcription models and whether each transcribes a turn while it is spoken (`transcription_mode`: `live` or `turn`), the voices, audio formats and turn detection types, and the session limits.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "List realtime capabilities",
-        "tags": [
-          "Realtime"
-        ]
-      }
-    },
-    "/v1/realtime/client_secrets": {
-      "post": {
-        "description": "Mint an ephemeral `ek_` key, bound to a session config, that admits `/v1/realtime` for 10 seconds to 2 hours (default 10 minutes). Browsers present it as the `openai-insecure-api-key.<key>` WebSocket subprotocol.",
-        "responses": {
-          "200": {
-            "description": "OK"
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "500": {
-            "description": "Server error"
-          }
-        },
-        "summary": "Create a realtime client secret",
-        "tags": [
-          "Realtime"
-        ]
-      }
-    },
-    "/v1/realtime/media-stream": {
-      "get": {
-        "description": "Upgrade to a phone call in the media-stream framing of call-centre platforms and carrier APIs: JSON text frames (`connected`, `start`, `media`, `mark`, `dtmf`, `stop`) with base64 8 kHz μ-law audio. The call runs as a `/v1/realtime` session. `?model=` and `?intent=transcription` select it as on `/v1/realtime`; `voice`, `instructions`, `language`, `transcription_model` and `transcripts` configure it, in the query string or the `start` frame's `customParameters`.",
-        "responses": {
-          "101": {
-            "description": "WebSocket upgrade"
-          },
-          "400": {
-            "description": "Invalid WebSocket request"
-          }
-        },
-        "summary": "Open a telephony media-stream WebSocket",
-        "tags": [
-          "Realtime"
-        ]
-      }
-    }
-  },
-  "servers": [
-    {
-      "description": "Local Izwi server",
-      "url": "/"
-    }
-  ],
   "tags": [
     {
-      "description": "Runtime health, readiness, and operational probes",
-      "name": "Runtime"
+      "name": "Runtime",
+      "description": "Runtime health, readiness, and operational probes"
     },
     {
-      "description": "OpenAI-compatible API surface, including preview compatibility routes",
-      "name": "OpenAI Compatible"
+      "name": "OpenAI Compatible",
+      "description": "OpenAI-compatible API surface, including preview compatibility routes"
     },
     {
-      "description": "Local administrative API surface",
-      "name": "Admin"
+      "name": "Admin",
+      "description": "Local administrative API surface"
     },
     {
-      "description": "Preview persisted transcription workflows",
-      "name": "Speech to Text"
+      "name": "Speech to Text",
+      "description": "Preview persisted transcription workflows"
     },
     {
-      "description": "Durable batch runtime job management",
-      "name": "Jobs"
+      "name": "Jobs",
+      "description": "Durable batch runtime job management"
     },
     {
-      "description": "Preview speaker diarization and speaker-labeling workflows",
-      "name": "Diarization"
+      "name": "Diarization",
+      "description": "Preview speaker diarization and speaker-labeling workflows"
     },
     {
-      "description": "Preview persisted speech generation and saved voice workflows",
-      "name": "Text to Speech"
+      "name": "Text to Speech",
+      "description": "Preview persisted speech generation and saved voice workflows"
     },
     {
-      "description": "Preview Studio project workflow APIs",
-      "name": "Studio"
+      "name": "Studio",
+      "description": "Preview Studio project workflow APIs"
     },
     {
-      "description": "Preview chat thread and agent session APIs",
-      "name": "Chat"
+      "name": "Chat",
+      "description": "Preview chat thread and agent session APIs"
     },
     {
-      "description": "Preview voice profile, memory, and session APIs",
-      "name": "Voice"
+      "name": "Voice",
+      "description": "Preview voice profile, memory, and session APIs"
     },
     {
-      "description": "Preview local media serving APIs",
-      "name": "Media"
+      "name": "Media",
+      "description": "Preview local media serving APIs"
     },
     {
-      "description": "Preview onboarding and user preference APIs",
-      "name": "Preferences"
+      "name": "Preferences",
+      "description": "Preview onboarding and user preference APIs"
     },
     {
-      "description": "Preview WebSocket realtime APIs",
-      "name": "Realtime"
+      "name": "Realtime",
+      "description": "Preview WebSocket realtime APIs"
     },
     {
-      "description": "Local API reference and OpenAPI document routes",
-      "name": "Reference"
+      "name": "Reference",
+      "description": "Local API reference and OpenAPI document routes"
     }
   ]
 }

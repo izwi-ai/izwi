@@ -1,6 +1,7 @@
 use super::*;
 use crate::api::openai::chat::stream::openai_chat_stream_interruption_payload;
 use crate::api::openai::convert::{InboundContent, InboundContentPart};
+use crate::api::openai::tool_calls::ToolCallFormat;
 use crate::app::chat::ChatStreamEvent;
 use crate::error::ErrorScope;
 use axum::http::StatusCode;
@@ -121,7 +122,7 @@ pub(super) fn tool_format(tool_calls: Option<ToolCallFormat>) -> AnswerFormat {
         compat_profile: OpenAiCompatibilityProfile::Strict,
         parse_reasoning: false,
         reasoning_opened_in_prompt: false,
-        tool_calls,
+        tool_calls: tool_calls.map(|dialect| std::sync::Arc::new(ToolPlan::from(dialect))),
     }
 }
 
@@ -136,7 +137,7 @@ async fn unparsed_stream_writes_back_the_opener_the_prompt_held() {
     };
     let body = json!({"model": "m", "messages": [], "stream": true});
     for size in [1, 3, text.len()] {
-        let payloads = sse_payloads(body.clone(), format, deltas(text, size)).await;
+        let payloads = sse_payloads(body.clone(), format.clone(), deltas(text, size)).await;
         let (content, _, _) = read_stream(&payloads);
         assert_eq!(content, "<think>r</think>\n\nA", "split {size}");
     }
@@ -265,6 +266,7 @@ fn tool_results_must_answer_a_call_of_the_preceding_turn() {
         content: Some(InboundContent::Text("x".to_string())),
         tool_calls,
         tool_call_id: tool_call_id.map(str::to_owned),
+        reasoning_content: None,
         additional_tools: None,
     };
     let call = Some(vec![json!({
@@ -293,6 +295,7 @@ fn lfm25_tool_turns_use_the_lfm_wire_format() {
         content: Some(InboundContent::Text(content.to_string())),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
         additional_tools: None,
     };
     let messages = vec![
@@ -306,6 +309,7 @@ fn lfm25_tool_turns_use_the_lfm_wire_format() {
                 "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
             })]),
             tool_call_id: None,
+            reasoning_content: None,
             additional_tools: None,
         },
         text("tool", "{\"temperature_c\": 21}"),
@@ -320,11 +324,20 @@ fn lfm25_tool_turns_use_the_lfm_wire_format() {
     assert_eq!(lfm[2].role, ChatRole::Tool);
     assert_eq!(lfm[2].content, "{\"temperature_c\": 21}");
 
-    // Other families keep the Qwen tool format.
-    let (qwen, _) = to_core_messages_with_media(ModelVariant::Qwen314BGguf, messages, &[]).unwrap();
-    assert!(qwen[1].content.contains("<function=get_weather>"));
-    assert_eq!(qwen[2].role, ChatRole::User);
-    assert!(qwen[2].content.starts_with("<tool_response>"));
+    // Qwen3 reads Hermes JSON calls, Qwen3.5 the XML form; both get the
+    // result as a tool message their prompt builder wraps.
+    let (qwen3, _) =
+        to_core_messages_with_media(ModelVariant::Qwen314BGguf, messages.clone(), &[]).unwrap();
+    assert!(qwen3[1].content.contains("{\"name\": \"get_weather\""));
+    assert_eq!(qwen3[2].role, ChatRole::Tool);
+    let (qwen35, _) =
+        to_core_messages_with_media(ModelVariant::Qwen359BGguf, messages.clone(), &[]).unwrap();
+    assert!(qwen35[1].content.contains("<function=get_weather>"));
+    assert_eq!(qwen35[2].role, ChatRole::Tool);
+    // A family without a tool template reads the result as a user turn.
+    let (gemma, _) = to_core_messages_with_media(ModelVariant::Gemma34BIt, messages, &[]).unwrap();
+    assert_eq!(gemma[2].role, ChatRole::User);
+    assert!(gemma[2].content.starts_with("<tool_response>"));
 }
 
 #[test]
@@ -347,6 +360,7 @@ fn to_core_messages_collects_multimodal_parts() {
             }])),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             additional_tools: None,
         }],
         &[],
@@ -372,6 +386,7 @@ fn validates_rejects_non_zero_frequency_penalty() {
             content: Some(InboundContent::Text("hello".to_string())),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             additional_tools: None,
         }],
         max_tokens: None,
@@ -392,6 +407,7 @@ fn validates_rejects_non_zero_frequency_penalty() {
         stop: None,
         tools: None,
         tool_choice: None,
+        parallel_tool_calls: None,
         enable_thinking: None,
         reasoning_effort: None,
         preserve_thinking: None,
@@ -418,6 +434,7 @@ fn strict_profile_accepts_stop_sequences() {
             content: Some(InboundContent::Text("hello".to_string())),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             additional_tools: None,
         }],
         max_tokens: None,
@@ -438,6 +455,7 @@ fn strict_profile_accepts_stop_sequences() {
         stop: Some(json!(["END"])),
         tools: None,
         tool_choice: None,
+        parallel_tool_calls: None,
         enable_thinking: None,
         reasoning_effort: None,
         preserve_thinking: None,
@@ -488,6 +506,7 @@ fn relaxed_profile_allows_stop_and_frequency_penalty_passthrough() {
             content: Some(InboundContent::Text("hello".to_string())),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             additional_tools: None,
         }],
         max_tokens: None,
@@ -508,6 +527,7 @@ fn relaxed_profile_allows_stop_and_frequency_penalty_passthrough() {
         stop: Some(json!(["END"])),
         tools: None,
         tool_choice: None,
+        parallel_tool_calls: None,
         enable_thinking: None,
         reasoning_effort: None,
         preserve_thinking: None,
@@ -573,6 +593,58 @@ fn chat_request(
     let ctx = RequestContext::new("audio".into(), izwi_hooks::Principal::local_anonymous());
     validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)?;
     prepare_execution_request(&req, &ctx, OpenAiCompatibilityProfile::Strict)
+}
+
+/// A forced tool call: the prompt opens the call, thinking is off for the
+/// turn, and the answer the model continues parses as that call.
+#[tokio::test]
+async fn a_forced_tool_call_is_opened_in_the_prompt_and_parsed_from_it() {
+    let tools = json!([
+        {"type": "function", "function": {"name": "get_weather", "strict": false,
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}},
+        {"type": "function", "function": {"name": "get_time"}}
+    ]);
+    let body = |choice: serde_json::Value, parallel: bool| {
+        json!({"messages": [{"role": "user", "content": "Harare"}], "tools": tools,
+               "tool_choice": choice, "parallel_tool_calls": parallel,
+               "reasoning_format": "parsed", "stop": ["END"]})
+    };
+    let named = json!({"type": "function", "function": {"name": "get_weather"}});
+    let (request, format) = chat_request(body(named, true)).unwrap();
+    assert_eq!(
+        request.chat_config.response_prefix,
+        "<tool_call>\n<function=get_weather>\n"
+    );
+    // A named function is one call: generation ends at its close tag.
+    assert_eq!(request.stop, ["END", "</tool_call>"]);
+    assert!(!format.reasoning_opened_in_prompt);
+    let response = render_completion_response(
+        request.variant,
+        generation("<parameter=city>\n4521\n</parameter>\n</function>\n</tool_call>"),
+        format,
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let call = &parsed["choices"][0]["message"]["tool_calls"][0]["function"];
+    assert_eq!(call["name"], "get_weather");
+    // The string parameter keeps its digits as text.
+    assert_eq!(call["arguments"], "{\"city\":\"4521\"}");
+    assert_eq!(parsed["choices"][0]["finish_reason"], "tool_calls");
+
+    // "required" opens a call and leaves the name to the model; one call at
+    // most ends generation at the call's close tag.
+    let (request, _) = chat_request(body(json!("required"), false)).unwrap();
+    assert_eq!(
+        request.chat_config.response_prefix,
+        "<tool_call>\n<function="
+    );
+    assert_eq!(request.stop, ["END", "</tool_call>"]);
+    // Unforced, the prompt is the model's own.
+    let (request, format) = chat_request(body(json!("auto"), true)).unwrap();
+    assert!(request.chat_config.response_prefix.is_empty());
+    assert!(format.reasoning_opened_in_prompt);
 }
 
 fn clip(format: &str) -> serde_json::Value {

@@ -433,7 +433,7 @@ impl ChatRuntimeRequest {
         let mut request = EngineCoreRequest::chat(self.messages);
         self.envelope.apply_to(&mut request);
         request.params = self.params;
-        request.chat_config = self.chat_config;
+        request.chat_config = Box::new(self.chat_config);
         request.prompt_tokens = self.prompt_tokens;
         request
     }

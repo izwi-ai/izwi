@@ -1,12 +1,13 @@
-//! Tool definitions as the LFM chat templates print them: Python's
-//! `json.dumps` spacing (the templates' `tojson`), and the deferred tools
+//! JSON as chat templates print it: Python's `json.dumps` spacing (the
+//! templates' `tojson`) in the client's key order, and the deferred tools
 //! (`defer_loading`) a template keeps out of the system turn's `<tools>`.
 
 use serde_json::Value;
 
 /// Serialize like Python's `json.dumps(value, ensure_ascii=False)`, which a
 /// chat template's `tojson` uses: `", "` and `": "` separators, non-ASCII
-/// kept. Object keys follow `serde_json`'s (sorted) map order.
+/// kept. Object keys keep the order the client sent them in (`serde_json`
+/// is built with `preserve_order`), as `tojson` keeps a dict's.
 pub fn write_python_json(value: &Value, out: &mut String) {
     match value {
         Value::Array(items) => {
@@ -93,7 +94,7 @@ mod tests {
     fn python_json_spaces_like_json_dumps_and_keeps_non_ascii() {
         assert_eq!(
             python_json(&json!({"b": [1, true, null], "a": "é"})),
-            r#"{"a": "é", "b": [1, true, null]}"#
+            r#"{"b": [1, true, null], "a": "é"}"#
         );
     }
 

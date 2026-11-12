@@ -518,7 +518,10 @@ mod tests {
         // A tool round's history already holds the spoken turn.
         let round = [
             message(ChatRole::User, CHAT_AUDIO_PLACEHOLDER),
-            message(ChatRole::Assistant, "<tool_call>[f()]</tool_call>"),
+            message(
+                ChatRole::Assistant,
+                "<tool_call>\n<function=f>\n</function>\n</tool_call>",
+            ),
             message(ChatRole::Tool, "21"),
         ];
         assert_eq!(voice_reply_messages(&round, None), round);
@@ -539,13 +542,16 @@ mod tests {
         let messages = [
             message(ChatRole::System, "Be brief."),
             message(ChatRole::User, "<|audio|>"),
-            message(ChatRole::Assistant, "<tool_call>[get_time()]</tool_call>"),
+            message(
+                ChatRole::Assistant,
+                "<tool_call>\n<function=get_time>\n</function>\n</tool_call>",
+            ),
             message(ChatRole::Tool, "12:00"),
             message(ChatRole::Tool, ""),
             message(ChatRole::Tool, "<tool_response>\nkept\n</tool_response>"),
         ];
         let turns = "<|im_start|>user\n[AUDIO]<|im_end|>\n\
-             <|im_start|>assistant\n<tool_call>[get_time()]</tool_call><|im_end|>\n\
+             <|im_start|>assistant\n<tool_call>\n<function=get_time>\n</function>\n</tool_call><|im_end|>\n\
              <|im_start|>tool\n<tool_response>\n12:00\n</tool_response><|im_end|>\n\
              <|im_start|>tool\n<|im_end|>\n\
              <|im_start|>tool\n<tool_response>\nkept\n</tool_response><|im_end|>\n\

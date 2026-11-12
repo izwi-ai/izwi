@@ -2414,8 +2414,13 @@ pub struct ChatCompletionRequest {
     pub truncation: Option<String>,
     /// vLLM extension: `false` keeps special tokens in the reply text.
     pub skip_special_tokens: Option<bool>,
+    /// OpenAI function tools. `strict: true` on a function holds its calls
+    /// to the declared names and parameter schema.
     pub tools: Option<Vec<serde_json::Value>>,
+    /// `"auto"` (default), `"none"`, `"required"`, or a named function.
     pub tool_choice: Option<serde_json::Value>,
+    /// `false` keeps the answer to one tool call.
+    pub parallel_tool_calls: Option<bool>,
     pub enable_thinking: Option<bool>,
     pub reasoning_effort: Option<ChatReasoningEffort>,
     pub preserve_thinking: Option<bool>,
@@ -2453,7 +2458,12 @@ pub struct ChatCompletionMessage {
     pub role: String,
     /// Text, or content parts: `text`, and images for Qwen3.5.
     pub content: Option<serde_json::Value>,
+    /// On an assistant message: the calls it made.
     pub tool_calls: Option<Vec<serde_json::Value>>,
+    /// On a tool message: the id of the call it answers.
+    pub tool_call_id: Option<String>,
+    /// On an assistant message: the reasoning a previous answer returned.
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2755,6 +2765,8 @@ pub struct ResponsesCreateRequest {
     pub store: Option<bool>,
     pub tools: Option<Vec<serde_json::Value>>,
     pub tool_choice: Option<serde_json::Value>,
+    /// `false` keeps the answer to one function call.
+    pub parallel_tool_calls: Option<bool>,
     pub enable_thinking: Option<bool>,
     pub reasoning_effort: Option<ChatReasoningEffort>,
     pub preserve_thinking: Option<bool>,

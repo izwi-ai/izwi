@@ -13,13 +13,12 @@
 //! request the model can also write the list as JSON objects
 //! (`[{"name": ..., "arguments": {...}}]`); the parser accepts both.
 
-pub(super) use izwi_model_catalog::chat::tools::write_python_json;
 use serde_json::{Map, Value};
 
-use crate::error::ApiError;
+use super::json::write_python_json;
 
-pub(super) const TOOL_CALL_START: &str = "<|tool_call_start|>";
-pub(super) const TOOL_CALL_END: &str = "<|tool_call_end|>";
+pub const TOOL_CALL_START: &str = "<|tool_call_start|>";
+pub const TOOL_CALL_END: &str = "<|tool_call_end|>";
 
 /// One parsed call: the function name and its arguments object.
 #[derive(Debug, Clone, PartialEq)]
@@ -29,16 +28,14 @@ pub(super) struct LfmToolCall {
 }
 
 /// Render OpenAI `tool_calls` as the LFM2.5 marker block.
-pub(super) fn render_tool_calls(tool_calls: &[Value]) -> Result<String, ApiError> {
+pub(super) fn render_tool_calls(tool_calls: &[Value]) -> Result<String, String> {
     let mut calls = Vec::with_capacity(tool_calls.len());
     for tool_call in tool_calls {
         let function = tool_call.get("function").unwrap_or(tool_call);
         let name = function
             .get("name")
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ApiError::bad_request("Each assistant tool call must include `function.name`")
-            })?;
+            .ok_or_else(|| "Each assistant tool call must include `function.name`".to_string())?;
         let arguments = call_arguments(function.get("arguments"))?;
         let rendered = arguments
             .iter()
@@ -55,8 +52,8 @@ pub(super) fn render_tool_calls(tool_calls: &[Value]) -> Result<String, ApiError
 
 /// OpenAI sends `arguments` as a JSON-encoded string; the template needs the
 /// mapping. Empty, `{}` and `null` mean no arguments.
-fn call_arguments(raw: Option<&Value>) -> Result<Map<String, Value>, ApiError> {
-    let invalid = || ApiError::bad_request("Tool call `arguments` must be a JSON object");
+fn call_arguments(raw: Option<&Value>) -> Result<Map<String, Value>, String> {
+    let invalid = || "Tool call `arguments` must be a JSON object".to_string();
     match raw {
         None | Some(Value::Null) => Ok(Map::new()),
         Some(Value::Object(map)) => Ok(map.clone()),
@@ -331,7 +328,7 @@ mod tests {
         assert_eq!(
             render_tool_calls(&calls).unwrap(),
             "<|tool_call_start|>[get_weather(city='Paris', days=2), \
-             flags(on=True, q='it\\'s\\nok', tags=[\"a\", \"b\"], x=None), now()]<|tool_call_end|>"
+             flags(on=True, tags=[\"a\", \"b\"], x=None, q='it\\'s\\nok'), now()]<|tool_call_end|>"
         );
         assert!(render_tool_calls(&[json!({"function": {"arguments": "{}"}})]).is_err());
         assert!(

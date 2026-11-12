@@ -12,12 +12,12 @@ use candle_core::quantized::gguf_file::Value as GgufValue;
 use candle_core::{DType, IndexOp, Tensor, D};
 use serde::Deserialize;
 
+#[cfg(any(feature = "cuda", feature = "metal"))]
+use crate::backends::kv::CandleAcceleratorKvArena;
+use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
 use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, TensorStateArena,
 };
-use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
-#[cfg(any(feature = "cuda", feature = "metal"))]
-use crate::backends::kv::CandleAcceleratorKvArena;
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::kv::v2::InferenceStateContract;
@@ -25,14 +25,15 @@ use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
 use crate::model::ModelVariant;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
-use crate::models::shared::speculative_sampling::{
-    propose_speculative_draft, verify_speculative_proposals, SpeculativeDraft,
-};
 use crate::models::shared::sampling::{
     bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
 };
+use crate::models::shared::speculative_sampling::{
+    propose_speculative_draft, verify_speculative_proposals, SpeculativeDraft,
+};
 use crate::models::shared::weights::gguf::GgufLoader;
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
+use izwi_model_catalog::chat::tools::{push_chatml_tool_response, qwen_xml_tools_prompt};
 
 use super::text::{Qwen36MoeFfnGeometry, Qwen36TextModel, Qwen36TextRuntimeState};
 
@@ -1107,9 +1108,8 @@ impl Qwen36ChatExec {
     /// event timing is available (CUDA) and the performance knob opted in;
     /// elsewhere the configured draft depth holds for the whole request.
     fn new_adaptive_mtp(&self) -> crate::models::architectures::qwen36moe::mtp::AdaptiveMtp {
-        let enabled = self.mtp_adaptive
-            && self.mtp_head.is_some()
-            && self.text_model.device().is_cuda();
+        let enabled =
+            self.mtp_adaptive && self.mtp_head.is_some() && self.text_model.device().is_cuda();
         crate::models::architectures::qwen36moe::mtp::AdaptiveMtp::new(
             enabled,
             self.mtp_head
@@ -1119,17 +1119,17 @@ impl Qwen36ChatExec {
         )
     }
 
-    /// DS9.2 grammar runtime for this request, or `None` when the request
-    /// did not ask for constrained decoding. Always-sampleable ids mirror
+    /// The grammar runtime for this request (DS9.2 JSON output, or
+    /// constrained tool calls), or `None` when the request asked for neither. Always-sampleable ids mirror
     /// `is_stop_token` so the decode loop can still finish inside the mask.
     fn grammar_runtime(
         &self,
         config: &ChatGenerationConfig,
     ) -> Option<crate::models::shared::sampling::GrammarRuntime> {
-        if !config.constrain_json_object {
+        if !crate::models::shared::sampling::GrammarRuntime::requested(config) {
             return None;
         }
-        Some(crate::models::shared::sampling::GrammarRuntime::new(
+        crate::models::shared::sampling::GrammarRuntime::for_request(
             std::sync::Arc::new(self.tokenizer.inner.clone()),
             [
                 Some(self.tokenizer.specials.im_end),
@@ -1139,7 +1139,8 @@ impl Qwen36ChatExec {
             .into_iter()
             .flatten()
             .collect(),
-        ))
+            config,
+        )
     }
 
     pub(crate) fn continue_resumable_prefill_physical(
@@ -1959,9 +1960,10 @@ impl Qwen36ChatExec {
         depth: usize,
     ) -> Result<DraftBlock> {
         let position = state.next_text_position;
-        let anchor = state.mtp_anchor_hidden.clone().ok_or_else(|| {
-            Error::InferenceError("Qwen3.5 MTP round has no anchor".into())
-        })?;
+        let anchor = state
+            .mtp_anchor_hidden
+            .clone()
+            .ok_or_else(|| Error::InferenceError("Qwen3.5 MTP round has no anchor".into()))?;
         let stochastic = state.config.temperature > 1e-5;
         let mut draft_history = if state.track_history {
             state.history_ids.clone()
@@ -1970,8 +1972,9 @@ impl Qwen36ChatExec {
         };
         let mut draft_proposals = Vec::with_capacity(depth);
 
-        let continuation_positions: Vec<[usize; 3]> =
-            (0..depth - 1).map(|offset| [position + offset; 3]).collect();
+        let continuation_positions: Vec<[usize; 3]> = (0..depth - 1)
+            .map(|offset| [position + offset; 3])
+            .collect();
         let mtp_cache = state
             .mtp_cache
             .as_mut()
@@ -1988,8 +1991,7 @@ impl Qwen36ChatExec {
             |logits| {
                 if !stochastic {
                     return crate::models::architectures::qwen36moe::mtp::greedy_argmax(
-                        logits,
-                        vocab_size,
+                        logits, vocab_size,
                     );
                 }
                 let mut values = logits_to_vec(&logits.i((0, 0))?)?;
@@ -2125,7 +2127,9 @@ impl Qwen36ChatExec {
         // attention keeps its already-written rows; they sit beyond the
         // truncated cursor and are rewritten by later steps.
         state.text_state.restore_linear_states(&snapshots[count])?;
-        state.physical_kv.truncate_verified_prefix(position + count)?;
+        state
+            .physical_kv
+            .truncate_verified_prefix(position + count)?;
 
         // Rebuild the draft state over the canonical commit: pair i = (embed
         // of kept[i] — the token at position+i+1 — , the target hidden at
@@ -2134,9 +2138,10 @@ impl Qwen36ChatExec {
             .mtp_cache
             .as_mut()
             .ok_or_else(|| Error::InferenceError("Qwen3.5 MTP cache lost".into()))?;
-        let mut anchor = state.mtp_anchor_hidden.clone().ok_or_else(|| {
-            Error::InferenceError("Qwen3.5 MTP anchor lost".into())
-        })?;
+        let mut anchor = state
+            .mtp_anchor_hidden
+            .clone()
+            .ok_or_else(|| Error::InferenceError("Qwen3.5 MTP anchor lost".into()))?;
         for (row, &token) in kept.iter().enumerate() {
             let embedding = self.text_model.embed_token_ids(&[token])?;
             anchor = head.forward_step(
@@ -2288,9 +2293,8 @@ impl Qwen36ChatExec {
                 // each pairing a row's post-norm hidden with its successor's
                 // embedding. The pending token supplies the final successor
                 // without being forwarded to the target cache.
-                let pair_rows: Vec<usize> = (start..end)
-                    .filter(|&index| index >= prompt_len)
-                    .collect();
+                let pair_rows: Vec<usize> =
+                    (start..end).filter(|&index| index >= prompt_len).collect();
                 let count = pair_rows.len();
                 if count > 0 {
                     let successors = pair_rows
@@ -2307,9 +2311,13 @@ impl Qwen36ChatExec {
                     // Pair rows are the chunk's trailing decode rows; their
                     // hiddens start at the first pair row's span offset.
                     let hidden_offset = pair_rows[0] - span_start;
-                    let predecessors = self.text_model.normalize_hidden(
-                        &output.hidden_states.narrow(1, hidden_offset, count)?,
-                    )?;
+                    let predecessors =
+                        self.text_model
+                            .normalize_hidden(&output.hidden_states.narrow(
+                                1,
+                                hidden_offset,
+                                count,
+                            )?)?;
                     let mut last_hidden = None;
                     for (row, &index) in pair_rows.iter().enumerate() {
                         let hidden = head.forward_step(
@@ -2389,19 +2397,16 @@ impl Qwen36ChatExec {
         // same pool (the managed-domain split does this); the batched draft
         // advance needs it, standalone per-session arenas advance in turn.
         let shared_mtp_arena = active.iter().all(|&row| {
-            states[row]
-                .mtp_cache
-                .as_ref()
-                .is_some_and(|cache| {
-                    std::sync::Arc::ptr_eq(
-                        cache.arena(),
-                        states[active[0]]
-                            .mtp_cache
-                            .as_ref()
-                            .expect("eligibility checked mtp cache")
-                            .arena(),
-                    )
-                })
+            states[row].mtp_cache.as_ref().is_some_and(|cache| {
+                std::sync::Arc::ptr_eq(
+                    cache.arena(),
+                    states[active[0]]
+                        .mtp_cache
+                        .as_ref()
+                        .expect("eligibility checked mtp cache")
+                        .arena(),
+                )
+            })
         });
 
         while !active.is_empty() {
@@ -2504,9 +2509,9 @@ impl Qwen36ChatExec {
                 let mut tokens_step = Vec::with_capacity(drafting.len());
                 for &position in &drafting {
                     let row = active[position];
-                    let logits =
-                        self.text_model
-                            .project_with_shared_lm_head(&currents[position])?;
+                    let logits = self
+                        .text_model
+                        .project_with_shared_lm_head(&currents[position])?;
                     let mut values = logits_to_vec(&logits.i((0, 0))?)?;
                     truncate_logits_to_vocab(&mut values, self.tokenizer.vocab_size);
                     if !values.iter().any(|value| value.is_finite()) {
@@ -2752,13 +2757,7 @@ fn render_prompt(
 
     if !config.request.tools.is_empty() {
         prompt.push_str("<|im_start|>system\n");
-        prompt.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>");
-        for tool in &config.request.tools {
-            prompt.push('\n');
-            prompt.push_str(&serde_json::to_string(tool)?);
-        }
-        prompt.push_str("\n</tools>");
-        prompt.push_str(TOOL_PROMPT_SUFFIX);
+        prompt.push_str(&qwen_xml_tools_prompt(&config.request.tools));
         if !system_content.is_empty() {
             prompt.push_str("\n\n");
             prompt.push_str(system_content);
@@ -2787,12 +2786,16 @@ fn render_prompt(
                 prompt.push_str(message.content.trim());
                 prompt.push_str("<|im_end|>\n");
             }
-            // The template's tool turn: a user turn wrapping the result.
-            ChatRole::Tool => {
-                prompt.push_str("<|im_start|>user\n<tool_response>\n");
-                prompt.push_str(message.content.trim());
-                prompt.push_str("\n</tool_response><|im_end|>\n");
-            }
+            // The template's tool turn: consecutive results share one user
+            // turn, each in its own `<tool_response>` block.
+            ChatRole::Tool => push_chatml_tool_response(
+                &mut prompt,
+                message.content.trim(),
+                index > 0 && messages[index - 1].role == ChatRole::Tool,
+                messages
+                    .get(index + 1)
+                    .is_some_and(|next| next.role == ChatRole::Tool),
+            ),
             ChatRole::Assistant => {
                 let (reasoning_content, content) = split_assistant_reasoning(&message.content);
                 prompt.push_str("<|im_start|>assistant\n");
@@ -2811,15 +2814,20 @@ fn render_prompt(
     }
 
     prompt.push_str("<|im_start|>assistant\n");
-    if config
-        .request
-        .enable_thinking
-        .unwrap_or(default_enable_thinking)
+    // A forced tool call starts the turn itself, so the model does not
+    // think first.
+    let forced = !config.request.response_prefix.is_empty();
+    if !forced
+        && config
+            .request
+            .enable_thinking
+            .unwrap_or(default_enable_thinking)
     {
         prompt.push_str("<think>\n");
     } else {
         prompt.push_str("<think>\n\n</think>\n\n");
     }
+    prompt.push_str(&config.request.response_prefix);
     Ok(prompt)
 }
 
@@ -2853,8 +2861,6 @@ fn split_assistant_reasoning(content: &str) -> (&str, &str) {
     let answer = content[(end_idx + "</think>".len())..].trim_start_matches('\n');
     (reasoning.trim_matches('\n'), answer)
 }
-
-const TOOL_PROMPT_SUFFIX: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
 
 fn resolve_default_enable_thinking(_chat_template: &str, variant: ModelVariant) -> bool {
     // Qwen3.6-35B-A3B ships thinking default-on; the empty think block is
@@ -3853,7 +3859,7 @@ mod tests {
         .expect("prompt should render");
 
         assert!(prompt.contains("# Tools"));
-        assert!(prompt.contains("\"name\":\"lookup\""));
+        assert!(prompt.contains("\"name\": \"lookup\""));
         assert!(prompt.contains("Be precise."));
         assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n"));
     }
@@ -4100,6 +4106,45 @@ mod tests {
             assert!(message.contains("1 +Inf"));
             assert!(message.contains("1 -Inf"));
             assert!(message.contains("3 in-vocabulary logits"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tool_prompt_reference_tests {
+    use super::*;
+    use crate::models::shared::tool_prompt_reference::reference_cases;
+    use izwi_model_catalog::chat::tools::ToolDialect;
+
+    /// A forced tool call opens the assistant turn with thinking off, so
+    /// the model continues the call.
+    #[test]
+    fn a_forced_tool_call_opens_the_assistant_turn() {
+        let mut case = reference_cases("qwen36", ToolDialect::QwenXml).remove(0);
+        case.request.response_prefix = "<tool_call>\n<function=get_time>\n".to_string();
+        let config = ChatGenerationConfig {
+            request: case.request,
+            ..ChatGenerationConfig::default()
+        };
+        let prompt = render_prompt(&case.messages, &config, true).unwrap();
+        assert!(prompt.ends_with(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_time>\n"
+        ));
+        // Thinking is off for the turn, so no reasoning-effort sentence.
+        assert!(!prompt.contains("Reasoning effort is set"));
+    }
+
+    /// The Qwen3.6 prompt builder writes tool conversations exactly as the
+    /// published chat template does.
+    #[test]
+    fn tool_prompts_match_the_qwen36_chat_template() {
+        for case in reference_cases("qwen36", ToolDialect::QwenXml) {
+            let config = ChatGenerationConfig {
+                request: case.request,
+                ..ChatGenerationConfig::default()
+            };
+            let prompt = render_prompt(&case.messages, &config, true).unwrap();
+            assert_eq!(prompt, case.prompt, "case {}", case.name);
         }
     }
 }

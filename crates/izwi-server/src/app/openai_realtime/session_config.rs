@@ -530,17 +530,19 @@ pub(crate) fn parse_tools(value: &Value, param: &str) -> Result<Vec<Value>, Real
 
 /// A tool in the chat completions form the chat models' templates take.
 pub(crate) fn chat_tool(tool: &Value) -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": tool["name"],
-            "description": tool.get("description").cloned().unwrap_or(Value::Null),
-            "parameters": tool
-                .get("parameters")
-                .cloned()
-                .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
-        }
-    })
+    let mut function = serde_json::Map::new();
+    function.insert("name".to_string(), tool["name"].clone());
+    // A tool without a description has none in the prompt either.
+    if let Some(description) = tool.get("description").filter(|value| !value.is_null()) {
+        function.insert("description".to_string(), description.clone());
+    }
+    function.insert(
+        "parameters".to_string(),
+        tool.get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+    );
+    json!({"type": "function", "function": function})
 }
 
 /// A response's `metadata`: at most 16 string pairs.

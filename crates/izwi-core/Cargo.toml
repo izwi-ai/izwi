@@ -60,6 +60,9 @@ rayon = "1.11"
 # that write straight into their output columns (`kernels::cpu_q8`).
 gemm = "=0.19.0"
 regex = "1.12"
+# Constrained decoding for tool calls: grammars (Lark with embedded JSON
+# schemas) compiled to token masks.
+llguidance = { version = "1.9", default-features = false, features = ["lark"] }
 # Chatterbox's Chinese frontend: Unicode general categories, and the
 # MessagePack feature table of its pkuseg segmenter.
 icu_properties = "2.3"

@@ -253,9 +253,11 @@ Supported request fields:
 | `frequency_penalty` | Rejected in strict OpenAI compatibility mode when non-default. |
 | `n` | Only `1` is supported. |
 | Ranges | `temperature` 0–2, `top_p` greater than 0 and at most 1, `top_k` -1 or 0 (disabled) or positive, `presence_penalty` and `frequency_penalty` -2–2, `repetition_penalty` 1–2, `max_tokens` and `max_completion_tokens` at least 1. Anything else is a `400` whose `error.param` names the field and whose `error.code` is `invalid_value`. |
-| `tools` | OpenAI function tools (`{"type": "function", "function": {"name": …}}`), rendered with the model's tool-calling template. Qwen3.5, Qwen3.6, Qwen3.8, LFM2.5 and LFM3 have one; tools for another chat model are a `400` (`unsupported_parameter`) rather than silently ignored. |
-| `tool_choice` | `auto` (default) offers the tools and parses calls; `none` neither offers them nor parses calls. `required` and named functions need constrained decoding and are a `400` (`unsupported_parameter`); other values are `invalid_value`. |
-| Deferred tools (LFM3) | A tool with `"defer_loading": true` (on the tool or its `function`) stays out of the prompt's tool list until a tool result names it, as LFM3's template defines. A `tool` message's content can name tools with `{"type": "tool_reference", "name": …}` items, list definitions in `{"result": {"tools": [...]}}` items, or carry them in an `additional_tools` key (definitions, or `true` when the content holds them); the model then sees them in `<additional_tools>`. Send every tool, deferred ones included, on every request: a reference to an undefined tool is a `400`. Consecutive tool messages with the same `tool_call_id` are one result. Other models refuse `tool_reference` items and `additional_tools` with a `400`. Tool definitions are written with sorted keys. |
+| `tools` | OpenAI function tools (`{"type": "function", "function": {"name": …}}`), written into the prompt exactly as the model's own chat template writes them, in the key order you send. Qwen3, Qwen3.5, Qwen3.6, Qwen3.8, LFM2.5 and LFM3 call tools; Gemma 3 has no tool template, so tools for it are a `400` (`unsupported_parameter`) rather than silently ignored. |
+| `tool_choice` | `auto` (default) offers the tools and parses calls; `none` neither offers them nor parses calls. `required` makes the answer call a tool, and `{"type": "function", "function": {"name": …}}` makes it call that tool: the prompt opens the call for the model, with thinking off for that turn, and the sampler allows only declared tool names and arguments that fit the tool's `parameters` schema. On Qwen3.8 a forced call is opened by the prompt alone (its arguments are not checked). A named tool that is not in `tools`, or a forced choice without `tools`, is a `400`. |
+| `parallel_tool_calls` | `false` keeps the answer to one tool call: generation ends when the call closes. Default `true`. |
+| `strict` (on a tool's `function`) | `true` guarantees that calls name a declared tool and that their arguments fit the `parameters` schema, also with `tool_choice: auto`: the sampler is unconstrained until the model opens a call, then follows the schema until the call closes. When any tool is `strict`, every tool's calls are checked. Parameters are written in schema order, required ones always. A schema the grammar cannot express is a `400` naming `tools`; Qwen3.8 cannot enforce `strict` and refuses it (`unsupported_parameter`). Without `strict` and without a forced choice the model is free and its output is parsed leniently. |
+| Deferred tools (LFM3) | A tool with `"defer_loading": true` (on the tool or its `function`) stays out of the prompt's tool list until a tool result names it, as LFM3's template defines. A `tool` message's content can name tools with `{"type": "tool_reference", "name": …}` items, list definitions in `{"result": {"tools": [...]}}` items, or carry them in an `additional_tools` key (definitions, or `true` when the content holds them); the model then sees them in `<additional_tools>`. Send every tool, deferred ones included, on every request: a reference to an undefined tool is a `400`. Consecutive tool messages with the same `tool_call_id` are one result. Other models refuse `tool_reference` items and `additional_tools` with a `400`. Tool definitions keep the key order you send. |
 | `enable_thinking` | Izwi extension for thinking-capable local models. Qwen3.8 and LFM3 default to `true`; LFM3 with `false` answers directly. |
 | `reasoning_effort` | Qwen3.8 reasoning level: `xhigh` (default), `medium`, or `low`. Unknown values are rejected. |
 | `preserve_thinking` | Preserve prior assistant reasoning in Qwen3.8 history; defaults to `true`. LFM3 defaults to `false` (its template keeps reasoning only for turns after the last user message). Qwen3.5 history behavior is unchanged. |
@@ -271,8 +273,9 @@ server: the same sampling profiles, `seed`, `stop`, `top_k`, penalties,
 when none is ready it returns a `400` with `code: unsupported_parameter` and
 `param` naming the control, never dropping it. `tools` need a worker that
 advertises tool support; the gateway parses the calls in the worker's text
-exactly as the local server does. The reasoning controls are not yet supported
-through the gateway (400).
+exactly as the local server does. A forced `tool_choice` and `strict` tools
+need a worker that advertises them too. The reasoning controls are not yet
+supported through the gateway (400).
 
 Gateway limits and headers:
 
@@ -318,30 +321,48 @@ Tool behavior:
 
 - Assistant messages may include `tool_calls`; a `tool` message's
   `tool_call_id`, when given, must match a call of the preceding assistant
-  message (`400` otherwise). The templates read tool results in order.
+  message (`400` otherwise). The templates read tool results in order. An
+  assistant message may also carry the `reasoning_content` a previous answer
+  returned, so the model keeps its reasoning across a tool round.
 - Calls are parsed only when the request offered tools. They are returned as
   `message.tool_calls` (ids `call_<hex>`) with `finish_reason: "tool_calls"`,
-  and the call markup never appears in `content`.
+  and the call markup never appears in `content`. An answer the output budget
+  cut off ends with `finish_reason: "length"`, also when it made calls: a
+  call cut off there keeps only its complete arguments.
+- Arguments keep the order the model wrote them in. In the XML formats a
+  `string` parameter keeps its text even when it reads as a number, `true`
+  or `null`; other parameters are read by their declared type.
+- A call to a tool the request did not declare is returned as text, not as a
+  call. A tool call ends a reasoning block the model left open, so with
+  `reasoning_format: "parsed"` the call is not lost in `reasoning_content`.
 - Streamed, calls arrive as `delta.tool_calls`: the first fragment of each
   carries its `index`, `id`, `type` and `function.name`, and the
-  `function.arguments` fragments concatenate to the JSON arguments. A Qwen call
-  is sent as soon as its name is known and its arguments one parameter at a
-  time; an LFM2.5 call list is sent when it closes. Text that might open a
-  call is held back until the next delta settles it, and a block that does
-  not parse is sent as text.
+  `function.arguments` fragments concatenate to the JSON arguments. A Qwen
+  XML call is sent as soon as its name is known and its arguments one
+  parameter at a time; a parameter declared as a `string` is sent as its
+  text arrives, so a long value (a file body) streams instead of arriving
+  at once. A Qwen3 JSON call and an LFM2.5 call list are sent when they
+  close. Text that might open a call is held back until the next
+  delta settles it, and a block that does not parse is sent as text.
+- Qwen3 uses the Hermes format its template defines: tools are listed in the
+  system turn, the model writes
+  `<tool_call>{"name": …, "arguments": {…}}</tool_call>`, and results are
+  `<tool_response>` blocks in a user turn.
+- Qwen3.5, Qwen3.6 and Qwen3.8 use Qwen's XML tool format (`<tool_call>`,
+  `<function=…>`, `<parameter=…>`); consecutive tool results share one user
+  turn, as their templates write them.
 - LFM2.5 models use their own format: tools are listed in the system turn,
   `tool` messages become native tool turns, and calls the model writes as
   `<|tool_call_start|>[name(arg="v")]<|tool_call_end|>` are returned as
-  `tool_calls`. The Qwen3.5 family uses Qwen's XML tool format.
+  `tool_calls`.
 - LFM2.5 1.2B supports 32,768 tokens of context, the length on Liquid's model
   cards, on every backend.
-- LFM3 uses the Qwen XML call format (`<tool_call>`, `<function=…>`,
-  `<parameter=…>`): tools are listed in the system turn inside `<tools>`, one
-  JSON object per line, `tool` messages become native tool turns wrapped in
-  `<tool_response>`, and calls are returned as `tool_calls`. Its context is
-  32,768 tokens by default on CPU and Metal and the checkpoint's 262,144 on
-  CUDA (capped by the memory the arena fits); the server's
-  `IZWI_LFM3_CONTEXT_TOKENS` sets it on any backend.
+- LFM3 uses the Qwen XML call format: tools are listed in the system turn
+  inside `<tools>`, one JSON object per line, `tool` messages become native
+  tool turns wrapped in `<tool_response>`, and calls are returned as
+  `tool_calls`. Its context is 32,768 tokens by default on CPU and Metal and
+  the checkpoint's 262,144 on CUDA (capped by the memory the arena fits); the
+  server's `IZWI_LFM3_CONTEXT_TOKENS` sets it on any backend.
 
 Multimodal content parts:
 
@@ -1344,7 +1365,7 @@ Request fields:
 | `metadata`, `user` | Stored or accepted for compatibility. |
 | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. |
 | `store` | `false` skips process-local retention. Default retains completed records. |
-| `tools`, `tool_choice` | Function tools in the Responses form (`{"type": "function", "name", "parameters"}`) or the chat completions form. A tool call in the answer is a `function_call` output item (`id` `fc_<hex>`, `call_id` `call_<hex>`, `name`, JSON `arguments`) after the message, which is left out when the answer only calls tools; streaming sends `response.output_item.added`, `response.function_call_arguments.delta`/`.done` and `response.output_item.done` for it. Send the result back as a `{"type": "function_call_output", "call_id", "output"}` input item, after the `function_call` item itself; for LFM3, `output` may be a list with deferred-tool items and the item may carry `additional_tools`, as in chat completions. As in chat completions, `tool_choice` `required` and named functions are refused. |
+| `tools`, `tool_choice` | Function tools in the Responses form (`{"type": "function", "name", "parameters"}`) or the chat completions form. A tool call in the answer is a `function_call` output item (`id` `fc_<hex>`, `call_id` `call_<hex>`, `name`, JSON `arguments`) after the message, which is left out when the answer only calls tools; streaming sends `response.output_item.added`, `response.function_call_arguments.delta`/`.done` and `response.output_item.done` for it. Send the result back as a `{"type": "function_call_output", "call_id", "output"}` input item, after the `function_call` item itself; for LFM3, `output` may be a list with deferred-tool items and the item may carry `additional_tools`, as in chat completions. `tool_choice` (`required`, or `{"type": "function", "name": …}`), `parallel_tool_calls` and `strict` work as in chat completions. |
 | `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Same behavior as chat completions. Response ids are `resp_<hex>` and message ids `msg_<hex>`. |
 
 Stored records are process-local:
@@ -2355,7 +2376,7 @@ Events are the GA protocol's: `session.update`, `input_audio_buffer.*`, `convers
 ### Responses, tools and history
 
 - Responses run on the conversation's items. Clients may add items with `conversation.item.create` (`previous_item_id`, `"root"`), including `function_call` and `function_call_output` items; `response.create` takes `instructions` (replacing the session's for that response), `tools`, `tool_choice`, `max_output_tokens`, `output_modalities` (`["audio"]` or `["text"]`), `metadata` (echoed on `response.created` and `response.done`), and `conversation: "none"` with `input` (items or `item_reference`s) for an out-of-band response kept out of the conversation.
-- A response that calls functions ends there with its `function_call` items. The client answers with `function_call_output` items and a new `response.create`. Function tools need a chat model that calls tools (Qwen3.5, LFM2.5) or LFM3-Audio; `tool_choice: "required"` and named tools are asked for in the prompt, which local models may not obey. MCP tools are refused.
+- A response that calls functions ends there with its `function_call` items. The client answers with `function_call_output` items and a new `response.create`. Function tools need a chat model that calls tools (Qwen3, Qwen3.5, LFM2.5, LFM3) or LFM3-Audio; tools for another chat model fail the response instead of being dropped. With a chat model, `tool_choice: "required"` and a named tool open the reply with that call, as in chat completions; LFM3-Audio is asked in the prompt, which it may not obey. MCP tools are refused.
 - One response at a time writes to the conversation, and one out-of-band response may run beside it. `conversation.item.truncate` cuts an assistant item's transcript to what the client played.
 - `response.done` reports usage: the chat model's text tokens, and audio tokens estimated at OpenAI's rates (1 per 100 ms of user audio, 1 per 50 ms of assistant audio).
 

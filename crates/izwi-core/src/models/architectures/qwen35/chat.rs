@@ -30,6 +30,7 @@ use crate::models::shared::sampling::{
 use crate::models::shared::telemetry::{record_host_read, thread_host_reads};
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
+use izwi_model_catalog::chat::tools::{push_chatml_tool_response, qwen_xml_tools_prompt};
 
 use super::cache::qwen35_composite_cache_contract;
 use super::fast_path::Qwen35CudaSwitches;
@@ -999,17 +1000,17 @@ impl Qwen35ChatExec {
         Ok(complete)
     }
 
-    /// DS9.2 grammar runtime for this request, or `None` when the request
-    /// did not ask for constrained decoding. Always-sampleable ids mirror
+    /// The grammar runtime for this request (DS9.2 JSON output, or
+    /// constrained tool calls), or `None` when the request asked for neither. Always-sampleable ids mirror
     /// `is_stop_token` so the decode loop can still finish inside the mask.
     fn grammar_runtime(
         &self,
         config: &ChatGenerationConfig,
     ) -> Option<crate::models::shared::sampling::GrammarRuntime> {
-        if !config.constrain_json_object {
+        if !crate::models::shared::sampling::GrammarRuntime::requested(config) {
             return None;
         }
-        Some(crate::models::shared::sampling::GrammarRuntime::new(
+        crate::models::shared::sampling::GrammarRuntime::for_request(
             std::sync::Arc::new(self.tokenizer.inner.clone()),
             [
                 Some(self.tokenizer.specials.im_end),
@@ -1019,7 +1020,8 @@ impl Qwen35ChatExec {
             .into_iter()
             .flatten()
             .collect(),
-        ))
+            config,
+        )
     }
 
     pub(crate) fn continue_resumable_prefill_physical(
@@ -1985,13 +1987,7 @@ fn render_prompt(
 
     if !config.request.tools.is_empty() {
         prompt.push_str("<|im_start|>system\n");
-        prompt.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>");
-        for tool in &config.request.tools {
-            prompt.push('\n');
-            prompt.push_str(&serde_json::to_string(tool)?);
-        }
-        prompt.push_str("\n</tools>");
-        prompt.push_str(TOOL_PROMPT_SUFFIX);
+        prompt.push_str(&qwen_xml_tools_prompt(&config.request.tools));
         if !system_content.is_empty() {
             prompt.push_str("\n\n");
             prompt.push_str(system_content);
@@ -2020,12 +2016,16 @@ fn render_prompt(
                 prompt.push_str(message.content.trim());
                 prompt.push_str("<|im_end|>\n");
             }
-            // The template's tool turn: a user turn wrapping the result.
-            ChatRole::Tool => {
-                prompt.push_str("<|im_start|>user\n<tool_response>\n");
-                prompt.push_str(message.content.trim());
-                prompt.push_str("\n</tool_response><|im_end|>\n");
-            }
+            // The template's tool turn: consecutive results share one user
+            // turn, each in its own `<tool_response>` block.
+            ChatRole::Tool => push_chatml_tool_response(
+                &mut prompt,
+                message.content.trim(),
+                index > 0 && messages[index - 1].role == ChatRole::Tool,
+                messages
+                    .get(index + 1)
+                    .is_some_and(|next| next.role == ChatRole::Tool),
+            ),
             ChatRole::Assistant => {
                 let (reasoning_content, content) = split_assistant_reasoning(&message.content);
                 prompt.push_str("<|im_start|>assistant\n");
@@ -2044,15 +2044,20 @@ fn render_prompt(
     }
 
     prompt.push_str("<|im_start|>assistant\n");
-    if config
-        .request
-        .enable_thinking
-        .unwrap_or(default_enable_thinking)
+    // A forced tool call starts the turn itself, so the model does not
+    // think first.
+    let forced = !config.request.response_prefix.is_empty();
+    if !forced
+        && config
+            .request
+            .enable_thinking
+            .unwrap_or(default_enable_thinking)
     {
         prompt.push_str("<think>\n");
     } else {
         prompt.push_str("<think>\n\n</think>\n\n");
     }
+    prompt.push_str(&config.request.response_prefix);
     Ok(prompt)
 }
 
@@ -2087,8 +2092,6 @@ fn split_assistant_reasoning(content: &str) -> (&str, &str) {
     (reasoning.trim_matches('\n'), answer)
 }
 
-const TOOL_PROMPT_SUFFIX: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
-
 pub(crate) fn qwen35_gguf_filename(variant: ModelVariant) -> Result<&'static str> {
     match variant {
         ModelVariant::Qwen3508BGguf => Ok("Qwen3.5-0.8B-Q4_K_M.gguf"),
@@ -2104,8 +2107,7 @@ pub(crate) fn qwen35_gguf_filename(variant: ModelVariant) -> Result<&'static str
 fn resolve_default_enable_thinking(_chat_template: &str, variant: ModelVariant) -> bool {
     matches!(
         variant,
-        ModelVariant::Qwen354BGguf
-            | ModelVariant::Qwen359BGguf
+        ModelVariant::Qwen354BGguf | ModelVariant::Qwen359BGguf
     )
 }
 
@@ -3269,7 +3271,7 @@ mod tests {
         .expect("prompt should render");
 
         assert!(prompt.contains("# Tools"));
-        assert!(prompt.contains("\"name\":\"lookup\""));
+        assert!(prompt.contains("\"name\": \"lookup\""));
         assert!(prompt.contains("Be precise."));
         assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n"));
     }
@@ -4070,3 +4072,42 @@ mod tests {
 #[cfg(test)]
 #[path = "chat_trace_tests.rs"]
 mod trace_tests;
+
+#[cfg(test)]
+mod tool_prompt_reference_tests {
+    use super::*;
+    use crate::models::shared::tool_prompt_reference::reference_cases;
+    use izwi_model_catalog::chat::tools::ToolDialect;
+
+    /// A forced tool call opens the assistant turn with thinking off, so
+    /// the model continues the call.
+    #[test]
+    fn a_forced_tool_call_opens_the_assistant_turn() {
+        let mut case = reference_cases("qwen35", ToolDialect::QwenXml).remove(0);
+        case.request.response_prefix = "<tool_call>\n<function=get_time>\n".to_string();
+        let config = ChatGenerationConfig {
+            request: case.request,
+            ..ChatGenerationConfig::default()
+        };
+        let prompt = render_prompt(&case.messages, &config, true).unwrap();
+        assert!(prompt.ends_with(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_time>\n"
+        ));
+        // Thinking is off for the turn, so no reasoning-effort sentence.
+        assert!(!prompt.contains("Reasoning effort is set"));
+    }
+
+    /// The Qwen3.5 prompt builder writes tool conversations exactly as the
+    /// published chat template does.
+    #[test]
+    fn tool_prompts_match_the_qwen35_chat_template() {
+        for case in reference_cases("qwen35", ToolDialect::QwenXml) {
+            let config = ChatGenerationConfig {
+                request: case.request,
+                ..ChatGenerationConfig::default()
+            };
+            let prompt = render_prompt(&case.messages, &config, true).unwrap();
+            assert_eq!(prompt, case.prompt, "case {}", case.name);
+        }
+    }
+}

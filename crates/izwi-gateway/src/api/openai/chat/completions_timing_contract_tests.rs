@@ -1,5 +1,6 @@
 use super::*;
 use crate::api::openai::chat::dto::OpenAiChatChunk;
+use crate::api::openai::tool_calls::ToolCallFormat;
 
 fn reasoning_mode_for(body: serde_json::Value) -> Result<Option<bool>, ApiError> {
     let req: ChatCompletionRequest = serde_json::from_value(body).unwrap();
@@ -70,11 +71,13 @@ async fn parsed_reasoning_fills_reasoning_content_and_keeps_tool_calls() {
             .unwrap();
         serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
     };
-    let format = |parse_reasoning, reasoning_opened_in_prompt, tool_calls| AnswerFormat {
+    let format = |parse_reasoning,
+                  reasoning_opened_in_prompt,
+                  tool_calls: Option<ToolCallFormat>| AnswerFormat {
         compat_profile: OpenAiCompatibilityProfile::Strict,
         parse_reasoning,
         reasoning_opened_in_prompt,
-        tool_calls,
+        tool_calls: tool_calls.map(|dialect| std::sync::Arc::new(ToolPlan::from(dialect))),
     };
     let text = "<think>check the tool</think>\n\n<|tool_call_start|>[now()]<|tool_call_end|>";
     let parsed = body(render_completion_response(
@@ -111,11 +114,13 @@ async fn parsed_reasoning_fills_reasoning_content_and_keeps_tool_calls() {
 }
 
 #[test]
-fn budget_termination_is_length_without_overriding_tool_calls() {
+fn budget_termination_is_length_even_when_the_answer_made_tool_calls() {
     use izwi_model_catalog::FinishReason::{MaxTokens, StopToken};
     assert_eq!(finish_reason(false, Some(MaxTokens)), "length");
     assert_eq!(finish_reason(false, Some(StopToken)), "stop");
-    assert_eq!(finish_reason(true, Some(MaxTokens)), "tool_calls");
+    assert_eq!(finish_reason(true, Some(StopToken)), "tool_calls");
+    // A call cut off by the budget lacks arguments; the client must see it.
+    assert_eq!(finish_reason(true, Some(MaxTokens)), "length");
 }
 
 #[test]
@@ -187,6 +192,7 @@ fn logprob_requests_validate_openai_bounds() {
         stop: None,
         tools: None,
         tool_choice: None,
+        parallel_tool_calls: None,
         enable_thinking: None,
         reasoning_effort: None,
         preserve_thinking: None,
@@ -235,6 +241,7 @@ fn response_format_types_are_validated() {
         stop: None,
         tools: None,
         tool_choice: None,
+        parallel_tool_calls: None,
         enable_thinking: None,
         reasoning_effort: None,
         preserve_thinking: None,

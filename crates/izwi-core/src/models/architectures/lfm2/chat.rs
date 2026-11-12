@@ -1372,21 +1372,32 @@ impl Lfm2ChatModel {
         request: &ChatRequestConfig,
     ) -> Result<Vec<u32>> {
         match self.dialect {
-            LfmChatDialect::Lfm2 => self.build_prompt(messages, &request.tools),
+            LfmChatDialect::Lfm2 => {
+                let mut ids = self.build_prompt(messages, &request.tools)?;
+                if !request.response_prefix.is_empty() {
+                    // A forced tool call: the prompt opens it for the model.
+                    ids.extend(self.tokenizer.encode_text(&request.response_prefix)?);
+                }
+                Ok(ids)
+            }
             LfmChatDialect::Lfm3 => {
                 if messages.is_empty() {
                     return Err(Error::InvalidInput(
                         "Chat request must include at least one message".to_string(),
                     ));
                 }
-                let text = render_lfm3_chat_prompt(
+                // A forced tool call starts the turn itself, after an empty
+                // think block.
+                let forced = !request.response_prefix.is_empty();
+                let mut text = render_lfm3_chat_prompt(
                     messages,
                     &request.tools,
                     Lfm3PromptOptions {
-                        enable_thinking: request.enable_thinking.unwrap_or(true),
+                        enable_thinking: !forced && request.enable_thinking.unwrap_or(true),
                         preserve_thinking: request.preserve_thinking.unwrap_or(false),
                     },
                 );
+                text.push_str(&request.response_prefix);
                 // One encode of the whole rendering, as the template's
                 // tokenization: special and added tokens split where it puts
                 // them.

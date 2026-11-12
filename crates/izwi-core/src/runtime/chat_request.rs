@@ -6,8 +6,9 @@
 
 use crate::engine::GenerationParams;
 pub use izwi_model_catalog::chat::{
-    chat_supports_json_object, chat_supports_tools, resolve_chat_max_tokens, resolve_chat_sampling,
-    ChatGenerationControls, ChatSamplingRequest, ResolvedChatSampling, CHAT_MAX_TOKENS_UNSET,
+    chat_supports_json_object, chat_supports_tool_constraint, chat_supports_tools,
+    resolve_chat_max_tokens, resolve_chat_sampling, ChatGenerationControls, ChatSamplingRequest,
+    ResolvedChatSampling, CHAT_MAX_TOKENS_UNSET,
 };
 
 impl GenerationParams {

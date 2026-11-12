@@ -41,7 +41,7 @@ impl EngineCoreRequest {
             audio_stream_engine_queue_capacity: None,
             text: Some(text),
             chat_messages: None,
-            chat_config: ChatRequestConfig::default(),
+            chat_config: Box::default(),
             language: None,
             correlation_id: None,
             audio_input: None,
@@ -115,7 +115,7 @@ impl EngineCoreRequest {
             audio_stream_engine_queue_capacity: None,
             text: None,
             chat_messages: None,
-            chat_config: ChatRequestConfig::default(),
+            chat_config: Box::default(),
             language: None,
             correlation_id: None,
             audio_input: Some(audio_base64),
@@ -189,7 +189,7 @@ impl EngineCoreRequest {
             audio_stream_engine_queue_capacity: None,
             text: None,
             chat_messages: None,
-            chat_config: ChatRequestConfig::default(),
+            chat_config: Box::default(),
             language: None,
             correlation_id: None,
             audio_input: None,
@@ -273,7 +273,7 @@ impl EngineCoreRequest {
             audio_stream_engine_queue_capacity: None,
             text: None,
             chat_messages: Some(messages),
-            chat_config: ChatRequestConfig::default(),
+            chat_config: Box::default(),
             language: None,
             correlation_id: None,
             audio_input: None,
@@ -345,7 +345,7 @@ impl EngineCoreRequest {
             audio_stream_engine_queue_capacity: None,
             text: None,
             chat_messages: None,
-            chat_config: ChatRequestConfig::default(),
+            chat_config: Box::default(),
             language: None,
             correlation_id: None,
             audio_input: Some(audio_base64),
@@ -417,7 +417,7 @@ impl EngineCoreRequest {
             audio_stream_engine_queue_capacity: None,
             text: None,
             chat_messages: None,
-            chat_config: ChatRequestConfig::default(),
+            chat_config: Box::default(),
             language: None,
             correlation_id: None,
             audio_input: None,
@@ -563,7 +563,7 @@ impl EngineCoreRequest {
 
     /// Set chat-specific prompt/runtime configuration.
     pub fn with_chat_config(mut self, chat_config: ChatRequestConfig) -> Self {
-        self.chat_config = chat_config;
+        self.chat_config = Box::new(chat_config);
         self.sync_task_from_fields();
         self
     }

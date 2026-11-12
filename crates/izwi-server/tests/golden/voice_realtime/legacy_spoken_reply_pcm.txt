@@ -1,5 +1,5 @@
-text {"text":"Hello there, it is lovely to hear from you. The second sentence is longer than the first. Last one.","type":"assistant_text_snapshot","utterance_id":"utt-1","utterance_seq":1}
-text {"audio_format":"pcm_i16","sample_rate":1000,"type":"assistant_audio_start","utterance_id":"utt-1","utterance_seq":1}
+text {"type":"assistant_text_snapshot","utterance_id":"utt-1","utterance_seq":1,"text":"Hello there, it is lovely to hear from you. The second sentence is longer than the first. Last one."}
+text {"type":"assistant_audio_start","utterance_id":"utt-1","utterance_seq":1,"sample_rate":1000,"audio_format":"pcm_i16"}
 bin len=204 head=4956575301020000010000000000000000000000e8030000 payload=75e2ed82715a2ee5
 bin len=224 head=4956575301020000010000000000000001000000e8030000 payload=5ff0433800304ea5
 bin len=224 head=4956575301020000010000000000000002000000e8030000 payload=5ff0433800304ea5

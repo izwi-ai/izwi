@@ -1,4 +1,4 @@
-norm {"connection_epoch":0,"data":{"revision":1,"text":"Sure,"},"event_id":1,"protocol":"voice_realtime","sequence":0,"session_id":"<volatile>","timestamp_ms":"<volatile>","turn_id":"turn-1","type":"assistant_text_partial","utterance_id":"utt-1","version":2}
-norm {"connection_epoch":0,"data":{"revision":2,"text":"Sure, let me check."},"event_id":2,"protocol":"voice_realtime","sequence":1,"session_id":"<volatile>","timestamp_ms":"<volatile>","turn_id":"turn-1","type":"assistant_text_partial","utterance_id":"utt-1","version":2}
+norm {"protocol":"voice_realtime","version":2,"event_id":1,"sequence":0,"session_id":"<volatile>","connection_epoch":0,"timestamp_ms":"<volatile>","utterance_id":"utt-1","turn_id":"turn-1","type":"assistant_text_partial","data":{"text":"Sure,","revision":1}}
+norm {"protocol":"voice_realtime","version":2,"event_id":2,"sequence":1,"session_id":"<volatile>","connection_epoch":0,"timestamp_ms":"<volatile>","utterance_id":"utt-1","turn_id":"turn-1","type":"assistant_text_partial","data":{"text":"Sure, let me check.","revision":2}}
 bin len=984 head=4956575301020000010000000000000002000000c05d0000 payload=f347d63d5c5fbb65
 bin len=504 head=4956575301020000010000000000000004000000c05d0000 payload=7abf9efa652dcee5

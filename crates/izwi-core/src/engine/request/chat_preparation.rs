@@ -504,7 +504,7 @@ impl EngineCoreRequest {
                 .params
                 .seed
                 .map_or_else(|| Self::chat_request_seed(&self.id), Self::chat_user_seed),
-            request: self.chat_config.clone(),
+            request: (*self.chat_config).clone(),
             logprobs: self.params.logprobs || self.params.top_logprobs > 0,
             top_logprobs: self.params.top_logprobs,
             constrain_json_object: self.params.constrain_json_object,

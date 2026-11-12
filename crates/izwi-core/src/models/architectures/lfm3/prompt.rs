@@ -192,7 +192,7 @@ mod tests {
             render_lfm3_chat_prompt(&messages, &tools, Lfm3PromptOptions::default()),
             "<|startoftext|><|im_start|>system\nBe brief.\n\n<tools>\n\
              {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\"}}\n\
-             {\"description\": \"Find tools\", \"name\": \"search\"}\n</tools><|im_end|>\n\
+             {\"name\": \"search\", \"description\": \"Find tools\"}\n</tools><|im_end|>\n\
              <|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n<think>"
         );
         // Tools alone make the system turn.
