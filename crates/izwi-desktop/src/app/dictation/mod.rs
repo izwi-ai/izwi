@@ -110,6 +110,8 @@ struct Shared {
     last_text: Mutex<Option<String>>,
     target_app: Mutex<Option<FocusedApp>>,
     microphones: Mutex<Vec<MicrophoneView>>,
+    /// The chat model clean-up uses when the settings name none.
+    cleanup_model: Mutex<Option<String>>,
 }
 
 /// Managed app state.
@@ -160,6 +162,7 @@ pub fn init(app: &AppHandle, server_url: &Url) {
         last_text: Mutex::new(None),
         target_app: Mutex::new(None),
         microphones: Mutex::new(Vec::new()),
+        cleanup_model: Mutex::new(None),
     });
 
     let sink_shared = Arc::clone(&shared);
@@ -495,6 +498,47 @@ impl Host for DesktopHost {
         self.shared
             .api
             .transcribe(audio::wav_bytes(clip), settings, keyword_biasing)
+    }
+
+    fn clean_up(&mut self, transcript: &str, settings: &DictationSettings) -> Option<String> {
+        if !settings.cleanup.enabled {
+            return None;
+        }
+        let shared = &self.shared;
+        let chosen = settings
+            .cleanup
+            .model
+            .clone()
+            .filter(|model| !model.trim().is_empty());
+        let model = match chosen {
+            Some(model) => model,
+            None => {
+                let mut cached = lock(&shared.cleanup_model);
+                if cached.is_none() {
+                    *cached = shared.api.default_cleanup_model();
+                }
+                cached.clone()?
+            }
+        };
+        // The request runs to its end even when the deadline passes: a model
+        // that had to be loaded is then ready for the next dictation.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let api = shared.api.clone();
+        let text = transcript.to_string();
+        std::thread::spawn(move || {
+            let _ = sender.send(api.clean_up(&text, &model));
+        });
+        match receiver.recv_timeout(Duration::from_millis(settings.cleanup.deadline_ms)) {
+            Ok(Ok(cleaned)) => Some(cleaned),
+            Ok(Err(error)) => {
+                desktop_log::warn(format!("dictation clean-up skipped: {error}"));
+                None
+            }
+            Err(_) => {
+                desktop_log::info("dictation clean-up missed its deadline; raw text inserted");
+                None
+            }
+        }
     }
 
     fn insert(&mut self, text: &str, settings: &DictationSettings) -> InsertOutcome {
