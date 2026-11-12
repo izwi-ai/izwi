@@ -25,7 +25,10 @@ mod platform {
     use std::process::Command;
 
     fn osascript(script: &str) -> Option<String> {
-        let output = Command::new("osascript").args(["-e", script]).output().ok()?;
+        let output = Command::new("osascript")
+            .args(["-e", script])
+            .output()
+            .ok()?;
         output
             .status
             .success()
@@ -71,7 +74,9 @@ mod platform {
 #[cfg(target_os = "windows")]
 mod platform {
     use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
-    use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
+    use windows::Win32::Media::Audio::{
+        eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator,
+    };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
     };
@@ -95,9 +100,8 @@ mod platform {
 
     pub fn set_muted(muted: bool) -> bool {
         // SAFETY: a null event context is allowed.
-        endpoint().is_some_and(|endpoint| unsafe {
-            endpoint.SetMute(muted, std::ptr::null()).is_ok()
-        })
+        endpoint()
+            .is_some_and(|endpoint| unsafe { endpoint.SetMute(muted, std::ptr::null()).is_ok() })
     }
 }
 

@@ -12,6 +12,7 @@ pub mod blocking;
 pub mod console;
 pub mod csp;
 pub mod desktop_log;
+pub mod dictation;
 pub mod downloads;
 pub mod install;
 pub mod reveal;
@@ -56,6 +57,12 @@ pub struct DesktopArgs {
     /// Initial window height
     #[arg(long, default_value = "900")]
     pub height: f64,
+
+    /// Control dictation in the Izwi that is already running: start, stop,
+    /// toggle or cancel. For desktops where the hotkey is bound in the
+    /// system's keyboard settings.
+    #[arg(long, value_name = "ACTION")]
+    pub dictation: Option<String>,
 }
 
 pub fn run(args: DesktopArgs) -> Result<()> {
@@ -79,8 +86,15 @@ pub fn run(args: DesktopArgs) -> Result<()> {
     // Must be the first plugin: a second launch hands its arguments to this
     // instance and exits before it can spawn a second server, window or tray.
     let mut builder = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            let _ = tray::show_main_window(app);
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // `izwi-desktop --dictation toggle` drives dictation and leaves
+            // the window where it is.
+            match dictation::cli_input(&args) {
+                Some(input) => dictation::send(app, input),
+                None => {
+                    let _ = tray::show_main_window(app);
+                }
+            }
         }))
         .invoke_handler(tauri::generate_handler![
             downloads::download_audio_file,
@@ -97,6 +111,17 @@ pub fn run(args: DesktopArgs) -> Result<()> {
             updater::updater_health_snapshot,
             install::cli_install_status,
             install::install_cli,
+            dictation::dictation_snapshot,
+            dictation::dictation_update_settings,
+            dictation::dictation_pause_hotkeys,
+            dictation::dictation_request_keyboard_permission,
+            dictation::dictation_open_system_settings,
+            dictation::dictation_toggle,
+            dictation::dictation_cancel,
+            dictation::dictation_history,
+            dictation::dictation_clear_history,
+            dictation::dictation_copy_text,
+            dictation::dictation_paste_last,
         ])
         .manage(updater::UpdaterState::new())
         .manage(ServerControl {
@@ -118,6 +143,7 @@ pub fn run(args: DesktopArgs) -> Result<()> {
     builder = builder.plugin(tauri_plugin_autostart::Builder::new().build());
     builder = builder.plugin(tauri_plugin_dialog::init());
     builder = builder.plugin(tauri_plugin_process::init());
+    builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
 
     let mut context = tauri::generate_context!();
     csp::allow_server_origin(context.config_mut(), &server_url);
@@ -208,6 +234,7 @@ pub fn run(args: DesktopArgs) -> Result<()> {
                 app.state::<TrayVisibilityState>().set_available(false);
             }
             tray_visibility::restore_tray_visibility(app.handle());
+            dictation::init(app.handle(), &local.url);
             Ok(())
         })
         .build(context)

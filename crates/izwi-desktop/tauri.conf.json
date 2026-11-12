@@ -8,9 +8,11 @@
   },
   "app": {
     "windows": [],
+    "macOSPrivateApi": true,
     "security": {
       "capabilities": [
-        "default"
+        "default",
+        "dictation-indicator"
       ],
       "csp": {
         "default-src": "'self'",

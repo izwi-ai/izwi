@@ -79,6 +79,43 @@ pub fn wav_bytes(samples: &[f32]) -> Vec<u8> {
     out
 }
 
+/// The samples of a 16-bit mono WAV file at [`SAMPLE_RATE`], as written by
+/// [`wav_bytes`]. For tests that stand in a file for the microphone.
+pub fn samples_from_wav(wav: &[u8]) -> Option<Vec<f32>> {
+    if wav.len() < 12 || &wav[..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut offset = 12;
+    let mut format_ok = false;
+    while offset + 8 <= wav.len() {
+        let id = &wav[offset..offset + 4];
+        let size = u32::from_le_bytes(wav[offset + 4..offset + 8].try_into().ok()?) as usize;
+        let body = wav.get(offset + 8..(offset + 8 + size).min(wav.len()))?;
+        match id {
+            b"fmt " if body.len() >= 16 => {
+                let pcm = u16::from_le_bytes([body[0], body[1]]) == 1;
+                let mono = u16::from_le_bytes([body[2], body[3]]) == 1;
+                let rate = u32::from_le_bytes(body[4..8].try_into().ok()?);
+                let bits = u16::from_le_bytes([body[14], body[15]]);
+                format_ok = pcm && mono && rate == SAMPLE_RATE && bits == 16;
+            }
+            b"data" => {
+                return format_ok.then(|| {
+                    body.as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|pair| f32::from(i16::from_le_bytes(*pair)) / f32::from(i16::MAX))
+                        .collect()
+                });
+            }
+            _ => {}
+        }
+        // Chunks are padded to an even length.
+        offset += 8 + size + (size & 1);
+    }
+    None
+}
+
 pub fn pcm16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16
 }
@@ -131,5 +168,21 @@ mod tests {
         assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 6);
         assert_eq!(i16::from_le_bytes([wav[46], wav[47]]), i16::MAX);
         assert_eq!(i16::from_le_bytes([wav[48], wav[49]]), -i16::MAX);
+    }
+
+    #[test]
+    fn wav_files_read_back() {
+        let samples = tone(50, 0.25);
+        let read = samples_from_wav(&wav_bytes(&samples)).unwrap();
+        assert_eq!(read.len(), samples.len());
+        assert!(read
+            .iter()
+            .zip(&samples)
+            .all(|(read, wrote)| (read - wrote).abs() < 1e-3));
+        assert_eq!(samples_from_wav(b"not a wav file"), None);
+        // Another rate is refused rather than played at the wrong speed.
+        let mut other_rate = wav_bytes(&samples);
+        other_rate[24..28].copy_from_slice(&44_100u32.to_le_bytes());
+        assert_eq!(samples_from_wav(&other_rate), None);
     }
 }

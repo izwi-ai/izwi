@@ -21,7 +21,8 @@ url = "2.5"
 percent-encoding = "2.3"
 # Keep the minor version in step with @tauri-apps/api, pinned with ~ in
 # ui/package.json: `cargo tauri build` fails when they differ.
-tauri = { version = "2.12.5", features = ["tray-icon"] }
+# macos-private-api: the dictation indicator is a transparent window.
+tauri = { version = "2.12.5", features = ["tray-icon", "macos-private-api"] }
 # Its default TLS feature turns on reqwest's aws-lc-rs provider next to ring.
 # Without it the plugin shares the reqwest rustls stack, with the ring provider
 # that main installs.
@@ -29,12 +30,15 @@ tauri-plugin-aptabase = { version = "1.3.0", default-features = false }
 tauri-plugin-autostart = "2.7.0"
 # Native save and error dialogs.
 tauri-plugin-dialog = "2.8.3"
+# The dictation hotkey, when it has a key (modifier-only hotkeys use the
+# listener in izwi-dictation).
+tauri-plugin-global-shortcut = "2.4.1"
 tauri-plugin-process = "2.4.0"
 tauri-plugin-single-instance = "2.5.4"
 tauri-plugin-updater = "2.14.1"
 # Keep the Aptabase reqwest proxy stack on a sandbox-safe macOS line.
 hyper-util = "0.1.20"
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["multipart"] }
 rustls = { workspace = true }
 semver = "1.0"
 tokio = { workspace = true }
@@ -42,3 +46,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 izwi-env = { path = "../izwi-env" }
+izwi-dictation = { path = "../izwi-dictation" }
