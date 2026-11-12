@@ -382,6 +382,14 @@ mod tests {
         Engine::new(host, settings)
     }
 
+    /// The key goes up at `at` and stays up. Where releases are debounced
+    /// (X11), the release only counts at the tick that follows the debounce.
+    fn release(engine: &mut Engine<FakeHost>, at: u64) {
+        engine.handle(Input::Release, at);
+        let debounce = engine.session.config().release_debounce_ms;
+        engine.handle(Input::Tick, at + debounce);
+    }
+
     #[test]
     fn a_hold_ends_in_inserted_text() {
         let host = FakeHost {
@@ -392,7 +400,7 @@ mod tests {
         let mut engine = engine(host, enabled());
         engine.handle(Input::Press, 0);
         engine.listening();
-        engine.handle(Input::Release, 2_000);
+        release(&mut engine, 2_000);
 
         let host = engine.host();
         assert_eq!(host.inserted, vec!["Hello world. "]);
@@ -433,7 +441,7 @@ mod tests {
         for host in [silent, empty] {
             let mut engine = engine(host, enabled());
             engine.handle(Input::Press, 0);
-            engine.handle(Input::Release, 1_000);
+            release(&mut engine, 1_000);
             assert!(engine.host().inserted.is_empty());
             assert!(engine.host().statuses.contains(&Status::Discarded {
                 reason: Discarded::NoSpeech
@@ -500,7 +508,7 @@ mod tests {
     fn a_double_tap_reports_hands_free_listening() {
         let mut engine = engine(FakeHost::default(), enabled());
         engine.handle(Input::Press, 0);
-        engine.handle(Input::Release, 100);
+        release(&mut engine, 100);
         engine.handle(Input::Press, 200);
         assert_eq!(
             engine.host().statuses.last(),
