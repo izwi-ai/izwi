@@ -24,3 +24,7 @@ cpal = { version = "0.18.2", optional = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 izwi-vad = { path = "../izwi-vad", features = ["test-signals"] }
+
+[[example]]
+name = "record"
+required-features = ["capture"]

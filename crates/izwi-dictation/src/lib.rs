@@ -6,6 +6,9 @@
 //! listens for keys and inserts text. Transcription itself is a trait the
 //! desktop app implements against its local server.
 
+pub mod audio;
+#[cfg(feature = "capture")]
+pub mod capture;
 pub mod session;
 pub mod settings;
 pub mod shortcut;
