@@ -1,3 +1,4 @@
+pub(crate) mod agent_runtime;
 pub mod chat;
 pub(crate) mod media_stream;
 #[cfg(test)]

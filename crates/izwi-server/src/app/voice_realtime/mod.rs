@@ -19,16 +19,15 @@ use std::time::{Duration, Instant};
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures::StreamExt;
 use izwi_agent::{
-    planner::{PlanningMode, SimplePlanner},
-    strip_reasoning, AgentDefinition, AgentEngine, AgentSession, AgentTurnOptions, HistoryBudget,
-    MemoryMessage, MemoryMessageMeta, MemoryMessageRole, MemoryStore, ModelBackend, ModelOutput,
-    ModelRequest, ReasoningFilter, TurnInput,
+    strip_reasoning, AgentDefinition, AgentEngine, AgentEvent, AgentSession, AgentSet,
+    AgentTurnOptions, BackgroundResults, HistoryBudget, MemoryMessage, MemoryMessageMeta,
+    MemoryMessageRole, ReasoningFilter, TurnEvents, TurnInput,
 };
 use izwi_core::{
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
-    resolve_asr_model_variant, ChatMessage, ChatRequestConfig, ChatRole, ChatTruncation,
-    GenerationConfig, GenerationParams, GenerationRequest, RuntimeRequestContext, RuntimeService,
-    SessionModelLeases, VoiceLatency, VoiceSession, VoiceSessionPhase, WorkloadClass,
+    resolve_asr_model_variant, ChatMessage, ChatRole, GenerationConfig, GenerationParams,
+    GenerationRequest, RuntimeRequestContext, RuntimeService, SessionModelLeases, VoiceLatency,
+    VoiceSession, VoiceSessionPhase, WorkloadClass,
 };
 use izwi_vad::{
     configured_snr_margin_db, sanitize_score_threshold, sanitize_snr_margin, EndpointConfig,
@@ -42,6 +41,7 @@ use tokio::sync::Notify;
 use tracing::warn;
 
 use crate::api::openai::tool_calls::{parse_answer, ToolCallFormat, ToolCallParser};
+use crate::app::agent_runtime::{cancel_with, ChatAgentBackend, RoundAdmission, ThreadMemory};
 use crate::app::realtime_codec::{AudioOutputEncoder, OutputAudioFormat};
 use crate::app::realtime_protocol::{
     RealtimeAudioFormat, RealtimeAudioGapAction, RealtimeClose, RealtimeCloseCode,
@@ -59,7 +59,6 @@ use crate::app::voice_tools::{
     builtin_tool_registry, run_builtin_call, FunctionCallOutcome, FunctionExecutor,
     PendingFunctionCalls, VoiceTools, MAX_TOOL_ROUNDS, MAX_TURN_FUNCTION_CALLS,
 };
-use crate::chat_store::ChatStore;
 use crate::ids::new_uuid;
 use crate::state::{AppState, OwnedAdmissionPermit, StoredAgentSessionRecord};
 use crate::voice_defaults::{
@@ -1782,26 +1781,22 @@ fn spawn_turn_task(
                     // synthesized while the text model is still writing.
                     let (deltas, delta_rx) = tokio::sync::mpsc::unbounded_channel();
                     let reply = async {
-                        let raw_text = with_stage_permit(&state, async |runtime_context| {
-                            model_leases
-                                .hold(&state.runtime, text_variant)
-                                .await
-                                .map_err(|err| model_load_error("chat", err))?;
-                            run_agent_turn(
-                                &state,
-                                &agent_session_id,
-                                &user_text,
-                                &config.text_model_id,
-                                config.max_output_tokens,
-                                voice_profile_id.as_deref(),
-                                &correlation_id,
-                                runtime_context,
-                                &control,
-                                &turn_record_id,
-                                deltas,
-                            )
+                        model_leases
+                            .hold(&state.runtime, text_variant)
                             .await
-                        })
+                            .map_err(|err| model_load_error("chat", err))?;
+                        let raw_text = run_agent_turn(
+                            &state,
+                            &agent_session_id,
+                            &user_text,
+                            &config.text_model_id,
+                            config.max_output_tokens,
+                            voice_profile_id.as_deref(),
+                            &correlation_id,
+                            &control,
+                            &turn_record_id,
+                            deltas,
+                        )
                         .await?;
                         let assistant_text = strip_reasoning(&raw_text);
                         // Silence is not an answer: the turn fails and says so.
@@ -2202,7 +2197,7 @@ async fn build_unified_history(
         ] {
             if let Some(content) = text.map(|text| text.trim().to_string()) {
                 if !content.is_empty() {
-                    history.push(MemoryMessage { role, content });
+                    history.push(MemoryMessage::new(role, content));
                 }
             }
         }
@@ -2216,6 +2211,7 @@ async fn build_unified_history(
                 MemoryMessageRole::System => ChatRole::System,
                 MemoryMessageRole::User => ChatRole::User,
                 MemoryMessageRole::Assistant => ChatRole::Assistant,
+                MemoryMessageRole::Tool => ChatRole::Tool,
             },
             content: message.content,
         })
@@ -2444,8 +2440,10 @@ async fn stream_unified_s2s_to_socket(
                         izwi_agent::ToolContext {
                             session_id: tools.voice_session_id.to_string(),
                             thread_id: utterance_id.to_string(),
+                            call_id: call.id.clone(),
                             user_text: user_text.clone(),
                             arguments: serde_json::Value::Null,
+                            cancel: izwi_agent::TurnCancel::new(),
                         },
                         tools.tools.timeout,
                     )
@@ -2766,7 +2764,6 @@ impl AgentSessionSlot {
                 thread_id: thread.id,
                 model_id,
                 system_prompt: system_prompt.to_string(),
-                planning_mode: PlanningMode::Auto,
                 created_at: now,
                 updated_at: now,
             })
@@ -2777,9 +2774,10 @@ impl AgentSessionSlot {
     }
 }
 
-/// Run the agent's reply to `input`, streaming its text into `deltas`. The
-/// reply is not stored here: the turn's record holds it until what the user
-/// heard of it is known (SPK-F13). Returns the raw reply.
+/// Run the agent's reply to `input`, streaming its text into `deltas`. Each
+/// model round takes its own admission permit, so none is held while a tool
+/// runs. The reply is not stored here: the turn's record holds it until
+/// what the user heard of it is known (SPK-F13). Returns the raw reply.
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_turn(
     state: &AppState,
@@ -2789,7 +2787,6 @@ async fn run_agent_turn(
     max_output_tokens: usize,
     voice_profile_id: Option<&str>,
     correlation_id: &str,
-    runtime_context: RuntimeRequestContext,
     control: &TurnControl,
     turn_record_id: &str,
     deltas: tokio::sync::mpsc::UnboundedSender<String>,
@@ -2804,14 +2801,12 @@ async fn run_agent_turn(
 
     let resolved_model_id = resolve_chat_model_id(Some(model_id))?;
 
-    let agent = AgentDefinition {
-        id: session_record.agent_id.clone(),
-        name: DEFAULT_VOICE_AGENT_NAME.to_string(),
-        system_prompt: session_record.system_prompt.clone(),
-        default_model: session_record.model_id.clone(),
-        capabilities: Default::default(),
-        planning_mode: session_record.planning_mode,
-    };
+    let agents = AgentSet::single(AgentDefinition::new(
+        session_record.agent_id.clone(),
+        DEFAULT_VOICE_AGENT_NAME,
+        session_record.system_prompt.clone(),
+        session_record.model_id.clone(),
+    ));
     let session = AgentSession {
         id: session_record.id.clone(),
         agent_id: session_record.agent_id.clone(),
@@ -2843,50 +2838,70 @@ async fn run_agent_turn(
         None
     };
 
-    let memory = VoiceContextMemoryStore::new(state.chat_store.clone(), memory_context);
-    let backend = IzwiRuntimeBackend {
+    let memory = ThreadMemory::new(state.chat_store.clone(), memory_context);
+    let backend = ChatAgentBackend {
         runtime: state.runtime.clone(),
         correlation_id: correlation_id.to_string(),
-        runtime_context,
-        deltas,
-        usage: Mutex::new(None),
+        admission: RoundAdmission::PerRound(state),
     };
-    let planner = SimplePlanner;
     let tools = builtin_tool_registry();
-
-    let result = AgentEngine
-        .run_turn(
-            &agent,
-            &session,
-            TurnInput {
-                text: input.to_string(),
-            },
-            Some(resolved_model_id.clone()),
-            &memory,
-            &backend,
-            &planner,
-            &tools,
-            AgentTurnOptions {
-                max_output_tokens: max_output_tokens.clamp(1, 4096),
-                max_tool_calls: 1,
-                history: VOICE_HISTORY_BUDGET,
-                persist_assistant_reply: false,
-            },
-        )
-        .await
-        .map_err(|err| match err {
-            izwi_agent::AgentError::InvalidInput(msg) => msg,
-            other => other.to_string(),
-        })?;
-
+    let (cancel, _cancel_link) = cancel_with(control);
+    let (events, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    let turn = izwi_agent::TurnContext {
+        agents: &agents,
+        memory: &memory,
+        model: &backend,
+        tools: &tools,
+        events: TurnEvents::new(events),
+        cancel,
+        background: BackgroundResults::default(),
+    };
+    let run = AgentEngine.run_turn(
+        &turn,
+        &session,
+        TurnInput {
+            text: input.to_string(),
+        },
+        Some(resolved_model_id.clone()),
+        AgentTurnOptions {
+            max_output_tokens: max_output_tokens.clamp(1, 4096),
+            history: VOICE_HISTORY_BUDGET,
+            persist_assistant_reply: false,
+            ..AgentTurnOptions::default()
+        },
+    );
+    tokio::pin!(run);
+    let speak = |event| {
+        if let AgentEvent::TextDelta { text } = event {
+            let _ = deltas.send(text);
+        }
+    };
+    let result = loop {
+        tokio::select! {
+            biased;
+            Some(event) = heard.recv() => speak(event),
+            result = &mut run => break result,
+        }
+    };
+    while let Ok(event) = heard.try_recv() {
+        speak(event);
+    }
+    let result = result.map_err(|err| match err {
+        izwi_agent::AgentError::InvalidInput(msg) => msg,
+        other => other.to_string(),
+    })?;
     {
         let mut reply = control.reply();
         reply.text = Some(strip_reasoning(&result.assistant_text));
         reply.raw_text = Some(result.assistant_text.clone());
         reply.meta = MemoryMessageMeta {
             model_id: Some(resolved_model_id.clone()),
-            ..backend.usage()
+            tokens_generated: Some(result.tokens_generated),
+            generation_time_ms: Some(result.generation_time_ms),
         };
+    }
+    if result.finish == izwi_agent::TurnFinish::Cancelled {
+        return Err("Turn cancelled".to_string());
     }
     state
         .touch_agent_session_record(session_id, now_unix_millis(), resolved_model_id)
@@ -2913,7 +2928,7 @@ async fn store_reply(state: &AppState, control: &TurnControl) {
             reply.raw_text.clone(),
         )
     };
-    let memory = VoiceContextMemoryStore::new(state.chat_store.clone(), None);
+    let memory = ThreadMemory::new(state.chat_store.clone(), None);
     if let Err(err) = AgentEngine
         .commit_assistant_reply(&memory, &session, &text, meta)
         .await
@@ -3358,161 +3373,6 @@ fn send_turn_error(
             "message": message,
         }),
     );
-}
-
-struct VoiceContextMemoryStore {
-    chat_store: Arc<ChatStore>,
-    memory_context: Option<String>,
-}
-
-impl VoiceContextMemoryStore {
-    fn new(chat_store: Arc<ChatStore>, memory_context: Option<String>) -> Self {
-        Self {
-            chat_store,
-            memory_context,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl MemoryStore for VoiceContextMemoryStore {
-    async fn load_messages(&self, thread_id: &str) -> izwi_agent::Result<Vec<MemoryMessage>> {
-        let records = self
-            .chat_store
-            .list_messages(thread_id.to_string())
-            .await
-            .map_err(|err| izwi_agent::AgentError::Memory(err.to_string()))?;
-
-        let mut out =
-            Vec::with_capacity(records.len() + usize::from(self.memory_context.is_some()));
-        if let Some(memory_context) = self.memory_context.clone() {
-            out.push(MemoryMessage {
-                role: MemoryMessageRole::System,
-                content: memory_context,
-            });
-        }
-        for record in records {
-            let role = match record.role.as_str() {
-                "system" => MemoryMessageRole::System,
-                "user" => MemoryMessageRole::User,
-                "assistant" => MemoryMessageRole::Assistant,
-                other => {
-                    return Err(izwi_agent::AgentError::Memory(format!(
-                        "Invalid stored chat role: {other}"
-                    )));
-                }
-            };
-            out.push(MemoryMessage {
-                role,
-                content: record.content,
-            });
-        }
-
-        Ok(out)
-    }
-
-    async fn append_message(
-        &self,
-        thread_id: &str,
-        role: MemoryMessageRole,
-        content: String,
-        meta: MemoryMessageMeta,
-    ) -> izwi_agent::Result<()> {
-        self.chat_store
-            .append_message(
-                thread_id.to_string(),
-                role.as_str().to_string(),
-                content,
-                None,
-                meta.model_id,
-                meta.tokens_generated,
-                meta.generation_time_ms,
-            )
-            .await
-            .map_err(|err| izwi_agent::AgentError::Memory(err.to_string()))?;
-        Ok(())
-    }
-}
-
-struct IzwiRuntimeBackend {
-    runtime: Arc<izwi_core::RuntimeService>,
-    correlation_id: String,
-    runtime_context: RuntimeRequestContext,
-    /// Receives the reply's text as it is generated.
-    deltas: tokio::sync::mpsc::UnboundedSender<String>,
-    usage: Mutex<Option<(usize, f64)>>,
-}
-
-impl IzwiRuntimeBackend {
-    fn usage(&self) -> MemoryMessageMeta {
-        let usage = *self
-            .usage
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        MemoryMessageMeta {
-            model_id: None,
-            tokens_generated: usage.map(|(tokens, _)| tokens),
-            generation_time_ms: usage.map(|(_, ms)| ms),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl ModelBackend for IzwiRuntimeBackend {
-    /// A streamed reply without reasoning: voice cannot speak thinking, and
-    /// waiting for it would hold back the first audio (SPK-F2).
-    async fn generate(&self, request: ModelRequest) -> izwi_agent::Result<ModelOutput> {
-        let variant = parse_chat_model_variant(Some(&request.model_id))
-            .map_err(|err| izwi_agent::AgentError::Model(err.to_string()))?;
-
-        let mut runtime_messages = Vec::with_capacity(request.messages.len());
-        for message in request.messages {
-            let role = match message.role {
-                MemoryMessageRole::System => ChatRole::System,
-                MemoryMessageRole::User => ChatRole::User,
-                MemoryMessageRole::Assistant => ChatRole::Assistant,
-            };
-            runtime_messages.push(ChatMessage {
-                role,
-                content: message.content,
-            });
-        }
-
-        let deltas = self.deltas.clone();
-        let generation = self
-            .runtime
-            .chat_generate_streaming_with_runtime_context(
-                variant,
-                runtime_messages,
-                GenerationParams {
-                    max_tokens: request.max_output_tokens.clamp(1, 4096),
-                    ..Default::default()
-                },
-                ChatRequestConfig {
-                    enable_thinking: Some(false),
-                    truncation: ChatTruncation::Auto,
-                    ..ChatRequestConfig::default()
-                },
-                Some(&self.correlation_id),
-                self.runtime_context,
-                move |delta| {
-                    let _ = deltas.send(delta);
-                },
-            )
-            .await
-            .map_err(|err| izwi_agent::AgentError::Model(err.to_string()))?;
-
-        *self
-            .usage
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) =
-            Some((generation.tokens_generated, generation.generation_time_ms));
-        Ok(ModelOutput {
-            text: generation.text,
-            tokens_generated: generation.tokens_generated,
-            generation_time_ms: generation.generation_time_ms,
-        })
-    }
 }
 
 #[cfg(test)]

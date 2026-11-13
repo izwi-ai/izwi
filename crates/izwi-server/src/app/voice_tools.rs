@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use izwi_agent::{NoopTool, TimeTool, ToolContext, ToolRegistry};
+use izwi_agent::{TimeTool, ToolContext, ToolRegistry};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
@@ -22,7 +22,6 @@ const FUNCTION_CALL_TIMEOUT_RANGE_MS: (u64, u64) = (1_000, 60_000);
 /// The server's built-in tools, shared by agent turns and voice turns.
 pub(crate) fn builtin_tool_registry() -> ToolRegistry {
     let mut tools = ToolRegistry::new();
-    tools.register(NoopTool);
     tools.register(TimeTool);
     tools
 }
@@ -120,7 +119,7 @@ impl VoiceTools {
     /// client's.
     pub(crate) fn definitions(&self) -> Vec<Value> {
         let mut definitions = if self.builtin {
-            builtin_tool_registry().function_definitions()
+            builtin_tool_registry().function_definitions(None)
         } else {
             Vec::new()
         };
@@ -301,7 +300,7 @@ mod tests {
         assert_eq!(tools.timeout, Duration::from_secs(10));
         assert_eq!(tools.executor("time").unwrap().as_str(), "server");
         assert_eq!(tools.executor("get_weather").unwrap().as_str(), "client");
-        assert!(tools.executor("noop").is_none());
+        assert!(tools.executor("nope").is_none());
 
         // The Responses form, no built-ins, a clamped timeout.
         let responses = json!({"type": "function", "name": "lookup", "parameters": {}});
@@ -381,8 +380,10 @@ mod tests {
         let context = ToolContext {
             session_id: "s".into(),
             thread_id: "t".into(),
+            call_id: "c".into(),
             user_text: String::new(),
             arguments: Value::Null,
+            cancel: izwi_agent::TurnCancel::new(),
         };
         let outcome =
             run_builtin_call(tool.clone(), "{}", context.clone(), Duration::from_secs(1)).await;

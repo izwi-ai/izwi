@@ -3512,10 +3512,12 @@ version = "0.1.2"
 dependencies = [
  "async-trait",
  "chrono",
+ "futures",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

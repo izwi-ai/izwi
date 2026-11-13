@@ -17,7 +17,6 @@ use crate::studio_project_store::StudioProjectStore;
 use crate::transcription_store::TranscriptionStore;
 use crate::voice_observation_store::VoiceObservationStore;
 use crate::voice_store::VoiceStore;
-use izwi_agent::planner::PlanningMode;
 use izwi_core::{
     JobCancellation, RuntimeRequestContext, RuntimeService, ServeRuntimeConfig, WorkloadClass,
 };
@@ -365,7 +364,6 @@ pub struct StoredAgentSessionRecord {
     pub thread_id: String,
     pub model_id: String,
     pub system_prompt: String,
-    pub planning_mode: PlanningMode,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -954,7 +952,6 @@ mod tests {
         StoredResponseRecord,
     };
     use crate::test_support::env_lock;
-    use izwi_agent::planner::PlanningMode;
     use izwi_core::{
         backends::BackendPreference, RuntimeService, ServeRuntimeConfig, WorkloadClass,
     };
@@ -1038,7 +1035,6 @@ mod tests {
                 thread_id: "thread-old".to_string(),
                 model_id: "model".to_string(),
                 system_prompt: "prompt".to_string(),
-                planning_mode: PlanningMode::Auto,
                 created_at: 1,
                 updated_at: 5,
             },
@@ -1051,7 +1047,6 @@ mod tests {
                 thread_id: "thread-new".to_string(),
                 model_id: "model".to_string(),
                 system_prompt: "prompt".to_string(),
-                planning_mode: PlanningMode::Auto,
                 created_at: 2,
                 updated_at: 15,
             },
@@ -1380,7 +1375,6 @@ mod tests {
             thread_id: format!("thread-{id}"),
             model_id: "model".to_string(),
             system_prompt: "prompt".to_string(),
-            planning_mode: PlanningMode::Auto,
             created_at: updated_at,
             updated_at,
         }

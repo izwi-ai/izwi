@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -6,18 +5,14 @@ use axum::{
     Json,
 };
 use izwi_agent::{
-    planner::{PlanningMode, SimplePlanner},
-    AgentDefinition, AgentEngine, AgentEvent, AgentSession, AgentTurnOptions, MemoryMessage,
-    MemoryMessageMeta, MemoryMessageRole, MemoryStore, ModelBackend, ModelOutput, ModelRequest,
-    TurnInput,
+    AgentDefinition, AgentEngine, AgentEvent, AgentSession, AgentSet, AgentTurnOptions,
+    BackgroundResults, TurnCancel, TurnContext, TurnEvents, TurnInput,
 };
-use izwi_core::{
-    parse_chat_model_variant, ChatMessage, ChatRole, RuntimeRequestContext, WorkloadClass,
-};
+use izwi_core::{parse_chat_model_variant, WorkloadClass};
 use serde::{Deserialize, Serialize};
 
 use crate::api::request_context::RequestContext;
-use crate::chat_store::ChatStore;
+use crate::app::agent_runtime::{ChatAgentBackend, RoundAdmission, ThreadMemory};
 use crate::error::{ApiError, ApiJson};
 use crate::ids::new_uuid;
 use crate::state::{AppState, StoredAgentSessionRecord};
@@ -34,8 +29,9 @@ pub struct CreateAgentSessionRequest {
     pub model_id: Option<String>,
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// Ignored: turns no longer plan ahead of the model.
     #[serde(default)]
-    pub planning_mode: Option<PlanningMode>,
+    pub planning_mode: Option<serde_json::Value>,
     #[serde(default)]
     pub title: Option<String>,
 }
@@ -46,7 +42,6 @@ pub struct AgentSessionResponse {
     pub agent_id: String,
     pub thread_id: String,
     pub model_id: String,
-    pub planning_mode: PlanningMode,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -66,7 +61,6 @@ pub struct AgentTurnResponse {
     pub thread_id: String,
     pub model_id: String,
     pub assistant_text: String,
-    pub plan: Option<izwi_agent::PlanSummary>,
     pub tool_calls: Vec<izwi_agent::ToolCallRecord>,
     pub events: Vec<AgentEvent>,
 }
@@ -89,7 +83,7 @@ pub async fn create_session(
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_VOICE_AGENT_SYSTEM_PROMPT)
         .to_string();
-    let planning_mode = req.planning_mode.unwrap_or(PlanningMode::Auto);
+    let _ = req.planning_mode;
 
     let thread = state
         .chat_store
@@ -105,7 +99,6 @@ pub async fn create_session(
         thread_id: thread.id.clone(),
         model_id: model_id.clone(),
         system_prompt,
-        planning_mode,
         created_at: now,
         updated_at: now,
     };
@@ -149,14 +142,12 @@ pub async fn create_turn(
         .clone()
         .unwrap_or_else(|| session_record.model_id.clone());
 
-    let agent = AgentDefinition {
-        id: session_record.agent_id.clone(),
-        name: DEFAULT_VOICE_AGENT_NAME.to_string(),
-        system_prompt: session_record.system_prompt.clone(),
-        default_model: session_record.model_id.clone(),
-        capabilities: Default::default(),
-        planning_mode: session_record.planning_mode,
-    };
+    let agents = AgentSet::single(AgentDefinition::new(
+        session_record.agent_id.clone(),
+        DEFAULT_VOICE_AGENT_NAME,
+        session_record.system_prompt.clone(),
+        session_record.model_id.clone(),
+    ));
     let session = AgentSession {
         id: session_record.id.clone(),
         agent_id: session_record.agent_id.clone(),
@@ -166,32 +157,33 @@ pub async fn create_turn(
     };
 
     let permit = state.admit_request(WorkloadClass::Interactive).await?;
-    let memory = ChatStoreMemory::new(state.chat_store.clone());
-    let backend = IzwiRuntimeBackend {
+    let memory = ThreadMemory::new(state.chat_store.clone(), None);
+    let backend = ChatAgentBackend {
         runtime: state.runtime.clone(),
         correlation_id: ctx.correlation_id,
-        runtime_context: permit.runtime_context(),
+        admission: RoundAdmission::Held(permit.runtime_context()),
     };
-    let planner = SimplePlanner;
     let tools = crate::app::voice_tools::builtin_tool_registry();
-
-    let engine = AgentEngine;
-    let result = engine
+    let turn = TurnContext {
+        agents: &agents,
+        memory: &memory,
+        model: &backend,
+        tools: &tools,
+        events: TurnEvents::none(),
+        cancel: TurnCancel::new(),
+        background: BackgroundResults::default(),
+    };
+    let result = AgentEngine
         .run_turn(
-            &agent,
+            &turn,
             &session,
             TurnInput { text: req.input },
             Some(resolved_model_id.clone()),
-            &memory,
-            &backend,
-            &planner,
-            &tools,
             AgentTurnOptions {
                 max_output_tokens: resolve_max_output_tokens_for_model(
                     &resolved_model_id,
                     req.max_output_tokens,
                 )?,
-                max_tool_calls: 1,
                 ..AgentTurnOptions::default()
             },
         )
@@ -207,7 +199,6 @@ pub async fn create_turn(
         thread_id: session_record.thread_id,
         model_id: result.model_id,
         assistant_text: result.assistant_text,
-        plan: result.plan,
         tool_calls: result.tool_calls,
         events: result.events,
     }))
@@ -219,7 +210,6 @@ fn session_response(record: StoredAgentSessionRecord) -> AgentSessionResponse {
         agent_id: record.agent_id,
         thread_id: record.thread_id,
         model_id: record.model_id,
-        planning_mode: record.planning_mode,
         created_at: record.created_at,
         updated_at: record.updated_at,
     }
@@ -280,116 +270,6 @@ fn map_agent_error(err: izwi_agent::AgentError) -> ApiError {
     match err {
         izwi_agent::AgentError::InvalidInput(msg) => ApiError::bad_request(msg),
         other => ApiError::internal(other.to_string()),
-    }
-}
-
-struct ChatStoreMemory {
-    chat_store: Arc<ChatStore>,
-}
-
-impl ChatStoreMemory {
-    fn new(chat_store: Arc<ChatStore>) -> Self {
-        Self { chat_store }
-    }
-}
-
-#[async_trait::async_trait]
-impl MemoryStore for ChatStoreMemory {
-    async fn load_messages(&self, thread_id: &str) -> izwi_agent::Result<Vec<MemoryMessage>> {
-        let records = self
-            .chat_store
-            .list_messages(thread_id.to_string())
-            .await
-            .map_err(|err| izwi_agent::AgentError::Memory(err.to_string()))?;
-
-        let mut out = Vec::with_capacity(records.len());
-        for record in records {
-            let role = match record.role.as_str() {
-                "system" => MemoryMessageRole::System,
-                "user" => MemoryMessageRole::User,
-                "assistant" => MemoryMessageRole::Assistant,
-                other => {
-                    return Err(izwi_agent::AgentError::Memory(format!(
-                        "Invalid stored chat role: {other}"
-                    )))
-                }
-            };
-            out.push(MemoryMessage {
-                role,
-                content: record.content,
-            });
-        }
-
-        Ok(out)
-    }
-
-    async fn append_message(
-        &self,
-        thread_id: &str,
-        role: MemoryMessageRole,
-        content: String,
-        meta: MemoryMessageMeta,
-    ) -> izwi_agent::Result<()> {
-        self.chat_store
-            .append_message(
-                thread_id.to_string(),
-                role.as_str().to_string(),
-                content,
-                None,
-                meta.model_id,
-                meta.tokens_generated,
-                meta.generation_time_ms,
-            )
-            .await
-            .map_err(|err| izwi_agent::AgentError::Memory(err.to_string()))?;
-        Ok(())
-    }
-}
-
-struct IzwiRuntimeBackend {
-    runtime: Arc<izwi_core::RuntimeService>,
-    correlation_id: String,
-    runtime_context: RuntimeRequestContext,
-}
-
-#[async_trait::async_trait]
-impl ModelBackend for IzwiRuntimeBackend {
-    async fn generate(&self, request: ModelRequest) -> izwi_agent::Result<ModelOutput> {
-        let variant = parse_chat_model_variant(Some(&request.model_id))
-            .map_err(|err| izwi_agent::AgentError::Model(err.to_string()))?;
-
-        let mut runtime_messages = Vec::with_capacity(request.messages.len());
-        for message in request.messages {
-            let role = match message.role {
-                MemoryMessageRole::System => ChatRole::System,
-                MemoryMessageRole::User => ChatRole::User,
-                MemoryMessageRole::Assistant => ChatRole::Assistant,
-            };
-            runtime_messages.push(ChatMessage {
-                role,
-                content: message.content,
-            });
-        }
-
-        let generation = self
-            .runtime
-            .chat_generate_with_correlation_and_runtime_context(
-                variant,
-                runtime_messages,
-                request
-                    .max_output_tokens
-                    .clamp(1, max_output_token_ceiling(variant)),
-                Some(&self.correlation_id),
-                self.runtime_context,
-            )
-            .await
-            .map_err(|err| izwi_agent::AgentError::Model(err.to_string()))?;
-
-        Ok(ModelOutput {
-            text: generation.text,
-            tokens_generated: generation.tokens_generated,
-            generation_time_ms: generation.generation_time_ms,
-        })
     }
 }
 
