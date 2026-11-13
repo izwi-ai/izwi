@@ -18,7 +18,7 @@
 # -----------------------------------------------------------------------------
 # Stage 1: Build the React UI
 # -----------------------------------------------------------------------------
-FROM node:24.22.1-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS ui-builder
+FROM node:26.13.0-trixie-slim@sha256:5adad64f9a1fca2d51972caa65983634c8a774eb300d72b20f7f2a0f60368072 AS ui-builder
 
 WORKDIR /app/ui
 
@@ -33,7 +33,7 @@ RUN npm run build
 # Stage 2: The Rust toolchain. The full rust image already has the C and C++
 # toolchain the -sys crates need; nothing links OpenSSL.
 # -----------------------------------------------------------------------------
-FROM rust:1.99.1-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc AS rust-toolchain
+FROM rust:1.99.1-trixie@sha256:8a4e90c7946b74626488b1446f712c0fe0ed1a596cbd3d871684bc9c5433ae07 AS rust-toolchain
 
 # -----------------------------------------------------------------------------
 # Stage 2a: Build the Rust backend (CPU)
@@ -89,7 +89,7 @@ RUN --mount=type=cache,id=izwi-cargo-registry,target=/usr/local/cargo/registry,s
 # digest-pinned rust image above rather than fetched with curl | sh; rustup's
 # release binaries run on any glibc distribution.
 # -----------------------------------------------------------------------------
-FROM nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04@sha256:0230b7f243483cb15969fa3cc724a9459599604427052fc2a0d4291c7c0647dd AS rust-builder-cuda
+FROM nvidia/cuda:13.5.0-cudnn-devel-ubuntu24.04@sha256:f24a2953ce729567af330c06d850a4f61f3a58df6901f9189d3319ea8881c107 AS rust-builder-cuda
 ARG TARGETARCH
 ARG CUDA_COMPUTE_CAP=80
 ARG IZWI_CUDA_FEATURES=cuda,cudnn
@@ -137,7 +137,7 @@ RUN --mount=type=cache,id=izwi-cargo-registry,target=/usr/local/cargo/registry,s
 # -----------------------------------------------------------------------------
 # Stage 4: Production runtime (CPU)
 # -----------------------------------------------------------------------------
-FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS production
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS production
 
 LABEL org.opencontainers.image.title="Izwi Audio" \
       org.opencontainers.image.description="Rust-native audio inference engine" \
@@ -193,7 +193,7 @@ CMD ["izwi-server"]
 # -----------------------------------------------------------------------------
 # Stage 5: Production runtime with CUDA support (Docker-only CUDA artifact)
 # -----------------------------------------------------------------------------
-FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04@sha256:14f6d08d1cd4a96effbfe3101d0b56326f552c199d05e4979ee0bd616df5811b AS production-cuda
+FROM nvidia/cuda:13.5.0-cudnn-runtime-ubuntu24.04@sha256:0490edd1b0d88388497dfbe3762d0deab0ded3baf4828616636c17cbd44723e3 AS production-cuda
 
 LABEL org.opencontainers.image.title="Izwi Audio (CUDA)" \
       org.opencontainers.image.description="Rust-native audio inference engine with CUDA support" \
@@ -253,7 +253,7 @@ CMD ["izwi-server"]
 # fleets: the gateway never runs a model. Distroless: no shell or package
 # manager, only glibc, libgcc and CA certificates.
 # -----------------------------------------------------------------------------
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:83b9b50586253821cf63ffcec87d3d94265a093ad30da232039af962dd8f4edf AS production-gateway
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2 AS production-gateway
 
 LABEL org.opencontainers.image.title="Izwi Gateway" \
       org.opencontainers.image.description="Izwi public API gateway: OpenAI-compatible routing to approved inference workers" \
