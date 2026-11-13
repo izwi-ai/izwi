@@ -527,6 +527,11 @@ struct InputStreamStartEvent {
     /// How long a turn waits for the client's output of a call.
     #[serde(default)]
     function_call_timeout_ms: Option<u64>,
+    /// What a modular reply says when a tool has kept it waiting and it
+    /// has said nothing yet. Default "One moment." for English sessions and
+    /// nothing otherwise; an empty string turns it off.
+    #[serde(default)]
+    tool_wait_phrase: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -557,6 +562,8 @@ pub(crate) struct ModularVoiceTurnConfig {
     output_format: OutputAudioFormat,
     /// The tools its turns may call, when the chat model can call tools.
     tools: Option<VoiceTools>,
+    /// Said when a tool keeps a silent reply waiting.
+    tool_wait_phrase: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -782,6 +789,8 @@ struct ConnectionState {
     next_turn_generation: u64,
     /// The client's tool calls the session's turns await.
     function_calls: PendingFunctionCalls,
+    /// The results of background tools, for the next turn to tell.
+    background_results: BackgroundResults,
 }
 
 impl Default for ConnectionState {
@@ -805,6 +814,7 @@ impl Default for ConnectionState {
             owner_instance_id: process_owner_instance_id().to_string(),
             next_turn_generation: 0,
             function_calls: PendingFunctionCalls::default(),
+            background_results: BackgroundResults::default(),
         }
     }
 }
@@ -987,6 +997,7 @@ fn finalize_stream_vad_utterance(
             output_generation,
             model_leases: conn.model_leases.clone(),
             function_calls: conn.function_calls.clone(),
+            background_results: conn.background_results.clone(),
         },
         record,
         wav_bytes,
@@ -1238,6 +1249,7 @@ async fn handle_text_message(
                 tools,
                 builtin_tools,
                 function_call_timeout_ms,
+                tool_wait_phrase,
             } = *start;
             if !conn.started {
                 return Err("Session not started. Send `session_start` first.".to_string());
@@ -1263,6 +1275,7 @@ async fn handle_text_message(
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
 
+            let normalized_asr_language_for_phrase = normalized_asr_language.clone();
             let turn_config = match mode {
                 RealtimeVoiceMode::Modular => {
                     let Some(asr_model_id) = normalized_asr else {
@@ -1309,12 +1322,16 @@ async fn handle_text_message(
                         text_model_id,
                         tts_model_id,
                         speaker: normalized_speaker.clone(),
-                        asr_language: normalized_asr_language,
+                        asr_language: normalized_asr_language.clone(),
                         max_output_tokens: max_output_tokens
                             .unwrap_or(VOICE_DEFAULT_MAX_OUTPUT_TOKENS)
                             .clamp(1, 4096),
                         output_format,
                         tools,
+                        tool_wait_phrase: resolve_tool_wait_phrase(
+                            tool_wait_phrase,
+                            normalized_asr_language_for_phrase.as_deref(),
+                        ),
                     })
                 }
                 RealtimeVoiceMode::Unified => {
@@ -1584,6 +1601,8 @@ struct TurnContext {
     output_generation: u64,
     model_leases: SessionModelLeases,
     function_calls: PendingFunctionCalls,
+    /// The results of background tools, for the next turn to tell.
+    background_results: BackgroundResults,
 }
 
 fn spawn_turn_task(
@@ -1607,6 +1626,7 @@ fn spawn_turn_task(
             output_generation,
             model_leases,
             function_calls,
+            background_results,
         } = context;
         let timeout_secs = state.request_timeout_secs.max(1);
         let timeout = Duration::from_secs(timeout_secs);
@@ -1803,7 +1823,13 @@ fn spawn_turn_task(
                             &correlation_id,
                             &control,
                             &turn_record_id,
-                            config.tools.as_ref().map(|tools| (tools, &function_calls)),
+                            config.tools.as_ref().map(|tools| VoiceTurnTools {
+                                tools,
+                                pending: &function_calls,
+                                background: &background_results,
+                                voice_session_id: &voice_session_id,
+                            }),
+                            config.tool_wait_phrase.as_deref(),
                             &|event: &AgentEvent| {
                                 if let Some(message) = function_call_message(
                                     event,
@@ -1919,9 +1945,10 @@ fn spawn_turn_task(
 
                     let history_messages =
                         build_unified_history(&state, &voice_session_id, &turn_record_id).await?;
-                    let tools = config.tools.as_ref().map(|tools| UnifiedTurnTools {
+                    let tools = config.tools.as_ref().map(|tools| VoiceTurnTools {
                         tools,
                         pending: &function_calls,
+                        background: &background_results,
                         voice_session_id: &voice_session_id,
                     });
                     let generation = stream_unified_s2s_to_socket(
@@ -2250,10 +2277,26 @@ struct UnifiedReplyStream {
 }
 
 /// The tools a spoken turn offers and how their calls reach the client.
-struct UnifiedTurnTools<'a> {
+struct VoiceTurnTools<'a> {
     tools: &'a VoiceTools,
     pending: &'a PendingFunctionCalls,
+    /// Where background tools leave their results for the next turn.
+    background: &'a BackgroundResults,
     voice_session_id: &'a str,
+}
+
+/// How long a tool may keep a reply silent before the reply says so.
+const TOOL_WAIT_PHRASE_AFTER: Duration = Duration::from_millis(1_500);
+
+/// What a reply says while a tool keeps it waiting: the session's phrase,
+/// or "One moment." when the session speaks English (or names no language).
+fn resolve_tool_wait_phrase(requested: Option<String>, language: Option<&str>) -> Option<String> {
+    match requested {
+        Some(phrase) => Some(phrase.trim().to_string()).filter(|phrase| !phrase.is_empty()),
+        None => language
+            .is_none_or(|language| language.to_ascii_lowercase().starts_with("en"))
+            .then(|| "One moment.".to_string()),
+    }
 }
 
 /// A unified spoken turn: the model's reply streamed to the socket. With
@@ -2274,7 +2317,7 @@ async fn stream_unified_s2s_to_socket(
     max_output_tokens: usize,
     output_format: OutputAudioFormat,
     audio_bytes: &[u8],
-    tools: Option<UnifiedTurnTools<'_>>,
+    tools: Option<VoiceTurnTools<'_>>,
     control: &TurnControl,
     output_generation: u64,
     model_leases: &SessionModelLeases,
@@ -2362,7 +2405,10 @@ async fn stream_unified_s2s_to_socket(
         tools: &registry,
         events: TurnEvents::new(events),
         cancel,
-        background: BackgroundResults::default(),
+        background: tools
+            .as_ref()
+            .map(|tools| tools.background.clone())
+            .unwrap_or_default(),
     };
     let defaults = AgentTurnOptions::default();
     let run = AgentEngine.run_conversation(
@@ -2896,7 +2942,8 @@ async fn run_agent_turn(
     correlation_id: &str,
     control: &TurnControl,
     turn_record_id: &str,
-    tools: Option<(&VoiceTools, &PendingFunctionCalls)>,
+    tools: Option<VoiceTurnTools<'_>>,
+    tool_wait_phrase: Option<&str>,
     on_event: &(dyn Fn(&AgentEvent) + Sync),
     deltas: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> Result<String, String> {
@@ -2953,9 +3000,13 @@ async fn run_agent_turn(
         correlation_id,
         RoundAdmission::PerRound(state),
     );
-    let tool_timeout = tools.map(|(tools, _)| tools.timeout);
+    let tool_timeout = tools.as_ref().map(|tools| tools.tools.timeout);
+    let background = tools
+        .as_ref()
+        .map(|tools| tools.background.clone())
+        .unwrap_or_default();
     let tools = tools
-        .map(|(tools, pending)| tools.registry(pending))
+        .map(|tools| tools.tools.registry(tools.pending))
         .unwrap_or_default();
     let (cancel, _cancel_link) = cancel_with(control);
     let (events, heard) = tokio::sync::mpsc::unbounded_channel();
@@ -2966,7 +3017,7 @@ async fn run_agent_turn(
         tools: &tools,
         events: TurnEvents::new(events),
         cancel,
-        background: BackgroundResults::default(),
+        background,
     };
     let defaults = AgentTurnOptions::default();
     let run = AgentEngine.run_turn(
@@ -2979,15 +3030,29 @@ async fn run_agent_turn(
         AgentTurnOptions {
             max_output_tokens: max_output_tokens.clamp(1, 4096),
             tool_timeout: tool_timeout.unwrap_or(defaults.tool_timeout),
+            tool_soft_timeout: tool_wait_phrase.map(|_| TOOL_WAIT_PHRASE_AFTER),
             history: VOICE_HISTORY_BUDGET,
             persist_assistant_reply: false,
             ..defaults
         },
     );
+    // A reply that has said nothing while a tool runs says it is waiting,
+    // once.
+    let mut spoke = false;
     let result = drive_turn(run, heard, |event| {
         on_event(&event);
-        if let AgentEvent::TextDelta { text } = event {
-            let _ = deltas.send(text);
+        match event {
+            AgentEvent::TextDelta { text } => {
+                spoke |= !text.trim().is_empty();
+                let _ = deltas.send(text);
+            }
+            AgentEvent::ToolCallSlow { .. } if !spoke => {
+                if let Some(phrase) = tool_wait_phrase {
+                    spoke = true;
+                    let _ = deltas.send(format!("{phrase} "));
+                }
+            }
+            _ => {}
         }
     })
     .await;
@@ -3629,9 +3694,11 @@ mod tests {
             let started = Instant::now();
             let reply = {
                 let control = TurnControl::new(Instant::now());
-                let turn_tools = UnifiedTurnTools {
+                let background = BackgroundResults::default();
+                let turn_tools = VoiceTurnTools {
                     tools: &tools,
                     pending: &pending,
+                    background: &background,
                     voice_session_id: "voice-session-1",
                 };
                 stream_unified_s2s_to_socket(
@@ -4172,6 +4239,7 @@ mod tests {
                 max_output_tokens: 64,
                 output_format: OutputAudioFormat::G711Ulaw,
                 tools: None,
+                tool_wait_phrase: None,
             }),
             endpointed_at: Instant::now(),
             endpointing_delay: None,
@@ -4318,6 +4386,21 @@ mod tests {
         )
         .expect_err("resume must be rejected")
         .contains("non-resumable"));
+    }
+
+    #[test]
+    fn a_waiting_reply_speaks_english_by_default_and_the_sessions_phrase_otherwise() {
+        let phrase = |requested: Option<&str>, language: Option<&str>| {
+            resolve_tool_wait_phrase(requested.map(str::to_string), language)
+        };
+        assert_eq!(phrase(None, None).as_deref(), Some("One moment."));
+        assert_eq!(phrase(None, Some("en-US")).as_deref(), Some("One moment."));
+        assert_eq!(phrase(None, Some("zu")), None);
+        assert_eq!(
+            phrase(Some(" Ngicela ulinde. "), Some("zu")).as_deref(),
+            Some("Ngicela ulinde.")
+        );
+        assert_eq!(phrase(Some(""), None), None);
     }
 
     #[test]

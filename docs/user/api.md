@@ -2267,9 +2267,10 @@ Client JSON messages:
 | `pre_roll_ms` | Audio retained before speech start. |
 | `barge_in_min_speech_ms` | Voiced speech, default `300`, that interrupts a speaking assistant. A shorter sound (a cough, a door, speaker echo) does not interrupt it. `0` interrupts on the first speech frame. |
 | `input_sample_rate` | Expected input sample rate. |
-| `tools` | Modular mode with a chat model that calls tools (Qwen3, Qwen3.5, LFM2.5, LFM3), or unified mode on LFM3-Audio: OpenAI function tools (`{"type": "function", "function": {"name", "description", "parameters"}}`, or the Responses form with the fields on the tool) the reply may call. The client runs them: it gets `function_call` and answers with `function_call_output`. A name must be letters, digits, `_` or `-`, unique, and not a built-in tool's. At most 64. |
+| `tools` | Modular mode with a chat model that calls tools (Qwen3, Qwen3.5, LFM2.5, LFM3), or unified mode on LFM3-Audio: OpenAI function tools (`{"type": "function", "function": {"name", "description", "parameters"}}`, or the Responses form with the fields on the tool) the reply may call. The client runs them: it gets `function_call` and answers with `function_call_output`. A name must be letters, digits, `_` or `-`, unique, and not a built-in tool's. At most 64. A tool with `"background": true` does not hold the reply: the call is reported with status `started`, the reply tells the user it is under way, and the output the client sends within 120 s is told in the next turn. |
 | `builtin_tools` | With a model that calls tools: whether the reply may also call the server's built-in tools (today `time`, the local date and time). Default `true`. |
 | `function_call_timeout_ms` | How long a turn waits for a call's result: default `10000`, clamped to `1000..60000`. |
+| `tool_wait_phrase` | Modular mode: what the reply says when a tool has kept it waiting 1.5 s and it has said nothing yet. Default `"One moment."` when `asr_language` is unset or English, nothing otherwise; `""` turns it off. |
 
 Client binary frame:
 

@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use izwi_agent::{AgentError, AgentEvent, TimeTool, Tool, ToolContext, ToolOutput, ToolRegistry};
+use izwi_agent::{
+    AgentError, AgentEvent, TimeTool, Tool, ToolContext, ToolExecution, ToolOutput, ToolRegistry,
+};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
@@ -129,6 +131,7 @@ impl VoiceTools {
                     .get("parameters")
                     .cloned()
                     .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                background: tool["background"].as_bool() == Some(true),
                 pending: pending.clone(),
             });
         }
@@ -142,6 +145,9 @@ struct ClientTool {
     name: String,
     description: String,
     parameters: Value,
+    /// The reply does not wait for the client's output: it reaches the
+    /// next turn.
+    background: bool,
     pending: PendingFunctionCalls,
 }
 
@@ -161,6 +167,14 @@ impl Tool for ClientTool {
 
     fn executor(&self) -> &'static str {
         "client"
+    }
+
+    fn execution(&self) -> ToolExecution {
+        if self.background {
+            ToolExecution::Background
+        } else {
+            ToolExecution::Inline
+        }
     }
 
     async fn invoke(&self, ctx: ToolContext) -> izwi_agent::Result<ToolOutput> {
@@ -205,7 +219,8 @@ pub(crate) fn function_call_message(
             "utterance_seq": utterance_seq,
             "call_id": call_id,
             "name": name,
-            // An interrupted call is an error on the wire.
+            // An interrupted call is an error on the wire; a background
+            // call reports `started` and its result reaches the next turn.
             "status": if status == "cancelled" { "error" } else { status.as_str() },
             "output": output,
         })),
@@ -243,7 +258,13 @@ fn chat_function_tool(tool: Value) -> Result<Value, String> {
             "Voice tool name {name:?} must be letters, digits, `_` or `-`"
         ));
     }
-    Ok(json!({"type": "function", "function": function}))
+    let background = tool.get("background").and_then(Value::as_bool) == Some(true)
+        || function.get("background").and_then(Value::as_bool) == Some(true);
+    let mut function = function;
+    if let Some(function) = function.as_object_mut() {
+        function.remove("background");
+    }
+    Ok(json!({"type": "function", "function": function, "background": background}))
 }
 
 /// The client's calls a voice session awaits, by call id. A turn registers
@@ -407,6 +428,30 @@ mod tests {
         }
         assert!(pending.resolve("call_9", &json!("Sunny.")));
         assert_eq!(call.await.unwrap().unwrap().text, "Sunny.");
+    }
+
+    #[test]
+    fn a_client_tool_marked_background_does_not_hold_the_reply() {
+        let report = json!({
+            "type": "function", "background": true,
+            "function": {"name": "run_report", "parameters": {"type": "object"}}
+        });
+        let tools = VoiceTools::parse(Some(vec![report, weather()]), Some(false), None, true)
+            .unwrap()
+            .unwrap();
+        let registry = tools.registry(&PendingFunctionCalls::default());
+        assert_eq!(
+            registry.find("run_report").unwrap().execution(),
+            ToolExecution::Background
+        );
+        assert_eq!(
+            registry.find("get_weather").unwrap().execution(),
+            ToolExecution::Inline
+        );
+        // The flag is the server's, not part of what the model reads.
+        let definitions = registry.function_definitions(None);
+        assert!(definitions[0]["function"].get("background").is_none());
+        assert!(definitions[0].get("background").is_none());
     }
 
     #[test]
