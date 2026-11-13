@@ -3315,7 +3315,7 @@ async fn run_agent_turn(
     let (cancel, _cancel_link) = cancel_with(control);
     let (events, heard) = tokio::sync::mpsc::unbounded_channel();
     let turn = izwi_agent::TurnContext {
-        agents: &agents,
+        agents,
         memory: &memory,
         model: &backend,
         tools: &tools,

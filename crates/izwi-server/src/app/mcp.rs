@@ -268,9 +268,9 @@ impl McpClient {
             .and_then(|value| value.to_str().ok())
             .is_some_and(|kind| kind.starts_with("text/event-stream"));
         let message = if event_stream {
-            read_event_stream(response, id).await.map_err(&failed)?
+            read_event_stream(response, id).await.map_err(failed)?
         } else {
-            let bytes = read_capped(response).await.map_err(&failed)?;
+            let bytes = read_capped(response).await.map_err(failed)?;
             serde_json::from_slice::<Value>(&bytes)
                 .map_err(|err| failed(format!("invalid JSON: {err}")))?
         };
