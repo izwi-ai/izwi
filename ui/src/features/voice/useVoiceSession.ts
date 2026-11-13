@@ -91,6 +91,8 @@ export function useVoiceSession({
   const ttsStreamSessionRef = useRef(0);
   /** Assistant playback is ducked while the user may be speaking over it. */
   const playbackDuckedRef = useRef(false);
+  /** The server paused the reply: it resumes it or interrupts it later. */
+  const playbackPausedRef = useRef(false);
   const playbackGainValue = useCallback(
     () => (playbackDuckedRef.current ? VOICE_REALTIME_DUCK_GAIN : 1),
     [],
@@ -549,9 +551,19 @@ export function useVoiceSession({
       const playbackAction = voiceRealtimePlaybackAction(
         event,
         voiceWsPlaybackRef.current?.utteranceSeq ?? null,
+        playbackPausedRef.current,
       );
-      if (playbackAction === "stop") {
+      if (playbackAction === "pause") {
+        // Keep what is queued: a suspended context holds its schedule.
+        playbackPausedRef.current = true;
+        ttsPlaybackContextRef.current?.suspend().catch(() => {});
+      } else if (playbackAction === "resume") {
+        playbackPausedRef.current = false;
+        setPlaybackDucked(false);
+        ttsPlaybackContextRef.current?.resume().catch(() => {});
+      } else if (playbackAction === "stop") {
         clearAudioPlayback();
+        playbackPausedRef.current = false;
         playbackDuckedRef.current = false;
         voiceWsPlaybackRef.current = null;
         processingRef.current = false;
@@ -709,6 +721,7 @@ export function useVoiceSession({
           }
 
           clearAudioPlayback();
+          playbackPausedRef.current = false;
 
           const playbackContext = new AudioContext();
           const playbackGain = playbackContext.createGain();
@@ -1042,6 +1055,9 @@ export function useVoiceSession({
           // Replies use the server's voice length (short, spoken answers).
           max_utterance_ms: 20_000,
           pre_roll_ms: 160,
+          // A sound that turns out not to be speech (or to have no words)
+          // pauses the reply and lets it play on, instead of cutting it.
+          resume_false_interruptions: true,
           input_sample_rate: Math.round(inputSampleRate),
         };
         sendVoiceRealtimeJson(

@@ -295,6 +295,36 @@ describe("voice realtime support", () => {
     ).toBeNull();
   });
 
+  it("pauses a reply the server holds and resumes or stops it on the server's word", () => {
+    const active = { utterance_id: "active", utterance_seq: 7 };
+    const next = { utterance_id: "next", utterance_seq: 8 };
+    expect(
+      voiceRealtimePlaybackAction({ type: "turn_paused", ...active }, 7),
+    ).toBe("pause");
+    // While paused, the end of the user's speech decides nothing.
+    expect(
+      voiceRealtimePlaybackAction(
+        { type: "user_speech_end", ...next, reason: "silence" },
+        7,
+        true,
+      ),
+    ).toBeNull();
+    expect(
+      voiceRealtimePlaybackAction({ type: "turn_resumed", ...active }, 7, true),
+    ).toBe("resume");
+    expect(
+      voiceRealtimePlaybackAction(
+        { type: "turn_interrupted", ...active, reason: "barge_in" },
+        7,
+        true,
+      ),
+    ).toBe("stop");
+    // A pause of another utterance's reply is not this one's.
+    expect(
+      voiceRealtimePlaybackAction({ type: "turn_paused", ...next }, 7),
+    ).toBeNull();
+  });
+
   it("ends the speaking status only for the latest rejected speech", () => {
     expect(
       voiceRealtimeEndsUserSpeech(

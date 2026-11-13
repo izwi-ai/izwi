@@ -127,6 +127,8 @@ export type VoiceRealtimeServerEvent =
       utterance_seq: number;
       reason?: string;
     }
+  | { type: "turn_paused"; utterance_id: string; utterance_seq: number; reason?: string }
+  | { type: "turn_resumed"; utterance_id: string; utterance_seq: number }
   | {
       type: "turn_done";
       utterance_id: string;
@@ -202,6 +204,8 @@ type VoiceRealtimeV2Payload =
       type: "assistant_audio_completed";
       data: { last_chunk_sequence: number };
     }
+  | { type: "turn_paused"; data?: Record<string, never> | null }
+  | { type: "turn_resumed"; data?: Record<string, never> | null }
   | {
       type: "interruption";
       data: {
@@ -701,6 +705,9 @@ export function isVoiceRealtimeV2ServerEnvelope(
       );
     case "assistant_audio_completed":
       return record !== null && isNonNegativeSafeInteger(record.last_chunk_sequence);
+    case "turn_paused":
+    case "turn_resumed":
+      return true;
     case "interruption":
       return (
         record !== null &&
@@ -831,6 +838,10 @@ export function normalizeVoiceRealtimeV2Event(
         : null;
     case "assistant_audio_completed":
       return identity ? { type: "assistant_audio_done", ...identity } : null;
+    case "turn_paused":
+      return identity ? { type: "turn_paused", ...identity } : null;
+    case "turn_resumed":
+      return identity ? { type: "turn_resumed", ...identity } : null;
     case "interruption":
       return identity
         ? { type: "turn_interrupted", ...identity, reason: envelope.data.reason }
@@ -947,6 +958,8 @@ export function isVoiceRealtimeServerEvent(
     case "assistant_text_start":
     case "assistant_audio_done":
     case "turn_interrupted":
+    case "turn_paused":
+    case "turn_resumed":
       return hasTurnIdentity();
     case "user_transcript_delta":
     case "assistant_text_delta":
@@ -979,7 +992,13 @@ export function isVoiceRealtimeServerEvent(
 /** Playback volume while the user may be speaking over the assistant. */
 export const VOICE_REALTIME_DUCK_GAIN = 0.25;
 
-export type VoiceRealtimePlaybackAction = "stop" | "duck" | "restore" | null;
+export type VoiceRealtimePlaybackAction =
+  | "stop"
+  | "duck"
+  | "restore"
+  | "pause"
+  | "resume"
+  | null;
 
 /**
  * What a server event does to the assistant reply playing for
@@ -988,10 +1007,16 @@ export type VoiceRealtimePlaybackAction = "stop" | "duck" | "restore" | null;
  * stops once the server interrupts it (a confirmed barge-in) or a newer
  * utterance becomes a turn, and comes back to full volume when the speech
  * that ducked it is rejected.
+ *
+ * A server that resumes false interruptions pauses the reply instead
+ * (`turn_paused`): it keeps its queue, and the server then either resumes
+ * it (`turn_resumed`) or interrupts it. While it is `paused`, the end of
+ * the user's speech decides nothing.
  */
 export function voiceRealtimePlaybackAction(
   event: VoiceRealtimeServerEvent,
   activeUtteranceSeq: number | null,
+  paused = false,
 ): VoiceRealtimePlaybackAction {
   if (activeUtteranceSeq == null) {
     return null;
@@ -1001,7 +1026,11 @@ export function voiceRealtimePlaybackAction(
     case "user_speech_start":
       return activeUtteranceSeq < event.utterance_seq ? "duck" : null;
     case "user_speech_end":
-      return activeUtteranceSeq < event.utterance_seq ? "stop" : null;
+      return activeUtteranceSeq < event.utterance_seq && !paused ? "stop" : null;
+    case "turn_paused":
+      return activeUtteranceSeq === event.utterance_seq ? "pause" : null;
+    case "turn_resumed":
+      return activeUtteranceSeq === event.utterance_seq ? "resume" : null;
     case "user_speech_rejected":
       return activeUtteranceSeq < event.utterance_seq ? "restore" : null;
     case "turn_interrupted":
