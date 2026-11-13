@@ -982,6 +982,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_voice_reply_is_stored_with_its_tool_calls_and_read_back_as_its_rounds() {
+        use crate::app::agent_runtime::ThreadMemory;
+        use izwi_agent::{
+            AgentEngine, AgentSession, MemoryMessageMeta, MemoryMessageRole, MemoryStore,
+            ToolCallRecord,
+        };
+
+        with_env_lock(async {
+            let (_temp, store) = setup_store();
+            let store = Arc::new(store);
+            let thread = store
+                .create_voice_thread("voice-session-1".to_string(), None)
+                .await
+                .expect("voice thread");
+            let session = AgentSession {
+                id: "s".to_string(),
+                agent_id: "voice".to_string(),
+                thread_id: thread.id.clone(),
+                created_at: 0,
+                updated_at: 0,
+            };
+            let memory = ThreadMemory::new(store.clone(), None);
+            let call = |id: &str, status: &str| ToolCallRecord {
+                call_id: id.to_string(),
+                name: "stock_level".to_string(),
+                arguments: r#"{"item":"bolts"}"#.to_string(),
+                status: status.to_string(),
+                output: "12 left".to_string(),
+                round: 0,
+            };
+            AgentEngine
+                .commit_user_message(&memory, &session, "Any bolts?")
+                .await
+                .unwrap();
+            AgentEngine
+                .commit_assistant_reply(
+                    &memory,
+                    &session,
+                    "Twelve.",
+                    MemoryMessageMeta {
+                        tool_calls: vec![call("c1", "ok"), call("c2", "cancelled")],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            // A reply nobody heard still keeps what it looked up.
+            AgentEngine
+                .commit_assistant_reply(
+                    &memory,
+                    &session,
+                    "",
+                    MemoryMessageMeta {
+                        tool_calls: vec![call("c3", "ok")],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+
+            // One assistant row a turn: the thread's readers see the reply.
+            let rows = store.list_messages(thread.id.clone()).await.unwrap();
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[1].content, "Twelve.");
+            assert_eq!(
+                rows[1].content_parts.as_ref().unwrap()[0]["type"],
+                "tool_calls"
+            );
+
+            let messages = memory.load_messages(&thread.id).await.unwrap();
+            let shape: Vec<_> = messages
+                .iter()
+                .map(|message| (message.role, message.content.as_str()))
+                .collect();
+            assert_eq!(
+                shape,
+                [
+                    (MemoryMessageRole::User, "Any bolts?"),
+                    (MemoryMessageRole::Assistant, ""),
+                    (MemoryMessageRole::Tool, "12 left"),
+                    (MemoryMessageRole::Assistant, "Twelve."),
+                    (MemoryMessageRole::Assistant, ""),
+                    (MemoryMessageRole::Tool, "12 left"),
+                ]
+            );
+            assert_eq!(messages[1].tool_calls[0].id, "c1");
+            assert_eq!(
+                messages[1].tool_calls.len(),
+                1,
+                "the cancelled call is gone"
+            );
+            assert_eq!(messages[2].tool_call_id.as_deref(), Some("c1"));
+            clear_env();
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn voice_threads_stay_out_of_chat_and_go_with_their_session() {
         with_env_lock(async {
             let (_temp, store) = setup_store();

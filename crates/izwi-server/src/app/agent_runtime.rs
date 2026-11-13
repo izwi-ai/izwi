@@ -258,8 +258,25 @@ pub(crate) fn chat_messages(
     .map_err(|err| err.message)
 }
 
+/// The content part of a stored assistant message that holds the calls its
+/// turn made: `{"type": "tool_calls", "calls": [..]}`.
+const TOOL_CALLS_PART: &str = "tool_calls";
+
+/// The calls a stored assistant message's content parts hold.
+fn stored_tool_calls(parts: Option<&[Value]>) -> Vec<izwi_agent::ToolCallRecord> {
+    parts
+        .into_iter()
+        .flatten()
+        .filter(|part| part["type"] == TOOL_CALLS_PART)
+        .filter_map(|part| serde_json::from_value(part["calls"].clone()).ok())
+        .next()
+        .unwrap_or_default()
+}
+
 /// A stored chat thread as the agent's memory, with the context a voice
-/// profile remembers about its user ahead of it.
+/// profile remembers about its user ahead of it. An assistant reply is
+/// stored with the calls its turn made, and read back as the messages that
+/// turn's rounds read, so a later turn knows what was looked up.
 pub(crate) struct ThreadMemory {
     chat_store: Arc<ChatStore>,
     memory_context: Option<String>,
@@ -393,6 +410,10 @@ fn summary_request(earlier: Option<&str>, messages: &[MemoryMessage]) -> String 
             MemoryMessageRole::Assistant => "Assistant",
             MemoryMessageRole::System | MemoryMessageRole::Tool => continue,
         };
+        if message.content.trim().is_empty() {
+            // An assistant message that only called tools.
+            continue;
+        }
         request.push_str(&format!("{speaker}: {}\n", message.content.trim()));
     }
     request
@@ -458,7 +479,12 @@ impl MemoryStore for ThreadMemory {
                     )));
                 }
             };
-            out.push(MemoryMessage::new(role, record.content));
+            let calls = stored_tool_calls(record.content_parts.as_deref());
+            if role == MemoryMessageRole::Assistant && !calls.is_empty() {
+                out.extend(izwi_agent::turn_messages(&record.content, &calls));
+            } else {
+                out.push(MemoryMessage::new(role, record.content));
+            }
         }
         Ok(out)
     }
@@ -470,12 +496,19 @@ impl MemoryStore for ThreadMemory {
         content: String,
         meta: MemoryMessageMeta,
     ) -> izwi_agent::Result<()> {
+        let calls: Vec<_> = meta
+            .tool_calls
+            .into_iter()
+            .filter(|call| call.status != "cancelled")
+            .collect();
+        let content_parts = (role == MemoryMessageRole::Assistant && !calls.is_empty())
+            .then(|| vec![serde_json::json!({"type": TOOL_CALLS_PART, "calls": calls})]);
         self.chat_store
             .append_message(
                 thread_id.to_string(),
                 role.as_str().to_string(),
                 content,
-                None,
+                content_parts,
                 meta.model_id,
                 meta.tokens_generated,
                 meta.generation_time_ms,

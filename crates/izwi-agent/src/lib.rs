@@ -17,7 +17,7 @@ pub use agent::{AgentDefinition, AgentSet, TaskSpec};
 pub use cancel::{TurnCancel, TurnGate};
 pub use engine::{AgentEngine, AgentTurnOptions, HistoryBudget, TurnContext};
 pub use errors::{AgentError, Result};
-pub use memory::{MemoryMessage, MemoryMessageMeta, MemoryMessageRole, MemoryStore};
+pub use memory::{turn_messages, MemoryMessage, MemoryMessageMeta, MemoryMessageRole, MemoryStore};
 pub use model::{ModelBackend, ModelOutput, ModelRequest};
 pub use reasoning::{strip_reasoning, ReasoningFilter};
 pub use session::{

@@ -177,7 +177,7 @@ The [API reference](/api#voice-realtime) lists every field and event. To test an
 
 ## Limits
 
-- Tool calls and their results last for one turn. Later turns remember what was said, not what was looked up.
+- On the Standard engine a conversation remembers what its tools found, so a later question can build on an earlier lookup without calling the tool again. A long result is kept in shortened form (about 1,500 characters). On the Compact engine tool calls and their results last for one turn.
 - Tool servers must be reachable over HTTP and allowed in `IZWI_MCP_ALLOWED_HOSTS`. Approval prompts for tool calls are not supported.
 - Agents and tasks are not available with the Compact engine. Tasks can only be set over the API.
 - A hum or a cough resumes the reply only where Izwi can tell it had no words. A short "yes" or "okay" while Izwi is speaking still interrupts it.

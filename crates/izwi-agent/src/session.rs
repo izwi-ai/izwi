@@ -27,6 +27,9 @@ pub struct ToolCallRecord {
     /// tool).
     pub status: String,
     pub output: String,
+    /// The model round of the turn that made the call.
+    #[serde(default)]
+    pub round: usize,
 }
 
 /// How a turn ended.

@@ -99,6 +99,9 @@ impl HistoryBudget {
         let mut start = conversation.len();
         for (index, message) in conversation.iter().enumerate().rev() {
             tokens = tokens.saturating_add(estimate_tokens(&message.content));
+            for call in &message.tool_calls {
+                tokens = tokens.saturating_add(estimate_tokens(&call.arguments));
+            }
             if conversation.len() - index > self.max_messages || tokens > self.max_tokens {
                 break;
             }
@@ -211,6 +214,7 @@ impl AgentEngine {
                     model_id: Some(result.model_id.clone()),
                     tokens_generated: Some(result.tokens_generated),
                     generation_time_ms: Some(result.generation_time_ms),
+                    tool_calls: result.tool_calls.clone(),
                 },
             )
             .await?;
@@ -348,7 +352,7 @@ impl AgentEngine {
                 });
                 let outcomes = futures::future::join_all(runs).await;
                 for (call, outcome) in output.tool_calls.iter().zip(outcomes) {
-                    turn.settle(&mut log, &mut conversation, call, outcome);
+                    turn.settle(&mut log, &mut conversation, call, round, outcome);
                 }
                 if ctx.cancel.is_cancelled() {
                     finish = TurnFinish::Cancelled;
@@ -430,7 +434,7 @@ impl AgentEngine {
                         Outcome::error(format!("No tool named `{}` is available.", call.name))
                     }
                 };
-                turn.settle(&mut log, &mut conversation, call, outcome);
+                turn.settle(&mut log, &mut conversation, call, round, outcome);
                 if ctx.cancel.is_cancelled() {
                     finish = TurnFinish::Cancelled;
                     break 'rounds;
@@ -493,7 +497,8 @@ impl AgentEngine {
     }
 
     /// Store an assistant reply in the session's thread, without its
-    /// reasoning. An empty reply is not stored.
+    /// reasoning, with the calls `meta` says were made before it. A reply
+    /// with neither words nor calls is not stored.
     pub async fn commit_assistant_reply<M: MemoryStore>(
         &self,
         memory: &M,
@@ -502,7 +507,7 @@ impl AgentEngine {
         meta: MemoryMessageMeta,
     ) -> Result<()> {
         let reply = strip_reasoning(reply);
-        if reply.is_empty() {
+        if reply.is_empty() && meta.tool_calls.is_empty() {
             return Ok(());
         }
         memory
@@ -555,6 +560,7 @@ impl TurnState {
         log: &mut EventLog,
         conversation: &mut Vec<MemoryMessage>,
         call: &ToolCall,
+        round: usize,
         outcome: Outcome,
     ) {
         log.emit(AgentEvent::ToolCallCompleted {
@@ -570,6 +576,7 @@ impl TurnState {
             arguments: call.arguments.clone(),
             status: outcome.status.to_string(),
             output: outcome.output,
+            round,
         });
     }
 }

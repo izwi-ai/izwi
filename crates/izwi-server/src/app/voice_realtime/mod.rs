@@ -3739,6 +3739,8 @@ async fn finish_agent_reply(
             model_id: Some(reply.model_id.clone()),
             tokens_generated: Some(result.tokens_generated),
             generation_time_ms: Some(result.generation_time_ms),
+            // Kept with the reply: a later turn knows what was looked up.
+            tool_calls: result.tool_calls.clone(),
         };
     }
     if result.finish == izwi_agent::TurnFinish::Cancelled {
