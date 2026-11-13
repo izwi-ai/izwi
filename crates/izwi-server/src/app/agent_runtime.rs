@@ -10,7 +10,7 @@ use izwi_agent::{
 };
 use izwi_core::{
     parse_chat_model_variant, ChatFinishReason, ChatMessage, ChatRequestConfig, ChatTruncation,
-    GenerationParams, ModelVariant, RuntimeRequestContext, RuntimeService,
+    GenerationParams, ModelVariant,
 };
 use serde_json::Value;
 
@@ -22,23 +22,15 @@ use crate::app::voice_realtime::{acquire_stage_permit, TurnControl};
 use crate::chat_store::ChatStore;
 use crate::state::AppState;
 
-/// Where a model round gets its admission.
-pub(crate) enum RoundAdmission<'a> {
-    /// The caller holds a permit for the whole turn.
-    Held(RuntimeRequestContext),
-    /// Each round takes its own realtime permit, so none is held while a
-    /// tool runs or a client answers.
-    PerRound(&'a AppState),
-}
-
 /// A chat model as the agent's backend: a streamed reply without reasoning
 /// (voice cannot speak thinking, and waiting for it would hold back the
 /// first audio), its visible text sent as it is generated and its tool
-/// calls parsed by the model family's call format.
+/// calls parsed by the model family's call format. Each round takes its
+/// own realtime admission permit, so none is held while a tool runs or a
+/// client answers.
 pub(crate) struct ChatAgentBackend<'a> {
-    runtime: Arc<RuntimeService>,
+    state: &'a AppState,
     correlation_id: String,
-    admission: RoundAdmission<'a>,
     /// What the first round must call; later rounds are free.
     choice: ToolChoice,
     usage: Mutex<ChatUsage>,
@@ -53,15 +45,10 @@ pub(crate) struct ChatUsage {
 }
 
 impl<'a> ChatAgentBackend<'a> {
-    pub(crate) fn new(
-        runtime: Arc<RuntimeService>,
-        correlation_id: impl Into<String>,
-        admission: RoundAdmission<'a>,
-    ) -> Self {
+    pub(crate) fn new(state: &'a AppState, correlation_id: impl Into<String>) -> Self {
         Self {
-            runtime,
+            state,
             correlation_id: correlation_id.into(),
-            admission,
             choice: ToolChoice::Auto,
             usage: Mutex::new(ChatUsage::default()),
         }
@@ -119,18 +106,15 @@ impl ModelBackend for ChatAgentBackend<'_> {
             .unwrap_or_default();
         let messages = chat_messages(variant, request.messages, &tools).map_err(model_error)?;
 
-        let permit;
-        let runtime_context = match &self.admission {
-            RoundAdmission::Held(context) => *context,
-            RoundAdmission::PerRound(state) => {
-                permit = acquire_stage_permit(state).await.map_err(model_error)?;
-                permit.runtime_context()
-            }
-        };
+        let permit = acquire_stage_permit(self.state)
+            .await
+            .map_err(model_error)?;
+        let runtime_context = permit.runtime_context();
 
         let parser = Arc::new(Mutex::new(plan.as_ref().map(ToolPlan::parser)));
         let (parser_sink, events_sink) = (parser.clone(), events.clone());
         let generation = self
+            .state
             .runtime
             .chat_generate_streaming_with_runtime_context(
                 variant,

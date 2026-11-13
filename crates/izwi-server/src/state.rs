@@ -28,7 +28,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, SemaphorePermit};
 
 const DEFAULT_RESPONSE_STORE_LIMIT: usize = 512;
-const DEFAULT_AGENT_SESSION_STORE_LIMIT: usize = 512;
 const DEFAULT_MAX_REALTIME_SESSIONS: usize = 32;
 const DEFAULT_ADMISSION_QUEUE_TIMEOUT_SECS: u64 = 30;
 
@@ -357,17 +356,6 @@ pub struct StoredResponseRecord {
     pub metadata: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoredAgentSessionRecord {
-    pub id: String,
-    pub agent_id: String,
-    pub thread_id: String,
-    pub model_id: String,
-    pub system_prompt: String,
-    pub created_at: u64,
-    pub updated_at: u64,
-}
-
 pub use izwi_gateway::lifecycle::ServerLifecycle;
 
 /// Cancellation handles of the diarization jobs this process is running, by
@@ -480,11 +468,8 @@ pub struct AppState {
     /// Max retained OpenAI-compatible response objects in memory.
     response_store_limit: usize,
     /// Max retained agent session records in memory.
-    agent_session_store_limit: usize,
     /// In-memory store for OpenAI-compatible `/v1/responses` objects.
     pub response_store: Arc<RwLock<HashMap<String, StoredResponseRecord>>>,
-    /// In-memory store for minimal agent sessions.
-    pub agent_session_store: Arc<RwLock<HashMap<String, StoredAgentSessionRecord>>>,
     /// Outcomes of `/v1/audio/speech` requests, process-local and bounded.
     pub(crate) speech_outcomes: Arc<crate::speech_outcomes::SpeechOutcomeStore>,
     /// SQLite-backed chat thread/message store.
@@ -547,10 +532,6 @@ impl AppState {
             "IZWI_MAX_RESPONSE_STORE_ENTRIES",
             DEFAULT_RESPONSE_STORE_LIMIT,
         );
-        let agent_session_store_limit = store_limit_from_env(
-            "IZWI_MAX_AGENT_SESSION_STORE_ENTRIES",
-            DEFAULT_AGENT_SESSION_STORE_LIMIT,
-        );
         let realtime_session_capacity = realtime_session_limit_from_env();
 
         let chat_store = Arc::new(ChatStore::initialize()?);
@@ -603,9 +584,7 @@ impl AppState {
             realtime_session_capacity,
             request_timeout_secs,
             response_store_limit,
-            agent_session_store_limit,
             response_store: Arc::new(RwLock::new(HashMap::new())),
-            agent_session_store: Arc::new(RwLock::new(HashMap::new())),
             speech_outcomes: Arc::new(crate::speech_outcomes::SpeechOutcomeStore::from_tuning()),
             chat_store,
             transcription_store,
@@ -641,10 +620,6 @@ impl AppState {
         let response_store_limit = store_limit_from_env(
             "IZWI_MAX_RESPONSE_STORE_ENTRIES",
             DEFAULT_RESPONSE_STORE_LIMIT,
-        );
-        let agent_session_store_limit = store_limit_from_env(
-            "IZWI_MAX_AGENT_SESSION_STORE_ENTRIES",
-            DEFAULT_AGENT_SESSION_STORE_LIMIT,
         );
         let realtime_session_capacity = realtime_session_limit_from_env();
         let store_database = StoreDatabase::from_connection(persistence.database.connection());
@@ -722,9 +697,7 @@ impl AppState {
             realtime_session_capacity,
             request_timeout_secs,
             response_store_limit,
-            agent_session_store_limit,
             response_store: Arc::new(RwLock::new(HashMap::new())),
-            agent_session_store: Arc::new(RwLock::new(HashMap::new())),
             speech_outcomes: Arc::new(crate::speech_outcomes::SpeechOutcomeStore::from_tuning()),
             chat_store,
             transcription_store,
@@ -830,27 +803,6 @@ impl AppState {
             record.created_at
         });
     }
-
-    pub async fn store_agent_session_record(&self, record: StoredAgentSessionRecord) {
-        let mut store = self.agent_session_store.write().await;
-        store.insert(record.id.clone(), record);
-        trim_store_by(&mut store, self.agent_session_store_limit, |record| {
-            record.updated_at
-        });
-    }
-
-    pub async fn touch_agent_session_record(
-        &self,
-        session_id: &str,
-        updated_at: u64,
-        model_id: String,
-    ) {
-        let mut store = self.agent_session_store.write().await;
-        if let Some(record) = store.get_mut(session_id) {
-            record.updated_at = updated_at;
-            record.model_id = model_id;
-        }
-    }
 }
 
 fn request_limits(serve_config: &ServeRuntimeConfig) -> (usize, u64) {
@@ -948,8 +900,7 @@ fn trim_store_by<T>(
 mod tests {
     use super::{
         request_limits, trim_store_by, AppState, DiarizationJobRegistry, RequestAdmissionLimiter,
-        RequestAdmissionLimits, StoredAgentSessionRecord, StoredResponseInputItem,
-        StoredResponseRecord,
+        RequestAdmissionLimits, StoredResponseInputItem, StoredResponseRecord,
     };
     use crate::test_support::env_lock;
     use izwi_core::{
@@ -1022,40 +973,6 @@ mod tests {
 
         assert!(store.contains_key("resp-new"));
         assert!(!store.contains_key("resp-old"));
-    }
-
-    #[test]
-    fn trim_store_by_uses_updated_at_for_agent_sessions() {
-        let mut store = HashMap::new();
-        store.insert(
-            "sess-old".to_string(),
-            StoredAgentSessionRecord {
-                id: "sess-old".to_string(),
-                agent_id: "agent".to_string(),
-                thread_id: "thread-old".to_string(),
-                model_id: "model".to_string(),
-                system_prompt: "prompt".to_string(),
-                created_at: 1,
-                updated_at: 5,
-            },
-        );
-        store.insert(
-            "sess-new".to_string(),
-            StoredAgentSessionRecord {
-                id: "sess-new".to_string(),
-                agent_id: "agent".to_string(),
-                thread_id: "thread-new".to_string(),
-                model_id: "model".to_string(),
-                system_prompt: "prompt".to_string(),
-                created_at: 2,
-                updated_at: 15,
-            },
-        );
-
-        trim_store_by(&mut store, 1, |record| record.updated_at);
-
-        assert!(store.contains_key("sess-new"));
-        assert!(!store.contains_key("sess-old"));
     }
 
     #[test]
@@ -1293,7 +1210,7 @@ mod tests {
     #[tokio::test]
     async fn app_state_response_store_limit_evicts_oldest_record() {
         let _guard = env_lock();
-        let (state, _temp_dir) = test_app_state("response_store_limit", 1, 8);
+        let (state, _temp_dir) = test_app_state("response_store_limit", 1);
 
         state
             .store_response_record(response_record("resp-old", 10))
@@ -1307,28 +1224,11 @@ mod tests {
         assert!(!store.contains_key("resp-old"));
     }
 
-    #[tokio::test]
-    async fn app_state_agent_session_store_limit_evicts_oldest_record() {
-        let _guard = env_lock();
-        let (state, _temp_dir) = test_app_state("agent_session_store_limit", 8, 1);
-
-        state
-            .store_agent_session_record(agent_session_record("sess-old", 5))
-            .await;
-        state
-            .store_agent_session_record(agent_session_record("sess-new", 15))
-            .await;
-
-        let store = state.agent_session_store.read().await;
-        assert!(store.contains_key("sess-new"));
-        assert!(!store.contains_key("sess-old"));
-    }
-
     #[test]
     fn app_state_bounds_active_realtime_sessions_independently() {
         let _guard = env_lock();
         std::env::set_var("IZWI_MAX_REALTIME_SESSIONS", "1");
-        let (state, _temp_dir) = test_app_state("realtime_session_limit", 8, 8);
+        let (state, _temp_dir) = test_app_state("realtime_session_limit", 8);
 
         assert_eq!(
             state.realtime_session_admission_snapshot(),
@@ -1368,23 +1268,7 @@ mod tests {
         }
     }
 
-    fn agent_session_record(id: &str, updated_at: u64) -> StoredAgentSessionRecord {
-        StoredAgentSessionRecord {
-            id: id.to_string(),
-            agent_id: "agent".to_string(),
-            thread_id: format!("thread-{id}"),
-            model_id: "model".to_string(),
-            system_prompt: "prompt".to_string(),
-            created_at: updated_at,
-            updated_at,
-        }
-    }
-
-    fn test_app_state(
-        name: &str,
-        response_limit: usize,
-        agent_session_limit: usize,
-    ) -> (AppState, tempfile::TempDir) {
+    fn test_app_state(name: &str, response_limit: usize) -> (AppState, tempfile::TempDir) {
         let temp_dir = tempfile::tempdir().expect("temp dir should create");
         let models_dir = temp_dir.path().join("models");
         let media_dir = temp_dir.path().join("media");
@@ -1398,10 +1282,6 @@ mod tests {
         std::env::set_var(
             "IZWI_MAX_RESPONSE_STORE_ENTRIES",
             response_limit.to_string(),
-        );
-        std::env::set_var(
-            "IZWI_MAX_AGENT_SESSION_STORE_ENTRIES",
-            agent_session_limit.to_string(),
         );
 
         let serve_config = ServeRuntimeConfig {
@@ -1422,7 +1302,6 @@ mod tests {
         std::env::remove_var("IZWI_DB_PATH");
         std::env::remove_var("IZWI_MEDIA_DIR");
         std::env::remove_var("IZWI_MAX_RESPONSE_STORE_ENTRIES");
-        std::env::remove_var("IZWI_MAX_AGENT_SESSION_STORE_ENTRIES");
     }
 
     fn clear_admission_env() {

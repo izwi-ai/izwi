@@ -42,8 +42,8 @@ use tracing::warn;
 
 use crate::api::openai::tool_calls::{parse_answer, ToolCallFormat, ToolCallParser};
 use crate::app::agent_runtime::{
-    cancel_with, drive_turn, finish_name, ChatAgentBackend, ConversationSummary, RoundAdmission,
-    ThreadMemory, TurnTrace,
+    cancel_with, drive_turn, finish_name, ChatAgentBackend, ConversationSummary, ThreadMemory,
+    TurnTrace,
 };
 use crate::app::mcp::{AllowedHosts, McpServerConfig, McpTools};
 use crate::app::realtime_codec::{AudioOutputEncoder, OutputAudioFormat};
@@ -61,7 +61,7 @@ use crate::app::realtime_transport::{
 use crate::app::voice_reply::{SegmentJoiner, SpeechSegmenter, SpokenLedger};
 use crate::app::voice_tools::{function_call_message, PendingFunctionCalls, VoiceTools};
 use crate::ids::new_uuid;
-use crate::state::{AppState, OwnedAdmissionPermit, StoredAgentSessionRecord};
+use crate::state::{AppState, OwnedAdmissionPermit};
 use crate::voice_defaults::{
     DEFAULT_VOICE_AGENT_ID, DEFAULT_VOICE_AGENT_NAME, DEFAULT_VOICE_AGENT_SYSTEM_PROMPT,
 };
@@ -2027,7 +2027,7 @@ fn spawn_turn_task(
                         }),
                     );
 
-                    let agent_session_id = agent_session
+                    let agent_binding = agent_session
                         .ensure(
                             &state,
                             &voice_session_id,
@@ -2051,7 +2051,7 @@ fn spawn_turn_task(
                             .map_err(|err| model_load_error("chat", err))?;
                         let raw_text = run_agent_turn(
                             &state,
-                            &agent_session_id,
+                            &agent_binding,
                             &user_text,
                             &config.text_model_id,
                             config.max_output_tokens,
@@ -3147,12 +3147,20 @@ async fn reap_interrupted_turn(mut turn: ActiveTurn, reason: String) {
 /// changes.
 #[derive(Default)]
 struct AgentSessionSlot {
-    /// The session's id and the system prompt it was created with.
-    binding: tokio::sync::Mutex<Option<(String, String)>>,
+    binding: tokio::sync::Mutex<Option<VoiceAgentBinding>>,
     /// The agent that holds the conversation, once a turn has run.
     active_agent: Mutex<Option<String>>,
     /// Notes on the part of the conversation the prompt no longer carries.
     summary: ConversationSummary,
+}
+
+/// A voice connection's agent session: its conversation thread, and the
+/// system prompt and chat model it was created with.
+#[derive(Debug, Clone)]
+struct VoiceAgentBinding {
+    session: AgentSession,
+    system_prompt: String,
+    model_id: String,
 }
 
 impl AgentSessionSlot {
@@ -3162,11 +3170,11 @@ impl AgentSessionSlot {
         voice_session_id: &str,
         system_prompt: &str,
         text_model_id: &str,
-    ) -> Result<String, String> {
+    ) -> Result<VoiceAgentBinding, String> {
         let mut binding = self.binding.lock().await;
-        if let Some((session_id, prompt)) = binding.as_ref() {
-            if prompt == system_prompt {
-                return Ok(session_id.clone());
+        if let Some(bound) = binding.as_ref() {
+            if bound.system_prompt == system_prompt {
+                return Ok(bound.clone());
             }
         }
 
@@ -3180,23 +3188,22 @@ impl AgentSessionSlot {
             .map_err(|err| format!("Chat storage error: {err:#}"))?;
 
         let now = now_unix_millis();
-        let session_id = new_uuid();
-        state
-            .store_agent_session_record(StoredAgentSessionRecord {
-                id: session_id.clone(),
+        let bound = VoiceAgentBinding {
+            session: AgentSession {
+                id: new_uuid(),
                 agent_id: DEFAULT_VOICE_AGENT_ID.to_string(),
                 thread_id: thread.id,
-                model_id,
-                system_prompt: system_prompt.to_string(),
                 created_at: now,
                 updated_at: now,
-            })
-            .await;
+            },
+            system_prompt: system_prompt.to_string(),
+            model_id,
+        };
 
         // A new thread starts the conversation over.
         self.summary.reset();
-        *binding = Some((session_id.clone(), system_prompt.to_string()));
-        Ok(session_id)
+        *binding = Some(bound.clone());
+        Ok(bound)
     }
 }
 
@@ -3207,7 +3214,7 @@ impl AgentSessionSlot {
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_turn(
     state: &AppState,
-    session_id: &str,
+    session_record: &VoiceAgentBinding,
     input: &str,
     model_id: &str,
     max_output_tokens: usize,
@@ -3222,14 +3229,6 @@ async fn run_agent_turn(
     on_event: &(dyn Fn(&AgentEvent) + Sync),
     deltas: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> Result<String, String> {
-    let session_record = {
-        let store = state.agent_session_store.read().await;
-        store
-            .get(session_id)
-            .cloned()
-            .ok_or_else(|| "Agent session not found".to_string())?
-    };
-
     let resolved_model_id = resolve_chat_model_id(Some(model_id))?;
 
     // The session's prompt leads each agent's own instructions.
@@ -3249,7 +3248,7 @@ async fn run_agent_turn(
         ),
         None => (
             AgentSet::single(AgentDefinition::new(
-                session_record.agent_id.clone(),
+                session_record.session.agent_id.clone(),
                 DEFAULT_VOICE_AGENT_NAME,
                 session_record.system_prompt.clone(),
                 session_record.model_id.clone(),
@@ -3267,11 +3266,8 @@ async fn run_agent_turn(
         })
         .unwrap_or_else(|| agents.first().id.clone());
     let session = AgentSession {
-        id: session_record.id.clone(),
         agent_id: holder,
-        thread_id: session_record.thread_id.clone(),
-        created_at: session_record.created_at,
-        updated_at: session_record.updated_at,
+        ..session_record.session.clone()
     };
     {
         let mut reply = control.reply();
@@ -3299,11 +3295,7 @@ async fn run_agent_turn(
 
     let memory =
         ThreadMemory::new(state.chat_store.clone(), memory_context).with_summary(summary.clone());
-    let backend = ChatAgentBackend::new(
-        state.runtime.clone(),
-        correlation_id,
-        RoundAdmission::PerRound(state),
-    );
+    let backend = ChatAgentBackend::new(state, correlation_id);
     let tool_timeout = tools.as_ref().map(|tools| tools.tools.timeout);
     let background = tools
         .as_ref()
@@ -3393,10 +3385,6 @@ async fn run_agent_turn(
         correlation_id,
         VOICE_HISTORY_BUDGET,
     );
-    state
-        .touch_agent_session_record(session_id, now_unix_millis(), resolved_model_id)
-        .await;
-
     Ok(result.assistant_text)
 }
 

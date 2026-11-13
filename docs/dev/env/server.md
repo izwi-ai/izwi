@@ -54,7 +54,6 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_REALTIME_DEFAULT_PROFILE` | ``izwi-voice`` | The OpenAI Realtime profile a session gets when `model` is absent, empty or an OpenAI model name (`gpt-realtime*`). |
 | `IZWI_REALTIME_PERSIST` | `off` | `1` records OpenAI Realtime sessions and their turns in the voice history; off, they leave nothing behind. |
 | `IZWI_MAX_RESPONSE_STORE_ENTRIES` | `512` | Stored Responses API responses kept in memory. |
-| `IZWI_MAX_AGENT_SESSION_STORE_ENTRIES` | `512` | Agent sessions kept in memory. |
 | `IZWI_OPENAI_COMPAT_PROFILE` | `strict` | OpenAI compatibility profile: `strict` or `relaxed`. |
 | `IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB` | 64 (relaxed) or the strict profile's limit | Largest audio upload on the OpenAI audio and media routes, in MiB. |
 | `IZWI_MEDIA_DECODE_LANES` | `2` | Audio uploads decoded at once. |

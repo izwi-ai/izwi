@@ -42,7 +42,7 @@ use crate::api::openai::tool_calls::{
     parse_answer, ToolCall, ToolCallFormat, ToolCallFunction, ToolCallParser, ToolChoice, ToolPlan,
 };
 use crate::app::agent_runtime::{
-    cancel_with, drive_turn, finish_name, ChatAgentBackend, RoundAdmission, ThreadMemory, TurnTrace,
+    cancel_with, drive_turn, finish_name, ChatAgentBackend, ThreadMemory, TurnTrace,
 };
 use crate::app::mcp::{AllowedHosts, McpServerConfig, McpTools};
 use crate::app::realtime_transport::{
@@ -1124,12 +1124,8 @@ async fn run_modular(
         // The session's items are the conversation; nothing is read from
         // or written to the chat store.
         let memory = ThreadMemory::new(state.chat_store.clone(), None);
-        let backend = ChatAgentBackend::new(
-            state.runtime.clone(),
-            ctx.correlation_id.clone(),
-            RoundAdmission::PerRound(state),
-        )
-        .with_tool_choice(choice);
+        let backend =
+            ChatAgentBackend::new(state, ctx.correlation_id.clone()).with_tool_choice(choice);
         let (cancel, _cancel_link) = cancel_with(control);
         let (events, heard) = mpsc::unbounded_channel();
         let turn = TurnContext {

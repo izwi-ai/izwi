@@ -273,6 +273,8 @@ impl ChatStore {
         fetch_thread_summary(db, &thread_id).await
     }
 
+    /// A thread without a system prompt, for tests.
+    #[cfg(test)]
     pub async fn create_thread(
         &self,
         title: Option<String>,

@@ -889,49 +889,6 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     );
     add_operation(
         paths,
-        "/v1/agent/sessions",
-        "post",
-        "Chat",
-        "Create agent session",
-        "Deprecated: use `/v1/responses` for text turns and `/v1/realtime` for voice. Create process-local agent session metadata and a linked chat thread.",
-        preview_response(),
-    );
-    add_operation_with_params(
-        paths,
-        "/v1/agent/sessions/{session_id}",
-        "get",
-        "Chat",
-        "Get agent session",
-        "Deprecated: use `/v1/responses`. Fetch retained process-local agent session metadata.",
-        &[("session_id", "Agent session identifier")],
-        preview_response(),
-    );
-    add_operation_with_params(
-        paths,
-        "/v1/agent/sessions/{session_id}/turns",
-        "post",
-        "Chat",
-        "Create agent turn",
-        "Deprecated: use `/v1/responses`. Run one agent turn.",
-        &[("session_id", "Agent session identifier")],
-        preview_response(),
-    );
-    for (path, method) in [
-        ("/v1/agent/sessions", "post"),
-        ("/v1/agent/sessions/{session_id}", "get"),
-        ("/v1/agent/sessions/{session_id}/turns", "post"),
-    ] {
-        if let Some(operation) = paths
-            .get_mut(path)
-            .and_then(|item| item.get_mut(method))
-            .and_then(Value::as_object_mut)
-        {
-            operation.insert("deprecated".to_string(), Value::Bool(true));
-        }
-    }
-
-    add_operation(
-        paths,
         "/v1/voice/profile",
         "get",
         "Voice",

@@ -108,7 +108,6 @@ pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Rout
         .merge(crate::api::internal::router())
         .merge(crate::api::onboarding::router())
         .merge(crate::api::preferences::router())
-        .merge(crate::api::agent::router())
         .merge(crate::api::chat::router())
         .merge(crate::api::jobs::router())
         .merge(crate::api::media::router())

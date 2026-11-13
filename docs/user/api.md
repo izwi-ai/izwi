@@ -155,7 +155,6 @@ Some older list routes return arrays or route-specific wrapper names. The route 
 | `IZWI_BATCH_WEBHOOK_ALLOW_HTTP`, `IZWI_BATCH_WEBHOOK_ALLOW_PRIVATE` | `false` | Allow `http://` webhook URLs, and webhook hosts on loopback, private or link-local addresses. |
 | `IZWI_AUDIO_STREAM_EVENT_QUEUE_CAPACITY` | `32` | Buffered SSE audio events for `/v1/audio/speech`. |
 | `IZWI_MAX_RESPONSE_STORE_ENTRIES` | `512` | Process-local `/v1/responses` retention cap. |
-| `IZWI_MAX_AGENT_SESSION_STORE_ENTRIES` | `512` | Process-local agent session metadata cap. |
 
 ### Streaming
 
@@ -1813,20 +1812,6 @@ Streaming thread events:
 | `delta` | Text delta. |
 | `done` | Includes persisted assistant message and generation stats. |
 | `error` | Error string. |
-
-### Agent Sessions (deprecated)
-
-These routes are deprecated and will be removed in a later release. Use `/v1/responses` for text turns with tools and stored state, and `/v1/realtime` for voice agents. Every response from them carries a `Deprecation: true` header and a `Link` header naming `/v1/responses` as the successor.
-
-| Method | Path | Notes |
-|--------|------|-------|
-| `POST` | `/v1/agent/sessions` | Create an agent session and linked thread. |
-| `GET` | `/v1/agent/sessions/{session_id}` | Fetch retained process-local session metadata. |
-| `POST` | `/v1/agent/sessions/{session_id}/turns` | Run one agent turn. |
-
-Create fields include `agent_id`, `model_id`, `system_prompt` and `title`. `planning_mode` is accepted and ignored.
-
-A turn lets the model call the server's built-in tools (`time`). Turn responses include the assistant text, the tool calls (`call_id`, `name`, `arguments`, `status`, `output`) and ordered events: `turn_started`, `tool_call_started`, `tool_call_completed`, `assistant_message` and `turn_completed`.
 
 ### Voice Profile, Memory, And Sessions
 

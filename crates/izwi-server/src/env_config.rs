@@ -277,11 +277,6 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "512",
         "Stored Responses API responses kept in memory.",
     ),
-    var(
-        "IZWI_MAX_AGENT_SESSION_STORE_ENTRIES",
-        "512",
-        "Agent sessions kept in memory.",
-    ),
     // Request paths (ServerTuning), captured once at start-up.
     var(
         "IZWI_OPENAI_COMPAT_PROFILE",
