@@ -142,6 +142,7 @@ fn input_for(config: &SessionConfig) -> Input {
         snr_margin_db: sanitize_snr_margin(configured_snr_margin_db()),
         input_sample_rate_hint: Some(config.input_format.sample_rate()),
         adaptive_silence_floor_ms: None,
+        early_transcription: false,
     })))
 }
 

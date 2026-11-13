@@ -512,6 +512,13 @@ struct InputStreamStartEvent {
     adaptive_silence: Option<bool>,
     #[serde(default)]
     adaptive_silence_floor_ms: Option<u32>,
+    /// Modular mode: start transcribing an utterance at a short pause (a
+    /// third of the end-of-utterance silence, 200 to 400 ms), so a pause
+    /// that does end it finds the transcript already under way. A pause
+    /// the speaker talks through wastes that transcription. Off by
+    /// default.
+    #[serde(default)]
+    early_transcription: Option<bool>,
     #[serde(default)]
     barge_in_min_speech_ms: Option<u32>,
     /// Energy above the noise floor, in dB, a frame needs to start an
@@ -885,6 +892,8 @@ struct ConnectionState {
     function_calls: PendingFunctionCalls,
     /// The results of background tools, for the next turn to tell.
     background_results: BackgroundResults,
+    /// A transcript started at a pause, for the turn that pause may begin.
+    early_transcript: Option<EarlyTranscript>,
 }
 
 impl Default for ConnectionState {
@@ -909,6 +918,7 @@ impl Default for ConnectionState {
             next_turn_generation: 0,
             function_calls: PendingFunctionCalls::default(),
             background_results: BackgroundResults::default(),
+            early_transcript: None,
         }
     }
 }
@@ -1092,6 +1102,11 @@ fn finalize_stream_vad_utterance(
             model_leases: conn.model_leases.clone(),
             function_calls: conn.function_calls.clone(),
             background_results: conn.background_results.clone(),
+            early_transcript: conn
+                .early_transcript
+                .take()
+                .filter(|early| early.utterance_seq == commit.utterance_seq)
+                .map(|early| early.task),
         },
         record,
         wav_bytes,
@@ -1338,6 +1353,7 @@ async fn handle_text_message(
                 pre_roll_ms,
                 adaptive_silence,
                 adaptive_silence_floor_ms,
+                early_transcription,
                 barge_in_min_speech_ms,
                 vad_snr_margin_db,
                 input_sample_rate,
@@ -1531,6 +1547,8 @@ async fn handle_text_message(
                 adaptive_silence_floor_ms: adaptive_silence
                     .unwrap_or(false)
                     .then(|| adaptive_silence_floor_ms.unwrap_or(450).clamp(200, 5_000)),
+                early_transcription: early_transcription.unwrap_or(false)
+                    && mode == RealtimeVoiceMode::Modular,
             }));
             conn.voice_session.begin_listening();
 
@@ -1705,6 +1723,24 @@ async fn handle_binary_message(
         conn.voice_session.interrupt("barge_in");
     }
 
+    if frame_result.speech_resumed {
+        conn.early_transcript = None;
+    }
+    if let Some(early) = frame_result.early {
+        if let Some(VoiceTurnConfig::Modular(config)) = conn.turn_config.as_ref() {
+            conn.early_transcript = Some(EarlyTranscript {
+                utterance_seq: early.utterance_seq,
+                task: spawn_early_transcript(
+                    state,
+                    correlation_id,
+                    &conn.model_leases,
+                    config,
+                    early.wav_bytes,
+                ),
+            });
+        }
+    }
+
     if let Some(outcome) = frame_result.utterance_end {
         dispatch_utterance_outcome(state, correlation_id, out_tx, conn, outcome)?;
     }
@@ -1730,6 +1766,57 @@ struct TurnContext {
     function_calls: PendingFunctionCalls,
     /// The results of background tools, for the next turn to tell.
     background_results: BackgroundResults,
+    early_transcript: Option<EarlyTranscriptTask>,
+}
+
+type EarlyTranscriptTask = AbortOnDropTask<Result<izwi_core::AsrTranscription, String>>;
+
+/// The transcript of an utterance, started at a pause in it. Dropping it
+/// stops the work.
+struct EarlyTranscript {
+    utterance_seq: u64,
+    task: EarlyTranscriptTask,
+}
+
+/// Transcribe `wav_bytes` under its own admission permit, beside the
+/// session.
+fn spawn_early_transcript(
+    state: &AppState,
+    correlation_id: &str,
+    model_leases: &SessionModelLeases,
+    config: &ModularVoiceTurnConfig,
+    wav_bytes: Vec<u8>,
+) -> EarlyTranscriptTask {
+    let (state, model_leases) = (state.clone(), model_leases.clone());
+    let correlation_id = correlation_id.to_string();
+    let (asr_model_id, asr_language) = (config.asr_model_id.clone(), config.asr_language.clone());
+    AbortOnDropTask::new(tokio::spawn(async move {
+        with_stage_permit(&state, async |runtime_context| {
+            model_leases
+                .hold(
+                    &state.runtime,
+                    resolve_asr_model_variant(Some(&asr_model_id)),
+                )
+                .await
+                .map_err(|err| model_load_error("ASR", err))?;
+            state
+                .runtime
+                .asr_transcribe_streaming_bytes_with_runtime_context(
+                    wav_bytes.as_slice(),
+                    Some(&asr_model_id),
+                    asr_language.as_deref(),
+                    None,
+                    izwi_core::AsrTaskOptions::default(),
+                    None,
+                    Some(&correlation_id),
+                    runtime_context,
+                    |_| {},
+                )
+                .await
+                .map_err(|err| format!("ASR failed: {err}"))
+        })
+        .await
+    }))
 }
 
 fn spawn_turn_task(
@@ -1754,6 +1841,7 @@ fn spawn_turn_task(
             model_leases,
             function_calls,
             background_results,
+            early_transcript,
         } = context;
         let timeout_secs = state.request_timeout_secs.max(1);
         let timeout = Duration::from_secs(timeout_secs);
@@ -1804,61 +1892,78 @@ fn spawn_turn_task(
                         }),
                     );
 
-                    let transcript = with_stage_permit(&state, async |runtime_context| {
-                        model_leases
-                            .hold(
-                                &state.runtime,
-                                resolve_asr_model_variant(Some(&config.asr_model_id)),
-                            )
-                            .await
-                            .map_err(|err| model_load_error("ASR", err))?;
-                        let tx = out_tx.clone();
-                        let utt_id = commit.utterance_id.clone();
-                        let utt_seq = commit.utterance_seq;
-                        let asr_model_id = config.asr_model_id.clone();
-                        let asr_language = config.asr_language.clone();
-                        let mut snapshot = String::new();
-                        let runtime = state.runtime.clone();
-                        let endpointed_at = control.endpointed_at();
-                        state
-                            .runtime
-                            .asr_transcribe_streaming_bytes_with_runtime_context(
-                                audio_bytes.as_slice(),
-                                Some(&asr_model_id),
-                                asr_language.as_deref(),
-                                None,
-                                izwi_core::AsrTaskOptions::default(),
-                                None,
-                                Some(&correlation_id),
-                                runtime_context,
-                                move |delta| {
-                                    if delta.is_empty() {
-                                        return;
-                                    }
-                                    if snapshot.is_empty() {
-                                        runtime.record_voice_latency(
-                                            VoiceLatency::AsrFirstPartial,
-                                            endpointed_at.elapsed(),
-                                        );
-                                    }
-                                    snapshot.push_str(&delta);
-                                    send_turn_text_snapshot(
-                                        &tx,
-                                        output_generation,
-                                        format!("user-transcript-{utt_seq}"),
-                                        json!({
-                                            "type": "user_transcript_snapshot",
-                                            "utterance_id": utt_id,
-                                            "utterance_seq": utt_seq,
-                                            "text": snapshot,
-                                        }),
-                                    );
-                                },
-                            )
-                            .await
-                            .map_err(|err| format!("ASR failed: {err}"))
-                    })
-                    .await?;
+                    // A transcript started at the pause that ended the
+                    // utterance is the utterance's: only silence followed.
+                    let early = match early_transcript {
+                        Some(task) => task.join().await.ok().and_then(Result::ok),
+                        None => None,
+                    };
+                    let transcript = match early {
+                        Some(transcript) => {
+                            state.runtime.record_voice_latency(
+                                VoiceLatency::AsrFirstPartial,
+                                control.endpointed_at().elapsed(),
+                            );
+                            transcript
+                        }
+                        None => {
+                            with_stage_permit(&state, async |runtime_context| {
+                                model_leases
+                                    .hold(
+                                        &state.runtime,
+                                        resolve_asr_model_variant(Some(&config.asr_model_id)),
+                                    )
+                                    .await
+                                    .map_err(|err| model_load_error("ASR", err))?;
+                                let tx = out_tx.clone();
+                                let utt_id = commit.utterance_id.clone();
+                                let utt_seq = commit.utterance_seq;
+                                let asr_model_id = config.asr_model_id.clone();
+                                let asr_language = config.asr_language.clone();
+                                let mut snapshot = String::new();
+                                let runtime = state.runtime.clone();
+                                let endpointed_at = control.endpointed_at();
+                                state
+                                    .runtime
+                                    .asr_transcribe_streaming_bytes_with_runtime_context(
+                                        audio_bytes.as_slice(),
+                                        Some(&asr_model_id),
+                                        asr_language.as_deref(),
+                                        None,
+                                        izwi_core::AsrTaskOptions::default(),
+                                        None,
+                                        Some(&correlation_id),
+                                        runtime_context,
+                                        move |delta| {
+                                            if delta.is_empty() {
+                                                return;
+                                            }
+                                            if snapshot.is_empty() {
+                                                runtime.record_voice_latency(
+                                                    VoiceLatency::AsrFirstPartial,
+                                                    endpointed_at.elapsed(),
+                                                );
+                                            }
+                                            snapshot.push_str(&delta);
+                                            send_turn_text_snapshot(
+                                                &tx,
+                                                output_generation,
+                                                format!("user-transcript-{utt_seq}"),
+                                                json!({
+                                                    "type": "user_transcript_snapshot",
+                                                    "utterance_id": utt_id,
+                                                    "utterance_seq": utt_seq,
+                                                    "text": snapshot,
+                                                }),
+                                            );
+                                        },
+                                    )
+                                    .await
+                                    .map_err(|err| format!("ASR failed: {err}"))
+                            })
+                            .await?
+                        }
+                    };
                     let transcript_final_at = Instant::now();
                     state.runtime.record_voice_latency(
                         VoiceLatency::AsrFinal,
@@ -4510,6 +4615,7 @@ mod tests {
             snr_margin_db: izwi_vad::DEFAULT_SNR_MARGIN_DB,
             input_sample_rate_hint: Some(16_000),
             adaptive_silence_floor_ms: None,
+            early_transcription: false,
         })
     }
 
@@ -5267,6 +5373,84 @@ mod tests {
         }
         turns += usize::from(finalized(input.finish_stream().expect("stop")).is_some());
         (turns, barge_ins)
+    }
+
+    /// With early transcription an utterance is handed out at each pause
+    /// long enough, taken back when the speaker goes on, and the last one
+    /// handed out is of the utterance that ends.
+    #[test]
+    fn an_utterance_is_handed_out_at_a_pause_and_taken_back_when_speech_goes_on() {
+        let fox = {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/fox.wav");
+            let mut reader = hound::WavReader::open(path).expect("speech fixture");
+            let rate = reader.spec().sample_rate;
+            let samples: Vec<f32> = reader
+                .samples::<i16>()
+                .map(|sample| sample.expect("sample") as f32 / 32768.0)
+                .collect();
+            izwi_vad::resample_linear_f32(&samples, rate, 16_000).expect("resample")
+        };
+        // Speech, half a second of silence, speech, then silence to the end.
+        let mut samples = vec![0.0f32; 8_000];
+        samples.extend_from_slice(&fox);
+        samples.extend(vec![0.0f32; 8_000]);
+        samples.extend_from_slice(&fox);
+        samples.extend(vec![0.0f32; 48_000]);
+
+        let run = |early_transcription: bool| {
+            let mut input = StreamingInputState::new(StreamingInputConfig {
+                min_speech_ms: DEFAULT_STREAM_MIN_SPEECH_MS,
+                // Longer than the pause in the middle, the recording's own
+                // leading and trailing silence included.
+                silence_duration_ms: 2_000,
+                early_transcription,
+                ..test_streaming_input().config
+            });
+            // What happened, in order: e(arly), r(esumed), t(urn).
+            let mut story = String::new();
+            let mut last_early = None;
+            for (index, chunk) in samples.chunks(320).enumerate() {
+                let pcm: Vec<i16> = chunk
+                    .iter()
+                    .map(|sample| (sample.clamp(-1.0, 1.0) * 32767.0) as i16)
+                    .collect();
+                let result = input
+                    .handle_pcm16_frame(index as u32 + 1, 16_000, &pcm16_frame(&pcm))
+                    .expect("frame");
+                if result.speech_resumed {
+                    story.push('r');
+                }
+                if let Some(early) = result.early {
+                    story.push('e');
+                    last_early = Some((early.utterance_seq, early.wav_bytes.len()));
+                }
+                if let Some((ended, wav, _)) = finalized(result.utterance_end) {
+                    story.push('t');
+                    let (seq, early_len) = last_early.take().unwrap_or((0, 0));
+                    if early_transcription {
+                        assert_eq!(seq, ended.utterance_seq);
+                        // The same audio, short of the trailing silence.
+                        assert!(early_len < wav.len());
+                        assert!(early_len > wav.len() / 2, "{early_len} of {}", wav.len());
+                    }
+                }
+            }
+            story
+        };
+        assert_eq!(run(false), "t");
+        let story = run(true);
+        assert!(story.ends_with("et"), "{story}");
+        assert!(
+            story.contains("er"),
+            "the middle pause was talked through: {story}"
+        );
+        assert_eq!(story.matches('t').count(), 1, "{story}");
+        // Every hand-out but the last was taken back.
+        assert_eq!(
+            story.matches('e').count(),
+            story.matches('r').count() + 1,
+            "{story}"
+        );
     }
 
     /// Steady background noise, which Earshot alone scores as speech, never

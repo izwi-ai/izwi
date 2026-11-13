@@ -2264,6 +2264,7 @@ Client JSON messages:
 | `min_speech_ms` | Minimum speech duration. |
 | `silence_duration_ms` | Silence before utterance end. |
 | `adaptive_silence` | `true` lets the silence that ends an utterance follow the speaker: once four of their mid-utterance pauses are known, it is one and a half times their longer pauses, never under `adaptive_silence_floor_ms` (default `450`, `200..5000`) or over `silence_duration_ms`. A fluent speaker is answered sooner. A speaker who talks again within 1.5 s of an utterance ending was cut off, and the window widens. Default `false`. `input_stream_ready` reports the floor when it is on. |
+| `early_transcription` | Modular mode: `true` starts transcribing an utterance at a short pause (a third of the end-of-utterance silence, `200..400` ms) instead of when the silence has passed, so the reply starts sooner by up to the transcription time. If the speaker goes on, that transcription is dropped and wasted; with a slow ASR model and a speaker who pauses often this costs compute. The turn sends no `user_transcript_snapshot` events when its transcript was started early. Default `false`. |
 | `max_utterance_ms` | Hard utterance duration cap. |
 | `pre_roll_ms` | Audio retained before speech start. |
 | `barge_in_min_speech_ms` | Voiced speech, default `300`, that interrupts a speaking assistant. A shorter sound (a cough, a door, speaker echo) does not interrupt it. `0` interrupts on the first speech frame. |

@@ -15,6 +15,16 @@ pub(crate) struct StreamingInputConfig {
     /// When set, the silence that ends an utterance follows the speaker's
     /// own pauses, between this floor and `silence_duration_ms`.
     pub(crate) adaptive_silence_floor_ms: Option<u32>,
+    /// Hand the utterance out for transcription at a short pause, before
+    /// the silence that ends it has passed.
+    pub(crate) early_transcription: bool,
+}
+
+/// An utterance as it stood at a pause that may turn out to end it.
+#[derive(Debug)]
+pub(crate) struct EarlyUtterance {
+    pub(crate) utterance_seq: u64,
+    pub(crate) wav_bytes: Vec<u8>,
 }
 
 /// The shortest pause worth learning from: shorter gaps are stops inside
@@ -104,6 +114,8 @@ pub(crate) struct StreamingActiveUtterance {
     pub(crate) total_ms: f32,
     pub(crate) silence_ms: f32,
     pub(crate) barge_in_confirmed: bool,
+    /// The utterance was handed out at the pause it is in now.
+    pub(crate) early_sent: bool,
     /// The offline no-speech gate's rule over this utterance's frames. An
     /// utterance without it never becomes a turn, for modular and unified
     /// (speech-to-speech) turns alike.
@@ -197,6 +209,12 @@ pub(crate) struct StreamingFrameResult {
     /// The active utterance has just confirmed a barge-in.
     pub(crate) barge_in: bool,
     pub(crate) utterance_end: Option<UtteranceOutcome>,
+    /// The utterance at a pause: transcribing it now saves the time if the
+    /// pause turns out to end it.
+    pub(crate) early: Option<EarlyUtterance>,
+    /// The speaker went on after such a pause: what was handed out is
+    /// stale.
+    pub(crate) speech_resumed: bool,
 }
 
 impl StreamingInputState {
@@ -248,6 +266,8 @@ impl StreamingInputState {
                 speech_start: None,
                 barge_in: false,
                 utterance_end: None,
+                early: None,
+                speech_resumed: false,
             });
         }
         if !payload.len().is_multiple_of(2) {
@@ -271,6 +291,8 @@ impl StreamingInputState {
                 speech_start: None,
                 barge_in: false,
                 utterance_end: None,
+                early: None,
+                speech_resumed: false,
             });
         }
 
@@ -307,7 +329,17 @@ impl StreamingInputState {
             speech_start: None,
             barge_in: false,
             utterance_end: None,
+            early: None,
+            speech_resumed: false,
         };
+        // A third of the silence that ends an utterance, when that leaves
+        // time worth saving.
+        let window_ms = self.silence_window_ms();
+        let early_after_ms = (window_ms / 3).clamp(200, 400);
+        let early_after_ms = (self.config.early_transcription && window_ms >= early_after_ms + 150)
+            .then_some(early_after_ms as f32);
+        let min_speech_ms = self.config.min_speech_ms as f32;
+        let sample_rate_now = sample_rate;
 
         if speech_started && self.active.is_none() {
             // Speech right after silence ended an utterance: that silence
@@ -333,6 +365,7 @@ impl StreamingInputState {
                 total_ms: 0.0,
                 silence_ms: 0.0,
                 barge_in_confirmed: false,
+                early_sent: false,
                 evidence: SpeechEvidence::new(self.config.evidence_config()),
             };
             let pre_roll_samples = self.pre_roll.len();
@@ -374,8 +407,22 @@ impl StreamingInputState {
                     self.endpoint.set_silence_ms(adaptive.window_ms());
                 }
                 active.silence_ms = 0.0;
+                result.speech_resumed = std::mem::take(&mut active.early_sent);
             } else {
                 active.silence_ms += frame_ms;
+                if early_after_ms.is_some_and(|after| active.silence_ms >= after)
+                    && !active.early_sent
+                    && end_reason.is_none()
+                    && !noise_rejected
+                    && active.voiced_ms >= min_speech_ms
+                    && active.evidence.is_sufficient()
+                {
+                    active.early_sent = true;
+                    result.early = Some(EarlyUtterance {
+                        utterance_seq: active.utterance_seq,
+                        wav_bytes: wav_bytes_from_pcm16_mono(&active.samples_i16, sample_rate_now)?,
+                    });
+                }
             }
             // An utterance that ends or is rejected in this frame never
             // barges in; finalizing one preempts the turn on its own.
