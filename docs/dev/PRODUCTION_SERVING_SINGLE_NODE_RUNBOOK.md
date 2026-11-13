@@ -533,6 +533,16 @@ has finished.
   server or worker to export request spans (`http_request`, `worker_request`)
   as OTLP/HTTP JSON. Spans queue in a bounded buffer and are dropped, never
   waited on, when the collector falls behind.
+- With export on, the server also exports each agent turn (a voice turn's
+  reply, a `/v1/realtime` chat response) as a trace of its own: an
+  `agent_turn` span (`izwi.agent.turn.kind` is `voice_modular`,
+  `voice_unified` or `realtime`; `izwi.request.id` is the session's
+  correlation id; `izwi.agent.outcome` says how it ended), and under it an
+  `agent_model_round` span for each model round (round number, tokens, calls
+  made) and an `agent_tool_call` span for each tool call (tool name,
+  executor, outcome; `error` and `timeout` set the span's error status).
+  Speech stage timings (ASR, first audio) stay in the `izwi_voice_*`
+  histograms.
 - Request audit and observability hooks run after the response body ends, on
   their own task. A streamed answer is audited with how it ended: a 200 SSE
   stream that reported an error in-band is a `Failure`, and the audit metadata

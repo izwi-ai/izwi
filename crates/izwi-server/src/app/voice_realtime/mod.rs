@@ -42,7 +42,8 @@ use tracing::warn;
 
 use crate::api::openai::tool_calls::{parse_answer, ToolCallFormat, ToolCallParser};
 use crate::app::agent_runtime::{
-    cancel_with, drive_turn, ChatAgentBackend, ConversationSummary, RoundAdmission, ThreadMemory,
+    cancel_with, drive_turn, finish_name, ChatAgentBackend, ConversationSummary, RoundAdmission,
+    ThreadMemory, TurnTrace,
 };
 use crate::app::mcp::{AllowedHosts, McpServerConfig, McpTools};
 use crate::app::realtime_codec::{AudioOutputEncoder, OutputAudioFormat};
@@ -2684,13 +2685,19 @@ async fn stream_unified_s2s_to_socket(
             ..defaults
         },
     );
+    let mut trace = TurnTrace::start("voice_unified", correlation_id);
     let result = drive_turn(run, heard, |event| {
+        trace.on_event(&event);
         if let Some(message) = function_call_message(&event, utterance_id, utterance_seq) {
             send_turn_json(out_tx, output_generation, message);
         }
     })
-    .await
-    .map_err(|err| match err {
+    .await;
+    trace.finish(match &result {
+        Ok(result) => finish_name(result.finish),
+        Err(_) => "error",
+    });
+    let result = result.map_err(|err| match err {
         izwi_agent::AgentError::Model(message) | izwi_agent::AgentError::ToolLoop(message) => {
             message
         }
@@ -3333,7 +3340,9 @@ async fn run_agent_turn(
     // A reply that has said nothing while a tool runs says it is waiting,
     // once.
     let mut spoke = false;
+    let mut trace = TurnTrace::start("voice_modular", correlation_id);
     let result = drive_turn(run, heard, |event| {
+        trace.on_event(&event);
         on_event(&event);
         match event {
             AgentEvent::TextDelta { text } => {
@@ -3350,6 +3359,10 @@ async fn run_agent_turn(
         }
     })
     .await;
+    trace.finish(match &result {
+        Ok(result) => finish_name(result.finish),
+        Err(_) => "error",
+    });
     let result = result.map_err(|err| match err {
         izwi_agent::AgentError::InvalidInput(msg) => msg,
         other => other.to_string(),

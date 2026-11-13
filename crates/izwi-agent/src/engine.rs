@@ -273,6 +273,7 @@ impl AgentEngine {
                 max_output_tokens: options.max_output_tokens.max(1),
                 round,
             };
+            ctx.events.emit(AgentEvent::ModelRoundStarted { round });
             let output = tokio::select! {
                 biased;
                 () = ctx.cancel.cancelled() => {
@@ -281,6 +282,11 @@ impl AgentEngine {
                 }
                 output = ctx.model.generate(request, &ctx.events) => output?,
             };
+            ctx.events.emit(AgentEvent::ModelRoundCompleted {
+                round,
+                tokens_generated: output.tokens_generated,
+                tool_calls: output.tool_calls.len(),
+            });
             turn.tokens_generated += output.tokens_generated;
             turn.generation_time_ms += output.generation_time_ms;
             join_text(&mut turn.text, &output.text);

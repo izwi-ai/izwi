@@ -4,9 +4,11 @@
 //! (for an OpenTelemetry Collector, `http://host:4318/v1/traces`). Trace
 //! context propagation and the ids in logs work without it.
 //!
-//! Only request spans are exported: the edge's `http_request` and the
-//! worker's `worker_request`, which carry the W3C `trace_id`, `span_id` and
-//! `parent_span_id` fields. Spans queue in a bounded channel and a background
+//! Request spans are exported: the edge's `http_request` and the worker's
+//! `worker_request`. So are an agent turn's spans: `agent_turn`, and under
+//! it one `agent_model_round` a model round and one `agent_tool_call` a
+//! tool call. All carry the W3C `trace_id`, `span_id` and `parent_span_id`
+//! fields. Spans queue in a bounded channel and a background
 //! thread posts them in batches; when the queue is full a span is dropped
 //! rather than slowing a request.
 
@@ -24,7 +26,13 @@ use tracing_subscriber::Layer;
 /// The collector traces URL; unset or empty disables export.
 pub const OTLP_TRACES_ENDPOINT_ENV: &str = "IZWI_OTLP_TRACES_ENDPOINT";
 
-const EXPORTED_SPANS: &[&str] = &["http_request", "worker_request"];
+const EXPORTED_SPANS: &[&str] = &[
+    "http_request",
+    "worker_request",
+    "agent_turn",
+    "agent_model_round",
+    "agent_tool_call",
+];
 const QUEUE_CAPACITY: usize = 4096;
 const MAX_BATCH: usize = 512;
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -171,6 +179,15 @@ fn otlp_span(name: &str, record: &SpanRecord, ended: SystemTime) -> Option<Value
         ("path", "url.path"),
         ("status", "http.response.status_code"),
         ("correlation_id", "izwi.request.id"),
+        ("kind", "izwi.agent.turn.kind"),
+        ("agent_id", "izwi.agent.id"),
+        ("round", "izwi.agent.round"),
+        ("tokens_generated", "izwi.agent.tokens_generated"),
+        ("tool_calls", "izwi.agent.tool_calls"),
+        ("tool", "izwi.agent.tool.name"),
+        ("call_id", "izwi.agent.tool.call_id"),
+        ("executor", "izwi.agent.tool.executor"),
+        ("outcome", "izwi.agent.outcome"),
     ] {
         if let Some(value) = record.field(key) {
             attributes.push(json!({"key": attribute, "value": {"stringValue": value}}));
@@ -181,7 +198,8 @@ fn otlp_span(name: &str, record: &SpanRecord, ended: SystemTime) -> Option<Value
     let failed = record
         .field("status")
         .and_then(|status| status.parse::<u16>().ok())
-        .is_some_and(|status| status >= 500);
+        .is_some_and(|status| status >= 500)
+        || matches!(record.field("outcome"), Some("error" | "timeout"));
     span["status"] = json!({ "code": if failed { 2 } else { 0 } });
     Some(span)
 }
@@ -248,6 +266,33 @@ fn export_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_tool_call_span_carries_its_tool_and_outcome() {
+        let record = SpanRecord {
+            started: None,
+            fields: [
+                ("trace_id", "0123456789abcdef0123456789abcdef"),
+                ("span_id", "0123456789abcdef"),
+                ("parent_span_id", "fedcba9876543210"),
+                ("tool", "get_weather"),
+                ("executor", "mcp"),
+                ("outcome", "timeout"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+        };
+        let span = otlp_span("agent_tool_call", &record, SystemTime::now()).unwrap();
+        assert_eq!(span["parentSpanId"], "fedcba9876543210");
+        assert_eq!(span["status"]["code"], 2, "a timed-out call is an error");
+        let attributes = span["attributes"].as_array().unwrap();
+        assert!(attributes.contains(&json!({
+            "key": "izwi.agent.tool.name",
+            "value": {"stringValue": "get_weather"}
+        })));
+        assert!(EXPORTED_SPANS.contains(&"agent_tool_call"));
+    }
     use std::io::{BufRead, BufReader, Read, Write};
     use tracing_subscriber::layer::SubscriberExt;
 

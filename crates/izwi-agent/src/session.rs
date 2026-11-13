@@ -54,6 +54,17 @@ pub enum AgentEvent {
     TextDelta {
         text: String,
     },
+    /// A model round began. Sent to the turn's listener only, like the
+    /// text deltas.
+    ModelRoundStarted {
+        round: usize,
+    },
+    /// A model round ended with this many tokens and calls. Listener only.
+    ModelRoundCompleted {
+        round: usize,
+        tokens_generated: usize,
+        tool_calls: usize,
+    },
     ToolCallStarted {
         call_id: String,
         name: String,

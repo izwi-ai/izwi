@@ -531,6 +531,124 @@ pub(crate) async fn drive_turn<T>(
     result
 }
 
+/// How a turn ended, as a trace's outcome.
+pub(crate) fn finish_name(finish: izwi_agent::TurnFinish) -> &'static str {
+    match finish {
+        izwi_agent::TurnFinish::Completed => "completed",
+        izwi_agent::TurnFinish::MaxTokens => "max_tokens",
+        izwi_agent::TurnFinish::PendingCalls => "pending_calls",
+        izwi_agent::TurnFinish::Cancelled => "cancelled",
+    }
+}
+
+/// A turn's trace: an `agent_turn` span, and under it a span for each
+/// model round and each tool call, built from the turn's events. The
+/// spans are exported when `IZWI_OTLP_TRACES_ENDPOINT` is set and are
+/// otherwise ordinary tracing spans.
+pub(crate) struct TurnTrace {
+    trace_id: String,
+    span_id: String,
+    turn: tracing::Span,
+    round: Option<tracing::Span>,
+    calls: Vec<(String, tracing::Span)>,
+}
+
+/// 32 random hex digits; the first 16 are a span id.
+fn trace_hex() -> String {
+    crate::ids::new_uuid().replace('-', "")
+}
+
+impl TurnTrace {
+    /// Start the trace of a turn of `kind` (`voice_modular`,
+    /// `voice_unified` or `realtime`).
+    pub(crate) fn start(kind: &'static str, correlation_id: &str) -> Self {
+        let trace_id = trace_hex();
+        let span_id = trace_hex()[..16].to_string();
+        let turn = tracing::info_span!(
+            parent: None,
+            "agent_turn",
+            trace_id = %trace_id,
+            span_id = %span_id,
+            correlation_id = %correlation_id,
+            kind,
+            agent_id = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+        Self {
+            trace_id,
+            span_id,
+            turn,
+            round: None,
+            calls: Vec::new(),
+        }
+    }
+
+    /// Follow one of the turn's events.
+    pub(crate) fn on_event(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::ModelRoundStarted { round } => {
+                self.round = Some(tracing::info_span!(
+                    parent: None,
+                    "agent_model_round",
+                    trace_id = %self.trace_id,
+                    span_id = %&trace_hex()[..16],
+                    parent_span_id = %self.span_id,
+                    round = *round as u64,
+                    tokens_generated = tracing::field::Empty,
+                    tool_calls = tracing::field::Empty,
+                ));
+            }
+            AgentEvent::ModelRoundCompleted {
+                tokens_generated,
+                tool_calls,
+                ..
+            } => {
+                if let Some(round) = self.round.take() {
+                    round.record("tokens_generated", *tokens_generated as u64);
+                    round.record("tool_calls", *tool_calls as u64);
+                }
+            }
+            AgentEvent::ToolCallStarted {
+                call_id,
+                name,
+                executor,
+                ..
+            } => {
+                let span = tracing::info_span!(
+                    parent: None,
+                    "agent_tool_call",
+                    trace_id = %self.trace_id,
+                    span_id = %&trace_hex()[..16],
+                    parent_span_id = %self.span_id,
+                    tool = %name,
+                    call_id = %call_id,
+                    executor = %executor,
+                    outcome = tracing::field::Empty,
+                );
+                self.calls.push((call_id.clone(), span));
+            }
+            AgentEvent::ToolCallCompleted {
+                call_id, status, ..
+            } => {
+                if let Some(index) = self.calls.iter().position(|(id, _)| id == call_id) {
+                    let (_, span) = self.calls.swap_remove(index);
+                    span.record("outcome", status.as_str());
+                }
+            }
+            AgentEvent::Handoff { to, .. } => {
+                self.turn.record("agent_id", to.as_str());
+            }
+            _ => {}
+        }
+    }
+
+    /// End the trace with the turn's `outcome` (`completed`, `cancelled`,
+    /// `error`, ...).
+    pub(crate) fn finish(self, outcome: &str) {
+        self.turn.record("outcome", outcome);
+    }
+}
+
 /// An agent turn's cancellation that follows a voice turn's control until
 /// the guard drops.
 pub(crate) fn cancel_with(control: &TurnControl) -> (TurnCancel, CancelLink) {
@@ -634,6 +752,36 @@ mod tests {
             request,
             "Notes so far:\nThey asked about trains.\n\nWhat was said next:\nUser: And buses?\nAssistant: Every hour.\n"
         );
+    }
+
+    #[test]
+    fn a_turns_trace_follows_its_rounds_and_calls() {
+        let mut trace = TurnTrace::start("voice_modular", "corr-1");
+        assert_eq!(trace.trace_id.len(), 32);
+        assert_eq!(trace.span_id.len(), 16);
+        trace.on_event(&AgentEvent::ModelRoundStarted { round: 0 });
+        assert!(trace.round.is_some());
+        trace.on_event(&AgentEvent::ModelRoundCompleted {
+            round: 0,
+            tokens_generated: 12,
+            tool_calls: 1,
+        });
+        assert!(trace.round.is_none());
+        trace.on_event(&AgentEvent::ToolCallStarted {
+            call_id: "c1".into(),
+            name: "time".into(),
+            arguments: "{}".into(),
+            executor: "server".into(),
+        });
+        assert_eq!(trace.calls.len(), 1);
+        trace.on_event(&AgentEvent::ToolCallCompleted {
+            call_id: "c1".into(),
+            name: "time".into(),
+            status: "ok".into(),
+            output: String::new(),
+        });
+        assert!(trace.calls.is_empty());
+        trace.finish("completed");
     }
 
     #[test]
