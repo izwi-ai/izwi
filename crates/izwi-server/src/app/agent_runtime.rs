@@ -637,14 +637,17 @@ impl TurnTrace {
 /// the guard drops.
 pub(crate) fn cancel_with(control: &TurnControl) -> (TurnCancel, CancelLink) {
     let cancel = TurnCancel::new();
-    let link = {
-        let (cancel, control) = (cancel.clone(), control.clone());
-        tokio::spawn(async move {
-            control.cancelled().await;
-            cancel.cancel();
-        })
-    };
-    (cancel, CancelLink(link))
+    let link = cancel_follows(control, cancel.clone());
+    (cancel, link)
+}
+
+/// Make `cancel` follow a voice turn's control until the guard drops.
+pub(crate) fn cancel_follows(control: &TurnControl, cancel: TurnCancel) -> CancelLink {
+    let control = control.clone();
+    CancelLink(tokio::spawn(async move {
+        control.cancelled().await;
+        cancel.cancel();
+    }))
 }
 
 pub(crate) struct CancelLink(tokio::task::JoinHandle<()>);

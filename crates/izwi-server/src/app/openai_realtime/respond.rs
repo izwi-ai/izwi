@@ -1136,6 +1136,7 @@ async fn run_modular(
             events: TurnEvents::new(events),
             cancel,
             background: BackgroundResults::default(),
+            confirmed: izwi_agent::TurnGate::opened(),
         };
         let run = AgentEngine.run_conversation(
             &turn,
