@@ -200,15 +200,13 @@ export function withoutVoiceAgent(agents: VoiceAgent[], id: string): VoiceAgent[
 }
 
 /**
- * Whether the built-in tools are on: the choice made, else the engine's
- * default (on for the compact engine, which pays nothing for them; off for
- * the standard one, where offering a tool lengthens every turn).
+ * Whether the built-in tools are on: the choice made, else off on both
+ * engines. Offering a tool lengthens every standard turn, and the compact
+ * engine's model calls a lone date-and-time tool on a greeting and reads
+ * the date out.
  */
-export function voiceBuiltinToolsOn(
-  settings: VoiceAgentSettings,
-  mode: "modular" | "unified",
-): boolean {
-  return settings.builtinTools ?? mode === "unified";
+export function voiceBuiltinToolsOn(settings: VoiceAgentSettings): boolean {
+  return settings.builtinTools ?? false;
 }
 
 /**

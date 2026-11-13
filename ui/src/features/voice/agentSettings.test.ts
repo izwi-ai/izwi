@@ -144,11 +144,10 @@ describe("voice agent settings", () => {
     ).toEqual({ resume_false_interruptions: true });
   });
 
-  it("turn the built-in tools on by default only where they cost nothing", () => {
-    expect(voiceBuiltinToolsOn(DEFAULT_VOICE_AGENT_SETTINGS, "unified")).toBe(true);
-    expect(voiceBuiltinToolsOn(DEFAULT_VOICE_AGENT_SETTINGS, "modular")).toBe(false);
+  it("leave the built-in tools off until they are turned on", () => {
+    expect(voiceBuiltinToolsOn(DEFAULT_VOICE_AGENT_SETTINGS)).toBe(false);
     expect(
-      voiceBuiltinToolsOn({ ...DEFAULT_VOICE_AGENT_SETTINGS, builtinTools: true }, "modular"),
+      voiceBuiltinToolsOn({ ...DEFAULT_VOICE_AGENT_SETTINGS, builtinTools: true }),
     ).toBe(true);
   });
 });

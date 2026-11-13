@@ -550,7 +550,7 @@ struct InputStreamStartEvent {
     #[serde(default)]
     tools: Option<Vec<serde_json::Value>>,
     /// Whether those turns may call the server's built-in tools
-    /// (default `true`).
+    /// (default `false`).
     #[serde(default)]
     builtin_tools: Option<bool>,
     /// How long a turn waits for the client's output of a call.
@@ -1478,12 +1478,9 @@ async fn handle_text_message(
                     let tts_variant = parse_tts_model_variant(tts_model_id.as_str())
                         .map_err(|err| format!("Unsupported TTS model: {err}"))?;
                     validate_realtime_tts_model(tts_variant)?;
-                    // Offering tools lengthens every turn's prompt, so a
-                    // modular session offers the built-in ones only when
-                    // asked.
                     let tools = VoiceTools::parse(
                         tools,
-                        Some(builtin_tools.unwrap_or(false)),
+                        builtin_tools,
                         function_call_timeout_ms,
                         ToolCallFormat::of(text_variant).is_some(),
                     )?;
@@ -4322,7 +4319,7 @@ mod tests {
                     }
                 }
             })]),
-            None,
+            Some(true),
             None,
             true,
         )
@@ -5337,7 +5334,7 @@ mod tests {
         let ClientEvent::InputStreamStart(start) = start else {
             panic!("an input stream start");
         };
-        let tools = VoiceTools::parse(None, None, None, true).unwrap();
+        let tools = VoiceTools::parse(None, Some(true), None, true).unwrap();
         let agents = voice_agent_set(start.agents.clone(), "Qwen3.5-4B", tools.as_ref())
             .unwrap()
             .unwrap();

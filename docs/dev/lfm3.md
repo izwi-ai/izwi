@@ -235,9 +235,10 @@ turn, then the calls and their results) and `transcribe: false`, since the
 first round already transcribed the turn.
 
 On the server, a unified voice session on LFM3-Audio offers the built-in tools
-(`NoopTool` and `TimeTool`, shared with agent turns) unless `builtin_tools` is
-`false`, plus up to 64 client function tools from `input_stream_start`. The
-client answers its calls with `function_call_output` within
+(`NoopTool` and `TimeTool`, shared with agent turns) when `builtin_tools` is
+`true` (off by default, as in modular mode: the model calls a lone `time` tool
+on a greeting), plus up to 64 client function tools from `input_stream_start`.
+The client answers its calls with `function_call_output` within
 `function_call_timeout_ms` (default 10 s, 1 to 60 s). A turn runs at most three
 model rounds and eight calls (`MAX_TOOL_ROUNDS`, `MAX_TURN_FUNCTION_CALLS` in
 `crates/izwi-server/src/app/voice_tools.rs`); each round holds its own

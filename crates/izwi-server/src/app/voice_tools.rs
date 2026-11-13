@@ -37,8 +37,8 @@ pub(crate) struct VoiceTools {
 }
 
 impl VoiceTools {
-    /// The tools `input_stream_start` offers: the built-in tools unless
-    /// `builtin_tools` is `false`, and the client's `tools` (OpenAI function
+    /// The tools `input_stream_start` offers: the built-in tools when
+    /// `builtin_tools` is `true`, and the client's `tools` (OpenAI function
     /// tools, in the chat completions or the Responses form), whose calls
     /// the client answers within `function_call_timeout_ms` (default 10 s,
     /// 1 to 60 s). `calls_tools` is whether the session's model can call
@@ -68,7 +68,10 @@ impl VoiceTools {
                 tools.len()
             ));
         }
-        let builtin = builtin_tools.unwrap_or(true);
+        // Off unless asked for, on every engine. Offering a tool lengthens
+        // every turn's prompt, and LFM3-Audio calls a lone `time` tool on a
+        // greeting and reads the date aloud.
+        let builtin = builtin_tools.unwrap_or(false);
         let registry = builtin_tool_registry();
         let mut names = std::collections::HashSet::new();
         let client = tools
@@ -349,7 +352,7 @@ mod tests {
 
     #[test]
     fn sessions_offer_builtin_and_client_tools_on_lfm3_audio_only() {
-        let tools = VoiceTools::parse(Some(vec![weather()]), None, None, true)
+        let tools = VoiceTools::parse(Some(vec![weather()]), Some(true), None, true)
             .unwrap()
             .unwrap();
         let names = tools
@@ -376,6 +379,18 @@ mod tests {
         assert_eq!(tools.timeout, Duration::from_secs(1));
         assert_eq!(VoiceTools::parse(None, Some(false), None, true), Ok(None));
 
+        // The built-ins are opt-in.
+        assert_eq!(VoiceTools::parse(None, None, None, true), Ok(None));
+        let tools = VoiceTools::parse(Some(vec![weather()]), None, None, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tools
+                .registry(&PendingFunctionCalls::default())
+                .tool_names(),
+            ["get_weather"]
+        );
+
         // Other sessions take no tools.
         assert_eq!(VoiceTools::parse(None, None, None, false), Ok(None));
         assert_eq!(VoiceTools::parse(None, Some(false), None, false), Ok(None));
@@ -397,10 +412,10 @@ mod tests {
             vec![json!({"type": "web_search"})],
             vec![json!({"type": "function", "function": {"name": "a b"}})],
         ] {
-            assert!(VoiceTools::parse(Some(tools), None, None, true).is_err());
+            assert!(VoiceTools::parse(Some(tools), Some(true), None, true).is_err());
         }
-        // Without the built-ins, `time` is the client's.
-        let tools = VoiceTools::parse(Some(vec![time]), Some(false), None, true)
+        // Without the built-ins (the default), `time` is the client's.
+        let tools = VoiceTools::parse(Some(vec![time]), None, None, true)
             .unwrap()
             .unwrap();
         let registry = tools.registry(&PendingFunctionCalls::default());
