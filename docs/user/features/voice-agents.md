@@ -33,7 +33,7 @@ Open **Voice settings › Tools**.
 
 Turn on **Date and time** and the assistant can answer "what's the date?" or "what time is it?" from the real clock.
 
-On the Standard engine this is off until you turn it on. Offering any tool makes the assistant read a longer prompt on every turn, which adds to each reply (about two seconds on an M1 Pro). On the Compact engine with LFM3 Audio it is on by default.
+On the Standard engine this is off until you turn it on. Offering any tool makes the assistant read a longer prompt. With the Qwen3.5 assistant Izwi reuses the part it has read before, so on an M1 Pro the cost is well under a second a reply, where it used to be about two; the first reply after Izwi starts still pays it in full. A reply that calls a tool takes about as long as one that does not. On the Compact engine with LFM3 Audio it is on by default.
 
 ### Tool servers
 
