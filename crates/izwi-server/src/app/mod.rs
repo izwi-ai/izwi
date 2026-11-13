@@ -1,5 +1,6 @@
 pub(crate) mod agent_runtime;
 pub mod chat;
+pub(crate) mod mcp;
 pub(crate) mod media_stream;
 #[cfg(test)]
 mod media_stream_socket_tests;

@@ -44,6 +44,7 @@ use crate::api::openai::tool_calls::{parse_answer, ToolCallFormat, ToolCallParse
 use crate::app::agent_runtime::{
     cancel_with, drive_turn, ChatAgentBackend, RoundAdmission, ThreadMemory,
 };
+use crate::app::mcp::{AllowedHosts, McpServerConfig, McpTools};
 use crate::app::realtime_codec::{AudioOutputEncoder, OutputAudioFormat};
 use crate::app::realtime_protocol::{
     RealtimeAudioFormat, RealtimeAudioGapAction, RealtimeClose, RealtimeCloseCode,
@@ -532,6 +533,11 @@ struct InputStreamStartEvent {
     /// nothing otherwise; an empty string turns it off.
     #[serde(default)]
     tool_wait_phrase: Option<String>,
+    /// MCP servers whose tools a turn may call (`label`, `url`, optional
+    /// `headers` and `allowed_tools`). The server connects only to hosts in
+    /// `IZWI_MCP_ALLOWED_HOSTS`.
+    #[serde(default)]
+    mcp_servers: Option<Vec<McpServerConfig>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -1250,6 +1256,7 @@ async fn handle_text_message(
                 builtin_tools,
                 function_call_timeout_ms,
                 tool_wait_phrase,
+                mcp_servers,
             } = *start;
             if !conn.started {
                 return Err("Session not started. Send `session_start` first.".to_string());
@@ -1316,6 +1323,12 @@ async fn handle_text_message(
                         function_call_timeout_ms,
                         ToolCallFormat::of(text_variant).is_some(),
                     )?;
+                    let tools = connect_mcp_tools(
+                        tools,
+                        mcp_servers,
+                        ToolCallFormat::of(text_variant).is_some(),
+                    )
+                    .await?;
 
                     VoiceTurnConfig::Modular(ModularVoiceTurnConfig {
                         asr_model_id,
@@ -1355,6 +1368,12 @@ async fn handle_text_message(
                         function_call_timeout_ms,
                         variant.family() == izwi_core::ModelFamily::Lfm3Audio,
                     )?;
+                    let tools = connect_mcp_tools(
+                        tools,
+                        mcp_servers,
+                        variant.family() == izwi_core::ModelFamily::Lfm3Audio,
+                    )
+                    .await?;
                     VoiceTurnConfig::Unified(UnifiedVoiceTurnConfig {
                         s2s_model_id,
                         speaker: normalized_speaker,
@@ -2283,6 +2302,26 @@ struct VoiceTurnTools<'a> {
     /// Where background tools leave their results for the next turn.
     background: &'a BackgroundResults,
     voice_session_id: &'a str,
+}
+
+/// Connect to a session's MCP servers and add their tools to its tools.
+async fn connect_mcp_tools(
+    tools: Option<VoiceTools>,
+    servers: Option<Vec<McpServerConfig>>,
+    calls_tools: bool,
+) -> Result<Option<VoiceTools>, String> {
+    let servers = servers.unwrap_or_default();
+    if servers.is_empty() {
+        return Ok(tools);
+    }
+    if !calls_tools {
+        return Err(
+            "MCP servers need a chat model that can call tools, or unified mode with an LFM3-Audio `s2s_model_id`"
+                .to_string(),
+        );
+    }
+    let mcp = McpTools::connect(&servers, &AllowedHosts::from_env()).await?;
+    VoiceTools::with_mcp(tools, mcp)
 }
 
 /// How long a tool may keep a reply silent before the reply says so.
@@ -3318,7 +3357,8 @@ fn map_typed_voice_event(
             name: json_str(value, "name"),
             arguments: json_str(value, "arguments"),
             executor: match value.get("executor").and_then(serde_json::Value::as_str) {
-                Some("server") => Some(RealtimeFunctionExecutor::Server),
+                // An MCP tool runs on the server's side of the socket.
+                Some("server" | "mcp") => Some(RealtimeFunctionExecutor::Server),
                 Some("client") => Some(RealtimeFunctionExecutor::Client),
                 _ => None,
             },

@@ -18,6 +18,7 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_ALLOW_UNAUTHENTICATED_NETWORK` | `false` | Serve a non-loopback bind without IZWI_API_KEY (same as --allow-unauthenticated-network). |
 | `IZWI_LOOPBACK_PUBLISHED` | `false` | The port is published on the host's loopback only (a container's `-p 127.0.0.1:…`): treat the bind as loopback, so no key is required and only loopback or IZWI_ALLOWED_HOSTS Host names are served. |
 | `IZWI_TRUST_GATEWAY_TENANT_HEADER` | `false` | Keep files, batches, jobs and speech lookups apart per gateway tenant: a request that carries the API key (any request when no key is set) acts for the tenant its `X-Izwi-Gateway-Tenant` header names, which an Izwi gateway sets for every caller. Anyone who can reach the server with the key can name any tenant, so enable it only where the gateway is the server's sole client. Off, the header is ignored. |
+| `IZWI_MCP_ALLOWED_HOSTS` | unset | Comma-separated hosts (`host` or `host:port`, `*` for any) whose MCP servers a voice or Realtime session may name. The server connects to those servers itself, so list only hosts every API client may reach through it. Empty turns MCP tools off. |
 | `IZWI_ALLOWED_HOSTS` | unset | Comma-separated extra Host names to accept (port optional). On a non-loopback bind, setting it turns the Host check on. |
 | `IZWI_PRELOAD_MODELS` | unset | Comma-separated model ids loaded at start-up; readiness waits for them. |
 | `IZWI_WARMUP_PRELOADED_MODELS` | `true` | Run a warm-up request on each preloaded model. |

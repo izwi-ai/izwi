@@ -10,6 +10,8 @@ use izwi_agent::{
     AgentError, AgentEvent, TimeTool, Tool, ToolContext, ToolExecution, ToolOutput, ToolRegistry,
 };
 use serde_json::{json, Value};
+
+use crate::app::mcp::McpTools;
 use tokio::sync::oneshot;
 
 const MAX_CLIENT_TOOLS: usize = 64;
@@ -29,6 +31,8 @@ pub(crate) struct VoiceTools {
     builtin: bool,
     /// The client's function tools, in the chat completions form.
     client: Vec<Value>,
+    /// The tools of the session's MCP servers.
+    mcp: McpTools,
     pub(crate) timeout: Duration,
 }
 
@@ -95,8 +99,27 @@ impl VoiceTools {
         Ok(Some(Self {
             builtin,
             client,
+            mcp: McpTools::default(),
             timeout: Duration::from_millis(timeout_ms),
         }))
+    }
+
+    /// Add the tools of the session's MCP servers to `tools` (which may be
+    /// none so far). `Err` when one has the name of another tool.
+    pub(crate) fn with_mcp(tools: Option<Self>, mcp: McpTools) -> Result<Option<Self>, String> {
+        if mcp.is_empty() {
+            return Ok(tools);
+        }
+        let mut tools = tools.unwrap_or(Self {
+            builtin: false,
+            client: Vec::new(),
+            mcp: McpTools::default(),
+            timeout: Duration::from_millis(DEFAULT_FUNCTION_CALL_TIMEOUT_MS),
+        });
+        let mut registry = tools.registry(&PendingFunctionCalls::default());
+        mcp.register(&mut registry)?;
+        tools.mcp = mcp;
+        Ok(Some(tools))
     }
 
     /// The tool definitions the model sees: the built-in ones, then the
@@ -135,6 +158,8 @@ impl VoiceTools {
                 pending: pending.clone(),
             });
         }
+        // Name clashes were refused when the session started.
+        let _ = self.mcp.register(&mut registry);
         registry
     }
 }

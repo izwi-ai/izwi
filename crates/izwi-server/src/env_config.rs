@@ -96,6 +96,11 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "Keep files, batches, jobs and speech lookups apart per gateway tenant: a request that carries the API key (any request when no key is set) acts for the tenant its `X-Izwi-Gateway-Tenant` header names, which an Izwi gateway sets for every caller. Anyone who can reach the server with the key can name any tenant, so enable it only where the gateway is the server's sole client. Off, the header is ignored.",
     ),
     var(
+        "IZWI_MCP_ALLOWED_HOSTS",
+        "",
+        "Comma-separated hosts (`host` or `host:port`, `*` for any) whose MCP servers a voice or Realtime session may name. The server connects to those servers itself, so list only hosts every API client may reach through it. Empty turns MCP tools off.",
+    ),
+    var(
         "IZWI_ALLOWED_HOSTS",
         "",
         "Comma-separated extra Host names to accept (port optional). On a non-loopback bind, setting it turns the Host check on.",
