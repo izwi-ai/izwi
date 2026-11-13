@@ -19,9 +19,9 @@ import {
   useMemo,
   useRef,
   useState,
-  type ReactNode,
 } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { Link } from "react-router";
 
 import { api } from "@/api";
 import { setAnalyticsEnabled } from "@/app/analytics/client";
@@ -34,7 +34,11 @@ import { useNotifications } from "@/app/providers/NotificationProvider";
 import { type UpdateStatus, useAppUpdates } from "@/app/providers/AppUpdateProvider";
 import { useTheme } from "@/app/providers/ThemeProvider";
 import { PageHeader, PageShell } from "@/components/PageShell";
+import { SettingsRow, SettingsSection } from "@/components/SettingsSection";
 import { Button } from "@/components/ui/button";
+import { dictationApi } from "@/features/dictation/api";
+import { HotkeyKeys } from "@/features/dictation/components/HotkeyRecorder";
+import type { DictationSnapshot } from "@/features/dictation/types";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
@@ -255,106 +259,6 @@ function ThemeSwatch({ theme }: { theme: "system" | "light" | "dark" }) {
   );
 }
 
-function SettingsSection({
-  id,
-  title,
-  description,
-  children,
-}: {
-  id: string;
-  title: string;
-  description?: ReactNode;
-  children: ReactNode;
-}) {
-  const headingId = `${id}-heading`;
-  return (
-    <section id={id} aria-labelledby={headingId} className="scroll-mt-6">
-      <h2
-        id={headingId}
-        className="text-[15px] font-semibold text-(--text-primary)"
-      >
-        {title}
-      </h2>
-      {description ? (
-        <p className="mt-0.5 text-[13px] text-(--text-muted)">
-          {description}
-        </p>
-      ) : null}
-      <div className="mt-3 rounded-[14px] border border-(--border-subtle) bg-(--surface-panel) px-4">
-        {children}
-      </div>
-    </section>
-  );
-}
-
-function SettingsRow({
-  title,
-  description,
-  action,
-  children,
-  className,
-}: {
-  title?: ReactNode;
-  description?: ReactNode;
-  action?: ReactNode;
-  children?: ReactNode;
-  className?: string;
-}) {
-  const hasHeaderCopy = Boolean(title || description);
-
-  return (
-    <div
-      className={cn(
-        "border-b border-(--border-subtle) py-3.5 last:border-b-0",
-        className,
-      )}
-    >
-      {hasHeaderCopy || action ? (
-        <div
-          className={cn(
-            "flex flex-col md:flex-row md:items-center md:justify-between",
-            hasHeaderCopy && action ? "gap-3" : "gap-0",
-          )}
-        >
-          {hasHeaderCopy ? (
-            <div className="min-w-0 max-w-2xl">
-              {title ? (
-                <div className="text-[13.5px] font-medium text-(--text-primary)">
-                  {title}
-                </div>
-              ) : null}
-              {description ? (
-                <div
-                  className={cn(
-                    "text-[12.5px] leading-5 text-(--text-subtle)",
-                    title ? "mt-0.5" : undefined,
-                  )}
-                >
-                  {description}
-                </div>
-              ) : null}
-            </div>
-          ) : null}
-          {action ? (
-            // ml-auto keeps action-only rows right-aligned; justify-between
-            // has no effect with a single child.
-            <div className="shrink-0 md:ml-auto">{action}</div>
-          ) : null}
-        </div>
-      ) : null}
-      {children ? (
-        <div
-          className={cn(
-            hasHeaderCopy ? "mt-3" : action ? "mt-1.5" : "mt-0",
-          )}
-        >
-          {children}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 type CliInstallStatus = {
   available: boolean;
   installed: boolean;
@@ -501,6 +405,55 @@ function RunSetupAgainRow() {
           )}
           Run setup again
         </Button>
+      }
+    />
+  );
+}
+
+/** The system-wide dictation shortcut; it is changed on the Dictation page. */
+function DictationShortcutRow() {
+  const [snapshot, setSnapshot] = useState<DictationSnapshot | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    dictationApi
+      .snapshot()
+      .then((next) => {
+        if (active && next?.settings && next.platform) {
+          setSnapshot(next);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  return (
+    <SettingsRow
+      title="Dictate anywhere"
+      description="Speak in any app and Izwi writes it at the cursor."
+      action={
+        <div className="flex items-center gap-3">
+          {snapshot ? (
+            snapshot.settings.enabled ? (
+              <HotkeyKeys
+                hotkey={snapshot.settings.hotkey}
+                os={snapshot.platform.os}
+              />
+            ) : (
+              <span className="text-sm font-medium text-(--text-secondary)">
+                Off
+              </span>
+            )
+          ) : null}
+          <Link
+            to="/dictation"
+            className="text-[13px] text-(--text-primary) underline underline-offset-2 hover:no-underline"
+          >
+            {snapshot?.settings.enabled ? "Change" : "Set up"}
+          </Link>
+        </div>
       }
     />
   );
@@ -1015,6 +968,7 @@ export function SettingsPage() {
                 }
               />
             ))}
+            {desktopRuntime ? <DictationShortcutRow /> : null}
           </SettingsSection>
 
           <SettingsSection

@@ -277,6 +277,8 @@ impl EncoderOptions {
 
     /// Checks the options without building an encoder, so a request can be
     /// refused before any work starts. Returns the output rate.
+    // Without mp3 and opus no format takes a bitrate.
+    #[cfg_attr(not(any(feature = "mp3", feature = "opus")), allow(unused_variables))]
     pub fn validate(&self) -> Result<u32, CodecError> {
         if !self.format.is_available() {
             return Err(CodecError::unsupported(self.format));
@@ -438,6 +440,7 @@ pub(crate) fn to_i16(sample: f32) -> i16 {
 /// `sample` clamped to [-1, 1] with non-finite values silenced, for codecs
 /// that take float input.
 #[inline]
+#[cfg_attr(not(any(feature = "mp3", feature = "opus")), allow(dead_code))]
 pub(crate) fn sanitize(sample: f32) -> f32 {
     if sample.is_finite() {
         sample.clamp(-1.0, 1.0)

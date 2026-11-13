@@ -3,12 +3,14 @@ import {
   Box,
   FileAudio,
   FileText,
+  Keyboard,
   Library,
   MessageSquare,
   Mic,
   Settings,
   type LucideIcon,
 } from "lucide-react";
+import { isTauri } from "@tauri-apps/api/core";
 
 export interface NavItem {
   id: string;
@@ -21,6 +23,11 @@ export interface NavGroup {
   label: string;
   items: NavItem[];
 }
+
+/** System-wide dictation exists only in the desktop app. */
+const DICTATION_NAV_ITEMS: NavItem[] = isTauri()
+  ? [{ id: "dictation", label: "Dictation", icon: Keyboard, path: "/dictation" }]
+  : [];
 
 export const NAV_GROUPS: NavGroup[] = [
   {
@@ -39,6 +46,7 @@ export const NAV_GROUPS: NavGroup[] = [
         icon: FileText,
         path: "/transcription",
       },
+      ...DICTATION_NAV_ITEMS,
       {
         id: "text-to-speech",
         label: "Text to Speech",

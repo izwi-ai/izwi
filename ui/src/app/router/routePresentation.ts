@@ -59,6 +59,8 @@ export function documentTitleForLocation(
       return withAppName(isDetail ? "Diarization Record" : "Diarization");
     case "text-to-speech":
       return withAppName(isDetail ? "Text-to-Speech Record" : "Text to Speech");
+    case "dictation":
+      return withAppName("Dictation");
     case "studio":
       return withAppName(isDetail ? "Studio Project" : "Studio");
     case "voices":

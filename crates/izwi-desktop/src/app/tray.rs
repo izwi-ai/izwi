@@ -12,6 +12,8 @@ const TRAY_SETTINGS_ID: &str = "tray_settings";
 const TRAY_MODELS_ID: &str = "tray_models";
 const TRAY_CHECK_UPDATES_ID: &str = "tray_check_updates";
 const TRAY_QUIT_ID: &str = "tray_quit";
+const TRAY_DICTATE_ID: &str = "tray_dictate";
+const TRAY_PASTE_LAST_ID: &str = "tray_paste_last";
 
 pub fn build_basic_tray<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
     let open_item = MenuItem::with_id(app, TRAY_OPEN_ID, "Open Izwi", true, None::<&str>)
@@ -20,6 +22,24 @@ pub fn build_basic_tray<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
         .context("failed to build tray settings item")?;
     let models_item = MenuItem::with_id(app, TRAY_MODELS_ID, "Models", true, None::<&str>)
         .context("failed to build tray models item")?;
+    let dictate_item = MenuItem::with_id(
+        app,
+        TRAY_DICTATE_ID,
+        "Start or Stop Dictation",
+        true,
+        None::<&str>,
+    )
+    .context("failed to build tray dictation item")?;
+    let paste_last_item = MenuItem::with_id(
+        app,
+        TRAY_PASTE_LAST_ID,
+        "Paste Last Dictation",
+        true,
+        None::<&str>,
+    )
+    .context("failed to build tray paste item")?;
+    let dictation_separator =
+        PredefinedMenuItem::separator(app).context("failed to build tray separator item")?;
     let check_updates_item = MenuItem::with_id(
         app,
         TRAY_CHECK_UPDATES_ID,
@@ -36,6 +56,9 @@ pub fn build_basic_tray<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
         app,
         &[
             &open_item,
+            &dictate_item,
+            &paste_last_item,
+            &dictation_separator,
             &settings_item,
             &models_item,
             &check_updates_item,
@@ -62,6 +85,8 @@ pub fn build_basic_tray<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
                 let _ = show_main_window(app_handle);
                 let _ = emit_tray_event(app_handle, "izwi:tray-check-updates", None);
             }
+            TRAY_DICTATE_ID => dictate_from_tray(app_handle),
+            TRAY_PASTE_LAST_ID => paste_last_from_tray(app_handle),
             TRAY_QUIT_ID => {
                 app_handle.exit(0);
             }
@@ -117,6 +142,36 @@ fn status_notifier_watcher_running() -> bool {
         .is_ok_and(|output| {
             output.status.success() && String::from_utf8_lossy(&output.stdout).contains("true")
         })
+}
+
+/// The dictation tray items act on the real app; test runtimes have none.
+fn dictate_from_tray<R: Runtime>(app: &AppHandle<R>) {
+    let Some(app) = (app as &dyn std::any::Any).downcast_ref::<AppHandle>() else {
+        return;
+    };
+    if super::dictation::is_enabled(app) {
+        super::dictation::send(app, izwi_dictation::Input::Toggle);
+    } else {
+        // Off: the Dictation page is where it is turned on.
+        let _ = navigate_main_window(app, "/dictation");
+    }
+}
+
+fn paste_last_from_tray<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(app) = (app as &dyn std::any::Any).downcast_ref::<AppHandle>() {
+        super::dictation::paste_last(app);
+    }
+}
+
+/// Show in the tray that a dictation is being recorded.
+pub fn set_dictation_recording<R: Runtime>(app: &AppHandle<R>, recording: bool) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    let _ = tray.set_tooltip(Some(if recording { "Izwi: listening" } else { "Izwi" }));
+    // The menu bar shows text next to the icon; other trays have no room.
+    #[cfg(target_os = "macos")]
+    let _ = tray.set_title(if recording { Some("●") } else { None::<&str> });
 }
 
 pub fn show_main_window<R: Runtime>(app: &AppHandle<R>) -> Result<()> {

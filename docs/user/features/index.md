@@ -8,6 +8,7 @@ icon: "sparkles"
 | Feature | Description | Guide |
 |---------|-------------|-------|
 | **Voice** | Real-time voice conversations with AI | [Voice Guide](/features/voice) |
+| **Dictation** | Speak into any app; the text appears at the cursor | [Dictation Guide](/features/dictation) |
 | **Phone calls** | Live transcription and voice agents on phone calls | [Phone calls and call centres](/features/telephony) |
 | **Chat** | Text-based AI conversations | [Chat Guide](/features/chat) |
 | **Transcription** | Convert audio to text | [Transcription Guide](/features/transcription) |

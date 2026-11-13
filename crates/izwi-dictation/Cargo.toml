@@ -1,0 +1,82 @@
+[package]
+name = "izwi-dictation"
+description = "System-wide dictation for Izwi desktop: hotkey sessions, microphone capture, text rules and insertion at the cursor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["capture"]
+# Microphone capture through cpal. Off for builds that only need the session
+# logic, text rules and insertion (cpal needs ALSA headers on Linux).
+capture = ["dep:cpal"]
+
+[dependencies]
+izwi-vad = { path = "../izwi-vad" }
+izwi-audio-codec = { path = "../izwi-audio-codec", default-features = false }
+serde = { workspace = true }
+thiserror = { workspace = true }
+cpal = { version = "0.18.2", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.25"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSPasteboard",
+    "NSPasteboardItem",
+    "NSRunningApplication",
+    "NSWorkspace",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSData",
+    "NSEnumerator",
+    "NSString",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+# Modifier-only and Fn hotkeys, which the OS hotkey registration cannot do.
+handy-keys = "0.3.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
+# Wayland: the GlobalShortcuts and RemoteDesktop portals.
+ashpd = { version = "0.14", default-features = false, features = [
+    "tokio",
+    "global_shortcuts",
+    "remote_desktop",
+    "screencast",
+] }
+futures-util = "0.3"
+tokio = { workspace = true }
+x11rb = { version = "0.14", features = ["xtest"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+izwi-vad = { path = "../izwi-vad", features = ["test-signals"] }
+
+[[example]]
+name = "record"
+required-features = ["capture"]
+
+[[example]]
+name = "insert"

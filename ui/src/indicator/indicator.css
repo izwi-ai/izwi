@@ -1,0 +1,170 @@
+/* The dictation indicator: a pill in a small transparent, click-through
+   window. Self-contained on purpose: none of the app's styles load here. */
+
+:root {
+  color-scheme: light dark;
+  --pill-bg: rgba(255, 255, 255, 0.94);
+  --pill-border: rgba(9, 9, 11, 0.1);
+  --pill-text: #09090b;
+  --pill-muted: #71717a;
+  --pill-danger: #b91c1c;
+  --pill-shadow: 0 4px 14px rgba(9, 9, 11, 0.16);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --pill-bg: rgba(24, 24, 27, 0.94);
+    --pill-border: rgba(255, 255, 255, 0.12);
+    --pill-text: #f5f5f4;
+    --pill-muted: #a1a1aa;
+    --pill-danger: #fca5a5;
+    --pill-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  }
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    sans-serif;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--pill-text);
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+#indicator {
+  display: flex;
+  max-width: calc(100% - 24px);
+}
+
+.pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  height: 36px;
+  padding: 0 14px;
+  box-sizing: border-box;
+  border: 1px solid var(--pill-border);
+  border-radius: 999px;
+  background: var(--pill-bg);
+  box-shadow: var(--pill-shadow);
+}
+
+.pill[data-kind="hidden"] {
+  display: none;
+}
+
+.pill > * {
+  display: none;
+  flex-shrink: 0;
+}
+
+.pill svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+}
+
+.pill[data-kind="starting"] .mic {
+  display: block;
+  opacity: 0.45;
+}
+
+.pill[data-kind="listening"] .bars {
+  display: flex;
+}
+
+.pill[data-kind="listening"][data-locked="true"] .lock {
+  display: block;
+  color: var(--pill-muted);
+}
+
+.pill[data-kind="listening"][data-locked="true"] .lock svg {
+  width: 12px;
+  height: 12px;
+}
+
+.pill[data-kind="transcribing"] .spinner,
+.pill[data-kind="done"] .check {
+  display: block;
+}
+
+.pill[data-has-text="true"] .text {
+  display: block;
+  flex: 1 1 auto;
+}
+
+.pill[data-tone="danger"] .text {
+  color: var(--pill-danger);
+}
+
+.bars {
+  align-items: center;
+  gap: 3px;
+  height: 18px;
+}
+
+.bars i {
+  width: 3px;
+  height: 100%;
+  border-radius: 2px;
+  background: currentColor;
+  transform: scaleY(0.15);
+  transition: transform 90ms linear;
+}
+
+.spinner svg {
+  animation: indicator-spin 0.9s linear infinite;
+}
+
+@keyframes indicator-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.text {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  line-height: 18px;
+}
+
+/* Live words: the box reads right-to-left so the overflow, and its ellipsis,
+   fall on the left and the newest words stay in view. */
+.pill[data-kind="listening"] .text {
+  direction: rtl;
+  text-align: left;
+}
+
+.text bdi {
+  unicode-bidi: isolate;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bars i {
+    transition: none;
+  }
+
+  .spinner svg {
+    animation: none;
+  }
+}

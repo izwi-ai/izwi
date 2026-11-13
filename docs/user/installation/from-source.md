@@ -46,7 +46,8 @@ source "$HOME/.cargo/env"
 ```bash
 sudo apt update
 sudo apt install -y build-essential curl git pkg-config libssl-dev \
-  libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+  libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+  libasound2-dev
 
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh

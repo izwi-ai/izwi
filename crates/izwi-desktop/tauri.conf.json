@@ -8,9 +8,11 @@
   },
   "app": {
     "windows": [],
+    "macOSPrivateApi": true,
     "security": {
       "capabilities": [
-        "default"
+        "default",
+        "dictation-indicator"
       ],
       "csp": {
         "default-src": "'self'",
@@ -48,6 +50,9 @@
     ],
     "linux": {
       "deb": {
+        "depends": [
+          "libasound2"
+        ],
         "files": {
           "/usr/bin/izwi": "../../target/release/izwi",
           "/usr/bin/izwi-server": "../../target/release/izwi-server"

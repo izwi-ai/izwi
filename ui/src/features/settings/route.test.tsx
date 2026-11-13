@@ -1,7 +1,18 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { MemoryRouter } from "react-router";
+
 import { SettingsPage } from "@/features/settings/route";
+
+// The page links to the Dictation page, so it needs a router around it.
+function renderSettings() {
+  return render(
+    <MemoryRouter>
+      <SettingsPage />
+    </MemoryRouter>,
+  );
+}
 
 const coreMocks = vi.hoisted(() => ({
   desktop: true,
@@ -150,7 +161,7 @@ describe("SettingsPage capabilities", () => {
       capabilityStatus: "unsupported",
     };
 
-    render(<SettingsPage />);
+    renderSettings();
 
     expect(screen.getByText("Desktop only")).toBeVisible();
     expect(screen.queryByRole("button", { name: "Check now" })).not.toBeInTheDocument();
@@ -176,7 +187,7 @@ describe("SettingsPage capabilities", () => {
       command === "install_cli" ? installed : defaultInvoke?.(command),
     );
 
-    render(<SettingsPage />);
+    renderSettings();
 
     // The button is there, disabled, until the install status is read;
     // a click before then does nothing.
@@ -197,7 +208,7 @@ describe("SettingsPage capabilities", () => {
         : defaultInvoke?.(command),
     );
 
-    render(<SettingsPage />);
+    renderSettings();
 
     await screen.findByText("This build does not include the izwi command.");
     expect(screen.queryByRole("button", { name: "Install" })).not.toBeInTheDocument();
@@ -207,7 +218,7 @@ describe("SettingsPage capabilities", () => {
     apiMocks.runSetupAgain
       .mockRejectedValueOnce(new Error("Request failed"))
       .mockResolvedValue(undefined);
-    render(<SettingsPage />);
+    renderSettings();
 
     const about = screen.getByRole("region", { name: "About" });
     const button = within(about).getByRole("button", { name: "Run setup again" });
@@ -228,7 +239,7 @@ describe("SettingsPage capabilities", () => {
   });
 
   it("shows the runtime and the keyboard shortcuts", async () => {
-    render(<SettingsPage />);
+    renderSettings();
 
     const runtime = screen.getByRole("region", { name: "Runtime" });
     expect(await within(runtime).findByText("Metal")).toBeVisible();
@@ -256,7 +267,7 @@ describe("SettingsPage capabilities", () => {
       return command === "tray_icon_visible";
     });
 
-    render(<SettingsPage />);
+    renderSettings();
 
     const analyticsSwitch = await screen.findByRole("switch", {
       name: "Share anonymous usage data",
@@ -291,7 +302,7 @@ describe("SettingsPage capabilities", () => {
       new Error("write failed"),
     );
 
-    render(<SettingsPage />);
+    renderSettings();
 
     const analyticsSwitch = await screen.findByRole("switch", {
       name: "Share anonymous usage data",
@@ -375,7 +386,7 @@ describe("SettingsPage capabilities", () => {
       errorMessage: testCase.error,
     };
 
-    render(<SettingsPage />);
+    renderSettings();
 
     expect(screen.getByText(testCase.badge)).toBeVisible();
     if (testCase.detail) {
@@ -394,7 +405,7 @@ describe("SettingsPage capabilities", () => {
       },
     };
 
-    render(<SettingsPage />);
+    renderSettings();
 
     expect(screen.getByText("Needs macOS 13.3")).toBeVisible();
     expect(screen.getByText(/needs macOS 13\.3 or later/)).toBeVisible();
@@ -409,7 +420,7 @@ describe("SettingsPage capabilities", () => {
       capabilityStatus: "error",
     };
 
-    render(<SettingsPage />);
+    renderSettings();
 
     expect(screen.getByText("Support unknown")).toBeVisible();
     expect(
