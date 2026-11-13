@@ -304,6 +304,7 @@ fn modular_commit(format: OutputAudioFormat) -> PendingAudioCommit {
             output_format: format,
             tools: None,
             tool_wait_phrase: None,
+            agents: None,
         }),
         endpointed_at: Instant::now(),
         endpointing_delay: None,

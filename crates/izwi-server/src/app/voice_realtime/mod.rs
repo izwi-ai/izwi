@@ -538,6 +538,85 @@ struct InputStreamStartEvent {
     /// `IZWI_MCP_ALLOWED_HOSTS`.
     #[serde(default)]
     mcp_servers: Option<Vec<McpServerConfig>>,
+    /// Modular mode: the agents of the session. The first holds the
+    /// conversation at the start; an agent hands it to another by calling
+    /// `transfer_to_<id>`, and records its task by calling
+    /// `complete_<task name>`. Without `agents` the session is one agent
+    /// with the session's system prompt.
+    #[serde(default)]
+    agents: Option<Vec<VoiceAgentConfig>>,
+}
+
+/// One agent of a voice session.
+#[derive(Debug, Clone, Deserialize)]
+struct VoiceAgentConfig {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    /// The agent's system prompt; the session's when absent.
+    #[serde(default)]
+    instructions: Option<String>,
+    /// The session tools the agent may call; all of them when absent.
+    #[serde(default)]
+    tools: Option<Vec<String>>,
+    #[serde(default)]
+    handoffs: Vec<String>,
+    #[serde(default)]
+    handoff_description: Option<String>,
+    #[serde(default)]
+    task: Option<izwi_agent::TaskSpec>,
+}
+
+/// The agents of a session as the runtime's, each on `model_id`. An agent
+/// without instructions keeps an empty prompt and takes the session's at
+/// its turn.
+fn voice_agent_set(
+    agents: Option<Vec<VoiceAgentConfig>>,
+    model_id: &str,
+    tools: Option<&VoiceTools>,
+) -> Result<Option<AgentSet>, String> {
+    let Some(agents) = agents.filter(|agents| !agents.is_empty()) else {
+        return Ok(None);
+    };
+    let offered = tools
+        .map(|tools| {
+            tools
+                .registry(&PendingFunctionCalls::default())
+                .tool_names()
+        })
+        .unwrap_or_default();
+    let agents = agents
+        .into_iter()
+        .map(|agent| {
+            for tool in agent.tools.iter().flatten() {
+                if !offered.contains(tool) {
+                    return Err(format!(
+                        "Agent `{}` names the tool `{tool}`, which the session does not offer",
+                        agent.id
+                    ));
+                }
+            }
+            Ok(AgentDefinition {
+                name: agent.name.unwrap_or_else(|| agent.id.clone()),
+                tools: agent.tools,
+                handoffs: agent.handoffs,
+                handoff_description: agent.handoff_description,
+                task: agent.task,
+                ..AgentDefinition::new(
+                    agent.id,
+                    "",
+                    agent.instructions.unwrap_or_default(),
+                    model_id,
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    AgentSet::new(agents).map(Some).map_err(|err| match err {
+        izwi_agent::AgentError::InvalidAgent(message) => {
+            format!("Invalid `agents`: {message}")
+        }
+        other => other.to_string(),
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -570,6 +649,8 @@ pub(crate) struct ModularVoiceTurnConfig {
     tools: Option<VoiceTools>,
     /// Said when a tool keeps a silent reply waiting.
     tool_wait_phrase: Option<String>,
+    /// The session's agents, when it has more than the default one.
+    agents: Option<AgentSet>,
 }
 
 #[derive(Debug, Clone)]
@@ -1257,6 +1338,7 @@ async fn handle_text_message(
                 function_call_timeout_ms,
                 tool_wait_phrase,
                 mcp_servers,
+                agents,
             } = *start;
             if !conn.started {
                 return Err("Session not started. Send `session_start` first.".to_string());
@@ -1330,6 +1412,11 @@ async fn handle_text_message(
                     )
                     .await?;
 
+                    if agents.is_some() && ToolCallFormat::of(text_variant).is_none() {
+                        return Err("`agents` need a chat model that can call tools".to_string());
+                    }
+                    let agents = voice_agent_set(agents, &text_model_id, tools.as_ref())?;
+
                     VoiceTurnConfig::Modular(ModularVoiceTurnConfig {
                         asr_model_id,
                         text_model_id,
@@ -1345,9 +1432,13 @@ async fn handle_text_message(
                             tool_wait_phrase,
                             normalized_asr_language_for_phrase.as_deref(),
                         ),
+                        agents,
                     })
                 }
                 RealtimeVoiceMode::Unified => {
+                    if agents.is_some() {
+                        return Err("`agents` need modular mode".to_string());
+                    }
                     let Some(s2s_model_id) = normalized_s2s else {
                         return Err(
                             "Missing required model id (`s2s_model_id`) for unified voice mode."
@@ -1849,6 +1940,10 @@ fn spawn_turn_task(
                                 voice_session_id: &voice_session_id,
                             }),
                             config.tool_wait_phrase.as_deref(),
+                            config
+                                .agents
+                                .as_ref()
+                                .map(|agents| (agents, &agent_session.active_agent)),
                             &|event: &AgentEvent| {
                                 if let Some(message) = function_call_message(
                                     event,
@@ -2921,6 +3016,8 @@ async fn reap_interrupted_turn(mut turn: ActiveTurn, reason: String) {
 struct AgentSessionSlot {
     /// The session's id and the system prompt it was created with.
     binding: tokio::sync::Mutex<Option<(String, String)>>,
+    /// The agent that holds the conversation, once a turn has run.
+    active_agent: Mutex<Option<String>>,
 }
 
 impl AgentSessionSlot {
@@ -2983,6 +3080,7 @@ async fn run_agent_turn(
     turn_record_id: &str,
     tools: Option<VoiceTurnTools<'_>>,
     tool_wait_phrase: Option<&str>,
+    agents: Option<(&AgentSet, &Mutex<Option<String>>)>,
     on_event: &(dyn Fn(&AgentEvent) + Sync),
     deltas: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> Result<String, String> {
@@ -2996,15 +3094,43 @@ async fn run_agent_turn(
 
     let resolved_model_id = resolve_chat_model_id(Some(model_id))?;
 
-    let agents = AgentSet::single(AgentDefinition::new(
-        session_record.agent_id.clone(),
-        DEFAULT_VOICE_AGENT_NAME,
-        session_record.system_prompt.clone(),
-        session_record.model_id.clone(),
-    ));
+    // The session's prompt leads each agent's own instructions.
+    let (agents, active_agent) = match agents {
+        Some((agents, active)) => (
+            agents.with_system_prompts(|agent| {
+                [
+                    session_record.system_prompt.trim(),
+                    agent.system_prompt.trim(),
+                ]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+            }),
+            Some(active),
+        ),
+        None => (
+            AgentSet::single(AgentDefinition::new(
+                session_record.agent_id.clone(),
+                DEFAULT_VOICE_AGENT_NAME,
+                session_record.system_prompt.clone(),
+                session_record.model_id.clone(),
+            )),
+            None,
+        ),
+    };
+    let agents = &agents;
+    let holder = active_agent
+        .and_then(|active| {
+            active
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
+        })
+        .unwrap_or_else(|| agents.first().id.clone());
     let session = AgentSession {
         id: session_record.id.clone(),
-        agent_id: session_record.agent_id.clone(),
+        agent_id: holder,
         thread_id: session_record.thread_id.clone(),
         created_at: session_record.created_at,
         updated_at: session_record.updated_at,
@@ -3099,6 +3225,9 @@ async fn run_agent_turn(
         izwi_agent::AgentError::InvalidInput(msg) => msg,
         other => other.to_string(),
     })?;
+    if let Some(active) = active_agent {
+        *active.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(result.agent_id.clone());
+    }
     {
         let mut reply = control.reply();
         reply.text = Some(strip_reasoning(&result.assistant_text));
@@ -3372,6 +3501,17 @@ fn map_typed_voice_event(
                 _ => RealtimeFunctionCallStatus::Error,
             },
             output: json_str(value, "output"),
+        },
+        "agent_handoff" => RealtimeServerEvent::AgentHandoff {
+            from: json_str(value, "from"),
+            to: json_str(value, "to"),
+        },
+        "task_completed" => RealtimeServerEvent::TaskCompleted {
+            name: json_str(value, "name"),
+            result: value
+                .get("result")
+                .map(serde_json::Value::to_string)
+                .unwrap_or_default(),
         },
         "turn_interrupted" => RealtimeServerEvent::Interruption {
             reason: match value
@@ -4280,6 +4420,7 @@ mod tests {
                 output_format: OutputAudioFormat::G711Ulaw,
                 tools: None,
                 tool_wait_phrase: None,
+                agents: None,
             }),
             endpointed_at: Instant::now(),
             endpointing_delay: None,
@@ -4441,6 +4582,49 @@ mod tests {
             Some("Ngicela ulinde.")
         );
         assert_eq!(phrase(Some(""), None), None);
+    }
+
+    #[test]
+    fn a_session_declares_agents_that_hand_over_and_collect_tasks() {
+        let start: ClientEvent = serde_json::from_value(json!({
+            "type": "input_stream_start",
+            "agents": [
+                {"id": "front", "instructions": "Greet callers.", "handoffs": ["billing"],
+                 "tools": ["time"]},
+                {"id": "billing", "name": "Billing", "handoff_description": "For invoices.",
+                 "task": {"name": "refund", "description": "Record a refund.",
+                          "parameters": {"type": "object", "required": ["invoice"]},
+                          "then": "front"}},
+            ],
+        }))
+        .unwrap();
+        let ClientEvent::InputStreamStart(start) = start else {
+            panic!("an input stream start");
+        };
+        let tools = VoiceTools::parse(None, None, None, true).unwrap();
+        let agents = voice_agent_set(start.agents.clone(), "Qwen3.5-4B", tools.as_ref())
+            .unwrap()
+            .unwrap();
+        assert_eq!(agents.first().id, "front");
+        assert_eq!(agents.first().name, "front");
+        assert_eq!(agents.first().system_prompt, "Greet callers.");
+        let billing = agents.get("billing").unwrap();
+        assert_eq!(billing.name, "Billing");
+        assert_eq!(billing.default_model, "Qwen3.5-4B");
+        assert_eq!(
+            billing.task.as_ref().unwrap().then.as_deref(),
+            Some("front")
+        );
+
+        // A tool the session does not offer, and a handoff to nobody.
+        let err = voice_agent_set(start.agents.clone(), "m", None).unwrap_err();
+        assert!(err.contains("`time`"), "{err}");
+        let mut lost = start.agents.clone().unwrap();
+        lost.truncate(1);
+        let err = voice_agent_set(Some(lost), "m", tools.as_ref()).unwrap_err();
+        assert!(err.starts_with("Invalid `agents`:"), "{err}");
+        assert_eq!(voice_agent_set(None, "m", None), Ok(None));
+        assert_eq!(voice_agent_set(Some(Vec::new()), "m", None), Ok(None));
     }
 
     #[test]

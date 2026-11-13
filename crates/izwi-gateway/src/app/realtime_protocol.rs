@@ -289,6 +289,17 @@ pub enum RealtimeServerEvent {
         status: RealtimeFunctionCallStatus,
         output: String,
     },
+    /// The conversation moved from one of the session's agents to another.
+    AgentHandoff {
+        from: String,
+        to: String,
+    },
+    /// An agent recorded its task; `result` is the task's JSON object as
+    /// text.
+    TaskCompleted {
+        name: String,
+        result: String,
+    },
     Interruption {
         reason: RealtimeInterruptionReason,
         cutoff_event_id: u64,

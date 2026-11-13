@@ -211,8 +211,10 @@ impl Tool for ClientTool {
     }
 }
 
-/// A turn's tool event as the voice socket's message: `function_call` when
-/// a call starts, `function_call_completed` when it ends.
+/// A turn's event as the voice socket's message: `function_call` when a
+/// call starts, `function_call_completed` when it ends, `agent_handoff`
+/// when the conversation changes agent and `task_completed` when an agent
+/// records its task.
 pub(crate) fn function_call_message(
     event: &AgentEvent,
     utterance_id: &str,
@@ -248,6 +250,20 @@ pub(crate) fn function_call_message(
             // call reports `started` and its result reaches the next turn.
             "status": if status == "cancelled" { "error" } else { status.as_str() },
             "output": output,
+        })),
+        AgentEvent::Handoff { from, to } => Some(json!({
+            "type": "agent_handoff",
+            "utterance_id": utterance_id,
+            "utterance_seq": utterance_seq,
+            "from": from,
+            "to": to,
+        })),
+        AgentEvent::TaskCompleted { name, result } => Some(json!({
+            "type": "task_completed",
+            "utterance_id": utterance_id,
+            "utterance_seq": utterance_seq,
+            "name": name,
+            "result": result,
         })),
         _ => None,
     }
@@ -503,6 +519,19 @@ mod tests {
         let message = function_call_message(&interrupted, "utt-1", 1).unwrap();
         assert_eq!(message["type"], "function_call_completed");
         assert_eq!(message["status"], "error");
+        let handoff = AgentEvent::Handoff {
+            from: "front".into(),
+            to: "billing".into(),
+        };
+        let message = function_call_message(&handoff, "utt-1", 1).unwrap();
+        assert_eq!(message["type"], "agent_handoff");
+        assert_eq!(message["to"], "billing");
+        let task = AgentEvent::TaskCompleted {
+            name: "refund".into(),
+            result: json!({"invoice": "A1"}),
+        };
+        let message = function_call_message(&task, "utt-1", 1).unwrap();
+        assert_eq!(message["result"]["invoice"], "A1");
         let other = AgentEvent::TextDelta { text: "hi".into() };
         assert!(function_call_message(&other, "utt-1", 1).is_none());
     }

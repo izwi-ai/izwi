@@ -2271,6 +2271,7 @@ Client JSON messages:
 | `builtin_tools` | With a model that calls tools: whether the reply may also call the server's built-in tools (today `time`, the local date and time). Default `true`. |
 | `function_call_timeout_ms` | How long a turn waits for a call's result: default `10000`, clamped to `1000..60000`. |
 | `mcp_servers` | MCP servers whose tools the reply may call, run by the Izwi server: `[{"label", "url", "headers", "allowed_tools"}]`, at most 8, each with at most 64 tools (name them in `allowed_tools` to narrow a larger server). Streamable HTTP servers only. The server connects only to hosts listed in `IZWI_MCP_ALLOWED_HOSTS`; with that unset, `mcp_servers` is refused. A tool's name must not repeat another tool's. Calls are reported as `function_call` with `executor: "mcp"`. |
+| `agents` | Modular mode with a chat model that calls tools: the session's agents, at most 16: `[{"id", "name", "instructions", "tools", "handoffs", "handoff_description", "task"}]`. The first holds the conversation at the start. Each agent's prompt is the session's system prompt followed by its `instructions`; `tools` narrows the session's tools to the named ones. An agent hands the conversation to one of its `handoffs` (agent ids) by calling the tool `transfer_to_<id>`, which the server offers it with the target's `handoff_description`; the next agent answers in the same turn and holds the conversation in later turns (`agent_handoff` event). A `task` (`{"name", "description", "parameters", "then"}`) is something the agent collects from the user: `parameters` is a JSON Schema object, and the agent records the result by calling `complete_<name>`. A result missing a `required` field is refused and the agent asks for it; a recorded one is sent as `task_completed`, and the conversation moves to the agent `then` names, if any. |
 | `tool_wait_phrase` | Modular mode: what the reply says when a tool has kept it waiting 1.5 s and it has said nothing yet. Default `"One moment."` when `asr_language` is unset or English, nothing otherwise; `""` turns it off. |
 
 Client binary frame:
@@ -2327,6 +2328,13 @@ How a modular turn runs:
 - Each stage (ASR, the reply, each TTS segment) takes its own request admission slot, so a turn holds none while it waits.
 - Assistant audio is paced by the client: when more than about 5 s (or 4 MiB) of audio is queued, synthesis waits for the client to take it rather than closing the session. A client that stops reading for 5 s ends the session.
 - The prompt carries the most recent history (24 messages, about 3000 tokens). A reply is remembered without reasoning, and only as far as it was heard: up to `conversation_item_truncate`'s `audio_end_ms`, or up to the client's estimated playback position when the user interrupted it.
+
+Events of a session with `agents`:
+
+| Event | Fields |
+|-------|--------|
+| `agent_handoff` | `utterance_id`, `utterance_seq`, `from`, `to` (agent ids). |
+| `task_completed` | `utterance_id`, `utterance_seq`, `name`, `result` (the task's object). In the typed protocol `result` is that object as JSON text. |
 
 How a turn with tools runs:
 

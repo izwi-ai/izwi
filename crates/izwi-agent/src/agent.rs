@@ -159,6 +159,20 @@ impl AgentSet {
         Ok(Self { agents })
     }
 
+    /// The same agents, each with the system prompt `prompt` gives it.
+    pub fn with_system_prompts(&self, prompt: impl Fn(&AgentDefinition) -> String) -> Self {
+        Self {
+            agents: self
+                .agents
+                .iter()
+                .map(|agent| AgentDefinition {
+                    system_prompt: prompt(agent),
+                    ..agent.clone()
+                })
+                .collect(),
+        }
+    }
+
     pub fn first(&self) -> &AgentDefinition {
         &self.agents[0]
     }
@@ -191,6 +205,9 @@ mod tests {
         front.handoffs = vec!["billing".to_string()];
         let set = AgentSet::new(vec![front.clone(), agent("billing")]).unwrap();
         assert_eq!(set.first().id, "front-desk");
+        let led = set.with_system_prompts(|agent| format!("Lead. {}", agent.id));
+        assert_eq!(led.get("billing").unwrap().system_prompt, "Lead. billing");
+        assert_eq!(led.first().handoffs, ["billing"]);
         assert!(set.get("billing").is_some());
 
         assert!(AgentSet::new(Vec::new()).is_err());
