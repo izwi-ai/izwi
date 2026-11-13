@@ -37,7 +37,7 @@ use super::audio::{base64, wav, OutputEncoder};
 use super::events::{server_event, Ids};
 use super::items::{ContentPart, Item, ItemKind, ItemStatus, ItemStore, Position, Role};
 use super::profiles::{ProfileMode, RealtimeProfile};
-use super::session_config::{chat_tool, is_mcp_tool, AudioFormat, Modality};
+use super::session_config::{chat_tool, is_mcp_tool, mcp_requires_approval, AudioFormat, Modality};
 use crate::api::openai::tool_calls::{
     parse_answer, ToolCall, ToolCallFormat, ToolCallFunction, ToolCallParser, ToolChoice, ToolPlan,
 };
@@ -254,15 +254,98 @@ pub(crate) fn mcp_configs(tools: &[Value]) -> Vec<McpServerConfig> {
 /// is not already connected to exactly those servers.
 pub(crate) async fn mcp_tools_for(shared: &SharedMcp, tools: &[Value]) -> Result<McpTools, String> {
     let configs = mcp_configs(tools);
+    // Taken even with no servers to connect: a call the client has just
+    // approved holds it until its result is in the conversation.
+    let mut session = shared.lock().await;
     if configs.is_empty() {
         return Ok(McpTools::default());
     }
-    let mut session = shared.lock().await;
     if session.configs != configs {
         session.tools = McpTools::connect(&configs, &McpAccess::from_env()).await?;
         session.configs = configs;
     }
     Ok(session.tools.clone())
+}
+
+/// Run the MCP call the client approved, outside any response: an
+/// `mcp_call` item joins the conversation in progress and is finished with
+/// the tool's output or error (`response.mcp_call.in_progress`, then
+/// `.completed` or `.failed`, and `response.output_item.done` naming the
+/// response that asked). The session's MCP connection is held for the
+/// call, so a response created meanwhile waits for the result. As with
+/// OpenAI, no response follows by itself: the client sends
+/// `response.create` to have the result read.
+pub(crate) async fn run_approved_call(
+    out: Outbound,
+    items: Arc<Mutex<ItemStore>>,
+    session: tokio::sync::OwnedMutexGuard<McpSession>,
+    request_id: String,
+) {
+    let Some(ItemKind::McpApprovalRequest {
+        server_label,
+        name,
+        arguments,
+        response_id,
+    }) = lock_items(&items)
+        .get(&request_id)
+        .map(|item| item.kind.clone())
+    else {
+        return;
+    };
+    let item_id = out.ids.next("item");
+    let item = |output: Option<String>, error: Option<String>, status: ItemStatus| {
+        Item::new(
+            item_id.clone(),
+            ItemKind::McpCall {
+                server_label: server_label.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+                output,
+                error,
+                approval_request_id: Some(request_id.clone()),
+            },
+            status,
+        )
+    };
+    let started = item(None, None, ItemStatus::InProgress);
+    let started_json = started.to_json();
+    let previous = match lock_items(&items).insert(started, &Position::End) {
+        Ok(previous) => previous,
+        Err(err) => {
+            warn!("realtime approved MCP call not stored: {}", err.message);
+            return;
+        }
+    };
+    out.event(
+        "conversation.item.added",
+        json!({"previous_item_id": previous, "item": started_json}),
+    );
+    let ids = json!({"response_id": response_id, "item_id": item_id, "output_index": 0});
+    out.event("response.mcp_call.in_progress", ids.clone());
+    let finished = match session.tools.call(&name, &arguments).await {
+        Ok(output) => {
+            out.event("response.mcp_call.completed", ids);
+            item(Some(output), None, ItemStatus::Completed)
+        }
+        Err(error) => {
+            out.event("response.mcp_call.failed", ids);
+            item(None, Some(error), ItemStatus::Completed)
+        }
+    };
+    let json = finished.to_json();
+    if let Some(stored) = lock_items(&items).get_mut(&item_id) {
+        *stored = finished;
+    }
+    // The result is in the conversation: a waiting response may read it.
+    drop(session);
+    out.event(
+        "response.output_item.done",
+        json!({"response_id": response_id, "output_index": 0, "item": json}),
+    );
+    out.event(
+        "conversation.item.done",
+        json!({"previous_item_id": previous, "item": json}),
+    );
 }
 
 /// A user turn's transcription left to the response that hears it: LFM3-Audio
@@ -644,6 +727,53 @@ impl Emitter {
         }
     }
 
+    /// The calls a reply made to MCP tools that wait for the client's
+    /// approval, each as an `mcp_approval_request` output item. The client
+    /// answers with an `mcp_approval_response` item, which runs the call or
+    /// declines it.
+    pub(crate) fn mcp_approval_requests(&self, calls: &[ToolCall], mcp: &McpTools) {
+        if calls.is_empty() {
+            return;
+        }
+        self.close_message(ItemStatus::Completed);
+        for call in calls {
+            let output_index = {
+                let mut state = self.lock();
+                state.next_output_index += 1;
+                state.next_output_index - 1
+            };
+            let item = Item::new(
+                self.out.ids.next("mcpr"),
+                ItemKind::McpApprovalRequest {
+                    server_label: mcp
+                        .server_of(&call.function.name)
+                        .unwrap_or_default()
+                        .to_string(),
+                    name: call.function.name.clone(),
+                    arguments: call.function.arguments.clone(),
+                    response_id: self.plan.id.clone(),
+                },
+                ItemStatus::Completed,
+            );
+            let json = item.to_json();
+            self.out.event(
+                "response.output_item.added",
+                json!({"response_id": self.plan.id, "output_index": output_index, "item": json}),
+            );
+            if self.plan.default_conversation {
+                self.add_to_conversation(item.clone());
+            }
+            self.out.event(
+                "response.output_item.done",
+                json!({"response_id": self.plan.id, "output_index": output_index, "item": json}),
+            );
+            if self.plan.default_conversation {
+                self.finish_in_conversation(item);
+            }
+            self.lock().outputs.push((output_index, json));
+        }
+    }
+
     /// Run the calls a reply made to MCP tools, each as an `mcp_call`
     /// output item that ends with the tool's output or its error. The
     /// response ends after them: the client asks for the next one, which
@@ -672,6 +802,7 @@ impl Emitter {
                         arguments: call.function.arguments.clone(),
                         output,
                         error,
+                        approval_request_id: None,
                     },
                     status,
                 )
@@ -975,6 +1106,40 @@ fn agent_conversation(items: &[Item]) -> Vec<MemoryMessage> {
             ItemKind::FunctionCallOutput { call_id, output } => {
                 conversation.push(MemoryMessage::tool(call_id.clone(), output.clone()));
             }
+            // A call the client declined: the call and the refusal. An
+            // approved one is its `mcp_call` item; one not yet answered
+            // has not happened.
+            ItemKind::McpApprovalRequest {
+                name, arguments, ..
+            } => {
+                let declined = items.iter().find_map(|other| match &other.kind {
+                    ItemKind::McpApprovalResponse {
+                        approval_request_id,
+                        approve: false,
+                        reason,
+                    } if *approval_request_id == item.id => Some(reason.clone()),
+                    _ => None,
+                });
+                let Some(reason) = declined else {
+                    continue;
+                };
+                conversation.push(MemoryMessage::assistant_calls(
+                    "",
+                    vec![izwi_agent::ToolCall {
+                        id: item.id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    }],
+                ));
+                conversation.push(MemoryMessage::tool(
+                    item.id.clone(),
+                    match reason.filter(|reason| !reason.trim().is_empty()) {
+                        Some(reason) => format!("The user declined this call: {reason}"),
+                        None => "The user declined this call.".to_string(),
+                    },
+                ));
+            }
+            ItemKind::McpApprovalResponse { .. } => {}
             // A call the server ran: the call and what came back.
             ItemKind::McpCall {
                 name,
@@ -1050,15 +1215,18 @@ async fn run_modular(
         return Err("Not a modular profile".to_string());
     };
     let (text, tts) = (*text, *tts);
+    // The session's MCP connection first: a call the client has just
+    // approved holds it until its result is in the conversation, so the
+    // prompt read next carries that result.
+    let mcp = if plan.tool_choice.as_str() == Some("none") {
+        mcp_tools_for(&ctx.mcp, &[]).await?
+    } else {
+        mcp_tools_for(&ctx.mcp, &plan.tools).await?
+    };
     let items = with_transcripts(ctx, prompt_items(ctx, plan), None).await;
     // Tools for a model without a tool template are refused, as on the chat
     // routes, rather than dropped. A required or named tool opens the reply.
     let mut tools = tools_for(plan);
-    let mcp = if plan.tool_choice.as_str() == Some("none") {
-        McpTools::default()
-    } else {
-        mcp_tools_for(&ctx.mcp, &plan.tools).await?
-    };
     for tool in mcp.function_definitions() {
         let name = &tool["function"]["name"];
         if tools.iter().any(|other| &other["function"]["name"] == name) {
@@ -1224,6 +1392,16 @@ async fn run_modular(
     let (mcp_calls, calls): (Vec<ToolCall>, Vec<ToolCall>) = calls
         .into_iter()
         .partition(|call| mcp.server_of(&call.function.name).is_some());
+    // A call waits for approval unless its server's entry says it need not.
+    let (asked, mcp_calls): (Vec<ToolCall>, Vec<ToolCall>) =
+        mcp_calls.into_iter().partition(|call| {
+            let label = mcp.server_of(&call.function.name);
+            plan.tools
+                .iter()
+                .find(|tool| is_mcp_tool(tool) && tool["server_label"].as_str() == label)
+                .is_none_or(|tool| mcp_requires_approval(tool, &call.function.name))
+        });
+    emitter.mcp_approval_requests(&asked, &mcp);
     emitter.mcp_calls(&mcp_calls, &mcp).await;
     emitter.function_calls(&calls);
     Ok(if result.finish == TurnFinish::MaxTokens {
@@ -1308,7 +1486,9 @@ async fn run_unified(
                 role: ChatRole::Tool,
                 content: output.clone(),
             }),
-            ItemKind::McpCall { .. } => None,
+            ItemKind::McpCall { .. }
+            | ItemKind::McpApprovalRequest { .. }
+            | ItemKind::McpApprovalResponse { .. } => None,
         };
         messages.extend(message);
     }
@@ -1524,6 +1704,7 @@ mod tests {
                     arguments: r#"{"q":"x"}"#.to_string(),
                     output: None,
                     error: Some("it broke".to_string()),
+                    approval_request_id: None,
                 },
             ),
             // A call still running has nothing to read yet.
@@ -1535,6 +1716,7 @@ mod tests {
                     arguments: "{}".to_string(),
                     output: None,
                     error: None,
+                    approval_request_id: None,
                 },
             ),
         ];
@@ -1554,6 +1736,127 @@ mod tests {
         assert!(json["output"].is_null());
     }
 
+    #[tokio::test]
+    async fn an_approved_call_runs_and_a_declined_one_is_told_to_the_model() {
+        use crate::app::realtime_transport::{MailboxOutput, OutboundLimits, OutboundMailbox};
+
+        let (url, _seen) = crate::app::mcp::tests::serve(false).await;
+        let tools = McpTools::connect(
+            &[crate::app::mcp::tests::config(&url)],
+            &crate::app::mcp::tests::hosts("127.0.0.1"),
+        )
+        .await
+        .unwrap();
+        let shared: SharedMcp = Arc::new(tokio::sync::Mutex::new(McpSession {
+            configs: Vec::new(),
+            tools,
+        }));
+        let out = Outbound {
+            mailbox: Arc::new(OutboundMailbox::new(OutboundLimits::items(64))),
+            ids: Arc::new(Ids::new()),
+        };
+        let items = Arc::new(Mutex::new(ItemStore::default()));
+        let request = |id: &str, name: &str| {
+            Item::new(
+                id.to_string(),
+                ItemKind::McpApprovalRequest {
+                    server_label: "calc".to_string(),
+                    name: name.to_string(),
+                    arguments: r#"{"a":2,"b":3}"#.to_string(),
+                    response_id: "resp_1".to_string(),
+                },
+                ItemStatus::Completed,
+            )
+        };
+        let answer = |id: &str, request: &str, approve: bool| {
+            Item::new(
+                id.to_string(),
+                ItemKind::McpApprovalResponse {
+                    approval_request_id: request.to_string(),
+                    approve,
+                    reason: (!approve).then(|| "not now".to_string()),
+                },
+                ItemStatus::Completed,
+            )
+        };
+        for item in [
+            request("mcpr_1", "add"),
+            answer("i1", "mcpr_1", true),
+            request("mcpr_2", "fail"),
+            answer("i2", "mcpr_2", true),
+            request("mcpr_3", "add"),
+            answer("i3", "mcpr_3", false),
+            request("mcpr_4", "add"),
+        ] {
+            lock_items(&items).insert(item, &Position::End).unwrap();
+        }
+
+        for request_id in ["mcpr_1", "mcpr_2"] {
+            run_approved_call(
+                out.clone(),
+                items.clone(),
+                shared.clone().lock_owned().await,
+                request_id.to_string(),
+            )
+            .await;
+        }
+        let mut events = Vec::new();
+        while let Ok(Some(MailboxOutput::Message(Message::Text(text)))) =
+            tokio::time::timeout(Duration::from_millis(50), out.mailbox.next()).await
+        {
+            events.push(serde_json::from_str::<Value>(text.as_str()).unwrap());
+        }
+        let types: Vec<_> = events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "conversation.item.added",
+                "response.mcp_call.in_progress",
+                "response.mcp_call.completed",
+                "response.output_item.done",
+                "conversation.item.done",
+                "conversation.item.added",
+                "response.mcp_call.in_progress",
+                "response.mcp_call.failed",
+                "response.output_item.done",
+                "conversation.item.done",
+            ]
+        );
+        let done = &events[4]["item"];
+        assert_eq!(done["type"], "mcp_call");
+        assert_eq!(done["approval_request_id"], "mcpr_1");
+        assert_eq!(done["output"], "5\n[image content]");
+        assert_eq!(events[3]["response_id"], "resp_1");
+        assert_eq!(events[9]["item"]["error"]["message"], "it broke");
+
+        // The model reads the two calls that ran and the one declined; the
+        // request nobody answered has not happened.
+        let conversation = agent_conversation(lock_items(&items).items());
+        let read: Vec<_> = conversation
+            .iter()
+            .filter(|message| message.role == MemoryMessageRole::Tool)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(
+            read,
+            [
+                "The user declined this call: not now",
+                "5\n[image content]",
+                "it broke"
+            ]
+        );
+        assert_eq!(
+            conversation
+                .iter()
+                .filter(|message| !message.tool_calls.is_empty())
+                .count(),
+            3
+        );
+    }
+
     #[test]
     fn mcp_servers_are_read_from_a_sessions_tools() {
         let tools = vec![
@@ -1566,6 +1869,16 @@ mod tests {
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].label, "docs");
         assert_eq!(configs[0].url.as_deref(), Some("http://h/mcp"));
+        // A label alone, and a connector: servers set up elsewhere.
+        let named = mcp_configs(&[
+            json!({"type": "mcp", "server_label": "files"}),
+            json!({"type": "mcp", "server_label": "cal", "connector_id": "connector_calendar"}),
+        ]);
+        assert_eq!(
+            (named[0].url.clone(), named[0].connector_id.clone()),
+            (None, None)
+        );
+        assert_eq!(named[1].connector_id.as_deref(), Some("connector_calendar"));
         assert_eq!(configs[0].headers["Authorization"], "Bearer t");
         assert_eq!(configs[0].allowed_tools, None);
     }

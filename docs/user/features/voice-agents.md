@@ -196,7 +196,7 @@ The server sends `agent_handoff` when the conversation moves, and `task_complete
 
 The turn-taking switches are `resume_false_interruptions`, `adaptive_silence` and `preemptive_generation`. A client that sets `resume_false_interruptions` must stop playback on `turn_paused` without discarding what it has queued, and play on at `turn_resumed`.
 
-Clients that speak the OpenAI Realtime protocol (`/v1/realtime`) get the same agent behind it: function tools as usual, and MCP servers as `{"type": "mcp", "server_label", "server_url", "require_approval": "never"}` entries in `tools`.
+Clients that speak the OpenAI Realtime protocol (`/v1/realtime`) get the same agent behind it: function tools as usual, and MCP servers as `{"type": "mcp", "server_label", "server_url"}` entries in `tools`. There a tool call waits for your client's approval unless the entry says `"require_approval": "never"`: the response ends with an `mcp_approval_request` item, and an `mcp_approval_response` item runs the call or declines it.
 
 The [API reference](/api#voice-realtime) lists every field and event. To test an agent before people talk to it, `scripts/bench/run-voice-agent-eval.py` plays a caller against it and scores the calls.
 

@@ -485,6 +485,7 @@ pub(crate) fn parse_tools(value: &Value, param: &str) -> Result<Vec<Value>, Real
                 .with_param(param.to_string()),
         );
     };
+    let mut labels: Vec<String> = Vec::new();
     tools
         .iter()
         .map(|tool| {
@@ -493,7 +494,20 @@ pub(crate) fn parse_tools(value: &Value, param: &str) -> Result<Vec<Value>, Real
                 .and_then(Value::as_str)
                 .unwrap_or("function");
             if kind == "mcp" {
-                return parse_mcp_tool(tool, param);
+                let tool = parse_mcp_tool(tool, param)?;
+                let label = tool["server_label"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                if labels.contains(&label) {
+                    return Err(RealtimeError::invalid(
+                        "invalid_value",
+                        format!("MCP server label '{label}' is used twice."),
+                    )
+                    .with_param(param.to_string()));
+                }
+                labels.push(label);
+                return Ok(tool);
             }
             if kind != "function" {
                 return Err(RealtimeError::invalid(
@@ -533,10 +547,12 @@ pub(crate) fn parse_tools(value: &Value, param: &str) -> Result<Vec<Value>, Real
         .collect()
 }
 
-/// An MCP server entry: `server_label`, `server_url`, optional `headers` or
-/// `authorization` (a bearer token), `allowed_tools`, and
-/// `require_approval: "never"` (approvals are not implemented, so a session
-/// must say it needs none).
+/// An MCP server entry: `server_label`; where the server is (`server_url`,
+/// or `connector_id` naming one of this server's configured MCP servers, or
+/// neither: the label names a server the session defined earlier or a
+/// configured one); optional `headers` or `authorization` (a bearer token)
+/// and `allowed_tools`; and `require_approval` (`"always"`, the default,
+/// `"never"`, or lists of tool names for either).
 fn parse_mcp_tool(tool: &Value, param: &str) -> Result<Value, RealtimeError> {
     let invalid = |message: &str| {
         Err(RealtimeError::invalid("invalid_value", message.to_string())
@@ -551,20 +567,37 @@ fn parse_mcp_tool(tool: &Value, param: &str) -> Result<Value, RealtimeError> {
     let Some(label) = text("server_label") else {
         return invalid("An mcp tool needs a 'server_label'.");
     };
-    if tool
-        .get("connector_id")
-        .is_some_and(|value| !value.is_null())
-    {
-        return invalid("MCP connectors are not supported; name the server with 'server_url'.");
+    let (url, connector) = (text("server_url"), text("connector_id"));
+    if url.is_some() && connector.is_some() {
+        return invalid("Send 'server_url' or 'connector_id', not both.");
     }
-    let Some(url) = text("server_url") else {
-        return invalid("An mcp tool needs a 'server_url'.");
+    let names = |list: &Value| -> Option<Value> {
+        let names = list.get("tool_names")?.as_array()?;
+        names.iter().all(Value::is_string).then(|| json!(names))
     };
-    if tool.get("require_approval").and_then(Value::as_str) != Some("never") {
-        return invalid(
-            "MCP tool approvals are not supported: set 'require_approval' to \"never\".",
-        );
-    }
+    let require_approval = match tool.get("require_approval") {
+        // As with OpenAI, a call waits for approval unless the session
+        // says otherwise.
+        None | Some(Value::Null) => json!("always"),
+        Some(Value::String(policy)) if policy == "always" || policy == "never" => json!(policy),
+        Some(Value::Object(policy)) => {
+            let mut lists = serde_json::Map::new();
+            for (key, list) in policy {
+                let (true, Some(names)) = (key == "always" || key == "never", names(list)) else {
+                    return invalid(
+                        "MCP 'require_approval' takes \"always\", \"never\", or {\"always\"|\"never\": {\"tool_names\": [...]}}.",
+                    );
+                };
+                lists.insert(key.clone(), json!({"tool_names": names}));
+            }
+            Value::Object(lists)
+        }
+        Some(_) => {
+            return invalid(
+                "MCP 'require_approval' takes \"always\", \"never\", or {\"always\"|\"never\": {\"tool_names\": [...]}}.",
+            )
+        }
+    };
     let mut headers = serde_json::Map::new();
     if let Some(given) = tool.get("headers").and_then(Value::as_object) {
         for (name, value) in given {
@@ -599,14 +632,49 @@ fn parse_mcp_tool(tool: &Value, param: &str) -> Result<Value, RealtimeError> {
         }
         Some(_) => return invalid("MCP 'allowed_tools' must be a list of tool names."),
     };
-    Ok(json!({
+    let mut entry = json!({
         "type": "mcp",
         "server_label": label,
-        "server_url": url,
         "headers": headers,
         "allowed_tools": allowed_tools,
-        "require_approval": "never",
-    }))
+        "require_approval": require_approval,
+    });
+    if let Some(url) = url {
+        entry["server_url"] = json!(url);
+    }
+    if let Some(connector) = connector {
+        entry["connector_id"] = json!(connector);
+    }
+    Ok(entry)
+}
+
+/// Whether a call to `name` on the MCP server entry `tool` waits for the
+/// client's approval: always, unless the entry says `"never"` or lists the
+/// tool under `never`.
+pub(crate) fn mcp_requires_approval(tool: &Value, name: &str) -> bool {
+    match &tool["require_approval"] {
+        Value::String(policy) => policy != "never",
+        policy => !policy["never"]["tool_names"]
+            .as_array()
+            .is_some_and(|names| names.iter().any(|listed| listed == name)),
+    }
+}
+
+/// Fill in the MCP entries of a response's `tools` that name a server by
+/// label alone with the session's entry of that label. One the session
+/// does not define is left for the server's configured MCP servers.
+pub(crate) fn resolve_session_servers(tools: &mut [Value], session: &[Value]) {
+    for tool in tools.iter_mut().filter(|tool| is_mcp_tool(tool)) {
+        if tool.get("server_url").is_some() || tool.get("connector_id").is_some() {
+            continue;
+        }
+        if let Some(defined) = session
+            .iter()
+            .find(|defined| is_mcp_tool(defined) && defined["server_label"] == tool["server_label"])
+        {
+            *tool = defined.clone();
+        }
+    }
 }
 
 /// Whether `tool` is an MCP server entry.
@@ -1030,10 +1098,7 @@ mod tests {
             .expect_err("beta shape");
         assert_eq!(err.code.as_deref(), Some("unsupported_beta_session"));
         assert!(config
-            .apply_update(
-                &json!({"tools": [{"type": "mcp", "server_label": "x"}]}),
-                false
-            )
+            .apply_update(&json!({"tools": [{"type": "mcp"}]}), false)
             .is_err());
 
         let outcome = config
@@ -1077,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_servers_are_accepted_without_approvals_and_echoed_without_credentials() {
+    fn mcp_servers_are_echoed_without_credentials_and_say_which_calls_need_approval() {
         let tool = json!({
             "type": "mcp", "server_label": "docs", "server_url": "https://mcp.example/mcp",
             "authorization": "secret-token", "allowed_tools": {"tool_names": ["search"]},
@@ -1096,16 +1161,54 @@ mod tests {
             tool.as_object_mut().unwrap().remove(key);
             parse_tools(&json!([tool]), "session.tools")
         };
-        assert!(without("server_url").is_err());
         assert!(without("server_label").is_err());
-        // Omitting it would mean approvals, which are not implemented.
-        let err = without("require_approval").unwrap_err();
-        assert!(err.message.contains("require_approval"), "{}", err.message);
         let mut both = tool.clone();
         both["headers"] = json!({"authorization": "Bearer other"});
         assert!(parse_tools(&json!([both]), "session.tools").is_err());
-        let mut connector = tool.clone();
-        connector["connector_id"] = json!("connector_x");
-        assert!(parse_tools(&json!([connector]), "session.tools").is_err());
+        // One place for the server, and one entry a label.
+        let mut two_places = tool.clone();
+        two_places["connector_id"] = json!("connector_x");
+        assert!(parse_tools(&json!([two_places]), "session.tools").is_err());
+        assert!(parse_tools(&json!([tool, tool]), "session.tools").is_err());
+
+        // A label alone, or a connector: a server defined elsewhere.
+        let by_label = without("server_url").unwrap();
+        assert!(by_label[0].get("server_url").is_none());
+        let connector = parse_tools(
+            &json!([{"type": "mcp", "server_label": "cal", "connector_id": "connector_calendar"}]),
+            "session.tools",
+        )
+        .unwrap();
+        assert_eq!(connector[0]["connector_id"], "connector_calendar");
+
+        // Approval is the default, and may be set per tool.
+        assert!(!mcp_requires_approval(&tools[0], "search"));
+        let asks = without("require_approval").unwrap();
+        assert_eq!(asks[0]["require_approval"], "always");
+        assert!(mcp_requires_approval(&asks[0], "search"));
+        let mut some = tool.clone();
+        some["require_approval"] = json!({"never": {"tool_names": ["search"]}});
+        let some = parse_tools(&json!([some]), "session.tools").unwrap();
+        assert!(!mcp_requires_approval(&some[0], "search"));
+        assert!(mcp_requires_approval(&some[0], "delete"));
+        for bad in [
+            json!("sometimes"),
+            json!({"never": ["search"]}),
+            json!({"maybe": {"tool_names": []}}),
+        ] {
+            let mut tool = tool.clone();
+            tool["require_approval"] = bad;
+            assert!(parse_tools(&json!([tool]), "session.tools").is_err());
+        }
+
+        // A response names a session's server by its label.
+        let mut response = parse_tools(
+            &json!([{"type": "mcp", "server_label": "docs"}, {"type": "mcp", "server_label": "files"}]),
+            "response.tools",
+        )
+        .unwrap();
+        resolve_session_servers(&mut response, &tools);
+        assert_eq!(response[0], tools[0]);
+        assert!(response[1].get("server_url").is_none());
     }
 }

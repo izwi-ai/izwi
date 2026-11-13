@@ -148,6 +148,22 @@ pub(crate) enum ItemKind {
         output: Option<String>,
         /// The tool's or the protocol's error message.
         error: Option<String>,
+        /// The approval request the call answers, when it waited for one.
+        approval_request_id: Option<String>,
+    },
+    /// A call to an MCP server's tool that waits for the client's approval.
+    McpApprovalRequest {
+        server_label: String,
+        name: String,
+        arguments: String,
+        /// The response that asked.
+        response_id: String,
+    },
+    /// The client's answer to an approval request.
+    McpApprovalResponse {
+        approval_request_id: String,
+        approve: bool,
+        reason: Option<String>,
     },
 }
 
@@ -287,6 +303,34 @@ impl Item {
                     Some(other) => other.to_string(),
                 },
             },
+            "mcp_approval_response" => ItemKind::McpApprovalResponse {
+                approval_request_id: value
+                    .get("approval_request_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        RealtimeError::invalid(
+                            "missing_required_parameter",
+                            "An mcp_approval_response item needs an 'approval_request_id'.",
+                        )
+                        .with_param("item.approval_request_id")
+                    })?
+                    .to_string(),
+                approve: value
+                    .get("approve")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| {
+                        RealtimeError::invalid(
+                            "missing_required_parameter",
+                            "An mcp_approval_response item needs 'approve': true or false.",
+                        )
+                        .with_param("item.approve")
+                    })?,
+                reason: value
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            },
             other => {
                 return Err(RealtimeError::invalid(
                     "invalid_value",
@@ -327,6 +371,7 @@ impl Item {
                 arguments,
                 output,
                 error,
+                approval_request_id,
             } => json!({
                 "type": "mcp_call",
                 "server_label": server_label,
@@ -337,7 +382,28 @@ impl Item {
                     "type": "tool_execution_error",
                     "message": message,
                 })),
-                "approval_request_id": null,
+                "approval_request_id": approval_request_id,
+            }),
+            ItemKind::McpApprovalRequest {
+                server_label,
+                name,
+                arguments,
+                ..
+            } => json!({
+                "type": "mcp_approval_request",
+                "server_label": server_label,
+                "name": name,
+                "arguments": arguments,
+            }),
+            ItemKind::McpApprovalResponse {
+                approval_request_id,
+                approve,
+                reason,
+            } => json!({
+                "type": "mcp_approval_response",
+                "approval_request_id": approval_request_id,
+                "approve": approve,
+                "reason": reason,
             }),
         };
         item["id"] = json!(self.id);
@@ -574,6 +640,32 @@ mod tests {
             "audio bytes are not echoed"
         );
         assert!(Item::from_client(&json!({"type": "mcp_call"}), || "i".to_string()).is_err());
+        // The client answers an approval request; it cannot write one.
+        let answer = Item::from_client(
+            &json!({"type": "mcp_approval_response", "approval_request_id": "mcpr_1",
+                    "approve": false, "reason": "not now"}),
+            || "i".to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            answer.kind,
+            ItemKind::McpApprovalResponse {
+                approval_request_id: "mcpr_1".to_string(),
+                approve: false,
+                reason: Some("not now".to_string()),
+            }
+        );
+        assert_eq!(answer.to_json()["type"], "mcp_approval_response");
+        for bad in [
+            json!({"type": "mcp_approval_response", "approve": true}),
+            json!({"type": "mcp_approval_response", "approval_request_id": "mcpr_1"}),
+            json!({"type": "mcp_approval_request", "name": "x"}),
+        ] {
+            assert!(
+                Item::from_client(&bad, || "i".to_string()).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

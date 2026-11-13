@@ -27,12 +27,13 @@ use super::live::{transcribes_live, LiveTranscription, LiveTurn};
 use super::persist::History;
 use super::profiles::{resolve_profile, speaker_for, transcription_model, RealtimeProfile};
 use super::respond::{
-    lock_items, mcp_configs, mcp_tools_for, run_response, Outbound, PendingTranscript,
-    PendingTranscripts, ResponseContext, ResponsePlan, ResponseSummary, SharedMcp,
+    lock_items, mcp_configs, mcp_tools_for, run_approved_call, run_response, Outbound,
+    PendingTranscript, PendingTranscripts, ResponseContext, ResponsePlan, ResponseSummary,
+    SharedMcp,
 };
 use super::session_config::{
-    parse_max_output_tokens, parse_metadata, parse_tools, AudioFormat, Modality, SessionConfig,
-    Voice,
+    parse_max_output_tokens, parse_metadata, parse_tools, resolve_session_servers, AudioFormat,
+    Modality, SessionConfig, Voice,
 };
 use super::transcribe::Transcription;
 use super::voices::{resolve_custom_voice, resolve_named_voice};
@@ -998,6 +999,7 @@ impl Session {
         value: &Value,
     ) -> Result<(), RealtimeError> {
         let mut item = Item::from_client(value, || self.out.ids.next("item"))?;
+        let approved = self.check_approval(&item)?;
         // Spoken input in an item (a client replaying history) is kept to be
         // heard, and transcribed when it carries no transcript.
         let audio = value
@@ -1040,7 +1042,56 @@ impl Session {
         if let Some((wav_bytes, ready)) = transcribe {
             self.transcribe(item_id, wav_bytes, ready);
         }
+        if let Some(request_id) = approved {
+            // Take the session's MCP connection now when it is free, so a
+            // response created next waits for the call's result.
+            let (out, items, shared) = (self.out.clone(), self.items.clone(), self.mcp.clone());
+            let held = shared.clone().try_lock_owned().ok();
+            tokio::spawn(async move {
+                let session = match held {
+                    Some(session) => session,
+                    None => shared.lock_owned().await,
+                };
+                run_approved_call(out, items, session, request_id).await;
+            });
+        }
         Ok(())
+    }
+
+    /// For an `mcp_approval_response` item: that it answers an approval
+    /// request of this conversation that has no answer yet. Returns the
+    /// request's id when the call was approved.
+    fn check_approval(&self, item: &Item) -> Result<Option<String>, RealtimeError> {
+        let ItemKind::McpApprovalResponse {
+            approval_request_id,
+            approve,
+            ..
+        } = &item.kind
+        else {
+            return Ok(None);
+        };
+        let invalid = |message: String| {
+            RealtimeError::invalid("invalid_value", message).with_param("item.approval_request_id")
+        };
+        let items = lock_items(&self.items);
+        let is_request = items
+            .get(approval_request_id)
+            .is_some_and(|request| matches!(request.kind, ItemKind::McpApprovalRequest { .. }));
+        if !is_request {
+            return Err(invalid(format!(
+                "No MCP approval request with id '{approval_request_id}' is in the conversation."
+            )));
+        }
+        let answered = items.items().iter().any(|other| {
+            matches!(&other.kind, ItemKind::McpApprovalResponse { approval_request_id: id, .. }
+                if id == approval_request_id)
+        });
+        if answered {
+            return Err(invalid(format!(
+                "MCP approval request '{approval_request_id}' has already been answered."
+            )));
+        }
+        Ok(approve.then(|| approval_request_id.clone()))
     }
 
     fn on_item_retrieve(&self, item_id: &str) -> Result<(), RealtimeError> {
@@ -1260,7 +1311,11 @@ impl Session {
             None => self.config.modality,
         };
         let tools = match params.get("tools") {
-            Some(value) => parse_tools(value, "response.tools")?,
+            Some(value) => {
+                let mut tools = parse_tools(value, "response.tools")?;
+                resolve_session_servers(&mut tools, &self.config.tools);
+                tools
+            }
             None => self.config.tools.clone(),
         };
         let max_output_tokens = match params.get("max_output_tokens") {
