@@ -279,6 +279,7 @@ pub(crate) fn chat_messages(
 pub(crate) struct ThreadMemory {
     chat_store: Arc<ChatStore>,
     memory_context: Option<String>,
+    summary: Option<ConversationSummary>,
 }
 
 impl ThreadMemory {
@@ -286,8 +287,167 @@ impl ThreadMemory {
         Self {
             chat_store,
             memory_context,
+            summary: None,
         }
     }
+
+    /// Carry `summary` for the part of the thread a trimmed prompt leaves
+    /// out.
+    pub(crate) fn with_summary(mut self, summary: ConversationSummary) -> Self {
+        self.summary = Some(summary);
+        self
+    }
+}
+
+/// How many more messages must fall out of the prompt before the summary
+/// is written again.
+const SUMMARY_STEP: usize = 6;
+const SUMMARY_SYSTEM_PROMPT: &str = "You keep notes on a conversation for the assistant taking part in it. Write the notes it needs to carry on once the earlier messages are gone: who the user is, what they asked for, what was decided or done, and what is still open. Plain sentences, at most 120 words, no preamble.";
+
+/// A conversation's running summary of the messages its prompt no longer
+/// carries, kept for the life of a voice connection and rewritten in the
+/// background as more messages fall out.
+#[derive(Clone, Default)]
+pub(crate) struct ConversationSummary {
+    state: Arc<Mutex<SummaryState>>,
+}
+
+#[derive(Default)]
+struct SummaryState {
+    text: Option<String>,
+    /// How many of the thread's oldest messages the text covers.
+    covers: usize,
+    writing: bool,
+}
+
+impl ConversationSummary {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SummaryState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    pub(crate) fn text(&self) -> Option<String> {
+        self.lock().text.clone()
+    }
+
+    /// Forget the summary: the conversation started over.
+    pub(crate) fn reset(&self) {
+        *self.lock() = SummaryState::default();
+    }
+
+    /// The range of dropped messages to add to the summary, when `dropped`
+    /// messages no longer fit the prompt and enough of them are new.
+    fn claim(&self, dropped: usize) -> Option<std::ops::Range<usize>> {
+        let mut state = self.lock();
+        if state.writing || dropped < state.covers + SUMMARY_STEP {
+            return None;
+        }
+        state.writing = true;
+        Some(state.covers..dropped)
+    }
+
+    /// Rewrite the summary in the background when enough of `thread_id`'s
+    /// messages have fallen out of `budget`.
+    pub(crate) fn refresh(
+        &self,
+        state: &AppState,
+        thread_id: &str,
+        model_id: &str,
+        correlation_id: &str,
+        budget: izwi_agent::HistoryBudget,
+    ) {
+        let (summary, state) = (self.clone(), state.clone());
+        let (thread_id, model_id, correlation_id) = (
+            thread_id.to_string(),
+            model_id.to_string(),
+            correlation_id.to_string(),
+        );
+        tokio::spawn(async move {
+            let memory = ThreadMemory::new(state.chat_store.clone(), None);
+            let Ok(messages) = memory.load_messages(&thread_id).await else {
+                return;
+            };
+            let dropped = messages.len() - budget.apply(messages.clone()).len();
+            let Some(range) = summary.claim(dropped) else {
+                return;
+            };
+            let earlier = summary.text();
+            let written = write_summary(
+                &state,
+                &model_id,
+                &correlation_id,
+                summary_request(earlier.as_deref(), &messages[range]),
+            )
+            .await;
+            let mut summary = summary.lock();
+            summary.writing = false;
+            match written {
+                Ok(text) if !text.is_empty() => {
+                    summary.text = Some(text);
+                    summary.covers = dropped;
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!("conversation summary failed: {err}"),
+            }
+        });
+    }
+}
+
+/// What the summary's writer reads: the notes so far and the messages to
+/// add to them.
+fn summary_request(earlier: Option<&str>, messages: &[MemoryMessage]) -> String {
+    let mut request = String::new();
+    if let Some(earlier) = earlier {
+        request.push_str("Notes so far:\n");
+        request.push_str(earlier);
+        request.push_str("\n\nWhat was said next:\n");
+    }
+    for message in messages {
+        let speaker = match message.role {
+            MemoryMessageRole::User => "User",
+            MemoryMessageRole::Assistant => "Assistant",
+            MemoryMessageRole::System | MemoryMessageRole::Tool => continue,
+        };
+        request.push_str(&format!("{speaker}: {}\n", message.content.trim()));
+    }
+    request
+}
+
+async fn write_summary(
+    state: &AppState,
+    model_id: &str,
+    correlation_id: &str,
+    request: String,
+) -> Result<String, String> {
+    let variant = parse_chat_model_variant(Some(model_id)).map_err(|err| err.to_string())?;
+    let permit = state
+        .acquire_workload_permit(izwi_core::WorkloadClass::Background)
+        .await;
+    let response = state
+        .runtime
+        .auxiliary_generate(
+            variant,
+            vec![
+                ChatMessage {
+                    role: izwi_core::ChatRole::System,
+                    content: SUMMARY_SYSTEM_PROMPT.to_string(),
+                },
+                ChatMessage {
+                    role: izwi_core::ChatRole::User,
+                    content: request,
+                },
+            ],
+            GenerationParams {
+                max_tokens: 256,
+                ..Default::default()
+            },
+            Some(correlation_id),
+            permit.runtime_context(),
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(izwi_agent::strip_reasoning(&response.text))
 }
 
 #[async_trait::async_trait]
@@ -339,6 +499,14 @@ impl MemoryStore for ThreadMemory {
             .await
             .map_err(|err| AgentError::Memory(err.to_string()))?;
         Ok(())
+    }
+
+    async fn load_summary(
+        &self,
+        _thread_id: &str,
+        _kept_messages: usize,
+    ) -> izwi_agent::Result<Option<String>> {
+        Ok(self.summary.as_ref().and_then(ConversationSummary::text))
     }
 }
 
@@ -431,6 +599,41 @@ mod tests {
             rendered[2].content
         );
         assert_eq!(rendered[3].content, "It is noon.");
+    }
+
+    #[test]
+    fn a_summary_is_rewritten_once_enough_more_messages_have_dropped() {
+        let summary = ConversationSummary::default();
+        assert_eq!(summary.claim(SUMMARY_STEP - 1), None);
+        assert_eq!(summary.claim(SUMMARY_STEP), Some(0..SUMMARY_STEP));
+        // One writer at a time.
+        assert_eq!(summary.claim(40), None);
+        {
+            let mut state = summary.lock();
+            state.writing = false;
+            state.text = Some("They asked about trains.".to_string());
+            state.covers = SUMMARY_STEP;
+        }
+        assert_eq!(summary.claim(SUMMARY_STEP + 2), None);
+        assert_eq!(
+            summary.claim(2 * SUMMARY_STEP),
+            Some(SUMMARY_STEP..2 * SUMMARY_STEP)
+        );
+        summary.reset();
+        assert_eq!(summary.text(), None);
+
+        let request = summary_request(
+            Some("They asked about trains."),
+            &[
+                MemoryMessage::user(" And buses? "),
+                MemoryMessage::tool("c", "ignored"),
+                MemoryMessage::assistant("Every hour."),
+            ],
+        );
+        assert_eq!(
+            request,
+            "Notes so far:\nThey asked about trains.\n\nWhat was said next:\nUser: And buses?\nAssistant: Every hour.\n"
+        );
     }
 
     #[test]

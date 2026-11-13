@@ -2327,7 +2327,7 @@ How a modular turn runs:
 - The reply streams from the chat model with thinking disabled (any reasoning text is dropped). Complete sentences are spoken as they arrive: the first segment is the fewest sentences reaching about 40 characters, later ones pack the sentences that have arrived (up to 240 characters), and the next segment is synthesized while the current one plays. Segments are joined with a short pause and fades.
 - Each stage (ASR, the reply, each TTS segment) takes its own request admission slot, so a turn holds none while it waits.
 - Assistant audio is paced by the client: when more than about 5 s (or 4 MiB) of audio is queued, synthesis waits for the client to take it rather than closing the session. A client that stops reading for 5 s ends the session.
-- The prompt carries the most recent history (24 messages, about 3000 tokens). A reply is remembered without reasoning, and only as far as it was heard: up to `conversation_item_truncate`'s `audio_end_ms`, or up to the client's estimated playback position when the user interrupted it.
+- The prompt carries the most recent history (24 messages, about 3000 tokens). In a modular session, once older messages no longer fit, the chat model writes short notes on them in the background (again after every 6 more) and the prompt carries those notes; they last for the connection. A reply is remembered without reasoning, and only as far as it was heard: up to `conversation_item_truncate`'s `audio_end_ms`, or up to the client's estimated playback position when the user interrupted it.
 
 Events of a session with `agents`:
 

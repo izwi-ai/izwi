@@ -42,7 +42,7 @@ use tracing::warn;
 
 use crate::api::openai::tool_calls::{parse_answer, ToolCallFormat, ToolCallParser};
 use crate::app::agent_runtime::{
-    cancel_with, drive_turn, ChatAgentBackend, RoundAdmission, ThreadMemory,
+    cancel_with, drive_turn, ChatAgentBackend, ConversationSummary, RoundAdmission, ThreadMemory,
 };
 use crate::app::mcp::{AllowedHosts, McpServerConfig, McpTools};
 use crate::app::realtime_codec::{AudioOutputEncoder, OutputAudioFormat};
@@ -1944,6 +1944,7 @@ fn spawn_turn_task(
                                 .agents
                                 .as_ref()
                                 .map(|agents| (agents, &agent_session.active_agent)),
+                            &agent_session.summary,
                             &|event: &AgentEvent| {
                                 if let Some(message) = function_call_message(
                                     event,
@@ -3018,6 +3019,8 @@ struct AgentSessionSlot {
     binding: tokio::sync::Mutex<Option<(String, String)>>,
     /// The agent that holds the conversation, once a turn has run.
     active_agent: Mutex<Option<String>>,
+    /// Notes on the part of the conversation the prompt no longer carries.
+    summary: ConversationSummary,
 }
 
 impl AgentSessionSlot {
@@ -3058,6 +3061,8 @@ impl AgentSessionSlot {
             })
             .await;
 
+        // A new thread starts the conversation over.
+        self.summary.reset();
         *binding = Some((session_id.clone(), system_prompt.to_string()));
         Ok(session_id)
     }
@@ -3081,6 +3086,7 @@ async fn run_agent_turn(
     tools: Option<VoiceTurnTools<'_>>,
     tool_wait_phrase: Option<&str>,
     agents: Option<(&AgentSet, &Mutex<Option<String>>)>,
+    summary: &ConversationSummary,
     on_event: &(dyn Fn(&AgentEvent) + Sync),
     deltas: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> Result<String, String> {
@@ -3159,7 +3165,8 @@ async fn run_agent_turn(
         None
     };
 
-    let memory = ThreadMemory::new(state.chat_store.clone(), memory_context);
+    let memory =
+        ThreadMemory::new(state.chat_store.clone(), memory_context).with_summary(summary.clone());
     let backend = ChatAgentBackend::new(
         state.runtime.clone(),
         correlation_id,
@@ -3241,6 +3248,13 @@ async fn run_agent_turn(
     if result.finish == izwi_agent::TurnFinish::Cancelled {
         return Err("Turn cancelled".to_string());
     }
+    summary.refresh(
+        state,
+        &session.thread_id,
+        &resolved_model_id,
+        correlation_id,
+        VOICE_HISTORY_BUDGET,
+    );
     state
         .touch_agent_session_record(session_id, now_unix_millis(), resolved_model_id)
         .await;
