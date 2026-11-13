@@ -37,13 +37,14 @@ use super::audio::{base64, wav, OutputEncoder};
 use super::events::{server_event, Ids};
 use super::items::{ContentPart, Item, ItemKind, ItemStatus, ItemStore, Position, Role};
 use super::profiles::{ProfileMode, RealtimeProfile};
-use super::session_config::{chat_tool, AudioFormat, Modality};
+use super::session_config::{chat_tool, is_mcp_tool, AudioFormat, Modality};
 use crate::api::openai::tool_calls::{
     parse_answer, ToolCall, ToolCallFormat, ToolCallFunction, ToolCallParser, ToolChoice, ToolPlan,
 };
 use crate::app::agent_runtime::{
     cancel_with, drive_turn, ChatAgentBackend, RoundAdmission, ThreadMemory,
 };
+use crate::app::mcp::{AllowedHosts, McpServerConfig, McpTools};
 use crate::app::realtime_transport::{
     OutboundClass, OutboundEnqueueError, OutboundItem, OutboundMailbox,
 };
@@ -227,6 +228,41 @@ pub(crate) struct ResponseContext {
     /// One LFM-Audio request at a time per session: a separate LFM3
     /// transcription beside a reply exceeds what Metal admits.
     pub(crate) lane: Arc<tokio::sync::Mutex<()>>,
+    /// The session's connections to its MCP servers.
+    pub(crate) mcp: SharedMcp,
+}
+
+/// A session's MCP servers and the tools last listed from them.
+#[derive(Default)]
+pub(crate) struct McpSession {
+    configs: Vec<McpServerConfig>,
+    tools: McpTools,
+}
+
+pub(crate) type SharedMcp = Arc<tokio::sync::Mutex<McpSession>>;
+
+/// The MCP servers among `tools`.
+pub(crate) fn mcp_configs(tools: &[Value]) -> Vec<McpServerConfig> {
+    tools
+        .iter()
+        .filter(|tool| is_mcp_tool(tool))
+        .filter_map(|tool| serde_json::from_value(tool.clone()).ok())
+        .collect()
+}
+
+/// The tools of the MCP servers among `tools`, connecting when the session
+/// is not already connected to exactly those servers.
+pub(crate) async fn mcp_tools_for(shared: &SharedMcp, tools: &[Value]) -> Result<McpTools, String> {
+    let configs = mcp_configs(tools);
+    if configs.is_empty() {
+        return Ok(McpTools::default());
+    }
+    let mut session = shared.lock().await;
+    if session.configs != configs {
+        session.tools = McpTools::connect(&configs, &AllowedHosts::from_env()).await?;
+        session.configs = configs;
+    }
+    Ok(session.tools.clone())
 }
 
 /// A user turn's transcription left to the response that hears it: LFM3-Audio
@@ -608,6 +644,80 @@ impl Emitter {
         }
     }
 
+    /// Run the calls a reply made to MCP tools, each as an `mcp_call`
+    /// output item that ends with the tool's output or its error. The
+    /// response ends after them: the client asks for the next one, which
+    /// reads the results.
+    pub(crate) async fn mcp_calls(&self, calls: &[ToolCall], mcp: &McpTools) {
+        if calls.is_empty() {
+            return;
+        }
+        self.close_message(ItemStatus::Completed);
+        for call in calls {
+            let item_id = self.out.ids.next("item");
+            let output_index = {
+                let mut state = self.lock();
+                state.next_output_index += 1;
+                state.next_output_index - 1
+            };
+            let item = |output: Option<String>, error: Option<String>, status: ItemStatus| {
+                Item::new(
+                    item_id.clone(),
+                    ItemKind::McpCall {
+                        server_label: mcp
+                            .server_of(&call.function.name)
+                            .unwrap_or_default()
+                            .to_string(),
+                        name: call.function.name.clone(),
+                        arguments: call.function.arguments.clone(),
+                        output,
+                        error,
+                    },
+                    status,
+                )
+            };
+            let started = item(None, None, ItemStatus::InProgress);
+            self.out.event(
+                "response.output_item.added",
+                json!({"response_id": self.plan.id, "output_index": output_index, "item": started.to_json()}),
+            );
+            if self.plan.default_conversation {
+                self.add_to_conversation(started);
+            }
+            let ids = json!({"response_id": self.plan.id, "item_id": item_id, "output_index": output_index});
+            let mut delta = ids.clone();
+            delta["delta"] = json!(call.function.arguments);
+            self.out.event("response.mcp_call_arguments.delta", delta);
+            let mut done = ids.clone();
+            done["arguments"] = json!(call.function.arguments);
+            self.out.event("response.mcp_call_arguments.done", done);
+            self.out.event("response.mcp_call.in_progress", ids.clone());
+
+            let result = mcp
+                .call(&call.function.name, &call.function.arguments)
+                .await;
+            let finished = match result {
+                Ok(output) => {
+                    self.out.event("response.mcp_call.completed", ids);
+                    item(Some(output), None, ItemStatus::Completed)
+                }
+                Err(error) => {
+                    self.out.event("response.mcp_call.failed", ids);
+                    item(None, Some(error), ItemStatus::Completed)
+                }
+            };
+            let json = finished.to_json();
+            self.out.event(
+                "response.output_item.done",
+                json!({"response_id": self.plan.id, "output_index": output_index, "item": json}),
+            );
+            if self.plan.default_conversation {
+                self.finish_in_conversation(finished);
+            }
+            self.lock().outputs.push((output_index, json));
+        }
+    }
+
     /// Close what is open and send `response.done`.
     pub(crate) fn finish(&self, outcome: &Outcome) -> ResponseSummary {
         let item_status = match outcome {
@@ -806,7 +916,11 @@ fn tools_for(plan: &ResponsePlan) -> Vec<Value> {
     if plan.tool_choice.as_str() == Some("none") {
         return Vec::new();
     }
-    plan.tools.iter().map(chat_tool).collect()
+    plan.tools
+        .iter()
+        .filter(|tool| !is_mcp_tool(tool))
+        .map(chat_tool)
+        .collect()
 }
 
 fn user_audio_ms(items: &[Item]) -> u64 {
@@ -860,6 +974,27 @@ fn agent_conversation(items: &[Item]) -> Vec<MemoryMessage> {
             }
             ItemKind::FunctionCallOutput { call_id, output } => {
                 conversation.push(MemoryMessage::tool(call_id.clone(), output.clone()));
+            }
+            // A call the server ran: the call and what came back.
+            ItemKind::McpCall {
+                name,
+                arguments,
+                output,
+                error,
+                ..
+            } => {
+                let Some(result) = output.clone().or_else(|| error.clone()) else {
+                    continue;
+                };
+                conversation.push(MemoryMessage::assistant_calls(
+                    "",
+                    vec![izwi_agent::ToolCall {
+                        id: item.id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    }],
+                ));
+                conversation.push(MemoryMessage::tool(item.id.clone(), result));
             }
         }
     }
@@ -918,7 +1053,21 @@ async fn run_modular(
     let items = with_transcripts(ctx, prompt_items(ctx, plan), None).await;
     // Tools for a model without a tool template are refused, as on the chat
     // routes, rather than dropped. A required or named tool opens the reply.
-    let tools = tools_for(plan);
+    let mut tools = tools_for(plan);
+    let mcp = if plan.tool_choice.as_str() == Some("none") {
+        McpTools::default()
+    } else {
+        mcp_tools_for(&ctx.mcp, &plan.tools).await?
+    };
+    for tool in mcp.function_definitions() {
+        let name = &tool["function"]["name"];
+        if tools.iter().any(|other| &other["function"]["name"] == name) {
+            return Err(format!(
+                "MCP tool {name} has the name of one of the session's function tools"
+            ));
+        }
+        tools.push(tool);
+    }
     let tool_plan = if tools.is_empty() {
         None
     } else {
@@ -1069,6 +1218,10 @@ async fn run_modular(
             },
         })
         .collect();
+    let (mcp_calls, calls): (Vec<ToolCall>, Vec<ToolCall>) = calls
+        .into_iter()
+        .partition(|call| mcp.server_of(&call.function.name).is_some());
+    emitter.mcp_calls(&mcp_calls, &mcp).await;
     emitter.function_calls(&calls);
     Ok(if result.finish == TurnFinish::MaxTokens {
         Outcome::Incomplete
@@ -1107,6 +1260,11 @@ async fn run_unified(
         .filter(|_| lfm3)
         .and_then(|item_id| TranscriptClaim::take(&ctx.pending_transcripts, item_id));
     let items = with_transcripts(ctx, items, skip.as_deref()).await;
+    if plan.tools.iter().any(is_mcp_tool) {
+        return Err(
+            "MCP tools need a profile with a chat model, not a speech-to-speech one".to_string(),
+        );
+    }
     let tools = if lfm3 { tools_for(plan) } else { Vec::new() };
     if !lfm3 && !plan.tools.is_empty() {
         warn!(model = %variant.dir_name(), "realtime tools ignored: only LFM3-Audio calls tools");
@@ -1147,6 +1305,7 @@ async fn run_unified(
                 role: ChatRole::Tool,
                 content: output.clone(),
             }),
+            ItemKind::McpCall { .. } => None,
         };
         messages.extend(message);
     }
@@ -1329,6 +1488,84 @@ async fn run_unified(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_conversation_carries_function_and_mcp_calls_with_their_results() {
+        let item =
+            |id: &str, kind: ItemKind| Item::new(id.to_string(), kind, ItemStatus::Completed);
+        let call = |id: &str, name: &str| {
+            item(
+                id,
+                ItemKind::FunctionCall {
+                    call_id: format!("call_{name}"),
+                    name: name.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            )
+        };
+        let items = vec![
+            call("i1", "a"),
+            call("i2", "b"),
+            item(
+                "i3",
+                ItemKind::FunctionCallOutput {
+                    call_id: "call_a".to_string(),
+                    output: "A".to_string(),
+                },
+            ),
+            item(
+                "i4",
+                ItemKind::McpCall {
+                    server_label: "docs".to_string(),
+                    name: "search".to_string(),
+                    arguments: r#"{"q":"x"}"#.to_string(),
+                    output: None,
+                    error: Some("it broke".to_string()),
+                },
+            ),
+            // A call still running has nothing to read yet.
+            item(
+                "i5",
+                ItemKind::McpCall {
+                    server_label: "docs".to_string(),
+                    name: "search".to_string(),
+                    arguments: "{}".to_string(),
+                    output: None,
+                    error: None,
+                },
+            ),
+        ];
+        let conversation = agent_conversation(&items);
+        // No user turn yet: the opening turn stands in.
+        assert_eq!(conversation[0], MemoryMessage::user(OPENING_TURN));
+        // Consecutive function calls are one assistant turn.
+        assert_eq!(conversation[1].tool_calls.len(), 2);
+        assert_eq!(conversation[2], MemoryMessage::tool("call_a", "A"));
+        assert_eq!(conversation[3].tool_calls[0].name, "search");
+        assert_eq!(conversation[4], MemoryMessage::tool("i4", "it broke"));
+        assert_eq!(conversation.len(), 5);
+
+        let json = items[3].to_json();
+        assert_eq!(json["type"], "mcp_call");
+        assert_eq!(json["error"]["type"], "tool_execution_error");
+        assert!(json["output"].is_null());
+    }
+
+    #[test]
+    fn mcp_servers_are_read_from_a_sessions_tools() {
+        let tools = vec![
+            json!({"type": "function", "name": "lookup"}),
+            json!({"type": "mcp", "server_label": "docs", "server_url": "http://h/mcp",
+                   "headers": {"Authorization": "Bearer t"}, "allowed_tools": null,
+                   "require_approval": "never"}),
+        ];
+        let configs = mcp_configs(&tools);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].label, "docs");
+        assert_eq!(configs[0].url, "http://h/mcp");
+        assert_eq!(configs[0].headers["Authorization"], "Bearer t");
+        assert_eq!(configs[0].allowed_tools, None);
+    }
 
     #[test]
     fn usage_counts_audio_at_openais_rates() {

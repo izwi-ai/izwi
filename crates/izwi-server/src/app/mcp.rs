@@ -151,6 +151,8 @@ impl McpClient {
             value.set_sensitive(true);
             headers.insert(name, value);
         }
+        // reqwest is built without a TLS provider of its own.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             // A redirect could leave the allowed hosts.
@@ -506,6 +508,51 @@ impl McpTools {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.tools.is_empty()
+    }
+
+    /// The tools as OpenAI function tools, for a turn that offers them but
+    /// leaves running them to its caller.
+    pub(crate) fn function_definitions(&self) -> Vec<Value> {
+        self.tools
+            .iter()
+            .map(|(_, info)| {
+                izwi_agent::function_definition(
+                    &info.name,
+                    &info.description,
+                    info.input_schema.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// The label of the server that offers `name`.
+    pub(crate) fn server_of(&self, name: &str) -> Option<&str> {
+        self.tools
+            .iter()
+            .find(|(_, info)| info.name == name)
+            .map(|(client, _)| client.label.as_str())
+    }
+
+    /// The tools of the server labelled `label`.
+    pub(crate) fn tools_of(&self, label: &str) -> Vec<&McpToolInfo> {
+        self.tools
+            .iter()
+            .filter(|(client, _)| client.label == label)
+            .map(|(_, info)| info)
+            .collect()
+    }
+
+    /// Call `name` with `arguments` (a JSON object as text).
+    pub(crate) async fn call(&self, name: &str, arguments: &str) -> Result<String, String> {
+        let Some((client, _)) = self.tools.iter().find(|(_, info)| info.name == name) else {
+            return Err(format!("No MCP tool named `{name}` is available."));
+        };
+        let arguments = match arguments.trim() {
+            "" => json!({}),
+            arguments => serde_json::from_str::<Value>(arguments)
+                .map_err(|err| format!("Invalid arguments: {err}"))?,
+        };
+        client.call_tool(name, arguments).await
     }
 
     pub(crate) fn names(&self) -> impl Iterator<Item = &str> {

@@ -140,6 +140,15 @@ pub(crate) enum ItemKind {
         call_id: String,
         output: String,
     },
+    /// A call the server made to an MCP server's tool, and what came back.
+    McpCall {
+        server_label: String,
+        name: String,
+        arguments: String,
+        output: Option<String>,
+        /// The tool's or the protocol's error message.
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,6 +320,24 @@ impl Item {
                 "type": "function_call_output",
                 "call_id": call_id,
                 "output": output,
+            }),
+            ItemKind::McpCall {
+                server_label,
+                name,
+                arguments,
+                output,
+                error,
+            } => json!({
+                "type": "mcp_call",
+                "server_label": server_label,
+                "name": name,
+                "arguments": arguments,
+                "output": output,
+                "error": error.as_ref().map(|message| json!({
+                    "type": "tool_execution_error",
+                    "message": message,
+                })),
+                "approval_request_id": null,
             }),
         };
         item["id"] = json!(self.id);

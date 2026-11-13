@@ -476,8 +476,8 @@ pub(crate) fn parse_max_output_tokens(
     }
 }
 
-/// The function tools of a session or response, validated; MCP tools are
-/// refused (Izwi runs no MCP servers).
+/// The tools of a session or response, validated: function tools, and MCP
+/// servers whose tools the server runs itself.
 pub(crate) fn parse_tools(value: &Value, param: &str) -> Result<Vec<Value>, RealtimeError> {
     let Some(tools) = value.as_array() else {
         return Err(
@@ -492,10 +492,15 @@ pub(crate) fn parse_tools(value: &Value, param: &str) -> Result<Vec<Value>, Real
                 .get("type")
                 .and_then(Value::as_str)
                 .unwrap_or("function");
+            if kind == "mcp" {
+                return parse_mcp_tool(tool, param);
+            }
             if kind != "function" {
                 return Err(RealtimeError::invalid(
                     "invalid_value",
-                    format!("Tool type '{kind}' is not supported; only function tools are."),
+                    format!(
+                        "Tool type '{kind}' is not supported; only function and mcp tools are."
+                    ),
                 )
                 .with_param(param.to_string()));
             }
@@ -524,6 +529,104 @@ pub(crate) fn parse_tools(value: &Value, param: &str) -> Result<Vec<Value>, Real
                 tool["parameters"] = parameters.clone();
             }
             Ok(tool)
+        })
+        .collect()
+}
+
+/// An MCP server entry: `server_label`, `server_url`, optional `headers` or
+/// `authorization` (a bearer token), `allowed_tools`, and
+/// `require_approval: "never"` (approvals are not implemented, so a session
+/// must say it needs none).
+fn parse_mcp_tool(tool: &Value, param: &str) -> Result<Value, RealtimeError> {
+    let invalid = |message: &str| {
+        Err(RealtimeError::invalid("invalid_value", message.to_string())
+            .with_param(param.to_string()))
+    };
+    let text = |key: &str| {
+        tool.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let Some(label) = text("server_label") else {
+        return invalid("An mcp tool needs a 'server_label'.");
+    };
+    if tool
+        .get("connector_id")
+        .is_some_and(|value| !value.is_null())
+    {
+        return invalid("MCP connectors are not supported; name the server with 'server_url'.");
+    }
+    let Some(url) = text("server_url") else {
+        return invalid("An mcp tool needs a 'server_url'.");
+    };
+    if tool.get("require_approval").and_then(Value::as_str) != Some("never") {
+        return invalid(
+            "MCP tool approvals are not supported: set 'require_approval' to \"never\".",
+        );
+    }
+    let mut headers = serde_json::Map::new();
+    if let Some(given) = tool.get("headers").and_then(Value::as_object) {
+        for (name, value) in given {
+            let Some(value) = value.as_str() else {
+                return invalid("MCP 'headers' values must be strings.");
+            };
+            headers.insert(name.clone(), json!(value));
+        }
+    }
+    if let Some(token) = text("authorization") {
+        if headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("authorization"))
+        {
+            return invalid("Send 'authorization' or an Authorization header, not both.");
+        }
+        headers.insert(
+            "Authorization".to_string(),
+            json!(format!("Bearer {token}")),
+        );
+    }
+    let allowed_tools = match tool.get("allowed_tools") {
+        None | Some(Value::Null) => Value::Null,
+        Some(Value::Array(names)) if names.iter().all(Value::is_string) => json!(names),
+        Some(Value::Object(filter))
+            if filter
+                .get("tool_names")
+                .and_then(Value::as_array)
+                .is_some_and(|names| names.iter().all(Value::is_string)) =>
+        {
+            filter["tool_names"].clone()
+        }
+        Some(_) => return invalid("MCP 'allowed_tools' must be a list of tool names."),
+    };
+    Ok(json!({
+        "type": "mcp",
+        "server_label": label,
+        "server_url": url,
+        "headers": headers,
+        "allowed_tools": allowed_tools,
+        "require_approval": "never",
+    }))
+}
+
+/// Whether `tool` is an MCP server entry.
+pub(crate) fn is_mcp_tool(tool: &Value) -> bool {
+    tool.get("type").and_then(Value::as_str) == Some("mcp")
+}
+
+/// A session's tools as it reports them: an MCP server's headers may carry
+/// credentials and are left out.
+pub(crate) fn tools_echo(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            let mut tool = tool.clone();
+            if is_mcp_tool(&tool) {
+                if let Some(tool) = tool.as_object_mut() {
+                    tool.remove("headers");
+                }
+            }
+            tool
         })
         .collect()
 }
@@ -775,7 +878,7 @@ impl SessionConfig {
             "model": self.model,
             "output_modalities": self.modality.to_json(),
             "instructions": self.instructions,
-            "tools": self.tools,
+            "tools": tools_echo(&self.tools),
             "tool_choice": self.tool_choice,
             "max_output_tokens": self.max_output_tokens.map_or_else(|| json!("inf"), |tokens| json!(tokens)),
             "tracing": self.tracing,
@@ -971,5 +1074,38 @@ mod tests {
             Some(64)
         );
         assert!(parse_max_output_tokens(&json!(0), "m").is_err());
+    }
+
+    #[test]
+    fn mcp_servers_are_accepted_without_approvals_and_echoed_without_credentials() {
+        let tool = json!({
+            "type": "mcp", "server_label": "docs", "server_url": "https://mcp.example/mcp",
+            "authorization": "secret-token", "allowed_tools": {"tool_names": ["search"]},
+            "require_approval": "never",
+        });
+        let tools = parse_tools(&json!([tool]), "session.tools").unwrap();
+        assert!(is_mcp_tool(&tools[0]));
+        assert_eq!(tools[0]["headers"]["Authorization"], "Bearer secret-token");
+        assert_eq!(tools[0]["allowed_tools"], json!(["search"]));
+        let echo = tools_echo(&tools);
+        assert!(echo[0].get("headers").is_none());
+        assert!(!echo[0].to_string().contains("secret-token"));
+
+        let without = |key: &str| {
+            let mut tool = tool.clone();
+            tool.as_object_mut().unwrap().remove(key);
+            parse_tools(&json!([tool]), "session.tools")
+        };
+        assert!(without("server_url").is_err());
+        assert!(without("server_label").is_err());
+        // Omitting it would mean approvals, which are not implemented.
+        let err = without("require_approval").unwrap_err();
+        assert!(err.message.contains("require_approval"), "{}", err.message);
+        let mut both = tool.clone();
+        both["headers"] = json!({"authorization": "Bearer other"});
+        assert!(parse_tools(&json!([both]), "session.tools").is_err());
+        let mut connector = tool.clone();
+        connector["connector_id"] = json!("connector_x");
+        assert!(parse_tools(&json!([connector]), "session.tools").is_err());
     }
 }
