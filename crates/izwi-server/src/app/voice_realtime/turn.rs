@@ -62,6 +62,22 @@ impl VoiceConversation {
     }
 }
 
+/// How speech recognizers write sounds that are not words: a hum, a cough
+/// or a breath comes back as "Uh", "Mm" or "Oh".
+const HESITATION_SOUNDS: &[&str] = &[
+    "uh", "um", "uhm", "erm", "er", "eh", "ah", "oh", "hm", "hmm", "mm", "mhm", "mmm",
+];
+
+/// Whether a transcript holds no words: nothing at all, or only the sounds
+/// a recognizer writes for a hum or a cough. A reply paused by such a
+/// sound plays on.
+pub(crate) fn is_wordless(transcript: &str) -> bool {
+    transcript
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .all(|word| HESITATION_SOUNDS.contains(&word.to_lowercase().as_str()))
+}
+
 #[derive(Clone)]
 pub(crate) struct TurnControl {
     pub(crate) inner: Arc<TurnControlInner>,

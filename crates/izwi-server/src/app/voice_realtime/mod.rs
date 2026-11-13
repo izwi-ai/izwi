@@ -2110,9 +2110,10 @@ fn spawn_turn_task(
                     let user_text = transcript.text.trim().to_string();
                     // Speech with words interrupts the reply it paused;
                     // a sound with none lets it play on.
+                    let mut resumed_reply = false;
                     if let Some(paused) = paused_reply.as_ref() {
-                        if user_text.is_empty() {
-                            paused.resume(&out_tx);
+                        if is_wordless(&user_text) {
+                            resumed_reply = paused.resume(&out_tx);
                         } else if paused.interrupt(&out_tx, "barge_in") {
                             state.runtime.record_voice_interruption();
                             state.runtime.record_voice_barge_in();
@@ -2141,7 +2142,9 @@ fn spawn_turn_task(
                         .await
                         .map_err(|err| format!("Voice storage error: {err}"))?;
 
-                    if user_text.is_empty() {
+                    // A sound that let the paused reply play on is not
+                    // answered.
+                    if user_text.is_empty() || resumed_reply {
                         state
                             .voice_store
                             .complete_turn(turn_record_id.clone(), "no_input", None)
@@ -4626,6 +4629,32 @@ mod tests {
         assert_eq!(events[0]["type"], "turn_interrupted");
         assert_eq!(events[0]["utterance_seq"], 1);
         assert_eq!(events[0]["reason"], "barge_in");
+    }
+
+    #[test]
+    fn hums_and_coughs_as_recognizers_write_them_are_wordless() {
+        for sound in [
+            "",
+            "  ",
+            "Uh",
+            "Uh uh.",
+            "Uh oh.",
+            "Oh",
+            "Mm-hmm?",
+            "um, er...",
+        ] {
+            assert!(is_wordless(sound), "{sound:?}");
+        }
+        for words in [
+            "Stop",
+            "Oh no",
+            "Uh, wait",
+            "No.",
+            "Hm, what about Friday?",
+            "2",
+        ] {
+            assert!(!is_wordless(words), "{words:?}");
+        }
     }
 
     /// A paused client's playback stands still: audio sent meanwhile queues
