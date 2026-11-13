@@ -5,8 +5,8 @@
 use std::sync::{Arc, Mutex};
 
 use izwi_agent::{
-    AgentError, MemoryMessage, MemoryMessageMeta, MemoryMessageRole, MemoryStore, ModelBackend,
-    ModelOutput, ModelRequest, ToolCall, TurnCancel, TurnEvents,
+    AgentError, AgentEvent, MemoryMessage, MemoryMessageMeta, MemoryMessageRole, MemoryStore,
+    ModelBackend, ModelOutput, ModelRequest, ToolCall, TurnCancel, TurnEvents,
 };
 use izwi_core::{
     parse_chat_model_variant, ChatFinishReason, ChatMessage, ChatRequestConfig, ChatTruncation,
@@ -269,6 +269,27 @@ impl MemoryStore for ThreadMemory {
             .map_err(|err| AgentError::Memory(err.to_string()))?;
         Ok(())
     }
+}
+
+/// Run a turn to its end while handing its events to `on_event` as they
+/// happen.
+pub(crate) async fn drive_turn<T>(
+    run: impl std::future::Future<Output = T>,
+    mut heard: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    mut on_event: impl FnMut(AgentEvent),
+) -> T {
+    tokio::pin!(run);
+    let result = loop {
+        tokio::select! {
+            biased;
+            Some(event) = heard.recv() => on_event(event),
+            result = &mut run => break result,
+        }
+    };
+    while let Ok(event) = heard.try_recv() {
+        on_event(event);
+    }
+    result
 }
 
 /// An agent turn's cancellation that follows a voice turn's control until

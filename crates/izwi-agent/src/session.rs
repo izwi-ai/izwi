@@ -58,6 +58,8 @@ pub enum AgentEvent {
         call_id: String,
         name: String,
         arguments: String,
+        /// Who runs the call: a tool's [`crate::Tool::executor`], or `none`
+        /// for a tool the turn does not offer.
         executor: String,
     },
     /// The call has run for the turn's soft timeout and is still running:

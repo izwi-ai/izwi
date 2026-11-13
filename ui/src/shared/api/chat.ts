@@ -226,56 +226,6 @@ export interface ChatThreadStreamCallbacks {
   onClose?: () => void;
 }
 
-export type AgentPlanningMode = "off" | "auto" | "on";
-
-export interface AgentSessionCreateRequest {
-  agent_id?: string;
-  model_id?: string;
-  system_prompt?: string;
-  planning_mode?: AgentPlanningMode;
-  title?: string;
-}
-
-export interface AgentSession {
-  id: string;
-  agent_id: string;
-  thread_id: string;
-  model_id: string;
-  planning_mode: AgentPlanningMode;
-  created_at: number;
-  updated_at: number;
-}
-
-export type AgentEvent =
-  | { event: "turn_started"; session_id: string; thread_id: string }
-  | { event: "plan_created"; steps: string[] }
-  | { event: "tool_call_started"; name: string }
-  | { event: "tool_call_completed"; name: string; output: string }
-  | { event: "assistant_message"; content: string }
-  | { event: "turn_completed"; session_id: string; thread_id: string };
-
-export interface AgentToolCallRecord {
-  name: string;
-  input_summary: string;
-  output: string;
-}
-
-export interface AgentTurnRequest {
-  input: string;
-  model_id?: string;
-  max_output_tokens?: number;
-}
-
-export interface AgentTurnResponse {
-  session_id: string;
-  thread_id: string;
-  model_id: string;
-  assistant_text: string;
-  plan: { mode: AgentPlanningMode; steps: string[] } | null;
-  tool_calls: AgentToolCallRecord[];
-  events: AgentEvent[];
-}
-
 export interface ResponsesCreateRequest {
   model_id?: string;
   input: string;
@@ -690,44 +640,6 @@ export class ChatApiClient {
 
     void startStream();
     return abortController;
-  }
-
-  async createAgentSession(
-    request: AgentSessionCreateRequest,
-  ): Promise<AgentSession> {
-    return this.http.request("/agent/sessions", {
-      method: "POST",
-      body: JSON.stringify({
-        agent_id: request.agent_id,
-        model_id: request.model_id,
-        system_prompt: request.system_prompt,
-        planning_mode: request.planning_mode,
-        title: request.title,
-      }),
-    });
-  }
-
-  async getAgentSession(sessionId: string): Promise<AgentSession> {
-    return this.http.request(`/agent/sessions/${encodeURIComponent(sessionId)}`);
-  }
-
-  async createAgentTurn(
-    sessionId: string,
-    request: AgentTurnRequest,
-    signal?: AbortSignal,
-  ): Promise<AgentTurnResponse> {
-    return this.http.request(
-      `/agent/sessions/${encodeURIComponent(sessionId)}/turns`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          input: request.input,
-          model_id: request.model_id,
-          max_output_tokens: request.max_output_tokens,
-        }),
-        signal,
-      },
-    );
   }
 
   async chatCompletions(

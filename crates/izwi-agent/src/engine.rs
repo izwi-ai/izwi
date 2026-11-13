@@ -406,7 +406,7 @@ impl AgentEngine {
                         }
                     }
                     Route::Unknown => {
-                        log.emit(started(call, "server"));
+                        log.emit(started(call, "none"));
                         Outcome::error(format!("No tool named `{}` is available.", call.name))
                     }
                 };

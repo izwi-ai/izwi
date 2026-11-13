@@ -41,7 +41,9 @@ use tokio::sync::Notify;
 use tracing::warn;
 
 use crate::api::openai::tool_calls::{parse_answer, ToolCallFormat, ToolCallParser};
-use crate::app::agent_runtime::{cancel_with, ChatAgentBackend, RoundAdmission, ThreadMemory};
+use crate::app::agent_runtime::{
+    cancel_with, drive_turn, ChatAgentBackend, RoundAdmission, ThreadMemory,
+};
 use crate::app::realtime_codec::{AudioOutputEncoder, OutputAudioFormat};
 use crate::app::realtime_protocol::{
     RealtimeAudioFormat, RealtimeAudioGapAction, RealtimeClose, RealtimeCloseCode,
@@ -55,10 +57,7 @@ use crate::app::realtime_transport::{
     OutboundLimits, OutboundMailbox, OutboundMessage,
 };
 use crate::app::voice_reply::{SegmentJoiner, SpeechSegmenter, SpokenLedger};
-use crate::app::voice_tools::{
-    builtin_tool_registry, run_builtin_call, FunctionCallOutcome, FunctionExecutor,
-    PendingFunctionCalls, VoiceTools, MAX_TOOL_ROUNDS, MAX_TURN_FUNCTION_CALLS,
-};
+use crate::app::voice_tools::{function_call_message, PendingFunctionCalls, VoiceTools};
 use crate::ids::new_uuid;
 use crate::state::{AppState, OwnedAdmissionPermit, StoredAgentSessionRecord};
 use crate::voice_defaults::{
@@ -516,8 +515,9 @@ struct InputStreamStartEvent {
     /// `pcm_i16` (default), `g711_ulaw` or `g711_alaw`.
     #[serde(default)]
     output_audio_format: Option<String>,
-    /// Function tools a unified LFM3-Audio turn may call; the client
-    /// answers their calls with `function_call_output`.
+    /// Function tools a turn may call; the client answers their calls
+    /// with `function_call_output`. They need a chat model with a
+    /// tool-calling template, or LFM3-Audio in unified mode.
     #[serde(default)]
     tools: Option<Vec<serde_json::Value>>,
     /// Whether those turns may call the server's built-in tools
@@ -555,6 +555,8 @@ pub(crate) struct ModularVoiceTurnConfig {
     asr_language: Option<String>,
     max_output_tokens: usize,
     output_format: OutputAudioFormat,
+    /// The tools its turns may call, when the chat model can call tools.
+    tools: Option<VoiceTools>,
 }
 
 #[derive(Debug, Clone)]
@@ -1295,7 +1297,12 @@ async fn handle_text_message(
                     let tts_variant = parse_tts_model_variant(tts_model_id.as_str())
                         .map_err(|err| format!("Unsupported TTS model: {err}"))?;
                     validate_realtime_tts_model(tts_variant)?;
-                    VoiceTools::parse(tools, builtin_tools, function_call_timeout_ms, false)?;
+                    let tools = VoiceTools::parse(
+                        tools,
+                        builtin_tools,
+                        function_call_timeout_ms,
+                        ToolCallFormat::of(text_variant).is_some(),
+                    )?;
 
                     VoiceTurnConfig::Modular(ModularVoiceTurnConfig {
                         asr_model_id,
@@ -1307,6 +1314,7 @@ async fn handle_text_message(
                             .unwrap_or(VOICE_DEFAULT_MAX_OUTPUT_TOKENS)
                             .clamp(1, 4096),
                         output_format,
+                        tools,
                     })
                 }
                 RealtimeVoiceMode::Unified => {
@@ -1795,6 +1803,16 @@ fn spawn_turn_task(
                             &correlation_id,
                             &control,
                             &turn_record_id,
+                            config.tools.as_ref().map(|tools| (tools, &function_calls)),
+                            &|event: &AgentEvent| {
+                                if let Some(message) = function_call_message(
+                                    event,
+                                    &commit.utterance_id,
+                                    commit.utterance_seq,
+                                ) {
+                                    send_turn_json(&out_tx, output_generation, message);
+                                }
+                            },
                             deltas,
                         )
                         .await?;
@@ -2239,10 +2257,9 @@ struct UnifiedTurnTools<'a> {
 }
 
 /// A unified spoken turn: the model's reply streamed to the socket. With
-/// tools, a round that calls them is followed by one that hears their
-/// results, at most [`MAX_TOOL_ROUNDS`] rounds and
-/// [`MAX_TURN_FUNCTION_CALLS`] calls; each round holds its own admission
-/// permit, so none is held while a tool runs.
+/// tools, the agent runtime follows a round that calls them with one that
+/// hears their results, within its round and call limits; each round holds
+/// its own admission permit, so none is held while a tool runs.
 #[allow(clippy::too_many_arguments)]
 async fn stream_unified_s2s_to_socket(
     state: &AppState,
@@ -2290,199 +2307,102 @@ async fn stream_unified_s2s_to_socket(
         }),
     );
 
-    let stream = Arc::new(Mutex::new(UnifiedReplyStream::default()));
-    let delivery_error = Arc::new(Mutex::new(None::<String>));
-    let definitions = tools
+    let registry = tools
         .as_ref()
-        .map(|tools| tools.tools.definitions())
+        .map(|tools| tools.tools.registry(tools.pending))
         .unwrap_or_default();
-    let mut messages = history_messages;
-    let mut reply = izwi_core::SpeechToSpeechGeneration {
-        text: String::new(),
-        samples: Vec::new(),
-        sample_rate: 24_000,
-        input_transcription: None,
-        generation_time_ms: 0.0,
+    let rounds = UnifiedRounds {
+        state,
+        out_tx,
+        correlation_id,
+        utterance_id,
+        utterance_seq,
+        variant,
+        speaker,
+        system_prompt,
+        max_output_tokens,
+        output_format,
+        audio_bytes,
+        control,
+        output_generation,
+        definitions: registry.function_definitions(None),
+        stream: Arc::new(Mutex::new(UnifiedReplyStream::default())),
+        delivery_error: Arc::new(Mutex::new(None)),
+        progress: Mutex::new(UnifiedProgress {
+            messages: history_messages,
+            reply: izwi_core::SpeechToSpeechGeneration {
+                text: String::new(),
+                samples: Vec::new(),
+                sample_rate: 24_000,
+                input_transcription: None,
+                generation_time_ms: 0.0,
+            },
+        }),
     };
-    let mut calls_made = 0usize;
-    for round in 0..MAX_TOOL_ROUNDS {
-        {
-            let mut stream = lock_reply_stream(&stream);
-            stream.chunk_offset = stream.next_chunk;
-            stream.parser = (!definitions.is_empty())
-                .then(|| ToolCallParser::new(ToolCallFormat::Lfm3Xml).with_tools(&definitions));
-        }
-        let params = GenerationParams {
-            max_tokens: max_output_tokens.clamp(1, 4096),
-            speaker: speaker.clone(),
-            voice: speaker.clone(),
-            ..Default::default()
-        };
-        let permit = acquire_stage_permit(state).await?;
-        let generation = state
-            .runtime
-            .speech_to_speech_round_streaming_bytes(
-                variant,
-                audio_bytes,
-                messages.clone(),
-                definitions.clone(),
-                round == 0,
-                params,
-                Some(system_prompt),
-                Some(correlation_id),
-                permit.runtime_context(),
-                unified_chunk_sink(
-                    out_tx,
-                    utterance_id,
-                    utterance_seq,
-                    output_format,
-                    control,
-                    output_generation,
-                    state.runtime.clone(),
-                    stream.clone(),
-                    delivery_error.clone(),
-                ),
-            )
-            .await
-            .map_err(|err| format!("Unified speech-to-speech failed: {err}"))?;
-        drop(permit);
-        if let Some(err) = delivery_error
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .take()
-        {
-            return Err(err);
-        }
 
-        // The parser holds back text that could still open a call.
-        let tail = {
-            let mut stream = lock_reply_stream(&stream);
-            let tail = stream
-                .parser
-                .take()
-                .map(|mut parser| parser.finish().content)
-                .unwrap_or_default();
-            stream.text.push_str(&tail);
-            (!tail.is_empty()).then(|| stream.text.clone())
-        };
-        if let Some(text) = tail {
-            send_turn_text_snapshot(
-                out_tx,
-                output_generation,
-                format!("assistant-text-{utterance_seq}"),
-                json!({
-                    "type": "assistant_text_snapshot",
-                    "utterance_id": utterance_id,
-                    "utterance_seq": utterance_seq,
-                    "text": text,
-                }),
-            );
+    let agents = AgentSet::single(AgentDefinition::new("voice", "voice", "", s2s_model_id));
+    let session = AgentSession {
+        id: tools
+            .as_ref()
+            .map(|tools| tools.voice_session_id.to_string())
+            .unwrap_or_default(),
+        agent_id: "voice".to_string(),
+        thread_id: utterance_id.to_string(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    // The turn keeps its own conversation; nothing is read from the store.
+    let memory = ThreadMemory::new(state.chat_store.clone(), None);
+    let (cancel, _cancel_link) = cancel_with(control);
+    let (events, heard) = tokio::sync::mpsc::unbounded_channel();
+    let turn = izwi_agent::TurnContext {
+        agents: &agents,
+        memory: &memory,
+        model: &rounds,
+        tools: &registry,
+        events: TurnEvents::new(events),
+        cancel,
+        background: BackgroundResults::default(),
+    };
+    let defaults = AgentTurnOptions::default();
+    let run = AgentEngine.run_conversation(
+        &turn,
+        &session,
+        Vec::new(),
+        vec![MemoryMessage::user(izwi_core::CHAT_AUDIO_PLACEHOLDER)],
+        "",
+        None,
+        AgentTurnOptions {
+            max_output_tokens,
+            tool_timeout: tools
+                .as_ref()
+                .map_or(defaults.tool_timeout, |tools| tools.tools.timeout),
+            persist_assistant_reply: false,
+            ..defaults
+        },
+    );
+    let result = drive_turn(run, heard, |event| {
+        if let Some(message) = function_call_message(&event, utterance_id, utterance_seq) {
+            send_turn_json(out_tx, output_generation, message);
         }
-        if round == 0 {
-            reply.input_transcription = generation.input_transcription.clone();
+    })
+    .await
+    .map_err(|err| match err {
+        izwi_agent::AgentError::Model(message) | izwi_agent::AgentError::ToolLoop(message) => {
+            message
         }
-        if !generation.samples.is_empty() {
-            reply.sample_rate = generation.sample_rate;
-            reply.samples.extend_from_slice(&generation.samples);
-        }
-        reply.generation_time_ms += generation.generation_time_ms;
-
-        let Some(tools) = tools.as_ref() else {
-            break;
-        };
-        let parser = ToolCallParser::new(ToolCallFormat::Lfm3Xml).with_tools(&definitions);
-        let (_, calls) = parse_answer(parser, &generation.text);
-        if calls.is_empty() {
-            break;
-        }
-        if round + 1 == MAX_TOOL_ROUNDS {
-            return Err(format!(
-                "The reply called tools in each of its {MAX_TOOL_ROUNDS} rounds without answering"
-            ));
-        }
-        calls_made += calls.len();
-        if calls_made > MAX_TURN_FUNCTION_CALLS {
-            return Err(format!(
-                "The reply made more than {MAX_TURN_FUNCTION_CALLS} tool calls in one turn"
-            ));
-        }
-        if round == 0 {
-            messages.push(ChatMessage {
-                role: ChatRole::User,
-                content: izwi_core::CHAT_AUDIO_PLACEHOLDER.to_string(),
-            });
-        }
-        messages.push(ChatMessage {
-            role: ChatRole::Assistant,
-            content: generation.text.clone(),
-        });
-        let user_text = reply.input_transcription.clone().unwrap_or_default();
-        for call in calls {
-            let executor = tools.tools.executor(&call.function.name);
-            send_turn_json(
-                out_tx,
-                output_generation,
-                json!({
-                    "type": "function_call",
-                    "utterance_id": utterance_id,
-                    "utterance_seq": utterance_seq,
-                    "call_id": call.id,
-                    "name": call.function.name,
-                    "arguments": call.function.arguments,
-                    "executor": executor.as_ref().map(FunctionExecutor::as_str),
-                }),
-            );
-            let outcome = match executor {
-                Some(FunctionExecutor::Server(tool)) => {
-                    run_builtin_call(
-                        tool,
-                        &call.function.arguments,
-                        izwi_agent::ToolContext {
-                            session_id: tools.voice_session_id.to_string(),
-                            thread_id: utterance_id.to_string(),
-                            call_id: call.id.clone(),
-                            user_text: user_text.clone(),
-                            arguments: serde_json::Value::Null,
-                            cancel: izwi_agent::TurnCancel::new(),
-                        },
-                        tools.tools.timeout,
-                    )
-                    .await
-                }
-                Some(FunctionExecutor::Client) => {
-                    tools
-                        .pending
-                        .await_output(&call.id, tools.tools.timeout, control.cancelled())
-                        .await
-                }
-                None => FunctionCallOutcome::error(format!(
-                    "No tool named `{}` is available.",
-                    call.function.name
-                )),
-            };
-            send_turn_json(
-                out_tx,
-                output_generation,
-                json!({
-                    "type": "function_call_completed",
-                    "utterance_id": utterance_id,
-                    "utterance_seq": utterance_seq,
-                    "call_id": call.id,
-                    "name": call.function.name,
-                    "status": outcome.status,
-                    "output": outcome.output,
-                }),
-            );
-            if control.is_cancelled() {
-                return Err("Turn cancelled".to_string());
-            }
-            messages.push(ChatMessage {
-                role: ChatRole::Tool,
-                content: outcome.output,
-            });
-        }
+        other => other.to_string(),
+    })?;
+    if result.finish == izwi_agent::TurnFinish::Cancelled {
+        return Err("Turn cancelled".to_string());
     }
-    reply.text = lock_reply_stream(&stream).text.clone();
+
+    let mut reply = rounds
+        .progress
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .reply;
+    reply.text = lock_reply_stream(&rounds.stream).text.clone();
 
     send_turn_json(
         out_tx,
@@ -2495,6 +2415,193 @@ async fn stream_unified_s2s_to_socket(
     );
 
     Ok(reply)
+}
+
+/// What a unified turn's rounds have built so far.
+struct UnifiedProgress {
+    /// The prompt's messages: the history, then each round's raw reply and
+    /// the results of its calls.
+    messages: Vec<ChatMessage>,
+    reply: izwi_core::SpeechToSpeechGeneration,
+}
+
+/// The rounds of a unified spoken turn as the agent runtime's model: each
+/// round hears the user's speech in the context so far and streams its
+/// speech and text to the socket.
+struct UnifiedRounds<'a> {
+    state: &'a AppState,
+    out_tx: &'a OutboundTx,
+    correlation_id: &'a str,
+    utterance_id: &'a str,
+    utterance_seq: u64,
+    variant: izwi_core::ModelVariant,
+    speaker: Option<String>,
+    system_prompt: &'a str,
+    max_output_tokens: usize,
+    output_format: OutputAudioFormat,
+    audio_bytes: &'a [u8],
+    control: &'a TurnControl,
+    output_generation: u64,
+    definitions: Vec<serde_json::Value>,
+    stream: Arc<Mutex<UnifiedReplyStream>>,
+    delivery_error: Arc<Mutex<Option<String>>>,
+    progress: Mutex<UnifiedProgress>,
+}
+
+impl UnifiedRounds<'_> {
+    fn progress(&self) -> std::sync::MutexGuard<'_, UnifiedProgress> {
+        self.progress
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn parser(&self) -> Option<ToolCallParser> {
+        (!self.definitions.is_empty())
+            .then(|| ToolCallParser::new(ToolCallFormat::Lfm3Xml).with_tools(&self.definitions))
+    }
+}
+
+#[async_trait::async_trait]
+impl izwi_agent::ModelBackend for UnifiedRounds<'_> {
+    async fn generate(
+        &self,
+        request: izwi_agent::ModelRequest,
+        _events: &TurnEvents,
+    ) -> izwi_agent::Result<izwi_agent::ModelOutput> {
+        let failed = izwi_agent::AgentError::Model;
+        let round = request.round;
+        // The results of the round before close the prompt.
+        let messages = {
+            let results = request
+                .messages
+                .iter()
+                .rev()
+                .take_while(|message| message.role == MemoryMessageRole::Tool)
+                .collect::<Vec<_>>();
+            let mut progress = self.progress();
+            progress
+                .messages
+                .extend(results.into_iter().rev().map(|message| ChatMessage {
+                    role: ChatRole::Tool,
+                    content: message.content.clone(),
+                }));
+            progress.messages.clone()
+        };
+        {
+            let mut stream = lock_reply_stream(&self.stream);
+            stream.chunk_offset = stream.next_chunk;
+            stream.parser = self.parser();
+        }
+        let params = GenerationParams {
+            max_tokens: self.max_output_tokens.clamp(1, 4096),
+            speaker: self.speaker.clone(),
+            voice: self.speaker.clone(),
+            ..Default::default()
+        };
+        let permit = acquire_stage_permit(self.state).await.map_err(failed)?;
+        let generation = self
+            .state
+            .runtime
+            .speech_to_speech_round_streaming_bytes(
+                self.variant,
+                self.audio_bytes,
+                messages,
+                self.definitions.clone(),
+                round == 0,
+                params,
+                Some(self.system_prompt),
+                Some(self.correlation_id),
+                permit.runtime_context(),
+                unified_chunk_sink(
+                    self.out_tx,
+                    self.utterance_id,
+                    self.utterance_seq,
+                    self.output_format,
+                    self.control,
+                    self.output_generation,
+                    self.state.runtime.clone(),
+                    self.stream.clone(),
+                    self.delivery_error.clone(),
+                ),
+            )
+            .await
+            .map_err(|err| failed(format!("Unified speech-to-speech failed: {err}")))?;
+        drop(permit);
+        if let Some(err) = self
+            .delivery_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+        {
+            return Err(failed(err));
+        }
+
+        // The parser holds back text that could still open a call.
+        let tail = {
+            let mut stream = lock_reply_stream(&self.stream);
+            let tail = stream
+                .parser
+                .take()
+                .map(|mut parser| parser.finish().content)
+                .unwrap_or_default();
+            stream.text.push_str(&tail);
+            (!tail.is_empty()).then(|| stream.text.clone())
+        };
+        if let Some(text) = tail {
+            send_turn_text_snapshot(
+                self.out_tx,
+                self.output_generation,
+                format!("assistant-text-{}", self.utterance_seq),
+                json!({
+                    "type": "assistant_text_snapshot",
+                    "utterance_id": self.utterance_id,
+                    "utterance_seq": self.utterance_seq,
+                    "text": text,
+                }),
+            );
+        }
+
+        let calls = match self.parser() {
+            Some(parser) => parse_answer(parser, &generation.text).1,
+            None => Vec::new(),
+        };
+        let mut progress = self.progress();
+        if round == 0 {
+            progress.reply.input_transcription = generation.input_transcription.clone();
+        }
+        if !generation.samples.is_empty() {
+            progress.reply.sample_rate = generation.sample_rate;
+            progress
+                .reply
+                .samples
+                .extend_from_slice(&generation.samples);
+        }
+        progress.reply.generation_time_ms += generation.generation_time_ms;
+        if !calls.is_empty() {
+            if round == 0 {
+                progress.messages.push(ChatMessage {
+                    role: ChatRole::User,
+                    content: izwi_core::CHAT_AUDIO_PLACEHOLDER.to_string(),
+                });
+            }
+            progress.messages.push(ChatMessage {
+                role: ChatRole::Assistant,
+                content: generation.text.clone(),
+            });
+        }
+        Ok(izwi_agent::ModelOutput {
+            tool_calls: calls
+                .into_iter()
+                .map(|call| izwi_agent::ToolCall {
+                    id: call.id,
+                    name: call.function.name,
+                    arguments: call.function.arguments,
+                })
+                .collect(),
+            generation_time_ms: generation.generation_time_ms,
+            ..Default::default()
+        })
+    }
 }
 
 fn lock_reply_stream(
@@ -2789,6 +2896,8 @@ async fn run_agent_turn(
     correlation_id: &str,
     control: &TurnControl,
     turn_record_id: &str,
+    tools: Option<(&VoiceTools, &PendingFunctionCalls)>,
+    on_event: &(dyn Fn(&AgentEvent) + Sync),
     deltas: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> Result<String, String> {
     let session_record = {
@@ -2844,9 +2953,12 @@ async fn run_agent_turn(
         correlation_id: correlation_id.to_string(),
         admission: RoundAdmission::PerRound(state),
     };
-    let tools = builtin_tool_registry();
+    let tool_timeout = tools.map(|(tools, _)| tools.timeout);
+    let tools = tools
+        .map(|(tools, pending)| tools.registry(pending))
+        .unwrap_or_default();
     let (cancel, _cancel_link) = cancel_with(control);
-    let (events, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    let (events, heard) = tokio::sync::mpsc::unbounded_channel();
     let turn = izwi_agent::TurnContext {
         agents: &agents,
         memory: &memory,
@@ -2856,6 +2968,7 @@ async fn run_agent_turn(
         cancel,
         background: BackgroundResults::default(),
     };
+    let defaults = AgentTurnOptions::default();
     let run = AgentEngine.run_turn(
         &turn,
         &session,
@@ -2865,27 +2978,19 @@ async fn run_agent_turn(
         Some(resolved_model_id.clone()),
         AgentTurnOptions {
             max_output_tokens: max_output_tokens.clamp(1, 4096),
+            tool_timeout: tool_timeout.unwrap_or(defaults.tool_timeout),
             history: VOICE_HISTORY_BUDGET,
             persist_assistant_reply: false,
-            ..AgentTurnOptions::default()
+            ..defaults
         },
     );
-    tokio::pin!(run);
-    let speak = |event| {
+    let result = drive_turn(run, heard, |event| {
+        on_event(&event);
         if let AgentEvent::TextDelta { text } = event {
             let _ = deltas.send(text);
         }
-    };
-    let result = loop {
-        tokio::select! {
-            biased;
-            Some(event) = heard.recv() => speak(event),
-            result = &mut run => break result,
-        }
-    };
-    while let Ok(event) = heard.try_recv() {
-        speak(event);
-    }
+    })
+    .await;
     let result = result.map_err(|err| match err {
         izwi_agent::AgentError::InvalidInput(msg) => msg,
         other => other.to_string(),
@@ -4066,6 +4171,7 @@ mod tests {
                 asr_language: None,
                 max_output_tokens: 64,
                 output_format: OutputAudioFormat::G711Ulaw,
+                tools: None,
             }),
             endpointed_at: Instant::now(),
             endpointing_delay: None,

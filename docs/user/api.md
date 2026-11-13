@@ -1814,9 +1814,9 @@ Streaming thread events:
 | `done` | Includes persisted assistant message and generation stats. |
 | `error` | Error string. |
 
-### Agent Sessions
+### Agent Sessions (deprecated)
 
-Agent session metadata is process-local preview state. The linked chat thread is durable.
+These routes are deprecated and will be removed in a later release. Use `/v1/responses` for text turns with tools and stored state, and `/v1/realtime` for voice agents. Every response from them carries a `Deprecation: true` header and a `Link` header naming `/v1/responses` as the successor.
 
 | Method | Path | Notes |
 |--------|------|-------|
@@ -1824,9 +1824,9 @@ Agent session metadata is process-local preview state. The linked chat thread is
 | `GET` | `/v1/agent/sessions/{session_id}` | Fetch retained process-local session metadata. |
 | `POST` | `/v1/agent/sessions/{session_id}/turns` | Run one agent turn. |
 
-Create fields include `agent_id`, `model_id`, `system_prompt`, `planning_mode` (`off`, `auto`, `on`), and `title`.
+Create fields include `agent_id`, `model_id`, `system_prompt` and `title`. `planning_mode` is accepted and ignored.
 
-Turn responses include assistant text, optional plan steps, tool calls, and ordered events such as `turn_started`, `plan_created`, `tool_call_started`, `tool_call_completed`, `assistant_message`, and `turn_completed`.
+A turn lets the model call the server's built-in tools (`time`). Turn responses include the assistant text, the tool calls (`call_id`, `name`, `arguments`, `status`, `output`) and ordered events: `turn_started`, `tool_call_started`, `tool_call_completed`, `assistant_message` and `turn_completed`.
 
 ### Voice Profile, Memory, And Sessions
 
@@ -2267,8 +2267,8 @@ Client JSON messages:
 | `pre_roll_ms` | Audio retained before speech start. |
 | `barge_in_min_speech_ms` | Voiced speech, default `300`, that interrupts a speaking assistant. A shorter sound (a cough, a door, speaker echo) does not interrupt it. `0` interrupts on the first speech frame. |
 | `input_sample_rate` | Expected input sample rate. |
-| `tools` | Unified mode on LFM3-Audio only: OpenAI function tools (`{"type": "function", "function": {"name", "description", "parameters"}}`, or the Responses form with the fields on the tool) the reply may call. The client runs them: it gets `function_call` and answers with `function_call_output`. A name must be letters, digits, `_` or `-`, unique, and not a built-in tool's. At most 64. |
-| `builtin_tools` | Unified mode on LFM3-Audio: whether the reply may also call the server's built-in tools (today `time`, the local date and time). Default `true`. |
+| `tools` | Modular mode with a chat model that calls tools (Qwen3, Qwen3.5, LFM2.5, LFM3), or unified mode on LFM3-Audio: OpenAI function tools (`{"type": "function", "function": {"name", "description", "parameters"}}`, or the Responses form with the fields on the tool) the reply may call. The client runs them: it gets `function_call` and answers with `function_call_output`. A name must be letters, digits, `_` or `-`, unique, and not a built-in tool's. At most 64. |
+| `builtin_tools` | With a model that calls tools: whether the reply may also call the server's built-in tools (today `time`, the local date and time). Default `true`. |
 | `function_call_timeout_ms` | How long a turn waits for a call's result: default `10000`, clamped to `1000..60000`. |
 
 Client binary frame:
@@ -2326,11 +2326,12 @@ How a modular turn runs:
 - Assistant audio is paced by the client: when more than about 5 s (or 4 MiB) of audio is queued, synthesis waits for the client to take it rather than closing the session. A client that stops reading for 5 s ends the session.
 - The prompt carries the most recent history (24 messages, about 3000 tokens). A reply is remembered without reasoning, and only as far as it was heard: up to `conversation_item_truncate`'s `audio_end_ms`, or up to the client's estimated playback position when the user interrupted it.
 
-How a unified turn with tools runs (LFM3-Audio):
+How a turn with tools runs:
 
-- The reply is told the tools in its system prompt. A reply that calls them speaks nothing in that round; the calls are sent as `function_call`, run (built-in tools on the server, the others by the client), reported as `function_call_completed`, and the reply's next round hears their results and speaks. A turn runs at most 3 rounds and makes at most 8 calls; past either it ends with an `error`.
+- The reply is told the tools in its prompt. A modular reply may say something before it calls ("Let me check"), which is spoken; an LFM3-Audio reply that calls tools speaks nothing in that round. In both, the calls are sent as `function_call`, run (built-in tools on the server, the others by the client), reported as `function_call_completed`, and the reply's next round reads their results and speaks. A turn runs at most 3 rounds and makes at most 8 calls; past either it ends with an `error`.
 - Each round takes its own request admission slot, so no slot is held while a tool runs. An interruption ends a call the client has not answered.
-- Text events and the remembered reply carry what the reply says, never its call markup. Audio chunk numbers count on across rounds, and only the last round's last chunk is marked final.
+- Text events and the remembered reply carry what the reply says, never its call markup. On LFM3-Audio, audio chunk numbers count on across rounds, and only the last round's last chunk is marked final.
+- Tool calls and their results last for the turn: the stored conversation keeps what the user said and what the reply said.
 
 Voice realtime persists voice sessions and turns in the local store. Modular turns can also update observational memory when that feature is enabled.
 

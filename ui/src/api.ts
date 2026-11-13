@@ -114,13 +114,6 @@ export type {
 } from "@/shared/api/audio";
 
 export type {
-  AgentEvent,
-  AgentPlanningMode,
-  AgentSession,
-  AgentSessionCreateRequest,
-  AgentToolCallRecord,
-  AgentTurnRequest,
-  AgentTurnResponse,
   ChatCompletionRequest,
   ChatCompletionResponse,
   ChatGenerationStats,

@@ -4322,6 +4322,29 @@ async fn dynamic_routes_cover_axum_upgrade_surface() {
     drop(temp_dir);
 }
 
+/// The agent session routes still answer, and say they are deprecated.
+#[tokio::test]
+async fn agent_session_routes_announce_their_deprecation() {
+    let (app, temp_dir) = test_api_app("agent_session_routes_deprecated", false);
+    let response = send_request(
+        app,
+        build_request(Method::GET, "/v1/agent/sessions/missing-session", None),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response.headers().get("deprecation"),
+        Some(&HeaderValue::from_static("true"))
+    );
+    assert_eq!(
+        response.headers().get(header::LINK),
+        Some(&HeaderValue::from_static(
+            "</v1/responses>; rel=\"successor-version\""
+        ))
+    );
+    drop(temp_dir);
+}
+
 #[tokio::test]
 async fn readyz_returns_unavailable_when_lifecycle_is_draining() {
     let (state, temp_dir) = test_state("readyz_draining", false);

@@ -1,20 +1,15 @@
-//! Tools a unified voice turn may call (LFM3-Audio): the server's built-in
-//! tools, the function tools a client declares on the voice websocket, and
-//! the client's calls a session awaits.
+//! Tools a voice turn may call: the server's built-in tools, the function
+//! tools a client declares on the voice websocket, and the client's calls a
+//! session awaits.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use izwi_agent::{TimeTool, ToolContext, ToolRegistry};
+use izwi_agent::{AgentError, AgentEvent, TimeTool, Tool, ToolContext, ToolOutput, ToolRegistry};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
-/// The most model rounds one spoken turn runs: a round that calls tools is
-/// followed by one that hears their results.
-pub(crate) const MAX_TOOL_ROUNDS: usize = 3;
-/// The most calls one spoken turn makes.
-pub(crate) const MAX_TURN_FUNCTION_CALLS: usize = 8;
 const MAX_CLIENT_TOOLS: usize = 64;
 const DEFAULT_FUNCTION_CALL_TIMEOUT_MS: u64 = 10_000;
 const FUNCTION_CALL_TIMEOUT_RANGE_MS: (u64, u64) = (1_000, 60_000);
@@ -35,27 +30,13 @@ pub(crate) struct VoiceTools {
     pub(crate) timeout: Duration,
 }
 
-/// Who runs a call.
-pub(crate) enum FunctionExecutor {
-    Server(Arc<dyn izwi_agent::Tool>),
-    Client,
-}
-
-impl FunctionExecutor {
-    pub(crate) fn as_str(&self) -> &'static str {
-        match self {
-            Self::Server(_) => "server",
-            Self::Client => "client",
-        }
-    }
-}
-
 impl VoiceTools {
     /// The tools `input_stream_start` offers: the built-in tools unless
     /// `builtin_tools` is `false`, and the client's `tools` (OpenAI function
     /// tools, in the chat completions or the Responses form), whose calls
     /// the client answers within `function_call_timeout_ms` (default 10 s,
-    /// 1 to 60 s). Only a unified session on LFM3-Audio calls tools.
+    /// 1 to 60 s). `calls_tools` is whether the session's model can call
+    /// tools: a chat model with a tool-calling template, or LFM3-Audio.
     pub(crate) fn parse(
         tools: Option<Vec<Value>>,
         builtin_tools: Option<bool>,
@@ -69,7 +50,8 @@ impl VoiceTools {
                 || function_call_timeout_ms.is_some()
             {
                 return Err(
-                    "Voice tools need unified mode with an LFM3-Audio `s2s_model_id`".to_string(),
+                    "Voice tools need a chat model that can call tools, or unified mode with an LFM3-Audio `s2s_model_id`"
+                        .to_string(),
                 );
             }
             return Ok(None);
@@ -127,18 +109,107 @@ impl VoiceTools {
         definitions
     }
 
-    /// Who runs a call to `name`, or `None` for a tool the session does not
-    /// offer.
-    pub(crate) fn executor(&self, name: &str) -> Option<FunctionExecutor> {
-        if self.builtin {
-            if let Some(tool) = builtin_tool_registry().find(name) {
-                return Some(FunctionExecutor::Server(tool));
-            }
+    /// The tools as a turn's registry: the built-in ones, then the client's,
+    /// each of which waits in `pending` for the client's output.
+    pub(crate) fn registry(&self, pending: &PendingFunctionCalls) -> ToolRegistry {
+        let mut registry = if self.builtin {
+            builtin_tool_registry()
+        } else {
+            ToolRegistry::new()
+        };
+        for tool in &self.client {
+            let function = &tool["function"];
+            registry.register(ClientTool {
+                name: function["name"].as_str().unwrap_or_default().to_string(),
+                description: function["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                parameters: function
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                pending: pending.clone(),
+            });
         }
-        self.client
-            .iter()
-            .any(|tool| tool["function"]["name"].as_str() == Some(name))
-            .then_some(FunctionExecutor::Client)
+        registry
+    }
+}
+
+/// A function tool the voice client runs: the turn sends the call and waits
+/// for the client's `function_call_output`.
+struct ClientTool {
+    name: String,
+    description: String,
+    parameters: Value,
+    pending: PendingFunctionCalls,
+}
+
+#[async_trait::async_trait]
+impl Tool for ClientTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn parameters(&self) -> Value {
+        self.parameters.clone()
+    }
+
+    fn executor(&self) -> &'static str {
+        "client"
+    }
+
+    async fn invoke(&self, ctx: ToolContext) -> izwi_agent::Result<ToolOutput> {
+        self.pending
+            .wait(&ctx.call_id)
+            .await
+            .map(|text| ToolOutput { text })
+            .ok_or_else(|| AgentError::Tool("The call was abandoned.".to_string()))
+    }
+}
+
+/// A turn's tool event as the voice socket's message: `function_call` when
+/// a call starts, `function_call_completed` when it ends.
+pub(crate) fn function_call_message(
+    event: &AgentEvent,
+    utterance_id: &str,
+    utterance_seq: u64,
+) -> Option<Value> {
+    match event {
+        AgentEvent::ToolCallStarted {
+            call_id,
+            name,
+            arguments,
+            executor,
+        } => Some(json!({
+            "type": "function_call",
+            "utterance_id": utterance_id,
+            "utterance_seq": utterance_seq,
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+            "executor": (executor != "none").then_some(executor),
+        })),
+        AgentEvent::ToolCallCompleted {
+            call_id,
+            name,
+            status,
+            output,
+        } => Some(json!({
+            "type": "function_call_completed",
+            "utterance_id": utterance_id,
+            "utterance_seq": utterance_seq,
+            "call_id": call_id,
+            "name": name,
+            // An interrupted call is an error on the wire.
+            "status": if status == "cancelled" { "error" } else { status.as_str() },
+            "output": output,
+        })),
+        _ => None,
     }
 }
 
@@ -175,60 +246,6 @@ fn chat_function_tool(tool: Value) -> Result<Value, String> {
     Ok(json!({"type": "function", "function": function}))
 }
 
-/// The outcome of one call.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FunctionCallOutcome {
-    /// `ok`, `error` or `timeout`.
-    pub(crate) status: &'static str,
-    /// What the model reads as the call's result.
-    pub(crate) output: String,
-}
-
-impl FunctionCallOutcome {
-    fn ok(output: String) -> Self {
-        Self {
-            status: "ok",
-            output,
-        }
-    }
-
-    pub(crate) fn error(message: impl Into<String>) -> Self {
-        Self {
-            status: "error",
-            output: message.into(),
-        }
-    }
-
-    fn timeout(timeout: Duration) -> Self {
-        Self {
-            status: "timeout",
-            output: format!("The tool did not answer within {} ms.", timeout.as_millis()),
-        }
-    }
-}
-
-/// Run a built-in tool with the call's `arguments` (a JSON object as text).
-pub(crate) async fn run_builtin_call(
-    tool: Arc<dyn izwi_agent::Tool>,
-    arguments: &str,
-    context: ToolContext,
-    timeout: Duration,
-) -> FunctionCallOutcome {
-    let arguments = match serde_json::from_str::<Value>(arguments) {
-        Ok(arguments) => arguments,
-        Err(err) => return FunctionCallOutcome::error(format!("Invalid arguments: {err}")),
-    };
-    let context = ToolContext {
-        arguments,
-        ..context
-    };
-    match tokio::time::timeout(timeout, tool.invoke(context)).await {
-        Ok(Ok(output)) => FunctionCallOutcome::ok(output.text),
-        Ok(Err(err)) => FunctionCallOutcome::error(err.to_string()),
-        Err(_) => FunctionCallOutcome::timeout(timeout),
-    }
-}
-
 /// The client's calls a voice session awaits, by call id. A turn registers
 /// each call it sends; the client's `function_call_output` settles it once.
 #[derive(Clone, Default)]
@@ -237,26 +254,20 @@ pub(crate) struct PendingFunctionCalls {
 }
 
 impl PendingFunctionCalls {
-    /// Await the client's output for `call_id` for at most `timeout`, or
-    /// until `cancelled` resolves.
-    pub(crate) async fn await_output(
-        &self,
-        call_id: &str,
-        timeout: Duration,
-        cancelled: impl std::future::Future<Output = ()>,
-    ) -> FunctionCallOutcome {
+    /// The client's output for `call_id`, or `None` when the call is
+    /// abandoned. A wait that is dropped (the turn timed out or was
+    /// interrupted) no longer accepts an output.
+    pub(crate) async fn wait(&self, call_id: &str) -> Option<String> {
+        struct Forget<'a>(&'a PendingFunctionCalls, &'a str);
+        impl Drop for Forget<'_> {
+            fn drop(&mut self) {
+                self.0.lock().remove(self.1);
+            }
+        }
         let (tx, rx) = oneshot::channel();
         self.lock().insert(call_id.to_string(), tx);
-        let outcome = tokio::select! {
-            output = tokio::time::timeout(timeout, rx) => match output {
-                Ok(Ok(output)) => FunctionCallOutcome::ok(output),
-                Ok(Err(_)) => FunctionCallOutcome::error("The call was abandoned."),
-                Err(_) => FunctionCallOutcome::timeout(timeout),
-            },
-            () = cancelled => FunctionCallOutcome::error("The turn was interrupted."),
-        };
-        self.lock().remove(call_id);
-        outcome
+        let _forget = Forget(self, call_id);
+        rx.await.ok()
     }
 
     /// Settle `call_id` with the client's `output` (text as it is, other
@@ -298,9 +309,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names, ["time", "get_weather"]);
         assert_eq!(tools.timeout, Duration::from_secs(10));
-        assert_eq!(tools.executor("time").unwrap().as_str(), "server");
-        assert_eq!(tools.executor("get_weather").unwrap().as_str(), "client");
-        assert!(tools.executor("nope").is_none());
+        let registry = tools.registry(&PendingFunctionCalls::default());
+        assert_eq!(registry.find("time").unwrap().executor(), "server");
+        assert_eq!(registry.find("get_weather").unwrap().executor(), "client");
+        assert!(registry.find("nope").is_none());
 
         // The Responses form, no built-ins, a clamped timeout.
         let responses = json!({"type": "function", "name": "lookup", "parameters": {}});
@@ -308,7 +320,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(tools.definitions()[0]["function"]["name"], "lookup");
-        assert!(tools.executor("time").is_none());
+        assert_eq!(
+            tools
+                .registry(&PendingFunctionCalls::default())
+                .tool_names(),
+            ["lookup"]
+        );
         assert_eq!(tools.timeout, Duration::from_secs(1));
         assert_eq!(VoiceTools::parse(None, Some(false), None, true), Ok(None));
 
@@ -339,19 +356,16 @@ mod tests {
         let tools = VoiceTools::parse(Some(vec![time]), Some(false), None, true)
             .unwrap()
             .unwrap();
-        assert_eq!(tools.executor("time").unwrap().as_str(), "client");
+        let registry = tools.registry(&PendingFunctionCalls::default());
+        assert_eq!(registry.find("time").unwrap().executor(), "client");
     }
 
     #[tokio::test]
-    async fn client_calls_settle_once_or_time_out() {
+    async fn client_calls_settle_once_and_a_dropped_wait_forgets_its_call() {
         let pending = PendingFunctionCalls::default();
         let waiting = {
             let pending = pending.clone();
-            tokio::spawn(async move {
-                pending
-                    .await_output("call_1", Duration::from_secs(5), std::future::pending())
-                    .await
-            })
+            tokio::spawn(async move { pending.wait("call_1").await })
         };
         while !pending.lock().contains_key("call_1") {
             tokio::task::yield_now().await;
@@ -360,36 +374,66 @@ mod tests {
         assert!(!pending.resolve("call_1", &json!("again")));
         assert_eq!(
             waiting.await.unwrap(),
-            FunctionCallOutcome::ok(r#"{"temperature_c":21}"#.to_string())
+            Some(r#"{"temperature_c":21}"#.to_string())
         );
 
-        let outcome = pending
-            .await_output("call_2", Duration::from_millis(10), std::future::pending())
-            .await;
-        assert_eq!(outcome.status, "timeout");
-        let outcome = pending
-            .await_output("call_3", Duration::from_secs(5), std::future::ready(()))
-            .await;
-        assert_eq!(outcome.status, "error");
-        assert!(!pending.resolve("call_3", &json!("late")));
+        // A turn that stops waiting (timeout, interruption) drops the wait.
+        let timed_out =
+            tokio::time::timeout(Duration::from_millis(10), pending.wait("call_2")).await;
+        assert!(timed_out.is_err());
+        assert!(!pending.resolve("call_2", &json!("late")));
     }
 
     #[tokio::test]
-    async fn builtin_calls_run_with_their_arguments() {
-        let tool = builtin_tool_registry().find("time").unwrap();
-        let context = ToolContext {
-            session_id: "s".into(),
-            thread_id: "t".into(),
-            call_id: "c".into(),
-            user_text: String::new(),
-            arguments: Value::Null,
-            cancel: izwi_agent::TurnCancel::new(),
+    async fn a_client_tool_answers_with_the_clients_output() {
+        let tools = VoiceTools::parse(Some(vec![weather()]), Some(false), None, true)
+            .unwrap()
+            .unwrap();
+        let pending = PendingFunctionCalls::default();
+        let tool = tools.registry(&pending).find("get_weather").unwrap();
+        let call = tokio::spawn(async move {
+            tool.invoke(ToolContext {
+                session_id: "s".into(),
+                thread_id: "t".into(),
+                call_id: "call_9".into(),
+                user_text: String::new(),
+                arguments: json!({}),
+                cancel: izwi_agent::TurnCancel::new(),
+            })
+            .await
+        });
+        while !pending.lock().contains_key("call_9") {
+            tokio::task::yield_now().await;
+        }
+        assert!(pending.resolve("call_9", &json!("Sunny.")));
+        assert_eq!(call.await.unwrap().unwrap().text, "Sunny.");
+    }
+
+    #[test]
+    fn tool_events_read_as_the_sockets_function_call_messages() {
+        let started = AgentEvent::ToolCallStarted {
+            call_id: "c1".into(),
+            name: "time".into(),
+            arguments: "{}".into(),
+            executor: "server".into(),
         };
-        let outcome =
-            run_builtin_call(tool.clone(), "{}", context.clone(), Duration::from_secs(1)).await;
-        assert_eq!(outcome.status, "ok");
-        assert!(outcome.output.starts_with("It is "));
-        let outcome = run_builtin_call(tool, "{", context, Duration::from_secs(1)).await;
-        assert_eq!(outcome.status, "error");
+        assert_eq!(
+            function_call_message(&started, "utt-1", 1).unwrap(),
+            json!({
+                "type": "function_call", "utterance_id": "utt-1", "utterance_seq": 1,
+                "call_id": "c1", "name": "time", "arguments": "{}", "executor": "server",
+            })
+        );
+        let interrupted = AgentEvent::ToolCallCompleted {
+            call_id: "c1".into(),
+            name: "time".into(),
+            status: "cancelled".into(),
+            output: "The turn was interrupted.".into(),
+        };
+        let message = function_call_message(&interrupted, "utt-1", 1).unwrap();
+        assert_eq!(message["type"], "function_call_completed");
+        assert_eq!(message["status"], "error");
+        let other = AgentEvent::TextDelta { text: "hi".into() };
+        assert!(function_call_message(&other, "utt-1", 1).is_none());
     }
 }

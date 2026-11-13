@@ -92,10 +92,12 @@ conversation. LFM2.5 Audio stays selectable in **Voice settings › Engine**,
 with its four voices, and with only LFM2.5 Audio downloaded the Compact engine
 uses it.
 
-With LFM3 Audio a spoken turn can call tools: the server's built-in tools (the
-local date and time) by default, and function tools a WebSocket client declares
-in `input_stream_start` and answers with `function_call_output`. The reply calls
-a tool, hears its result, then speaks the answer. See
+A spoken turn can call tools when its model can: a chat model that calls tools
+(Qwen3, Qwen3.5, LFM2.5, LFM3) in the modular pipeline, or LFM3 Audio. It may
+call the server's built-in tools (the local date and time) by default, and
+function tools a WebSocket client declares in `input_stream_start` and answers
+with `function_call_output`. The reply calls a tool, reads its result, then
+speaks the answer. See
 [Voice Realtime](/api#voice-realtime) for the fields and events.
 
 ---
