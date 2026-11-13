@@ -2327,53 +2327,60 @@ fn spawn_turn_task(
                         &system_prompt,
                         &izwi_agent::current_time_instruction(),
                     );
-                    let generation = stream_unified_s2s_to_socket(
-                        &state,
-                        &out_tx,
-                        &correlation_id,
-                        &commit.utterance_id,
-                        commit.utterance_seq,
-                        &config.s2s_model_id,
-                        config.speaker.clone(),
-                        &instructions,
-                        history_messages,
-                        config.max_output_tokens,
-                        config.output_format,
-                        audio_bytes.as_slice(),
-                        tools,
-                        &control,
-                        output_generation,
-                        &model_leases,
-                    )
-                    .await?;
-
-                    let user_text = generation
-                        .input_transcription
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
-                    send_turn_json(
-                        &out_tx,
-                        output_generation,
-                        json!({
-                            "type": "user_transcript_final",
-                            "utterance_id": commit.utterance_id,
-                            "utterance_seq": commit.utterance_seq,
-                            "text": user_text.clone(),
-                            "language": null,
-                            "audio_duration_secs": null,
-                        }),
-                    );
-                    state
-                        .voice_store
-                        .update_turn_transcript(
-                            turn_record_id.clone(),
-                            user_text.clone(),
-                            None,
-                            None,
+                    // What the user said is shown and stored as soon as it
+                    // is transcribed, usually while the reply still streams,
+                    // so it reads before the reply and an interrupted turn
+                    // keeps it.
+                    let record_transcript = |text: String| {
+                        record_unified_transcript(
+                            &state,
+                            &out_tx,
+                            output_generation,
+                            &commit,
+                            &turn_record_id,
+                            text,
                         )
-                        .await
-                        .map_err(|err| format!("Voice storage error: {err}"))?;
+                    };
+                    let (heard_tx, heard_rx) = tokio::sync::oneshot::channel();
+                    let heard = async {
+                        match heard_rx.await {
+                            Ok(text) => record_transcript(text).await.map(Some),
+                            Err(_) => Ok(None),
+                        }
+                    };
+                    let (generation, heard) = tokio::join!(
+                        stream_unified_s2s_to_socket(
+                            &state,
+                            &out_tx,
+                            &correlation_id,
+                            &commit.utterance_id,
+                            commit.utterance_seq,
+                            &config.s2s_model_id,
+                            config.speaker.clone(),
+                            &instructions,
+                            history_messages,
+                            config.max_output_tokens,
+                            config.output_format,
+                            audio_bytes.as_slice(),
+                            tools,
+                            heard_tx,
+                            &control,
+                            output_generation,
+                            &model_leases,
+                        ),
+                        heard,
+                    );
+                    let generation = generation?;
+                    let user_text = match heard? {
+                        Some(text) => text,
+                        // A model that reports the transcript with its reply.
+                        None => {
+                            record_transcript(
+                                generation.input_transcription.clone().unwrap_or_default(),
+                            )
+                            .await?
+                        }
+                    };
 
                     let assistant_text = strip_reasoning(generation.text.trim());
                     send_turn_json(
@@ -2595,6 +2602,37 @@ pub(crate) fn validate_realtime_tts_model(variant: izwi_core::ModelVariant) -> R
     Ok(())
 }
 
+/// Show and store what the user said in a unified turn; returns it
+/// trimmed.
+async fn record_unified_transcript(
+    state: &AppState,
+    out_tx: &OutboundTx,
+    output_generation: u64,
+    commit: &PendingAudioCommit,
+    turn_record_id: &str,
+    text: String,
+) -> Result<String, String> {
+    let text = text.trim().to_string();
+    send_turn_json(
+        out_tx,
+        output_generation,
+        json!({
+            "type": "user_transcript_final",
+            "utterance_id": commit.utterance_id,
+            "utterance_seq": commit.utterance_seq,
+            "text": text.clone(),
+            "language": null,
+            "audio_duration_secs": null,
+        }),
+    );
+    state
+        .voice_store
+        .update_turn_transcript(turn_record_id.to_string(), text.clone(), None, None)
+        .await
+        .map_err(|err| format!("Voice storage error: {err}"))?;
+    Ok(text)
+}
+
 async fn build_unified_history(
     state: &AppState,
     voice_session_id: &str,
@@ -2726,6 +2764,7 @@ async fn stream_unified_s2s_to_socket(
     output_format: OutputAudioFormat,
     audio_bytes: &[u8],
     tools: Option<VoiceTurnTools<'_>>,
+    heard: tokio::sync::oneshot::Sender<String>,
     control: &TurnControl,
     output_generation: u64,
     model_leases: &SessionModelLeases,
@@ -2779,6 +2818,7 @@ async fn stream_unified_s2s_to_socket(
         definitions: registry.function_definitions(None),
         stream: Arc::new(Mutex::new(UnifiedReplyStream::default())),
         delivery_error: Arc::new(Mutex::new(None)),
+        heard: Mutex::new(Some(heard)),
         progress: Mutex::new(UnifiedProgress {
             messages: history_messages,
             reply: izwi_core::SpeechToSpeechGeneration {
@@ -2906,6 +2946,8 @@ struct UnifiedRounds<'a> {
     definitions: Vec<serde_json::Value>,
     stream: Arc<Mutex<UnifiedReplyStream>>,
     delivery_error: Arc<Mutex<Option<String>>>,
+    /// Where the first round sends the turn's transcript once it has it.
+    heard: Mutex<Option<tokio::sync::oneshot::Sender<String>>>,
     progress: Mutex<UnifiedProgress>,
 }
 
@@ -2959,6 +3001,11 @@ impl izwi_agent::ModelBackend for UnifiedRounds<'_> {
             voice: self.speaker.clone(),
             ..Default::default()
         };
+        let heard = self
+            .heard
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
         let permit = acquire_stage_permit(self.state).await.map_err(failed)?;
         let generation = self
             .state
@@ -2973,6 +3020,12 @@ impl izwi_agent::ModelBackend for UnifiedRounds<'_> {
                 Some(self.system_prompt),
                 Some(self.correlation_id),
                 permit.runtime_context(),
+                move |text: &str| {
+                    if let Some(heard) = heard {
+                        // The turn may have ended already; nobody listens.
+                        let _ = heard.send(text.to_string());
+                    }
+                },
                 unified_chunk_sink(
                     self.out_tx,
                     self.utterance_id,
@@ -4396,6 +4449,7 @@ mod tests {
                 })
             };
             let started = Instant::now();
+            let (heard_tx, heard_rx) = tokio::sync::oneshot::channel();
             let reply = {
                 let control = TurnControl::new(Instant::now());
                 let background = BackgroundResults::default();
@@ -4419,6 +4473,7 @@ mod tests {
                     OutputAudioFormat::parse(None).unwrap(),
                     &audio,
                     Some(turn_tools),
+                    heard_tx,
                     &control,
                     0,
                     &SessionModelLeases::default(),
@@ -4426,6 +4481,7 @@ mod tests {
                 .await
                 .expect("a turn with tools")
             };
+            assert_eq!(heard_rx.await.ok(), reply.input_transcription);
             out_tx.close();
             let (events, chunks) = reader.await.unwrap();
             let seconds = reply.samples.len() as f64 / f64::from(reply.sample_rate.max(1));

@@ -456,6 +456,38 @@ describe("VoicePage conversation", () => {
     expect(within(transcript).getByText("You")).toBeVisible();
   });
 
+  it("puts your words above the reply that started before them", async () => {
+    renderVoicePage(standardModels("downloaded"));
+    const socket = await startConversation();
+    const turn = { utterance_id: "utterance-1", turn_id: "turn-1" };
+
+    // The Compact engine's order: its reply starts while your words are
+    // still being transcribed.
+    await act(async () => {
+      socket.emit("session_started");
+      socket.emit("speech_started", turn);
+      socket.emit("assistant_text_started", turn);
+      socket.emit("assistant_text_partial", { ...turn, data: { text: "Alfama is" } });
+      socket.emit("transcript_final", {
+        ...turn,
+        data: { text: "Where should I stay?", revision: 1 },
+      });
+      socket.emit("assistant_text_final", {
+        ...turn,
+        data: { text: "Alfama is lovely." },
+      });
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Show transcript" }));
+    const transcript = screen.getByRole("complementary", { name: "Transcript" });
+    const lines = within(transcript)
+      .getAllByRole("listitem")
+      .map((item) => item.textContent ?? "");
+    const said = lines.findIndex((line) => line.includes("Where should I stay?"));
+    const reply = lines.findIndex((line) => line.includes("Alfama is lovely."));
+    expect(said).not.toBe(-1);
+    expect(said).toBeLessThan(reply);
+  });
+
   it("mutes the microphone and ends with Space", async () => {
     renderVoicePage(standardModels("downloaded"));
     await startConversation();

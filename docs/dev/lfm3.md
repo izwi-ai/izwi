@@ -232,7 +232,10 @@ one; CUDA follows the engine's tensor width.
 tools it may call; only LFM3-Audio accepts tools there. A continuation round
 passes the round so far in its messages (the spoken turn as an `<|audio|>` user
 turn, then the calls and their results) and `transcribe: false`, since the
-first round already transcribed the turn.
+first round already transcribed the turn. The turn's transcript is a row of its
+own beside the reply; `on_transcript` gets it as soon as that row finishes,
+and a voice session sends it then as `user_transcript_final` (and stores it),
+so the client can show it above a reply that is still streaming.
 
 On the server, a unified voice session on LFM3-Audio offers the built-in tools
 (`NoopTool` and `TimeTool`, shared with agent turns) when `builtin_tools` is

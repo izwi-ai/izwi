@@ -1611,6 +1611,7 @@ async fn run_unified(
             Some(&system),
             Some(&ctx.correlation_id),
             permit.runtime_context(),
+            |_: &str| {},
             on_chunk,
         )
         .await

@@ -738,6 +738,10 @@ async fn lfm3_audio_speaks_after_a_tool_round_if_env_set() {
         max_tokens: 400,
         ..Default::default()
     };
+    // The transcript arrives through `on_transcript` as well as in the
+    // result, and before the reply has finished streaming.
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(None::<(String, usize)>));
+    let chunks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let first = runtime
         .speech_to_speech_round_streaming_bytes(
             variant,
@@ -749,10 +753,29 @@ async fn lfm3_audio_speaks_after_a_tool_round_if_env_set() {
             None,
             None,
             RuntimeRequestContext::default(),
-            |_| std::future::ready(Ok(())),
+            {
+                let (heard, chunks) = (heard.clone(), chunks.clone());
+                move |text: &str| {
+                    let seen = chunks.load(std::sync::atomic::Ordering::SeqCst);
+                    *heard.lock().unwrap() = Some((text.to_string(), seen));
+                }
+            },
+            {
+                let chunks = chunks.clone();
+                move |_| {
+                    chunks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::future::ready(Ok(()))
+                }
+            },
         )
         .await
         .expect("the first round");
+    let (heard, chunks_before) = heard.lock().unwrap().clone().expect("a transcript");
+    eprintln!(
+        "{backend:?}: transcript after {chunks_before} of {} chunks",
+        chunks.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    assert_eq!(Some(heard), first.input_transcription);
     eprintln!(
         "{backend:?}: spoken tools round 0 heard {:?} -> {:?} ({:.2}s of speech)",
         first.input_transcription,
@@ -789,6 +812,7 @@ async fn lfm3_audio_speaks_after_a_tool_round_if_env_set() {
             None,
             None,
             RuntimeRequestContext::default(),
+            |_: &str| panic!("a continuation round does not transcribe"),
             |_| std::future::ready(Ok(())),
         )
         .await
