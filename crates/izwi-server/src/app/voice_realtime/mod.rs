@@ -520,6 +520,13 @@ struct InputStreamStartEvent {
     /// default.
     #[serde(default)]
     early_transcription: Option<bool>,
+    /// Pause the reply when the user seems to interrupt it, and play it on
+    /// if the sound turns out to be no speech (noise, a cough) or, in
+    /// modular mode, speech with no words. Off, any sustained speech
+    /// cancels the reply at once. The client must honour `turn_paused` and
+    /// `turn_resumed`.
+    #[serde(default)]
+    resume_false_interruptions: Option<bool>,
     #[serde(default)]
     barge_in_min_speech_ms: Option<u32>,
     /// Energy above the noise floor, in dB, a frame needs to start an
@@ -895,6 +902,11 @@ struct ConnectionState {
     background_results: BackgroundResults,
     /// A transcript started at a pause, for the turn that pause may begin.
     early_transcript: Option<EarlyTranscript>,
+    /// Whether speech over a reply pauses it until it is known to be an
+    /// interruption.
+    resume_false_interruptions: bool,
+    /// The reply paused that way, if any.
+    held_reply: HeldReply,
 }
 
 impl Default for ConnectionState {
@@ -920,6 +932,8 @@ impl Default for ConnectionState {
             function_calls: PendingFunctionCalls::default(),
             background_results: BackgroundResults::default(),
             early_transcript: None,
+            resume_false_interruptions: false,
+            held_reply: HeldReply::default(),
         }
     }
 }
@@ -960,6 +974,7 @@ impl ConnectionState {
         {
             self.active_turn = None;
         }
+        self.held_reply.release_finished();
     }
 
     fn has_running_turn(&self) -> bool {
@@ -967,6 +982,7 @@ impl ConnectionState {
             .as_ref()
             .map(|turn| !turn.task.is_finished())
             .unwrap_or(false)
+            || self.held_reply.is_running()
     }
 
     fn close_voice_session_if_idle(&mut self) -> Option<String> {
@@ -1027,6 +1043,8 @@ fn dispatch_utterance_outcome(
             )
         }
         UtteranceOutcome::Rejected(evt) => {
+            // The sound that paused a reply was no speech: it plays on.
+            conn.held_reply.resume(out_tx);
             state.runtime.record_voice_speech_rejected();
             send_json(
                 out_tx,
@@ -1053,6 +1071,26 @@ fn finalize_stream_vad_utterance(
     wav_bytes: Vec<u8>,
     end_reason: UtteranceEndReason,
 ) -> Result<(), String> {
+    // A modular turn that may resume the reply it spoke over decides once
+    // it has its transcript: the reply stays paused until then. Any other
+    // turn interrupts it now.
+    let decides_later = conn.resume_false_interruptions
+        && matches!(commit.turn_config, VoiceTurnConfig::Modular(_));
+    let paused_reply = if decides_later {
+        let running = conn
+            .active_turn
+            .take_if(|turn| !turn.task.is_finished() || turn.control.is_speaking());
+        conn.held_reply.pause(out_tx, running, "barge_in");
+        conn.held_reply
+            .holds_turn()
+            .then(|| conn.held_reply.clone())
+    } else {
+        if conn.held_reply.interrupt(out_tx, "barge_in") {
+            state.runtime.record_voice_interruption();
+            state.runtime.record_voice_barge_in();
+        }
+        None
+    };
     if interrupt_active_turn(out_tx, &mut conn.active_turn, "preempted_by_new_turn") {
         state.runtime.record_voice_interruption();
         conn.voice_session.interrupt("preempted_by_new_turn");
@@ -1108,6 +1146,7 @@ fn finalize_stream_vad_utterance(
                 .take()
                 .filter(|early| early.utterance_seq == commit.utterance_seq)
                 .map(|early| early.task),
+            paused_reply,
         },
         record,
         wav_bytes,
@@ -1264,6 +1303,9 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
         }
     }
 
+    if conn.held_reply.interrupt(&out_tx, "socket_closed") {
+        state.runtime.record_voice_interruption();
+    }
     if interrupt_active_turn(&out_tx, &mut conn.active_turn, "socket_closed") {
         state.runtime.record_voice_interruption();
     }
@@ -1355,6 +1397,7 @@ async fn handle_text_message(
                 adaptive_silence,
                 adaptive_silence_floor_ms,
                 early_transcription,
+                resume_false_interruptions,
                 barge_in_min_speech_ms,
                 vad_snr_margin_db,
                 input_sample_rate,
@@ -1555,6 +1598,7 @@ async fn handle_text_message(
                     && mode == RealtimeVoiceMode::Modular,
             }));
             conn.voice_session.begin_listening();
+            conn.resume_false_interruptions = resume_false_interruptions.unwrap_or(false);
 
             let mut ready = json!({
                 "type": "input_stream_ready",
@@ -1570,6 +1614,9 @@ async fn handle_text_message(
                     "barge_in_min_speech_ms": conn.streaming_input.as_ref().map(|s| s.config.barge_in_min_speech_ms),
                 }
             });
+            if conn.resume_false_interruptions {
+                ready["resume_false_interruptions"] = json!(true);
+            }
             if let Some(floor_ms) = conn
                 .streaming_input
                 .as_ref()
@@ -1607,6 +1654,9 @@ async fn handle_text_message(
         }
         ClientEvent::Interrupt { reason } => {
             let reason = reason.unwrap_or_else(|| "client_interrupt".to_string());
+            if conn.held_reply.interrupt(out_tx, &reason) {
+                state.runtime.record_voice_interruption();
+            }
             if interrupt_active_turn(out_tx, &mut conn.active_turn, &reason) {
                 state.runtime.record_voice_interruption();
                 conn.voice_session.interrupt(reason);
@@ -1628,6 +1678,7 @@ async fn handle_text_message(
                 .as_ref()
                 .filter(|turn| turn.utterance_seq == utterance_seq)
                 .map(|turn| turn.control.clone())
+                .or_else(|| conn.held_reply.control_of(utterance_seq))
                 .or_else(|| conn.conversation.reply_of(utterance_seq))
                 .ok_or_else(|| {
                     format!("No assistant reply of utterance {utterance_seq} to truncate")
@@ -1712,11 +1763,28 @@ async fn handle_binary_message(
         );
     }
 
-    if frame_result.barge_in {
+    // With `resume_false_interruptions` sustained speech only pauses the
+    // reply: whether it was an interruption is known when the utterance
+    // ends (and, in modular mode, has been transcribed).
+    if frame_result.barge_in && conn.resume_false_interruptions {
+        let running = conn
+            .active_turn
+            .take_if(|turn| !turn.task.is_finished() || turn.control.is_speaking());
+        if conn.held_reply.pause(out_tx, running, "barge_in") {
+            if let Some(started) = conn.speech_started_at {
+                state
+                    .runtime
+                    .record_voice_latency(VoiceLatency::BargeIn, started.elapsed());
+            }
+        }
+    } else if frame_result.barge_in {
         // A finished reply may still be playing on the client.
         conn.conversation.interrupt_playback();
     }
-    if frame_result.barge_in && interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in") {
+    if frame_result.barge_in
+        && !conn.resume_false_interruptions
+        && interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in")
+    {
         state.runtime.record_voice_interruption();
         state.runtime.record_voice_barge_in();
         if let Some(started) = conn.speech_started_at {
@@ -1771,6 +1839,9 @@ struct TurnContext {
     /// The results of background tools, for the next turn to tell.
     background_results: BackgroundResults,
     early_transcript: Option<EarlyTranscriptTask>,
+    /// The reply this turn's speech paused; the turn resumes or interrupts
+    /// it once it knows whether the speech had words.
+    paused_reply: Option<HeldReply>,
 }
 
 type EarlyTranscriptTask = AbortOnDropTask<Result<izwi_core::AsrTranscription, String>>;
@@ -1846,6 +1917,7 @@ fn spawn_turn_task(
             function_calls,
             background_results,
             early_transcript,
+            paused_reply,
         } = context;
         let timeout_secs = state.request_timeout_secs.max(1);
         let timeout = Duration::from_secs(timeout_secs);
@@ -1975,6 +2047,16 @@ fn spawn_turn_task(
                     );
 
                     let user_text = transcript.text.trim().to_string();
+                    // Speech with words interrupts the reply it paused;
+                    // a sound with none lets it play on.
+                    if let Some(paused) = paused_reply.as_ref() {
+                        if user_text.is_empty() {
+                            paused.resume(&out_tx);
+                        } else if paused.interrupt(&out_tx, "barge_in") {
+                            state.runtime.record_voice_interruption();
+                            state.runtime.record_voice_barge_in();
+                        }
+                    }
                     send_turn_json(
                         &out_tx,
                         output_generation,
@@ -3062,6 +3144,130 @@ fn unified_chunk_sink(
     }
 }
 
+/// A reply that speech may have interrupted: paused on the client, still
+/// generating here, until the speech proves to be an interruption (the
+/// reply is cancelled) or not (it plays on). The connection and the turn
+/// that transcribes the speech share it.
+#[derive(Clone, Default)]
+pub(crate) struct HeldReply {
+    state: Arc<Mutex<HeldReplyState>>,
+}
+
+#[derive(Default)]
+struct HeldReplyState {
+    turn: Option<ActiveTurn>,
+    paused: bool,
+}
+
+impl HeldReply {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HeldReplyState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Whether a reply is held, paused or playing on.
+    fn holds_turn(&self) -> bool {
+        self.lock().turn.is_some()
+    }
+
+    fn is_running(&self) -> bool {
+        self.lock()
+            .turn
+            .as_ref()
+            .is_some_and(|turn| !turn.task.is_finished())
+    }
+
+    fn control_of(&self, utterance_seq: u64) -> Option<TurnControl> {
+        self.lock()
+            .turn
+            .as_ref()
+            .filter(|turn| turn.utterance_seq == utterance_seq)
+            .map(|turn| turn.control.clone())
+    }
+
+    /// Pause `turn`'s reply (or the one already held) and tell the client.
+    fn pause(&self, out_tx: &OutboundTx, turn: Option<ActiveTurn>, reason: &str) -> bool {
+        let mut state = self.lock();
+        if let Some(turn) = turn {
+            // A reply held before this one has had its say.
+            if let Some(earlier) = state.turn.replace(turn) {
+                drop(state);
+                interrupt_active_turn(out_tx, &mut Some(earlier), "preempted_by_new_turn");
+                state = self.lock();
+            }
+            state.paused = false;
+        }
+        let Some(turn) = state.turn.as_ref() else {
+            return false;
+        };
+        if state.paused {
+            return false;
+        }
+        turn.control.pause_playback();
+        send_json(
+            out_tx,
+            json!({
+                "type": "turn_paused",
+                "utterance_id": turn.utterance_id,
+                "utterance_seq": turn.utterance_seq,
+                "reason": reason,
+            }),
+        );
+        state.paused = true;
+        true
+    }
+
+    /// The speech was no interruption: the reply plays on. It stays held,
+    /// so a later interruption still finds it.
+    pub(crate) fn resume(&self, out_tx: &OutboundTx) -> bool {
+        let mut state = self.lock();
+        if !state.paused {
+            return false;
+        }
+        state.paused = false;
+        let Some(turn) = state.turn.as_ref() else {
+            return false;
+        };
+        turn.control.resume_playback();
+        send_json(
+            out_tx,
+            json!({
+                "type": "turn_resumed",
+                "utterance_id": turn.utterance_id,
+                "utterance_seq": turn.utterance_seq,
+            }),
+        );
+        true
+    }
+
+    /// The speech was an interruption: cancel the held reply. Returns
+    /// whether a running turn was interrupted.
+    pub(crate) fn interrupt(&self, out_tx: &OutboundTx, reason: &str) -> bool {
+        let turn = {
+            let mut state = self.lock();
+            state.paused = false;
+            state.turn.take()
+        };
+        let mut turn = turn;
+        interrupt_active_turn(out_tx, &mut turn, reason)
+    }
+
+    /// Give back a reply that has finished and is not paused: nothing more
+    /// can interrupt its generation, and its playback is the client's.
+    fn release_finished(&self) {
+        let mut state = self.lock();
+        if !state.paused
+            && state
+                .turn
+                .as_ref()
+                .is_some_and(|turn| turn.task.is_finished())
+        {
+            state.turn = None;
+        }
+    }
+}
+
 /// Interrupt the active turn without waiting for it (SPK-F19): its output
 /// is cut off and the interruption announced at once, and a background
 /// reaper gives the task [`TURN_CANCELLATION_TIMEOUT`] to stop on its own,
@@ -3653,6 +3859,8 @@ fn map_typed_voice_event(
                 .map(serde_json::Value::to_string)
                 .unwrap_or_default(),
         },
+        "turn_paused" => RealtimeServerEvent::TurnPaused,
+        "turn_resumed" => RealtimeServerEvent::TurnResumed,
         "turn_interrupted" => RealtimeServerEvent::Interruption {
             reason: match value
                 .get("reason")
@@ -4263,6 +4471,128 @@ mod tests {
         assert_eq!(events[0]["reason"], "barge_in");
     }
 
+    /// A paused client's playback stands still: audio sent meanwhile queues
+    /// behind what it holds, and it plays on from where it stopped.
+    #[test]
+    fn a_paused_playback_clock_stands_still() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        let mut clock = PlaybackClock::default();
+        clock.sent(start, ms(2_000));
+        clock.pause(start + ms(500));
+        assert_eq!(clock.played(start + ms(500)), ms(500));
+        // Time passes and more audio arrives; nothing more is played.
+        assert!(!clock.sent(start + ms(900), ms(1_000)));
+        assert_eq!(clock.played(start + ms(5_000)), ms(500));
+        clock.pause(start + ms(6_000));
+        assert_eq!(
+            clock.played(start + ms(6_000)),
+            ms(500),
+            "pausing twice changes nothing"
+        );
+        clock.resume(start + ms(6_000));
+        assert_eq!(clock.played(start + ms(6_400)), ms(900));
+        assert_eq!(clock.played(start + ms(20_000)), ms(3_000));
+        clock.resume(start + ms(21_000));
+        assert_eq!(clock.played(start + ms(21_000)), ms(3_000));
+    }
+
+    fn running_turn(state: &AppState, utterance_seq: u64) -> ActiveTurn {
+        ActiveTurn {
+            utterance_id: format!("utt-{utterance_seq}"),
+            utterance_seq,
+            turn_record_id: format!("turn-{utterance_seq}"),
+            state: state.clone(),
+            conversation: Arc::default(),
+            task: tokio::spawn(tokio::time::sleep(Duration::from_secs(30))),
+            control: TurnControl::new(Instant::now()),
+            output_generation: utterance_seq,
+        }
+    }
+
+    /// A held reply is paused once, plays on when the sound was no
+    /// interruption, and stays held so that a real one still cancels it.
+    #[tokio::test]
+    async fn a_held_reply_is_paused_then_resumed_or_interrupted() {
+        let (_dir, state) = test_app_state(1);
+        let out_tx = OutboundTx::new(state.runtime.clone(), "voice test");
+        let types = |events: Vec<serde_json::Value>| -> Vec<String> {
+            events
+                .iter()
+                .map(|event| event["type"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        let held = HeldReply::default();
+        assert!(!held.pause(&out_tx, None, "barge_in"), "nothing to pause");
+        assert!(!held.resume(&out_tx));
+
+        let turn = running_turn(&state, 1);
+        let control = turn.control.clone();
+        control.audio_sent(&state.runtime, Duration::from_secs(4));
+        {
+            let mut reply = control.reply();
+            reply.ledger.begin_segment("One two three four.");
+            reply.ledger.audio_sent(4_000.0);
+        }
+        assert!(held.pause(&out_tx, Some(turn), "barge_in"));
+        assert!(!held.pause(&out_tx, None, "barge_in"), "already paused");
+        assert!(held.is_running() && held.holds_turn());
+        assert!(held.control_of(1).is_some() && held.control_of(2).is_none());
+        assert!(!control.is_cancelled(), "a paused reply keeps generating");
+
+        assert!(held.resume(&out_tx));
+        assert!(!held.resume(&out_tx));
+        assert!(
+            held.holds_turn(),
+            "a resumed reply can still be interrupted"
+        );
+
+        // Speech with words: paused again, then cancelled where it stood.
+        assert!(held.pause(&out_tx, None, "barge_in"));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(held.interrupt(&out_tx, "barge_in"));
+        assert!(control.is_cancelled());
+        assert!(!held.holds_turn());
+        let heard_ms = control.reply().heard_ms.expect("heard up to the pause");
+        assert!(
+            heard_ms < 50.0,
+            "playback stood still while paused: {heard_ms} ms"
+        );
+        assert!(
+            !held.interrupt(&out_tx, "barge_in"),
+            "nothing left to interrupt"
+        );
+
+        // A newer reply replaces a held one, which is then over.
+        let first = running_turn(&state, 2);
+        let first_control = first.control.clone();
+        assert!(held.pause(&out_tx, Some(first), "barge_in"));
+        assert!(held.pause(&out_tx, Some(running_turn(&state, 3)), "barge_in"));
+        assert!(first_control.is_cancelled());
+        assert!(held.control_of(3).is_some());
+        held.interrupt(&out_tx, "socket_closed");
+
+        assert_eq!(
+            types(drain_text(&out_tx).await),
+            [
+                // Paused, played on, paused again and interrupted.
+                "turn_paused",
+                "turn_resumed",
+                "turn_paused",
+                "turn_interrupted",
+                "turn_done",
+                // A held reply gives way to a newer one.
+                "turn_paused",
+                "turn_interrupted",
+                "turn_done",
+                "turn_paused",
+                // The socket closes.
+                "turn_interrupted",
+                "turn_done",
+            ]
+        );
+    }
+
     /// SPK-F21: starting an input stream loads and leases its models in the
     /// background and reports their readiness, before any turn.
     #[tokio::test]
@@ -4404,6 +4734,7 @@ mod tests {
         *interrupted.inner.playback.lock().expect("playback") = PlaybackClock {
             playing_until: Some(Instant::now() + Duration::from_millis(1_000)),
             sent: Duration::from_millis(3_000),
+            paused_with: None,
         };
         conversation.hold(2, interrupted);
         conversation.interrupt_playback();

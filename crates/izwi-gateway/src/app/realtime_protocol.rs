@@ -300,6 +300,11 @@ pub enum RealtimeServerEvent {
         name: String,
         result: String,
     },
+    /// Speech may have interrupted the turn's reply: stop playing it but
+    /// keep what is queued.
+    TurnPaused,
+    /// It was no interruption: play the reply on.
+    TurnResumed,
     Interruption {
         reason: RealtimeInterruptionReason,
         cutoff_event_id: u64,

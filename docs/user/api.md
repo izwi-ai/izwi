@@ -2253,6 +2253,7 @@ Client JSON messages:
 | `max_utterance_ms` | Hard utterance duration cap. |
 | `pre_roll_ms` | Audio retained before speech start. |
 | `barge_in_min_speech_ms` | Voiced speech, default `300`, that interrupts a speaking assistant. A shorter sound (a cough, a door, speaker echo) does not interrupt it. `0` interrupts on the first speech frame. |
+| `resume_false_interruptions` | `true` makes speech over a reply pause it instead of cancelling it. After `barge_in_min_speech_ms` of speech the server sends `turn_paused`: the client stops playing but keeps what it has queued, and the reply keeps generating. If the sound is then rejected as no speech, or in modular mode transcribes to no words, the server sends `turn_resumed` and the client plays on. Otherwise the reply is interrupted as usual (`turn_interrupted`), heard up to where it was paused: in modular mode once the utterance has been transcribed, in unified mode when the utterance ends. A client that does not honour the two events must leave this off. Default `false`; `input_stream_ready` reports it when on. |
 | `input_sample_rate` | Expected input sample rate. |
 | `tools` | Modular mode with a chat model that calls tools (Qwen3, Qwen3.5, LFM2.5, LFM3), or unified mode on LFM3-Audio: OpenAI function tools (`{"type": "function", "function": {"name", "description", "parameters"}}`, or the Responses form with the fields on the tool) the reply may call. The client runs them: it gets `function_call` and answers with `function_call_output`. A name must be letters, digits, `_` or `-`, unique, and not a built-in tool's. At most 64. A tool with `"background": true` does not hold the reply: the call is reported with status `started`, the reply tells the user it is under way, and the output the client sends within 120 s is told in the next turn. |
 | `builtin_tools` | With a model that calls tools: whether the reply may also call the server's built-in tools (today `time`, the local date and time). Default `true` on LFM3-Audio and `false` in modular mode, where offering any tool lengthens every turn's prompt (about 2 s more to the first audio on an M1 Pro with Qwen3.5-4B). |
@@ -2315,6 +2316,13 @@ How a modular turn runs:
 - Each stage (ASR, the reply, each TTS segment) takes its own request admission slot, so a turn holds none while it waits.
 - Assistant audio is paced by the client: when more than about 5 s (or 4 MiB) of audio is queued, synthesis waits for the client to take it rather than closing the session. A client that stops reading for 5 s ends the session.
 - The prompt carries the most recent history (24 messages, about 3000 tokens). In a modular session, once older messages no longer fit, the chat model writes short notes on them in the background (again after every 6 more) and the prompt carries those notes; they last for the connection. A reply is remembered without reasoning, and only as far as it was heard: up to `conversation_item_truncate`'s `audio_end_ms`, or up to the client's estimated playback position when the user interrupted it.
+
+Events of a session with `resume_false_interruptions`:
+
+| Event | Fields |
+|-------|--------|
+| `turn_paused` | `utterance_id`, `utterance_seq` of the reply, `reason` (`barge_in`). Stop playing; keep the queue. |
+| `turn_resumed` | `utterance_id`, `utterance_seq` of the reply. Play on from where playback stopped. |
 
 Events of a session with `agents`:
 

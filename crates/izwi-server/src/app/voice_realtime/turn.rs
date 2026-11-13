@@ -149,6 +149,24 @@ impl TurnControl {
         }
     }
 
+    /// The client stopped playing for now, keeping what it has queued.
+    pub(crate) fn pause_playback(&self) {
+        self.inner
+            .playback
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .pause(Instant::now());
+    }
+
+    /// The client plays on from where it paused.
+    pub(crate) fn resume_playback(&self) {
+        self.inner
+            .playback
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .resume(Instant::now());
+    }
+
     /// The client says it played `audio_end_ms` of the reply; returns the
     /// text that covers.
     pub(crate) fn truncate(&self, audio_end_ms: u64) -> String {
@@ -231,12 +249,20 @@ impl TurnControl {
 pub(crate) struct PlaybackClock {
     pub(crate) playing_until: Option<Instant>,
     pub(crate) sent: Duration,
+    /// While the client is paused: the audio it holds unplayed.
+    pub(crate) paused_with: Option<Duration>,
 }
 
 impl PlaybackClock {
     /// Account for `duration` of audio sent at `now`; returns whether the
     /// audio sent before it had already finished playing (an underrun).
     pub(crate) fn sent(&mut self, now: Instant, duration: Duration) -> bool {
+        // A paused client queues what arrives behind what it holds.
+        if let Some(queued) = self.paused_with.as_mut() {
+            *queued += duration;
+            self.sent += duration;
+            return false;
+        }
         let underrun = self
             .playing_until
             .is_some_and(|until| now > until + PLAYBACK_UNDERRUN_TOLERANCE);
@@ -251,9 +277,27 @@ impl PlaybackClock {
 
     /// How much of the audio sent has played by `now`.
     pub(crate) fn played(&self, now: Instant) -> Duration {
-        let queued = self
-            .playing_until
-            .map_or(Duration::ZERO, |until| until.saturating_duration_since(now));
+        let queued = self.paused_with.unwrap_or_else(|| {
+            self.playing_until
+                .map_or(Duration::ZERO, |until| until.saturating_duration_since(now))
+        });
         self.sent.saturating_sub(queued)
+    }
+
+    /// The client stops playing at `now` and keeps its queue.
+    pub(crate) fn pause(&mut self, now: Instant) {
+        if self.paused_with.is_none() {
+            self.paused_with = Some(
+                self.playing_until
+                    .map_or(Duration::ZERO, |until| until.saturating_duration_since(now)),
+            );
+        }
+    }
+
+    /// The client plays its queue on from `now`.
+    pub(crate) fn resume(&mut self, now: Instant) {
+        if let Some(queued) = self.paused_with.take() {
+            self.playing_until = Some(now + queued);
+        }
     }
 }
