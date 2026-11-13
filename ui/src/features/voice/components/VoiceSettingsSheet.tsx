@@ -20,8 +20,15 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { useReadAloud } from "@/features/chat/hooks/useReadAloud";
 import {
+  AgentsView,
+  ConversationFlowSection,
+  ToolsAndAgentsSection,
+  ToolsView,
+} from "@/features/voice/components/VoiceAgentSettings";
+import {
   VOICE_ENGINES,
   compactVoiceModels,
+  voiceEngineCallsTools,
   voiceEngineChoosesItsOwnVoice,
   voiceEngineModels,
   voiceEngineSpeakerVariant,
@@ -42,7 +49,7 @@ import type {
 import { cn } from "@/lib/utils";
 import type { SpeakerProfile } from "@/types";
 
-export type VoiceSettingsView = "main" | "memories" | "engine";
+export type VoiceSettingsView = "main" | "memories" | "engine" | "tools" | "agents";
 
 const VISIBLE_VOICES = 5;
 const PROMPT_SAVE_DELAY_MS = 800;
@@ -79,7 +86,15 @@ export function VoiceSettingsSheet(props: VoiceSettingsSheetProps) {
     main: "Voice settings",
     memories: "Memories",
     engine: "Engine",
+    tools: "Tools",
+    agents: "Agents",
   };
+  const agentSettings = {
+    settings: props.preferences.agentSettings,
+    onChange: props.preferences.updateAgentSettings,
+    mode: props.preferences.engine === "compact" ? "unified" : "modular",
+    callsTools: voiceEngineCallsTools(props.preferences.engine, props.compactModel),
+  } as const;
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -119,6 +134,8 @@ export function VoiceSettingsSheet(props: VoiceSettingsSheetProps) {
         {view === "main" && <MainView {...props} />}
         {view === "memories" && <MemoriesView preferences={props.preferences} />}
         {view === "engine" && <EngineView {...props} />}
+        {view === "tools" && <ToolsView {...agentSettings} />}
+        {view === "agents" && <AgentsView {...agentSettings} />}
       </SheetContent>
     </Sheet>
   );
@@ -367,6 +384,22 @@ function MainView({
           </span>
         </button>
       </section>
+
+      <ToolsAndAgentsSection
+        settings={preferences.agentSettings}
+        onChange={preferences.updateAgentSettings}
+        mode={preferences.engine === "compact" ? "unified" : "modular"}
+        callsTools={voiceEngineCallsTools(preferences.engine, compactModel)}
+        onOpenTools={() => onViewChange("tools")}
+        onOpenAgents={() => onViewChange("agents")}
+      />
+
+      <ConversationFlowSection
+        settings={preferences.agentSettings}
+        onChange={preferences.updateAgentSettings}
+        mode={preferences.engine === "compact" ? "unified" : "modular"}
+        callsTools={voiceEngineCallsTools(preferences.engine, compactModel)}
+      />
 
       <section className="flex flex-col">
         <h3 className={sectionTitle}>Engine</h3>

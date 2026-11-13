@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { api, type VoiceObservation } from "@/api";
+import {
+  parseVoiceAgentSettings,
+  type VoiceAgentSettings,
+} from "@/features/voice/agentSettings";
 import { VOICE_AGENT_SYSTEM_PROMPT } from "@/features/voice/realtime/support";
 
 /** Standard runs separate ASR, chat and TTS models; Compact one audio model. */
@@ -9,6 +13,7 @@ export type VoiceEngineId = "standard" | "compact";
 const ENGINE_STORAGE_KEY = "izwi.voice.engine";
 const COMPACT_MODEL_STORAGE_KEY = "izwi.voice.compactModel";
 const SPEAKER_STORAGE_KEY = "izwi.voice.speaker";
+const AGENT_SETTINGS_STORAGE_KEY = "izwi.voice.agent";
 
 function readStored(key: string): string | null {
   try {
@@ -30,8 +35,9 @@ export type PromptSaveState = "idle" | "saving" | "saved" | "error";
 
 /**
  * What the user chose for voice conversations: the engine, the Compact
- * engine's model and the voice are remembered on this device; the
- * instructions and memory setting live in the server's voice profile.
+ * engine's model, the voice and the agent settings (tools, agents, turn
+ * taking) are remembered on this device; the instructions and memory
+ * setting live in the server's voice profile.
  */
 export function useVoicePreferences(onError?: (message: string) => void) {
   const [engine, setEngineState] = useState<VoiceEngineId>(() =>
@@ -43,6 +49,10 @@ export function useVoicePreferences(onError?: (message: string) => void) {
   );
   const [speaker, setSpeakerState] = useState<string | null>(() =>
     readStored(SPEAKER_STORAGE_KEY),
+  );
+
+  const [agentSettings, setAgentSettings] = useState<VoiceAgentSettings>(() =>
+    parseVoiceAgentSettings(readStored(AGENT_SETTINGS_STORAGE_KEY)),
   );
 
   const [savedPrompt, setSavedPrompt] = useState(VOICE_AGENT_SYSTEM_PROMPT);
@@ -103,6 +113,17 @@ export function useVoicePreferences(onError?: (message: string) => void) {
     setSpeakerState(next);
     writeStored(SPEAKER_STORAGE_KEY, next);
   }, []);
+
+  const updateAgentSettings = useCallback(
+    (change: Partial<VoiceAgentSettings>) => {
+      setAgentSettings((current) => {
+        const next = { ...current, ...change };
+        writeStored(AGENT_SETTINGS_STORAGE_KEY, JSON.stringify(next));
+        return next;
+      });
+    },
+    [],
+  );
 
   /** Save the instructions; an empty text restores the default. */
   const savePrompt = useCallback(
@@ -185,6 +206,8 @@ export function useVoicePreferences(onError?: (message: string) => void) {
       setCompactModel,
       speaker,
       setSpeaker,
+      agentSettings,
+      updateAgentSettings,
       savedPrompt,
       defaultPrompt,
       isPromptCustom: savedPrompt.trim() !== defaultPrompt.trim(),
@@ -200,6 +223,7 @@ export function useVoicePreferences(onError?: (message: string) => void) {
       forgetAllMemories,
     }),
     [
+      agentSettings,
       compactModel,
       defaultPrompt,
       engine,
@@ -218,6 +242,7 @@ export function useVoicePreferences(onError?: (message: string) => void) {
       setMemoryEnabled,
       setSpeaker,
       speaker,
+      updateAgentSettings,
     ],
   );
 }

@@ -122,6 +122,15 @@ export function voiceSessionEngine(
       };
 }
 
+/** Whether the engine's model can call tools: the standard engine's chat
+ * model does, and of the compact models LFM3 Audio does. */
+export function voiceEngineCallsTools(
+  engine: VoiceEngineId,
+  compactModel: string = COMPACT_VOICE_MODEL,
+): boolean {
+  return engine === "standard" || isLfm3AudioVariant(compactModel);
+}
+
 /** The model whose built-in voices the assistant speaks with. */
 export function voiceEngineSpeakerVariant(
   engine: VoiceEngineId,
