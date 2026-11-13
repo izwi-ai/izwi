@@ -3032,6 +3032,17 @@ fn binds_mixed_step(request: &EngineCoreRequest) -> bool {
     })
 }
 
+/// Whether the request's chat model shares committed prefixes at a declared
+/// history boundary. A shared prefix attaches only to a prompt that resumes
+/// above it, so such a prompt prefills in resumable spans whatever the
+/// engine's chunked prefill switch says.
+fn shares_history_prefixes(request: &EngineCoreRequest) -> bool {
+    request.task_type == super::types::TaskType::Chat
+        && request
+            .prepared_chat_model_for_executor()
+            .is_ok_and(|model| model.shares_history_prefixes())
+}
+
 /// `IZWI_MIXED_FORCE_SPLIT=1` runs mixed physical batches through the split
 /// prefill and decode handlers: the parity oracle for a family's mixed
 /// forward, and a production kill switch.
@@ -3616,7 +3627,10 @@ impl ModelExecutor for NativeExecutor {
             // resumable prefill safe point. Unsupported families remain full.
             let spans_required = variant.family().requires_prefill_spans();
             profile.prefill = resolved_resumable_prefill_mode(
-                self.config.enable_chunked_prefill || binds_mixed_step(request) || spans_required,
+                self.config.enable_chunked_prefill
+                    || binds_mixed_step(request)
+                    || spans_required
+                    || shares_history_prefixes(request),
                 resumable_prefill_proof,
             );
             profile.prefill_spans_required = spans_required;

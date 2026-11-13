@@ -180,9 +180,21 @@ impl ModelFamily {
                 PrefixReuseEvidenceLevel::ContractDeclared,
                 "LM contract declares committed pages; no lane parity evidence yet",
             ),
-            Self::Qwen35Chat => excluded(
-                "hybrid linear-attention/conv reuse is not proven (DS1.1 scope); contract keeps hybrid domains Disabled",
-            ),
+            // Hybrid Qwen3.5 shares committed pages and DeltaNet/convolution
+            // snapshots at the prepared prompt's history boundary, as
+            // Qwen3.6-MoE does, so each round of a tool-calling turn and each
+            // turn of a conversation attaches at the history before it. A
+            // prompt with images shares nothing. No CUDA run yet.
+            Self::Qwen35Chat => match backend {
+                BackendKind::Cpu | BackendKind::Metal => supported(
+                    PrefixReuseEvidenceLevel::FixtureSuite,
+                    "qwen35 fixture attach tests (attached_prefill_matches_the_fresh_run_on_cpu / _on_metal): the attached session starts from the published snapshot bit for bit and generates the fresh run's tokens; the CPU state is bit-identical",
+                ),
+                BackendKind::Cuda => not_enabled(
+                    PrefixReuseEvidenceLevel::ContractDeclared,
+                    "the contract declares committed pages and hybrid snapshots; no CUDA GPU run yet",
+                ),
+            },
             // Phase 5a: hybrid qwen3.6-MoE shares committed pages and DeltaNet
             // snapshots at the prepared prompt's declared history boundary, so
             // each chat turn attaches at the previous turn's history. The CPU
@@ -364,13 +376,22 @@ mod tests {
 
     #[test]
     fn hybrid_unproven_families_stay_excluded() {
-        for variant in [ModelVariant::Qwen3508BGguf, ModelVariant::FishAudioDrama3] {
-            for backend in ALL_BACKENDS {
-                let cell = variant.prefix_reuse_support(backend);
-                assert!(!cell.engages(), "{variant:?} must stay off on {backend:?}");
-                assert_eq!(cell.evidence, PrefixReuseEvidenceLevel::Excluded);
-            }
+        for backend in ALL_BACKENDS {
+            let cell = ModelVariant::FishAudioDrama3.prefix_reuse_support(backend);
+            assert!(!cell.engages(), "Drama 3 must stay off on {backend:?}");
+            assert_eq!(cell.evidence, PrefixReuseEvidenceLevel::Excluded);
         }
+    }
+
+    #[test]
+    fn qwen35_shares_prefixes_where_its_attach_test_ran() {
+        let variant = ModelVariant::Qwen354BGguf;
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            let cell = variant.prefix_reuse_support(backend);
+            assert!(cell.engages(), "{backend:?}");
+            assert_eq!(cell.evidence, PrefixReuseEvidenceLevel::FixtureSuite);
+        }
+        assert!(!variant.prefix_reuse_support(BackendKind::Cuda).engages());
     }
 
     #[test]

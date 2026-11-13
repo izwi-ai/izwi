@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -126,6 +127,11 @@ pub struct Qwen35PreparedPrompt {
     prompt_positions: Vec<[usize; 3]>,
     next_text_position: usize,
     vision_inputs: Option<PreparedVisionInputs>,
+    /// Tokens of the stable history: everything before the final assistant
+    /// generation header, which the next round or turn of the conversation
+    /// shares. `None` for a prompt with images: an image placeholder's token
+    /// says nothing of the image behind it.
+    history_boundary: Option<usize>,
 }
 
 impl Qwen35PreparedPrompt {
@@ -133,9 +139,26 @@ impl Qwen35PreparedPrompt {
         &self.prompt_ids
     }
 
+    pub(crate) fn history_boundary(&self) -> Option<usize> {
+        self.history_boundary
+    }
+
     pub(crate) fn prompt_positions(&self) -> &[[usize; 3]] {
         &self.prompt_positions
     }
+}
+
+/// Tokens of a rendered prompt's stable history: everything before its final
+/// `<|im_start|>`, the assistant generation header every render ends with.
+/// A later round or turn of the conversation renders exactly these tokens
+/// again (the template strips past reasoning, so nothing after them is
+/// shared), and `<|im_start|>` is a special token, so the encoding splits
+/// there and the prefix is a token boundary.
+fn history_boundary(prompt_ids: &[u32], im_start: u32) -> Option<usize> {
+    prompt_ids
+        .iter()
+        .rposition(|id| *id == im_start)
+        .filter(|boundary| *boundary > 0)
 }
 
 fn resolve_prepared_prompt<F>(
@@ -714,6 +737,49 @@ pub(crate) struct Qwen35ChatExec {
     pub(crate) tokenizer: Qwen35Tokenizer,
     pub(crate) text_config: Qwen35TextConfig,
     pub(crate) text_model: Qwen35TextModel,
+    /// Whether requests share committed prefixes: the contract declares
+    /// shareable domains and prefill may start at an attached cursor.
+    pub(crate) prefix_caching: bool,
+    pub(crate) prefix_reuse: PrefixReuseCounters,
+}
+
+/// How many prefills started at an attached prefix, and how many prompt
+/// tokens they reused or computed, for the model's diagnostics.
+#[derive(Debug, Default)]
+pub(crate) struct PrefixReuseCounters {
+    attached_prefills: AtomicU64,
+    fresh_prefills: AtomicU64,
+    reused_prompt_tokens: AtomicU64,
+    computed_prompt_tokens: AtomicU64,
+}
+
+impl PrefixReuseCounters {
+    fn record_prefill(&self, start: usize, prompt_tokens: usize) {
+        let counter = if start > 0 {
+            &self.attached_prefills
+        } else {
+            &self.fresh_prefills
+        };
+        counter.fetch_add(1, AtomicOrdering::Relaxed);
+        self.reused_prompt_tokens
+            .fetch_add(start as u64, AtomicOrdering::Relaxed);
+        self.computed_prompt_tokens.fetch_add(
+            prompt_tokens.saturating_sub(start) as u64,
+            AtomicOrdering::Relaxed,
+        );
+    }
+
+    fn summary(&self, engaged: bool) -> serde_json::Value {
+        let load = |counter: &AtomicU64| counter.load(AtomicOrdering::Relaxed);
+        serde_json::json!({
+            "engaged": engaged,
+            "history_boundary": "before the prompt's final <|im_start|> (the assistant generation header)",
+            "attached_prefills": load(&self.attached_prefills),
+            "fresh_prefills": load(&self.fresh_prefills),
+            "reused_prompt_tokens": load(&self.reused_prompt_tokens),
+            "computed_prompt_tokens": load(&self.computed_prompt_tokens),
+        })
+    }
 }
 
 pub struct Qwen35ChatModel {
@@ -749,7 +815,12 @@ impl Qwen35ChatExec {
         attention_dtype: DType,
         preferred_page_tokens: usize,
     ) -> Result<InferenceStateContract> {
-        qwen35_composite_cache_contract(&self.text_config, attention_dtype, preferred_page_tokens)
+        qwen35_composite_cache_contract(
+            &self.text_config,
+            attention_dtype,
+            preferred_page_tokens,
+            self.prefix_caching,
+        )
     }
 
     pub(crate) fn chat_template(&self) -> &str {
@@ -793,11 +864,17 @@ impl Qwen35ChatExec {
         }
         let prompt_ids = self.tokenizer.encode_text(&prompt)?;
         let prompt_positions = build_text_positions(prompt_ids.len());
+        // A load that shares nothing declares no boundary.
+        let history_boundary = self
+            .prefix_caching
+            .then(|| history_boundary(&prompt_ids, self.tokenizer.specials.im_start))
+            .flatten();
         Ok(Qwen35PreparedPrompt {
             next_text_position: prompt_positions.len(),
             prompt_ids,
             prompt_positions,
             vision_inputs: None,
+            history_boundary,
         })
     }
 
@@ -847,12 +924,24 @@ impl Qwen35ChatExec {
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
-        if prepared.prompt_ids.is_empty() || cache.context_len() != 0 {
+        // A managed prefix attach hands over a reservation whose physical
+        // cursor already sits above zero: shared pages plus a forked hybrid
+        // snapshot that the executor restores before the first span. Prefill
+        // resumes at that cursor and must compute at least one private
+        // token. Shared prefixes hold no images (a prompt with images shares
+        // nothing), so no vision row lies below the cursor.
+        let prefill_start = cache.context_len();
+        if prepared.prompt_ids.is_empty()
+            || prefill_start >= prepared.prompt_ids.len()
+            || (prefill_start != 0 && !self.prefix_caching)
+        {
             return Err(Error::InvalidInput(
-                "Qwen3.5 physical prefill requires a non-empty prompt and an empty reservation"
+                "Qwen3.5 physical prefill requires a non-empty prompt with a cache cursor below it"
                     .into(),
             ));
         }
+        self.prefix_reuse
+            .record_prefill(prefill_start, prepared.prompt_ids.len());
         let track_history =
             config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
         let include_prompt = track_history && config.repetition_penalty > 1.0;
@@ -881,7 +970,7 @@ impl Qwen35ChatExec {
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
             next_text_position: prepared.next_text_position,
-            prefill_progress: 0,
+            prefill_progress: prefill_start,
             pending_logprobs: Vec::new(),
             prefill_vision_progress: 0,
             config: config.clone(),
@@ -1536,6 +1625,8 @@ impl Qwen35ChatModel {
                 tokenizer,
                 text_config,
                 text_model,
+                prefix_caching: false,
+                prefix_reuse: PrefixReuseCounters::default(),
             },
             text_checkpoint,
             projector_checkpoint,
@@ -1642,6 +1733,16 @@ impl Qwen35ChatModel {
         self.device_kind
     }
 
+    /// Share committed prefixes across requests (set at load, before the
+    /// model's state contract is read).
+    pub(crate) fn set_prefix_caching(&mut self, enabled: bool) {
+        self.exec.prefix_caching = enabled;
+    }
+
+    pub(crate) fn shares_prefixes(&self) -> bool {
+        self.exec.prefix_caching
+    }
+
     /// Serving diagnostics for the admin model API: device, storage and
     /// scheduling preferences, and cumulative decode counters.
     pub fn runtime_diagnostics(&self) -> serde_json::Value {
@@ -1660,6 +1761,7 @@ impl Qwen35ChatModel {
                 "preferred_decode_tokens": self.preferred_decode_tokens(),
                 "sustained_decode_quantum": self.sustained_decode_quantum(),
             },
+            "prefix_reuse": self.exec.prefix_reuse.summary(self.exec.prefix_caching),
             "gdn_decode": self.exec.text_model.gdn_decode_summary(),
             "gdn_batched_decode": self.exec.text_model.gdn_batched_decode_summary(),
             "gdn_prefill": self.exec.text_model.gdn_prefill_summary(),
@@ -1796,6 +1898,7 @@ impl Qwen35ChatModel {
             prompt_positions,
             next_text_position,
             vision_inputs: Some(vision_inputs),
+            history_boundary: None,
         })
     }
 }
@@ -3013,6 +3116,7 @@ mod tests {
             prompt_positions: build_text_positions(3),
             next_text_position: 3,
             vision_inputs: None,
+            history_boundary: None,
         };
         let preparation_calls = AtomicUsize::new(0);
         let resolved = resolve_prepared_prompt(Some(&prepared), || {
@@ -3767,6 +3871,8 @@ mod tests {
             tokenizer,
             text_config,
             text_model,
+            prefix_caching: false,
+            prefix_reuse: PrefixReuseCounters::default(),
         }
     }
 
@@ -3811,6 +3917,7 @@ mod tests {
             next_text_position: prompt_ids.len(),
             prompt_ids: prompt_ids.clone(),
             vision_inputs: None,
+            history_boundary: None,
         };
         let profile = DeviceProfile {
             device: device.clone(),
@@ -3944,6 +4051,7 @@ mod tests {
             next_text_position: prompt_ids.len(),
             prompt_ids: prompt_ids.clone(),
             vision_inputs: None,
+            history_boundary: None,
         };
         let profile = DeviceProfile {
             device: device.clone(),
@@ -4050,6 +4158,358 @@ mod tests {
             return;
         };
         assert_batched_sampling_matches_solo(&device);
+    }
+
+    /// Prefills a prompt fresh, and again attached at a page-aligned fork of
+    /// a published prefix: the publisher's KV pages below the fork and a
+    /// fork of its committed DeltaNet and convolution snapshot. The attached
+    /// session must start from the published snapshot bit for bit and
+    /// generate the fresh run's tokens. `exact` also demands a bit-identical
+    /// final state (the CPU lane); on a device, matmuls over the attached
+    /// run's shorter prefill may round differently, so the final state only
+    /// has to land within a gross-error bound.
+    fn assert_attach_matches_fresh(device: &candle_core::Device, exact: bool) {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        use crate::backends::kv::CandleAcceleratorKvArena;
+        use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
+        use crate::backends::state::{
+            negotiate_state_plan, PhysicalStateSequenceId, PhysicalStateTransactionId,
+            StateBackendPlanRequest, StateComponentValue, TensorStateArena, TensorStateCapacity,
+        };
+        use crate::engine::ModelInstanceId;
+        use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+        use crate::models::architectures::qwen35::cache::{
+            CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
+        };
+
+        const PAGE: usize = 8;
+        // Another test sets the prefill chunk size; hold it fixed so both
+        // prefills chunk alike.
+        let _env = crate::env_test_lock().lock().expect("env lock");
+        let mut exec = tiny_exec(device);
+        exec.prefix_caching = true;
+        let exec = &exec;
+        let backend = if device.is_metal() {
+            BackendKind::Metal
+        } else {
+            BackendKind::Cpu
+        };
+        let config = ChatGenerationConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            seed: 7,
+            ..Default::default()
+        };
+        let prompt_ids: Vec<u32> = (0..44u32).map(|index| 97 + (index * 7) % 26).collect();
+        let total = prompt_ids.len();
+        let prepared = Qwen35PreparedPrompt {
+            prompt_positions: (0..total).map(|index| [index; 3]).collect(),
+            next_text_position: total,
+            prompt_ids,
+            vision_inputs: None,
+            history_boundary: None,
+        };
+        let fork = (total / 2) - (total / 2) % PAGE;
+        assert!(fork >= PAGE && fork < total);
+
+        // One paged arena with addressable blocks: the publisher's pages
+        // below the fork are shared; every session keeps private pages above.
+        let device_ordinal = match device.location() {
+            candle_core::DeviceLocation::Cpu => None,
+            candle_core::DeviceLocation::Cuda { gpu_id } => u32::try_from(gpu_id).ok(),
+            candle_core::DeviceLocation::Metal { gpu_id } => {
+                let id = gpu_id as u64;
+                Some((id ^ (id >> 32)) as u32)
+            }
+        };
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(3535),
+            backend,
+            device_ordinal,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let text = &exec.text_config;
+        let bindings = (0..text.block_count)
+            .filter(|layer| (layer + 1).is_multiple_of(text.full_attention_interval))
+            .enumerate()
+            .map(|(physical, model_layer)| KvLayerBinding {
+                model_layer: model_layer as u32,
+                physical_layer: physical as u32,
+            })
+            .collect::<Vec<_>>();
+        let arena_config = KvArenaConfig {
+            id,
+            group,
+            page_tokens: PAGE as u32,
+            capacity_pages: 64,
+            growth: None,
+            dtype: DType::F32,
+            layers: bindings
+                .iter()
+                .map(|binding| KvLayerConfig {
+                    binding: *binding,
+                    num_kv_heads: text.attention_head_count_kv as u32,
+                    key_head_dim: text.attention_key_length as u32,
+                    value_head_dim: text.attention_value_length as u32,
+                })
+                .collect(),
+        };
+        let arena: Arc<dyn KvArena> = if backend == BackendKind::Cpu {
+            Arc::new(CpuKvArena::new(arena_config).unwrap())
+        } else {
+            #[cfg(any(feature = "cuda", feature = "metal"))]
+            {
+                Arc::new(
+                    CandleAcceleratorKvArena::new_mutation_only(arena_config, device.clone())
+                        .unwrap(),
+                )
+            }
+            #[cfg(not(any(feature = "cuda", feature = "metal")))]
+            {
+                let _ = arena_config;
+                unreachable!("accelerator KV arenas need the cuda or metal feature")
+            }
+        };
+        let view = |blocks: Vec<u32>, context_len: usize| {
+            PhysicalPagedKvCache::new(
+                arena.clone(),
+                bindings.clone(),
+                blocks
+                    .into_iter()
+                    .map(|index| CacheBlockRef {
+                        arena: id,
+                        group,
+                        index,
+                        slot_generation: 1,
+                    })
+                    .collect(),
+                context_len,
+            )
+            .unwrap()
+        };
+        let pages = total.div_ceil(PAGE) as u32 + 2;
+
+        let contract = exec
+            .managed_composite_cache_contract(DType::F32, PAGE)
+            .unwrap();
+        let plan = negotiate_state_plan(
+            &contract,
+            &StateBackendPlanRequest {
+                backend,
+                device_ordinal,
+                page_tokens_hint: None,
+                storage_dtype_hint: None,
+            },
+        )
+        .unwrap();
+        let capacity = TensorStateCapacity::for_plan(&plan, 8, 8).unwrap();
+        let tensors = TensorStateArena::new(Arc::new(plan), capacity, device.clone()).unwrap();
+
+        let decode = |state: &mut ChatDecodeState| {
+            (0..8)
+                .map(|_| exec.decode_step(state).unwrap().delta)
+                .collect::<Vec<_>>()
+        };
+
+        // Publisher: prefill [0, fork) and commit the hybrid state there.
+        let mut publisher = exec
+            .begin_resumable_prefill_state_physical(
+                &prepared,
+                10,
+                &config,
+                view((0..pages).collect(), 0),
+            )
+            .unwrap();
+        assert!(!exec
+            .continue_resumable_prefill_physical(&mut publisher, &prepared, 0, fork)
+            .unwrap());
+        let published_state = publisher.text_state.linear_state_values();
+        assert!(!published_state.is_empty());
+        let published = PhysicalStateSequenceId::new(1).unwrap();
+        tensors.register(published).unwrap();
+        let transaction = PhysicalStateTransactionId::new(1).unwrap();
+        tensors.begin(transaction, published).unwrap();
+        publisher
+            .stage_tensor_state(&tensors, transaction.get())
+            .unwrap();
+        tensors.commit(transaction, fork as u64).unwrap();
+        let snapshot_values = |sequence| {
+            [RECURRENT_STATE_DOMAIN, CONVOLUTION_STATE_DOMAIN]
+                .iter()
+                .flat_map(|domain| {
+                    tensors
+                        .read(sequence, *domain)
+                        .unwrap()
+                        .unwrap()
+                        .components
+                        .iter()
+                        .flat_map(|component| {
+                            component
+                                .tensor
+                                .as_ref()
+                                .unwrap()
+                                .to_dtype(DType::F32)
+                                .unwrap()
+                                .flatten_all()
+                                .unwrap()
+                                .to_vec1::<f32>()
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let snapshot_before = snapshot_values(published);
+
+        // Fresh reference over private pages, prefilled across the same span
+        // boundary as the publisher and the attached session, so every
+        // forward has the same shape on both sides.
+        let mut reference = exec
+            .begin_resumable_prefill_state_physical(
+                &prepared,
+                10,
+                &config,
+                view((pages..2 * pages).collect(), 0),
+            )
+            .unwrap();
+        assert!(!exec
+            .continue_resumable_prefill_physical(&mut reference, &prepared, 0, fork)
+            .unwrap());
+        assert!(exec
+            .continue_resumable_prefill_physical(&mut reference, &prepared, fork, total)
+            .unwrap());
+        let reference_state = reference.text_state.linear_state_values();
+        let expected = decode(&mut reference);
+        assert!(expected.iter().any(|delta| !delta.is_empty()));
+
+        // Without prefix sharing a reservation must be empty.
+        {
+            let mut private = tiny_exec(device);
+            private.prefix_caching = false;
+            assert!(private
+                .begin_resumable_prefill_state_physical(
+                    &prepared,
+                    10,
+                    &config,
+                    view((0..pages).collect(), fork),
+                )
+                .is_err());
+        }
+
+        // Attached session: the publisher's pages below the fork, private
+        // pages above, and the forked snapshot. Only [fork, total) is
+        // prefilled.
+        let fork_pages = (fork / PAGE) as u32;
+        let blocks = (0..fork_pages).chain(2 * pages..3 * pages).collect();
+        let mut attached = exec
+            .begin_resumable_prefill_state_physical(&prepared, 10, &config, view(blocks, fork))
+            .unwrap();
+        assert_eq!(attached.prefill_progress(), fork);
+        let forked = PhysicalStateSequenceId::new(2).unwrap();
+        tensors.register(forked).unwrap();
+        let fork_transaction = PhysicalStateTransactionId::new(2).unwrap();
+        tensors.begin(fork_transaction, forked).unwrap();
+        for domain in [RECURRENT_STATE_DOMAIN, CONVOLUTION_STATE_DOMAIN] {
+            let snapshot = tensors.read(published, domain).unwrap().unwrap();
+            let components = snapshot
+                .components
+                .iter()
+                .map(|component| StateComponentValue {
+                    component: component.component,
+                    tensor: component.tensor.clone(),
+                })
+                .collect();
+            tensors
+                .stage_replace(fork_transaction, domain, 0, fork as u64, components)
+                .unwrap();
+        }
+        tensors.commit(fork_transaction, fork as u64).unwrap();
+        attached.bind_tensor_sequence(forked.get()).unwrap();
+        attached.restore_tensor_state(&tensors).unwrap();
+        assert_eq!(
+            attached.text_state.linear_state_values(),
+            published_state,
+            "the attached session must start from the published snapshot, bit for bit"
+        );
+        assert!(exec
+            .continue_resumable_prefill_physical(&mut attached, &prepared, fork, total)
+            .unwrap());
+        assert_eq!(attached.physical_kv.context_len(), total);
+        let attached_state = attached.text_state.linear_state_values();
+        if exact {
+            assert_eq!(
+                attached_state, reference_state,
+                "the attached hybrid state must equal the fresh run's, bit for bit"
+            );
+        } else {
+            let scale = reference_state.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let error = attached_state
+                .iter()
+                .zip(&reference_state)
+                .map(|(a, r)| (a - r).abs())
+                .fold(0f32, |m, d| {
+                    if d.is_finite() {
+                        m.max(d)
+                    } else {
+                        f32::INFINITY
+                    }
+                });
+            assert_eq!(attached_state.len(), reference_state.len());
+            assert!(
+                error <= 5e-2 * scale.max(1e-3),
+                "{backend:?}: attached hybrid state differs from the fresh run by {error} (max |ref| {scale})"
+            );
+        }
+        assert_eq!(
+            decode(&mut attached),
+            expected,
+            "the attached session must generate the fresh run's tokens"
+        );
+        assert_eq!(
+            snapshot_values(published),
+            snapshot_before,
+            "decoding an attached session must not mutate the published snapshot"
+        );
+
+        // A cursor at or past the prompt end has no private token to compute.
+        assert!(exec
+            .begin_resumable_prefill_state_physical(
+                &prepared,
+                10,
+                &config,
+                view((0..pages).collect(), total),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn attached_prefill_matches_the_fresh_run_on_cpu() {
+        assert_attach_matches_fresh(&candle_core::Device::Cpu, true);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn attached_prefill_matches_the_fresh_run_on_metal() {
+        let Some((device, _serial)) = crate::backends::metal_test_device_or_skip(
+            "qwen35 attached_prefill_matches_the_fresh_run_on_metal",
+        ) else {
+            return;
+        };
+        assert_attach_matches_fresh(&device, false);
+    }
+
+    #[test]
+    fn a_text_prompt_declares_its_history_boundary() {
+        let im_start = 7u32;
+        // system turn, user turn, then the assistant generation header.
+        let ids = [im_start, 1, 2, im_start, 3, 4, im_start, 5];
+        assert_eq!(history_boundary(&ids, im_start), Some(6));
+        assert_eq!(history_boundary(&[im_start, 1, 2], im_start), None);
+        assert_eq!(history_boundary(&[1, 2, 3], im_start), None);
     }
 
     #[test]

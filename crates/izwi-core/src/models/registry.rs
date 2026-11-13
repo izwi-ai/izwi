@@ -453,11 +453,13 @@ fn load_qwen35_chat_model(
     variant: ModelVariant,
     device: DeviceProfile,
     performance: &crate::performance::PerformanceConfig,
-    _prefix_reuse: PrefixReuseMode,
+    prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
-    Ok(NativeChatModel::Qwen35(
-        Qwen35ChatModel::load_with_performance(model_dir, variant, device, performance)?,
-    ))
+    let prefix_reuse = prefix_reuse_engages(variant, BackendKind::from(device.kind), prefix_reuse);
+    let mut model =
+        Qwen35ChatModel::load_with_performance(model_dir, variant, device, performance)?;
+    model.set_prefix_caching(prefix_reuse);
+    Ok(NativeChatModel::Qwen35(model))
 }
 
 fn load_qwen38_chat_model(
@@ -5891,9 +5893,9 @@ impl NativeChatPreparedPrompt {
     /// turn of the conversation shares), when the family declares one.
     pub fn managed_snapshot_boundary(&self) -> Option<usize> {
         match self {
+            Self::Qwen35(prepared) => prepared.history_boundary(),
             Self::Qwen36Moe(prepared) => prepared.history_boundary(),
             Self::Qwen38(prepared) => prepared.history_boundary(),
-            Self::Qwen35(_) => None,
         }
     }
 
@@ -6546,6 +6548,19 @@ impl NativeChatModel {
         match self {
             Self::Lfm2(model) if model.prefix_caching() => model.history_boundary(prompt_ids),
             _ => None,
+        }
+    }
+
+    /// Whether this load shares committed hybrid prefixes at a declared
+    /// history boundary. Such a prompt attaches a shared prefix only when it
+    /// prefills in resumable spans, so its requests always do.
+    pub(crate) fn shares_history_prefixes(&self) -> bool {
+        match self {
+            Self::Qwen35(model) => model.shares_prefixes(),
+            Self::Qwen36Moe(model) => model.shares_prefixes(),
+            Self::Qwen38(model) => model.shares_prefixes(),
+            Self::Lfm2(model) => model.prefix_caching(),
+            _ => false,
         }
     }
 

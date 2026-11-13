@@ -1584,6 +1584,12 @@ impl Qwen38ChatModel {
         }
     }
 
+    /// Whether this load shares committed prefixes: engaged, and without
+    /// the MTP head, whose draft state has no prefix snapshot.
+    pub(crate) fn shares_prefixes(&self) -> bool {
+        self.prefix_caching && !self.mtp_policy.enabled()
+    }
+
     pub fn device_kind(&self) -> BackendKind {
         self.device_kind
     }
@@ -3007,7 +3013,7 @@ impl Qwen38ChatModel {
     /// (`kv_cache.counters` and `kv_cache.models[]` in `/v1/metrics`) show
     /// hits, misses, snapshot publications and the snapshot budget.
     fn prefix_reuse_diagnostics(&self) -> serde_json::Value {
-        let shared = self.prefix_caching && !self.mtp_policy.enabled();
+        let shared = self.shares_prefixes();
         let reason = if shared {
             "engaged: committed KV pages and hybrid-state snapshots are shared at each turn's history boundary"
         } else if self.prefix_reuse.switched_off {

@@ -288,7 +288,8 @@ impl NativeExecutor {
         }
         let model = request.prepared_chat_model_for_executor()?;
         let resumable_prefill = (self.config.enable_chunked_prefill
-            || super::binds_mixed_step(request))
+            || super::binds_mixed_step(request)
+            || model.shares_history_prefixes())
             && model.supports_resumable_prefill();
         let replaying =
             scheduled.is_prefill && self.chat_session_replaying(&scheduled.session_key())?;
