@@ -2948,11 +2948,11 @@ async fn run_agent_turn(
     };
 
     let memory = ThreadMemory::new(state.chat_store.clone(), memory_context);
-    let backend = ChatAgentBackend {
-        runtime: state.runtime.clone(),
-        correlation_id: correlation_id.to_string(),
-        admission: RoundAdmission::PerRound(state),
-    };
+    let backend = ChatAgentBackend::new(
+        state.runtime.clone(),
+        correlation_id,
+        RoundAdmission::PerRound(state),
+    );
     let tool_timeout = tools.map(|(tools, _)| tools.timeout);
     let tools = tools
         .map(|(tools, pending)| tools.registry(pending))

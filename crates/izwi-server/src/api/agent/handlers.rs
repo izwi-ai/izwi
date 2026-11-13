@@ -158,11 +158,11 @@ pub async fn create_turn(
 
     let permit = state.admit_request(WorkloadClass::Interactive).await?;
     let memory = ThreadMemory::new(state.chat_store.clone(), None);
-    let backend = ChatAgentBackend {
-        runtime: state.runtime.clone(),
-        correlation_id: ctx.correlation_id,
-        admission: RoundAdmission::Held(permit.runtime_context()),
-    };
+    let backend = ChatAgentBackend::new(
+        state.runtime.clone(),
+        ctx.correlation_id,
+        RoundAdmission::Held(permit.runtime_context()),
+    );
     let tools = crate::app::voice_tools::builtin_tool_registry();
     let turn = TurnContext {
         agents: &agents,

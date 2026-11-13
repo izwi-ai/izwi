@@ -36,19 +36,65 @@ pub(crate) enum RoundAdmission<'a> {
 /// first audio), its visible text sent as it is generated and its tool
 /// calls parsed by the model family's call format.
 pub(crate) struct ChatAgentBackend<'a> {
-    pub(crate) runtime: Arc<RuntimeService>,
-    pub(crate) correlation_id: String,
-    pub(crate) admission: RoundAdmission<'a>,
+    runtime: Arc<RuntimeService>,
+    correlation_id: String,
+    admission: RoundAdmission<'a>,
+    /// What the first round must call; later rounds are free.
+    choice: ToolChoice,
+    usage: Mutex<ChatUsage>,
 }
 
-/// The tools a round offers `variant`: none for a family without a
-/// tool-calling chat template.
-pub(crate) fn tool_plan_for(variant: ModelVariant, tools: &[Value]) -> Option<ToolPlan> {
+/// The tokens a turn's rounds read and wrote.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ChatUsage {
+    pub(crate) prompt_tokens: u64,
+    pub(crate) cached_prompt_tokens: u64,
+    pub(crate) output_tokens: u64,
+}
+
+impl<'a> ChatAgentBackend<'a> {
+    pub(crate) fn new(
+        runtime: Arc<RuntimeService>,
+        correlation_id: impl Into<String>,
+        admission: RoundAdmission<'a>,
+    ) -> Self {
+        Self {
+            runtime,
+            correlation_id: correlation_id.into(),
+            admission,
+            choice: ToolChoice::Auto,
+            usage: Mutex::new(ChatUsage::default()),
+        }
+    }
+
+    /// Open the turn's first reply with a call: any tool (`Required`) or a
+    /// named one.
+    pub(crate) fn with_tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.choice = choice;
+        self
+    }
+
+    pub(crate) fn usage(&self) -> ChatUsage {
+        *self
+            .usage
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+/// How a round uses the tools it offers `variant`: `None` for a family
+/// without a tool-calling chat template, or when `choice` names a tool that
+/// is not offered.
+pub(crate) fn tool_plan_for(
+    variant: ModelVariant,
+    tools: &[Value],
+    choice: ToolChoice,
+) -> Option<ToolPlan> {
     if tools.is_empty() {
         return None;
     }
     let dialect = ToolCallFormat::of(variant)?;
-    ToolPlan::new(dialect, tools.to_vec(), ToolChoice::Auto, true).ok()
+    ToolPlan::new(dialect, tools.to_vec(), choice, true).ok()
 }
 
 #[async_trait::async_trait]
@@ -61,7 +107,12 @@ impl ModelBackend for ChatAgentBackend<'_> {
         let model_error = |err: String| AgentError::Model(err);
         let variant = parse_chat_model_variant(Some(&request.model_id))
             .map_err(|err| model_error(err.to_string()))?;
-        let plan = tool_plan_for(variant, &request.tools);
+        let choice = if request.round == 0 {
+            self.choice.clone()
+        } else {
+            ToolChoice::Auto
+        };
+        let plan = tool_plan_for(variant, &request.tools, choice);
         let tools = plan
             .as_ref()
             .map(|plan| plan.tools.clone())
@@ -91,6 +142,17 @@ impl ModelBackend for ChatAgentBackend<'_> {
                 ChatRequestConfig {
                     enable_thinking: Some(false),
                     tools,
+                    response_prefix: plan
+                        .as_ref()
+                        .and_then(ToolPlan::response_prefix)
+                        .unwrap_or_default(),
+                    // A required or named tool is held to the declared
+                    // names and schemas where the sampler can.
+                    tool_constraint: plan
+                        .as_ref()
+                        .filter(|_| izwi_core::chat_supports_tool_constraint(variant))
+                        .and_then(|plan| plan.constraint(false))
+                        .map(Box::new),
                     truncation: ChatTruncation::Auto,
                     ..ChatRequestConfig::default()
                 },
@@ -120,6 +182,15 @@ impl ModelBackend for ChatAgentBackend<'_> {
             .unwrap_or_default();
         events.text_delta(&tail);
 
+        {
+            let mut usage = self
+                .usage
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            usage.prompt_tokens += generation.prompt_tokens as u64;
+            usage.cached_prompt_tokens += generation.cached_prompt_tokens.unwrap_or(0);
+            usage.output_tokens += generation.tokens_generated as u64;
+        }
         let (text, tool_calls) = match &plan {
             Some(plan) => {
                 let (content, calls) = parse_answer(plan.parser(), &generation.text);
@@ -365,8 +436,8 @@ mod tests {
     #[test]
     fn a_family_without_a_tool_template_is_offered_no_tools() {
         let tools = vec![serde_json::json!({"type": "function", "function": {"name": "time"}})];
-        assert!(tool_plan_for(ModelVariant::Qwen354BGguf, &tools).is_some());
-        assert!(tool_plan_for(ModelVariant::Qwen354BGguf, &[]).is_none());
-        assert!(tool_plan_for(ModelVariant::Gemma34BIt, &tools).is_none());
+        assert!(tool_plan_for(ModelVariant::Qwen354BGguf, &tools, ToolChoice::Auto).is_some());
+        assert!(tool_plan_for(ModelVariant::Qwen354BGguf, &[], ToolChoice::Auto).is_none());
+        assert!(tool_plan_for(ModelVariant::Gemma34BIt, &tools, ToolChoice::Auto).is_none());
     }
 }

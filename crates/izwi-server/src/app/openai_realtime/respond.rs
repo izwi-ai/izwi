@@ -20,10 +20,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::Message;
-use izwi_agent::ReasoningFilter;
+use izwi_agent::{
+    AgentDefinition, AgentEngine, AgentError, AgentEvent, AgentSession, AgentSet, AgentTurnOptions,
+    BackgroundResults, MemoryMessage, MemoryMessageRole, ReasoningFilter, ToolRegistry,
+    TurnContext, TurnEvents, TurnFinish,
+};
 use izwi_core::{
-    ChatFinishReason, ChatMessage, ChatRequestConfig, ChatRole, ChatTruncation, GenerationParams,
-    ModelFamily, RuntimeService, SessionModelLeases, CHAT_AUDIO_PLACEHOLDER,
+    ChatMessage, ChatRole, GenerationParams, ModelFamily, RuntimeService, SessionModelLeases,
+    CHAT_AUDIO_PLACEHOLDER,
 };
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -34,18 +38,18 @@ use super::events::{server_event, Ids};
 use super::items::{ContentPart, Item, ItemKind, ItemStatus, ItemStore, Position, Role};
 use super::profiles::{ProfileMode, RealtimeProfile};
 use super::session_config::{chat_tool, AudioFormat, Modality};
-use crate::api::openai::convert::InboundContent;
-use crate::api::openai::responses::dto::{ResponseInput, ResponseInputItem};
-use crate::api::openai::responses::handlers::build_input_messages;
 use crate::api::openai::tool_calls::{
-    parse_answer, ToolCall, ToolCallFormat, ToolCallParser, ToolChoice, ToolPlan,
+    parse_answer, ToolCall, ToolCallFormat, ToolCallFunction, ToolCallParser, ToolChoice, ToolPlan,
+};
+use crate::app::agent_runtime::{
+    cancel_with, drive_turn, ChatAgentBackend, RoundAdmission, ThreadMemory,
 };
 use crate::app::realtime_transport::{
     OutboundClass, OutboundEnqueueError, OutboundItem, OutboundMailbox,
 };
 use crate::app::voice_realtime::{
-    acquire_stage_permit, model_load_error, speak_reply, with_stage_permit, ReplySink,
-    SegmentSynthesis, TtsVoice, TurnControl,
+    acquire_stage_permit, model_load_error, speak_reply, ReplySink, SegmentSynthesis, TtsVoice,
+    TurnControl,
 };
 use crate::state::AppState;
 use izwi_core::chat_tools::render_tool_calls;
@@ -814,66 +818,61 @@ fn user_audio_ms(items: &[Item]) -> u64 {
         .sum()
 }
 
-/// The conversation as chat messages, through the Responses API's item
-/// conversion (tool calls and results rendered as the model's template
-/// expects).
-fn chat_messages(
-    variant: izwi_core::ModelVariant,
-    system: &str,
-    items: &[Item],
-    tools: &[Value],
-) -> Result<Vec<ChatMessage>, String> {
-    let input: Vec<ResponseInputItem> = items
-        .iter()
-        .filter_map(|item| match &item.kind {
+/// The conversation as the agent runtime's messages: the user's and the
+/// assistant's words, the calls made and their results. System messages
+/// are part of the instructions.
+fn agent_conversation(items: &[Item]) -> Vec<MemoryMessage> {
+    let mut conversation: Vec<MemoryMessage> = Vec::with_capacity(items.len() + 1);
+    for item in items {
+        match &item.kind {
             ItemKind::Message {
                 role: Role::System, ..
-            } => None,
-            ItemKind::Message { role, .. } => item.text().map(|text| ResponseInputItem {
-                role: Some(role.as_str().to_string()),
-                content: Some(InboundContent::Text(text)),
-                ..ResponseInputItem::default()
-            }),
+            } => {}
+            ItemKind::Message { role, .. } => {
+                if let Some(text) = item.text() {
+                    let role = match role {
+                        Role::Assistant => MemoryMessageRole::Assistant,
+                        _ => MemoryMessageRole::User,
+                    };
+                    conversation.push(MemoryMessage::new(role, text));
+                }
+            }
             ItemKind::FunctionCall {
                 call_id,
                 name,
                 arguments,
-            } => Some(ResponseInputItem {
-                item_type: Some("function_call".to_string()),
-                call_id: Some(call_id.clone()),
-                name: Some(name.clone()),
-                arguments: Some(Value::String(arguments.clone())),
-                ..ResponseInputItem::default()
-            }),
-            ItemKind::FunctionCallOutput { call_id, output } => Some(ResponseInputItem {
-                item_type: Some("function_call_output".to_string()),
-                call_id: Some(call_id.clone()),
-                output: Some(Value::String(output.clone())),
-                ..ResponseInputItem::default()
-            }),
-        })
-        .collect();
-    let mut input = input;
+            } => {
+                let call = izwi_agent::ToolCall {
+                    id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                };
+                // Consecutive calls are one assistant turn.
+                match conversation.last_mut() {
+                    Some(last)
+                        if last.role == MemoryMessageRole::Assistant
+                            && !last.tool_calls.is_empty() =>
+                    {
+                        last.tool_calls.push(call)
+                    }
+                    _ => conversation.push(MemoryMessage::assistant_calls("", vec![call])),
+                }
+            }
+            ItemKind::FunctionCallOutput { call_id, output } => {
+                conversation.push(MemoryMessage::tool(call_id.clone(), output.clone()));
+            }
+        }
+    }
     // A response with no user turn yet (a greeting asked for with
     // `response.create` instructions) still needs one: chat templates
     // refuse a prompt without a user query.
-    if !input
+    if !conversation
         .iter()
-        .any(|item| item.role.as_deref() == Some("user") && item.item_type.is_none())
+        .any(|message| message.role == MemoryMessageRole::User)
     {
-        input.insert(
-            0,
-            ResponseInputItem {
-                role: Some("user".to_string()),
-                content: Some(InboundContent::Text(OPENING_TURN.to_string())),
-                ..ResponseInputItem::default()
-            },
-        );
+        conversation.insert(0, MemoryMessage::user(OPENING_TURN));
     }
-    let system = Some(system).filter(|system| !system.trim().is_empty());
-    build_input_messages(variant, system, Some(ResponseInput::Many(input)), tools)
-        .map(|(messages, _, _)| messages)
-        .map_err(|err| err.message)
+    conversation
 }
 
 /// The user turn of a conversation that has none yet.
@@ -932,13 +931,14 @@ async fn run_modular(
         let choice = ToolChoice::parse(Some(&plan.tool_choice)).map_err(str::to_string)?;
         Some(ToolPlan::new(dialect, tools.clone(), choice, true)?)
     };
+    let choice = match &tool_plan {
+        Some(tool_plan) => tool_plan.choice.clone(),
+        None => ToolChoice::Auto,
+    };
     let system = system_prompt(plan, &items, false);
-    let messages = chat_messages(text, &system, &items, &tools)?;
     emitter.add_usage(|usage| usage.input_audio_ms += user_audio_ms(&items));
 
     let audio_out = plan.modality == Modality::Audio;
-    let parser = Arc::new(Mutex::new(tool_plan.as_ref().map(ToolPlan::parser)));
-    let reasoning = Arc::new(Mutex::new(ReasoningFilter::default()));
     let (deltas, delta_rx) = mpsc::unbounded_channel::<String>();
     let state = &ctx.state;
     let max_tokens = plan
@@ -946,93 +946,86 @@ async fn run_modular(
         .unwrap_or(DEFAULT_MODULAR_MAX_TOKENS)
         .clamp(1, 8_192);
 
+    // The reply runs on the agent runtime. The client's function tools are
+    // declared, not run: a reply that calls them ends with the calls
+    // pending, which the client answers with `function_call_output` items
+    // and a new `response.create`.
     let chat = async {
-        let parser_sink = parser.clone();
-        let reasoning_sink = reasoning.clone();
-        let emitter_sink = emitter.clone();
-        let deltas_sink = deltas.clone();
-        let generation = with_stage_permit(state, async |runtime_context| {
-            ctx.model_leases
-                .hold(&state.runtime, text)
-                .await
-                .map_err(|err| model_load_error("chat", err))?;
-            state
-                .runtime
-                .chat_generate_streaming_with_runtime_context(
-                    text,
-                    messages,
-                    GenerationParams {
-                        max_tokens,
-                        ..Default::default()
-                    },
-                    ChatRequestConfig {
-                        enable_thinking: Some(false),
-                        tools: tools.clone(),
-                        response_prefix: tool_plan
-                            .as_ref()
-                            .and_then(ToolPlan::response_prefix)
-                            .unwrap_or_default(),
-                        // A required or named tool is held to the declared
-                        // names and schemas where the sampler can.
-                        tool_constraint: tool_plan
-                            .as_ref()
-                            .filter(|_| izwi_core::chat_supports_tool_constraint(text))
-                            .and_then(|plan| plan.constraint(false))
-                            .map(Box::new),
-                        truncation: ChatTruncation::Auto,
-                        ..ChatRequestConfig::default()
-                    },
-                    Some(&ctx.correlation_id),
-                    runtime_context,
-                    move |delta| {
-                        let visible = match parser_sink
-                            .lock()
-                            .unwrap_or_else(|poison| poison.into_inner())
-                            .as_mut()
-                        {
-                            Some(parser) => parser.push(&delta).content,
-                            None => delta,
-                        };
-                        if visible.is_empty() {
-                            return;
-                        }
-                        if audio_out {
-                            let _ = deltas_sink.send(visible);
-                        } else {
-                            let text = reasoning_sink
-                                .lock()
-                                .unwrap_or_else(|poison| poison.into_inner())
-                                .push(&visible);
-                            emitter_sink.text_delta(&text);
-                        }
-                    },
-                )
-                .await
-                .map_err(|err| format!("Chat failed: {err}"))
-        })
-        .await?;
-        // The parser holds back text that could still open a call.
-        let tail = parser
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .take()
-            .map(|mut parser| parser.finish().content)
-            .unwrap_or_default();
-        if audio_out {
-            if !tail.is_empty() {
-                let _ = deltas.send(tail);
+        ctx.model_leases
+            .hold(&state.runtime, text)
+            .await
+            .map_err(|err| model_load_error("chat", err))?;
+        let mut registry = ToolRegistry::new();
+        for tool in &tools {
+            registry.declare_external(tool.clone());
+        }
+        let agents = AgentSet::single(AgentDefinition::new(
+            "realtime",
+            "assistant",
+            system,
+            text.dir_name(),
+        ));
+        let session = AgentSession {
+            id: ctx.correlation_id.clone(),
+            agent_id: "realtime".to_string(),
+            thread_id: ctx.correlation_id.clone(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        // The session's items are the conversation; nothing is read from
+        // or written to the chat store.
+        let memory = ThreadMemory::new(state.chat_store.clone(), None);
+        let backend = ChatAgentBackend::new(
+            state.runtime.clone(),
+            ctx.correlation_id.clone(),
+            RoundAdmission::PerRound(state),
+        )
+        .with_tool_choice(choice);
+        let (cancel, _cancel_link) = cancel_with(control);
+        let (events, heard) = mpsc::unbounded_channel();
+        let turn = TurnContext {
+            agents: &agents,
+            memory: &memory,
+            model: &backend,
+            tools: &registry,
+            events: TurnEvents::new(events),
+            cancel,
+            background: BackgroundResults::default(),
+        };
+        let run = AgentEngine.run_conversation(
+            &turn,
+            &session,
+            Vec::new(),
+            agent_conversation(&items),
+            "",
+            None,
+            AgentTurnOptions {
+                max_output_tokens: max_tokens,
+                persist_assistant_reply: false,
+                ..AgentTurnOptions::default()
+            },
+        );
+        let mut reasoning = ReasoningFilter::default();
+        let result = drive_turn(run, heard, |event| {
+            let AgentEvent::TextDelta { text } = event else {
+                return;
+            };
+            if audio_out {
+                let _ = deltas.send(text);
+            } else {
+                emitter.text_delta(&reasoning.push(&text));
             }
-        } else {
-            let mut reasoning = reasoning
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            let mut text = reasoning.push(&tail);
-            text.push_str(&reasoning.finish());
-            drop(reasoning);
-            emitter.text_delta(&text);
+        })
+        .await
+        .map_err(|err| match err {
+            AgentError::Model(message) => format!("Chat failed: {message}"),
+            other => other.to_string(),
+        })?;
+        if !audio_out {
+            emitter.text_delta(&reasoning.finish());
         }
         drop(deltas);
-        Ok::<_, String>(generation)
+        Ok::<_, String>((result, backend.usage()))
     };
     let speech = async {
         if !audio_out {
@@ -1058,23 +1051,30 @@ async fn run_modular(
         )
         .await
     };
-    let (generation, ()) = tokio::try_join!(chat, speech)?;
+    let ((result, used), ()) = tokio::try_join!(chat, speech)?;
     emitter.add_usage(|usage| {
-        usage.input_text_tokens += generation.prompt_tokens as u64;
-        usage.cached_tokens += generation.cached_prompt_tokens.unwrap_or(0);
-        usage.output_text_tokens += generation.tokens_generated as u64;
+        usage.input_text_tokens += used.prompt_tokens;
+        usage.cached_tokens += used.cached_prompt_tokens;
+        usage.output_text_tokens += used.output_tokens;
     });
-    if let Some(tool_plan) = &tool_plan {
-        let (_, calls) = parse_answer(tool_plan.parser(), &generation.text);
-        emitter.function_calls(&calls);
-    }
-    Ok(
-        if generation.finish_reason == Some(ChatFinishReason::MaxTokens) {
-            Outcome::Incomplete
-        } else {
-            Outcome::Completed
-        },
-    )
+    let calls: Vec<ToolCall> = result
+        .pending_calls
+        .into_iter()
+        .map(|call| ToolCall {
+            id: call.id,
+            kind: "function",
+            function: ToolCallFunction {
+                name: call.name,
+                arguments: call.arguments,
+            },
+        })
+        .collect();
+    emitter.function_calls(&calls);
+    Ok(if result.finish == TurnFinish::MaxTokens {
+        Outcome::Incomplete
+    } else {
+        Outcome::Completed
+    })
 }
 
 /// A function call as LFM3-Audio's template writes one.
