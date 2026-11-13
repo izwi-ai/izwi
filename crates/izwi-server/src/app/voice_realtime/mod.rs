@@ -505,6 +505,13 @@ struct InputStreamStartEvent {
     max_utterance_ms: Option<u32>,
     #[serde(default)]
     pre_roll_ms: Option<u32>,
+    /// Let the silence that ends an utterance follow the speaker's own
+    /// pauses, between `adaptive_silence_floor_ms` (default 450) and
+    /// `silence_duration_ms`. Off by default.
+    #[serde(default)]
+    adaptive_silence: Option<bool>,
+    #[serde(default)]
+    adaptive_silence_floor_ms: Option<u32>,
     #[serde(default)]
     barge_in_min_speech_ms: Option<u32>,
     /// Energy above the noise floor, in dB, a frame needs to start an
@@ -1329,6 +1336,8 @@ async fn handle_text_message(
                 silence_duration_ms,
                 max_utterance_ms,
                 pre_roll_ms,
+                adaptive_silence,
+                adaptive_silence_floor_ms,
                 barge_in_min_speech_ms,
                 vad_snr_margin_db,
                 input_sample_rate,
@@ -1519,26 +1528,34 @@ async fn handle_text_message(
                 ),
                 input_sample_rate_hint: input_sample_rate
                     .filter(|sr| *sr >= 8_000 && *sr <= 192_000),
+                adaptive_silence_floor_ms: adaptive_silence
+                    .unwrap_or(false)
+                    .then(|| adaptive_silence_floor_ms.unwrap_or(450).clamp(200, 5_000)),
             }));
             conn.voice_session.begin_listening();
 
-            send_json(
-                out_tx,
-                json!({
-                    "type": "input_stream_ready",
-                    "output_audio_format": output_format.as_str(),
-                    "vad": {
-                        "backend": "earshot",
-                        "threshold": conn.streaming_input.as_ref().map(|s| s.config.vad_threshold),
-                        "score_sample_rate": VAD_SAMPLE_RATE,
-                        "score_frame_ms": VAD_FRAME_MS,
-                        "snr_margin_db": conn.streaming_input.as_ref().map(|s| s.config.snr_margin_db),
-                        "min_speech_ms": conn.streaming_input.as_ref().map(|s| s.config.min_speech_ms),
-                        "silence_duration_ms": conn.streaming_input.as_ref().map(|s| s.config.silence_duration_ms),
-                        "barge_in_min_speech_ms": conn.streaming_input.as_ref().map(|s| s.config.barge_in_min_speech_ms),
-                    }
-                }),
-            );
+            let mut ready = json!({
+                "type": "input_stream_ready",
+                "output_audio_format": output_format.as_str(),
+                "vad": {
+                    "backend": "earshot",
+                    "threshold": conn.streaming_input.as_ref().map(|s| s.config.vad_threshold),
+                    "score_sample_rate": VAD_SAMPLE_RATE,
+                    "score_frame_ms": VAD_FRAME_MS,
+                    "snr_margin_db": conn.streaming_input.as_ref().map(|s| s.config.snr_margin_db),
+                    "min_speech_ms": conn.streaming_input.as_ref().map(|s| s.config.min_speech_ms),
+                    "silence_duration_ms": conn.streaming_input.as_ref().map(|s| s.config.silence_duration_ms),
+                    "barge_in_min_speech_ms": conn.streaming_input.as_ref().map(|s| s.config.barge_in_min_speech_ms),
+                }
+            });
+            if let Some(floor_ms) = conn
+                .streaming_input
+                .as_ref()
+                .and_then(|input| input.config.adaptive_silence_floor_ms)
+            {
+                ready["vad"]["adaptive_silence_floor_ms"] = json!(floor_ms);
+            }
+            send_json(out_tx, ready);
             conn.model_warmup = Some(AbortOnDropTask::new(tokio::spawn(warm_session_models(
                 state.runtime.clone(),
                 conn.model_leases.clone(),
@@ -4492,16 +4509,91 @@ mod tests {
             barge_in_min_speech_ms: DEFAULT_BARGE_IN_MIN_SPEECH_MS,
             snr_margin_db: izwi_vad::DEFAULT_SNR_MARGIN_DB,
             input_sample_rate_hint: Some(16_000),
+            adaptive_silence_floor_ms: None,
         })
     }
 
     /// Every frame voiced, whatever its content: the score threshold drops
     /// to the minimum and the SNR check is off, since digital silence never
     /// rises over its own noise floor.
+    #[test]
+    fn the_silence_window_follows_the_speakers_pauses() {
+        let mut window = AdaptiveSilence::new(450, 900);
+        // Until four pauses are known, the configured silence stands.
+        for pause in [200.0, 220.0, 180.0] {
+            window.observe(pause);
+            assert_eq!(window.window_ms(), 900);
+        }
+        // Gaps inside words teach nothing.
+        window.observe(60.0);
+        assert_eq!(window.window_ms(), 900);
+        // A fluent speaker is answered sooner, never under the floor.
+        window.observe(240.0);
+        assert_eq!(window.window_ms(), 450);
+        // One long pause is an outlier; a second moves the window.
+        window.observe(500.0);
+        assert_eq!(window.window_ms(), 450);
+        window.observe(520.0);
+        assert_eq!(window.window_ms(), 750);
+        // A slow speaker stays at the configured silence.
+        for _ in 0..4 {
+            window.observe(800.0);
+        }
+        assert_eq!(window.window_ms(), 900);
+        // Old pauses are forgotten.
+        for _ in 0..12 {
+            window.observe(200.0);
+        }
+        assert_eq!(window.window_ms(), 450);
+    }
+
+    /// A speaker cut off mid-thought speaks again at once: the silence
+    /// that split the thought counts as a pause, and the window widens.
+    #[test]
+    fn speech_right_after_an_endpoint_widens_the_window() {
+        let mut input = StreamingInputState::new(StreamingInputConfig {
+            silence_duration_ms: 900,
+            adaptive_silence_floor_ms: Some(300),
+            ..test_streaming_input().config
+        });
+        always_voiced(&mut input);
+        for pause in [200.0, 210.0, 190.0, 205.0] {
+            input.adaptive_silence.as_mut().unwrap().observe(pause);
+        }
+        assert_eq!(input.silence_window_ms(), 308);
+
+        input.last_silence_end = Some((Instant::now(), 308));
+        input
+            .handle_pcm16_frame(1, 16_000, &pcm16_frame(&[0; 320]))
+            .expect("frame");
+        assert!(input.active.is_some(), "speech started");
+        assert!(input.last_silence_end.is_none());
+        // 308 ms of silence plus the gap is the newest pause; with a
+        // second one like it the window follows.
+        input.adaptive_silence.as_mut().unwrap().observe(320.0);
+        assert!(
+            input.silence_window_ms() >= 460,
+            "{}",
+            input.silence_window_ms()
+        );
+
+        // Speech long after an endpoint is a new thought.
+        let mut input = StreamingInputState::new(StreamingInputConfig {
+            adaptive_silence_floor_ms: Some(300),
+            ..test_streaming_input().config
+        });
+        always_voiced(&mut input);
+        input.last_silence_end = Some((Instant::now() - RESUMED_SPEECH_WITHIN * 2, 300));
+        input
+            .handle_pcm16_frame(1, 16_000, &pcm16_frame(&[0; 320]))
+            .expect("frame");
+        assert!(input.adaptive_silence.as_ref().unwrap().window_ms() == 200);
+    }
+
     fn always_voiced(input: &mut StreamingInputState) {
         input.config.vad_threshold = 0.01;
         input.config.snr_margin_db = 0.0;
-        input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+        input.endpoint = EndpointDetector::new(input.config.endpoint_config(None));
     }
 
     fn finalized(
@@ -5122,7 +5214,7 @@ mod tests {
         let start = |input: &mut StreamingInputState| {
             always_voiced(input);
             input.config.min_speech_ms = 300;
-            input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+            input.endpoint = EndpointDetector::new(input.config.endpoint_config(None));
             for frame_seq in 1..=5_u32 {
                 input
                     .handle_pcm16_frame(frame_seq, 16_000, &frame)
@@ -5206,7 +5298,7 @@ mod tests {
             let mut input = test_streaming_input();
             input.config.min_speech_ms = DEFAULT_STREAM_MIN_SPEECH_MS;
             input.config.silence_duration_ms = DEFAULT_STREAM_SILENCE_MS;
-            input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+            input.endpoint = EndpointDetector::new(input.config.endpoint_config(None));
             assert_eq!(stream_turns(&mut input, &noise), (0, 0), "{name} alone");
 
             // Fox 3 s in, 10 dB over the noise.
@@ -5218,7 +5310,7 @@ mod tests {
             let mut input = test_streaming_input();
             input.config.min_speech_ms = DEFAULT_STREAM_MIN_SPEECH_MS;
             input.config.silence_duration_ms = DEFAULT_STREAM_SILENCE_MS;
-            input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+            input.endpoint = EndpointDetector::new(input.config.endpoint_config(None));
             let (turns, barge_ins) = stream_turns(&mut input, &mixed);
             assert_eq!((turns, barge_ins), (1, 1), "{name} with speech");
         }
@@ -5231,7 +5323,7 @@ mod tests {
         let mut input = test_streaming_input();
         input.config.min_speech_ms = DEFAULT_STREAM_MIN_SPEECH_MS;
         input.config.silence_duration_ms = DEFAULT_STREAM_SILENCE_MS;
-        input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+        input.endpoint = EndpointDetector::new(input.config.endpoint_config(None));
         assert_eq!(stream_turns(&mut input, &short).0, 1, "short reply");
     }
 

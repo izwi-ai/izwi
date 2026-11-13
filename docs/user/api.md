@@ -2263,6 +2263,7 @@ Client JSON messages:
 | `vad_snr_margin_db` | How far, in dB, a frame must rise above the stream's own noise floor to start an utterance; half of it keeps one going. Default `6` (or `IZWI_VAD_SNR_MARGIN_DB`), clamped to `0..40`. Earshot scores steady noise such as a fan or hum as speech; this margin is what ignores it. `0` turns the check off. |
 | `min_speech_ms` | Minimum speech duration. |
 | `silence_duration_ms` | Silence before utterance end. |
+| `adaptive_silence` | `true` lets the silence that ends an utterance follow the speaker: once four of their mid-utterance pauses are known, it is one and a half times their longer pauses, never under `adaptive_silence_floor_ms` (default `450`, `200..5000`) or over `silence_duration_ms`. A fluent speaker is answered sooner. A speaker who talks again within 1.5 s of an utterance ending was cut off, and the window widens. Default `false`. `input_stream_ready` reports the floor when it is on. |
 | `max_utterance_ms` | Hard utterance duration cap. |
 | `pre_roll_ms` | Audio retained before speech start. |
 | `barge_in_min_speech_ms` | Voiced speech, default `300`, that interrupts a speaking assistant. A shorter sound (a cough, a door, speaker echo) does not interrupt it. `0` interrupts on the first speech frame. |
