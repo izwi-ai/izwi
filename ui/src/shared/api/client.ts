@@ -146,9 +146,6 @@ const chatMethodNames = [
   "editChatThreadMessageStream",
   "regenerateChatThreadMessageStream",
   "deleteChatThreadMessage",
-  "createAgentSession",
-  "getAgentSession",
-  "createAgentTurn",
   "chatCompletions",
   "chatCompletionsStream",
   "createResponse",
@@ -159,6 +156,7 @@ const chatMethodNames = [
 ] as const;
 
 const voiceMethodNames = [
+  "listVoiceToolServers",
   "getVoiceProfile",
   "updateVoiceProfile",
   "listVoiceObservations",

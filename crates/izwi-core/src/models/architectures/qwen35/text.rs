@@ -95,6 +95,35 @@ pub struct Qwen35TextRuntimeState {
 }
 
 impl Qwen35TextRuntimeState {
+    /// Every DeltaNet layer's conv history (oldest first) and recurrent
+    /// state, flattened, for tests comparing two sessions exactly.
+    #[cfg(test)]
+    pub(crate) fn linear_state_values(&self) -> Vec<f32> {
+        let mut values = Vec::new();
+        for layer in &self.layers {
+            if let Qwen35LayerRuntimeState::Linear {
+                conv_state,
+                recurrent_state,
+            } = layer
+            {
+                let tensors = conv_state
+                    .iter()
+                    .flat_map(ConvRingState::ordered_slots)
+                    .chain(recurrent_state.iter().cloned());
+                for tensor in tensors {
+                    values.extend(
+                        tensor
+                            .to_dtype(DType::F32)
+                            .and_then(|tensor| tensor.flatten_all())
+                            .and_then(|tensor| tensor.to_vec1::<f32>())
+                            .unwrap(),
+                    );
+                }
+            }
+        }
+        values
+    }
+
     /// Backing allocations retained by the per-request text runtime state.
     ///
     /// This intentionally excludes model-global caches (notably full-attention

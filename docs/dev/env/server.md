@@ -18,6 +18,8 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_ALLOW_UNAUTHENTICATED_NETWORK` | `false` | Serve a non-loopback bind without IZWI_API_KEY (same as --allow-unauthenticated-network). |
 | `IZWI_LOOPBACK_PUBLISHED` | `false` | The port is published on the host's loopback only (a container's `-p 127.0.0.1:…`): treat the bind as loopback, so no key is required and only loopback or IZWI_ALLOWED_HOSTS Host names are served. |
 | `IZWI_TRUST_GATEWAY_TENANT_HEADER` | `false` | Keep files, batches, jobs and speech lookups apart per gateway tenant: a request that carries the API key (any request when no key is set) acts for the tenant its `X-Izwi-Gateway-Tenant` header names, which an Izwi gateway sets for every caller. Anyone who can reach the server with the key can name any tenant, so enable it only where the gateway is the server's sole client. Off, the header is ignored. |
+| `IZWI_MCP_ALLOWED_HOSTS` | unset | Comma-separated hosts (`host` or `host:port`, `*` for any) whose MCP servers a voice or Realtime session may name. The server connects to those servers itself, so list only hosts every API client may reach through it. Empty turns MCP tools off. |
+| `IZWI_MCP_SERVERS_FILE` | `mcp.json` in the platform data directory | A JSON file of MCP servers set up on this server, in the `{"mcpServers": {label: {"command", "args", "env"} \| {"url", "headers"}}}` form other MCP clients use. A voice or Realtime session uses one by naming its label without a URL; a local command runs once and is shared by every session. Only this file can name a command. Read once, at first use. |
 | `IZWI_ALLOWED_HOSTS` | unset | Comma-separated extra Host names to accept (port optional). On a non-loopback bind, setting it turns the Host check on. |
 | `IZWI_PRELOAD_MODELS` | unset | Comma-separated model ids loaded at start-up; readiness waits for them. |
 | `IZWI_WARMUP_PRELOADED_MODELS` | `true` | Run a warm-up request on each preloaded model. |
@@ -53,7 +55,6 @@ The local role (`izwi-server`, the default `--role local`) reads these variables
 | `IZWI_REALTIME_DEFAULT_PROFILE` | ``izwi-voice`` | The OpenAI Realtime profile a session gets when `model` is absent, empty or an OpenAI model name (`gpt-realtime*`). |
 | `IZWI_REALTIME_PERSIST` | `off` | `1` records OpenAI Realtime sessions and their turns in the voice history; off, they leave nothing behind. |
 | `IZWI_MAX_RESPONSE_STORE_ENTRIES` | `512` | Stored Responses API responses kept in memory. |
-| `IZWI_MAX_AGENT_SESSION_STORE_ENTRIES` | `512` | Agent sessions kept in memory. |
 | `IZWI_OPENAI_COMPAT_PROFILE` | `strict` | OpenAI compatibility profile: `strict` or `relaxed`. |
 | `IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB` | 64 (relaxed) or the strict profile's limit | Largest audio upload on the OpenAI audio and media routes, in MiB. |
 | `IZWI_MEDIA_DECODE_LANES` | `2` | Audio uploads decoded at once. |

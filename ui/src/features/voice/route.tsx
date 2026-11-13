@@ -6,6 +6,7 @@ import {
   isVoiceEngineReady,
   resolveCompactVoiceModel,
   resolveVoiceSpeaker,
+  voiceEngineCallsTools,
   voiceEngineDownloadBytes,
   voiceEngineModels,
   voiceEngineSpeakers,
@@ -25,6 +26,7 @@ import {
   type RuntimeStatus,
   type VoicePageProps,
 } from "@/features/voice/realtime/support";
+import { voiceStreamOptions } from "@/features/voice/agentSettings";
 import { useVoicePreferences } from "@/features/voice/useVoicePreferences";
 import { useVoiceSession } from "@/features/voice/useVoiceSession";
 
@@ -102,11 +104,33 @@ export function VoicePage({
       isReady ? voiceSessionEngine(preferences.engine, compactModel) : null,
     [compactModel, isReady, preferences.engine],
   );
+  const streamOptions = useMemo(
+    () =>
+      voiceStreamOptions(
+        preferences.agentSettings,
+        preferences.engine === "compact" ? "unified" : "modular",
+        voiceEngineCallsTools(preferences.engine, compactModel),
+        preferences.configuredToolServers.map((server) => server.label),
+      ),
+    [
+      compactModel,
+      preferences.agentSettings,
+      preferences.configuredToolServers,
+      preferences.engine,
+    ],
+  );
+  const { agents } = preferences.agentSettings;
+  const agentName = useCallback(
+    (id: string) => agents.find((agent) => agent.id === id)?.name || id,
+    [agents],
+  );
   const session = useVoiceSession({
     engine: sessionEngine,
     // None when the engine picks its own voice (LFM3 Audio).
     speaker: speaker?.id,
     systemPrompt: preferences.savedPrompt,
+    streamOptions,
+    agentName,
   });
 
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);

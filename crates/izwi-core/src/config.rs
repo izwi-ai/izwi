@@ -185,6 +185,12 @@ pub struct ResolvedConcurrency {
     pub chunked_prefill: bool,
 }
 
+/// The request the prefix page budget is fitted beside on CPU and Metal while
+/// the context length is automatic: the effective context is only known once
+/// a model loads, and each model's prefix index is then bounded by its own
+/// arena, whose pages a request takes back when it needs them.
+pub(crate) const PORTABLE_AUTO_CONTEXT_RESERVE_TOKENS: usize = 4096;
+
 /// Chunked prefill when the operator did not choose: on for a multi-user
 /// `max_num_seqs`, so one user's long prompt prefills between the others'
 /// decode steps instead of freezing them. CUDA chat chunks regardless.
@@ -1062,7 +1068,9 @@ impl EngineConfig {
     /// context against the concrete memory plan. Explicit operator intent is
     /// preserved; Auto starts from the historical safe portable baseline.
     pub(crate) fn portable_context_ceiling(&self) -> usize {
-        self.max_sequence_length.explicit_tokens().unwrap_or(4096)
+        self.max_sequence_length
+            .explicit_tokens()
+            .unwrap_or(PORTABLE_AUTO_CONTEXT_RESERVE_TOKENS)
     }
 
     /// The configured prefix page budget, or the default when it is

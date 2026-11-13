@@ -701,9 +701,6 @@ These routes back the desktop UI's saved history and reusable assets. Canonical 
 | `GET, POST` | `/v1/chat/threads` | List or create durable local chat threads |
 | `GET, PATCH, DELETE` | `/v1/chat/threads/:thread_id` | Fetch, update, or delete a chat thread |
 | `GET, POST` | `/v1/chat/threads/:thread_id/messages` | List messages or send a thread message |
-| `POST` | `/v1/agent/sessions` | Create preview process-local agent session metadata and a linked chat thread |
-| `GET` | `/v1/agent/sessions/:session_id` | Fetch retained agent session metadata |
-| `POST` | `/v1/agent/sessions/:session_id/turns` | Run one agent turn |
 | `GET, PATCH` | `/v1/voice/profile` | Fetch or update voice profile settings |
 | `GET, DELETE` | `/v1/voice/observations` | List or clear voice memory observations |
 | `DELETE` | `/v1/voice/observations/:observation_id` | Delete one voice memory observation |
@@ -745,13 +742,6 @@ Current preview retention rules:
 - When the cap is exceeded, the oldest response records by `created_at` are evicted.
 - Streaming response records are stored only after terminal completion or failure, not as a durable in-progress lifecycle object.
 - `GET`, `DELETE`, `cancel`, and `input_items` operate only on currently retained process-local records.
-
-Agent session metadata has the same preview shape: `/v1/agent/sessions` stores
-session id, agent id, model id, planning mode, and the linked chat thread id in
-bounded process memory. The cap is `IZWI_MAX_AGENT_SESSION_STORE_ENTRIES`, also
-defaulting to 512 entries, and eviction uses `updated_at`. The linked chat
-thread and messages are SQLite-backed durable local history; the agent-session
-id and metadata are not durable across server restarts.
 
 ### 10.3 Admin Endpoints
 

@@ -19,16 +19,15 @@ use std::time::{Duration, Instant};
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures::StreamExt;
 use izwi_agent::{
-    planner::{PlanningMode, SimplePlanner},
-    strip_reasoning, AgentDefinition, AgentEngine, AgentSession, AgentTurnOptions, HistoryBudget,
-    MemoryMessage, MemoryMessageMeta, MemoryMessageRole, MemoryStore, ModelBackend, ModelOutput,
-    ModelRequest, ReasoningFilter, TurnInput,
+    strip_reasoning, AgentDefinition, AgentEngine, AgentEvent, AgentSession, AgentSet,
+    AgentTurnOptions, BackgroundResults, HistoryBudget, MemoryMessage, MemoryMessageMeta,
+    MemoryMessageRole, ReasoningFilter, TurnEvents, TurnInput,
 };
 use izwi_core::{
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
-    resolve_asr_model_variant, ChatMessage, ChatRequestConfig, ChatRole, ChatTruncation,
-    GenerationConfig, GenerationParams, GenerationRequest, RuntimeRequestContext, RuntimeService,
-    SessionModelLeases, VoiceLatency, VoiceSession, VoiceSessionPhase, WorkloadClass,
+    resolve_asr_model_variant, ChatMessage, ChatRole, GenerationConfig, GenerationParams,
+    GenerationRequest, RuntimeRequestContext, RuntimeService, SessionModelLeases, VoiceLatency,
+    VoiceSession, VoiceSessionPhase, WorkloadClass,
 };
 use izwi_vad::{
     configured_snr_margin_db, sanitize_score_threshold, sanitize_snr_margin, EndpointConfig,
@@ -42,6 +41,11 @@ use tokio::sync::Notify;
 use tracing::warn;
 
 use crate::api::openai::tool_calls::{parse_answer, ToolCallFormat, ToolCallParser};
+use crate::app::agent_runtime::{
+    cancel_follows, cancel_with, drive_turn, finish_name, ChatAgentBackend, ConversationSummary,
+    ThreadMemory, TurnTrace,
+};
+use crate::app::mcp::{McpAccess, McpServerConfig, McpTools};
 use crate::app::realtime_codec::{AudioOutputEncoder, OutputAudioFormat};
 use crate::app::realtime_protocol::{
     RealtimeAudioFormat, RealtimeAudioGapAction, RealtimeClose, RealtimeCloseCode,
@@ -55,13 +59,9 @@ use crate::app::realtime_transport::{
     OutboundLimits, OutboundMailbox, OutboundMessage,
 };
 use crate::app::voice_reply::{SegmentJoiner, SpeechSegmenter, SpokenLedger};
-use crate::app::voice_tools::{
-    builtin_tool_registry, run_builtin_call, FunctionCallOutcome, FunctionExecutor,
-    PendingFunctionCalls, VoiceTools, MAX_TOOL_ROUNDS, MAX_TURN_FUNCTION_CALLS,
-};
-use crate::chat_store::ChatStore;
+use crate::app::voice_tools::{function_call_message, PendingFunctionCalls, VoiceTools};
 use crate::ids::new_uuid;
-use crate::state::{AppState, OwnedAdmissionPermit, StoredAgentSessionRecord};
+use crate::state::{AppState, OwnedAdmissionPermit};
 use crate::voice_defaults::{
     DEFAULT_VOICE_AGENT_ID, DEFAULT_VOICE_AGENT_NAME, DEFAULT_VOICE_AGENT_SYSTEM_PROMPT,
 };
@@ -506,6 +506,33 @@ struct InputStreamStartEvent {
     max_utterance_ms: Option<u32>,
     #[serde(default)]
     pre_roll_ms: Option<u32>,
+    /// Let the silence that ends an utterance follow the speaker's own
+    /// pauses, between `adaptive_silence_floor_ms` (default 450) and
+    /// `silence_duration_ms`. Off by default.
+    #[serde(default)]
+    adaptive_silence: Option<bool>,
+    #[serde(default)]
+    adaptive_silence_floor_ms: Option<u32>,
+    /// Modular mode: start transcribing an utterance at a short pause (a
+    /// third of the end-of-utterance silence, 200 to 400 ms), so a pause
+    /// that does end it finds the transcript already under way. A pause
+    /// the speaker talks through wastes that transcription. Off by
+    /// default.
+    #[serde(default)]
+    early_transcription: Option<bool>,
+    /// Modular mode: also start writing the reply at that pause (this
+    /// turns `early_transcription` on). The reply stores nothing and runs
+    /// no tool until the pause has ended the utterance; if the speaker
+    /// goes on, it is dropped. Off by default.
+    #[serde(default)]
+    preemptive_generation: Option<bool>,
+    /// Pause the reply when the user seems to interrupt it, and play it on
+    /// if the sound turns out to be no speech (noise, a cough) or, in
+    /// modular mode, speech with no words. Off, any sustained speech
+    /// cancels the reply at once. The client must honour `turn_paused` and
+    /// `turn_resumed`.
+    #[serde(default)]
+    resume_false_interruptions: Option<bool>,
     #[serde(default)]
     barge_in_min_speech_ms: Option<u32>,
     /// Energy above the noise floor, in dB, a frame needs to start an
@@ -517,8 +544,9 @@ struct InputStreamStartEvent {
     /// `pcm_i16` (default), `g711_ulaw` or `g711_alaw`.
     #[serde(default)]
     output_audio_format: Option<String>,
-    /// Function tools a unified LFM3-Audio turn may call; the client
-    /// answers their calls with `function_call_output`.
+    /// Function tools a turn may call; the client answers their calls
+    /// with `function_call_output`. They need a chat model with a
+    /// tool-calling template, or LFM3-Audio in unified mode.
     #[serde(default)]
     tools: Option<Vec<serde_json::Value>>,
     /// Whether those turns may call the server's built-in tools
@@ -528,6 +556,95 @@ struct InputStreamStartEvent {
     /// How long a turn waits for the client's output of a call.
     #[serde(default)]
     function_call_timeout_ms: Option<u64>,
+    /// What a modular reply says when a tool has kept it waiting and it
+    /// has said nothing yet. Default "One moment." for English sessions and
+    /// nothing otherwise; an empty string turns it off.
+    #[serde(default)]
+    tool_wait_phrase: Option<String>,
+    /// MCP servers whose tools a turn may call (`label`, `url`, optional
+    /// `headers` and `allowed_tools`). The server connects only to hosts in
+    /// `IZWI_MCP_ALLOWED_HOSTS`.
+    #[serde(default)]
+    mcp_servers: Option<Vec<McpServerConfig>>,
+    /// Modular mode: the agents of the session. The first holds the
+    /// conversation at the start; an agent hands it to another by calling
+    /// `transfer_to_<id>`, and records its task by calling
+    /// `complete_<task name>`. Without `agents` the session is one agent
+    /// with the session's system prompt.
+    #[serde(default)]
+    agents: Option<Vec<VoiceAgentConfig>>,
+}
+
+/// One agent of a voice session.
+#[derive(Debug, Clone, Deserialize)]
+struct VoiceAgentConfig {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    /// The agent's system prompt; the session's when absent.
+    #[serde(default)]
+    instructions: Option<String>,
+    /// The session tools the agent may call; all of them when absent.
+    #[serde(default)]
+    tools: Option<Vec<String>>,
+    #[serde(default)]
+    handoffs: Vec<String>,
+    #[serde(default)]
+    handoff_description: Option<String>,
+    #[serde(default)]
+    task: Option<izwi_agent::TaskSpec>,
+}
+
+/// The agents of a session as the runtime's, each on `model_id`. An agent
+/// without instructions keeps an empty prompt and takes the session's at
+/// its turn.
+fn voice_agent_set(
+    agents: Option<Vec<VoiceAgentConfig>>,
+    model_id: &str,
+    tools: Option<&VoiceTools>,
+) -> Result<Option<AgentSet>, String> {
+    let Some(agents) = agents.filter(|agents| !agents.is_empty()) else {
+        return Ok(None);
+    };
+    let offered = tools
+        .map(|tools| {
+            tools
+                .registry(&PendingFunctionCalls::default())
+                .tool_names()
+        })
+        .unwrap_or_default();
+    let agents = agents
+        .into_iter()
+        .map(|agent| {
+            for tool in agent.tools.iter().flatten() {
+                if !offered.contains(tool) {
+                    return Err(format!(
+                        "Agent `{}` names the tool `{tool}`, which the session does not offer",
+                        agent.id
+                    ));
+                }
+            }
+            Ok(AgentDefinition {
+                name: agent.name.unwrap_or_else(|| agent.id.clone()),
+                tools: agent.tools,
+                handoffs: agent.handoffs,
+                handoff_description: agent.handoff_description,
+                task: agent.task,
+                ..AgentDefinition::new(
+                    agent.id,
+                    "",
+                    agent.instructions.unwrap_or_default(),
+                    model_id,
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    AgentSet::new(agents).map(Some).map_err(|err| match err {
+        izwi_agent::AgentError::InvalidAgent(message) => {
+            format!("Invalid `agents`: {message}")
+        }
+        other => other.to_string(),
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -556,6 +673,12 @@ pub(crate) struct ModularVoiceTurnConfig {
     asr_language: Option<String>,
     max_output_tokens: usize,
     output_format: OutputAudioFormat,
+    /// The tools its turns may call, when the chat model can call tools.
+    tools: Option<VoiceTools>,
+    /// Said when a tool keeps a silent reply waiting.
+    tool_wait_phrase: Option<String>,
+    /// The session's agents, when it has more than the default one.
+    agents: Option<AgentSet>,
 }
 
 #[derive(Debug, Clone)]
@@ -781,6 +904,17 @@ struct ConnectionState {
     next_turn_generation: u64,
     /// The client's tool calls the session's turns await.
     function_calls: PendingFunctionCalls,
+    /// The results of background tools, for the next turn to tell.
+    background_results: BackgroundResults,
+    /// A transcript started at a pause, for the turn that pause may begin.
+    early_transcript: Option<EarlyTranscript>,
+    /// Whether a reply is started at the pause that may end an utterance.
+    preemptive_generation: bool,
+    /// Whether speech over a reply pauses it until it is known to be an
+    /// interruption.
+    resume_false_interruptions: bool,
+    /// The reply paused that way, if any.
+    held_reply: HeldReply,
 }
 
 impl Default for ConnectionState {
@@ -804,6 +938,11 @@ impl Default for ConnectionState {
             owner_instance_id: process_owner_instance_id().to_string(),
             next_turn_generation: 0,
             function_calls: PendingFunctionCalls::default(),
+            background_results: BackgroundResults::default(),
+            early_transcript: None,
+            preemptive_generation: false,
+            resume_false_interruptions: false,
+            held_reply: HeldReply::default(),
         }
     }
 }
@@ -844,6 +983,7 @@ impl ConnectionState {
         {
             self.active_turn = None;
         }
+        self.held_reply.release_finished();
     }
 
     fn has_running_turn(&self) -> bool {
@@ -851,6 +991,7 @@ impl ConnectionState {
             .as_ref()
             .map(|turn| !turn.task.is_finished())
             .unwrap_or(false)
+            || self.held_reply.is_running()
     }
 
     fn close_voice_session_if_idle(&mut self) -> Option<String> {
@@ -911,6 +1052,8 @@ fn dispatch_utterance_outcome(
             )
         }
         UtteranceOutcome::Rejected(evt) => {
+            // The sound that paused a reply was no speech: it plays on.
+            conn.held_reply.resume(out_tx);
             state.runtime.record_voice_speech_rejected();
             send_json(
                 out_tx,
@@ -937,6 +1080,26 @@ fn finalize_stream_vad_utterance(
     wav_bytes: Vec<u8>,
     end_reason: UtteranceEndReason,
 ) -> Result<(), String> {
+    // A modular turn that may resume the reply it spoke over decides once
+    // it has its transcript: the reply stays paused until then. Any other
+    // turn interrupts it now.
+    let decides_later = conn.resume_false_interruptions
+        && matches!(commit.turn_config, VoiceTurnConfig::Modular(_));
+    let paused_reply = if decides_later {
+        let running = conn
+            .active_turn
+            .take_if(|turn| !turn.task.is_finished() || turn.control.is_speaking());
+        conn.held_reply.pause(out_tx, running, "barge_in");
+        conn.held_reply
+            .holds_turn()
+            .then(|| conn.held_reply.clone())
+    } else {
+        if conn.held_reply.interrupt(out_tx, "barge_in") {
+            state.runtime.record_voice_interruption();
+            state.runtime.record_voice_barge_in();
+        }
+        None
+    };
     if interrupt_active_turn(out_tx, &mut conn.active_turn, "preempted_by_new_turn") {
         state.runtime.record_voice_interruption();
         conn.voice_session.interrupt("preempted_by_new_turn");
@@ -986,6 +1149,13 @@ fn finalize_stream_vad_utterance(
             output_generation,
             model_leases: conn.model_leases.clone(),
             function_calls: conn.function_calls.clone(),
+            background_results: conn.background_results.clone(),
+            early_transcript: conn
+                .early_transcript
+                .take()
+                .filter(|early| early.utterance_seq == commit.utterance_seq)
+                .map(|early| early.task),
+            paused_reply,
         },
         record,
         wav_bytes,
@@ -1142,6 +1312,9 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
         }
     }
 
+    if conn.held_reply.interrupt(&out_tx, "socket_closed") {
+        state.runtime.record_voice_interruption();
+    }
     if interrupt_active_turn(&out_tx, &mut conn.active_turn, "socket_closed") {
         state.runtime.record_voice_interruption();
     }
@@ -1230,6 +1403,11 @@ async fn handle_text_message(
                 silence_duration_ms,
                 max_utterance_ms,
                 pre_roll_ms,
+                adaptive_silence,
+                adaptive_silence_floor_ms,
+                early_transcription,
+                preemptive_generation,
+                resume_false_interruptions,
                 barge_in_min_speech_ms,
                 vad_snr_margin_db,
                 input_sample_rate,
@@ -1237,6 +1415,9 @@ async fn handle_text_message(
                 tools,
                 builtin_tools,
                 function_call_timeout_ms,
+                tool_wait_phrase,
+                mcp_servers,
+                agents,
             } = *start;
             if !conn.started {
                 return Err("Session not started. Send `session_start` first.".to_string());
@@ -1262,6 +1443,7 @@ async fn handle_text_message(
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
 
+            let normalized_asr_language_for_phrase = normalized_asr_language.clone();
             let turn_config = match mode {
                 RealtimeVoiceMode::Modular => {
                     let Some(asr_model_id) = normalized_asr else {
@@ -1296,21 +1478,49 @@ async fn handle_text_message(
                     let tts_variant = parse_tts_model_variant(tts_model_id.as_str())
                         .map_err(|err| format!("Unsupported TTS model: {err}"))?;
                     validate_realtime_tts_model(tts_variant)?;
-                    VoiceTools::parse(tools, builtin_tools, function_call_timeout_ms, false)?;
+                    // Offering tools lengthens every turn's prompt, so a
+                    // modular session offers the built-in ones only when
+                    // asked.
+                    let tools = VoiceTools::parse(
+                        tools,
+                        Some(builtin_tools.unwrap_or(false)),
+                        function_call_timeout_ms,
+                        ToolCallFormat::of(text_variant).is_some(),
+                    )?;
+                    let tools = connect_mcp_tools(
+                        tools,
+                        mcp_servers,
+                        ToolCallFormat::of(text_variant).is_some(),
+                    )
+                    .await?;
+
+                    if agents.is_some() && ToolCallFormat::of(text_variant).is_none() {
+                        return Err("`agents` need a chat model that can call tools".to_string());
+                    }
+                    let agents = voice_agent_set(agents, &text_model_id, tools.as_ref())?;
 
                     VoiceTurnConfig::Modular(ModularVoiceTurnConfig {
                         asr_model_id,
                         text_model_id,
                         tts_model_id,
                         speaker: normalized_speaker.clone(),
-                        asr_language: normalized_asr_language,
+                        asr_language: normalized_asr_language.clone(),
                         max_output_tokens: max_output_tokens
                             .unwrap_or(VOICE_DEFAULT_MAX_OUTPUT_TOKENS)
                             .clamp(1, 4096),
                         output_format,
+                        tools,
+                        tool_wait_phrase: resolve_tool_wait_phrase(
+                            tool_wait_phrase,
+                            normalized_asr_language_for_phrase.as_deref(),
+                        ),
+                        agents,
                     })
                 }
                 RealtimeVoiceMode::Unified => {
+                    if agents.is_some() {
+                        return Err("`agents` need modular mode".to_string());
+                    }
                     let Some(s2s_model_id) = normalized_s2s else {
                         return Err(
                             "Missing required model id (`s2s_model_id`) for unified voice mode."
@@ -1331,6 +1541,12 @@ async fn handle_text_message(
                         function_call_timeout_ms,
                         variant.family() == izwi_core::ModelFamily::Lfm3Audio,
                     )?;
+                    let tools = connect_mcp_tools(
+                        tools,
+                        mcp_servers,
+                        variant.family() == izwi_core::ModelFamily::Lfm3Audio,
+                    )
+                    .await?;
                     VoiceTurnConfig::Unified(UnifiedVoiceTurnConfig {
                         s2s_model_id,
                         speaker: normalized_speaker,
@@ -1385,26 +1601,43 @@ async fn handle_text_message(
                 ),
                 input_sample_rate_hint: input_sample_rate
                     .filter(|sr| *sr >= 8_000 && *sr <= 192_000),
+                adaptive_silence_floor_ms: adaptive_silence
+                    .unwrap_or(false)
+                    .then(|| adaptive_silence_floor_ms.unwrap_or(450).clamp(200, 5_000)),
+                early_transcription: (early_transcription.unwrap_or(false)
+                    || preemptive_generation.unwrap_or(false))
+                    && mode == RealtimeVoiceMode::Modular,
             }));
             conn.voice_session.begin_listening();
+            conn.resume_false_interruptions = resume_false_interruptions.unwrap_or(false);
+            conn.preemptive_generation =
+                preemptive_generation.unwrap_or(false) && mode == RealtimeVoiceMode::Modular;
 
-            send_json(
-                out_tx,
-                json!({
-                    "type": "input_stream_ready",
-                    "output_audio_format": output_format.as_str(),
-                    "vad": {
-                        "backend": "earshot",
-                        "threshold": conn.streaming_input.as_ref().map(|s| s.config.vad_threshold),
-                        "score_sample_rate": VAD_SAMPLE_RATE,
-                        "score_frame_ms": VAD_FRAME_MS,
-                        "snr_margin_db": conn.streaming_input.as_ref().map(|s| s.config.snr_margin_db),
-                        "min_speech_ms": conn.streaming_input.as_ref().map(|s| s.config.min_speech_ms),
-                        "silence_duration_ms": conn.streaming_input.as_ref().map(|s| s.config.silence_duration_ms),
-                        "barge_in_min_speech_ms": conn.streaming_input.as_ref().map(|s| s.config.barge_in_min_speech_ms),
-                    }
-                }),
-            );
+            let mut ready = json!({
+                "type": "input_stream_ready",
+                "output_audio_format": output_format.as_str(),
+                "vad": {
+                    "backend": "earshot",
+                    "threshold": conn.streaming_input.as_ref().map(|s| s.config.vad_threshold),
+                    "score_sample_rate": VAD_SAMPLE_RATE,
+                    "score_frame_ms": VAD_FRAME_MS,
+                    "snr_margin_db": conn.streaming_input.as_ref().map(|s| s.config.snr_margin_db),
+                    "min_speech_ms": conn.streaming_input.as_ref().map(|s| s.config.min_speech_ms),
+                    "silence_duration_ms": conn.streaming_input.as_ref().map(|s| s.config.silence_duration_ms),
+                    "barge_in_min_speech_ms": conn.streaming_input.as_ref().map(|s| s.config.barge_in_min_speech_ms),
+                }
+            });
+            if conn.resume_false_interruptions {
+                ready["resume_false_interruptions"] = json!(true);
+            }
+            if let Some(floor_ms) = conn
+                .streaming_input
+                .as_ref()
+                .and_then(|input| input.config.adaptive_silence_floor_ms)
+            {
+                ready["vad"]["adaptive_silence_floor_ms"] = json!(floor_ms);
+            }
+            send_json(out_tx, ready);
             conn.model_warmup = Some(AbortOnDropTask::new(tokio::spawn(warm_session_models(
                 state.runtime.clone(),
                 conn.model_leases.clone(),
@@ -1434,6 +1667,9 @@ async fn handle_text_message(
         }
         ClientEvent::Interrupt { reason } => {
             let reason = reason.unwrap_or_else(|| "client_interrupt".to_string());
+            if conn.held_reply.interrupt(out_tx, &reason) {
+                state.runtime.record_voice_interruption();
+            }
             if interrupt_active_turn(out_tx, &mut conn.active_turn, &reason) {
                 state.runtime.record_voice_interruption();
                 conn.voice_session.interrupt(reason);
@@ -1455,6 +1691,7 @@ async fn handle_text_message(
                 .as_ref()
                 .filter(|turn| turn.utterance_seq == utterance_seq)
                 .map(|turn| turn.control.clone())
+                .or_else(|| conn.held_reply.control_of(utterance_seq))
                 .or_else(|| conn.conversation.reply_of(utterance_seq))
                 .ok_or_else(|| {
                     format!("No assistant reply of utterance {utterance_seq} to truncate")
@@ -1539,11 +1776,28 @@ async fn handle_binary_message(
         );
     }
 
-    if frame_result.barge_in {
+    // With `resume_false_interruptions` sustained speech only pauses the
+    // reply: whether it was an interruption is known when the utterance
+    // ends (and, in modular mode, has been transcribed).
+    if frame_result.barge_in && conn.resume_false_interruptions {
+        let running = conn
+            .active_turn
+            .take_if(|turn| !turn.task.is_finished() || turn.control.is_speaking());
+        if conn.held_reply.pause(out_tx, running, "barge_in") {
+            if let Some(started) = conn.speech_started_at {
+                state
+                    .runtime
+                    .record_voice_latency(VoiceLatency::BargeIn, started.elapsed());
+            }
+        }
+    } else if frame_result.barge_in {
         // A finished reply may still be playing on the client.
         conn.conversation.interrupt_playback();
     }
-    if frame_result.barge_in && interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in") {
+    if frame_result.barge_in
+        && !conn.resume_false_interruptions
+        && interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in")
+    {
         state.runtime.record_voice_interruption();
         state.runtime.record_voice_barge_in();
         if let Some(started) = conn.speech_started_at {
@@ -1552,6 +1806,49 @@ async fn handle_binary_message(
                 .record_voice_latency(VoiceLatency::BargeIn, started.elapsed());
         }
         conn.voice_session.interrupt("barge_in");
+    }
+
+    if frame_result.speech_resumed {
+        conn.early_transcript = None;
+    }
+    if let Some(early) = frame_result.early {
+        // A reply is started ahead only when the conversation is settled:
+        // no earlier reply still being written, or held for a decision.
+        let reply_plan = match (conn.turn_config.as_ref(), conn.voice_session_id.as_ref()) {
+            (Some(VoiceTurnConfig::Modular(config)), Some(voice_session_id))
+                if conn.preemptive_generation
+                    && !conn.has_running_turn()
+                    && !conn.held_reply.holds_turn() =>
+            {
+                Some(AgentReplyPlan {
+                    state: state.clone(),
+                    correlation_id: correlation_id.to_string(),
+                    voice_session_id: voice_session_id.clone(),
+                    voice_profile_id: conn.voice_profile_id.clone(),
+                    system_prompt: conn.system_prompt.clone(),
+                    agent_session: conn.agent_session.clone(),
+                    conversation: conn.conversation.clone(),
+                    model_leases: conn.model_leases.clone(),
+                    function_calls: conn.function_calls.clone(),
+                    background_results: conn.background_results.clone(),
+                    config: config.clone(),
+                })
+            }
+            _ => None,
+        };
+        if let Some(VoiceTurnConfig::Modular(config)) = conn.turn_config.as_ref() {
+            conn.early_transcript = Some(EarlyTranscript {
+                utterance_seq: early.utterance_seq,
+                task: spawn_early_transcript(
+                    state,
+                    correlation_id,
+                    &conn.model_leases,
+                    config,
+                    early.wav_bytes,
+                    reply_plan,
+                ),
+            });
+        }
     }
 
     if let Some(outcome) = frame_result.utterance_end {
@@ -1577,6 +1874,81 @@ struct TurnContext {
     output_generation: u64,
     model_leases: SessionModelLeases,
     function_calls: PendingFunctionCalls,
+    /// The results of background tools, for the next turn to tell.
+    background_results: BackgroundResults,
+    early_transcript: Option<EarlyTranscriptTask>,
+    /// The reply this turn's speech paused; the turn resumes or interrupts
+    /// it once it knows whether the speech had words.
+    paused_reply: Option<HeldReply>,
+}
+
+/// What was done ahead of a turn: the utterance's transcript, and with
+/// preemptive generation the reply to it, unconfirmed.
+struct EarlyTurnWork {
+    transcript: izwi_core::AsrTranscription,
+    reply: Option<AgentReply>,
+}
+
+type EarlyTranscriptTask = AbortOnDropTask<Result<EarlyTurnWork, String>>;
+
+/// The transcript of an utterance, started at a pause in it. Dropping it
+/// stops the work.
+struct EarlyTranscript {
+    utterance_seq: u64,
+    task: EarlyTranscriptTask,
+}
+
+/// Transcribe `wav_bytes` under its own admission permit, beside the
+/// session, and with a `reply_plan` start the reply to what was said.
+fn spawn_early_transcript(
+    state: &AppState,
+    correlation_id: &str,
+    model_leases: &SessionModelLeases,
+    config: &ModularVoiceTurnConfig,
+    wav_bytes: Vec<u8>,
+    reply_plan: Option<AgentReplyPlan>,
+) -> EarlyTranscriptTask {
+    let (state, model_leases) = (state.clone(), model_leases.clone());
+    let correlation_id = correlation_id.to_string();
+    let (asr_model_id, asr_language) = (config.asr_model_id.clone(), config.asr_language.clone());
+    AbortOnDropTask::new(tokio::spawn(async move {
+        let transcript = with_stage_permit(&state, async |runtime_context| {
+            model_leases
+                .hold(
+                    &state.runtime,
+                    resolve_asr_model_variant(Some(&asr_model_id)),
+                )
+                .await
+                .map_err(|err| model_load_error("ASR", err))?;
+            state
+                .runtime
+                .asr_transcribe_streaming_bytes_with_runtime_context(
+                    wav_bytes.as_slice(),
+                    Some(&asr_model_id),
+                    asr_language.as_deref(),
+                    None,
+                    izwi_core::AsrTaskOptions::default(),
+                    None,
+                    Some(&correlation_id),
+                    runtime_context,
+                    |_| {},
+                )
+                .await
+                .map_err(|err| format!("ASR failed: {err}"))
+        })
+        .await?;
+        let said = transcript.text.trim();
+        let reply = match reply_plan {
+            Some(plan) if !said.is_empty() => {
+                // A reply that cannot start is started again by the turn.
+                start_agent_reply(&plan, said, izwi_agent::TurnGate::closed())
+                    .await
+                    .ok()
+            }
+            _ => None,
+        };
+        Ok(EarlyTurnWork { transcript, reply })
+    }))
 }
 
 fn spawn_turn_task(
@@ -1600,6 +1972,9 @@ fn spawn_turn_task(
             output_generation,
             model_leases,
             function_calls,
+            background_results,
+            early_transcript,
+            paused_reply,
         } = context;
         let timeout_secs = state.request_timeout_secs.max(1);
         let timeout = Duration::from_secs(timeout_secs);
@@ -1650,61 +2025,82 @@ fn spawn_turn_task(
                         }),
                     );
 
-                    let transcript = with_stage_permit(&state, async |runtime_context| {
-                        model_leases
-                            .hold(
-                                &state.runtime,
-                                resolve_asr_model_variant(Some(&config.asr_model_id)),
-                            )
-                            .await
-                            .map_err(|err| model_load_error("ASR", err))?;
-                        let tx = out_tx.clone();
-                        let utt_id = commit.utterance_id.clone();
-                        let utt_seq = commit.utterance_seq;
-                        let asr_model_id = config.asr_model_id.clone();
-                        let asr_language = config.asr_language.clone();
-                        let mut snapshot = String::new();
-                        let runtime = state.runtime.clone();
-                        let endpointed_at = control.endpointed_at();
-                        state
-                            .runtime
-                            .asr_transcribe_streaming_bytes_with_runtime_context(
-                                audio_bytes.as_slice(),
-                                Some(&asr_model_id),
-                                asr_language.as_deref(),
-                                None,
-                                izwi_core::AsrTaskOptions::default(),
-                                None,
-                                Some(&correlation_id),
-                                runtime_context,
-                                move |delta| {
-                                    if delta.is_empty() {
-                                        return;
-                                    }
-                                    if snapshot.is_empty() {
-                                        runtime.record_voice_latency(
-                                            VoiceLatency::AsrFirstPartial,
-                                            endpointed_at.elapsed(),
-                                        );
-                                    }
-                                    snapshot.push_str(&delta);
-                                    send_turn_text_snapshot(
-                                        &tx,
-                                        output_generation,
-                                        format!("user-transcript-{utt_seq}"),
-                                        json!({
-                                            "type": "user_transcript_snapshot",
-                                            "utterance_id": utt_id,
-                                            "utterance_seq": utt_seq,
-                                            "text": snapshot,
-                                        }),
-                                    );
-                                },
-                            )
-                            .await
-                            .map_err(|err| format!("ASR failed: {err}"))
-                    })
-                    .await?;
+                    // A transcript started at the pause that ended the
+                    // utterance is the utterance's: only silence followed.
+                    let early = match early_transcript {
+                        Some(task) => task.join().await.ok().and_then(Result::ok),
+                        None => None,
+                    };
+                    let (early, early_reply) = match early {
+                        Some(work) => (Some(work.transcript), work.reply),
+                        None => (None, None),
+                    };
+                    let transcript = match early {
+                        Some(transcript) => {
+                            state.runtime.record_voice_latency(
+                                VoiceLatency::AsrFirstPartial,
+                                control.endpointed_at().elapsed(),
+                            );
+                            transcript
+                        }
+                        None => {
+                            with_stage_permit(&state, async |runtime_context| {
+                                model_leases
+                                    .hold(
+                                        &state.runtime,
+                                        resolve_asr_model_variant(Some(&config.asr_model_id)),
+                                    )
+                                    .await
+                                    .map_err(|err| model_load_error("ASR", err))?;
+                                let tx = out_tx.clone();
+                                let utt_id = commit.utterance_id.clone();
+                                let utt_seq = commit.utterance_seq;
+                                let asr_model_id = config.asr_model_id.clone();
+                                let asr_language = config.asr_language.clone();
+                                let mut snapshot = String::new();
+                                let runtime = state.runtime.clone();
+                                let endpointed_at = control.endpointed_at();
+                                state
+                                    .runtime
+                                    .asr_transcribe_streaming_bytes_with_runtime_context(
+                                        audio_bytes.as_slice(),
+                                        Some(&asr_model_id),
+                                        asr_language.as_deref(),
+                                        None,
+                                        izwi_core::AsrTaskOptions::default(),
+                                        None,
+                                        Some(&correlation_id),
+                                        runtime_context,
+                                        move |delta| {
+                                            if delta.is_empty() {
+                                                return;
+                                            }
+                                            if snapshot.is_empty() {
+                                                runtime.record_voice_latency(
+                                                    VoiceLatency::AsrFirstPartial,
+                                                    endpointed_at.elapsed(),
+                                                );
+                                            }
+                                            snapshot.push_str(&delta);
+                                            send_turn_text_snapshot(
+                                                &tx,
+                                                output_generation,
+                                                format!("user-transcript-{utt_seq}"),
+                                                json!({
+                                                    "type": "user_transcript_snapshot",
+                                                    "utterance_id": utt_id,
+                                                    "utterance_seq": utt_seq,
+                                                    "text": snapshot,
+                                                }),
+                                            );
+                                        },
+                                    )
+                                    .await
+                                    .map_err(|err| format!("ASR failed: {err}"))
+                            })
+                            .await?
+                        }
+                    };
                     let transcript_final_at = Instant::now();
                     state.runtime.record_voice_latency(
                         VoiceLatency::AsrFinal,
@@ -1712,6 +2108,17 @@ fn spawn_turn_task(
                     );
 
                     let user_text = transcript.text.trim().to_string();
+                    // Speech with words interrupts the reply it paused;
+                    // a sound with none lets it play on.
+                    let mut resumed_reply = false;
+                    if let Some(paused) = paused_reply.as_ref() {
+                        if is_wordless(&user_text) {
+                            resumed_reply = paused.resume(&out_tx);
+                        } else if paused.interrupt(&out_tx, "barge_in") {
+                            state.runtime.record_voice_interruption();
+                            state.runtime.record_voice_barge_in();
+                        }
+                    }
                     send_turn_json(
                         &out_tx,
                         output_generation,
@@ -1735,7 +2142,9 @@ fn spawn_turn_task(
                         .await
                         .map_err(|err| format!("Voice storage error: {err}"))?;
 
-                    if user_text.is_empty() {
+                    // A sound that let the paused reply play on is not
+                    // answered.
+                    if user_text.is_empty() || resumed_reply {
                         state
                             .voice_store
                             .complete_turn(turn_record_id.clone(), "no_input", None)
@@ -1764,44 +2173,49 @@ fn spawn_turn_task(
                         }),
                     );
 
-                    let agent_session_id = agent_session
-                        .ensure(
-                            &state,
-                            &voice_session_id,
-                            &system_prompt,
-                            &config.text_model_id,
-                        )
-                        .await?;
-                    let text_variant = parse_chat_model_variant(Some(&config.text_model_id))
-                        .map_err(|err| format!("Invalid chat model: {err}"))?;
-                    // The earlier replies join the history now, as far as
-                    // they were heard.
-                    conversation.store(&state).await;
+                    let plan = AgentReplyPlan {
+                        state: state.clone(),
+                        correlation_id: correlation_id.clone(),
+                        voice_session_id: voice_session_id.clone(),
+                        voice_profile_id: voice_profile_id.clone(),
+                        system_prompt: system_prompt.clone(),
+                        agent_session: agent_session.clone(),
+                        conversation: conversation.clone(),
+                        model_leases: model_leases.clone(),
+                        function_calls: function_calls.clone(),
+                        background_results: background_results.clone(),
+                        config: config.clone(),
+                    };
 
                     // The reply streams into speech: its sentences are
                     // synthesized while the text model is still writing.
                     let (deltas, delta_rx) = tokio::sync::mpsc::unbounded_channel();
                     let reply = async {
-                        let raw_text = with_stage_permit(&state, async |runtime_context| {
-                            model_leases
-                                .hold(&state.runtime, text_variant)
-                                .await
-                                .map_err(|err| model_load_error("chat", err))?;
-                            run_agent_turn(
-                                &state,
-                                &agent_session_id,
-                                &user_text,
-                                &config.text_model_id,
-                                config.max_output_tokens,
-                                voice_profile_id.as_deref(),
-                                &correlation_id,
-                                runtime_context,
-                                &control,
-                                &turn_record_id,
-                                deltas,
-                            )
-                            .await
-                        })
+                        // A reply started at the pause that ended the
+                        // utterance answers the same words.
+                        let started = match early_reply.filter(|early| early.input == user_text) {
+                            Some(early) => early,
+                            None => {
+                                start_agent_reply(&plan, &user_text, izwi_agent::TurnGate::opened())
+                                    .await?
+                            }
+                        };
+                        let raw_text = finish_agent_reply(
+                            &plan,
+                            started,
+                            &control,
+                            &turn_record_id,
+                            &|event: &AgentEvent| {
+                                if let Some(message) = function_call_message(
+                                    event,
+                                    &commit.utterance_id,
+                                    commit.utterance_seq,
+                                ) {
+                                    send_turn_json(&out_tx, output_generation, message);
+                                }
+                            },
+                            deltas,
+                        )
                         .await?;
                         let assistant_text = strip_reasoning(&raw_text);
                         // Silence is not an answer: the turn fails and says so.
@@ -1906,9 +2320,10 @@ fn spawn_turn_task(
 
                     let history_messages =
                         build_unified_history(&state, &voice_session_id, &turn_record_id).await?;
-                    let tools = config.tools.as_ref().map(|tools| UnifiedTurnTools {
+                    let tools = config.tools.as_ref().map(|tools| VoiceTurnTools {
                         tools,
                         pending: &function_calls,
+                        background: &background_results,
                         voice_session_id: &voice_session_id,
                     });
                     let generation = stream_unified_s2s_to_socket(
@@ -2202,7 +2617,7 @@ async fn build_unified_history(
         ] {
             if let Some(content) = text.map(|text| text.trim().to_string()) {
                 if !content.is_empty() {
-                    history.push(MemoryMessage { role, content });
+                    history.push(MemoryMessage::new(role, content));
                 }
             }
         }
@@ -2216,6 +2631,7 @@ async fn build_unified_history(
                 MemoryMessageRole::System => ChatRole::System,
                 MemoryMessageRole::User => ChatRole::User,
                 MemoryMessageRole::Assistant => ChatRole::Assistant,
+                MemoryMessageRole::Tool => ChatRole::Tool,
             },
             content: message.content,
         })
@@ -2236,17 +2652,52 @@ struct UnifiedReplyStream {
 }
 
 /// The tools a spoken turn offers and how their calls reach the client.
-struct UnifiedTurnTools<'a> {
+struct VoiceTurnTools<'a> {
     tools: &'a VoiceTools,
     pending: &'a PendingFunctionCalls,
+    /// Where background tools leave their results for the next turn.
+    background: &'a BackgroundResults,
     voice_session_id: &'a str,
 }
 
+/// Connect to a session's MCP servers and add their tools to its tools.
+async fn connect_mcp_tools(
+    tools: Option<VoiceTools>,
+    servers: Option<Vec<McpServerConfig>>,
+    calls_tools: bool,
+) -> Result<Option<VoiceTools>, String> {
+    let servers = servers.unwrap_or_default();
+    if servers.is_empty() {
+        return Ok(tools);
+    }
+    if !calls_tools {
+        return Err(
+            "MCP servers need a chat model that can call tools, or unified mode with an LFM3-Audio `s2s_model_id`"
+                .to_string(),
+        );
+    }
+    let mcp = McpTools::connect(&servers, &McpAccess::from_env()).await?;
+    VoiceTools::with_mcp(tools, mcp)
+}
+
+/// How long a tool may keep a reply silent before the reply says so.
+const TOOL_WAIT_PHRASE_AFTER: Duration = Duration::from_millis(1_500);
+
+/// What a reply says while a tool keeps it waiting: the session's phrase,
+/// or "One moment." when the session speaks English (or names no language).
+fn resolve_tool_wait_phrase(requested: Option<String>, language: Option<&str>) -> Option<String> {
+    match requested {
+        Some(phrase) => Some(phrase.trim().to_string()).filter(|phrase| !phrase.is_empty()),
+        None => language
+            .is_none_or(|language| language.to_ascii_lowercase().starts_with("en"))
+            .then(|| "One moment.".to_string()),
+    }
+}
+
 /// A unified spoken turn: the model's reply streamed to the socket. With
-/// tools, a round that calls them is followed by one that hears their
-/// results, at most [`MAX_TOOL_ROUNDS`] rounds and
-/// [`MAX_TURN_FUNCTION_CALLS`] calls; each round holds its own admission
-/// permit, so none is held while a tool runs.
+/// tools, the agent runtime follows a round that calls them with one that
+/// hears their results, within its round and call limits; each round holds
+/// its own admission permit, so none is held while a tool runs.
 #[allow(clippy::too_many_arguments)]
 async fn stream_unified_s2s_to_socket(
     state: &AppState,
@@ -2261,7 +2712,7 @@ async fn stream_unified_s2s_to_socket(
     max_output_tokens: usize,
     output_format: OutputAudioFormat,
     audio_bytes: &[u8],
-    tools: Option<UnifiedTurnTools<'_>>,
+    tools: Option<VoiceTurnTools<'_>>,
     control: &TurnControl,
     output_generation: u64,
     model_leases: &SessionModelLeases,
@@ -2294,197 +2745,112 @@ async fn stream_unified_s2s_to_socket(
         }),
     );
 
-    let stream = Arc::new(Mutex::new(UnifiedReplyStream::default()));
-    let delivery_error = Arc::new(Mutex::new(None::<String>));
-    let definitions = tools
+    let registry = tools
         .as_ref()
-        .map(|tools| tools.tools.definitions())
+        .map(|tools| tools.tools.registry(tools.pending))
         .unwrap_or_default();
-    let mut messages = history_messages;
-    let mut reply = izwi_core::SpeechToSpeechGeneration {
-        text: String::new(),
-        samples: Vec::new(),
-        sample_rate: 24_000,
-        input_transcription: None,
-        generation_time_ms: 0.0,
+    let rounds = UnifiedRounds {
+        state,
+        out_tx,
+        correlation_id,
+        utterance_id,
+        utterance_seq,
+        variant,
+        speaker,
+        system_prompt,
+        max_output_tokens,
+        output_format,
+        audio_bytes,
+        control,
+        output_generation,
+        definitions: registry.function_definitions(None),
+        stream: Arc::new(Mutex::new(UnifiedReplyStream::default())),
+        delivery_error: Arc::new(Mutex::new(None)),
+        progress: Mutex::new(UnifiedProgress {
+            messages: history_messages,
+            reply: izwi_core::SpeechToSpeechGeneration {
+                text: String::new(),
+                samples: Vec::new(),
+                sample_rate: 24_000,
+                input_transcription: None,
+                generation_time_ms: 0.0,
+            },
+        }),
     };
-    let mut calls_made = 0usize;
-    for round in 0..MAX_TOOL_ROUNDS {
-        {
-            let mut stream = lock_reply_stream(&stream);
-            stream.chunk_offset = stream.next_chunk;
-            stream.parser = (!definitions.is_empty())
-                .then(|| ToolCallParser::new(ToolCallFormat::Lfm3Xml).with_tools(&definitions));
-        }
-        let params = GenerationParams {
-            max_tokens: max_output_tokens.clamp(1, 4096),
-            speaker: speaker.clone(),
-            voice: speaker.clone(),
-            ..Default::default()
-        };
-        let permit = acquire_stage_permit(state).await?;
-        let generation = state
-            .runtime
-            .speech_to_speech_round_streaming_bytes(
-                variant,
-                audio_bytes,
-                messages.clone(),
-                definitions.clone(),
-                round == 0,
-                params,
-                Some(system_prompt),
-                Some(correlation_id),
-                permit.runtime_context(),
-                unified_chunk_sink(
-                    out_tx,
-                    utterance_id,
-                    utterance_seq,
-                    output_format,
-                    control,
-                    output_generation,
-                    state.runtime.clone(),
-                    stream.clone(),
-                    delivery_error.clone(),
-                ),
-            )
-            .await
-            .map_err(|err| format!("Unified speech-to-speech failed: {err}"))?;
-        drop(permit);
-        if let Some(err) = delivery_error
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .take()
-        {
-            return Err(err);
-        }
 
-        // The parser holds back text that could still open a call.
-        let tail = {
-            let mut stream = lock_reply_stream(&stream);
-            let tail = stream
-                .parser
-                .take()
-                .map(|mut parser| parser.finish().content)
-                .unwrap_or_default();
-            stream.text.push_str(&tail);
-            (!tail.is_empty()).then(|| stream.text.clone())
-        };
-        if let Some(text) = tail {
-            send_turn_text_snapshot(
-                out_tx,
-                output_generation,
-                format!("assistant-text-{utterance_seq}"),
-                json!({
-                    "type": "assistant_text_snapshot",
-                    "utterance_id": utterance_id,
-                    "utterance_seq": utterance_seq,
-                    "text": text,
-                }),
-            );
+    let agents = AgentSet::single(AgentDefinition::new("voice", "voice", "", s2s_model_id));
+    let session = AgentSession {
+        id: tools
+            .as_ref()
+            .map(|tools| tools.voice_session_id.to_string())
+            .unwrap_or_default(),
+        agent_id: "voice".to_string(),
+        thread_id: utterance_id.to_string(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    // The turn keeps its own conversation; nothing is read from the store.
+    let memory = ThreadMemory::new(state.chat_store.clone(), None);
+    let (cancel, _cancel_link) = cancel_with(control);
+    let (events, heard) = tokio::sync::mpsc::unbounded_channel();
+    let turn = izwi_agent::TurnContext {
+        agents: &agents,
+        memory: &memory,
+        model: &rounds,
+        tools: &registry,
+        events: TurnEvents::new(events),
+        cancel,
+        background: tools
+            .as_ref()
+            .map(|tools| tools.background.clone())
+            .unwrap_or_default(),
+        confirmed: izwi_agent::TurnGate::opened(),
+    };
+    let defaults = AgentTurnOptions::default();
+    let run = AgentEngine.run_conversation(
+        &turn,
+        &session,
+        Vec::new(),
+        vec![MemoryMessage::user(izwi_core::CHAT_AUDIO_PLACEHOLDER)],
+        "",
+        None,
+        AgentTurnOptions {
+            max_output_tokens,
+            tool_timeout: tools
+                .as_ref()
+                .map_or(defaults.tool_timeout, |tools| tools.tools.timeout),
+            persist_assistant_reply: false,
+            ..defaults
+        },
+    );
+    let mut trace = TurnTrace::start("voice_unified", correlation_id);
+    let result = drive_turn(run, heard, |event| {
+        trace.on_event(&event);
+        if let Some(message) = function_call_message(&event, utterance_id, utterance_seq) {
+            send_turn_json(out_tx, output_generation, message);
         }
-        if round == 0 {
-            reply.input_transcription = generation.input_transcription.clone();
+    })
+    .await;
+    trace.finish(match &result {
+        Ok(result) => finish_name(result.finish),
+        Err(_) => "error",
+    });
+    let result = result.map_err(|err| match err {
+        izwi_agent::AgentError::Model(message) | izwi_agent::AgentError::ToolLoop(message) => {
+            message
         }
-        if !generation.samples.is_empty() {
-            reply.sample_rate = generation.sample_rate;
-            reply.samples.extend_from_slice(&generation.samples);
-        }
-        reply.generation_time_ms += generation.generation_time_ms;
-
-        let Some(tools) = tools.as_ref() else {
-            break;
-        };
-        let parser = ToolCallParser::new(ToolCallFormat::Lfm3Xml).with_tools(&definitions);
-        let (_, calls) = parse_answer(parser, &generation.text);
-        if calls.is_empty() {
-            break;
-        }
-        if round + 1 == MAX_TOOL_ROUNDS {
-            return Err(format!(
-                "The reply called tools in each of its {MAX_TOOL_ROUNDS} rounds without answering"
-            ));
-        }
-        calls_made += calls.len();
-        if calls_made > MAX_TURN_FUNCTION_CALLS {
-            return Err(format!(
-                "The reply made more than {MAX_TURN_FUNCTION_CALLS} tool calls in one turn"
-            ));
-        }
-        if round == 0 {
-            messages.push(ChatMessage {
-                role: ChatRole::User,
-                content: izwi_core::CHAT_AUDIO_PLACEHOLDER.to_string(),
-            });
-        }
-        messages.push(ChatMessage {
-            role: ChatRole::Assistant,
-            content: generation.text.clone(),
-        });
-        let user_text = reply.input_transcription.clone().unwrap_or_default();
-        for call in calls {
-            let executor = tools.tools.executor(&call.function.name);
-            send_turn_json(
-                out_tx,
-                output_generation,
-                json!({
-                    "type": "function_call",
-                    "utterance_id": utterance_id,
-                    "utterance_seq": utterance_seq,
-                    "call_id": call.id,
-                    "name": call.function.name,
-                    "arguments": call.function.arguments,
-                    "executor": executor.as_ref().map(FunctionExecutor::as_str),
-                }),
-            );
-            let outcome = match executor {
-                Some(FunctionExecutor::Server(tool)) => {
-                    run_builtin_call(
-                        tool,
-                        &call.function.arguments,
-                        izwi_agent::ToolContext {
-                            session_id: tools.voice_session_id.to_string(),
-                            thread_id: utterance_id.to_string(),
-                            user_text: user_text.clone(),
-                            arguments: serde_json::Value::Null,
-                        },
-                        tools.tools.timeout,
-                    )
-                    .await
-                }
-                Some(FunctionExecutor::Client) => {
-                    tools
-                        .pending
-                        .await_output(&call.id, tools.tools.timeout, control.cancelled())
-                        .await
-                }
-                None => FunctionCallOutcome::error(format!(
-                    "No tool named `{}` is available.",
-                    call.function.name
-                )),
-            };
-            send_turn_json(
-                out_tx,
-                output_generation,
-                json!({
-                    "type": "function_call_completed",
-                    "utterance_id": utterance_id,
-                    "utterance_seq": utterance_seq,
-                    "call_id": call.id,
-                    "name": call.function.name,
-                    "status": outcome.status,
-                    "output": outcome.output,
-                }),
-            );
-            if control.is_cancelled() {
-                return Err("Turn cancelled".to_string());
-            }
-            messages.push(ChatMessage {
-                role: ChatRole::Tool,
-                content: outcome.output,
-            });
-        }
+        other => other.to_string(),
+    })?;
+    if result.finish == izwi_agent::TurnFinish::Cancelled {
+        return Err("Turn cancelled".to_string());
     }
-    reply.text = lock_reply_stream(&stream).text.clone();
+
+    let mut reply = rounds
+        .progress
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .reply;
+    reply.text = lock_reply_stream(&rounds.stream).text.clone();
 
     send_turn_json(
         out_tx,
@@ -2497,6 +2863,193 @@ async fn stream_unified_s2s_to_socket(
     );
 
     Ok(reply)
+}
+
+/// What a unified turn's rounds have built so far.
+struct UnifiedProgress {
+    /// The prompt's messages: the history, then each round's raw reply and
+    /// the results of its calls.
+    messages: Vec<ChatMessage>,
+    reply: izwi_core::SpeechToSpeechGeneration,
+}
+
+/// The rounds of a unified spoken turn as the agent runtime's model: each
+/// round hears the user's speech in the context so far and streams its
+/// speech and text to the socket.
+struct UnifiedRounds<'a> {
+    state: &'a AppState,
+    out_tx: &'a OutboundTx,
+    correlation_id: &'a str,
+    utterance_id: &'a str,
+    utterance_seq: u64,
+    variant: izwi_core::ModelVariant,
+    speaker: Option<String>,
+    system_prompt: &'a str,
+    max_output_tokens: usize,
+    output_format: OutputAudioFormat,
+    audio_bytes: &'a [u8],
+    control: &'a TurnControl,
+    output_generation: u64,
+    definitions: Vec<serde_json::Value>,
+    stream: Arc<Mutex<UnifiedReplyStream>>,
+    delivery_error: Arc<Mutex<Option<String>>>,
+    progress: Mutex<UnifiedProgress>,
+}
+
+impl UnifiedRounds<'_> {
+    fn progress(&self) -> std::sync::MutexGuard<'_, UnifiedProgress> {
+        self.progress
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn parser(&self) -> Option<ToolCallParser> {
+        (!self.definitions.is_empty())
+            .then(|| ToolCallParser::new(ToolCallFormat::Lfm3Xml).with_tools(&self.definitions))
+    }
+}
+
+#[async_trait::async_trait]
+impl izwi_agent::ModelBackend for UnifiedRounds<'_> {
+    async fn generate(
+        &self,
+        request: izwi_agent::ModelRequest,
+        _events: &TurnEvents,
+    ) -> izwi_agent::Result<izwi_agent::ModelOutput> {
+        let failed = izwi_agent::AgentError::Model;
+        let round = request.round;
+        // The results of the round before close the prompt.
+        let messages = {
+            let results = request
+                .messages
+                .iter()
+                .rev()
+                .take_while(|message| message.role == MemoryMessageRole::Tool)
+                .collect::<Vec<_>>();
+            let mut progress = self.progress();
+            progress
+                .messages
+                .extend(results.into_iter().rev().map(|message| ChatMessage {
+                    role: ChatRole::Tool,
+                    content: message.content.clone(),
+                }));
+            progress.messages.clone()
+        };
+        {
+            let mut stream = lock_reply_stream(&self.stream);
+            stream.chunk_offset = stream.next_chunk;
+            stream.parser = self.parser();
+        }
+        let params = GenerationParams {
+            max_tokens: self.max_output_tokens.clamp(1, 4096),
+            speaker: self.speaker.clone(),
+            voice: self.speaker.clone(),
+            ..Default::default()
+        };
+        let permit = acquire_stage_permit(self.state).await.map_err(failed)?;
+        let generation = self
+            .state
+            .runtime
+            .speech_to_speech_round_streaming_bytes(
+                self.variant,
+                self.audio_bytes,
+                messages,
+                self.definitions.clone(),
+                round == 0,
+                params,
+                Some(self.system_prompt),
+                Some(self.correlation_id),
+                permit.runtime_context(),
+                unified_chunk_sink(
+                    self.out_tx,
+                    self.utterance_id,
+                    self.utterance_seq,
+                    self.output_format,
+                    self.control,
+                    self.output_generation,
+                    self.state.runtime.clone(),
+                    self.stream.clone(),
+                    self.delivery_error.clone(),
+                ),
+            )
+            .await
+            .map_err(|err| failed(format!("Unified speech-to-speech failed: {err}")))?;
+        drop(permit);
+        if let Some(err) = self
+            .delivery_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+        {
+            return Err(failed(err));
+        }
+
+        // The parser holds back text that could still open a call.
+        let tail = {
+            let mut stream = lock_reply_stream(&self.stream);
+            let tail = stream
+                .parser
+                .take()
+                .map(|mut parser| parser.finish().content)
+                .unwrap_or_default();
+            stream.text.push_str(&tail);
+            (!tail.is_empty()).then(|| stream.text.clone())
+        };
+        if let Some(text) = tail {
+            send_turn_text_snapshot(
+                self.out_tx,
+                self.output_generation,
+                format!("assistant-text-{}", self.utterance_seq),
+                json!({
+                    "type": "assistant_text_snapshot",
+                    "utterance_id": self.utterance_id,
+                    "utterance_seq": self.utterance_seq,
+                    "text": text,
+                }),
+            );
+        }
+
+        let calls = match self.parser() {
+            Some(parser) => parse_answer(parser, &generation.text).1,
+            None => Vec::new(),
+        };
+        let mut progress = self.progress();
+        if round == 0 {
+            progress.reply.input_transcription = generation.input_transcription.clone();
+        }
+        if !generation.samples.is_empty() {
+            progress.reply.sample_rate = generation.sample_rate;
+            progress
+                .reply
+                .samples
+                .extend_from_slice(&generation.samples);
+        }
+        progress.reply.generation_time_ms += generation.generation_time_ms;
+        if !calls.is_empty() {
+            if round == 0 {
+                progress.messages.push(ChatMessage {
+                    role: ChatRole::User,
+                    content: izwi_core::CHAT_AUDIO_PLACEHOLDER.to_string(),
+                });
+            }
+            progress.messages.push(ChatMessage {
+                role: ChatRole::Assistant,
+                content: generation.text.clone(),
+            });
+        }
+        Ok(izwi_agent::ModelOutput {
+            tool_calls: calls
+                .into_iter()
+                .map(|call| izwi_agent::ToolCall {
+                    id: call.id,
+                    name: call.function.name,
+                    arguments: call.function.arguments,
+                })
+                .collect(),
+            generation_time_ms: generation.generation_time_ms,
+            ..Default::default()
+        })
+    }
 }
 
 fn lock_reply_stream(
@@ -2644,6 +3197,130 @@ fn unified_chunk_sink(
     }
 }
 
+/// A reply that speech may have interrupted: paused on the client, still
+/// generating here, until the speech proves to be an interruption (the
+/// reply is cancelled) or not (it plays on). The connection and the turn
+/// that transcribes the speech share it.
+#[derive(Clone, Default)]
+pub(crate) struct HeldReply {
+    state: Arc<Mutex<HeldReplyState>>,
+}
+
+#[derive(Default)]
+struct HeldReplyState {
+    turn: Option<ActiveTurn>,
+    paused: bool,
+}
+
+impl HeldReply {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HeldReplyState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Whether a reply is held, paused or playing on.
+    fn holds_turn(&self) -> bool {
+        self.lock().turn.is_some()
+    }
+
+    fn is_running(&self) -> bool {
+        self.lock()
+            .turn
+            .as_ref()
+            .is_some_and(|turn| !turn.task.is_finished())
+    }
+
+    fn control_of(&self, utterance_seq: u64) -> Option<TurnControl> {
+        self.lock()
+            .turn
+            .as_ref()
+            .filter(|turn| turn.utterance_seq == utterance_seq)
+            .map(|turn| turn.control.clone())
+    }
+
+    /// Pause `turn`'s reply (or the one already held) and tell the client.
+    fn pause(&self, out_tx: &OutboundTx, turn: Option<ActiveTurn>, reason: &str) -> bool {
+        let mut state = self.lock();
+        if let Some(turn) = turn {
+            // A reply held before this one has had its say.
+            if let Some(earlier) = state.turn.replace(turn) {
+                drop(state);
+                interrupt_active_turn(out_tx, &mut Some(earlier), "preempted_by_new_turn");
+                state = self.lock();
+            }
+            state.paused = false;
+        }
+        let Some(turn) = state.turn.as_ref() else {
+            return false;
+        };
+        if state.paused {
+            return false;
+        }
+        turn.control.pause_playback();
+        send_json(
+            out_tx,
+            json!({
+                "type": "turn_paused",
+                "utterance_id": turn.utterance_id,
+                "utterance_seq": turn.utterance_seq,
+                "reason": reason,
+            }),
+        );
+        state.paused = true;
+        true
+    }
+
+    /// The speech was no interruption: the reply plays on. It stays held,
+    /// so a later interruption still finds it.
+    pub(crate) fn resume(&self, out_tx: &OutboundTx) -> bool {
+        let mut state = self.lock();
+        if !state.paused {
+            return false;
+        }
+        state.paused = false;
+        let Some(turn) = state.turn.as_ref() else {
+            return false;
+        };
+        turn.control.resume_playback();
+        send_json(
+            out_tx,
+            json!({
+                "type": "turn_resumed",
+                "utterance_id": turn.utterance_id,
+                "utterance_seq": turn.utterance_seq,
+            }),
+        );
+        true
+    }
+
+    /// The speech was an interruption: cancel the held reply. Returns
+    /// whether a running turn was interrupted.
+    pub(crate) fn interrupt(&self, out_tx: &OutboundTx, reason: &str) -> bool {
+        let turn = {
+            let mut state = self.lock();
+            state.paused = false;
+            state.turn.take()
+        };
+        let mut turn = turn;
+        interrupt_active_turn(out_tx, &mut turn, reason)
+    }
+
+    /// Give back a reply that has finished and is not paused: nothing more
+    /// can interrupt its generation, and its playback is the client's.
+    fn release_finished(&self) {
+        let mut state = self.lock();
+        if !state.paused
+            && state
+                .turn
+                .as_ref()
+                .is_some_and(|turn| turn.task.is_finished())
+        {
+            state.turn = None;
+        }
+    }
+}
+
 /// Interrupt the active turn without waiting for it (SPK-F19): its output
 /// is cut off and the interruption announced at once, and a background
 /// reaper gives the task [`TURN_CANCELLATION_TIMEOUT`] to stop on its own,
@@ -2729,8 +3406,20 @@ async fn reap_interrupted_turn(mut turn: ActiveTurn, reason: String) {
 /// changes.
 #[derive(Default)]
 struct AgentSessionSlot {
-    /// The session's id and the system prompt it was created with.
-    binding: tokio::sync::Mutex<Option<(String, String)>>,
+    binding: tokio::sync::Mutex<Option<VoiceAgentBinding>>,
+    /// The agent that holds the conversation, once a turn has run.
+    active_agent: Mutex<Option<String>>,
+    /// Notes on the part of the conversation the prompt no longer carries.
+    summary: ConversationSummary,
+}
+
+/// A voice connection's agent session: its conversation thread, and the
+/// system prompt and chat model it was created with.
+#[derive(Debug, Clone)]
+struct VoiceAgentBinding {
+    session: AgentSession,
+    system_prompt: String,
+    model_id: String,
 }
 
 impl AgentSessionSlot {
@@ -2740,11 +3429,11 @@ impl AgentSessionSlot {
         voice_session_id: &str,
         system_prompt: &str,
         text_model_id: &str,
-    ) -> Result<String, String> {
+    ) -> Result<VoiceAgentBinding, String> {
         let mut binding = self.binding.lock().await;
-        if let Some((session_id, prompt)) = binding.as_ref() {
-            if prompt == system_prompt {
-                return Ok(session_id.clone());
+        if let Some(bound) = binding.as_ref() {
+            if bound.system_prompt == system_prompt {
+                return Ok(bound.clone());
             }
         }
 
@@ -2758,77 +3447,129 @@ impl AgentSessionSlot {
             .map_err(|err| format!("Chat storage error: {err:#}"))?;
 
         let now = now_unix_millis();
-        let session_id = new_uuid();
-        state
-            .store_agent_session_record(StoredAgentSessionRecord {
-                id: session_id.clone(),
+        let bound = VoiceAgentBinding {
+            session: AgentSession {
+                id: new_uuid(),
                 agent_id: DEFAULT_VOICE_AGENT_ID.to_string(),
                 thread_id: thread.id,
-                model_id,
-                system_prompt: system_prompt.to_string(),
-                planning_mode: PlanningMode::Auto,
                 created_at: now,
                 updated_at: now,
-            })
-            .await;
+            },
+            system_prompt: system_prompt.to_string(),
+            model_id,
+        };
 
-        *binding = Some((session_id.clone(), system_prompt.to_string()));
-        Ok(session_id)
+        // A new thread starts the conversation over.
+        self.summary.reset();
+        *binding = Some(bound.clone());
+        Ok(bound)
     }
 }
 
-/// Run the agent's reply to `input`, streaming its text into `deltas`. The
-/// reply is not stored here: the turn's record holds it until what the user
-/// heard of it is known (SPK-F13). Returns the raw reply.
-#[allow(clippy::too_many_arguments)]
-async fn run_agent_turn(
-    state: &AppState,
-    session_id: &str,
-    input: &str,
-    model_id: &str,
-    max_output_tokens: usize,
-    voice_profile_id: Option<&str>,
-    correlation_id: &str,
-    runtime_context: RuntimeRequestContext,
-    control: &TurnControl,
-    turn_record_id: &str,
-    deltas: tokio::sync::mpsc::UnboundedSender<String>,
-) -> Result<String, String> {
-    let session_record = {
-        let store = state.agent_session_store.read().await;
-        store
-            .get(session_id)
-            .cloned()
-            .ok_or_else(|| "Agent session not found".to_string())?
-    };
+/// What a modular reply is made from. Owned, so a reply can start beside
+/// the session before its turn exists.
+#[derive(Clone)]
+struct AgentReplyPlan {
+    state: AppState,
+    correlation_id: String,
+    voice_session_id: String,
+    voice_profile_id: Option<String>,
+    system_prompt: String,
+    agent_session: Arc<AgentSessionSlot>,
+    conversation: Arc<VoiceConversation>,
+    model_leases: SessionModelLeases,
+    function_calls: PendingFunctionCalls,
+    background_results: BackgroundResults,
+    config: ModularVoiceTurnConfig,
+}
 
-    let resolved_model_id = resolve_chat_model_id(Some(model_id))?;
+/// A reply being written by the agent. Until its turn confirms it
+/// ([`finish_agent_reply`]) it has stored nothing and run no tool; dropping
+/// it stops it.
+struct AgentReply {
+    /// What the user said, as the reply read it.
+    input: String,
+    session: AgentSession,
+    model_id: String,
+    events: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    task: tokio::task::JoinHandle<izwi_agent::Result<izwi_agent::AgentTurnResult>>,
+    cancel: izwi_agent::TurnCancel,
+    confirmed: izwi_agent::TurnGate,
+}
 
-    let agent = AgentDefinition {
-        id: session_record.agent_id.clone(),
-        name: DEFAULT_VOICE_AGENT_NAME.to_string(),
-        system_prompt: session_record.system_prompt.clone(),
-        default_model: session_record.model_id.clone(),
-        capabilities: Default::default(),
-        planning_mode: session_record.planning_mode,
-    };
-    let session = AgentSession {
-        id: session_record.id.clone(),
-        agent_id: session_record.agent_id.clone(),
-        thread_id: session_record.thread_id.clone(),
-        created_at: session_record.created_at,
-        updated_at: session_record.updated_at,
-    };
-    {
-        let mut reply = control.reply();
-        reply.session = Some(session.clone());
-        reply.turn_record_id = Some(turn_record_id.to_string());
+impl Drop for AgentReply {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.task.abort();
     }
+}
 
-    let memory_context = if let Some(profile_id) = voice_profile_id {
+/// Start the agent's reply to `input`. Each model round takes its own
+/// admission permit, so none is held while a tool runs. With `confirmed`
+/// closed the reply is speculative: it writes its text, and waits at its
+/// first tool call.
+async fn start_agent_reply(
+    plan: &AgentReplyPlan,
+    input: &str,
+    confirmed: izwi_agent::TurnGate,
+) -> Result<AgentReply, String> {
+    let state = &plan.state;
+    let config = &plan.config;
+    let binding = plan
+        .agent_session
+        .ensure(
+            state,
+            &plan.voice_session_id,
+            &plan.system_prompt,
+            &config.text_model_id,
+        )
+        .await?;
+    let text_variant = parse_chat_model_variant(Some(&config.text_model_id))
+        .map_err(|err| format!("Invalid chat model: {err}"))?;
+    // The earlier replies join the history now, as far as they were heard.
+    plan.conversation.store(state).await;
+    plan.model_leases
+        .hold(&state.runtime, text_variant)
+        .await
+        .map_err(|err| model_load_error("chat", err))?;
+    let model_id = resolve_chat_model_id(Some(&config.text_model_id))?;
+
+    // The session's prompt leads each agent's own instructions.
+    let agents = match &config.agents {
+        Some(agents) => agents.with_system_prompts(|agent| {
+            [binding.system_prompt.trim(), agent.system_prompt.trim()]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        }),
+        None => AgentSet::single(AgentDefinition::new(
+            binding.session.agent_id.clone(),
+            DEFAULT_VOICE_AGENT_NAME,
+            binding.system_prompt.clone(),
+            binding.model_id.clone(),
+        )),
+    };
+    let holder = config
+        .agents
+        .as_ref()
+        .and_then(|_| {
+            plan.agent_session
+                .active_agent
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
+        })
+        .unwrap_or_else(|| agents.first().id.clone());
+    let session = AgentSession {
+        agent_id: holder,
+        ..binding.session.clone()
+    };
+
+    let memory_context = if let Some(profile_id) = plan.voice_profile_id.clone() {
         match state
             .voice_store
-            .get_profile(profile_id.to_string())
+            .get_profile(profile_id)
             .await
             .map_err(|err| format!("Voice storage error: {err}"))?
         {
@@ -2843,55 +3584,175 @@ async fn run_agent_turn(
         None
     };
 
-    let memory = VoiceContextMemoryStore::new(state.chat_store.clone(), memory_context);
-    let backend = IzwiRuntimeBackend {
-        runtime: state.runtime.clone(),
-        correlation_id: correlation_id.to_string(),
-        runtime_context,
-        deltas,
-        usage: Mutex::new(None),
+    let cancel = izwi_agent::TurnCancel::new();
+    let (events, heard) = tokio::sync::mpsc::unbounded_channel();
+    let task = {
+        let plan = plan.clone();
+        let (session, model_id) = (session.clone(), model_id.clone());
+        let (cancel, confirmed) = (cancel.clone(), confirmed.clone());
+        let input = input.to_string();
+        tokio::spawn(async move {
+            let config = &plan.config;
+            let memory = ThreadMemory::new(plan.state.chat_store.clone(), memory_context)
+                .with_summary(plan.agent_session.summary.clone());
+            let backend = ChatAgentBackend::new(&plan.state, plan.correlation_id.clone());
+            let tools = config
+                .tools
+                .as_ref()
+                .map(|tools| tools.registry(&plan.function_calls))
+                .unwrap_or_default();
+            let turn = izwi_agent::TurnContext {
+                agents: &agents,
+                memory: &memory,
+                model: &backend,
+                tools: &tools,
+                events: TurnEvents::new(events),
+                cancel,
+                background: plan.background_results.clone(),
+                confirmed,
+            };
+            let defaults = AgentTurnOptions::default();
+            AgentEngine
+                .run_turn(
+                    &turn,
+                    &session,
+                    TurnInput { text: input },
+                    Some(model_id),
+                    AgentTurnOptions {
+                        max_output_tokens: config.max_output_tokens.clamp(1, 4096),
+                        tool_timeout: config
+                            .tools
+                            .as_ref()
+                            .map_or(defaults.tool_timeout, |tools| tools.timeout),
+                        tool_soft_timeout: config
+                            .tool_wait_phrase
+                            .as_ref()
+                            .map(|_| TOOL_WAIT_PHRASE_AFTER),
+                        history: VOICE_HISTORY_BUDGET,
+                        // The turn stores both once it is confirmed and,
+                        // for the reply, heard.
+                        persist_assistant_reply: false,
+                        persist_user_message: false,
+                        ..defaults
+                    },
+                )
+                .await
+        })
     };
-    let planner = SimplePlanner;
-    let tools = builtin_tool_registry();
+    Ok(AgentReply {
+        input: input.to_string(),
+        session,
+        model_id,
+        events: heard,
+        task,
+        cancel,
+        confirmed,
+    })
+}
 
-    let result = AgentEngine
-        .run_turn(
-            &agent,
-            &session,
-            TurnInput {
-                text: input.to_string(),
-            },
-            Some(resolved_model_id.clone()),
-            &memory,
-            &backend,
-            &planner,
-            &tools,
-            AgentTurnOptions {
-                max_output_tokens: max_output_tokens.clamp(1, 4096),
-                max_tool_calls: 1,
-                history: VOICE_HISTORY_BUDGET,
-                persist_assistant_reply: false,
-            },
+/// Confirm `reply` as its turn's and see it through: the user's words are
+/// stored, the reply's tools may run, and its text streams into `deltas`
+/// (what it wrote before now first). The reply itself is not stored here:
+/// the turn's record holds it until what the user heard of it is known
+/// (SPK-F13). Returns the raw reply.
+async fn finish_agent_reply(
+    plan: &AgentReplyPlan,
+    mut reply: AgentReply,
+    control: &TurnControl,
+    turn_record_id: &str,
+    on_event: &(dyn Fn(&AgentEvent) + Sync),
+    deltas: tokio::sync::mpsc::UnboundedSender<String>,
+) -> Result<String, String> {
+    let state = &plan.state;
+    {
+        let mut record = control.reply();
+        record.session = Some(reply.session.clone());
+        record.turn_record_id = Some(turn_record_id.to_string());
+    }
+    AgentEngine
+        .commit_user_message(
+            &ThreadMemory::new(state.chat_store.clone(), None),
+            &reply.session,
+            &reply.input,
         )
         .await
-        .map_err(|err| match err {
+        .map_err(|err| err.to_string())?;
+    let _cancel_link = cancel_follows(control, reply.cancel.clone());
+    reply.confirmed.open();
+
+    // A reply that has said nothing while a tool runs says it is waiting,
+    // once.
+    let tool_wait_phrase = plan.config.tool_wait_phrase.as_deref();
+    let mut spoke = false;
+    let mut trace = TurnTrace::start("voice_modular", &plan.correlation_id);
+    let mut hear = |event: AgentEvent| {
+        trace.on_event(&event);
+        on_event(&event);
+        match event {
+            AgentEvent::TextDelta { text } => {
+                spoke |= !text.trim().is_empty();
+                let _ = deltas.send(text);
+            }
+            AgentEvent::ToolCallSlow { .. } if !spoke => {
+                if let Some(phrase) = tool_wait_phrase {
+                    spoke = true;
+                    let _ = deltas.send(format!("{phrase} "));
+                }
+            }
+            _ => {}
+        }
+    };
+    let joined = loop {
+        tokio::select! {
+            biased;
+            Some(event) = reply.events.recv() => hear(event),
+            joined = &mut reply.task => break joined,
+        }
+    };
+    while let Ok(event) = reply.events.try_recv() {
+        hear(event);
+    }
+    let result = match joined {
+        Ok(result) => result.map_err(|err| match err {
             izwi_agent::AgentError::InvalidInput(msg) => msg,
             other => other.to_string(),
-        })?;
-
+        }),
+        Err(_) => Err("Turn cancelled".to_string()),
+    };
+    trace.finish(match &result {
+        Ok(result) => finish_name(result.finish),
+        Err(_) => "error",
+    });
+    let result = result?;
+    if plan.config.agents.is_some() {
+        *plan
+            .agent_session
+            .active_agent
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(result.agent_id.clone());
+    }
     {
-        let mut reply = control.reply();
-        reply.text = Some(strip_reasoning(&result.assistant_text));
-        reply.raw_text = Some(result.assistant_text.clone());
-        reply.meta = MemoryMessageMeta {
-            model_id: Some(resolved_model_id.clone()),
-            ..backend.usage()
+        let mut record = control.reply();
+        record.text = Some(strip_reasoning(&result.assistant_text));
+        record.raw_text = Some(result.assistant_text.clone());
+        record.meta = MemoryMessageMeta {
+            model_id: Some(reply.model_id.clone()),
+            tokens_generated: Some(result.tokens_generated),
+            generation_time_ms: Some(result.generation_time_ms),
+            // Kept with the reply: a later turn knows what was looked up.
+            tool_calls: result.tool_calls.clone(),
         };
     }
-    state
-        .touch_agent_session_record(session_id, now_unix_millis(), resolved_model_id)
-        .await;
-
+    if result.finish == izwi_agent::TurnFinish::Cancelled {
+        return Err("Turn cancelled".to_string());
+    }
+    plan.agent_session.summary.refresh(
+        state,
+        &reply.session.thread_id,
+        &reply.model_id,
+        &plan.correlation_id,
+        VOICE_HISTORY_BUDGET,
+    );
     Ok(result.assistant_text)
 }
 
@@ -2913,7 +3774,7 @@ async fn store_reply(state: &AppState, control: &TurnControl) {
             reply.raw_text.clone(),
         )
     };
-    let memory = VoiceContextMemoryStore::new(state.chat_store.clone(), None);
+    let memory = ThreadMemory::new(state.chat_store.clone(), None);
     if let Err(err) = AgentEngine
         .commit_assistant_reply(&memory, &session, &text, meta)
         .await
@@ -3133,7 +3994,8 @@ fn map_typed_voice_event(
             name: json_str(value, "name"),
             arguments: json_str(value, "arguments"),
             executor: match value.get("executor").and_then(serde_json::Value::as_str) {
-                Some("server") => Some(RealtimeFunctionExecutor::Server),
+                // An MCP tool runs on the server's side of the socket.
+                Some("server" | "mcp") => Some(RealtimeFunctionExecutor::Server),
                 Some("client") => Some(RealtimeFunctionExecutor::Client),
                 _ => None,
             },
@@ -3144,10 +4006,24 @@ fn map_typed_voice_event(
             status: match value.get("status").and_then(serde_json::Value::as_str) {
                 Some("ok") => RealtimeFunctionCallStatus::Ok,
                 Some("timeout") => RealtimeFunctionCallStatus::Timeout,
+                Some("started") => RealtimeFunctionCallStatus::Started,
                 _ => RealtimeFunctionCallStatus::Error,
             },
             output: json_str(value, "output"),
         },
+        "agent_handoff" => RealtimeServerEvent::AgentHandoff {
+            from: json_str(value, "from"),
+            to: json_str(value, "to"),
+        },
+        "task_completed" => RealtimeServerEvent::TaskCompleted {
+            name: json_str(value, "name"),
+            result: value
+                .get("result")
+                .map(serde_json::Value::to_string)
+                .unwrap_or_default(),
+        },
+        "turn_paused" => RealtimeServerEvent::TurnPaused,
+        "turn_resumed" => RealtimeServerEvent::TurnResumed,
         "turn_interrupted" => RealtimeServerEvent::Interruption {
             reason: match value
                 .get("reason")
@@ -3360,161 +4236,6 @@ fn send_turn_error(
     );
 }
 
-struct VoiceContextMemoryStore {
-    chat_store: Arc<ChatStore>,
-    memory_context: Option<String>,
-}
-
-impl VoiceContextMemoryStore {
-    fn new(chat_store: Arc<ChatStore>, memory_context: Option<String>) -> Self {
-        Self {
-            chat_store,
-            memory_context,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl MemoryStore for VoiceContextMemoryStore {
-    async fn load_messages(&self, thread_id: &str) -> izwi_agent::Result<Vec<MemoryMessage>> {
-        let records = self
-            .chat_store
-            .list_messages(thread_id.to_string())
-            .await
-            .map_err(|err| izwi_agent::AgentError::Memory(err.to_string()))?;
-
-        let mut out =
-            Vec::with_capacity(records.len() + usize::from(self.memory_context.is_some()));
-        if let Some(memory_context) = self.memory_context.clone() {
-            out.push(MemoryMessage {
-                role: MemoryMessageRole::System,
-                content: memory_context,
-            });
-        }
-        for record in records {
-            let role = match record.role.as_str() {
-                "system" => MemoryMessageRole::System,
-                "user" => MemoryMessageRole::User,
-                "assistant" => MemoryMessageRole::Assistant,
-                other => {
-                    return Err(izwi_agent::AgentError::Memory(format!(
-                        "Invalid stored chat role: {other}"
-                    )));
-                }
-            };
-            out.push(MemoryMessage {
-                role,
-                content: record.content,
-            });
-        }
-
-        Ok(out)
-    }
-
-    async fn append_message(
-        &self,
-        thread_id: &str,
-        role: MemoryMessageRole,
-        content: String,
-        meta: MemoryMessageMeta,
-    ) -> izwi_agent::Result<()> {
-        self.chat_store
-            .append_message(
-                thread_id.to_string(),
-                role.as_str().to_string(),
-                content,
-                None,
-                meta.model_id,
-                meta.tokens_generated,
-                meta.generation_time_ms,
-            )
-            .await
-            .map_err(|err| izwi_agent::AgentError::Memory(err.to_string()))?;
-        Ok(())
-    }
-}
-
-struct IzwiRuntimeBackend {
-    runtime: Arc<izwi_core::RuntimeService>,
-    correlation_id: String,
-    runtime_context: RuntimeRequestContext,
-    /// Receives the reply's text as it is generated.
-    deltas: tokio::sync::mpsc::UnboundedSender<String>,
-    usage: Mutex<Option<(usize, f64)>>,
-}
-
-impl IzwiRuntimeBackend {
-    fn usage(&self) -> MemoryMessageMeta {
-        let usage = *self
-            .usage
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        MemoryMessageMeta {
-            model_id: None,
-            tokens_generated: usage.map(|(tokens, _)| tokens),
-            generation_time_ms: usage.map(|(_, ms)| ms),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl ModelBackend for IzwiRuntimeBackend {
-    /// A streamed reply without reasoning: voice cannot speak thinking, and
-    /// waiting for it would hold back the first audio (SPK-F2).
-    async fn generate(&self, request: ModelRequest) -> izwi_agent::Result<ModelOutput> {
-        let variant = parse_chat_model_variant(Some(&request.model_id))
-            .map_err(|err| izwi_agent::AgentError::Model(err.to_string()))?;
-
-        let mut runtime_messages = Vec::with_capacity(request.messages.len());
-        for message in request.messages {
-            let role = match message.role {
-                MemoryMessageRole::System => ChatRole::System,
-                MemoryMessageRole::User => ChatRole::User,
-                MemoryMessageRole::Assistant => ChatRole::Assistant,
-            };
-            runtime_messages.push(ChatMessage {
-                role,
-                content: message.content,
-            });
-        }
-
-        let deltas = self.deltas.clone();
-        let generation = self
-            .runtime
-            .chat_generate_streaming_with_runtime_context(
-                variant,
-                runtime_messages,
-                GenerationParams {
-                    max_tokens: request.max_output_tokens.clamp(1, 4096),
-                    ..Default::default()
-                },
-                ChatRequestConfig {
-                    enable_thinking: Some(false),
-                    truncation: ChatTruncation::Auto,
-                    ..ChatRequestConfig::default()
-                },
-                Some(&self.correlation_id),
-                self.runtime_context,
-                move |delta| {
-                    let _ = deltas.send(delta);
-                },
-            )
-            .await
-            .map_err(|err| izwi_agent::AgentError::Model(err.to_string()))?;
-
-        *self
-            .usage
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) =
-            Some((generation.tokens_generated, generation.generation_time_ms));
-        Ok(ModelOutput {
-            text: generation.text,
-            tokens_generated: generation.tokens_generated,
-            generation_time_ms: generation.generation_time_ms,
-        })
-    }
-}
-
 #[cfg(test)]
 mod golden_tests;
 
@@ -3664,9 +4385,11 @@ mod tests {
             let started = Instant::now();
             let reply = {
                 let control = TurnControl::new(Instant::now());
-                let turn_tools = UnifiedTurnTools {
+                let background = BackgroundResults::default();
+                let turn_tools = VoiceTurnTools {
                     tools: &tools,
                     pending: &pending,
+                    background: &background,
                     voice_session_id: "voice-session-1",
                 };
                 stream_unified_s2s_to_socket(
@@ -3911,6 +4634,154 @@ mod tests {
         assert_eq!(events[0]["reason"], "barge_in");
     }
 
+    #[test]
+    fn hums_and_coughs_as_recognizers_write_them_are_wordless() {
+        for sound in [
+            "",
+            "  ",
+            "Uh",
+            "Uh uh.",
+            "Uh oh.",
+            "Oh",
+            "Mm-hmm?",
+            "um, er...",
+        ] {
+            assert!(is_wordless(sound), "{sound:?}");
+        }
+        for words in [
+            "Stop",
+            "Oh no",
+            "Uh, wait",
+            "No.",
+            "Hm, what about Friday?",
+            "2",
+        ] {
+            assert!(!is_wordless(words), "{words:?}");
+        }
+    }
+
+    /// A paused client's playback stands still: audio sent meanwhile queues
+    /// behind what it holds, and it plays on from where it stopped.
+    #[test]
+    fn a_paused_playback_clock_stands_still() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        let mut clock = PlaybackClock::default();
+        clock.sent(start, ms(2_000));
+        clock.pause(start + ms(500));
+        assert_eq!(clock.played(start + ms(500)), ms(500));
+        // Time passes and more audio arrives; nothing more is played.
+        assert!(!clock.sent(start + ms(900), ms(1_000)));
+        assert_eq!(clock.played(start + ms(5_000)), ms(500));
+        clock.pause(start + ms(6_000));
+        assert_eq!(
+            clock.played(start + ms(6_000)),
+            ms(500),
+            "pausing twice changes nothing"
+        );
+        clock.resume(start + ms(6_000));
+        assert_eq!(clock.played(start + ms(6_400)), ms(900));
+        assert_eq!(clock.played(start + ms(20_000)), ms(3_000));
+        clock.resume(start + ms(21_000));
+        assert_eq!(clock.played(start + ms(21_000)), ms(3_000));
+    }
+
+    fn running_turn(state: &AppState, utterance_seq: u64) -> ActiveTurn {
+        ActiveTurn {
+            utterance_id: format!("utt-{utterance_seq}"),
+            utterance_seq,
+            turn_record_id: format!("turn-{utterance_seq}"),
+            state: state.clone(),
+            conversation: Arc::default(),
+            task: tokio::spawn(tokio::time::sleep(Duration::from_secs(30))),
+            control: TurnControl::new(Instant::now()),
+            output_generation: utterance_seq,
+        }
+    }
+
+    /// A held reply is paused once, plays on when the sound was no
+    /// interruption, and stays held so that a real one still cancels it.
+    #[tokio::test]
+    async fn a_held_reply_is_paused_then_resumed_or_interrupted() {
+        let (_dir, state) = test_app_state(1);
+        let out_tx = OutboundTx::new(state.runtime.clone(), "voice test");
+        let types = |events: Vec<serde_json::Value>| -> Vec<String> {
+            events
+                .iter()
+                .map(|event| event["type"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        let held = HeldReply::default();
+        assert!(!held.pause(&out_tx, None, "barge_in"), "nothing to pause");
+        assert!(!held.resume(&out_tx));
+
+        let turn = running_turn(&state, 1);
+        let control = turn.control.clone();
+        control.audio_sent(&state.runtime, Duration::from_secs(4));
+        {
+            let mut reply = control.reply();
+            reply.ledger.begin_segment("One two three four.");
+            reply.ledger.audio_sent(4_000.0);
+        }
+        assert!(held.pause(&out_tx, Some(turn), "barge_in"));
+        assert!(!held.pause(&out_tx, None, "barge_in"), "already paused");
+        assert!(held.is_running() && held.holds_turn());
+        assert!(held.control_of(1).is_some() && held.control_of(2).is_none());
+        assert!(!control.is_cancelled(), "a paused reply keeps generating");
+
+        assert!(held.resume(&out_tx));
+        assert!(!held.resume(&out_tx));
+        assert!(
+            held.holds_turn(),
+            "a resumed reply can still be interrupted"
+        );
+
+        // Speech with words: paused again, then cancelled where it stood.
+        assert!(held.pause(&out_tx, None, "barge_in"));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(held.interrupt(&out_tx, "barge_in"));
+        assert!(control.is_cancelled());
+        assert!(!held.holds_turn());
+        let heard_ms = control.reply().heard_ms.expect("heard up to the pause");
+        assert!(
+            heard_ms < 50.0,
+            "playback stood still while paused: {heard_ms} ms"
+        );
+        assert!(
+            !held.interrupt(&out_tx, "barge_in"),
+            "nothing left to interrupt"
+        );
+
+        // A newer reply replaces a held one, which is then over.
+        let first = running_turn(&state, 2);
+        let first_control = first.control.clone();
+        assert!(held.pause(&out_tx, Some(first), "barge_in"));
+        assert!(held.pause(&out_tx, Some(running_turn(&state, 3)), "barge_in"));
+        assert!(first_control.is_cancelled());
+        assert!(held.control_of(3).is_some());
+        held.interrupt(&out_tx, "socket_closed");
+
+        assert_eq!(
+            types(drain_text(&out_tx).await),
+            [
+                // Paused, played on, paused again and interrupted.
+                "turn_paused",
+                "turn_resumed",
+                "turn_paused",
+                "turn_interrupted",
+                "turn_done",
+                // A held reply gives way to a newer one.
+                "turn_paused",
+                "turn_interrupted",
+                "turn_done",
+                "turn_paused",
+                // The socket closes.
+                "turn_interrupted",
+                "turn_done",
+            ]
+        );
+    }
+
     /// SPK-F21: starting an input stream loads and leases its models in the
     /// background and reports their readiness, before any turn.
     #[tokio::test]
@@ -4052,6 +4923,7 @@ mod tests {
         *interrupted.inner.playback.lock().expect("playback") = PlaybackClock {
             playing_until: Some(Instant::now() + Duration::from_millis(1_000)),
             sent: Duration::from_millis(3_000),
+            paused_with: None,
         };
         conversation.hold(2, interrupted);
         conversation.interrupt_playback();
@@ -4206,6 +5078,9 @@ mod tests {
                 asr_language: None,
                 max_output_tokens: 64,
                 output_format: OutputAudioFormat::G711Ulaw,
+                tools: None,
+                tool_wait_phrase: None,
+                agents: None,
             }),
             endpointed_at: Instant::now(),
             endpointing_delay: None,
@@ -4263,16 +5138,92 @@ mod tests {
             barge_in_min_speech_ms: DEFAULT_BARGE_IN_MIN_SPEECH_MS,
             snr_margin_db: izwi_vad::DEFAULT_SNR_MARGIN_DB,
             input_sample_rate_hint: Some(16_000),
+            adaptive_silence_floor_ms: None,
+            early_transcription: false,
         })
     }
 
     /// Every frame voiced, whatever its content: the score threshold drops
     /// to the minimum and the SNR check is off, since digital silence never
     /// rises over its own noise floor.
+    #[test]
+    fn the_silence_window_follows_the_speakers_pauses() {
+        let mut window = AdaptiveSilence::new(450, 900);
+        // Until four pauses are known, the configured silence stands.
+        for pause in [200.0, 220.0, 180.0] {
+            window.observe(pause);
+            assert_eq!(window.window_ms(), 900);
+        }
+        // Gaps inside words teach nothing.
+        window.observe(60.0);
+        assert_eq!(window.window_ms(), 900);
+        // A fluent speaker is answered sooner, never under the floor.
+        window.observe(240.0);
+        assert_eq!(window.window_ms(), 450);
+        // One long pause is an outlier; a second moves the window.
+        window.observe(500.0);
+        assert_eq!(window.window_ms(), 450);
+        window.observe(520.0);
+        assert_eq!(window.window_ms(), 750);
+        // A slow speaker stays at the configured silence.
+        for _ in 0..4 {
+            window.observe(800.0);
+        }
+        assert_eq!(window.window_ms(), 900);
+        // Old pauses are forgotten.
+        for _ in 0..12 {
+            window.observe(200.0);
+        }
+        assert_eq!(window.window_ms(), 450);
+    }
+
+    /// A speaker cut off mid-thought speaks again at once: the silence
+    /// that split the thought counts as a pause, and the window widens.
+    #[test]
+    fn speech_right_after_an_endpoint_widens_the_window() {
+        let mut input = StreamingInputState::new(StreamingInputConfig {
+            silence_duration_ms: 900,
+            adaptive_silence_floor_ms: Some(300),
+            ..test_streaming_input().config
+        });
+        always_voiced(&mut input);
+        for pause in [200.0, 210.0, 190.0, 205.0] {
+            input.adaptive_silence.as_mut().unwrap().observe(pause);
+        }
+        assert_eq!(input.silence_window_ms(), 308);
+
+        input.last_silence_end = Some((Instant::now(), 308));
+        input
+            .handle_pcm16_frame(1, 16_000, &pcm16_frame(&[0; 320]))
+            .expect("frame");
+        assert!(input.active.is_some(), "speech started");
+        assert!(input.last_silence_end.is_none());
+        // 308 ms of silence plus the gap is the newest pause; with a
+        // second one like it the window follows.
+        input.adaptive_silence.as_mut().unwrap().observe(320.0);
+        assert!(
+            input.silence_window_ms() >= 460,
+            "{}",
+            input.silence_window_ms()
+        );
+
+        // Speech long after an endpoint is a new thought.
+        let mut input = StreamingInputState::new(StreamingInputConfig {
+            adaptive_silence_floor_ms: Some(300),
+            ..test_streaming_input().config
+        });
+        always_voiced(&mut input);
+        input.last_silence_end = Some((Instant::now() - RESUMED_SPEECH_WITHIN * 2, 300));
+        input
+            .handle_pcm16_frame(1, 16_000, &pcm16_frame(&[0; 320]))
+            .expect("frame");
+        assert!(input.adaptive_silence.as_ref().unwrap().window_ms() == 200);
+    }
+
     fn always_voiced(input: &mut StreamingInputState) {
         input.config.vad_threshold = 0.01;
         input.config.snr_margin_db = 0.0;
-        input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+        input.endpoint = EndpointDetector::new(input.config.endpoint_config(None));
     }
 
     fn finalized(
@@ -4352,6 +5303,64 @@ mod tests {
         )
         .expect_err("resume must be rejected")
         .contains("non-resumable"));
+    }
+
+    #[test]
+    fn a_waiting_reply_speaks_english_by_default_and_the_sessions_phrase_otherwise() {
+        let phrase = |requested: Option<&str>, language: Option<&str>| {
+            resolve_tool_wait_phrase(requested.map(str::to_string), language)
+        };
+        assert_eq!(phrase(None, None).as_deref(), Some("One moment."));
+        assert_eq!(phrase(None, Some("en-US")).as_deref(), Some("One moment."));
+        assert_eq!(phrase(None, Some("zu")), None);
+        assert_eq!(
+            phrase(Some(" Ngicela ulinde. "), Some("zu")).as_deref(),
+            Some("Ngicela ulinde.")
+        );
+        assert_eq!(phrase(Some(""), None), None);
+    }
+
+    #[test]
+    fn a_session_declares_agents_that_hand_over_and_collect_tasks() {
+        let start: ClientEvent = serde_json::from_value(json!({
+            "type": "input_stream_start",
+            "agents": [
+                {"id": "front", "instructions": "Greet callers.", "handoffs": ["billing"],
+                 "tools": ["time"]},
+                {"id": "billing", "name": "Billing", "handoff_description": "For invoices.",
+                 "task": {"name": "refund", "description": "Record a refund.",
+                          "parameters": {"type": "object", "required": ["invoice"]},
+                          "then": "front"}},
+            ],
+        }))
+        .unwrap();
+        let ClientEvent::InputStreamStart(start) = start else {
+            panic!("an input stream start");
+        };
+        let tools = VoiceTools::parse(None, None, None, true).unwrap();
+        let agents = voice_agent_set(start.agents.clone(), "Qwen3.5-4B", tools.as_ref())
+            .unwrap()
+            .unwrap();
+        assert_eq!(agents.first().id, "front");
+        assert_eq!(agents.first().name, "front");
+        assert_eq!(agents.first().system_prompt, "Greet callers.");
+        let billing = agents.get("billing").unwrap();
+        assert_eq!(billing.name, "Billing");
+        assert_eq!(billing.default_model, "Qwen3.5-4B");
+        assert_eq!(
+            billing.task.as_ref().unwrap().then.as_deref(),
+            Some("front")
+        );
+
+        // A tool the session does not offer, and a handoff to nobody.
+        let err = voice_agent_set(start.agents.clone(), "m", None).unwrap_err();
+        assert!(err.contains("`time`"), "{err}");
+        let mut lost = start.agents.clone().unwrap();
+        lost.truncate(1);
+        let err = voice_agent_set(Some(lost), "m", tools.as_ref()).unwrap_err();
+        assert!(err.starts_with("Invalid `agents`:"), "{err}");
+        assert_eq!(voice_agent_set(None, "m", None), Ok(None));
+        assert_eq!(voice_agent_set(Some(Vec::new()), "m", None), Ok(None));
     }
 
     #[test]
@@ -4835,7 +5844,7 @@ mod tests {
         let start = |input: &mut StreamingInputState| {
             always_voiced(input);
             input.config.min_speech_ms = 300;
-            input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+            input.endpoint = EndpointDetector::new(input.config.endpoint_config(None));
             for frame_seq in 1..=5_u32 {
                 input
                     .handle_pcm16_frame(frame_seq, 16_000, &frame)
@@ -4890,6 +5899,84 @@ mod tests {
         (turns, barge_ins)
     }
 
+    /// With early transcription an utterance is handed out at each pause
+    /// long enough, taken back when the speaker goes on, and the last one
+    /// handed out is of the utterance that ends.
+    #[test]
+    fn an_utterance_is_handed_out_at_a_pause_and_taken_back_when_speech_goes_on() {
+        let fox = {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/fox.wav");
+            let mut reader = hound::WavReader::open(path).expect("speech fixture");
+            let rate = reader.spec().sample_rate;
+            let samples: Vec<f32> = reader
+                .samples::<i16>()
+                .map(|sample| sample.expect("sample") as f32 / 32768.0)
+                .collect();
+            izwi_vad::resample_linear_f32(&samples, rate, 16_000).expect("resample")
+        };
+        // Speech, half a second of silence, speech, then silence to the end.
+        let mut samples = vec![0.0f32; 8_000];
+        samples.extend_from_slice(&fox);
+        samples.extend(vec![0.0f32; 8_000]);
+        samples.extend_from_slice(&fox);
+        samples.extend(vec![0.0f32; 48_000]);
+
+        let run = |early_transcription: bool| {
+            let mut input = StreamingInputState::new(StreamingInputConfig {
+                min_speech_ms: DEFAULT_STREAM_MIN_SPEECH_MS,
+                // Longer than the pause in the middle, the recording's own
+                // leading and trailing silence included.
+                silence_duration_ms: 2_000,
+                early_transcription,
+                ..test_streaming_input().config
+            });
+            // What happened, in order: e(arly), r(esumed), t(urn).
+            let mut story = String::new();
+            let mut last_early = None;
+            for (index, chunk) in samples.chunks(320).enumerate() {
+                let pcm: Vec<i16> = chunk
+                    .iter()
+                    .map(|sample| (sample.clamp(-1.0, 1.0) * 32767.0) as i16)
+                    .collect();
+                let result = input
+                    .handle_pcm16_frame(index as u32 + 1, 16_000, &pcm16_frame(&pcm))
+                    .expect("frame");
+                if result.speech_resumed {
+                    story.push('r');
+                }
+                if let Some(early) = result.early {
+                    story.push('e');
+                    last_early = Some((early.utterance_seq, early.wav_bytes.len()));
+                }
+                if let Some((ended, wav, _)) = finalized(result.utterance_end) {
+                    story.push('t');
+                    let (seq, early_len) = last_early.take().unwrap_or((0, 0));
+                    if early_transcription {
+                        assert_eq!(seq, ended.utterance_seq);
+                        // The same audio, short of the trailing silence.
+                        assert!(early_len < wav.len());
+                        assert!(early_len > wav.len() / 2, "{early_len} of {}", wav.len());
+                    }
+                }
+            }
+            story
+        };
+        assert_eq!(run(false), "t");
+        let story = run(true);
+        assert!(story.ends_with("et"), "{story}");
+        assert!(
+            story.contains("er"),
+            "the middle pause was talked through: {story}"
+        );
+        assert_eq!(story.matches('t').count(), 1, "{story}");
+        // Every hand-out but the last was taken back.
+        assert_eq!(
+            story.matches('e').count(),
+            story.matches('r').count() + 1,
+            "{story}"
+        );
+    }
+
     /// Steady background noise, which Earshot alone scores as speech, never
     /// becomes a turn or a barge-in; speech spoken over it becomes one turn.
     #[test]
@@ -4919,7 +6006,7 @@ mod tests {
             let mut input = test_streaming_input();
             input.config.min_speech_ms = DEFAULT_STREAM_MIN_SPEECH_MS;
             input.config.silence_duration_ms = DEFAULT_STREAM_SILENCE_MS;
-            input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+            input.endpoint = EndpointDetector::new(input.config.endpoint_config(None));
             assert_eq!(stream_turns(&mut input, &noise), (0, 0), "{name} alone");
 
             // Fox 3 s in, 10 dB over the noise.
@@ -4931,7 +6018,7 @@ mod tests {
             let mut input = test_streaming_input();
             input.config.min_speech_ms = DEFAULT_STREAM_MIN_SPEECH_MS;
             input.config.silence_duration_ms = DEFAULT_STREAM_SILENCE_MS;
-            input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+            input.endpoint = EndpointDetector::new(input.config.endpoint_config(None));
             let (turns, barge_ins) = stream_turns(&mut input, &mixed);
             assert_eq!((turns, barge_ins), (1, 1), "{name} with speech");
         }
@@ -4944,7 +6031,7 @@ mod tests {
         let mut input = test_streaming_input();
         input.config.min_speech_ms = DEFAULT_STREAM_MIN_SPEECH_MS;
         input.config.silence_duration_ms = DEFAULT_STREAM_SILENCE_MS;
-        input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+        input.endpoint = EndpointDetector::new(input.config.endpoint_config(None));
         assert_eq!(stream_turns(&mut input, &short).0, 1, "short reply");
     }
 

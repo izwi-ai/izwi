@@ -4206,18 +4206,6 @@ async fn dynamic_routes_cover_axum_upgrade_surface() {
         ),
         (
             Method::GET,
-            "/v1/agent/sessions/missing-session",
-            None,
-            StatusCode::NOT_FOUND,
-        ),
-        (
-            Method::POST,
-            "/v1/agent/sessions/missing-session/turns",
-            Some(r#"{"input":"hello"}"#),
-            StatusCode::NOT_FOUND,
-        ),
-        (
-            Method::GET,
             "/v1/responses/missing-response",
             None,
             StatusCode::NOT_FOUND,
@@ -4319,6 +4307,24 @@ async fn dynamic_routes_cover_axum_upgrade_surface() {
     )
     .await;
 
+    drop(temp_dir);
+}
+
+/// The agent session routes are gone.
+#[tokio::test]
+async fn agent_session_routes_are_not_served() {
+    let (app, temp_dir) = test_api_app("agent_session_routes_removed", false);
+    for (method, path, body) in [
+        (Method::POST, "/v1/agent/sessions", Some("{}")),
+        (Method::GET, "/v1/agent/sessions/some-session", None),
+        (
+            Method::POST,
+            "/v1/agent/sessions/some-session/turns",
+            Some(r#"{"input":"hello"}"#),
+        ),
+    ] {
+        assert_route_status(app.clone(), method, path, body, StatusCode::NOT_FOUND).await;
+    }
     drop(temp_dir);
 }
 

@@ -13,6 +13,7 @@ import { VoicePage } from "./route";
 
 const apiMocks = vi.hoisted(() => ({
   getVoiceProfile: vi.fn(),
+  listVoiceToolServers: vi.fn(),
   updateVoiceProfile: vi.fn(),
   listVoiceObservations: vi.fn(),
   deleteVoiceObservation: vi.fn(),
@@ -160,6 +161,7 @@ const storage = new Map<string, string>();
 
 beforeEach(() => {
   Object.values(handlers).forEach((handler) => handler.mockReset());
+  apiMocks.listVoiceToolServers.mockResolvedValue([]);
   apiMocks.getVoiceProfile.mockResolvedValue({
     id: "default",
     name: "Default",
@@ -539,6 +541,168 @@ describe("VoicePage failures", () => {
       await screen.findByRole("heading", { name: "Microphone is blocked" }),
     ).toBeVisible();
     expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+});
+
+describe("VoicePage tools and agents", () => {
+  async function sessionReady(socket: FakeWebSocket) {
+    await act(async () => {
+      socket.emit("session_ready", {
+        data: {
+          accepted_version: 2,
+          owner_instance_id: "process-1",
+          resumable: false,
+          resume_window_ms: 0,
+        },
+      });
+    });
+  }
+
+  it("asks for false interruptions to be resumed, and nothing else, by default", async () => {
+    renderVoicePage(standardModels("downloaded"));
+    const socket = await startConversation();
+    await sessionReady(socket);
+    await waitFor(() =>
+      expect(socket.sent).toContainEqual(
+        expect.objectContaining({ type: "input_stream_start" }),
+      ),
+    );
+    const start = socket.sent.find(
+      (message) => (message as { type?: string }).type === "input_stream_start",
+    ) as Record<string, unknown>;
+    expect(start.resume_false_interruptions).toBe(true);
+    for (const key of ["builtin_tools", "mcp_servers", "agents", "adaptive_silence", "preemptive_generation"]) {
+      expect(start).not.toHaveProperty(key);
+    }
+  });
+
+  it("sets up tools, a tool server and the conversation switches in settings", async () => {
+    renderVoicePage(standardModels("downloaded"));
+    fireEvent.click(screen.getByRole("button", { name: "Voice settings" }));
+    const sheet = await screen.findByRole("dialog", { name: "Voice settings" });
+
+    fireEvent.click(within(sheet).getByRole("switch", { name: /Follow my pace/ }));
+    fireEvent.click(within(sheet).getByRole("switch", { name: /Start replies sooner/ }));
+    fireEvent.click(within(sheet).getByRole("button", { name: /Tools/ }));
+    const tools = await screen.findByRole("dialog", { name: "Tools" });
+    fireEvent.click(within(tools).getByRole("switch", { name: /Date and time/ }));
+
+    // A tool server needs a name and a full address.
+    fireEvent.click(within(tools).getByRole("button", { name: "Add tool server" }));
+    expect(within(tools).getByRole("alert")).toHaveTextContent("short name");
+    fireEvent.change(within(tools).getByLabelText("Name"), { target: { value: "stock" } });
+    fireEvent.change(within(tools).getByLabelText("Address"), {
+      target: { value: "http://127.0.0.1:9000/mcp" },
+    });
+    fireEvent.click(within(tools).getByRole("button", { name: "Add tool server" }));
+    expect(within(tools).getByText("http://127.0.0.1:9000/mcp")).toBeVisible();
+
+    fireEvent.click(within(tools).getByRole("button", { name: "Back to voice settings" }));
+    const main = await screen.findByRole("dialog", { name: "Voice settings" });
+    expect(within(main).getByRole("button", { name: /Tools/ })).toHaveTextContent(
+      "Date and time · 1 tool server",
+    );
+    fireEvent.click(within(main).getAllByRole("button", { name: "Close" })[0]);
+
+    const socket = await startConversation();
+    await sessionReady(socket);
+    await waitFor(() =>
+      expect(socket.sent).toContainEqual(
+        expect.objectContaining({
+          type: "input_stream_start",
+          builtin_tools: true,
+          adaptive_silence: true,
+          preemptive_generation: true,
+          mcp_servers: [{ label: "stock", url: "http://127.0.0.1:9000/mcp" }],
+        }),
+      ),
+    );
+  });
+
+  it("defines agents that hand over to each other", async () => {
+    renderVoicePage(standardModels("downloaded"));
+    fireEvent.click(screen.getByRole("button", { name: "Voice settings" }));
+    const sheet = await screen.findByRole("dialog", { name: "Voice settings" });
+    expect(within(sheet).getByRole("button", { name: /Agents/ })).toHaveTextContent(
+      "One assistant",
+    );
+    fireEvent.click(within(sheet).getByRole("button", { name: /Agents/ }));
+    const agents = await screen.findByRole("dialog", { name: "Agents" });
+
+    fireEvent.click(within(agents).getByRole("button", { name: "Add agent" }));
+    expect(within(agents).getByText(/Add a second agent/)).toBeVisible();
+    fireEvent.click(within(agents).getByRole("button", { name: "Add agent" }));
+    const names = within(agents).getAllByLabelText("Name");
+    fireEvent.change(names[0], { target: { value: "Front desk" } });
+    fireEvent.change(names[1], { target: { value: "Billing" } });
+    fireEvent.change(within(agents).getByLabelText("When to hand over to it"), {
+      target: { value: "For invoices" },
+    });
+    // The first agent may hand over to the second.
+    fireEvent.click(within(agents).getAllByRole("checkbox", { name: "Billing" })[0]);
+    fireEvent.click(within(agents).getAllByRole("button", { name: "Close" })[0]);
+
+    const socket = await startConversation();
+    await sessionReady(socket);
+    await waitFor(() =>
+      expect(socket.sent).toContainEqual(
+        expect.objectContaining({
+          type: "input_stream_start",
+          agents: [
+            { id: "assistant", name: "Front desk", handoffs: ["agent-2"] },
+            {
+              id: "agent-2",
+              name: "Billing",
+              handoff_description: "For invoices",
+              handoffs: [],
+            },
+          ],
+        }),
+      ),
+    );
+
+    // What the agents do shows in the transcript, ahead of the reply.
+    const turn = { utterance_id: "utterance-1", turn_id: "turn-1" };
+    await act(async () => {
+      socket.emit("session_started");
+      socket.emit("transcript_final", {
+        ...turn,
+        data: { text: "My invoice is wrong.", revision: 1 },
+      });
+      socket.emit("assistant_text_started", turn);
+      socket.emit("function_call", {
+        ...turn,
+        data: { call_id: "c1", name: "transfer_to_agent-2", arguments: "{}", executor: "server" },
+      });
+      socket.emit("agent_handoff", { ...turn, data: { from: "assistant", to: "agent-2" } });
+      socket.emit("function_call", {
+        ...turn,
+        data: { call_id: "c2", name: "lookup_invoice", arguments: "{}", executor: "mcp" },
+      });
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Show transcript" }));
+    const transcript = screen.getByRole("complementary", { name: "Transcript" });
+    expect(within(transcript).getByText("Handed over to Billing")).toBeVisible();
+    expect(within(transcript).getByText("Using lookup invoice…")).toBeVisible();
+    expect(within(transcript).queryByText(/transfer to/)).toBeNull();
+
+    await act(async () => {
+      socket.emit("function_call_completed", {
+        ...turn,
+        data: { call_id: "c2", name: "lookup_invoice", status: "ok", output: "{}" },
+      });
+      socket.emit("assistant_text_final", {
+        ...turn,
+        data: { text: "I can see the double charge." },
+      });
+    });
+    expect(within(transcript).queryByText("Using lookup invoice…")).toBeNull();
+    const lines = within(transcript)
+      .getAllByRole("listitem")
+      .map((item) => item.textContent);
+    expect(lines.indexOf("Used lookup invoice")).toBeLessThan(
+      lines.findIndex((line) => line?.includes("I can see the double charge.")),
+    );
   });
 });
 

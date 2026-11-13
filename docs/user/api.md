@@ -155,7 +155,6 @@ Some older list routes return arrays or route-specific wrapper names. The route 
 | `IZWI_BATCH_WEBHOOK_ALLOW_HTTP`, `IZWI_BATCH_WEBHOOK_ALLOW_PRIVATE` | `false` | Allow `http://` webhook URLs, and webhook hosts on loopback, private or link-local addresses. |
 | `IZWI_AUDIO_STREAM_EVENT_QUEUE_CAPACITY` | `32` | Buffered SSE audio events for `/v1/audio/speech`. |
 | `IZWI_MAX_RESPONSE_STORE_ENTRIES` | `512` | Process-local `/v1/responses` retention cap. |
-| `IZWI_MAX_AGENT_SESSION_STORE_ENTRIES` | `512` | Process-local agent session metadata cap. |
 
 ### Streaming
 
@@ -1814,20 +1813,6 @@ Streaming thread events:
 | `done` | Includes persisted assistant message and generation stats. |
 | `error` | Error string. |
 
-### Agent Sessions
-
-Agent session metadata is process-local preview state. The linked chat thread is durable.
-
-| Method | Path | Notes |
-|--------|------|-------|
-| `POST` | `/v1/agent/sessions` | Create an agent session and linked thread. |
-| `GET` | `/v1/agent/sessions/{session_id}` | Fetch retained process-local session metadata. |
-| `POST` | `/v1/agent/sessions/{session_id}/turns` | Run one agent turn. |
-
-Create fields include `agent_id`, `model_id`, `system_prompt`, `planning_mode` (`off`, `auto`, `on`), and `title`.
-
-Turn responses include assistant text, optional plan steps, tool calls, and ordered events such as `turn_started`, `plan_created`, `tool_call_started`, `tool_call_completed`, `assistant_message`, and `turn_completed`.
-
 ### Voice Profile, Memory, And Sessions
 
 Voice-mode persisted state:
@@ -1835,6 +1820,7 @@ Voice-mode persisted state:
 | Method | Path | Notes |
 |--------|------|-------|
 | `GET`, `PATCH` | `/v1/voice/profile` | Fetch or update name, system prompt, and observational memory setting. |
+| `GET` | `/v1/voice/tool-servers` | List the MCP servers set up in the server's MCP servers file: `{"servers": [{"label", "transport"}]}`, `transport` being `stdio` or `http`. Commands, addresses and credentials are not returned. |
 | `GET`, `DELETE` | `/v1/voice/observations` | List or clear remembered observations. `limit` controls list size. |
 | `DELETE` | `/v1/voice/observations/{observation_id}` | Forget one observation. |
 | `GET` | `/v1/voice/sessions` | List voice sessions. |
@@ -2263,13 +2249,20 @@ Client JSON messages:
 | `vad_snr_margin_db` | How far, in dB, a frame must rise above the stream's own noise floor to start an utterance; half of it keeps one going. Default `6` (or `IZWI_VAD_SNR_MARGIN_DB`), clamped to `0..40`. Earshot scores steady noise such as a fan or hum as speech; this margin is what ignores it. `0` turns the check off. |
 | `min_speech_ms` | Minimum speech duration. |
 | `silence_duration_ms` | Silence before utterance end. |
+| `adaptive_silence` | `true` lets the silence that ends an utterance follow the speaker: once four of their mid-utterance pauses are known, it is one and a half times their longer pauses, never under `adaptive_silence_floor_ms` (default `450`, `200..5000`) or over `silence_duration_ms`. A fluent speaker is answered sooner. A speaker who talks again within 1.5 s of an utterance ending was cut off, and the window widens. Default `false`. `input_stream_ready` reports the floor when it is on. |
+| `early_transcription` | Modular mode: `true` starts transcribing an utterance at a short pause (a third of the end-of-utterance silence, `200..400` ms) instead of when the silence has passed, so the reply starts sooner by up to the transcription time. If the speaker goes on, that transcription is dropped and wasted; with a slow ASR model and a speaker who pauses often this costs compute. The turn sends no `user_transcript_snapshot` events when its transcript was started early. Default `false`. |
+| `preemptive_generation` | Modular mode: `true` also starts writing the reply at that pause, as soon as the early transcript is there (it turns `early_transcription` on). Until the silence has ended the utterance the reply is unconfirmed: nothing is stored, no tool runs (a reply that calls one waits there) and nothing is sent to the client. If the speaker goes on, the reply is dropped. A reply is started ahead only when no earlier reply is still being written or paused. Measured on an M1 Pro with Qwen3.5-4B and a 900 ms silence: about 0.6 s sooner to the first audio. The cost is chat-model work thrown away at every pause the speaker talks through. Default `false`. |
 | `max_utterance_ms` | Hard utterance duration cap. |
 | `pre_roll_ms` | Audio retained before speech start. |
 | `barge_in_min_speech_ms` | Voiced speech, default `300`, that interrupts a speaking assistant. A shorter sound (a cough, a door, speaker echo) does not interrupt it. `0` interrupts on the first speech frame. |
+| `resume_false_interruptions` | `true` makes speech over a reply pause it instead of cancelling it. After `barge_in_min_speech_ms` of speech the server sends `turn_paused`: the client stops playing but keeps what it has queued, and the reply keeps generating. If the sound is then rejected as no speech, or in modular mode transcribes to no words (nothing, or only hesitation sounds such as "uh", "mm" or "oh", which is how a recognizer writes a hum or a cough), the server sends `turn_resumed` and the client plays on; that sound is not answered (`turn_done` with `no_input`). Otherwise the reply is interrupted as usual (`turn_interrupted`), heard up to where it was paused: in modular mode once the utterance has been transcribed, in unified mode when the utterance ends. A client that does not honour the two events must leave this off. Default `false`; `input_stream_ready` reports it when on. |
 | `input_sample_rate` | Expected input sample rate. |
-| `tools` | Unified mode on LFM3-Audio only: OpenAI function tools (`{"type": "function", "function": {"name", "description", "parameters"}}`, or the Responses form with the fields on the tool) the reply may call. The client runs them: it gets `function_call` and answers with `function_call_output`. A name must be letters, digits, `_` or `-`, unique, and not a built-in tool's. At most 64. |
-| `builtin_tools` | Unified mode on LFM3-Audio: whether the reply may also call the server's built-in tools (today `time`, the local date and time). Default `true`. |
+| `tools` | Modular mode with a chat model that calls tools (Qwen3, Qwen3.5, LFM2.5, LFM3), or unified mode on LFM3-Audio: OpenAI function tools (`{"type": "function", "function": {"name", "description", "parameters"}}`, or the Responses form with the fields on the tool) the reply may call. The client runs them: it gets `function_call` and answers with `function_call_output`. A name must be letters, digits, `_` or `-`, unique, and not a built-in tool's. At most 64. A tool with `"background": true` does not hold the reply: the call is reported with status `started`, the reply tells the user it is under way, and the output the client sends within 120 s is told in the next turn. |
+| `builtin_tools` | With a model that calls tools: whether the reply may also call the server's built-in tools (today `time`, the local date and time). Default `true` on LFM3-Audio and `false` in modular mode, where offering any tool lengthens every turn's prompt. Qwen3.5 reuses the prompt it has already read (see [Chat history reuse](/features/chat#chat-history-reuse)), which on an M1 Pro with Qwen3.5-4B leaves well under a second more to the first audio, down from about 2 s, and brings a turn that calls a tool from about 7.3 s to about 2.6 s. |
 | `function_call_timeout_ms` | How long a turn waits for a call's result: default `10000`, clamped to `1000..60000`. |
+| `mcp_servers` | MCP servers whose tools the reply may call, run by the Izwi server: `[{"label", "url", "headers", "allowed_tools"}]`, at most 8, each with at most 64 tools (name them in `allowed_tools` to narrow a larger server). An entry with a `url` is a Streamable HTTP server, which the server connects to only when its host is listed in `IZWI_MCP_ALLOWED_HOSTS`. An entry without a `url` names, by its `label`, a server from the server's MCP servers file (`mcp.json` in the data directory, or `IZWI_MCP_SERVERS_FILE`): a local command that speaks MCP over its standard streams, or a remote server. Only that file can name a command; `GET /v1/voice/tool-servers` lists its servers. `headers` on such an entry are added to a remote server's own and refused for a local command. A tool's name must not repeat another tool's. Calls are reported as `function_call` with `executor: "mcp"`. |
+| `agents` | Modular mode with a chat model that calls tools: the session's agents, at most 16: `[{"id", "name", "instructions", "tools", "handoffs", "handoff_description", "task"}]`. The first holds the conversation at the start. Each agent's prompt is the session's system prompt followed by its `instructions`; `tools` narrows the session's tools to the named ones. An agent hands the conversation to one of its `handoffs` (agent ids) by calling the tool `transfer_to_<id>`, which the server offers it with the target's `handoff_description`; the next agent answers in the same turn and holds the conversation in later turns (`agent_handoff` event). A `task` (`{"name", "description", "parameters", "then"}`) is something the agent collects from the user: `parameters` is a JSON Schema object, and the agent records the result by calling `complete_<name>`. A result missing a `required` field is refused and the agent asks for it; a recorded one is sent as `task_completed`, and the conversation moves to the agent `then` names, if any. |
+| `tool_wait_phrase` | Modular mode: what the reply says when a tool has kept it waiting 1.5 s and it has said nothing yet. Default `"One moment."` when `asr_language` is unset or English, nothing otherwise; `""` turns it off. |
 
 Client binary frame:
 
@@ -2324,13 +2317,28 @@ How a modular turn runs:
 - The reply streams from the chat model with thinking disabled (any reasoning text is dropped). Complete sentences are spoken as they arrive: the first segment is the fewest sentences reaching about 40 characters, later ones pack the sentences that have arrived (up to 240 characters), and the next segment is synthesized while the current one plays. Segments are joined with a short pause and fades.
 - Each stage (ASR, the reply, each TTS segment) takes its own request admission slot, so a turn holds none while it waits.
 - Assistant audio is paced by the client: when more than about 5 s (or 4 MiB) of audio is queued, synthesis waits for the client to take it rather than closing the session. A client that stops reading for 5 s ends the session.
-- The prompt carries the most recent history (24 messages, about 3000 tokens). A reply is remembered without reasoning, and only as far as it was heard: up to `conversation_item_truncate`'s `audio_end_ms`, or up to the client's estimated playback position when the user interrupted it.
+- The prompt carries the most recent history (24 messages, about 3000 tokens). In a modular session, once older messages no longer fit, the chat model writes short notes on them in the background (again after every 6 more) and the prompt carries those notes; they last for the connection. A reply is remembered without reasoning, and only as far as it was heard: up to `conversation_item_truncate`'s `audio_end_ms`, or up to the client's estimated playback position when the user interrupted it.
 
-How a unified turn with tools runs (LFM3-Audio):
+Events of a session with `resume_false_interruptions`:
 
-- The reply is told the tools in its system prompt. A reply that calls them speaks nothing in that round; the calls are sent as `function_call`, run (built-in tools on the server, the others by the client), reported as `function_call_completed`, and the reply's next round hears their results and speaks. A turn runs at most 3 rounds and makes at most 8 calls; past either it ends with an `error`.
+| Event | Fields |
+|-------|--------|
+| `turn_paused` | `utterance_id`, `utterance_seq` of the reply, `reason` (`barge_in`). Stop playing; keep the queue. |
+| `turn_resumed` | `utterance_id`, `utterance_seq` of the reply. Play on from where playback stopped. |
+
+Events of a session with `agents`:
+
+| Event | Fields |
+|-------|--------|
+| `agent_handoff` | `utterance_id`, `utterance_seq`, `from`, `to` (agent ids). |
+| `task_completed` | `utterance_id`, `utterance_seq`, `name`, `result` (the task's object). In the typed protocol `result` is that object as JSON text. |
+
+How a turn with tools runs:
+
+- The reply is told the tools in its prompt. A modular reply may say something before it calls ("Let me check"), which is spoken; an LFM3-Audio reply that calls tools speaks nothing in that round. In both, the calls are sent as `function_call`, run (built-in tools on the server, the others by the client), reported as `function_call_completed`, and the reply's next round reads their results and speaks. A turn runs at most 3 rounds and makes at most 8 calls; past either it ends with an `error`.
 - Each round takes its own request admission slot, so no slot is held while a tool runs. An interruption ends a call the client has not answered.
-- Text events and the remembered reply carry what the reply says, never its call markup. Audio chunk numbers count on across rounds, and only the last round's last chunk is marked final.
+- Text events and the remembered reply carry what the reply says, never its call markup. On LFM3-Audio, audio chunk numbers count on across rounds, and only the last round's last chunk is marked final.
+- Tool calls and their results last for the turn: the stored conversation keeps what the user said and what the reply said.
 
 Voice realtime persists voice sessions and turns in the local store. Modular turns can also update observational memory when that feature is enabled.
 
@@ -2376,7 +2384,11 @@ Events are the GA protocol's: `session.update`, `input_audio_buffer.*`, `convers
 ### Responses, tools and history
 
 - Responses run on the conversation's items. Clients may add items with `conversation.item.create` (`previous_item_id`, `"root"`), including `function_call` and `function_call_output` items; `response.create` takes `instructions` (replacing the session's for that response), `tools`, `tool_choice`, `max_output_tokens`, `output_modalities` (`["audio"]` or `["text"]`), `metadata` (echoed on `response.created` and `response.done`), and `conversation: "none"` with `input` (items or `item_reference`s) for an out-of-band response kept out of the conversation.
-- A response that calls functions ends there with its `function_call` items. The client answers with `function_call_output` items and a new `response.create`. Function tools need a chat model that calls tools (Qwen3, Qwen3.5, LFM2.5, LFM3) or LFM3-Audio; tools for another chat model fail the response instead of being dropped. With a chat model, `tool_choice: "required"` and a named tool open the reply with that call, as in chat completions; LFM3-Audio is asked in the prompt, which it may not obey. MCP tools are refused.
+- A response that calls functions ends there with its `function_call` items. The client answers with `function_call_output` items and a new `response.create`. Function tools need a chat model that calls tools (Qwen3, Qwen3.5, LFM2.5, LFM3) or LFM3-Audio; tools for another chat model fail the response instead of being dropped. With a chat model, `tool_choice: "required"` and a named tool open the reply with that call, as in chat completions; LFM3-Audio is asked in the prompt, which it may not obey.
+- MCP servers: a `tools` entry `{"type": "mcp", "server_label", "server_url"}` (optional `authorization` bearer token or `headers`, `allowed_tools`, and `require_approval`) lets a chat-model profile call that server's tools. Izwi lists them when the session is updated (`mcp_list_tools.in_progress`, an `mcp_list_tools` item in `conversation.item.done`, then `mcp_list_tools.completed` or `.failed`) and runs the calls itself: a response that calls one carries an `mcp_call` output item (`response.mcp_call_arguments.delta`/`.done`, `response.mcp_call.in_progress`, then `.completed` or `.failed`) whose `output` or `error` is filled in before `response.done`. As with OpenAI, the response ends there and the client sends `response.create` for the answer.
+  - Approvals: `require_approval` is `"always"` (the default, as with OpenAI), `"never"`, or `{"never": {"tool_names": [...]}}` to let named tools run unasked. A call that needs approval ends its response with an `mcp_approval_request` output item (`id`, `server_label`, `name`, `arguments`) instead of running. Answer with `conversation.item.create` and `{"type": "mcp_approval_response", "approval_request_id", "approve": true|false, "reason"}`. On approval Izwi runs the call at once: an `mcp_call` item with that `approval_request_id` joins the conversation (`conversation.item.added`, `response.mcp_call.in_progress`, `.completed` or `.failed`, `response.output_item.done`, `conversation.item.done`), and a `response.create` sent meanwhile waits for it. A declined call is told to the model, with the `reason`, in the next response. A request can be answered once.
+  - A server by name: an entry without `server_url` names a server the session already defined with that `server_label` (so a `response.create` can list `{"type": "mcp", "server_label": "docs"}` alone), or else a server from the Izwi server's MCP servers file (`mcp.json`, see `mcp_servers` under [Voice realtime](#voice-realtime)); those include programs run over standard streams. `connector_id` names a server from that file too, under the session's own `server_label`: OpenAI's hosted connectors do not exist here, but an operator can set up a server under a connector's id (`"connector_googlecalendar": {...}`) and existing client code keeps working. `authorization` is then sent to that server as the user's token.
+  - Differences from OpenAI: a server named by URL is reached only when its host is in `IZWI_MCP_ALLOWED_HOSTS`; `response.mcp_call.*` events for an approved call carry `output_index: 0` and the id of the response that asked; the session echo leaves out `headers`; speech-to-speech profiles do not take MCP tools.
 - One response at a time writes to the conversation, and one out-of-band response may run beside it. `conversation.item.truncate` cuts an assistant item's transcript to what the client played.
 - `response.done` reports usage: the chat model's text tokens, and audio tokens estimated at OpenAI's rates (1 per 100 ms of user audio, 1 per 50 ms of assistant audio).
 
@@ -2386,7 +2398,7 @@ Events are the GA protocol's: `session.update`, `input_audio_buffer.*`, `convers
 - Errors are `error` events with `type`, `code`, `message`, `param` and the client's `event_id`; the session stays open. Requests that conflict harmlessly (a different `model` in `session.update`, a voice change after the session has spoken, a truncate past the end) are accepted and ignored.
 - Sessions are not written to the voice history unless `IZWI_REALTIME_PERSIST=1`.
 - `?intent=transcription` opens a transcription session: input audio, VAD or manual commits and transcription events, no responses.
-- WebRTC (`/v1/realtime/calls`), SIP, MCP tools and image input are not served. [Phone calls and call centres](/features/telephony) covers how a call reaches a session.
+- WebRTC (`/v1/realtime/calls`), SIP and image input are not served. [Phone calls and call centres](/features/telephony) covers how a call reaches a session.
 
 ### Browser clients and client secrets
 

@@ -9,10 +9,10 @@ use crate::error::{Error, Result};
 use crate::kv::v2::{
     AttentionMask, AttentionPattern, BoundedShape, CheckpointPolicy, InferenceStateContract,
     KeyEncoding, PageSizeConstraint, PagedAttentionDomainSpec, PagedAttentionLayerSpec,
-    PlacementPolicy, PrefixPolicy, ShapeAxis, ShapeDimension, ShapeExtent, StateClock,
-    StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId,
-    StateGroupSpec, StateScope, TensorComponentSpec, TensorRole, TensorStateDomainSpec,
-    CURRENT_INFERENCE_STATE_ABI,
+    PlacementPolicy, PositionSemantics, PrefixPolicy, ShapeAxis, ShapeDimension, ShapeExtent,
+    StateClock, StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec,
+    StateGroupId, StateGroupSpec, StateScope, TensorComponentSpec, TensorRole,
+    TensorStateDomainSpec, CURRENT_INFERENCE_STATE_ABI,
 };
 
 use super::chat::Qwen35TextConfig;
@@ -21,10 +21,15 @@ pub(crate) const FULL_ATTENTION_DOMAIN: StateDomainId = StateDomainId::new(1);
 pub(crate) const RECURRENT_STATE_DOMAIN: StateDomainId = StateDomainId::new(2);
 pub(crate) const CONVOLUTION_STATE_DOMAIN: StateDomainId = StateDomainId::new(3);
 
+/// `prefix_caching` shares committed prefixes across requests as Qwen3.6-MoE
+/// and Qwen3.8 do: the attention domain publishes committed pages and the
+/// recurrent and convolution domains publish transactional snapshots at page
+/// boundaries.
 pub(crate) fn qwen35_composite_cache_contract(
     config: &Qwen35TextConfig,
     attention_dtype: DType,
     preferred_page_tokens: usize,
+    prefix_caching: bool,
 ) -> Result<InferenceStateContract> {
     if config.full_attention_interval == 0 {
         return Err(Error::InvalidInput(
@@ -97,12 +102,26 @@ pub(crate) fn qwen35_composite_cache_contract(
         ));
     }
 
-    let retained_header = |id| StateDomainHeader {
+    let attention_prefix = if prefix_caching {
+        PrefixPolicy::CommittedPages {
+            positions: PositionSemantics::Absolute,
+        }
+    } else {
+        PrefixPolicy::Disabled
+    };
+    let tensor_prefix = if prefix_caching {
+        PrefixPolicy::CommittedSnapshots {
+            interval_steps: u64::from(preferred),
+        }
+    } else {
+        PrefixPolicy::Disabled
+    };
+    let retained_header = |id, prefix: PrefixPolicy| StateDomainHeader {
         id,
         scope: StateScope::Retained,
         clock: StateClock::DecoderTokens,
         placement: PlacementPolicy::BackendLocalWithHostOffload,
-        prefix: PrefixPolicy::Disabled,
+        prefix,
         checkpoint: CheckpointPolicy::Transactional,
     };
     let tensor_components = |layers: &[(u32, u64)], role: TensorRole| {
@@ -130,7 +149,7 @@ pub(crate) fn qwen35_composite_cache_contract(
         abi: CURRENT_INFERENCE_STATE_ABI,
         domains: vec![
             StateDomainSpec::PagedAttention(PagedAttentionDomainSpec {
-                header: retained_header(FULL_ATTENTION_DOMAIN),
+                header: retained_header(FULL_ATTENTION_DOMAIN, attention_prefix),
                 layers: attention_layers,
                 page_size: PageSizeConstraint {
                     min_tokens: 1,
@@ -141,11 +160,11 @@ pub(crate) fn qwen35_composite_cache_contract(
                 accepted_dtypes: vec![dtype],
             }),
             StateDomainSpec::Tensor(TensorStateDomainSpec {
-                header: retained_header(RECURRENT_STATE_DOMAIN),
+                header: retained_header(RECURRENT_STATE_DOMAIN, tensor_prefix.clone()),
                 components: tensor_components(&recurrent_layers, TensorRole::RecurrentHidden)?,
             }),
             StateDomainSpec::Tensor(TensorStateDomainSpec {
-                header: retained_header(CONVOLUTION_STATE_DOMAIN),
+                header: retained_header(CONVOLUTION_STATE_DOMAIN, tensor_prefix),
                 components: tensor_components(&convolution_layers, TensorRole::ConvolutionState)?,
             }),
         ],
@@ -218,7 +237,7 @@ mod tests {
 
     #[test]
     fn composite_contract_covers_every_hybrid_layer_without_prefix_claims() {
-        let contract = qwen35_composite_cache_contract(&config(), DType::F16, 32).unwrap();
+        let contract = qwen35_composite_cache_contract(&config(), DType::F16, 32, false).unwrap();
         assert_eq!(contract.domains.len(), 3);
 
         let StateDomainSpec::PagedAttention(attention) = &contract.domains[0] else {
@@ -258,12 +277,32 @@ mod tests {
     }
 
     #[test]
+    fn prefix_caching_declares_shareable_policies() {
+        let shared = qwen35_composite_cache_contract(&config(), DType::F16, 32, true).unwrap();
+        let StateDomainSpec::PagedAttention(attention) = &shared.domains[0] else {
+            panic!("expected attention domain");
+        };
+        assert_eq!(
+            attention.header.prefix,
+            PrefixPolicy::CommittedPages {
+                positions: PositionSemantics::Absolute,
+            }
+        );
+        for tensor in &shared.domains[1..] {
+            assert_eq!(
+                tensor.header().prefix,
+                PrefixPolicy::CommittedSnapshots { interval_steps: 32 }
+            );
+        }
+    }
+
+    #[test]
     fn composite_contract_allocates_paged_and_transactional_tensor_arenas() {
         use crate::backends::BackendKind;
         use crate::engine::{ManagedKvCacheManager, ModelInstanceId};
         use crate::kv::InferenceStateCapability;
 
-        let contract = qwen35_composite_cache_contract(&config(), DType::F16, 32).unwrap();
+        let contract = qwen35_composite_cache_contract(&config(), DType::F16, 32, false).unwrap();
         assert_eq!(contract.groups.len(), 1);
         assert_eq!(
             contract.groups[0].domains,

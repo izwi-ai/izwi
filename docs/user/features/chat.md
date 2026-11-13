@@ -221,14 +221,17 @@ figures if they do not fit.
 ### Chat history reuse
 
 Each chat turn re-renders the whole conversation, but Qwen3.8 on CUDA, Qwen3.6 on
-CPU and CUDA, and LFM2.5 and LFM3 on CPU and Metal do not recompute the history they
-already processed (Qwen3.8 on CPU and Metal too, once its MTP draft head is off with
-`IZWI_QWEN38_MTP=0`). On CPU and Metal this needs resumable prefill, which is off by
-default there:
+CPU and CUDA, and Qwen3.5, LFM2.5 and LFM3 on CPU and Metal do not recompute the
+history they already processed (Qwen3.8 on CPU and Metal too, once its MTP draft head
+is off with `IZWI_QWEN38_MTP=0`). Reuse needs resumable prefill, which a model that
+shares history now uses on its own: `IZWI_ENABLE_CHUNKED_PREFILL` no longer has to
+be set for it.
 
-```bash
-export IZWI_ENABLE_CHUNKED_PREFILL=1
-```
+For Qwen3.5 the same reuse serves a reply that calls a tool: the round that reads the
+tool's result attaches at the prompt the round before it processed, and a prompt that
+starts with the same system prompt and tools as an earlier one attaches after them. On
+an M1 Pro with Qwen3.5-4B that brings a voice turn that calls a tool from about 7.3 s
+to about 2.6 s to first audio. A prompt with images shares nothing.
 
 A turn's prompt is split before its final assistant header (earlier answers are
 re-rendered, so only the history up to there repeats in the next turn); the server
@@ -239,7 +242,7 @@ conversations. A history shorter than one page has no snapshot, so after a very 
 first prompt the third turn is the first to reuse.
 
 Snapshots are bounded: `IZWI_MAX_PREFIX_SNAPSHOTS` (default 8) snapshots per model,
-about 157 MB each for Qwen3.8 and under 1 MB for LFM2.5 and LFM3, reserved at load. The least recently used snapshot is
+about 157 MB each for Qwen3.8, 53 MB for Qwen3.5-4B and under 1 MB for LFM2.5 and LFM3, reserved at load. The least recently used snapshot is
 dropped first, so up to 8 conversations continue with their history reused at once;
 others prefill in full. History pages share the KV cache and are released when a
 request needs the room. A conversation's whole history must fit the prefix page

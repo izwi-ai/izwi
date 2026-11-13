@@ -19,6 +19,7 @@ import {
   VOICE_REALTIME_DUCK_GAIN,
   voiceRealtimeEndsUserSpeech,
   voiceRealtimePlaybackAction,
+  voiceTranscriptEvent,
   type RuntimeStatus,
   type TranscriptEntry,
   type VoiceRealtimeAssistantAudioBinaryChunk,
@@ -42,6 +43,10 @@ interface UseVoiceSessionOptions {
   engine: VoiceSessionEngine | null;
   speaker?: string;
   systemPrompt: string;
+  /** More `input_stream_start` fields: tools, agents, turn taking. */
+  streamOptions?: Record<string, unknown>;
+  /** The name of the agent with this id, for the transcript. */
+  agentName?: (id: string) => string;
 }
 
 const MICROPHONE_ERRORS = new Set([
@@ -61,6 +66,8 @@ export function useVoiceSession({
   engine,
   speaker,
   systemPrompt,
+  streamOptions,
+  agentName,
 }: UseVoiceSessionOptions) {
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>("idle");
   const [failure, setFailure] = useState<VoiceSessionFailure | null>(null);
@@ -91,6 +98,8 @@ export function useVoiceSession({
   const ttsStreamSessionRef = useRef(0);
   /** Assistant playback is ducked while the user may be speaking over it. */
   const playbackDuckedRef = useRef(false);
+  /** The server paused the reply: it resumes it or interrupts it later. */
+  const playbackPausedRef = useRef(false);
   const playbackGainValue = useCallback(
     () => (playbackDuckedRef.current ? VOICE_REALTIME_DUCK_GAIN : 1),
     [],
@@ -122,6 +131,7 @@ export function useVoiceSession({
   );
   const voiceUserEntryIdsRef = useRef<Map<string, string>>(new Map());
   const voiceAssistantEntryIdsRef = useRef<Map<string, string>>(new Map());
+  const voiceEventEntryIdsRef = useRef<Map<string, string>>(new Map());
   const voiceWsPlaybackRef = useRef<{
     utteranceId: string;
     utteranceSeq: number;
@@ -133,6 +143,11 @@ export function useVoiceSession({
   useEffect(() => {
     runtimeStatusRef.current = runtimeStatus;
   }, [runtimeStatus]);
+
+  const agentNameRef = useRef(agentName);
+  useEffect(() => {
+    agentNameRef.current = agentName;
+  }, [agentName]);
 
   const stopTtsStreamingPlayback = useCallback(() => {
     ttsStreamSessionRef.current += 1;
@@ -300,6 +315,7 @@ export function useVoiceSession({
     playbackDuckedRef.current = false;
     voiceUserEntryIdsRef.current.clear();
     voiceAssistantEntryIdsRef.current.clear();
+    voiceEventEntryIdsRef.current.clear();
 
     analyserRef.current = null;
     clearAudioPlayback();
@@ -340,6 +356,42 @@ export function useVoiceSession({
           text,
         };
         return next;
+      });
+    },
+    [],
+  );
+
+  /** What the assistant did (a tool, a handoff), shown ahead of the reply
+   * of the same turn. A later event with the same key replaces the line. */
+  const showTranscriptEvent = useCallback(
+    (
+      utteranceId: string,
+      line: { key: string; text: string; state?: "pending" | "failed" },
+    ) => {
+      const known = voiceEventEntryIdsRef.current.get(line.key);
+      const entryId = known ?? makeTranscriptEntryId("assistant");
+      voiceEventEntryIdsRef.current.set(line.key, entryId);
+      const replyId = voiceAssistantEntryIdsRef.current.get(utteranceId);
+      setTranscript((prev) => {
+        const entry: TranscriptEntry = {
+          id: entryId,
+          role: "event",
+          text: line.text,
+          state: line.state,
+          timestamp: Date.now(),
+        };
+        const at = prev.findIndex((item) => item.id === entryId);
+        if (at !== -1) {
+          const next = [...prev];
+          next[at] = { ...entry, timestamp: prev[at].timestamp };
+          return next;
+        }
+        const reply = replyId ? prev.findIndex((item) => item.id === replyId) : -1;
+        // An empty reply entry is still to come: the event goes before it.
+        if (reply !== -1 && prev[reply].text === "") {
+          return [...prev.slice(0, reply), entry, ...prev.slice(reply)];
+        }
+        return [...prev, entry];
       });
     },
     [],
@@ -482,7 +534,7 @@ export function useVoiceSession({
    * typed protocol sends no start events, so any text event may be first.
    */
   const transcriptEntryId = useCallback(
-    (role: TranscriptEntry["role"], utteranceId: string) => {
+    (role: "user" | "assistant", utteranceId: string) => {
       const ids =
         role === "user"
           ? voiceUserEntryIdsRef.current
@@ -512,7 +564,7 @@ export function useVoiceSession({
 
   /** Settle an utterance's line on its final text; an empty one is removed. */
   const finishTranscriptEntry = useCallback(
-    (role: TranscriptEntry["role"], utteranceId: string, finalText: string) => {
+    (role: "user" | "assistant", utteranceId: string, finalText: string) => {
       if (finalText) {
         setTranscriptEntryText(transcriptEntryId(role, utteranceId), finalText);
         return;
@@ -549,9 +601,19 @@ export function useVoiceSession({
       const playbackAction = voiceRealtimePlaybackAction(
         event,
         voiceWsPlaybackRef.current?.utteranceSeq ?? null,
+        playbackPausedRef.current,
       );
-      if (playbackAction === "stop") {
+      if (playbackAction === "pause") {
+        // Keep what is queued: a suspended context holds its schedule.
+        playbackPausedRef.current = true;
+        ttsPlaybackContextRef.current?.suspend().catch(() => {});
+      } else if (playbackAction === "resume") {
+        playbackPausedRef.current = false;
+        setPlaybackDucked(false);
+        ttsPlaybackContextRef.current?.resume().catch(() => {});
+      } else if (playbackAction === "stop") {
         clearAudioPlayback();
+        playbackPausedRef.current = false;
         playbackDuckedRef.current = false;
         voiceWsPlaybackRef.current = null;
         processingRef.current = false;
@@ -604,6 +666,16 @@ export function useVoiceSession({
             runtimeStatusRef.current === "preparing"
           ) {
             setRuntimeStatus("listening");
+          }
+          return;
+        }
+        case "function_call":
+        case "function_call_completed":
+        case "agent_handoff":
+        case "task_completed": {
+          const line = voiceTranscriptEvent(event, agentNameRef.current);
+          if (line) {
+            showTranscriptEvent(event.utterance_id, line);
           }
           return;
         }
@@ -709,6 +781,7 @@ export function useVoiceSession({
           }
 
           clearAudioPlayback();
+          playbackPausedRef.current = false;
 
           const playbackContext = new AudioContext();
           const playbackGain = playbackContext.createGain();
@@ -818,6 +891,7 @@ export function useVoiceSession({
     },
     [
       appendTranscriptText,
+      showTranscriptEvent,
       clearAudioPlayback,
       finalizeVoiceWsPlaybackIfComplete,
       failSession,
@@ -1042,6 +1116,7 @@ export function useVoiceSession({
           // Replies use the server's voice length (short, spoken answers).
           max_utterance_ms: 20_000,
           pre_roll_ms: 160,
+          ...streamOptions,
           input_sample_rate: Math.round(inputSampleRate),
         };
         sendVoiceRealtimeJson(
@@ -1075,6 +1150,7 @@ export function useVoiceSession({
     },
     [
       engine,
+      streamOptions,
       ensureVoiceRealtimeSocket,
       sendVoiceRealtimeJson,
       speaker,
@@ -1093,6 +1169,7 @@ export function useVoiceSession({
     setTranscript([]);
     voiceUserEntryIdsRef.current.clear();
     voiceAssistantEntryIdsRef.current.clear();
+    voiceEventEntryIdsRef.current.clear();
     isMicMutedRef.current = false;
     setIsMicMuted(false);
     isSessionActiveRef.current = true;

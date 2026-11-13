@@ -392,6 +392,11 @@ impl EndpointDetector {
         self.total_ms = 0.0;
     }
 
+    /// Change how much silence ends an utterance, from now on.
+    pub fn set_silence_ms(&mut self, silence_ms: u32) {
+        self.config.silence_ms = silence_ms;
+    }
+
     /// Advance on one scored frame, holding it to the score threshold and the
     /// SNR margin.
     pub fn process_frame(&mut self, frame: &VadFrame) -> EndpointDecision {

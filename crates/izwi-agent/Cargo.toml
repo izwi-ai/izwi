@@ -1,6 +1,6 @@
 [package]
 name = "izwi-agent"
-description = "Minimal agent framework primitives and engine for Izwi"
+description = "Agent turn runtime for Izwi: streaming model rounds, tool calls, handoffs and tasks"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,11 @@ license.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-async-trait = "0.1"
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

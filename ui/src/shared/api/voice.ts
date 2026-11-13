@@ -31,8 +31,22 @@ export interface VoiceObservation {
   forgotten_at: number | null;
 }
 
+/** An MCP server set up on the Izwi server, usable by its label. */
+export interface VoiceConfiguredToolServer {
+  label: string;
+  /** A local command (`stdio`) or a remote server (`http`). */
+  transport: "stdio" | "http";
+}
+
 export class VoiceApiClient {
   constructor(private readonly http: ApiHttpClient) {}
+
+  async listVoiceToolServers(): Promise<VoiceConfiguredToolServer[]> {
+    const response = await this.http.request<{
+      servers?: VoiceConfiguredToolServer[];
+    }>("/voice/tool-servers");
+    return response.servers ?? [];
+  }
 
   async getVoiceProfile(): Promise<VoiceProfile> {
     return this.http.request("/voice/profile");

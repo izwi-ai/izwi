@@ -128,6 +128,39 @@ export type VoiceRealtimeServerEvent =
       reason?: string;
     }
   | {
+      type: "function_call";
+      utterance_id: string;
+      utterance_seq: number;
+      call_id: string;
+      name: string;
+      arguments?: string;
+      executor?: string | null;
+    }
+  | {
+      type: "function_call_completed";
+      utterance_id: string;
+      utterance_seq: number;
+      call_id: string;
+      name: string;
+      status: string;
+      output?: string;
+    }
+  | {
+      type: "agent_handoff";
+      utterance_id: string;
+      utterance_seq: number;
+      from: string;
+      to: string;
+    }
+  | {
+      type: "task_completed";
+      utterance_id: string;
+      utterance_seq: number;
+      name: string;
+    }
+  | { type: "turn_paused"; utterance_id: string; utterance_seq: number; reason?: string }
+  | { type: "turn_resumed"; utterance_id: string; utterance_seq: number }
+  | {
       type: "turn_done";
       utterance_id: string;
       utterance_seq: number;
@@ -202,6 +235,18 @@ type VoiceRealtimeV2Payload =
       type: "assistant_audio_completed";
       data: { last_chunk_sequence: number };
     }
+  | {
+      type: "function_call";
+      data: { call_id: string; name: string; arguments: string; executor?: string };
+    }
+  | {
+      type: "function_call_completed";
+      data: { call_id: string; name: string; status: string; output: string };
+    }
+  | { type: "agent_handoff"; data: { from: string; to: string } }
+  | { type: "task_completed"; data: { name: string; result: string } }
+  | { type: "turn_paused"; data?: Record<string, never> | null }
+  | { type: "turn_resumed"; data?: Record<string, never> | null }
   | {
       type: "interruption";
       data: {
@@ -299,9 +344,12 @@ export interface VoiceRealtimeAssistantAudioBinaryChunk {
 
 export interface TranscriptEntry {
   id: string;
-  role: "user" | "assistant";
+  /** `event` is something the assistant did: used a tool, handed over. */
+  role: "user" | "assistant" | "event";
   text: string;
   timestamp: number;
+  /** An event still under way, or one that failed. */
+  state?: "pending" | "failed";
 }
 
 export interface VoicePageProps {
@@ -701,6 +749,30 @@ export function isVoiceRealtimeV2ServerEnvelope(
       );
     case "assistant_audio_completed":
       return record !== null && isNonNegativeSafeInteger(record.last_chunk_sequence);
+    case "turn_paused":
+    case "turn_resumed":
+      return true;
+    case "function_call":
+      return (
+        record !== null &&
+        typeof record.call_id === "string" &&
+        typeof record.name === "string"
+      );
+    case "function_call_completed":
+      return (
+        record !== null &&
+        typeof record.call_id === "string" &&
+        typeof record.name === "string" &&
+        typeof record.status === "string"
+      );
+    case "agent_handoff":
+      return (
+        record !== null &&
+        typeof record.from === "string" &&
+        typeof record.to === "string"
+      );
+    case "task_completed":
+      return record !== null && typeof record.name === "string";
     case "interruption":
       return (
         record !== null &&
@@ -831,6 +903,43 @@ export function normalizeVoiceRealtimeV2Event(
         : null;
     case "assistant_audio_completed":
       return identity ? { type: "assistant_audio_done", ...identity } : null;
+    case "function_call":
+      return identity
+        ? {
+            type: "function_call",
+            ...identity,
+            call_id: envelope.data.call_id,
+            name: envelope.data.name,
+            executor: envelope.data.executor ?? null,
+          }
+        : null;
+    case "function_call_completed":
+      return identity
+        ? {
+            type: "function_call_completed",
+            ...identity,
+            call_id: envelope.data.call_id,
+            name: envelope.data.name,
+            status: envelope.data.status,
+          }
+        : null;
+    case "agent_handoff":
+      return identity
+        ? {
+            type: "agent_handoff",
+            ...identity,
+            from: envelope.data.from,
+            to: envelope.data.to,
+          }
+        : null;
+    case "task_completed":
+      return identity
+        ? { type: "task_completed", ...identity, name: envelope.data.name }
+        : null;
+    case "turn_paused":
+      return identity ? { type: "turn_paused", ...identity } : null;
+    case "turn_resumed":
+      return identity ? { type: "turn_resumed", ...identity } : null;
     case "interruption":
       return identity
         ? { type: "turn_interrupted", ...identity, reason: envelope.data.reason }
@@ -947,7 +1056,20 @@ export function isVoiceRealtimeServerEvent(
     case "assistant_text_start":
     case "assistant_audio_done":
     case "turn_interrupted":
+    case "turn_paused":
+    case "turn_resumed":
       return hasTurnIdentity();
+    case "function_call":
+    case "function_call_completed":
+      return (
+        hasTurnIdentity() &&
+        typeof event.call_id === "string" &&
+        typeof event.name === "string"
+      );
+    case "agent_handoff":
+      return hasTurnIdentity() && typeof event.to === "string";
+    case "task_completed":
+      return hasTurnIdentity() && typeof event.name === "string";
     case "user_transcript_delta":
     case "assistant_text_delta":
       return hasTurnText("delta");
@@ -976,10 +1098,72 @@ export function isVoiceRealtimeServerEvent(
   }
 }
 
+/** "get_weather" → "get weather": a tool's name as words. */
+function toolWords(name: string): string {
+  return name.replace(/[_-]+/g, " ").trim() || "a tool";
+}
+
+/**
+ * What the transcript says about something the assistant did, or `null`
+ * for an event it does not show. The tools the server adds for handoffs
+ * and tasks (`transfer_to_…`, `complete_…`) are shown by their own events.
+ * `agentName` turns an agent's id into the name the user gave it.
+ */
+export function voiceTranscriptEvent(
+  event: VoiceRealtimeServerEvent,
+  agentName: (id: string) => string = (id) => id,
+): { key: string; text: string; state?: "pending" | "failed" } | null {
+  switch (event.type) {
+    case "function_call":
+    case "function_call_completed": {
+      if (/^(transfer_to_|complete_)/.test(event.name)) {
+        return null;
+      }
+      const tool = toolWords(event.name);
+      const key = `call:${event.call_id}`;
+      if (event.type === "function_call") {
+        return { key, text: `Using ${tool}…`, state: "pending" };
+      }
+      if (event.status === "ok") {
+        return { key, text: `Used ${tool}` };
+      }
+      if (event.status === "started") {
+        return { key, text: `Started ${tool}` };
+      }
+      return {
+        key,
+        text:
+          event.status === "timeout"
+            ? `${tool} took too long`
+            : `Couldn’t use ${tool}`,
+        state: "failed",
+      };
+    }
+    case "agent_handoff":
+      return {
+        key: `handoff:${event.utterance_id}:${event.to}`,
+        text: `Handed over to ${agentName(event.to)}`,
+      };
+    case "task_completed":
+      return {
+        key: `task:${event.utterance_id}:${event.name}`,
+        text: `Recorded ${toolWords(event.name)}`,
+      };
+    default:
+      return null;
+  }
+}
+
 /** Playback volume while the user may be speaking over the assistant. */
 export const VOICE_REALTIME_DUCK_GAIN = 0.25;
 
-export type VoiceRealtimePlaybackAction = "stop" | "duck" | "restore" | null;
+export type VoiceRealtimePlaybackAction =
+  | "stop"
+  | "duck"
+  | "restore"
+  | "pause"
+  | "resume"
+  | null;
 
 /**
  * What a server event does to the assistant reply playing for
@@ -988,10 +1172,16 @@ export type VoiceRealtimePlaybackAction = "stop" | "duck" | "restore" | null;
  * stops once the server interrupts it (a confirmed barge-in) or a newer
  * utterance becomes a turn, and comes back to full volume when the speech
  * that ducked it is rejected.
+ *
+ * A server that resumes false interruptions pauses the reply instead
+ * (`turn_paused`): it keeps its queue, and the server then either resumes
+ * it (`turn_resumed`) or interrupts it. While it is `paused`, the end of
+ * the user's speech decides nothing.
  */
 export function voiceRealtimePlaybackAction(
   event: VoiceRealtimeServerEvent,
   activeUtteranceSeq: number | null,
+  paused = false,
 ): VoiceRealtimePlaybackAction {
   if (activeUtteranceSeq == null) {
     return null;
@@ -1001,7 +1191,11 @@ export function voiceRealtimePlaybackAction(
     case "user_speech_start":
       return activeUtteranceSeq < event.utterance_seq ? "duck" : null;
     case "user_speech_end":
-      return activeUtteranceSeq < event.utterance_seq ? "stop" : null;
+      return activeUtteranceSeq < event.utterance_seq && !paused ? "stop" : null;
+    case "turn_paused":
+      return activeUtteranceSeq === event.utterance_seq ? "pause" : null;
+    case "turn_resumed":
+      return activeUtteranceSeq === event.utterance_seq ? "resume" : null;
     case "user_speech_rejected":
       return activeUtteranceSeq < event.utterance_seq ? "restore" : null;
     case "turn_interrupted":

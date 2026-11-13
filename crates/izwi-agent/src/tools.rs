@@ -1,17 +1,31 @@
+use crate::cancel::TurnCancel;
 use crate::errors::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A call a model made: the tool's name and its arguments, a JSON object
+/// as text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ToolContext {
     pub session_id: String,
     pub thread_id: String,
+    pub call_id: String,
+    /// What the user said in the turn that made the call.
     pub user_text: String,
-    /// The arguments a model called the tool with (an object), or `null`
-    /// when the tool runs on its own.
-    #[serde(default)]
-    pub arguments: serde_json::Value,
+    /// The arguments the model called the tool with (an object).
+    pub arguments: Value,
+    /// Resolves when the turn is cancelled; a tool that waits on something
+    /// (a client's answer) stops waiting then.
+    pub cancel: TurnCancel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,37 +33,53 @@ pub struct ToolOutput {
     pub text: String,
 }
 
+/// How a turn runs a tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolExecution {
+    /// The turn waits for the result and the model reads it in the next
+    /// round.
+    Inline,
+    /// The tool keeps running after the turn; the model is told it started
+    /// and reads the result in a later turn.
+    Background,
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
-    fn description(&self) -> &'static str;
-
-    fn should_auto_run(&self, _user_text: &str) -> bool {
-        false
-    }
+    fn description(&self) -> &str;
 
     /// The JSON Schema of the arguments a model calls the tool with.
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({"type": "object", "properties": {}})
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {}})
     }
 
-    /// Whether a model may call the tool.
-    fn model_callable(&self) -> bool {
-        true
+    fn execution(&self) -> ToolExecution {
+        ToolExecution::Inline
+    }
+
+    /// Who runs the tool, for the turn's events: `server`, `client` or
+    /// `mcp`.
+    fn executor(&self) -> &'static str {
+        "server"
     }
 
     async fn invoke(&self, ctx: ToolContext) -> Result<ToolOutput>;
 }
 
+/// The tools a turn may call: tools the turn runs itself, and declared
+/// tools the caller runs (a call to one ends the turn with the call
+/// pending).
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: Vec<Arc<dyn Tool>>,
+    external: Vec<Value>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: Vec::new() }
+        Self::default()
     }
 
     pub fn register<T>(&mut self, tool: T)
@@ -59,68 +89,111 @@ impl ToolRegistry {
         self.tools.push(Arc::new(tool));
     }
 
+    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
+        self.tools.push(tool);
+    }
+
+    /// Declare a function tool (chat completions form) the caller runs.
+    pub fn declare_external(&mut self, definition: Value) {
+        self.external.push(definition);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty() && self.external.is_empty()
+    }
+
     pub fn tool_names(&self) -> Vec<String> {
         self.tools
             .iter()
             .map(|tool| tool.name().to_string())
+            .chain(
+                self.external
+                    .iter()
+                    .filter_map(|tool| definition_name(tool).map(str::to_string)),
+            )
             .collect()
     }
 
-    /// The model-callable tool named `name`.
+    /// The tool named `name` that the turn runs itself.
     pub fn find(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools
-            .iter()
-            .find(|tool| tool.model_callable() && tool.name() == name)
-            .cloned()
+        self.tools.iter().find(|tool| tool.name() == name).cloned()
     }
 
-    /// The model-callable tools as OpenAI function tools.
-    pub fn function_definitions(&self) -> Vec<serde_json::Value> {
+    /// Whether `name` is a declared tool the caller runs.
+    pub fn is_external(&self, name: &str) -> bool {
+        self.external
+            .iter()
+            .any(|tool| definition_name(tool) == Some(name))
+    }
+
+    /// The tools as OpenAI function tools; `allowed` narrows them to the
+    /// names an agent may call.
+    pub fn function_definitions(&self, allowed: Option<&[String]>) -> Vec<Value> {
+        let allows = |name: &str| allowed.is_none_or(|names| names.iter().any(|n| n == name));
         self.tools
             .iter()
-            .filter(|tool| tool.model_callable())
-            .map(|tool| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name(),
-                        "description": tool.description(),
-                        "parameters": tool.parameters(),
-                    }
-                })
-            })
+            .filter(|tool| allows(tool.name()))
+            .map(|tool| function_definition(tool.name(), tool.description(), tool.parameters()))
+            .chain(
+                self.external
+                    .iter()
+                    .filter(|tool| definition_name(tool).is_some_and(allows))
+                    .cloned(),
+            )
             .collect()
-    }
-
-    pub fn find_auto_tool(&self, user_text: &str) -> Option<Arc<dyn Tool>> {
-        self.tools
-            .iter()
-            .find(|tool| tool.should_auto_run(user_text))
-            .cloned()
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoopTool;
+/// A function tool in the chat completions form.
+pub fn function_definition(name: &str, description: &str, parameters: Value) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        }
+    })
+}
 
-#[async_trait]
-impl Tool for NoopTool {
-    fn name(&self) -> &'static str {
-        "noop"
+fn definition_name(definition: &Value) -> Option<&str> {
+    definition["function"]["name"].as_str()
+}
+
+/// The result of a background tool, waiting for the session's next turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundResult {
+    pub call_id: String,
+    pub name: String,
+    /// `ok`, `error` or `timeout`.
+    pub status: String,
+    pub output: String,
+}
+
+/// A session's background tool results: a turn's background tools add to
+/// it when they finish, and the next turn takes what is there.
+#[derive(Debug, Clone, Default)]
+pub struct BackgroundResults {
+    results: Arc<Mutex<Vec<BackgroundResult>>>,
+}
+
+impl BackgroundResults {
+    pub fn push(&self, result: BackgroundResult) {
+        self.lock().push(result);
     }
 
-    fn description(&self) -> &'static str {
-        "A no-op tool used for testing and scaffolding."
+    pub fn take(&self) -> Vec<BackgroundResult> {
+        std::mem::take(&mut *self.lock())
     }
 
-    fn model_callable(&self) -> bool {
-        false
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
     }
 
-    async fn invoke(&self, _ctx: ToolContext) -> Result<ToolOutput> {
-        Ok(ToolOutput {
-            text: "No-op tool executed.".to_string(),
-        })
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<BackgroundResult>> {
+        self.results
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 }
 
@@ -129,18 +202,12 @@ pub struct TimeTool;
 
 #[async_trait]
 impl Tool for TimeTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "time"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Returns the current local date and time."
-    }
-
-    /// A question about the time or the date, by whole words: "sometimes",
-    /// "update" or "times" do not run it.
-    fn should_auto_run(&self, user_text: &str) -> bool {
-        has_any_word(user_text, &["time", "date", "today"])
     }
 
     async fn invoke(&self, _ctx: ToolContext) -> Result<ToolOutput> {
@@ -158,53 +225,35 @@ where
     now.format("%A %-d %B %Y, %H:%M (UTC%:z)").to_string()
 }
 
-/// Whether `text` contains one of `words` as a whole word, ignoring case.
-pub(crate) fn has_any_word(text: &str, words: &[&str]) -> bool {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '\'')
-        .any(|word| words.contains(&word))
-}
-
 #[cfg(test)]
-mod word_tests {
+mod tests {
     use super::*;
 
     #[test]
-    fn the_time_tool_runs_for_whole_words_only() {
-        let tool = TimeTool;
-        for asks in ["What time is it?", "What's the date", "What is today?"] {
-            assert!(tool.should_auto_run(asks), "{asks}");
-        }
-        for chat in [
-            "Sometimes I forget",
-            "Any update on the candidate?",
-            "Three times a week",
-            "Nice lifetime story",
-        ] {
-            assert!(!tool.should_auto_run(chat), "{chat}");
-        }
-    }
-
-    /// A model can call `time` (with no arguments), never the scaffolding
-    /// `noop`.
-    #[test]
-    fn models_call_the_time_tool_but_not_noop() {
+    fn the_registry_lists_its_own_and_declared_tools() {
         let mut tools = ToolRegistry::new();
-        tools.register(NoopTool);
         tools.register(TimeTool);
+        tools.declare_external(function_definition("lookup", "Look it up.", json!({})));
         assert!(tools.find("time").is_some());
-        assert!(tools.find("noop").is_none());
+        assert!(tools.find("lookup").is_none());
+        assert!(tools.is_external("lookup"));
+        assert!(!tools.is_external("time"));
+        assert_eq!(tools.tool_names(), ["time", "lookup"]);
         assert_eq!(
-            tools.function_definitions(),
-            vec![serde_json::json!({
+            tools.function_definitions(None)[0],
+            json!({
                 "type": "function",
                 "function": {
                     "name": "time",
                     "description": "Returns the current local date and time.",
                     "parameters": {"type": "object", "properties": {}}
                 }
-            })]
+            })
         );
+        let only = ["lookup".to_string()];
+        let narrowed = tools.function_definitions(Some(&only));
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0]["function"]["name"], "lookup");
     }
 
     #[test]

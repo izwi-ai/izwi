@@ -1,7 +1,8 @@
 import { useEffect, useRef } from "react";
-import { X } from "lucide-react";
+import { Check, CircleAlert, Loader2, X } from "lucide-react";
 
 import type { TranscriptEntry } from "@/features/voice/realtime/support";
+import { cn } from "@/lib/utils";
 
 /** The conversation so far, as plain text, beside the stage. */
 export function VoiceTranscript({
@@ -51,6 +52,28 @@ export function VoiceTranscript({
               isAssistantLive &&
               entry.role === "assistant" &&
               index === entries.length - 1;
+            if (entry.role === "event") {
+              return (
+                <li
+                  key={entry.id}
+                  className={cn(
+                    "-my-2 flex items-center gap-2 text-xs",
+                    entry.state === "failed"
+                      ? "text-(--danger-text)"
+                      : "text-(--text-subtle)",
+                  )}
+                >
+                  {entry.state === "pending" ? (
+                    <Loader2 aria-hidden="true" className="h-3 w-3 animate-spin" />
+                  ) : entry.state === "failed" ? (
+                    <CircleAlert aria-hidden="true" className="h-3 w-3" />
+                  ) : (
+                    <Check aria-hidden="true" className="h-3 w-3" />
+                  )}
+                  {entry.text}
+                </li>
+              );
+            }
             return (
               <li key={entry.id} className="flex flex-col gap-1">
                 <span className="text-xs text-(--text-subtle)">

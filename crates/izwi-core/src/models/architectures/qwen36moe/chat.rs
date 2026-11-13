@@ -428,6 +428,12 @@ impl Qwen36MoeChatModel {
         self.exec.continuous_decode_batch_workspace_per_row_bytes()
     }
 
+    /// Whether this load shares committed prefixes: engaged, and without
+    /// the MTP head, which keeps every domain private.
+    pub(crate) fn shares_prefixes(&self) -> bool {
+        self.exec.prefix_caching && self.exec.mtp_head.is_none()
+    }
+
     pub fn device_kind(&self) -> BackendKind {
         self.device_kind
     }

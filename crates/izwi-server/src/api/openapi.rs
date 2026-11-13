@@ -889,36 +889,6 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     );
     add_operation(
         paths,
-        "/v1/agent/sessions",
-        "post",
-        "Chat",
-        "Create agent session",
-        "Create preview process-local agent session metadata and a linked chat thread.",
-        preview_response(),
-    );
-    add_operation_with_params(
-        paths,
-        "/v1/agent/sessions/{session_id}",
-        "get",
-        "Chat",
-        "Get agent session",
-        "Fetch retained process-local agent session metadata.",
-        &[("session_id", "Agent session identifier")],
-        preview_response(),
-    );
-    add_operation_with_params(
-        paths,
-        "/v1/agent/sessions/{session_id}/turns",
-        "post",
-        "Chat",
-        "Create agent turn",
-        "Run one agent turn.",
-        &[("session_id", "Agent session identifier")],
-        preview_response(),
-    );
-
-    add_operation(
-        paths,
         "/v1/voice/profile",
         "get",
         "Voice",
@@ -933,6 +903,15 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Voice",
         "Update voice profile",
         "Update voice profile settings.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/voice/tool-servers",
+        "get",
+        "Voice",
+        "List configured tool servers",
+        "List the MCP servers set up in this server's MCP servers file: each one's label and transport. A voice or Realtime session uses one by naming its label.",
         preview_response(),
     );
     add_operation(

@@ -20,10 +20,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::Message;
-use izwi_agent::ReasoningFilter;
+use izwi_agent::{
+    AgentDefinition, AgentEngine, AgentError, AgentEvent, AgentSession, AgentSet, AgentTurnOptions,
+    BackgroundResults, MemoryMessage, MemoryMessageRole, ReasoningFilter, ToolRegistry,
+    TurnContext, TurnEvents, TurnFinish,
+};
 use izwi_core::{
-    ChatFinishReason, ChatMessage, ChatRequestConfig, ChatRole, ChatTruncation, GenerationParams,
-    ModelFamily, RuntimeService, SessionModelLeases, CHAT_AUDIO_PLACEHOLDER,
+    ChatMessage, ChatRole, GenerationParams, ModelFamily, RuntimeService, SessionModelLeases,
+    CHAT_AUDIO_PLACEHOLDER,
 };
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -33,19 +37,20 @@ use super::audio::{base64, wav, OutputEncoder};
 use super::events::{server_event, Ids};
 use super::items::{ContentPart, Item, ItemKind, ItemStatus, ItemStore, Position, Role};
 use super::profiles::{ProfileMode, RealtimeProfile};
-use super::session_config::{chat_tool, AudioFormat, Modality};
-use crate::api::openai::convert::InboundContent;
-use crate::api::openai::responses::dto::{ResponseInput, ResponseInputItem};
-use crate::api::openai::responses::handlers::build_input_messages;
+use super::session_config::{chat_tool, is_mcp_tool, mcp_requires_approval, AudioFormat, Modality};
 use crate::api::openai::tool_calls::{
-    parse_answer, ToolCall, ToolCallFormat, ToolCallParser, ToolChoice, ToolPlan,
+    parse_answer, ToolCall, ToolCallFormat, ToolCallFunction, ToolCallParser, ToolChoice, ToolPlan,
 };
+use crate::app::agent_runtime::{
+    cancel_with, drive_turn, finish_name, ChatAgentBackend, ThreadMemory, TurnTrace,
+};
+use crate::app::mcp::{McpAccess, McpServerConfig, McpTools};
 use crate::app::realtime_transport::{
     OutboundClass, OutboundEnqueueError, OutboundItem, OutboundMailbox,
 };
 use crate::app::voice_realtime::{
-    acquire_stage_permit, model_load_error, speak_reply, with_stage_permit, ReplySink,
-    SegmentSynthesis, TtsVoice, TurnControl,
+    acquire_stage_permit, model_load_error, speak_reply, ReplySink, SegmentSynthesis, TtsVoice,
+    TurnControl,
 };
 use crate::state::AppState;
 use izwi_core::chat_tools::render_tool_calls;
@@ -223,6 +228,124 @@ pub(crate) struct ResponseContext {
     /// One LFM-Audio request at a time per session: a separate LFM3
     /// transcription beside a reply exceeds what Metal admits.
     pub(crate) lane: Arc<tokio::sync::Mutex<()>>,
+    /// The session's connections to its MCP servers.
+    pub(crate) mcp: SharedMcp,
+}
+
+/// A session's MCP servers and the tools last listed from them.
+#[derive(Default)]
+pub(crate) struct McpSession {
+    configs: Vec<McpServerConfig>,
+    tools: McpTools,
+}
+
+pub(crate) type SharedMcp = Arc<tokio::sync::Mutex<McpSession>>;
+
+/// The MCP servers among `tools`.
+pub(crate) fn mcp_configs(tools: &[Value]) -> Vec<McpServerConfig> {
+    tools
+        .iter()
+        .filter(|tool| is_mcp_tool(tool))
+        .filter_map(|tool| serde_json::from_value(tool.clone()).ok())
+        .collect()
+}
+
+/// The tools of the MCP servers among `tools`, connecting when the session
+/// is not already connected to exactly those servers.
+pub(crate) async fn mcp_tools_for(shared: &SharedMcp, tools: &[Value]) -> Result<McpTools, String> {
+    let configs = mcp_configs(tools);
+    // Taken even with no servers to connect: a call the client has just
+    // approved holds it until its result is in the conversation.
+    let mut session = shared.lock().await;
+    if configs.is_empty() {
+        return Ok(McpTools::default());
+    }
+    if session.configs != configs {
+        session.tools = McpTools::connect(&configs, &McpAccess::from_env()).await?;
+        session.configs = configs;
+    }
+    Ok(session.tools.clone())
+}
+
+/// Run the MCP call the client approved, outside any response: an
+/// `mcp_call` item joins the conversation in progress and is finished with
+/// the tool's output or error (`response.mcp_call.in_progress`, then
+/// `.completed` or `.failed`, and `response.output_item.done` naming the
+/// response that asked). The session's MCP connection is held for the
+/// call, so a response created meanwhile waits for the result. As with
+/// OpenAI, no response follows by itself: the client sends
+/// `response.create` to have the result read.
+pub(crate) async fn run_approved_call(
+    out: Outbound,
+    items: Arc<Mutex<ItemStore>>,
+    session: tokio::sync::OwnedMutexGuard<McpSession>,
+    request_id: String,
+) {
+    let Some(ItemKind::McpApprovalRequest {
+        server_label,
+        name,
+        arguments,
+        response_id,
+    }) = lock_items(&items)
+        .get(&request_id)
+        .map(|item| item.kind.clone())
+    else {
+        return;
+    };
+    let item_id = out.ids.next("item");
+    let item = |output: Option<String>, error: Option<String>, status: ItemStatus| {
+        Item::new(
+            item_id.clone(),
+            ItemKind::McpCall {
+                server_label: server_label.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+                output,
+                error,
+                approval_request_id: Some(request_id.clone()),
+            },
+            status,
+        )
+    };
+    let started = item(None, None, ItemStatus::InProgress);
+    let started_json = started.to_json();
+    let previous = match lock_items(&items).insert(started, &Position::End) {
+        Ok(previous) => previous,
+        Err(err) => {
+            warn!("realtime approved MCP call not stored: {}", err.message);
+            return;
+        }
+    };
+    out.event(
+        "conversation.item.added",
+        json!({"previous_item_id": previous, "item": started_json}),
+    );
+    let ids = json!({"response_id": response_id, "item_id": item_id, "output_index": 0});
+    out.event("response.mcp_call.in_progress", ids.clone());
+    let finished = match session.tools.call(&name, &arguments).await {
+        Ok(output) => {
+            out.event("response.mcp_call.completed", ids);
+            item(Some(output), None, ItemStatus::Completed)
+        }
+        Err(error) => {
+            out.event("response.mcp_call.failed", ids);
+            item(None, Some(error), ItemStatus::Completed)
+        }
+    };
+    let json = finished.to_json();
+    if let Some(stored) = lock_items(&items).get_mut(&item_id) {
+        *stored = finished;
+    }
+    // The result is in the conversation: a waiting response may read it.
+    drop(session);
+    out.event(
+        "response.output_item.done",
+        json!({"response_id": response_id, "output_index": 0, "item": json}),
+    );
+    out.event(
+        "conversation.item.done",
+        json!({"previous_item_id": previous, "item": json}),
+    );
 }
 
 /// A user turn's transcription left to the response that hears it: LFM3-Audio
@@ -604,6 +727,128 @@ impl Emitter {
         }
     }
 
+    /// The calls a reply made to MCP tools that wait for the client's
+    /// approval, each as an `mcp_approval_request` output item. The client
+    /// answers with an `mcp_approval_response` item, which runs the call or
+    /// declines it.
+    pub(crate) fn mcp_approval_requests(&self, calls: &[ToolCall], mcp: &McpTools) {
+        if calls.is_empty() {
+            return;
+        }
+        self.close_message(ItemStatus::Completed);
+        for call in calls {
+            let output_index = {
+                let mut state = self.lock();
+                state.next_output_index += 1;
+                state.next_output_index - 1
+            };
+            let item = Item::new(
+                self.out.ids.next("mcpr"),
+                ItemKind::McpApprovalRequest {
+                    server_label: mcp
+                        .server_of(&call.function.name)
+                        .unwrap_or_default()
+                        .to_string(),
+                    name: call.function.name.clone(),
+                    arguments: call.function.arguments.clone(),
+                    response_id: self.plan.id.clone(),
+                },
+                ItemStatus::Completed,
+            );
+            let json = item.to_json();
+            self.out.event(
+                "response.output_item.added",
+                json!({"response_id": self.plan.id, "output_index": output_index, "item": json}),
+            );
+            if self.plan.default_conversation {
+                self.add_to_conversation(item.clone());
+            }
+            self.out.event(
+                "response.output_item.done",
+                json!({"response_id": self.plan.id, "output_index": output_index, "item": json}),
+            );
+            if self.plan.default_conversation {
+                self.finish_in_conversation(item);
+            }
+            self.lock().outputs.push((output_index, json));
+        }
+    }
+
+    /// Run the calls a reply made to MCP tools, each as an `mcp_call`
+    /// output item that ends with the tool's output or its error. The
+    /// response ends after them: the client asks for the next one, which
+    /// reads the results.
+    pub(crate) async fn mcp_calls(&self, calls: &[ToolCall], mcp: &McpTools) {
+        if calls.is_empty() {
+            return;
+        }
+        self.close_message(ItemStatus::Completed);
+        for call in calls {
+            let item_id = self.out.ids.next("item");
+            let output_index = {
+                let mut state = self.lock();
+                state.next_output_index += 1;
+                state.next_output_index - 1
+            };
+            let item = |output: Option<String>, error: Option<String>, status: ItemStatus| {
+                Item::new(
+                    item_id.clone(),
+                    ItemKind::McpCall {
+                        server_label: mcp
+                            .server_of(&call.function.name)
+                            .unwrap_or_default()
+                            .to_string(),
+                        name: call.function.name.clone(),
+                        arguments: call.function.arguments.clone(),
+                        output,
+                        error,
+                        approval_request_id: None,
+                    },
+                    status,
+                )
+            };
+            let started = item(None, None, ItemStatus::InProgress);
+            self.out.event(
+                "response.output_item.added",
+                json!({"response_id": self.plan.id, "output_index": output_index, "item": started.to_json()}),
+            );
+            if self.plan.default_conversation {
+                self.add_to_conversation(started);
+            }
+            let ids = json!({"response_id": self.plan.id, "item_id": item_id, "output_index": output_index});
+            let mut delta = ids.clone();
+            delta["delta"] = json!(call.function.arguments);
+            self.out.event("response.mcp_call_arguments.delta", delta);
+            let mut done = ids.clone();
+            done["arguments"] = json!(call.function.arguments);
+            self.out.event("response.mcp_call_arguments.done", done);
+            self.out.event("response.mcp_call.in_progress", ids.clone());
+
+            let result = mcp
+                .call(&call.function.name, &call.function.arguments)
+                .await;
+            let finished = match result {
+                Ok(output) => {
+                    self.out.event("response.mcp_call.completed", ids);
+                    item(Some(output), None, ItemStatus::Completed)
+                }
+                Err(error) => {
+                    self.out.event("response.mcp_call.failed", ids);
+                    item(None, Some(error), ItemStatus::Completed)
+                }
+            };
+            let json = finished.to_json();
+            self.out.event(
+                "response.output_item.done",
+                json!({"response_id": self.plan.id, "output_index": output_index, "item": json}),
+            );
+            if self.plan.default_conversation {
+                self.finish_in_conversation(finished);
+            }
+            self.lock().outputs.push((output_index, json));
+        }
+    }
+
     /// Close what is open and send `response.done`.
     pub(crate) fn finish(&self, outcome: &Outcome) -> ResponseSummary {
         let item_status = match outcome {
@@ -802,7 +1047,11 @@ fn tools_for(plan: &ResponsePlan) -> Vec<Value> {
     if plan.tool_choice.as_str() == Some("none") {
         return Vec::new();
     }
-    plan.tools.iter().map(chat_tool).collect()
+    plan.tools
+        .iter()
+        .filter(|tool| !is_mcp_tool(tool))
+        .map(chat_tool)
+        .collect()
 }
 
 fn user_audio_ms(items: &[Item]) -> u64 {
@@ -814,66 +1063,116 @@ fn user_audio_ms(items: &[Item]) -> u64 {
         .sum()
 }
 
-/// The conversation as chat messages, through the Responses API's item
-/// conversion (tool calls and results rendered as the model's template
-/// expects).
-fn chat_messages(
-    variant: izwi_core::ModelVariant,
-    system: &str,
-    items: &[Item],
-    tools: &[Value],
-) -> Result<Vec<ChatMessage>, String> {
-    let input: Vec<ResponseInputItem> = items
-        .iter()
-        .filter_map(|item| match &item.kind {
+/// The conversation as the agent runtime's messages: the user's and the
+/// assistant's words, the calls made and their results. System messages
+/// are part of the instructions.
+fn agent_conversation(items: &[Item]) -> Vec<MemoryMessage> {
+    let mut conversation: Vec<MemoryMessage> = Vec::with_capacity(items.len() + 1);
+    for item in items {
+        match &item.kind {
             ItemKind::Message {
                 role: Role::System, ..
-            } => None,
-            ItemKind::Message { role, .. } => item.text().map(|text| ResponseInputItem {
-                role: Some(role.as_str().to_string()),
-                content: Some(InboundContent::Text(text)),
-                ..ResponseInputItem::default()
-            }),
+            } => {}
+            ItemKind::Message { role, .. } => {
+                if let Some(text) = item.text() {
+                    let role = match role {
+                        Role::Assistant => MemoryMessageRole::Assistant,
+                        _ => MemoryMessageRole::User,
+                    };
+                    conversation.push(MemoryMessage::new(role, text));
+                }
+            }
             ItemKind::FunctionCall {
                 call_id,
                 name,
                 arguments,
-            } => Some(ResponseInputItem {
-                item_type: Some("function_call".to_string()),
-                call_id: Some(call_id.clone()),
-                name: Some(name.clone()),
-                arguments: Some(Value::String(arguments.clone())),
-                ..ResponseInputItem::default()
-            }),
-            ItemKind::FunctionCallOutput { call_id, output } => Some(ResponseInputItem {
-                item_type: Some("function_call_output".to_string()),
-                call_id: Some(call_id.clone()),
-                output: Some(Value::String(output.clone())),
-                ..ResponseInputItem::default()
-            }),
-        })
-        .collect();
-    let mut input = input;
+            } => {
+                let call = izwi_agent::ToolCall {
+                    id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                };
+                // Consecutive calls are one assistant turn.
+                match conversation.last_mut() {
+                    Some(last)
+                        if last.role == MemoryMessageRole::Assistant
+                            && !last.tool_calls.is_empty() =>
+                    {
+                        last.tool_calls.push(call)
+                    }
+                    _ => conversation.push(MemoryMessage::assistant_calls("", vec![call])),
+                }
+            }
+            ItemKind::FunctionCallOutput { call_id, output } => {
+                conversation.push(MemoryMessage::tool(call_id.clone(), output.clone()));
+            }
+            // A call the client declined: the call and the refusal. An
+            // approved one is its `mcp_call` item; one not yet answered
+            // has not happened.
+            ItemKind::McpApprovalRequest {
+                name, arguments, ..
+            } => {
+                let declined = items.iter().find_map(|other| match &other.kind {
+                    ItemKind::McpApprovalResponse {
+                        approval_request_id,
+                        approve: false,
+                        reason,
+                    } if *approval_request_id == item.id => Some(reason.clone()),
+                    _ => None,
+                });
+                let Some(reason) = declined else {
+                    continue;
+                };
+                conversation.push(MemoryMessage::assistant_calls(
+                    "",
+                    vec![izwi_agent::ToolCall {
+                        id: item.id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    }],
+                ));
+                conversation.push(MemoryMessage::tool(
+                    item.id.clone(),
+                    match reason.filter(|reason| !reason.trim().is_empty()) {
+                        Some(reason) => format!("The user declined this call: {reason}"),
+                        None => "The user declined this call.".to_string(),
+                    },
+                ));
+            }
+            ItemKind::McpApprovalResponse { .. } => {}
+            // A call the server ran: the call and what came back.
+            ItemKind::McpCall {
+                name,
+                arguments,
+                output,
+                error,
+                ..
+            } => {
+                let Some(result) = output.clone().or_else(|| error.clone()) else {
+                    continue;
+                };
+                conversation.push(MemoryMessage::assistant_calls(
+                    "",
+                    vec![izwi_agent::ToolCall {
+                        id: item.id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    }],
+                ));
+                conversation.push(MemoryMessage::tool(item.id.clone(), result));
+            }
+        }
+    }
     // A response with no user turn yet (a greeting asked for with
     // `response.create` instructions) still needs one: chat templates
     // refuse a prompt without a user query.
-    if !input
+    if !conversation
         .iter()
-        .any(|item| item.role.as_deref() == Some("user") && item.item_type.is_none())
+        .any(|message| message.role == MemoryMessageRole::User)
     {
-        input.insert(
-            0,
-            ResponseInputItem {
-                role: Some("user".to_string()),
-                content: Some(InboundContent::Text(OPENING_TURN.to_string())),
-                ..ResponseInputItem::default()
-            },
-        );
+        conversation.insert(0, MemoryMessage::user(OPENING_TURN));
     }
-    let system = Some(system).filter(|system| !system.trim().is_empty());
-    build_input_messages(variant, system, Some(ResponseInput::Many(input)), tools)
-        .map(|(messages, _, _)| messages)
-        .map_err(|err| err.message)
+    conversation
 }
 
 /// The user turn of a conversation that has none yet.
@@ -916,10 +1215,27 @@ async fn run_modular(
         return Err("Not a modular profile".to_string());
     };
     let (text, tts) = (*text, *tts);
+    // The session's MCP connection first: a call the client has just
+    // approved holds it until its result is in the conversation, so the
+    // prompt read next carries that result.
+    let mcp = if plan.tool_choice.as_str() == Some("none") {
+        mcp_tools_for(&ctx.mcp, &[]).await?
+    } else {
+        mcp_tools_for(&ctx.mcp, &plan.tools).await?
+    };
     let items = with_transcripts(ctx, prompt_items(ctx, plan), None).await;
     // Tools for a model without a tool template are refused, as on the chat
     // routes, rather than dropped. A required or named tool opens the reply.
-    let tools = tools_for(plan);
+    let mut tools = tools_for(plan);
+    for tool in mcp.function_definitions() {
+        let name = &tool["function"]["name"];
+        if tools.iter().any(|other| &other["function"]["name"] == name) {
+            return Err(format!(
+                "MCP tool {name} has the name of one of the session's function tools"
+            ));
+        }
+        tools.push(tool);
+    }
     let tool_plan = if tools.is_empty() {
         None
     } else {
@@ -932,13 +1248,14 @@ async fn run_modular(
         let choice = ToolChoice::parse(Some(&plan.tool_choice)).map_err(str::to_string)?;
         Some(ToolPlan::new(dialect, tools.clone(), choice, true)?)
     };
+    let choice = match &tool_plan {
+        Some(tool_plan) => tool_plan.choice.clone(),
+        None => ToolChoice::Auto,
+    };
     let system = system_prompt(plan, &items, false);
-    let messages = chat_messages(text, &system, &items, &tools)?;
     emitter.add_usage(|usage| usage.input_audio_ms += user_audio_ms(&items));
 
     let audio_out = plan.modality == Modality::Audio;
-    let parser = Arc::new(Mutex::new(tool_plan.as_ref().map(ToolPlan::parser)));
-    let reasoning = Arc::new(Mutex::new(ReasoningFilter::default()));
     let (deltas, delta_rx) = mpsc::unbounded_channel::<String>();
     let state = &ctx.state;
     let max_tokens = plan
@@ -946,93 +1263,89 @@ async fn run_modular(
         .unwrap_or(DEFAULT_MODULAR_MAX_TOKENS)
         .clamp(1, 8_192);
 
+    // The reply runs on the agent runtime. The client's function tools are
+    // declared, not run: a reply that calls them ends with the calls
+    // pending, which the client answers with `function_call_output` items
+    // and a new `response.create`.
     let chat = async {
-        let parser_sink = parser.clone();
-        let reasoning_sink = reasoning.clone();
-        let emitter_sink = emitter.clone();
-        let deltas_sink = deltas.clone();
-        let generation = with_stage_permit(state, async |runtime_context| {
-            ctx.model_leases
-                .hold(&state.runtime, text)
-                .await
-                .map_err(|err| model_load_error("chat", err))?;
-            state
-                .runtime
-                .chat_generate_streaming_with_runtime_context(
-                    text,
-                    messages,
-                    GenerationParams {
-                        max_tokens,
-                        ..Default::default()
-                    },
-                    ChatRequestConfig {
-                        enable_thinking: Some(false),
-                        tools: tools.clone(),
-                        response_prefix: tool_plan
-                            .as_ref()
-                            .and_then(ToolPlan::response_prefix)
-                            .unwrap_or_default(),
-                        // A required or named tool is held to the declared
-                        // names and schemas where the sampler can.
-                        tool_constraint: tool_plan
-                            .as_ref()
-                            .filter(|_| izwi_core::chat_supports_tool_constraint(text))
-                            .and_then(|plan| plan.constraint(false))
-                            .map(Box::new),
-                        truncation: ChatTruncation::Auto,
-                        ..ChatRequestConfig::default()
-                    },
-                    Some(&ctx.correlation_id),
-                    runtime_context,
-                    move |delta| {
-                        let visible = match parser_sink
-                            .lock()
-                            .unwrap_or_else(|poison| poison.into_inner())
-                            .as_mut()
-                        {
-                            Some(parser) => parser.push(&delta).content,
-                            None => delta,
-                        };
-                        if visible.is_empty() {
-                            return;
-                        }
-                        if audio_out {
-                            let _ = deltas_sink.send(visible);
-                        } else {
-                            let text = reasoning_sink
-                                .lock()
-                                .unwrap_or_else(|poison| poison.into_inner())
-                                .push(&visible);
-                            emitter_sink.text_delta(&text);
-                        }
-                    },
-                )
-                .await
-                .map_err(|err| format!("Chat failed: {err}"))
-        })
-        .await?;
-        // The parser holds back text that could still open a call.
-        let tail = parser
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .take()
-            .map(|mut parser| parser.finish().content)
-            .unwrap_or_default();
-        if audio_out {
-            if !tail.is_empty() {
-                let _ = deltas.send(tail);
+        ctx.model_leases
+            .hold(&state.runtime, text)
+            .await
+            .map_err(|err| model_load_error("chat", err))?;
+        let mut registry = ToolRegistry::new();
+        for tool in &tools {
+            registry.declare_external(tool.clone());
+        }
+        let agents = AgentSet::single(AgentDefinition::new(
+            "realtime",
+            "assistant",
+            system,
+            text.dir_name(),
+        ));
+        let session = AgentSession {
+            id: ctx.correlation_id.clone(),
+            agent_id: "realtime".to_string(),
+            thread_id: ctx.correlation_id.clone(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        // The session's items are the conversation; nothing is read from
+        // or written to the chat store.
+        let memory = ThreadMemory::new(state.chat_store.clone(), None);
+        let backend =
+            ChatAgentBackend::new(state, ctx.correlation_id.clone()).with_tool_choice(choice);
+        let (cancel, _cancel_link) = cancel_with(control);
+        let (events, heard) = mpsc::unbounded_channel();
+        let turn = TurnContext {
+            agents: &agents,
+            memory: &memory,
+            model: &backend,
+            tools: &registry,
+            events: TurnEvents::new(events),
+            cancel,
+            background: BackgroundResults::default(),
+            confirmed: izwi_agent::TurnGate::opened(),
+        };
+        let run = AgentEngine.run_conversation(
+            &turn,
+            &session,
+            Vec::new(),
+            agent_conversation(&items),
+            "",
+            None,
+            AgentTurnOptions {
+                max_output_tokens: max_tokens,
+                persist_assistant_reply: false,
+                ..AgentTurnOptions::default()
+            },
+        );
+        let mut reasoning = ReasoningFilter::default();
+        let mut trace = TurnTrace::start("realtime", &ctx.correlation_id);
+        let result = drive_turn(run, heard, |event| {
+            trace.on_event(&event);
+            let AgentEvent::TextDelta { text } = event else {
+                return;
+            };
+            if audio_out {
+                let _ = deltas.send(text);
+            } else {
+                emitter.text_delta(&reasoning.push(&text));
             }
-        } else {
-            let mut reasoning = reasoning
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            let mut text = reasoning.push(&tail);
-            text.push_str(&reasoning.finish());
-            drop(reasoning);
-            emitter.text_delta(&text);
+        })
+        .await;
+        trace.finish(match &result {
+            Ok(result) => finish_name(result.finish),
+            Err(_) => "error",
+        });
+        let result = result.map_err(|err| match err {
+            AgentError::Model(message) => format!("Chat failed: {message}"),
+            other => other.to_string(),
+        })?;
+        if !audio_out {
+            emitter.text_delta(&reasoning.finish());
         }
         drop(deltas);
-        Ok::<_, String>(generation)
+        Ok::<_, String>((result, backend.usage()))
     };
     let speech = async {
         if !audio_out {
@@ -1058,23 +1371,44 @@ async fn run_modular(
         )
         .await
     };
-    let (generation, ()) = tokio::try_join!(chat, speech)?;
+    let ((result, used), ()) = tokio::try_join!(chat, speech)?;
     emitter.add_usage(|usage| {
-        usage.input_text_tokens += generation.prompt_tokens as u64;
-        usage.cached_tokens += generation.cached_prompt_tokens.unwrap_or(0);
-        usage.output_text_tokens += generation.tokens_generated as u64;
+        usage.input_text_tokens += used.prompt_tokens;
+        usage.cached_tokens += used.cached_prompt_tokens;
+        usage.output_text_tokens += used.output_tokens;
     });
-    if let Some(tool_plan) = &tool_plan {
-        let (_, calls) = parse_answer(tool_plan.parser(), &generation.text);
-        emitter.function_calls(&calls);
-    }
-    Ok(
-        if generation.finish_reason == Some(ChatFinishReason::MaxTokens) {
-            Outcome::Incomplete
-        } else {
-            Outcome::Completed
-        },
-    )
+    let calls: Vec<ToolCall> = result
+        .pending_calls
+        .into_iter()
+        .map(|call| ToolCall {
+            id: call.id,
+            kind: "function",
+            function: ToolCallFunction {
+                name: call.name,
+                arguments: call.arguments,
+            },
+        })
+        .collect();
+    let (mcp_calls, calls): (Vec<ToolCall>, Vec<ToolCall>) = calls
+        .into_iter()
+        .partition(|call| mcp.server_of(&call.function.name).is_some());
+    // A call waits for approval unless its server's entry says it need not.
+    let (asked, mcp_calls): (Vec<ToolCall>, Vec<ToolCall>) =
+        mcp_calls.into_iter().partition(|call| {
+            let label = mcp.server_of(&call.function.name);
+            plan.tools
+                .iter()
+                .find(|tool| is_mcp_tool(tool) && tool["server_label"].as_str() == label)
+                .is_none_or(|tool| mcp_requires_approval(tool, &call.function.name))
+        });
+    emitter.mcp_approval_requests(&asked, &mcp);
+    emitter.mcp_calls(&mcp_calls, &mcp).await;
+    emitter.function_calls(&calls);
+    Ok(if result.finish == TurnFinish::MaxTokens {
+        Outcome::Incomplete
+    } else {
+        Outcome::Completed
+    })
 }
 
 /// A function call as LFM3-Audio's template writes one.
@@ -1107,6 +1441,11 @@ async fn run_unified(
         .filter(|_| lfm3)
         .and_then(|item_id| TranscriptClaim::take(&ctx.pending_transcripts, item_id));
     let items = with_transcripts(ctx, items, skip.as_deref()).await;
+    if plan.tools.iter().any(is_mcp_tool) {
+        return Err(
+            "MCP tools need a profile with a chat model, not a speech-to-speech one".to_string(),
+        );
+    }
     let tools = if lfm3 { tools_for(plan) } else { Vec::new() };
     if !lfm3 && !plan.tools.is_empty() {
         warn!(model = %variant.dir_name(), "realtime tools ignored: only LFM3-Audio calls tools");
@@ -1147,6 +1486,9 @@ async fn run_unified(
                 role: ChatRole::Tool,
                 content: output.clone(),
             }),
+            ItemKind::McpCall { .. }
+            | ItemKind::McpApprovalRequest { .. }
+            | ItemKind::McpApprovalResponse { .. } => None,
         };
         messages.extend(message);
     }
@@ -1329,6 +1671,217 @@ async fn run_unified(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_conversation_carries_function_and_mcp_calls_with_their_results() {
+        let item =
+            |id: &str, kind: ItemKind| Item::new(id.to_string(), kind, ItemStatus::Completed);
+        let call = |id: &str, name: &str| {
+            item(
+                id,
+                ItemKind::FunctionCall {
+                    call_id: format!("call_{name}"),
+                    name: name.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            )
+        };
+        let items = vec![
+            call("i1", "a"),
+            call("i2", "b"),
+            item(
+                "i3",
+                ItemKind::FunctionCallOutput {
+                    call_id: "call_a".to_string(),
+                    output: "A".to_string(),
+                },
+            ),
+            item(
+                "i4",
+                ItemKind::McpCall {
+                    server_label: "docs".to_string(),
+                    name: "search".to_string(),
+                    arguments: r#"{"q":"x"}"#.to_string(),
+                    output: None,
+                    error: Some("it broke".to_string()),
+                    approval_request_id: None,
+                },
+            ),
+            // A call still running has nothing to read yet.
+            item(
+                "i5",
+                ItemKind::McpCall {
+                    server_label: "docs".to_string(),
+                    name: "search".to_string(),
+                    arguments: "{}".to_string(),
+                    output: None,
+                    error: None,
+                    approval_request_id: None,
+                },
+            ),
+        ];
+        let conversation = agent_conversation(&items);
+        // No user turn yet: the opening turn stands in.
+        assert_eq!(conversation[0], MemoryMessage::user(OPENING_TURN));
+        // Consecutive function calls are one assistant turn.
+        assert_eq!(conversation[1].tool_calls.len(), 2);
+        assert_eq!(conversation[2], MemoryMessage::tool("call_a", "A"));
+        assert_eq!(conversation[3].tool_calls[0].name, "search");
+        assert_eq!(conversation[4], MemoryMessage::tool("i4", "it broke"));
+        assert_eq!(conversation.len(), 5);
+
+        let json = items[3].to_json();
+        assert_eq!(json["type"], "mcp_call");
+        assert_eq!(json["error"]["type"], "tool_execution_error");
+        assert!(json["output"].is_null());
+    }
+
+    #[tokio::test]
+    async fn an_approved_call_runs_and_a_declined_one_is_told_to_the_model() {
+        use crate::app::realtime_transport::{MailboxOutput, OutboundLimits, OutboundMailbox};
+
+        let (url, _seen) = crate::app::mcp::tests::serve(false).await;
+        let tools = McpTools::connect(
+            &[crate::app::mcp::tests::config(&url)],
+            &crate::app::mcp::tests::hosts("127.0.0.1"),
+        )
+        .await
+        .unwrap();
+        let shared: SharedMcp = Arc::new(tokio::sync::Mutex::new(McpSession {
+            configs: Vec::new(),
+            tools,
+        }));
+        let out = Outbound {
+            mailbox: Arc::new(OutboundMailbox::new(OutboundLimits::items(64))),
+            ids: Arc::new(Ids::new()),
+        };
+        let items = Arc::new(Mutex::new(ItemStore::default()));
+        let request = |id: &str, name: &str| {
+            Item::new(
+                id.to_string(),
+                ItemKind::McpApprovalRequest {
+                    server_label: "calc".to_string(),
+                    name: name.to_string(),
+                    arguments: r#"{"a":2,"b":3}"#.to_string(),
+                    response_id: "resp_1".to_string(),
+                },
+                ItemStatus::Completed,
+            )
+        };
+        let answer = |id: &str, request: &str, approve: bool| {
+            Item::new(
+                id.to_string(),
+                ItemKind::McpApprovalResponse {
+                    approval_request_id: request.to_string(),
+                    approve,
+                    reason: (!approve).then(|| "not now".to_string()),
+                },
+                ItemStatus::Completed,
+            )
+        };
+        for item in [
+            request("mcpr_1", "add"),
+            answer("i1", "mcpr_1", true),
+            request("mcpr_2", "fail"),
+            answer("i2", "mcpr_2", true),
+            request("mcpr_3", "add"),
+            answer("i3", "mcpr_3", false),
+            request("mcpr_4", "add"),
+        ] {
+            lock_items(&items).insert(item, &Position::End).unwrap();
+        }
+
+        for request_id in ["mcpr_1", "mcpr_2"] {
+            run_approved_call(
+                out.clone(),
+                items.clone(),
+                shared.clone().lock_owned().await,
+                request_id.to_string(),
+            )
+            .await;
+        }
+        let mut events = Vec::new();
+        while let Ok(Some(MailboxOutput::Message(Message::Text(text)))) =
+            tokio::time::timeout(Duration::from_millis(50), out.mailbox.next()).await
+        {
+            events.push(serde_json::from_str::<Value>(text.as_str()).unwrap());
+        }
+        let types: Vec<_> = events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "conversation.item.added",
+                "response.mcp_call.in_progress",
+                "response.mcp_call.completed",
+                "response.output_item.done",
+                "conversation.item.done",
+                "conversation.item.added",
+                "response.mcp_call.in_progress",
+                "response.mcp_call.failed",
+                "response.output_item.done",
+                "conversation.item.done",
+            ]
+        );
+        let done = &events[4]["item"];
+        assert_eq!(done["type"], "mcp_call");
+        assert_eq!(done["approval_request_id"], "mcpr_1");
+        assert_eq!(done["output"], "5\n[image content]");
+        assert_eq!(events[3]["response_id"], "resp_1");
+        assert_eq!(events[9]["item"]["error"]["message"], "it broke");
+
+        // The model reads the two calls that ran and the one declined; the
+        // request nobody answered has not happened.
+        let conversation = agent_conversation(lock_items(&items).items());
+        let read: Vec<_> = conversation
+            .iter()
+            .filter(|message| message.role == MemoryMessageRole::Tool)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(
+            read,
+            [
+                "The user declined this call: not now",
+                "5\n[image content]",
+                "it broke"
+            ]
+        );
+        assert_eq!(
+            conversation
+                .iter()
+                .filter(|message| !message.tool_calls.is_empty())
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn mcp_servers_are_read_from_a_sessions_tools() {
+        let tools = vec![
+            json!({"type": "function", "name": "lookup"}),
+            json!({"type": "mcp", "server_label": "docs", "server_url": "http://h/mcp",
+                   "headers": {"Authorization": "Bearer t"}, "allowed_tools": null,
+                   "require_approval": "never"}),
+        ];
+        let configs = mcp_configs(&tools);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].label, "docs");
+        assert_eq!(configs[0].url.as_deref(), Some("http://h/mcp"));
+        // A label alone, and a connector: servers set up elsewhere.
+        let named = mcp_configs(&[
+            json!({"type": "mcp", "server_label": "files"}),
+            json!({"type": "mcp", "server_label": "cal", "connector_id": "connector_calendar"}),
+        ]);
+        assert_eq!(
+            (named[0].url.clone(), named[0].connector_id.clone()),
+            (None, None)
+        );
+        assert_eq!(named[1].connector_id.as_deref(), Some("connector_calendar"));
+        assert_eq!(configs[0].headers["Authorization"], "Bearer t");
+        assert_eq!(configs[0].allowed_tools, None);
+    }
 
     #[test]
     fn usage_counts_audio_at_openais_rates() {

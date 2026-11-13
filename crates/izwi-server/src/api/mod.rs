@@ -1,7 +1,6 @@
 //! API routes and handlers
 
 pub mod admin;
-pub mod agent;
 pub(crate) mod asr_task;
 pub(crate) mod audio_payload;
 pub mod chat;

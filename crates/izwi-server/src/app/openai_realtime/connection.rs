@@ -27,15 +27,17 @@ use super::live::{transcribes_live, LiveTranscription, LiveTurn};
 use super::persist::History;
 use super::profiles::{resolve_profile, speaker_for, transcription_model, RealtimeProfile};
 use super::respond::{
-    lock_items, run_response, Outbound, PendingTranscript, PendingTranscripts, ResponseContext,
-    ResponsePlan, ResponseSummary,
+    lock_items, mcp_configs, mcp_tools_for, run_approved_call, run_response, Outbound,
+    PendingTranscript, PendingTranscripts, ResponseContext, ResponsePlan, ResponseSummary,
+    SharedMcp,
 };
 use super::session_config::{
-    parse_max_output_tokens, parse_metadata, parse_tools, AudioFormat, Modality, SessionConfig,
-    Voice,
+    parse_max_output_tokens, parse_metadata, parse_tools, resolve_session_servers, AudioFormat,
+    Modality, SessionConfig, Voice,
 };
 use super::transcribe::Transcription;
 use super::voices::{resolve_custom_voice, resolve_named_voice};
+use crate::app::mcp::McpServerConfig;
 use crate::app::realtime_transport::{spawn_writer, OutboundLimits, OutboundMailbox};
 use crate::app::voice_realtime::{
     normalize_stream_vad_threshold, StreamingInputConfig, StreamingInputState, TtsVoice,
@@ -113,6 +115,10 @@ struct Session {
     model_leases: SessionModelLeases,
     pending_transcripts: PendingTranscripts,
     lane: Arc<tokio::sync::Mutex<()>>,
+    /// The session's connections to its MCP servers, and the servers whose
+    /// tools were last announced.
+    mcp: SharedMcp,
+    mcp_announced: Vec<McpServerConfig>,
     finished_tx: mpsc::UnboundedSender<(String, ResponseSummary)>,
     /// The voice-store record of the session, when `IZWI_REALTIME_PERSIST`
     /// is on (D5).
@@ -136,6 +142,8 @@ fn input_for(config: &SessionConfig) -> Input {
         barge_in_min_speech_ms: DEFAULT_BARGE_IN_MIN_SPEECH_MS,
         snr_margin_db: sanitize_snr_margin(configured_snr_margin_db()),
         input_sample_rate_hint: Some(config.input_format.sample_rate()),
+        adaptive_silence_floor_ms: None,
+        early_transcription: false,
     })))
 }
 
@@ -294,6 +302,8 @@ pub(crate) async fn run_session<Tx, Rx, E>(
         model_leases: SessionModelLeases::default(),
         pending_transcripts: Arc::default(),
         lane: Arc::default(),
+        mcp: SharedMcp::default(),
+        mcp_announced: Vec::new(),
         finished_tx,
         history: (super::persist::enabled() && kind == SessionKind::Realtime).then(|| {
             History::new(
@@ -517,7 +527,68 @@ impl Session {
         self.apply_session(update).await?;
         self.out
             .event("session.updated", json!({"session": self.session_json()}));
+        self.announce_mcp_tools();
         Ok(())
+    }
+
+    /// List the tools of the session's MCP servers when they change:
+    /// `mcp_list_tools.in_progress`, then per server an `mcp_list_tools`
+    /// item and `mcp_list_tools.completed`, or `mcp_list_tools.failed`.
+    /// Runs beside the session; a response waits for it.
+    fn announce_mcp_tools(&mut self) {
+        let configs = mcp_configs(&self.config.tools);
+        if configs == self.mcp_announced {
+            return;
+        }
+        self.mcp_announced = configs.clone();
+        if configs.is_empty() {
+            return;
+        }
+        let (out, shared, tools) = (
+            self.out.clone(),
+            self.mcp.clone(),
+            self.config.tools.clone(),
+        );
+        let listings: Vec<(String, String)> = configs
+            .iter()
+            .map(|config| (config.label.clone(), out.ids.next("item")))
+            .collect();
+        for (_, item_id) in &listings {
+            out.event("mcp_list_tools.in_progress", json!({"item_id": item_id}));
+        }
+        tokio::spawn(async move {
+            match mcp_tools_for(&shared, &tools).await {
+                Ok(mcp) => {
+                    for (label, item_id) in listings {
+                        let tools: Vec<Value> = mcp
+                            .tools_of(&label)
+                            .into_iter()
+                            .map(|tool| {
+                                json!({
+                                    "name": tool.name,
+                                    "description": tool.description,
+                                    "input_schema": tool.input_schema,
+                                })
+                            })
+                            .collect();
+                        out.event(
+                            "conversation.item.done",
+                            json!({"previous_item_id": null, "item": {
+                                "id": item_id, "type": "mcp_list_tools",
+                                "server_label": label, "tools": tools,
+                            }}),
+                        );
+                        out.event("mcp_list_tools.completed", json!({"item_id": item_id}));
+                    }
+                }
+                Err(err) => {
+                    warn!("realtime MCP tool listing failed: {err}");
+                    for (_, item_id) in listings {
+                        out.event("mcp_list_tools.failed", json!({"item_id": item_id}));
+                    }
+                }
+            }
+        });
     }
 
     /// Merge a session config into the session's.
@@ -928,6 +999,7 @@ impl Session {
         value: &Value,
     ) -> Result<(), RealtimeError> {
         let mut item = Item::from_client(value, || self.out.ids.next("item"))?;
+        let approved = self.check_approval(&item)?;
         // Spoken input in an item (a client replaying history) is kept to be
         // heard, and transcribed when it carries no transcript.
         let audio = value
@@ -970,7 +1042,56 @@ impl Session {
         if let Some((wav_bytes, ready)) = transcribe {
             self.transcribe(item_id, wav_bytes, ready);
         }
+        if let Some(request_id) = approved {
+            // Take the session's MCP connection now when it is free, so a
+            // response created next waits for the call's result.
+            let (out, items, shared) = (self.out.clone(), self.items.clone(), self.mcp.clone());
+            let held = shared.clone().try_lock_owned().ok();
+            tokio::spawn(async move {
+                let session = match held {
+                    Some(session) => session,
+                    None => shared.lock_owned().await,
+                };
+                run_approved_call(out, items, session, request_id).await;
+            });
+        }
         Ok(())
+    }
+
+    /// For an `mcp_approval_response` item: that it answers an approval
+    /// request of this conversation that has no answer yet. Returns the
+    /// request's id when the call was approved.
+    fn check_approval(&self, item: &Item) -> Result<Option<String>, RealtimeError> {
+        let ItemKind::McpApprovalResponse {
+            approval_request_id,
+            approve,
+            ..
+        } = &item.kind
+        else {
+            return Ok(None);
+        };
+        let invalid = |message: String| {
+            RealtimeError::invalid("invalid_value", message).with_param("item.approval_request_id")
+        };
+        let items = lock_items(&self.items);
+        let is_request = items
+            .get(approval_request_id)
+            .is_some_and(|request| matches!(request.kind, ItemKind::McpApprovalRequest { .. }));
+        if !is_request {
+            return Err(invalid(format!(
+                "No MCP approval request with id '{approval_request_id}' is in the conversation."
+            )));
+        }
+        let answered = items.items().iter().any(|other| {
+            matches!(&other.kind, ItemKind::McpApprovalResponse { approval_request_id: id, .. }
+                if id == approval_request_id)
+        });
+        if answered {
+            return Err(invalid(format!(
+                "MCP approval request '{approval_request_id}' has already been answered."
+            )));
+        }
+        Ok(approve.then(|| approval_request_id.clone()))
     }
 
     fn on_item_retrieve(&self, item_id: &str) -> Result<(), RealtimeError> {
@@ -1190,7 +1311,11 @@ impl Session {
             None => self.config.modality,
         };
         let tools = match params.get("tools") {
-            Some(value) => parse_tools(value, "response.tools")?,
+            Some(value) => {
+                let mut tools = parse_tools(value, "response.tools")?;
+                resolve_session_servers(&mut tools, &self.config.tools);
+                tools
+            }
             None => self.config.tools.clone(),
         };
         let max_output_tokens = match params.get("max_output_tokens") {
@@ -1266,6 +1391,7 @@ impl Session {
             model_leases: self.model_leases.clone(),
             pending_transcripts: self.pending_transcripts.clone(),
             lane: self.lane.clone(),
+            mcp: self.mcp.clone(),
         };
         let id = plan.id.clone();
         let generation = plan.audio_generation;

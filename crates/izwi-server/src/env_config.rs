@@ -96,6 +96,16 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "Keep files, batches, jobs and speech lookups apart per gateway tenant: a request that carries the API key (any request when no key is set) acts for the tenant its `X-Izwi-Gateway-Tenant` header names, which an Izwi gateway sets for every caller. Anyone who can reach the server with the key can name any tenant, so enable it only where the gateway is the server's sole client. Off, the header is ignored.",
     ),
     var(
+        "IZWI_MCP_ALLOWED_HOSTS",
+        "",
+        "Comma-separated hosts (`host` or `host:port`, `*` for any) whose MCP servers a voice or Realtime session may name. The server connects to those servers itself, so list only hosts every API client may reach through it. Empty turns MCP tools off.",
+    ),
+    var(
+        "IZWI_MCP_SERVERS_FILE",
+        "`mcp.json` in the platform data directory",
+        "A JSON file of MCP servers set up on this server, in the `{\"mcpServers\": {label: {\"command\", \"args\", \"env\"} | {\"url\", \"headers\"}}}` form other MCP clients use. A voice or Realtime session uses one by naming its label without a URL; a local command runs once and is shared by every session. Only this file can name a command. Read once, at first use.",
+    ),
+    var(
         "IZWI_ALLOWED_HOSTS",
         "",
         "Comma-separated extra Host names to accept (port optional). On a non-loopback bind, setting it turns the Host check on.",
@@ -271,11 +281,6 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "IZWI_MAX_RESPONSE_STORE_ENTRIES",
         "512",
         "Stored Responses API responses kept in memory.",
-    ),
-    var(
-        "IZWI_MAX_AGENT_SESSION_STORE_ENTRIES",
-        "512",
-        "Agent sessions kept in memory.",
     ),
     // Request paths (ServerTuning), captured once at start-up.
     var(

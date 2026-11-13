@@ -831,7 +831,16 @@ impl EngineCoreConfig {
             self.managed_prefix_cache_salt.as_deref(),
             self.prefix_cache_pages_or_default(),
             self.max_blocks,
-            self.max_seq_len,
+            // Under portable automatic context `max_seq_len` is only the
+            // native upper bound (`apply_backend_context_capacity`), far
+            // above the page baseline: reserving it would leave prefix
+            // reuse no budget on any CPU or Metal default. Reserve what the
+            // runtime's resolver does.
+            if self.backend != BackendKind::Cuda && self.portable_context_auto {
+                crate::config::PORTABLE_AUTO_CONTEXT_RESERVE_TOKENS
+            } else {
+                self.max_seq_len
+            },
             // Catalog-auto reuse degrades instead of failing startup when the
             // safe page budget is zero; explicit enablement stays fail-closed.
             self.prefix_reuse_catalog_auto,
@@ -1117,6 +1126,30 @@ mod managed_kv_default_tests {
             config.apply_backend_context_capacity(4096);
             assert_eq!(config.max_seq_len, CUDA_MAX_NATIVE_CONTEXT_TOKENS);
             assert_eq!(config.max_blocks, 1024);
+        }
+    }
+
+    #[test]
+    fn portable_auto_context_leaves_catalog_auto_reuse_its_page_budget() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            let mut config = EngineCoreConfig {
+                backend,
+                portable_context_auto: true,
+                prefix_reuse_catalog_auto: true,
+                ..EngineCoreConfig::default()
+            };
+            config.apply_backend_context_capacity(4096);
+            config.apply_prefix_engagement();
+            let policy = config.resolved_kv_cache_policy().unwrap();
+            assert!(
+                matches!(
+                    policy.effective.prefix,
+                    crate::config::PrefixCachePolicy::Namespaced { max_pages, .. }
+                        if max_pages == crate::config::DEFAULT_MAX_PREFIX_CACHE_PAGES
+                ),
+                "{backend:?}: {:?}",
+                policy.fallback_reason
+            );
         }
     }
 

@@ -1,16 +1,40 @@
-use crate::agent::AgentDefinition;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{json, Value};
+
+use crate::agent::{AgentDefinition, AgentSet};
+use crate::cancel::{TurnCancel, TurnGate};
 use crate::errors::{AgentError, Result};
 use crate::memory::{MemoryMessage, MemoryMessageMeta, MemoryMessageRole, MemoryStore};
 use crate::model::{ModelBackend, ModelRequest};
-use crate::planner::{PlanSummary, Planner, PlannerContext, PlannerDecision};
 use crate::reasoning::strip_reasoning;
-use crate::session::{AgentEvent, AgentSession, AgentTurnResult, ToolCallRecord, TurnInput};
-use crate::tools::{ToolContext, ToolRegistry};
+use crate::session::{
+    AgentEvent, AgentSession, AgentTurnResult, CompletedTask, ToolCallRecord, TurnEvents,
+    TurnFinish, TurnInput,
+};
+use crate::tools::{
+    function_definition, BackgroundResult, BackgroundResults, Tool, ToolCall, ToolContext,
+    ToolExecution, ToolRegistry,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct AgentTurnOptions {
     pub max_output_tokens: usize,
+    /// The most model rounds one turn runs: a round that calls tools is
+    /// followed by one that reads their results.
+    pub max_tool_rounds: usize,
+    /// The most calls one turn makes.
     pub max_tool_calls: usize,
+    /// How long the turn waits for one tool.
+    pub tool_timeout: Duration,
+    /// After this long a running call is reported as slow
+    /// ([`AgentEvent::ToolCallSlow`]), once.
+    pub tool_soft_timeout: Option<Duration>,
+    /// How long a background tool may run.
+    pub background_tool_timeout: Duration,
+    /// Whether the calls of one round run at the same time.
+    pub parallel_tool_calls: bool,
     /// How much of the thread's history the prompt carries.
     pub history: HistoryBudget,
     /// Whether the turn stores the assistant reply itself. A caller that
@@ -18,15 +42,25 @@ pub struct AgentTurnOptions {
     /// interrupted reply was only partly heard) stores it with
     /// [`AgentEngine::commit_assistant_reply`] instead.
     pub persist_assistant_reply: bool,
+    /// Whether the turn stores the user's message. A caller that starts a
+    /// turn before it is confirmed stores it with
+    /// [`AgentEngine::commit_user_message`] once it is.
+    pub persist_user_message: bool,
 }
 
 impl Default for AgentTurnOptions {
     fn default() -> Self {
         Self {
             max_output_tokens: 1536,
-            max_tool_calls: 1,
+            max_tool_rounds: 3,
+            max_tool_calls: 8,
+            tool_timeout: Duration::from_secs(10),
+            tool_soft_timeout: None,
+            background_tool_timeout: Duration::from_secs(120),
+            parallel_tool_calls: false,
             history: HistoryBudget::default(),
             persist_assistant_reply: true,
+            persist_user_message: true,
         }
     }
 }
@@ -65,6 +99,9 @@ impl HistoryBudget {
         let mut start = conversation.len();
         for (index, message) in conversation.iter().enumerate().rev() {
             tokens = tokens.saturating_add(estimate_tokens(&message.content));
+            for call in &message.tool_calls {
+                tokens = tokens.saturating_add(estimate_tokens(&call.arguments));
+            }
             if conversation.len() - index > self.max_messages || tokens > self.max_tokens {
                 break;
             }
@@ -86,27 +123,40 @@ fn estimate_tokens(text: &str) -> usize {
     text.chars().count().div_ceil(4).max(1)
 }
 
+/// What a turn runs with.
+pub struct TurnContext<'a, M, B> {
+    pub agents: &'a AgentSet,
+    pub memory: &'a M,
+    pub model: &'a B,
+    pub tools: &'a ToolRegistry,
+    /// Hears the turn as it runs: text, calls, handoffs.
+    pub events: TurnEvents,
+    pub cancel: TurnCancel,
+    /// The session's background tool results.
+    pub background: BackgroundResults,
+    /// Closed while the turn is not yet confirmed: the reply's text is
+    /// written, but no tool runs, no agent takes over and no task is
+    /// recorded until it opens.
+    pub confirmed: TurnGate,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AgentEngine;
 
 impl AgentEngine {
-    #[allow(clippy::too_many_arguments)]
-    pub async fn run_turn<M, B, P>(
+    /// Run one turn on the session's stored thread: the user's `input`,
+    /// then model rounds until the reply calls no more tools.
+    pub async fn run_turn<M, B>(
         &self,
-        agent: &AgentDefinition,
+        ctx: &TurnContext<'_, M, B>,
         session: &AgentSession,
         input: TurnInput,
         model_id: Option<String>,
-        memory: &M,
-        model: &B,
-        planner: &P,
-        tools: &ToolRegistry,
         options: AgentTurnOptions,
     ) -> Result<AgentTurnResult>
     where
         M: MemoryStore,
         B: ModelBackend,
-        P: Planner,
     {
         let user_text = input.text.trim().to_string();
         if user_text.is_empty() {
@@ -115,153 +165,340 @@ impl AgentEngine {
             ));
         }
 
-        let mut events = vec![AgentEvent::TurnStarted {
-            session_id: session.id.clone(),
-            thread_id: session.thread_id.clone(),
-        }];
-
-        let history = if agent.capabilities.memory {
-            options
-                .history
-                .apply(memory.load_messages(&session.thread_id).await?)
-        } else {
-            Vec::new()
-        };
-
-        memory
-            .append_message(
-                &session.thread_id,
-                MemoryMessageRole::User,
-                user_text.clone(),
-                MemoryMessageMeta::default(),
-            )
-            .await?;
-
-        let planning_decision = if agent.capabilities.planning {
-            planner.decide(&PlannerContext {
-                user_text: user_text.clone(),
-                planning_mode: agent.planning_mode,
-                tools_enabled: agent.capabilities.tools,
-                available_tool_names: tools.tool_names(),
-            })?
-        } else {
-            PlannerDecision::DirectRespond
-        };
-
-        let mut plan: Option<PlanSummary> = None;
-        if let PlannerDecision::PlanThenAct(plan_summary) = planning_decision {
-            events.push(AgentEvent::PlanCreated {
-                steps: plan_summary.steps.clone(),
-            });
-            plan = Some(plan_summary);
-        }
-
-        let mut tool_calls = Vec::new();
-        let mut tool_context_note: Option<String> = None;
-        if agent.capabilities.tools && options.max_tool_calls > 0 {
-            if let Some(tool) = tools.find_auto_tool(&user_text) {
-                events.push(AgentEvent::ToolCallStarted {
-                    name: tool.name().to_string(),
-                });
-                let output = tool
-                    .invoke(ToolContext {
-                        session_id: session.id.clone(),
-                        thread_id: session.thread_id.clone(),
-                        user_text: user_text.clone(),
-                        arguments: serde_json::Value::Null,
-                    })
-                    .await?;
-                events.push(AgentEvent::ToolCallCompleted {
-                    name: tool.name().to_string(),
-                    output: output.text.clone(),
-                });
-                tool_context_note = Some(format!("Tool `{}` output: {}", tool.name(), output.text));
-                tool_calls.push(ToolCallRecord {
-                    name: tool.name().to_string(),
-                    input_summary: "auto".to_string(),
-                    output: output.text,
-                });
-            }
+        let stored = ctx.memory.load_messages(&session.thread_id).await?;
+        let stored_len = stored.len();
+        let history = options.history.apply(stored);
+        if options.persist_user_message {
+            self.commit_user_message(ctx.memory, session, &user_text)
+                .await?;
         }
 
         // One leading system message: chat templates such as Qwen3.5's reject
-        // a system message anywhere else, so the memory context, the plan and
-        // a tool result join the agent's prompt instead of following it.
-        let mut system_parts = vec![agent.system_prompt.clone()];
+        // a system message anywhere else, so the memory context joins the
+        // agent's prompt instead of following it.
+        let mut context = Vec::new();
         let mut conversation = Vec::with_capacity(history.len() + 1);
         for message in history {
             if message.role == MemoryMessageRole::System {
-                system_parts.push(message.content);
+                context.push(message.content);
             } else {
                 conversation.push(message);
             }
         }
-        if let Some(plan_summary) = &plan {
-            system_parts.push(format!(
-                "Planning summary for this request (do not expose as hidden reasoning): {}",
-                plan_summary.steps.join(" | ")
-            ));
+        let kept = conversation.len();
+        if kept + context.len() < stored_len {
+            if let Some(summary) = ctx.memory.load_summary(&session.thread_id, kept).await? {
+                context.push(format!("Earlier in this conversation: {summary}"));
+            }
         }
-        if let Some(tool_note) = tool_context_note {
-            system_parts.push(format!(
-                "Use this verified tool result if relevant: {tool_note}"
-            ));
-        }
-        system_parts.retain(|part| !part.trim().is_empty());
+        conversation.push(MemoryMessage::user(user_text.clone()));
 
-        let mut model_messages = Vec::with_capacity(conversation.len() + 2);
-        model_messages.push(MemoryMessage {
-            role: MemoryMessageRole::System,
-            content: system_parts.join("\n\n"),
-        });
-        model_messages.extend(conversation);
-        model_messages.push(MemoryMessage {
-            role: MemoryMessageRole::User,
-            content: user_text,
-        });
-
-        let resolved_model_id = model_id.unwrap_or_else(|| agent.default_model.clone());
-        let output = model
-            .generate(ModelRequest {
-                model_id: resolved_model_id.clone(),
-                messages: model_messages,
-                max_output_tokens: options.max_output_tokens.max(1),
-            })
+        let result = self
+            .run_conversation(
+                ctx,
+                session,
+                context,
+                conversation,
+                &user_text,
+                model_id,
+                options,
+            )
             .await?;
 
         if options.persist_assistant_reply {
             self.commit_assistant_reply(
-                memory,
+                ctx.memory,
                 session,
-                &output.text,
+                &result.assistant_text,
                 MemoryMessageMeta {
-                    model_id: Some(resolved_model_id.clone()),
-                    tokens_generated: Some(output.tokens_generated),
-                    generation_time_ms: Some(output.generation_time_ms),
+                    model_id: Some(result.model_id.clone()),
+                    tokens_generated: Some(result.tokens_generated),
+                    generation_time_ms: Some(result.generation_time_ms),
+                    tool_calls: result.tool_calls.clone(),
                 },
             )
             .await?;
         }
+        Ok(result)
+    }
 
-        events.push(AgentEvent::AssistantMessage {
-            content: output.text.clone(),
-        });
-        events.push(AgentEvent::TurnCompleted {
+    /// Run a turn's model rounds over a `conversation` the caller keeps:
+    /// `context` joins the agent's system prompt, `conversation` ends with
+    /// what the reply answers. Nothing is stored.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_conversation<M, B>(
+        &self,
+        ctx: &TurnContext<'_, M, B>,
+        session: &AgentSession,
+        mut context: Vec<String>,
+        mut conversation: Vec<MemoryMessage>,
+        user_text: &str,
+        model_id: Option<String>,
+        options: AgentTurnOptions,
+    ) -> Result<AgentTurnResult>
+    where
+        M: MemoryStore,
+        B: ModelBackend,
+    {
+        let mut agent = ctx
+            .agents
+            .get(&session.agent_id)
+            .unwrap_or_else(|| ctx.agents.first());
+        let model_id = model_id.unwrap_or_else(|| agent.default_model.clone());
+        let mut log = EventLog::new(ctx.events.clone());
+        log.emit(AgentEvent::TurnStarted {
             session_id: session.id.clone(),
             thread_id: session.thread_id.clone(),
         });
 
+        let earlier = ctx.background.take();
+        if !earlier.is_empty() {
+            let lines = earlier
+                .iter()
+                .map(|result| format!("- {} ({}): {}", result.name, result.status, result.output))
+                .collect::<Vec<_>>()
+                .join("\n");
+            context.push(format!(
+                "Tools started earlier have finished. Tell the user what they found if it still matters:\n{lines}"
+            ));
+        }
+
+        let max_rounds = options.max_tool_rounds.max(1);
+        let mut turn = TurnState::default();
+        let mut finish = TurnFinish::Completed;
+        'rounds: for round in 0..max_rounds {
+            if ctx.cancel.is_cancelled() {
+                finish = TurnFinish::Cancelled;
+                break;
+            }
+            // A listener hears the rounds as one reply.
+            if !turn.text.is_empty() && !turn.text.ends_with(char::is_whitespace) {
+                ctx.events.text_delta(" ");
+            }
+            let request = ModelRequest {
+                model_id: model_id.clone(),
+                messages: prompt(agent, &context, &conversation),
+                tools: offered_tools(ctx.agents, agent, ctx.tools),
+                max_output_tokens: options.max_output_tokens.max(1),
+                round,
+            };
+            ctx.events.emit(AgentEvent::ModelRoundStarted { round });
+            let output = tokio::select! {
+                biased;
+                () = ctx.cancel.cancelled() => {
+                    finish = TurnFinish::Cancelled;
+                    break;
+                }
+                output = ctx.model.generate(request, &ctx.events) => output?,
+            };
+            ctx.events.emit(AgentEvent::ModelRoundCompleted {
+                round,
+                tokens_generated: output.tokens_generated,
+                tool_calls: output.tool_calls.len(),
+            });
+            turn.tokens_generated += output.tokens_generated;
+            turn.generation_time_ms += output.generation_time_ms;
+            join_text(&mut turn.text, &output.text);
+
+            if output.tool_calls.is_empty() {
+                if output.truncated {
+                    finish = TurnFinish::MaxTokens;
+                }
+                break;
+            }
+            if round + 1 == max_rounds {
+                return Err(AgentError::ToolLoop(format!(
+                    "The reply called tools in each of its {max_rounds} rounds without answering"
+                )));
+            }
+            turn.calls_made += output.tool_calls.len();
+            if turn.calls_made > options.max_tool_calls {
+                return Err(AgentError::ToolLoop(format!(
+                    "The reply made more than {} tool calls in one turn",
+                    options.max_tool_calls
+                )));
+            }
+            conversation.push(MemoryMessage::assistant_calls(
+                output.text.clone(),
+                output.tool_calls.clone(),
+            ));
+            // Calls have effects: an unconfirmed turn waits here.
+            tokio::select! {
+                biased;
+                () = ctx.cancel.cancelled() => {
+                    finish = TurnFinish::Cancelled;
+                    break;
+                }
+                () = ctx.confirmed.wait_open() => {}
+            }
+
+            let routes = output
+                .tool_calls
+                .iter()
+                .map(|call| route(ctx.agents, agent, ctx.tools, &call.name))
+                .collect::<Vec<_>>();
+            let together = options.parallel_tool_calls
+                && routes.len() > 1
+                && routes
+                    .iter()
+                    .all(|route| matches!(route, Route::Tool(tool) if tool.execution() == ToolExecution::Inline));
+            if together {
+                let runs = output.tool_calls.iter().zip(&routes).map(|(call, route)| {
+                    let Route::Tool(tool) = route else {
+                        unreachable!("only inline tools run together");
+                    };
+                    log.emit(started(call, tool.executor()));
+                    run_inline(ctx, session, tool.clone(), call, user_text, options)
+                });
+                let outcomes = futures::future::join_all(runs).await;
+                for (call, outcome) in output.tool_calls.iter().zip(outcomes) {
+                    turn.settle(&mut log, &mut conversation, call, round, outcome);
+                }
+                if ctx.cancel.is_cancelled() {
+                    finish = TurnFinish::Cancelled;
+                    break 'rounds;
+                }
+                continue;
+            }
+
+            for (call, route) in output.tool_calls.iter().zip(routes) {
+                let outcome = match route {
+                    Route::External => {
+                        log.emit(started(call, "client"));
+                        turn.pending.push(call.clone());
+                        continue;
+                    }
+                    Route::Tool(tool) => {
+                        log.emit(started(call, tool.executor()));
+                        match tool.execution() {
+                            ToolExecution::Inline => {
+                                run_inline(ctx, session, tool, call, user_text, options).await
+                            }
+                            ToolExecution::Background => {
+                                start_background(ctx, session, tool, call, user_text, options)
+                            }
+                        }
+                    }
+                    Route::Handoff(target) => {
+                        log.emit(started(call, "server"));
+                        log.emit(AgentEvent::Handoff {
+                            from: agent.id.clone(),
+                            to: target.id.clone(),
+                        });
+                        agent = target;
+                        Outcome::ok(handoff_note(target))
+                    }
+                    Route::Task => {
+                        log.emit(started(call, "server"));
+                        let task = agent.task.as_ref().expect("a task route has a task");
+                        match serde_json::from_str::<Value>(&call.arguments) {
+                            Err(err) => Outcome::error(format!("Invalid arguments: {err}")),
+                            Ok(result) => {
+                                let missing = task.missing_fields(&result);
+                                if missing.is_empty() {
+                                    log.emit(AgentEvent::TaskCompleted {
+                                        name: task.name.clone(),
+                                        result: result.clone(),
+                                    });
+                                    turn.completed_tasks.push(CompletedTask {
+                                        name: task.name.clone(),
+                                        result,
+                                    });
+                                    let next =
+                                        task.then.as_deref().and_then(|id| ctx.agents.get(id));
+                                    match next {
+                                        Some(target) => {
+                                            log.emit(AgentEvent::Handoff {
+                                                from: agent.id.clone(),
+                                                to: target.id.clone(),
+                                            });
+                                            agent = target;
+                                            Outcome::ok(format!(
+                                                "Recorded. {}",
+                                                handoff_note(target)
+                                            ))
+                                        }
+                                        None => Outcome::ok("Recorded."),
+                                    }
+                                } else {
+                                    Outcome::error(format!(
+                                        "Not recorded: ask the user for {}.",
+                                        missing.join(", ")
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                    Route::Unknown => {
+                        log.emit(started(call, "none"));
+                        Outcome::error(format!("No tool named `{}` is available.", call.name))
+                    }
+                };
+                turn.settle(&mut log, &mut conversation, call, round, outcome);
+                if ctx.cancel.is_cancelled() {
+                    finish = TurnFinish::Cancelled;
+                    break 'rounds;
+                }
+            }
+            if !turn.pending.is_empty() {
+                finish = TurnFinish::PendingCalls;
+                break;
+            }
+        }
+
+        if !turn.text.is_empty() {
+            log.emit(AgentEvent::AssistantMessage {
+                content: turn.text.clone(),
+            });
+        }
+        log.emit(AgentEvent::TurnCompleted {
+            session_id: session.id.clone(),
+            thread_id: session.thread_id.clone(),
+            finish,
+        });
+        tracing::debug!(
+            session_id = %session.id,
+            agent_id = %agent.id,
+            ?finish,
+            tool_calls = turn.records.len(),
+            tokens = turn.tokens_generated,
+            "agent turn finished"
+        );
+
         Ok(AgentTurnResult {
-            assistant_text: output.text,
-            model_id: resolved_model_id,
-            plan,
-            tool_calls,
-            events,
+            assistant_text: turn.text,
+            model_id,
+            finish,
+            agent_id: agent.id.clone(),
+            tool_calls: turn.records,
+            pending_calls: turn.pending,
+            completed_tasks: turn.completed_tasks,
+            tokens_generated: turn.tokens_generated,
+            generation_time_ms: turn.generation_time_ms,
+            events: log.events,
         })
     }
 
+    /// Store the user's message of a turn in the session's thread.
+    pub async fn commit_user_message<M: MemoryStore>(
+        &self,
+        memory: &M,
+        session: &AgentSession,
+        text: &str,
+    ) -> Result<()> {
+        memory
+            .append_message(
+                &session.thread_id,
+                MemoryMessageRole::User,
+                text.trim().to_string(),
+                MemoryMessageMeta::default(),
+            )
+            .await
+    }
+
     /// Store an assistant reply in the session's thread, without its
-    /// reasoning. An empty reply is not stored.
+    /// reasoning, with the calls `meta` says were made before it. A reply
+    /// with neither words nor calls is not stored.
     pub async fn commit_assistant_reply<M: MemoryStore>(
         &self,
         memory: &M,
@@ -270,7 +507,7 @@ impl AgentEngine {
         meta: MemoryMessageMeta,
     ) -> Result<()> {
         let reply = strip_reasoning(reply);
-        if reply.is_empty() {
+        if reply.is_empty() && meta.tool_calls.is_empty() {
             return Ok(());
         }
         memory
@@ -284,328 +521,325 @@ impl AgentEngine {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::agent::AgentCapabilities;
-    use crate::errors::Result;
-    use crate::model::{ModelBackend, ModelOutput, ModelRequest};
-    use crate::planner::{PlanningMode, SimplePlanner};
-    use crate::session::AgentTurnResult;
-    use crate::tools::{TimeTool, ToolRegistry};
-    use async_trait::async_trait;
-    use std::sync::{Arc, Mutex};
+/// The events of a turn: each goes to the turn's listener and into its
+/// result.
+struct EventLog {
+    listener: TurnEvents,
+    events: Vec<AgentEvent>,
+}
 
-    #[derive(Default)]
-    struct TestMemory {
-        messages: Arc<Mutex<Vec<MemoryMessage>>>,
-    }
-
-    #[async_trait]
-    impl MemoryStore for TestMemory {
-        async fn load_messages(&self, _thread_id: &str) -> Result<Vec<MemoryMessage>> {
-            Ok(self.messages.lock().expect("lock").clone())
-        }
-
-        async fn append_message(
-            &self,
-            _thread_id: &str,
-            role: MemoryMessageRole,
-            content: String,
-            _meta: MemoryMessageMeta,
-        ) -> Result<()> {
-            self.messages
-                .lock()
-                .expect("lock")
-                .push(MemoryMessage { role, content });
-            Ok(())
+impl EventLog {
+    fn new(listener: TurnEvents) -> Self {
+        Self {
+            listener,
+            events: Vec::new(),
         }
     }
 
-    #[derive(Default)]
-    struct TestModel {
-        /// Prefix every reply with a reasoning block.
-        thinks: bool,
-        prompts: Mutex<Vec<Vec<MemoryMessage>>>,
-    }
-
-    #[async_trait]
-    impl ModelBackend for TestModel {
-        async fn generate(&self, request: ModelRequest) -> Result<ModelOutput> {
-            let prompt = request
-                .messages
-                .iter()
-                .rev()
-                .find(|m| m.role == MemoryMessageRole::User)
-                .map(|m| m.content.clone())
-                .unwrap_or_default();
-            self.prompts.lock().expect("lock").push(request.messages);
-            let thinking = if self.thinks {
-                "<think>hmm</think>"
-            } else {
-                ""
-            };
-            Ok(ModelOutput {
-                text: format!("{thinking}Echo: {prompt}"),
-                tokens_generated: 5,
-                generation_time_ms: 1.0,
-            })
-        }
-    }
-
-    fn message(role: MemoryMessageRole, content: &str) -> MemoryMessage {
-        MemoryMessage {
-            role,
-            content: content.to_string(),
-        }
-    }
-
-    fn test_agent() -> (AgentDefinition, AgentSession) {
-        (
-            AgentDefinition {
-                id: "voice".to_string(),
-                name: "Voice Agent".to_string(),
-                system_prompt: "Be helpful".to_string(),
-                default_model: "Qwen3.5-4B".to_string(),
-                capabilities: AgentCapabilities {
-                    tools: false,
-                    ..AgentCapabilities::default()
-                },
-                planning_mode: PlanningMode::Auto,
-            },
-            AgentSession {
-                id: "sess_1".to_string(),
-                agent_id: "voice".to_string(),
-                thread_id: "thread_1".to_string(),
-                created_at: 0,
-                updated_at: 0,
-            },
-        )
-    }
-
-    async fn turn(
-        memory: &TestMemory,
-        model: &TestModel,
-        text: &str,
-        options: AgentTurnOptions,
-    ) -> AgentTurnResult {
-        let (agent, session) = test_agent();
-        AgentEngine
-            .run_turn(
-                &agent,
-                &session,
-                TurnInput {
-                    text: text.to_string(),
-                },
-                None,
-                memory,
-                model,
-                &SimplePlanner,
-                &ToolRegistry::new(),
-                options,
-            )
-            .await
-            .expect("turn")
-    }
-
-    /// SPK-F13: the budget keeps the newest whole turns that fit, never
-    /// opens on an orphaned reply, and always keeps the leading system
-    /// context.
-    #[test]
-    fn history_budget_keeps_the_newest_turns_and_the_system_context() {
-        use MemoryMessageRole::{Assistant, System, User};
-        let history = vec![
-            message(System, "memory context"),
-            message(User, "u1"),
-            message(Assistant, "a1"),
-            message(User, "u2"),
-            message(Assistant, "a2"),
-            message(User, "u3"),
-            message(Assistant, "a3"),
-        ];
-        let kept = |budget: HistoryBudget| -> Vec<String> {
-            budget
-                .apply(history.clone())
-                .into_iter()
-                .map(|message| message.content)
-                .collect()
-        };
-        let by_messages = |max_messages| HistoryBudget {
-            max_messages,
-            max_tokens: usize::MAX,
-        };
-        assert_eq!(
-            kept(by_messages(4)),
-            ["memory context", "u2", "a2", "u3", "a3"]
-        );
-        // Three messages would open on a2, a reply without its question.
-        assert_eq!(kept(by_messages(3)), ["memory context", "u3", "a3"]);
-        assert_eq!(kept(by_messages(0)), ["memory context"]);
-        // Each two-character message estimates at one token.
-        let by_tokens = HistoryBudget {
-            max_messages: usize::MAX,
-            max_tokens: 2,
-        };
-        assert_eq!(kept(by_tokens), ["memory context", "u3", "a3"]);
-        assert_eq!(kept(HistoryBudget::UNBOUNDED).len(), history.len());
-    }
-
-    /// SPK-F13: the prompt carries only the budgeted history, and the stored
-    /// reply has no reasoning.
-    #[tokio::test]
-    async fn turns_bound_the_prompt_history_and_store_replies_without_reasoning() {
-        let memory = TestMemory::default();
-        let model = TestModel {
-            thinks: true,
-            ..TestModel::default()
-        };
-        let options = AgentTurnOptions {
-            history: HistoryBudget {
-                max_messages: 2,
-                max_tokens: usize::MAX,
-            },
-            ..AgentTurnOptions::default()
-        };
-        for text in ["one", "two", "three"] {
-            let result = turn(&memory, &model, text, options).await;
-            assert!(result.assistant_text.starts_with("<think>"));
-        }
-        let stored = memory.messages.lock().expect("lock").clone();
-        assert_eq!(stored.len(), 6);
-        assert_eq!(stored[5].content, "Echo: three");
-        // System prompt, the previous turn and the new user message.
-        let prompts = model.prompts.lock().expect("lock");
-        let last: Vec<&str> = prompts[2].iter().map(|m| m.content.as_str()).collect();
-        assert_eq!(last, ["Be helpful", "two", "Echo: two", "three"]);
-    }
-
-    /// SPK-F13: a caller that defers the reply stores it later, once it
-    /// knows how much of it the user heard.
-    /// Chat templates such as Qwen3.5's accept a system message only first:
-    /// memory, a plan and a tool result all join the one leading message.
-    #[tokio::test]
-    async fn the_prompt_has_one_leading_system_message() {
-        let memory = TestMemory::default();
-        memory.messages.lock().expect("lock").extend([
-            message(MemoryMessageRole::System, "Remembered: likes tea"),
-            message(MemoryMessageRole::User, "Hi"),
-            message(MemoryMessageRole::Assistant, "Hello"),
-        ]);
-        let model = TestModel::default();
-        let (mut agent, session) = test_agent();
-        agent.capabilities.tools = true;
-        let mut tools = ToolRegistry::new();
-        tools.register(TimeTool);
-        AgentEngine
-            .run_turn(
-                &agent,
-                &session,
-                TurnInput {
-                    text: "Help me plan my time today".to_string(),
-                },
-                None,
-                &memory,
-                &model,
-                &SimplePlanner,
-                &tools,
-                AgentTurnOptions::default(),
-            )
-            .await
-            .expect("turn");
-
-        let prompt = model.prompts.lock().expect("lock").pop().expect("prompt");
-        let roles: Vec<_> = prompt.iter().map(|message| message.role).collect();
-        assert_eq!(
-            roles,
-            [
-                MemoryMessageRole::System,
-                MemoryMessageRole::User,
-                MemoryMessageRole::Assistant,
-                MemoryMessageRole::User,
-            ]
-        );
-        let system = &prompt[0].content;
-        for part in [
-            "Be helpful",
-            "Remembered: likes tea",
-            "Planning summary",
-            "Tool `time`",
-        ] {
-            assert!(system.contains(part), "{part} missing from {system}");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_deferred_reply_is_stored_only_when_committed() {
-        let memory = TestMemory::default();
-        let model = TestModel::default();
-        let options = AgentTurnOptions {
-            persist_assistant_reply: false,
-            ..AgentTurnOptions::default()
-        };
-        let result = turn(&memory, &model, "hello", options).await;
-        assert_eq!(memory.messages.lock().expect("lock").len(), 1);
-
-        let (_, session) = test_agent();
-        AgentEngine
-            .commit_assistant_reply(
-                &memory,
-                &session,
-                &format!("<think>x</think>{}", &result.assistant_text[..4]),
-                MemoryMessageMeta::default(),
-            )
-            .await
-            .expect("commit");
-        let stored = memory.messages.lock().expect("lock").clone();
-        assert_eq!(stored.len(), 2);
-        assert_eq!(stored[1].role, MemoryMessageRole::Assistant);
-        assert_eq!(stored[1].content, "Echo");
-    }
-
-    #[tokio::test]
-    async fn engine_persists_user_and_assistant_messages() {
-        let agent = AgentDefinition {
-            id: "voice".to_string(),
-            name: "Voice Agent".to_string(),
-            system_prompt: "Be helpful".to_string(),
-            default_model: "Qwen3.5-4B".to_string(),
-            capabilities: AgentCapabilities::default(),
-            planning_mode: PlanningMode::Auto,
-        };
-        let session = AgentSession {
-            id: "sess_1".to_string(),
-            agent_id: "voice".to_string(),
-            thread_id: "thread_1".to_string(),
-            created_at: 0,
-            updated_at: 0,
-        };
-        let memory = TestMemory::default();
-        let model = TestModel::default();
-        let planner = SimplePlanner;
-        let mut tools = ToolRegistry::new();
-        tools.register(TimeTool);
-
-        let result = AgentEngine
-            .run_turn(
-                &agent,
-                &session,
-                TurnInput {
-                    text: "What time is it?".to_string(),
-                },
-                None,
-                &memory,
-                &model,
-                &planner,
-                &tools,
-                AgentTurnOptions::default(),
-            )
-            .await
-            .expect("engine should succeed");
-
-        assert!(result.assistant_text.starts_with("Echo:"));
-        let stored = memory.messages.lock().expect("lock");
-        assert_eq!(stored.len(), 2);
-        assert_eq!(stored[0].role, MemoryMessageRole::User);
-        assert_eq!(stored[1].role, MemoryMessageRole::Assistant);
+    fn emit(&mut self, event: AgentEvent) {
+        self.listener.emit(event.clone());
+        self.events.push(event);
     }
 }
+
+#[derive(Default)]
+struct TurnState {
+    text: String,
+    calls_made: usize,
+    records: Vec<ToolCallRecord>,
+    pending: Vec<ToolCall>,
+    completed_tasks: Vec<CompletedTask>,
+    tokens_generated: usize,
+    generation_time_ms: f64,
+}
+
+impl TurnState {
+    /// Record a call's outcome and hand it to the model's next round.
+    fn settle(
+        &mut self,
+        log: &mut EventLog,
+        conversation: &mut Vec<MemoryMessage>,
+        call: &ToolCall,
+        round: usize,
+        outcome: Outcome,
+    ) {
+        log.emit(AgentEvent::ToolCallCompleted {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            status: outcome.status.to_string(),
+            output: outcome.output.clone(),
+        });
+        conversation.push(MemoryMessage::tool(call.id.clone(), outcome.output.clone()));
+        self.records.push(ToolCallRecord {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+            status: outcome.status.to_string(),
+            output: outcome.output,
+            round,
+        });
+    }
+}
+
+struct Outcome {
+    status: &'static str,
+    output: String,
+}
+
+impl Outcome {
+    fn ok(output: impl Into<String>) -> Self {
+        Self {
+            status: "ok",
+            output: output.into(),
+        }
+    }
+
+    fn error(output: impl Into<String>) -> Self {
+        Self {
+            status: "error",
+            output: output.into(),
+        }
+    }
+
+    fn timeout(timeout: Duration) -> Self {
+        Self {
+            status: "timeout",
+            output: format!("The tool did not answer within {} ms.", timeout.as_millis()),
+        }
+    }
+}
+
+/// Who answers a call.
+enum Route<'a> {
+    Tool(Arc<dyn Tool>),
+    /// A declared tool the caller runs.
+    External,
+    Handoff(&'a AgentDefinition),
+    Task,
+    Unknown,
+}
+
+fn route<'a>(
+    agents: &'a AgentSet,
+    agent: &AgentDefinition,
+    tools: &ToolRegistry,
+    name: &str,
+) -> Route<'a> {
+    if let Some(target) = agent
+        .handoffs
+        .iter()
+        .find(|id| AgentDefinition::transfer_tool_name(id) == name)
+        .and_then(|id| agents.get(id))
+    {
+        return Route::Handoff(target);
+    }
+    if agent
+        .task
+        .as_ref()
+        .is_some_and(|task| task.tool_name() == name)
+    {
+        return Route::Task;
+    }
+    if agent
+        .tools
+        .as_ref()
+        .is_some_and(|allowed| !allowed.iter().any(|allowed| allowed == name))
+    {
+        return Route::Unknown;
+    }
+    match tools.find(name) {
+        Some(tool) => Route::Tool(tool),
+        None if tools.is_external(name) => Route::External,
+        None => Route::Unknown,
+    }
+}
+
+/// The tools a round offers: the agent's registry tools, a transfer tool
+/// for each handoff and the tool that records its task.
+fn offered_tools(agents: &AgentSet, agent: &AgentDefinition, tools: &ToolRegistry) -> Vec<Value> {
+    let mut offered = tools.function_definitions(agent.tools.as_deref());
+    for target in agent.handoffs.iter().filter_map(|id| agents.get(id)) {
+        let description = match &target.handoff_description {
+            Some(when) => format!("Hand the conversation to {}. {when}", target.name),
+            None => format!("Hand the conversation to {}.", target.name),
+        };
+        offered.push(function_definition(
+            &AgentDefinition::transfer_tool_name(&target.id),
+            &description,
+            json!({"type": "object", "properties": {}}),
+        ));
+    }
+    if let Some(task) = &agent.task {
+        offered.push(function_definition(
+            &task.tool_name(),
+            &task.description,
+            task.parameters.clone(),
+        ));
+    }
+    offered
+}
+
+fn handoff_note(target: &AgentDefinition) -> String {
+    format!(
+        "Done: you are now {}. Answer the user directly in that role, following your new \
+         instructions. Do not announce the transfer.",
+        target.name
+    )
+}
+
+fn prompt(
+    agent: &AgentDefinition,
+    context: &[String],
+    conversation: &[MemoryMessage],
+) -> Vec<MemoryMessage> {
+    let system = std::iter::once(agent.system_prompt.as_str())
+        .chain(context.iter().map(String::as_str))
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut messages = Vec::with_capacity(conversation.len() + 1);
+    if !system.is_empty() {
+        messages.push(MemoryMessage::system(system));
+    }
+    messages.extend(conversation.iter().cloned());
+    messages
+}
+
+/// Append a round's text to the reply so far.
+fn join_text(reply: &mut String, round: &str) {
+    if round.is_empty() {
+        return;
+    }
+    if !reply.is_empty()
+        && !reply.ends_with(char::is_whitespace)
+        && !round.starts_with(char::is_whitespace)
+    {
+        reply.push(' ');
+    }
+    reply.push_str(round);
+}
+
+fn started(call: &ToolCall, executor: &str) -> AgentEvent {
+    AgentEvent::ToolCallStarted {
+        call_id: call.id.clone(),
+        name: call.name.clone(),
+        arguments: call.arguments.clone(),
+        executor: executor.to_string(),
+    }
+}
+
+fn tool_context(
+    session: &AgentSession,
+    call: &ToolCall,
+    user_text: &str,
+    cancel: TurnCancel,
+) -> std::result::Result<ToolContext, Outcome> {
+    let arguments = match call.arguments.trim() {
+        "" => json!({}),
+        arguments => serde_json::from_str::<Value>(arguments)
+            .map_err(|err| Outcome::error(format!("Invalid arguments: {err}")))?,
+    };
+    Ok(ToolContext {
+        session_id: session.id.clone(),
+        thread_id: session.thread_id.clone(),
+        call_id: call.id.clone(),
+        user_text: user_text.to_string(),
+        arguments,
+        cancel,
+    })
+}
+
+/// Run a tool the turn waits for: until it answers, its timeout passes or
+/// the turn is cancelled.
+async fn run_inline<M, B>(
+    ctx: &TurnContext<'_, M, B>,
+    session: &AgentSession,
+    tool: Arc<dyn Tool>,
+    call: &ToolCall,
+    user_text: &str,
+    options: AgentTurnOptions,
+) -> Outcome {
+    let context = match tool_context(session, call, user_text, ctx.cancel.clone()) {
+        Ok(context) => context,
+        Err(outcome) => return outcome,
+    };
+    let invoke = tool.invoke(context);
+    let deadline = tokio::time::sleep(options.tool_timeout);
+    let slow = async {
+        match options.tool_soft_timeout {
+            Some(after) => tokio::time::sleep(after).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(invoke, deadline, slow);
+    let mut reported_slow = false;
+    loop {
+        tokio::select! {
+            result = &mut invoke => {
+                return match result {
+                    Ok(output) => Outcome::ok(output.text),
+                    Err(err) => Outcome::error(err.to_string()),
+                };
+            }
+            () = &mut deadline => return Outcome::timeout(options.tool_timeout),
+            () = ctx.cancel.cancelled() => {
+                return Outcome {
+                    status: "cancelled",
+                    output: "The turn was interrupted.".to_string(),
+                };
+            }
+            () = &mut slow, if !reported_slow => {
+                reported_slow = true;
+                ctx.events.emit(AgentEvent::ToolCallSlow {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                });
+            }
+        }
+    }
+}
+
+/// Start a tool that outlives the turn. Its result waits in the session's
+/// background results for the next turn.
+fn start_background<M, B>(
+    ctx: &TurnContext<'_, M, B>,
+    session: &AgentSession,
+    tool: Arc<dyn Tool>,
+    call: &ToolCall,
+    user_text: &str,
+    options: AgentTurnOptions,
+) -> Outcome {
+    // The turn's cancellation does not reach a background tool.
+    let context = match tool_context(session, call, user_text, TurnCancel::new()) {
+        Ok(context) => context,
+        Err(outcome) => return outcome,
+    };
+    let (results, events) = (ctx.background.clone(), ctx.events.clone());
+    let (call_id, name) = (call.id.clone(), call.name.clone());
+    let timeout = options.background_tool_timeout;
+    tokio::spawn(async move {
+        let outcome = match tokio::time::timeout(timeout, tool.invoke(context)).await {
+            Ok(Ok(output)) => Outcome::ok(output.text),
+            Ok(Err(err)) => Outcome::error(err.to_string()),
+            Err(_) => Outcome::timeout(timeout),
+        };
+        results.push(BackgroundResult {
+            call_id: call_id.clone(),
+            name: name.clone(),
+            status: outcome.status.to_string(),
+            output: outcome.output,
+        });
+        events.emit(AgentEvent::BackgroundToolCompleted {
+            call_id,
+            name,
+            status: outcome.status.to_string(),
+        });
+    });
+    Outcome {
+        status: "started",
+        output: "Started. The result will arrive later; tell the user it is under way.".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests;

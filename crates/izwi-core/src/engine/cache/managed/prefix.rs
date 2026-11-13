@@ -20,6 +20,11 @@ pub(super) fn managed_prefix_namespace(
     {
         return Ok(None);
     }
+    // Pages are keyed by token ids, and an image placeholder's id says
+    // nothing of the image behind it: a request with media shares nothing.
+    if !request.chat_config.media_inputs.is_empty() {
+        return Ok(None);
+    }
 
     // The current managed producer is text-only Qwen3. Each digest is derived
     // from exact lifecycle/adapter facts already sealed onto this request. The

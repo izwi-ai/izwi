@@ -18,6 +18,7 @@ import {
   type VoiceRealtimeServerEvent,
   voiceRealtimeEndsUserSpeech,
   voiceRealtimePlaybackAction,
+  voiceTranscriptEvent,
   type VoiceRealtimeV2ServerEnvelope,
 } from "./support";
 
@@ -293,6 +294,70 @@ describe("voice realtime support", () => {
     expect(
       voiceRealtimePlaybackAction({ type: "user_speech_start", ...next }, null),
     ).toBeNull();
+  });
+
+  it("pauses a reply the server holds and resumes or stops it on the server's word", () => {
+    const active = { utterance_id: "active", utterance_seq: 7 };
+    const next = { utterance_id: "next", utterance_seq: 8 };
+    expect(
+      voiceRealtimePlaybackAction({ type: "turn_paused", ...active }, 7),
+    ).toBe("pause");
+    // While paused, the end of the user's speech decides nothing.
+    expect(
+      voiceRealtimePlaybackAction(
+        { type: "user_speech_end", ...next, reason: "silence" },
+        7,
+        true,
+      ),
+    ).toBeNull();
+    expect(
+      voiceRealtimePlaybackAction({ type: "turn_resumed", ...active }, 7, true),
+    ).toBe("resume");
+    expect(
+      voiceRealtimePlaybackAction(
+        { type: "turn_interrupted", ...active, reason: "barge_in" },
+        7,
+        true,
+      ),
+    ).toBe("stop");
+    // A pause of another utterance's reply is not this one's.
+    expect(
+      voiceRealtimePlaybackAction({ type: "turn_paused", ...next }, 7),
+    ).toBeNull();
+  });
+
+  it("says what the assistant did in words, and leaves out the server's own tools", () => {
+    const turn = { utterance_id: "utterance-1", utterance_seq: 1 };
+    expect(
+      voiceTranscriptEvent({ type: "function_call", ...turn, call_id: "c1", name: "get_weather" }),
+    ).toEqual({ key: "call:c1", text: "Using get weather…", state: "pending" });
+    const done = (status: string) =>
+      voiceTranscriptEvent({
+        type: "function_call_completed",
+        ...turn,
+        call_id: "c1",
+        name: "get_weather",
+        status,
+      });
+    expect(done("ok")).toEqual({ key: "call:c1", text: "Used get weather" });
+    expect(done("started")?.text).toBe("Started get weather");
+    expect(done("timeout")).toMatchObject({ text: "get weather took too long", state: "failed" });
+    expect(done("error")).toMatchObject({ text: "Couldn’t use get weather", state: "failed" });
+    for (const name of ["transfer_to_billing", "complete_refund"]) {
+      expect(
+        voiceTranscriptEvent({ type: "function_call", ...turn, call_id: "c2", name }),
+      ).toBeNull();
+    }
+    expect(
+      voiceTranscriptEvent(
+        { type: "agent_handoff", ...turn, from: "front", to: "billing" },
+        (id) => (id === "billing" ? "Billing" : id),
+      )?.text,
+    ).toBe("Handed over to Billing");
+    expect(
+      voiceTranscriptEvent({ type: "task_completed", ...turn, name: "refund" })?.text,
+    ).toBe("Recorded refund");
+    expect(voiceTranscriptEvent({ type: "turn_paused", ...turn })).toBeNull();
   });
 
   it("ends the speaking status only for the latest rejected speech", () => {
