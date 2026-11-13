@@ -303,6 +303,7 @@ impl Lfm3AudioModel {
             clips: Vec::new(),
             mode: Lfm3AudioMode::Text,
             text_only: true,
+            opening: Lfm3AudioOpening::Free,
             max_slots: FINAL_TEXT_TOKENS,
             text_sampling: Lfm3TextSampling::default(),
             audio_sampling: Lfm3AudioSampling::default(),

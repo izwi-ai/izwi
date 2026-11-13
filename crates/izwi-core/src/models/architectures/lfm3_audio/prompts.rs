@@ -268,7 +268,8 @@ impl PromptBuilder {
 /// * A tool turn is wrapped in `<tool_response>` unless it already holds one
 ///   or is empty.
 /// * The assistant turn opens `<|mixed_start|>`, unless the reply may call
-///   tools, when the model chooses between a call and speech itself.
+///   tools, when the model chooses between a call and speech itself (and
+///   generation holds it to those two).
 pub(crate) fn reply_prompt(messages: &[ChatMessage], tools: &[Value]) -> Vec<PromptPart> {
     let (system, turns) = match messages.split_first() {
         Some((first, rest)) if first.role == ChatRole::System => (first.content.trim(), rest),

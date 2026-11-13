@@ -16,6 +16,7 @@ use super::*;
 use crate::backends::DeviceProfile;
 use crate::models::architectures::lfm2::physical::Lfm2StateLayout;
 use crate::models::shared::attention::physical::test_physical_caches_for_model_layers_on;
+use crate::models::shared::chat::ChatRole;
 use std::time::Instant;
 
 use super::super::prompts::{
@@ -157,6 +158,7 @@ fn transcribe(model: &Lfm3AudioModel, samples: &[f32], sample_rate: u32) -> (Str
             clips: vec![audio],
             mode: Lfm3AudioMode::Text,
             text_only: true,
+            opening: Lfm3AudioOpening::Free,
             max_slots: 256,
             text_sampling: Lfm3TextSampling::default(),
             audio_sampling: Lfm3AudioSampling::default(),
@@ -177,6 +179,7 @@ fn speak(model: &Lfm3AudioModel, voice: &str, seed: u64) -> (Lfm3AudioOutput, f6
             clips: Vec::new(),
             mode: Lfm3AudioMode::Audio,
             text_only: false,
+            opening: Lfm3AudioOpening::Free,
             max_slots: 400,
             text_sampling: Lfm3TextSampling::default(),
             audio_sampling: Lfm3AudioSampling::default(),
@@ -310,6 +313,7 @@ fn time_components(profile: DeviceProfile) {
         clips: Vec::new(),
         mode: Lfm3AudioMode::Audio,
         text_only: false,
+        opening: Lfm3AudioOpening::Free,
         max_slots: 1,
         text_sampling: Lfm3TextSampling::default(),
         audio_sampling: Lfm3AudioSampling::default(),
@@ -1032,4 +1036,172 @@ fn depth_fusion_matches_the_op_by_op_pass_on_metal() {
         plain_ms += time(true) / 3.0;
     }
     eprintln!("one row, one pass (indicative): fused {fused_ms:.2} ms, op-by-op {plain_ms:.2} ms");
+}
+
+/// A reply offered tools keeps a sampled `<tool_call>` and opens speech in
+/// place of any other first token; a reply without tools starts speaking.
+#[test]
+fn tool_replies_open_with_a_call_or_speech() {
+    assert_eq!(open_tool_reply(TOOL_CALL), TOOL_CALL);
+    for token in [MIXED_START, AUDIO_START, IM_END, TEXT_END, 1_000] {
+        assert_eq!(open_tool_reply(token), MIXED_START, "token {token}");
+    }
+    let messages = [ChatMessage {
+        role: ChatRole::User,
+        content: "Hello".into(),
+    }];
+    let request = |tools: &[serde_json::Value]| {
+        reply_request(
+            &messages,
+            Vec::new(),
+            tools,
+            64,
+            Lfm3TextSampling::default(),
+            Lfm3AudioSampling::default(),
+            0,
+        )
+        .unwrap()
+    };
+    let plain = request(&[]);
+    assert_eq!(
+        (plain.mode, plain.opening),
+        (Lfm3AudioMode::Interleaved, Lfm3AudioOpening::Free)
+    );
+    let tools = request(&[time_tool()]);
+    assert_eq!(
+        (tools.mode, tools.opening),
+        (Lfm3AudioMode::Text, Lfm3AudioOpening::CallOrSpeech)
+    );
+}
+
+fn time_tool() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "time",
+            "description": "Returns the current local date and time.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    })
+}
+
+/// The Voice page conversation that went silent (2026-11-13): with the `time`
+/// tool offered, four text answers in the history and the fifth question,
+/// greedy decoding opened the reply in plain text and it carried no speech.
+/// A reply offered tools now speaks unless it calls, and a time question
+/// still calls.
+fn tool_replies_speak_or_call(profile: DeviceProfile) {
+    let dir = models_dir().join(FOLDER);
+    if !dir.exists() {
+        eprintln!("skipping: {} is missing", dir.display());
+        return;
+    }
+    let backend = format!("{:?}", profile.kind);
+    let model = Lfm3AudioModel::load(&dir, ModelVariant::Lfm3Audio2BGguf, profile).unwrap();
+    assert_eq!(model.tokenizer.token_to_id("<tool_call>"), Some(TOOL_CALL));
+    let history = [
+        (
+            "Hi there! How are you today?",
+            "Hi there! I'm doing well, thank you. Today is Friday, November 13th, 2026, at 7:08 PM \
+             UTC plus two hours. How can I help you today?",
+        ),
+        (
+            "I'm planning a trip to Portugal next month. Do you have any tips?",
+            "I'd love to help with your Portugal trip! Since I don't have specific travel tools, I \
+             can offer some general advice. Portugal is known for its beautiful coastlines, historic \
+             cities like Lisbon and Porto, and delicious food. You might want to consider visiting \
+             the Algarve region for beaches, exploring the Douro Valley for wine, or checking out \
+             the old town of Évora. Let me know if you'd like more specific recommendations!",
+        ),
+        (
+            "What is the best part of Lisbon to stay in?",
+            "Lisbon has several great areas to stay in, each with its own charm. The historic center \
+             is perfect for walking and exploring, while Alfama offers a cozy, narrow-street \
+             atmosphere. Bairro Alto is lively and trendy, and Mouraria has a unique, bohemian vibe.",
+        ),
+        (
+            "Can you recommend a typical Portuguese dish I should try?",
+            "A must-try is bacalhau à Brás, which is cod with potatoes, onions, and peppers. It's a \
+             classic dish that showcases the fresh seafood and local ingredients. You can also try \
+             pastel de nata, a creamy custard tart.",
+        ),
+    ];
+    let reply = |line: &str, opening: Lfm3AudioOpening| {
+        let mut messages = vec![ChatMessage {
+            role: ChatRole::System,
+            content: "You are a helpful voice assistant. Reply with concise spoken-friendly \
+                      language. Avoid markdown. Do not output <think> tags or internal reasoning. \
+                      Return only the final spoken answer. Keep responses brief unless asked for \
+                      details."
+                .into(),
+        }];
+        for (user, assistant) in history {
+            messages.push(ChatMessage {
+                role: ChatRole::User,
+                content: user.into(),
+            });
+            messages.push(ChatMessage {
+                role: ChatRole::Assistant,
+                content: assistant.into(),
+            });
+        }
+        messages.push(ChatMessage {
+            role: ChatRole::User,
+            content: line.into(),
+        });
+        let mut request = reply_request(
+            &messages,
+            Vec::new(),
+            &[time_tool()],
+            64,
+            Lfm3TextSampling::default(),
+            Lfm3AudioSampling::default(),
+            5,
+        )
+        .unwrap();
+        request.opening = opening;
+        run(&model, request).0
+    };
+    let question = "Is it expensive to eat out in Lisbon?";
+    // What the model does when left to choose: logged, not asserted, as it
+    // is the checkpoint's behaviour rather than ours.
+    let free = reply(question, Lfm3AudioOpening::Free);
+    eprintln!(
+        "{backend}: unconstrained opening: {} frames, text {:?}",
+        free.audio_frames, free.text
+    );
+    let answer = reply(question, Lfm3AudioOpening::CallOrSpeech);
+    eprintln!(
+        "{backend}: answer {} frames, text {:?}",
+        answer.audio_frames, answer.text
+    );
+    assert!(!answer.text.contains("<tool_call>"), "{backend}: no call");
+    assert!(answer.audio_frames > 0, "{backend}: the answer speaks");
+    let call = reply("What time is it?", Lfm3AudioOpening::CallOrSpeech);
+    eprintln!("{backend}: call text {:?}", call.text);
+    assert!(
+        call.text.starts_with("<tool_call>") && call.text.contains("<function=time>"),
+        "{backend}: a time question calls the tool"
+    );
+}
+
+#[test]
+#[ignore = "needs the LFM3-Audio-2B GGUF (IZWI_LFM25_MODELS_DIR)"]
+fn lfm3_audio_tool_replies_speak_or_call_on_cpu() {
+    tool_replies_speak_or_call(DeviceProfile::cpu());
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM3-Audio-2B GGUF (IZWI_LFM25_MODELS_DIR)"]
+fn lfm3_audio_tool_replies_speak_or_call_on_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let _lease = crate::backends::metal_test_device_or_skip(
+        "lfm3_audio_tool_replies_speak_or_call_on_metal",
+    );
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if !matches!(profile.device, Device::Metal(_)) {
+        return;
+    }
+    tool_replies_speak_or_call(profile);
 }
