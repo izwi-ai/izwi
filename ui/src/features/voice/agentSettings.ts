@@ -29,6 +29,11 @@ export interface VoiceAgentSettings {
   /** The built-in tools (date and time); `null` is the engine's default. */
   builtinTools: boolean | null;
   toolServers: VoiceToolServer[];
+  /**
+   * Labels of the servers set up on the Izwi server (its MCP servers file)
+   * that are turned on.
+   */
+  configuredToolServers: string[];
   /** With two or more, the first answers and they hand over to each other. */
   agents: VoiceAgent[];
   /** Follow the speaker's own pauses when deciding they have finished. */
@@ -42,6 +47,7 @@ export interface VoiceAgentSettings {
 export const DEFAULT_VOICE_AGENT_SETTINGS: VoiceAgentSettings = {
   builtinTools: null,
   toolServers: [],
+  configuredToolServers: [],
   agents: [],
   adaptiveSilence: false,
   replySooner: false,
@@ -159,10 +165,23 @@ export function parseVoiceAgentSettings(raw: string | null): VoiceAgentSettings 
     );
   }
 
+  const configuredToolServers = [
+    ...new Set(
+      (Array.isArray(stored.configuredToolServers)
+        ? stored.configuredToolServers
+        : []
+      ).filter(
+        (label): label is string =>
+          typeof label === "string" && ID_PATTERN.test(label),
+      ),
+    ),
+  ];
+
   return {
     builtinTools:
       typeof stored.builtinTools === "boolean" ? stored.builtinTools : null,
     toolServers,
+    configuredToolServers,
     agents,
     adaptiveSilence: flag("adaptiveSilence"),
     replySooner: flag("replySooner"),
@@ -196,12 +215,16 @@ export function voiceBuiltinToolsOn(
  * The `input_stream_start` fields these settings add for a conversation on
  * an engine of `mode`. Agents and an early reply need the standard
  * (modular) engine. `callsTools` is whether the engine's model can call
- * tools at all: without it nothing tool-related is sent.
+ * tools at all: without it nothing tool-related is sent. `configured` are
+ * the labels of the servers set up on the Izwi server: one that is turned
+ * on but no longer there is left out, as is one whose name an added server
+ * has taken.
  */
 export function voiceStreamOptions(
   settings: VoiceAgentSettings,
   mode: "modular" | "unified",
   callsTools: boolean,
+  configured: string[] = [],
 ): Record<string, unknown> {
   const options: Record<string, unknown> = {
     resume_false_interruptions: settings.resumeFalseInterruptions,
@@ -218,14 +241,25 @@ export function voiceStreamOptions(
   if (settings.builtinTools !== null) {
     options.builtin_tools = settings.builtinTools;
   }
-  if (settings.toolServers.length > 0) {
-    options.mcp_servers = settings.toolServers.map((server) => ({
+  const servers: Record<string, unknown>[] = settings.toolServers.map(
+    (server) => ({
       label: server.label,
       url: server.url,
       ...(server.token.trim()
         ? { headers: { Authorization: `Bearer ${server.token.trim()}` } }
         : {}),
-    }));
+    }),
+  );
+  for (const label of settings.configuredToolServers) {
+    if (
+      configured.includes(label) &&
+      !settings.toolServers.some((server) => server.label === label)
+    ) {
+      servers.push({ label });
+    }
+  }
+  if (servers.length > 0) {
+    options.mcp_servers = servers.slice(0, MAX_VOICE_TOOL_SERVERS);
   }
   if (mode === "modular" && settings.agents.length >= 2) {
     options.agents = settings.agents.map((agent) => ({

@@ -110,8 +110,14 @@ export function VoicePage({
         preferences.agentSettings,
         preferences.engine === "compact" ? "unified" : "modular",
         voiceEngineCallsTools(preferences.engine, compactModel),
+        preferences.configuredToolServers.map((server) => server.label),
       ),
-    [compactModel, preferences.agentSettings, preferences.engine],
+    [
+      compactModel,
+      preferences.agentSettings,
+      preferences.configuredToolServers,
+      preferences.engine,
+    ],
   );
   const { agents } = preferences.agentSettings;
   const agentName = useCallback(

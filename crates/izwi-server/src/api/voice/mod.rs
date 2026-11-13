@@ -14,6 +14,10 @@ pub fn router() -> Router<AppState> {
             get(handlers::get_voice_profile).patch(handlers::update_voice_profile),
         )
         .route(
+            "/voice/tool-servers",
+            get(handlers::list_voice_tool_servers),
+        )
+        .route(
             "/voice/observations",
             get(handlers::list_voice_observations).delete(handlers::clear_voice_observations),
         )

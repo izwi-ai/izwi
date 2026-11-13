@@ -101,6 +101,11 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "Comma-separated hosts (`host` or `host:port`, `*` for any) whose MCP servers a voice or Realtime session may name. The server connects to those servers itself, so list only hosts every API client may reach through it. Empty turns MCP tools off.",
     ),
     var(
+        "IZWI_MCP_SERVERS_FILE",
+        "`mcp.json` in the platform data directory",
+        "A JSON file of MCP servers set up on this server, in the `{\"mcpServers\": {label: {\"command\", \"args\", \"env\"} | {\"url\", \"headers\"}}}` form other MCP clients use. A voice or Realtime session uses one by naming its label without a URL; a local command runs once and is shared by every session. Only this file can name a command. Read once, at first use.",
+    ),
+    var(
         "IZWI_ALLOWED_HOSTS",
         "",
         "Comma-separated extra Host names to accept (port optional). On a non-loopback bind, setting it turns the Host check on.",

@@ -16,7 +16,7 @@ For starting a conversation and choosing an engine, see [Voice Mode](/features/v
 |------------|---------------|------------|--------------|
 | **Built-in tools** | The assistant can check the date and time | Voice settings › Tools | `builtin_tools` |
 | **Your own tools** | The assistant calls a function and your program answers | — | `tools` |
-| **Tool servers (MCP)** | The assistant calls the tools of an MCP server, and Izwi runs the calls | Voice settings › Tools | `mcp_servers` |
+| **Tool servers (MCP)** | The assistant calls the tools of an MCP server (a web service or a program on this computer), and Izwi runs the calls | Voice settings › Tools | `mcp_servers` |
 | **Agents and handoffs** | Several agents, each with its own job, pass the conversation between them | Voice settings › Agents | `agents` |
 | **Tasks** | An agent collects set details (a name, a date) and records them | — | `agents[].task` |
 | **Turn taking** | How quickly it answers, and what counts as an interruption | Voice settings › Conversation | see [Turn taking](#turn-taking) |
@@ -39,12 +39,36 @@ On the Standard engine this is off until you turn it on. Offering any tool makes
 
 A tool server is a program that offers tools over the [Model Context Protocol](https://modelcontextprotocol.io) (MCP): a stock lookup, a calendar, a ticket system. Add its name and address, and an access token if it needs one. The assistant can then call its tools, and Izwi runs the calls.
 
-Two things to know:
-
-- **Izwi's server makes the connection, not your browser.** For safety it only connects to hosts you have allowed. Set `IZWI_MCP_ALLOWED_HOSTS` to a comma-separated list of hosts (`mcp.example.com`, `127.0.0.1:9000`, or `*` for any) before starting Izwi. Until it is set, a conversation that names a tool server fails to start and says so.
-- **Only servers that speak MCP over HTTP** (the "Streamable HTTP" transport) are supported. A server that runs as a local command is not.
+Izwi's server makes the connection, not your browser. For safety it only connects to hosts you have allowed. Set `IZWI_MCP_ALLOWED_HOSTS` to a comma-separated list of hosts (`mcp.example.com`, `127.0.0.1:9000`, or `*` for any) before starting Izwi. Until it is set, a conversation that names a tool server by address fails to start and says so.
 
 The access token is kept in this device's browser storage and sent to Izwi when a conversation starts.
+
+### Tool servers that run as a program
+
+Many MCP servers are not web services but programs you run: a file browser, a database reader, a calendar bridge. Izwi starts these itself. Because a program can do anything your account can, only a file on the computer Izwi runs on can name one; nothing typed into the app or sent over the API can.
+
+Create `mcp.json` in Izwi's data folder, next to `izwi.sqlite3`: `~/Library/Application Support/izwi` on macOS, `~/.local/share/izwi` on Linux, `%LOCALAPPDATA%\izwi` on Windows (`IZWI_MCP_SERVERS_FILE` names another place). It takes the same form other MCP apps use:
+
+```json
+{
+  "mcpServers": {
+    "files": {
+      "command": "/opt/homebrew/bin/npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/Documents"]
+    },
+    "docs": {
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer YOUR_TOKEN" }
+    }
+  }
+}
+```
+
+Restart Izwi. Each server then appears in **Voice settings › Tools** under **Set up on this server**, with a switch. A remote server listed in this file needs no entry in `IZWI_MCP_ALLOWED_HOSTS`, and its token stays in the file.
+
+- **Give the full path to the command.** The desktop app does not see the `PATH` your terminal has, so `npx` or `uvx` alone is often not found. `env` adds environment variables and `cwd` sets the folder the program starts in.
+- **One copy runs for everyone.** A program starts the first time a conversation uses it, is shared by every conversation after, and is started again if it exits. Its first start may take a while if it has to install itself; Izwi waits up to a minute.
+- **Anyone who can use this Izwi server can use these tools.** List only servers you would let every caller of the API reach.
 
 ### What you see
 
@@ -114,10 +138,13 @@ The voice WebSocket (`/v1/voice/realtime/ws`) takes all of this in `input_stream
     }
   ],
   "mcp_servers": [
-    { "label": "stock", "url": "http://127.0.0.1:9000/mcp" }
+    { "label": "stock", "url": "http://127.0.0.1:9000/mcp" },
+    { "label": "files" }
   ]
 }
 ```
+
+An `mcp_servers` entry without a `url` names a server from `mcp.json`; `GET /v1/voice/tool-servers` lists them.
 
 When the reply calls `get_weather`, the server sends `function_call` with a `call_id`. Your client runs it and answers:
 
@@ -178,6 +205,6 @@ The [API reference](/api#voice-realtime) lists every field and event. To test an
 ## Limits
 
 - On the Standard engine a conversation remembers what its tools found, so a later question can build on an earlier lookup without calling the tool again. A long result is kept in shortened form (about 1,500 characters). On the Compact engine tool calls and their results last for one turn.
-- Tool servers must be reachable over HTTP and allowed in `IZWI_MCP_ALLOWED_HOSTS`. Approval prompts for tool calls are not supported.
+- A tool server named by address must be allowed in `IZWI_MCP_ALLOWED_HOSTS`; one that runs as a program must be in `mcp.json`. A voice conversation does not ask you before a tool runs.
 - Agents and tasks are not available with the Compact engine. Tasks can only be set over the API.
 - A hum or a cough resumes the reply only where Izwi can tell it had no words. A short "yes" or "okay" while Izwi is speaking still interrupts it.

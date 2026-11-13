@@ -137,6 +137,7 @@ export type {
 } from "@/shared/api/chat";
 
 export type {
+  VoiceConfiguredToolServer,
   VoiceObservation,
   VoiceProfile,
   VoiceProfileUpdateRequest,

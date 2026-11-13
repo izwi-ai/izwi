@@ -156,6 +156,7 @@ const chatMethodNames = [
 ] as const;
 
 const voiceMethodNames = [
+  "listVoiceToolServers",
   "getVoiceProfile",
   "updateVoiceProfile",
   "listVoiceObservations",

@@ -93,6 +93,7 @@ describe("voice agent settings", () => {
         { label: "stock", url: "http://h/mcp", token: " secret " },
         { label: "open", url: "http://o/mcp", token: "" },
       ],
+      configuredToolServers: [],
       agents: [front, billing],
       adaptiveSilence: true,
       replySooner: true,
@@ -122,6 +123,21 @@ describe("voice agent settings", () => {
       resume_false_interruptions: true,
       adaptive_silence: true,
     });
+    // A server set up on the Izwi server is named by its label alone, while
+    // it is still there and no added server has taken its name.
+    const local = {
+      ...DEFAULT_VOICE_AGENT_SETTINGS,
+      toolServers: [{ label: "stock", url: "http://h/mcp", token: "" }],
+      configuredToolServers: ["files", "gone", "stock"],
+    };
+    expect(
+      voiceStreamOptions(local, "modular", true, ["files", "stock"]).mcp_servers,
+    ).toEqual([{ label: "stock", url: "http://h/mcp" }, { label: "files" }]);
+    expect(
+      parseVoiceAgentSettings(
+        JSON.stringify({ configuredToolServers: ["files", "files", "a b", 3] }),
+      ).configuredToolServers,
+    ).toEqual(["files"]);
     // One agent alone is just the instructions; the defaults send nothing extra.
     expect(
       voiceStreamOptions({ ...DEFAULT_VOICE_AGENT_SETTINGS, agents: [front] }, "modular", true),

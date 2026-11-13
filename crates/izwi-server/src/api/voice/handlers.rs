@@ -80,6 +80,33 @@ pub struct VoiceSessionExport<'a> {
     pub transcript: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct VoiceToolServer {
+    pub label: String,
+    /// `stdio` (a local command) or `http`.
+    pub transport: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VoiceToolServersResponse {
+    pub servers: Vec<VoiceToolServer>,
+}
+
+/// The MCP servers set up in this server's MCP servers file, which a voice
+/// or Realtime session may use by naming a label. Commands, addresses and
+/// credentials stay on the server.
+pub async fn list_voice_tool_servers() -> Json<VoiceToolServersResponse> {
+    let servers = crate::app::mcp::ConfiguredServers::shared()
+        .list()
+        .into_iter()
+        .map(|(label, transport)| VoiceToolServer {
+            label: label.to_string(),
+            transport,
+        })
+        .collect();
+    Json(VoiceToolServersResponse { servers })
+}
+
 pub async fn get_voice_profile(
     State(state): State<AppState>,
 ) -> Result<Json<VoiceProfileResponse>, ApiError> {

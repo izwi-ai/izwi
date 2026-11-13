@@ -13,6 +13,7 @@ import { VoicePage } from "./route";
 
 const apiMocks = vi.hoisted(() => ({
   getVoiceProfile: vi.fn(),
+  listVoiceToolServers: vi.fn(),
   updateVoiceProfile: vi.fn(),
   listVoiceObservations: vi.fn(),
   deleteVoiceObservation: vi.fn(),
@@ -160,6 +161,7 @@ const storage = new Map<string, string>();
 
 beforeEach(() => {
   Object.values(handlers).forEach((handler) => handler.mockReset());
+  apiMocks.listVoiceToolServers.mockResolvedValue([]);
   apiMocks.getVoiceProfile.mockResolvedValue({
     id: "default",
     name: "Default",

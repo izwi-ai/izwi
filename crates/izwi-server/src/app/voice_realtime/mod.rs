@@ -45,7 +45,7 @@ use crate::app::agent_runtime::{
     cancel_follows, cancel_with, drive_turn, finish_name, ChatAgentBackend, ConversationSummary,
     ThreadMemory, TurnTrace,
 };
-use crate::app::mcp::{AllowedHosts, McpServerConfig, McpTools};
+use crate::app::mcp::{McpAccess, McpServerConfig, McpTools};
 use crate::app::realtime_codec::{AudioOutputEncoder, OutputAudioFormat};
 use crate::app::realtime_protocol::{
     RealtimeAudioFormat, RealtimeAudioGapAction, RealtimeClose, RealtimeCloseCode,
@@ -2676,7 +2676,7 @@ async fn connect_mcp_tools(
                 .to_string(),
         );
     }
-    let mcp = McpTools::connect(&servers, &AllowedHosts::from_env()).await?;
+    let mcp = McpTools::connect(&servers, &McpAccess::from_env()).await?;
     VoiceTools::with_mcp(tools, mcp)
 }
 

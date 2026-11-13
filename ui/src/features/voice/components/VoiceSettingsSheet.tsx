@@ -94,6 +94,7 @@ export function VoiceSettingsSheet(props: VoiceSettingsSheetProps) {
     onChange: props.preferences.updateAgentSettings,
     mode: props.preferences.engine === "compact" ? "unified" : "modular",
     callsTools: voiceEngineCallsTools(props.preferences.engine, props.compactModel),
+    configured: props.preferences.configuredToolServers,
   } as const;
 
   return (
@@ -390,6 +391,7 @@ function MainView({
         onChange={preferences.updateAgentSettings}
         mode={preferences.engine === "compact" ? "unified" : "modular"}
         callsTools={voiceEngineCallsTools(preferences.engine, compactModel)}
+        configured={preferences.configuredToolServers}
         onOpenTools={() => onViewChange("tools")}
         onOpenAgents={() => onViewChange("agents")}
       />
@@ -399,6 +401,7 @@ function MainView({
         onChange={preferences.updateAgentSettings}
         mode={preferences.engine === "compact" ? "unified" : "modular"}
         callsTools={voiceEngineCallsTools(preferences.engine, compactModel)}
+        configured={preferences.configuredToolServers}
       />
 
       <section className="flex flex-col">

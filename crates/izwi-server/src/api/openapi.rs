@@ -907,6 +907,15 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     );
     add_operation(
         paths,
+        "/v1/voice/tool-servers",
+        "get",
+        "Voice",
+        "List configured tool servers",
+        "List the MCP servers set up in this server's MCP servers file: each one's label and transport. A voice or Realtime session uses one by naming its label.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
         "/v1/voice/observations",
         "get",
         "Voice",

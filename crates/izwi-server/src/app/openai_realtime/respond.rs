@@ -44,7 +44,7 @@ use crate::api::openai::tool_calls::{
 use crate::app::agent_runtime::{
     cancel_with, drive_turn, finish_name, ChatAgentBackend, ThreadMemory, TurnTrace,
 };
-use crate::app::mcp::{AllowedHosts, McpServerConfig, McpTools};
+use crate::app::mcp::{McpAccess, McpServerConfig, McpTools};
 use crate::app::realtime_transport::{
     OutboundClass, OutboundEnqueueError, OutboundItem, OutboundMailbox,
 };
@@ -259,7 +259,7 @@ pub(crate) async fn mcp_tools_for(shared: &SharedMcp, tools: &[Value]) -> Result
     }
     let mut session = shared.lock().await;
     if session.configs != configs {
-        session.tools = McpTools::connect(&configs, &AllowedHosts::from_env()).await?;
+        session.tools = McpTools::connect(&configs, &McpAccess::from_env()).await?;
         session.configs = configs;
     }
     Ok(session.tools.clone())
@@ -1565,7 +1565,7 @@ mod tests {
         let configs = mcp_configs(&tools);
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].label, "docs");
-        assert_eq!(configs[0].url, "http://h/mcp");
+        assert_eq!(configs[0].url.as_deref(), Some("http://h/mcp"));
         assert_eq!(configs[0].headers["Authorization"], "Bearer t");
         assert_eq!(configs[0].allowed_tools, None);
     }

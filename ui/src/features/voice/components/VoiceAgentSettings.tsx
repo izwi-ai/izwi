@@ -13,6 +13,7 @@ import {
   type VoiceAgent,
   type VoiceAgentSettings,
 } from "@/features/voice/agentSettings";
+import type { VoiceConfiguredToolServer } from "@/api";
 import { cn } from "@/lib/utils";
 
 const sectionTitle = "mb-1.5 text-[13px] font-medium text-(--text-muted)";
@@ -30,6 +31,8 @@ interface AgentSettingsProps {
   mode: "modular" | "unified";
   /** Whether the engine's model can call tools at all. */
   callsTools: boolean;
+  /** The MCP servers set up on the Izwi server. */
+  configured: VoiceConfiguredToolServer[];
 }
 
 function SwitchRow({
@@ -99,13 +102,19 @@ export function ToolsAndAgentsSection({
   settings,
   mode,
   callsTools,
+  configured,
   onOpenTools,
   onOpenAgents,
 }: AgentSettingsProps & { onOpenTools: () => void; onOpenAgents: () => void }) {
+  const servers =
+    settings.toolServers.length +
+    configured.filter((server) =>
+      settings.configuredToolServers.includes(server.label),
+    ).length;
   const tools = [
     callsTools && voiceBuiltinToolsOn(settings, mode) ? "Date and time" : null,
-    callsTools && settings.toolServers.length > 0
-      ? `${settings.toolServers.length} tool server${settings.toolServers.length === 1 ? "" : "s"}`
+    callsTools && servers > 0
+      ? `${servers} tool server${servers === 1 ? "" : "s"}`
       : null,
   ].filter(Boolean);
   const agents =
@@ -140,7 +149,13 @@ export function ToolsAndAgentsSection({
 }
 
 /** The tools the assistant may call: the built-in ones and tool servers. */
-export function ToolsView({ settings, onChange, mode, callsTools }: AgentSettingsProps) {
+export function ToolsView({
+  settings,
+  onChange,
+  mode,
+  callsTools,
+  configured,
+}: AgentSettingsProps) {
   const nameId = useId();
   const addressId = useId();
   const tokenId = useId();
@@ -184,12 +199,44 @@ export function ToolsView({ settings, onChange, mode, callsTools }: AgentSetting
         />
       </section>
 
+      {configured.length > 0 && (
+        <section className="flex flex-col">
+          <h3 className={sectionTitle}>Set up on this server</h3>
+          {configured.map((server) => (
+            <SwitchRow
+              key={server.label}
+              title={server.label}
+              detail={
+                server.transport === "stdio"
+                  ? "Runs as a program on the computer Izwi runs on"
+                  : "A tool server Izwi connects to"
+              }
+              checked={
+                callsTools && settings.configuredToolServers.includes(server.label)
+              }
+              disabled={!callsTools}
+              onCheckedChange={(checked) =>
+                onChange({
+                  configuredToolServers: checked
+                    ? [...settings.configuredToolServers, server.label]
+                    : settings.configuredToolServers.filter(
+                        (label) => label !== server.label,
+                      ),
+                })
+              }
+            />
+          ))}
+        </section>
+      )}
+
       <section className="flex flex-col gap-3">
         <h3 className={cn(sectionTitle, "mb-0")}>Tool servers</h3>
         <p className={note}>
           Connect an MCP server and the assistant can call its tools. Izwi
           connects to it from the server, which must allow the address in{" "}
-          <code className="text-xs">IZWI_MCP_ALLOWED_HOSTS</code>.
+          <code className="text-xs">IZWI_MCP_ALLOWED_HOSTS</code>. A server
+          that runs as a program is set up in Izwi’s{" "}
+          <code className="text-xs">mcp.json</code> file instead.
         </p>
         {settings.toolServers.length > 0 && (
           <ul className="flex flex-col">

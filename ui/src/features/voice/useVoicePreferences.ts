@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { api, type VoiceObservation } from "@/api";
+import {
+  api,
+  type VoiceConfiguredToolServer,
+  type VoiceObservation,
+} from "@/api";
 import {
   parseVoiceAgentSettings,
   type VoiceAgentSettings,
@@ -54,6 +58,25 @@ export function useVoicePreferences(onError?: (message: string) => void) {
   const [agentSettings, setAgentSettings] = useState<VoiceAgentSettings>(() =>
     parseVoiceAgentSettings(readStored(AGENT_SETTINGS_STORAGE_KEY)),
   );
+
+  // The MCP servers set up on the Izwi server; none when it has none.
+  const [configuredToolServers, setConfiguredToolServers] = useState<
+    VoiceConfiguredToolServer[]
+  >([]);
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .listVoiceToolServers()
+      .then((servers) => {
+        if (!cancelled) setConfiguredToolServers(servers);
+      })
+      .catch(() => {
+        // An older server has no such list: there are none to offer.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const [savedPrompt, setSavedPrompt] = useState(VOICE_AGENT_SYSTEM_PROMPT);
   const [defaultPrompt, setDefaultPrompt] = useState(VOICE_AGENT_SYSTEM_PROMPT);
@@ -208,6 +231,7 @@ export function useVoicePreferences(onError?: (message: string) => void) {
       setSpeaker,
       agentSettings,
       updateAgentSettings,
+      configuredToolServers,
       savedPrompt,
       defaultPrompt,
       isPromptCustom: savedPrompt.trim() !== defaultPrompt.trim(),
@@ -225,6 +249,7 @@ export function useVoicePreferences(onError?: (message: string) => void) {
     [
       agentSettings,
       compactModel,
+      configuredToolServers,
       defaultPrompt,
       engine,
       forgetAllMemories,
