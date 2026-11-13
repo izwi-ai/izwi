@@ -643,7 +643,8 @@ fn offered_tools(agents: &AgentSet, agent: &AgentDefinition, tools: &ToolRegistr
 
 fn handoff_note(target: &AgentDefinition) -> String {
     format!(
-        "The conversation is now with {}. Carry on from here.",
+        "Done: you are now {}. Answer the user directly in that role, following your new \
+         instructions. Do not announce the transfer.",
         target.name
     )
 }

@@ -122,18 +122,6 @@ impl VoiceTools {
         Ok(Some(tools))
     }
 
-    /// The tool definitions the model sees: the built-in ones, then the
-    /// client's.
-    pub(crate) fn definitions(&self) -> Vec<Value> {
-        let mut definitions = if self.builtin {
-            builtin_tool_registry().function_definitions(None)
-        } else {
-            Vec::new()
-        };
-        definitions.extend(self.client.iter().cloned());
-        definitions
-    }
-
     /// The tools as a turn's registry: the built-in ones, then the client's,
     /// each of which waits in `pending` for the client's output.
     pub(crate) fn registry(&self, pending: &PendingFunctionCalls) -> ToolRegistry {
@@ -365,10 +353,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let names = tools
-            .definitions()
-            .iter()
-            .map(|tool| tool["function"]["name"].as_str().unwrap().to_string())
-            .collect::<Vec<_>>();
+            .registry(&PendingFunctionCalls::default())
+            .tool_names();
         assert_eq!(names, ["time", "get_weather"]);
         assert_eq!(tools.timeout, Duration::from_secs(10));
         let registry = tools.registry(&PendingFunctionCalls::default());
@@ -381,7 +367,6 @@ mod tests {
         let tools = VoiceTools::parse(Some(vec![responses]), Some(false), Some(500), true)
             .unwrap()
             .unwrap();
-        assert_eq!(tools.definitions()[0]["function"]["name"], "lookup");
         assert_eq!(
             tools
                 .registry(&PendingFunctionCalls::default())

@@ -1425,9 +1425,12 @@ async fn handle_text_message(
                     let tts_variant = parse_tts_model_variant(tts_model_id.as_str())
                         .map_err(|err| format!("Unsupported TTS model: {err}"))?;
                     validate_realtime_tts_model(tts_variant)?;
+                    // Offering tools lengthens every turn's prompt, so a
+                    // modular session offers the built-in ones only when
+                    // asked.
                     let tools = VoiceTools::parse(
                         tools,
-                        builtin_tools,
+                        Some(builtin_tools.unwrap_or(false)),
                         function_call_timeout_ms,
                         ToolCallFormat::of(text_variant).is_some(),
                     )?;
