@@ -191,7 +191,7 @@ export function ToolsView({
           detail={
             mode === "modular"
               ? "Lets the assistant check today’s date and the time. Replies take a little longer while any tool is on."
-              : "Lets the assistant check today’s date and the time"
+              : "Rarely needed: the Compact engine is already told the date and time. With this on, it may read them out when you say hello."
           }
           checked={callsTools && voiceBuiltinToolsOn(settings)}
           disabled={!callsTools}

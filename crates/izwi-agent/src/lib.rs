@@ -25,6 +25,6 @@ pub use session::{
     TurnFinish, TurnInput,
 };
 pub use tools::{
-    function_definition, BackgroundResult, BackgroundResults, TimeTool, Tool, ToolCall,
-    ToolContext, ToolExecution, ToolOutput, ToolRegistry,
+    current_time_instruction, function_definition, BackgroundResult, BackgroundResults, TimeTool,
+    Tool, ToolCall, ToolContext, ToolExecution, ToolOutput, ToolRegistry,
 };

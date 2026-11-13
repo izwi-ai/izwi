@@ -2323,6 +2323,10 @@ fn spawn_turn_task(
                         background: &background_results,
                         voice_session_id: &voice_session_id,
                     });
+                    let instructions = unified_turn_instructions(
+                        &system_prompt,
+                        &izwi_agent::current_time_instruction(),
+                    );
                     let generation = stream_unified_s2s_to_socket(
                         &state,
                         &out_tx,
@@ -2331,7 +2335,7 @@ fn spawn_turn_task(
                         commit.utterance_seq,
                         &config.s2s_model_id,
                         config.speaker.clone(),
-                        &system_prompt,
+                        &instructions,
                         history_messages,
                         config.max_output_tokens,
                         config.output_format,
@@ -2688,6 +2692,18 @@ fn resolve_tool_wait_phrase(requested: Option<String>, language: Option<&str>) -
         None => language
             .is_none_or(|language| language.to_ascii_lowercase().starts_with("en"))
             .then(|| "One moment.".to_string()),
+    }
+}
+
+/// A unified turn's instructions: the session's, then the current local
+/// date and time (`now`, see [`izwi_agent::current_time_instruction`]). The
+/// model then knows them without a `time` tool, which LFM3-Audio calls on a
+/// plain greeting. A unified reply reads its whole prompt every turn, so a
+/// line that changes from turn to turn costs nothing.
+fn unified_turn_instructions(system_prompt: &str, now: &str) -> String {
+    match system_prompt.trim() {
+        "" => now.to_string(),
+        instructions => format!("{instructions}\n\n{now}"),
     }
 }
 
@@ -5315,6 +5331,16 @@ mod tests {
             Some("Ngicela ulinde.")
         );
         assert_eq!(phrase(Some(""), None), None);
+    }
+
+    #[test]
+    fn unified_turns_are_told_the_date_and_time_after_the_instructions() {
+        let now = "The current local date and time is Friday 13 November 2026, 19:45.";
+        assert_eq!(
+            unified_turn_instructions(" Be brief. ", now),
+            format!("Be brief.\n\n{now}")
+        );
+        assert_eq!(unified_turn_instructions("  ", now), now);
     }
 
     #[test]
