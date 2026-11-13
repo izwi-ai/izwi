@@ -4004,6 +4004,7 @@ fn map_typed_voice_event(
             status: match value.get("status").and_then(serde_json::Value::as_str) {
                 Some("ok") => RealtimeFunctionCallStatus::Ok,
                 Some("timeout") => RealtimeFunctionCallStatus::Timeout,
+                Some("started") => RealtimeFunctionCallStatus::Started,
                 _ => RealtimeFunctionCallStatus::Error,
             },
             output: json_str(value, "output"),

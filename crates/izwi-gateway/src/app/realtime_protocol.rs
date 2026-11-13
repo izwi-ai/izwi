@@ -454,6 +454,8 @@ pub enum RealtimeFunctionCallStatus {
     Ok,
     Error,
     Timeout,
+    /// A background tool is under way; its result reaches a later turn.
+    Started,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
