@@ -14,7 +14,7 @@ pub mod session;
 pub mod tools;
 
 pub use agent::{AgentDefinition, AgentSet, TaskSpec};
-pub use cancel::TurnCancel;
+pub use cancel::{TurnCancel, TurnGate};
 pub use engine::{AgentEngine, AgentTurnOptions, HistoryBudget, TurnContext};
 pub use errors::{AgentError, Result};
 pub use memory::{MemoryMessage, MemoryMessageMeta, MemoryMessageRole, MemoryStore};

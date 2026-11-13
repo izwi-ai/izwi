@@ -153,6 +153,7 @@ struct Harness {
     tools: ToolRegistry,
     cancel: TurnCancel,
     background: BackgroundResults,
+    confirmed: TurnGate,
     events: mpsc::UnboundedReceiver<AgentEvent>,
     listener: TurnEvents,
     session: AgentSession,
@@ -170,6 +171,7 @@ impl Harness {
             tools,
             cancel: TurnCancel::new(),
             background: BackgroundResults::default(),
+            confirmed: TurnGate::default(),
             events,
             listener: TurnEvents::new(tx),
             session: AgentSession {
@@ -191,6 +193,7 @@ impl Harness {
             events: self.listener.clone(),
             cancel: self.cancel.clone(),
             background: self.background.clone(),
+            confirmed: self.confirmed.clone(),
         };
         AgentEngine
             .run_turn(
@@ -726,4 +729,73 @@ async fn a_trimmed_history_carries_the_stores_summary() {
         .await
         .unwrap();
     assert_eq!(harness.model.requests()[1].messages[0].content, "Be brief.");
+}
+
+/// A turn started before it is confirmed writes its reply but runs no tool
+/// and stores nothing; confirming it lets the tools run, and cancelling it
+/// leaves no trace.
+#[tokio::test(start_paused = true)]
+async fn an_unconfirmed_turn_writes_its_reply_but_holds_its_tools() {
+    let unconfirmed = AgentTurnOptions {
+        persist_user_message: false,
+        persist_assistant_reply: false,
+        ..AgentTurnOptions::default()
+    };
+
+    // Confirmed while it waits at its first tool call.
+    let mut harness = Harness::new(vec![
+        calls("Let me check.", &[("lookup", "{}")]),
+        says("Here you go."),
+    ]);
+    harness.confirmed = TurnGate::closed();
+    let gate = harness.confirmed.clone();
+    let confirm = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        gate.open();
+    });
+    let started = tokio::time::Instant::now();
+    let result = harness.turn("Weather?", unconfirmed).await.unwrap();
+    confirm.await.unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "the tool waited"
+    );
+    assert_eq!(result.assistant_text, "Let me check. Here you go.");
+    assert_eq!(result.tool_calls[0].status, "ok");
+    assert!(
+        harness.stored().is_empty(),
+        "the caller stores a confirmed turn"
+    );
+    AgentEngine
+        .commit_user_message(&harness.memory, &harness.session, " Weather? ")
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.stored(),
+        [(MemoryMessageRole::User, "Weather?".to_string())]
+    );
+
+    // Never confirmed: the first round's text is there, the tool never ran.
+    let mut harness = Harness::new(vec![calls("Let me check.", &[("lookup", "{}")])]);
+    harness.confirmed = TurnGate::closed();
+    let cancel = harness.cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        cancel.cancel();
+    });
+    let result = harness.turn("Weather?", unconfirmed).await.unwrap();
+    assert_eq!(result.finish, TurnFinish::Cancelled);
+    assert_eq!(result.assistant_text, "Let me check.");
+    assert!(result.tool_calls.is_empty());
+    assert!(harness.stored().is_empty());
+    assert!(!harness
+        .heard()
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. })));
+
+    // A reply without calls needs no confirmation to finish.
+    let mut harness = Harness::new(vec![says("Hello.")]);
+    harness.confirmed = TurnGate::closed();
+    let result = harness.turn("Hi", unconfirmed).await.unwrap();
+    assert_eq!(result.finish, TurnFinish::Completed);
 }

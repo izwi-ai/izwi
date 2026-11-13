@@ -4,7 +4,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::agent::{AgentDefinition, AgentSet};
-use crate::cancel::TurnCancel;
+use crate::cancel::{TurnCancel, TurnGate};
 use crate::errors::{AgentError, Result};
 use crate::memory::{MemoryMessage, MemoryMessageMeta, MemoryMessageRole, MemoryStore};
 use crate::model::{ModelBackend, ModelRequest};
@@ -42,6 +42,10 @@ pub struct AgentTurnOptions {
     /// interrupted reply was only partly heard) stores it with
     /// [`AgentEngine::commit_assistant_reply`] instead.
     pub persist_assistant_reply: bool,
+    /// Whether the turn stores the user's message. A caller that starts a
+    /// turn before it is confirmed stores it with
+    /// [`AgentEngine::commit_user_message`] once it is.
+    pub persist_user_message: bool,
 }
 
 impl Default for AgentTurnOptions {
@@ -56,6 +60,7 @@ impl Default for AgentTurnOptions {
             parallel_tool_calls: false,
             history: HistoryBudget::default(),
             persist_assistant_reply: true,
+            persist_user_message: true,
         }
     }
 }
@@ -126,6 +131,10 @@ pub struct TurnContext<'a, M, B> {
     pub cancel: TurnCancel,
     /// The session's background tool results.
     pub background: BackgroundResults,
+    /// Closed while the turn is not yet confirmed: the reply's text is
+    /// written, but no tool runs, no agent takes over and no task is
+    /// recorded until it opens.
+    pub confirmed: TurnGate,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -156,14 +165,10 @@ impl AgentEngine {
         let stored = ctx.memory.load_messages(&session.thread_id).await?;
         let stored_len = stored.len();
         let history = options.history.apply(stored);
-        ctx.memory
-            .append_message(
-                &session.thread_id,
-                MemoryMessageRole::User,
-                user_text.clone(),
-                MemoryMessageMeta::default(),
-            )
-            .await?;
+        if options.persist_user_message {
+            self.commit_user_message(ctx.memory, session, &user_text)
+                .await?;
+        }
 
         // One leading system message: chat templates such as Qwen3.5's reject
         // a system message anywhere else, so the memory context joins the
@@ -313,6 +318,15 @@ impl AgentEngine {
                 output.text.clone(),
                 output.tool_calls.clone(),
             ));
+            // Calls have effects: an unconfirmed turn waits here.
+            tokio::select! {
+                biased;
+                () = ctx.cancel.cancelled() => {
+                    finish = TurnFinish::Cancelled;
+                    break;
+                }
+                () = ctx.confirmed.wait_open() => {}
+            }
 
             let routes = output
                 .tool_calls
@@ -459,6 +473,23 @@ impl AgentEngine {
             generation_time_ms: turn.generation_time_ms,
             events: log.events,
         })
+    }
+
+    /// Store the user's message of a turn in the session's thread.
+    pub async fn commit_user_message<M: MemoryStore>(
+        &self,
+        memory: &M,
+        session: &AgentSession,
+        text: &str,
+    ) -> Result<()> {
+        memory
+            .append_message(
+                &session.thread_id,
+                MemoryMessageRole::User,
+                text.trim().to_string(),
+                MemoryMessageMeta::default(),
+            )
+            .await
     }
 
     /// Store an assistant reply in the session's thread, without its
