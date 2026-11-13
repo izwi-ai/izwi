@@ -86,6 +86,7 @@
         "root": "features/index",
         "pages": [
           "features/voice",
+          "features/voice-agents",
           "features/dictation",
           "features/telephony",
           "features/chat",

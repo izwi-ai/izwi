@@ -101,6 +101,10 @@ client declares in `input_stream_start` and answers with
 speaks the answer. See
 [Voice Realtime](/api#voice-realtime) for the fields and events.
 
+Tools, tool servers, agents that hand over to each other, and the switches
+for how Izwi takes turns are set in **Voice settings**. The
+[Voice agents](/features/voice-agents) guide walks through them.
+
 ---
 
 ## Tips for Best Results
