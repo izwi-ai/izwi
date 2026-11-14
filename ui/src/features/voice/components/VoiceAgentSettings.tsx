@@ -112,7 +112,7 @@ export function ToolsAndAgentsSection({
       settings.configuredToolServers.includes(server.label),
     ).length;
   const tools = [
-    callsTools && voiceBuiltinToolsOn(settings, mode) ? "Date and time" : null,
+    callsTools && voiceBuiltinToolsOn(settings) ? "Date and time" : null,
     callsTools && servers > 0
       ? `${servers} tool server${servers === 1 ? "" : "s"}`
       : null,
@@ -191,9 +191,9 @@ export function ToolsView({
           detail={
             mode === "modular"
               ? "Lets the assistant check today’s date and the time. Replies take a little longer while any tool is on."
-              : "Lets the assistant check today’s date and the time"
+              : "Rarely needed: the Compact engine is already told the date and time. With this on, it may read them out when you say hello."
           }
-          checked={callsTools && voiceBuiltinToolsOn(settings, mode)}
+          checked={callsTools && voiceBuiltinToolsOn(settings)}
           disabled={!callsTools}
           onCheckedChange={(checked) => onChange({ builtinTools: checked })}
         />

@@ -20,6 +20,9 @@ pub(crate) const TEXT_END: u32 = 125_014;
 pub(crate) const MIXED_START: u32 = 125_015;
 /// `<|mixed_end|>`: closes LiveASR's final chunk.
 pub(crate) const MIXED_END: u32 = 125_016;
+/// `<tool_call>`: opens a function call. An added token that is not
+/// special, so it decodes as text.
+pub(crate) const TOOL_CALL: u32 = 125_019;
 /// One encoded input-speech frame.
 pub(crate) const AUDIO_PLACEHOLDER: u32 = 125_031;
 /// One generated speech frame in a prompt.

@@ -132,6 +132,9 @@ export function useVoiceSession({
   const voiceUserEntryIdsRef = useRef<Map<string, string>>(new Map());
   const voiceAssistantEntryIdsRef = useRef<Map<string, string>>(new Map());
   const voiceEventEntryIdsRef = useRef<Map<string, string>>(new Map());
+  /** Each utterance's assistant lines (its reply and events): its user line
+   * goes before them, whichever arrives first. */
+  const voiceReplyEntryIdsRef = useRef<Map<string, Set<string>>>(new Map());
   const voiceWsPlaybackRef = useRef<{
     utteranceId: string;
     utteranceSeq: number;
@@ -316,6 +319,7 @@ export function useVoiceSession({
     voiceUserEntryIdsRef.current.clear();
     voiceAssistantEntryIdsRef.current.clear();
     voiceEventEntryIdsRef.current.clear();
+    voiceReplyEntryIdsRef.current.clear();
 
     analyserRef.current = null;
     clearAudioPlayback();
@@ -341,6 +345,13 @@ export function useVoiceSession({
 
   const appendTranscriptEntry = useCallback((entry: TranscriptEntry) => {
     setTranscript((prev) => [...prev, entry]);
+  }, []);
+
+  /** Note `entryId` as one of the assistant's lines for `utteranceId`. */
+  const noteReplyEntry = useCallback((utteranceId: string, entryId: string) => {
+    const lines = voiceReplyEntryIdsRef.current.get(utteranceId) ?? new Set();
+    lines.add(entryId);
+    voiceReplyEntryIdsRef.current.set(utteranceId, lines);
   }, []);
 
   const setTranscriptEntryText = useCallback(
@@ -371,6 +382,7 @@ export function useVoiceSession({
       const known = voiceEventEntryIdsRef.current.get(line.key);
       const entryId = known ?? makeTranscriptEntryId("assistant");
       voiceEventEntryIdsRef.current.set(line.key, entryId);
+      noteReplyEntry(utteranceId, entryId);
       const replyId = voiceAssistantEntryIdsRef.current.get(utteranceId);
       setTranscript((prev) => {
         const entry: TranscriptEntry = {
@@ -394,7 +406,7 @@ export function useVoiceSession({
         return [...prev, entry];
       });
     },
-    [],
+    [noteReplyEntry],
   );
 
   const removeTranscriptEntry = useCallback((entryId: string) => {
@@ -532,6 +544,9 @@ export function useVoiceSession({
   /**
    * The transcript line of one utterance, added on its first event. The
    * typed protocol sends no start events, so any text event may be first.
+   * The user's line goes before the assistant's lines of the same utterance:
+   * the compact engine can start its reply before the words it heard
+   * arrive.
    */
   const transcriptEntryId = useCallback(
     (role: "user" | "assistant", utteranceId: string) => {
@@ -543,15 +558,27 @@ export function useVoiceSession({
       if (existing) return existing;
       const entryId = makeTranscriptEntryId(role);
       ids.set(utteranceId, entryId);
-      appendTranscriptEntry({
+      const entry: TranscriptEntry = {
         id: entryId,
         role,
         text: "",
         timestamp: Date.now(),
+      };
+      if (role === "assistant") {
+        noteReplyEntry(utteranceId, entryId);
+        appendTranscriptEntry(entry);
+        return entryId;
+      }
+      const reply = voiceReplyEntryIdsRef.current.get(utteranceId);
+      setTranscript((prev) => {
+        const at = reply ? prev.findIndex((item) => reply.has(item.id)) : -1;
+        return at === -1
+          ? [...prev, entry]
+          : [...prev.slice(0, at), entry, ...prev.slice(at)];
       });
       return entryId;
     },
-    [appendTranscriptEntry],
+    [appendTranscriptEntry, noteReplyEntry],
   );
 
   const appendTranscriptText = useCallback((entryId: string, delta: string) => {
@@ -1170,6 +1197,7 @@ export function useVoiceSession({
     voiceUserEntryIdsRef.current.clear();
     voiceAssistantEntryIdsRef.current.clear();
     voiceEventEntryIdsRef.current.clear();
+    voiceReplyEntryIdsRef.current.clear();
     isMicMutedRef.current = false;
     setIsMicMuted(false);
     isSessionActiveRef.current = true;

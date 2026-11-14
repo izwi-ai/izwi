@@ -79,6 +79,27 @@ pub(crate) enum Lfm3AudioMode {
     Interleaved,
 }
 
+/// How a reply may open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lfm3AudioOpening {
+    /// With whatever the model samples.
+    Free,
+    /// With a function call or with speech, the model card's contract for a
+    /// reply offered tools. Its prompt leaves the assistant turn open; any
+    /// other first token would answer in text alone, with no speech.
+    CallOrSpeech,
+}
+
+/// The first token of a reply offered tools: a sampled `<tool_call>`
+/// stands, anything else opens speech (`<|mixed_start|>`) instead.
+pub(crate) fn open_tool_reply(token: u32) -> u32 {
+    if token == TOOL_CALL {
+        TOOL_CALL
+    } else {
+        MIXED_START
+    }
+}
+
 /// One generation's inputs.
 pub(crate) struct Lfm3AudioRequest {
     pub(crate) prompt: Vec<PromptPart>,
@@ -89,6 +110,7 @@ pub(crate) struct Lfm3AudioRequest {
     /// Keep the reply in text: forbid `<|audio_start|>` and
     /// `<|mixed_start|>`.
     pub(crate) text_only: bool,
+    pub(crate) opening: Lfm3AudioOpening,
     /// Slots (text tokens and frames) to generate at most.
     pub(crate) max_slots: usize,
     pub(crate) text_sampling: Lfm3TextSampling,
@@ -130,6 +152,9 @@ pub(crate) struct Lfm3AudioRow {
     codec: LiquidCodecStream,
     pending_frames: Vec<[u32; CODEBOOKS]>,
     mode: Lfm3AudioMode,
+    /// How the first text token may open the reply; [`Lfm3AudioOpening::Free`]
+    /// once it has.
+    opening: Lfm3AudioOpening,
     slots_left: usize,
     speaking: bool,
     text_done: bool,
@@ -272,6 +297,7 @@ pub(crate) fn asr_request(
         clips: vec![audio],
         mode: Lfm3AudioMode::Text,
         text_only: true,
+        opening: Lfm3AudioOpening::Free,
         max_slots: max_tokens.max(1),
         text_sampling: Lfm3TextSampling::default(),
         audio_sampling: Lfm3AudioSampling::default(),
@@ -295,6 +321,7 @@ pub(crate) fn tts_request(
         clips: Vec::new(),
         mode: Lfm3AudioMode::Audio,
         text_only: false,
+        opening: Lfm3AudioOpening::Free,
         // The end-of-audio frame and the closing `<|im_end|>`.
         max_slots: max_frames.max(1) + 2,
         text_sampling: Lfm3TextSampling::default(),
@@ -305,8 +332,8 @@ pub(crate) fn tts_request(
 
 /// A voice reply to `messages` (see [`reply_prompt`]): interleaved text and
 /// speech, the encoder embeddings `clips` filling the prompt's speech slots
-/// in order, at most `max_slots` slots. A reply that may call tools starts
-/// in text and moves to speech at `<|mixed_start|>`.
+/// in order, at most `max_slots` slots. A reply that may call tools opens
+/// with `<tool_call>` or with `<|mixed_start|>` (see [`open_tool_reply`]).
 pub(crate) fn reply_request(
     messages: &[ChatMessage],
     clips: Vec<Tensor>,
@@ -324,16 +351,17 @@ pub(crate) fn reply_request(
             clips.len()
         )));
     }
-    let mode = if tools.is_empty() {
-        Lfm3AudioMode::Interleaved
+    let (mode, opening) = if tools.is_empty() {
+        (Lfm3AudioMode::Interleaved, Lfm3AudioOpening::Free)
     } else {
-        Lfm3AudioMode::Text
+        (Lfm3AudioMode::Text, Lfm3AudioOpening::CallOrSpeech)
     };
     Ok(Lfm3AudioRequest {
         prompt,
         clips,
         mode,
         text_only: false,
+        opening,
         max_slots: max_slots.max(1),
         text_sampling,
         audio_sampling,
@@ -648,6 +676,7 @@ impl Lfm3AudioModel {
             codec: LiquidCodecStream::default(),
             pending_frames: Vec::new(),
             mode: request.mode,
+            opening: request.opening,
             slots_left: INTERLEAVED_TEXT,
             speaking: false,
             text_done: false,
@@ -771,13 +800,17 @@ impl Lfm3AudioModel {
             for id in &row.suppress {
                 scores[*id as usize] = f32::NEG_INFINITY;
             }
-            let token = sample(
+            let mut token = sample(
                 &mut scores,
                 row.text_sampling.temperature,
                 row.text_sampling.top_k,
                 row.text_sampling.top_p,
                 &mut row.rng,
             );
+            if row.opening == Lfm3AudioOpening::CallOrSpeech {
+                row.opening = Lfm3AudioOpening::Free;
+                token = open_tool_reply(token);
+            }
             if row.text_sampling.repetition_window > 0 {
                 if row.text_history.len() == row.text_sampling.repetition_window {
                     row.text_history.pop_front();

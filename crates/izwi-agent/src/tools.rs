@@ -225,6 +225,24 @@ where
     now.format("%A %-d %B %Y, %H:%M (UTC%:z)").to_string()
 }
 
+/// "The current local date and time is Monday 20 October 2026, 14:05.": an
+/// instructions line for a model that should know the date and time without
+/// calling [`TimeTool`]. It leaves out the UTC offset, which a voice reads
+/// out ("UTC plus two hours").
+pub fn current_time_instruction() -> String {
+    time_instruction(chrono::Local::now())
+}
+
+fn time_instruction<Tz: chrono::TimeZone>(now: chrono::DateTime<Tz>) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    format!(
+        "The current local date and time is {}.",
+        now.format("%A %-d %B %Y, %H:%M")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +284,19 @@ mod tests {
         assert_eq!(
             readable_now(now),
             "Tuesday 20 October 2026, 14:05 (UTC+02:00)"
+        );
+    }
+
+    #[test]
+    fn the_time_instruction_has_no_offset() {
+        use chrono::TimeZone;
+        let now = chrono::FixedOffset::east_opt(2 * 3600)
+            .unwrap()
+            .with_ymd_and_hms(2026, 11, 13, 9, 5, 0)
+            .unwrap();
+        assert_eq!(
+            time_instruction(now),
+            "The current local date and time is Friday 13 November 2026, 09:05."
         );
     }
 }

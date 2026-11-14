@@ -400,6 +400,7 @@ impl RuntimeService {
             system_prompt,
             correlation_id,
             runtime_context,
+            |_: &str| {},
             on_chunk,
         )
         .await
@@ -411,7 +412,13 @@ impl RuntimeService {
     /// `messages` (the spoken turn as its `<|audio|>` user turn, then the
     /// calls and their results) and `transcribe: false`, as the first round
     /// already transcribed the turn.
-    pub async fn speech_to_speech_round_streaming_bytes<F, Fut>(
+    ///
+    /// LFM3-Audio transcribes the turn beside the reply; `on_transcript`
+    /// gets that transcript the moment it is ready, usually while the reply
+    /// still streams. A model that reports its transcript with the reply
+    /// leaves it to the result's `input_transcription`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn speech_to_speech_round_streaming_bytes<F, Fut, T>(
         &self,
         variant: ModelVariant,
         audio_bytes: &[u8],
@@ -422,11 +429,13 @@ impl RuntimeService {
         system_prompt: Option<&str>,
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
+        on_transcript: T,
         mut on_chunk: F,
     ) -> Result<SpeechToSpeechGeneration>
     where
         F: FnMut(StreamingOutput) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<()>> + Send,
+        T: FnOnce(&str) + Send,
     {
         if !tools.is_empty() && variant.family() != ModelFamily::Lfm3Audio {
             return Err(Error::InvalidInput(format!(
@@ -473,13 +482,18 @@ impl RuntimeService {
             if !transcribe {
                 return Ok(None);
             }
-            self.lfm3_audio_turn_transcript(
-                variant,
-                SpeechAudioInput::Bytes(audio_bytes),
-                correlation_id,
-                runtime_context,
-            )
-            .await
+            let transcript = self
+                .lfm3_audio_turn_transcript(
+                    variant,
+                    SpeechAudioInput::Bytes(audio_bytes),
+                    correlation_id,
+                    runtime_context,
+                )
+                .await?;
+            if let Some(text) = transcript.as_deref() {
+                on_transcript(text);
+            }
+            Ok::<_, Error>(transcript)
         };
         let ((output, streamed_text, streamed_samples, streamed_sample_rate), transcript) =
             tokio::try_join!(reply, transcript)?;
