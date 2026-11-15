@@ -196,7 +196,7 @@ impl SovTranscribeConfig {
                 frontend.window_frames, encoder.positions
             )));
         }
-        if downsample_factor == 0 || encoder.positions % downsample_factor != 0 {
+        if downsample_factor == 0 || !encoder.positions.is_multiple_of(downsample_factor) {
             return Err(invalid("the frame stacking does not divide a window"));
         }
         let eos_token_ids = match generation.get("eos_token_id") {
@@ -262,7 +262,8 @@ impl SovTranscribeConfig {
             ffn: usize_of(a, "encoder_ffn_dim")?,
             positions: usize_of(a, "max_source_positions")?,
         };
-        if encoder.heads == 0 || encoder.width % encoder.heads != 0 || encoder.layers == 0 {
+        if encoder.heads == 0 || !encoder.width.is_multiple_of(encoder.heads) || encoder.layers == 0
+        {
             return Err(invalid("the encoder width is not a whole number of heads"));
         }
         Ok(encoder)
@@ -346,9 +347,9 @@ impl SovTranscribeConfig {
         for geometry in [&sliding, &full] {
             if geometry.heads == 0
                 || geometry.kv_heads == 0
-                || geometry.heads % geometry.kv_heads != 0
+                || !geometry.heads.is_multiple_of(geometry.kv_heads)
                 || geometry.head_dim == 0
-                || geometry.head_dim % 2 != 0
+                || !geometry.head_dim.is_multiple_of(2)
                 || geometry.rotary_pairs == 0
                 || geometry.rotary_pairs > geometry.head_dim / 2
                 || geometry.window == Some(0)

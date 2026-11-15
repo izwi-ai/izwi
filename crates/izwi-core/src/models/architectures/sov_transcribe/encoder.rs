@@ -270,7 +270,7 @@ impl SovProjector {
     /// `[windows, positions / downsample, hidden]`.
     pub fn forward(&self, encoded: &Tensor) -> Result<Tensor> {
         let (windows, frames, width) = encoded.dims3()?;
-        if frames % self.downsample != 0 {
+        if !frames.is_multiple_of(self.downsample) {
             return Err(Error::InferenceError(
                 "the encoder output is not a whole number of stacked frames".into(),
             ));

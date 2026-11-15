@@ -126,6 +126,18 @@ fn print_models_table(models: &[ModelRecord], detailed: bool) {
     );
 }
 
+fn status_cell(status: &str) -> Cell {
+    let color = match status {
+        "ready" | "downloaded" => Color::Green,
+        "downloading" => Color::Yellow,
+        "loading" => Color::Blue,
+        "error" => Color::Red,
+        "not_downloaded" => Color::DarkGrey,
+        _ => Color::DarkGrey,
+    };
+    Cell::new(status).fg(color)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,16 +167,4 @@ mod tests {
         .unwrap();
         assert_eq!(runs_here.status_label(), "not_downloaded");
     }
-}
-
-fn status_cell(status: &str) -> Cell {
-    let color = match status {
-        "ready" | "downloaded" => Color::Green,
-        "downloading" => Color::Yellow,
-        "loading" => Color::Blue,
-        "error" => Color::Red,
-        "not_downloaded" => Color::DarkGrey,
-        _ => Color::DarkGrey,
-    };
-    Cell::new(status).fg(color)
 }
