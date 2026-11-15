@@ -5919,6 +5919,7 @@ mod tests {
             ModelFamily::VoxtralTts,
             ModelFamily::GraniteSpeechAsr,
             ModelFamily::GraniteSpeech5Asr,
+            ModelFamily::SovTranscribeAsr,
         ] {
             assert!(stage_sets_batch_rows(family), "{family:?}");
         }
@@ -5926,7 +5927,6 @@ mod tests {
             ModelFamily::Qwen3Chat,
             ModelFamily::Gemma3Chat,
             ModelFamily::NemotronTranscribeAsr,
-            ModelFamily::SovTranscribeAsr,
             ModelFamily::Lfm25Audio,
             ModelFamily::Lfm3Audio,
             ModelFamily::KokoroTts,
