@@ -38,7 +38,8 @@ impl Rope {
         &self.inv_freq
     }
 
-    /// `(cos, sin)` `[positions, 1, head_dim / 2]` in `dtype`.
+    /// `(cos, sin)` `[positions, 1, head_dim / 2]` in `dtype`, computed on
+    /// the host (the reference for [`RopeTables`]).
     pub fn tables(
         &self,
         positions: &[usize],
@@ -61,13 +62,55 @@ impl Rope {
         ))
     }
 
-    /// Rotates `x [positions, heads, head_dim]`.
-    pub fn apply(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        let first = x.narrow(2, 0, self.half)?;
-        let second = x.narrow(2, self.half, self.half)?;
-        let rotated_first = (first.broadcast_mul(cos)? - second.broadcast_mul(sin)?)?;
-        let rotated_second = (second.broadcast_mul(cos)? + first.broadcast_mul(sin)?)?;
-        Ok(Tensor::cat(&[&rotated_first, &rotated_second], 2)?)
+    /// Every position's `(cos, sin)` up to `positions`, resident on `device`.
+    pub fn resident(&self, positions: usize, device: &Device, dtype: DType) -> Result<RopeTables> {
+        let all = (0..positions).collect::<Vec<_>>();
+        let (cos, sin) = self.tables(&all, device, dtype)?;
+        Ok(RopeTables {
+            half: self.half,
+            cos: cos.squeeze(1)?,
+            sin: sin.squeeze(1)?,
+        })
+    }
+}
+
+/// Rotates `x [positions, heads, head_dim]` by `(cos, sin)`
+/// `[positions, 1, head_dim / 2]` (`rotate_half`).
+pub fn apply(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let half = cos.dim(2)?;
+    let first = x.narrow(2, 0, half)?;
+    let second = x.narrow(2, half, half)?;
+    let rotated_first = (first.broadcast_mul(cos)? - second.broadcast_mul(sin)?)?;
+    let rotated_second = (second.broadcast_mul(cos)? + first.broadcast_mul(sin)?)?;
+    Ok(Tensor::cat(&[&rotated_first, &rotated_second], 2)?)
+}
+
+/// One geometry's `(cos, sin)` for every position of the context, resident
+/// on the device: a step gathers its rows by a positions tensor instead of
+/// building and uploading tables per layer.
+pub struct RopeTables {
+    half: usize,
+    /// `[positions, head_dim / 2]`.
+    cos: Tensor,
+    sin: Tensor,
+}
+
+impl RopeTables {
+    /// `(cos, sin)` `[n, 1, head_dim / 2]` of `positions` (U32 `[n]`).
+    pub fn gather(&self, positions: &Tensor) -> Result<(Tensor, Tensor)> {
+        let n = positions.dim(0)?;
+        Ok((
+            self.cos
+                .index_select(positions, 0)?
+                .reshape((n, 1, self.half))?,
+            self.sin
+                .index_select(positions, 0)?
+                .reshape((n, 1, self.half))?,
+        ))
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        2 * self.cos.elem_count() * self.cos.dtype().size_in_bytes()
     }
 }
 
@@ -109,8 +152,16 @@ mod tests {
         let values = (1..=8).map(|v| v as f32).collect::<Vec<_>>();
         let x = Tensor::from_vec(values.clone(), (1, 1, 8), &Device::Cpu).unwrap();
         let (cos, sin) = rope.tables(&[3], &Device::Cpu, DType::F32).unwrap();
-        let out = rope
-            .apply(&x, &cos, &sin)
+        // The resident tables gather the same rows.
+        let resident = rope.resident(5, &Device::Cpu, DType::F32).unwrap();
+        let (gathered, _) = resident
+            .gather(&Tensor::new(&[3u32], &Device::Cpu).unwrap())
+            .unwrap();
+        assert_eq!(
+            gathered.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            cos.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        let out = apply(&x, &cos, &sin)
             .unwrap()
             .flatten_all()
             .unwrap()

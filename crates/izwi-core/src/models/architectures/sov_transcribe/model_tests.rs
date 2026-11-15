@@ -129,11 +129,10 @@ fn the_synthetic_checkpoint_passes_the_census_and_loads_on_cpu() {
     assert_eq!(model.window_seconds(), 0.24);
     assert_eq!(model.audio_token_rate(), 12.5);
     assert_eq!(summary["head_tied"], true);
-    // The tied head is not resident twice: everything else, widened from
-    // BF16 to the reference's F32, is at most twice what the shards store.
+    // The tied head is not resident twice (and the rotation tables are);
+    // `residency::tests` pins the exact figure against the load plan.
     let stored = checkpoint.uploaded_bytes();
     assert!(model.resident_bytes() as u64 > stored);
-    assert!(model.resident_bytes() as u64 <= 2 * stored);
 }
 
 #[test]

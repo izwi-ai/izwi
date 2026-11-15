@@ -92,16 +92,19 @@ impl MoeBackend {
     }
 }
 
+/// The dense MLP, gate and up projections as one `[gate; up]` weight.
 pub struct DenseMlp {
-    gate: Tensor,
-    up: Tensor,
+    gate_up: Tensor,
     down: Tensor,
+    width: usize,
 }
 
 impl DenseMlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = linear(x, &self.gate, None)?.gelu()?;
-        linear(&(gate * linear(x, &self.up, None)?)?, &self.down, None)
+        let gate_up = linear(x, &self.gate_up, None)?;
+        let gate = gate_up.narrow(1, 0, self.width)?.gelu()?;
+        let up = gate_up.narrow(1, self.width, self.width)?;
+        linear(&(gate * up)?, &self.down, None)
     }
 }
 
@@ -169,9 +172,15 @@ impl SovFeedForward {
         let get =
             |name: &str, dtype: DType| checkpoint.tensor(&format!("{l}.{name}"), device, dtype);
         let mlp = DenseMlp {
-            gate: get("mlp.gate_proj.weight", dtype)?,
-            up: get("mlp.up_proj.weight", dtype)?,
+            gate_up: Tensor::cat(
+                &[
+                    get("mlp.gate_proj.weight", dtype)?,
+                    get("mlp.up_proj.weight", dtype)?,
+                ],
+                0,
+            )?,
             down: get("mlp.down_proj.weight", dtype)?,
+            width: d.mlp_width,
         };
         let router = Router {
             norm: RmsNorm::without_scale(d.norm_eps),
@@ -184,16 +193,10 @@ impl SovFeedForward {
             per_expert_scale: checkpoint.host_f32(&format!("{l}.router.per_expert_scale"))?,
             width: d.expert_width,
         };
-        let resident_bytes = [
-            &mlp.gate,
-            &mlp.up,
-            &mlp.down,
-            &experts.gate_up,
-            &experts.down,
-        ]
-        .iter()
-        .map(|t| t.elem_count() * dtype.size_in_bytes())
-        .sum::<usize>()
+        let resident_bytes = [&mlp.gate_up, &mlp.down, &experts.gate_up, &experts.down]
+            .iter()
+            .map(|t| t.elem_count() * dtype.size_in_bytes())
+            .sum::<usize>()
             + (router.scale.elem_count() + router.proj.elem_count()) * 4;
         let per_expert_scale =
             Tensor::from_vec(experts.per_expert_scale.clone(), d.experts, device)?;

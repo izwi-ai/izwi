@@ -9,6 +9,7 @@
 //! | Decoder norm gains, router projection and scale | F32 |
 //! | `per_expert_scale` | host F32 |
 //! | `lm_head.weight` | not loaded (tied to the embedding) |
+//! | Rotation tables (cos, sin for every context position) | the compute dtype (48 MiB in BF16) |
 
 use super::checkpoint::{expected_census, LM_HEAD};
 use super::config::SovTranscribeConfig;
@@ -50,6 +51,12 @@ pub fn residency(config: &SovTranscribeConfig, compute_bytes: u64) -> SovResiden
             out.largest_tensor_bytes = out.largest_tensor_bytes.max(elements * 2);
         }
     }
+    // The rotation tables, `(cos, sin)` per position for each geometry.
+    let d = &config.decoder;
+    out.device_bytes += (super::decoder::ROPE_POSITIONS
+        * (d.sliding.head_dim / 2 + d.full.head_dim / 2)
+        * 2) as u64
+        * compute_bytes;
     out
 }
 

@@ -10,6 +10,10 @@
 //! * Sliding layers see `window` keys, the query's own position included.
 //!
 //! The KV domain stores rotated keys.
+//!
+//! The q, k and v projections are one weight (`[q; k; v]` rows, v absent on
+//! full layers), so a step runs one product per layer instead of three; the
+//! rotation tables come from the decoder, gathered once per step.
 
 use candle_core::{DType, Device, Tensor};
 
@@ -17,20 +21,19 @@ use super::super::checkpoint::{SovCheckpoint, DECODER_PREFIX};
 use super::super::config::{SovAttentionGeometry, SovTranscribeConfig};
 use super::super::encoder::linear;
 use super::norm::RmsNorm;
-use super::rope::Rope;
+use super::rope;
 use crate::error::Result;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 
 pub struct SovAttention {
     geometry: SovAttentionGeometry,
-    q_proj: Tensor,
-    k_proj: Tensor,
-    v_proj: Option<Tensor>,
+    /// `[q; k; v]` rows: `heads * d`, `kv_heads * d` and (sliding layers)
+    /// `kv_heads * d`.
+    qkv_proj: Tensor,
     o_proj: Tensor,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     v_norm: RmsNorm,
-    rope: Rope,
     resident_bytes: usize,
 }
 
@@ -46,28 +49,24 @@ impl SovAttention {
         let eps = config.decoder.norm_eps;
         let x = format!("{DECODER_PREFIX}.layers.{layer}.self_attn");
         let weight = |name: &str| checkpoint.tensor(&format!("{x}.{name}.weight"), device, dtype);
-        let q_proj = weight("q_proj")?;
-        let k_proj = weight("k_proj")?;
-        let v_proj = geometry.own_values.then(|| weight("v_proj")).transpose()?;
+        let mut parts = vec![weight("q_proj")?, weight("k_proj")?];
+        if geometry.own_values {
+            parts.push(weight("v_proj")?);
+        }
+        let qkv_proj = Tensor::cat(&parts, 0)?;
+        drop(parts);
         let o_proj = weight("o_proj")?;
-        let resident_bytes = [Some(&q_proj), Some(&k_proj), v_proj.as_ref(), Some(&o_proj)]
-            .into_iter()
-            .flatten()
-            .map(|t| t.elem_count() * dtype.size_in_bytes())
-            .sum::<usize>();
+        let resident_bytes = (qkv_proj.elem_count() + o_proj.elem_count()) * dtype.size_in_bytes();
         let q_norm = RmsNorm::load(checkpoint, &format!("{x}.q_norm.weight"), device, eps)?;
         let k_norm = RmsNorm::load(checkpoint, &format!("{x}.k_norm.weight"), device, eps)?;
         let resident_bytes = resident_bytes + q_norm.resident_bytes() + k_norm.resident_bytes();
         Ok(Self {
             geometry,
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
             q_norm,
             k_norm,
             v_norm: RmsNorm::without_scale(eps),
-            rope: Rope::new(&geometry),
             resident_bytes,
         })
     }
@@ -80,21 +79,34 @@ impl SovAttention {
         self.resident_bytes
     }
 
-    /// Projects `h [n, hidden]`, whose tokens sit at `positions`, to
-    /// `(q [n, heads, d], k [n, kv_heads, d], v [n, kv_heads, d])`.
-    pub fn project(&self, h: &Tensor, positions: &[usize]) -> Result<(Tensor, Tensor, Tensor)> {
+    /// Projects `h [n, hidden]` to `(q [n, heads, d], k [n, kv_heads, d],
+    /// v [n, kv_heads, d])`, q and k rotated by `(cos, sin)`
+    /// `[n, 1, d / 2]` (the tokens' rows of this geometry's tables).
+    pub fn project(
+        &self,
+        h: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let g = &self.geometry;
         let n = h.dim(0)?;
-        let (cos, sin) = self.rope.tables(positions, h.device(), h.dtype())?;
-        let q = linear(h, &self.q_proj, None)?.reshape((n, g.heads, g.head_dim))?;
-        let q = self.rope.apply(&self.q_norm.forward(&q)?, &cos, &sin)?;
-        let raw_k = linear(h, &self.k_proj, None)?.reshape((n, g.kv_heads, g.head_dim))?;
-        let v = match &self.v_proj {
-            Some(v_proj) => linear(h, v_proj, None)?.reshape((n, g.kv_heads, g.head_dim))?,
-            None => raw_k.clone(),
+        let (q_rows, kv_rows) = (g.heads * g.head_dim, g.kv_heads * g.head_dim);
+        let qkv = linear(h, &self.qkv_proj, None)?;
+        let q = qkv
+            .narrow(1, 0, q_rows)?
+            .reshape((n, g.heads, g.head_dim))?;
+        let q = rope::apply(&self.q_norm.forward(&q)?, cos, sin)?;
+        let raw_k = qkv
+            .narrow(1, q_rows, kv_rows)?
+            .reshape((n, g.kv_heads, g.head_dim))?;
+        let v = if g.own_values {
+            qkv.narrow(1, q_rows + kv_rows, kv_rows)?
+                .reshape((n, g.kv_heads, g.head_dim))?
+        } else {
+            raw_k.clone()
         };
         let v = self.v_norm.forward(&v)?;
-        let k = self.rope.apply(&self.k_norm.forward(&raw_k)?, &cos, &sin)?;
+        let k = rope::apply(&self.k_norm.forward(&raw_k)?, cos, sin)?;
         Ok((q, k, v))
     }
 

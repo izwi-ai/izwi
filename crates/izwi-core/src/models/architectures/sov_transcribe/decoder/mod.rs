@@ -30,6 +30,7 @@ use candle_core::{DType, Device, Tensor};
 use self::attention::SovAttention;
 use self::moe::{MoeBackend, SovFeedForward};
 use self::norm::RmsNorm;
+use self::rope::{Rope, RopeTables};
 use super::checkpoint::{SovCheckpoint, DECODER_PREFIX, EMBEDDING};
 use super::config::{SovDecoderConfig, SovTranscribeConfig};
 use super::encoder::linear;
@@ -82,8 +83,32 @@ pub struct SovDecoder {
     embedding_scale: f64,
     layers: Vec<Layer>,
     final_norm: RmsNorm,
+    /// Every context position's rotation, per attention geometry.
+    rope_sliding: RopeTables,
+    rope_full: RopeTables,
     resident_bytes: usize,
     moe_backend: MoeBackend,
+}
+
+/// Positions the resident rotation tables cover: the model's context.
+pub const ROPE_POSITIONS: usize = super::model::MAX_CONTEXT_TOKENS;
+
+/// A step's rotation rows: `(cos, sin)` of the sliding and the full
+/// geometry for every token of the step.
+pub(crate) struct StepRope {
+    sliding: (Tensor, Tensor),
+    full: (Tensor, Tensor),
+}
+
+impl StepRope {
+    fn of(&self, attention: &SovAttention) -> (&Tensor, &Tensor) {
+        let (cos, sin) = if attention.geometry().window.is_some() {
+            &self.sliding
+        } else {
+            &self.full
+        };
+        (cos, sin)
+    }
 }
 
 fn host_values(tensor: &Tensor) -> Result<Vec<f32>> {
@@ -148,9 +173,14 @@ impl SovDecoder {
             eps,
         )?;
         resident_bytes += final_norm.resident_bytes();
+        let rope_sliding = Rope::new(&d.sliding).resident(ROPE_POSITIONS, device, dtype)?;
+        let rope_full = Rope::new(&d.full).resident(ROPE_POSITIONS, device, dtype)?;
+        resident_bytes += rope_sliding.resident_bytes() + rope_full.resident_bytes();
         Ok(Self {
             embedding_scale: embedding_scale(d.hidden, checkpoint.is_bf16(EMBEDDING)?) as f64,
             final_norm,
+            rope_sliding,
+            rope_full,
             config: d,
             device: device.clone(),
             dtype,
@@ -220,6 +250,25 @@ impl SovDecoder {
         let widest = d.sliding.heads.max(d.full.heads) * d.sliding.head_dim.max(d.full.head_dim);
         let values = 6 * d.hidden + 3 * widest + 3 * d.mlp_width + d.top_k * 3 * d.expert_width;
         (values * 4) as u64
+    }
+
+    /// The rotation rows of `positions`, gathered from the resident tables
+    /// by one small upload.
+    pub(crate) fn step_rope(&self, positions: &[usize]) -> Result<StepRope> {
+        if positions.iter().any(|&position| position >= ROPE_POSITIONS) {
+            return Err(Error::ContextLengthExceeded(format!(
+                "SOV-Transcribe positions end at {ROPE_POSITIONS}"
+            )));
+        }
+        let index = Tensor::from_vec(
+            positions.iter().map(|&p| p as u32).collect::<Vec<_>>(),
+            positions.len(),
+            &self.device,
+        )?;
+        Ok(StepRope {
+            sliding: self.rope_sliding.gather(&index)?,
+            full: self.rope_full.gather(&index)?,
+        })
     }
 
     /// Scaled text embeddings `[ids, hidden]`.
@@ -300,9 +349,11 @@ impl SovDecoder {
             .map(|row| row.embeds.to_dtype(self.dtype))
             .collect::<candle_core::Result<Vec<_>>>()?;
         let mut x = Tensor::cat(&embeds, 0)?;
+        let rope = self.step_rope(positions)?;
         for (index, layer) in self.layers.iter().enumerate() {
             let h = layer.input_norm.forward(&x)?;
-            let (q, k, v) = layer.attention.project(&h, positions)?;
+            let (cos, sin) = rope.of(&layer.attention);
+            let (q, k, v) = layer.attention.project(&h, cos, sin)?;
             let mut attended = Vec::with_capacity(rows.len());
             let mut offset = 0;
             for (r, row) in rows.iter().enumerate() {
@@ -380,7 +431,9 @@ impl SovDecoder {
         for layer in &self.layers {
             let g = *layer.attention.geometry();
             let h = layer.input_norm.forward(&x)?;
-            let (q, k, v) = layer.attention.project(&h, &positions)?;
+            // The host-built tables, so the resident ones are checked too.
+            let (cos, sin) = Rope::new(&g).tables(&positions, &self.device, self.dtype)?;
+            let (q, k, v) = layer.attention.project(&h, &cos, &sin)?;
             let group = g.heads / g.kv_heads;
             let spread = Tensor::from_vec(
                 (0..g.heads)
