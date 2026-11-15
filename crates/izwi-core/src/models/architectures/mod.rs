@@ -26,6 +26,7 @@ pub mod qwen35;
 pub mod qwen36moe;
 pub mod qwen38;
 pub mod sortformer;
+pub mod sov_transcribe;
 pub mod vibevoice;
 pub mod voxtral;
 pub mod whisper;
