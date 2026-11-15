@@ -93,9 +93,15 @@ pub struct AdminModelInfo {
     pub estimated_memory_bytes: u64,
     /// Whether the model can load on this device at all: `fits`,
     /// `too_large` (it needs more memory than loads here are planned
-    /// against) or `unknown`. Other loaded models may still have to make
-    /// room for one that fits.
+    /// against), `unsupported_backend` (it runs only on
+    /// `required_backend`, which this server is not) or `unknown`. Other
+    /// loaded models may still have to make room for one that fits.
     pub device_fit: String,
+    /// The one backend the model runs on (`cuda`), for a model that cannot
+    /// run on the others at all; `null` for a model that runs everywhere.
+    /// Such a model is listed on every server and refused where
+    /// `device_fit` is `unsupported_backend`.
+    pub required_backend: Option<String>,
     /// Free disk a download of the model needs: its files, plus the
     /// checkpoint a `.nemo` archive unpacks on first load. 0 once
     /// downloaded.
@@ -325,6 +331,9 @@ impl AdminModelInfo {
             memory_required_gb: variant.memory_required_gb(),
             estimated_memory_bytes: 0,
             device_fit: DEVICE_FIT_UNKNOWN.to_string(),
+            required_backend: variant
+                .required_backend()
+                .map(|backend| backend.as_str().to_string()),
             disk_required_bytes: match info.status {
                 ModelStatus::NotDownloaded | ModelStatus::Downloading | ModelStatus::Error => {
                     download_disk_required_bytes(
@@ -369,6 +378,7 @@ impl AdminModelInfo {
 }
 
 const DEVICE_FIT_UNKNOWN: &str = "unknown";
+const DEVICE_FIT_UNSUPPORTED_BACKEND: &str = "unsupported_backend";
 
 impl AdminModelInfo {
     /// The memory the model needs against what loads on this device are
@@ -378,6 +388,19 @@ impl AdminModelInfo {
         runtime: &izwi_core::RuntimeService,
         variant: ModelVariant,
     ) -> Self {
+        let backend = runtime.backend_context().backend_kind;
+        if !variant.runs_on_backend(backend) {
+            // What it needs where it does run; there is no figure for here.
+            self.estimated_memory_bytes = variant
+                .required_backend()
+                .map(|required| {
+                    (f64::from(variant.memory_required_gb_on(required)) * (1u64 << 30) as f64)
+                        as u64
+                })
+                .unwrap_or(0);
+            self.device_fit = DEVICE_FIT_UNSUPPORTED_BACKEND.to_string();
+            return self;
+        }
         let needed = runtime.estimated_model_load_bytes(variant);
         self.estimated_memory_bytes = needed;
         self.device_fit = match runtime.model_capacity_bytes() {

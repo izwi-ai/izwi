@@ -1225,7 +1225,7 @@
           },
           "device_fit": {
             "type": "string",
-            "description": "Whether the model can load on this device at all: `fits`,\n`too_large` (it needs more memory than loads here are planned\nagainst) or `unknown`. Other loaded models may still have to make\nroom for one that fits."
+            "description": "Whether the model can load on this device at all: `fits`,\n`too_large` (it needs more memory than loads here are planned\nagainst), `unsupported_backend` (it runs only on\n`required_backend`, which this server is not) or `unknown`. Other\nloaded models may still have to make room for one that fits."
           },
           "disk_required_bytes": {
             "type": "integer",
@@ -1298,6 +1298,13 @@
           "pinned": {
             "type": "boolean",
             "description": "Explicitly loaded in this session: survives budget and memory-pressure\neviction until explicitly unloaded."
+          },
+          "required_backend": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The one backend the model runs on (`cuda`), for a model that cannot\nrun on the others at all; `null` for a model that runs everywhere.\nSuch a model is listed on every server and refused where\n`device_fit` is `unsupported_backend`."
           },
           "route_capabilities": {
             "$ref": "#/components/schemas/AdminModelRouteCapabilities"
