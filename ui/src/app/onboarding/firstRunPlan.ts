@@ -117,8 +117,13 @@ export function needsDownload(model: ModelInfo): boolean {
   return model.status === "not_downloaded" || model.status === "error";
 }
 
+/** Whether the model can be set up on this device: it runs on this
+ * server's backend and fits its memory. */
 export function fitsDevice(model: ModelInfo): boolean {
-  return model.device_fit !== "too_large";
+  return (
+    model.device_fit !== "too_large" &&
+    model.device_fit !== "unsupported_backend"
+  );
 }
 
 /** Download size: the catalog's estimate for a model not on disk yet. */

@@ -128,6 +128,71 @@ describe("ModelListRow", () => {
     ).toBeInTheDocument();
   });
 
+  it("lists a CUDA-only model on another backend without download or load", () => {
+    const actions = {
+      onDownload: vi.fn(),
+      onLoad: vi.fn(),
+      onUnload: vi.fn(),
+    };
+    for (const status of ["not_downloaded", "downloaded"] as const) {
+      const { unmount } = render(
+        <ul>
+          <ModelListRow
+            model={{
+              variant: "SOV-Transcribe-1",
+              status,
+              local_path: null,
+              size_bytes: null,
+              estimated_size_bytes: 53_315_567_087,
+              download_progress: null,
+              error_message: null,
+              device_fit: "unsupported_backend",
+              required_backend: "cuda",
+            }}
+            label="SOV-Transcribe-1"
+            subtitle="Speech to text · Salesforce"
+            progress={0}
+            actions={actions}
+          />
+        </ul>,
+      );
+      const row = screen.getByTestId("model-row-SOV-Transcribe-1");
+      expect(within(row).getByText("CUDA only")).toBeInTheDocument();
+      expect(
+        within(row).getByText(
+          "Speech to text · Salesforce · Runs on NVIDIA GPUs (CUDA) only",
+        ),
+      ).toBeInTheDocument();
+      expect(within(row).getByText("53.3 GB")).toBeInTheDocument();
+      expect(within(row).queryByRole("button", { name: /Download|Load/ })).toBeNull();
+      unmount();
+    }
+    // On a CUDA server it is an ordinary row.
+    render(
+      <ul>
+        <ModelListRow
+          model={{
+            variant: "SOV-Transcribe-1",
+            status: "not_downloaded",
+            local_path: null,
+            size_bytes: null,
+            download_progress: null,
+            error_message: null,
+            device_fit: "fits",
+            required_backend: "cuda",
+          }}
+          label="SOV-Transcribe-1"
+          subtitle="Speech to text · Salesforce"
+          progress={0}
+          actions={actions}
+        />
+      </ul>,
+    );
+    expect(screen.queryByText("CUDA only")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Download SOV-Transcribe-1" }));
+    expect(actions.onDownload).toHaveBeenCalledWith("SOV-Transcribe-1");
+  });
+
   it("offers no folder outside the desktop app", () => {
     reveal.canRevealPaths.mockReturnValueOnce(false);
     expect(revealModelActions(vi.fn())).toEqual({});

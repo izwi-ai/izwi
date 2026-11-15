@@ -123,8 +123,13 @@ export interface ModelInfo {
   memory_required_gb?: number;
   /** Memory the model needs to load, from the catalog. */
   estimated_memory_bytes?: number;
-  /** Whether the model can load on this device at all. */
-  device_fit?: "fits" | "too_large" | "unknown";
+  /** Whether the model can load on this device at all:
+   * `unsupported_backend` when it runs only on `required_backend` and this
+   * server is another backend. */
+  device_fit?: "fits" | "too_large" | "unsupported_backend" | "unknown";
+  /** The one backend the model runs on ("cuda"), for a model that cannot
+   * run on the others; null or absent for a model that runs everywhere. */
+  required_backend?: "cuda" | "metal" | "cpu" | null;
   /** Free disk a download needs (0 once downloaded). */
   disk_required_bytes?: number;
   enabled?: boolean;

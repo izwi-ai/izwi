@@ -27,6 +27,35 @@ export function formatModelBytes(bytes: number): string {
   return `${(bytes / 1e9).toFixed(1)} GB`;
 }
 
+const BACKEND_LABELS: Record<string, string> = {
+  cuda: "CUDA",
+  metal: "Metal",
+  cpu: "CPU",
+};
+
+/** "CUDA only", for a model this server's backend cannot run. */
+export function requiredBackendLabel(model: ModelInfo): string | null {
+  if (model.device_fit !== "unsupported_backend" || !model.required_backend) {
+    return null;
+  }
+  return `${BACKEND_LABELS[model.required_backend] ?? model.required_backend} only`;
+}
+
+/** Why a model can never run on this server, in a sentence. */
+export function unsupportedBackendReason(model: ModelInfo): string | null {
+  if (model.device_fit !== "unsupported_backend") {
+    return null;
+  }
+  return model.required_backend === "cuda"
+    ? "Runs on NVIDIA GPUs (CUDA) only"
+    : "Does not run on this server";
+}
+
+/** Whether this server can run the model at all (its backend, not memory). */
+export function runsOnThisServer(model: ModelInfo): boolean {
+  return model.device_fit !== "unsupported_backend";
+}
+
 /** Memory a model needs, for one that cannot load on this device. */
 export function neededMemoryLabel(model: ModelInfo): string | null {
   if (model.device_fit !== "too_large") {
@@ -110,6 +139,14 @@ export function ModelStatusCell({
     "aria-live": model.status === "error" ? "assertive" : "polite",
     "aria-atomic": true,
   } as const;
+  const backendOnly = requiredBackendLabel(model);
+  if (backendOnly && model.status !== "ready" && model.status !== "loading") {
+    return (
+      <span {...live} title={unsupportedBackendReason(model) ?? undefined}>
+        <RowBadge>{backendOnly}</RowBadge>
+      </span>
+    );
+  }
   switch (model.status) {
     case "ready":
       return (
@@ -192,7 +229,11 @@ export function ModelListRow({
   readyAction = null,
   highlighted = false,
 }: ModelListRowProps) {
-  const tooLarge = model.device_fit === "too_large" && !isModelOnDisk(model);
+  // A model this backend cannot run is listed but never downloaded or
+  // loaded here; one too large for this device only until it is on disk.
+  const unsupported = !runsOnThisServer(model);
+  const tooLarge =
+    unsupported || (model.device_fit === "too_large" && !isModelOnDisk(model));
   const size = model.size_bytes ?? model.estimated_size_bytes ?? null;
   const license = modelLicenseText(model);
   const common = "h-8 gap-1.5 px-2.5 text-[13px]";
@@ -235,7 +276,7 @@ export function ModelListRow({
       ) : null;
       break;
     case "downloaded":
-      primary = (
+      primary = unsupported ? null : (
         <Button
           type="button"
           variant="outline"
@@ -355,7 +396,9 @@ export function ModelListRow({
         >
           {model.status === "error" && model.error_message
             ? model.error_message
-            : subtitle}
+            : unsupported
+              ? `${subtitle} · ${unsupportedBackendReason(model)}`
+              : subtitle}
         </span>
         {license ? (
           <span className="text-[12px] leading-4 text-(--text-subtle)">
