@@ -81,12 +81,44 @@ A request covers one 30 s window. A longer file is cut at pauses by the
 shared chunk planner and runs as concurrent chunk rows
 (`runtime/asr/chunk_rows.rs`), joined in order.
 
-The routed experts have two paths (`decoder/moe.rs`,
-`IZWI_SOV_TRANSCRIBE_MOE_BACKEND`): host-routed (one readback per layer,
-each used expert read once) and device-routed (softmax, top 8 and gathered
-batched matmuls on the device, no readback), which `auto` takes on CUDA for
-steps of up to four rows. The device path serves only after a load-time
-check against the host path (`moe_check` in the diagnostics).
+### Performance on CUDA
+
+- **Fused experts** (`kernels::moe_gelu`, `IZWI_SOV_TRANSCRIBE_MOE_BACKEND`):
+  routing (softmax, top 8, renormalize, per-expert scale) and the BF16
+  experts in five launches with the ids on the device. Expert-major kernels
+  read each used expert's rows once for every row of the step and sum each
+  pair in a fixed order, so a row decodes the same alone as in a batch.
+  `auto` takes them for calls of up to 512 routed pairs (every decode step
+  up to 64 rows); prefill spans route on the host, where each used expert's
+  tokens run as one GEMM. They serve only after a load-time check against
+  the host path (`moe_check`).
+- **Decode width 32** on CUDA (`catalog/batch_width.rs`).
+- **CUDA graphs**: the encoder and projector per batch size of windows
+  (`IZWI_SOV_TRANSCRIBE_ENCODER_GRAPHS`), and each decode step as 31
+  stretches between the layers' paged attention, per row count 1 to 4 and 8
+  (`IZWI_SOV_TRANSCRIBE_DECODE_GRAPHS`). Both verify every graph bit for
+  bit against the eager run before replaying it; any failure turns that set
+  off for the process (`encoder_graphs`, `decode_graphs` in the
+  diagnostics).
+- **Fewer launches per layer**: the q, k, v projections and the dense
+  gate/up projections are single fused weights; every RMSNorm is one launch
+  of `kernels::residual_norm`, with the residual adds fused into the
+  following norm; the RoPE tables for the whole context are resident and a
+  step gathers its rows with one upload.
+- **Encoder attention** on the shared fused kernel (FlashAttention on CUDA
+  builds that have it), never the 1500 x 1500 score matrices.
+- **Packed prefill** across rows and **cross-request encoder batches**.
+
+Considered and not done:
+
+- **Freeing KV pages that leave the sliding window.** A served request is
+  one 30 s window, at most about 410 prompt and 424 planned decode tokens,
+  so a row never passes the 1,024-token window and the sliding layers
+  already hold exactly what they attend to. Rotating them separately would
+  split the KV state into two domains for no saving on this route.
+- **Greedy picks on the raw logits** (skipping the softcap). The reference
+  picks over the softcapped logits, whose rounding can tie tokens the raw
+  logits order; the saving is three element-wise passes over 1 MB a row.
 
 ## What is verified
 
@@ -102,16 +134,17 @@ check against the host path (`moe_check` in the diagnostics).
   file as chunk rows.
 
 Not verified: any run on an NVIDIA GPU or on the real checkpoint. The CUDA
-path builds but has not run. `reference_tests.rs` is the ignored parity test
+path builds (`--features cuda`) but has not run. `reference_tests.rs` is the ignored parity test
 for the H100: generate its reference with
 `scripts/fixtures/generate_sov_transcribe_reference.py`, then run it with
 `IZWI_SOV_TRANSCRIBE_MODEL_DIR` and `IZWI_SOV_TRANSCRIBE_AUDIO_DIR` set.
 
 ## Not done
 
-- CUDA graphs for the encoder or the decode step, and a fused BF16 MoE
-  kernel: the device-routed path is composed Candle operations.
-- Freeing KV pages that have left a sliding window (the window is applied as
-  a mask, so a row keeps its whole context).
+- Any run on an NVIDIA GPU: the fused kernels and the graphs build and the
+  CUDA source passes a host-compiler syntax check, but none has run. The
+  kernels' CUDA test (`moe_gelu::tests::the_cuda_kernels_match_the_reference`)
+  and the load-time checks are the first things to watch on the H100.
+- Throughput and the 32-row width are unmeasured.
 - The DFlash speculative draft, a smaller (FP8) build, and single-pass long
   audio.
