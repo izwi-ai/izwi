@@ -23,7 +23,7 @@ use tokenizers::Tokenizer;
 
 use super::checkpoint::SovCheckpoint;
 use super::config::{SovTranscribeConfig, TOKENIZER_FILE};
-use super::decoder::moe::MoeBackend;
+use super::decoder::moe::{ExpertPath, MoeBackend};
 use super::decoder::{DecoderTrace, SovDecoder, SpanRow, TraceRequest};
 use super::encoder::{max_abs, SovEncoder, SovProjector};
 use super::frontend::{SovMel, SovMelFrontend};
@@ -468,19 +468,32 @@ impl SovTranscribeModel {
         // The device-routed experts serve only after they agree with the
         // host-routed reference on a probe; otherwise the host path serves
         // every call and the diagnostics say why.
-        let moe_check = if decoder.moe_backend() != MoeBackend::Host
-            && (device.is_cuda() || decoder.moe_backend() == MoeBackend::Device)
-        {
-            let error = decoder.check_device_routed_experts(4)?;
-            if error.is_nan() || error > MOE_CHECK_LIMIT {
+        let checked_path = match decoder.moe_backend() {
+            MoeBackend::Host => None,
+            MoeBackend::Device => Some(ExpertPath::Gathered),
+            MoeBackend::Fused => Some(ExpertPath::Fused),
+            MoeBackend::Auto if device.is_cuda() => Some(ExpertPath::Fused),
+            MoeBackend::Auto => None,
+        };
+        let moe_check = match checked_path {
+            Some(ExpertPath::Fused) if !decoder.fused_experts_supported() => {
                 tracing::warn!(
-                    "SOV-Transcribe: the device-routed experts deviate from the host-routed reference by {error:.3e}; routing on the host"
+                    "SOV-Transcribe: the fused expert kernels do not take this checkpoint's geometry; routing on the host"
                 );
                 decoder.set_moe_backend(MoeBackend::Host);
+                None
             }
-            Some(error)
-        } else {
-            None
+            Some(path) => {
+                let error = decoder.check_expert_path(path, 4)?;
+                if error.is_nan() || error > MOE_CHECK_LIMIT {
+                    tracing::warn!(
+                        "SOV-Transcribe: the {path:?} experts deviate from the host-routed reference by {error:.3e}; routing on the host"
+                    );
+                    decoder.set_moe_backend(MoeBackend::Host);
+                }
+                Some(error)
+            }
+            None => None,
         };
         let load_seconds = started.elapsed().as_secs_f64();
         let model = Self {
@@ -611,7 +624,7 @@ impl SovTranscribeModel {
             "load_seconds": d.load_seconds,
             "head_tied": d.head_tied,
             "moe_backend": self.decoder.moe_backend().name(),
-            "moe_device_routed_max_choices": super::decoder::moe::DEVICE_ROUTED_MAX_CHOICES,
+            "moe_fused_max_pairs": super::decoder::moe::FUSED_MAX_PAIRS,
             "moe_check": d.moe_check,
             "prefill_span": self.prefill_span,
             "decode_quantum": self.decode_quantum,

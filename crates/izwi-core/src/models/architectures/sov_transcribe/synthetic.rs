@@ -7,7 +7,7 @@
 //! tokens); a 2-layer encoder of width 16; a decoder of hidden 32 with
 //! layers `sliding full sliding full`, 4 query heads, sliding 2 KV heads of
 //! 8 dims with a 6-token window, full 1 KV head of 16 dims rotating 2 of
-//! its 8 pairs; a dense MLP of 48 and 6 experts (top-2) of width 12.
+//! its 8 pairs; a dense MLP of 48 and 6 experts (top-2) of width 16.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -96,7 +96,7 @@ pub fn config_json_with(positions: usize) -> serde_json::Value {
             "intermediate_size": 48,
             "num_experts": 6,
             "top_k_experts": 2,
-            "moe_intermediate_size": 12,
+            "moe_intermediate_size": 16,
             "rms_norm_eps": 1e-6,
             "final_logit_softcapping": 30.0,
             "vocab_size": VOCAB

@@ -28,7 +28,7 @@ pub mod state;
 use candle_core::{DType, Device, Tensor};
 
 use self::attention::SovAttention;
-use self::moe::{MoeBackend, SovFeedForward};
+use self::moe::{ExpertPath, MoeBackend, SovFeedForward};
 use self::norm::RmsNorm;
 use self::rope::{Rope, RopeTables};
 use super::checkpoint::{SovCheckpoint, DECODER_PREFIX, EMBEDDING};
@@ -216,10 +216,10 @@ impl SovDecoder {
         self.moe_backend = backend;
     }
 
-    /// The largest relative difference between the device-routed and the
-    /// host-routed experts of layer 0 over `rows` probe tokens: the load
-    /// check that keeps the device path only when it agrees.
-    pub fn check_device_routed_experts(&self, rows: usize) -> Result<f64> {
+    /// The relative difference between `path` and the host-routed experts
+    /// of layer 0 over `rows` probe tokens: the load check that keeps a
+    /// device path only when it agrees.
+    pub fn check_expert_path(&self, path: ExpertPath, rows: usize) -> Result<f64> {
         let hidden = self.config.hidden;
         let h =
             crate::kernels::numeric_check::xorshift_tensor(&[rows, hidden], 11, 1.0, &self.device)?
@@ -227,8 +227,15 @@ impl SovDecoder {
         let ff = &self.layers[0].feed_forward;
         let normed = self.layers[0].pre_ff_norm_2.forward(&h)?;
         let host = host_values(&ff.sparse(&h, &normed)?)?;
-        let device = host_values(&ff.sparse_device(&h, &normed)?)?;
-        Ok(crate::kernels::numeric_check::relative_l2(&device, &host))
+        let other = host_values(&ff.sparse_on(path, &h, &normed)?)?;
+        Ok(crate::kernels::numeric_check::relative_l2(&other, &host))
+    }
+
+    /// Whether every layer's experts fit the fused kernels.
+    pub fn fused_experts_supported(&self) -> bool {
+        self.layers
+            .iter()
+            .all(|layer| layer.feed_forward.fused_supported())
     }
 
     /// `(model layer, KV heads, key dim, value dim)` of every layer, in
@@ -427,6 +434,11 @@ impl SovDecoder {
     /// 0, recomputed without a KV cache: dense attention with an explicit
     /// causal and sliding-window mask. `[tokens, hidden]` F32, normalized.
     pub(crate) fn dense_reference(&self, embeds: &Tensor) -> Result<Tensor> {
+        self.dense_reference_with(embeds, true)
+    }
+
+    /// [`Self::dense_reference`], the sliding layers' window applied or not.
+    pub(crate) fn dense_reference_with(&self, embeds: &Tensor, windowed: bool) -> Result<Tensor> {
         let tokens = embeds.dim(0)?;
         let positions = (0..tokens).collect::<Vec<_>>();
         let mut x = embeds.to_dtype(self.dtype)?;
@@ -451,7 +463,8 @@ impl SovDecoder {
             let mut mask = vec![0f32; tokens * tokens];
             for query in 0..tokens {
                 for key in 0..tokens {
-                    let hidden = key > query || g.window.is_some_and(|w| key + w <= query);
+                    let hidden =
+                        key > query || (windowed && g.window.is_some_and(|w| key + w <= query));
                     if hidden {
                         mask[query * tokens + key] = f32::NEG_INFINITY;
                     }

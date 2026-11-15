@@ -2739,7 +2739,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Choice,
         "auto",
         Load,
-        "How SOV-Transcribe-1 computes its routed experts: `auto` routes on the device (softmax, top-8 and the experts' batched matmuls with no host readback) for decode steps of up to 4 rows on CUDA and on the host otherwise; `host` always routes on the host (one readback per layer, each used expert read once); `device` always routes on the device. The device path serves only after a load-time check against the host path; `moe_backend` and `moe_check` in the diagnostics report it.",
+        "How SOV-Transcribe-1 computes its routed experts: `auto` (the default) runs the fused CUDA kernels (`kernels::moe_gelu`: device routing, each used expert's BF16 rows read once, no host readback) for calls of up to 512 routed pairs, so every decode step, and routes prefill spans on the host (each used expert's tokens as one GEMM); `fused` always takes the fused kernels (their CPU reference off CUDA); `host` always routes on the host; `device` takes the portable gathered path. A device path serves only after a load-time check against the host path; `moe_backend` and `moe_check` in the diagnostics report it.",
     ),
     CoreEnvVar::new(
         "IZWI_SOV_TRANSCRIBE_PREFILL_SPAN",

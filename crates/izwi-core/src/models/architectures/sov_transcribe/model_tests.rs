@@ -279,28 +279,31 @@ fn the_paged_decoder_matches_the_dense_reference() {
 
 #[test]
 fn the_sliding_window_hides_old_tokens() {
-    // Changing a token outside every sliding window still reaches a later
-    // token through the full layers; with the dense reference agreeing
-    // above, this pins that the window is applied at all: the same change
-    // to the first token must alter the last hidden state less than a
-    // change inside the window does.
+    // Past the 6-token window, the paged decoder agrees with the dense
+    // reference that applies the window and not with one that does not.
     let (_dir, model) = load();
     let decoder = model.decoder();
-    let base = (0..20).map(|i| FIRST_WORD + i).collect::<Vec<_>>();
-    let run = |ids: &[u32]| {
-        let embeds = decoder.embed_text(ids).unwrap();
-        let hidden = values(&decoder.dense_reference(&embeds).unwrap());
-        hidden[19 * 32..].to_vec()
-    };
-    let reference = run(&base);
-    let mut far = base.clone();
-    far[0] = FIRST_WORD + 50;
-    let mut near = base.clone();
-    near[17] = FIRST_WORD + 50;
-    let far_change = max_difference(&run(&far), &reference);
-    let near_change = max_difference(&run(&near), &reference);
-    assert!(far_change > 0.0, "the full layers see every token");
-    assert!(near_change > far_change, "{near_change} vs {far_change}");
+    let ids = (0..20)
+        .map(|i| FIRST_WORD + (i * 5) % 60)
+        .collect::<Vec<_>>();
+    let embeds = decoder.embed_text(&ids).unwrap();
+    let last = |t: Tensor| values(&t)[19 * 32..].to_vec();
+    let windowed = last(decoder.dense_reference_with(&embeds, true).unwrap());
+    let unwindowed = last(decoder.dense_reference_with(&embeds, false).unwrap());
+    let mut cache = caches(&model, 1, 64).remove(0);
+    let paged = values(
+        &decoder
+            .forward_rows(
+                &mut [SpanRow {
+                    embeds,
+                    cache: &mut cache,
+                }],
+                None,
+            )
+            .unwrap(),
+    );
+    assert!(max_difference(&paged, &windowed) < 2e-4);
+    assert!(max_difference(&paged, &unwindowed) > 1e-2);
 }
 
 #[test]
@@ -350,21 +353,28 @@ fn routes_follow_the_reference_order() {
 }
 
 #[test]
-fn device_routed_experts_match_the_host_routed_reference() {
-    use super::decoder::moe::{MoeBackend, DEVICE_ROUTED_MAX_CHOICES};
+fn device_expert_paths_match_the_host_routed_reference() {
+    use super::decoder::moe::{ExpertPath, MoeBackend, FUSED_MAX_PAIRS};
     let (_dir, model) = load();
-    // On the CPU the automatic choice is the host path; the check still runs
-    // the device path's arithmetic against it.
+    // On the CPU the automatic choice is the host path; the checks still run
+    // the device paths' arithmetic against it (the fused one through the
+    // kernels' CPU reference).
     assert_eq!(model.decoder().moe_backend(), MoeBackend::Auto);
-    for rows in [1, 3, 9] {
-        let error = model.decoder().check_device_routed_experts(rows).unwrap();
-        assert!(error < 1e-5, "{rows} rows: {error}");
+    assert!(model.decoder().fused_experts_supported());
+    for path in [ExpertPath::Gathered, ExpertPath::Fused] {
+        for rows in [1, 3, 9] {
+            let error = model.decoder().check_expert_path(path, rows).unwrap();
+            assert!(error < 1e-5, "{path:?} {rows} rows: {error}");
+        }
     }
     let cpu = Device::Cpu;
+    assert_eq!(MoeBackend::Auto.path(&cpu, 1, 8), ExpertPath::Host);
+    assert_eq!(MoeBackend::Device.path(&cpu, 64, 8), ExpertPath::Gathered);
+    assert_eq!(MoeBackend::Fused.path(&cpu, 64, 8), ExpertPath::Fused);
+    assert_eq!(MoeBackend::Host.path(&cpu, 1, 8), ExpertPath::Host);
     assert!(!MoeBackend::Auto.routes_on_device(&cpu, 1, 8));
-    assert!(MoeBackend::Device.routes_on_device(&cpu, 64, 8));
-    assert!(!MoeBackend::Host.routes_on_device(&cpu, 1, 8));
-    assert_eq!(DEVICE_ROUTED_MAX_CHOICES / 8, 4);
+    assert_eq!(FUSED_MAX_PAIRS / 8, 64);
+    assert_eq!(MoeBackend::parse("fused").unwrap(), MoeBackend::Fused);
     assert!(MoeBackend::parse("vllm").is_err());
 }
 
@@ -374,10 +384,12 @@ fn transcripts_agree_across_the_expert_paths() {
     let (dir, mut model) = load();
     let audio = test_audio(WINDOW_SAMPLES + 200, 51);
     let host = transcribe(&model, &audio, 10_000, 20);
-    model.decoder_mut().set_moe_backend(MoeBackend::Device);
-    let device = transcribe(&model, &audio, 10_000, 20);
-    assert_eq!(device.text, host.text);
-    assert_eq!(device.generated_tokens, host.generated_tokens);
+    for backend in [MoeBackend::Device, MoeBackend::Fused] {
+        model.decoder_mut().set_moe_backend(backend);
+        let other = transcribe(&model, &audio, 10_000, 20);
+        assert_eq!(other.text, host.text, "{backend:?}");
+        assert_eq!(other.generated_tokens, host.generated_tokens, "{backend:?}");
+    }
     drop(dir);
 }
 
