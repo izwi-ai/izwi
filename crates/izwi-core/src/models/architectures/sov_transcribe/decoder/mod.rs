@@ -88,6 +88,8 @@ pub struct SovDecoder {
     rope_full: RopeTables,
     resident_bytes: usize,
     moe_backend: MoeBackend,
+    /// CUDA graphs of the decode step's stretches, or why there are none.
+    graphs: std::result::Result<crate::kernels::cuda::stretch_graphs::StretchGraphs, String>,
 }
 
 /// Positions the resident rotation tables cover: the model's context.
@@ -173,6 +175,7 @@ impl SovDecoder {
             eps,
         )?;
         resident_bytes += final_norm.resident_bytes();
+        let decode_graphs = super::graphs::resolve_decode(device, d.layers() + 1);
         let rope_sliding = Rope::new(&d.sliding).resident(ROPE_POSITIONS, device, dtype)?;
         let rope_full = Rope::new(&d.full).resident(ROPE_POSITIONS, device, dtype)?;
         resident_bytes += rope_sliding.resident_bytes() + rope_full.resident_bytes();
@@ -188,6 +191,7 @@ impl SovDecoder {
             layers,
             resident_bytes,
             moe_backend: MoeBackend::from_env()?,
+            graphs: decode_graphs,
         })
     }
 
@@ -205,6 +209,14 @@ impl SovDecoder {
 
     pub fn resident_bytes(&self) -> usize {
         self.resident_bytes
+    }
+
+    /// The decode graphs' captures and replays, or why they are off.
+    pub fn graph_diagnostics(&self) -> serde_json::Value {
+        match &self.graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        }
     }
 
     pub fn moe_backend(&self) -> MoeBackend {
@@ -326,7 +338,13 @@ impl SovDecoder {
             positions.extend(start..start + tokens);
             lengths.push(tokens);
         }
-        let result = self.run_layers(rows, &mut prepared, &lengths, &positions, &mut trace);
+        // A decode step (one token a row) runs as stretches between the
+        // layers' attention, through CUDA graphs where they are on.
+        let result = if trace.is_none() && lengths.iter().all(|&len| len == 1) {
+            self.decode_layers(rows, &mut prepared, &positions)
+        } else {
+            self.run_layers(rows, &mut prepared, &lengths, &positions, &mut trace)
+        };
         match result {
             Ok(hidden) => {
                 for (row, step) in rows.iter_mut().zip(prepared) {
@@ -410,6 +428,133 @@ impl SovDecoder {
             offset += len;
         }
         self.final_norm.forward_f32(&Tensor::cat(&last, 0)?)
+    }
+
+    /// Layer `index`'s input norm and projections: q, k (rotated) and v of
+    /// `x`. `rope` is the step's sliding then full `(cos, sin)`.
+    fn pre_attention(
+        &self,
+        index: usize,
+        x: &Tensor,
+        rope: &[Tensor],
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let layer = &self.layers[index];
+        let h = layer.input_norm.forward(x)?;
+        let (cos, sin) = if layer.attention.geometry().window.is_some() {
+            (&rope[0], &rope[1])
+        } else {
+            (&rope[2], &rope[3])
+        };
+        layer.attention.project(&h, cos, sin)
+    }
+
+    /// Layer `index` after its attention (`attended` `[rows, heads * d]`):
+    /// the output projection, the dense and expert branches and the
+    /// residual, as [`Self::run_layers`] computes them.
+    fn post_attention(&self, index: usize, x: &Tensor, attended: &Tensor) -> Result<Tensor> {
+        let layer = &self.layers[index];
+        let attended = layer.attention.output(attended)?;
+        let (sum, dense_in) = layer
+            .pre_ff_norm
+            .add_forward(x, &layer.post_attention_norm.forward(&attended)?)?;
+        let ff = &layer.feed_forward;
+        let dense = layer.post_ff_norm_1.forward(&ff.dense(&dense_in)?)?;
+        let sparse = layer.post_ff_norm_2.forward(&ff.sparse_with(
+            self.moe_backend,
+            &sum,
+            &layer.pre_ff_norm_2.forward(&sum)?,
+        )?)?;
+        let (_, m) = layer.post_ff_norm.add_forward(&dense, &sparse)?;
+        Ok((sum + m)?.broadcast_mul(&layer.scalar)?)
+    }
+
+    /// One decode step (each row one token) as `layers + 1` stretches: the
+    /// first layer's projections, then per layer everything between its
+    /// attention and the next layer's (or the final norm). The paged
+    /// attention between them stays eager. On CUDA, with the experts routed
+    /// on the device, each stretch replays its graph for this row count; the
+    /// same bodies run directly everywhere else.
+    fn decode_layers(
+        &self,
+        rows: &[SpanRow<'_>],
+        prepared: &mut [PreparedPhysicalPagedStep],
+        positions: &[usize],
+    ) -> Result<Tensor> {
+        let count = rows.len();
+        let embeds = rows
+            .iter()
+            .map(|row| row.embeds.to_dtype(self.dtype))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        let mut x = Tensor::cat(&embeds, 0)?;
+        let step = self.step_rope(positions)?;
+        let rope = [
+            step.sliding.0.clone(),
+            step.sliding.1.clone(),
+            step.full.0.clone(),
+            step.full.1.clone(),
+        ];
+        let mut run = match &self.graphs {
+            Ok(graphs)
+                if self
+                    .moe_backend
+                    .routes_on_device(&self.device, count, self.config.top_k) =>
+            {
+                graphs.begin(count)
+            }
+            _ => None,
+        };
+        let mut stretch = |index: usize,
+                           inputs: Vec<Tensor>,
+                           body: &dyn Fn(&[Tensor]) -> Result<Vec<Tensor>>|
+         -> Result<Vec<Tensor>> {
+            match run.as_mut() {
+                Some(run) => run.run(index, &inputs, body),
+                None => body(&inputs),
+            }
+        };
+        let first = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+            let (q, k, v) = self.pre_attention(0, &inputs[0], &inputs[1..])?;
+            Ok(vec![q, k, v])
+        };
+        let mut inputs = vec![x.clone()];
+        inputs.extend(rope.iter().cloned());
+        let mut qkv = stretch(0, inputs, &first)?;
+        let last = self.layers.len() - 1;
+        for index in 0..self.layers.len() {
+            let attention = &self.layers[index].attention;
+            let (q, k, v) = (&qkv[0], &qkv[1], &qkv[2]);
+            let mut attended = Vec::with_capacity(count);
+            for (r, row) in rows.iter().enumerate() {
+                attended.push(attention.attend(
+                    row.cache,
+                    &mut prepared[r],
+                    index,
+                    &q.narrow(0, r, 1)?,
+                    &k.narrow(0, r, 1)?,
+                    &v.narrow(0, r, 1)?,
+                    self.dtype,
+                )?);
+            }
+            let attended = Tensor::cat(&attended, 0)?;
+            if index == last {
+                let tail = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+                    let x = self.post_attention(index, &inputs[0], &inputs[1])?;
+                    Ok(vec![self.final_norm.forward_f32(&x)?])
+                };
+                return Ok(stretch(index + 1, vec![x, attended], &tail)?.remove(0));
+            }
+            let between = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+                let x = self.post_attention(index, &inputs[0], &inputs[1])?;
+                let (q, k, v) = self.pre_attention(index + 1, &x, &inputs[2..])?;
+                Ok(vec![x, q, k, v])
+            };
+            let mut inputs = vec![x, attended];
+            inputs.extend(rope.iter().cloned());
+            let mut outputs = stretch(index + 1, inputs, &between)?;
+            x = outputs.remove(0);
+            qkv = outputs;
+        }
+        unreachable!("the last layer returns")
     }
 
     /// Logits `[rows, vocab]` F32 of final hidden states, softcapped.

@@ -2576,7 +2576,11 @@ fn sov_transcribe_plan(model_path: &Path, backend: BackendKind) -> Result<Option
             BackendKind::Cuda => priced.largest_tensor_bytes,
             BackendKind::Cpu | BackendKind::Metal => 0,
         },
-        deferred_device_bytes: 0,
+        // The encoder's CUDA graphs allocate on their first batches.
+        deferred_device_bytes:
+            crate::models::architectures::sov_transcribe::graphs::encoder_graph_device_bytes(
+                backend,
+            ),
     }))
 }
 

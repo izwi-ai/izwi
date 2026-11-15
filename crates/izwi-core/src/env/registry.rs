@@ -2714,6 +2714,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Runs the prompt spans of a SOV-Transcribe-1 prefill quantum's rows as one packed decoder forward (norms, projections, the dense MLP and the experts over every row's tokens, attention per row, one greedy readback). The wider products can round a row's values differently in the last bits than when it prefills alone, so a near-tied greedy token may depend on the rows beside it. Any false value prefills the rows one after another, each exactly as alone; the rows' audio windows are encoded together either way. `packed_prefills` in the diagnostics counts packed quanta.",
     ),
     CoreEnvVar::new(
+        "IZWI_SOV_TRANSCRIBE_DECODE_GRAPHS",
+        Flag,
+        "true",
+        Load,
+        "On CUDA, each SOV-Transcribe-1 decode step replays a CUDA graph for each stretch between two layers' paged attention (output projection, norms, dense MLP, fused experts, the next layer's projections and rotation), captured per row count from 1 to 4 and at 8 and checked bit for bit against the eager stretch on two steps; any mismatch or failure turns them off for the process. They run only while the experts route on the device. Any false value, or `IZWI_CUDA_DECODE_GRAPHS=off`, runs every stretch eagerly; `decode_graphs` in the diagnostics reports captures, replays and why the graphs are off.",
+    ),
+    CoreEnvVar::new(
         "IZWI_SOV_TRANSCRIBE_DECODE_QUANTUM",
         Int,
         "8 on CUDA",
@@ -2726,6 +2733,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "8",
         Load,
         "The most 30-second windows one SOV-Transcribe-1 encoder call takes (1 to 64), fixed per load. Windows of every row of a prefill quantum share these batches; each window of a batch holds about 320 MiB of activations. Values outside that range are ignored.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_SOV_TRANSCRIBE_ENCODER_GRAPHS",
+        Flag,
+        "true",
+        Load,
+        "On CUDA, SOV-Transcribe-1's encoder and projector over a batch of 30-second windows replay a CUDA graph per batch size (1 to the encoder batch), each checked bit for bit against the eager run on its first two batches; any mismatch or failure turns them off for the process. A load prices up to 1.7 GiB for them. Any false value runs the encoder eagerly; `encoder_graphs` in the diagnostics reports captures and replays.",
     ),
     CoreEnvVar::new(
         "IZWI_SOV_TRANSCRIBE_MODEL_DIR",

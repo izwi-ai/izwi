@@ -22,6 +22,7 @@ pub mod config;
 pub mod decoder;
 pub mod encoder;
 pub mod frontend;
+pub mod graphs;
 pub mod model;
 pub mod precision;
 pub mod prompt;

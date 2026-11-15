@@ -400,6 +400,8 @@ pub struct SovTranscribeModel {
     prefill_span: usize,
     decode_quantum: usize,
     encoder_batch: usize,
+    encoder_graphs:
+        std::result::Result<crate::kernels::cuda::shape_graphs::ShapeGraphs<usize>, String>,
     batched_prefill: bool,
     diagnostics: SovDiagnostics,
 }
@@ -511,6 +513,7 @@ impl SovTranscribeModel {
             prefill_span: prefill_span(backend_of(device)),
             decode_quantum: decode_quantum(backend_of(device)),
             encoder_batch: encoder_batch(),
+            encoder_graphs: super::graphs::resolve_encoder(device),
             batched_prefill: crate::env::flag_or(BATCHED_PREFILL_ENV, true),
             diagnostics: SovDiagnostics {
                 load_seconds,
@@ -625,10 +628,15 @@ impl SovTranscribeModel {
             "head_tied": d.head_tied,
             "moe_backend": self.decoder.moe_backend().name(),
             "moe_fused_max_pairs": super::decoder::moe::FUSED_MAX_PAIRS,
+            "decode_graphs": self.decoder.graph_diagnostics(),
             "moe_check": d.moe_check,
             "prefill_span": self.prefill_span,
             "decode_quantum": self.decode_quantum,
             "encoder_batch": self.encoder_batch,
+            "encoder_graphs": match &self.encoder_graphs {
+                Ok(graphs) => graphs.diagnostics(),
+                Err(reason) => json!({ "off": reason }),
+            },
             "batched_prefill": self.batched_prefill,
             "windows_encoded": load(&d.windows_encoded),
             "encoder_batches": load(&d.encoder_batches),
@@ -763,8 +771,7 @@ impl SovTranscribeModel {
                 .iter()
                 .map(|&(clip, window)| clips[clip].window_tensor(window, 1, &self.device))
                 .collect::<Result<Vec<_>>>()?;
-            let encoded = self.encoder.forward(&Tensor::cat(&features, 0)?)?;
-            let projected = self.projector.forward(&encoded)?;
+            let projected = self.encode_windows(Tensor::cat(&features, 0)?)?;
             for row in 0..batch.len() {
                 embedded.push(projected.get(row)?);
             }
@@ -800,6 +807,29 @@ impl SovTranscribeModel {
             .encoder_us
             .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         Ok(out)
+    }
+
+    /// The encoder and projector over `features` `[windows, n_mels,
+    /// frames]`, through the batch size's CUDA graph when the graphs are on.
+    fn encode_windows(&self, features: Tensor) -> Result<Tensor> {
+        let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+            Ok(vec![self
+                .projector
+                .forward(&self.encoder.forward(&inputs[0])?)?])
+        };
+        let Ok(graphs) = &self.encoder_graphs else {
+            return Ok(body(&[features])?.remove(0));
+        };
+        let windows = features.dim(0)?;
+        let retained = (features.elem_count() * 4) as u64
+            + (windows
+                * self.config.tokens_per_window()
+                * self.config.decoder.hidden
+                * self.dtype.size_in_bytes()) as u64;
+        graphs
+            .run(windows, retained, &[features], &body)?
+            .pop()
+            .ok_or_else(|| Error::InferenceError("the encoder graph returned nothing".into()))
     }
 
     /// Encodes the audio of every row that has not been encoded yet.
