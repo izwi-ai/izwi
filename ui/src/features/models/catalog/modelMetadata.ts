@@ -14,6 +14,7 @@ export const PROVIDER_ORDER = [
   "Fish Audio",
   "Resemble AI",
   "Maya Research",
+  "Salesforce",
   "Other",
 ] as const;
 
@@ -87,6 +88,12 @@ export function getModelProviderLabel(variant: string): string {
     variant.startsWith("maya-research/")
   ) {
     return "Maya Research";
+  }
+  if (
+    variant.startsWith("SOV-Transcribe-") ||
+    variant.startsWith("salesforce-sovereign-intelligence/")
+  ) {
+    return "Salesforce";
   }
   return "Other";
 }

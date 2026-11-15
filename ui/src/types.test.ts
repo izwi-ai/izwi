@@ -101,6 +101,19 @@ describe("speech route model filters", () => {
     ).toBe(true);
   });
 
+  it("includes sov-transcribe-1 on transcription routes", () => {
+    expect(VIEW_CONFIGS.transcription.modelFilter("SOV-Transcribe-1")).toBe(
+      true,
+    );
+    expect(
+      VIEW_CONFIGS.transcription.modelFilter(
+        "salesforce-sovereign-intelligence/SOV-Transcribe-1",
+      ),
+    ).toBe(true);
+    // Not a chat model, although its decoder is Gemma 4.
+    expect(VIEW_CONFIGS.chat.modelFilter("SOV-Transcribe-1")).toBe(false);
+  });
+
   it("includes granite speech on regular transcription routes", () => {
     expect(
       VIEW_CONFIGS.transcription.modelFilter("Granite-Speech-4.1-2B"),

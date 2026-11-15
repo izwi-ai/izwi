@@ -217,6 +217,18 @@ describe("route model catalog", () => {
     );
   });
 
+  it("lists SOV-Transcribe-1 as a Salesforce ASR model without making it a default", () => {
+    const sov = "SOV-Transcribe-1";
+    // CUDA only and about 52 GB of GPU memory: offered, never preselected.
+    expect(TRANSCRIPTION_PREFERRED_MODELS).not.toContain(sov);
+    expect(DIARIZATION_PREFERRED_ASR_MODELS).not.toContain(sov);
+    expect(getModelProviderLabel(sov)).toBe("Salesforce");
+    expect(
+      getModelProviderLabel("salesforce-sovereign-intelligence/SOV-Transcribe-1"),
+    ).toBe("Salesforce");
+    expect(MODEL_DETAILS[sov]?.category).toBe("asr");
+  });
+
   it("offers Nemotron 3.5 Transcribe for speaker attribution without making it a default", () => {
     const transcribe = "Nemotron-3.5-Transcribe-30B-A4B-FP8";
     // About 32 GB of memory: never a default transcription pick, and the
