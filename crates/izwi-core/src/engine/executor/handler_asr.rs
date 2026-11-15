@@ -261,11 +261,12 @@ fn physical_asr_route(family: ModelFamily) -> Result<PhysicalAsrRoute> {
         ModelFamily::WhisperAsr => Ok(PhysicalAsrRoute::Whisper),
         ModelFamily::ParakeetAsr => Ok(PhysicalAsrRoute::Parakeet),
         ModelFamily::NemotronAsr => Ok(PhysicalAsrRoute::Nemotron),
-        // Voxtral, the LFM audio models and Nemotron 3.5 Transcribe (retained
-        // rows) have their own executors; the forced aligner and the
-        // remaining families do not transcribe.
+        // Voxtral, the LFM audio models, Nemotron 3.5 Transcribe and
+        // SOV-Transcribe-1 (retained rows) have their own executors; the
+        // forced aligner and the remaining families do not transcribe.
         ModelFamily::Voxtral
         | ModelFamily::NemotronTranscribeAsr
+        | ModelFamily::SovTranscribeAsr
         | ModelFamily::Lfm25Audio
         | ModelFamily::Lfm3Audio
         | ModelFamily::Qwen3ForcedAligner
@@ -572,6 +573,13 @@ impl NativeExecutor {
         }
         if family == ModelFamily::NemotronTranscribeAsr {
             return self.nemotron_transcribe_request_with_managed_cache(
+                request,
+                scheduled,
+                managed_state.take(),
+            );
+        }
+        if family == ModelFamily::SovTranscribeAsr {
+            return self.sov_transcribe_request_with_managed_cache(
                 request,
                 scheduled,
                 managed_state.take(),
@@ -1542,6 +1550,9 @@ pub(super) fn asr_planned_decode_tokens(
         }
         ModelFamily::VibeVoiceAsr => {
             crate::runtime::vibevoice_asr_planned_max_tokens(request, audio_seconds)
+        }
+        ModelFamily::SovTranscribeAsr => {
+            crate::runtime::sov_transcribe_asr_planned_max_tokens(request, audio_seconds)
         }
         _ => MAX_ASR_NEW_TOKENS,
     }

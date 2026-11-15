@@ -42,6 +42,7 @@ pub(crate) use asr::voxtral_offline_preparation_cost;
 use asr::{
     ContinuousAsrExecutionAdapter, Lfm25AudioAsrExecutionAdapter, Lfm3AudioAsrExecutionAdapter,
     NemotronAsrExecutionAdapter, NemotronTranscribeAsrExecutionAdapter,
+    SovTranscribeAsrExecutionAdapter,
     ParakeetAsrExecutionAdapter, VoxtralAsrExecutionAdapter,
 };
 use chat::ContinuousChatExecutionAdapter;
@@ -91,6 +92,7 @@ const LFM3_AUDIO_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1
 const LFM3_AUDIO_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const LFM3_AUDIO_CHAT_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const NEMOTRON_TRANSCRIBE_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
+const SOV_TRANSCRIBE_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const PARAKEET_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(29);
 const NEMOTRON_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 pub(crate) const VOXTRAL_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);

@@ -482,6 +482,38 @@ impl LoadedExecutionAdapterFactory for NemotronTranscribeAsrAdapterFactory {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub(super) struct SovTranscribeAsrAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for SovTranscribeAsrAdapterFactory {
+    fn id(&self) -> &'static str {
+        LoadedAdapterKind::SovTranscribeAsr.factory_id()
+    }
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Continuous
+    }
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(
+            LoadedAdapterKind::SovTranscribeAsr,
+            metadata,
+            backend_kind,
+        )
+    }
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(SovTranscribeAsrExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+            context.max_tensor_batch_size,
+        )))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(super) struct KokoroStaticTtsAdapterFactory;
 
 impl LoadedExecutionAdapterFactory for KokoroStaticTtsAdapterFactory {
@@ -930,6 +962,7 @@ pub(in crate::runtime::adapters) fn built_in_loaded_adapter_factories() -> Vec<A
         Arc::new(Lfm3AudioPhysicalTtsAdapterFactory),
         Arc::new(Lfm3AudioPhysicalAsrAdapterFactory),
         Arc::new(NemotronTranscribeAsrAdapterFactory),
+        Arc::new(SovTranscribeAsrAdapterFactory),
         Arc::new(Lfm3AudioPhysicalChatAdapterFactory),
         Arc::new(Lfm3AudioRealtimeAdapterFactory),
         Arc::new(KokoroStaticTtsAdapterFactory),

@@ -131,6 +131,7 @@ pub(crate) fn validate_managed_state_plan_eligibility(
             | (ModelFamily::GraniteSpeechAsr, CapabilityKind::Asr)
             | (ModelFamily::GraniteSpeech5Asr, CapabilityKind::Asr)
             | (ModelFamily::NemotronTranscribeAsr, CapabilityKind::Asr)
+            | (ModelFamily::SovTranscribeAsr, CapabilityKind::Asr)
     );
     if !route_validated {
         return Err(Error::ModelLoadError(format!(

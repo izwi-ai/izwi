@@ -43,6 +43,7 @@ pub(crate) enum LoadedAdapterKind {
     Lfm3AudioChat,
     Lfm3AudioRealtime,
     NemotronTranscribeAsr,
+    SovTranscribeAsr,
     KokoroStaticTts,
     Scalar,
 }
@@ -76,6 +77,7 @@ impl LoadedAdapterKind {
             Self::Lfm3AudioChat => "builtin.lfm3_audio_chat.physical_sequence",
             Self::Lfm3AudioRealtime => "builtin.lfm3_audio_realtime.physical_session",
             Self::NemotronTranscribeAsr => "builtin.nemotron_transcribe_asr.physical_sequence",
+            Self::SovTranscribeAsr => "builtin.sov_transcribe_asr.physical_sequence",
             Self::KokoroStaticTts => "builtin.kokoro_tts.tensor_static",
             Self::Scalar => "builtin.scalar",
         }
@@ -397,6 +399,19 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
             F::NemotronTranscribeAsr,
             C::Asr,
             Loaded::NemotronTranscribeAsr,
+            RetainedAndInvocation,
+        )
+        .sequence()
+        .resumable(),
+        // SOV-Transcribe-1 runs every request as a retained row: resumable
+        // prefill spans (the first encodes the row's 30 s windows, batched
+        // with other rows'), then decode batched across rows, on the
+        // family's paged KV in the managed arena. Long files reach it as
+        // chunk rows. CUDA only.
+        row(
+            F::SovTranscribeAsr,
+            C::Asr,
+            Loaded::SovTranscribeAsr,
             RetainedAndInvocation,
         )
         .sequence()

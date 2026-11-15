@@ -200,6 +200,19 @@ pub enum ModelVariant {
         alias = "Nemotron 3.5 Transcribe"
     )]
     Nemotron35Transcribe30BA4BFp8,
+    /// Salesforce SOV-Transcribe-1: a speech language model (the Whisper
+    /// large-v3 encoder and a frame-stacking projector over the Gemma 4
+    /// 26B-A4B MoE decoder) for non-streaming transcription in seven
+    /// languages, steered by instructions and keywords. BF16, 53 GB; it
+    /// runs on CUDA only ([`ModelVariant::required_backend`]).
+    #[serde(
+        rename = "SOV-Transcribe-1",
+        alias = "salesforce-sovereign-intelligence/SOV-Transcribe-1",
+        alias = "sov-transcribe-1",
+        alias = "sov-transcribe",
+        alias = "SOV Transcribe 1"
+    )]
+    SovTranscribe1,
     /// Streaming Sortformer 4-speaker diarization model (.nemo)
     #[serde(rename = "diar_streaming_sortformer_4spk-v2.1")]
     DiarStreamingSortformer4SpkV21,
@@ -517,6 +530,10 @@ impl ModelVariant {
         "006d73cd8385237ed5603fc6c7e76200e50abbd2";
     pub const GRANITE_SPEECH_5_0_2B_ARTIFACT_REVISION: &'static str =
         "0555e70346a8992da6b5df98ae26ec50c43958b8";
+    /// SOV-Transcribe-1 as of 2026-11-11, two days after release: later
+    /// commits to the repo so far changed only the card.
+    pub const SOV_TRANSCRIBE_1_ARTIFACT_REVISION: &'static str =
+        "505d8fae243924c0d8acdc622f7f0abab344eba3";
     /// The GGUF release as published 2026-10-15 (`granite-speech-5.0-2b-GGUF`).
     pub const GRANITE_SPEECH_5_0_2B_GGUF_ARTIFACT_REVISION: &'static str =
         "df3833f5e22e7d51c3f5dfedd4726260f7ec7cb5";
@@ -573,6 +590,7 @@ impl ModelVariant {
                 Some(Self::NEMOTRON_3_5_TRANSCRIBE_FP8_ARTIFACT_REVISION)
             }
             Self::GraniteSpeech502BGguf => Some(Self::GRANITE_SPEECH_5_0_2B_GGUF_ARTIFACT_REVISION),
+            Self::SovTranscribe1 => Some(Self::SOV_TRANSCRIBE_1_ARTIFACT_REVISION),
             _ => None,
         }
     }
@@ -618,6 +636,7 @@ impl ModelVariant {
             Self::Nemotron35Transcribe30BA4BFp8 => {
                 "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-FP8"
             }
+            Self::SovTranscribe1 => "salesforce-sovereign-intelligence/SOV-Transcribe-1",
             Self::DiarStreamingSortformer4SpkV21 => "nvidia/diar_streaming_sortformer_4spk-v2.1",
             Self::Nemotron3Diarization => "nvidia/Nemotron-3-Diarization",
             Self::Qwen306B => "Qwen/Qwen3-0.6B",
@@ -680,6 +699,7 @@ impl ModelVariant {
             Self::GraniteSpeech502B => "Granite Speech 5.0 2B",
             Self::GraniteSpeech502BGguf => "Granite Speech 5.0 2B GGUF",
             Self::Nemotron35Transcribe30BA4BFp8 => "Nemotron 3.5 Transcribe 30B-A4B FP8",
+            Self::SovTranscribe1 => "SOV-Transcribe-1",
             Self::DiarStreamingSortformer4SpkV21 => "Streaming Sortformer 4spk v2.1",
             Self::Nemotron3Diarization => "Nemotron 3 Diarization",
             Self::Qwen306B => "Qwen3 0.6B",
@@ -743,6 +763,7 @@ impl ModelVariant {
             Self::GraniteSpeech502B => "Granite-Speech-5.0-2B",
             Self::GraniteSpeech502BGguf => "Granite-Speech-5.0-2B-GGUF",
             Self::Nemotron35Transcribe30BA4BFp8 => "Nemotron-3.5-Transcribe-30B-A4B-FP8",
+            Self::SovTranscribe1 => "SOV-Transcribe-1",
             Self::DiarStreamingSortformer4SpkV21 => "diar_streaming_sortformer_4spk-v2.1",
             Self::Nemotron3Diarization => "Nemotron-3-Diarization",
             Self::Qwen306B => "Qwen3-0.6B",
@@ -813,6 +834,9 @@ impl ModelVariant {
             // The seven weight files, the index, configs and tokenizer at the
             // pinned revision (the MTP head is downloaded, never loaded).
             Self::Nemotron35Transcribe30BA4BFp8 => 34_689_132_519,
+            // The 16 shards, the index, configs, tokenizer and chat template
+            // at the pinned revision (HF tree sizes).
+            Self::SovTranscribe1 => 53_315_567_087,
             Self::DiarStreamingSortformer4SpkV21 => 471_367_680, // .nemo bytes, HF tree, Oct 2026
             Self::Nemotron3Diarization => 198_676_480,  // .nemo bytes, HF tree, Oct 2026
             Self::Qwen306B => 1_520_000_000,            // ~1.42 GB (est)
@@ -897,6 +921,9 @@ impl ModelVariant {
             // About 31 GiB resident as raw FP8 on Metal and CUDA, 33 GiB as
             // CPU Q8_0, before rows.
             Self::Nemotron35Transcribe30BA4BFp8 => 36.0,
+            // CUDA only: 48.3 GiB of BF16 weights resident (the stored copy
+            // of the tied head is never uploaded), before rows.
+            Self::SovTranscribe1 => 52.0,
             // The diarizers and the forced aligner are priced by their
             // residency plans (`asr_memory`); these figures cover the largest
             // plan resident on any backend. Sortformer loads F32 weights:
@@ -1028,7 +1055,55 @@ impl ModelVariant {
                 | crate::catalog::ModelFamily::GraniteSpeechAsr
                 | crate::catalog::ModelFamily::GraniteSpeech5Asr
                 | crate::catalog::ModelFamily::NemotronTranscribeAsr
+                | crate::catalog::ModelFamily::SovTranscribeAsr
         )
+    }
+
+    /// The one backend this model runs on, for a model that cannot run on
+    /// the others at all. The catalog still lists such a model everywhere,
+    /// marked (the app shows "CUDA only"), and every entry point refuses to
+    /// load or run it on another backend. `None` for a model that runs on
+    /// every backend.
+    pub fn required_backend(&self) -> Option<crate::BackendKind> {
+        match self {
+            // 53 GB of BF16 with no smaller published build Izwi reads.
+            Self::SovTranscribe1 => Some(crate::BackendKind::Cuda),
+            _ => None,
+        }
+    }
+
+    /// Whether the model can run on `backend` at all
+    /// ([`Self::required_backend`]). Whether it fits a particular device is
+    /// a separate question.
+    pub fn runs_on_backend(&self, backend: crate::BackendKind) -> bool {
+        self.required_backend()
+            .is_none_or(|required| required == backend)
+    }
+
+    /// What a request for the model is told on a backend it cannot run on.
+    pub fn unsupported_backend_message(&self, backend: crate::BackendKind) -> Option<String> {
+        let required = self.required_backend().filter(|required| *required != backend)?;
+        let needs = match required {
+            crate::BackendKind::Cuda => "an NVIDIA GPU (CUDA)",
+            crate::BackendKind::Metal => "Apple Metal",
+            crate::BackendKind::Cpu => "the CPU backend",
+        };
+        let here = match backend {
+            crate::BackendKind::Cuda => "CUDA",
+            crate::BackendKind::Metal => "Metal",
+            crate::BackendKind::Cpu => "the CPU",
+        };
+        Some(format!(
+            "{} needs {needs}; this server runs on {here}",
+            self.display_name()
+        ))
+    }
+
+    /// [`Self::memory_required_gb_on`] for a backend the model runs on, and
+    /// nothing for one it does not: there is no honest figure there.
+    pub fn supported_memory_required_gb_on(&self, backend: crate::BackendKind) -> Option<f32> {
+        self.runs_on_backend(backend)
+            .then(|| self.memory_required_gb_on(backend))
     }
 
     /// Whether this is a diarization model.
@@ -1093,7 +1168,24 @@ impl ModelVariant {
             Self::GraniteSpeech502B
                 | Self::GraniteSpeech502BGguf
                 | Self::Nemotron35Transcribe30BA4BFp8
+                | Self::SovTranscribe1
         )
+    }
+
+    /// Whether a transcription request's `prompt` is the instruction this
+    /// model follows (transcript style, formatting, context), not only
+    /// context text: SOV-Transcribe-1 takes everything as an instruction.
+    pub fn takes_asr_instruction_prompt(&self) -> bool {
+        matches!(self, Self::SovTranscribe1)
+    }
+
+    /// The languages a transcription request may name, for a model that
+    /// transcribes a fixed set (ISO 639-1 codes); `None` for the others.
+    pub fn asr_language_codes(&self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::SovTranscribe1 => Some(&["en", "fr", "de", "es", "it", "pt", "nl"]),
+            _ => None,
+        }
     }
 
     /// Whether this model diarizes a recording on its own (speaker tags,
@@ -1104,18 +1196,28 @@ impl ModelVariant {
     }
 
     /// Whether the diarization pipeline may use this model as its ASR stage:
-    /// every speech-to-text model but Nemotron 3.5 Transcribe, whose
-    /// transcripts run only as resumable engine rows (never the one blocking
-    /// stage the pipeline needs) and which tags speakers itself.
+    /// every speech-to-text model but Nemotron 3.5 Transcribe and
+    /// SOV-Transcribe-1, whose transcripts run only as resumable engine rows
+    /// (never the one blocking stage the pipeline needs); the first also
+    /// tags speakers itself.
     pub fn serves_diarization_pipeline_asr(&self) -> bool {
-        self.runs_speech_to_text_jobs() && !matches!(self, Self::Nemotron35Transcribe30BA4BFp8)
+        self.runs_speech_to_text_jobs()
+            && !matches!(
+                self,
+                Self::Nemotron35Transcribe30BA4BFp8 | Self::SovTranscribe1
+            )
     }
 
     /// Whether this ASR model may serve live transcription and voice turns:
     /// every ASR model but Nemotron 3.5 Transcribe, whose card says offline
-    /// (a 30B decoder over 40 s perception windows).
+    /// (a 30B decoder over 40 s perception windows), and SOV-Transcribe-1,
+    /// a non-streaming model whose every call costs a full 30 s window.
     pub fn serves_live_asr(&self) -> bool {
-        self.is_asr() && !matches!(self, Self::Nemotron35Transcribe30BA4BFp8)
+        self.is_asr()
+            && !matches!(
+                self,
+                Self::Nemotron35Transcribe30BA4BFp8 | Self::SovTranscribe1
+            )
     }
 
     /// Whether this model times words itself (a CTC timestamp head), so a
@@ -1202,7 +1304,8 @@ impl ModelVariant {
             | Self::Qwen36Moe35BA3BFp8
             | Self::Maya13B
             | Self::Maya13BGguf
-            | Self::Maya2Native25B => Some("Apache-2.0"),
+            | Self::Maya2Native25B
+            | Self::SovTranscribe1 => Some("Apache-2.0"),
             Self::Lfm2512BInstructGguf
             | Self::Lfm2512BThinkingGguf
             | Self::Lfm25Audio15BGguf
@@ -1878,6 +1981,7 @@ impl ModelVariant {
             Self::GraniteSpeech502B,
             Self::GraniteSpeech502BGguf,
             Self::Nemotron35Transcribe30BA4BFp8,
+            Self::SovTranscribe1,
             Self::DiarStreamingSortformer4SpkV21,
             Self::Nemotron3Diarization,
             Self::Qwen306B,

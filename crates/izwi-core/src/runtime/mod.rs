@@ -32,6 +32,8 @@ mod request;
 pub(crate) mod rollout;
 mod routing;
 mod service;
+#[cfg(test)]
+mod sov_transcribe_tests;
 mod speech_to_speech;
 mod telemetry;
 mod tts;
@@ -44,7 +46,8 @@ pub(crate) use asr::{
     compose_invocation_audio_limit, ASR_TEXT_PROMPT_TOKEN_RESERVE,
 };
 pub(crate) use asr::{
-    nemotron_transcribe_asr_planned_max_tokens, vibevoice_asr_planned_max_tokens,
+    nemotron_transcribe_asr_planned_max_tokens, sov_transcribe_asr_planned_max_tokens,
+    sov_transcribe_prompt_options, vibevoice_asr_planned_max_tokens,
 };
 
 pub(crate) use adapters::capability_rows;

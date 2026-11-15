@@ -387,6 +387,77 @@ const NEMOTRON_TRANSCRIBE_WEIGHT_FILES: &[(&str, u64)] = &[
     ("model-mtp-fp8.safetensors", 1_335_778_712),
 ];
 
+/// SOV-Transcribe-1's metadata files, and its weight shards with their exact
+/// sizes at the pinned revision (HF tree API).
+const SOV_TRANSCRIBE_METADATA_FILES: [&str; 8] = [
+    "config.json",
+    "preprocessor_config.json",
+    "generation_config.json",
+    "processor_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "chat_template.jinja",
+    "model.safetensors.index.json",
+];
+const SOV_TRANSCRIBE_WEIGHT_FILES: [(&str, u64); 16] = [
+    ("model-00001-of-00016.safetensors", 2_952_790_264),
+    ("model-00002-of-00016.safetensors", 3_765_350_092),
+    ("model-00003-of-00016.safetensors", 3_286_675_948),
+    ("model-00004-of-00016.safetensors", 4_284_761_710),
+    ("model-00005-of-00016.safetensors", 3_859_836_268),
+    ("model-00006-of-00016.safetensors", 3_286_675_948),
+    ("model-00007-of-00016.safetensors", 4_284_761_686),
+    ("model-00008-of-00016.safetensors", 3_859_836_268),
+    ("model-00009-of-00016.safetensors", 3_286_675_948),
+    ("model-00010-of-00016.safetensors", 3_765_350_108),
+    ("model-00011-of-00016.safetensors", 3_286_675_908),
+    ("model-00012-of-00016.safetensors", 4_284_761_662),
+    ("model-00013-of-00016.safetensors", 3_352_325_372),
+    ("model-00014-of-00016.safetensors", 4_284_761_710),
+    ("model-00015-of-00016.safetensors", 123_328_640),
+    ("model-00016-of-00016.safetensors", 1_318_692_712),
+];
+
+
+fn sov_transcribe_files() -> Vec<String> {
+    SOV_TRANSCRIBE_METADATA_FILES
+        .iter()
+        .copied()
+        .chain(SOV_TRANSCRIBE_WEIGHT_FILES.iter().map(|(file, _)| *file))
+        .map(str::to_string)
+        .collect()
+}
+
+fn sov_transcribe_file_bytes(file: &str) -> Option<u64> {
+    SOV_TRANSCRIBE_WEIGHT_FILES
+        .iter()
+        .find(|(name, _)| *name == file)
+        .map(|(_, bytes)| *bytes)
+}
+
+/// Every file present, and every shard at its exact pinned size, so an
+/// interrupted 53 GB download never reads as complete.
+fn sov_transcribe_bundle_is_complete(model_dir: &Path) -> bool {
+    // Tests load a tiny two-shard checkpoint in the published layout
+    // through the real runtime, at its own sizes.
+    #[cfg(test)]
+    if model_dir
+        .join(crate::models::architectures::sov_transcribe::precision::SYNTHETIC_MARKER)
+        .is_file()
+    {
+        return ["config.json", "tokenizer.json", "model.safetensors.index.json"]
+            .iter()
+            .all(|file| model_dir.join(file).is_file());
+    }
+    SOV_TRANSCRIBE_METADATA_FILES
+        .iter()
+        .all(|file| model_dir.join(file).is_file())
+        && SOV_TRANSCRIBE_WEIGHT_FILES.iter().all(|(file, bytes)| {
+            std::fs::metadata(model_dir.join(file))
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() == *bytes)
+        })
+}
+
 /// Marks a test's synthetic checkpoint (see `nemotron_transcribe::synthetic`).
 #[cfg(test)]
 pub(crate) const NEMOTRON_TRANSCRIBE_SYNTHETIC_MARKER: &str = ".izwi-synthetic-checkpoint";
@@ -1872,6 +1943,7 @@ impl ModelDownloader {
                     .all(|file| path.join(file).exists())
             }
             ModelFamily::NemotronTranscribeAsr => nemotron_transcribe_bundle_is_complete(&path),
+            ModelFamily::SovTranscribeAsr => sov_transcribe_bundle_is_complete(&path),
             ModelFamily::SortformerDiarization => {
                 let nemo_file = match variant {
                     ModelVariant::DiarStreamingSortformer4SpkV21 => {
@@ -2517,6 +2589,7 @@ impl ModelDownloader {
                 granite_speech_files(variant)
             }
             ModelFamily::NemotronTranscribeAsr => nemotron_transcribe_files(),
+            ModelFamily::SovTranscribeAsr => sov_transcribe_files(),
             ModelFamily::SortformerDiarization => match variant {
                 ModelVariant::Nemotron3Diarization => {
                     vec!["Nemotron-3-Diarization.nemo".to_string()]
@@ -3026,6 +3099,7 @@ impl ModelDownloader {
         let require_exact_bundle = variant.is_qwen38_fp8()
             || variant.is_qwen35_moe_fp8()
             || variant.family() == ModelFamily::NemotronTranscribeAsr
+            || variant.family() == ModelFamily::SovTranscribeAsr
             || variant.family() == ModelFamily::FishDrama3Tts;
 
         let mut repo_tree_indexes: HashMap<(String, String), HashMap<String, u64>> = HashMap::new();
@@ -3294,6 +3368,11 @@ impl ModelDownloader {
             size
         } else if let Some(size) = (variant.family() == ModelFamily::NemotronTranscribeAsr)
             .then(|| nemotron_transcribe_file_bytes(file))
+            .flatten()
+        {
+            size
+        } else if let Some(size) = (variant.family() == ModelFamily::SovTranscribeAsr)
+            .then(|| sov_transcribe_file_bytes(file))
             .flatten()
         {
             size
@@ -4367,6 +4446,47 @@ mod tests {
             .sum::<u64>();
         assert_eq!(shard_bytes, 4_626_527_776);
         std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn sov_transcribe_downloads_every_shard_at_its_pinned_size() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "izwi-sov-transcribe-download-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let downloader = ModelDownloader::new(temp_dir.clone()).unwrap();
+        let variant = ModelVariant::SovTranscribe1;
+        let files = downloader.get_model_files(variant);
+        assert_eq!(files.len(), 24);
+        for file in [
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer.json",
+            "model.safetensors.index.json",
+            "model-00001-of-00016.safetensors",
+            "model-00016-of-00016.safetensors",
+        ] {
+            assert!(files.iter().any(|f| f == file), "{file}");
+        }
+        // The reference code and the vLLM plugin are not downloaded.
+        assert!(files.iter().all(|file| !file.ends_with(".py")));
+        let weights = SOV_TRANSCRIBE_WEIGHT_FILES
+            .iter()
+            .map(|(_, bytes)| bytes)
+            .sum::<u64>();
+        assert_eq!(weights, 53_283_260_244);
+        // The catalog's size is the shards plus the small files.
+        assert!(variant.estimated_size() > weights);
+        assert!(variant.estimated_size() - weights < 40_000_000);
+        // Present but short shards are not a download.
+        let dir = downloader.model_path(variant);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in &files {
+            std::fs::write(dir.join(file), b"x").unwrap();
+        }
+        assert!(!downloader.is_downloaded(variant));
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

@@ -2415,7 +2415,10 @@ impl RuntimeService {
         let (request, job) = self
             .prepare_voxtral_asr_shape_for_binding(request, job, residency_lease)
             .await?;
-        self.prepare_nemotron_transcribe_asr_shape_for_binding(request, job)
+        let (request, job) = self
+            .prepare_nemotron_transcribe_asr_shape_for_binding(request, job)
+            .await?;
+        self.prepare_sov_transcribe_asr_shape_for_binding(request, job)
             .await
     }
 
@@ -2461,6 +2464,67 @@ impl RuntimeService {
         let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
             .map_err(|_| {
                 Error::Overloaded("Nemotron 3.5 Transcribe retained input exceeds u64".into())
+            })?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let (spec, observation) = self.coordinator_job_for_request(&prepared)?;
+        match self
+            .coordinator
+            .admit_observed_from_preparation(bridge, spec, observation)
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                Err(error)
+            }
+        }
+    }
+
+    /// Seal a SOV-Transcribe request as a retained row: its audio is
+    /// decoded, resampled and turned into the family's whole-clip log-mel,
+    /// window plan and prompt on the host; the windows encode inside the
+    /// row's first prefill span.
+    pub(super) async fn prepare_sov_transcribe_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::SovTranscribeAsr)
+            || request.prepared_asr_execution_shape().is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request
+            .model_variant
+            .expect("validated SOV-Transcribe variant");
+        let model = self
+            .model_registry
+            .get_asr_lease(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not loaded")))?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .unwrap_or(crate::models::architectures::sov_transcribe::MAX_CONTEXT_TOKENS);
+        let prepared = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let features_started = Instant::now();
+                request.prepare_sov_transcribe_row(variant, model, context_limit)?;
+                record_host_features(variant, features_started);
+                Ok(request)
+            })
+            .await?;
+        let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
+            .map_err(|_| {
+                Error::Overloaded("SOV-Transcribe retained input exceeds u64".into())
             })?;
         job.record_materialized_usage(JobResourceObservation::host(retained_host_bytes))?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;

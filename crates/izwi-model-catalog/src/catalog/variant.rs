@@ -34,6 +34,10 @@ pub enum ModelFamily {
     /// encoder and a streaming Sortformer) over a Nemotron-H Mamba2/MoE
     /// decoder; one pass over up to an hour of audio.
     NemotronTranscribeAsr,
+    /// SOV-Transcribe-1: the Whisper large-v3 encoder over 30 s windows, a
+    /// frame-stacking projector and the Gemma 4 26B-A4B MoE decoder. CUDA
+    /// only.
+    SovTranscribeAsr,
     SortformerDiarization,
     Qwen3Chat,
     Qwen3MoeChat,
@@ -68,6 +72,7 @@ impl ModelFamily {
             | Self::GraniteSpeechAsr
             | Self::GraniteSpeech5Asr
             | Self::NemotronTranscribeAsr
+            | Self::SovTranscribeAsr
             | Self::Lfm25Audio
             | Self::Lfm3Audio
             | Self::Voxtral => true,
@@ -120,9 +125,13 @@ impl ModelFamily {
     /// prompts (Nemotron 3.5 Transcribe: up to 45,000 audio tokens for an
     /// hour) are too long for one quantum to hold the device, or its model
     /// prefills on a grid of its own (Fish Audio Drama 3: one cell a
-    /// quantum, so other users' work interleaves between them).
+    /// quantum, so other users' work interleaves between them;
+    /// SOV-Transcribe-1: retained rows whose spans pack across requests).
     pub fn requires_prefill_spans(self) -> bool {
-        matches!(self, Self::NemotronTranscribeAsr | Self::FishDrama3Tts)
+        matches!(
+            self,
+            Self::NemotronTranscribeAsr | Self::FishDrama3Tts | Self::SovTranscribeAsr
+        )
     }
 
     /// Whether this family's ASR encoder pads every input to one fixed window
@@ -130,7 +139,7 @@ impl ModelFamily {
     /// so the route planner never cuts such a model's audio below its window
     /// for latency.
     pub fn asr_fixed_encoder_window(self) -> bool {
-        matches!(self, Self::WhisperAsr)
+        matches!(self, Self::WhisperAsr | Self::SovTranscribeAsr)
     }
 
     /// Whether one ASR invocation is meant to cover the model's whole audio
@@ -159,6 +168,7 @@ impl ModelFamily {
                 | Self::Lfm25Audio
                 | Self::Lfm3Audio
                 | Self::NemotronTranscribeAsr
+                | Self::SovTranscribeAsr
                 | Self::Voxtral
         )
     }
@@ -422,6 +432,7 @@ impl ModelVariant {
             GraniteSpeech412B | GraniteSpeech412BPlus => ModelFamily::GraniteSpeechAsr,
             GraniteSpeech502B | GraniteSpeech502BGguf => ModelFamily::GraniteSpeech5Asr,
             Nemotron35Transcribe30BA4BFp8 => ModelFamily::NemotronTranscribeAsr,
+            SovTranscribe1 => ModelFamily::SovTranscribeAsr,
             DiarStreamingSortformer4SpkV21 | Nemotron3Diarization => {
                 ModelFamily::SortformerDiarization
             }
@@ -460,7 +471,8 @@ impl ModelVariant {
             | ModelFamily::NemotronAsr
             | ModelFamily::GraniteSpeechAsr
             | ModelFamily::GraniteSpeech5Asr
-            | ModelFamily::NemotronTranscribeAsr => ModelTask::Asr,
+            | ModelFamily::NemotronTranscribeAsr
+            | ModelFamily::SovTranscribeAsr => ModelTask::Asr,
             ModelFamily::SortformerDiarization => ModelTask::Diarization,
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen3MoeChat
@@ -548,6 +560,17 @@ pub fn resolve_diarization_llm_variant(
 /// Whether a normalized id names Nemotron 3.5 Transcribe (any precision of
 /// the published release resolves to the FP8 checkpoint the catalog
 /// carries; its BF16, NVFP4 and DFlash2 siblings are other artifacts).
+/// Whether a normalized identifier names SOV-Transcribe-1. Its draft model
+/// (`SOV-Transcribe-1-DFlash`) and the community quantizations are other
+/// repos the catalog does not carry.
+fn is_sov_transcribe(normalized: &str) -> bool {
+    normalized.contains("sov")
+        && normalized.contains("transcribe")
+        && !["dflash", "4bit", "8bit", "mlx", "gguf"]
+            .iter()
+            .any(|other| normalized.contains(other))
+}
+
 fn is_nemotron_transcribe(normalized: &str) -> bool {
     normalized.contains("nemotron")
         && normalized.contains("transcribe")
@@ -574,6 +597,8 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
                 VoxtralMini4BRealtime2602
             } else if is_nemotron_transcribe(&normalized) {
                 Nemotron35Transcribe30BA4BFp8
+            } else if is_sov_transcribe(&normalized) {
+                SovTranscribe1
             } else if normalized.contains("nemotron") && normalized.contains("asr") {
                 Nemotron35AsrStreaming06B
             } else if let Some(granite_speech) = resolve_granite_speech_variant(&normalized) {
@@ -741,6 +766,10 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
     // diarization" name the 30B speech language model.
     if is_nemotron_transcribe(normalized) {
         return Some(Nemotron35Transcribe30BA4BFp8);
+    }
+
+    if is_sov_transcribe(normalized) {
+        return Some(SovTranscribe1);
     }
 
     if normalized.contains("nemotron") && normalized.contains("asr") {
@@ -1484,6 +1513,94 @@ mod tests {
             ),
         ] {
             assert_eq!(resolve_asr_model_variant(Some(input)), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn sov_transcribe_resolves_and_is_cuda_only() {
+        for input in [
+            "salesforce-sovereign-intelligence/SOV-Transcribe-1",
+            "SOV-Transcribe-1",
+            "sov-transcribe-1",
+            "sov-transcribe",
+            "SOV Transcribe 1",
+        ] {
+            assert_eq!(
+                parse_model_variant(input).unwrap(),
+                ModelVariant::SovTranscribe1,
+                "{input}"
+            );
+            assert_eq!(
+                resolve_asr_model_variant(Some(input)),
+                ModelVariant::SovTranscribe1,
+                "{input}"
+            );
+        }
+        // Repos the catalog does not carry do not resolve to it.
+        for input in [
+            "SOV-Transcribe-1-DFlash",
+            "TypeWhisper/SOV-Transcribe-1-4bit",
+            "nativ-community/SOV-Transcribe-1-8bit",
+        ] {
+            assert!(parse_model_variant(input).is_err(), "{input}");
+        }
+        let variant = ModelVariant::SovTranscribe1;
+        let family = variant.family();
+        assert_eq!(family, ModelFamily::SovTranscribeAsr);
+        assert_eq!(variant.primary_task(), ModelTask::Asr);
+        assert!(variant.is_asr() && variant.is_enabled() && !variant.is_quantized());
+        assert_eq!(variant.license_label(), Some("Apache-2.0"));
+        // 30 s windows that always cost a full window, cut on speech and
+        // run as rows; never one dispatch per file.
+        assert!(family.asr_fixed_encoder_window());
+        assert!(family.hallucinates_on_non_speech());
+        assert!(family.requires_prefill_spans());
+        assert!(!family.asr_single_pass_spans_model_window());
+        assert!(!family.dispatches_long_form_asr_by_chunk());
+        assert!(family.asr_streams_within_chunk());
+        // What it does and does not do.
+        assert!(variant.supports_asr_keyword_biasing());
+        assert!(variant.takes_asr_instruction_prompt());
+        assert_eq!(
+            variant.asr_language_codes(),
+            Some(&["en", "fr", "de", "es", "it", "pt", "nl"][..])
+        );
+        assert!(!variant.supports_asr_translation());
+        assert!(!variant.supports_asr_speaker_tags());
+        assert!(!variant.supports_native_word_timestamps());
+        assert!(!variant.serves_live_asr());
+        assert!(!variant.serves_diarization_pipeline_asr());
+        assert!(!variant.diarizes_in_one_model());
+        // CUDA only: listed everywhere, runnable on one backend.
+        assert_eq!(variant.required_backend(), Some(crate::BackendKind::Cuda));
+        assert!(variant.runs_on_backend(crate::BackendKind::Cuda));
+        assert!(!variant.runs_on_backend(crate::BackendKind::Metal));
+        assert!(!variant.runs_on_backend(crate::BackendKind::Cpu));
+        assert!(ModelVariant::all().contains(&variant));
+        assert_eq!(
+            variant
+                .unsupported_backend_message(crate::BackendKind::Metal)
+                .unwrap(),
+            "SOV-Transcribe-1 needs an NVIDIA GPU (CUDA); this server runs on Metal"
+        );
+        assert!(variant
+            .unsupported_backend_message(crate::BackendKind::Cuda)
+            .is_none());
+        assert!(variant
+            .supported_memory_required_gb_on(crate::BackendKind::Cpu)
+            .is_none());
+        assert_eq!(
+            variant.supported_memory_required_gb_on(crate::BackendKind::Cuda),
+            Some(variant.memory_required_gb())
+        );
+        // Every other model runs everywhere.
+        for other in ModelVariant::all() {
+            if *other != variant {
+                assert_eq!(other.required_backend(), None, "{other:?}");
+                assert!(other
+                    .supported_memory_required_gb_on(crate::BackendKind::Cpu)
+                    .is_some());
+            }
         }
     }
 

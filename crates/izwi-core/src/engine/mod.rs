@@ -2044,6 +2044,56 @@ impl Engine {
                     })??;
                 }
             }
+            TaskType::ASR
+                if variant.family() == crate::catalog::ModelFamily::SovTranscribeAsr =>
+            {
+                let model = registry.get_asr_lease(variant).await.ok_or_else(|| {
+                    Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
+                })?;
+                if request
+                    .prepared_sov_transcribe_artifact_for_executor()?
+                    .is_none()
+                {
+                    let request_id = request.id.clone();
+                    let deadline = request.deadline;
+                    let context_limit = registry.effective_context(variant).unwrap_or(
+                        crate::models::architectures::sov_transcribe::MAX_CONTEXT_TOKENS,
+                    );
+                    let acquire_permit = self
+                        .direct_request_preparation_permits
+                        .clone()
+                        .acquire_owned();
+                    let permit = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire_permit)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => acquire_permit.await,
+                    }
+                    .map_err(|_| {
+                        Error::InferenceError(
+                            "Direct SOV-Transcribe preparation queue is unavailable"
+                                .into(),
+                        )
+                    })?;
+                    let worker = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let mut request = request;
+                        request.prepare_sov_transcribe_row(variant, model, context_limit)?;
+                        Ok::<_, Error>(request)
+                    });
+                    request = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), worker)
+                            .await
+                            .map_err(|_| Error::Timeout(request_id.clone()))?,
+                        None => worker.await,
+                    }
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "SOV-Transcribe request {request_id} preparation worker failed: {error}"
+                        ))
+                    })??;
+                }
+            }
             TaskType::ASR if variant.family() != crate::catalog::ModelFamily::Voxtral => {
                 let model = registry.get_asr_lease(variant).await.ok_or_else(|| {
                     Error::ModelNotFound(format!("ASR model {variant} is not loaded"))

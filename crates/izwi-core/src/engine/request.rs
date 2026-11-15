@@ -506,6 +506,9 @@ pub(super) struct IncrementalModelExecutionReady {
     /// `Asr` lease).
     nemotron_transcribe:
         Option<Arc<crate::models::architectures::nemotron_transcribe::NemotronPreparedArtifact>>,
+    /// A SOV-Transcribe row's host preparation (the model is the `Asr`
+    /// lease).
+    sov_transcribe: Option<Arc<crate::models::architectures::sov_transcribe::SovPreparedArtifact>>,
     kokoro_tts: Option<Arc<KokoroPreparedText>>,
 }
 

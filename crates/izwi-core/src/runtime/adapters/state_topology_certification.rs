@@ -269,6 +269,9 @@ fn certified_topology(
         // state and the convolution history as one transaction; each stage
         // leases its activations as per-row scratch.
         (NemotronTranscribeAsr, Asr) => RetainedPagedTensorTensorAndInvocationScratch,
+        // SOV-Transcribe rows commit the decoder's attention pages; each
+        // stage leases its activations as per-row scratch.
+        (SovTranscribeAsr, Asr) => RetainedPagedAndInvocationScratch,
         // Short clips retain the RNNT predictor between quanta in the
         // executor session; long audio and diarization lease the predictor
         // and the static encoder projection per invocation.
