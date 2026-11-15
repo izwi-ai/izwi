@@ -2735,6 +2735,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Checkpoint directory of salesforce-sovereign-intelligence/SOV-Transcribe-1 for the ignored real-checkpoint tests (CUDA only).",
     ),
     CoreEnvVar::new(
+        "IZWI_SOV_TRANSCRIBE_MOE_BACKEND",
+        Choice,
+        "auto",
+        Load,
+        "How SOV-Transcribe-1 computes its routed experts: `auto` routes on the device (softmax, top-8 and the experts' batched matmuls with no host readback) for decode steps of up to 4 rows on CUDA and on the host otherwise; `host` always routes on the host (one readback per layer, each used expert read once); `device` always routes on the device. The device path serves only after a load-time check against the host path; `moe_backend` and `moe_check` in the diagnostics report it.",
+    ),
+    CoreEnvVar::new(
         "IZWI_SOV_TRANSCRIBE_PREFILL_SPAN",
         Int,
         "512 on CUDA",

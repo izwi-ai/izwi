@@ -28,7 +28,7 @@ pub mod state;
 use candle_core::{DType, Device, Tensor};
 
 use self::attention::SovAttention;
-use self::moe::SovFeedForward;
+use self::moe::{MoeBackend, SovFeedForward};
 use self::norm::RmsNorm;
 use super::checkpoint::{SovCheckpoint, DECODER_PREFIX, EMBEDDING};
 use super::config::{SovDecoderConfig, SovTranscribeConfig};
@@ -83,6 +83,7 @@ pub struct SovDecoder {
     layers: Vec<Layer>,
     final_norm: RmsNorm,
     resident_bytes: usize,
+    moe_backend: MoeBackend,
 }
 
 fn host_values(tensor: &Tensor) -> Result<Vec<f32>> {
@@ -156,6 +157,7 @@ impl SovDecoder {
             embedding,
             layers,
             resident_bytes,
+            moe_backend: MoeBackend::from_env()?,
         })
     }
 
@@ -173,6 +175,30 @@ impl SovDecoder {
 
     pub fn resident_bytes(&self) -> usize {
         self.resident_bytes
+    }
+
+    pub fn moe_backend(&self) -> MoeBackend {
+        self.moe_backend
+    }
+
+    /// Switches the expert path (tests, and the load-time check's fallback).
+    pub(crate) fn set_moe_backend(&mut self, backend: MoeBackend) {
+        self.moe_backend = backend;
+    }
+
+    /// The largest relative difference between the device-routed and the
+    /// host-routed experts of layer 0 over `rows` probe tokens: the load
+    /// check that keeps the device path only when it agrees.
+    pub fn check_device_routed_experts(&self, rows: usize) -> Result<f64> {
+        let hidden = self.config.hidden;
+        let h =
+            crate::kernels::numeric_check::xorshift_tensor(&[rows, hidden], 11, 1.0, &self.device)?
+                .to_dtype(self.dtype)?;
+        let ff = &self.layers[0].feed_forward;
+        let normed = self.layers[0].pre_ff_norm_2.forward(&h)?;
+        let host = host_values(&ff.sparse(&h, &normed)?)?;
+        let device = host_values(&ff.sparse_device(&h, &normed)?)?;
+        Ok(crate::kernels::numeric_check::relative_l2(&device, &host))
     }
 
     /// `(model layer, KV heads, key dim, value dim)` of every layer, in
@@ -304,9 +330,11 @@ impl SovDecoder {
                     trace.routes.push(ff.routes(&x)?);
                 }
             }
-            let sparse = layer
-                .post_ff_norm_2
-                .forward(&ff.sparse(&x, &layer.pre_ff_norm_2.forward(&x)?)?)?;
+            let sparse = layer.post_ff_norm_2.forward(&ff.sparse_with(
+                self.moe_backend,
+                &x,
+                &layer.pre_ff_norm_2.forward(&x)?,
+            )?)?;
             let m = layer.post_ff_norm.forward(&(dense + sparse)?)?;
             x = (x + m)?.broadcast_mul(&layer.scalar)?;
             if let Some((request, trace)) = trace.as_mut() {

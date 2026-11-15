@@ -23,6 +23,7 @@ use tokenizers::Tokenizer;
 
 use super::checkpoint::SovCheckpoint;
 use super::config::{SovTranscribeConfig, TOKENIZER_FILE};
+use super::decoder::moe::MoeBackend;
 use super::decoder::{DecoderTrace, SovDecoder, SpanRow, TraceRequest};
 use super::encoder::{max_abs, SovEncoder, SovProjector};
 use super::frontend::{SovMel, SovMelFrontend};
@@ -53,6 +54,10 @@ pub const MAX_AUDIO_SECONDS: f32 = 1_800.0;
 
 static NEXT_MODEL_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
+/// Relative L2 bound of the device-routed experts against the host-routed
+/// reference at load (BF16 on CUDA; the two sum the same products in a
+/// different order).
+const MOE_CHECK_LIMIT: f64 = 2e-2;
 
 /// `IZWI_SOV_TRANSCRIBE_PREFILL_SPAN`: the prompt tokens one row prefills in
 /// one engine quantum (16 to 16,384).
@@ -362,6 +367,9 @@ pub struct SovTranscription {
 struct SovDiagnostics {
     load_seconds: f64,
     head_tied: bool,
+    /// The device-routed experts' relative error against the host-routed
+    /// reference at load, when the check ran.
+    moe_check: Option<f64>,
     windows_encoded: AtomicU64,
     encoder_batches: AtomicU64,
     encoder_us: AtomicU64,
@@ -455,8 +463,25 @@ impl SovTranscribeModel {
         let frontend = SovMelFrontend::new(config.frontend)?;
         let encoder = SovEncoder::load(&checkpoint, &config, device, dtype)?;
         let projector = SovProjector::load(&checkpoint, &config, device, dtype)?;
-        let decoder = SovDecoder::load(&checkpoint, &config, device, dtype)?;
+        let mut decoder = SovDecoder::load(&checkpoint, &config, device, dtype)?;
         drop(checkpoint);
+        // The device-routed experts serve only after they agree with the
+        // host-routed reference on a probe; otherwise the host path serves
+        // every call and the diagnostics say why.
+        let moe_check = if decoder.moe_backend() != MoeBackend::Host
+            && (device.is_cuda() || decoder.moe_backend() == MoeBackend::Device)
+        {
+            let error = decoder.check_device_routed_experts(4)?;
+            if error.is_nan() || error > MOE_CHECK_LIMIT {
+                tracing::warn!(
+                    "SOV-Transcribe: the device-routed experts deviate from the host-routed reference by {error:.3e}; routing on the host"
+                );
+                decoder.set_moe_backend(MoeBackend::Host);
+            }
+            Some(error)
+        } else {
+            None
+        };
         let load_seconds = started.elapsed().as_secs_f64();
         let model = Self {
             variant,
@@ -477,6 +502,7 @@ impl SovTranscribeModel {
             diagnostics: SovDiagnostics {
                 load_seconds,
                 head_tied,
+                moe_check,
                 ..Default::default()
             },
             config,
@@ -534,6 +560,11 @@ impl SovTranscribeModel {
         &self.decoder
     }
 
+    #[cfg(test)]
+    pub(crate) fn decoder_mut(&mut self) -> &mut SovDecoder {
+        &mut self.decoder
+    }
+
     pub fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
     }
@@ -579,7 +610,9 @@ impl SovTranscribeModel {
             "resident_bytes": self.resident_bytes(),
             "load_seconds": d.load_seconds,
             "head_tied": d.head_tied,
-            "moe": "host-routed",
+            "moe_backend": self.decoder.moe_backend().name(),
+            "moe_device_routed_max_choices": super::decoder::moe::DEVICE_ROUTED_MAX_CHOICES,
+            "moe_check": d.moe_check,
             "prefill_span": self.prefill_span,
             "decode_quantum": self.decode_quantum,
             "encoder_batch": self.encoder_batch,

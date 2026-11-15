@@ -350,6 +350,38 @@ fn routes_follow_the_reference_order() {
     }
 }
 
+#[test]
+fn device_routed_experts_match_the_host_routed_reference() {
+    use super::decoder::moe::{MoeBackend, DEVICE_ROUTED_MAX_CHOICES};
+    let (_dir, model) = load();
+    // On the CPU the automatic choice is the host path; the check still runs
+    // the device path's arithmetic against it.
+    assert_eq!(model.decoder().moe_backend(), MoeBackend::Auto);
+    for rows in [1, 3, 9] {
+        let error = model.decoder().check_device_routed_experts(rows).unwrap();
+        assert!(error < 1e-5, "{rows} rows: {error}");
+    }
+    let cpu = Device::Cpu;
+    assert!(!MoeBackend::Auto.routes_on_device(&cpu, 1, 8));
+    assert!(MoeBackend::Device.routes_on_device(&cpu, 64, 8));
+    assert!(!MoeBackend::Host.routes_on_device(&cpu, 1, 8));
+    assert_eq!(DEVICE_ROUTED_MAX_CHOICES / 8, 4);
+    assert!(MoeBackend::parse("vllm").is_err());
+}
+
+#[test]
+fn transcripts_agree_across_the_expert_paths() {
+    use super::decoder::moe::MoeBackend;
+    let (dir, mut model) = load();
+    let audio = test_audio(WINDOW_SAMPLES + 200, 51);
+    let host = transcribe(&model, &audio, 10_000, 20);
+    model.decoder_mut().set_moe_backend(MoeBackend::Device);
+    let device = transcribe(&model, &audio, 10_000, 20);
+    assert_eq!(device.text, host.text);
+    assert_eq!(device.generated_tokens, host.generated_tokens);
+    drop(dir);
+}
+
 fn transcribe(
     model: &SovTranscribeModel,
     audio: &[f32],
