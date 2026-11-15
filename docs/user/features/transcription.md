@@ -194,6 +194,35 @@ transcripts (Granite Speech 4.1 Plus or Nemotron 3.5 Transcribe), and
 
 ---
 
+## SOV-Transcribe-1
+
+`SOV-Transcribe-1` is Salesforce's speech language model: the Whisper
+large-v3 audio encoder in front of Google's Gemma 4 26B-A4B mixture of
+experts. It writes punctuated, capitalized transcripts in English, French,
+German, Spanish, Italian, Portuguese and Dutch.
+
+It runs on NVIDIA GPUs (CUDA) only and needs about 52 GiB of GPU memory. On
+a CPU or Metal server it is listed as "CUDA only" and cannot be loaded.
+
+```bash
+izwi pull SOV-Transcribe-1
+izwi transcribe call.wav --model SOV-Transcribe-1 --language de
+izwi transcribe call.wav --model SOV-Transcribe-1 --keyword Izwi --keyword "Ada Lovelace"
+```
+
+The model follows a written instruction, which `prompt` (`--prompt`)
+replaces outright, for example "Transcribe the audio verbatim, outputting
+only spoken words in sequence." for a plain verbatim transcript or "Write
+numbers as digits." Without one it uses the model card's punctuated
+instruction, or the card's language hint when you give a language.
+Keywords (`--keyword`) are added before the instruction in the card's
+wording. A language outside the seven is refused.
+
+The model encodes audio in 30-second windows. A longer recording is cut at
+pauses into chunks of up to 30 seconds that run side by side with other
+requests and are joined in order. It does not translate, label speakers or
+time words itself; word timestamps use the forced aligner.
+
 ## Nemotron 3.5 Transcribe
 
 `Nemotron-3.5-Transcribe-30B-A4B-FP8` is NVIDIA's 30B speech language model.
@@ -344,6 +373,7 @@ model repeated itself and was stopped).
 | `Granite-Speech-5.0-2B` | 4.6 GB | IBM ASR with punctuated transcripts, speech translation and keyword biasing | Medium |
 | `Granite-Speech-5.0-2B-GGUF` | 3.1 GB | Granite Speech 5.0 with a Q8_0 language model; the faster choice, above all on CPU | Fast |
 | `Nemotron-3.5-Transcribe-30B-A4B-FP8` | 34.7 GB | NVIDIA's 30B speech language model: up to 60 minutes in one pass, 40 languages, translation, context terms, speaker labels and its own word timestamps; needs about 32 GiB of memory | Not yet measured |
+| `SOV-Transcribe-1` | 53.3 GB | Salesforce's speech language model: punctuated transcripts in seven languages that follow an instruction, keyword biasing; CUDA only, needs about 52 GiB of GPU memory | Not yet measured |
 | `LFM2.5-Audio-1.5B-GGUF` | 1.2 GB | Good integrated speech model | Medium |
 | `LFM3-Audio-2B-GGUF` | 1.46 GB | Integrated speech model in 18 languages; no word timestamps of its own | Not yet measured |
 | `Voxtral-Mini-4B-Realtime-2602` | 8 GB | Rust/Candle offline transcription; realtime planned | Medium |

@@ -121,6 +121,18 @@ Rust ports of:
   (c) 2001-2002 Enthought, Inc. 2003, SciPy Developers. All rights
   reserved. BSD 3-Clause License, below.
 
+The SOV-Transcribe family (crates/izwi-core/src/models/architectures/
+sov_transcribe) runs Salesforce's SOV-Transcribe-1 checkpoint
+(https://huggingface.co/salesforce-sovereign-intelligence/SOV-Transcribe-1),
+which izwi downloads unmodified. Salesforce licenses it under the Apache
+License, Version 2.0. Its weights derive from OpenAI's Whisper large-v3
+(MIT License) and Google's Gemma 4 26B-A4B. The family is a Rust port of the
+model's reference code in that repository (modeling, processing and
+configuration of `SovereignAITranscribe`) and of the Gemma 4 text model and
+Whisper feature extractor in Hugging Face Transformers
+(https://github.com/huggingface/transformers). Copyright Salesforce, Inc.
+and The HuggingFace Inc. team. Apache License, Version 2.0.
+
 The Fish Audio S2 Pro and Fish Audio Drama 3 text-to-speech families
 (crates/izwi-core/src/models/architectures/fish_s2 and fish_drama3) run
 Fish Audio's open-weight checkpoints, which izwi downloads unmodified:

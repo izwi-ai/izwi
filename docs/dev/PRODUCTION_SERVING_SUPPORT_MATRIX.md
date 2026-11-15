@@ -179,12 +179,14 @@ CPU 9/16 → 16/16).
 A family whose prompts must never prefill whole sets
 `ModelFamily::requires_prefill_spans`; the scheduler then prefills it in
 resumable spans whatever the chunked-prefill switch says
-(`ExecutionProfile::prefill_spans_required`). Only Nemotron 3.5 Transcribe
-sets it today: a one-hour recording is a prompt of about 45,000 tokens.
+(`ExecutionProfile::prefill_spans_required`). Nemotron 3.5 Transcribe sets
+it (a one-hour recording is a prompt of about 45,000 tokens), and so does
+SOV-Transcribe-1, whose 30-second rows pack their spans across requests.
 
 | Family | CPU | Metal | CUDA |
 |---|---|---|---|
 | Nemotron 3.5 Transcribe (ASR rows) | 192-token spans | 192-token spans | 512-token spans |
+| SOV-Transcribe-1 (ASR rows, CUDA only) | not served | not served | 512-token spans (one span a request) |
 
 The span is the family's prefill grid (`ExecutionProfile::prefill_grid_tokens`):
 every span but a prompt's last has exactly that length, alone or beside other
