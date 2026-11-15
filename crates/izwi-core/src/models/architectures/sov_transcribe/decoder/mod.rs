@@ -370,12 +370,14 @@ impl SovDecoder {
                 offset += len;
             }
             let attended = layer.attention.output(&Tensor::cat(&attended, 0)?)?;
-            x = (x + layer.post_attention_norm.forward(&attended)?)?;
+            // The residual add and the dense branch's norm in one launch.
+            let (sum, dense_in) = layer
+                .pre_ff_norm
+                .add_forward(&x, &layer.post_attention_norm.forward(&attended)?)?;
+            x = sum;
 
             let ff = &layer.feed_forward;
-            let dense = layer
-                .post_ff_norm_1
-                .forward(&ff.dense(&layer.pre_ff_norm.forward(&x)?)?)?;
+            let dense = layer.post_ff_norm_1.forward(&ff.dense(&dense_in)?)?;
             if let Some((request, trace)) = trace.as_mut() {
                 if request.routes {
                     trace.routes.push(ff.routes(&x)?);
@@ -386,7 +388,7 @@ impl SovDecoder {
                 &x,
                 &layer.pre_ff_norm_2.forward(&x)?,
             )?)?;
-            let m = layer.post_ff_norm.forward(&(dense + sparse)?)?;
+            let (_, m) = layer.post_ff_norm.add_forward(&dense, &sparse)?;
             x = (x + m)?.broadcast_mul(&layer.scalar)?;
             if let Some((request, trace)) = trace.as_mut() {
                 if request.hidden_after_layers.contains(&index) {
@@ -466,15 +468,16 @@ impl SovDecoder {
                 .reshape((tokens, g.heads * g.head_dim))?
                 .to_dtype(self.dtype)?;
             let attended = layer.attention.output(&attended)?;
-            x = (x + layer.post_attention_norm.forward(&attended)?)?;
+            let (sum, dense_in) = layer
+                .pre_ff_norm
+                .add_forward(&x, &layer.post_attention_norm.forward(&attended)?)?;
+            x = sum;
             let ff = &layer.feed_forward;
-            let dense = layer
-                .post_ff_norm_1
-                .forward(&ff.dense(&layer.pre_ff_norm.forward(&x)?)?)?;
+            let dense = layer.post_ff_norm_1.forward(&ff.dense(&dense_in)?)?;
             let sparse = layer
                 .post_ff_norm_2
                 .forward(&ff.sparse(&x, &layer.pre_ff_norm_2.forward(&x)?)?)?;
-            let m = layer.post_ff_norm.forward(&(dense + sparse)?)?;
+            let (_, m) = layer.post_ff_norm.add_forward(&dense, &sparse)?;
             x = (x + m)?.broadcast_mul(&layer.scalar)?;
         }
         self.final_norm.forward_f32(&x)

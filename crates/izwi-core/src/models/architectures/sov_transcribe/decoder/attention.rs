@@ -66,7 +66,7 @@ impl SovAttention {
             o_proj,
             q_norm,
             k_norm,
-            v_norm: RmsNorm::without_scale(eps),
+            v_norm: RmsNorm::without_scale(eps, geometry.head_dim, device)?,
             resident_bytes,
         })
     }

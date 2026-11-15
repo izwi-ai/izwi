@@ -183,7 +183,7 @@ impl SovFeedForward {
             width: d.mlp_width,
         };
         let router = Router {
-            norm: RmsNorm::without_scale(d.norm_eps),
+            norm: RmsNorm::without_scale(d.norm_eps, d.hidden, device)?,
             scale: (get("router.scale", DType::F32)? * (d.hidden as f64).powf(-0.5))?,
             proj: get("router.proj.weight", DType::F32)?,
         };
