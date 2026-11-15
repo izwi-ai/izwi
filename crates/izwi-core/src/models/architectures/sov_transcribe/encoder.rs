@@ -2,8 +2,10 @@
 //!
 //! The tower is the Whisper large-v3 encoder: two convolutions (the second
 //! of stride 2), the **stored** position table added to each window from
-//! row 0, pre-norm blocks (query scaled by `head_dim^-0.5` before the
-//! product, no key bias), a final LayerNorm, no mask. Each 30 s window is
+//! row 0, pre-norm blocks (scores scaled by `head_dim^-0.5`, no key bias),
+//! a final LayerNorm, no mask. Attention runs on the shared fused kernel
+//! where the build has one (CUDA FlashAttention, Metal SDPA) and as
+//! composed products elsewhere. Each 30 s window is
 //! one batch row; windows never attend to each other, so windows of
 //! different requests share a batch.
 //!
@@ -187,14 +189,31 @@ impl SovEncoder {
                 .contiguous()?)
         };
         let scale = (head_dim as f64).powf(-0.5);
-        let q = split((linear(x, &layer.q_w, Some(&layer.q_b))? * scale)?)?;
+        let q = split(linear(x, &layer.q_w, Some(&layer.q_b))?)?;
         let k = split(linear(x, &layer.k_w, None)?)?;
         let v = split(linear(x, &layer.v_w, Some(&layer.v_b))?)?;
-        let weights = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
-        let weights = candle_nn::ops::softmax_last_dim(&weights.to_dtype(DType::F32)?)?
-            .to_dtype(self.dtype)?;
-        let out = weights
-            .matmul(&v)?
+        // The fused kernel (CUDA FlashAttention, Metal SDPA) scales the
+        // scores itself and never holds the 1500 x 1500 matrices; elsewhere
+        // the composed form scales q first, as the reference does.
+        let fused = crate::models::shared::attention::flash::try_fused_self_attention_scaled(
+            &q,
+            &k,
+            &v,
+            None,
+            head_dim,
+            false,
+            scale as f32,
+        )?;
+        let out = match fused {
+            Some(out) => out,
+            None => {
+                let weights = (q * scale)?.matmul(&k.transpose(2, 3)?.contiguous()?)?;
+                let weights = candle_nn::ops::softmax_last_dim(&weights.to_dtype(DType::F32)?)?
+                    .to_dtype(self.dtype)?;
+                weights.matmul(&v)?
+            }
+        };
+        let out = out
             .transpose(1, 2)?
             .contiguous()?
             .reshape((windows, frames, e.width))?;
