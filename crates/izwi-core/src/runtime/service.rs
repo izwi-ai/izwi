@@ -1095,6 +1095,7 @@ fn bind_request_to_residency(
                 | ModelFamily::VibeVoiceAsr
                 | ModelFamily::GraniteSpeechAsr
                 | ModelFamily::GraniteSpeech5Asr
+                | ModelFamily::RumbleAsr
                 | ModelFamily::Lfm25Audio
                 | ModelFamily::Lfm3Audio
                 | ModelFamily::Voxtral

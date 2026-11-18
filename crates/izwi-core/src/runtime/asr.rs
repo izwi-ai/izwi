@@ -526,6 +526,13 @@ pub fn validate_asr_task(
                 keywords: task.keywords.clone(),
             })
         }
+        ModelFamily::RumbleAsr => crate::models::architectures::rumble::validate_rumble_request(
+            &crate::models::architectures::rumble::RumbleRequestOptions {
+                language: language.map(str::to_string),
+                prompt: prompt.map(str::to_string),
+                ..Default::default()
+            },
+        ),
         // The instruction the request would render: languages, the
         // translation pair (to or from English), the context terms and a
         // custom prompt are all checked before admission.

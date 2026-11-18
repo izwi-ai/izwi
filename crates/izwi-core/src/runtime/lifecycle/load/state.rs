@@ -878,6 +878,32 @@ impl ModelLifecycleController {
                         )
                         .await?;
                     state_publications.insert(CapabilityKind::Asr, publication);
+                } else if publication_route == LoadedAsrStatePublicationRoute::Rumble {
+                    // Every invocation leases decoder pages of one bounded
+                    // sequence (prompt, a 30 s window of audio tokens and the
+                    // decode budget); no state is retained between them.
+                    if !managed_kv_backend_compiled(backend) {
+                        return Err(Error::ModelLoadError(format!(
+                            "loaded model {variant} requires physical ASR invocation state, but the {backend:?} build has no direct paged-attention runtime"
+                        )));
+                    }
+                    let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
+                    let stage_graphs = contracts
+                        .iter()
+                        .map(|contract| contract.stages.as_ref())
+                        .collect::<Vec<_>>();
+                    let physical_spec = loaded.rumble_physical_state_spec(&stage_graphs)?;
+                    let publication = self
+                        .load_invocation_workspace_publication(
+                            model_instance_id,
+                            &contracts,
+                            physical_spec.descriptor,
+                            &physical_spec.invocation,
+                            None,
+                            HashMap::new(),
+                        )
+                        .await?;
+                    state_publications.insert(CapabilityKind::Asr, publication);
                 } else if let crate::kv::InferenceStateCapability::Managed(contract) =
                     &loaded_cache
                 {

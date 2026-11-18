@@ -1,0 +1,50 @@
+{#- Resonant-Light chat template (Qwen3-ASR format + Reson8 control tokens).
+    chat_template_kwargs (all optional):
+      digits   (bool, default true)  -> <digits>   numbers as digits        | false -> <nodigits>  numbers as words
+      filler   (bool, default false) -> <filler>   keep um/uh fillers       | false -> <nofiller>  drop fillers
+      verbatim (bool, default true)  -> <verbatim> keep repeated words      | false -> <noverbatim> collapse repeats
+      language (string)              -> forces the language, English name as in Qwen3-ASR ("Dutch", "English", ...)
+    A system message, if given, follows the control tokens; if it already contains control tokens it is used as is. -#}
+{%- set use_digits = digits if digits is defined else true -%}
+{%- set use_filler = filler if filler is defined else false -%}
+{%- set use_verbatim = verbatim if verbatim is defined else true -%}
+{%- set ns = namespace(system_text="") -%}
+{%- for m in messages -%}
+  {%- if m.role == 'system' -%}
+    {%- if m.content is string -%}
+      {%- set ns.system_text = ns.system_text + m.content -%}
+    {%- else -%}
+      {%- for c in m.content -%}
+        {%- if c.type == 'text' and (c.text is defined) -%}
+          {%- set ns.system_text = ns.system_text + c.text -%}
+        {%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set ctl = ('<digits>' if use_digits else '<nodigits>') + ('<filler>' if use_filler else '<nofiller>') + ('<verbatim>' if use_verbatim else '<noverbatim>') -%}
+{%- if '<digits>' in ns.system_text or '<nodigits>' in ns.system_text -%}
+  {%- set system_text = ns.system_text -%}
+{%- else -%}
+  {%- set system_text = ctl + ns.system_text -%}
+{%- endif -%}
+{%- set ns2 = namespace(audio_tokens="") -%}
+{%- for m in messages -%}
+  {%- if m.content is not string -%}
+    {%- for c in m.content -%}
+      {%- if c.type == 'audio' or c.type == 'audio_url' or c.type == 'input_audio' or ('audio' in c) or ('audio_url' in c) -%}
+        {%- set ns2.audio_tokens = ns2.audio_tokens + "<|audio_start|><|audio_pad|><|audio_end|>" -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+{%- endfor -%}
+{{- '<|im_start|>system\n' + system_text + '<|im_end|>\n' -}}
+{{- '<|im_start|>user\n' + ns2.audio_tokens + '<|im_end|>\n' -}}
+{%- for m in messages -%}{%- if m.role == 'assistant' -%}{%- set ns3 = namespace(assistant_text='') -%}{%- if m.content is string -%}{%- set ns3.assistant_text = m.content -%}{%- else -%}{%- for c in m.content -%}{%- if c.type == 'text' and (c.text is defined) -%}{%- set ns3.assistant_text = ns3.assistant_text + c.text -%}{%- endif -%}{%- endfor -%}{%- endif -%}{{- '<|im_start|>assistant
+' -}}{% generation %}{{- ns3.assistant_text + '<|im_end|>
+' -}}{% endgeneration %}{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}
+{{- '<|im_start|>assistant\n' -}}
+{%- if language is defined and language -%}
+{{- 'language ' + language + '<asr_text>' -}}
+{%- endif -%}
+{%- endif -%}

@@ -55,6 +55,7 @@ use super::{
 use crate::models::architectures::granite_speech5::asr::{
     granite_speech5_auto_max_tokens_for_duration, GraniteSpeech5RequestOptions,
 };
+use crate::models::architectures::rumble::{RumbleRequestOptions, RUMBLE_DEFAULT_MAX_NEW_TOKENS};
 use granite_speech5::{recover_granite_speech5_chunk, ChunkRecoveryLimits};
 
 #[path = "handler_asr/continuous.rs"]
@@ -162,6 +163,7 @@ fn resolve_asr_execution_audio(
             | ModelFamily::VibeVoiceAsr
             | ModelFamily::GraniteSpeechAsr
             | ModelFamily::GraniteSpeech5Asr
+            | ModelFamily::RumbleAsr
             | ModelFamily::Lfm25Audio
             | ModelFamily::Lfm3Audio
             | ModelFamily::NemotronAsr
@@ -245,6 +247,7 @@ enum PhysicalAsrRoute {
     VibeVoice,
     GraniteSpeech,
     GraniteSpeech5,
+    Rumble,
     Whisper,
     Parakeet,
     Nemotron,
@@ -258,6 +261,7 @@ fn physical_asr_route(family: ModelFamily) -> Result<PhysicalAsrRoute> {
         ModelFamily::VibeVoiceAsr => Ok(PhysicalAsrRoute::VibeVoice),
         ModelFamily::GraniteSpeechAsr => Ok(PhysicalAsrRoute::GraniteSpeech),
         ModelFamily::GraniteSpeech5Asr => Ok(PhysicalAsrRoute::GraniteSpeech5),
+        ModelFamily::RumbleAsr => Ok(PhysicalAsrRoute::Rumble),
         ModelFamily::WhisperAsr => Ok(PhysicalAsrRoute::Whisper),
         ModelFamily::ParakeetAsr => Ok(PhysicalAsrRoute::Parakeet),
         ModelFamily::NemotronAsr => Ok(PhysicalAsrRoute::Nemotron),
@@ -636,6 +640,11 @@ impl NativeExecutor {
             translate_to: request.asr_task.translate_to.clone(),
             keywords: request.asr_task.keywords.clone(),
         };
+        let rumble_request = RumbleRequestOptions {
+            language: language.map(str::to_string),
+            prompt: asr_prompt.map(str::to_string),
+            ..RumbleRequestOptions::default()
+        };
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
         // A long-form row of a family that dispatches its chunks one at a
@@ -915,6 +924,40 @@ impl NativeExecutor {
                                     redecode,
                                 )?
                             }
+                            PhysicalAsrRoute::Rumble => {
+                                if let Some(emit) = partial {
+                                    return with_single_invocation_cache(
+                                        request,
+                                        scheduled,
+                                        |cache| {
+                                            model.transcribe_rumble_physical(
+                                                chunk_audio,
+                                                sr,
+                                                &rumble_request,
+                                                chunk_generation_options.clone(),
+                                                cache,
+                                                Some(emit),
+                                            )
+                                        },
+                                    )
+                                    .map(|details| {
+                                        AsrChunkTranscription {
+                                            text: details.text,
+                                            diagnostics: details.diagnostics,
+                                        }
+                                    });
+                                }
+                                with_single_invocation_cache(request, scheduled, |cache| {
+                                    model.transcribe_rumble_physical(
+                                        chunk_audio,
+                                        sr,
+                                        &rumble_request,
+                                        chunk_generation_options.clone(),
+                                        cache,
+                                        None,
+                                    )
+                                })?
+                            }
                             PhysicalAsrRoute::Whisper => {
                                 if let Some(emit) = partial {
                                     return with_whisper_invocation_state(
@@ -1132,6 +1175,20 @@ impl NativeExecutor {
                                     .map(|details| details.text)
                             })?
                         }
+                        PhysicalAsrRoute::Rumble => {
+                            with_single_invocation_cache(request, scheduled, |cache| {
+                                model
+                                    .transcribe_rumble_physical(
+                                        samples,
+                                        sample_rate,
+                                        &rumble_request,
+                                        segment_generation_options.clone(),
+                                        cache,
+                                        Some(&mut emit),
+                                    )
+                                    .map(|details| details.text)
+                            })?
+                        }
                         PhysicalAsrRoute::Whisper => with_whisper_invocation_state(
                             request,
                             scheduled,
@@ -1230,6 +1287,18 @@ impl NativeExecutor {
                             samples,
                             sample_rate,
                             &granite_speech5_request,
+                            segment_generation_options.clone(),
+                            cache,
+                            None,
+                        )
+                    })?
+                }
+                PhysicalAsrRoute::Rumble => {
+                    with_single_invocation_cache(request, scheduled, |cache| {
+                        model.transcribe_rumble_physical(
+                            samples,
+                            sample_rate,
+                            &rumble_request,
                             segment_generation_options.clone(),
                             cache,
                             None,
@@ -1508,6 +1577,11 @@ impl NativeExecutor {
             options.max_new_tokens = invocation_context.map_or(budget, |(context, rate)| {
                 budget.min(invocation_decode_room(context, rate, chunk_seconds))
             });
+        }
+        // Rumble's automatic budget is its generation config's; the model
+        // narrows any budget to the room its invocation context leaves.
+        if request.asr_auto_max_tokens && matches!(family, ModelFamily::RumbleAsr) {
+            options.max_new_tokens = base.max_new_tokens.min(RUMBLE_DEFAULT_MAX_NEW_TOKENS);
         }
         // VibeVoice's automatic budget is admitted at the reference ceiling;
         // each chunk decodes with its own duration budget.

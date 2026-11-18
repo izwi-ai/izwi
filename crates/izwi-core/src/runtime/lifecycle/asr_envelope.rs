@@ -308,6 +308,29 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             forced_alignment: None,
             encoder_rel_pos: None,
         },
+        // Rumble's audio tower after its ×8 convolution stem: 13 positions
+        // per second in 8 s attention windows, into a 14-layer decoder over
+        // a 99,630-token vocabulary.
+        _ if variant.family() == ModelFamily::RumbleAsr => AsrEnvelopeGeometry {
+            max_chunk_secs: CHUNK_SECS,
+            encoder_positions_per_sec: 13.0,
+            encoder_window_secs: Some(8.0),
+            encoder: stack(896, 3584, 14),
+            audio_tokens_per_sec: 13.0,
+            prompt_tokens: PROMPT_TEXT_TOKENS,
+            decoder: stack(1024, 3072, 16),
+            vocab: 99_630,
+            conv_stem: Some(ConvStemGeometry {
+                channels: 480,
+                mel_bins: MEL_BINS,
+                chunk_frames: MEL_FRAMES_PER_SEC,
+                output_rows: MEL_BINS / 8,
+                output_frames: 13,
+                conv_chunksize: 500,
+            }),
+            forced_alignment: None,
+            encoder_rel_pos: None,
+        },
         // The audio tower of Qwen3-ASR-1.7B (104-position ≈ 8 s attention
         // windows after the ×8 stem) under a 5,000-class timestamp head; the
         // prompt is the window's audio and about 3.5 tokens per word.
@@ -381,6 +404,13 @@ pub(crate) fn minimum_sequence_tokens(variant: ModelVariant) -> Option<u64> {
         ModelVariant::Qwen3Asr06BGguf | ModelVariant::Qwen3Asr17BGguf => {
             asr_sequence_ceiling(PROMPT, rate, PLANNED_CHUNK_SECS, 768)
         }
+        // One planned chunk with the checkpoint's default decode budget.
+        _ if variant.family() == ModelFamily::RumbleAsr => asr_sequence_ceiling(
+            PROMPT,
+            rate,
+            PLANNED_CHUNK_SECS,
+            crate::models::architectures::rumble::RUMBLE_DEFAULT_MAX_NEW_TOKENS,
+        ),
         _ if variant.family() == ModelFamily::GraniteSpeechAsr => asr_sequence_ceiling(
             PROMPT,
             rate,
@@ -884,7 +914,8 @@ pub(crate) fn cuda_decode_row_bytes(variant: ModelVariant) -> Result<Option<u64>
 mod tests {
     use super::*;
 
-    const ENVELOPE_VARIANTS: [ModelVariant; 11] = [
+    const ENVELOPE_VARIANTS: [ModelVariant; 12] = [
+        ModelVariant::Rumble2Flash,
         ModelVariant::WhisperLargeV3Turbo,
         ModelVariant::Qwen3Asr06BGguf,
         ModelVariant::Qwen3Asr17BGguf,

@@ -1,0 +1,345 @@
+{
+"revision": "92ec9141fb1178c5e77fd0020fe86a33c355060b",
+"added_tokens": [
+{
+"id": 99562,
+"content": "<|endoftext|>",
+"special": true
+},
+{
+"id": 99563,
+"content": "<|im_start|>",
+"special": true
+},
+{
+"id": 99564,
+"content": "<|im_end|>",
+"special": true
+},
+{
+"id": 99565,
+"content": "<|object_ref_start|>",
+"special": true
+},
+{
+"id": 99566,
+"content": "<|object_ref_end|>",
+"special": true
+},
+{
+"id": 99567,
+"content": "<|box_start|>",
+"special": true
+},
+{
+"id": 99568,
+"content": "<|box_end|>",
+"special": true
+},
+{
+"id": 99569,
+"content": "<|quad_start|>",
+"special": true
+},
+{
+"id": 99570,
+"content": "<|quad_end|>",
+"special": true
+},
+{
+"id": 99571,
+"content": "<|vision_start|>",
+"special": true
+},
+{
+"id": 99572,
+"content": "<|vision_end|>",
+"special": true
+},
+{
+"id": 99573,
+"content": "<|vision_pad|>",
+"special": true
+},
+{
+"id": 99574,
+"content": "<|image_pad|>",
+"special": true
+},
+{
+"id": 99575,
+"content": "<|video_pad|>",
+"special": true
+},
+{
+"id": 99576,
+"content": "<tool_call>",
+"special": false
+},
+{
+"id": 99577,
+"content": "</tool_call>",
+"special": false
+},
+{
+"id": 99578,
+"content": "<|fim_prefix|>",
+"special": false
+},
+{
+"id": 99579,
+"content": "<|fim_middle|>",
+"special": false
+},
+{
+"id": 99580,
+"content": "<|fim_suffix|>",
+"special": false
+},
+{
+"id": 99581,
+"content": "<|fim_pad|>",
+"special": false
+},
+{
+"id": 99582,
+"content": "<|repo_name|>",
+"special": false
+},
+{
+"id": 99583,
+"content": "<|file_sep|>",
+"special": false
+},
+{
+"id": 99584,
+"content": "<tool_response>",
+"special": false
+},
+{
+"id": 99585,
+"content": "</tool_response>",
+"special": false
+},
+{
+"id": 99586,
+"content": "<think>",
+"special": false
+},
+{
+"id": 99587,
+"content": "</think>",
+"special": false
+},
+{
+"id": 99588,
+"content": "<|audio_start|>",
+"special": true
+},
+{
+"id": 99589,
+"content": "<|audio_end|>",
+"special": true
+},
+{
+"id": 99590,
+"content": "<tts_pad>",
+"special": true
+},
+{
+"id": 99591,
+"content": "<tts_text_bos>",
+"special": true
+},
+{
+"id": 99592,
+"content": "<tts_text_eod>",
+"special": true
+},
+{
+"id": 99593,
+"content": "<tts_text_bos_single>",
+"special": true
+},
+{
+"id": 99594,
+"content": "<non_speech>",
+"special": false
+},
+{
+"id": 99595,
+"content": "<|audio_pad|>",
+"special": true
+},
+{
+"id": 99596,
+"content": "<blank1>",
+"special": true
+},
+{
+"id": 99597,
+"content": "<blank2>",
+"special": true
+},
+{
+"id": 99598,
+"content": "<blank3>",
+"special": true
+},
+{
+"id": 99599,
+"content": "<blank4>",
+"special": true
+},
+{
+"id": 99600,
+"content": "<blank5>",
+"special": true
+},
+{
+"id": 99601,
+"content": "<blank6>",
+"special": true
+},
+{
+"id": 99602,
+"content": "<blank7>",
+"special": true
+},
+{
+"id": 99603,
+"content": "<blank8>",
+"special": true
+},
+{
+"id": 99604,
+"content": "<blank9>",
+"special": true
+},
+{
+"id": 99605,
+"content": "<blank10>",
+"special": true
+},
+{
+"id": 99606,
+"content": "<blank11>",
+"special": true
+},
+{
+"id": 99607,
+"content": "<blank12>",
+"special": true
+},
+{
+"id": 99608,
+"content": "<blank13>",
+"special": true
+},
+{
+"id": 99609,
+"content": "<blank14>",
+"special": true
+},
+{
+"id": 99610,
+"content": "<blank15>",
+"special": true
+},
+{
+"id": 99611,
+"content": "<blank16>",
+"special": true
+},
+{
+"id": 99612,
+"content": "<blank17>",
+"special": true
+},
+{
+"id": 99613,
+"content": "<blank18>",
+"special": true
+},
+{
+"id": 99614,
+"content": "<blank19>",
+"special": true
+},
+{
+"id": 99615,
+"content": "<blank20>",
+"special": true
+},
+{
+"id": 99616,
+"content": "<blank21>",
+"special": true
+},
+{
+"id": 99617,
+"content": "<blank22>",
+"special": true
+},
+{
+"id": 99618,
+"content": "<blank23>",
+"special": true
+},
+{
+"id": 99619,
+"content": "<blank24>",
+"special": true
+},
+{
+"id": 99620,
+"content": "<blank25>",
+"special": true
+},
+{
+"id": 99621,
+"content": "<blank26>",
+"special": true
+},
+{
+"id": 99622,
+"content": "<blank27>",
+"special": true
+},
+{
+"id": 99623,
+"content": "<asr_text>",
+"special": false
+},
+{
+"id": 99624,
+"content": "<digits>",
+"special": true
+},
+{
+"id": 99625,
+"content": "<nodigits>",
+"special": true
+},
+{
+"id": 99626,
+"content": "<filler>",
+"special": true
+},
+{
+"id": 99627,
+"content": "<nofiller>",
+"special": true
+},
+{
+"id": 99628,
+"content": "<verbatim>",
+"special": true
+},
+{
+"id": 99629,
+"content": "<noverbatim>",
+"special": true
+}
+]
+}

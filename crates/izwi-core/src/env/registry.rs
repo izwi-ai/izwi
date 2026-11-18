@@ -2630,6 +2630,20 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Makes Metal-feature tests fail instead of skipping when no Metal device exists.",
     ),
     CoreEnvVar::new(
+        "IZWI_RUMBLE_AUDIO_DTYPE",
+        Choice,
+        "f32",
+        Load,
+        "Overrides the dtype of Rumble's audio tower and projector (f32, f16, bf16); a lowered dtype must pass a load-time probe or the component reloads in F32.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_RUMBLE_TEXT_DTYPE",
+        Choice,
+        "CPU and Metal: f32; CUDA: the device's half precision (bf16 where supported)",
+        Load,
+        "Overrides the dtype of Rumble's decoder and its KV pages (f32, f16, bf16); a lowered dtype must pass a load-time probe or the decoder reloads in F32.",
+    ),
+    CoreEnvVar::new(
         "IZWI_SORTFORMER_PP_FILTER_SPEECH_FIRST",
         Flag,
         "true (preset value)",

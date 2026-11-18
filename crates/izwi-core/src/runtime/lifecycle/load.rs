@@ -137,6 +137,7 @@ enum LoadedAsrStatePublicationRoute {
     Parakeet,
     NemotronOffline,
     GraniteSpeech5,
+    Rumble,
     /// Allocated by `allocate_nemotron_transcribe_state` (retained rows).
     NemotronTranscribe,
     LegacyCache,
@@ -152,6 +153,7 @@ fn loaded_asr_state_publication_route(variant: ModelVariant) -> LoadedAsrStatePu
         crate::catalog::ModelFamily::GraniteSpeech5Asr => {
             LoadedAsrStatePublicationRoute::GraniteSpeech5
         }
+        crate::catalog::ModelFamily::RumbleAsr => LoadedAsrStatePublicationRoute::Rumble,
         crate::catalog::ModelFamily::NemotronTranscribeAsr => {
             LoadedAsrStatePublicationRoute::NemotronTranscribe
         }
@@ -207,6 +209,7 @@ fn uses_asr_model_registry(variant: ModelVariant) -> bool {
             | crate::catalog::ModelFamily::NemotronAsr
             | crate::catalog::ModelFamily::GraniteSpeechAsr
             | crate::catalog::ModelFamily::GraniteSpeech5Asr
+            | crate::catalog::ModelFamily::RumbleAsr
             | crate::catalog::ModelFamily::NemotronTranscribeAsr
             | crate::catalog::ModelFamily::Qwen3ForcedAligner
     )

@@ -389,6 +389,9 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         .sequence()
         .resumable()
         .chunked(),
+        // Rumble runs one atomic invocation on leased decoder pages; long
+        // audio is chunked inside the dispatch.
+        row(F::RumbleAsr, C::Asr, Loaded::Scalar, Invocation).chunked(),
         // Nemotron 3.5 Transcribe runs every request (up to an hour, one
         // pass) as a retained row: resumable prefill spans that encode the
         // perception windows they need, then decode batched across rows, on
