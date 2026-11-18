@@ -53,6 +53,14 @@ describe("speech route model filters", () => {
     );
   });
 
+  it("includes Rumble on transcription routes and nowhere else", () => {
+    expect(VIEW_CONFIGS.transcription.modelFilter("Rumble-2-Flash")).toBe(true);
+    expect(
+      VIEW_CONFIGS.transcription.modelFilter("Reson8/Rumble-2-Flash"),
+    ).toBe(true);
+    expect(VIEW_CONFIGS.chat.modelFilter("Rumble-2-Flash")).toBe(false);
+  });
+
   it("includes vibevoice asr on transcription routes", () => {
     expect(VIEW_CONFIGS.transcription.modelFilter("VibeVoice-ASR")).toBe(true);
     expect(

@@ -36,6 +36,7 @@ describe("analytics event helpers", () => {
   it("classifies model variants by analytics category", () => {
     expect(modelCategoryFromVariant("Qwen3.5-4B")).toBe("chat");
     expect(modelCategoryFromVariant("Qwen3-ASR-0.6B-GGUF")).toBe("asr");
+    expect(modelCategoryFromVariant("Rumble-2-Flash")).toBe("asr");
     expect(modelCategoryFromVariant("Kokoro-82M")).toBe("tts");
     expect(modelCategoryFromVariant("FishAudio-Drama-3")).toBe("tts");
     expect(modelCategoryFromVariant("UnmappedModel")).toBe("other");
