@@ -23,6 +23,8 @@ mod model;
 mod precision;
 mod prompt;
 #[cfg(test)]
+mod reference_tests;
+#[cfg(test)]
 mod synthetic;
 #[cfg(test)]
 mod tests;
