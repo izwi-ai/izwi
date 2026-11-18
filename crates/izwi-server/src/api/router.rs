@@ -3,7 +3,7 @@ use axum::{
     http::{header, HeaderValue, StatusCode},
     middleware,
     response::Response,
-    routing::get,
+    routing::{get, MethodRouter},
     Router,
 };
 use izwi_core::ServeRuntimeConfig;
@@ -17,6 +17,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{field, info, info_span, warn, Span};
 
 use crate::api::request_context::{attach_enterprise_request_context, RequestTrace};
+use crate::api::web_ui::{has_built_in_ui, select_ui_source, serve_built_in_ui, UiSource};
 use crate::local_security::{guard_local_request, LocalRequestGuard};
 use crate::logging::{SERVICE_NAME, SERVICE_VERSION};
 use crate::state::AppState;
@@ -174,17 +175,47 @@ fn apply_ui_fallback(app: Router, serve_config: &ServeRuntimeConfig) -> Router {
     if !serve_config.ui_enabled {
         return app;
     }
-    let index_path = serve_config.ui_dir.join("index.html");
-    app.fallback_service(
-        ServiceBuilder::new()
-            .layer(SetResponseHeaderLayer::overriding(
-                header::CONTENT_SECURITY_POLICY,
-                HeaderValue::from_static(UI_CONTENT_SECURITY_POLICY),
-            ))
-            .service(
-                ServeDir::new(serve_config.ui_dir.clone()).fallback(ServeFile::new(index_path)),
-            ),
-    )
+    let source = select_ui_source(&serve_config.ui_dir, has_built_in_ui());
+    match &source {
+        UiSource::Directory(ui_dir) => {
+            info!(ui_dir = %ui_dir.display(), "Serving the web UI from a folder");
+        }
+        UiSource::BuiltIn => info!("Serving the web UI built into this server"),
+        UiSource::Missing => warn!(
+            ui_dir = %serve_config.ui_dir.display(),
+            "No web UI to serve: the UI folder has no index.html and this build has no \
+             built-in UI. Build it with `npm --prefix ui run build`, set IZWI_UI_DIR, or \
+             pass --no-ui"
+        ),
+    }
+    apply_ui_source(app, source)
+}
+
+fn apply_ui_source(app: Router, source: UiSource) -> Router {
+    let content_security_policy = SetResponseHeaderLayer::overriding(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(UI_CONTENT_SECURITY_POLICY),
+    );
+    match source {
+        UiSource::Directory(ui_dir) => {
+            let index_path = ui_dir.join("index.html");
+            app.fallback_service(
+                ServiceBuilder::new()
+                    .layer(content_security_policy)
+                    .service(ServeDir::new(ui_dir).fallback(ServeFile::new(index_path))),
+            )
+        }
+        UiSource::BuiltIn => {
+            // GET and HEAD only, like the folder service: other methods get 405.
+            let built_in: MethodRouter = get(serve_built_in_ui);
+            app.fallback_service(
+                ServiceBuilder::new()
+                    .layer(content_security_policy)
+                    .service(built_in),
+            )
+        }
+        UiSource::Missing => app,
+    }
 }
 
 fn apply_cors(app: Router, serve_config: &ServeRuntimeConfig) -> Router {

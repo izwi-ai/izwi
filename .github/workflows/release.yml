@@ -175,7 +175,7 @@ jobs:
       - name: Test UI
         run: npm --prefix ui test
 
-      - name: Build UI dist (required by izwi-desktop compile-time Tauri config)
+      - name: Build UI dist (izwi-server and izwi-desktop embed it at compile time)
         run: npm --prefix ui run build
 
       - name: Build CLI, gateway, supervisor, and worker binaries (Linux/Windows)
@@ -197,6 +197,21 @@ jobs:
           cargo build --release -p izwi-gateway --features db-postgres
           cargo build --release -p izwi-serving-supervisor
           cargo build --release -p izwi-serving-worker --features metal
+
+      - name: Verify izwi-server has the web UI built in
+        shell: bash
+        run: |
+          # Release installs have no ui/dist beside the binary, so the web UI
+          # must be embedded (crates/izwi-server/src/api/web_ui.rs). A server
+          # compiled before the UI build would ship without it.
+          entry="$(grep -o 'src="/assets/[^"]*\.js"' ui/dist/index.html | head -n 1 | sed 's|^src="/||; s|"$||')"
+          binary=target/release/izwi-server
+          if [[ -f "$binary.exe" ]]; then binary="$binary.exe"; fi
+          # -a: search the binary as text (BSD grep skips binary files).
+          if [[ -z "$entry" ]] || ! LC_ALL=C grep -aqF "$entry" "$binary"; then
+            echo "::error::$binary does not embed the web UI (ui/dist entry '${entry:-none}')."
+            exit 1
+          fi
 
       - name: Build desktop binary
         env:

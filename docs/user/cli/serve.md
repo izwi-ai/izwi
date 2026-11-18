@@ -90,6 +90,10 @@ izwi serve --mode web
 
 When `--no-ui` is set, web mode opens `http://<host>:<port>/v1/ready` instead of the UI root.
 
+The web UI is built into `izwi-server`, so release installs serve it from any folder. When
+the UI directory (`ui.dir` or `IZWI_UI_DIR`, default `ui/dist`) holds an `index.html`, the
+server serves that folder instead, as it does in a source checkout or the Docker image.
+
 ---
 
 ## Examples
@@ -162,7 +166,7 @@ izwi serve --mode web --no-ui
 | `IZWI_CORS` | `--cors` |
 | `IZWI_CORS_ORIGINS` | CORS origin list (no flag; same as `server.cors_origins`) |
 | `IZWI_NO_UI` | `--no-ui` |
-| `IZWI_UI_DIR` | UI build directory (no flag; same as `ui.dir`) |
+| `IZWI_UI_DIR` | UI build directory (no flag; same as `ui.dir`). Used when it holds an `index.html`; otherwise the server serves its built-in UI |
 | `RUST_LOG` | `--log-level` |
 | `IZWI_LOG_FORMAT` | `--log-format` |
 | `IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS` | Environment only: how long a streamed chat answer waits for a client that stopped reading before it fails (default `30000`). While the client lags, text is merged rather than dropped |

@@ -1,4 +1,5 @@
 use super::*;
+use crate::api::web_ui::built_in_ui_response;
 use crate::batch_runtime::{
     store::{NewJobStage, NewRuntimeArtifact, NewRuntimeJob},
     types::{
@@ -24,6 +25,7 @@ use izwi_hooks::{
     AuthProvider, AuthorizationDecision, AuthorizationRequest, EnterpriseHooks, HookError,
     HookResult, PolicyEngine, Principal, RequestEnvelope,
 };
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -214,6 +216,122 @@ async fn disabled_ui_returns_not_found_for_unknown_routes() {
             ui_enabled: false,
             ..ServeRuntimeConfig::default()
         },
+    );
+
+    let response = send_request(
+        app,
+        Request::builder()
+            .uri("/missing")
+            .body(Body::empty())
+            .expect("request should build"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn ui_folder_with_an_index_wins_over_the_built_in_ui() {
+    let ui_dir = test_ui_dir("ui_folder_with_an_index_wins_over_the_built_in_ui");
+
+    // No folder, or a folder without an index (an unbuilt checkout): the
+    // built-in UI if this binary has one, otherwise no UI.
+    assert_eq!(select_ui_source(&ui_dir, true), UiSource::BuiltIn);
+    assert_eq!(select_ui_source(&ui_dir, false), UiSource::Missing);
+    std::fs::create_dir_all(&ui_dir).expect("ui dir should be created");
+    assert_eq!(select_ui_source(&ui_dir, true), UiSource::BuiltIn);
+
+    std::fs::write(ui_dir.join("index.html"), "<html>ui</html>").expect("index should be written");
+    assert_eq!(
+        select_ui_source(&ui_dir, true),
+        UiSource::Directory(ui_dir.clone())
+    );
+    assert_eq!(
+        select_ui_source(&ui_dir, false),
+        UiSource::Directory(ui_dir.clone())
+    );
+
+    std::fs::remove_dir_all(ui_dir).expect("ui dir should be removed");
+}
+
+#[tokio::test]
+async fn built_in_ui_serves_files_and_sends_other_paths_to_the_index() {
+    let lookup = |path: &str| -> Option<Cow<'static, [u8]>> {
+        match path {
+            "index.html" => Some(Cow::Borrowed(b"<html>ui</html>")),
+            "app.js" => Some(Cow::Borrowed(b"console.log('ui')")),
+            "assets/main-abc123.js" => Some(Cow::Borrowed(b"export {}")),
+            _ => None,
+        }
+    };
+    let index = ("<html>ui</html>", "text/html", "no-cache");
+    let immutable = "public, max-age=31536000, immutable";
+
+    // The same table as the folder service's test, plus a hashed asset.
+    for (uri, (body, content_type, cache_control)) in [
+        ("/", index),
+        ("/missing", index),
+        ("/models/", index),
+        ("/app.js/", index),
+        (
+            "/app.js",
+            ("console.log('ui')", "text/javascript", "no-cache"),
+        ),
+        (
+            "/assets/main-abc123.js",
+            ("export {}", "text/javascript", immutable),
+        ),
+    ] {
+        let response = built_in_ui_response(uri, lookup);
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static(content_type)),
+            "{uri}"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static(cache_control)),
+            "{uri}"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        assert_eq!(bytes, body, "{uri}");
+    }
+}
+
+#[test]
+fn built_in_ui_without_an_index_is_not_found() {
+    let response = built_in_ui_response("/missing", |_| None);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn built_in_ui_answers_only_get_and_head() {
+    let app = apply_ui_source(
+        Router::new().route("/hello", get(|| async { "ok" })),
+        UiSource::BuiltIn,
+    );
+
+    let response = send_request(
+        app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/")
+            .body(Body::empty())
+            .expect("request should build"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn missing_ui_leaves_unknown_routes_not_found() {
+    let app = apply_ui_source(
+        Router::new().route("/hello", get(|| async { "ok" })),
+        UiSource::Missing,
     );
 
     let response = send_request(
