@@ -2622,6 +2622,16 @@ pub struct TranscriptionMultipartRequest {
     /// as Nemotron-3.5-Transcribe-30B-A4B-FP8; others reject it with 400).
     /// verbose_json then carries `speaker_turns`.
     pub speaker_labels: Option<bool>,
+    /// Izwi extension, for models whose route_capabilities report
+    /// `transcript_style` (Rumble-2-Flash; others reject it with 400):
+    /// write numbers as digits (`true`, the default) or as words.
+    pub digits: Option<bool>,
+    /// Izwi extension (models with `transcript_style`): keep fillers such as
+    /// "um" and "uh" (`true`) or drop them (the default).
+    pub filler: Option<bool>,
+    /// Izwi extension (models with `transcript_style`): keep repeated words
+    /// (`true`, the default) or collapse them.
+    pub verbatim: Option<bool>,
     pub max_tokens: Option<usize>,
     /// 0 to 1, checked and without effect: every ASR model decodes
     /// greedily (Whisper with its fallback ladder from 0).
@@ -2664,6 +2674,16 @@ pub struct TranscriptionJsonRequest {
     /// as Nemotron-3.5-Transcribe-30B-A4B-FP8; others reject it with 400).
     /// verbose_json then carries `speaker_turns`.
     pub speaker_labels: Option<bool>,
+    /// Izwi extension, for models whose route_capabilities report
+    /// `transcript_style` (Rumble-2-Flash; others reject it with 400):
+    /// write numbers as digits (`true`, the default) or as words.
+    pub digits: Option<bool>,
+    /// Izwi extension (models with `transcript_style`): keep fillers such as
+    /// "um" and "uh" (`true`) or drop them (the default).
+    pub filler: Option<bool>,
+    /// Izwi extension (models with `transcript_style`): keep repeated words
+    /// (`true`, the default) or collapse them.
+    pub verbatim: Option<bool>,
     pub max_tokens: Option<usize>,
     /// 0 to 1, checked and without effect: every ASR model decodes
     /// greedily (Whisper with its fallback ladder from 0).

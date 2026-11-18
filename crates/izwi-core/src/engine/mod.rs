@@ -184,7 +184,7 @@ pub use metrics::{
 };
 pub use output::{AsrProgress, AsrProgressPhase, OutputProcessor, StreamingOutput};
 pub use request::{
-    AsrEngineInput, AsrTaskOptions, AudioChatEngineInput, ChatEngineInput, EngineAudioInput,
+    AsrEngineInput, AsrTaskOptions, AsrTranscriptStyle, AudioChatEngineInput, ChatEngineInput, EngineAudioInput,
     EngineCoreRequest, EngineStreamPolicy, EngineTask, RealtimeAsrOperationAck,
     RealtimeAsrOperationKind, RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
 };

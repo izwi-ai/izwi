@@ -217,6 +217,26 @@ pub struct AsrEngineInput {
     pub prompt: Option<String>,
 }
 
+/// How a transcript is written, for models that take the choice
+/// (`ModelVariant::supports_asr_transcript_style`). `None` leaves a setting
+/// at the model's default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct AsrTranscriptStyle {
+    /// Numbers as digits (`true`) or as words (`false`).
+    pub digits: Option<bool>,
+    /// Keep fillers such as "um" and "uh" (`true`) or drop them.
+    pub filler: Option<bool>,
+    /// Keep repeated words (`true`) or collapse them.
+    pub verbatim: Option<bool>,
+}
+
+impl AsrTranscriptStyle {
+    /// Whether every setting is left at the model's default.
+    pub fn is_default(&self) -> bool {
+        self.digits.is_none() && self.filler.is_none() && self.verbatim.is_none()
+    }
+}
+
 /// What an ASR request asks for beyond transcription in the spoken language.
 /// Only families that report the capability accept a non-empty value
 /// (`ModelVariant::supports_asr_translation`, `supports_asr_keyword_biasing`).
@@ -229,6 +249,9 @@ pub struct AsrTaskOptions {
     /// Tag the transcript with speakers
     /// (`ModelVariant::supports_asr_speaker_tags`).
     pub speaker_attribution: bool,
+    /// How the transcript is written
+    /// (`ModelVariant::supports_asr_transcript_style`).
+    pub style: AsrTranscriptStyle,
 }
 
 impl AsrTaskOptions {
@@ -244,7 +267,14 @@ impl AsrTaskOptions {
                 .filter(|keyword| !keyword.is_empty())
                 .collect(),
             speaker_attribution: false,
+            style: AsrTranscriptStyle::default(),
         }
+    }
+
+    /// The same options with the transcript style set.
+    pub fn with_style(mut self, style: AsrTranscriptStyle) -> Self {
+        self.style = style;
+        self
     }
 
     /// The same options with speaker tags on or off.

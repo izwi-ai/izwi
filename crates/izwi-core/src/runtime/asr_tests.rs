@@ -1210,6 +1210,49 @@ fn asr_response_language_prefers_the_hint_then_the_detected_language() {
 }
 
 #[test]
+fn only_a_model_with_style_options_takes_a_transcript_style() {
+    use crate::engine::AsrTranscriptStyle;
+    let words = AsrTaskOptions::default().with_style(AsrTranscriptStyle {
+        digits: Some(false),
+        ..AsrTranscriptStyle::default()
+    });
+    assert!(!words.style.is_default());
+    validate_asr_task(ModelVariant::Rumble2Flash, None, None, &words).unwrap();
+    validate_asr_task(
+        ModelVariant::Rumble2Flash,
+        Some("nl"),
+        Some("Izwi"),
+        &AsrTaskOptions::default(),
+    )
+    .unwrap();
+    for variant in [
+        ModelVariant::Qwen3Asr06BGguf,
+        ModelVariant::WhisperLargeV3Turbo,
+        ModelVariant::GraniteSpeech502B,
+    ] {
+        let error = validate_asr_task(variant, None, None, &words)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("transcript style"), "{variant}: {error}");
+        validate_asr_task(variant, None, None, &AsrTaskOptions::default()).unwrap();
+    }
+    // Rumble takes none of the other task options, and a context prompt
+    // has a bound.
+    let keywords = AsrTaskOptions::new(None, vec!["Izwi".to_string()]);
+    assert!(validate_asr_task(ModelVariant::Rumble2Flash, None, None, &keywords).is_err());
+    let long = "word ".repeat(1_000);
+    assert!(validate_asr_task(
+        ModelVariant::Rumble2Flash,
+        None,
+        Some(&long),
+        &AsrTaskOptions::default()
+    )
+    .is_err());
+    // The style is part of what a prepared artifact is keyed on.
+    assert_ne!(words, AsrTaskOptions::default());
+}
+
+#[test]
 fn only_granite_speech_5_takes_a_translation_target_or_keywords() {
     let granite5 = ModelVariant::GraniteSpeech502B;
     let translate = AsrTaskOptions::new(Some("English".to_string()), Vec::new());

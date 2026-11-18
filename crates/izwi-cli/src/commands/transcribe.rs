@@ -17,6 +17,16 @@ pub struct TranscribeArgs {
     pub output: Option<PathBuf>,
     pub word_timestamps: bool,
     pub speaker_labels: bool,
+    pub style: TranscriptStyle,
+}
+
+/// Transcript style options (`digits`, `filler`, `verbatim`); `None` leaves
+/// the model's default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TranscriptStyle {
+    pub digits: Option<bool>,
+    pub filler: Option<bool>,
+    pub verbatim: Option<bool>,
 }
 
 pub async fn execute(args: TranscribeArgs, server: &str) -> Result<()> {
@@ -32,6 +42,7 @@ pub async fn execute(args: TranscribeArgs, server: &str) -> Result<()> {
         output,
         word_timestamps,
         speaker_labels,
+        style,
     } = args;
 
     // Verify file exists
@@ -55,6 +66,7 @@ pub async fn execute(args: TranscribeArgs, server: &str) -> Result<()> {
         format,
         word_timestamps,
         speaker_labels,
+        style,
     };
     for (name, value) in fields.into_form_fields() {
         form = form.text(name, value);
@@ -97,6 +109,7 @@ struct TranscriptionFormFields {
     format: TranscriptFormat,
     word_timestamps: bool,
     speaker_labels: bool,
+    style: TranscriptStyle,
 }
 
 impl TranscriptionFormFields {
@@ -150,6 +163,16 @@ impl TranscriptionFormFields {
             fields.push(("speaker_labels", "true".to_string()));
         }
 
+        for (name, value) in [
+            ("digits", self.style.digits),
+            ("filler", self.style.filler),
+            ("verbatim", self.style.verbatim),
+        ] {
+            if let Some(value) = value {
+                fields.push((name, value.to_string()));
+            }
+        }
+
         fields
     }
 }
@@ -165,6 +188,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn style_options_send_only_the_fields_that_were_set() {
+        let fields = |style: TranscriptStyle| {
+            TranscriptionFormFields {
+                model: "Rumble-2-Flash".to_string(),
+                language: None,
+                prompt: None,
+                translate_to: None,
+                keywords: Vec::new(),
+                max_tokens: None,
+                format: TranscriptFormat::Text,
+                word_timestamps: false,
+                speaker_labels: false,
+                style,
+            }
+            .into_form_fields()
+        };
+        let default = fields(TranscriptStyle::default());
+        for name in ["digits", "filler", "verbatim"] {
+            assert!(!default.iter().any(|(field, _)| *field == name), "{name}");
+        }
+        let set = fields(TranscriptStyle {
+            digits: Some(false),
+            filler: Some(true),
+            verbatim: Some(false),
+        });
+        assert!(set.contains(&("digits", "false".to_string())));
+        assert!(set.contains(&("filler", "true".to_string())));
+        assert!(set.contains(&("verbatim", "false".to_string())));
+        assert!(set.contains(&("response_format", "text".to_string())));
+    }
+
+    #[test]
     fn speaker_labels_ask_for_verbose_json_and_the_extension_field() {
         let fields = TranscriptionFormFields {
             model: "Nemotron-3.5-Transcribe-30B-A4B-FP8".to_string(),
@@ -176,6 +231,7 @@ mod tests {
             format: TranscriptFormat::Text,
             word_timestamps: false,
             speaker_labels: true,
+            style: TranscriptStyle::default(),
         }
         .into_form_fields();
         assert!(fields.contains(&("response_format", "verbose_json".to_string())));
@@ -197,6 +253,7 @@ mod tests {
             format: TranscriptFormat::Text,
             word_timestamps: true,
             speaker_labels: false,
+            style: TranscriptStyle::default(),
         }
         .into_form_fields();
         let field = |name: &str| {
@@ -233,6 +290,7 @@ mod tests {
             format: TranscriptFormat::Text,
             word_timestamps: false,
             speaker_labels: false,
+            style: TranscriptStyle::default(),
         }
         .into_form_fields();
 

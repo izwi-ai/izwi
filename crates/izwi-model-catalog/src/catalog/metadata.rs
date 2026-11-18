@@ -1120,6 +1120,13 @@ impl ModelVariant {
         )
     }
 
+    /// Whether a transcription request may choose how this model writes its
+    /// transcript: numbers as digits or words, fillers kept or dropped,
+    /// repeated words kept or collapsed (Rumble's control tokens).
+    pub fn supports_asr_transcript_style(&self) -> bool {
+        matches!(self, Self::Rumble2Flash)
+    }
+
     /// Whether this model diarizes a recording on its own (speaker tags,
     /// its diarizer's segments and CTC word times from one transcription),
     /// so a diarization job naming it loads no diarizer, ASR or aligner.
@@ -2895,6 +2902,8 @@ mod tests {
         assert!(!variant.supports_asr_keyword_biasing());
         assert!(!variant.supports_speaker_attributed_asr());
         assert!(!variant.supports_native_word_timestamps());
+        assert!(variant.supports_asr_transcript_style());
+        assert!(!ModelVariant::Qwen3Asr06BGguf.supports_asr_transcript_style());
         let serialized = serde_json::to_string(&variant).unwrap();
         assert_eq!(serialized, "\"Rumble-2-Flash\"");
         for alias in ["Rumble-2-Flash", "Reson8/Rumble-2-Flash", "rumble-2-flash"] {

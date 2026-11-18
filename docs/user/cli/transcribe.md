@@ -38,6 +38,9 @@ Transcribes audio files to text using automatic speech recognition (ASR). Suppor
 | `--prompt <TEXT>` | Initial ASR prompt or keyword guidance | — |
 | `--translate-to <LANGUAGE>` | Translate the speech into this language instead of transcribing it (models with speech translation, such as `Granite-Speech-5.0-2B` and `Nemotron-3.5-Transcribe-30B-A4B-FP8`) | — |
 | `--keyword <TERM>` | A term to bias recognition toward; repeat for more (models with keyword biasing, such as `Granite-Speech-5.0-2B` and `Nemotron-3.5-Transcribe-30B-A4B-FP8`) | — |
+| `--numbers <digits\|words>` | Write numbers as digits or as words (models with transcript style options, such as `Rumble-2-Flash`) | Model default |
+| `--keep-fillers` | Keep fillers such as "um" and "uh" (models with transcript style options) | Dropped |
+| `--collapse-repeats` | Collapse repeated words (models with transcript style options) | Kept |
 | `--max-tokens <N>` | Maximum number of ASR decoder tokens to generate | Model default |
 | `-f, --format <FORMAT>` | Output format: `text`, `json`, `verbose-json` | `text` |
 | `-o, --output <PATH>` | Output file (default: stdout) | — |

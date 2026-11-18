@@ -1345,6 +1345,7 @@
           "speech_to_text_realtime",
           "speech_translation",
           "keyword_biasing",
+          "transcript_style",
           "speaker_attributed_asr",
           "native_word_timestamps",
           "diarization_records",
@@ -1421,6 +1422,10 @@
           },
           "tokenizer": {
             "type": "boolean"
+          },
+          "transcript_style": {
+            "type": "boolean",
+            "description": "Transcription requests may set `digits`, `filler` and `verbatim`."
           },
           "voice_clone_records": {
             "type": "boolean"
@@ -3510,6 +3515,20 @@
           "chunking_strategy": {
             "description": "`\"auto\"`, the server's own splitting of long audio at pauses, or\nomitted. A `server_vad` object is refused with 400."
           },
+          "digits": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Izwi extension, for models whose route_capabilities report\n`transcript_style` (Rumble-2-Flash; others reject it with 400):\nwrite numbers as digits (`true`, the default) or as words."
+          },
+          "filler": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Izwi extension (models with `transcript_style`): keep fillers such as\n\"um\" and \"uh\" (`true`) or drop them (the default)."
+          },
           "include": {
             "type": [
               "array",
@@ -3605,6 +3624,13 @@
             "items": {
               "type": "string"
             }
+          },
+          "verbatim": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Izwi extension (models with `transcript_style`): keep repeated words\n(`true`, the default) or collapse them."
           }
         }
       },
@@ -3629,9 +3655,23 @@
           "chunking_strategy": {
             "description": "`\"auto\"`, the server's own splitting of long audio at pauses, or\nomitted. A `server_vad` object is refused with 400."
           },
+          "digits": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Izwi extension, for models whose route_capabilities report\n`transcript_style` (Rumble-2-Flash; others reject it with 400):\nwrite numbers as digits (`true`, the default) or as words."
+          },
           "file": {
             "type": "string",
             "format": "binary"
+          },
+          "filler": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Izwi extension (models with `transcript_style`): keep fillers such as\n\"um\" and \"uh\" (`true`) or drop them (the default)."
           },
           "include": {
             "type": [
@@ -3728,6 +3768,13 @@
             "items": {
               "type": "string"
             }
+          },
+          "verbatim": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Izwi extension (models with `transcript_style`): keep repeated words\n(`true`, the default) or collapse them."
           }
         }
       },

@@ -37,6 +37,16 @@ impl Default for RumbleTranscriptStyle {
 }
 
 impl RumbleTranscriptStyle {
+    /// A request's style over the model's defaults.
+    pub fn from_request(style: &crate::engine::AsrTranscriptStyle) -> Self {
+        let defaults = Self::default();
+        Self {
+            digits: style.digits.unwrap_or(defaults.digits),
+            fillers: style.filler.unwrap_or(defaults.fillers),
+            verbatim: style.verbatim.unwrap_or(defaults.verbatim),
+        }
+    }
+
     /// The three control ids, in the template's order.
     pub fn control_ids(&self, specials: &RumbleSpecialTokens) -> [u32; 3] {
         [

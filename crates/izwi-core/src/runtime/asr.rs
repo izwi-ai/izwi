@@ -512,6 +512,11 @@ pub fn validate_asr_task(
             "{variant} does not take keywords; pass them in the prompt instead"
         )));
     }
+    if !task.style.is_default() && !variant.supports_asr_transcript_style() {
+        return Err(Error::InvalidInput(format!(
+            "{variant} has no transcript style options (`digits`, `filler`, `verbatim`)"
+        )));
+    }
     if task.speaker_attribution && !variant.supports_asr_speaker_tags() {
         return Err(Error::InvalidInput(format!(
             "{variant} does not tag speakers in a transcript"
@@ -530,7 +535,9 @@ pub fn validate_asr_task(
             &crate::models::architectures::rumble::RumbleRequestOptions {
                 language: language.map(str::to_string),
                 prompt: prompt.map(str::to_string),
-                ..Default::default()
+                style: crate::models::architectures::rumble::RumbleTranscriptStyle::from_request(
+                    &task.style,
+                ),
             },
         ),
         // The instruction the request would render: languages, the

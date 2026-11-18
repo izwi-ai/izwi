@@ -55,7 +55,9 @@ use super::{
 use crate::models::architectures::granite_speech5::asr::{
     granite_speech5_auto_max_tokens_for_duration, GraniteSpeech5RequestOptions,
 };
-use crate::models::architectures::rumble::{RumbleRequestOptions, RUMBLE_DEFAULT_MAX_NEW_TOKENS};
+use crate::models::architectures::rumble::{
+    RumbleRequestOptions, RumbleTranscriptStyle, RUMBLE_DEFAULT_MAX_NEW_TOKENS,
+};
 use granite_speech5::{recover_granite_speech5_chunk, ChunkRecoveryLimits};
 
 #[path = "handler_asr/continuous.rs"]
@@ -643,7 +645,7 @@ impl NativeExecutor {
         let rumble_request = RumbleRequestOptions {
             language: language.map(str::to_string),
             prompt: asr_prompt.map(str::to_string),
-            ..RumbleRequestOptions::default()
+            style: RumbleTranscriptStyle::from_request(&request.asr_task.style),
         };
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;

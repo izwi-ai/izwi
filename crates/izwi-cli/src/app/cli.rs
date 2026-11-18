@@ -529,6 +529,20 @@ pub enum Commands {
         /// (models that do, such as Nemotron-3.5-Transcribe-30B-A4B-FP8)
         #[arg(long)]
         speaker_labels: bool,
+
+        /// Write numbers as digits or as words (models with transcript
+        /// style options, such as Rumble-2-Flash; default: the model's)
+        #[arg(long, value_enum, value_name = "STYLE")]
+        numbers: Option<NumberStyle>,
+
+        /// Keep fillers such as "um" and "uh" (models with transcript style
+        /// options)
+        #[arg(long)]
+        keep_fillers: bool,
+
+        /// Collapse repeated words (models with transcript style options)
+        #[arg(long)]
+        collapse_repeats: bool,
     },
 
     /// Chat with a multimodal model
@@ -930,6 +944,13 @@ pub enum AudioFormat {
     Opus,
     /// FLAC (lossless)
     Flac,
+}
+
+/// How a transcript writes numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum NumberStyle {
+    Digits,
+    Words,
 }
 
 #[derive(Clone, ValueEnum)]
