@@ -756,9 +756,15 @@ impl AudioTower {
             remaining -= take;
         }
 
+        // The last chunk reads the frames the caller supplied past the valid
+        // length (the reference pads the waveform with silence before the
+        // STFT, so those frames are the mel of silence, not zeros); only
+        // frames the tensor does not hold are zero.
+        let available = feature_seq.dim(0)?;
         let mut chunks = Vec::with_capacity(chunk_lengths.len());
         let mut offset = 0usize;
-        for &len in &chunk_lengths {
+        for _ in &chunk_lengths {
+            let len = (available - offset).min(chunk_input_len);
             let chunk = feature_seq.narrow(0, offset, len)?;
             offset += len;
             if len < chunk_input_len {
@@ -891,13 +897,16 @@ impl AudioTower {
         }
 
         let mut chunks = Vec::with_capacity(all_chunk_lengths.len());
-        for (row, (&input_len, &chunk_count)) in
-            feature_lens.iter().zip(row_chunk_counts.iter()).enumerate()
-        {
+        for (row, &chunk_count) in row_chunk_counts.iter().enumerate() {
             let feature_row = features.i(row)?;
+            // A row's last chunk reads the frames the caller supplied past
+            // its valid length (the reference pads the waveform with silence
+            // before the STFT, so those frames are the mel of silence, not
+            // zeros); only frames the tensor does not hold are zero.
+            let available = feature_row.dim(0)?;
             for chunk in 0..chunk_count {
                 let offset = chunk * chunk_input_len;
-                let length = (input_len - offset).min(chunk_input_len);
+                let length = (available - offset).min(chunk_input_len);
                 let values = feature_row.narrow(0, offset, length)?;
                 if length == chunk_input_len {
                     chunks.push(values);

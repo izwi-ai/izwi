@@ -348,9 +348,11 @@ impl RumbleAsrModel {
         features: &RumbleAudioFeatures,
     ) -> Result<RumbleAudioEmbeddings> {
         let upload_started = Instant::now();
+        // The padded frames ride along: the tower reads them as its last
+        // chunk's padding and encodes `mel_frames` of them.
         let input = Tensor::from_slice(
             &features.flat,
-            (1, features.mel_frames, features.n_mels),
+            (1, features.padded_frames, features.n_mels),
             &self.device.device,
         )?
         .to_dtype(self.audio_dtype())?;

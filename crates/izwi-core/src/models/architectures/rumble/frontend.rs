@@ -1,5 +1,13 @@
 //! Rumble's audio front end on the host: resample to 16 kHz, pad very short
-//! clips, and compute Whisper-style log-mel features.
+//! clips, and compute Whisper-style log-mel features as the published
+//! feature extractor does.
+//!
+//! The reference pads every clip with silence to its 30 s window before the
+//! STFT and marks `ceil(samples / hop)` frames valid. So the last frames of
+//! a clip see silence after it (not the reflected signal), and the audio
+//! tower's last 100-frame chunk is filled with the mel of that silence. This
+//! front end pads the waveform to the next whole chunk the same way and
+//! hands the tower those frames beside the valid count.
 
 use std::time::Instant;
 
@@ -16,11 +24,15 @@ pub const RUMBLE_MAX_AUDIO_SECONDS: f32 = 30.0;
 /// Audio tokens per second: 13 per 100 mel frames at 100 frames per second.
 pub const RUMBLE_AUDIO_TOKENS_PER_SECOND: f32 = 13.0;
 
-/// One request's log-mel features, frame-major (`[frames, n_mels]`).
+/// One request's log-mel features, frame-major (`[padded_frames, n_mels]`).
 #[derive(Debug, Clone)]
 pub struct RumbleAudioFeatures {
     pub flat: Vec<f32>,
+    /// Frames of audio: the tower's valid length.
     pub mel_frames: usize,
+    /// Frames in `flat`: `mel_frames` rounded up to a whole conv chunk, the
+    /// extra ones the mel of the silence the waveform was padded with.
+    pub padded_frames: usize,
     pub n_mels: usize,
     /// Audio tokens the tower emits for these frames.
     pub audio_tokens: usize,
@@ -38,6 +50,8 @@ pub struct RumbleFrontend {
     mel: MelSpectrogram,
     min_samples: usize,
     max_frames: usize,
+    /// Mel frames per conv chunk of the audio tower (`2 * n_window`).
+    chunk_frames: usize,
 }
 
 impl RumbleFrontend {
@@ -61,6 +75,7 @@ impl RumbleFrontend {
             mel,
             min_samples: config.min_length,
             max_frames,
+            chunk_frames: (config.n_window * 2).max(1),
         })
     }
 
@@ -77,10 +92,12 @@ impl RumbleFrontend {
         self.max_frames
     }
 
-    /// Mel frames for `resampled_samples` of 16 kHz audio: one per hop, after
-    /// the minimum-length pad.
+    /// Valid mel frames for `resampled_samples` of 16 kHz audio: one per
+    /// started hop, after the minimum-length pad.
     pub fn mel_frames_for(&self, resampled_samples: usize) -> usize {
-        resampled_samples.max(self.min_samples) / self.hop_length().max(1)
+        resampled_samples
+            .max(self.min_samples)
+            .div_ceil(self.hop_length().max(1))
     }
 
     /// Features for one invocation of audio.
@@ -107,21 +124,34 @@ impl RumbleFrontend {
             samples.resize(self.min_samples, 0.0);
         }
 
-        let mel_started = Instant::now();
-        let (flat, mel_frames) = log_mel(&self.mel, &samples)?;
-        let mel_ms = mel_started.elapsed().as_secs_f64() * 1000.0;
-        if mel_frames == 0 {
-            return Err(Error::InvalidInput("Empty audio input".into()));
-        }
+        let hop = self.hop_length().max(1);
+        let mel_frames = samples.len().div_ceil(hop);
         if mel_frames > self.max_frames {
             return Err(Error::InvalidInput(format!(
                 "Rumble transcribes up to {RUMBLE_MAX_AUDIO_SECONDS:.0}s per invocation, got {audio_seconds:.1}s"
+            )));
+        }
+        // Silence to the next whole chunk, and one FFT window more so the
+        // STFT's reflection at the end reflects silence; never past the
+        // reference's 30 s window, whose own end is reflected.
+        let padded_frames = mel_frames.div_ceil(self.chunk_frames) * self.chunk_frames;
+        let window_samples = self.max_frames * hop;
+        let padded_len = (padded_frames * hop + self.mel.config().n_fft).min(window_samples);
+        samples.resize(padded_len.max(samples.len()), 0.0);
+
+        let mel_started = Instant::now();
+        let (flat, computed_frames) = log_mel(&self.mel, &samples, padded_frames)?;
+        let mel_ms = mel_started.elapsed().as_secs_f64() * 1000.0;
+        if computed_frames != padded_frames {
+            return Err(Error::InferenceError(format!(
+                "Rumble mel geometry drifted: expected {padded_frames} frames, computed {computed_frames}"
             )));
         }
         let audio_tokens = get_cnn_output_lengths(&[mel_frames])[0];
         Ok(RumbleAudioFeatures {
             flat,
             mel_frames,
+            padded_frames,
             n_mels: self.n_mels(),
             audio_tokens,
             input_sample_rate: sample_rate,
@@ -137,13 +167,18 @@ impl RumbleFrontend {
 
 /// Whisper log-mel features as the published feature extractor computes
 /// them: the centre-padded STFT without its last frame, clamped to
-/// `max - 8` and scaled, the max taken over the kept frames.
-fn log_mel(mel: &MelSpectrogram, samples: &[f32]) -> Result<(Vec<f32>, usize)> {
+/// `max - 8` and scaled. The max is taken over every computed frame (the
+/// reference takes it over its whole padded window, whose frames past these
+/// are silence and never the max); the first `keep` frames are returned.
+fn log_mel(mel: &MelSpectrogram, samples: &[f32], keep: usize) -> Result<(Vec<f32>, usize)> {
     debug_assert!(!mel.config().normalize);
+    let n_mels = mel.config().n_mels;
     let (mut flat, frames) = mel.compute_flat(samples)?;
-    let kept = frames.saturating_sub(1);
-    flat.truncate(kept * mel.config().n_mels);
+    let computed = frames.saturating_sub(1);
+    flat.truncate(computed * n_mels);
     MelSpectrogram::whisper_normalize_flat(&mut flat);
+    let kept = keep.min(computed);
+    flat.truncate(kept * n_mels);
     Ok((flat, kept))
 }
 
@@ -172,14 +207,49 @@ mod tests {
         let frontend = frontend();
         let features = frontend.prepare(&tone(48_000), 16_000).unwrap();
         assert_eq!(features.mel_frames, 300);
+        assert_eq!(features.padded_frames, 300);
         assert_eq!(features.audio_tokens, 39);
         assert_eq!(features.flat.len(), 300 * 128);
         assert_eq!(features.padded_samples, 0);
         assert_eq!(frontend.mel_frames_for(48_000), 300);
-        // A partial chunk: 250 frames -> 2 * 13 + ceil-halved 50 frames.
+        // A partial chunk: 250 frames -> 2 * 13 + ceil-halved 50 frames. The
+        // features run to the whole chunk; the valid count does not.
         let features = frontend.prepare(&tone(40_000), 16_000).unwrap();
         assert_eq!(features.mel_frames, 250);
+        assert_eq!(features.padded_frames, 300);
+        assert_eq!(features.flat.len(), 300 * 128);
         assert_eq!(features.audio_tokens, 26 + 7);
+        // A started hop is a valid frame, as the reference's mask counts it.
+        let features = frontend.prepare(&tone(40_001), 16_000).unwrap();
+        assert_eq!(features.mel_frames, 251);
+        assert_eq!(frontend.mel_frames_for(40_001), 251);
+        // A full 30 s window is not padded past itself.
+        let features = frontend.prepare(&tone(480_000), 16_000).unwrap();
+        assert_eq!(
+            (features.mel_frames, features.padded_frames),
+            (3_000, 3_000)
+        );
+        assert_eq!(features.audio_tokens, 390);
+    }
+
+    /// The frames past the audio are the mel of silence: constant across
+    /// frames and mel bins once the audio's last window has passed, and not
+    /// the zeros a tensor pad would give.
+    #[test]
+    fn the_chunk_padding_is_the_mel_of_silence() {
+        let frontend = frontend();
+        let features = frontend.prepare(&tone(40_000), 16_000).unwrap();
+        let row = |frame: usize| &features.flat[frame * 128..(frame + 1) * 128];
+        let silence = row(299);
+        assert!(silence.iter().all(|value| *value == silence[0]));
+        assert_ne!(silence[0], 0.0);
+        for frame in 254..300 {
+            assert_eq!(row(frame), silence, "frame {frame}");
+        }
+        // The clamp floor: 8 below the clip's maximum, then scaled.
+        let max = features.flat.iter().copied().fold(f32::MIN, f32::max);
+        assert!((silence[0] - (max - 2.0)).abs() < 1e-4, "{}", silence[0]);
+        assert_ne!(row(100), silence);
     }
 
     #[test]
@@ -188,6 +258,7 @@ mod tests {
         let features = frontend.prepare(&tone(1_600), 16_000).unwrap();
         assert_eq!(features.padded_samples, 6_400);
         assert_eq!(features.mel_frames, 50);
+        assert_eq!(features.padded_frames, 100);
         assert_eq!(features.audio_tokens, 7);
         assert_eq!(frontend.mel_frames_for(1_600), 50);
     }
