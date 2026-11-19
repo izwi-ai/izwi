@@ -1,4 +1,6 @@
 use izwi_core::catalog::ModelFamily;
+use izwi_core::runtime_models::architectures::audio8::auto_frame_budget as audio8_auto_frame_budget;
+use izwi_core::runtime_models::architectures::audio8::contracts::CONTROL_TOKENS as AUDIO8_CONTROL_TOKENS;
 use izwi_core::runtime_models::architectures::chatterbox::{
     chatterbox_auto_max_speech_tokens, ChatterboxEdition,
 };
@@ -187,12 +189,13 @@ pub(crate) fn validate_speech_references(
 }
 
 /// The tokens only `variant`'s prompt builder writes (Fish S2, Fish Audio
-/// Drama 3): the ChatML turn markers, the modality markers and the semantic
+/// Drama 3, Audio8): the ChatML turn markers, the modality markers and the semantic
 /// band. Their tokenizers map each to one special id, so a copy in caller
 /// text would rewrite the prompt.
 fn speech_control_tokens(variant: ModelVariant) -> &'static [&'static str] {
     match variant.family() {
         ModelFamily::FishS2Tts => &FISH_S2_CONTROL_TOKENS,
+        ModelFamily::Audio8Tts => &AUDIO8_CONTROL_TOKENS,
         ModelFamily::FishDrama3Tts => &fish_drama3_prompt::STRUCTURAL_TOKENS,
         _ => &[],
     }
@@ -559,6 +562,10 @@ pub(crate) fn resolve_tts_output_frames(
         }
         Some(0) | None if variant == ModelVariant::FishAudioS2Pro => {
             Some(fish_s2_tts_auto_max_frames_for_text(text).min(model_max_frames))
+        }
+        // Per segment: the text's speaking estimate, at most 1,024 frames.
+        Some(0) | None if variant.family() == ModelFamily::Audio8Tts => {
+            Some(audio8_auto_frame_budget(text).min(model_max_frames))
         }
         // Per chunk: S2's speaking estimate times 2.5, at most 1,024 frames.
         Some(0) | None if variant.family() == ModelFamily::FishDrama3Tts => {
