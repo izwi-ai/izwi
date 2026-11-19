@@ -47,8 +47,6 @@ pub use contracts::{
 pub use dac::{Audio8DacConfig, Audio8DacDecoder};
 pub(crate) use fast::audio8_fast_graph_device_bytes;
 pub use fast::{Audio8FastConfig, Audio8FastDecoder, Audio8GeneratedFrame, Audio8Sampler};
-#[cfg(test)]
-pub(crate) use physical::audio8_physical_state_spec;
 pub(crate) use physical::{Audio8PhysicalStateSpec, AUDIO8_SLOW_STATE_GROUP};
 #[allow(unused_imports)]
 pub(crate) use retained::{
@@ -1063,6 +1061,8 @@ fn audio8_codec_support_name(support: Audio8CodecSupport) -> &'static str {
     }
 }
 
+#[cfg(test)]
+mod reference_tests;
 #[cfg(test)]
 mod smoke;
 

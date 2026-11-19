@@ -144,22 +144,25 @@ impl Audio8PromptTokenizer {
         })
     }
 
-    /// Token count of the prompt's text parts for `target_text` (and the
-    /// reference transcript, when there is one), without the reference
-    /// frames.
-    pub(crate) fn speech_prompt_text_tokens(
+    /// The token ids of the prompt's text, before and after the place the
+    /// reference frames go (everything is before it when there is no
+    /// reference): what the published processor returns as its prefix and
+    /// suffix.
+    #[cfg(test)]
+    pub(crate) fn speech_prompt_text_ids(
         &self,
         reference_text: Option<&str>,
         target_text: &str,
-    ) -> Result<usize> {
+    ) -> Result<(Vec<u32>, Vec<u32>)> {
         let parts = speech_prompt_text_parts(reference_text, target_text)?;
-        let mut tokens = 0usize;
-        for part in parts.before.iter().chain(&parts.after) {
-            tokens = tokens
-                .checked_add(self.tokenizer.encode(part)?.len())
-                .ok_or_else(|| Error::InvalidInput("Audio8 prompt length overflow".into()))?;
-        }
-        Ok(tokens)
+        let encode = |parts: &[String]| -> Result<Vec<u32>> {
+            let mut ids = Vec::new();
+            for part in parts {
+                ids.extend(self.tokenizer.encode(part)?);
+            }
+            Ok(ids)
+        };
+        Ok((encode(&parts.before)?, encode(&parts.after)?))
     }
 }
 

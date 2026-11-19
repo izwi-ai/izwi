@@ -1060,7 +1060,9 @@ impl ModelVariant {
             Self::VoxtralMini4BRealtime2602 => [18.5, 10.0, 9.0],
             Self::Lfm25Audio15BGguf => [2.5, 2.5, 1.5],
             Self::VibeVoice15BTts => [11.5, 6.5, 5.5],
-            Self::Audio8TtsRealisticAir => [5.5, 4.0, 4.0],
+            // 601M parameters (F32 on the CPU, 16-bit elsewhere) and a 1.35 GB
+            // F32 codec; CUDA adds the fast transformer's graphs.
+            Self::Audio8TtsRealisticAir => [5.5, 4.0, 4.5],
             _ => return None,
         })
     }

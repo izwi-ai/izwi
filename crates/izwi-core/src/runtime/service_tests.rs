@@ -3203,6 +3203,17 @@ fn speech_family_params_keep_reference_defaults_until_the_request_sets_them() {
     let fish = fish_s2_request_params(&unset, "request-a");
     assert_eq!((fish.temperature, fish.top_p, fish.top_k), (0.7, 0.7, 30));
     assert_eq!(fish.seed, EngineCoreRequest::chat_request_seed("request-a"));
+    // The checkpoint's generation_config.json; with no reference voice the
+    // seed is also what picks the speaker.
+    let audio8 = audio8_request_params(&unset, "request-a");
+    assert_eq!(
+        (audio8.temperature, audio8.top_p, audio8.top_k),
+        (0.7, 0.9, 50)
+    );
+    assert_eq!(
+        audio8.seed,
+        EngineCoreRequest::chat_request_seed("request-a")
+    );
     let voxtral = voxtral_tts_request_params(&unset, "request-a", 4096);
     assert_eq!(
         (voxtral.temperature, voxtral.top_p, voxtral.top_k),
@@ -3223,6 +3234,16 @@ fn speech_family_params_keep_reference_defaults_until_the_request_sets_them() {
     assert_eq!(
         (fish.temperature, fish.top_p, fish.top_k, fish.seed),
         (0.5, 0.9, 12, 99)
+    );
+    let audio8 = audio8_request_params(&set, "request-a");
+    assert_eq!(
+        (audio8.temperature, audio8.top_p, audio8.top_k, audio8.seed),
+        (0.5, 0.9, 12, 99)
+    );
+    set.max_tokens = usize::MAX;
+    assert_eq!(
+        audio8_request_params(&set, "request-a").max_frames,
+        ModelVariant::AUDIO8_MAX_OUTPUT_FRAMES
     );
     let voxtral = voxtral_tts_request_params(&set, "request-a", 4096);
     assert_eq!(
