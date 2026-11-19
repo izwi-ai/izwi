@@ -233,7 +233,7 @@ impl MingVaeDecoder {
                 ));
             }
             let mut buffer = vec![Complex::new(0f32, 0f32); ISTFT_SIZE];
-            for (index, frame) in head.chunks_exact(2 * ISTFT_BINS).enumerate() {
+            for (index, frame) in head.as_chunks::<{ 2 * ISTFT_BINS }>().0.iter().enumerate() {
                 let start = (state.frames + index) * FRAME_SAMPLES - state.base;
                 let end = start + ISTFT_SIZE;
                 if state.signal.len() < end {

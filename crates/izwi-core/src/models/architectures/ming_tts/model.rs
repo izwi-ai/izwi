@@ -329,6 +329,6 @@ mod tests {
     #[test]
     fn the_voice_list_is_the_catalog_table() {
         assert_eq!(MING_TTS_VOICES.len(), 85);
-        assert!(CONTEXT_POSITIONS > crate::models::architectures::ming_tts::MIN_LATENTS);
+        const { assert!(CONTEXT_POSITIONS > crate::models::architectures::ming_tts::MIN_LATENTS) };
     }
 }

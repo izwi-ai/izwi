@@ -479,7 +479,9 @@ impl MingRuntime {
         }
         Ok(self
             .speaker_weight
-            .chunks_exact(SPEAKER_EMBEDDING_DIM)
+            .as_chunks::<SPEAKER_EMBEDDING_DIM>()
+            .0
+            .iter()
             .zip(&self.speaker_bias)
             .map(|(row, bias)| row.iter().zip(embedding).map(|(w, e)| w * e).sum::<f32>() + bias)
             .collect())
