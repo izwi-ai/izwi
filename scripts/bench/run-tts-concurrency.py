@@ -62,6 +62,7 @@ MODELS = {
     'VibeVoice-1.5B': {CLONE: True},
     'FishAudio-S2-Pro': {CLONE: True},
     'FishAudio-Drama-3': {},
+    'Audio8-TTS-Realistic-Air': {},
     'Chatterbox-500M': {'voice': 'default'},
     'Chatterbox-Multilingual-500M': {'voice': 'default', 'language': 'en'},
     'Maya1-3B': {'voice': 'ava'},
