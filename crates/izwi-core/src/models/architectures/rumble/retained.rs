@@ -55,7 +55,7 @@ pub(crate) fn rumble_retained_decode_enabled(backend: BackendKind) -> bool {
 pub(crate) struct RumblePreparedPromptArtifact {
     model_identity: u64,
     /// `[1, prompt tokens, hidden]` in the decoder's dtype.
-    embeddings: Tensor,
+    pub(super) embeddings: Tensor,
     prompt_tokens: usize,
     audio_tokens: usize,
     /// The language the assistant turn was prefilled with.
@@ -678,6 +678,54 @@ impl RumbleAsrModel {
             forced_language: prompt.forced_language,
             style: request.style,
         }))
+    }
+
+    /// Encode several requests' features in one tower pass and splice each
+    /// row's audio into its prompt. Each artifact is the one
+    /// [`Self::prepare_prompt_artifact_from_features`] builds for that row,
+    /// up to the tower's rounding between a packed and a lone encode.
+    pub(crate) fn prepare_prompt_artifact_batch_from_features(
+        &self,
+        rows: &[(&RumbleAudioFeatures, &RumbleRequestOptions)],
+    ) -> Result<Vec<Arc<RumblePreparedPromptArtifact>>> {
+        if let [(features, request)] = rows {
+            return Ok(vec![
+                self.prepare_prompt_artifact_from_features(features, request)?
+            ]);
+        }
+        let prompts = rows
+            .iter()
+            .map(|(features, request)| {
+                self.build_prompt(features.audio_tokens, &request.prompt_options())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let features = rows
+            .iter()
+            .map(|(features, _)| *features)
+            .collect::<Vec<_>>();
+        let audio = self.audio_embeddings_batch(&features)?;
+        prompts
+            .into_iter()
+            .zip(audio)
+            .zip(rows)
+            .map(|((prompt, audio), (_, request))| {
+                let embeddings = self.prompt_embeddings(&prompt, &audio)?;
+                // Each row keeps exactly its own storage, not a view of the
+                // packed encode.
+                let embeddings =
+                    crate::models::shared::memory::accounting::deep_copy_tensor_storage(
+                        &embeddings,
+                    )?;
+                Ok(Arc::new(RumblePreparedPromptArtifact {
+                    model_identity: self.model_identity(),
+                    embeddings,
+                    prompt_tokens: prompt.ids.len(),
+                    audio_tokens: prompt.audio_tokens,
+                    forced_language: prompt.forced_language,
+                    style: request.style,
+                }))
+            })
+            .collect()
     }
 
     /// Features and artifact for one request's audio.

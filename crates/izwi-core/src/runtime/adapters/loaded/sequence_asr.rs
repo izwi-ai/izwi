@@ -687,8 +687,9 @@ pub(super) struct RumbleAsrExecutionSeal {
     pub(super) decode_workspace_per_row_bytes: u64,
 }
 
-/// Rumble's ASR graphs: a retained sequence graph (scalar encoder
-/// preparation, scalar exact prefill, continuous decode) for audio of up to
+/// Rumble's ASR graphs: a retained sequence graph (encoder preparation
+/// batched at the engine rows, scalar exact prefill, continuous decode) for
+/// audio of up to
 /// 30 s, and the chunked atomic graph for longer audio. With the retained
 /// route off (`IZWI_RUMBLE_RETAINED_DECODE`, the default on CPU and Metal)
 /// the atomic graph is the only graph and the load fits no retained state.
@@ -914,22 +915,45 @@ impl LoadedExecutionAdapter for RumbleAsrExecutionAdapter {
         profile.max_batch_size = self.decode_batch_size;
         profile.resolved_from_loaded_model = true;
 
-        // Each request's audio encodes on its own: the tower's windows are
-        // per request, so the preparation stays scalar.
+        // Concurrent requests' audio encodes in one tower pass at the engine
+        // rows. The tower packs every row's conv chunks and attends inside
+        // each row's own windows, so rows of any length share a pass with
+        // no padding: a ragged batch, each row priced at its own geometry.
+        let native_preparation = self.max_batch_size > 1;
         let mut preparation = StageDescriptor::from_execution_profile(
             StageId::new(0),
             "asr.encoder.rumble",
             &profile,
-            NativeBatchMode::None,
+            if native_preparation {
+                NativeBatchMode::Static
+            } else {
+                NativeBatchMode::None
+            },
         );
         preparation.selector = StageWorkSelector::PreSequencePreparation;
         preparation.progress = StageProgressKind::Atomic;
         preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
-        preparation.max_batch_size = 1;
-        preparation.max_work_units = seal.preparation.max_work_units;
-        preparation.max_workspace_bytes = seal.preparation.max_workspace_bytes;
-        preparation.concurrency = ConcurrencyClass::Exclusive;
-        preparation.shape_policy = StageShapePolicy::Exact;
+        if native_preparation {
+            let width = u64::try_from(self.max_batch_size)
+                .map_err(|_| Error::Overloaded("Rumble ASR batch width exceeds u64".into()))?;
+            let ceiling = |value: u64, what: &str| {
+                value.checked_mul(width).ok_or_else(|| {
+                    Error::Overloaded(format!("Rumble ASR batch {what} ceiling overflow"))
+                })
+            };
+            preparation.max_batch_size = self.max_batch_size;
+            preparation.max_work_units = ceiling(seal.preparation.max_work_units, "work")?;
+            preparation.max_workspace_bytes =
+                ceiling(seal.preparation.max_workspace_bytes, "workspace")?;
+            preparation.shape_policy = StageShapePolicy::Ragged;
+            preparation.max_padding_basis_points = 0;
+        } else {
+            preparation.max_batch_size = 1;
+            preparation.max_work_units = seal.preparation.max_work_units;
+            preparation.max_workspace_bytes = seal.preparation.max_workspace_bytes;
+            preparation.concurrency = ConcurrencyClass::Exclusive;
+            preparation.shape_policy = StageShapePolicy::Exact;
+        }
         preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
 
         let mut prefill = StageDescriptor::from_execution_profile(

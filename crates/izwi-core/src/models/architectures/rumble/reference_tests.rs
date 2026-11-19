@@ -314,10 +314,7 @@ fn compare_retained_with_atomic(profile: DeviceProfile) {
             &samples
         }
     };
-    let begin = |index: usize, cache: PhysicalPagedKvCache| {
-        let artifact = model
-            .prepare_prompt_artifact(audio(index), rate, &requests[index])
-            .unwrap();
+    let begin_with = |artifact, cache: PhysicalPagedKvCache| {
         let mut state = model
             .begin_resumable_prefill_managed(artifact, RumbleGenerationOptions::default(), cache)
             .unwrap();
@@ -333,6 +330,12 @@ fn compare_retained_with_atomic(profile: DeviceProfile) {
             start = end;
         }
         state
+    };
+    let begin = |index: usize, cache: PhysicalPagedKvCache| {
+        let artifact = model
+            .prepare_prompt_artifact(audio(index), rate, &requests[index])
+            .unwrap();
+        begin_with(artifact, cache)
     };
     let mut atomic = Vec::new();
     for (index, request) in requests.iter().enumerate() {
@@ -374,10 +377,19 @@ fn compare_retained_with_atomic(profile: DeviceProfile) {
         alone_ids.push(state.generated_ids().to_vec());
     }
 
+    // The batch's rows are encoded together too, in one tower pass.
+    let features = (0..requests.len())
+        .map(|index| model.prepare_features(audio(index), rate).unwrap())
+        .collect::<Vec<_>>();
+    let encoded = model
+        .prepare_prompt_artifact_batch_from_features(
+            &features.iter().zip(&requests).collect::<Vec<_>>(),
+        )
+        .unwrap();
     let mut states = caches(&model, requests.len())
         .into_iter()
-        .enumerate()
-        .map(|(index, cache)| begin(index, cache))
+        .zip(encoded)
+        .map(|(cache, artifact)| begin_with(artifact, cache))
         .collect::<Vec<_>>();
     let mut texts = vec![None; states.len()];
     let mut widths = Vec::new();

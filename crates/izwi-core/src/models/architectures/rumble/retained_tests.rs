@@ -307,3 +307,83 @@ fn decode_graphs_stay_off_off_cuda() {
     let registry = crate::models::registry::NativeAsrModel::Rumble(model);
     assert!(registry.decode_graph_diagnostics().is_some());
 }
+
+/// Requests encoded in one tower pass get the artifacts they get alone:
+/// the same prompt, the same tokens on decode, and embeddings equal up to
+/// the tower's rounding.
+#[test]
+fn artifacts_encoded_together_match_those_encoded_alone() {
+    let checkpoint = SyntheticRumbleCheckpoint::write();
+    let model = load(&checkpoint);
+    let clips = [tone(16_000, 0.031), tone(40_000, 0.012), tone(8_000, 0.07)];
+    let requests = [
+        request(),
+        RumbleRequestOptions::default(),
+        RumbleRequestOptions {
+            prompt: Some("Izwi".into()),
+            ..request()
+        },
+    ];
+    let features = clips
+        .iter()
+        .map(|audio| model.prepare_features(audio, 16_000).unwrap())
+        .collect::<Vec<_>>();
+    let rows = features.iter().zip(&requests).collect::<Vec<_>>();
+    let together = model
+        .prepare_prompt_artifact_batch_from_features(&rows)
+        .expect("batch encodes");
+    assert_eq!(together.len(), rows.len());
+    for (index, (features, request)) in rows.iter().enumerate() {
+        let alone = model
+            .prepare_prompt_artifact_from_features(features, request)
+            .unwrap();
+        let batched = &together[index];
+        assert_eq!(
+            batched.prompt_tokens(),
+            alone.prompt_tokens(),
+            "row {index}"
+        );
+        assert_eq!(batched.audio_tokens(), alone.audio_tokens(), "row {index}");
+        assert_eq!(
+            batched.resident_tensor_bytes().unwrap(),
+            alone.resident_tensor_bytes().unwrap()
+        );
+        let values = |artifact: &RumblePreparedPromptArtifact| {
+            artifact
+                .embeddings
+                .to_dtype(candle_core::DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let (batched_values, alone_values) = (values(batched), values(&alone));
+        assert_eq!(batched_values.len(), alone_values.len());
+        for (lhs, rhs) in batched_values.iter().zip(&alone_values) {
+            assert!((lhs - rhs).abs() <= 1e-4, "row {index}: {lhs} vs {rhs}");
+        }
+        let decode = |artifact: Arc<RumblePreparedPromptArtifact>| {
+            let mut state = model
+                .begin_resumable_prefill_managed(
+                    artifact,
+                    options(8),
+                    caches(&model, 1).pop().unwrap(),
+                )
+                .unwrap();
+            prefill(&model, &mut state, usize::MAX / 2);
+            while !model
+                .decode_step(&mut state)
+                .expect("step decodes")
+                .finished
+            {
+                let _ = state.take_managed_write_completions();
+            }
+            state.generated_ids().to_vec()
+        };
+        assert_eq!(decode(batched.clone()), decode(alone), "row {index}");
+    }
+    assert!(model
+        .prepare_prompt_artifact_batch_from_features(&[])
+        .is_err());
+}

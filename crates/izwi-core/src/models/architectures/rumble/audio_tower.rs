@@ -871,7 +871,89 @@ impl AudioTower {
         features: &Tensor,
         feature_lens: &[usize],
     ) -> Result<AudioTowerBatchOutput> {
-        let n_mels = features.dim(2)?;
+        let rows = (0..feature_lens.len())
+            .map(|row| features.i(row))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        let (x, row_output_lengths) = self.encode_ragged_rows(&rows, feature_lens)?;
+
+        let max_output_len = row_output_lengths.iter().copied().max().unwrap_or(0);
+        let hidden = x.dim(2)?;
+        let mut padded_rows = Vec::with_capacity(row_output_lengths.len());
+        let mut offset = 0usize;
+        for &length in &row_output_lengths {
+            let row = x.narrow(1, offset, length)?;
+            offset += length;
+            if length == max_output_len {
+                padded_rows.push(row);
+            } else {
+                let pad = Tensor::zeros(
+                    (1, max_output_len - length, hidden),
+                    row.dtype(),
+                    row.device(),
+                )?;
+                padded_rows.push(Tensor::cat(&[row, pad], 1)?);
+            }
+        }
+        let row_refs: Vec<&Tensor> = padded_rows.iter().collect();
+        let padded = Tensor::cat(&row_refs, 0)?;
+        Ok(AudioTowerBatchOutput {
+            padded,
+            output_lengths: row_output_lengths,
+        })
+    }
+
+    /// Encode several requests' feature rows in one tower pass, with no
+    /// padding between them: each row is `[frames, n_mels]` with its own
+    /// frame count (at least its valid length), and each output is that
+    /// row's `[1, tokens, hidden]`. One row takes the scalar path.
+    pub fn forward_feature_rows(&self, rows: &[(&Tensor, usize)]) -> Result<Vec<Tensor>> {
+        if rows.is_empty() {
+            return Err(Error::InvalidInput(
+                "No audio features available for ASR batch".to_string(),
+            ));
+        }
+        for (row, (features, length)) in rows.iter().enumerate() {
+            let (frames, n_mels) = features.dims2()?;
+            if n_mels != self.cfg.num_mel_bins {
+                return Err(Error::InvalidInput(format!(
+                    "Rumble audio row {row} has {n_mels} mel bins, expected {}",
+                    self.cfg.num_mel_bins
+                )));
+            }
+            if *length == 0 || *length > frames {
+                return Err(Error::InvalidInput(format!(
+                    "Rumble audio row {row} has invalid feature length {length}; it holds {frames} frames"
+                )));
+            }
+        }
+        if let [(features, length)] = rows {
+            return Ok(vec![
+                self.forward_single_feature_sequence(features, *length)?
+            ]);
+        }
+        let tensors = rows
+            .iter()
+            .map(|(features, _)| (*features).clone())
+            .collect::<Vec<_>>();
+        let lengths = rows.iter().map(|(_, length)| *length).collect::<Vec<_>>();
+        let (x, row_output_lengths) = self.encode_ragged_rows(&tensors, &lengths)?;
+        let mut outputs = Vec::with_capacity(row_output_lengths.len());
+        let mut offset = 0usize;
+        for &length in &row_output_lengths {
+            outputs.push(x.narrow(1, offset, length)?);
+            offset += length;
+        }
+        Ok(outputs)
+    }
+
+    /// The packed encoder output `[1, sum of row tokens, hidden]` of `rows`
+    /// (each `[frames, n_mels]`) and each row's token count.
+    fn encode_ragged_rows(
+        &self,
+        rows: &[Tensor],
+        feature_lens: &[usize],
+    ) -> Result<(Tensor, Vec<usize>)> {
+        let n_mels = self.cfg.num_mel_bins;
         let n_window = self.cfg.n_window.unwrap_or(50);
         let n_window_infer = self.cfg.n_window_infer.unwrap_or(800);
         let chunk_input_len = n_window
@@ -898,7 +980,7 @@ impl AudioTower {
 
         let mut chunks = Vec::with_capacity(all_chunk_lengths.len());
         for (row, &chunk_count) in row_chunk_counts.iter().enumerate() {
-            let feature_row = features.i(row)?;
+            let feature_row = &rows[row];
             // A row's last chunk reads the frames the caller supplied past
             // its valid length (the reference pads the waveform with silence
             // before the STFT, so those frames are the mel of silence, not
@@ -1000,31 +1082,7 @@ impl AudioTower {
         }
 
         let x = self.encode_windows(x, &cu_seqlens)?;
-
-        let max_output_len = row_output_lengths.iter().copied().max().unwrap_or(0);
-        let hidden = x.dim(2)?;
-        let mut padded_rows = Vec::with_capacity(row_output_lengths.len());
-        let mut offset = 0usize;
-        for &length in &row_output_lengths {
-            let row = x.narrow(1, offset, length)?;
-            offset += length;
-            if length == max_output_len {
-                padded_rows.push(row);
-            } else {
-                let pad = Tensor::zeros(
-                    (1, max_output_len - length, hidden),
-                    row.dtype(),
-                    row.device(),
-                )?;
-                padded_rows.push(Tensor::cat(&[row, pad], 1)?);
-            }
-        }
-        let row_refs: Vec<&Tensor> = padded_rows.iter().collect();
-        let padded = Tensor::cat(&row_refs, 0)?;
-        Ok(AudioTowerBatchOutput {
-            padded,
-            output_lengths: row_output_lengths,
-        })
+        Ok((x, row_output_lengths))
     }
 }
 
@@ -1316,6 +1374,44 @@ mod tests {
             let exact = batched.row(row).expect("exact batch row");
             assert_close(&exact, &scalar);
         }
+    }
+
+    /// Rows handed over unpadded, each with its own frame count, encode as
+    /// they do alone.
+    #[test]
+    fn unpadded_audio_rows_match_their_scalar_encodes() {
+        let device = Device::Cpu;
+        let tower = tiny_audio_tower(&device);
+        let lengths = [1usize, 99, 100, 101, 250];
+        let features = ragged_features(&lengths, 8, &device);
+        // Each row keeps whole chunks of its own frames, as the front end
+        // hands them over.
+        let rows = lengths
+            .iter()
+            .enumerate()
+            .map(|(row, &length)| {
+                features
+                    .i(row)
+                    .and_then(|features| {
+                        features.narrow(0, 0, (length.div_ceil(100) * 100).min(250))
+                    })
+                    .expect("feature row")
+            })
+            .collect::<Vec<_>>();
+        let inputs = rows.iter().zip(lengths).collect::<Vec<_>>();
+        let encoded = tower.forward_feature_rows(&inputs).expect("ragged rows");
+        let expected = tower.output_lengths(&lengths).expect("output geometry");
+        for (row, &length) in lengths.iter().enumerate() {
+            assert_eq!(encoded[row].dim(1).unwrap(), expected[row]);
+            let scalar = tower
+                .forward_feature_sequence(&rows[row], length)
+                .expect("scalar audio tower");
+            assert_close(&encoded[row], &scalar);
+        }
+        let alone = tower.forward_feature_rows(&inputs[..1]).expect("one row");
+        assert_close(&alone[0], &encoded[0]);
+        assert!(tower.forward_feature_rows(&[]).is_err());
+        assert!(tower.forward_feature_rows(&[(&rows[0], 500)]).is_err());
     }
 
     #[test]

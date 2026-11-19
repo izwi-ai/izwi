@@ -3082,7 +3082,7 @@ fn lfm25_audio_asr_factory_publishes_sealed_retained_graph_and_atomic_long_form(
 }
 
 /// Rumble's normal requirement (with or without native streaming) binds its
-/// retained sequence graph: scalar encoder preparation at any engine width,
+/// retained sequence graph: encoder preparation batched at the engine rows,
 /// scalar exact prefill, and continuous decode priced per row. A long-form
 /// requirement binds the atomic stage, which chunks long audio inside its
 /// dispatch; with the retained route off (the default on CPU and Metal) it
@@ -3160,10 +3160,21 @@ fn rumble_asr_offers_its_retained_graph_and_chunked_atomic_graph() {
                     ),
                 ]
             );
+            // The encoder batches at the engine rows, as a ragged batch
+            // with no padding; one row stays scalar and exact.
             let preparation = &normal.stages[0];
-            assert_eq!(preparation.batch_mode, NativeBatchMode::None);
-            assert_eq!(preparation.max_batch_size, 1);
-            assert_eq!(preparation.max_work_units, 10_000);
+            assert_eq!(preparation.max_batch_size, rows);
+            assert_eq!(preparation.max_work_units, 10_000 * rows as u64);
+            assert_eq!(preparation.max_padding_basis_points, 0);
+            if rows > 1 {
+                assert_eq!(preparation.batch_mode, NativeBatchMode::Static);
+                assert_eq!(preparation.shape_policy, StageShapePolicy::Ragged);
+                assert_eq!(preparation.concurrency, ConcurrencyClass::Batchable);
+            } else {
+                assert_eq!(preparation.batch_mode, NativeBatchMode::None);
+                assert_eq!(preparation.shape_policy, StageShapePolicy::Exact);
+                assert_eq!(preparation.concurrency, ConcurrencyClass::Exclusive);
+            }
             assert_eq!(normal.stages[1].max_batch_size, 1);
             let decode = &normal.stages[2];
             assert_eq!(decode.batch_mode, NativeBatchMode::Continuous);

@@ -3969,6 +3969,19 @@ impl NativeAsrModel {
         }
     }
 
+    /// Encodes several Rumble requests' features in one tower pass.
+    pub(crate) fn prepare_rumble_prompt_artifact_batch_from_features(
+        &self,
+        rows: &[(&RumbleAudioFeatures, &RumbleRequestOptions)],
+    ) -> Result<Vec<Arc<RumblePreparedPromptArtifact>>> {
+        match self {
+            Self::Rumble(model) => model.prepare_prompt_artifact_batch_from_features(rows),
+            _ => Err(Error::InvalidInput(
+                "Rumble preparation was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
     pub(crate) fn continue_resumable_prefill(
         &self,
         state: &mut NativeAsrDecodeState,

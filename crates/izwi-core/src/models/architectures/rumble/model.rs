@@ -410,6 +410,56 @@ impl RumbleAsrModel {
         })
     }
 
+    /// Run the audio tower and projector over several requests' features in
+    /// one pass: each row's `[1, audio_tokens, hidden]` embeddings at the
+    /// decoder's dtype, in order. Rows are uploaded at their own length and
+    /// none reads another's frames.
+    pub(crate) fn audio_embeddings_batch(
+        &self,
+        rows: &[&RumbleAudioFeatures],
+    ) -> Result<Vec<Tensor>> {
+        let inputs = rows
+            .iter()
+            .map(|features| {
+                Tensor::from_slice(
+                    &features.flat,
+                    (features.padded_frames, features.n_mels),
+                    &self.device.device,
+                )?
+                .to_dtype(self.audio_dtype())
+                .map_err(Error::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let tower_rows = inputs
+            .iter()
+            .zip(rows)
+            .map(|(input, features)| (input, features.mel_frames))
+            .collect::<Vec<_>>();
+        let encoded = self.audio_tower.forward_feature_rows(&tower_rows)?;
+        if encoded.len() != rows.len() {
+            return Err(Error::InferenceError(
+                "Rumble audio tower returned the wrong row count".into(),
+            ));
+        }
+        encoded
+            .into_iter()
+            .zip(rows)
+            .map(|(embeddings, features)| {
+                if embeddings.dim(1)? != features.audio_tokens {
+                    return Err(Error::InferenceError(format!(
+                        "Rumble audio tower emitted {} tokens, expected {}",
+                        embeddings.dim(1)?,
+                        features.audio_tokens
+                    )));
+                }
+                if embeddings.dtype() != self.text_dtype() {
+                    return embeddings.to_dtype(self.text_dtype()).map_err(Error::from);
+                }
+                Ok(embeddings)
+            })
+            .collect()
+    }
+
     pub(crate) fn build_prompt(
         &self,
         audio_tokens: usize,
@@ -769,9 +819,19 @@ fn rumble_retained_graph(stages: &[StageDescriptor]) -> bool {
             && stage.concurrency == ConcurrencyClass::Exclusive
             && stage.max_batch_size == 1
     };
-    let preparation = stages
-        .iter()
-        .any(|stage| stage.selector == StageWorkSelector::PreSequencePreparation && scalar(stage));
+    // The encoder runs one request at a time, or several as a ragged batch
+    // with no padding.
+    let ragged_batch = |stage: &StageDescriptor| {
+        stage.batch_mode == NativeBatchMode::Static
+            && stage.shape_policy == StageShapePolicy::Ragged
+            && stage.concurrency == ConcurrencyClass::Batchable
+            && stage.max_batch_size > 1
+            && stage.max_padding_basis_points == 0
+    };
+    let preparation = stages.iter().any(|stage| {
+        stage.selector == StageWorkSelector::PreSequencePreparation
+            && (scalar(stage) || ragged_batch(stage))
+    });
     let prefill = stages
         .iter()
         .any(|stage| stage.selector == StageWorkSelector::SequencePrefill && scalar(stage));
@@ -833,7 +893,7 @@ fn rumble_physical_state_spec(
     };
     if !valid {
         return Err(Error::ModelLoadError(
-            "Rumble ASR runs its atomic graph, beside at most a retained graph of scalar preparation, scalar exact prefill and continuous ragged decode"
+            "Rumble ASR runs its atomic graph, beside at most a retained graph of scalar or ragged-batch preparation, scalar exact prefill and continuous ragged decode"
                 .into(),
         ));
     }
@@ -902,7 +962,17 @@ fn rumble_physical_state_spec(
             }
             invocation_stages.push(InvocationStageWorkspace {
                 stage: stage.id,
-                lease_scope: InvocationLeaseScope::PerRow,
+                // A batched encoder pass leases its scratch once for the
+                // batch, at the stage's whole-batch ceiling.
+                lease_scope: if stage.selector
+                    == crate::engine::StageWorkSelector::PreSequencePreparation
+                    && stage.batch_mode == crate::engine::NativeBatchMode::Static
+                    && stage.workspace_per_row_bytes == 0
+                {
+                    InvocationLeaseScope::PerStageBatch
+                } else {
+                    InvocationLeaseScope::PerRow
+                },
                 groups: if atomic {
                     invocation.groups.clone()
                 } else {
