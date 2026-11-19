@@ -152,16 +152,26 @@ impl Audio8ServingCapacity {
             fast_head,
             model.num_codebooks,
         ])?;
-        // The slow state is retained once and shared by both public
-        // capabilities; each has its own invocation bank, so price its
-        // prefill+decode scratch and fast state twice, plus codec candidates.
-        let row_bytes = slow_bytes
-            .checked_add(fast_bytes.checked_mul(2).ok_or_else(|| {
-                Error::ModelLoadError("Audio8 serving row budget overflow".into())
-            })?)
-            .and_then(|bytes| bytes.checked_add(profile.ar_workspace_per_row.checked_mul(4)?))
-            .and_then(|bytes| bytes.checked_add(profile.codec_workspace_per_row.checked_mul(4)?))
+        // A request runs in one capability at a time, and its prefill, decode
+        // and codec workspaces are transient: the live resource authority
+        // admits each invocation's workspace exactly. So a row prices its
+        // retained slow and fast state, its codec stream's current and
+        // rollback histories, and one of each workspace, which is what every
+        // row in flight at once can use together.
+        let codec_histories = crate::models::architectures::audio8::dac::Audio8DacConfig::current()
+            .streaming_history_bound_bytes()?
+            .checked_mul(2)
             .ok_or_else(|| Error::ModelLoadError("Audio8 serving row budget overflow".into()))?;
+        let row_bytes = [
+            slow_bytes,
+            fast_bytes,
+            profile.ar_workspace_per_row,
+            profile.codec_workspace_per_row,
+            codec_histories,
+        ]
+        .into_iter()
+        .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(|| Error::ModelLoadError("Audio8 serving row budget overflow".into()))?;
         // Reference preparation for the longest reference a request may
         // carry (the 30 s reference limit, at the highest accepted rate), not
         // the codec's 4,096-frame ceiling.
@@ -336,9 +346,9 @@ mod tests {
     }
 
     /// A row is priced at the loaded precision over one request's tokens
-    /// (the model's 2,048 positions, counted once) and the 30 s reference
-    /// limit, so an H100's headroom seals several rows. The per-row codec
-    /// and AR workspaces (four of each) dominate a row.
+    /// (the model's 2,048 positions, counted once) and one of each
+    /// workspace, so an H100's headroom holds the server's whole batch width
+    /// with requests to spare. The codec and AR workspaces dominate a row.
     #[test]
     fn rows_are_priced_from_one_request_at_the_loaded_precision() {
         let model = Audio8TtsModel::for_test();
@@ -361,7 +371,22 @@ mod tests {
         };
         // H100 headroom after the weights.
         let h100 = rows(68, 2);
-        assert!(h100 >= 4, "H100: {h100} rows");
+        assert!(h100 >= 16, "H100: {h100} rows");
+        // The engine's staged transactions (eight on a multi-user server)
+        // are the batch width; the rest are retained between steps.
+        let staged = Audio8ServingCapacity::resolve(
+            model.config(),
+            &EngineConfig {
+                max_staged_transactions: 8,
+                ..config.clone()
+            },
+            Some(68 << 30),
+            true,
+            2,
+        )
+        .unwrap();
+        assert_eq!((staged.ar_rows, staged.codec_rows), (8, 8));
+        assert_eq!(staged.active_rows, h100);
         // An F32 fallback prices twice the KV, never more rows.
         assert!(rows(68, 4) <= h100);
         // A full reference, a text segment and the output cap are more than
