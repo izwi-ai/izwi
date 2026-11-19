@@ -285,6 +285,7 @@ fn an_invocation_decodes_deterministically_within_its_budget() {
     assert_eq!(diagnostics["mel_frames"], 150);
     assert_eq!(diagnostics["audio_tokens"], 20);
     assert_eq!(diagnostics["forced_language"], "English");
+    assert_eq!(diagnostics["language"], "English");
     let prompt_tokens = diagnostics["prompt_tokens"].as_u64().unwrap() as usize;
     let generated = diagnostics["generated_tokens"].as_u64().unwrap() as usize;
     assert!(generated <= 12, "{generated}");

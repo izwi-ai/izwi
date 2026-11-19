@@ -529,6 +529,9 @@ impl RumbleAsrModel {
             "prompt_tokens": prompt.ids.len(),
             "context_tokens": prompt.context_tokens,
             "forced_language": prompt.forced_language,
+            // The transcript's language, forced or detected: the server
+            // reports it when the request named none.
+            "language": language,
             "style": {
                 "digits": request.style.digits,
                 "fillers": request.style.fillers,
